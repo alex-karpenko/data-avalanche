@@ -383,6 +383,7 @@ cluster:
 | Field | Type | Required | Default | Mutability | Notes |
 |---|---|---|---|---|---|
 | `tokens` | integer | no | `128` | PROC | Virtual nodes per physical node on the consistent-hash ring. **Must be identical cluster-wide** (V-026, V-062): the first node writes the established value to `globals.state`; a node whose `tokens` differs refuses to start. Recommended band 64–256; out-of-band values warn; <1 or >4096 error. |
+| `lock_backend` | enum | no | `storage` | PROC | Mutual-exclusion lease backend (D-2, `Clustering_Architecture_Research.md` §5.6). `storage` = object-storage CAS lease (default, portable). `kubernetes` = K8s Lease API — **reserved, not yet implemented**; only `storage` is valid in v1. **Must be identical cluster-wide** (V-075, V-076): pinned in the `globals.state` cluster anchor; a node whose `lock_backend` differs refuses to start, because a mixed-backend cluster has two independent arbiters and is split-brain by construction. |
 | `memberlist` | object | no | (defaults below) | PROC | §6.5.1. |
 
 A deployment with no peers (empty `join_members`, none discovered) is the supported
@@ -398,7 +399,7 @@ gossip timers are fixed for a process lifetime) unless noted.
 | Field | Type | Required | Default | Notes |
 |---|---|---|---|---|
 | `join_members` | list<host:port> | no | `[]` | Seed addresses to join. Empty = single-node (or wait for inbound joins). |
-| `node_name` | string | no | OS hostname | Unique node identity. |
+| `node_name` | string | no | OS hostname | Unique, **stable** node identity; this is also the `node_id` used for consistent-hash ring placement (`Clustering_Architecture_Research.md` §3.4). See the sourcing rule below. |
 | `advertise_addr` | string | no | `""` (bind_addr or first private IP) | Address advertised to peers. |
 | `advertise_port` | integer | no | `7946` | Port advertised to peers. |
 | `bind_addr` | list<ip> | no | `[0.0.0.0]` | Listen addresses. |
@@ -414,6 +415,15 @@ gossip timers are fixed for a process lifetime) unless noted.
 | `push_pull_interval` | Duration | no | `30s` | Full-state sync cadence. |
 | `retransmit_factor` | integer | no | `4` | Retransmit multiplier. |
 | `tls` | object | no | `{enabled:false}` | §6.5.2. |
+
+**`node_name` sourcing (D-1).** `node_name` is the node's stable identity for both gossip and
+consistent-hash ring placement, so it must be **stable across restarts of the same logical worker**
+and **must not embed an ephemeral pod IP**. On **Kubernetes, run workers as a StatefulSet (not a
+Deployment)** and set `node_name` to the pod name via the Downward API — a Deployment's random,
+changing pod names would reshuffle the derived ring on every restart. For **standalone** deployments,
+use a persisted-once UUID on a durable path, falling back to `${HOSTNAME}` only when no durable volume
+exists. A restarted process keeps its `node_name` but bumps a per-process `incarnation` so peers
+discard its stale in-flight gossip.
 
 #### 6.5.2 `globals.cluster.memberlist.tls`
 
@@ -1007,6 +1017,9 @@ radius. `reload` locus marks a rule that can only fire on reload.
 | V-025 | `catalog.hive.auth` / `catalog.rest.auth` | hive ∈ {none,ldap,kerberos}; rest ∈ {none,bearer,oauth2,sigv4}. | error | pipeline |
 | V-026 | `globals.cluster.tokens` | 1 ≤ tokens ≤ 4096. Outside 64–256 → also `warning`. | error / warning | config |
 | V-027 | `tables.snapshots.parallelism` | ≥ 1. | error | pipeline |
+| V-072 | `globals.cluster.lease_safety_margin` | 0 ≤ margin ≤ 0.5. Outside 0.05–0.30 → also `warning`. Fraction of `lease_duration` held back as the renewal safety-deadline `guard` (Clustering doc §19.3/§19.6, D-8). | error / warning | config |
+| V-074 | `globals.cluster.max_concurrent_handoffs` / `globals.cluster.max_concurrent_takeovers` | ≥ 1 (per-node concurrency caps; local resource knobs, not cluster-wide-consistent). Clustering doc §8.5/§20.2 (G-9, D-10). | error | config |
+| V-075 | `globals.cluster.lock_backend` | ∈ {storage, kubernetes}. `kubernetes` is reserved / not yet implemented → `error` in v1. Clustering doc §5.6 (D-2). | error | config |
 
 ### 13.4 Cross-field / conditional
 
@@ -1015,6 +1028,7 @@ radius. `reload` locus marks a rule that can only fire on reload.
 | V-028 | `catalog.glue` | Requires `globals.cloud = aws`. | error | pipeline |
 | V-029 | `catalog.rest.auth = sigv4` | Requires `globals.cloud = aws`. | error | pipeline |
 | V-030 | `source.ssl_mode = allow` | Invalid for MySQL. | error | pipeline |
+| V-073 | `globals.cluster.lease_renewal_interval` | Must be ≤ `lease_duration / 3` (the holder must get ≥2 renew attempts inside the renewal safety deadline). **Hard error** — promoted from the previously-advisory guidance (Clustering doc §18.2/§19.6, D-8). | error | config |
 | V-033 | `tables.snapshots.overrides` keys | Must be full `schema.table`; globs forbidden. | error | pipeline |
 | V-034 | `tables.snapshots.overrides` keys | Key not in the resolved include/exclude set. | warning | pipeline |
 | V-035 | `sink.flush` | All of `seconds`/`rows`/`bytes` null/disabled. | error | pipeline |
@@ -1065,6 +1079,7 @@ radius. `reload` locus marks a rule that can only fire on reload.
 |---|---|---|---|---|
 | V-061 | any PROC-class field | Changed during a live reload. | error | reload |
 | V-062 | `globals.cluster.tokens` | Differs from the cluster-established value in `globals.state`. | error | config (startup) |
+| V-076 | `globals.cluster.lock_backend` | Differs from the cluster-established value in the `globals.state` anchor. | error | config (startup) |
 
 ### 13.9 Resolution / materialization (Phase 2 — §11)
 
@@ -1273,7 +1288,8 @@ These will become config fields once their design lands (gap IDs in parentheses)
 
 | Future field(s) | Section it will extend | Gap |
 |---|---|---|
-| `cluster.lease_duration`, `cluster.lease_renewal_interval` | `globals.cluster` | G-8 (split-brain lease) |
+| `cluster.lease_duration`, `cluster.lease_renewal_interval`, `cluster.lease_safety_margin` | `globals.cluster` | G-8 (split-brain lease) — **design landed** in `Clustering_Architecture_Research.md` §5/§11/§19; concrete defaults `lease_duration=15s`, `lease_renewal_interval=5s`, `lease_safety_margin=0.15` (D-6/D-8). Validation rules V-072/V-073 already added (§13); these fields are reserved here pending promotion into the §6.5 `globals.cluster` table once the clustering design is ratified. |
+| `cluster.rebalance_stabilization`, `cluster.max_concurrent_handoffs`, `cluster.max_concurrent_takeovers`, `cluster.drain_timeout`, `cluster.discovery` (+ `cluster.discovery_dns_name`), `cluster.memberlist.lifeguard_enabled` | `globals.cluster` | G-9 (rebalancing / handoff) — **design landed** in `Clustering_Architecture_Research.md` §8/§10/§11/§20; concrete defaults `rebalance_stabilization=15s`, `max_concurrent_handoffs=2`, `max_concurrent_takeovers=4`, `drain_timeout=60s`, `discovery=static`, `lifeguard_enabled=true` (D-4/D-10/D-11). Validation rule V-074 added (§13); reserved here pending promotion into the §6.5 `globals.cluster` table once the clustering design is ratified. |
 | `tables.primary_key`, `tables.surrogate_key` | `tables` | G-13, G-30 (ghost-row dedup / PK-less tables) |
 | `sink.partitioning` | `sink` | G-24 (Iceberg partitioning) |
 | `sink.max_transaction_batch_rows` | `sink` | G-29 (large-txn vs atomic-flush tension) |
