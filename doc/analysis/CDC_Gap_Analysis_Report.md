@@ -2,7 +2,7 @@
 
 **Document type:** Pre-implementation analysis  
 **Based on:** System-Overview.md · Data-Flow.md · Configuration_Specification.md · Catalog_Auth_Research.md · Type_Mapping.md · Schema_Change_Detection_and_Evolution.md · Sources Index v3 (50 sources)  
-**Revision:** v9 — updated after Clustering_Architecture_Research.md was added  
+**Revision:** v12 — updated after Clustering_Architecture_Research.md D-1–D-4/D-7 were signed off  
 **Purpose:** Identify every gap, edge case, and research deficit that must be resolved before detailed requirements can be written
 
 ---
@@ -20,6 +20,131 @@ Severity codes:
 - 🔴 **Blocker** — implementation cannot start without resolving this
 - 🟡 **High** — wrong answer causes correctness bugs or data loss
 - 🟢 **Medium** — wrong answer degrades performance or operability
+
+---
+
+## v12 update — clustering decisions D-1–D-4, D-7 signed off
+
+The five outstanding clustering decision points are now resolved (recommendations approved, with
+sharpenings). **All clustering design decisions D-1…D-11 are closed**; what remains is
+implementation-time verification (D-5 conditional-write conformance, D-6 timing under load) and the
+proposed config-spec edits below.
+
+- **D-1 — `node_id` source.** `node_id` *is* the existing `globals.cluster.memberlist.node_name` (not
+  a new field). k8s → set it to the **StatefulSet pod name** via the Downward API, which **mandates a
+  StatefulSet (not a Deployment)** for workers — a Deployment's changing pod names would reshuffle the
+  derived ring on every restart. Standalone → persisted-once UUID, `${HOSTNAME}` fallback. §3.4.
+- **D-2 — lock backend.** Cloud-storage CAS lease is primary/default. Reserve
+  `cluster.lock_backend: storage | kubernetes` but **build `storage` only for v1**. `lock_backend` is
+  **pinned in the `globals.state` anchor** (cluster-wide-consistent) — a mixed-backend cluster is
+  split-brain, so a mismatched node refuses to start. §5.6 / §12.
+- **D-3 — cold-start precedence.** Cloud-generation-wins-at-runtime, file-is-input, reload-promotes.
+  Simplified: no "compare file to generation number" — a starting node adopts the latest cloud
+  generation if one exists; the file matters only at first bootstrap (CAS-create gen 1) or explicit
+  reload. **Documented footgun: a pod restart does not apply config-file changes — only
+  `POST /v1/config/reload` does.** §9.3.
+- **D-4 — discovery.** Add `cluster.discovery: static | dns` (+ `discovery_dns_name`, default
+  `static`); `dns` resolves **and periodically re-resolves** a headless Service so an isolated node can
+  re-bootstrap. Already reserved in config spec §16 (G-9 row). §10.2.
+- **D-7 — `owner_epoch` fencing (assert it).** `owner_epoch` is embedded in the Iceberg snapshot
+  summary (`cdc.owner_epoch`); the commit reload-retry loop rejects a commit when
+  `latest_committed_epoch > my_epoch` — a **sink-side fencing token** that stops a zombie committing
+  *after* a new owner takes over. Defense-in-depth atop the metadata-pointer CAS + `_lsn` dedup, not a
+  correctness prerequisite. §5.5.
+
+**Config-spec follow-ups — D-1 / D-2 APPLIED:**
+(1) **D-1** — `globals.cluster.memberlist.node_name` (§6.5.1) now documents the sourcing rule:
+it *is* the ring `node_id`, must be stable / non-IP, k8s → StatefulSet pod name via Downward API
+(StatefulSet **not** Deployment), standalone → persisted UUID / `${HOSTNAME}`.
+(2) **D-2** — `globals.cluster.lock_backend` promoted into the §6.5 field table (enum, default
+`storage`, `kubernetes` reserved/not-yet-implemented), pinned cluster-wide via the `globals.state`
+anchor; validation rules **V-075** (domain ∈ {storage, kubernetes}; `kubernetes` → error in v1) and
+**V-076** (differs from anchor → refuse to start, parallels V-062 for `tokens`) added.
+(3) `discovery`/`discovery_dns_name` remain reserved in §16 (G-9 row). The lease-timing fields stay
+§16-reserved pending D-6.
+
+---
+
+## v11 update — clustering reconciler robustness (D-9/D-10/D-11)
+
+`Clustering_Architecture_Research.md` gained **§20**, closing the three remaining clustering
+correctness sub-gaps surfaced while reading §8/§13 as the implementation contract. All three are
+resolved at the design level; none required reopening a 🔴 blocker (G-8/G-9 stay resolved).
+
+- **D-9 — reconciler ↔ renewer orchestration.** §8.1's single reconcile loop would block every
+  pipeline behind any one pipeline's takeover-evaluation wait (up to a full `lease_duration`), and the
+  "who writes the lease" boundary between the loop and the §13 renewer was undrawn. Resolved by
+  splitting into a **`ClusterReconciler`** (owns only the ring; pushes per-pipeline `Own`/`DontOwn`
+  targets; never touches a lease) + a **per-pipeline `PipelineController`** (sole lease-writer; runs
+  acquire/takeover/renew/handoff in its own task, with the §19 renewer living in its `Owned` state).
+  Triggering is **event-driven + periodic-resync**, controllers are **idempotent / level-triggered**
+  (Kubernetes-controller pattern), so at-most-one / at-least-one holds under dropped or reordered
+  events. §8.1 and §13 refined to point at §20.1.
+- **D-10 — unplanned-takeover storm.** `max_concurrent_handoffs` capped only *planned* drains; an
+  unplanned death of a multi-pipeline node let survivors stampede source-DB reconnects + state reads.
+  Resolved by `cluster.max_concurrent_takeovers` (default `4`) gating concurrent **Phase-0 starts**
+  (not the cheap takeover-evaluation waits) on the unplanned path, plus jitter. Per-node-global scope;
+  per-source-endpoint bulkhead noted as future. It is a tuning knob, not a safety boundary — the lease
+  still guarantees at-most-one.
+- **D-11 — flap immunity.** Stabilization (§8.5) covered only first-time joins. Resolved by keeping
+  **suspect nodes in the ring** (only `dead`/`left` removes a node — safe because safety is the lease,
+  not the ring, §8.4) and applying `rebalance_stabilization` to **all ring additions including
+  rejoins**, while ring **removals act immediately** (dead-node failover is lease-expiry-driven and
+  must not be delayed). A transient suspicion now causes zero ring churn.
+
+New config field: `cluster.max_concurrent_takeovers` (R, default 4). **Config-spec follow-up —
+APPLIED:** `Configuration_Specification.md` §16 now reserves the full **G-9 rebalancing/discovery
+surface** (`rebalance_stabilization`, `max_concurrent_handoffs`, `max_concurrent_takeovers`,
+`drain_timeout`, `discovery`/`discovery_dns_name`, `memberlist.lifeguard_enabled`) marked
+design-landed, and validation rule **V-074** (`max_concurrent_handoffs` / `max_concurrent_takeovers`
+≥ 1) was added. These fields stay §16-reserved pending promotion into the §6.5 `globals.cluster` field
+table when the clustering design is ratified.
+
+Remaining clustering decision points: D-1 (node_id source), D-2 (lock_backend switch), D-3 (cold-start
+precedence), D-4 (DNS discovery), D-7 (owner_epoch into Iceberg metadata) — recommendations exist,
+sign-off pending. D-5/D-6 remain elaborated-and-recommended pending implementation verification.
+
+---
+
+## v10 update — clustering lease renewal hardened (D-8)
+
+`Clustering_Architecture_Research.md` gained **§19 (D-8 elaborated)**, closing a correctness/
+availability defect in the original §5.3 renew rule. The old text treated *every* renewal failure as
+"I lost the lease → hard stop," conflating two different classes:
+
+- **`412` (definitive loss)** — a challenger CAS-advanced the lease object → stop immediately. Correct.
+- **Transient storage error (timeout / `5xx` / throttle / conn-reset)** — the arbiter was unreachable;
+  lease status is *unknown*, not lost. Stopping here needlessly drops a healthy holder's pipelines on
+  every storage blip, and in **single-node mode** stops the only worker for a 2-second S3 hiccup.
+
+§19 replaces the rule with a **renew-outcome taxonomy** + a **renewer state machine**
+(`Held → Renewing → {Held | Degraded | Lost}`) bounded by a **safety deadline**:
+`deadline = last_renew_local + lease_duration − guard`, with `guard = lease_duration ×
+lease_safety_margin` (default `0.15`), measured on the holder's **own** clock. Transient failures move
+to *Degraded* and retry until either a renew succeeds or the deadline is hit; only `412`/`404`/`403`
+stop immediately. The deadline preserves §5.3's clock-skew-safe property (both holder-stop and
+challenger-take are durations anchored to the same ETag-write event; only bounded clock-*rate* drift
+matters, which `guard` absorbs). This also gives the §18.2 invariant
+`lease_renewal_interval ≤ lease_duration / 3` its purpose — it guarantees two retry attempts inside
+the deadline — so that rule is **promoted from advisory to an enforced config-validation rule**.
+
+Commits gate at commit-start on `state ∈ {Held, Degraded} ∧ now() < deadline`, with the Iceberg
+atomic-commit fence (§5.5) as the slip backstop. New config field: `cluster.lease_safety_margin`
+(PROC, default `0.15`). New clustering metrics: `cdc_lease_state`, `cdc_lease_renew_failures_total`,
+`cdc_lease_renew_latency_seconds` (fold into G-33). D-8 is **resolved (design)**; two small follow-ups
+fall out (see §4.1 and §9.2 below):
+
+- **Config-spec follow-up — APPLIED:** `Configuration_Specification.md` now carries
+  `cluster.lease_safety_margin` (§16 G-8 row, defaults noted), validation rule **V-072**
+  (`lease_safety_margin ∈ [0, 0.5]`, warn outside 0.05–0.30) and **V-073**
+  (`lease_renewal_interval ≤ lease_duration / 3`, hard error). The three lease fields remain in §16
+  reserved-for-design pending promotion into the §6.5 `globals.cluster` field table when the
+  clustering design is ratified.
+- The three lease metrics extend the still-open metrics catalogue (G-33).
+
+Remaining clustering decision points: D-1 (node_id source), D-2 (lock_backend switch), D-3 (cold-start
+precedence), D-4 (DNS discovery), D-7 (owner_epoch into Iceberg metadata) — recommendations exist,
+sign-off pending. D-5/D-6 remain elaborated-and-recommended pending implementation verification.
 
 ---
 
@@ -389,6 +514,15 @@ mechanism.
 `cluster.lease_renewal_interval` (default 5s) populate the config spec §16 G-8 reservation. Final
 default values are D-6 (research doc §18), being tuned against the replication-lag SLA (OQ-OB2).
 
+**Renewal hardened (D-8, research doc §19 — v10):** the renew rule no longer treats all failures as
+loss. A `412` is a definitive loss (stop now); a transient storage error moves the renewer to a
+*Degraded* state that retries until a **safety deadline** (`last_renew_local + lease_duration − guard`,
+`guard = lease_duration × lease_safety_margin`, default margin `0.15`), then stops — preserving the
+clock-skew-safe property and fixing the single-node "stop on a 2-second S3 blip" regression. Adds
+`cluster.lease_safety_margin` and promotes `lease_renewal_interval ≤ lease_duration / 3` to an
+enforced validation rule (now applied to the config spec as V-072/V-073). Lease-state metrics fold
+into G-33.
+
 ---
 
 ### 4.2 Offset handover staleness — UNCHANGED 🟡
@@ -418,6 +552,15 @@ lease expiry → new owner takes over and replays from the last checkpoint, at-l
   time"); a joiner passes through `Joining` before `Active` so it never grabs-and-drops.
 - **Bound:** `cluster.drain_timeout` (default 60s) — exceed it and fall back to the unplanned replay
   path. This extends the existing `Data-Flow.md` shutdown sequence with an explicit lease release.
+
+**Hardened in v11 (research doc §20):** the *unplanned* path now also has a burst cap —
+`cluster.max_concurrent_takeovers` (default 4) limits concurrent Phase-0 starts (not the cheap
+takeover-evaluation waits) with jitter, so a dead multi-pipeline node doesn't stampede source-DB
+reconnects (D-10). Rebalancing is also flap-immune: **suspect** nodes stay in the ring (only
+`dead`/`left` removes a node), and `rebalance_stabilization` now applies to **all ring additions
+including rejoins** while removals act immediately (D-11). The execution model is a `ClusterReconciler`
+(ring only) + per-pipeline `PipelineController` (sole lease-writer), so a long takeover-evaluation
+wait never blocks other pipelines' reconciliation (D-9).
 
 ---
 
