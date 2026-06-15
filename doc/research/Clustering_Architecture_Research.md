@@ -1,7 +1,7 @@
 ---
 title: Clustering Architecture Research
 status: Research / Design proposal (input for further elaboration)
-updated: 2026-06-14
+updated: 2026-06-15
 domain: Architecture / Distributed Systems
 tags: [clustering, gossip, swim, memberlist, consistent-hashing, lease, split-brain, rebalancing, config-propagation]
 closes_or_advances: [G-8, G-9, G-2, G-17, G-23, G-36, "OQ-CL1", "OQ-CL3", "OQ-CL4", "OQ-API3", "OQ-P3", "5.1", "5.2"]
@@ -217,8 +217,15 @@ by its own *stale* gossip still in flight. We adopt the same pattern with the `i
 - `incarnation`: a wall-clock-seeded or counter value bumped on every process start. Used to ignore
   resurrected stale NodeMeta from a node that just restarted.
 
-> **Decision needed (D-1):** confirm the `node_id` source per deployment target (StatefulSet pod
-> name recommended on k8s). This interacts with ring stability during rolling restarts.
+> **Decision (D-1) — resolved:** `node_id` *is* the existing `globals.cluster.memberlist.node_name`
+> field (config spec §6.5.1, defaults to OS hostname) — not a new field, just a sourcing rule:
+> (a) on **Kubernetes set `node_name` to the StatefulSet pod name** via the Downward API; (b) this
+> **mandates a StatefulSet, not a Deployment**, for the worker workload — a Deployment's random,
+> changing pod names would reshuffle the derived ring on every restart (ring stability depends on
+> stable identity); (c) **standalone** uses a persisted-once UUID on a durable path, falling back to
+> `${HOSTNAME}` only when there is no durable volume. `incarnation` (§3.2) still distinguishes a fresh
+> process of the same `node_id`. Config-spec follow-up: document the node_name sourcing rule and the
+> StatefulSet constraint in §6.5.1 (proposed).
 
 ### 3.5 Coordinated join, leave, and status update
 
@@ -368,9 +375,13 @@ skew. The only assumption is single-node: *a live holder renews at least once pe
 someone holds it → go to *takeover-evaluation*.
 
 **Renew (current holder), every `lease_renewal_interval`:**
-`PUT … If-Match: <my_last_etag>` with updated `renewed_at`; store the **new** ETag. If `412` → **I
-have lost the lease** (a challenger took over, or my view is stale): immediately **stop the pipeline
-and do not commit**. Renewal failure is a hard stop, not a warning.
+`PUT … If-Match: <my_last_etag>` with updated `renewed_at`; store the **new** ETag. A `412` means a
+challenger took over → **I have lost the lease**: immediately **stop the pipeline and do not commit.**
+But a *renew that fails to reach storage* (timeout / `5xx` / throttle / conn-reset) is **not** the
+same as a `412` and must **not** trigger an immediate stop — it is retried within a bounded safety
+deadline. The full failure taxonomy, the safety-deadline formula, and the renewer state machine are
+specified in **§19 (D-8)**; the one-line summary is: `412`/`404`/`403` → stop now; transient → retry
+until success or `last_renew_local + lease_duration − guard`, then stop.
 
 **Takeover-evaluation (challenger that became ring-owner while another node holds the lease):**
 1. `GET` the lease → record `etag0`; start a **local** timer.
@@ -409,8 +420,18 @@ attempt one stale Iceberg commit before noticing. We close this with **defense i
    are a CAS on the table-metadata pointer (already in `Data-Flow.md`'s "catalog conflict → reload &
    retry" path). If a zombie slips past (1), the new owner has already advanced the metadata, so the
    zombie's commit conflicts and fails. The new owner never loses; at worst the zombie wastes effort.
-3. **`owner_epoch`** is carried in the write path so any ambiguous artifact is attributable, and so
-   future hardening (e.g., embedding epoch in commit metadata for assertion) has a hook.
+3. **`owner_epoch` as a sink-side fencing token (D-7 — resolved: assert it).** The monotonic
+   `owner_epoch` is **embedded in the Iceberg snapshot summary** (`cdc.owner_epoch`), and the commit
+   path — inside the existing catalog-conflict reload-retry loop (Data-Flow.md) — **rejects a commit
+   when `latest_committed_epoch > my_epoch`** (a higher epoch already owns ⇒ I am the zombie, abort).
+   This upgrades `owner_epoch` from advisory attribution to a real **fencing token at the sink**:
+   it stops a zombie from committing *after* a new owner has established ownership. It does not undo
+   the rarer "zombie commits in the gap *before* the new owner's first commit" — that single stale
+   commit still lands and is caught by (4) `_lsn` dedup. This is defense-in-depth layered on top of
+   the metadata-pointer CAS (2), not a correctness prerequisite; cost is low because iceberg-rust
+   exposes the snapshot-summary string map and the monotonic check rides the reload-retry path that
+   already exists. **Implementation note:** verify the chosen iceberg-rust version preserves custom
+   snapshot-summary properties across commits.
 4. **Idempotent/dedup writes** (the `_lsn`-based exactly-once guard, Phase 4, and the ghost-row
    dedup gap G-13) absorb the residual duplicate-row possibility.
 
@@ -429,8 +450,14 @@ attempt one stale Iceberg commit before noticing. We close this with **defense i
 | **etcd / Consul session locks** | Rejected for core | Strong and well-understood, but adds a CP infrastructure dependency the system explicitly avoids ("operational simplicity," no extra state stores). |
 | **Iceberg optimistic concurrency only (no lease)** | Rejected as *primary* | Prevents *corruption* but not *wasted duplicate work*, not MySQL double-reads, not flapping; gives no "who should start it" liveness story. Kept as the §5.5 backstop, not the mechanism. |
 
-> **Decision needed (D-2):** approve cloud-storage lease as primary, with optional k8s `Lease`
-> backend behind a `cluster.lock_backend: storage | kubernetes` switch (future field).
+> **Decision (D-2) — resolved:** cloud-storage CAS lease is the **primary/default** backend.
+> (a) Reserve `cluster.lock_backend: storage | kubernetes` but **build `storage` only for v1** — the
+> `kubernetes` (K8s Lease API) backend is a future `LeaseStore` impl; do not build two backends before
+> the first ships. (b) `lock_backend` is **cluster-wide-consistent and pinned in the `globals.state`
+> anchor** alongside `tokens`/`lease_duration` (§12) — a cluster running *mixed* backends is
+> split-brain by construction (two nodes using different arbiters can both "win"), so a node whose
+> `lock_backend` differs from the anchor **refuses to start**. Config-spec follow-up: add the
+> `lock_backend` enum and its anchor/consistency rule (proposed).
 
 ---
 
@@ -498,6 +525,14 @@ for each pipeline P in the full config:
 
 This loop is what guarantees **every pipeline is running** (some node is always the owner and will
 start it) and **only one runs it** (the lease gate inside `ensure_lease_held`).
+
+> **Execution refinement (§20.1, D-9):** this pseudocode describes the *desired state* correctly, but
+> it must **not** be executed as one loop with inline blocking calls — `ensure_lease_held` can wait a
+> full `lease_duration` during takeover-evaluation (§5.3) and would stall every other pipeline behind
+> it. In the implementation it is split into a **`ClusterReconciler`** (owns the ring; pushes per-
+> pipeline `Own`/`DontOwn` targets; never touches a lease) and a **per-pipeline `PipelineController`**
+> (sole lease-writer; runs acquire/takeover/renew/handoff in its own task). Triggering is event-driven
+> with a periodic resync backstop, and controllers are idempotent/level-triggered. See §20.1.
 
 ### 8.2 Unplanned death path (timing)
 ```
@@ -610,14 +645,20 @@ A node's **mounted file is its input**; the **cloud generation pointer is the di
 truth.** On start, a node loads its file, derives a candidate config, then checks
 `config/generation.json`:
 
-- If cloud `generation` ≥ the node's file-derived view → **adopt the cloud snapshot** for runtime
-  (and log the divergence). This prevents a freshly-started pod whose ConfigMap has not yet updated
-  from *regressing the whole cluster* to a stale config.
-- A subsequent operator `reload` promotes the (now-updated) file to generation N+1 in the normal way.
+- **If `config/generation.json` exists → adopt the cloud snapshot** for runtime (and log the
+  divergence vs. the local file). This prevents a freshly-started pod whose ConfigMap has not yet
+  updated from *regressing the whole cluster* to a stale config.
+- The local file is authoritative **only at first bootstrap** (no `generation.json` yet → the starting
+  node CAS-creates generation 1 from its file; concurrent starters race on `If-None-Match:*`, one
+  wins, the rest adopt) **or via an explicit `reload`** (which promotes the now-updated file to
+  generation N+1 in the normal way).
 
-> **Decision needed (D-3):** confirm this precedence rule (cloud-wins-at-runtime, file-is-input,
-> reload-promotes). It is the safe choice under rolling deploys but worth an explicit sign-off
-> because it means "the file on disk is not always what's running."
+> **Decision (D-3) — resolved:** cloud-wins-at-runtime, file-is-input, reload-promotes.
+> (a) **Simplified rule:** there is no "compare the file to a generation number" step — a file carries
+> no generation; a starting node simply adopts the latest cloud generation if one exists, and the file
+> matters only at first bootstrap or on explicit reload. (b) **Operator footgun, documented loudly:**
+> **a pod restart does NOT apply config-file changes — only `POST /v1/config/reload` does.** Under
+> cloud-wins this surprises operators who edit a ConfigMap and restart expecting it to take effect.
 
 ### 9.4 Mutability interaction
 The generation mechanism is orthogonal to the R/PR/PROC classes: once a node adopts generation N it
@@ -656,8 +697,12 @@ seed list:
   handoff (§8.3)** → newcomer acquires their leases and resumes. No promotion step, no leader, no
   manual rebalance.
 
-> **Future fields (D-4):** `cluster.discovery: static | dns` and `cluster.discovery_dns_name` so the
-> seed mechanism is config-driven. `static` keeps `join_members`; `dns` resolves a headless Service.
+> **Decision (D-4) — resolved:** add `cluster.discovery: static | dns` (default `static`) and
+> `cluster.discovery_dns_name` so the seed mechanism is config-driven. `static` keeps `join_members`;
+> `dns` resolves a headless Service to all pod IPs. (a) **`dns` mode re-resolves the headless Service
+> periodically**, not just at boot, so a node that has lost all peers can re-bootstrap; once gossip is
+> joined, SWIM carries membership and DNS is only the bootstrap/rejoin path. These fields are already
+> reserved in config spec §16 (G-9 row).
 
 ### 10.3 The N=1 ↔ N>1 symmetry
 The architecture is *identical* at every cluster size; only the membership set differs. That symmetry
@@ -681,10 +726,12 @@ anchored like `tokens` (G-36).**
 | `cluster.lock_backend` | enum | `storage` | PROC | Yes | `storage` (CAS lease, default/portable) or `kubernetes` (k8s Lease API, opt-in on k8s). §5.6. |
 | `cluster.rebalance_stabilization` | Duration | `15s` | R | No | Delay proactive rebalancing until membership stable this long. Does **not** delay dead-node failover. §8.5. |
 | `cluster.max_concurrent_handoffs` | integer | `2` | R | No | Cap simultaneous graceful drains. §8.5. |
+| `cluster.max_concurrent_takeovers` | integer | `4` | R | No | Cap simultaneous Phase-0 starts on the **unplanned**-takeover path (gates the resume, not the cheap takeover-evaluation wait); de-synchronized with jitter. §20.2. |
 | `cluster.drain_timeout` | Duration | `60s` | R | No | Max graceful drain before falling back to unplanned replay. §8.3. |
 | `cluster.discovery` | enum | `static` | PROC | No | `static` (use `join_members`) or `dns` (resolve a headless Service). §10.2. |
 | `cluster.discovery_dns_name` | string | — | PROC | No | Required when `discovery: dns`. |
 | `cluster.memberlist.lifeguard_enabled` | bool | `true` | PROC | Recommended equal | Enable Lifeguard (G-23 decision). |
+| `cluster.lease_safety_margin` | float (0–0.5) | `0.15` | PROC | Recommended equal | Fraction of `lease_duration` held back as `guard` before the renewal safety deadline (§19.3). Also: `lease_renewal_interval ≤ lease_duration / 3` is an **enforced** rule (§19.6), not just advisory. |
 
 > The `lease_duration` / `lease_renewal_interval` pair are the two fields config spec §16 already
 > earmarked for G-8; the rest are the G-9 / rebalancing surface. Anchoring `lease_duration` in
@@ -703,7 +750,8 @@ conditional writes (gap 5.2): create via `If-None-Match: *`, update via `If-Matc
 ├── cluster/
 │   ├── anchor.json            # FIRST-WRITER-WINS via If-None-Match:*. Establishes the cluster-wide
 │   │                          # invariants: { version, tokens: 128, lease_duration_ms: 15000,
-│   │                          # hash_algo: "xxh3", established_by, established_at }.
+│   │                          # lock_backend: "storage", hash_algo: "xxh3",
+│   │                          # established_by, established_at }.   (lock_backend pinned per D-2)
 │   │                          # A node whose config disagrees REFUSES TO START (extends V-026/V-062
 │   │                          # from tokens-only to the full safety-timing anchor).
 │   └── membership.json        # OPTIONAL advisory snapshot of last-known membership, for cold-start
@@ -748,9 +796,17 @@ ClusterManager (one per worker)
 ├── ConfigCoordinator                               // generation pointer poll + gossip nudge
 │   └── on new generation → fetch snapshot → reconcile (§9)
 │
-└── Reconciler (periodic tokio task, §8.1)
-    └── for each pipeline: align (ring owner, lease held, running) ; drive handoffs (§8.3)
+└── ClusterReconciler (ring only, §20.1) + N × PipelineController (one per pipeline)
+    ├── ClusterReconciler: recompute ring on membership/config change + periodic resync;
+    │                      push Own/DontOwn target to each PipelineController (never touches a lease)
+    └── PipelineController: sole lease-writer; state machine Unowned→Acquiring→Owned→Releasing;
+                           hosts the §19 renewer in Owned; drives handoff (§8.3); Phase-0 start
+                           gated by max_concurrent_takeovers on the unplanned path (§20.2)
 ```
+
+> The earlier single-`Reconciler` box (one periodic loop calling `ensure_lease_held` inline) is
+> refined into this two-layer form by §20.1 (D-9) to avoid head-of-line blocking during the
+> takeover-evaluation wait.
 
 - The `Reconciler` is the single place that ties ring + lease + running-set together; keeping that
   logic in one loop (rather than scattered event handlers) is what makes the at-most-one / at-least-one
@@ -781,13 +837,17 @@ ClusterManager (one per worker)
 
 ## 15. Decision points to resolve in the next elaboration pass
 
-- **D-1** `node_id` source per deployment target (StatefulSet pod name on k8s recommended). §3.4
-- **D-2** Approve cloud-storage lease as primary; add optional `cluster.lock_backend: kubernetes`. §5.6
-- **D-3** Confirm config cold-start precedence (cloud-wins-at-runtime, file-is-input). §9.3
-- **D-4** Add `cluster.discovery: static | dns` + headless-Service discovery. §10.2
+- **D-1** *(resolved)* `node_id` = `memberlist.node_name`; k8s → StatefulSet pod name (mandates a StatefulSet, not a Deployment); standalone → persisted UUID, `${HOSTNAME}` fallback. §3.4
+- **D-2** *(resolved)* Cloud-storage CAS lease is primary; reserve `cluster.lock_backend: storage | kubernetes` but build `storage` only for v1; `lock_backend` pinned in the `globals.state` anchor (cluster-wide-consistent). §5.6 / §12
+- **D-3** *(resolved)* Cold-start: cloud-generation-wins-at-runtime, file-is-input, reload-promotes; file matters only at first bootstrap or explicit reload; **restart ≠ apply config**. §9.3
+- **D-4** *(resolved)* Add `cluster.discovery: static | dns` (+ `discovery_dns_name`); `dns` resolves + periodically re-resolves a headless Service. §10.2
 - **D-5** *(elaborated below, §17)* Verify atomic conditional-write path on S3 *and* GCS *and* Azure (SDK vs opendal); per-backend conformance test. §12
 - **D-6** *(elaborated below, §18)* Pick concrete defaults for `lease_duration` / `renewal_interval` against the target failover-time SLA (ties to OQ-OB2 replication-lag SLA). §8.2 / §11
-- **D-7** Decide whether `owner_epoch` is merely advisory or is asserted into Iceberg commit metadata for stronger zombie detection. §5.5
+- **D-7** *(resolved: assert it)* `owner_epoch` is embedded in the Iceberg snapshot summary (`cdc.owner_epoch`) and the commit reload-retry loop rejects a commit when `latest_committed_epoch > my_epoch` — a sink-side fencing token (defense-in-depth atop the metadata-pointer CAS + `_lsn` dedup). §5.5
+- **D-8** *(elaborated below, §19; resolved)* Lease renewal failure taxonomy — distinguish `412` (definitive loss → stop) from transient storage errors (retry within a safety deadline), via a renewer state machine. Adds `cluster.lease_safety_margin` and promotes `lease_renewal_interval ≤ lease_duration / 3` to an enforced rule. §5.3 / §19
+- **D-9** *(elaborated below, §20.1; resolved)* Reconciler ↔ renewer orchestration — split into `ClusterReconciler` (ring only) + per-pipeline `PipelineController` (sole lease-writer, hosts the §19 renewer); event-driven + periodic-resync, idempotent/level-triggered. §8.1 / §13 / §20.1
+- **D-10** *(elaborated below, §20.2; resolved)* Unplanned-takeover storm rate-limiting — `cluster.max_concurrent_takeovers` (default 4) caps concurrent Phase-0 starts (not the cheap waits), with jitter; per-node-global now, per-source-endpoint group noted as future. §20.2
+- **D-11** *(elaborated below, §20.3; resolved)* Flap immunity — suspect nodes stay in the ring (only `dead`/`left` removes); `rebalance_stabilization` applies to all ring additions incl. rejoins; removals act immediately. §8.5 / §20.3
 
 ---
 
@@ -996,3 +1056,302 @@ Two sub-decisions feed back into OQ-OB2: (1) fix the numeric end-to-end lag SLA 
 is grounded, and (2) decide whether **failover-time** carries its own SLA distinct from steady-state
 lag (it usually should — a ~20s recovery blip can be acceptable even under a tight steady-state target
 if consumers tolerate occasional gaps, which the `_lsn` dedup already assumes).
+
+---
+
+## 19. D-8 elaborated — Lease renewal failure taxonomy and the safety deadline
+
+### 19.1 The bug this closes
+
+§5.3's renew rule says: *"If `412` → I have lost the lease … immediately stop the pipeline and do not
+commit. Renewal failure is a hard stop, not a warning."* That single sentence **conflates two
+fundamentally different failure classes**:
+
+- **"The arbiter told me I lost"** — a `412` means a challenger CAS-advanced the lease object. This is
+  a *definitive loss* and must be an immediate hard stop.
+- **"I could not reach the arbiter"** — a timeout, `5xx`, throttle, or connection reset means the
+  lease *status is unknown*, not lost. The holder very likely still owns the lease; it simply could
+  not refresh its proof this round.
+
+Treating the second as a hard stop is wrong in both directions: it needlessly drops a healthy
+holder's pipelines on every transient storage blip, and — acutely — in single-node mode (§10) it
+stops the *only* worker for a 2-second S3 hiccup, manufacturing an outage where none existed. The fix
+is to classify the renew outcome and drive a small state machine off it, bounded by a **safety
+deadline** that preserves the clock-skew-safe guarantee of §5.3.
+
+### 19.2 Renew outcome taxonomy
+
+Outcomes of a renew `PUT leases/<id>.json If-Match: <my_etag>`:
+
+| Outcome | Meaning | Class | Action |
+|---|---|---|---|
+| `200/201` | ETag/generation advanced, still mine | success | `last_renew_local = now()`; store new version → stay **Held** |
+| `412 Precondition Failed` | A challenger CAS-took the lease | **definitive loss** | → **Lost**: signal hard-stop before next commit; no retry |
+| `409 ConditionalRequestConflict` (S3 only) | Concurrent conditional-write contention, *not* a loss | transient/contention | re-`GET`: if holder still me → retry `PUT`; if holder changed → **Lost**. Counts against the deadline |
+| timeout / `5xx` / `503 SlowDown` / `429` / conn-reset / DNS | Arbiter unreachable; status unknown | **transient** | → **Degraded**: retry with jittered backoff until success (→ Held) or the deadline (→ Lost) |
+| `404 Not Found` | Lease object absent (external delete) | ambiguous | → **Lost**, stop; the reconcile loop re-acquires via `If-None-Match:*` (D-8 decision: stop-first, not in-place re-acquire) |
+| `403` / permanent auth | Credentials/permission fault | permanent | → **Lost**, stop **and alert** — operator issue, not lease contention |
+
+The acquire and takeover-evaluation paths (§5.3) are unchanged; this taxonomy governs **renew only**.
+
+### 19.3 The safety deadline (the load-bearing addition)
+
+A holder may continue running and committing **only while it can still prove a valid, unexpired
+lease.** The proof is a successful renew that advances the version. The holder must therefore hard-stop
+by, measured on its **own** clock:
+
+```
+deadline = last_renew_local + lease_duration − guard
+```
+
+where `last_renew_local` is the local timestamp of the holder's last *successful* renew or acquire,
+and `guard = lease_duration × lease_safety_margin` (default `lease_safety_margin = 0.15`; see §19.6).
+
+**Why this is still clock-skew-safe.** Both the holder's `deadline` and the challenger's
+takeover-evaluation wait (§5.3 step 2) are *durations* anchored to the **same physical event**: the
+ETag write at `last_renew_local`. A challenger can only `GET` that version at a real time
+≥ `last_renew_local`, and it waits a full `lease_duration` on *its* clock before CAS-taking. So if the
+holder stops by its local `last_renew_local + lease_duration`, the holder's run-window and the
+challenger's take cannot overlap — modulo clock-*rate* drift (not absolute offset). `guard` absorbs
+that bounded rate drift over one TTL plus the time to actually halt in-flight commits. No node ever
+compares its clock to another's; the protocol depends only on the existing bounded-drift-rate
+assumption from §5.3 / §7.3.
+
+This is the precise relationship the §18.2 invariant `lease_renewal_interval ≤ lease_duration / 3`
+exists to serve: it guarantees the Degraded state has budget for **two** failed renew attempts before
+the deadline. With Balanced defaults (15s / 5s, `guard ≈ 2.25s`): a renew succeeds at `T`, retries
+fire at `T+5` and `T+10`, and the deadline lands at `≈ T+12.75` — room for two transient failures to
+recover before the holder must stop.
+
+### 19.4 The renewer state machine
+
+```
+              ┌────────────────────────── 200 (version advanced) ──────────────────────────┐
+              │                                                                             │
+              ▼                                                                             │
+        ┌──────────┐   renew due        ┌───────────┐   200            ┌──────────┐         │
+        │   HELD   │ ─────────────────► │ RENEWING  │ ───────────────► │   HELD   │ ────────┘
+        └────┬─────┘                    └─────┬─────┘                  └──────────┘
+             │                                │
+             │                                ├─ 412 / 404 / 403 ───────────────► ┌────────┐
+             │                                │                                   │  LOST  │──► hard-stop
+             │                                ├─ transient / 409 ──► ┌──────────┐ └────────┘    (halt worker
+             │                                │                      │ DEGRADED │                 before next
+             │                                │   backoff+jitter ◄───┤ retrying │                 commit)
+             │                                │   retry            ─►└────┬─────┘
+             │                                │                           │ 200 → HELD (reset last_renew_local)
+             │                                │                           │ now() ≥ deadline → LOST
+             │                                │
+   leave/drain (§8.3) ─► RELEASED (CAS delete/tombstone)
+```
+
+- **HELD → RENEWING**: every `lease_renewal_interval`.
+- **RENEWING → HELD**: `200`; reset `last_renew_local`, store the new version token, clear any Degraded
+  backoff.
+- **RENEWING → LOST**: `412` (taken), `404` (deleted), `403`/permanent (operator fault). Lost is
+  terminal for this ownership; the per-pipeline renewer signals the `PipelineWorker` to halt (via the
+  `tokio::sync::watch` / cancellation token already in §13) *before* its next Iceberg commit, then the
+  reconcile loop (§8.1) re-evaluates ownership.
+- **RENEWING → DEGRADED**: transient error or S3 `409`. Retry with jittered exponential backoff capped
+  well below `lease_renewal_interval` (so multiple attempts fit each interval).
+- **DEGRADED → HELD**: any retry succeeds.
+- **DEGRADED → LOST**: `now() ≥ deadline` reached without a successful renew. This is the *only* path
+  where "couldn't reach storage" becomes a stop — and only after the full safety budget is spent.
+
+### 19.5 Commit gating (D-8 decision #3)
+
+The owner's pipeline gates each Iceberg commit on a cheap local check at **commit-start**:
+
+```
+may_commit := renewer_state ∈ {HELD, DEGRADED} ∧ now() < deadline
+```
+
+We deliberately do **not** estimate commit duration to decide whether a commit "will finish in time."
+A commit that begins just under the deadline and slips past it is caught by the **Iceberg atomic
+commit fence** (§5.5): the new owner has already advanced the table metadata, so the zombie's commit
+conflicts and fails. Gate at start, let the fence backstop the slip. This keeps the gate to a single
+comparison on the hot path and avoids a fragile duration model. The pre-commit lease re-check of §5.5
+remains, but it is now understood as *"is the renewer still within its deadline?"* — answerable from
+local state without a synchronous `GET` on every commit (the renewer's background cadence already
+maintains the proof).
+
+### 19.6 Config and validation additions
+
+Extends the §11 table:
+
+| Field | Type | Default | Mutability | Cluster-wide consistent? | Notes |
+|---|---|---|---|---|---|
+| `cluster.lease_safety_margin` | float (0–0.5) | `0.15` | PROC | Recommended equal | Fraction of `lease_duration` reserved as `guard` before the renewal safety deadline (§19.3). Scales with the chosen timing profile rather than being a fixed constant. |
+
+And promotes the previously-advisory ratio to an **enforced** rule (D-8 decision #4), since the
+Degraded retry budget now depends on it:
+
+> **New validation rule (proposed for config spec §13):** `lease_renewal_interval ≤ lease_duration / 3`
+> is a **hard error** (was a "should" in §11 / §18.2). Rationale: the renewal-failure safety deadline
+> (§19.3) relies on the holder getting at least two renew attempts before it must self-stop. A
+> renewal interval above `lease_duration / 3` silently removes that budget and turns a single slow
+> renew into an unnecessary failover. Recommend `lease_safety_margin ∈ [0.05, 0.30]` with a warning
+> outside that band.
+
+(The validation rule lands in `Configuration_Specification.md`, which Oleksii owns — flagged as a
+config-spec follow-up in the gap report, not edited here.)
+
+### 19.7 Single-node and observability
+
+- **Single-node (§10):** the taxonomy makes the §7.2 storage-correlation argument *explicit*. A
+  storage blip shorter than the deadline no longer stops the sole worker (Degraded → recovers → Held);
+  only a sustained outage longer than `lease_duration` stops it — and during such an outage the
+  pipeline cannot commit anyway (storage is the sink), so the stop is harmless, not a regression.
+- **Observability (D-8 decision #5, folds into G-33):** emit
+  - `cdc_lease_state{pipeline}` gauge — `held | degraded | lost` (enum)
+  - `cdc_lease_renew_failures_total{pipeline, class}` counter — `transient | conflict | lost`
+  - `cdc_lease_renew_latency_seconds{pipeline}` histogram
+
+  Degraded is the early-warning signal: operators see storage flapping *before* it escalates to a
+  failover. A rising `transient` count with no `lost` means "storage is wobbling but safety held."
+
+### 19.8 D-8 output
+
+Adopt the renew-outcome taxonomy (§19.2), the safety deadline `deadline = last_renew_local +
+lease_duration − guard` with `guard = lease_duration × lease_safety_margin` (default `0.15`, §19.3),
+and the renewer state machine (§19.4). Gate commits at start on `state ∈ {HELD, DEGRADED} ∧ now() <
+deadline`, with the Iceberg CAS fence as the slip backstop (§19.5). Add `cluster.lease_safety_margin`
+(§19.6) and promote `lease_renewal_interval ≤ lease_duration / 3` to an enforced config-validation
+rule. Tighten the §5.3 renew rule to reference this section. The §13 implementation sketch's
+per-pipeline renewer owns this state machine and the `watch`/cancellation signal into the
+`PipelineWorker`.
+
+---
+
+## 20. D-9 / D-10 / D-11 elaborated — reconciler robustness, takeover rate-limiting, flap immunity
+
+These three close the remaining clustering correctness sub-gaps surfaced while reading §8/§13 as the
+implementation contract. They are independent but share a refactor: the single reconcile loop of §8.1
+becomes a **cluster reconciler + a per-pipeline controller**, which is the natural home for the lease
+renewer (§19), the takeover cap (D-10), and the flap rules (D-11).
+
+### 20.1 D-9 — per-pipeline controller model (reconciler ↔ renewer orchestration)
+
+**The gap.** §8.1 sketches one periodic loop that, per pipeline, calls `ensure_lease_held` — which can
+**block a full `lease_duration`** inside takeover-evaluation (§5.3) — and `ensure_running`. A single
+loop doing that inline stalls every *other* pipeline behind the one being taken over. Separately, §13
+lists per-pipeline renewer tasks, but the boundary between "the loop" and "the renewer" — and who is
+allowed to write the lease — is never drawn.
+
+**The model.** Split responsibilities into two layers:
+
+- **`ClusterReconciler` (one per node)** owns *only the ring*. On a membership change, a config-
+  generation advance, or a periodic resync tick, it recomputes `ring_owner(P)` for every pipeline and
+  pushes each pipeline's **target** (`Own` / `DontOwn`) to that pipeline's controller. It **never reads
+  or writes a lease**. It is cheap, non-blocking, and purely a function of membership + config.
+- **`PipelineController` (one task/actor per pipeline)** owns the full per-pipeline lifecycle and is the
+  **sole writer of that pipeline's lease object.** It runs this state machine:
+
+  ```
+  Unowned ──target=Own──► Acquiring ──CAS ok──► Owned(running) ──target=DontOwn──► Releasing ──► Unowned
+     ▲                       │  (acquire §5.3 / takeover-evaluate, may wait lease_duration)
+     │                       │
+     └───────────────────────┴── target=DontOwn before acquire ─► Unowned (abandon)
+                                                       Owned ──renew 412/404/403 (§19)──► Lost ─► Unowned
+  ```
+
+  The lease **renewer** (the §19 `Held/Renewing/Degraded/Lost` machine) lives *inside* the controller's
+  `Owned` state. The (possibly long) takeover-evaluation wait happens inside the controller's own task,
+  so it never blocks peers.
+
+**Why this resolves the orchestration race.** The lease has exactly **one writer per pipeline at a
+time — the controller in `Acquiring`/`Owned`.** The `ClusterReconciler` only ever *advises* (pushes a
+target); it cannot race the renewer because it never PUTs a lease. `ensure_lease_held` / `ensure_running`
+from §8.1 are now *internal controller transitions*, not loop-body calls.
+
+**Trigger model — level-triggered + event-driven.** Following the Kubernetes-controller pattern: the
+reconciler acts on **events** (membership change, config generation advance) for low-latency reaction,
+**and** runs a **periodic resync** (cadence ≈ `lease_renewal_interval`) that re-pushes targets
+unconditionally as a safety backstop against missed events. Controllers are **idempotent / level-
+triggered**: re-receiving `Own` while already `Owned(running)` is a no-op. This is what makes the
+at-most-one / at-least-one reasoning (§5.4) hold under dropped or reordered events — convergence does
+not depend on seeing every edge.
+
+§8.1's pseudocode remains a correct *description of the desired state*; §20.1 specifies *how it is
+executed* without head-of-line blocking. §13's `Reconciler` + `LeaseManager` boxes are refined into
+`ClusterReconciler` (ring only) + N × `PipelineController` (lease + worker + renewer).
+
+### 20.2 D-10 — unplanned-takeover storm rate-limiting
+
+**The gap.** `cluster.max_concurrent_handoffs` (§8.5, default 2) caps only **planned drains**. On an
+**unplanned death** of a node holding many pipelines, every survivor that becomes ring-owner starts
+takeover + Phase-0 (source reconnect, state read, resume) at once — a reconnect/state-read burst
+against the source DBs and object storage exactly when the system is already perturbed. In a small
+cluster the ring concentrates the dead node's pipelines onto few survivors, amplifying the burst.
+
+**The mechanism.** Add a per-node cap, `cluster.max_concurrent_takeovers` (default `4`), that gates
+**concurrent Phase-0 starts** on the unplanned path — i.e. how many pipelines a node will simultaneously
+*bring into running* (reconnect + resume). It deliberately does **not** gate the takeover-evaluation
+*wait*: that wait is a local timer plus two `GET`s (§5.3), is cheap, and may run for all pending
+pipelines in parallel so that none of their safety clocks are delayed. Only the expensive, load-bearing
+Phase-0 start is queued behind the cap. Add small randomized **jitter** to each Phase-0 start to
+de-synchronize reconnect bursts even within the cap.
+
+**Scope and trade-off.** The cap is **per-node-global** for now; the sharper risk — many pipelines
+sharing one source endpoint reconnecting together — is noted as a future **per-source-endpoint**
+concurrency group (analogous to a bulkhead). The cap trades failover *latency* for source-DB
+*protection*: the `(owned − cap)` pipelines recover in waves, so a node taking over many pipelines at
+once has a longer tail. Default `4` (> `max_concurrent_handoffs = 2`) reflects that takeover is the
+urgent, unplanned path and should drain its queue faster than a planned rebalance, while still capping
+the burst. This is a tuning knob, not a safety boundary — the lease still guarantees at-most-one
+regardless of the cap.
+
+### 20.3 D-11 — flap immunity (suspect-stays-in-ring + symmetric stabilization)
+
+**The gap.** `cluster.rebalance_stabilization` (§8.5) was specified for *first-time joins* only. Two
+membership perturbations were unhandled: a node going `suspect` (a transient blip / brief GC), and a
+previously-`dead` node **rejoining**. Both change the derived ring and can cause drain→reverse churn.
+
+**The rules.**
+
+| Membership transition | Ring effect | Timing |
+|---|---|---|
+| node `alive → suspect` | **none — suspect stays in the ring** | n/a (no recompute) |
+| node `suspect → alive` (recovered) | **none** (it never left the ring) | n/a |
+| node `→ dead` / `→ left` | **removed** from ownership computation | **immediate** (urgent; lease-expiry-driven for `dead`, lease-release-driven for `left`) |
+| node joins (new) **or rejoins** (dead→Active) | **added** to ownership computation | **delayed** by `rebalance_stabilization` + `Joining→Active` hysteresis |
+
+- **Suspect nodes remain in the ring** (ring membership = `(alive ∨ suspect) ∧ phase ∈ {Active,
+  Draining}`). This is safe because **safety is the lease, not the ring** (§8.4): a node that is truly
+  dead transitions to `dead` shortly and the lease-expiry takeover (§8.2) handles it; a node that
+  recovers caused **zero** ring churn. A suspect node also keeps renewing its own lease, so any peer's
+  speculative takeover-evaluation sees the ETag advancing and backs off. This is the direct payoff of
+  the §3.6 / §8.4 "SWIM accuracy is a latency concern, not a safety concern" stance.
+- **Symmetric stabilization:** ring *removals* act **immediately** (the dead-node failover path must
+  not be delayed — it is driven by lease expiry, its own timer); ring *additions* — **both** new joins
+  **and rejoins** of a returning node — wait out `rebalance_stabilization` before proactive rebalancing
+  moves any pipeline, and the added node passes `Joining → Active` before it can own anything. A
+  flapping node therefore never repeatedly grabs-and-drops pipelines, and a transient suspicion never
+  triggers a handoff at all.
+
+This removes the asymmetry hole in §8.5 without new config: it is a precise statement of *which*
+membership transitions perturb the ring and how fast the system reacts to each.
+
+### 20.4 Configuration additions
+
+Extends the §11 table:
+
+| Field | Type | Default | Mutability | Cluster-wide consistent? | Notes |
+|---|---|---|---|---|---|
+| `cluster.max_concurrent_takeovers` | integer | `4` | R | No | Cap on simultaneous **Phase-0 starts** on the unplanned-takeover path, per node (§20.2). Gates the expensive resume, not the cheap takeover-evaluation wait. Tuning knob, not a safety boundary. |
+
+> **Config-spec follow-up (proposed, not applied — Oleksii owns the spec):** add
+> `cluster.max_concurrent_takeovers` to `Configuration_Specification.md` §6.5 / §16 with validation
+> `≥ 1` (and the existing `max_concurrent_handoffs` ≥ 1 pattern). No cluster-wide-consistency
+> requirement (it is a local resource knob).
+
+### 20.5 Output
+
+Adopt the **`ClusterReconciler` + per-pipeline `PipelineController`** split (D-9): the reconciler owns
+the ring and pushes targets; each controller owns its pipeline's lifecycle and is the sole lease-writer,
+with the §19 renewer living in its `Owned` state; triggering is event-driven with a periodic resync,
+and controllers are idempotent/level-triggered. Add `cluster.max_concurrent_takeovers` (default 4) to
+cap concurrent Phase-0 starts on the unplanned path, with jitter, per-node-global scope, and a future
+per-source-endpoint group noted (D-10). Keep **suspect nodes in the ring** (only `dead`/`left` removes
+a node) and apply `rebalance_stabilization` to **all ring additions including rejoins**, while ring
+removals act immediately (D-11). Refine §8.1 and §13 to reference this section.
