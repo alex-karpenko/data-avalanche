@@ -89,7 +89,9 @@ delete-file + data compaction (the MOR-critical, writer-coupled part), keep expi
 - **Reserved:** `sink.maintenance` block (§16 list) — not active in v1.
 - **Metrics:** the §3 signals added to the G-33 catalogue.
 - **Research item (§14):** verify iceberg-rust compaction/rewrite API availability against the pinned
-  version; it gates any built-in maintenance.
+  version; it gates any built-in maintenance. Tracked as capability gate 🧪 DA-SINK-10
+  (`CDC_Design_Gap_Analysis_v1.md` §24.6) — **deferred, no v1 impact** since v1 maintenance is external;
+  fold the API-surface check into the `prototypes/iceberg-capability/` probe.
 - **Doc edits owed (spec, propose-only):** System-Overview to state external-maintenance-for-v1 + the
   exposed signals; operational runbook to include the external maintenance procedures.
 

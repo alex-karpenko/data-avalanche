@@ -103,7 +103,7 @@ does not block starting the specification.
 | 🔄 Partial | small | Decided but with an open sub-item. |
 | 🟥 Open | ~12 items | §20 register. |
 | 🧪 Verify | 6 gates | §21. |
-| 🟢 Spec-merge debt | ~30 edits owed (16 config + 9 data-flow + 6 overview) | §19. |
+| 🟢 Spec-merge debt | ~22 owed (16 config + 6 overview); **9 data-flow applied 2026-06-20** | §19. |
 
 ---
 
@@ -510,6 +510,11 @@ applied without instruction.
 
 ### 19.2 `Data-Flow.md` (the most-drifted spec)
 
+> **APPLIED 2026-06-20.** All nine landed: DF-1/DF-2/DF-4/DF-5/DF-7/DF-8/DF-9 as edits, DF-3 subsumed by
+> DF-1, DF-6 was already correct in `Data-Flow.md` (its residual is a stale note in config §10). Patch
+> record: git history (commit on 2026-06-20). The DA-FLOW-2/4/7 and DA-X-1/3 items above are now
+> reflected in the spec.
+
 | # | Edit | Source |
 |---|---|---|
 | DF-1 | Rewrite **Phase 1** from blocking COPY/EXPORT_SNAPSHOT to the stream-first incremental chunk loop (watermarks + PK-upsert reconciliation). | Snapshot §1 |
@@ -581,6 +586,10 @@ sequencing, snapshot-summary persistence, schema-evolution ops, and the uuid ann
 pinned version) would close five of these six at once. The storage-CAS conformance suite closes the
 sixth (and the top blocker).
 
+> **Each gate is elaborated in §24 (Appendix A)** — mechanism, exact claim to prove, verification
+> plan with pass/fail criteria, design fallback, and redesign-risk impact. §24.0 triages which gates
+> can force a redesign (only DA-CLUS-1 and DA-SINK-1) versus which degrade gracefully.
+
 ---
 
 ## 22. Spec-readiness assessment
@@ -644,6 +653,268 @@ legacy blockers and their current status here: `G-8`→DA-CLUS-2 ✅, `G-9`→DA
 `D-6`→DA-CLUS-11 ✅. The legacy "remaining blockers" list (D-5, D-6, G-13/G-30, G-14, G-6, G-11, G-15,
 G-16, G-NEW-20/21/22) is now **all resolved on paper except D-5 (DA-CLUS-1)** — plus the newly-explicit
 crate gate DA-SINK-1, which the legacy report folded into G-13's implementation note.
+
+---
+
+## 24. Appendix A — Blocker & capability-gate deep-dive (verification + fallback)
+
+This appendix elaborates the six items in §21 that cannot be closed on paper. For each: the
+**mechanism** it underpins, the **exact claim** that must be true, a concrete **verification plan**
+(harness + pass/fail), the **design fallback** if it proves false, and the **redesign-risk impact**.
+
+### 24.0 Triage — only two of the six can force a redesign
+
+The six gates are not equal. Two of them, if they fail, invalidate a core design choice and force a
+different architecture (🔴). The other four have a benign fallback that is *already part of the
+agreed design*, so a negative result degrades a feature or a defense layer without reopening a
+decision (🧪).
+
+| Gate | DA-ID | If it fails… | Redesign? |
+|---|---|---|---|
+| Storage CAS conformance | DA-CLUS-1 | the storage lease is unsafe (esp. silent on GCS) | **Yes → native-SDK lease path** 🔴 |
+| Equality-delete sequencing | DA-SINK-1 | the MOR ghost-row guarantee breaks | **Yes → position-delete or COW writer** 🔴 |
+| Snapshot-summary persistence | DA-SINK-2 | lose the sink-side fence + dedup optimization | No — idempotency is correctness; fence is defense-in-depth 🧪 |
+| Schema-evolution ops | DA-SCHEMA-8 | unsupported op can't auto-apply | No — halt-the-table is already the safety branch 🧪 |
+| uuid annotation | DA-TYPE-5 | uuid stored as `fixed(16)`/`string` | No — cosmetic logical-type loss 🧪 |
+| Compaction API | DA-SINK-10 | no built-in maintenance | No — external maintenance is the v1 plan 🧪 |
+
+The practical consequence: **focus verification effort on DA-CLUS-1 and DA-SINK-1.** The other four
+are worth a single confirmatory test each, but their failure paths are already designed.
+
+---
+
+### 24.1 DA-CLUS-1 — Atomic compare-and-swap conformance on S3 / GCS / Azure 🔴
+
+**Mechanism.** The entire single-writer safety guarantee (`Clustering…` §5) is a per-pipeline lease
+object mutated only by atomic compare-and-swap. Everything reduces to three operations on one object:
+**acquire** = create-if-absent, **renew/takeover** = swap-if-version-matches, **release** =
+conditional delete.
+
+**Exact claim (per backend).**
+
+| Backend | Create-if-absent | CAS update | Version token | Conflict code |
+|---|---|---|---|---|
+| S3 | `If-None-Match: *` | `If-Match: <etag>` | **ETag** | 412 (sometimes 409 `ConditionalRequestConflict` → retry) |
+| GCS | `x-goog-if-generation-match: 0` | `x-goog-if-generation-match: <generation>` | **generation (int64), NOT ETag** | 412 |
+| Azure Blob | `If-None-Match: *` | `If-Match: <etag>` | **ETag** | 412 |
+
+The load-bearing risk is the **GCS trap**: GCS honors ETag-match only on *reads*; object-modifying
+writes must use the **generation** precondition. An abstraction that feeds the GCS read-ETag into a
+"write if-match" silently performs **no CAS** and breaks single-writer on GCS with no error.
+
+**Verification plan.** The `LeaseStore` trait + the T1–T10 conformance suite already scaffolded at
+`prototypes/lease-conformance/`:
+
+- T1–T3, T6–T8: functional acquire/swap/release happy paths (emulators OK: MinIO / fake-gcs-server / Azurite).
+- **T4** swap-with-stale-version → Conflict, and **T5** N concurrent swaps on the same version →
+  exactly one Ok — these two *prove* "at most one writer."
+- **T9** S3 `409 ConditionalRequestConflict` surfaces as a retryable Conflict (not a hard error).
+- **T10** the token fed back into `swap` on GCS is the **generation**, not the read ETag — the gating
+  assertion for the trap.
+- Startup guard: assert `op.info().full_capability()` advertises `write_with_if_none_match`,
+  `write_with_if_match`, `delete_with_if_match`; **refuse to start** if a backend build lacks them.
+
+**Pass/fail.** T4, T5, T10 **must pass against the real services** (not just emulators — emulators
+implement preconditions loosely). T10 failing means the OpenDAL→GCS mapping is wrong and the storage
+lease is unsafe on GCS. Pin OpenDAL ≥ the release where `if_match`-on-writes landed (late-2024 /
+early-2025).
+
+**Fallback.** The `LeaseStore` trait already isolates this. If OpenDAL lacks a capability or mis-maps a
+backend, **drop that backend to its native SDK** behind the same trait (Route B, `Clustering…` §17.3):
+`aws-sdk-s3` (`if_none_match`/`if_match`), the GCS SDK (`if_generation_match`), `azure_storage_blob`
+(`If-None-Match`/`If-Match`). This is a per-backend escape hatch, not a redesign of the lease protocol.
+The protocol itself (acquire/renew/takeover, §5.3) is unchanged. The optional `kubernetes` lock_backend
+(D-2) remains a separate future `LeaseStore` impl for k8s.
+
+**Impact.** 🔴 because a *silent* failure on GCS would corrupt single-owner safety in production. But
+the cost of the fallback is bounded (native SDK for one backend), so it is a "must verify," not a
+"design may collapse." Status: **open-until-executed against real S3, GCS and Azure.**
+
+---
+
+### 24.2 DA-SINK-1 — Equality-delete files carry the enclosing commit's sequence number 🔴
+
+**Mechanism.** An Iceberg equality delete applies **only to data files whose data-sequence-number is
+strictly less than the delete file's** (`Ghost_Row…` §0). This one property makes the in-batch upsert
+correct: a "delete old key + insert new key" written in the *same* commit shares one sequence number,
+so the delete purges every **prior-commit** version of the key while sparing the **same-commit**
+insert. If the writer mis-sequences — gives the same-commit insert a lower sequence than its delete —
+the row that must survive is purged, or (the documented ghost-row bug) a row that must disappear
+survives forever.
+
+**Exact claim.** iceberg-rust 0.9.0's equality-delete writer assigns delete files **the enclosing
+commit's data-sequence-number** (equal to the data files committed in the same transaction), and the
+strictly-less-than rule holds on read.
+
+**Verification plan.** A focused integration test against the *pinned* crate:
+
+1. Create a MOR table with `identifier-field-ids` set.
+2. Commit C1: insert key `K=1` (data seq `s1`).
+3. Commit C2 (single transaction): equality-delete `K=1` **and** insert `K=1` with a new image.
+4. **Assert (read):** the table shows exactly the C2 image of `K=1` — the same-commit delete did **not**
+   remove the same-commit insert, and it **did** remove C1's version.
+5. **Assert (metadata):** the C2 delete file's sequence number equals C2's data sequence number.
+6. **Cross-read with a mature engine** (Spark or Trino Iceberg) to confirm the on-disk result, not just
+   iceberg-rust's own reader — the two must agree.
+7. Ordering test: insert/delete of the same key spread across three commits resolves to the last op.
+
+Suggested home: a new `prototypes/iceberg-capability/` test crate, pinned to the exact iceberg-rust
+version, parallel to `prototypes/lease-conformance/`.
+
+**Pass/fail.** Step 4 + step 6 are the gate. If the same-commit insert is purged, or a Spark read
+disagrees with iceberg-rust's, the equality-delete path is unusable as designed.
+
+**Fallback (in priority order).**
+
+1. **Position deletes after a read.** For each affected key, read the data file(s), compute row
+   positions, write position-delete files. Correct, but adds a read per affected file and is
+   partition-scoped — materially costlier on write, and changes the §4 collapse contract.
+2. **COW for affected tables.** Read-modify-rewrite whole data files (`Ghost_Row…` §5 already notes COW
+   carries the same identifier rules). Highest write cost; reserved as the heavy fallback.
+3. **Manual sequence assignment** if the crate exposes per-file sequence control — keep equality
+   deletes but set the sequence explicitly.
+4. **Pin/upgrade or contribute upstream** to a crate version that sequences correctly.
+
+**Impact.** 🔴 and the single most consequential sink gate: a failure cascades into `Ghost_Row…`
+(keying/collapse), `Iceberg_Partitioning…` (before-image partition routing of deletes),
+`Iceberg_Maintenance…` (delete-file compaction), and `Delivery…` (the per-table guard rides the same
+writer). All of those assume equality deletes work. The position-delete fallback keeps correctness but
+is a real writer redesign — hence verify **before** the sink writer is specified in detail.
+
+---
+
+### 24.3 DA-SINK-2 — Custom `cdc.*` snapshot-summary properties persist across commits 🧪
+
+**Mechanism.** Two orthogonal sink-side mechanisms live in the Iceberg snapshot summary string map:
+`cdc.owner_epoch` (the clustering zombie-fence, D-7) and `cdc.committed_position` (the delivery
+guard / per-table durable HWM, D-14.4). On each commit the writer reads the latest snapshot's summary,
+checks `latest_committed_epoch`/`committed_position`, and writes the updated values into the new
+snapshot's summary. Iceberg snapshot summaries are **per-snapshot**, so the writer must *re-assert*
+these on every commit (they are not auto-inherited).
+
+**Exact claim.** iceberg-rust lets the writer (a) read the latest snapshot's summary before committing
+and (b) set arbitrary string properties on the snapshot it creates, atomically with the data commit.
+
+**Verification plan.** In `prototypes/iceberg-capability/`:
+
+1. Commit with `cdc.owner_epoch="5"`, `cdc.committed_position="0/1A2B3C4"`; read them back from the
+   snapshot summary.
+2. Commit again with `owner_epoch="6"`; assert the monotonic read (`latest > mine → abort`) is
+   answerable from the summary.
+3. Confirm a commit that does **not** set the property does not silently strand the running value —
+   i.e. the writer can read the prior summary and carry it forward (since summaries don't inherit).
+
+**Pass/fail.** If custom summary properties are dropped or unreadable across commits, the in-summary
+fence/guard has no carrier.
+
+**Fallback.**
+
+1. **Iceberg table properties** instead of the snapshot summary — but confirm the property update
+   commits **atomically with the data files** (it must be the same metadata commit to be a real fence,
+   not a separate write).
+2. **Drop `owner_epoch` to advisory.** The design already states it is **defense-in-depth, not a
+   correctness prerequisite** (`Clustering…` §5.5): the metadata-pointer CAS (layer 2) + `_lsn`/PK-upsert
+   idempotency (layer 4) preserve correctness without it. Losing the sink-side fence only re-widens the
+   rare "zombie commits in the gap before the new owner's first commit" window, which idempotency
+   absorbs.
+3. **Move `committed_position` to per-table state storage** (the per-pipeline `state` location) instead
+   of the snapshot summary. Since `Delivery…` §1 demotes the guard to an *optimization* (idempotency is
+   the correctness basis, D-14.3), a state-storage HWM is a fully adequate home; the only loss is reading
+   the durable position straight from the table.
+
+**Impact.** 🧪 not 🔴 — correctness is anchored in idempotency, so every fallback degrades a defense
+layer or an optimization, never a guarantee.
+
+---
+
+### 24.4 DA-SCHEMA-8 — iceberg-rust supports drop / rename / type-promotion transactions 🧪
+
+**Mechanism.** The safe-evolution set (`Schema_Change…` §7.1) is `add_column` (mature), plus
+`drop_column`, `rename_column`, and type-promotion (`int→long`, `float→double`, `decimal` precision
+widen). Rename correctness rests on Iceberg's **field-ID stability** (a rename keeps the field ID and
+all history).
+
+**Exact claim.** The pinned crate's table-transaction API exposes `drop_column`, `rename_column`, and
+`update_column` (promotion), committing them as metadata-only ops with field IDs preserved on rename.
+
+**Verification plan.** In `prototypes/iceberg-capability/`: apply each op to a table; assert (a) rename
+preserves the field ID (write under the old name, rename, read history under the new name), and (b)
+promotion is metadata-only (no data rewrite). 
+
+**Fallback.** Already the agreed safety branch (`Schema_Change…` §7.1 implementation note): **route any
+unsupported op into the "halt table" branch** until the crate catches up. A halted table surfaces an
+error + metric; the operator re-snapshots into a fresh table if needed. Rename specifically degrades to
+the documented `drop+add` + warning (history NULL under the new name) when `rename_column` is
+unavailable.
+
+**Impact.** 🧪 — the fallback is the existing design's fail-safe; no redesign.
+
+---
+
+### 24.5 DA-TYPE-5 — `FixedSizeBinary(16)` → Iceberg `uuid` annotation 🧪
+
+**Mechanism.** iceberg-rust auto-maps most Arrow types, but `FixedSizeBinary(16)` is ambiguous between
+`uuid` and `fixed(16)` and needs an explicit field-level hint (`{"iceberg.type":"uuid"}` or
+`IcebergType::Uuid` in the schema builder) — `Type_Mapping.md` Hop-3.
+
+**Exact claim.** The pinned crate honors a field-level annotation that forces `FixedSizeBinary(16)` →
+Iceberg `uuid`.
+
+**Verification plan.** Build a schema with a uuid column using the hint; assert the resulting Iceberg
+field type is `uuid` (not `fixed(16)`); round-trip a value through write + read.
+
+**Fallback.** Store uuid as `fixed(16)` (raw 16 bytes, data fully intact, downstream loses only the
+`uuid` logical type) or as canonical `string` (text uuid, human-readable, slightly larger). Both are
+lossless of *data*; only the logical type annotation is lost.
+
+**Impact.** 🧪, cosmetic — purely a downstream logical-type nicety.
+
+---
+
+### 24.6 DA-SINK-10 — Compaction / rewrite API availability 🧪 (deferred)
+
+**Mechanism.** Built-in maintenance (delete-file compaction, data-file compaction, expire snapshots,
+orphan removal) needs iceberg-rust rewrite APIs. v1 maintenance is **external** (Spark/Trino), so this
+gate only affects a *future* built-in scheduler (`sink.maintenance`, reserved & disabled in v1).
+
+**Exact claim.** A future crate version exposes `rewrite_data_files` / `rewrite_position_delete_files` /
+`expire_snapshots` equivalents.
+
+**Verification plan.** Periodically re-check the crate's API surface; only build `sink.maintenance` once
+available, starting with the MOR-critical delete-file + data compaction (the hybrid first step,
+`Iceberg_Maintenance…` §4).
+
+**Fallback.** External maintenance — already the v1 plan. The app's only obligation is to never assume
+maintenance has run (planning/writes tolerate deep delete stacks and many small files) and to emit the
+when-needed signals (`cdc_iceberg_delete_files`, etc.).
+
+**Impact.** 🧪 and deferred — **no v1 impact.**
+
+---
+
+### 24.7 Consolidated execution plan
+
+All six gates close with **two prototypes**, both pinned to the exact dependency versions:
+
+1. **`prototypes/lease-conformance/`** (exists, scaffolded) — the T1–T10 storage-CAS suite → closes
+   **DA-CLUS-1**. Gate: T4/T5/T10 against **real** S3, GCS, Azure.
+2. **`prototypes/iceberg-capability/`** (recommended new) — one integration test binary pinned to
+   iceberg-rust 0.9.0, exercising: equality-delete same-commit sequencing + Spark/Trino cross-read
+   (**DA-SINK-1**), custom snapshot-summary round-trip (**DA-SINK-2**), drop/rename/promote with
+   field-ID preservation (**DA-SCHEMA-8**), and the uuid annotation (**DA-TYPE-5**). DA-SINK-10 is a
+   passive API-surface check in the same crate, deferred.
+
+**Recommended sequencing for spec elaboration.** Run both prototypes early. DA-CLUS-1 and DA-SINK-1 are
+the only two whose failure changes the architecture (native-SDK lease; position-delete/COW writer), so
+they gate the **lease** and **sink-writer** portions of the application spec respectively. The other
+four can be written against the assumed capability with the documented fallback noted inline, because
+their failure paths (halt, cosmetic, defer, advisory) are already part of the design.
+
+**Config/spec follow-ups owed (propose-only):** add a startup assertion requirement —
+*the worker asserts the storage-CAS capabilities (DA-CLUS-1) and the iceberg-rust capability set
+(DA-SINK-1/2, DA-SCHEMA-8) at boot and refuses to start if a required capability is absent* — to
+`System-Overview.md` (operational preconditions) and reference it from `Configuration_Specification.md`
+§11.2. This makes a missing capability a fail-fast at startup rather than a first-write surprise.
 
 
 

@@ -1,5 +1,5 @@
 ---
-updated: 2026-06-08
+updated: 2026-06-20
 domain: Data Types
 tags: [data-types, mapping, arrow, iceberg, postgres, mysql, cdc]
 resolves: G-18
@@ -329,6 +329,13 @@ Non-obvious mappings that need explicit annotation in the `SchemaBuilder`:
 | `Struct(fields)` | `struct(fields)` | No |
 | `UInt8`, `UInt16`, `UInt32`, `UInt64` | **not directly supported** | Always pre-convert to signed or `Decimal128` before building the Arrow schema; never pass unsigned Arrow types to iceberg-rust |
 | `Int8` (from PG `"char"`) | `int` | No — iceberg `int` is 32-bit, Int8 widens automatically |
+
+**Capability gate + fallback (🧪 DA-TYPE-5, `CDC_Design_Gap_Analysis_v1.md` §24.5).** The
+`FixedSizeBinary(16) → uuid` mapping is the one entry that needs an explicit annotation; verify the
+field-level hint mechanism (`{"iceberg.type":"uuid"}` / `IcebergType::Uuid`) exists in the pinned
+iceberg-rust version (fold into the `prototypes/iceberg-capability/` probe). **If the annotation is
+unavailable**, fall back to `fixed(16)` (raw bytes, data intact, only the `uuid` logical type lost) or
+canonical `string` (text uuid) — both lossless of data; the impact is cosmetic.
 
 ---
 

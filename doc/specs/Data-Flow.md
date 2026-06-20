@@ -1,5 +1,5 @@
 ---
-updated: 2026-06-06
+updated: 2026-06-20
 domain: Architecture
 tags: [architecture, data-flow, pipeline, cdc, iceberg, arrow, snapshot, replication]
 sources: []
@@ -73,67 +73,47 @@ Each time table set changes against current publication set, publication should 
 
 ---
 
-## Phase 1a — Snapshot: PostgreSQL
+## Phase 1 — Snapshot (incremental chunked, stream-first)
+
+Snapshot does **not** block the stream or hold a long transaction. Streaming is established first and
+runs throughout; each table is captured in keyset **chunks** interleaved with the live stream and
+reconciled by **position watermarks + PK-upsert idempotency**. The order is **stream-first,
+snapshot-concurrent**. This supersedes the earlier blocking `EXPORT_SNAPSHOT` / `FLUSH TABLES WITH
+READ LOCK` model (which could not resume mid-table — an exported snapshot dies with the worker). See
+`research/Snapshot_Resumability_and_Consistency.md` (closes G-6/G-7/G-20).
 
 ```
-Worker connection (regular)
-│
-├─► CREATE_REPLICATION_SLOT slot LOGICAL pgoutput (snapshot='EXPORT_SNAPSHOT')
-│   Returns: (slot_name, snapshot_name, start_lsn)
-│   ─ persist slot_name and start_lsn to state storage
-│
-└─► For each table in resolved table set:
-    │
-    ├─► Open new connection
-    ├─► BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ
-    ├─► SET TRANSACTION SNAPSHOT '<snapshot_name>'
-    │
-    ├─► COPY schema.table TO STDOUT (BINARY)
-    │   │
-    │   └─► rows → CdcEvent { op: Snapshot, after: Row, lsn: start_lsn, ... }
-    │        │
-    │        └─► mpsc ──► Batch Accumulator
-    │
-    ├─► Checkpoint per-table cursor to state storage after each page
-    │   (enables resume on crash without full re-scan)
-    │
-    └─► Checkpoint snapshot_status = completed for this table
+1. Establish the stream:
+   PG    — CREATE_REPLICATION_SLOT slot LOGICAL pgoutput; capture start_lsn (WAL retention begins);
+           persist slot_name + start_lsn; stream from start_lsn.
+   MySQL — position the binlog stream at gtid_executed (COM_BINLOG_DUMP_GTID); stream immediately.
+
+2. Per table, ordered by the G-13 identifier — chunk loop:
+   a. lw  = current stream position            (pg_current_wal_lsn() / @@gtid_executed; read-only)
+   b. read chunk: SELECT ... WHERE (key) > (cursor) ORDER BY (key) LIMIT chunk_size
+                  in a SHORT read-committed txn; buffer the rows
+                  rows → CdcEvent { op: Snapshot (_op = r), after: Row, ... }
+   c. hw  = current stream position
+   d. reconcile: as the stream is consumed lw→hw, any streamed change whose identifier is in the
+                 buffered chunk REMOVES that key from the buffer (the live change supersedes the
+                 snapshot read). After hw, emit the surviving buffered rows as snapshot inserts.
+   e. checkpoint the cursor (last row's identifier tuple) to state storage.
+
+3. Last chunk done ⇒ table fully captured (snapshot_status = completed); streaming simply continues.
 ```
 
-The `start_lsn` captured with the slot is the safe resume point: after all tables are snapshotted, streaming begins from `start_lsn`. The exported snapshot ensures the SELECT sees exactly the data that existed at `start_lsn` — no gap, no overlap.
+**Consistency is convergent, not a frozen instant.** Every table is PK-keyed and written as an upsert
+with keep-last-by-`_seq` (G-13), so a snapshot row that races a concurrent change converges (the
+streamed change carries the higher `_seq` and wins). **No global read lock, no long-held transaction,
+no `EXPORT_SNAPSHOT`/`FLUSH TABLES`** — the snapshot needs only `SELECT` plus the existing replication
+privileges (MySQL `RELOAD`/`LOCK TABLES` are no longer required).
 
----
-
-## Phase 1b — Snapshot: MySQL
-
-```
-Worker connection (regular, SUPER privilege or REPLICATION CLIENT)
-│
-├─► FLUSH TABLES WITH READ LOCK  (MySQL < 8.0)
-│   or: START TRANSACTION WITH CONSISTENT SNAPSHOT (MySQL 8.0+)
-│
-├─► SELECT @@GLOBAL.gtid_executed → snapshot_gtid_set
-│   ─ persist snapshot_gtid_set to state storage
-│
-├─► UNLOCK TABLES
-│
-└─► For each table in resolved table set:
-    │
-    ├─► Open new connection
-    ├─► START TRANSACTION WITH CONSISTENT SNAPSHOT
-    │
-    ├─► SELECT * FROM schema.table  (with LIMIT/OFFSET cursor or keyset pagination)
-    │   │
-    │   └─► rows → CdcEvent { op: Snapshot, after: Row, lsn: snapshot_gtid_set, ... }
-    │        │
-    │        └─► mpsc ──► Batch Accumulator
-    │
-    ├─► Checkpoint per-table cursor after each page
-    │
-    └─► Checkpoint snapshot_status = completed for this table
-```
-
-After all tables are snapshotted, streaming starts with `COM_BINLOG_DUMP_GTID` passing `snapshot_gtid_set` as the already-executed set — MySQL streams only transactions not in that set.
+**Cursor & resume.** The resume cursor is a typed identifier tuple; pagination is a row-value
+comparison `WHERE (c1,…) > (v1,…) ORDER BY c1,… LIMIT chunk_size`, with ordering pinned to a **binary
+collation** (`COLLATE "C"` / `utf8mb4_bin`) recorded in the cursor. Crash resume reopens from the
+checkpointed cursor; re-reading the in-flight chunk is harmless (upsert idempotency).
+`snapshot.chunk_size` defaults to 10000 (checkpoint per chunk). `parallelism` assigns disjoint tables
+to parallel workers; keyset order is serial within a table.
 
 ---
 
@@ -224,7 +204,9 @@ CdcEvent {
     table:     TableRef,        // { schema: String, name: String }
     before:    Option<Row>,     // old image: present for Update (if FULL/PK) and Delete
     after:     Option<Row>,     // new image: present for Insert, Update, Snapshot
-    source_pos: SourcePosition, // LSN (PG) or GtidSet (MySQL)
+    source_pos: SourcePosition, // COMMIT position: LSN (PG) or GtidSet (MySQL)
+    change_seq: SourceSeq,      // PER-CHANGE order: PG change-LSN / MySQL (binlog_file,end_log_pos).
+                                // Finer than source_pos; the keep-last key for dedup (Ghost_Row §4).
     xid:       u64,             // transaction ID (xid in PG, seq-no in GTID for MySQL)
     commit_ts: DateTime<Utc>,   // server commit timestamp
 }
@@ -307,6 +289,16 @@ This guarantees atomic transaction visibility in the Iceberg snapshot.
 If schema change was detected during batch accumulation, it forces flush of all data accumulated before change event.
 ```
 
+**Oversized transactions (opt-in split commits).** When `sink.max_transaction_batch_rows` is set and a
+single source transaction exceeds it, the writer flushes **partial-transaction** Iceberg commits
+instead of waiting for the source `COMMIT`, but **pins the durable resume checkpoint at the
+transaction's START** — `cdc.committed_position` does not advance past the txn until its `XID`/commit is
+seen. A crash mid-split replays the whole transaction; already-flushed slices re-write as idempotent
+upserts (no loss, no duplicate). Default `null` = unlimited = strict atomic visibility (a sub-threshold
+txn flushes as one commit). An absolute `sink.max_transaction_buffer_bytes` ceiling (default ~1 GiB)
+halts the pipeline (never OOMs the worker) if an unsplittable txn exceeds it. See
+`research/Large_Transaction_Handling.md` (G-29).
+
 ---
 
 ## Phase 4 — Iceberg Write
@@ -345,7 +337,33 @@ For each (TableRef, RecordBatch) in the flush batch:
     └─► On success: send flush_confirmation(lsn) back to accumulator
 ```
 
-**Exactly-once guard (if enabled):** Before committing, the writer checks the Iceberg table's snapshot summary for a `committed_lsn` property. If `committed_lsn ≥ flush_lsn`, the batch was already committed (duplicate from a crash recovery replay) and is silently dropped without re-writing.
+**Position guard (optimization, not correctness):** correctness comes from row-level PK-upsert idempotency (G-13); the guard only skips already-done work. Before committing a table, the writer reads that table's `cdc.committed_position` from its Iceberg snapshot summary — an **engine-tagged** value (PG LSN, or **canonical GTID-set** string). If `committed_position.covers(flush.position_for_table)` (PG: `≥`; MySQL: GTID **subset**) the table is already committed and is skipped. On commit, the new value is the `union` of the prior value and the flush's per-table position. The pipeline **resume checkpoint** persisted to state storage is the **laggard** across all tracked tables (PG `min` / MySQL set-intersection); tables ahead skip via the guard or are absorbed by idempotency. `cdc.committed_position` coexists with `cdc.owner_epoch` (clustering fence) — orthogonal: the epoch rejects a zombie writer, the position skips done work. See `research/Delivery_Guarantee_and_Position_Guard.md` (G-14).
+
+### Sink-writer contract (consolidated)
+
+The Iceberg writer must, for every flush batch:
+
+1. **Key** each table by its **identifier** (inferred source PK via channel C, or `tables.primary_key`
+   override) as Iceberg `identifier-field-ids`; identifier columns are top-level, primitive, NOT NULL,
+   non-floating (`research/Ghost_Row_Dedup_and_Primary_Keys.md`, G-13).
+2. **Collapse** to ≤1 equality-delete + ≤1 data record per identifier tuple, keep-last by `change_seq`
+   (`_seq`). DELETE → equality-delete only (mirror; no `D` data row). INSERT/UPDATE/snapshot →
+   equality-delete(old key) + one data record (new image). A PK-changing UPDATE is two tuples:
+   delete(old key) + data(new key).
+3. **Sequence** the equality-delete file with the **enclosing commit's** data-sequence-number so the
+   strictly-less-than rule purges prior-commit versions but spares the same-commit insert
+   (**verification gate DA-SINK-1**; fallback: position-deletes / COW).
+4. **Route partition-scoped deletes by the BEFORE-image:** when a partition-source column changes, write
+   the equality-delete in the row's **old** partition (computed from the before-image), data in the new
+   partition — no cross-partition ghost (`research/Iceberg_Partitioning_and_Layout_Evolution.md`, G-24).
+5. **Stamp the snapshot summary** with `cdc.committed_position` (per-table HWM) and `cdc.owner_epoch`
+   (clustering fence); re-assert both on every commit (**gate DA-SINK-2**).
+6. **TRUNCATE** of a tracked table is a data-clear (overwrite-to-empty / delete-all), not a schema
+   change; same idempotent treatment for PG (`T` message) and MySQL (`QUERY_EVENT` classifier). *(Open:
+   confirm the exact Iceberg op — gap-analysis DA-X-5.)*
+7. **Tolerate unmaintained tables:** never assume compaction/expiry has run; planning and writes work
+   (slower) under deep delete-file stacks and many small files — v1 maintenance is external
+   (`research/Iceberg_Maintenance.md`, G-25).
 
 ---
 
@@ -413,23 +431,20 @@ Triggered via the management REST API (`POST /pipelines/{name}/snapshot`):
 Request payload: { tables: ["schema.orders", "schema.products"] }
                   (exact table names, no globs; may include tables not in pipeline config)
 
-1. Validate: tables list non-empty, no globs
-2. For each table:
-   a. Pause streaming events for that table in the accumulator
-      (events continue to be received but are not forwarded to the Iceberg writer)
-   b. Record pause_lsn = last_complete_lsn at the moment of pause
-3. Run snapshot for each table (Phase 1a / 1b)
-   ─ uses the same snapshot flow as startup
-   ─ tables not in the pipeline config: snapshot is written to Iceberg but
-     table is not added to the pipeline's streaming set
-4. After snapshot completes:
-   a. Resume streaming events from pause_lsn + 1
-      (events buffered during the pause are now forwarded)
-   b. Update snapshot_status = completed in state storage
-5. Return snapshot job ID; status queryable via GET /snapshots/{id}
+1. Validate: tables list non-empty, no globs.
+2. For each table: run the Phase-1 chunk loop (watermark lw/hw + keyset chunks) WITHOUT pausing the
+   stream. Tables already in the streaming set keep streaming; the snapshot reconciles against the
+   live stream exactly as at startup.
+3. Tables not in the pipeline config: snapshot is written to Iceberg but the table is not added to
+   the pipeline's streaming set.
+4. Update snapshot_status = completed in state storage.
+5. Return snapshot job ID; status queryable via GET /v1/snapshots/{id}.
 ```
 
-The "resume from pause_lsn + 1" ensures the snapshot and the subsequent stream are contiguous with no gap and no overlap.
+There is **no stream pause and no `pause_lsn + 1` assumption**: watermarks reconcile re-snapshotted
+rows against concurrent changes, and idempotent upserts mean re-reading existing keys re-writes the
+same rows. This is also the mechanism for **re-snapshot-after-unsafe-DDL** (`Schema_Change_Detection_
+and_Evolution.md` §8.2).
 
 ---
 
@@ -476,6 +491,13 @@ Node dies (SWIM detects via failed probes → marks dead)
     └─► Resumes from last confirmed_flush_lsn / gtid_executed
         (worst-case replay = time since last checkpoint write)
 ```
+
+**Desired-state survives failover.** Each pipeline's `desired_state` (`RUNNING`/`PAUSED`/`STOPPED`) is
+persisted in per-pipeline state. The new owner reads it and reconciles — a paused pipeline stays paused,
+a stopped one stays stopped. `PAUSE` and `STOP` **flush to a clean transaction boundary and commit
+before settling**, so there is **no in-memory buffer at risk** during failover or restart; a config
+reload does **not** resurrect a paused/stopped pipeline (runtime desired-state wins). See
+`research/Pipeline_Lifecycle_State_Machine.md` (G-NEW-15).
 
 ### Mid-Snapshot Crash
 
@@ -533,7 +555,8 @@ Every row written to Iceberg carries these metadata columns in addition to the s
 |---|---|---|
 | `_op` | `CHAR(1)` | `I` insert, `U` update, `D` delete, `r` snapshot |
 | `_ts` | `TIMESTAMP WITH TIME ZONE` | source database commit timestamp |
-| `_lsn` | `VARCHAR` | LSN string (PG) or GTID string (MySQL) |
+| `_lsn` | `VARCHAR` | commit LSN string (PG) or GTID string (MySQL) |
+| `_seq` | `VARCHAR` | per-change source order (PG change-LSN / MySQL binlog file+pos); keep-last dedup key (G-13) |
 | `_source_db` | `VARCHAR` | `host/database` from pipeline source config |
 | `_pipeline` | `VARCHAR` | pipeline name from config |
 

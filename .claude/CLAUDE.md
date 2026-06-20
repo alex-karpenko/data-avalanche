@@ -9,9 +9,7 @@ PostgreSQL and MySQL into Apache Iceberg tables stored on cloud object storage (
 Blob). Key subsystems: distributed worker cluster (consistent hashing + SWIM/memberlist), Apache
 Arrow as the in-memory columnar format, and multiple Iceberg catalog backends (AWS Glue, HMS, REST).
 
-Work style: **requirements-driven, iterative refinement**. Oleksii authors and edits spec
-documents; Claude performs gap analysis, authors research documents, and maintains the living gap
-tracker — all as in-place file edits.
+Work style: **requirements-driven, iterative refinement**. Claude performs gap analysis, authors research documents, and maintains the living gap tracker — all as in-place file edits. Claude authors and maintains specifications.
 
 ---
 
@@ -42,7 +40,7 @@ data-avalanche/
 
 | Directory | Authority | Claude may edit? |
 |---|---|---|
-| `doc/specs/` | Oleksii owns; source of truth | Propose patches only; do not edit without explicit instruction |
+| `doc/specs/` | Source of truth | Propose patches, don't edit without approve |
 | `doc/research/` | Claude authors; Oleksii reviews | Yes — in-place edits/extensions on request |
 | `doc/analysis/` | Claude maintains | Yes — in-place updates every gap-analysis cycle |
 | `doc/sources/` | Static reference | Never edit |
@@ -137,36 +135,11 @@ Non-trivial cases: `TINYINT(1)` boolean detection requires `information_schema` 
 
 ---
 
-## Current gap-analysis state (v9 summary)
-
-### ✅ Resolved domains
-- Config modelling (all config-schema gaps)
-- Data types / type mapping (`Type_Mapping.md` → G-18 ✅)
-- DDL classification (partially closes G-19)
-- Catalog auth (`Catalog_Auth_Research.md` → G-1g ✅)
-- Clustering / coordination design (`Clustering_Architecture_Research.md` → G-8 ✅, G-9 ✅,
-  G-2 ✅, G-17 ✅, G-23 ✅)
-
-### 🔴 Remaining blockers
-| ID | Topic |
-|---|---|
-| D-5 | Verify conditional-write atomicity on S3, GCS, Azure via `opendal` (GCS generation precondition trap) |
-| D-6 | Concrete `lease_duration` / `lease_renewal_interval` defaults vs. failover-time SLA |
-| G-13 / G-30 | Ghost-row dedup and primary-key config |
-| G-14 | Delivery-guarantee GTID-set comparison |
-| G-6 | Snapshot resumability |
-| G-11 | Atomic S3 state updates |
-| G-15 | PostgreSQL slot lifecycle |
-| G-16 | RBAC role matrix |
-| G-NEW-20/21/22 | Documentation reconciliation |
-
----
-
 ## Session startup checklist
 
 Before responding to any gap-analysis or spec-review request:
 
-1. Read `doc/analysis/CDC_Gap_Analysis_Report.md` to load current gap state.
+1. Read `doc/analysis/*.md` to load current gaps state.
 2. Read the specific `doc/specs/` or `doc/research/` files relevant to the request.
 3. Cross-reference with `doc/sources/Sources_Index_v3.md` if the topic maps to a known source.
 4. Only then produce analysis or edits.

@@ -113,6 +113,18 @@ The `_lsn` metadata **column** (per-row commit position) and the per-change **`_
 ordering) are distinct from `committed_position` (per-commit, per-table durable HWM) and remain as
 specified.
 
+**Capability gate + fallback (🧪 DA-SINK-2, `CDC_Design_Gap_Analysis_v1.md` §24.3).** Both
+`cdc.committed_position` and `cdc.owner_epoch` rely on iceberg-rust being able to read the latest
+snapshot summary and set custom string properties on the snapshot it commits, atomically with the data
+commit, with the values surviving across commits (summaries are per-snapshot, so the writer re-asserts
+them each commit). This must be verified against the pinned crate. **If it fails, correctness is
+unaffected** — per §1, idempotency (G-13) is the correctness mechanism and this guard is only an
+optimization + checkpoint-advance. Fallbacks, in order: (1) use Iceberg **table properties** if they
+commit atomically with the data files; (2) move `committed_position` to the per-pipeline **state
+storage** HWM (a fully adequate home, since the guard is an optimization, not a guarantee); (3) drop
+the in-summary `owner_epoch` fence to advisory — it is explicitly defense-in-depth (`Clustering…`
+§5.5), backstopped by the metadata-pointer CAS and `_lsn`/PK-upsert idempotency.
+
 ---
 
 ## §5 — Multi-table atomicity limitation (D-14.5)

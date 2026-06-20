@@ -183,14 +183,41 @@ mutability class is **PR**, and changing it forces the same re-snapshot path as 
 
 ---
 
-## §8 — Implementation gate (research item)
+## §8 — Implementation gate (verification + fallback)
 
 The whole mechanism assumes **iceberg-rust 0.9.0 exposes an equality-delete writer that assigns delete
-files the enclosing commit's sequence number**, so the §0 strictly-less-than guarantee holds. This
-must be verified against the pinned crate version before the sink writer is implemented; if equality
-deletes are unsupported or mis-sequenced, the writer needs a workaround (e.g. position deletes after a
-read, or a higher write strategy). Tracked as a new entry in the gap report §14 "missing research
-topics."
+files the enclosing commit's sequence number**, so the §0 strictly-less-than guarantee holds. This is a
+🔴 capability gate (`CDC_Design_Gap_Analysis_v1.md` DA-SINK-1, §24.2) — it **must be proven against the
+pinned crate before the sink writer is specified in detail**, because a negative result is a writer
+redesign, not a code tweak.
+
+**Verification (suggested home: `prototypes/iceberg-capability/`, pinned to the exact crate version):**
+
+1. Create a MOR table with `identifier-field-ids` set.
+2. Commit C1: insert key `K=1` (data sequence `s1`).
+3. Commit C2 in a **single transaction**: equality-delete `K=1` **and** insert `K=1` with a new image.
+4. **Assert (read):** the table shows exactly C2's image of `K=1` — the same-commit delete did **not**
+   purge the same-commit insert, and it **did** purge C1's version.
+5. **Assert (metadata):** C2's delete-file sequence number equals C2's data sequence number.
+6. **Cross-read with Spark or Trino Iceberg** to confirm the on-disk result independently of
+   iceberg-rust's own reader; the two must agree.
+
+Steps 4 and 6 are the gate.
+
+**Fallback, in priority order, if the gate fails:**
+
+1. **Position deletes after a read** — read affected data file(s), compute row positions, write
+   position-delete files. Correct, but adds a read per affected file, is partition-scoped, and changes
+   the §4 collapse contract.
+2. **COW for affected tables** — read-modify-rewrite whole data files (§5; same identifier rules).
+   Highest write cost; the heavy fallback.
+3. **Manual per-file sequence assignment** if the crate exposes it — keep equality deletes, set the
+   sequence explicitly.
+4. **Pin/upgrade or contribute upstream** to a version that sequences correctly.
+
+A failure here cascades into partition-delete routing (`Iceberg_Partitioning…` §2), delete-file
+compaction (`Iceberg_Maintenance…`), and the per-table guard (`Delivery…`), all of which assume
+equality deletes work — see DA-SINK-1 / §24.2 of the gap analysis for the full impact analysis.
 
 ---
 

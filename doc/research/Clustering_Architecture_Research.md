@@ -1,7 +1,7 @@
 ---
 title: Clustering Architecture Research
 status: Research / Design proposal (input for further elaboration)
-updated: 2026-06-15
+updated: 2026-06-20
 domain: Architecture / Distributed Systems
 tags: [clustering, gossip, swim, memberlist, consistent-hashing, lease, split-brain, rebalancing, config-propagation]
 closes_or_advances: [G-8, G-9, G-2, G-17, G-23, G-36, "OQ-CL1", "OQ-CL3", "OQ-CL4", "OQ-API3", "OQ-P3", "5.1", "5.2"]
@@ -981,6 +981,12 @@ the optional `kubernetes` backend (D-2) is a separate `LeaseStore` impl over the
 > runs). D-5 stays **open-until-executed**: the suite must pass against real S3, GCS *and* Azure once —
 > T10 (GCS generation-vs-ETag) is the gating assertion — before the storage lease is trusted in
 > production. This is the only remaining clustering item that cannot be closed on paper.
+>
+> **Verification + fallback are consolidated** in `CDC_Design_Gap_Analysis_v1.md` DA-CLUS-1 / §24.1:
+> the per-backend conflict-code table, the startup capability assertion (`op.info().full_capability()`
+> → refuse to start if `write_with_if_none_match` / `write_with_if_match` / `delete_with_if_match` is
+> absent), and the **per-backend drop-to-native-SDK** escape (Route B, §17.3) if OpenDAL lacks or
+> mis-maps a capability — an isolated `LeaseStore` swap, not a change to the §5.3 protocol.
 
 ---
 

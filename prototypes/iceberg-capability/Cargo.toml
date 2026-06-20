@@ -1,0 +1,64 @@
+[package]
+name = "iceberg-capability"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Capability probe: proves the iceberg-rust behaviors the CDC sink/clustering design depends on (DA-SINK-1/2, DA-SCHEMA-8, DA-TYPE-5, DA-SINK-10)"
+
+# MSRV: 1.92.0 (iceberg-rust 0.9.0, per doc/sources/Sources_Index_v3.md).
+#
+# The iceberg-dependent probe code is gated behind the `probe` feature and is
+# OFF by default, so `cargo test` stays green without the engineer's attention
+# (same posture as the lease-conformance harness, which env-skips). The probe
+# bodies are written against the *documented* iceberg-rust 0.9.0 surface; the
+# exact method/type names MUST be reconciled against the pinned crate before the
+# first `--features probe` compile. See README.md.
+
+[dependencies]
+
+[features]
+# Enable to compile + run the real iceberg-rust probes. Requires the pinned crate
+# and a writable warehouse (local fs is fine — see README).
+probe = [
+    "dep:iceberg",
+    "dep:iceberg-catalog-memory",
+    "dep:arrow-array",
+    "dep:arrow-schema",
+    "dep:tokio",
+    "dep:tempfile",
+    "dep:futures",
+    "dep:anyhow",
+]
+
+[dependencies.anyhow]
+version = "1"
+optional = true
+
+[dependencies.iceberg]
+version = "0.9" # VERIFY against the workspace pin; must match the sink's iceberg dep
+optional = true
+
+[dependencies.iceberg-catalog-memory]
+version = "0.9" # in-process catalog for a self-contained probe; VERIFY crate name/version
+optional = true
+
+[dependencies.arrow-array]
+version = "59"  # arrow-rs; VERIFY the major matches iceberg 0.9's arrow pin
+optional = true
+
+[dependencies.arrow-schema]
+version = "59"
+optional = true
+
+[dependencies.tokio]
+version = "1"
+features = ["macros", "rt-multi-thread"]
+optional = true
+
+[dependencies.tempfile]
+version = "3"
+optional = true
+
+[dependencies.futures]
+version = "0.3"
+optional = true
