@@ -1,0 +1,25 @@
+[package]
+name = "lease-conformance"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "D-5 conformance harness: proves CAS atomicity of the storage LeaseStore across S3 / GCS / Azure"
+
+# NOTE (D-5): pin OpenDAL at or above the release where conditional *writes*
+# (`write_with().if_none_match("*")` and `.if_match(<version>)`) are stable and
+# advertised via Capability flags. Verify the `iceberg-storage-opendal` transitive
+# pin agrees so the sink and the lease use one OpenDAL.
+[dependencies]
+opendal = { version = "0.57", features = [
+    "services-s3",
+    "services-gcs",
+    "services-azblob",
+] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+async-trait = "0.1"
+thiserror = "2"
+bytes = "1"
+
+[dev-dependencies]
+futures = "0.3"
+uuid = { version = "1", features = ["v4"] }

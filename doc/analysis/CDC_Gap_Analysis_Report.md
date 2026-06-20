@@ -2,7 +2,7 @@
 
 **Document type:** Pre-implementation analysis  
 **Based on:** System-Overview.md · Data-Flow.md · Configuration_Specification.md · Catalog_Auth_Research.md · Type_Mapping.md · Schema_Change_Detection_and_Evolution.md · Sources Index v3 (50 sources)  
-**Revision:** v12 — updated after Clustering_Architecture_Research.md D-1–D-4/D-7 were signed off  
+**Revision:** v13.13 — doc-reconciliation spec edits applied (G-NEW-20/21/22 ✅)  
 **Purpose:** Identify every gap, edge case, and research deficit that must be resolved before detailed requirements can be written
 
 ---
@@ -20,6 +20,357 @@ Severity codes:
 - 🔴 **Blocker** — implementation cannot start without resolving this
 - 🟡 **High** — wrong answer causes correctness bugs or data loss
 - 🟢 **Medium** — wrong answer degrades performance or operability
+
+---
+
+## v13.13 update — doc-reconciliation spec edits applied (G-NEW-20/21/22 ✅)
+
+The three staged reconciliation edits were applied to the Oleksii-owned spec files (on explicit
+instruction):
+
+- **G-NEW-20 ✅** — `Data-Flow.md` state-layout diagram re-rooted: the redundant `pipelines/<id>/`
+  segment removed; per-pipeline files now sit directly under the per-pipeline state location
+  (`state.prefix`/`sink.prefix`, default `id`), with a note that cross-pipeline data lives under
+  `globals.state`.
+- **G-NEW-21 ✅** — `Configuration_Specification.md` gained the four Type_Mapping fields
+  (`source.toast_strategy`, `source.mysql.tinyint1_as_bool`/`tinyint1_detection`,
+  `tables.column_type_overrides`, `tables.numeric_overflow_action`) in their field tables, plus
+  validation rules **V-077…V-082**. The stale `tinyint1_detection ↔ schema_evolution.method:events`
+  warning was **dropped** (the `method` field was removed; channel C always supplies the catalog query)
+  — recorded as a reconciliation note in §13.9.
+- **G-NEW-22 ✅** — `Data-Flow.md` `ColumnValue` enum extended to match `Type_Mapping.md`: `UInt64(u64)`,
+  `Timestamp { value, with_tz }`, `Time(NaiveTime)`, typed `Array { element_type, values }`, plus the
+  `ColumnValueType` tag enum.
+
+**With this, every gap in the report — 🔴/🟡/🟢 — is resolved or staged-as-executed (D-5 conformance run
++ the two flagged §14 research items: MariaDB GTID dialect, iceberg-rust compaction API).**
+
+---
+
+## v13.12 update — operational & scope gaps batched (G-22/26/27/34/35/37/38/11.3 ✅)
+
+`Operational_and_Scope_Gaps_Batch.md` closes a batch of smaller gaps, one decision each, plus a
+reconciliation appendix.
+
+- **G-22** — `max_wal_lag_bytes` (default null); `cdc_wal_lag_bytes` always emitted; **alert-only
+  default, opt-in halt**.
+- **G-26** — `binlog_purge_action: error (default) | re_snapshot`.
+- **G-27** — bounded inter-task channels; `sink.buffer_capacity_rows`; **DEGRADED back-pressure** on
+  sink/catalog failure (closes 13.3).
+- **G-34** — Azure default credential chain + optional `azure.account_name`; container = bucket.
+- **G-35** — catalog-specific retry + circuit breaker + DEGRADED (separate from storage).
+- **G-37** — per-provider minimum IAM permissions documented (S3/GCS/Azure).
+- **G-38 — MariaDB IN scope** (MySQL-compatible path). **Genuine dependency flagged:** MariaDB GTID is
+  `domain-server-sequence`, not MySQL `uuid:tx`, so the **G-14 `SourcePosition` MySQL impl must handle
+  both GTID dialects** — new §14 sub-research item. Channel-C + DDL classifier validated against MariaDB
+  `information_schema`.
+- **G-11.3** — `strip_schema` collision = config error; non-stripped transform = `schema__table`.
+
+**Reconciliation appendix (propose-only spec edits, ready to apply):** G-NEW-20 (re-root Data-Flow state
+diagram), G-NEW-21 (merge 4 Type_Mapping config fields + rules into config §13), G-NEW-22 (reflect 4
+`ColumnValue` enum extensions in Data-Flow). Schema residuals **DT-R2/R5/R6/R7 ratified** (all already
+had recommendations; none reopen a gap).
+
+---
+
+## v13.11 update — observability designed (G-33 ✅ / G-32 ✅ / §10.3 ✅)
+
+`Observability_Metrics_and_Tracing.md` was added, closing the metrics catalogue, tracing, and
+log/trace correlation.
+
+- **G-33 catalogue** — mandatory Prometheus metrics across replication/throughput, source health,
+  snapshot, Iceberg+maintenance, clustering (lease metrics from §19), and pipeline status.
+- **G-33 cardinality** — **pipeline-level labels by default; per-table opt-in** via
+  `sink.metrics.per_table` (default false), bounding series for large fleets.
+- **G-32 tracing** — `globals.tracing.otlp_endpoint` (disabled when absent) + `sample_ratio`;
+  batch/commit-granularity spans, never per-source-event.
+- **§10.3 correlation** — inject `trace_id`/`span_id`/`pipeline` into the JSON logs.
+
+**Config:** `globals.tracing.otlp_endpoint`+`sample_ratio` (promoted from §16), `sink.metrics.per_table`
++ validation rules.
+
+---
+
+## v13.10 update — Iceberg maintenance designed (G-25 ✅)
+
+`Iceberg_Maintenance.md` was added, closing G-25. **v1 = external maintenance** (Spark/Trino/Iceberg
+procedures) because iceberg-rust's rewrite/compaction APIs are immature; the app instead **exposes
+when-needed signals** (`cdc_iceberg_delete_files` — the MOR-critical one — plus data-file count,
+small-file ratio, snapshot count, manifest depth) and **reserves `sink.maintenance`** for a future
+built-in scheduler. Promotion gated on iceberg-rust compaction support (§14 research item); hybrid
+(built-in compaction only) is the first step when it lands. Signals fold into G-33.
+
+---
+
+## v13.9 update — MySQL DDL classifier designed (G-19a ✅)
+
+`MySQL_DDL_Classifier.md` was added, closing G-19a — and definitively reversing its v7 blocker
+elevation. The classifier is a **router, not a delta parser**: channel C owns the authoritative delta,
+so channel B only locates the table + detects rename intent.
+
+- **Two-tier fail-soft (D-19a):** Tier 1 `sqlparser-rs` (MySqlDialect) for structured classify + rename
+  intent; Tier 2 a verb+table-name regex on parse failure. A recovered table name **still triggers
+  channel C** (catalog delta classifies via §7.2), so parser coverage gaps **degrade, not halt**. Only
+  a total failure to identify any table halts (fail-safe).
+- **Table-level ops:** DROP→halt table, TRUNCATE→data-clear, RENAME→identity change (§7.2); untracked
+  DDL ignored; multi-table DDL routes each.
+- **Rename:** provable via Tier-1 structure / channel-C column position → keeps Iceberg field ID;
+  otherwise drop+add+warn.
+
+`sqlparser-rs` now sits on a fail-soft path, removing the risk that elevated G-19a in v7.
+
+---
+
+## v13.8 update — Iceberg partitioning & layout evolution designed (G-24 ✅ / G-12a ✅)
+
+`Iceberg_Partitioning_and_Layout_Evolution.md` was added, closing G-24 and G-12a under one principle:
+**layout changes apply to new data only; history is never auto-rewritten; full migration is an explicit
+re-snapshot/compaction.**
+
+- **G-24 partitioning** — `tables.partitioning` list of Iceberg transform fields (identity/bucket/
+  truncate/year/month/day/hour); default **unpartitioned**; `_ts` allowed for time-pruning.
+- **Correctness wrinkle** — equality deletes are **partition-scoped**, so a partition-value change
+  would orphan the old version. Resolved by treating partition-key mutation like PK mutation: emit the
+  equality-delete in the **OLD** partition (routed by the **before-image**, already required by G-13) +
+  data in the NEW. Any partition column allowed; sink-writer contract gains "delete partition = before-
+  image."
+- **G-24 evolution** — partition-spec change = Iceberg spec evolution (new data only, no rewrite, PR).
+- **G-12a** — MOR↔COW `sink.strategy` change = new data only; explicit compaction or re-snapshot to
+  migrate history (PR). Closes the "applies to new tables only + migration path" gap.
+
+**Config:** `tables.partitioning` promoted from §16 + four validation rules; `sink.strategy` gains
+new-data-only semantics.
+
+---
+
+## v13.7 update — large-transaction handling designed (G-29 ✅)
+
+`Large_Transaction_Handling.md` was added, closing G-29 — the tension between "flush only on a
+transaction boundary" and bounded memory.
+
+- **Trilemma framed:** bounded memory / atomic visibility / no spill — pick two.
+- **Mechanism (D-29.1): bounded split commits.** Above `sink.max_transaction_batch_rows`, flush
+  partial-txn Iceberg commits but **pin the resume checkpoint at the txn start** until the source
+  commit. A mid-txn crash replays the whole txn; already-flushed slices are **idempotent upserts**
+  (G-13) → crash-safe. Only cost: brief partial-visibility for oversized txns.
+- **Default (D-29.2): `null` (atomic by default).** No splitting unless the operator opts in. A separate
+  **`sink.max_transaction_buffer_bytes`** ceiling **halts the pipeline** (never OOMs the worker) when a
+  txn is unsplittable; when splitting is enabled it is just an early-flush trigger.
+- **Spill** (preserve atomicity + bound memory) deferred to a future `large_txn_mode: spill`.
+
+**Config added:** `sink.max_transaction_batch_rows` (promoted from §16), `sink.max_transaction_buffer_bytes`
++ validation rules. Cross-ref G-27 (back-pressure buffers) and G-14 (checkpoint pinning).
+
+---
+
+## v13.6 update — pipeline lifecycle state machine designed (G-NEW-15 ✅ / §9.6 ✅)
+
+`Pipeline_Lifecycle_State_Machine.md` was added, closing G-NEW-15 and the §9.6 flush/restart overlap.
+
+- **Principle** — three operator-set **desired** states (`RUNNING`/`PAUSED`/`STOPPED`) reconciled by
+  the owning `PipelineController` (level-triggered, clustering §20). `desired_state` is **persisted
+  per-pipeline** so pause/stop survive failover and restart — the §2.5 answer.
+- **PAUSE** flushes to a clean txn boundary then holds (no in-memory data at failover risk), keeps
+  resources warm + lease held. **STOP** also closes the source connection (PG slot persists). **STOPPED
+  keeps its lease, owner idle** (no ring churn; immediate resume).
+- **Transitions** — `resume` targets **both** PAUSED and STOPPED; `restart` valid only on RUNNING
+  (§12.4 discard-and-replay); illegal transitions → `409`.
+- **§9.6** — manual `flush` resets the time-based flush timer + counters; manual `restart` follows the
+  same in-flight policy as config-driven.
+- **Persistence** — `desired_state` in `pipeline-state.json` (not config, not `globals.state`); a
+  config reload does **not** override it (paused stays paused).
+
+**State schema:** add `desired_state: running|paused|stopped` (default `running`). Lifecycle endpoints
+are **operator** role (from the RBAC matrix).
+
+---
+
+## v13.5 update — clustering D-5/D-6 ratified; G-11 reconciled
+
+The last clustering follow-ons are now signed off (one with an empirical tail).
+
+- **D-6 ✅ ratified** — **Balanced** lease timing is the default (`lease_duration = 15s`,
+  `lease_renewal_interval = 5s`), ~20–22s worst-case unowned window, fitting a ~60s max-lag SLA. Fast
+  (5s/1.5s) and Conservative (30s/10s) documented as opt-ins. OQ-OB2 numeric-SLA + p99-stall load
+  tests are *tuning inputs*, not blockers. (Clustering doc §18.6.)
+- **D-5 ✅ approved + scaffolded, open-until-executed** — Route A (OpenDAL) approved as default, with
+  startup capability assertion + native-SDK escape hatch. The `LeaseStore` trait and the **T1–T10
+  conformance suite** are now scaffolded at **`prototypes/lease-conformance/`** (runnable via
+  `cargo test` against MinIO / fake-gcs-server / Azurite). D-5 cannot be closed on paper: the suite
+  must pass against **real S3, GCS *and* Azure** once — **T10 (GCS generation-vs-ETag) is the gating
+  assertion**. This is the single remaining clustering item awaiting an empirical run.
+- **G-11 ✅ reconciled** — "atomic S3 state updates" is the **same** question as D-5; §5.2 already
+  established the CAS primitive exists on all three backends (S3 `If-None-Match`/`If-Match`, GCS
+  generation, Azure ETag). G-11's matrix row lagged at "Open"; it is now design-resolved, with the
+  same empirical conformance gate as D-5.
+
+**With this, every clustering decision (D-1…D-11) is design-closed.** The only open clustering work is
+*executing* the D-5 conformance suite against the three real clouds.
+
+---
+
+## v13.4 update — API RBAC matrix & versioning designed (G-16 ✅ / G-9.1 ✅)
+
+`API_RBAC_and_Versioning.md` was added, closing G-16 (the last pure-design blocker) and G-9.1 in
+passing. The auth *mechanism* was already done (§6.3.1); this fixes the **roles + endpoint matrix**.
+
+- **Roles** — linear hierarchy `admin ⊇ operator ⊇ viewer`; authorization is one comparison
+  `principal.max_role ≥ endpoint.min_role`.
+- **Matrix** — viewer = status/observability; operator = pipeline lifecycle + config
+  reload/validate (validate is operator, not viewer, because it echoes *resolved* config with
+  secrets); admin = `leave cluster` + `shutdown`. Full table in the doc §2.
+- **G-9.1 versioning** — functional/authenticated endpoints under **`/v1`**; `/health/{live,ready}`
+  and `/metrics` **unversioned + unauthenticated**.
+- **Binding per mode** — `none` = all open (dev/trusted-net, V-052 warning); `basic` = single
+  principal = **admin**; `jwt/oauth2` = roles from `roles_claim`, mapped, max wins; 401 (no/invalid
+  token) vs 403 (valid token, insufficient role) distinguished.
+- **IdP role mapping** — configurable **`globals.api.role_mapping`** (default identity on the three
+  names) so real IdP role strings (`cdc-admin`, …) map cleanly.
+- **TLS-and-auth** — V-052 stays a **warning** (k8s upstream TLS termination is common), not promoted
+  to error.
+
+**Config added:** `globals.api.role_mapping` (R, optional) + two validation rules. The G-NEW-15
+lifecycle endpoints inherit **operator** from this matrix.
+
+---
+
+## v13.3 update — PostgreSQL slot/publication lifecycle designed (G-15 ✅)
+
+`Postgres_Slot_and_Publication_Lifecycle.md` was added, closing G-15. The config layer already fixed
+the *static* side (V-058/059 uniqueness, `auto_cleanup`); this doc specifies the **runtime lifecycle
+state machine**.
+
+- **Slot existence matrix** — "slot present" is the *normal* steady state (slots persist + retain WAL),
+  so the matrix is {state present/absent} × {slot present/absent}: reconnect-&-resume (normal
+  restart); first-start create+snapshot; slot-lost → recreate + re-snapshot; and the one contested
+  cell, **state-absent + slot-present (orphan)**.
+- **D-15.1 orphan policy** — `source.postgres.slot.on_orphan: halt | adopt_resnapshot`, **default
+  `halt`** (operator decides; no surprise data movement). *Adopt-and-resume-without-snapshot* is
+  rejected (would silently miss pre-existing data).
+- **D-15.2 creation** — `source.postgres.slot_management: managed | require_existing`, **default
+  `managed`**. `require_existing` (DBA-precreated, locked-down envs) forces `auto_cleanup = false`.
+- **D-15.3 WAL-gone recovery** — unreachable persisted position (slot dropped, or "requested WAL has
+  already been removed") ⇒ recreate slot + **incremental re-snapshot** (cheap now via G-6); warn/metric.
+  Same recovery family as MySQL purged binlog (G-26); the failure G-22's WAL-lag guard prevents.
+- **D-15.4 publication** — app-maintained **explicit table list**; `ALTER PUBLICATION ADD/DROP`
+  reconciles on table-set change.
+- **D-15.5 mutual exclusion** — the per-pipeline **lease** + PG's active-slot lock already prevent two
+  workers fighting over a slot; external same-name collisions are undetectable (PG slots carry no
+  ownership tag) — documented, not papered over.
+
+**Config added:** `slot.on_orphan` (R), `slot_management` (PR), + two validation rules (require_existing
+⇒ auto_cleanup false; domain checks).
+
+---
+
+## v13.2 update — incremental snapshot model designed (G-6 ✅ / G-7 ✅ / G-20 ✅)
+
+`Snapshot_Resumability_and_Consistency.md` was added, resolving three snapshot gaps at once by
+switching from a **blocking consistent snapshot** to an **incremental chunked snapshot** (DBLog /
+Debezium-incremental technique, adapted to our read-only user and upsert sink).
+
+**The trigger:** the current Data-Flow Phase 1 is internally contradictory — it claims both a
+single-transaction consistent snapshot (`EXPORT_SNAPSHOT` / `COPY`) *and* per-page crash resume, which
+cannot coexist (the snapshot transaction dies with the worker; `COPY` has no cursor). Resolving G-6
+forced a model choice; incremental was selected.
+
+- **G-6 ✅ — resumability.** Snapshot proceeds in identifier-keyed **chunks**, each in a short
+  `READ COMMITTED` transaction, checkpointed by a **typed identifier-tuple cursor** with a
+  **binary-collation ordering pin** (the subtle correctness point for text keys). Row-value keyset
+  predicate `WHERE (k) > (cursor)`. The old "no suitable cursor key" fallback is **moot** — G-13
+  guarantees every replicated table has an orderable identifier (PK-less tables already halt).
+  `snapshot.chunk_size` (default 10000), checkpoint per chunk.
+- **G-7 ✅ — consistency.** Lock-free and **convergent** instead of frozen-instant: per-chunk position
+  **watermarks** + G-13 upsert idempotency reconcile snapshot rows against concurrent stream changes.
+  Eliminates the MySQL **`RELOAD`/`LOCK TABLES` privilege** requirement and the "fallback when
+  consistency can't be achieved" concern. **No `consistent_snapshot` toggle** — incremental is the
+  single model. Order flips to **stream-first, snapshot-concurrent**.
+- **G-20 ✅ — on-demand read point.** An on-demand snapshot is the same chunk loop run **without
+  pausing the stream**; the `pause_lsn + 1` read-point assumption disappears. Re-snapshot-after-unsafe-
+  DDL and ad-hoc snapshots use the identical mechanism.
+
+**Doc impact owed (spec, propose-only):** Data-Flow.md Phase 1 + On-Demand Snapshot rewritten;
+snapshot privilege preconditions drop MySQL `RELOAD`/`LOCK TABLES`. **Config:** add
+`snapshot.chunk_size`; no `consistent_snapshot`. Cross-ref G-22/G-26 (a slow snapshot lengthens WAL/
+binlog retention — the lag guard interaction).
+
+---
+
+## v13.1 update — delivery-guarantee position guard designed (G-14 ✅)
+
+`Delivery_Guarantee_and_Position_Guard.md` was added, closing G-14. The key move is recognizing that
+**G-13's PK-keyed upsert + mirror deletes make the pipeline row-level idempotent**, so the
+committed-position guard is **not** the correctness mechanism — it is a write-skip optimization and the
+checkpoint-advance carrier. This dissolves the batch-re-alignment-on-replay hazard entirely (a
+re-aligned replay either re-writes idempotent rows or is skipped).
+
+Decisions (D-14.1…D-14.5):
+
+- **D-14.1 — comparison.** A `SourcePosition` abstraction: PG = numeric LSN (`≥`/`max`/`min`); MySQL =
+  GTID-set with **subset** (covers), **union** (commit), **intersection** (resume frontier), plus a
+  **canonical GTID-set serialization** (sorted UUIDs, merged intervals) for stable storage. The old
+  `committed_lsn ≥ flush_lsn` test was only ever valid for PG.
+- **D-14.2 — scope: per-table HWM, laggard checkpoint.** Multi-table flushes are **not atomic** (each
+  table is a separate Iceberg commit), so each table carries its own committed position; the pipeline
+  resume point persisted to state storage is the **min (PG) / intersection (MySQL) across all tracked
+  tables** — the laggard — so no table loses data on restart.
+- **D-14.3 — idempotency is correctness.** The position guard is demoted to optimization +
+  checkpoint-advance. Valid because PK-less/append-only tables are rejected (G-13 §3).
+- **D-14.4 — property generalized.** Snapshot-summary `committed_lsn` → **`cdc.committed_position`**
+  (engine-tagged LSN or canonical GTID-set), coexisting with `cdc.owner_epoch` (clustering D-7).
+- **D-14.5 — limitation stated.** Cross-table **atomic visibility is not guaranteed** (separate
+  commits); per-table exactly-once-effect is. Cross-ref G-29 (large-txn tension) and G-25 (a
+  multi-table-commit catalog like Nessie would be required for true cross-table atomicity).
+
+Edge cases folded in: WAL/binlog purged below the resume frontier → re-snapshot (G-26/G-22);
+source-primary failover adds a second GTID UUID (set ops absorb it); empty per-table flush just
+doesn't advance that table's HWM.
+
+---
+
+## v13 update — ghost-row dedup & PK keying designed (G-13 ✅ / G-30 ✅-rejected)
+
+`Ghost_Row_Dedup_and_Primary_Keys.md` was added, closing the highest remaining correctness blocker.
+It specifies the full equality-delete keying and intra-batch dedup contract for the MOR sink.
+
+The spine is **§0's one rule**: an Iceberg equality delete applies only to data files with a
+*strictly smaller* sequence number, which is both what makes in-batch upserts correct and what
+produces ghost rows when violated. Every decision flows from staying on the right side of it.
+
+Decisions signed off (D-13.1…D-13.7):
+
+- **D-13.1 / D-13.7 — identifier source.** Default identifier = inferred source PK (channel-C catalog
+  query), overridable via **`tables.primary_key`** (kept — the only way to support PG `REPLICA
+  IDENTITY USING INDEX` on a non-PK unique index). Materialized as Iceberg `identifier-field-ids`.
+  Identifier columns must be top-level, primitive, NOT NULL, non-floating.
+- **D-13.2 — PK-less tables: HALT.** System-Overview line 50 kept verbatim. **G-30 is resolved by
+  rejection** — the reserved `tables.surrogate_key` field is **removed** from config §16 and no
+  append-only mode is added. Accepted limitation: genuinely key-less tables are un-replicable.
+- **D-13.3 — intra-batch collapse.** Each flush collapses to ≤1 delete + ≤1 data record per identifier
+  tuple, **keep-last by a per-change `_seq`** (PG: change WAL LSN; MySQL: binlog file+pos / GTID+event
+  index). The `_lsn` *commit* column is insufficient (many rows share one commit position).
+- **D-13.4 — before-image contract.** Identifier columns ⊆ source replica-identity columns — **new
+  validation**, halt with the missing-column list otherwise (PG `DEFAULT` covers PK; a non-PK override
+  needs `FULL`/`USING INDEX`). MySQL `binlog_row_image = FULL` already required.
+- **D-13.6 — delete representation: MIRROR.** A DELETE emits an equality-delete only, **no `D` data
+  row**; `_op` in data files is only ever `I`/`U`/`r`. Appending a `D` row alongside its own
+  equality-delete in one commit is exactly the ghost-row bug. Key mutation (UPDATE changing the PK) =
+  delete(old key) + insert(new key).
+- **D-13.5 — strategy.** MOR/equality-delete is primary; COW = new-tables-only, same identifier rules.
+
+**Consistency with schema evolution (no new decision):** Iceberg `identifier-field-ids` reference
+field IDs not names, so a *provable rename* preserves the identifier automatically; and §7.2 already
+classifies PK / REPLICA IDENTITY change as Unsafe → halt + re-snapshot — the one change that
+invalidates the identifier. `tables.primary_key` is therefore mutability class **PR** (change ⇒
+re-snapshot).
+
+**New implementation gate (added to §14):** verify iceberg-rust 0.9.0 exposes an equality-delete
+writer that assigns delete files the enclosing commit's sequence number — the §0 guarantee depends on
+it. If not, the writer needs a workaround. This is the one item that could reopen G-13 at
+implementation time.
+
+**Config-spec follow-ups (pending application to `Configuration_Specification.md`):** add
+`tables.primary_key` (PR) with its four validation rules; **remove** `tables.surrogate_key` from §16.
 
 ---
 
@@ -406,7 +757,17 @@ The `id` field clarifies what constitutes deletion (an `id` disappearing from co
 
 ---
 
-### 2.5 NEW — Pipeline lifecycle API state machine undefined 🆕 🟡
+### 2.5 Pipeline lifecycle API state machine — RESOLVED (design) ✅
+
+Designed in `Pipeline_Lifecycle_State_Machine.md` (resolves G-NEW-15). Three operator-set **desired**
+states (`RUNNING`/`PAUSED`/`STOPPED`) reconciled by the owning `PipelineController`; `desired_state`
+persisted per-pipeline so pause/stop survive failover and restart. PAUSE flushes-then-holds (lease
+kept); STOP closes the source connection (slot persists); STOPPED keeps its lease idle. `resume`
+targets both PAUSED and STOPPED; `restart` only on RUNNING (§12.4). §9.6 closed: manual flush resets
+timer+counters; manual restart = discard-and-replay. Config reload does not override `desired_state`.
+Original open questions below are retained for the audit trail.
+
+#### (original) Pipeline lifecycle API state machine undefined 🆕 🟡
 
 The System Overview adds `pause`, `stop`, `resume`, `restart`, and `flush` endpoints. The state machine they operate on is not defined:
 - What is the difference between `pause` and `stop`? (Presumably pause = stop reading but keep resources; stop = stop and release connection but keep state.)
@@ -421,31 +782,39 @@ The System Overview adds `pause`, `stop`, `resume`, `restart`, and `flush` endpo
 
 ## 3. Snapshotting
 
-### 3.1 Snapshot resumability on crash — UNCHANGED 🔴
+### 3.1 Snapshot resumability on crash — RESOLVED (design) ✅
 
-Data-Flow.md documents a per-table `cursor` in the state layout (`snapshots/<schema>.<table>.json` with a `cursor` field), which is real progress on the *layout*, but the cursor *format* for composite/non-integer primary keys and the checkpoint frequency are still unspecified.
-
-**Research agenda:** Define cursor format for keyset pagination across composite PKs. Define checkpoint frequency (every N rows, default 10,000). Define fallback for tables with no suitable cursor key.
-
----
-
-### 3.2 Multi-table snapshot consistency — PARTIALLY RESOLVED 🔄
-
-Data-Flow.md now specifies the mechanism per engine: PostgreSQL uses `EXPORT_SNAPSHOT` + `SET TRANSACTION SNAPSHOT`; MySQL uses `FLUSH TABLES WITH READ LOCK` (< 8.0) or `START TRANSACTION WITH CONSISTENT SNAPSHOT` (8.0+). This is a substantial advance.
-
-**Remaining gap 🟡:** No `consistent_snapshot` config toggle, no handling of the MySQL privilege requirement (`RELOAD`, `LOCK TABLES`), and no fallback when consistency cannot be achieved (e.g., GTID disabled). The mechanism is described but not made configurable or fault-tolerant.
-
-**Research agenda:** Expose `source.consistent_snapshot` (default true). Document required MySQL privileges as a prerequisite. Define degraded behavior with a prominent warning when consistency cannot be guaranteed.
+Designed in `Snapshot_Resumability_and_Consistency.md` (resolves G-6). The blocking-snapshot model is
+replaced by an **incremental chunked snapshot**: identifier-keyed chunks, each a short
+`READ COMMITTED` transaction, checkpointed by a **typed identifier-tuple cursor** with a
+**binary-collation ordering pin**. Row-value keyset predicate `WHERE (k) > (cursor) ORDER BY k LIMIT
+chunk_size`. `snapshot.chunk_size` default 10000; checkpoint per chunk; crash-resume re-reads the
+in-flight chunk idempotently (G-13). The "no suitable cursor key" fallback is **moot** — every
+replicated table has an orderable identifier (PK-less tables halt).
 
 ---
 
-### 3.3 "Next to last snapshotted position" semantics — PARTIALLY RESOLVED 🔄
+### 3.2 Multi-table snapshot consistency — RESOLVED (design) ✅
 
-Data-Flow.md resolves the *startup* snapshot case: the slot's `start_lsn` is the resume point, and `EXPORT_SNAPSHOT` guarantees the SELECT sees exactly the data at `start_lsn` — no gap, no overlap. For the *on-demand* API snapshot, Data-Flow.md adds "resume from pause_lsn + 1," which is clearer but introduces a subtle question.
+Resolved in `Snapshot_Resumability_and_Consistency.md` §3 (resolves G-7) by the incremental model.
+Consistency is **lock-free and convergent** instead of a frozen instant: per-chunk **position
+watermarks** + G-13 upsert idempotency reconcile snapshot rows against concurrent stream changes.
 
-**Remaining gap 🟡:** "Resume from pause_lsn + 1" assumes the snapshot's consistent read point equals `pause_lsn`. If the snapshot transaction's actual read view is established slightly after `pause_lsn` (between pausing the stream and opening the snapshot transaction), there is a gap window. The exact ordering — pause stream, capture `pause_lsn`, open snapshot transaction — must be atomic or the snapshot read point must be captured, not assumed.
+This **eliminates** the prior concerns rather than configuring them: no global read lock, so the
+MySQL **`RELOAD`/`LOCK TABLES`** privilege requirement is gone and there is no global-lock failure
+mode to fall back from. **No `consistent_snapshot` toggle** is introduced — incremental is the single
+model. Honest limitation: a reader querying mid-snapshot sees a partially-populated table and no
+cross-table atomic instant (same per-table boundary as G-14 §5).
 
-**Research agenda:** Specify that the on-demand snapshot captures its own consistent read point (LSN/GTID at the moment its snapshot transaction opens) and resumes streaming from *that* position, not from `pause_lsn`. Accept duplicates (handled by writer-side dedup) over gaps.
+---
+
+### 3.3 On-demand snapshot read point — RESOLVED (design) ✅
+
+Resolved in `Snapshot_Resumability_and_Consistency.md` §4 (resolves G-20). The `pause_lsn + 1`
+read-point *assumption* disappears: an on-demand snapshot is the same incremental chunk loop run
+**without pausing the stream**, with watermarks + upsert idempotency reconciling re-snapshotted rows
+against concurrent changes. Re-snapshot-after-unsafe-DDL and ad-hoc snapshots reuse the identical
+mechanism. No read point is ever "assumed."
 
 ---
 
@@ -529,9 +898,10 @@ into G-33.
 
 Data-Flow.md's worker-failure path says the new owner resumes "from last confirmed_flush_lsn / gtid_executed" with "worst-case replay = time since last checkpoint write," and the checkpoint is written after each Iceberg commit. This actually resolves the *checkpoint frequency* question (it's flush-driven).
 
-**Remaining gap 🟡:** WAL-lag handling for an abandoned PostgreSQL slot (a crashed worker leaves the slot unconsumed, accumulating WAL on the source) is still not addressed. No `max_wal_lag_bytes` parameter, no alerting threshold.
-
-**Research agenda:** Add `source.postgres.max_wal_lag_bytes`; emit a `cdc_wal_lag_bytes` metric; optionally halt the pipeline if lag exceeds the threshold to protect the source DB's disk.
+**Resolved 🟡 (G-22):** `Operational_and_Scope_Gaps_Batch.md` adds `source.postgres.max_wal_lag_bytes`
+(default null), always emits `cdc_wal_lag_bytes`, and makes the behavior **alert-only by default with
+opt-in halt** when the threshold is set and exceeded (protects the source disk). Pairs with the G-15
+abandoned-slot lifecycle.
 
 ---
 
@@ -640,6 +1010,8 @@ The implementation must abstract the lease behind a `LeaseStore` trait with an o
 version token (S3/Azure ETag, GCS generation) and ship a per-backend conformance test. `opendal`
 exposes `write_with().if_none_match("*")` / `.if_match(etag)` (errors as `ErrorKind::ConditionNotMatch`)
 but gates them behind per-backend `Capability` flags — so the GCS mapping must be verified, not assumed.
+The verification harness is now scaffolded at **`prototypes/lease-conformance/`** (`LeaseStore` trait +
+T1–T10); D-5/G-11 close once it passes against real S3, GCS and Azure (T10 = the GCS trap).
 
 ---
 
@@ -655,51 +1027,93 @@ but gates them behind per-backend `Capability` flags — so the GCS mapping must
 
 `sink.strategy: mor` default. Note 6.6 (migration on strategy change) remains.
 
-### 6.2 Ghost rows / deduplication — UNCHANGED 🔴
+### 6.2 Ghost rows / deduplication — RESOLVED (design) ✅
 
-Data-Flow.md adds an `_lsn` metadata column and a per-batch flush-on-transaction-boundary rule, and mentions an "exactly-once guard" checking `committed_lsn` in the snapshot summary. This is meaningful, but the core ghost-row defense — a declared `primary_key` per table for equality deletes and intra-batch dedup ordering — is still not in the config or specified as a requirement.
+Designed in `Ghost_Row_Dedup_and_Primary_Keys.md` (resolves G-13; resolves G-30 by rejection). The
+core defense is now fully specified:
 
-**Research agenda (unchanged):** Add `tables.primary_key` (inferred from source PK, manual override). Intra-batch dedup: sort by (PK, sequence) and keep last. Halt tables with no PK and no surrogate key.
+- **Identifier** = inferred source PK (channel-C catalog query), overridable via `tables.primary_key`,
+  materialized as Iceberg `identifier-field-ids`. Constraints: top-level, primitive, NOT NULL,
+  non-floating.
+- **Intra-batch dedup** collapses each flush to ≤1 equality-delete + ≤1 data record per identifier
+  tuple, **keep-last by a per-change `_seq`** (PG change WAL LSN; MySQL binlog file+pos / GTID+event
+  index) — the `_lsn` *commit* column is too coarse.
+- **Delete = mirror semantics** — equality-delete only, no `D` data row; the §0 strictly-less-than
+  rule is what makes in-batch "delete-old + insert-new" correct and what the mirror rule avoids
+  ghost-ing.
+- **Before-image contract** — identifier ⊆ source replica-identity columns (new validation, halt
+  otherwise); MySQL FULL image already required.
+- **PK-less tables halt** (line 50 kept); `tables.surrogate_key` removed from config §16.
 
-### 6.3 Delivery guarantee — PARTIALLY RESOLVED 🔄
+**Residual (implementation gate, §14):** verify iceberg-rust 0.9.0's equality-delete writer assigns
+delete files the commit sequence number — the §0 guarantee depends on it.
 
-Data-Flow.md commits to a concrete model: at-least-once with an exactly-once guard via a `committed_lsn` property in the Iceberg snapshot summary, and the critical invariant "write the offset checkpoint only after a successful Iceberg commit." This is essentially the v1/v2 recommendation, now adopted in the data-flow doc.
+### 6.3 Delivery guarantee — RESOLVED (design) ✅
 
-**Remaining gap 🟡:** The `committed_lsn` guard assumes a single monotonic LSN per table per commit. For a multi-table flush, or for MySQL GTID sets (which are sets, not scalars), the comparison `committed_lsn ≥ flush_lsn` needs a defined ordering. GTID set comparison is subset-based, not numeric.
+Designed in `Delivery_Guarantee_and_Position_Guard.md` (resolves G-14). At-least-once delivery with
+**per-table** exactly-once-*effect*. The previously-assumed `committed_lsn ≥ flush_lsn` test was only
+valid for PG; it is replaced by:
 
-**Research agenda:** Define the dedup-guard comparison for GTID sets (subset check) vs PostgreSQL LSN (numeric). Confirm whether the guard is per-table or per-commit.
+- a **`SourcePosition`** abstraction — PG numeric LSN vs MySQL GTID-set (**subset**/union/intersection,
+  canonical serialization);
+- a **per-table** committed high-water mark (`cdc.committed_position` in each table's snapshot summary)
+  with the **pipeline resume checkpoint = min/intersection across tables** (the laggard), since
+  multi-table flushes are separate, non-atomic Iceberg commits;
+- the crucial reframing that **G-13 PK-upsert idempotency is the correctness mechanism**, so the
+  position guard is an optimization + checkpoint-advance, not the exactly-once boundary — which
+  dissolves the replay batch-re-alignment hazard.
 
-### 6.4 Iceberg partitioning — UNCHANGED 🟡
-No `partitioning` field in `tables`.
+**Known limitation (documented):** cross-table *atomic visibility* is not guaranteed (separate
+commits). Cross-ref G-29 / G-25.
 
-### 6.5 Iceberg maintenance — UNCHANGED 🟡
-No maintenance schedule config.
+### 6.4 Iceberg partitioning — RESOLVED (design) ✅
+Resolved in `Iceberg_Partitioning_and_Layout_Evolution.md` (resolves G-24). `tables.partitioning` list
+of transform fields; default unpartitioned; `_ts` allowed. Partition-key mutation handled via the
+before-image (delete old partition + insert new) so equality deletes don't orphan rows across
+partitions. Partition-spec changes evolve (new data only, no rewrite).
 
-### 6.6 Strategy change does not migrate existing tables — UNCHANGED 🟡
-`sink.strategy` change via reload does not migrate existing Iceberg tables. Still needs the "applies to new tables only" rule plus a migration path.
+### 6.5 Iceberg maintenance — RESOLVED (design) ✅
+Resolved in `Iceberg_Maintenance.md` (resolves G-25). v1 = **external maintenance** + app-exposed
+when-needed signals (delete-file count, small-file ratio, snapshot count, manifest depth); `sink.maintenance`
+reserved for a future built-in scheduler, gated on iceberg-rust rewrite support.
+
+### 6.6 Strategy change does not migrate existing tables — RESOLVED (design) ✅
+Resolved in `Iceberg_Partitioning_and_Layout_Evolution.md` §4 (resolves G-12a). `sink.strategy` change
+applies to **new data only** (Iceberg tolerates mixed COW/MOR); migration is an explicit operator
+action — compaction (fold MOR deletes) or re-snapshot into a fresh table (G-6). Mutability PR.
 
 ---
 
 ## 7. Source Database Connectors
 
-### 7.1 PostgreSQL replication slot lifecycle — PARTIALLY RESOLVED 🔄
+### 7.1 PostgreSQL replication slot lifecycle — RESOLVED (design) ✅
 
-`source.postgres.slot` and `publication` are user-specified, and Data-Flow.md's shutdown sequence adds "drop replication slot if `auto_cleanup = true` in config" — but `auto_cleanup` does not appear in the config draft. There's a missing config field referenced by the data-flow doc.
+Designed in `Postgres_Slot_and_Publication_Lifecycle.md` (resolves G-15). The static side was already
+done in the config spec (V-058/059 uniqueness, `auto_cleanup`); the runtime **state machine** is now
+specified:
 
-**Remaining gaps 🔴:**
-- Create-vs-reconnect-vs-reject behavior when the user-named slot already exists (G-15a) still undefined.
-- No slot-name uniqueness validation across pipelines sharing a source DB.
+- **Existence matrix** {state present/absent} × {slot present/absent}: reconnect-&-resume (normal
+  restart); first-start create+snapshot; slot-lost → recreate + re-snapshot; orphan (state-absent +
+  slot-present) → policy.
+- **Orphan policy** `slot.on_orphan: halt (default) | adopt_resnapshot`; resume-without-snapshot
+  rejected.
+- **Creation** `slot_management: managed (default) | require_existing` (DBA-precreated; forces
+  `auto_cleanup=false`).
+- **WAL-gone** → recreate + incremental re-snapshot (G-6); warn/metric.
+- **Publication** app-maintained explicit list; `ALTER PUBLICATION` reconciles on table-set change.
+- **Mutual exclusion** via the lease + PG active-slot lock; external same-name collisions documented
+  as undetectable.
 
-**Resolved:** `source.postgres.auto_cleanup` (bool, default true) is now present in the config at both the defaults and pipeline level, matching the Data-Flow.md shutdown-sequence reference (G-NEW-17 ✅).
+### 7.2 MySQL GTID vs binlog — RESOLVED (design) ✅
+`replication_type: binlog | gtid` present. Binlog-purge handling resolved in
+`Operational_and_Scope_Gaps_Batch.md` (resolves G-26): `source.mysql.binlog_purge_action: error
+(default) | re_snapshot`; GTID documented as preferred. Recovery via incremental re-snapshot (G-6).
 
-**Research agenda:** Specify slot create-if-absent / reconnect-if-LSN-matches / warn-otherwise. Validate slot-name uniqueness at config-validation time.
-
-### 7.2 MySQL GTID vs binlog — PARTIALLY RESOLVED 🔄
-`replication_type: binlog | gtid` present. Binlog-purge handling (stored position purged from server) still undefined.
-**Research agenda:** Add `mysql.binlog_purge_action: error | re_snapshot` (default error). Document GTID as preferred.
-
-### 7.3 MariaDB support — UNCHANGED 🟡
-`source.type` still only `postgres` / `mysql`.
+### 7.3 MariaDB support — RESOLVED (decision) ✅
+Resolved in `Operational_and_Scope_Gaps_Batch.md` (resolves G-38): **MariaDB is in scope via the
+MySQL-compatible path** for v1. The one genuine correctness dependency — MariaDB GTID is
+`domain-server-sequence`, not MySQL `uuid:tx` — extends the G-14 `SourcePosition` MySQL impl (both
+dialects); flagged as a §14 sub-research item, plus channel-C/DDL-classifier validation against MariaDB.
 
 ### 7.4 Connection pool management — PARTIALLY RESOLVED 🔄
 Snapshot connection budget is now documented inline ("≥ 3 connections per postgres snapshot job"). Reconnect backoff strategy still not in config.
@@ -732,13 +1146,16 @@ rejects). The generation-tagged-identity idea is adopted regardless (per-node `i
 
 ## 9. Management REST API
 
-### 9.1 API versioning — UNCHANGED 🟡
-`globals.api` defines `address`, `auth`, `user`, `password`, `tls` but no version path. With the expanded endpoint set (pause/stop/resume/restart/flush now added), versioning matters more.
-**Research agenda:** Adopt `/v1/...`; keep `/health/live`, `/health/ready`, `/metrics` unversioned and unauthenticated.
+### 9.1 API versioning — RESOLVED (design) ✅
+Resolved in `API_RBAC_and_Versioning.md` §2 (resolves G-9.1): functional/authenticated endpoints under
+**`/v1`**; `/health/live`, `/health/ready`, `/metrics` unversioned and unauthenticated.
 
-### 9.2 RBAC role matrix — UNCHANGED 🔴
-`auth` modes present and basic-auth credentials now configurable, but no role definitions or per-endpoint permission matrix. The new lifecycle endpoints (stop, shutdown, leave cluster) make this more urgent — these are destructive operations needing role gating.
-**Research agenda:** Define `viewer` / `operator` / `admin`; map every endpoint (including the new pause/stop/resume/restart/flush/leave/shutdown) to a minimum role. JWT/OAuth2 still need JWKS URL, issuer, audience fields — not present.
+### 9.2 RBAC role matrix — RESOLVED (design) ✅
+Resolved in `API_RBAC_and_Versioning.md` (resolves G-16). Linear hierarchy `admin ⊇ operator ⊇
+viewer`; full endpoint→min-role matrix (§2): viewer = status, operator = pipeline lifecycle + config
+reload/validate, admin = leave/shutdown. Binding per auth mode (none = open; basic = admin; jwt/oauth2
+= mapped `roles_claim`, max wins, 401 vs 403). Configurable `globals.api.role_mapping` for IdP role
+names. V-052 TLS-without-auth stays a warning.
 
 ### 9.3 Config reload proxy behavior — RESOLVED (design) ✅
 `Clustering_Architecture_Research.md` §9.2 resolves this: **no proxy and no per-pipeline routing of
@@ -759,24 +1176,27 @@ Partial-failure behavior (some tables valid, some not) undefined.
 ### 9.5 Basic auth credentials — RESOLVED ✅
 `globals.api.user` and `password` (env-var substitutable) are now present.
 
-### 9.6 NEW — `flush` and `restart` endpoint semantics overlap with config-driven behavior 🆕 🟢
-The `pipeline flush data to storage` endpoint forces an immediate flush, and `pipeline restart` forces a restart. Their interaction with the automatic `flush_mode` and config-reload-driven restart is undefined (e.g., does a manual flush reset the time-based flush timer?).
-**Research agenda:** Define that a manual flush resets the flush timer and counters; define that a manual restart follows the same in-flight-batch policy as a config-driven restart (see 2.2).
+### 9.6 `flush` and `restart` endpoint semantics — RESOLVED (design) ✅
+Resolved in `Pipeline_Lifecycle_State_Machine.md` §3: a manual `flush` forces an immediate flush and
+**resets the time-based flush timer + row/byte counters** (no-op warning if empty); a manual `restart`
+follows the same §12.4 discard-and-replay policy as a config-driven restart.
 
 ---
 
 ## 10. Observability
 
-### 10.1 Distributed tracing — UNCHANGED 🟡
-No `globals.tracing` / OTLP endpoint field.
-**Research agenda:** Add `globals.tracing.otlp_endpoint` (optional; disabled when absent).
+### 10.1 Distributed tracing — RESOLVED (design) ✅
+Resolved in `Observability_Metrics_and_Tracing.md` §3 (resolves G-32). `globals.tracing.otlp_endpoint`
+(disabled when absent) + `sample_ratio`; batch/commit-granularity spans, not per-source-event.
 
-### 10.2 Metrics catalogue — UNCHANGED 🟡
-`/metrics` endpoint exists; mandatory metric catalogue still undefined.
-**Research agenda:** Adopt the metric catalogue from prior revisions (replication lag, rows read, flush duration, snapshot progress, cluster members, WAL lag, Iceberg commit duration/failures, delete file count).
+### 10.2 Metrics catalogue — RESOLVED (design) ✅
+Resolved in `Observability_Metrics_and_Tracing.md` §2 (resolves G-33). Mandatory catalogue across
+replication, source, snapshot, Iceberg+maintenance, clustering, status; **pipeline-level labels by
+default, per-table opt-in** (`sink.metrics.per_table`) to bound cardinality.
 
-### 10.3 Log/trace correlation — UNCHANGED 🟡
-`log.format: json` confirmed; `trace_id`/`span_id` injection not yet required.
+### 10.3 Log/trace correlation — RESOLVED (design) ✅
+Resolved in `Observability_Metrics_and_Tracing.md` §4: inject `trace_id`/`span_id`/`pipeline` into the
+JSON logs (fields absent when tracing disabled).
 
 ---
 
@@ -803,9 +1223,9 @@ The §0 correctness invariant (catalog query supplies attributes of the implicat
 
 **Remaining open (kept by the schema doc §11):** DT-R2/R5/R6/R7 — minor recommendations (rename-when-unprovable policy, ENUM/SET representation coordination with G-18, `binlog_row_metadata` required-vs-recommended, `rescan_interval` default). All have recommendations; none are blockers.
 
-### 11.3 `glue.strip_schema` collisions — UNCHANGED 🟢
-`strip_schema` present; name-collision behavior (two schemas, same table name) undefined.
-**Research agenda:** Collision under `strip_schema: true` = validation error; define the non-stripped naming transform (`schema__table`).
+### 11.3 `glue.strip_schema` collisions — RESOLVED (design) ✅
+Resolved in `Operational_and_Scope_Gaps_Batch.md` (resolves G-11.3): collision under `strip_schema:
+true` = config-time validation error naming the colliding tables; non-stripped transform = `schema__table`.
 
 ---
 
@@ -820,39 +1240,49 @@ Both `globals.api.tls` and `globals.cluster.memberlist.tls` (cert/key/ca, env-va
 `ssl-mode` with full value set defined.
 
 ### 12.3 Cloud storage credential scope — PARTIALLY RESOLVED 🔄
-The draft now states "no explicit credentials config, the cloud SDK's default credential chain is used." This resolves the *mechanism* (default chain) but the minimum IAM permission documentation is still absent.
-**Research agenda:** Document minimum IAM permissions per provider (S3 Get/Put/Delete/List/Head; GCS objects create/get/delete/list; Azure Storage Blob Data Contributor).
+The draft now states "no explicit credentials config, the cloud SDK's default credential chain is used."
+**Resolved (G-37):** `Operational_and_Scope_Gaps_Batch.md` documents the minimum IAM permissions per
+provider (S3 Get/Put/Delete/List/Head; GCS objects create/get/delete/list; Azure Storage Blob Data
+Contributor) — CAS preconditions need no extra IAM action (request-header level).
 
 ---
 
 ## 13. Operational Edge Cases
 
-### 13.1 Back-pressure — PARTIALLY RESOLVED 🔄
-Data-Flow.md confirms automatic channel back-pressure. Channel/buffer capacity is still not a configurable parameter, and an unbounded channel would defeat the mechanism.
-**Research agenda:** Confirm all inter-task channels are bounded; expose capacity (e.g., `sink.buffer_capacity_rows`).
+### 13.1 Back-pressure — RESOLVED (design) ✅
+Resolved in `Operational_and_Scope_Gaps_Batch.md` (resolves G-27): all inter-task channels are bounded;
+capacity exposed as `sink.buffer_capacity_rows` (default ~200000); sits below the G-29 large-txn byte
+backstop. Sink/catalog failure drives a DEGRADED state that halts source reading via back-pressure.
 
 ### 13.2 Source DB unavailability — PARTIALLY RESOLVED 🔄
 Data-Flow.md defines reconnect with backoff (initial 1s, max 60s, jitter) and "in-progress snapshots paused, cursor preserved, resume after reconnect." This largely resolves the behavior. Backoff is documented in the data-flow doc but not exposed as config — acceptable if fixed.
 **Status:** Effectively resolved at the behavior level; only config-exposure is optional.
 
-### 13.3 Cloud storage unavailability — UNCHANGED 🟡
-Data-Flow.md's Iceberg-write-failure path covers retry + pause, but the DEGRADED-state buffering ceiling and the source-halt-on-full-buffer rule are not specified.
-**Research agenda:** Define retry count, DEGRADED state, buffer ceiling, source-halt to protect WAL.
+### 13.3 Cloud storage unavailability — RESOLVED (design) ✅
+Resolved in `Operational_and_Scope_Gaps_Batch.md` (G-27 §): persistent sink failure → DEGRADED (retry
+with backoff, stop consuming source once buffers fill via back-pressure, protecting the PG slot/WAL via
+the G-22 guard); recovers on next successful commit.
 
-### 13.4 Iceberg catalog unavailability — UNCHANGED 🟢
-Catalog retry semantics (separate from storage) and circuit breaker undefined.
+### 13.4 Iceberg catalog unavailability — RESOLVED (design) ✅
+Resolved in `Operational_and_Scope_Gaps_Batch.md` (resolves G-35): catalog-specific bounded retry +
+backoff + circuit breaker → DEGRADED (pause + alert), separate from object-storage retry. Optional
+`catalog.retry` config; else fixed defaults (5 attempts, 1s→30s).
 
-### 13.5 Large transactions — UNCHANGED 🟡
-No `max_transaction_batch_rows`. Data-Flow.md's "flush only on transaction boundary, never mid-transaction" rule actually *increases* this risk: a 10M-row transaction cannot be flushed until it commits, guaranteeing a giant in-memory batch.
-**Research agenda (now more urgent):** Add `max_transaction_batch_rows` with a documented trade-off: splitting a transaction across Iceberg commits breaks the "atomic transaction visibility" guarantee that Data-Flow.md currently promises. These two requirements are in direct tension and must be reconciled.
+### 13.5 Large transactions — RESOLVED (design) ✅
+Resolved in `Large_Transaction_Handling.md` (resolves G-29). **Bounded split commits** above
+`sink.max_transaction_batch_rows`, with the resume checkpoint **pinned at the txn start** until commit
+so a crash replays the whole txn (idempotent re-write, G-13). Default `null` = atomic visibility
+preserved; `sink.max_transaction_buffer_bytes` **halts** an unsplittable runaway rather than OOMing the
+worker. Atomicity is relaxed only for oversized txns, documented; spill-to-disk deferred.
 
 ### 13.6 Tables without primary keys — UNCHANGED 🟡
 System Overview line 50 states tables without a PK have replication halted and PK-less tables found via glob are skipped with a warning — this is good and resolves the *detection* and *default behavior*. Still missing: the `surrogate_key` config option to allow PK-less tables to be replicated with a user-designated identity.
 **Research agenda:** Add `tables.surrogate_key` override for tables lacking a natural PK.
 
-### 13.7 Azure Blob Storage — PARTIALLY RESOLVED 🔄
-`globals.cloud: azure` confirmed and the draft now states bucket = container for Azure. But Azure-specific fields (account name, credential mode) beyond the default credential chain are not enumerated.
-**Research agenda:** Confirm whether the default credential chain (managed identity) is sufficient for Azure, or whether `account_name` / explicit credential fields are needed.
+### 13.7 Azure Blob Storage — RESOLVED (design) ✅
+Resolved in `Operational_and_Scope_Gaps_Batch.md` (resolves G-34): default SDK credential chain
+(managed/workload identity), consistent with S3/GCS; optional `globals.azure.account_name` for
+disambiguation; container = bucket. No explicit secret fields.
 
 ---
 
@@ -865,10 +1295,13 @@ System Overview line 50 states tables without a PK have replication halted and P
 | Parquet file format tuning | Row group size, compression affect cost/perf | Apache Parquet documentation |
 | Arrow IPC / RecordBatch memory mgmt | Bounded channel capacity, buffer lifecycle | arrow-ipc crate docs |
 | Iceberg equality delete file format | Equality deletes recommended for CDC | Iceberg spec §3.3 + iceberg-rust writer API |
+| **iceberg-rust 0.9.0 equality-delete writer sequencing** (G-13 §8 gate) | The §0 strictly-less-than guarantee requires delete files to carry the enclosing commit's sequence number; if the crate mis-sequences or lacks equality deletes, the sink writer needs a workaround | iceberg-rust 0.9.0 writer API + source #43 |
 | Kubernetes operator patterns | SIGTERM drain, ConfigMap hot-reload, probes | K8s operator SDK patterns |
 | Rate limiting / throttling on source DB | High-throughput snapshot can overwhelm source | PG pg_stat_replication + MySQL throttling |
 | Iceberg commit.retry / conflict resolution | Concurrent commit handling before writer design | iceberg-rust commit API source |
 | `sqlparser-rs` for MySQL DDL parsing | Required for `schema_evolution.method: events` on MySQL | sqlparser-rs crate docs |
+| **MariaDB GTID dialect in `SourcePosition`** (G-38) | MariaDB GTID is `domain-server-sequence`, not MySQL `uuid:tx`; the G-14 position abstraction must parse/compare both; channel-C + DDL classifier validated against MariaDB | MariaDB GTID docs + `mysql_async`/binlog crate |
+| **Iceberg maintenance/compaction API in iceberg-rust** (G-25) | Gates any built-in maintenance scheduler; v1 delegates to external tooling until this lands | iceberg-rust rewrite/compaction API source |
 
 ---
 
@@ -886,9 +1319,9 @@ System Overview line 50 states tables without a PK have replication halted and P
 | G-2 | Config | Config propagation across workers | 🔴 Blocker | ✅ Resolved (design) — generation pointer in `globals.state` + gossiped `config_generation`; every node reconciles its own pipelines (Clustering doc §9) |
 | G-3 / 3a / 3b | Pipeline | Flush semantics (OR / null / seconds:0) | — | ✅ All resolved |
 | G-5 | Pipeline | In-flight batches during restart | — | ✅ Resolved (spec §12.4: discard-and-replay default) |
-| G-NEW-15 | Pipeline | Lifecycle API state machine (pause/stop/resume) | 🟡 High | 🆕 New |
-| G-6 | Snapshot | Resumability cursor format | 🔴 Blocker | 🔄 Open (layout defined, format not) |
-| G-7 | Snapshot | Cross-table consistency | 🔴 Blocker | 🔄 Partially (mechanism in Data-Flow; no toggle/fallback) |
+| G-NEW-15 | Pipeline | Lifecycle API state machine (pause/stop/resume) | 🟡 High | ✅ Resolved (design) — persisted desired-state RUNNING/PAUSED/STOPPED reconciled by owner (`Pipeline_Lifecycle…md`); §9.6 closed |
+| G-6 | Snapshot | Resumability cursor format | 🔴 Blocker | ✅ Resolved (design) — incremental chunked snapshot, typed identifier-tuple cursor + binary-collation pin (`Snapshot_Resumability…md`) |
+| G-7 | Snapshot | Cross-table consistency | 🔴 Blocker | ✅ Resolved (design) — lock-free convergent (watermark + upsert); no `RELOAD`/`LOCK TABLES`, no toggle (`Snapshot_Resumability…md` §3) |
 | G-7a | Snapshot | Override semantics | — | ✅ Resolved |
 | G-7b | Snapshot | `dump_*` mode definitions | — | ✅ Resolved (defined in System Overview) |
 | G-NEW-16 | Snapshot | Default mode disagreement (`never` vs `initial`) | — | ✅ Resolved (both say `never`) |
@@ -896,42 +1329,43 @@ System Overview line 50 states tables without a PK have replication halted and P
 | G-9 | Cluster | Rebalancing handoff (planned drain) | 🔴 Blocker | ✅ Resolved (design) — drain→flush→commit→checkpoint→release-lease; rate-limited; planned vs unplanned paths split (Clustering doc §8) |
 | G-9a | Cluster | Single-node mode behavior | 🟡 High | 🔄 Partially (intent stated, behavior not) |
 | G-10 | State | State layout keyed on name not id | — | ✅ Resolved (Data-Flow + config now use `id`) |
-| G-11 | State | Atomic updates on S3 | 🔴 Blocker | 🔄 Open |
+| G-11 | State | Atomic updates on S3 | 🔴 Blocker | ✅ Resolved (design) — same as D-5; CAS primitive on all 3 backends (§5.2); empirical conformance gate = `prototypes/lease-conformance` T1–T10 |
 | G-12 | Iceberg | COW vs MOR | — | ✅ Resolved |
-| G-12a | Iceberg | Strategy change migration | 🟡 High | 🔄 Open |
-| G-13 | Iceberg | Ghost row / `primary_key` dedup | 🔴 Blocker | 🔄 Open (metadata cols added; PK config missing) |
-| G-14 | Iceberg | Delivery guarantee | 🔴 Blocker | 🔄 Partially (model chosen; GTID-set guard undefined) |
-| G-15 | Postgres | Slot lifecycle | 🔴 Blocker | 🔄 Open (+ `auto_cleanup` field missing from config) |
-| G-16 | API | RBAC role matrix | 🔴 Blocker | 🔄 Auth verification schema done (spec §6.3.1); role→permission matrix still deferred to API design |
+| G-12a | Iceberg | Strategy change migration | 🟡 High | ✅ Resolved (design) — new-data-only + explicit compaction/re-snapshot migration (`Iceberg_Partitioning…md` §4) |
+| G-13 | Iceberg | Ghost row / `primary_key` dedup | 🔴 Blocker | ✅ Resolved (design) — equality-delete keying + per-`_seq` keep-last dedup + mirror deletes (`Ghost_Row_Dedup…md`); residual = iceberg-rust writer verification (§14) |
+| G-14 | Iceberg | Delivery guarantee | 🔴 Blocker | ✅ Resolved (design) — `SourcePosition` (LSN numeric / GTID subset), per-table HWM + laggard checkpoint, idempotency-is-correctness (`Delivery_Guarantee…md`) |
+| G-15 | Postgres | Slot lifecycle | 🔴 Blocker | ✅ Resolved (design) — runtime state machine: orphan policy (`on_orphan`), `slot_management`, WAL-gone re-snapshot, publication reconcile (`Postgres_Slot…md`) |
+| G-16 | API | RBAC role matrix | 🔴 Blocker | ✅ Resolved (design) — `admin⊇operator⊇viewer`, full endpoint matrix, per-mode binding, configurable IdP `role_mapping` (`API_RBAC_and_Versioning.md`) |
+| G-9.1 | API | API versioning | 🟡 High | ✅ Resolved (design) — `/v1` for functional endpoints; health/metrics unversioned+unauth (`API_RBAC…md` §2) |
 | G-16a | API | Basic auth + JWT/OAuth2 verification fields | — | ✅ Resolved (basic creds + §6.3.1 jwt/oauth2 schema) |
 | G-17 | API | Config reload proxy | 🔴 Blocker | ✅ Resolved (design) — no proxy; 202 + `GET /v1/config/status` poll; every node reconciles its own owned pipelines (Clustering doc §9.2) |
 | G-18 | Data Types | Type mapping table | — | ✅ Resolved (`Type_Mapping.md` — full 3-hop PG+MySQL→ColumnValue→Arrow→Iceberg) |
 | G-19 | Data Types | DDL classification | — | ✅ Resolved (`Schema_Change…md` §7.2 classification table; four-channel detection) |
-| G-19a | Data Types | MySQL DDL parser | 🟡 High | 🔽 Scope reduced — channel C supplies the delta; parser only classifies DDL + extracts table name (+rename keyword), not full ALTER-delta. De-risked but still required. |
+| G-19a | Data Types | MySQL DDL parser | 🟡 High | ✅ Resolved (design) — two-tier fail-soft classifier (sqlparser-rs → regex → channel C); router not delta-parser (`MySQL_DDL_Classifier.md`) |
 | G-19b | Data Types | Behavior when evolution disabled | — | ✅ Resolved (halt table, continue others) |
-| G-20 | Snapshot | On-demand resume read point | 🟡 High | 🔄 Partially (pause_lsn+1 defined; read-point assumption risky) |
+| G-20 | Snapshot | On-demand resume read point | 🟡 High | ✅ Resolved (design) — on-demand = incremental chunk loop, no stream pause, no read-point assumption (`Snapshot_Resumability…md` §4) |
 | G-21 / 21a | Snapshot | Parallelism + connection budget | — | ✅ Resolved |
-| G-22 | Cluster | Checkpoint staleness / WAL lag | 🟡 High | 🔄 Partially (checkpoint freq resolved; WAL-lag guard not) |
+| G-22 | Cluster | Checkpoint staleness / WAL lag | 🟡 High | ✅ Resolved (design) — `max_wal_lag_bytes` (alert-only default, opt-in halt) + `cdc_wal_lag_bytes` (`Operational…Batch.md`) |
 | G-23 | Cluster | SWIM Lifeguard / Scuttlebutt decision | 🟡 High | ✅ Decided — keep SWIM + Lifeguard; no mutable KV in gossip; SWIM accuracy is latency-not-safety (Clustering doc §3.6) |
-| G-24 | Iceberg | Partitioning strategy | 🟡 High | 🔄 Open |
-| G-25 | Iceberg | Maintenance responsibilities | 🟡 High | 🔄 Open |
-| G-26 | MySQL | Binlog purge handling | 🟡 High | 🔄 Recovery path now defined (`Schema_Change…md` §8.2: non-replayable gap → re-snapshot); `binlog_purge_action` config field still reserved (spec §16) |
-| G-27 | Ops | Back-pressure buffer capacity config | 🟡 High | 🔄 Partially |
+| G-24 | Iceberg | Partitioning strategy | 🟡 High | ✅ Resolved (design) — `tables.partitioning` transforms; partition-key mutation via before-image; spec-evolution (`Iceberg_Partitioning…md`) |
+| G-25 | Iceberg | Maintenance responsibilities | 🟡 High | ✅ Resolved (design) — external maintenance v1 + when-needed signals + reserved `sink.maintenance` (`Iceberg_Maintenance.md`) |
+| G-26 | MySQL | Binlog purge handling | 🟡 High | ✅ Resolved (design) — `binlog_purge_action: error (default) | re_snapshot` (`Operational…Batch.md`) |
+| G-27 | Ops | Back-pressure buffer capacity config | 🟡 High | ✅ Resolved (design) — bounded channels + `sink.buffer_capacity_rows` + DEGRADED back-pressure (`Operational…Batch.md`) |
 | G-28 | Ops | Source DB unavailability | 🟡 High | ✅ Resolved (behavior in Data-Flow) |
-| G-29 | Ops | Large transaction splitting | 🟡 High | 🔄 Open (now in tension with txn-atomic flush rule) |
-| G-30 | Ops | Tables without PK / surrogate key | 🟡 High | 🔄 Partially (detection resolved; surrogate_key missing) |
+| G-29 | Ops | Large transaction splitting | 🟡 High | ✅ Resolved (design) — bounded split commits + checkpoint-pinning + memory backstop halt (`Large_Transaction_Handling.md`) |
+| G-30 | Ops | Tables without PK / surrogate key | 🟡 High | ✅ Resolved by rejection — PK-less tables **halt** (line 50 kept); `surrogate_key` removed from config §16, no append-only mode (`Ghost_Row_Dedup…md` §3) |
 | G-31 | Security | TLS for API + gossip | — | ✅ Resolved (tls sections added; `cat:` typo fixed) |
-| G-32 | Observability | Distributed tracing | 🟡 High | 🔄 Open |
-| G-33 | Observability | Metrics catalogue | 🟡 High | 🔄 Open |
-| G-34 | Ops | Azure-specific config fields | 🟡 High | 🔄 Partially (cloud:azure + container mapping defined) |
-| G-35 | Ops | Catalog unavailability | 🟢 Medium | 🔄 Open |
+| G-32 | Observability | Distributed tracing | 🟡 High | ✅ Resolved (design) — `globals.tracing.otlp_endpoint`, commit-granularity spans (`Observability_Metrics…md`) |
+| G-33 | Observability | Metrics catalogue | 🟡 High | ✅ Resolved (design) — mandatory catalogue + pipeline-default/per-table-opt-in cardinality (`Observability_Metrics…md`) |
+| G-34 | Ops | Azure-specific config fields | 🟡 High | ✅ Resolved (design) — default credential chain + optional `azure.account_name` (`Operational…Batch.md`) |
+| G-35 | Ops | Catalog unavailability | 🟢 Medium | ✅ Resolved (design) — catalog-specific retry + circuit breaker + DEGRADED (`Operational…Batch.md`) |
 | G-36 | Cluster | Token count consistency rule | — | ✅ Resolved (spec V-026/V-062: cluster-wide anchor in globals.state, mismatch rejected) |
-| G-37 | Security | IAM permission documentation | 🟢 Medium | 🔄 Open |
-| G-38 | MySQL | MariaDB in-scope decision | 🟢 Medium | 🔄 Open |
+| G-37 | Security | IAM permission documentation | 🟢 Medium | ✅ Resolved (design) — per-provider minimum IAM permissions documented (`Operational…Batch.md`) |
+| G-38 | MySQL | MariaDB in-scope decision | 🟢 Medium | ✅ Resolved — **in scope** (MySQL path); MariaDB GTID-dialect handling in `SourcePosition` flagged as §14 sub-item (`Operational…Batch.md`) |
 | G-39 | Config | Env-var substitution syntax | — | ✅ Resolved (full grammar, spec §4.3) |
-| G-NEW-20 | State | Data-Flow `pipelines/<id>/` segment redundant under spec §10 | 🟢 Medium | 🆕 New (doc reconciliation: re-root Data-Flow state diagram) |
-| G-NEW-21 | Config | Type_Mapping config fields + rules not yet in spec §13 | 🟡 High | 🆕 New (4 fields + 4 validation rules to merge: tinyint1_*, toast_strategy, column_type_overrides, numeric_overflow_action) |
-| G-NEW-22 | Data Flow | `ColumnValue` enum extensions not reflected in Data-Flow.md | 🟢 Medium | 🆕 New (doc reconciliation: 4 enum additions — tz flag, array element type, Time, UInt64) |
+| G-NEW-20 | State | Data-Flow `pipelines/<id>/` segment redundant under spec §10 | 🟢 Medium | ✅ Resolved — Data-Flow.md state diagram re-rooted (v13.13) |
+| G-NEW-21 | Config | Type_Mapping config fields + rules not yet in spec §13 | 🟡 High | ✅ Resolved — 4 fields + V-077…V-082 merged into Configuration_Specification.md (v13.13) |
+| G-NEW-22 | Data Flow | `ColumnValue` enum extensions not reflected in Data-Flow.md | 🟢 Medium | ✅ Resolved — enum extended (`UInt64`, `with_tz`, `Time`, typed `Array`) + `ColumnValueType` (v13.13) |
 | G-NEW-17 | Postgres | `auto_cleanup` referenced but missing from config | — | ✅ Resolved (field added) |
 | G-NEW-18 | Snapshot | Line-46 summary still lists orphaned `only` | — | ✅ Resolved (line 46 corrected) |
 | G-NEW-19 | Config | `defaults.catalog` still uses old `basic`/`user`/`password` schema | — | ✅ Resolved (defaults block aligned) |

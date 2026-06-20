@@ -572,6 +572,7 @@ source:
 | `timeouts.connect` | Duration | no | `10s` | PR | |
 | `timeouts.command` | Duration | no | `30s` | PR | |
 | `timeouts.snapshot` | Duration | no | `6h` | PR | **Per-table** snapshot timeout. |
+| `toast_strategy` | enum `carry_forward`\|`re_query` | no | `carry_forward` | PR | **PostgreSQL only.** Handling of unchanged TOAST(out-of-line) columns in UPDATE events: `carry_forward` reuses the last known value; `re_query` re-fetches the row over the control connection. `re_query` on high-volume snapshots may saturate the control pool (V-077 warning). Ignored for MySQL. See `research/Type_Mapping.md`. |
 
 > **CHANGE (vs draft):** `ssl-mode`/`ssl-cert`/`ssl-key`/`ssl-ca` renamed to snake_case
 > (`ssl_mode`, …) for consistency with the rest of the schema.
@@ -590,6 +591,8 @@ source:
 | Field | Type | Required | Default | Mutability | Notes |
 |---|---|---|---|---|---|
 | `replication_type` | enum `binlog`\|`gtid` | no | `binlog` | PR | `gtid` is preferred (position-independent, gap-free). |
+| `tinyint1_as_bool` | bool | no | `true` | PR | Map `TINYINT(1)` columns to Iceberg `boolean`. When `true`, requires the display-width from the catalog query (channel C); when `false`, `TINYINT(1)` maps as `TINYINT SIGNED` → `Int16`. See `research/Type_Mapping.md`. |
+| `tinyint1_detection` | enum `information_schema`\|`none` | no | `information_schema` | PR | Source of the `TINYINT(1)` display-width signal. `none` disables the detection (all `TINYINT` treated as integer); `information_schema` uses the catalog query (always available via channel C). |
 
 ### 9.3 `tables`
 
@@ -610,6 +613,8 @@ tables:
 | `snapshots.mode` | enum | no | `never` | PR | `never`\|`initial`\|`always`\|`dump_always`\|`dump_initial` (semantics in `System-Overview.md`). |
 | `snapshots.parallelism` | integer | no | `1` | R | ≥ 1 (V-027). Concurrent snapshot jobs. **> 4 warns** (V-038): each PG snapshot job uses ≥ 3 connections. The limit is read by the snapshot scheduler at job-launch time; a change affects only **future** scheduling — in-flight and already-queued jobs are unaffected — so it applies in place. Implies an adjustable permit count, not a pool sized once at pipeline start. |
 | `snapshots.overrides` | map<table,mode> | no | `{}` | PR | Per-table mode override. Keys are full `schema.table` for PostgreSQL / bare table name for MySQL (V-064), **no globs** (V-033). A key not in the resolved set **warns** at load (V-034). Not allowed in `defaults`. |
+| `column_type_overrides` | map<column, iceberg-type-string> | no | `{}` | PR | Per-column target-Iceberg-type override applied at schema resolution (e.g. `public.orders.amount: "decimal(38,10)"`). Value must be a valid Iceberg type string (V-078). First step of the unsupported-type fallback chain (`research/Type_Mapping.md`). |
+| `numeric_overflow_action` | enum `string`\|`error` | no | `string` | PR | Action when a `numeric(P,S)` with `P > 38` (beyond Iceberg `decimal` range) is encountered: `string` serializes it as text; `error` halts the table. With `error`, unscaled `numeric` columns may halt unexpectedly (V-079 warning). |
 
 Glob grammar: `*` matches within a single name segment (it does not cross the `.` separator);
 matching is case-sensitive. The match target depends on the engine — **PostgreSQL** matches
@@ -1020,6 +1025,9 @@ radius. `reload` locus marks a rule that can only fire on reload.
 | V-072 | `globals.cluster.lease_safety_margin` | 0 ≤ margin ≤ 0.5. Outside 0.05–0.30 → also `warning`. Fraction of `lease_duration` held back as the renewal safety-deadline `guard` (Clustering doc §19.3/§19.6, D-8). | error / warning | config |
 | V-074 | `globals.cluster.max_concurrent_handoffs` / `globals.cluster.max_concurrent_takeovers` | ≥ 1 (per-node concurrency caps; local resource knobs, not cluster-wide-consistent). Clustering doc §8.5/§20.2 (G-9, D-10). | error | config |
 | V-075 | `globals.cluster.lock_backend` | ∈ {storage, kubernetes}. `kubernetes` is reserved / not yet implemented → `error` in v1. Clustering doc §5.6 (D-2). | error | config |
+| V-080 | `source.toast_strategy` | ∈ {carry_forward, re_query} (PostgreSQL only; ignored for MySQL). `research/Type_Mapping.md`. | error | pipeline |
+| V-081 | `source.mysql.tinyint1_detection` | ∈ {information_schema, none}. | error | pipeline |
+| V-082 | `tables.numeric_overflow_action` | ∈ {string, error}. | error | pipeline |
 
 ### 13.4 Cross-field / conditional
 
@@ -1036,6 +1044,7 @@ radius. `reload` locus marks a rule that can only fire on reload.
 | V-037 | `sink.flush.seconds` | 0 < seconds < 5 (write amplification). | warning | pipeline |
 | V-038 | `tables.snapshots.parallelism` | > 4 (connection budget). | warning | pipeline |
 | V-064 | `tables.include`/`exclude` globs and `snapshots.overrides` keys, when `source.type = mysql` | Must be bare table names — no `.` namespace prefix (the database is fixed by `source.db`). | error | pipeline |
+| V-077 | `source.toast_strategy = re_query` with `tables.snapshots.mode = always` | `re_query` on high-volume snapshots may saturate the control connection pool. | warning | pipeline |
 
 ### 13.5 Catalog authentication (the 9 rules from `Catalog_Auth_Research.md`)
 
@@ -1094,6 +1103,13 @@ a runtime concern, §1.4).
 | V-071 | `catalog.rest.token_file` | Resolved path exists and is readable; content (the raw token, trailing whitespace trimmed) is non-empty. | error | pipeline |
 | V-068 | TLS material (`cert`/`key`/`ca` across `globals.api`, `memberlist`, `source.ssl_*`, `catalog.*`) | Resolved value (inline / file / env) is non-empty and parses as valid PEM (and a private key where a key is expected). | error | config / pipeline |
 | V-069 | any other referenced file (e.g. `catalog.hive.kerberos.keytab`) | Resolved path exists, is readable, and is non-empty. | error | pipeline |
+| V-078 | `tables.column_type_overrides` values | Each value is a valid Iceberg type string; else error `"invalid Iceberg type <value> in column_type_overrides for <table>.<column>"`. | error | pipeline |
+| V-079 | `tables.numeric_overflow_action = error` with any source `numeric` column lacking declared precision | Such a column may halt the table unexpectedly under `error`; consider a `column_type_overrides` entry. (Emitted at schema resolution.) | warning | pipeline |
+
+> **Reconciliation note (G-NEW-21).** An earlier Type_Mapping draft proposed a warning tying
+> `tinyint1_detection` to `schema_evolution.method: events`. That field was **removed** (detection is
+> the fixed four-channel model), and the catalog query is always available via channel C, so the
+> warning is **dropped** — `tinyint1_as_bool` works regardless of detection method.
 
 ---
 

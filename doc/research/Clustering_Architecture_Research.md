@@ -975,6 +975,13 @@ conformance suite as a CI merge gate, and a documented **per-backend drop-to-nat
 if a capability or mapping gap is found. This is the `cluster.lock_backend: storage` implementation;
 the optional `kubernetes` backend (D-2) is a separate `LeaseStore` impl over the K8s Lease API.
 
+> **APPROVED + scaffolded (2026-06-20).** Route A approved. The `LeaseStore` trait and the T1–T10
+> conformance suite are now scaffolded at **`prototypes/lease-conformance/`** (runnable via
+> `cargo test` against MinIO / fake-gcs-server / Azurite, with T4/T5/T9/T10 flagged for real-service
+> runs). D-5 stays **open-until-executed**: the suite must pass against real S3, GCS *and* Azure once —
+> T10 (GCS generation-vs-ETag) is the gating assertion — before the storage lease is trusted in
+> production. This is the only remaining clustering item that cannot be closed on paper.
+
 ---
 
 ## 18. D-6 elaborated — Lease timing and the replication-lag budget
@@ -1046,7 +1053,14 @@ failover-speed vs false-takeover/pause-tolerance.
 - Keep `lease_duration ≫ probe_interval + suspicion` (15s ≫ ~5s ✓) so normal SWIM jitter never races
   the lease.
 
-### 18.6 D-6 output
+### 18.6 D-6 output — RATIFIED (Balanced, 2026-06-20)
+
+**Signed off:** ship **Balanced** as the default profile (`lease_duration = 15s`,
+`lease_renewal_interval = 5s`), ~20–22s worst-case unowned window, fitting a ~60s max-lag SLA with
+margin. Fast (5s/1.5s) is the documented opt-in for latency-critical deployments with validated low S3
+tail latency; Conservative (30s/10s) for high-stall workloads. The two OQ-OB2 feedbacks below remain
+open as *tuning inputs*, not blockers — the defaults stand until load tests measure real p99 worker
+stalls.
 
 Ship **Balanced** defaults (`lease_duration = 15s`, `lease_renewal_interval = 5s`); both are config
 (§11), so operators tune per environment, and the trade table is the guidance. Revisit once **OQ-OB2

@@ -234,16 +234,29 @@ Row = Vec<(column_name: String, value: ColumnValue)>
 ColumnValue = Null
             | Bool(bool)
             | Int16(i16) | Int32(i32) | Int64(i64)
+            | UInt64(u64)                                            // MySQL/MariaDB BIGINT UNSIGNED (Type_Mapping Gap C)
             | Float32(f32) | Float64(f64)
             | Numeric(Decimal)
             | Text(String)
             | Bytes(Vec<u8>)
-            | Timestamp(DateTime<Utc>)
+            | Timestamp { value: DateTime<Utc>, with_tz: bool }     // with_tz distinguishes timestamp vs timestamptz (Gap A)
             | Date(NaiveDate)
+            | Time(NaiveTime)                                       // PG time / MySQL TIME, no date component (Gap D)
             | Uuid(Uuid)
             | Json(serde_json::Value)
-            | Array(Vec<ColumnValue>)
+            | Array { element_type: ColumnValueType, values: Vec<ColumnValue> }  // typed element for ListBuilder<T> (Gap B)
+
+// element-type tag carried by Array so the accumulator can build a typed Arrow ListBuilder<T>
+ColumnValueType = BoolType
+                | Int16Type | Int32Type | Int64Type | UInt64Type
+                | Float32Type | Float64Type | NumericType(u8, i8)
+                | TextType | BytesType | TimestampType | DateType | TimeType
+                | UuidType | JsonType | ArrayType(Box<ColumnValueType>)
 ```
+
+The four extensions over the original enum — `UInt64`, the `with_tz` flag on `Timestamp`, `Time`, and
+the typed `Array` — are required by the Hop-2 accumulator; see `research/Type_Mapping.md` §"ColumnValue
+enum extensions" for the per-extension correctness rationale.
 
 ---
 
@@ -365,24 +378,29 @@ The state storage write (step 4 / step 2) is the crash-safe checkpoint. On resta
 
 ## State Layout in Cloud Storage
 
+Per-pipeline state is rooted at the **per-pipeline state location** — `state.prefix` (or `sink.prefix`),
+which defaults to the pipeline `id` (see `Configuration_Specification.md` §10). The state is already
+per-pipeline-scoped by that prefix, so there is **no** redundant `pipelines/<id>/` parent segment; the
+files sit directly under the per-pipeline root. Cross-pipeline data (config generation, cluster anchor,
+membership, the lease registry) lives separately under `globals.state` per
+`research/Clustering_Architecture_Research.md` §12.
+
 ```
-<state_prefix>/                                  (global, from globals config section)
-└── pipelines/
-    └── <pipeline-id>/
-        ├── pipeline-state.json                  — overall pipeline state version
-        ├── replication/
-        │   ├── slot.json                        — PG: slot name, confirmed_flush_lsn
-        │   └── gtid.json                        — MySQL: current gtid_executed set
-        └── snapshots/
-            ├── <schema>.<table>.json            — per-table snapshot state
-            │   {
-            │     "status": "completed",          // none | in_progress | completed | broken
-            │     "start_lsn": "0/1A2B3C4",
-            │     "cursor": null,                 // keyset/offset for resume on crash
-            │     "row_count": 1234567,
-            │     "completed_at": "2026-06-06T..."
-            │   }
-            └── ...
+<per-pipeline state location>/                   (state.prefix | sink.prefix, defaults to pipeline id)
+├── pipeline-state.json                          — overall pipeline state version
+├── replication/
+│   ├── slot.json                                — PG: slot name, confirmed_flush_lsn
+│   └── gtid.json                                — MySQL: current gtid_executed set
+└── snapshots/
+    ├── <schema>.<table>.json                    — per-table snapshot state
+    │   {
+    │     "status": "completed",                  // none | in_progress | completed | broken
+    │     "start_lsn": "0/1A2B3C4",
+    │     "cursor": null,                         // keyset/offset for resume on crash
+    │     "row_count": 1234567,
+    │     "completed_at": "2026-06-06T..."
+    │   }
+    └── ...
 ```
 
 ---

@@ -1,0 +1,650 @@
+---
+updated: 2026-06-20
+domain: Architecture
+tags: [gap-analysis, design, re-derivation, spec-readiness, blockers, open-decisions]
+resolves: []
+sources: [Sources_Index_v3.md]
+---
+
+# CDC System — Design Gap Analysis (fresh re-derivation, v1)
+
+> **This document is a from-scratch re-evaluation.** It deliberately ignores the content of
+> `CDC_Gap_Analysis_Report.md` (v9) and re-derives the gap set directly from the four spec
+> documents and the thirteen research documents as they stand on 2026-06-20. The legacy report is
+> retained unchanged as the historical audit trail. Where a re-derived gap maps onto a legacy ID,
+> the legacy ID is shown in *(parentheses)* so the two trackers can be reconciled.
+>
+> Purpose, per the brief: **prepare a strong foundation for application-specification elaboration.**
+> The lens is comprehensive — every domain is mapped, including what is already resolved (with the
+> resolving document cited) and everything still open, risky, or contradictory.
+
+---
+
+## 1. Method & inputs
+
+This analysis was produced by reading, in full:
+
+**Specs (Oleksii owns; source of truth):**
+`System-Overview.md`, `Data-Flow.md`, `Configuration_Specification.md`, `Schema_Change_Detection_and_Evolution.md`.
+
+**Research (Claude authors; Oleksii reviews):**
+`Type_Mapping.md`, `Catalog_Auth_Research.md`, `Clustering_Architecture_Research.md`,
+`Snapshot_Resumability_and_Consistency.md`, `Ghost_Row_Dedup_and_Primary_Keys.md`,
+`Delivery_Guarantee_and_Position_Guard.md`, `Pipeline_Lifecycle_State_Machine.md`,
+`Postgres_Slot_and_Publication_Lifecycle.md`, `MySQL_DDL_Classifier.md`,
+`Iceberg_Maintenance.md`, `Iceberg_Partitioning_and_Layout_Evolution.md`,
+`Large_Transaction_Handling.md`, `Observability_Metrics_and_Tracing.md`,
+`Operational_and_Scope_Gaps_Batch.md`, `API_RBAC_and_Versioning.md`.
+
+**Reference (read-only):** `Sources_Index_v3.md` (50-source index; crate versions & external protocols).
+
+Each domain section below states the **design state**, then a **gap table**. A "gap" here is any
+question whose answer the application specification will need: an open decision, an unverified
+external dependency, a contradiction between two documents, an unhandled edge case, or spec text
+that no longer matches the agreed design.
+
+---
+
+## 2. Legend
+
+### Severity
+- 🔴 **Blocker** — implementation/spec of the affected component cannot responsibly start until this is closed.
+- 🟡 **High** — a wrong or missing answer causes correctness bugs or data loss in some path.
+- 🟢 **Medium** — degrades performance, operability, or document coherence; not a correctness risk.
+
+### Status
+- ✅ **Resolved** — a spec or research document fully closes it; only execution/ratification remains.
+- 🔄 **Partial** — design decided, but a sub-question, verification, or spec-merge is still open.
+- 🟥 **Open** — no settled answer yet; genuine work for the spec-elaboration phase.
+- 🧪 **Verify** — design is settled *on paper* but rests on an unproven external capability (a pinned
+  crate version or a cloud-storage guarantee) that must be empirically confirmed before it can be trusted.
+
+A 🧪 item is *not* a design gap — it is an execution gate. They are tracked separately (§21) because
+they are the items most likely to invalidate a "design complete" claim if they fail.
+
+### ID scheme
+Fresh, domain-prefixed, sequential: `DA-<DOMAIN>-<n>`. Domains: `SYS`, `CFG`, `FLOW`, `TYPE`,
+`SCHEMA`, `CLUS`, `SNAP`, `DEDUP`, `CAT`, `SINK`, `SRC`, `OBS`, `API`, `OPS`, `DEP`.
+
+---
+
+## 3. Executive dashboard
+
+The design corpus is **substantially complete**. Of the original blocker set, the clustering,
+type-mapping, schema-evolution, snapshot, dedup/delivery, lifecycle, slot-lifecycle, catalog-auth,
+RBAC, observability, and operational domains are all closed *on paper*. What remains is concentrated
+in three buckets:
+
+1. **Empirical capability gates (🧪)** — a handful of external guarantees that must be proven before
+   the code that depends on them can be trusted. These are the single biggest risk to a
+   "design-complete" claim. See §21.
+2. **Spec-merge debt (🟢, mostly)** — a large volume of agreed decisions that live only in research
+   docs and have not yet been folded into the authoritative specs (especially `Data-Flow.md`, which
+   still describes a superseded snapshot model, and `Configuration_Specification.md` §16's reserved
+   field list). See §19.
+3. **A short list of genuinely open design questions (🟥)** — mostly scoping/SLA decisions and a few
+   newly-surfaced edge cases. See §20 and §18.
+
+### Remaining blockers (🔴)
+
+| ID | Title | Why it blocks |
+|---|---|---|
+| DA-CLUS-1 | Conditional-write (CAS) conformance on S3 **and** GCS **and** Azure | The entire single-writer safety guarantee rests on this one primitive; the GCS generation-vs-ETag trap can silently break it. Scaffolded, not yet executed against real services. *(D-5)* |
+| DA-SINK-1 | iceberg-rust equality-delete writer assigns delete files the **enclosing commit's sequence number** | The ghost-row correctness rule (strictly-less-than) and thus all MOR dedup depends on it; unverified against the pinned crate. *(G-13 §8)* |
+
+Everything else is 🧪 (other capability gates), 🟡/🟢 with a decided design, or 🟥 scoping work that
+does not block starting the specification.
+
+### Counts (by status)
+
+| Status | Count (approx.) | Notes |
+|---|---|---|
+| ✅ Resolved | ~70% of items | Design closed by a research/spec doc. |
+| 🔄 Partial | small | Decided but with an open sub-item. |
+| 🟥 Open | ~12 items | §20 register. |
+| 🧪 Verify | 6 gates | §21. |
+| 🟢 Spec-merge debt | ~30 edits owed (16 config + 9 data-flow + 6 overview) | §19. |
+
+---
+
+## 4. Architecture & system scope (SYS)
+
+**State.** `System-Overview.md` fixes the top-level shape: Rust + Arrow + Iceberg + memberlist +
+tokio; pipeline as the unit of replication; per-table halt philosophy; "no local state, everything
+durable to cloud storage"; app creates/destroys its own DB resources but never deletes Iceberg
+artifacts. Most of the original "Open Questions" block in that doc has since been answered by the
+research corpus.
+
+| ID | Title | Sev | Status | Resolution / note | Old ID |
+|---|---|---|---|---|---|
+| DA-SYS-1 | Two-plane architecture (AP coordination ring + CP lease) | 🔴→✅ | ✅ | `Clustering_Architecture_Research.md` §1 — ring decides *should-own*, lease decides *may-run*. | OQ-CL1 |
+| DA-SYS-2 | Single-node = one-member cluster, same code path | 🟡 | ✅ | Clustering §10; lease stays on to guard rolling-deploy double-singleton. | OQ-CL4 |
+| DA-SYS-3 | "App never deletes Iceberg artifacts" vs maintenance/orphan cleanup ownership | 🟢 | ✅ | `Iceberg_Maintenance.md` — v1 maintenance is external (operator/Spark/Trino); app exposes signals + reserves `sink.maintenance`. | OQ-M2, G-25 |
+| DA-SYS-4 | Reserved metadata column collision (`_op/_ts/_lsn/_source_db/_pipeline` vs a source column of the same name) | 🟡 | 🟥 | Config spec §5 only says operators "should be aware." **No defined runtime behavior** if a source table actually has an `_op` column — rename? prefix-escape? halt? Needs a rule. See DA-FLOW-5. | — |
+| DA-SYS-5 | Lineage column `_seq` (per-change order) is required by dedup but absent from the documented lineage column set | 🟡 | 🟥 | `Ghost_Row_Dedup_and_Primary_Keys.md` §4 introduces `_seq`; `Data-Flow.md`'s lineage table lists only five `_`-columns and `CdcEvent` carries only commit `source_pos`. The per-change position must be added to both. See DA-FLOW-2. | — |
+| DA-SYS-6 | `snapshot_mode: only` referenced but not in the enum | 🟢 | ✅(moot) | The enum is `never\|initial\|always\|dump_always\|dump_initial` (config §9.3). The stray "only" in System-Overview's OQ-M2 is superseded by `dump_*`. Drop the dangling reference. | OQ-M2 |
+
+---
+
+## 5. Configuration model (CFG)
+
+**State.** `Configuration_Specification.md` is the most mature spec: full type vocabulary, env-var
+grammar, two-phase validation (structural Phase 1 / resolution Phase 2), the R/PR/PROC mutability
+model, merge/union semantics, the 80+ rule master validation table (§13), and a complete annotated
+example. The catalog-auth and schema-evolution surfaces are already merged. The principal CFG gaps
+are **not** in the model itself but in **reserved fields awaiting promotion** (§16 of that spec) and
+in keeping the table synchronized with research outputs.
+
+| ID | Title | Sev | Status | Resolution / note | Old ID |
+|---|---|---|---|---|---|
+| DA-CFG-1 | Config data model fully specified | 🔴→✅ | ✅ | The whole `Configuration_Specification.md`. | OQ-C2, G-1f |
+| DA-CFG-2 | Env-var substitution grammar (`${VAR}`, `:-default`, `$$` escape, coercion order) | 🟡 | ✅ | Config §4.3. | — |
+| DA-CFG-3 | Secret **rotation** without process restart | 🟡 | ✅ | `credentials_file`/`token_file` (§4.6) + resolved-config diffing (§11.1). | OQ-C3 (partial) |
+| DA-CFG-4 | External secret-manager integration (Vault / AWS SM / GCP SM) | 🟢 | 🟥 | Only env-var and file-content rotation are designed. Direct secret-manager integration is **undecided** — likely out-of-scope-for-v1, but say so explicitly (file-on-tmpfs by a sidecar is the implied pattern). | OQ-C3 (remainder) |
+| DA-CFG-5 | Flush-trigger multi-criteria semantics (OR, first-wins, tri-state null) | 🟡 | ✅ | Config §9.4.1; `Data-Flow.md` §Flush decision. | OQ-P1 |
+| DA-CFG-6 | Reserved cluster fields not yet promoted into `globals.cluster` table | 🟢 | 🔄 | `lease_duration`, `lease_renewal_interval`, `lease_safety_margin`, `rebalance_stabilization`, `max_concurrent_handoffs`, `max_concurrent_takeovers`, `drain_timeout`, `discovery`, `discovery_dns_name`, `memberlist.lifeguard_enabled` are designed (Clustering §11/§19/§20) but still sit in config §16. Promotion owed. See §19. | G-8, G-9 |
+| DA-CFG-7 | Reserved data-plane fields not yet promoted | 🟢 | 🔄 | `tables.primary_key`, `tables.partitioning`, `snapshot.chunk_size`, `sink.max_transaction_batch_rows`, `sink.max_transaction_buffer_bytes`, `sink.buffer_capacity_rows`, `source.postgres.max_wal_lag_bytes`, `source.mysql.binlog_purge_action`, slot-lifecycle fields, `globals.tracing.*`, `sink.metrics.per_table`, `globals.api.role_mapping`, `globals.azure.account_name`, `catalog.retry`, `sink.maintenance`, `glue.strip_schema`. Designed in research; promotion owed. See §19. | many |
+| DA-CFG-8 | Reserved fields now **rejected/moot** and to be struck from §16 | 🟢 | ✅ | `tables.surrogate_key` (G-30 rejected, `Ghost_Row…` §3) and `source.consistent_snapshot` (G-7 moot — incremental snapshot has no weaker mode, `Snapshot_Resumability…` §3). Remove from the deferred list. | G-30, G-7 |
+| DA-CFG-9 | `lease_renewal_interval ≤ lease_duration/3` enforcement | 🟡 | ✅ | Promoted to hard error V-073 (config §13.4); rationale in Clustering §19.3/§19.6. | D-8 |
+| DA-CFG-10 | Config reload cross-worker propagation contract | 🔴→✅ | ✅ | Clustering §9 — generation pointer in `globals.state` + gossip nudge; no proxy. | OQ-C1, G-2, G-17, OQ-API3 |
+
+---
+
+## 6. Data flow & pipeline execution (FLOW)
+
+**State.** `Data-Flow.md` defines the four stages, the `CdcEvent` boundary type, per-source decode,
+the accumulator, the Iceberg write path, offset acknowledgment, and the task/concurrency model. It is
+also the spec that has **drifted most** from the agreed design: it still documents the *blocking
+consistent snapshot* (superseded by the incremental chunked model), the scalar `committed_lsn` guard
+(generalized to `committed_position`), and a redundant `pipelines/<id>/` state path. These are
+documentation gaps, not design gaps, but they are load-bearing for anyone reading the spec as truth.
+
+| ID | Title | Sev | Status | Resolution / note | Old ID |
+|---|---|---|---|---|---|
+| DA-FLOW-1 | In-flight buffer handling on pipeline restart | 🟡 | ✅ | Config §12.4 discard-and-replay default; `Pipeline_Lifecycle_State_Machine.md`. | OQ-P2 |
+| DA-FLOW-2 | `CdcEvent` lacks a **per-change** position distinct from commit `source_pos` | 🟡 | 🟥 | Dedup keep-last needs `_seq` = PG change LSN / MySQL `(binlog_file,end_log_pos)` (`Ghost_Row…` §4); `CdcEvent` currently carries only commit `source_pos` + `xid`. The struct and the accumulator contract must add the per-change sequence. Surfaced by reading FLOW+DEDUP together. | — |
+| DA-FLOW-3 | Backpressure / bounded channels | 🟡 | ✅ | `Operational…` G-27 — all inter-task channels bounded; `sink.buffer_capacity_rows`. | G-27 |
+| DA-FLOW-4 | Phase-1 snapshot model in spec is superseded | 🟢 | 🔄 | `Snapshot_Resumability…` replaces blocking COPY/EXPORT_SNAPSHOT with the stream-first incremental chunk loop; `Data-Flow.md` Phase 1 + On-Demand section must be rewritten. Spec-merge debt (§19). | G-6 |
+| DA-FLOW-5 | `TRUNCATE` manifestation in the Iceberg mirror (both engines) | 🟡 | 🟥 | `MySQL_DDL_Classifier.md` §3 says TRUNCATE → "table-clear (Iceberg DELETE/overwrite all rows or fresh snapshot boundary), flagged for the sink-writer contract." `Data-Flow.md` Phase 2a lists the PG `T` message but no sink action is specified. The concrete sink behavior (and PG/MySQL parity) is undefined. | — |
+| DA-FLOW-6 | PG `DROP TABLE` detection (no in-band DDL on pgoutput) | 🟡 | 🔄 | MySQL DROP is caught by channel B (`QUERY_EVENT`). PG drops are **not** replicated as DDL; the table simply stops emitting and is caught by channel D idle-rescan / channel A on restart (`Schema_Change…` §2.1). The *latency and exact reaction* (halt vs retain) for a PG drop of a tracked table is not spelled out as crisply as MySQL's. Worth an explicit line. | — |
+| DA-FLOW-7 | `committed_lsn` scalar generalized to engine-tagged `committed_position` | 🟡 | ✅(design) | `Delivery_Guarantee…` §4 — per-table HWM `cdc.committed_position`; `Data-Flow.md` wording owed (§19). | G-14 |
+| DA-FLOW-8 | Shutdown / drain ordering | 🟡 | ✅ | `Data-Flow.md` §Concurrency + Clustering §8.3 drain protocol (adds explicit lease release). | OQ-CL3 |
+
+---
+
+## 7. Type mapping (TYPE)
+
+**State.** `Type_Mapping.md` closes the three-hop chain (DB wire → `ColumnValue` → Arrow → Iceberg)
+with full PG and MySQL tables, four `ColumnValue` enum extensions, an unsupported-type fallback chain,
+and per-column overrides. Essentially complete; residual items are spec-merge and one crate annotation.
+
+| ID | Title | Sev | Status | Resolution / note | Old ID |
+|---|---|---|---|---|---|
+| DA-TYPE-1 | Full DB→Arrow→Iceberg mapping table | 🔴→✅ | ✅ | `Type_Mapping.md`. | G-18, OQ-DT1 |
+| DA-TYPE-2 | `ColumnValue` enum extensions (tz flag, typed `Array`, `Time`, `UInt64`) | 🟡 | ✅ | `Type_Mapping.md` §extensions; reflected in `Data-Flow.md` enum. | G-NEW-22 |
+| DA-TYPE-3 | `BIGINT UNSIGNED` / `numeric(P>38)` overflow handling | 🟡 | ✅ | `decimal(20,0)` for the former; `numeric_overflow_action: string\|error` for the latter. | — |
+| DA-TYPE-4 | `TINYINT(1)`→bool detection requiring `information_schema` | 🟢 | ✅ | `tinyint1_as_bool` + `tinyint1_detection`; G-NEW-21 dropped the stale events-mode warning. | G-NEW-21 |
+| DA-TYPE-5 | `FixedSizeBinary(16)` → Iceberg `uuid` needs explicit iceberg-rust annotation | 🟢 | 🧪 | `Type_Mapping.md` Hop-3 table flags this as the one Arrow type needing a field-level `{"iceberg.type":"uuid"}` hint — verify the mechanism exists in the pinned crate. See §21. | — |
+| DA-TYPE-6 | Merge the four TYPE config fields + 4 validation rules into the master table | 🟢 | 🔄 | Already largely done (V-078..V-082 present); confirm `column_type_overrides`, `numeric_overflow_action`, `toast_strategy`, `tinyint1_*` all merged (G-NEW-21). | G-NEW-21 |
+| DA-TYPE-7 | TOAST unchanged-column strategy (`carry_forward` vs `re_query`) | 🟡 | ✅ | `source.toast_strategy` (PG only); V-077/V-080. Re-query pool-saturation is a warning, not a halt. | — |
+
+---
+
+## 8. Schema change detection & evolution (SCHEMA)
+
+**State.** `Schema_Change_Detection_and_Evolution.md` is a complete, reviewed design: the
+four-channel detection model (A startup / B in-band trigger / C catalog augment / D idle rescan), the
+§0 ordering invariant (apply in stream order, scoped to the change, never fast-forward to "now"), the
+§7.2 safe/unsafe/ignorable DDL classification table, the apply protocol (seal→flush→evolve→rebuild→
+resume), idempotent replay, and rename resolution. The MySQL classifier is separately de-risked.
+
+| ID | Title | Sev | Status | Resolution / note | Old ID |
+|---|---|---|---|---|---|
+| DA-SCHEMA-1 | DDL during live replication — apply protocol | 🔴→✅ | ✅ | §8 detect-at-boundary protocol; startup & non-replayable-gap → re-snapshot (§8.2). | OQ-DT2 |
+| DA-SCHEMA-2 | Supported evolution operations (safe/unsafe set) | 🟡 | ✅ | §7.1–§7.2 classification table = the G-19 contract. | OQ-DT3, G-19 |
+| DA-SCHEMA-3 | Rename vs drop+add disambiguation | 🟡 | ✅ | §6 — PG `pg_attribute.attnum`; MySQL `RENAME`/`CHANGE` keyword; degrade to drop+add+warn only when unprovable. | DT-R2 |
+| DA-SCHEMA-4 | MySQL DDL classifier scope & failure mode | 🟡 | ✅ | `MySQL_DDL_Classifier.md` — two-tier fail-soft (sqlparser-rs → regex → channel C); halt only if no table name recoverable. De-risked from its v7 blocker elevation. | G-19a |
+| DA-SCHEMA-5 | Channel-C/A/D require SELECT on `information_schema`/catalogs | 🟡 | ✅ | §9 precondition; checked at pipeline start (runtime, not config). Reuse replication creds. | DT-R8 |
+| DA-SCHEMA-6 | `method` field removed; detection is fixed four-channel model | 🟢 | ✅ | §10; config V-024/V-031/V-032 deleted, `interval`→`rescan_interval`. | DT-R1 |
+| DA-SCHEMA-7 | ENUM/SET representation (string vs ordinal) | 🟢 | ✅ | `ENUM→string`, `SET→list<string>`; append-only value adds Ignorable, reorder/remove Unsafe. | DT-R5 |
+| DA-SCHEMA-8 | iceberg-rust drop/rename/type-promotion support | 🟡 | 🧪 | §7.1 implementation note — only `add_column` is mature; **verify** drop/rename/promotion against the pinned crate, route unsupported ops to halt. See §21. | — |
+| DA-SCHEMA-9 | Idempotent DDL replay + checkpoint-after-evolve ordering | 🟡 | ✅ | §8.3 — re-read live Iceberg schema, skip if already applied; advance offset only after schema commit. | — |
+
+---
+
+## 9. Clustering & coordination (CLUS)
+
+**State.** `Clustering_Architecture_Research.md` is the deepest doc: two-plane model, derived ring,
+NodeMeta schema, SWIM-vs-Scuttlebutt decision (keep SWIM+Lifeguard), the storage CAS lease with a
+clock-skew-safe acquire/renew/takeover protocol, the renewal-failure taxonomy + safety deadline
+(§19), the `ClusterReconciler`+`PipelineController` split (§20.1), takeover rate-limiting (§20.2),
+flap immunity (§20.3), config propagation, single-node mode, and the `globals.state` object layout.
+All design decisions D-1..D-11 are resolved on paper; **D-5 is the one item that cannot be closed on
+paper** and is this report's top blocker.
+
+| ID | Title | Sev | Status | Resolution / note | Old ID |
+|---|---|---|---|---|---|
+| DA-CLUS-1 | **Conditional-write CAS conformance on S3+GCS+Azure** | 🔴 | 🧪🟥 | Clustering §12/§17 — lease rests entirely on atomic CAS on one object; **GCS uses *generation*, not ETag, for write preconditions** (the trap). Trait + T1–T10 suite scaffolded at `prototypes/lease-conformance/`; **open-until-executed against real S3, GCS and Azure** (T10 the gating assertion). The only clustering item that cannot be closed on paper. | D-5 |
+| DA-CLUS-2 | Split-brain exclusive ownership (the lease) | 🔴→✅ | ✅ | §5 storage CAS lease; ring is scheduling, lease is safety. | G-8, OQ-CL1 |
+| DA-CLUS-3 | Sink-side fencing for a zombie holder | 🟡 | ✅(design) | §5.5 — `owner_epoch` in Iceberg snapshot summary + Iceberg atomic-commit fence + `_lsn` dedup (defense in depth). Depends on DA-SINK-2 (snapshot-summary persistence). | D-7 |
+| DA-CLUS-4 | Lease renewal failure taxonomy (412 vs transient) + safety deadline | 🟡 | ✅ | §19 — `deadline = last_renew_local + lease_duration − guard`; renewer state machine; commit gating. Prevents a transient S3 blip from stopping a healthy (esp. single-node) worker. | D-8 |
+| DA-CLUS-5 | Rebalancing / graceful drain / handoff | 🔴→✅ | ✅ | §8.3 drain (flush→commit→checkpoint→release lease) + §8.5 rate-limiting; planned vs unplanned paths separated. | G-9, OQ-CL3 |
+| DA-CLUS-6 | Reconciler ↔ renewer orchestration (head-of-line blocking) | 🟡 | ✅ | §20.1 — `ClusterReconciler` (ring only) + per-pipeline `PipelineController` (sole lease-writer); level-triggered + periodic resync. | D-9 |
+| DA-CLUS-7 | Unplanned-takeover storm rate-limiting | 🟢 | ✅ | §20.2 — `max_concurrent_takeovers` (default 4) caps concurrent Phase-0 starts, with jitter. | D-10 |
+| DA-CLUS-8 | Flap immunity (suspect stays in ring; symmetric stabilization) | 🟢 | ✅ | §20.3 — only `dead`/`left` removes from ring; `rebalance_stabilization` on all additions incl. rejoins. | D-11 |
+| DA-CLUS-9 | `node_id` stability / StatefulSet mandate | 🟡 | ✅ | §3.4 D-1 — `node_id = memberlist.node_name`; k8s StatefulSet pod name; standalone persisted UUID; `incarnation` distinguishes a fresh process. | D-1, OQ-P3 |
+| DA-CLUS-10 | Cluster-wide-consistent anchors (`tokens`, `lease_duration`, `lock_backend`, `hash_algo`) | 🟡 | ✅ | §12 anchor; refuse-to-start on mismatch (V-026/V-062/V-075/V-076). | G-36, D-2 |
+| DA-CLUS-11 | Lease timing defaults vs failover SLA | 🟡 | ✅ | §18 D-6 — **Balanced** ratified (`lease_duration=15s`, `renewal=5s`, ~20–22s unowned window). Tunable. | D-6 |
+| DA-CLUS-12 | `kubernetes` lock_backend (K8s Lease API) | 🟢 | 🟥 | Reserved as a future `LeaseStore` impl; **only `storage` is built for v1** (V-075). A genuine but deliberately deferred scope item. | D-2 |
+| DA-CLUS-13 | Per-source-endpoint takeover bulkhead | 🟢 | 🟥 | §20.2 notes the sharper risk (many pipelines on one source DB reconnecting together) as a **future** per-endpoint concurrency group; v1 cap is per-node-global. | D-10 |
+
+---
+
+## 10. Snapshotting (SNAP)
+
+**State.** `Snapshot_Resumability_and_Consistency.md` replaces the blocking snapshot with an
+**incremental chunked, stream-first** model (DBLog/Debezium-style watermarks + PK-upsert
+reconciliation), which simultaneously closes resumability, multi-table consistency, and the on-demand
+read-point hazard. This is a *change* to `Data-Flow.md` Phase 1, so it carries spec-merge debt.
+
+| ID | Title | Sev | Status | Resolution / note | Old ID |
+|---|---|---|---|---|---|
+| DA-SNAP-1 | Mid-snapshot crash resumability (cursor format) | 🔴→✅ | ✅ | §2 typed identifier-tuple keyset cursor; checkpoint per chunk; resume idempotent. | G-6, OQ-S1 |
+| DA-SNAP-2 | Multi-table consistency without a global lock | 🟡 | ✅ | §3 — convergent, not frozen-instant; no `RELOAD`/`LOCK TABLES`/`EXPORT_SNAPSHOT` needed; no `consistent_snapshot` toggle. | G-7, OQ-S2 |
+| DA-SNAP-3 | On-demand snapshot read-point (the "pause_lsn+1" hazard) | 🟡 | ✅ | §4 — on-demand is the §1 chunk loop with **no stream pause**; watermarks reconcile. | G-20, OQ-S3 |
+| DA-SNAP-4 | Snapshot parallelism within a pipeline | 🟢 | ✅ | §5 — reuses `parallelism`; disjoint tables per worker; serial keyset within a table. | OQ-S4 |
+| DA-SNAP-5 | Keyset collation correctness (text identifiers) | 🟡 | ✅ | §2 collation pin — binary collation (`COLLATE "C"` / `utf8mb4_bin`) for the pagination predicate, recorded in the cursor. Subtle but load-bearing. | — |
+| DA-SNAP-6 | `snapshot.chunk_size` config field | 🟢 | 🔄 | Default 10000; promotion into config owed (§19). | G-6 |
+| DA-SNAP-7 | Snapshot vs WAL/binlog retention coupling | 🟡 | 🔄 | §7 cross-ref — a slow snapshot lengthens the stream backlog; interacts with the WAL-lag guard (G-22) and binlog purge (G-26). Designed but the interaction tuning is an operational note, not a hard rule. | — |
+| DA-SNAP-8 | PK-less table under a **dump-only** mode (snapshot, never stream) | 🟡 | 🟥 | The PK-less halt rule (DA-DEDUP-3) is justified by equality-delete keying — but a `dump_*` table is insert-only and never deletes, so the keying argument doesn't apply. Whether a dump-only PK-less table may be snapshotted (or still halts) is **unspecified**. Newly surfaced edge case. | — |
+
+---
+
+## 11. Delivery guarantee, dedup & primary keys (DEDUP)
+
+**State.** `Ghost_Row_Dedup_and_Primary_Keys.md` (G-13/G-30) and
+`Delivery_Guarantee_and_Position_Guard.md` (G-14) together make the pipeline **row-level idempotent**:
+MOR equality-delete keyed on the table identifier, intra-batch collapse to ≤1 delete + ≤1 data record
+per key ordered by `_seq`, mirror-delete semantics (no `D` data row), and a `SourcePosition`
+abstraction (numeric LSN vs GTID-set subset/union/intersect). Idempotency is the correctness basis;
+the position guard is demoted to optimization + checkpoint-advance.
+
+| ID | Title | Sev | Status | Resolution / note | Old ID |
+|---|---|---|---|---|---|
+| DA-DEDUP-1 | Ghost-row / equality-delete keying correctness | 🔴→✅ | ✅ | §0 strictly-less-than rule; in-batch collapse §4. | G-13 |
+| DA-DEDUP-2 | Delivery-guarantee position comparison (LSN vs GTID-set) | 🔴→✅ | ✅ | `SourcePosition` trait; canonical GTID-set serialization; per-table HWM; resume = laggard (min/intersect). | G-14 |
+| DA-DEDUP-3 | PK-less tables | 🟡 | ✅(by rejection) | §3 — halt; `surrogate_key` removed; accepted limitation (genuinely key-less tables can't replicate). | G-30 |
+| DA-DEDUP-4 | Identifier source & override | 🟡 | ✅ | Inferred PK via channel C; `tables.primary_key` override (not a surrogate); Iceberg identifier constraints (top-level, primitive, NOT NULL, non-floating). | D-13.1/7 |
+| DA-DEDUP-5 | Before-image / REPLICA IDENTITY contract | 🟡 | ✅ | §2 — identifier ⊆ replica-identity (PG); MySQL FULL image already required; halt with named columns if unmet. | D-13.4 |
+| DA-DEDUP-6 | Key-mutating UPDATE (PK value changes) | 🟡 | ✅ | §4 — delete(old key) + data(new key); reuses before-image. | D-13.3 |
+| DA-DEDUP-7 | Cross-table atomic visibility **not** guaranteed | 🟡 | 🟥(scoped-out) | `Delivery…` §5 / `Large_Transaction…` — each table is its own Iceberg commit; cross-table atomicity is explicitly out of scope; would need a multi-table-commit catalog (Nessie). Documented limitation, reopen path noted. | D-14.5, G-25-noted |
+
+---
+
+## 12. Catalog & authentication (CAT)
+
+**State.** `Catalog_Auth_Research.md` closed G-1g and the schema is fully merged into config §9.5 and
+the §13 validation rules (V-040..V-048). Hive Thrift `none/ldap/kerberos`; REST HTTP
+`none/bearer/oauth2/sigv4`; the deprecated built-in `/v1/oauth/tokens` warning.
+
+| ID | Title | Sev | Status | Resolution / note | Old ID |
+|---|---|---|---|---|---|
+| DA-CAT-1 | Catalog auth model (Hive SASL / REST OAuth2/bearer/sigv4) | 🔴→✅ | ✅ | `Catalog_Auth_Research.md` §2–§3; config §9.5. | G-1g |
+| DA-CAT-2 | Primary catalog vs multi-catalog at launch | 🟢 | ✅ | All three backends (glue/hive/rest) are first-class via the union; choice is per-pipeline. | OQ-IC2 |
+| DA-CAT-3 | OAuth2 must point at an external IdP | 🟡 | ✅ | `token_url` external; V-048 warns on the deprecated built-in endpoint. | — |
+| DA-CAT-4 | Credential vending interaction with the sink credential model | 🟢 | 🟥 | §3.5 is informational only — if the catalog vends short-lived table-scoped storage creds, the `globals.cloud` chain becomes optional, but **how the writer consumes vended creds is not specified**. Minor; flag for the sink-writer contract. | — |
+| DA-CAT-5 | Catalog unavailability retry policy (separate from object storage) | 🟡 | ✅ | `Operational…` G-35 — own retry + circuit breaker + DEGRADED; optional `catalog.retry`. | G-35 |
+
+---
+
+## 13. Sink / Iceberg writer (SINK)
+
+**State.** The writer contract is spread across `Ghost_Row_Dedup…` (equality-delete keying),
+`Iceberg_Partitioning…` (partition spec + before-image routing), `Iceberg_Maintenance…` (external
+maintenance + signals), `Large_Transaction…` (split commits), and `Delivery…` (snapshot-summary
+properties). The design is coherent; the open items are the **two crate-capability gates** that the
+writer's correctness literally depends on.
+
+| ID | Title | Sev | Status | Resolution / note | Old ID |
+|---|---|---|---|---|---|
+| DA-SINK-1 | **Equality-delete writer assigns delete files the enclosing commit's sequence number** | 🔴 | 🧪🟥 | `Ghost_Row…` §8 — the entire strictly-less-than ghost-row guarantee assumes this iceberg-rust 0.9.0 behavior; **verify before building the writer**. If unsupported/mis-sequenced, need position-deletes-after-read or a different strategy. | G-13 §8 |
+| DA-SINK-2 | Custom snapshot-summary properties (`cdc.owner_epoch`, `cdc.committed_position`) preserved across commits | 🟡 | 🧪 | Required by CLUS fencing (D-7) and DEDUP guard (D-14.4); `Clustering…` §5.5 flags "verify iceberg-rust preserves custom snapshot-summary properties." See §21. | D-7 |
+| DA-SINK-3 | Write strategy COW vs MOR | 🟡 | ✅ | MOR + equality deletes is the default (`Ghost_Row…` §5); COW new-tables-only. | OQ-IC1 |
+| DA-SINK-4 | MOR↔COW strategy change migration | 🟢 | ✅ | `Iceberg_Partitioning…` §4 (G-12a) — new-data-only; explicit compaction/re-snapshot to migrate; PR. | G-12a |
+| DA-SINK-5 | Partition spec config + evolution | 🟢 | ✅ | `Iceberg_Partitioning…` §1/§3 (G-24) — `tables.partitioning`; default unpartitioned; spec evolution = new-data-only. | G-24 |
+| DA-SINK-6 | Partition-key-changing UPDATE (cross-partition ghost) | 🟡 | ✅ | §2 (D-24) — equality-delete routed to the **old** partition via before-image; same machinery as a PK mutation. **Sink-writer contract addition.** | G-24 |
+| DA-SINK-7 | Large-transaction vs txn-atomic-flush tension | 🟡 | ✅ | `Large_Transaction…` (G-29) — bounded split commits (default off → atomic), `max_transaction_buffer_bytes` halt-backstop; crash-safe via idempotency. | G-29 |
+| DA-SINK-8 | Spill-to-disk for oversized txns | 🟢 | 🟥(deferred) | `Large_Transaction…` §5 — future `sink.large_txn_mode: split\|spill`; out of scope for v1. | G-29 §5 |
+| DA-SINK-9 | Iceberg maintenance ownership (compaction/expiry/orphans) | 🟢 | ✅ | `Iceberg_Maintenance…` (G-25) — external for v1; app exposes signals + reserves `sink.maintenance`; built-in gated on iceberg-rust rewrite support. | G-25 |
+| DA-SINK-10 | iceberg-rust compaction/rewrite API availability | 🟢 | 🧪 | Gates any **future** built-in maintenance (deferred anyway). Verify against pinned crate. | G-25 §14 |
+| DA-SINK-11 | Exactly-once vs at-least-once into Iceberg | 🟡 | ✅ | Effectively exactly-once-effect via idempotency (DEDUP) + position guard; at-least-once delivery, dedup absorbs replays. | OQ-IC3 |
+
+---
+
+## 14. Source connection lifecycle (SRC)
+
+**State.** `Postgres_Slot_and_Publication_Lifecycle.md` (G-15) closes the PG runtime lifecycle;
+`Operational…` covers MySQL binlog purge (G-26) and the WAL-lag guard (G-22). MariaDB is in scope via
+the MySQL path with one genuine correctness dependency.
+
+| ID | Title | Sev | Status | Resolution / note | Old ID |
+|---|---|---|---|---|---|
+| DA-SRC-1 | PG slot existence state machine + orphan policy | 🟡 | ✅ | §1 — `slot.on_orphan: halt(default)\|adopt_resnapshot`; resume-without-snapshot rejected. | G-15 |
+| DA-SRC-2 | Slot creation responsibility | 🟡 | ✅ | §2 — `slot_management: managed(default)\|require_existing`; the latter forces `auto_cleanup=false`. | G-15 |
+| DA-SRC-3 | Slot loss / WAL-gone recovery | 🟡 | ✅ | §3 — recreate slot + incremental re-snapshot (G-6); warn/metric. | G-15 |
+| DA-SRC-4 | Publication reconciliation | 🟢 | ✅ | §4 — app-maintained explicit table list; `ALTER PUBLICATION` on table-set change; never `FOR ALL TABLES`. | G-15 |
+| DA-SRC-5 | Abandoned-slot WAL-lag guard | 🟡 | ✅ | `Operational…` G-22 — `cdc_wal_lag_bytes` always emitted; `max_wal_lag_bytes` opt-in halt. | G-22 |
+| DA-SRC-6 | MySQL purged-binlog handling | 🟡 | ✅ | `Operational…` G-26 — `binlog_purge_action: error(default)\|re_snapshot`. | G-26 |
+| DA-SRC-7 | External same-name slot collisions undetectable | 🟢 | ✅(limitation) | §5 — PG slots carry no ownership tag; mitigated by V-058 uniqueness + operator discipline; documented, not papered over. | G-15 |
+| DA-SRC-8 | MariaDB GTID dialect (`domain-server-sequence`) | 🟡 | 🟥 | `Operational…` G-38 — MariaDB accepted via the MySQL path, but the `SourcePosition` MySQL impl **must support both GTID dialects** (MariaDB domains vs MySQL UUIDs); flagged as a **new sub-research item** and the one genuine correctness dependency. | G-38 |
+| DA-SRC-9 | TOAST re-query control-connection pool sizing | 🟢 | 🔄 | V-077 warns on `re_query`+high-volume snapshot; concrete pool sizing is an implementation detail, not yet fixed. | — |
+
+---
+
+## 15. Observability (OBS)
+
+**State.** `Observability_Metrics_and_Tracing.md` (G-33/G-32) defines the mandatory metric catalogue,
+the pipeline-level-default / per-table-opt-in cardinality policy, OTLP tracing (disabled when no
+endpoint), and trace-id/pipeline injection into JSON logs.
+
+| ID | Title | Sev | Status | Resolution / note | Old ID |
+|---|---|---|---|---|---|
+| DA-OBS-1 | Mandatory Prometheus metric catalogue | 🟡 | ✅ | §2 — replication/source/snapshot/Iceberg+maintenance/clustering/status families. | G-33, OQ-OB3 |
+| DA-OBS-2 | Metric cardinality policy | 🟢 | ✅ | §1 — `{pipeline,source_host,source_db}` default; `table` label only when `sink.metrics.per_table=true`. | G-33 |
+| DA-OBS-3 | Distributed tracing | 🟢 | ✅ | §3 (G-32) — `globals.tracing.otlp_endpoint` (absent⇒off) + `sample_ratio`; batch/commit-granularity spans, no per-event spans. | G-32, OQ-OB1 |
+| DA-OBS-4 | Log/trace correlation | 🟢 | ✅ | §4 — inject `trace_id`/`span_id`/`pipeline` into JSON logs. | §10.3 |
+| DA-OBS-5 | **Numeric end-to-end replication-lag SLA** | 🟡 | 🟥 | `Clustering…` §18.6 explicitly leaves OQ-OB2 open as a *tuning input*: a concrete max-lag number is not fixed, which is what grounds the lease-timing profile and flush/checkpoint cadence. Decide a number (and whether failover-time carries its own SLA distinct from steady-state). | OQ-OB2 |
+
+---
+
+## 16. Management API & security (API)
+
+**State.** `API_RBAC_and_Versioning.md` (G-16/G-9.1) closes the RBAC matrix: three nested roles
+(`admin ⊇ operator ⊇ viewer`), an endpoint→min-role table under `/v1`, per-auth-mode role binding,
+configurable IdP role mapping, and the versioning scheme. Health/metrics are unversioned and
+unauthenticated. The auth *mechanism* (jwt/oauth2 verification params) was already in config §6.3.1.
+
+| ID | Title | Sev | Status | Resolution / note | Old ID |
+|---|---|---|---|---|---|
+| DA-API-1 | RBAC role→permission matrix | 🟡 | ✅ | `API_RBAC…` §2 — endpoint table; reload/validate = operator; leave/shutdown = admin. | G-16, OQ-API2 |
+| DA-API-2 | API versioning | 🟢 | ✅ | `/v1` for functional endpoints; health/metrics unversioned. | G-9.1 |
+| DA-API-3 | Role binding per auth mode + IdP role mapping | 🟡 | ✅ | §3/§4 — none=open, basic=admin, jwt/oauth2=mapped claim (max wins); 401 vs 403 distinguished; configurable `role_mapping`. | D-16.3/4 |
+| DA-API-4 | `config/validate` may echo resolved secrets → operator-only | 🟡 | ✅ | §2 note — validate is operator, not viewer, because the resolved config can contain secret material. | — |
+| DA-API-5 | TLS / mTLS for API and cluster-internal transport | 🟡 | ✅ | API TLS config §6.3.2; memberlist TLS §6.5.2 (CA presence ⇒ mTLS). V-052 "auth without TLS" stays a **warning** (upstream termination in k8s is common). | OQ-API1, D-16.5 |
+| DA-API-6 | Lifecycle endpoints inherit operator role | 🟢 | ✅ | `Pipeline_Lifecycle…` §6 — pause/resume/restart/stop/flush all operator. | G-NEW-15 |
+
+### Pipeline lifecycle state machine (sub-domain of API + FLOW)
+
+| ID | Title | Sev | Status | Resolution / note | Old ID |
+|---|---|---|---|---|---|
+| DA-API-7 | Pause/stop/resume/restart/flush state machine | 🟡 | ✅ | `Pipeline_Lifecycle_State_Machine.md` — persisted desired-state (`RUNNING/PAUSED/STOPPED`), owner reconciles; survives failover & reload. | G-NEW-15 |
+| DA-API-8 | STOPPED keeps its lease (owner idle) | 🟢 | ✅ | §2 — avoids ring churn, immediate resume; cost = one idle renewal. | D-NEW15.1 |
+| DA-API-9 | PAUSE flushes to a clean boundary (no at-risk buffer at failover) | 🟡 | ✅ | §2/§4 — resume is fast (warm, no buffer reconcile). | D-NEW15.3 |
+| DA-API-10 | Reload must not resurrect a paused/stopped pipeline | 🟡 | ✅ | §4 — runtime `desired_state` wins over config's implicit "should run." | §9.6 |
+
+---
+
+## 17. Operational, deployment & dependencies (OPS / DEP)
+
+**State.** `Operational_and_Scope_Gaps_Batch.md` resolves a batch of smaller gaps (Azure creds,
+catalog retry, IAM matrix, MariaDB scope, strip_schema collisions, backpressure-on-sink-failure).
+Deployment topology (StatefulSet, headless Service) is fixed by the clustering doc. Dependency
+pinning is the remaining cross-cutting concern.
+
+| ID | Title | Sev | Status | Resolution / note | Old ID |
+|---|---|---|---|---|---|
+| DA-OPS-1 | Azure credentials & container model | 🟢 | ✅ | `Operational…` G-34 — SDK default chain; optional `azure.account_name`; bucket=container. | G-34 |
+| DA-OPS-2 | Minimum IAM permissions per provider | 🟢 | ✅ | G-37 — documented S3/GCS/Azure permission sets (runbook prerequisite, no config). | G-37 |
+| DA-OPS-3 | `glue.strip_schema` collision handling | 🟢 | ✅ | G-11.3 — collision = config error; non-stripped = `schema__table`. | G-11.3 |
+| DA-OPS-4 | Sink/catalog unavailability → DEGRADED back-pressure | 🟡 | ✅ | G-27/G-35 — stop consuming once buffers fill, protect slot/WAL via G-22; recover on next commit; catalog circuit breaker. | G-27, G-35 |
+| DA-OPS-5 | k8s deployment as StatefulSet (not Deployment) | 🟡 | ✅ | Clustering §3.4/§10.2 — stable `node_name` via Downward API; headless Service discovery. | D-1, D-4 |
+| DA-OPS-6 | "Restart ≠ apply config" operator footgun | 🟢 | ✅(documented) | Clustering §9.3 D-3 — cloud-generation-wins; a pod restart does **not** apply ConfigMap edits, only `POST /reload` does. Document loudly. | D-3 |
+| DA-DEP-1 | iceberg-rust pinned version & capabilities | 🟡 | 🧪 | MSRV 1.92.0 (Sources_Index). Multiple capability gates ride on the exact version: DA-SINK-1, DA-SINK-2, DA-SCHEMA-8, DA-TYPE-5, DA-SINK-10. Pin and assert at startup. | — |
+| DA-DEP-2 | OpenDAL version exposing conditional writes | 🔴 | 🧪 | Clustering §17.2 — `if_match` on writes landed late-2024/early-2025; the `iceberg-storage-opendal` transitive pin must be ≥ that, and capabilities asserted at startup (refuse to start if absent). Part of DA-CLUS-1. | D-5 |
+| DA-DEP-3 | `sqlparser-rs` (MySqlDialect) pin | 🟢 | ✅ | `MySQL_DDL_Classifier.md` §5 — now on a fail-soft path, so a coverage gap degrades rather than halts; de-risked. | G-19a |
+| DA-DEP-4 | `memberlist` crate (Lifeguard, TLS/QUIC transport) | 🟢 | ✅ | Sources_Index; Clustering §2 — features confirmed available. | G-23 |
+
+---
+
+## 18. Cross-cutting & newly-surfaced gaps
+
+These are not contained in any single domain — they emerge from reading two or more documents
+together and finding a seam. They are the items most worth attention in spec elaboration because no
+single research doc "owns" them.
+
+### DA-X-1 — `CdcEvent` is missing the per-change sequence the dedup design requires 🟡 🟥
+`Ghost_Row_Dedup_and_Primary_Keys.md` §4 keeps-last by a **per-change** `_seq` (PG: the change's own
+WAL LSN; MySQL: `(binlog_file, end_log_pos)` or GTID + intra-txn event index), explicitly *finer* than
+the commit position. But `Data-Flow.md`'s `CdcEvent` carries only `source_pos` (commit LSN/GTID) and
+`xid`. **The boundary type and the accumulator contract must add a per-change position**, and the
+lineage columns (`_op/_ts/_lsn/_source_db/_pipeline`) must decide whether `_seq` is also persisted as a
+column (it is referenced as one in the dedup doc but absent from the lineage table). Resolving this is a
+prerequisite to specifying both the decoder output and the sink collapse step. *(Links DA-FLOW-2,
+DA-SYS-5.)*
+
+### DA-X-2 — The Iceberg snapshot-summary carries three independent CDC properties; their coexistence is assumed, not specified 🟡 🧪
+Three separate designs write into the Iceberg snapshot summary: `cdc.owner_epoch` (clustering fence,
+D-7), `cdc.committed_position` (delivery guard, D-14.4), and the implicit per-table HWM. Each doc
+individually says "verify iceberg-rust preserves custom snapshot-summary properties across commits."
+**No doc owns the combined property set or its schema.** Spec elaboration should define one
+`cdc.*` snapshot-summary schema and a single verification that all of it survives commits. *(Links
+DA-SINK-2, DA-CLUS-3, DA-FLOW-7.)*
+
+### DA-X-3 — Equality-delete partition routing by before-image is a writer-contract obligation referenced from two docs but defined in neither's spec 🟡 🔄
+`Iceberg_Partitioning…` §2 (D-24) requires the writer to route an equality-delete to the **old**
+partition (from the before-image) when an UPDATE changes a partition value; `Ghost_Row…` §4 requires
+the analogous old-key delete for PK mutation. Both are "sink-writer contract additions" with no single
+authoritative sink-writer contract document yet. Spec elaboration needs a **consolidated sink-writer
+contract** (keying, collapse, partition routing, delete-file sequencing, snapshot-summary properties,
+truncate handling) — today it is scattered across five research docs.
+
+### DA-X-4 — Reserved metadata-column collision has no runtime rule 🟡 🟥
+*(= DA-SYS-4, restated as cross-cutting.)* If a source table legitimately has a column named `_op`,
+`_ts`, `_lsn`, `_source_db`, `_pipeline`, or a future `_seq`, the accumulator injects a colliding
+column. Config §5 only says operators "should be aware." Decide the rule: reject/halt the table, or
+escape source columns (e.g. double-underscore prefix as in `glue.strip_schema` collisions). Until
+decided, the writer behavior is undefined.
+
+### DA-X-5 — `TRUNCATE` sink semantics undefined and possibly engine-asymmetric 🟡 🟥
+*(= DA-FLOW-5.)* MySQL's classifier maps TRUNCATE to a "table-clear" but defers the actual Iceberg
+operation to "the sink-writer contract"; PG's `T` truncate message is decoded but no sink action is
+written down. Define one cross-engine truncate→Iceberg mapping (overwrite-to-empty vs delete-all vs a
+snapshot boundary marker) and confirm it is idempotent under replay like everything else.
+
+### DA-X-6 — PK-less semantics interact with dump-only modes 🟡 🟥
+*(= DA-SNAP-8.)* "PK-less halts" is justified by equality-delete keying, but `dump_always` /
+`dump_initial` tables are insert-only and never delete — so the keying argument does not bind. The
+spec should state explicitly whether a dump-only table may be PK-less (snapshot as plain inserts,
+`identifier-field-ids` unset) or still halts for uniformity.
+
+### DA-X-7 — MariaDB GTID dialect is the one open correctness dependency in an otherwise "in-scope" claim 🟡 🟥
+*(= DA-SRC-8.)* G-38 accepts MariaDB "best-effort via the MySQL path," but the `SourcePosition` MySQL
+implementation must handle MariaDB's `domain-server-sequence` GTID, which is a *different* set algebra
+from MySQL's `server-uuid:tx`. This is flagged as a new sub-research item and is the single place where
+"in scope" hides real work. Either schedule the sub-research or narrow the v1 scope statement.
+
+### DA-X-8 — Three specs disagree on the per-pipeline state path; one canonical layout is needed 🟢 🔄
+`Data-Flow.md` roots per-pipeline state at `…/pipelines/<id>/`; `Configuration_Specification.md` §10
+and `Operational…` G-NEW-20 remove that segment (state already roots at `sink.prefix`/`state.prefix` =
+`id`). Until `Data-Flow.md` is re-rooted, implementers reading the two specs will build different key
+layouts. Low severity, high confusion potential. *(Spec-merge debt, §19.)*
+
+### DA-X-9 — "Idempotency is correctness; the position guard is an optimization" is a load-bearing systemic claim worth a single statement 🟢 ✅(but distributed)
+The whole exactly-once story (Delivery §1, Large-Txn §1, Snapshot §1, Lifecycle replay) rests on
+row-level PK-upsert idempotency being the correctness mechanism, with positions/guards/leases as
+optimizations and fences layered on top. This is stated correctly in each doc but never in one place as
+*the* system invariant. A one-paragraph "correctness model" at the top of the application spec would
+prevent a future contributor from re-introducing a correctness dependency on batch alignment or
+position arithmetic.
+
+---
+
+## 19. Spec-merge debt (decided in research, not yet in the authoritative specs)
+
+These are **not open design questions** — every item is decided. They are the gap between the research
+corpus and the Oleksii-owned spec docs. Each is a "propose-only" edit the research docs already
+flagged. Carrying them across keeps the specs usable as the single source of truth and is the
+lowest-risk, highest-leverage work before elaboration. Per project rules, these are proposed, not
+applied without instruction.
+
+### 19.1 `Configuration_Specification.md`
+
+| # | Edit | Source |
+|---|---|---|
+| C-1 | Promote the 10 reserved `globals.cluster.*` fields from §16 into the §6.5 field tables (lease/rebalance/discovery/lifeguard). | Clustering §11/§19.6/§20.4 |
+| C-2 | Promote `tables.primary_key` (PR); **remove** `tables.surrogate_key` from §16. | Ghost_Row §7 |
+| C-3 | Promote `tables.partitioning` (PR, default none) + its 4 validation rules. | Partitioning §5 |
+| C-4 | Promote `snapshot.chunk_size` (R, default 10000, ≥1). | Snapshot §7 |
+| C-5 | Promote `sink.max_transaction_batch_rows` (R, null) + `sink.max_transaction_buffer_bytes` (R, ~1GiB) + rules. | Large_Txn §4 |
+| C-6 | Promote `sink.buffer_capacity_rows` (R, ~200000). | Operational G-27 |
+| C-7 | Promote `source.postgres.max_wal_lag_bytes` (R, null) + floor rule; `source.postgres.slot.on_orphan` and `slot_management` (+ the `require_existing`⇒`auto_cleanup=false` rule). | Operational G-22, Slot_Lifecycle §6 |
+| C-8 | Promote `source.mysql.binlog_purge_action` (R, `error`). | Operational G-26 |
+| C-9 | **Remove** `source.consistent_snapshot` from §16 (moot — no weaker snapshot mode exists). | Snapshot §3 |
+| C-10 | Promote `globals.tracing.otlp_endpoint` + `sample_ratio` (R) + rules; `sink.metrics.per_table` (R, false). | Observability §5 |
+| C-11 | Promote `globals.api.role_mapping` + 2 rules; reference the RBAC matrix. | API_RBAC §6 |
+| C-12 | Promote `globals.azure.account_name` (R) + rule. | Operational G-34 |
+| C-13 | Add optional `catalog.retry { max_attempts, base_backoff, max_backoff }` (R). | Operational G-35 |
+| C-14 | Reserve `sink.maintenance` block (disabled in v1). | Maintenance §4 |
+| C-15 | Add `glue.strip_schema` + collision-error validation rule. | Operational G-11.3 |
+| C-16 | Merge the four Type_Mapping config fields & rules if any remain unmerged (verify V-078..V-082 cover all). | Type_Mapping §Validation |
+
+### 19.2 `Data-Flow.md` (the most-drifted spec)
+
+| # | Edit | Source |
+|---|---|---|
+| DF-1 | Rewrite **Phase 1** from blocking COPY/EXPORT_SNAPSHOT to the stream-first incremental chunk loop (watermarks + PK-upsert reconciliation). | Snapshot §1 |
+| DF-2 | Rewrite the **On-Demand Snapshot** section: drop "pause / `pause_lsn + 1`"; use the watermark chunk loop with no stream pause. | Snapshot §4 |
+| DF-3 | Remove MySQL `RELOAD`/`LOCK TABLES` from snapshot preconditions. | Snapshot §3 |
+| DF-4 | Generalize the `committed_lsn` scalar guard to engine-tagged `cdc.committed_position` (per-table HWM; resume = min/intersect across tables). | Delivery §3/§4 |
+| DF-5 | Add the per-change `_seq` to `CdcEvent` and the dedup collapse to Phase 3/4 (mirror-delete semantics, ≤1 delete + ≤1 data per key). | Ghost_Row §4 (see DA-X-1) |
+| DF-6 | Re-root per-pipeline state directly under the per-pipeline location; drop the `pipelines/<id>/` segment. | Config §10, Operational G-NEW-20 |
+| DF-7 | Add the split-commit rule + checkpoint-pinned-at-txn-start for oversized transactions. | Large_Txn §1 |
+| DF-8 | Note pause/stop flush-to-boundary and desired-state reconciliation in the shutdown/handoff section. | Lifecycle §6 |
+| DF-9 | State the consolidated **sink-writer contract** (keying, collapse, partition-routing-by-before-image, delete-file sequencing, snapshot-summary properties, truncate). | DA-X-3 |
+
+### 19.3 `System-Overview.md`
+
+| # | Edit | Source |
+|---|---|---|
+| S-1 | Replace the resolved "Open Questions" block with pointers to the closing docs (most OQ-* are now closed). | this report |
+| S-2 | Add the `/v1` API path list + min-role column; annotate lifecycle endpoints with the state machine. | API_RBAC §6, Lifecycle |
+| S-3 | Add the observability catalogue + cardinality policy summary. | Observability |
+| S-4 | State external-maintenance-for-v1 + the exposed when-needed signals. | Maintenance §5 |
+| S-5 | Document the `node_name` sourcing rule + StatefulSet mandate; the "restart ≠ apply config" footgun. | Clustering §3.4/§9.3 |
+| S-6 | Fix the typo `worked` → `worker that` (line ~241 region) and drop the dangling `snapshot_mode: only`. | OQ-M1/M2 |
+
+> `Schema_Change_Detection_and_Evolution.md` is already aligned with the config spec (the `method`
+> removal and `rescan_interval` rename are reflected in §13). No further schema-doc merge owed.
+
+---
+
+## 20. Open-decisions register (genuinely undecided, 🟥)
+
+The short list of questions spec elaboration must actually *decide* (everything else is resolved or is
+merge/verify work). Ordered roughly by leverage.
+
+| ID | Decision | Recommendation / starting position |
+|---|---|---|
+| DA-OBS-5 | Fix a **numeric end-to-end replication-lag SLA**, and whether failover-time has its own SLA. | Pick a steady-state max-lag (e.g. 60s fits Balanced lease defaults) + a separate, looser failover-time target (~20–30s); load-test to confirm. Grounds lease/flush/checkpoint tuning. |
+| DA-X-1 / DA-FLOW-2 | `CdcEvent` per-change sequence field + whether `_seq` is a persisted column. | Add `change_seq: SourceSeq` to `CdcEvent`; persist `_seq` as a 6th lineage column (downstream dedup auditability). |
+| DA-X-4 / DA-SYS-4 | Runtime rule for source columns colliding with reserved `_`-names. | Halt the table with a clear error by default; offer a configurable escape-prefix if demand appears. |
+| DA-X-5 / DA-FLOW-5 | Cross-engine `TRUNCATE` → Iceberg semantics. | Map to an overwrite-to-empty (or delete-all-by-no-key snapshot boundary); define once, same for PG + MySQL; keep idempotent. |
+| DA-X-6 / DA-SNAP-8 | PK-less table under dump-only modes. | Allow dump-only PK-less tables as plain inserts (no `identifier-field-ids`); they never stream/delete so the keying rule doesn't bind. (Or halt for uniformity — decide.) |
+| DA-SRC-8 / DA-X-7 | MariaDB GTID dialect support in `SourcePosition`. | Schedule the sub-research; detect MariaDB at connect and select the GTID parser; otherwise narrow v1 scope to MySQL-only. |
+| DA-CFG-4 | External secret-manager integration. | Declare out of scope for v1; the file-content-rotation path (sidecar writes the file) is the supported pattern. |
+| DA-DEDUP-7 | Cross-table atomic visibility. | Keep out of scope; document the per-table-only guarantee; reopen only if a multi-table-commit catalog (Nessie) becomes a requirement. |
+| DA-CLUS-12 | `kubernetes` lock_backend. | Defer; `storage` CAS lease is the v1 backend (already enforced by V-075). |
+| DA-CLUS-13 | Per-source-endpoint takeover bulkhead. | Defer; per-node-global cap ships in v1; add per-endpoint group if reconnect storms are observed. |
+| DA-SINK-8 | Spill-to-disk for oversized transactions. | Defer to a future `sink.large_txn_mode: spill`; v1 uses split-commits or sized memory. |
+| DA-CAT-4 | How the writer consumes catalog-vended credentials. | Specify in the sink-writer contract if credential vending is targeted for v1; otherwise note as future. |
+
+---
+
+## 21. Capability & verification gates (🧪 — must be proven, cannot be closed on paper)
+
+These are the items most likely to invalidate a "design complete" claim. Each depends on a real
+behavior of a pinned crate or a cloud service. **Recommendation: stand up the prototypes/gates below
+before (or in parallel with) writing the implementation spec, because a negative result changes the
+design, not just the code.**
+
+| ID | Gate | Depends on | If it fails |
+|---|---|---|---|
+| DA-CLUS-1 / DA-DEP-2 | Atomic CAS (create-if-absent, swap-if-version, conditional-delete) on **S3, GCS, Azure** — especially the **GCS generation (not ETag)** mapping. | OpenDAL ≥ late-2024 + per-backend behavior. | The storage lease is unsafe; either drop to native SDKs per backend, or reconsider the lock backend. **Top blocker.** Suite scaffolded at `prototypes/lease-conformance/` (T1–T10); T4/T5/T10 must run against real services. |
+| DA-SINK-1 | Equality-delete writer assigns delete files the **enclosing commit's sequence number**. | iceberg-rust 0.9.0. | The ghost-row strictly-less-than guarantee breaks; need position-deletes-after-read or a different write strategy. **Blocks the sink writer.** |
+| DA-SINK-2 / DA-X-2 | Custom `cdc.*` **snapshot-summary properties preserved across commits**. | iceberg-rust 0.9.0. | `owner_epoch` fence + `committed_position` guard lose their carrier; need a side-channel (e.g. table properties) or an alternate fence. |
+| DA-SCHEMA-8 | `drop_column` / `rename_column` / type-promotion transactions supported. | iceberg-rust 0.9.0. | Route the unsupported op to "halt table" until the crate catches up (graceful, already the fallback). |
+| DA-TYPE-5 | `FixedSizeBinary(16)` → Iceberg `uuid` annotation mechanism. | iceberg-rust 0.9.0. | UUID columns fall back to `fixed(16)`/`binary`; cosmetic, low risk. |
+| DA-SINK-10 | Compaction / rewrite API availability. | iceberg-rust (future). | Built-in maintenance stays deferred (already external for v1); no v1 impact. |
+
+A single **iceberg-rust capability probe** (one integration test exercising equality-delete
+sequencing, snapshot-summary persistence, schema-evolution ops, and the uuid annotation against the
+pinned version) would close five of these six at once. The storage-CAS conformance suite closes the
+sixth (and the top blocker).
+
+---
+
+## 22. Spec-readiness assessment
+
+**Verdict: the foundation is strong; design is essentially complete and the application specification
+can begin now**, provided the work is sequenced so the two 🔴 verification gates are run early (a
+negative result there is the only thing that would force a design change rather than a spec edit).
+
+Readiness by area:
+
+- **Ready to specify immediately:** configuration model, catalog auth, RBAC/API, schema-evolution
+  detection/apply, type mapping, snapshot model, dedup/keying, clustering protocol, lifecycle state
+  machine, observability, source-lifecycle. All have a closing research doc.
+- **Specify against a verification gate:** the sink writer (DA-SINK-1, DA-SINK-2) and the storage
+  lease (DA-CLUS-1). Write the contract, but treat the crate/cloud behavior as an assumption to be
+  proven, with the documented fallback paths in the spec.
+- **Decide first (small, bounded):** the ~12 items in §20 — most have a clear recommended default
+  already; a half-day of decisions unblocks them.
+- **Mechanical, do anytime:** the §19 spec-merge debt — best done before elaboration so the specs are
+  internally consistent when the spec author reads them.
+
+Suggested sequence: (1) run the two verification gates / probes; (2) make the §20 decisions; (3) apply
+the §19 merges to the specs; (4) write the consolidated sink-writer contract (DA-X-3); (5) proceed to
+full application specification.
+
+---
+
+## 23. Document inventory & authority
+
+| Document | Role | Authoritative for | Edit policy |
+|---|---|---|---|
+| `specs/System-Overview.md` | spec | top-level requirements, scope | Oleksii owns; propose-only |
+| `specs/Data-Flow.md` | spec | pipeline stages, CdcEvent, state layout | Oleksii owns; propose-only (most merge debt, §19.2) |
+| `specs/Configuration_Specification.md` | spec | config model, validation, mutability | Oleksii owns; propose-only |
+| `specs/Schema_Change_Detection_and_Evolution.md` | spec | detection channels, DDL classification, apply | reviewed & approved |
+| `research/Type_Mapping.md` | research | three-hop type mapping | Claude authors |
+| `research/Catalog_Auth_Research.md` | research | catalog auth schema | Claude authors |
+| `research/Clustering_Architecture_Research.md` | research | two-plane clustering, lease, propagation | Claude authors |
+| `research/Snapshot_Resumability_and_Consistency.md` | research | incremental chunked snapshot | Claude authors |
+| `research/Ghost_Row_Dedup_and_Primary_Keys.md` | research | equality-delete keying, PK policy | Claude authors |
+| `research/Delivery_Guarantee_and_Position_Guard.md` | research | SourcePosition, committed_position | Claude authors |
+| `research/Pipeline_Lifecycle_State_Machine.md` | research | pause/stop/resume/restart/flush | Claude authors |
+| `research/Postgres_Slot_and_Publication_Lifecycle.md` | research | PG slot/publication runtime lifecycle | Claude authors |
+| `research/MySQL_DDL_Classifier.md` | research | channel-B classifier | Claude authors |
+| `research/Iceberg_Maintenance.md` | research | maintenance ownership + signals | Claude authors |
+| `research/Iceberg_Partitioning_and_Layout_Evolution.md` | research | partitioning, MOR↔COW change | Claude authors |
+| `research/Large_Transaction_Handling.md` | research | split commits, memory backstop | Claude authors |
+| `research/Observability_Metrics_and_Tracing.md` | research | metrics catalogue, tracing | Claude authors |
+| `research/Operational_and_Scope_Gaps_Batch.md` | research | WAL/binlog guards, Azure, MariaDB, IAM | Claude authors |
+| `research/API_RBAC_and_Versioning.md` | research | RBAC matrix, versioning | Claude authors |
+| `sources/Sources_Index_v3.md` | reference | 50-source index, crate versions | read-only |
+| `analysis/CDC_Gap_Analysis_Report.md` | analysis | legacy v9 tracker | retained as audit trail |
+| `analysis/CDC_Design_Gap_Analysis_v1.md` | analysis | **this fresh re-derivation** | Claude maintains |
+
+### Cross-reference: this report's IDs ↔ legacy IDs
+
+The *(parenthetical)* legacy IDs in every gap table above are the bridge back to the v9 tracker. Notable
+legacy blockers and their current status here: `G-8`→DA-CLUS-2 ✅, `G-9`→DA-CLUS-5 ✅, `G-13`→DA-DEDUP-1
+✅ (+ DA-SINK-1 🧪), `G-14`→DA-DEDUP-2 ✅, `G-6`→DA-SNAP-1 ✅, `G-15`→DA-SRC-1..4 ✅, `G-16`→DA-API-1 ✅,
+`G-18`→DA-TYPE-1 ✅, `G-19/19a/19b`→DA-SCHEMA-* ✅, `D-5`→DA-CLUS-1 🧪 (still the top blocker),
+`D-6`→DA-CLUS-11 ✅. The legacy "remaining blockers" list (D-5, D-6, G-13/G-30, G-14, G-6, G-11, G-15,
+G-16, G-NEW-20/21/22) is now **all resolved on paper except D-5 (DA-CLUS-1)** — plus the newly-explicit
+crate gate DA-SINK-1, which the legacy report folded into G-13's implementation note.
+
+
+
+
