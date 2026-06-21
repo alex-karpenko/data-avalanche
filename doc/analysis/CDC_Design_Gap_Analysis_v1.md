@@ -89,7 +89,7 @@ in three buckets:
 
 | ID | Title | Why it blocks |
 |---|---|---|
-| DA-SINK-1 | iceberg-rust equality-delete writer assigns delete files the **enclosing commit's sequence number** | The ghost-row correctness rule (strictly-less-than) and thus all MOR dedup depends on it; unverified against the pinned crate. *(G-13 §8)* |
+| DA-SINK-1 | **iceberg-rust 0.9.1 cannot commit deletes/overwrites — the MOR-equality-delete sink (and its COW fallback) is not buildable on the pinned crate** | Confirmed 2026-06 by reading the pinned API: `EqualityDeleteFileWriter` exists but the `Transaction` API is **append-only** (`fast_append` data files; no row-delta/overwrite/rewrite, no `update_schema`). A CDC sink that applies UPDATE/DELETE cannot be built on 0.9.1's public API. **The sink spec must gate on a future iceberg-rust version or adopt §24.2.1 option 2–4.** *(G-13 §8; details §24.2.1)* |
 
 > **DA-CLUS-1 (storage-CAS conformance) — CLOSED 2026-06.** Proven against **real S3, GCS, and Azure**:
 > S3 T1–T9 (versioned + non-versioned), GCS T1–T10 (incl. the generation-CAS gate T10), Azure T1–T9.
@@ -840,6 +840,66 @@ disagrees with iceberg-rust's, the equality-delete path is unusable as designed.
 `Iceberg_Maintenance…` (delete-file compaction), and `Delivery…` (the per-table guard rides the same
 writer). All of those assume equality deletes work. The position-delete fallback keeps correctness but
 is a real writer redesign — hence verify **before** the sink writer is specified in detail.
+
+---
+
+#### 24.2.1 RESULT (2026-06) — 🔴 **iceberg-rust 0.9.1 cannot commit deletes at all. This is worse than a sequencing bug.**
+
+The probe was answered by reading the pinned crate's public API (`iceberg` 0.9.1, the latest 0.9). The
+question is no longer "does the equality-delete writer sequence correctly" — it is "**can deletes be
+committed at all?**", and the answer is **no**:
+
+- **The writer exists, the commit path does not.** `iceberg::writer::base_writer` does expose
+  `EqualityDeleteFileWriter`, `PositionDeleteFileWriter`, and `DataFileWriter` — so delete files can be
+  *written*. But the **`Transaction` commit API exposes only**: `fast_append()` (→ `add_data_files(...)`,
+  **data files only**), `update_table_properties`, `replace_sort_order`, `update_location`,
+  `update_statistics`, `upgrade_table_version`, `commit`. There is **no row-delta / overwrite / rewrite
+  / delete-commit action, and no `update_schema`.** The transaction module contains only
+  `Transaction`, `ActionCommit`, and the `ApplyTransactionAction` trait. The doc's own example states
+  fast-append "will not rewrite or append to existing metadata."
+- **Consequence.** iceberg-rust 0.9.1's public write API is **append-only**. You can ingest data files;
+  you **cannot commit equality-delete files, position-delete files, overwrites, or file rewrites.**
+  The MOR-equality-delete sink (the system default) is **not implementable** on 0.9.1 — and the **COW
+  fallback is equally blocked**, because COW also needs an overwrite/replace-files commit, which is
+  absent. A CDC sink whose entire purpose is to apply UPDATEs and DELETEs cannot be built on this crate
+  version through the public API. This is the position-delete/COW fallback from the list above being
+  *unavailable*, not just costly.
+
+**Options (all require a decision before the sink is specced):**
+
+1. **Track iceberg-rust and pin a version that adds delete/overwrite commits.** The `fast_append`
+   naming and the active write-path work upstream imply row-delta/MOR commit support is coming; this is
+   the lowest-friction path but is **schedule-dependent on an external project**. Make the sink spec
+   explicitly gated on "iceberg-rust ≥ the release that lands delete commits," and re-run this probe then.
+2. **Drop to a lower-level commit** — assemble the snapshot/manifest with delete files via iceberg-rust's
+   spec types directly (below the `Transaction` convenience API), if those internals are public enough.
+   High effort and fragile across versions; essentially re-implementing the delete-commit action.
+3. **Bridge the commit to another Iceberg implementation** (PyIceberg / Java) for the delete/upsert
+   commit while keeping the Rust capture/decode/accumulate path. Contradicts the "Rust-native, no JVM"
+   design tenet; heavy operationally.
+4. **Contribute the delete-commit (row-delta) action upstream** to iceberg-rust. Most aligned with the
+   design, real engineering + review-cycle cost, benefits the ecosystem.
+5. **Restrict v1 to append-only** (snapshot/insert-only tables) — **not viable** for a CDC system that
+   must mirror updates and deletes; listed only to reject it.
+
+**This finding outranks the original DA-SINK-1 framing and should headline the sink section of the
+application spec:** the sink's core write strategy (MOR equality deletes, and its COW fallback) is **not
+buildable on the pinned iceberg-rust**, so the spec must either gate on a future crate version (option 1)
+or commit to options 2–4. The capture→decode→accumulate pipeline is unaffected; the gap is entirely at
+the Iceberg *commit* boundary. The probe (`prototypes/iceberg-capability/`) records this; re-run it
+against any newer iceberg-rust to detect when delete commits land.
+
+> **DECISION (2026-06) — Option 1: track iceberg-rust; gate the sink spec on a delete-commit-capable
+> release.** The sink writer's detailed spec is **deferred** until iceberg-rust ships a delete-aware
+> commit action (row-delta / overwrite / merge-append). Capture/decode/accumulate spec work may
+> proceed; the *commit* layer waits. **Revisit ~2026-07-21**: re-check the iceberg-rust `Transaction`
+> API (and the `iceberg-capability` canary) for a delete-commit action. A scheduled reminder is set.
+> If, by the revisit, no delete-commit support has landed and the timeline matters, escalate to
+> option 4 (contribute upstream) or 2 (low-level commit).
+
+> **Knock-on:** the same "no `update_schema` / no rewrite" gap means **DA-SCHEMA-8** (schema evolution
+> via transaction) and **DA-SINK-10** (compaction/rewrite) are *also* absent from 0.9.1's public API —
+> see §24.4 and §24.6. DA-SINK-2 (snapshot-summary properties) is moot until a delete-commit path exists.
 
 ---
 

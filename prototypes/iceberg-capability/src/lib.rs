@@ -1,22 +1,23 @@
-//! iceberg-capability — verification probe for the iceberg-rust behaviors the
-//! CDC design assumes but cannot confirm on paper.
+//! iceberg-capability — iceberg-rust 0.9.1 capability assessment for the CDC sink.
 //!
-//! Gates (see `doc/analysis/CDC_Design_Gap_Analysis_v1.md` §21 / §24):
+//! **RESULT (2026-06): iceberg-rust 0.9.1's public write API is APPEND-ONLY.**
+//! `EqualityDeleteFileWriter` / `PositionDeleteFileWriter` exist (delete files can be
+//! *written*), but the `Transaction` commit surface is data-file-only — `fast_append`
+//! + a few metadata actions, with **no row-delta / overwrite / rewrite / delete-commit
+//! action and no `update_schema`**. So the MOR-equality-delete sink (and its COW
+//! fallback) is **not buildable on 0.9.1**. Full analysis + options:
+//! `doc/analysis/CDC_Design_Gap_Analysis_v1.md` §24.2.1.
 //!
-//! | Gate | DA-ID | Proves |
-//! |------|-------|--------|
-//! | G1 | **DA-SINK-1** 🔴 | An equality-delete file gets the **enclosing commit's** data-sequence-number, so a same-commit `delete(K)+insert(K')` purges prior-commit `K` but spares the same-commit `K'` (the ghost-row strictly-less-than rule, `Ghost_Row_Dedup_and_Primary_Keys.md` §0). |
-//! | G2 | **DA-SINK-2** 🧪 | Custom `cdc.*` snapshot-summary properties are readable and survive across commits (`owner_epoch` fence + `committed_position` guard carrier). |
-//! | G3 | **DA-SCHEMA-8** 🧪 | `add_column` / `drop_column` / `rename_column` / type-promotion commit as metadata-only ops, with **field-IDs preserved on rename**. |
-//! | G4 | **DA-TYPE-5** 🧪 | A field-level hint maps Arrow `FixedSizeBinary(16)` → Iceberg `uuid` (not `fixed(16)`). |
-//! | G5 | **DA-SINK-10** 🧪 (deferred) | API-surface presence of rewrite/compaction/expire entry points — informational only; v1 maintenance is external. |
+//! | Gate | DA-ID | Verdict (0.9.1) |
+//! |------|-------|-----------------|
+//! | G1 | **DA-SINK-1** | 🔴 Unsupported — delete files can be written but not committed (blocks the sink). |
+//! | G2 | **DA-SINK-2** | ⏸ Moot until deletes can be committed. |
+//! | G3 | **DA-SCHEMA-8** | 🔴 Unsupported — no `update_schema` transaction action. |
+//! | G4 | **DA-TYPE-5** | 🟡 Likely OK — schema-definition only, independent of the commit path. |
+//! | G5 | **DA-SINK-10** | 🔴 (expected) — no rewrite/compaction API; confirms external-maintenance-for-v1. |
 //!
-//! **Only G1 can force a redesign** (position-deletes / COW). G2–G4 degrade
-//! gracefully (idempotency is correctness; halt-the-table; cosmetic uuid). G5 is
-//! deferred. The triage lives in gap-analysis §24.0.
-//!
-//! The iceberg-touching code is behind the `probe` feature; the default build is
-//! a green scaffold-status check (`tests/capability.rs`).
+//! Re-run when iceberg-rust gains a delete-aware commit action (see README). The
+//! `probe` feature pulls iceberg so this can be re-checked on a crate bump.
 
 /// Outcome of one capability gate.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,64 +36,61 @@ impl Gate {
     }
 }
 
-/// The five gate ids in execution order, with their severity tag.
+/// The five gates with their 0.9.1 verdict.
 pub const GATES: &[(&str, &str, &str)] = &[
-    ("G1", "DA-SINK-1", "equality-delete same-commit sequencing (BLOCKER)"),
-    ("G2", "DA-SINK-2", "custom snapshot-summary properties persist"),
-    ("G3", "DA-SCHEMA-8", "drop/rename/promote schema-evolution ops"),
-    ("G4", "DA-TYPE-5", "FixedSizeBinary(16) -> uuid annotation"),
-    ("G5", "DA-SINK-10", "rewrite/compaction API surface (deferred)"),
+    (
+        "G1",
+        "DA-SINK-1",
+        "🔴 UNSUPPORTED — delete files writable, NOT committable (append-only Transaction)",
+    ),
+    ("G2", "DA-SINK-2", "⏸ moot until deletes can be committed"),
+    (
+        "G3",
+        "DA-SCHEMA-8",
+        "🔴 UNSUPPORTED — no update_schema transaction action",
+    ),
+    ("G4", "DA-TYPE-5", "🟡 likely OK — schema-definition only"),
+    (
+        "G5",
+        "DA-SINK-10",
+        "🔴 expected — no rewrite/compaction API",
+    ),
 ];
 
-/// Print the gate roster + run guidance. Used by the default (no-feature) build
-/// so `cargo test` is self-documenting and green.
+/// Print the capability verdict. Used by the default (no-feature) build so
+/// `cargo test` reports the finding and stays green.
 pub fn print_scaffold_status() {
-    println!("iceberg-capability — probe scaffold");
-    println!("  default build runs no iceberg code; enable with `--features probe`.");
-    println!("  gates:");
-    for (g, da, what) in GATES {
-        println!("    {g}  {da:<12} {what}");
+    println!("iceberg-capability — iceberg-rust 0.9.1 capability assessment");
+    println!("  RESULT: 0.9.1 public write API is APPEND-ONLY (fast_append data files only);");
+    println!(
+        "          deletes/overwrites/rewrites and update_schema are NOT in the Transaction API."
+    );
+    println!("  => MOR-equality-delete sink (and COW fallback) NOT buildable on 0.9.1.");
+    println!("  gate verdicts:");
+    for (g, da, verdict) in GATES {
+        println!("    {g}  {da:<12} {verdict}");
     }
-    println!("  fallbacks + full plan: doc/analysis/CDC_Design_Gap_Analysis_v1.md §24");
+    println!("  full analysis + options: doc/analysis/CDC_Design_Gap_Analysis_v1.md §24.2.1");
 }
 
 // ---------------------------------------------------------------------------
-// Probe helpers (compiled only with `--features probe`).
+// Re-check hook (`--features probe`).
 // ---------------------------------------------------------------------------
+//
+// There is intentionally NO probe implementation here yet: on iceberg 0.9.1 the
+// blocking gate (G1) is UNSUPPORTED because the `Transaction` commit API cannot
+// commit delete files (it is append-only). So the probe can only be *built* once
+// iceberg-rust gains a delete-aware commit action.
+//
+// This module exists so `cargo build --features probe` exercises the iceberg dep
+// and acts as a CANARY: if a crate bump removes/relocates these types, it breaks
+// here, prompting a re-run of the §24.2.1 assessment. The single thing to look for
+// on a bump is a NEW delete-aware action on `Transaction` (row-delta / overwrite /
+// merge-append). When that lands, implement G1 per the README.
 #[cfg(feature = "probe")]
 pub mod probe {
-    //! Shared helpers for the gate tests. Every `// VERIFY:` marks a call whose
-    //! exact signature must be checked against the pinned iceberg-rust 0.9.0.
-
-    use std::collections::HashMap;
-
-    /// Build an in-process Memory catalog over a temp local-fs warehouse so the
-    /// probe is fully self-contained (no cloud needed for the functional gates).
-    ///
-    /// Returns the catalog handle and the temp dir guard (drop = cleanup).
-    pub async fn temp_catalog() -> anyhow::Result<()> {
-        // VERIFY: the 0.9.0 constructor + storage wiring. Sketch:
-        //   let tmp = tempfile::tempdir()?;
-        //   let warehouse = format!("file://{}", tmp.path().display());
-        //   let file_io = iceberg::io::FileIOBuilder::new("fs").build()?;   // VERIFY
-        //   let catalog = iceberg_catalog_memory::MemoryCatalog::new(file_io, Some(warehouse)); // VERIFY
-        //   Ok((catalog, tmp))
-        todo!("wire MemoryCatalog over a tempfile fs warehouse (VERIFY 0.9.0 API)")
-    }
-
-    /// A 2-column identifier'd schema: `id uuid (required, identifier)`, `v string`.
-    /// Used by G1/G2/G3. The uuid column also exercises G4's annotation path.
-    pub fn cdc_schema() -> anyhow::Result<()> {
-        // VERIFY: iceberg::spec::{Schema, NestedField, Type, PrimitiveType}
-        //   NestedField::required(1, "id", Type::Primitive(PrimitiveType::Uuid))
-        //   NestedField::optional(2, "v",  Type::Primitive(PrimitiveType::String))
-        //   Schema::builder().with_fields(..).with_identifier_field_ids([1]).build()
-        todo!("build Schema with identifier-field-ids = [id] (VERIFY 0.9.0 API)")
-    }
-
-    /// Read the current snapshot's summary as a string map (G2).
-    pub fn current_summary() -> anyhow::Result<HashMap<String, String>> {
-        // VERIFY: table.metadata().current_snapshot()?.summary() -> &Summary { other: HashMap<..> , .. }
-        todo!("read current_snapshot().summary() (VERIFY 0.9.0 API)")
-    }
+    /// Canary against a confirmed 0.9.1 path: the transaction whose action surface
+    /// gates the commit. Re-inspect `Transaction`'s methods on any iceberg bump for a
+    /// new delete-aware action (row-delta / overwrite / merge-append); 0.9.1 has none.
+    pub type TransactionCanary = iceberg::transaction::Transaction;
 }

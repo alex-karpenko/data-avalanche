@@ -5,25 +5,26 @@ edition = "2021"
 publish = false
 description = "Capability probe: proves the iceberg-rust behaviors the CDC sink/clustering design depends on (DA-SINK-1/2, DA-SCHEMA-8, DA-TYPE-5, DA-SINK-10)"
 
-# MSRV: 1.92.0 (iceberg-rust 0.9.0, per doc/sources/Sources_Index_v3.md).
+# MSRV: 1.92 (iceberg 0.9.1 — latest 0.9, edition 2024, per crates.io 2026-06).
 #
-# The iceberg-dependent probe code is gated behind the `probe` feature and is
-# OFF by default, so `cargo test` stays green without the engineer's attention
-# (same posture as the lease-conformance harness, which env-skips). The probe
-# bodies are written against the *documented* iceberg-rust 0.9.0 surface; the
-# exact method/type names MUST be reconciled against the pinned crate before the
-# first `--features probe` compile. See README.md.
+# The iceberg-dependent probe code is gated behind the `probe` feature and is OFF
+# by default, so the default `cargo build`/`cargo test` stays green. The probe test
+# bodies are still SCAFFOLDS (`todo!()`) — they encode the test plan; the real
+# iceberg-rust 0.9 writer/transaction/catalog calls remain to be implemented.
+#
+# Dependency notes (verified on crates.io):
+#   - `iceberg-catalog-memory` is YANKED at every version (no 0.9) — the memory
+#     catalog moved into the core `iceberg` crate (`iceberg::catalog::memory`).
+#   - arrow is NOT pinned here: iceberg re-exports the exact arrow it builds
+#     against, so the probe must use iceberg's arrow to avoid a version clash.
 
 [dependencies]
 
 [features]
-# Enable to compile + run the real iceberg-rust probes. Requires the pinned crate
-# and a writable warehouse (local fs is fine — see README).
+# Enable to compile + run the real iceberg-rust probes. Self-contained: a
+# MemoryCatalog over a temp local-fs warehouse (no cloud needed for G1–G4).
 probe = [
     "dep:iceberg",
-    "dep:iceberg-catalog-memory",
-    "dep:arrow-array",
-    "dep:arrow-schema",
     "dep:tokio",
     "dep:tempfile",
     "dep:futures",
@@ -35,19 +36,7 @@ version = "1"
 optional = true
 
 [dependencies.iceberg]
-version = "0.9" # VERIFY against the workspace pin; must match the sink's iceberg dep
-optional = true
-
-[dependencies.iceberg-catalog-memory]
-version = "0.9" # in-process catalog for a self-contained probe; VERIFY crate name/version
-optional = true
-
-[dependencies.arrow-array]
-version = "59"  # arrow-rs; VERIFY the major matches iceberg 0.9's arrow pin
-optional = true
-
-[dependencies.arrow-schema]
-version = "59"
+version = "0.9" # -> 0.9.1; must match the sink's iceberg dep. Provides MemoryCatalog + arrow re-export.
 optional = true
 
 [dependencies.tokio]
