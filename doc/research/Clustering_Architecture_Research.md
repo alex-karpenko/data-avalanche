@@ -903,24 +903,48 @@ required regardless of backend; and if S3 bucket **versioning** is enabled, cond
 behaves (412 on a live version) but deletes leave delete-markers — keep the lease prefix versioning-off
 or lifecycle-expired to avoid clutter.
 
+> **Versioning footgun confirmed by the conformance run (2026-06).** On a **versioning-enabled S3
+> bucket** the write/stat metadata's `version()` becomes the object **version-id**, which `If-Match`
+> does **not** accept — a swap CAS'd against the version-id fails `412` every time. The token fed into
+> `if_match` on S3/Azure must be the **ETag** (on GCS, the generation). The `LeaseStore` fixes the token
+> kind by backend, never inferring it from whichever metadata field happens to be populated. Net: bucket
+> versioning is **not required** and is **best left off** for the lease prefix (the high-frequency renew
+> writes would also pile up noncurrent versions).
+
 ### 17.2 Route A — OpenDAL (already a dependency via `iceberg-storage-opendal`)
 
 OpenDAL exposes the primitives directly:
 
 ```rust
-// ACQUIRE (S3 accepts only "*" for if_none_match)
-op.write_with(&key, bytes).if_none_match("*").await        // Err(ConditionNotMatch) if held
+// ACQUIRE — create-if-absent via the portable if_not_exists (NOT if_none_match; see note)
+op.write_with(&key, bytes).if_not_exists(true).await       // Err(ConditionNotMatch|AlreadyExists) if held
 // RENEW / TAKEOVER
 op.write_with(&key, bytes).if_match(&version).await         // Err(ConditionNotMatch) if version moved
-// RELEASE
-op.delete_with(&key).if_match(&version).await               // capability-dependent
+// RELEASE — conditional tombstone write (OpenDAL has no conditional delete)
+op.write_with(&key, TOMBSTONE).if_match(&version).await     // Err(ConditionNotMatch) if version moved
 ```
 
-A failed precondition surfaces as `Err(e)` with `e.kind() == ErrorKind::ConditionNotMatch`. **But**
-these calls are gated by a `CorrectnessCheckLayer` against per-backend `Capability` flags
-(`write_with_if_none_match`, `write_with_if_match`, `delete_with_if_match`). If a backend build does
-not advertise a flag, the call errors as *unsupported* rather than executing. Therefore Route A
-requires:
+> **Real-S3 finding (2026-06, from the conformance harness).** S3's `If-None-Match` supports only the
+> wildcard `*` (create-if-absent), so OpenDAL models that as the dedicated **`write_with_if_not_exists`**
+> capability and reports **`write_with_if_none_match = false`** on S3 (it reserves if-none-match for
+> arbitrary-ETag matching, which S3 does not support on writes). Use `.if_not_exists(true)` for ACQUIRE,
+> not `.if_none_match("*")`. Likewise OpenDAL's `delete_with(...)` exposes no `if_match`, so RELEASE is a
+> conditional **tombstone write** (`write_with(...).if_match(...)`), which `acquire` then CAS-takes.
+>
+> **GCS finding (2026-06) — Route A cannot run the lease on GCS.** OpenDAL's GCS backend reports
+> **`write_with_if_match = false`**: GCS write preconditions are **generation-based** (`ifGenerationMatch`),
+> not ETag/`If-Match`. OpenDAL surfaces the generation only as `if_not_exists` (=0) for *create* and has
+> no arbitrary generation-match write option, so it cannot express the CAS **update** (renew/takeover) on
+> GCS. This is a static capability gap, not an auth/access problem. **Therefore GCS uses Route B — the
+> native GCS SDK** (`google-cloud-storage`, `ifGenerationMatch` for create=0 and swap=N; token =
+> generation) behind the same `LeaseStore` trait. Route A (OpenDAL) covers **S3 + Azure** only.
+
+A failed precondition surfaces as `Err(e)` with `e.kind() == ErrorKind::ConditionNotMatch` (a held
+create may also surface `AlreadyExists`). **But** these calls are gated by a `CorrectnessCheckLayer`
+against per-backend `Capability` flags — the ones the lease truly needs are **`write_with_if_not_exists`**
+and **`write_with_if_match`** (no `delete_with_if_match`, since release tombstones via a conditional
+write). If a backend build does not advertise a required flag, the call errors as *unsupported* rather
+than executing. Therefore Route A requires:
 
 1. **Pin a recent OpenDAL** — `if_match` on writes landed late-2024 / early-2025; the
    `iceberg-storage-opendal` transitive pin must be at or above that.
@@ -975,18 +999,27 @@ conformance suite as a CI merge gate, and a documented **per-backend drop-to-nat
 if a capability or mapping gap is found. This is the `cluster.lock_backend: storage` implementation;
 the optional `kubernetes` backend (D-2) is a separate `LeaseStore` impl over the K8s Lease API.
 
-> **APPROVED + scaffolded (2026-06-20).** Route A approved. The `LeaseStore` trait and the T1–T10
-> conformance suite are now scaffolded at **`prototypes/lease-conformance/`** (runnable via
-> `cargo test` against MinIO / fake-gcs-server / Azurite, with T4/T5/T9/T10 flagged for real-service
-> runs). D-5 stays **open-until-executed**: the suite must pass against real S3, GCS *and* Azure once —
-> T10 (GCS generation-vs-ETag) is the gating assertion — before the storage lease is trusted in
+> **APPROVED + S3 & GCS PROVEN (2026-06).** The `LeaseStore` trait and the T1–T10 conformance suite live
+> at **`prototypes/lease-conformance/`**. **S3 (Route A/OpenDAL): T1–T9 pass on real AWS S3, versioned
+> and non-versioned. GCS (Route B/native `google-cloud-storage`): T1–T10 pass on real GCS, including T10
+> — the generation-CAS gate.** Findings folded into §17.1/§17.2: create-if-absent is `if_not_exists` (S3
+> reports `write_with_if_none_match = false`); the S3/Azure token is the **ETag** (a versioned bucket's
+> `version()` is the version-id, which `If-Match` rejects); and **OpenDAL can't run the lease on GCS**
+> (`write_with_if_match = false`), so GCS uses the native SDK with `ifGenerationMatch`. **Azure: OpenDAL
+> 0.57 azblob ALSO reports `write_with_if_match = false`** (`if_not_exists=true, if_none_match=true`) — an
+> OpenDAL limitation (Azure Blob natively supports `If-Match`). The project is pinned to OpenDAL 0.57, so
+> **on 0.57 Route A covers S3 only**, and Azure is implemented as a native Route B (raw Blob REST +
+> `reqwest` + SAS, `If-Match`/`If-None-Match`, ETag token). Net: `lock_backend: storage` is a per-backend
+> `LeaseStore` — OpenDAL/S3, native/GCS, native/Azure — one trait, §5.3 protocol unchanged. D-5 stays
+> **open-until the Azure run** before the storage lease is trusted in
 > production. This is the only remaining clustering item that cannot be closed on paper.
 >
 > **Verification + fallback are consolidated** in `CDC_Design_Gap_Analysis_v1.md` DA-CLUS-1 / §24.1:
 > the per-backend conflict-code table, the startup capability assertion (`op.info().full_capability()`
-> → refuse to start if `write_with_if_none_match` / `write_with_if_match` / `delete_with_if_match` is
-> absent), and the **per-backend drop-to-native-SDK** escape (Route B, §17.3) if OpenDAL lacks or
-> mis-maps a capability — an isolated `LeaseStore` swap, not a change to the §5.3 protocol.
+> → refuse to start if `write_with_if_not_exists` / `write_with_if_match` is absent — the real-S3
+> finding: S3 reports `write_with_if_none_match = false`, so acquire uses `if_not_exists`), and the
+> **per-backend drop-to-native-SDK** escape (Route B, §17.3) if OpenDAL lacks or mis-maps a capability —
+> an isolated `LeaseStore` swap, not a change to the §5.3 protocol.
 
 ---
 

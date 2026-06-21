@@ -5,20 +5,34 @@ edition = "2021"
 publish = false
 description = "D-5 conformance harness: proves CAS atomicity of the storage LeaseStore across S3 / GCS / Azure"
 
-# NOTE (D-5): pin OpenDAL at or above the release where conditional *writes*
-# (`write_with().if_none_match("*")` and `.if_match(<version>)`) are stable and
-# advertised via Capability flags. Verify the `iceberg-storage-opendal` transitive
-# pin agrees so the sink and the lease use one OpenDAL.
+# NOTE (D-5): on OpenDAL 0.57, Route A (OpenDAL) works only for **S3**. Both other
+# backends advertise `write_with_if_match = false` and need a native Route B:
+#   - GCS   → `gcs`   feature, `google-cloud-storage` + ifGenerationMatch
+#   - Azure → `azure` feature, raw Blob REST + SAS, If-Match/If-None-Match
+# (Azure Blob natively supports If-Match; it's an OpenDAL azblob limitation in 0.57.)
 [dependencies]
-opendal = { version = "0.57", features = [
-    "services-s3",
-    "services-gcs",
-    "services-azblob",
-] }
+opendal = { version = "0.57", features = ["services-s3"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 async-trait = "0.1"
 thiserror = "2"
 bytes = "1"
+
+# Route B (GCS): enable with `--features gcs`. Official Google SDK
+# (googleapis/google-cloud-rust), `ifGenerationMatch` for create=0 / swap=N.
+[dependencies.google-cloud-storage]
+version = "1.15"
+optional = true
+
+# Route B (Azure): enable with `--features azure`. Raw Blob REST over reqwest + SAS.
+[dependencies.reqwest]
+version = "0.13"
+optional = true
+default-features = false
+features = ["rustls"]
+
+[features]
+gcs = ["dep:google-cloud-storage"]
+azure = ["dep:reqwest"]
 
 [dev-dependencies]
 futures = "0.3"

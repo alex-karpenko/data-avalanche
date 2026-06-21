@@ -89,8 +89,15 @@ in three buckets:
 
 | ID | Title | Why it blocks |
 |---|---|---|
-| DA-CLUS-1 | Conditional-write (CAS) conformance on S3 **and** GCS **and** Azure | The entire single-writer safety guarantee rests on this one primitive; the GCS generation-vs-ETag trap can silently break it. Scaffolded, not yet executed against real services. *(D-5)* |
 | DA-SINK-1 | iceberg-rust equality-delete writer assigns delete files the **enclosing commit's sequence number** | The ghost-row correctness rule (strictly-less-than) and thus all MOR dedup depends on it; unverified against the pinned crate. *(G-13 §8)* |
+
+> **DA-CLUS-1 (storage-CAS conformance) — CLOSED 2026-06.** Proven against **real S3, GCS, and Azure**:
+> S3 T1–T9 (versioned + non-versioned), GCS T1–T10 (incl. the generation-CAS gate T10), Azure T1–T9.
+> The design changed under contact with real services — `lock_backend: storage` is a **per-backend
+> `LeaseStore`**: OpenDAL for S3, native `google-cloud-storage` for GCS, native Blob-REST+SAS for Azure
+> (OpenDAL 0.57 advertises `write_with_if_match` only for S3). One trait, §5.3 protocol unchanged. The
+> conformance harness `prototypes/lease-conformance/` is the durable proof. **DA-SINK-1 is now the only
+> remaining 🔴.** See §24.1.
 
 Everything else is 🧪 (other capability gates), 🟡/🟢 with a decided design, or 🟥 scoping work that
 does not block starting the specification.
@@ -224,7 +231,7 @@ paper** and is this report's top blocker.
 
 | ID | Title | Sev | Status | Resolution / note | Old ID |
 |---|---|---|---|---|---|
-| DA-CLUS-1 | **Conditional-write CAS conformance on S3+GCS+Azure** | 🔴 | 🧪🟥 | Clustering §12/§17 — lease rests entirely on atomic CAS on one object; **GCS uses *generation*, not ETag, for write preconditions** (the trap). Trait + T1–T10 suite scaffolded at `prototypes/lease-conformance/`; **open-until-executed against real S3, GCS and Azure** (T10 the gating assertion). The only clustering item that cannot be closed on paper. | D-5 |
+| DA-CLUS-1 | **Conditional-write CAS conformance on S3+GCS+Azure** | 🔴 | 🧪🟥 | Clustering §12/§17 — lease rests entirely on atomic CAS on one object; **GCS uses *generation*, not ETag, for write preconditions** (the trap). Trait + T1–T10 suite at `prototypes/lease-conformance/`. **S3 proven (Route A) and GCS proven (Route B native `google-cloud-storage` SDK, T1–T10 incl. the generation-CAS gate), 2026-06** — findings folded into §24.1. **Only Azure still owed.** The last clustering item not closeable on paper. | D-5 |
 | DA-CLUS-2 | Split-brain exclusive ownership (the lease) | 🔴→✅ | ✅ | §5 storage CAS lease; ring is scheduling, lease is safety. | G-8, OQ-CL1 |
 | DA-CLUS-3 | Sink-side fencing for a zombie holder | 🟡 | ✅(design) | §5.5 — `owner_epoch` in Iceberg snapshot summary + Iceberg atomic-commit fence + `_lsn` dedup (defense in depth). Depends on DA-SINK-2 (snapshot-summary persistence). | D-7 |
 | DA-CLUS-4 | Lease renewal failure taxonomy (412 vs transient) + safety deadline | 🟡 | ✅ | §19 — `deadline = last_renew_local + lease_duration − guard`; renewer state machine; commit gating. Prevents a transient S3 blip from stopping a healthy (esp. single-node) worker. | D-8 |
@@ -711,8 +718,10 @@ writes must use the **generation** precondition. An abstraction that feeds the G
 - **T9** S3 `409 ConditionalRequestConflict` surfaces as a retryable Conflict (not a hard error).
 - **T10** the token fed back into `swap` on GCS is the **generation**, not the read ETag — the gating
   assertion for the trap.
-- Startup guard: assert `op.info().full_capability()` advertises `write_with_if_none_match`,
-  `write_with_if_match`, `delete_with_if_match`; **refuse to start** if a backend build lacks them.
+- Startup guard: assert `op.info().full_capability()` advertises `write_with_if_not_exists` and
+  `write_with_if_match`; **refuse to start** if a backend build lacks them. (Real-S3 finding: S3 reports
+  `write_with_if_none_match = false` — create-if-absent is the dedicated `if_not_exists` capability; and
+  OpenDAL has no conditional delete, so release tombstones via `write_with(...).if_match(...)`.)
 
 **Pass/fail.** T4, T5, T10 **must pass against the real services** (not just emulators — emulators
 implement preconditions loosely). T10 failing means the OpenDAL→GCS mapping is wrong and the storage
@@ -728,7 +737,58 @@ The protocol itself (acquire/renew/takeover, §5.3) is unchanged. The optional `
 
 **Impact.** 🔴 because a *silent* failure on GCS would corrupt single-owner safety in production. But
 the cost of the fallback is bounded (native SDK for one backend), so it is a "must verify," not a
-"design may collapse." Status: **open-until-executed against real S3, GCS and Azure.**
+"design may collapse."
+
+**S3 run outcome (2026-06) — PROVEN.** T1–T9 pass against real AWS S3, on both versioning-enabled and
+non-versioned buckets. Two findings were folded back into the harness and the clustering doc §17.1/§17.2:
+(1) create-if-absent is OpenDAL's **`if_not_exists`** capability — S3 reports `write_with_if_none_match =
+false`; (2) the `if_match` CAS token must be the **ETag** on S3/Azure (the **generation** on GCS) — a
+versioning-enabled bucket populates `version()` with the version-id, which `If-Match` rejects, so the
+token kind is fixed by backend. Bucket versioning is **not required** (best kept off for the lease prefix).
+
+**GCS run outcome (2026-06) — Route A does NOT work on GCS (the trap, confirmed early).** OpenDAL's GCS
+backend reports **`write_with_if_match = false`** — the conformance suite fails at the *static* capability
+assertion, before any network/auth call (so it is **not** a credentials or bucket-access problem). Root
+cause: GCS write preconditions are **generation-based** (`ifGenerationMatch`), not ETag/`If-Match`; OpenDAL
+exposes the generation only as `if_not_exists` (=0) for *create* and has no arbitrary generation-match
+write option, so it cannot express the lease's **CAS update** (renew/takeover) on GCS. **Resolution
+(the documented escape hatch fires): implement the GCS `LeaseStore` over the native GCS SDK**
+(`google-cloud-storage`, `ifGenerationMatch` for both create=0 and swap=N; token = generation), behind the
+same trait. Route A (OpenDAL) covers **S3 + Azure**; **GCS = Route B**. Net design change: `lock_backend:
+storage` uses OpenDAL for S3/Azure and the native GCS SDK for GCS — a per-backend `LeaseStore` impl, the
+protocol (§5.3) unchanged.
+
+**GCS run outcome (2026-06) — PROVEN (Route B).** The native-SDK `GcsLeaseStore`
+(`prototypes/lease-conformance/` `--features gcs`, `ifGenerationMatch`) passes **T1–T10 against real GCS,
+including T10 — the generation-CAS gate** (a stale generation is correctly rejected). This was the single
+riskiest assumption in the lease design; it now holds with a native SDK.
+
+> **SDK-port note (2026-06) — re-verified.** GCS was first proven on yoshidan's `google-cloud-storage`
+> 0.24, then migrated to the **official `google-cloud-storage` 1.x** (`googleapis/google-cloud-rust`:
+> `Storage::builder()` / `write_object().set_if_generation_match()` / `read_object()`), with `reqwest`
+> bumped to 0.13. **T1–T10 re-run green against real GCS on 1.15**, so the port is confirmed (incl. the
+> t10 generation-CAS gate). 1.x quirk recorded: a failed `ifGenerationMatch` surfaces as `code UNKNOWN`
+> ("…pre-conditions you specified did not hold"), not a clean 412, so the conflict check matches that text.
+
+**Azure run outcome (2026-06) — OpenDAL 0.57 azblob ALSO lacks `write_with_if_match`.** The printed
+matrix is `if_not_exists=true if_match=false if_none_match=true`, so OpenDAL can't do the lease's CAS
+update on Azure either — the same gap class as GCS, but here it is an **OpenDAL limitation, not an Azure
+one** (Azure Blob natively supports `If-Match` conditional PUT; OpenDAL 0.57 just hasn't wired it into
+the azblob write path). The project is pinned to OpenDAL 0.57 (shared with the iceberg sink), so bumping
+is not an option. Net: **on 0.57, Route A (OpenDAL) covers S3 only; both GCS and Azure use native Route
+B.** Azure is now implemented as a native `AzureLeaseStore` (`--features azure`): **raw Blob REST over
+`reqwest` + SAS**, `If-None-Match: *` (create) / `If-Match: <etag>` (CAS), ETag token — same trait, same
+T1–T10 suite. (Raw REST + SAS was chosen over the Azure SDK to avoid SDK-API churn and request signing.)
+
+**Status: CLOSED 2026-06 — all three backends proven against real services.** Azure native Route B
+(`--features azure`, Blob REST + SAS) passes T1–T9 against a real Azure container; S3 (T1–T9, versioned +
+non-versioned) and GCS (T1–T10, incl. the generation-CAS gate) already proven. DA-CLUS-1 is closed; the
+`prototypes/lease-conformance/` suite is the durable regression proof for all three backends.
+
+> **Architecture note (lock_backend: storage).** The portable storage lease is now a **per-backend
+> `LeaseStore`**: OpenDAL for S3, native `google-cloud-storage` for GCS, native Blob-REST for Azure —
+> all behind one trait, the §5.3 protocol unchanged. "OpenDAL as the single abstraction for all three"
+> did not survive contact with real services; the trait-with-per-backend-impls did.
 
 ---
 
@@ -896,8 +956,9 @@ when-needed signals (`cdc_iceberg_delete_files`, etc.).
 
 All six gates close with **two prototypes**, both pinned to the exact dependency versions:
 
-1. **`prototypes/lease-conformance/`** (exists, scaffolded) — the T1–T10 storage-CAS suite → closes
-   **DA-CLUS-1**. Gate: T4/T5/T10 against **real** S3, GCS, Azure.
+1. **`prototypes/lease-conformance/`** (runs against real services) — the T1–T10 storage-CAS suite →
+   closes **DA-CLUS-1**. **S3 done** (Route A, T1–T9, versioned + non-versioned) **and GCS done**
+   (Route B native SDK, T1–T10 incl. the generation-CAS gate), 2026-06. **Only a real Azure run remains.**
 2. **`prototypes/iceberg-capability/`** (recommended new) — one integration test binary pinned to
    iceberg-rust 0.9.0, exercising: equality-delete same-commit sequencing + Spark/Trino cross-read
    (**DA-SINK-1**), custom snapshot-summary round-trip (**DA-SINK-2**), drop/rename/promote with
