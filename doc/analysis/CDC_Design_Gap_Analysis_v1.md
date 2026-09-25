@@ -1,5 +1,5 @@
 ---
-updated: 2026-06-20
+updated: 2026-09-19
 domain: Architecture
 tags: [gap-analysis, design, re-derivation, spec-readiness, blockers, open-decisions]
 resolves: []
@@ -89,7 +89,7 @@ in three buckets:
 
 | ID | Title | Why it blocks |
 |---|---|---|
-| DA-SINK-1 | **iceberg-rust 0.9.1 cannot commit deletes/overwrites — the MOR-equality-delete sink (and its COW fallback) is not buildable on the pinned crate** | Confirmed 2026-06 by reading the pinned API: `EqualityDeleteFileWriter` exists but the `Transaction` API is **append-only** (`fast_append` data files; no row-delta/overwrite/rewrite, no `update_schema`). A CDC sink that applies UPDATE/DELETE cannot be built on 0.9.1's public API. **The sink spec must gate on a future iceberg-rust version or adopt §24.2.1 option 2–4.** *(G-13 §8; details §24.2.1)* |
+| DA-SINK-1 | **iceberg-rust cannot commit deletes/overwrites — the MOR-equality-delete sink (and its COW fallback) is not buildable on any published version** | Confirmed 2026-06 on 0.9.1, rechecked 2026-07-22 on 0.10.0, rechecked 2026-08-23 on 0.10.1, **rechecked 2026-09-19 on compiled 0.10.1 and the v0.11.0-rc.1/rc.2 surfaces — still true**: `EqualityDeleteFileWriter` exists but the `Transaction` API is **append-only** (`fast_append` data files + metadata actions; no row-delta/overwrite/rewrite/merge-append). A CDC sink that applies UPDATE/DELETE cannot be built on the current public API. Upstream epic apache/iceberg-rust#2186 is **open**; the §24.2.3 "`OverwriteAction` merged" reading is **retracted** (PR #2185 is open/unmerged — §24.2.4). **The sink spec must gate on a future iceberg-rust version or adopt §24.2.1 option 2–4.** *(G-13 §8; details §24.2.1, rechecks §24.2.2/§24.2.3, latest §24.2.4)* |
 
 > **DA-CLUS-1 (storage-CAS conformance) — CLOSED 2026-06.** Proven against **real S3, GCS, and Azure**:
 > S3 T1–T9 (versioned + non-versioned), GCS T1–T10 (incl. the generation-CAS gate T10), Azure T1–T9.
@@ -406,7 +406,7 @@ pinning is the remaining cross-cutting concern.
 | DA-OPS-4 | Sink/catalog unavailability → DEGRADED back-pressure | 🟡 | ✅ | G-27/G-35 — stop consuming once buffers fill, protect slot/WAL via G-22; recover on next commit; catalog circuit breaker. | G-27, G-35 |
 | DA-OPS-5 | k8s deployment as StatefulSet (not Deployment) | 🟡 | ✅ | Clustering §3.4/§10.2 — stable `node_name` via Downward API; headless Service discovery. | D-1, D-4 |
 | DA-OPS-6 | "Restart ≠ apply config" operator footgun | 🟢 | ✅(documented) | Clustering §9.3 D-3 — cloud-generation-wins; a pod restart does **not** apply ConfigMap edits, only `POST /reload` does. Document loudly. | D-3 |
-| DA-DEP-1 | iceberg-rust pinned version & capabilities | 🟡 | 🧪 | MSRV 1.92.0 (Sources_Index). Multiple capability gates ride on the exact version: DA-SINK-1, DA-SINK-2, DA-SCHEMA-8, DA-TYPE-5, DA-SINK-10. Pin and assert at startup. | — |
+| DA-DEP-1 | iceberg-rust pinned version & capabilities | 🟡 | 🧪 | `iceberg` 0.10.1, MSRV 1.94 (main has moved to 1.95, #3083; Sources_Index needs refreshing from 1.92). Multiple capability gates ride on the exact version: DA-SINK-1, DA-SINK-2, DA-SCHEMA-8, DA-TYPE-5, DA-SINK-10. Pin and assert at startup. | — |
 | DA-DEP-2 | OpenDAL version exposing conditional writes | 🔴 | 🧪 | Clustering §17.2 — `if_match` on writes landed late-2024/early-2025; the `iceberg-storage-opendal` transitive pin must be ≥ that, and capabilities asserted at startup (refuse to start if absent). Part of DA-CLUS-1. | D-5 |
 | DA-DEP-3 | `sqlparser-rs` (MySqlDialect) pin | 🟢 | ✅ | `MySQL_DDL_Classifier.md` §5 — now on a fail-soft path, so a coverage gap degrades rather than halts; de-risked. | G-19a |
 | DA-DEP-4 | `memberlist` crate (Lifeguard, TLS/QUIC transport) | 🟢 | ✅ | Sources_Index; Clustering §2 — features confirmed available. | G-23 |
@@ -582,9 +582,9 @@ design, not just the code.**
 | ID | Gate | Depends on | If it fails |
 |---|---|---|---|
 | DA-CLUS-1 / DA-DEP-2 | Atomic CAS (create-if-absent, swap-if-version, conditional-delete) on **S3, GCS, Azure** — especially the **GCS generation (not ETag)** mapping. | OpenDAL ≥ late-2024 + per-backend behavior. | The storage lease is unsafe; either drop to native SDKs per backend, or reconsider the lock backend. **Top blocker.** Suite scaffolded at `prototypes/lease-conformance/` (T1–T10); T4/T5/T10 must run against real services. |
-| DA-SINK-1 | Equality-delete writer assigns delete files the **enclosing commit's sequence number**. | iceberg-rust 0.9.0. | The ghost-row strictly-less-than guarantee breaks; need position-deletes-after-read or a different write strategy. **Blocks the sink writer.** |
-| DA-SINK-2 / DA-X-2 | Custom `cdc.*` **snapshot-summary properties preserved across commits**. | iceberg-rust 0.9.0. | `owner_epoch` fence + `committed_position` guard lose their carrier; need a side-channel (e.g. table properties) or an alternate fence. |
-| DA-SCHEMA-8 | `drop_column` / `rename_column` / type-promotion transactions supported. | iceberg-rust 0.9.0. | Route the unsupported op to "halt table" until the crate catches up (graceful, already the fallback). |
+| DA-SINK-1 | Equality-delete writer assigns delete files the **enclosing commit's sequence number** | iceberg-rust 0.9.0. **Confirmed ABSENT on 0.9.1/0.10.0/0.10.1 and the v0.11.0-rc.1/rc.2 surfaces (2026-09-19, compiled crate).** | The ghost-row strictly-less-than guarantee breaks; need position-deletes-after-read or a different write strategy. **Blocks the sink writer.** |
+| DA-SINK-2 / DA-X-2 | Custom `cdc.*` **snapshot-summary properties preserved across commits** | iceberg-rust 0.9.0. **Append-path mechanism flash-verified on 0.10.1 (2026-09-19): `fast_append().set_snapshot_properties(...)` + catalog reload round-trip in `prototypes/iceberg-capability`.** Full gate (carrier across delete commits) deferred to the delete-commit capability. | `owner_epoch` fence + `committed_position` guard lose their carrier; need a side-channel (e.g. table properties) or an alternate fence. |
+| DA-SCHEMA-8 | `drop_column` / `rename_column` / type-promotion transactions supported. | iceberg-rust 0.9.0. **`update_schema` confirmed present on 0.10.1 (2026-09-19); the open question narrowed to drop/rename/promotion extent.** | Route the unsupported op to "halt table" until the crate catches up (graceful, already the fallback). |
 | DA-TYPE-5 | `FixedSizeBinary(16)` → Iceberg `uuid` annotation mechanism. | iceberg-rust 0.9.0. | UUID columns fall back to `fixed(16)`/`binary`; cosmetic, low risk. |
 | DA-SINK-10 | Compaction / rewrite API availability. | iceberg-rust (future). | Built-in maintenance stays deferred (already external for v1); no v1 impact. |
 
@@ -900,6 +900,173 @@ against any newer iceberg-rust to detect when delete commits land.
 > **Knock-on:** the same "no `update_schema` / no rewrite" gap means **DA-SCHEMA-8** (schema evolution
 > via transaction) and **DA-SINK-10** (compaction/rewrite) are *also* absent from 0.9.1's public API —
 > see §24.4 and §24.6. DA-SINK-2 (snapshot-summary properties) is moot until a delete-commit path exists.
+
+---
+
+#### 24.2.2 RECHECK (2026-07-22) — still 🔴 **no delete-commit action; `iceberg` 0.10.0 checked**
+
+Scheduled recheck per the 2026-06 decision's "revisit ~2026-07-21" trigger. Latest published crate at
+recheck time: **`iceberg` 0.10.0** (crates.io `max_stable_version`; published 2026-07-21, one day before
+this recheck — so this is a fresh release, not a stale read).
+
+**`Transaction` API in 0.10.0** (`docs.rs/iceberg/0.10.0/iceberg/transaction/struct.Transaction.html`):
+`new`, `upgrade_table_version`, `update_table_properties`, `update_schema`, `fast_append`,
+`replace_sort_order`, `update_location`, `update_statistics`, **`expire_snapshots`** (new in this
+release), `commit`. `fast_append` still only exposes `add_data_files(...)` — no `row_delta`,
+`overwrite`, `rewrite_files`, or `merge_append` action exists anywhere on `Transaction`.
+
+**Result: NO — delete-commit support has not landed.** The MOR-equality-delete sink (and its COW
+fallback) remain un-buildable on the public `Transaction` API for the same reason recorded in §24.2.1.
+The one addition since the June check is `expire_snapshots` (a maintenance action — relevant to
+DA-SINK-10/`Iceberg_Maintenance…`, not to DA-SINK-1).
+
+**Correction to §24.2.1:** `update_schema` is *not* missing — it was present on `Transaction` in 0.9.1
+at recheck time (and remains in 0.10.0). The June finding that "no `update_schema`" existed appears to
+have been an error in that pass (possibly checking against `rust.iceberg.apache.org`'s
+then-lagging docs mirror rather than the published crate); DA-SCHEMA-8's knock-on framing in §24.2.1
+and §24.4 should be read as "unverified pending the DA-SCHEMA-8 probe," not "absent from the API."
+
+**Action taken:** `prototypes/iceberg-capability/Cargo.toml` bumped `iceberg` from `"0.9"` to `"0.10"`.
+Could not run `cargo build -p iceberg-capability --features probe` as a canary in this session — no
+Rust toolchain available in the execution sandbox. **Recommend running that build locally** before
+relying on the bump; the probe bodies are still `todo!()` scaffolds either way (§24.2's verification
+plan / G1 probe), so a green build only confirms the dependency bump resolves, not that the delete
+sequencing behavior holds.
+
+**Decision unchanged:** still tracking iceberg-rust (option 1). No new revisit date is fixed by this
+recheck; re-run when the next iceberg-rust minor ships, or sooner if upstream issue/PR activity signals
+a row-delta or overwrite commit action landing.
+
+---
+
+#### 24.2.3 RECHECK (2026-08-23) — still 🔴 **no delete-commit action; `iceberg` 0.10.1 checked; upstream CoW work spotted**
+
+Automated recheck (scheduled task `iceberg-delete-commit-recheck`). Latest published crate at recheck
+time: **`iceberg` 0.10.1** (crates.io `max_stable_version`; published 2026-08-01, three weeks before
+this recheck).
+
+**`Transaction` API in 0.10.1** (`docs.rs/iceberg/0.10.1/iceberg/transaction/struct.Transaction.html`,
+cross-checked against the crate's own `src/transaction/mod.rs` source on docs.rs): `new`,
+`upgrade_table_version`, `update_table_properties`, `update_schema`, `fast_append`,
+`replace_sort_order`, `update_location`, `update_statistics`, `expire_snapshots`, `commit` — unchanged
+from the 0.10.0 set in §24.2.2. `fast_append` still only exposes `add_data_files(...)`. No `row_delta`,
+`overwrite`, `rewrite_files`, or `merge_append` method exists on `Transaction`, and the `transaction`
+module's public struct list (`ActionCommit`, `AddColumn`, `Transaction`) has no `OverwriteAction` or
+`RowDeltaAction` type exported.
+
+**Result: NO — delete-commit support has still not landed in a published release.** The
+MOR-equality-delete sink (and its COW fallback) remain un-buildable on the public `Transaction` API,
+same root cause as §24.2.1/§24.2.2.
+
+**New signal worth tracking closely.** ⚠️ *Superseded 2026-09-19 — the merge claims below were
+upstream-reported and are RETRACTED by direct verification (§24.2.4): PR #2185 is open/unmerged,
+and no delete-aware action exists on `main` or in the v0.11.0-rc.* releases. Kept as the historical
+record.* `apache/iceberg-rust` issue **#2186** ("Copy-on-Write and Merge-on-Read support", opened
+2026-02-27) is an epic explicitly tracking this gap upstream:
+
+- Copy-on-Write: **`OverwriteAction` (PR #2185, "add OverwriteAction with CoW delete support" —
+  overwrite semantics with manifest rewriting for deleted entries) is checked off as merged** in the
+  epic's task list. Conflict detection, filter-based overwrite, and rewrite-based compaction are still
+  open (unchecked).
+- Merge-on-Read: `RowDeltaAction` (position/equality delete file write path), scan-side delete
+  reconciliation, and V3 Deletion Vectors are **all unchecked / not started.**
+
+Despite `OverwriteAction` being marked merged in the epic, it does **not** appear anywhere in the
+0.10.1 public API checked above — no `overwrite()` method on `Transaction`, no `OverwriteAction` struct
+in the `transaction` module docs, and no such module in the `src/transaction/mod.rs` source. Most
+likely explanation: merged to `main` after the 0.10.1 release cut (2026-08-01) and not yet published to
+crates.io, or not yet wired into the public `Transaction` surface even on `main`. This could not be
+confirmed further without a GitHub API/commit-date check beyond what was available this session — treat
+the merge status as **upstream-reported, not independently confirmed against a tagged release.**
+
+**Practical read:** if `OverwriteAction` does ship in the next `iceberg` release, it would very plausibly
+unblock **option 2 from §24.2.1 — the COW fallback** (whole-file overwrite/replace), since "overwrite
+semantics with manifest rewriting for deleted entries" is exactly the commit primitive COW needs. It
+would **not** by itself unblock the MOR-equality-delete default path, which needs `RowDeltaAction`
+(still unstarted per the epic). This raises the value of re-checking on a **shorter cadence** than "next
+minor" — the next `iceberg` patch/minor release is worth checking specifically for `OverwriteAction`
+landing, independent of `RowDeltaAction` progress.
+
+**Action taken:** none to `prototypes/iceberg-capability/Cargo.toml` — its existing dependency pin
+(`version = "0.10"`, i.e. `^0.10`) already resolves to 0.10.1, so no bump was needed for the version
+requirement itself; only the comment's "latest checked" note would go stale, not the resolution. Did
+**not** attempt `cargo build -p iceberg-capability --features probe` — no Rust toolchain available in
+this session's execution sandbox (same limitation as §24.2.2). **Recommend running that build locally**
+before relying on the pin, and recommend implementing the `iceberg-capability` G1 probe (equality-delete
+same-commit sequencing, §24.2's verification plan) once a delete-aware commit action is confirmed
+available, per the scheduled task's standing instruction.
+
+**Decision unchanged:** still tracking iceberg-rust (option 1 in §24.2.1). Recommend the next recheck
+trigger on **either** the next `iceberg` crate release **or** direct confirmation (via the GitHub repo)
+that `OverwriteAction`/`RowDeltaAction` landed in a tagged version — whichever comes first — rather than
+waiting a full minor-release cycle as before.
+
+---
+
+#### 24.2.4 RECHECK (2026-09-19) — still 🔴 **no delete-commit action in any release, incl. v0.11.0 RCs; §24.2.3's "OverwriteAction merged" lead retracted; G2 flash-verified on the append path**
+
+This session is the **first recheck with a Rust toolchain available**, so the finding is now backed by
+the **compiled crate** (plus the repo tags), not docs.rs alone. `prototypes/iceberg-capability`
+`Cargo.lock` was bumped 0.9.1 → 0.10.1, `cargo build --features probe` **compiles green**, and the
+append-path probe **passes**.
+
+**The delete-commit question, checked three independent ways — still NO:**
+
+1. **Crates.io latest remains `iceberg` 0.10.1** (published 2026-08-01; rust-version **1.94**). No
+   0.11.0 published; RCs are GitHub tags only.
+2. **Compiled 0.10.1 source** (`~/.cargo/registry/…/iceberg-0.10.1/src/transaction/`): `Transaction`
+   exposes `new`, `upgrade_table_version`, `update_table_properties`, `update_schema`, `fast_append`,
+   `replace_sort_order`, `update_location`, `update_statistics`, `expire_snapshots`, `commit` — same
+   set as §24.2.2/§24.2.3. `FastAppendAction` accepts **data files only** and produces an
+   `Operation::Append` snapshot with **no delete entries** (`delete_entries` → empty; the §24.2.3
+   append.md source confirms a delete-only-manifest-carry-forward fix #2148, but that is a preservation
+   fix, not a delete-commit action). Optional **snapshot-summary properties are supported**
+   (`set_snapshot_properties`, §24.2.4 G2 below).
+3. **v0.11.0-rc.1 / v0.11.0-rc.2** (git tags, cut after the "Bump version to 0.11.0" commit of
+   2026-09-04; MSRV raised to 1.95 per #3083): their own `src/transaction/mod.rs` reads the **same
+   append-only method set**. **Conclusion: the imminent 0.11.0 will NOT unblock the sink.**
+   The next trigger is a PR merge, not a release.
+
+**Retraction — §24.2.3's "OverwriteAction merged" was wrong.** apache/iceberg-rust **PR #2185**
+("feat(transaction): add OverwriteAction with CoW delete support") is **open, unmerged** (GitHub API,
+2026-09-19: `merged: False`). The epic #2186's task-list checkbox was inaccurate/optimistic. Lesson
+recorded: **an epic checkbox is never merge proof; the PR's own `merged` state is the source of truth.**
+The §24.2.3 "upstream-reported, not independently confirmed" caveat was therefore right to keep — and
+the independent confirmation now refutes the report.
+
+**RowDelta work exists; none merged.**
+`#2203` (RowDelta, the original MoR action), **open** since 2026-03, last active 2026-08-31 (594 insertions, 5 files).
+`#2785` (RowDeltaAction: commit data + delete files in one snapshot) and `#2678` (RowDelta deletion
+vectors) both **closed unmerged** (2026-09-02) — superseded in favour of the new base work below.
+**`#3046` "MergingSnapshotProducer and RewriteFilesAction"** (open, 861 insertions, updated
+2026-09-18) — the author states it is *the first in a series* to add compaction/rewrite support
+(issue #1607); **follow-ups will add OverwriteFiles, RowDelta, and conflict detection**. This is the
+foundation any delete-aware `Transaction` action must sit on, so it is the single most important PR
+to watch. Related: `#2752` (core COW rewrite primitive, open) and RFC **`#2620`** "Stateful
+Transaction Action" (opened 2026-09-19 — may re-shape the whole action API). MoR *read*-side
+groundwork landed for the 0.11.0 window (V3 deletion-vector scan PRs [2/N]/[3/N], `_row_id`
+synthesis on read, #3058) — read-side only, not a write/commit capability.
+
+**G2 (DA-SINK-2) flash-verified on the append path — de-risked.**
+`prototypes/iceberg-capability` now has its first **real passing probe**
+(`tests/probe_append_and_summary.rs`): MemoryCatalog + two `fast_append` commits. Findings:
+(a) data files **and** arbitrary `cdc.*` snapshot-summary properties commit **atomically** in one
+`Transaction`; (b) they read back from the **catalog-reloaded** table, i.e. they survive the metadata
+commit + reload; (c) a second commit re-asserting a monotonic `cdc.owner_epoch` lands on the new
+snapshot while the first snapshot keeps its old value. **This is exactly the carrier + monotonic-read
+semantics the clustering fence (D-7) requires** — on the one commit path that exists today. The full
+DA-SINK-2 gate ("does the carrier survive *delete* commits too") remains deferred to the
+delete-commit capability, but the mechanism exists and §24.3's fallbacks are unchanged.
+
+**Other gates touched by 0.10.1:** `update_schema` **confirmed present** (G3's concern narrows to the
+drop/rename/type-promotion *extent* — DA-SCHEMA-8 stays 🧪 until probed); `expire_snapshots` exists
+(maintenance — positive signal for DA-SINK-10's future built-in path, still external for v1).
+
+**Decision unchanged: option 1 (track iceberg-rust; gate the sink spec on a delete-commit-capable
+release).** Revised re-check trigger: watch **#3046 merge on `main`** and then its promised
+OverwriteFiles/RowDelta follow-ups appearing on the `Transaction` surface; validate in a **tagged
+release** before trusting it (0.11.0-RCs prove a tag can lag a merge, and a merge can lag a release —
+both directions of lag observed). The scheduled-recheck cadence stays in effect.
 
 ---
 

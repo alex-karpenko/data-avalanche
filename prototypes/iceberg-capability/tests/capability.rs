@@ -1,16 +1,19 @@
-//! iceberg-rust 0.9.1 capability assessment (see `src/lib.rs` and gap-analysis §24.2.1).
+//! iceberg-rust capability assessment (see `src/lib.rs` and gap-analysis §24.2.1/§24.2.4).
 //!
-//! RESULT: 0.9.1's public write API is APPEND-ONLY — delete files can be written
-//! (`EqualityDeleteFileWriter`) but NOT committed (the `Transaction` surface is
-//! `fast_append` + metadata actions only; no row-delta/overwrite/rewrite, no
-//! `update_schema`). So the MOR-equality-delete sink (G1 / DA-SINK-1) is NOT
-//! buildable on 0.9.1, and the COW fallback is equally blocked.
+//! RESULT (re-verified 2026-09-19 against compiled iceberg 0.10.1 and the
+//! v0.11.0-rc.1/rc.2 surfaces): the public write API is APPEND-ONLY — delete files
+//! can be written (`EqualityDeleteFileWriter`) but NOT committed (the `Transaction`
+//! surface is `fast_append` + metadata actions only; no row-delta/overwrite/rewrite).
+//! So the MOR-equality-delete sink (G1 / DA-SINK-1) is NOT buildable on any
+//! published version, and the COW fallback is equally blocked.
 //!
-//! There is no passing probe to run yet — the capability is absent. Re-run when
-//! iceberg-rust gains a delete-aware commit action (README has the G1 plan).
+//! G1's probe cannot run yet — the capability is absent. Re-run when iceberg-rust
+//! merges + publishes a delete-aware commit action (README has the G1 plan). The
+//! append-path probe (DA-SINK-2 carrier) IS live and passing:
+//! `tests/probe_append_and_summary.rs`.
 //!
 //!   cargo test  -p iceberg-capability                  # prints the verdict (green)
-//!   cargo build -p iceberg-capability --features probe # canary: iceberg still resolves/compiles
+//!   cargo test  -p iceberg-capability --features probe # canary + G2 append-path probe
 
 /// Always-on: prints the capability verdict (and stays green).
 #[test]

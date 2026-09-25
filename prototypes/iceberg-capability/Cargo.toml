@@ -5,24 +5,28 @@ edition = "2021"
 publish = false
 description = "Capability probe: proves the iceberg-rust behaviors the CDC sink/clustering design depends on (DA-SINK-1/2, DA-SCHEMA-8, DA-TYPE-5, DA-SINK-10)"
 
-# MSRV: 1.92 (iceberg 0.9.1 — latest 0.9, edition 2024, per crates.io 2026-06).
+# iceberg 0.10.1 rust-version = 1.94; main has moved to 1.95 (apache/iceberg-rust
+# #3083, 2026-08-27). The probe compiles on the 1.98.1 toolchain (verified
+# 2026-09-19: `cargo test -p iceberg-capability --features probe` is green).
 #
 # The iceberg-dependent probe code is gated behind the `probe` feature and is OFF
-# by default, so the default `cargo build`/`cargo test` stays green. The probe test
-# bodies are still SCAFFOLDS (`todo!()`) — they encode the test plan; the real
-# iceberg-rust 0.9 writer/transaction/catalog calls remain to be implemented.
+# by default, so the default `cargo build`/`cargo test` stays green. G1's
+# delete-sequencing probe CANNOT be implemented yet (the Transaction API is
+# append-only on every published version and on the v0.11.0-rc.1/rc.2 surfaces;
+# see docs/analysis …/CDC_Design_Gap_Analysis_v1.md §24.2.4). The append-path probe
+# (DA-SINK-2 carrier) IS implemented and passing: `tests/probe_append_and_summary.rs`.
 #
 # Dependency notes (verified on crates.io):
-#   - `iceberg-catalog-memory` is YANKED at every version (no 0.9) — the memory
-#     catalog moved into the core `iceberg` crate (`iceberg::catalog::memory`).
+#   - `iceberg-catalog-memory` is YANKED at every version — the memory catalog is
+#     in the core `iceberg` crate (`iceberg::memory`).
 #   - arrow is NOT pinned here: iceberg re-exports the exact arrow it builds
 #     against, so the probe must use iceberg's arrow to avoid a version clash.
 
 [dependencies]
 
 [features]
-# Enable to compile + run the real iceberg-rust probes. Self-contained: a
-# MemoryCatalog over a temp local-fs warehouse (no cloud needed for G1–G4).
+# Enable to compile + run the real iceberg-rust probes. Self-contained: an
+# in-memory MemoryCatalog (MemoryStorageFactory default; no cloud needed).
 probe = [
     "dep:iceberg",
     "dep:tokio",
@@ -36,7 +40,9 @@ version = "1"
 optional = true
 
 [dependencies.iceberg]
-version = "0.9" # -> 0.9.1; must match the sink's iceberg dep. Provides MemoryCatalog + arrow re-export.
+version = "0.10" # resolves to 0.10.1 (2026-08-01); latest published as of the 2026-09-19
+                 # DA-SINK-1 recheck (no 0.11.0 on crates.io; rc.1/rc.2 are GitHub tags only).
+                 # Provides MemoryCatalog + arrow re-export.
 optional = true
 
 [dependencies.tokio]
