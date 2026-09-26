@@ -1239,7 +1239,7 @@ Source: `research/Multi_Sink_Architecture_and_Delta_Lake.md` — all decisions *
 | ID | Change |
 |---|---|
 | DA-SINK-1 | 🔴 → re-scoped as **DA-SINK-1i** 🟡: Iceberg **mirror** mode capability-gated on an iceberg-rust delete-commit action; tracking upstream continues (D-MS.10). No longer blocks the system. |
-| DA-X-3 | 🔄 → ✅(design): neutral sink contract + per-sink realizations (research §6–§7); spec merge owed. |
+| DA-X-3 | 🔄 → ✅: neutral sink contract + per-sink realizations — merged into `Data-Flow.md` Phase 4 (2026-09-26). |
 | DA-X-5 / DA-FLOW-5 | 🟥 → ✅(design): TRUNCATE is a barrier (seal→flush→clear); Delta = delete-all (metadata-only), Iceberg = overwrite-to-empty (with the mirror capability). |
 | DA-X-6 / DA-SNAP-8 | 🟥 → 🔄: PK-less tables allowed **only in `write_mode: changelog`** (D-MS.6); changelog reserved in config, implemented after the Delta mirror (D-MS.5). Dump-only + mirror still halts. |
 | DA-SINK-2 | scope widened: marker carrier is now a per-sink responsibility (`CommitMarker`). |
@@ -1257,11 +1257,13 @@ Source: `research/Multi_Sink_Architecture_and_Delta_Lake.md` — all decisions *
 | DA-MS-5 | Delta schema evolution gaps (no drop/rename/widen in delta-rs) | 🟢 | ✅(design) | Soft-drop + warn (D-MS.9); widen → halt. |
 | DA-MS-7 | delta-rs 1.0 refuses ADD COLUMN on column-mapping (`name`) tables (probe P7b) | 🟡 | ✅ | Would disable the only Delta evolution op. **R-1 decided 2026-09-26**: `sink.delta.column_mapping` default `none`, `name` rejected in v1 (V-092). |
 | DA-DEP-1b | Single arrow major across sinks (P9) | 🟢 | ✅(resolution) | deltalake 1.0 + iceberg `main` resolve to one arrow/parquet 59.3; joint compile not yet run. |
-| DA-MS-6 | Spec-merge debt from the multi-sink design | 🟢 | 🆕 🔄 | System-Overview, Data-Flow Phase 3/4, Config §9.4/§9.5/§10/§13 (V-083…V-091), Schema §7, Type_Mapping Hop 3 — research §8/§9. Propose-only. |
+| DA-MS-6 | Spec-merge debt from the multi-sink design | 🟢 | ✅ | **Applied 2026-09-26**: System-Overview (Sinks block, pluggable format), Data-Flow (Phase 0 sink preflight, Phase 3 collapse + `TableChangeSet` + TRUNCATE barrier, Phase 4 sink contract + Iceberg/Delta realizations), Config (`sink.type` required, `sink.iceberg`/`sink.delta`, catalog → `sink.iceberg.catalog`, pipeline-level `schema_evolution`, sink preconditions §11.2, V-083…V-093), Schema §7 (Applied/Degraded/Unsupported, Delta column), Type_Mapping (logical tags, Hop 3b). |
 
 ### 25.4 Next
 
-1. `prototypes/delta-capability/` — probes P1–P10 (research §10).
-2. Propose the spec patches (DA-MS-6) for approval.
+1. ~~`prototypes/delta-capability/` — probes P1–P7~~ ✅ 2026-09-26; remaining: **P8** (real S3/GCS/Azure commit atomicity), **P10** (type round-trip + external reader).
+2. ~~Spec patches (DA-MS-6)~~ ✅ applied 2026-09-26.
 3. Implementation order: core → Delta sink (mirror) → Iceberg sink (changelog; mirror when capable).
+   **v1 consequence:** with Iceberg mirror capability-gated (DA-SINK-1i) and changelog deferred
+   (D-MS.5), an Iceberg-sink pipeline is refused at start in v1 until either lands.
 
