@@ -23,7 +23,7 @@ position carrier.
 | P7b | add column on a **column-mapping `name`** table | ❌ **refused**: `UnsupportedColumnMapping { mode: Write, operation: "ADD COLUMN" }` (asserted, so a fixed delta-rs flips the test) |
 | P10 | Hop-3b type round-trip (append + MERGE), read back by delta-rs **and cross-read by DuckDB** | ✅ all 15 columns, exact types and values — see below |
 | P10b | protocol of the same table without `timestamp_ntz` | ✅ reader 1 / writer 2 (so `timestamp_ntz` alone raises it to 3 / 7) |
-| P8 | commit atomicity on **real S3** (us-east-1) — see below | ✅ P8a–P8e; GCS / Azure pending credentials |
+| P8 | commit atomicity on **real S3** (us-east-1) and **real GCS** (US) — see below | ✅ P8a–P8e on both; Azure pending credentials |
 
 ### P6 — write amplification (the Delta cost model, measured)
 
@@ -75,16 +75,17 @@ P10_OUT=/tmp/p10 cargo test --release --features probe --test probe_types -- --n
 uv run --no-project --with duckdb --with pytz python scripts/p10_duckdb_crossread.py /tmp/p10
 ```
 
-### P8 — commit atomicity on real S3 (`tests/probe_s3_commit.rs`, `--features s3`)
+### P8 — commit atomicity on real S3 and GCS (`tests/probe_cloud_commit.rs`, `--features s3` / `gcs`)
 
-delta-rs 1.0 on S3 uses the `DefaultLogStore`: a commit is **one** `PUT _delta_log/<N>.json` with
-`If-None-Match: *` (object_store 0.13 `S3ConditionalPut::ETagMatch`, the default). No DynamoDB
-locking provider, no temp-file + rename (none found in the bucket after the run).
+delta-rs 1.0 uses the `DefaultLogStore` on both: a commit is **one** create-only
+`PUT _delta_log/<N>.json` — S3 `If-None-Match: *` (object_store 0.13 `S3ConditionalPut::ETagMatch`, the
+default; no DynamoDB), GCS `x-goog-if-generation-match: 0`. No temp-file + rename on either (none found
+after the runs). Results below are identical on both backends unless noted.
 
 | Probe | What | Result (2026-09-26) |
 |---|---|---|
 | P8a | 16 concurrent put-if-absent of one key, 10 rounds | ✅ exactly 1 winner each round (15 `AlreadyExists`); stored body = winner's |
-| P8b | 8 sink MERGEs on one snapshot, **retries off**, 5 rounds | ✅ exactly one new version per round, no stray v+2; v+1 carries the winner's `commitInfo` position; content = base + winner's change set only (~4.4 s per round) |
+| P8b | 8 sink MERGEs on one snapshot, **retries off**, 5 rounds | ✅ exactly one new version per round, no stray v+2; v+1 carries the winner's `commitInfo` position; content = base + winner's change set only (~4.4 s per round on S3, ~7.3 s on GCS) |
 | P8c | 8 owners MERGE the **same row**, retries on | ✅ exactly one lands; losers stopped by the **data** conflict check (`a concurrent transactions added new data`) — fires before the fence |
 | P8e | 8 owners append **disjoint** rows, retries on | ✅ exactly one lands; losers stopped by the **`txn` fence alone** (`Concurrent transaction failed`); `txn` version = winner's epoch |
 | P8d | 8 foreign appends (no `txn`), retries on | ✅ all land on contiguous versions 1..=8; 800/800 rows |
@@ -96,16 +97,31 @@ primitive directly.
 
 ```bash
 eval "$(aws configure export-credentials --profile <profile> --format env)"
-AWS_REGION=us-east-1 P8_S3_URL=s3://<bucket>/delta-probe \
-cargo test --release --features s3 --test probe_s3_commit -- --nocapture --test-threads=1
+AWS_REGION=us-east-1 P8_URL=s3://<bucket>/delta-probe \
+cargo test --release --features s3 --test probe_cloud_commit -- --nocapture --test-threads=1
 aws s3 rm s3://<bucket>/delta-probe/ --recursive   # cleanup
 ```
 
-Run 2026-09-26 on account `418759522081` (profile `kav`); prefix deleted afterwards.
+```bash
+# GCS — service-account key (object_store reads GOOGLE_* env)
+GOOGLE_SERVICE_ACCOUNT_PATH=<key.json> P8_URL=gs://<bucket>/delta-probe \
+cargo test --release --features gcs --test probe_cloud_commit -- --nocapture --test-threads=1
+gcloud storage rm -r gs://<bucket>/delta-probe/   # cleanup
+```
+
+Runs 2026-09-26: S3 on account `418759522081` (profile `kav`, us-east-1); GCS on project
+`data-avalanche-500111`, bucket `gs://leasetest` (US), service account `test-743`. Prefixes deleted
+afterwards.
+
+**GCS 429 check.** GCS allows ~1 mutation/s per object, and delta-rs maps a 429 to `AlreadyExists` only
+on its rename path, not the put path the commit uses — so a racing loser *could* surface a generic
+error instead of a conflict. Not observed: 160 racing creators (P8a) all ended in a clean 412 →
+`AlreadyExists` (object_store's retry absorbs any 429 before the precondition decides). The sink
+still classifies an unexpected commit I/O error as retryable (Data-Flow "Sink Commit Failure").
 
 ### Not covered yet
 
-- **P8 on GCS / Azure** — credentials pending (same probe shape; needs `deltalake/gcs`, `deltalake/azure`).
+- **P8 on Azure** — credentials pending (same probe; add a `deltalake/azure` feature).
 - Spark cross-read (no JVM on the probe host; DuckDB covers the independent-reader check).
 
 ## Running

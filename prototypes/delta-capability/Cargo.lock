@@ -2118,6 +2118,7 @@ dependencies = [
  "ctor",
  "deltalake-aws",
  "deltalake-core",
+ "deltalake-gcp",
 ]
 
 [[package]]
@@ -2214,6 +2215,23 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "deltalake-gcp"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd6490d316e343d462ef3476ab0332f947c4333ca03703ea192c8bc15da932b4"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "deltalake-core",
+ "futures",
+ "object_store",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]
