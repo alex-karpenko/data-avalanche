@@ -1,5 +1,5 @@
 ---
-updated: 2026-06-20
+updated: 2026-09-26
 domain: Architecture
 tags: [observability, metrics, prometheus, tracing, otlp, logs, correlation, cardinality, cdc]
 resolves: [G-33, G-32]
@@ -49,11 +49,16 @@ All Prometheus, exposed at `/metrics` (unauthenticated, per System-Overview / RB
 - `cdc_snapshot_rows_done{pipeline[,table]}` / `cdc_snapshot_state{pipeline[,table]}`.
 - `cdc_snapshot_chunk_duration_seconds{pipeline}` (G-6).
 
-### Iceberg sink + maintenance (G-25)
-- `cdc_iceberg_commit_duration_seconds{pipeline}` (histogram), `cdc_iceberg_commit_failures_total{pipeline}`.
-- `cdc_iceberg_delete_files{pipeline[,table]}` — **MOR health signal**.
-- `cdc_iceberg_data_file_count`, `cdc_iceberg_small_file_ratio`, `cdc_iceberg_snapshot_count`,
-  `cdc_iceberg_manifest_depth`, `cdc_iceberg_metadata_json_bytes`.
+### Sink + maintenance (G-25; multi-sink rename 2026-09-26)
+- `cdc_sink_commit_duration_seconds{pipeline,sink_type}` (histogram),
+  `cdc_sink_commit_failures_total{pipeline,sink_type}` — sink-neutral (were `cdc_iceberg_*`; the rename
+  follows `Multi_Sink_Architecture_and_Delta_Lake.md` §8).
+- **Delta (v1):** `cdc_sink_merge_files_rewritten`, `cdc_sink_merge_rows_copied`,
+  `cdc_sink_merge_bytes_rewritten`, `cdc_sink_merge_duration_seconds` (MERGE cost — D-MS.15), and
+  `cdc_sink_soft_dropped_columns` (D-MS.9).
+- **Iceberg (⏭ v2):** `cdc_iceberg_delete_files{pipeline[,table]}` — **MOR health signal**;
+  `cdc_iceberg_data_file_count`, `cdc_iceberg_small_file_ratio`, `cdc_iceberg_snapshot_count`,
+  `cdc_iceberg_manifest_depth`, `cdc_iceberg_metadata_json_bytes` (format-specific; keep their names).
 
 ### Clustering (from Clustering doc §19)
 - `cdc_lease_state{pipeline}`, `cdc_lease_renew_failures_total{pipeline}`,
