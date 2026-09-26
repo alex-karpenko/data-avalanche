@@ -25,6 +25,9 @@ Added by later milestones: `postgres-tls` (M5, CA-signed server certificate) and
 
 `fake-gcs-server` 1.56.1 rejects `object_store`'s path-style PUT (`400 invalid uploadType`) and
 doesn't honour preconditions (fake-gcs-server issue #994), so GCS tests use a real bucket.
+Re-checked on 2026-09-26 after the bump to `object_store` 0.14.2: fake-gcs 1.56.1 (the current
+release; the Docker `latest` tag is the same image) still answers every PUT with
+`400 invalid uploadType`, and #994 is still open.
 
 | Variable | Meaning |
 |---|---|
@@ -59,7 +62,7 @@ run on the emulators above.
 |---|---|---|---|---|
 | RustFS 1.0.0 (S3 API) | PASS | PASS | 2026-09-26 | Carries the S3 lease/CAS suite in PR CI |
 | Azurite 3.37.0 | PASS | PASS | 2026-09-26 | Carries the Azure lease/CAS suite in PR CI |
-| fake-gcs-server 1.56.1 | FAIL (plain PUT → 400 `invalid uploadType`) | not reachable | 2026-09-26 | Dropped |
+| fake-gcs-server 1.56.1 | FAIL (plain PUT → 400 `invalid uploadType`) | not reachable | 2026-09-26 (`object_store` 0.13.2 and 0.14.2) | Dropped |
 | Real GCS (`DATA_AVALANCHE_GCS_BUCKET`) | PASS | PASS | 2026-09-26 (bucket `leasetest`) | Carries the GCS lease/CAS suite in PR CI |
 
 RustFS and Azurite rows above were re-measured against this implementation's test code on 2026-09-26
@@ -70,3 +73,18 @@ and `azurite_honours_conditional_writes` PASS. The real-GCS row is carried over 
 prints `skipped: GCS tests need DATA_AVALANCHE_IT=1 and no DATA_AVALANCHE_SKIP_GCS` and reports PASS
 as a no-op when `DATA_AVALANCHE_SKIP_GCS=1`) — re-run Step 8 with real credentials to reconfirm before
 M2.
+
+Re-run on `object_store` 0.14.2 on 2026-09-26: RustFS and Azurite PASS (same command), and real GCS
+PASS (`DATA_AVALANCHE_IT=1 DATA_AVALANCHE_GCS_BUCKET=leasetest GOOGLE_SERVICE_ACCOUNT_PATH=<key.json>
+cargo test -p data-avalanche-testkit --test storage_cas real_gcs`), which also reconfirms the real-GCS
+row above against this implementation's test code.
+
+## Dependency audit
+
+CI runs `cargo audit` (RustSec) as the last step of the `check` job. It is **non-blocking**: an
+advisory fails that step and adds a warning annotation, but the job stays green. To run it locally:
+
+```sh
+cargo install cargo-audit --locked   # once; cargo-audit isn't a rustup component, so rust-toolchain.toml can't pin it
+cargo audit
+```

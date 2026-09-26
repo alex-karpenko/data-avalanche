@@ -28,7 +28,7 @@ build on the interfaces that actually landed. That staging was chosen on 2026-09
 | P-2 | First shippable slice | **PostgreSQL → Delta on a single node** (M0–M6) |
 | P-3 | Flush default | **30s** (config §9.4.1 and Data-Flow Phase 3 change from 60s); D-V1.3 lag target stands |
 | P-4 | MySQL positioning | **Both modes**: `gtid` (new **default**) and `binlog` file/position. File/position mode needs its own probe (M7) |
-| P-5 | Storage client for lease/state/config | **`object_store` everywhere** (0.13, shared with delta-rs). T1–T10 conformance is re-proven on it against real S3/GCS/Azure before the lease is trusted (M2) |
+| P-5 | Storage client for lease/state/config | **`object_store` everywhere** (0.14.2 since 2026-09-26; deltalake 1.0 still pulls its own 0.13, see R-13). T1–T10 conformance is re-proven on it against real S3/GCS/Azure before the lease is trusted (M2) |
 | P-6 | Deliverables | Binary, **container image**, **Kubernetes manifests + Helm chart**, **CI** (GitHub Actions), **documentation site** (MkDocs): architecture and internal flows, REST API reference, configuration reference with detailed examples, operator runbooks |
 | P-7 | S3 emulator | **RustFS** (not MinIO) |
 | P-8 | Source versions | PostgreSQL 14–18, MySQL 8.4 LTS, MariaDB 10.11 / 11.4 / 11.8 LTS. CI runs the newest of each on every change and the full matrix nightly |
@@ -125,7 +125,7 @@ Rules:
 | Purpose | Crate | Pin | Evidence |
 |---|---|---|---|
 | Delta sink | `deltalake` (features `datafusion`, `rustls`, `s3`, `gcs`, `azure`) | `=1.0.0` | delta P1–P10, P8 on S3/GCS/Azure |
-| Object storage / CAS | `object_store` | `0.13` (the version deltalake resolves) | API checked; T1–T10 re-proof in M2 |
+| Object storage / CAS | `object_store` | `0.14.2` (bumped from 0.13.2 on 2026-09-26; deltalake 1.0 requires `^0.13.2`, so M4 adds a second copy, R-13) | API checked; RustFS/Azurite/real-GCS CAS re-run on 0.14.2; T1–T10 re-proof in M2 |
 | Arrow | `arrow` / `parquet` | `59` (as resolved by deltalake) | P9 |
 | PG replication transport | `pgwire-replication` | `=0.4.1` | S-PG0–8 |
 | PG SQL (catalog, chunks) | `tokio-postgres` + `tokio-postgres-rustls` | `0.7` | S-PG probes |
@@ -587,7 +587,8 @@ Detailed plan: `M0-foundations.md`.
   - Chaos: storage outage shorter and longer than the lease, source restart, network partition.
   - The real-cloud matrix: S3, GCS, Azure × PG and MySQL.
   - The nightly DB version matrix green for 7 consecutive runs.
-  - A dependency audit (`cargo-deny`).
+  - A dependency audit: `cargo audit` clean, or every remaining advisory triaged and recorded (the CI
+    step is non-blocking, so this is where the audit is enforced).
   - Tag `v1.0.0`.
 - **Deps:** all of the above.
 - **Exit:** the acceptance checklist in §8.
@@ -616,7 +617,8 @@ Conventions:
 
 Default profile (M0): `postgres-18`, `mysql-84`, `mariadb-118`, `rustfs`, `azurite`. GCS has no
 emulator: `fake-gcs-server` 1.56.1 rejects `object_store`'s PUT (`400 invalid uploadType`) and ignores
-preconditions, so GCS tests use a real bucket (P-10; `DATA_AVALANCHE_GCS_BUCKET` + `GOOGLE_SERVICE_ACCOUNT_PATH`,
+preconditions (re-checked 2026-09-26 with `object_store` 0.14.2: still `400 invalid uploadType`; upstream
+fake-gcs issue #994 still open), so GCS tests use a real bucket (P-10; `DATA_AVALANCHE_GCS_BUCKET` + `GOOGLE_SERVICE_ACCOUNT_PATH`,
 opt-out `DATA_AVALANCHE_SKIP_GCS=1`).
 Profile `matrix` adds `postgres-14…17`, `mariadb-1011` and `mariadb-114`; profile `init` holds the
 one-shot bucket/container creators. Later milestones add `postgres-tls` (M5, a CA-signed
@@ -655,7 +657,9 @@ fake-gcs FAIL (risk R-3).
 ### 5.4 CI (`.github/workflows/`)
 
 - `ci.yml` (push/PR): fmt; clippy `-D warnings`; unit + property tests; containers (default profile) +
-  integration, including real GCS; slice E2E; `cargo-deny`; docs build (from M11). Requires secret
+  integration, including real GCS; slice E2E; docs build (from M11); at the end of the check job, a
+  **non-blocking** `cargo audit` (RustSec) step: an advisory fails the step and adds a warning
+  annotation, but never fails the job. Requires secret
   `GCP_SA_KEY` (service-account JSON, `roles/storage.objectAdmin` on the bucket) and variable
   `DATA_AVALANCHE_GCS_BUCKET`, documented in `test-infra/README.md` and in the workflow comments.
 - `nightly.yml`: full DB matrix, full E2E, longer property-test case counts.
@@ -670,7 +674,7 @@ fake-gcs FAIL (risk R-3).
 |---|---|---|---|
 | R-1 | `memberlist` 0.8.5 has never been probed (TLS, metadata size, Lifeguard, runtime-agnostic API) | medium / high | M8 opens with a probe gate; `foca` 2.0 as fallback; everything above membership consumes an owner function, so the swap is contained |
 | R-2 | `object_store` CAS behaves differently from the proven native clients (GCS generation, S3 409, Azure MI) | low / high | T1–T10 re-proof on real clouds in M2 before any lease code depends on it; the proven per-backend stores in `prototypes/lease-conformance` are the fallback |
-| R-3 | An emulator's conditional writes are incomplete | ~~medium~~ low / low | Measured 2026-09-26: RustFS and Azurite honour Create and Update preconditions; fake-gcs doesn't serve `object_store` at all, so it's replaced by a real bucket (P-10). Real GCS via `object_store` passed the same checks (2026-09-26). Closed |
+| R-3 | An emulator's conditional writes are incomplete | ~~medium~~ low / low | Measured 2026-09-26: RustFS and Azurite honour Create and Update preconditions; fake-gcs doesn't serve `object_store` at all, so it's replaced by a real bucket (P-10). Real GCS via `object_store` passed the same checks (2026-09-26). Re-checked with `object_store` 0.14.2 the same day: fake-gcs 1.56.1 (= `latest`) still fails the plain PUT. Closed |
 | R-12 | Clamped PG edge dates (Arrow min/max, Q-M5-1) are valid Parquet but some engines can't render years ±5.8M / ±294k | medium / low | M4 type round-trip reads them through DuckDB `delta_scan`; the operator docs list the clamping and the engines checked |
 | R-11 | The real GCS bucket makes PR CI depend on credentials, network and cost | low / low | Per-test unique prefixes plus cleanup, a 1-day lifecycle rule on `data-avalanche-it/`, a dedicated CI bucket and service account; fork PRs skip GCS with a notice (P-10) |
 | R-4 | File/position MySQL mode (new per P-4) has unknown resume edge cases (rotation, restart, failover invalidates positions) | medium / medium | Probe S-MY10 opens M7; a changed source server halts the pipeline (`BINLOG_SOURCE_CHANGED`, Q-M7-2) and the operator docs give the recovery (switch to `gtid` or re-snapshot) |
@@ -680,6 +684,7 @@ fake-gcs FAIL (risk R-3).
 | R-8 | `pgwire-replication` =0.4.1 is a young crate (proto v1 only) | medium / medium | Thin wrapper; the decoder is ours; a fork path is documented |
 | R-9 | `serde-saphyr` lacks a strictness or error-location feature the spec needs | low / medium | First M1 task verifies it; `serde_yaml_ng` fallback |
 | R-10 | TOAST carry-forward across batches depends on the MERGE update expression (D-IMPL-3) | medium / high | M4 test with an unchanged TOAST column across two flushes; `re_query` strategy as the alternative |
+| R-13 | Two `object_store` versions after M4: ours at 0.14, deltalake 1.0 at `^0.13.2`. Store handles can't be shared across them (e.g. passing our store to delta-rs), and `quick-xml` 0.39.4 (RUSTSEC-2026-0194/0195, fixed in 0.41) comes back through deltalake's copy | known / low | Keep the two apart: the storage crate owns 0.14 for lease/state/config; the Delta sink builds its stores through deltalake's own API. The non-blocking `cargo audit` step reports the advisories. Move to one version when a deltalake release accepts 0.14 (check at M4) |
 
 ---
 
