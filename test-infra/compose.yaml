@@ -1,0 +1,74 @@
+# Integration-test infrastructure. Default profile = newest of each engine + S3/Azure emulators.
+# GCS has no usable emulator for object_store; GCS tests use a real bucket (see README.md).
+# `matrix` profile adds the older supported versions (P-8). `init` profile = one-shot bucket creation.
+# Host ports are fixed and non-default; see README.md.
+name: data-avalanche-test
+
+x-pg: &pg
+  environment: { POSTGRES_USER: avalanche, POSTGRES_PASSWORD: avalanche, POSTGRES_DB: avalanche }
+  command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=20",
+            "-c", "max_wal_senders=20", "-c", "logical_decoding_work_mem=64kB"]
+  healthcheck: { test: ["CMD-SHELL", "pg_isready -U avalanche -d avalanche"], interval: 2s, retries: 30 }
+
+x-mariadb: &mariadb
+  environment: { MARIADB_ROOT_PASSWORD: avalanche, MARIADB_DATABASE: avalanche }
+  command: ["--server-id=1", "--log-bin=mariadb-bin", "--binlog-format=ROW",
+            "--binlog-row-image=FULL", "--binlog-row-metadata=FULL", "--gtid-strict-mode=1"]
+  healthcheck: { test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"], interval: 2s, retries: 60 }
+
+services:
+  postgres-18: { <<: *pg, image: "postgres:18", ports: ["55418:5432"] }
+  postgres-17: { <<: *pg, image: "postgres:17", ports: ["55417:5432"], profiles: [matrix] }
+  postgres-16: { <<: *pg, image: "postgres:16", ports: ["55416:5432"], profiles: [matrix] }
+  postgres-15: { <<: *pg, image: "postgres:15", ports: ["55415:5432"], profiles: [matrix] }
+  postgres-14: { <<: *pg, image: "postgres:14", ports: ["55414:5432"], profiles: [matrix] }
+
+  mysql-84:
+    image: "mysql:8.4"
+    environment: { MYSQL_ROOT_PASSWORD: avalanche, MYSQL_DATABASE: avalanche }
+    command: ["--server-id=1", "--log-bin=mysql-bin", "--binlog-format=ROW", "--binlog-row-image=FULL",
+              "--binlog-row-metadata=FULL", "--gtid-mode=ON", "--enforce-gtid-consistency=ON"]
+    ports: ["53384:3306"]
+    healthcheck: { test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-pavalanche"], interval: 2s, retries: 60 }
+
+  mariadb-118: { <<: *mariadb, image: "mariadb:11.8", ports: ["53318:3306"] }
+  mariadb-114: { <<: *mariadb, image: "mariadb:11.4", ports: ["53314:3306"], profiles: [matrix] }
+  mariadb-1011: { <<: *mariadb, image: "mariadb:10.11", ports: ["53311:3306"], profiles: [matrix] }
+
+  rustfs:
+    image: "rustfs/rustfs:1.0.0"
+    environment:
+      RUSTFS_ACCESS_KEY: avalanche
+      RUSTFS_SECRET_KEY: avalanche-secret
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ENABLE: "false"
+    command: ["/data"]
+    volumes: ["rustfs-data:/data"]
+    ports: ["59000:9000"]
+
+  azurite:
+    image: "mcr.microsoft.com/azure-storage/azurite:3.37.0"
+    command: ["azurite-blob", "--blobHost", "0.0.0.0", "--blobPort", "10000", "--skipApiVersionCheck", "--loose"]
+    # object_store's emulator mode targets 127.0.0.1:10000, so this port is not remapped.
+    ports: ["10000:10000"]
+
+  rustfs-init:
+    image: "amazon/aws-cli:2.37.4"
+    profiles: [init]
+    environment: { AWS_ACCESS_KEY_ID: avalanche, AWS_SECRET_ACCESS_KEY: avalanche-secret, AWS_DEFAULT_REGION: us-east-1 }
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - 'for i in $$(seq 1 60); do aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket data-avalanche-test 2>/dev/null && exit 0;
+         aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket data-avalanche-test >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1'
+
+  azurite-init:
+    image: "mcr.microsoft.com/azure-cli:2.90.0-azurelinux4.0"
+    profiles: [init]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - 'for i in $$(seq 1 60); do az storage container create --name data-avalanche-test --only-show-errors
+         --connection-string "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;"
+         >/dev/null && exit 0; sleep 1; done; exit 1'
+
+volumes:
+  rustfs-data: {}

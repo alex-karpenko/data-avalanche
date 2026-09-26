@@ -24,3 +24,43 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Unit and property tests
         run: cargo test --workspace
+
+  # Integration tests: DB containers + S3/Azure emulators (test-infra/compose.yaml) + a REAL GCS bucket.
+  # Requirements (documented in test-infra/README.md, "CI requirements"):
+  #   secrets.GCP_SA_KEY           service-account key JSON with roles/storage.objectAdmin on the bucket
+  #   vars.DATA_AVALANCHE_GCS_BUCKET    CI bucket name (versioning off, lifecycle rule on data-avalanche-it/)
+  # Fork PRs get no secrets: GCS tests are then skipped (DATA_AVALANCHE_SKIP_GCS=1) with a notice.
+  integration:
+    runs-on: ubuntu-latest
+    needs: check
+    env:
+      DATA_AVALANCHE_IT: "1"
+      DATA_AVALANCHE_GCS_BUCKET: ${{ vars.DATA_AVALANCHE_GCS_BUCKET }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: GCS credentials
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: |
+          if [ -z "$GCP_SA_KEY" ] || [ -z "$DATA_AVALANCHE_GCS_BUCKET" ]; then
+            echo "::notice::GCP_SA_KEY or DATA_AVALANCHE_GCS_BUCKET unavailable (fork PR?) - GCS tests skipped"
+            echo "DATA_AVALANCHE_SKIP_GCS=1" >> "$GITHUB_ENV"
+          else
+            umask 077
+            printf '%s' "$GCP_SA_KEY" > "$RUNNER_TEMP/gcs-key.json"
+            echo "GOOGLE_SERVICE_ACCOUNT_PATH=$RUNNER_TEMP/gcs-key.json" >> "$GITHUB_ENV"
+          fi
+      - name: Start test infrastructure
+        run: test-infra/up.sh
+      - name: Integration tests
+        run: cargo test --workspace -- --test-threads=1
+      - name: Container logs on failure
+        if: failure()
+        run: docker compose -f test-infra/compose.yaml logs --no-color
+      - name: Stop test infrastructure
+        if: always()
+        run: test-infra/down.sh
+      - name: Remove GCS key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/gcs-key.json"
