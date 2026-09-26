@@ -1,14 +1,14 @@
 ---
-updated: 2026-06-06
+updated: 2026-09-26
 domain: Architecture
-tags: [architecture, design, system]
+tags: [architecture, design, system, multi-sink, iceberg, delta-lake]
 sources: []
 ---
 
 # System Overview
 
 ## Overview
-A high-load Change Data Capture system written in Rust that streams row-level changes from PostgreSQL and MySQL source databases into Apache Iceberg tables stored in cloud object storage. Built for correctness, throughput, and operational simplicity.
+A high-load Change Data Capture system written in Rust that streams row-level changes from PostgreSQL and MySQL source databases into lakehouse tables — **Apache Iceberg or Delta Lake, selected per pipeline** — stored in cloud object storage. Built for correctness, throughput, and operational simplicity.
 
 ## High-Level Flow
 
@@ -18,13 +18,15 @@ PostgreSQL (logical replication / pgoutput)  ─┐
 MySQL (binlog / GTID)                         ─┘        │
                                                          ▼
                                                Arrow RecordBatch buffer
+                                               + per-key collapse (TableChangeSet)
                                                          │
                                                          ▼
-                                               Apache Iceberg writer
-                                               (iceberg-rust + OpenDAL)
+                                               Sink (per pipeline, `sink.type`)
+                                               ├─ Iceberg     (iceberg-rust + OpenDAL)
+                                               └─ Delta Lake  (delta-rs + object_store)
                                                          │
                                                          ▼
-                                               Cloud Object Storage (S3/GCS)
+                                               Cloud Object Storage (S3/GCS/Azure)
 ```
 
 ## High-level system requirements
@@ -41,8 +43,10 @@ MySQL (binlog / GTID)                         ─┘        │
 	- config data model will be provided later
 - Data replication entity is `pipeline`, it defines:
 	- `source`: database attributes to source data from (type, hostname, credentials, publication and replication slot name, ssl mode, etc.), without tables definition (see below)
-	- `sink`:  cloud storage attributes where to store data to (type, bucket name, prefix, etc.)
-	- `catalog`:  where to store schema to, catalog type, how to handle schema evolution, etc.
+	- `sink`:  target table format and cloud storage attributes where to store data to: `type` (`iceberg` | `delta` — **mandatory, no default**, so a pipeline's target format never changes implicitly when the binary's compiled-in sink set changes), write mode, bucket name, prefix, flush criteria, and one format-specific block:
+		- `iceberg`: write strategy (MOR/COW) and `catalog` — where table schemas/metadata are registered (Glue, Hive Metastore, REST)
+		- `delta`: table-creation properties; Delta tables are path-based (no catalog registration in v1)
+	- `schema_evolution`:  how to handle source schema changes (sink-neutral policy; the sink applies it within its declared capabilities)
 	- `snapshot_mode`:  defines startup snapshotting mode (when app restarts or pipeline restarts due to config change) like - always, never (default), initial, dump_always, dump_initial
 	- `tables`:  include/exclude filters lists with glob pattern allowed, table level snapshot mode overrides
 	- `flush_mode`:  when to flush source data to sink: immediately or when one or several criteria satisfied: time interval elapsed (default mode, value is 30s), max number of sourced rows collected (default is 100,000 rows), max collected data size (default is 512Mb)
@@ -54,11 +58,16 @@ MySQL (binlog / GTID)                         ─┘        │
 		- never - just start/continue data streaming without snapshot, this is default
 		- initial - if table doesn't exist at the sink storage (there is no confirmed replication point), then do snapshot once and start replication
 		- dump_always - do snapshot each time pipeline starts, but don't stream further data
-		- dump_initial - if table doesn't exist at the sink storage and in the catalog, then do snapshot once but don't stream further data. if data is present at the storage but no table in the catalog - don't snapshot, emit warning. if catalog entry is present but data storage is empty for the table - do snapshot like data is absent.
+		- dump_initial - if table doesn't exist at the sink storage and in the catalog, then do snapshot once but don't stream further data. if data is present at the storage but no table in the catalog - don't snapshot, emit warning. if catalog entry is present but data storage is empty for the table - do snapshot like data is absent. for sinks without a catalog (Delta Lake in v1) the catalog condition is the table's own metadata (`_delta_log`) existence.
 	- on request via management REST API:
 		- request payload should contain pipeline name and non-empty tables list without globs. 
 		- replication of the specified tables should be paused, and resumed after snapshot completed form the point "next to last snapshotted position"
 		- may contain table(s) which isn't present in the pipeline config - do snapshot but don't stream data
+- Sinks:
+	- each pipeline writes to exactly one sink (v1); the sink type is selected explicitly per pipeline
+	- capture, decode, accumulation and per-key collapse are sink-independent; only the commit to the target table format is sink-specific
+	- every sink declares its capabilities (write modes, schema-evolution operations, partition transforms, logical types); a pipeline whose configuration needs a capability its sink lacks is **refused at pipeline start** with the named capability (e.g. Iceberg mirror mode until iceberg-rust gains a delete-capable commit)
+	- a table location holding another format's metadata, or pipeline state recorded under a different sink type, is a hard error (no silent format mixing); changing `sink.type` re-seeds the pipeline's tables
 - Clustering:
 	- app (Kubernetes pod(s), standalone container(s), standalone Linux service(s)) may be running in one or more instances
 	- single instance (worker) process its unique non-overlapped set of pipelines
@@ -98,7 +107,7 @@ MySQL (binlog / GTID)                         ─┘        │
 	- no data or state on local filesystem, everything we need to be stored should be preserved to cloud storage
 	- app automatically creates pipeline's database resources it needs, like publications, replication slots, etc. and automatically destroys created resources when pipeline is gone
 	- to satisfy previous requirement app preserves current config/reconciliation state to cloud storage (defined in globals config section)
-	- app doesn't delete any other created data artifacts like iceberg tables, tables metadata, catalog entries, etc.
+	- app doesn't delete any other created data artifacts like sink tables (Iceberg or Delta), tables metadata, catalog entries, etc. format-internal metadata housekeeping that the table format itself requires (Delta checkpoints and expired transaction-log cleanup) is not artifact deletion; data-file removal (Iceberg orphan cleanup, Delta VACUUM) stays external.
 
 ## Key Design Decisions
 
@@ -106,7 +115,8 @@ MySQL (binlog / GTID)                         ─┘        │
 | ---------------- | -------------- | --------------------------------------------- |
 | Language         | Rust           | Memory safety + performance without GC pauses |
 | In-memory format | Apache Arrow   | Zero-copy, columnar, interoperable            |
-| Table format     | Apache Iceberg | ACID, time travel, cloud-native               |
+| Table format     | Pluggable per pipeline: Apache Iceberg, Delta Lake | ACID, time travel, cloud-native; no single-crate hostage (see `research/Multi_Sink_Architecture_and_Delta_Lake.md`) |
+| Sink abstraction | `Sink` trait over a sink-neutral `TableChangeSet` + declared capabilities | Format-independent core; missing capability fails fast at pipeline start |
 | Cluster state    | memberlist     | Proven, well-understood failure model         |
 | Async runtime    | tokio          | Ecosystem standard for Rust async             |
 

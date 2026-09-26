@@ -1,8 +1,8 @@
 ---
-updated: 2026-06-12
+updated: 2026-09-26
 domain: Architecture
 status: Specification (supersedes the Configuration_file_model.md draft)
-tags: [architecture, configuration, spec, validation]
+tags: [architecture, configuration, spec, validation, multi-sink, iceberg, delta-lake]
 sources: []
 ---
 
@@ -50,7 +50,7 @@ to it triggers:
 | Class | Name | On change during a live reload |
 |---|---|---|
 | **R** | Reloadable | Applied in place, no interruption. (e.g., `log.level`, `sink.flush.*`, `tables.include`.) |
-| **PR** | Pipeline-restart | The affected pipeline(s) are restarted per the restart policy (§12.4): drain/flush, release resources, re-create. Other pipelines keep running. (e.g., `source.host`, `catalog.*`.) |
+| **PR** | Pipeline-restart | The affected pipeline(s) are restarted per the restart policy (§12.4): drain/flush, release resources, re-create. Other pipelines keep running. (e.g., `source.host`, `sink.iceberg.catalog.*`.) |
 | **PROC** | Process-restart | Cannot be hot-applied. The reload is **rejected** with an error naming the field; the operator must restart the worker process. (e.g., `cluster.tokens`, `api.address`, memberlist binding.) |
 
 The reload engine computes the highest class touched per scope and acts accordingly. A reload
@@ -193,7 +193,7 @@ where `PG_PORT=5432` yields the integer `5432`; a non-numeric value is a type er
 Fields named `cert`, `key`, `ca` accept **either** a filesystem path **or** inline PEM data
 **or** an `${ENV}` reference resolving to either. Detection: a value beginning with
 `-----BEGIN` is treated as inline PEM; otherwise it is a path. This applies uniformly to
-`globals.api.tls`, `globals.cluster.memberlist.tls`, `source.ssl_*`, and `catalog.*.tls`.
+`globals.api.tls`, `globals.cluster.memberlist.tls`, `source.ssl_*`, and `sink.iceberg.catalog.*.tls`.
 
 ### 4.5 Booleans, lists, maps
 
@@ -206,9 +206,9 @@ Anywhere a `user`/`password` pair or an OAuth2 `client_id`/`client_secret` pair 
 `credentials_file` field is offered as a **mutually exclusive** alternative: instead of the two
 explicit fields, give the path to a JSON file holding the pair.
 
-- `user`/`password` contexts (`globals.api`, `source`, `catalog.hive`):
+- `user`/`password` contexts (`globals.api`, `source`, `sink.iceberg.catalog.hive`):
   `{ "user": "...", "password": "..." }`
-- OAuth2 context (`catalog.rest.oauth2`):
+- OAuth2 context (`sink.iceberg.catalog.rest.oauth2`):
   `{ "client_id": "...", "client_secret": "..." }`
 
 The `credentials_file` **value is a path** and is itself subject to env-var substitution (§4.3)
@@ -216,7 +216,7 @@ The `credentials_file` **value is a path** and is itself subject to env-var subs
 during **resolution** (§11 phase 2); its JSON must parse and contain the two required, non-empty
 fields (V-067).
 
-Where a **single bearer token** is accepted (`catalog.rest`, `auth: bearer`), the parallel field
+Where a **single bearer token** is accepted (`sink.iceberg.catalog.rest`, `auth: bearer`), the parallel field
 is **`token_file`**: a path (also env-var-substitutable, e.g. `token_file: ${CATALOG_TOKEN_FILE}`)
 to a file whose **raw contents are the token**. It is **not** JSON — a bearer token is a single
 opaque value, so the file holds just the token (any trailing newline/whitespace is trimmed). It is
@@ -238,8 +238,9 @@ the per-context requirement rules (V-010, V-040, V-044, V-045, V-049).
 
 ## 5. Reserved metadata column names
 
-The accumulator injects lineage columns (`_op`, `_ts`, `_lsn`, `_source_db`, `_pipeline`;
-see `Data-Flow.md`). Source columns whose names collide with these are a runtime concern, not
+The accumulator injects lineage columns (`_op`, `_ts`, `_lsn`, `_seq`, `_source_db`, `_pipeline`;
+see `Data-Flow.md`). The `__avalanche_` prefix is reserved for sink-internal working columns (e.g.
+the Delta MERGE delete flag); they are never persisted. Source columns whose names collide with these are a runtime concern, not
 a config concern, but operators should be aware the `_`-prefixed names are reserved.
 
 ---
@@ -269,7 +270,7 @@ configured** — the provider SDK's default credential chain is used (instance p
 role, environment variables, workload identity, managed identity). For **Azure**, every
 `bucket` field across the config is interpreted as a **container** name (§10).
 
-Affects which `catalog` and `sigv4` options are valid (§6, §9.5): `catalog.glue` and
+Affects which `sink.iceberg.catalog` and `sigv4` options are valid (§6, §9.5): `sink.iceberg.catalog.glue` and
 `rest.auth = sigv4` require `cloud = aws`.
 
 ### 6.2 `globals.state`
@@ -451,15 +452,17 @@ Defaults are merged into every pipeline per §8. The example default values in �
 **actual** system defaults; a field absent from both `defaults` and the pipeline falls back to
 the value in this spec's tables.
 
-`defaults.catalog` may set the full catalog block (DRY); a pipeline overrides it per the union
-rule in §8.4. Both `defaults.catalog.hive` and `defaults.catalog.rest` carry the same
-protocol-correct auth schema as the pipeline-level blocks (§9.5).
+`defaults.sink.iceberg.catalog` may set the full Iceberg catalog block (DRY); a pipeline overrides it
+per the union rule in §8.4. Both `defaults.sink.iceberg.catalog.hive` and
+`defaults.sink.iceberg.catalog.rest` carry the same protocol-correct auth schema as the pipeline-level
+blocks (§9.5). `defaults.sink.type` may be set — it is still an explicit choice in the config file,
+which is all V-091 requires.
 
 ---
 
 ## 8. Merge & override semantics
 
-This section is normative for the reconcile engine. The draft stated the rule for `catalog`
+This section is normative for the reconcile engine. The draft stated the rule for the catalog
 only; the rules below cover every shape.
 
 ### 8.1 Direction
@@ -483,41 +486,66 @@ Lists are **replaced wholesale**, never merged element-wise. If a pipeline speci
 
 ### 8.4 Discriminated-union subtrees
 
-Two subtrees are unions; the **active branch** replaces the entire subtree, and the sibling
-branch from `defaults` is **dropped**:
+Three subtrees are unions; the **active branch** replaces the entire subtree, and the sibling
+branch from `defaults` is **dropped** (no field-level merge across branches):
 
-- **`catalog`** — branches `glue` / `hive` / `rest`. If `defaults.catalog.glue` is set and a
-  pipeline sets `catalog.rest`, the pipeline gets `rest` and the defaulted `glue` is discarded
-  entirely (no field-level merge across branches). The `schema_evolution` sub-block, which is
-  **not** part of the union, still merges normally.
 - **`source` engine block** — branches `postgres` / `mysql`, selected by `source.type`. If
   `defaults.source.type = postgres` (with a `postgres:` block) and a pipeline sets
   `source.type = mysql`, the defaulted `postgres:` block is dropped and the pipeline's `mysql:`
   block applies. The common `source` fields (`host`, `port`, `db`, `user`, `password`,
   `ssl_*`, `timeouts`) still merge normally.
+- **`sink` format block** — branches `iceberg` / `delta`, selected by `sink.type`. If `defaults`
+  carries `sink.iceberg` and a pipeline sets `sink.type = delta`, the defaulted `iceberg:` block is
+  dropped. The common `sink` fields (`type`, `write_mode`, `bucket`, `prefix`, `flush`, …) still
+  merge normally.
+- **`sink.iceberg.catalog`** — branches `glue` / `hive` / `rest`. If
+  `defaults.sink.iceberg.catalog.glue` is set and a pipeline sets `sink.iceberg.catalog.rest`, the
+  pipeline gets `rest` and the defaulted `glue` is discarded entirely.
+
+`schema_evolution` is a pipeline-level block (§9.7), not part of any union; it merges normally.
 
 ### 8.5 Worked example
 
 ```yaml
 defaults:
   source: { type: postgres, host: db.internal, port: 5432, ssl_mode: require }
-  sink:   { strategy: mor, flush: { seconds: 60, rows: 100000, bytes: 512MiB } }
-  catalog:
-    glue: { name: "123456789012", database: analytics }
+  sink:
+    type: iceberg
+    write_mode: mirror
+    flush: { seconds: 60, rows: 100000, bytes: 512MiB }
+    iceberg:
+      strategy: mor
+      catalog:
+        glue: { name: "123456789012", database: analytics }
 
 pipelines:
   orders:
     id: orders
     source: { db: orders, user: cdc, password: ${PW}, postgres: { publication: p, slot: s } }
-    catalog: { rest: { url: https://cat.example.com, auth: oauth2, oauth2: {...} } }
-    sink: { bucket: lake, flush: { rows: 50000 } }
+    sink:
+      bucket: lake
+      flush: { rows: 50000 }
+      iceberg:
+        catalog: { rest: { url: https://cat.example.com, auth: oauth2, oauth2: {...} } }
+  clicks:
+    id: clicks
+    source: { db: clicks, user: cdc, password: ${PW}, postgres: { publication: pc, slot: sc } }
+    sink:
+      type: delta
+      bucket: lake
+      delta: { checkpoint_interval: 20 }
 ```
 
 Effective `orders`:
 - `source`: host/port/ssl_mode/type from defaults; db/user/password/postgres from pipeline.
-- `catalog`: **`rest` only** — the defaulted `glue` is gone (union rule §8.4).
-- `sink.flush`: `seconds:60` and `bytes:512MiB` from defaults, `rows:50000` from pipeline
-  (map merge §8.2); `strategy: mor` inherited.
+- `sink.type: iceberg`, `write_mode: mirror` inherited; `sink.iceberg.strategy: mor` inherited
+  (map merge §8.2); `sink.iceberg.catalog`: **`rest` only** — the defaulted `glue` is gone (union
+  rule §8.4).
+- `sink.flush`: `seconds:60` and `bytes:512MiB` from defaults, `rows:50000` from pipeline.
+
+Effective `clicks`:
+- `sink.type: delta` — the defaulted `sink.iceberg` block (strategy + catalog) is **dropped**
+  (union rule §8.4); `sink.delta` from the pipeline; `flush` and `write_mode` inherited.
 
 ---
 
@@ -591,7 +619,7 @@ source:
 | Field | Type | Required | Default | Mutability | Notes |
 |---|---|---|---|---|---|
 | `replication_type` | enum `binlog`\|`gtid` | no | `binlog` | PR | `gtid` is preferred (position-independent, gap-free). |
-| `tinyint1_as_bool` | bool | no | `true` | PR | Map `TINYINT(1)` columns to Iceberg `boolean`. When `true`, requires the display-width from the catalog query (channel C); when `false`, `TINYINT(1)` maps as `TINYINT SIGNED` → `Int16`. See `research/Type_Mapping.md`. |
+| `tinyint1_as_bool` | bool | no | `true` | PR | Map `TINYINT(1)` columns to logical `bool`. When `true`, requires the display-width from the catalog query (channel C); when `false`, `TINYINT(1)` maps as `TINYINT SIGNED` → `Int16`. See `research/Type_Mapping.md`. |
 | `tinyint1_detection` | enum `information_schema`\|`none` | no | `information_schema` | PR | Source of the `TINYINT(1)` display-width signal. `none` disables the detection (all `TINYINT` treated as integer); `information_schema` uses the catalog query (always available via channel C). |
 
 ### 9.3 `tables`
@@ -613,7 +641,7 @@ tables:
 | `snapshots.mode` | enum | no | `never` | PR | `never`\|`initial`\|`always`\|`dump_always`\|`dump_initial` (semantics in `System-Overview.md`). |
 | `snapshots.parallelism` | integer | no | `1` | R | ≥ 1 (V-027). Concurrent snapshot jobs. **> 4 warns** (V-038): each PG snapshot job uses ≥ 3 connections. The limit is read by the snapshot scheduler at job-launch time; a change affects only **future** scheduling — in-flight and already-queued jobs are unaffected — so it applies in place. Implies an adjustable permit count, not a pool sized once at pipeline start. |
 | `snapshots.overrides` | map<table,mode> | no | `{}` | PR | Per-table mode override. Keys are full `schema.table` for PostgreSQL / bare table name for MySQL (V-064), **no globs** (V-033). A key not in the resolved set **warns** at load (V-034). Not allowed in `defaults`. |
-| `column_type_overrides` | map<column, iceberg-type-string> | no | `{}` | PR | Per-column target-Iceberg-type override applied at schema resolution (e.g. `public.orders.amount: "decimal(38,10)"`). Value must be a valid Iceberg type string (V-078). First step of the unsupported-type fallback chain (`research/Type_Mapping.md`). |
+| `column_type_overrides` | map<column, logical-type> | no | `{}` | PR | Per-column target-type override applied at schema resolution (e.g. `public.orders.amount: "decimal(38,10)"`). Values use the **sink-neutral logical type grammar** — `bool`, `int16`, `int32`, `int64`, `float32`, `float64`, `decimal(P,S)`, `string`, `binary`, `date`, `time`, `timestamp_tz`, `timestamp_ntz`, `uuid`, `json`, `list<T>` — never a format-specific type name (Iceberg `timestamp` = without tz, Delta `timestamp` = with tz). Each sink maps it to its physical type (`research/Type_Mapping.md` Hop 3). Must be valid (V-078) and mappable by the pipeline's sink (V-087). First step of the unsupported-type fallback chain. |
 | `numeric_overflow_action` | enum `string`\|`error` | no | `string` | PR | Action when a `numeric(P,S)` with `P > 38` (beyond Iceberg `decimal` range) is encountered: `string` serializes it as text; `error` halts the table. With `error`, unscaled `numeric` columns may halt unexpectedly (V-079 warning). |
 
 Glob grammar: `*` matches within a single name segment (it does not cross the `.` separator);
@@ -624,20 +652,33 @@ schema); **MySQL** matches against the bare table name (`payment_*` = every tabl
 
 ### 9.4 `sink`
 
+The pipeline's target table format and storage location. Common fields plus exactly one format block
+(`iceberg` xor `delta`), selected by `type`. One sink per pipeline. See
+`research/Multi_Sink_Architecture_and_Delta_Lake.md` (decisions D-MS.1–D-MS.15, R-1).
+
 ```yaml
 sink:
-  strategy: mor
+  type: delta                 # REQUIRED — iceberg | delta; no default (V-091)
+  write_mode: mirror          # mirror (v1) | changelog (reserved, V-089)
   bucket: lake-bucket
   prefix: orders
   flush: { seconds: 60, rows: 100000, bytes: 512MiB }
+  iceberg: { ... }            # iff type = iceberg (§9.4.2)
+  delta:   { ... }            # iff type = delta   (§9.4.3)
 ```
 
 | Field | Type | Required | Default | Mutability | Notes |
 |---|---|---|---|---|---|
-| `strategy` | enum `mor`\|`cow` | no | `mor` | PR | Applies to **new** tables only; changing it does not migrate existing Iceberg tables (G-12a — migration path is a design item). |
+| `type` | enum `iceberg`\|`delta` | **yes** | **— (no default)** | **PR, re-seed** | Must be set explicitly (pipeline or `defaults`) — V-091. There is deliberately no default, so a pipeline's target format never changes implicitly when the runtime binary is rebuilt with a different compiled-in sink set. The sink must be compiled into the binary (V-083). Pipeline state records the sink type; changing it re-seeds the pipeline's tables (fresh positions, snapshot per `snapshot_mode`) and requires table locations that hold no other format's metadata (start-time check). |
+| `write_mode` | enum `mirror`\|`changelog` | no | `mirror` | PR, re-seed | `mirror` = the target mirrors the source (upserts + deletes). `changelog` (append-only `_op` log; PK-less tables allowed) is **reserved** — error in v1 (V-089). A sink that does not declare the mode refuses the pipeline at start (§11.2). |
 | `bucket` | string | yes (resolvable) | — | PR | Object-storage bucket (Azure: container). |
-| `prefix` | string | no | pipeline `id` | PR | Root prefix for this pipeline's data/metadata/state. See §10 for the full path layout. |
-| `flush` | object | no | (below) | R | Flush triggers. |
+| `prefix` | string | no | pipeline `id` | PR | Root prefix for this pipeline's tables and co-located state. See §10 for the full path layout. |
+| `flush` | object | no | (below) | R | Flush triggers (§9.4.1). |
+| `iceberg` / `delta` | object | exactly one, matching `type` | — | PR | Format block (§9.4.2 / §9.4.3). The foreign block is forbidden (V-084). |
+
+> **CHANGE (2026-09-26, multi-sink):** `sink.strategy` moved to `sink.iceberg.strategy`; the
+> pipeline-level `catalog` moved to `sink.iceberg.catalog` (§9.5); `catalog.schema_evolution` moved to
+> the pipeline-level `schema_evolution` (§9.7).
 
 #### 9.4.1 `sink.flush` (OR semantics, tri-state per field)
 
@@ -658,53 +699,66 @@ Constraints: all three `null` is an **error** (V-035). `seconds: null` with at l
 > `Option<Option<T>>` (e.g. `serde_with::rust::double_option`): outer `None` = absent (apply
 > default), `Some(None)` = explicit null (disable), `Some(Some(v))` = value.
 
-### 9.5 `catalog`
+#### 9.4.2 `sink.iceberg` (iff `type = iceberg`)
 
-Where table schemas/metadata are registered. Exactly one of `glue` / `hive` / `rest`, plus a
-non-union `schema_evolution` block.
+| Field | Type | Required | Default | Mutability | Notes |
+|---|---|---|---|---|---|
+| `strategy` | enum `mor`\|`cow` | no | `mor` | PR | Applies to **new** tables only; changing it does not migrate existing tables (G-12a). Valid only with `write_mode: mirror` (V-085). |
+| `catalog` | union glue/hive/rest | yes (resolvable) | — | PR | Where Iceberg table metadata is registered — §9.5. |
+
+> **Capability note.** Iceberg `mirror` needs a delete-capable commit that no published iceberg-rust
+> provides (gap DA-SINK-1i). The config is valid; the pipeline is refused at start by the capability
+> assertion (§11.2) until the pinned crate gains it.
+
+#### 9.4.3 `sink.delta` (iff `type = delta`)
+
+Settings apply when the sink **creates** a table; existing tables keep their properties.
+
+| Field | Type | Required | Default | Mutability | Notes |
+|---|---|---|---|---|---|
+| `column_mapping` | enum `none`\|`name` | no | `none` | PR (new tables) | `name` is **rejected in v1** (V-092): delta-rs 1.0 refuses ADD COLUMN on column-mapped tables, which would disable the only Delta schema-evolution op (probe P7b). |
+| `checkpoint_interval` | integer | no | `10` | PR (new tables) | → `delta.checkpointInterval`. ≥ 1. |
+| `log_retention` | Duration | no | `30d` | PR (new tables) | → `delta.logRetentionDuration`. Expired-log cleanup runs as a post-commit hook (format metadata housekeeping). |
+| `table_properties` | map<string,string> | no | `{}` | PR (new tables) | Passthrough of allow-listed `delta.*` table properties (V-093). |
+| `catalog.type` | enum `none`\|`glue`\|`unity`\|`hive` | no | `none` | PR | Catalog **registration** of Delta tables. v1 implements `none` (path-based tables); other values are reserved (V-088). |
+
+Delta maintenance in v1: checkpoints + expired-log cleanup are built-in (post-commit hooks);
+OPTIMIZE and VACUUM are external (never delete data files — `System-Overview.md`).
+
+### 9.5 `sink.iceberg.catalog` (Iceberg sink only)
+
+Where Iceberg table schemas/metadata are registered. Exactly one of `glue` / `hive` / `rest`.
+(Moved from the pipeline-level `catalog` on 2026-09-26; field semantics unchanged.)
 
 ```yaml
-catalog:
-  type: rest            # optional discriminator: glue | hive | rest
-  schema_evolution: { ... }
-  glue: { ... }         # OR
-  hive: { ... }         # OR
-  rest: { ... }
+sink:
+  type: iceberg
+  iceberg:
+    catalog:
+      type: rest            # optional discriminator: glue | hive | rest
+      glue: { ... }         # OR
+      hive: { ... }         # OR
+      rest: { ... }
 ```
 
 | Field | Type | Required | Default | Mutability | Notes |
 |---|---|---|---|---|---|
 | `type` | enum `glue`\|`hive`\|`rest` | no | inferred | PR | **NEW (vs draft).** Optional explicit discriminator, symmetric with `source.type`. If present it must match the single present sub-block (V-002); if absent it is inferred from the one present sub-block (0 or >1 present = error). |
-| `schema_evolution` | object | no | (below) | R | §9.5.1. Not part of the union (merges normally). |
-| `glue` / `hive` / `rest` | object | one required (resolvable) | — | PR | §9.5.2–9.5.4. |
+| `glue` / `hive` / `rest` | object | one required (resolvable) | — | PR | §9.5.1–9.5.3. |
 
-#### 9.5.1 `catalog.schema_evolution`
-
-| Field | Type | Required | Default | Mutability | Notes |
-|---|---|---|---|---|---|
-| `enabled` | bool | no | `true` | R | When disabled, or on an unsafe change, the changed table halts (log error); other tables continue (G-19b). |
-| `rescan_interval` | Duration | no | `60m` | R | Idle-table rescan cadence (detection channel D only). `0` disables the idle rescan. Always applicable. |
-
-> Detection and evolution are defined by `Schema_Change_Detection_and_Evolution.md` (the
-> four-channel trigger→augment→diff model and the safe/unsafe DDL classification, §7.2 there) —
-> this spec only carries the configuration surface. There is no `method` field: detection is the
-> fixed four-channel model, not an operator choice. Source-side requirements for detection
-> (e.g. SELECT on the source catalog) are operational start-time preconditions, not config rules
-> — see §11.2.
-
-#### 9.5.2 `catalog.glue` (valid only if `globals.cloud = aws`, V-028)
+#### 9.5.1 `sink.iceberg.catalog.glue` (valid only if `globals.cloud = aws`, V-028)
 
 | Field | Type | Required | Default | Mutability | Notes |
 |---|---|---|---|---|---|
 | `name` | string | yes | — | PR | Glue catalog id (AWS account id or registered catalog name). |
 | `database` | string | no | `source.db` | PR | Glue database mapped to the source schema/db. |
 
-#### 9.5.3 `catalog.hive` (Thrift / SASL)
+#### 9.5.2 `sink.iceberg.catalog.hive` (Thrift / SASL)
 
 | Field | Type | Required | Default | Mutability | Notes |
 |---|---|---|---|---|---|
 | `url` | string | yes | — | PR | `thrift://host:9083` or bare `host:port`. Default port 9083. |
-| `auth` | enum `none`\|`ldap`\|`kerberos` | no | `none` | PR | SASL mode. Mode change is structural (sub-blocks added/removed) — kept PR; see the credential-rotation note below §9.5.4. |
+| `auth` | enum `none`\|`ldap`\|`kerberos` | no | `none` | PR | SASL mode. Mode change is structural (sub-blocks added/removed) — kept PR; see the credential-rotation note below §9.5.3. |
 | `user` | string | conditional | — | R | For `ldap`: required unless `credentials_file` is given (V-040); mutually exclusive with it (V-065). Rotation applied via catalog-client reconnect (SASL is connection-bound). |
 | `password` | string | conditional | — | R | For `ldap`: required unless `credentials_file` is given (V-040); mutually exclusive with it (V-065). Rotation applied via reconnect. |
 | `credentials_file` | path | conditional | — | R | Alternative to `user`/`password` for `ldap` (§4.6): path to JSON `{user, password}`. Mutually exclusive with them (V-065). |
@@ -715,7 +769,7 @@ catalog:
 | `tls.ca` | PEM/path | no | — | PR | Custom CA for self-signed HMS certs. |
 | `database` | string | no | `source.db` | PR | Hive database mapping (catalog target, not a credential). |
 
-#### 9.5.4 `catalog.rest` (HTTP)
+#### 9.5.3 `sink.iceberg.catalog.rest` (HTTP)
 
 | Field | Type | Required | Default | Mutability | Notes |
 |---|---|---|---|---|---|
@@ -773,6 +827,24 @@ state:
 Relocating state on a running pipeline (PR) is dangerous (the new location has no history);
 treat such a change as effectively a re-seed and review before applying.
 
+### 9.7 `schema_evolution` (per-pipeline)
+
+Sink-neutral schema-evolution policy (moved from `catalog.schema_evolution`, 2026-09-26). The sink
+applies it within its declared capabilities: an operation the sink cannot perform halts the table
+(`Schema_Change_Detection_and_Evolution.md` §7).
+
+| Field | Type | Required | Default | Mutability | Notes |
+|---|---|---|---|---|---|
+| `enabled` | bool | no | `true` | R | When disabled, or on an unsafe change, the changed table halts (log error); other tables continue (G-19b). |
+| `rescan_interval` | Duration | no | `60m` | R | Idle-table rescan cadence (detection channel D only). `0` disables the idle rescan. Always applicable. |
+
+> Detection and evolution are defined by `Schema_Change_Detection_and_Evolution.md` (the
+> four-channel trigger→augment→diff model and the safe/unsafe DDL classification, §7.2 there) —
+> this spec only carries the configuration surface. There is no `method` field: detection is the
+> fixed four-channel model, not an operator choice. Source-side requirements for detection
+> (e.g. SELECT on the source catalog) are operational start-time preconditions, not config rules
+> — see §11.2.
+
 ---
 
 ## 10. Storage path construction
@@ -784,9 +856,14 @@ regardless of leading/trailing slashes in any segment. For **Azure**, `bucket` m
 **Per-pipeline data & metadata** (under `sink`):
 
 ```
-<sink.bucket>/<sink.prefix>/<schema>/<table>/data/      ← Parquet data files
-<sink.bucket>/<sink.prefix>/<schema>/<table>/meta/      ← Iceberg metadata
+<sink.bucket>/<sink.prefix>/<schema>/<table>/           ← table root (common to all sinks)
+    sink.type = iceberg:  data/   ← Parquet data (+ delete) files
+                          meta/   ← Iceberg metadata
+    sink.type = delta:    _delta_log/          ← Delta transaction log + checkpoints
+                          part-*.parquet       ← data files (partition dirs when partitioned)
 ```
+A table root that already holds the **other** format's metadata is refused at pipeline start
+(no silent format mixing).
 `sink.prefix` defaults to the pipeline `id`. The `<schema>` segment is the PostgreSQL schema;
 for **MySQL** — which has no schema layer and uses bare table names in config (§9.3) — this
 segment is filled internally with the database (`source.db`), so the layout stays uniform across
@@ -919,6 +996,17 @@ Because these are runtime checks, they sit outside the all-or-nothing config-val
 a privilege or server-setting problem on one pipeline's source does not reject the config or stop
 other pipelines.
 
+**Sink (start-time) preconditions** — same runtime class (no V-IDs; the affected pipeline is refused,
+others keep running). Authority: `Data-Flow.md` Phase 0 step 4 and
+`research/Multi_Sink_Architecture_and_Delta_Lake.md` §6.4.
+
+| Sink | Requirement | Severity (at start) | Rationale |
+|---|---|---|---|
+| All | **Capability assertion** — the sink declares every capability the pipeline's config needs (`write_mode`, partition transforms, logical types of the resolved tables) | error → refuse pipeline, naming the capability | Fail fast instead of a first-write surprise. Example: `sink.type: iceberg` + `write_mode: mirror` is refused until the pinned iceberg-rust has a delete-capable commit (DA-SINK-1i). |
+| All | Pipeline state's recorded `sink_type` equals `sink.type` | error → refuse pipeline | Positions and markers are sink-specific; a changed `sink.type` must re-seed. |
+| All | No table root holds the **other** format's metadata (`metadata/` vs `_delta_log/`) | error → halt table | No silent format mixing. |
+| All | Storage supports **atomic create-if-absent** (conditional PUT) on the sink location | error → refuse pipeline | Iceberg file-based commits and every Delta commit rely on it (same capability as the storage lease). |
+
 ---
 
 ## 12. Reload & reconciliation behavior
@@ -984,13 +1072,14 @@ radius. `reload` locus marks a rule that can only fire on reload.
 | ID | Path / Scope | Rule | Severity | Locus |
 |---|---|---|---|---|
 | V-001 | `source` | Exactly one engine block (`postgres` xor `mysql`) after merge, matching `type`. | error | pipeline |
-| V-002 | `catalog` | Exactly one sub-block (`glue`/`hive`/`rest`); if `type` is set it must equal the present block. | error | pipeline |
+| V-002 | `sink.iceberg.catalog` | Exactly one sub-block (`glue`/`hive`/`rest`); if `type` is set it must equal the present block. | error | pipeline |
+| V-084 | `sink.{iceberg,delta}` | Exactly the format block matching `sink.type` after merge; the foreign block is forbidden. | error | pipeline |
 | V-003 | `source.{postgres,mysql}` | Engine block present must match `type`; the foreign engine block is forbidden. | error | pipeline |
 | V-004 | top | `pipelines` key present (may be `{}`). | error | config |
 | V-005 | top | `globals` present. | error | config |
-| V-065 | `globals.api`, `source`, `catalog.hive` | `credentials_file` is mutually exclusive with `user`/`password` in the same block — providing both (any of `user`/`password` alongside `credentials_file`) is an error. | error | config / pipeline |
-| V-066 | `catalog.rest.oauth2` | `oauth2.credentials_file` is mutually exclusive with `oauth2.client_id`/`client_secret` — providing both is an error. | error | pipeline |
-| V-070 | `catalog.rest` | `token_file` is mutually exclusive with `token` — providing both is an error. | error | pipeline |
+| V-065 | `globals.api`, `source`, `sink.iceberg.catalog.hive` | `credentials_file` is mutually exclusive with `user`/`password` in the same block — providing both (any of `user`/`password` alongside `credentials_file`) is an error. | error | config / pipeline |
+| V-066 | `sink.iceberg.catalog.rest.oauth2` | `oauth2.credentials_file` is mutually exclusive with `oauth2.client_id`/`client_secret` — providing both is an error. | error | pipeline |
+| V-070 | `sink.iceberg.catalog.rest` | `token_file` is mutually exclusive with `token` — providing both is an error. | error | pipeline |
 
 ### 13.2 Requiredness / presence
 
@@ -1003,7 +1092,8 @@ radius. `reload` locus marks a rule that can only fire on reload.
 | V-010 | `source` credentials | Resolvable: either `user`+`password`, or `credentials_file` (exactly one — V-065). | error | pipeline |
 | V-011 | `source.postgres.{publication,slot}` | Present when `type=postgres`. | error | pipeline |
 | V-012 | `sink.bucket` | Resolvable. | error | pipeline |
-| V-013 | `catalog` | A catalog block resolvable (pipeline or defaults). | error | pipeline |
+| V-013 | `sink.iceberg.catalog` | When `sink.type = iceberg`: a catalog block resolvable (pipeline or defaults). | error | pipeline |
+| V-091 | `sink.type` | Present after merge (pipeline or `defaults`). **No implicit default.** | error | pipeline |
 | V-014 | `config_version` | Present and supported by this binary. | error | config |
 
 ### 13.3 Value domain
@@ -1018,8 +1108,12 @@ radius. `reload` locus marks a rule that can only fire on reload.
 | V-020 | `source.ssl_mode` | ∈ {disable, allow, prefer, require, verify-ca, verify-full}. | error | pipeline |
 | V-021 | `source.mysql.replication_type` | ∈ {binlog, gtid}. | error | pipeline |
 | V-022 | `tables.snapshots.mode` (and overrides values) | ∈ {never, initial, always, dump_always, dump_initial}. | error | pipeline |
-| V-023 | `sink.strategy` | ∈ {mor, cow}. | error | pipeline |
-| V-025 | `catalog.hive.auth` / `catalog.rest.auth` | hive ∈ {none,ldap,kerberos}; rest ∈ {none,bearer,oauth2,sigv4}. | error | pipeline |
+| V-023 | `sink.iceberg.strategy` | ∈ {mor, cow}. | error | pipeline |
+| V-083 | `sink.type` | ∈ {iceberg, delta} **and** compiled into this binary (Cargo feature `sink-iceberg` / `sink-delta`). | error | pipeline |
+| V-089 | `sink.write_mode` | ∈ {mirror, changelog}; `changelog` is reserved → `error` in v1 (D-MS.5). | error | pipeline |
+| V-092 | `sink.delta.column_mapping` | ∈ {none, name}; `name` → `error` in v1 (delta-rs refuses ADD COLUMN under column mapping; R-1). | error | pipeline |
+| V-088 | `sink.delta.catalog.type` | ∈ {none, glue, unity, hive}; anything but `none` is reserved → `error` in v1 (D-MS.12). | error | pipeline |
+| V-025 | `sink.iceberg.catalog.hive.auth` / `sink.iceberg.catalog.rest.auth` | hive ∈ {none,ldap,kerberos}; rest ∈ {none,bearer,oauth2,sigv4}. | error | pipeline |
 | V-026 | `globals.cluster.tokens` | 1 ≤ tokens ≤ 4096. Outside 64–256 → also `warning`. | error / warning | config |
 | V-027 | `tables.snapshots.parallelism` | ≥ 1. | error | pipeline |
 | V-072 | `globals.cluster.lease_safety_margin` | 0 ≤ margin ≤ 0.5. Outside 0.05–0.30 → also `warning`. Fraction of `lease_duration` held back as the renewal safety-deadline `guard` (Clustering doc §19.3/§19.6, D-8). | error / warning | config |
@@ -1033,8 +1127,8 @@ radius. `reload` locus marks a rule that can only fire on reload.
 
 | ID | Path / Scope | Rule | Severity | Locus |
 |---|---|---|---|---|
-| V-028 | `catalog.glue` | Requires `globals.cloud = aws`. | error | pipeline |
-| V-029 | `catalog.rest.auth = sigv4` | Requires `globals.cloud = aws`. | error | pipeline |
+| V-028 | `sink.iceberg.catalog.glue` | Requires `globals.cloud = aws`. | error | pipeline |
+| V-029 | `sink.iceberg.catalog.rest.auth = sigv4` | Requires `globals.cloud = aws`. | error | pipeline |
 | V-030 | `source.ssl_mode = allow` | Invalid for MySQL. | error | pipeline |
 | V-073 | `globals.cluster.lease_renewal_interval` | Must be ≤ `lease_duration / 3` (the holder must get ≥2 renew attempts inside the renewal safety deadline). **Hard error** — promoted from the previously-advisory guidance (Clustering doc §18.2/§19.6, D-8). | error | config |
 | V-033 | `tables.snapshots.overrides` keys | Must be full `schema.table`; globs forbidden. | error | pipeline |
@@ -1044,21 +1138,25 @@ radius. `reload` locus marks a rule that can only fire on reload.
 | V-037 | `sink.flush.seconds` | 0 < seconds < 5 (write amplification). | warning | pipeline |
 | V-038 | `tables.snapshots.parallelism` | > 4 (connection budget). | warning | pipeline |
 | V-064 | `tables.include`/`exclude` globs and `snapshots.overrides` keys, when `source.type = mysql` | Must be bare table names — no `.` namespace prefix (the database is fixed by `source.db`). | error | pipeline |
+| V-085 | `sink.iceberg.strategy` | Only meaningful with `write_mode: mirror`. | error | pipeline |
+| V-086 | `tables.partitioning` transforms | Each transform supported by the pipeline's sink (Delta v1: `identity` only). Active once `tables.partitioning` is promoted from §16. | error | pipeline |
+| V-087 | `tables.column_type_overrides` values | Logical type mappable by the pipeline's sink. | error | pipeline |
+| V-093 | `sink.delta.table_properties` keys | Only allow-listed `delta.*` keys; `delta.columnMapping.mode` / `delta.enableDeletionVectors` / `delta.appendOnly` are managed by the sink and forbidden here. | error | pipeline |
 | V-077 | `source.toast_strategy = re_query` with `tables.snapshots.mode = always` | `re_query` on high-volume snapshots may saturate the control connection pool. | warning | pipeline |
 
 ### 13.5 Catalog authentication (the 9 rules from `Catalog_Auth_Research.md`)
 
 | ID | Path / Scope | Rule | Severity | Locus |
 |---|---|---|---|---|
-| V-040 | `catalog.hive.auth = ldap` | Requires `user`+`password`, or `credentials_file` (exactly one — V-065). | error | pipeline |
-| V-041 | `catalog.hive.auth = kerberos` | Requires `kerberos.principal` + `kerberos.keytab`. | error | pipeline |
-| V-042 | `catalog.hive.auth = ldap` without `tls.enabled` | Password in cleartext. | warning | pipeline |
-| V-043 | `catalog.hive.tls.enabled = true` w/ private CA but no `tls.ca` | May fail cert validation against system store. | warning | pipeline |
-| V-044 | `catalog.rest.auth = bearer` | Requires `token` or `token_file` (exactly one — V-070). | error | pipeline |
-| V-045 | `catalog.rest.auth = oauth2` | Requires `token_url`, and either `oauth2.client_id`+`client_secret` or `oauth2.credentials_file` (exactly one — V-066). | error | pipeline |
-| V-046 | `catalog.rest.auth = sigv4` | Requires `sigv4.region` + `service`. | error | pipeline |
-| V-047 | `catalog.rest.auth = sigv4` | Requires `globals.cloud = aws`. (Same constraint as V-029.) | error | pipeline |
-| V-048 | `catalog.rest.auth = oauth2`, `token_url` = `<url>/v1/oauth/tokens` | Deprecated built-in endpoint (Iceberg ≥1.6, removed 2.0). | warning | pipeline |
+| V-040 | `sink.iceberg.catalog.hive.auth = ldap` | Requires `user`+`password`, or `credentials_file` (exactly one — V-065). | error | pipeline |
+| V-041 | `sink.iceberg.catalog.hive.auth = kerberos` | Requires `kerberos.principal` + `kerberos.keytab`. | error | pipeline |
+| V-042 | `sink.iceberg.catalog.hive.auth = ldap` without `tls.enabled` | Password in cleartext. | warning | pipeline |
+| V-043 | `sink.iceberg.catalog.hive.tls.enabled = true` w/ private CA but no `tls.ca` | May fail cert validation against system store. | warning | pipeline |
+| V-044 | `sink.iceberg.catalog.rest.auth = bearer` | Requires `token` or `token_file` (exactly one — V-070). | error | pipeline |
+| V-045 | `sink.iceberg.catalog.rest.auth = oauth2` | Requires `token_url`, and either `oauth2.client_id`+`client_secret` or `oauth2.credentials_file` (exactly one — V-066). | error | pipeline |
+| V-046 | `sink.iceberg.catalog.rest.auth = sigv4` | Requires `sigv4.region` + `service`. | error | pipeline |
+| V-047 | `sink.iceberg.catalog.rest.auth = sigv4` | Requires `globals.cloud = aws`. (Same constraint as V-029.) | error | pipeline |
+| V-048 | `sink.iceberg.catalog.rest.auth = oauth2`, `token_url` = `<url>/v1/oauth/tokens` | Deprecated built-in endpoint (Iceberg ≥1.6, removed 2.0). | warning | pipeline |
 
 ### 13.6 Management-API security
 
@@ -1100,10 +1198,10 @@ a runtime concern, §1.4).
 |---|---|---|---|---|
 | V-063 | any `${VAR}` | Unset with no `:-default`. | error | config |
 | V-067 | any `credentials_file` (incl. `oauth2.credentials_file`) | Resolved path exists and is readable; content is non-empty, valid JSON, and contains the required non-empty fields (`user`+`password`, or `client_id`+`client_secret`). | error | config / pipeline |
-| V-071 | `catalog.rest.token_file` | Resolved path exists and is readable; content (the raw token, trailing whitespace trimmed) is non-empty. | error | pipeline |
-| V-068 | TLS material (`cert`/`key`/`ca` across `globals.api`, `memberlist`, `source.ssl_*`, `catalog.*`) | Resolved value (inline / file / env) is non-empty and parses as valid PEM (and a private key where a key is expected). | error | config / pipeline |
-| V-069 | any other referenced file (e.g. `catalog.hive.kerberos.keytab`) | Resolved path exists, is readable, and is non-empty. | error | pipeline |
-| V-078 | `tables.column_type_overrides` values | Each value is a valid Iceberg type string; else error `"invalid Iceberg type <value> in column_type_overrides for <table>.<column>"`. | error | pipeline |
+| V-071 | `sink.iceberg.catalog.rest.token_file` | Resolved path exists and is readable; content (the raw token, trailing whitespace trimmed) is non-empty. | error | pipeline |
+| V-068 | TLS material (`cert`/`key`/`ca` across `globals.api`, `memberlist`, `source.ssl_*`, `sink.iceberg.catalog.*`) | Resolved value (inline / file / env) is non-empty and parses as valid PEM (and a private key where a key is expected). | error | config / pipeline |
+| V-069 | any other referenced file (e.g. `sink.iceberg.catalog.hive.kerberos.keytab`) | Resolved path exists, is readable, and is non-empty. | error | pipeline |
+| V-078 | `tables.column_type_overrides` values | Each value parses in the sink-neutral logical type grammar (§9.3); else error `"invalid logical type <value> in column_type_overrides for <table>.<column>"`. | error | pipeline |
 | V-079 | `tables.numeric_overflow_action = error` with any source `numeric` column lacking declared precision | Such a column may halt the table unexpectedly under `error`; consider a `column_type_overrides` entry. (Emitted at schema resolution.) | warning | pipeline |
 
 > **Reconciliation note (G-NEW-21).** An earlier Type_Mapping draft proposed a warning tying
@@ -1171,20 +1269,23 @@ defaults:
       heartbeat: 60s
   tables:
     snapshots: { mode: never, parallelism: 1 }
+  schema_evolution: { enabled: true, rescan_interval: 60m }
   sink:
-    strategy: mor
+    type: iceberg                              # REQUIRED somewhere (V-091); set once here
+    write_mode: mirror
     flush: { seconds: 60, rows: 100000, bytes: 512MiB }
-  catalog:
-    schema_evolution: { enabled: true, rescan_interval: 60m }
-    rest:
-      url: https://catalog.example.com
-      warehouse: analytics
-      auth: oauth2
-      oauth2:
-        client_id: ${CATALOG_CLIENT_ID}          # or: credentials_file: ${CATALOG_OAUTH_CREDS_FILE} (JSON {client_id, client_secret}) — V-066
-        client_secret: ${CATALOG_CLIENT_SECRET}
-        token_url: https://idp.example.com/realms/cdc/protocol/openid-connect/token
-        scope: catalog:read catalog:write
+    iceberg:
+      strategy: mor
+      catalog:
+        rest:
+          url: https://catalog.example.com
+          warehouse: analytics
+          auth: oauth2
+          oauth2:
+            client_id: ${CATALOG_CLIENT_ID}      # or: credentials_file: ${CATALOG_OAUTH_CREDS_FILE} (JSON {client_id, client_secret}) — V-066
+            client_secret: ${CATALOG_CLIENT_SECRET}
+            token_url: https://idp.example.com/realms/cdc/protocol/openid-connect/token
+            scope: catalog:read catalog:write
   state:
     prefix: pipeline-state
 
@@ -1224,13 +1325,14 @@ pipelines:
         replication_type: gtid
     tables:
       include: [ orders, payment_* ]           # MySQL: bare table names (db = source.db = events); a prefix would violate V-064
+    schema_evolution: { enabled: true }       # rescan_interval merges from defaults (60m)
     sink:
+      type: delta                              # drops the defaulted iceberg block (union rule §8.4)
       bucket: ${ACCOUNT_ID}-lake
-    catalog:                                    # overrides the defaulted rest catalog wholesale
-      glue:
-        name: "${ACCOUNT_ID}"
-        database: events
-      schema_evolution: { enabled: true }   # rescan_interval merges from defaults (60m)
+      delta:
+        checkpoint_interval: 10
+        log_retention: 30d
+        catalog: { type: none }                # path-based Delta tables (v1)
 ```
 
 ---
@@ -1281,7 +1383,7 @@ Every deviation, so nothing is silent:
     for presence and content validity (V-063, V-067–V-069, V-071). Runtime uses only the **resolved**
     config (secrets/PEM materialized in memory), and the reconcile diff is computed on resolved
     values so secret rotation via file content is detected without a process restart.
-18. **`schema_evolution` contract aligned to `Schema_Change_Detection_and_Evolution.md`** — §9.5.1
+18. **`schema_evolution` contract aligned to `Schema_Change_Detection_and_Evolution.md`** — §9.5.1 (now §9.7)
     reduces to two fields: `enabled` and `rescan_interval` (renamed from `interval`, default
     `60s` → `60m`, always applicable, `0` disables). The `method` field is **removed** (detection
     is the fixed four-channel model, not an operator choice), and validation rules **V-024**,
@@ -1290,6 +1392,14 @@ Every deviation, so nothing is silent:
     (SELECT on the source catalog, `binlog_format`/`binlog_row_image`/`binlog_row_metadata`,
     REPLICATION privileges, `REPLICA IDENTITY`) are documented as **operational start-time
     preconditions** (§11.2) — runtime checks handled per §1.4, **not** config-validation rules.
+
+19. **Multi-sink (2026-09-26)** — `sink.type` (**required, no default**) selects the target table
+    format (`iceberg` | `delta`); format blocks `sink.iceberg` / `sink.delta` (union rule §8.4);
+    `sink.strategy` → `sink.iceberg.strategy`; pipeline-level `catalog` → `sink.iceberg.catalog`
+    (all catalog rule paths relocated, semantics unchanged); `catalog.schema_evolution` →
+    pipeline-level `schema_evolution` (§9.7); `sink.write_mode` (`changelog` reserved);
+    `column_type_overrides` switched to a sink-neutral logical type grammar; new rules
+    **V-083…V-093**. Source: `research/Multi_Sink_Architecture_and_Delta_Lake.md`.
 
 None of these change the **decided** catalog-auth schema (hive Thrift `none/ldap/kerberos`;
 rest HTTP `none/bearer/oauth2/sigv4`) — those are reproduced verbatim from
@@ -1307,7 +1417,7 @@ These will become config fields once their design lands (gap IDs in parentheses)
 | `cluster.lease_duration`, `cluster.lease_renewal_interval`, `cluster.lease_safety_margin` | `globals.cluster` | G-8 (split-brain lease) — **design landed** in `Clustering_Architecture_Research.md` §5/§11/§19; concrete defaults `lease_duration=15s`, `lease_renewal_interval=5s`, `lease_safety_margin=0.15` (D-6/D-8). Validation rules V-072/V-073 already added (§13); these fields are reserved here pending promotion into the §6.5 `globals.cluster` table once the clustering design is ratified. |
 | `cluster.rebalance_stabilization`, `cluster.max_concurrent_handoffs`, `cluster.max_concurrent_takeovers`, `cluster.drain_timeout`, `cluster.discovery` (+ `cluster.discovery_dns_name`), `cluster.memberlist.lifeguard_enabled` | `globals.cluster` | G-9 (rebalancing / handoff) — **design landed** in `Clustering_Architecture_Research.md` §8/§10/§11/§20; concrete defaults `rebalance_stabilization=15s`, `max_concurrent_handoffs=2`, `max_concurrent_takeovers=4`, `drain_timeout=60s`, `discovery=static`, `lifeguard_enabled=true` (D-4/D-10/D-11). Validation rule V-074 added (§13); reserved here pending promotion into the §6.5 `globals.cluster` table once the clustering design is ratified. |
 | `tables.primary_key`, `tables.surrogate_key` | `tables` | G-13, G-30 (ghost-row dedup / PK-less tables) |
-| `sink.partitioning` | `sink` | G-24 (Iceberg partitioning) |
+| `tables.partitioning` (sink-neutral transforms; validated per sink by V-086 — Delta v1: `identity` only) | `tables` | G-24 (partitioning) |
 | `sink.max_transaction_batch_rows` | `sink` | G-29 (large-txn vs atomic-flush tension) |
 | `source.postgres.max_wal_lag_bytes` | `source.postgres` | G-22 (abandoned-slot WAL guard) |
 | `source.mysql.binlog_purge_action` | `source.mysql` | G-26 (purged-position handling) |
@@ -1315,7 +1425,7 @@ These will become config fields once their design lands (gap IDs in parentheses)
 | `sink.buffer_capacity_rows` | `sink` | G-27 (bounded back-pressure channel) |
 | `globals.tracing.otlp_endpoint` | `globals` | G-32 (distributed tracing) |
 | `globals.api` RBAC role→permission matrix | `globals.api` | G-16 (RBAC) |
-| `glue.strip_schema` collision transform | `catalog.glue` | §11.3 of gap report |
+| `glue.strip_schema` collision transform | `sink.iceberg.catalog.glue` | §11.3 of gap report |
 
 ---
 
@@ -1324,7 +1434,9 @@ These will become config fields once their design lands (gap IDs in parentheses)
 - `System-Overview.md` — high-level requirements and snapshot-mode semantics.
 - `Data-Flow.md` — pipeline stages, state layout under `pipelines/<id>/`, offset acknowledgment.
 - `Catalog_Auth_Research.md` — source of the catalog auth schema and the 9 catalog rules.
+- `research/Multi_Sink_Architecture_and_Delta_Lake.md` — sink abstraction, `sink.type`, Delta Lake
+  block, V-083…V-093.
 - `Schema_Change_Detection_and_Evolution.md` — authority for the four-channel detection model,
   DDL safe/unsafe classification, and the source-side preconditions (§11.2); owns the
-  `catalog.schema_evolution` semantics that §9.5.1 configures.
+  `schema_evolution` semantics that §9.7 configures.
 - `CDC_Gap_Analysis_Report.md` — gap IDs referenced throughout (G-1f is closed by §13).

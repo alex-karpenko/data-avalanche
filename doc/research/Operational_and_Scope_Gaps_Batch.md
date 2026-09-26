@@ -117,7 +117,7 @@ These are mechanical edits to Oleksii-owned spec docs; staged here as ready-to-a
   append-only value additions Ignorable, reorder/remove Unsafe.
 - **DT-R6 (`binlog_row_metadata`):** confirmed **recommended (warn if absent)**, names fall back to
   channel C — already in config §13.
-- **DT-R7 (`rescan_interval` default):** confirmed **60m**, `0` disables — already in config §9.5.1.
+- **DT-R7 (`rescan_interval` default):** confirmed **60m**, `0` disables — already in config §9.7 (formerly §9.5.1).
 
 These residuals had recommendations already; this batch ratifies them — none reopen a gap.
 

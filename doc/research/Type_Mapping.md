@@ -1,12 +1,12 @@
 ---
-updated: 2026-06-20
+updated: 2026-09-26
 domain: Data Types
-tags: [data-types, mapping, arrow, iceberg, postgres, mysql, cdc]
+tags: [data-types, mapping, arrow, iceberg, delta-lake, multi-sink, postgres, mysql, cdc]
 resolves: G-18
 sources: []
 ---
 
-# Data Type Mapping: Sources → ColumnValue → Arrow → Iceberg
+# Data Type Mapping: Sources → ColumnValue → Arrow → Sink (Iceberg | Delta)
 
 ## Overview
 
@@ -17,10 +17,10 @@ each hop correctly.
 ```
 PostgreSQL wire (OID + binary)    ─┐
                                    ├─► [Decode] ──► ColumnValue ──► [Accumulate] ──► Arrow DataType ──► [Sink] ──► Iceberg Type
-MySQL binlog (column type code)   ─┘
+MySQL binlog (column type code)   ─┘                                   + logical tag             └──► Delta Type
                                         Phase 2          Phase 3                        Phase 4
-                                     source-specific   source-agnostic             iceberg-rust handles
-                                     per-crate          Rust code                  most of this
+                                     source-specific   source-agnostic             per-sink (sink.type):
+                                     per-crate          Rust code                  iceberg-rust / delta-rs
 ```
 
 **Hop 1 (Decode):** `pgwire-replication` / `mysql-binlog-connector-rust` decode the wire
@@ -31,9 +31,12 @@ binary into `ColumnValue` variants. All source-specific type knowledge lives her
 for each column — derived from the `ColumnValue` variant plus column metadata loaded during
 schema resolution.
 
-**Hop 3 (Sink):** `iceberg-rust` translates an Arrow `Schema` into an Iceberg `Schema` when
-creating or evolving a table. The crate handles most standard Arrow types automatically;
-non-standard variants (e.g. `FixedSizeBinary(16)` intended as UUID) need explicit annotation.
+**Hop 3 (Sink):** the pipeline's sink (`sink.type`) translates the canonical Arrow `Schema` into
+its table format's schema when creating or evolving a table — **3a** Iceberg via `iceberg-rust`,
+**3b** Delta Lake via `delta-rs`. Where Arrow alone is ambiguous, the accumulator attaches a
+**logical type tag** in field metadata (`avalanche.logical`, see "Logical type tags" below); the
+accumulator never knows the target format, and any value conversion a format needs (e.g. uuid →
+string for Delta) happens inside that sink. See `Multi_Sink_Architecture_and_Delta_Lake.md` §6.5.
 
 ---
 
@@ -304,7 +307,21 @@ operators know which columns require attention.
 
 ---
 
-## Hop 3 Annotation: Arrow → Iceberg Type Mapping (via iceberg-rust)
+## Logical type tags (sink-neutral, Hop 2 → Hop 3 boundary)
+
+The accumulator's Arrow field carries `avalanche.logical = <tag>` in field metadata whenever the
+Arrow type does not determine the intended type on its own. The same vocabulary is the grammar of
+`tables.column_type_overrides` (config §9.3, V-078/V-087):
+
+`bool` · `int16` · `int32` · `int64` · `float32` · `float64` · `decimal(P,S)` · `string` · `binary` ·
+`date` · `time` · `timestamp_tz` · `timestamp_ntz` · `uuid` · `json` · `list<T>`
+
+Tags actually attached by Hop 2: `uuid` (FixedSizeBinary(16)), `time`, `json` (Utf8), `timestamp_tz` /
+`timestamp_ntz` (explicit, because Iceberg `timestamp` = *without* tz while Delta `timestamp` = *with*
+tz), `uint64` provenance on `Decimal128(20,0)` (informational), `enum` / `set` provenance on Utf8 /
+List<Utf8> (informational).
+
+## Hop 3a: Arrow → Iceberg Type Mapping (via iceberg-rust)
 
 `iceberg-rust` handles Arrow → Iceberg type conversion automatically for standard types.
 Non-obvious mappings that need explicit annotation in the `SchemaBuilder`:
@@ -336,6 +353,35 @@ field-level hint mechanism (`{"iceberg.type":"uuid"}` / `IcebergType::Uuid`) exi
 iceberg-rust version (fold into the `prototypes/iceberg-capability/` probe). **If the annotation is
 unavailable**, fall back to `fixed(16)` (raw bytes, data intact, only the `uuid` logical type lost) or
 canonical `string` (text uuid) — both lossless of data; the impact is cosmetic.
+
+## Hop 3b: Arrow → Delta Lake Type Mapping (via delta-rs 1.0)
+
+Delta's type system has no `uuid`, `time`, `fixed(n)` or unsigned integers; the Delta sink converts
+those columns inside its own Hop 3 (the accumulator is unchanged).
+
+| Arrow DataType (+ tag) | Delta type | Conversion in the sink? |
+|---------------|-------------|---------------------|
+| `Boolean` | `boolean` | No |
+| `Int8` | `byte` | No |
+| `Int16` | `short` | No |
+| `Int32` | `integer` | No |
+| `Int64` | `long` | No |
+| `Float32` / `Float64` | `float` / `double` | No |
+| `Decimal128(P, S)`, P ≤ 38 (incl. `uint64` → `decimal(20,0)`) | `decimal(P, S)` | No |
+| `Utf8` (incl. `json`, `enum`, overflowed `numeric`) | `string` | No (Variant for `json` is a later option) |
+| `Binary` | `binary` | No |
+| `Date32` | `date` | No |
+| `Time64(Microsecond)` (`time`) | `string` `HH:MM:SS.ffffff` | **Yes** — D-MS.8; override to `int64` for µs-since-midnight |
+| `Timestamp(Microsecond, Some("UTC"))` (`timestamp_tz`) | `timestamp` | No |
+| `Timestamp(Microsecond, None)` (`timestamp_ntz`) | `timestamp_ntz` (table feature `timestampNtz`) | No |
+| `FixedSizeBinary(16)` (`uuid`) | `string` (canonical 36-char, lowercase) | **Yes** |
+| `FixedSizeBinary(n)`, n ≠ 16 | `binary` | **Yes** (cast) |
+| `List<T>` (incl. `set` → `list<string>`) | `array<T>` | No |
+| `Struct(fields)` | `struct<…>` | No |
+| unsigned Arrow types | — | Never reach Hop 3 (pre-converted in Hop 2, same as 3a) |
+
+Probe P10 (`prototypes/delta-capability/`, pending) round-trips these through delta-rs and an
+external reader (Spark/DuckDB).
 
 ---
 
@@ -407,13 +453,14 @@ defaults:
                                    # re_query: issue a SELECT to fetch current value (adds latency).
 
   tables:
-    column_type_overrides: {}  # optional. map of column name → target Iceberg type string.
-                               # e.g.:  public.orders.amount: "decimal(38, 10)"
+    column_type_overrides: {}  # optional. map of column name → sink-neutral logical type
+                               # (grammar: see "Logical type tags"; never a format-specific name).
+                               # e.g.:  public.orders.amount: "decimal(38,10)"
                                # e.g.:  public.orders.payload: "binary"
                                # overrides apply at schema resolution time.
     numeric_overflow_action: string  # optional, string (default) | error.
                                      # action when numeric(P,S) with P > 38 is encountered.
-                                     # 'string': store as Iceberg string with a WARN log.
+                                     # 'string': store as logical string with a WARN log.
                                      # 'error': halt the table.
 ```
 
@@ -423,7 +470,7 @@ defaults:
 
 | Constraint | Severity | Message |
 |-----------|----------|---------|
-| `column_type_overrides` value is not a valid Iceberg type string | error | "invalid Iceberg type `<value>` in column_type_overrides for `<table>.<column>`" |
+| `column_type_overrides` value is not a valid logical type (merged as V-078; per-sink mappability V-087) | error | "invalid logical type `<value>` in column_type_overrides for `<table>.<column>`" |
 | `source.mysql.tinyint1_detection: information_schema` with `schema_evolution.method: events` | warning | "tinyint1_as_bool requires information_schema queries; schema_evolution.method:events cannot detect display width changes — set method:query" |
 | `toast_strategy: re_query` with `snapshot_mode: always` | warning | "re_query TOAST strategy on high-volume snapshots may saturate the control connection pool" |
 | `numeric_overflow_action: error` and any source table has unscaled `numeric` columns | warning (emitted at schema resolution) | "numeric column `<col>` has no precision declared; overflow action is 'error' which may halt the table unexpectedly — consider explicit column_type_override" |
