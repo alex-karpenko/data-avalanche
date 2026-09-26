@@ -7,6 +7,11 @@ pub const MAX_DECIMAL_PRECISION: u8 = 38;
 
 /// A fixed-point decimal: `unscaled × 10^-scale`, up to 38 significant digits (D-IMPL-1).
 /// `rust_decimal` holds only 28–29 digits, too few for `decimal(38, S)`.
+///
+/// `Eq`/`Hash` compare the representation (`unscaled`, `scale`), not the mathematical value:
+/// `1.0 != 1.00` because their `scale`s differ, even though both denote the same number.
+/// Callers that key or compare by value (e.g. collapse-by-key, map lookups) must first
+/// [`rescale`](Decimal::rescale) both sides to the column's declared scale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Decimal {
     unscaled: i128,

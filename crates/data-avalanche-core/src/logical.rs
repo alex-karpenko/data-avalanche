@@ -5,8 +5,12 @@ use thiserror::Error;
 
 use crate::MAX_DECIMAL_PRECISION;
 
-/// Sink-neutral logical type — the grammar of `tables.column_type_overrides` (config §9.3) and of the
-/// `data-avalanche.logical` Arrow field tag (`Type_Mapping.md`).
+/// Sink-neutral logical type — the grammar of `tables.column_type_overrides` (config §9.3).
+///
+/// This is *not* the grammar of the `data-avalanche.logical` Arrow field tag
+/// (`Type_Mapping.md`): that tag carries additional provenance-only values (e.g. `uint64`,
+/// `enum`, `set`) that have no `LogicalType` variant and must not be parsed with
+/// [`LogicalType::from_str`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LogicalType {
     Bool,

@@ -53,7 +53,9 @@ impl MariaGtidState {
         })
     }
 
-    /// Per domain, the later of the two GTIDs.
+    /// Per domain, the later of the two GTIDs (by `seq`). When both sides hold the same `seq`
+    /// for a domain, `self`'s GTID (and so its `server_id`) is kept — `union` is commutative only
+    /// up to `server_id` on ties; the `seq` result is unaffected.
     pub fn union(&self, other: &MariaGtidState) -> MariaGtidState {
         let mut out = self.clone();
         for (&domain, &(server_id, seq)) in &other.by_domain {
@@ -227,6 +229,11 @@ mod tests {
         fn intersect_is_covered_by_both(a in arb_state(), b in arb_state()) {
             let i = a.intersect(&b);
             prop_assert!(a.covers(&i) && b.covers(&i));
+        }
+
+        #[test]
+        fn covers_iff_union_is_identity(a in arb_state(), b in arb_state()) {
+            prop_assert_eq!(a.covers(&b), a.union(&b) == a);
         }
     }
 }

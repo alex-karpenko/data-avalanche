@@ -109,16 +109,26 @@ impl CdcEvent {
     /// Checks the image shape per op: Insert/Snapshot = after only; Update = after (+ optional before);
     /// Delete = before only.
     pub fn validate(&self) -> Result<(), EventShapeError> {
-        let (op, table) = (self.op, self.table.clone());
+        let op = self.op;
         match (self.op, self.before.is_some(), self.after.is_some()) {
-            (Op::Insert | Op::Snapshot, true, _) => {
-                Err(EventShapeError::UnexpectedBefore { op, table })
-            }
+            (Op::Insert | Op::Snapshot, true, _) => Err(EventShapeError::UnexpectedBefore {
+                op,
+                table: self.table.clone(),
+            }),
             (Op::Insert | Op::Snapshot | Op::Update, _, false) => {
-                Err(EventShapeError::MissingAfter { op, table })
+                Err(EventShapeError::MissingAfter {
+                    op,
+                    table: self.table.clone(),
+                })
             }
-            (Op::Delete, false, _) => Err(EventShapeError::MissingBefore { op, table }),
-            (Op::Delete, true, true) => Err(EventShapeError::UnexpectedAfter { op, table }),
+            (Op::Delete, false, _) => Err(EventShapeError::MissingBefore {
+                op,
+                table: self.table.clone(),
+            }),
+            (Op::Delete, true, true) => Err(EventShapeError::UnexpectedAfter {
+                op,
+                table: self.table.clone(),
+            }),
             _ => Ok(()),
         }
     }
