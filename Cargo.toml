@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+exclude = ["prototypes"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[workspace.dependencies]
+data-avalanche-core = { path = "crates/data-avalanche-core" }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+proptest = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+object_store = { version = "0.13", features = ["aws", "gcp", "azure"] }
+tokio-postgres = "0.7"
+mysql_async = { version = "=0.37.1", default-features = false, features = ["default-rustls", "binlog"] }
+rustls = { version = "0.23", features = ["aws_lc_rs"] }
