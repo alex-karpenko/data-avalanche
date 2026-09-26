@@ -7,3 +7,7 @@ pub use lsn::{Lsn, LsnParseError};
 pub mod gtid;
 
 pub use gtid::{GtidParseError, GtidSet, GtidSource};
+
+pub mod mariadb;
+
+pub use mariadb::{MariaGtid, MariaGtidParseError, MariaGtidState};
