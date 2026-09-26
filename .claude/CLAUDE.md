@@ -50,7 +50,8 @@ data-avalanche/
 │   │   ├── Large_Transaction_Handling.md
 │   │   ├── Observability_Metrics_and_Tracing.md
 │   │   ├── API_RBAC_and_Versioning.md
-│   │   └── Operational_and_Scope_Gaps_Batch.md
+│   │   ├── Operational_and_Scope_Gaps_Batch.md
+│   │   └── V1_Scope_Decisions.md               v1 decision register D-V1.1–6 + confirmed deferrals
 │   ├── analysis/
 │   │   ├── CDC_Design_Gap_Analysis_v1.md          **current** living gap tracker (DA-* IDs)
 │   │   └── CDC_Gap_Analysis_Report.md             legacy tracker (v13.13, G-* IDs) — frozen audit trail
@@ -129,7 +130,7 @@ sources: [source name, ...]     # from Sources_Index_v3.md (omit if none)
   `DA-MS-<n>`.
 - **Legacy (in parentheses for reconciliation):** `G-1…G-40`, `G-NEW-1…G-NEW-22`, `OQ-*`.
 - **Design decisions** live in research docs: `D-<n>` / `D-<gap>.<n>` (e.g. `D-13.1`), multi-sink
-  `D-MS.<n>`, revisions `R-<n>`.
+  `D-MS.<n>`, v1 scope `D-V1.<n>`, revisions `R-<n>`.
 - Probe IDs: lease `T1–T10`, iceberg `G1–G5` (+ `G2b`, `G2c`), delta `P1–P10`, source `S-PG0–8` / `S-MY0–9`.
 
 When closing a gap, mark it ✅ and add a one-line rationale pointing at the doc/section (or probe)
@@ -143,7 +144,7 @@ checkbox, release note) is never proof: verify against the compiled crate or a r
 ### Sources
 - **PostgreSQL:** logical replication via `pgoutput`, WAL/LSN, replication slots, publications
 - **MySQL:** binlog / GTID-set, row-based replication (`binlog_row_image = FULL`); MariaDB via the
-  MySQL path (GTID dialect proven feasible, S-MY9; v1 scope to confirm)
+  MySQL path — **in v1** (D-V1.5; GTID dialect proven, S-MY9)
 - **Client crates (proven 2026-09-26, `prototypes/source-capability/`):** PG `pgwire-replication =0.4.1`
   is transport-only — **the pgoutput decoder is ours**; MySQL/MariaDB `mysql_async =0.37.1` binlog stream
   (+ own MariaDB `GTID_EVENT` decode, + payload guard DA-SRC-12). Install one rustls `CryptoProvider`
