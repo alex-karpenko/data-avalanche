@@ -35,6 +35,9 @@ probe = [
     "dep:anyhow",
     "dep:async-trait",
 ]
+# Real-service probe G2c: the pinned-base commit against AWS Glue (needs AWS credentials + env,
+# see README "G2c"). Implies `probe`.
+glue = ["probe", "dep:iceberg-catalog-glue"]
 
 [dependencies.anyhow]
 version = "1"
@@ -62,4 +65,8 @@ optional = true
 
 [dependencies.futures]
 version = "0.3"
+optional = true
+
+[dependencies.iceberg-catalog-glue]
+version = "=0.10.1" # same release train as iceberg 0.10.1 (update_table: Glue UpdateTable + VersionId)
 optional = true

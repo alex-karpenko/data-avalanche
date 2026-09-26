@@ -429,6 +429,10 @@ attempt one stale Iceberg commit before noticing. We close this with **defense i
    `fast_append`'s `assert-ref-snapshot-id(main)` requirement then turns the commit into a real
    compare-and-swap, a conflict is surfaced as non-retryable, and the **sink** owns the retry loop
    (reload → re-check fence → re-pin → recommit). Public API only; no fork.
+   **Real catalog (probe G2c, AWS Glue + S3):** proven under concurrency — 8 pinned writers per round,
+   exactly one wins; every loser is stopped by Glue's `VersionId` optimistic lock (iceberg-catalog-glue
+   checks the requirements client-side, then `UpdateTable` with the loaded `VersionId`). HMS cannot
+   commit at all in iceberg-rust (DA-CAT-6); REST lacks SigV4 (DA-CAT-7).
 3. **`owner_epoch` as a sink-side fencing token (D-7 — resolved: assert it).** The monotonic
    `owner_epoch` is **embedded in the Iceberg snapshot summary** (`cdc.owner_epoch`), and the commit
    path — inside the existing catalog-conflict reload-retry loop (Data-Flow.md) — **rejects a commit

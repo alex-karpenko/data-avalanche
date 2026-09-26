@@ -34,6 +34,7 @@ the ongoing rechecks in **§24.2.2–§24.2.4**.
 | G1 | DA-SINK-1 | 🔴 **Unsupported** | equality-delete *writer* exists; **no commit path** for delete files. Blocks the sink. |
 | G2 | DA-SINK-2 | 🟢 **flash-verified (append path)** | `tests/probe_append_and_summary.rs` commits `cdc.*` snapshot-summary properties atomically with data, reads them back from the catalog after reload, and re-asserts a monotonic fence value across two commits. Full gate re-check when a delete-commit path exists. |
 | G2b | DA-X-10 / DA-X-11 | 🟢 **verified** + ⚠️ finding | `tests/probe_epoch_property.rs` (2026-09-26): `cdc.owner_epoch` table property + append = one metadata commit; property survives foreign commits and expiry. **Finding:** `Transaction::commit` rebases a stale zombie — see below. |
+| G2c | DA-X-11 (real catalog) | 🟢 **verified on AWS Glue + S3** | `tests/probe_glue_cas.rs` (2026-09-26): pinned commit is a CAS under 8-way concurrency; all losers stopped by Glue `VersionId`. |
 | G3 | DA-SCHEMA-8 | 🟡 Partial | `update_schema` exists; drop/rename/promotion extent still unverified. |
 | G4 | DA-TYPE-5 | 🟡 Likely OK | uuid is a schema-definition concern, independent of the commit path (not yet exercised here). |
 | G5 | DA-SINK-10 | 🟡 Partial | `expire_snapshots` landed; rewrite/compaction still absent (external maintenance for v1). |
@@ -77,6 +78,41 @@ under its lock) — a real-catalog check, same class as delta P8.
 ```bash
 cargo test --features probe --test probe_epoch_property -- --nocapture
 ```
+
+## G2c — the pinned commit on a real catalog (AWS Glue + S3), 2026-09-26
+
+`iceberg-catalog-glue` 0.10.1 `update_table`: load the table **with its Glue `VersionId`** → check the
+commit requirements client-side → write the new `metadata.json` → Glue `UpdateTable(VersionId)`.
+Writers that load the same version all pass the client check, so atomicity rests on Glue's
+`VersionId`. Verified two ways:
+
+1. **AWS CLI, deterministic:** `UpdateTable` with the current `VersionId` succeeds (0 → 1); a second
+   `UpdateTable` with the stale `VersionId` 0 fails `ConcurrentModificationException`, table unchanged.
+   Without `--version-id` the update is unconditional (the crate always sends it when Glue returns one).
+2. **Probe, through iceberg-rust** (`tests/probe_glue_cas.rs`, 6 rounds × 8 concurrent pinned writers):
+
+| Check | Result |
+|---|---|
+| winners per round | exactly **1** (6/6 rounds, ~2 s per round) |
+| losers | **42/42 stopped by Glue `VersionId`** (`ConcurrentModificationException` → `CatalogCommitConflicts`); 0 by the client-side check |
+| state after each round | one new snapshot, parent = the pinned base; property **and** summary = the winner's epoch |
+| zombie pinned to a stale base | rejected (`assert-ref-snapshot-id(main)`), nothing applied |
+| same zombie via plain `Transaction::commit` | ⚠️ rebased and landed on Glue too — property regressed 603 → 1 (G2b-3 reproduced) |
+| orphans | 42 `metadata.json` + 86 manifests from losing attempts (not deleted by iceberg-rust) → `remove_orphan_files` |
+
+Other catalogs (source-read, 0.10.1): **HMS `update_table` is `FeatureUnsupported`** (also on `main`)
+— DA-CAT-6; **REST has no SigV4** (open PRs #3082/#3092) — DA-CAT-7; S3 Tables uses the same
+optimistic pattern with `versionToken` (not run).
+
+```bash
+eval "$(aws configure export-credentials --profile <profile> --format env)"
+AWS_REGION=us-east-1 GLUE_PROBE_DB=avalanche_probe \
+GLUE_PROBE_WAREHOUSE=s3://<bucket>/iceberg-probe \
+cargo test --features glue --test probe_glue_cas -- --nocapture
+# then: delete the Glue tables + database, `aws s3 rm --recursive` the warehouse prefix
+```
+
+Run 2026-09-26 on account `418759522081` (profile `kav`), us-east-1; resources deleted afterwards.
 
 ## Upstream status (2026-09-19)
 
