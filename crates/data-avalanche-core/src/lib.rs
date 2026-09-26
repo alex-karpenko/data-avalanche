@@ -2,6 +2,7 @@
 
 pub mod decimal;
 pub mod logical;
+pub mod position;
 pub mod table;
 pub mod value;
 
