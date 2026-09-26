@@ -143,7 +143,11 @@ checkbox, release note) is never proof: verify against the compiled crate or a r
 ### Sources
 - **PostgreSQL:** logical replication via `pgoutput`, WAL/LSN, replication slots, publications
 - **MySQL:** binlog / GTID-set, row-based replication (`binlog_row_image = FULL`); MariaDB via the
-  MySQL path (GTID dialect is an open item)
+  MySQL path (GTID dialect proven feasible, S-MY9; v1 scope to confirm)
+- **Client crates (proven 2026-09-26, `prototypes/source-capability/`):** PG `pgwire-replication =0.4.1`
+  is transport-only — **the pgoutput decoder is ours**; MySQL/MariaDB `mysql_async =0.37.1` binlog stream
+  (+ own MariaDB `GTID_EVENT` decode, + payload guard DA-SRC-12). Install one rustls `CryptoProvider`
+  at process start (two providers are linked — DA-DEP-5).
 
 ### In-memory format and the sink boundary
 - **Apache Arrow** `RecordBatch` — columnar; a **single arrow major** workspace-wide (arrow 59:
