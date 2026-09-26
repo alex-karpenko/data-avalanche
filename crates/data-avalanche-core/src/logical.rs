@@ -3,6 +3,8 @@ use std::str::FromStr;
 
 use thiserror::Error;
 
+use crate::MAX_DECIMAL_PRECISION;
+
 /// Sink-neutral logical type — the grammar of `tables.column_type_overrides` (config §9.3) and of the
 /// `data-avalanche.logical` Arrow field tag (`Type_Mapping.md`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -79,8 +81,10 @@ fn parse_type(s: &str) -> Result<LogicalType, String> {
             .trim()
             .parse()
             .map_err(|_| format!("bad scale {:?}", sc.trim()))?;
-        if !(1..=38).contains(&precision) {
-            return Err(format!("precision {precision} is outside 1..=38"));
+        if !(1..=MAX_DECIMAL_PRECISION).contains(&precision) {
+            return Err(format!(
+                "precision {precision} is outside 1..={MAX_DECIMAL_PRECISION}"
+            ));
         }
         if scale < 0 || scale.unsigned_abs() > precision {
             return Err(format!("scale {scale} is outside 0..={precision}"));
