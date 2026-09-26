@@ -1,0 +1,60 @@
+[package]
+name = "delta-capability"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Capability probe: proves the delta-rs behaviors the Delta sink design depends on (DA-MS-1..4; research Multi_Sink_Architecture_and_Delta_Lake.md §10)"
+
+# deltalake 1.0.0 (2026-09-21), MSRV 1.94.1; arrow 59, object_store 0.13, DataFusion 55.
+# MERGE / DELETE / OPTIMIZE need the `datafusion` feature.
+#
+# Like iceberg-capability, the delta-dependent probe code is gated behind the
+# `probe` feature and is OFF by default, so a plain `cargo test` stays fast and green.
+# Probes run against a local `file://` table in a temp dir (no cloud needed);
+# P8 (real S3/GCS/Azure commit atomicity) is not covered here.
+#
+#   cargo test -p delta-capability --features probe -- --nocapture --test-threads=1
+
+[dependencies]
+
+[features]
+probe = [
+    "dep:deltalake",
+    "dep:tokio",
+    "dep:tempfile",
+    "dep:futures",
+    "dep:anyhow",
+    "dep:url",
+    "dep:serde_json",
+]
+
+[dependencies.deltalake]
+version = "=1.0.0"
+default-features = false
+features = ["datafusion", "rustls"]
+optional = true
+
+[dependencies.tokio]
+version = "1"
+features = ["macros", "rt-multi-thread"]
+optional = true
+
+[dependencies.tempfile]
+version = "3"
+optional = true
+
+[dependencies.futures]
+version = "0.3"
+optional = true
+
+[dependencies.anyhow]
+version = "1"
+optional = true
+
+[dependencies.url]
+version = "2"
+optional = true
+
+[dependencies.serde_json]
+version = "1"
+optional = true
