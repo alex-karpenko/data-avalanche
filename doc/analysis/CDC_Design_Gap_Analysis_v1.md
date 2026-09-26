@@ -117,6 +117,8 @@ does not block starting the specification.
 > design; all Delta gates are proven on S3, GCS and Azure, and the **source-side crates are proven**
 > too (DA-SRC-10/11, same day). The v1 open set: four v1 decisions + MariaDB scope confirmation, the
 > DA-SRC-12 payload guard, and the spec debt. See §22 (re-assessment) and §26.
+> **Later the same day, all v1 decisions were signed off** (`V1_Scope_Decisions.md`, D-V1.1–D-V1.6 + the
+> five deferrals, §26.5). **What remains before the v1 plan is spec debt only.**
 
 ### Counts (by status)
 
@@ -125,11 +127,11 @@ does not block starting the specification.
 | Status | Count (v1 scope) | Notes |
 |---|---|---|
 | ✅ Resolved | the large majority | Design closed by a research/spec doc or a probe. |
-| 🔄 Partial | 4 | DA-FLOW-6, DA-SNAP-7, DA-SRC-9, DA-X-8 (config residual); DA-MS-3 is a decided caveat. |
-| 🟥 Open (v1) | 5 + deferral confirmations | Decisions DA-SYS-4, DA-SYS-7, DA-OBS-5, DA-FLOW-6 (§20) + DA-SRC-12 (payload guard). DA-SRC-8 → 🔄 (feasible; confirm scope). |
+| 🔄 Partial | 3 | DA-SNAP-7, DA-SRC-9, DA-X-8 (config residual); DA-MS-3 is a decided caveat. |
+| 🟥 Open (v1) | **0** | All decided 2026-09-26 (§26.5, `V1_Scope_Decisions.md`); deferrals confirmed. |
 | 🧪 Verify (v1) | **0** | DA-SRC-10/11 proven 2026-09-26 (§21). |
 | ⏭ v2 | 13 | Iceberg-sink items (§26.2). |
-| 🟢 Spec-merge debt | 6 + 1 | §19.3 System-Overview S-1…S-6 (unapplied) + DA-X-8 config residual. Config (§19.1) and Data-Flow (§19.2) are applied. |
+| 🟢 Spec-merge debt | 6 + 1 + 5 | §19.3 System-Overview S-1…S-6 (unapplied) + DA-X-8 config residual + the five D-V1 patches (`V1_Scope_Decisions.md` §3) and the two Data-Flow Phase 2a probe details. Config (§19.1) and Data-Flow (§19.2) are applied. |
 
 ---
 
@@ -146,10 +148,10 @@ research corpus.
 | DA-SYS-1 | Two-plane architecture (AP coordination ring + CP lease) | 🔴→✅ | ✅ | `Clustering_Architecture_Research.md` §1 — ring decides *should-own*, lease decides *may-run*. | OQ-CL1 |
 | DA-SYS-2 | Single-node = one-member cluster, same code path | 🟡 | ✅ | Clustering §10; lease stays on to guard rolling-deploy double-singleton. | OQ-CL4 |
 | DA-SYS-3 | "App never deletes Iceberg artifacts" vs maintenance/orphan cleanup ownership | 🟢 | ✅ | `Iceberg_Maintenance.md` — v1 maintenance is external (operator/Spark/Trino); app exposes signals + reserves `sink.maintenance`. | OQ-M2, G-25 |
-| DA-SYS-4 | Reserved metadata column collision (`_op/_ts/_lsn/_source_db/_pipeline` vs a source column of the same name) | 🟡 | 🟥 | Config spec §5 only says operators "should be aware." **No defined runtime behavior** if a source table actually has an `_op` column — rename? prefix-escape? halt? Needs a rule. See DA-FLOW-5. | — |
+| DA-SYS-4 | Reserved metadata column collision (`_op/_ts/_lsn/_source_db/_pipeline` vs a source column of the same name) | 🟡 | ✅ | Config spec §5 only says operators "should be aware." **No defined runtime behavior** if a source table actually has an `_op` column — rename? prefix-escape? halt? Needs a rule. See DA-FLOW-5. **✅ 2026-09-26 — D-V1.1 (`V1_Scope_Decisions.md`):** halt the table with `RESERVED_COLUMN_COLLISION` (case-insensitive; checked at resolution + evolution); no escaping. | — |
 | DA-SYS-5 | Lineage column `_seq` (per-change order) is required by dedup but absent from the documented lineage column set | 🟡 | ✅ | `Ghost_Row_Dedup_and_Primary_Keys.md` §4 introduces `_seq`; `Data-Flow.md`'s lineage table lists only five `_`-columns and `CdcEvent` carries only commit `source_pos`. The per-change position must be added to both. See DA-FLOW-2. **2026-09-26 tidy:** `Data-Flow.md` lineage table lists `_seq`; `CdcEvent.change_seq` feeds the Phase-3 keep-last collapse. | — |
 | DA-SYS-6 | `snapshot_mode: only` referenced but not in the enum | 🟢 | ✅(moot) | The enum is `never\|initial\|always\|dump_always\|dump_initial` (config §9.3). The stray "only" in System-Overview's OQ-M2 is superseded by `dump_*`. Drop the dangling reference. | OQ-M2 |
-| DA-SYS-7 | **v1 scope: the Iceberg sink is deferred to v2** — record it in `System-Overview.md`, and decide how v1 treats `sink.type: iceberg` | 🟢 | 🆕 🟥 | Today the config accepts `iceberg` and the pipeline is refused at start by the capability assertion (DA-SINK-1i). Options: (a) keep that — the enum stays stable across v1→v2; (b) validation error "not available in v1". Recommendation: (a) with an explicit start-refusal message naming v2. | — |
+| DA-SYS-7 | **v1 scope: the Iceberg sink is deferred to v2** — record it in `System-Overview.md`, and decide how v1 treats `sink.type: iceberg` | 🟢 | ✅ | Today the config accepts `iceberg` and the pipeline is refused at start by the capability assertion (DA-SINK-1i). Options: (a) keep that — the enum stays stable across v1→v2; (b) validation error "not available in v1". Recommendation: (a) with an explicit start-refusal message naming v2. **✅ 2026-09-26 — D-V1.4 (`V1_Scope_Decisions.md`):** option (a) — enum kept, refused at start naming v2. Scope statement → spec debt. | — |
 
 ---
 
@@ -167,7 +169,7 @@ in keeping the table synchronized with research outputs.
 | DA-CFG-1 | Config data model fully specified | 🔴→✅ | ✅ | The whole `Configuration_Specification.md`. | OQ-C2, G-1f |
 | DA-CFG-2 | Env-var substitution grammar (`${VAR}`, `:-default`, `$$` escape, coercion order) | 🟡 | ✅ | Config §4.3. | — |
 | DA-CFG-3 | Secret **rotation** without process restart | 🟡 | ✅ | `credentials_file`/`token_file` (§4.6) + resolved-config diffing (§11.1). | OQ-C3 (partial) |
-| DA-CFG-4 | External secret-manager integration (Vault / AWS SM / GCP SM) | 🟢 | 🟥 | Only env-var and file-content rotation are designed. Direct secret-manager integration is **undecided** — likely out-of-scope-for-v1, but say so explicitly (file-on-tmpfs by a sidecar is the implied pattern). | OQ-C3 (remainder) |
+| DA-CFG-4 | External secret-manager integration (Vault / AWS SM / GCP SM) | 🟢 | ✅ (out of v1) | Only env-var and file-content rotation are designed. Direct secret-manager integration is **undecided** — likely out-of-scope-for-v1, but say so explicitly (file-on-tmpfs by a sidecar is the implied pattern). **✅ 2026-09-26 — confirmed out of v1 (`V1_Scope_Decisions.md` §2).** | OQ-C3 (remainder) |
 | DA-CFG-5 | Flush-trigger multi-criteria semantics (OR, first-wins, tri-state null) | 🟡 | ✅ | Config §9.4.1; `Data-Flow.md` §Flush decision. | OQ-P1 |
 | DA-CFG-6 | Reserved cluster fields not yet promoted into `globals.cluster` table | 🟢 | ✅ | `lease_duration`, `lease_renewal_interval`, `lease_safety_margin`, `rebalance_stabilization`, `max_concurrent_handoffs`, `max_concurrent_takeovers`, `drain_timeout`, `discovery`, `discovery_dns_name`, `memberlist.lifeguard_enabled` are designed (Clustering §11/§19/§20) but still sit in config §16. Promotion owed. See §19. **Promoted 2026-09-26** — config §6.5 / §6.5.1 (V-094–V-096). | G-8, G-9 |
 | DA-CFG-7 | Reserved data-plane fields not yet promoted | 🟢 | ✅ | `tables.primary_key`, `tables.partitioning`, `snapshot.chunk_size`, `sink.max_transaction_batch_rows`, `sink.max_transaction_buffer_bytes`, `sink.buffer_capacity_rows`, `source.postgres.max_wal_lag_bytes`, `source.mysql.binlog_purge_action`, slot-lifecycle fields, `globals.tracing.*`, `sink.metrics.per_table`, `globals.api.role_mapping`, `globals.azure.account_name`, `catalog.retry`, `sink.maintenance`, `glue.strip_schema`. Designed in research; promotion owed. See §19. **Promoted 2026-09-26** — config §6.3/§6.6/§6.7/§9.2/§9.3/§9.4/§9.5 (V-097–V-113); `sink.maintenance` stays reserved per sink in §16; `primary_key`/`partitioning` specified as per-table maps; PG orphan policy named `slot_on_orphan` (`slot` is the name string). | many |
@@ -193,7 +195,7 @@ documentation gaps, not design gaps, but they are load-bearing for anyone readin
 | DA-FLOW-3 | Backpressure / bounded channels | 🟡 | ✅ | `Operational…` G-27 — all inter-task channels bounded; `sink.buffer_capacity_rows`. | G-27 |
 | DA-FLOW-4 | Phase-1 snapshot model in spec is superseded | 🟢 | ✅ | `Snapshot_Resumability…` replaces blocking COPY/EXPORT_SNAPSHOT with the stream-first incremental chunk loop; `Data-Flow.md` Phase 1 + On-Demand section must be rewritten. Spec-merge debt (§19). **2026-09-26 tidy:** `Data-Flow.md` Phase 1 is the incremental chunked, stream-first model (DF-1/DF-2 applied 2026-06-20). | G-6 |
 | DA-FLOW-5 | `TRUNCATE` manifestation in the Iceberg mirror (both engines) | 🟡 | ✅ (Delta) · ⏭ v2 (Iceberg) | `MySQL_DDL_Classifier.md` §3 says TRUNCATE → "table-clear (Iceberg DELETE/overwrite all rows or fresh snapshot boundary), flagged for the sink-writer contract." `Data-Flow.md` Phase 2a lists the PG `T` message but no sink action is specified. The concrete sink behavior (and PG/MySQL parity) is undefined. **2026-09-26 tidy:** `Data-Flow.md` Phase 3 TRUNCATE barrier + Delta realization (metadata-only delete-all, probe P5); the Iceberg overwrite-to-empty goes with the Iceberg sink to v2. | — |
-| DA-FLOW-6 | PG `DROP TABLE` detection (no in-band DDL on pgoutput) | 🟡 | 🔄 | MySQL DROP is caught by channel B (`QUERY_EVENT`). PG drops are **not** replicated as DDL; the table simply stops emitting and is caught by channel D idle-rescan / channel A on restart (`Schema_Change…` §2.1). The *latency and exact reaction* (halt vs retain) for a PG drop of a tracked table is not spelled out as crisply as MySQL's. Worth an explicit line. | — |
+| DA-FLOW-6 | PG `DROP TABLE` detection (no in-band DDL on pgoutput) | 🟡 | ✅ | MySQL DROP is caught by channel B (`QUERY_EVENT`). PG drops are **not** replicated as DDL; the table simply stops emitting and is caught by channel D idle-rescan / channel A on restart (`Schema_Change…` §2.1). The *latency and exact reaction* (halt vs retain) for a PG drop of a tracked table is not spelled out as crisply as MySQL's. Worth an explicit line. **✅ 2026-09-26 — D-V1.2 (`V1_Scope_Decisions.md`):** OID gone from `pg_class` (channel D / A) → halt the table `TABLE_DROPPED`, Delta kept; latency ≤ `rescan_interval`; re-created table does not auto-resume. | — |
 | DA-FLOW-7 | `committed_lsn` scalar generalized to engine-tagged `committed_position` | 🟡 | ✅(design) | `Delivery_Guarantee…` §4 — per-table HWM `cdc.committed_position`; `Data-Flow.md` wording owed (§19). | G-14 |
 | DA-FLOW-8 | Shutdown / drain ordering | 🟡 | ✅ | `Data-Flow.md` §Concurrency + Clustering §8.3 drain protocol (adds explicit lease release). | OQ-CL3 |
 
@@ -262,8 +264,8 @@ paper** and is this report's top blocker.
 | DA-CLUS-9 | `node_id` stability / StatefulSet mandate | 🟡 | ✅ | §3.4 D-1 — `node_id = memberlist.node_name`; k8s StatefulSet pod name; standalone persisted UUID; `incarnation` distinguishes a fresh process. | D-1, OQ-P3 |
 | DA-CLUS-10 | Cluster-wide-consistent anchors (`tokens`, `lease_duration`, `lock_backend`, `hash_algo`) | 🟡 | ✅ | §12 anchor; refuse-to-start on mismatch (V-026/V-062/V-075/V-076). | G-36, D-2 |
 | DA-CLUS-11 | Lease timing defaults vs failover SLA | 🟡 | ✅ | §18 D-6 — **Balanced** ratified (`lease_duration=15s`, `renewal=5s`, ~20–22s unowned window). Tunable. | D-6 |
-| DA-CLUS-12 | `kubernetes` lock_backend (K8s Lease API) | 🟢 | 🟥 | Reserved as a future `LeaseStore` impl; **only `storage` is built for v1** (V-075). A genuine but deliberately deferred scope item. | D-2 |
-| DA-CLUS-13 | Per-source-endpoint takeover bulkhead | 🟢 | 🟥 | §20.2 notes the sharper risk (many pipelines on one source DB reconnecting together) as a **future** per-endpoint concurrency group; v1 cap is per-node-global. | D-10 |
+| DA-CLUS-12 | `kubernetes` lock_backend (K8s Lease API) | 🟢 | ✅ (deferred) | Reserved as a future `LeaseStore` impl; **only `storage` is built for v1** (V-075). A genuine but deliberately deferred scope item. **✅ 2026-09-26 — deferral confirmed (`V1_Scope_Decisions.md` §2).** | D-2 |
+| DA-CLUS-13 | Per-source-endpoint takeover bulkhead | 🟢 | ✅ (deferred) | §20.2 notes the sharper risk (many pipelines on one source DB reconnecting together) as a **future** per-endpoint concurrency group; v1 cap is per-node-global. **✅ 2026-09-26 — deferral confirmed (`V1_Scope_Decisions.md` §2).** | D-10 |
 
 ---
 
@@ -304,7 +306,7 @@ the position guard is demoted to optimization + checkpoint-advance.
 | DA-DEDUP-4 | Identifier source & override | 🟡 | ✅ | Inferred PK via channel C; `tables.primary_key` override (not a surrogate); Iceberg identifier constraints (top-level, primitive, NOT NULL, non-floating). | D-13.1/7 |
 | DA-DEDUP-5 | Before-image / REPLICA IDENTITY contract | 🟡 | ✅ | §2 — identifier ⊆ replica-identity (PG); MySQL FULL image already required; halt with named columns if unmet. | D-13.4 |
 | DA-DEDUP-6 | Key-mutating UPDATE (PK value changes) | 🟡 | ✅ | §4 — delete(old key) + data(new key); reuses before-image. | D-13.3 |
-| DA-DEDUP-7 | Cross-table atomic visibility **not** guaranteed | 🟡 | 🟥(scoped-out) | `Delivery…` §5 / `Large_Transaction…` — each table is its own Iceberg commit; cross-table atomicity is explicitly out of scope; would need a multi-table-commit catalog (Nessie). Documented limitation, reopen path noted. | D-14.5, G-25-noted |
+| DA-DEDUP-7 | Cross-table atomic visibility **not** guaranteed | 🟡 | ✅ (scoped-out) | `Delivery…` §5 / `Large_Transaction…` — each table is its own Iceberg commit; cross-table atomicity is explicitly out of scope; would need a multi-table-commit catalog (Nessie). Documented limitation, reopen path noted. **✅ 2026-09-26 — confirmed out of scope (`V1_Scope_Decisions.md` §2).** | D-14.5, G-25-noted |
 
 ---
 
@@ -341,7 +343,7 @@ writer's correctness literally depends on.
 | DA-SINK-5 | Partition spec config + evolution | 🟢 | ✅ | `Iceberg_Partitioning…` §1/§3 (G-24) — `tables.partitioning`; default unpartitioned; spec evolution = new-data-only. | G-24 |
 | DA-SINK-6 | Partition-key-changing UPDATE (cross-partition ghost) | 🟡 | ✅ | §2 (D-24) — equality-delete routed to the **old** partition via before-image; same machinery as a PK mutation. **Sink-writer contract addition.** | G-24 |
 | DA-SINK-7 | Large-transaction vs txn-atomic-flush tension | 🟡 | ✅ | `Large_Transaction…` (G-29) — bounded split commits (default off → atomic), `max_transaction_buffer_bytes` halt-backstop; crash-safe via idempotency. | G-29 |
-| DA-SINK-8 | Spill-to-disk for oversized txns | 🟢 | 🟥(deferred) | `Large_Transaction…` §5 — future `sink.large_txn_mode: split\|spill`; out of scope for v1. | G-29 §5 |
+| DA-SINK-8 | Spill-to-disk for oversized txns | 🟢 | ✅ (deferred) | `Large_Transaction…` §5 — future `sink.large_txn_mode: split\|spill`; out of scope for v1. **✅ 2026-09-26 — deferral confirmed (`V1_Scope_Decisions.md` §2).** | G-29 §5 |
 | DA-SINK-9 | Iceberg maintenance ownership (compaction/expiry/orphans) | 🟢 | ✅ | `Iceberg_Maintenance…` (G-25) — external for v1; app exposes signals + reserves `sink.maintenance`; built-in gated on iceberg-rust rewrite support. | G-25 |
 | DA-SINK-10 | iceberg-rust compaction/rewrite API availability | 🟢 | ⏭ v2 | Gates any **future** built-in maintenance (deferred anyway). Verify against pinned crate. **2026-09-26 tidy:** Iceberg-sink only — deferred with the Iceberg sink to v2. | G-25 §14 |
 | DA-SINK-11 | Exactly-once vs at-least-once into Iceberg | 🟡 | ✅ | Effectively exactly-once-effect via idempotency (DEDUP) + position guard; at-least-once delivery, dedup absorbs replays. | OQ-IC3 |
@@ -363,11 +365,11 @@ the MySQL path with one genuine correctness dependency.
 | DA-SRC-5 | Abandoned-slot WAL-lag guard | 🟡 | ✅ | `Operational…` G-22 — `cdc_wal_lag_bytes` always emitted; `max_wal_lag_bytes` opt-in halt. | G-22 |
 | DA-SRC-6 | MySQL purged-binlog handling | 🟡 | ✅ | `Operational…` G-26 — `binlog_purge_action: error(default)\|re_snapshot`. | G-26 |
 | DA-SRC-7 | External same-name slot collisions undetectable | 🟢 | ✅(limitation) | §5 — PG slots carry no ownership tag; mitigated by V-058 uniqueness + operator discipline; documented, not papered over. | G-15 |
-| DA-SRC-8 | MariaDB GTID dialect (`domain-server-sequence`) | 🟡 | 🔄 | `Operational…` G-38 — MariaDB accepted via the MySQL path, but the `SourcePosition` MySQL impl **must support both GTID dialects** (MariaDB domains vs MySQL UUIDs); flagged as a **new sub-research item** and the one genuine correctness dependency. **2026-09-26: feasible — proven** (S-MY9, `mysql_async`): MariaDB GTID-positioned resume via `@mariadb_slave_capability`/`@slave_connect_state`/`@slave_gtid_strict_mode`; per-txn GTIDs decode exactly (last = `gtid_binlog_pos`) with a ~10-line parser. Remaining: confirm MariaDB in v1 scope (recommended). | G-38 |
+| DA-SRC-8 | MariaDB GTID dialect (`domain-server-sequence`) | 🟡 | ✅ | `Operational…` G-38 — MariaDB accepted via the MySQL path, but the `SourcePosition` MySQL impl **must support both GTID dialects** (MariaDB domains vs MySQL UUIDs); flagged as a **new sub-research item** and the one genuine correctness dependency. **2026-09-26: feasible — proven** (S-MY9, `mysql_async`): MariaDB GTID-positioned resume via `@mariadb_slave_capability`/`@slave_connect_state`/`@slave_gtid_strict_mode`; per-txn GTIDs decode exactly (last = `gtid_binlog_pos`) with a ~10-line parser. Remaining: confirm MariaDB in v1 scope (recommended). **✅ 2026-09-26 — D-V1.5 (`V1_Scope_Decisions.md`):** MariaDB in v1; dialect selected at connect. | G-38 |
 | DA-SRC-9 | TOAST re-query control-connection pool sizing | 🟢 | 🔄 | V-077 warns on `re_query`+high-volume snapshot; concrete pool sizing is an implementation detail, not yet fixed. | — |
 | DA-SRC-10 | **PG replication client crate capability** (`pgwire-replication` named in Sources_Index; never pinned, compiled or probed) | 🔴 | ✅ | Needed: pgoutput proto v1–v4 incl. streamed in-progress txns (`Stream Start/Stop/Commit/Abort`), `Relation`/`Type`/`Truncate` messages, unchanged-TOAST marker, standby status feedback (flush-LSN ack), slot `START_REPLICATION` from an LSN, TLS, keepalives. Probe: `prototypes/source-capability/` (S-gates) against local PostgreSQL. A negative result means writing/forking the protocol layer — a plan-shaping item. **Scaffolded 2026-09-26, source-read:** the crate is **transport-only** — pgoutput decoding (Relation/Insert/Update/Delete/Truncate/Type/Origin) is a stated non-goal, so **the decoder is ours** (bounded v1 work item); `proto_version '1'` is hard-coded with no `streaming` (large txns arrive whole at commit — fine for the design, but `Data-Flow.md` Phase 2a says `'2'`). Gates S-PG0…S-PG8 in `prototypes/source-capability/README.md`. **Proven 2026-09-26** (`prototypes/source-capability/`, PG 17): S-PG0…S-PG8 9/9 — transport, our pgoutput decoder (Relation/Type/Origin/Insert/Update none·K·O/Delete K·O/Truncate), unchanged-TOAST `u`, 50k-row txn whole at commit under proto v1, restart/resume at-least-once, slow consumer survives `wal_sender_timeout`, live `ALTER PUBLICATION ADD TABLE`, 18-type text decode, TLS 1.3 verify-full. **Pin `pgwire-replication =0.4.1`; the pgoutput decoder is a v1 work item.** Implementation rules: `with_wakeup_interval` ≈ status interval (idle acks otherwise lag up to 10 s); pin the walsender session (`TimeZone=UTC`, `DateStyle=ISO`, `IntervalStyle=iso_8601`, `extra_float_digits=3`). | — |
 | DA-SRC-11 | **MySQL binlog client crate capability** (`mysql-binlog-connector-rust` named in Sources_Index; never pinned, compiled or probed) | 🔴 | ✅ | Needed: GTID-set positioning (`COM_BINLOG_DUMP_GTID`), `ROW` events with FULL image, `TABLE_MAP` optional metadata (column names/signedness, `binlog_row_metadata=FULL`), `QUERY_EVENT` (DDL classifier input), CRC32 checksums, heartbeats, MySQL 8.4 `caching_sha2_password` auth + TLS; MariaDB GTID dialect if in v1 scope (DA-SRC-8). Probe: `prototypes/source-capability/` against local MySQL (and MariaDB). **Scaffolded 2026-09-26, source-read:** two candidates probed side by side — (a) `mysql-binlog-connector-rust` 0.3.3 (TLS looks absent, claims ≤ MySQL 8.0.31, has MariaDB GTID events) vs (b) `mysql_async` 0.37.1 binlog stream (TLS ✅, active; MariaDB GTID events not found in `mysql_common`). Neither complete on paper. Gates S-MY0…S-MY9. **Proven 2026-09-26** (MySQL 8.4 + MariaDB 11.4): **pin `mysql_async =0.37.1`** — S-MY0…S-MY9 10/10 (GTID resume, FULL images, optional metadata incl. UNSIGNED, DDL `QUERY_EVENT`, heartbeats via `@master_heartbeat_period`, zstd payloads, type decode, TLS 1.3, MariaDB GTID). **Reject** `mysql-binlog-connector-rust` 0.3.3: no TLS, no MariaDB GTID positioning, `is_signed` carries the *unsigned* bit, `BIGINT UNSIGNED` as `-1`. Own code: MariaDB `GTID_EVENT` (type 162) decode; payload guard (DA-SRC-12). | — |
-| DA-SRC-12 | **`mysql_async` silently drops a compressed transaction it cannot decompress** | 🟡 | 🆕 🟥 | Found 2026-09-26 (source-read, `mysql_common` 0.37.3 / `mysql_async` 0.37.1): on a zstd error `TransactionPayloadEvent::danger_decompress` returns an **empty buffer**, and `mysql_async` ignores a payload-header parse error (`/* TODO: Log the error */`) — the transaction's rows vanish with no stream error. Rare (corrupt payload / unsupported algorithm) but silent data loss. Guard (v1): validate every `TRANSACTION_PAYLOAD` ourselves — decompressed length == `uncompressed_size`, ≥ 1 inner event — and halt the pipeline on mismatch; offer the fix upstream. | — |
+| DA-SRC-12 | **`mysql_async` silently drops a compressed transaction it cannot decompress** | 🟡 | ✅ (guard designed) | Found 2026-09-26 (source-read, `mysql_common` 0.37.3 / `mysql_async` 0.37.1): on a zstd error `TransactionPayloadEvent::danger_decompress` returns an **empty buffer**, and `mysql_async` ignores a payload-header parse error (`/* TODO: Log the error */`) — the transaction's rows vanish with no stream error. Rare (corrupt payload / unsupported algorithm) but silent data loss. Guard (v1): validate every `TRANSACTION_PAYLOAD` ourselves — decompressed length == `uncompressed_size`, ≥ 1 inner event — and halt the pipeline on mismatch; offer the fix upstream. **✅ 2026-09-26 — D-V1.6 (`V1_Scope_Decisions.md`):** validate each payload; pipeline halt `BINLOG_PAYLOAD_INVALID`; report upstream. | — |
 
 ---
 
@@ -383,7 +385,7 @@ endpoint), and trace-id/pipeline injection into JSON logs.
 | DA-OBS-2 | Metric cardinality policy | 🟢 | ✅ | §1 — `{pipeline,source_host,source_db}` default; `table` label only when `sink.metrics.per_table=true`. | G-33 |
 | DA-OBS-3 | Distributed tracing | 🟢 | ✅ | §3 (G-32) — `globals.tracing.otlp_endpoint` (absent⇒off) + `sample_ratio`; batch/commit-granularity spans, no per-event spans. | G-32, OQ-OB1 |
 | DA-OBS-4 | Log/trace correlation | 🟢 | ✅ | §4 — inject `trace_id`/`span_id`/`pipeline` into JSON logs. | §10.3 |
-| DA-OBS-5 | **Numeric end-to-end replication-lag SLA** | 🟡 | 🟥 | `Clustering…` §18.6 explicitly leaves OQ-OB2 open as a *tuning input*: a concrete max-lag number is not fixed, which is what grounds the lease-timing profile and flush/checkpoint cadence. Decide a number (and whether failover-time carries its own SLA distinct from steady-state). | OQ-OB2 |
+| DA-OBS-5 | **Numeric end-to-end replication-lag SLA** | 🟡 | ✅ | `Clustering…` §18.6 explicitly leaves OQ-OB2 open as a *tuning input*: a concrete max-lag number is not fixed, which is what grounds the lease-timing profile and flush/checkpoint cadence. Decide a number (and whether failover-time carries its own SLA distinct from steady-state). **✅ 2026-09-26 — D-V1.3 (`V1_Scope_Decisions.md`):** steady-state p99 ≤ 60s, failover ≤ 2 min, at default config; confirm by v1 load test. | OQ-OB2 |
 
 ---
 
@@ -475,7 +477,9 @@ authoritative sink-writer contract document yet. Spec elaboration needs a **cons
 contract** (keying, collapse, partition routing, delete-file sequencing, snapshot-summary properties,
 truncate handling) — today it is scattered across five research docs.
 
-### DA-X-4 — Reserved metadata-column collision has no runtime rule 🟡 🟥
+### DA-X-4 — Reserved metadata-column collision has no runtime rule 🟡 ✅
+
+> **✅ 2026-09-26 — D-V1.1 (`V1_Scope_Decisions.md`):** the table halts with `RESERVED_COLUMN_COLLISION`; no escaping.
 *(= DA-SYS-4, restated as cross-cutting.)* If a source table legitimately has a column named `_op`,
 `_ts`, `_lsn`, `_source_db`, `_pipeline`, or a future `_seq`, the accumulator injects a colliding
 column. Config §5 only says operators "should be aware." Decide the rule: reject/halt the table, or
@@ -498,9 +502,9 @@ snapshot boundary marker) and confirm it is idempotent under replay like everyth
 spec should state explicitly whether a dump-only table may be PK-less (snapshot as plain inserts,
 `identifier-field-ids` unset) or still halts for uniformity.
 
-### DA-X-7 — MariaDB GTID dialect is the one open correctness dependency in an otherwise "in-scope" claim 🟡 🔄
+### DA-X-7 — MariaDB GTID dialect is the one open correctness dependency in an otherwise "in-scope" claim 🟡 ✅
 
-> **2026-09-26:** proven feasible with `mysql_async` (S-MY9) — see DA-SRC-8; scope confirmation pending.
+> **2026-09-26:** proven feasible with `mysql_async` (S-MY9) — see DA-SRC-8. **✅ MariaDB in v1 — D-V1.5 (`V1_Scope_Decisions.md`).**
 *(= DA-SRC-8.)* G-38 accepts MariaDB "best-effort via the MySQL path," but the `SourcePosition` MySQL
 implementation must handle MariaDB's `domain-server-sequence` GTID, which is a *different* set algebra
 from MySQL's `server-uuid:tx`. This is flagged as a new sub-research item and is the single place where
@@ -599,22 +603,25 @@ applied without instruction.
 The short list of questions spec elaboration must actually *decide* (everything else is resolved or is
 merge/verify work). Ordered roughly by leverage.
 
+> **2026-09-26: every v1 row below is decided** — `V1_Scope_Decisions.md` (D-V1.1–D-V1.6 + deferrals). The register is
+> kept as the audit trail; no 🟥 decision remains for v1.
+
 | ID | Decision | Recommendation / starting position |
 |---|---|---|
-| DA-OBS-5 | Fix a **numeric end-to-end replication-lag SLA**, and whether failover-time has its own SLA. | Pick a steady-state max-lag (e.g. 60s fits Balanced lease defaults) + a separate, looser failover-time target (~20–30s); load-test to confirm. Grounds lease/flush/checkpoint tuning. |
+| ~~DA-OBS-5~~ | Fix a **numeric end-to-end replication-lag SLA**, and whether failover-time has its own SLA. | Pick a steady-state max-lag (e.g. 60s fits Balanced lease defaults) + a separate, looser failover-time target (~20–30s); load-test to confirm. Grounds lease/flush/checkpoint tuning. **✅ Decided 2026-09-26 — D-V1.3: 60s p99 steady / 2 min failover (`V1_Scope_Decisions.md`).** |
 | ~~DA-X-1 / DA-FLOW-2~~  | `CdcEvent` per-change sequence field + whether `_seq` is a persisted column. | Add `change_seq: SourceSeq` to `CdcEvent`; persist `_seq` as a 6th lineage column (downstream dedup auditability). **✅ Closed 2026-09-26: in `Data-Flow.md` (`change_seq`, `_seq`).** |
-| DA-X-4 / DA-SYS-4 | Runtime rule for source columns colliding with reserved `_`-names. | Halt the table with a clear error by default; offer a configurable escape-prefix if demand appears. |
+| ~~DA-X-4 / DA-SYS-4~~ | Runtime rule for source columns colliding with reserved `_`-names. | Halt the table with a clear error by default; offer a configurable escape-prefix if demand appears. **✅ Decided 2026-09-26 — D-V1.1: halt the table (`V1_Scope_Decisions.md`).** |
 | ~~DA-X-5 / DA-FLOW-5~~  | Cross-engine `TRUNCATE` → Iceberg semantics. | Map to an overwrite-to-empty (or delete-all-by-no-key snapshot boundary); define once, same for PG + MySQL; keep idempotent. **✅ Closed 2026-09-26 for v1 (Delta; TRUNCATE barrier); Iceberg → ⏭ v2.** |
 | ~~DA-X-6 / DA-SNAP-8~~  | PK-less table under dump-only modes. | Allow dump-only PK-less tables as plain inserts (no `identifier-field-ids`); they never stream/delete so the keying rule doesn't bind. (Or halt for uniformity — decide.) **✅ Closed 2026-09-26: uniform identifier rule (config §11.2).** |
-| DA-SRC-8 / DA-X-7 | MariaDB GTID dialect support in `SourcePosition`. | Schedule the sub-research; detect MariaDB at connect and select the GTID parser; otherwise narrow v1 scope to MySQL-only. **2026-09-26: proven feasible (S-MY9) — recommendation: keep MariaDB in v1.** |
-| DA-CFG-4 | External secret-manager integration. | Declare out of scope for v1; the file-content-rotation path (sidecar writes the file) is the supported pattern. |
-| DA-DEDUP-7 | Cross-table atomic visibility. | Keep out of scope; document the per-table-only guarantee; reopen only if a multi-table-commit catalog (Nessie) becomes a requirement. |
-| DA-CLUS-12 | `kubernetes` lock_backend. | Defer; `storage` CAS lease is the v1 backend (already enforced by V-075). |
-| DA-CLUS-13 | Per-source-endpoint takeover bulkhead. | Defer; per-node-global cap ships in v1; add per-endpoint group if reconnect storms are observed. |
-| DA-SINK-8 | Spill-to-disk for oversized transactions. | Defer to a future `sink.large_txn_mode: spill`; v1 uses split-commits or sized memory. |
+| ~~DA-SRC-8 / DA-X-7~~ | MariaDB GTID dialect support in `SourcePosition`. | Schedule the sub-research; detect MariaDB at connect and select the GTID parser; otherwise narrow v1 scope to MySQL-only. **2026-09-26: proven feasible (S-MY9) — recommendation: keep MariaDB in v1.** **✅ Decided 2026-09-26 — D-V1.5: MariaDB in v1 (`V1_Scope_Decisions.md`).** |
+| ~~DA-CFG-4~~ | External secret-manager integration. | Declare out of scope for v1; the file-content-rotation path (sidecar writes the file) is the supported pattern. **✅ Decided 2026-09-26 — confirmed out of v1 (`V1_Scope_Decisions.md`).** |
+| ~~DA-DEDUP-7~~ | Cross-table atomic visibility. | Keep out of scope; document the per-table-only guarantee; reopen only if a multi-table-commit catalog (Nessie) becomes a requirement. **✅ Decided 2026-09-26 — confirmed out of scope (`V1_Scope_Decisions.md`).** |
+| ~~DA-CLUS-12~~ | `kubernetes` lock_backend. | Defer; `storage` CAS lease is the v1 backend (already enforced by V-075). **✅ Decided 2026-09-26 — deferral confirmed (`V1_Scope_Decisions.md`).** |
+| ~~DA-CLUS-13~~ | Per-source-endpoint takeover bulkhead. | Defer; per-node-global cap ships in v1; add per-endpoint group if reconnect storms are observed. **✅ Decided 2026-09-26 — deferral confirmed (`V1_Scope_Decisions.md`).** |
+| ~~DA-SINK-8~~ | Spill-to-disk for oversized transactions. | Defer to a future `sink.large_txn_mode: spill`; v1 uses split-commits or sized memory. **✅ Decided 2026-09-26 — deferral confirmed (`V1_Scope_Decisions.md`).** |
 | ~~DA-CAT-4~~  | How the writer consumes catalog-vended credentials. | Specify in the sink-writer contract if credential vending is targeted for v1; otherwise note as future. **⏭ v2 (Iceberg sink).** |
-| DA-FLOW-6 | PG `DROP TABLE` reaction + detection latency (no in-band DDL on pgoutput). | Detect via channel D rescan (table gone from catalog / publication); halt the table with `TABLE_DROPPED`, never auto-drop the Delta table. State the latency bound = rescan interval. |
-| DA-SYS-7 | v1 handling of `sink.type: iceberg` (Iceberg sink → v2). | Keep accepted by the config; refuse at start with an explicit "Iceberg sink ships in v2" message (enum stable across versions). |
+| ~~DA-FLOW-6~~ | PG `DROP TABLE` reaction + detection latency (no in-band DDL on pgoutput). | Detect via channel D rescan (table gone from catalog / publication); halt the table with `TABLE_DROPPED`, never auto-drop the Delta table. State the latency bound = rescan interval. **✅ Decided 2026-09-26 — D-V1.2: halt the table, Delta kept (`V1_Scope_Decisions.md`).** |
+| ~~DA-SYS-7~~ | v1 handling of `sink.type: iceberg` (Iceberg sink → v2). | Keep accepted by the config; refuse at start with an explicit "Iceberg sink ships in v2" message (enum stable across versions). **✅ Decided 2026-09-26 — D-V1.4: enum kept, refused at start (`V1_Scope_Decisions.md`).** |
 
 ---
 
@@ -662,6 +669,8 @@ sixth (and the top blocker).
 > DA-OBS-5 (lag target — non-blocking); confirm the §20 deferrals; (3) **spec debt** — §19.3
 > System-Overview S-1…S-6 (still unapplied) + the DA-X-8 config residual. Details: §26. The verdict
 > below is the 2026-06 assessment, kept as the audit trail.
+> **Update (same day):** (2) is done — all v1 decisions signed off (§26.5). Only (3), spec debt, remains
+> before the v1 implementation plan.
 
 **Verdict: the foundation is strong; design is essentially complete and the application specification
 can begin now**, provided the work is sequenced so the two 🔴 verification gates are run early (a
@@ -1376,14 +1385,33 @@ research, the iceberg-capability probes (G1–G2c) and the V-115/V-116 gates car
    (`prototypes/source-capability/`). Pins: `pgwire-replication =0.4.1` (+ our pgoutput decoder),
    `mysql_async =0.37.1` (+ MariaDB GTID decode, payload guard DA-SRC-12). Plan-shaping result: the
    **pgoutput decoder** is a v1 work item (bounded; probe version ~150 lines).
-2. **v1 decisions** (§20): DA-SRC-8 MariaDB in v1 (now proven feasible — recommend in), DA-SYS-4 reserved-column collision,
+2. ~~**v1 decisions** (§20): DA-SRC-8 MariaDB in v1 (now proven feasible — recommend in), DA-SYS-4 reserved-column collision,
    DA-FLOW-6 PG DROP reaction, DA-SYS-7 Iceberg handling, DA-OBS-5 lag target (non-blocking); confirm
-   the deferrals DA-CFG-4, DA-CLUS-12, DA-CLUS-13, DA-SINK-8, DA-DEDUP-7.
+   the deferrals DA-CFG-4, DA-CLUS-12, DA-CLUS-13, DA-SINK-8, DA-DEDUP-7.~~ ✅ 2026-09-26 — §26.5.
 3. **Spec debt** (needs approval): §19.3 System-Overview S-1…S-6 (never applied — the Open Questions
    block and the Iceberg-only framing are stale) + the DA-X-8 residual in `Configuration_Specification.md`
    (~606, ~960–965, ~1553) + the DA-SYS-7 scope statement + two `Data-Flow.md` Phase 2a source
    details from the probes: `proto_version '2'` → `'1'` (what the pinned crate sends; identical
-   messages without `streaming`) and the pinned walsender session options (F-PG-session).
+   messages without `streaming`) and the pinned walsender session options (F-PG-session). Plus the
+   five patches the v1 decisions imply (`V1_Scope_Decisions.md` §3).
 
 Not blocking: DA-MS-3 (accepted cost caveat, D-MS.15), DA-SRC-9 (implementation detail), DA-SNAP-7
 (retention coupling — designed; the tuning is an operational note), the optional ADLS Gen2 re-run of P8.
+
+### 26.5 v1 decisions signed off (2026-09-26)
+
+All recommendations accepted as proposed. Recorded in `research/V1_Scope_Decisions.md`; the spec
+changes they imply are listed there (§3) and are pending approval.
+
+| Decision | Gap | Outcome |
+|---|---|---|
+| D-V1.1 | DA-SYS-4 / DA-X-4 | Reserved lineage-column (or `__avalanche_*`) collision, compared case-insensitively → the table halts with `RESERVED_COLUMN_COLLISION` (checked at resolution and evolution); no escaping. v2 reopen path: rename *our* columns via a pipeline setting. |
+| D-V1.2 | DA-FLOW-6 | PG `DROP TABLE`: relation OID gone from `pg_class` (channel D / A) → the table halts with `TABLE_DROPPED`; the Delta table is never auto-dropped; latency ≤ `rescan_interval`; a re-created table does not auto-resume. Same as the MySQL rule. |
+| D-V1.3 | DA-OBS-5 (OQ-OB2) | Lag targets at default config: steady-state p99 ≤ 60s; failover ≤ 2 min. Grounds the ratified Balanced lease and the 30s flush; confirm by v1 load test. |
+| D-V1.4 | DA-SYS-7 | `sink.type: iceberg` stays valid in the config; refused at pipeline start: "Iceberg sink ships in v2". Scope statement → System-Overview. |
+| D-V1.5 | DA-SRC-8 / DA-X-7 | MariaDB in v1; dialect detected at connect; `SourcePosition` carries either GTID form. |
+| D-V1.6 | DA-SRC-12 | Validate every `TRANSACTION_PAYLOAD` (length == `uncompressed_size`, ≥ 1 inner event) → **pipeline** halt `BINLOG_PAYLOAD_INVALID`; report upstream. |
+| Deferrals | DA-CFG-4, DA-CLUS-12, DA-CLUS-13, DA-SINK-8, DA-DEDUP-7 | Confirmed out of v1; rows kept as the reopen path. |
+
+**Result:** no 🔴, 🧪 or 🟥 item remains in v1 scope. The only work before the v1 implementation plan is
+the spec debt in §26.4 item 3.
