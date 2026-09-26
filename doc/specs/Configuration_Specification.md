@@ -822,6 +822,9 @@ sink:
 
 #### 9.5.2 `sink.iceberg.catalog.hive` (Thrift / SASL)
 
+> **Rejected on the pinned crate (V-115, DA-CAT-6):** iceberg-rust's HMS catalog cannot commit. The
+> block is specified for when it can; until then a pipeline configuring it fails validation.
+
 | Field | Type | Required | Default | Mutability | Notes |
 |---|---|---|---|---|---|
 | `url` | string | yes | — | PR | `thrift://host:9083` or bare `host:port`. Default port 9083. |
@@ -843,7 +846,7 @@ sink:
 | `url` | string | yes | — | PR | Base URL (no trailing `/v1`). Endpoint/target change. |
 | `warehouse` | string | no | — | PR | Logical warehouse id (Polaris, Lakekeeper, Unity, some Nessie). Catalog target, not a credential. |
 | `prefix` | string | no | — | PR | URL path prefix before `/v1/` (e.g. `/iceberg` for HMS REST). Distinct from `sink.prefix`. |
-| `auth` | enum `none`\|`bearer`\|`oauth2`\|`sigv4` | no | `none` | PR | HTTP auth mode. Mode change is structural — kept PR; see the credential-rotation note below. |
+| `auth` | enum `none`\|`bearer`\|`oauth2`\|`sigv4` | no | `none` | PR | HTTP auth mode. Mode change is structural — kept PR; see the credential-rotation note below. `sigv4` is **rejected on the pinned crate** (V-116, DA-CAT-7). |
 | `token` | string | conditional | — | R | For `bearer`: required unless `token_file` is given (V-044); mutually exclusive with it (V-070). `Authorization: Bearer <token>`. Rotation applies to the next request. |
 | `token_file` | path | conditional | — | R | Alternative to `token` for `bearer` (§4.6): path to a file whose raw contents are the token (not JSON). Mutually exclusive with `token` (V-070). Replacing the file's contents + reload rotates the bearer token without a process restart. |
 | `oauth2.client_id` | string | conditional | — | R | For `oauth2`: required unless `oauth2.credentials_file` is given (V-045); mutually exclusive with it (V-066). Applied at the next token refresh (force a refresh on change). |
@@ -1205,6 +1208,8 @@ radius. `reload` locus marks a rule that can only fire on reload.
 | V-111 | `sink.buffer_capacity_rows` | ≥ 1. | error | pipeline |
 | V-112 | `sink.iceberg.catalog.retry` | `max_attempts ≥ 1`; `base_backoff ≤ max_backoff`. | error | pipeline |
 | V-114 | `sink.delta.timestamp_ntz_as` | ∈ {timestamp_ntz, timestamp, string}. | error | pipeline |
+| V-115 | `sink.iceberg.catalog.type` / `sink.iceberg.catalog.hive` | `hive` → `error`: the pinned iceberg-rust HMS catalog cannot commit (`update_table` is `FeatureUnsupported`; DA-CAT-6). Lifted when a pinned release implements it and the iceberg-capability probe passes against a real HMS. | error | pipeline |
+| V-116 | `sink.iceberg.catalog.rest.auth` | `sigv4` → `error`: the pinned iceberg-rust REST client has no SigV4 signing (DA-CAT-7; upstream #3082/#3092). `none`/`bearer`/`oauth2` unaffected; on AWS use `catalog.glue`. Lifted when a pinned release carries SigV4 and it is probed against the Glue or S3 Tables REST endpoint. | error | pipeline |
 
 ### 13.4 Cross-field / conditional
 
@@ -1510,7 +1515,9 @@ Every deviation, so nothing is silent:
     `tables.partitioning` (per-table maps); `sink.max_transaction_batch_rows` /
     `max_transaction_buffer_bytes` / `buffer_capacity_rows` / `metrics.per_table`;
     `sink.iceberg.catalog.retry` and `glue.strip_schema`; identifier / partition start-time checks
-    (§11.2); rules **V-094…V-113**. Later the same day: `sink.delta.timestamp_ntz_as` (DA-MS-8, V-114). `tables.surrogate_key` (G-30 rejected) and
+    (§11.2); rules **V-094…V-113**. Later the same day: `sink.delta.timestamp_ntz_as` (DA-MS-8, V-114); crate-capability rules V-115
+    (`catalog.hive` — HMS cannot commit, DA-CAT-6) and V-116 (`rest.auth: sigv4` — no SigV4 client,
+    DA-CAT-7), from probe G2c / crate source review. `tables.surrogate_key` (G-30 rejected) and
     `source.consistent_snapshot` (G-7 moot) struck from §16.
 
 None of these change the **decided** catalog-auth schema (hive Thrift `none/ldap/kerberos`;
