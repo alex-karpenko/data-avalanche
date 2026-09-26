@@ -420,6 +420,15 @@ attempt one stale Iceberg commit before noticing. We close this with **defense i
    are a CAS on the table-metadata pointer (already in `Data-Flow.md`'s "catalog conflict → reload &
    retry" path). If a zombie slips past (1), the new owner has already advanced the metadata, so the
    zombie's commit conflicts and fails. The new owner never loses; at worst the zombie wastes effort.
+   **⚠️ Only if the commit is pinned to the base the sink read (probe G2b, 2026-09-26, DA-X-11).**
+   iceberg-rust's `Transaction::commit` reloads the table and re-applies its actions on **every**
+   attempt, including the first, so a zombie holding a stale `Table` is silently **rebased** onto the
+   new owner's snapshot and lands; the pointer CAS never sees a stale base. The sink must therefore
+   commit through a per-commit catalog view whose `load_table` returns the base it checked the fence
+   against (`PinnedBase` in `prototypes/iceberg-capability/tests/probe_epoch_property.rs`):
+   `fast_append`'s `assert-ref-snapshot-id(main)` requirement then turns the commit into a real
+   compare-and-swap, a conflict is surfaced as non-retryable, and the **sink** owns the retry loop
+   (reload → re-check fence → re-pin → recommit). Public API only; no fork.
 3. **`owner_epoch` as a sink-side fencing token (D-7 — resolved: assert it).** The monotonic
    `owner_epoch` is **embedded in the Iceberg snapshot summary** (`cdc.owner_epoch`), and the commit
    path — inside the existing catalog-conflict reload-retry loop (Data-Flow.md) — **rejects a commit
@@ -446,8 +455,16 @@ attempt one stale Iceberg commit before noticing. We close this with **defense i
      before this rule, or property removed), walk the snapshot log back to the newest snapshot whose
      summary carries `cdc.pipeline = <pipeline_id>` and read its `cdc.owner_epoch`; if none is retained,
      the sink-side fence is simply not armed for that commit — layers (1), (2), (4) still hold.
-   - 🧪 Verify that `update_table_properties` + the data-commit action apply as **one** metadata commit
-     in the pinned iceberg-rust (extends the DA-SINK-2 probe). Fallback: summary + walk-back only.
+   - ✅ **Verified (probe G2b, iceberg 0.10.1, 2026-09-26):** `update_table_properties` + `fast_append`
+     in one `Transaction` are **one** metadata commit (either action order); a rejected commit applies
+     **neither** the property nor the snapshot; the property survives a foreign append, a foreign
+     property edit and `expire_snapshots` of our own snapshot (where the summary walk-back finds
+     nothing).
+   - **Residual (accepted):** the pin fences on `main`, so a new owner's **metadata-only** commit
+     (e.g. a schema-only `evolve`) does not fence a pinned zombie — one stale commit can still land
+     (and write its lower epoch to the property) until the new owner's next data commit. This is the
+     same "zombie commits before the new owner's first data commit" window as above, absorbed by
+     idempotent PK-upsert / `_lsn` dedup (4). The epoch property is written **only** by data commits.
    This is the Iceberg analogue of the Delta sink's `txn` app-transaction, which lives in table state
    and was probed to survive a foreign OPTIMIZE (`prototypes/delta-capability/` P3/P4).
 4. **Idempotent/dedup writes** (the `_lsn`-based exactly-once guard, Phase 4, and the ghost-row
@@ -861,7 +878,7 @@ ClusterManager (one per worker)
 - **D-4** *(resolved)* Add `cluster.discovery: static | dns` (+ `discovery_dns_name`); `dns` resolves + periodically re-resolves a headless Service. §10.2
 - **D-5** *(elaborated below, §17)* Verify atomic conditional-write path on S3 *and* GCS *and* Azure (SDK vs opendal); per-backend conformance test. §12
 - **D-6** *(elaborated below, §18)* Pick concrete defaults for `lease_duration` / `renewal_interval` against the target failover-time SLA (ties to OQ-OB2 replication-lag SLA). §8.2 / §11
-- **D-7** *(resolved: assert it; carrier refined 2026-09-26 for DA-X-10 — table property authoritative, summary + own-snapshot walk-back as fallback, §5.5)* `owner_epoch` is embedded in the Iceberg snapshot summary (`cdc.owner_epoch`) and the commit reload-retry loop rejects a commit when `latest_committed_epoch > my_epoch` — a sink-side fencing token (defense-in-depth atop the metadata-pointer CAS + `_lsn` dedup). §5.5
+- **D-7** *(resolved: assert it; carrier refined 2026-09-26 for DA-X-10 — table property authoritative, summary + own-snapshot walk-back as fallback, §5.5)* `owner_epoch` is embedded in the Iceberg snapshot summary (`cdc.owner_epoch`) and the commit reload-retry loop rejects a commit when `latest_committed_epoch > my_epoch`; the commit is **pinned to the base the fence was read from** (iceberg-rust `Transaction::commit` otherwise rebases a stale zombie — probe G2b, DA-X-11) — a sink-side fencing token (defense-in-depth atop the metadata-pointer CAS + `_lsn` dedup). §5.5
 - **D-8** *(elaborated below, §19; resolved)* Lease renewal failure taxonomy — distinguish `412` (definitive loss → stop) from transient storage errors (retry within a safety deadline), via a renewer state machine. Adds `cluster.lease_safety_margin` and promotes `lease_renewal_interval ≤ lease_duration / 3` to an enforced rule. §5.3 / §19
 - **D-9** *(elaborated below, §20.1; resolved)* Reconciler ↔ renewer orchestration — split into `ClusterReconciler` (ring only) + per-pipeline `PipelineController` (sole lease-writer, hosts the §19 renewer); event-driven + periodic-resync, idempotent/level-triggered. §8.1 / §13 / §20.1
 - **D-10** *(elaborated below, §20.2; resolved)* Unplanned-takeover storm rate-limiting — `cluster.max_concurrent_takeovers` (default 4) caps concurrent Phase-0 starts (not the cheap waits), with jitter; per-node-global now, per-source-endpoint group noted as future. §20.2

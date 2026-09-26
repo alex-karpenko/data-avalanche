@@ -447,7 +447,11 @@ application** (walk back), or use a carrier that persists in table state (Delta 
 Delta; applies to the Iceberg design as-is. **Resolved in the Iceberg research docs (2026-09-26):**
 epoch mirrored into a `cdc.owner_epoch` table property in the same transaction (authoritative read),
 position via own-snapshot walk-back by `cdc.pipeline`, "none retained" = not covered —
-`Clustering…` §5.5, `Delivery…` §3–§4, `Iceberg_Maintenance.md` §2.
+`Clustering…` §5.5, `Delivery…` §3–§4, `Iceberg_Maintenance.md` §2. **Probed (G2b, 2026-09-26):**
+property + append = one metadata commit; property survives foreign commits and expiry. Finding
+DA-X-11: iceberg-rust `Transaction::commit` rebases a stale zombie instead of rejecting it — the
+Iceberg sink commits pinned to the base it fenced against (the Delta `txn` conflict check has no such
+hole: P4).
 
 ---
 

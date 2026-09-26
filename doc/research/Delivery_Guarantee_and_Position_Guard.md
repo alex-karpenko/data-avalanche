@@ -122,7 +122,9 @@ The `_lsn` metadata **column** (per-row commit position) and the per-change **`_
 ordering) are distinct from `committed_position` (per-commit, per-table durable HWM) and remain as
 specified.
 
-**Capability gate + fallback (🧪 DA-SINK-2, `CDC_Design_Gap_Analysis_v1.md` §24.3).** Both
+**Capability gate + fallback (DA-SINK-2 — ✅ verified on the append path: probes G2 and G2b,
+`prototypes/iceberg-capability/`, 2026-09-26; the table-property carrier commits atomically with the
+data files).** Both
 `cdc.committed_position` and `cdc.owner_epoch` rely on iceberg-rust being able to read the latest
 snapshot summary and set custom string properties on the snapshot it commits, atomically with the data
 commit, with the values surviving across commits (summaries are per-snapshot, so the writer re-asserts
