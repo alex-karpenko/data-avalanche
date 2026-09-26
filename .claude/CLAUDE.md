@@ -5,11 +5,21 @@
 ## What this project is
 
 A **Rust-based Change Data Capture (CDC) system** that replicates row-level changes from
-PostgreSQL and MySQL into Apache Iceberg tables stored on cloud object storage (S3, GCS, Azure
-Blob). Key subsystems: distributed worker cluster (consistent hashing + SWIM/memberlist), Apache
-Arrow as the in-memory columnar format, and multiple Iceberg catalog backends (AWS Glue, HMS, REST).
+PostgreSQL and MySQL into **lakehouse tables on cloud object storage** (S3, GCS, Azure Blob). The
+target table format is **pluggable per pipeline** (`sink.type`, required, no default):
 
-Work style: **requirements-driven, iterative refinement**. Claude performs gap analysis, authors research documents, and maintains the living gap tracker — all as in-place file edits. Claude authors and maintains specifications.
+- **Delta Lake** via `delta-rs` — the v1 mirror sink (MERGE commits deletes + upserts atomically).
+- **Apache Iceberg** via `iceberg-rust` — designed; **mirror mode is capability-gated** until
+  iceberg-rust ships a delete-capable commit (gap DA-SINK-1i), so an Iceberg pipeline is refused at
+  start in v1.
+
+Key subsystems: distributed worker cluster (consistent hashing + SWIM/memberlist + storage CAS
+lease), Apache Arrow as the in-memory columnar format, a sink-neutral `Sink` trait with per-format
+realizations, and Iceberg catalog backends (AWS Glue, HMS, REST).
+
+Work style: **requirements-driven, iterative refinement**. Claude performs gap analysis, authors
+research documents, runs capability prototypes, and maintains the living gap tracker — all as
+in-place file edits. Claude authors and maintains specifications (spec edits need approval).
 
 ---
 
@@ -17,22 +27,42 @@ Work style: **requirements-driven, iterative refinement**. Claude performs gap a
 
 ```
 data-avalanche/
-├── .claude/CLAUDE.md                         ← this file
-|-- doc
-    ├── specs/
-    │   ├── System-Overview.md                    authoritative top-level requirements
-    │   ├── Data-Flow.md                          end-to-end data-flow spec
-    │   ├── Configuration_Specification.md        full YAML config data model
-    │   └── Schema_Change_Detection_and_Evolution.md   DDL detection & schema evolution
-    ├── research/
-    │   ├── Type_Mapping.md                       three-hop type mapping (DB → ColumnValue → Arrow → Iceberg)
-    │   ├── Catalog_Auth_Research.md              catalog authentication protocols
-    │   └── Clustering_Architecture_Research.md   clustering design proposal
-    ├── analysis/
-    │   └── CDC_Gap_Analysis_Report.md            living gap tracker (current: v9)
-    └── sources/
-        └── Sources_Index_v3.md                   50-source external knowledge index (read-only reference)
+├── .claude/CLAUDE.md                              ← this file
+├── doc/
+│   ├── specs/                                     source of truth (Oleksii owns)
+│   │   ├── System-Overview.md                     top-level requirements (incl. Sinks block)
+│   │   ├── Data-Flow.md                           pipeline phases, TableChangeSet, sink contract + realizations
+│   │   ├── Configuration_Specification.md         YAML config model, validation rules V-001…V-113
+│   │   └── Schema_Change_Detection_and_Evolution.md   DDL detection & per-sink evolution
+│   ├── research/                                  Claude authors, Oleksii reviews
+│   │   ├── Multi_Sink_Architecture_and_Delta_Lake.md   sink abstraction, Delta sink, D-MS.1–15
+│   │   ├── Type_Mapping.md                        DB → ColumnValue → Arrow → sink (Hop 3a Iceberg / 3b Delta)
+│   │   ├── Clustering_Architecture_Research.md    two-plane cluster, lease, fencing (D-1…D-11)
+│   │   ├── Catalog_Auth_Research.md               Iceberg catalog authentication
+│   │   ├── Snapshot_Resumability_and_Consistency.md   incremental chunked snapshot
+│   │   ├── Ghost_Row_Dedup_and_Primary_Keys.md    keying, collapse, PK policy
+│   │   ├── Delivery_Guarantee_and_Position_Guard.md   SourcePosition, committed_position
+│   │   ├── Pipeline_Lifecycle_State_Machine.md    pause/stop/resume/restart/flush
+│   │   ├── Postgres_Slot_and_Publication_Lifecycle.md
+│   │   ├── MySQL_DDL_Classifier.md
+│   │   ├── Iceberg_Partitioning_and_Layout_Evolution.md
+│   │   ├── Iceberg_Maintenance.md
+│   │   ├── Large_Transaction_Handling.md
+│   │   ├── Observability_Metrics_and_Tracing.md
+│   │   ├── API_RBAC_and_Versioning.md
+│   │   └── Operational_and_Scope_Gaps_Batch.md
+│   ├── analysis/
+│   │   ├── CDC_Design_Gap_Analysis_v1.md          **current** living gap tracker (DA-* IDs)
+│   │   └── CDC_Gap_Analysis_Report.md             legacy tracker (v13.13, G-* IDs) — frozen audit trail
+│   └── sources/
+│       └── Sources_Index_v3.md                    50-source external index (read-only)
+└── prototypes/                                    capability probes (standalone crates, not the app)
+    ├── lease-conformance/                         storage CAS lease T1–T10 on real S3/GCS/Azure
+    ├── iceberg-capability/                        iceberg-rust gates (append-only finding, G2 probe)
+    └── delta-capability/                          delta-rs 1.0 gates P1–P7 (MERGE, fence, cost)
 ```
+
+There is no application code yet; the design corpus and the prototypes are the current deliverables.
 
 ---
 
@@ -40,19 +70,23 @@ data-avalanche/
 
 | Directory | Authority | Claude may edit? |
 |---|---|---|
-| `doc/specs/` | Source of truth | Propose patches, don't edit without approve |
+| `doc/specs/` | Source of truth | Propose patches; edit only on explicit approval |
 | `doc/research/` | Claude authors; Oleksii reviews | Yes — in-place edits/extensions on request |
 | `doc/analysis/` | Claude maintains | Yes — in-place updates every gap-analysis cycle |
 | `doc/sources/` | Static reference | Never edit |
+| `prototypes/` | Claude maintains | Yes — probes are evidence, keep READMEs current with results |
 
 When Oleksii says **"update the gap report"** or **"re-run gap analysis"**, edit
-`doc/analysis/CDC_Gap_Analysis_Report.md` in place and increment the revision number.
+`doc/analysis/CDC_Design_Gap_Analysis_v1.md` in place: update the affected rows, record the change
+in a dated section (e.g. §25 "Multi-sink re-scope"), and bump `updated:`. Leave
+`CDC_Gap_Analysis_Report.md` untouched (legacy audit trail).
 
 When Oleksii says **"write a research doc on X"**, create `doc/research/X.md` following the
 frontmatter convention below.
 
 When Oleksii says **"apply this fix to the spec"**, make the surgical `str_replace`-style edit to
-the relevant `doc/specs/*.md` file and summarise what changed.
+the relevant `doc/specs/*.md` file and summarise what changed. For larger spec changes, draft the
+patch on scratch copies, get approval, then apply.
 
 ---
 
@@ -63,9 +97,9 @@ Every document must carry a YAML frontmatter block:
 ```yaml
 ---
 updated: YYYY-MM-DD
-domain: <one of: Architecture | Data Types | Configuration | Data Flow | Auth | Clustering | Schema Evolution>
+domain: <one of: Architecture | Data Types | Configuration | Data Flow | Auth | Clustering | Schema Evolution | Sink>
 tags: [comma, separated, tags]
-resolves: [G-xx, G-yy]          # gap IDs closed or advanced by this doc (omit if none)
+resolves: [DA-xx-n, G-yy]       # gap IDs closed or advanced by this doc (omit if none)
 sources: [source name, ...]     # from Sources_Index_v3.md (omit if none)
 ---
 ```
@@ -79,19 +113,26 @@ sources: [source name, ...]     # from Sources_Index_v3.md (omit if none)
 - 🟡 **High** — wrong answer causes correctness bugs or data loss
 - 🟢 **Medium** — wrong answer degrades performance or operability
 
-### Resolution markers
+### Status markers
 - ✅ **Resolved** — spec or research doc fully closes this gap
-- 🔄 **Partially resolved** — progress made; sub-questions remain open
+- 🔄 **Partial** — progress made; sub-questions remain open
+- 🟥 **Open** — no settled answer yet
+- 🧪 **Verify** — settled on paper, rests on an unproven external capability (crate / cloud) —
+  closed by a prototype, not by a document
 - 🆕 **New gap** — surfaced by the latest revision cycle
 
 ### Gap ID system
-- `G-1` … `G-40` — original gap set
-- `G-NEW-1` … `G-NEW-22` — gaps surfaced during revision cycles
-- `D-1` … `D-N` — design decisions (open questions within a research doc)
-- `OQ-*` — open questions (e.g. `OQ-CL1`, `OQ-OB2`)
+- **Current tracker:** `DA-<DOMAIN>-<n>` (`SYS`, `CFG`, `FLOW`, `TYPE`, `SCHEMA`, `CLUS`, `SNAP`,
+  `DEDUP`, `CAT`, `SINK`, `SRC`, `OBS`, `API`, `OPS`, `DEP`), cross-cutting `DA-X-<n>`, multi-sink
+  `DA-MS-<n>`.
+- **Legacy (in parentheses for reconciliation):** `G-1…G-40`, `G-NEW-1…G-NEW-22`, `OQ-*`.
+- **Design decisions** live in research docs: `D-<n>` / `D-<gap>.<n>` (e.g. `D-13.1`), multi-sink
+  `D-MS.<n>`, revisions `R-<n>`.
+- Probe IDs: lease `T1–T10`, iceberg `G1–G5`, delta `P1–P10`.
 
-When closing a gap, mark it ✅ and add a one-line rationale pointing at the doc/section that
-closes it. **Do not delete resolved gaps** — they are the audit trail.
+When closing a gap, mark it ✅ and add a one-line rationale pointing at the doc/section (or probe)
+that closes it. **Do not delete resolved gaps** — they are the audit trail. An upstream claim (epic
+checkbox, release note) is never proof: verify against the compiled crate or a real service.
 
 ---
 
@@ -99,39 +140,58 @@ closes it. **Do not delete resolved gaps** — they are the audit trail.
 
 ### Sources
 - **PostgreSQL:** logical replication via `pgoutput`, WAL/LSN, replication slots, publications
-- **MySQL:** binlog / GTID-set, statement vs. row-based replication
+- **MySQL:** binlog / GTID-set, row-based replication (`binlog_row_image = FULL`); MariaDB via the
+  MySQL path (GTID dialect is an open item)
 
-### In-memory format
-- **Apache Arrow** `RecordBatch` — columnar, zero-copy
-- **`ColumnValue` enum** — source-specific decoded value; four extensions in flight:
-  timezone flag on `Timestamp`, element type on `Array`, new `Time(NaiveTime)` variant,
-  new `UInt64(u64)` for MySQL `BIGINT UNSIGNED`
+### In-memory format and the sink boundary
+- **Apache Arrow** `RecordBatch` — columnar; a **single arrow major** workspace-wide (arrow 59:
+  deltalake 1.0 + iceberg-rust `main`/0.11)
+- **`ColumnValue` enum** — source-decoded value (incl. `UInt64`, tz-flagged `Timestamp`, `Time`,
+  typed `Array`)
+- **Collapse** (keep-last by per-change `_seq`, ≤1 delete + ≤1 upsert per key) happens in the core;
+  the sink receives a sink-neutral **`TableChangeSet`**
+- **Idempotency is correctness** (PK-upsert); position guard and epoch fence are optimizations /
+  defense-in-depth
 
-### Sink / catalog
-- **Apache Iceberg** via `iceberg-rust` crate; MOR (equality deletes) or COW write modes
-- **Catalogs:** AWS Glue, Hive Metastore (Thrift: NOSASL/SASL PLAIN/GSSAPI), REST (bearer/oauth2/sigv4)
-- **Auth note:** Iceberg REST's built-in `/v1/oauth/tokens` is deprecated (Java 1.6.0),
-  removed in 2.0 — `oauth2` must point to external IdP
+### Sinks (`sink.type`, one per pipeline)
+- **`Sink` trait:** `table_state`, `ensure_table`, `evolve` (Applied / Degraded / Unsupported→halt),
+  `commit` (atomic per table, idempotent, fenced by `owner_epoch`); declared **capabilities** checked
+  at pipeline start
+- **Delta Lake (delta-rs 1.0, DataFusion):** one MERGE per table per flush; fence = `txn`
+  app-transaction; position = `commitInfo` + own-commit walk-back; truncate = metadata-only delete;
+  S3 commits via conditional PUT (no DynamoDB); column mapping **off** (it blocks ADD COLUMN); no
+  drop/rename/widen → soft-drop / halt; cost ∝ files touched (random-key churn ≈ full rewrite —
+  D-MS.15, DV writer post-v1)
+- **Apache Iceberg (iceberg-rust):** MOR equality deletes / COW designed; public `Transaction` API is
+  **append-only** on every release so far → mirror gated; fence = `cdc.owner_epoch` table property
+  (+ snapshot summary), position = own-snapshot walk-back (DA-X-10)
+- **Iceberg catalogs:** AWS Glue, Hive Metastore (Thrift: none / LDAP / Kerberos), REST (bearer /
+  oauth2 / sigv4); REST's built-in `/v1/oauth/tokens` is deprecated (Java 1.6.0), removed in 2.0 —
+  `oauth2` must point to an external IdP. Delta tables are path-based in v1 (no catalog registration)
+- **Maintenance:** external for data rewrite/expiry/vacuum; Delta checkpoints + log cleanup built-in
 
 ### Type mapping chain
-Three hops, each owned by a distinct layer:
 ```
-DB wire format → ColumnValue (source decode) → Arrow DataType (accumulate) → Iceberg schema (sink)
+DB wire format → ColumnValue (decode) → Arrow + logical tag (accumulate) → sink schema (Hop 3a Iceberg / 3b Delta)
 ```
-Non-trivial cases: `TINYINT(1)` boolean detection requires `information_schema` query;
-`UNSIGNED BIGINT` → `decimal(20,0)`.
+Non-trivial cases: `TINYINT(1)` boolean detection via `information_schema`; `BIGINT UNSIGNED` →
+`decimal(20,0)`; Delta has no `uuid`/`time` (→ string); Iceberg `timestamp` = no tz but Delta
+`timestamp` = with tz — config type overrides use a **sink-neutral logical grammar**.
 
 ### Cluster coordination
-- **AP plane:** `memberlist`/SWIM for membership + `alive/suspect/dead/left` state machine;
-  hash ring is *derived* from membership (not gossiped)
-- **CP plane:** per-pipeline lease object in `globals.state`, acquired via **conditional writes
-  (compare-and-swap)**; clock-skew-safe acquire/renew/takeover protocol
+- **AP plane:** `memberlist`/SWIM (+ Lifeguard) for membership; hash ring is *derived* from
+  membership (not gossiped); suspects stay in the ring (flap immunity)
+- **CP plane:** per-pipeline lease object in `globals.state`, **compare-and-swap** acquire / renew /
+  takeover with a renewal safety deadline; `ClusterReconciler` + per-pipeline `PipelineController`
+- **`LeaseStore` per backend** (proven on real services): OpenDAL for S3; native
+  `google-cloud-storage` (generation preconditions) for GCS; Blob REST + SAS for Azure
 - **Single-node** is a one-member cluster with the lease active — same code path
 
 ### State storage
-- Pipeline state and leases stored in `globals.state` (cloud object storage)
-- All state files carry a `version` field; updates are conditional writes
-- GCS caveat: uses *generation* preconditions, not ETag-on-write (verify via `opendal`)
+- `globals.state`: cluster anchor (`tokens`, `lease_duration`, `lock_backend`), config generation,
+  leases — cross-pipeline only; every file has a `version`, updates are conditional writes
+- Per-pipeline state (offsets, snapshot cursors, recorded `sink_type`) under the pipeline's
+  `state.prefix` / `sink.prefix`
 
 ---
 
@@ -139,20 +199,24 @@ Non-trivial cases: `TINYINT(1)` boolean detection requires `information_schema` 
 
 Before responding to any gap-analysis or spec-review request:
 
-1. Read `doc/analysis/*.md` to load current gaps state.
+1. Read `doc/analysis/CDC_Design_Gap_Analysis_v1.md` (dashboard §3, the latest dated section, and
+   the domain tables relevant to the request).
 2. Read the specific `doc/specs/` or `doc/research/` files relevant to the request.
-3. Cross-reference with `doc/sources/Sources_Index_v3.md` if the topic maps to a known source.
-4. Only then produce analysis or edits.
+3. For a capability question, check the matching `prototypes/*/README.md` first — results there
+   outrank documentation claims.
+4. Cross-reference with `doc/sources/Sources_Index_v3.md` if the topic maps to a known source.
+5. Only then produce analysis or edits.
 
-For a **full re-evaluation cycle** (all files changed), read all nine documents before writing.
+For a **full re-evaluation cycle**, read all specs, all research docs, the current tracker and the
+prototype READMEs before writing.
 
 ---
 
 ## Commit message conventions
 
 ```
-spec: <file> — <what changed>          # spec doc edit
-research: <topic> — <what this covers> # new or updated research doc
-gap: v<N> — <what resolved/surfaced>   # gap report update
-infra: <topic>                         # CLAUDE.md or repo structure changes
+spec: <file or topic> — <what changed>        # spec doc edit
+research: <topic> — <what this covers>        # new or updated research doc (+ its prototype)
+gap: v1 §<N> — <what resolved/surfaced>       # gap tracker update
+infra: <topic>                                # CLAUDE.md or repo structure changes
 ```
