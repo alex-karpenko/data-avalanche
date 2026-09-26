@@ -32,10 +32,10 @@ data-avalanche/
 │   ├── specs/                                     source of truth (Oleksii owns)
 │   │   ├── System-Overview.md                     top-level requirements (incl. Sinks block)
 │   │   ├── Data-Flow.md                           pipeline phases, TableChangeSet, sink contract + realizations
-│   │   ├── Configuration_Specification.md         YAML config model, validation rules V-001…V-113
+│   │   ├── Configuration_Specification.md         YAML config model, validation rules V-001…V-114
 │   │   └── Schema_Change_Detection_and_Evolution.md   DDL detection & per-sink evolution
 │   ├── research/                                  Claude authors, Oleksii reviews
-│   │   ├── Multi_Sink_Architecture_and_Delta_Lake.md   sink abstraction, Delta sink, D-MS.1–15
+│   │   ├── Multi_Sink_Architecture_and_Delta_Lake.md   sink abstraction, Delta sink, D-MS.1–16
 │   │   ├── Type_Mapping.md                        DB → ColumnValue → Arrow → sink (Hop 3a Iceberg / 3b Delta)
 │   │   ├── Clustering_Architecture_Research.md    two-plane cluster, lease, fencing (D-1…D-11)
 │   │   ├── Catalog_Auth_Research.md               Iceberg catalog authentication
@@ -59,7 +59,7 @@ data-avalanche/
 └── prototypes/                                    capability probes (standalone crates, not the app)
     ├── lease-conformance/                         storage CAS lease T1–T10 on real S3/GCS/Azure
     ├── iceberg-capability/                        iceberg-rust gates (append-only finding, G2 probe)
-    └── delta-capability/                          delta-rs 1.0 gates P1–P7 (MERGE, fence, cost)
+    └── delta-capability/                          delta-rs 1.0 gates P1–P10 (MERGE, fence, cost, types)
 ```
 
 There is no application code yet; the design corpus and the prototypes are the current deliverables.

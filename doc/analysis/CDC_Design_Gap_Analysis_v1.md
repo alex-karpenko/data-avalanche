@@ -1262,12 +1262,14 @@ Source: `research/Multi_Sink_Architecture_and_Delta_Lake.md` — all decisions *
 | DA-MS-4 | Delta commit atomicity on real S3/GCS/Azure via conditional put (P8) | 🔴 | 🆕 🧪 | Same capability class as DA-CLUS-1 (proven for the lease). |
 | DA-MS-5 | Delta schema evolution gaps (no drop/rename/widen in delta-rs) | 🟢 | ✅(design) | Soft-drop + warn (D-MS.9); widen → halt. |
 | DA-MS-7 | delta-rs 1.0 refuses ADD COLUMN on column-mapping (`name`) tables (probe P7b) | 🟡 | ✅ | Would disable the only Delta evolution op. **R-1 decided 2026-09-26**: `sink.delta.column_mapping` default `none`, `name` rejected in v1 (V-092). |
+| DA-MS-8 | **`timestamp_ntz` raises the Delta table protocol to reader v3 / writer v7** (probe P10) | 🟡 | ✅ | Any source `timestamp without time zone` column (common in PG/MySQL) makes the Delta table require `timestampNtz` table-feature support; engines without it cannot read the table at all. Without such a column the table stays at reader 1 / writer 2 (P10b). Options: (a) accept + document reader requirements; (b) map `timestamp_ntz` → Delta `timestamp` (UTC-interpreted wall clock; keeps the protocol minimal, loses the no-tz marker); (c) → string; (d) a `sink.delta` option choosing (a)/(b). **Recommendation: (d) with default (a)** — correct semantics by default, an explicit escape hatch for legacy-reader estates. **Decided 2026-09-26 (D-MS.16): (d) with default (a)** — `sink.delta.timestamp_ntz_as: timestamp_ntz | timestamp | string` (config §9.4.3, V-114). |
+| DA-MS-9 | Hop-3b type mapping verified end-to-end (probe P10) | 🟢 | ✅ | All types exact through append + MERGE; independent DuckDB (delta-kernel) cross-read agrees; tz vs ntz semantics preserved. |
 | DA-DEP-1b | Single arrow major across sinks (P9) | 🟢 | ✅(resolution) | deltalake 1.0 + iceberg `main` resolve to one arrow/parquet 59.3; joint compile not yet run. |
 | DA-MS-6 | Spec-merge debt from the multi-sink design | 🟢 | ✅ | **Applied 2026-09-26**: System-Overview (Sinks block, pluggable format), Data-Flow (Phase 0 sink preflight, Phase 3 collapse + `TableChangeSet` + TRUNCATE barrier, Phase 4 sink contract + Iceberg/Delta realizations), Config (`sink.type` required, `sink.iceberg`/`sink.delta`, catalog → `sink.iceberg.catalog`, pipeline-level `schema_evolution`, sink preconditions §11.2, V-083…V-093), Schema §7 (Applied/Degraded/Unsupported, Delta column), Type_Mapping (logical tags, Hop 3b). |
 
 ### 25.4 Next
 
-1. ~~`prototypes/delta-capability/` — probes P1–P7~~ ✅ 2026-09-26; remaining: **P8** (real S3/GCS/Azure commit atomicity), **P10** (type round-trip + external reader).
+1. ~~`prototypes/delta-capability/` — probes P1–P7, P10~~ ✅ 2026-09-26; remaining: **P8** (real S3/GCS/Azure commit atomicity). P10 finding DA-MS-8 decided (D-MS.16: `sink.delta.timestamp_ntz_as`, default `timestamp_ntz`).
 2. ~~Spec patches (DA-MS-6)~~ ✅ applied 2026-09-26.
 3. Implementation order: core → Delta sink (mirror) → Iceberg sink (changelog; mirror when capable).
    **v1 consequence:** with Iceberg mirror capability-gated (DA-SINK-1i) and changelog deferred

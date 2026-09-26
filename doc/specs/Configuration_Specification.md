@@ -783,6 +783,7 @@ Settings apply when the sink **creates** a table; existing tables keep their pro
 | `column_mapping` | enum `none`\|`name` | no | `none` | PR (new tables) | `name` is **rejected in v1** (V-092): delta-rs 1.0 refuses ADD COLUMN on column-mapped tables, which would disable the only Delta schema-evolution op (probe P7b). |
 | `checkpoint_interval` | integer | no | `10` | PR (new tables) | → `delta.checkpointInterval`. ≥ 1. |
 | `log_retention` | Duration | no | `30d` | PR (new tables) | → `delta.logRetentionDuration`. Expired-log cleanup runs as a post-commit hook (format metadata housekeeping). |
+| `timestamp_ntz_as` | enum `timestamp_ntz`\|`timestamp`\|`string` | no | `timestamp_ntz` | PR (new tables) | Delta type for source `timestamp without time zone` columns (DA-MS-8). `timestamp_ntz`: exact semantics, but the table is created at **reader v3 / writer v7** (`timestampNtz` table feature) — engines without table-feature support cannot read it. `timestamp`: the wall-clock value stored as a UTC instant; keeps the protocol at reader 1 / writer 2, loses the no-time-zone marker. `string`: `YYYY-MM-DD HH:MM:SS.ffffff`. A per-column `tables.column_type_overrides` entry takes precedence. Existing tables keep their column type. V-114. |
 | `table_properties` | map<string,string> | no | `{}` | PR (new tables) | Passthrough of allow-listed `delta.*` table properties (V-093). |
 | `catalog.type` | enum `none`\|`glue`\|`unity`\|`hive` | no | `none` | PR | Catalog **registration** of Delta tables. v1 implements `none` (path-based tables); other values are reserved (V-088). |
 
@@ -1203,6 +1204,7 @@ radius. `reload` locus marks a rule that can only fire on reload.
 | V-110 | `sink.max_transaction_buffer_bytes` | ≥ 16 MiB. | error | pipeline |
 | V-111 | `sink.buffer_capacity_rows` | ≥ 1. | error | pipeline |
 | V-112 | `sink.iceberg.catalog.retry` | `max_attempts ≥ 1`; `base_backoff ≤ max_backoff`. | error | pipeline |
+| V-114 | `sink.delta.timestamp_ntz_as` | ∈ {timestamp_ntz, timestamp, string}. | error | pipeline |
 
 ### 13.4 Cross-field / conditional
 
@@ -1430,6 +1432,7 @@ pipelines:
       delta:
         checkpoint_interval: 10
         log_retention: 30d
+        timestamp_ntz_as: timestamp_ntz          # default; `timestamp` keeps reader v1 (DA-MS-8)
         catalog: { type: none }                # path-based Delta tables (v1)
 ```
 
@@ -1507,7 +1510,7 @@ Every deviation, so nothing is silent:
     `tables.partitioning` (per-table maps); `sink.max_transaction_batch_rows` /
     `max_transaction_buffer_bytes` / `buffer_capacity_rows` / `metrics.per_table`;
     `sink.iceberg.catalog.retry` and `glue.strip_schema`; identifier / partition start-time checks
-    (§11.2); rules **V-094…V-113**. `tables.surrogate_key` (G-30 rejected) and
+    (§11.2); rules **V-094…V-113**. Later the same day: `sink.delta.timestamp_ntz_as` (DA-MS-8, V-114). `tables.surrogate_key` (G-30 rejected) and
     `source.consistent_snapshot` (G-7 moot) struck from §16.
 
 None of these change the **decided** catalog-auth schema (hive Thrift `none/ldap/kerberos`;
