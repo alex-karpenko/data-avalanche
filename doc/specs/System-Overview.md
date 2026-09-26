@@ -33,7 +33,7 @@ MySQL / MariaDB (binlog / GTID)               ─┘        │
 
 - **Sources:** PostgreSQL (logical replication, `pgoutput`), MySQL 8.x, and MariaDB (binlog, row-based, GTID-positioned — both GTID dialects).
 - **Sink:** Delta Lake only (mirror mode: upserts + deletes via one MERGE per table per flush). `sink.type: iceberg` stays a valid config value, but such a pipeline is **refused at start** ("the Iceberg sink ships in v2") while other pipelines keep running — so v1 → v2 needs no config migration. The Iceberg design and probes carry over as the v2 backlog.
-- **Replication-lag targets** (at default config; measured by `cdc_replication_lag_seconds`): steady-state **p99 ≤ 60s**; after an owner failure, back under that target within **2 min**. Initial/re-snapshot backfill, a single transaction larger than the flush bounds, and heavy random-key MERGE churn on large tables are excluded.
+- **Replication-lag targets** (at default config; measured by `data_avalanche_replication_lag_seconds`): steady-state **p99 ≤ 60s**; after an owner failure, back under that target within **2 min**. Initial/re-snapshot backfill, a single transaction larger than the flush bounds, and heavy random-key MERGE churn on large tables are excluded.
 - **Out of v1 scope** (deferred, with a reopen path): external secret-manager integration (a sidecar writing the credential file is the supported pattern), the `kubernetes` lock backend, per-source-endpoint takeover limits, spill-to-disk for oversized transactions, and atomic visibility **across** tables (each table commits atomically on its own).
 
 Decisions: `research/V1_Scope_Decisions.md`.
@@ -128,6 +128,7 @@ Functional endpoints are versioned under `/v1`; probes and metrics are unversion
 | Pipelines status | `GET /v1/pipelines`, `GET /v1/pipelines/{id}` | viewer | `desired_state`, `actual_state`, positions, per-table status (halted tables with their reason) |
 | Request snapshot | `POST /v1/pipelines/{id}/snapshots` | operator | tables list, no globs |
 | Snapshot job status | `GET /v1/snapshots/{job_id}` | viewer | |
+| List snapshot jobs | `GET /v1/pipelines/{id}/snapshots` | viewer | persisted in the pipeline state location; survive restart and failover |
 | Pipeline pause | `POST /v1/pipelines/{id}/pause` | operator | `RUNNING → PAUSED`: flush to a transaction boundary and commit; source connection kept warm; lease kept |
 | Pipeline stop | `POST /v1/pipelines/{id}/stop` | operator | `RUNNING/PAUSED → STOPPED`: flush, close the source connection (PG slot kept); lease kept |
 | Pipeline resume | `POST /v1/pipelines/{id}/resume` | operator | `PAUSED/STOPPED → RUNNING` |
@@ -144,12 +145,12 @@ Pause/stop/resume set the pipeline's persisted **desired state**; it survives re
 
 | Family | Metrics (mandatory) |
 |---|---|
-| Replication | `cdc_replication_lag_seconds` (headline — see the lag targets in Scope), `cdc_rows_read_total{op}`, `cdc_rows_written_total`, `cdc_flush_duration_seconds`, `cdc_flush_rows`, `cdc_transaction_buffer_bytes` |
-| Source health | `cdc_wal_lag_bytes` (PG) / `cdc_binlog_lag_seconds` (MySQL/MariaDB), `cdc_source_reconnects_total` |
-| Snapshot | `cdc_snapshot_rows_done`, `cdc_snapshot_state`, `cdc_snapshot_chunk_duration_seconds` |
-| Sink | `cdc_sink_commit_duration_seconds{sink_type}`, `cdc_sink_commit_failures_total`; Delta MERGE cost and maintenance signals: `cdc_sink_merge_files_rewritten`, `cdc_sink_merge_rows_copied`, `cdc_sink_soft_dropped_columns` |
-| Clustering | `cdc_lease_state`, `cdc_lease_renew_failures_total`, `cdc_lease_renew_latency_seconds`, `cdc_cluster_members`, `cdc_owned_pipelines`, `cdc_ring_generation` |
-| Status | `cdc_pipeline_status` (running / paused / stopped / error) |
+| Replication | `data_avalanche_replication_lag_seconds` (headline — see the lag targets in Scope), `data_avalanche_rows_read_total{op}`, `data_avalanche_rows_written_total`, `data_avalanche_flush_duration_seconds`, `data_avalanche_flush_rows`, `data_avalanche_transaction_buffer_bytes` |
+| Source health | `data_avalanche_wal_lag_bytes` (PG) / `data_avalanche_binlog_lag_seconds` (MySQL/MariaDB), `data_avalanche_source_reconnects_total` |
+| Snapshot | `data_avalanche_snapshot_rows_done`, `data_avalanche_snapshot_state`, `data_avalanche_snapshot_chunk_duration_seconds` |
+| Sink | `data_avalanche_sink_commit_duration_seconds{sink_type}`, `data_avalanche_sink_commit_failures_total`; Delta MERGE cost and maintenance signals: `data_avalanche_sink_merge_files_rewritten`, `data_avalanche_sink_merge_rows_copied`, `data_avalanche_sink_soft_dropped_columns` |
+| Clustering | `data_avalanche_lease_state`, `data_avalanche_lease_renew_failures_total`, `data_avalanche_lease_renew_latency_seconds`, `data_avalanche_cluster_members`, `data_avalanche_owned_pipelines`, `data_avalanche_ring_generation` |
+| Status | `data_avalanche_pipeline_status` (running / paused / stopped / error) |
 
 **Tracing:** a span per flush/commit cycle, per snapshot chunk and per DDL apply (no per-event spans), sampled by `globals.tracing.sample_ratio`.
 

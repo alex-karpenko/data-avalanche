@@ -239,11 +239,11 @@ the per-context requirement rules (V-010, V-040, V-044, V-045, V-049).
 ## 5. Reserved metadata column names
 
 The accumulator injects lineage columns (`_op`, `_ts`, `_lsn`, `_seq`, `_source_db`, `_pipeline`;
-see `Data-Flow.md`). The `__avalanche_` prefix is reserved for sink-internal working columns (e.g.
+see `Data-Flow.md`). The `__data_avalanche_` prefix is reserved for sink-internal working columns (e.g.
 the Delta MERGE delete flag); they are never persisted.
 
 **Collision rule (D-V1.1).** A source column whose name equals a lineage column, or starts with
-`__avalanche_`, **halts that table** with `RESERVED_COLUMN_COLLISION` naming the column; other tables
+`__data_avalanche_`, **halts that table** with `RESERVED_COLUMN_COLLISION` naming the column; other tables
 continue. The comparison is **case-insensitive** (Delta column names are). It is checked when the table
 is resolved at start (§11.2), before the target table is created, and on schema evolution: an
 `ADD COLUMN` or rename to a reserved name is Unsafe (`Schema_Change_Detection_and_Evolution.md` §7.2).
@@ -563,7 +563,7 @@ defaults:
   sink:
     type: iceberg
     write_mode: mirror
-    flush: { seconds: 60, rows: 100000, bytes: 512MiB }
+    flush: { seconds: 30, rows: 100000, bytes: 512MiB }
     iceberg:
       strategy: mor
       catalog:
@@ -592,7 +592,7 @@ Effective `orders`:
 - `sink.type: iceberg`, `write_mode: mirror` inherited; `sink.iceberg.strategy: mor` inherited
   (map merge §8.2); `sink.iceberg.catalog`: **`rest` only** — the defaulted `glue` is gone (union
   rule §8.4).
-- `sink.flush`: `seconds:60` and `bytes:512MiB` from defaults, `rows:50000` from pipeline.
+- `sink.flush`: `seconds:30` and `bytes:512MiB` from defaults, `rows:50000` from pipeline.
 
 Effective `clicks`:
 - `sink.type: delta` — the defaulted `sink.iceberg` block (strategy + catalog) is **dropped**
@@ -666,13 +666,13 @@ source:
 | `heartbeat` | Duration | no | `60s` | R | StandbyStatusUpdate interval; keeps the connection alive and prevents WAL-lag-as-inactivity. |
 | `slot_management` | enum `managed`\|`require_existing` | no | `managed` | PR | `managed`: create the slot if absent, reuse if present, drop on delete per `auto_cleanup`. `require_existing`: never create (DBA-owned slot; error if absent) and **requires `auto_cleanup: false`** (V-103). `research/Postgres_Slot_and_Publication_Lifecycle.md` §2. |
 | `slot_on_orphan` | enum `halt`\|`adopt_resnapshot` | no | `halt` | R | Slot exists but the pipeline has no state for it. `halt`: refuse to start, naming the slot. `adopt_resnapshot`: take ownership, restart from a fresh consistent point and incrementally re-snapshot all tables. Resume-from-slot without a snapshot is never offered. (Slot-lifecycle doc §1.1; named `slot_on_orphan` because `slot` is the slot-name string.) |
-| `max_wal_lag_bytes` | ByteSize \| null | no | `null` | R | WAL-retention guard (G-22). `cdc_wal_lag_bytes` is always emitted; when set and exceeded the pipeline **halts** to protect the source disk. `null` = alert only. ≥ 64 MiB when set (V-104). |
+| `max_wal_lag_bytes` | ByteSize \| null | no | `null` | R | WAL-retention guard (G-22). `data_avalanche_wal_lag_bytes` is always emitted; when set and exceeded the pipeline **halts** to protect the source disk. `null` = alert only. ≥ 64 MiB when set (V-104). |
 
 #### 9.2.2 `source.mysql` (iff `type = mysql`)
 
 | Field | Type | Required | Default | Mutability | Notes |
 |---|---|---|---|---|---|
-| `replication_type` | enum `binlog`\|`gtid` | no | `binlog` | PR | `gtid` is preferred (position-independent, gap-free). |
+| `replication_type` | enum `binlog`\|`gtid` | no | `gtid` | PR | `gtid`: GTID-positioned stream (MySQL `gtid_executed`, MariaDB `gtid_binlog_pos`); position-independent, gap-free, survives a source failover. Requires GTID on the server (MySQL `gtid_mode=ON`; MariaDB `gtid_strict_mode=1`). `binlog`: file/position stream (`COM_BINLOG_DUMP` at `<file>:<pos>`) for servers without GTID. A file/position is only meaningful on the server that wrote it: when the source server changes (failover, restore), the pipeline **halts** with `BINLOG_SOURCE_CHANGED` (`Data-Flow.md` Phase 2b); recover by switching to `gtid` or re-snapshotting. |
 | `tinyint1_as_bool` | bool | no | `true` | PR | Map `TINYINT(1)` columns to logical `bool`. When `true`, requires the display-width from the catalog query (channel C); when `false`, `TINYINT(1)` maps as `TINYINT SIGNED` → `Int16`. See `research/Type_Mapping.md`. |
 | `tinyint1_detection` | enum `information_schema`\|`none` | no | `information_schema` | PR | Source of the `TINYINT(1)` display-width signal. `none` disables the detection (all `TINYINT` treated as integer); `information_schema` uses the catalog query (always available via channel C). |
 | `binlog_purge_action` | enum `error`\|`re_snapshot` | no | `error` | R | Resume position purged on the server (G-26). `error`: halt with an error (operator decides). `re_snapshot`: automatic recovery via incremental re-snapshot. GTID `replication_type` remains recommended. |
@@ -703,7 +703,7 @@ tables:
 | `snapshots.parallelism` | integer | no | `1` | R | ≥ 1 (V-027). Concurrent snapshot jobs. **> 4 warns** (V-038): each PG snapshot job uses ≥ 3 connections. The limit is read by the snapshot scheduler at job-launch time; a change affects only **future** scheduling — in-flight and already-queued jobs are unaffected — so it applies in place. Implies an adjustable permit count, not a pool sized once at pipeline start. |
 | `snapshots.chunk_size` | integer | no | `10000` | R | Rows per keyset chunk of the incremental snapshot; the resume cursor is checkpointed per chunk (`research/Snapshot_Resumability_and_Consistency.md` §5). ≥ 1; very large values warn (V-108). |
 | `snapshots.overrides` | map<table,mode> | no | `{}` | PR | Per-table mode override. Keys are full `schema.table` for PostgreSQL / bare table name for MySQL (V-064), **no globs** (V-033). A key not in the resolved set **warns** at load (V-034). Not allowed in `defaults`. |
-| `column_type_overrides` | map<column, logical-type> | no | `{}` | PR | Per-column target-type override applied at schema resolution (e.g. `public.orders.amount: "decimal(38,10)"`). Values use the **sink-neutral logical type grammar** — `bool`, `int16`, `int32`, `int64`, `float32`, `float64`, `decimal(P,S)`, `string`, `binary`, `date`, `time`, `timestamp_tz`, `timestamp_ntz`, `uuid`, `json`, `list<T>` — never a format-specific type name (Iceberg `timestamp` = without tz, Delta `timestamp` = with tz). Each sink maps it to its physical type (`research/Type_Mapping.md` Hop 3). Must be valid (V-078) and mappable by the pipeline's sink (V-087). First step of the unsupported-type fallback chain. |
+| `column_type_overrides` | map<column, logical-type> | no | `{}` | PR | Per-column target-type override applied at schema resolution (e.g. `public.orders.amount: "decimal(38,10)"`). Values use the **sink-neutral logical type grammar** — `bool`, `int16`, `int32`, `int64`, `float32`, `float64`, `decimal(P,S)`, `string`, `binary`, `date`, `time`, `timestamp_tz`, `timestamp_ntz`, `uuid`, `json`, `list<T>` — never a format-specific type name (Iceberg `timestamp` = without tz, Delta `timestamp` = with tz). Each sink maps it to its physical type (`research/Type_Mapping.md` Hop 3). Must be valid (V-078) and mappable by the pipeline's sink (V-087). First step of the unsupported-type fallback chain. A `string` override of a MySQL/MariaDB `DATE` / `DATETIME` / `TIMESTAMP` column carries the server's raw text (e.g. `2024-00-15`); it is the remedy for an `INVALID_DATE_VALUE` halt (`research/Type_Mapping.md` §Date/time edge values). |
 | `numeric_overflow_action` | enum `string`\|`error` | no | `string` | PR | Action when a `numeric(P,S)` with `P > 38` (beyond Iceberg `decimal` range) is encountered: `string` serializes it as text; `error` halts the table. With `error`, unscaled `numeric` columns may halt unexpectedly (V-079 warning). |
 | `primary_key` | map<table, list<column>> | no | `{}` | PR (re-snapshot) | Identifier override per table (G-13): replaces the inferred source PK as the upsert/delete key — needed for PG `REPLICA IDENTITY USING INDEX` on a non-PK unique index. Selects existing identifying columns; it is **not** a surrogate key (`tables.surrogate_key` was rejected, G-30). Keys: same form as `snapshots.overrides` (V-033/V-064), no globs; unknown key warns (V-106). Column constraints (exist, top-level, primitive, NOT NULL, non-floating; PG ⊆ REPLICA IDENTITY) are checked at start (§11.2). Changing it on a live table = PK change ⇒ re-snapshot. `research/Ghost_Row_Dedup_and_Primary_Keys.md` §1/§7. |
 | `partitioning` | map<table, list<field>> | no | `{}` (unpartitioned) | PR | Per-table partition spec (G-24). A field is `{ column, transform }` with `transform ∈ {identity, bucket, truncate, year, month, day, hour}` (+ `n` for `bucket`, `width` for `truncate`; V-107). `_ts` is a valid source (commit-time pruning; `day(_ts)` is the common opt-in). Transforms must be supported by the pipeline's sink (V-086 — Delta v1: `identity` only). A change applies to **new data only** (Iceberg spec evolution; no rewrite of history). Keys as for `primary_key`. Column existence / temporal-type checks at start (§11.2). `research/Iceberg_Partitioning_and_Layout_Evolution.md`. |
@@ -730,7 +730,7 @@ sink:
   write_mode: mirror          # mirror (v1) | changelog (reserved, V-089)
   bucket: lake-bucket
   prefix: orders
-  flush: { seconds: 60, rows: 100000, bytes: 512MiB }
+  flush: { seconds: 30, rows: 100000, bytes: 512MiB }
   iceberg: { ... }            # iff type = iceberg (§9.4.2)
   delta:   { ... }            # iff type = delta   (§9.4.3)
 ```
@@ -759,7 +759,7 @@ states: **absent** → use default; explicit **`null`** → disabled; **value** 
 
 | Field | Type | Required | Default | Mutability | Notes |
 |---|---|---|---|---|---|
-| `seconds` | integer \| null | no | `60` | R | Max age of the oldest buffered event. `0` = flush at **every transaction boundary** (not per-row). `null` = time-based flushing **disabled**. `< 5` (and > 0) **warns** (write amplification, V-037). |
+| `seconds` | integer \| null | no | `30` | R | Max age of the oldest buffered event. `0` = flush at **every transaction boundary** (not per-row). `null` = time-based flushing **disabled**. `< 5` (and > 0) **warns** (write amplification, V-037). |
 | `rows` | integer \| null | no | `100000` | R | Max buffered rows. `null` = disabled. |
 | `bytes` | ByteSize \| null | no | `512MiB` | R | Max buffered size. `null` = disabled. |
 
@@ -818,7 +818,7 @@ sink:
 |---|---|---|---|---|---|
 | `type` | enum `glue`\|`hive`\|`rest` | no | inferred | PR | **NEW (vs draft).** Optional explicit discriminator, symmetric with `source.type`. If present it must match the single present sub-block (V-002); if absent it is inferred from the one present sub-block (0 or >1 present = error). |
 | `glue` / `hive` / `rest` | object | one required (resolvable) | — | PR | §9.5.1–9.5.3. |
-| `retry` | object | no | `{max_attempts: 5, base_backoff: 1s, max_backoff: 30s}` | R | Catalog-operation retry policy, separate from object storage (G-35): exponential backoff + jitter, then **DEGRADED** (alert via `cdc_pipeline_status`), with a circuit breaker so a down catalog is not hammered. V-112. Not part of the union; merges normally. |
+| `retry` | object | no | `{max_attempts: 5, base_backoff: 1s, max_backoff: 30s}` | R | Catalog-operation retry policy, separate from object storage (G-35): exponential backoff + jitter, then **DEGRADED** (alert via `data_avalanche_pipeline_status`), with a circuit breaker so a down catalog is not hammered. V-112. Not part of the union; merges normally. |
 
 #### 9.5.1 `sink.iceberg.catalog.glue` (valid only if `globals.cloud = aws`, V-028)
 
@@ -959,7 +959,7 @@ engines and consistent with `Data-Flow.md`'s `TableRef { schema, name }` and
 ```
 The location is already scoped to a single pipeline (`sink.prefix` / `state.prefix` default to
 the pipeline `id`, which is unique per V-056), so the internal layout from `Data-Flow.md`
-(`pipeline-state.json`, `replication/slot.json` + `gtid.json`, `snapshots/<schema>.<table>.json`)
+(`pipeline-state.json`, `replication/slot.json` + `position.json`, `snapshots/<schema>.<table>.json`)
 sits **directly** under this root — no `pipelines/<id>/` namespacing segment. The
 `.pipeline-state/` marker in the co-located case is what separates state from the table data
 that shares `sink.prefix`; in the explicit case the entire location is pipeline state, so no
@@ -1065,7 +1065,7 @@ on.
 | Both | Each table has an **identifier**: an inferred PK, or a `tables.primary_key` override whose columns exist and are top-level, primitive, NOT NULL, non-floating | error → halt table (explicit table) / warning + skip (glob-matched PK-less table) | Upsert/delete keying (G-13, G-30). |
 | PostgreSQL | Identifier columns ⊆ **REPLICA IDENTITY** columns | error → halt table, naming the missing columns | Before-image must carry the old key (`Ghost_Row…` §2). |
 | Both | `tables.partitioning` columns exist; temporal transforms target a date/time column | error → halt table | Partition spec validity (G-24). |
-| Both | No source column is named like a lineage column (`_op`, `_ts`, `_lsn`, `_seq`, `_source_db`, `_pipeline`) or prefixed `__avalanche_`, compared case-insensitively | error → halt table (`RESERVED_COLUMN_COLLISION`) | The accumulator injects these columns (§5, D-V1.1). |
+| Both | No source column is named like a lineage column (`_op`, `_ts`, `_lsn`, `_seq`, `_source_db`, `_pipeline`) or prefixed `__data_avalanche_`, compared case-insensitively | error → halt table (`RESERVED_COLUMN_COLLISION`) | The accumulator injects these columns (§5, D-V1.1). |
 
 Because these are runtime checks, they sit outside the all-or-nothing config-validation contract:
 a privilege or server-setting problem on one pipeline's source does not reject the config or stop
@@ -1093,9 +1093,10 @@ others keep running). Authority: `Data-Flow.md` Phase 0 step 4 and
 (Phase 1) → resolution (Phase 2) → resolved config (Phase 3)** per §11 → diff the new resolved
 config against the running resolved config → reconcile. Because the diff is over **resolved**
 values (§11.1), a change limited to a `credentials_file`'s contents or any other referenced
-secret/cert is detected here even though the config text is unchanged. Cross-worker propagation of
-the reload (so peers also re-read) is a **design item (G-2 / G-17)** and is out of scope for this
-schema; this section defines only what one worker does with the new file.
+secret/cert is detected here even though the config text is unchanged. Cross-worker propagation
+(config generations published to `globals.state`, every worker converging on the same generation, no
+request proxying) is specified in `research/Clustering_Architecture_Research.md` §9 (closes G-2 / G-17);
+this section defines what one worker does with a new generation.
 
 ### 12.2 Diff granularity
 
@@ -1120,12 +1121,13 @@ highest class touched.
 
 The default for a restart (PR change, explicit `restart`/`stop`, or `id` change) is
 **discard-and-replay**: drop unflushed in-memory batches and replay from the last confirmed
-offset (the Phase-4 exactly-once guard deduplicates). A graceful-flush option (flush before
-restart) is a planned flag on the restart path (gap 2.2). The replay window is bounded by the
-checkpoint interval (flush-driven, per `Data-Flow.md`).
+offset (the Phase-4 exactly-once guard deduplicates). To flush first, call the `flush` action and
+then `restart` (`research/Pipeline_Lifecycle_State_Machine.md` §3). The replay window is bounded by
+the checkpoint interval (flush-driven, per `Data-Flow.md`).
 
-> The detailed pipeline **state machine** (RUNNING/PAUSED/STOPPED, which transitions flush /
-> release leases / persist to cloud) is a design item (G-NEW-15) and not fixed by this schema.
+> The pipeline **state machine** (desired vs actual state; RUNNING / PAUSED / STOPPED; `restart` and
+> `flush` as actions; persistence and failover of `desired_state`) is specified in
+> `research/Pipeline_Lifecycle_State_Machine.md` (closes G-NEW-15).
 
 ---
 
@@ -1379,7 +1381,7 @@ defaults:
   sink:
     type: iceberg                              # REQUIRED somewhere (V-091); set once here
     write_mode: mirror
-    flush: { seconds: 60, rows: 100000, bytes: 512MiB }
+    flush: { seconds: 30, rows: 100000, bytes: 512MiB }
     iceberg:
       strategy: mor
       catalog:
@@ -1418,7 +1420,7 @@ pipelines:
     sink:
       bucket: ${ACCOUNT_ID}-lake
       prefix: orders_pg
-      flush: { rows: 50000 }                   # merges over defaults (seconds:60, bytes:512MiB kept)
+      flush: { rows: 50000 }                   # merges over defaults (seconds:30, bytes:512MiB kept)
 
   events-mysql:
     id: events_mysql

@@ -47,7 +47,7 @@ On worker start (or when a pipeline is assigned via the consistent hash ring), t
 
 ```
 1. Load pipeline state from cloud storage
-   └── confirmed LSN / binlog name+position / GTID per table
+   └── confirmed position: PG LSN / MySQL GTID set / MariaDB GTID position / binlog file:pos
    └── snapshot status per table (none | in-progress | completed | broken)
    └── replication slot name (if PG)
 
@@ -102,10 +102,12 @@ READ LOCK` model (which could not resume mid-table — an exported snapshot dies
 1. Establish the stream:
    PG    — CREATE_REPLICATION_SLOT slot LOGICAL pgoutput; capture start_lsn (WAL retention begins);
            persist slot_name + start_lsn; stream from start_lsn.
-   MySQL — position the binlog stream at gtid_executed (COM_BINLOG_DUMP_GTID); stream immediately.
+   MySQL — position the binlog stream at the current position (gtid: COM_BINLOG_DUMP_GTID with
+           gtid_executed; binlog: COM_BINLOG_DUMP at SHOW BINARY LOG STATUS file:pos); stream immediately.
 
 2. Per table, ordered by the G-13 identifier — chunk loop:
-   a. lw  = current stream position            (pg_current_wal_lsn() / @@gtid_executed; read-only)
+   a. lw  = current stream position            (pg_current_wal_lsn() / @@gtid_executed /
+                                                 SHOW BINARY LOG STATUS file:pos; read-only)
    b. read chunk: SELECT ... WHERE (key) > (cursor) ORDER BY (key) LIMIT chunk_size
                   in a SHORT read-committed txn; buffer the rows
                   rows → CdcEvent { op: Snapshot (_op = r), after: Row, ... }
@@ -183,16 +185,30 @@ Replication connection (replication protocol, not SQL)
   10s in the crate. Setting the wakeup to the status interval bounds how late a quiet-period ack
   reaches the slot. This is slot lag, not a correctness issue.
 
-**TOAST columns:** Unchanged large columns in UPDATE events are represented by a "unchanged TOAST" marker, not the actual value. The pipeline must either re-fetch the value via a separate query or treat the column as unchanged and carry forward the last known value.
+**TOAST columns:** Unchanged large columns in UPDATE events arrive as an "unchanged TOAST" marker
+(pgoutput `u`), not the value. `source.toast_strategy` chooses the handling:
+
+- **`carry_forward` (default)** keeps the last known value without a source round-trip:
+  1. The decoder marks the column in the row's *unchanged* mask instead of inventing a value.
+  2. The collapse (keep-last per key) fills a masked column from an earlier image of the same key
+     in the same batch, or from the snapshot row it supersedes; the mask bit is then cleared.
+  3. A column still masked at commit is written from the target: the Delta MERGE updates it with
+     `CASE WHEN <mask> THEN t.col ELSE s.col END`, so the stored value is kept.
+  4. An insert whose masked column cannot be resolved (no target row, e.g. `snapshot_mode: never`)
+     writes NULL and increments a metric.
+- **`re_query`** re-fetches the row over the control connection (V-077 warns on heavy snapshots).
+
 
 ---
 
 ## Phase 2b — Streaming Replication: MySQL
 
 ```
-Replication connection (binlog dump, GTID-positioned)
+Replication connection (binlog dump; replication_type gtid (default) or binlog)
 │
 ├─► Detect the server flavour at connect (`SELECT version()`) → GTID dialect
+│
+├─► binlog (file/position) mode — see "File/position mode" below
 │
 ├─► MySQL:   COM_BINLOG_DUMP_GTID with the gtid_executed set from state storage
 │   MariaDB: SET @mariadb_slave_capability=4, @slave_connect_state='<gtid_pos>',
@@ -231,7 +247,8 @@ Replication connection (binlog dump, GTID-positioned)
     │
     ├─► XID_EVENT
     │   └─► emit TransactionBoundary(current_gtid) to accumulator
-    │   └─► update the local position (MySQL gtid_executed set / MariaDB gtid_binlog_pos)
+    │   └─► update the local position (MySQL gtid_executed set / MariaDB gtid_binlog_pos /
+    │       file/position mode: current file + the event's end_log_pos)
     │
     └─► ROTATE_EVENT
         └─► update current binlog filename; clear table_id cache
@@ -241,6 +258,29 @@ Replication connection (binlog dump, GTID-positioned)
 MySQL 8.4 and MariaDB 11.4 (MariaDB is in v1 — D-V1.5). The payload check is ours because the pinned
 crate **silently drops** a compressed transaction it cannot decompress (DA-SRC-12, D-V1.6). It halts the
 pipeline, not the table: the position cannot advance past a transaction that was not read.
+
+**File/position mode (`replication_type: binlog`, MySQL and MariaDB):**
+
+```
+Connect
+├─► read the server identity: MySQL @@server_uuid / MariaDB @@server_id
+├─► no stored position (first start):
+│     record the identity and SHOW BINARY LOG STATUS (MySQL 8.4) / SHOW BINLOG STATUS (MariaDB)
+│     as the start position; Phase 1 watermarks use the same statement
+├─► stored position present:
+│   ├─► identity differs from the recorded one → halt the PIPELINE (BINLOG_SOURCE_CHANGED):
+│   │     "binlog position <file>:<pos> was recorded on server <old>, now connected to <new>;
+│   │      file/position cannot be carried across servers — switch to replication_type: gtid
+│   │      or re-snapshot". No automatic recovery (a failover under file/position mode
+│   │      would otherwise silently skip or repeat transactions).
+│   ├─► file no longer in SHOW BINARY LOGS → binlog_purge_action (error | re_snapshot, G-26)
+│   └─► COM_BINLOG_DUMP at <file>:<pos>
+└─► Event loop as above (GTID events ignored); the position after each XID_EVENT is
+    (current file, end_log_pos); ROTATE_EVENT switches the file
+```
+
+Per-change order (`_seq`) in every MySQL mode is (binlog file index from the `.NNNNNN` suffix,
+`end_log_pos`), totally ordered within one server's log.
 
 ---
 
@@ -271,8 +311,8 @@ ColumnValue = Null
             | Numeric(Decimal)
             | Text(String)
             | Bytes(Vec<u8>)
-            | Timestamp { value: DateTime<Utc>, with_tz: bool }     // with_tz distinguishes timestamp vs timestamptz (Gap A)
-            | Date(NaiveDate)
+            | Timestamp { micros: i64, with_tz: bool }              // µs since Unix epoch; with_tz distinguishes timestamp vs timestamptz (Gap A)
+            | Date(i32)                                             // days since Unix epoch (= Arrow Date32 range; edge values clamp, Type_Mapping)
             | Time(NaiveTime)                                       // PG time / MySQL TIME, no date component (Gap D)
             | Uuid(Uuid)
             | Json(serde_json::Value)
@@ -301,7 +341,7 @@ Accumulator state (per-table):
 │
 ├─► SchemaBuilder         — builds Arrow schema from first event's column set
 ├─► Vec<ArrayBuilder>     — one Arrow array builder per column
-├─► metadata columns:     _op, _ts, _lsn, _source_db, _pipeline
+├─► metadata columns:     _op, _ts, _lsn, _seq, _source_db, _pipeline
 ├─► row_count: usize
 ├─► byte_estimate: usize
 └─► oldest_event_ts: Instant
@@ -316,7 +356,9 @@ For each incoming CdcEvent:
 │   ├─► _op:        'I' | 'U' | 'D' | 'r'  (r = snapshot/read)
 │   ├─► _ts:        commit_ts
 │   ├─► _lsn:       source_pos.to_string()
-│   └─► _source_db: pipeline.source.host + '/' + pipeline.source.database
+│   ├─► _seq:       change_seq.to_string()  (PG change LSN / binlog NNNNNN:end_log_pos)
+│   ├─► _source_db: pipeline.source.host + '/' + pipeline.source.database
+│   └─► _pipeline:  pipeline name
 │
 ├─► Update row_count += 1
 └─► Update byte_estimate += estimated_row_size
@@ -330,7 +372,7 @@ On TransactionBoundary(lsn):
 ```
 Flush trigger (OR semantics — first condition that fires):
 │
-├─► time:      now - oldest_event_ts  ≥  flush_interval      (default 60s)
+├─► time:      now - oldest_event_ts  ≥  flush_interval      (default 30s)
 ├─► rows:      row_count              ≥  max_rows            (default 100,000)
 └─► size:      byte_estimate          ≥  max_bytes           (default 512 MiB)
 
@@ -348,7 +390,7 @@ to the sink:
 TableChangeSet {
     table:      TableRef,
     schema:     SchemaRef,          // canonical Arrow schema + logical-type field metadata
-                                    // (`avalanche.logical` = uuid | time | json | uint64 | …)
+                                    // (`data-avalanche.logical` = uuid | time | json | uint64 | …)
     identifier: Vec<FieldName>,
     truncate:   bool,               // a TRUNCATE barrier precedes this set
     upserts:    Vec<RecordBatch>,   // ≤1 row per key: final image (I/U/r) + lineage columns
@@ -471,19 +513,19 @@ For each TableChangeSet:
 │
 ├─► if truncate: DELETE (no predicate) — metadata-only removal of all files
 │
-├─► MERGE source = upserts ∪ deletes, with boolean __avalanche_del
+├─► MERGE source = upserts ∪ deletes, with boolean __data_avalanche_del
 │   (deletes carry identifier + before-image partition columns; other columns NULL)
 │
 ├─► MERGE INTO target t USING source s ON t.<id cols> = s.<id cols>
 │       [AND t.<part> IN (s.<old part>, s.<new part>) — pruning only, when partitioned]
-│     WHEN MATCHED AND s.__avalanche_del          THEN DELETE
-│     WHEN MATCHED AND NOT s.__avalanche_del      THEN UPDATE SET <all columns>
-│     WHEN NOT MATCHED AND NOT s.__avalanche_del  THEN INSERT <all columns>
+│     WHEN MATCHED AND s.__data_avalanche_del          THEN DELETE
+│     WHEN MATCHED AND NOT s.__data_avalanche_del      THEN UPDATE SET <all columns>
+│     WHEN NOT MATCHED AND NOT s.__data_avalanche_del  THEN INSERT <all columns>
 │
 └─► commit (put-if-absent of _delta_log/<N>.json; conflict checker on retry) carrying:
-      txn { app_id: "avalanche/<pipeline_id>/owner", version: owner_epoch }  ← fence carrier
-      commitInfo { "avalanche.committed_position", "avalanche.owner_epoch",
-                   "avalanche.pipeline" }                                   ← position carrier
+      txn { app_id: "data-avalanche/<pipeline_id>/owner", version: owner_epoch }  ← fence carrier
+      commitInfo { "data-avalanche.committed_position", "data-avalanche.owner_epoch",
+                   "data-avalanche.pipeline" }                                   ← position carrier
     → flush_confirmation(lsn)
 ```
 
@@ -492,14 +534,14 @@ Realization of the contract:
 1. **Fence:** pre-check the table's `txn` version for the owner `app_id`; `> owner_epoch` → `Fenced`.
    A concurrent commit carrying the same `app_id` makes a stale writer's commit fail
    (`ConcurrentTransaction`). The `txn` version lives in table state, so it survives foreign commits.
-2. **Position:** read `avalanche.committed_position` from the latest own `commitInfo` (walk back).
+2. **Position:** read `data-avalanche.committed_position` from the latest own `commitInfo` (walk back).
 3. **No ghost-row hazard:** Delta has no equality deletes; MERGE rewrites the touched files, so there is
    no sequence-number rule to engineer around. A PK-changing UPDATE is delete(old) + upsert(new) in the
    same MERGE; a partition-changing UPDATE is matched by key across partitions.
 4. **Cost model:** each flush rewrites every data file whose key range contains a changed key —
    proportional to change volume for time/sequence-correlated keys, approaching a full-table rewrite
    for uniformly spread keys (probe P6: 1M rows / 40 files, 5k random updates → 40/40 files
-   rewritten). v1 exposes `cdc_sink_merge_files_rewritten` / `cdc_sink_merge_rows_copied`; a
+   rewritten). v1 exposes `data_avalanche_sink_merge_files_rewritten` / `data_avalanche_sink_merge_rows_copied`; a
    deletion-vector writer is the post-v1 fix (D-MS.15).
 5. **Table creation:** column mapping **off** (delta-rs 1.0 refuses ADD COLUMN under column mapping),
    deletion vectors off, `delta.checkpointInterval` / `delta.logRetentionDuration` from `sink.delta`.
@@ -524,12 +566,20 @@ After receiving `flush_confirmation(lsn)` from the sink writer:
 4. Persist confirmed_flush_lsn to state storage
 ```
 
-**MySQL:**
+**MySQL / MariaDB:**
 ```
-1. Update local gtid_executed set to include the flushed transactions
-2. Persist updated gtid_executed to state storage
-   (MySQL binlog has no server-side acknowledgment — the executed set is the resume point)
+1. Update the local position to the flush frontier (MySQL gtid_executed set / MariaDB GTID
+   position / binlog file:pos)
+2. Persist it to state storage (replication/position.json)
+   (the binlog has no server-side acknowledgment — the persisted position is the resume point)
 ```
+
+**Checkpoint rule (all sources).** The resume checkpoint is the **flush frontier**: the stream
+position up to which every complete transaction was part of this flush. It is persisted only after
+**every table in the flush** reports `Committed` or `SkippedCovered`; each table's
+`committed_position` is set to that frontier, including tables no transaction touched. (Recording
+only the positions of transactions that touched a table would let an idle table pin the resume
+point forever and block PG WAL release.)
 
 The state storage write (step 4 / step 2) is the crash-safe checkpoint. On restart, the pipeline resumes streaming from the last persisted position, replaying any events not yet flushed. Idempotent sink commits (and the Phase 4 position guard) absorb the resulting duplicates.
 
@@ -550,7 +600,9 @@ membership, the lease registry) lives separately under `globals.state` per
 │                                                  (resume refuses a mismatch with `sink.type`)
 ├── replication/
 │   ├── slot.json                                — PG: slot name, confirmed_flush_lsn
-│   └── gtid.json                                — MySQL: gtid_executed set · MariaDB: domain-server-seq list
+│   └── position.json                            — MySQL/MariaDB: tagged position (`mysql-gtid:…` /
+│                                                  `mariadb-gtid:…` / `binlog:<file>:<pos>`) + the
+│                                                  source server identity (file/position mode)
 └── snapshots/
     ├── <schema>.<table>.json                    — per-table snapshot state
     │   {
@@ -560,28 +612,39 @@ membership, the lease registry) lives separately under `globals.state` per
     │     "row_count": 1234567,
     │     "completed_at": "2026-06-06T..."
     │   }
-    └── ...
+    ├── ...
+    └── jobs/<job_id>.json                        — on-demand snapshot jobs (tables, status, per-table
+                                                    progress, requested_at/by, finished_at); survive
+                                                    restart and failover
 ```
 
 ---
 
 ## On-Demand Snapshot Flow
 
-Triggered via the management REST API (`POST /pipelines/{name}/snapshot`):
+Triggered via the management REST API (`POST /v1/pipelines/{id}/snapshots`; see `System-Overview.md`
+endpoint table):
 
 ```
 Request payload: { tables: ["schema.orders", "schema.products"] }
                   (exact table names, no globs; may include tables not in pipeline config)
 
 1. Validate: tables list non-empty, no globs.
+   Persist a job record snapshots/jobs/<job_id>.json (status queued) before responding.
 2. For each table: run the Phase-1 chunk loop (watermark lw/hw + keyset chunks) WITHOUT pausing the
    stream. Tables already in the streaming set keep streaming; the snapshot reconciles against the
    live stream exactly as at startup.
 3. Tables not in the pipeline config: snapshot is written to the sink but the table is not added to
    the pipeline's streaming set.
-4. Update snapshot_status = completed in state storage.
-5. Return snapshot job ID; status queryable via GET /v1/snapshots/{id}.
+4. Update snapshot_status = completed in state storage; mark the job completed (or failed, with
+   the error).
+5. Return the snapshot job ID; status via GET /v1/snapshots/{job_id}, all jobs of a pipeline via
+   GET /v1/pipelines/{id}/snapshots.
 ```
+
+Jobs are persisted in the per-pipeline state location, so they are **listed after a restart or a
+failover**. A job that was running continues on the (new) owner from the persisted per-table chunk
+cursors, like the Phase-1 snapshot does after a crash.
 
 There is **no stream pause and no `pause_lsn + 1` assumption**: watermarks reconcile re-snapshotted
 rows against concurrent changes, and idempotent upserts mean re-reading existing keys re-writes the
@@ -600,7 +663,7 @@ Replication stream error / TCP timeout
 ├─► Close connection
 ├─► Exponential backoff (initial 1s, max 60s, jitter)
 ├─► Reconnect and re-authenticate
-└─► Resume from last confirmed_flush_lsn (PG) or gtid_executed (MySQL)
+└─► Resume from last confirmed_flush_lsn (PG) or the persisted MySQL/MariaDB position
     ─ any events since last confirmed position are replayed
     ─ idempotent sink commits (+ Phase 4 position guard) absorb previously flushed events
 ```
@@ -635,7 +698,8 @@ Node dies (SWIM detects via failed probes → marks dead)
 │
 └─► New owner starts each inherited pipeline (Phase 0):
     ├─► Reads state from cloud storage
-    └─► Resumes from last confirmed_flush_lsn / gtid_executed
+    └─► Resumes from last confirmed_flush_lsn / persisted MySQL position
+        (file/position mode: a changed source server halts, BINLOG_SOURCE_CHANGED)
         (worst-case replay = time since last checkpoint write)
 ```
 

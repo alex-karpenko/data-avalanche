@@ -304,7 +304,7 @@ transaction boundary via §8.
 | Cross-family change (`int→varchar`, `timestamp→date`) | **Unsafe** | — | — | halt table |
 | `nullable → NOT NULL` | **Unsafe**\* | — | — | halt table (optional→required is breaking) |
 | Change PK / `REPLICA IDENTITY` / unique key | **Unsafe** | — | — | halt table; operator re-snapshot |
-| `ADD COLUMN` / `RENAME COLUMN` to a **reserved lineage name** (`_op`, `_ts`, `_lsn`, `_seq`, `_source_db`, `_pipeline`, `__avalanche_*`; case-insensitive) | **Unsafe** | — | — | halt table `RESERVED_COLUMN_COLLISION` (config §5) |
+| `ADD COLUMN` / `RENAME COLUMN` to a **reserved lineage name** (`_op`, `_ts`, `_lsn`, `_seq`, `_source_db`, `_pipeline`, `__data_avalanche_*`; case-insensitive) | **Unsafe** | — | — | halt table `RESERVED_COLUMN_COLLISION` (config §5) |
 | `DROP TABLE` (tracked) | **Unsafe** | — (target kept) | — (target kept) | halt table `TABLE_DROPPED`; the target is never dropped. A re-created table of the same name (new OID) does **not** auto-resume; it needs an operator re-snapshot. Detection — PG: channel D / A (§2.1); MySQL: channel B |
 | MySQL `ENUM`/`SET` **add** values (append-only) | Ignorable\*\* | none | none | decoded value set widens; verify mapping (G-18) |
 | MySQL `ENUM`/`SET` reorder/remove values | **Unsafe** | — | — | halt (changes decoded string meaning) |
