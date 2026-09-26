@@ -1,0 +1,45 @@
+# Local sources for the source-capability probes. Non-default host ports to avoid clashes.
+#   docker compose up -d --wait     /     docker compose down -v
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: probe
+      POSTGRES_PASSWORD: probe
+      POSTGRES_DB: probe
+    command: >
+      postgres -c wal_level=logical -c max_replication_slots=10 -c max_wal_senders=10
+               -c logical_decoding_work_mem=64kB
+    ports: ["55432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U probe -d probe"]
+      interval: 2s
+      retries: 30
+
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: probe
+      MYSQL_DATABASE: probe
+    command: >
+      --server-id=1 --log-bin=mysql-bin --binlog-format=ROW --binlog-row-image=FULL
+      --binlog-row-metadata=FULL --gtid-mode=ON --enforce-gtid-consistency=ON
+    ports: ["53306:3306"]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-pprobe"]
+      interval: 2s
+      retries: 60
+
+  mariadb:
+    image: mariadb:11.4
+    environment:
+      MARIADB_ROOT_PASSWORD: probe
+      MARIADB_DATABASE: probe
+    command: >
+      --server-id=1 --log-bin=mariadb-bin --binlog-format=ROW --binlog-row-image=FULL
+      --binlog-row-metadata=FULL
+    ports: ["53307:3306"]
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 2s
+      retries: 60
