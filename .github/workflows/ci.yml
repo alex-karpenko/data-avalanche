@@ -18,15 +18,25 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Reads rust-toolchain.toml (channel + components) and caches the build.
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Unit and property tests
         run: cargo test --locked --workspace
+      # RustSec advisory audit of Cargo.lock. Non-blocking by design: a vulnerable dependency is
+      # reported (warning annotation + failed step) but never fails the job.
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Security audit (non-blocking)
+        continue-on-error: true
+        run: |
+          cargo audit || { echo "::warning::cargo audit reported RustSec advisories (non-blocking) - see this step's log"; exit 1; }
 
   # Integration tests: DB containers + S3/Azure emulators (test-infra/compose.yaml) + a REAL GCS bucket.
   # Requirements (documented in test-infra/README.md, "CI requirements"):
@@ -41,8 +51,8 @@ jobs:
       DATA_AVALANCHE_IT: "1"
       DATA_AVALANCHE_GCS_BUCKET: ${{ vars.DATA_AVALANCHE_GCS_BUCKET }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
       - name: GCS credentials
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
