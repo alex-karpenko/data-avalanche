@@ -248,7 +248,7 @@ a config concern, but operators should be aware the `_`-prefixed names are reser
 ## 6. `globals` section
 
 Parameters not tied to any single pipeline: cloud target, application state location,
-management API, logging, and cluster membership.
+management API, logging, cluster membership, tracing, and provider-specific settings.
 
 ```yaml
 globals:
@@ -257,6 +257,8 @@ globals:
   api:      { ... }
   log:      { ... }
   cluster:  { ... }
+  tracing:  { ... }     # optional (§6.6)
+  azure:    { ... }     # optional, cloud = azure only (§6.7)
 ```
 
 ### 6.1 `globals.cloud`
@@ -268,7 +270,8 @@ globals:
 Selects the object-storage provider and SDK credential chain. **No explicit credentials are
 configured** — the provider SDK's default credential chain is used (instance profile / IAM
 role, environment variables, workload identity, managed identity). For **Azure**, every
-`bucket` field across the config is interpreted as a **container** name (§10).
+`bucket` field across the config is interpreted as a **container** name (§10); the storage account
+comes from the credential chain or `globals.azure.account_name` (§6.7).
 
 Affects which `sink.iceberg.catalog` and `sigv4` options are valid (§6, §9.5): `sink.iceberg.catalog.glue` and
 `rest.auth = sigv4` require `cloud = aws`.
@@ -319,6 +322,7 @@ api:
 | `credentials_file` | path | conditional | — | R | Alternative to `user`/`password` for `auth = basic` (§4.6): path to JSON `{user, password}`. Mutually exclusive with `user`/`password` (V-065). Enables runtime rotation by replacing the file's contents. |
 | `jwt` | object | conditional | — | R | Required when `auth = jwt`. §6.3.1. |
 | `oauth2` | object | conditional | — | R | Required when `auth = oauth2`. §6.3.1. |
+| `role_mapping` | map<role, list<string>> | no | identity | R | Maps IdP role strings to the three local roles `viewer` ⊂ `operator` ⊂ `admin` (`research/API_RBAC_and_Versioning.md` §4). Only meaningful for `auth ∈ {jwt, oauth2}` (V-100). Omitted = identity (a claim value `viewer`/`operator`/`admin` maps to itself). Unmapped IdP roles are ignored; the effective role is the **maximum** mapped role. |
 | `tls` | object | no | `{enabled:false}` | PROC | §6.3.2. |
 
 Endpoints that are **always unauthenticated** regardless of `auth` (per `System-Overview.md`):
@@ -327,8 +331,8 @@ Endpoints that are **always unauthenticated** regardless of `auth` (per `System-
 #### 6.3.1 `globals.api.jwt` / `globals.api.oauth2` (verification parameters)
 
 > **NEW (vs draft):** the draft listed `auth: jwt | oauth2` but defined no verification
-> parameters. These blocks supply the schema; the **role→permission matrix itself remains a
-> design item (G-16)** and is intentionally not fixed here — see §16.
+> parameters. These blocks supply the schema. The role→permission matrix (G-16) is defined in
+> `research/API_RBAC_and_Versioning.md` §2; IdP role strings are mapped via `role_mapping` (§6.3).
 
 ```yaml
 jwt:
@@ -345,9 +349,11 @@ oauth2:                                            # OIDC; superset of jwt for t
   roles_claim: realm_access.roles                   # optional (default "roles")
 ```
 
-The set of roles and which endpoint each role may call (the RBAC matrix) is deferred to the
-API design (G-16). The `roles_claim` tells the verifier **where** to read roles; **what** each
-role may do is design work.
+`roles_claim` tells the verifier **where** to read roles; `role_mapping` (§6.3) maps them to the
+local roles; **what** each role may call is the endpoint → minimum-role matrix in
+`research/API_RBAC_and_Versioning.md` §2 (`admin ⊇ operator ⊇ viewer`, functional endpoints under
+`/v1`; health and metrics unversioned and unauthenticated). Binding per mode: `none` = open, `basic` =
+`admin`, `jwt`/`oauth2` = mapped claim (401 unauthenticated vs 403 insufficient role).
 
 #### 6.3.2 `globals.api.tls`
 
@@ -378,6 +384,15 @@ error, to accommodate that topology.
 ```yaml
 cluster:
   tokens: 128
+  lock_backend: storage
+  lease_duration: 15s
+  lease_renewal_interval: 5s
+  lease_safety_margin: 0.15
+  rebalance_stabilization: 15s
+  max_concurrent_handoffs: 2
+  max_concurrent_takeovers: 4
+  drain_timeout: 60s
+  discovery: static            # static | dns
   memberlist: { ... }
 ```
 
@@ -385,12 +400,21 @@ cluster:
 |---|---|---|---|---|---|
 | `tokens` | integer | no | `128` | PROC | Virtual nodes per physical node on the consistent-hash ring. **Must be identical cluster-wide** (V-026, V-062): the first node writes the established value to `globals.state`; a node whose `tokens` differs refuses to start. Recommended band 64–256; out-of-band values warn; <1 or >4096 error. |
 | `lock_backend` | enum | no | `storage` | PROC | Mutual-exclusion lease backend (D-2, `Clustering_Architecture_Research.md` §5.6). `storage` = object-storage CAS lease (default, portable). `kubernetes` = K8s Lease API — **reserved, not yet implemented**; only `storage` is valid in v1. **Must be identical cluster-wide** (V-075, V-076): pinned in the `globals.state` cluster anchor; a node whose `lock_backend` differs refuses to start, because a mixed-backend cluster has two independent arbiters and is split-brain by construction. |
+| `lease_duration` | Duration | no | `15s` | PROC | Per-pipeline lease TTL — the safety boundary and the worst-case unowned window after an unplanned death. **Cluster-wide consistent**: anchored in `globals.state` with `tokens`; a node whose value differs refuses to start (V-094). Balanced profile ratified (D-6, `Clustering_Architecture_Research.md` §18). |
+| `lease_renewal_interval` | Duration | no | `5s` | PROC | Must be ≤ `lease_duration / 3` (V-073, hard error). Recommended equal cluster-wide. |
+| `lease_safety_margin` | float (0–0.5) | no | `0.15` | PROC | Fraction of `lease_duration` held back as the renewal safety-deadline guard (§19.3 of the clustering doc; V-072). |
+| `rebalance_stabilization` | Duration | no | `15s` | R | Membership must be stable this long before proactive rebalancing; applies symmetrically to additions incl. rejoins (flap immunity, D-11). Does **not** delay dead-node failover. |
+| `max_concurrent_handoffs` | integer | no | `2` | R | Per-node cap on simultaneous graceful drains (V-074). Local knob, not cluster-wide. |
+| `max_concurrent_takeovers` | integer | no | `4` | R | Per-node cap on simultaneous Phase-0 starts on the unplanned-takeover path, with jitter (D-10; V-074). Local knob. |
+| `drain_timeout` | Duration | no | `60s` | R | Max graceful drain (flush → commit → checkpoint → release lease) before falling back to unplanned replay. |
+| `discovery` | enum `static`\|`dns` | no | `static` | PROC | `static` = `memberlist.join_members`; `dns` = resolve `discovery_dns_name` (k8s headless Service). V-095. |
+| `discovery_dns_name` | string | conditional | — | PROC | Required when `discovery = dns` (V-096). |
 | `memberlist` | object | no | (defaults below) | PROC | §6.5.1. |
 
 A deployment with no peers (empty `join_members`, none discovered) is the supported
 **single-node mode**: the ring contains only self, all pipelines are owned locally, gossip is
-idle, and the lease mechanism (once designed, G-8) still runs to guard against a second
-process accidentally attaching to the same `globals.state` bucket.
+idle, and the lease (`Clustering_Architecture_Research.md` §5) still runs to guard against a second
+process accidentally attaching to the same `globals.state` bucket (e.g. a rolling-deploy overlap).
 
 #### 6.5.1 `globals.cluster.memberlist`
 
@@ -415,6 +439,7 @@ gossip timers are fixed for a process lifetime) unless noted.
 | `dead_node_reclaim_time` | Duration | no | `30s` | Bounds the stale-membership window (relevant to split-brain, G-8). |
 | `push_pull_interval` | Duration | no | `30s` | Full-state sync cadence. |
 | `retransmit_factor` | integer | no | `4` | Retransmit multiplier. |
+| `lifeguard_enabled` | bool | no | `true` | Lifeguard extensions to SWIM (local health aware probing/suspicion; G-23). Recommended equal cluster-wide. |
 | `tls` | object | no | `{enabled:false}` | §6.5.2. |
 
 **`node_name` sourcing (D-1).** `node_name` is the node's stable identity for both gossip and
@@ -437,6 +462,23 @@ discard its stale in-flight gossip.
 
 > Fixes the draft's `cat:` → `ca:` typo (already corrected upstream; restated here as the
 > canonical field name).
+
+### 6.6 `globals.tracing`
+
+Distributed tracing (G-32, `research/Observability_Metrics_and_Tracing.md` §3). Spans are emitted at
+batch/commit granularity (flush → sink commit, snapshot chunk, DDL apply), never per source event.
+When tracing is active, `trace_id` / `span_id` are injected into JSON log records.
+
+| Field | Type | Required | Default | Mutability | Notes |
+|---|---|---|---|---|---|
+| `otlp_endpoint` | URL | no | — | R | OTLP collector endpoint. **Absent ⇒ tracing disabled** (zero overhead, no error). |
+| `sample_ratio` | float [0,1] | no | `0.0` (no endpoint) / `0.05` (endpoint set) | R | Head sampling ratio (V-097). `> 0` without an endpoint warns (V-098). |
+
+### 6.7 `globals.azure` (`cloud = azure` only)
+
+| Field | Type | Required | Default | Mutability | Notes |
+|---|---|---|---|---|---|
+| `account_name` | string | no | from credential chain | PROC | Storage account for all containers (G-34). Credentials still come from the SDK default chain (managed / workload identity) — no secret fields. Valid storage-account name (V-101). |
 
 ---
 
@@ -500,7 +542,8 @@ branch from `defaults` is **dropped** (no field-level merge across branches):
   merge normally.
 - **`sink.iceberg.catalog`** — branches `glue` / `hive` / `rest`. If
   `defaults.sink.iceberg.catalog.glue` is set and a pipeline sets `sink.iceberg.catalog.rest`, the
-  pipeline gets `rest` and the defaulted `glue` is discarded entirely.
+  pipeline gets `rest` and the defaulted `glue` is discarded entirely. The common catalog fields
+  (`type`, `retry`) still merge normally.
 
 `schema_evolution` is a pipeline-level block (§9.7), not part of any union; it merges normally.
 
@@ -613,6 +656,9 @@ source:
 | `slot` | string | yes | — | PR | Logical replication slot name. Charset `^[a-z_][a-z0-9_]{0,62}$` (PG constraint); **unique** per source host+db across pipelines (V-058). |
 | `auto_cleanup` | bool | no | `true` | R | Drop the slot & publication when the pipeline is deleted. Teardown-time policy flag only — consulted at deletion/`id`-change, not on the live path, so a change applies in place with no restart. |
 | `heartbeat` | Duration | no | `60s` | R | StandbyStatusUpdate interval; keeps the connection alive and prevents WAL-lag-as-inactivity. |
+| `slot_management` | enum `managed`\|`require_existing` | no | `managed` | PR | `managed`: create the slot if absent, reuse if present, drop on delete per `auto_cleanup`. `require_existing`: never create (DBA-owned slot; error if absent) and **requires `auto_cleanup: false`** (V-103). `research/Postgres_Slot_and_Publication_Lifecycle.md` §2. |
+| `slot_on_orphan` | enum `halt`\|`adopt_resnapshot` | no | `halt` | R | Slot exists but the pipeline has no state for it. `halt`: refuse to start, naming the slot. `adopt_resnapshot`: take ownership, restart from a fresh consistent point and incrementally re-snapshot all tables. Resume-from-slot without a snapshot is never offered. (Slot-lifecycle doc §1.1; named `slot_on_orphan` because `slot` is the slot-name string.) |
+| `max_wal_lag_bytes` | ByteSize \| null | no | `null` | R | WAL-retention guard (G-22). `cdc_wal_lag_bytes` is always emitted; when set and exceeded the pipeline **halts** to protect the source disk. `null` = alert only. ≥ 64 MiB when set (V-104). |
 
 #### 9.2.2 `source.mysql` (iff `type = mysql`)
 
@@ -621,6 +667,7 @@ source:
 | `replication_type` | enum `binlog`\|`gtid` | no | `binlog` | PR | `gtid` is preferred (position-independent, gap-free). |
 | `tinyint1_as_bool` | bool | no | `true` | PR | Map `TINYINT(1)` columns to logical `bool`. When `true`, requires the display-width from the catalog query (channel C); when `false`, `TINYINT(1)` maps as `TINYINT SIGNED` → `Int16`. See `research/Type_Mapping.md`. |
 | `tinyint1_detection` | enum `information_schema`\|`none` | no | `information_schema` | PR | Source of the `TINYINT(1)` display-width signal. `none` disables the detection (all `TINYINT` treated as integer); `information_schema` uses the catalog query (always available via channel C). |
+| `binlog_purge_action` | enum `error`\|`re_snapshot` | no | `error` | R | Resume position purged on the server (G-26). `error`: halt with an error (operator decides). `re_snapshot`: automatic recovery via incremental re-snapshot. GTID `replication_type` remains recommended. |
 
 ### 9.3 `tables`
 
@@ -631,7 +678,13 @@ tables:
   snapshots:
     mode: never
     parallelism: 1
+    chunk_size: 10000
     overrides: { public.table_1: always, data.analytics: initial }
+  primary_key:                                           # optional per-table identifier override
+    data.analytics: [ tenant_id, event_id ]
+  partitioning:                                          # optional per-table partition spec
+    public.orders: [ { column: _ts, transform: day } ]
+    data.analytics: [ { column: tenant_id, transform: bucket, n: 16 } ]
 ```
 
 | Field | Type | Required | Default | Mutability | Notes |
@@ -640,9 +693,16 @@ tables:
 | `exclude` | list<glob> | no | `[]` | PR (cond.) | Subtracted from the include set; same per-engine form as `include` (PG `schema.table`, MySQL bare table name). Same conditional rule: restart only when the resolved set actually changes. |
 | `snapshots.mode` | enum | no | `never` | PR | `never`\|`initial`\|`always`\|`dump_always`\|`dump_initial` (semantics in `System-Overview.md`). |
 | `snapshots.parallelism` | integer | no | `1` | R | ≥ 1 (V-027). Concurrent snapshot jobs. **> 4 warns** (V-038): each PG snapshot job uses ≥ 3 connections. The limit is read by the snapshot scheduler at job-launch time; a change affects only **future** scheduling — in-flight and already-queued jobs are unaffected — so it applies in place. Implies an adjustable permit count, not a pool sized once at pipeline start. |
+| `snapshots.chunk_size` | integer | no | `10000` | R | Rows per keyset chunk of the incremental snapshot; the resume cursor is checkpointed per chunk (`research/Snapshot_Resumability_and_Consistency.md` §5). ≥ 1; very large values warn (V-108). |
 | `snapshots.overrides` | map<table,mode> | no | `{}` | PR | Per-table mode override. Keys are full `schema.table` for PostgreSQL / bare table name for MySQL (V-064), **no globs** (V-033). A key not in the resolved set **warns** at load (V-034). Not allowed in `defaults`. |
 | `column_type_overrides` | map<column, logical-type> | no | `{}` | PR | Per-column target-type override applied at schema resolution (e.g. `public.orders.amount: "decimal(38,10)"`). Values use the **sink-neutral logical type grammar** — `bool`, `int16`, `int32`, `int64`, `float32`, `float64`, `decimal(P,S)`, `string`, `binary`, `date`, `time`, `timestamp_tz`, `timestamp_ntz`, `uuid`, `json`, `list<T>` — never a format-specific type name (Iceberg `timestamp` = without tz, Delta `timestamp` = with tz). Each sink maps it to its physical type (`research/Type_Mapping.md` Hop 3). Must be valid (V-078) and mappable by the pipeline's sink (V-087). First step of the unsupported-type fallback chain. |
 | `numeric_overflow_action` | enum `string`\|`error` | no | `string` | PR | Action when a `numeric(P,S)` with `P > 38` (beyond Iceberg `decimal` range) is encountered: `string` serializes it as text; `error` halts the table. With `error`, unscaled `numeric` columns may halt unexpectedly (V-079 warning). |
+| `primary_key` | map<table, list<column>> | no | `{}` | PR (re-snapshot) | Identifier override per table (G-13): replaces the inferred source PK as the upsert/delete key — needed for PG `REPLICA IDENTITY USING INDEX` on a non-PK unique index. Selects existing identifying columns; it is **not** a surrogate key (`tables.surrogate_key` was rejected, G-30). Keys: same form as `snapshots.overrides` (V-033/V-064), no globs; unknown key warns (V-106). Column constraints (exist, top-level, primitive, NOT NULL, non-floating; PG ⊆ REPLICA IDENTITY) are checked at start (§11.2). Changing it on a live table = PK change ⇒ re-snapshot. `research/Ghost_Row_Dedup_and_Primary_Keys.md` §1/§7. |
+| `partitioning` | map<table, list<field>> | no | `{}` (unpartitioned) | PR | Per-table partition spec (G-24). A field is `{ column, transform }` with `transform ∈ {identity, bucket, truncate, year, month, day, hour}` (+ `n` for `bucket`, `width` for `truncate`; V-107). `_ts` is a valid source (commit-time pruning; `day(_ts)` is the common opt-in). Transforms must be supported by the pipeline's sink (V-086 — Delta v1: `identity` only). A change applies to **new data only** (Iceberg spec evolution; no rewrite of history). Keys as for `primary_key`. Column existence / temporal-type checks at start (§11.2). `research/Iceberg_Partitioning_and_Layout_Evolution.md`. |
+
+> **Per-table maps.** The research docs sketched `primary_key` and `partitioning` as bare lists; they
+> are specified here as **per-table maps** (keyed like `snapshots.overrides`) because an identifier or
+> partition column is a property of one table, not of a whole glob-resolved table set.
 
 Glob grammar: `*` matches within a single name segment (it does not cross the `.` separator);
 matching is case-sensitive. The match target depends on the engine — **PostgreSQL** matches
@@ -674,6 +734,10 @@ sink:
 | `bucket` | string | yes (resolvable) | — | PR | Object-storage bucket (Azure: container). |
 | `prefix` | string | no | pipeline `id` | PR | Root prefix for this pipeline's tables and co-located state. See §10 for the full path layout. |
 | `flush` | object | no | (below) | R | Flush triggers (§9.4.1). |
+| `max_transaction_batch_rows` | integer \| null | no | `null` | R | Split-commit threshold for oversized source transactions (G-29). `null` = never split (strict atomic visibility). When set, a larger transaction is committed in slices; the resume checkpoint stays pinned at the transaction start, so a crash replays it idempotently. ≥ 1; small values warn (V-109). `research/Large_Transaction_Handling.md`. |
+| `max_transaction_buffer_bytes` | ByteSize | no | `1GiB` | R | Absolute per-transaction memory ceiling. Splitting disabled ⇒ reaching it **halts the pipeline** (never OOMs the worker); splitting enabled ⇒ an early flush trigger. ≥ 16 MiB (V-110). |
+| `buffer_capacity_rows` | integer | no | `200000` | R | Capacity of the bounded inter-task channels (G-27). All channels are bounded; on persistent sink failure the pipeline is **DEGRADED** — retries with backoff and stops consuming once buffers fill. ≥ 1 (V-111). |
+| `metrics.per_table` | bool | no | `false` | R | Add the `table` label to per-table metrics (G-33). Default labels are `{pipeline, source_host, source_db}`; enabling this multiplies series count on large fleets. |
 | `iceberg` / `delta` | object | exactly one, matching `type` | — | PR | Format block (§9.4.2 / §9.4.3). The foreign block is forbidden (V-084). |
 
 > **CHANGE (2026-09-26, multi-sink):** `sink.strategy` moved to `sink.iceberg.strategy`; the
@@ -745,6 +809,7 @@ sink:
 |---|---|---|---|---|---|
 | `type` | enum `glue`\|`hive`\|`rest` | no | inferred | PR | **NEW (vs draft).** Optional explicit discriminator, symmetric with `source.type`. If present it must match the single present sub-block (V-002); if absent it is inferred from the one present sub-block (0 or >1 present = error). |
 | `glue` / `hive` / `rest` | object | one required (resolvable) | — | PR | §9.5.1–9.5.3. |
+| `retry` | object | no | `{max_attempts: 5, base_backoff: 1s, max_backoff: 30s}` | R | Catalog-operation retry policy, separate from object storage (G-35): exponential backoff + jitter, then **DEGRADED** (alert via `cdc_pipeline_status`), with a circuit breaker so a down catalog is not hammered. V-112. Not part of the union; merges normally. |
 
 #### 9.5.1 `sink.iceberg.catalog.glue` (valid only if `globals.cloud = aws`, V-028)
 
@@ -752,6 +817,7 @@ sink:
 |---|---|---|---|---|---|
 | `name` | string | yes | — | PR | Glue catalog id (AWS account id or registered catalog name). |
 | `database` | string | no | `source.db` | PR | Glue database mapped to the source schema/db. |
+| `strip_schema` | bool | no | `false` | PR | Glue table naming. `false`: `<schema>__<table>` (double underscore; collision-free). `true`: bare `<table>` — two source schemas with the same table name then **collide** and the pipeline is refused when its table set is resolved, naming the colliding tables (V-113). |
 
 #### 9.5.2 `sink.iceberg.catalog.hive` (Thrift / SASL)
 
@@ -991,6 +1057,9 @@ on.
 | MySQL | **`binlog_row_image = FULL`** | error → halt pipeline | Complete before-images / equality-delete keys. |
 | MySQL | **`binlog_row_metadata = FULL`** | warning → continue | Column names/PK/ENUM strings in `TABLE_MAP`; if absent, names fall back to the catalog query (channel C). |
 | MySQL | **`REPLICATION CLIENT` / `REPLICATION SLAVE`** privilege | error → halt pipeline | Binlog dump access. |
+| Both | Each table has an **identifier**: an inferred PK, or a `tables.primary_key` override whose columns exist and are top-level, primitive, NOT NULL, non-floating | error → halt table (explicit table) / warning + skip (glob-matched PK-less table) | Upsert/delete keying (G-13, G-30). |
+| PostgreSQL | Identifier columns ⊆ **REPLICA IDENTITY** columns | error → halt table, naming the missing columns | Before-image must carry the old key (`Ghost_Row…` §2). |
+| Both | `tables.partitioning` columns exist; temporal transforms target a date/time column | error → halt table | Partition spec validity (G-24). |
 
 Because these are runtime checks, they sit outside the all-or-nothing config-validation contract:
 a privilege or server-setting problem on one pipeline's source does not reject the config or stop
@@ -1122,6 +1191,18 @@ radius. `reload` locus marks a rule that can only fire on reload.
 | V-080 | `source.toast_strategy` | ∈ {carry_forward, re_query} (PostgreSQL only; ignored for MySQL). `research/Type_Mapping.md`. | error | pipeline |
 | V-081 | `source.mysql.tinyint1_detection` | ∈ {information_schema, none}. | error | pipeline |
 | V-082 | `tables.numeric_overflow_action` | ∈ {string, error}. | error | pipeline |
+| V-095 | `globals.cluster.discovery` | ∈ {static, dns}. | error | config |
+| V-097 | `globals.tracing.sample_ratio` | ∈ [0, 1]. | error | config |
+| V-101 | `globals.azure.account_name` | Valid storage-account name (3–24 chars, lowercase letters and digits). | error | config |
+| V-102 | `source.postgres.slot_management` / `slot_on_orphan` | slot_management ∈ {managed, require_existing}; slot_on_orphan ∈ {halt, adopt_resnapshot}. | error | pipeline |
+| V-104 | `source.postgres.max_wal_lag_bytes` | ≥ 64 MiB when set. | error | pipeline |
+| V-105 | `source.mysql.binlog_purge_action` | ∈ {error, re_snapshot}. | error | pipeline |
+| V-107 | `tables.partitioning` fields | `transform` ∈ {identity, bucket, truncate, year, month, day, hour}; `bucket` requires `n ≥ 1`; `truncate` requires `width ≥ 1`. | error | pipeline |
+| V-108 | `tables.snapshots.chunk_size` | ≥ 1. > 1,000,000 → also `warning` (long chunk transactions, large memory). | error / warning | pipeline |
+| V-109 | `sink.max_transaction_batch_rows` | ≥ 1 when set. < 1000 → also `warning` (commit amplification). | error / warning | pipeline |
+| V-110 | `sink.max_transaction_buffer_bytes` | ≥ 16 MiB. | error | pipeline |
+| V-111 | `sink.buffer_capacity_rows` | ≥ 1. | error | pipeline |
+| V-112 | `sink.iceberg.catalog.retry` | `max_attempts ≥ 1`; `base_backoff ≤ max_backoff`. | error | pipeline |
 
 ### 13.4 Cross-field / conditional
 
@@ -1142,6 +1223,11 @@ radius. `reload` locus marks a rule that can only fire on reload.
 | V-086 | `tables.partitioning` transforms | Each transform supported by the pipeline's sink (Delta v1: `identity` only). Active once `tables.partitioning` is promoted from §16. | error | pipeline |
 | V-087 | `tables.column_type_overrides` values | Logical type mappable by the pipeline's sink. | error | pipeline |
 | V-093 | `sink.delta.table_properties` keys | Only allow-listed `delta.*` keys; `delta.columnMapping.mode` / `delta.enableDeletionVectors` / `delta.appendOnly` are managed by the sink and forbidden here. | error | pipeline |
+| V-096 | `globals.cluster.discovery = dns` | Requires `discovery_dns_name`. | error | config |
+| V-098 | `globals.tracing.sample_ratio > 0` without `otlp_endpoint` | Sampling configured but tracing disabled. | warning | config |
+| V-103 | `source.postgres.slot_management = require_existing` | Requires `auto_cleanup = false` (the app must not drop a slot it did not create). | error | pipeline |
+| V-106 | `tables.primary_key` / `tables.partitioning` keys | Same key form as `snapshots.overrides` (full `schema.table` / MySQL bare name, no globs — V-033/V-064); column lists non-empty. A key not in the resolved table set → `warning` (as V-034). | error / warning | pipeline |
+| V-113 | `sink.iceberg.catalog.glue.strip_schema = true` | Two resolved tables share a bare name across schemas. Evaluated when the table set is resolved (start / table-set change); refuses the pipeline naming the collision. | error | pipeline (resolution) |
 | V-077 | `source.toast_strategy = re_query` with `tables.snapshots.mode = always` | `re_query` on high-volume snapshots may saturate the control connection pool. | warning | pipeline |
 
 ### 13.5 Catalog authentication (the 9 rules from `Catalog_Auth_Research.md`)
@@ -1166,6 +1252,8 @@ radius. `reload` locus marks a rule that can only fire on reload.
 | V-050 | `globals.api.auth = jwt` | Requires `jwt.issuer` + `jwt.jwks_url`. | error | config |
 | V-051 | `globals.api.auth = oauth2` | Requires `oauth2.issuer` + (`jwks_url` or `discovery_url`). | error | config |
 | V-052 | `globals.api.auth ≠ none` without `tls.enabled` | Credentials/tokens in cleartext unless TLS terminated upstream. | warning | config |
+| V-099 | `globals.api.role_mapping` | Keys ∈ {viewer, operator, admin}; values are lists of strings. | error | config |
+| V-100 | `globals.api.role_mapping` with `auth ∈ {none, basic}` | Ignored — roles come from the open mode / single basic principal. | warning | config |
 | V-053 | `globals.api.tls.enabled = true` | Requires `cert` + `key`. | error | config |
 | V-054 | `globals.cluster.memberlist.tls.enabled = true` | Requires `cert` + `key`. | error | config |
 
@@ -1187,6 +1275,7 @@ radius. `reload` locus marks a rule that can only fire on reload.
 | V-061 | any PROC-class field | Changed during a live reload. | error | reload |
 | V-062 | `globals.cluster.tokens` | Differs from the cluster-established value in `globals.state`. | error | config (startup) |
 | V-076 | `globals.cluster.lock_backend` | Differs from the cluster-established value in the `globals.state` anchor. | error | config (startup) |
+| V-094 | `globals.cluster.lease_duration` | Differs from the cluster-established value in the `globals.state` anchor (`lease_duration_ms`). | error | config (startup) |
 
 ### 13.9 Resolution / materialization (Phase 2 — §11)
 
@@ -1241,6 +1330,10 @@ globals:
     format: json
   cluster:
     tokens: 128                                # must match cluster-wide
+    lease_duration: 15s                        # must match cluster-wide (anchored, V-094)
+    lease_renewal_interval: 5s                 # ≤ lease_duration / 3 (V-073)
+    discovery: dns
+    discovery_dns_name: cdc-headless.svc.cluster.local
     memberlist:
       join_members:
         - cdc-headless.svc.cluster.local:7946
@@ -1257,6 +1350,9 @@ globals:
         cert: /etc/cdc/tls/gossip.crt
         key: ${GOSSIP_TLS_KEY}
         ca: /etc/cdc/tls/gossip-ca.crt
+  tracing:
+    otlp_endpoint: http://otel-collector.observability:4317
+    sample_ratio: 0.05
 
 defaults:
   source:
@@ -1307,6 +1403,8 @@ pipelines:
         mode: initial
         parallelism: 2
         overrides: { public.orders: always }
+      partitioning:
+        public.orders: [ { column: _ts, transform: day } ]
     sink:
       bucket: ${ACCOUNT_ID}-lake
       prefix: orders_pg
@@ -1401,6 +1499,17 @@ Every deviation, so nothing is silent:
     `column_type_overrides` switched to a sink-neutral logical type grammar; new rules
     **V-083…V-093**. Source: `research/Multi_Sink_Architecture_and_Delta_Lake.md`.
 
+20. **Research-field promotion (2026-09-26, gap report §19.1 C-1…C-16)** — cluster lease /
+    rebalance / discovery fields (§6.5, `lifeguard_enabled` §6.5.1); `globals.tracing` (§6.6);
+    `globals.azure.account_name` (§6.7); `globals.api.role_mapping` + RBAC pointer (§6.3);
+    `source.postgres.slot_management` / `slot_on_orphan` / `max_wal_lag_bytes`;
+    `source.mysql.binlog_purge_action`; `tables.snapshots.chunk_size`, `tables.primary_key`,
+    `tables.partitioning` (per-table maps); `sink.max_transaction_batch_rows` /
+    `max_transaction_buffer_bytes` / `buffer_capacity_rows` / `metrics.per_table`;
+    `sink.iceberg.catalog.retry` and `glue.strip_schema`; identifier / partition start-time checks
+    (§11.2); rules **V-094…V-113**. `tables.surrogate_key` (G-30 rejected) and
+    `source.consistent_snapshot` (G-7 moot) struck from §16.
+
 None of these change the **decided** catalog-auth schema (hive Thrift `none/ldap/kerberos`;
 rest HTTP `none/bearer/oauth2/sigv4`) — those are reproduced verbatim from
 `Catalog_Auth_Research.md`.
@@ -1409,23 +1518,22 @@ rest HTTP `none/bearer/oauth2/sigv4`) — those are reproduced verbatim from
 
 ## 16. Config surface deliberately deferred to design
 
-These will become config fields once their design lands (gap IDs in parentheses). They are
-**not** invented here; this list reserves their place so the schema can grow without churn:
+Reserved names for designed-but-not-built (or not-yet-designed) surface, so the schema can grow
+without churn. Fields that exist in this spec but reject some values in v1 (`lock_backend:
+kubernetes` V-075, `sink.write_mode: changelog` V-089, `sink.delta.catalog.type ≠ none` V-088,
+`sink.delta.column_mapping: name` V-092) are not repeated here.
 
-| Future field(s) | Section it will extend | Gap |
+| Future field(s) | Section it will extend | Gap / decision |
 |---|---|---|
-| `cluster.lease_duration`, `cluster.lease_renewal_interval`, `cluster.lease_safety_margin` | `globals.cluster` | G-8 (split-brain lease) — **design landed** in `Clustering_Architecture_Research.md` §5/§11/§19; concrete defaults `lease_duration=15s`, `lease_renewal_interval=5s`, `lease_safety_margin=0.15` (D-6/D-8). Validation rules V-072/V-073 already added (§13); these fields are reserved here pending promotion into the §6.5 `globals.cluster` table once the clustering design is ratified. |
-| `cluster.rebalance_stabilization`, `cluster.max_concurrent_handoffs`, `cluster.max_concurrent_takeovers`, `cluster.drain_timeout`, `cluster.discovery` (+ `cluster.discovery_dns_name`), `cluster.memberlist.lifeguard_enabled` | `globals.cluster` | G-9 (rebalancing / handoff) — **design landed** in `Clustering_Architecture_Research.md` §8/§10/§11/§20; concrete defaults `rebalance_stabilization=15s`, `max_concurrent_handoffs=2`, `max_concurrent_takeovers=4`, `drain_timeout=60s`, `discovery=static`, `lifeguard_enabled=true` (D-4/D-10/D-11). Validation rule V-074 added (§13); reserved here pending promotion into the §6.5 `globals.cluster` table once the clustering design is ratified. |
-| `tables.primary_key`, `tables.surrogate_key` | `tables` | G-13, G-30 (ghost-row dedup / PK-less tables) |
-| `tables.partitioning` (sink-neutral transforms; validated per sink by V-086 — Delta v1: `identity` only) | `tables` | G-24 (partitioning) |
-| `sink.max_transaction_batch_rows` | `sink` | G-29 (large-txn vs atomic-flush tension) |
-| `source.postgres.max_wal_lag_bytes` | `source.postgres` | G-22 (abandoned-slot WAL guard) |
-| `source.mysql.binlog_purge_action` | `source.mysql` | G-26 (purged-position handling) |
-| `source.consistent_snapshot` | `source` | G-7 (snapshot-consistency toggle/fallback) |
-| `sink.buffer_capacity_rows` | `sink` | G-27 (bounded back-pressure channel) |
-| `globals.tracing.otlp_endpoint` | `globals` | G-32 (distributed tracing) |
-| `globals.api` RBAC role→permission matrix | `globals.api` | G-16 (RBAC) |
-| `glue.strip_schema` collision transform | `sink.iceberg.catalog.glue` | §11.3 of gap report |
+| `sink.iceberg.maintenance { enabled, expire_snapshots, compaction, remove_orphans, schedule }` | `sink.iceberg` | G-25 — built-in Iceberg maintenance; gated on iceberg-rust rewrite/compaction support (DA-SINK-10). v1 maintenance is external. |
+| `sink.delta.maintenance { optimize, … }` | `sink.delta` | D-MS.13 — built-in OPTIMIZE; v1 runs only checkpoints + expired-log cleanup. |
+| `sink.large_txn_mode: split \| spill` | `sink` | G-29 §5 / DA-SINK-8 — spill-to-disk for oversized transactions. |
+| per-source-endpoint takeover concurrency group | `globals.cluster` | DA-CLUS-13 — v1 cap is per-node global (`max_concurrent_takeovers`). |
+
+**Struck (2026-09-26):** `tables.surrogate_key` — G-30 rejected (a PK-less table halts;
+`Ghost_Row_Dedup_and_Primary_Keys.md` §3); `source.consistent_snapshot` — G-7 moot (the incremental
+snapshot has no weaker mode; `Snapshot_Resumability_and_Consistency.md` §3). All other previously
+reserved fields were promoted (§15 item 20).
 
 ---
 
@@ -1436,6 +1544,11 @@ These will become config fields once their design lands (gap IDs in parentheses)
 - `Catalog_Auth_Research.md` — source of the catalog auth schema and the 9 catalog rules.
 - `research/Multi_Sink_Architecture_and_Delta_Lake.md` — sink abstraction, `sink.type`, Delta Lake
   block, V-083…V-093.
+- `research/Clustering_Architecture_Research.md`, `Postgres_Slot_and_Publication_Lifecycle.md`,
+  `Snapshot_Resumability_and_Consistency.md`, `Large_Transaction_Handling.md`,
+  `Operational_and_Scope_Gaps_Batch.md`, `Observability_Metrics_and_Tracing.md`,
+  `API_RBAC_and_Versioning.md`, `Iceberg_Partitioning_and_Layout_Evolution.md`,
+  `Ghost_Row_Dedup_and_Primary_Keys.md` — sources of the fields promoted in §15 item 20.
 - `Schema_Change_Detection_and_Evolution.md` — authority for the four-channel detection model,
   DDL safe/unsafe classification, and the source-side preconditions (§11.2); owns the
   `schema_evolution` semantics that §9.7 configures.

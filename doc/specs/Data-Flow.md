@@ -412,9 +412,14 @@ Realization of the contract:
    strictly-less-than rule purges prior-commit versions but spares the same-commit insert.
 4. **Route partition-scoped deletes by the before-image** (old partition) when a partition-source
    column changes (`research/Iceberg_Partitioning_and_Layout_Evolution.md`, G-24).
-5. **Marker carrier:** snapshot summary `cdc.owner_epoch` + `cdc.committed_position`, re-asserted on
-   every commit (summaries are per-snapshot, not inherited); read from the latest snapshot **authored by
-   this application**.
+5. **Marker carrier:** snapshot summary `cdc.owner_epoch` + `cdc.committed_position` + `cdc.pipeline`,
+   re-asserted on every commit (summaries are per-snapshot, not inherited). The epoch is also written
+   to the **`cdc.owner_epoch` table property in the same transaction**; the fence reads the **table
+   property** (authoritative — survives foreign commits and snapshot expiry), falling back to the
+   latest snapshot **authored by this application** if the property is absent. The position guard
+   reads `cdc.committed_position` from the latest own snapshot (walk-back by `cdc.pipeline`); none
+   retained ⇒ not covered (`Clustering_Architecture_Research.md` §5.5,
+   `Delivery_Guarantee_and_Position_Guard.md` §3, gap DA-X-10).
 6. **TRUNCATE:** overwrite-to-empty.
 7. **Maintenance:** external (`research/Iceberg_Maintenance.md`, G-25).
 
