@@ -2,7 +2,7 @@
 //!
 //! delta-rs 1.0 uses the `DefaultLogStore` on S3 and GCS: a commit is ONE create-only
 //! `PUT _delta_log/<N>.json` — S3 `If-None-Match: *` (object_store 0.13 `S3ConditionalPut::ETagMatch`,
-//! the default; no DynamoDB), GCS `x-goog-if-generation-match: 0`. The Delta sink's atomicity,
+//! the default; no DynamoDB), GCS `x-goog-if-generation-match: 0`, Azure Blob `If-None-Match: *`. The Delta sink's atomicity,
 //! idempotency and epoch fence all reduce to that put.
 //!
 //!   P8a  raw conditional put: W concurrent creators of one key → exactly one wins, content = winner's
@@ -14,7 +14,8 @@
 //!        ON → exactly one lands; the rest fail the `txn` app-id check (P4 on real storage)
 //!   P8d  foreign concurrent appends, retries ON → all land, on contiguous versions, no row lost
 //!
-//! Skipped unless `P8_URL` is set (`s3://…` with `--features s3`, `gs://…` with `--features gcs`).
+//! Skipped unless `P8_URL` is set (`s3://…` with `--features s3`, `gs://…` with `--features gcs`,
+//! `az://<container>/…` with `--features azure`).
 //!
 //!   # S3 — standard AWS env vars
 //!   eval "$(aws configure export-credentials --profile kav --format env)"
@@ -24,8 +25,12 @@
 //!   # GCS — service-account key file
 //!   GOOGLE_SERVICE_ACCOUNT_PATH=<key.json> P8_URL=gs://<bucket>/delta-probe \
 //!   cargo test --release --features gcs --test probe_cloud_commit -- --nocapture --test-threads=1
+//!
+//!   # Azure — AZURE_STORAGE_ACCOUNT_NAME + AZURE_STORAGE_SAS_TOKEN (or client id/secret/tenant)
+//!   P8_URL=az://<container>/delta-probe \
+//!   cargo test --release --features azure --test probe_cloud_commit -- --nocapture --test-threads=1
 
-#![cfg(any(feature = "s3", feature = "gcs"))]
+#![cfg(any(feature = "s3", feature = "gcs", feature = "azure"))]
 
 use std::collections::BTreeSet;
 use std::ops::Not;
@@ -58,6 +63,8 @@ fn table_url(name: &str) -> Option<Url> {
     deltalake::aws::register_handlers(None);
     #[cfg(feature = "gcs")]
     deltalake::gcp::register_handlers(None);
+    #[cfg(feature = "azure")]
+    deltalake::azure::register_handlers(None);
     Some(Url::parse(&format!("{}/{run}/{name}/", base.trim_end_matches('/'))).unwrap())
 }
 

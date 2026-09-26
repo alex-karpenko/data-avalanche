@@ -23,7 +23,7 @@ position carrier.
 | P7b | add column on a **column-mapping `name`** table | ❌ **refused**: `UnsupportedColumnMapping { mode: Write, operation: "ADD COLUMN" }` (asserted, so a fixed delta-rs flips the test) |
 | P10 | Hop-3b type round-trip (append + MERGE), read back by delta-rs **and cross-read by DuckDB** | ✅ all 15 columns, exact types and values — see below |
 | P10b | protocol of the same table without `timestamp_ntz` | ✅ reader 1 / writer 2 (so `timestamp_ntz` alone raises it to 3 / 7) |
-| P8 | commit atomicity on **real S3** (us-east-1) and **real GCS** (US) — see below | ✅ P8a–P8e on both; Azure pending credentials |
+| P8 | commit atomicity on **real S3** (us-east-1), **GCS** (US) and **Azure Blob** — see below | ✅ P8a–P8e on all three |
 
 ### P6 — write amplification (the Delta cost model, measured)
 
@@ -75,17 +75,17 @@ P10_OUT=/tmp/p10 cargo test --release --features probe --test probe_types -- --n
 uv run --no-project --with duckdb --with pytz python scripts/p10_duckdb_crossread.py /tmp/p10
 ```
 
-### P8 — commit atomicity on real S3 and GCS (`tests/probe_cloud_commit.rs`, `--features s3` / `gcs`)
+### P8 — commit atomicity on real S3, GCS and Azure (`tests/probe_cloud_commit.rs`, `--features s3` / `gcs` / `azure`)
 
-delta-rs 1.0 uses the `DefaultLogStore` on both: a commit is **one** create-only
+delta-rs 1.0 uses the `DefaultLogStore` on all three: a commit is **one** create-only
 `PUT _delta_log/<N>.json` — S3 `If-None-Match: *` (object_store 0.13 `S3ConditionalPut::ETagMatch`, the
-default; no DynamoDB), GCS `x-goog-if-generation-match: 0`. No temp-file + rename on either (none found
-after the runs). Results below are identical on both backends unless noted.
+default; no DynamoDB), GCS `x-goog-if-generation-match: 0`, Azure Blob `If-None-Match: *`. No temp-file +
+rename anywhere (none found after the runs). Results below are identical on all backends unless noted.
 
 | Probe | What | Result (2026-09-26) |
 |---|---|---|
 | P8a | 16 concurrent put-if-absent of one key, 10 rounds | ✅ exactly 1 winner each round (15 `AlreadyExists`); stored body = winner's |
-| P8b | 8 sink MERGEs on one snapshot, **retries off**, 5 rounds | ✅ exactly one new version per round, no stray v+2; v+1 carries the winner's `commitInfo` position; content = base + winner's change set only (~4.4 s per round on S3, ~7.3 s on GCS) |
+| P8b | 8 sink MERGEs on one snapshot, **retries off**, 5 rounds | ✅ exactly one new version per round, no stray v+2; v+1 carries the winner's `commitInfo` position; content = base + winner's change set only (~4.4 s per round on S3, ~7.3 s on GCS, ~4.2 s on Azure) |
 | P8c | 8 owners MERGE the **same row**, retries on | ✅ exactly one lands; losers stopped by the **data** conflict check (`a concurrent transactions added new data`) — fires before the fence |
 | P8e | 8 owners append **disjoint** rows, retries on | ✅ exactly one lands; losers stopped by the **`txn` fence alone** (`Concurrent transaction failed`); `txn` version = winner's epoch |
 | P8d | 8 foreign appends (no `txn`), retries on | ✅ all land on contiguous versions 1..=8; 800/800 rows |
@@ -109,9 +109,18 @@ cargo test --release --features gcs --test probe_cloud_commit -- --nocapture --t
 gcloud storage rm -r gs://<bucket>/delta-probe/   # cleanup
 ```
 
+```bash
+# Azure — AZURE_STORAGE_ACCOUNT_NAME + AZURE_STORAGE_SAS_TOKEN (object_store reads AZURE_* env)
+set -a; source ~/.config/avalanche/azure-p8.env; set +a
+P8_URL="az://$AZURE_CONTAINER/delta-probe" \
+cargo test --release --features azure --test probe_cloud_commit -- --nocapture --test-threads=1
+# cleanup: delete the blobs under delta-probe/ (List Blobs + Delete Blob with the same SAS)
+```
+
 Runs 2026-09-26: S3 on account `418759522081` (profile `kav`, us-east-1); GCS on project
-`data-avalanche-500111`, bucket `gs://leasetest` (US), service account `test-743`. Prefixes deleted
-afterwards.
+`data-avalanche-500111`, bucket `gs://leasetest` (US), service account `test-743`; Azure on storage
+account `dataavalanchetest` (StorageV2, Standard_LRS, **hierarchical namespace off** — plain Blob, not
+ADLS Gen2), container `leasetest`, SAS auth. Prefixes deleted afterwards.
 
 **GCS 429 check.** GCS allows ~1 mutation/s per object, and delta-rs maps a 429 to `AlreadyExists` only
 on its rename path, not the put path the commit uses — so a racing loser *could* surface a generic
@@ -121,7 +130,9 @@ still classifies an unexpected commit I/O error as retryable (Data-Flow "Sink Co
 
 ### Not covered yet
 
-- **P8 on Azure** — credentials pending (same probe; add a `deltalake/azure` feature).
+- **P8 on ADLS Gen2** (hierarchical-namespace account) — the Azure run used a flat-namespace account.
+  object_store talks to the Blob endpoint either way and HNS accounts honour `If-None-Match` on Put
+  Blob, so no difference is expected; re-run the same probe against an HNS account to confirm.
 - Spark cross-read (no JVM on the probe host; DuckDB covers the independent-reader check).
 
 ## Running
