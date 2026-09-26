@@ -9,7 +9,7 @@ The sink commit under test is **one MERGE per table per flush**: source = collap
 version: owner_epoch}` as the fence carrier; `commitInfo["avalanche.committed_position"]` as the
 position carrier.
 
-## Results (2026-09-26, local `file://` tables, release build) — 10/10 green
+## Results (2026-09-26, local `file://` tables unless noted, release build) — 10/10 green + P8 on S3
 
 | Probe | What | Result |
 |---|---|---|
@@ -23,6 +23,7 @@ position carrier.
 | P7b | add column on a **column-mapping `name`** table | ❌ **refused**: `UnsupportedColumnMapping { mode: Write, operation: "ADD COLUMN" }` (asserted, so a fixed delta-rs flips the test) |
 | P10 | Hop-3b type round-trip (append + MERGE), read back by delta-rs **and cross-read by DuckDB** | ✅ all 15 columns, exact types and values — see below |
 | P10b | protocol of the same table without `timestamp_ntz` | ✅ reader 1 / writer 2 (so `timestamp_ntz` alone raises it to 3 / 7) |
+| P8 | commit atomicity on **real S3** (us-east-1) — see below | ✅ P8a–P8e; GCS / Azure pending credentials |
 
 ### P6 — write amplification (the Delta cost model, measured)
 
@@ -74,9 +75,37 @@ P10_OUT=/tmp/p10 cargo test --release --features probe --test probe_types -- --n
 uv run --no-project --with duckdb --with pytz python scripts/p10_duckdb_crossread.py /tmp/p10
 ```
 
+### P8 — commit atomicity on real S3 (`tests/probe_s3_commit.rs`, `--features s3`)
+
+delta-rs 1.0 on S3 uses the `DefaultLogStore`: a commit is **one** `PUT _delta_log/<N>.json` with
+`If-None-Match: *` (object_store 0.13 `S3ConditionalPut::ETagMatch`, the default). No DynamoDB
+locking provider, no temp-file + rename (none found in the bucket after the run).
+
+| Probe | What | Result (2026-09-26) |
+|---|---|---|
+| P8a | 16 concurrent put-if-absent of one key, 10 rounds | ✅ exactly 1 winner each round (15 `AlreadyExists`); stored body = winner's |
+| P8b | 8 sink MERGEs on one snapshot, **retries off**, 5 rounds | ✅ exactly one new version per round, no stray v+2; v+1 carries the winner's `commitInfo` position; content = base + winner's change set only (~4.4 s per round) |
+| P8c | 8 owners MERGE the **same row**, retries on | ✅ exactly one lands; losers stopped by the **data** conflict check (`a concurrent transactions added new data`) — fires before the fence |
+| P8e | 8 owners append **disjoint** rows, retries on | ✅ exactly one lands; losers stopped by the **`txn` fence alone** (`Concurrent transaction failed`); `txn` version = winner's epoch |
+| P8d | 8 foreign appends (no `txn`), retries on | ✅ all land on contiguous versions 1..=8; 800/800 rows |
+
+Losing writers leave their Parquet files behind (≈7 per contested round) — reclaimed by VACUUM
+(external maintenance). P8b cannot tell whether a loser was stopped by S3's `If-None-Match` or by
+delta-rs's pre-commit version check (both surface as `MaxCommitAttempts(0)`); P8a proves the S3
+primitive directly.
+
+```bash
+eval "$(aws configure export-credentials --profile <profile> --format env)"
+AWS_REGION=us-east-1 P8_S3_URL=s3://<bucket>/delta-probe \
+cargo test --release --features s3 --test probe_s3_commit -- --nocapture --test-threads=1
+aws s3 rm s3://<bucket>/delta-probe/ --recursive   # cleanup
+```
+
+Run 2026-09-26 on account `418759522081` (profile `kav`); prefix deleted afterwards.
+
 ### Not covered yet
 
-- **P8** — commit atomicity on real S3 / GCS / Azure (needs the lease-conformance buckets/credentials).
+- **P8 on GCS / Azure** — credentials pending (same probe shape; needs `deltalake/gcs`, `deltalake/azure`).
 - Spark cross-read (no JVM on the probe host; DuckDB covers the independent-reader check).
 
 ## Running

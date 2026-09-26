@@ -561,7 +561,8 @@ P1, P2, P4, P6, P8 are the gates whose failure would change the Delta design; th
 | P7b add column on column-mapping `name` table | ❌ refused by delta-rs 1.0 → **default revised to `none`** (§7.2, §9.2, V-092) |
 | P9 single arrow with iceberg `main` | ✅ at resolution (arrow/parquet 59.3), joint compile not run |
 | P10 types + independent cross-read | ✅ all Hop-3b types exact through append **and** MERGE; DuckDB 1.5.5 `delta_scan` (delta-kernel) reads identical types/values; tz vs ntz semantics preserved. **Finding:** a `timestamp_ntz` column puts the table at reader v3 / writer v7 (`timestampNtz` feature); without it the table stays at reader 1 / writer 2 (P10b) — gap DA-MS-8 |
-| P8 real clouds | ⏳ not run (needs credentials) |
+| P8 real clouds — **S3** (2026-09-26, us-east-1) | ✅ commit = one `PUT _delta_log/<N>.json` with `If-None-Match: *` (object_store 0.13 default, no DynamoDB, no tmp+rename). **P8a** raw put-if-absent: 10 rounds × 16 → exactly 1 winner, content = winner's · **P8b** same-version MERGE race, retries off: 5 rounds × 8 → exactly one version, no stray v+2, content = base + winner only · **P8c** 8 owners MERGE one row, retries on → 1 lands, losers stopped by the *data* conflict check · **P8e** 8 owners append disjoint rows → 1 lands, losers stopped by the **`txn` fence alone** (`Concurrent transaction failed`) · **P8d** 8 foreign appends, retries on → all land on contiguous versions, 800/800 rows. Losers leave orphan Parquet (reclaimed by VACUUM). |
+| P8 real clouds — GCS / Azure | ⏳ credentials pending |
 
 **P6 interpretation.** Delta MERGE cost per flush is ∝ *(number of files whose key range contains a
 changed key)* × file size. For time/sequence-correlated updates (append-heavy OLTP, recent-row

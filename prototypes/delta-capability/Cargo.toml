@@ -11,7 +11,7 @@ description = "Capability probe: proves the delta-rs behaviors the Delta sink de
 # Like iceberg-capability, the delta-dependent probe code is gated behind the
 # `probe` feature and is OFF by default, so a plain `cargo test` stays fast and green.
 # Probes run against a local `file://` table in a temp dir (no cloud needed);
-# P8 (real S3/GCS/Azure commit atomicity) is not covered here.
+# P8 (real-cloud commit atomicity) is behind the `s3` feature (GCS/Azure: pending credentials).
 #
 #   cargo test -p delta-capability --features probe -- --nocapture --test-threads=1
 
@@ -27,6 +27,8 @@ probe = [
     "dep:url",
     "dep:serde_json",
 ]
+# P8 on real S3 (deltalake-aws; conditional-put commits, no DynamoDB). Implies `probe`.
+s3 = ["probe", "deltalake/s3"]
 
 [dependencies.deltalake]
 version = "=1.0.0"
