@@ -30,10 +30,13 @@ pg = [
     "dep:anyhow",
     "dep:futures",
     "dep:bytes",
+    "dep:rustls",
 ]
 mysql = [
     "dep:mysql-binlog-connector-rust",
     "dep:mysql_async",
+    "dep:mysql_common",
+    "dep:rustls",
     "dep:tokio",
     "dep:anyhow",
     "dep:futures",
@@ -55,6 +58,22 @@ optional = true
 version = "=0.37.1"
 default-features = false
 features = ["default-rustls", "binlog"]
+optional = true
+
+# same version mysql_async resolves to — only for `constants::ColumnType` (not re-exported)
+[dependencies.mysql_common]
+version = "=0.37.3"
+default-features = false
+optional = true
+
+# Only to install a process-wide CryptoProvider: pgwire-replication enables rustls `ring`,
+# mysql_async enables `aws-lc-rs`; with both linked rustls cannot pick one and panics at the first
+# handshake (finding — the app must install a provider at startup; deltalake/object_store use
+# rustls too).
+[dependencies.rustls]
+version = "0.23"
+default-features = false
+features = ["aws_lc_rs"]
 optional = true
 
 [dependencies.tokio]

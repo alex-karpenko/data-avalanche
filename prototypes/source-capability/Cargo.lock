@@ -2201,7 +2201,9 @@ dependencies = [
  "futures",
  "mysql-binlog-connector-rust",
  "mysql_async",
+ "mysql_common 0.37.3",
  "pgwire-replication",
+ "rustls",
  "tokio",
  "tokio-postgres",
 ]
