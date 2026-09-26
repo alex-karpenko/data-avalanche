@@ -8,6 +8,7 @@ pub mod value;
 
 pub use decimal::{Decimal, DecimalError, MAX_DECIMAL_PRECISION};
 pub use logical::{LogicalType, LogicalTypeError};
+pub use position::{PositionError, SourcePosition};
 pub use table::{
     INTERNAL_COLUMN_PREFIX, LINEAGE_COLUMNS, TableRef, first_reserved_collision, is_reserved_column,
 };
