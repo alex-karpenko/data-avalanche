@@ -58,6 +58,8 @@ that no longer matches the agreed design.
 - 🟥 **Open** — no settled answer yet; genuine work for the spec-elaboration phase.
 - 🧪 **Verify** — design is settled *on paper* but rests on an unproven external capability (a pinned
   crate version or a cloud-storage guarantee) that must be empirically confirmed before it can be trusted.
+- ⏭ **v2** — out of v1 scope: deferred with the Iceberg sink (2026-09-26). Kept, not closed — this is the
+  v2 backlog (§26.2).
 
 A 🧪 item is *not* a design gap — it is an execution gate. They are tracked separately (§21) because
 they are the items most likely to invalidate a "design complete" claim if they fail.
@@ -111,15 +113,23 @@ in three buckets:
 Everything else is 🧪 (other capability gates), 🟡/🟢 with a decided design, or 🟥 scoping work that
 does not block starting the specification.
 
+> **v1 readiness (2026-09-26) — Iceberg sink deferred to v2.** No 🔴 remains in the sink, cluster or config
+> design; all Delta gates are proven on S3, GCS and Azure. The v1 open set is small: two **source-side
+> capability gates** (DA-SRC-10/11, 🔴 🧪 — the pgoutput and binlog client crates were never probed),
+> five v1 decisions and the System-Overview spec debt. See §22 (re-assessment) and §26.
+
 ### Counts (by status)
 
-| Status | Count (approx.) | Notes |
+> Recounted 2026-09-26 (v1 readiness tidy, §26); the 2026-06 figures are superseded.
+
+| Status | Count (v1 scope) | Notes |
 |---|---|---|
-| ✅ Resolved | ~70% of items | Design closed by a research/spec doc. |
-| 🔄 Partial | small | Decided but with an open sub-item. |
-| 🟥 Open | ~12 items | §20 register. |
-| 🧪 Verify | 6 gates | §21. |
-| 🟢 Spec-merge debt | ~22 owed (16 config + 6 overview); **9 data-flow applied 2026-06-20** | §19. |
+| ✅ Resolved | the large majority | Design closed by a research/spec doc or a probe. |
+| 🔄 Partial | 4 | DA-FLOW-6, DA-SNAP-7, DA-SRC-9, DA-X-8 (config residual); DA-MS-3 is a decided caveat. |
+| 🟥 Open (v1 decisions) | 5 + deferral confirmations | DA-SRC-8, DA-SYS-4, DA-SYS-7, DA-OBS-5, DA-FLOW-6 (§20). |
+| 🧪 Verify (v1) | **2** | DA-SRC-10/11 — source-side crates (§21). |
+| ⏭ v2 | 13 | Iceberg-sink items (§26.2). |
+| 🟢 Spec-merge debt | 6 + 1 | §19.3 System-Overview S-1…S-6 (unapplied) + DA-X-8 config residual. Config (§19.1) and Data-Flow (§19.2) are applied. |
 
 ---
 
@@ -137,8 +147,9 @@ research corpus.
 | DA-SYS-2 | Single-node = one-member cluster, same code path | 🟡 | ✅ | Clustering §10; lease stays on to guard rolling-deploy double-singleton. | OQ-CL4 |
 | DA-SYS-3 | "App never deletes Iceberg artifacts" vs maintenance/orphan cleanup ownership | 🟢 | ✅ | `Iceberg_Maintenance.md` — v1 maintenance is external (operator/Spark/Trino); app exposes signals + reserves `sink.maintenance`. | OQ-M2, G-25 |
 | DA-SYS-4 | Reserved metadata column collision (`_op/_ts/_lsn/_source_db/_pipeline` vs a source column of the same name) | 🟡 | 🟥 | Config spec §5 only says operators "should be aware." **No defined runtime behavior** if a source table actually has an `_op` column — rename? prefix-escape? halt? Needs a rule. See DA-FLOW-5. | — |
-| DA-SYS-5 | Lineage column `_seq` (per-change order) is required by dedup but absent from the documented lineage column set | 🟡 | 🟥 | `Ghost_Row_Dedup_and_Primary_Keys.md` §4 introduces `_seq`; `Data-Flow.md`'s lineage table lists only five `_`-columns and `CdcEvent` carries only commit `source_pos`. The per-change position must be added to both. See DA-FLOW-2. | — |
+| DA-SYS-5 | Lineage column `_seq` (per-change order) is required by dedup but absent from the documented lineage column set | 🟡 | ✅ | `Ghost_Row_Dedup_and_Primary_Keys.md` §4 introduces `_seq`; `Data-Flow.md`'s lineage table lists only five `_`-columns and `CdcEvent` carries only commit `source_pos`. The per-change position must be added to both. See DA-FLOW-2. **2026-09-26 tidy:** `Data-Flow.md` lineage table lists `_seq`; `CdcEvent.change_seq` feeds the Phase-3 keep-last collapse. | — |
 | DA-SYS-6 | `snapshot_mode: only` referenced but not in the enum | 🟢 | ✅(moot) | The enum is `never\|initial\|always\|dump_always\|dump_initial` (config §9.3). The stray "only" in System-Overview's OQ-M2 is superseded by `dump_*`. Drop the dangling reference. | OQ-M2 |
+| DA-SYS-7 | **v1 scope: the Iceberg sink is deferred to v2** — record it in `System-Overview.md`, and decide how v1 treats `sink.type: iceberg` | 🟢 | 🆕 🟥 | Today the config accepts `iceberg` and the pipeline is refused at start by the capability assertion (DA-SINK-1i). Options: (a) keep that — the enum stays stable across v1→v2; (b) validation error "not available in v1". Recommendation: (a) with an explicit start-refusal message naming v2. | — |
 
 ---
 
@@ -178,10 +189,10 @@ documentation gaps, not design gaps, but they are load-bearing for anyone readin
 | ID | Title | Sev | Status | Resolution / note | Old ID |
 |---|---|---|---|---|---|
 | DA-FLOW-1 | In-flight buffer handling on pipeline restart | 🟡 | ✅ | Config §12.4 discard-and-replay default; `Pipeline_Lifecycle_State_Machine.md`. | OQ-P2 |
-| DA-FLOW-2 | `CdcEvent` lacks a **per-change** position distinct from commit `source_pos` | 🟡 | 🟥 | Dedup keep-last needs `_seq` = PG change LSN / MySQL `(binlog_file,end_log_pos)` (`Ghost_Row…` §4); `CdcEvent` currently carries only commit `source_pos` + `xid`. The struct and the accumulator contract must add the per-change sequence. Surfaced by reading FLOW+DEDUP together. | — |
+| DA-FLOW-2 | `CdcEvent` lacks a **per-change** position distinct from commit `source_pos` | 🟡 | ✅ | Dedup keep-last needs `_seq` = PG change LSN / MySQL `(binlog_file,end_log_pos)` (`Ghost_Row…` §4); `CdcEvent` currently carries only commit `source_pos` + `xid`. The struct and the accumulator contract must add the per-change sequence. Surfaced by reading FLOW+DEDUP together. **2026-09-26 tidy:** `CdcEvent.change_seq: SourceSeq` (PG change-LSN / MySQL binlog file+pos) in `Data-Flow.md` §CdcEvent; collapse in Phase 3. | — |
 | DA-FLOW-3 | Backpressure / bounded channels | 🟡 | ✅ | `Operational…` G-27 — all inter-task channels bounded; `sink.buffer_capacity_rows`. | G-27 |
-| DA-FLOW-4 | Phase-1 snapshot model in spec is superseded | 🟢 | 🔄 | `Snapshot_Resumability…` replaces blocking COPY/EXPORT_SNAPSHOT with the stream-first incremental chunk loop; `Data-Flow.md` Phase 1 + On-Demand section must be rewritten. Spec-merge debt (§19). | G-6 |
-| DA-FLOW-5 | `TRUNCATE` manifestation in the Iceberg mirror (both engines) | 🟡 | 🟥 | `MySQL_DDL_Classifier.md` §3 says TRUNCATE → "table-clear (Iceberg DELETE/overwrite all rows or fresh snapshot boundary), flagged for the sink-writer contract." `Data-Flow.md` Phase 2a lists the PG `T` message but no sink action is specified. The concrete sink behavior (and PG/MySQL parity) is undefined. | — |
+| DA-FLOW-4 | Phase-1 snapshot model in spec is superseded | 🟢 | ✅ | `Snapshot_Resumability…` replaces blocking COPY/EXPORT_SNAPSHOT with the stream-first incremental chunk loop; `Data-Flow.md` Phase 1 + On-Demand section must be rewritten. Spec-merge debt (§19). **2026-09-26 tidy:** `Data-Flow.md` Phase 1 is the incremental chunked, stream-first model (DF-1/DF-2 applied 2026-06-20). | G-6 |
+| DA-FLOW-5 | `TRUNCATE` manifestation in the Iceberg mirror (both engines) | 🟡 | ✅ (Delta) · ⏭ v2 (Iceberg) | `MySQL_DDL_Classifier.md` §3 says TRUNCATE → "table-clear (Iceberg DELETE/overwrite all rows or fresh snapshot boundary), flagged for the sink-writer contract." `Data-Flow.md` Phase 2a lists the PG `T` message but no sink action is specified. The concrete sink behavior (and PG/MySQL parity) is undefined. **2026-09-26 tidy:** `Data-Flow.md` Phase 3 TRUNCATE barrier + Delta realization (metadata-only delete-all, probe P5); the Iceberg overwrite-to-empty goes with the Iceberg sink to v2. | — |
 | DA-FLOW-6 | PG `DROP TABLE` detection (no in-band DDL on pgoutput) | 🟡 | 🔄 | MySQL DROP is caught by channel B (`QUERY_EVENT`). PG drops are **not** replicated as DDL; the table simply stops emitting and is caught by channel D idle-rescan / channel A on restart (`Schema_Change…` §2.1). The *latency and exact reaction* (halt vs retain) for a PG drop of a tracked table is not spelled out as crisply as MySQL's. Worth an explicit line. | — |
 | DA-FLOW-7 | `committed_lsn` scalar generalized to engine-tagged `committed_position` | 🟡 | ✅(design) | `Delivery_Guarantee…` §4 — per-table HWM `cdc.committed_position`; `Data-Flow.md` wording owed (§19). | G-14 |
 | DA-FLOW-8 | Shutdown / drain ordering | 🟡 | ✅ | `Data-Flow.md` §Concurrency + Clustering §8.3 drain protocol (adds explicit lease release). | OQ-CL3 |
@@ -200,7 +211,7 @@ and per-column overrides. Essentially complete; residual items are spec-merge an
 | DA-TYPE-2 | `ColumnValue` enum extensions (tz flag, typed `Array`, `Time`, `UInt64`) | 🟡 | ✅ | `Type_Mapping.md` §extensions; reflected in `Data-Flow.md` enum. | G-NEW-22 |
 | DA-TYPE-3 | `BIGINT UNSIGNED` / `numeric(P>38)` overflow handling | 🟡 | ✅ | `decimal(20,0)` for the former; `numeric_overflow_action: string\|error` for the latter. | — |
 | DA-TYPE-4 | `TINYINT(1)`→bool detection requiring `information_schema` | 🟢 | ✅ | `tinyint1_as_bool` + `tinyint1_detection`; G-NEW-21 dropped the stale events-mode warning. | G-NEW-21 |
-| DA-TYPE-5 | `FixedSizeBinary(16)` → Iceberg `uuid` needs explicit iceberg-rust annotation | 🟢 | 🧪 | `Type_Mapping.md` Hop-3 table flags this as the one Arrow type needing a field-level `{"iceberg.type":"uuid"}` hint — verify the mechanism exists in the pinned crate. See §21. | — |
+| DA-TYPE-5 | `FixedSizeBinary(16)` → Iceberg `uuid` needs explicit iceberg-rust annotation | 🟢 | ⏭ v2 | `Type_Mapping.md` Hop-3 table flags this as the one Arrow type needing a field-level `{"iceberg.type":"uuid"}` hint — verify the mechanism exists in the pinned crate. See §21. **2026-09-26 tidy:** Iceberg-sink only — deferred with the Iceberg sink to v2. | — |
 | DA-TYPE-6 | Merge the four TYPE config fields + 4 validation rules into the master table | 🟢 | ✅ | Already largely done (V-078..V-082 present); confirm `column_type_overrides`, `numeric_overflow_action`, `toast_strategy`, `tinyint1_*` all merged (G-NEW-21). Verified 2026-09-26: V-078…V-082 present; V-078 now uses the sink-neutral logical type grammar. | G-NEW-21 |
 | DA-TYPE-7 | TOAST unchanged-column strategy (`carry_forward` vs `re_query`) | 🟡 | ✅ | `source.toast_strategy` (PG only); V-077/V-080. Re-query pool-saturation is a warning, not a halt. | — |
 
@@ -223,7 +234,7 @@ resume), idempotent replay, and rename resolution. The MySQL classifier is separ
 | DA-SCHEMA-5 | Channel-C/A/D require SELECT on `information_schema`/catalogs | 🟡 | ✅ | §9 precondition; checked at pipeline start (runtime, not config). Reuse replication creds. | DT-R8 |
 | DA-SCHEMA-6 | `method` field removed; detection is fixed four-channel model | 🟢 | ✅ | §10; config V-024/V-031/V-032 deleted, `interval`→`rescan_interval`. | DT-R1 |
 | DA-SCHEMA-7 | ENUM/SET representation (string vs ordinal) | 🟢 | ✅ | `ENUM→string`, `SET→list<string>`; append-only value adds Ignorable, reorder/remove Unsafe. | DT-R5 |
-| DA-SCHEMA-8 | iceberg-rust drop/rename/type-promotion support | 🟡 | 🧪 | §7.1 implementation note — only `add_column` is mature; **verify** drop/rename/promotion against the pinned crate, route unsupported ops to halt. See §21. | — |
+| DA-SCHEMA-8 | iceberg-rust drop/rename/type-promotion support | 🟡 | ⏭ v2 | §7.1 implementation note — only `add_column` is mature; **verify** drop/rename/promotion against the pinned crate, route unsupported ops to halt. See §21. **2026-09-26 tidy:** Iceberg-sink only — deferred with the Iceberg sink to v2. | — |
 | DA-SCHEMA-9 | Idempotent DDL replay + checkpoint-after-evolve ordering | 🟡 | ✅ | §8.3 — re-read live Iceberg schema, skip if already applied; advance offset only after schema commit. | — |
 
 ---
@@ -272,7 +283,7 @@ read-point hazard. This is a *change* to `Data-Flow.md` Phase 1, so it carries s
 | DA-SNAP-5 | Keyset collation correctness (text identifiers) | 🟡 | ✅ | §2 collation pin — binary collation (`COLLATE "C"` / `utf8mb4_bin`) for the pagination predicate, recorded in the cursor. Subtle but load-bearing. | — |
 | DA-SNAP-6 | `snapshot.chunk_size` config field | 🟢 | ✅ | Default 10000; promotion into config owed (§19). Promoted 2026-09-26 as `tables.snapshots.chunk_size` (V-108). | G-6 |
 | DA-SNAP-7 | Snapshot vs WAL/binlog retention coupling | 🟡 | 🔄 | §7 cross-ref — a slow snapshot lengthens the stream backlog; interacts with the WAL-lag guard (G-22) and binlog purge (G-26). Designed but the interaction tuning is an operational note, not a hard rule. | — |
-| DA-SNAP-8 | PK-less table under a **dump-only** mode (snapshot, never stream) | 🟡 | 🟥 | The PK-less halt rule (DA-DEDUP-3) is justified by equality-delete keying — but a `dump_*` table is insert-only and never deletes, so the keying argument doesn't apply. Whether a dump-only PK-less table may be snapshotted (or still halts) is **unspecified**. Newly surfaced edge case. | — |
+| DA-SNAP-8 | PK-less table under a **dump-only** mode (snapshot, never stream) | 🟡 | ✅ | The PK-less halt rule (DA-DEDUP-3) is justified by equality-delete keying — but a `dump_*` table is insert-only and never deletes, so the keying argument doesn't apply. Whether a dump-only PK-less table may be snapshotted (or still halts) is **unspecified**. Newly surfaced edge case. **2026-09-26 tidy:** decided by spec: the identifier precondition (config §11.2) applies in every mode — explicit PK-less table halts, glob-matched one is skipped; `tables.surrogate_key` struck (G-30). Dump-only PK-less tables are not supported in v1. | — |
 
 ---
 
@@ -308,7 +319,7 @@ the §13 validation rules (V-040..V-048). Hive Thrift `none/ldap/kerberos`; REST
 | DA-CAT-1 | Catalog auth model (Hive SASL / REST OAuth2/bearer/sigv4) | 🔴→✅ | ✅ | `Catalog_Auth_Research.md` §2–§3; config §9.5. | G-1g |
 | DA-CAT-2 | Primary catalog vs multi-catalog at launch | 🟢 | ✅ | All three backends (glue/hive/rest) are first-class via the union; choice is per-pipeline. | OQ-IC2 |
 | DA-CAT-3 | OAuth2 must point at an external IdP | 🟡 | ✅ | `token_url` external; V-048 warns on the deprecated built-in endpoint. | — |
-| DA-CAT-4 | Credential vending interaction with the sink credential model | 🟢 | 🟥 | §3.5 is informational only — if the catalog vends short-lived table-scoped storage creds, the `globals.cloud` chain becomes optional, but **how the writer consumes vended creds is not specified**. Minor; flag for the sink-writer contract. | — |
+| DA-CAT-4 | Credential vending interaction with the sink credential model | 🟢 | ⏭ v2 | §3.5 is informational only — if the catalog vends short-lived table-scoped storage creds, the `globals.cloud` chain becomes optional, but **how the writer consumes vended creds is not specified**. Minor; flag for the sink-writer contract. **2026-09-26 tidy:** Iceberg-sink only — deferred with the Iceberg sink to v2. | — |
 | DA-CAT-5 | Catalog unavailability retry policy (separate from object storage) | 🟡 | ✅ | `Operational…` G-35 — own retry + circuit breaker + DEGRADED; optional `catalog.retry`. | G-35 |
 
 ---
@@ -323,8 +334,8 @@ writer's correctness literally depends on.
 
 | ID | Title | Sev | Status | Resolution / note | Old ID |
 |---|---|---|---|---|---|
-| DA-SINK-1 | **Equality-delete writer assigns delete files the enclosing commit's sequence number** | 🔴→🟡 | 🔄 | **Superseded:** the real finding is "no delete-commit action at all" (§24.2.1–§24.2.4). **Re-scoped 2026-09-26 to DA-SINK-1i (Iceberg mirror-mode capability)** by the multi-sink design (§25); Delta sink is the v1 mirror. Original note: | `Ghost_Row…` §8 — the entire strictly-less-than ghost-row guarantee assumes this iceberg-rust 0.9.0 behavior; **verify before building the writer**. If unsupported/mis-sequenced, need position-deletes-after-read or a different strategy. | G-13 §8 |
-| DA-SINK-2 | Custom snapshot-summary properties (`cdc.owner_epoch`, `cdc.committed_position`) preserved across commits | 🟡 | ✅ (append path) | Required by CLUS fencing (D-7) and DEDUP guard (D-14.4); `Clustering…` §5.5 flags "verify iceberg-rust preserves custom snapshot-summary properties." See §21. **2026-09-26 (probe G2b):** the `cdc.owner_epoch` table-property carrier commits in the same metadata commit as the append, all-or-nothing, and survives foreign commits + expiry. Delete-commit path still waits on DA-SINK-1i. | D-7 |
+| DA-SINK-1 | **Equality-delete writer assigns delete files the enclosing commit's sequence number** | 🔴→🟡 | ⏭ v2 | **Superseded:** the real finding is "no delete-commit action at all" (§24.2.1–§24.2.4). **Re-scoped 2026-09-26 to DA-SINK-1i (Iceberg mirror-mode capability)** by the multi-sink design (§25); Delta sink is the v1 mirror. Original note: **2026-09-26 tidy:** Iceberg-sink only — deferred with the Iceberg sink to v2. | `Ghost_Row…` §8 — the entire strictly-less-than ghost-row guarantee assumes this iceberg-rust 0.9.0 behavior; **verify before building the writer**. If unsupported/mis-sequenced, need position-deletes-after-read or a different strategy. | G-13 §8 |
+| DA-SINK-2 | Custom snapshot-summary properties (`cdc.owner_epoch`, `cdc.committed_position`) preserved across commits | 🟡 | ✅ (append path) | Required by CLUS fencing (D-7) and DEDUP guard (D-14.4); `Clustering…` §5.5 flags "verify iceberg-rust preserves custom snapshot-summary properties." See §21. **2026-09-26 (probe G2b):** the `cdc.owner_epoch` table-property carrier commits in the same metadata commit as the append, all-or-nothing, and survives foreign commits + expiry. Delete-commit path still waits on DA-SINK-1i. | D-7 **2026-09-26 tidy:** delete-commit path ⏭ v2 with the Iceberg sink. |
 | DA-SINK-3 | Write strategy COW vs MOR | 🟡 | ✅ | MOR + equality deletes is the default (`Ghost_Row…` §5); COW new-tables-only. | OQ-IC1 |
 | DA-SINK-4 | MOR↔COW strategy change migration | 🟢 | ✅ | `Iceberg_Partitioning…` §4 (G-12a) — new-data-only; explicit compaction/re-snapshot to migrate; PR. | G-12a |
 | DA-SINK-5 | Partition spec config + evolution | 🟢 | ✅ | `Iceberg_Partitioning…` §1/§3 (G-24) — `tables.partitioning`; default unpartitioned; spec evolution = new-data-only. | G-24 |
@@ -332,7 +343,7 @@ writer's correctness literally depends on.
 | DA-SINK-7 | Large-transaction vs txn-atomic-flush tension | 🟡 | ✅ | `Large_Transaction…` (G-29) — bounded split commits (default off → atomic), `max_transaction_buffer_bytes` halt-backstop; crash-safe via idempotency. | G-29 |
 | DA-SINK-8 | Spill-to-disk for oversized txns | 🟢 | 🟥(deferred) | `Large_Transaction…` §5 — future `sink.large_txn_mode: split\|spill`; out of scope for v1. | G-29 §5 |
 | DA-SINK-9 | Iceberg maintenance ownership (compaction/expiry/orphans) | 🟢 | ✅ | `Iceberg_Maintenance…` (G-25) — external for v1; app exposes signals + reserves `sink.maintenance`; built-in gated on iceberg-rust rewrite support. | G-25 |
-| DA-SINK-10 | iceberg-rust compaction/rewrite API availability | 🟢 | 🧪 | Gates any **future** built-in maintenance (deferred anyway). Verify against pinned crate. | G-25 §14 |
+| DA-SINK-10 | iceberg-rust compaction/rewrite API availability | 🟢 | ⏭ v2 | Gates any **future** built-in maintenance (deferred anyway). Verify against pinned crate. **2026-09-26 tidy:** Iceberg-sink only — deferred with the Iceberg sink to v2. | G-25 §14 |
 | DA-SINK-11 | Exactly-once vs at-least-once into Iceberg | 🟡 | ✅ | Effectively exactly-once-effect via idempotency (DEDUP) + position guard; at-least-once delivery, dedup absorbs replays. | OQ-IC3 |
 
 ---
@@ -354,6 +365,8 @@ the MySQL path with one genuine correctness dependency.
 | DA-SRC-7 | External same-name slot collisions undetectable | 🟢 | ✅(limitation) | §5 — PG slots carry no ownership tag; mitigated by V-058 uniqueness + operator discipline; documented, not papered over. | G-15 |
 | DA-SRC-8 | MariaDB GTID dialect (`domain-server-sequence`) | 🟡 | 🟥 | `Operational…` G-38 — MariaDB accepted via the MySQL path, but the `SourcePosition` MySQL impl **must support both GTID dialects** (MariaDB domains vs MySQL UUIDs); flagged as a **new sub-research item** and the one genuine correctness dependency. | G-38 |
 | DA-SRC-9 | TOAST re-query control-connection pool sizing | 🟢 | 🔄 | V-077 warns on `re_query`+high-volume snapshot; concrete pool sizing is an implementation detail, not yet fixed. | — |
+| DA-SRC-10 | **PG replication client crate capability** (`pgwire-replication` named in Sources_Index; never pinned, compiled or probed) | 🔴 | 🆕 🧪 | Needed: pgoutput proto v1–v4 incl. streamed in-progress txns (`Stream Start/Stop/Commit/Abort`), `Relation`/`Type`/`Truncate` messages, unchanged-TOAST marker, standby status feedback (flush-LSN ack), slot `START_REPLICATION` from an LSN, TLS, keepalives. Probe: `prototypes/source-capability/` (S-gates) against local PostgreSQL. A negative result means writing/forking the protocol layer — a plan-shaping item. **Scaffolded 2026-09-26, source-read:** the crate is **transport-only** — pgoutput decoding (Relation/Insert/Update/Delete/Truncate/Type/Origin) is a stated non-goal, so **the decoder is ours** (bounded v1 work item); `proto_version '1'` is hard-coded with no `streaming` (large txns arrive whole at commit — fine for the design, but `Data-Flow.md` Phase 2a says `'2'`). Gates S-PG0…S-PG8 in `prototypes/source-capability/README.md`. | — |
+| DA-SRC-11 | **MySQL binlog client crate capability** (`mysql-binlog-connector-rust` named in Sources_Index; never pinned, compiled or probed) | 🔴 | 🆕 🧪 | Needed: GTID-set positioning (`COM_BINLOG_DUMP_GTID`), `ROW` events with FULL image, `TABLE_MAP` optional metadata (column names/signedness, `binlog_row_metadata=FULL`), `QUERY_EVENT` (DDL classifier input), CRC32 checksums, heartbeats, MySQL 8.4 `caching_sha2_password` auth + TLS; MariaDB GTID dialect if in v1 scope (DA-SRC-8). Probe: `prototypes/source-capability/` against local MySQL (and MariaDB). **Scaffolded 2026-09-26, source-read:** two candidates probed side by side — (a) `mysql-binlog-connector-rust` 0.3.3 (TLS looks absent, claims ≤ MySQL 8.0.31, has MariaDB GTID events) vs (b) `mysql_async` 0.37.1 binlog stream (TLS ✅, active; MariaDB GTID events not found in `mysql_common`). Neither complete on paper. Gates S-MY0…S-MY9. | — |
 
 ---
 
@@ -415,8 +428,8 @@ pinning is the remaining cross-cutting concern.
 | DA-OPS-4 | Sink/catalog unavailability → DEGRADED back-pressure | 🟡 | ✅ | G-27/G-35 — stop consuming once buffers fill, protect slot/WAL via G-22; recover on next commit; catalog circuit breaker. | G-27, G-35 |
 | DA-OPS-5 | k8s deployment as StatefulSet (not Deployment) | 🟡 | ✅ | Clustering §3.4/§10.2 — stable `node_name` via Downward API; headless Service discovery. | D-1, D-4 |
 | DA-OPS-6 | "Restart ≠ apply config" operator footgun | 🟢 | ✅(documented) | Clustering §9.3 D-3 — cloud-generation-wins; a pod restart does **not** apply ConfigMap edits, only `POST /reload` does. Document loudly. | D-3 |
-| DA-DEP-1 | iceberg-rust pinned version & capabilities | 🟡 | 🧪 | `iceberg` 0.10.1, MSRV 1.94 (main has moved to 1.95, #3083; Sources_Index needs refreshing from 1.92). Multiple capability gates ride on the exact version: DA-SINK-1, DA-SINK-2, DA-SCHEMA-8, DA-TYPE-5, DA-SINK-10. Pin and assert at startup. | — |
-| DA-DEP-2 | OpenDAL version exposing conditional writes | 🔴 | 🧪 | Clustering §17.2 — `if_match` on writes landed late-2024/early-2025; the `iceberg-storage-opendal` transitive pin must be ≥ that, and capabilities asserted at startup (refuse to start if absent). Part of DA-CLUS-1. | D-5 |
+| DA-DEP-1 | iceberg-rust pinned version & capabilities | 🟡 | ⏭ v2 | `iceberg` 0.10.1, MSRV 1.94 (main has moved to 1.95, #3083; Sources_Index needs refreshing from 1.92). Multiple capability gates ride on the exact version: DA-SINK-1, DA-SINK-2, DA-SCHEMA-8, DA-TYPE-5, DA-SINK-10. Pin and assert at startup. **2026-09-26 tidy:** Iceberg-sink only — deferred with the Iceberg sink to v2. | — |
+| DA-DEP-2 | OpenDAL version exposing conditional writes | 🔴 | ✅ | Clustering §17.2 — `if_match` on writes landed late-2024/early-2025; the `iceberg-storage-opendal` transitive pin must be ≥ that, and capabilities asserted at startup (refuse to start if absent). Part of DA-CLUS-1. **2026-09-26 tidy:** superseded — DA-CLUS-1 closed with a per-backend `LeaseStore` (OpenDAL only on S3, where `if_match` exists; native SDKs for GCS/Azure); the Delta sink uses object_store conditional puts (P8), not OpenDAL. | D-5 |
 | DA-DEP-3 | `sqlparser-rs` (MySqlDialect) pin | 🟢 | ✅ | `MySQL_DDL_Classifier.md` §5 — now on a fail-soft path, so a coverage gap degrades rather than halts; de-risked. | G-19a |
 | DA-DEP-4 | `memberlist` crate (Lifeguard, TLS/QUIC transport) | 🟢 | ✅ | Sources_Index; Clustering §2 — features confirmed available. | G-23 |
 
@@ -428,7 +441,9 @@ These are not contained in any single domain — they emerge from reading two or
 together and finding a seam. They are the items most worth attention in spec elaboration because no
 single research doc "owns" them.
 
-### DA-X-1 — `CdcEvent` is missing the per-change sequence the dedup design requires 🟡 🟥
+### DA-X-1 — `CdcEvent` is missing the per-change sequence the dedup design requires 🟡 ✅
+
+> **2026-09-26 tidy:** Closed: `CdcEvent.change_seq` + persisted `_seq` lineage column are in `Data-Flow.md` (DF-5).
 `Ghost_Row_Dedup_and_Primary_Keys.md` §4 keeps-last by a **per-change** `_seq` (PG: the change's own
 WAL LSN; MySQL: `(binlog_file, end_log_pos)` or GTID + intra-txn event index), explicitly *finer* than
 the commit position. But `Data-Flow.md`'s `CdcEvent` carries only `source_pos` (commit LSN/GTID) and
@@ -438,7 +453,9 @@ column (it is referenced as one in the dedup doc but absent from the lineage tab
 prerequisite to specifying both the decoder output and the sink collapse step. *(Links DA-FLOW-2,
 DA-SYS-5.)*
 
-### DA-X-2 — The Iceberg snapshot-summary carries three independent CDC properties; their coexistence is assumed, not specified 🟡 🧪
+### DA-X-2 — The Iceberg snapshot-summary carries three independent CDC properties; their coexistence is assumed, not specified 🟡 ⏭ v2
+
+> **2026-09-26 tidy:** Iceberg-sink only — v2.
 Three separate designs write into the Iceberg snapshot summary: `cdc.owner_epoch` (clustering fence,
 D-7), `cdc.committed_position` (delivery guard, D-14.4), and the implicit per-table HWM. Each doc
 individually says "verify iceberg-rust preserves custom snapshot-summary properties across commits."
@@ -446,7 +463,9 @@ individually says "verify iceberg-rust preserves custom snapshot-summary propert
 `cdc.*` snapshot-summary schema and a single verification that all of it survives commits. *(Links
 DA-SINK-2, DA-CLUS-3, DA-FLOW-7.)*
 
-### DA-X-3 — Equality-delete partition routing by before-image is a writer-contract obligation referenced from two docs but defined in neither's spec 🟡 🔄
+### DA-X-3 — Equality-delete partition routing by before-image is a writer-contract obligation referenced from two docs but defined in neither's spec 🟡 ⏭ v2
+
+> **2026-09-26 tidy:** Iceberg-sink only (equality deletes) — v2. The Delta MERGE matches on the key across partitions, so it has no equivalent obligation.
 `Iceberg_Partitioning…` §2 (D-24) requires the writer to route an equality-delete to the **old**
 partition (from the before-image) when an UPDATE changes a partition value; `Ghost_Row…` §4 requires
 the analogous old-key delete for PK mutation. Both are "sink-writer contract additions" with no single
@@ -461,13 +480,17 @@ column. Config §5 only says operators "should be aware." Decide the rule: rejec
 escape source columns (e.g. double-underscore prefix as in `glue.strip_schema` collisions). Until
 decided, the writer behavior is undefined.
 
-### DA-X-5 — `TRUNCATE` sink semantics undefined and possibly engine-asymmetric 🟡 🟥
+### DA-X-5 — `TRUNCATE` sink semantics undefined and possibly engine-asymmetric 🟡 ✅ (Delta) · ⏭ v2 (Iceberg)
+
+> **2026-09-26 tidy:** Closed for v1: `Data-Flow.md` TRUNCATE barrier, one semantics for PG + MySQL; Delta = metadata-only delete-all (P5). Iceberg realization → v2.
 *(= DA-FLOW-5.)* MySQL's classifier maps TRUNCATE to a "table-clear" but defers the actual Iceberg
 operation to "the sink-writer contract"; PG's `T` truncate message is decoded but no sink action is
 written down. Define one cross-engine truncate→Iceberg mapping (overwrite-to-empty vs delete-all vs a
 snapshot boundary marker) and confirm it is idempotent under replay like everything else.
 
-### DA-X-6 — PK-less semantics interact with dump-only modes 🟡 🟥
+### DA-X-6 — PK-less semantics interact with dump-only modes 🟡 ✅
+
+> **2026-09-26 tidy:** Closed by spec (uniform rule): the identifier precondition applies in every mode (config §11.2). See DA-SNAP-8.
 *(= DA-SNAP-8.)* "PK-less halts" is justified by equality-delete keying, but `dump_always` /
 `dump_initial` tables are insert-only and never delete — so the keying argument does not bind. The
 spec should state explicitly whether a dump-only table may be PK-less (snapshot as plain inserts,
@@ -480,6 +503,8 @@ from MySQL's `server-uuid:tx`. This is flagged as a new sub-research item and is
 "in scope" hides real work. Either schedule the sub-research or narrow the v1 scope statement.
 
 ### DA-X-8 — Three specs disagree on the per-pipeline state path; one canonical layout is needed 🟢 🔄
+
+> **2026-09-26 tidy:** Layout decided and in `Data-Flow.md` §State Layout (no `pipelines/<id>/` segment). **Residual:** three stale references in `Configuration_Specification.md` — line ~606 (`pipelines/<id>/`), the obsolete "Reconcile with Data-Flow" note (~960–965), and the §17 cross-reference (~1553). Spec edit owed (§26.4, needs approval).
 `Data-Flow.md` roots per-pipeline state at `…/pipelines/<id>/`; `Configuration_Specification.md` §10
 and `Operational…` G-NEW-20 remove that segment (state already roots at `sink.prefix`/`state.prefix` =
 `id`). Until `Data-Flow.md` is re-rooted, implementers reading the two specs will build different key
@@ -573,17 +598,19 @@ merge/verify work). Ordered roughly by leverage.
 | ID | Decision | Recommendation / starting position |
 |---|---|---|
 | DA-OBS-5 | Fix a **numeric end-to-end replication-lag SLA**, and whether failover-time has its own SLA. | Pick a steady-state max-lag (e.g. 60s fits Balanced lease defaults) + a separate, looser failover-time target (~20–30s); load-test to confirm. Grounds lease/flush/checkpoint tuning. |
-| DA-X-1 / DA-FLOW-2 | `CdcEvent` per-change sequence field + whether `_seq` is a persisted column. | Add `change_seq: SourceSeq` to `CdcEvent`; persist `_seq` as a 6th lineage column (downstream dedup auditability). |
+| ~~DA-X-1 / DA-FLOW-2~~  | `CdcEvent` per-change sequence field + whether `_seq` is a persisted column. | Add `change_seq: SourceSeq` to `CdcEvent`; persist `_seq` as a 6th lineage column (downstream dedup auditability). **✅ Closed 2026-09-26: in `Data-Flow.md` (`change_seq`, `_seq`).** |
 | DA-X-4 / DA-SYS-4 | Runtime rule for source columns colliding with reserved `_`-names. | Halt the table with a clear error by default; offer a configurable escape-prefix if demand appears. |
-| DA-X-5 / DA-FLOW-5 | Cross-engine `TRUNCATE` → Iceberg semantics. | Map to an overwrite-to-empty (or delete-all-by-no-key snapshot boundary); define once, same for PG + MySQL; keep idempotent. |
-| DA-X-6 / DA-SNAP-8 | PK-less table under dump-only modes. | Allow dump-only PK-less tables as plain inserts (no `identifier-field-ids`); they never stream/delete so the keying rule doesn't bind. (Or halt for uniformity — decide.) |
+| ~~DA-X-5 / DA-FLOW-5~~  | Cross-engine `TRUNCATE` → Iceberg semantics. | Map to an overwrite-to-empty (or delete-all-by-no-key snapshot boundary); define once, same for PG + MySQL; keep idempotent. **✅ Closed 2026-09-26 for v1 (Delta; TRUNCATE barrier); Iceberg → ⏭ v2.** |
+| ~~DA-X-6 / DA-SNAP-8~~  | PK-less table under dump-only modes. | Allow dump-only PK-less tables as plain inserts (no `identifier-field-ids`); they never stream/delete so the keying rule doesn't bind. (Or halt for uniformity — decide.) **✅ Closed 2026-09-26: uniform identifier rule (config §11.2).** |
 | DA-SRC-8 / DA-X-7 | MariaDB GTID dialect support in `SourcePosition`. | Schedule the sub-research; detect MariaDB at connect and select the GTID parser; otherwise narrow v1 scope to MySQL-only. |
 | DA-CFG-4 | External secret-manager integration. | Declare out of scope for v1; the file-content-rotation path (sidecar writes the file) is the supported pattern. |
 | DA-DEDUP-7 | Cross-table atomic visibility. | Keep out of scope; document the per-table-only guarantee; reopen only if a multi-table-commit catalog (Nessie) becomes a requirement. |
 | DA-CLUS-12 | `kubernetes` lock_backend. | Defer; `storage` CAS lease is the v1 backend (already enforced by V-075). |
 | DA-CLUS-13 | Per-source-endpoint takeover bulkhead. | Defer; per-node-global cap ships in v1; add per-endpoint group if reconnect storms are observed. |
 | DA-SINK-8 | Spill-to-disk for oversized transactions. | Defer to a future `sink.large_txn_mode: spill`; v1 uses split-commits or sized memory. |
-| DA-CAT-4 | How the writer consumes catalog-vended credentials. | Specify in the sink-writer contract if credential vending is targeted for v1; otherwise note as future. |
+| ~~DA-CAT-4~~  | How the writer consumes catalog-vended credentials. | Specify in the sink-writer contract if credential vending is targeted for v1; otherwise note as future. **⏭ v2 (Iceberg sink).** |
+| DA-FLOW-6 | PG `DROP TABLE` reaction + detection latency (no in-band DDL on pgoutput). | Detect via channel D rescan (table gone from catalog / publication); halt the table with `TABLE_DROPPED`, never auto-drop the Delta table. State the latency bound = rescan interval. |
+| DA-SYS-7 | v1 handling of `sink.type: iceberg` (Iceberg sink → v2). | Keep accepted by the config; refuse at start with an explicit "Iceberg sink ships in v2" message (enum stable across versions). |
 
 ---
 
@@ -597,11 +624,18 @@ design, not just the code.**
 | ID | Gate | Depends on | If it fails |
 |---|---|---|---|
 | DA-CLUS-1 / DA-DEP-2 ✅ closed 2026-06 | Atomic CAS (create-if-absent, swap-if-version, conditional-delete) on **S3, GCS, Azure** — especially the **GCS generation (not ETag)** mapping. | OpenDAL ≥ late-2024 + per-backend behavior. | The storage lease is unsafe; either drop to native SDKs per backend, or reconsider the lock backend. **Top blocker.** Suite scaffolded at `prototypes/lease-conformance/` (T1–T10); T4/T5/T10 must run against real services. |
-| DA-SINK-1 | Equality-delete writer assigns delete files the **enclosing commit's sequence number** | iceberg-rust 0.9.0. **Confirmed ABSENT on 0.9.1/0.10.0/0.10.1 and the v0.11.0-rc.1/rc.2 surfaces (2026-09-19, compiled crate).** | The ghost-row strictly-less-than guarantee breaks; need position-deletes-after-read or a different write strategy. **Blocks the Iceberg mirror only** since the 2026-09-26 multi-sink re-scope (§25). |
-| DA-SINK-2 / DA-X-2 | Custom `cdc.*` **snapshot-summary properties preserved across commits** | iceberg-rust 0.9.0. **Append-path mechanism flash-verified on 0.10.1 (2026-09-19): `fast_append().set_snapshot_properties(...)` + catalog reload round-trip in `prototypes/iceberg-capability`.** Full gate (carrier across delete commits) deferred to the delete-commit capability. | `owner_epoch` fence + `committed_position` guard lose their carrier; need a side-channel (e.g. table properties) or an alternate fence. |
-| DA-SCHEMA-8 | `drop_column` / `rename_column` / type-promotion transactions supported. | iceberg-rust 0.9.0. **`update_schema` confirmed present on 0.10.1 (2026-09-19); the open question narrowed to drop/rename/promotion extent.** | Route the unsupported op to "halt table" until the crate catches up (graceful, already the fallback). |
-| DA-TYPE-5 | `FixedSizeBinary(16)` → Iceberg `uuid` annotation mechanism. | iceberg-rust 0.9.0. | UUID columns fall back to `fixed(16)`/`binary`; cosmetic, low risk. |
-| DA-SINK-10 | Compaction / rewrite API availability. | iceberg-rust (future). | Built-in maintenance stays deferred (already external for v1); no v1 impact. |
+| ⏭ v2 · DA-SINK-1 | Equality-delete writer assigns delete files the **enclosing commit's sequence number** | iceberg-rust 0.9.0. **Confirmed ABSENT on 0.9.1/0.10.0/0.10.1 and the v0.11.0-rc.1/rc.2 surfaces (2026-09-19, compiled crate).** | The ghost-row strictly-less-than guarantee breaks; need position-deletes-after-read or a different write strategy. **Blocks the Iceberg mirror only** since the 2026-09-26 multi-sink re-scope (§25). |
+| ✅ append path (G2/G2b/G2c) · delete path ⏭ v2 · DA-SINK-2 / DA-X-2 | Custom `cdc.*` **snapshot-summary properties preserved across commits** | iceberg-rust 0.9.0. **Append-path mechanism flash-verified on 0.10.1 (2026-09-19): `fast_append().set_snapshot_properties(...)` + catalog reload round-trip in `prototypes/iceberg-capability`.** Full gate (carrier across delete commits) deferred to the delete-commit capability. | `owner_epoch` fence + `committed_position` guard lose their carrier; need a side-channel (e.g. table properties) or an alternate fence. |
+| ⏭ v2 · DA-SCHEMA-8 | `drop_column` / `rename_column` / type-promotion transactions supported. | iceberg-rust 0.9.0. **`update_schema` confirmed present on 0.10.1 (2026-09-19); the open question narrowed to drop/rename/promotion extent.** | Route the unsupported op to "halt table" until the crate catches up (graceful, already the fallback). |
+| ⏭ v2 · DA-TYPE-5 | `FixedSizeBinary(16)` → Iceberg `uuid` annotation mechanism. | iceberg-rust 0.9.0. | UUID columns fall back to `fixed(16)`/`binary`; cosmetic, low risk. |
+| ⏭ v2 · DA-SINK-10 | Compaction / rewrite API availability. | iceberg-rust (future). | Built-in maintenance stays deferred (already external for v1); no v1 impact. |
+| DA-MS-1…4 ✅ closed 2026-09-26 | Delta sink: MERGE atomicity + idempotent replay, `txn` epoch fence, cost model, commit atomicity on **real S3, GCS, Azure** (P1–P10). | delta-rs 1.0.0 / object_store 0.13 | — (proven; `prototypes/delta-capability/`) |
+| 🆕 DA-SRC-10 | PG logical-replication client: pgoutput v1–v4 (streamed in-progress txns), Relation/Type/Truncate, unchanged-TOAST, standby-status flush-LSN ack, TLS. | `pgwire-replication` (unpinned) | Write/fork the pgoutput protocol layer over `tokio-postgres` replication mode — a large v1 work item. |
+| 🆕 DA-SRC-11 | MySQL binlog client: GTID-set dump, FULL row images, TABLE_MAP optional metadata, QUERY_EVENT, CRC32, heartbeats, `caching_sha2_password` + TLS; MariaDB GTID if in scope. | `mysql-binlog-connector-rust` (unpinned) | Fork/extend the crate or implement the binlog protocol; or narrow v1 to PG-only. |
+
+> **2026-09-26 — v1 view.** With the Iceberg sink in v2, the only open v1 gates are the **source-side
+> crates** (DA-SRC-10/11), probed by `prototypes/source-capability/`. Everything Iceberg below is the v2
+> gate list.
 
 A single **iceberg-rust capability probe** (one integration test exercising equality-delete
 sequencing, snapshot-summary persistence, schema-evolution ops, and the uuid annotation against the
@@ -615,6 +649,15 @@ sixth (and the top blocker).
 ---
 
 ## 22. Spec-readiness assessment
+
+> **v1 re-assessment (2026-09-26; Iceberg sink deferred to v2) — close, not yet.** The sink, the lease and
+> the config/schema/snapshot design are proven or specified. Before the v1 implementation plan:
+> (1) **source-side capability gates** DA-SRC-10/11 — the one remaining redesign risk
+> (`prototypes/source-capability/`); (2) **v1 decisions** — DA-SRC-8 (MariaDB in v1, informed by (1)),
+> DA-SYS-4 (reserved-column collision), DA-FLOW-6 (PG DROP), DA-SYS-7 (Iceberg handling in v1),
+> DA-OBS-5 (lag target — non-blocking); confirm the §20 deferrals; (3) **spec debt** — §19.3
+> System-Overview S-1…S-6 (still unapplied) + the DA-X-8 config residual. Details: §26. The verdict
+> below is the 2026-06 assessment, kept as the audit trail.
 
 **Verdict: the foundation is strong; design is essentially complete and the application specification
 can begin now**, provided the work is sequenced so the two 🔴 verification gates are run early (a
@@ -1268,8 +1311,8 @@ Source: `research/Multi_Sink_Architecture_and_Delta_Lake.md` — all decisions *
 | DA-MS-6 | Spec-merge debt from the multi-sink design | 🟢 | ✅ | **Applied 2026-09-26**: System-Overview (Sinks block, pluggable format), Data-Flow (Phase 0 sink preflight, Phase 3 collapse + `TableChangeSet` + TRUNCATE barrier, Phase 4 sink contract + Iceberg/Delta realizations), Config (`sink.type` required, `sink.iceberg`/`sink.delta`, catalog → `sink.iceberg.catalog`, pipeline-level `schema_evolution`, sink preconditions §11.2, V-083…V-093), Schema §7 (Applied/Degraded/Unsupported, Delta column), Type_Mapping (logical tags, Hop 3b). |
 
 | DA-X-11 | **iceberg-rust `Transaction::commit` rebases a stale zombie instead of rejecting it** *(probe G2b-3, iceberg 0.10.1, 2026-09-26)* — `do_commit` reloads the table and re-applies the actions on **every** attempt (not only on retry), so requirements are derived from the fresh metadata: a zombie holding a stale `Table` lands on top of the new owner's snapshot and regresses `cdc.owner_epoch` 6 → 5. Invalidates `Clustering…` §5.5 layer 2 ("zombie's commit conflicts and fails") and the TOCTOU-free reading of layer 3 | 🟡 | ✅(research) | **Fix, public API only (G2b-4):** commit through a per-commit catalog view whose `load_table` returns the base the fence was checked against → `fast_append`'s `assert-ref-snapshot-id(main)` makes it a real CAS; conflict surfaced non-retryable; the sink owns reload → re-check → re-pin. Proven: stale zombie rejected with neither property nor snapshot applied; foreign append under the pin → conflict → re-pin succeeds; foreign metadata-only edit not clobbered. Residual: a new owner's metadata-only commit doesn't move `main`, so one pinned zombie commit can still land — same window as "before the new owner's first data commit", absorbed by idempotency. `Clustering…` §5.5 / D-7 updated. Spec applied 2026-09-26: `Data-Flow.md` "Sink Commit Failure" names the pin. **Real catalog (probe G2c, AWS Glue + S3, 2026-09-26):** the pinned commit is a CAS — 6 rounds × 8 concurrent pinned writers → exactly 1 winner per round, **all 42 losers stopped by Glue's `VersionId` lock** (`ConcurrentModificationException`; the client-side requirement check alone stopped none), nothing of theirs applied; a stale pinned zombie rejected; the plain-`Transaction::commit` zombie rebase reproduced on Glue (property 603 → 1). S3 Tables uses the same pattern (`versionToken`; source-read, not run). REST / HMS: see DA-CAT-7 / DA-CAT-6. |
-| DA-CAT-6 | **iceberg-rust HMS catalog cannot commit** — `iceberg-catalog-hms` `update_table` returns `FeatureUnsupported` (0.10.1 and `main`, source-read 2026-09-26) | 🟡 | 🆕 🔄 | **Gated 2026-09-26: config V-115 rejects `catalog.hive`** until a pinned release can commit (probe to lift). Every Iceberg sink commit is an `update_table`, so `sink.iceberg.catalog.type: hive` is unusable on the pinned crate (create/load work; commit does not). Moot for v1 while the Iceberg sink is gated (DA-SINK-1i), but it must join the Iceberg sink's **capability assertion** (per catalog backend). Upstream: #3104 (HMS config refactor) is the only open HMS PR; no commit path in flight. Options: capability-gate `hive` · contribute `update_table` (HMS `alter_table` with an env-context `metadata_location` expectation, as Java's `HiveTableOperations` does — needs a lock or `expected_parameter_key`) · route HMS estates via a REST catalog in front of HMS. |
-| DA-CAT-7 | **iceberg-rust REST client has no SigV4** (0.10.1, source-read 2026-09-26) | 🟡 | 🆕 🔄 | **Gated 2026-09-26: config V-116 rejects `rest.auth: sigv4`** until a pinned release carries it (probe to lift). `sink.iceberg.catalog.rest.auth: sigv4` (config §9.5.3, `Catalog_Auth_Research.md` §3.2) is not realizable on the pinned crate, so the AWS Glue Iceberg REST and S3 Tables REST endpoints are unreachable through `iceberg-catalog-rest`. Upstream: open PRs **#3082** (SigV4 request signer) and **#3092** (SigV4 auth manager). Meanwhile the native `glue` catalog (probed, G2c) and the native `iceberg-catalog-s3tables` crate cover AWS. Capability-gate `rest`+`sigv4` until a release carries it. REST commit atomicity itself is server-side (409 on failed requirements) — not probed. |
+| DA-CAT-6 | **iceberg-rust HMS catalog cannot commit** — `iceberg-catalog-hms` `update_table` returns `FeatureUnsupported` (0.10.1 and `main`, source-read 2026-09-26) | 🟡 | ⏭ v2 | **Gated 2026-09-26: config V-115 rejects `catalog.hive`** until a pinned release can commit (probe to lift). Every Iceberg sink commit is an `update_table`, so `sink.iceberg.catalog.type: hive` is unusable on the pinned crate (create/load work; commit does not). Moot for v1 while the Iceberg sink is gated (DA-SINK-1i), but it must join the Iceberg sink's **capability assertion** (per catalog backend). Upstream: #3104 (HMS config refactor) is the only open HMS PR; no commit path in flight. Options: capability-gate `hive` · contribute `update_table` (HMS `alter_table` with an env-context `metadata_location` expectation, as Java's `HiveTableOperations` does — needs a lock or `expected_parameter_key`) · route HMS estates via a REST catalog in front of HMS. **2026-09-26 tidy:** Iceberg-sink only — deferred to v2; V-115/V-116 keep the gate in the config meanwhile. |
+| DA-CAT-7 | **iceberg-rust REST client has no SigV4** (0.10.1, source-read 2026-09-26) | 🟡 | ⏭ v2 | **Gated 2026-09-26: config V-116 rejects `rest.auth: sigv4`** until a pinned release carries it (probe to lift). `sink.iceberg.catalog.rest.auth: sigv4` (config §9.5.3, `Catalog_Auth_Research.md` §3.2) is not realizable on the pinned crate, so the AWS Glue Iceberg REST and S3 Tables REST endpoints are unreachable through `iceberg-catalog-rest`. Upstream: open PRs **#3082** (SigV4 request signer) and **#3092** (SigV4 auth manager). Meanwhile the native `glue` catalog (probed, G2c) and the native `iceberg-catalog-s3tables` crate cover AWS. Capability-gate `rest`+`sigv4` until a release carries it. REST commit atomicity itself is server-side (409 on failed requirements) — not probed. **2026-09-26 tidy:** Iceberg-sink only — deferred to v2; V-115/V-116 keep the gate in the config meanwhile. |
 | DA-CAT-8 | Losing / rejected commits leave orphan files | 🟢 | 🆕 ✅(measured) | G2c: every attempt writes its manifest + manifest list before the catalog decides, and every attempt that passes the client check also writes a `metadata.json`; iceberg-rust does not delete them on failure. 48 racing attempts → 42 orphan `metadata.json` + 86 orphan manifests. Bounded by conflict rate (the pipeline lease makes conflicts rare in practice); reclaimed by external `remove_orphan_files` (`Iceberg_Maintenance.md` §1). No design change. |
 
 ### 25.4 Next
@@ -1286,3 +1329,51 @@ Source: `research/Multi_Sink_Architecture_and_Delta_Lake.md` — all decisions *
    join the Iceberg sink's per-catalog capability assertion. Spec applied 2026-09-26: V-115
    (`catalog.hive` rejected) and V-116 (`rest.auth: sigv4` rejected) — both lifted by a passing probe.
 
+
+---
+
+## 26. v1 readiness tidy — Iceberg sink deferred to v2 (2026-09-26)
+
+Trigger: the decision to ship **v1 with the Delta sink only** and move the Iceberg sink to v2, plus a
+readiness check before the v1 implementation plan. Every open row was re-checked against the current
+specs; rows that later spec work had already closed were stale and are closed here, with a pointer.
+
+### 26.1 Stale rows closed (already resolved in the specs)
+
+| ID | Closed by |
+|---|---|
+| DA-SYS-5, DA-FLOW-2, DA-X-1 | `Data-Flow.md` — `CdcEvent.change_seq`, `_seq` lineage column, Phase-3 keep-last collapse |
+| DA-FLOW-4 | `Data-Flow.md` Phase 1 — incremental chunked, stream-first snapshot (DF-1/DF-2) |
+| DA-FLOW-5, DA-X-5 | `Data-Flow.md` TRUNCATE barrier; Delta metadata-only delete-all (P5) — **Iceberg part → v2** |
+| DA-SNAP-8, DA-X-6 | Config §11.2 identifier precondition applies in every mode (uniform rule; G-30 struck) |
+| DA-DEP-2 | Superseded by DA-CLUS-1 (per-backend `LeaseStore`) and the Delta sink's object_store puts (P8) |
+| DA-X-8 | Layout decided in `Data-Flow.md`; stays 🔄 for three stale config references (§26.4) |
+
+### 26.2 Deferred to v2 (⏭ v2 — the Iceberg-sink backlog)
+
+DA-SINK-1 (→ DA-SINK-1i, mirror capability), DA-SINK-2 (delete-commit path; append path ✅),
+DA-SINK-10, DA-SCHEMA-8, DA-TYPE-5, DA-DEP-1, DA-CAT-4, DA-CAT-6, DA-CAT-7, DA-X-2, DA-X-3, and the
+Iceberg halves of DA-FLOW-5 / DA-X-5. Kept as rows (audit trail + v2 starting point), not closed. The
+research, the iceberg-capability probes (G1–G2c) and the V-115/V-116 gates carry over unchanged.
+
+### 26.3 New gaps
+
+| ID | Title | Sev | Status | Note |
+|---|---|---|---|---|
+| DA-SRC-10 | PG replication client crate capability (`pgwire-replication`) | 🔴 | 🆕 🧪 | Never pinned, compiled or probed. The sink side had three probe rounds; the source side had none. Probe: `prototypes/source-capability/` S-gates. |
+| DA-SRC-11 | MySQL binlog client crate capability (`mysql-binlog-connector-rust`) | 🔴 | 🆕 🧪 | Same. Also decides DA-SRC-8 (MariaDB GTID dialect) in practice. |
+| DA-SYS-7 | v1 scope statement + v1 handling of `sink.type: iceberg` | 🟢 | 🆕 🟥 | Recommendation: keep the enum, refuse at start naming v2 (§20). |
+
+### 26.4 What stands between here and the v1 implementation plan
+
+1. **Source-side gates** DA-SRC-10/11 — `prototypes/source-capability/` against local PostgreSQL /
+   MySQL (/ MariaDB) containers. The only item whose negative result reshapes the plan.
+2. **v1 decisions** (§20): DA-SRC-8 MariaDB in v1 (after 1), DA-SYS-4 reserved-column collision,
+   DA-FLOW-6 PG DROP reaction, DA-SYS-7 Iceberg handling, DA-OBS-5 lag target (non-blocking); confirm
+   the deferrals DA-CFG-4, DA-CLUS-12, DA-CLUS-13, DA-SINK-8, DA-DEDUP-7.
+3. **Spec debt** (needs approval): §19.3 System-Overview S-1…S-6 (never applied — the Open Questions
+   block and the Iceberg-only framing are stale) + the DA-X-8 residual in `Configuration_Specification.md`
+   (~606, ~960–965, ~1553) + the DA-SYS-7 scope statement.
+
+Not blocking: DA-MS-3 (accepted cost caveat, D-MS.15), DA-SRC-9 (implementation detail), DA-SNAP-7
+(retention coupling — designed; the tuning is an operational note), the optional ADLS Gen2 re-run of P8.
