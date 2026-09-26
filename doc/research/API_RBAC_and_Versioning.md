@@ -45,6 +45,7 @@ version skew).
 | Pipeline status | `GET /v1/pipelines/{id}` | viewer |
 | Trigger snapshot | `POST /v1/pipelines/{id}/snapshots` | operator |
 | Snapshot job status | `GET /v1/snapshots/{job_id}` | viewer |
+| List snapshot jobs | `GET /v1/pipelines/{id}/snapshots` | viewer |
 | Pipeline pause | `POST /v1/pipelines/{id}/pause` | operator |
 | Pipeline resume | `POST /v1/pipelines/{id}/resume` | operator |
 | Pipeline restart | `POST /v1/pipelines/{id}/restart` | operator |

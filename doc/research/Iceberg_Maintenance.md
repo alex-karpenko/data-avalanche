@@ -61,11 +61,11 @@ app for correctness.
 
 So operators / automation know *when* to run maintenance, the app emits per-table:
 
-- `cdc_iceberg_delete_files` (gauge) — equality-delete files since last compaction; the primary MOR
+- `data_avalanche_iceberg_delete_files` (gauge) — equality-delete files since last compaction; the primary MOR
   health signal.
-- `cdc_iceberg_data_file_count` and `cdc_iceberg_small_file_ratio` (files below target size).
-- `cdc_iceberg_snapshot_count` and `cdc_iceberg_manifest_depth`.
-- `cdc_iceberg_metadata_json_bytes`.
+- `data_avalanche_iceberg_data_file_count` and `data_avalanche_iceberg_small_file_ratio` (files below target size).
+- `data_avalanche_iceberg_snapshot_count` and `data_avalanche_iceberg_manifest_depth`.
+- `data_avalanche_iceberg_metadata_json_bytes`.
 
 These fold into the metrics catalogue (G-33) and are the trigger inputs for an external maintenance
 cron or an alerting rule (e.g. "delete_files > N → run compaction").
@@ -110,5 +110,5 @@ delete-file + data compaction (the MOR-critical, writer-coupled part), keep expi
 | Decision | Resolution |
 |---|---|
 | G-25 ownership (v1) | **External maintenance**; app exposes when-needed signals + reserves `sink.maintenance` |
-| MOR criticality | delete-file compaction is the key signal (`cdc_iceberg_delete_files`) |
+| MOR criticality | delete-file compaction is the key signal (`data_avalanche_iceberg_delete_files`) |
 | built-in path | deferred, gated on iceberg-rust rewrite support; hybrid (compaction-only) is the first step |

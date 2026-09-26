@@ -93,7 +93,7 @@ into the GTID set; `union`/`covers` handle multiple UUIDs naturally.
   maintenance), the table is treated as **not covered**: the flush is written and idempotency (§1)
   absorbs any re-delivery. The guard never blocks progress and never skips on missing evidence.
 - **Pipeline resume checkpoint = the laggard.** The single position persisted to state storage
-  (`slot.json` / `gtid.json`) is the **`intersect` (MySQL) / `min` (PG) across all tracked tables** —
+  (`slot.json` / `position.json`) is the **`intersect` (MySQL) / `min` (PG) across all tracked tables** —
   the position every table has durably passed. On restart the single replication stream resumes from
   there; tables already ahead skip via the guard (or, failing that, idempotency absorbs the
   re-delivery).
@@ -112,8 +112,8 @@ Generalize the Data-Flow.md `committed_lsn` scalar to:
   each table's Iceberg snapshot summary on every successful commit, as `union` of the prior value and
   the flush's per-table position. The "prior value" is the latest **own** snapshot's value (§3).
 - **`cdc.pipeline`** — the pipeline `id`, written alongside, so own snapshots are identifiable during
-  the walk-back. (Delta sink equivalent: `commitInfo` `avalanche.committed_position` /
-  `avalanche.pipeline`, same walk-back rule — probed in `prototypes/delta-capability/` P3.)
+  the walk-back. (Delta sink equivalent: `commitInfo` `data-avalanche.committed_position` /
+  `data-avalanche.pipeline`, same walk-back rule — probed in `prototypes/delta-capability/` P3.)
 
 It coexists with **`cdc.owner_epoch`** (clustering D-7, sink-side fencing). The two are orthogonal:
 `owner_epoch` rejects a zombie writer; `committed_position` skips already-done work.

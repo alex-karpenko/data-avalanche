@@ -36,37 +36,37 @@ always on.
 All Prometheus, exposed at `/metrics` (unauthenticated, per System-Overview / RBAC §2).
 
 ### Replication / throughput
-- `cdc_replication_lag_seconds{pipeline}` — source commit-ts to sink-commit lag (the headline SLA).
-- `cdc_rows_read_total{pipeline,op}` / `cdc_rows_written_total{pipeline}` — counters.
-- `cdc_flush_duration_seconds{pipeline}` (histogram), `cdc_flush_rows{pipeline}` (histogram).
-- `cdc_transaction_buffer_bytes{pipeline}` — large-txn backstop visibility (G-29).
+- `data_avalanche_replication_lag_seconds{pipeline}` — source commit-ts to sink-commit lag (the headline SLA).
+- `data_avalanche_rows_read_total{pipeline,op}` / `data_avalanche_rows_written_total{pipeline}` — counters.
+- `data_avalanche_flush_duration_seconds{pipeline}` (histogram), `data_avalanche_flush_rows{pipeline}` (histogram).
+- `data_avalanche_transaction_buffer_bytes{pipeline}` — large-txn backstop visibility (G-29).
 
 ### Source health
-- `cdc_wal_lag_bytes{pipeline}` (PG abandoned-slot guard, G-22) / `cdc_binlog_lag_seconds{pipeline}`.
-- `cdc_source_reconnects_total{pipeline}`.
+- `data_avalanche_wal_lag_bytes{pipeline}` (PG abandoned-slot guard, G-22) / `data_avalanche_binlog_lag_seconds{pipeline}`.
+- `data_avalanche_source_reconnects_total{pipeline}`.
 
 ### Snapshot (per-table opt-in)
-- `cdc_snapshot_rows_done{pipeline[,table]}` / `cdc_snapshot_state{pipeline[,table]}`.
-- `cdc_snapshot_chunk_duration_seconds{pipeline}` (G-6).
+- `data_avalanche_snapshot_rows_done{pipeline[,table]}` / `data_avalanche_snapshot_state{pipeline[,table]}`.
+- `data_avalanche_snapshot_chunk_duration_seconds{pipeline}` (G-6).
 
 ### Sink + maintenance (G-25; multi-sink rename 2026-09-26)
-- `cdc_sink_commit_duration_seconds{pipeline,sink_type}` (histogram),
-  `cdc_sink_commit_failures_total{pipeline,sink_type}` — sink-neutral (were `cdc_iceberg_*`; the rename
+- `data_avalanche_sink_commit_duration_seconds{pipeline,sink_type}` (histogram),
+  `data_avalanche_sink_commit_failures_total{pipeline,sink_type}` — sink-neutral (were `data_avalanche_iceberg_*`; the rename
   follows `Multi_Sink_Architecture_and_Delta_Lake.md` §8).
-- **Delta (v1):** `cdc_sink_merge_files_rewritten`, `cdc_sink_merge_rows_copied`,
-  `cdc_sink_merge_bytes_rewritten`, `cdc_sink_merge_duration_seconds` (MERGE cost — D-MS.15), and
-  `cdc_sink_soft_dropped_columns` (D-MS.9).
-- **Iceberg (⏭ v2):** `cdc_iceberg_delete_files{pipeline[,table]}` — **MOR health signal**;
-  `cdc_iceberg_data_file_count`, `cdc_iceberg_small_file_ratio`, `cdc_iceberg_snapshot_count`,
-  `cdc_iceberg_manifest_depth`, `cdc_iceberg_metadata_json_bytes` (format-specific; keep their names).
+- **Delta (v1):** `data_avalanche_sink_merge_files_rewritten`, `data_avalanche_sink_merge_rows_copied`,
+  `data_avalanche_sink_merge_bytes_rewritten`, `data_avalanche_sink_merge_duration_seconds` (MERGE cost — D-MS.15), and
+  `data_avalanche_sink_soft_dropped_columns` (D-MS.9).
+- **Iceberg (⏭ v2):** `data_avalanche_iceberg_delete_files{pipeline[,table]}` — **MOR health signal**;
+  `data_avalanche_iceberg_data_file_count`, `data_avalanche_iceberg_small_file_ratio`, `data_avalanche_iceberg_snapshot_count`,
+  `data_avalanche_iceberg_manifest_depth`, `data_avalanche_iceberg_metadata_json_bytes` (format-specific; keep their names).
 
 ### Clustering (from Clustering doc §19)
-- `cdc_lease_state{pipeline}`, `cdc_lease_renew_failures_total{pipeline}`,
-  `cdc_lease_renew_latency_seconds{pipeline}`.
-- `cdc_cluster_members`, `cdc_owned_pipelines`, `cdc_ring_generation`.
+- `data_avalanche_lease_state{pipeline}`, `data_avalanche_lease_renew_failures_total{pipeline}`,
+  `data_avalanche_lease_renew_latency_seconds{pipeline}`.
+- `data_avalanche_cluster_members`, `data_avalanche_owned_pipelines`, `data_avalanche_ring_generation`.
 
 ### Pipeline status
-- `cdc_pipeline_status{pipeline}` — gauge enum (running/paused/stopped/error), aligned with the
+- `data_avalanche_pipeline_status{pipeline}` — gauge enum (running/paused/stopped/error), aligned with the
   lifecycle state machine (G-NEW-15).
 
 ---

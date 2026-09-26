@@ -23,7 +23,8 @@ MySQL binlog (column type code)   ─┘                                   + log
                                      per-crate          Rust code                  iceberg-rust / delta-rs
 ```
 
-**Hop 1 (Decode):** `pgwire-replication` / `mysql-binlog-connector-rust` decode the wire
+**Hop 1 (Decode):** our pgoutput decoder (over the `pgwire-replication` transport) and the
+`mysql_async` / `mysql_common` binlog row decoder (S-MY probes) decode the wire
 binary into `ColumnValue` variants. All source-specific type knowledge lives here.
 
 **Hop 2 (Accumulate):** `BatchAccumulator` maps each `ColumnValue` variant to an Arrow
@@ -34,7 +35,7 @@ schema resolution.
 **Hop 3 (Sink):** the pipeline's sink (`sink.type`) translates the canonical Arrow `Schema` into
 its table format's schema when creating or evolving a table — **3a** Iceberg via `iceberg-rust`,
 **3b** Delta Lake via `delta-rs`. Where Arrow alone is ambiguous, the accumulator attaches a
-**logical type tag** in field metadata (`avalanche.logical`, see "Logical type tags" below); the
+**logical type tag** in field metadata (`data-avalanche.logical`, see "Logical type tags" below); the
 accumulator never knows the target format, and any value conversion a format needs (e.g. uuid →
 string for Delta) happens inside that sink. See `Multi_Sink_Architecture_and_Delta_Lake.md` §6.5.
 
@@ -91,6 +92,10 @@ ColumnValueType = NullType | BoolType | Int16Type | Int32Type | Int64Type
 | C — `UInt64` | MySQL `BIGINT UNSIGNED` has a value range 0..2⁶⁴−1 which overflows `i64`; silently truncating is a correctness bug |
 | D — `Time(NaiveTime)` | PG `time` and MySQL `TIME` have no date component; forcing into `Timestamp` requires an arbitrary epoch date and produces misleading data |
 
+**Representation (v1, 2026-09-26):** `Timestamp` carries `micros: i64` and `Date` carries `i32` days since
+the Unix epoch, exactly the ranges of Arrow `Timestamp(Microsecond)` and `Date32`. chrono's
+`DateTime`/`NaiveDate` are narrower, so they couldn't hold the clamped edge values below.
+
 ---
 
 ## PostgreSQL Type Mapping
@@ -122,7 +127,7 @@ Column type information arrives via the pgoutput **Relation** message (OID per c
 
 | PostgreSQL Type | OID | ColumnValue Variant | Arrow DataType | Iceberg Type | Notes |
 |----------------|-----|--------------------|--------------|-----------|----|
-| `date` | 1082 | `Date(NaiveDate)` | `Date32` | `date` | Days since Unix epoch |
+| `date` | 1082 | `Date(i32)` | `Date32` | `date` | Days since Unix epoch; `±infinity` clamps (see Date/time edge values) |
 | `time` | 1083 | `Time(NaiveTime)` | `Time64(Microsecond)` | `time` | Microseconds since midnight |
 | `timetz` / `time with time zone` | 1266 | `Text(String)` | `Utf8` | `string` | ⚠ No Arrow/Iceberg equivalent; serialized as ISO-8601 |
 | `timestamp` | 1114 | `Timestamp { value, with_tz: false }` | `Timestamp(Microsecond, None)` | `timestamp` | No timezone; microsecond precision |
@@ -197,7 +202,8 @@ from the Relation messages and supplemented by a startup `pg_type` query.
 ## MySQL Type Mapping
 
 Column type information arrives via the **TABLE_MAP_EVENT** in the MySQL binlog. The
-`mysql-binlog-connector-rust` crate exposes the column type code and optional metadata.
+`mysql_async` binlog stream (`mysql_common` row decoding; it replaced `mysql-binlog-connector-rust`,
+see `prototypes/source-capability/`) exposes the column type code and optional metadata.
 `ENUM` and `SET` member lists, column signedness, and `TINYINT(1)` display widths require
 supplementary schema data from `information_schema` — this is the primary reason
 `schema_evolution.method: query` is the default for MySQL.
@@ -262,7 +268,7 @@ When disabled, `TINYINT(1)` maps as `TINYINT SIGNED` → `Int16`.
 
 | MySQL Type | ColumnValue | Arrow DataType | Iceberg Type | Notes |
 |-----------|------------|--------------|-----------|-------|
-| `DATE` | `Date(NaiveDate)` | `Date32` | `date` | |
+| `DATE` | `Date(i32)` | `Date32` | `date` | `0000-00-00` → NULL; zero-in-part / invalid dates halt the table (see Date/time edge values) |
 | `TIME[(fsp)]` | `Time(NaiveTime)` | `Time64(Microsecond)` | `time` | `fsp` 0–6; normalize to microseconds |
 | `DATETIME[(fsp)]` | `Timestamp { value, with_tz: false }` | `Timestamp(Microsecond, None)` | `timestamp` | No timezone; MySQL stores as-is |
 | `TIMESTAMP[(fsp)]` | `Timestamp { value, with_tz: true }` | `Timestamp(Microsecond, Some("UTC"))` | `timestamptz` | MySQL converts to UTC on write; returned as UTC |
@@ -280,6 +286,39 @@ When disabled, `TINYINT(1)` maps as `TINYINT SIGNED` → `Int16`.
 | `POINT`, `LINESTRING`, `POLYGON`, `MULTIPOINT`, `MULTILINESTRING`, `MULTIPOLYGON`, `GEOMETRYCOLLECTION` | `Bytes(Vec<u8>)` | `LargeBinary` | `binary` | WKB format |
 
 ---
+
+## Date/time edge values (Q-M5-1, Q-M7-1 — decided 2026-09-26)
+
+**PostgreSQL — clamp.** `infinity` / `-infinity` and values outside the Arrow range clamp to the
+Arrow maximum/minimum of the column's Arrow type: `Date32` → `i32::MIN` / `i32::MAX` days;
+`Timestamp(Microsecond, _)` → `i64::MIN` / `i64::MAX` µs.
+
+| PostgreSQL value | Written as |
+|---|---|
+| `date` / `timestamp` / `timestamptz` `-infinity` | Arrow minimum |
+| `date` / `timestamp` / `timestamptz` `infinity` | Arrow maximum |
+| `timestamp[tz]` beyond the i64-µs range (294247–294276 AD) | Arrow maximum |
+
+The clamped values are valid Arrow and Parquet values. Some query engines can't render years that
+far out; the M4 type round-trip test (source → Delta → DuckDB `delta_scan`) pins what readers see.
+
+**MySQL / MariaDB — NULL for "no date", halt for invalid dates.** Measured 2026-09-26: MySQL 8.4's
+default `sql_mode` rejects all of the values below, but any session can relax it
+(`sql_mode=''`); **MariaDB 11.8's default `sql_mode` accepts zero dates and zero-in-part dates**;
+`ALLOW_INVALID_DATES` stores days like `2024-02-31` on both. The binlog carries what was stored.
+
+| MySQL/MariaDB value | Written as |
+|---|---|
+| All-zero `DATE` `0000-00-00`, `DATETIME` / `TIMESTAMP` `0000-00-00 00:00:00` | **NULL**. It is the server's "no date" sentinel and carries no information. Non-key columns are always nullable in the sink (Multi_Sink §6). In an **identifier (key) column**, NULL is impossible → halt as below |
+| Zero month or day (`2024-00-15`, `2024-05-00 10:00:00`; accepted without `NO_ZERO_IN_DATE`) | **Halt the table** `INVALID_DATE_VALUE` |
+| Impossible day of month (`2024-02-31`; `ALLOW_INVALID_DATES`) | **Halt the table** `INVALID_DATE_VALUE` |
+
+`INVALID_DATE_VALUE` halts only that table (other tables continue). The message names the table,
+column, raw value and binlog position, and gives the remedy: set
+`tables.column_type_overrides: {<column>: string}`, which replicates the server's raw text
+(`2024-00-15`), then resume or re-snapshot the table; or correct the source rows. A partial date
+such as `1980-00-00` usually means "year known, month/day unknown", so no silent conversion
+(clamp or NULL) is applied.
 
 ## Unsupported Type Policy
 
@@ -309,7 +348,7 @@ operators know which columns require attention.
 
 ## Logical type tags (sink-neutral, Hop 2 → Hop 3 boundary)
 
-The accumulator's Arrow field carries `avalanche.logical = <tag>` in field metadata whenever the
+The accumulator's Arrow field carries `data-avalanche.logical = <tag>` in field metadata whenever the
 Arrow type does not determine the intended type on its own. The same vocabulary is the grammar of
 `tables.column_type_overrides` (config §9.3, V-078/V-087):
 
@@ -496,5 +535,6 @@ It depends on the following sources from the notebook index:
 - **Apache Iceberg Rust 0.9.0 Release** — Arrow → Iceberg schema conversion API in iceberg-rust
 - **Apache Iceberg Catalogs: Types & How to Choose** — Iceberg type system definition
 - **rustcdc** — ColumnValue enum scope and integration contract
-- **mysql-binlog-connector-rust** — MySQL column type decoding, ENUM/SET bitmask handling
+- **mysql-binlog-connector-rust** — MySQL column type decoding, ENUM/SET bitmask handling (original
+  reference; the implementation uses `mysql_async` / `mysql_common`)
 - **pgwire-replication** — PG OID-based column type delivery, TOAST sentinel handling

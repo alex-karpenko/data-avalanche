@@ -18,7 +18,7 @@ need approval).
 
 **Rule.** If a source table has a column whose name equals a lineage column the accumulator injects
 (`_op`, `_ts`, `_lsn`, `_seq`, `_source_db`, `_pipeline`) or starts with the sink-internal prefix
-`__avalanche_`, that table **halts** with `RESERVED_COLUMN_COLLISION`, naming the column. Other tables
+`__data_avalanche_`, that table **halts** with `RESERVED_COLUMN_COLLISION`, naming the column. Other tables
 continue (the per-table halt of G-19b). Nothing is renamed or escaped.
 
 - **Comparison is case-insensitive.** Delta column names are case-insensitive, so `_OP` collides with
@@ -60,7 +60,7 @@ pgoutput carries no DDL, so a dropped table simply stops emitting.
 
 | Target | Value | Measured by | Budget |
 |---|---|---|---|
-| Steady-state lag | **p99 ≤ 60s** | `cdc_replication_lag_seconds{pipeline}` (source commit timestamp → sink commit) | default flush 30s + MERGE commit + decode/accumulate; about 2× headroom |
+| Steady-state lag | **p99 ≤ 60s** | `data_avalanche_replication_lag_seconds{pipeline}` (source commit timestamp → sink commit) | default flush 30s + MERGE commit + decode/accumulate; about 2× headroom |
 | Failover lag | **≤ 2 min** from owner loss to lag back under the steady-state target | the same metric, over a takeover | unowned window ~20–22s (Balanced lease, D-6) + replay since the last checkpoint (≤ one 30s flush interval) + Phase-0 resume |
 
 - These are **design targets at default config**, not a contractual SLA. They ground the defaults

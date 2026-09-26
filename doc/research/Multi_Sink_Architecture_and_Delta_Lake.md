@@ -286,7 +286,7 @@ delete-all (metadata-only). Idempotent under replay in both (deleting an empty t
 ### 6.5 Logical types (sink-neutral Hop 2½)
 
 The accumulator's Arrow schema carries a **logical type tag** in field metadata where Arrow alone is
-ambiguous: `avalanche.logical = uuid | time | json | uint64 | enum | set | timestamp_ntz`. Each sink's
+ambiguous: `data-avalanche.logical = uuid | time | json | uint64 | enum | set | timestamp_ntz`. Each sink's
 Hop-3 maps logical → physical:
 
 | Logical (from `Type_Mapping.md`) | Arrow (accumulator) | Iceberg | Delta |
@@ -309,8 +309,8 @@ Hop 3 — the accumulator never knows the target format.
 
 ### 6.6 Crates, features, and the Arrow-version rule
 
-- Workspace crates: `avalanche-core` (types, change set, `Sink` trait), `avalanche-sink-iceberg`,
-  `avalanche-sink-delta`, plus the existing source/cluster crates.
+- Workspace crates: `data-avalanche-core` (types, change set, `Sink` trait), `data-avalanche-sink-iceberg`,
+  `data-avalanche-sink-delta`, plus the existing source/cluster crates.
 - **Cargo features** `sink-iceberg`, `sink-delta` (both default-on). A build without a sink rejects a
   config that selects it (validation V-083). Lets slim images drop DataFusion.
 - **Single-Arrow rule:** the workspace pins **one** arrow/parquet major; every sink crate must compile
@@ -356,22 +356,22 @@ D-MS.5 is accepted, **changelog mode** ships on the current crate (append `I/U/D
 **Per flush, per table — one Delta commit:**
 
 1. If `truncate`: `DeleteBuilder` (no predicate) commit first — metadata-only — then continue.
-2. Build the MERGE source = `upserts` ∪ `deletes` with a boolean `__avalanche_del` column
+2. Build the MERGE source = `upserts` ∪ `deletes` with a boolean `__data_avalanche_del` column
    (deletes carry only identifier + before-image partition columns; other columns NULL).
 3. `MergeBuilder` with predicate `t.<id cols> = s.<id cols>` (+ partition-pruning disjunct
    `t.<part> IN (s.<old part>, s.<new part>)` when partitioned):
-   - `when_matched_delete(s.__avalanche_del)`
-   - `when_matched_update(NOT s.__avalanche_del)` → all columns from `s`
-   - `when_not_matched_insert(NOT s.__avalanche_del)`
+   - `when_matched_delete(s.__data_avalanche_del)`
+   - `when_matched_update(NOT s.__data_avalanche_del)` → all columns from `s`
+   - `when_not_matched_insert(NOT s.__data_avalanche_del)`
 4. `CommitProperties`:
-   - `with_application_transaction(txn{ app_id: "avalanche/<pipeline_id>/owner", version: owner_epoch })`
-   - `with_metadata({ "avalanche.committed_position": "<engine-tagged>", "avalanche.pipeline": id,
-     "avalanche.owner_epoch": n })`
+   - `with_application_transaction(txn{ app_id: "data-avalanche/<pipeline_id>/owner", version: owner_epoch })`
+   - `with_metadata({ "data-avalanche.committed_position": "<engine-tagged>", "data-avalanche.pipeline": id,
+     "data-avalanche.owner_epoch": n })`
 5. **Fence (before step 3):** read the snapshot's app-transaction version for
-   `avalanche/<pipeline_id>/owner`; if `> owner_epoch` → `Fenced` (abort, stop pipeline per §19 of
+   `data-avalanche/<pipeline_id>/owner`; if `> owner_epoch` → `Fenced` (abort, stop pipeline per §19 of
    clustering). A concurrent commit carrying the same `app_id` makes the loser's commit conflict and
    re-check on retry (🧪 P4).
-6. **Position guard:** read `avalanche.committed_position` from the latest **own** `commitInfo`
+6. **Position guard:** read `data-avalanche.committed_position` from the latest **own** `commitInfo`
    (walk back past foreign commits such as an external OPTIMIZE); if it covers `position` → `SkippedCovered`.
    Guard is an optimization; correctness is the idempotent MERGE.
 
@@ -435,7 +435,7 @@ soft-drop is acceptable vs halting is D-MS.9.
 | `Clustering_Architecture_Research.md` §5.5 | Fence = "sink marker epoch" — Iceberg: snapshot summary; Delta: `txn` app-transaction version. |
 | `Iceberg_Partitioning…` | Partition spec becomes neutral; Delta = identity-only in v1. |
 | `Iceberg_Maintenance.md` | Add Delta column (§7.4). |
-| `Observability_Metrics_and_Tracing.md` | `cdc_iceberg_*` → `cdc_sink_*{sink_type}`; Delta-specific: `cdc_sink_merge_files_rewritten`, `cdc_sink_merge_bytes_rewritten`, `cdc_sink_merge_duration_seconds`, `cdc_sink_soft_dropped_columns`. |
+| `Observability_Metrics_and_Tracing.md` | `data_avalanche_iceberg_*` → `data_avalanche_sink_*{sink_type}`; Delta-specific: `data_avalanche_sink_merge_files_rewritten`, `data_avalanche_sink_merge_bytes_rewritten`, `data_avalanche_sink_merge_duration_seconds`, `data_avalanche_sink_soft_dropped_columns`. |
 | `CDC_Design_Gap_Analysis_v1.md` | DA-SINK-1 re-scoped to "Iceberg mirror capability"; new gaps DA-MS-* and DA-X-10 (below). |
 
 **New cross-cutting gap surfaced — DA-X-10 (🟡):** the sink marker (`owner_epoch`,
@@ -602,6 +602,6 @@ a correctness risk but it is a real scope caveat — see **D-MS.15**.
 | **D-MS.12** | Delta catalog registration in v1 | none · glue · unity | ✅ **DECIDED 2026-09-26:** **none** (path-based) in v1; reserve `glue`/`unity`/`hive`. |
 | **D-MS.13** | Delta built-in maintenance | checkpoint+log cleanup only · + optimize · none | ✅ **DECIDED 2026-09-26:** **checkpoint + log cleanup** (metadata; required for health); OPTIMIZE/VACUUM external, consistent with Iceberg_Maintenance and the "never delete data artifacts" tenet. |
 | **D-MS.14** | Arrow alignment policy | single major workspace-wide (+FFI escape hatch) · per-sink majors via FFI always | ✅ **DECIDED 2026-09-26:** **Single major** (arrow 59 now); FFI bridge only as a temporary per-sink escape hatch. |
-| **D-MS.15** | *(surfaced by probe P6)* Delta write amplification for large tables with spread-out updates | (a) accept + document + metrics, guidance: larger flush intervals · (b) (a) in v1 + post-v1 **deletion-vector writer** via low-level `CommitBuilder` · (c) route such tables to `write_mode: changelog` | ✅ **DECIDED 2026-09-26: (b)** — v1 ships (a): documented caveat, `cdc_sink_merge_rows_copied` / `cdc_sink_merge_files_rewritten` metrics, flush-interval guidance. Post-v1: DV writer (read key columns → row positions → write deletion vectors, no data rewrite), gated on its own probe. |
+| **D-MS.15** | *(surfaced by probe P6)* Delta write amplification for large tables with spread-out updates | (a) accept + document + metrics, guidance: larger flush intervals · (b) (a) in v1 + post-v1 **deletion-vector writer** via low-level `CommitBuilder` · (c) route such tables to `write_mode: changelog` | ✅ **DECIDED 2026-09-26: (b)** — v1 ships (a): documented caveat, `data_avalanche_sink_merge_rows_copied` / `data_avalanche_sink_merge_files_rewritten` metrics, flush-interval guidance. Post-v1: DV writer (read key columns → row positions → write deletion vectors, no data rewrite), gated on its own probe. |
 | **R-1** | *(revision of the signed-off `column_mapping: name`, from probe P7b)* `sink.delta.column_mapping` default | `name` · `none` | ✅ **DECIDED 2026-09-26: `none`; `name` rejected in v1 (V-092)** — delta-rs 1.0 refuses ADD COLUMN on column-mapped tables. |
 | **D-MS.16** | *(surfaced by probe P10/P10b)* Delta mapping of source `timestamp without time zone` — `timestamp_ntz` raises the table to reader v3 / writer v7 | (a) accept + document · (b) map to `timestamp` (UTC instant, protocol stays 1/2) · (c) string · (d) `sink.delta` option choosing (a)/(b)/(c) | ✅ **DECIDED 2026-09-26: (d), default (a)** — `sink.delta.timestamp_ntz_as: timestamp_ntz` (default) \| `timestamp` \| `string` (config §9.4.3, V-114); per-column `column_type_overrides` still take precedence. Correct semantics by default, explicit escape hatch for legacy-reader estates. |

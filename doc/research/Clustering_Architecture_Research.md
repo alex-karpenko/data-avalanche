@@ -1295,9 +1295,9 @@ config-spec follow-up in the gap report, not edited here.)
   only a sustained outage longer than `lease_duration` stops it — and during such an outage the
   pipeline cannot commit anyway (storage is the sink), so the stop is harmless, not a regression.
 - **Observability (D-8 decision #5, folds into G-33):** emit
-  - `cdc_lease_state{pipeline}` gauge — `held | degraded | lost` (enum)
-  - `cdc_lease_renew_failures_total{pipeline, class}` counter — `transient | conflict | lost`
-  - `cdc_lease_renew_latency_seconds{pipeline}` histogram
+  - `data_avalanche_lease_state{pipeline}` gauge — `held | degraded | lost` (enum)
+  - `data_avalanche_lease_renew_failures_total{pipeline, class}` counter — `transient | conflict | lost`
+  - `data_avalanche_lease_renew_latency_seconds{pipeline}` histogram
 
   Degraded is the early-warning signal: operators see storage flapping *before* it escalates to a
   failover. A rising `transient` count with no `lost` means "storage is wobbling but safety held."

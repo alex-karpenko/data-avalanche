@@ -1,5 +1,5 @@
 ---
-updated: 2026-06-20
+updated: 2026-09-26
 domain: Configuration
 tags: [wal-lag, binlog-purge, backpressure, azure, mariadb, catalog, iam, strip-schema, batch, cdc]
 resolves: [G-22, G-26, G-27, G-34, G-35, G-37, G-38, G-11.3]
@@ -17,7 +17,7 @@ appendix for the documentation-consistency items (G-NEW-20/21/22) and the schema
 
 ## G-22 — PostgreSQL abandoned-slot WAL-lag guard
 
-- **`source.postgres.max_wal_lag_bytes`** (R, default `null`). Metric **`cdc_wal_lag_bytes`** is always
+- **`source.postgres.max_wal_lag_bytes`** (R, default `null`). Metric **`data_avalanche_wal_lag_bytes`** is always
   emitted; default behavior on lag is **alert only** (warning). When the field is set and exceeded, the
   pipeline **halts** (opt-in) to protect the source disk from WAL accumulation behind an abandoned/slow
   slot.
@@ -54,8 +54,8 @@ appendix for the documentation-consistency items (G-NEW-20/21/22) and the schema
 ## G-35 — Iceberg catalog unavailability
 
 - Catalog operations get their **own** retry policy (separate from object storage): bounded retries with
-  exponential backoff + jitter, then **DEGRADED** (pause + alert via `cdc_pipeline_status = error` and
-  `cdc_iceberg_commit_failures_total`). A **circuit breaker** avoids hammering a down catalog. Mirrors
+  exponential backoff + jitter, then **DEGRADED** (pause + alert via `data_avalanche_pipeline_status = error` and
+  `data_avalanche_iceberg_commit_failures_total`). A **circuit breaker** avoids hammering a down catalog. Mirrors
   the Iceberg-write-failure path (Data-Flow) but keyed on catalog (commit/metadata) vs data-file write.
 - Optional `catalog.retry: { max_attempts, base_backoff, max_backoff }` (R) — else fixed defaults
   (5 attempts, 1s→30s).
