@@ -119,6 +119,7 @@ does not block starting the specification.
 > DA-SRC-12 payload guard, and the spec debt. See §22 (re-assessment) and §26.
 > **Later the same day, all v1 decisions were signed off** (`V1_Scope_Decisions.md`, D-V1.1–D-V1.6 + the
 > five deferrals, §26.5). **What remains before the v1 plan is spec debt only.**
+> **The spec debt was applied the same day (§26.6): the corpus is ready for v1 implementation planning.**
 
 ### Counts (by status)
 
@@ -127,11 +128,11 @@ does not block starting the specification.
 | Status | Count (v1 scope) | Notes |
 |---|---|---|
 | ✅ Resolved | the large majority | Design closed by a research/spec doc or a probe. |
-| 🔄 Partial | 3 | DA-SNAP-7, DA-SRC-9, DA-X-8 (config residual); DA-MS-3 is a decided caveat. |
+| 🔄 Partial | 2 | DA-SNAP-7, DA-SRC-9 (neither blocks the plan); DA-MS-3 is a decided caveat. DA-X-8 ✅ 2026-09-26. |
 | 🟥 Open (v1) | **0** | All decided 2026-09-26 (§26.5, `V1_Scope_Decisions.md`); deferrals confirmed. |
 | 🧪 Verify (v1) | **0** | DA-SRC-10/11 proven 2026-09-26 (§21). |
 | ⏭ v2 | 13 | Iceberg-sink items (§26.2). |
-| 🟢 Spec-merge debt | 6 + 1 + 5 | §19.3 System-Overview S-1…S-6 (unapplied) + DA-X-8 config residual + the five D-V1 patches (`V1_Scope_Decisions.md` §3) and the two Data-Flow Phase 2a probe details. Config (§19.1) and Data-Flow (§19.2) are applied. |
+| 🟢 Spec-merge debt | **0** | All applied 2026-09-26 (§26.6): §19.3 S-1…S-6, the DA-X-8 config residual, the D-V1 patches and the Data-Flow Phase 2a probe details. |
 
 ---
 
@@ -510,7 +511,9 @@ implementation must handle MariaDB's `domain-server-sequence` GTID, which is a *
 from MySQL's `server-uuid:tx`. This is flagged as a new sub-research item and is the single place where
 "in scope" hides real work. Either schedule the sub-research or narrow the v1 scope statement.
 
-### DA-X-8 — Three specs disagree on the per-pipeline state path; one canonical layout is needed 🟢 🔄
+### DA-X-8 — Three specs disagree on the per-pipeline state path; one canonical layout is needed 🟢 ✅
+
+> **✅ 2026-09-26:** the three stale config references are removed (config §10 note, `id` field text, §17) — §26.6.
 
 > **2026-09-26 tidy:** Layout decided and in `Data-Flow.md` §State Layout (no `pipelines/<id>/` segment). **Residual:** three stale references in `Configuration_Specification.md` — line ~606 (`pipelines/<id>/`), the obsolete "Reconcile with Data-Flow" note (~960–965), and the §17 cross-reference (~1553). Spec edit owed (§26.4, needs approval).
 `Data-Flow.md` roots per-pipeline state at `…/pipelines/<id>/`; `Configuration_Specification.md` §10
@@ -583,6 +586,10 @@ applied without instruction.
 | DF-9 | State the consolidated **sink-writer contract** (keying, collapse, partition-routing-by-before-image, delete-file sequencing, snapshot-summary properties, truncate). | DA-X-3 |
 
 ### 19.3 `System-Overview.md`
+
+> **APPLIED 2026-09-26** (§26.6) — S-1…S-6 as proposed, plus the v1 scope section (D-V1.3/4/5). S-1 became
+> a resolved-questions table (every OQ → answer → doc); S-2 an endpoint table with `GET /v1/pipelines`
+> and `/v1/pipelines/{id}` added (they were missing from the RBAC matrix — now added there too).
 
 | # | Edit | Source |
 |---|---|---|
@@ -670,7 +677,7 @@ sixth (and the top blocker).
 > System-Overview S-1…S-6 (still unapplied) + the DA-X-8 config residual. Details: §26. The verdict
 > below is the 2026-06 assessment, kept as the audit trail.
 > **Update (same day):** (2) is done — all v1 decisions signed off (§26.5). Only (3), spec debt, remains
-> before the v1 implementation plan.
+> before the v1 implementation plan. **(3) done too (§26.6) — ready for v1 implementation planning.**
 
 **Verdict: the foundation is strong; design is essentially complete and the application specification
 can begin now**, provided the work is sequenced so the two 🔴 verification gates are run early (a
@@ -1388,12 +1395,12 @@ research, the iceberg-capability probes (G1–G2c) and the V-115/V-116 gates car
 2. ~~**v1 decisions** (§20): DA-SRC-8 MariaDB in v1 (now proven feasible — recommend in), DA-SYS-4 reserved-column collision,
    DA-FLOW-6 PG DROP reaction, DA-SYS-7 Iceberg handling, DA-OBS-5 lag target (non-blocking); confirm
    the deferrals DA-CFG-4, DA-CLUS-12, DA-CLUS-13, DA-SINK-8, DA-DEDUP-7.~~ ✅ 2026-09-26 — §26.5.
-3. **Spec debt** (needs approval): §19.3 System-Overview S-1…S-6 (never applied — the Open Questions
+3. ~~**Spec debt** (needs approval): §19.3 System-Overview S-1…S-6 (never applied — the Open Questions
    block and the Iceberg-only framing are stale) + the DA-X-8 residual in `Configuration_Specification.md`
    (~606, ~960–965, ~1553) + the DA-SYS-7 scope statement + two `Data-Flow.md` Phase 2a source
    details from the probes: `proto_version '2'` → `'1'` (what the pinned crate sends; identical
    messages without `streaming`) and the pinned walsender session options (F-PG-session). Plus the
-   five patches the v1 decisions imply (`V1_Scope_Decisions.md` §3).
+   five patches the v1 decisions imply (`V1_Scope_Decisions.md` §3).~~ ✅ 2026-09-26 — §26.6.
 
 Not blocking: DA-MS-3 (accepted cost caveat, D-MS.15), DA-SRC-9 (implementation detail), DA-SNAP-7
 (retention coupling — designed; the tuning is an operational note), the optional ADLS Gen2 re-run of P8.
@@ -1415,3 +1422,21 @@ changes they imply are listed there (§3) and are pending approval.
 
 **Result:** no 🔴, 🧪 or 🟥 item remains in v1 scope. The only work before the v1 implementation plan is
 the spec debt in §26.4 item 3.
+
+### 26.6 Spec debt applied (2026-09-26)
+
+Approved and applied as drafted: the §26.4 item-3 spec debt and the patches implied by §26.5.
+
+| Spec | What changed |
+|---|---|
+| `System-Overview.md` | v1 scope section (Delta only, Iceberg v2, MariaDB, lag targets, deferrals); S-1 Open Questions → resolved-questions table; S-2 endpoint table (min role + lifecycle semantics); S-3 metric catalogue + cardinality; S-4 external maintenance; S-5 lease/ownership, generation-pointer config, StatefulSet + "restart ≠ reload"; S-6 typos, dangling `snapshot_mode: only` gone; on-demand snapshot no longer "pauses" the stream (DF-2). |
+| `Configuration_Specification.md` | §5 reserved-column collision rule + §11.2 start-time row (D-V1.1); `sink.type` v1 note, new §11.2 sink row, and **V-083 lets `iceberg` pass in v1** so one Iceberg pipeline is refused at start instead of rejecting the whole config (§11 is all-or-nothing) — D-V1.4; DA-X-8 residual removed; §15 item 21. |
+| `Schema_Change_Detection_and_Evolution.md` | PG `DROP TABLE` in §2.1 and channels A/D; §7.2 rows `DROP TABLE` → `TABLE_DROPPED` and reserved-name ADD/RENAME → `RESERVED_COLUMN_COLLISION` (D-V1.1/2). |
+| `Data-Flow.md` | Phase 0 reserved-column check + Iceberg refusal; Phase 2a `proto_version '1'`, session pinning, status timer / idle wakeup, probe-verified protocol note; Phase 2b MariaDB GTID dialect + own `GTID_EVENT` decode, heartbeat, `TRANSACTION_PAYLOAD` check → pipeline halt `BINLOG_PAYLOAD_INVALID` (D-V1.5/6); `gtid.json` covers both dialects. |
+
+Research follow-ups in the same change: `API_RBAC_and_Versioning.md` §2 gains the two pipeline-status
+rows; `Observability_Metrics_and_Tracing.md` renames the commit metrics to `cdc_sink_*{sink_type}` and
+adds the Delta MERGE metrics (Iceberg MOR metrics marked ⏭ v2). DA-X-8 → ✅.
+
+**Result:** no 🔴 / 🧪 / 🟥 in v1 scope and no spec-merge debt. **The design corpus is ready for the v1
+implementation plan.**
