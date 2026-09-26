@@ -11,3 +11,7 @@ pub use gtid::{GtidParseError, GtidSet, GtidSource};
 pub mod mariadb;
 
 pub use mariadb::{MariaGtid, MariaGtidParseError, MariaGtidState};
+
+pub mod binlog;
+
+pub use binlog::{BinlogFilePos, BinlogPosError, parse_binlog_index};
