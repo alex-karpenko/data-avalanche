@@ -58,7 +58,7 @@ data-avalanche/
 │       └── Sources_Index_v3.md                    50-source external index (read-only)
 └── prototypes/                                    capability probes (standalone crates, not the app)
     ├── lease-conformance/                         storage CAS lease T1–T10 on real S3/GCS/Azure
-    ├── iceberg-capability/                        iceberg-rust gates (append-only finding, G2 probe)
+    ├── iceberg-capability/                        iceberg-rust gates (append-only finding, G2/G2b probes)
     └── delta-capability/                          delta-rs 1.0 gates P1–P10 (MERGE, fence, cost, types)
 ```
 
@@ -128,7 +128,7 @@ sources: [source name, ...]     # from Sources_Index_v3.md (omit if none)
 - **Legacy (in parentheses for reconciliation):** `G-1…G-40`, `G-NEW-1…G-NEW-22`, `OQ-*`.
 - **Design decisions** live in research docs: `D-<n>` / `D-<gap>.<n>` (e.g. `D-13.1`), multi-sink
   `D-MS.<n>`, revisions `R-<n>`.
-- Probe IDs: lease `T1–T10`, iceberg `G1–G5`, delta `P1–P10`.
+- Probe IDs: lease `T1–T10`, iceberg `G1–G5` (+ `G2b`), delta `P1–P10`.
 
 When closing a gap, mark it ✅ and add a one-line rationale pointing at the doc/section (or probe)
 that closes it. **Do not delete resolved gaps** — they are the audit trail. An upstream claim (epic
@@ -164,7 +164,8 @@ checkbox, release note) is never proof: verify against the compiled crate or a r
   D-MS.15, DV writer post-v1)
 - **Apache Iceberg (iceberg-rust):** MOR equality deletes / COW designed; public `Transaction` API is
   **append-only** on every release so far → mirror gated; fence = `cdc.owner_epoch` table property
-  (+ snapshot summary), position = own-snapshot walk-back (DA-X-10)
+  (+ snapshot summary), position = own-snapshot walk-back (DA-X-10); commits are **pinned to the
+  fenced base** — `Transaction::commit` otherwise rebases a stale zombie (DA-X-11, probe G2b)
 - **Iceberg catalogs:** AWS Glue, Hive Metastore (Thrift: none / LDAP / Kerberos), REST (bearer /
   oauth2 / sigv4); REST's built-in `/v1/oauth/tokens` is deprecated (Java 1.6.0), removed in 2.0 —
   `oauth2` must point to an external IdP. Delta tables are path-based in v1 (no catalog registration)
