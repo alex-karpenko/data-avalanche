@@ -9,9 +9,9 @@ PostgreSQL and MySQL into **lakehouse tables on cloud object storage** (S3, GCS,
 target table format is **pluggable per pipeline** (`sink.type`, required, no default):
 
 - **Delta Lake** via `delta-rs` — the v1 mirror sink (MERGE commits deletes + upserts atomically).
-- **Apache Iceberg** via `iceberg-rust` — designed; **mirror mode is capability-gated** until
-  iceberg-rust ships a delete-capable commit (gap DA-SINK-1i), so an Iceberg pipeline is refused at
-  start in v1.
+- **Apache Iceberg** via `iceberg-rust` — designed and partly probed, but **deferred to v2**
+  (2026-09-26): mirror mode needs a delete-capable commit iceberg-rust doesn't ship (DA-SINK-1i). In
+  v1 an Iceberg pipeline is refused at start; the Iceberg gaps are the ⏭ v2 backlog (tracker §26.2).
 
 Key subsystems: distributed worker cluster (consistent hashing + SWIM/memberlist + storage CAS
 lease), Apache Arrow as the in-memory columnar format, a sink-neutral `Sink` trait with per-format
@@ -59,7 +59,8 @@ data-avalanche/
 └── prototypes/                                    capability probes (standalone crates, not the app)
     ├── lease-conformance/                         storage CAS lease T1–T10 on real S3/GCS/Azure
     ├── iceberg-capability/                        iceberg-rust gates (append-only finding, G2/G2b/G2c probes)
-    └── delta-capability/                          delta-rs 1.0 gates P1–P10 (MERGE, fence, cost, types)
+    ├── delta-capability/                          delta-rs 1.0 gates P1–P10 (MERGE, fence, cost, types, P8 clouds)
+    └── source-capability/                         PG pgoutput + MySQL/MariaDB binlog client gates S-PG*/S-MY* (local containers)
 ```
 
 There is no application code yet; the design corpus and the prototypes are the current deliverables.
@@ -119,6 +120,7 @@ sources: [source name, ...]     # from Sources_Index_v3.md (omit if none)
 - 🟥 **Open** — no settled answer yet
 - 🧪 **Verify** — settled on paper, rests on an unproven external capability (crate / cloud) —
   closed by a prototype, not by a document
+- ⏭ **v2** — out of v1 scope (deferred with the Iceberg sink); kept as the v2 backlog, not closed
 - 🆕 **New gap** — surfaced by the latest revision cycle
 
 ### Gap ID system
@@ -128,7 +130,7 @@ sources: [source name, ...]     # from Sources_Index_v3.md (omit if none)
 - **Legacy (in parentheses for reconciliation):** `G-1…G-40`, `G-NEW-1…G-NEW-22`, `OQ-*`.
 - **Design decisions** live in research docs: `D-<n>` / `D-<gap>.<n>` (e.g. `D-13.1`), multi-sink
   `D-MS.<n>`, revisions `R-<n>`.
-- Probe IDs: lease `T1–T10`, iceberg `G1–G5` (+ `G2b`, `G2c`), delta `P1–P10`.
+- Probe IDs: lease `T1–T10`, iceberg `G1–G5` (+ `G2b`, `G2c`), delta `P1–P10`, source `S-PG0–8` / `S-MY0–9`.
 
 When closing a gap, mark it ✅ and add a one-line rationale pointing at the doc/section (or probe)
 that closes it. **Do not delete resolved gaps** — they are the audit trail. An upstream claim (epic
