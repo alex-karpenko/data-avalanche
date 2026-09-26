@@ -120,6 +120,8 @@ does not block starting the specification.
 > **Later the same day, all v1 decisions were signed off** (`V1_Scope_Decisions.md`, D-V1.1–D-V1.6 + the
 > five deferrals, §26.5). **What remains before the v1 plan is spec debt only.**
 > **The spec debt was applied the same day (§26.6): the corpus is ready for v1 implementation planning.**
+> **v1 implementation plan drafted in `doc/v1.0/` (roadmap + M0); its spec edits and the product
+> rename to `data-avalanche` were applied the same day (§26.7).**
 
 ### Counts (by status)
 
@@ -363,7 +365,7 @@ the MySQL path with one genuine correctness dependency.
 | DA-SRC-2 | Slot creation responsibility | 🟡 | ✅ | §2 — `slot_management: managed(default)\|require_existing`; the latter forces `auto_cleanup=false`. | G-15 |
 | DA-SRC-3 | Slot loss / WAL-gone recovery | 🟡 | ✅ | §3 — recreate slot + incremental re-snapshot (G-6); warn/metric. | G-15 |
 | DA-SRC-4 | Publication reconciliation | 🟢 | ✅ | §4 — app-maintained explicit table list; `ALTER PUBLICATION` on table-set change; never `FOR ALL TABLES`. | G-15 |
-| DA-SRC-5 | Abandoned-slot WAL-lag guard | 🟡 | ✅ | `Operational…` G-22 — `cdc_wal_lag_bytes` always emitted; `max_wal_lag_bytes` opt-in halt. | G-22 |
+| DA-SRC-5 | Abandoned-slot WAL-lag guard | 🟡 | ✅ | `Operational…` G-22 — `data_avalanche_wal_lag_bytes` always emitted; `max_wal_lag_bytes` opt-in halt. | G-22 |
 | DA-SRC-6 | MySQL purged-binlog handling | 🟡 | ✅ | `Operational…` G-26 — `binlog_purge_action: error(default)\|re_snapshot`. | G-26 |
 | DA-SRC-7 | External same-name slot collisions undetectable | 🟢 | ✅(limitation) | §5 — PG slots carry no ownership tag; mitigated by V-058 uniqueness + operator discipline; documented, not papered over. | G-15 |
 | DA-SRC-8 | MariaDB GTID dialect (`domain-server-sequence`) | 🟡 | ✅ | `Operational…` G-38 — MariaDB accepted via the MySQL path, but the `SourcePosition` MySQL impl **must support both GTID dialects** (MariaDB domains vs MySQL UUIDs); flagged as a **new sub-research item** and the one genuine correctness dependency. **2026-09-26: feasible — proven** (S-MY9, `mysql_async`): MariaDB GTID-positioned resume via `@mariadb_slave_capability`/`@slave_connect_state`/`@slave_gtid_strict_mode`; per-txn GTIDs decode exactly (last = `gtid_binlog_pos`) with a ~10-line parser. Remaining: confirm MariaDB in v1 scope (recommended). **✅ 2026-09-26 — D-V1.5 (`V1_Scope_Decisions.md`):** MariaDB in v1; dialect selected at connect. | G-38 |
@@ -1440,3 +1442,33 @@ adds the Delta MERGE metrics (Iceberg MOR metrics marked ⏭ v2). DA-X-8 → ✅
 
 **Result:** no 🔴 / 🧪 / 🟥 in v1 scope and no spec-merge debt. **The design corpus is ready for the v1
 implementation plan.**
+
+### 26.7 Implementation-plan spec edits and product naming (2026-09-26)
+
+The v1 implementation plan (`doc/v1.0/00-roadmap.md`, `M0-foundations.md`) was reviewed. Approved and
+applied: roadmap §7 S-A…S-G, the answers to Q-M5-1 / Q-M7-1 / Q-M7-2 / Q-M9-1 (roadmap §9.1) and
+D-IMPL-7 (naming).
+
+| Spec | What changed |
+|---|---|
+| `Configuration_Specification.md` | `sink.flush.seconds` default 60 → **30** (§8.5, §9.4.1, §14; S-A); `source.mysql.replication_type` default `binlog` → **`gtid`**, with `binlog` = file/position mode that halts on a changed source server (S-B, Q-M7-2); §12.1 / §12.4 design-item notes point to Clustering §9 and Pipeline_Lifecycle (S-E); reserved prefix `__data_avalanche_`; metric names. |
+| `Data-Flow.md` | Flush default 30s; file/position mode (Phase 0/1 watermark `SHOW BINARY LOG STATUS`, Phase 2b server-identity check → pipeline halt `BINLOG_SOURCE_CHANGED`, `_seq` = file index + `end_log_pos`; S-C, Q-M7-2); `replication/position.json` replaces `gtid.json`; lineage list adds `_seq`/`_pipeline` and Phase 5 states the flush-frontier checkpoint rule (S-F, D-IMPL-2); TOAST carry-forward mechanism (S-G, D-IMPL-3); on-demand snapshot endpoint `POST /v1/pipelines/{id}/snapshots` (S-D) with jobs persisted under `snapshots/jobs/` and listed after restart/failover (Q-M9-1); `ColumnValue` `Timestamp { micros: i64 }` / `Date(i32)` so PG edge values can clamp (Q-M5-1); Delta names below. |
+| `System-Overview.md` | `GET /v1/pipelines/{id}/snapshots` (viewer) (Q-M9-1); metric names. |
+| `Configuration_Specification.md` §9.3 | A `string` override of a MySQL/MariaDB date/time column carries the raw server text, the remedy for `INVALID_DATE_VALUE` (Q-M7-1). |
+| `Schema_Change_Detection_and_Evolution.md` | Reserved prefix `__data_avalanche_*`. |
+
+**Naming (D-IMPL-7), across specs and research docs:** metric prefix `cdc_` → `data_avalanche_`;
+Delta `app_id` `data-avalanche/<pipeline_id>/owner`; `commitInfo` keys and the Arrow field tag
+`data-avalanche.*`; internal column prefix `__data_avalanche_` (MERGE flag `__data_avalanche_del`).
+Earlier dated sections of this tracker keep the names as they were then. `prototypes/` (probe
+evidence as run) and the legacy report are unchanged; Iceberg's `cdc.owner_epoch` property is v2.
+
+Research follow-ups: `Type_Mapping.md` names `mysql_async` / `mysql_common` instead of
+`mysql-binlog-connector-rust` and gains §Date/time edge values (PG ±infinity clamps to the Arrow
+min/max; MySQL/MariaDB all-zero dates → NULL, zero-in-part or impossible dates → table halt
+`INVALID_DATE_VALUE`, after measuring that MariaDB 11.8 accepts them by default);
+`API_RBAC_and_Versioning.md` gains the snapshot-job list row; `Delivery_Guarantee…` points to
+`position.json`.
+
+**Result:** no gap status changes. One question remains open for M9 planning: Q-M9-2 (resolving a
+job ID to its pipeline for `GET /v1/snapshots/{job_id}`).
