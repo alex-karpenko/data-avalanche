@@ -2,8 +2,10 @@
 
 pub mod decimal;
 pub mod table;
+pub mod value;
 
 pub use decimal::{Decimal, DecimalError, MAX_DECIMAL_PRECISION};
 pub use table::{
     INTERNAL_COLUMN_PREFIX, LINEAGE_COLUMNS, TableRef, first_reserved_collision, is_reserved_column,
 };
+pub use value::{ColumnValue, ColumnValueType, Row};

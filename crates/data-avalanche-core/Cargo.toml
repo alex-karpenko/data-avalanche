@@ -10,8 +10,11 @@ description = "Domain types shared by every data-avalanche crate. No I/O."
 workspace = true
 
 [dependencies]
+chrono.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
