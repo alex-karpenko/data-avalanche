@@ -9,7 +9,7 @@ The sink commit under test is **one MERGE per table per flush**: source = collap
 version: owner_epoch}` as the fence carrier; `commitInfo["avalanche.committed_position"]` as the
 position carrier.
 
-## Results (2026-09-26, local `file://` tables, release build) — 8/8 green
+## Results (2026-09-26, local `file://` tables, release build) — 10/10 green
 
 | Probe | What | Result |
 |---|---|---|
@@ -21,6 +21,8 @@ position carrier.
 | P6 | MERGE cost, 1M rows / 40 files, 5,000 updates | ⚠️ see below |
 | P7a | add column on a default table | ✅ `add_columns()`; pre-evolution MERGE shape still commits |
 | P7b | add column on a **column-mapping `name`** table | ❌ **refused**: `UnsupportedColumnMapping { mode: Write, operation: "ADD COLUMN" }` (asserted, so a fixed delta-rs flips the test) |
+| P10 | Hop-3b type round-trip (append + MERGE), read back by delta-rs **and cross-read by DuckDB** | ✅ all 15 columns, exact types and values — see below |
+| P10b | protocol of the same table without `timestamp_ntz` | ✅ reader 1 / writer 2 (so `timestamp_ntz` alone raises it to 3 / 7) |
 
 ### P6 — write amplification (the Delta cost model, measured)
 
@@ -41,11 +43,41 @@ for (b) while removing 40 files — the scan/skip metrics are unreliable; use `f
   (`9a2111a`, 2026-09-26) resolves to a **single arrow 59.3 / parquet 59.3**. Resolution only, not a
   joint compile.
 
+### P10 — type round-trip (`tests/probe_types.rs` + `scripts/p10_duckdb_crossread.py`)
+
+One table with every Hop-3b row (`doc/research/Type_Mapping.md`), loaded by **append** then fully
+re-imaged by the sink's **MERGE**; uuid (FixedSizeBinary(16)) and time (Time64 µs) are converted in the
+sink exactly as specified (canonical lowercase uuid string; `HH:MM:SS.ffffff`).
+
+| Column (Delta type) | delta-rs read-back | DuckDB 1.5.5 `delta_scan` |
+|---|---|---|
+| byte / short / long / boolean | Int8 / Int16 / Int64 / Boolean, extremes exact | TINYINT / SMALLINT / BIGINT / BOOLEAN ✅ |
+| `decimal(20,0)` (BIGINT UNSIGNED) | Decimal128(20,0), `u64::MAX−7` exact | DECIMAL(20,0) ✅ |
+| `decimal(38,10)` | Decimal128(38,10), 38-digit negative exact | DECIMAL(38,10) ✅ |
+| string (text, json, uuid, time) | Utf8View; Unicode / empty / NULL exact | VARCHAR ✅ |
+| binary | BinaryView; non-UTF-8 bytes exact (hex-compared) | BLOB ✅ |
+| date | Date32 incl. 1969-12-31 | DATE ✅ |
+| `timestamp` (with tz) | Timestamp(µs, "UTC") | TIMESTAMP WITH TIME ZONE — an instant ✅ |
+| `timestamp_ntz` | Timestamp(µs, None) | TIMESTAMP — wall-clock ✅ (incl. −1 µs pre-epoch) |
+| `array<string>` | List<Utf8View>, NULL list exact | VARCHAR[] ✅ |
+
+**Finding — `timestamp_ntz` raises the table protocol.** A table with a `timestamp_ntz` column is
+created at **reader v3 / writer v7** with the `timestampNtz` table feature. Engines without Delta
+table-feature / `timestampNtz` support cannot read such a table at all. **P10b** confirms the cause:
+the same columns without `timestamp_ntz` stay at **reader 1 / writer 2**. Gap DA-MS-8 → decided D-MS.16: native `timestamp_ntz` by default,
+`sink.delta.timestamp_ntz_as: timestamp | string` as the opt-out for legacy readers (config V-114).
+
+The cross-read needs no global install: `uv` runs DuckDB in a throwaway environment.
+
+```bash
+P10_OUT=/tmp/p10 cargo test --release --features probe --test probe_types -- --nocapture
+uv run --no-project --with duckdb --with pytz python scripts/p10_duckdb_crossread.py /tmp/p10
+```
+
 ### Not covered yet
 
 - **P8** — commit atomicity on real S3 / GCS / Azure (needs the lease-conformance buckets/credentials).
-- **P10** — type round-trip (uuid/time as string, decimal(20,0), timestamp vs timestamp_ntz) and
-  cross-read by Spark/DuckDB.
+- Spark cross-read (no JVM on the probe host; DuckDB covers the independent-reader check).
 
 ## Running
 

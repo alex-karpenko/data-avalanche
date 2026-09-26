@@ -373,15 +373,19 @@ those columns inside its own Hop 3 (the accumulator is unchanged).
 | `Date32` | `date` | No |
 | `Time64(Microsecond)` (`time`) | `string` `HH:MM:SS.ffffff` | **Yes** — D-MS.8; override to `int64` for µs-since-midnight |
 | `Timestamp(Microsecond, Some("UTC"))` (`timestamp_tz`) | `timestamp` | No |
-| `Timestamp(Microsecond, None)` (`timestamp_ntz`) | `timestamp_ntz` (table feature `timestampNtz`) | No |
+| `Timestamp(Microsecond, None)` (`timestamp_ntz`) | `timestamp_ntz` (table feature `timestampNtz`; default) — or per `sink.delta.timestamp_ntz_as`: `timestamp` (wall clock as UTC instant) / `string` | Only for `timestamp` / `string` (DA-MS-8) |
 | `FixedSizeBinary(16)` (`uuid`) | `string` (canonical 36-char, lowercase) | **Yes** |
 | `FixedSizeBinary(n)`, n ≠ 16 | `binary` | **Yes** (cast) |
 | `List<T>` (incl. `set` → `list<string>`) | `array<T>` | No |
 | `Struct(fields)` | `struct<…>` | No |
 | unsigned Arrow types | — | Never reach Hop 3 (pre-converted in Hop 2, same as 3a) |
 
-Probe P10 (`prototypes/delta-capability/`, pending) round-trips these through delta-rs and an
-external reader (Spark/DuckDB).
+**Verified 2026-09-26 (probe P10, `prototypes/delta-capability/`):** every row above round-trips
+exactly through the sink's append and MERGE paths and is read back identically by delta-rs and by
+DuckDB's `delta_scan` (delta-kernel). **Interop note:** a `timestamp_ntz` column upgrades the table to
+reader v3 / writer v7 (`timestampNtz` table feature); readers without table-feature support cannot
+open it (gap DA-MS-8). **Decided (D-MS.16):** keep `timestamp_ntz` by default; `sink.delta.timestamp_ntz_as:
+timestamp | string` is the explicit escape hatch for legacy-reader estates (config V-114).
 
 ---
 

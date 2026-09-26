@@ -543,7 +543,7 @@ Mirror of `prototypes/iceberg-capability/`, pinned to `deltalake = "=1.0.0"`:
 
 P1, P2, P4, P6, P8 are the gates whose failure would change the Delta design; the rest are confirmatory.
 
-### 10.1 Results (2026-09-26, `prototypes/delta-capability/`, local `file://`, deltalake 1.0.0) — 8/8 green
+### 10.1 Results (2026-09-26, `prototypes/delta-capability/`, local `file://`, deltalake 1.0.0) — 10/10 green
 
 | Probe | Result |
 |---|---|
@@ -556,7 +556,8 @@ P1, P2, P4, P6, P8 are the gates whose failure would change the Delta design; th
 | P7a add column (default table) | ✅ |
 | P7b add column on column-mapping `name` table | ❌ refused by delta-rs 1.0 → **default revised to `none`** (§7.2, §9.2, V-092) |
 | P9 single arrow with iceberg `main` | ✅ at resolution (arrow/parquet 59.3), joint compile not run |
-| P8 real clouds, P10 types/cross-read | ⏳ not run |
+| P10 types + independent cross-read | ✅ all Hop-3b types exact through append **and** MERGE; DuckDB 1.5.5 `delta_scan` (delta-kernel) reads identical types/values; tz vs ntz semantics preserved. **Finding:** a `timestamp_ntz` column puts the table at reader v3 / writer v7 (`timestampNtz` feature); without it the table stays at reader 1 / writer 2 (P10b) — gap DA-MS-8 |
+| P8 real clouds | ⏳ not run (needs credentials) |
 
 **P6 interpretation.** Delta MERGE cost per flush is ∝ *(number of files whose key range contains a
 changed key)* × file size. For time/sequence-correlated updates (append-heavy OLTP, recent-row
@@ -597,3 +598,4 @@ a correctness risk but it is a real scope caveat — see **D-MS.15**.
 | **D-MS.14** | Arrow alignment policy | single major workspace-wide (+FFI escape hatch) · per-sink majors via FFI always | ✅ **DECIDED 2026-09-26:** **Single major** (arrow 59 now); FFI bridge only as a temporary per-sink escape hatch. |
 | **D-MS.15** | *(surfaced by probe P6)* Delta write amplification for large tables with spread-out updates | (a) accept + document + metrics, guidance: larger flush intervals · (b) (a) in v1 + post-v1 **deletion-vector writer** via low-level `CommitBuilder` · (c) route such tables to `write_mode: changelog` | ✅ **DECIDED 2026-09-26: (b)** — v1 ships (a): documented caveat, `cdc_sink_merge_rows_copied` / `cdc_sink_merge_files_rewritten` metrics, flush-interval guidance. Post-v1: DV writer (read key columns → row positions → write deletion vectors, no data rewrite), gated on its own probe. |
 | **R-1** | *(revision of the signed-off `column_mapping: name`, from probe P7b)* `sink.delta.column_mapping` default | `name` · `none` | ✅ **DECIDED 2026-09-26: `none`; `name` rejected in v1 (V-092)** — delta-rs 1.0 refuses ADD COLUMN on column-mapped tables. |
+| **D-MS.16** | *(surfaced by probe P10/P10b)* Delta mapping of source `timestamp without time zone` — `timestamp_ntz` raises the table to reader v3 / writer v7 | (a) accept + document · (b) map to `timestamp` (UTC instant, protocol stays 1/2) · (c) string · (d) `sink.delta` option choosing (a)/(b)/(c) | ✅ **DECIDED 2026-09-26: (d), default (a)** — `sink.delta.timestamp_ntz_as: timestamp_ntz` (default) \| `timestamp` \| `string` (config §9.4.3, V-114); per-column `column_type_overrides` still take precedence. Correct semantics by default, explicit escape hatch for legacy-reader estates. |
