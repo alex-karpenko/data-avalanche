@@ -176,7 +176,12 @@ pub struct CdcEvent {
     pub change_seq: SourceSeq,               // per-change order (keep-last key, `_seq`)
     pub xid: u64, pub commit_ts_micros: i64,
 }
-pub struct Row(pub Vec<(String, ColumnValue)>);  // plus an `unchanged_toast` column mask for PG, D-IMPL-3
+impl CdcEvent { pub fn validate(&self) -> Result<(), EventShapeError>; }   // image shape per op
+pub enum EventShapeError { MissingAfter{..}, MissingBefore{..}, UnexpectedBefore{..}, UnexpectedAfter{..} }
+pub struct TransactionBoundary { pub xid: u64, pub commit_pos: SourcePosition, pub commit_ts_micros: i64 }
+pub struct Row(pub Vec<(String, ColumnValue)>);  // the PG unchanged-TOAST mask (D-IMPL-3) needs a shape: Q-M3-1
+// Landed in M0 (2026-09-26): all of the above, plus Decimal { unscaled: i128, scale: i8 } with parse / precision /
+// rescale / fits (Eq/Hash compare the representation: rescale before keying by value).
 ```
 
 ### 3.2 Positions (Delivery §2; P-4 adds file/position)
@@ -194,7 +199,11 @@ impl SourcePosition {
     pub fn intersect(&self, other: &Self) -> Result<Self, PositionError>;
     pub fn to_tagged(&self) -> String;                                     // "pg:0/16B3748", "mysql-gtid:…",
     pub fn parse_tagged(s: &str) -> Result<Self, PositionError>;           // "mariadb-gtid:…", "binlog:…"
+    pub fn dialect(&self) -> &'static str;                                 // "pg" | "mysql-gtid" | "mariadb-gtid" | "binlog"
 }
+pub enum PositionError { DialectMismatch { left, right }, DifferentBinlogSeries { left, right }, Parse { input, reason } }
+// Component types live in `data_avalanche_core::position` (Lsn, GtidSet + GtidSource, MariaGtidState + MariaGtid,
+// BinlogFilePos, parse_binlog_index); Display/FromStr of each is the untagged form. Serde of SourcePosition = tagged string.
 pub enum SourceSeq { Pg(Lsn), Binlog { file_index: u64, end_log_pos: u64 } }   // total order within one stream
 ```
 
@@ -733,6 +742,21 @@ the naming below (2026-09-26).**
 | Q-M9-1 | Snapshot-job persistence | **Persisted in the pipeline state location** (`snapshots/jobs/<job_id>.json`); listed after a restart or failover via `GET /v1/pipelines/{id}/snapshots`; a running job continues on the new owner from its chunk cursors | `Data-Flow.md` §On-Demand Snapshot + State Layout; System-Overview and API_RBAC endpoint tables |
 
 ### 9.2 Open questions (answer before the named milestone)
+
+- **Q-M3-1:** Shape of the PG unchanged-TOAST mask on `Row` (D-IMPL-3): a second field (breaks the
+  `Row(vec![..])` tuple constructor), a named-field struct, or a `ColumnValue::Unchanged` marker.
+- **Q-M3-2 (M0 final review I-1):** `_seq` must sort in source order as text, but `SourceSeq`'s
+  `Display` (PG `X/Y` unpadded, binlog `NNNNNN:pos`) doesn't (`"0/9" > "0/10"`). Proposal: a fixed-width
+  column form (`{:08X}/{:08X}`, `{:010}:{:020}`) for the `_seq` column only, keeping the canonical
+  `Display`; Data-Flow §Data Lineage states it (spec edit).
+- **Q-M3-3 (M0 final review I-2):** `ColumnValue::Time(NaiveTime)` can't hold PG `time` `24:00:00` or
+  MySQL/MariaDB `TIME` (an elapsed time, −838:59:59…838:59:59). Options: `Time(i64 µs)` plus edge rules
+  in Type_Mapping, or a halt/string rule for out-of-day values. (Delta has no `time` type; it maps to
+  string there.)
+- Recorded for later plans: M1 — depth limit on `list<T>` in the `LogicalType` parser (config input);
+  M7 — the decoder validates `gno >= 1` before `GtidSet::insert` (anonymous GTID events carry 0, and
+  `insert_range` panics on 0); M1 — settle one public-API convention (root re-exports, `FromStr` for
+  `Decimal`, error-type naming) before more types land.
 
 - **Q-M9-2:** `GET /v1/snapshots/{job_id}` is served by any node, but the job lives in one pipeline's
   state location. Either the job ID embeds the pipeline ID so any node can read it from storage, or
