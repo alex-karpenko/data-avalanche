@@ -3,3 +3,7 @@
 pub mod lsn;
 
 pub use lsn::{Lsn, LsnParseError};
+
+pub mod gtid;
+
+pub use gtid::{GtidParseError, GtidSet, GtidSource};
