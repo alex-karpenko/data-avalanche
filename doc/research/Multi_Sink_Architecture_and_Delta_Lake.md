@@ -444,7 +444,10 @@ expire) create snapshots/versions without it. The current Iceberg design reads "
 summary" — after an external compaction that read returns nothing and the fence silently disarms until
 our next commit. Rule for both sinks: **read the marker from the latest commit authored by this
 application** (walk back), or use a carrier that persists in table state (Delta `txn`). Independent of
-Delta; applies to the Iceberg design as-is.
+Delta; applies to the Iceberg design as-is. **Resolved in the Iceberg research docs (2026-09-26):**
+epoch mirrored into a `cdc.owner_epoch` table property in the same transaction (authoritative read),
+position via own-snapshot walk-back by `cdc.pipeline`, "none retained" = not covered —
+`Clustering…` §5.5, `Delivery…` §3–§4, `Iceberg_Maintenance.md` §2.
 
 ---
 

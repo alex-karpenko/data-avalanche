@@ -1,5 +1,5 @@
 ---
-updated: 2026-06-20
+updated: 2026-09-26
 domain: Architecture
 tags: [iceberg, maintenance, compaction, expire-snapshots, delete-files, orphan-files, mor, cdc]
 resolves: [G-25]
@@ -46,6 +46,14 @@ scheduler can land later without a config break.
 
 **The app's obligation:** never assume maintenance has run — planning and writes must tolerate deep
 delete-file stacks and many small files (just slower).
+
+**…and never assume the latest snapshot is its own (DA-X-10).** External maintenance commits
+snapshots without the app's `cdc.*` markers and `expire_snapshots` may remove the app's last snapshot.
+The sink therefore reads the owner-epoch fence from the `cdc.owner_epoch` **table property** and the
+position guard from the newest **own** snapshot (walk-back by `cdc.pipeline`), treating "no own
+snapshot retained" as not-covered (`Clustering_Architecture_Research.md` §5.5,
+`Delivery_Guarantee_and_Position_Guard.md` §3). Operators need not coordinate maintenance with the
+app for correctness.
 
 ---
 

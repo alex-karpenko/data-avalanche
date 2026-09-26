@@ -1,5 +1,5 @@
 ---
-updated: 2026-06-20
+updated: 2026-09-26
 domain: Data Flow
 tags: [delivery-guarantee, exactly-once, gtid, lsn, idempotency, checkpoint, multi-table, cdc]
 resolves: [G-14]
@@ -84,8 +84,14 @@ into the GTID set; `union`/`covers` handle multiple UUIDs naturally.
 
 - **Per-table high-water mark.** Each Iceberg table's snapshot summary carries its own
   `cdc.committed_position`. The guard compares a flush's per-table position against that table's
-  summary: if `table.committed_position.covers(flush.position_for_table)` → already committed, skip
-  writing that table.
+  **latest own** marker (below): if `table.committed_position.covers(flush.position_for_table)` →
+  already committed, skip writing that table.
+- **"Latest own", not "latest" (DA-X-10, 2026-09-26).** Foreign commits (external compaction,
+  `expire_snapshots`, other engines) produce snapshots without `cdc.*` properties. The guard walks the
+  snapshot log back to the newest snapshot whose summary carries `cdc.pipeline = <pipeline_id>` and
+  reads its `cdc.committed_position`. If no own snapshot is retained (expired by external
+  maintenance), the table is treated as **not covered**: the flush is written and idempotency (§1)
+  absorbs any re-delivery. The guard never blocks progress and never skips on missing evidence.
 - **Pipeline resume checkpoint = the laggard.** The single position persisted to state storage
   (`slot.json` / `gtid.json`) is the **`intersect` (MySQL) / `min` (PG) across all tracked tables** —
   the position every table has durably passed. On restart the single replication stream resumes from
@@ -104,7 +110,10 @@ Generalize the Data-Flow.md `committed_lsn` scalar to:
 
 - **`cdc.committed_position`** — engine-tagged string: PG LSN, or canonical GTID-set. Written into
   each table's Iceberg snapshot summary on every successful commit, as `union` of the prior value and
-  the flush's per-table position.
+  the flush's per-table position. The "prior value" is the latest **own** snapshot's value (§3).
+- **`cdc.pipeline`** — the pipeline `id`, written alongside, so own snapshots are identifiable during
+  the walk-back. (Delta sink equivalent: `commitInfo` `avalanche.committed_position` /
+  `avalanche.pipeline`, same walk-back rule — probed in `prototypes/delta-capability/` P3.)
 
 It coexists with **`cdc.owner_epoch`** (clustering D-7, sink-side fencing). The two are orthogonal:
 `owner_epoch` rejects a zombie writer; `committed_position` skips already-done work.

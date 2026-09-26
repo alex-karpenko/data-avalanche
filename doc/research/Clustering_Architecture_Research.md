@@ -1,7 +1,7 @@
 ---
 title: Clustering Architecture Research
 status: Research / Design proposal (input for further elaboration)
-updated: 2026-06-20
+updated: 2026-09-26
 domain: Architecture / Distributed Systems
 tags: [clustering, gossip, swim, memberlist, consistent-hashing, lease, split-brain, rebalancing, config-propagation]
 closes_or_advances: [G-8, G-9, G-2, G-17, G-23, G-36, "OQ-CL1", "OQ-CL3", "OQ-CL4", "OQ-API3", "OQ-P3", "5.1", "5.2"]
@@ -432,6 +432,24 @@ attempt one stale Iceberg commit before noticing. We close this with **defense i
    exposes the snapshot-summary string map and the monotonic check rides the reload-retry path that
    already exists. **Implementation note:** verify the chosen iceberg-rust version preserves custom
    snapshot-summary properties across commits.
+
+   **Where `latest_committed_epoch` is read from (DA-X-10, 2026-09-26).** Not from "the latest
+   snapshot": foreign commits — external compaction (`rewrite_data_files`), `expire_snapshots`, any
+   other engine — create snapshots **without** `cdc.*` properties, so the latest snapshot after an
+   external compaction carries no epoch and a naive read silently **disarms the fence** until our next
+   commit. And external `expire_snapshots` can remove our own last snapshot entirely. Rule:
+   - **Write** the epoch in **two** places in the **same** Iceberg transaction as the data: the
+     snapshot summary (`cdc.owner_epoch`, per-snapshot audit) **and** a table property
+     (`cdc.owner_epoch`), which persists across foreign commits and snapshot expiry (external
+     maintenance preserves table properties).
+   - **Read** the fence from the **table property** (authoritative). If it is absent (table created
+     before this rule, or property removed), walk the snapshot log back to the newest snapshot whose
+     summary carries `cdc.pipeline = <pipeline_id>` and read its `cdc.owner_epoch`; if none is retained,
+     the sink-side fence is simply not armed for that commit — layers (1), (2), (4) still hold.
+   - 🧪 Verify that `update_table_properties` + the data-commit action apply as **one** metadata commit
+     in the pinned iceberg-rust (extends the DA-SINK-2 probe). Fallback: summary + walk-back only.
+   This is the Iceberg analogue of the Delta sink's `txn` app-transaction, which lives in table state
+   and was probed to survive a foreign OPTIMIZE (`prototypes/delta-capability/` P3/P4).
 4. **Idempotent/dedup writes** (the `_lsn`-based exactly-once guard, Phase 4, and the ghost-row
    dedup gap G-13) absorb the residual duplicate-row possibility.
 
@@ -843,7 +861,7 @@ ClusterManager (one per worker)
 - **D-4** *(resolved)* Add `cluster.discovery: static | dns` (+ `discovery_dns_name`); `dns` resolves + periodically re-resolves a headless Service. §10.2
 - **D-5** *(elaborated below, §17)* Verify atomic conditional-write path on S3 *and* GCS *and* Azure (SDK vs opendal); per-backend conformance test. §12
 - **D-6** *(elaborated below, §18)* Pick concrete defaults for `lease_duration` / `renewal_interval` against the target failover-time SLA (ties to OQ-OB2 replication-lag SLA). §8.2 / §11
-- **D-7** *(resolved: assert it)* `owner_epoch` is embedded in the Iceberg snapshot summary (`cdc.owner_epoch`) and the commit reload-retry loop rejects a commit when `latest_committed_epoch > my_epoch` — a sink-side fencing token (defense-in-depth atop the metadata-pointer CAS + `_lsn` dedup). §5.5
+- **D-7** *(resolved: assert it; carrier refined 2026-09-26 for DA-X-10 — table property authoritative, summary + own-snapshot walk-back as fallback, §5.5)* `owner_epoch` is embedded in the Iceberg snapshot summary (`cdc.owner_epoch`) and the commit reload-retry loop rejects a commit when `latest_committed_epoch > my_epoch` — a sink-side fencing token (defense-in-depth atop the metadata-pointer CAS + `_lsn` dedup). §5.5
 - **D-8** *(elaborated below, §19; resolved)* Lease renewal failure taxonomy — distinguish `412` (definitive loss → stop) from transient storage errors (retry within a safety deadline), via a renewer state machine. Adds `cluster.lease_safety_margin` and promotes `lease_renewal_interval ≤ lease_duration / 3` to an enforced rule. §5.3 / §19
 - **D-9** *(elaborated below, §20.1; resolved)* Reconciler ↔ renewer orchestration — split into `ClusterReconciler` (ring only) + per-pipeline `PipelineController` (sole lease-writer, hosts the §19 renewer); event-driven + periodic-resync, idempotent/level-triggered. §8.1 / §13 / §20.1
 - **D-10** *(elaborated below, §20.2; resolved)* Unplanned-takeover storm rate-limiting — `cluster.max_concurrent_takeovers` (default 4) caps concurrent Phase-0 starts (not the cheap waits), with jitter; per-node-global now, per-source-endpoint group noted as future. §20.2
