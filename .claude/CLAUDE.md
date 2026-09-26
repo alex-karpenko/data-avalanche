@@ -32,7 +32,7 @@ data-avalanche/
 │   ├── specs/                                     source of truth (Oleksii owns)
 │   │   ├── System-Overview.md                     top-level requirements (incl. Sinks block)
 │   │   ├── Data-Flow.md                           pipeline phases, TableChangeSet, sink contract + realizations
-│   │   ├── Configuration_Specification.md         YAML config model, validation rules V-001…V-114
+│   │   ├── Configuration_Specification.md         YAML config model, validation rules V-001…V-116
 │   │   └── Schema_Change_Detection_and_Evolution.md   DDL detection & per-sink evolution
 │   ├── research/                                  Claude authors, Oleksii reviews
 │   │   ├── Multi_Sink_Architecture_and_Delta_Lake.md   sink abstraction, Delta sink, D-MS.1–16
@@ -58,7 +58,7 @@ data-avalanche/
 │       └── Sources_Index_v3.md                    50-source external index (read-only)
 └── prototypes/                                    capability probes (standalone crates, not the app)
     ├── lease-conformance/                         storage CAS lease T1–T10 on real S3/GCS/Azure
-    ├── iceberg-capability/                        iceberg-rust gates (append-only finding, G2/G2b probes)
+    ├── iceberg-capability/                        iceberg-rust gates (append-only finding, G2/G2b/G2c probes)
     └── delta-capability/                          delta-rs 1.0 gates P1–P10 (MERGE, fence, cost, types)
 ```
 
@@ -128,7 +128,7 @@ sources: [source name, ...]     # from Sources_Index_v3.md (omit if none)
 - **Legacy (in parentheses for reconciliation):** `G-1…G-40`, `G-NEW-1…G-NEW-22`, `OQ-*`.
 - **Design decisions** live in research docs: `D-<n>` / `D-<gap>.<n>` (e.g. `D-13.1`), multi-sink
   `D-MS.<n>`, revisions `R-<n>`.
-- Probe IDs: lease `T1–T10`, iceberg `G1–G5` (+ `G2b`), delta `P1–P10`.
+- Probe IDs: lease `T1–T10`, iceberg `G1–G5` (+ `G2b`, `G2c`), delta `P1–P10`.
 
 When closing a gap, mark it ✅ and add a one-line rationale pointing at the doc/section (or probe)
 that closes it. **Do not delete resolved gaps** — they are the audit trail. An upstream claim (epic
