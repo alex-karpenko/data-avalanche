@@ -240,8 +240,16 @@ the per-context requirement rules (V-010, V-040, V-044, V-045, V-049).
 
 The accumulator injects lineage columns (`_op`, `_ts`, `_lsn`, `_seq`, `_source_db`, `_pipeline`;
 see `Data-Flow.md`). The `__avalanche_` prefix is reserved for sink-internal working columns (e.g.
-the Delta MERGE delete flag); they are never persisted. Source columns whose names collide with these are a runtime concern, not
-a config concern, but operators should be aware the `_`-prefixed names are reserved.
+the Delta MERGE delete flag); they are never persisted.
+
+**Collision rule (D-V1.1).** A source column whose name equals a lineage column, or starts with
+`__avalanche_`, **halts that table** with `RESERVED_COLUMN_COLLISION` naming the column; other tables
+continue. The comparison is **case-insensitive** (Delta column names are). It is checked when the table
+is resolved at start (§11.2), before the target table is created, and on schema evolution: an
+`ADD COLUMN` or rename to a reserved name is Unsafe (`Schema_Change_Detection_and_Evolution.md` §7.2).
+Nothing is renamed or escaped. The halt clears once the source column is renamed and the table is
+resumed or re-snapshotted. There is no config field for this in v1; a per-pipeline rename of the
+lineage columns is the reopen path (`research/V1_Scope_Decisions.md`).
 
 ---
 
@@ -603,7 +611,7 @@ A map of human-readable pipeline name → pipeline config.
 | *(map key)* | string | yes | — | R | Human name. Used in the `_pipeline` lineage column and metric labels. Renaming the key **without** changing `id` is a pure rename. Charset: `^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$` (V-057). |
 | `id` | string | yes | — | special | **Immutable identity** for state keying and resource lifecycle. Changing `id` = delete-and-recreate the pipeline (drop slots/publications per `auto_cleanup`, abandon old state prefix, snapshot per `snapshot_mode`). Charset `^[a-z0-9][a-z0-9_-]{0,62}$`, ≤ 63 chars (V-055); unique across all pipelines (V-056). |
 
-The `id` is used to build the state prefix (`pipelines/<id>/`, see `Data-Flow.md`) and may be
+The `id` is the default per-pipeline state location (`state.prefix` / `sink.prefix`, §10) and may be
 used to derive object-storage prefixes; keep it within the conservative charset above so it is
 always a safe path segment and metric-label value. If future versions auto-derive DB resource
 names from `id`, hyphens will be translated to underscores (PG slot names forbid hyphens).
@@ -729,7 +737,7 @@ sink:
 
 | Field | Type | Required | Default | Mutability | Notes |
 |---|---|---|---|---|---|
-| `type` | enum `iceberg`\|`delta` | **yes** | **— (no default)** | **PR, re-seed** | Must be set explicitly (pipeline or `defaults`) — V-091. There is deliberately no default, so a pipeline's target format never changes implicitly when the runtime binary is rebuilt with a different compiled-in sink set. The sink must be compiled into the binary (V-083). Pipeline state records the sink type; changing it re-seeds the pipeline's tables (fresh positions, snapshot per `snapshot_mode`) and requires table locations that hold no other format's metadata (start-time check). |
+| `type` | enum `iceberg`\|`delta` | **yes** | **— (no default)** | **PR, re-seed** | Must be set explicitly (pipeline or `defaults`) — V-091. There is deliberately no default, so a pipeline's target format never changes implicitly when the runtime binary is rebuilt with a different compiled-in sink set. The sink must be compiled into the binary (V-083). Pipeline state records the sink type; changing it re-seeds the pipeline's tables (fresh positions, snapshot per `snapshot_mode`) and requires table locations that hold no other format's metadata (start-time check). **v1:** only `delta` is implemented. `iceberg` stays a valid value (so v1 → v2 needs no config migration) but the pipeline is **refused at start** — "the Iceberg sink ships in v2" — while other pipelines run (§11.2, D-V1.4). |
 | `write_mode` | enum `mirror`\|`changelog` | no | `mirror` | PR, re-seed | `mirror` = the target mirrors the source (upserts + deletes). `changelog` (append-only `_op` log; PK-less tables allowed) is **reserved** — error in v1 (V-089). A sink that does not declare the mode refuses the pipeline at start (§11.2). |
 | `bucket` | string | yes (resolvable) | — | PR | Object-storage bucket (Azure: container). |
 | `prefix` | string | no | pipeline `id` | PR | Root prefix for this pipeline's tables and co-located state. See §10 for the full path layout. |
@@ -957,13 +965,6 @@ sits **directly** under this root — no `pipelines/<id>/` namespacing segment. 
 that shares `sink.prefix`; in the explicit case the entire location is pipeline state, so no
 marker is needed.
 
-> **Reconcile with `Data-Flow.md`:** its state-layout diagram still roots per-pipeline state at
-> `<state_prefix>/pipelines/<pipeline-id>/` under a prefix it labels "global." That nesting
-> belongs to a shared-prefix model; under the per-pipeline `state`/`sink` location used here
-> (and the `globals.state` boundary in §6.2, which reserves the global prefix for cross-pipeline
-> data only), the `pipelines/<id>/` segment is the same redundancy removed above. Data-Flow's
-> diagram should be re-rooted at the per-pipeline state location and drop that segment.
-
 **Application-level state** (under `globals.state`):
 
 ```
@@ -1064,6 +1065,7 @@ on.
 | Both | Each table has an **identifier**: an inferred PK, or a `tables.primary_key` override whose columns exist and are top-level, primitive, NOT NULL, non-floating | error → halt table (explicit table) / warning + skip (glob-matched PK-less table) | Upsert/delete keying (G-13, G-30). |
 | PostgreSQL | Identifier columns ⊆ **REPLICA IDENTITY** columns | error → halt table, naming the missing columns | Before-image must carry the old key (`Ghost_Row…` §2). |
 | Both | `tables.partitioning` columns exist; temporal transforms target a date/time column | error → halt table | Partition spec validity (G-24). |
+| Both | No source column is named like a lineage column (`_op`, `_ts`, `_lsn`, `_seq`, `_source_db`, `_pipeline`) or prefixed `__avalanche_`, compared case-insensitively | error → halt table (`RESERVED_COLUMN_COLLISION`) | The accumulator injects these columns (§5, D-V1.1). |
 
 Because these are runtime checks, they sit outside the all-or-nothing config-validation contract:
 a privilege or server-setting problem on one pipeline's source does not reject the config or stop
@@ -1077,6 +1079,7 @@ others keep running). Authority: `Data-Flow.md` Phase 0 step 4 and
 |---|---|---|---|
 | All | **Capability assertion** — the sink declares every capability the pipeline's config needs (`write_mode`, partition transforms, logical types of the resolved tables) | error → refuse pipeline, naming the capability | Fail fast instead of a first-write surprise. Example: `sink.type: iceberg` + `write_mode: mirror` is refused until the pinned iceberg-rust has a delete-capable commit (DA-SINK-1i). |
 | All | Pipeline state's recorded `sink_type` equals `sink.type` | error → refuse pipeline | Positions and markers are sink-specific; a changed `sink.type` must re-seed. |
+| Iceberg (v1) | `sink.type: iceberg` | error → refuse pipeline: "sink.type 'iceberg' is not available in this version — the Iceberg sink ships in v2; use 'delta'" | Iceberg sink deferred to v2 (D-V1.4); the config value stays valid. |
 | All | No table root holds the **other** format's metadata (`metadata/` vs `_delta_log/`) | error → halt table | No silent format mixing. |
 | All | Storage supports **atomic create-if-absent** (conditional PUT) on the sink location | error → refuse pipeline | Iceberg file-based commits and every Delta commit rely on it (same capability as the storage lease). |
 
@@ -1182,7 +1185,7 @@ radius. `reload` locus marks a rule that can only fire on reload.
 | V-021 | `source.mysql.replication_type` | ∈ {binlog, gtid}. | error | pipeline |
 | V-022 | `tables.snapshots.mode` (and overrides values) | ∈ {never, initial, always, dump_always, dump_initial}. | error | pipeline |
 | V-023 | `sink.iceberg.strategy` | ∈ {mor, cow}. | error | pipeline |
-| V-083 | `sink.type` | ∈ {iceberg, delta} **and** compiled into this binary (Cargo feature `sink-iceberg` / `sink-delta`). | error | pipeline |
+| V-083 | `sink.type` | ∈ {iceberg, delta} **and** compiled into this binary (Cargo feature `sink-iceberg` / `sink-delta`). **v1:** `iceberg` is a known value this version does not implement; it passes V-083 and the pipeline is refused at start instead (§11.2, D-V1.4), so one Iceberg pipeline never rejects the whole config (§11). | error | pipeline |
 | V-089 | `sink.write_mode` | ∈ {mirror, changelog}; `changelog` is reserved → `error` in v1 (D-MS.5). | error | pipeline |
 | V-092 | `sink.delta.column_mapping` | ∈ {none, name}; `name` → `error` in v1 (delta-rs refuses ADD COLUMN under column mapping; R-1). | error | pipeline |
 | V-088 | `sink.delta.catalog.type` | ∈ {none, glue, unity, hive}; anything but `none` is reserved → `error` in v1 (D-MS.12). | error | pipeline |
@@ -1520,6 +1523,11 @@ Every deviation, so nothing is silent:
     DA-CAT-7), from probe G2c / crate source review. `tables.surrogate_key` (G-30 rejected) and
     `source.consistent_snapshot` (G-7 moot) struck from §16.
 
+21. **v1 scope decisions (2026-09-26, `research/V1_Scope_Decisions.md`)** — §5 reserved lineage-column
+    collision rule and its §11.2 start-time check (D-V1.1); `sink.type: iceberg` accepted by V-083 but
+    refused at pipeline start in v1 (D-V1.4, new §11.2 sink row); the stale `pipelines/<id>/` state
+    references removed (§10 note, `id` field text, §17 — DA-X-8).
+
 None of these change the **decided** catalog-auth schema (hive Thrift `none/ldap/kerberos`;
 rest HTTP `none/bearer/oauth2/sigv4`) — those are reproduced verbatim from
 `Catalog_Auth_Research.md`.
@@ -1550,7 +1558,9 @@ reserved fields were promoted (§15 item 20).
 ## 17. Related documents
 
 - `System-Overview.md` — high-level requirements and snapshot-mode semantics.
-- `Data-Flow.md` — pipeline stages, state layout under `pipelines/<id>/`, offset acknowledgment.
+- `Data-Flow.md` — pipeline stages, per-pipeline state layout (§State Layout), offset acknowledgment.
+- `research/V1_Scope_Decisions.md` — v1 decisions D-V1.1–D-V1.6 (reserved-column collision, PG
+  `DROP TABLE`, lag targets, `sink.type: iceberg` in v1, MariaDB, binlog payload check).
 - `Catalog_Auth_Research.md` — source of the catalog auth schema and the 9 catalog rules.
 - `research/Multi_Sink_Architecture_and_Delta_Lake.md` — sink abstraction, `sink.type`, Delta Lake
   block, V-083…V-093.

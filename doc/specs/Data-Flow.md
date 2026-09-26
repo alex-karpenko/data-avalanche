@@ -68,12 +68,16 @@ On worker start (or when a pipeline is assigned via the consistent hash ring), t
      in v1) — reported by the sink's `table_state()`.
 
 3. Apply table include/exclude glob filters → resolved table set
+   └── per resolved table: a source column named like a lineage column → halt that table
+       (`RESERVED_COLUMN_COLLISION`, Configuration_Specification.md §5)
 
 4. Sink preflight (per pipeline):
    ├── capability assertion — the sink confirms it supports everything this pipeline's config
    │   needs (write mode, partition transforms, logical types of the resolved tables); otherwise
    │   the pipeline is refused with the named capability (e.g. "Iceberg mirror mode requires a
    │   delete-capable commit action")
+   ├── v1: `sink.type: iceberg` → pipeline refused ("the Iceberg sink ships in v2"); other
+   │   pipelines run
    ├── pipeline state's recorded `sink_type` must equal `sink.type` (a change re-seeds; §State Layout)
    └── each table root must not hold another format's metadata (no silent format mixing)
 
@@ -134,10 +138,13 @@ to parallel workers; keyset order is serial within a table.
 ```
 Replication connection (replication protocol, not SQL)
 │
-├─► START_REPLICATION SLOT <slot> LOGICAL <confirmed_flush_lsn>
-│       (proto_version '2', publication_names '<pub>')
+├─► Session pinned at connect (startup options):
+│       TimeZone=UTC, DateStyle=ISO, IntervalStyle=iso_8601, extra_float_digits=3
 │
-├─► Keepalive timer (tokio::time::interval, default 60s)
+├─► START_REPLICATION SLOT <slot> LOGICAL <confirmed_flush_lsn>
+│       (proto_version '1', publication_names '<pub>')
+│
+├─► Status timer (`source.postgres.heartbeat`, default 60s; idle wakeup = same interval)
 │   └─► send StandbyStatusUpdate(write_lsn, flush_lsn, apply_lsn)
 │       advancing confirmed_flush_lsn after each committed + flushed batch
 │
@@ -163,6 +170,19 @@ Replication connection (replication protocol, not SQL)
 - `FULL`: UPDATE and DELETE carry the complete old row image. Required for tables without a primary key.
 - `NOTHING`: DELETE events are unusable — the sink cannot identify which row to delete. Pipelines should reject tables with `REPLICA IDENTITY NOTHING`.
 
+**Protocol and client (probe-verified, `prototypes/source-capability/` S-PG0…8):**
+- The client crate (`pgwire-replication`) is transport only; **the pgoutput decoder is ours**.
+- **`proto_version '1'`**, which the pinned crate sends, with no `streaming` option. A large
+  transaction arrives whole at commit, and the server spills it past `logical_decoding_work_mem`.
+  Without `streaming`, v1 and v2 carry the same messages. Oversized transactions are bounded on
+  our side (Phase 3: transaction buffer limit, opt-in split commits).
+- **Session pinning.** pgoutput's text values are rendered with the *walsender session's* settings,
+  not the writer's. Pinning TimeZone, DateStyle, IntervalStyle and `extra_float_digits` makes
+  decoding deterministic and float-exact.
+- **Idle acks.** The client sends status on message arrival or on its idle wakeup, which defaults to
+  10s in the crate. Setting the wakeup to the status interval bounds how late a quiet-period ack
+  reaches the slot. This is slot lag, not a correctness issue.
+
 **TOAST columns:** Unchanged large columns in UPDATE events are represented by a "unchanged TOAST" marker, not the actual value. The pipeline must either re-fetch the value via a separate query or treat the column as unchanged and carry forward the last known value.
 
 ---
@@ -170,15 +190,28 @@ Replication connection (replication protocol, not SQL)
 ## Phase 2b — Streaming Replication: MySQL
 
 ```
-Replication connection (COM_BINLOG_DUMP_GTID)
+Replication connection (binlog dump, GTID-positioned)
 │
-├─► Send COM_BINLOG_DUMP_GTID with gtid_executed set from state storage
-│   └─► MySQL streams only transactions not in the set (gap-free, position-independent)
+├─► Detect the server flavour at connect (`SELECT version()`) → GTID dialect
+│
+├─► MySQL:   COM_BINLOG_DUMP_GTID with the gtid_executed set from state storage
+│   MariaDB: SET @mariadb_slave_capability=4, @slave_connect_state='<gtid_pos>',
+│            @slave_gtid_strict_mode=1, then COM_BINLOG_DUMP
+│   └─► the server streams only transactions not in the set (gap-free, position-independent)
+│
+├─► SET @master_heartbeat_period before the dump (idle-connection liveness)
 │
 └─► Event loop:
     │
-    ├─► GTID_LOG_EVENT
+    ├─► GTID_LOG_EVENT (MySQL) / GTID_EVENT, type 162 (MariaDB — decoded by us:
+    │   seq_no u64 LE, domain u32 LE, server_id from the event header)
     │   └─► record current_gtid for this transaction
+    │
+    ├─► TRANSACTION_PAYLOAD_EVENT (binlog transaction compression)
+    │   └─► validate: header parses, decompressed length == uncompressed_size,
+    │       ≥ 1 inner event; mismatch → halt the PIPELINE (BINLOG_PAYLOAD_INVALID,
+    │       with binlog file/position + GTID)
+    │   └─► process the inner events as below
     │
     ├─► QUERY_EVENT (BEGIN)
     │   └─► record transaction start
@@ -198,11 +231,16 @@ Replication connection (COM_BINLOG_DUMP_GTID)
     │
     ├─► XID_EVENT
     │   └─► emit TransactionBoundary(current_gtid) to accumulator
-    │   └─► update local gtid_executed set
+    │   └─► update the local position (MySQL gtid_executed set / MariaDB gtid_binlog_pos)
     │
     └─► ROTATE_EVENT
         └─► update current binlog filename; clear table_id cache
 ```
+
+**Client (probe-verified, `prototypes/source-capability/` S-MY0…9):** `mysql_async` binlog stream for
+MySQL 8.4 and MariaDB 11.4 (MariaDB is in v1 — D-V1.5). The payload check is ours because the pinned
+crate **silently drops** a compressed transaction it cannot decompress (DA-SRC-12, D-V1.6). It halts the
+pipeline, not the table: the position cannot advance past a transaction that was not read.
 
 ---
 
@@ -512,7 +550,7 @@ membership, the lease registry) lives separately under `globals.state` per
 │                                                  (resume refuses a mismatch with `sink.type`)
 ├── replication/
 │   ├── slot.json                                — PG: slot name, confirmed_flush_lsn
-│   └── gtid.json                                — MySQL: current gtid_executed set
+│   └── gtid.json                                — MySQL: gtid_executed set · MariaDB: domain-server-seq list
 └── snapshots/
     ├── <schema>.<table>.json                    — per-table snapshot state
     │   {

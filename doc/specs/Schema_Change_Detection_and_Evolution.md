@@ -91,6 +91,10 @@ decision, not whether the decoder tracks layout.
 - **Trigger blind spot:** changes that don't alter the tuple descriptor pgoutput sees (a bare
   nullability tighten, a `CHECK` addition) may not emit a Relation message. Acceptable here —
   those are Ignorable for the target (§7) — with the idle rescan as backstop.
+- **`DROP TABLE` is not replicated either.** A dropped table just stops emitting. It is detected
+  out-of-band: its relation OID is gone from `pg_class`. Channel D finds it in steady state and
+  channel A at the next start; the table then halts (§7.2, `TABLE_DROPPED`). MySQL delivers the
+  DROP in-band on channel B.
 
 ### 2.2 MySQL (binlog, ROW format)
 
@@ -135,6 +139,10 @@ Query the source catalog for each tracked table; then:
 - **Non-replayable gap** (PG slot invalidated / WAL recycled; MySQL binlog purged — G-26) →
   the DDL events and intervening rows are lost; baseline the target to the queried schema and
   trigger a **re-snapshot** (§8.2).
+- **Tracked table gone from the source** (PG: relation OID absent from `pg_class`) → halt that
+  table with `TABLE_DROPPED`; the target is kept (§7.2).
+- **Source column named like a reserved lineage column** → halt that table with
+  `RESERVED_COLUMN_COLLISION` (`Configuration_Specification.md` §5).
 
 Channel A is *not* redundant with in-band replay: it is the only thing that covers table
 creation and the non-replayable-gap recovery, which the stream structurally cannot deliver.
@@ -168,7 +176,10 @@ A single **batched** catalog query across all tracked tables, every `rescan_inte
 (default 60m, `0` disables). Catches DDL on tables with no DML — its value is
 **downstream-schema freshness** and **early alerting**, not data correctness (a truly idle
 table has no rows to write under the new schema, and the first write would trigger B+C
-anyway). Lower-criticality than A–C.
+anyway). Lower-criticality than A–C. On PostgreSQL it is also the steady-state detector for a
+**dropped tracked table** (relation OID gone from `pg_class` → `TABLE_DROPPED`, §7.2). Latency is
+bounded by `rescan_interval` (with `0`, until the next start). Nothing is lost while detection waits,
+because a dropped table emits nothing further.
 
 ### Channel comparison
 
@@ -293,6 +304,8 @@ transaction boundary via §8.
 | Cross-family change (`int→varchar`, `timestamp→date`) | **Unsafe** | — | — | halt table |
 | `nullable → NOT NULL` | **Unsafe**\* | — | — | halt table (optional→required is breaking) |
 | Change PK / `REPLICA IDENTITY` / unique key | **Unsafe** | — | — | halt table; operator re-snapshot |
+| `ADD COLUMN` / `RENAME COLUMN` to a **reserved lineage name** (`_op`, `_ts`, `_lsn`, `_seq`, `_source_db`, `_pipeline`, `__avalanche_*`; case-insensitive) | **Unsafe** | — | — | halt table `RESERVED_COLUMN_COLLISION` (config §5) |
+| `DROP TABLE` (tracked) | **Unsafe** | — (target kept) | — (target kept) | halt table `TABLE_DROPPED`; the target is never dropped. A re-created table of the same name (new OID) does **not** auto-resume; it needs an operator re-snapshot. Detection — PG: channel D / A (§2.1); MySQL: channel B |
 | MySQL `ENUM`/`SET` **add** values (append-only) | Ignorable\*\* | none | none | decoded value set widens; verify mapping (G-18) |
 | MySQL `ENUM`/`SET` reorder/remove values | **Unsafe** | — | — | halt (changes decoded string meaning) |
 | Index/comment/storage-params/`AUTO_INCREMENT`/charset w/ same logical type | **Ignorable** | none | none | none |
