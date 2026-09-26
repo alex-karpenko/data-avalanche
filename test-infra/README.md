@@ -1,7 +1,9 @@
 # test-infra
 
 Containers for integration tests. Start with `test-infra/up.sh` (add `matrix` for older engine
-versions), stop with `test-infra/down.sh`, and run tests with `DATA_AVALANCHE_IT=1 cargo test`.
+versions), stop with `test-infra/down.sh`, and run tests with
+`DATA_AVALANCHE_IT=1 DATA_AVALANCHE_SKIP_GCS=1 cargo test`. GCS tests need the variables from the
+GCS section below.
 
 | Service | Image | Host port | Credentials | Profile |
 |---|---|---|---|---|
@@ -46,7 +48,10 @@ Bucket requirements:
 
 Pull requests from forks receive no secrets. The workflow detects the empty secret, sets
 `DATA_AVALANCHE_SKIP_GCS=1` and emits a notice, so fork PRs test S3/Azure only; a maintainer re-runs
-GCS on merge. S3 and Azure need no CI secrets because they run on the emulators above.
+GCS on merge. On pushes and same-repository pull requests, a missing `GCP_SA_KEY` secret or
+`DATA_AVALANCHE_GCS_BUCKET` variable is a misconfiguration, not a fork limitation: the workflow
+prints an `::error::` and fails the integration job. S3 and Azure need no CI secrets because they
+run on the emulators above.
 
 ## Storage conditional-write results (M0 Task 12)
 

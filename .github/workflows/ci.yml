@@ -8,6 +8,9 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -21,15 +24,16 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Unit and property tests
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
   # Integration tests: DB containers + S3/Azure emulators (test-infra/compose.yaml) + a REAL GCS bucket.
   # Requirements (documented in test-infra/README.md, "CI requirements"):
   #   secrets.GCP_SA_KEY           service-account key JSON with roles/storage.objectAdmin on the bucket
   #   vars.DATA_AVALANCHE_GCS_BUCKET    CI bucket name (versioning off, lifecycle rule on data-avalanche-it/)
-  # Fork PRs get no secrets: GCS tests are then skipped (DATA_AVALANCHE_SKIP_GCS=1) with a notice.
+  # Fork PRs skip GCS (DATA_AVALANCHE_SKIP_GCS=1) with a notice when the secret/variable is unavailable.
+  # On pushes and same-repository PRs, a missing secret/variable fails the job.
   integration:
     runs-on: ubuntu-latest
     needs: check
@@ -42,10 +46,16 @@ jobs:
       - name: GCS credentials
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
         run: |
           if [ -z "$GCP_SA_KEY" ] || [ -z "$DATA_AVALANCHE_GCS_BUCKET" ]; then
-            echo "::notice::GCP_SA_KEY or DATA_AVALANCHE_GCS_BUCKET unavailable (fork PR?) - GCS tests skipped"
-            echo "DATA_AVALANCHE_SKIP_GCS=1" >> "$GITHUB_ENV"
+            if [ "$IS_FORK_PR" = "true" ]; then
+              echo "::notice::GCP_SA_KEY or DATA_AVALANCHE_GCS_BUCKET unavailable (fork PR) - GCS tests skipped"
+              echo "DATA_AVALANCHE_SKIP_GCS=1" >> "$GITHUB_ENV"
+            else
+              echo "::error::GCP_SA_KEY secret or DATA_AVALANCHE_GCS_BUCKET variable is not configured (see test-infra/README.md \"CI requirements\")"
+              exit 1
+            fi
           else
             umask 077
             printf '%s' "$GCP_SA_KEY" > "$RUNNER_TEMP/gcs-key.json"
@@ -54,7 +64,7 @@ jobs:
       - name: Start test infrastructure
         run: test-infra/up.sh
       - name: Integration tests
-        run: cargo test --workspace -- --test-threads=1
+        run: cargo test --locked --workspace -- --test-threads=1
       - name: Container logs on failure
         if: failure()
         run: docker compose -f test-infra/compose.yaml logs --no-color

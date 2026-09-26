@@ -11,4 +11,4 @@ docker compose ${profiles[@]+"${profiles[@]}"} up -d --wait
 for init in rustfs-init azurite-init; do
   docker compose --profile init run --rm "$init"
 done
-echo "test-infra ready — export DATA_AVALANCHE_IT=1 to run integration tests"
+echo "test-infra ready — export DATA_AVALANCHE_IT=1 (and DATA_AVALANCHE_SKIP_GCS=1 without GCS credentials) to run integration tests"
