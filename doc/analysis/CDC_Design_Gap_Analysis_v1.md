@@ -1,5 +1,5 @@
 ---
-updated: 2026-09-19
+updated: 2026-09-26
 domain: Architecture
 tags: [gap-analysis, design, re-derivation, spec-readiness, blockers, open-decisions]
 resolves: []
@@ -89,7 +89,16 @@ in three buckets:
 
 | ID | Title | Why it blocks |
 |---|---|---|
-| DA-SINK-1 | **iceberg-rust cannot commit deletes/overwrites — the MOR-equality-delete sink (and its COW fallback) is not buildable on any published version** | Confirmed 2026-06 on 0.9.1, rechecked 2026-07-22 on 0.10.0, rechecked 2026-08-23 on 0.10.1, **rechecked 2026-09-19 on compiled 0.10.1 and the v0.11.0-rc.1/rc.2 surfaces — still true**: `EqualityDeleteFileWriter` exists but the `Transaction` API is **append-only** (`fast_append` data files + metadata actions; no row-delta/overwrite/rewrite/merge-append). A CDC sink that applies UPDATE/DELETE cannot be built on the current public API. Upstream epic apache/iceberg-rust#2186 is **open**; the §24.2.3 "`OverwriteAction` merged" reading is **retracted** (PR #2185 is open/unmerged — §24.2.4). **The sink spec must gate on a future iceberg-rust version or adopt §24.2.1 option 2–4.** *(G-13 §8; details §24.2.1, rechecks §24.2.2/§24.2.3, latest §24.2.4)* |
+| ~~DA-SINK-1~~ → re-scoped 2026-09-26 | *No longer a system blocker — see the multi-sink note below.* **iceberg-rust cannot commit deletes/overwrites — the MOR-equality-delete sink (and its COW fallback) is not buildable on any published version** | Confirmed 2026-06 on 0.9.1, rechecked 2026-07-22 on 0.10.0, rechecked 2026-08-23 on 0.10.1, **rechecked 2026-09-19 on compiled 0.10.1 and the v0.11.0-rc.1/rc.2 surfaces — still true**: `EqualityDeleteFileWriter` exists but the `Transaction` API is **append-only** (`fast_append` data files + metadata actions; no row-delta/overwrite/rewrite/merge-append). A CDC sink that applies UPDATE/DELETE cannot be built on the current public API. Upstream epic apache/iceberg-rust#2186 is **open**; the §24.2.3 "`OverwriteAction` merged" reading is **retracted** (PR #2185 is open/unmerged — §24.2.4). **The sink spec must gate on a future iceberg-rust version or adopt §24.2.1 option 2–4.** *(G-13 §8; details §24.2.1, rechecks §24.2.2/§24.2.3, latest §24.2.4)* |
+
+> **MULTI-SINK RE-SCOPE (2026-09-26) — no system-level 🔴 remains on paper.**
+> `research/Multi_Sink_Architecture_and_Delta_Lake.md` (decisions D-MS.1–D-MS.14 signed off) makes the
+> sink pluggable (`sink.type`, required, no default) and adopts **Delta Lake via delta-rs 1.0** as a
+> first-class v1 sink: MERGE commits deletes + upserts atomically, which iceberg-rust cannot. DA-SINK-1
+> is re-scoped to **DA-SINK-1i — "Iceberg sink, mirror mode" capability**, enforced at pipeline start
+> by the per-sink capability assertion instead of blocking the design. The Delta sink carries its own
+> 🧪 gates (DA-MS-1…DA-MS-4, §25) — P6 (MERGE cost under random-key churn) is the one that could add a
+> scope caveat. See §25.
 
 > **DA-CLUS-1 (storage-CAS conformance) — CLOSED 2026-06.** Proven against **real S3, GCS, and Azure**:
 > S3 T1–T9 (versioned + non-versioned), GCS T1–T10 (incl. the generation-CAS gate T10), Azure T1–T9.
@@ -97,7 +106,7 @@ in three buckets:
 > `LeaseStore`**: OpenDAL for S3, native `google-cloud-storage` for GCS, native Blob-REST+SAS for Azure
 > (OpenDAL 0.57 advertises `write_with_if_match` only for S3). One trait, §5.3 protocol unchanged. The
 > conformance harness `prototypes/lease-conformance/` is the durable proof. **DA-SINK-1 is now the only
-> remaining 🔴.** See §24.1.
+> remaining 🔴** (itself re-scoped 2026-09-26 — see the note above). See §24.1.
 
 Everything else is 🧪 (other capability gates), 🟡/🟢 with a decided design, or 🟥 scoping work that
 does not block starting the specification.
@@ -231,7 +240,7 @@ paper** and is this report's top blocker.
 
 | ID | Title | Sev | Status | Resolution / note | Old ID |
 |---|---|---|---|---|---|
-| DA-CLUS-1 | **Conditional-write CAS conformance on S3+GCS+Azure** | 🔴 | 🧪🟥 | Clustering §12/§17 — lease rests entirely on atomic CAS on one object; **GCS uses *generation*, not ETag, for write preconditions** (the trap). Trait + T1–T10 suite at `prototypes/lease-conformance/`. **S3 proven (Route A) and GCS proven (Route B native `google-cloud-storage` SDK, T1–T10 incl. the generation-CAS gate), 2026-06** — findings folded into §24.1. **Only Azure still owed.** The last clustering item not closeable on paper. | D-5 |
+| DA-CLUS-1 | **Conditional-write CAS conformance on S3+GCS+Azure** | 🔴→✅ | ✅ | **CLOSED 2026-06 — all three backends proven against real services (§24.1); the notes below are the historical trail.** | Clustering §12/§17 — lease rests entirely on atomic CAS on one object; **GCS uses *generation*, not ETag, for write preconditions** (the trap). Trait + T1–T10 suite at `prototypes/lease-conformance/`. **S3 proven (Route A) and GCS proven (Route B native `google-cloud-storage` SDK, T1–T10 incl. the generation-CAS gate), 2026-06** — findings folded into §24.1. **Only Azure still owed.** The last clustering item not closeable on paper. | D-5 |
 | DA-CLUS-2 | Split-brain exclusive ownership (the lease) | 🔴→✅ | ✅ | §5 storage CAS lease; ring is scheduling, lease is safety. | G-8, OQ-CL1 |
 | DA-CLUS-3 | Sink-side fencing for a zombie holder | 🟡 | ✅(design) | §5.5 — `owner_epoch` in Iceberg snapshot summary + Iceberg atomic-commit fence + `_lsn` dedup (defense in depth). Depends on DA-SINK-2 (snapshot-summary persistence). | D-7 |
 | DA-CLUS-4 | Lease renewal failure taxonomy (412 vs transient) + safety deadline | 🟡 | ✅ | §19 — `deadline = last_renew_local + lease_duration − guard`; renewer state machine; commit gating. Prevents a transient S3 blip from stopping a healthy (esp. single-node) worker. | D-8 |
@@ -314,7 +323,7 @@ writer's correctness literally depends on.
 
 | ID | Title | Sev | Status | Resolution / note | Old ID |
 |---|---|---|---|---|---|
-| DA-SINK-1 | **Equality-delete writer assigns delete files the enclosing commit's sequence number** | 🔴 | 🧪🟥 | `Ghost_Row…` §8 — the entire strictly-less-than ghost-row guarantee assumes this iceberg-rust 0.9.0 behavior; **verify before building the writer**. If unsupported/mis-sequenced, need position-deletes-after-read or a different strategy. | G-13 §8 |
+| DA-SINK-1 | **Equality-delete writer assigns delete files the enclosing commit's sequence number** | 🔴→🟡 | 🔄 | **Superseded:** the real finding is "no delete-commit action at all" (§24.2.1–§24.2.4). **Re-scoped 2026-09-26 to DA-SINK-1i (Iceberg mirror-mode capability)** by the multi-sink design (§25); Delta sink is the v1 mirror. Original note: | `Ghost_Row…` §8 — the entire strictly-less-than ghost-row guarantee assumes this iceberg-rust 0.9.0 behavior; **verify before building the writer**. If unsupported/mis-sequenced, need position-deletes-after-read or a different strategy. | G-13 §8 |
 | DA-SINK-2 | Custom snapshot-summary properties (`cdc.owner_epoch`, `cdc.committed_position`) preserved across commits | 🟡 | 🧪 | Required by CLUS fencing (D-7) and DEDUP guard (D-14.4); `Clustering…` §5.5 flags "verify iceberg-rust preserves custom snapshot-summary properties." See §21. | D-7 |
 | DA-SINK-3 | Write strategy COW vs MOR | 🟡 | ✅ | MOR + equality deletes is the default (`Ghost_Row…` §5); COW new-tables-only. | OQ-IC1 |
 | DA-SINK-4 | MOR↔COW strategy change migration | 🟢 | ✅ | `Iceberg_Partitioning…` §4 (G-12a) — new-data-only; explicit compaction/re-snapshot to migrate; PR. | G-12a |
@@ -581,8 +590,8 @@ design, not just the code.**
 
 | ID | Gate | Depends on | If it fails |
 |---|---|---|---|
-| DA-CLUS-1 / DA-DEP-2 | Atomic CAS (create-if-absent, swap-if-version, conditional-delete) on **S3, GCS, Azure** — especially the **GCS generation (not ETag)** mapping. | OpenDAL ≥ late-2024 + per-backend behavior. | The storage lease is unsafe; either drop to native SDKs per backend, or reconsider the lock backend. **Top blocker.** Suite scaffolded at `prototypes/lease-conformance/` (T1–T10); T4/T5/T10 must run against real services. |
-| DA-SINK-1 | Equality-delete writer assigns delete files the **enclosing commit's sequence number** | iceberg-rust 0.9.0. **Confirmed ABSENT on 0.9.1/0.10.0/0.10.1 and the v0.11.0-rc.1/rc.2 surfaces (2026-09-19, compiled crate).** | The ghost-row strictly-less-than guarantee breaks; need position-deletes-after-read or a different write strategy. **Blocks the sink writer.** |
+| DA-CLUS-1 / DA-DEP-2 ✅ closed 2026-06 | Atomic CAS (create-if-absent, swap-if-version, conditional-delete) on **S3, GCS, Azure** — especially the **GCS generation (not ETag)** mapping. | OpenDAL ≥ late-2024 + per-backend behavior. | The storage lease is unsafe; either drop to native SDKs per backend, or reconsider the lock backend. **Top blocker.** Suite scaffolded at `prototypes/lease-conformance/` (T1–T10); T4/T5/T10 must run against real services. |
+| DA-SINK-1 | Equality-delete writer assigns delete files the **enclosing commit's sequence number** | iceberg-rust 0.9.0. **Confirmed ABSENT on 0.9.1/0.10.0/0.10.1 and the v0.11.0-rc.1/rc.2 surfaces (2026-09-19, compiled crate).** | The ghost-row strictly-less-than guarantee breaks; need position-deletes-after-read or a different write strategy. **Blocks the Iceberg mirror only** since the 2026-09-26 multi-sink re-scope (§25). |
 | DA-SINK-2 / DA-X-2 | Custom `cdc.*` **snapshot-summary properties preserved across commits** | iceberg-rust 0.9.0. **Append-path mechanism flash-verified on 0.10.1 (2026-09-19): `fast_append().set_snapshot_properties(...)` + catalog reload round-trip in `prototypes/iceberg-capability`.** Full gate (carrier across delete commits) deferred to the delete-commit capability. | `owner_epoch` fence + `committed_position` guard lose their carrier; need a side-channel (e.g. table properties) or an alternate fence. |
 | DA-SCHEMA-8 | `drop_column` / `rename_column` / type-promotion transactions supported. | iceberg-rust 0.9.0. **`update_schema` confirmed present on 0.10.1 (2026-09-19); the open question narrowed to drop/rename/promotion extent.** | Route the unsupported op to "halt table" until the crate catches up (graceful, already the fallback). |
 | DA-TYPE-5 | `FixedSizeBinary(16)` → Iceberg `uuid` annotation mechanism. | iceberg-rust 0.9.0. | UUID columns fall back to `fixed(16)`/`binary`; cosmetic, low risk. |
@@ -1204,6 +1213,55 @@ their failure paths (halt, cosmetic, defer, advisory) are already part of the de
 `System-Overview.md` (operational preconditions) and reference it from `Configuration_Specification.md`
 §11.2. This makes a missing capability a fail-fast at startup rather than a first-write surprise.
 
+---
 
+## 25. Multi-sink re-scope & Delta Lake sink (2026-09-26)
 
+Source: `research/Multi_Sink_Architecture_and_Delta_Lake.md` — all decisions **D-MS.1–D-MS.14 signed off
+2026-09-26** (D-MS.4 corrected by Oleksii: `sink.type` is **required, no default**, V-091).
+
+### 25.1 What changed
+
+- **Sink is pluggable per pipeline** (`sink.type: iceberg | delta`, required). One sink per pipeline in
+  v1 (D-MS.2); positions kept per (sink, table) so fan-out is additive later.
+- **Collapse moves to the core** (D-MS.3): sinks receive a sink-neutral `TableChangeSet`; the old
+  Iceberg "sink-writer contract" becomes the Iceberg *realization* of a neutral `Sink` trait contract
+  (DA-X-3 ✅ by construction, pending spec merge).
+- **Per-sink capabilities + startup assertion**: a config needing a capability the compiled-in sink
+  lacks is refused at pipeline start with a named capability. This is what turns DA-SINK-1 from a
+  design blocker into a runtime capability.
+- **Delta Lake (delta-rs 1.0.0) is a first-class v1 sink** (D-MS.1): one MERGE per table per flush
+  (delete + upsert + insert), `txn` app-transaction as the epoch fence carrier, `commitInfo` metadata as
+  the position carrier, delete-all TRUNCATE, checkpoints + log cleanup built-in, OPTIMIZE/VACUUM external.
+
+### 25.2 Gap status changes
+
+| ID | Change |
+|---|---|
+| DA-SINK-1 | 🔴 → re-scoped as **DA-SINK-1i** 🟡: Iceberg **mirror** mode capability-gated on an iceberg-rust delete-commit action; tracking upstream continues (D-MS.10). No longer blocks the system. |
+| DA-X-3 | 🔄 → ✅(design): neutral sink contract + per-sink realizations (research §6–§7); spec merge owed. |
+| DA-X-5 / DA-FLOW-5 | 🟥 → ✅(design): TRUNCATE is a barrier (seal→flush→clear); Delta = delete-all (metadata-only), Iceberg = overwrite-to-empty (with the mirror capability). |
+| DA-X-6 / DA-SNAP-8 | 🟥 → 🔄: PK-less tables allowed **only in `write_mode: changelog`** (D-MS.6); changelog reserved in config, implemented after the Delta mirror (D-MS.5). Dump-only + mirror still halts. |
+| DA-SINK-2 | scope widened: marker carrier is now a per-sink responsibility (`CommitMarker`). |
+| DA-DEP-1 | + **single-Arrow rule** (D-MS.14): arrow 59 workspace-wide; iceberg sink moves to iceberg 0.11 (arrow 59); FFI bridge only as a temporary escape hatch. |
+
+### 25.3 New gaps
+
+| ID | Title | Sev | Status | Note |
+|---|---|---|---|---|
+| DA-X-10 | **Sink marker disarmed by foreign commits** *(confirmed empirically 2026-09-26, delta probe P3: latest commit after OPTIMIZE carries no marker)* — an external compaction/OPTIMIZE/expire commit carries no `owner_epoch`/`committed_position`; "read the latest snapshot's marker" then returns nothing and the fence silently disarms | 🟡 | 🆕 🟥 | Applies to the Iceberg design as-is. Rule: read the marker from the **latest commit authored by this application** (walk back), or use a carrier persisted in table state (Delta `txn`). Research §8. |
+| DA-MS-1 | Delta MERGE atomic delete+upsert, idempotent replay (probes P1/P2/P5) | 🔴→✅ | ✅ | **Proven 2026-09-26** on local fs (`prototypes/delta-capability/`): one MERGE = one version; replay identical; truncate metadata-only. Real-cloud atomicity is DA-MS-4. |
+| DA-MS-2 | Delta epoch fence via `txn` (conflict on same `app_id`, survives foreign OPTIMIZE) (P3/P4) | 🟡→✅ | ✅ | **Proven 2026-09-26**: stale zombie rejected (`Concurrent transaction failed`), reloaded zombie fenced by pre-check; `txn` survives a foreign OPTIMIZE; commitInfo walk-back recovers the position. |
+| DA-MS-3 | Delta MERGE write amplification under random-key churn (P6) | 🟡 | 🔄 | **Measured 2026-09-26**: 1M rows/40 files, 5k updates — sequential keys rewrite 1 file (20k rows); random keys rewrite **all 40 files (995k rows, ≈200×)**. Not a correctness risk; a scope caveat for large tables with spread-out updates. **D-MS.15 decided (b)**: v1 = documented caveat + rows-copied/files-rewritten metrics + flush guidance; post-v1 = deletion-vector writer (own probe). |
+| DA-MS-4 | Delta commit atomicity on real S3/GCS/Azure via conditional put (P8) | 🔴 | 🆕 🧪 | Same capability class as DA-CLUS-1 (proven for the lease). |
+| DA-MS-5 | Delta schema evolution gaps (no drop/rename/widen in delta-rs) | 🟢 | ✅(design) | Soft-drop + warn (D-MS.9); widen → halt. |
+| DA-MS-7 | delta-rs 1.0 refuses ADD COLUMN on column-mapping (`name`) tables (probe P7b) | 🟡 | ✅ | Would disable the only Delta evolution op. **R-1 decided 2026-09-26**: `sink.delta.column_mapping` default `none`, `name` rejected in v1 (V-092). |
+| DA-DEP-1b | Single arrow major across sinks (P9) | 🟢 | ✅(resolution) | deltalake 1.0 + iceberg `main` resolve to one arrow/parquet 59.3; joint compile not yet run. |
+| DA-MS-6 | Spec-merge debt from the multi-sink design | 🟢 | 🆕 🔄 | System-Overview, Data-Flow Phase 3/4, Config §9.4/§9.5/§10/§13 (V-083…V-091), Schema §7, Type_Mapping Hop 3 — research §8/§9. Propose-only. |
+
+### 25.4 Next
+
+1. `prototypes/delta-capability/` — probes P1–P10 (research §10).
+2. Propose the spec patches (DA-MS-6) for approval.
+3. Implementation order: core → Delta sink (mirror) → Iceberg sink (changelog; mirror when capable).
 
