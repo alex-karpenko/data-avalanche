@@ -574,7 +574,9 @@ Sink commit error (network, commit conflict, storage/catalog error)
 │
 ├─► Retry with backoff (up to configured max_retries)
 ├─► On commit conflict (concurrent writer):
-│   ├─► Iceberg: re-load table metadata, re-check marker, retry the commit
+│   ├─► Iceberg: re-load table metadata, re-check marker, re-pin, retry the commit
+│   │   (the commit is pinned to the base the marker was read from — assert main unchanged;
+│   │    iceberg-rust's own reload-and-reapply would rebase a stale zombie: DA-X-11)
 │   └─► Delta:   re-load snapshot, re-check marker, retry the MERGE
 │       (ConcurrentTransaction on the owner app_id ⇒ another owner committed ⇒ Fenced)
 ├─► On Fenced: stop the pipeline immediately (lease lost; Clustering §19)
