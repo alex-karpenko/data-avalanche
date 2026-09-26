@@ -2971,10 +2971,8 @@ cargo test -p data-avalanche-testkit -- --test-threads=1 --nocapture
 ```
 
 Expected: the three smoke tests PASS. `rustfs_honours_conditional_writes` and
-`azurite_honours_conditional_writes` PASS (both already measured on 2026-09-26 while this plan was
-written). `real_gcs_honours_conditional_writes` is expected to PASS: GCS generation preconditions were
-proven with the native client in lease T1–T10, and `object_store` maps a 412 on Create to
-`AlreadyExists`. Record the outcome. **A failure is a finding, not an M0 blocker**: record it in Step 9
+`azurite_honours_conditional_writes` and `real_gcs_honours_conditional_writes` PASS (all three
+measured on 2026-09-26 while this plan was written; GCS against bucket `leasetest`). Record the outcome. **A failure is a finding, not an M0 blocker**: record it in Step 9
 and raise it before M2 starts.
 
 - [ ] **Step 9: Write `test-infra/README.md` with the recorded results**
@@ -3037,11 +3035,11 @@ GCS on merge. S3 and Azure need no CI secrets because they run on the emulators 
 | RustFS 1.0.0 (S3 API) | PASS | PASS | 2026-09-26 | Carries the S3 lease/CAS suite in PR CI |
 | Azurite 3.37.0 | PASS | PASS | 2026-09-26 | Carries the Azure lease/CAS suite in PR CI |
 | fake-gcs-server 1.56.1 | FAIL (plain PUT → 400 `invalid uploadType`) | not reachable | 2026-09-26 | Dropped |
-| Real GCS (`DATA_AVALANCHE_GCS_BUCKET`) | <PASS / FAIL: message> | <PASS / FAIL: message> | <date> | <carries the GCS lease/CAS suite in PR CI / escalate> |
+| Real GCS (`DATA_AVALANCHE_GCS_BUCKET`) | PASS | PASS | 2026-09-26 (bucket `leasetest`) | Carries the GCS lease/CAS suite in PR CI |
 ```
 
-Fill the real-GCS row with the Step 8 result before committing. Its `<…>` cells are recording slots
-for a measured value, not plan placeholders.
+All four rows were measured while this plan was written (2026-09-26); re-run Step 8 to confirm them
+on the implementation.
 
 - [ ] **Step 10: Add the integration job to CI** (append to `.github/workflows/ci.yml` under `jobs:`)
 

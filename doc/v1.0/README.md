@@ -27,8 +27,9 @@ This folder holds the plan for **building** v1. The design it implements is in `
   produces, the failing test, the command and expected failure, the implementation, the passing run,
   and the commit. Each plan has a *Review Focus* section: the input classes most likely to bite,
   each pinned by a test.
-- **Executor: Claude agents** (P-9). Each task is sized so that a fresh agent that sees only that task
-  can finish it and a reviewer can accept or reject it on its own.
+- **Executor: Claude agents, subagent-driven** (P-9, confirmed 2026-09-26). A fresh agent implements
+  each task and a fresh reviewer checks it before the next task starts; a whole-branch review closes
+  each milestone. Tasks are sized so an agent that sees only its task can finish it.
 - **Verification before claims.** A result that depends on an external system (a crate's behaviour,
   an emulator, a cloud) is measured, not assumed. Plans say where each number came from.
 

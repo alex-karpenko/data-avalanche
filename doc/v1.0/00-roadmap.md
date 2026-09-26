@@ -32,7 +32,7 @@ build on the interfaces that actually landed. That staging was chosen on 2026-09
 | P-6 | Deliverables | Binary, **container image**, **Kubernetes manifests + Helm chart**, **CI** (GitHub Actions), **documentation site** (MkDocs): architecture and internal flows, REST API reference, configuration reference with detailed examples, operator runbooks |
 | P-7 | S3 emulator | **RustFS** (not MinIO) |
 | P-8 | Source versions | PostgreSQL 14–18, MySQL 8.4 LTS, MariaDB 10.11 / 11.4 / 11.8 LTS. CI runs the newest of each on every change and the full matrix nightly |
-| P-9 | Plan executor | Claude agents. Tasks give exact files, full test code, commands, expected output, and one commit per task |
+| P-9 | Plan executor | Claude agents, **subagent-driven** (confirmed 2026-09-26): a fresh agent implements each task and a fresh reviewer checks it before the next starts; a whole-branch review closes each milestone. Tasks give exact files, full test code, commands, expected output, and one commit per task |
 | P-10 | GCS test backend | **A real GCS bucket**, locally and in PR CI (fake-gcs-server can't serve `object_store`, measured in M0 planning). CI needs secret `GCP_SA_KEY` and variable `DATA_AVALANCHE_GCS_BUCKET`; fork PRs skip GCS with a notice. S3 and Azure use RustFS and Azurite |
 
 ---
@@ -620,8 +620,8 @@ GTID on (MariaDB also `gtid_strict_mode=1`).
 Pinned images (tags checked against their registries on 2026-09-26): `postgres:14…18`, `mysql:8.4`,
 `mariadb:10.11/11.4/11.8`, `rustfs/rustfs:1.0.0`, `mcr.microsoft.com/azure-storage/azurite:3.37.0`;
 init tools `amazon/aws-cli:2.37.4`, `mcr.microsoft.com/azure-cli:2.90.0-azurelinux4.0`. Conditional
-create/update measured 2026-09-26: **RustFS PASS, Azurite PASS**, fake-gcs FAIL. M0 Task 12 records
-the real-GCS result (risk R-3).
+create/update measured 2026-09-26: **RustFS PASS, Azurite PASS, real GCS PASS** (via `object_store`),
+fake-gcs FAIL (risk R-3).
 
 ### 5.3 Slice-1 E2E scenarios (M6 exit, then reused as the parity suite in M7)
 
@@ -661,7 +661,7 @@ the real-GCS result (risk R-3).
 |---|---|---|---|
 | R-1 | `memberlist` 0.8.5 has never been probed (TLS, metadata size, Lifeguard, runtime-agnostic API) | medium / high | M8 opens with a probe gate; `foca` 2.0 as fallback; everything above membership consumes an owner function, so the swap is contained |
 | R-2 | `object_store` CAS behaves differently from the proven native clients (GCS generation, S3 409, Azure MI) | low / high | T1–T10 re-proof on real clouds in M2 before any lease code depends on it; the proven per-backend stores in `prototypes/lease-conformance` are the fallback |
-| R-3 | An emulator's conditional writes are incomplete | ~~medium~~ low / low | Measured 2026-09-26: RustFS and Azurite honour Create and Update preconditions; fake-gcs doesn't serve `object_store` at all, so it's replaced by a real bucket (P-10). Residual: the real-GCS row, recorded in M0 Task 12 |
+| R-3 | An emulator's conditional writes are incomplete | ~~medium~~ low / low | Measured 2026-09-26: RustFS and Azurite honour Create and Update preconditions; fake-gcs doesn't serve `object_store` at all, so it's replaced by a real bucket (P-10). Real GCS via `object_store` passed the same checks (2026-09-26). Closed |
 | R-12 | Clamped PG edge dates (Arrow min/max, Q-M5-1) are valid Parquet but some engines can't render years ±5.8M / ±294k | medium / low | M4 type round-trip reads them through DuckDB `delta_scan`; the operator docs list the clamping and the engines checked |
 | R-11 | The real GCS bucket makes PR CI depend on credentials, network and cost | low / low | Per-test unique prefixes plus cleanup, a 1-day lifecycle rule on `data-avalanche-it/`, a dedicated CI bucket and service account; fork PRs skip GCS with a notice (P-10) |
 | R-4 | File/position MySQL mode (new per P-4) has unknown resume edge cases (rotation, restart, failover invalidates positions) | medium / medium | Probe S-MY10 opens M7; a changed source server halts the pipeline (`BINLOG_SOURCE_CHANGED`, Q-M7-2) and the operator docs give the recovery (switch to `gtid` or re-snapshot) |
