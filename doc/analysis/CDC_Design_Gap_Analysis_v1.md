@@ -114,9 +114,9 @@ Everything else is 🧪 (other capability gates), 🟡/🟢 with a decided desig
 does not block starting the specification.
 
 > **v1 readiness (2026-09-26) — Iceberg sink deferred to v2.** No 🔴 remains in the sink, cluster or config
-> design; all Delta gates are proven on S3, GCS and Azure. The v1 open set is small: two **source-side
-> capability gates** (DA-SRC-10/11, 🔴 🧪 — the pgoutput and binlog client crates were never probed),
-> five v1 decisions and the System-Overview spec debt. See §22 (re-assessment) and §26.
+> design; all Delta gates are proven on S3, GCS and Azure, and the **source-side crates are proven**
+> too (DA-SRC-10/11, same day). The v1 open set: four v1 decisions + MariaDB scope confirmation, the
+> DA-SRC-12 payload guard, and the spec debt. See §22 (re-assessment) and §26.
 
 ### Counts (by status)
 
@@ -126,8 +126,8 @@ does not block starting the specification.
 |---|---|---|
 | ✅ Resolved | the large majority | Design closed by a research/spec doc or a probe. |
 | 🔄 Partial | 4 | DA-FLOW-6, DA-SNAP-7, DA-SRC-9, DA-X-8 (config residual); DA-MS-3 is a decided caveat. |
-| 🟥 Open (v1 decisions) | 5 + deferral confirmations | DA-SRC-8, DA-SYS-4, DA-SYS-7, DA-OBS-5, DA-FLOW-6 (§20). |
-| 🧪 Verify (v1) | **2** | DA-SRC-10/11 — source-side crates (§21). |
+| 🟥 Open (v1) | 5 + deferral confirmations | Decisions DA-SYS-4, DA-SYS-7, DA-OBS-5, DA-FLOW-6 (§20) + DA-SRC-12 (payload guard). DA-SRC-8 → 🔄 (feasible; confirm scope). |
+| 🧪 Verify (v1) | **0** | DA-SRC-10/11 proven 2026-09-26 (§21). |
 | ⏭ v2 | 13 | Iceberg-sink items (§26.2). |
 | 🟢 Spec-merge debt | 6 + 1 | §19.3 System-Overview S-1…S-6 (unapplied) + DA-X-8 config residual. Config (§19.1) and Data-Flow (§19.2) are applied. |
 
@@ -363,10 +363,11 @@ the MySQL path with one genuine correctness dependency.
 | DA-SRC-5 | Abandoned-slot WAL-lag guard | 🟡 | ✅ | `Operational…` G-22 — `cdc_wal_lag_bytes` always emitted; `max_wal_lag_bytes` opt-in halt. | G-22 |
 | DA-SRC-6 | MySQL purged-binlog handling | 🟡 | ✅ | `Operational…` G-26 — `binlog_purge_action: error(default)\|re_snapshot`. | G-26 |
 | DA-SRC-7 | External same-name slot collisions undetectable | 🟢 | ✅(limitation) | §5 — PG slots carry no ownership tag; mitigated by V-058 uniqueness + operator discipline; documented, not papered over. | G-15 |
-| DA-SRC-8 | MariaDB GTID dialect (`domain-server-sequence`) | 🟡 | 🟥 | `Operational…` G-38 — MariaDB accepted via the MySQL path, but the `SourcePosition` MySQL impl **must support both GTID dialects** (MariaDB domains vs MySQL UUIDs); flagged as a **new sub-research item** and the one genuine correctness dependency. | G-38 |
+| DA-SRC-8 | MariaDB GTID dialect (`domain-server-sequence`) | 🟡 | 🔄 | `Operational…` G-38 — MariaDB accepted via the MySQL path, but the `SourcePosition` MySQL impl **must support both GTID dialects** (MariaDB domains vs MySQL UUIDs); flagged as a **new sub-research item** and the one genuine correctness dependency. **2026-09-26: feasible — proven** (S-MY9, `mysql_async`): MariaDB GTID-positioned resume via `@mariadb_slave_capability`/`@slave_connect_state`/`@slave_gtid_strict_mode`; per-txn GTIDs decode exactly (last = `gtid_binlog_pos`) with a ~10-line parser. Remaining: confirm MariaDB in v1 scope (recommended). | G-38 |
 | DA-SRC-9 | TOAST re-query control-connection pool sizing | 🟢 | 🔄 | V-077 warns on `re_query`+high-volume snapshot; concrete pool sizing is an implementation detail, not yet fixed. | — |
-| DA-SRC-10 | **PG replication client crate capability** (`pgwire-replication` named in Sources_Index; never pinned, compiled or probed) | 🔴 | 🆕 🧪 | Needed: pgoutput proto v1–v4 incl. streamed in-progress txns (`Stream Start/Stop/Commit/Abort`), `Relation`/`Type`/`Truncate` messages, unchanged-TOAST marker, standby status feedback (flush-LSN ack), slot `START_REPLICATION` from an LSN, TLS, keepalives. Probe: `prototypes/source-capability/` (S-gates) against local PostgreSQL. A negative result means writing/forking the protocol layer — a plan-shaping item. **Scaffolded 2026-09-26, source-read:** the crate is **transport-only** — pgoutput decoding (Relation/Insert/Update/Delete/Truncate/Type/Origin) is a stated non-goal, so **the decoder is ours** (bounded v1 work item); `proto_version '1'` is hard-coded with no `streaming` (large txns arrive whole at commit — fine for the design, but `Data-Flow.md` Phase 2a says `'2'`). Gates S-PG0…S-PG8 in `prototypes/source-capability/README.md`. | — |
-| DA-SRC-11 | **MySQL binlog client crate capability** (`mysql-binlog-connector-rust` named in Sources_Index; never pinned, compiled or probed) | 🔴 | 🆕 🧪 | Needed: GTID-set positioning (`COM_BINLOG_DUMP_GTID`), `ROW` events with FULL image, `TABLE_MAP` optional metadata (column names/signedness, `binlog_row_metadata=FULL`), `QUERY_EVENT` (DDL classifier input), CRC32 checksums, heartbeats, MySQL 8.4 `caching_sha2_password` auth + TLS; MariaDB GTID dialect if in v1 scope (DA-SRC-8). Probe: `prototypes/source-capability/` against local MySQL (and MariaDB). **Scaffolded 2026-09-26, source-read:** two candidates probed side by side — (a) `mysql-binlog-connector-rust` 0.3.3 (TLS looks absent, claims ≤ MySQL 8.0.31, has MariaDB GTID events) vs (b) `mysql_async` 0.37.1 binlog stream (TLS ✅, active; MariaDB GTID events not found in `mysql_common`). Neither complete on paper. Gates S-MY0…S-MY9. | — |
+| DA-SRC-10 | **PG replication client crate capability** (`pgwire-replication` named in Sources_Index; never pinned, compiled or probed) | 🔴 | ✅ | Needed: pgoutput proto v1–v4 incl. streamed in-progress txns (`Stream Start/Stop/Commit/Abort`), `Relation`/`Type`/`Truncate` messages, unchanged-TOAST marker, standby status feedback (flush-LSN ack), slot `START_REPLICATION` from an LSN, TLS, keepalives. Probe: `prototypes/source-capability/` (S-gates) against local PostgreSQL. A negative result means writing/forking the protocol layer — a plan-shaping item. **Scaffolded 2026-09-26, source-read:** the crate is **transport-only** — pgoutput decoding (Relation/Insert/Update/Delete/Truncate/Type/Origin) is a stated non-goal, so **the decoder is ours** (bounded v1 work item); `proto_version '1'` is hard-coded with no `streaming` (large txns arrive whole at commit — fine for the design, but `Data-Flow.md` Phase 2a says `'2'`). Gates S-PG0…S-PG8 in `prototypes/source-capability/README.md`. **Proven 2026-09-26** (`prototypes/source-capability/`, PG 17): S-PG0…S-PG8 9/9 — transport, our pgoutput decoder (Relation/Type/Origin/Insert/Update none·K·O/Delete K·O/Truncate), unchanged-TOAST `u`, 50k-row txn whole at commit under proto v1, restart/resume at-least-once, slow consumer survives `wal_sender_timeout`, live `ALTER PUBLICATION ADD TABLE`, 18-type text decode, TLS 1.3 verify-full. **Pin `pgwire-replication =0.4.1`; the pgoutput decoder is a v1 work item.** Implementation rules: `with_wakeup_interval` ≈ status interval (idle acks otherwise lag up to 10 s); pin the walsender session (`TimeZone=UTC`, `DateStyle=ISO`, `IntervalStyle=iso_8601`, `extra_float_digits=3`). | — |
+| DA-SRC-11 | **MySQL binlog client crate capability** (`mysql-binlog-connector-rust` named in Sources_Index; never pinned, compiled or probed) | 🔴 | ✅ | Needed: GTID-set positioning (`COM_BINLOG_DUMP_GTID`), `ROW` events with FULL image, `TABLE_MAP` optional metadata (column names/signedness, `binlog_row_metadata=FULL`), `QUERY_EVENT` (DDL classifier input), CRC32 checksums, heartbeats, MySQL 8.4 `caching_sha2_password` auth + TLS; MariaDB GTID dialect if in v1 scope (DA-SRC-8). Probe: `prototypes/source-capability/` against local MySQL (and MariaDB). **Scaffolded 2026-09-26, source-read:** two candidates probed side by side — (a) `mysql-binlog-connector-rust` 0.3.3 (TLS looks absent, claims ≤ MySQL 8.0.31, has MariaDB GTID events) vs (b) `mysql_async` 0.37.1 binlog stream (TLS ✅, active; MariaDB GTID events not found in `mysql_common`). Neither complete on paper. Gates S-MY0…S-MY9. **Proven 2026-09-26** (MySQL 8.4 + MariaDB 11.4): **pin `mysql_async =0.37.1`** — S-MY0…S-MY9 10/10 (GTID resume, FULL images, optional metadata incl. UNSIGNED, DDL `QUERY_EVENT`, heartbeats via `@master_heartbeat_period`, zstd payloads, type decode, TLS 1.3, MariaDB GTID). **Reject** `mysql-binlog-connector-rust` 0.3.3: no TLS, no MariaDB GTID positioning, `is_signed` carries the *unsigned* bit, `BIGINT UNSIGNED` as `-1`. Own code: MariaDB `GTID_EVENT` (type 162) decode; payload guard (DA-SRC-12). | — |
+| DA-SRC-12 | **`mysql_async` silently drops a compressed transaction it cannot decompress** | 🟡 | 🆕 🟥 | Found 2026-09-26 (source-read, `mysql_common` 0.37.3 / `mysql_async` 0.37.1): on a zstd error `TransactionPayloadEvent::danger_decompress` returns an **empty buffer**, and `mysql_async` ignores a payload-header parse error (`/* TODO: Log the error */`) — the transaction's rows vanish with no stream error. Rare (corrupt payload / unsupported algorithm) but silent data loss. Guard (v1): validate every `TRANSACTION_PAYLOAD` ourselves — decompressed length == `uncompressed_size`, ≥ 1 inner event — and halt the pipeline on mismatch; offer the fix upstream. | — |
 
 ---
 
@@ -432,6 +433,7 @@ pinning is the remaining cross-cutting concern.
 | DA-DEP-2 | OpenDAL version exposing conditional writes | 🔴 | ✅ | Clustering §17.2 — `if_match` on writes landed late-2024/early-2025; the `iceberg-storage-opendal` transitive pin must be ≥ that, and capabilities asserted at startup (refuse to start if absent). Part of DA-CLUS-1. **2026-09-26 tidy:** superseded — DA-CLUS-1 closed with a per-backend `LeaseStore` (OpenDAL only on S3, where `if_match` exists; native SDKs for GCS/Azure); the Delta sink uses object_store conditional puts (P8), not OpenDAL. | D-5 |
 | DA-DEP-3 | `sqlparser-rs` (MySqlDialect) pin | 🟢 | ✅ | `MySQL_DDL_Classifier.md` §5 — now on a fail-soft path, so a coverage gap degrades rather than halts; de-risked. | G-19a |
 | DA-DEP-4 | `memberlist` crate (Lifeguard, TLS/QUIC transport) | 🟢 | ✅ | Sources_Index; Clustering §2 — features confirmed available. | G-23 |
+| DA-DEP-5 | Two rustls crypto providers in one process (`ring` via pgwire-replication, `aws-lc-rs` via mysql_async) | 🟢 | 🆕 ✅(rule) | Found 2026-09-26 (S-MY8 with both features built): rustls cannot pick a provider and **panics at the first TLS handshake**. Rule: install one process-wide `CryptoProvider` at startup, before any TLS client (sources, deltalake/object_store). | — |
 
 ---
 
@@ -496,7 +498,9 @@ snapshot boundary marker) and confirm it is idempotent under replay like everyth
 spec should state explicitly whether a dump-only table may be PK-less (snapshot as plain inserts,
 `identifier-field-ids` unset) or still halts for uniformity.
 
-### DA-X-7 — MariaDB GTID dialect is the one open correctness dependency in an otherwise "in-scope" claim 🟡 🟥
+### DA-X-7 — MariaDB GTID dialect is the one open correctness dependency in an otherwise "in-scope" claim 🟡 🔄
+
+> **2026-09-26:** proven feasible with `mysql_async` (S-MY9) — see DA-SRC-8; scope confirmation pending.
 *(= DA-SRC-8.)* G-38 accepts MariaDB "best-effort via the MySQL path," but the `SourcePosition` MySQL
 implementation must handle MariaDB's `domain-server-sequence` GTID, which is a *different* set algebra
 from MySQL's `server-uuid:tx`. This is flagged as a new sub-research item and is the single place where
@@ -602,7 +606,7 @@ merge/verify work). Ordered roughly by leverage.
 | DA-X-4 / DA-SYS-4 | Runtime rule for source columns colliding with reserved `_`-names. | Halt the table with a clear error by default; offer a configurable escape-prefix if demand appears. |
 | ~~DA-X-5 / DA-FLOW-5~~  | Cross-engine `TRUNCATE` → Iceberg semantics. | Map to an overwrite-to-empty (or delete-all-by-no-key snapshot boundary); define once, same for PG + MySQL; keep idempotent. **✅ Closed 2026-09-26 for v1 (Delta; TRUNCATE barrier); Iceberg → ⏭ v2.** |
 | ~~DA-X-6 / DA-SNAP-8~~  | PK-less table under dump-only modes. | Allow dump-only PK-less tables as plain inserts (no `identifier-field-ids`); they never stream/delete so the keying rule doesn't bind. (Or halt for uniformity — decide.) **✅ Closed 2026-09-26: uniform identifier rule (config §11.2).** |
-| DA-SRC-8 / DA-X-7 | MariaDB GTID dialect support in `SourcePosition`. | Schedule the sub-research; detect MariaDB at connect and select the GTID parser; otherwise narrow v1 scope to MySQL-only. |
+| DA-SRC-8 / DA-X-7 | MariaDB GTID dialect support in `SourcePosition`. | Schedule the sub-research; detect MariaDB at connect and select the GTID parser; otherwise narrow v1 scope to MySQL-only. **2026-09-26: proven feasible (S-MY9) — recommendation: keep MariaDB in v1.** |
 | DA-CFG-4 | External secret-manager integration. | Declare out of scope for v1; the file-content-rotation path (sidecar writes the file) is the supported pattern. |
 | DA-DEDUP-7 | Cross-table atomic visibility. | Keep out of scope; document the per-table-only guarantee; reopen only if a multi-table-commit catalog (Nessie) becomes a requirement. |
 | DA-CLUS-12 | `kubernetes` lock_backend. | Defer; `storage` CAS lease is the v1 backend (already enforced by V-075). |
@@ -630,12 +634,12 @@ design, not just the code.**
 | ⏭ v2 · DA-TYPE-5 | `FixedSizeBinary(16)` → Iceberg `uuid` annotation mechanism. | iceberg-rust 0.9.0. | UUID columns fall back to `fixed(16)`/`binary`; cosmetic, low risk. |
 | ⏭ v2 · DA-SINK-10 | Compaction / rewrite API availability. | iceberg-rust (future). | Built-in maintenance stays deferred (already external for v1); no v1 impact. |
 | DA-MS-1…4 ✅ closed 2026-09-26 | Delta sink: MERGE atomicity + idempotent replay, `txn` epoch fence, cost model, commit atomicity on **real S3, GCS, Azure** (P1–P10). | delta-rs 1.0.0 / object_store 0.13 | — (proven; `prototypes/delta-capability/`) |
-| 🆕 DA-SRC-10 | PG logical-replication client: pgoutput v1–v4 (streamed in-progress txns), Relation/Type/Truncate, unchanged-TOAST, standby-status flush-LSN ack, TLS. | `pgwire-replication` (unpinned) | Write/fork the pgoutput protocol layer over `tokio-postgres` replication mode — a large v1 work item. |
-| 🆕 DA-SRC-11 | MySQL binlog client: GTID-set dump, FULL row images, TABLE_MAP optional metadata, QUERY_EVENT, CRC32, heartbeats, `caching_sha2_password` + TLS; MariaDB GTID if in scope. | `mysql-binlog-connector-rust` (unpinned) | Fork/extend the crate or implement the binlog protocol; or narrow v1 to PG-only. |
+| ✅ DA-SRC-10 (S-PG0…8, 2026-09-26) | PG logical-replication client: pgoutput v1–v4 (streamed in-progress txns), Relation/Type/Truncate, unchanged-TOAST, standby-status flush-LSN ack, TLS. | `pgwire-replication` (unpinned) | Write/fork the pgoutput protocol layer over `tokio-postgres` replication mode — a large v1 work item. |
+| ✅ DA-SRC-11 (S-MY0…9, 2026-09-26; `mysql_async`) | MySQL binlog client: GTID-set dump, FULL row images, TABLE_MAP optional metadata, QUERY_EVENT, CRC32, heartbeats, `caching_sha2_password` + TLS; MariaDB GTID if in scope. | `mysql-binlog-connector-rust` (unpinned) | Fork/extend the crate or implement the binlog protocol; or narrow v1 to PG-only. |
 
-> **2026-09-26 — v1 view.** With the Iceberg sink in v2, the only open v1 gates are the **source-side
-> crates** (DA-SRC-10/11), probed by `prototypes/source-capability/`. Everything Iceberg below is the v2
-> gate list.
+> **2026-09-26 — v1 view.** With the Iceberg sink in v2, the only v1 gates were the **source-side
+> crates** (DA-SRC-10/11) — **both proven the same day** (`prototypes/source-capability/`). No v1 🧪
+> gate remains. Everything Iceberg below is the v2 gate list.
 
 A single **iceberg-rust capability probe** (one integration test exercising equality-delete
 sequencing, snapshot-summary persistence, schema-evolution ops, and the uuid annotation against the
@@ -652,8 +656,8 @@ sixth (and the top blocker).
 
 > **v1 re-assessment (2026-09-26; Iceberg sink deferred to v2) — close, not yet.** The sink, the lease and
 > the config/schema/snapshot design are proven or specified. Before the v1 implementation plan:
-> (1) **source-side capability gates** DA-SRC-10/11 — the one remaining redesign risk
-> (`prototypes/source-capability/`); (2) **v1 decisions** — DA-SRC-8 (MariaDB in v1, informed by (1)),
+> (1) ~~source-side capability gates DA-SRC-10/11~~ ✅ proven the same day (the pgoutput decoder is
+> ours — a bounded v1 work item); (2) **v1 decisions** — DA-SRC-8 (MariaDB in v1, informed by (1)),
 > DA-SYS-4 (reserved-column collision), DA-FLOW-6 (PG DROP), DA-SYS-7 (Iceberg handling in v1),
 > DA-OBS-5 (lag target — non-blocking); confirm the §20 deferrals; (3) **spec debt** — §19.3
 > System-Overview S-1…S-6 (still unapplied) + the DA-X-8 config residual. Details: §26. The verdict
@@ -1360,20 +1364,26 @@ research, the iceberg-capability probes (G1–G2c) and the V-115/V-116 gates car
 
 | ID | Title | Sev | Status | Note |
 |---|---|---|---|---|
-| DA-SRC-10 | PG replication client crate capability (`pgwire-replication`) | 🔴 | 🆕 🧪 | Never pinned, compiled or probed. The sink side had three probe rounds; the source side had none. Probe: `prototypes/source-capability/` S-gates. |
-| DA-SRC-11 | MySQL binlog client crate capability (`mysql-binlog-connector-rust`) | 🔴 | 🆕 🧪 | Same. Also decides DA-SRC-8 (MariaDB GTID dialect) in practice. |
+| DA-SRC-10 | PG replication client crate capability (`pgwire-replication`) | 🔴 | ✅ | Never pinned, compiled or probed. The sink side had three probe rounds; the source side had none. Probe: `prototypes/source-capability/` S-gates. **Proven same day** — S-PG0…8 9/9; decoder is ours. |
+| DA-SRC-11 | MySQL binlog client crate capability (`mysql-binlog-connector-rust`) | 🔴 | ✅ | Same. Also decides DA-SRC-8 (MariaDB GTID dialect) in practice. **Proven same day with `mysql_async`** (S-MY0…9 10/10); `mysql-binlog-connector-rust` rejected. |
 | DA-SYS-7 | v1 scope statement + v1 handling of `sink.type: iceberg` | 🟢 | 🆕 🟥 | Recommendation: keep the enum, refuse at start naming v2 (§20). |
+| DA-SRC-12 | `mysql_async` silently drops an undecompressable compressed transaction | 🟡 | 🆕 🟥 | Guard in our source: validate each `TRANSACTION_PAYLOAD`, halt on mismatch. |
+| DA-DEP-5 | Two rustls crypto providers → panic at first handshake | 🟢 | 🆕 ✅(rule) | Install a process-wide `CryptoProvider` at startup. |
 
 ### 26.4 What stands between here and the v1 implementation plan
 
-1. **Source-side gates** DA-SRC-10/11 — `prototypes/source-capability/` against local PostgreSQL /
-   MySQL (/ MariaDB) containers. The only item whose negative result reshapes the plan.
-2. **v1 decisions** (§20): DA-SRC-8 MariaDB in v1 (after 1), DA-SYS-4 reserved-column collision,
+1. ~~**Source-side gates** DA-SRC-10/11~~ ✅ 2026-09-26 — PG 9/9, MySQL/MariaDB 10/10
+   (`prototypes/source-capability/`). Pins: `pgwire-replication =0.4.1` (+ our pgoutput decoder),
+   `mysql_async =0.37.1` (+ MariaDB GTID decode, payload guard DA-SRC-12). Plan-shaping result: the
+   **pgoutput decoder** is a v1 work item (bounded; probe version ~150 lines).
+2. **v1 decisions** (§20): DA-SRC-8 MariaDB in v1 (now proven feasible — recommend in), DA-SYS-4 reserved-column collision,
    DA-FLOW-6 PG DROP reaction, DA-SYS-7 Iceberg handling, DA-OBS-5 lag target (non-blocking); confirm
    the deferrals DA-CFG-4, DA-CLUS-12, DA-CLUS-13, DA-SINK-8, DA-DEDUP-7.
 3. **Spec debt** (needs approval): §19.3 System-Overview S-1…S-6 (never applied — the Open Questions
    block and the Iceberg-only framing are stale) + the DA-X-8 residual in `Configuration_Specification.md`
-   (~606, ~960–965, ~1553) + the DA-SYS-7 scope statement.
+   (~606, ~960–965, ~1553) + the DA-SYS-7 scope statement + two `Data-Flow.md` Phase 2a source
+   details from the probes: `proto_version '2'` → `'1'` (what the pinned crate sends; identical
+   messages without `streaming`) and the pinned walsender session options (F-PG-session).
 
 Not blocking: DA-MS-3 (accepted cost caveat, D-MS.15), DA-SRC-9 (implementation detail), DA-SNAP-7
 (retention coupling — designed; the tuning is an operational note), the optional ADLS Gen2 re-run of P8.
