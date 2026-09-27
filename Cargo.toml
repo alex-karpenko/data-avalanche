@@ -37,3 +37,4 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["s
 rustls-pki-types = { version = "1", features = ["std"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 tempfile = "3"
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
