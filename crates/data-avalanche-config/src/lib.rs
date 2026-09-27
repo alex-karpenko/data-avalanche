@@ -58,3 +58,13 @@ pub use resolved::{Pipeline, ResolvedConfig};
 pub use secret::Secret;
 pub use template::{Env, ProcessEnv};
 pub use units::{ByteSize, HostPort};
+
+// Every public type is reachable from the crate root (API convention): the resolved model, the raw
+// model and the config enums by glob; the rest by name.
+pub use enums::*;
+pub use raw::*;
+pub use resolved::*;
+
+pub use material::PemKind;
+pub use merge::Merge;
+pub use template::{Expanded, TemplateError, expand};
