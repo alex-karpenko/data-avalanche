@@ -73,10 +73,14 @@ impl<T> Clone for Leaf<T> {
 }
 
 impl<T> fmt::Debug for Leaf<T> {
+    /// Never prints the text: a leaf can hold a secret's literal value (before it becomes a
+    /// [`crate::secret::Secret`]), and `Debug` output ends up in test failure messages, panics
+    /// and `{:#?}`-formatted diagnostics dumps alike. Only the location survives, e.g.
+    /// `Leaf(***@12:5)` or `Leaf(***)` with no location.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.loc {
-            Some(loc) => write!(f, "{:?}@{}:{}", self.text, loc.line, loc.column),
-            None => write!(f, "{:?}", self.text),
+            Some(loc) => write!(f, "Leaf(***@{}:{})", loc.line, loc.column),
+            None => write!(f, "Leaf(***)"),
         }
     }
 }
@@ -116,4 +120,26 @@ where
     T: Deserialize<'de>,
 {
     Option::<T>::deserialize(d).map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_never_prints_the_text() {
+        let with_loc = Leaf::<String>::with_loc(
+            "s3cr3t",
+            Loc {
+                line: 12,
+                column: 5,
+            },
+        );
+        assert_eq!(format!("{with_loc:?}"), "Leaf(***@12:5)");
+        assert!(!format!("{with_loc:?}").contains("s3cr3t"));
+
+        let without_loc = Leaf::<String>::new("s3cr3t");
+        assert_eq!(format!("{without_loc:?}"), "Leaf(***)");
+        assert!(!format!("{without_loc:?}").contains("s3cr3t"));
+    }
 }
