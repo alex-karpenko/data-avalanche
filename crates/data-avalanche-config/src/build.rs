@@ -1084,10 +1084,15 @@ fn hive(h: &RawHive, at: &At, db: Option<&str>, ctx: &mut Ctx) -> Option<Hive> {
     let tls = h.tls.clone().unwrap_or_default();
     let tls_at = at.key("tls");
     let enabled = or(ctx, &tls.enabled, &tls_at, "enabled", false);
-    // Unlike `globals.api.tls`/`memberlist.tls`, the spec's §11 Phase 2 bullet does not gate
-    // `hive.tls.ca` on `tls.enabled` — it stays unconditional (in practice unreachable: V-115
-    // refuses any `hive` block in Phase 1, before Phase 2 ever reads a file here).
-    let ca = pem(ctx, &tls.ca, &tls_at, "ca", PemKind::Certificates);
+    // §11 Phase 2 / V-068: `tls.ca` is only in effect when `tls.enabled` is `true`; an unused
+    // reference is never read. Same gate as `globals.api.tls`/`memberlist.tls` above — in practice
+    // unreachable today (V-115 refuses any `hive` block in Phase 1, before Phase 2 ever reads a
+    // file here), but kept for when V-115 lifts.
+    let ca = if enabled == Some(true) {
+        pem(ctx, &tls.ca, &tls_at, "ca", PemKind::Certificates)
+    } else {
+        Some(None)
+    };
     let database = opt(ctx, &h.database, at, "database");
     let auth = auth?;
     let (credentials, kerberos) = match auth {
@@ -1288,4 +1293,54 @@ pub fn build(
         globals: globals??,
         pipelines: by_id,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    fn hive_at() -> At {
+        At::pipeline(
+            "p",
+            YamlPath::root()
+                .key("pipelines")
+                .key("p")
+                .key("sink")
+                .key("iceberg")
+                .key("catalog")
+                .key("hive"),
+        )
+    }
+
+    fn hive_with_tls(enabled: &str) -> RawHive {
+        RawHive {
+            url: Some(Leaf::new("thrift://hms:9083")),
+            tls: Some(RawHiveTls {
+                enabled: Some(Leaf::new(enabled)),
+                ca: Some(Leaf::new("/nonexistent/ca.pem")),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// V-068 / §11 Phase 2: `hive.tls.ca` is only in effect when `tls.enabled` is `true`, the same
+    /// gate `api.tls`/`memberlist.tls` use. Unreachable via `load_str` today (V-115 refuses `hive`
+    /// in Phase 1), so exercised directly against `hive()`.
+    #[test]
+    fn hive_tls_ca_is_not_read_when_tls_is_disabled() {
+        let env: BTreeMap<String, String> = BTreeMap::new();
+        let mut ctx = Ctx::resolving(&env);
+        hive(&hive_with_tls("false"), &hive_at(), None, &mut ctx);
+        assert!(ctx.report().is_ok(), "{:#?}", ctx.report());
+    }
+
+    #[test]
+    fn hive_tls_ca_is_read_when_tls_is_enabled() {
+        let env: BTreeMap<String, String> = BTreeMap::new();
+        let mut ctx = Ctx::resolving(&env);
+        hive(&hive_with_tls("true"), &hive_at(), None, &mut ctx);
+        assert_eq!(ctx.report().errors[0].rule, "V-068");
+    }
 }
