@@ -68,3 +68,4 @@ pub use resolved::*;
 pub use material::PemKind;
 pub use merge::Merge;
 pub use template::{Expanded, TemplateError, expand};
+pub use units::{ByteSizeError, HostPortError};
