@@ -231,6 +231,13 @@ pub fn cases() -> Vec<Case> {
         case(PARSE, Error, "glue without name", || {
             pg_iceberg().set("/pipelines/p/sink/iceberg/catalog", json!({"glue": {}}))
         }),
+        // F4: a required field that resolves to empty is an error, not just an absent one.
+        case(PARSE, Error, "glue name resolves empty", || {
+            pg_iceberg().set(
+                "/pipelines/p/sink/iceberg/catalog",
+                json!({"glue": {"name": ""}}),
+            )
+        }),
         case(PARSE, Error, "hive without url", || {
             pg_iceberg().set("/pipelines/p/sink/iceberg/catalog", json!({"hive": {}}))
         }),

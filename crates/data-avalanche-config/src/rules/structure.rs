@@ -120,8 +120,18 @@ fn pipeline(name: &str, p: &RawPipeline, ctx: &mut Ctx) {
 /// raw model keeps every field optional so that layers can merge, so they are checked after the
 /// merge and reported as `PARSE`.
 fn required_fields(p: &RawPipeline, at: &At, ctx: &mut Ctx) {
+    // F4: spec §11 says any required value that resolves to empty is an error, not just an absent
+    // one (`name: ""` must fail exactly as an absent `name` would). Same rule as `missing()`
+    // (`rules::missing`), generalized: these fields aren't all `Leaf<String>`, and in the
+    // structural pass an unresolved template isn't empty, so it can't yet fail here.
     fn require<T>(ctx: &mut Ctx, at: &At, key: &str, leaf: &Option<Leaf<T>>) {
-        if leaf.is_none() {
+        let missing = match leaf {
+            None => true,
+            Some(l) => ctx
+                .text(l, &at.key(key))
+                .is_some_and(|t| t.trim().is_empty()),
+        };
+        if missing {
             ctx.error(
                 PARSE,
                 &at.key(key),
