@@ -1,4 +1,5 @@
 use std::fmt;
+use std::str::FromStr;
 
 use thiserror::Error;
 
@@ -137,6 +138,15 @@ impl Decimal {
     }
 }
 
+impl FromStr for Decimal {
+    type Err = DecimalError;
+
+    /// Same as [`Decimal::parse`].
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+    }
+}
+
 impl fmt::Display for Decimal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let sign = if self.unscaled < 0 { "-" } else { "" };
@@ -179,6 +189,14 @@ mod tests {
         for s in ["-12.340", "100", "0.5", "-0.5", "123456.000001"] {
             assert_eq!(Decimal::parse(s).unwrap().to_string(), s);
         }
+    }
+
+    #[test]
+    fn from_str_is_parse() {
+        let d: Decimal = "-12.340".parse().unwrap();
+        assert_eq!(d, Decimal::parse("-12.340").unwrap());
+        assert_eq!(d.to_string(), "-12.340");
+        assert_eq!("NaN".parse::<Decimal>(), Decimal::parse("NaN"));
     }
 
     #[test]

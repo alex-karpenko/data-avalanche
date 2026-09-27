@@ -5,6 +5,10 @@ use thiserror::Error;
 
 use crate::MAX_DECIMAL_PRECISION;
 
+/// Deepest `list<…>` nesting the grammar accepts. Config input is operator-written, so the recursive
+/// parser needs a bound; real schemas nest two or three levels at most.
+pub const MAX_LIST_DEPTH: usize = 8;
+
 /// Sink-neutral logical type — the grammar of `tables.column_type_overrides` (config §9.3).
 ///
 /// This is *not* the grammar of the `data-avalanche.logical` Arrow field tag
@@ -42,14 +46,14 @@ impl FromStr for LogicalType {
     type Err = LogicalTypeError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        parse_type(s.trim()).map_err(|reason| LogicalTypeError {
+        parse_type(s.trim(), 0).map_err(|reason| LogicalTypeError {
             input: s.to_string(),
             reason,
         })
     }
 }
 
-fn parse_type(s: &str) -> Result<LogicalType, String> {
+fn parse_type(s: &str, depth: usize) -> Result<LogicalType, String> {
     let simple = match s {
         "bool" => Some(LogicalType::Bool),
         "int16" => Some(LogicalType::Int16),
@@ -96,12 +100,18 @@ fn parse_type(s: &str) -> Result<LogicalType, String> {
         return Ok(LogicalType::Decimal { precision, scale });
     }
     if let Some(args) = s.strip_prefix("list") {
+        if depth == MAX_LIST_DEPTH {
+            return Err(format!("list nesting is deeper than {MAX_LIST_DEPTH}"));
+        }
         let inner = args
             .trim()
             .strip_prefix('<')
             .and_then(|a| a.strip_suffix('>'))
             .ok_or("list needs <T>")?;
-        return Ok(LogicalType::List(Box::new(parse_type(inner.trim())?)));
+        return Ok(LogicalType::List(Box::new(parse_type(
+            inner.trim(),
+            depth + 1,
+        )?)));
     }
     Err("unknown type".to_string())
 }
@@ -214,6 +224,18 @@ mod tests {
         ] {
             assert!(s.parse::<LogicalType>().is_err(), "{s:?}");
         }
+    }
+
+    #[test]
+    fn bounds_list_nesting() {
+        let nested = |n: usize| format!("{}int64{}", "list<".repeat(n), ">".repeat(n));
+        assert!(nested(MAX_LIST_DEPTH).parse::<LogicalType>().is_ok());
+        let err = nested(MAX_LIST_DEPTH + 1)
+            .parse::<LogicalType>()
+            .unwrap_err();
+        assert!(err.reason.contains("deeper than 8"), "{err}");
+        // Far past the limit: rejected without exhausting the stack.
+        assert!(nested(100_000).parse::<LogicalType>().is_err());
     }
 
     #[test]
