@@ -1,5 +1,5 @@
 ---
-updated: 2026-09-26
+updated: 2026-09-27
 domain: Architecture
 status: Specification (supersedes the Configuration_file_model.md draft)
 tags: [architecture, configuration, spec, validation, multi-sink, iceberg, delta-lake]
@@ -618,7 +618,9 @@ names from `id`, hyphens will be translated to underscores (PG slot names forbid
 
 ### 9.2 `source`
 
-Common fields plus exactly one engine block (`postgres` xor `mysql`), selected by `type`.
+Common fields plus exactly one engine block (`postgres` xor `mysql`), selected by `type`. Every
+`mysql` field has a default, so an absent `mysql` block means all defaults; `postgres` has required
+fields (`publication`, `slot`), so its block must be present (V-001).
 
 ```yaml
 source:
@@ -697,7 +699,7 @@ tables:
 
 | Field | Type | Required | Default | Mutability | Notes |
 |---|---|---|---|---|---|
-| `include` | list<glob> | yes | — | PR (cond.) | Non-empty (V-007). **PostgreSQL:** globs over `schema.table`, schema **mandatory** (e.g. `public.*`, `data.orders`). **MySQL:** bare table-name globs, **no** `schema.`/`database.` prefix — the database is fixed by `source.db` (e.g. `orders`, `payment_*`, `*`); a prefix is a validation error (V-064). Resolved against the live schema at (re)start. **Conditional:** PR when the edit changes the **resolved** table set — added tables go through Phase-0 snapshot evaluation, removed tables are drained and the publication is updated; a no-op when the resolved set is unchanged. |
+| `include` | list<glob> | yes | — | PR (cond.) | Non-empty (V-007). **PostgreSQL:** globs over `schema.table`, schema **mandatory** (e.g. `public.*`, `data.orders`; V-117). **MySQL:** bare table-name globs, **no** `schema.`/`database.` prefix — the database is fixed by `source.db` (e.g. `orders`, `payment_*`, `*`); a prefix is a validation error (V-064). Resolved against the live schema at (re)start. **Conditional:** PR when the edit changes the **resolved** table set — added tables go through Phase-0 snapshot evaluation, removed tables are drained and the publication is updated; a no-op when the resolved set is unchanged. |
 | `exclude` | list<glob> | no | `[]` | PR (cond.) | Subtracted from the include set; same per-engine form as `include` (PG `schema.table`, MySQL bare table name). Same conditional rule: restart only when the resolved set actually changes. |
 | `snapshots.mode` | enum | no | `never` | PR | `never`\|`initial`\|`always`\|`dump_always`\|`dump_initial` (semantics in `System-Overview.md`). |
 | `snapshots.parallelism` | integer | no | `1` | R | ≥ 1 (V-027). Concurrent snapshot jobs. **> 4 warns** (V-038): each PG snapshot job uses ≥ 3 connections. The limit is read by the snapshot scheduler at job-launch time; a change affects only **future** scheduling — in-flight and already-queued jobs are unaffected — so it applies in place. Implies an adjustable permit count, not a pool sized once at pipeline start. |
@@ -746,7 +748,7 @@ sink:
 | `max_transaction_buffer_bytes` | ByteSize | no | `1GiB` | R | Absolute per-transaction memory ceiling. Splitting disabled ⇒ reaching it **halts the pipeline** (never OOMs the worker); splitting enabled ⇒ an early flush trigger. ≥ 16 MiB (V-110). |
 | `buffer_capacity_rows` | integer | no | `200000` | R | Capacity of the bounded inter-task channels (G-27). All channels are bounded; on persistent sink failure the pipeline is **DEGRADED** — retries with backoff and stops consuming once buffers fill. ≥ 1 (V-111). |
 | `metrics.per_table` | bool | no | `false` | R | Add the `table` label to per-table metrics (G-33). Default labels are `{pipeline, source_host, source_db}`; enabling this multiplies series count on large fleets. |
-| `iceberg` / `delta` | object | exactly one, matching `type` | — | PR | Format block (§9.4.2 / §9.4.3). The foreign block is forbidden (V-084). |
+| `iceberg` / `delta` | object | the one matching `type`; `delta` may be omitted | — | PR | Format block (§9.4.2 / §9.4.3). Every `delta` field has a default, so an absent `delta` block means all defaults; `iceberg` needs its `catalog`, so its block must be present. The foreign block is forbidden (V-084). |
 
 > **CHANGE (2026-09-26, multi-sink):** `sink.strategy` moved to `sink.iceberg.strategy`; the
 > pipeline-level `catalog` moved to `sink.iceberg.catalog` (§9.5); `catalog.schema_evolution` moved to
@@ -792,7 +794,7 @@ Settings apply when the sink **creates** a table; existing tables keep their pro
 | `checkpoint_interval` | integer | no | `10` | PR (new tables) | → `delta.checkpointInterval`. ≥ 1. |
 | `log_retention` | Duration | no | `30d` | PR (new tables) | → `delta.logRetentionDuration`. Expired-log cleanup runs as a post-commit hook (format metadata housekeeping). |
 | `timestamp_ntz_as` | enum `timestamp_ntz`\|`timestamp`\|`string` | no | `timestamp_ntz` | PR (new tables) | Delta type for source `timestamp without time zone` columns (DA-MS-8). `timestamp_ntz`: exact semantics, but the table is created at **reader v3 / writer v7** (`timestampNtz` table feature) — engines without table-feature support cannot read it. `timestamp`: the wall-clock value stored as a UTC instant; keeps the protocol at reader 1 / writer 2, loses the no-time-zone marker. `string`: `YYYY-MM-DD HH:MM:SS.ffffff`. A per-column `tables.column_type_overrides` entry takes precedence. Existing tables keep their column type. V-114. |
-| `table_properties` | map<string,string> | no | `{}` | PR (new tables) | Passthrough of allow-listed `delta.*` table properties (V-093). |
+| `table_properties` | map<string,string> | no | `{}` | PR (new tables) | Passthrough of table properties. `delta.*` keys must be on the allow-list (V-093): `delta.dataSkippingNumIndexedCols`, `delta.dataSkippingStatsColumns`, `delta.deletedFileRetentionDuration`, `delta.targetFileSize`, `delta.tuneFileSizesForRewrites`, `delta.checkpoint.writeStatsAsJson`, `delta.checkpoint.writeStatsAsStruct`. Keys without the `delta.` prefix pass through unchanged. |
 | `catalog.type` | enum `none`\|`glue`\|`unity`\|`hive` | no | `none` | PR | Catalog **registration** of Delta tables. v1 implements `none` (path-based tables); other values are reserved (V-088). |
 
 Delta maintenance in v1: checkpoints + expired-log cleanup are built-in (post-commit hooks);
@@ -900,7 +902,7 @@ state:
 | Field | Type | Required | Default | Mutability | Notes |
 |---|---|---|---|---|---|
 | `bucket` | string | conditional | `sink.bucket` | PR | If omitted, state co-locates with `sink` (under `.pipeline-state`, §10). Mandatory only if you split state from sink and it is not set in `defaults`. |
-| `prefix` | string | no | pipeline `id` | PR | Prefixed by `defaults.state.prefix` when that is defined (§10). |
+| `prefix` | string | no | pipeline `id` | PR | For an explicit location (`state.bucket` set on the pipeline or in `defaults`), prefixed by `defaults.state.prefix` when that is defined (§10). `defaults.state.prefix` is a **parent** prefix: a pipeline does not inherit it as its own `prefix`, and it has no effect (and no warning) when state co-locates with the sink. |
 
 Relocating state on a running pipeline (PR) is dangerous (the new location has no history);
 treat such a change as effectively a re-seed and review before applying.
@@ -957,6 +959,8 @@ engines and consistent with `Data-Flow.md`'s `TableRef { schema, name }` and
 # explicit pipeline state location:
 <state.bucket>/[<defaults.state.prefix>/]<state.prefix>/...
 ```
+`defaults.state.prefix` is the parent segment of the explicit form only; the co-located form ignores
+it.
 The location is already scoped to a single pipeline (`sink.prefix` / `state.prefix` default to
 the pipeline `id`, which is unique per V-056), so the internal layout from `Data-Flow.md`
 (`pipeline-state.json`, `replication/slot.json` + `position.json`, `snapshots/<schema>.<table>.json`)
@@ -1145,13 +1149,18 @@ report (`config`-level vs a named `pipeline`) and point the operator to the righ
 `pipeline`-locus **error still rejects the whole config** — locus is diagnostic, not a blast
 radius. `reload` locus marks a rule that can only fire on reload.
 
+A diagnostic that no V-rule covers carries `PARSE` or `TYPE` in place of a rule ID. `PARSE` covers
+YAML syntax or structure, an unknown key, and a required field with no rule of its own. `TYPE`
+covers a scalar that does not coerce to its field's type where no V-rule covers the field. Both are
+errors.
+
 ### 13.1 Structure & mutual exclusion
 
 | ID | Path / Scope | Rule | Severity | Locus |
 |---|---|---|---|---|
-| V-001 | `source` | Exactly one engine block (`postgres` xor `mysql`) after merge, matching `type`. | error | pipeline |
+| V-001 | `source` | After merge, the engine block matching `type` is present when that engine has required fields: `postgres` must be present; an absent `mysql` block means all defaults. (The foreign block: V-003.) | error | pipeline |
 | V-002 | `sink.iceberg.catalog` | Exactly one sub-block (`glue`/`hive`/`rest`); if `type` is set it must equal the present block. | error | pipeline |
-| V-084 | `sink.{iceberg,delta}` | Exactly the format block matching `sink.type` after merge; the foreign block is forbidden. | error | pipeline |
+| V-084 | `sink.{iceberg,delta}` | After merge, the format block matching `sink.type` is present when that format has required fields: `iceberg` must be present; an absent `delta` block means all defaults. The foreign block is forbidden. | error | pipeline |
 | V-003 | `source.{postgres,mysql}` | Engine block present must match `type`; the foreign engine block is forbidden. | error | pipeline |
 | V-004 | top | `pipelines` key present (may be `{}`). | error | config |
 | V-005 | top | `globals` present. | error | config |
@@ -1230,11 +1239,12 @@ radius. `reload` locus marks a rule that can only fire on reload.
 | V-036 | `sink.flush.seconds = null` | With at least one other trigger set (time-based disabled). | warning | pipeline |
 | V-037 | `sink.flush.seconds` | 0 < seconds < 5 (write amplification). | warning | pipeline |
 | V-038 | `tables.snapshots.parallelism` | > 4 (connection budget). | warning | pipeline |
+| V-117 | `tables.include`/`exclude` globs, when `source.type = postgres` | Must be `schema.table`: one `.` between a non-empty schema part and a non-empty table part (globs allowed within each part, e.g. `public.*`, `*.orders`). | error | pipeline |
 | V-064 | `tables.include`/`exclude` globs and `snapshots.overrides` keys, when `source.type = mysql` | Must be bare table names — no `.` namespace prefix (the database is fixed by `source.db`). | error | pipeline |
 | V-085 | `sink.iceberg.strategy` | Only meaningful with `write_mode: mirror`. | error | pipeline |
 | V-086 | `tables.partitioning` transforms | Each transform supported by the pipeline's sink (Delta v1: `identity` only). Active once `tables.partitioning` is promoted from §16. | error | pipeline |
 | V-087 | `tables.column_type_overrides` values | Logical type mappable by the pipeline's sink. | error | pipeline |
-| V-093 | `sink.delta.table_properties` keys | Only allow-listed `delta.*` keys; `delta.columnMapping.mode` / `delta.enableDeletionVectors` / `delta.appendOnly` are managed by the sink and forbidden here. | error | pipeline |
+| V-093 | `sink.delta.table_properties` keys | A `delta.*` key must be on the §9.4.3 allow-list (7 keys); any other `delta.*` key is an error, including `delta.columnMapping.mode` / `delta.enableDeletionVectors` / `delta.appendOnly`, which the sink manages. Keys without the `delta.` prefix pass through. | error | pipeline |
 | V-096 | `globals.cluster.discovery = dns` | Requires `discovery_dns_name`. | error | config |
 | V-098 | `globals.tracing.sample_ratio > 0` without `otlp_endpoint` | Sampling configured but tracing disabled. | warning | config |
 | V-103 | `source.postgres.slot_management = require_existing` | Requires `auto_cleanup = false` (the app must not drop a slot it did not create). | error | pipeline |
@@ -1529,6 +1539,12 @@ Every deviation, so nothing is silent:
     collision rule and its §11.2 start-time check (D-V1.1); `sink.type: iceberg` accepted by V-083 but
     refused at pipeline start in v1 (D-V1.4, new §11.2 sink row); the stale `pipelines/<id>/` state
     references removed (§10 note, `id` field text, §17 — DA-X-8).
+
+22. **M1 planning (2026-09-27, `v1.0/00-roadmap.md` §7 S-H…S-L)** — `PARSE` / `TYPE` for diagnostics
+    no V-rule covers (§13 intro); the V-093 allow-list named (§9.4.3); `defaults.state.prefix`
+    defined as a parent prefix for explicit state locations only (§9.6, §10); an absent `mysql` /
+    `delta` block means all defaults (V-001, V-084, §9.2, §9.4); new rule **V-117** (PostgreSQL
+    `include`/`exclude` patterns are `schema.table`).
 
 None of these change the **decided** catalog-auth schema (hive Thrift `none/ldap/kerberos`;
 rest HTTP `none/bearer/oauth2/sigv4`) — those are reproduced verbatim from
