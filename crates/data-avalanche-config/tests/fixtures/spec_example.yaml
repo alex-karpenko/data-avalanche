@@ -1,0 +1,126 @@
+config_version: 1
+
+globals:
+  cloud: aws                                   # aws (default) | google | azure
+  state:
+    bucket: ${ACCOUNT_ID}-cdc-app-state
+    prefix: cdc-app
+  api:
+    address: 0.0.0.0:8080
+    auth: jwt
+    jwt:
+      issuer: https://idp.example.com/realms/cdc
+      audience: cdc-management-api
+      jwks_url: https://idp.example.com/realms/cdc/protocol/openid-connect/certs
+      roles_claim: realm_access.roles
+    tls:
+      enabled: true
+      cert: /etc/cdc/tls/api.crt
+      key: ${API_TLS_KEY}
+  log:
+    level: info                                # rust module syntax allowed: info,rustcdc::sink=debug
+    format: json
+  cluster:
+    tokens: 128                                # must match cluster-wide
+    lease_duration: 15s                        # must match cluster-wide (anchored, V-094)
+    lease_renewal_interval: 5s                 # ≤ lease_duration / 3 (V-073)
+    discovery: dns
+    discovery_dns_name: cdc-headless.svc.cluster.local
+    memberlist:
+      join_members:
+        - cdc-headless.svc.cluster.local:7946
+      bind_port: 7946
+      advertise_port: 7946
+      gossip_interval: 200ms
+      probe_interval: 1s
+      probe_timeout: 500ms
+      push_pull_interval: 30s
+      dead_node_reclaim_time: 30s
+      compression_enabled: true
+      tls:
+        enabled: true
+        cert: /etc/cdc/tls/gossip.crt
+        key: ${GOSSIP_TLS_KEY}
+        ca: /etc/cdc/tls/gossip-ca.crt
+  tracing:
+    otlp_endpoint: http://otel-collector.observability:4317
+    sample_ratio: 0.05
+
+defaults:
+  source:
+    type: postgres
+    port: 5432
+    ssl_mode: require
+    timeouts: { connect: 10s, command: 30s, snapshot: 6h }
+    postgres:
+      auto_cleanup: true
+      heartbeat: 60s
+  tables:
+    snapshots: { mode: never, parallelism: 1 }
+  schema_evolution: { enabled: true, rescan_interval: 60m }
+  sink:
+    type: iceberg                              # REQUIRED somewhere (V-091); set once here
+    write_mode: mirror
+    flush: { seconds: 30, rows: 100000, bytes: 512MiB }
+    iceberg:
+      strategy: mor
+      catalog:
+        rest:
+          url: https://catalog.example.com
+          warehouse: analytics
+          auth: oauth2
+          oauth2:
+            client_id: ${CATALOG_CLIENT_ID}      # or: credentials_file: ${CATALOG_OAUTH_CREDS_FILE} (JSON {client_id, client_secret}) — V-066
+            client_secret: ${CATALOG_CLIENT_SECRET}
+            token_url: https://idp.example.com/realms/cdc/protocol/openid-connect/token
+            scope: catalog:read catalog:write
+  state:
+    prefix: pipeline-state
+
+pipelines:
+  orders-pg:
+    id: orders_pg
+    source:
+      host: pg-orders.example.com
+      db: orders
+      user: cdc
+      password: ${ORDERS_DB_PASSWORD}
+      postgres:
+        publication: orders_pub
+        slot: orders_slot
+    tables:
+      include: [ public.* ]
+      exclude: [ public.temp_* ]
+      snapshots:
+        mode: initial
+        parallelism: 2
+        overrides: { public.orders: always }
+      partitioning:
+        public.orders: [ { column: _ts, transform: day } ]
+    sink:
+      bucket: ${ACCOUNT_ID}-lake
+      prefix: orders_pg
+      flush: { rows: 50000 }                   # merges over defaults (seconds:30, bytes:512MiB kept)
+
+  events-mysql:
+    id: events_mysql
+    source:
+      type: mysql                              # drops the defaulted postgres block (union rule §8.4)
+      host: mysql-events.example.com
+      port: 3306
+      db: events
+      credentials_file: ${EVENTS_DB_CREDS_FILE}  # JSON {user, password}; mutually exclusive with user/password (V-065); rotatable in place
+      ssl_mode: require
+      mysql:
+        replication_type: gtid
+    tables:
+      include: [ orders, payment_* ]           # MySQL: bare table names (db = source.db = events); a prefix would violate V-064
+    schema_evolution: { enabled: true }       # rescan_interval merges from defaults (60m)
+    sink:
+      type: delta                              # drops the defaulted iceberg block (union rule §8.4)
+      bucket: ${ACCOUNT_ID}-lake
+      delta:
+        checkpoint_interval: 10
+        log_retention: 30d
+        timestamp_ntz_as: timestamp_ntz          # default; `timestamp` keeps reader v1 (DA-MS-8)
+        catalog: { type: none }                # path-based Delta tables (v1)
