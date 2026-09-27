@@ -68,13 +68,15 @@ impl LeafType for Duration {
 
 impl LeafType for ByteSize {
     fn parse_leaf(text: &str) -> Result<Self, String> {
-        text.parse()
+        text.parse::<ByteSize>()
+            .map_err(|e: crate::units::ByteSizeError| e.to_string())
     }
 }
 
 impl LeafType for HostPort {
     fn parse_leaf(text: &str) -> Result<Self, String> {
-        text.parse()
+        text.parse::<HostPort>()
+            .map_err(|e: crate::units::HostPortError| e.to_string())
     }
 }
 

@@ -7,6 +7,16 @@ use std::time::Duration;
 
 use serde::{Serialize, Serializer};
 
+/// A text that is not a byte size (config §4.2).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct ByteSizeError(String);
+
+/// A text that is not `host:port`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct HostPortError(String);
+
 /// Parses a `humantime` duration (`200ms`, `5s`, `1h30m`, `30d`). A bare integer is not a duration
 /// (§4.1), except `0`, which `schema_evolution.rescan_interval` uses to mean "disabled".
 pub fn parse_duration(text: &str) -> Result<Duration, String> {
@@ -54,13 +64,15 @@ const UNITS: [(&str, u64); 6] = [
 ];
 
 impl FromStr for ByteSize {
-    type Err = String;
+    type Err = ByteSizeError;
 
-    fn from_str(text: &str) -> Result<Self, String> {
+    fn from_str(text: &str) -> Result<Self, ByteSizeError> {
         let digits = text.bytes().take_while(u8::is_ascii_digit).count();
         let (number, unit) = text.split_at(digits);
         let bad = || {
-            format!("{text:?} is not a byte size; write e.g. 512MiB, 256MB or a number of bytes")
+            ByteSizeError(format!(
+                "{text:?} is not a byte size; write e.g. 512MiB, 256MB or a number of bytes"
+            ))
         };
         if number.is_empty() {
             return Err(bad());
@@ -77,7 +89,7 @@ impl FromStr for ByteSize {
         };
         n.checked_mul(factor)
             .map(ByteSize)
-            .ok_or_else(|| format!("{text:?} is too large"))
+            .ok_or_else(|| ByteSizeError(format!("{text:?} is too large")))
     }
 }
 
@@ -110,10 +122,10 @@ pub struct HostPort {
 }
 
 impl FromStr for HostPort {
-    type Err = String;
+    type Err = HostPortError;
 
-    fn from_str(text: &str) -> Result<Self, String> {
-        let bad = |why: &str| format!("{text:?} is not host:port: {why}");
+    fn from_str(text: &str) -> Result<Self, HostPortError> {
+        let bad = |why: &str| HostPortError(format!("{text:?} is not host:port: {why}"));
         let (host, port) = if let Some(rest) = text.strip_prefix('[') {
             let (h, p) = rest
                 .split_once("]:")
@@ -214,5 +226,21 @@ mod tests {
         for bad in ["host", ":80", "h:0", "h:70000", "::1:80", "[zz]:1", "[::1]"] {
             assert!(bad.parse::<HostPort>().is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn byte_size_error_display_text() {
+        assert_eq!(
+            "12XB".parse::<ByteSize>().unwrap_err().to_string(),
+            "\"12XB\" is not a byte size; write e.g. 512MiB, 256MB or a number of bytes"
+        );
+    }
+
+    #[test]
+    fn host_port_error_display_text() {
+        assert_eq!(
+            "host:99999".parse::<HostPort>().unwrap_err().to_string(),
+            "\"host:99999\" is not host:port: port is not 1..=65535"
+        );
     }
 }

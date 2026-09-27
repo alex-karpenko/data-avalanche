@@ -9,6 +9,14 @@ use serde::{Serialize, Serializer};
 
 use crate::coerce::LeafType;
 
+/// A text that is not one of a config enum's values.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{value:?} is not one of: {}", expected.join(", "))]
+pub struct EnumValueError {
+    pub value: String,
+    pub expected: &'static [&'static str],
+}
+
 macro_rules! config_enum {
     ($(#[$meta:meta])* $name:ident, rule = $rule:literal, { $($variant:ident => $text:literal),+ $(,)? }) => {
         $(#[$meta])*
@@ -28,15 +36,15 @@ macro_rules! config_enum {
         }
 
         impl FromStr for $name {
-            type Err = String;
+            type Err = EnumValueError;
 
-            fn from_str(s: &str) -> Result<Self, String> {
+            fn from_str(s: &str) -> Result<Self, EnumValueError> {
                 match s {
                     $($text => Ok($name::$variant),)+
-                    _ => Err(format!(
-                        "{s:?} is not one of: {}",
-                        [$($text),+].join(", ")
-                    )),
+                    _ => Err(EnumValueError {
+                        value: s.to_string(),
+                        expected: &[$($text),+],
+                    }),
                 }
             }
         }
@@ -57,7 +65,7 @@ macro_rules! config_enum {
             const RULE: &'static str = $rule;
 
             fn parse_leaf(text: &str) -> Result<Self, String> {
-                text.parse()
+                text.parse().map_err(|e: EnumValueError| e.to_string())
             }
         }
     };
@@ -133,9 +141,17 @@ mod tests {
         }
         assert_eq!(SslMode::VerifyFull.to_string(), "verify-full");
         let err = "gcp".parse::<Cloud>().unwrap_err();
-        assert_eq!(err, "\"gcp\" is not one of: aws, google, azure");
+        assert_eq!(err.to_string(), "\"gcp\" is not one of: aws, google, azure");
         assert!("Aws".parse::<Cloud>().is_err(), "values are case-sensitive");
         assert_eq!(<Cloud as LeafType>::RULE, "V-015");
         assert_eq!(serde_json::to_value(RestAuth::Sigv4).unwrap(), "sigv4");
+    }
+
+    #[test]
+    fn enum_value_error_display_text() {
+        assert_eq!(
+            "invalid".parse::<Cloud>().unwrap_err().to_string(),
+            "\"invalid\" is not one of: aws, google, azure"
+        );
     }
 }
