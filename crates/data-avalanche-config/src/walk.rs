@@ -23,8 +23,6 @@ use crate::raw::*;
 
 pub(crate) trait Walk {
     fn drop_empty(&mut self, ctx: &Ctx);
-    // Wired into `rules::check_defaults` in the next commit (§8.6); unit-tested here meanwhile.
-    #[allow(dead_code)]
     fn check_values(&self, ctx: &mut Ctx, at: &At);
 }
 

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use data_avalanche_config::enums::*;
 use data_avalanche_config::resolved::*;
-use data_avalanche_config::{Origin, load_file, load_str};
+use data_avalanche_config::{Locus, Origin, load_file, load_str};
 use support::{Files, MINIMAL, env, spec_example};
 
 #[test]
@@ -724,4 +724,87 @@ fn empty_optional_tri_state_flush_seconds_falls_back_to_the_default_not_disabled
         Some(30),
         "an empty tri-state value is absent (apply the default), not null (disabled)"
     );
+}
+
+// FU-C (config §8.6): `defaults` is validated on its own, at its own path, before any pipeline
+// merges it in — and reported once even when several pipelines would otherwise duplicate it.
+
+#[test]
+fn invalid_defaults_value_rejects_the_config_even_with_no_pipelines() {
+    let yaml = r#"
+config_version: 1
+globals:
+  state: { bucket: app-state }
+defaults:
+  sink: { flush: { rows: abc } }
+pipelines: {}
+"#;
+    let report = load_str(yaml, &env(&[])).unwrap_err();
+    assert_eq!(report.errors.len(), 1, "{report:#?}");
+    let e = &report.errors[0];
+    assert_eq!(e.rule, "TYPE");
+    assert_eq!(e.path, "defaults.sink.flush.rows");
+    assert_eq!(e.locus, Locus::Config);
+}
+
+#[test]
+fn invalid_defaults_value_is_reported_once_however_many_pipelines_inherit_it() {
+    let yaml = r#"
+config_version: 1
+globals:
+  state: { bucket: app-state }
+defaults:
+  sink: { flush: { rows: abc } }
+pipelines:
+  orders:
+    id: orders
+    source:
+      host: db.example.com
+      db: shop
+      user: cdc
+      password: ${PW}
+      postgres: { publication: orders_pub, slot: orders_slot }
+    tables:
+      include: [public.orders]
+    sink:
+      type: delta
+      bucket: lake
+      delta: {}
+  clicks:
+    id: clicks
+    source:
+      host: db.example.com
+      db: shop
+      user: cdc
+      password: ${PW}
+      postgres: { publication: clicks_pub, slot: clicks_slot }
+    tables:
+      include: [public.clicks]
+    sink:
+      type: delta
+      bucket: lake
+      delta: {}
+"#;
+    let report = load_str(yaml, &env(&[("PW", "pw")])).unwrap_err();
+    let hits: Vec<_> = report
+        .errors
+        .iter()
+        .filter(|d| d.rule == "TYPE" && d.path.contains("flush.rows"))
+        .collect();
+    assert_eq!(hits.len(), 1, "{report:#?}");
+    assert_eq!(hits[0].path, "defaults.sink.flush.rows");
+    assert_eq!(hits[0].locus, Locus::Config);
+}
+
+#[test]
+fn invalid_enum_in_defaults_is_v020_at_its_defaults_path() {
+    let yaml = MINIMAL.replace(
+        "pipelines:",
+        "defaults:\n  source: { ssl_mode: nope }\npipelines:",
+    );
+    let report = load_str(&yaml, &env(&[("PW", "pw")])).unwrap_err();
+    let hits: Vec<_> = report.errors.iter().filter(|d| d.rule == "V-020").collect();
+    assert_eq!(hits.len(), 1, "{report:#?}");
+    assert_eq!(hits[0].path, "defaults.source.ssl_mode");
+    assert_eq!(hits[0].locus, Locus::Config);
 }

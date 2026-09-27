@@ -48,8 +48,18 @@ pub fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut Ctx) {
         globals(g, ctx);
     }
     for (name, p) in merged {
-        pipeline(name, p, ctx);
+        pipeline_fields(&pipeline_at(name), p, ctx, true);
     }
+}
+
+/// §8.6: the single-field rules of this module, run directly on `raw.defaults` at its own path
+/// (`defaults`, locus config) — before any pipeline merges it in, so an invalid value rejects the
+/// config even when nothing inherits it. `cross_field: false` skips the two checks below that
+/// relate sibling fields rather than reading one on its own; everything else here is unconditional
+/// and doesn't need the pipeline's engine or sink format, so `pipeline_fields` runs it unchanged.
+pub fn check_defaults(defaults: &RawPipeline, ctx: &mut Ctx) {
+    let at = At::config(YamlPath::root().key("defaults"));
+    pipeline_fields(&at, defaults, ctx, false);
 }
 
 fn globals(g: &RawGlobals, ctx: &mut Ctx) {
@@ -172,8 +182,11 @@ fn globals(g: &RawGlobals, ctx: &mut Ctx) {
     }
 }
 
-fn pipeline(name: &str, p: &RawPipeline, ctx: &mut Ctx) {
-    let at = pipeline_at(name);
+/// The rules of this module that read one field of a `RawPipeline`-shaped block. Shared by the
+/// per-pipeline pass (`cross_field: true`, unchanged) and the `defaults`-alone pass
+/// (`cross_field: false`, which skips V-107 — a partition's `n`/`width` against its `transform` —
+/// and V-112's backoff-order half — `base_backoff` against `max_backoff`).
+fn pipeline_fields(at: &At, p: &RawPipeline, ctx: &mut Ctx, cross_field: bool) {
     if let Some(pg) = p.source.as_ref().and_then(|s| s.postgres.as_ref()) {
         // V-104
         let lag_at = at.key("source").key("postgres").key("max_wal_lag_bytes");
@@ -227,15 +240,18 @@ fn pipeline(name: &str, p: &RawPipeline, ctx: &mut Ctx) {
                 }
             }
         }
-        // V-107
-        for (table, fields) in t.partitioning.iter().flatten() {
-            for (i, f) in fields.iter().enumerate() {
-                partition_field(f, &t_at.key("partitioning").key(table).index(i), ctx);
+        // V-107: relates a partition's `transform` to its `n`/`width`, so it's skipped for the
+        // `defaults`-alone pass (§8.6) — it still runs once the pipeline is merged.
+        if cross_field {
+            for (table, fields) in t.partitioning.iter().flatten() {
+                for (i, f) in fields.iter().enumerate() {
+                    partition_field(f, &t_at.key("partitioning").key(table).index(i), ctx);
+                }
             }
         }
     }
     if let Some(s) = &p.sink {
-        sink(s, &at.key("sink"), ctx);
+        sink(s, &at.key("sink"), ctx, cross_field);
     }
 }
 
@@ -287,7 +303,7 @@ fn partition_field(f: &RawPartitionField, at: &At, ctx: &mut Ctx) {
     }
 }
 
-fn sink(s: &RawSink, at: &At, ctx: &mut Ctx) {
+fn sink(s: &RawSink, at: &At, ctx: &mut Ctx, cross_field: bool) {
     // V-089
     if let Some((WriteMode::Changelog, loc)) = val(ctx, &s.write_mode, &at.key("write_mode")) {
         ctx.error(
@@ -374,11 +390,11 @@ fn sink(s: &RawSink, at: &At, ctx: &mut Ctx) {
         }
     }
     if let Some(c) = s.iceberg.as_ref().and_then(|i| i.catalog.as_ref()) {
-        catalog(c, &at.key("iceberg").key("catalog"), ctx);
+        catalog(c, &at.key("iceberg").key("catalog"), ctx, cross_field);
     }
 }
 
-fn catalog(c: &RawCatalog, at: &At, ctx: &mut Ctx) {
+fn catalog(c: &RawCatalog, at: &At, ctx: &mut Ctx, cross_field: bool) {
     // V-112
     if let Some(r) = &c.retry {
         let r_at = at.key("retry");
@@ -390,37 +406,41 @@ fn catalog(c: &RawCatalog, at: &At, ctx: &mut Ctx) {
             1,
             "retry.max_attempts",
         );
-        let base = r
-            .base_backoff
-            .as_ref()
-            .map_or(Some(Duration::from_secs(1)), |l| {
-                ctx.value(l, &r_at.key("base_backoff"))
-            });
-        let max = r
-            .max_backoff
-            .as_ref()
-            .map_or(Some(Duration::from_secs(30)), |l| {
-                ctx.value(l, &r_at.key("max_backoff"))
-            });
-        if let (Some(b), Some(m)) = (base, max)
-            && b > m
-        {
-            // Duration has no `Display`, so `shown_value` doesn't apply; redact by hand from the
-            // same "is this leaf a template" test it uses.
-            let shown_duration = |leaf: &Option<Leaf<Duration>>, d: Duration| match leaf {
-                Some(l) if is_templated(l) => format!("{:?} (resolved value hidden)", l.text()),
-                _ => crate::units::format_duration(d),
-            };
-            ctx.error(
-                "V-112",
-                &r_at,
-                None,
-                format!(
-                    "retry.base_backoff {} is above max_backoff {}",
-                    shown_duration(&r.base_backoff, b),
-                    shown_duration(&r.max_backoff, m)
-                ),
-            );
+        // The backoff-order half relates `base_backoff` to `max_backoff`, so it's skipped for the
+        // `defaults`-alone pass (§8.6) — it still runs once the pipeline is merged.
+        if cross_field {
+            let base = r
+                .base_backoff
+                .as_ref()
+                .map_or(Some(Duration::from_secs(1)), |l| {
+                    ctx.value(l, &r_at.key("base_backoff"))
+                });
+            let max = r
+                .max_backoff
+                .as_ref()
+                .map_or(Some(Duration::from_secs(30)), |l| {
+                    ctx.value(l, &r_at.key("max_backoff"))
+                });
+            if let (Some(b), Some(m)) = (base, max)
+                && b > m
+            {
+                // Duration has no `Display`, so `shown_value` doesn't apply; redact by hand from
+                // the same "is this leaf a template" test it uses.
+                let shown_duration = |leaf: &Option<Leaf<Duration>>, d: Duration| match leaf {
+                    Some(l) if is_templated(l) => format!("{:?} (resolved value hidden)", l.text()),
+                    _ => crate::units::format_duration(d),
+                };
+                ctx.error(
+                    "V-112",
+                    &r_at,
+                    None,
+                    format!(
+                        "retry.base_backoff {} is above max_backoff {}",
+                        shown_duration(&r.base_backoff, b),
+                        shown_duration(&r.max_backoff, m)
+                    ),
+                );
+            }
         }
     }
     // V-115

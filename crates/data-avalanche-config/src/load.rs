@@ -43,6 +43,31 @@ fn drop_empty(raw: &mut RawConfig, ctx: &Ctx) {
     }
 }
 
+/// §8.6: a per-pipeline diagnostic that duplicates one the `defaults`-alone pass already emitted
+/// (`rules::check_defaults`) is dropped — that value came from `defaults` and is already reported
+/// once, at its `defaults` path. A per-pipeline diagnostic matches when its `rule` and `loc` equal
+/// a config-locus diagnostic at a `defaults` path: `loc` is the value's exact source position, so a
+/// leaf a pipeline didn't override carries the very same `loc` it had under `defaults` (merge
+/// clones the leaf unchanged), and nothing else in the document can coincide with it. A diagnostic
+/// with no `loc` (built in code rather than read from the file) is never deduped this way.
+/// Cross-field diagnostics never collide, because the `defaults` pass never emits them (§8.6).
+fn dedupe_defaults(report: &mut Report) {
+    let from_defaults: std::collections::HashSet<(String, crate::leaf::Loc)> = report
+        .errors
+        .iter()
+        .chain(&report.warnings)
+        .filter(|d| d.locus == Locus::Config && d.path.starts_with("defaults"))
+        .filter_map(|d| d.loc.map(|loc| (d.rule.clone(), loc)))
+        .collect();
+    let keep = |d: &Diagnostic| {
+        !(matches!(d.locus, Locus::Pipeline(_))
+            && d.loc
+                .is_some_and(|loc| from_defaults.contains(&(d.rule.clone(), loc))))
+    };
+    report.errors.retain(keep);
+    report.warnings.retain(keep);
+}
+
 /// Loads config text. Any error rejects the whole config (§1.4) and the report lists every error
 /// of the phase that failed (the first one only for a Phase 0 parse error).
 pub fn load_str(text: &str, env: &dyn Env) -> Result<Loaded, Report> {
@@ -54,7 +79,8 @@ pub fn load_str(text: &str, env: &dyn Env) -> Result<Loaded, Report> {
     let merged = merge_all(&raw, &ctx);
     rules::check(&raw, &merged, &mut ctx);
     build(&raw, &merged, &mut ctx);
-    let structural = ctx.into_report();
+    let mut structural = ctx.into_report();
+    dedupe_defaults(&mut structural);
     if !structural.is_ok() {
         return Err(structural);
     }
@@ -67,6 +93,7 @@ pub fn load_str(text: &str, env: &dyn Env) -> Result<Loaded, Report> {
     rules::check(&raw, &merged, &mut ctx);
     let config = build(&raw, &merged, &mut ctx);
     let mut report = ctx.into_report();
+    dedupe_defaults(&mut report);
     report.extend(structural);
     match config {
         Some(config) if report.is_ok() => Ok(Loaded {

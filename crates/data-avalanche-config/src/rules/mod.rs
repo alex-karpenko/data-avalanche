@@ -6,6 +6,7 @@ use crate::ctx::{At, Ctx};
 use crate::leaf::Leaf;
 use crate::path::YamlPath;
 use crate::raw::{RawConfig, RawPipeline};
+use crate::walk::Walk;
 
 mod auth;
 pub mod cross;
@@ -15,11 +16,26 @@ mod structure;
 
 /// Runs every config-time rule over the parsed document and its merged pipelines.
 pub fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut Ctx) {
+    check_defaults(raw, ctx);
     structure::check(raw, merged, ctx);
     identity::check(raw, merged, ctx);
     domain::check(raw, merged, ctx);
     cross::check(raw, merged, ctx);
     auth::check(raw, merged, ctx);
+}
+
+/// §8.6: `defaults` validated on its own, before any pipeline inherits it — every leaf coerced
+/// (`TYPE` / its own V-rule / V-063, via the raw-model walker), plus `domain.rs`'s single-field
+/// rules (`domain::check_defaults`; it lists which rules run and which are skipped). Locus config,
+/// path `defaults`. No files are read here (§8.6) — Phase 1 never reads files regardless, and
+/// Phase 2 only reads a file for a setting that's in effect on a *merged* pipeline (§11 Phase 2),
+/// which `defaults` alone never is.
+fn check_defaults(raw: &RawConfig, ctx: &mut Ctx) {
+    let at = At::config(YamlPath::root().key("defaults"));
+    raw.defaults.check_values(ctx, &at);
+    if let Some(defaults) = &raw.defaults {
+        domain::check_defaults(defaults, ctx);
+    }
 }
 
 /// `pipelines.<name>` as a pipeline-locus location.
