@@ -1,8 +1,12 @@
 //! Phase 3 (config §11): the merged raw model becomes the [`ResolvedConfig`], with every default of
 //! the spec's field tables applied. The build visits every leaf, so a leaf no rule reads still
-//! reports a coercion failure. Presence is the rules' job: an absent required value makes the
-//! build return `None` without a diagnostic of its own. Files are read only when the context is
-//! resolving (§11: Phase 1 touches neither the environment nor the filesystem).
+//! reports a coercion failure — except a file reference whose setting isn't in effect (§11: e.g.
+//! `credentials_file` when `auth` isn't `basic`, `tls.cert`/`key`/`ca` when `tls.enabled` is
+//! `false`, `ssl_cert`/`ssl_key`/`ssl_ca` when `ssl_mode` is `disable`, catalog auth material for a
+//! mode the catalog didn't select): that leaf is never visited, so it cannot fail the load. Presence
+//! is the rules' job: an absent required value makes the build return `None` without a diagnostic of
+//! its own. Files are read only when the context is resolving (§11: Phase 1 touches neither the
+//! environment nor the filesystem).
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
@@ -296,7 +300,12 @@ fn api(a: &RawApi, at: &At, ctx: &mut Ctx) -> Option<Api> {
         },
     );
     let auth = or(ctx, &a.auth, at, "auth", ApiAuth::None);
-    let creds = credentials(ctx, &a.user, &a.password, &a.credentials_file, at);
+    // §11 Phase 2: `credentials_file` is only in effect for `auth = basic`; an unused reference is
+    // never read.
+    let creds = match auth {
+        Some(ApiAuth::Basic) => credentials(ctx, &a.user, &a.password, &a.credentials_file, at),
+        _ => None,
+    };
     let jwt = a.jwt.as_ref().map(|j| {
         let at = at.key("jwt");
         let issuer = req(ctx, &j.issuer, &at, "issuer");
@@ -329,11 +338,21 @@ fn api(a: &RawApi, at: &At, ctx: &mut Ctx) -> Option<Api> {
     let tls = a.tls.clone().unwrap_or_default();
     let tls_at = at.key("tls");
     let enabled = or(ctx, &tls.enabled, &tls_at, "enabled", false);
-    let cert = pem(ctx, &tls.cert, &tls_at, "cert", PemKind::Certificates);
-    let key = pem(ctx, &tls.key, &tls_at, "key", PemKind::PrivateKey);
-    // Every block above was already validated (V-067 reads credentials_file, V-068 reads TLS
-    // material, even when auth is none or TLS is disabled); only the block the auth mode uses is
-    // kept in the result below.
+    // §11 Phase 2: `cert`/`key` are only in effect when `tls.enabled` is `true`; an unused
+    // reference is never read.
+    let tls_in_effect = enabled == Some(true);
+    let cert = if tls_in_effect {
+        pem(ctx, &tls.cert, &tls_at, "cert", PemKind::Certificates)
+    } else {
+        Some(None)
+    };
+    let key = if tls_in_effect {
+        pem(ctx, &tls.key, &tls_at, "key", PemKind::PrivateKey)
+    } else {
+        Some(None)
+    };
+    // Only the block the auth mode selects, and (for tls) the block `enabled` selects, is kept in
+    // the result below; the rest were never computed above (§11 Phase 2).
     let auth = auth?;
     let (credentials, jwt, oauth2) = match auth {
         ApiAuth::None => (None, None, None),
@@ -515,9 +534,24 @@ fn memberlist(m: &RawMemberlist, at: &At, ctx: &mut Ctx) -> Option<Memberlist> {
     let tls = m.tls.clone().unwrap_or_default();
     let tls_at = at.key("tls");
     let enabled = or(ctx, &tls.enabled, &tls_at, "enabled", false);
-    let cert = pem(ctx, &tls.cert, &tls_at, "cert", PemKind::Certificates);
-    let key = pem(ctx, &tls.key, &tls_at, "key", PemKind::PrivateKey);
-    let ca = pem(ctx, &tls.ca, &tls_at, "ca", PemKind::Certificates);
+    // §11 Phase 2: `cert`/`key`/`ca` are only in effect when `tls.enabled` is `true`; an unused
+    // reference is never read.
+    let tls_in_effect = enabled == Some(true);
+    let cert = if tls_in_effect {
+        pem(ctx, &tls.cert, &tls_at, "cert", PemKind::Certificates)
+    } else {
+        Some(None)
+    };
+    let key = if tls_in_effect {
+        pem(ctx, &tls.key, &tls_at, "key", PemKind::PrivateKey)
+    } else {
+        Some(None)
+    };
+    let ca = if tls_in_effect {
+        pem(ctx, &tls.ca, &tls_at, "ca", PemKind::Certificates)
+    } else {
+        Some(None)
+    };
     let tls = match enabled? {
         true => Some(MemberlistTls {
             cert: cert??,
@@ -627,9 +661,24 @@ fn source(s: &RawSource, at: &At, ctx: &mut Ctx) -> Option<Source> {
     let db = req(ctx, &s.db, at, "db");
     let credentials = credentials(ctx, &s.user, &s.password, &s.credentials_file, at);
     let ssl_mode = or(ctx, &s.ssl_mode, at, "ssl_mode", SslMode::Require);
-    let ssl_cert = pem(ctx, &s.ssl_cert, at, "ssl_cert", PemKind::Certificates);
-    let ssl_key = pem(ctx, &s.ssl_key, at, "ssl_key", PemKind::PrivateKey);
-    let ssl_ca = pem(ctx, &s.ssl_ca, at, "ssl_ca", PemKind::Certificates);
+    // §11 Phase 2: `ssl_cert`/`ssl_key`/`ssl_ca` are only in effect when `ssl_mode` isn't
+    // `disable`; an unused reference is never read.
+    let ssl_in_effect = ssl_mode != Some(SslMode::Disable);
+    let ssl_cert = if ssl_in_effect {
+        pem(ctx, &s.ssl_cert, at, "ssl_cert", PemKind::Certificates)
+    } else {
+        Some(None)
+    };
+    let ssl_key = if ssl_in_effect {
+        pem(ctx, &s.ssl_key, at, "ssl_key", PemKind::PrivateKey)
+    } else {
+        Some(None)
+    };
+    let ssl_ca = if ssl_in_effect {
+        pem(ctx, &s.ssl_ca, at, "ssl_ca", PemKind::Certificates)
+    } else {
+        Some(None)
+    };
     let t = s.timeouts.clone().unwrap_or_default();
     let t_at = at.key("timeouts");
     let connect = or(ctx, &t.connect, &t_at, "connect", Duration::from_secs(10));
@@ -1004,29 +1053,40 @@ fn catalog(c: &RawCatalog, at: &At, db: Option<&str>, ctx: &mut Ctx) -> Option<C
 fn hive(h: &RawHive, at: &At, db: Option<&str>, ctx: &mut Ctx) -> Option<Hive> {
     let url = req(ctx, &h.url, at, "url");
     let auth = or(ctx, &h.auth, at, "auth", HiveAuth::None);
-    let creds = credentials(ctx, &h.user, &h.password, &h.credentials_file, at);
-    let kerberos = h.kerberos.as_ref().map(|k| {
-        let at = at.key("kerberos");
-        let principal = req(ctx, &k.principal, &at, "principal");
-        let keytab = k.keytab.as_ref().and_then(|l| {
-            read_or_report(ctx, "V-069", &at.key("keytab"), l, read_file_ref).map(|(_, f)| f)
-        });
-        let service_name = or(
-            ctx,
-            &k.service_name,
-            &at,
-            "service_name",
-            "hive".to_string(),
-        );
-        Some(Kerberos {
-            principal: principal?,
-            keytab: keytab?,
-            service_name: service_name?,
-        })
-    });
+    // §11 Phase 2: `credentials_file`/`ldap` material and the Kerberos `keytab` are only in effect
+    // for the matching catalog `auth` mode; an unused reference is never read.
+    let creds = match auth {
+        Some(HiveAuth::Ldap) => credentials(ctx, &h.user, &h.password, &h.credentials_file, at),
+        _ => None,
+    };
+    let kerberos = match auth {
+        Some(HiveAuth::Kerberos) => h.kerberos.as_ref().map(|k| {
+            let at = at.key("kerberos");
+            let principal = req(ctx, &k.principal, &at, "principal");
+            let keytab = k.keytab.as_ref().and_then(|l| {
+                read_or_report(ctx, "V-069", &at.key("keytab"), l, read_file_ref).map(|(_, f)| f)
+            });
+            let service_name = or(
+                ctx,
+                &k.service_name,
+                &at,
+                "service_name",
+                "hive".to_string(),
+            );
+            Some(Kerberos {
+                principal: principal?,
+                keytab: keytab?,
+                service_name: service_name?,
+            })
+        }),
+        _ => None,
+    };
     let tls = h.tls.clone().unwrap_or_default();
     let tls_at = at.key("tls");
     let enabled = or(ctx, &tls.enabled, &tls_at, "enabled", false);
+    // Unlike `globals.api.tls`/`memberlist.tls`, the spec's §11 Phase 2 bullet does not gate
+    // `hive.tls.ca` on `tls.enabled` — it stays unconditional (in practice unreachable: V-115
+    // refuses any `hive` block in Phase 1, before Phase 2 ever reads a file here).
     let ca = pem(ctx, &tls.ca, &tls_at, "ca", PemKind::Certificates);
     let database = opt(ctx, &h.database, at, "database");
     let auth = auth?;
@@ -1054,49 +1114,61 @@ fn rest(r: &RawRest, at: &At, ctx: &mut Ctx) -> Option<Rest> {
     let warehouse = opt(ctx, &r.warehouse, at, "warehouse");
     let prefix = opt(ctx, &r.prefix, at, "prefix");
     let auth = or(ctx, &r.auth, at, "auth", RestAuth::None);
-    let token = match (&r.token, &r.token_file) {
-        (Some(t), None) => ctx.text(t, &at.key("token")).map(|t| BearerToken::Inline {
-            token: Secret::new(t),
-        }),
-        (None, Some(f)) => read_or_report(ctx, "V-071", &at.key("token_file"), f, read_token_file)
-            .map(|(path, token)| BearerToken::File { path, token }),
+    // §11 Phase 2: the bearer `token_file` and the oauth2 `credentials_file` are only in effect
+    // for the matching catalog `auth` mode; an unused reference is never read.
+    let token = match auth {
+        Some(RestAuth::Bearer) => match (&r.token, &r.token_file) {
+            (Some(t), None) => ctx.text(t, &at.key("token")).map(|t| BearerToken::Inline {
+                token: Secret::new(t),
+            }),
+            (None, Some(f)) => {
+                read_or_report(ctx, "V-071", &at.key("token_file"), f, read_token_file)
+                    .map(|(path, token)| BearerToken::File { path, token })
+            }
+            _ => None,
+        },
         _ => None,
     };
-    let oauth2 = r.oauth2.as_ref().map(|o| {
-        let at = at.key("oauth2");
-        let id = o
-            .client_id
-            .as_ref()
-            .and_then(|l| ctx.text(l, &at.key("client_id")));
-        let secret = o
-            .client_secret
-            .as_ref()
-            .and_then(|l| ctx.text(l, &at.key("client_secret")));
-        let client = match (&o.credentials_file, &o.client_id, &o.client_secret) {
-            (Some(f), None, None) => {
-                read_or_report(ctx, "V-067", &at.key("credentials_file"), f, |p, label| {
-                    read_json_pair(p, label, "client_id", "client_secret")
-                })
-                .map(|(path, (client_id, client_secret))| OauthClient::File {
-                    path,
-                    client_id,
-                    client_secret,
-                })
-            }
-            (None, Some(_), Some(_)) => Some(OauthClient::Inline {
-                client_id: id?,
-                client_secret: Secret::new(secret?),
-            }),
-            _ => None,
-        };
-        let token_url = req(ctx, &o.token_url, &at, "token_url");
-        let scope = opt(ctx, &o.scope, &at, "scope");
-        Some(RestOauth2 {
-            client: client?,
-            token_url: token_url?,
-            scope: scope?,
-        })
-    });
+    let oauth2 = match auth {
+        Some(RestAuth::Oauth2) => r.oauth2.as_ref().map(|o| {
+            let at = at.key("oauth2");
+            let id = o
+                .client_id
+                .as_ref()
+                .and_then(|l| ctx.text(l, &at.key("client_id")));
+            let secret = o
+                .client_secret
+                .as_ref()
+                .and_then(|l| ctx.text(l, &at.key("client_secret")));
+            let client = match (&o.credentials_file, &o.client_id, &o.client_secret) {
+                (Some(f), None, None) => {
+                    read_or_report(ctx, "V-067", &at.key("credentials_file"), f, |p, label| {
+                        read_json_pair(p, label, "client_id", "client_secret")
+                    })
+                    .map(|(path, (client_id, client_secret))| {
+                        OauthClient::File {
+                            path,
+                            client_id,
+                            client_secret,
+                        }
+                    })
+                }
+                (None, Some(_), Some(_)) => Some(OauthClient::Inline {
+                    client_id: id?,
+                    client_secret: Secret::new(secret?),
+                }),
+                _ => None,
+            };
+            let token_url = req(ctx, &o.token_url, &at, "token_url");
+            let scope = opt(ctx, &o.scope, &at, "scope");
+            Some(RestOauth2 {
+                client: client?,
+                token_url: token_url?,
+                scope: scope?,
+            })
+        }),
+        _ => None,
+    };
     let sigv4 = r.sigv4.as_ref().map(|s| {
         let at = at.key("sigv4");
         let region = req(ctx, &s.region, &at, "region");

@@ -271,6 +271,51 @@ fn bad_pem_is_v068() {
     assert!(e.message.contains("no certificate"), "{}", e.message);
 }
 
+// FU-B (config §11 Phase 2): a file reference is read only when the setting that uses it is in
+// effect; an unused one is never read and cannot fail the load.
+
+#[test]
+fn unused_api_credentials_file_is_not_read() {
+    let yaml = MINIMAL.replace(
+        "globals:\n  state: { bucket: app-state }",
+        "globals:\n  state: { bucket: app-state }\n  api:\n    auth: none\n    credentials_file: /nonexistent/x.json",
+    );
+    let loaded = load_str(&yaml, &env(&[("PW", "pw")])).unwrap_or_else(|r| panic!("{r:#?}"));
+    assert!(loaded.warnings.is_empty(), "{:#?}", loaded.warnings);
+}
+
+#[test]
+fn unused_api_tls_material_is_not_read() {
+    let yaml = MINIMAL.replace(
+        "globals:\n  state: { bucket: app-state }",
+        "globals:\n  state: { bucket: app-state }\n  api:\n    tls: { enabled: false, cert: /nonexistent/cert.pem, key: /nonexistent/key.pem }",
+    );
+    let loaded = load_str(&yaml, &env(&[("PW", "pw")])).unwrap_or_else(|r| panic!("{r:#?}"));
+    assert!(loaded.warnings.is_empty(), "{:#?}", loaded.warnings);
+}
+
+#[test]
+fn unused_ssl_ca_is_not_read_when_ssl_mode_is_disable() {
+    let yaml = MINIMAL.replace(
+        "postgres: { publication: orders_pub, slot: orders_slot }",
+        "postgres: { publication: orders_pub, slot: orders_slot }\n      ssl_mode: disable\n      ssl_ca: /nonexistent/ca.pem",
+    );
+    let loaded = load_str(&yaml, &env(&[("PW", "pw")])).unwrap_or_else(|r| panic!("{r:#?}"));
+    assert!(loaded.warnings.is_empty(), "{:#?}", loaded.warnings);
+}
+
+// Contrast: the same `credentials_file` under `auth: basic` is in effect, and a bad path fails
+// the load as before.
+#[test]
+fn api_credentials_file_is_read_when_auth_is_basic() {
+    let yaml = MINIMAL.replace(
+        "globals:\n  state: { bucket: app-state }",
+        "globals:\n  state: { bucket: app-state }\n  api:\n    auth: basic\n    credentials_file: /nonexistent/x.json",
+    );
+    let report = load_str(&yaml, &env(&[("PW", "pw")])).unwrap_err();
+    assert_eq!(report.errors[0].rule, "V-067");
+}
+
 // F1: a diagnostic never prints a file-reference field's resolved value, whether that value came
 // from the environment or is literal text that only looks like something else (config §13.9).
 
