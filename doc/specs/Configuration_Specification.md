@@ -1175,7 +1175,9 @@ statically-invalid config.
 The **Locus** column says *where* the problem is, so the validation endpoint can group its
 report (`config`-level vs a named `pipeline`) and point the operator to the right place. A
 `pipeline`-locus **error still rejects the whole config** — locus is diagnostic, not a blast
-radius. `reload` locus marks a rule that can only fire on reload.
+radius. `reload` locus marks a rule that can only fire on reload. A diagnostic for a value written
+in `defaults` (§8.6) has locus `config` and a `defaults.…` path, whatever the rule's Locus column
+says: that column describes the rule as it applies to a pipeline.
 
 A diagnostic that no V-rule covers carries `PARSE` or `TYPE` in place of a rule ID. `PARSE` covers
 YAML syntax or structure, an unknown key, and a required field with no rule of its own. `TYPE`
@@ -1577,7 +1579,8 @@ Every deviation, so nothing is silent:
     per server (`host` + `port`), V-059 per database including `port`; V-067/V-068/V-069 and §11:
     a file reference is read only when its setting is in effect; §11: an optional value that
     resolves to empty is absent; new §8.6 (validation of `defaults` on its own); §6.2 cluster-anchor
-    `fingerprint_key` and keyed fingerprints (§11.1); diagnostics never show env-resolved values.
+    `fingerprint_key` and keyed fingerprints (§11.1); diagnostics never show env-resolved values; §13 intro: a
+    diagnostic for a `defaults` value has locus `config`.
 
 None of these change the **decided** catalog-auth schema (hive Thrift `none/ldap/kerberos`;
 rest HTTP `none/bearer/oauth2/sigv4`) — those are reproduced verbatim from
