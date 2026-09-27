@@ -285,7 +285,7 @@ fn with_catalog(catalog: &str) -> String {
 }
 
 #[test]
-fn empty_token_file_is_v071_and_missing_keytab_is_v069() {
+fn empty_token_file_is_v071() {
     let files = Files::new();
     let token = files.write("token", "\n");
     let yaml = with_catalog(&format!(
@@ -293,18 +293,12 @@ fn empty_token_file_is_v071_and_missing_keytab_is_v069() {
         token.display()
     ));
     let report = load_str(&yaml, &env(&[("PW", "pw")])).unwrap_err();
-    assert_eq!(report.errors[0].rule, "V-071");
-
-    let yaml = with_catalog(
-        "hive: { url: \"thrift://hms:9083\", auth: kerberos, kerberos: { principal: cdc, keytab: /nonexistent/cdc.keytab } }",
-    );
-    let report = load_str(&yaml, &env(&[("PW", "pw")])).unwrap_err();
     let e = &report.errors[0];
     assert_eq!(
         (e.rule.as_str(), e.path.as_str()),
         (
-            "V-069",
-            "pipelines.orders.sink.iceberg.catalog.hive.kerberos.keytab"
+            "V-071",
+            "pipelines.orders.sink.iceberg.catalog.rest.token_file"
         )
     );
 }

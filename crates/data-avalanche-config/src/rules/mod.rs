@@ -7,6 +7,7 @@ use crate::leaf::Leaf;
 use crate::path::YamlPath;
 use crate::raw::{RawConfig, RawPipeline};
 
+mod domain;
 mod identity;
 mod structure;
 
@@ -14,6 +15,7 @@ mod structure;
 pub fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut Ctx) {
     structure::check(raw, merged, ctx);
     identity::check(raw, merged, ctx);
+    domain::check(raw, merged, ctx);
 }
 
 /// `pipelines.<name>` as a pipeline-locus location.

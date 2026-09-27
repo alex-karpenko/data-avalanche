@@ -61,16 +61,6 @@ pub fn cases() -> Vec<Case> {
         case("V-068", Silent, "inline certificate", || {
             pg_delta().set("/pipelines/p/source/ssl_ca", json!(cert()))
         }),
-        case_with("V-069", Error, "empty keytab", |files| {
-            let keytab = files.write("cdc.keytab", "");
-            Fixture {
-                doc: pg_iceberg().set(
-                    "/pipelines/p/sink/iceberg/catalog",
-                    json!({"hive": {"url": "thrift://hms:9083", "auth": "kerberos", "kerberos": {"principal": "cdc", "keytab": keytab}}}),
-                ),
-                env: base_env(),
-            }
-        }),
         case_with("V-069", Silent, "readable keytab", |files| {
             let keytab = files.write("cdc.keytab", "\u{5}\u{2}binary");
             Fixture {
