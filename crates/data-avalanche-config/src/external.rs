@@ -28,12 +28,26 @@ pub struct ClusterAnchor {
 
 /// V-062, V-076, V-094: this node's cluster-wide settings must equal the anchor's. An error means
 /// the node refuses to start.
+///
+/// V-062 and V-094 print only the field name and the anchor's value, never this node's
+/// `globals.cluster` value: it may have come from `${VAR}`, and by the time it reaches the
+/// resolved `Globals` there's no leaf left to say so, so the value can't be redacted the way a
+/// templated leaf's can — it's simply never printed. V-076 (`lock_backend`) is a parsed enum, not
+/// a number or a secret-shaped value, and keeps printing both sides (controller ruling).
 pub fn check_cluster_anchor(globals: &Globals, anchor: &ClusterAnchor) -> Report {
     let mut ctx = Ctx::structural();
     let at = At::config(YamlPath::root().key("globals").key("cluster"));
     let c = &globals.cluster;
     if c.tokens != anchor.tokens {
-        ctx.error("V-062", &at.key("tokens"), None, format!("tokens is {} but the cluster was established with {}; every node must use the same value", c.tokens, anchor.tokens));
+        ctx.error(
+            "V-062",
+            &at.key("tokens"),
+            None,
+            format!(
+                "tokens differs from the cluster's established value {}; every node must use the same value",
+                anchor.tokens
+            ),
+        );
     }
     if c.lock_backend != anchor.lock_backend {
         ctx.error("V-076", &at.key("lock_backend"), None, format!("lock_backend is {} but the cluster uses {}; a mixed-backend cluster has two arbiters", c.lock_backend, anchor.lock_backend));
@@ -44,8 +58,7 @@ pub fn check_cluster_anchor(globals: &Globals, anchor: &ClusterAnchor) -> Report
             &at.key("lease_duration"),
             None,
             format!(
-                "lease_duration is {} but the cluster was established with {}",
-                format_duration(c.lease_duration),
+                "lease_duration differs from the cluster's established value {}",
                 format_duration(anchor.lease_duration)
             ),
         );

@@ -494,7 +494,7 @@ pub const RULES: &[RuleMeta] = &[
         "config",
         Config,
         r#"source.postgres.slot"#,
-        r#"Matches ^[a-z_][a-z0-9_]{0,62}$; unique per source host+db across pipelines."#,
+        r#"Matches ^[a-z_][a-z0-9_]{0,62}$; unique per source server (host + port) across pipelines — PostgreSQL scopes slot names to the server, not the database."#,
     ),
     rule(
         "V-059",
@@ -502,7 +502,7 @@ pub const RULES: &[RuleMeta] = &[
         "pipeline",
         Config,
         r#"source.postgres.publication"#,
-        r#"Valid identifier; uniqueness per source DB recommended."#,
+        r#"Valid identifier; uniqueness per source database (host + port + db) recommended."#,
     ),
     rule(
         "V-060",

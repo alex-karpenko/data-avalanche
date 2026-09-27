@@ -443,6 +443,7 @@ fn env_resolved_at_least_check_hides_the_value_in_v074() {
         .iter()
         .find(|d| d.rule == "V-074")
         .unwrap_or_else(|| panic!("no V-074 diagnostic: {report:#?}"));
+    assert!(!e.message.contains("got 0"), "{}", e.message);
     assert!(!e.message.contains(" 0"), "{}", e.message);
     assert!(e.message.contains("${SECRET}"), "{}", e.message);
     assert!(!report.to_json().to_string().contains("\"0\""));

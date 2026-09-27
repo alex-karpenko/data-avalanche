@@ -16,15 +16,26 @@ use cases::{Case, Expect};
 use data_avalanche_config::{Locus, RULES, RuleInput, Severity, rule_meta, validate_str};
 
 /// Whether `locus` is one the registry's §13 "Locus" column allows for a rule, given its text
-/// exactly as `src/registry.rs` writes it (`"config"`, `"pipeline"`, `"config / pipeline"`,
-/// `"config (startup)"`, `"reload"`).
+/// exactly as `src/registry.rs` writes it (`"config"`, `"pipeline"`, `"pipeline (resolution)"`,
+/// `"config / pipeline"`, `"config (startup)"`, `"reload"`). Panics on any other spelling — see
+/// `every_registry_locus_is_recognized`, which checks every `RULES` entry against that panic.
 fn locus_allowed(column: &str, locus: &Locus) -> bool {
     match column {
         "config" | "config (startup)" => matches!(locus, Locus::Config),
-        "pipeline" => matches!(locus, Locus::Pipeline(_)),
+        "pipeline" | "pipeline (resolution)" => matches!(locus, Locus::Pipeline(_)),
         "config / pipeline" => matches!(locus, Locus::Config | Locus::Pipeline(_)),
         "reload" => matches!(locus, Locus::Reload),
         other => panic!("unrecognized registry locus column {other:?}"),
+    }
+}
+
+/// So a future §13 locus spelling can't silently slip past `locus_allowed`'s `other => panic!`
+/// arm (and so `rule_cases` skip its check for that rule): every `RULES` entry's locus column must
+/// be one `locus_allowed` recognizes, independent of which rule fired.
+#[test]
+fn every_registry_locus_is_recognized() {
+    for rule in RULES {
+        locus_allowed(rule.locus, &Locus::Config);
     }
 }
 
