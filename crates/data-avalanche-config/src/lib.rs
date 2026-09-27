@@ -39,6 +39,7 @@ pub mod rules;
 pub mod secret;
 pub mod template;
 pub mod units;
+mod walk;
 
 pub use coerce::{LeafType, LogFilter};
 pub use ctx::{At, Ctx};

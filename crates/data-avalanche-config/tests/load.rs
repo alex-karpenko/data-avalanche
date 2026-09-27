@@ -666,3 +666,62 @@ fn unreadable_config_file_is_a_parse_error() {
             .starts_with("cannot read config file")
     );
 }
+
+// FU-C (config §11 Phase 2): an optional value that resolves to empty is absent, so its default
+// applies — for a tri-state field, the default, not `null`.
+
+#[test]
+fn empty_optional_otlp_endpoint_is_absent() {
+    let yaml = MINIMAL.replace(
+        "globals:\n  state: { bucket: app-state }",
+        "globals:\n  state: { bucket: app-state }\n  tracing: { otlp_endpoint: \"${OTLP:-}\" }",
+    );
+    let cfg = load_str(&yaml, &env(&[("PW", "pw")]))
+        .unwrap_or_else(|r| panic!("{r:#?}"))
+        .config;
+    assert_eq!(
+        cfg.globals.tracing,
+        Tracing {
+            otlp_endpoint: None,
+            sample_ratio: 0.0,
+        },
+        "an otlp_endpoint that resolves empty is absent, exactly as if it were never written"
+    );
+}
+
+#[test]
+fn empty_optional_ssl_mode_falls_back_through_defaults() {
+    let yaml = MINIMAL
+        .replace(
+            "pipelines:",
+            "defaults:\n  source: { ssl_mode: disable }\npipelines:",
+        )
+        .replace(
+            "postgres: { publication: orders_pub, slot: orders_slot }",
+            "postgres: { publication: orders_pub, slot: orders_slot }\n      ssl_mode: \"${M:-}\"",
+        );
+    let cfg = load_str(&yaml, &env(&[("PW", "pw")]))
+        .unwrap_or_else(|r| panic!("{r:#?}"))
+        .config;
+    assert_eq!(
+        cfg.pipelines["orders"].source.ssl_mode,
+        SslMode::Disable,
+        "the pipeline's own ssl_mode resolves empty, so it's absent and defaults.source.ssl_mode applies"
+    );
+}
+
+#[test]
+fn empty_optional_tri_state_flush_seconds_falls_back_to_the_default_not_disabled() {
+    let yaml = MINIMAL.replace(
+        "delta: {}",
+        "delta: {}\n      flush: { seconds: \"${S:-}\" }",
+    );
+    let cfg = load_str(&yaml, &env(&[("PW", "pw")]))
+        .unwrap_or_else(|r| panic!("{r:#?}"))
+        .config;
+    assert_eq!(
+        cfg.pipelines["orders"].sink.flush.seconds,
+        Some(30),
+        "an empty tri-state value is absent (apply the default), not null (disabled)"
+    );
+}

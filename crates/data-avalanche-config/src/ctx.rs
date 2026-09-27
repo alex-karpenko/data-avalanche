@@ -178,6 +178,17 @@ impl<'e> Ctx<'e> {
         }
     }
 
+    /// The leaf's expanded text without reporting anything (`Walk::drop_empty`, §11 Phase 2:
+    /// "empty is absent"). `None` when the text is a template not yet known (structural pass) or
+    /// fails to expand — its own coercion later reports that; a leaf that fails here is never
+    /// treated as empty, only as "not yet known".
+    pub(crate) fn peek_text<T>(&self, leaf: &Leaf<T>) -> Option<String> {
+        match expand(leaf.text(), self.env) {
+            Ok(Expanded::Text(t)) => Some(t),
+            _ => None,
+        }
+    }
+
     pub fn error(&mut self, rule: &str, at: &At, loc: Option<Loc>, message: impl Into<String>) {
         self.push(rule, Severity::Error, at, loc, message.into());
     }

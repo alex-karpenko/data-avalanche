@@ -11,6 +11,7 @@ use crate::raw::RawConfig;
 use crate::resolved::ResolvedConfig;
 use crate::rules;
 use crate::template::Env;
+use crate::walk::Walk;
 
 /// A config that passed every phase. `warnings` never block loading (§1.3).
 #[derive(Debug, Clone)]
@@ -25,13 +26,31 @@ fn only(d: Diagnostic) -> Report {
     r
 }
 
+/// §11 Phase 2 ("an optional value that resolves to empty is absent") and §8.6 ("`defaults`
+/// validated on its own"): before merging, every optional leaf of `raw.globals`, `raw.defaults`
+/// and each raw pipeline whose resolved text is empty becomes absent, so "absent" uniformly means
+/// "inherit from `defaults`, then the spec default" (§8). Run once per pass — the structural pass
+/// (`ctx.is_resolving() == false`) only ever finds a literal `""` empty (an unresolved template
+/// isn't known to be empty yet); the resolving pass additionally drops a template that resolves to
+/// `""`, on top of whatever the structural pass already dropped.
+fn drop_empty(raw: &mut RawConfig, ctx: &Ctx) {
+    raw.globals.drop_empty(ctx);
+    raw.defaults.drop_empty(ctx);
+    if let Some(pipelines) = &mut raw.pipelines {
+        for p in pipelines.values_mut() {
+            p.drop_empty(ctx);
+        }
+    }
+}
+
 /// Loads config text. Any error rejects the whole config (§1.4) and the report lists every error
 /// of the phase that failed (the first one only for a Phase 0 parse error).
 pub fn load_str(text: &str, env: &dyn Env) -> Result<Loaded, Report> {
-    let raw: RawConfig = parse_document(text).map_err(|d| only(*d))?;
+    let mut raw: RawConfig = parse_document(text).map_err(|d| only(*d))?;
 
     // Phase 1: references unresolved; no environment, no files.
     let mut ctx = Ctx::structural();
+    drop_empty(&mut raw, &ctx);
     let merged = merge_all(&raw, &ctx);
     rules::check(&raw, &merged, &mut ctx);
     build(&raw, &merged, &mut ctx);
@@ -43,6 +62,7 @@ pub fn load_str(text: &str, env: &dyn Env) -> Result<Loaded, Report> {
     // Phases 2 and 3: substitute, read files, apply defaults, check everything again with the
     // now-known values (a rule skipped on a template in Phase 1 runs here).
     let mut ctx = Ctx::resolving(env);
+    drop_empty(&mut raw, &ctx);
     let merged = merge_all(&raw, &ctx);
     rules::check(&raw, &merged, &mut ctx);
     let config = build(&raw, &merged, &mut ctx);

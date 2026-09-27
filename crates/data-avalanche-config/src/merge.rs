@@ -58,7 +58,9 @@ impl<V> Merge for Option<BTreeMap<String, V>> {
     }
 }
 
-/// Field-by-field merge for a plain object.
+/// Field-by-field merge for a plain object. Also generates [`crate::walk::Walk`] for the same
+/// struct from the same field list (`crate::walk::walk_fields!`), so the raw-model walker (config
+/// §11 Phase 2, §8.6) can't drift from this one by hand-maintaining a second copy of it.
 macro_rules! merge_struct {
     ($t:ident { $($f:ident),+ $(,)? }) => {
         impl Merge for Option<$t> {
@@ -69,6 +71,7 @@ macro_rules! merge_struct {
                 }
             }
         }
+        crate::walk::walk_fields!($t { $($f),+ });
     };
 }
 
