@@ -42,7 +42,7 @@ pub const CLASSES: &[(&str, Mutability)] = &[
     ("globals.tracing", R),
     ("globals.azure", Proc),
     ("pipelines.*.name", R),
-    ("pipelines.*.id", Pr),
+    ("pipelines.*.id", Pr), // Diffs match pipelines by `id`, so a field-level `id` change never happens (an `id` change is remove + add, §9.1). This entry exists only so `unclassified_paths` covers the path.
     ("pipelines.*.source", Pr),
     ("pipelines.*.source.postgres.auto_cleanup", R),
     ("pipelines.*.source.postgres.heartbeat", R),

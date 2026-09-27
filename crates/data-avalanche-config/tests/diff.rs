@@ -156,6 +156,21 @@ fn include_change_restarts_only_when_the_table_set_changes() {
     );
 }
 
+#[test]
+fn table_keyed_paths_quote_the_table_name() {
+    let old = MINIMAL.replace(
+        "include: [public.orders]",
+        "include: [public.orders]\n      primary_key: { public.orders: [id] }",
+    );
+    let new = old.replace("[id]", "[id, region]");
+    let (_, fields, _) = modified(&diff(&load(&old), &load(&new), &unknown));
+    let paths: Vec<&str> = fields.iter().map(|(p, _)| p.as_str()).collect();
+    assert_eq!(
+        paths,
+        [r#"pipelines.orders.tables.primary_key["public.orders"]"#]
+    );
+}
+
 /// Every leaf of these configs is covered by a mutability pattern.
 #[test]
 fn every_resolved_path_has_a_class() {

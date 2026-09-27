@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use crate::diag::{Diagnostic, Locus, Report, Severity};
 use crate::mutability::{Mutability, classify};
+use crate::path::YamlPath;
 use crate::resolved::{Pipeline, ResolvedConfig};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -108,6 +109,14 @@ fn class_of(path: &[String]) -> Mutability {
     classify(&segments).unwrap_or(Mutability::Pr)
 }
 
+/// A flattened path in the crate's dotted form (`YamlPath`), so a key such as `public.orders`
+/// prints as `["public.orders"]` rather than as two segments.
+fn dotted(path: &[String]) -> String {
+    path.iter()
+        .fold(YamlPath::root(), |p, k| p.key(k.as_str()))
+        .to_string()
+}
+
 /// Diffs `new` against `old`. `table_set_changed(old, new)` answers whether a pipeline's resolved
 /// table set changed (it needs the live source); `None` means "unknown", which counts as changed.
 pub fn diff(
@@ -122,7 +131,7 @@ pub fn diff(
     new_g.insert(vec!["config_version".into()], new.config_version.into());
     for path in changed_paths(&old_g, &new_g) {
         let class = class_of(&path);
-        let text = path.join(".");
+        let text = dotted(&path);
         if class == Mutability::Proc {
             out.report.push(Diagnostic {
                 locus: Locus::Reload,
@@ -175,7 +184,7 @@ pub fn diff(
                     c => c,
                 };
                 FieldChange {
-                    path: path.join("."),
+                    path: dotted(path),
                     class,
                 }
             })
@@ -200,6 +209,6 @@ pub fn unclassified_paths(cfg: &ResolvedConfig) -> Vec<String> {
     }
     all.keys()
         .filter(|p| classify(&p.iter().map(String::as_str).collect::<Vec<_>>()).is_none())
-        .map(|p| p.join("."))
+        .map(|p| dotted(p))
         .collect()
 }
