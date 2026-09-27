@@ -409,6 +409,52 @@ fn env_resolved_enum_hides_the_value_in_its_rule() {
     assert!(!report.to_json().to_string().contains("s3cr3t-value-123"));
 }
 
+#[test]
+fn env_resolved_duplicate_slot_hides_the_value_in_v058() {
+    let yaml = r#"
+config_version: 1
+globals:
+  state: { bucket: app-state }
+pipelines:
+  orders:
+    id: orders
+    source:
+      host: db.example.com
+      db: shop
+      user: cdc
+      password: ${PW}
+      postgres: { publication: orders_pub, slot: "${S}" }
+    tables:
+      include: [public.orders]
+    sink:
+      type: delta
+      bucket: lake
+      delta: {}
+  orders2:
+    id: orders2
+    source:
+      host: db.example.com
+      db: shop
+      user: cdc
+      password: ${PW}
+      postgres: { publication: orders2_pub, slot: "${S}" }
+    tables:
+      include: [public.orders]
+    sink:
+      type: delta
+      bucket: lake
+      delta: {}
+"#;
+    let report = load_str(yaml, &env(&[("PW", "pw"), ("S", "dup_slot_x")])).unwrap_err();
+    let hits: Vec<_> = report.errors.iter().filter(|d| d.rule == "V-058").collect();
+    assert_eq!(hits.len(), 2, "{report:#?}");
+    for e in &hits {
+        assert!(!e.message.contains("dup_slot_x"), "{}", e.message);
+        assert!(e.message.contains("${S}"), "{}", e.message);
+    }
+    assert!(!report.to_json().to_string().contains("dup_slot_x"));
+}
+
 // F3: `null` on `tables.include`/`exclude` clears an inherited list instead of falling back to it
 // (end to end; the merge-level behavior is covered in `tests/merge.rs`).
 

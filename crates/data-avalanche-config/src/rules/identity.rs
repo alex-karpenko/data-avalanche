@@ -3,10 +3,20 @@
 use std::collections::BTreeMap;
 
 use super::pipeline_at;
+use crate::build::DEFAULT_POSTGRES_PORT;
 use crate::ctx::{At, Ctx, shown};
 use crate::enums::SourceType;
+use crate::leaf::Leaf;
 use crate::path::YamlPath;
 use crate::raw::{RawConfig, RawPipeline};
+
+/// V-056 dedup entries: the pipeline name and the id's redacted display text.
+type IdEntries<'a> = Vec<(&'a str, String)>;
+/// V-058 dedup entries: the pipeline name, then the host's and the slot's redacted display text.
+type SlotEntries<'a> = Vec<(&'a str, String, String)>;
+/// V-059 dedup entries: the pipeline name, then the host's, db's and publication's redacted
+/// display text.
+type PublicationEntries<'a> = Vec<(&'a str, String, String, String)>;
 
 /// `^[a-z0-9][a-z0-9_-]{0,62}$` (V-055).
 fn is_pipeline_id(s: &str) -> bool {
@@ -91,9 +101,15 @@ pub fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut Ctx) {
         }
     }
 
-    let mut ids: BTreeMap<String, Vec<&str>> = BTreeMap::new();
-    let mut slots: BTreeMap<(String, String, String), Vec<&str>> = BTreeMap::new();
-    let mut publications: BTreeMap<(String, String, String), Vec<&str>> = BTreeMap::new();
+    // V-058 is keyed on the source *server* (`host` + `port`), not the database: PostgreSQL
+    // scopes slot names to the server. V-059 is keyed on `host` + `port` + `db`. The display
+    // strings (built with `Ctx::shown`) travel next to each entry so the diagnostic never prints
+    // an env-resolved id/slot/publication/host/db — only the key, used for comparison, is the
+    // resolved value.
+    let mut ids: BTreeMap<String, IdEntries<'_>> = BTreeMap::new();
+    let mut slots: BTreeMap<(String, u16, String), SlotEntries<'_>> = BTreeMap::new();
+    let mut publications: BTreeMap<(String, u16, String, String), PublicationEntries<'_>> =
+        BTreeMap::new();
     for (name, p) in merged {
         let at = pipeline_at(name);
         // V-057
@@ -111,7 +127,8 @@ pub fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut Ctx) {
             Some(l) => {
                 if let Some(id) = ctx.text(l, &at.key("id")) {
                     if is_pipeline_id(&id) {
-                        ids.entry(id).or_default().push(name);
+                        let id_shown = shown(l, &id);
+                        ids.entry(id).or_default().push((name, id_shown));
                     } else {
                         ctx.error(
                             "V-055",
@@ -133,14 +150,22 @@ pub fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut Ctx) {
             continue;
         };
         let pg_at = at.key("source").key("postgres");
-        let host = src
+        let host: Option<(&Leaf<String>, String)> = src
             .host
             .as_ref()
-            .and_then(|l| ctx.text(l, &at.key("source").key("host")));
-        let db = src
+            .and_then(|l| ctx.text(l, &at.key("source").key("host")).map(|t| (l, t)));
+        // The resolved port, or PostgreSQL's default when absent (build.rs uses the same
+        // constant); `None` only when a given port fails to coerce.
+        let port: Option<(Option<&Leaf<u16>>, u16)> = match &src.port {
+            Some(l) => ctx
+                .value(l, &at.key("source").key("port"))
+                .map(|v| (Some(l), v)),
+            None => Some((None, DEFAULT_POSTGRES_PORT)),
+        };
+        let db: Option<(&Leaf<String>, String)> = src
             .db
             .as_ref()
-            .and_then(|l| ctx.text(l, &at.key("source").key("db")));
+            .and_then(|l| ctx.text(l, &at.key("source").key("db")).map(|t| (l, t)));
         if let Some(l) = &pg.slot
             && let Some(slot) = ctx.text(l, &pg_at.key("slot"))
         {
@@ -154,11 +179,13 @@ pub fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut Ctx) {
                         shown(l, &slot)
                     ),
                 );
-            } else if let (Some(h), Some(d)) = (&host, &db) {
+            } else if let (Some((host_leaf, host)), Some((_, port))) = (&host, &port) {
+                let slot_shown = shown(l, &slot);
+                let host_shown = shown(*host_leaf, host);
                 slots
-                    .entry((h.clone(), d.clone(), slot))
+                    .entry((host.clone(), *port, slot))
                     .or_default()
-                    .push(name);
+                    .push((name, host_shown, slot_shown));
             }
         }
         if let Some(l) = &pg.publication
@@ -174,28 +201,35 @@ pub fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut Ctx) {
                         shown(l, &publication)
                     ),
                 );
-            } else if let (Some(h), Some(d)) = (&host, &db) {
+            } else if let (Some((host_leaf, host)), Some((_, port)), Some((db_leaf, db))) =
+                (&host, &port, &db)
+            {
+                let publication_shown = shown(l, &publication);
+                let host_shown = shown(*host_leaf, host);
+                let db_shown = shown(*db_leaf, db);
                 publications
-                    .entry((h.clone(), d.clone(), publication))
+                    .entry((host.clone(), *port, db.clone(), publication))
                     .or_default()
-                    .push(name);
+                    .push((name, host_shown, db_shown, publication_shown));
             }
         }
     }
     // V-056
-    for (id, names) in ids.iter().filter(|(_, n)| n.len() > 1) {
-        for name in names {
+    for (_, entries) in ids.iter().filter(|(_, n)| n.len() > 1) {
+        let names: Vec<&str> = entries.iter().map(|(n, _)| *n).collect();
+        for (name, id_shown) in entries {
             ctx.error(
                 "V-056",
                 &At::config(pipeline_at(name).path.key("id")),
                 None,
-                format!("id {id:?} is used by pipelines {}", names.join(", ")),
+                format!("id {id_shown} is used by pipelines {}", names.join(", ")),
             );
         }
     }
-    // V-058 (uniqueness per source host+db)
-    for ((host, db, slot), names) in slots.iter().filter(|(_, n)| n.len() > 1) {
-        for name in names {
+    // V-058 (uniqueness per source server: host + port)
+    for ((_, port, _), entries) in slots.iter().filter(|(_, n)| n.len() > 1) {
+        let names: Vec<&str> = entries.iter().map(|(n, _, _)| *n).collect();
+        for (name, host_shown, slot_shown) in entries {
             ctx.error(
                 "V-058",
                 &At::config(
@@ -207,15 +241,16 @@ pub fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut Ctx) {
                 ),
                 None,
                 format!(
-                    "slot {slot:?} on {host}/{db} is used by pipelines {}",
+                    "slot {slot_shown} on server {host_shown}:{port} is used by pipelines {}",
                     names.join(", ")
                 ),
             );
         }
     }
-    // V-059 (uniqueness recommended)
-    for ((host, db, publication), names) in publications.iter().filter(|(_, n)| n.len() > 1) {
-        for name in names {
+    // V-059 (uniqueness recommended per source database: host + port + db)
+    for ((_, port, _, _), entries) in publications.iter().filter(|(_, n)| n.len() > 1) {
+        let names: Vec<&str> = entries.iter().map(|(n, _, _, _)| *n).collect();
+        for (name, host_shown, db_shown, publication_shown) in entries {
             ctx.warning(
                 "V-059",
                 &pipeline_at(name)
@@ -224,7 +259,7 @@ pub fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut Ctx) {
                     .key("publication"),
                 None,
                 format!(
-                    "publication {publication:?} on {host}/{db} is shared by pipelines {}",
+                    "publication {publication_shown} on server {host_shown}:{port}/{db_shown} is shared by pipelines {}",
                     names.join(", ")
                 ),
             );

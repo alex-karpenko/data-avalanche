@@ -28,6 +28,10 @@ pub const DEFAULT_LEASE_RENEWAL_INTERVAL: Duration = Duration::from_secs(5);
 pub const DEFAULT_FLUSH_SECONDS: u64 = 30;
 pub const DEFAULT_FLUSH_ROWS: u64 = 100_000;
 pub const DEFAULT_FLUSH_BYTES: u64 = 512 * ByteSize::MIB;
+/// PostgreSQL's default port, when `source.port` is absent. Reused by V-058 (slot uniqueness is
+/// scoped to the source server, `host` + `port`), so the number lives in one place.
+pub const DEFAULT_POSTGRES_PORT: u16 = 5432;
+pub const DEFAULT_MYSQL_PORT: u16 = 3306;
 
 /// A field that has a default: absent → `Some(default)`; present → its value (`None` if unknown
 /// or invalid).
@@ -660,8 +664,8 @@ fn source(s: &RawSource, at: &At, ctx: &mut Ctx) -> Option<Source> {
         SourceType::Mysql => (None, Some(mysql?)),
     };
     let default_port = match kind {
-        SourceType::Postgres => 5432,
-        SourceType::Mysql => 3306,
+        SourceType::Postgres => DEFAULT_POSTGRES_PORT,
+        SourceType::Mysql => DEFAULT_MYSQL_PORT,
     };
     Some(Source {
         kind,

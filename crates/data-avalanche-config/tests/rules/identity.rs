@@ -47,11 +47,29 @@ pub fn cases() -> Vec<Case> {
         case("V-058", Error, "slot shared on one host+db", || {
             two_pipelines().set("/pipelines/q/source/postgres/slot", json!("p_slot"))
         }),
-        case("V-058", Silent, "same slot name on another db", || {
-            two_pipelines()
-                .set("/pipelines/q/source/postgres/slot", json!("p_slot"))
-                .set("/pipelines/q/source/db", json!("other"))
-        }),
+        // V-058 scopes the slot to the source *server* (`host` + `port`), not the database:
+        // PostgreSQL slots live on the server, so a different `db` doesn't excuse a collision.
+        case(
+            "V-058",
+            Error,
+            "slot shared on one host, different db",
+            || {
+                two_pipelines()
+                    .set("/pipelines/q/source/postgres/slot", json!("p_slot"))
+                    .set("/pipelines/q/source/db", json!("other"))
+            },
+        ),
+        case(
+            "V-058",
+            Silent,
+            "same slot name on a different port",
+            || {
+                two_pipelines()
+                    .set("/pipelines/p/source/port", json!(5432))
+                    .set("/pipelines/q/source/port", json!(5433))
+                    .set("/pipelines/q/source/postgres/slot", json!("p_slot"))
+            },
+        ),
         case("V-059", Warning, "publication needs quoting", || {
             pg_delta().set("/pipelines/p/source/postgres/publication", json!("p-pub"))
         }),
