@@ -271,6 +271,89 @@ fn bad_pem_is_v068() {
     assert!(e.message.contains("no certificate"), "{}", e.message);
 }
 
+// F1: a diagnostic never prints a file-reference field's resolved value, whether that value came
+// from the environment or is literal text that only looks like something else (config §13.9).
+
+#[test]
+fn inline_key_with_leading_whitespace_is_accepted() {
+    let yaml = MINIMAL.replace(
+        "postgres: { publication: orders_pub, slot: orders_slot }",
+        "postgres: { publication: orders_pub, slot: orders_slot }\n      ssl_key: \"${KEY}\"",
+    );
+    let leading = format!("\n{}", support::key());
+    let cfg = load_str(&yaml, &env(&[("PW", "pw"), ("KEY", &leading)]))
+        .unwrap_or_else(|r| panic!("{r:#?}"))
+        .config;
+    assert!(matches!(
+        cfg.pipelines["orders"]
+            .source
+            .ssl_key
+            .as_ref()
+            .unwrap()
+            .origin,
+        Origin::Inline
+    ));
+}
+
+#[test]
+fn credentials_file_that_looks_like_json_is_never_shown() {
+    let yaml = MINIMAL.replace(
+        "user: cdc\n      password: ${PW}",
+        r#"credentials_file: '{"user":"u","password":"hunter2"}'"#,
+    );
+    let report = load_str(&yaml, &env(&[])).unwrap_err();
+    let e = &report.errors[0];
+    assert_eq!(e.rule, "V-067");
+    assert!(!e.message.contains("hunter2"), "{}", e.message);
+    assert!(!report.to_json().to_string().contains("hunter2"));
+}
+
+#[test]
+fn env_resolved_ssl_key_path_is_never_shown() {
+    let yaml = MINIMAL.replace(
+        "postgres: { publication: orders_pub, slot: orders_slot }",
+        "postgres: { publication: orders_pub, slot: orders_slot }\n      ssl_key: \"${KEY}\"",
+    );
+    let report = load_str(
+        &yaml,
+        &env(&[("PW", "pw"), ("KEY", "c2VjcmV0LWtleS1tYXRlcmlhbA==")]),
+    )
+    .unwrap_err();
+    let e = &report.errors[0];
+    assert_eq!(
+        (e.rule.as_str(), e.path.as_str()),
+        ("V-068", "pipelines.orders.source.ssl_key")
+    );
+    assert!(
+        !e.message.contains("c2VjcmV0LWtleS1tYXRlcmlhbA=="),
+        "{}",
+        e.message
+    );
+    assert!(e.message.contains("${KEY}"), "{}", e.message);
+    assert!(
+        !report
+            .to_json()
+            .to_string()
+            .contains("c2VjcmV0LWtleS1tYXRlcmlhbA==")
+    );
+}
+
+#[test]
+fn env_resolved_token_file_path_is_never_shown() {
+    let yaml = with_catalog("rest: { url: \"https://c\", auth: bearer, token_file: \"${TOK}\" }");
+    let report = load_str(&yaml, &env(&[("PW", "pw"), ("TOK", "tok-abc123-secret")])).unwrap_err();
+    let e = &report.errors[0];
+    assert_eq!(
+        (e.rule.as_str(), e.path.as_str()),
+        (
+            "V-071",
+            "pipelines.orders.sink.iceberg.catalog.rest.token_file"
+        )
+    );
+    assert!(!e.message.contains("tok-abc123-secret"), "{}", e.message);
+    assert!(!report.to_json().to_string().contains("tok-abc123-secret"));
+}
+
 const ICEBERG_SINK: &str = "sink:
       type: iceberg
       bucket: lake

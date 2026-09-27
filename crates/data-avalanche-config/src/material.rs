@@ -10,55 +10,64 @@ use serde::Serialize;
 
 use crate::secret::{Secret, fingerprint};
 
-fn read(path: &Path) -> Result<Vec<u8>, String> {
-    let bytes = fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+/// Reads `path`; every message names it by `label`, never by its own text, so a resolved path (an
+/// env substitution) or file content never reaches a diagnostic (F1, config §13.9).
+fn read(path: &Path, label: &str) -> Result<Vec<u8>, String> {
+    let bytes = fs::read(path).map_err(|e| format!("cannot read {label}: {e}"))?;
     if bytes.is_empty() {
-        return Err(format!("{} is empty", path.display()));
+        return Err(format!("{label} is empty"));
     }
     Ok(bytes)
 }
 
 /// A JSON object file holding two non-empty string fields (V-067): `{user, password}` or
-/// `{client_id, client_secret}`. Other fields are ignored.
-pub fn read_json_pair(path: &Path, first: &str, second: &str) -> Result<(String, Secret), String> {
-    let bytes = read(path)?;
-    let doc: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|e| format!("{} is not valid JSON: {e}", path.display()))?;
+/// `{client_id, client_secret}`. Other fields are ignored. `label` is what a message calls the
+/// file: never its resolved path or content.
+pub fn read_json_pair(
+    path: &Path,
+    label: &str,
+    first: &str,
+    second: &str,
+) -> Result<(String, Secret), String> {
+    let bytes = read(path, label)?;
+    let doc: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("{label} is not valid JSON: {e}"))?;
     let field = |name: &str| {
         doc.get(name)
             .and_then(|v| v.as_str())
             .filter(|v| !v.is_empty())
             .map(str::to_string)
-            .ok_or_else(|| format!("{} has no non-empty string field {name:?}", path.display()))
+            .ok_or_else(|| format!("{label} has no non-empty string field {name:?}"))
     };
     Ok((field(first)?, Secret::new(field(second)?)))
 }
 
-/// A bearer-token file (V-071): the raw contents, trailing whitespace trimmed, non-empty.
-pub fn read_token_file(path: &Path) -> Result<Secret, String> {
-    let bytes = read(path)?;
-    let text =
-        String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8 text", path.display()))?;
+/// A bearer-token file (V-071): the raw contents, trailing whitespace trimmed, non-empty. `label`
+/// is what a message calls the file: never its resolved path or content.
+pub fn read_token_file(path: &Path, label: &str) -> Result<Secret, String> {
+    let bytes = read(path, label)?;
+    let text = String::from_utf8(bytes).map_err(|_| format!("{label} is not UTF-8 text"))?;
     let token = text.trim_end();
     if token.is_empty() {
-        return Err(format!("{} holds only whitespace", path.display()));
+        return Err(format!("{label} holds only whitespace"));
     }
     Ok(Secret::new(token))
 }
 
 /// Any other referenced file (V-069, e.g. a Kerberos keytab): exists, readable, non-empty. Only
 /// the path and a content fingerprint are kept: the runtime re-reads the file when it reconnects,
-/// and the fingerprint lets a reload notice that the contents changed.
+/// and the fingerprint lets a reload notice that the contents changed. `label` is what a message
+/// calls the file: never its resolved path or content.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FileRef {
     pub path: PathBuf,
     pub fingerprint: String,
 }
 
-pub fn read_file_ref(path: &Path) -> Result<FileRef, String> {
+pub fn read_file_ref(path: &Path, label: &str) -> Result<FileRef, String> {
     Ok(FileRef {
         path: path.to_path_buf(),
-        fingerprint: fingerprint(&read(path)?),
+        fingerprint: fingerprint(&read(path, label)?),
     })
 }
 
@@ -86,20 +95,22 @@ pub enum PemKind {
     PrivateKey,
 }
 
-/// A `cert`/`key`/`ca` value (§4.4): inline PEM when it starts with `-----BEGIN`, otherwise a path.
-pub fn load_pem(value: &str, kind: PemKind) -> Result<Pem, String> {
-    let (origin, text) = if value.starts_with("-----BEGIN") {
-        (Origin::Inline, value.to_string())
+/// A `cert`/`key`/`ca` value (§4.4): inline PEM when its text, after leading whitespace, starts
+/// with `-----BEGIN`, otherwise a path. `label` is what a message calls the file when it is a
+/// path: never its resolved path or content (F1).
+pub fn load_pem(value: &str, label: &str, kind: PemKind) -> Result<Pem, String> {
+    let trimmed = value.trim_start();
+    let (origin, text) = if trimmed.starts_with("-----BEGIN") {
+        (Origin::Inline, trimmed.to_string())
     } else {
         let path = PathBuf::from(value);
-        let bytes = read(&path)?;
-        let text =
-            String::from_utf8(bytes).map_err(|_| format!("{} is not PEM text", path.display()))?;
+        let bytes = read(&path, label)?;
+        let text = String::from_utf8(bytes).map_err(|_| format!("{label} is not PEM text"))?;
         (Origin::File(path), text)
     };
     let from = match &origin {
         Origin::Inline => "inline PEM".to_string(),
-        Origin::File(p) => p.display().to_string(),
+        Origin::File(_) => label.to_string(),
     };
     match kind {
         PemKind::Certificates => {
@@ -142,10 +153,18 @@ mod tests {
         f
     }
 
+    /// These unit tests exercise the read mechanics directly, so they pass the path itself as the
+    /// label (mirroring the pre-F1 messages); computing a diagnostic-safe label from a leaf is
+    /// `build::file_label`'s job, covered by `tests/load.rs`.
+    fn label(path: &Path) -> String {
+        path.display().to_string()
+    }
+
     #[test]
     fn credentials_file_needs_both_fields_non_empty() {
         let ok = file(br#"{"user": "cdc", "password": "pw", "note": "ignored"}"#);
-        let (user, password) = read_json_pair(ok.path(), "user", "password").unwrap();
+        let (user, password) =
+            read_json_pair(ok.path(), &label(ok.path()), "user", "password").unwrap();
         assert_eq!((user.as_str(), password.expose()), ("cdc", "pw"));
         for (content, why) in [
             (
@@ -161,11 +180,11 @@ mod tests {
             (b"", "is empty"),
         ] {
             let f = file(content);
-            let err = read_json_pair(f.path(), "user", "password").unwrap_err();
+            let err = read_json_pair(f.path(), &label(f.path()), "user", "password").unwrap_err();
             assert!(err.contains(why), "{err}");
         }
-        let err =
-            read_json_pair(Path::new("/nonexistent/creds.json"), "user", "password").unwrap_err();
+        let missing = Path::new("/nonexistent/creds.json");
+        let err = read_json_pair(missing, &label(missing), "user", "password").unwrap_err();
         assert!(
             err.starts_with("cannot read /nonexistent/creds.json"),
             "{err}"
@@ -175,9 +194,15 @@ mod tests {
     #[test]
     fn token_file_is_trimmed_raw_text() {
         let f = file(b"tok-123\n\n");
-        assert_eq!(read_token_file(f.path()).unwrap().expose(), "tok-123");
+        assert_eq!(
+            read_token_file(f.path(), &label(f.path()))
+                .unwrap()
+                .expose(),
+            "tok-123"
+        );
+        let empty = file(b" \n");
         assert!(
-            read_token_file(file(b" \n").path())
+            read_token_file(empty.path(), &label(empty.path()))
                 .unwrap_err()
                 .contains("only whitespace")
         );
@@ -186,33 +211,57 @@ mod tests {
     #[test]
     fn pem_is_inline_or_a_path_and_must_hold_the_right_kind() {
         let (cert_pem, key_pem) = pem_pair();
-        let inline = load_pem(&cert_pem, PemKind::Certificates).unwrap();
+        let inline = load_pem(&cert_pem, "unused", PemKind::Certificates).unwrap();
         assert_eq!(inline.origin, Origin::Inline);
         let key_file = file(key_pem.as_bytes());
-        let key = load_pem(key_file.path().to_str().unwrap(), PemKind::PrivateKey).unwrap();
+        let key_label = label(key_file.path());
+        let key = load_pem(
+            key_file.path().to_str().unwrap(),
+            &key_label,
+            PemKind::PrivateKey,
+        )
+        .unwrap();
         assert_eq!(key.origin, Origin::File(key_file.path().to_path_buf()));
         assert!(
-            load_pem(&key_pem, PemKind::Certificates)
+            load_pem(&key_pem, "unused", PemKind::Certificates)
                 .unwrap_err()
                 .contains("no certificate")
         );
         assert!(
-            load_pem(&cert_pem, PemKind::PrivateKey)
+            load_pem(&cert_pem, "unused", PemKind::PrivateKey)
                 .unwrap_err()
                 .contains("no private key")
         );
         assert!(
             load_pem(
                 "-----BEGIN CERTIFICATE-----\nnot base64!\n-----END CERTIFICATE-----\n",
+                "unused",
                 PemKind::Certificates
             )
             .is_err()
         );
+        let missing = Path::new("/nonexistent/ca.pem");
         assert!(
-            load_pem("/nonexistent/ca.pem", PemKind::Certificates)
-                .unwrap_err()
-                .contains("cannot read")
+            load_pem(
+                missing.to_str().unwrap(),
+                &label(missing),
+                PemKind::Certificates
+            )
+            .unwrap_err()
+            .contains("cannot read")
         );
+    }
+
+    /// F1: leading whitespace before `-----BEGIN` still counts as inline PEM, not a path (a
+    /// substituted key with a leading newline, or an operator's stray indentation).
+    #[test]
+    fn leading_whitespace_before_begin_is_still_inline() {
+        let (cert_pem, _) = pem_pair();
+        for prefix in ["\n", "\n\n", "  ", " \n "] {
+            let padded = format!("{prefix}{cert_pem}");
+            let pem = load_pem(&padded, "unused", PemKind::Certificates).unwrap();
+            assert_eq!(pem.origin, Origin::Inline, "prefix {prefix:?}");
+        }
     }
 
     #[test]
@@ -220,11 +269,16 @@ mod tests {
         let a = file(b"keytab-1");
         let b = file(b"keytab-2");
         assert_ne!(
-            read_file_ref(a.path()).unwrap().fingerprint,
-            read_file_ref(b.path()).unwrap().fingerprint
+            read_file_ref(a.path(), &label(a.path()))
+                .unwrap()
+                .fingerprint,
+            read_file_ref(b.path(), &label(b.path()))
+                .unwrap()
+                .fingerprint
         );
+        let empty = file(b"");
         assert!(
-            read_file_ref(file(b"").path())
+            read_file_ref(empty.path(), &label(empty.path()))
                 .unwrap_err()
                 .contains("is empty")
         );

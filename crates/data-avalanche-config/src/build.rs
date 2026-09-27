@@ -99,10 +99,39 @@ fn map<T: LeafType>(
     items.into_iter().map(|(k, v)| v.map(|v| (k, v))).collect()
 }
 
-/// A path to a file read in Phase 2. `None` in the structural pass (not an error) and on failure.
-fn file_path(ctx: &mut Ctx, leaf: &Leaf<String>, at: &At) -> Option<PathBuf> {
+/// F1 (config §13.9): a diagnostic-safe label for a file-reference field's value (`cert`/`key`/
+/// `ca`, `credentials_file`, `token_file`, `keytab`) — what a message calls it, never the value
+/// itself. A diagnostic must show only what the operator wrote, never a value that came from the
+/// environment or from a file's content:
+/// - templated (substitution changed the text): the leaf's written text, hiding the resolved
+///   value, e.g. `the file named by "${VAR}" (resolved value hidden)`;
+/// - literal but not path-shaped (JSON pasted into the field, inline PEM text, control characters,
+///   or over 256 bytes): a placeholder, since printing it back out would print the pasted value;
+/// - otherwise (a plausible literal path): the value itself, quoted.
+fn file_label<T>(leaf: &Leaf<T>, text: &str) -> String {
+    if leaf.text() != text {
+        return format!(
+            "the file named by {:?} (resolved value hidden)",
+            leaf.text()
+        );
+    }
+    let looks_like_a_path = text.len() <= 256
+        && !text.chars().any(|c| c.is_whitespace() || c.is_control())
+        && !text.starts_with('{')
+        && !text.starts_with("-----");
+    if looks_like_a_path {
+        format!("{text:?}")
+    } else {
+        "the configured value (not shown: it does not look like a file path)".to_string()
+    }
+}
+
+/// A path to a file read in Phase 2, plus its `file_label`. `None` in the structural pass (not an
+/// error) and on failure.
+fn file_path(ctx: &mut Ctx, leaf: &Leaf<String>, at: &At) -> Option<(PathBuf, String)> {
     let text = ctx.text(leaf, at)?;
-    ctx.is_resolving().then(|| PathBuf::from(text))
+    ctx.is_resolving()
+        .then(|| (PathBuf::from(&text), file_label(leaf, &text)))
 }
 
 /// Optional PEM (`cert`/`key`/`ca`, §4.4); V-068 on invalid material.
@@ -113,7 +142,8 @@ fn pem(ctx: &mut Ctx, leaf: &L<String>, at: &At, key: &str, kind: PemKind) -> Op
     if !ctx.is_resolving() {
         return None;
     }
-    match load_pem(&text, kind) {
+    let label = file_label(l, &text);
+    match load_pem(&text, &label, kind) {
         Ok(p) => Some(Some(p)),
         Err(e) => {
             ctx.error("V-068", &at, l.loc(), e);
@@ -138,8 +168,8 @@ fn credentials(
     match (file, user, password) {
         (Some(f), None, None) => {
             let at = at.key("credentials_file");
-            let path = file_path(ctx, f, &at)?;
-            match read_json_pair(&path, "user", "password") {
+            let (path, label) = file_path(ctx, f, &at)?;
+            match read_json_pair(&path, &label, "user", "password") {
                 Ok((user, password)) => Some(Credentials::File {
                     path,
                     user,
@@ -164,10 +194,10 @@ fn read_or_report<T>(
     rule: &str,
     at: &At,
     leaf: &Leaf<String>,
-    read: impl FnOnce(&Path) -> Result<T, String>,
+    read: impl FnOnce(&Path, &str) -> Result<T, String>,
 ) -> Option<(PathBuf, T)> {
-    let path = file_path(ctx, leaf, at)?;
-    match read(&path) {
+    let (path, label) = file_path(ctx, leaf, at)?;
+    match read(&path, &label) {
         Ok(v) => Some((path, v)),
         Err(e) => {
             ctx.error(rule, at, leaf.loc(), e);
@@ -1022,8 +1052,8 @@ fn rest(r: &RawRest, at: &At, ctx: &mut Ctx) -> Option<Rest> {
             .and_then(|l| ctx.text(l, &at.key("client_secret")));
         let client = match (&o.credentials_file, &o.client_id, &o.client_secret) {
             (Some(f), None, None) => {
-                read_or_report(ctx, "V-067", &at.key("credentials_file"), f, |p| {
-                    read_json_pair(p, "client_id", "client_secret")
+                read_or_report(ctx, "V-067", &at.key("credentials_file"), f, |p, label| {
+                    read_json_pair(p, label, "client_id", "client_secret")
                 })
                 .map(|(path, (client_id, client_secret))| OauthClient::File {
                     path,
