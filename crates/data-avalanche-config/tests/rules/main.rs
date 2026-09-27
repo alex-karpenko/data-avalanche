@@ -4,13 +4,13 @@
 #[path = "../support/mod.rs"]
 mod support;
 
+mod auth;
 mod cases;
+mod cross;
 mod domain;
 mod identity;
 mod resolution;
 mod structure;
-
-use std::collections::BTreeSet;
 
 use cases::{Case, Expect};
 use data_avalanche_config::{RULES, RuleInput, Severity, validate_str};
@@ -19,19 +19,12 @@ fn all_cases() -> Vec<Case> {
     let mut all = Vec::new();
     all.extend(structure::cases());
     all.extend(domain::cases());
+    all.extend(cross::cases());
+    all.extend(auth::cases());
     all.extend(identity::cases());
     all.extend(resolution::cases());
     all
 }
-
-/// Config-time rules whose cases are not written yet. Each rule task removes its IDs; the last one
-/// leaves this empty.
-const PENDING: &[&str] = &[
-    "V-028", "V-029", "V-030", "V-033", "V-035", "V-036", "V-037", "V-038", "V-040", "V-041",
-    "V-042", "V-043", "V-044", "V-045", "V-046", "V-047", "V-048", "V-049", "V-050", "V-051",
-    "V-052", "V-053", "V-054", "V-064", "V-073", "V-077", "V-085", "V-086", "V-087", "V-093",
-    "V-096", "V-098", "V-099", "V-100", "V-103", "V-106", "V-117",
-];
 
 /// Rules with no failing input through `validate_str` in v1:
 /// - V-069: the only "other referenced file" is `catalog.hive.kerberos.keytab`, and V-115 rejects
@@ -95,12 +88,9 @@ fn every_config_rule_has_a_passing_and_a_failing_case() {
             .iter()
             .any(|c| c.rule == id && (c.expect == Expect::Silent) == pass)
     };
-    let pending: BTreeSet<&str> = PENDING.iter().copied().collect();
     let mut missing = Vec::new();
     for rule in RULES {
-        if !matches!(rule.input, RuleInput::Config | RuleInput::Resolution)
-            || pending.contains(rule.id)
-        {
+        if !matches!(rule.input, RuleInput::Config | RuleInput::Resolution) {
             continue;
         }
         if !with(rule.id, true) {
@@ -109,9 +99,6 @@ fn every_config_rule_has_a_passing_and_a_failing_case() {
         if !with(rule.id, false) && !NO_FAILING_INPUT.contains(&rule.id) {
             missing.push(format!("{}: no failing case", rule.id));
         }
-    }
-    for id in &pending {
-        assert!(!with(id, false), "{id} has cases; remove it from PENDING");
     }
     assert!(missing.is_empty(), "{}", missing.join("\n"));
 }

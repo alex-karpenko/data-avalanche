@@ -14,6 +14,7 @@ fn spec_example_resolves() {
     let files = Files::new();
     let (yaml, env) = spec_example(&files);
     let loaded = load_str(&yaml, &env).unwrap_or_else(|r| panic!("{r:#?}"));
+    assert!(loaded.warnings.is_empty(), "{:#?}", loaded.warnings);
     let cfg = loaded.config;
     assert_eq!(cfg.config_version, 1);
     assert_eq!(cfg.globals.state.bucket, "123456789012-cdc-app-state");

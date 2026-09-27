@@ -7,6 +7,8 @@ use crate::leaf::Leaf;
 use crate::path::YamlPath;
 use crate::raw::{RawConfig, RawPipeline};
 
+mod auth;
+pub mod cross;
 mod domain;
 mod identity;
 mod structure;
@@ -16,6 +18,8 @@ pub fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut Ctx) {
     structure::check(raw, merged, ctx);
     identity::check(raw, merged, ctx);
     domain::check(raw, merged, ctx);
+    cross::check(raw, merged, ctx);
+    auth::check(raw, merged, ctx);
 }
 
 /// `pipelines.<name>` as a pipeline-locus location.
