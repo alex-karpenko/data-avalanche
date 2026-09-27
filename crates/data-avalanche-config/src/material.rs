@@ -23,7 +23,7 @@ fn read(path: &Path, label: &str) -> Result<Vec<u8>, String> {
 /// A JSON object file holding two non-empty string fields (V-067): `{user, password}` or
 /// `{client_id, client_secret}`. Other fields are ignored. `label` is what a message calls the
 /// file: never its resolved path or content.
-pub fn read_json_pair(
+pub(crate) fn read_json_pair(
     path: &Path,
     label: &str,
     first: &str,
@@ -45,7 +45,11 @@ pub fn read_json_pair(
 
 /// A bearer-token file (V-071): the raw contents, trailing whitespace trimmed, non-empty. `label`
 /// is what a message calls the file: never its resolved path or content.
-pub fn read_token_file(path: &Path, label: &str, key: &FingerprintKey) -> Result<Secret, String> {
+pub(crate) fn read_token_file(
+    path: &Path,
+    label: &str,
+    key: &FingerprintKey,
+) -> Result<Secret, String> {
     let bytes = read(path, label)?;
     let text = String::from_utf8(bytes).map_err(|_| format!("{label} is not UTF-8 text"))?;
     let token = text.trim_end();
@@ -65,7 +69,11 @@ pub struct FileRef {
     pub fingerprint: String,
 }
 
-pub fn read_file_ref(path: &Path, label: &str, key: &FingerprintKey) -> Result<FileRef, String> {
+pub(crate) fn read_file_ref(
+    path: &Path,
+    label: &str,
+    key: &FingerprintKey,
+) -> Result<FileRef, String> {
     Ok(FileRef {
         path: path.to_path_buf(),
         fingerprint: fingerprint(key, &read(path, label)?),
@@ -89,7 +97,7 @@ pub struct Pem {
 
 /// What a PEM value must contain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PemKind {
+pub(crate) enum PemKind {
     /// `cert`, `ca`: at least one certificate.
     Certificates,
     /// `key`: a private key (PKCS#8, PKCS#1 or SEC1).
@@ -99,7 +107,7 @@ pub enum PemKind {
 /// A `cert`/`key`/`ca` value (§4.4): inline PEM when its text, after leading whitespace, starts
 /// with `-----BEGIN`, otherwise a path. `label` is what a message calls the file when it is a
 /// path: never its resolved path or content (F1).
-pub fn load_pem(
+pub(crate) fn load_pem(
     value: &str,
     label: &str,
     kind: PemKind,

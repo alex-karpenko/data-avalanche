@@ -6,7 +6,7 @@ use std::fmt;
 /// (`tables.snapshots.overrides["public.orders"]`), so a table or pipeline name never reads as
 /// several segments.
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct YamlPath(Vec<Segment>);
+pub(crate) struct YamlPath(Vec<Segment>);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum Segment {
@@ -29,10 +29,6 @@ impl YamlPath {
         let mut next = self.clone();
         next.0.push(Segment::Index(index));
         next
-    }
-
-    pub fn is_root(&self) -> bool {
-        self.0.is_empty()
     }
 }
 

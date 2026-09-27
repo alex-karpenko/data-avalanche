@@ -46,7 +46,7 @@ fn require(ctx: &mut Ctx, rule: &str, at: &At, key: &str, leaf: &L, what: &str) 
     }
 }
 
-pub fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut Ctx) {
+pub(crate) fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut Ctx) {
     let default = RawGlobals::default();
     let g = raw.globals.as_ref().unwrap_or(&default);
     let cloud = if g.cloud.is_none() {

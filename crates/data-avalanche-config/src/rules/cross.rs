@@ -15,7 +15,7 @@ use crate::units::format_duration;
 /// 2026-09-27). Tuning and statistics only; everything that changes the protocol, the write path,
 /// the `txn` fence or the sink's own fields is excluded. Keys without the `delta.` prefix are user
 /// metadata and pass through.
-pub const DELTA_PROPERTY_ALLOW_LIST: [&str; 7] = [
+pub(crate) const DELTA_PROPERTY_ALLOW_LIST: [&str; 7] = [
     "delta.dataSkippingNumIndexedCols",
     "delta.dataSkippingStatsColumns",
     "delta.deletedFileRetentionDuration",
@@ -28,7 +28,7 @@ pub const DELTA_PROPERTY_ALLOW_LIST: [&str; 7] = [
 /// Whether `sink` can map `t` (V-087). In v1 both sinks map every type of the grammar: Delta has no
 /// `uuid` or `time` and stores them as strings (Type_Mapping Hop 3b), Iceberg stores `json` as a
 /// string (Hop 3a).
-pub fn sink_maps(sink: SinkType, t: &LogicalType) -> bool {
+pub(crate) fn sink_maps(sink: SinkType, t: &LogicalType) -> bool {
     match (sink, t) {
         (_, LogicalType::List(inner)) => sink_maps(sink, inner),
         (SinkType::Delta | SinkType::Iceberg, _) => true,
@@ -36,7 +36,7 @@ pub fn sink_maps(sink: SinkType, t: &LogicalType) -> bool {
 }
 
 /// Whether `sink` supports partition transform `t` (V-086; Delta v1: `identity` only).
-pub fn sink_partitions(sink: SinkType, t: Transform) -> bool {
+pub(crate) fn sink_partitions(sink: SinkType, t: Transform) -> bool {
     match sink {
         SinkType::Iceberg => true,
         SinkType::Delta => t == Transform::Identity,
@@ -47,7 +47,7 @@ fn has_glob(s: &str) -> bool {
     s.contains(['*', '?', '['])
 }
 
-pub fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut Ctx) {
+pub(crate) fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut Ctx) {
     let default = RawGlobals::default();
     let g = raw.globals.as_ref().unwrap_or(&default);
     let cloud = if g.cloud.is_none() {

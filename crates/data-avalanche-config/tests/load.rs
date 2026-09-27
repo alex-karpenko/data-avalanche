@@ -4,9 +4,7 @@ mod support;
 
 use std::time::Duration;
 
-use data_avalanche_config::enums::*;
-use data_avalanche_config::resolved::*;
-use data_avalanche_config::{Locus, Origin, load_file, load_str};
+use data_avalanche_config::*;
 use support::{Files, MINIMAL, env, fp_key, spec_example};
 
 #[test]

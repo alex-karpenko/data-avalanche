@@ -28,56 +28,67 @@
 //! [`TYPE`] for YAML and value-type errors. [`Secret`] values never print: `Debug` shows `***` and
 //! `Serialize` a keyed BLAKE3 fingerprint (§11.1). [`FingerprintKey`]'s own `Debug` hides its
 //! bytes too, and it carries no `Serialize` impl — it is not a config field.
+//!
+//! ## Public surface
+//!
+//! The public surface is exactly what the runtime (milestones M2–M8) consumes to load, validate,
+//! diff and act on a config; everything else (the parser, the raw model, merge, the evaluation
+//! context, the resolved-config build, the rule checks, scalar coercion, template expansion, raw
+//! leaves, unit-parsing helpers and file-material readers) is an internal implementation detail and
+//! is not reachable from outside this crate. Every public type is re-exported at the crate root (the
+//! workspace API convention, `data-avalanche-core`'s crate docs): callers import
+//! `data_avalanche_config::X`, never a module path.
+//!
+//! The surface is:
+//! - **loaders:** [`load_file`], [`load_str`], [`validate_str`], [`Loaded`], [`FingerprintKey`];
+//! - **the resolved model:** every type in the (private) `resolved` module, the config enums, the
+//!   value types with their own text grammar ([`ByteSize`]/[`ByteSizeError`],
+//!   [`HostPort`]/[`HostPortError`]), [`Secret`], [`Pem`], [`Origin`], [`FileRef`], [`LogFilter`]
+//!   (a resolved `Log.level`), and [`Loc`] (a [`Diagnostic`]'s source location);
+//! - **diagnostics:** [`Report`], [`Diagnostic`], [`Severity`], [`Locus`], [`PARSE`], [`TYPE`];
+//! - **the registry:** [`RULES`], [`RuleMeta`], [`RuleSeverity`], [`RuleInput`], [`rule_meta`];
+//! - **the reload diff:** [`diff`], [`ConfigDiff`], [`FieldChange`], [`PipelineChange`],
+//!   [`Mutability`];
+//! - **external checks:** [`ClusterAnchor`] and the three `check_*` functions;
+//! - **env:** [`Env`], [`ProcessEnv`].
 
-pub mod build;
-pub mod coerce;
-pub mod ctx;
-pub mod diag;
-pub mod diff;
-pub mod enums;
-pub mod external;
-pub mod leaf;
-pub mod load;
-pub mod material;
-pub mod merge;
-pub mod mutability;
-pub mod parse;
-pub mod path;
-pub mod raw;
-pub mod registry;
-pub mod resolved;
-pub mod rules;
-pub mod secret;
-pub mod template;
-pub mod units;
+mod build;
+mod coerce;
+mod ctx;
+mod diag;
+mod diff;
+mod enums;
+mod external;
+mod leaf;
+mod load;
+mod material;
+mod merge;
+mod mutability;
+mod parse;
+mod path;
+mod raw;
+mod registry;
+mod resolved;
+mod rules;
+mod secret;
+mod template;
+mod units;
 mod walk;
 
-pub use coerce::{LeafType, LogFilter};
-pub use ctx::{At, Ctx};
+pub use coerce::LogFilter;
 pub use diag::{Diagnostic, Locus, PARSE, Report, Severity, TYPE};
 pub use diff::{ConfigDiff, FieldChange, PipelineChange, diff};
 pub use external::{ClusterAnchor, check_cluster_anchor, check_table_set, check_unbounded_numeric};
-pub use leaf::{Leaf, Loc, Tri};
+pub use leaf::Loc;
 pub use load::{Loaded, load_file, load_str, validate_str};
 pub use material::{FileRef, Origin, Pem};
-pub use merge::merge_pipeline;
 pub use mutability::Mutability;
-pub use parse::parse_document;
-pub use path::YamlPath;
-pub use raw::RawConfig;
 pub use registry::{RULES, RuleInput, RuleMeta, RuleSeverity, rule_meta};
-pub use resolved::{Pipeline, ResolvedConfig};
 pub use secret::{FingerprintKey, Secret};
 pub use template::{Env, ProcessEnv};
-pub use units::{ByteSize, HostPort};
+pub use units::{ByteSize, ByteSizeError, HostPort, HostPortError};
 
-// Every public type is reachable from the crate root (API convention): the resolved model, the raw
-// model and the config enums by glob; the rest by name.
+// Every public type is reachable from the crate root (API convention): the resolved model and the
+// config enums by glob.
 pub use enums::*;
-pub use raw::*;
 pub use resolved::*;
-
-pub use material::PemKind;
-pub use merge::Merge;
-pub use template::{Expanded, TemplateError, expand};
-pub use units::{ByteSizeError, HostPortError};

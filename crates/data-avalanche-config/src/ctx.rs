@@ -10,7 +10,7 @@ use crate::template::{Env, Expanded, expand};
 
 /// Where a check applies: the locus (config, a named pipeline, or reload) and the YAML path.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct At {
+pub(crate) struct At {
     pub locus: Locus,
     pub path: YamlPath,
 }
@@ -83,7 +83,7 @@ impl At {
 /// secret is ever built — the fingerprint key would go unused); `resolving(env, key)` is Phase 2
 /// (references substituted, files read by the build, [`crate::secret::Secret`] values built with
 /// `key`, config §6.2).
-pub struct Ctx<'e> {
+pub(crate) struct Ctx<'e> {
     env: Option<&'e dyn Env>,
     key: Option<&'e FingerprintKey>,
     report: Report,
@@ -177,11 +177,6 @@ impl<'e> Ctx<'e> {
         }
     }
 
-    /// [`Ctx::value`] of an optional field; `None` when absent.
-    pub fn opt<T: LeafType>(&mut self, leaf: &Option<Leaf<T>>, at: &At) -> Option<T> {
-        leaf.as_ref().and_then(|l| self.value(l, at))
-    }
-
     /// The leaf's value without reporting anything: for choices made before validation (the
     /// union branch in merge). `None` when absent, unknown or invalid.
     pub fn peek<T: LeafType>(&self, leaf: &Option<Leaf<T>>) -> Option<T> {
@@ -221,7 +216,10 @@ impl<'e> Ctx<'e> {
         });
     }
 
-    pub fn report(&self) -> &Report {
+    /// Only used by unit tests inline in this crate (production code takes the report by value via
+    /// [`Ctx::into_report`] once a pass is done).
+    #[cfg(test)]
+    pub(crate) fn report(&self) -> &Report {
         &self.report
     }
 

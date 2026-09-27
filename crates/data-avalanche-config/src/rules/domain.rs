@@ -43,7 +43,7 @@ fn at_least<T: LeafType + PartialOrd + std::fmt::Display>(
     }
 }
 
-pub fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut Ctx) {
+pub(crate) fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut Ctx) {
     if let Some(g) = &raw.globals {
         globals(g, ctx);
     }
@@ -57,7 +57,7 @@ pub fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut Ctx) {
 /// config even when nothing inherits it. `cross_field: false` skips the two checks below that
 /// relate sibling fields rather than reading one on its own; everything else here is unconditional
 /// and doesn't need the pipeline's engine or sink format, so `pipeline_fields` runs it unchanged.
-pub fn check_defaults(defaults: &RawPipeline, ctx: &mut Ctx) {
+pub(crate) fn check_defaults(defaults: &RawPipeline, ctx: &mut Ctx) {
     let at = At::config(YamlPath::root().key("defaults"));
     pipeline_fields(&at, defaults, ctx, false);
 }

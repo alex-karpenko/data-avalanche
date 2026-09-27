@@ -2,9 +2,8 @@
 
 mod support;
 
-use data_avalanche_config::diff::unclassified_paths;
 use data_avalanche_config::{Mutability, PipelineChange, ResolvedConfig, diff, load_str};
-use support::{Files, MINIMAL, cert, env, fp_key, key, spec_example};
+use support::{Files, MINIMAL, env, fp_key};
 
 fn load(yaml: &str) -> ResolvedConfig {
     load_str(yaml, &env(&[("PW", "pw")]), &fp_key())
@@ -171,49 +170,5 @@ fn table_keyed_paths_quote_the_table_name() {
     );
 }
 
-/// Every leaf of these configs is covered by a mutability pattern.
-#[test]
-fn every_resolved_path_has_a_class() {
-    let files = Files::new();
-    let (spec, spec_env) = spec_example(&files);
-    let token = files.write("token", "tok\n");
-    let (pem_cert, pem_key) = (cert(), key());
-    let rich = MINIMAL
-        .replace(
-            "globals:\n  state: { bucket: app-state }",
-            &format!(
-                "globals:\n  cloud: azure\n  state: {{ bucket: app-state, prefix: app }}\n  azure: {{ account_name: lakeacct }}\n  api:\n    auth: basic\n    user: admin\n    password: x\n    tls: {{ enabled: true, cert: {c:?}, key: {k:?} }}\n  cluster:\n    memberlist:\n      join_members: [\"a:7946\"]\n      tls: {{ enabled: true, cert: {c:?}, key: {k:?}, ca: {c:?} }}\n  tracing: {{ otlp_endpoint: \"http://otel:4317\" }}",
-                c = pem_cert,
-                k = pem_key
-            ),
-        )
-        .replace(
-            "postgres: { publication: orders_pub, slot: orders_slot }",
-            &format!("ssl_ca: {pem_cert:?}\n      postgres: {{ publication: orders_pub, slot: orders_slot, max_wal_lag_bytes: 1GiB }}"),
-        )
-        .replace(
-            "include: [public.orders]",
-            "include: [public.orders]\n      exclude: [public.tmp_*]\n      snapshots: { mode: initial, overrides: { public.orders: always } }\n      column_type_overrides: { public.orders.amount: \"decimal(38,10)\" }\n      primary_key: { public.orders: [id] }\n      partitioning: { public.orders: [ { column: region, transform: identity } ] }",
-        )
-        .replace(
-            "delta: {}",
-            "delta: { table_properties: { delta.targetFileSize: \"134217728\" } }\n      max_transaction_batch_rows: 50000\n    state: { bucket: state }",
-        );
-    let bearer = MINIMAL.replace(
-        "sink:\n      type: delta\n      bucket: lake\n      delta: {}",
-        &format!("sink:\n      type: iceberg\n      bucket: lake\n      iceberg:\n        catalog:\n          rest: {{ url: \"https://c\", auth: bearer, token_file: {}, tls: {{ ca: {pem_cert:?} }} }}", token.display()),
-    );
-    let glue = MINIMAL.replace(
-        "sink:\n      type: delta\n      bucket: lake\n      delta: {}",
-        "sink:\n      type: iceberg\n      bucket: lake\n      iceberg:\n        catalog:\n          glue: { name: \"123\" }\n          retry: { max_attempts: 3 }",
-    );
-    let configs = [
-        load_str(&spec, &spec_env, &fp_key()).unwrap().config,
-        load(&rich),
-        load(&bearer),
-        load(&glue),
-    ];
-    for cfg in &configs {
-        assert_eq!(unclassified_paths(cfg), Vec::<String>::new());
-    }
-}
+// `every_resolved_path_has_a_class` moved to `src/diff.rs`'s `#[cfg(test)]` module (FU-E):
+// `unclassified_paths` is crate-internal.

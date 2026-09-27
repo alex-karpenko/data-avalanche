@@ -22,7 +22,7 @@ use Mutability::*;
 /// Path patterns over the resolved config's serialized form (`*` = one segment: a pipeline id).
 /// The longest matching pattern wins, so a block's class can be refined field by field.
 /// Source: the Mutability columns of config §3, §6, §9.
-pub const CLASSES: &[(&str, Mutability)] = &[
+pub(crate) const CLASSES: &[(&str, Mutability)] = &[
     ("config_version", Proc),
     ("globals.cloud", Proc),
     ("globals.state", Proc),
@@ -80,7 +80,7 @@ fn matches(pattern: &str, path: &[&str]) -> Option<usize> {
 
 /// The class of a resolved-config path given as segments (`["pipelines", "orders", "sink",
 /// "flush", "rows"]`), or `None` when no pattern covers it.
-pub fn classify(path: &[&str]) -> Option<Mutability> {
+pub(crate) fn classify(path: &[&str]) -> Option<Mutability> {
     CLASSES
         .iter()
         .filter_map(|(pattern, class)| matches(pattern, path).map(|len| (len, *class)))

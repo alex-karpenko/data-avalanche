@@ -10,7 +10,7 @@ use crate::diag::TYPE;
 use crate::units::{ByteSize, HostPort, parse_duration};
 
 /// A type a scalar leaf can coerce to.
-pub trait LeafType: Sized {
+pub(crate) trait LeafType: Sized {
     /// The rule that reports a failed coercion: the value-domain V-rule for enums (V-015, …),
     /// [`TYPE`] for plain types.
     const RULE: &'static str = TYPE;

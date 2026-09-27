@@ -8,7 +8,7 @@ use crate::leaf::Leaf;
 use crate::path::YamlPath;
 use crate::raw::*;
 
-pub fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut Ctx) {
+pub(crate) fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut Ctx) {
     let root = At::config(YamlPath::root());
     // V-014
     match &raw.config_version {

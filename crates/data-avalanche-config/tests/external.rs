@@ -5,10 +5,9 @@ mod support;
 
 use std::time::Duration;
 
-use data_avalanche_config::enums::LockBackend;
 use data_avalanche_config::{
-    ClusterAnchor, RULES, ResolvedConfig, RuleInput, check_cluster_anchor, check_table_set,
-    check_unbounded_numeric, load_str,
+    ClusterAnchor, LockBackend, RULES, ResolvedConfig, RuleInput, check_cluster_anchor,
+    check_table_set, check_unbounded_numeric, load_str,
 };
 use data_avalanche_core::TableRef;
 use support::{MINIMAL, env, fp_key};

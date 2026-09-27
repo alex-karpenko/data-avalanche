@@ -54,7 +54,7 @@ fn is_pg_identifier(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'$'))
 }
 
-pub fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut Ctx) {
+pub(crate) fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut Ctx) {
     // V-060: per-pipeline unique names can't be defaulted.
     if let Some(d) = &raw.defaults {
         let at = At::config(YamlPath::root().key("defaults"));

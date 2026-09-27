@@ -9,13 +9,13 @@ use crate::raw::{RawConfig, RawPipeline};
 use crate::walk::Walk;
 
 mod auth;
-pub mod cross;
+pub(crate) mod cross;
 mod domain;
 mod identity;
 mod structure;
 
 /// Runs every config-time rule over the parsed document and its merged pipelines.
-pub fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut Ctx) {
+pub(crate) fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut Ctx) {
     check_defaults(raw, ctx);
     structure::check(raw, merged, ctx);
     identity::check(raw, merged, ctx);

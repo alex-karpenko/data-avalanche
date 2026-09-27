@@ -2,7 +2,7 @@
 
 use serde_json::json;
 
-use data_avalanche_config::diag::PARSE;
+use data_avalanche_config::PARSE;
 
 use crate::cases::{Case, Edit, Expect::*, case, mysql_delta, pg_delta, pg_iceberg};
 

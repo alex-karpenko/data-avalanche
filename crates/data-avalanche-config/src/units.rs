@@ -19,7 +19,7 @@ pub struct HostPortError(String);
 
 /// Parses a `humantime` duration (`200ms`, `5s`, `1h30m`, `30d`). A bare integer is not a duration
 /// (§4.1), except `0`, which `schema_evolution.rescan_interval` uses to mean "disabled".
-pub fn parse_duration(text: &str) -> Result<Duration, String> {
+pub(crate) fn parse_duration(text: &str) -> Result<Duration, String> {
     if text == "0" {
         return Ok(Duration::ZERO);
     }
@@ -30,12 +30,12 @@ pub fn parse_duration(text: &str) -> Result<Duration, String> {
 }
 
 /// `humantime` text form of a duration (`15s`, `1h 30m`), for messages and the reload diff.
-pub fn format_duration(d: Duration) -> String {
+pub(crate) fn format_duration(d: Duration) -> String {
     humantime::format_duration(d).to_string()
 }
 
 /// `#[serde(serialize_with = "crate::units::ser_duration")]`: a duration serializes as its text form.
-pub fn ser_duration<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
+pub(crate) fn ser_duration<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_str(&format_duration(*d))
 }
 

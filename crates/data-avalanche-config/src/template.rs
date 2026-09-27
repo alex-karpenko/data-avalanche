@@ -34,7 +34,7 @@ impl Env for HashMap<String, String> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum TemplateError {
+pub(crate) enum TemplateError {
     #[error("unterminated ${{...}} reference")]
     Unterminated,
     #[error("{0:?} is not a variable name (letters, digits and _, not starting with a digit)")]
@@ -49,7 +49,7 @@ pub enum TemplateError {
 
 /// The outcome of expanding one leaf's text.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Expanded {
+pub(crate) enum Expanded {
     /// The final text: references substituted and `$${` unescaped.
     Text(String),
     /// The text has references and no environment was given (structural validation, §11 Phase 1).
@@ -58,7 +58,7 @@ pub enum Expanded {
 
 /// Expands `text`. With `env: None`, only checks the syntax: returns [`Expanded::Unresolved`] if
 /// there is any reference, else the unescaped text. Syntax errors are reported in both modes.
-pub fn expand(text: &str, env: Option<&dyn Env>) -> Result<Expanded, TemplateError> {
+pub(crate) fn expand(text: &str, env: Option<&dyn Env>) -> Result<Expanded, TemplateError> {
     let mut out = String::with_capacity(text.len());
     let mut unresolved = false;
     let mut rest = text;

@@ -28,15 +28,17 @@ impl fmt::Display for Loc {
 /// Any YAML scalar deserializes into a `Leaf`, whatever `T` is: `port: 5432`, `port: "5432"` and
 /// `port: ${PG_PORT}` all yield text. The spelling is kept (`007` stays `007`), because
 /// serde-saphyr hands a string target the scalar's original text.
-pub struct Leaf<T> {
+pub(crate) struct Leaf<T> {
     text: String,
     loc: Option<Loc>,
     _type: PhantomData<fn() -> T>,
 }
 
 impl<T> Leaf<T> {
-    /// A leaf with no file location (built in code or by tests).
-    pub fn new(text: impl Into<String>) -> Self {
+    /// A leaf with no file location. Only used by unit tests inline in this crate — production
+    /// code always gets a `Leaf` from deserializing the document (`Leaf::deserialize`).
+    #[cfg(test)]
+    pub(crate) fn new(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
             loc: None,
@@ -44,7 +46,9 @@ impl<T> Leaf<T> {
         }
     }
 
-    pub fn with_loc(text: impl Into<String>, loc: Loc) -> Self {
+    /// Only used by this module's own unit tests.
+    #[cfg(test)]
+    pub(crate) fn with_loc(text: impl Into<String>, loc: Loc) -> Self {
         Self {
             text: text.into(),
             loc: Some(loc),
@@ -110,11 +114,11 @@ impl<'de, T> Deserialize<'de> for Leaf<T> {
 
 /// A tri-state field (config §9.4.1): absent → `None` (use the default), explicit `null` →
 /// `Some(None)` (disabled), a value → `Some(Some(v))`.
-pub type Tri<T> = Option<Option<Leaf<T>>>;
+pub(crate) type Tri<T> = Option<Option<Leaf<T>>>;
 
 /// `#[serde(default, deserialize_with = "crate::leaf::tri")]` for [`Tri`] fields: serde maps an absent
 /// field to `None` through `default`, so reaching this function means the key was present.
-pub fn tri<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+pub(crate) fn tri<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
