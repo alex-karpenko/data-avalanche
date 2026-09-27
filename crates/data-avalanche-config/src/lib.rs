@@ -16,6 +16,7 @@ pub mod path;
 pub mod raw;
 pub mod registry;
 pub mod resolved;
+pub mod rules;
 pub mod secret;
 pub mod template;
 pub mod units;

@@ -9,6 +9,7 @@ use crate::diag::{Diagnostic, Locus, PARSE, Report, Severity};
 use crate::parse::parse_document;
 use crate::raw::RawConfig;
 use crate::resolved::ResolvedConfig;
+use crate::rules;
 use crate::template::Env;
 
 /// A config that passed every phase. `warnings` never block loading (§1.3).
@@ -32,6 +33,7 @@ pub fn load_str(text: &str, env: &dyn Env) -> Result<Loaded, Report> {
     // Phase 1: references unresolved; no environment, no files.
     let mut ctx = Ctx::structural();
     let merged = merge_all(&raw, &ctx);
+    rules::check(&raw, &merged, &mut ctx);
     build(&raw, &merged, &mut ctx);
     let structural = ctx.into_report();
     if !structural.is_ok() {
@@ -42,6 +44,7 @@ pub fn load_str(text: &str, env: &dyn Env) -> Result<Loaded, Report> {
     // now-known values (a rule skipped on a template in Phase 1 runs here).
     let mut ctx = Ctx::resolving(env);
     let merged = merge_all(&raw, &ctx);
+    rules::check(&raw, &merged, &mut ctx);
     let config = build(&raw, &merged, &mut ctx);
     let mut report = ctx.into_report();
     report.extend(structural);
