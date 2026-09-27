@@ -50,6 +50,14 @@ pub fn cases() -> Vec<Case> {
         case("V-020", Silent, "ssl_mode verify-full", || {
             pg_delta().set("/pipelines/p/source/ssl_mode", json!("verify-full"))
         }),
+        // §13 intro (spec c591bdb): a diagnostic for a `defaults` value has locus config and a
+        // `defaults.…` path, whatever V-020's own (pipeline) Locus column says.
+        case(
+            "V-020",
+            Error,
+            "ssl_mode invalid in defaults: config locus",
+            || pg_delta().set("/defaults/source/ssl_mode", json!("nope")),
+        ),
         case("V-021", Error, "replication_type position", || {
             mysql_delta().set(
                 "/pipelines/p/source/mysql/replication_type",

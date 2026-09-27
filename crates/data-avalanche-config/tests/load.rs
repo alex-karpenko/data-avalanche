@@ -808,3 +808,52 @@ fn invalid_enum_in_defaults_is_v020_at_its_defaults_path() {
     assert_eq!(hits[0].path, "defaults.source.ssl_mode");
     assert_eq!(hits[0].locus, Locus::Config);
 }
+
+// Fix round 1, item 4: a literal (non-templated) invalid `defaults` value is reported exactly
+// once, however many pipelines inherit it. Literal text coerces the same way regardless of the
+// environment, so it's already caught in the structural pass (Phase 1) — `dedupe_defaults` runs
+// there too, before the early return, not only on the resolving-pass report.
+#[test]
+fn literal_invalid_defaults_value_is_reported_once_with_two_pipelines() {
+    let yaml = r#"
+config_version: 1
+globals:
+  state: { bucket: app-state }
+defaults:
+  source: { ssl_mode: nope }
+pipelines:
+  orders:
+    id: orders
+    source:
+      host: db.example.com
+      db: shop
+      user: cdc
+      password: ${PW}
+      postgres: { publication: orders_pub, slot: orders_slot }
+    tables:
+      include: [public.orders]
+    sink:
+      type: delta
+      bucket: lake
+      delta: {}
+  clicks:
+    id: clicks
+    source:
+      host: db.example.com
+      db: shop
+      user: cdc
+      password: ${PW}
+      postgres: { publication: clicks_pub, slot: clicks_slot }
+    tables:
+      include: [public.clicks]
+    sink:
+      type: delta
+      bucket: lake
+      delta: {}
+"#;
+    let report = load_str(yaml, &env(&[("PW", "pw")])).unwrap_err();
+    let hits: Vec<_> = report.errors.iter().filter(|d| d.rule == "V-020").collect();
+    assert_eq!(hits.len(), 1, "{report:#?}");
+    assert_eq!(hits[0].path, "defaults.source.ssl_mode");
+    assert_eq!(hits[0].locus, Locus::Config);
+}

@@ -1,9 +1,12 @@
 //! One walker over the raw model (config §11 Phase 2 "empty is absent", §8.6 "`defaults` on its
 //! own"). [`Walk`] is implemented for every raw type the same way [`crate::merge::Merge`] is:
-//! `walk_fields!` generates it for a struct from the same field list `merge_struct!` already has
-//! (`merge_struct!` invokes it directly, so the two can never drift), and this module adds the
+//! `walk_fields!` generates it for a struct from a field list — `merge_struct!` invokes it with
+//! the same list it uses for `Merge`, so the two can't drift there, and this module adds the
 //! handful of raw structs `merge_struct!` never covers (the union types with a hand-written
-//! `Merge`, and `RawPartitionField`, which is never merged on its own).
+//! `Merge`, and `RawPartitionField`, which is never merged on its own). Either way,
+//! `walk_fields!` destructures the struct with no `..` (`let $t { $($f),+ } = self;`), so the
+//! list is also tied to the compiler directly: a field the invocation omits fails to compile,
+//! whether or not `merge_struct!` happens to cover that struct too.
 //!
 //! Two operations:
 //! - [`Walk::drop_empty`]: an optional leaf whose resolved text is empty becomes absent — `None`
@@ -45,12 +48,16 @@ pub(crate) use walk_key;
 macro_rules! walk_fields {
     ($t:ident { $($f:ident),+ $(,)? }) => {
         impl $crate::walk::Walk for $t {
+            // Destructured with every field named and no `..`: adding a field to `$t` without
+            // adding it here fails to compile, instead of silently never being walked.
             fn drop_empty(&mut self, ctx: &$crate::ctx::Ctx) {
-                $( $crate::walk::Walk::drop_empty(&mut self.$f, ctx); )+
+                let $t { $($f),+ } = self;
+                $( $crate::walk::Walk::drop_empty($f, ctx); )+
             }
             fn check_values(&self, ctx: &mut $crate::ctx::Ctx, at: &$crate::ctx::At) {
+                let $t { $($f),+ } = self;
                 $( $crate::walk::Walk::check_values(
-                    &self.$f, ctx, &at.key($crate::walk::walk_key!($f)),
+                    $f, ctx, &at.key($crate::walk::walk_key!($f)),
                 ); )+
             }
         }

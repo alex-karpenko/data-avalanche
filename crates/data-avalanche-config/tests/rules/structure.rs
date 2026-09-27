@@ -153,6 +153,12 @@ pub fn cases() -> Vec<Case> {
                 .set("/defaults/sink/type", json!("delta"))
                 .del("/pipelines/p/sink/type")
         }),
+        // Fix round 1, item 1: an empty `sink.type` resolves to absent (§11 Phase 2), so it now
+        // reports the "required" rule (V-091) instead of the enum's own value-domain rule
+        // (V-083) — accepted: the config is still rejected, and the message is clearer.
+        case("V-091", Error, "empty sink type", || {
+            pg_delta().set("/pipelines/p/sink/type", json!(""))
+        }),
         // V-014
         case("V-014", Error, "missing", || {
             pg_delta().del("/config_version")
