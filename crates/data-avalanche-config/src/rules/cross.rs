@@ -331,7 +331,9 @@ fn sink(s: &RawSink, at: &At, kind: Option<SinkType>, cloud: Option<Cloud>, ctx:
         );
     }
     // V-093
-    if let Some(d) = &s.delta {
+    if kind == Some(SinkType::Delta)
+        && let Some(d) = &s.delta
+    {
         for (key, l) in d.table_properties.iter().flatten() {
             if key.starts_with("delta.") && !DELTA_PROPERTY_ALLOW_LIST.contains(&key.as_str()) {
                 ctx.error(
@@ -347,7 +349,8 @@ fn sink(s: &RawSink, at: &At, kind: Option<SinkType>, cloud: Option<Cloud>, ctx:
         }
     }
     // V-028, V-029 (and V-047 in `auth`)
-    if let Some(c) = s.iceberg.as_ref().and_then(|i| i.catalog.as_ref())
+    if kind == Some(SinkType::Iceberg)
+        && let Some(c) = s.iceberg.as_ref().and_then(|i| i.catalog.as_ref())
         && cloud.is_some_and(|c| c != Cloud::Aws)
     {
         let c_at = at.key("iceberg").key("catalog");

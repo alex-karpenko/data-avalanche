@@ -18,6 +18,20 @@ pub fn cases() -> Vec<Case> {
                 json!({"glue": {"name": "123"}}),
             )
         }),
+        case(
+            "V-028",
+            Silent,
+            "glue block under a delta sink is only V-084",
+            || {
+                pg_iceberg()
+                    .set("/globals/cloud", json!("google"))
+                    .set("/pipelines/p/sink/type", json!("delta"))
+                    .set(
+                        "/pipelines/p/sink/iceberg/catalog",
+                        json!({"glue": {"name": "123"}}),
+                    )
+            },
+        ),
         case("V-029", Error, "sigv4 on azure", || {
             pg_iceberg().set("/globals/cloud", json!("azure")).set(
                 "/pipelines/p/sink/iceberg/catalog/rest/auth",
@@ -179,6 +193,17 @@ pub fn cases() -> Vec<Case> {
                 json!({"delta.targetFileSize": 134217728, "owner": "team-x"}),
             )
         }),
+        case(
+            "V-093",
+            Silent,
+            "delta properties under an iceberg sink are only V-084",
+            || {
+                pg_iceberg().set(
+                    "/pipelines/p/sink/delta",
+                    json!({"table_properties": {"delta.appendOnly": "true"}}),
+                )
+            },
+        ),
         case("V-096", Error, "dns without name", || {
             pg_delta().set("/globals/cluster/discovery", json!("dns"))
         }),
