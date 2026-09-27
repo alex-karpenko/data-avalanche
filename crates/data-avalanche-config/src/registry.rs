@@ -531,7 +531,7 @@ pub const RULES: &[RuleMeta] = &[
     rule(
         "V-063",
         Error,
-        "config",
+        "config / pipeline",
         Resolution,
         r#"any ${VAR}"#,
         r#"Unset with no :-default."#,
