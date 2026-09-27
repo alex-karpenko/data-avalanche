@@ -14,6 +14,18 @@ pub struct At {
     pub path: YamlPath,
 }
 
+/// F2: the text to embed in a diagnostic message for a leaf's resolved value — never the
+/// env-resolved value itself. `text` is `leaf`'s resolved text (after `${VAR}` substitution).
+/// Quoted verbatim when `leaf` is literal (nothing was substituted); otherwise the leaf's own
+/// written text (e.g. `${VAR}`), quoted, with the resolution called out.
+pub(crate) fn shown<T>(leaf: &Leaf<T>, text: &str) -> String {
+    if leaf.text() == text {
+        format!("{text:?}")
+    } else {
+        format!("{:?} (resolved value hidden)", leaf.text())
+    }
+}
+
 impl At {
     /// A config-level location (`globals…`, top-level keys).
     pub fn config(path: YamlPath) -> Self {
@@ -102,6 +114,12 @@ impl<'e> Ctx<'e> {
 
     /// [`Ctx::value`] with a caller-built message (`text`, `reason`) → message, for rules whose
     /// message the spec fixes (V-078).
+    ///
+    /// F2: a value obtained by substituting `${VAR}` is never printed in a diagnostic. When `leaf`
+    /// was templated (its written text differs from the resolved `text`), every occurrence of the
+    /// resolved value in the built message — Debug-quoted or raw — is replaced by the leaf's
+    /// written text with the resolution called out ([`shown`]). A literal (non-templated) leaf's
+    /// message is unchanged.
     pub fn value_with<T: LeafType>(
         &mut self,
         leaf: &Leaf<T>,
@@ -112,7 +130,15 @@ impl<'e> Ctx<'e> {
         match T::parse_leaf(&text) {
             Ok(v) => Some(v),
             Err(reason) => {
-                self.error(T::RULE, at, leaf.loc(), message(&text, reason));
+                let mut msg = message(&text, reason);
+                if leaf.text() != text {
+                    let hidden = shown(leaf, &text);
+                    msg = msg.replace(&format!("{text:?}"), &hidden);
+                    if text.len() >= 4 && msg.contains(text.as_str()) {
+                        msg = msg.replace(text.as_str(), &hidden);
+                    }
+                }
+                self.error(T::RULE, at, leaf.loc(), msg);
                 None
             }
         }

@@ -4,7 +4,7 @@ use data_avalanche_core::LogicalType;
 
 use super::{missing, pipeline_at};
 use crate::build::{DEFAULT_LEASE_DURATION, DEFAULT_LEASE_RENEWAL_INTERVAL};
-use crate::ctx::{At, Ctx};
+use crate::ctx::{At, Ctx, shown};
 use crate::enums::*;
 use crate::leaf::Leaf;
 use crate::path::YamlPath;
@@ -211,7 +211,8 @@ fn tables(
                         &at.key(key).index(i),
                         l.loc(),
                         format!(
-                            "{g:?}: MySQL table patterns are bare names (the database is source.db)"
+                            "{}: MySQL table patterns are bare names (the database is source.db)",
+                            shown(l, &g)
                         ),
                     );
                 } else if !mysql && !is_schema_table(&g) {
@@ -219,7 +220,10 @@ fn tables(
                         "V-117",
                         &at.key(key).index(i),
                         l.loc(),
-                        format!("{g:?}: PostgreSQL table patterns are schema.table (e.g. public.* or public.orders)"),
+                        format!(
+                            "{}: PostgreSQL table patterns are schema.table (e.g. public.* or public.orders)",
+                            shown(l, &g)
+                        ),
                     );
                 }
             }

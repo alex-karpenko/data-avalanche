@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use super::pipeline_at;
 use crate::coerce::LeafType;
-use crate::ctx::{At, Ctx};
+use crate::ctx::{At, Ctx, shown};
 use crate::enums::*;
 use crate::leaf::Leaf;
 use crate::path::YamlPath;
@@ -145,12 +145,14 @@ fn globals(g: &RawGlobals, ctx: &mut Ctx) {
                 .bytes()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
         if !ok {
+            let leaf = a.account_name.as_ref().expect("val returned Some");
             ctx.error(
                 "V-101",
                 &root.key("azure").key("account_name"),
                 loc,
                 format!(
-                    "{name:?} is not a storage account name (3-24 lower-case letters and digits)"
+                    "{} is not a storage account name (3-24 lower-case letters and digits)",
+                    shown(leaf, &name)
                 ),
             );
         }

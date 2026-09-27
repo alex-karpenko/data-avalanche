@@ -354,6 +354,61 @@ fn env_resolved_token_file_path_is_never_shown() {
     assert!(!report.to_json().to_string().contains("tok-abc123-secret"));
 }
 
+// F2: a value obtained by `${VAR}` substitution is never printed in a validation message either,
+// whether the coercion failure comes from the generic value path (TYPE, a config enum) or from a
+// rule that builds its own message from the resolved text (V-055).
+
+#[test]
+fn env_resolved_port_hides_the_value_in_a_type_error() {
+    let yaml = MINIMAL.replace(
+        "host: db.example.com",
+        "host: db.example.com\n      port: \"${SECRET}\"",
+    );
+    let report =
+        load_str(&yaml, &env(&[("PW", "pw"), ("SECRET", "s3cr3t-value-123")])).unwrap_err();
+    let e = &report.errors[0];
+    assert_eq!(e.rule, "TYPE");
+    assert!(!e.message.contains("s3cr3t-value-123"), "{}", e.message);
+    assert!(e.message.contains("${SECRET}"), "{}", e.message);
+    assert!(!report.to_json().to_string().contains("s3cr3t-value-123"));
+}
+
+#[test]
+fn env_resolved_pipeline_id_hides_the_value_in_v055() {
+    // Unlike the crate's usual `s3cr3t-value-123`, this needs an uppercase letter: that value
+    // happens to be a syntactically valid pipeline id (lower-case letters, digits, `_`/`-`), so it
+    // would not trigger V-055's format check at all.
+    let yaml = MINIMAL.replace("id: orders", "id: \"${SECRET}\"");
+    let report =
+        load_str(&yaml, &env(&[("PW", "pw"), ("SECRET", "S3CR3T-VALUE-123")])).unwrap_err();
+    let e = report
+        .errors
+        .iter()
+        .find(|d| d.rule == "V-055")
+        .unwrap_or_else(|| panic!("no V-055 diagnostic: {report:#?}"));
+    assert!(!e.message.contains("S3CR3T-VALUE-123"), "{}", e.message);
+    assert!(e.message.contains("${SECRET}"), "{}", e.message);
+    assert!(!report.to_json().to_string().contains("S3CR3T-VALUE-123"));
+}
+
+#[test]
+fn env_resolved_enum_hides_the_value_in_its_rule() {
+    let yaml = MINIMAL.replace(
+        "include: [public.orders]",
+        "include: [public.orders]\n      snapshots: { mode: \"${SECRET}\" }",
+    );
+    let report =
+        load_str(&yaml, &env(&[("PW", "pw"), ("SECRET", "s3cr3t-value-123")])).unwrap_err();
+    let e = report
+        .errors
+        .iter()
+        .find(|d| d.rule == "V-022")
+        .unwrap_or_else(|| panic!("no V-022 diagnostic: {report:#?}"));
+    assert!(!e.message.contains("s3cr3t-value-123"), "{}", e.message);
+    assert!(e.message.contains("${SECRET}"), "{}", e.message);
+    assert!(!report.to_json().to_string().contains("s3cr3t-value-123"));
+}
+
 const ICEBERG_SINK: &str = "sink:
       type: iceberg
       bucket: lake

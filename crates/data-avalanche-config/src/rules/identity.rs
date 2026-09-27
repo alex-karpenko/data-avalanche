@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use super::pipeline_at;
-use crate::ctx::{At, Ctx};
+use crate::ctx::{At, Ctx, shown};
 use crate::enums::SourceType;
 use crate::path::YamlPath;
 use crate::raw::{RawConfig, RawPipeline};
@@ -117,7 +117,10 @@ pub fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut Ctx) {
                             "V-055",
                             &at.key("id"),
                             l.loc(),
-                            format!("pipeline id {id:?} must match ^[a-z0-9][a-z0-9_-]{{0,62}}$"),
+                            format!(
+                                "pipeline id {} must match ^[a-z0-9][a-z0-9_-]{{0,62}}$",
+                                shown(l, &id)
+                            ),
                         );
                     }
                 }
@@ -146,7 +149,10 @@ pub fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut Ctx) {
                     "V-058",
                     &At::config(pg_at.key("slot").path),
                     l.loc(),
-                    format!("slot {slot:?} must match ^[a-z_][a-z0-9_]{{0,62}}$"),
+                    format!(
+                        "slot {} must match ^[a-z_][a-z0-9_]{{0,62}}$",
+                        shown(l, &slot)
+                    ),
                 );
             } else if let (Some(h), Some(d)) = (&host, &db) {
                 slots
@@ -159,7 +165,15 @@ pub fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut Ctx) {
             && let Some(publication) = ctx.text(l, &pg_at.key("publication"))
         {
             if !is_pg_identifier(&publication) {
-                ctx.warning("V-059", &pg_at.key("publication"), l.loc(), format!("publication {publication:?} is not a plain PostgreSQL identifier; it will need quoting"));
+                ctx.warning(
+                    "V-059",
+                    &pg_at.key("publication"),
+                    l.loc(),
+                    format!(
+                        "publication {} is not a plain PostgreSQL identifier; it will need quoting",
+                        shown(l, &publication)
+                    ),
+                );
             } else if let (Some(h), Some(d)) = (&host, &db) {
                 publications
                     .entry((h.clone(), d.clone(), publication))
