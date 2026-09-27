@@ -118,7 +118,7 @@ impl<'e> Ctx<'e> {
     /// F2: a value obtained by substituting `${VAR}` is never printed in a diagnostic. When `leaf`
     /// was templated (its written text differs from the resolved `text`), every occurrence of the
     /// resolved value in the built message — Debug-quoted or raw — is replaced by the leaf's
-    /// written text with the resolution called out ([`shown`]). A literal (non-templated) leaf's
+    /// written text with the resolution called out (`shown`). A literal (non-templated) leaf's
     /// message is unchanged.
     pub fn value_with<T: LeafType>(
         &mut self,

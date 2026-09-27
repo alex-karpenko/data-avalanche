@@ -70,7 +70,7 @@ pub const RULES: &[RuleMeta] = &[
         "pipeline",
         Config,
         r#"source"#,
-        r#"Exactly one engine block (postgres xor mysql) after merge, matching type."#,
+        r#"After merge, the engine block matching `type` is present when that engine has required fields: `postgres` must be present; an absent `mysql` block means all defaults. (The foreign block: V-003.)"#,
     ),
     rule(
         "V-002",
@@ -702,7 +702,7 @@ pub const RULES: &[RuleMeta] = &[
         "pipeline",
         Config,
         r#"sink.{iceberg,delta}"#,
-        r#"Exactly the format block matching sink.type after merge; the foreign block is forbidden."#,
+        r#"After merge, the format block matching `sink.type` is present when that format has required fields: `iceberg` must be present; an absent `delta` block means all defaults. The foreign block is forbidden."#,
     ),
     rule(
         "V-085",

@@ -15,7 +15,9 @@ use crate::resolved::{Pipeline, ResolvedConfig};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FieldChange {
-    /// The changed path (`globals.log.level`, `pipelines.orders.sink.flush.rows`).
+    /// The changed path (`globals.log.level`, `pipelines.orders.sink.flush.rows`), in the
+    /// resolved model's field names; a pipeline is keyed by its `id`, not its human name
+    /// (`pipelines.<id>.…`).
     pub path: String,
     /// `R`, `Pr` or `Proc`, after the table-set check.
     pub class: Mutability,
@@ -119,6 +121,8 @@ fn dotted(path: &[String]) -> String {
 
 /// Diffs `new` against `old`. `table_set_changed(old, new)` answers whether a pipeline's resolved
 /// table set changed (it needs the live source); `None` means "unknown", which counts as changed.
+/// This call is synchronous, so a caller whose table-set resolution is async precomputes the
+/// answer for each pipeline whose `include`/`exclude` changed and has this closure look it up.
 pub fn diff(
     old: &ResolvedConfig,
     new: &ResolvedConfig,

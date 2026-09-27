@@ -141,8 +141,9 @@ fn file_label<T>(leaf: &Leaf<T>, text: &str) -> String {
     }
 }
 
-/// A path to a file read in Phase 2, plus its `file_label`. `None` in the structural pass (not an
-/// error) and on failure.
+/// A path to a file read in Phase 2, plus its `file_label`. A relative path resolves against the
+/// process's current directory (there is no config-relative base). `None` in the structural pass
+/// (not an error) and on failure.
 fn file_path(ctx: &mut Ctx, leaf: &Leaf<String>, at: &At) -> Option<(PathBuf, String)> {
     let text = ctx.text(leaf, at)?;
     ctx.is_resolving()
@@ -326,7 +327,9 @@ fn api(a: &RawApi, at: &At, ctx: &mut Ctx) -> Option<Api> {
     let enabled = or(ctx, &tls.enabled, &tls_at, "enabled", false);
     let cert = pem(ctx, &tls.cert, &tls_at, "cert", PemKind::Certificates);
     let key = pem(ctx, &tls.key, &tls_at, "key", PemKind::PrivateKey);
-    // Only the block the auth mode uses is kept: an unused block can't fail the load.
+    // Every block above was already validated (V-067 reads credentials_file, V-068 reads TLS
+    // material, even when auth is none or TLS is disabled); only the block the auth mode uses is
+    // kept in the result below.
     let auth = auth?;
     let (credentials, jwt, oauth2) = match auth {
         ApiAuth::None => (None, None, None),
