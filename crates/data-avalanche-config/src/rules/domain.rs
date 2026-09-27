@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use super::pipeline_at;
 use crate::coerce::LeafType;
-use crate::ctx::{At, Ctx, shown};
+use crate::ctx::{At, Ctx, is_templated, shown, shown_value};
 use crate::enums::*;
 use crate::leaf::Leaf;
 use crate::path::YamlPath;
@@ -33,11 +33,12 @@ fn at_least<T: LeafType + PartialOrd + std::fmt::Display>(
     if let Some((v, loc)) = val(ctx, leaf, at)
         && v < min
     {
+        let l = leaf.as_ref().expect("val returned Some");
         ctx.error(
             rule,
             at,
             loc,
-            format!("{field} must be at least {min}, got {v}"),
+            format!("{field} must be at least {min}, got {}", shown_value(l, &v)),
         );
     }
 }
@@ -57,37 +58,48 @@ fn globals(g: &RawGlobals, ctx: &mut Ctx) {
         let at = root.key("cluster");
         // V-026
         if let Some((tokens, loc)) = val(ctx, &c.tokens, &at.key("tokens")) {
+            let l = c.tokens.as_ref().expect("val returned Some");
             if !(1..=4096).contains(&tokens) {
                 ctx.error(
                     "V-026",
                     &at.key("tokens"),
                     loc,
-                    format!("tokens must be 1..=4096, got {tokens}"),
+                    format!("tokens must be 1..=4096, got {}", shown_value(l, &tokens)),
                 );
             } else if !(64..=256).contains(&tokens) {
                 ctx.warning(
                     "V-026",
                     &at.key("tokens"),
                     loc,
-                    format!("tokens {tokens} is outside the recommended 64..=256"),
+                    format!(
+                        "tokens {} is outside the recommended 64..=256",
+                        shown_value(l, &tokens)
+                    ),
                 );
             }
         }
         // V-072
         if let Some((m, loc)) = val(ctx, &c.lease_safety_margin, &at.key("lease_safety_margin")) {
+            let l = c.lease_safety_margin.as_ref().expect("val returned Some");
             if !(0.0..=0.5).contains(&m) {
                 ctx.error(
                     "V-072",
                     &at.key("lease_safety_margin"),
                     loc,
-                    format!("lease_safety_margin must be 0..=0.5, got {m}"),
+                    format!(
+                        "lease_safety_margin must be 0..=0.5, got {}",
+                        shown_value(l, &m)
+                    ),
                 );
             } else if !(0.05..=0.30).contains(&m) {
                 ctx.warning(
                     "V-072",
                     &at.key("lease_safety_margin"),
                     loc,
-                    format!("lease_safety_margin {m} is outside the recommended 0.05..=0.30"),
+                    format!(
+                        "lease_safety_margin {} is outside the recommended 0.05..=0.30",
+                        shown_value(l, &m)
+                    ),
                 );
             }
         }
@@ -129,11 +141,12 @@ fn globals(g: &RawGlobals, ctx: &mut Ctx) {
         )
         && !(0.0..=1.0).contains(&r)
     {
+        let l = t.sample_ratio.as_ref().expect("val returned Some");
         ctx.error(
             "V-097",
             &root.key("tracing").key("sample_ratio"),
             loc,
-            format!("sample_ratio must be 0..=1, got {r}"),
+            format!("sample_ratio must be 0..=1, got {}", shown_value(l, &r)),
         );
     }
     // V-101
@@ -172,7 +185,10 @@ fn pipeline(name: &str, p: &RawPipeline, ctx: &mut Ctx) {
                 "V-104",
                 &lag_at,
                 l.loc(),
-                format!("max_wal_lag_bytes must be at least 64MiB when set, got {v}"),
+                format!(
+                    "max_wal_lag_bytes must be at least 64MiB when set, got {}",
+                    shown_value(l, &v)
+                ),
             );
         }
     }
@@ -198,7 +214,16 @@ fn pipeline(name: &str, p: &RawPipeline, ctx: &mut Ctx) {
                         "snapshots.chunk_size must be at least 1",
                     );
                 } else if n > 1_000_000 {
-                    ctx.warning("V-108", &s_at.key("chunk_size"), loc, format!("snapshots.chunk_size {n} is above 1000000: long chunk transactions and large memory"));
+                    let l = s.chunk_size.as_ref().expect("val returned Some");
+                    ctx.warning(
+                        "V-108",
+                        &s_at.key("chunk_size"),
+                        loc,
+                        format!(
+                            "snapshots.chunk_size {} is above 1000000: long chunk transactions and large memory",
+                            shown_value(l, &n)
+                        ),
+                    );
                 }
             }
         }
@@ -237,19 +262,27 @@ fn partition_field(f: &RawPartitionField, at: &At, ctx: &mut Ctx) {
         _ => {}
     }
     if transform != Transform::Bucket && f.n.is_some() {
+        let l = f.transform.as_ref().expect("val returned Some");
         ctx.error(
             "V-107",
             &at.key("n"),
             loc,
-            format!("n applies only to transform bucket, not {transform}"),
+            format!(
+                "n applies only to transform bucket, not {}",
+                shown_value(l, &transform)
+            ),
         );
     }
     if transform != Transform::Truncate && f.width.is_some() {
+        let l = f.transform.as_ref().expect("val returned Some");
         ctx.error(
             "V-107",
             &at.key("width"),
             loc,
-            format!("width applies only to transform truncate, not {transform}"),
+            format!(
+                "width applies only to transform truncate, not {}",
+                shown_value(l, &transform)
+            ),
         );
     }
 }
@@ -281,7 +314,10 @@ fn sink(s: &RawSink, at: &At, ctx: &mut Ctx) {
                 "V-109",
                 &rows_at,
                 l.loc(),
-                format!("max_transaction_batch_rows {v} is below 1000: many small commits"),
+                format!(
+                    "max_transaction_batch_rows {} is below 1000: many small commits",
+                    shown_value(l, &v)
+                ),
             );
         }
     }
@@ -292,11 +328,18 @@ fn sink(s: &RawSink, at: &At, ctx: &mut Ctx) {
         &at.key("max_transaction_buffer_bytes"),
     ) && v.bytes() < 16 * ByteSize::MIB
     {
+        let l = s
+            .max_transaction_buffer_bytes
+            .as_ref()
+            .expect("val returned Some");
         ctx.error(
             "V-110",
             &at.key("max_transaction_buffer_bytes"),
             loc,
-            format!("max_transaction_buffer_bytes must be at least 16MiB, got {v}"),
+            format!(
+                "max_transaction_buffer_bytes must be at least 16MiB, got {}",
+                shown_value(l, &v)
+            ),
         );
     }
     at_least(
@@ -362,14 +405,20 @@ fn catalog(c: &RawCatalog, at: &At, ctx: &mut Ctx) {
         if let (Some(b), Some(m)) = (base, max)
             && b > m
         {
+            // Duration has no `Display`, so `shown_value` doesn't apply; redact by hand from the
+            // same "is this leaf a template" test it uses.
+            let shown_duration = |leaf: &Option<Leaf<Duration>>, d: Duration| match leaf {
+                Some(l) if is_templated(l) => format!("{:?} (resolved value hidden)", l.text()),
+                _ => crate::units::format_duration(d),
+            };
             ctx.error(
                 "V-112",
                 &r_at,
                 None,
                 format!(
                     "retry.base_backoff {} is above max_backoff {}",
-                    crate::units::format_duration(b),
-                    crate::units::format_duration(m)
+                    shown_duration(&r.base_backoff, b),
+                    shown_duration(&r.max_backoff, m)
                 ),
             );
         }

@@ -4,7 +4,7 @@ use data_avalanche_core::LogicalType;
 
 use super::{missing, pipeline_at};
 use crate::build::{DEFAULT_LEASE_DURATION, DEFAULT_LEASE_RENEWAL_INTERVAL};
-use crate::ctx::{At, Ctx, shown};
+use crate::ctx::{At, Ctx, is_templated, shown, shown_value};
 use crate::enums::*;
 use crate::leaf::Leaf;
 use crate::path::YamlPath;
@@ -81,11 +81,24 @@ fn globals(g: &RawGlobals, ctx: &mut Ctx) {
         if let (Some(d), Some(r)) = (duration, renewal)
             && r > d / 3
         {
-            ctx.error("V-073", &at.key("lease_renewal_interval"), c.lease_renewal_interval.as_ref().and_then(|l| l.loc()), format!(
-                "lease_renewal_interval {} exceeds lease_duration / 3 ({}): the holder needs at least two renewals inside the safety deadline",
-                format_duration(r),
-                format_duration(d / 3)
-            ));
+            // Duration has no `Display`, so `shown_value` doesn't apply; redact by hand from the
+            // same "is this leaf a template" test it uses. `lease_duration` (unlike
+            // `lease_renewal_interval`) appears only divided by 3, not verbatim, so it is shown
+            // as `lease_duration / 3` regardless — never the raw configured duration.
+            let renewal_shown = match &c.lease_renewal_interval {
+                Some(l) if is_templated(l) => format!("{:?} (resolved value hidden)", l.text()),
+                _ => format_duration(r),
+            };
+            ctx.error(
+                "V-073",
+                &at.key("lease_renewal_interval"),
+                c.lease_renewal_interval.as_ref().and_then(|l| l.loc()),
+                format!(
+                    "lease_renewal_interval {} exceeds lease_duration / 3 ({}): the holder needs at least two renewals inside the safety deadline",
+                    renewal_shown,
+                    format_duration(d / 3)
+                ),
+            );
         }
         // V-096
         if ctx.peek(&c.discovery) == Some(Discovery::Dns)
@@ -274,7 +287,16 @@ fn tables(
             if let Some(tr) = ctx.peek(&f.transform)
                 && !sink_partitions(sink_kind, tr)
             {
-                ctx.error("V-086", &at.key("partitioning").key(key).index(i).key("transform"), f.transform.as_ref().and_then(|l| l.loc()), format!("the {sink_kind} sink does not support partition transform {tr} (v1 Delta: identity only)"));
+                let l = f.transform.as_ref().expect("peek returned Some");
+                ctx.error(
+                    "V-086",
+                    &at.key("partitioning").key(key).index(i).key("transform"),
+                    l.loc(),
+                    format!(
+                        "the {sink_kind} sink does not support partition transform {} (v1 Delta: identity only)",
+                        shown_value(l, &tr)
+                    ),
+                );
             }
         }
     }
@@ -287,7 +309,10 @@ fn tables(
                 "V-087",
                 &at.key("column_type_overrides").key(column),
                 l.loc(),
-                format!("the {sink_kind} sink cannot map logical type {lt}"),
+                format!(
+                    "the {sink_kind} sink cannot map logical type {}",
+                    shown_value(l, &lt)
+                ),
             );
         }
     }

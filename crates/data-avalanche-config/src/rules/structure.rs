@@ -1,7 +1,7 @@
 //! §13.1 structure and mutual exclusion, §13.2 requiredness.
 
 use super::{missing, pipeline_at};
-use crate::ctx::{At, Ctx};
+use crate::ctx::{At, Ctx, shown_value};
 use crate::diag::PARSE;
 use crate::enums::{CatalogKind, SinkType, SourceType};
 use crate::leaf::Leaf;
@@ -26,7 +26,7 @@ pub fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut Ctx) {
                     "V-014",
                     &root.key("config_version"),
                     l.loc(),
-                    format!("config_version {v} is not supported by this binary, which reads version 1; migrate the file to version 1"),
+                    format!("config_version {} is not supported by this binary, which reads version 1; migrate the file to version 1", shown_value(l, &v)),
                 );
             }
         }
@@ -320,11 +320,15 @@ fn catalog(c: &RawCatalog, at: &At, ctx: &mut Ctx) {
             if let Some(declared) = ctx.peek(&c.kind)
                 && declared != *one
             {
+                let l = c.kind.as_ref().expect("peek returned Some");
                 ctx.error(
                     "V-002",
                     &at.key("type"),
-                    c.kind.as_ref().and_then(|l| l.loc()),
-                    format!("catalog type is {declared} but the block present is {one}"),
+                    l.loc(),
+                    format!(
+                        "catalog type is {} but the block present is {one}",
+                        shown_value(l, &declared)
+                    ),
                 );
             }
         }

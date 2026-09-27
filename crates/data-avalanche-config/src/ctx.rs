@@ -26,6 +26,26 @@ pub(crate) fn shown<T>(leaf: &Leaf<T>, text: &str) -> String {
     }
 }
 
+/// Whether `leaf`'s own written text is a `${VAR}` reference (resolved or not) — decided from the
+/// text alone, never from the resolved value's shape. `$${` escapes don't count: `expand` already
+/// unescapes them without leaving a reference behind.
+pub(crate) fn is_templated<T>(leaf: &Leaf<T>) -> bool {
+    matches!(expand(leaf.text(), None), Ok(Expanded::Unresolved))
+}
+
+/// F3b: [`shown`] for a value already coerced out of a leaf (a range/consistency check's `v`,
+/// after `ctx.value` succeeded) — the coerced value has no resolved *text* to compare against
+/// `leaf.text()`, so the redaction decision is made from the leaf's own text instead. A literal
+/// leaf displays `v` normally; a templated leaf displays its written `${VAR}` text with the
+/// resolution called out, never `v`.
+pub(crate) fn shown_value<T: std::fmt::Display>(leaf: &Leaf<T>, v: &T) -> String {
+    if is_templated(leaf) {
+        format!("{:?} (resolved value hidden)", leaf.text())
+    } else {
+        v.to_string()
+    }
+}
+
 impl At {
     /// A config-level location (`globals…`, top-level keys).
     pub fn config(path: YamlPath) -> Self {

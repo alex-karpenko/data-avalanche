@@ -409,6 +409,63 @@ fn env_resolved_enum_hides_the_value_in_its_rule() {
     assert!(!report.to_json().to_string().contains("s3cr3t-value-123"));
 }
 
+// F3b: a rule that coerces a value successfully and then fails its own range/consistency check
+// builds its message from the *parsed* value, which bypasses `value_with`'s F2 rewrite. `shown_value`
+// (next to `Ctx::shown`) closes that: the message names the templated leaf's own `${VAR}` text
+// instead of the value that came out of it.
+
+#[test]
+fn env_resolved_range_check_hides_the_value_in_v026() {
+    let yaml = MINIMAL.replace(
+        "state: { bucket: app-state }",
+        "state: { bucket: app-state }\n  cluster: { tokens: \"${SECRET}\" }",
+    );
+    let report = load_str(&yaml, &env(&[("PW", "pw"), ("SECRET", "99999")])).unwrap_err();
+    let e = report
+        .errors
+        .iter()
+        .find(|d| d.rule == "V-026")
+        .unwrap_or_else(|| panic!("no V-026 diagnostic: {report:#?}"));
+    assert!(!e.message.contains("99999"), "{}", e.message);
+    assert!(e.message.contains("${SECRET}"), "{}", e.message);
+    assert!(!report.to_json().to_string().contains("99999"));
+}
+
+#[test]
+fn env_resolved_at_least_check_hides_the_value_in_v074() {
+    let yaml = MINIMAL.replace(
+        "state: { bucket: app-state }",
+        "state: { bucket: app-state }\n  cluster: { max_concurrent_handoffs: \"${SECRET}\" }",
+    );
+    let report = load_str(&yaml, &env(&[("PW", "pw"), ("SECRET", "0")])).unwrap_err();
+    let e = report
+        .errors
+        .iter()
+        .find(|d| d.rule == "V-074")
+        .unwrap_or_else(|| panic!("no V-074 diagnostic: {report:#?}"));
+    assert!(!e.message.contains(" 0"), "{}", e.message);
+    assert!(e.message.contains("${SECRET}"), "{}", e.message);
+    assert!(!report.to_json().to_string().contains("\"0\""));
+}
+
+#[test]
+fn env_resolved_lease_renewal_interval_hides_the_value_in_v073() {
+    let yaml = MINIMAL.replace(
+        "state: { bucket: app-state }",
+        "state: { bucket: app-state }\n  cluster: { lease_renewal_interval: \"${SECRET}\" }",
+    );
+    // Default lease_duration is 15s, so anything above 5s (15s / 3) trips V-073.
+    let report = load_str(&yaml, &env(&[("PW", "pw"), ("SECRET", "20s")])).unwrap_err();
+    let e = report
+        .errors
+        .iter()
+        .find(|d| d.rule == "V-073")
+        .unwrap_or_else(|| panic!("no V-073 diagnostic: {report:#?}"));
+    assert!(!e.message.contains("20s"), "{}", e.message);
+    assert!(e.message.contains("${SECRET}"), "{}", e.message);
+    assert!(!report.to_json().to_string().contains("20s"));
+}
+
 #[test]
 fn env_resolved_duplicate_slot_hides_the_value_in_v058() {
     let yaml = r#"
