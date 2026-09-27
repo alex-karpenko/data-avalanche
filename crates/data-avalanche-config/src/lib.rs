@@ -9,6 +9,7 @@ pub mod leaf;
 pub mod parse;
 pub mod path;
 pub mod raw;
+pub mod template;
 pub mod units;
 
 pub use coerce::{LeafType, LogFilter};
@@ -17,4 +18,5 @@ pub use leaf::{Leaf, Loc, Tri};
 pub use parse::parse_document;
 pub use path::YamlPath;
 pub use raw::RawConfig;
+pub use template::{Env, ProcessEnv};
 pub use units::{ByteSize, HostPort};
