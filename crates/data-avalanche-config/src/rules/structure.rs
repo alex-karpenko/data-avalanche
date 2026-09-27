@@ -2,6 +2,7 @@
 
 use super::{missing, pipeline_at};
 use crate::ctx::{At, Ctx};
+use crate::diag::PARSE;
 use crate::enums::{CatalogKind, SinkType, SourceType};
 use crate::leaf::Leaf;
 use crate::path::YamlPath;
@@ -108,6 +109,48 @@ fn pipeline(name: &str, p: &RawPipeline, ctx: &mut Ctx) {
     }
     let default = RawSink::default();
     sink(p.sink.as_ref().unwrap_or(&default), &at.key("sink"), ctx);
+    required_fields(p, &at, ctx);
+}
+
+/// Required fields that §13 gives no V-rule: a strict parse would report them as missing, but the
+/// raw model keeps every field optional so that layers can merge, so they are checked after the
+/// merge and reported as `PARSE`.
+fn required_fields(p: &RawPipeline, at: &At, ctx: &mut Ctx) {
+    fn require<T>(ctx: &mut Ctx, at: &At, key: &str, leaf: &Option<Leaf<T>>) {
+        if leaf.is_none() {
+            ctx.error(
+                PARSE,
+                &at.key(key),
+                None,
+                format!("missing required field `{key}`"),
+            );
+        }
+    }
+    let catalog = p
+        .sink
+        .as_ref()
+        .and_then(|s| s.iceberg.as_ref())
+        .and_then(|i| i.catalog.as_ref());
+    if let Some(c) = catalog {
+        let c_at = at.key("sink").key("iceberg").key("catalog");
+        if let Some(g) = &c.glue {
+            require(ctx, &c_at.key("glue"), "name", &g.name);
+        }
+        if let Some(h) = &c.hive {
+            require(ctx, &c_at.key("hive"), "url", &h.url);
+        }
+        if let Some(r) = &c.rest {
+            require(ctx, &c_at.key("rest"), "url", &r.url);
+        }
+    }
+    let partitioning = p.tables.as_ref().and_then(|t| t.partitioning.as_ref());
+    for (table, fields) in partitioning.into_iter().flatten() {
+        let t_at = at.key("tables").key("partitioning").key(table);
+        for (i, f) in fields.iter().enumerate() {
+            require(ctx, &t_at.index(i), "column", &f.column);
+            require(ctx, &t_at.index(i), "transform", &f.transform);
+        }
+    }
 }
 
 fn source(s: &RawSource, at: &At, ctx: &mut Ctx) {

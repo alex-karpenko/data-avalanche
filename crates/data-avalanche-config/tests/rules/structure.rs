@@ -2,6 +2,8 @@
 
 use serde_json::json;
 
+use data_avalanche_config::diag::PARSE;
+
 use crate::cases::{Case, Edit, Expect::*, case, mysql_delta, pg_delta, pg_iceberg};
 
 pub fn cases() -> Vec<Case> {
@@ -213,6 +215,36 @@ pub fn cases() -> Vec<Case> {
         }),
         case("V-070", Silent, "token only", || {
             pg_iceberg().set("/pipelines/p/sink/iceberg/catalog/rest/token", json!("t"))
+        }),
+        // Required fields with no V-rule are PARSE errors, checked after the merge.
+        case(PARSE, Error, "rest without url", || {
+            pg_iceberg().del("/pipelines/p/sink/iceberg/catalog/rest/url")
+        }),
+        case(PARSE, Silent, "rest url from defaults", || {
+            pg_iceberg()
+                .set(
+                    "/defaults/sink/iceberg/catalog/rest/url",
+                    json!("https://c.example.com"),
+                )
+                .del("/pipelines/p/sink/iceberg/catalog/rest/url")
+        }),
+        case(PARSE, Error, "glue without name", || {
+            pg_iceberg().set("/pipelines/p/sink/iceberg/catalog", json!({"glue": {}}))
+        }),
+        case(PARSE, Error, "hive without url", || {
+            pg_iceberg().set("/pipelines/p/sink/iceberg/catalog", json!({"hive": {}}))
+        }),
+        case(PARSE, Error, "partition field without transform", || {
+            pg_delta().set(
+                "/pipelines/p/tables/partitioning",
+                json!({"public.orders": [{"column": "region"}]}),
+            )
+        }),
+        case(PARSE, Error, "partition field without column", || {
+            pg_delta().set(
+                "/pipelines/p/tables/partitioning",
+                json!({"public.orders": [{"transform": "identity"}]}),
+            )
         }),
     ]
 }
