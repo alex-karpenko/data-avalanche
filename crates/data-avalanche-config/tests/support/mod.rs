@@ -7,7 +7,16 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use data_avalanche_config::FingerprintKey;
+
 pub const SPEC_EXAMPLE: &str = include_str!("../fixtures/spec_example.yaml");
+
+/// A fixed cluster-wide fingerprint key for tests: they check the config, not fingerprint
+/// agreement across a real cluster, so any key will do as long as it's the same key on both sides
+/// of a reload diff.
+pub fn fp_key() -> FingerprintKey {
+    FingerprintKey::from_bytes([0x42; 32])
+}
 
 /// A minimal valid config: one PostgreSQL → Delta pipeline. Needs `PW` in the environment.
 pub const MINIMAL: &str = r#"

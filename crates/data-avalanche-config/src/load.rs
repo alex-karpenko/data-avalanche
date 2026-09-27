@@ -10,6 +10,7 @@ use crate::parse::parse_document;
 use crate::raw::RawConfig;
 use crate::resolved::ResolvedConfig;
 use crate::rules;
+use crate::secret::FingerprintKey;
 use crate::template::Env;
 use crate::walk::Walk;
 
@@ -68,12 +69,16 @@ fn dedupe_defaults(report: &mut Report) {
     report.warnings.retain(keep);
 }
 
-/// Loads config text. Any error rejects the whole config (§1.4) and the report lists every error
-/// of the phase that failed (the first one only for a Phase 0 parse error).
-pub fn load_str(text: &str, env: &dyn Env) -> Result<Loaded, Report> {
+/// Loads config text. `key` fingerprints every resolved secret and referenced file (config §6.2):
+/// the runtime passes the cluster-wide `fingerprint_key` held in the `globals.state` cluster
+/// anchor, so fingerprints agree across every node. Any error rejects the whole config (§1.4) and
+/// the report lists every error of the phase that failed (the first one only for a Phase 0 parse
+/// error).
+pub fn load_str(text: &str, env: &dyn Env, key: &FingerprintKey) -> Result<Loaded, Report> {
     let mut raw: RawConfig = parse_document(text).map_err(|d| only(*d))?;
 
-    // Phase 1: references unresolved; no environment, no files.
+    // Phase 1: references unresolved; no environment, no files, no secret built (so no key is
+    // used here).
     let mut ctx = Ctx::structural();
     drop_empty(&mut raw, &ctx);
     let merged = merge_all(&raw, &ctx);
@@ -87,7 +92,7 @@ pub fn load_str(text: &str, env: &dyn Env) -> Result<Loaded, Report> {
 
     // Phases 2 and 3: substitute, read files, apply defaults, check everything again with the
     // now-known values (a rule skipped on a template in Phase 1 runs here).
-    let mut ctx = Ctx::resolving(env);
+    let mut ctx = Ctx::resolving(env, key);
     drop_empty(&mut raw, &ctx);
     let merged = merge_all(&raw, &ctx);
     rules::check(&raw, &merged, &mut ctx);
@@ -117,8 +122,9 @@ pub fn load_str(text: &str, env: &dyn Env) -> Result<Loaded, Report> {
     }
 }
 
-/// Loads the config file at `path` (§2: the path comes from the command line).
-pub fn load_file(path: &Path, env: &dyn Env) -> Result<Loaded, Report> {
+/// Loads the config file at `path` (§2: the path comes from the command line). `key` is the same
+/// cluster-wide fingerprint key [`load_str`] takes.
+pub fn load_file(path: &Path, env: &dyn Env, key: &FingerprintKey) -> Result<Loaded, Report> {
     let text = std::fs::read_to_string(path).map_err(|e| {
         only(Diagnostic {
             locus: Locus::Config,
@@ -129,13 +135,15 @@ pub fn load_file(path: &Path, env: &dyn Env) -> Result<Loaded, Report> {
             message: format!("cannot read config file {}: {e}", path.display()),
         })
     })?;
-    load_str(&text, env)
+    load_str(&text, env, key)
 }
 
 /// The validation endpoint's dry run (§11): the full pipeline, returning only the report. The
-/// resolved config (it holds secrets) is never part of it (§11.1).
+/// resolved config (it holds secrets) is never part of it (§11.1). Its fingerprints never leave
+/// this call, so it keys them with a fresh, throwaway [`FingerprintKey::random`] rather than
+/// asking the caller for one.
 pub fn validate_str(text: &str, env: &dyn Env) -> Report {
-    match load_str(text, env) {
+    match load_str(text, env, &FingerprintKey::random()) {
         Ok(loaded) => Report {
             errors: Vec::new(),
             warnings: loaded.warnings,

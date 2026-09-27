@@ -7,13 +7,13 @@ use std::time::Duration;
 use data_avalanche_config::enums::*;
 use data_avalanche_config::resolved::*;
 use data_avalanche_config::{Locus, Origin, load_file, load_str};
-use support::{Files, MINIMAL, env, spec_example};
+use support::{Files, MINIMAL, env, fp_key, spec_example};
 
 #[test]
 fn spec_example_resolves() {
     let files = Files::new();
     let (yaml, env) = spec_example(&files);
-    let loaded = load_str(&yaml, &env).unwrap_or_else(|r| panic!("{r:#?}"));
+    let loaded = load_str(&yaml, &env, &fp_key()).unwrap_or_else(|r| panic!("{r:#?}"));
     assert!(loaded.warnings.is_empty(), "{:#?}", loaded.warnings);
     let cfg = loaded.config;
     assert_eq!(cfg.config_version, 1);
@@ -99,7 +99,9 @@ fn spec_example_resolves() {
 
 #[test]
 fn applies_spec_defaults() {
-    let cfg = load_str(MINIMAL, &env(&[("PW", "pw")])).unwrap().config;
+    let cfg = load_str(MINIMAL, &env(&[("PW", "pw")]), &fp_key())
+        .unwrap()
+        .config;
     let g = &cfg.globals;
     assert_eq!(g.cloud, Cloud::Aws);
     assert_eq!(g.api.address.to_string(), "0.0.0.0:8080");
@@ -176,7 +178,8 @@ fn absent_mysql_and_delta_blocks_take_every_default() {
         !yaml.contains("mysql:") && !yaml.contains("delta:"),
         "{yaml}"
     );
-    let loaded = load_str(&yaml, &env(&[("PW", "pw")])).unwrap_or_else(|r| panic!("{r:#?}"));
+    let loaded =
+        load_str(&yaml, &env(&[("PW", "pw")]), &fp_key()).unwrap_or_else(|r| panic!("{r:#?}"));
     assert!(loaded.warnings.is_empty(), "{:#?}", loaded.warnings);
     let p = &loaded.config.pipelines["orders"];
     let mysql = p.source.mysql.as_ref().unwrap();
@@ -198,7 +201,7 @@ fn structural_pass_stops_before_env_and_files() {
             "user: cdc\n      password: ${PW}",
             "credentials_file: /nonexistent/creds.json",
         );
-    let report = load_str(&yaml, &env(&[])).unwrap_err();
+    let report = load_str(&yaml, &env(&[]), &fp_key()).unwrap_err();
     let rules: Vec<_> = report.errors.iter().map(|d| d.rule.as_str()).collect();
     assert_eq!(rules, ["TYPE"], "{report:#?}");
     assert_eq!(report.errors[0].path, "pipelines.orders.source.port");
@@ -207,7 +210,7 @@ fn structural_pass_stops_before_env_and_files() {
 
 #[test]
 fn unset_variable_is_v063_at_its_path() {
-    let report = load_str(MINIMAL, &env(&[])).unwrap_err();
+    let report = load_str(MINIMAL, &env(&[]), &fp_key()).unwrap_err();
     let e = &report.errors[0];
     assert_eq!(
         (e.rule.as_str(), e.path.as_str()),
@@ -228,7 +231,7 @@ fn template_in_a_union_discriminator_resolves_in_phase_2() {
             "mysql: {}",
         )
         .replace("[public.orders]", "[orders]");
-    let cfg = load_str(&yaml, &env(&[("PW", "pw"), ("SRC", "mysql")]))
+    let cfg = load_str(&yaml, &env(&[("PW", "pw"), ("SRC", "mysql")]), &fp_key())
         .unwrap()
         .config;
     assert_eq!(cfg.pipelines["orders"].source.kind, SourceType::Mysql);
@@ -243,7 +246,7 @@ fn bad_credentials_file_is_v067() {
         "user: cdc\n      password: ${PW}",
         &format!("credentials_file: {}", path.display()),
     );
-    let report = load_str(&yaml, &env(&[])).unwrap_err();
+    let report = load_str(&yaml, &env(&[]), &fp_key()).unwrap_err();
     assert_eq!(report.errors[0].rule, "V-067");
     assert_eq!(
         report.errors[0].path,
@@ -262,7 +265,7 @@ fn bad_pem_is_v068() {
             k = key.display()
         ),
     );
-    let report = load_str(&yaml, &env(&[("PW", "pw")])).unwrap_err();
+    let report = load_str(&yaml, &env(&[("PW", "pw")]), &fp_key()).unwrap_err();
     let e = &report.errors[0];
     assert_eq!(
         (e.rule.as_str(), e.path.as_str()),
@@ -280,7 +283,8 @@ fn unused_api_credentials_file_is_not_read() {
         "globals:\n  state: { bucket: app-state }",
         "globals:\n  state: { bucket: app-state }\n  api:\n    auth: none\n    credentials_file: /nonexistent/x.json",
     );
-    let loaded = load_str(&yaml, &env(&[("PW", "pw")])).unwrap_or_else(|r| panic!("{r:#?}"));
+    let loaded =
+        load_str(&yaml, &env(&[("PW", "pw")]), &fp_key()).unwrap_or_else(|r| panic!("{r:#?}"));
     assert!(loaded.warnings.is_empty(), "{:#?}", loaded.warnings);
 }
 
@@ -290,7 +294,8 @@ fn unused_api_tls_material_is_not_read() {
         "globals:\n  state: { bucket: app-state }",
         "globals:\n  state: { bucket: app-state }\n  api:\n    tls: { enabled: false, cert: /nonexistent/cert.pem, key: /nonexistent/key.pem }",
     );
-    let loaded = load_str(&yaml, &env(&[("PW", "pw")])).unwrap_or_else(|r| panic!("{r:#?}"));
+    let loaded =
+        load_str(&yaml, &env(&[("PW", "pw")]), &fp_key()).unwrap_or_else(|r| panic!("{r:#?}"));
     assert!(loaded.warnings.is_empty(), "{:#?}", loaded.warnings);
 }
 
@@ -300,7 +305,8 @@ fn unused_ssl_ca_is_not_read_when_ssl_mode_is_disable() {
         "postgres: { publication: orders_pub, slot: orders_slot }",
         "postgres: { publication: orders_pub, slot: orders_slot }\n      ssl_mode: disable\n      ssl_ca: /nonexistent/ca.pem",
     );
-    let loaded = load_str(&yaml, &env(&[("PW", "pw")])).unwrap_or_else(|r| panic!("{r:#?}"));
+    let loaded =
+        load_str(&yaml, &env(&[("PW", "pw")]), &fp_key()).unwrap_or_else(|r| panic!("{r:#?}"));
     assert!(loaded.warnings.is_empty(), "{:#?}", loaded.warnings);
 }
 
@@ -312,7 +318,7 @@ fn api_credentials_file_is_read_when_auth_is_basic() {
         "globals:\n  state: { bucket: app-state }",
         "globals:\n  state: { bucket: app-state }\n  api:\n    auth: basic\n    credentials_file: /nonexistent/x.json",
     );
-    let report = load_str(&yaml, &env(&[("PW", "pw")])).unwrap_err();
+    let report = load_str(&yaml, &env(&[("PW", "pw")]), &fp_key()).unwrap_err();
     assert_eq!(report.errors[0].rule, "V-067");
 }
 
@@ -326,7 +332,7 @@ fn inline_key_with_leading_whitespace_is_accepted() {
         "postgres: { publication: orders_pub, slot: orders_slot }\n      ssl_key: \"${KEY}\"",
     );
     let leading = format!("\n{}", support::key());
-    let cfg = load_str(&yaml, &env(&[("PW", "pw"), ("KEY", &leading)]))
+    let cfg = load_str(&yaml, &env(&[("PW", "pw"), ("KEY", &leading)]), &fp_key())
         .unwrap_or_else(|r| panic!("{r:#?}"))
         .config;
     assert!(matches!(
@@ -346,7 +352,7 @@ fn credentials_file_that_looks_like_json_is_never_shown() {
         "user: cdc\n      password: ${PW}",
         r#"credentials_file: '{"user":"u","password":"hunter2"}'"#,
     );
-    let report = load_str(&yaml, &env(&[])).unwrap_err();
+    let report = load_str(&yaml, &env(&[]), &fp_key()).unwrap_err();
     let e = &report.errors[0];
     assert_eq!(e.rule, "V-067");
     assert!(!e.message.contains("hunter2"), "{}", e.message);
@@ -362,6 +368,7 @@ fn env_resolved_ssl_key_path_is_never_shown() {
     let report = load_str(
         &yaml,
         &env(&[("PW", "pw"), ("KEY", "c2VjcmV0LWtleS1tYXRlcmlhbA==")]),
+        &fp_key(),
     )
     .unwrap_err();
     let e = &report.errors[0];
@@ -386,7 +393,12 @@ fn env_resolved_ssl_key_path_is_never_shown() {
 #[test]
 fn env_resolved_token_file_path_is_never_shown() {
     let yaml = with_catalog("rest: { url: \"https://c\", auth: bearer, token_file: \"${TOK}\" }");
-    let report = load_str(&yaml, &env(&[("PW", "pw"), ("TOK", "tok-abc123-secret")])).unwrap_err();
+    let report = load_str(
+        &yaml,
+        &env(&[("PW", "pw"), ("TOK", "tok-abc123-secret")]),
+        &fp_key(),
+    )
+    .unwrap_err();
     let e = &report.errors[0];
     assert_eq!(
         (e.rule.as_str(), e.path.as_str()),
@@ -409,8 +421,12 @@ fn env_resolved_port_hides_the_value_in_a_type_error() {
         "host: db.example.com",
         "host: db.example.com\n      port: \"${SECRET}\"",
     );
-    let report =
-        load_str(&yaml, &env(&[("PW", "pw"), ("SECRET", "s3cr3t-value-123")])).unwrap_err();
+    let report = load_str(
+        &yaml,
+        &env(&[("PW", "pw"), ("SECRET", "s3cr3t-value-123")]),
+        &fp_key(),
+    )
+    .unwrap_err();
     let e = &report.errors[0];
     assert_eq!(e.rule, "TYPE");
     assert!(!e.message.contains("s3cr3t-value-123"), "{}", e.message);
@@ -424,8 +440,12 @@ fn env_resolved_pipeline_id_hides_the_value_in_v055() {
     // happens to be a syntactically valid pipeline id (lower-case letters, digits, `_`/`-`), so it
     // would not trigger V-055's format check at all.
     let yaml = MINIMAL.replace("id: orders", "id: \"${SECRET}\"");
-    let report =
-        load_str(&yaml, &env(&[("PW", "pw"), ("SECRET", "S3CR3T-VALUE-123")])).unwrap_err();
+    let report = load_str(
+        &yaml,
+        &env(&[("PW", "pw"), ("SECRET", "S3CR3T-VALUE-123")]),
+        &fp_key(),
+    )
+    .unwrap_err();
     let e = report
         .errors
         .iter()
@@ -442,8 +462,12 @@ fn env_resolved_enum_hides_the_value_in_its_rule() {
         "include: [public.orders]",
         "include: [public.orders]\n      snapshots: { mode: \"${SECRET}\" }",
     );
-    let report =
-        load_str(&yaml, &env(&[("PW", "pw"), ("SECRET", "s3cr3t-value-123")])).unwrap_err();
+    let report = load_str(
+        &yaml,
+        &env(&[("PW", "pw"), ("SECRET", "s3cr3t-value-123")]),
+        &fp_key(),
+    )
+    .unwrap_err();
     let e = report
         .errors
         .iter()
@@ -465,7 +489,8 @@ fn env_resolved_range_check_hides_the_value_in_v026() {
         "state: { bucket: app-state }",
         "state: { bucket: app-state }\n  cluster: { tokens: \"${SECRET}\" }",
     );
-    let report = load_str(&yaml, &env(&[("PW", "pw"), ("SECRET", "99999")])).unwrap_err();
+    let report =
+        load_str(&yaml, &env(&[("PW", "pw"), ("SECRET", "99999")]), &fp_key()).unwrap_err();
     let e = report
         .errors
         .iter()
@@ -482,7 +507,7 @@ fn env_resolved_at_least_check_hides_the_value_in_v074() {
         "state: { bucket: app-state }",
         "state: { bucket: app-state }\n  cluster: { max_concurrent_handoffs: \"${SECRET}\" }",
     );
-    let report = load_str(&yaml, &env(&[("PW", "pw"), ("SECRET", "0")])).unwrap_err();
+    let report = load_str(&yaml, &env(&[("PW", "pw"), ("SECRET", "0")]), &fp_key()).unwrap_err();
     let e = report
         .errors
         .iter()
@@ -501,7 +526,7 @@ fn env_resolved_lease_renewal_interval_hides_the_value_in_v073() {
         "state: { bucket: app-state }\n  cluster: { lease_renewal_interval: \"${SECRET}\" }",
     );
     // Default lease_duration is 15s, so anything above 5s (15s / 3) trips V-073.
-    let report = load_str(&yaml, &env(&[("PW", "pw"), ("SECRET", "20s")])).unwrap_err();
+    let report = load_str(&yaml, &env(&[("PW", "pw"), ("SECRET", "20s")]), &fp_key()).unwrap_err();
     let e = report
         .errors
         .iter()
@@ -548,7 +573,7 @@ pipelines:
       bucket: lake
       delta: {}
 "#;
-    let report = load_str(yaml, &env(&[("PW", "pw"), ("S", "dup_slot_x")])).unwrap_err();
+    let report = load_str(yaml, &env(&[("PW", "pw"), ("S", "dup_slot_x")]), &fp_key()).unwrap_err();
     let hits: Vec<_> = report.errors.iter().filter(|d| d.rule == "V-058").collect();
     assert_eq!(hits.len(), 2, "{report:#?}");
     for e in &hits {
@@ -572,7 +597,7 @@ fn explicit_null_exclude_resolves_to_an_empty_list() {
             "include: [public.orders]",
             "include: [public.orders]\n      exclude: null",
         );
-    let cfg = load_str(&yaml, &env(&[("PW", "pw")]))
+    let cfg = load_str(&yaml, &env(&[("PW", "pw")]), &fp_key())
         .unwrap_or_else(|r| panic!("{r:#?}"))
         .config;
     assert!(cfg.pipelines["orders"].tables.exclude.is_empty());
@@ -586,7 +611,7 @@ fn explicit_null_include_fails_v007() {
             "defaults:\n  tables: { include: [public.orders] }\npipelines:",
         )
         .replace("include: [public.orders]\n", "include: null\n");
-    let report = load_str(&yaml, &env(&[("PW", "pw")])).unwrap_err();
+    let report = load_str(&yaml, &env(&[("PW", "pw")]), &fp_key()).unwrap_err();
     assert!(
         report.errors.iter().any(|d| d.rule == "V-007"),
         "{report:#?}"
@@ -615,7 +640,7 @@ fn empty_token_file_is_v071() {
         "rest: {{ url: \"https://c\", auth: bearer, token_file: {} }}",
         token.display()
     ));
-    let report = load_str(&yaml, &env(&[("PW", "pw")])).unwrap_err();
+    let report = load_str(&yaml, &env(&[("PW", "pw")]), &fp_key()).unwrap_err();
     let e = &report.errors[0];
     assert_eq!(
         (e.rule.as_str(), e.path.as_str()),
@@ -632,7 +657,9 @@ fn explicit_state_location_takes_the_defaults_prefix_as_parent() {
         "pipelines:",
         "defaults:\n  state: { bucket: state-bucket, prefix: parent }\npipelines:",
     );
-    let cfg = load_str(&yaml, &env(&[("PW", "pw")])).unwrap().config;
+    let cfg = load_str(&yaml, &env(&[("PW", "pw")]), &fp_key())
+        .unwrap()
+        .config;
     assert_eq!(
         cfg.pipelines["orders"].state,
         StateLocation::Explicit {
@@ -645,7 +672,7 @@ fn explicit_state_location_takes_the_defaults_prefix_as_parent() {
 
 #[test]
 fn secrets_never_print() {
-    let cfg = load_str(MINIMAL, &env(&[("PW", "s3cr3t-pw")]))
+    let cfg = load_str(MINIMAL, &env(&[("PW", "s3cr3t-pw")]), &fp_key())
         .unwrap()
         .config;
     assert!(!format!("{cfg:?}").contains("s3cr3t-pw"));
@@ -657,6 +684,7 @@ fn unreadable_config_file_is_a_parse_error() {
     let report = load_file(
         std::path::Path::new("/nonexistent/data-avalanche.yaml"),
         &env(&[]),
+        &fp_key(),
     )
     .unwrap_err();
     assert_eq!(report.errors[0].rule, "PARSE");
@@ -676,7 +704,7 @@ fn empty_optional_otlp_endpoint_is_absent() {
         "globals:\n  state: { bucket: app-state }",
         "globals:\n  state: { bucket: app-state }\n  tracing: { otlp_endpoint: \"${OTLP:-}\" }",
     );
-    let cfg = load_str(&yaml, &env(&[("PW", "pw")]))
+    let cfg = load_str(&yaml, &env(&[("PW", "pw")]), &fp_key())
         .unwrap_or_else(|r| panic!("{r:#?}"))
         .config;
     assert_eq!(
@@ -700,7 +728,7 @@ fn empty_optional_ssl_mode_falls_back_through_defaults() {
             "postgres: { publication: orders_pub, slot: orders_slot }",
             "postgres: { publication: orders_pub, slot: orders_slot }\n      ssl_mode: \"${M:-}\"",
         );
-    let cfg = load_str(&yaml, &env(&[("PW", "pw")]))
+    let cfg = load_str(&yaml, &env(&[("PW", "pw")]), &fp_key())
         .unwrap_or_else(|r| panic!("{r:#?}"))
         .config;
     assert_eq!(
@@ -716,7 +744,7 @@ fn empty_optional_tri_state_flush_seconds_falls_back_to_the_default_not_disabled
         "delta: {}",
         "delta: {}\n      flush: { seconds: \"${S:-}\" }",
     );
-    let cfg = load_str(&yaml, &env(&[("PW", "pw")]))
+    let cfg = load_str(&yaml, &env(&[("PW", "pw")]), &fp_key())
         .unwrap_or_else(|r| panic!("{r:#?}"))
         .config;
     assert_eq!(
@@ -739,7 +767,7 @@ defaults:
   sink: { flush: { rows: abc } }
 pipelines: {}
 "#;
-    let report = load_str(yaml, &env(&[])).unwrap_err();
+    let report = load_str(yaml, &env(&[]), &fp_key()).unwrap_err();
     assert_eq!(report.errors.len(), 1, "{report:#?}");
     let e = &report.errors[0];
     assert_eq!(e.rule, "TYPE");
@@ -785,7 +813,7 @@ pipelines:
       bucket: lake
       delta: {}
 "#;
-    let report = load_str(yaml, &env(&[("PW", "pw")])).unwrap_err();
+    let report = load_str(yaml, &env(&[("PW", "pw")]), &fp_key()).unwrap_err();
     let hits: Vec<_> = report
         .errors
         .iter()
@@ -802,7 +830,7 @@ fn invalid_enum_in_defaults_is_v020_at_its_defaults_path() {
         "pipelines:",
         "defaults:\n  source: { ssl_mode: nope }\npipelines:",
     );
-    let report = load_str(&yaml, &env(&[("PW", "pw")])).unwrap_err();
+    let report = load_str(&yaml, &env(&[("PW", "pw")]), &fp_key()).unwrap_err();
     let hits: Vec<_> = report.errors.iter().filter(|d| d.rule == "V-020").collect();
     assert_eq!(hits.len(), 1, "{report:#?}");
     assert_eq!(hits[0].path, "defaults.source.ssl_mode");
@@ -851,7 +879,7 @@ pipelines:
       bucket: lake
       delta: {}
 "#;
-    let report = load_str(yaml, &env(&[("PW", "pw")])).unwrap_err();
+    let report = load_str(yaml, &env(&[("PW", "pw")]), &fp_key()).unwrap_err();
     let hits: Vec<_> = report.errors.iter().filter(|d| d.rule == "V-020").collect();
     assert_eq!(hits.len(), 1, "{report:#?}");
     assert_eq!(hits[0].path, "defaults.source.ssl_mode");

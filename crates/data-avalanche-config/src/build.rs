@@ -21,6 +21,7 @@ use crate::material::{Pem, PemKind, load_pem, read_file_ref, read_json_pair, rea
 use crate::path::YamlPath;
 use crate::raw::*;
 use crate::resolved::*;
+use crate::secret::Secret;
 use crate::units::{ByteSize, HostPort};
 
 type L<T> = Option<Leaf<T>>;
@@ -167,7 +168,10 @@ fn pem(ctx: &mut Ctx, leaf: &L<String>, at: &At, key: &str, kind: PemKind) -> Op
         return None;
     }
     let label = file_label(l, &text);
-    match load_pem(&text, &label, kind) {
+    let fp_key = ctx
+        .fingerprint_key()
+        .expect("resolving pass carries a fingerprint key");
+    match load_pem(&text, &label, kind, fp_key) {
         Ok(p) => Some(Some(p)),
         Err(e) => {
             ctx.error("V-068", &at, l.loc(), e);
@@ -193,7 +197,10 @@ fn credentials(
         (Some(f), None, None) => {
             let at = at.key("credentials_file");
             let (path, label) = file_path(ctx, f, &at)?;
-            match read_json_pair(&path, &label, "user", "password") {
+            let fp_key = ctx
+                .fingerprint_key()
+                .expect("resolving pass carries a fingerprint key");
+            match read_json_pair(&path, &label, "user", "password", fp_key) {
                 Ok((user, password)) => Some(Credentials::File {
                     path,
                     user,
@@ -205,10 +212,16 @@ fn credentials(
                 }
             }
         }
-        (None, Some(_), Some(_)) => Some(Credentials::Inline {
-            user: user_v?,
-            password: crate::secret::Secret::new(password_v?),
-        }),
+        // §11 Phase 2: the structural pass builds no `Secret` (it has no fingerprint key), so an
+        // inline credential is only assembled once resolving; the structural pass's diagnostics
+        // already ran above, via `ctx.text`.
+        (None, Some(_), Some(_)) => {
+            let fp_key = ctx.fingerprint_key()?;
+            Some(Credentials::Inline {
+                user: user_v?,
+                password: Secret::new(password_v?, fp_key),
+            })
+        }
         _ => None,
     }
 }
@@ -1064,7 +1077,15 @@ fn hive(h: &RawHive, at: &At, db: Option<&str>, ctx: &mut Ctx) -> Option<Hive> {
             let at = at.key("kerberos");
             let principal = req(ctx, &k.principal, &at, "principal");
             let keytab = k.keytab.as_ref().and_then(|l| {
-                read_or_report(ctx, "V-069", &at.key("keytab"), l, read_file_ref).map(|(_, f)| f)
+                let fp_key = ctx.fingerprint_key();
+                read_or_report(ctx, "V-069", &at.key("keytab"), l, |p, label| {
+                    read_file_ref(
+                        p,
+                        label,
+                        fp_key.expect("resolving pass carries a fingerprint key"),
+                    )
+                })
+                .map(|(_, f)| f)
             });
             let service_name = or(
                 ctx,
@@ -1114,7 +1135,6 @@ fn hive(h: &RawHive, at: &At, db: Option<&str>, ctx: &mut Ctx) -> Option<Hive> {
 }
 
 fn rest(r: &RawRest, at: &At, ctx: &mut Ctx) -> Option<Rest> {
-    use crate::secret::Secret;
     let url = req(ctx, &r.url, at, "url");
     let warehouse = opt(ctx, &r.warehouse, at, "warehouse");
     let prefix = opt(ctx, &r.prefix, at, "prefix");
@@ -1123,12 +1143,23 @@ fn rest(r: &RawRest, at: &At, ctx: &mut Ctx) -> Option<Rest> {
     // for the matching catalog `auth` mode; an unused reference is never read.
     let token = match auth {
         Some(RestAuth::Bearer) => match (&r.token, &r.token_file) {
-            (Some(t), None) => ctx.text(t, &at.key("token")).map(|t| BearerToken::Inline {
-                token: Secret::new(t),
+            // §11 Phase 2: the structural pass builds no `Secret` (no fingerprint key); its
+            // `ctx.text` call still runs, so a malformed template is still reported.
+            (Some(t), None) => ctx.text(t, &at.key("token")).and_then(|text| {
+                ctx.fingerprint_key().map(|fp_key| BearerToken::Inline {
+                    token: Secret::new(text, fp_key),
+                })
             }),
             (None, Some(f)) => {
-                read_or_report(ctx, "V-071", &at.key("token_file"), f, read_token_file)
-                    .map(|(path, token)| BearerToken::File { path, token })
+                let fp_key = ctx.fingerprint_key();
+                read_or_report(ctx, "V-071", &at.key("token_file"), f, |p, label| {
+                    read_token_file(
+                        p,
+                        label,
+                        fp_key.expect("resolving pass carries a fingerprint key"),
+                    )
+                })
+                .map(|(path, token)| BearerToken::File { path, token })
             }
             _ => None,
         },
@@ -1147,8 +1178,15 @@ fn rest(r: &RawRest, at: &At, ctx: &mut Ctx) -> Option<Rest> {
                 .and_then(|l| ctx.text(l, &at.key("client_secret")));
             let client = match (&o.credentials_file, &o.client_id, &o.client_secret) {
                 (Some(f), None, None) => {
+                    let fp_key = ctx.fingerprint_key();
                     read_or_report(ctx, "V-067", &at.key("credentials_file"), f, |p, label| {
-                        read_json_pair(p, label, "client_id", "client_secret")
+                        read_json_pair(
+                            p,
+                            label,
+                            "client_id",
+                            "client_secret",
+                            fp_key.expect("resolving pass carries a fingerprint key"),
+                        )
                     })
                     .map(|(path, (client_id, client_secret))| {
                         OauthClient::File {
@@ -1158,9 +1196,14 @@ fn rest(r: &RawRest, at: &At, ctx: &mut Ctx) -> Option<Rest> {
                         }
                     })
                 }
-                (None, Some(_), Some(_)) => Some(OauthClient::Inline {
-                    client_id: id?,
-                    client_secret: Secret::new(secret?),
+                // §11 Phase 2: same as the bearer token above — no `Secret` is built in the
+                // structural pass, but `id`/`secret` already ran `ctx.text` for their own
+                // diagnostics, and `token_url`/`scope` below still get theirs either way.
+                (None, Some(_), Some(_)) => id.zip(secret).and_then(|(id, secret)| {
+                    ctx.fingerprint_key().map(|fp_key| OauthClient::Inline {
+                        client_id: id,
+                        client_secret: Secret::new(secret, fp_key),
+                    })
                 }),
                 _ => None,
             };
@@ -1300,6 +1343,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::secret::FingerprintKey;
 
     fn hive_at() -> At {
         At::pipeline(
@@ -1331,7 +1375,8 @@ mod tests {
     #[test]
     fn hive_tls_ca_is_not_read_when_tls_is_disabled() {
         let env: BTreeMap<String, String> = BTreeMap::new();
-        let mut ctx = Ctx::resolving(&env);
+        let key = FingerprintKey::from_bytes([1; 32]);
+        let mut ctx = Ctx::resolving(&env, &key);
         hive(&hive_with_tls("false"), &hive_at(), None, &mut ctx);
         assert!(ctx.report().is_ok(), "{:#?}", ctx.report());
     }
@@ -1339,7 +1384,8 @@ mod tests {
     #[test]
     fn hive_tls_ca_is_read_when_tls_is_enabled() {
         let env: BTreeMap<String, String> = BTreeMap::new();
-        let mut ctx = Ctx::resolving(&env);
+        let key = FingerprintKey::from_bytes([1; 32]);
+        let mut ctx = Ctx::resolving(&env, &key);
         hive(&hive_with_tls("true"), &hive_at(), None, &mut ctx);
         assert_eq!(ctx.report().errors[0].rule, "V-068");
     }

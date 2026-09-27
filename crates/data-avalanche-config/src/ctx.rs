@@ -5,6 +5,7 @@ use crate::coerce::LeafType;
 use crate::diag::{Diagnostic, Locus, Report, Severity};
 use crate::leaf::{Leaf, Loc};
 use crate::path::YamlPath;
+use crate::secret::FingerprintKey;
 use crate::template::{Env, Expanded, expand};
 
 /// Where a check applies: the locus (config, a named pipeline, or reload) and the YAML path.
@@ -78,10 +79,13 @@ impl At {
     }
 }
 
-/// One evaluation pass. `structural()` is config §11 Phase 1 (no environment, no files);
-/// `resolving(env)` is Phase 2 (references substituted, files read by the build).
+/// One evaluation pass. `structural()` is config §11 Phase 1 (no environment, no files, so no
+/// secret is ever built — the fingerprint key would go unused); `resolving(env, key)` is Phase 2
+/// (references substituted, files read by the build, [`crate::secret::Secret`] values built with
+/// `key`, config §6.2).
 pub struct Ctx<'e> {
     env: Option<&'e dyn Env>,
+    key: Option<&'e FingerprintKey>,
     report: Report,
 }
 
@@ -98,19 +102,28 @@ impl<'e> Ctx<'e> {
     pub fn structural() -> Self {
         Self {
             env: None,
+            key: None,
             report: Report::default(),
         }
     }
 
-    pub fn resolving(env: &'e dyn Env) -> Self {
+    pub fn resolving(env: &'e dyn Env, key: &'e FingerprintKey) -> Self {
         Self {
             env: Some(env),
+            key: Some(key),
             report: Report::default(),
         }
     }
 
     pub fn is_resolving(&self) -> bool {
         self.env.is_some()
+    }
+
+    /// The fingerprint key for this pass: `None` in [`Ctx::structural`] (it builds no secret,
+    /// since it reads no file and a leaf's inline value never needs fingerprinting before it's
+    /// known to survive the pass), `Some` in [`Ctx::resolving`].
+    pub(crate) fn fingerprint_key(&self) -> Option<&'e FingerprintKey> {
+        self.key
     }
 
     /// The leaf's final text: `${VAR}` substituted and `$${` unescaped. `None` when the text is a
@@ -257,7 +270,8 @@ mod tests {
     #[test]
     fn resolving_pass_substitutes_then_coerces() {
         let env: BTreeMap<String, String> = [("PG_PORT".to_string(), "5432".to_string())].into();
-        let mut ctx = Ctx::resolving(&env);
+        let key = FingerprintKey::from_bytes([1; 32]);
+        let mut ctx = Ctx::resolving(&env, &key);
         assert_eq!(
             ctx.value(&Leaf::<u16>::new("${PG_PORT}"), &at()),
             Some(5432)

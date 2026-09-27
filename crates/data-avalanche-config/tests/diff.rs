@@ -4,10 +4,10 @@ mod support;
 
 use data_avalanche_config::diff::unclassified_paths;
 use data_avalanche_config::{Mutability, PipelineChange, ResolvedConfig, diff, load_str};
-use support::{Files, MINIMAL, cert, env, key, spec_example};
+use support::{Files, MINIMAL, cert, env, fp_key, key, spec_example};
 
 fn load(yaml: &str) -> ResolvedConfig {
-    load_str(yaml, &env(&[("PW", "pw")]))
+    load_str(yaml, &env(&[("PW", "pw")]), &fp_key())
         .unwrap_or_else(|r| panic!("{r:#?}"))
         .config
 }
@@ -208,7 +208,7 @@ fn every_resolved_path_has_a_class() {
         "sink:\n      type: iceberg\n      bucket: lake\n      iceberg:\n        catalog:\n          glue: { name: \"123\" }\n          retry: { max_attempts: 3 }",
     );
     let configs = [
-        load_str(&spec, &spec_env).unwrap().config,
+        load_str(&spec, &spec_env, &fp_key()).unwrap().config,
         load(&rich),
         load(&bearer),
         load(&glue),

@@ -11,10 +11,10 @@ use data_avalanche_config::{
     check_unbounded_numeric, load_str,
 };
 use data_avalanche_core::TableRef;
-use support::{MINIMAL, env};
+use support::{MINIMAL, env, fp_key};
 
 fn load(yaml: &str) -> ResolvedConfig {
-    load_str(yaml, &env(&[("PW", "pw")]))
+    load_str(yaml, &env(&[("PW", "pw")]), &fp_key())
         .unwrap_or_else(|r| panic!("{r:#?}"))
         .config
 }

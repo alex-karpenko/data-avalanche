@@ -339,6 +339,7 @@ mod tests {
 
     use super::*;
     use crate::path::YamlPath;
+    use crate::secret::FingerprintKey;
 
     fn at() -> At {
         At::config(YamlPath::root().key("x"))
@@ -363,8 +364,9 @@ mod tests {
     #[test]
     fn drop_empty_turns_a_tri_state_leaf_that_resolves_empty_into_fully_absent() {
         let env: BTreeMap<String, String> = BTreeMap::new();
+        let key = FingerprintKey::from_bytes([1; 32]);
         let mut tri: Tri<u64> = Some(Some(Leaf::new("${S:-}")));
-        tri.drop_empty(&Ctx::resolving(&env));
+        tri.drop_empty(&Ctx::resolving(&env, &key));
         assert_eq!(
             tri, None,
             "empty means absent (apply the default), not null"

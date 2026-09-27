@@ -5,18 +5,27 @@
 //! How the runtime uses it:
 //!
 //! - **Startup and reload:** [`load_file`] (or [`load_str`]) returns a [`ResolvedConfig`] plus
-//!   warnings, or a [`Report`] of every error. Any error rejects the whole config (§1.4).
+//!   warnings, or a [`Report`] of every error. Any error rejects the whole config (§1.4). Both
+//!   take a [`FingerprintKey`] (config §6.2): the runtime reads `fingerprint_key` from the
+//!   `globals.state` cluster anchor — 32 random bytes the node that creates the anchor generates
+//!   once, with the same create-if-absent conditional write that pins `tokens`, and never changes
+//!   afterward — and passes it here so every node's fingerprints of the same secret or file agree.
 //! - **Validation endpoint:** [`validate_str`] runs the same phases and returns only the report;
-//!   it never exposes the resolved config (§11.1). [`Report::to_json`] is the response body.
+//!   it never exposes the resolved config (§11.1), and its fingerprints never leave the call, so
+//!   it keys them with [`FingerprintKey::random`] rather than taking a key. [`Report::to_json`] is
+//!   the response body.
 //! - **Reload:** [`diff()`] compares the running and the new config, classifying each changed
-//!   field by [`Mutability`]; a changed restart-only field rejects the reload (V-061).
+//!   field by [`Mutability`]; a changed restart-only field rejects the reload (V-061). Diff both
+//!   configs with the same [`FingerprintKey`] (they normally are — it's the same anchor), or a
+//!   rotated secret and an unrelated key will look identical to an unchanged one.
 //! - **Rules that need more than the file:** [`check_cluster_anchor`] at startup,
 //!   [`check_table_set`] when a pipeline's tables resolve, [`check_unbounded_numeric`] at schema
 //!   resolution.
 //!
 //! Every diagnostic carries its V-rule ID ([`RULES`] is the §13 master table), or [`PARSE`] /
 //! [`TYPE`] for YAML and value-type errors. [`Secret`] values never print: `Debug` shows `***` and
-//! `Serialize` a fingerprint.
+//! `Serialize` a keyed BLAKE3 fingerprint (§11.1). [`FingerprintKey`]'s own `Debug` hides its
+//! bytes too, and it carries no `Serialize` impl — it is not a config field.
 
 pub mod build;
 pub mod coerce;
@@ -56,7 +65,7 @@ pub use path::YamlPath;
 pub use raw::RawConfig;
 pub use registry::{RULES, RuleInput, RuleMeta, RuleSeverity, rule_meta};
 pub use resolved::{Pipeline, ResolvedConfig};
-pub use secret::Secret;
+pub use secret::{FingerprintKey, Secret};
 pub use template::{Env, ProcessEnv};
 pub use units::{ByteSize, HostPort};
 
