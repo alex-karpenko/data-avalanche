@@ -1031,7 +1031,9 @@ value, and the result is checked for **presence** (non-empty) and **content vali
   read and cannot fail the load. In effect means: `globals.api` `credentials_file` / `jwt` /
   `oauth2` material only for the matching `auth` mode; `tls.cert`/`key`/`ca` (`globals.api.tls`,
   `memberlist.tls`) only when that block's `enabled` is `true`; `source.ssl_cert`/`ssl_key`/`ssl_ca`
-  only when `ssl_mode` ≠ `disable`; catalog auth material only for the matching catalog `auth` mode.
+  only when `ssl_mode` ≠ `disable`; catalog auth material only for the matching catalog `auth` mode;
+  catalog TLS material (`sink.iceberg.catalog.*.tls`) only when that block's `enabled` is `true`
+  (a block with no `enabled` field is always in effect).
 - Any required value that resolves to empty is an error.
 - An optional value that resolves to empty (e.g. `${VAR:-}` with `VAR` unset) is treated as
   **absent**: its default applies (for a tri-state field, the default — not `null`).
