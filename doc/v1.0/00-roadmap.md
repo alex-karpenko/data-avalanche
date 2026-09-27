@@ -1,5 +1,5 @@
 ---
-updated: 2026-09-26
+updated: 2026-09-27
 domain: Architecture
 tags: [v1, implementation-plan, roadmap, milestones, workspace, crates, interfaces, test-strategy, ci, risks]
 sources: []
@@ -131,7 +131,7 @@ Rules:
 | PG SQL (catalog, chunks) | `tokio-postgres` + `tokio-postgres-rustls` | `0.7` | S-PG probes |
 | MySQL binlog + SQL | `mysql_async` / `mysql_common` | `=0.37.1` / `=0.37.3` | S-MY0–9 |
 | DDL classifier | `sqlparser` | latest 0.x, pinned in M7 | MySQL_DDL_Classifier §5 |
-| YAML 1.2 (serde) | `serde-saphyr` | `1.3` | verified at the start of M1 (fallback `serde_yaml_ng`) |
+| YAML 1.2 (serde) | `serde-saphyr` (`deserialize` only) | `=1.3.0` | Verified in M1 planning (2026-09-27): strict booleans, duplicate-key errors, `Spanned` locations, unknown-key errors with location. One trap: `${…}` inside a flow collection must be quoted (M1 Review Focus 1). R-9 closed |
 | Membership | `memberlist` `0.8.5` (fallback `foca` `2.0`) | pinned in M8 | **unprobed** — M8 opens with a probe gate |
 | HTTP API | `axum` `0.8` + `utoipa` `6` | | |
 | Metrics | `prometheus-client` | | |
@@ -337,6 +337,7 @@ Detailed plan: `M0-foundations.md`.
 
 ### M1 — Configuration (`data-avalanche-config`)
 
+- **Plan:** [`M1-configuration.md`](M1-configuration.md), 15 tasks (2026-09-27, draft for review).
 - **Scope:**
   - The full config §3–§10 model: every field, default, union and tri-state, including the Iceberg
     blocks, because they must validate even though v1 refuses them at start.
@@ -346,7 +347,7 @@ Detailed plan: `M0-foundations.md`.
     template.
   - Phase 2 resolution: env vars, `credentials_file`, `token_file`, PEM material, other files.
   - Merge semantics §8, including union subtrees and list replacement.
-  - The **whole V-rule table** (V-001…V-116, with the P-3/P-4 changes) as data-driven validators with
+  - The **whole V-rule table** (V-001…V-117, with the P-3/P-4 changes and S-H…S-L) as data-driven validators with
     locus and severity.
   - The resolved-config type (§11.1), the diff with R/PR/PROC classification (§12.2–12.3), and the
     validation report (JSON, used later by the API).
@@ -682,7 +683,7 @@ fake-gcs FAIL (risk R-3).
 | R-6 | DataFusion memory during large MERGEs | medium / medium | Bound the batch bytes per commit (split at `flush.bytes`); a memory test in M4; the DataFusion memory pool configured |
 | R-7 | `mysql_async` silent payload drop (DA-SRC-12) | low / high | Our own check (M7) plus a fault-injection test; upstream report |
 | R-8 | `pgwire-replication` =0.4.1 is a young crate (proto v1 only) | medium / medium | Thin wrapper; the decoder is ours; a fork path is documented |
-| R-9 | `serde-saphyr` lacks a strictness or error-location feature the spec needs | low / medium | First M1 task verifies it; `serde_yaml_ng` fallback |
+| R-9 | `serde-saphyr` lacks a strictness or error-location feature the spec needs | ~~low / medium~~ closed | Verified in M1 planning (2026-09-27) against the full M1 implementation in a scratch workspace: every needed feature is there (§2.1). Closed; `serde_yaml_ng` not needed |
 | R-10 | TOAST carry-forward across batches depends on the MERGE update expression (D-IMPL-3) | medium / high | M4 test with an unchanged TOAST column across two flushes; `re_query` strategy as the alternative |
 | R-13 | Two `object_store` versions after M4: ours at 0.14, deltalake 1.0 at `^0.13.2`. Store handles can't be shared across them (e.g. passing our store to delta-rs), and `quick-xml` 0.39.4 (RUSTSEC-2026-0194/0195, fixed in 0.41) comes back through deltalake's copy | known / low | Keep the two apart: the storage crate owns 0.14 for lease/state/config; the Delta sink builds its stores through deltalake's own API. The non-blocking `cargo audit` step reports the advisories. Move to one version when a deltalake release accepts 0.14 (check at M4) |
 
@@ -702,6 +703,14 @@ fake-gcs FAIL (risk R-3).
 | S-E | `Configuration_Specification.md` §12.1, §12.4 | Replace the stale "design item" notes (cross-worker propagation, pipeline state machine) with pointers to Clustering §9 and Pipeline_Lifecycle | consistency | M1 |
 | S-F | `Data-Flow.md` Phase 3 metadata list, Phase 5 | Lineage list gains `_seq`/`_pipeline`; Phase 5 states the checkpoint rule D-IMPL-2 | D-IMPL-2 | M6 |
 | S-G | `Data-Flow.md` Phase 2a TOAST paragraph | State the carry-forward mechanism D-IMPL-3 | D-IMPL-3 | M4 |
+| S-H | `Configuration_Specification.md` §13 intro | Add: "A diagnostic that no V-rule covers carries `PARSE` (YAML syntax or structure, an unknown key, a required field with no rule of its own) or `TYPE` (a scalar that does not coerce to its field's type where no V-rule covers the field)." | Q-M1-2 | M1 |
+| S-I | `Configuration_Specification.md` §9.4.3 `table_properties` note, §13.4 V-093 | Name the allow-list: `delta.dataSkippingNumIndexedCols`, `delta.dataSkippingStatsColumns`, `delta.deletedFileRetentionDuration`, `delta.targetFileSize`, `delta.tuneFileSizesForRewrites`, `delta.checkpoint.writeStatsAsJson`, `delta.checkpoint.writeStatsAsStruct`. Any other `delta.*` key is an error; keys without the `delta.` prefix pass through unchanged | Q-M1-1 | M1 |
+| S-J | `Configuration_Specification.md` §9.6 `prefix` note, §10 | `defaults.state.prefix` is a **parent** prefix, applied only when state has an explicit location (`state.bucket` on the pipeline or in `defaults`). It has no effect, and no warning, when state co-locates with the sink. A pipeline does not inherit it as its own `state.prefix` | Q-M1-3 | M1 |
+| S-K | `Configuration_Specification.md` V-001, V-084, §9.2 intro, §9.4 `iceberg`/`delta` row | An absent `mysql` / `delta` block means all defaults (every field in them has one); `postgres` / `iceberg` blocks stay required (they have required fields) | Q-M1-4 | M1 |
+| S-L | `Configuration_Specification.md` §13.4 (new row), §9.3 `include` note | New rule **V-117**: PostgreSQL `tables.include`/`exclude` patterns are `schema.table` (one `.`, both parts non-empty, globs within parts) | Q-M1-5 | M1 |
+
+**S-H…S-L: approved and applied on 2026-09-27** (spec §15 item 22 records them). The M1 plan
+implements them.
 
 `Type_Mapping.md` (research) still names `mysql-binlog-connector-rust` as the MySQL decoder, but
 `mysql_async` replaced it. That research-doc fix is applied (2026-09-26).
@@ -736,6 +745,7 @@ the naming below (2026-09-26).**
 | D-IMPL-5 | `SourceSeq` for binlog = (file index from the `.NNNNNN` suffix, `end_log_pos`), in every MySQL mode | Totally ordered within a stream across rotations | M0 |
 | D-IMPL-6 | Integration tests gate on `DATA_AVALANCHE_IT` (non-empty), cloud tests on `DATA_AVALANCHE_CLOUD` | Keeps `cargo test` hermetic by default | M0 |
 | D-IMPL-7 | Product name **`data-avalanche`** everywhere: binary and crate family `data-avalanche` / `data-avalanche-*` (imports `data_avalanche_*`); Helm chart and image `data-avalanche`; metric prefix **`data_avalanche_`** (replaces the specified `cdc_`); Delta `app_id` **`data-avalanche/<pipeline_id>/owner`**; `commitInfo` keys and the Arrow field tag `data-avalanche.*` (`data-avalanche.committed_position`, `.owner_epoch`, `.pipeline`, `data-avalanche.logical`); internal column prefix **`__data_avalanche_`** (MERGE flag `__data_avalanche_del`); env vars `DATA_AVALANCHE_*`; test bucket `data-avalanche-test`, test object prefix `data-avalanche-it/` | Owner decision (2026-09-26); specs, research docs and this plan updated. Untouched: `prototypes/` (probe evidence as run) and the legacy gap report; Iceberg's `cdc.owner_epoch` table property is v2 and keeps its name until the Iceberg sink is planned | M0 |
+| D-IMPL-8 | M1 config rulings **D-M1.1…D-M1.15** (listed in `M1-configuration.md` §Decisions and rulings, each pinned by a test). Among them: `Leaf<T>` replaces §4 M1's `Resolvable<T>`; templates allowed in union discriminators; a defaults catalog `type` dropped when the pipeline picks a block; required fields without a V-rule reported as `PARSE`; V-069/V-087 have no failing input in v1; the validate endpoint never returns the resolved config. D-M1.5, D-M1.12 and D-M1.14 were changed at review (Q-M1-4…6) | The spec is silent on these; each choice is the one that keeps a hand-written config valid or safe | M1 — **approved 2026-09-27** |
 
 ### 9.1 Questions answered at plan review (2026-09-26)
 
@@ -744,6 +754,12 @@ the naming below (2026-09-26).**
 | Q-M5-1 | PG `infinity` / `-infinity` for `date` / `timestamp[tz]` | **Clamp to the Arrow min/max** (`Date32` `i32::MIN/MAX`; `Timestamp(µs)` `i64::MIN/MAX`); out-of-range PG timestamps clamp too | `Type_Mapping.md` §Date/time edge values; `ColumnValue::Date(i32)` (§3.1) |
 | Q-M7-1 | MySQL/MariaDB zero dates under a permissive `sql_mode` | **All-zero date → NULL** (halt if it is in a key column); **zero-in-part / impossible dates → table halt `INVALID_DATE_VALUE`**, remedy `column_type_overrides: string` (raw text). Revised at review: MariaDB 11.8 accepts zero-in-part dates by default (measured) | `Type_Mapping.md` §Date/time edge values; config §9.3 `column_type_overrides` |
 | Q-M7-2 | File/position mode under a source failover | **Halt with a clear error**: pipeline halt `BINLOG_SOURCE_CHANGED` when `@@server_uuid` (MySQL) / `@@server_id` (MariaDB) differs from the recorded one; remedy = `gtid` or re-snapshot | `Data-Flow.md` Phase 2b; config §9.2.2 |
+| Q-M1-1 (2026-09-27) | What does V-093 allow in `sink.delta.table_properties`? | **A 7-key allow-list** (S-I); any other `delta.*` key is an error, non-`delta.` keys pass through | `M1-configuration.md`; spec edit S-I |
+| Q-M1-2 (2026-09-27) | Which rule does a diagnostic with no V-rule carry? | **`PARSE` / `TYPE`** (S-H) | `M1-configuration.md`; spec edit S-H |
+| Q-M1-3 (2026-09-27) | What does `defaults.state.prefix` mean? | **A parent prefix for explicit state locations**; co-located state ignores it silently (S-J) | `M1-configuration.md`; spec edit S-J |
+| Q-M1-4 (2026-09-27) | Must an operator write an empty `mysql: {}` / `delta: {}`? | **No**: every field in those blocks has a default, so absent = all defaults; `postgres` / `iceberg` stay required (S-K) | `M1-configuration.md`; spec edit S-K |
+| Q-M1-5 (2026-09-27) | PostgreSQL `include` pattern without a schema? | **A validation error, new rule V-117** (S-L) | `M1-configuration.md`; spec edit S-L |
+| Q-M1-6 (2026-09-27) | Commit a test TLS key pair? | **Never commit key material**; tests generate a throwaway pair at run time (`rcgen` dev-dependency) | `M1-configuration.md` D-M1.14 |
 | Q-M9-1 | Snapshot-job persistence | **Persisted in the pipeline state location** (`snapshots/jobs/<job_id>.json`); listed after a restart or failover via `GET /v1/pipelines/{id}/snapshots`; a running job continues on the new owner from its chunk cursors | `Data-Flow.md` §On-Demand Snapshot + State Layout; System-Overview and API_RBAC endpoint tables |
 
 ### 9.2 Open questions (answer before the named milestone)
@@ -758,10 +774,11 @@ the naming below (2026-09-26).**
   MySQL/MariaDB `TIME` (an elapsed time, −838:59:59…838:59:59). Options: `Time(i64 µs)` plus edge rules
   in Type_Mapping, or a halt/string rule for out-of-day values. (Delta has no `time` type; it maps to
   string there.)
-- Recorded for later plans: M1 — depth limit on `list<T>` in the `LogicalType` parser (config input);
-  M7 — the decoder validates `gno >= 1` before `GtidSet::insert` (anonymous GTID events carry 0, and
-  `insert_range` panics on 0); M1 — settle one public-API convention (root re-exports, `FromStr` for
-  `Decimal`, error-type naming) before more types land.
+- Recorded for later plans: M7 — the decoder validates `gno >= 1` before `GtidSet::insert` (anonymous
+  GTID events carry 0, and `insert_range` panics on 0). The two M1 items are settled in M1 Task 1
+  (2026-09-27): `MAX_LIST_DEPTH = 8` for `list<T>`, and the public-API convention (root re-exports,
+  `Display`+`FromStr` round-trip incl. `FromStr for Decimal`, errors named after what failed) is in
+  `data-avalanche-core`'s crate docs.
 
 - **Q-M9-2:** `GET /v1/snapshots/{job_id}` is served by any node, but the job lives in one pipeline's
   state location. Either the job ID embeds the pipeline ID so any node can read it from storage, or
