@@ -201,7 +201,7 @@ fn tables(
             } else {
                 &t.exclude
             };
-            for (i, l) in list.iter().flatten().enumerate() {
+            for (i, l) in list.iter().flatten().flatten().enumerate() {
                 let Some(g) = ctx.text(l, &at.key(key).index(i)) else {
                     continue;
                 };

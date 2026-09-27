@@ -139,6 +139,7 @@ pipelines:
     let include: Vec<_> = tables
         .include
         .unwrap()
+        .unwrap()
         .iter()
         .map(|l| l.text().to_string())
         .collect();
@@ -152,6 +153,67 @@ pipelines:
         "explicit null wins over 30"
     );
     assert!(matches!(sink.max_transaction_batch_rows, Some(None)));
+}
+
+/// F3: `null` on `tables.include`/`exclude` means "no list", not "inherit `defaults`" (Review
+/// Focus 2).
+#[test]
+fn explicit_null_clears_an_inherited_exclude_list() {
+    let yaml = r#"
+defaults:
+  tables:
+    exclude: [public.tmp_x]
+pipelines:
+  p:
+    tables:
+      exclude: null
+"#;
+    let tables = effective(yaml, "p").tables.unwrap();
+    assert!(
+        matches!(tables.exclude, Some(None)),
+        "null overrides the inherited list, it doesn't inherit it: {:?}",
+        tables.exclude
+    );
+}
+
+#[test]
+fn explicit_null_on_include_leaves_no_list_for_v007() {
+    let yaml = r#"
+defaults:
+  tables:
+    include: [public.orders]
+pipelines:
+  p:
+    tables:
+      include: null
+"#;
+    let tables = effective(yaml, "p").tables.unwrap();
+    assert!(
+        matches!(tables.include, Some(None)),
+        "null overrides the inherited list; V-007 then sees an empty list and fires: {:?}",
+        tables.include
+    );
+}
+
+#[test]
+fn absent_pipeline_exclude_still_inherits_defaults() {
+    let yaml = r#"
+defaults:
+  tables:
+    exclude: [public.tmp_x]
+pipelines:
+  p:
+    tables: {}
+"#;
+    let tables = effective(yaml, "p").tables.unwrap();
+    let exclude: Vec<_> = tables
+        .exclude
+        .unwrap()
+        .unwrap()
+        .iter()
+        .map(|l| l.text().to_string())
+        .collect();
+    assert_eq!(exclude, ["public.tmp_x"]);
 }
 
 #[test]

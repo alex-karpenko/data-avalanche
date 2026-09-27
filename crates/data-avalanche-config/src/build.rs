@@ -83,6 +83,21 @@ fn list<T: LeafType>(
     items.into_iter().collect()
 }
 
+/// A tri-state list (§9.4.1 applied to `tables.include`/`exclude`): absent or explicit `null` →
+/// empty (there is no separate default to fall back to); a value → that list, every element
+/// visited.
+fn tri_list<T: LeafType>(
+    ctx: &mut Ctx,
+    v: &Option<Option<Vec<Leaf<T>>>>,
+    at: &At,
+    key: &str,
+) -> Option<Vec<T>> {
+    match v {
+        None | Some(None) => Some(Vec::new()),
+        Some(Some(items)) => list(ctx, &Some(items.clone()), at, key),
+    }
+}
+
 /// A map of scalars; absent → empty. Every value is visited.
 fn map<T: LeafType>(
     ctx: &mut Ctx,
@@ -729,8 +744,8 @@ fn mysql(m: &RawMysql, at: &At, ctx: &mut Ctx) -> Option<Mysql> {
 }
 
 fn tables(t: &RawTables, at: &At, ctx: &mut Ctx) -> Option<Tables> {
-    let include = list(ctx, &t.include, at, "include");
-    let exclude = list(ctx, &t.exclude, at, "exclude");
+    let include = tri_list(ctx, &t.include, at, "include");
+    let exclude = tri_list(ctx, &t.exclude, at, "exclude");
     let s = t.snapshots.clone().unwrap_or_default();
     let s_at = at.key("snapshots");
     let mode = or(ctx, &s.mode, &s_at, "mode", SnapshotMode::Never);

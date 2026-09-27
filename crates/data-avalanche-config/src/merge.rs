@@ -36,6 +36,15 @@ impl<T> Merge for Option<Vec<T>> {
     }
 }
 
+/// A tri-state list (§9.4.1 applied to a list field, e.g. `tables.include`/`exclude`): an explicit
+/// `null` in the pipeline (`Some(None)`, meaning "no list") overrides a default list, same as a
+/// tri-state scalar.
+impl<T> Merge for Option<Option<Vec<T>>> {
+    fn merge(base: Self, over: Self, _: &Ctx) -> Self {
+        over.or(base)
+    }
+}
+
 /// A map merges key by key; a key in the pipeline replaces the same key in `defaults` (§8.2).
 impl<V> Merge for Option<BTreeMap<String, V>> {
     fn merge(base: Self, over: Self, _: &Ctx) -> Self {

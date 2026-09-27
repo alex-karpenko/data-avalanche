@@ -224,8 +224,13 @@ pub struct RawMysql {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawTables {
-    pub include: Option<Vec<Leaf<String>>>,
-    pub exclude: Option<Vec<Leaf<String>>>,
+    /// Tri-state (§9.4.1, config §8.3): absent → inherit `defaults`; explicit `null` → no list (an
+    /// empty list, not "inherit"); a value → that list. Not the `Tri<T>` alias: that wraps a
+    /// scalar leaf, and a list is not itself a leaf.
+    #[serde(default, deserialize_with = "tri")]
+    pub include: Option<Option<Vec<Leaf<String>>>>,
+    #[serde(default, deserialize_with = "tri")]
+    pub exclude: Option<Option<Vec<Leaf<String>>>>,
     pub snapshots: Option<RawSnapshots>,
     pub column_type_overrides: Option<BTreeMap<String, Leaf<LogicalType>>>,
     pub numeric_overflow_action: L<NumericOverflowAction>,

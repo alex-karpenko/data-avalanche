@@ -409,6 +409,41 @@ fn env_resolved_enum_hides_the_value_in_its_rule() {
     assert!(!report.to_json().to_string().contains("s3cr3t-value-123"));
 }
 
+// F3: `null` on `tables.include`/`exclude` clears an inherited list instead of falling back to it
+// (end to end; the merge-level behavior is covered in `tests/merge.rs`).
+
+#[test]
+fn explicit_null_exclude_resolves_to_an_empty_list() {
+    let yaml = MINIMAL
+        .replace(
+            "pipelines:",
+            "defaults:\n  tables: { exclude: [public.tmp_x] }\npipelines:",
+        )
+        .replace(
+            "include: [public.orders]",
+            "include: [public.orders]\n      exclude: null",
+        );
+    let cfg = load_str(&yaml, &env(&[("PW", "pw")]))
+        .unwrap_or_else(|r| panic!("{r:#?}"))
+        .config;
+    assert!(cfg.pipelines["orders"].tables.exclude.is_empty());
+}
+
+#[test]
+fn explicit_null_include_fails_v007() {
+    let yaml = MINIMAL
+        .replace(
+            "pipelines:",
+            "defaults:\n  tables: { include: [public.orders] }\npipelines:",
+        )
+        .replace("include: [public.orders]\n", "include: null\n");
+    let report = load_str(&yaml, &env(&[("PW", "pw")])).unwrap_err();
+    assert!(
+        report.errors.iter().any(|d| d.rule == "V-007"),
+        "{report:#?}"
+    );
+}
+
 const ICEBERG_SINK: &str = "sink:
       type: iceberg
       bucket: lake

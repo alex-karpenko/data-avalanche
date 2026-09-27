@@ -95,9 +95,13 @@ fn pipeline(name: &str, p: &RawPipeline, ctx: &mut Ctx) {
     let default = RawSource::default();
     let src = p.source.as_ref().unwrap_or(&default);
     source(src, &at.key("source"), ctx);
-    // V-007
+    // V-007: absent, explicit `null` (no list), or an empty list are all "no include".
     let include_at = at.key("tables").key("include");
-    let include = p.tables.as_ref().and_then(|t| t.include.as_ref());
+    let include = p
+        .tables
+        .as_ref()
+        .and_then(|t| t.include.as_ref())
+        .and_then(|inner| inner.as_ref());
     if include.is_none_or(|v| v.is_empty()) {
         let loc = include.and_then(|v| v.first()).and_then(|l| l.loc());
         ctx.error(
