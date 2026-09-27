@@ -144,7 +144,7 @@ pub fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut Ctx) {
             if !is_slot_name(&slot) {
                 ctx.error(
                     "V-058",
-                    &pg_at.key("slot"),
+                    &At::config(pg_at.key("slot").path),
                     l.loc(),
                     format!("slot {slot:?} must match ^[a-z_][a-z0-9_]{{0,62}}$"),
                 );
@@ -222,6 +222,10 @@ pub fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut Ctx) {
 mod tests {
     use super::*;
 
+    use std::collections::BTreeMap;
+
+    use crate::diag::Locus;
+
     #[test]
     fn charsets() {
         assert!(
@@ -237,5 +241,49 @@ mod tests {
             is_slot_name("_orders_slot") && !is_slot_name("orders-slot") && !is_slot_name("9x")
         );
         assert!(is_pg_identifier("Orders_Pub$1") && !is_pg_identifier("orders-pub"));
+    }
+
+    #[test]
+    fn v058_slot_format_uses_config_locus() {
+        let mut env = BTreeMap::new();
+        env.insert("PW".into(), "pw".into());
+
+        let config = r#"
+config_version: 1
+globals:
+  state:
+    bucket: app-state
+pipelines:
+  p:
+    id: p
+    source:
+      host: db.example.com
+      db: shop
+      user: cdc
+      password: "${PW}"
+      postgres:
+        publication: p_pub
+        slot: "Bad-Slot"
+    tables:
+      include:
+        - public.orders
+    sink:
+      type: delta
+      bucket: lake
+      delta: {}
+"#;
+
+        let report = crate::validate_str(config, &env);
+        let v058_format = report
+            .iter()
+            .find(|d| d.rule == "V-058" && d.message.contains("must match"));
+        assert!(
+            v058_format.is_some(),
+            "expected V-058 format diagnostic, got: {:#?}",
+            report
+        );
+        let d = v058_format.unwrap();
+        assert_eq!(d.locus, Locus::Config);
+        assert!(d.path.ends_with("source.postgres.slot"));
     }
 }
