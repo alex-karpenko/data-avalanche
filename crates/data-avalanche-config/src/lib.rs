@@ -15,9 +15,11 @@
 //!   it keys them with [`FingerprintKey::random`] rather than taking a key. [`Report::to_json`] is
 //!   the response body.
 //! - **Reload:** [`diff()`] compares the running and the new config, classifying each changed
-//!   field by [`Mutability`]; a changed restart-only field rejects the reload (V-061). Diff both
-//!   configs with the same [`FingerprintKey`] (they normally are — it's the same anchor), or a
-//!   rotated secret and an unrelated key will look identical to an unchanged one.
+//!   field by [`Mutability`]; a changed restart-only field rejects the reload (V-061). Both
+//!   configs must be loaded with the same [`FingerprintKey`] (the cluster anchor's) — with two
+//!   different keys every secret and file fingerprint differs whether or not the value changed,
+//!   so a key mismatch reports every secret field as changed (a spurious V-061 for a PROC field),
+//!   never the reverse: it cannot hide a real rotation.
 //! - **Rules that need more than the file:** [`check_cluster_anchor`] at startup,
 //!   [`check_table_set`] when a pipeline's tables resolve, [`check_unbounded_numeric`] at schema
 //!   resolution.

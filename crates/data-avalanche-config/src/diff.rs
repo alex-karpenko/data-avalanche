@@ -123,6 +123,9 @@ fn dotted(path: &[String]) -> String {
 /// table set changed (it needs the live source); `None` means "unknown", which counts as changed.
 /// This call is synchronous, so a caller whose table-set resolution is async precomputes the
 /// answer for each pipeline whose `include`/`exclude` changed and has this closure look it up.
+/// `old` and `new` must have been loaded with the same [`crate::FingerprintKey`] (see the crate
+/// docs): a key mismatch makes every secret and file fingerprint differ, so it reports every
+/// secret field as changed rather than hiding a real rotation.
 pub fn diff(
     old: &ResolvedConfig,
     new: &ResolvedConfig,
