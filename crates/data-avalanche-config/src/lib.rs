@@ -2,11 +2,13 @@
 //! strict parse, `${VAR}` and file resolution, merge of `defaults`, the V-rule validators, the
 //! resolved config the runtime uses, and the reload diff.
 
+pub mod build;
 pub mod coerce;
 pub mod ctx;
 pub mod diag;
 pub mod enums;
 pub mod leaf;
+pub mod load;
 pub mod material;
 pub mod merge;
 pub mod parse;
@@ -22,6 +24,7 @@ pub use coerce::{LeafType, LogFilter};
 pub use ctx::{At, Ctx};
 pub use diag::{Diagnostic, Locus, PARSE, Report, Severity, TYPE};
 pub use leaf::{Leaf, Loc, Tri};
+pub use load::{Loaded, load_file, load_str, validate_str};
 pub use material::{FileRef, Origin, Pem};
 pub use merge::merge_pipeline;
 pub use parse::parse_document;
