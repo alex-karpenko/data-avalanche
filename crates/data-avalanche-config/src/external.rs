@@ -18,7 +18,10 @@ use crate::path::YamlPath;
 use crate::resolved::{Globals, Pipeline};
 use crate::units::format_duration;
 
-/// The values the first node wrote to the `globals.state` cluster anchor (Clustering §5.6).
+/// The values the first node wrote to the `globals.state` cluster anchor (Clustering §5.6). The
+/// anchor also holds `fingerprint_key` (config §6.2), but that field travels separately — as the
+/// [`crate::FingerprintKey`] passed to [`crate::load_file`]/[`crate::load_str`] (see the crate docs'
+/// startup sequence) — rather than living on this struct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClusterAnchor {
     pub tokens: u32,

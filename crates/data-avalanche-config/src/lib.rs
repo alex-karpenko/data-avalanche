@@ -6,10 +6,17 @@
 //!
 //! - **Startup and reload:** [`load_file`] (or [`load_str`]) returns a [`ResolvedConfig`] plus
 //!   warnings, or a [`Report`] of every error. Any error rejects the whole config (§1.4). Both
-//!   take a [`FingerprintKey`] (config §6.2): the runtime reads `fingerprint_key` from the
-//!   `globals.state` cluster anchor — 32 random bytes the node that creates the anchor generates
-//!   once, with the same create-if-absent conditional write that pins `tokens`, and never changes
-//!   afterward — and passes it here so every node's fingerprints of the same secret or file agree.
+//!   take a [`FingerprintKey`] (config §6.2): 32 random bytes the node that creates the
+//!   `globals.state` cluster anchor ([`ClusterAnchor`]) generates once, with the same
+//!   create-if-absent conditional write that pins `tokens`, and never changes afterward, so every
+//!   node's fingerprints of the same secret or file agree. On a cold start the key isn't known yet
+//!   — it lives *in* the config the crate is about to load — so M2's startup sequence runs
+//!   [`load_file`] twice: (1) once with [`FingerprintKey::random`], discarding the result except
+//!   for `globals.state`, `cloud` and the cluster anchor fields (their fingerprints don't matter
+//!   here); (2) read the anchor at that `globals.state` location, or create it (generating
+//!   `fingerprint_key` there); (3) [`load_file`] again, this time with the anchor's key — that
+//!   result is the running config. A dedicated `load_globals` entry point is deliberately not
+//!   added for step 1; a later reload only ever repeats step 3, with the already-known key.
 //! - **Validation endpoint:** [`validate_str`] runs the same phases and returns only the report;
 //!   it never exposes the resolved config (§11.1), and its fingerprints never leave the call, so
 //!   it keys them with [`FingerprintKey::random`] rather than taking a key. [`Report::to_json`] is

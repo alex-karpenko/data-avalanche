@@ -370,6 +370,10 @@ fn api(a: &RawApi, at: &At, ctx: &mut Ctx) -> Option<Api> {
     // §11 Phase 2 (G4): `cert`/`key` are only in effect when `tls.enabled` is `true` — the PEM
     // itself is parsed (and any file read) only then — but a present leaf still gets `${VAR}`
     // substituted either way (V-063).
+    //
+    // G7: when `enabled` itself can't be resolved (`None`), `tls_in_effect` falls back to `false`
+    // — `enabled`'s own spec default — so this reads as "not in effect" either way; the load
+    // already fails on `enabled`'s own coercion rule regardless of which branch runs here.
     let tls_in_effect = enabled == Some(true);
     let cert = if tls_in_effect {
         pem(ctx, &tls.cert, &tls_at, "cert", PemKind::Certificates)
@@ -569,6 +573,10 @@ fn memberlist(m: &RawMemberlist, at: &At, ctx: &mut Ctx) -> Option<Memberlist> {
     // §11 Phase 2 (G4): `cert`/`key`/`ca` are only in effect when `tls.enabled` is `true` — the PEM
     // itself is parsed (and any file read) only then — but a present leaf still gets `${VAR}`
     // substituted either way (V-063).
+    //
+    // G7: when `enabled` itself can't be resolved (`None`), `tls_in_effect` falls back to `false`
+    // — `enabled`'s own spec default — so this reads as "not in effect" either way; the load
+    // already fails on `enabled`'s own coercion rule regardless of which branch runs here.
     let tls_in_effect = enabled == Some(true);
     let cert = if tls_in_effect {
         pem(ctx, &tls.cert, &tls_at, "cert", PemKind::Certificates)
@@ -700,6 +708,11 @@ fn source(s: &RawSource, at: &At, ctx: &mut Ctx) -> Option<Source> {
     // §11 Phase 2 (G4): `ssl_cert`/`ssl_key`/`ssl_ca` are only in effect when `ssl_mode` isn't
     // `disable` — the PEM itself is parsed (and any file read) only then — but a present leaf still
     // gets `${VAR}` substituted either way (V-063).
+    //
+    // G7: when `ssl_mode` itself can't be resolved (`None`), `ssl_in_effect` falls back to `true`
+    // — `!=` against `None` is always `true`, which happens to agree with `ssl_mode`'s own spec
+    // default (`require`, not `disable`) — so this reads as "in effect" either way; the load
+    // already fails on `ssl_mode`'s own coercion rule regardless of which branch runs here.
     let ssl_in_effect = ssl_mode != Some(SslMode::Disable);
     let ssl_cert = if ssl_in_effect {
         pem(ctx, &s.ssl_cert, at, "ssl_cert", PemKind::Certificates)
