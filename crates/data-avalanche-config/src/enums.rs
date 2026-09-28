@@ -9,7 +9,9 @@ use serde::{Serialize, Serializer};
 
 use crate::coerce::LeafType;
 
-/// A text that is not one of a config enum's values.
+/// A text that is not one of a config enum's values. Public because the config enums' `FromStr::
+/// Err` must be (E0446): a public `FromStr` impl cannot name a private type as its associated
+/// `Err`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{value:?} is not one of: {}", expected.join(", "))]
 pub struct EnumValueError {

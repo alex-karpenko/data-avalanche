@@ -70,7 +70,7 @@ pub const RULES: &[RuleMeta] = &[
         "pipeline",
         Config,
         r#"source"#,
-        r#"After merge, the engine block matching `type` is present when that engine has required fields: `postgres` must be present; an absent `mysql` block means all defaults. (The foreign block: V-003.)"#,
+        r#"After merge, the engine block matching type is present when that engine has required fields: postgres must be present; an absent mysql block means all defaults. (The foreign block: V-003.)"#,
     ),
     rule(
         "V-002",
@@ -702,7 +702,7 @@ pub const RULES: &[RuleMeta] = &[
         "pipeline",
         Config,
         r#"sink.{iceberg,delta}"#,
-        r#"After merge, the format block matching `sink.type` is present when that format has required fields: `iceberg` must be present; an absent `delta` block means all defaults. The foreign block is forbidden."#,
+        r#"After merge, the format block matching sink.type is present when that format has required fields: iceberg must be present; an absent delta block means all defaults. The foreign block is forbidden."#,
     ),
     rule(
         "V-085",
@@ -958,7 +958,7 @@ pub const RULES: &[RuleMeta] = &[
         "pipeline",
         Config,
         r#"tables.include/exclude globs, when source.type = postgres"#,
-        r#"Must be schema.table: one `.` between a non-empty schema part and a non-empty table part (globs allowed within each part)."#,
+        r#"Must be schema.table: one . between a non-empty schema part and a non-empty table part (globs allowed within each part)."#,
     ),
 ];
 

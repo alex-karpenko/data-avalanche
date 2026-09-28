@@ -935,3 +935,54 @@ pipelines:
     assert_eq!(hits[0].path, "defaults.source.ssl_mode");
     assert_eq!(hits[0].locus, Locus::Config);
 }
+
+// G8: a *templated* invalid `defaults` value is unknown in Phase 1 (structural) and only fails to
+// coerce once Phase 2 resolves it, so this pins `dedupe_defaults` on the resolving-pass report
+// specifically (`load_str`'s second call) — the literal case above only ever exercises the
+// structural-pass one. G3 also applies: the invalid resolved value must not leak into a message.
+#[test]
+fn templated_invalid_defaults_value_is_reported_once_and_hides_the_value() {
+    let yaml = r#"
+config_version: 1
+globals:
+  state: { bucket: app-state }
+defaults:
+  source: { ssl_mode: "${MODE}" }
+pipelines:
+  orders:
+    id: orders
+    source:
+      host: db.example.com
+      db: shop
+      user: cdc
+      password: ${PW}
+      postgres: { publication: orders_pub, slot: orders_slot }
+    tables:
+      include: [public.orders]
+    sink:
+      type: delta
+      bucket: lake
+      delta: {}
+  clicks:
+    id: clicks
+    source:
+      host: db.example.com
+      db: shop
+      user: cdc
+      password: ${PW}
+      postgres: { publication: clicks_pub, slot: clicks_slot }
+    tables:
+      include: [public.clicks]
+    sink:
+      type: delta
+      bucket: lake
+      delta: {}
+"#;
+    let report = load_str(yaml, &env(&[("PW", "pw"), ("MODE", "nope")]), &fp_key()).unwrap_err();
+    let hits: Vec<_> = report.errors.iter().filter(|d| d.rule == "V-020").collect();
+    assert_eq!(hits.len(), 1, "{report:#?}");
+    assert_eq!(hits[0].path, "defaults.source.ssl_mode");
+    assert_eq!(hits[0].locus, Locus::Config);
+    assert!(!hits[0].message.contains("nope"), "{}", hits[0].message);
+    assert!(!report.to_json().to_string().contains("nope"));
+}

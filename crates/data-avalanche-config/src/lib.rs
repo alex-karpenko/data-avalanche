@@ -48,8 +48,10 @@
 //!
 //! The surface is:
 //! - **loaders:** [`load_file`], [`load_str`], [`validate_str`], [`Loaded`], [`FingerprintKey`];
-//! - **the resolved model:** every type in the (private) `resolved` module, the config enums, the
-//!   value types with their own text grammar ([`ByteSize`]/[`ByteSizeError`],
+//! - **the resolved model:** every type in the (private) `resolved` module, the config enums and
+//!   their shared `FromStr::Err`, [`EnumValueError`] (public because a public `FromStr` impl's
+//!   associated `Err` type must be, E0446), the value types with their own text grammar
+//!   ([`ByteSize`]/[`ByteSizeError`],
 //!   [`HostPort`]/[`HostPortError`]), [`Secret`], [`Pem`], [`Origin`], [`FileRef`], [`LogFilter`]
 //!   (a resolved `Log.level`), and [`Loc`] (a [`Diagnostic`]'s source location);
 //! - **diagnostics:** [`Report`], [`Diagnostic`], [`Severity`], [`Locus`], [`PARSE`], [`TYPE`];
