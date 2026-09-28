@@ -49,6 +49,6 @@ of `.github/workflows/ci.yml`.
 
 ## Commit conventions for implementation work
 
-The doc prefixes from `.claude/CLAUDE.md` (`spec:`, `research:`, `gap:`, `infra:`) cover design
+The doc prefixes from `CLAUDE.md` (`spec:`, `research:`, `gap:`, `infra:`) cover design
 documents. Code commits use `build:`, `ci:`, `feat(<crate>):`, `fix(<crate>):`, `test(<area>):`,
 `docs:`, as each task's commit step specifies.

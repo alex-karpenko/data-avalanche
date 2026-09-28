@@ -1,4 +1,4 @@
-# CDC System — Cowork Project Instructions
+# data-avalanche — Project Instructions
 
 ---
 
@@ -17,9 +17,18 @@ Key subsystems: distributed worker cluster (consistent hashing + SWIM/memberlist
 lease), Apache Arrow as the in-memory columnar format, a sink-neutral `Sink` trait with per-format
 realizations, and Iceberg catalog backends (AWS Glue, HMS, REST).
 
-Work style: **requirements-driven, iterative refinement**. Claude performs gap analysis, authors
-research documents, runs capability prototypes, and maintains the living gap tracker — all as
-in-place file edits. Claude authors and maintains specifications (spec edits need approval).
+**Current phase: v1 implementation.** The design corpus (specs, research, gap tracker) and the
+capability probes are done enough to build on; v1 is now being built milestone by milestone
+(M0–M12) from the plans in `doc/v1.0/`. Which milestones have landed, and which plan is next, is
+in the index table of `doc/v1.0/README.md` (the source of truth for status; this file doesn't
+repeat it).
+
+Work style: **plan-driven, test-first implementation**, with the design kept alive beside it.
+- For each milestone, Claude writes a detailed plan, verifies its code in a scratch workspace, and
+  gets it approved. Then the plan is executed **subagent-driven** (P-9): one implementer and one
+  reviewer per task, and a whole-branch review at the end.
+- Design questions that come up while building go back into the specs (with approval), the
+  research docs and the gap tracker, as in-place edits.
 
 ---
 
@@ -27,12 +36,20 @@ in-place file edits. Claude authors and maintains specifications (spec edits nee
 
 ```
 data-avalanche/
-├── .claude/CLAUDE.md                              ← this file
+├── CLAUDE.md                                     ← this file
+├── Cargo.toml, Cargo.lock, rust-toolchain.toml   Cargo workspace (members crates/*), toolchain 1.98.1
+├── crates/                                       the application (roadmap §2 has the full target layout)
+│   ├── data-avalanche-core/                      domain types: values, events, positions, tables (no I/O)
+│   ├── data-avalanche-config/                    YAML config: parse, resolve, merge, V-rules, reload diff
+│   ├── data-avalanche-testkit/                   integration-test helpers (gates, emulator stores)
+│   └── …                                         one crate per milestone (storage and state come in M2)
+├── test-infra/                                   compose.yaml (PG, MySQL, MariaDB, RustFS, Azurite), up.sh/down.sh, README
+├── .github/workflows/                            ci.yml (pull requests only); cloud.yml (real S3/Azure, from M2)
 ├── doc/
 │   ├── specs/                                     source of truth (Oleksii owns)
 │   │   ├── System-Overview.md                     top-level requirements (incl. Sinks block)
 │   │   ├── Data-Flow.md                           pipeline phases, TableChangeSet, sink contract + realizations
-│   │   ├── Configuration_Specification.md         YAML config model, validation rules V-001…V-116
+│   │   ├── Configuration_Specification.md         YAML config model, validation rules V-001…V-117
 │   │   └── Schema_Change_Detection_and_Evolution.md   DDL detection & per-sink evolution
 │   ├── research/                                  Claude authors, Oleksii reviews
 │   │   ├── Multi_Sink_Architecture_and_Delta_Lake.md   sink abstraction, Delta sink, D-MS.1–16
@@ -52,6 +69,10 @@ data-avalanche/
 │   │   ├── API_RBAC_and_Versioning.md
 │   │   ├── Operational_and_Scope_Gaps_Batch.md
 │   │   └── V1_Scope_Decisions.md               v1 decision register D-V1.1–6 + confirmed deferrals
+│   ├── v1.0/                                      the v1 build plan (Claude authors, Oleksii approves)
+│   │   ├── README.md                              index + status of every plan, conventions, test gates
+│   │   ├── 00-roadmap.md                          milestones M0–M12, cross-crate interfaces, decisions
+│   │   └── M<n>-<topic>.md                        one detailed, test-first task plan per milestone
 │   ├── analysis/
 │   │   ├── CDC_Design_Gap_Analysis_v1.md          **current** living gap tracker (DA-* IDs)
 │   │   └── CDC_Gap_Analysis_Report.md             legacy tracker (v13.13, G-* IDs) — frozen audit trail
@@ -64,7 +85,8 @@ data-avalanche/
     └── source-capability/                         PG pgoutput + MySQL/MariaDB binlog client gates S-PG*/S-MY* (local containers)
 ```
 
-There is no application code yet; the design corpus and the prototypes are the current deliverables.
+The prototypes are frozen evidence (excluded from the workspace, their own lockfiles); the
+application lives in `crates/`.
 
 ---
 
@@ -77,6 +99,8 @@ There is no application code yet; the design corpus and the prototypes are the c
 | `doc/analysis/` | Claude maintains | Yes — in-place updates every gap-analysis cycle |
 | `doc/sources/` | Static reference | Never edit |
 | `prototypes/` | Claude maintains | Yes — probes are evidence, keep READMEs current with results |
+| `doc/v1.0/` | Claude authors; Oleksii approves | Yes — a new or changed plan needs approval before execution; record deviations found during execution in the plan |
+| `crates/`, `test-infra/`, `.github/` | Claude implements the approved plan | Yes — through the plan's tasks; changes outside a plan need a request |
 
 When Oleksii says **"update the gap report"** or **"re-run gap analysis"**, edit
 `doc/analysis/CDC_Design_Gap_Analysis_v1.md` in place: update the affected rows, record the change
@@ -191,19 +215,57 @@ Non-trivial cases: `TINYINT(1)` boolean detection via `information_schema`; `BIG
   membership (not gossiped); suspects stay in the ring (flap immunity)
 - **CP plane:** per-pipeline lease object in `globals.state`, **compare-and-swap** acquire / renew /
   takeover with a renewal safety deadline; `ClusterReconciler` + per-pipeline `PipelineController`
-- **`LeaseStore` per backend** (proven on real services): OpenDAL for S3; native
-  `google-cloud-storage` (generation preconditions) for GCS; Blob REST + SAS for Azure
+- **Storage client: `object_store` everywhere** (P-5): S3, GCS (generation preconditions) and
+  Azure through one crate. The native per-backend stores in `prototypes/lease-conformance` are the
+  proven fallback; T1–T10 are re-proven on `object_store` in M2
 - **Single-node** is a one-member cluster with the lease active — same code path
 
 ### State storage
-- `globals.state`: cluster anchor (`tokens`, `lease_duration`, `lock_backend`), config generation,
-  leases — cross-pipeline only; every file has a `version`, updates are conditional writes
+- `globals.state`: cluster anchor (`tokens`, `lease_duration`, `lock_backend`, `fingerprint_key`),
+  config generation (raw config text snapshots), leases — cross-pipeline only; every file has a
+  `version`, updates are conditional writes
 - Per-pipeline state (offsets, snapshot cursors, recorded `sink_type`) under the pipeline's
   `state.prefix` / `sink.prefix`
 
 ---
 
+## Implementation workflow
+
+- **Branch and scope.** Implementation happens on a feature branch, never directly on `main`.
+  Commit only when asked; never push, open a PR or merge without Oleksii.
+- **The spec wins.** When a plan and a spec disagree, stop and raise it. Spec edits need explicit
+  approval, even when a plan that proposes them is approved.
+- **Plans.** Each `doc/v1.0/M<n>-*.md` follows `doc/v1.0/README.md`: frontmatter, Goal /
+  Architecture / Tech Stack / Spec, Global Constraints, Review Focus, Decisions and rulings, a file
+  map, and test-first tasks (failing test → expected failure → implementation → passing run →
+  commit). The code blocks are replayed in a scratch workspace before the plan is presented.
+- **Quality gates** before every commit:
+  `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+  `cargo test --workspace`. Workspace lints: `unsafe_code = "forbid"` (so tests can't call
+  `std::env::set_var`); libraries return `thiserror` errors; every public type is re-exported at
+  its crate root.
+- **Test gates** (`doc/v1.0/README.md`): `DATA_AVALANCHE_IT` (emulators; start with
+  `test-infra/up.sh`), `DATA_AVALANCHE_GCS_BUCKET` + `GOOGLE_SERVICE_ACCOUNT_PATH` (real GCS),
+  `DATA_AVALANCHE_SKIP_GCS`, `DATA_AVALANCHE_CLOUD=s3|azure` (real clouds). Plain `cargo test` stays
+  hermetic.
+- **Credentials and keys.** Never print, search for or record credentials, or the path to a key
+  file, in docs, code or output. When a command needs Oleksii's credentials, ask him to run it with
+  `!`. Never commit key material; tests generate throwaway keys at run time.
+- **Verification before claims.** A result that depends on a crate, an emulator or a cloud is
+  measured, not assumed, and a plan or README says where each result came from.
+- Temporary files go in the session scratchpad, not the repository.
+
+---
+
 ## Session startup checklist
+
+For **implementation work**:
+
+1. Read `doc/v1.0/README.md` (status), the roadmap sections the task touches (§2 layout, §3
+   interfaces, the milestone's scope and exit), and the current milestone plan.
+2. Read the specs and research docs the plan's **Spec** list names.
+3. Check `git log` and `git status` before changing anything; after a context reset, trust the SDD
+   ledger and `git log` over memory.
 
 Before responding to any gap-analysis or spec-review request:
 
@@ -226,5 +288,8 @@ prototype READMEs before writing.
 spec: <file or topic> — <what changed>        # spec doc edit
 research: <topic> — <what this covers>        # new or updated research doc (+ its prototype)
 gap: v1 §<N> — <what resolved/surfaced>       # gap tracker update
-infra: <topic>                                # CLAUDE.md or repo structure changes
+infra: <topic>                                # CLAUDE.md, repo structure, doc/v1.0 plans
 ```
+
+Code commits (as each plan task specifies): `build:`, `ci:`, `feat(<crate>):`, `fix(<crate>):`,
+`test(<area>):`, `docs(<crate>):`.
