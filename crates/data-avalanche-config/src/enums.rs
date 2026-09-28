@@ -17,6 +17,14 @@ pub struct EnumValueError {
     pub expected: &'static [&'static str],
 }
 
+/// Joins two or more string literals with `", "` at compile time, for a config enum's `EXPECTED`
+/// (G3, config §11.1): `joined!("aws", "google", "azure")` is `"aws, google, azure"`.
+macro_rules! joined {
+    ($first:literal $(, $rest:literal)+ $(,)?) => {
+        concat!($first $(, ", ", $rest)+)
+    };
+}
+
 macro_rules! config_enum {
     ($(#[$meta:meta])* $name:ident, rule = $rule:literal, { $($variant:ident => $text:literal),+ $(,)? }) => {
         $(#[$meta])*
@@ -63,6 +71,10 @@ macro_rules! config_enum {
 
         impl LeafType for $name {
             const RULE: &'static str = $rule;
+            /// The allowed values, spelled out (G3): this is public spec text, not a resolved
+            /// value, so — unlike other types' `EXPECTED` — it is safe to show in full even for a
+            /// templated leaf.
+            const EXPECTED: &'static str = concat!("one of: ", joined!($($text),+));
 
             fn parse_leaf(text: &str) -> Result<Self, String> {
                 text.parse().map_err(|e: EnumValueError| e.to_string())

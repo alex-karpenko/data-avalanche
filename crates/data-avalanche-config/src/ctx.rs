@@ -148,11 +148,14 @@ impl<'e> Ctx<'e> {
     /// [`Ctx::value`] with a caller-built message (`text`, `reason`) → message, for rules whose
     /// message the spec fixes (V-078).
     ///
-    /// F2: a value obtained by substituting `${VAR}` is never printed in a diagnostic. When `leaf`
-    /// was templated (its written text differs from the resolved `text`), every occurrence of the
-    /// resolved value in the built message — Debug-quoted or raw — is replaced by the leaf's
-    /// written text with the resolution called out (`shown`). A literal (non-templated) leaf's
-    /// message is unchanged.
+    /// G3 (config §11.1): a value obtained by substituting `${VAR}` is never printed in a
+    /// diagnostic, and neither is any fragment of it — the parser's own failure `reason` and the
+    /// caller-built `message` both quote pieces of the resolved text (e.g. `write e.g. "12s"`,
+    /// `unknown time unit "xyz"`), and no amount of substring surgery on the built message can be
+    /// trusted to catch every such fragment. So when `leaf` was templated (its written text differs
+    /// from the resolved `text`), `reason`/`message` are never even built: the diagnostic is a fixed
+    /// sentence naming the leaf's own `${VAR}` text and `T::EXPECTED`. A literal (non-templated)
+    /// leaf's message is unchanged — built by `message` as always.
     pub fn value_with<T: LeafType>(
         &mut self,
         leaf: &Leaf<T>,
@@ -163,14 +166,11 @@ impl<'e> Ctx<'e> {
         match T::parse_leaf(&text) {
             Ok(v) => Some(v),
             Err(reason) => {
-                let mut msg = message(&text, reason);
-                if leaf.text() != text {
-                    let hidden = shown(leaf, &text);
-                    msg = msg.replace(&format!("{text:?}"), &hidden);
-                    if text.len() >= 4 && msg.contains(text.as_str()) {
-                        msg = msg.replace(text.as_str(), &hidden);
-                    }
-                }
+                let msg = if leaf.text() == text {
+                    message(&text, reason)
+                } else {
+                    format!("{} is not a valid {}", shown(leaf, &text), T::EXPECTED)
+                };
                 self.error(T::RULE, at, leaf.loc(), msg);
                 None
             }
@@ -298,6 +298,43 @@ mod tests {
         assert_eq!(
             ctx.value(&Leaf::<Duration>::new("15s"), &at),
             Some(Duration::from_secs(15))
+        );
+    }
+
+    /// G3: the parser's own failure reason (`parse_duration`'s `write e.g. "12s"` /
+    /// `unknown time unit "xyz"`) quotes a fragment of the resolved text — not the whole value a
+    /// substring replacement could catch — so a templated leaf must skip that reason entirely,
+    /// not merely redact known-equal substrings out of it.
+    #[test]
+    fn templated_duration_coercion_error_hides_every_fragment_of_the_resolved_text() {
+        for (value, must_not_contain) in [("12", "12"), ("7xyz", "xyz")] {
+            let env: BTreeMap<String, String> = [("D".to_string(), value.to_string())].into();
+            let key = FingerprintKey::from_bytes([1; 32]);
+            let mut ctx = Ctx::resolving(&env, &key);
+            assert_eq!(ctx.value(&Leaf::<Duration>::new("${D}"), &at()), None);
+            let e = &ctx.report().errors[0];
+            assert!(!e.message.contains(must_not_contain), "{}", e.message);
+            assert!(e.message.contains("${D}"), "{}", e.message);
+        }
+    }
+
+    /// G3: a templated config enum's message still lists the allowed values (public spec text,
+    /// `LeafType::EXPECTED`), but never the invalid resolved value itself.
+    #[test]
+    fn templated_enum_hides_the_value_and_lists_the_allowed_choices() {
+        let env: BTreeMap<String, String> = [("CLOUD".to_string(), "nope".to_string())].into();
+        let key = FingerprintKey::from_bytes([2; 32]);
+        let mut ctx = Ctx::resolving(&env, &key);
+        let at = At::config(YamlPath::root().key("globals").key("cloud"));
+        assert_eq!(ctx.value(&Leaf::<Cloud>::new("${CLOUD}"), &at), None);
+        let e = &ctx.report().errors[0];
+        assert_eq!(e.rule, "V-015");
+        assert!(!e.message.contains("nope"), "{}", e.message);
+        assert!(e.message.contains("${CLOUD}"), "{}", e.message);
+        assert!(
+            e.message.contains("one of: aws, google, azure"),
+            "{}",
+            e.message
         );
     }
 
