@@ -804,6 +804,70 @@ fn empty_optional_tri_state_flush_seconds_falls_back_to_the_default_not_disabled
     );
 }
 
+// §11 Phase 2 exception: a `prefix` field that resolves to `""` keeps the empty prefix — the
+// bucket root (§10) — rather than being treated as absent, unlike every other optional leaf above.
+
+#[test]
+fn absent_sink_prefix_is_still_the_pipeline_id() {
+    let cfg = load_str(MINIMAL, &env(&[("PW", "pw")]), &fp_key())
+        .unwrap_or_else(|r| panic!("{r:#?}"))
+        .config;
+    assert_eq!(
+        cfg.pipelines["orders"].sink.prefix, "orders",
+        "an absent sink.prefix still defaults to the pipeline id"
+    );
+}
+
+#[test]
+fn explicit_empty_sink_prefix_is_the_bucket_root_not_the_pipeline_id() {
+    let yaml = MINIMAL.replace(
+        "sink:\n      type: delta\n      bucket: lake\n      delta: {}",
+        "sink:\n      type: delta\n      bucket: lake\n      prefix: \"\"\n      delta: {}",
+    );
+    let cfg = load_str(&yaml, &env(&[("PW", "pw")]), &fp_key())
+        .unwrap_or_else(|r| panic!("{r:#?}"))
+        .config;
+    assert_eq!(
+        cfg.pipelines["orders"].sink.prefix, "",
+        "a sink.prefix that resolves to \"\" keeps the empty prefix (the bucket root), not the pipeline id"
+    );
+}
+
+#[test]
+fn explicit_empty_sink_prefix_overrides_a_defaults_prefix() {
+    let yaml = MINIMAL
+        .replace(
+            "pipelines:",
+            "defaults:\n  sink: { prefix: shared }\npipelines:",
+        )
+        .replace(
+            "sink:\n      type: delta\n      bucket: lake\n      delta: {}",
+            "sink:\n      type: delta\n      bucket: lake\n      prefix: \"\"\n      delta: {}",
+        );
+    let cfg = load_str(&yaml, &env(&[("PW", "pw")]), &fp_key())
+        .unwrap_or_else(|r| panic!("{r:#?}"))
+        .config;
+    assert_eq!(
+        cfg.pipelines["orders"].sink.prefix, "",
+        "the pipeline's own empty prefix wins over defaults.sink.prefix, same as any other explicit value"
+    );
+}
+
+#[test]
+fn sink_prefix_from_an_unset_env_var_default_is_the_bucket_root() {
+    let yaml = MINIMAL.replace(
+        "sink:\n      type: delta\n      bucket: lake\n      delta: {}",
+        "sink:\n      type: delta\n      bucket: lake\n      prefix: \"${P:-}\"\n      delta: {}",
+    );
+    let cfg = load_str(&yaml, &env(&[("PW", "pw")]), &fp_key())
+        .unwrap_or_else(|r| panic!("{r:#?}"))
+        .config;
+    assert_eq!(
+        cfg.pipelines["orders"].sink.prefix, "",
+        "a prefix templated to an unset variable with an empty default resolves to \"\", still the bucket root"
+    );
+}
+
 // FU-C (config §8.6): `defaults` is validated on its own, at its own path, before any pipeline
 // merges it in — and reported once even when several pipelines would otherwise duplicate it.
 

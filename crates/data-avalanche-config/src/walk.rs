@@ -42,6 +42,22 @@ macro_rules! walk_key {
 }
 pub(crate) use walk_key;
 
+/// §11 Phase 2 exception: a `prefix` field that resolves to `""` keeps the empty prefix — the
+/// bucket root (§10) — rather than being dropped as absent. `walk_fields!` routes every field's
+/// `drop_empty` call through here so the one exception lives in one place, matched on the field's
+/// own identifier: it fires for every raw struct's `prefix` field alike (`globals.state.prefix`,
+/// `sink.prefix`, the pipeline `state.prefix`, `catalog.rest.prefix`) and nowhere else.
+/// `check_values` is unaffected — it doesn't route through this macro.
+macro_rules! walk_drop_empty_field {
+    (prefix, $val:expr, $ctx:expr) => {
+        let _ = ($val, $ctx);
+    };
+    ($f:ident, $val:expr, $ctx:expr) => {
+        $crate::walk::Walk::drop_empty($val, $ctx);
+    };
+}
+pub(crate) use walk_drop_empty_field;
+
 /// Generates `Walk` for a raw struct and for `Option<struct>`, from the same field list
 /// `merge_struct!` uses for `Merge` (it calls this macro with its own list) or, for a struct
 /// `merge_struct!` never covers, from a matching call added here.
@@ -52,7 +68,7 @@ macro_rules! walk_fields {
             // adding it here fails to compile, instead of silently never being walked.
             fn drop_empty(&mut self, ctx: &$crate::ctx::Ctx) {
                 let $t { $($f),+ } = self;
-                $( $crate::walk::Walk::drop_empty($f, ctx); )+
+                $( $crate::walk::walk_drop_empty_field!($f, $f, ctx); )+
             }
             fn check_values(&self, ctx: &mut $crate::ctx::Ctx, at: &$crate::ctx::At) {
                 let $t { $($f),+ } = self;
@@ -395,6 +411,27 @@ mod tests {
             Some([("k".to_string(), Leaf::new(""))].into());
         map.drop_empty(&Ctx::structural());
         assert_eq!(map, Some(BTreeMap::new()));
+    }
+
+    #[test]
+    fn drop_empty_keeps_a_literal_empty_prefix_field_but_still_drops_an_empty_bucket() {
+        // §11 Phase 2 exception: `prefix` (here `RawPipelineState::prefix`) keeps `""` — the
+        // bucket root (§10) — while every other field on the same struct follows the general
+        // "empty is absent" rule.
+        let mut state = RawPipelineState {
+            bucket: Some(Leaf::new("")),
+            prefix: Some(Leaf::new("")),
+        };
+        state.drop_empty(&Ctx::structural());
+        assert_eq!(
+            state.prefix,
+            Some(Leaf::new("")),
+            "a prefix field that resolves to \"\" stays present, not absent"
+        );
+        assert_eq!(
+            state.bucket, None,
+            "bucket has no such exception: empty still means absent"
+        );
     }
 
     #[test]
