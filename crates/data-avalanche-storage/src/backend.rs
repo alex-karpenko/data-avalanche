@@ -80,6 +80,17 @@ fn ms(d: Duration) -> String {
     format!("{}ms", d.as_millis())
 }
 
+/// Replaces every non-empty option value that appears in a builder's error text with `***`,
+/// so a rejected value (e.g. an unparsable `allow_http`) never reaches `OpenError.reason`.
+fn redact(mut reason: String, options: &[(String, String)]) -> String {
+    for (_, v) in options {
+        if !v.is_empty() {
+            reason = reason.replace(v.as_str(), "***");
+        }
+    }
+    reason
+}
+
 /// Builds the store for `spec`. Nothing is contacted until the first request.
 ///
 /// # Errors
@@ -107,7 +118,10 @@ pub fn open_bucket(spec: &BucketSpec) -> Result<Arc<dyn ObjectStore>, OpenError>
                     ms(t.connect),
                 )
                 .with_retry(t.retry());
-            Arc::new(b.build().map_err(|e| err(e.to_string()))?)
+            Arc::new(
+                b.build()
+                    .map_err(|e| err(redact(e.to_string(), &spec.options)))?,
+            )
         }
         Backend::Gcs => {
             let mut b = GoogleCloudStorageBuilder::from_env().with_bucket_name(&spec.bucket);
@@ -124,7 +138,10 @@ pub fn open_bucket(spec: &BucketSpec) -> Result<Arc<dyn ObjectStore>, OpenError>
                     ms(t.connect),
                 )
                 .with_retry(t.retry());
-            Arc::new(b.build().map_err(|e| err(e.to_string()))?)
+            Arc::new(
+                b.build()
+                    .map_err(|e| err(redact(e.to_string(), &spec.options)))?,
+            )
         }
         Backend::Azure { account } => {
             let mut b = MicrosoftAzureBuilder::from_env().with_container_name(&spec.bucket);
@@ -144,7 +161,10 @@ pub fn open_bucket(spec: &BucketSpec) -> Result<Arc<dyn ObjectStore>, OpenError>
                     ms(t.connect),
                 )
                 .with_retry(t.retry());
-            Arc::new(b.build().map_err(|e| err(e.to_string()))?)
+            Arc::new(
+                b.build()
+                    .map_err(|e| err(redact(e.to_string(), &spec.options)))?,
+            )
         }
     };
     Ok(store)

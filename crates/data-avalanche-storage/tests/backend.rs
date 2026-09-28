@@ -227,6 +227,18 @@ fn unknown_option_is_rejected_without_its_value() {
     }
 }
 
+/// A known option's malformed VALUE must never reach `OpenError`, only its key. `allow_http`
+/// parses as a bool; object_store's rejection message otherwise echoes the value verbatim.
+#[test]
+fn known_option_bad_value_is_rejected_without_its_value() {
+    let mut spec = s3_spec("http://127.0.0.1:1");
+    spec.options
+        .push(("allow_http".into(), "yesplz-s3cr3t".into()));
+    let e = open_bucket(&spec).unwrap_err().to_string();
+    assert!(!e.contains("yesplz-s3cr3t"), "{e}");
+    assert!(e.contains("***"), "{e}");
+}
+
 #[test]
 fn azure_emulator_opens_offline() {
     let azure = BucketSpec {
