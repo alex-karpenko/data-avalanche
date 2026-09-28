@@ -1,5 +1,5 @@
 ---
-updated: 2026-09-27
+updated: 2026-09-28
 domain: Architecture
 status: Specification (supersedes the Configuration_file_model.md draft)
 tags: [architecture, configuration, spec, validation, multi-sink, iceberg, delta-lake]
@@ -1034,9 +1034,15 @@ value, and the result is checked for **presence** (non-empty) and **content vali
   only when `ssl_mode` ≠ `disable`; catalog auth material only for the matching catalog `auth` mode;
   catalog TLS material (`sink.iceberg.catalog.*.tls`) only when that block's `enabled` is `true`
   (a block with no `enabled` field is always in effect).
-- Any required value that resolves to empty is an error.
-- An optional value that resolves to empty (e.g. `${VAR:-}` with `VAR` unset) is treated as
-  **absent**: its default applies (for a tri-state field, the default — not `null`).
+- A required field that is absent after merge (§8) is an error — including one whose value
+  resolved to empty and that has nothing to inherit from `defaults`.
+- A value that resolves to empty (e.g. `${VAR:-}` with `VAR` unset) is treated as **absent**,
+  before the merge: it inherits from `defaults`, else its default applies (for a tri-state field,
+  the default — not `null`). This holds for required fields too, and for a map entry's value — the
+  entry is dropped, so `column_type_overrides: { t.c: "" }` has no effect. List elements are not
+  dropped: an empty element is reported by its list's rule. **Exception:** a `prefix` field
+  (`globals.state.prefix`, `sink.prefix`, `state.prefix`, `catalog.rest.prefix`) that resolves to
+  `""` keeps the empty prefix — the bucket root (§10) — rather than being treated as absent.
 
 **Phase 3 — Resolved config.** The output is a fully **resolved** configuration in which every
 reference has been replaced by its materialized value. This is the only representation the
@@ -1577,12 +1583,13 @@ Every deviation, so nothing is silent:
     defined as a parent prefix for explicit state locations only (§9.6, §10); an absent `mysql` /
     `delta` block means all defaults (V-001, V-084, §9.2, §9.4); new rule **V-117** (PostgreSQL
     `include`/`exclude` patterns are `schema.table`).
-23. **M1 review follow-ups (2026-09-27)** — V-063 locus `config / pipeline`; V-058 slot uniqueness
-    per server (`host` + `port`), V-059 per database including `port`; V-067/V-068/V-069 and §11:
-    a file reference is read only when its setting is in effect; §11: an optional value that
-    resolves to empty is absent; new §8.6 (validation of `defaults` on its own); §6.2 cluster-anchor
-    `fingerprint_key` and keyed fingerprints (§11.1); diagnostics never show env-resolved values; §13 intro: a
-    diagnostic for a `defaults` value has locus `config`.
+23. **M1 review follow-ups (2026-09-27/28)** — V-063 locus `config / pipeline`; V-058 slot
+    uniqueness per server (`host` + `port`), V-059 per database including `port`; V-067/V-068/V-069
+    and §11: a file reference is read only when its setting is in effect (catalog TLS included);
+    §11: a value that resolves to empty is absent (map entries dropped; `prefix` fields excepted),
+    and a required field is checked after merge; new §8.6 (validation of `defaults` on its own);
+    §6.2 cluster-anchor `fingerprint_key` and keyed fingerprints (§11.1); diagnostics never show
+    env-resolved values; §13 intro: a diagnostic for a `defaults` value has locus `config`.
 
 None of these change the **decided** catalog-auth schema (hive Thrift `none/ldap/kerberos`;
 rest HTTP `none/bearer/oauth2/sigv4`) — those are reproduced verbatim from
