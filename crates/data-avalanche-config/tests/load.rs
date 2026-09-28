@@ -308,6 +308,40 @@ fn unused_ssl_ca_is_not_read_when_ssl_mode_is_disable() {
     assert!(loaded.warnings.is_empty(), "{:#?}", loaded.warnings);
 }
 
+// G4: "not in effect" only skips the file read (or PEM parse) and the value built from it —
+// `${VAR}` substitution still runs on every leaf, so an unset variable is still V-063 even when
+// the field it names isn't in effect.
+
+#[test]
+fn unused_api_password_still_substitutes_and_reports_v063() {
+    let yaml = MINIMAL.replace(
+        "globals:\n  state: { bucket: app-state }",
+        "globals:\n  state: { bucket: app-state }\n  api:\n    auth: none\n    password: \"${UNSET}\"",
+    );
+    let report = load_str(&yaml, &env(&[("PW", "pw")]), &fp_key()).unwrap_err();
+    let e = report
+        .errors
+        .iter()
+        .find(|d| d.rule == "V-063")
+        .unwrap_or_else(|| panic!("no V-063 diagnostic: {report:#?}"));
+    assert!(e.path.ends_with("api.password"), "{}", e.path);
+}
+
+#[test]
+fn unused_ssl_ca_still_substitutes_and_reports_v063_when_ssl_mode_is_disable() {
+    let yaml = MINIMAL.replace(
+        "postgres: { publication: orders_pub, slot: orders_slot }",
+        "postgres: { publication: orders_pub, slot: orders_slot }\n      ssl_mode: disable\n      ssl_ca: \"${UNSET}\"",
+    );
+    let report = load_str(&yaml, &env(&[("PW", "pw")]), &fp_key()).unwrap_err();
+    let e = report
+        .errors
+        .iter()
+        .find(|d| d.rule == "V-063")
+        .unwrap_or_else(|| panic!("no V-063 diagnostic: {report:#?}"));
+    assert!(e.path.ends_with("source.ssl_ca"), "{}", e.path);
+}
+
 // Contrast: the same `credentials_file` under `auth: basic` is in effect, and a bad path fails
 // the load as before.
 #[test]

@@ -1,12 +1,13 @@
 //! Phase 3 (config §11): the merged raw model becomes the [`ResolvedConfig`], with every default of
-//! the spec's field tables applied. The build visits every leaf, so a leaf no rule reads still
-//! reports a coercion failure — except a file reference whose setting isn't in effect (§11: e.g.
-//! `credentials_file` when `auth` isn't `basic`, `tls.cert`/`key`/`ca` when `tls.enabled` is
-//! `false`, `ssl_cert`/`ssl_key`/`ssl_ca` when `ssl_mode` is `disable`, catalog auth material for a
-//! mode the catalog didn't select): that leaf is never visited, so it cannot fail the load. Presence
-//! is the rules' job: an absent required value makes the build return `None` without a diagnostic of
-//! its own. Files are read only when the context is resolving (§11: Phase 1 touches neither the
-//! environment nor the filesystem).
+//! the spec's field tables applied. The build visits every leaf, including a file reference whose
+//! setting isn't in effect (§11: e.g. `credentials_file` when `auth` isn't `basic`,
+//! `tls.cert`/`key`/`ca` when `tls.enabled` is `false`, `ssl_cert`/`ssl_key`/`ssl_ca` when
+//! `ssl_mode` is `disable`, catalog auth material for a mode the catalog didn't select) — its
+//! `${VAR}` substitution still runs and can still report V-063 (G4). What "not in effect" skips is
+//! narrower: the file itself is never read, and no value (a `Pem`, a `Credentials`, …) is ever built
+//! from that leaf, so it alone cannot otherwise fail the load. Presence is the rules' job: an absent
+//! required value makes the build return `None` without a diagnostic of its own. Files are read only
+//! when the context is resolving (§11: Phase 1 touches neither the environment nor the filesystem).
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
@@ -147,6 +148,16 @@ fn file_label<T>(leaf: &Leaf<T>, text: &str) -> String {
         format!("{text:?}")
     } else {
         "the configured value (not shown: it does not look like a file path)".to_string()
+    }
+}
+
+/// G4 (config §11/V-063): a leaf whose setting is *not* in effect (an unmatched `auth` mode, a
+/// disabled `tls`/`ssl_mode` block) still gets `${VAR}` substituted and reported — an unset
+/// variable is still V-063 — only the file it would otherwise name is never read and no value is
+/// built from it. `at` is the field's own `At` (as `pem`'s), and `key` its name under it.
+fn touch<T>(ctx: &mut Ctx, leaf: &L<T>, at: &At, key: &str) {
+    if let Some(l) = leaf {
+        ctx.text(l, &at.key(key));
     }
 }
 
@@ -313,11 +324,16 @@ fn api(a: &RawApi, at: &At, ctx: &mut Ctx) -> Option<Api> {
         },
     );
     let auth = or(ctx, &a.auth, at, "auth", ApiAuth::None);
-    // §11 Phase 2: `credentials_file` is only in effect for `auth = basic`; an unused reference is
-    // never read.
+    // §11 Phase 2 (G4): `credentials_file` is only in effect for `auth = basic` — the file itself is
+    // read only then — but every present leaf still gets `${VAR}` substituted either way (V-063).
     let creds = match auth {
         Some(ApiAuth::Basic) => credentials(ctx, &a.user, &a.password, &a.credentials_file, at),
-        _ => None,
+        _ => {
+            touch(ctx, &a.user, at, "user");
+            touch(ctx, &a.password, at, "password");
+            touch(ctx, &a.credentials_file, at, "credentials_file");
+            None
+        }
     };
     let jwt = a.jwt.as_ref().map(|j| {
         let at = at.key("jwt");
@@ -351,17 +367,20 @@ fn api(a: &RawApi, at: &At, ctx: &mut Ctx) -> Option<Api> {
     let tls = a.tls.clone().unwrap_or_default();
     let tls_at = at.key("tls");
     let enabled = or(ctx, &tls.enabled, &tls_at, "enabled", false);
-    // §11 Phase 2: `cert`/`key` are only in effect when `tls.enabled` is `true`; an unused
-    // reference is never read.
+    // §11 Phase 2 (G4): `cert`/`key` are only in effect when `tls.enabled` is `true` — the PEM
+    // itself is parsed (and any file read) only then — but a present leaf still gets `${VAR}`
+    // substituted either way (V-063).
     let tls_in_effect = enabled == Some(true);
     let cert = if tls_in_effect {
         pem(ctx, &tls.cert, &tls_at, "cert", PemKind::Certificates)
     } else {
+        touch(ctx, &tls.cert, &tls_at, "cert");
         Some(None)
     };
     let key = if tls_in_effect {
         pem(ctx, &tls.key, &tls_at, "key", PemKind::PrivateKey)
     } else {
+        touch(ctx, &tls.key, &tls_at, "key");
         Some(None)
     };
     // Only the block the auth mode selects, and (for tls) the block `enabled` selects, is kept in
@@ -547,22 +566,26 @@ fn memberlist(m: &RawMemberlist, at: &At, ctx: &mut Ctx) -> Option<Memberlist> {
     let tls = m.tls.clone().unwrap_or_default();
     let tls_at = at.key("tls");
     let enabled = or(ctx, &tls.enabled, &tls_at, "enabled", false);
-    // §11 Phase 2: `cert`/`key`/`ca` are only in effect when `tls.enabled` is `true`; an unused
-    // reference is never read.
+    // §11 Phase 2 (G4): `cert`/`key`/`ca` are only in effect when `tls.enabled` is `true` — the PEM
+    // itself is parsed (and any file read) only then — but a present leaf still gets `${VAR}`
+    // substituted either way (V-063).
     let tls_in_effect = enabled == Some(true);
     let cert = if tls_in_effect {
         pem(ctx, &tls.cert, &tls_at, "cert", PemKind::Certificates)
     } else {
+        touch(ctx, &tls.cert, &tls_at, "cert");
         Some(None)
     };
     let key = if tls_in_effect {
         pem(ctx, &tls.key, &tls_at, "key", PemKind::PrivateKey)
     } else {
+        touch(ctx, &tls.key, &tls_at, "key");
         Some(None)
     };
     let ca = if tls_in_effect {
         pem(ctx, &tls.ca, &tls_at, "ca", PemKind::Certificates)
     } else {
+        touch(ctx, &tls.ca, &tls_at, "ca");
         Some(None)
     };
     let tls = match enabled? {
@@ -674,22 +697,26 @@ fn source(s: &RawSource, at: &At, ctx: &mut Ctx) -> Option<Source> {
     let db = req(ctx, &s.db, at, "db");
     let credentials = credentials(ctx, &s.user, &s.password, &s.credentials_file, at);
     let ssl_mode = or(ctx, &s.ssl_mode, at, "ssl_mode", SslMode::Require);
-    // §11 Phase 2: `ssl_cert`/`ssl_key`/`ssl_ca` are only in effect when `ssl_mode` isn't
-    // `disable`; an unused reference is never read.
+    // §11 Phase 2 (G4): `ssl_cert`/`ssl_key`/`ssl_ca` are only in effect when `ssl_mode` isn't
+    // `disable` — the PEM itself is parsed (and any file read) only then — but a present leaf still
+    // gets `${VAR}` substituted either way (V-063).
     let ssl_in_effect = ssl_mode != Some(SslMode::Disable);
     let ssl_cert = if ssl_in_effect {
         pem(ctx, &s.ssl_cert, at, "ssl_cert", PemKind::Certificates)
     } else {
+        touch(ctx, &s.ssl_cert, at, "ssl_cert");
         Some(None)
     };
     let ssl_key = if ssl_in_effect {
         pem(ctx, &s.ssl_key, at, "ssl_key", PemKind::PrivateKey)
     } else {
+        touch(ctx, &s.ssl_key, at, "ssl_key");
         Some(None)
     };
     let ssl_ca = if ssl_in_effect {
         pem(ctx, &s.ssl_ca, at, "ssl_ca", PemKind::Certificates)
     } else {
+        touch(ctx, &s.ssl_ca, at, "ssl_ca");
         Some(None)
     };
     let t = s.timeouts.clone().unwrap_or_default();
@@ -1066,11 +1093,17 @@ fn catalog(c: &RawCatalog, at: &At, db: Option<&str>, ctx: &mut Ctx) -> Option<C
 fn hive(h: &RawHive, at: &At, db: Option<&str>, ctx: &mut Ctx) -> Option<Hive> {
     let url = req(ctx, &h.url, at, "url");
     let auth = or(ctx, &h.auth, at, "auth", HiveAuth::None);
-    // §11 Phase 2: `credentials_file`/`ldap` material and the Kerberos `keytab` are only in effect
-    // for the matching catalog `auth` mode; an unused reference is never read.
+    // §11 Phase 2 (G4): `credentials_file`/`ldap` material and the Kerberos `keytab` are only in
+    // effect for the matching catalog `auth` mode — the file itself is read only then — but a
+    // present leaf still gets `${VAR}` substituted either way (V-063).
     let creds = match auth {
         Some(HiveAuth::Ldap) => credentials(ctx, &h.user, &h.password, &h.credentials_file, at),
-        _ => None,
+        _ => {
+            touch(ctx, &h.user, at, "user");
+            touch(ctx, &h.password, at, "password");
+            touch(ctx, &h.credentials_file, at, "credentials_file");
+            None
+        }
     };
     let kerberos = match auth {
         Some(HiveAuth::Kerberos) => h.kerberos.as_ref().map(|k| {
@@ -1100,18 +1133,28 @@ fn hive(h: &RawHive, at: &At, db: Option<&str>, ctx: &mut Ctx) -> Option<Hive> {
                 service_name: service_name?,
             })
         }),
-        _ => None,
+        _ => {
+            if let Some(k) = &h.kerberos {
+                let at = at.key("kerberos");
+                touch(ctx, &k.principal, &at, "principal");
+                touch(ctx, &k.keytab, &at, "keytab");
+                touch(ctx, &k.service_name, &at, "service_name");
+            }
+            None
+        }
     };
     let tls = h.tls.clone().unwrap_or_default();
     let tls_at = at.key("tls");
     let enabled = or(ctx, &tls.enabled, &tls_at, "enabled", false);
-    // §11 Phase 2 / V-068: `tls.ca` is only in effect when `tls.enabled` is `true`; an unused
-    // reference is never read. Same gate as `globals.api.tls`/`memberlist.tls` above — in practice
-    // unreachable today (V-115 refuses any `hive` block in Phase 1, before Phase 2 ever reads a
-    // file here), but kept for when V-115 lifts.
+    // §11 Phase 2 / V-068 (G4): `tls.ca` is only in effect when `tls.enabled` is `true` — the PEM
+    // itself is parsed (and any file read) only then — but a present leaf still gets `${VAR}`
+    // substituted either way (V-063). Same gate as `globals.api.tls`/`memberlist.tls` above — in
+    // practice unreachable today (V-115 refuses any `hive` block in Phase 1, before Phase 2 ever
+    // reads a file here), but kept for when V-115 lifts.
     let ca = if enabled == Some(true) {
         pem(ctx, &tls.ca, &tls_at, "ca", PemKind::Certificates)
     } else {
+        touch(ctx, &tls.ca, &tls_at, "ca");
         Some(None)
     };
     let database = opt(ctx, &h.database, at, "database");
@@ -1139,8 +1182,9 @@ fn rest(r: &RawRest, at: &At, ctx: &mut Ctx) -> Option<Rest> {
     let warehouse = opt(ctx, &r.warehouse, at, "warehouse");
     let prefix = opt(ctx, &r.prefix, at, "prefix");
     let auth = or(ctx, &r.auth, at, "auth", RestAuth::None);
-    // §11 Phase 2: the bearer `token_file` and the oauth2 `credentials_file` are only in effect
-    // for the matching catalog `auth` mode; an unused reference is never read.
+    // §11 Phase 2 (G4): the bearer `token_file` and the oauth2 `credentials_file` are only in
+    // effect for the matching catalog `auth` mode — the file itself is read only then — but a
+    // present leaf still gets `${VAR}` substituted either way (V-063).
     let token = match auth {
         Some(RestAuth::Bearer) => match (&r.token, &r.token_file) {
             // §11 Phase 2: the structural pass builds no `Secret` (no fingerprint key); its
@@ -1163,7 +1207,11 @@ fn rest(r: &RawRest, at: &At, ctx: &mut Ctx) -> Option<Rest> {
             }
             _ => None,
         },
-        _ => None,
+        _ => {
+            touch(ctx, &r.token, at, "token");
+            touch(ctx, &r.token_file, at, "token_file");
+            None
+        }
     };
     let oauth2 = match auth {
         Some(RestAuth::Oauth2) => r.oauth2.as_ref().map(|o| {
@@ -1215,7 +1263,20 @@ fn rest(r: &RawRest, at: &At, ctx: &mut Ctx) -> Option<Rest> {
                 scope: scope?,
             })
         }),
-        _ => None,
+        _ => {
+            // G4: `id`/`secret` above only run within the `Oauth2` arm (they feed `client`, which
+            // is built only there); touch every oauth2 leaf here so none is skipped when this
+            // block isn't in effect.
+            if let Some(o) = &r.oauth2 {
+                let at = at.key("oauth2");
+                touch(ctx, &o.client_id, &at, "client_id");
+                touch(ctx, &o.client_secret, &at, "client_secret");
+                touch(ctx, &o.credentials_file, &at, "credentials_file");
+                touch(ctx, &o.token_url, &at, "token_url");
+                touch(ctx, &o.scope, &at, "scope");
+            }
+            None
+        }
     };
     let sigv4 = r.sigv4.as_ref().map(|s| {
         let at = at.key("sigv4");
