@@ -137,12 +137,12 @@ task named after the arrow.
 | D-M2.9 | `acquire` never touches a live holder: it returns `Acquired::HeldBy`, and the caller runs the takeover evaluation (§5.3) and then `take_over(observed, …)`. A lost race inside `acquire` re-reads, up to 3 attempts | The "observed unchanged for a lease duration" timing is the renewer's (M8) | Task 5 |
 | D-M2.10 | The cluster anchor holds `tokens`, `lease_duration_ms`, `lock_backend` (the config string), `hash_algo` (`xxh3`, the only accepted value) and `fingerprint_key` (64 lowercase hex), plus `established_by` / `established_at`. The config crate's `check_cluster_anchor` compares a node's settings with it | Config §6.2 and Clustering §12; `hash_algo` as an enum makes a future algorithm a decode error, not a silent ring split | Task 7, Task 11 |
 | D-M2.11 | Config snapshots: `config/snapshots/<NNNNNN>-<blake3 hex>.yaml`, holding the raw text (Q-M2-1). The pointer's `hash` is `blake3:<hex>` (the research doc said `sha256:`; BLAKE3 is already a dependency). The snapshot is checked against the hash on every read | Content addressing means two nodes racing to publish the same generation can't overwrite each other's snapshot; the loser's file stays unreferenced | Task 8 `racing_publishers_keep_their_own_snapshots`, `a_tampered_or_missing_snapshot_is_refused` |
-| D-M2.12 | The table snapshot document records `table` verbatim and uses `start_position` (a tagged `SourcePosition`) where Data-Flow's example says `start_lsn`. MySQL has no LSN. `cursor` follows Snapshot_Resumability §2 plus `collation` (the pinned binary collation, `None` when no key column is text) | One shape for both engines. Proposed spec edit **S-M** below | Task 10 `table_snapshot_json_shape` |
+| D-M2.12 | The table snapshot document records `table` verbatim and uses `start_position` (a tagged `SourcePosition`) where Data-Flow's example says `start_lsn`. MySQL has no LSN. `cursor` follows Snapshot_Resumability §2 plus `collation` (the pinned binary collation, `None` when no key column is text) | One shape for both engines. Spec edit **S-M** below (approved) | Task 10 `table_snapshot_json_shape` |
 | D-M2.13 | `position.json` always records the source server identity (`{"engine":"mysql","server_uuid":…}` or `{"engine":"mariadb","server_id":…}`). Only file/position mode acts on it (M7, Q-M7-2) | Cheap to record, and it lets M7 detect a changed server in every mode if needed | Task 9 `position_json_shape` |
 | D-M2.14 | `PipelineDocs::open` refuses a state location whose `pipeline_id` differs (`PipelineIdMismatch`), as well as a changed `sink_type` (`SinkTypeMismatch`, config §13.4) | Two pipelines sharing a state location would corrupt each other's positions | Task 9 |
 | D-M2.15 | Real S3 and Azure tests open their bucket through `open_bucket` (the production path) and run only in `cloud.yml` (weekly and manual). `DATA_AVALANCHE_CLOUD` takes a comma-separated list | Proves the credential chains, not just the CAS | Task 6 |
 
-**Proposed spec edit (needs owner approval; not applied by this plan):**
+**Spec edit S-M (approved and applied 2026-09-28):**
 
 - **S-M** — `Data-Flow.md` §State Layout, the per-table snapshot example: `"start_lsn": "0/1A2B3C4"`
   → `"start_position": "pg:0/1A2B3C4"`. Add `"table": {"schema": …, "name": …}`. Show the cursor
@@ -5820,4 +5820,4 @@ The roadmap's M2 exit criteria, and where each is met:
 - [ ] Roadmap §3.5 is replaced by the landed storage/state interface (D-M2.2's error set, the
   state crate's entry points), and R-2 records the `object_store` re-proof, per the doc/v1.0
   README.
-- [ ] S-M is approved and applied, or the table snapshot shape is changed to match the spec.
+- [ ] The table snapshot document matches `Data-Flow.md` §State Layout as amended by S-M (approved and applied 2026-09-28).

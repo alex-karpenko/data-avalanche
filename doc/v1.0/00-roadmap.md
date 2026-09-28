@@ -743,10 +743,9 @@ implements them.
 
 | # | Spec | Change | From | Before |
 |---|---|---|---|---|
-| S-M | `Data-Flow.md` §State Layout, per-table snapshot example | `"start_lsn": "0/1A2B3C4"` → `"start_position": "pg:0/1A2B3C4"` (MySQL has no LSN); add `"table": {"schema", "name"}`; show the cursor as `{key: [{col, val, type}], chunk_size, rows_done, collation}` or point at Snapshot_Resumability §2 | M2 D-M2.12 | M2 exit |
+| S-M | `Data-Flow.md` §State Layout, per-table snapshot example | `"start_lsn": "0/1A2B3C4"` → `"start_position": "pg:0/1A2B3C4"` (MySQL has no LSN); add `"version"` and `"table": {"schema", "name"}`; show the cursor as `{key: [{col, val, type}], chunk_size, rows_done, collation}`; note the file-name escaping | M2 D-M2.12 | M2 exit |
 
-**S-M: proposed 2026-09-28, awaiting owner approval** (not applied). M2's code already uses the
-proposed shape; if S-M is rejected, M2 changes the table snapshot document to match the spec.
+**S-M: approved and applied on 2026-09-28.** The M2 plan implements it (D-M2.12).
 
 `Type_Mapping.md` (research) still names `mysql-binlog-connector-rust` as the MySQL decoder, but
 `mysql_async` replaced it. That research-doc fix is applied (2026-09-26).
