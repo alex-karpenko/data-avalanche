@@ -567,6 +567,24 @@ fn env_resolved_lease_renewal_interval_hides_the_value_in_v073() {
     assert!(!e.message.contains("20s"), "{}", e.message);
     assert!(e.message.contains("${SECRET}"), "{}", e.message);
     assert!(!report.to_json().to_string().contains("20s"));
+
+    // G6: a templated `lease_duration` must not leak through the computed bound either — printing
+    // `lease_duration / 3` as a duration would let dividing by 3 recover the env value.
+    let yaml = MINIMAL.replace(
+        "state: { bucket: app-state }",
+        "state: { bucket: app-state }\n  cluster: { lease_duration: \"${DUR}\" }",
+    );
+    // Default lease_renewal_interval is 5s; lease_duration 9s / 3 = 3s, so 5s trips V-073.
+    let report = load_str(&yaml, &env(&[("PW", "pw"), ("DUR", "9s")]), &fp_key()).unwrap_err();
+    let e = report
+        .errors
+        .iter()
+        .find(|d| d.rule == "V-073")
+        .unwrap_or_else(|| panic!("no V-073 diagnostic: {report:#?}"));
+    assert!(!e.message.contains("9s"), "{}", e.message);
+    assert!(!e.message.contains("3s"), "{}", e.message);
+    assert!(e.message.contains("lease_duration / 3"), "{}", e.message);
+    assert!(!report.to_json().to_string().contains("9s"));
 }
 
 #[test]

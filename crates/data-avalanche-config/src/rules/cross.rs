@@ -82,22 +82,30 @@ fn globals(g: &RawGlobals, ctx: &mut Ctx) {
             && r > d / 3
         {
             // Duration has no `Display`, so `shown_value` doesn't apply; redact by hand from the
-            // same "is this leaf a template" test it uses. `lease_duration` (unlike
-            // `lease_renewal_interval`) appears only divided by 3, not verbatim, so it is shown
-            // as `lease_duration / 3` regardless — never the raw configured duration.
+            // same "is this leaf a template" test it uses.
             let renewal_shown = match &c.lease_renewal_interval {
                 Some(l) if is_templated(l) => format!("{:?} (resolved value hidden)", l.text()),
                 _ => format_duration(r),
+            };
+            // G6: `lease_duration` itself is never shown verbatim, but printing the *computed*
+            // bound (`lease_duration / 3`) would still let dividing by 3 recover a templated env
+            // value, so when `lease_duration` is templated the bound is named, not computed — the
+            // literal text "lease_duration / 3", never a duration derived from the env value.
+            let message = match &c.lease_duration {
+                Some(l) if is_templated(l) => format!(
+                    "lease_renewal_interval {renewal_shown} exceeds lease_duration / 3: the holder needs at least two renewals inside the safety deadline"
+                ),
+                _ => format!(
+                    "lease_renewal_interval {} exceeds lease_duration / 3 ({}): the holder needs at least two renewals inside the safety deadline",
+                    renewal_shown,
+                    format_duration(d / 3)
+                ),
             };
             ctx.error(
                 "V-073",
                 &at.key("lease_renewal_interval"),
                 c.lease_renewal_interval.as_ref().and_then(|l| l.loc()),
-                format!(
-                    "lease_renewal_interval {} exceeds lease_duration / 3 ({}): the holder needs at least two renewals inside the safety deadline",
-                    renewal_shown,
-                    format_duration(d / 3)
-                ),
+                message,
             );
         }
         // V-096
