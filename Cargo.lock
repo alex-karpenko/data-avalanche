@@ -513,9 +513,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "data-avalanche-storage"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "data-avalanche-testkit",
+ "futures-util",
+ "object_store",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "data-avalanche-testkit"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "mysql_async",
  "object_store",
  "rustls",

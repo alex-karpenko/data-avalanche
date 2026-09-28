@@ -10,6 +10,7 @@ description = "Integration-test helpers. Never linked into production binaries."
 workspace = true
 
 [dependencies]
+futures-util.workspace = true
 object_store.workspace = true
 rustls.workspace = true
 uuid.workspace = true

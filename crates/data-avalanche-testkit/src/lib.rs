@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use futures_util::TryStreamExt;
 use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 use object_store::azure::MicrosoftAzureBuilder;
@@ -57,6 +58,23 @@ pub fn install_crypto_provider() {
 /// GCS bucket must write only under such a prefix and delete it when done.
 pub fn unique_prefix(test: &str) -> String {
     format!("data-avalanche-it/{test}/{}", uuid::Uuid::new_v4())
+}
+
+/// Deletes every object under `prefix` (test cleanup). Panics on a storage error.
+pub async fn delete_prefix(store: &dyn ObjectStore, prefix: &str) {
+    let prefix = object_store::path::Path::from(prefix);
+    let keys: Vec<_> = store
+        .list(Some(&prefix))
+        .map_ok(|m| Ok(m.location))
+        .try_collect()
+        .await
+        .expect("list for cleanup");
+    let deleted: Vec<_> = store
+        .delete_stream(Box::pin(futures_util::stream::iter(keys)))
+        .try_collect()
+        .await
+        .expect("delete for cleanup");
+    drop(deleted);
 }
 
 /// Fixed endpoints from `test-infra/compose.yaml`.

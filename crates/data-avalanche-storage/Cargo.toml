@@ -1,0 +1,21 @@
+[package]
+name = "data-avalanche-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Object storage for data-avalanche: backends, path rules and compare-and-swap writes."
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+object_store.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+data-avalanche-testkit.workspace = true
+tokio.workspace = true
