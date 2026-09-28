@@ -1,5 +1,5 @@
 ---
-updated: 2026-09-26
+updated: 2026-09-28
 domain: Architecture
 tags: [architecture, data-flow, pipeline, cdc, iceberg, delta-lake, multi-sink, arrow, snapshot, replication]
 sources: []
@@ -604,13 +604,21 @@ membership, the lease registry) lives separately under `globals.state` per
 │                                                  `mariadb-gtid:…` / `binlog:<file>:<pos>`) + the
 │                                                  source server identity (file/position mode)
 └── snapshots/
-    ├── <schema>.<table>.json                    — per-table snapshot state
+    ├── <schema>.<table>.json                    — per-table snapshot state (a `.`, `/`, `%` or control character
+    │                                              inside a name is escaped as `%XX` in the file name)
     │   {
-    │     "status": "completed",                  // none | in_progress | completed | broken
-    │     "start_lsn": "0/1A2B3C4",
-    │     "cursor": null,                         // keyset/offset for resume on crash
-    │     "row_count": 1234567,
-    │     "completed_at": "2026-06-06T..."
+    │     "version": 1,
+    │     "table": { "schema": "public", "name": "orders" },   // verbatim
+    │     "status": "in_progress",                // none | in_progress | completed | broken
+    │     "start_position": "pg:0/1A2B3C4",       // tagged SourcePosition; MySQL/MariaDB forms too
+    │     "cursor": {                             // resume point (Snapshot_Resumability §2);
+    │       "key": [ {"col": "id", "val": 4530000, "type": "int8"} ],   // null before the first
+    │       "chunk_size": 10000,                  //   chunk and once completed
+    │       "rows_done": 4530000,
+    │       "collation": null                     // pinned binary collation when a key column is text
+    │     },
+    │     "row_count": null,                      // set on completion
+    │     "completed_at": null                    // set on completion
     │   }
     ├── ...
     └── jobs/<job_id>.json                        — on-demand snapshot jobs (tables, status, per-table
