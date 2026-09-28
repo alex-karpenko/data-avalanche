@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use super::pipeline_at;
 use crate::build::DEFAULT_POSTGRES_PORT;
-use crate::ctx::{At, Ctx, shown};
+use crate::ctx::{At, Ctx, shown, shown_value};
 use crate::enums::SourceType;
 use crate::leaf::Leaf;
 use crate::path::YamlPath;
@@ -12,11 +12,12 @@ use crate::raw::{RawConfig, RawPipeline};
 
 /// V-056 dedup entries: the pipeline name and the id's redacted display text.
 type IdEntries<'a> = Vec<(&'a str, String)>;
-/// V-058 dedup entries: the pipeline name, then the host's and the slot's redacted display text.
-type SlotEntries<'a> = Vec<(&'a str, String, String)>;
-/// V-059 dedup entries: the pipeline name, then the host's, db's and publication's redacted
+/// V-058 dedup entries: the pipeline name, then the host's, port's and the slot's redacted display
+/// text.
+type SlotEntries<'a> = Vec<(&'a str, String, String, String)>;
+/// V-059 dedup entries: the pipeline name, then the host's, port's, db's and publication's redacted
 /// display text.
-type PublicationEntries<'a> = Vec<(&'a str, String, String, String)>;
+type PublicationEntries<'a> = Vec<(&'a str, String, String, String, String)>;
 
 /// `^[a-z0-9][a-z0-9_-]{0,62}$` (V-055).
 fn is_pipeline_id(s: &str) -> bool {
@@ -103,9 +104,11 @@ pub(crate) fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut
 
     // V-058 is keyed on the source *server* (`host` + `port`), not the database: PostgreSQL
     // scopes slot names to the server. V-059 is keyed on `host` + `port` + `db`. The display
-    // strings (built with `Ctx::shown`) travel next to each entry so the diagnostic never prints
-    // an env-resolved id/slot/publication/host/db — only the key, used for comparison, is the
-    // resolved value.
+    // strings (built with `Ctx::shown`/`Ctx::shown_value`) travel next to each entry so the
+    // diagnostic never prints an env-resolved id/slot/publication/host/port/db — only the key, used
+    // for comparison, is the resolved value. `port` has no leaf of its own when it's absent (the
+    // PostgreSQL default applies), so its display falls back to the plain default number, which
+    // came from no `${VAR}` and is always safe to print.
     let mut ids: BTreeMap<String, IdEntries<'_>> = BTreeMap::new();
     let mut slots: BTreeMap<(String, u16, String), SlotEntries<'_>> = BTreeMap::new();
     let mut publications: BTreeMap<(String, u16, String, String), PublicationEntries<'_>> =
@@ -179,13 +182,17 @@ pub(crate) fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut
                         shown(l, &slot)
                     ),
                 );
-            } else if let (Some((host_leaf, host)), Some((_, port))) = (&host, &port) {
+            } else if let (Some((host_leaf, host)), Some((port_leaf, port))) = (&host, &port) {
                 let slot_shown = shown(l, &slot);
                 let host_shown = shown(*host_leaf, host);
+                let port_shown = match port_leaf {
+                    Some(pl) => shown_value(pl, port),
+                    None => port.to_string(),
+                };
                 slots
                     .entry((host.clone(), *port, slot))
                     .or_default()
-                    .push((name, host_shown, slot_shown));
+                    .push((name, host_shown, port_shown, slot_shown));
             }
         }
         if let Some(l) = &pg.publication
@@ -201,16 +208,20 @@ pub(crate) fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut
                         shown(l, &publication)
                     ),
                 );
-            } else if let (Some((host_leaf, host)), Some((_, port)), Some((db_leaf, db))) =
+            } else if let (Some((host_leaf, host)), Some((port_leaf, port)), Some((db_leaf, db))) =
                 (&host, &port, &db)
             {
                 let publication_shown = shown(l, &publication);
                 let host_shown = shown(*host_leaf, host);
+                let port_shown = match port_leaf {
+                    Some(pl) => shown_value(pl, port),
+                    None => port.to_string(),
+                };
                 let db_shown = shown(*db_leaf, db);
                 publications
                     .entry((host.clone(), *port, db.clone(), publication))
                     .or_default()
-                    .push((name, host_shown, db_shown, publication_shown));
+                    .push((name, host_shown, port_shown, db_shown, publication_shown));
             }
         }
     }
@@ -227,9 +238,9 @@ pub(crate) fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut
         }
     }
     // V-058 (uniqueness per source server: host + port)
-    for ((_, port, _), entries) in slots.iter().filter(|(_, n)| n.len() > 1) {
-        let names: Vec<&str> = entries.iter().map(|(n, _, _)| *n).collect();
-        for (name, host_shown, slot_shown) in entries {
+    for ((_, _port, _), entries) in slots.iter().filter(|(_, n)| n.len() > 1) {
+        let names: Vec<&str> = entries.iter().map(|(n, _, _, _)| *n).collect();
+        for (name, host_shown, port_shown, slot_shown) in entries {
             ctx.error(
                 "V-058",
                 &At::config(
@@ -241,16 +252,16 @@ pub(crate) fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut
                 ),
                 None,
                 format!(
-                    "slot {slot_shown} on server {host_shown}:{port} is used by pipelines {}",
+                    "slot {slot_shown} on server {host_shown}:{port_shown} is used by pipelines {}",
                     names.join(", ")
                 ),
             );
         }
     }
     // V-059 (uniqueness recommended per source database: host + port + db)
-    for ((_, port, _, _), entries) in publications.iter().filter(|(_, n)| n.len() > 1) {
-        let names: Vec<&str> = entries.iter().map(|(n, _, _, _)| *n).collect();
-        for (name, host_shown, db_shown, publication_shown) in entries {
+    for ((_, _port, _, _), entries) in publications.iter().filter(|(_, n)| n.len() > 1) {
+        let names: Vec<&str> = entries.iter().map(|(n, _, _, _, _)| *n).collect();
+        for (name, host_shown, port_shown, db_shown, publication_shown) in entries {
             ctx.warning(
                 "V-059",
                 &pipeline_at(name)
@@ -259,7 +270,7 @@ pub(crate) fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut
                     .key("publication"),
                 None,
                 format!(
-                    "publication {publication_shown} on server {host_shown}:{port}/{db_shown} is shared by pipelines {}",
+                    "publication {publication_shown} on server {host_shown}:{port_shown}/{db_shown} is shared by pipelines {}",
                     names.join(", ")
                 ),
             );
@@ -334,5 +345,74 @@ pipelines:
         let d = v058_format.unwrap();
         assert_eq!(d.locus, Locus::Config);
         assert!(d.path.ends_with("source.postgres.slot"));
+    }
+
+    /// G2 / V-058: a templated `port` must not leak the resolved port number into the "used by"
+    /// message, the same way a templated host or slot is already hidden.
+    #[test]
+    fn v058_duplicate_slot_hides_a_templated_port() {
+        let mut env = BTreeMap::new();
+        env.insert("PW".into(), "pw".into());
+        env.insert("P".into(), "6543".into());
+
+        let config = r#"
+config_version: 1
+globals:
+  state:
+    bucket: app-state
+pipelines:
+  p1:
+    id: p1
+    source:
+      host: db.example.com
+      port: "${P}"
+      db: shop1
+      user: cdc
+      password: "${PW}"
+      postgres:
+        publication: p1_pub
+        slot: shared_slot
+    tables:
+      include:
+        - public.orders
+    sink:
+      type: delta
+      bucket: lake
+      delta: {}
+  p2:
+    id: p2
+    source:
+      host: db.example.com
+      port: "${P}"
+      db: shop2
+      user: cdc
+      password: "${PW}"
+      postgres:
+        publication: p2_pub
+        slot: shared_slot
+    tables:
+      include:
+        - public.orders
+    sink:
+      type: delta
+      bucket: lake
+      delta: {}
+"#;
+
+        let report = crate::validate_str(config, &env);
+        let dupes: Vec<_> = report
+            .iter()
+            .filter(|d| d.rule == "V-058" && d.message.contains("is used by pipelines"))
+            .collect();
+        assert_eq!(
+            dupes.len(),
+            2,
+            "expected one V-058 per pipeline: {report:#?}"
+        );
+        for d in &dupes {
+            assert!(!d.message.contains("6543"), "{}", d.message);
+            assert!(d.message.contains("${P}"), "{}", d.message);
+        }
+        assert!(!report.to_json().to_string().contains("6543"));
     }
 }
