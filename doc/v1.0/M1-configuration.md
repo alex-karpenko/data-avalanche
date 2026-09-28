@@ -1,5 +1,5 @@
 ---
-updated: 2026-09-27
+updated: 2026-09-28
 domain: Configuration
 tags: [v1, implementation-plan, m1, configuration, yaml, validation, v-rules, merge, reload-diff, secrets]
 sources: []
@@ -139,7 +139,7 @@ a test in the task named after the arrow.
 |---|---|---|---|
 | D-M1.1 | The roadmap's `Resolvable<T>` becomes `Leaf<T>`: source text + location, coerced when a pass reads it | A leaf is literal or template only relative to a pass; one type serves both passes and keeps the location for every diagnostic | Task 2, Task 6 |
 | D-M1.2 | Both passes run the same rule functions; `Report` sorts and deduplicates | One rule implementation, no drift between Phase 1 and Phase 2 | Task 9 `structural_pass_stops_before_env_and_files` |
-| D-M1.3 | A template in a discriminator (`source.type`, `sink.type`, catalog block choice) is supported. Phase 1 keeps every branch, and Phase 2 re-merges with the resolved value | Per-environment files are the reason templates exist | Review Focus 4 |
+| D-M1.3 | A template in a discriminator (`source.type`, `sink.type`, catalog block choice) is supported. Phase 1 keeps only the pipeline's own blocks (it does not pull in `defaults` branches it cannot choose between yet), and Phase 2 re-merges with the resolved value | Per-environment files are the reason templates exist | Review Focus 4 |
 | D-M1.4 | A catalog `type` from `defaults` is dropped when the pipeline picks a catalog block | Otherwise `defaults: {type: glue}` + pipeline `rest: {…}` contradicts itself (V-002) through no fault of the pipeline | Task 7 `catalog_type_from_defaults_is_dropped_when_the_pipeline_picks_a_block` |
 | D-M1.5 | *Superseded by Q-M1-4.* An absent `mysql` / `delta` block takes every default; `postgres` / `iceberg` stay required | Owner decision (S-K) | Task 9 `absent_mysql_and_delta_blocks_take_every_default`; Task 10 cases V-001, V-084 |
 | D-M1.6 | Required fields with no V-rule are `PARSE` errors, checked after merge: `catalog.glue.name`, `catalog.hive.url`, `catalog.rest.url`, partition `column`/`transform` | A strict parse would report them as missing fields; the raw model defers that to after the merge | Task 14 cases `PARSE` |
@@ -151,7 +151,40 @@ a test in the task named after the arrow.
 | D-M1.12 | *Superseded by Q-M1-5.* PostgreSQL patterns without a schema part are rejected by the new V-117 | Owner decision (S-L) | Task 12 cases V-117 |
 | D-M1.13 | The validation endpoint returns only the report, never the resolved config | Config §11.1 keeps secrets out of the API; `API_RBAC` note 2's "echoes the resolved config" is superseded | Task 9 `validate_str` |
 | D-M1.14 | No key material is committed. Tests generate a throwaway self-signed pair (CN `data-avalanche-test`) with the `rcgen` dev-dependency | Owner decision: a committed private key is never acceptable, even a test one | Task 8 (`material` unit tests), Task 9 (`tests/support` `cert()` / `key()`) |
-| D-M1.15 | Secrets serialize as an xxh3 fingerprint | The reload diff sees a rotated secret without holding its value | Review Focus 3 |
+| D-M1.15 | *Superseded in execution (FU-D, owner decision).* Secrets serialize as a keyed BLAKE3 fingerprint; the key is the cluster anchor's `fingerprint_key` (config §6.2) | The reload diff sees a rotated secret without holding its value | Review Focus 3 |
+
+## Deviations during execution (2026-09-27/28)
+
+The task code blocks below are the plan as executed at task time. The landed code differs from
+them where reviews or the owner changed it; `git log 9598567..` on `feat/claude/impl-v1` is the
+record. In order:
+
+- **Per-task review fixes.** `ByteSize`/`HostPort`/config enums got `thiserror` error types
+  (`ByteSizeError`, `HostPortError`, `EnumValueError`) instead of `FromStr::Err = String` (T3);
+  V-058's slot-format diagnostic uses config locus (T10); V-028/V-029 run only for an Iceberg sink
+  and V-093 only for a Delta sink (T12); reload-diff paths use `YamlPath` quoting (T13); test counts
+  ended above the plan's (T13+).
+- **Final review, fix wave 1.** File-reference values and env-resolved values never appear in a
+  diagnostic; inline PEM is detected after leading whitespace; `null` on a pipeline
+  `include`/`exclude` clears the inherited list; D-M1.6's PARSE fields reject empty values;
+  registry V-001/V-084 text follows S-K.
+- **Owner follow-up batch (FU-A…FU-E), with spec edits 2541d19, c591bdb, ed28e8f, e0e8713.**
+  - V-058 slot uniqueness per server (`host` + `port`), V-059 per database including `port`;
+    duplicate and range-check messages hide env-resolved values; V-063 locus `config / pipeline`;
+    the rule harness checks each diagnostic's locus; `Leaf` Debug is redacted.
+  - A file reference is read only when its setting is in effect (api `auth`, TLS `enabled`,
+    `ssl_mode` ≠ `disable`, catalog `auth` / TLS); `${VAR}` substitution still applies everywhere.
+  - A raw-model walker (compiler-checked field lists shared with merge): a value that resolves to
+    empty is absent before the merge (a `prefix` field keeps `""` = bucket root); `defaults` is
+    validated on its own at `defaults.…` paths with config locus, and each value is reported once.
+  - D-M1.15 superseded: keyed BLAKE3 fingerprints; `load_str` / `load_file` take a
+    `FingerprintKey`; `validate_str` uses a random one. `xxhash-rust` removed; `blake3`,
+    `getrandom` added.
+  - The public surface is narrowed to the runtime API (superseding the Task 15 "re-export every
+    public type" ruling); internals are `pub(crate)` and their tests moved into the crate.
+- **Final review, fix wave 2.** V-068 never prints PEM content; a templated value that fails its
+  type gets a fixed message (no parser reason); a templated port and `lease_duration / 3` are never
+  printed; the M2 startup sequence is documented in the crate docs.
 
 ---
 
@@ -424,7 +457,7 @@ git commit -m "feat(core): bound list<T> nesting, FromStr for Decimal, document 
 **Interfaces:**
 - Consumes: nothing from M1.
 - Produces:
-  - `Loc { line: usize, column: usize }` (1-based).
+  - `Loc { line: u64, column: u64 }` (1-based).
   - `Leaf<T>`: `new(text)`, `with_loc(text, loc)`, `text() -> &str`, `loc() -> Option<Loc>`. It
     deserializes from any YAML scalar and keeps its spelling.
   - `Tri<T> = Option<Option<Leaf<T>>>`, and `leaf::tri` for `#[serde(default, deserialize_with = "tri")]`.

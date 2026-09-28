@@ -1,5 +1,5 @@
 ---
-updated: 2026-09-27
+updated: 2026-09-28
 domain: Architecture
 tags: [v1, implementation-plan, index, conventions]
 ---
@@ -16,7 +16,7 @@ This folder holds the plan for **building** v1. The design it implements is in `
 |---|---|---|
 | [`00-roadmap.md`](00-roadmap.md) | Master plan: planning decisions P-1…P-10, workspace layout, cross-crate interfaces, milestones M0–M12 with exit criteria, test/CI strategy, risks, spec edits S-A…S-L, implementation decisions D-IMPL-1…8 | Draft for review |
 | [`M0-foundations.md`](M0-foundations.md) | Detailed task plan for M0: workspace, CI, core domain types, all four position dialects, test infrastructure | Draft for review; code blocks compiled, and the test/clippy/integration results verified in a scratch crate on 2026-09-26 |
-| [`M1-configuration.md`](M1-configuration.md) | Detailed task plan for M1: the `data-avalanche-config` crate. Strict YAML parse, `${VAR}` and file resolution, §8 merge, all V-rules, the resolved config, the reload diff | Draft for review. Every task was replayed on 2026-09-27 from a scratch implementation: each Step 1 fails as stated, and Steps 1+3 reproduce the verified tree byte for byte and pass tests, clippy and fmt |
+| [`M1-configuration.md`](M1-configuration.md) | Detailed task plan for M1: the `data-avalanche-config` crate. Strict YAML parse, `${VAR}` and file resolution, §8 merge, all V-rules, the resolved config, the reload diff | **Landed 2026-09-28** on `feat/claude/impl-v1` (15 tasks, two review fix waves, owner follow-up batch FU-A…FU-E). The plan's "Deviations during execution" section lists where the code differs from its task blocks; the landed interface is roadmap §3.8 |
 | `M2-…` … `M12-…` | One detailed plan per milestone | Written just before each milestone starts, from the interfaces that actually landed |
 
 ## How the plans are written and run

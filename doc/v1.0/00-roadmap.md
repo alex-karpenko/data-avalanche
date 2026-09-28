@@ -1,5 +1,5 @@
 ---
-updated: 2026-09-27
+updated: 2026-09-28
 domain: Architecture
 tags: [v1, implementation-plan, roadmap, milestones, workspace, crates, interfaces, test-strategy, ci, risks]
 sources: []
@@ -299,6 +299,33 @@ now < deadline. `PipelineController` is the sole lease writer and owns the `Pipe
 `ClusterReconciler` pushes `Own/DontOwn` targets. The same types run in single-node mode; M6 ships them
 with a self-only ring.
 
+### 3.8 Configuration (`data-avalanche-config`, landed in M1)
+
+The crate root is the whole public surface (internals are `pub(crate)`):
+
+- `load_file(path: &Path, env: &dyn Env, key: &FingerprintKey) -> Result<Loaded, Report>`, and
+  `load_str(text, env, key)` for tests. `Loaded { config: ResolvedConfig, warnings: Vec<Diagnostic> }`.
+  Any error rejects the whole config.
+- `validate_str(text, env) -> Report` for the validation endpoint; `Report::to_json` is its body. It
+  never returns the resolved config.
+- `FingerprintKey` (32 bytes, from the `globals.state` cluster anchor, config §6.2). Startup (M2):
+  load with `FingerprintKey::random()` to learn `globals.state`; read or create the anchor; load
+  again with the anchor's key. Reloads reuse the key.
+- `diff(old, new, table_set_changed: &dyn Fn(&Pipeline, &Pipeline) -> Option<bool>) -> ConfigDiff`:
+  field changes classified by `Mutability` (R / PR / PROC); a PROC change rejects the reload (V-061).
+  Both configs must be loaded with the same key.
+- Checks that need runtime input: `check_cluster_anchor(&Globals, &ClusterAnchor)` (M2/M8 startup),
+  `check_table_set(&Pipeline, &[TableRef])` (M5/M7, when the table set resolves),
+  `check_unbounded_numeric(&Pipeline, &[(TableRef, String)])` (M5/M7, schema resolution). Each
+  returns a `Report`.
+- The resolved model (`ResolvedConfig`, `Globals`, `Pipeline`, …), the config enums, `Secret`
+  (Debug `***`, Serialize = keyed fingerprint), `Pem`, `FileRef`, `ByteSize`, `HostPort`;
+  diagnostics (`Report`, `Diagnostic`, `Severity`, `Locus`, `PARSE`, `TYPE`); the registry
+  (`RULES`, `rule_meta`).
+
+No diagnostic contains an env-resolved value, a file-reference value, file content or a secret
+(config §11.1).
+
 ---
 
 ## 4. Milestones
@@ -337,7 +364,8 @@ Detailed plan: `M0-foundations.md`.
 
 ### M1 — Configuration (`data-avalanche-config`)
 
-- **Plan:** [`M1-configuration.md`](M1-configuration.md), 15 tasks (2026-09-27, draft for review).
+- **Plan:** [`M1-configuration.md`](M1-configuration.md), 15 tasks. **Landed 2026-09-28** on
+  `feat/claude/impl-v1`, with the owner follow-up batch; interface in §3.8, deviations in the plan.
 - **Scope:**
   - The full config §3–§10 model: every field, default, union and tri-state, including the Iceberg
     blocks, because they must validate even though v1 refuses them at start.
