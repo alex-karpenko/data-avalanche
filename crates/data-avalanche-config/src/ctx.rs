@@ -169,7 +169,7 @@ impl<'e> Ctx<'e> {
                 let msg = if leaf.text() == text {
                     message(&text, reason)
                 } else {
-                    format!("{} is not a valid {}", shown(leaf, &text), T::EXPECTED)
+                    format!("{} is not {}", shown(leaf, &text), T::EXPECTED)
                 };
                 self.error(T::RULE, at, leaf.loc(), msg);
                 None
@@ -319,7 +319,8 @@ mod tests {
     }
 
     /// G3: a templated config enum's message still lists the allowed values (public spec text,
-    /// `LeafType::EXPECTED`), but never the invalid resolved value itself.
+    /// `LeafType::EXPECTED`), but never the invalid resolved value itself. O2: the sentence reads
+    /// "is not one of: …", not "is not a valid one of: …".
     #[test]
     fn templated_enum_hides_the_value_and_lists_the_allowed_choices() {
         let env: BTreeMap<String, String> = [("CLOUD".to_string(), "nope".to_string())].into();
@@ -329,12 +330,24 @@ mod tests {
         assert_eq!(ctx.value(&Leaf::<Cloud>::new("${CLOUD}"), &at), None);
         let e = &ctx.report().errors[0];
         assert_eq!(e.rule, "V-015");
-        assert!(!e.message.contains("nope"), "{}", e.message);
-        assert!(e.message.contains("${CLOUD}"), "{}", e.message);
-        assert!(
-            e.message.contains("one of: aws, google, azure"),
-            "{}",
-            e.message
+        assert_eq!(
+            e.message,
+            "\"${CLOUD}\" (resolved value hidden) is not one of: aws, google, azure"
+        );
+    }
+
+    /// O2: a templated leaf of a non-enum type reads "is not a duration" (`LeafType::EXPECTED` is
+    /// now a complete phrase), not "is not a valid duration".
+    #[test]
+    fn templated_non_enum_coercion_error_reads_is_not_a_duration() {
+        let env: BTreeMap<String, String> = [("D".to_string(), "xyz".to_string())].into();
+        let key = FingerprintKey::from_bytes([3; 32]);
+        let mut ctx = Ctx::resolving(&env, &key);
+        assert_eq!(ctx.value(&Leaf::<Duration>::new("${D}"), &at()), None);
+        let e = &ctx.report().errors[0];
+        assert_eq!(
+            e.message,
+            "\"${D}\" (resolved value hidden) is not a duration"
         );
     }
 

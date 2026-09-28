@@ -15,11 +15,12 @@ pub(crate) trait LeafType: Sized {
     /// [`TYPE`] for plain types.
     const RULE: &'static str = TYPE;
 
-    /// A short noun phrase for what this type expects (G3, config §11.1): used in place of the
-    /// parser's own failure reason when the leaf is templated, so a coercion error never echoes a
-    /// fragment of an env-resolved or file-derived value back in the message. A config enum's
-    /// `EXPECTED` (built by the `config_enum!` macro) instead lists its allowed values — that list
-    /// is public spec text, not a resolved value, so it is safe to show in full.
+    /// A complete phrase for what this type expects, filling `"{value} is not {EXPECTED}"` (G3,
+    /// config §11.1): used in place of the parser's own failure reason when the leaf is templated,
+    /// so a coercion error never echoes a fragment of an env-resolved or file-derived value back in
+    /// the message. A config enum's `EXPECTED` (built by the `config_enum!` macro) instead lists
+    /// its allowed values ("one of: a, b, c") — that list is public spec text, not a resolved
+    /// value, so it is safe to show in full.
     const EXPECTED: &'static str;
 
     fn parse_leaf(text: &str) -> Result<Self, String>;
@@ -27,6 +28,8 @@ pub(crate) trait LeafType: Sized {
 
 impl LeafType for String {
     const EXPECTED: &'static str = "text";
+    // `parse_leaf` below never fails, so `EXPECTED` never actually reaches a diagnostic — kept as
+    // a complete phrase anyway ("is not text") for consistency with every other `LeafType`.
 
     fn parse_leaf(text: &str) -> Result<Self, String> {
         Ok(text.to_string())
@@ -34,7 +37,7 @@ impl LeafType for String {
 }
 
 impl LeafType for bool {
-    const EXPECTED: &'static str = "boolean";
+    const EXPECTED: &'static str = "a boolean";
 
     /// Only `true` and `false` (YAML 1.2): `yes`, `on`, `True` are not booleans.
     fn parse_leaf(text: &str) -> Result<Self, String> {
@@ -49,7 +52,7 @@ impl LeafType for bool {
 macro_rules! integer_leaf {
     ($($t:ty),+) => {$(
         impl LeafType for $t {
-            const EXPECTED: &'static str = "non-negative integer";
+            const EXPECTED: &'static str = "a non-negative integer";
 
             /// Decimal digits only; no hex, octal or exponent forms.
             fn parse_leaf(text: &str) -> Result<Self, String> {
@@ -65,7 +68,7 @@ macro_rules! integer_leaf {
 integer_leaf!(u16, u32, u64);
 
 impl LeafType for f64 {
-    const EXPECTED: &'static str = "finite number";
+    const EXPECTED: &'static str = "a finite number";
 
     fn parse_leaf(text: &str) -> Result<Self, String> {
         match text.parse::<f64>() {
@@ -76,7 +79,7 @@ impl LeafType for f64 {
 }
 
 impl LeafType for Duration {
-    const EXPECTED: &'static str = "duration";
+    const EXPECTED: &'static str = "a duration";
 
     fn parse_leaf(text: &str) -> Result<Self, String> {
         parse_duration(text)
@@ -84,7 +87,7 @@ impl LeafType for Duration {
 }
 
 impl LeafType for ByteSize {
-    const EXPECTED: &'static str = "byte size";
+    const EXPECTED: &'static str = "a byte size";
 
     fn parse_leaf(text: &str) -> Result<Self, String> {
         text.parse::<ByteSize>()
@@ -93,7 +96,7 @@ impl LeafType for ByteSize {
 }
 
 impl LeafType for HostPort {
-    const EXPECTED: &'static str = "host:port";
+    const EXPECTED: &'static str = "a host:port";
 
     fn parse_leaf(text: &str) -> Result<Self, String> {
         text.parse::<HostPort>()
@@ -102,7 +105,7 @@ impl LeafType for HostPort {
 }
 
 impl LeafType for IpAddr {
-    const EXPECTED: &'static str = "IP address";
+    const EXPECTED: &'static str = "an IP address";
 
     fn parse_leaf(text: &str) -> Result<Self, String> {
         text.parse()
@@ -112,7 +115,7 @@ impl LeafType for IpAddr {
 
 impl LeafType for LogicalType {
     const RULE: &'static str = "V-078";
-    const EXPECTED: &'static str = "logical type";
+    const EXPECTED: &'static str = "a logical type";
 
     fn parse_leaf(text: &str) -> Result<Self, String> {
         text.parse()
@@ -127,7 +130,7 @@ pub struct LogFilter(pub String);
 
 impl LeafType for LogFilter {
     const RULE: &'static str = "V-017";
-    const EXPECTED: &'static str = "log filter";
+    const EXPECTED: &'static str = "a log filter";
 
     fn parse_leaf(text: &str) -> Result<Self, String> {
         if text.trim().is_empty() {
