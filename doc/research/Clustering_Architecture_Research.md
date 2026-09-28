@@ -1,7 +1,7 @@
 ---
 title: Clustering Architecture Research
 status: Research / Design proposal (input for further elaboration)
-updated: 2026-09-26
+updated: 2026-09-28
 domain: Architecture / Distributed Systems
 tags: [clustering, gossip, swim, memberlist, consistent-hashing, lease, split-brain, rebalancing, config-propagation]
 closes_or_advances: [G-8, G-9, G-2, G-17, G-23, G-36, "OQ-CL1", "OQ-CL3", "OQ-CL4", "OQ-API3", "OQ-P3", "5.1", "5.2"]
@@ -644,12 +644,18 @@ handoffs during a rolling deploy (every pod restart reshuffles the ring). Mitiga
 Do **not** put the full config into gossip (it can be large; gossip is for small deltas). Instead:
 
 - **Durable truth in `globals.state`:** a monotonic **generation pointer** plus an immutable
-  per-generation resolved-config snapshot:
+  per-generation snapshot of the **config file text**:
   ```
-  config/generation.json          { "version":1, "generation": 87, "hash": "sha256:…",
+  config/generation.json          { "version":1, "generation": 87, "hash": "blake3:<hex>",
                                      "written_by": "worker-7f3a9c", "written_at": "…" }
-  config/snapshots/000087.yaml     # the resolved config for generation 87 (immutable)
+  config/snapshots/000087-<hex>.yaml   # the raw config text of generation 87 (immutable)
   ```
+  The snapshot holds the raw text, not a resolved config: `${VAR}` values and referenced files
+  (credentials, PEM) are resolved by **each node** in its own environment, so no secret is written
+  to `globals.state`. The file name carries the text's BLAKE3 hash (content-addressed), so two
+  nodes racing to publish the same generation never overwrite each other's snapshot; the
+  pointer's `hash` names the winner, and every read checks the text against it (M2 plan
+  D-M2.11, owner decision Q-M2-1, 2026-09-28).
 - **Tiny signal in gossip:** each node's NodeMeta carries `config_generation` (the highest it has
   *applied*). That is the entire cross-node config footprint in gossip.
 
@@ -661,12 +667,13 @@ log" source): generation N is durable and immutable; nodes converge by replaying
 1. Operator → POST /v1/config/reload  on ANY worker A.
 2. A re-reads its file → strict parse → validate → resolve (§11 of the config spec).
 3. A computes new generation = current_generation + 1, writes:
-     config/snapshots/<N>.yaml,
+     config/snapshots/<N>-<hash>.yaml (the raw file text),
      then CAS-updates config/generation.json with If-Match:<etag of generation N-1>.
    (CAS serializes concurrent reloads: a racing reload on B gets 412 and retries against N.)
 4. A applies N locally (reconcile §12), bumps its NodeMeta config_generation → gossiped.
 5. Every other worker observes target generation advanced (via the gossiped config_generation of
-   peers, or a short poll of generation.json), FETCHES config/snapshots/<N>.yaml, runs its OWN
+   peers, or a short poll of generation.json), FETCHES config/snapshots/<N>-<hash>.yaml, resolves it in its own
+   environment, runs its OWN
    reconcile over ITS OWN owned pipelines, and bumps its config_generation.
 6. A returns 202 Accepted immediately; GET /v1/config/status reports per-node applied generation;
    the reload is "complete" when all live nodes report N.
@@ -790,7 +797,9 @@ conditional writes (gap 5.2): create via `If-None-Match: *`, update via `If-Matc
 │   ├── anchor.json            # FIRST-WRITER-WINS via If-None-Match:*. Establishes the cluster-wide
 │   │                          # invariants: { version, tokens: 128, lease_duration_ms: 15000,
 │   │                          # lock_backend: "storage", hash_algo: "xxh3",
-│   │                          # established_by, established_at }.   (lock_backend pinned per D-2)
+│   │                          # fingerprint_key (64 hex: the secret/file fingerprint key,
+│   │                          # config §6.2), established_by, established_at }.
+│   │                          # (lock_backend pinned per D-2)
 │   │                          # A node whose config disagrees REFUSES TO START (extends V-026/V-062
 │   │                          # from tokens-only to the full safety-timing anchor).
 │   └── membership.json        # OPTIONAL advisory snapshot of last-known membership, for cold-start
@@ -798,7 +807,7 @@ conditional writes (gap 5.2): create via `If-None-Match: *`, update via `If-Matc
 ├── config/
 │   ├── generation.json        # CAS pointer: { version, generation, hash, written_by, written_at }
 │   └── snapshots/
-│       └── <NNNNNN>.yaml       # immutable resolved config per generation
+│       └── <NNNNNN>-<hash>.yaml   # immutable raw config text per generation (content-addressed)
 └── leases/
     └── <pipeline_id>.json      # per-pipeline lease (§5.2), CAS via ETag
 ```
