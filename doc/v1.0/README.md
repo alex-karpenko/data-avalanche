@@ -14,10 +14,11 @@ This folder holds the plan for **building** v1. The design it implements is in `
 
 | File | What it is | Status |
 |---|---|---|
-| [`00-roadmap.md`](00-roadmap.md) | Master plan: planning decisions P-1…P-10, workspace layout, cross-crate interfaces, milestones M0–M12 with exit criteria, test/CI strategy, risks, spec edits S-A…S-L, implementation decisions D-IMPL-1…8 | Draft for review |
+| [`00-roadmap.md`](00-roadmap.md) | Master plan: planning decisions P-1…P-10, workspace layout, cross-crate interfaces, milestones M0–M12 with exit criteria, test/CI strategy, risks, spec edits S-A…S-M, implementation decisions D-IMPL-1…9 | Draft for review |
 | [`M0-foundations.md`](M0-foundations.md) | Detailed task plan for M0: workspace, CI, core domain types, all four position dialects, test infrastructure | Draft for review; code blocks compiled, and the test/clippy/integration results verified in a scratch crate on 2026-09-26 |
 | [`M1-configuration.md`](M1-configuration.md) | Detailed task plan for M1: the `data-avalanche-config` crate. Strict YAML parse, `${VAR}` and file resolution, §8 merge, all V-rules, the resolved config, the reload diff | **Landed 2026-09-28** on `feat/claude/impl-v1` (15 tasks, two review fix waves, owner follow-up batch FU-A…FU-E). The plan's "Deviations during execution" section lists where the code differs from its task blocks; the landed interface is roadmap §3.8 |
-| `M2-…` … `M12-…` | One detailed plan per milestone | Written just before each milestone starts, from the interfaces that actually landed |
+| [`M2-storage-and-state.md`](M2-storage-and-state.md) | Detailed task plan for M2: `data-avalanche-storage` (backends with bounded timeouts, config §10 paths, `VersionedStore` CAS) and `data-avalanche-state` (versioned documents, leases, cluster anchor, config generations, per-pipeline and snapshot state), T1–T10 on every backend, `cloud.yml` | **Approved 2026-09-28**, not yet executed. Every task replayed in a scratch workspace on 2026-09-28 (tests fail first, then pass, and the final tree matches); integration tests pass on RustFS, Azurite and real GCS (T1–T10, CAS races, `open_bucket`) |
+| `M3-…` … `M12-…` | One detailed plan per milestone | Written just before each milestone starts, from the interfaces that actually landed |
 
 ## How the plans are written and run
 

@@ -389,6 +389,7 @@ Detailed plan: `M0-foundations.md`.
 
 ### M2 — Storage and state (`data-avalanche-storage`, `data-avalanche-state`)
 
+- **Plan:** [`M2-storage-and-state.md`](M2-storage-and-state.md), 11 tasks. **Approved 2026-09-28**; not yet executed.
 - **Scope:**
   - `object_store` backends from `globals.cloud`: S3 via the default chain, GCS via ADC, Azure via
     managed/workload identity plus `globals.azure.account_name`, and emulator endpoints for tests.
@@ -740,6 +741,13 @@ fake-gcs FAIL (risk R-3).
 **S-H…S-L: approved and applied on 2026-09-27** (spec §15 item 22 records them). The M1 plan
 implements them.
 
+| # | Spec | Change | From | Before |
+|---|---|---|---|---|
+| S-M | `Data-Flow.md` §State Layout, per-table snapshot example | `"start_lsn": "0/1A2B3C4"` → `"start_position": "pg:0/1A2B3C4"` (MySQL has no LSN); add `"table": {"schema", "name"}`; show the cursor as `{key: [{col, val, type}], chunk_size, rows_done, collation}` or point at Snapshot_Resumability §2 | M2 D-M2.12 | M2 exit |
+
+**S-M: proposed 2026-09-28, awaiting owner approval** (not applied). M2's code already uses the
+proposed shape; if S-M is rejected, M2 changes the table snapshot document to match the spec.
+
 `Type_Mapping.md` (research) still names `mysql-binlog-connector-rust` as the MySQL decoder, but
 `mysql_async` replaced it. That research-doc fix is applied (2026-09-26).
 
@@ -774,6 +782,7 @@ the naming below (2026-09-26).**
 | D-IMPL-6 | Integration tests gate on `DATA_AVALANCHE_IT` (non-empty), cloud tests on `DATA_AVALANCHE_CLOUD` | Keeps `cargo test` hermetic by default | M0 |
 | D-IMPL-7 | Product name **`data-avalanche`** everywhere: binary and crate family `data-avalanche` / `data-avalanche-*` (imports `data_avalanche_*`); Helm chart and image `data-avalanche`; metric prefix **`data_avalanche_`** (replaces the specified `cdc_`); Delta `app_id` **`data-avalanche/<pipeline_id>/owner`**; `commitInfo` keys and the Arrow field tag `data-avalanche.*` (`data-avalanche.committed_position`, `.owner_epoch`, `.pipeline`, `data-avalanche.logical`); internal column prefix **`__data_avalanche_`** (MERGE flag `__data_avalanche_del`); env vars `DATA_AVALANCHE_*`; test bucket `data-avalanche-test`, test object prefix `data-avalanche-it/` | Owner decision (2026-09-26); specs, research docs and this plan updated. Untouched: `prototypes/` (probe evidence as run) and the legacy gap report; Iceberg's `cdc.owner_epoch` table property is v2 and keeps its name until the Iceberg sink is planned | M0 |
 | D-IMPL-8 | M1 config rulings **D-M1.1…D-M1.15** (listed in `M1-configuration.md` §Decisions and rulings, each pinned by a test). Among them: `Leaf<T>` replaces §4 M1's `Resolvable<T>`; templates allowed in union discriminators; a defaults catalog `type` dropped when the pipeline picks a block; required fields without a V-rule reported as `PARSE`; V-069/V-087 have no failing input in v1; the validate endpoint never returns the resolved config. D-M1.5, D-M1.12 and D-M1.14 were changed at review (Q-M1-4…6) | The spec is silent on these; each choice is the one that keeps a hand-written config valid or safe | M1 — **approved 2026-09-27** |
+| D-IMPL-9 | M2 storage/state rulings **D-M2.1…D-M2.15** (listed in `M2-storage-and-state.md` §Decisions and rulings, each pinned by a test). Among them: `StoreError` is `Conflict` / `Contention` / `Transient` / `Permanent` with no `NotFound` (supersedes §3.5's sketch at M2 exit); `Timeouts::COORDINATION` bounds a storage call to about 8 s; the lease tombstone keeps `owner_epoch`; config snapshots are the raw text under a content-addressed name with a `blake3:` hash | The specs and research docs are silent on these; each keeps the lease and state safe under races, hangs and hand-edited objects | M2 — **approved 2026-09-28** |
 
 ### 9.1 Questions answered at plan review (2026-09-26)
 
@@ -788,6 +797,10 @@ the naming below (2026-09-26).**
 | Q-M1-4 (2026-09-27) | Must an operator write an empty `mysql: {}` / `delta: {}`? | **No**: every field in those blocks has a default, so absent = all defaults; `postgres` / `iceberg` stay required (S-K) | `M1-configuration.md`; spec edit S-K |
 | Q-M1-5 (2026-09-27) | PostgreSQL `include` pattern without a schema? | **A validation error, new rule V-117** (S-L) | `M1-configuration.md`; spec edit S-L |
 | Q-M1-6 (2026-09-27) | Commit a test TLS key pair? | **Never commit key material**; tests generate a throwaway pair at run time (`rcgen` dev-dependency) | `M1-configuration.md` D-M1.14 |
+| Q-M2-1 (2026-09-28) | What does a config snapshot in `globals.state` hold? | **The raw config file text**; each node resolves it itself. Clustering §9/§12 corrected | `M2-storage-and-state.md`; `Clustering_Architecture_Research.md` §9.1, §12 |
+| Q-M2-2 (2026-09-28) | How much of the lease is M2? | **The lease document and its CAS operations**, proven by T1–T10; the renewer, safety deadline and controller are M6/M8 | `M2-storage-and-state.md` |
+| Q-M2-3 (2026-09-28) | Where is M2 verified during planning? | **RustFS, Azurite and real GCS** (all passed 2026-09-28); real S3 and Azure at execution through `cloud.yml` | `M2-storage-and-state.md`, `test-infra/README.md` |
+| Q-M2-4 (2026-09-28) | Snapshot cursor shape? | **Defined in M2; each cursor key value is a JSON value**; M5/M7 convert it | `M2-storage-and-state.md` D-M2.12 |
 | Q-M9-1 | Snapshot-job persistence | **Persisted in the pipeline state location** (`snapshots/jobs/<job_id>.json`); listed after a restart or failover via `GET /v1/pipelines/{id}/snapshots`; a running job continues on the new owner from its chunk cursors | `Data-Flow.md` §On-Demand Snapshot + State Layout; System-Overview and API_RBAC endpoint tables |
 
 ### 9.2 Open questions (answer before the named milestone)
