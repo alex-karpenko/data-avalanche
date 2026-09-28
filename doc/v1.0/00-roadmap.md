@@ -686,7 +686,7 @@ fake-gcs FAIL (risk R-3).
 
 ### 5.4 CI (`.github/workflows/`)
 
-- `ci.yml` (push/PR): fmt; clippy `-D warnings`; unit + property tests; containers (default profile) +
+- `ci.yml` (pull requests only; each push to a PR's head branch re-runs it): fmt; clippy `-D warnings`; unit + property tests; containers (default profile) +
   integration, including real GCS; slice E2E; docs build (from M11); at the end of the check job, a
   **non-blocking** `cargo audit` (RustSec) step: an advisory fails the step and adds a warning
   annotation, but never fails the job. Requires secret

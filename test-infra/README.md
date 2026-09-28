@@ -49,9 +49,11 @@ Bucket requirements:
 | `GCP_SA_KEY` | repository **secret** | The service-account key JSON, verbatim. The workflow writes it to `$RUNNER_TEMP` and exports `GOOGLE_SERVICE_ACCOUNT_PATH`; it is never echoed. |
 | `DATA_AVALANCHE_GCS_BUCKET` | repository **variable** | The CI bucket name (not secret). Prefer a bucket separate from local development. |
 
-Pull requests from forks receive no secrets. The workflow detects the empty secret, sets
-`DATA_AVALANCHE_SKIP_GCS=1` and emits a notice, so fork PRs test S3/Azure only; a maintainer re-runs
-GCS on merge. On pushes and same-repository pull requests, a missing `GCP_SA_KEY` secret or
+`ci.yml` runs on pull requests only: opening a PR and every push to its head branch run it; a push
+to a branch with no open PR, and a merge to `main`, run nothing. Pull requests from forks receive no
+secrets. The workflow detects the empty secret, sets `DATA_AVALANCHE_SKIP_GCS=1` and emits a notice,
+so fork PRs test S3/Azure only; a maintainer re-runs GCS from a same-repository branch before
+merging. On a same-repository pull request, a missing `GCP_SA_KEY` secret or
 `DATA_AVALANCHE_GCS_BUCKET` variable is a misconfiguration, not a fork limitation: the workflow
 prints an `::error::` and fails the integration job. S3 and Azure need no CI secrets because they
 run on the emulators above.
