@@ -133,18 +133,36 @@ pub(crate) fn load_pem(
             match certs {
                 Ok(c) if !c.is_empty() => {}
                 Ok(_) => return Err(format!("{from} holds no certificate")),
-                Err(e) => return Err(format!("{from} is not valid PEM: {e}")),
+                Err(e) => return Err(format!("{from} is not valid PEM: {}", pem_error_reason(&e))),
             }
         }
         PemKind::PrivateKey => {
             PrivateKeyDer::from_pem_slice(text.as_bytes())
-                .map_err(|e| format!("{from} holds no private key: {e}"))?;
+                .map_err(|e| format!("{from} holds no private key: {}", pem_error_reason(&e)))?;
         }
     }
     Ok(Pem {
         origin,
         text: Secret::new(text, key),
     })
+}
+
+/// A fixed, payload-free reason for a PEM parse failure (V-068, §11.1). `rustls_pki_types::pem::
+/// Error`'s `Display` embeds the offending bytes for two variants — `IllegalSectionStart { line }`
+/// and `MissingSectionEnd { end_marker }` print a decimal byte array of the input line that failed,
+/// which can be most of a damaged key or certificate body. Never format the error itself: match on
+/// its variants and name the problem instead. The enum is `#[non_exhaustive]`, so a catch-all covers
+/// any future variant (and today's `Io`/`SectionTooLarge`, which carry no PEM content but also no
+/// reason worth spelling out separately).
+fn pem_error_reason(e: &rustls_pki_types::pem::Error) -> &'static str {
+    use rustls_pki_types::pem::Error::*;
+    match e {
+        IllegalSectionStart { .. } => "malformed BEGIN line",
+        MissingSectionEnd { .. } => "missing END line",
+        Base64Decode(_) => "invalid base64",
+        NoItemsFound => "no PEM section",
+        _ => "malformed PEM",
+    }
 }
 
 #[cfg(test)]
@@ -307,5 +325,70 @@ mod tests {
                 .unwrap_err()
                 .contains("is empty")
         );
+    }
+
+    /// G1 / V-068: a damaged key or certificate's body never reaches the message, whatever way the
+    /// line structure was damaged (a lossy `${VAR}` substitution can turn newlines into spaces,
+    /// escape them as a literal `\n`, or strip them outright).
+    #[test]
+    fn mangled_pem_never_leaks_its_body() {
+        let (cert_pem, key_pem) = pem_pair();
+        let mangles: [fn(&str) -> String; 3] = [
+            |s| s.replace('\n', " "),
+            |s| s.replace('\n', "\\n"),
+            |s| s.replace('\n', ""),
+        ];
+        for (original, kind) in [
+            (&cert_pem, PemKind::Certificates),
+            (&key_pem, PemKind::PrivateKey),
+        ] {
+            for mangle in mangles {
+                let mangled = mangle(original);
+                let err = load_pem(&mangled, "unused", kind, &fp_key())
+                    .expect_err("a mangled PEM must fail to parse");
+                assert_no_pem_body_leak(&err, original, &mangled);
+            }
+        }
+    }
+
+    /// No long base64 run, no `[<digit>` (a `Vec<u8>` Debug-printed as a byte list), and none of
+    /// the original PEM's non-trivial lines, appear in `err`.
+    fn assert_no_pem_body_leak(err: &str, original: &str, mangled: &str) {
+        assert!(
+            !has_base64_run(err, 16),
+            "error leaks a base64 run: {err:?}"
+        );
+        assert!(
+            !has_bracketed_digit(err),
+            "error leaks a byte list: {err:?}"
+        );
+        for line in original
+            .lines()
+            .chain(mangled.lines())
+            .filter(|l| !l.starts_with("-----") && l.len() >= 8)
+        {
+            assert!(
+                !err.contains(line),
+                "error leaks a body line {line:?}: {err:?}"
+            );
+        }
+    }
+
+    fn has_base64_run(s: &str, min_len: usize) -> bool {
+        let is_b64 = |c: char| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=');
+        let mut run = 0;
+        for c in s.chars() {
+            run = if is_b64(c) { run + 1 } else { 0 };
+            if run >= min_len {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn has_bracketed_digit(s: &str) -> bool {
+        s.as_bytes()
+            .windows(2)
+            .any(|w| w[0] == b'[' && w[1].is_ascii_digit())
     }
 }
