@@ -1,0 +1,51 @@
+name: cloud
+
+# Real-cloud conformance (roadmap §5.4, P-5): the T1–T10 lease suite on real S3 and real Azure Blob,
+# through the production `open_bucket` path. GCS already runs in ci.yml. Requirements are in
+# test-infra/README.md, "Real S3 and Azure (cloud.yml)". Credentials are injected as env vars and
+# never printed.
+
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  s3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DATA_AVALANCHE_CLOUD: s3
+      DATA_AVALANCHE_S3_BUCKET: ${{ vars.DATA_AVALANCHE_S3_BUCKET }}
+      AWS_REGION: ${{ vars.DATA_AVALANCHE_S3_REGION }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - name: Lease conformance on real S3
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: cargo test --locked -p data-avalanche-state --test lease_conformance real_s3 -- --nocapture
+
+  azure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DATA_AVALANCHE_CLOUD: azure
+      DATA_AVALANCHE_AZURE_CONTAINER: ${{ vars.DATA_AVALANCHE_AZURE_CONTAINER }}
+      AZURE_STORAGE_ACCOUNT_NAME: ${{ vars.DATA_AVALANCHE_AZURE_ACCOUNT }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - name: Lease conformance on real Azure Blob
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: cargo test --locked -p data-avalanche-state --test lease_conformance real_azure -- --nocapture
