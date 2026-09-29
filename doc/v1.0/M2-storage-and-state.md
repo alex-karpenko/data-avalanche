@@ -5864,7 +5864,7 @@ The roadmap's M2 exit criteria, and where each is met:
 
 - [x] **T1–T10 pass on RustFS, Azurite and real GCS** (2026-09-29: RustFS and Azurite in the controller's run, real GCS in the owner's run) (`tests/lease_conformance.rs`, run in
   `ci.yml`'s integration job); nothing needed skipping on either emulator.
-- [ ] **The recorded run shows T1–T10 passing on real S3, real GCS and real Azure.** Real GCS is recorded (2026-09-29). **Open:** real S3 and Azure need the owner to set `cloud.yml`'s variables and secrets and dispatch it once.
+- [x] **The recorded run shows T1–T10 passing on real S3, real GCS and real Azure.** Real GCS: the owner's run (2026-09-29). Real S3 and Azure: `cloud.yml` run 36604762684 (2026-09-29, at 3a287dd).
   - Real S3 and Azure: `cloud.yml`, run once by manual dispatch after the owner sets its secrets.
   - Real GCS: the integration job.
   

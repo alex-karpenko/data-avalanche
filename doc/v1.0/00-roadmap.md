@@ -426,7 +426,7 @@ Detailed plan: `M0-foundations.md`.
 
 ### M2 — Storage and state (`data-avalanche-storage`, `data-avalanche-state`)
 
-- **Plan:** [`M2-storage-and-state.md`](M2-storage-and-state.md), 11 tasks. **Approved 2026-09-28**; **executed 2026-09-29** on `feat/claude/impl-v1`. One exit item is open: T1–T10 on real S3 and Azure (`cloud.yml`).
+- **Plan:** [`M2-storage-and-state.md`](M2-storage-and-state.md), 11 tasks. **Approved 2026-09-28**; **executed 2026-09-29** on `feat/claude/impl-v1`; every exit item is met (T1–T10 on real S3, GCS and Azure included).
 - **Scope:**
   - `object_store` backends from `globals.cloud`: S3 via the default chain, GCS via ADC, Azure via
     managed/workload identity plus `globals.azure.account_name`, and emulator endpoints for tests.
@@ -740,7 +740,7 @@ fake-gcs FAIL (risk R-3).
 | # | Risk | Likelihood / impact | Mitigation (where) |
 |---|---|---|---|
 | R-1 | `memberlist` 0.8.5 has never been probed (TLS, metadata size, Lifeguard, runtime-agnostic API) | medium / high | M8 opens with a probe gate; `foca` 2.0 as fallback; everything above membership consumes an owner function, so the swap is contained |
-| R-2 | `object_store` CAS behaves differently from the proven native clients (GCS generation, S3 409, Azure MI) | low / high | T1–T10 re-proof on real clouds in M2 before any lease code depends on it; the proven per-backend stores in `prototypes/lease-conformance` are the fallback. **Re-proven 2026-09-29** on `object_store` 0.14.2 through `Leases` (`tests/lease_conformance.rs`): in memory, RustFS, Azurite and real GCS PASS. Real S3 and Azure are pending the `cloud.yml` run |
+| R-2 | `object_store` CAS behaves differently from the proven native clients (GCS generation, S3 409, Azure MI) | low / high | T1–T10 re-proof on real clouds in M2 before any lease code depends on it; the proven per-backend stores in `prototypes/lease-conformance` are the fallback. **Re-proven 2026-09-29** on `object_store` 0.14.2 through `Leases` (`tests/lease_conformance.rs`): in memory, RustFS, Azurite, real GCS, real S3 and real Azure all PASS (S3 and Azure: `cloud.yml` run 36604762684) |
 | R-3 | An emulator's conditional writes are incomplete | ~~medium~~ low / low | Measured 2026-09-26: RustFS and Azurite honour Create and Update preconditions; fake-gcs doesn't serve `object_store` at all, so it's replaced by a real bucket (P-10). Real GCS via `object_store` passed the same checks (2026-09-26). Re-checked with `object_store` 0.14.2 the same day: fake-gcs 1.56.1 (= `latest`) still fails the plain PUT. Closed |
 | R-12 | Clamped PG edge dates (Arrow min/max, Q-M5-1) are valid Parquet but some engines can't render years ±5.8M / ±294k | medium / low | M4 type round-trip reads them through DuckDB `delta_scan`; the operator docs list the clamping and the engines checked |
 | R-11 | The real GCS bucket makes PR CI depend on credentials, network and cost | low / low | Per-test unique prefixes plus cleanup, a 1-day lifecycle rule on `data-avalanche-it/`, a dedicated CI bucket and service account; fork PRs skip GCS with a notice (P-10) |
