@@ -58,6 +58,41 @@ merging. On a same-repository pull request, a missing `GCP_SA_KEY` secret or
 prints an `::error::` and fails the integration job. S3 and Azure need no CI secrets because they
 run on the emulators above.
 
+## Real S3 and Azure (`cloud.yml`)
+
+Real S3 and Azure Blob run only in `.github/workflows/cloud.yml` (weekly and on manual dispatch) or by
+hand, never in `ci.yml`. A test runs when `DATA_AVALANCHE_CLOUD` names its cloud (`s3`, `azure`, or
+`s3,azure`); it opens the bucket through `open_bucket`, so credentials come from the standard
+chains. Tests write only under `data-avalanche-it/<test>/<uuid>/` and delete what they wrote.
+
+| Name | Kind | Value |
+|---|---|---|
+| `DATA_AVALANCHE_S3_BUCKET` | repository **variable** | S3 bucket for the tests (versioning off; lifecycle rule on `data-avalanche-it/`, 1 day). |
+| `DATA_AVALANCHE_S3_REGION` | repository **variable** | Its region, exported as `AWS_REGION`. |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | repository **secrets** | An IAM user limited to `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` on the bucket and `s3:ListBucket` on it. |
+| `DATA_AVALANCHE_AZURE_CONTAINER` | repository **variable** | Blob container for the tests (lifecycle rule on `data-avalanche-it/`, 1 day). |
+| `DATA_AVALANCHE_AZURE_ACCOUNT` | repository **variable** | The storage account name, exported as `AZURE_STORAGE_ACCOUNT_NAME`. |
+| `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` | repository **secrets** | A service principal with `Storage Blob Data Contributor` on the container. |
+
+By hand: `DATA_AVALANCHE_CLOUD=s3 DATA_AVALANCHE_S3_BUCKET=<bucket> AWS_REGION=<region> cargo test -p
+data-avalanche-state --test lease_conformance real_s3 -- --nocapture` with AWS credentials in the
+environment or profile (`azure` / `real_azure` likewise, with `AZURE_*`).
+
+## Lease conformance T1–T10 (M2)
+
+`crates/data-avalanche-state/tests/lease_conformance.rs` runs T1–T10 (Clustering §17.4) through
+`object_store` and `Leases` on each backend. It replaces `prototypes/lease-conformance` as the
+evidence the lease rests on (roadmap R-2).
+
+| Backend | Result | Measured | Command |
+|---|---|---|---|
+| In memory | recorded at M2 exit | | `cargo test -p data-avalanche-state --test lease_conformance in_memory` |
+| RustFS 1.0.0 | recorded at M2 exit | | `DATA_AVALANCHE_IT=1 DATA_AVALANCHE_SKIP_GCS=1 cargo test -p data-avalanche-state --test lease_conformance rustfs` |
+| Azurite 3.37.0 | recorded at M2 exit | | same, `azurite` |
+| Real GCS | recorded at M2 exit | | `DATA_AVALANCHE_IT=1 DATA_AVALANCHE_GCS_BUCKET=<bucket> GOOGLE_SERVICE_ACCOUNT_PATH=<key.json> cargo test -p data-avalanche-state --test lease_conformance real_gcs` |
+| Real S3 | recorded at M2 exit | | `cloud.yml`, job `s3` |
+| Real Azure Blob | recorded at M2 exit | | `cloud.yml`, job `azure` |
+
 ## Storage conditional-write results (M0 Task 12)
 
 | Backend | Create-if-absent | Update-if-version | Measured | Consequence for M2 |

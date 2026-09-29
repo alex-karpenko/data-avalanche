@@ -521,6 +521,7 @@ dependencies = [
  "chrono",
  "data-avalanche-storage",
  "data-avalanche-testkit",
+ "futures-util",
  "object_store",
  "serde",
  "serde_json",

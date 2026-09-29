@@ -25,6 +25,31 @@ pub fn gcs_enabled() -> bool {
     it_enabled() && !env_set("DATA_AVALANCHE_SKIP_GCS")
 }
 
+/// True when `DATA_AVALANCHE_CLOUD` (a comma-separated list, e.g. `s3` or `s3,azure`) names
+/// `cloud`. Real-cloud tests run only in `cloud.yml` or by hand, never in `ci.yml`.
+pub fn cloud_enabled(cloud: &str) -> bool {
+    std::env::var("DATA_AVALANCHE_CLOUD").is_ok_and(|list| names(&list, cloud))
+}
+
+fn names(list: &str, cloud: &str) -> bool {
+    list.split(',').any(|c| c.trim() == cloud)
+}
+
+/// Returns early unless `DATA_AVALANCHE_CLOUD` names this cloud (`"s3"` or `"azure"`).
+#[macro_export]
+macro_rules! require_cloud {
+    ($cloud:literal) => {
+        if !$crate::cloud_enabled($cloud) {
+            eprintln!(concat!(
+                "skipped: set DATA_AVALANCHE_CLOUD=",
+                $cloud,
+                " with its credentials"
+            ));
+            return;
+        }
+    };
+}
+
 /// Returns early from a test when integration tests are disabled.
 #[macro_export]
 macro_rules! require_it {
@@ -75,6 +100,17 @@ pub async fn delete_prefix(store: &dyn ObjectStore, prefix: &str) {
         .await
         .expect("delete for cleanup");
     drop(deleted);
+}
+
+/// The value of a required environment variable for a real-cloud test.
+///
+/// # Panics
+/// When it is unset or empty, naming it.
+pub fn required_env(name: &str) -> String {
+    std::env::var(name)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| panic!("{name} is not set (see test-infra/README.md)"))
 }
 
 /// Fixed endpoints from `test-infra/compose.yaml`.
@@ -135,5 +171,19 @@ pub mod stores {
             .build()
             .expect("GCS credentials: set GOOGLE_SERVICE_ACCOUNT_PATH (see test-infra/README.md)");
         Arc::new(store)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::names;
+
+    #[test]
+    fn cloud_list_parsing() {
+        assert!(names("s3", "s3"));
+        assert!(names("s3, azure", "azure"));
+        assert!(!names("", "s3"));
+        assert!(!names("s3x", "s3"));
+        assert!(!names("azure", "s3"));
     }
 }

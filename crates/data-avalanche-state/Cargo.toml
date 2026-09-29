@@ -20,5 +20,6 @@ thiserror.workspace = true
 [dev-dependencies]
 async-trait.workspace = true
 data-avalanche-testkit.workspace = true
+futures-util.workspace = true
 object_store.workspace = true
 tokio.workspace = true
