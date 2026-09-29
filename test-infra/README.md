@@ -86,12 +86,14 @@ evidence the lease rests on (roadmap R-2).
 
 | Backend | Result | Measured | Command |
 |---|---|---|---|
-| In memory | recorded at M2 exit | | `cargo test -p data-avalanche-state --test lease_conformance in_memory` |
-| RustFS 1.0.0 | recorded at M2 exit | | `DATA_AVALANCHE_IT=1 DATA_AVALANCHE_SKIP_GCS=1 cargo test -p data-avalanche-state --test lease_conformance rustfs` |
-| Azurite 3.37.0 | recorded at M2 exit | | same, `azurite` |
-| Real GCS | recorded at M2 exit | | `DATA_AVALANCHE_IT=1 DATA_AVALANCHE_GCS_BUCKET=<bucket> GOOGLE_SERVICE_ACCOUNT_PATH=<key.json> cargo test -p data-avalanche-state --test lease_conformance real_gcs` |
-| Real S3 | recorded at M2 exit | | `cloud.yml`, job `s3` |
-| Real Azure Blob | recorded at M2 exit | | `cloud.yml`, job `azure` |
+| In memory | PASS | 2026-09-29 | `cargo test -p data-avalanche-state --test lease_conformance in_memory` |
+| RustFS 1.0.0 | PASS | 2026-09-29 | `DATA_AVALANCHE_IT=1 DATA_AVALANCHE_SKIP_GCS=1 cargo test -p data-avalanche-state --test lease_conformance rustfs` |
+| Azurite 3.37.0 | PASS | 2026-09-29 | same, `azurite` |
+| Real GCS | PASS (bucket `leasetest`, 24 s; owner's run at 3b215ef, before the final-review fixes) | 2026-09-29 | `DATA_AVALANCHE_IT=1 DATA_AVALANCHE_GCS_BUCKET=<bucket> GOOGLE_SERVICE_ACCOUNT_PATH=<key.json> cargo test -p data-avalanche-state --test lease_conformance real_gcs` |
+| Real S3 | not yet run (needs the `cloud.yml` secrets) | | `cloud.yml`, job `s3` |
+| Real Azure Blob | not yet run (needs the `cloud.yml` secrets) | | `cloud.yml`, job `azure` |
+
+In memory, RustFS and Azurite were re-run on the final M2 tree (`feat/claude/impl-v1` after the final-review fix wave).
 
 ## Storage conditional-write results (M0 Task 12)
 

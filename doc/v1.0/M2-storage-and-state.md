@@ -1,5 +1,5 @@
 ---
-updated: 2026-09-28
+updated: 2026-09-29
 domain: Architecture
 tags: [v1, implementation-plan, m2, storage, state, object-store, cas, lease, cluster-anchor, config-generation]
 sources: []
@@ -153,6 +153,64 @@ task named after the arrow.
 `Clustering_Architecture_Research.md` §9.1/§9.2/§12 now say:
 - a snapshot holds the raw config text under a content-addressed name, with a `blake3:` hash;
 - the anchor carries `fingerprint_key`.
+
+## Deviations during execution (2026-09-29)
+
+The task code blocks below are the plan as it stood when each task ran. Where a review changed
+the code afterwards, the landed code differs; `git log 7806811..` on `feat/claude/impl-v1` is the
+record. In order:
+
+- **Per-task review fixes.**
+  - T3: `OpenError` never shows an option value. A known option with a bad value is reported by
+    key, with the value replaced by `***`.
+  - T5: after a race error or an unknown outcome on its own write, `acquire` recognizes that write
+    and returns `Mine`: it compares the reloaded document with the one it tried to write. A lease
+    document whose `pipeline_id` doesn't match its key is `Corrupt`. `take_over` and `release`
+    document `Contention`.
+  - T8: `write_snapshot` read the snapshot back after `Contention`. In the plan's code, several
+    nodes creating the same snapshot at once on S3 could fail cold start instead of adopting.
+    `bootstrap_or_adopt` reports `created` correctly for its own landed pointer write. Tests now
+    cover same-text races. The `WriteThenLoseResponse` fake moved to `src/test_support.rs`.
+  - Test counts end above the plan's: 328 in the workspace, against the plan's 314.
+- **Final review, one fix wave.**
+  - **The startup recipe runs the adopted generation** (Clustering §9.3, D-3).
+    - Task 11's `tests/startup.rs` loaded the node's local file as the running config, which was
+      a plan error. It now runs `bootstrap_or_adopt` first and loads the generation's text with
+      the anchor's key.
+    - The config crate's docs and roadmap §3.8 say the same, and a reload loads the new text and
+      publishes it as the next generation.
+  - **`Transient` on a conditional write is an unknown outcome**, like `Contention`, because
+    `object_store` doesn't retry conditional PUTs. The doc comments on `renew`, `take_over`,
+    `release`, `Acquired::HeldBy` and `publish` say so.
+    - **M8 input:** after `Transient` or `Contention`, `observe` before retrying. A stored lease
+      that `is_held_by(holder)` at the same `owner_epoch` is still this holder's, because a
+      takeover always changes both. A `Conflict` on a retry is therefore not proof of loss.
+    - Pass `renew` and `release` only a lease this holder got from `Mine`, `take_over` or
+      `renew`. A `HeldLease` newtype is an M8 option.
+  - **`write_snapshot` reads back on `Conflict` too.** On S3, a 409 on create can map to
+    `AlreadyExists` without the object existing. A different stored hash is `Corrupt`, and that
+    branch is now tested.
+  - **Smaller fixes.**
+    - An epoch at `u64::MAX` is `Corrupt`; it no longer wraps to 0.
+    - One crate-private `CREATE_ATTEMPTS = 3` bounds every create-race retry.
+    - `establish_anchor` reports `created` for its own landed write.
+    - `BucketSpec`'s `Debug` hides option values.
+    - `tests/versioned_store.rs` round-trips an escaped key on every backend.
+    - `cloud.yml` passes the cloud secrets to the test step only, with `timeout-minutes: 30`.
+    - `DocStore::store()` is documented as bypassing the envelope.
+- **Left open.** Each is recorded here for a later milestone or for the owner.
+  - `TableRef` (core) has no `deny_unknown_fields`, so unknown fields inside `"table"` in snapshot
+    and job documents are ignored. Changing that touches core's other serde users.
+  - A schema literally named `.pipeline-state` would collide with co-located state under
+    `table_root`. This is a config §10 question for the owner.
+  - The escaped-key round trip covers `/`, `%` and space, not non-ASCII text or `%2E`. Both
+    round-trip on RustFS and Azurite (the reviewer's probe).
+  - The final review ruled the other per-task minors "leave":
+    - cold paths (`escape_segment`'s `format!`);
+    - plan-mandated structure (`open_bucket`'s three builder arms);
+    - the testkit convention that a skipped IT test reports ok;
+    - behaviour that is safe as documented: content-equality `Mine`, and single-writer overwrites
+      of the slot and position.
 
 ---
 
@@ -5800,24 +5858,24 @@ git commit -m "test(state): startup sequence end to end; docs(storage, state): c
 
 The roadmap's M2 exit criteria, and where each is met:
 
-- [ ] **T1–T10 pass on RustFS, Azurite and real GCS** (`tests/lease_conformance.rs`, run in
+- [x] **T1–T10 pass on RustFS, Azurite and real GCS** (2026-09-29: RustFS and Azurite in the controller's run, real GCS in the owner's run) (`tests/lease_conformance.rs`, run in
   `ci.yml`'s integration job); nothing needed skipping on either emulator.
-- [ ] **The recorded run shows T1–T10 passing on real S3, real GCS and real Azure.**
+- [ ] **The recorded run shows T1–T10 passing on real S3, real GCS and real Azure.** Real GCS is recorded (2026-09-29). **Open:** real S3 and Azure need the owner to set `cloud.yml`'s variables and secrets and dispatch it once.
   - Real S3 and Azure: `cloud.yml`, run once by manual dispatch after the owner sets its secrets.
   - Real GCS: the integration job.
   
   Record each date in `test-infra/README.md` ("Lease conformance T1–T10").
-- [ ] **State round-trips and CAS races pass**:
+- [x] **State round-trips and CAS races pass**:
   - JSON shape and round-trip tests: Tasks 5, 7, 8, 9, 10.
   - N writers → 1 winner: `tests/races.rs`, Task 4 `concurrent_creates_have_one_winner`, Task 5
     `concurrent_acquirers_have_one_winner`, Task 7 `concurrent_establishers_agree_on_one_anchor`,
     Task 8 `concurrent_bootstraps_adopt_one_winner`.
-- [ ] **Anchor mismatch detection is tested**: `tests/startup.rs`
+- [x] **Anchor mismatch detection is tested**: `tests/startup.rs`
   `a_node_with_other_cluster_settings_refuses_to_start`.
-- [ ] `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
+- [x] `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo fmt --all --check` and `RUSTDOCFLAGS="-D warnings" cargo doc -p data-avalanche-storage
-  -p data-avalanche-state --no-deps` are clean.
-- [ ] Roadmap §3.5 is replaced by the landed storage/state interface (D-M2.2's error set, the
+  -p data-avalanche-state --no-deps` are clean (2026-09-29: 328 tests).
+- [x] Roadmap §3.5 is replaced by the landed storage/state interface (D-M2.2's error set, the
   state crate's entry points), and R-2 records the `object_store` re-proof, per the doc/v1.0
   README.
-- [ ] The table snapshot document matches `Data-Flow.md` §State Layout as amended by S-M (approved and applied 2026-09-28).
+- [x] The table snapshot document matches `Data-Flow.md` §State Layout as amended by S-M (approved and applied 2026-09-28).

@@ -1,5 +1,5 @@
 ---
-updated: 2026-09-28
+updated: 2026-09-29
 domain: Architecture
 tags: [v1, implementation-plan, roadmap, milestones, workspace, crates, interfaces, test-strategy, ci, risks]
 sources: []
@@ -249,23 +249,55 @@ pub trait Sink: Send + Sync {
 pub struct CommitMarker { pub owner_epoch: u64, pub committed_position: SourcePosition, pub pipeline_id: String }
 ```
 
-### 3.5 Storage CAS (`data-avalanche-storage`, P-5)
+### 3.5 Storage and state (`data-avalanche-storage`, `data-avalanche-state`, landed in M2)
+
+The crate roots are the whole public surface. D-M2.1…15 in `M2-storage-and-state.md` are the rulings behind it.
+
+**Storage** (`data-avalanche-storage`, P-5: `object_store` 0.14.2 everywhere):
 
 ```rust
+pub fn open_bucket(spec: &BucketSpec) -> Result<Arc<dyn ObjectStore>, OpenError>;
+pub struct BucketSpec { pub backend: Backend, pub bucket: String, pub options: Vec<(String, String)>, pub timeouts: Timeouts }
+pub enum Backend { S3, Gcs, Azure { account: Option<String> } }       // credentials from each cloud's standard chain
+impl Timeouts { pub const COORDINATION: Self; }                         // a hung store surfaces in about 8 s
 pub struct ObjectVersion { pub e_tag: Option<String>, pub version: Option<String> }   // = object_store::UpdateVersion
 #[async_trait]
-pub trait VersionedStore: Send + Sync {
+pub trait VersionedStore: Send + Sync + Debug {
     async fn get(&self, key: &str) -> Result<Option<(Bytes, ObjectVersion)>, StoreError>;
     async fn create(&self, key: &str, body: Bytes) -> Result<ObjectVersion, StoreError>;                 // Conflict if present
-    async fn update(&self, key: &str, expected: &ObjectVersion, body: Bytes) -> Result<ObjectVersion, StoreError>; // Conflict if moved
-    async fn put(&self, key: &str, body: Bytes) -> Result<ObjectVersion, StoreError>;                    // unconditional (immutable snapshots)
+    async fn update(&self, key: &str, expected: &ObjectVersion, body: Bytes) -> Result<ObjectVersion, StoreError>; // Conflict if moved or missing
+    async fn put(&self, key: &str, body: Bytes) -> Result<ObjectVersion, StoreError>;                    // unconditional
     async fn list(&self, prefix: &str) -> Result<Vec<String>, StoreError>;
 }
-pub enum StoreError { Conflict, NotFound, Transient(String), Permanent(String) }   // renewer taxonomy (Clustering §19.2)
+pub enum StoreError { Conflict { key }, Contention { key }, Transient { key, reason }, Permanent { key, reason } }
 ```
 
-Lease release is a **tombstone write** (object_store has no conditional delete), as in
-`prototypes/lease-conformance`.
+- `ObjectStoreVersioned::new(store, root)` is the implementation.
+- There is no `NotFound`: `get` of a missing object is `Ok(None)`, and an `update` of a missing object is `Conflict` (D-M2.2).
+- `Contention` (S3's 409) and `Transient` on a conditional write are **unknown outcomes**: the write may have landed.
+- The path rules follow config §10: `table_root`, `colocated_state`, `explicit_state`, `globals_state` and `escape_segment`, each returning a `Location { bucket, root }`.
+- `OpenError` and `BucketSpec`'s `Debug` never show an option value.
+
+**State** (`data-avalanche-state`): every document is pretty JSON with `version` first and `deny_unknown_fields`. A document with another schema version is `StateError::UnsupportedVersion`; a malformed one is `Corrupt`. Neither is ever treated as absent.
+
+- `DocStore` provides `load`, `create`, `update`, and `modify` (read-modify-write with `MODIFY_ATTEMPTS` retries). `StateError::{is_race, is_conflict}` classify its errors.
+- `globals.state` holds three document types:
+  - **Cluster anchor:** `establish_anchor(&DocStore, &AnchorDoc) -> Anchor { doc, created }` writes `cluster/anchor.json`. The first writer wins. The anchor holds `tokens`, `lease_duration_ms`, `lock_backend`, `hash_algo` and `fingerprint_key`; `Debug` shows `***` for the key.
+  - **Config generations:** `ConfigGenerations::{current, bootstrap_or_adopt, publish}` manage the `config/generation.json` CAS pointer and the raw-text snapshots `config/snapshots/<NNNNNN>-<blake3>.yaml`.
+  - **Leases:** `Leases::{acquire, renew, observe, take_over, release}` operate on `leases/<pipeline_id>.json`.
+    - The epoch is +1 on every acquisition. Release writes a tombstone that keeps the epoch.
+    - `Acquired::{Mine, HeldBy}` is what `acquire` returns.
+    - After an unknown outcome, the caller `observe`s before retrying: a lease still `is_held_by` it at the same epoch is its own.
+    - Timing (renew interval, safety deadline) is M8's.
+- Per pipeline, `PipelineDocs` is rooted at the pipeline's state location:
+  - `open(pipeline_id, sink_type)` creates or checks `pipeline-state.json`, returning `PipelineIdMismatch` or `SinkTypeMismatch` on a mismatch;
+  - `set_desired_state`;
+  - `slot` / `save_slot` for PostgreSQL;
+  - `position` / `save_position` for MySQL and MariaDB, recording `ServerIdentity`;
+  - `table_snapshot` / `save_table_snapshot` (Data-Flow §State Layout as amended by S-M);
+  - `create_snapshot_job` / `save_snapshot_job` / `snapshot_job` / `snapshot_jobs`.
+
+Lease release is a **tombstone write** (object_store has no conditional delete). T1–T10 prove the lease CAS on every backend (`tests/lease_conformance.rs`, `test-infra/README.md`).
 
 ### 3.6 Source connector (`data-avalanche-pipeline` owns the trait; each source crate implements it)
 
@@ -309,8 +341,13 @@ The crate root is the whole public surface (internals are `pub(crate)`):
 - `validate_str(text, env) -> Report` for the validation endpoint; `Report::to_json` is its body. It
   never returns the resolved config.
 - `FingerprintKey` (32 bytes, from the `globals.state` cluster anchor, config §6.2). Startup (M2):
-  load with `FingerprintKey::random()` to learn `globals.state`; read or create the anchor; load
-  again with the anchor's key. Reloads reuse the key.
+  1. Load the local file with `FingerprintKey::random()` to learn `globals.state`.
+  2. Read or create the anchor, and run `check_cluster_anchor`.
+  3. Adopt the cloud config generation (`bootstrap_or_adopt`, Clustering §9.3), and load its text
+     with the anchor's key.
+
+  `tests/startup.rs` runs this sequence. A reload loads the new text with the same key and
+  publishes it as the next generation.
 - `diff(old, new, table_set_changed: &dyn Fn(&Pipeline, &Pipeline) -> Option<bool>) -> ConfigDiff`:
   field changes classified by `Mutability` (R / PR / PROC); a PROC change rejects the reload (V-061).
   Both configs must be loaded with the same key.
@@ -389,7 +426,7 @@ Detailed plan: `M0-foundations.md`.
 
 ### M2 — Storage and state (`data-avalanche-storage`, `data-avalanche-state`)
 
-- **Plan:** [`M2-storage-and-state.md`](M2-storage-and-state.md), 11 tasks. **Approved 2026-09-28**; not yet executed.
+- **Plan:** [`M2-storage-and-state.md`](M2-storage-and-state.md), 11 tasks. **Approved 2026-09-28**; **executed 2026-09-29** on `feat/claude/impl-v1`. One exit item is open: T1–T10 on real S3 and Azure (`cloud.yml`).
 - **Scope:**
   - `object_store` backends from `globals.cloud`: S3 via the default chain, GCS via ADC, Azure via
     managed/workload identity plus `globals.azure.account_name`, and emulator endpoints for tests.
@@ -703,7 +740,7 @@ fake-gcs FAIL (risk R-3).
 | # | Risk | Likelihood / impact | Mitigation (where) |
 |---|---|---|---|
 | R-1 | `memberlist` 0.8.5 has never been probed (TLS, metadata size, Lifeguard, runtime-agnostic API) | medium / high | M8 opens with a probe gate; `foca` 2.0 as fallback; everything above membership consumes an owner function, so the swap is contained |
-| R-2 | `object_store` CAS behaves differently from the proven native clients (GCS generation, S3 409, Azure MI) | low / high | T1–T10 re-proof on real clouds in M2 before any lease code depends on it; the proven per-backend stores in `prototypes/lease-conformance` are the fallback |
+| R-2 | `object_store` CAS behaves differently from the proven native clients (GCS generation, S3 409, Azure MI) | low / high | T1–T10 re-proof on real clouds in M2 before any lease code depends on it; the proven per-backend stores in `prototypes/lease-conformance` are the fallback. **Re-proven 2026-09-29** on `object_store` 0.14.2 through `Leases` (`tests/lease_conformance.rs`): in memory, RustFS, Azurite and real GCS PASS. Real S3 and Azure are pending the `cloud.yml` run |
 | R-3 | An emulator's conditional writes are incomplete | ~~medium~~ low / low | Measured 2026-09-26: RustFS and Azurite honour Create and Update preconditions; fake-gcs doesn't serve `object_store` at all, so it's replaced by a real bucket (P-10). Real GCS via `object_store` passed the same checks (2026-09-26). Re-checked with `object_store` 0.14.2 the same day: fake-gcs 1.56.1 (= `latest`) still fails the plain PUT. Closed |
 | R-12 | Clamped PG edge dates (Arrow min/max, Q-M5-1) are valid Parquet but some engines can't render years ±5.8M / ±294k | medium / low | M4 type round-trip reads them through DuckDB `delta_scan`; the operator docs list the clamping and the engines checked |
 | R-11 | The real GCS bucket makes PR CI depend on credentials, network and cost | low / low | Per-test unique prefixes plus cleanup, a 1-day lifecycle rule on `data-avalanche-it/`, a dedicated CI bucket and service account; fork PRs skip GCS with a notice (P-10) |
@@ -781,7 +818,7 @@ the naming below (2026-09-26).**
 | D-IMPL-6 | Integration tests gate on `DATA_AVALANCHE_IT` (non-empty), cloud tests on `DATA_AVALANCHE_CLOUD` | Keeps `cargo test` hermetic by default | M0 |
 | D-IMPL-7 | Product name **`data-avalanche`** everywhere: binary and crate family `data-avalanche` / `data-avalanche-*` (imports `data_avalanche_*`); Helm chart and image `data-avalanche`; metric prefix **`data_avalanche_`** (replaces the specified `cdc_`); Delta `app_id` **`data-avalanche/<pipeline_id>/owner`**; `commitInfo` keys and the Arrow field tag `data-avalanche.*` (`data-avalanche.committed_position`, `.owner_epoch`, `.pipeline`, `data-avalanche.logical`); internal column prefix **`__data_avalanche_`** (MERGE flag `__data_avalanche_del`); env vars `DATA_AVALANCHE_*`; test bucket `data-avalanche-test`, test object prefix `data-avalanche-it/` | Owner decision (2026-09-26); specs, research docs and this plan updated. Untouched: `prototypes/` (probe evidence as run) and the legacy gap report; Iceberg's `cdc.owner_epoch` table property is v2 and keeps its name until the Iceberg sink is planned | M0 |
 | D-IMPL-8 | M1 config rulings **D-M1.1…D-M1.15** (listed in `M1-configuration.md` §Decisions and rulings, each pinned by a test). Among them: `Leaf<T>` replaces §4 M1's `Resolvable<T>`; templates allowed in union discriminators; a defaults catalog `type` dropped when the pipeline picks a block; required fields without a V-rule reported as `PARSE`; V-069/V-087 have no failing input in v1; the validate endpoint never returns the resolved config. D-M1.5, D-M1.12 and D-M1.14 were changed at review (Q-M1-4…6) | The spec is silent on these; each choice is the one that keeps a hand-written config valid or safe | M1 — **approved 2026-09-27** |
-| D-IMPL-9 | M2 storage/state rulings **D-M2.1…D-M2.15** (listed in `M2-storage-and-state.md` §Decisions and rulings, each pinned by a test). Among them: `StoreError` is `Conflict` / `Contention` / `Transient` / `Permanent` with no `NotFound` (supersedes §3.5's sketch at M2 exit); `Timeouts::COORDINATION` bounds a storage call to about 8 s; the lease tombstone keeps `owner_epoch`; config snapshots are the raw text under a content-addressed name with a `blake3:` hash | The specs and research docs are silent on these; each keeps the lease and state safe under races, hangs and hand-edited objects | M2 — **approved 2026-09-28** |
+| D-IMPL-9 | M2 storage/state rulings **D-M2.1…D-M2.15** (listed in `M2-storage-and-state.md` §Decisions and rulings, each pinned by a test). Among them: `StoreError` is `Conflict` / `Contention` / `Transient` / `Permanent` with no `NotFound` (§3.5 now shows the landed interface); `Timeouts::COORDINATION` bounds a storage call to about 8 s; the lease tombstone keeps `owner_epoch`; config snapshots are the raw text under a content-addressed name with a `blake3:` hash | The specs and research docs are silent on these; each keeps the lease and state safe under races, hangs and hand-edited objects | M2 — **approved 2026-09-28** |
 
 ### 9.1 Questions answered at plan review (2026-09-26)
 
