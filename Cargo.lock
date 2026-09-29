@@ -520,6 +520,7 @@ dependencies = [
  "blake3",
  "bytes",
  "chrono",
+ "data-avalanche-core",
  "data-avalanche-storage",
  "data-avalanche-testkit",
  "futures-util",

@@ -13,6 +13,7 @@ workspace = true
 blake3.workspace = true
 bytes.workspace = true
 chrono.workspace = true
+data-avalanche-core.workspace = true
 data-avalanche-storage.workspace = true
 serde.workspace = true
 serde_json.workspace = true

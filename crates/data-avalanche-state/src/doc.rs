@@ -41,6 +41,20 @@ pub enum StateError {
         found: u64,
         supported: u64,
     },
+    #[error(
+        "pipeline state records sink type {recorded} but the config says {configured}; positions and markers are sink-specific, so a sink type change needs a new state location (re-seed)"
+    )]
+    SinkTypeMismatch {
+        recorded: String,
+        configured: String,
+    },
+    #[error(
+        "the state location belongs to pipeline {recorded:?}, not {configured:?}; two pipelines must not share a state location"
+    )]
+    PipelineIdMismatch {
+        recorded: String,
+        configured: String,
+    },
 }
 
 impl StateError {

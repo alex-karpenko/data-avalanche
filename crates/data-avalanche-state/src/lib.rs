@@ -6,6 +6,7 @@ mod anchor;
 mod doc;
 mod generation;
 mod lease;
+mod pipeline;
 #[cfg(test)]
 mod test_support;
 
@@ -16,3 +17,7 @@ pub use generation::{
     config_snapshot_key,
 };
 pub use lease::{Acquired, Holder, LeaseDoc, Leases, lease_key};
+pub use pipeline::{
+    DesiredState, PIPELINE_STATE_KEY, POSITION_KEY, PipelineDocs, PipelineStateDoc, PositionDoc,
+    SLOT_KEY, ServerIdentity, SlotDoc,
+};
