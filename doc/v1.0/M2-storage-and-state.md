@@ -171,7 +171,7 @@ record. In order:
     nodes creating the same snapshot at once on S3 could fail cold start instead of adopting.
     `bootstrap_or_adopt` reports `created` correctly for its own landed pointer write. Tests now
     cover same-text races. The `WriteThenLoseResponse` fake moved to `src/test_support.rs`.
-  - Test counts end above the plan's: 328 in the workspace, against the plan's 314.
+  - Test counts end above the plan's: 330 in the workspace (after the owner decisions below), against the plan's 314.
 - **Final review, one fix wave.**
   - **The startup recipe runs the adopted generation** (Clustering §9.3, D-3).
     - Task 11's `tests/startup.rs` loaded the node's local file as the running config, which was
@@ -198,11 +198,15 @@ record. In order:
     - `tests/versioned_store.rs` round-trips an escaped key on every backend.
     - `cloud.yml` passes the cloud secrets to the test step only, with `timeout-minutes: 30`.
     - `DocStore::store()` is documented as bypassing the envelope.
-- **Left open.** Each is recorded here for a later milestone or for the owner.
-  - `TableRef` (core) has no `deny_unknown_fields`, so unknown fields inside `"table"` in snapshot
-    and job documents are ignored. Changing that touches core's other serde users.
-  - A schema literally named `.pipeline-state` would collide with co-located state under
-    `table_root`. This is a config §10 question for the owner.
+- **Owner decisions after the final review (2026-09-29).**
+  - `TableRef` (core) now has `deny_unknown_fields`, so an unknown field inside `"table"` in a
+    snapshot or job document is `Corrupt`, like any other unknown field (D-M2.6).
+  - A schema named exactly `.pipeline-state` is escaped to `%2Epipeline-state` in `table_root`.
+    This extends D-M2.4. Without it, with co-located state, such a table's root would be inside
+    `<sink.prefix>/.pipeline-state/`, next to `slot.json` and `position.json`, and a Delta `VACUUM`
+    of that table could delete them. Only the schema segment can collide; ordinary names are
+    unchanged.
+- **Left open.** Each is recorded here for a later milestone.
   - The escaped-key round trip covers `/`, `%` and space, not non-ASCII text or `%2E`. Both
     round-trip on RustFS and Azurite (the reviewer's probe).
   - The final review ruled the other per-task minors "leave":
@@ -5874,7 +5878,7 @@ The roadmap's M2 exit criteria, and where each is met:
   `a_node_with_other_cluster_settings_refuses_to_start`.
 - [x] `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo fmt --all --check` and `RUSTDOCFLAGS="-D warnings" cargo doc -p data-avalanche-storage
-  -p data-avalanche-state --no-deps` are clean (2026-09-29: 328 tests).
+  -p data-avalanche-state --no-deps` are clean (2026-09-29: 330 tests).
 - [x] Roadmap §3.5 is replaced by the landed storage/state interface (D-M2.2's error set, the
   state crate's entry points), and R-2 records the `object_store` re-proof, per the doc/v1.0
   README.
