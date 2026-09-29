@@ -8,7 +8,7 @@ use std::fmt;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::doc::{DocStore, Document, StateError};
+use crate::doc::{CREATE_ATTEMPTS, DocStore, Document, StateError};
 
 pub const ANCHOR_KEY: &str = "cluster/anchor.json";
 
@@ -89,14 +89,19 @@ pub struct Anchor {
 /// A storage failure, or a stored anchor that isn't a valid document.
 pub async fn establish_anchor(docs: &DocStore, proposal: &AnchorDoc) -> Result<Anchor, StateError> {
     let mut attempts = 0;
+    // Set once this call's own create returns a race error: an unknown outcome
+    // (`Store(Contention)`) may still have landed.
+    let mut attempted = false;
     loop {
         attempts += 1;
         if let Some(existing) = docs.load::<AnchorDoc>(ANCHOR_KEY).await? {
+            let created = attempted && existing.doc == *proposal;
             return Ok(Anchor {
                 doc: existing.doc,
-                created: false,
+                created,
             });
         }
+        attempted = true;
         match docs.create(ANCHOR_KEY, proposal).await {
             Ok(_) => {
                 return Ok(Anchor {
@@ -104,7 +109,7 @@ pub async fn establish_anchor(docs: &DocStore, proposal: &AnchorDoc) -> Result<A
                     created: true,
                 });
             }
-            Err(e) if e.is_race() && attempts < 3 => continue,
+            Err(e) if e.is_race() && attempts < CREATE_ATTEMPTS => continue,
             Err(e) => return Err(e),
         }
     }
@@ -120,6 +125,7 @@ mod tests {
     use object_store::memory::InMemory;
 
     use super::*;
+    use crate::test_support::WriteThenLoseResponse;
 
     fn docs() -> DocStore {
         let store = ObjectStoreVersioned::new(Arc::new(InMemory::new()), "globals").unwrap();
@@ -231,6 +237,24 @@ mod tests {
             let text = e.to_string();
             assert!(!text.contains("5c5c") && !text.contains("5C5C"), "{text}");
         }
+    }
+
+    #[tokio::test]
+    async fn establish_anchor_recognizes_its_own_create_that_landed_despite_contention() {
+        let store = WriteThenLoseResponse::new(
+            ObjectStoreVersioned::new(Arc::new(InMemory::new()), "globals").unwrap(),
+        );
+        let d = DocStore::new(Arc::new(store));
+        let p = proposal("a", 1);
+        let a = establish_anchor(&d, &p).await.unwrap();
+        assert_eq!(
+            a,
+            Anchor {
+                doc: p,
+                created: true
+            },
+            "the create landed even though the response reported Contention"
+        );
     }
 
     #[test]

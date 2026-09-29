@@ -125,11 +125,18 @@ pub struct DocStore {
 /// How many times [`DocStore::modify`] re-reads after losing a race before it gives up.
 pub const MODIFY_ATTEMPTS: usize = 16;
 
+/// How many times a plain create (anchor, lease acquire, config generation bootstrap or
+/// snapshot, pipeline open) retries after losing a race before it gives up: small, because a
+/// lost create race resolves on the next read rather than needing many attempts.
+pub(crate) const CREATE_ATTEMPTS: u32 = 3;
+
 impl DocStore {
     pub fn new(store: Arc<dyn VersionedStore>) -> Self {
         Self { store }
     }
 
+    /// Bypasses the `Document` envelope — for raw objects such as config snapshots and listings
+    /// only.
     pub fn store(&self) -> &Arc<dyn VersionedStore> {
         &self.store
     }
@@ -149,7 +156,8 @@ impl DocStore {
     /// Writes `doc` only if nothing exists at `key`.
     ///
     /// # Errors
-    /// `Store(Conflict)` when the key exists.
+    /// `Store(Conflict)` when the key exists (on S3, rarely, also when a concurrent write or
+    /// delete raced this one).
     pub async fn create<T: Document>(
         &self,
         key: &str,

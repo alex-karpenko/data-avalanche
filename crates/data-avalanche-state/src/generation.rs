@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use data_avalanche_storage::StoreError;
 use serde::{Deserialize, Serialize};
 
-use crate::doc::{DocStore, Document, StateError, Versioned};
+use crate::doc::{CREATE_ATTEMPTS, DocStore, Document, StateError, Versioned};
 
 pub const GENERATION_KEY: &str = "config/generation.json";
 
@@ -123,7 +123,7 @@ impl ConfigGenerations {
                         true,
                     ));
                 }
-                Err(e) if e.is_race() && attempts < 3 => continue,
+                Err(e) if e.is_race() && attempts < CREATE_ATTEMPTS => continue,
                 Err(e) => return Err(e),
             }
         }
@@ -133,9 +133,10 @@ impl ConfigGenerations {
     ///
     /// # Errors
     /// `Store(Conflict)` when another node published since `base` was read: re-read, re-validate
-    /// against the new generation and try again. `Store(Contention)` means the pointer update's
-    /// outcome is unknown — the same recovery applies: re-read (the pointer may already name this
-    /// node's generation) and decide. The losing snapshot stays behind, unreferenced.
+    /// against the new generation and try again. `Store(Contention)` (or a transient write error)
+    /// means the pointer update's outcome is unknown — the same recovery applies: re-read (the
+    /// pointer may already name this node's generation) and decide. The losing snapshot stays
+    /// behind, unreferenced.
     pub async fn publish(
         &self,
         base: &Versioned<GenerationDoc>,
@@ -176,28 +177,30 @@ impl ConfigGenerations {
         loop {
             attempts += 1;
             match self.docs.store().create(&key, text.to_owned().into()).await {
-                // Same key = same generation and same text: someone already wrote these exact
-                // bytes.
-                Ok(_) | Err(StoreError::Conflict { .. }) => break,
-                // The outcome is unknown (e.g. an S3 409 after object_store's own retries): read
-                // the key back and settle it, rather than assuming either landed or lost.
-                Err(StoreError::Contention { .. }) => match self.docs.store().get(&key).await? {
-                    Some((body, _))
-                        if format!("blake3:{}", blake3::hash(&body).to_hex()) == hash =>
-                    {
-                        break;
+                Ok(_) => break,
+                // `Conflict` claims the key exists (same key = same generation and same text,
+                // normally — but on S3 a 409 can map to `Conflict` without the object existing);
+                // `Contention` leaves the outcome unknown after object_store's own retries.
+                // Either way, read the key back and settle it, rather than assuming.
+                Err(e @ (StoreError::Conflict { .. } | StoreError::Contention { .. })) => {
+                    match self.docs.store().get(&key).await? {
+                        Some((body, _))
+                            if format!("blake3:{}", blake3::hash(&body).to_hex()) == hash =>
+                        {
+                            break;
+                        }
+                        Some(_) => {
+                            return Err(StateError::Corrupt {
+                                key: key.clone(),
+                                kind: "config snapshot",
+                                reason: "already holds bytes with a different hash than this write's content-addressed key".to_owned(),
+                            });
+                        }
+                        // Nothing landed: retry the create, bounded like any other race.
+                        None if attempts < CREATE_ATTEMPTS => continue,
+                        None => return Err(e.into()),
                     }
-                    Some(_) => {
-                        return Err(StateError::Corrupt {
-                            key: key.clone(),
-                            kind: "config snapshot",
-                            reason: "already holds bytes with a different hash than this write's content-addressed key".to_owned(),
-                        });
-                    }
-                    // Nothing landed: retry the create, bounded like any other race.
-                    None if attempts < 3 => continue,
-                    None => return Err(StoreError::Contention { key: key.clone() }.into()),
-                },
+                }
                 Err(e) => return Err(e.into()),
             }
         }
@@ -441,6 +444,26 @@ mod tests {
         assert!(created);
         assert_eq!(first.text, V1);
         assert_eq!(g.current().await.unwrap(), Some(first));
+    }
+
+    #[tokio::test]
+    async fn write_snapshot_treats_a_conflict_with_mismatched_bytes_as_corrupt() {
+        let g = gens();
+        // A real `Conflict`, not a fake one: pre-write bytes at the snapshot key that don't
+        // match its content-addressed hash, so `write_snapshot`'s own `create` fails with
+        // `Conflict` because the key already exists.
+        let key = config_snapshot_key(1, &config_hash(V1));
+        g.docs
+            .store()
+            .put(&key, Bytes::from_static(b"tampered"))
+            .await
+            .unwrap();
+        let e = g.bootstrap_or_adopt(V1, "a", t(0)).await.unwrap_err();
+        assert!(
+            matches!(&e, StateError::Corrupt { key: k, kind: "config snapshot", reason }
+                if k == &key && reason.contains("different hash")),
+            "{e:?}"
+        );
     }
 
     #[tokio::test]

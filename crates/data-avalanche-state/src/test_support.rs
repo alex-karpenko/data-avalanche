@@ -7,11 +7,13 @@ use bytes::Bytes;
 use data_avalanche_storage::{ObjectStoreVersioned, ObjectVersion, StoreError, VersionedStore};
 
 /// A `VersionedStore` whose first `create`/`update` (optionally restricted to one `key`) reports
-/// `Contention` — the unknown-outcome case (S3 409 after retries; a `Transient` timeout behaves
-/// the same way from the caller's point of view). By default the real write still happens
-/// underneath first, so the outcome landed but the caller is told it didn't
-/// ([`Self::without_write`] makes it not happen at all: the outcome is unknown *and* it didn't
-/// land). Fires once (for a matching key), then behaves normally.
+/// `Contention` — the unknown-outcome case this fake injects (an S3 409 after object_store's own
+/// retries). A `Transient` timeout on a conditional write is an unknown outcome for the same
+/// reason, even though this fake never injects it; callers must treat it the same way as
+/// `Contention`. By default the real write still happens underneath first, so the outcome landed
+/// but the caller is told it didn't ([`Self::without_write`] makes it not happen at all: the
+/// outcome is unknown *and* it didn't land). Fires once (for a matching key), then behaves
+/// normally.
 #[derive(Debug)]
 pub(crate) struct WriteThenLoseResponse {
     inner: ObjectStoreVersioned,

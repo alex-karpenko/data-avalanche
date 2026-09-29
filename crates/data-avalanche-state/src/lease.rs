@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use data_avalanche_storage::escape_segment;
 use serde::{Deserialize, Serialize};
 
-use crate::doc::{DocStore, Document, StateError, Versioned};
+use crate::doc::{CREATE_ATTEMPTS, DocStore, Document, StateError, Versioned};
 
 /// A lease as stored. `released: true` is the tombstone a planned release leaves behind: the next
 /// acquirer takes it without waiting, and `owner_epoch` carries on from it.
@@ -53,9 +53,11 @@ impl LeaseDoc {
 pub enum Acquired {
     /// This node now holds the lease.
     Mine(Versioned<LeaseDoc>),
-    /// Another holder has it; the caller may observe it and consider a takeover (§5.3). It can
-    /// name this very holder when an earlier call's write landed despite returning a race error
-    /// that this call could not attribute to itself; the caller checks [`LeaseDoc::is_held_by`].
+    /// Another holder has it; the caller may observe it and consider a takeover (§5.3). It may
+    /// name this holder after an earlier call returned an error (race or transient) whose write
+    /// in fact landed. This also happens on `acquire`'s own bounded retries: a race on the last
+    /// attempt returns `Err` even when that write landed — the caller checks
+    /// [`LeaseDoc::is_held_by`] either way.
     HeldBy(Versioned<LeaseDoc>),
 }
 
@@ -151,7 +153,13 @@ impl Leases {
                         .map(|v| Versioned { doc, version: v })
                 }
                 Some(seen) if seen.doc.released => {
-                    let epoch = seen.doc.owner_epoch + 1;
+                    let Some(epoch) = seen.doc.owner_epoch.checked_add(1) else {
+                        return Err(StateError::Corrupt {
+                            key: key.clone(),
+                            kind: LeaseDoc::KIND,
+                            reason: "owner_epoch is at its maximum".to_owned(),
+                        });
+                    };
                     let doc = Self::new_doc(pipeline_id, holder, epoch, lease_duration, now);
                     attempted = Some(doc.clone());
                     self.docs
@@ -166,7 +174,7 @@ impl Leases {
                 // Someone else created or took it first: read again; a live winner is reported
                 // as the holder on the next pass (unless it turns out to be our own landed
                 // write, above).
-                Err(e) if e.is_race() && attempts < 3 => continue,
+                Err(e) if e.is_race() && attempts < CREATE_ATTEMPTS => continue,
                 Err(e) => return Err(e),
             }
         }
@@ -175,8 +183,15 @@ impl Leases {
     /// Renews a held lease: a CAS write from `lease.version` with a new `renewed_at`.
     ///
     /// # Errors
-    /// `Store(Conflict)` means the lease was taken or deleted (lost); `Store(Contention)` means the
-    /// outcome is unknown — observe it and check [`LeaseDoc::is_held_by`] (§19.2).
+    /// `Store(Conflict)` means the lease was taken or deleted (lost) — unless this call is
+    /// itself a retry after an earlier `Store(Contention)` or a transient write error, in which
+    /// case the write may have landed and the `Conflict` only means this call's expected version
+    /// is now stale. Either way, after `Store(Contention)` or a transient error, call
+    /// [`Self::observe`] before retrying: a stored lease that [`LeaseDoc::is_held_by`] this holder
+    /// with the same `owner_epoch` is still this holder's (a takeover always changes both), so
+    /// continue renewing from the observed version. Pass only a lease this holder got from
+    /// [`Acquired::Mine`], [`Self::take_over`] or [`Self::renew`] — passing a `HeldBy` document
+    /// would CAS-write over someone else's live lease.
     pub async fn renew(
         &self,
         lease: &Versioned<LeaseDoc>,
@@ -207,8 +222,11 @@ impl Leases {
     ///
     /// # Errors
     /// `Store(Conflict)` when the lease moved since it was observed (the holder renewed, or
-    /// another challenger won); `Store(Contention)` means the outcome is unknown — observe it and
-    /// check [`LeaseDoc::is_held_by`] against `holder`.
+    /// another challenger won); `Store(Contention)` (or a transient write error) means the
+    /// outcome is unknown — call [`Self::observe`] before retrying and check
+    /// [`LeaseDoc::is_held_by`] against `holder`: a stored lease held by `holder` with the same
+    /// `owner_epoch` this call proposed is still this call's own landed write (a takeover always
+    /// changes both). `Corrupt` when `owner_epoch` is already at its maximum.
     pub async fn take_over(
         &self,
         observed: &Versioned<LeaseDoc>,
@@ -216,7 +234,13 @@ impl Leases {
         lease_duration: Duration,
         now: DateTime<Utc>,
     ) -> Result<Versioned<LeaseDoc>, StateError> {
-        let epoch = observed.doc.owner_epoch + 1;
+        let Some(epoch) = observed.doc.owner_epoch.checked_add(1) else {
+            return Err(StateError::Corrupt {
+                key: lease_key(&observed.doc.pipeline_id),
+                kind: LeaseDoc::KIND,
+                reason: "owner_epoch is at its maximum".to_owned(),
+            });
+        };
         let doc = Self::new_doc(
             &observed.doc.pipeline_id,
             holder,
@@ -231,8 +255,11 @@ impl Leases {
     /// delete). The epoch is kept, so the next acquisition continues from it.
     ///
     /// # Errors
-    /// `Store(Conflict)` when the lease is no longer the one held; `Store(Contention)` means the
-    /// outcome is unknown — observe it and check `released`.
+    /// `Store(Conflict)` when the lease is no longer the one held; `Store(Contention)` (or a
+    /// transient write error) means the outcome is unknown — call [`Self::observe`] before
+    /// retrying and check `released`. Pass only a lease this holder got from [`Acquired::Mine`],
+    /// [`Self::take_over`] or [`Self::renew`] — releasing a `HeldBy` document would tombstone
+    /// someone else's live lease.
     pub async fn release(
         &self,
         lease: &Versioned<LeaseDoc>,
@@ -518,6 +545,64 @@ mod tests {
         assert_eq!(lease.doc.owner_epoch, 2);
         assert_eq!(lease.doc.holder_node_id, "b");
         assert_eq!(lease, l.observe("orders").await.unwrap().unwrap());
+    }
+
+    #[tokio::test]
+    async fn acquire_refuses_to_overflow_the_epoch_past_a_tombstone() {
+        let l = leases();
+        let tomb = LeaseDoc {
+            pipeline_id: "orders".into(),
+            holder_node_id: "a".into(),
+            holder_incarnation: 7,
+            owner_epoch: u64::MAX,
+            acquired_at: t(0),
+            renewed_at: t(0),
+            lease_duration_ms: 15_000,
+            released: true,
+        };
+        l.docs
+            .store()
+            .put(&lease_key("orders"), crate::doc::encode(&tomb))
+            .await
+            .unwrap();
+        let e = l
+            .acquire("orders", &node("b"), DUR, t(1))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&e, StateError::Corrupt { kind: "lease", reason, .. } if reason.contains("maximum")),
+            "{e:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn take_over_refuses_to_overflow_the_epoch() {
+        let l = leases();
+        let doc = LeaseDoc {
+            pipeline_id: "orders".into(),
+            holder_node_id: "a".into(),
+            holder_incarnation: 7,
+            owner_epoch: u64::MAX,
+            acquired_at: t(0),
+            renewed_at: t(0),
+            lease_duration_ms: 15_000,
+            released: false,
+        };
+        let version = l
+            .docs
+            .store()
+            .put(&lease_key("orders"), crate::doc::encode(&doc))
+            .await
+            .unwrap();
+        let observed = Versioned { doc, version };
+        let e = l
+            .take_over(&observed, &node("b"), DUR, t(1))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&e, StateError::Corrupt { kind: "lease", reason, .. } if reason.contains("maximum")),
+            "{e:?}"
+        );
     }
 
     #[tokio::test]

@@ -9,7 +9,7 @@ use data_avalanche_core::SourcePosition;
 use data_avalanche_core::position::Lsn;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::doc::{DocStore, Document, StateError, Versioned};
+use crate::doc::{CREATE_ATTEMPTS, DocStore, Document, StateError, Versioned};
 
 pub const PIPELINE_STATE_KEY: &str = "pipeline-state.json";
 pub const SLOT_KEY: &str = "replication/slot.json";
@@ -143,7 +143,7 @@ impl PipelineDocs {
             };
             match self.docs.create(PIPELINE_STATE_KEY, &doc).await {
                 Ok(version) => return Ok(Versioned { doc, version }),
-                Err(e) if e.is_race() && attempts < 3 => continue,
+                Err(e) if e.is_race() && attempts < CREATE_ATTEMPTS => continue,
                 Err(e) => return Err(e),
             }
         }
