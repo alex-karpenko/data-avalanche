@@ -58,7 +58,7 @@ impl Timeouts {
 }
 
 /// One bucket (Azure: container) to open.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct BucketSpec {
     pub backend: Backend,
     pub bucket: String,
@@ -66,6 +66,25 @@ pub struct BucketSpec {
     /// `region`, `use_emulator`), applied over the environment.
     pub options: Vec<(String, String)>,
     pub timeouts: Timeouts,
+}
+
+impl std::fmt::Debug for BucketSpec {
+    /// Option values can be secrets (`secret_access_key`, `sas_token`); only their keys print.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BucketSpec")
+            .field("backend", &self.backend)
+            .field("bucket", &self.bucket)
+            .field(
+                "options",
+                &self
+                    .options
+                    .iter()
+                    .map(|(k, _)| (k.as_str(), "***"))
+                    .collect::<Vec<_>>(),
+            )
+            .field("timeouts", &self.timeouts)
+            .finish()
+    }
 }
 
 /// A bucket that can't be opened. The message names an option key, never its value.
@@ -168,4 +187,22 @@ pub fn open_bucket(spec: &BucketSpec) -> Result<Arc<dyn ObjectStore>, OpenError>
         }
     };
     Ok(store)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_redacts_option_values_but_keeps_keys() {
+        let spec = BucketSpec {
+            backend: Backend::S3,
+            bucket: "lake".into(),
+            options: vec![("secret_access_key".into(), "shh-dont-tell".into())],
+            timeouts: Timeouts::COORDINATION,
+        };
+        let text = format!("{spec:?}");
+        assert!(text.contains("secret_access_key"), "{text}");
+        assert!(!text.contains("shh-dont-tell"), "{text}");
+    }
 }

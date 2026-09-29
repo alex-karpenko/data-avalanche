@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use data_avalanche_storage::{
-    Backend, BucketSpec, ObjectStoreVersioned, StoreError, Timeouts, VersionedStore, open_bucket,
+    Backend, BucketSpec, ObjectStoreVersioned, StoreError, Timeouts, VersionedStore,
+    escape_segment, open_bucket,
 };
 use data_avalanche_testkit::endpoints::{
     RUSTFS_ACCESS_KEY, RUSTFS_SECRET_KEY, RUSTFS_URL, TEST_BUCKET,
@@ -51,9 +52,27 @@ async fn check(store: Arc<dyn ObjectStore>, test: &str) {
 
     s.put("snapshots/public.orders.json", b("s")).await.unwrap();
     s.put("snapshots/jobs/j1.json", b("j")).await.unwrap();
+
+    // A table-snapshot-style key built with the real escaping (config §10, `escape_segment`): a
+    // database identifier's `/`, `%` and space must round-trip byte-for-byte on every backend.
+    let table = escape_segment("a.b/c 50%");
+    let escaped_key = format!("snapshots/tables/{table}.json");
+    let v3 = s
+        .create(&escaped_key, b("t"))
+        .await
+        .expect("create on an escaped key");
+    assert_eq!(
+        s.get(&escaped_key).await.unwrap(),
+        Some((b("t"), v3)),
+        "the escaped key stores and reads back verbatim"
+    );
     assert_eq!(
         s.list("snapshots").await.unwrap(),
-        vec!["snapshots/jobs/j1.json", "snapshots/public.orders.json"]
+        vec![
+            "snapshots/jobs/j1.json",
+            "snapshots/public.orders.json",
+            escaped_key.as_str(),
+        ]
     );
     assert_eq!(s.get("doc.json").await.unwrap().unwrap().0, b("two"));
 
