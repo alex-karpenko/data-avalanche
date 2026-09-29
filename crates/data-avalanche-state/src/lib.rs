@@ -7,6 +7,7 @@ mod doc;
 mod generation;
 mod lease;
 mod pipeline;
+mod snapshot;
 #[cfg(test)]
 mod test_support;
 
@@ -20,4 +21,8 @@ pub use lease::{Acquired, Holder, LeaseDoc, Leases, lease_key};
 pub use pipeline::{
     DesiredState, PIPELINE_STATE_KEY, POSITION_KEY, PipelineDocs, PipelineStateDoc, PositionDoc,
     SLOT_KEY, ServerIdentity, SlotDoc,
+};
+pub use snapshot::{
+    CursorKey, JOBS_PREFIX, JobStatus, JobTable, SnapshotCursor, SnapshotJobDoc, SnapshotStatus,
+    TableSnapshotDoc, job_key, table_snapshot_key,
 };
