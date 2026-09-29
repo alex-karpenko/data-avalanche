@@ -53,7 +53,9 @@ impl LeaseDoc {
 pub enum Acquired {
     /// This node now holds the lease.
     Mine(Versioned<LeaseDoc>),
-    /// Another holder has it; the caller may observe it and consider a takeover (§5.3).
+    /// Another holder has it; the caller may observe it and consider a takeover (§5.3). It can
+    /// name this very holder when an earlier call's write landed despite returning a race error
+    /// that this call could not attribute to itself; the caller checks [`LeaseDoc::is_held_by`].
     HeldBy(Versioned<LeaseDoc>),
 }
 
@@ -66,6 +68,24 @@ pub struct Leases {
 /// `leases/<pipeline_id>.json`.
 pub fn lease_key(pipeline_id: &str) -> String {
     format!("leases/{}.json", escape_segment(pipeline_id))
+}
+
+/// Refuses a loaded document that is for another pipeline (a corrupt or misplaced object).
+fn check_pipeline_id(
+    key: &str,
+    pipeline_id: &str,
+    loaded: Option<Versioned<LeaseDoc>>,
+) -> Result<Option<Versioned<LeaseDoc>>, StateError> {
+    if let Some(v) = &loaded
+        && v.doc.pipeline_id != pipeline_id
+    {
+        return Err(StateError::Corrupt {
+            key: key.to_owned(),
+            kind: LeaseDoc::KIND,
+            reason: format!("it is for pipeline {:?}", v.doc.pipeline_id),
+        });
+    }
+    Ok(loaded)
 }
 
 impl Leases {
@@ -94,7 +114,9 @@ impl Leases {
     }
 
     /// Acquires a free lease: creates it (epoch 1) when absent, or takes a released tombstone
-    /// (epoch + 1). A live holder is left alone and returned as [`Acquired::HeldBy`].
+    /// (epoch + 1). A live holder is left alone and returned as [`Acquired::HeldBy`] — unless it
+    /// is the very document this call itself just wrote (a `create`/`update` that landed but
+    /// returned a race error), in which case it is reported as [`Acquired::Mine`].
     ///
     /// # Errors
     /// A storage or decode failure, or a race error when another acquirer won the tombstone and
@@ -108,12 +130,21 @@ impl Leases {
     ) -> Result<Acquired, StateError> {
         let key = lease_key(pipeline_id);
         let mut attempts = 0;
+        // The doc this call last tried to write, set when that write returned a race error: an
+        // unknown outcome (`Store(Contention)`) or a transient one may still have landed.
+        let mut attempted: Option<LeaseDoc> = None;
         loop {
             attempts += 1;
-            let current = self.docs.load::<LeaseDoc>(&key).await?;
+            let current = check_pipeline_id(&key, pipeline_id, self.docs.load(&key).await?)?;
+            if let Some(seen) = &current
+                && attempted.as_ref() == Some(&seen.doc)
+            {
+                return Ok(Acquired::Mine(seen.clone()));
+            }
             let written = match &current {
                 None => {
                     let doc = Self::new_doc(pipeline_id, holder, 1, lease_duration, now);
+                    attempted = Some(doc.clone());
                     self.docs
                         .create(&key, &doc)
                         .await
@@ -122,6 +153,7 @@ impl Leases {
                 Some(seen) if seen.doc.released => {
                     let epoch = seen.doc.owner_epoch + 1;
                     let doc = Self::new_doc(pipeline_id, holder, epoch, lease_duration, now);
+                    attempted = Some(doc.clone());
                     self.docs
                         .update(&key, &seen.version, &doc)
                         .await
@@ -132,7 +164,8 @@ impl Leases {
             match written {
                 Ok(lease) => return Ok(Acquired::Mine(lease)),
                 // Someone else created or took it first: read again; a live winner is reported
-                // as the holder on the next pass.
+                // as the holder on the next pass (unless it turns out to be our own landed
+                // write, above).
                 Err(e) if e.is_race() && attempts < 3 => continue,
                 Err(e) => return Err(e),
             }
@@ -159,12 +192,14 @@ impl Leases {
     /// The lease as stored now, or `None` when it doesn't exist.
     ///
     /// # Errors
-    /// A storage or decode failure.
+    /// A storage or decode failure, or `Corrupt` when the object at this key is for another
+    /// pipeline.
     pub async fn observe(
         &self,
         pipeline_id: &str,
     ) -> Result<Option<Versioned<LeaseDoc>>, StateError> {
-        self.docs.load(&lease_key(pipeline_id)).await
+        let key = lease_key(pipeline_id);
+        check_pipeline_id(&key, pipeline_id, self.docs.load(&key).await?)
     }
 
     /// Takes over a lease the caller has observed unchanged for a full lease duration (§5.3): a
@@ -172,7 +207,8 @@ impl Leases {
     ///
     /// # Errors
     /// `Store(Conflict)` when the lease moved since it was observed (the holder renewed, or
-    /// another challenger won).
+    /// another challenger won); `Store(Contention)` means the outcome is unknown — observe it and
+    /// check [`LeaseDoc::is_held_by`] against `holder`.
     pub async fn take_over(
         &self,
         observed: &Versioned<LeaseDoc>,
@@ -195,7 +231,8 @@ impl Leases {
     /// delete). The epoch is kept, so the next acquisition continues from it.
     ///
     /// # Errors
-    /// `Store(Conflict)` when the lease is no longer the one held.
+    /// `Store(Conflict)` when the lease is no longer the one held; `Store(Contention)` means the
+    /// outcome is unknown — observe it and check `released`.
     pub async fn release(
         &self,
         lease: &Versioned<LeaseDoc>,
@@ -223,12 +260,79 @@ impl Leases {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
+    use async_trait::async_trait;
+    use bytes::Bytes;
     use chrono::TimeZone;
-    use data_avalanche_storage::ObjectStoreVersioned;
+    use data_avalanche_storage::{ObjectStoreVersioned, ObjectVersion, StoreError, VersionedStore};
     use object_store::memory::InMemory;
 
     use super::*;
+
+    /// A `VersionedStore` whose first `create`/`update` performs the real write on `inner` but
+    /// reports it as `Contention` — the unknown-outcome case (S3 409 after retries; a `Transient`
+    /// timeout behaves the same way from the caller's point of view). Fires once, then behaves
+    /// normally.
+    #[derive(Debug)]
+    struct WriteThenLoseResponse {
+        inner: ObjectStoreVersioned,
+        armed: AtomicBool,
+    }
+
+    impl WriteThenLoseResponse {
+        fn new(inner: ObjectStoreVersioned) -> Self {
+            Self {
+                inner,
+                armed: AtomicBool::new(true),
+            }
+        }
+
+        /// True the first time this is called; false ever after.
+        fn fire(&self) -> bool {
+            self.armed.swap(false, Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl VersionedStore for WriteThenLoseResponse {
+        async fn get(&self, key: &str) -> Result<Option<(Bytes, ObjectVersion)>, StoreError> {
+            self.inner.get(key).await
+        }
+
+        async fn create(&self, key: &str, body: Bytes) -> Result<ObjectVersion, StoreError> {
+            let result = self.inner.create(key, body).await;
+            if self.fire() {
+                return Err(StoreError::Contention {
+                    key: key.to_owned(),
+                });
+            }
+            result
+        }
+
+        async fn update(
+            &self,
+            key: &str,
+            expected: &ObjectVersion,
+            body: Bytes,
+        ) -> Result<ObjectVersion, StoreError> {
+            let result = self.inner.update(key, expected, body).await;
+            if self.fire() {
+                return Err(StoreError::Contention {
+                    key: key.to_owned(),
+                });
+            }
+            result
+        }
+
+        async fn put(&self, key: &str, body: Bytes) -> Result<ObjectVersion, StoreError> {
+            self.inner.put(key, body).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+            self.inner.list(prefix).await
+        }
+    }
 
     const DUR: Duration = Duration::from_secs(15);
 
@@ -444,5 +548,68 @@ mod tests {
     fn lease_keys_escape_the_pipeline_id() {
         assert_eq!(lease_key("orders-pg"), "leases/orders-pg.json");
         assert_eq!(lease_key("a/b"), "leases/a%2Fb.json");
+    }
+
+    #[tokio::test]
+    async fn acquire_recognizes_its_own_create_that_landed_despite_contention() {
+        let store = WriteThenLoseResponse::new(
+            ObjectStoreVersioned::new(Arc::new(InMemory::new()), "globals").unwrap(),
+        );
+        let l = Leases::new(DocStore::new(Arc::new(store)));
+        let lease = match l.acquire("orders", &node("a"), DUR, t(0)).await.unwrap() {
+            Acquired::Mine(lease) => lease,
+            other => panic!("expected Mine (own landed write), got {other:?}"),
+        };
+        assert_eq!(lease.doc.owner_epoch, 1);
+        assert_eq!(lease.doc.holder_node_id, "a");
+        assert_eq!(lease, l.observe("orders").await.unwrap().unwrap());
+    }
+
+    #[tokio::test]
+    async fn acquire_recognizes_its_own_tombstone_take_that_landed_despite_contention() {
+        let mem = Arc::new(InMemory::new());
+        {
+            // Acquire and release once, with no fault injection, to leave a tombstone.
+            let store = ObjectStoreVersioned::new(mem.clone(), "globals").unwrap();
+            let l = Leases::new(DocStore::new(Arc::new(store)));
+            let a = mine(&l, "orders", "a").await;
+            l.release(&a, t(1)).await.unwrap();
+        }
+        let store = WriteThenLoseResponse::new(ObjectStoreVersioned::new(mem, "globals").unwrap());
+        let l = Leases::new(DocStore::new(Arc::new(store)));
+        let lease = match l.acquire("orders", &node("b"), DUR, t(2)).await.unwrap() {
+            Acquired::Mine(lease) => lease,
+            other => panic!("expected Mine (own landed write), got {other:?}"),
+        };
+        assert_eq!(lease.doc.owner_epoch, 2);
+        assert_eq!(lease.doc.holder_node_id, "b");
+        assert_eq!(lease, l.observe("orders").await.unwrap().unwrap());
+    }
+
+    #[tokio::test]
+    async fn observe_and_acquire_refuse_a_document_for_another_pipeline() {
+        let l = leases();
+        let key = lease_key("orders");
+        let wrong = Leases::new_doc("shipments", &node("a"), 1, DUR, t(0));
+        l.docs
+            .store()
+            .put(&key, crate::doc::encode(&wrong))
+            .await
+            .unwrap();
+
+        let e = l.observe("orders").await.unwrap_err();
+        assert!(
+            matches!(&e, StateError::Corrupt { key: k, kind: "lease", .. } if k == &key),
+            "{e:?}"
+        );
+
+        let e = l
+            .acquire("orders", &node("b"), DUR, t(1))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&e, StateError::Corrupt { key: k, kind: "lease", .. } if k == &key),
+            "{e:?}"
+        );
     }
 }

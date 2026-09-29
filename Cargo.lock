@@ -516,6 +516,7 @@ dependencies = [
 name = "data-avalanche-state"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "chrono",
  "data-avalanche-storage",
