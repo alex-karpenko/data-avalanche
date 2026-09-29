@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 
 /// A source table. For MySQL the `schema` slot holds the database (`source.db`), so the layout is
 /// uniform across engines (config §10, `Data-Flow.md` `TableRef`).
+/// Unknown fields are refused, like every stored state document (D-M2.6).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TableRef {
     pub schema: String,
     pub name: String,
@@ -50,6 +52,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_fields_are_refused() {
+        let ok: TableRef = serde_json::from_str(r#"{"schema":"public","name":"orders"}"#).unwrap();
+        assert_eq!(ok, TableRef::new("public", "orders"));
+        let e = serde_json::from_str::<TableRef>(r#"{"schema":"public","name":"orders","db":"x"}"#)
+            .unwrap_err();
+        assert!(e.to_string().contains("unknown field `db`"), "{e}");
+    }
 
     #[test]
     fn displays_as_schema_dot_name() {
