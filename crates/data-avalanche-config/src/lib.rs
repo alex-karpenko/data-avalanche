@@ -14,9 +14,11 @@
 //!   [`load_file`] twice: (1) once with [`FingerprintKey::random`], discarding the result except
 //!   for `globals.state`, `cloud` and the cluster anchor fields (their fingerprints don't matter
 //!   here); (2) read the anchor at that `globals.state` location, or create it (generating
-//!   `fingerprint_key` there); (3) [`load_file`] again, this time with the anchor's key — that
-//!   result is the running config. A dedicated `load_globals` entry point is deliberately not
-//!   added for step 1; a later reload only ever repeats step 3, with the already-known key.
+//!   `fingerprint_key` there); (3) adopt the cloud config generation
+//!   (`data_avalanche_state`'s `ConfigGenerations::bootstrap_or_adopt`, which bootstraps it from
+//!   this file only when none exists) and load its text with the anchor's key — that result is
+//!   the running config (Clustering §9.3). A dedicated `load_globals` entry point is deliberately
+//!   not added for step 1; a later reload only ever repeats step 3, with the already-known key.
 //! - **Validation endpoint:** [`validate_str`] runs the same phases and returns only the report;
 //!   it never exposes the resolved config (§11.1), and its fingerprints never leave the call, so
 //!   it keys them with [`FingerprintKey::random`] rather than taking a key. [`Report::to_json`] is

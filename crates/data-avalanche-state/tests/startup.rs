@@ -14,8 +14,8 @@ use data_avalanche_config::{
     check_cluster_anchor, load_str,
 };
 use data_avalanche_state::{
-    AnchorDoc, ConfigGenerations, DesiredState, DocStore, HashAlgo, PipelineDocs, StateError,
-    establish_anchor,
+    AnchorDoc, ConfigGeneration, ConfigGenerations, DesiredState, DocStore, HashAlgo, PipelineDocs,
+    StateError, establish_anchor,
 };
 use data_avalanche_storage::{
     Location, ObjectStoreVersioned, colocated_state, explicit_state, globals_state,
@@ -102,6 +102,7 @@ fn state_location(p: &Pipeline) -> Location {
 struct Started {
     config: ResolvedConfig,
     anchor: AnchorDoc,
+    generation: ConfigGeneration,
 }
 
 /// Steps 1–5 for one node. `Err` carries the refusal a real node would print.
@@ -144,15 +145,25 @@ async fn start(buckets: &Buckets, node: &str, text: &str) -> Result<Started, Str
             .join("; "));
     }
 
-    // 4. The running config: loaded with the cluster's key.
-    let config = load(text, &FingerprintKey::from_bytes(anchor.fingerprint_key));
-
-    // 5. Adopt the cloud generation, or bootstrap it from this file.
-    ConfigGenerations::new(globals)
+    // 4. Adopt the cloud config generation, or bootstrap it from this file when none exists yet
+    //    (Clustering §9.3): the generation's text, not this node's local file, is the running
+    //    config from here on.
+    let (generation, _created) = ConfigGenerations::new(globals)
         .bootstrap_or_adopt(text, node, Utc::now())
         .await
         .map_err(|e| e.to_string())?;
-    Ok(Started { config, anchor })
+
+    // 5. The running config: the adopted generation's text, loaded with the cluster's key.
+    let config = load(
+        &generation.text,
+        &FingerprintKey::from_bytes(anchor.fingerprint_key),
+    );
+
+    Ok(Started {
+        config,
+        anchor,
+        generation,
+    })
 }
 
 #[tokio::test]
@@ -210,8 +221,14 @@ async fn a_node_with_other_cluster_settings_refuses_to_start() {
 async fn a_restarted_node_adopts_the_cloud_generation_not_its_file() {
     let buckets = Buckets::default();
     start(&buckets, "node-a", CONFIG).await.unwrap();
-    let edited = format!("{CONFIG}# edited after bootstrap\n");
-    start(&buckets, "node-a", &edited).await.unwrap();
+    // A change that lands in `ResolvedConfig`, not just a comment: the running config must come
+    // from the adopted generation, not from this local, edited file.
+    let edited = CONFIG.replace(
+        "include: [public.orders]",
+        "include: [public.orders, public.orders_edited]",
+    );
+    assert_ne!(edited, CONFIG, "the replace must actually match");
+    let restarted = start(&buckets, "node-a", &edited).await.unwrap();
     let globals = buckets.docs(&globals_state("app-state", "cluster-a"));
     let current = ConfigGenerations::new(globals)
         .current()
@@ -221,6 +238,20 @@ async fn a_restarted_node_adopts_the_cloud_generation_not_its_file() {
     assert_eq!(
         (current.pointer.doc.generation, current.text.as_str()),
         (1, CONFIG)
+    );
+    assert_eq!(
+        (
+            restarted.generation.pointer.doc.generation,
+            restarted.generation.text.as_str()
+        ),
+        (1, CONFIG),
+        "the node's own adopted generation is also generation 1 with the original text"
+    );
+    assert_eq!(
+        restarted.config.pipelines["orders"].tables.include,
+        vec!["public.orders".to_string()],
+        "the running config is loaded from the adopted generation's text, not the local file \
+         (Clustering §9.3)"
     );
 }
 

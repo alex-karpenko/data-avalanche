@@ -10,9 +10,10 @@
 //! `globals.state` (one [`DocStore`] rooted at `data_avalanche_storage::globals_state`):
 //! - [`establish_anchor`]: `cluster/anchor.json`, first writer wins. It holds `tokens`,
 //!   `lease_duration_ms`, `lock_backend`, `hash_algo` and the `fingerprint_key` for the config
-//!   crate's [`FingerprintKey`](https://docs.rs/) (config §6.2). Startup: load the config with a
-//!   random key, establish the anchor, run the config crate's `check_cluster_anchor`, then load
-//!   again with the anchor's key (`tests/startup.rs` runs the whole sequence).
+//!   crate's [`FingerprintKey`](https://docs.rs/) (config §6.2). Startup: load the config with
+//!   a random key, establish the anchor, run the config crate's `check_cluster_anchor`,
+//!   adopt or bootstrap the config generation ([`ConfigGenerations::bootstrap_or_adopt`]), then
+//!   load its text with the anchor's key (`tests/startup.rs` runs the whole sequence).
 //! - [`ConfigGenerations`]: `config/generation.json` (CAS pointer) and content-addressed
 //!   `config/snapshots/<NNNNNN>-<hash>.yaml` holding the raw config text. A starting node adopts
 //!   the current generation; the first one bootstraps generation 1 (Clustering §9.3).
