@@ -52,6 +52,12 @@ impl StateError {
             Self::Store(StoreError::Conflict { .. } | StoreError::Contention { .. })
         )
     }
+
+    /// True when a conditional write definitely lost (`Conflict`), as opposed to an unknown
+    /// outcome (`Contention`).
+    pub fn is_conflict(&self) -> bool {
+        matches!(self, Self::Store(StoreError::Conflict { .. }))
+    }
 }
 
 #[derive(Serialize)]

@@ -517,6 +517,7 @@ name = "data-avalanche-state"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "chrono",
  "data-avalanche-storage",
  "data-avalanche-testkit",
  "object_store",

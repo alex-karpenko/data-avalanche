@@ -3,5 +3,7 @@
 //! `version`, written with compare-and-swap through `data-avalanche-storage`.
 
 mod doc;
+mod lease;
 
 pub use doc::{DocStore, Document, MODIFY_ATTEMPTS, StateError, Versioned};
+pub use lease::{Acquired, Holder, LeaseDoc, Leases, lease_key};
