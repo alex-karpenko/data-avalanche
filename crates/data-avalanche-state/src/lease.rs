@@ -260,79 +260,13 @@ impl Leases {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
-    use async_trait::async_trait;
-    use bytes::Bytes;
     use chrono::TimeZone;
-    use data_avalanche_storage::{ObjectStoreVersioned, ObjectVersion, StoreError, VersionedStore};
+    use data_avalanche_storage::ObjectStoreVersioned;
     use object_store::memory::InMemory;
 
     use super::*;
-
-    /// A `VersionedStore` whose first `create`/`update` performs the real write on `inner` but
-    /// reports it as `Contention` — the unknown-outcome case (S3 409 after retries; a `Transient`
-    /// timeout behaves the same way from the caller's point of view). Fires once, then behaves
-    /// normally.
-    #[derive(Debug)]
-    struct WriteThenLoseResponse {
-        inner: ObjectStoreVersioned,
-        armed: AtomicBool,
-    }
-
-    impl WriteThenLoseResponse {
-        fn new(inner: ObjectStoreVersioned) -> Self {
-            Self {
-                inner,
-                armed: AtomicBool::new(true),
-            }
-        }
-
-        /// True the first time this is called; false ever after.
-        fn fire(&self) -> bool {
-            self.armed.swap(false, Ordering::SeqCst)
-        }
-    }
-
-    #[async_trait]
-    impl VersionedStore for WriteThenLoseResponse {
-        async fn get(&self, key: &str) -> Result<Option<(Bytes, ObjectVersion)>, StoreError> {
-            self.inner.get(key).await
-        }
-
-        async fn create(&self, key: &str, body: Bytes) -> Result<ObjectVersion, StoreError> {
-            let result = self.inner.create(key, body).await;
-            if self.fire() {
-                return Err(StoreError::Contention {
-                    key: key.to_owned(),
-                });
-            }
-            result
-        }
-
-        async fn update(
-            &self,
-            key: &str,
-            expected: &ObjectVersion,
-            body: Bytes,
-        ) -> Result<ObjectVersion, StoreError> {
-            let result = self.inner.update(key, expected, body).await;
-            if self.fire() {
-                return Err(StoreError::Contention {
-                    key: key.to_owned(),
-                });
-            }
-            result
-        }
-
-        async fn put(&self, key: &str, body: Bytes) -> Result<ObjectVersion, StoreError> {
-            self.inner.put(key, body).await
-        }
-
-        async fn list(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
-            self.inner.list(prefix).await
-        }
-    }
+    use crate::test_support::WriteThenLoseResponse;
 
     const DUR: Duration = Duration::from_secs(15);
 

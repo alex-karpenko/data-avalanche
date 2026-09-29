@@ -4,6 +4,7 @@
 //! resolved config.
 
 use chrono::{DateTime, Utc};
+use data_avalanche_storage::StoreError;
 use serde::{Deserialize, Serialize};
 
 use crate::doc::{DocStore, Document, StateError, Versioned};
@@ -87,7 +88,9 @@ impl ConfigGenerations {
 
     /// Cold start (§9.3): adopts the current generation if there is one; otherwise publishes
     /// `text` as generation 1. Concurrent bootstrappers race on the pointer's create; the losers
-    /// adopt the winner's generation. Returns the generation and whether this call created it.
+    /// adopt the winner's generation. Returns the generation and whether this call created it —
+    /// which it can, even when its own `create` returned a race error, if that write in fact
+    /// landed (the outcome of `Store(Contention)` is unknown until read back).
     ///
     /// # Errors
     /// As [`Self::current`], or a storage failure while writing.
@@ -98,12 +101,17 @@ impl ConfigGenerations {
         now: DateTime<Utc>,
     ) -> Result<(ConfigGeneration, bool), StateError> {
         let mut attempts = 0;
+        // The pointer doc this call last tried to create, set when that create returned a race
+        // error: an unknown outcome (`Store(Contention)`) may still have landed.
+        let mut attempted: Option<GenerationDoc> = None;
         loop {
             attempts += 1;
             if let Some(current) = self.current().await? {
-                return Ok((current, false));
+                let created = attempted.as_ref() == Some(&current.pointer.doc);
+                return Ok((current, created));
             }
             let doc = self.write_snapshot(1, text, node_id, now).await?;
+            attempted = Some(doc.clone());
             match self.docs.create(GENERATION_KEY, &doc).await {
                 Ok(version) => {
                     let pointer = Versioned { doc, version };
@@ -125,7 +133,9 @@ impl ConfigGenerations {
     ///
     /// # Errors
     /// `Store(Conflict)` when another node published since `base` was read: re-read, re-validate
-    /// against the new generation and try again. The losing snapshot stays behind, unreferenced.
+    /// against the new generation and try again. `Store(Contention)` means the pointer update's
+    /// outcome is unknown — the same recovery applies: re-read (the pointer may already name this
+    /// node's generation) and decide. The losing snapshot stays behind, unreferenced.
     pub async fn publish(
         &self,
         base: &Versioned<GenerationDoc>,
@@ -146,6 +156,13 @@ impl ConfigGenerations {
         })
     }
 
+    /// Writes the immutable snapshot for `generation`, tolerating races on its content-addressed
+    /// key: two writers who land on the same key always agree on its bytes.
+    ///
+    /// # Errors
+    /// A storage failure, or `Corrupt` when the key already holds bytes that hash to something
+    /// other than this write's content-addressed hash (a key collision that should be
+    /// impossible barring a `blake3` break or tampering).
     async fn write_snapshot(
         &self,
         generation: u64,
@@ -155,10 +172,34 @@ impl ConfigGenerations {
     ) -> Result<GenerationDoc, StateError> {
         let hash = config_hash(text);
         let key = config_snapshot_key(generation, &hash);
-        match self.docs.store().create(&key, text.to_owned().into()).await {
-            // Same key = same generation and same text: someone already wrote these exact bytes.
-            Ok(_) | Err(data_avalanche_storage::StoreError::Conflict { .. }) => {}
-            Err(e) => return Err(e.into()),
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            match self.docs.store().create(&key, text.to_owned().into()).await {
+                // Same key = same generation and same text: someone already wrote these exact
+                // bytes.
+                Ok(_) | Err(StoreError::Conflict { .. }) => break,
+                // The outcome is unknown (e.g. an S3 409 after object_store's own retries): read
+                // the key back and settle it, rather than assuming either landed or lost.
+                Err(StoreError::Contention { .. }) => match self.docs.store().get(&key).await? {
+                    Some((body, _))
+                        if format!("blake3:{}", blake3::hash(&body).to_hex()) == hash =>
+                    {
+                        break;
+                    }
+                    Some(_) => {
+                        return Err(StateError::Corrupt {
+                            key: key.clone(),
+                            kind: "config snapshot",
+                            reason: "already holds bytes with a different hash than this write's content-addressed key".to_owned(),
+                        });
+                    }
+                    // Nothing landed: retry the create, bounded like any other race.
+                    None if attempts < 3 => continue,
+                    None => return Err(StoreError::Contention { key: key.clone() }.into()),
+                },
+                Err(e) => return Err(e.into()),
+            }
         }
         Ok(GenerationDoc {
             generation,
@@ -179,6 +220,7 @@ mod tests {
     use object_store::memory::InMemory;
 
     use super::*;
+    use crate::test_support::WriteThenLoseResponse;
 
     fn gens() -> ConfigGenerations {
         let store = ObjectStoreVersioned::new(Arc::new(InMemory::new()), "globals").unwrap();
@@ -286,9 +328,11 @@ mod tests {
         let g = gens();
         let (first, _) = g.bootstrap_or_adopt(V1, "a", t(0)).await.unwrap();
         let winner = g.publish(&first.pointer, V2, "b", t(5)).await.unwrap();
-        g.publish(&first.pointer, "# loser\n", "c", t(6))
+        let e = g
+            .publish(&first.pointer, "# loser\n", "c", t(6))
             .await
             .unwrap_err();
+        assert!(e.is_conflict(), "{e:?}");
         let keys = g.docs.store().list("config/snapshots").await.unwrap();
         assert_eq!(keys.len(), 3, "{keys:?}");
         assert_eq!(
@@ -320,5 +364,96 @@ mod tests {
             .unwrap();
         let e = g.current().await.unwrap_err();
         assert!(e.to_string().contains("missing"), "{e}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_bootstraps_with_identical_text_all_succeed() {
+        let g = gens();
+        let tasks: Vec<_> = (0..8)
+            .map(|i| {
+                let g = g.clone();
+                tokio::spawn(async move { g.bootstrap_or_adopt(V1, &format!("n{i}"), t(0)).await })
+            })
+            .collect();
+        let mut results = vec![];
+        for task in tasks {
+            results.push(task.await.unwrap().unwrap());
+        }
+        assert_eq!(
+            results.iter().filter(|(_, created)| *created).count(),
+            1,
+            "exactly one bootstrapper creates the pointer; the rest hit the snapshot's Conflict \
+             arm (same key, identical text) and then adopt"
+        );
+        let current = g.current().await.unwrap().unwrap();
+        assert!(
+            results
+                .iter()
+                .all(|(g2, _)| g2.text == current.text && g2.pointer.doc == current.pointer.doc)
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_retries_with_the_same_text_after_a_pointer_conflict() {
+        let g = gens();
+        let (first, _) = g.bootstrap_or_adopt(V1, "a", t(0)).await.unwrap();
+        // "b" publishes generation 2 first.
+        let winner = g.publish(&first.pointer, V2, "b", t(5)).await.unwrap();
+        // "c" was racing from the same stale base with its own text; it loses.
+        const SAME: &str = "# c's reload\n";
+        let e = g
+            .publish(&first.pointer, SAME, "c", t(6))
+            .await
+            .unwrap_err();
+        assert!(e.is_conflict(), "{e:?}");
+        let current = g.current().await.unwrap().unwrap();
+        assert_eq!(current, winner);
+        // "c" re-reads and republishes the very same text on the new base: it succeeds.
+        let retried = g.publish(&current.pointer, SAME, "c", t(7)).await.unwrap();
+        assert_eq!(
+            (retried.pointer.doc.generation, retried.text.as_str()),
+            (3, SAME)
+        );
+        assert_eq!(g.current().await.unwrap(), Some(retried));
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_contention_whose_write_landed_resolves_to_success() {
+        let key = config_snapshot_key(1, &config_hash(V1));
+        let inner = ObjectStoreVersioned::new(Arc::new(InMemory::new()), "globals").unwrap();
+        let store = WriteThenLoseResponse::new(inner).on_key(&key);
+        let g = ConfigGenerations::new(DocStore::new(Arc::new(store)));
+        let (first, created) = g.bootstrap_or_adopt(V1, "a", t(0)).await.unwrap();
+        assert!(created);
+        assert_eq!(first.text, V1);
+        assert_eq!(g.current().await.unwrap(), Some(first));
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_contention_whose_write_did_not_land_retries_and_succeeds() {
+        let key = config_snapshot_key(1, &config_hash(V1));
+        let inner = ObjectStoreVersioned::new(Arc::new(InMemory::new()), "globals").unwrap();
+        let store = WriteThenLoseResponse::new(inner)
+            .without_write()
+            .on_key(&key);
+        let g = ConfigGenerations::new(DocStore::new(Arc::new(store)));
+        let (first, created) = g.bootstrap_or_adopt(V1, "a", t(0)).await.unwrap();
+        assert!(created);
+        assert_eq!(first.text, V1);
+        assert_eq!(g.current().await.unwrap(), Some(first));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_recognizes_its_own_pointer_create_that_landed_despite_contention() {
+        let inner = ObjectStoreVersioned::new(Arc::new(InMemory::new()), "globals").unwrap();
+        let store = WriteThenLoseResponse::new(inner).on_key(GENERATION_KEY);
+        let g = ConfigGenerations::new(DocStore::new(Arc::new(store)));
+        let (first, created) = g.bootstrap_or_adopt(V1, "a", t(0)).await.unwrap();
+        assert!(
+            created,
+            "the pointer create landed even though the response reported Contention"
+        );
+        assert_eq!(first.text, V1);
+        assert_eq!(g.current().await.unwrap(), Some(first));
     }
 }

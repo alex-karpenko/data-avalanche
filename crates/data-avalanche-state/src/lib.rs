@@ -6,6 +6,8 @@ mod anchor;
 mod doc;
 mod generation;
 mod lease;
+#[cfg(test)]
+mod test_support;
 
 pub use anchor::{ANCHOR_KEY, Anchor, AnchorDoc, HashAlgo, establish_anchor};
 pub use doc::{DocStore, Document, MODIFY_ATTEMPTS, StateError, Versioned};
