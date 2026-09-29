@@ -18,7 +18,8 @@
 //!   (`data_avalanche_state`'s `ConfigGenerations::bootstrap_or_adopt`, which bootstraps it from
 //!   this file only when none exists) and load its text with the anchor's key — that result is
 //!   the running config (Clustering §9.3). A dedicated `load_globals` entry point is deliberately
-//!   not added for step 1; a later reload only ever repeats step 3, with the already-known key.
+//!   not added for step 1; a later reload only loads the new text with the already-known key
+//!   (and publishes it as the next generation).
 //! - **Validation endpoint:** [`validate_str`] runs the same phases and returns only the report;
 //!   it never exposes the resolved config (§11.1), and its fingerprints never leave the call, so
 //!   it keys them with [`FingerprintKey::random`] rather than taking a key. [`Report::to_json`] is
