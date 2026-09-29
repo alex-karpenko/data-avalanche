@@ -513,6 +513,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "data-avalanche-state"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "data-avalanche-storage",
+ "data-avalanche-testkit",
+ "object_store",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "data-avalanche-storage"
 version = "0.1.0"
 dependencies = [
