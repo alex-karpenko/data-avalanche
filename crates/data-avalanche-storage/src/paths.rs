@@ -45,9 +45,15 @@ pub fn escape_segment(ident: &str) -> String {
 }
 
 /// `<sink.bucket>/<sink.prefix>/<schema>/<table>/`: one table's root, for every sink format. For
-/// MySQL, `schema` is the database (`source.db`).
+/// MySQL, `schema` is the database (`source.db`). A schema named exactly
+/// [`COLOCATED_STATE_DIR`] has its leading dot escaped (`%2Epipeline-state`), so a table never
+/// lands inside co-located pipeline state under the same `sink.prefix`.
 pub fn table_root(sink_bucket: &str, sink_prefix: &str, schema: &str, table: &str) -> Location {
-    let (schema, table) = (escape_segment(schema), escape_segment(table));
+    let schema = match escape_segment(schema) {
+        s if s == COLOCATED_STATE_DIR => format!("%2E{}", &s[1..]),
+        s => s,
+    };
+    let table = escape_segment(table);
     Location {
         bucket: sink_bucket.to_owned(),
         root: join(&[sink_prefix, &schema, &table]),
@@ -128,6 +134,23 @@ mod tests {
         assert_eq!(table_root("b", "p", "a/b", "50%").root, "p/a%2Fb/50%25");
         assert_eq!(table_root("b", "p", "..", ".").root, "p/%2E%2E/%2E");
         assert_eq!(table_root("b", "p", "s", "t\n").root, "p/s/t%0A");
+    }
+
+    #[test]
+    fn a_schema_named_like_the_state_marker_never_lands_in_colocated_state() {
+        let state = colocated_state("lake", "p").root;
+        let root = table_root("lake", "p", COLOCATED_STATE_DIR, "replication").root;
+        assert_eq!(root, "p/%2Epipeline-state/replication");
+        assert!(!root.starts_with(&format!("{state}/")));
+        // Only the schema segment can collide; the rest map as before.
+        assert_eq!(
+            table_root("lake", "p", "s", COLOCATED_STATE_DIR).root,
+            "p/s/.pipeline-state"
+        );
+        assert_eq!(
+            table_root("lake", "p", ".pipeline-state2", "t").root,
+            "p/.pipeline-state2/t"
+        );
     }
 
     #[test]
