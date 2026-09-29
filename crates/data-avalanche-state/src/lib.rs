@@ -4,8 +4,13 @@
 
 mod anchor;
 mod doc;
+mod generation;
 mod lease;
 
 pub use anchor::{ANCHOR_KEY, Anchor, AnchorDoc, HashAlgo, establish_anchor};
 pub use doc::{DocStore, Document, MODIFY_ATTEMPTS, StateError, Versioned};
+pub use generation::{
+    ConfigGeneration, ConfigGenerations, GENERATION_KEY, GenerationDoc, config_hash,
+    config_snapshot_key,
+};
 pub use lease::{Acquired, Holder, LeaseDoc, Leases, lease_key};
