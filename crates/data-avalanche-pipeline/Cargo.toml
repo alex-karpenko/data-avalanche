@@ -17,6 +17,8 @@ data-avalanche-core.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+data-avalanche-testkit.workspace = true
+tokio.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 proptest.workspace = true

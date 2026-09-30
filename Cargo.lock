@@ -639,9 +639,11 @@ dependencies = [
  "arrow-buffer",
  "arrow-schema",
  "data-avalanche-core",
+ "data-avalanche-testkit",
  "proptest",
  "serde_json",
  "thiserror",
+ "tokio",
  "uuid",
 ]
 
