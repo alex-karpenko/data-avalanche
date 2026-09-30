@@ -22,6 +22,13 @@ pub enum AccumulatorError {
     /// commit the change sets, then apply the barrier again (seal → flush → apply).
     #[error("table {table} has committed changes to flush before the barrier")]
     FlushRequired { table: TableRef },
+    /// With splitting on, the open transaction reached `max_transaction_buffer_bytes`: nothing
+    /// changed; split, commit the slice, then apply the same event again. The split empties the
+    /// open transaction, so the retry is buffered (Large_Transaction §1).
+    #[error(
+        "the open transaction reached max_transaction_buffer_bytes: split it, then apply again"
+    )]
+    SplitRequired,
     /// The open transaction outgrew `max_transaction_buffer_bytes` with splitting off: the
     /// pipeline halts rather than exhaust the worker's memory (Large_Transaction §2).
     #[error(

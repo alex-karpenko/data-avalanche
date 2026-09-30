@@ -137,6 +137,12 @@ impl Accumulator {
         Ok(())
     }
 
+    /// Buffers one event of the open transaction. The transaction buffer ceiling
+    /// (`TxnLimits::buffer_bytes`) is checked here: with splitting off, reaching it halts
+    /// ([`AccumulatorError::TransactionTooLarge`]); with splitting on, an event that arrives once
+    /// it is reached is refused with [`AccumulatorError::SplitRequired`] and nothing changes —
+    /// split, commit the slice, then apply the event again. The split empties the open
+    /// transaction, so the retry always makes progress.
     pub fn apply(&mut self, event: &CdcEvent, now: Instant) -> Result<(), AccumulatorError> {
         let Some(txn) = &mut self.txn else {
             return Err(protocol(format!(
@@ -153,12 +159,21 @@ impl Accumulator {
         if self.halted.contains(&event.table) {
             return Ok(());
         }
-        let buffer =
-            self.tables
-                .get_mut(&event.table)
-                .ok_or_else(|| AccumulatorError::UnknownTable {
-                    table: event.table.clone(),
-                })?;
+        if !self.tables.contains_key(&event.table) {
+            return Err(AccumulatorError::UnknownTable {
+                table: event.table.clone(),
+            });
+        }
+        // Past the ceiling with something to split: an empty open transaction always takes the
+        // event, so a retry after the split makes progress whatever the limit.
+        let open_bytes: usize = self.tables.values().map(TableBuffer::open_bytes).sum();
+        if self.limits.batch_rows.is_some()
+            && open_bytes > 0
+            && open_bytes as u64 >= self.limits.buffer_bytes
+        {
+            return Err(AccumulatorError::SplitRequired);
+        }
+        let buffer = self.tables.get_mut(&event.table).expect("checked above");
         buffer.apply(event)?;
         txn.first_event_at.get_or_insert(now);
         if self.limits.batch_rows.is_none() {
@@ -264,7 +279,10 @@ impl Accumulator {
         Ok(())
     }
 
-    /// Whether a flush is due at `now`. Called after each boundary and on a timer.
+    /// Whether a flush is due at `now`. Called after each boundary and on a timer. With splitting
+    /// on, [`FlushReason::Split`] once the open transaction reaches `batch_rows` events or the
+    /// byte ceiling; the ceiling itself doesn't depend on how often this is called, since
+    /// [`Self::apply`] refuses an event past it ([`AccumulatorError::SplitRequired`]).
     pub fn due(&self, now: Instant) -> Option<FlushReason> {
         if let (Some(_), Some(rows)) = (&self.txn, self.limits.batch_rows)
             && (self.open_events() >= rows || self.open_bytes() as u64 >= self.limits.buffer_bytes)
@@ -815,6 +833,28 @@ mod tests {
             matches!(a.split(), Err(AccumulatorError::Protocol { .. })),
             "no open transaction"
         );
+    }
+
+    #[test]
+    fn with_splitting_on_apply_asks_for_a_split_at_the_byte_ceiling() {
+        let t0 = Instant::now();
+        let mut a = acc(FlushPolicy::default());
+        a.set_txn_limits(TxnLimits {
+            batch_rows: Some(1_000_000),
+            buffer_bytes: 1,
+        });
+        a.begin(1).unwrap();
+        a.apply(&insert("a", 1, 1, 1), t0).unwrap();
+        let before = (a.open_bytes(), a.open_events());
+        let next = insert("b", 1, 2, 2);
+        let err = a.apply(&next, t0).unwrap_err();
+        assert!(matches!(err, AccumulatorError::SplitRequired), "{err}");
+        assert_eq!((a.open_bytes(), a.open_events()), before, "nothing changed");
+
+        let slice = a.split().unwrap();
+        assert_eq!(slice.change_sets.len(), 1);
+        a.apply(&next, t0).unwrap();
+        assert_eq!(a.open_events(), 1, "the retry is buffered");
     }
 
     #[test]

@@ -289,7 +289,16 @@ impl Run<'_> {
                 match item {
                     Item::Begin(xid) => self.acc.begin(*xid).unwrap(),
                     Item::Event(e) => {
-                        self.acc.apply(e, self.now).unwrap();
+                        loop {
+                            match self.acc.apply(e, self.now) {
+                                Ok(()) => break,
+                                Err(AccumulatorError::SplitRequired) => {
+                                    let f = self.acc.split().unwrap();
+                                    self.commit(f).await?;
+                                }
+                                Err(e) => panic!("{e}"),
+                            }
+                        }
                         if self.acc.due(self.now) == Some(FlushReason::Split) {
                             let f = self.acc.split().unwrap();
                             self.commit(f).await?;
