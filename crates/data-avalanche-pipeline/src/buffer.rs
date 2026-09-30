@@ -5,8 +5,8 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use data_avalanche_core::{
-    CdcEvent, ColumnValue, ColumnValueType, HaltReason, LogicalType, Op, PositionRange, Row,
-    SourcePosition, SourceSeq, SplitInfo, TableChangeSet, TableSchema, upsert_schema,
+    CdcEvent, ColumnValue, ColumnValueType, Decimal, HaltReason, LogicalType, Op, PositionRange,
+    Row, SourcePosition, SourceSeq, SplitInfo, TableChangeSet, TableSchema, upsert_schema,
 };
 
 use crate::AccumulatorError;
@@ -84,16 +84,25 @@ pub(crate) fn row_bytes(values: &[ColumnValue]) -> usize {
 }
 
 /// Conform a source value to its column: the type must match (a mismatch means the buffer's schema
-/// is stale), and decimals are rescaled to the column's Arrow scale (Hop 2).
+/// is stale), and decimals are rescaled to the column's Arrow scale (Hop 2). A `bigint unsigned`
+/// becomes a decimal of scale 0 first, so it is rescaled and checked the same way; the Numeric arm
+/// takes a `UInt64` column too, for a buffered value a schema change conforms again.
 fn conform_value(
     v: ColumnValue,
     t: &ColumnValueType,
     logical: &LogicalType,
 ) -> Result<ColumnValue, Misfit> {
     match (v, t, logical) {
+        (ColumnValue::UInt64(u), ColumnValueType::UInt64, LogicalType::Decimal { .. }) => {
+            conform_value(
+                ColumnValue::Numeric(Decimal::new(i128::from(u), 0)),
+                t,
+                logical,
+            )
+        }
         (
             ColumnValue::Numeric(d),
-            ColumnValueType::Numeric { .. },
+            ColumnValueType::Numeric { .. } | ColumnValueType::UInt64,
             LogicalType::Decimal { precision, scale },
         ) => match d.rescale(*scale) {
             Ok(r) if r.precision() <= *precision => Ok(ColumnValue::Numeric(r)),
@@ -550,7 +559,7 @@ fn supersede(
 #[cfg(test)]
 mod tests {
     use data_avalanche_core::position::Lsn;
-    use data_avalanche_core::{ColumnSchema, ColumnValueType as V, Decimal, TableRef};
+    use data_avalanche_core::{ColumnSchema, ColumnValueType as V, TableRef};
 
     use super::*;
 
@@ -786,6 +795,82 @@ mod tests {
         assert_eq!(
             halt_code(b.apply(&event(Op::Insert, 3, None, Some(r)))),
             "NUMERIC_OVERFLOW"
+        );
+    }
+
+    /// A table `(id bigint key, n bigint unsigned)` whose `n` is stored as `logical`.
+    fn unsigned(logical: LogicalType) -> TableSchema {
+        let mut n = ColumnSchema::new("n", V::UInt64, "bigint unsigned");
+        n.logical = logical;
+        TableSchema::new(
+            TableRef::new("public", "t"),
+            vec![ColumnSchema::new("id", V::Int64, "bigint").not_null(), n],
+            vec!["id".into()],
+        )
+        .unwrap()
+    }
+
+    fn unsigned_row(seq: u64, n: u64) -> CdcEvent {
+        let r = Row(vec![
+            ("id".into(), ColumnValue::Int64(seq as i64)),
+            ("n".into(), ColumnValue::UInt64(n)),
+        ]);
+        event(Op::Insert, seq, None, Some(r))
+    }
+
+    fn decimal(precision: u8, scale: i8) -> LogicalType {
+        LogicalType::Decimal { precision, scale }
+    }
+
+    #[test]
+    fn an_unsigned_value_is_rescaled_to_its_decimal_column() {
+        let mut b = TableBuffer::new(unsigned(decimal(25, 2)), &[]).unwrap();
+        b.apply(&unsigned_row(1, 12345)).unwrap();
+        assert_eq!(
+            flush(&mut b)[0].values[1],
+            ColumnValue::Numeric(Decimal::new(1_234_500, 2)),
+            "12345, not 123.45"
+        );
+
+        let mut b = TableBuffer::new(unsigned(decimal(10, 0)), &[]).unwrap();
+        assert_eq!(
+            halt_code(b.apply(&unsigned_row(1, u64::MAX))),
+            "NUMERIC_OVERFLOW"
+        );
+
+        let canonical = TableSchema::new(
+            TableRef::new("public", "t"),
+            vec![
+                ColumnSchema::new("id", V::Int64, "bigint").not_null(),
+                ColumnSchema::new("n", V::UInt64, "bigint unsigned"),
+            ],
+            vec!["id".into()],
+        )
+        .unwrap();
+        assert_eq!(canonical.columns()[1].logical, decimal(20, 0));
+        let mut b = TableBuffer::new(canonical, &[]).unwrap();
+        b.apply(&unsigned_row(1, u64::MAX)).unwrap();
+        assert_eq!(
+            flush(&mut b)[0].values[1],
+            ColumnValue::Numeric(Decimal::new(i128::from(u64::MAX), 0))
+        );
+    }
+
+    #[test]
+    fn a_rescaled_unsigned_value_survives_a_schema_change() {
+        let mut b = TableBuffer::new(unsigned(decimal(25, 2)), &[]).unwrap();
+        b.apply(&unsigned_row(1, 12345)).unwrap();
+        b.set_schema(unsigned(decimal(30, 4)), &[]).unwrap();
+        b.apply(&unsigned_row(2, 7)).unwrap();
+        let rows = flush(&mut b);
+        assert_eq!(
+            rows[0].values[1],
+            ColumnValue::Numeric(Decimal::new(123_450_000, 4))
+        );
+        assert_eq!(
+            rows[1].values[1],
+            ColumnValue::Numeric(Decimal::new(70_000, 4)),
+            "every value of the column at one scale"
         );
     }
 
