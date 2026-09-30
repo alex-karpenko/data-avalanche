@@ -1,5 +1,5 @@
 ---
-updated: 2026-09-29
+updated: 2026-09-30
 domain: Architecture
 tags: [v1, implementation-plan, index, conventions]
 ---
@@ -14,11 +14,12 @@ This folder holds the plan for **building** v1. The design it implements is in `
 
 | File | What it is | Status |
 |---|---|---|
-| [`00-roadmap.md`](00-roadmap.md) | Master plan: planning decisions P-1…P-10, workspace layout, cross-crate interfaces, milestones M0–M12 with exit criteria, test/CI strategy, risks, spec edits S-A…S-M, implementation decisions D-IMPL-1…9 | Draft for review |
+| [`00-roadmap.md`](00-roadmap.md) | Master plan: planning decisions P-1…P-10, workspace layout, cross-crate interfaces, milestones M0–M12 with exit criteria, test/CI strategy, risks, spec edits S-A…S-P, implementation decisions D-IMPL-1…10 | Draft for review |
 | [`M0-foundations.md`](M0-foundations.md) | Detailed task plan for M0: workspace, CI, core domain types, all four position dialects, test infrastructure | Draft for review; code blocks compiled, and the test/clippy/integration results verified in a scratch crate on 2026-09-26 |
 | [`M1-configuration.md`](M1-configuration.md) | Detailed task plan for M1: the `data-avalanche-config` crate. Strict YAML parse, `${VAR}` and file resolution, §8 merge, all V-rules, the resolved config, the reload diff | **Landed 2026-09-28** on `feat/claude/impl-v1` (15 tasks, two review fix waves, owner follow-up batch FU-A…FU-E). The plan's "Deviations during execution" section lists where the code differs from its task blocks; the landed interface is roadmap §3.8 |
 | [`M2-storage-and-state.md`](M2-storage-and-state.md) | Detailed task plan for M2: `data-avalanche-storage` (backends with bounded timeouts, config §10 paths, `VersionedStore` CAS) and `data-avalanche-state` (versioned documents, leases, cluster anchor, config generations, per-pipeline and snapshot state), T1–T10 on every backend, `cloud.yml` | **Executed 2026-09-29** on `feat/claude/impl-v1`: 11 tasks, fix rounds on Tasks 3, 5 and 8, and one final-review fix wave. T1–T10 pass in memory and on RustFS, Azurite, real GCS, real S3 and real Azure (`cloud.yml` run 36604762684); every exit item is met. The plan's "Deviations during execution" section lists where the code differs from its task blocks; the landed interface is roadmap §3.5 |
-| `M3-…` … `M12-…` | One detailed plan per milestone | Written just before each milestone starts, from the interfaces that actually landed |
+| [`M3-core-data-path.md`](M3-core-data-path.md) | Detailed task plan for M3: the schema model and §7.2 classifier, Hop 2 Arrow schemas, `TableChangeSet` and the `Sink` trait (core); the in-memory reference sink (testkit); the accumulator in the new `data-avalanche-pipeline` (keep-last collapse, TOAST carry-forward, transactions and positions, flush policy, TRUNCATE and schema barriers, split commits); the collapse property tests | **Approved 2026-09-30**, with spec edits S-N, S-O, S-P (applied). All 13 tasks replayed test-first in a scratch workspace on 2026-09-29 (each fails, then matches the verified code and passes; 427 workspace tests), and the property tests were checked against six injected bugs |
+| `M4-…` … `M12-…` | One detailed plan per milestone | Written just before each milestone starts, from the interfaces that actually landed |
 
 ## How the plans are written and run
 

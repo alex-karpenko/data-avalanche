@@ -1,5 +1,5 @@
 ---
-updated: 2026-09-29
+updated: 2026-09-30
 domain: Architecture
 tags: [v1, implementation-plan, roadmap, milestones, workspace, crates, interfaces, test-strategy, ci, risks]
 sources: []
@@ -784,6 +784,14 @@ implements them.
 
 **S-M: approved and applied on 2026-09-28.** The M2 plan implements it (D-M2.12).
 
+| # | Spec | Change | From | Before |
+|---|---|---|---|---|
+| S-N | `Data-Flow.md` §Data Lineage Per Row, Phase 3 metadata list | `_seq` is fixed-width text that sorts like the source order (PG `XXXXXXXX/XXXXXXXX`, binlog `<10-digit file index>:<20-digit end_log_pos>`); `_lsn` is the commit position, untagged | Q-M3-2 | M3 |
+| S-O | `Schema_Change_Detection_and_Evolution.md` §7.2, §7.3 | Every non-identifier column is created nullable, identifier columns NOT NULL; `nullable → NOT NULL` and `NOT NULL → nullable` are Ignorable | Q-M3-4 | M3 |
+| S-P | `Data-Flow.md` Phase 4 §Position guard, Phase 3 oversized transactions | A split slice is skipped only when the stored position is strictly past its transaction's start; the rest of a split transaction goes out with the next regular flush | M3 D-M3.14 | M3 |
+
+**S-N, S-O, S-P: approved and applied on 2026-09-30.** The M3 plan implements them.
+
 `Type_Mapping.md` (research) still names `mysql-binlog-connector-rust` as the MySQL decoder, but
 `mysql_async` replaced it. That research-doc fix is applied (2026-09-26).
 
@@ -819,6 +827,7 @@ the naming below (2026-09-26).**
 | D-IMPL-7 | Product name **`data-avalanche`** everywhere: binary and crate family `data-avalanche` / `data-avalanche-*` (imports `data_avalanche_*`); Helm chart and image `data-avalanche`; metric prefix **`data_avalanche_`** (replaces the specified `cdc_`); Delta `app_id` **`data-avalanche/<pipeline_id>/owner`**; `commitInfo` keys and the Arrow field tag `data-avalanche.*` (`data-avalanche.committed_position`, `.owner_epoch`, `.pipeline`, `data-avalanche.logical`); internal column prefix **`__data_avalanche_`** (MERGE flag `__data_avalanche_del`); env vars `DATA_AVALANCHE_*`; test bucket `data-avalanche-test`, test object prefix `data-avalanche-it/` | Owner decision (2026-09-26); specs, research docs and this plan updated. Untouched: `prototypes/` (probe evidence as run) and the legacy gap report; Iceberg's `cdc.owner_epoch` table property is v2 and keeps its name until the Iceberg sink is planned | M0 |
 | D-IMPL-8 | M1 config rulings **D-M1.1…D-M1.15** (listed in `M1-configuration.md` §Decisions and rulings, each pinned by a test). Among them: `Leaf<T>` replaces §4 M1's `Resolvable<T>`; templates allowed in union discriminators; a defaults catalog `type` dropped when the pipeline picks a block; required fields without a V-rule reported as `PARSE`; V-069/V-087 have no failing input in v1; the validate endpoint never returns the resolved config. D-M1.5, D-M1.12 and D-M1.14 were changed at review (Q-M1-4…6) | The spec is silent on these; each choice is the one that keeps a hand-written config valid or safe | M1 — **approved 2026-09-27** |
 | D-IMPL-9 | M2 storage/state rulings **D-M2.1…D-M2.15** (listed in `M2-storage-and-state.md` §Decisions and rulings, each pinned by a test). Among them: `StoreError` is `Conflict` / `Contention` / `Transient` / `Permanent` with no `NotFound` (§3.5 now shows the landed interface); `Timeouts::COORDINATION` bounds a storage call to about 8 s; the lease tombstone keeps `owner_epoch`; config snapshots are the raw text under a content-addressed name with a `blake3:` hash | The specs and research docs are silent on these; each keeps the lease and state safe under races, hangs and hand-edited objects | M2 — **approved 2026-09-28** |
+| D-IMPL-10 | M3 core data-path rulings **D-M3.1…D-M3.18** (listed in `M3-core-data-path.md` §Decisions and rulings, each pinned by a test). Among them: unchanged TOAST fills from the row's previous image, under its old key after a key change; Hop 2 uses `Utf8`/`Binary` with 512 MiB batch rollover; a flush takes only complete transactions and covers `checkpoint..=frontier`; barriers return `FlushRequired` (seal → flush → apply); a split slice ends at its transaction's start and is guard-skipped only when the stored position is strictly past it | The specs are silent on these, or (D-M3.14) were wrong; the property tests prove replay convergence | M3 — **approved 2026-09-30** |
 
 ### 9.1 Questions answered at plan review (2026-09-26)
 
@@ -837,20 +846,14 @@ the naming below (2026-09-26).**
 | Q-M2-2 (2026-09-28) | How much of the lease is M2? | **The lease document and its CAS operations**, proven by T1–T10; the renewer, safety deadline and controller are M6/M8 | `M2-storage-and-state.md` |
 | Q-M2-3 (2026-09-28) | Where is M2 verified during planning? | **RustFS, Azurite and real GCS** (all passed 2026-09-28); real S3 and Azure at execution through `cloud.yml` | `M2-storage-and-state.md`, `test-infra/README.md` |
 | Q-M2-4 (2026-09-28) | Snapshot cursor shape? | **Defined in M2; each cursor key value is a JSON value**; M5/M7 convert it | `M2-storage-and-state.md` D-M2.12 |
+| Q-M3-1 (2026-09-29) | Shape of the unchanged-TOAST mask on `Row` | **A `ColumnValue::Unchanged` marker**; `Row` keeps its shape | `M3-core-data-path.md` D-M3.1 |
+| Q-M3-2 (2026-09-29) | `_seq` must sort in source order as text | **A fixed-width form for the `_seq` column only** (`SourceSeq::lineage_text`); `Display` stays canonical | `M3-core-data-path.md`; spec edit S-N |
+| Q-M3-3 (2026-09-29) | `Time(NaiveTime)` can't hold PG `24:00:00` or MySQL `TIME` intervals | **`ColumnValue::Time(i64)`, signed µs** | `M3-core-data-path.md`; `Type_Mapping.md` §Date/time edge values |
+| Q-M3-4 (2026-09-29) | Does the target keep the source's `NOT NULL`? | **No: identifier columns NOT NULL, every other column nullable** | `M3-core-data-path.md`; spec edit S-O |
 | Q-M9-1 | Snapshot-job persistence | **Persisted in the pipeline state location** (`snapshots/jobs/<job_id>.json`); listed after a restart or failover via `GET /v1/pipelines/{id}/snapshots`; a running job continues on the new owner from its chunk cursors | `Data-Flow.md` §On-Demand Snapshot + State Layout; System-Overview and API_RBAC endpoint tables |
 
 ### 9.2 Open questions (answer before the named milestone)
 
-- **Q-M3-1:** Shape of the PG unchanged-TOAST mask on `Row` (D-IMPL-3): a second field (breaks the
-  `Row(vec![..])` tuple constructor), a named-field struct, or a `ColumnValue::Unchanged` marker.
-- **Q-M3-2 (M0 final review I-1):** `_seq` must sort in source order as text, but `SourceSeq`'s
-  `Display` (PG `X/Y` unpadded, binlog `NNNNNN:pos`) doesn't (`"0/9" > "0/10"`). Proposal: a fixed-width
-  column form (`{:08X}/{:08X}`, `{:010}:{:020}`) for the `_seq` column only, keeping the canonical
-  `Display`; Data-Flow §Data Lineage states it (spec edit).
-- **Q-M3-3 (M0 final review I-2):** `ColumnValue::Time(NaiveTime)` can't hold PG `time` `24:00:00` or
-  MySQL/MariaDB `TIME` (an elapsed time, −838:59:59…838:59:59). Options: `Time(i64 µs)` plus edge rules
-  in Type_Mapping, or a halt/string rule for out-of-day values. (Delta has no `time` type; it maps to
-  string there.)
 - Recorded for later plans: M7 — the decoder validates `gno >= 1` before `GtidSet::insert` (anonymous
   GTID events carry 0, and `insert_range` panics on 0). The two M1 items are settled in M1 Task 1
   (2026-09-27): `MAX_LIST_DEPTH = 8` for `list<T>`, and the public-API convention (root re-exports,
