@@ -609,6 +609,7 @@ dependencies = [
  "arrow-array",
  "arrow-row",
  "arrow-schema",
+ "async-trait",
  "proptest",
  "serde",
  "serde_json",
