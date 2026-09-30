@@ -146,7 +146,7 @@ the arrow.
 | Q-M4-5 | delta-kernel (delta-rs and DuckDB) decodes a table's path twice, so M2's `%XX` escape breaks any table named with `%`, `/`, a control character, `.`/`..`, or the schema `.pipeline-state` | **Table roots escape with `~XX`**: `%`, `/`, `~` and control characters per UTF-8 byte, `.`/`..` as `~2E`, the schema `.pipeline-state` as `~2Epipeline-state`. State keys and snapshot file names keep `%XX` (D-M2.4 stands for them). No released tables exist, so nothing migrates |
 | Q-M4-6 | DuckDB 1.5.6 can't open a Delta table whose path has non-ASCII text (it drops that segment when opening data files); delta-rs can | **Keep non-ASCII names verbatim.** The operator docs (M11, R-12) list DuckDB's limit with the engines checked |
 
-**Rulings where the specs are silent** (each is pinned by a test):
+**Rulings where the specs are silent** (each is pinned by a test). **Plan approved 2026-09-30**, with these rulings (roadmap D-IMPL-11):
 
 | # | Ruling | Why | Pinned by |
 |---|---|---|---|
@@ -166,8 +166,8 @@ the arrow.
 | D-M4.14 | `DeltaStats` counts commits, skips, fences, retries and the MERGE metrics (rows inserted, updated, deleted, copied; files added, removed); M10 exports them. `merge_memory_limit` bounds DataFusion's memory for one MERGE. A MERGE over it fails `Transient` ("Resources exhausted") instead of growing the process. There is no config key for it yet: M6 sets it, and `None` means no ceiling | Data-Flow §Delta item 4 metrics; R-6 | Task 7, Task 9, Task 10 |
 | D-M4.15 | Calls on one table run one at a time (a per-table async mutex); different tables run concurrently | The handle caches the last own version; two commits to one table from one sink would race each other for nothing | Task 9 |
 
-**Documents this plan changes** (applied with the plan commit once it is approved, in a
-`research:` commit and an `infra:` commit):
+**Documents this plan changes** (applied at plan approval, 2026-09-30, in a `research:` commit and
+an `infra:` commit; `test-infra/README.md` changes in Task 13):
 
 - `Type_Mapping.md` §Date/time edge values and Hop 3b: the Delta clamp (Q-M4-2); `time`/`uuid` as
   text, the three `timestamp_ntz` forms; a negative decimal scale is refused at Hop 3b, and M5 widens
@@ -6093,8 +6093,8 @@ failure and every count above is that replay's output. Measured along the way:
   `object_store` 0.13.2). R-13 foresaw this, and the CI step is non-blocking. `deltalake` 1.1.0
   still requires `object_store ^0.13.2`, so no release fixes it yet. It also warns that
   `proc-macro-error2` (via deltalake-core's `validator`) is unmaintained.
-- **Real GCS:** Oleksii runs Task 12's GCS case before approval (it needs his credentials), and PR
-  CI runs it on every push.
+- **Real GCS:** Task 12's GCS case passes on the CI bucket (run by Oleksii, 2026-09-30, 184 s), and
+  PR CI runs it on every push.
 
 ## M4 exit checklist
 
