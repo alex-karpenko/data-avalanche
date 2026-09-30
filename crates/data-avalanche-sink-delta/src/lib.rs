@@ -3,7 +3,13 @@
 
 mod config;
 pub mod convert;
+mod error;
 pub mod marker;
+#[allow(dead_code)] // `DeltaSink` (Task 9) is the caller
+mod table;
+#[cfg(test)]
+mod test_support;
 pub mod types;
 
 pub use config::{DeltaLocation, DeltaSinkConfig, NtzAs, TableDefaults};
+pub use table::IDENTIFIER_KEY;
