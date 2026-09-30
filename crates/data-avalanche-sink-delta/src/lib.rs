@@ -4,6 +4,8 @@
 mod config;
 pub mod convert;
 mod error;
+#[allow(dead_code)] // `DeltaSink` (Task 9) is the caller
+mod evolve;
 pub mod marker;
 #[allow(dead_code)] // `DeltaSink` (Task 9) is the caller
 mod table;
