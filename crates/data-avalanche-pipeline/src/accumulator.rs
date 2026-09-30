@@ -463,6 +463,28 @@ mod tests {
     }
 
     #[test]
+    fn a_position_of_another_dialect_is_a_position_error() {
+        let t0 = Instant::now();
+        let mut a = acc(FlushPolicy::default());
+        let binlog = SourcePosition::parse_tagged("binlog:b.000001:9").unwrap();
+        let is_position =
+            |r: Result<(), AccumulatorError>| matches!(r, Err(AccumulatorError::Position(_)));
+        assert!(is_position(a.keepalive(&binlog, t0)));
+        a.begin(1).unwrap();
+        let foreign = TransactionBoundary {
+            xid: 1,
+            commit_pos: binlog,
+            commit_ts_micros: 1,
+        };
+        assert!(is_position(a.commit(&foreign, t0)));
+        assert!(
+            a.in_transaction(),
+            "a rejected commit leaves the transaction open"
+        );
+        assert_eq!(a.frontier(), &lsn(100), "the frontier didn't move");
+    }
+
+    #[test]
     fn keepalives_advance_the_frontier_between_transactions() {
         let t0 = Instant::now();
         let mut a = acc(only_time(30));

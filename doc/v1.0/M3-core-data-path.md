@@ -220,9 +220,14 @@ record. In order:
   `every_scalar_type_builds_its_arrow_array_and_null_is_null`, builds each one and checks its value
   and its NULL. It was mutation-checked: it fails when the float32 builder drops its values. No
   later task touches `batch.rs`.
-- **Test counts.** Because of the two tests above, `data-avalanche-pipeline` ends up with more unit
-  tests than the tasks' Expected lines say: 14 after T8, 21 after T9, then 31, 39, 42, 42 for
-  T10–T13. The workspace total ends two above the plan's 427.
+- **T10, review follow-up (owner's ruling).** No test fed the accumulator a position of another
+  dialect. A new test, `a_position_of_another_dialect_is_a_position_error`, covers a keep-alive and
+  a commit with a binlog position after a PostgreSQL `resume_from`. Each is
+  `AccumulatorError::Position`, the transaction stays open and the frontier stays put. It was
+  mutation-checked: it fails when the position error is swallowed.
+- **Test counts.** Because of the three tests above, `data-avalanche-pipeline` ends up with more
+  unit tests than the tasks' Expected lines say: 14 after T8, 21 after T9, 32 after T10, then 40,
+  43, 43 for T11–T13. The workspace total ends three above the plan's 427.
 
 ---
 
