@@ -194,6 +194,10 @@ impl CommitMarker {
 pub struct SinkTableState {
     /// The sink has the table (Delta: a `_delta_log`; Iceberg: a catalog entry).
     pub exists: bool,
+    /// The table's columns in Hop 2 terms, as the reference sink reports them: the Arrow schema it
+    /// was created with ([`upsert_schema`]: source columns tagged with their logical type, then the
+    /// lineage columns), plus every column `evolve` added. Soft-dropped columns stay. Not the
+    /// sink's physical (Hop 3) types.
     pub schema: Option<SchemaRef>,
     /// The marker of the latest commit this pipeline made to the table.
     pub marker: Option<CommitMarker>,
@@ -250,6 +254,13 @@ impl SinkError {
 /// One table format (Multi_Sink §6.3). Every method is per table; `commit` is atomic per table,
 /// idempotent under replay, and applies the fence ([`CommitMarker::fences`]) before the guard
 /// ([`CommitMarker::covers`]).
+///
+/// The reference sink (testkit `MemorySink`) implements this contract and a real sink must match
+/// it (Data-Flow Phase 4):
+/// - A change set's columns may be a subset of the table's: after a soft-drop, or on a replay from
+///   before an ADD COLUMN. A table column missing from the set is written NULL.
+/// - A masked cell (the set's unchanged mask is `true`) keeps the stored value. On a row the table
+///   doesn't have, it takes the set's value, which is NULL.
 #[async_trait]
 pub trait Sink: Send + Sync {
     fn kind(&self) -> SinkKind;
@@ -262,6 +273,15 @@ pub trait Sink: Send + Sync {
         table: &TableRef,
         delta: &SchemaDelta,
     ) -> Result<EvolveOutcome, SinkError>;
+    /// Commits one change set, in this order:
+    /// 1. [`TableChangeSet::validate`] ([`SinkError::InvalidChangeSet`]);
+    /// 2. refuse a marker whose `committed_position` isn't `cs.position.end`;
+    /// 3. [`SinkError::NoTable`] when the table is absent;
+    /// 4. the fence, then the guard, against the stored marker: a [`CommitOutcome::Fenced`] or
+    ///    [`CommitOutcome::SkippedCovered`] commit changes nothing;
+    /// 5. every column of the set must be in the table with the same type;
+    /// 6. apply, as one table version: the truncate clear, then the deletes, then the upserts;
+    /// 7. store the marker with the **union** of the prior stored position and the new one.
     async fn commit(
         &self,
         cs: TableChangeSet,
