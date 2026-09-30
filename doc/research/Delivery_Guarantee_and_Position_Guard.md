@@ -1,5 +1,5 @@
 ---
-updated: 2026-09-26
+updated: 2026-09-30
 domain: Data Flow
 tags: [delivery-guarantee, exactly-once, gtid, lsn, idempotency, checkpoint, multi-table, cdc]
 resolves: [G-14]
@@ -85,7 +85,9 @@ into the GTID set; `union`/`covers` handle multiple UUIDs naturally.
 - **Per-table high-water mark.** Each Iceberg table's snapshot summary carries its own
   `cdc.committed_position`. The guard compares a flush's per-table position against that table's
   **latest own** marker (below): if `table.committed_position.covers(flush.position_for_table)` →
-  already committed, skip writing that table.
+  already committed, skip writing that table. A split-commit slice is the exception: its range
+  ends at its transaction's pinned start, so it is skipped only when the stored position is
+  **strictly past** that start (`Large_Transaction_Handling.md` §1; spec edit S-P).
 - **"Latest own", not "latest" (DA-X-10, 2026-09-26).** Foreign commits (external compaction,
   `expire_snapshots`, other engines) produce snapshots without `cdc.*` properties. The guard walks the
   snapshot log back to the newest snapshot whose summary carries `cdc.pipeline = <pipeline_id>` and

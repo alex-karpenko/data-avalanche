@@ -1,5 +1,5 @@
 ---
-updated: 2026-06-20
+updated: 2026-09-30
 domain: Data Flow
 tags: [large-transaction, flush, atomicity, memory, backpressure, split-commit, idempotency, cdc]
 resolves: [G-29]
@@ -52,6 +52,21 @@ restart the stream **replays the entire transaction**. The already-flushed slice
 **idempotent upserts** (keep-last by `_seq`, equality-delete keyed) — re-writing the same rows
 produces the identical table state. No duplicates, no loss. The only externally observable effect is
 that a concurrent reader may briefly see a **partially-applied** large transaction.
+
+**The position guard for a slice (D-M3.14, `doc/v1.0/M3-core-data-path.md`; spec edit S-P,
+2026-09-30).** A slice's range ends at the pinned transaction start, and from the first slice on the
+table's stored `committed_position` equals that start. The ordinary guard ("the stored position
+covers the end → skip") would therefore skip every slice after the first: **data loss**. Never
+guarding slices is wrong too: on a replay after the transaction and later commits have landed, a
+slice would roll its rows back to their state inside the transaction, and the later commits would
+then be guard-skipped. The rule is: **skip a slice only when the stored position is strictly past
+its transaction's start** (the commit, or a later one, has landed). Every skip decision is then
+monotone in stream order, and a replay from any checkpoint converges; the M3 property tests prove it,
+and fail with either of the other two rules.
+
+**After the last slice.** What the transaction writes after its last slice needs no "last slice"
+marker: it goes out with the next regular flush, whose range ends at the commit, under the ordinary
+guard. That flush may also carry later transactions.
 
 ### What is given up, stated honestly
 

@@ -1,5 +1,5 @@
 ---
-updated: 2026-09-26
+updated: 2026-09-30
 domain: Architecture
 tags: [sink, multi-sink, delta-lake, delta-rs, iceberg, merge, upsert, capabilities, configuration, arrow]
 resolves: [DA-SINK-1, DA-X-5, DA-X-3]
@@ -383,8 +383,10 @@ D-MS.5 is accepted, **changelog mode** ships on the current crate (append `I/U/D
   used only for pruning, not routing.
 - Snapshot chunks: upserts like any other change set. Keyset chunks are key-ordered, so file stats
   prune well — chunk MERGEs mostly touch zero or few existing files (🧪 P6).
-- Split commits (`Large_Transaction…`): unchanged — each slice is an idempotent MERGE; the checkpoint
-  pin lives in pipeline state, not in the sink.
+- Split commits (`Large_Transaction…`): each slice is an idempotent MERGE; the checkpoint pin lives
+  in pipeline state, not in the sink. The position guard skips a slice only when the stored position
+  is strictly past its transaction's start (`Large_Transaction…` §1, spec edit S-P); the shared rule
+  is `CommitMarker::covers` in core.
 
 **Table creation defaults (proposed; revised 2026-09-26 by probe P7b):** writer features
 `appendOnly=false`, column mapping **off** (`none`) — *originally proposed `name` to future-proof
@@ -402,7 +404,7 @@ the one evolution op the Delta sink supports*,
 | RENAME proven (Safe) | rename_column (field ID kept) | **Degraded**: add new column; soft-drop old; warn (history under old name) |
 | RENAME unprovable (Safe-degraded) | drop + add | add new + soft-drop old; warn |
 | Type widen in Iceberg set (Safe) | update_column | **Unsupported → halt** (no type widening in delta-rs) |
-| nullable → NOT NULL (Unsafe) | halt | halt |
+| nullable → NOT NULL (Ignorable, S-O 2026-09-30) | none | none (target columns are always nullable) |
 | NOT NULL → nullable | (n/a today: Ignorable) | `drop_column_not_null` if the Delta column was NOT NULL (we create all non-identifier columns nullable, so usually no-op) |
 | PK / replica-identity change (Unsafe) | halt | halt |
 | Everything else Unsafe/Ignorable | as today | as today |

@@ -1,5 +1,5 @@
 ---
-updated: 2026-09-26
+updated: 2026-09-30
 domain: Data Types
 tags: [data-types, mapping, arrow, iceberg, delta-lake, multi-sink, postgres, mysql, cdc]
 resolves: G-18
@@ -71,7 +71,7 @@ ColumnValue = Null
             | Bytes(Vec<u8>)
             | Timestamp { value: DateTime<Utc>, with_tz: bool }  // ➕ Gap A fixed
             | Date(NaiveDate)
-            | Time(NaiveTime)                         // ➕ Gap D: TIME columns (PG + MySQL)
+            | Time(NaiveTime)                         // ➕ Gap D: TIME columns (PG + MySQL); landed as Time(i64), Q-M3-3
             | Uuid(Uuid)
             | Json(serde_json::Value)
             | Array { element_type: ColumnValueType, values: Vec<ColumnValue> }  // ➕ Gap B fixed
@@ -120,7 +120,7 @@ Column type information arrives via the pgoutput **Relation** message (OID per c
 | `text` | 25 | `Text(String)` | `Utf8` | `string` | |
 | `"char"` (single-byte internal) | 18 | `Int16(i16)` | `Int8` | `int` | Internal PG type; rare in user tables |
 | `name` | 19 | `Text(String)` | `Utf8` | `string` | Internal PG type; max 63 bytes |
-| `bytea` | 17 | `Bytes(Vec<u8>)` | `LargeBinary` | `binary` | |
+| `bytea` | 17 | `Bytes(Vec<u8>)` | `Binary` | `binary` | |
 | `oid` | 26 | `Int64(i64)` | `Int64` | `long` | Technically u32; widened to avoid sign issues |
 
 ### Date and Time Types
@@ -128,7 +128,7 @@ Column type information arrives via the pgoutput **Relation** message (OID per c
 | PostgreSQL Type | OID | ColumnValue Variant | Arrow DataType | Iceberg Type | Notes |
 |----------------|-----|--------------------|--------------|-----------|----|
 | `date` | 1082 | `Date(i32)` | `Date32` | `date` | Days since Unix epoch; `±infinity` clamps (see Date/time edge values) |
-| `time` | 1083 | `Time(NaiveTime)` | `Time64(Microsecond)` | `time` | Microseconds since midnight |
+| `time` | 1083 | `Time(i64)` | `Time64(Microsecond)` | `time` | Signed microseconds; `24:00:00` is 86 400 000 000 (see Date/time edge values) |
 | `timetz` / `time with time zone` | 1266 | `Text(String)` | `Utf8` | `string` | ⚠ No Arrow/Iceberg equivalent; serialized as ISO-8601 |
 | `timestamp` | 1114 | `Timestamp { value, with_tz: false }` | `Timestamp(Microsecond, None)` | `timestamp` | No timezone; microsecond precision |
 | `timestamptz` / `timestamp with time zone` | 1184 | `Timestamp { value, with_tz: true }` | `Timestamp(Microsecond, Some("UTC"))` | `timestamptz` | PG always stores UTC internally |
@@ -170,12 +170,12 @@ via SQL `LIKE` and `CAST` in engines like Spark or Trino.
 | `uuid` | 2950 | `Uuid(Uuid)` | `FixedSizeBinary(16)` | `uuid` | Stored as 16 raw bytes; iceberg-rust maps `FixedSizeBinary(16)` → `uuid` |
 | `json` | 114 | `Json(serde_json::Value)` | `Utf8` | `string` | Serialized as compact JSON string |
 | `jsonb` | 3802 | `Json(serde_json::Value)` | `Utf8` | `string` | Semantically same as json after decode |
-| `bit(n)` | 1560 | `Bytes(Vec<u8>)` | `FixedSizeBinary(⌈n/8⌉)` | `fixed(⌈n/8⌉)` | MSB-first packed |
-| `varbit(n)` | 1562 | `Bytes(Vec<u8>)` | `LargeBinary` | `binary` | Length-prefixed |
+| `bit(n)` | 1560 | `Bytes(Vec<u8>)` | `Binary` | `fixed(⌈n/8⌉)` | MSB-first packed |
+| `varbit(n)` | 1562 | `Bytes(Vec<u8>)` | `Binary` | `binary` | Length-prefixed |
 | User-defined `ENUM` | varies | `Text(String)` | `Utf8` | `string` | pgoutput sends the label string, not the OID index |
 | `hstore` | 16935 (ext) | `Json(serde_json::Value)` | `Utf8` | `string` | Decoded as `{"key":"val"}` JSON object |
 | `any[]` (array of type T) | varies | `Array { element_type, values }` | `List<T_arrow>` | `list<T_iceberg>` | Element type resolved from OID; nested arrays supported recursively |
-| PostGIS `geometry` / `geography` | ext | `Bytes(Vec<u8>)` | `LargeBinary` | `binary` | WKB (Well-Known Binary) format |
+| PostGIS `geometry` / `geography` | ext | `Bytes(Vec<u8>)` | `Binary` | `binary` | WKB (Well-Known Binary) format |
 | Composite / user-defined | varies | `Text(String)` | `Utf8` | `string` | Serialized as `(f1,f2,...)` PG text; ⚠ consider `Bytes` for non-UTF data |
 
 ### PostgreSQL-Specific Decision Notes
@@ -251,25 +251,25 @@ When disabled, `TINYINT(1)` maps as `TINYINT SIGNED` → `Int16`.
 | `TINYTEXT` | `Text(String)` | `Utf8` | `string` | Max 255 bytes |
 | `TEXT` | `Text(String)` | `Utf8` | `string` | Max 65,535 bytes |
 | `MEDIUMTEXT` | `Text(String)` | `Utf8` | `string` | Max 16 MiB |
-| `LONGTEXT` | `Text(String)` | `LargeUtf8` | `string` | Max 4 GiB; `LargeUtf8` for 64-bit offset |
+| `LONGTEXT` | `Text(String)` | `Utf8` | `string` | Max 4 GiB at the server, but a replicated value is at most 1 GiB (`max_allowed_packet`); batches roll over instead of `LargeUtf8` (see Arrow widths at Hop 2) |
 
 ### Binary Types
 
 | MySQL Type | ColumnValue | Arrow DataType | Iceberg Type | Notes |
 |-----------|------------|--------------|-----------|-------|
-| `BINARY(n)` | `Bytes(Vec<u8>)` | `FixedSizeBinary(n)` | `fixed(n)` | Right-padded with `\0` |
-| `VARBINARY(n)` | `Bytes(Vec<u8>)` | `LargeBinary` | `binary` | |
-| `TINYBLOB` | `Bytes(Vec<u8>)` | `LargeBinary` | `binary` | Max 255 bytes |
-| `BLOB` | `Bytes(Vec<u8>)` | `LargeBinary` | `binary` | |
-| `MEDIUMBLOB` | `Bytes(Vec<u8>)` | `LargeBinary` | `binary` | |
-| `LONGBLOB` | `Bytes(Vec<u8>)` | `LargeBinary` | `binary` | Max 4 GiB |
+| `BINARY(n)` | `Bytes(Vec<u8>)` | `Binary` | `fixed(n)` | Right-padded with `\0` |
+| `VARBINARY(n)` | `Bytes(Vec<u8>)` | `Binary` | `binary` | |
+| `TINYBLOB` | `Bytes(Vec<u8>)` | `Binary` | `binary` | Max 255 bytes |
+| `BLOB` | `Bytes(Vec<u8>)` | `Binary` | `binary` | |
+| `MEDIUMBLOB` | `Bytes(Vec<u8>)` | `Binary` | `binary` | |
+| `LONGBLOB` | `Bytes(Vec<u8>)` | `Binary` | `binary` | Max 4 GiB |
 
 ### Date and Time Types
 
 | MySQL Type | ColumnValue | Arrow DataType | Iceberg Type | Notes |
 |-----------|------------|--------------|-----------|-------|
 | `DATE` | `Date(i32)` | `Date32` | `date` | `0000-00-00` → NULL; zero-in-part / invalid dates halt the table (see Date/time edge values) |
-| `TIME[(fsp)]` | `Time(NaiveTime)` | `Time64(Microsecond)` | `time` | `fsp` 0–6; normalize to microseconds |
+| `TIME[(fsp)]` | `Time(i64)` | `Time64(Microsecond)` | `time` | `fsp` 0–6; an elapsed time, −838:59:59…838:59:59, as signed microseconds (see Date/time edge values) |
 | `DATETIME[(fsp)]` | `Timestamp { value, with_tz: false }` | `Timestamp(Microsecond, None)` | `timestamp` | No timezone; MySQL stores as-is |
 | `TIMESTAMP[(fsp)]` | `Timestamp { value, with_tz: true }` | `Timestamp(Microsecond, Some("UTC"))` | `timestamptz` | MySQL converts to UTC on write; returned as UTC |
 | `YEAR` | `Int32(i32)` | `Int32` | `int` | 4-digit year integer (1901..2155); 0000 is also valid |
@@ -281,9 +281,9 @@ When disabled, `TINYINT(1)` maps as `TINYINT SIGNED` → `Int16`.
 | `JSON` | `Json(serde_json::Value)` | `Utf8` | `string` | MySQL's binary JSON decoded to value, serialized as string |
 | `ENUM('a','b',...)` | `Text(String)` | `Utf8` | `string` | Binlog TABLE_MAP carries member list; decode integer index to label |
 | `SET('a','b',...)` | `Array { element_type: TextType, values }` | `List<Utf8>` | `list<string>` | Binlog carries bitmask; decode to list of active member labels |
-| `BIT(N)` | `Bytes(Vec<u8>)` | `FixedSizeBinary(⌈N/8⌉)` | `fixed(⌈N/8⌉)` | MSB-first packed bits; N ∈ 1..64 |
-| `GEOMETRY` | `Bytes(Vec<u8>)` | `LargeBinary` | `binary` | WKB format |
-| `POINT`, `LINESTRING`, `POLYGON`, `MULTIPOINT`, `MULTILINESTRING`, `MULTIPOLYGON`, `GEOMETRYCOLLECTION` | `Bytes(Vec<u8>)` | `LargeBinary` | `binary` | WKB format |
+| `BIT(N)` | `Bytes(Vec<u8>)` | `Binary` | `fixed(⌈N/8⌉)` | MSB-first packed bits; N ∈ 1..64 |
+| `GEOMETRY` | `Bytes(Vec<u8>)` | `Binary` | `binary` | WKB format |
+| `POINT`, `LINESTRING`, `POLYGON`, `MULTIPOINT`, `MULTILINESTRING`, `MULTIPOLYGON`, `GEOMETRYCOLLECTION` | `Bytes(Vec<u8>)` | `Binary` | `binary` | WKB format |
 
 ---
 
@@ -320,6 +320,13 @@ column, raw value and binlog position, and gives the remedy: set
 such as `1980-00-00` usually means "year known, month/day unknown", so no silent conversion
 (clamp or NULL) is applied.
 
+**`time` — signed microseconds (Q-M3-3, decided 2026-09-29).** `ColumnValue::Time(i64)` holds
+signed microseconds of elapsed time, so both engines' full ranges fit without clamping: PostgreSQL
+`time` is `0…86 400 000 000` (`24:00:00` included), MySQL/MariaDB `TIME` is an interval of
+−838:59:59…838:59:59. Arrow `Time64(Microsecond)` holds any `i64`. Delta has no `time` type: Hop 3b
+writes `time_text`'s `[-]HH:MM:SS.ffffff` (`24:00:00.000000`, `838:59:59.000000`,
+`-01:30:00.500000`), which keeps out-of-day values.
+
 ## Unsupported Type Policy
 
 Any column type encountered that is not in the tables above follows this priority chain:
@@ -328,13 +335,13 @@ Any column type encountered that is not in the tables above follows this priorit
 1. If a per-column override is configured (tables.column_type_overrides):
       → apply the override mapping
 2. If the type is a PG array of an unsupported element type:
-      → store as Text(String) → LargeUtf8 → Iceberg string
+      → store as Text(String) → Utf8 → Iceberg string
          (PG text representation of the array, e.g. `{a,b,c}`)
 3. If the type's wire encoding is textual (most PG types support text output):
       → Text(String) → Utf8 → Iceberg string
          log WARN: "column <name> type <type> has no native mapping; stored as string"
 4. If the type's wire encoding is binary-only with no text fallback:
-      → Bytes(Vec<u8>) → LargeBinary → Iceberg binary
+      → Bytes(Vec<u8>) → Binary → Iceberg binary
          log WARN: "column <name> type <type> stored as raw bytes"
 5. If neither is possible (type decode error):
       → halt the column (treat as NULL for all events); log ERROR
@@ -358,7 +365,14 @@ Arrow type does not determine the intended type on its own. The same vocabulary 
 Tags actually attached by Hop 2: `uuid` (FixedSizeBinary(16)), `time`, `json` (Utf8), `timestamp_tz` /
 `timestamp_ntz` (explicit, because Iceberg `timestamp` = *without* tz while Delta `timestamp` = *with*
 tz), `uint64` provenance on `Decimal128(20,0)` (informational), `enum` / `set` provenance on Utf8 /
-List<Utf8> (informational).
+List<Utf8> (informational; attached once the MySQL decoder lands, M7).
+
+**Arrow widths at Hop 2 (D-M3.5, `doc/v1.0/M3-core-data-path.md`).** Every byte column is `Binary` and
+every text column `Utf8`, never the `Large*` types; `FixedSizeBinary(16)` is used only for `uuid`.
+A value is at most 1 GiB (the PostgreSQL and MySQL limits), and the accumulator rolls a batch over
+before its rows reach 512 MiB, so a column stays under the `i32` offsets. Fixed-width source types
+(`BINARY(n)`, `bit(n)`, `BIT(N)`) are `Binary` in Arrow; the Iceberg `fixed(n)` in the tables above is
+chosen from the source type at Hop 3a (v2).
 
 ## Hop 3a: Arrow → Iceberg Type Mapping (via iceberg-rust)
 
