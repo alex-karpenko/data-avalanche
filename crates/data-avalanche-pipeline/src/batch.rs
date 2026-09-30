@@ -436,6 +436,84 @@ mod tests {
     }
 
     #[test]
+    fn every_scalar_type_builds_its_arrow_array_and_null_is_null() {
+        use ColumnValue as C;
+        use arrow_array::types::{
+            Date32Type, Float32Type, Float64Type, Int16Type, Int32Type as I32,
+        };
+        let schema = TableSchema::new(
+            TableRef::new("public", "s"),
+            vec![
+                ColumnSchema::new("id", V::Int64, "bigint").not_null(),
+                ColumnSchema::new("b", V::Bool, "boolean"),
+                ColumnSchema::new("i16", V::Int16, "smallint"),
+                ColumnSchema::new("i32", V::Int32, "integer"),
+                ColumnSchema::new("f32", V::Float32, "real"),
+                ColumnSchema::new("f64", V::Float64, "double precision"),
+                ColumnSchema::new("d", V::Date, "date"),
+                ColumnSchema::new("bin", V::Bytes, "bytea"),
+                ColumnSchema::new("ts", V::Timestamp { with_tz: false }, "timestamp"),
+            ],
+            vec!["id".into()],
+        )
+        .unwrap();
+        let row = |id: i64, values: Vec<C>| CollapsedRow {
+            kind: RowKind::Upsert,
+            values: std::iter::once(C::Int64(id)).chain(values).collect(),
+            op: Op::Insert,
+            commit_ts_micros: 5,
+            position: SourcePosition::Pg(Lsn(0x10)),
+            seq: SourceSeq::Pg(Lsn(id as u64)),
+        };
+        let rows = vec![
+            row(
+                1,
+                vec![
+                    C::Bool(true),
+                    C::Int16(-2),
+                    C::Int32(3),
+                    C::Float32(1.5),
+                    C::Float64(-2.25),
+                    C::Date(-1),
+                    C::Bytes(vec![0, 255]),
+                    C::Timestamp {
+                        micros: 7,
+                        with_tz: false,
+                    },
+                ],
+            ),
+            row(2, vec![C::Null; 8]),
+        ];
+        let (up, _) = build(&schema, &[0], rows, &lineage(), MAX_BATCH_BYTES);
+        let b = &up[0];
+        assert_eq!(
+            b.schema(),
+            upsert_schema(&schema),
+            "each array has its field's type"
+        );
+        let col = |name: &str| b.column_by_name(name).unwrap();
+        assert!(col("b").as_boolean().value(0));
+        assert_eq!(col("i16").as_primitive::<Int16Type>().value(0), -2);
+        assert_eq!(col("i32").as_primitive::<I32>().value(0), 3);
+        assert_eq!(col("f32").as_primitive::<Float32Type>().value(0), 1.5);
+        assert_eq!(col("f64").as_primitive::<Float64Type>().value(0), -2.25);
+        assert_eq!(col("d").as_primitive::<Date32Type>().value(0), -1);
+        assert_eq!(col("bin").as_binary::<i32>().value(0), [0, 255]);
+        assert_eq!(
+            col("ts")
+                .as_primitive::<TimestampMicrosecondType>()
+                .value(0),
+            7
+        );
+        for name in ["b", "i16", "i32", "f32", "f64", "d", "bin", "ts"] {
+            assert!(
+                col(name).is_null(1),
+                "a NULL cell of {name} is an Arrow null"
+            );
+        }
+    }
+
+    #[test]
     fn no_rows_no_batches() {
         assert_eq!(built(vec![], MAX_BATCH_BYTES), (vec![], vec![]));
     }

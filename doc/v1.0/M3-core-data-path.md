@@ -212,10 +212,17 @@ record. In order:
   changed, the old row stayed in the mirror. Now it halts `NULL_IDENTIFIER`, before anything is
   buffered. A valid setup can't produce this event (config §11.2 checks that identifier ⊆
   REPLICA IDENTITY), so the halt is defense in depth. There is one new test,
-  `an_update_whose_before_image_lacks_the_key_halts`. From T8 on, `data-avalanche-pipeline` has
-  one more unit test than each task's Expected line says (14, 20, 30, 38, 41, 41), and the
-  workspace has one more than the plan's 427. The change was replayed on the verified T13 code,
-  where the unit and property tests still pass.
+  `an_update_whose_before_image_lacks_the_key_halts`. The change was replayed on the verified T13
+  code, where the unit and property tests still pass.
+- **T9, review follow-up (owner's ruling).** The batch tests left some Hop 2 types without a test:
+  bool, int16, int32 as a scalar, float32, float64, date, binary and a timestamp without a zone.
+  None of them had a test for a plain NULL cell either. A new test,
+  `every_scalar_type_builds_its_arrow_array_and_null_is_null`, builds each one and checks its value
+  and its NULL. It was mutation-checked: it fails when the float32 builder drops its values. No
+  later task touches `batch.rs`.
+- **Test counts.** Because of the two tests above, `data-avalanche-pipeline` ends up with more unit
+  tests than the tasks' Expected lines say: 14 after T8, 21 after T9, then 31, 39, 42, 42 for
+  T10–T13. The workspace total ends two above the plan's 427.
 
 ---
 
