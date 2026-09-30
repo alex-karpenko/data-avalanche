@@ -1,7 +1,7 @@
 ---
-updated: 2026-06-13
+updated: 2026-09-30
 domain: Architecture
-tags: [architecture, schema-evolution, ddl, cdc, postgresql, mysql, iceberg, arrow]
+tags: [architecture, schema-evolution, ddl, cdc, postgresql, mysql, iceberg, delta-lake, multi-sink, arrow]
 status: design reviewed & approved — unified trigger→augment→diff model
 sources:
   - https://www.postgresql.org/docs/18/logical-replication.html
@@ -20,7 +20,7 @@ Design for handling source-side DDL in the CDC pipeline, for **PostgreSQL logica
 replication (pgoutput)** and **MySQL binlog (ROW format, GTID)**. Feeds the design work
 tracked as **G-19** (DDL safe/unsafe classification), **G-19a** (MySQL DDL handling) and the
 open questions **OQ-DT2 / OQ-DT3**. It assumes the Phase 2–4 flow in `Data-Flow.md` and
-updates the `catalog.schema_evolution` contract in `Configuration_Specification.md` §9.5.1
+updates the `schema_evolution` contract in `Configuration_Specification.md` §9.7 (formerly `catalog.schema_evolution`, §9.5.1)
 (see §10–§11: the `method` field is removed).
 
 ---
@@ -52,9 +52,10 @@ for older rows); destructive ones are not.
 
 1. **Detection** — *noticing* that a source table's structure changed. **Source-specific**:
    PostgreSQL and MySQL expose changes through different channels.
-2. **Evolution** — *reacting* by mutating the Iceberg target schema and the in-flight Arrow
-   builders. **Source-agnostic**, governed by Iceberg's evolution rules, exactly like the
-   three-hop type mapping (G-18).
+2. **Evolution** — *reacting* by mutating the target table schema (through the pipeline's sink,
+   `sink.type`) and the in-flight Arrow builders. **Source-agnostic** and **sink-mediated**: the
+   classification (§7.2) states the intent; each sink applies it within its declared capabilities
+   (§7.1), exactly like the per-sink Hop 3 of the type mapping (G-18).
 
 Detection answers three sub-questions that must be handled independently:
 
@@ -62,7 +63,7 @@ Detection answers three sub-questions that must be handled independently:
 |---|---|---|
 | **(a) Decode correctness** — the *physical layout* of the bytes being decoded right now. | Decoding against the wrong layout is silent corruption. | The row decoder (Phase 2), on **every** event, from the in-band layout signal. Non-negotiable. |
 | **(b) Idle-table changes** — a schema changed though no rows have flowed. | An in-band signal can't fire without DML; only a poll catches it. | The idle rescan (§3, channel D). |
-| **(c) Semantic intent** — *rename* (preserve data + field ID) vs *drop + add* (lose lineage); *widen* vs *narrow*. | Determines the right Iceberg op and whether history survives. | Catalog augmentation (§3, channel C). |
+| **(c) Semantic intent** — *rename* (preserve data + field ID) vs *drop + add* (lose lineage); *widen* vs *narrow*. | Determines the right target-schema op and whether history survives. | Catalog augmentation (§3, channel C). |
 
 Consequence: **(a) is mandatory and in-band regardless of any configuration** — the decoder
 self-heals its layout cache from the in-band signal that precedes the first row after a
@@ -89,7 +90,11 @@ decision, not whether the decoder tracks layout.
   makes rename positively provable on PostgreSQL (§6).
 - **Trigger blind spot:** changes that don't alter the tuple descriptor pgoutput sees (a bare
   nullability tighten, a `CHECK` addition) may not emit a Relation message. Acceptable here —
-  those are Ignorable for the Iceberg target (§7) — with the idle rescan as backstop.
+  those are Ignorable for the target (§7) — with the idle rescan as backstop.
+- **`DROP TABLE` is not replicated either.** A dropped table just stops emitting. It is detected
+  out-of-band: its relation OID is gone from `pg_class`. Channel D finds it in steady state and
+  channel A at the next start; the table then halts (§7.2, `TABLE_DROPPED`). MySQL delivers the
+  DROP in-band on channel B.
 
 ### 2.2 MySQL (binlog, ROW format)
 
@@ -126,7 +131,7 @@ feed the same evolution pipeline; each has a distinct role. (This replaces the e
 Query the source catalog for each tracked table; then:
 
 - **Table absent in target** → use the queried schema as the **baseline** to create the
-  Iceberg table (consistent with the snapshot read point, `Data-Flow.md` Phase 1).
+  target table via the sink (consistent with the snapshot read point, `Data-Flow.md` Phase 1).
 - **Replayable existing table** → **do not** evolve the target from this query. The decoder
   re-acquires its layout from the in-band signal at stream resume, and any DDL between the
   confirmed offset and now is replayed **in order** by channels B+C. The startup query here is
@@ -134,6 +139,10 @@ Query the source catalog for each tracked table; then:
 - **Non-replayable gap** (PG slot invalidated / WAL recycled; MySQL binlog purged — G-26) →
   the DDL events and intervening rows are lost; baseline the target to the queried schema and
   trigger a **re-snapshot** (§8.2).
+- **Tracked table gone from the source** (PG: relation OID absent from `pg_class`) → halt that
+  table with `TABLE_DROPPED`; the target is kept (§7.2).
+- **Source column named like a reserved lineage column** → halt that table with
+  `RESERVED_COLUMN_COLLISION` (`Configuration_Specification.md` §5).
 
 Channel A is *not* redundant with in-band replay: it is the only thing that covers table
 creation and the non-replayable-gap recovery, which the stream structurally cannot deliver.
@@ -167,7 +176,10 @@ A single **batched** catalog query across all tracked tables, every `rescan_inte
 (default 60m, `0` disables). Catches DDL on tables with no DML — its value is
 **downstream-schema freshness** and **early alerting**, not data correctness (a truly idle
 table has no rows to write under the new schema, and the first write would trigger B+C
-anyway). Lower-criticality than A–C.
+anyway). Lower-criticality than A–C. On PostgreSQL it is also the steady-state detector for a
+**dropped tracked table** (relation OID gone from `pg_class` → `TABLE_DROPPED`, §7.2). Latency is
+bounded by `rescan_interval` (with `0`, until the next start). Nothing is lost while detection waits,
+because a dropped table emits nothing further.
 
 ### Channel comparison
 
@@ -205,8 +217,9 @@ model and have been removed.*
 
 ## 6. Rename resolution
 
-A rename is the highest-stakes case: the *correct* Iceberg op and the *fallback* diverge
-sharply.
+A rename is the highest-stakes case: the *correct* op and the *fallback* diverge sharply. (Iceberg
+terms below; the Delta sink has no rename op in delta-rs 1.0 and always takes the degraded path —
+§7.1.2.)
 
 - **True rename** → Iceberg `rename_column`: metadata-only, **preserves the field ID and all
   historical data** under the new name.
@@ -228,9 +241,22 @@ columns, so the lineage loss is visible rather than silent. Never infer a rename
 
 ---
 
-## 7. Schema evolution (source-agnostic action)
+## 7. Schema evolution (source-agnostic action, sink-mediated)
 
-### 7.1 Iceberg capability reference
+Evolution is applied through the sink's `evolve(delta)` (`Data-Flow.md` Phase 4, sink contract
+item 5), which returns one of:
+
+- **Applied** — the target schema now reflects the delta;
+- **Degraded** — the delta was absorbed in a weaker form that keeps the mirror flowing and loses no
+  data, with a **warning + metric** naming table and columns (e.g. Delta soft-drop, §7.1.2);
+- **Unsupported** — the sink cannot perform it → **halt the table** exactly like an Unsafe delta.
+
+A delta that is **Safe** in §7.2 is therefore *auto-evolved if the pipeline's sink can*; the per-sink
+column of §7.2 is the contract.
+
+### 7.1 Sink capability reference
+
+#### 7.1.1 Iceberg
 
 Iceberg tracks columns by **unique field ID** (not name/position), so name reuse is safe and
 reordering is free. **Safe** operations: add column, drop column, rename column, reorder, and
@@ -244,42 +270,62 @@ type change, or tightening `optional → required`.
 > version** and route any unsupported op into the "halt table" branch until the crate catches
 > up.
 
+#### 7.1.2 Delta Lake (delta-rs 1.0)
+
+Delta tracks columns by **name** unless column mapping is enabled; the Delta sink creates tables
+**without** column mapping (delta-rs 1.0 refuses ADD COLUMN on column-mapped tables — probe P7b,
+config V-092). delta-rs 1.0 exposes **add column** and **drop NOT NULL**; it has **no** drop-column,
+rename-column or type-widening operation. Hence:
+
+- **Add column** → Applied (nullable).
+- **Drop column (non-identity)** → **Degraded: soft-drop** — the column stays in the Delta schema and
+  is written NULL from the change onward; history is intact. Physical drop is reserved until delta-rs
+  exposes it.
+- **Rename** → **Degraded**: add the new column + soft-drop the old one; history remains under the
+  old name (the same visible outcome as §6's unprovable-rename fallback).
+- **Type widening** → **Unsupported → halt** (the operator re-snapshots into a fresh table if needed).
+
 ### 7.2 DDL classification table (the G-19 contract)
 
-Each normalized delta is **Safe** (auto-evolve), **Unsafe** (halt the table per the
-`enabled`/halt contract, G-19b), or **Ignorable** (no Iceberg action). Applied at a
+Each normalized delta is **Safe** (auto-evolve, within the sink's capabilities), **Unsafe** (halt
+the table per the `enabled`/halt contract, G-19b), or **Ignorable** (no target action). Applied at a
 transaction boundary via §8.
 
-| Source DDL | Class | Iceberg action | Arrow / data handling |
-|---|---|---|---|
-| `ADD COLUMN` (any nullability) | **Safe** | `add_column` as **optional** (§7.3) | new builder; historical rows read NULL |
-| `DROP COLUMN` (non-identity) | **Safe** | `drop_column` (metadata-only) | stop producing the column |
-| `DROP COLUMN` part of PK / replica identity | **Unsafe** | — | halt table (breaks equality-delete keying) |
-| `RENAME COLUMN` — proven (§6) | **Safe** | `rename_column` (keeps field ID + data) | re-point builder to new name |
-| `RENAME COLUMN` — not provable | **Safe (degraded)** | `drop_column` + `add_column` | **warn**: history NULL under new name |
-| Type **widen** within Iceberg set (§7.1) | **Safe** | `update_column` promotion | builder adopts wider Arrow type |
-| Type **widen** outside the set (e.g. `int→decimal`) | **Unsafe** | — | halt table |
-| Type **narrow** (`bigint→int`, `varchar(100)→varchar(10)`, decimal shrink) | **Unsafe** | — | halt table |
-| Cross-family change (`int→varchar`, `timestamp→date`) | **Unsafe** | — | halt table |
-| `nullable → NOT NULL` | **Unsafe**\* | — | halt table (optional→required is breaking) |
-| Change PK / `REPLICA IDENTITY` / unique key | **Unsafe** | — | halt table; operator re-snapshot |
-| MySQL `ENUM`/`SET` **add** values (append-only) | Ignorable\*\* | none | decoded value set widens; verify mapping (G-18) |
-| MySQL `ENUM`/`SET` reorder/remove values | **Unsafe** | — | halt (changes decoded string meaning) |
-| Index/comment/storage-params/`AUTO_INCREMENT`/charset w/ same logical type | **Ignorable** | none | none |
-| **Parse failure / unclassifiable DDL on a tracked table** | **Unsafe** | — | halt table (fail-safe) |
+| Source DDL | Class | Iceberg action | Delta action | Arrow / data handling |
+|---|---|---|---|---|
+| `ADD COLUMN` (any nullability) | **Safe** | `add_column` as **optional** (§7.3) | `add_columns`, nullable | new builder; historical rows read NULL |
+| `DROP COLUMN` (non-identity) | **Safe** | `drop_column` (metadata-only) | **Degraded**: soft-drop (column kept, NULL onward; warn) | stop producing the column |
+| `DROP COLUMN` part of PK / replica identity | **Unsafe** | — | — | halt table (breaks keying) |
+| `RENAME COLUMN` — proven (§6) | **Safe** | `rename_column` (keeps field ID + data) | **Degraded**: add new + soft-drop old (warn; history under old name) | re-point builder to new name |
+| `RENAME COLUMN` — not provable | **Safe (degraded)** | `drop_column` + `add_column` | **Degraded**: add new + soft-drop old (warn) | **warn**: history NULL under new name |
+| Type **widen** within Iceberg set (§7.1.1) | **Safe** | `update_column` promotion | **Unsupported → halt** | builder adopts wider Arrow type |
+| Type **widen** outside the set (e.g. `int→decimal`) | **Unsafe** | — | — | halt table |
+| Type **narrow** (`bigint→int`, `varchar(100)→varchar(10)`, decimal shrink) | **Unsafe** | — | — | halt table |
+| Cross-family change (`int→varchar`, `timestamp→date`) | **Unsafe** | — | — | halt table |
+| `nullable → NOT NULL` | **Ignorable** | none | none | none: target columns are always nullable (§7.3) |
+| `NOT NULL → nullable` | **Ignorable** | none | none | none |
+| Change PK / `REPLICA IDENTITY` / unique key | **Unsafe** | — | — | halt table; operator re-snapshot |
+| `ADD COLUMN` / `RENAME COLUMN` to a **reserved lineage name** (`_op`, `_ts`, `_lsn`, `_seq`, `_source_db`, `_pipeline`, `__data_avalanche_*`; case-insensitive) | **Unsafe** | — | — | halt table `RESERVED_COLUMN_COLLISION` (config §5) |
+| `DROP TABLE` (tracked) | **Unsafe** | — (target kept) | — (target kept) | halt table `TABLE_DROPPED`; the target is never dropped. A re-created table of the same name (new OID) does **not** auto-resume; it needs an operator re-snapshot. Detection — PG: channel D / A (§2.1); MySQL: channel B |
+| MySQL `ENUM`/`SET` **add** values (append-only) | Ignorable\*\* | none | none | decoded value set widens; verify mapping (G-18) |
+| MySQL `ENUM`/`SET` reorder/remove values | **Unsafe** | — | — | halt (changes decoded string meaning) |
+| Index/comment/storage-params/`AUTO_INCREMENT`/charset w/ same logical type | **Ignorable** | none | none | none |
+| **Parse failure / unclassifiable DDL on a tracked table** | **Unsafe** | — | — | halt table (fail-safe) |
 
-\* Detected only when the trigger fires; a descriptor-invisible nullability tighten on PG may
-surface only via channel D. Acceptable — see §7.3.
 \*\* Only if the Arrow/Iceberg representation is a string, not an ordinal; pin in the
 type-mapping doc (G-18).
 
 ### 7.3 Always add columns as nullable
 
-A column added mid-stream has no value for any historical row already in Iceberg. Iceberg can
-only add a *required* column with both initial- and write-defaults (immature in the crate),
-so add as **optional** — both spec-safe and semantically honest. Enforce source `NOT NULL`
-downstream if needed; never push it into the Iceberg schema. This also makes a source
+A column added mid-stream has no value for any historical row already in the target. Iceberg can
+only add a *required* column with both initial- and write-defaults (immature in the crate), and a
+Delta column added to an existing table must be nullable, so add as **optional** in every sink — both
+spec-safe and semantically honest. Enforce source `NOT NULL` downstream if needed; never push it into
+the target schema. This also makes a source
 nullability change effectively Ignorable for the target.
+
+At table creation every non-identifier column is nullable, whatever the source declares; identifier
+columns are NOT NULL.
 
 ---
 
@@ -294,21 +340,23 @@ invariant used for flushing.
 On a normalized delta D for table T at transaction boundary B:
 
 1. SEAL    finalize T's current RecordBatch under the OLD schema.
-2. FLUSH   write it to Iceberg under the pre-change target schema (Phase 4);
+2. FLUSH   commit it to the sink under the pre-change target schema (Phase 4);
            obtain flush_confirmation.
 3. CLASSIFY D → Safe | Unsafe | Ignorable (§7.2).
               ├─ Ignorable → goto 6.
               └─ Unsafe (or evolution disabled) → halt table T only,
                  log error, emit metric; other tables keep running (G-19b).
-4. EVOLVE  apply the Iceberg schema transaction for D, idempotently (§8.3),
-           scoped to D's columns only — never the whole "now" catalog schema (§0).
+4. EVOLVE  sink.evolve(D), idempotently (§8.3), scoped to D's columns only — never the
+           whole "now" catalog schema (§0).
+           ├─ Applied / Degraded (warn + metric) → continue.
+           └─ Unsupported → halt table T only (as Unsafe).
 5. REBUILD recreate T's Arrow ArrayBuilders from the NEW schema.
 6. RESUME  continue accumulation under the new schema from B onward.
 ```
 
-Because B is exact (channel B fires at the precise stream position), each Iceberg data file
-stays homogeneous — written under exactly one schema — which is what keeps evolution a
-metadata operation rather than a file rewrite.
+Because B is exact (channel B fires at the precise stream position), each data file stays
+homogeneous — written under exactly one schema — which is what keeps evolution a metadata operation
+rather than a file rewrite (in both Iceberg and Delta).
 
 ### 8.2 Startup & non-replayable gaps
 
@@ -326,11 +374,12 @@ DDL carries an LSN/GTID and is **replayed on restart**. On replay, B re-fires an
 re-queries (returning a possibly further-evolved schema — the §0 hazard applies on replay
 too), so:
 
-1. **Idempotent apply** — before mutating, re-read the live Iceberg schema and skip the op if
-   the target already reflects it (mirrors the Phase 4 `committed_lsn` guard). Scoping to D's
+1. **Idempotent apply** — before mutating, re-read the live target schema and skip the op if
+   the target already reflects it (mirrors the Phase 4 position guard). A soft-dropped Delta column
+   counts as "already reflected" for a replayed drop. Scoping to D's
    columns (§0) prevents replay from importing later changes early.
 2. **Checkpoint ordering** — advance the confirmed offset past the DDL **only after** the
-   Iceberg schema transaction commits. A crash between EVOLVE and the offset write replays the
+   sink's schema change commits. A crash between EVOLVE and the offset write replays the
    DDL, and the idempotent guard absorbs it.
 
 ---
@@ -373,7 +422,7 @@ Ripple into `Configuration_Specification.md` (deliberate spec edit, touches G-1f
 - Rename `interval` → `rescan_interval`; it now **always applies** (idle rescan), default
   `60m`, `0` disables. (Was "valid only when `method = query`.")
 - Add the source-query-access precondition (§9) to the validation table.
-- §9.5.1 reduces to two fields: `enabled`, `rescan_interval`.
+- §9.5.1 reduces to two fields: `enabled`, `rescan_interval`. *(Now §9.7, pipeline-level `schema_evolution` — multi-sink, 2026-09-26.)*
 
 ---
 
@@ -405,7 +454,7 @@ should reference it rather than restate it.
 
 ### 12.1 `Configuration_Specification.md`
 
-Replace §9.5.1 `catalog.schema_evolution` with two fields:
+Replace §9.5.1 `catalog.schema_evolution` with two fields *(now §9.7, pipeline-level `schema_evolution` — multi-sink, 2026-09-26)*:
 
 | Field | Type | Required | Default | Mutability | Notes |
 |---|---|---|---|---|---|
@@ -450,7 +499,7 @@ Replace §9.5.1 `catalog.schema_evolution` with two fields:
 
 - [[Architecture/System-Overview]] — OQ-DT2 / OQ-DT3, minimal source-footprint principle
 - [[Architecture/Data-Flow]] — Phase 2 decode (`R` / `TABLE_MAP`), Phase 3 force-flush, Phase 4 schema reconciliation
-- [[Configuration_Specification]] — §9.5.1 `schema_evolution` (now `enabled` + `rescan_interval`), validation rules
+- [[Configuration_Specification]] — §9.7 `schema_evolution` (`enabled` + `rescan_interval`), validation rules
 - [[CDC/Type_Mapping]] — G-18 three-hop type mapping (type promotion + ENUM/SET representation)
 - [[CDC_Gap_Analysis_Report]] — G-19 / G-19a / G-19b tracking
 

@@ -1,5 +1,5 @@
 ---
-updated: 2026-06-20
+updated: 2026-09-26
 domain: Auth
 tags: [rbac, api, authorization, roles, jwt, oauth2, versioning, management-api, cdc]
 resolves: [G-16, G-9.1]
@@ -41,8 +41,11 @@ version skew).
 | Config reload | `POST /v1/config/reload` | **operator** |
 | Config status | `GET /v1/config/status` | viewer |
 | Cluster status | `GET /v1/cluster/status` | viewer |
+| Pipelines list | `GET /v1/pipelines` | viewer |
+| Pipeline status | `GET /v1/pipelines/{id}` | viewer |
 | Trigger snapshot | `POST /v1/pipelines/{id}/snapshots` | operator |
 | Snapshot job status | `GET /v1/snapshots/{job_id}` | viewer |
+| List snapshot jobs | `GET /v1/pipelines/{id}/snapshots` | viewer |
 | Pipeline pause | `POST /v1/pipelines/{id}/pause` | operator |
 | Pipeline resume | `POST /v1/pipelines/{id}/resume` | operator |
 | Pipeline restart | `POST /v1/pipelines/{id}/restart` | operator |
@@ -61,6 +64,11 @@ Notes:
 - **Config reload = operator** (routine ops). Cluster-destructive ops (`leave`, `shutdown`) = admin.
 - **Pipeline `stop`** releases DB connections/leases but is recoverable, so it stays operator; only
   node-level teardown is admin.
+- **Pipeline status (added 2026-09-26)** — System-Overview's "get pipelines status" had no row.
+  `GET /v1/pipelines/{id}` (defined in `Pipeline_Lifecycle_State_Machine.md` §6) returns
+  `desired_state`, `actual_state`, positions and per-table status, including each halted table's reason
+  (`TABLE_DROPPED`, `RESERVED_COLUMN_COLLISION`, …). `GET /v1/pipelines` lists the pipelines with
+  the same summary. Both are read-only → viewer.
 
 ---
 

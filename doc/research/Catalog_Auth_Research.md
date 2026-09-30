@@ -279,3 +279,20 @@ These should be added to the validation rules table (gap G-1f):
 This research fully resolves **G-1g** (catalog JWT/OAuth2 auth fields — previously marked 🔴 Blocker).
 
 No new gaps are introduced. The new `sigv4` constraint (`globals.cloud = aws`) should be added to the validation rules list (G-1f).
+
+---
+
+## 8. Crate capability check (2026-09-26)
+
+Read against the pinned `iceberg-catalog-*` **0.10.1** sources (and `main`), plus a live probe for Glue
+(`prototypes/iceberg-capability/`, G2c):
+
+| Catalog | Commit (`update_table`) | Auth as specified here | Status |
+|---|---|---|---|
+| `glue` (native) | client-side requirement check + Glue `UpdateTable` with `VersionId` (optimistic lock) | AWS SDK chain / static keys / profile | ✅ **probed on AWS**: CAS holds under 8-way concurrency |
+| `hive` | **`FeatureUnsupported`** (0.10.1 and `main`) | NOSASL / SASL PLAIN / GSSAPI (§2) — moot | 🟥 **cannot commit** — DA-CAT-6 |
+| `rest` | server-side requirements, 409 → `CatalogCommitConflicts` | `none` / `bearer` / `oauth2` available; **`sigv4` absent** (open PRs #3082, #3092) | 🟥 `sigv4` unrealizable — DA-CAT-7 |
+| `s3tables` (native, not in config) | `UpdateTableMetadataLocation` with `versionToken` | AWS SDK chain | source-read only |
+
+The auth model in §2–§4 stays correct as a design; the Iceberg sink's capability assertion must refuse
+`hive` and `rest` + `sigv4` while the pinned crate lacks them.

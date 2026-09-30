@@ -1,0 +1,28 @@
+[package]
+name = "data-avalanche-state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Durable state for data-avalanche: per-pipeline documents, leases and globals.state."
+
+[lints]
+workspace = true
+
+[dependencies]
+blake3.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+data-avalanche-core.workspace = true
+data-avalanche-storage.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+data-avalanche-config.workspace = true
+data-avalanche-testkit.workspace = true
+futures-util.workspace = true
+object_store.workspace = true
+tokio.workspace = true

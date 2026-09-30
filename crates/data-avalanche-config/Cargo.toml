@@ -1,0 +1,26 @@
+[package]
+name = "data-avalanche-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Configuration model, strict YAML parse, env/file resolution, V-rule validation and reload diff."
+
+[lints]
+workspace = true
+
+[dependencies]
+data-avalanche-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde-saphyr.workspace = true
+thiserror.workspace = true
+humantime.workspace = true
+tracing-subscriber.workspace = true
+rustls-pki-types.workspace = true
+blake3.workspace = true
+getrandom.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rcgen.workspace = true

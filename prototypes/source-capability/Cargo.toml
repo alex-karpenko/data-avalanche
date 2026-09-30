@@ -1,0 +1,94 @@
+[package]
+name = "source-capability"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Capability probe: proves the source-side replication client crates the CDC sources depend on (DA-SRC-10 PostgreSQL pgoutput, DA-SRC-11 MySQL/MariaDB binlog)"
+
+# Companion to lease-conformance / iceberg-capability / delta-capability. Same convention: the
+# crate-dependent probe code is gated behind features and OFF by default, so a plain `cargo test`
+# stays instant and green. Probes run against local containers (docker-compose.yml) — no cloud.
+#
+#   docker compose up -d --wait
+#   cargo test --features pg    --test probe_pg    -- --nocapture --test-threads=1
+#   cargo test --features mysql --test probe_mysql -- --nocapture --test-threads=1
+#
+# Candidates (crates.io, 2026-09-26):
+#   PostgreSQL : pgwire-replication 0.4.1 (updated 2026-09-21). No maintained alternative on
+#                crates.io — upstream tokio-postgres has no replication stream; fallback = own
+#                pgoutput decoder. tokio-postgres is the control-plane client (slots/publications).
+#   MySQL      : mysql-binlog-connector-rust 0.3.3 (updated 2025-10-31) vs mysql_async 0.37.1
+#                binlog stream (updated 2026-09-01) — both probed, the better one is pinned.
+
+[dependencies]
+
+[features]
+pg = [
+    "dep:pgwire-replication",
+    "dep:tokio-postgres",
+    "dep:tokio",
+    "dep:anyhow",
+    "dep:futures",
+    "dep:bytes",
+    "dep:rustls",
+]
+mysql = [
+    "dep:mysql-binlog-connector-rust",
+    "dep:mysql_async",
+    "dep:mysql_common",
+    "dep:rustls",
+    "dep:tokio",
+    "dep:anyhow",
+    "dep:futures",
+]
+
+[dependencies.pgwire-replication]
+version = "=0.4.1"
+optional = true
+
+[dependencies.tokio-postgres]
+version = "0.7"
+optional = true
+
+[dependencies.mysql-binlog-connector-rust]
+version = "=0.3.3"
+optional = true
+
+[dependencies.mysql_async]
+version = "=0.37.1"
+default-features = false
+features = ["default-rustls", "binlog"]
+optional = true
+
+# same version mysql_async resolves to — only for `constants::ColumnType` (not re-exported)
+[dependencies.mysql_common]
+version = "=0.37.3"
+default-features = false
+optional = true
+
+# Only to install a process-wide CryptoProvider: pgwire-replication enables rustls `ring`,
+# mysql_async enables `aws-lc-rs`; with both linked rustls cannot pick one and panics at the first
+# handshake (finding — the app must install a provider at startup; deltalake/object_store use
+# rustls too).
+[dependencies.rustls]
+version = "0.23"
+default-features = false
+features = ["aws_lc_rs"]
+optional = true
+
+[dependencies.tokio]
+version = "1"
+features = ["macros", "rt-multi-thread", "time"]
+optional = true
+
+[dependencies.anyhow]
+version = "1"
+optional = true
+
+[dependencies.futures]
+version = "0.3"
+optional = true
+
+[dependencies.bytes]
+version = "1"
+optional = true

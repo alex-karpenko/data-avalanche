@@ -1,7 +1,7 @@
 ---
 title: Clustering Architecture Research
 status: Research / Design proposal (input for further elaboration)
-updated: 2026-06-20
+updated: 2026-09-28
 domain: Architecture / Distributed Systems
 tags: [clustering, gossip, swim, memberlist, consistent-hashing, lease, split-brain, rebalancing, config-propagation]
 closes_or_advances: [G-8, G-9, G-2, G-17, G-23, G-36, "OQ-CL1", "OQ-CL3", "OQ-CL4", "OQ-API3", "OQ-P3", "5.1", "5.2"]
@@ -420,6 +420,19 @@ attempt one stale Iceberg commit before noticing. We close this with **defense i
    are a CAS on the table-metadata pointer (already in `Data-Flow.md`'s "catalog conflict → reload &
    retry" path). If a zombie slips past (1), the new owner has already advanced the metadata, so the
    zombie's commit conflicts and fails. The new owner never loses; at worst the zombie wastes effort.
+   **⚠️ Only if the commit is pinned to the base the sink read (probe G2b, 2026-09-26, DA-X-11).**
+   iceberg-rust's `Transaction::commit` reloads the table and re-applies its actions on **every**
+   attempt, including the first, so a zombie holding a stale `Table` is silently **rebased** onto the
+   new owner's snapshot and lands; the pointer CAS never sees a stale base. The sink must therefore
+   commit through a per-commit catalog view whose `load_table` returns the base it checked the fence
+   against (`PinnedBase` in `prototypes/iceberg-capability/tests/probe_epoch_property.rs`):
+   `fast_append`'s `assert-ref-snapshot-id(main)` requirement then turns the commit into a real
+   compare-and-swap, a conflict is surfaced as non-retryable, and the **sink** owns the retry loop
+   (reload → re-check fence → re-pin → recommit). Public API only; no fork.
+   **Real catalog (probe G2c, AWS Glue + S3):** proven under concurrency — 8 pinned writers per round,
+   exactly one wins; every loser is stopped by Glue's `VersionId` optimistic lock (iceberg-catalog-glue
+   checks the requirements client-side, then `UpdateTable` with the loaded `VersionId`). HMS cannot
+   commit at all in iceberg-rust (DA-CAT-6); REST lacks SigV4 (DA-CAT-7).
 3. **`owner_epoch` as a sink-side fencing token (D-7 — resolved: assert it).** The monotonic
    `owner_epoch` is **embedded in the Iceberg snapshot summary** (`cdc.owner_epoch`), and the commit
    path — inside the existing catalog-conflict reload-retry loop (Data-Flow.md) — **rejects a commit
@@ -432,6 +445,32 @@ attempt one stale Iceberg commit before noticing. We close this with **defense i
    exposes the snapshot-summary string map and the monotonic check rides the reload-retry path that
    already exists. **Implementation note:** verify the chosen iceberg-rust version preserves custom
    snapshot-summary properties across commits.
+
+   **Where `latest_committed_epoch` is read from (DA-X-10, 2026-09-26).** Not from "the latest
+   snapshot": foreign commits — external compaction (`rewrite_data_files`), `expire_snapshots`, any
+   other engine — create snapshots **without** `cdc.*` properties, so the latest snapshot after an
+   external compaction carries no epoch and a naive read silently **disarms the fence** until our next
+   commit. And external `expire_snapshots` can remove our own last snapshot entirely. Rule:
+   - **Write** the epoch in **two** places in the **same** Iceberg transaction as the data: the
+     snapshot summary (`cdc.owner_epoch`, per-snapshot audit) **and** a table property
+     (`cdc.owner_epoch`), which persists across foreign commits and snapshot expiry (external
+     maintenance preserves table properties).
+   - **Read** the fence from the **table property** (authoritative). If it is absent (table created
+     before this rule, or property removed), walk the snapshot log back to the newest snapshot whose
+     summary carries `cdc.pipeline = <pipeline_id>` and read its `cdc.owner_epoch`; if none is retained,
+     the sink-side fence is simply not armed for that commit — layers (1), (2), (4) still hold.
+   - ✅ **Verified (probe G2b, iceberg 0.10.1, 2026-09-26):** `update_table_properties` + `fast_append`
+     in one `Transaction` are **one** metadata commit (either action order); a rejected commit applies
+     **neither** the property nor the snapshot; the property survives a foreign append, a foreign
+     property edit and `expire_snapshots` of our own snapshot (where the summary walk-back finds
+     nothing).
+   - **Residual (accepted):** the pin fences on `main`, so a new owner's **metadata-only** commit
+     (e.g. a schema-only `evolve`) does not fence a pinned zombie — one stale commit can still land
+     (and write its lower epoch to the property) until the new owner's next data commit. This is the
+     same "zombie commits before the new owner's first data commit" window as above, absorbed by
+     idempotent PK-upsert / `_lsn` dedup (4). The epoch property is written **only** by data commits.
+   This is the Iceberg analogue of the Delta sink's `txn` app-transaction, which lives in table state
+   and was probed to survive a foreign OPTIMIZE (`prototypes/delta-capability/` P3/P4).
 4. **Idempotent/dedup writes** (the `_lsn`-based exactly-once guard, Phase 4, and the ghost-row
    dedup gap G-13) absorb the residual duplicate-row possibility.
 
@@ -605,12 +644,18 @@ handoffs during a rolling deploy (every pod restart reshuffles the ring). Mitiga
 Do **not** put the full config into gossip (it can be large; gossip is for small deltas). Instead:
 
 - **Durable truth in `globals.state`:** a monotonic **generation pointer** plus an immutable
-  per-generation resolved-config snapshot:
+  per-generation snapshot of the **config file text**:
   ```
-  config/generation.json          { "version":1, "generation": 87, "hash": "sha256:…",
+  config/generation.json          { "version":1, "generation": 87, "hash": "blake3:<hex>",
                                      "written_by": "worker-7f3a9c", "written_at": "…" }
-  config/snapshots/000087.yaml     # the resolved config for generation 87 (immutable)
+  config/snapshots/000087-<hex>.yaml   # the raw config text of generation 87 (immutable)
   ```
+  The snapshot holds the raw text, not a resolved config: `${VAR}` values and referenced files
+  (credentials, PEM) are resolved by **each node** in its own environment, so no secret is written
+  to `globals.state`. The file name carries the text's BLAKE3 hash (content-addressed), so two
+  nodes racing to publish the same generation never overwrite each other's snapshot; the
+  pointer's `hash` names the winner, and every read checks the text against it (M2 plan
+  D-M2.11, owner decision Q-M2-1, 2026-09-28).
 - **Tiny signal in gossip:** each node's NodeMeta carries `config_generation` (the highest it has
   *applied*). That is the entire cross-node config footprint in gossip.
 
@@ -622,12 +667,13 @@ log" source): generation N is durable and immutable; nodes converge by replaying
 1. Operator → POST /v1/config/reload  on ANY worker A.
 2. A re-reads its file → strict parse → validate → resolve (§11 of the config spec).
 3. A computes new generation = current_generation + 1, writes:
-     config/snapshots/<N>.yaml,
+     config/snapshots/<N>-<hash>.yaml (the raw file text),
      then CAS-updates config/generation.json with If-Match:<etag of generation N-1>.
    (CAS serializes concurrent reloads: a racing reload on B gets 412 and retries against N.)
 4. A applies N locally (reconcile §12), bumps its NodeMeta config_generation → gossiped.
 5. Every other worker observes target generation advanced (via the gossiped config_generation of
-   peers, or a short poll of generation.json), FETCHES config/snapshots/<N>.yaml, runs its OWN
+   peers, or a short poll of generation.json), FETCHES config/snapshots/<N>-<hash>.yaml, resolves it in its own
+   environment, runs its OWN
    reconcile over ITS OWN owned pipelines, and bumps its config_generation.
 6. A returns 202 Accepted immediately; GET /v1/config/status reports per-node applied generation;
    the reload is "complete" when all live nodes report N.
@@ -751,7 +797,9 @@ conditional writes (gap 5.2): create via `If-None-Match: *`, update via `If-Matc
 │   ├── anchor.json            # FIRST-WRITER-WINS via If-None-Match:*. Establishes the cluster-wide
 │   │                          # invariants: { version, tokens: 128, lease_duration_ms: 15000,
 │   │                          # lock_backend: "storage", hash_algo: "xxh3",
-│   │                          # established_by, established_at }.   (lock_backend pinned per D-2)
+│   │                          # fingerprint_key (64 hex: the secret/file fingerprint key,
+│   │                          # config §6.2), established_by, established_at }.
+│   │                          # (lock_backend pinned per D-2)
 │   │                          # A node whose config disagrees REFUSES TO START (extends V-026/V-062
 │   │                          # from tokens-only to the full safety-timing anchor).
 │   └── membership.json        # OPTIONAL advisory snapshot of last-known membership, for cold-start
@@ -759,7 +807,7 @@ conditional writes (gap 5.2): create via `If-None-Match: *`, update via `If-Matc
 ├── config/
 │   ├── generation.json        # CAS pointer: { version, generation, hash, written_by, written_at }
 │   └── snapshots/
-│       └── <NNNNNN>.yaml       # immutable resolved config per generation
+│       └── <NNNNNN>-<hash>.yaml   # immutable raw config text per generation (content-addressed)
 └── leases/
     └── <pipeline_id>.json      # per-pipeline lease (§5.2), CAS via ETag
 ```
@@ -843,7 +891,7 @@ ClusterManager (one per worker)
 - **D-4** *(resolved)* Add `cluster.discovery: static | dns` (+ `discovery_dns_name`); `dns` resolves + periodically re-resolves a headless Service. §10.2
 - **D-5** *(elaborated below, §17)* Verify atomic conditional-write path on S3 *and* GCS *and* Azure (SDK vs opendal); per-backend conformance test. §12
 - **D-6** *(elaborated below, §18)* Pick concrete defaults for `lease_duration` / `renewal_interval` against the target failover-time SLA (ties to OQ-OB2 replication-lag SLA). §8.2 / §11
-- **D-7** *(resolved: assert it)* `owner_epoch` is embedded in the Iceberg snapshot summary (`cdc.owner_epoch`) and the commit reload-retry loop rejects a commit when `latest_committed_epoch > my_epoch` — a sink-side fencing token (defense-in-depth atop the metadata-pointer CAS + `_lsn` dedup). §5.5
+- **D-7** *(resolved: assert it; carrier refined 2026-09-26 for DA-X-10 — table property authoritative, summary + own-snapshot walk-back as fallback, §5.5)* `owner_epoch` is embedded in the Iceberg snapshot summary (`cdc.owner_epoch`) and the commit reload-retry loop rejects a commit when `latest_committed_epoch > my_epoch`; the commit is **pinned to the base the fence was read from** (iceberg-rust `Transaction::commit` otherwise rebases a stale zombie — probe G2b, DA-X-11) — a sink-side fencing token (defense-in-depth atop the metadata-pointer CAS + `_lsn` dedup). §5.5
 - **D-8** *(elaborated below, §19; resolved)* Lease renewal failure taxonomy — distinguish `412` (definitive loss → stop) from transient storage errors (retry within a safety deadline), via a renewer state machine. Adds `cluster.lease_safety_margin` and promotes `lease_renewal_interval ≤ lease_duration / 3` to an enforced rule. §5.3 / §19
 - **D-9** *(elaborated below, §20.1; resolved)* Reconciler ↔ renewer orchestration — split into `ClusterReconciler` (ring only) + per-pipeline `PipelineController` (sole lease-writer, hosts the §19 renewer); event-driven + periodic-resync, idempotent/level-triggered. §8.1 / §13 / §20.1
 - **D-10** *(elaborated below, §20.2; resolved)* Unplanned-takeover storm rate-limiting — `cluster.max_concurrent_takeovers` (default 4) caps concurrent Phase-0 starts (not the cheap waits), with jitter; per-node-global now, per-source-endpoint group noted as future. §20.2
@@ -1256,9 +1304,9 @@ config-spec follow-up in the gap report, not edited here.)
   only a sustained outage longer than `lease_duration` stops it — and during such an outage the
   pipeline cannot commit anyway (storage is the sink), so the stop is harmless, not a regression.
 - **Observability (D-8 decision #5, folds into G-33):** emit
-  - `cdc_lease_state{pipeline}` gauge — `held | degraded | lost` (enum)
-  - `cdc_lease_renew_failures_total{pipeline, class}` counter — `transient | conflict | lost`
-  - `cdc_lease_renew_latency_seconds{pipeline}` histogram
+  - `data_avalanche_lease_state{pipeline}` gauge — `held | degraded | lost` (enum)
+  - `data_avalanche_lease_renew_failures_total{pipeline, class}` counter — `transient | conflict | lost`
+  - `data_avalanche_lease_renew_latency_seconds{pipeline}` histogram
 
   Degraded is the early-warning signal: operators see storage flapping *before* it escalates to a
   failover. A rising `transient` count with no `lost` means "storage is wobbling but safety held."

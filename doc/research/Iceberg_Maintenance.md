@@ -1,5 +1,5 @@
 ---
-updated: 2026-06-20
+updated: 2026-09-26
 domain: Architecture
 tags: [iceberg, maintenance, compaction, expire-snapshots, delete-files, orphan-files, mor, cdc]
 resolves: [G-25]
@@ -47,17 +47,25 @@ scheduler can land later without a config break.
 **The app's obligation:** never assume maintenance has run — planning and writes must tolerate deep
 delete-file stacks and many small files (just slower).
 
+**…and never assume the latest snapshot is its own (DA-X-10).** External maintenance commits
+snapshots without the app's `cdc.*` markers and `expire_snapshots` may remove the app's last snapshot.
+The sink therefore reads the owner-epoch fence from the `cdc.owner_epoch` **table property** and the
+position guard from the newest **own** snapshot (walk-back by `cdc.pipeline`), treating "no own
+snapshot retained" as not-covered (`Clustering_Architecture_Research.md` §5.5,
+`Delivery_Guarantee_and_Position_Guard.md` §3). Operators need not coordinate maintenance with the
+app for correctness.
+
 ---
 
 ## §3 — When-needed signals (metrics the app must expose)
 
 So operators / automation know *when* to run maintenance, the app emits per-table:
 
-- `cdc_iceberg_delete_files` (gauge) — equality-delete files since last compaction; the primary MOR
+- `data_avalanche_iceberg_delete_files` (gauge) — equality-delete files since last compaction; the primary MOR
   health signal.
-- `cdc_iceberg_data_file_count` and `cdc_iceberg_small_file_ratio` (files below target size).
-- `cdc_iceberg_snapshot_count` and `cdc_iceberg_manifest_depth`.
-- `cdc_iceberg_metadata_json_bytes`.
+- `data_avalanche_iceberg_data_file_count` and `data_avalanche_iceberg_small_file_ratio` (files below target size).
+- `data_avalanche_iceberg_snapshot_count` and `data_avalanche_iceberg_manifest_depth`.
+- `data_avalanche_iceberg_metadata_json_bytes`.
 
 These fold into the metrics catalogue (G-33) and are the trigger inputs for an external maintenance
 cron or an alerting rule (e.g. "delete_files > N → run compaction").
@@ -102,5 +110,5 @@ delete-file + data compaction (the MOR-critical, writer-coupled part), keep expi
 | Decision | Resolution |
 |---|---|
 | G-25 ownership (v1) | **External maintenance**; app exposes when-needed signals + reserves `sink.maintenance` |
-| MOR criticality | delete-file compaction is the key signal (`cdc_iceberg_delete_files`) |
+| MOR criticality | delete-file compaction is the key signal (`data_avalanche_iceberg_delete_files`) |
 | built-in path | deferred, gated on iceberg-rust rewrite support; hybrid (compaction-only) is the first step |

@@ -1,0 +1,27 @@
+[package]
+name = "data-avalanche-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Integration-test helpers. Never linked into production binaries."
+
+[lints]
+workspace = true
+
+[dependencies]
+arrow-array.workspace = true
+arrow-row.workspace = true
+arrow-schema.workspace = true
+arrow-select.workspace = true
+async-trait.workspace = true
+data-avalanche-core.workspace = true
+futures-util.workspace = true
+object_store.workspace = true
+rustls.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+tokio-postgres.workspace = true
+mysql_async.workspace = true

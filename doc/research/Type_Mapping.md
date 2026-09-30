@@ -1,12 +1,12 @@
 ---
-updated: 2026-06-20
+updated: 2026-09-30
 domain: Data Types
-tags: [data-types, mapping, arrow, iceberg, postgres, mysql, cdc]
+tags: [data-types, mapping, arrow, iceberg, delta-lake, multi-sink, postgres, mysql, cdc]
 resolves: G-18
 sources: []
 ---
 
-# Data Type Mapping: Sources → ColumnValue → Arrow → Iceberg
+# Data Type Mapping: Sources → ColumnValue → Arrow → Sink (Iceberg | Delta)
 
 ## Overview
 
@@ -17,13 +17,14 @@ each hop correctly.
 ```
 PostgreSQL wire (OID + binary)    ─┐
                                    ├─► [Decode] ──► ColumnValue ──► [Accumulate] ──► Arrow DataType ──► [Sink] ──► Iceberg Type
-MySQL binlog (column type code)   ─┘
+MySQL binlog (column type code)   ─┘                                   + logical tag             └──► Delta Type
                                         Phase 2          Phase 3                        Phase 4
-                                     source-specific   source-agnostic             iceberg-rust handles
-                                     per-crate          Rust code                  most of this
+                                     source-specific   source-agnostic             per-sink (sink.type):
+                                     per-crate          Rust code                  iceberg-rust / delta-rs
 ```
 
-**Hop 1 (Decode):** `pgwire-replication` / `mysql-binlog-connector-rust` decode the wire
+**Hop 1 (Decode):** our pgoutput decoder (over the `pgwire-replication` transport) and the
+`mysql_async` / `mysql_common` binlog row decoder (S-MY probes) decode the wire
 binary into `ColumnValue` variants. All source-specific type knowledge lives here.
 
 **Hop 2 (Accumulate):** `BatchAccumulator` maps each `ColumnValue` variant to an Arrow
@@ -31,9 +32,12 @@ binary into `ColumnValue` variants. All source-specific type knowledge lives her
 for each column — derived from the `ColumnValue` variant plus column metadata loaded during
 schema resolution.
 
-**Hop 3 (Sink):** `iceberg-rust` translates an Arrow `Schema` into an Iceberg `Schema` when
-creating or evolving a table. The crate handles most standard Arrow types automatically;
-non-standard variants (e.g. `FixedSizeBinary(16)` intended as UUID) need explicit annotation.
+**Hop 3 (Sink):** the pipeline's sink (`sink.type`) translates the canonical Arrow `Schema` into
+its table format's schema when creating or evolving a table — **3a** Iceberg via `iceberg-rust`,
+**3b** Delta Lake via `delta-rs`. Where Arrow alone is ambiguous, the accumulator attaches a
+**logical type tag** in field metadata (`data-avalanche.logical`, see "Logical type tags" below); the
+accumulator never knows the target format, and any value conversion a format needs (e.g. uuid →
+string for Delta) happens inside that sink. See `Multi_Sink_Architecture_and_Delta_Lake.md` §6.5.
 
 ---
 
@@ -67,7 +71,7 @@ ColumnValue = Null
             | Bytes(Vec<u8>)
             | Timestamp { value: DateTime<Utc>, with_tz: bool }  // ➕ Gap A fixed
             | Date(NaiveDate)
-            | Time(NaiveTime)                         // ➕ Gap D: TIME columns (PG + MySQL)
+            | Time(NaiveTime)                         // ➕ Gap D: TIME columns (PG + MySQL); landed as Time(i64), Q-M3-3
             | Uuid(Uuid)
             | Json(serde_json::Value)
             | Array { element_type: ColumnValueType, values: Vec<ColumnValue> }  // ➕ Gap B fixed
@@ -87,6 +91,10 @@ ColumnValueType = NullType | BoolType | Int16Type | Int32Type | Int64Type
 | B — `Array` element type | Accumulator cannot build a typed `arrow::array::ListBuilder<T>` without knowing `T`; would have to fall back to opaque `LargeUtf8`, defeating columnar analytics |
 | C — `UInt64` | MySQL `BIGINT UNSIGNED` has a value range 0..2⁶⁴−1 which overflows `i64`; silently truncating is a correctness bug |
 | D — `Time(NaiveTime)` | PG `time` and MySQL `TIME` have no date component; forcing into `Timestamp` requires an arbitrary epoch date and produces misleading data |
+
+**Representation (v1, 2026-09-26):** `Timestamp` carries `micros: i64` and `Date` carries `i32` days since
+the Unix epoch, exactly the ranges of Arrow `Timestamp(Microsecond)` and `Date32`. chrono's
+`DateTime`/`NaiveDate` are narrower, so they couldn't hold the clamped edge values below.
 
 ---
 
@@ -112,15 +120,15 @@ Column type information arrives via the pgoutput **Relation** message (OID per c
 | `text` | 25 | `Text(String)` | `Utf8` | `string` | |
 | `"char"` (single-byte internal) | 18 | `Int16(i16)` | `Int8` | `int` | Internal PG type; rare in user tables |
 | `name` | 19 | `Text(String)` | `Utf8` | `string` | Internal PG type; max 63 bytes |
-| `bytea` | 17 | `Bytes(Vec<u8>)` | `LargeBinary` | `binary` | |
+| `bytea` | 17 | `Bytes(Vec<u8>)` | `Binary` | `binary` | |
 | `oid` | 26 | `Int64(i64)` | `Int64` | `long` | Technically u32; widened to avoid sign issues |
 
 ### Date and Time Types
 
 | PostgreSQL Type | OID | ColumnValue Variant | Arrow DataType | Iceberg Type | Notes |
 |----------------|-----|--------------------|--------------|-----------|----|
-| `date` | 1082 | `Date(NaiveDate)` | `Date32` | `date` | Days since Unix epoch |
-| `time` | 1083 | `Time(NaiveTime)` | `Time64(Microsecond)` | `time` | Microseconds since midnight |
+| `date` | 1082 | `Date(i32)` | `Date32` | `date` | Days since Unix epoch; `±infinity` clamps (see Date/time edge values) |
+| `time` | 1083 | `Time(i64)` | `Time64(Microsecond)` | `time` | Signed microseconds; `24:00:00` is 86 400 000 000 (see Date/time edge values) |
 | `timetz` / `time with time zone` | 1266 | `Text(String)` | `Utf8` | `string` | ⚠ No Arrow/Iceberg equivalent; serialized as ISO-8601 |
 | `timestamp` | 1114 | `Timestamp { value, with_tz: false }` | `Timestamp(Microsecond, None)` | `timestamp` | No timezone; microsecond precision |
 | `timestamptz` / `timestamp with time zone` | 1184 | `Timestamp { value, with_tz: true }` | `Timestamp(Microsecond, Some("UTC"))` | `timestamptz` | PG always stores UTC internally |
@@ -162,12 +170,12 @@ via SQL `LIKE` and `CAST` in engines like Spark or Trino.
 | `uuid` | 2950 | `Uuid(Uuid)` | `FixedSizeBinary(16)` | `uuid` | Stored as 16 raw bytes; iceberg-rust maps `FixedSizeBinary(16)` → `uuid` |
 | `json` | 114 | `Json(serde_json::Value)` | `Utf8` | `string` | Serialized as compact JSON string |
 | `jsonb` | 3802 | `Json(serde_json::Value)` | `Utf8` | `string` | Semantically same as json after decode |
-| `bit(n)` | 1560 | `Bytes(Vec<u8>)` | `FixedSizeBinary(⌈n/8⌉)` | `fixed(⌈n/8⌉)` | MSB-first packed |
-| `varbit(n)` | 1562 | `Bytes(Vec<u8>)` | `LargeBinary` | `binary` | Length-prefixed |
+| `bit(n)` | 1560 | `Bytes(Vec<u8>)` | `Binary` | `fixed(⌈n/8⌉)` | MSB-first packed |
+| `varbit(n)` | 1562 | `Bytes(Vec<u8>)` | `Binary` | `binary` | Length-prefixed |
 | User-defined `ENUM` | varies | `Text(String)` | `Utf8` | `string` | pgoutput sends the label string, not the OID index |
 | `hstore` | 16935 (ext) | `Json(serde_json::Value)` | `Utf8` | `string` | Decoded as `{"key":"val"}` JSON object |
 | `any[]` (array of type T) | varies | `Array { element_type, values }` | `List<T_arrow>` | `list<T_iceberg>` | Element type resolved from OID; nested arrays supported recursively |
-| PostGIS `geometry` / `geography` | ext | `Bytes(Vec<u8>)` | `LargeBinary` | `binary` | WKB (Well-Known Binary) format |
+| PostGIS `geometry` / `geography` | ext | `Bytes(Vec<u8>)` | `Binary` | `binary` | WKB (Well-Known Binary) format |
 | Composite / user-defined | varies | `Text(String)` | `Utf8` | `string` | Serialized as `(f1,f2,...)` PG text; ⚠ consider `Bytes` for non-UTF data |
 
 ### PostgreSQL-Specific Decision Notes
@@ -194,7 +202,8 @@ from the Relation messages and supplemented by a startup `pg_type` query.
 ## MySQL Type Mapping
 
 Column type information arrives via the **TABLE_MAP_EVENT** in the MySQL binlog. The
-`mysql-binlog-connector-rust` crate exposes the column type code and optional metadata.
+`mysql_async` binlog stream (`mysql_common` row decoding; it replaced `mysql-binlog-connector-rust`,
+see `prototypes/source-capability/`) exposes the column type code and optional metadata.
 `ENUM` and `SET` member lists, column signedness, and `TINYINT(1)` display widths require
 supplementary schema data from `information_schema` — this is the primary reason
 `schema_evolution.method: query` is the default for MySQL.
@@ -242,25 +251,25 @@ When disabled, `TINYINT(1)` maps as `TINYINT SIGNED` → `Int16`.
 | `TINYTEXT` | `Text(String)` | `Utf8` | `string` | Max 255 bytes |
 | `TEXT` | `Text(String)` | `Utf8` | `string` | Max 65,535 bytes |
 | `MEDIUMTEXT` | `Text(String)` | `Utf8` | `string` | Max 16 MiB |
-| `LONGTEXT` | `Text(String)` | `LargeUtf8` | `string` | Max 4 GiB; `LargeUtf8` for 64-bit offset |
+| `LONGTEXT` | `Text(String)` | `Utf8` | `string` | Max 4 GiB at the server, but a replicated value is at most 1 GiB (`max_allowed_packet`); batches roll over instead of `LargeUtf8` (see Arrow widths at Hop 2) |
 
 ### Binary Types
 
 | MySQL Type | ColumnValue | Arrow DataType | Iceberg Type | Notes |
 |-----------|------------|--------------|-----------|-------|
-| `BINARY(n)` | `Bytes(Vec<u8>)` | `FixedSizeBinary(n)` | `fixed(n)` | Right-padded with `\0` |
-| `VARBINARY(n)` | `Bytes(Vec<u8>)` | `LargeBinary` | `binary` | |
-| `TINYBLOB` | `Bytes(Vec<u8>)` | `LargeBinary` | `binary` | Max 255 bytes |
-| `BLOB` | `Bytes(Vec<u8>)` | `LargeBinary` | `binary` | |
-| `MEDIUMBLOB` | `Bytes(Vec<u8>)` | `LargeBinary` | `binary` | |
-| `LONGBLOB` | `Bytes(Vec<u8>)` | `LargeBinary` | `binary` | Max 4 GiB |
+| `BINARY(n)` | `Bytes(Vec<u8>)` | `Binary` | `fixed(n)` | Right-padded with `\0` |
+| `VARBINARY(n)` | `Bytes(Vec<u8>)` | `Binary` | `binary` | |
+| `TINYBLOB` | `Bytes(Vec<u8>)` | `Binary` | `binary` | Max 255 bytes |
+| `BLOB` | `Bytes(Vec<u8>)` | `Binary` | `binary` | |
+| `MEDIUMBLOB` | `Bytes(Vec<u8>)` | `Binary` | `binary` | |
+| `LONGBLOB` | `Bytes(Vec<u8>)` | `Binary` | `binary` | Max 4 GiB |
 
 ### Date and Time Types
 
 | MySQL Type | ColumnValue | Arrow DataType | Iceberg Type | Notes |
 |-----------|------------|--------------|-----------|-------|
-| `DATE` | `Date(NaiveDate)` | `Date32` | `date` | |
-| `TIME[(fsp)]` | `Time(NaiveTime)` | `Time64(Microsecond)` | `time` | `fsp` 0–6; normalize to microseconds |
+| `DATE` | `Date(i32)` | `Date32` | `date` | `0000-00-00` → NULL; zero-in-part / invalid dates halt the table (see Date/time edge values) |
+| `TIME[(fsp)]` | `Time(i64)` | `Time64(Microsecond)` | `time` | `fsp` 0–6; an elapsed time, −838:59:59…838:59:59, as signed microseconds (see Date/time edge values) |
 | `DATETIME[(fsp)]` | `Timestamp { value, with_tz: false }` | `Timestamp(Microsecond, None)` | `timestamp` | No timezone; MySQL stores as-is |
 | `TIMESTAMP[(fsp)]` | `Timestamp { value, with_tz: true }` | `Timestamp(Microsecond, Some("UTC"))` | `timestamptz` | MySQL converts to UTC on write; returned as UTC |
 | `YEAR` | `Int32(i32)` | `Int32` | `int` | 4-digit year integer (1901..2155); 0000 is also valid |
@@ -272,11 +281,51 @@ When disabled, `TINYINT(1)` maps as `TINYINT SIGNED` → `Int16`.
 | `JSON` | `Json(serde_json::Value)` | `Utf8` | `string` | MySQL's binary JSON decoded to value, serialized as string |
 | `ENUM('a','b',...)` | `Text(String)` | `Utf8` | `string` | Binlog TABLE_MAP carries member list; decode integer index to label |
 | `SET('a','b',...)` | `Array { element_type: TextType, values }` | `List<Utf8>` | `list<string>` | Binlog carries bitmask; decode to list of active member labels |
-| `BIT(N)` | `Bytes(Vec<u8>)` | `FixedSizeBinary(⌈N/8⌉)` | `fixed(⌈N/8⌉)` | MSB-first packed bits; N ∈ 1..64 |
-| `GEOMETRY` | `Bytes(Vec<u8>)` | `LargeBinary` | `binary` | WKB format |
-| `POINT`, `LINESTRING`, `POLYGON`, `MULTIPOINT`, `MULTILINESTRING`, `MULTIPOLYGON`, `GEOMETRYCOLLECTION` | `Bytes(Vec<u8>)` | `LargeBinary` | `binary` | WKB format |
+| `BIT(N)` | `Bytes(Vec<u8>)` | `Binary` | `fixed(⌈N/8⌉)` | MSB-first packed bits; N ∈ 1..64 |
+| `GEOMETRY` | `Bytes(Vec<u8>)` | `Binary` | `binary` | WKB format |
+| `POINT`, `LINESTRING`, `POLYGON`, `MULTIPOINT`, `MULTILINESTRING`, `MULTIPOLYGON`, `GEOMETRYCOLLECTION` | `Bytes(Vec<u8>)` | `Binary` | `binary` | WKB format |
 
 ---
+
+## Date/time edge values (Q-M5-1, Q-M7-1 — decided 2026-09-26)
+
+**PostgreSQL — clamp.** `infinity` / `-infinity` and values outside the Arrow range clamp to the
+Arrow maximum/minimum of the column's Arrow type: `Date32` → `i32::MIN` / `i32::MAX` days;
+`Timestamp(Microsecond, _)` → `i64::MIN` / `i64::MAX` µs.
+
+| PostgreSQL value | Written as |
+|---|---|
+| `date` / `timestamp` / `timestamptz` `-infinity` | Arrow minimum |
+| `date` / `timestamp` / `timestamptz` `infinity` | Arrow maximum |
+| `timestamp[tz]` beyond the i64-µs range (294247–294276 AD) | Arrow maximum |
+
+The clamped values are valid Arrow and Parquet values. Some query engines can't render years that
+far out; the M4 type round-trip test (source → Delta → DuckDB `delta_scan`) pins what readers see.
+
+**MySQL / MariaDB — NULL for "no date", halt for invalid dates.** Measured 2026-09-26: MySQL 8.4's
+default `sql_mode` rejects all of the values below, but any session can relax it
+(`sql_mode=''`); **MariaDB 11.8's default `sql_mode` accepts zero dates and zero-in-part dates**;
+`ALLOW_INVALID_DATES` stores days like `2024-02-31` on both. The binlog carries what was stored.
+
+| MySQL/MariaDB value | Written as |
+|---|---|
+| All-zero `DATE` `0000-00-00`, `DATETIME` / `TIMESTAMP` `0000-00-00 00:00:00` | **NULL**. It is the server's "no date" sentinel and carries no information. Non-key columns are always nullable in the sink (Multi_Sink §6). In an **identifier (key) column**, NULL is impossible → halt as below |
+| Zero month or day (`2024-00-15`, `2024-05-00 10:00:00`; accepted without `NO_ZERO_IN_DATE`) | **Halt the table** `INVALID_DATE_VALUE` |
+| Impossible day of month (`2024-02-31`; `ALLOW_INVALID_DATES`) | **Halt the table** `INVALID_DATE_VALUE` |
+
+`INVALID_DATE_VALUE` halts only that table (other tables continue). The message names the table,
+column, raw value and binlog position, and gives the remedy: set
+`tables.column_type_overrides: {<column>: string}`, which replicates the server's raw text
+(`2024-00-15`), then resume or re-snapshot the table; or correct the source rows. A partial date
+such as `1980-00-00` usually means "year known, month/day unknown", so no silent conversion
+(clamp or NULL) is applied.
+
+**`time` — signed microseconds (Q-M3-3, decided 2026-09-29).** `ColumnValue::Time(i64)` holds
+signed microseconds of elapsed time, so both engines' full ranges fit without clamping: PostgreSQL
+`time` is `0…86 400 000 000` (`24:00:00` included), MySQL/MariaDB `TIME` is an interval of
+−838:59:59…838:59:59. Arrow `Time64(Microsecond)` holds any `i64`. Delta has no `time` type: Hop 3b
+writes `time_text`'s `[-]HH:MM:SS.ffffff` (`24:00:00.000000`, `838:59:59.000000`,
+`-01:30:00.500000`), which keeps out-of-day values.
 
 ## Unsupported Type Policy
 
@@ -286,13 +335,13 @@ Any column type encountered that is not in the tables above follows this priorit
 1. If a per-column override is configured (tables.column_type_overrides):
       → apply the override mapping
 2. If the type is a PG array of an unsupported element type:
-      → store as Text(String) → LargeUtf8 → Iceberg string
+      → store as Text(String) → Utf8 → Iceberg string
          (PG text representation of the array, e.g. `{a,b,c}`)
 3. If the type's wire encoding is textual (most PG types support text output):
       → Text(String) → Utf8 → Iceberg string
          log WARN: "column <name> type <type> has no native mapping; stored as string"
 4. If the type's wire encoding is binary-only with no text fallback:
-      → Bytes(Vec<u8>) → LargeBinary → Iceberg binary
+      → Bytes(Vec<u8>) → Binary → Iceberg binary
          log WARN: "column <name> type <type> stored as raw bytes"
 5. If neither is possible (type decode error):
       → halt the column (treat as NULL for all events); log ERROR
@@ -304,7 +353,28 @@ operators know which columns require attention.
 
 ---
 
-## Hop 3 Annotation: Arrow → Iceberg Type Mapping (via iceberg-rust)
+## Logical type tags (sink-neutral, Hop 2 → Hop 3 boundary)
+
+The accumulator's Arrow field carries `data-avalanche.logical = <tag>` in field metadata whenever the
+Arrow type does not determine the intended type on its own. The same vocabulary is the grammar of
+`tables.column_type_overrides` (config §9.3, V-078/V-087):
+
+`bool` · `int16` · `int32` · `int64` · `float32` · `float64` · `decimal(P,S)` · `string` · `binary` ·
+`date` · `time` · `timestamp_tz` · `timestamp_ntz` · `uuid` · `json` · `list<T>`
+
+Tags actually attached by Hop 2: `uuid` (FixedSizeBinary(16)), `time`, `json` (Utf8), `timestamp_tz` /
+`timestamp_ntz` (explicit, because Iceberg `timestamp` = *without* tz while Delta `timestamp` = *with*
+tz), `uint64` provenance on `Decimal128(20,0)` (informational), `enum` / `set` provenance on Utf8 /
+List<Utf8> (informational; attached once the MySQL decoder lands, M7).
+
+**Arrow widths at Hop 2 (D-M3.5, `doc/v1.0/M3-core-data-path.md`).** Every byte column is `Binary` and
+every text column `Utf8`, never the `Large*` types; `FixedSizeBinary(16)` is used only for `uuid`.
+A value is at most 1 GiB (the PostgreSQL and MySQL limits), and the accumulator rolls a batch over
+before its rows reach 512 MiB, so a column stays under the `i32` offsets. Fixed-width source types
+(`BINARY(n)`, `bit(n)`, `BIT(N)`) are `Binary` in Arrow; the Iceberg `fixed(n)` in the tables above is
+chosen from the source type at Hop 3a (v2).
+
+## Hop 3a: Arrow → Iceberg Type Mapping (via iceberg-rust)
 
 `iceberg-rust` handles Arrow → Iceberg type conversion automatically for standard types.
 Non-obvious mappings that need explicit annotation in the `SchemaBuilder`:
@@ -336,6 +406,39 @@ field-level hint mechanism (`{"iceberg.type":"uuid"}` / `IcebergType::Uuid`) exi
 iceberg-rust version (fold into the `prototypes/iceberg-capability/` probe). **If the annotation is
 unavailable**, fall back to `fixed(16)` (raw bytes, data intact, only the `uuid` logical type lost) or
 canonical `string` (text uuid) — both lossless of data; the impact is cosmetic.
+
+## Hop 3b: Arrow → Delta Lake Type Mapping (via delta-rs 1.0)
+
+Delta's type system has no `uuid`, `time`, `fixed(n)` or unsigned integers; the Delta sink converts
+those columns inside its own Hop 3 (the accumulator is unchanged).
+
+| Arrow DataType (+ tag) | Delta type | Conversion in the sink? |
+|---------------|-------------|---------------------|
+| `Boolean` | `boolean` | No |
+| `Int8` | `byte` | No |
+| `Int16` | `short` | No |
+| `Int32` | `integer` | No |
+| `Int64` | `long` | No |
+| `Float32` / `Float64` | `float` / `double` | No |
+| `Decimal128(P, S)`, P ≤ 38 (incl. `uint64` → `decimal(20,0)`) | `decimal(P, S)` | No |
+| `Utf8` (incl. `json`, `enum`, overflowed `numeric`) | `string` | No (Variant for `json` is a later option) |
+| `Binary` | `binary` | No |
+| `Date32` | `date` | No |
+| `Time64(Microsecond)` (`time`) | `string` `HH:MM:SS.ffffff` | **Yes** — D-MS.8; override to `int64` for µs-since-midnight |
+| `Timestamp(Microsecond, Some("UTC"))` (`timestamp_tz`) | `timestamp` | No |
+| `Timestamp(Microsecond, None)` (`timestamp_ntz`) | `timestamp_ntz` (table feature `timestampNtz`; default) — or per `sink.delta.timestamp_ntz_as`: `timestamp` (wall clock as UTC instant) / `string` | Only for `timestamp` / `string` (DA-MS-8) |
+| `FixedSizeBinary(16)` (`uuid`) | `string` (canonical 36-char, lowercase) | **Yes** |
+| `FixedSizeBinary(n)`, n ≠ 16 | `binary` | **Yes** (cast) |
+| `List<T>` (incl. `set` → `list<string>`) | `array<T>` | No |
+| `Struct(fields)` | `struct<…>` | No |
+| unsigned Arrow types | — | Never reach Hop 3 (pre-converted in Hop 2, same as 3a) |
+
+**Verified 2026-09-26 (probe P10, `prototypes/delta-capability/`):** every row above round-trips
+exactly through the sink's append and MERGE paths and is read back identically by delta-rs and by
+DuckDB's `delta_scan` (delta-kernel). **Interop note:** a `timestamp_ntz` column upgrades the table to
+reader v3 / writer v7 (`timestampNtz` table feature); readers without table-feature support cannot
+open it (gap DA-MS-8). **Decided (D-MS.16):** keep `timestamp_ntz` by default; `sink.delta.timestamp_ntz_as:
+timestamp | string` is the explicit escape hatch for legacy-reader estates (config V-114).
 
 ---
 
@@ -407,13 +510,14 @@ defaults:
                                    # re_query: issue a SELECT to fetch current value (adds latency).
 
   tables:
-    column_type_overrides: {}  # optional. map of column name → target Iceberg type string.
-                               # e.g.:  public.orders.amount: "decimal(38, 10)"
+    column_type_overrides: {}  # optional. map of column name → sink-neutral logical type
+                               # (grammar: see "Logical type tags"; never a format-specific name).
+                               # e.g.:  public.orders.amount: "decimal(38,10)"
                                # e.g.:  public.orders.payload: "binary"
                                # overrides apply at schema resolution time.
     numeric_overflow_action: string  # optional, string (default) | error.
                                      # action when numeric(P,S) with P > 38 is encountered.
-                                     # 'string': store as Iceberg string with a WARN log.
+                                     # 'string': store as logical string with a WARN log.
                                      # 'error': halt the table.
 ```
 
@@ -423,7 +527,7 @@ defaults:
 
 | Constraint | Severity | Message |
 |-----------|----------|---------|
-| `column_type_overrides` value is not a valid Iceberg type string | error | "invalid Iceberg type `<value>` in column_type_overrides for `<table>.<column>`" |
+| `column_type_overrides` value is not a valid logical type (merged as V-078; per-sink mappability V-087) | error | "invalid logical type `<value>` in column_type_overrides for `<table>.<column>`" |
 | `source.mysql.tinyint1_detection: information_schema` with `schema_evolution.method: events` | warning | "tinyint1_as_bool requires information_schema queries; schema_evolution.method:events cannot detect display width changes — set method:query" |
 | `toast_strategy: re_query` with `snapshot_mode: always` | warning | "re_query TOAST strategy on high-volume snapshots may saturate the control connection pool" |
 | `numeric_overflow_action: error` and any source table has unscaled `numeric` columns | warning (emitted at schema resolution) | "numeric column `<col>` has no precision declared; overflow action is 'error' which may halt the table unexpectedly — consider explicit column_type_override" |
@@ -445,5 +549,6 @@ It depends on the following sources from the notebook index:
 - **Apache Iceberg Rust 0.9.0 Release** — Arrow → Iceberg schema conversion API in iceberg-rust
 - **Apache Iceberg Catalogs: Types & How to Choose** — Iceberg type system definition
 - **rustcdc** — ColumnValue enum scope and integration contract
-- **mysql-binlog-connector-rust** — MySQL column type decoding, ENUM/SET bitmask handling
+- **mysql-binlog-connector-rust** — MySQL column type decoding, ENUM/SET bitmask handling (original
+  reference; the implementation uses `mysql_async` / `mysql_common`)
 - **pgwire-replication** — PG OID-based column type delivery, TOAST sentinel handling

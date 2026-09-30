@@ -1,7 +1,7 @@
 ---
-updated: 2026-06-20
+updated: 2026-09-30
 domain: Architecture
-tags: [architecture, data-flow, pipeline, cdc, iceberg, arrow, snapshot, replication]
+tags: [architecture, data-flow, pipeline, cdc, iceberg, delta-lake, multi-sink, arrow, snapshot, replication]
 sources: []
 ---
 
@@ -13,8 +13,10 @@ Each pipeline moves data through four sequential stages:
 
 1. **Source** — connect to the database and receive change events (WAL / binlog)
 2. **Decode** — translate raw protocol messages into typed `CdcEvent` structs
-3. **Accumulate** — batch row-oriented events into columnar Arrow `RecordBatch` objects
-4. **Sink** — encode batches as Parquet, write to cloud storage, commit an Iceberg snapshot
+3. **Accumulate** — batch row-oriented events into columnar Arrow `RecordBatch` objects and, at
+   flush, **collapse** them per key into a sink-neutral `TableChangeSet`
+4. **Sink** — commit each table's change set to the pipeline's target table format (`sink.type`:
+   Iceberg or Delta Lake) in cloud storage, atomically per table
 
 Two paths feed the accumulate stage: **streaming replication** (steady-state) and **snapshot** (initial load or on-demand). Both produce the same `CdcEvent` type so the rest of the pipeline is source-agnostic.
 
@@ -31,11 +33,11 @@ Two paths feed the accumulate stage: **streaming replication** (steady-state) an
 │  │ Reader       │                  │                  │                 │
 │  └──────────────┘                  └──────────────────┘                 │
 │                                                                         │
-│   flush_lsn ◄──── flush_confirmation ◄──── Iceberg Writer ◄───────────  │
+│   flush_lsn ◄──── flush_confirmation ◄──── Sink Writer    ◄───────────  │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-All tasks communicate via `tokio::sync::mpsc` channels. Backpressure is automatic: a slow Iceberg writer fills the channel and stalls the accumulator, which stalls the replication reader, which stops advancing the source offset — no data is lost.
+All tasks communicate via `tokio::sync::mpsc` channels. Backpressure is automatic: a slow sink writer fills the channel and stalls the accumulator, which stalls the replication reader, which stops advancing the source offset — no data is lost.
 
 ---
 
@@ -45,7 +47,7 @@ On worker start (or when a pipeline is assigned via the consistent hash ring), t
 
 ```
 1. Load pipeline state from cloud storage
-   └── confirmed LSN / binlog name+position / GTID per table
+   └── confirmed position: PG LSN / MySQL GTID set / MariaDB GTID position / binlog file:pos
    └── snapshot status per table (none | in-progress | completed | broken)
    └── replication slot name (if PG)
 
@@ -59,13 +61,27 @@ On worker start (or when a pipeline is assigned via the consistent hash ring), t
    │  initial        │  yes                           │  stream                 │
    │  dump_always    │  either                        │  snapshot, then stop    │
    |  dump_initial   |  no                            │  snapshot, then stop    │
-   |  dump_initial   |  yes, and catalog has table    │  stop                   │
-   |  dump_initial   |  yes, and not table in catalog |  snapshot, then stop    │
+   |  dump_initial   |  yes, and sink has table †     │  stop                   │
+   |  dump_initial   |  yes, and sink lacks table †   |  snapshot, then stop    │
    └────────────────────────────────────────────────────────────────────────────┘
+   † "sink has table" = catalog entry (Iceberg) / table metadata `_delta_log` (Delta, no catalog
+     in v1) — reported by the sink's `table_state()`.
 
 3. Apply table include/exclude glob filters → resolved table set
+   └── per resolved table: a source column named like a lineage column → halt that table
+       (`RESERVED_COLUMN_COLLISION`, Configuration_Specification.md §5)
 
-4. Start Snapshot Reader (if required) and/or Replication Reader
+4. Sink preflight (per pipeline):
+   ├── capability assertion — the sink confirms it supports everything this pipeline's config
+   │   needs (write mode, partition transforms, logical types of the resolved tables); otherwise
+   │   the pipeline is refused with the named capability (e.g. "Iceberg mirror mode requires a
+   │   delete-capable commit action")
+   ├── v1: `sink.type: iceberg` → pipeline refused ("the Iceberg sink ships in v2"); other
+   │   pipelines run
+   ├── pipeline state's recorded `sink_type` must equal `sink.type` (a change re-seeds; §State Layout)
+   └── each table root must not hold another format's metadata (no silent format mixing)
+
+5. Start Snapshot Reader (if required) and/or Replication Reader
 ```
 
 The resolved table set is the result of resolution of configured include filter, minus the exclude filter. Source of the full actual list of tables in the source database is the schema's data at the pipeline start moment. Glob patterns are evaluated against `schema.table` (e.g. `public.*`, `*.orders`).
@@ -86,10 +102,12 @@ READ LOCK` model (which could not resume mid-table — an exported snapshot dies
 1. Establish the stream:
    PG    — CREATE_REPLICATION_SLOT slot LOGICAL pgoutput; capture start_lsn (WAL retention begins);
            persist slot_name + start_lsn; stream from start_lsn.
-   MySQL — position the binlog stream at gtid_executed (COM_BINLOG_DUMP_GTID); stream immediately.
+   MySQL — position the binlog stream at the current position (gtid: COM_BINLOG_DUMP_GTID with
+           gtid_executed; binlog: COM_BINLOG_DUMP at SHOW BINARY LOG STATUS file:pos); stream immediately.
 
 2. Per table, ordered by the G-13 identifier — chunk loop:
-   a. lw  = current stream position            (pg_current_wal_lsn() / @@gtid_executed; read-only)
+   a. lw  = current stream position            (pg_current_wal_lsn() / @@gtid_executed /
+                                                 SHOW BINARY LOG STATUS file:pos; read-only)
    b. read chunk: SELECT ... WHERE (key) > (cursor) ORDER BY (key) LIMIT chunk_size
                   in a SHORT read-committed txn; buffer the rows
                   rows → CdcEvent { op: Snapshot (_op = r), after: Row, ... }
@@ -122,10 +140,13 @@ to parallel workers; keyset order is serial within a table.
 ```
 Replication connection (replication protocol, not SQL)
 │
-├─► START_REPLICATION SLOT <slot> LOGICAL <confirmed_flush_lsn>
-│       (proto_version '2', publication_names '<pub>')
+├─► Session pinned at connect (startup options):
+│       TimeZone=UTC, DateStyle=ISO, IntervalStyle=iso_8601, extra_float_digits=3
 │
-├─► Keepalive timer (tokio::time::interval, default 60s)
+├─► START_REPLICATION SLOT <slot> LOGICAL <confirmed_flush_lsn>
+│       (proto_version '1', publication_names '<pub>')
+│
+├─► Status timer (`source.postgres.heartbeat`, default 60s; idle wakeup = same interval)
 │   └─► send StandbyStatusUpdate(write_lsn, flush_lsn, apply_lsn)
 │       advancing confirmed_flush_lsn after each committed + flushed batch
 │
@@ -149,24 +170,69 @@ Replication connection (replication protocol, not SQL)
 **REPLICA IDENTITY handling:**
 - `DEFAULT` (PK only): UPDATE messages carry the new tuple + PK of the old row; DELETE carries only the PK. The full old image is not available.
 - `FULL`: UPDATE and DELETE carry the complete old row image. Required for tables without a primary key.
-- `NOTHING`: DELETE events are unusable — the Iceberg writer cannot identify which row to mark deleted. Pipelines should reject tables with `REPLICA IDENTITY NOTHING`.
+- `NOTHING`: DELETE events are unusable — the sink cannot identify which row to delete. Pipelines should reject tables with `REPLICA IDENTITY NOTHING`.
 
-**TOAST columns:** Unchanged large columns in UPDATE events are represented by a "unchanged TOAST" marker, not the actual value. The pipeline must either re-fetch the value via a separate query or treat the column as unchanged and carry forward the last known value.
+**Protocol and client (probe-verified, `prototypes/source-capability/` S-PG0…8):**
+- The client crate (`pgwire-replication`) is transport only; **the pgoutput decoder is ours**.
+- **`proto_version '1'`**, which the pinned crate sends, with no `streaming` option. A large
+  transaction arrives whole at commit, and the server spills it past `logical_decoding_work_mem`.
+  Without `streaming`, v1 and v2 carry the same messages. Oversized transactions are bounded on
+  our side (Phase 3: transaction buffer limit, opt-in split commits).
+- **Session pinning.** pgoutput's text values are rendered with the *walsender session's* settings,
+  not the writer's. Pinning TimeZone, DateStyle, IntervalStyle and `extra_float_digits` makes
+  decoding deterministic and float-exact.
+- **Idle acks.** The client sends status on message arrival or on its idle wakeup, which defaults to
+  10s in the crate. Setting the wakeup to the status interval bounds how late a quiet-period ack
+  reaches the slot. This is slot lag, not a correctness issue.
+
+**TOAST columns:** Unchanged large columns in UPDATE events arrive as an "unchanged TOAST" marker
+(pgoutput `u`), not the value. `source.toast_strategy` chooses the handling:
+
+- **`carry_forward` (default)** keeps the last known value without a source round-trip:
+  1. The decoder marks the column in the row's *unchanged* mask instead of inventing a value.
+  2. The collapse (keep-last per key) fills a masked column from an earlier image of the same key
+     in the same batch (under the old key after a key change), then from the event's before-image
+     when the source sent the column there (REPLICA IDENTITY FULL), or from the snapshot row it
+     supersedes; the mask bit is then cleared.
+  3. A column still masked at commit is written from the target: the Delta MERGE updates it with
+     `CASE WHEN <mask> THEN t.col ELSE s.col END`, so the stored value is kept.
+  4. An insert whose masked column cannot be resolved (no target row, e.g. `snapshot_mode: never`)
+     writes NULL and increments a metric. This includes an UPDATE that changes the key when the old
+     image is no longer buffered and the before-image doesn't carry the column (REPLICA IDENTITY
+     DEFAULT or USING INDEX): the value is not copied from the old key's row. A table whose key can
+     change and that has TOAST columns needs REPLICA IDENTITY FULL or `toast_strategy: re_query`.
+- **`re_query`** re-fetches the row over the control connection (V-077 warns on heavy snapshots).
+
 
 ---
 
 ## Phase 2b — Streaming Replication: MySQL
 
 ```
-Replication connection (COM_BINLOG_DUMP_GTID)
+Replication connection (binlog dump; replication_type gtid (default) or binlog)
 │
-├─► Send COM_BINLOG_DUMP_GTID with gtid_executed set from state storage
-│   └─► MySQL streams only transactions not in the set (gap-free, position-independent)
+├─► Detect the server flavour at connect (`SELECT version()`) → GTID dialect
+│
+├─► binlog (file/position) mode — see "File/position mode" below
+│
+├─► MySQL:   COM_BINLOG_DUMP_GTID with the gtid_executed set from state storage
+│   MariaDB: SET @mariadb_slave_capability=4, @slave_connect_state='<gtid_pos>',
+│            @slave_gtid_strict_mode=1, then COM_BINLOG_DUMP
+│   └─► the server streams only transactions not in the set (gap-free, position-independent)
+│
+├─► SET @master_heartbeat_period before the dump (idle-connection liveness)
 │
 └─► Event loop:
     │
-    ├─► GTID_LOG_EVENT
+    ├─► GTID_LOG_EVENT (MySQL) / GTID_EVENT, type 162 (MariaDB — decoded by us:
+    │   seq_no u64 LE, domain u32 LE, server_id from the event header)
     │   └─► record current_gtid for this transaction
+    │
+    ├─► TRANSACTION_PAYLOAD_EVENT (binlog transaction compression)
+    │   └─► validate: header parses, decompressed length == uncompressed_size,
+    │       ≥ 1 inner event; mismatch → halt the PIPELINE (BINLOG_PAYLOAD_INVALID,
+    │       with binlog file/position + GTID)
+    │   └─► process the inner events as below
     │
     ├─► QUERY_EVENT (BEGIN)
     │   └─► record transaction start
@@ -186,11 +252,40 @@ Replication connection (COM_BINLOG_DUMP_GTID)
     │
     ├─► XID_EVENT
     │   └─► emit TransactionBoundary(current_gtid) to accumulator
-    │   └─► update local gtid_executed set
+    │   └─► update the local position (MySQL gtid_executed set / MariaDB gtid_binlog_pos /
+    │       file/position mode: current file + the event's end_log_pos)
     │
     └─► ROTATE_EVENT
         └─► update current binlog filename; clear table_id cache
 ```
+
+**Client (probe-verified, `prototypes/source-capability/` S-MY0…9):** `mysql_async` binlog stream for
+MySQL 8.4 and MariaDB 11.4 (MariaDB is in v1 — D-V1.5). The payload check is ours because the pinned
+crate **silently drops** a compressed transaction it cannot decompress (DA-SRC-12, D-V1.6). It halts the
+pipeline, not the table: the position cannot advance past a transaction that was not read.
+
+**File/position mode (`replication_type: binlog`, MySQL and MariaDB):**
+
+```
+Connect
+├─► read the server identity: MySQL @@server_uuid / MariaDB @@server_id
+├─► no stored position (first start):
+│     record the identity and SHOW BINARY LOG STATUS (MySQL 8.4) / SHOW BINLOG STATUS (MariaDB)
+│     as the start position; Phase 1 watermarks use the same statement
+├─► stored position present:
+│   ├─► identity differs from the recorded one → halt the PIPELINE (BINLOG_SOURCE_CHANGED):
+│   │     "binlog position <file>:<pos> was recorded on server <old>, now connected to <new>;
+│   │      file/position cannot be carried across servers — switch to replication_type: gtid
+│   │      or re-snapshot". No automatic recovery (a failover under file/position mode
+│   │      would otherwise silently skip or repeat transactions).
+│   ├─► file no longer in SHOW BINARY LOGS → binlog_purge_action (error | re_snapshot, G-26)
+│   └─► COM_BINLOG_DUMP at <file>:<pos>
+└─► Event loop as above (GTID events ignored); the position after each XID_EVENT is
+    (current file, end_log_pos); ROTATE_EVENT switches the file
+```
+
+Per-change order (`_seq`) in every MySQL mode is (binlog file index from the `.NNNNNN` suffix,
+`end_log_pos`), totally ordered within one server's log.
 
 ---
 
@@ -202,7 +297,8 @@ Both sources produce the same intermediate type. This is the boundary between so
 CdcEvent {
     op:        Op,              // Insert | Update | Delete | Snapshot
     table:     TableRef,        // { schema: String, name: String }
-    before:    Option<Row>,     // old image: present for Update (if FULL/PK) and Delete
+    before:    Option<Row>,     // old image: present for Update (if FULL/PK) and Delete; carries only
+                                // the columns the source sent (a PG key-only old tuple: the identity columns)
     after:     Option<Row>,     // new image: present for Insert, Update, Snapshot
     source_pos: SourcePosition, // COMMIT position: LSN (PG) or GtidSet (MySQL)
     change_seq: SourceSeq,      // PER-CHANGE order: PG change-LSN / MySQL (binlog_file,end_log_pos).
@@ -221,8 +317,8 @@ ColumnValue = Null
             | Numeric(Decimal)
             | Text(String)
             | Bytes(Vec<u8>)
-            | Timestamp { value: DateTime<Utc>, with_tz: bool }     // with_tz distinguishes timestamp vs timestamptz (Gap A)
-            | Date(NaiveDate)
+            | Timestamp { micros: i64, with_tz: bool }              // µs since Unix epoch; with_tz distinguishes timestamp vs timestamptz (Gap A)
+            | Date(i32)                                             // days since Unix epoch (= Arrow Date32 range; edge values clamp, Type_Mapping)
             | Time(NaiveTime)                                       // PG time / MySQL TIME, no date component (Gap D)
             | Uuid(Uuid)
             | Json(serde_json::Value)
@@ -251,7 +347,7 @@ Accumulator state (per-table):
 │
 ├─► SchemaBuilder         — builds Arrow schema from first event's column set
 ├─► Vec<ArrayBuilder>     — one Arrow array builder per column
-├─► metadata columns:     _op, _ts, _lsn, _source_db, _pipeline
+├─► metadata columns:     _op, _ts, _lsn, _seq, _source_db, _pipeline
 ├─► row_count: usize
 ├─► byte_estimate: usize
 └─► oldest_event_ts: Instant
@@ -265,8 +361,10 @@ For each incoming CdcEvent:
 ├─► Append metadata:
 │   ├─► _op:        'I' | 'U' | 'D' | 'r'  (r = snapshot/read)
 │   ├─► _ts:        commit_ts
-│   ├─► _lsn:       source_pos.to_string()
-│   └─► _source_db: pipeline.source.host + '/' + pipeline.source.database
+│   ├─► _lsn:       the commit position, untagged
+│   ├─► _seq:       change_seq in the fixed-width form (§Data Lineage)
+│   ├─► _source_db: pipeline.source.host + '/' + pipeline.source.database
+│   └─► _pipeline:  pipeline name
 │
 ├─► Update row_count += 1
 └─► Update byte_estimate += estimated_row_size
@@ -280,117 +378,220 @@ On TransactionBoundary(lsn):
 ```
 Flush trigger (OR semantics — first condition that fires):
 │
-├─► time:      now - oldest_event_ts  ≥  flush_interval      (default 60s)
+├─► time:      now - oldest_event_ts  ≥  flush_interval      (default 30s)
 ├─► rows:      row_count              ≥  max_rows            (default 100,000)
 └─► size:      byte_estimate          ≥  max_bytes           (default 512 MiB)
 
 Note: flush only occurs on a transaction boundary — never mid-transaction.
-This guarantees atomic transaction visibility in the Iceberg snapshot.
+This guarantees atomic transaction visibility in the committed table version.
 If schema change was detected during batch accumulation, it forces flush of all data accumulated before change event.
 ```
 
+**Collapse (sink-neutral, at flush).** Before a table's batch leaves the accumulator it is collapsed
+per identifier tuple (inferred source PK, or `tables.primary_key`), keep-last by `change_seq`
+(`_seq`) — `research/Ghost_Row_Dedup_and_Primary_Keys.md` §4. The result is the boundary type handed
+to the sink:
+
+```
+TableChangeSet {
+    table:      TableRef,
+    schema:     SchemaRef,          // canonical Arrow schema + logical-type field metadata
+                                    // (`data-avalanche.logical` = uuid | time | json | uint64 | …)
+    identifier: Vec<FieldName>,
+    truncate:   bool,               // a TRUNCATE barrier precedes this set
+    upserts:    Vec<RecordBatch>,   // ≤1 row per key: final image (I/U/r) + lineage columns
+    deletes:    Vec<RecordBatch>,   // ≤1 row per key: identifier (+ before-image partition columns)
+    position:   PositionRange,      // per-table source position covered (guard / HWM)
+    split:      Option<SplitInfo>,  // oversized-transaction slice marker (checkpoint pinning)
+}
+```
+
+A key appears in at most one of `upserts`/`deletes`; a PK-changing UPDATE is two keys
+(delete(old) + upsert(new)). A DELETE is a delete only — **mirror semantics**, never a `D` data row.
+Collapse is format-independent: every sink receives an already-collapsed change set.
+
+**TRUNCATE barrier.** A TRUNCATE of a tracked table (PG `T` message; MySQL `QUERY_EVENT` classifier) is
+sequenced like DDL: seal and flush the table's pre-truncate batch, then emit a change set with
+`truncate = true` carrying the post-truncate changes. The sink clears the table before applying them
+(Iceberg: overwrite-to-empty; Delta: delete-all, metadata-only). Idempotent under replay.
+
 **Oversized transactions (opt-in split commits).** When `sink.max_transaction_batch_rows` is set and a
-single source transaction exceeds it, the writer flushes **partial-transaction** Iceberg commits
+single source transaction exceeds it, the writer flushes **partial-transaction** sink commits
 instead of waiting for the source `COMMIT`, but **pins the durable resume checkpoint at the
 transaction's START** — `cdc.committed_position` does not advance past the txn until its `XID`/commit is
 seen. A crash mid-split replays the whole transaction; already-flushed slices re-write as idempotent
-upserts (no loss, no duplicate). Default `null` = unlimited = strict atomic visibility (a sub-threshold
+upserts (no loss, no duplicate). What the transaction writes after its last slice goes out with the
+next regular flush, whose range ends at the commit. Default `null` = unlimited = strict atomic visibility (a sub-threshold
 txn flushes as one commit). An absolute `sink.max_transaction_buffer_bytes` ceiling (default ~1 GiB)
 halts the pipeline (never OOMs the worker) if an unsplittable txn exceeds it. See
 `research/Large_Transaction_Handling.md` (G-29).
 
 ---
 
-## Phase 4 — Iceberg Write
+## Phase 4 — Sink Commit
 
-When the accumulator triggers a flush, it finalizes the Arrow `RecordBatch` for each table and sends it to the Iceberg writer.
+When the accumulator triggers a flush, it hands each table's `TableChangeSet` to the pipeline's sink
+(`sink.type`). The sink is a trait with per-format realizations; everything upstream is identical for
+every sink. See `research/Multi_Sink_Architecture_and_Delta_Lake.md` §6–§7.
+
+### Sink contract (all sinks)
+
+For every `TableChangeSet` the sink must:
+
+1. **Commit atomically per table** — upserts and deletes land as one visible table version; a
+   `truncate` clear precedes them in the same flush. Cross-table atomicity is not provided
+   (per-table commits).
+2. **Be idempotent under replay** — applying the same change set twice yields the same table content
+   (PK-upsert semantics). Idempotency is the correctness basis; the position guard is an optimization.
+3. **Fence zombies** — each commit carries a `CommitMarker { owner_epoch, committed_position,
+   pipeline_id }`; the commit is rejected (`Fenced`) if the table's latest **own** marker epoch is
+   greater than `owner_epoch` (clustering sink-side fence, `Clustering_Architecture_Research.md` §5.5).
+4. **Read markers from the latest commit authored by this application** — foreign commits (external
+   compaction/OPTIMIZE, expire) carry no marker; reading "the latest commit" would silently disarm the
+   fence (gap DA-X-10). Walk back to the last own commit, or use a carrier persisted in table state.
+5. **Evolve schemas within declared capabilities** — `evolve(delta)` returns `Applied`, `Degraded`
+   (e.g. Delta soft-drop, with warning + metric) or `Unsupported` (→ halt the table,
+   `Schema_Change_Detection_and_Evolution.md` §7).
+6. **Map logical → physical types** (Hop 3, `research/Type_Mapping.md`) inside the sink; the
+   accumulator never knows the target format.
+7. **Tolerate unmaintained tables** — never assume compaction/expiry has run.
+
+Outcome per table: `Committed{version}` | `SkippedCovered` (position guard) | `Fenced` (stop the
+pipeline; lease lost).
+
+**Position guard (optimization, not correctness):** before committing a table, the sink reads that
+table's own `committed_position` marker — an **engine-tagged** value (PG LSN, or **canonical GTID-set**
+string). If `committed_position.covers(flush.position_for_table)` (PG: `≥`; MySQL: GTID **subset**) the
+table is already committed and is skipped. A split slice (`split` set) ends at its transaction's
+pinned start, which the stored position equals from the first slice on; a slice is skipped only
+when the stored position is strictly past that start (the transaction's commit, or a later one, has
+landed). On commit, the new value is the `union` of the prior value
+and the flush's per-table position. The pipeline **resume checkpoint** persisted to state storage is the
+**laggard** across all tracked tables (PG `min` / MySQL set-intersection); tables ahead skip via the
+guard or are absorbed by idempotency. The epoch rejects a zombie writer; the position skips done work.
+See `research/Delivery_Guarantee_and_Position_Guard.md` (G-14).
+
+### Iceberg realization (`sink.type: iceberg`)
+
+> **Capability note.** Mirror mode needs a delete-capable Iceberg commit (row-delta / overwrite). No
+> published iceberg-rust version provides one (gap DA-SINK-1i); until one does, the Iceberg sink does
+> not declare the `mirror` write mode and an Iceberg `mirror` pipeline is refused at pipeline start.
 
 ```
-For each (TableRef, RecordBatch) in the flush batch:
+For each TableChangeSet:
 │
-├─► Schema reconciliation:
-│   ├─► Load current Iceberg table schema from catalog
-│   ├─► Compare with RecordBatch schema
-│   └─► If new columns present AND schema_evolution = add_columns:
-│           → open SchemaUpdate transaction, add columns, commit schema
-│       Else if incompatible AND schema_evolution = reject:
-│           → return error, pause pipeline
+├─► Schema reconciliation: load current Iceberg schema; apply pending evolution via evolve()
 │
-├─► Parquet encoding (spawn_blocking — CPU-bound):
-│   ├─► iceberg-rust encodes RecordBatch → Parquet byte stream
-│   ├─► compression: zstd (default)
-│   └─► row group size: aligned to RecordBatch size
+├─► Parquet encoding (spawn_blocking — CPU-bound): zstd; row group aligned to batch size
 │
-├─► Object storage write (OpenDAL):
-│   └─► PUT data/<uuid>.parquet to configured bucket/prefix
+├─► Object storage write (OpenDAL): PUT data/<uuid>.parquet (+ equality-delete files)
 │
-├─► Manifest entry creation:
-│   ├─► record file path, file size, row count
-│   └─► record per-column statistics (min/max for partition pruning)
+├─► Manifest entries: path, size, row count, per-column statistics
 │
-└─► Iceberg transaction commit:
-    ├─► TableTransaction::fast_append()  →  appends new data files
-    ├─► Atomic metadata.json update via catalog
-    │   (REST catalog: conditional HTTP PUT;
-    │    Glue: UpdateTable with expected version;
-    │    file-based: atomic rename or conditional PUT)
-    └─► On success: send flush_confirmation(lsn) back to accumulator
+└─► Iceberg transaction commit (catalog CAS on the metadata pointer):
+    REST: conditional HTTP PUT · Glue: UpdateTable with expected version ·
+    file-based: atomic rename or conditional PUT → flush_confirmation(lsn)
 ```
 
-**Position guard (optimization, not correctness):** correctness comes from row-level PK-upsert idempotency (G-13); the guard only skips already-done work. Before committing a table, the writer reads that table's `cdc.committed_position` from its Iceberg snapshot summary — an **engine-tagged** value (PG LSN, or **canonical GTID-set** string). If `committed_position.covers(flush.position_for_table)` (PG: `≥`; MySQL: GTID **subset**) the table is already committed and is skipped. On commit, the new value is the `union` of the prior value and the flush's per-table position. The pipeline **resume checkpoint** persisted to state storage is the **laggard** across all tracked tables (PG `min` / MySQL set-intersection); tables ahead skip via the guard or are absorbed by idempotency. `cdc.committed_position` coexists with `cdc.owner_epoch` (clustering fence) — orthogonal: the epoch rejects a zombie writer, the position skips done work. See `research/Delivery_Guarantee_and_Position_Guard.md` (G-14).
+Realization of the contract:
 
-### Sink-writer contract (consolidated)
-
-The Iceberg writer must, for every flush batch:
-
-1. **Key** each table by its **identifier** (inferred source PK via channel C, or `tables.primary_key`
-   override) as Iceberg `identifier-field-ids`; identifier columns are top-level, primitive, NOT NULL,
-   non-floating (`research/Ghost_Row_Dedup_and_Primary_Keys.md`, G-13).
-2. **Collapse** to ≤1 equality-delete + ≤1 data record per identifier tuple, keep-last by `change_seq`
-   (`_seq`). DELETE → equality-delete only (mirror; no `D` data row). INSERT/UPDATE/snapshot →
-   equality-delete(old key) + one data record (new image). A PK-changing UPDATE is two tuples:
-   delete(old key) + data(new key).
+1. **Key** by `identifier-field-ids` (top-level, primitive, NOT NULL, non-floating;
+   `research/Ghost_Row_Dedup_and_Primary_Keys.md`, G-13).
+2. `upserts` → equality-delete(key) + one data record; `deletes` → equality-delete only.
 3. **Sequence** the equality-delete file with the **enclosing commit's** data-sequence-number so the
-   strictly-less-than rule purges prior-commit versions but spares the same-commit insert
-   (**verification gate DA-SINK-1**; fallback: position-deletes / COW).
-4. **Route partition-scoped deletes by the BEFORE-image:** when a partition-source column changes, write
-   the equality-delete in the row's **old** partition (computed from the before-image), data in the new
-   partition — no cross-partition ghost (`research/Iceberg_Partitioning_and_Layout_Evolution.md`, G-24).
-5. **Stamp the snapshot summary** with `cdc.committed_position` (per-table HWM) and `cdc.owner_epoch`
-   (clustering fence); re-assert both on every commit (**gate DA-SINK-2**).
-6. **TRUNCATE** of a tracked table is a data-clear (overwrite-to-empty / delete-all), not a schema
-   change; same idempotent treatment for PG (`T` message) and MySQL (`QUERY_EVENT` classifier). *(Open:
-   confirm the exact Iceberg op — gap-analysis DA-X-5.)*
-7. **Tolerate unmaintained tables:** never assume compaction/expiry has run; planning and writes work
-   (slower) under deep delete-file stacks and many small files — v1 maintenance is external
-   (`research/Iceberg_Maintenance.md`, G-25).
+   strictly-less-than rule purges prior-commit versions but spares the same-commit insert.
+4. **Route partition-scoped deletes by the before-image** (old partition) when a partition-source
+   column changes (`research/Iceberg_Partitioning_and_Layout_Evolution.md`, G-24).
+5. **Marker carrier:** snapshot summary `cdc.owner_epoch` + `cdc.committed_position` + `cdc.pipeline`,
+   re-asserted on every commit (summaries are per-snapshot, not inherited). The epoch is also written
+   to the **`cdc.owner_epoch` table property in the same transaction**; the fence reads the **table
+   property** (authoritative — survives foreign commits and snapshot expiry), falling back to the
+   latest snapshot **authored by this application** if the property is absent. The position guard
+   reads `cdc.committed_position` from the latest own snapshot (walk-back by `cdc.pipeline`); none
+   retained ⇒ not covered (`Clustering_Architecture_Research.md` §5.5,
+   `Delivery_Guarantee_and_Position_Guard.md` §3, gap DA-X-10).
+6. **TRUNCATE:** overwrite-to-empty.
+7. **Maintenance:** external (`research/Iceberg_Maintenance.md`, G-25).
+
+### Delta Lake realization (`sink.type: delta`)
+
+One **MERGE** per table per flush (delta-rs, DataFusion engine), proven by
+`prototypes/delta-capability/` (P1–P7).
+
+```
+For each TableChangeSet:
+│
+├─► if truncate: DELETE (no predicate) — metadata-only removal of all files
+│
+├─► MERGE source = upserts ∪ deletes, with boolean __data_avalanche_del
+│   (deletes carry identifier + before-image partition columns; other columns NULL)
+│
+├─► MERGE INTO target t USING source s ON t.<id cols> = s.<id cols>
+│       [AND t.<part> IN (s.<old part>, s.<new part>) — pruning only, when partitioned]
+│     WHEN MATCHED AND s.__data_avalanche_del          THEN DELETE
+│     WHEN MATCHED AND NOT s.__data_avalanche_del      THEN UPDATE SET <all columns>
+│     WHEN NOT MATCHED AND NOT s.__data_avalanche_del  THEN INSERT <all columns>
+│
+└─► commit (put-if-absent of _delta_log/<N>.json; conflict checker on retry) carrying:
+      txn { app_id: "data-avalanche/<pipeline_id>/owner", version: owner_epoch }  ← fence carrier
+      commitInfo { "data-avalanche.committed_position", "data-avalanche.owner_epoch",
+                   "data-avalanche.pipeline" }                                   ← position carrier
+    → flush_confirmation(lsn)
+```
+
+Realization of the contract:
+
+1. **Fence:** pre-check the table's `txn` version for the owner `app_id`; `> owner_epoch` → `Fenced`.
+   A concurrent commit carrying the same `app_id` makes a stale writer's commit fail
+   (`ConcurrentTransaction`). The `txn` version lives in table state, so it survives foreign commits.
+2. **Position:** read `data-avalanche.committed_position` from the latest own `commitInfo` (walk back).
+3. **No ghost-row hazard:** Delta has no equality deletes; MERGE rewrites the touched files, so there is
+   no sequence-number rule to engineer around. A PK-changing UPDATE is delete(old) + upsert(new) in the
+   same MERGE; a partition-changing UPDATE is matched by key across partitions.
+4. **Cost model:** each flush rewrites every data file whose key range contains a changed key —
+   proportional to change volume for time/sequence-correlated keys, approaching a full-table rewrite
+   for uniformly spread keys (probe P6: 1M rows / 40 files, 5k random updates → 40/40 files
+   rewritten). v1 exposes `data_avalanche_sink_merge_files_rewritten` / `data_avalanche_sink_merge_rows_copied`; a
+   deletion-vector writer is the post-v1 fix (D-MS.15).
+5. **Table creation:** column mapping **off** (delta-rs 1.0 refuses ADD COLUMN under column mapping),
+   deletion vectors off, `delta.checkpointInterval` / `delta.logRetentionDuration` from `sink.delta`.
+6. **Maintenance:** checkpoints and expired-log cleanup as post-commit hooks (built-in);
+   OPTIMIZE / VACUUM external.
 
 ---
 
 ## Phase 5 — Offset Acknowledgment
 
-After receiving `flush_confirmation(lsn)` from the Iceberg writer:
+After receiving `flush_confirmation(lsn)` from the sink writer:
 
 **PostgreSQL:**
 ```
 1. Update local confirmed_flush_lsn = lsn
 2. Send StandbyStatusUpdate to PostgreSQL:
    write_lsn  = lsn  (data written to local buffer)
-   flush_lsn  = lsn  (data durably flushed to Iceberg)
+   flush_lsn  = lsn  (data durably committed to the sink)
    apply_lsn  = lsn
 3. PostgreSQL advances the slot's confirmed_flush_lsn
    → WAL before this point can now be reclaimed
 4. Persist confirmed_flush_lsn to state storage
 ```
 
-**MySQL:**
+**MySQL / MariaDB:**
 ```
-1. Update local gtid_executed set to include the flushed transactions
-2. Persist updated gtid_executed to state storage
-   (MySQL binlog has no server-side acknowledgment — the executed set is the resume point)
+1. Update the local position to the flush frontier (MySQL gtid_executed set / MariaDB GTID
+   position / binlog file:pos)
+2. Persist it to state storage (replication/position.json)
+   (the binlog has no server-side acknowledgment — the persisted position is the resume point)
 ```
 
-The state storage write (step 4 / step 2) is the crash-safe checkpoint. On restart, the pipeline resumes streaming from the last persisted position, replaying any events not yet flushed. The exactly-once guard in Phase 4 handles the resulting duplicates.
+**Checkpoint rule (all sources).** The resume checkpoint is the **flush frontier**: the stream
+position up to which every complete transaction was part of this flush. It is persisted only after
+**every table in the flush** reports `Committed` or `SkippedCovered`; each table's
+`committed_position` is set to that frontier, including tables no transaction touched. (Recording
+only the positions of transactions that touched a table would let an idle table pin the resume
+point forever and block PG WAL release.)
+
+The state storage write (step 4 / step 2) is the crash-safe checkpoint. On restart, the pipeline resumes streaming from the last persisted position, replaying any events not yet flushed. Idempotent sink commits (and the Phase 4 position guard) absorb the resulting duplicates.
 
 ---
 
@@ -405,41 +606,63 @@ membership, the lease registry) lives separately under `globals.state` per
 
 ```
 <per-pipeline state location>/                   (state.prefix | sink.prefix, defaults to pipeline id)
-├── pipeline-state.json                          — overall pipeline state version
+├── pipeline-state.json                          — overall pipeline state version + recorded `sink_type`
+│                                                  (resume refuses a mismatch with `sink.type`)
 ├── replication/
 │   ├── slot.json                                — PG: slot name, confirmed_flush_lsn
-│   └── gtid.json                                — MySQL: current gtid_executed set
+│   └── position.json                            — MySQL/MariaDB: tagged position (`mysql-gtid:…` /
+│                                                  `mariadb-gtid:…` / `binlog:<file>:<pos>`) + the
+│                                                  source server identity (file/position mode)
 └── snapshots/
-    ├── <schema>.<table>.json                    — per-table snapshot state
+    ├── <schema>.<table>.json                    — per-table snapshot state (a `.`, `/`, `%` or control character
+    │                                              inside a name is escaped as `%XX` in the file name)
     │   {
-    │     "status": "completed",                  // none | in_progress | completed | broken
-    │     "start_lsn": "0/1A2B3C4",
-    │     "cursor": null,                         // keyset/offset for resume on crash
-    │     "row_count": 1234567,
-    │     "completed_at": "2026-06-06T..."
+    │     "version": 1,
+    │     "table": { "schema": "public", "name": "orders" },   // verbatim
+    │     "status": "in_progress",                // none | in_progress | completed | broken
+    │     "start_position": "pg:0/1A2B3C4",       // tagged SourcePosition; MySQL/MariaDB forms too
+    │     "cursor": {                             // resume point (Snapshot_Resumability §2);
+    │       "key": [ {"col": "id", "val": 4530000, "type": "int8"} ],   // null before the first
+    │       "chunk_size": 10000,                  //   chunk and once completed
+    │       "rows_done": 4530000,
+    │       "collation": null                     // pinned binary collation when a key column is text
+    │     },
+    │     "row_count": null,                      // set on completion
+    │     "completed_at": null                    // set on completion
     │   }
-    └── ...
+    ├── ...
+    └── jobs/<job_id>.json                        — on-demand snapshot jobs (tables, status, per-table
+                                                    progress, requested_at/by, finished_at); survive
+                                                    restart and failover
 ```
 
 ---
 
 ## On-Demand Snapshot Flow
 
-Triggered via the management REST API (`POST /pipelines/{name}/snapshot`):
+Triggered via the management REST API (`POST /v1/pipelines/{id}/snapshots`; see `System-Overview.md`
+endpoint table):
 
 ```
 Request payload: { tables: ["schema.orders", "schema.products"] }
                   (exact table names, no globs; may include tables not in pipeline config)
 
 1. Validate: tables list non-empty, no globs.
+   Persist a job record snapshots/jobs/<job_id>.json (status queued) before responding.
 2. For each table: run the Phase-1 chunk loop (watermark lw/hw + keyset chunks) WITHOUT pausing the
    stream. Tables already in the streaming set keep streaming; the snapshot reconciles against the
    live stream exactly as at startup.
-3. Tables not in the pipeline config: snapshot is written to Iceberg but the table is not added to
+3. Tables not in the pipeline config: snapshot is written to the sink but the table is not added to
    the pipeline's streaming set.
-4. Update snapshot_status = completed in state storage.
-5. Return snapshot job ID; status queryable via GET /v1/snapshots/{id}.
+4. Update snapshot_status = completed in state storage; mark the job completed (or failed, with
+   the error).
+5. Return the snapshot job ID; status via GET /v1/snapshots/{job_id}, all jobs of a pipeline via
+   GET /v1/pipelines/{id}/snapshots.
 ```
+
+Jobs are persisted in the per-pipeline state location, so they are **listed after a restart or a
+failover**. A job that was running continues on the (new) owner from the persisted per-table chunk
+cursors, like the Phase-1 snapshot does after a crash.
 
 There is **no stream pause and no `pause_lsn + 1` assumption**: watermarks reconcile re-snapshotted
 rows against concurrent changes, and idempotent upserts mean re-reading existing keys re-writes the
@@ -458,19 +681,24 @@ Replication stream error / TCP timeout
 ├─► Close connection
 ├─► Exponential backoff (initial 1s, max 60s, jitter)
 ├─► Reconnect and re-authenticate
-└─► Resume from last confirmed_flush_lsn (PG) or gtid_executed (MySQL)
+└─► Resume from last confirmed_flush_lsn (PG) or the persisted MySQL/MariaDB position
     ─ any events since last confirmed position are replayed
-    ─ exactly-once guard in Phase 4 deduplicates previously flushed events
+    ─ idempotent sink commits (+ Phase 4 position guard) absorb previously flushed events
 ```
 
-### Iceberg Write Failure
+### Sink Commit Failure
 
 ```
-Iceberg commit error (network, catalog conflict, storage error)
+Sink commit error (network, commit conflict, storage/catalog error)
 │
 ├─► Retry with backoff (up to configured max_retries)
-├─► On catalog conflict (concurrent writer):
-│   └─► Re-load current table metadata, retry fast_append
+├─► On commit conflict (concurrent writer):
+│   ├─► Iceberg: re-load table metadata, re-check marker, re-pin, retry the commit
+│   │   (the commit is pinned to the base the marker was read from — assert main unchanged;
+│   │    iceberg-rust's own reload-and-reapply would rebase a stale zombie: DA-X-11)
+│   └─► Delta:   re-load snapshot, re-check marker, retry the MERGE
+│       (ConcurrentTransaction on the owner app_id ⇒ another owner committed ⇒ Fenced)
+├─► On Fenced: stop the pipeline immediately (lease lost; Clustering §19)
 ├─► On persistent failure:
 │   └─► Pause pipeline; record error in state storage
 │   └─► Alert via metrics (pipeline_status gauge = error)
@@ -488,7 +716,8 @@ Node dies (SWIM detects via failed probes → marks dead)
 │
 └─► New owner starts each inherited pipeline (Phase 0):
     ├─► Reads state from cloud storage
-    └─► Resumes from last confirmed_flush_lsn / gtid_executed
+    └─► Resumes from last confirmed_flush_lsn / persisted MySQL position
+        (file/position mode: a changed source server halts, BINLOG_SOURCE_CHANGED)
         (worst-case replay = time since last checkpoint write)
 ```
 
@@ -531,8 +760,10 @@ tokio runtime
     │   ├─► per-table RecordBatch builders (in-task state, not spawned)
     │   └─► flush timer (tokio::time::interval)
     │
-    ├─► IcebergWriter task
-    │   └─► per-table Parquet encode + S3 write (spawn_blocking for CPU work)
+    ├─► SinkWriter task
+    │   └─► per-table commit of the TableChangeSet via the pipeline's sink
+    │       (Iceberg: Parquet encode + object write, spawn_blocking for CPU work;
+    │        Delta: DataFusion MERGE)
     │
     └─► StateCheckpointer task
         └─► periodic write of confirmed_lsn to cloud storage
@@ -542,21 +773,21 @@ tokio runtime
 Shutdown sequence (on SIGTERM or pipeline removal from config):
 1. Send shutdown signal to `ReplicationReader` → it stops reading, closes connection
 2. `BatchAccumulator` receives channel close → flushes any buffered data
-3. `IcebergWriter` processes remaining flush, sends final confirmation
+3. `SinkWriter` processes remaining flush, sends final confirmation
 4. `StateCheckpointer` writes final confirmed position
 
 ---
 
 ## Data Lineage Per Row
 
-Every row written to Iceberg carries these metadata columns in addition to the source table columns:
+Every row written to the sink carries these metadata columns in addition to the source table columns:
 
 | Column | Type | Content |
 |---|---|---|
-| `_op` | `CHAR(1)` | `I` insert, `U` update, `D` delete, `r` snapshot |
+| `_op` | `CHAR(1)` | `I` insert, `U` update, `r` snapshot (`D` never appears in mirror mode — deletes remove the row; reserved for the future `changelog` write mode) |
 | `_ts` | `TIMESTAMP WITH TIME ZONE` | source database commit timestamp |
 | `_lsn` | `VARCHAR` | commit LSN string (PG) or GTID string (MySQL) |
-| `_seq` | `VARCHAR` | per-change source order (PG change-LSN / MySQL binlog file+pos); keep-last dedup key (G-13) |
+| `_seq` | `VARCHAR` | per-change source order as fixed-width text that sorts like the source order: PostgreSQL `XXXXXXXX/XXXXXXXX` (upper-case hex, 8 + 8 digits), MySQL/MariaDB `<file index, 10 digits>:<end_log_pos, 20 digits>`; keep-last dedup key (G-13) |
 | `_source_db` | `VARCHAR` | `host/database` from pipeline source config |
 | `_pipeline` | `VARCHAR` | pipeline name from config |
 
@@ -572,6 +803,7 @@ These columns enable downstream consumers to reconstruct point-in-time state, de
 - [[CDC/CDC-Overview]] — delivery guarantees, ghost-row hazards
 - [[Iceberg/iceberg-rust]] — RecordBatch → Parquet → Iceberg write API
 - [[Iceberg/Iceberg-Overview]] — snapshot model, catalog types, maintenance
+- `research/Multi_Sink_Architecture_and_Delta_Lake.md` — sink abstraction, Delta Lake realization, capability probe
 - [[Arrow/Arrow-Overview]] — RecordBatch structure and columnar format
 - [[Distributed-Systems/Gossip-SWIM]] — failure detection and pipeline reassignment
 - [[Rust-Infra/Tokio-Async]] — task structure and channel backpressure patterns
