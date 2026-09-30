@@ -4,6 +4,9 @@
 
 use std::sync::Arc;
 
+pub mod memory_sink;
+pub use memory_sink::MemorySink;
+
 use futures_util::TryStreamExt;
 use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;

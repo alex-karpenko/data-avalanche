@@ -21,8 +21,8 @@ pub mod value;
 pub use change_set::{ChangeSetError, PositionRange, SplitInfo, TableChangeSet};
 pub use classify::{DeltaClass, SchemaChange, SchemaDelta, classify};
 pub use columnar::{
-    LIST_ELEMENT, LOGICAL_TAG, UNCHANGED_MASK_PREFIX, arrow_type, column_field, delete_schema,
-    lineage_fields, logical_tag, unchanged_mask_field, upsert_schema,
+    LIST_ELEMENT, LOGICAL_TAG, UNCHANGED_MASK_PREFIX, added_column_field, arrow_type, column_field,
+    delete_schema, lineage_fields, logical_tag, unchanged_mask_field, upsert_schema,
 };
 pub use decimal::{Decimal, DecimalError, MAX_DECIMAL_PRECISION};
 pub use event::{CdcEvent, EventShapeError, Op, SourceSeq, TransactionBoundary};

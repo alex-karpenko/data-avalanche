@@ -58,11 +58,12 @@ pub fn logical_tag(column: &ColumnSchema) -> Option<&'static str> {
 /// The Arrow field of a source column. Only identifier columns are non-nullable in the target;
 /// every other column is nullable, whatever the source says (S-O).
 pub fn column_field(schema: &TableSchema, column: &ColumnSchema) -> Field {
-    let field = Field::new(
-        &column.name,
-        arrow_type(&column.logical),
-        !schema.is_identifier(&column.name),
-    );
+    added_column_field(column).with_nullable(!schema.is_identifier(&column.name))
+}
+
+/// The field a sink adds for an ADD COLUMN: nullable, like every non-identifier column (S-O).
+pub fn added_column_field(column: &ColumnSchema) -> Field {
+    let field = Field::new(&column.name, arrow_type(&column.logical), true);
     match logical_tag(column) {
         Some(tag) => field.with_metadata(HashMap::from([(LOGICAL_TAG.into(), tag.into())])),
         None => field,
@@ -263,6 +264,17 @@ mod tests {
         assert!(!s.field(0).is_nullable() && s.field(1).is_nullable());
         let err = delete_schema(&table(), &["nope".into()]).unwrap_err();
         assert_eq!(err.code(), "SCHEMA_MISMATCH");
+    }
+
+    #[test]
+    fn an_added_column_is_nullable_and_tagged() {
+        let f = added_column_field(&ColumnSchema::new("ref", V::Uuid, "uuid").not_null());
+        assert!(f.is_nullable());
+        assert_eq!(f.data_type(), &DataType::FixedSizeBinary(16));
+        assert_eq!(
+            f.metadata().get(LOGICAL_TAG).map(String::as_str),
+            Some("uuid")
+        );
     }
 
     #[test]
