@@ -328,13 +328,13 @@ impl TableBuffer {
                     self.conform(event.after.as_ref().expect("validated"), Image::After)?;
                 let key = self.key(&after)?;
                 // An UPDATE whose before-image has another key moved the row: delete the old key.
+                // A before-image without its key halts: the row may have moved, and guessing it
+                // didn't would leave the old key behind.
                 let moved = match (&event.before, event.op) {
                     (Some(before), Op::Update) => {
                         let before = self.conform(before, Image::Before)?;
-                        match self.key(&before) {
-                            Ok(old) if old != key => Some((old, before)),
-                            _ => None,
-                        }
+                        let old = self.key(&before)?;
+                        (old != key).then_some((old, before))
                     }
                     _ => None,
                 };
@@ -688,6 +688,19 @@ mod tests {
             None,
         );
         assert_eq!(halt_code(b.apply(&no_key)), "NULL_IDENTIFIER");
+    }
+
+    #[test]
+    fn an_update_whose_before_image_lacks_the_key_halts() {
+        let mut b = buffer();
+        let no_key = event(
+            Op::Update,
+            1,
+            Some(Row(vec![("doc".into(), text("a"))])),
+            Some(row(1, text("b"))),
+        );
+        assert_eq!(halt_code(b.apply(&no_key)), "NULL_IDENTIFIER");
+        assert!(b.is_empty(), "a halted event leaves the buffer as it was");
     }
 
     #[test]

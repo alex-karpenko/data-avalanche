@@ -201,6 +201,22 @@ exit):
   - `CommitOutcome::Fenced { current_epoch }`;
   - `SinkError`'s variants.
 
+## Deviations during execution (2026-09-30)
+
+The task code blocks below are the plan as it stood when each task ran. Where a review changed
+the code afterwards, the landed code differs; `git log 0edaf35..` on `feat/claude/impl-v1` is the
+record. In order:
+
+- **T8, review follow-up (owner's ruling).** In the plan's `TableBuffer::apply`, an UPDATE whose
+  before-image lacks its key (NULL or not sent) counted as "the key didn't change". If the key had
+  changed, the old row stayed in the mirror. Now it halts `NULL_IDENTIFIER`, before anything is
+  buffered. A valid setup can't produce this event (config §11.2 checks that identifier ⊆
+  REPLICA IDENTITY), so the halt is defense in depth. There is one new test,
+  `an_update_whose_before_image_lacks_the_key_halts`. From T8 on, `data-avalanche-pipeline` has
+  one more unit test than each task's Expected line says (14, 20, 30, 38, 41, 41), and the
+  workspace has one more than the plan's 427. The change was replayed on the verified T13 code,
+  where the unit and property tests still pass.
+
 ---
 
 ## File Structure
