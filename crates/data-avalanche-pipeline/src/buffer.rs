@@ -368,18 +368,19 @@ impl TableBuffer {
                 // An UPDATE whose before-image has another key moved the row: delete the old key.
                 // A before-image without its key halts: the row may have moved, and guessing it
                 // didn't would leave the old key behind.
-                let moved = match (&event.before, event.op) {
-                    (Some(before), Op::Update) => {
-                        let before = self.conform(before, Image::Before)?;
-                        let old = self.key(&before)?;
-                        (old != key).then_some((old, before))
-                    }
+                let before = match (&event.before, event.op) {
+                    (Some(raw), Op::Update) => Some((raw, self.conform(raw, Image::Before)?)),
                     _ => None,
                 };
+                let moved = match &before {
+                    Some((_, before)) => Some(self.key(before)?).filter(|old| *old != key),
+                    None => None,
+                };
                 // Unchanged-TOAST values belong to the row's previous image, under its old key when
-                // the key moved (D-IMPL-3).
+                // the key moved (D-IMPL-3): the buffered image first, then the before-image where
+                // the source sent the column (REPLICA IDENTITY FULL; a sent NULL is a value).
                 if after.iter().any(|v| matches!(v, ColumnValue::Unchanged)) {
-                    let source = moved.as_ref().map_or(&key, |(old, _)| old);
+                    let source = moved.as_ref().unwrap_or(&key);
                     if let Some(prev) = self.latest(source).filter(|p| p.kind == RowKind::Upsert) {
                         for (v, p) in after.iter_mut().zip(&prev.values) {
                             if matches!(v, ColumnValue::Unchanged) {
@@ -387,8 +388,22 @@ impl TableBuffer {
                             }
                         }
                     }
+                    if let Some((raw, before)) = &before {
+                        let columns = self.schema.columns();
+                        for ((v, b), c) in after.iter_mut().zip(before).zip(columns) {
+                            let sent = raw
+                                .get(&c.name)
+                                .is_some_and(|r| !matches!(r, ColumnValue::Unchanged));
+                            if sent && matches!(v, ColumnValue::Unchanged) {
+                                *v = b.clone();
+                            }
+                        }
+                    }
+                    // A value still unchanged stays masked: the sink keeps the target's value, or
+                    // writes NULL for a moved key the target doesn't have yet (Data-Flow TOAST
+                    // step 4; its metric comes with a later milestone).
                 }
-                if let Some((old, before)) = moved {
+                if let (Some(old), Some((_, before))) = (moved, before) {
                     let row = self.row(RowKind::Delete, before, event);
                     self.put_open(old, row);
                 }
@@ -735,6 +750,67 @@ mod tests {
             flush(&mut b)[0].values[1],
             ColumnValue::Unchanged,
             "no earlier image in the buffer: the target keeps its value"
+        );
+    }
+
+    #[test]
+    fn a_key_move_fills_unchanged_toast_from_the_before_image_the_source_sent() {
+        let mut b = buffer();
+        b.apply(&insert(1, 1, "big")).unwrap();
+        flush(&mut b);
+        let full = event(
+            Op::Update,
+            2,
+            Some(row(1, text("big"))),
+            Some(row(2, ColumnValue::Unchanged)),
+        );
+        b.apply(&full).unwrap();
+        let rows = flush(&mut b);
+        assert_eq!(rows[1].kind, RowKind::Upsert);
+        assert_eq!(
+            rows[1].values[1],
+            text("big"),
+            "the old image was flushed: filled from the REPLICA IDENTITY FULL before-image"
+        );
+
+        let key_only = event(
+            Op::Update,
+            3,
+            Some(Row(vec![("id".into(), ColumnValue::Int64(2))])),
+            Some(row(3, ColumnValue::Unchanged)),
+        );
+        b.apply(&key_only).unwrap();
+        assert_eq!(
+            flush(&mut b)[1].values[1],
+            ColumnValue::Unchanged,
+            "a key-only before-image didn't send doc"
+        );
+    }
+
+    #[test]
+    fn a_full_before_image_fills_unchanged_toast_with_nothing_buffered() {
+        let mut b = buffer();
+        let full = event(
+            Op::Update,
+            1,
+            Some(row(1, text("big"))),
+            Some(row(1, ColumnValue::Unchanged)),
+        );
+        b.apply(&full).unwrap();
+        assert_eq!(flush(&mut b)[0].values[1], text("big"));
+
+        let mut sent_null = row(1, ColumnValue::Null);
+        sent_null.0[2].1 = ColumnValue::Unchanged;
+        let mut after = row(1, ColumnValue::Unchanged);
+        after.0[2].1 = ColumnValue::Unchanged;
+        b.apply(&event(Op::Update, 2, Some(sent_null), Some(after)))
+            .unwrap();
+        let values = &flush(&mut b)[0].values;
+        assert_eq!(values[1], ColumnValue::Null, "a sent NULL is a value");
+        assert_eq!(
+            values[2],
+            ColumnValue::Unchanged,
+            "unchanged in the before-image too: not sent"
         );
     }
 
