@@ -3,6 +3,7 @@
 
 mod config;
 pub mod convert;
+pub mod marker;
 pub mod types;
 
 pub use config::{DeltaLocation, DeltaSinkConfig, NtzAs, TableDefaults};
