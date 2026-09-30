@@ -9,10 +9,10 @@ use arrow_schema::{DataType, Field, Schema};
 use data_avalanche_core::{SinkError, TableChangeSet, UNCHANGED_MASK_PREFIX};
 use deltalake::DeltaTable;
 use deltalake::datafusion::common::{Column, ScalarValue};
-use deltalake::datafusion::execution::SessionStateBuilder;
 use deltalake::datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use deltalake::datafusion::logical_expr::{Expr, when};
-use deltalake::datafusion::prelude::{SessionConfig, SessionContext};
+use deltalake::datafusion::prelude::SessionContext;
+use deltalake::delta_datafusion::DeltaSessionContext;
 use deltalake::kernel::transaction::{CommitBuilder, CommitProperties};
 use deltalake::kernel::{DataType as DeltaType, StructType};
 use deltalake::operations::merge::MergeMetrics;
@@ -137,21 +137,25 @@ pub fn merge_source(
     Ok(batches)
 }
 
-/// A DataFusion session, with a memory ceiling when one is set (R-6).
+/// delta-rs's own DataFusion session (its planner and tuned settings, the session the probes ran
+/// on), with a memory ceiling when one is set (R-6).
 pub fn session(memory_limit: Option<usize>) -> Result<SessionContext, SinkError> {
     let Some(limit) = memory_limit else {
-        return Ok(SessionContext::new());
+        return Ok(DeltaSessionContext::new().into_inner());
     };
     let runtime = RuntimeEnvBuilder::new()
         .with_memory_limit(limit, 1.0)
         .build_arc()
         .map_err(|e| permanent(e.to_string()))?;
-    let state = SessionStateBuilder::new()
-        .with_config(SessionConfig::new())
-        .with_runtime_env(runtime)
-        .with_default_features()
-        .build();
-    Ok(SessionContext::new_with_state(state))
+    Ok(DeltaSessionContext::with_runtime_env(runtime).into_inner())
+}
+
+/// A deterministic failure building the MERGE: `InvalidData`, which `sink_error` classes
+/// `Permanent`, so the pipeline halts the table instead of retrying it.
+fn invalid(e: impl std::fmt::Display) -> deltalake::DeltaTableError {
+    deltalake::DeltaTableError::InvalidData {
+        message: e.to_string(),
+    }
 }
 
 /// One MERGE of the change set's rows (Data-Flow §Delta Lake realization):
@@ -169,10 +173,8 @@ pub async fn merge(
     props: CommitProperties,
     memory_limit: Option<usize>,
 ) -> Result<(DeltaTable, MergeMetrics), deltalake::DeltaTableError> {
-    let batches =
-        merge_source(cs, types).map_err(|e| deltalake::DeltaTableError::Generic(e.to_string()))?;
-    let ctx =
-        session(memory_limit).map_err(|e| deltalake::DeltaTableError::Generic(e.to_string()))?;
+    let batches = merge_source(cs, types).map_err(invalid)?;
+    let ctx = session(memory_limit).map_err(invalid)?;
     let df = ctx.read_batches(batches)?;
     let columns: Vec<(String, DeltaType)> = table
         .snapshot()?
@@ -187,7 +189,7 @@ pub async fn merge(
             .is_some_and(|b| b.column_by_name(&mask_name(name)).is_some())
     };
     let null = |t: &DeltaType| -> Result<Expr, deltalake::DeltaTableError> {
-        let physical = physical_type(t).map_err(deltalake::DeltaTableError::Generic)?;
+        let physical = physical_type(t).map_err(invalid)?;
         Ok(Expr::Literal(ScalarValue::try_from(&physical)?, None))
     };
     let mut on: Option<Expr> = None;
@@ -565,5 +567,22 @@ mod tests {
         merge(h.table().clone(), &cs, &types, props(1, 20), Some(1 << 30))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_change_set_the_merge_cant_convert_is_permanent() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = created(&dir).await;
+        let cs = change_set(10, vec![upserts(&full(), &[(1, Some("a"))], None)], vec![]);
+        // Delta types that don't fit the set's columns: the source can't be built.
+        let wrong = vec![
+            DeltaType::Primitive(deltalake::kernel::PrimitiveType::Integer);
+            cs.schema.fields().len()
+        ];
+        let err = merge(h.table().clone(), &cs, &wrong, props(1, 10), None)
+            .await
+            .unwrap_err();
+        let err = crate::error::sink_error(err);
+        assert!(matches!(err, SinkError::Permanent { .. }), "{err}");
     }
 }
