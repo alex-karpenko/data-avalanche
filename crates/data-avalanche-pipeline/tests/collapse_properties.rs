@@ -45,6 +45,13 @@ enum Action {
         from: i64,
         to: i64,
     },
+    /// An UPDATE of the primary key that doesn't touch `doc`, under REPLICA IDENTITY FULL: the
+    /// after-image carries `doc` as unchanged TOAST, the before-image the whole old row.
+    MoveFull {
+        t: usize,
+        from: i64,
+        to: i64,
+    },
     Truncate {
         t: usize,
     },
@@ -57,7 +64,8 @@ fn action() -> impl Strategy<Value = Action> {
         4 => (t.clone(), key.clone(), any::<u8>()).prop_map(|(t, key, doc)| Action::Put { t, key, doc }),
         2 => (t.clone(), key.clone()).prop_map(|(t, key)| Action::Touch { t, key }),
         2 => (t.clone(), key.clone()).prop_map(|(t, key)| Action::Delete { t, key }),
-        1 => (t.clone(), key.clone(), key).prop_map(|(t, from, to)| Action::Move { t, from, to }),
+        1 => (t.clone(), key.clone(), key.clone()).prop_map(|(t, from, to)| Action::Move { t, from, to }),
+        1 => (t.clone(), key.clone(), key).prop_map(|(t, from, to)| Action::MoveFull { t, from, to }),
         1 => t.prop_map(|t| Action::Truncate { t }),
     ]
 }
@@ -170,6 +178,18 @@ fn source(txns: &[Vec<Action>]) -> (Vec<Vec<Item>>, Tables) {
                         rows.insert(to, doc.clone());
                         let after = row(to, ColumnValue::Text(doc));
                         items.push(event(Op::Update, t, Some(key_only(from)), Some(after)));
+                    }
+                }
+                Action::MoveFull { t, from, to } => {
+                    let rows = db.get_mut(&table(t)).unwrap();
+                    if from != to
+                        && !rows.contains_key(&to)
+                        && let Some(doc) = rows.remove(&from)
+                    {
+                        rows.insert(to, doc.clone());
+                        let before = row(from, ColumnValue::Text(doc));
+                        let after = row(to, ColumnValue::Unchanged);
+                        items.push(event(Op::Update, t, Some(before), Some(after)));
                     }
                 }
                 Action::Truncate { t } => {
