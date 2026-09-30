@@ -10,6 +10,7 @@ pub mod decimal;
 pub mod event;
 pub mod logical;
 pub mod position;
+pub mod schema;
 pub mod table;
 pub mod value;
 
@@ -17,6 +18,7 @@ pub use decimal::{Decimal, DecimalError, MAX_DECIMAL_PRECISION};
 pub use event::{CdcEvent, EventShapeError, Op, SourceSeq, TransactionBoundary};
 pub use logical::{LogicalType, LogicalTypeError, MAX_LIST_DEPTH};
 pub use position::{PositionError, SourcePosition};
+pub use schema::{ColumnSchema, HaltReason, TableSchema, canonical_logical, hop2_compatible};
 pub use table::{
     INTERNAL_COLUMN_PREFIX, LINEAGE_COLUMNS, TableRef, first_reserved_collision, is_reserved_column,
 };
