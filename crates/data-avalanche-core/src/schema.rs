@@ -149,9 +149,9 @@ pub struct TableSchema {
 
 impl TableSchema {
     /// Checks the table can be replicated, in this order: no reserved column name (config §5), a
-    /// non-empty identifier (Ghost_Row §3), identifier columns that exist and are NOT NULL,
-    /// non-floating and primitive (Ghost_Row §1), unique column names, and every column's logical
-    /// type reachable from its value type ([`hop2_compatible`]).
+    /// non-empty identifier (Ghost_Row §3), identifier columns listed once that exist and are NOT
+    /// NULL, non-floating and primitive (Ghost_Row §1), unique column names, and every column's
+    /// logical type reachable from its value type ([`hop2_compatible`]).
     pub fn new(
         table: TableRef,
         columns: Vec<ColumnSchema>,
@@ -165,11 +165,14 @@ impl TableSchema {
         if identifier.is_empty() {
             return Err(HaltReason::NoIdentifier);
         }
-        for id in &identifier {
+        for (i, id) in identifier.iter().enumerate() {
             let unusable = |reason: &str| HaltReason::IdentifierNotUsable {
                 column: id.clone(),
                 reason: reason.to_owned(),
             };
+            if identifier[..i].contains(id) {
+                return Err(unusable("listed twice"));
+            }
             let c = columns
                 .iter()
                 .find(|c| &c.name == id)
@@ -314,6 +317,34 @@ mod tests {
             "floating-point equality is unsafe"
         );
         assert_eq!(reason(c, "doc"), "it isn't a primitive type");
+        assert_eq!(
+            halt(cols(), &["id", "id"]),
+            HaltReason::IdentifierNotUsable {
+                column: "id".into(),
+                reason: "listed twice".into()
+            }
+        );
+    }
+
+    #[test]
+    fn text_uuid_unsigned_and_decimal_identifiers_are_keys() {
+        let columns = vec![
+            ColumnSchema::new("code", V::Text, "text").not_null(),
+            ColumnSchema::new("ref", V::Uuid, "uuid").not_null(),
+            ColumnSchema::new("seq", V::UInt64, "bigint unsigned").not_null(),
+            ColumnSchema::new(
+                "part",
+                V::Numeric {
+                    precision: 10,
+                    scale: 0,
+                },
+                "numeric(10,0)",
+            )
+            .not_null(),
+        ];
+        let id: Vec<String> = ["code", "ref", "seq", "part"].map(String::from).into();
+        let s = TableSchema::new(t(), columns, id.clone()).unwrap();
+        assert_eq!(s.identifier(), id);
     }
 
     #[test]
