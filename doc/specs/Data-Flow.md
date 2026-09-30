@@ -1,5 +1,5 @@
 ---
-updated: 2026-09-28
+updated: 2026-09-30
 domain: Architecture
 tags: [architecture, data-flow, pipeline, cdc, iceberg, delta-lake, multi-sink, arrow, snapshot, replication]
 sources: []
@@ -355,8 +355,8 @@ For each incoming CdcEvent:
 ├─► Append metadata:
 │   ├─► _op:        'I' | 'U' | 'D' | 'r'  (r = snapshot/read)
 │   ├─► _ts:        commit_ts
-│   ├─► _lsn:       source_pos.to_string()
-│   ├─► _seq:       change_seq.to_string()  (PG change LSN / binlog NNNNNN:end_log_pos)
+│   ├─► _lsn:       the commit position, untagged
+│   ├─► _seq:       change_seq in the fixed-width form (§Data Lineage)
 │   ├─► _source_db: pipeline.source.host + '/' + pipeline.source.database
 │   └─► _pipeline:  pipeline name
 │
@@ -414,7 +414,8 @@ single source transaction exceeds it, the writer flushes **partial-transaction**
 instead of waiting for the source `COMMIT`, but **pins the durable resume checkpoint at the
 transaction's START** — `cdc.committed_position` does not advance past the txn until its `XID`/commit is
 seen. A crash mid-split replays the whole transaction; already-flushed slices re-write as idempotent
-upserts (no loss, no duplicate). Default `null` = unlimited = strict atomic visibility (a sub-threshold
+upserts (no loss, no duplicate). What the transaction writes after its last slice goes out with the
+next regular flush, whose range ends at the commit. Default `null` = unlimited = strict atomic visibility (a sub-threshold
 txn flushes as one commit). An absolute `sink.max_transaction_buffer_bytes` ceiling (default ~1 GiB)
 halts the pipeline (never OOMs the worker) if an unsplittable txn exceeds it. See
 `research/Large_Transaction_Handling.md` (G-29).
@@ -455,7 +456,10 @@ pipeline; lease lost).
 **Position guard (optimization, not correctness):** before committing a table, the sink reads that
 table's own `committed_position` marker — an **engine-tagged** value (PG LSN, or **canonical GTID-set**
 string). If `committed_position.covers(flush.position_for_table)` (PG: `≥`; MySQL: GTID **subset**) the
-table is already committed and is skipped. On commit, the new value is the `union` of the prior value
+table is already committed and is skipped. A split slice (`split` set) ends at its transaction's
+pinned start, which the stored position equals from the first slice on; a slice is skipped only
+when the stored position is strictly past that start (the transaction's commit, or a later one, has
+landed). On commit, the new value is the `union` of the prior value
 and the flush's per-table position. The pipeline **resume checkpoint** persisted to state storage is the
 **laggard** across all tracked tables (PG `min` / MySQL set-intersection); tables ahead skip via the
 guard or are absorbed by idempotency. The epoch rejects a zombie writer; the position skips done work.
@@ -777,7 +781,7 @@ Every row written to the sink carries these metadata columns in addition to the 
 | `_op` | `CHAR(1)` | `I` insert, `U` update, `r` snapshot (`D` never appears in mirror mode — deletes remove the row; reserved for the future `changelog` write mode) |
 | `_ts` | `TIMESTAMP WITH TIME ZONE` | source database commit timestamp |
 | `_lsn` | `VARCHAR` | commit LSN string (PG) or GTID string (MySQL) |
-| `_seq` | `VARCHAR` | per-change source order (PG change-LSN / MySQL binlog file+pos); keep-last dedup key (G-13) |
+| `_seq` | `VARCHAR` | per-change source order as fixed-width text that sorts like the source order: PostgreSQL `XXXXXXXX/XXXXXXXX` (upper-case hex, 8 + 8 digits), MySQL/MariaDB `<file index, 10 digits>:<end_log_pos, 20 digits>`; keep-last dedup key (G-13) |
 | `_source_db` | `VARCHAR` | `host/database` from pipeline source config |
 | `_pipeline` | `VARCHAR` | pipeline name from config |
 

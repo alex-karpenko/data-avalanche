@@ -1,5 +1,5 @@
 ---
-updated: 2026-09-26
+updated: 2026-09-30
 domain: Architecture
 tags: [architecture, schema-evolution, ddl, cdc, postgresql, mysql, iceberg, delta-lake, multi-sink, arrow]
 status: design reviewed & approved — unified trigger→augment→diff model
@@ -302,7 +302,8 @@ transaction boundary via §8.
 | Type **widen** outside the set (e.g. `int→decimal`) | **Unsafe** | — | — | halt table |
 | Type **narrow** (`bigint→int`, `varchar(100)→varchar(10)`, decimal shrink) | **Unsafe** | — | — | halt table |
 | Cross-family change (`int→varchar`, `timestamp→date`) | **Unsafe** | — | — | halt table |
-| `nullable → NOT NULL` | **Unsafe**\* | — | — | halt table (optional→required is breaking) |
+| `nullable → NOT NULL` | **Ignorable** | none | none | none: target columns are always nullable (§7.3) |
+| `NOT NULL → nullable` | **Ignorable** | none | none | none |
 | Change PK / `REPLICA IDENTITY` / unique key | **Unsafe** | — | — | halt table; operator re-snapshot |
 | `ADD COLUMN` / `RENAME COLUMN` to a **reserved lineage name** (`_op`, `_ts`, `_lsn`, `_seq`, `_source_db`, `_pipeline`, `__data_avalanche_*`; case-insensitive) | **Unsafe** | — | — | halt table `RESERVED_COLUMN_COLLISION` (config §5) |
 | `DROP TABLE` (tracked) | **Unsafe** | — (target kept) | — (target kept) | halt table `TABLE_DROPPED`; the target is never dropped. A re-created table of the same name (new OID) does **not** auto-resume; it needs an operator re-snapshot. Detection — PG: channel D / A (§2.1); MySQL: channel B |
@@ -311,8 +312,6 @@ transaction boundary via §8.
 | Index/comment/storage-params/`AUTO_INCREMENT`/charset w/ same logical type | **Ignorable** | none | none | none |
 | **Parse failure / unclassifiable DDL on a tracked table** | **Unsafe** | — | — | halt table (fail-safe) |
 
-\* Detected only when the trigger fires; a descriptor-invisible nullability tighten on PG may
-surface only via channel D. Acceptable — see §7.3.
 \*\* Only if the Arrow/Iceberg representation is a string, not an ordinal; pin in the
 type-mapping doc (G-18).
 
@@ -324,6 +323,9 @@ Delta column added to an existing table must be nullable, so add as **optional**
 spec-safe and semantically honest. Enforce source `NOT NULL` downstream if needed; never push it into
 the target schema. This also makes a source
 nullability change effectively Ignorable for the target.
+
+At table creation every non-identifier column is nullable, whatever the source declares; identifier
+columns are NOT NULL.
 
 ---
 
