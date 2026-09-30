@@ -1,0 +1,17 @@
+[package]
+name = "data-avalanche-pipeline"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The data path between a source and a sink: accumulate, collapse, flush."
+
+[lints]
+workspace = true
+
+[dependencies]
+data-avalanche-core.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

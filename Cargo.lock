@@ -632,6 +632,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "data-avalanche-pipeline"
+version = "0.1.0"
+dependencies = [
+ "data-avalanche-core",
+ "proptest",
+ "thiserror",
+]
+
+[[package]]
 name = "data-avalanche-state"
 version = "0.1.0"
 dependencies = [

@@ -22,6 +22,7 @@ data-avalanche-config = { path = "crates/data-avalanche-config" }
 data-avalanche-testkit = { path = "crates/data-avalanche-testkit" }
 data-avalanche-storage = { path = "crates/data-avalanche-storage" }
 data-avalanche-state = { path = "crates/data-avalanche-state" }
+data-avalanche-pipeline = { path = "crates/data-avalanche-pipeline" }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
