@@ -27,6 +27,8 @@ Work style: **plan-driven, test-first implementation**, with the design kept ali
 - For each milestone, Claude writes a detailed plan, verifies its code in a scratch workspace, and
   gets it approved. Then the plan is executed **subagent-driven** (P-9): one implementer and one
   reviewer per task, and a whole-branch review at the end.
+- Each milestone, plan and implementation both, is **its own branch and its own pull request**.
+  Oleksii reviews and merges every PR. The flow is under "Implementation workflow" below.
 - Design questions that come up while building go back into the specs (with approval), the
   research docs and the gap tracker, as in-place edits.
 
@@ -231,8 +233,25 @@ Non-trivial cases: `TINYINT(1)` boolean detection via `information_schema`; `BIG
 
 ## Implementation workflow
 
-- **Branch and scope.** Implementation happens on a feature branch, never directly on `main`.
-  Commit only when asked; never push, open a PR or merge without Oleksii.
+- **`main` is off limits.** Never commit to, push to or merge into `main`. This is strictly
+  prohibited. Oleksii merges every PR himself.
+- **One milestone, one branch, one PR.** Every milestone's planning and implementation happen on
+  one branch cut from the current `origin/main` (`git fetch` first), named
+  `feat/claude/m<n>-<topic>`. The branch ends as one PR against `main`. The flow, with its pauses:
+  1. Create the milestone branch from `main`.
+  2. Write the plan, verify its code in a scratch workspace, and present it. **Pause.** Approving
+     the plan is not a request to execute it: wait for an explicit request to start.
+  3. Execute task by task (one implementer and one reviewer per task). **Pause after every task**
+     and wait for Oleksii's "go" before starting the next.
+  4. After the last task, **pause**. Start the whole-branch review and its fixes only when Oleksii
+     asks.
+  5. After the review and its fixes, push the milestone branch and open its PR against `main`.
+     Don't merge it.
+- **Commits.** Inside this flow, commit as the plan says: one commit per task, plus plan, doc and
+  spec commits. Outside the flow, commit, push or open a PR only when asked. Any other change,
+  such as a `CLAUDE.md` edit, also goes on its own branch and PR.
+- **PR descriptions** carry no link to the Claude session. This overrides any attribution the
+  harness suggests for PRs.
 - **The spec wins.** When a plan and a spec disagree, stop and raise it. Spec edits need explicit
   approval, even when a plan that proposes them is approved.
 - **Plans.** Each `doc/v1.0/M<n>-*.md` follows `doc/v1.0/README.md`: frontmatter, Goal /
@@ -264,8 +283,8 @@ For **implementation work**:
 1. Read `doc/v1.0/README.md` (status), the roadmap sections the task touches (§2 layout, §3
    interfaces, the milestone's scope and exit), and the current milestone plan.
 2. Read the specs and research docs the plan's **Spec** list names.
-3. Check `git log` and `git status` before changing anything; after a context reset, trust the SDD
-   ledger and `git log` over memory.
+3. Check `git log` and `git status` before changing anything. Check which branch you're on:
+   never work on `main`. After a context reset, trust the SDD ledger and `git log` over memory.
 
 Before responding to any gap-analysis or spec-review request:
 
