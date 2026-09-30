@@ -3,7 +3,8 @@
 Containers for integration tests. Start with `test-infra/up.sh` (add `matrix` for older engine
 versions), stop with `test-infra/down.sh`, and run tests with
 `DATA_AVALANCHE_IT=1 DATA_AVALANCHE_SKIP_GCS=1 cargo test`. GCS tests need the variables from the
-GCS section below.
+GCS section below. The Delta sink's DuckDB cross-read also needs [`uv`](https://docs.astral.sh/uv/)
+on `PATH`; it fetches DuckDB itself.
 
 | Service | Image | Host port | Credentials | Profile |
 |---|---|---|---|---|
