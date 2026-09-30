@@ -10,8 +10,9 @@ use arrow_array::{
 use arrow_schema::{Field, Schema, SchemaRef};
 use data_avalanche_core::position::Lsn;
 use data_avalanche_core::{
-    ColumnSchema, ColumnValueType as V, PositionRange, SourcePosition, TableChangeSet, TableRef,
-    TableSchema, TableSpec, delete_schema, unchanged_mask_field, upsert_schema,
+    ColumnSchema, ColumnValueType as V, CommitMarker, PositionRange, SourcePosition,
+    TableChangeSet, TableRef, TableSchema, TableSpec, delete_schema, unchanged_mask_field,
+    upsert_schema,
 };
 
 use crate::DeltaLocation;
@@ -109,5 +110,13 @@ pub(crate) fn change_set(end: u64, up: Vec<RecordBatch>, del: Vec<RecordBatch>) 
             end: SourcePosition::Pg(Lsn(end)),
         },
         split: None,
+    }
+}
+
+pub(crate) fn marker(epoch: u64, cs: &TableChangeSet) -> CommitMarker {
+    CommitMarker {
+        owner_epoch: epoch,
+        committed_position: cs.position.end.clone(),
+        pipeline_id: "p".into(),
     }
 }
