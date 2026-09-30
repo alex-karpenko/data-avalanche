@@ -23,6 +23,7 @@ data-avalanche-testkit = { path = "crates/data-avalanche-testkit" }
 data-avalanche-storage = { path = "crates/data-avalanche-storage" }
 data-avalanche-state = { path = "crates/data-avalanche-state" }
 data-avalanche-pipeline = { path = "crates/data-avalanche-pipeline" }
+data-avalanche-sink-delta = { path = "crates/data-avalanche-sink-delta" }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -51,3 +52,14 @@ arrow-buffer = "59"
 arrow-row = "59"
 arrow-schema = "59"
 arrow-select = "59"
+arrow-cast = "59"
+# The Delta sink (roadmap §2.1). `deltalake` asks for `deltalake-core = "1.0"`, which resolves to
+# 1.1; the direct pin keeps the engine the probes ran on (delta P1–P10, 2026-09-26).
+deltalake = { version = "=1.0.0", default-features = false, features = ["datafusion", "rustls", "s3", "gcs", "azure"] }
+deltalake-core = { version = "=1.0.0", default-features = false }
+url = "2"
+
+# Dependencies build without debug info: DataFusion's full debug build is over 6 GB, which fills
+# CI runners. Workspace crates keep it.
+[profile.dev.package."*"]
+debug = false
