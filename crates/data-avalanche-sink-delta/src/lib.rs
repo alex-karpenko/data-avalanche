@@ -10,6 +10,9 @@ mod table;
 #[cfg(test)]
 mod test_support;
 pub mod types;
+#[allow(dead_code)] // `DeltaSink` (Task 9) is the caller
+mod write;
 
 pub use config::{DeltaLocation, DeltaSinkConfig, NtzAs, TableDefaults};
 pub use table::IDENTIFIER_KEY;
+pub use write::DELETE_FLAG;
