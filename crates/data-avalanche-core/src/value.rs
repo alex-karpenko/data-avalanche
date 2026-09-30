@@ -70,8 +70,8 @@ impl ColumnValue {
     }
 
     /// True when the value can be stored in a column of type `t`. NULL and [`Self::Unchanged`] fit
-    /// every type (nullability is checked separately); arrays check the declared element type and
-    /// every element.
+    /// every type (nullability is checked separately; [`crate::CdcEvent::validate`] rejects an
+    /// unchanged array element); arrays check the declared element type and every element.
     pub fn fits(&self, t: &ColumnValueType) -> bool {
         use ColumnValueType as T;
         match (self, t) {

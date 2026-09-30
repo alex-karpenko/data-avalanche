@@ -4,7 +4,7 @@ use std::fmt;
 use thiserror::Error;
 
 use crate::position::{BinlogPosError, Lsn, parse_binlog_index};
-use crate::{Row, SourcePosition, TableRef};
+use crate::{ColumnValue, Row, SourcePosition, TableRef};
 
 /// Per-change source order — the keep-last key of the collapse (`_seq`, `Ghost_Row…` §4).
 /// Comparable only within one dialect (one pipeline has one source).
@@ -120,12 +120,23 @@ pub enum EventShapeError {
     UnexpectedBefore { op: Op, table: TableRef },
     #[error("{op:?} event for {table} must not carry an after-image")]
     UnexpectedAfter { op: Op, table: TableRef },
+    /// Unchanged TOAST is a whole column's value, never an array element.
+    #[error("event for {table} has an unchanged value inside the array in column {column:?}")]
+    UnchangedInArray { table: TableRef, column: String },
 }
 
 impl CdcEvent {
     /// Checks the image shape per op: Insert/Snapshot = after only; Update = after (+ optional before);
-    /// Delete = before only.
+    /// Delete = before only. No array element of either image is [`ColumnValue::Unchanged`].
     pub fn validate(&self) -> Result<(), EventShapeError> {
+        fn unchanged_inside(v: &ColumnValue) -> bool {
+            match v {
+                ColumnValue::Array { values, .. } => values
+                    .iter()
+                    .any(|e| matches!(e, ColumnValue::Unchanged) || unchanged_inside(e)),
+                _ => false,
+            }
+        }
         let op = self.op;
         match (self.op, self.before.is_some(), self.after.is_some()) {
             (Op::Insert | Op::Snapshot, true, _) => Err(EventShapeError::UnexpectedBefore {
@@ -147,7 +158,16 @@ impl CdcEvent {
                 table: self.table.clone(),
             }),
             _ => Ok(()),
+        }?;
+        for row in self.before.iter().chain(&self.after) {
+            if let Some((column, _)) = row.0.iter().find(|(_, v)| unchanged_inside(v)) {
+                return Err(EventShapeError::UnchangedInArray {
+                    table: self.table.clone(),
+                    column: column.clone(),
+                });
+            }
         }
+        Ok(())
     }
 }
 
@@ -163,7 +183,7 @@ pub struct TransactionBoundary {
 mod tests {
     use super::*;
     use crate::position::Lsn;
-    use crate::{ColumnValue, Row, SourcePosition, TableRef};
+    use crate::{ColumnValue, ColumnValueType, Row, SourcePosition, TableRef};
     use std::cmp::Ordering;
 
     fn row() -> Option<Row> {
@@ -270,5 +290,43 @@ mod tests {
             event(Op::Snapshot, row(), row()).validate(),
             Err(EventShapeError::UnexpectedBefore { .. })
         ));
+    }
+
+    #[test]
+    fn unchanged_inside_an_array_is_rejected() {
+        let array = |values| ColumnValue::Array {
+            element_type: ColumnValueType::Array(Box::new(ColumnValueType::Int32)),
+            values,
+        };
+        let inner = |v| ColumnValue::Array {
+            element_type: ColumnValueType::Int32,
+            values: vec![ColumnValue::Int32(1), v],
+        };
+        let with = |tags| {
+            Some(Row(vec![
+                ("id".into(), ColumnValue::Int64(1)),
+                ("tags".into(), tags),
+            ]))
+        };
+        let nested = with(array(vec![inner(ColumnValue::Unchanged)]));
+        assert_eq!(
+            event(Op::Update, None, nested.clone()).validate(),
+            Err(EventShapeError::UnchangedInArray {
+                table: TableRef::new("public", "t"),
+                column: "tags".into()
+            })
+        );
+        assert!(matches!(
+            event(Op::Delete, nested, None).validate(),
+            Err(EventShapeError::UnchangedInArray { .. })
+        ));
+        let fine = with(array(vec![inner(ColumnValue::Null)]));
+        assert!(event(Op::Update, None, fine).validate().is_ok());
+        assert!(
+            event(Op::Update, None, with(ColumnValue::Unchanged))
+                .validate()
+                .is_ok(),
+            "a top-level unchanged TOAST value"
+        );
     }
 }
