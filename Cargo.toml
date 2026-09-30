@@ -45,4 +45,6 @@ bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 # One arrow major workspace-wide (roadmap §2, D-MS.14): 59, as deltalake 1.0 resolves it.
+arrow-array = "59"
+arrow-row = "59"
 arrow-schema = "59"

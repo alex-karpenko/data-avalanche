@@ -10,6 +10,8 @@ description = "Domain types shared by every data-avalanche crate. No I/O."
 workspace = true
 
 [dependencies]
+arrow-array.workspace = true
+arrow-row.workspace = true
 arrow-schema.workspace = true
 serde.workspace = true
 serde_json.workspace = true
