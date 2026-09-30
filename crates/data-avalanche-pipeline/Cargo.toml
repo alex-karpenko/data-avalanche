@@ -10,8 +10,13 @@ description = "The data path between a source and a sink: accumulate, collapse, 
 workspace = true
 
 [dependencies]
+arrow-array.workspace = true
+arrow-buffer.workspace = true
+arrow-schema.workspace = true
 data-avalanche-core.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
+uuid.workspace = true
 proptest.workspace = true

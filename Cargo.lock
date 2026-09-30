@@ -635,9 +635,14 @@ dependencies = [
 name = "data-avalanche-pipeline"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-schema",
  "data-avalanche-core",
  "proptest",
+ "serde_json",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]

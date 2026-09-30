@@ -5,11 +5,12 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use data_avalanche_core::{
-    CdcEvent, ColumnValue, ColumnValueType, HaltReason, LogicalType, Op, Row, SourcePosition,
-    SourceSeq, TableSchema,
+    CdcEvent, ColumnValue, ColumnValueType, HaltReason, LogicalType, Op, PositionRange, Row,
+    SourcePosition, SourceSeq, SplitInfo, TableChangeSet, TableSchema, upsert_schema,
 };
 
 use crate::AccumulatorError;
+use crate::batch::{self, Lineage, MAX_BATCH_BYTES};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowKind {
@@ -68,7 +69,7 @@ fn key_part(v: &ColumnValue) -> Option<KeyPart> {
 }
 
 /// Rough in-memory size of a row, for the flush `bytes` trigger and the transaction buffer ceiling.
-fn row_bytes(values: &[ColumnValue]) -> usize {
+pub(crate) fn row_bytes(values: &[ColumnValue]) -> usize {
     fn value_bytes(v: &ColumnValue) -> usize {
         let payload = match v {
             ColumnValue::Text(s) => s.len(),
@@ -389,6 +390,33 @@ impl TableBuffer {
         self.committed_events = 0;
         rows
     }
+
+    /// Takes the committed layer as a change set for the sink.
+    pub fn flush(
+        &mut self,
+        lineage: &Lineage,
+        position: PositionRange,
+        split: Option<SplitInfo>,
+    ) -> TableChangeSet {
+        let rows = self.take_committed();
+        let (upserts, deletes) = batch::build(
+            &self.schema,
+            &self.delete_columns,
+            rows,
+            lineage,
+            MAX_BATCH_BYTES,
+        );
+        TableChangeSet {
+            table: self.schema.table().clone(),
+            schema: upsert_schema(&self.schema),
+            identifier: self.schema.identifier().to_vec(),
+            truncate: false,
+            upserts,
+            deletes,
+            position,
+            split,
+        }
+    }
 }
 
 /// Keep-last by `_seq`: `row` replaces the key's image unless the stored one is newer (a replayed
@@ -708,6 +736,28 @@ mod tests {
         let mut b = buffer();
         let bad = event(Op::Insert, 1, None, None);
         assert!(matches!(b.apply(&bad), Err(AccumulatorError::Event(_))));
+    }
+
+    #[test]
+    fn a_flush_is_a_valid_change_set_of_the_committed_layer() {
+        let mut b = buffer();
+        b.apply(&insert(1, 1, "a")).unwrap();
+        b.apply(&insert(2, 2, "b")).unwrap();
+        b.apply(&delete(3, 2)).unwrap();
+        b.commit_txn();
+        b.apply(&insert(4, 3, "open")).unwrap();
+        let lineage = Lineage {
+            source_db: "db".into(),
+            pipeline: "p".into(),
+        };
+        let range = PositionRange {
+            start: SourcePosition::Pg(Lsn(0)),
+            end: SourcePosition::Pg(Lsn(1000)),
+        };
+        let cs = b.flush(&lineage, range, None);
+        cs.validate().unwrap();
+        assert_eq!((cs.upsert_rows(), cs.delete_rows()), (1, 1));
+        assert_eq!(b.open_events(), 1, "the open transaction stays buffered");
     }
 
     #[test]
