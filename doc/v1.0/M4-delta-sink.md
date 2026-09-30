@@ -202,7 +202,19 @@ the landed code differs; `git log` on `feat/claude/m4-delta-sink` is the record.
 
   A new test, `malformed_text_is_an_error_not_a_panic`, covers these. It panicked on the plan's
   code. The unit-test count after T4 is 19, one above the plan's 18. The later tasks' counts are
-  one higher too: 23 after T5, 30, 38, 41, and 44 after T9.
+  one higher too: 23 after T5 and 30 after T6 (T7's deviation below adds one more).
+- **T7, review follow-up (owner's ruling, 2026-09-30; `5c46dc0`).** Two defects in the plan's `write.rs`:
+  - `merge` wrapped its own deterministic failures (building the MERGE source, a column's physical
+    type) as `DeltaTableError::Generic`, which `sink_error` classes `Transient`: such a change set
+    would have retried forever instead of halting the table. They are `InvalidData` now (Permanent).
+  - The MERGE ran on a bare DataFusion `SessionContext`, not delta-rs's `DeltaSessionContext` (its
+    `DeltaPlanner` and tuned settings, including a workaround for a hash-join panic on dictionary
+    keys). The probes ran on delta-rs's session. `session()` now builds `DeltaSessionContext`, with
+    the memory ceiling through `with_runtime_env`.
+
+  A new test, `a_change_set_the_merge_cant_convert_is_permanent`, came back `Transient` on the plan's
+  code. The fix was verified first on the milestone's final code: 44 unit tests and all 15
+  integration tests pass, P6 counts unchanged. Unit counts: 39 after T7, 42 after T8, 45 after T9.
 
 ---
 
