@@ -146,6 +146,46 @@ impl Accumulator {
         Ok(())
     }
 
+    /// A TRUNCATE of `tables` in the open transaction (Data-Flow §TRUNCATE barrier). When one of them
+    /// has committed changes, nothing is applied and the result is
+    /// [`AccumulatorError::FlushRequired`]: flush, commit the change sets, then truncate again.
+    pub fn truncate(&mut self, tables: &[TableRef], now: Instant) -> Result<(), AccumulatorError> {
+        let Some(txn) = &mut self.txn else {
+            return Err(protocol("a TRUNCATE outside a transaction".into()));
+        };
+        let mut buffers = Vec::new();
+        for t in tables.iter().filter(|t| !self.halted.contains(t)) {
+            let b = self
+                .tables
+                .get(t)
+                .ok_or_else(|| AccumulatorError::UnknownTable { table: t.clone() })?;
+            if b.committed_events() > 0 {
+                return Err(AccumulatorError::FlushRequired { table: t.clone() });
+            }
+            buffers.push(t.clone());
+        }
+        for t in &buffers {
+            self.tables.get_mut(t).expect("checked above").truncate()?;
+        }
+        txn.first_event_at.get_or_insert(now);
+        Ok(())
+    }
+
+    /// A table's new schema (`Schema_Change…` §8), after the classifier found the change safe and
+    /// the sink evolved the table. [`AccumulatorError::FlushRequired`] when the table has committed
+    /// changes still in the old shape.
+    pub fn set_schema(
+        &mut self,
+        schema: TableSchema,
+        delete_extra: &[String],
+    ) -> Result<(), AccumulatorError> {
+        let table = schema.table().clone();
+        self.tables
+            .get_mut(&table)
+            .ok_or(AccumulatorError::UnknownTable { table })?
+            .set_schema(schema, delete_extra)
+    }
+
     /// The source committed the open transaction: its changes become flushable and the frontier
     /// moves to its commit position.
     pub fn commit(
@@ -529,6 +569,95 @@ mod tests {
             Err(AccumulatorError::UnknownTable { .. })
         ));
         assert!(is_protocol(a.add_table(schema("a"), &[])));
+    }
+
+    #[test]
+    fn a_truncate_seals_flushes_then_applies() {
+        let t0 = Instant::now();
+        let mut a = acc(FlushPolicy::default());
+        txn(&mut a, 1, 200, &[("a", 1), ("b", 1)], t0);
+        a.begin(2).unwrap();
+        a.apply(&insert("b", 2, 1, 2), t0).unwrap();
+        let err = a.truncate(&[table("b"), table("a")], t0).unwrap_err();
+        assert!(
+            matches!(err, AccumulatorError::FlushRequired { .. }),
+            "{err}"
+        );
+
+        let sealed = a.flush();
+        assert_eq!(sealed.checkpoint, lsn(200));
+        assert!(sealed.change_sets.iter().all(|cs| !cs.truncate));
+        a.truncate(&[table("b"), table("a")], t0).unwrap();
+        a.apply(&insert("a", 2, 2, 3), t0).unwrap();
+        a.commit(&boundary(2, 300), t0).unwrap();
+        let f = a.flush();
+        assert_eq!(f.change_sets.len(), 2);
+        let (ca, cb) = (&f.change_sets[0], &f.change_sets[1]);
+        assert!(ca.truncate && cb.truncate);
+        assert_eq!(
+            (ca.upsert_rows(), cb.upsert_rows()),
+            (1, 0),
+            "b's pre-truncate row is gone"
+        );
+        assert_eq!(ca.position.start, lsn(200));
+    }
+
+    #[test]
+    fn a_schema_change_seals_flushes_then_applies() {
+        let t0 = Instant::now();
+        let mut a = acc(FlushPolicy::default());
+        txn(&mut a, 1, 200, &[("a", 1)], t0);
+        let wider = TableSchema::new(
+            table("a"),
+            vec![
+                ColumnSchema::new("id", V::Int64, "bigint").not_null(),
+                ColumnSchema::new("doc", V::Text, "text"),
+                ColumnSchema::new("n", V::Int32, "integer"),
+            ],
+            vec!["id".into()],
+        )
+        .unwrap();
+        let err = a.set_schema(wider.clone(), &[]).unwrap_err();
+        assert!(
+            matches!(err, AccumulatorError::FlushRequired { .. }),
+            "{err}"
+        );
+        let old = a.flush();
+        assert_eq!(old.change_sets[0].schema.fields().len(), 2 + 6);
+        a.set_schema(wider, &[]).unwrap();
+        a.begin(2).unwrap();
+        let mut e = insert("a", 2, 1, 2);
+        e.after
+            .as_mut()
+            .unwrap()
+            .0
+            .push(("n".into(), ColumnValue::Int32(4)));
+        a.apply(&e, t0).unwrap();
+        a.commit(&boundary(2, 300), t0).unwrap();
+        let new = a.flush();
+        new.change_sets[0].validate().unwrap();
+        assert_eq!(new.change_sets[0].schema.fields().len(), 3 + 6);
+        assert!(matches!(
+            a.set_schema(schema("zzz"), &[]),
+            Err(AccumulatorError::UnknownTable { .. })
+        ));
+    }
+
+    #[test]
+    fn a_truncate_needs_a_transaction_and_skips_halted_tables() {
+        let t0 = Instant::now();
+        let mut a = acc(FlushPolicy::default());
+        assert!(matches!(
+            a.truncate(&[table("a")], t0),
+            Err(AccumulatorError::Protocol { .. })
+        ));
+        a.halt_table(&table("a"));
+        a.begin(1).unwrap();
+        a.truncate(&[table("a"), table("b")], t0).unwrap();
+        a.commit(&boundary(1, 200), t0).unwrap();
+        let f = a.flush();
+        assert_eq!(f.change_sets.len(), 1);
+        assert_eq!(f.change_sets[0].table, table("b"));
     }
 
     #[test]

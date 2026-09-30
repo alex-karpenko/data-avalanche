@@ -18,4 +18,8 @@ pub enum AccumulatorError {
     Protocol { detail: String },
     #[error(transparent)]
     Position(#[from] PositionError),
+    /// A barrier (TRUNCATE, schema change) met committed changes of the table: flush them and
+    /// commit the change sets, then apply the barrier again (seal → flush → apply).
+    #[error("table {table} has committed changes to flush before the barrier")]
+    FlushRequired { table: TableRef },
 }

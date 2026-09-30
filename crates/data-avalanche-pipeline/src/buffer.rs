@@ -154,32 +154,58 @@ pub struct TableBuffer {
     committed_bytes: usize,
     open_events: u64,
     committed_events: u64,
+    /// A TRUNCATE in the open transaction / in the committed layer.
+    open_truncate: bool,
+    committed_truncate: bool,
+}
+
+/// The identifier's column indices, and the columns a delete carries (identifier first).
+fn layout(
+    schema: &TableSchema,
+    delete_extra: &[String],
+) -> Result<(Vec<usize>, Vec<usize>), HaltReason> {
+    let index = |name: &String| {
+        schema
+            .index_of(name)
+            .ok_or_else(|| HaltReason::SchemaMismatch {
+                column: name.clone(),
+                detail: "a delete column that isn't in the table".into(),
+            })
+    };
+    let identifier = schema
+        .identifier()
+        .iter()
+        .map(index)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut delete_columns = identifier.clone();
+    for name in delete_extra {
+        let i = index(name)?;
+        if !delete_columns.contains(&i) {
+            delete_columns.push(i);
+        }
+    }
+    Ok((identifier, delete_columns))
+}
+
+/// The widenings the classifier lets through as Safe (`Schema_Change…` §7.2); decimals widen by
+/// precision alone, which [`conform_value`] handles.
+fn widen(v: ColumnValue, to: &ColumnValueType) -> ColumnValue {
+    use ColumnValue as V;
+    use ColumnValueType as T;
+    match (v, to) {
+        (V::Int16(i), T::Int32) => V::Int32(i.into()),
+        (V::Int16(i), T::Int64) => V::Int64(i.into()),
+        (V::Int32(i), T::Int64) => V::Int64(i.into()),
+        (V::Float32(f), T::Float64) => V::Float64(f.into()),
+        (v, _) => v,
+    }
 }
 
 impl TableBuffer {
     /// `delete_extra` names the columns a delete carries besides the identifier (the partition
     /// columns a sink prunes by).
     pub fn new(schema: TableSchema, delete_extra: &[String]) -> Result<Self, HaltReason> {
-        let index = |name: &String| {
-            schema
-                .index_of(name)
-                .ok_or_else(|| HaltReason::SchemaMismatch {
-                    column: name.clone(),
-                    detail: "a delete column that isn't in the table".into(),
-                })
-        };
-        let identifier = schema
-            .identifier()
-            .iter()
-            .map(index)
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut delete_columns = identifier.clone();
-        for name in delete_extra {
-            let i = index(name)?;
-            if !delete_columns.contains(&i) {
-                delete_columns.push(i);
-            }
-        }
+        let (identifier, delete_columns) = layout(&schema, delete_extra)?;
         Ok(Self {
             schema,
             identifier,
@@ -190,6 +216,8 @@ impl TableBuffer {
             committed_bytes: 0,
             open_events: 0,
             committed_events: 0,
+            open_truncate: false,
+            committed_truncate: false,
         })
     }
 
@@ -367,8 +395,90 @@ impl TableBuffer {
         supersede(&mut self.open, &mut self.open_bytes, key, row);
     }
 
+    fn flush_required(&self) -> Result<(), AccumulatorError> {
+        if self.committed_events > 0 {
+            return Err(AccumulatorError::FlushRequired {
+                table: self.schema.table().clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// A TRUNCATE in the open transaction: the barrier (Data-Flow §TRUNCATE barrier). The committed
+    /// layer must have been flushed ([`AccumulatorError::FlushRequired`] otherwise, nothing
+    /// changed); the open transaction's earlier rows are dropped, and the next change set clears
+    /// the table before applying the rows that follow.
+    pub fn truncate(&mut self) -> Result<(), AccumulatorError> {
+        self.flush_required()?;
+        self.open.clear();
+        self.open_bytes = 0;
+        self.open_truncate = true;
+        self.open_events += 1;
+        Ok(())
+    }
+
+    /// A schema change (`Schema_Change…` §8: seal → flush → apply). The committed layer must have
+    /// been flushed ([`AccumulatorError::FlushRequired`] otherwise); the open transaction's rows
+    /// are carried over by column name: a new column is NULL, a dropped one goes, a widened one is
+    /// widened. The identifier can't change (the classifier halts that).
+    pub fn set_schema(
+        &mut self,
+        schema: TableSchema,
+        delete_extra: &[String],
+    ) -> Result<(), AccumulatorError> {
+        self.flush_required()?;
+        if schema.identifier() != self.schema.identifier() {
+            return Err(self.halt(HaltReason::UnsafeDdl {
+                detail: "the identifier changed".into(),
+            }));
+        }
+        let (identifier, delete_columns) =
+            layout(&schema, delete_extra).map_err(|r| self.halt(r))?;
+        let mut open = HashMap::with_capacity(self.open.len());
+        let mut open_bytes = 0;
+        for row in self.open.values() {
+            let mut values = Vec::with_capacity(schema.columns().len());
+            for (j, c) in schema.columns().iter().enumerate() {
+                let v = match self.schema.index_of(&c.name) {
+                    Some(i) if row.kind == RowKind::Upsert || delete_columns.contains(&j) => {
+                        widen(row.values[i].clone(), &c.value_type)
+                    }
+                    _ => ColumnValue::Null,
+                };
+                let v = conform_value(v, &c.value_type, &c.logical).map_err(|_| {
+                    self.halt(HaltReason::SchemaMismatch {
+                        column: c.name.clone(),
+                        detail: "a buffered value doesn't fit the new column type".into(),
+                    })
+                })?;
+                values.push(v);
+            }
+            let key = Key(identifier
+                .iter()
+                .map(|&i| key_part(&values[i]).expect("identifier values stay non-null"))
+                .collect());
+            open_bytes += row_bytes(&values);
+            open.insert(
+                key,
+                CollapsedRow {
+                    values,
+                    ..row.clone()
+                },
+            );
+        }
+        self.schema = schema;
+        self.identifier = identifier;
+        self.delete_columns = delete_columns;
+        self.open = open;
+        self.open_bytes = open_bytes;
+        Ok(())
+    }
+
     /// The source committed the open transaction: its rows join the committed layer.
     pub fn commit_txn(&mut self) {
+        if std::mem::take(&mut self.open_truncate) {
+            self.committed_truncate = true;
+        }
         for (key, row) in std::mem::take(&mut self.open) {
             supersede(&mut self.committed, &mut self.committed_bytes, key, row);
         }
@@ -410,7 +520,7 @@ impl TableBuffer {
             table: self.schema.table().clone(),
             schema: upsert_schema(&self.schema),
             identifier: self.schema.identifier().to_vec(),
-            truncate: false,
+            truncate: std::mem::take(&mut self.committed_truncate),
             upserts,
             deletes,
             position,
@@ -746,18 +856,165 @@ mod tests {
         b.apply(&delete(3, 2)).unwrap();
         b.commit_txn();
         b.apply(&insert(4, 3, "open")).unwrap();
-        let lineage = Lineage {
-            source_db: "db".into(),
-            pipeline: "p".into(),
-        };
-        let range = PositionRange {
-            start: SourcePosition::Pg(Lsn(0)),
-            end: SourcePosition::Pg(Lsn(1000)),
-        };
-        let cs = b.flush(&lineage, range, None);
+        let cs = b.flush(&lineage(), range(), None);
         cs.validate().unwrap();
         assert_eq!((cs.upsert_rows(), cs.delete_rows()), (1, 1));
         assert_eq!(b.open_events(), 1, "the open transaction stays buffered");
+    }
+
+    fn lineage() -> Lineage {
+        Lineage {
+            source_db: "db".into(),
+            pipeline: "p".into(),
+        }
+    }
+
+    fn range() -> PositionRange {
+        PositionRange {
+            start: SourcePosition::Pg(Lsn(0)),
+            end: SourcePosition::Pg(Lsn(1000)),
+        }
+    }
+
+    fn is_flush_required(r: Result<(), AccumulatorError>) -> bool {
+        matches!(r, Err(AccumulatorError::FlushRequired { .. }))
+    }
+
+    #[test]
+    fn a_truncate_drops_earlier_open_rows_and_marks_the_next_change_set() {
+        let mut b = buffer();
+        b.apply(&insert(1, 1, "before")).unwrap();
+        b.truncate().unwrap();
+        b.apply(&insert(2, 2, "after")).unwrap();
+        b.commit_txn();
+        let cs = b.flush(&lineage(), range(), None);
+        assert!(cs.truncate);
+        assert_eq!(cs.upsert_rows(), 1);
+        b.apply(&insert(3, 3, "later")).unwrap();
+        b.commit_txn();
+        assert!(!b.flush(&lineage(), range(), None).truncate, "only once");
+    }
+
+    #[test]
+    fn a_truncate_alone_is_a_change_set() {
+        let mut b = buffer();
+        b.truncate().unwrap();
+        b.commit_txn();
+        assert_eq!(b.committed_events(), 1);
+        let cs = b.flush(&lineage(), range(), None);
+        assert!(cs.truncate && cs.upsert_rows() == 0 && !cs.is_empty());
+    }
+
+    #[test]
+    fn barriers_need_the_committed_layer_flushed() {
+        let mut b = buffer();
+        b.apply(&insert(1, 1, "a")).unwrap();
+        b.commit_txn();
+        b.apply(&insert(2, 2, "open")).unwrap();
+        assert!(is_flush_required(b.truncate()));
+        assert!(is_flush_required(b.set_schema(schema(), &[])));
+        assert_eq!(b.open_events(), 1, "nothing changed");
+        b.take_committed();
+        b.truncate().unwrap();
+    }
+
+    #[test]
+    fn a_schema_change_carries_open_rows_over_by_name() {
+        let mut b = buffer();
+        b.apply(&insert(1, 1, "a")).unwrap();
+        b.apply(&delete(2, 2)).unwrap();
+        let wider = TableSchema::new(
+            TableRef::new("public", "t"),
+            vec![
+                ColumnSchema::new("id", V::Int64, "bigint").not_null(),
+                ColumnSchema::new("added", V::Int32, "integer"),
+                ColumnSchema::new("region", V::Text, "text"),
+                ColumnSchema::new(
+                    "price",
+                    V::Numeric {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    "numeric(10,2)",
+                ),
+                ColumnSchema::new("doc", V::Text, "text"),
+            ],
+            vec!["id".into()],
+        )
+        .unwrap();
+        b.set_schema(wider, &["region".into()]).unwrap();
+        b.apply(&event(
+            Op::Insert,
+            3,
+            None,
+            Some(Row(vec![
+                ("id".into(), ColumnValue::Int64(3)),
+                ("added".into(), ColumnValue::Int32(7)),
+                ("region".into(), text("us")),
+                ("price".into(), ColumnValue::Null),
+                ("doc".into(), text("c")),
+            ])),
+        ))
+        .unwrap();
+        b.commit_txn();
+        let rows = b.take_committed();
+        assert_eq!(
+            rows[0].values,
+            [
+                ColumnValue::Int64(1),
+                ColumnValue::Null,
+                text("eu"),
+                ColumnValue::Null,
+                text("a")
+            ]
+        );
+        assert_eq!(rows[1].kind, RowKind::Delete);
+        assert_eq!(rows[2].values[1], ColumnValue::Int32(7));
+    }
+
+    #[test]
+    fn a_schema_change_widens_buffered_values_and_halts_on_the_rest() {
+        let narrow = |t: V| {
+            TableSchema::new(
+                TableRef::new("public", "t"),
+                vec![
+                    ColumnSchema::new("id", V::Int64, "bigint").not_null(),
+                    ColumnSchema::new("n", t, "n"),
+                ],
+                vec!["id".into()],
+            )
+            .unwrap()
+        };
+        let mut b = TableBuffer::new(narrow(V::Int32), &[]).unwrap();
+        let r = |n| Row(vec![("id".into(), ColumnValue::Int64(1)), ("n".into(), n)]);
+        b.apply(&event(Op::Insert, 1, None, Some(r(ColumnValue::Int32(5)))))
+            .unwrap();
+        b.set_schema(narrow(V::Int64), &[]).unwrap();
+        assert!(b.open_bytes() > 0);
+        b.commit_txn();
+        assert_eq!(b.take_committed()[0].values[1], ColumnValue::Int64(5));
+
+        b.apply(&event(Op::Insert, 2, None, Some(r(ColumnValue::Int64(5)))))
+            .unwrap();
+        assert_eq!(
+            halt_code(b.set_schema(narrow(V::Text), &[])),
+            "SCHEMA_MISMATCH"
+        );
+        assert_eq!(
+            b.schema().columns()[1].value_type,
+            V::Int64,
+            "nothing changed"
+        );
+        let other_key = TableSchema::new(
+            TableRef::new("public", "t"),
+            vec![
+                ColumnSchema::new("id", V::Int64, "bigint").not_null(),
+                ColumnSchema::new("n", V::Int64, "n").not_null(),
+            ],
+            vec!["n".into()],
+        )
+        .unwrap();
+        assert_eq!(halt_code(b.set_schema(other_key, &[])), "UNSAFE_DDL");
     }
 
     #[test]
