@@ -6,6 +6,7 @@
 //! - errors are `thiserror` types named after what failed (`DecimalError`, `PositionError`), and
 //!   `FromStr::Err` is that type.
 
+pub mod classify;
 pub mod decimal;
 pub mod event;
 pub mod logical;
@@ -14,6 +15,7 @@ pub mod schema;
 pub mod table;
 pub mod value;
 
+pub use classify::{DeltaClass, SchemaChange, SchemaDelta, classify};
 pub use decimal::{Decimal, DecimalError, MAX_DECIMAL_PRECISION};
 pub use event::{CdcEvent, EventShapeError, Op, SourceSeq, TransactionBoundary};
 pub use logical::{LogicalType, LogicalTypeError, MAX_LIST_DEPTH};
