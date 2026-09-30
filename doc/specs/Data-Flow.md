@@ -191,11 +191,16 @@ Replication connection (replication protocol, not SQL)
 - **`carry_forward` (default)** keeps the last known value without a source round-trip:
   1. The decoder marks the column in the row's *unchanged* mask instead of inventing a value.
   2. The collapse (keep-last per key) fills a masked column from an earlier image of the same key
-     in the same batch, or from the snapshot row it supersedes; the mask bit is then cleared.
+     in the same batch (under the old key after a key change), then from the event's before-image
+     when the source sent the column there (REPLICA IDENTITY FULL), or from the snapshot row it
+     supersedes; the mask bit is then cleared.
   3. A column still masked at commit is written from the target: the Delta MERGE updates it with
      `CASE WHEN <mask> THEN t.col ELSE s.col END`, so the stored value is kept.
   4. An insert whose masked column cannot be resolved (no target row, e.g. `snapshot_mode: never`)
-     writes NULL and increments a metric.
+     writes NULL and increments a metric. This includes an UPDATE that changes the key when the old
+     image is no longer buffered and the before-image doesn't carry the column (REPLICA IDENTITY
+     DEFAULT or USING INDEX): the value is not copied from the old key's row. A table whose key can
+     change and that has TOAST columns needs REPLICA IDENTITY FULL or `toast_strategy: re_query`.
 - **`re_query`** re-fetches the row over the control connection (V-077 warns on heavy snapshots).
 
 
@@ -292,7 +297,8 @@ Both sources produce the same intermediate type. This is the boundary between so
 CdcEvent {
     op:        Op,              // Insert | Update | Delete | Snapshot
     table:     TableRef,        // { schema: String, name: String }
-    before:    Option<Row>,     // old image: present for Update (if FULL/PK) and Delete
+    before:    Option<Row>,     // old image: present for Update (if FULL/PK) and Delete; carries only
+                                // the columns the source sent (a PG key-only old tuple: the identity columns)
     after:     Option<Row>,     // new image: present for Insert, Update, Snapshot
     source_pos: SourcePosition, // COMMIT position: LSN (PG) or GtidSet (MySQL)
     change_seq: SourceSeq,      // PER-CHANGE order: PG change-LSN / MySQL (binlog_file,end_log_pos).
