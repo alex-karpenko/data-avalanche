@@ -119,6 +119,17 @@ impl SourcePosition {
         }
     }
 
+    /// The position in its dialect's own text form, without the tag: `0/16B3748`, a canonical
+    /// GTID set, `0-1-42`, `mysql-bin.000003:154`. The `_lsn` lineage column holds this.
+    pub fn untagged(&self) -> String {
+        match self {
+            Self::Pg(v) => v.to_string(),
+            Self::MySqlGtid(v) => v.to_string(),
+            Self::MariaDbGtid(v) => v.to_string(),
+            Self::BinlogFile(v) => v.to_string(),
+        }
+    }
+
     pub fn to_tagged(&self) -> String {
         match self {
             Self::Pg(v) => format!("pg:{v}"),
@@ -190,6 +201,18 @@ mod tests {
 
     fn pos(s: &str) -> SourcePosition {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn untagged_is_the_dialect_text_without_the_tag() {
+        for (tagged, untagged) in [
+            ("pg:16/B374D848", "16/B374D848"),
+            (&format!("mysql-gtid:{A}:1-5"), &format!("{A}:1-5")),
+            ("mariadb-gtid:0-1-42", "0-1-42"),
+            ("binlog:mysql-bin.000003:154", "mysql-bin.000003:154"),
+        ] {
+            assert_eq!(pos(tagged).untagged(), untagged);
+        }
     }
 
     #[test]

@@ -1,4 +1,3 @@
-use chrono::NaiveTime;
 use uuid::Uuid;
 
 use crate::Decimal;
@@ -49,13 +48,20 @@ pub enum ColumnValue {
     /// Days since the Unix epoch — exactly Arrow `Date32`, so PG `±infinity` can clamp to `i32::MIN` /
     /// `i32::MAX` (Q-M5-1). chrono's `NaiveDate` is too narrow for that.
     Date(i32),
-    Time(NaiveTime),
+    /// Signed microseconds of elapsed time (Q-M3-3): PG `time` is `0..=86_400_000_000`
+    /// (`24:00:00` included), MySQL/MariaDB `TIME` is an interval of `-838:59:59..=838:59:59`.
+    /// [`time_text`] renders it.
+    Time(i64),
     Uuid(Uuid),
     Json(serde_json::Value),
     Array {
         element_type: ColumnValueType,
         values: Vec<ColumnValue>,
     },
+    /// The source did not send this value: a PostgreSQL unchanged-TOAST column in an UPDATE
+    /// (pgoutput `u`, D-IMPL-3). It is not NULL. The collapse fills it from an earlier image of the
+    /// same key; a value still unresolved at flush keeps the target's value.
+    Unchanged,
 }
 
 impl ColumnValue {
@@ -63,12 +69,13 @@ impl ColumnValue {
         matches!(self, Self::Null)
     }
 
-    /// True when the value can be stored in a column of type `t`. NULL fits every type
-    /// (nullability is checked separately); arrays check the declared element type and every element.
+    /// True when the value can be stored in a column of type `t`. NULL and [`Self::Unchanged`] fit
+    /// every type (nullability is checked separately); arrays check the declared element type and
+    /// every element.
     pub fn fits(&self, t: &ColumnValueType) -> bool {
         use ColumnValueType as T;
         match (self, t) {
-            (Self::Null, _) => true,
+            (Self::Null | Self::Unchanged, _) => true,
             (Self::Bool(_), T::Bool)
             | (Self::Int16(_), T::Int16)
             | (Self::Int32(_), T::Int32)
@@ -99,6 +106,20 @@ impl ColumnValue {
             _ => false,
         }
     }
+}
+
+/// Renders a [`ColumnValue::Time`] as `[-]HH:MM:SS.ffffff`, with at least two hour digits:
+/// `24:00:00.000000`, `838:59:59.000000`, `-01:30:00.500000`.
+pub fn time_text(micros: i64) -> String {
+    let sign = if micros < 0 { "-" } else { "" };
+    let m = micros.unsigned_abs();
+    let (secs, frac) = (m / 1_000_000, m % 1_000_000);
+    format!(
+        "{sign}{:02}:{:02}:{:02}.{frac:06}",
+        secs / 3600,
+        secs / 60 % 60,
+        secs % 60
+    )
 }
 
 /// A row image: `(column name, value)` pairs in source column order.
@@ -196,6 +217,31 @@ mod tests {
             values: vec![ColumnValue::Text("x".into())],
         };
         assert!(!lying.fits(&ColumnValueType::Array(Box::new(ColumnValueType::Int32))));
+    }
+
+    #[test]
+    fn time_holds_elapsed_intervals_beyond_a_day() {
+        // PG `24:00:00` and MySQL `TIME` extremes (Q-M3-3).
+        for micros in [0, 86_400_000_000, 3_020_399_000_000, -3_020_399_000_000] {
+            assert!(ColumnValue::Time(micros).fits(&ColumnValueType::Time));
+        }
+        assert_eq!(time_text(86_400_000_000), "24:00:00.000000");
+        assert_eq!(time_text(3_020_399_000_000), "838:59:59.000000");
+        assert_eq!(time_text(-5_400_500_000), "-01:30:00.500000");
+        assert_eq!(time_text(0), "00:00:00.000000");
+        assert_eq!(time_text(i64::MIN), "-2562047788:00:54.775808");
+    }
+
+    #[test]
+    fn unchanged_fits_every_type_and_is_not_null() {
+        for t in [
+            ColumnValueType::Text,
+            ColumnValueType::Json,
+            ColumnValueType::Array(Box::new(ColumnValueType::Int32)),
+        ] {
+            assert!(ColumnValue::Unchanged.fits(&t));
+        }
+        assert!(!ColumnValue::Unchanged.is_null());
     }
 
     #[test]

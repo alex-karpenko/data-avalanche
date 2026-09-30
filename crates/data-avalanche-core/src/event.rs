@@ -45,6 +45,23 @@ impl PartialOrd for SourceSeq {
     }
 }
 
+impl SourceSeq {
+    /// The `_seq` lineage text (Q-M3-2): fixed width, so text order is source order.
+    /// PG `{:08X}/{:08X}` (`00000000/0000000A`), binlog `{:010}:{:020}`. [`Display`] keeps the
+    /// canonical form (`0/A`, `000003:154`).
+    ///
+    /// [`Display`]: fmt::Display
+    pub fn lineage_text(&self) -> String {
+        match self {
+            Self::Pg(lsn) => format!("{:08X}/{:08X}", lsn.0 >> 32, lsn.0 & 0xFFFF_FFFF),
+            Self::Binlog {
+                file_index,
+                end_log_pos,
+            } => format!("{file_index:010}:{end_log_pos:020}"),
+        }
+    }
+}
+
 impl fmt::Display for SourceSeq {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -176,7 +193,7 @@ mod tests {
     }
 
     #[test]
-    fn seq_displays_for_the_seq_column() {
+    fn seq_displays_in_its_canonical_form() {
         assert_eq!(SourceSeq::Pg(Lsn(0x16B_3748)).to_string(), "0/16B3748");
         assert_eq!(
             SourceSeq::binlog("mysql-bin.000123", 4567)
@@ -184,6 +201,27 @@ mod tests {
                 .to_string(),
             "000123:4567"
         );
+    }
+
+    #[test]
+    fn lineage_text_sorts_like_the_source_order() {
+        let pg = [Lsn(9), Lsn(0x10), Lsn(0xFFFF_FFFF), Lsn(1 << 32)].map(SourceSeq::Pg);
+        assert_eq!(pg[0].lineage_text(), "00000000/00000009");
+        assert_eq!(pg[3].lineage_text(), "00000001/00000000");
+        let binlog = [
+            ("mysql-bin.000009", 900),
+            ("mysql-bin.000010", 4),
+            ("mysql-bin.000010", 40),
+            ("mysql-bin.1000000", 4),
+        ]
+        .map(|(f, p)| SourceSeq::binlog(f, p).unwrap());
+        assert_eq!(binlog[1].lineage_text(), "0000000010:00000000000000000004");
+        for seqs in [&pg[..], &binlog[..]] {
+            for pair in seqs.windows(2) {
+                assert!(pair[0] < pair[1]);
+                assert!(pair[0].lineage_text() < pair[1].lineage_text(), "{pair:?}");
+            }
+        }
     }
 
     #[test]

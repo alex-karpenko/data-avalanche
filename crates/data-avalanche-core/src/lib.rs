@@ -20,4 +20,4 @@ pub use position::{PositionError, SourcePosition};
 pub use table::{
     INTERNAL_COLUMN_PREFIX, LINEAGE_COLUMNS, TableRef, first_reserved_collision, is_reserved_column,
 };
-pub use value::{ColumnValue, ColumnValueType, Row};
+pub use value::{ColumnValue, ColumnValueType, Row, time_text};
