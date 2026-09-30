@@ -250,6 +250,8 @@ Non-trivial cases: `TINYINT(1)` boolean detection via `information_schema`; `BIG
 - **Commits.** Inside this flow, commit as the plan says: one commit per task, plus plan, doc and
   spec commits. Outside the flow, commit, push or open a PR only when asked. Any other change,
   such as a `CLAUDE.md` edit, also goes on its own branch and PR.
+- **PR descriptions** carry no link to the Claude session. This overrides any attribution the
+  harness suggests for PRs.
 - **The spec wins.** When a plan and a spec disagree, stop and raise it. Spec edits need explicit
   approval, even when a plan that proposes them is approved.
 - **Plans.** Each `doc/v1.0/M<n>-*.md` follows `doc/v1.0/README.md`: frontmatter, Goal /
