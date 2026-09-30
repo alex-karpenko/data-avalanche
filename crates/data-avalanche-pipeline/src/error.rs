@@ -22,4 +22,10 @@ pub enum AccumulatorError {
     /// commit the change sets, then apply the barrier again (seal → flush → apply).
     #[error("table {table} has committed changes to flush before the barrier")]
     FlushRequired { table: TableRef },
+    /// The open transaction outgrew `max_transaction_buffer_bytes` with splitting off: the
+    /// pipeline halts rather than exhaust the worker's memory (Large_Transaction §2).
+    #[error(
+        "a transaction buffers {bytes} bytes, over max_transaction_buffer_bytes {limit}; set max_transaction_batch_rows to split it"
+    )]
+    TransactionTooLarge { bytes: usize, limit: u64 },
 }

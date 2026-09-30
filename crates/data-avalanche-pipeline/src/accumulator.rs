@@ -10,17 +10,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use data_avalanche_core::{
-    CdcEvent, PositionRange, SourcePosition, TableChangeSet, TableRef, TableSchema,
+    CdcEvent, PositionRange, SourcePosition, SplitInfo, TableChangeSet, TableRef, TableSchema,
     TransactionBoundary,
 };
 
-use crate::{AccumulatorError, FlushPolicy, FlushReason, Lineage, TableBuffer};
+use crate::{AccumulatorError, FlushPolicy, FlushReason, Lineage, TableBuffer, TxnLimits};
 
 #[derive(Debug)]
 struct OpenTxn {
     xid: u64,
-    /// When the transaction's first event arrived.
+    /// When the transaction's first event (since its last slice) arrived.
     first_event_at: Option<Instant>,
+    /// Slices flushed so far.
+    slices: u32,
 }
 
 /// The change sets of one flush.
@@ -36,6 +38,7 @@ pub struct Flush {
 pub struct Accumulator {
     lineage: Lineage,
     policy: FlushPolicy,
+    limits: TxnLimits,
     tables: BTreeMap<TableRef, TableBuffer>,
     /// Halted tables: their events are dropped.
     halted: BTreeSet<TableRef>,
@@ -52,6 +55,7 @@ impl Accumulator {
         Self {
             lineage,
             policy,
+            limits: TxnLimits::default(),
             tables: BTreeMap::new(),
             halted: BTreeSet::new(),
             txn: None,
@@ -64,6 +68,19 @@ impl Accumulator {
     /// `sink.flush` is reloadable (R): the next [`Self::due`] uses the new policy.
     pub fn set_policy(&mut self, policy: FlushPolicy) {
         self.policy = policy;
+    }
+
+    /// The transaction limits (reloadable, like the flush policy). The default never splits.
+    pub fn set_txn_limits(&mut self, limits: TxnLimits) {
+        self.limits = limits;
+    }
+
+    fn open_events(&self) -> u64 {
+        self.tables.values().map(TableBuffer::open_events).sum()
+    }
+
+    fn open_bytes(&self) -> usize {
+        self.tables.values().map(TableBuffer::open_bytes).sum()
     }
 
     pub fn checkpoint(&self) -> &SourcePosition {
@@ -115,6 +132,7 @@ impl Accumulator {
         self.txn = Some(OpenTxn {
             xid,
             first_event_at: None,
+            slices: 0,
         });
         Ok(())
     }
@@ -143,6 +161,15 @@ impl Accumulator {
                 })?;
         buffer.apply(event)?;
         txn.first_event_at.get_or_insert(now);
+        if self.limits.batch_rows.is_none() {
+            let bytes = self.open_bytes();
+            if bytes as u64 >= self.limits.buffer_bytes {
+                return Err(AccumulatorError::TransactionTooLarge {
+                    bytes,
+                    limit: self.limits.buffer_bytes,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -239,6 +266,11 @@ impl Accumulator {
 
     /// Whether a flush is due at `now`. Called after each boundary and on a timer.
     pub fn due(&self, now: Instant) -> Option<FlushReason> {
+        if let (Some(_), Some(rows)) = (&self.txn, self.limits.batch_rows)
+            && (self.open_events() >= rows || self.open_bytes() as u64 >= self.limits.buffer_bytes)
+        {
+            return Some(FlushReason::Split);
+        }
         let since = self.flushable_since?;
         let p = &self.policy;
         if p.seconds == Some(0) {
@@ -283,6 +315,40 @@ impl Accumulator {
             change_sets,
             checkpoint: self.checkpoint.clone(),
         }
+    }
+
+    /// Flushes a slice of the open transaction together with everything already complete
+    /// (Large_Transaction §1). The change sets are marked [`SplitInfo`] and end at the frontier —
+    /// the transaction's start — which is also the returned checkpoint: until the source commit,
+    /// a restart replays the whole transaction. The transaction stays open; what it writes after
+    /// its last slice goes out with the next regular flush.
+    pub fn split(&mut self) -> Result<Flush, AccumulatorError> {
+        let Some(txn) = &mut self.txn else {
+            return Err(protocol("a split outside a transaction".into()));
+        };
+        txn.slices += 1;
+        txn.first_event_at = None;
+        let split = SplitInfo {
+            txn_start: self.frontier.clone(),
+            slice: txn.slices,
+        };
+        let position = PositionRange {
+            start: self.checkpoint.clone(),
+            end: self.frontier.clone(),
+        };
+        let mut change_sets = Vec::new();
+        for b in self.tables.values_mut() {
+            b.commit_txn();
+            if b.committed_events() > 0 {
+                change_sets.push(b.flush(&self.lineage, position.clone(), Some(split.clone())));
+            }
+        }
+        self.checkpoint = self.frontier.clone();
+        self.flushable_since = None;
+        Ok(Flush {
+            change_sets,
+            checkpoint: self.checkpoint.clone(),
+        })
     }
 }
 
@@ -658,6 +724,97 @@ mod tests {
         let f = a.flush();
         assert_eq!(f.change_sets.len(), 1);
         assert_eq!(f.change_sets[0].table, table("b"));
+    }
+
+    fn split_every(rows: u64) -> TxnLimits {
+        TxnLimits {
+            batch_rows: Some(rows),
+            buffer_bytes: 1 << 30,
+        }
+    }
+
+    #[test]
+    fn a_large_transaction_halts_when_splitting_is_off() {
+        let t0 = Instant::now();
+        let mut a = acc(FlushPolicy::default());
+        a.set_txn_limits(TxnLimits {
+            batch_rows: None,
+            buffer_bytes: 1,
+        });
+        a.begin(1).unwrap();
+        let err = a.apply(&insert("a", 1, 1, 1), t0).unwrap_err();
+        assert!(
+            matches!(err, AccumulatorError::TransactionTooLarge { limit: 1, .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn slices_pin_the_checkpoint_at_the_transaction_start() {
+        let t0 = Instant::now();
+        let mut a = acc(only_time(0));
+        a.set_txn_limits(split_every(2));
+        txn(&mut a, 1, 200, &[("a", 1)], t0);
+        a.begin(2).unwrap();
+        a.apply(&insert("a", 2, 1, 2), t0).unwrap();
+        assert_eq!(a.due(t0), Some(FlushReason::Boundary), "not yet a slice");
+        a.apply(&insert("b", 2, 2, 2), t0).unwrap();
+        assert_eq!(a.due(t0), Some(FlushReason::Split));
+
+        let first = a.split().unwrap();
+        assert_eq!(first.checkpoint, lsn(200));
+        assert_eq!(first.change_sets.len(), 2);
+        for cs in &first.change_sets {
+            cs.validate().unwrap();
+            assert_eq!(
+                cs.split.as_ref().map(|s| (&s.txn_start, s.slice)),
+                Some((&lsn(200), 1))
+            );
+            assert_eq!(
+                (&cs.position.start, &cs.position.end),
+                (&lsn(100), &lsn(200))
+            );
+        }
+        assert_eq!(
+            first.change_sets[0].upsert_rows(),
+            2,
+            "the complete transaction rides along"
+        );
+        assert_eq!(a.due(t0), None, "the open transaction was emptied");
+
+        a.apply(&insert("a", 2, 3, 3), t0).unwrap();
+        a.apply(&insert("a", 2, 4, 4), t0).unwrap();
+        let second = a.split().unwrap();
+        assert_eq!(second.change_sets[0].split.as_ref().unwrap().slice, 2);
+        assert_eq!(second.change_sets[0].position.start, lsn(200));
+
+        a.apply(&insert("a", 2, 5, 5), t0).unwrap();
+        a.commit(&boundary(2, 300), t0).unwrap();
+        let rest = a.flush();
+        assert_eq!(rest.checkpoint, lsn(300));
+        assert!(
+            rest.change_sets[0].split.is_none(),
+            "the rest is a regular flush"
+        );
+        assert_eq!(rest.change_sets[0].position.start, lsn(200));
+    }
+
+    #[test]
+    fn with_splitting_on_the_byte_ceiling_splits_early() {
+        let t0 = Instant::now();
+        let mut a = acc(FlushPolicy::default());
+        a.set_txn_limits(TxnLimits {
+            batch_rows: Some(1_000_000),
+            buffer_bytes: 1,
+        });
+        a.begin(1).unwrap();
+        a.apply(&insert("a", 1, 1, 1), t0).unwrap();
+        assert_eq!(a.due(t0), Some(FlushReason::Split));
+        assert!(matches!(a.commit(&boundary(1, 200), t0), Ok(())));
+        assert!(
+            matches!(a.split(), Err(AccumulatorError::Protocol { .. })),
+            "no open transaction"
+        );
     }
 
     #[test]

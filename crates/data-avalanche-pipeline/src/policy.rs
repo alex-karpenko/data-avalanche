@@ -19,9 +19,33 @@ impl Default for FlushPolicy {
     }
 }
 
+/// The resolved `sink.max_transaction_batch_rows` and `sink.max_transaction_buffer_bytes`
+/// (Large_Transaction §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxnLimits {
+    /// Split a transaction into slices of this many events. `None`: never split.
+    pub batch_rows: Option<u64>,
+    /// The open transaction's buffer ceiling: the pipeline halts when splitting is off, and
+    /// splits early when it is on.
+    pub buffer_bytes: u64,
+}
+
+impl Default for TxnLimits {
+    /// The config defaults: no splitting, 1 GiB.
+    fn default() -> Self {
+        Self {
+            batch_rows: None,
+            buffer_bytes: 1 << 30,
+        }
+    }
+}
+
 /// Why a flush is due.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlushReason {
+    /// The open transaction reached a [`TxnLimits`] ceiling: flush a slice
+    /// ([`crate::Accumulator::split`]) rather than a regular flush.
+    Split,
     /// `seconds: 0`: every transaction boundary.
     Boundary,
     /// The oldest flushable event is `seconds` old.

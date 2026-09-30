@@ -15,4 +15,4 @@ pub use accumulator::{Accumulator, Flush};
 pub use batch::{Lineage, MAX_BATCH_BYTES};
 pub use buffer::{CollapsedRow, RowKind, TableBuffer};
 pub use error::AccumulatorError;
-pub use policy::{FlushPolicy, FlushReason};
+pub use policy::{FlushPolicy, FlushReason, TxnLimits};
