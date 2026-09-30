@@ -7,7 +7,8 @@
 //!   and state: a hung store fails within about 8 s.
 //! - **Where things live:** [`table_root`], [`colocated_state`], [`explicit_state`] and
 //!   [`globals_state`] give a [`Location`] (bucket + key prefix, `""` = bucket root).
-//!   [`escape_segment`] makes a database identifier safe as a key segment.
+//!   [`escape_segment`] makes a database identifier safe as a key segment, and
+//!   [`escape_table_segment`] as a segment of a table root.
 //! - **Compare-and-swap:** [`ObjectStoreVersioned`] roots a [`VersionedStore`] at a
 //!   [`Location`]'s prefix: `get`, `create` (if absent), `update` (if the version still matches),
 //!   `put`, `list`. Failures are a [`StoreError`]: `Conflict` (the condition failed; also an update
@@ -24,7 +25,7 @@ mod store;
 
 pub use backend::{Backend, BucketSpec, OpenError, Timeouts, open_bucket};
 pub use paths::{
-    COLOCATED_STATE_DIR, Location, colocated_state, escape_segment, explicit_state, globals_state,
-    join, table_root,
+    COLOCATED_STATE_DIR, Location, colocated_state, escape_segment, escape_table_segment,
+    explicit_state, globals_state, join, table_root,
 };
 pub use store::{ObjectStoreVersioned, ObjectVersion, StoreError, VersionedStore};
