@@ -146,7 +146,7 @@ Rules:
 Shapes are normative; exact signatures are fixed by the milestone that owns them and recorded back
 here. `data-avalanche-core` owns every type in this section unless noted.
 
-### 3.1 Values and events (Data-Flow §CdcEvent, Type_Mapping)
+### 3.1 Values and events (Data-Flow §CdcEvent, Type_Mapping; landed in M0, extended in M3)
 
 ```rust
 pub struct TableRef { pub schema: String, pub name: String }        // MySQL: schema = source.db
@@ -154,14 +154,16 @@ pub struct TableRef { pub schema: String, pub name: String }        // MySQL: sc
 pub enum ColumnValue {
     Null, Bool(bool), Int16(i16), Int32(i32), Int64(i64), UInt64(u64),
     Float32(f32), Float64(f64),
-    Numeric(Decimal),                        // see D-IMPL-1: i128 unscaled + scale (38 digits)
+    Numeric(Decimal),                        // D-IMPL-1: i128 unscaled + scale (38 digits)
     Text(String), Bytes(Vec<u8>),
     Timestamp { micros: i64, with_tz: bool },   // µs since Unix epoch (= Arrow range), UTC instant or wall clock
     Date(i32),                               // days since Unix epoch = Arrow Date32; PG ±infinity clamps (Q-M5-1)
-    Time(chrono::NaiveTime),
+    Time(i64),                               // signed µs (Q-M3-3): PG 0..=24:00:00, MySQL ±838:59:59; `time_text` renders it
     Uuid(uuid::Uuid), Json(serde_json::Value),
     Array { element_type: ColumnValueType, values: Vec<ColumnValue> },
+    Unchanged,                               // PG unchanged TOAST (pgoutput `u`, D-IMPL-3, Q-M3-1): not NULL; never inside an array
 }
+impl ColumnValue { pub fn is_null(&self) -> bool; pub fn fits(&self, t: &ColumnValueType) -> bool; }
 pub enum ColumnValueType { Bool, Int16, Int32, Int64, UInt64, Float32, Float64, Numeric { precision: u8, scale: i8 },
                            Text, Bytes, Timestamp { with_tz: bool }, Date, Time, Uuid, Json, Array(Box<ColumnValueType>) }
 pub enum LogicalType { Bool, Int16, Int32, Int64, Float32, Float64, Decimal { precision: u8, scale: i8 }, String,
@@ -171,17 +173,23 @@ pub enum LogicalType { Bool, Int16, Int32, Int64, Float32, Float64, Decimal { pr
 pub enum Op { Insert, Update, Delete, Snapshot }
 pub struct CdcEvent {
     pub op: Op, pub table: TableRef,
-    pub before: Option<Row>, pub after: Option<Row>,
+    pub before: Option<Row>,                 // only the columns the source sent (a PG `K` old tuple: the key columns)
+    pub after: Option<Row>,
     pub source_pos: SourcePosition,          // commit position of the enclosing transaction
     pub change_seq: SourceSeq,               // per-change order (keep-last key, `_seq`)
     pub xid: u64, pub commit_ts_micros: i64,
 }
-impl CdcEvent { pub fn validate(&self) -> Result<(), EventShapeError>; }   // image shape per op
-pub enum EventShapeError { MissingAfter{..}, MissingBefore{..}, UnexpectedBefore{..}, UnexpectedAfter{..} }
+impl CdcEvent { pub fn validate(&self) -> Result<(), EventShapeError>; }   // image shape per op; no Unchanged in arrays
+pub enum EventShapeError { MissingAfter{..}, MissingBefore{..}, UnexpectedBefore{..}, UnexpectedAfter{..},
+                           UnchangedInArray { table, column } }
 pub struct TransactionBoundary { pub xid: u64, pub commit_pos: SourcePosition, pub commit_ts_micros: i64 }
-pub struct Row(pub Vec<(String, ColumnValue)>);  // the PG unchanged-TOAST mask (D-IMPL-3) needs a shape: Q-M3-1
-// Landed in M0 (2026-09-26): all of the above, plus Decimal { unscaled: i128, scale: i8 } with parse / precision /
-// rescale / fits (Eq/Hash compare the representation: rescale before keying by value).
+pub struct Row(pub Vec<(String, ColumnValue)>);   // Row::get(column)
+impl SourceSeq { pub fn lineage_text(&self) -> String; }   // `_seq`: fixed width, sorts as text (S-N)
+impl SourcePosition { pub fn untagged(&self) -> String; }  // `_lsn` (S-N)
+// Also: Decimal { unscaled: i128, scale: i8 } with parse / precision / rescale / fits (Eq/Hash compare the
+// representation: rescale before keying by value); table.rs: LINEAGE_COLUMNS
+// (`_op _ts _lsn _seq _source_db _pipeline`), INTERNAL_COLUMN_PREFIX `__data_avalanche_`,
+// is_reserved_column / first_reserved_collision.
 ```
 
 ### 3.2 Positions (Delivery §2; P-4 adds file/position)
@@ -207,47 +215,121 @@ pub enum PositionError { DialectMismatch { left, right }, DifferentBinlogSeries 
 pub enum SourceSeq { Pg(Lsn), Binlog { file_index: u64, end_log_pos: u64 } }   // total order within one stream
 ```
 
-### 3.3 Schema model and change set (Schema_Change §7, Multi_Sink §6.2)
+### 3.3 Schema model and change set (Schema_Change §7, Multi_Sink §6.2; landed in M3)
+
+`M3-core-data-path.md` D-M3.1…18 and its "Deviations during execution" are the rulings behind this.
 
 ```rust
 pub struct ColumnSchema { pub name: String, pub value_type: ColumnValueType, pub logical: LogicalType,
-                          pub nullable: bool, pub source_type: String, pub source_ordinal: Option<i32> /* PG attnum */ }
-pub struct TableSchema { pub table: TableRef, pub columns: Vec<ColumnSchema>, pub identifier: Vec<String> }
+                          pub nullable: bool /* source's; targets ignore it (S-O) */, pub source_type: String,
+                          pub source_ordinal: Option<i32> /* PG attnum */ }
+impl ColumnSchema { pub fn new(name, value_type, source_type) -> Self /* canonical logical, nullable */; pub fn not_null(self) -> Self; }
+pub fn canonical_logical(t: &ColumnValueType) -> LogicalType;             // UInt64 → decimal(20,0), …
+pub fn hop2_compatible(value_type: &ColumnValueType, logical: &LogicalType) -> bool;   // an override Hop 2 can store
 
-pub enum SchemaChange { AddColumn(ColumnSchema), DropColumn(String), RenameColumn { from: String, to: String, proven: bool },
-                        ChangeType { column: String, from: ColumnValueType, to: ColumnValueType },
-                        SetNotNull(String), DropNotNull(String), IdentifierChanged, TableDropped, Other(String) }
+pub struct TableSchema { /* private: table, columns, identifier */ }
+impl TableSchema {
+    // Checks, in order: no reserved name; a non-empty identifier; identifier columns listed once, present,
+    // NOT NULL, non-floating, primitive; unique names; every logical type hop2_compatible.
+    pub fn new(table: TableRef, columns: Vec<ColumnSchema>, identifier: Vec<String>) -> Result<Self, HaltReason>;
+    pub fn table(&self) -> &TableRef; pub fn columns(&self) -> &[ColumnSchema]; pub fn identifier(&self) -> &[String];
+    pub fn column(&self, name: &str) -> Option<&ColumnSchema>; pub fn index_of(&self, name: &str) -> Option<usize>;
+    pub fn is_identifier(&self, name: &str) -> bool;
+}
+pub enum HaltReason {                        // code(): the SCREAMING_SNAKE name, e.g. NULL_IDENTIFIER
+    ReservedColumnCollision { column }, TableDropped, UnsafeDdl { detail }, NoIdentifier,
+    IdentifierNotUsable { column, reason }, IdentifierNotInReplicaIdentity { missing: Vec<String> },
+    EvolutionUnsupported { detail }, EvolutionDisabled, NumericOverflow { column },
+    InvalidDateValue { column, raw },        // MySQL/MariaDB zero-in-part / invalid dates (Q-M7-1)
+    SchemaMismatch { column, detail },       // a value or buffered row that doesn't fit the schema
+    NullIdentifier { column },               // NULL or unsent key value
+}
+// Pipeline-scope halts (not per table): BINLOG_PAYLOAD_INVALID (D-V1.6), BINLOG_SOURCE_CHANGED (Q-M7-2)
+
+pub enum SchemaChange { AddColumn(ColumnSchema), DropColumn(String), RenameColumn { from, to, proven: bool },
+                        ChangeType { column, from: ColumnSchema, to: ColumnSchema, narrowed: bool },
+                        SetNotNull(String), DropNotNull(String), IdentifierChanged, TableDropped,
+                        EnumValuesAppended(String), EnumValuesChanged(String), NoTargetEffect(String),
+                        Unclassifiable(String) }
 pub struct SchemaDelta { pub table: TableRef, pub changes: Vec<SchemaChange> }
-pub enum DeltaClass { Safe, Unsafe { reason: HaltReason }, Ignorable }
-pub fn classify(delta: &SchemaDelta) -> Vec<(SchemaChange, DeltaClass)>;   // the §7.2 table as code
+pub enum DeltaClass { Safe, Unsafe(HaltReason), Ignorable }
+pub fn classify(schema: &TableSchema, delta: &SchemaDelta) -> Vec<(SchemaChange, DeltaClass)>;  // the §7.2 table
 
+// Hop 2 Arrow (columnar.rs): field metadata LOGICAL_TAG = "data-avalanche.logical" where the Arrow type
+// is ambiguous; LIST_ELEMENT = "element"; unchanged masks `__data_avalanche_unchanged:<col>` (non-null Boolean).
+pub fn arrow_type(logical: &LogicalType) -> DataType;
+pub fn column_field(schema: &TableSchema, c: &ColumnSchema) -> Field;   // identifier NOT NULL, the rest nullable
+pub fn added_column_field(c: &ColumnSchema) -> Field;                    // always nullable
+pub fn upsert_schema(schema: &TableSchema) -> SchemaRef;                 // source columns, then the lineage columns
+pub fn delete_schema(schema: &TableSchema, extra: &[String]) -> Result<SchemaRef, HaltReason>;   // identifier first
+pub fn unchanged_mask_field(column: &str) -> Field;   // also: lineage_fields(), logical_tag(&ColumnSchema)
+
+pub struct PositionRange { pub start: SourcePosition, pub end: SourcePosition }   // (start, end]
+pub struct SplitInfo { pub txn_start: SourcePosition, pub slice: u32 }              // slice ranges end at txn_start
 pub struct TableChangeSet {
-    pub table: TableRef, pub schema: arrow::datatypes::SchemaRef, pub identifier: Vec<String>,
+    pub table: TableRef, pub schema: SchemaRef /* upsert_schema */, pub identifier: Vec<String>,
     pub truncate: bool, pub upserts: Vec<RecordBatch>, pub deletes: Vec<RecordBatch>,
     pub position: PositionRange, pub split: Option<SplitInfo>,
 }
-pub enum HaltReason { ReservedColumnCollision { column: String }, TableDropped, UnsafeDdl { detail: String },
-                      NoIdentifier, IdentifierNotInReplicaIdentity { missing: Vec<String> }, EvolutionUnsupported { detail: String },
-                      EvolutionDisabled, NumericOverflow { column: String },
-                      InvalidDateValue { column: String, raw: String },   // MySQL/MariaDB zero-in-part / invalid dates (Q-M7-1)
-                      /* … extended by milestones */ }
-// Pipeline-scope halts (not per table): BINLOG_PAYLOAD_INVALID (D-V1.6), BINLOG_SOURCE_CHANGED (Q-M7-2)
+impl TableChangeSet {
+    // Upsert batches: schema's fields, then the same unchanged masks (non-identifier columns) in every batch;
+    // delete batches start with the identifier; a key at most once across both; no NULL key;
+    // the range doesn't run backwards; a slice's range ends at txn_start.
+    pub fn validate(&self) -> Result<(), ChangeSetError>;
+    pub fn upsert_rows(&self) -> usize; pub fn delete_rows(&self) -> usize; pub fn is_empty(&self) -> bool;
+}
+pub struct ChangeSetError { pub table: TableRef, pub detail: String }
 ```
 
-### 3.4 Sink trait (Multi_Sink §6.3–6.4)
+### 3.4 Sink trait (Multi_Sink §6.3–6.4; landed in M3)
 
 ```rust
 #[async_trait]
-pub trait Sink: Send + Sync {
+pub trait Sink: Send + Sync {             // object safe: Arc<dyn Sink>
     fn kind(&self) -> SinkKind;
     fn capabilities(&self) -> &SinkCapabilities;
-    async fn table_state(&self, t: &TableRef) -> Result<SinkTableState, SinkError>;
-    async fn ensure_table(&self, spec: &TableSpec) -> Result<(), SinkError>;
-    async fn evolve(&self, t: &TableRef, d: &SchemaDelta) -> Result<EvolveOutcome, SinkError>; // Applied|Degraded|Unsupported
-    async fn commit(&self, cs: TableChangeSet, m: CommitMarker) -> Result<CommitOutcome, SinkError>; // Committed|SkippedCovered|Fenced
+    async fn table_state(&self, table: &TableRef) -> Result<SinkTableState, SinkError>;
+    async fn ensure_table(&self, spec: &TableSpec) -> Result<(), SinkError>;         // a present table is left alone
+    async fn evolve(&self, table: &TableRef, delta: &SchemaDelta) -> Result<EvolveOutcome, SinkError>;
+    async fn commit(&self, cs: TableChangeSet, marker: CommitMarker) -> Result<CommitOutcome, SinkError>;
 }
+// commit, in order (documented on the trait; testkit `MemorySink` is the reference):
+//  1. cs.validate(); 2. refuse a marker whose committed_position != cs.position.end; 3. NoTable;
+//  4. fence, then guard, against the stored marker (Fenced / SkippedCovered change nothing);
+//  5. every column of the set in the table with the same type; a table column missing from the set is written NULL;
+//  6. one table version: truncate clear → deletes → upserts; a masked cell keeps the stored value (NULL on a new row);
+//  7. store the marker with the UNION of the prior and new positions.
+pub enum SinkKind { Delta, Iceberg }        // as_str(): "delta" | "iceberg" (pipeline state `sink_type`)
+pub enum WriteMode { Mirror, Changelog }
+pub enum SchemaOp { AddColumn, DropColumn, RenameColumn, WidenType, DropNotNull }
+pub enum PartitionTransform { Identity, Bucket { n: u32 }, Truncate { width: u32 }, Year, Month, Day, Hour }  // kind() → TransformKind
+pub struct PartitionField { pub column: String, pub transform: PartitionTransform }
+pub struct SinkCapabilities { pub write_modes: BTreeSet<WriteMode>, pub schema_ops: BTreeSet<SchemaOp>,
+                              pub partition_transforms: BTreeSet<TransformKind> }
+impl SinkCapabilities { pub fn refusal(&self, mode: WriteMode, partition_by: &[PartitionField]) -> Option<String>; }
+pub struct TableSpec { pub table: TableRef, pub schema: SchemaRef /* upsert_schema */, pub identifier: Vec<String>,
+                       pub partition_by: Vec<PartitionField> }
+impl TableSpec { pub fn new(schema: &TableSchema, partition_by: Vec<PartitionField>) -> Result<Self, HaltReason>; }
 pub struct CommitMarker { pub owner_epoch: u64, pub committed_position: SourcePosition, pub pipeline_id: String }
+impl CommitMarker {
+    pub fn fences(&self, ours: &CommitMarker) -> bool;   // stored.owner_epoch > ours.owner_epoch
+    // Guard (D-M3.14, S-P): split None → stored covers cs.position.end;
+    // split Some → stored strictly past txn_start (covers it and isn't equal).
+    pub fn covers(&self, cs: &TableChangeSet) -> Result<bool, PositionError>;
+}
+pub struct SinkTableState { pub exists: bool, pub schema: Option<SchemaRef> /* Hop 2 terms, soft-drops stay */,
+                            pub marker: Option<CommitMarker> }
+pub enum EvolveOutcome { Applied, Degraded { warning: String }, Unsupported { reason: String } }
+pub enum CommitOutcome { Committed { version: u64 }, SkippedCovered, Fenced { current_epoch: u64 } }
+pub enum SinkError { InvalidChangeSet(ChangeSetError), Position(PositionError), NoTable { table },
+                     Transient { reason }, Permanent { reason } }   // is_transient(): Transient only
 ```
+
+`data-avalanche-testkit::MemorySink` (`Clone` shares the tables) implements this contract with the Delta
+evolution rules: add column `Applied`; a drop is a soft-drop (kept, written NULL) and a rename adds the new
+name and keeps the old, both `Degraded`; NOT NULL changes, appended enum values and no-effect changes need
+nothing; everything else `Unsupported`. It also has
+`content(&TableRef) -> Option<RecordBatch>` (rows in key order) and `version(&TableRef) -> Option<u64>`.
 
 ### 3.5 Storage and state (`data-avalanche-storage`, `data-avalanche-state`, landed in M2)
 
@@ -362,6 +444,51 @@ The crate root is the whole public surface (internals are `pub(crate)`):
 
 No diagnostic contains an env-resolved value, a file-reference value, file content or a secret
 (config §11.1).
+
+
+### 3.9 The accumulator (`data-avalanche-pipeline`, landed in M3)
+
+No I/O and no clock: the orchestrator passes events and `now` in, reads `Flush`es out and commits them
+through a `Sink`. The crate root is the whole public surface.
+
+```rust
+pub struct Lineage { pub source_db: String, pub pipeline: String }   // MAX_BATCH_BYTES = 512 MiB per batch
+pub struct FlushPolicy { pub seconds: Option<u64>, pub rows: Option<u64>, pub bytes: Option<u64> }   // Default 30 s / 100 000 / 512 MiB
+pub struct TxnLimits { pub batch_rows: Option<u64>, pub buffer_bytes: u64 }                          // Default no split / 1 GiB
+pub enum FlushReason { Split, Boundary, Age, Rows, Bytes }
+pub struct Flush { pub change_sets: Vec<TableChangeSet>, pub checkpoint: SourcePosition }   // checkpoint: durable once all are committed
+
+impl Accumulator {
+    pub fn new(lineage: Lineage, policy: FlushPolicy, resume_from: SourcePosition) -> Self;
+    pub fn set_policy(&mut self, p: FlushPolicy); pub fn set_txn_limits(&mut self, l: TxnLimits);
+    pub fn add_table(&mut self, schema: TableSchema, delete_extra: &[String]) -> Result<(), AccumulatorError>;
+    pub fn halt_table(&mut self, table: &TableRef);                       // later events of the table are dropped
+    pub fn begin(&mut self, xid: u64) -> Result<(), AccumulatorError>;
+    pub fn apply(&mut self, e: &CdcEvent, now: Instant) -> Result<(), AccumulatorError>;
+    pub fn truncate(&mut self, tables: &[TableRef], now: Instant) -> Result<(), AccumulatorError>;   // barrier
+    pub fn set_schema(&mut self, schema: TableSchema, delete_extra: &[String]) -> Result<(), AccumulatorError>;  // barrier
+    pub fn commit(&mut self, b: &TransactionBoundary, now: Instant) -> Result<(), AccumulatorError>;
+    pub fn keepalive(&mut self, p: &SourcePosition, now: Instant) -> Result<(), AccumulatorError>;  // between transactions
+    pub fn due(&self, now: Instant) -> Option<FlushReason>;              // after each boundary and on a timer
+    pub fn flush(&mut self) -> Flush;                                     // committed layer: checkpoint..=frontier
+    pub fn split(&mut self) -> Result<Flush, AccumulatorError>;          // a slice of the open transaction
+    pub fn checkpoint(&self) -> &SourcePosition; pub fn frontier(&self) -> &SourcePosition; pub fn in_transaction(&self) -> bool;
+}
+pub enum AccumulatorError {
+    Halt { table, reason: HaltReason },     // the table is halted in the accumulator too
+    Event(EventShapeError), UnknownTable { table }, Protocol { detail }, Position(PositionError),  // connector bugs
+    FlushRequired { table },                // barrier: nothing changed; flush + commit, then call again
+    SplitRequired,                          // splitting on, open txn at buffer_bytes: nothing changed; split + commit, apply again
+    TransactionTooLarge { bytes, limit },   // splitting off: halt the pipeline
+}
+```
+
+`TableBuffer` (per table: keep-last collapse by `_seq`, PK change = delete + upsert, TOAST fill from the
+buffered image then the sent before-image) and `CollapsedRow`/`RowKind` are public for tests; the
+orchestrator uses the `Accumulator`. Deferred to later milestones (M3 plan, Deviations): `_lsn` for a
+binlog-file position is taken from the event, not the commit boundary (M6); a rename inside an open
+transaction NULLs the renamed column's open values; `add_table` doesn't mark a table halted when its
+buffer can't be created.
 
 ---
 
@@ -791,6 +918,12 @@ implements them.
 | S-P | `Data-Flow.md` Phase 4 §Position guard, Phase 3 oversized transactions | A split slice is skipped only when the stored position is strictly past its transaction's start; the rest of a split transaction goes out with the next regular flush | M3 D-M3.14 | M3 |
 
 **S-N, S-O, S-P: approved and applied on 2026-09-30.** The M3 plan implements them.
+
+| # | Spec | Change | From | Before |
+|---|---|---|---|---|
+| S-Q | `Data-Flow.md` §TOAST `carry_forward` steps 2 and 4, §CdcEvent Structure `before` | A masked column is filled under the old key after a key change, then from the before-image when the source sent the column (REPLICA IDENTITY FULL). An unresolved key change writes NULL (step 4); the remedy is REPLICA IDENTITY FULL or `toast_strategy: re_query`. A before-image carries only the columns the source sent (a PG `K` tuple: the key columns) | M3 final review, I1 | M3 exit |
+
+**S-Q: approved and applied on 2026-09-30.** The M3 final-review fix wave implements it; M5's decoder follows its before-image rule.
 
 `Type_Mapping.md` (research) still names `mysql-binlog-connector-rust` as the MySQL decoder, but
 `mysql_async` replaced it. That research-doc fix is applied (2026-09-26).

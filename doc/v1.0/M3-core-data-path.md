@@ -225,9 +225,41 @@ record. In order:
   a commit with a binlog position after a PostgreSQL `resume_from`. Each is
   `AccumulatorError::Position`, the transaction stays open and the frontier stays put. It was
   mutation-checked: it fails when the position error is swallowed.
-- **Test counts.** Because of the three tests above, `data-avalanche-pipeline` ends up with more
-  unit tests than the tasks' Expected lines say: 14 after T8, 21 after T9, 32 after T10, then 40,
-  43, 43 for T11–T13. The workspace total ends three above the plan's 427.
+- **Test counts during the tasks.** Because of the three tests above, `data-avalanche-pipeline`
+  had more unit tests than the tasks' Expected lines say: 14 after T8, 21 after T9, 32 after T10,
+  then 40, 43, 43 for T11–T13. The workspace had 430 tests at T13, three above the plan's 427.
+- **Final review, one fix wave** (`a23c939..26957ef`). The owner ruled on each item:
+  - **C1.** A `bigint unsigned` value under a decimal logical type (a `decimal(P,S)` override) was
+    stored unscaled. `UInt64(12345)` in `decimal(25,2)` became 123.45. It is now converted,
+    rescaled and precision-checked like any decimal: `NUMERIC_OVERFLOW` when it doesn't fit.
+  - **I2.** `TableSchema::new` rejects an identifier column that is listed twice
+    (`IDENTIFIER_NOT_USABLE`). Before, every delete of that table failed `validate`. A new test
+    shows that `Text`, `Uuid`, `UInt64` and `Numeric` identifiers are accepted.
+  - **I3.** With splitting on, `Accumulator::apply` returns `AccumulatorError::SplitRequired` once
+    the open transaction reaches `buffer_bytes`, and changes nothing. The caller calls `split()`,
+    commits the slice and applies the event again; that retry always makes progress. Before, the
+    ceiling held only if `due()` ran after every event.
+  - **I1.** An UPDATE's unchanged TOAST value is filled from the buffered image first, as before.
+    Then it is filled from the before-image when the source sent that column there (REPLICA
+    IDENTITY FULL). A column the before-image doesn't carry stays unchanged, which is Data-Flow
+    §TOAST step 4 (NULL for a moved key). The collapse properties gained a `MoveFull` action: a key
+    move with an unchanged doc and a full before-image. For the M5 decoder: a before-image carries
+    only the columns the source sent, so a key-only (`K`) old tuple carries only its key columns.
+  - **M2.** A halt from a table's buffer (`apply`, `truncate`, `set_schema`) also halts the table
+    in the accumulator. `set_schema` on a halted table is a no-op, like `truncate`.
+  - **M5.** An `Unchanged` inside an array value is `EventShapeError::UnchangedInArray`.
+  - **T5b.** A position range whose ends are of different dialects reports the dialect mismatch.
+  - **M4.** The `Sink` trait documents the commit contract the reference sink implements: the
+    order of checks, the union position, columns missing from the set are written NULL, a mask on
+    a missing row is NULL, and `SinkTableState.schema` is in Hop 2 terms.
+  - Workspace tests: 440.
+  - Deferred to later milestones:
+    - the reviewer's performance notes: `row_bytes` serializes JSON, `conform` is O(columns²);
+    - `_lsn` for a binlog-file position, which the commit boundary knows and the row doesn't (M6);
+    - a rename inside an open transaction NULLs the renamed column in the open rows (plan ruling
+      D-M3.12);
+    - `add_table` doesn't mark a table halted when creating its buffer halts;
+    - the property schedules never reach `SplitRequired` (a unit test covers it).
 
 ---
 
@@ -7626,22 +7658,24 @@ git commit -m "test(pipeline): collapse property tests (M3 exit)"
 
 The roadmap's M3 exit criteria, and where each is met:
 
-- [ ] **Property tests: collapse is idempotent and order-insensitive to batch boundaries**:
+- [x] **Property tests: collapse is idempotent and order-insensitive to batch boundaries**:
   Task 13 (`the_mirror_equals_the_source_whatever_the_batch_boundaries`,
   `a_crash_and_a_replay_from_any_checkpoint_converge`), in the reference sink.
-- [ ] **The flush policy is tested under simulated time**: Task 10
+- [x] **The flush policy is tested under simulated time**: Task 10
   (`age_counts_from_the_oldest_event_not_the_commit`, `seconds_zero_flushes_at_every_boundary`,
   `rows_and_bytes_trigger_on_committed_changes`,
   `disabled_triggers_never_fire_and_the_policy_reloads`,
   `keepalives_advance_the_frontier_between_transactions`).
-- [ ] **Every §7.2 row is a test case, including the reserved-name and `DROP TABLE` rows**:
+- [x] **Every §7.2 row is a test case, including the reserved-name and `DROP TABLE` rows**:
   Task 3 (`row_*`).
-- [ ] **The in-memory reference sink implements the contract** (idempotent upsert map, fence,
+- [x] **The in-memory reference sink implements the contract** (idempotent upsert map, fence,
   guard): Task 7.
-- [ ] `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
+- [x] `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo fmt --all --check` and `RUSTDOCFLAGS="-D warnings" cargo doc -p data-avalanche-core
   -p data-avalanche-pipeline -p data-avalanche-testkit --no-deps` are clean.
-- [ ] Roadmap §3.1, §3.3 and §3.4 are replaced by the landed interface, per the doc/v1.0 README.
+- [x] Roadmap §3.1, §3.3 and §3.4 are replaced by the landed interface, per the doc/v1.0 README,
+  and §3.9 describes the accumulator (2026-09-30).
 - [x] Q-M3-1…4 are recorded as answered in roadmap §9.1 (2026-09-30).
-- [x] S-N, S-O and S-P are approved and applied (2026-09-30).
+- [x] S-N, S-O and S-P are approved and applied (2026-09-30), and S-Q from the final review
+  (2026-09-30).
 - [x] The research-doc corrections above are made (2026-09-30).
