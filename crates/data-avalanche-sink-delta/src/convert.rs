@@ -68,6 +68,12 @@ pub fn to_delta(
     Ok(match (logical, p) {
         (L::Uuid, P::String) => {
             let a = array.as_fixed_size_binary();
+            if a.value_length() != 16 {
+                return Err(format!(
+                    "a uuid column holds {}-byte values, not 16",
+                    a.value_length()
+                ));
+            }
             Arc::new(
                 (0..a.len())
                     .map(|i| {
@@ -231,6 +237,9 @@ fn bad(text: &str, what: &str) -> String {
     format!("{text:?} isn't a {what}")
 }
 
+/// The largest year `parse_ntz_text` accepts (either sign).
+const MAX_TEXT_YEAR: i64 = 300_000;
+
 /// The inverse of [`ntz_text`].
 pub fn parse_ntz_text(text: &str) -> Result<i64, String> {
     let err = || bad(text, "timestamp text");
@@ -245,8 +254,17 @@ pub fn parse_ntz_text(text: &str) -> Result<i64, String> {
     let y: i64 = y.parse().map_err(|_| err())?;
     let m: u32 = m.parse().map_err(|_| err())?;
     let d: u32 = d.parse().map_err(|_| err())?;
+    // `i64` microseconds span years -290308 … 294247; the bound keeps the arithmetic in range.
+    if !(0..=MAX_TEXT_YEAR).contains(&y) || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return Err(err());
+    }
     let y = if negative { -y } else { y };
-    let days = i128::from(days_from_civil(y, m, d));
+    let days = days_from_civil(y, m, d);
+    // A day the month doesn't have (`2024-02-31`) comes back as another date.
+    if civil_from_days(days) != (y, m, d) {
+        return Err(err());
+    }
+    let days = i128::from(days);
     let micros = days * 86_400_000_000 + i128::from(parse_time_text(time)?);
     i64::try_from(micros).map_err(|_| err())
 }
@@ -263,11 +281,21 @@ pub fn parse_time_text(text: &str) -> Result<i64, String> {
     let mut next =
         || -> Result<i128, String> { parts.next().ok_or_else(err)?.parse().map_err(|_| err()) };
     let (h, m, s) = (next()?, next()?, next()?);
-    if frac.len() != 6 || m > 59 || s > 59 {
+    if frac.len() != 6 || !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(err());
+    }
+    if h < 0 || !(0..=59).contains(&m) || !(0..=59).contains(&s) {
         return Err(err());
     }
     let frac: i128 = frac.parse().map_err(|_| err())?;
-    let magnitude = ((h * 60 + m) * 60 + s) * 1_000_000 + frac;
+    let magnitude = h
+        .checked_mul(60)
+        .and_then(|v| v.checked_add(m))
+        .and_then(|v| v.checked_mul(60))
+        .and_then(|v| v.checked_add(s))
+        .and_then(|v| v.checked_mul(1_000_000))
+        .and_then(|v| v.checked_add(frac))
+        .ok_or_else(err)?;
     let micros = if negative { -magnitude } else { magnitude };
     i64::try_from(micros).map_err(|_| err())
 }
@@ -275,7 +303,7 @@ pub fn parse_time_text(text: &str) -> Result<i64, String> {
 #[cfg(test)]
 mod tests {
     use arrow_array::builder::{FixedSizeBinaryBuilder, ListBuilder, StringBuilder};
-    use arrow_array::{Date32Array, Int64Array, StringViewArray};
+    use arrow_array::{Date32Array, FixedSizeBinaryArray, Int64Array, StringViewArray};
     use arrow_schema::DataType;
     use deltalake::kernel::ArrayType;
     use proptest::prelude::*;
@@ -442,5 +470,40 @@ mod tests {
             prop_assert_eq!(parse_time_text(&time_text(v)).unwrap(), v);
             prop_assert_eq!(parse_ntz_text(&ntz_text(v)).unwrap(), v);
         }
+    }
+
+    #[test]
+    fn malformed_text_is_an_error_not_a_panic() {
+        for bad in [
+            "9000000000000000000-01-01 00:00:00.000000",
+            "-9223372036854775808-01-01 00:00:00.000000",
+            "300001-01-01 00:00:00.000000",
+            "2024-13-01 00:00:00.000000",
+            "2024-00-10 00:00:00.000000",
+            "2024-4294967295-01 00:00:00.000000",
+            "2023-02-29 00:00:00.000000",
+            "2024-04-31 00:00:00.000000",
+            "2024-01-01 99999999999999999999999999999999:00:00.000000",
+        ] {
+            assert!(parse_ntz_text(bad).is_err(), "{bad}");
+        }
+        assert!(parse_ntz_text("2024-02-29 00:00:00.000000").is_ok());
+        for bad in [
+            "99999999999999999999999999999999:00:00.000000",
+            "--1:00:00.000000",
+            "00:-1:00.000000",
+            "00:00:60.000000",
+            "00:00:00.-00001",
+        ] {
+            assert!(parse_time_text(bad).is_err(), "{bad}");
+        }
+        let wide = FixedSizeBinaryArray::try_from_iter([[0u8; 20]].into_iter()).unwrap();
+        let err = to_delta(
+            &(Arc::new(wide) as ArrayRef),
+            &LogicalType::Uuid,
+            &DeltaType::Primitive(PrimitiveType::String),
+        )
+        .unwrap_err();
+        assert!(err.contains("20-byte"), "{err}");
     }
 }
