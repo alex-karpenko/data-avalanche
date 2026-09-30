@@ -185,6 +185,25 @@ an `infra:` commit; `test-infra/README.md` changes in Task 13):
 No spec edit is needed. The spec's MERGE pruning clause is optional (D-M4.4), and truncate follows
 the spec (Q-M4-3).
 
+## Deviations during execution
+
+The task code blocks below are the plan as approved. Where a review changed the code afterwards,
+the landed code differs; `git log` on `feat/claude/m4-delta-sink` is the record.
+
+- **T4, review follow-up (owner's ruling, 2026-09-30; `c579b2b`).** The plan's `parse_ntz_text` and
+  `parse_time_text` panicked on malformed but parseable text. A huge year overflowed
+  `days_from_civil`, a 30-digit hour overflowed the time arithmetic, and a month of `u32::MAX`
+  overflowed `m + 9`. `2024-02-31` was accepted as another date. They are reached from `from_delta`
+  when a Delta string column is read back. Now:
+  - the time parts must be non-negative, and their arithmetic is checked;
+  - the year must be within ±300 000 (`MAX_TEXT_YEAR`), the month 1–12 and the day 1–31;
+  - the date must convert back to itself, which rejects days the month doesn't have;
+  - `to_delta` returns an error for a uuid column that doesn't hold 16-byte values.
+
+  A new test, `malformed_text_is_an_error_not_a_panic`, covers these. It panicked on the plan's
+  code. The unit-test count after T4 is 19, one above the plan's 18. The later tasks' counts are
+  one higher too: 23 after T5, 30, 38, 41, and 44 after T9.
+
 ---
 
 ## File Structure
