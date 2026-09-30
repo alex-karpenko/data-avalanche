@@ -127,16 +127,19 @@ impl TableChangeSet {
                 ));
             }
         }
-        if !self
-            .position
-            .end
-            .covers(&self.position.start)
-            .unwrap_or(false)
-        {
-            return Err(err(format!(
-                "position range ends at {} before it starts at {}",
-                self.position.end, self.position.start
-            )));
+        let (start, end) = (&self.position.start, &self.position.end);
+        match end.covers(start) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(err(format!(
+                    "position range ends at {end} before it starts at {start}"
+                )));
+            }
+            Err(e) => {
+                return Err(err(format!(
+                    "position range from {start} to {end} doesn't compare: {e}"
+                )));
+            }
         }
         if let Some(split) = &self.split
             && self.position.end != split.txn_start
@@ -309,5 +312,17 @@ mod tests {
         let mut c = cs(vec![], vec![]);
         c.position.end = SourcePosition::Pg(Lsn(5));
         assert!(detail(c).contains("before it starts"));
+    }
+
+    #[test]
+    fn a_range_across_dialects_names_both() {
+        let mut c = cs(vec![], vec![]);
+        c.position.end = SourcePosition::parse_tagged("binlog:mysql-bin.000001:4").unwrap();
+        let d = detail(c);
+        assert!(!d.contains("before it starts"), "{d}");
+        assert!(
+            d.contains("cannot combine a binlog position with a pg position"),
+            "{d}"
+        );
     }
 }
