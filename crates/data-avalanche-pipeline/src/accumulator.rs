@@ -117,9 +117,18 @@ impl Accumulator {
     }
 
     /// Stops a table after a halt: its buffered changes are dropped and its later events ignored.
+    /// A halt the accumulator returns has already done this; calling it again changes nothing.
     pub fn halt_table(&mut self, table: &TableRef) {
         self.tables.remove(table);
         self.halted.insert(table.clone());
+    }
+
+    /// Halts the table of a [`AccumulatorError::Halt`] before handing the error on.
+    fn halting<T>(&mut self, r: Result<T, AccumulatorError>) -> Result<T, AccumulatorError> {
+        if let Err(AccumulatorError::Halt { table, .. }) = &r {
+            self.halt_table(table);
+        }
+        r
     }
 
     pub fn begin(&mut self, xid: u64) -> Result<(), AccumulatorError> {
@@ -142,7 +151,9 @@ impl Accumulator {
     /// ([`AccumulatorError::TransactionTooLarge`]); with splitting on, an event that arrives once
     /// it is reached is refused with [`AccumulatorError::SplitRequired`] and nothing changes —
     /// split, commit the slice, then apply the event again. The split empties the open
-    /// transaction, so the retry always makes progress.
+    /// transaction, so the retry always makes progress. An [`AccumulatorError::Halt`] has already
+    /// stopped the table ([`Self::halt_table`]), as it has from [`Self::truncate`] and
+    /// [`Self::set_schema`].
     pub fn apply(&mut self, event: &CdcEvent, now: Instant) -> Result<(), AccumulatorError> {
         let Some(txn) = &mut self.txn else {
             return Err(protocol(format!(
@@ -174,7 +185,9 @@ impl Accumulator {
             return Err(AccumulatorError::SplitRequired);
         }
         let buffer = self.tables.get_mut(&event.table).expect("checked above");
-        buffer.apply(event)?;
+        if let Err(e) = buffer.apply(event) {
+            return self.halting(Err(e));
+        }
         txn.first_event_at.get_or_insert(now);
         if self.limits.batch_rows.is_none() {
             let bytes = self.open_bytes();
@@ -192,9 +205,9 @@ impl Accumulator {
     /// has committed changes, nothing is applied and the result is
     /// [`AccumulatorError::FlushRequired`]: flush, commit the change sets, then truncate again.
     pub fn truncate(&mut self, tables: &[TableRef], now: Instant) -> Result<(), AccumulatorError> {
-        let Some(txn) = &mut self.txn else {
+        if self.txn.is_none() {
             return Err(protocol("a TRUNCATE outside a transaction".into()));
-        };
+        }
         let mut buffers = Vec::new();
         for t in tables.iter().filter(|t| !self.halted.contains(t)) {
             let b = self
@@ -207,25 +220,32 @@ impl Accumulator {
             buffers.push(t.clone());
         }
         for t in &buffers {
-            self.tables.get_mut(t).expect("checked above").truncate()?;
+            let r = self.tables.get_mut(t).expect("checked above").truncate();
+            self.halting(r)?;
         }
+        let txn = self.txn.as_mut().expect("checked above");
         txn.first_event_at.get_or_insert(now);
         Ok(())
     }
 
     /// A table's new schema (`Schema_Change…` §8), after the classifier found the change safe and
     /// the sink evolved the table. [`AccumulatorError::FlushRequired`] when the table has committed
-    /// changes still in the old shape.
+    /// changes still in the old shape. A halted table is skipped.
     pub fn set_schema(
         &mut self,
         schema: TableSchema,
         delete_extra: &[String],
     ) -> Result<(), AccumulatorError> {
         let table = schema.table().clone();
-        self.tables
+        if self.halted.contains(&table) {
+            return Ok(());
+        }
+        let r = self
+            .tables
             .get_mut(&table)
             .ok_or(AccumulatorError::UnknownTable { table })?
-            .set_schema(schema, delete_extra)
+            .set_schema(schema, delete_extra);
+        self.halting(r)
     }
 
     /// The source committed the open transaction: its changes become flushable and the frontier
@@ -855,6 +875,50 @@ mod tests {
         assert_eq!(slice.change_sets.len(), 1);
         a.apply(&next, t0).unwrap();
         assert_eq!(a.open_events(), 1, "the retry is buffered");
+    }
+
+    #[test]
+    fn a_halt_stops_the_table_even_before_the_orchestrator_does() {
+        let t0 = Instant::now();
+        let mut a = acc(FlushPolicy::default());
+        a.begin(1).unwrap();
+        let mut bad = insert("a", 1, 1, 1);
+        bad.after.as_mut().unwrap().0[0].1 = ColumnValue::Null;
+        let err = a.apply(&bad, t0).unwrap_err();
+        assert!(matches!(err, AccumulatorError::Halt { .. }), "{err}");
+        a.apply(&insert("a", 1, 2, 2), t0).unwrap();
+        assert_eq!(a.open_events(), 0, "the halted table buffers nothing");
+        a.apply(&insert("b", 1, 3, 3), t0).unwrap();
+        a.commit(&boundary(1, 200), t0).unwrap();
+        let f = a.flush();
+        assert_eq!(f.change_sets.len(), 1);
+        assert_eq!(f.change_sets[0].table, table("b"));
+        a.halt_table(&table("a"));
+        a.halt_table(&table("a"));
+    }
+
+    #[test]
+    fn a_schema_change_of_a_halted_table_is_ignored() {
+        let t0 = Instant::now();
+        let mut a = acc(FlushPolicy::default());
+        a.halt_table(&table("a"));
+        a.set_schema(schema("a"), &[]).unwrap();
+
+        let other_key = TableSchema::new(
+            table("b"),
+            vec![
+                ColumnSchema::new("id", V::Int64, "bigint").not_null(),
+                ColumnSchema::new("doc", V::Text, "text").not_null(),
+            ],
+            vec!["doc".into()],
+        )
+        .unwrap();
+        let err = a.set_schema(other_key, &[]).unwrap_err();
+        assert!(matches!(err, AccumulatorError::Halt { .. }), "{err}");
+        a.begin(1).unwrap();
+        a.apply(&insert("b", 1, 1, 1), t0).unwrap();
+        assert_eq!(a.open_events(), 0, "a halt from set_schema halts the table");
+        a.set_schema(schema("b"), &[]).unwrap();
     }
 
     #[test]
