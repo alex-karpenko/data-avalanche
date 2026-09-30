@@ -60,7 +60,8 @@ pub enum ColumnValue {
     },
     /// The source did not send this value: a PostgreSQL unchanged-TOAST column in an UPDATE
     /// (pgoutput `u`, D-IMPL-3). It is not NULL. The collapse fills it from an earlier image of the
-    /// same key; a value still unresolved at flush keeps the target's value.
+    /// same key, then from the event's before-image when the source sent the column there
+    /// (REPLICA IDENTITY FULL); a value still unresolved at flush keeps the target's value.
     Unchanged,
 }
 
