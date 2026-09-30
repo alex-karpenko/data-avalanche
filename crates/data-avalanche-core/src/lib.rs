@@ -7,6 +7,7 @@
 //!   `FromStr::Err` is that type.
 
 pub mod classify;
+pub mod columnar;
 pub mod decimal;
 pub mod event;
 pub mod logical;
@@ -16,6 +17,10 @@ pub mod table;
 pub mod value;
 
 pub use classify::{DeltaClass, SchemaChange, SchemaDelta, classify};
+pub use columnar::{
+    LIST_ELEMENT, LOGICAL_TAG, UNCHANGED_MASK_PREFIX, arrow_type, column_field, delete_schema,
+    lineage_fields, logical_tag, unchanged_mask_field, upsert_schema,
+};
 pub use decimal::{Decimal, DecimalError, MAX_DECIMAL_PRECISION};
 pub use event::{CdcEvent, EventShapeError, Op, SourceSeq, TransactionBoundary};
 pub use logical::{LogicalType, LogicalTypeError, MAX_LIST_DEPTH};
