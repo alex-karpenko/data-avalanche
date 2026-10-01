@@ -153,6 +153,7 @@ the arrow.
 | Q-M5-9 | The `varbit` value layout ("length-prefixed") | **PostgreSQL's binary form**: a 4-byte big-endian bit count, then the bits packed MSB-first, the last byte zero-padded |
 | Q-M5-10 | libpq treats `sslmode=require` with a root CA file as `verify-ca`. Should `require` with `ssl_ca` set check the chain? | **No: `require` encrypts without checking the chain**, on both connections, whether or not `ssl_ca` is set (D-M5.16). Only `verify-ca` and `verify-full` check it |
 | Q-M5-12 (2026-10-01, during execution) | An override other than `string` or a decimal on a numeric column had to equal the mapped type: `int → int64` halted, and `timestamp_ntz_as: timestamp` had no per-column form | **Lossless conversions at Hop 1** (Task 5b): integer widening, an integer to a decimal with room, `float32 → float64`, `timestamp_ntz ↔ timestamp_tz`, `date → timestamp_*`, lists element by element, through one table in core for every source; anything else halts (`SCHEMA_MISMATCH`). Config §9.3 lists them |
+| Q-M5-13 (2026-10-01, during execution) | PostgreSQL doesn't publish `UNLOGGED` tables, but channel A selected them: a managed publication refused the pipeline, and under `FOR ALL TABLES` the table was snapshotted once and then never changed | **Like a table without an identifier**: a glob-matched unlogged table is skipped with a warning, a named one halts (`TABLE_NOT_REPLICABLE`, new in core). Config §11.2 lists the precondition |
 
 **Rulings where the specs are silent** (each is pinned by a test). **Plan approved 2026-10-01**, with these rulings (roadmap D-IMPL-12):
 
@@ -169,7 +170,7 @@ the arrow.
 | D-M5.9 | Numerics. `numeric(P,S)` with P ≤ 38 → `decimal(P,S)`. A negative scale → `decimal(P+|S|, 0)`. S > P → `decimal(S,S)`. P > 38 under `string` → text with a warning, and under `error` → a halt at resolution. A bare `numeric` → text under `string`, `decimal(38,18)` under `error` (Q-M5-8). NaN and `±Infinity` → `SCHEMA_MISMATCH` halt. `money` → `decimal(19,2)` | Type_Mapping's cap, filled in where it is silent | Task 4, Task 5 (`numeric_precision_rules`) |
 | D-M5.10 | Overrides. `string` reads the column as its PostgreSQL text. `decimal(P,S)` on a `numeric` or `money` base (through domains) decodes as that decimal. Any other override must be Hop 2-compatible with the column's mapped type or a lossless conversion (Q-M5-12, Task 5b), or the table halts (`SCHEMA_MISMATCH`). Other fallbacks: multi-dimensional arrays halt; array bound decorations are dropped; PostGIS hex EWKB → bytes; hstore → a JSON object; unknown types → their text with a warning | Config §9.3 `column_type_overrides`; the fallback chain of Type_Mapping | Task 5 (`overrides`, `user_and_extension_types`, `arrays_follow_their_element`), Task 5b (`overrides_convert_losslessly`) |
 | D-M5.11 | Selection. System schemas (`pg_*`, `information_schema`) are never matched. A glob `*` stays inside one name segment and is case-sensitive. An explicit name that matches nothing warns. Generated columns (`attgenerated <> ''`) are left out | Config §9.3; pgoutput doesn't send generated columns | Task 6 (`globs_stay_inside_a_name`, `selection`) |
-| D-M5.12 | Identifier. The override, else the primary key. It must lie within the replica identity (an index, FULL, or the default primary key), else the table halts (`IDENTIFIER_NOT_IN_REPLICA_IDENTITY`). No identifier: a glob-matched table is skipped with a warning, a named one halts | Ghost_Row_Dedup §PK policy; a delete must carry the identifier | Task 6 (`identifiers_and_replica_identity`), Task 7 (`channel_a_resolves_checks_and_skips`) |
+| D-M5.12 | Identifier. The override, else the primary key. It must lie within the replica identity (an index, FULL, or the default primary key), else the table halts (`IDENTIFIER_NOT_IN_REPLICA_IDENTITY`). No identifier: a glob-matched table is skipped with a warning, a named one halts. An unlogged table the same way, halting `TABLE_NOT_REPLICABLE` (Q-M5-13) | Ghost_Row_Dedup §PK policy; a delete must carry the identifier | Task 6 (`identifiers_and_replica_identity`), Task 7 (`channel_a_resolves_checks_and_skips`) |
 | D-M5.13 | The slot state table (`decide`). Checkpoint and slot → `Resume`, except: another plugin or database → `Refuse`; invalidated, or `confirmed_flush` past the checkpoint → `Recreate(PositionLost)` under `managed`, `Refuse` under `require_existing`. A checkpoint and no slot → `Create(PositionLost)` under `managed`, else `Refuse`. A slot and no checkpoint (an orphan) → `Refuse` under `on_orphan: halt`; `Adopt` (advance to the current WAL, then snapshot) under `adopt_resnapshot`, `require_existing` included; an invalidated orphan → `Recreate(AdoptedOrphan)` under `managed`, else `Refuse`. Neither → `Create(FirstStart)` under `managed`, else `Refuse` | Postgres_Slot… §1–§3. A slot past the checkpoint has released WAL the pipeline still needs | Task 8 (the seven `decide` tests, the integration cells) |
 | D-M5.14 | Publication. Under `managed`: create it when absent, `ADD`/`DROP TABLE` to match the tracked set, and set `publish = 'insert, update, delete, truncate'` and `publish_via_partition_root = false`. Under `require_existing`, or for a `FOR ALL TABLES` publication: never change it, warn on each difference, except one. With `publish_via_partition_root = true` and a tracked table that is a partition, `prepare` is refused (`Permanent`), naming the partitions and the `ALTER PUBLICATION` that fixes it | D-15.4. A partition's changes would arrive under its untracked parent's name and be dropped: silent loss, so a refusal, not a warning (Q-M5-5) | Task 8 (`the_publication_follows_the_table_set`, `require_existing_never_creates`, `a_root_publication_of_tracked_partitions_is_refused`) |
 | D-M5.15 | `prepare` reconciles the publication, then the slot. Creating a slot (it waits for running transactions) is bounded by `timeouts.snapshot`; every other catalog call by `timeouts.command`. `reset_position` drops and recreates the slot (refused under `require_existing`). `teardown` drops the slot and the publication only under `managed` with `auto_cleanup`. `retained_bytes` is `pg_current_wal_lsn() - confirmed_flush_lsn` | The `max_wal_lag_bytes` guard (V-104) compares against it in M6 | Task 8 (`reset_teardown_and_retained_wal`) |
@@ -10471,7 +10472,7 @@ diff --git a/crates/data-avalanche-source-pg/src/connector.rs b/crates/data-aval
      pub(crate) pg: Postgres,
      pub(crate) conn: Connector,
      /// `pg_type` rows fetched so far.
-@@ -234,10 +236,87 @@
+@@ -241,10 +243,87 @@
      }
  }
  
@@ -11930,3 +11931,24 @@ tests each without TLS, and the workspace passes 632 tests. Task 5b replayed on 
 branch at `88b7c58`. Counts after it: `data-avalanche-source-pg` unit tests 43, so each later task's
 count is three higher than its block shows. Integration tests: Task 12 31, Task 13 35 (31 on each of
 PostgreSQL 14–17).
+
+**Task 7: unlogged tables, and two small fixes** (`b25934f`; found by the task review, owner
+decision Q-M5-13, 2026-10-01). `catalog::relations` listed every `relkind` `r`/`p` table, including
+`UNLOGGED` ones, which PostgreSQL can't publish. Measured: PostgreSQL 18 refuses `CREATE PUBLICATION
+… FOR TABLE` on one with SQLSTATE 22023 ("not supported for unlogged tables"), and 14 with "Temporary
+and unlogged relations cannot be replicated". Under a managed publication Task 8 would have refused
+the whole pipeline. Under `FOR ALL TABLES` or `require_existing` the table would have been snapshotted
+once and then never changed. Now:
+- `Relation.logged` (`relpersistence = 'p'`). `select` skips a glob-matched unlogged table with a
+  warning and halts a named one: `Selection.halted`, `HaltReason::NotReplicable`
+  (`TABLE_NOT_REPLICABLE`, new in core). Config §11.2 has the row (`4db7c26`).
+- `resolve_tables` counts halted tables as resolved for V-106. A halted table's `primary_key` entry
+  used to warn "not in the pipeline's resolved table set".
+- The authentication test checks `SQLSTATE 28`, not just `28`.
+
+Tests: `unlogged_tables_are_skipped_or_halted` (unit); `channel_a_resolves_checks_and_skips` gains
+`cache` (glob, skipped) and `cache_named` (named, halted), a `primary_key` entry on the halted
+`nothing`, and asserts no V-106 warning. Measured on the verified workspace: PostgreSQL 14–18 pass
+31 integration tests each without TLS; the workspace passes 633. Task 11's `connector.rs` diff is
+regenerated against the fixed file (it applied at an offset of 7 lines). Counts: each later task's
+`data-avalanche-source-pg` unit-test count is four higher than its block shows.
