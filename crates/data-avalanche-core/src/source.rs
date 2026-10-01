@@ -265,10 +265,7 @@ pub fn identifier_values(schema: &TableSchema, row: &Row) -> Option<Row> {
 mod tests {
     use super::*;
     use crate::position::Lsn;
-    use crate::{
-        CdcEvent, ColumnSchema, ColumnValue, ColumnValueType, HaltReason, Op, Row, SourcePosition,
-        SourceSeq, TableRef, TableSchema, TransactionBoundary,
-    };
+    use crate::{ColumnValueType, Op};
 
     fn schema() -> TableSchema {
         TableSchema::new(
