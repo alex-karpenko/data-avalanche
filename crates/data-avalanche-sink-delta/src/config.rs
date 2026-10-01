@@ -141,7 +141,7 @@ impl DeltaLocation {
     }
 
     /// The options delta-rs opens a table with; `env` is the process environment
-    /// ([`utf8_vars`]). delta-rs reads the `AWS_*` and `GOOGLE_*` variables itself, and of
+    /// (its UTF-8 pairs). delta-rs reads the `AWS_*` and `GOOGLE_*` variables itself, and of
     /// `AZURE_*` only the credential keys, not the others (`use_emulator`, the endpoint, …), so
     /// for Azure every `AZURE_*` variable is added here (lower-cased, as `object_store` spells its
     /// keys; one it doesn't know is dropped); an explicit option wins.

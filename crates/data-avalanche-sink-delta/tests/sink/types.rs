@@ -16,10 +16,10 @@ use data_avalanche_core::{
     TransactionBoundary,
 };
 use data_avalanche_pipeline::{Accumulator, FlushPolicy, Lineage};
-use data_avalanche_sink_delta::convert::{
-    DELTA_MAX_DATE, DELTA_MAX_MICROS, DELTA_MIN_DATE, DELTA_MIN_MICROS,
+use data_avalanche_sink_delta::{
+    DELTA_MAX_DATE, DELTA_MAX_MICROS, DELTA_MIN_DATE, DELTA_MIN_MICROS, DeltaLocation, DeltaSink,
+    DeltaSinkConfig, NtzAs, TableDefaults,
 };
-use data_avalanche_sink_delta::{DeltaLocation, DeltaSink, DeltaSinkConfig, NtzAs, TableDefaults};
 use data_avalanche_testkit::{MemorySink, require_it};
 
 fn table() -> TableRef {
