@@ -237,11 +237,13 @@ impl DeltaSink {
                 Err(e) => return race_or_fail(e),
             };
             h.set_table(table.clone());
-            // A commit delta-rs doesn't count as a conflict can outrun the DELETE: deltalake-core
-            // 1.0 `conflict_checker.rs` skips `data_change=false` actions, so a concurrent OPTIMIZE's
-            // compacted file survives a DELETE of the files it replaced. The table isn't empty, so
-            // this lost the race: the retry re-reads the table, re-runs the fence and the guard
-            // (the DELETE has no position, D-M4.8) and truncates again.
+            // A commit delta-rs doesn't count as a conflict can outrun the DELETE. In deltalake-core
+            // 1.0 a DELETE without a predicate declares no read, so `conflict_checker.rs` doesn't
+            // check the files a concurrent commit added, and it skips OPTIMIZE's
+            // `data_change=false` removes: the compacted file survives a DELETE of the files it
+            // replaced (probe P11a). The table isn't empty, so this lost the race: the retry
+            // re-reads the table, re-runs the fence and the guard (the DELETE has no position,
+            // D-M4.8) and truncates again.
             if table.snapshot().map_err(sink_error)?.log_data().num_files() > 0 {
                 return Ok(Step::Retry(
                     "the truncate left files a concurrent commit wrote (an OPTIMIZE, which \
@@ -608,8 +610,9 @@ mod tests {
     }
 
     /// A foreign OPTIMIZE lands between the read and the truncate's DELETE. delta-rs doesn't see a
-    /// conflict (the compaction's actions are `data_change=false`), so the DELETE commits and the
-    /// compacted file survives it: the attempt must retry, not land a table that still holds rows.
+    /// conflict (a predicate-less DELETE declares no read, and the compaction's removes are
+    /// `data_change=false`), so the DELETE commits and the compacted file survives it: the attempt
+    /// must retry, not land a table that still holds rows.
     #[tokio::test]
     async fn a_truncate_that_a_foreign_optimize_outran_is_retried() {
         let dir = tempfile::tempdir().unwrap();
