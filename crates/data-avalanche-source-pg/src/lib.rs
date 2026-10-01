@@ -12,5 +12,6 @@ pub mod pgoutput;
 mod test_support;
 #[allow(dead_code)] // `PgConnector` (Task 7) is the caller
 mod tls;
+pub mod value;
 
 pub use connect::{APPLICATION_NAME, SESSION_OPTIONS};
