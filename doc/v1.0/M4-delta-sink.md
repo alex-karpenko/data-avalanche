@@ -1,5 +1,5 @@
 ---
-updated: 2026-09-30
+updated: 2026-10-01
 domain: Sink
 tags: [v1, implementation-plan, m4, delta-lake, delta-rs, sink, merge, fence, position-guard, hop-3b, schema-evolution]
 sources: []
@@ -215,6 +215,71 @@ the landed code differs; `git log` on `feat/claude/m4-delta-sink` is the record.
   A new test, `a_change_set_the_merge_cant_convert_is_permanent`, came back `Transient` on the plan's
   code. The fix was verified first on the milestone's final code: 44 unit tests and all 15
   integration tests pass, P6 counts unchanged. Unit counts: 39 after T7, 42 after T8, 45 after T9.
+- **Final review fix wave (owner's rulings, 2026-10-01; `901ab43`…`4023bf7`).** The whole-branch
+  review found no Critical item, two Important ones and eight minor ones. It also confirmed with
+  a probe that one parked item was data loss. Eight commits fix them:
+  - **A re-created table was skipped (`901ab43`).** `TableHandle` cached the last own version
+    and position (`known`) without the table's identity. If the table was deleted and re-created,
+    the walk-back stopped at the cached version, and the next commit returned `SkippedCovered`
+    onto an empty table. `known` now carries the table id (`metadata().id()`). It is cleared when
+    `refresh` finds no table and by `create`, and it is ignored when the id differs or its version
+    is past the latest.
+    - A handle behind another sink's re-create now recovers in `fence_epoch`. delta-rs 1.0's
+      `update_incremental` returns `Ok` on the stale snapshot, so the `txn` read is where it
+      fails; the handle re-opens the table once and reads again.
+    - One case is left to M6, by the owner's ruling: a table re-created behind a live handle whose
+      new log has already passed the handle's version. Every commit then fails `Transient` until
+      the handle is re-opened. Nothing is lost.
+  - **Failures that always repeat were `Transient` (`9e1576e`).** A MERGE that breaks a Delta rule
+    (a NULL in a NOT NULL column, a CHECK constraint) comes back from delta-rs as `Generic`.
+    `sink_error` now classes its "validation check" text as `Permanent`, and a test builds the
+    real error. `check_columns` refuses, as `Permanent`, a set that lacks a table column that
+    can't be NULL (the identifier, the lineage columns). `MemorySink` accepts such a set; the
+    Delta table can't store it.
+  - **D-M4.5 is narrowed (`9e1576e`).** A retry follows only a real race: `CommitConflict`
+    `ConcurrentAppend`, `ConcurrentDeleteRead`, `ConcurrentDeleteDelete`, `MetadataChanged`,
+    `ConcurrentTransaction` or `ProtocolChanged`, `MaxCommitAttempts`, and `VersionAlreadyExists`.
+    `Predicate` and the other conflict variants are `Permanent`. The `VersionMismatch` arm is gone:
+    deltalake-core 1.0 never raises it.
+  - **D-M4.8 gains a retry (`4023bf7`).** deltalake-core 1.0's conflict checker skips actions with
+    `data_change=false` (`conflict_checker.rs`), which is what OPTIMIZE writes. A truncate's DELETE
+    built before a foreign OPTIMIZE therefore committed without a conflict, and the compacted file
+    survived with the old rows. After the DELETE, a table that still holds files is now a lost race
+    (`Step::Retry`): the retry re-reads, fences, truncates again and lands the MERGE. A truncate on an
+    empty table still adds no commit.
+  - **Core: a change set needs an identifier (`22a676c`).** `TableChangeSet::validate()` refuses an
+    empty `identifier` (a table without a key halts first, Ghost_Row_Dedup §3), and the Delta sink
+    returns `Permanent` instead of panicking.
+  - **Bad input is an error, not a panic (`6b221aa`).** A delete batch whose key types differ from
+    the schema is `Permanent`. `DeltaLocation::table_url` returns `Result<Url, SinkError>`, so a
+    relative local root or an invalid bucket host is `Permanent`. Azure options come from
+    `std::env::vars_os()`, skipping non-UTF-8 pairs. **D-M4.13 corrected:** delta-rs 1.0 does read
+    the Azure credential variables. Only the others (`use_emulator`, the endpoint, …) are missing,
+    so merging every `AZURE_*` variable stays harmless.
+  - **`convert`, `marker` and `types` are crate-private (`cd76ee5`).** The plan made them public,
+    which exposed `Result<_, String>` and deltalake's `LogStore` (CLAUDE.md: libraries return
+    `thiserror` errors). The crate root re-exports what tests and later milestones use:
+    `DELTA_MIN_DATE`, `DELTA_MAX_DATE`, `DELTA_MIN_MICROS`, `DELTA_MAX_MICROS`, `POSITION_KEY`,
+    `EPOCH_KEY`, `PIPELINE_KEY`, `TYPE_KEY` and `app_id`.
+  - **Tests and tidies (`66992db`, `9c1ec79`).**
+    - New tests: the truncate crash replay (the DELETE landed, the MERGE not), a check that the
+      sink's own DELETE carries the fence but no position, three lost races (`Transient`,
+      `retries == 2`), and a truncate that loses a race.
+    - Literal pins for the Delta bounds.
+    - Truncates are counted in `DeltaStats`, and the `txn` version is computed once.
+    - Comment and docstring fixes.
+
+  Workspace: 519 tests pass (499 at plan time). The emulator run passes 59 unit and 18
+  integration tests on local, RustFS, Azurite and DuckDB.
+- **Carried to M6 (final review, 2026-10-01).** These are recorded in the roadmap's M6 scope:
+  - a MERGE over `merge_memory_limit` is `Transient` but fails the same way every time (D-M4.14);
+  - `table_state`'s `marker: None` doesn't mean "no own commit" (a truncate's DELETE carries none);
+  - the stale live handle above, and two cases of the same kind: `evolve` on a stale live handle
+    (it doesn't go through `fence_epoch`'s re-open), and a table dropped between `refresh` and the
+    re-open (delta-rs's `NotATable` is `Permanent`);
+  - `commit` doesn't compare `cs.identifier` with the table's recorded identifier (owner's ruling:
+    M6 owns identifier changes, parity with `MemorySink`);
+  - `evolve` carries no fence, because `Sink::evolve` takes no marker.
 
 ---
 
@@ -6131,17 +6196,18 @@ failure and every count above is that replay's output. Measured along the way:
 
 The roadmap's M4 exit criteria, and where each is met:
 
-- [ ] **The delta-capability probes P1–P7 and P10 are re-run as integration tests against the crate
+- [x] **The delta-capability probes P1–P7 and P10 are re-run as integration tests against the crate
   on a local filesystem and RustFS**:
   - P1–P5, P7a/P7b and P6 on a local filesystem (Task 10);
   - the scenarios on RustFS, Azurite and real GCS (Task 12);
   - P10 (Task 13).
-- [ ] **Conformance with the M3 reference sink: the same change-set sequence gives the same table
+- [x] **Conformance with the M3 reference sink: the same change-set sequence gives the same table
   content**: Task 11 (`the_delta_table_equals_the_reference_sinks`).
-- [ ] **A foreign OPTIMIZE doesn't disarm the fence or the guard**:
+- [x] **A foreign OPTIMIZE doesn't disarm the fence or the guard**, nor a truncate (final review,
+  `4023bf7`):
   - Task 10 and Task 12 (`fence_and_guard_survive_a_foreign_optimize`);
   - Task 9 (`a_race_with_a_foreign_optimize_is_retried_and_lands`).
-- [ ] The M4 scope items not in the exit list, each with its test:
+- [x] The M4 scope items not in the exit list, each with its test:
   - capabilities (Task 9);
   - `table_state` with foreign-format detection (Task 6);
   - `ensure_table`'s settings (Task 6);
@@ -6153,17 +6219,18 @@ The roadmap's M4 exit criteria, and where each is met:
   - retry and conflicts (Task 9);
   - checkpoints and log cleanup (Task 10);
   - merge metrics (Tasks 9, 10).
-- [ ] `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
+- [x] `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo fmt --all --check` and `RUSTDOCFLAGS="-D warnings" cargo doc -p data-avalanche-sink-delta
   -p data-avalanche-storage --no-deps` are clean.
-- [ ] The integration job of PR CI is green: emulators, DuckDB and real GCS.
-- [ ] Roadmap updates:
+- [ ] The integration job of PR CI is green: emulators, DuckDB and real GCS. (Real GCS passed
+  locally, run by Oleksii on 2026-09-30; the PR run is pending.)
+- [x] Roadmap updates:
   - a new §3.10 with the Delta sink's landed interface;
   - §2.1's pin note;
   - §3.5's `escape_table_segment`;
   - §9.1 Q-M4-1…6;
   - R-12 and R-13;
   - D-IMPL-11 for the rulings D-M4.1…15.
-- [ ] `Type_Mapping.md` records the Delta clamp and the Hop 3b forms (Q-M4-2, D-M4.2).
+- [x] `Type_Mapping.md` records the Delta clamp and the Hop 3b forms (Q-M4-2, D-M4.2).
   `M2-storage-and-state.md` D-M2.4 points at Q-M4-5.
-- [ ] `doc/v1.0/README.md` lists this plan and its status.
+- [x] `doc/v1.0/README.md` lists this plan and its status.

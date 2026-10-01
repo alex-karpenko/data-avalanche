@@ -1,5 +1,5 @@
 ---
-updated: 2026-09-30
+updated: 2026-10-01
 domain: Architecture
 tags: [v1, implementation-plan, roadmap, milestones, workspace, crates, interfaces, test-strategy, ci, risks]
 sources: []
@@ -273,7 +273,7 @@ pub struct TableChangeSet {
 }
 impl TableChangeSet {
     // Upsert batches: schema's fields, then the same unchanged masks (non-identifier columns) in every batch;
-    // delete batches start with the identifier; a key at most once across both; no NULL key;
+    // a non-empty identifier; delete batches start with it; a key at most once across both; no NULL key;
     // the range doesn't run backwards; a slice's range ends at txn_start.
     pub fn validate(&self) -> Result<(), ChangeSetError>;
     pub fn upsert_rows(&self) -> usize; pub fn delete_rows(&self) -> usize; pub fn is_empty(&self) -> bool;
@@ -491,6 +491,65 @@ binlog-file position is taken from the event, not the commit boundary (M6); a re
 transaction NULLs the renamed column's open values; `add_table` doesn't mark a table halted when its
 buffer can't be created.
 
+### 3.10 The Delta sink (`data-avalanche-sink-delta`, landed in M4)
+
+Path-based Delta tables on delta-rs 1.0 (no catalog in v1). The crate root is the whole public
+surface. Everything else (`convert`, `marker`, `types`, the table handle, the MERGE) is private.
+
+```rust
+pub struct DeltaSinkConfig { pub pipeline_id: String, pub location: DeltaLocation, pub table: TableDefaults,
+                             pub merge_memory_limit: Option<usize> }        // None: no DataFusion memory ceiling
+pub enum DeltaLocation {                                                     // Debug hides option values
+    Local { root: PathBuf },
+    Bucket { backend: Backend, bucket: String, prefix: String, options: Vec<(String, String)> },
+}
+impl DeltaLocation {
+    pub fn table_url(&self, table: &TableRef) -> Result<Url, SinkError>;    // config §10 table_root (~XX names); Permanent if invalid
+    pub fn storage_options(&self, env: impl IntoIterator<Item = (String, String)>) -> HashMap<String, String>;  // Azure: AZURE_* merged
+}
+pub struct TableDefaults { pub checkpoint_interval: u64, pub log_retention: Duration,
+                           pub timestamp_ntz_as: NtzAs, pub table_properties: BTreeMap<String, String> }
+pub enum NtzAs { TimestampNtz, Timestamp, String }
+
+pub struct DeltaSink;                                   // impl Sink: kind Delta; Mirror, AddColumn, Identity transforms
+impl DeltaSink {
+    pub fn new(config: DeltaSinkConfig) -> Self;        // registers the S3/GCS/Azure handlers once
+    pub fn stats(&self) -> DeltaStats;
+    pub async fn content(&self, table: &TableRef) -> Result<Option<RecordBatch>, SinkError>;  // Hop 2 rows, key order
+}
+pub struct DeltaStats { pub commits, pub skipped, pub fenced, pub retries, pub rows_inserted, pub rows_updated,
+                        pub rows_deleted, pub rows_copied, pub files_added, pub files_removed: u64 }   // M10 exports them
+pub const COMMIT_ATTEMPTS: usize = 3;
+pub fn app_id(pipeline_id: &str) -> String;            // the fence's txn app id: data-avalanche/<pipeline>/owner
+pub const POSITION_KEY, EPOCH_KEY, PIPELINE_KEY: &str;  // commitInfo entries of the marker
+pub const TYPE_KEY, IDENTIFIER_KEY: &str;              // Delta column / table metadata: logical type, identifier
+pub const DELETE_FLAG: &str;                           // the MERGE source's delete flag column
+pub const DELTA_MIN_DATE, DELTA_MAX_DATE: i32; pub const DELTA_MIN_MICROS, DELTA_MAX_MICROS: i64;   // Hop 3b clamp (Q-M4-2)
+```
+
+`commit` (per table, one at a time) runs these steps:
+1. **Fence pre-check.** The snapshot's `txn` version for `app_id` is compared with the marker's
+   epoch; a greater one gives `Fenced`.
+2. **Guard.** The walk-back over own `commitInfo` entries stops at the cached own version, after
+   1000 commits, or at a cleaned-up file. If the position covers the set, the result is
+   `SkippedCovered`.
+3. **Truncate**, when the set has one: a DELETE commit with the `txn` but no position. It is
+   retried when files remain, because delta-rs ignores OPTIMIZE's `data_change=false` actions.
+4. **Write.** One MERGE on the identifier with unchanged masks, carrying the `txn` and the
+   position. A set that changes no row gets a marker-only commit instead.
+
+Errors:
+- A real race (the six `CommitConflict` race variants, `MaxCommitAttempts`, `VersionAlreadyExists`)
+  is retried up to `COMMIT_ATTEMPTS` times, then becomes `Transient`. A zombie that loses a race
+  ends `Fenced`.
+- `Permanent`: data or table errors, Delta validation failures, the other conflict variants,
+  unsupported features, invalid locations.
+- `Transient`: storage and network errors, and a MERGE over `merge_memory_limit`.
+
+`table_state` reads the Hop 2 schema back from the column metadata. Its `marker` is `None` when no
+positioned own commit is in reach. The rulings are D-M4.1…15 (D-IMPL-11), with the plan's
+deviations.
+
 ---
 
 ## 4. Milestones
@@ -668,6 +727,18 @@ Detailed plan: `M0-foundations.md`.
   - Binary: `data-avalanche run --config <path>` with CLI log overrides, and a minimal HTTP listener serving
     `/health/live`, `/health/ready` and `/metrics`.
   - Metrics for everything built so far.
+- **Carried from M4** (`M4-delta-sink.md`, Deviations):
+  - Route a MERGE that fails over `merge_memory_limit` (`Transient`, but the same set fails the
+    same way every time) to a smaller flush or a table halt, and add the config key.
+  - `marker: None` from `table_state` doesn't mean "no own commit": a truncate's DELETE carries
+    none.
+  - Re-open a Delta table handle after repeated `Transient` errors. This covers a table
+    re-created behind a live handle, `evolve` on such a handle included. A table dropped between
+    `refresh` and the re-open comes back `Permanent` (`NotATable`) and should be `NoTable`.
+  - Refuse a commit whose identifier differs from the table's recorded `data-avalanche.identifier`,
+    together with the identifier-change path.
+  - `Sink::evolve` carries no marker, so a zombie's ADD COLUMN isn't fenced. It is idempotent, but
+    the trait question is open.
 - **Deps:** M1, M2, M3, M4, M5.
 - **Exit:** the **slice-1 E2E suite** passes on PG 18 + RustFS and nightly on PG 14–17. See §5.3 for
   the scenario list.
