@@ -24,6 +24,7 @@ data-avalanche-storage = { path = "crates/data-avalanche-storage" }
 data-avalanche-state = { path = "crates/data-avalanche-state" }
 data-avalanche-pipeline = { path = "crates/data-avalanche-pipeline" }
 data-avalanche-sink-delta = { path = "crates/data-avalanche-sink-delta" }
+data-avalanche-source-pg = { path = "crates/data-avalanche-source-pg" }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -58,6 +59,11 @@ arrow-cast = "59"
 deltalake = { version = "=1.0.0", default-features = false, features = ["datafusion", "rustls", "s3", "gcs", "azure"] }
 deltalake-core = { version = "=1.0.0", default-features = false }
 url = "2"
+# The PostgreSQL source (roadmap §2.1): the replication transport the S-PG probes ran on (the
+# pgoutput decoder is ours), and rustls for the catalog connection.
+pgwire-replication = { version = "=0.4.1", default-features = false, features = ["tls-rustls", "scram", "md5"] }
+tokio-postgres-rustls = "0.14"
+webpki-roots = "1"
 
 # Dependencies build without debug info: DataFusion's full debug build is over 6 GB, which fills
 # CI runners. Workspace crates keep it.
