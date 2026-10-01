@@ -353,7 +353,7 @@ fn offset(text: &str, full: &str) -> Result<i64, ValueError> {
 }
 
 /// `timestamp` / `timestamptz` → microseconds since the epoch (UTC for `timestamptz`, wall clock
-/// for `timestamp`); `±infinity` clamps to `i64` MAX/MIN.
+/// for `timestamp`); `±infinity`, and instants beyond `i64` microseconds, clamp to `i64` MAX/MIN.
 pub fn timestamp(text: &str, with_tz: bool) -> Result<i64, ValueError> {
     match text {
         "infinity" => return Ok(i64::MAX),
@@ -371,10 +371,10 @@ pub fn timestamp(text: &str, with_tz: bool) -> Result<i64, ValueError> {
     }
     let days = civil_days(date_part, bc, text)?;
     let t = time(clock).map_err(|_| err())?;
-    days.checked_mul(86_400_000_000)
-        .and_then(|d| d.checked_add(t))
-        .and_then(|v| v.checked_sub(offset_secs * 1_000_000))
-        .ok_or_else(|| bad("timestamp out of range:", text))
+    // Beyond the i64 microseconds PostgreSQL's range reaches (294247–294276 AD): clamp (Q-M5-1).
+    let micros =
+        i128::from(days) * 86_400_000_000 + i128::from(t) - i128::from(offset_secs) * 1_000_000;
+    Ok(micros.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64)
 }
 
 /// The `hstore` text form `"k"=>"v", "k2"=>NULL` → a JSON object.
@@ -659,10 +659,8 @@ mod tests {
         assert_eq!(timestamp("-infinity", false), Ok(i64::MIN));
         assert_eq!(
             timestamp("294276-12-31 23:59:59.999999", false),
-            Err(ValueError::Unrepresentable(
-                "timestamp out of range: \"294276-12-31 23:59:59.999999\"".into()
-            )),
-            "PostgreSQL's last instant is past i64 microseconds"
+            Ok(i64::MAX),
+            "PostgreSQL's last instant is past i64 microseconds: it clamps (Q-M5-1)"
         );
         for (t, tz) in [
             ("1970-01-01", false),
