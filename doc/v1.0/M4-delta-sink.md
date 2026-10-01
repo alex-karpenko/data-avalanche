@@ -6229,8 +6229,9 @@ The roadmap's M4 exit criteria, and where each is met:
 - [x] `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo fmt --all --check` and `RUSTDOCFLAGS="-D warnings" cargo doc -p data-avalanche-sink-delta
   -p data-avalanche-storage --no-deps` are clean.
-- [ ] The integration job of PR CI is green: emulators, DuckDB and real GCS. (Real GCS passed
-  locally, run by Oleksii on 2026-09-30; the PR run is pending.)
+- [x] The integration job of PR CI is green: emulators, DuckDB and real GCS. PR #3, run
+  36805795472 on `b3147d8` (2026-10-01): `check` and `integration` pass, `scenarios_on_real_gcs`
+  and `duckdb_reads_the_table` included.
 - [x] Roadmap updates:
   - a new §3.10 with the Delta sink's landed interface;
   - §2.1's pin note;
