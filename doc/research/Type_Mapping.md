@@ -380,7 +380,7 @@ type:
 | `float32` | `float64`, through the shortest decimal text (`0.1` stays `0.1`) |
 | `timestamp_ntz` | `timestamp_tz`: the wall clock read as UTC (as `timestamp_ntz_as: timestamp`) |
 | `timestamp_tz` | `timestamp_ntz`: the UTC wall clock |
-| `date` | `timestamp_ntz`, `timestamp_tz`: midnight; `±infinity` stays infinite, beyond 294276 AD clamps (Q-M5-1) |
+| `date` | `timestamp_ntz`, `timestamp_tz`: midnight; `±infinity` stays infinite; a date past the i64-µs range (294247 AD on) clamps to the maximum, as a timestamp does (Q-M5-1) |
 | `list<T>` | `list<U>` when `T → U` is one of the above |
 
 Any other override halts the table at resolution (`SCHEMA_MISMATCH`). That covers narrowing, a
