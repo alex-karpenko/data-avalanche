@@ -12,6 +12,7 @@ mod error;
 pub mod pgoutput;
 #[allow(dead_code)] // the stream (Task 9) is the caller
 mod position;
+mod slot;
 #[cfg(test)]
 mod test_support;
 mod tls;
