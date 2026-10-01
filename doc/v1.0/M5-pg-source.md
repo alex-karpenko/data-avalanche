@@ -146,7 +146,7 @@ the arrow.
 | Q-M5-2 | Where does the source trait live? Roadmap §3.6 puts it in `data-avalanche-pipeline` | **In `data-avalanche-core`**, next to `Sink`; the source crates depend on core only |
 | Q-M5-3 | Binary tuples (roadmap: "text and binary tuples") | **Text only.** The stream never asks for binary; a binary datum is a protocol error |
 | Q-M5-4 | `pgwire-replication` takes TLS material as file paths; config allows inline PEM | **An inline PEM becomes a private temporary file** (0600 in a 0700 directory, removed when the connector is dropped); a path PEM is used where it is |
-| Q-M5-5 | Partitioned tables | **Replicate the leaves as tables.** A partitioned parent (`relkind = 'p'`) is skipped with a warning, named explicitly or by a glob; `publish_via_partition_root = false` |
+| Q-M5-5 | Partitioned tables | **Replicate the leaves as tables.** A partitioned parent (`relkind = 'p'`) is skipped with a warning, named explicitly or by a glob; `publish_via_partition_root = false`. A publication the pipeline may not change that publishes via the root while a tracked table is a partition is refused (D-M5.14): the stream would drop those changes as untracked |
 | Q-M5-6 | `toast_strategy: re_query` needs a keyed re-read; who builds it? | **M5 adds `fetch_rows`** to the trait; M6 calls it |
 | Q-M5-7 | Where do PostgreSQL 14–17 run? | **A new `nightly.yml`** (scheduled and on dispatch), one job per version |
 | Q-M5-8 | A bare `numeric` under `numeric_overflow_action: error` | **`decimal(38,18)`, halting per value**: a value that doesn't fit halts the table (`NUMERIC_OVERFLOW`); V-079 warns at resolution |
@@ -170,7 +170,7 @@ the arrow.
 | D-M5.11 | Selection. System schemas (`pg_*`, `information_schema`) are never matched. A glob `*` stays inside one name segment and is case-sensitive. An explicit name that matches nothing warns. Generated columns (`attgenerated <> ''`) are left out | Config §9.3; pgoutput doesn't send generated columns | Task 6 (`globs_stay_inside_a_name`, `selection`) |
 | D-M5.12 | Identifier. The override, else the primary key. It must lie within the replica identity (an index, FULL, or the default primary key), else the table halts (`IDENTIFIER_NOT_IN_REPLICA_IDENTITY`). No identifier: a glob-matched table is skipped with a warning, a named one halts | Ghost_Row_Dedup §PK policy; a delete must carry the identifier | Task 6 (`identifiers_and_replica_identity`), Task 7 (`channel_a_resolves_checks_and_skips`) |
 | D-M5.13 | The slot state table (`decide`). Checkpoint and slot → `Resume`, except: another plugin or database → `Refuse`; invalidated, or `confirmed_flush` past the checkpoint → `Recreate(PositionLost)` under `managed`, `Refuse` under `require_existing`. A checkpoint and no slot → `Create(PositionLost)` under `managed`, else `Refuse`. A slot and no checkpoint (an orphan) → `Refuse` under `on_orphan: halt`; `Adopt` (advance to the current WAL, then snapshot) under `adopt_resnapshot`, `require_existing` included; an invalidated orphan → `Recreate(AdoptedOrphan)` under `managed`, else `Refuse`. Neither → `Create(FirstStart)` under `managed`, else `Refuse` | Postgres_Slot… §1–§3. A slot past the checkpoint has released WAL the pipeline still needs | Task 8 (the seven `decide` tests, the integration cells) |
-| D-M5.14 | Publication. Under `managed`: create it when absent, `ADD`/`DROP TABLE` to match the tracked set, and set `publish = 'insert, update, delete, truncate'` and `publish_via_partition_root = false`. Under `require_existing`, or for a `FOR ALL TABLES` publication: never change it, warn on each difference | D-15.4 | Task 8 (`the_publication_follows_the_table_set`, `require_existing_never_creates`) |
+| D-M5.14 | Publication. Under `managed`: create it when absent, `ADD`/`DROP TABLE` to match the tracked set, and set `publish = 'insert, update, delete, truncate'` and `publish_via_partition_root = false`. Under `require_existing`, or for a `FOR ALL TABLES` publication: never change it, warn on each difference, except one. With `publish_via_partition_root = true` and a tracked table that is a partition, `prepare` is refused (`Permanent`), naming the partitions and the `ALTER PUBLICATION` that fixes it | D-15.4. A partition's changes would arrive under its untracked parent's name and be dropped: silent loss, so a refusal, not a warning (Q-M5-5) | Task 8 (`the_publication_follows_the_table_set`, `require_existing_never_creates`, `a_root_publication_of_tracked_partitions_is_refused`) |
 | D-M5.15 | `prepare` reconciles the publication, then the slot. Creating a slot (it waits for running transactions) is bounded by `timeouts.snapshot`; every other catalog call by `timeouts.command`. `reset_position` drops and recreates the slot (refused under `require_existing`). `teardown` drops the slot and the publication only under `managed` with `auto_cleanup`. `retained_bytes` is `pg_current_wal_lsn() - confirmed_flush_lsn` | The `max_wal_lag_bytes` guard (V-104) compares against it in M6 | Task 8 (`reset_teardown_and_retained_wal`) |
 | D-M5.16 | TLS. `allow` connects as `prefer` (the replication crate has no `allow`; both accept either kind). `require` and `prefer` encrypt but don't verify the chain (signatures are still checked), even with `ssl_ca` set (Q-M5-10). `verify-ca` checks the chain and ignores the name. `verify-full` checks both. The trust roots are `ssl_ca`, else the webpki roots. `ssl_cert` and `ssl_key` go together | Config §9.1; one meaning of each mode on both connections | Task 2 (`modes_map_to_both_clients`, `bad_material_is_refused_by_name`), Task 13 |
 | D-M5.17 | Snapshot reads. They use the simple-query protocol, so values are the output-function text pgoutput sends (`true::text` is `true`, pgoutput sends `t`). Columns are qualified by the alias `src`, so an output name can't shadow a key. Collatable keys compare under `COLLATE "C"`. Key values are quoted literals cast to the column's `format_type` text; a `"char"` key goes through a signed byte. A column changed under the snapshot (gone, or a different type) → `Transient`: read again once the stream's signal caught up. `fetch_rows` sends `FETCH_BATCH` = 1000 keys per statement | Snapshot_Resumability §2; a snapshot row must equal the streamed row of the same data | Task 10 |
@@ -182,6 +182,9 @@ the arrow.
 - PostgreSQL 15 and later skip empty transactions; 14 sends a Begin/Commit for every transaction
   of the database.
 - A Relation message's XLogData `wal_start` is 0 (PostgreSQL 18), hence D-M5.3.
+- Partitions (PostgreSQL 14–18, `publish_via_partition_root = false`): a write through the parent
+  arrives under its leaf. An update that moves a row to another partition arrives as a delete in
+  the old leaf and an insert in the new one. A TRUNCATE of the parent lists the leaves.
 - PostgreSQL's first date prints as `4714-11-24 BC` (-2,440,588 days from 1970); the last is
   `5874897-12-31` (2,145,042,905 days).
 - `tempfile` creates directories 0755 unless told otherwise; the PEM directory asks for 0700.
@@ -5878,7 +5881,7 @@ git commit -m "feat(source-pg): PgConnector, preflight and table resolution"
 - Create: `crates/data-avalanche-source-pg/tests/pg/slot.rs`
 
 **Interfaces:**
-- Consumes: `PgConnector`, `parse_lsn`, `lsn_of` (Task 7); `Connector` (Task 2); `SlotManagement`,
+- Consumes: `PgConnector`, `parse_lsn`, `lsn_of` (Task 7); `Connector` (Task 2); `table_key` (Task 6); `SlotManagement`,
   `SlotOnOrphan` (config).
 - Produces:
   - `SlotState { plugin, database, confirmed_flush, invalidated }`, `SlotAction::{Resume,
@@ -5893,7 +5896,8 @@ D-M5.13, D-M5.14, D-M5.15. `decide` is the whole state table of Postgres_Slot…
 pure function, unit-tested cell by cell. The integration tests run every cell against a live
 server: a missing slot, an invalidated one (`max_slot_wal_keep_size` and a WAL switch), an orphan
 under each policy, a wrong plugin, and `require_existing`. The publication is reconciled before
-the slot is created.
+the slot is created. A publication the pipeline may not change, publishing via the partition root
+while a tracked table is a partition, is refused (Q-M5-5).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -6293,6 +6297,70 @@ async fn the_publication_follows_the_table_set() {
 }
 
 #[tokio::test]
+async fn a_root_publication_of_tracked_partitions_is_refused() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(
+        &a,
+        "slot_via_root",
+        "CREATE TABLE a (id int PRIMARY KEY);
+         CREATE TABLE events (id int, at date, PRIMARY KEY (id, at)) PARTITION BY RANGE (at);
+         CREATE TABLE events_2024 PARTITION OF events FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');",
+    )
+    .await;
+    a.batch_execute(&format!(
+        "CREATE PUBLICATION {} FOR TABLE {s}.a, {s}.events WITH (publish_via_partition_root = true)",
+        n.publication,
+        s = n.schema
+    ))
+    .await
+    .unwrap();
+    let start: String = a
+        .query_one(
+            "SELECT lsn::text FROM pg_create_logical_replication_slot($1, 'pgoutput')",
+            &[&n.slot],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let start = SourcePosition::Pg(start.parse().unwrap());
+    let postgres = ", slot_management: require_existing, auto_cleanup: false";
+    let c = connector(&pipeline(&n, &["*"], "", postgres));
+    let e = c
+        .prepare(Some(&start), &[n.table("a"), n.table("events_2024")])
+        .await
+        .unwrap_err();
+    permanent(
+        e,
+        &format!(
+            "the partitions {}.events_2024 would arrive under their parent's name",
+            n.schema
+        ),
+    );
+    let p = c.prepare(Some(&start), &[n.table("a")]).await.unwrap();
+    assert_eq!(
+        p.plan,
+        StartPlan::Resume,
+        "no partition tracked: the flag is harmless"
+    );
+
+    // Under `managed`, a FOR ALL TABLES publication isn't changed either.
+    a.batch_execute(&format!(
+        "DROP PUBLICATION {p}; CREATE PUBLICATION {p} FOR ALL TABLES WITH (publish_via_partition_root = true)",
+        p = n.publication
+    ))
+    .await
+    .unwrap();
+    let c = connector(&pipeline(&n, &["*"], "", ""));
+    let e = c
+        .prepare(Some(&start), &[n.table("events_2024")])
+        .await
+        .unwrap_err();
+    permanent(e, "publish_via_partition_root = false");
+    cleanup(&a, &n).await;
+}
+
+#[tokio::test]
 async fn reset_teardown_and_retained_wal() {
     require_it!();
     let a = admin().await;
@@ -6377,6 +6445,7 @@ use data_avalanche_core::{
 };
 use tokio_postgres::Client;
 
+use crate::catalog::table_key;
 use crate::connect::within;
 use crate::connector::PgConnector;
 use crate::position::{lsn_of, parse_lsn};
@@ -6492,6 +6561,30 @@ pub(crate) fn qualified(t: &TableRef) -> String {
     format!("{}.{}", ident(&t.schema), ident(&t.name))
 }
 
+/// The tables among `tables` that are partitions (`relispartition`).
+async fn partitions(
+    client: &Client,
+    tables: &[TableRef],
+) -> Result<Vec<TableRef>, tokio_postgres::Error> {
+    let schemas: Vec<&str> = tables.iter().map(|t| t.schema.as_str()).collect();
+    let names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
+    let rows = client
+        .query(
+            "SELECT n.nspname::text, c.relname::text
+               FROM pg_catalog.pg_class c
+               JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+               JOIN unnest($1::text[], $2::text[]) AS w(s, t) ON w.s = n.nspname AND w.t = c.relname
+              WHERE c.relispartition
+              ORDER BY 1, 2",
+            &[&schemas, &names],
+        )
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| TableRef::new(r.get::<_, String>(0), r.get::<_, String>(1)))
+        .collect())
+}
+
 pub(crate) async fn slot_state(
     client: &Client,
     name: &str,
@@ -6550,7 +6643,9 @@ impl PgConnector {
 
     /// D-15.4: under `managed`, the publication publishes exactly `tables` and every operation
     /// (created when absent, then `ALTER PUBLICATION … ADD/DROP TABLE` and `SET`); under
-    /// `require_existing`, it must exist and a tracked table it doesn't publish warns.
+    /// `require_existing`, it must exist and a tracked table it doesn't publish warns. A
+    /// publication this can't change (`require_existing`, `FOR ALL TABLES`) that publishes via the
+    /// partition root while a tracked table is a partition is refused.
     pub(crate) async fn reconcile_publication(
         &self,
         client: &Client,
@@ -6614,6 +6709,22 @@ impl PgConnector {
             .collect();
         let mut warnings = vec![];
         if !managed || all_tables {
+            // Q-M5-5: a partition's changes would arrive under its parent's name, which isn't
+            // tracked, so the stream would drop them. Refused, not warned: it would lose data.
+            if via_root {
+                let leaves = self
+                    .conn
+                    .command("find partitions", partitions(client, tables))
+                    .await?;
+                if !leaves.is_empty() {
+                    let list: Vec<String> = leaves.iter().map(table_key).collect();
+                    return Err(SourceError::Permanent(format!(
+                        "publication {name} publishes via the partition root, so the changes of the partitions {} would arrive under their parent's name and be lost; run ALTER PUBLICATION {} SET (publish_via_partition_root = false)",
+                        list.join(", "),
+                        ident(name)
+                    )));
+                }
+            }
             for t in missing {
                 warnings.push(format!(
                     "publication {name} doesn't publish {t}: its changes won't arrive"
@@ -6622,11 +6733,6 @@ impl PgConnector {
             if !every_op {
                 warnings.push(format!(
                     "publication {name} doesn't publish every operation; set publish = 'insert, update, delete, truncate'"
-                ));
-            }
-            if via_root {
-                warnings.push(format!(
-                    "publication {name} publishes via the partition root; partitions' changes arrive under the parent's name"
                 ));
             }
             return Ok(warnings);
@@ -6789,7 +6895,7 @@ Expected: PASS. `data-avalanche-source-pg` unit tests: 56.
 
 Run, with `test-infra/up.sh` running: `DATA_AVALANCHE_IT=1 cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 10 tests.
+Expected: PASS, 11 tests.
 
 Run: `cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all --check`
 
@@ -6838,7 +6944,9 @@ D-M5.2, D-M5.3, D-M5.4, D-M5.6, D-M5.7. The stream turns pgoutput into `StreamIt
 
 The integration tests are the regression tests of S-PG0…S-PG6: begin/commit order, unchanged
 TOAST, replica identity FULL and key updates, truncate, a Relation change mid-stream, keep-alives
-on an idle server and acknowledgment moving `confirmed_flush_lsn`.
+on an idle server and acknowledgment moving `confirmed_flush_lsn`. Partitions are covered too
+(Q-M5-5): a write through the parent arrives under its leaf, and a row moved across partitions
+arrives as a delete in one leaf and an insert in the other.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -7588,6 +7696,87 @@ async fn s_pg6_a_table_added_to_the_publication_mid_stream() {
 
 /// Channel B: a changed column list signals before the change that carries it; an unchanged one
 /// doesn't.
+/// Q-M5-5: partitions replicate as tables. A write through the parent arrives under its leaf, a
+/// row whose partition key moves it arrives as a delete in one leaf and an insert in the other, and
+/// a TRUNCATE of the parent truncates the leaves.
+#[tokio::test(flavor = "multi_thread")]
+async fn partition_changes_arrive_under_their_leaves() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(
+        &a,
+        "stream_partitions",
+        "CREATE TABLE events (id int, at date, note text, PRIMARY KEY (id, at)) PARTITION BY RANGE (at);
+         CREATE TABLE events_2024 PARTITION OF events FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+         CREATE TABLE events_2025 PARTITION OF events FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');",
+    )
+    .await;
+    let c = connector(&pipeline(&n, &["*"], "", ""));
+    let (mut s, tables, _) = first_stream(&c).await;
+    let tracked: Vec<&TableRef> = tables.iter().map(|t| t.table()).collect();
+    assert_eq!(
+        tracked,
+        [&n.table("events_2024"), &n.table("events_2025")],
+        "the leaves, not the parent"
+    );
+    let sc = &n.schema;
+    each(
+        &a,
+        &[
+            format!("INSERT INTO {sc}.events VALUES (1, '2024-06-01', 'a')"),
+            format!("UPDATE {sc}.events SET at = '2025-06-01' WHERE id = 1"),
+            format!("TRUNCATE {sc}.events"),
+        ],
+    )
+    .await;
+    let items = collect(&mut s, 3, 20).await;
+    let id = ("id", V::Int32(1));
+    let at = |days: i32| ("at", V::Date(days));
+    let note = ("note", V::Text("a".into()));
+    let shapes: Vec<(Op, &TableRef, Option<Row>, Option<Row>)> = changes(&items)
+        .iter()
+        .map(|e| (e.op, &e.table, e.before.clone(), e.after.clone()))
+        .collect();
+    assert_eq!(
+        shapes,
+        [
+            (
+                Op::Insert,
+                &n.table("events_2024"),
+                None,
+                Some(row(&[id.clone(), at(19875), note.clone()]))
+            ),
+            (
+                Op::Delete,
+                &n.table("events_2024"),
+                Some(row(&[id.clone(), at(19875)])),
+                None
+            ),
+            (
+                Op::Insert,
+                &n.table("events_2025"),
+                None,
+                Some(row(&[id.clone(), at(20240), note.clone()]))
+            ),
+        ],
+        "the moved row leaves one leaf and enters the other"
+    );
+    let truncates: Vec<&Vec<TableRef>> = items
+        .iter()
+        .filter_map(|i| match i {
+            StreamItem::Truncate { tables, .. } => Some(tables),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        truncates,
+        [&vec![n.table("events_2024"), n.table("events_2025")]],
+        "a TRUNCATE of the parent truncates its leaves"
+    );
+    s.close().await.unwrap();
+    cleanup(&a, &n).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn relation_changes_signal_before_the_next_change() {
     require_it!();
@@ -8368,7 +8557,7 @@ Expected: PASS. `data-avalanche-source-pg` unit tests: 60.
 
 Run, with `test-infra/up.sh` running: `DATA_AVALANCHE_IT=1 cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 20 tests.
+Expected: PASS, 22 tests.
 
 Run: `cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all --check`
 
@@ -9057,7 +9246,7 @@ Expected: PASS. `data-avalanche-source-pg` unit tests: 61.
 
 Run, with `test-infra/up.sh` running: `DATA_AVALANCHE_IT=1 cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 25 tests.
+Expected: PASS, 27 tests.
 
 Run: `cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all --check`
 
@@ -9793,7 +9982,7 @@ Expected: PASS. `data-avalanche-source-pg` unit tests: 66.
 
 Run, with `test-infra/up.sh` running: `DATA_AVALANCHE_IT=1 cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 27 tests.
+Expected: PASS, 29 tests.
 
 Run: `cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all --check`
 
@@ -10352,13 +10541,13 @@ async fn every_mapped_type_round_trips_through_stream_and_snapshot() {
 
 Run: `cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 28 tests. Without `DATA_AVALANCHE_IT` every test returns at once. These tests drive the code of Tasks 2–11, so nothing fails first. A failure in Step 3 is a defect in that code: stop and report it.
+Expected: PASS, 30 tests. Without `DATA_AVALANCHE_IT` every test returns at once. These tests drive the code of Tasks 2–11, so nothing fails first. A failure in Step 3 is a defect in that code: stop and report it.
 
 - [ ] **Step 3: Run them against PostgreSQL**
 
 Run: `test-infra/up.sh`, then `DATA_AVALANCHE_IT=1 cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 28 tests.
+Expected: PASS, 30 tests.
 
 - [ ] **Step 4: Run the gates**
 
@@ -10809,13 +10998,13 @@ jobs:
 
 Run: `cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 31 tests. Without `DATA_AVALANCHE_IT` every test returns at once. These tests drive the code of Tasks 2–11, so nothing fails first. A failure in Step 3 is a defect in that code: stop and report it.
+Expected: PASS, 33 tests. Without `DATA_AVALANCHE_IT` every test returns at once. These tests drive the code of Tasks 2–11, so nothing fails first. A failure in Step 3 is a defect in that code: stop and report it.
 
 - [ ] **Step 3: Run them against PostgreSQL**
 
 Run: `test-infra/up.sh` (it now starts `postgres-tls` too), then `DATA_AVALANCHE_IT=1 cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 31 tests.
+Expected: PASS, 33 tests.
 
 Then the nightly matrix by hand, one server at a time (55414…55417):
 
@@ -10824,7 +11013,7 @@ docker compose -f test-infra/compose.yaml --profile matrix up -d --wait postgres
 DATA_AVALANCHE_IT=1 DATA_AVALANCHE_PG_PORT=55414 cargo test -p data-avalanche-source-pg --test pg -- --skip tls::
 ```
 
-Expected: PASS on each, 28 tests.
+Expected: PASS on each, 30 tests.
 
 - [ ] **Step 4: Run the gates**
 
@@ -10848,20 +11037,20 @@ git commit -m "test(source-pg): TLS end to end, and PostgreSQL 14-17 nightly"
 
 ## Verified during planning (2026-10-01)
 
-The task blocks above were replayed in order on a fresh clone of `origin/main` (`9502c8c`). The
-replay applied each task's files exactly as shown and ran each step's command. Every expected
-failure and every count above is that replay's output. The replayed tree equals the verified
-workspace. Measured along the way:
+The task blocks above were replayed in order on a fresh clone of the milestone branch
+(`origin/main` `9502c8c` plus the plan commits). The replay applied each task's files exactly as
+shown and ran each step's command. Every expected failure and every count above is that replay's
+output. Outside `doc/`, the replayed tree equals the verified workspace. Measured along the way:
 
-- **PostgreSQL 18** (`postgres-18`, `postgres-tls`): 31 integration tests pass (Task 13's run).
-- **PostgreSQL 14, 15, 16, 17** (the `matrix` profile): 28 integration tests pass on each,
+- **PostgreSQL 18** (`postgres-18`, `postgres-tls`): 33 integration tests pass (Task 13's run).
+- **PostgreSQL 14, 15, 16, 17** (the `matrix` profile): 30 integration tests pass on each,
   the TLS tests skipped (the nightly command). PostgreSQL 14 needed the empty-transaction handling
   of D-M5.7 in the tests' idle loop.
 - **TLS** (Task 13): `pg_stat_ssl` shows TLS on the catalog connections and the walsender, under
   `verify-full` with an inline CA, and with a client certificate whose key is inline. A foreign CA
   fails with `invalid peer certificate: UnknownIssuer`. `disable` is refused by `pg_hba`
   (SQLSTATE 28000). Both are `Permanent`.
-- **Workspace:** 620 tests pass with plain `cargo test --workspace`. Clippy, fmt and
+- **Workspace:** 622 tests pass with plain `cargo test --workspace`. Clippy, fmt and
   rustdoc (`-D warnings`) are clean.
 - **Not run while planning:** the CI workflows themselves. GitHub schedules and dispatches a
   workflow only from the default branch, so `nightly.yml` first runs after the merge. Until then
