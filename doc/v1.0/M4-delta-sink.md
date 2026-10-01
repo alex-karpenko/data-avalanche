@@ -241,12 +241,15 @@ the landed code differs; `git log` on `feat/claude/m4-delta-sink` is the record.
     `ConcurrentTransaction` or `ProtocolChanged`, `MaxCommitAttempts`, and `VersionAlreadyExists`.
     `Predicate` and the other conflict variants are `Permanent`. The `VersionMismatch` arm is gone:
     deltalake-core 1.0 never raises it.
-  - **D-M4.8 gains a retry (`4023bf7`).** deltalake-core 1.0's conflict checker skips actions with
-    `data_change=false` (`conflict_checker.rs`), which is what OPTIMIZE writes. A truncate's DELETE
-    built before a foreign OPTIMIZE therefore committed without a conflict, and the compacted file
-    survived with the old rows. After the DELETE, a table that still holds files is now a lost race
-    (`Step::Retry`): the retry re-reads, fences, truncates again and lands the MERGE. A truncate on an
-    empty table still adds no commit.
+  - **D-M4.8 gains a retry (`4023bf7`).** A truncate's DELETE built before a foreign OPTIMIZE
+    committed without a conflict, and the compacted file survived with the old rows. In
+    deltalake-core 1.0 (`conflict_checker.rs`, `protocol/mod.rs`), the check for files a concurrent
+    commit added runs only when the losing commit declares a read, and a DELETE without a predicate
+    declares none. The remove checks skip OPTIMIZE's `data_change=false` removes. A MERGE declares
+    its join predicate, so it does conflict (`ConcurrentAppend`). Probe P11 in
+    `prototypes/delta-capability` (PR #4) reproduces both on the bare crate. After the DELETE, a
+    table that still holds files is now a lost race (`Step::Retry`): the retry re-reads, fences,
+    truncates again and lands the MERGE. A truncate on an empty table still adds no commit.
   - **Core: a change set needs an identifier (`22a676c`).** `TableChangeSet::validate()` refuses an
     empty `identifier` (a table without a key halts first, Ghost_Row_Dedup §3), and the Delta sink
     returns `Permanent` instead of panicking.
@@ -271,6 +274,10 @@ the landed code differs; `git log` on `feat/claude/m4-delta-sink` is the record.
 
   Workspace: 519 tests pass (499 at plan time). The emulator run passes 59 unit and 18
   integration tests on local, RustFS, Azurite and DuckDB.
+- **CI: `astral-sh/setup-uv` pinned to `v10.2.0` (PR #3's first run, 2026-10-01).** Task 13's
+  `@v10` doesn't resolve: setup-uv publishes moving major tags only up to `v7`, so the integration
+  job failed at "Set up job" (`unable to find version v10`). The step now names the release
+  `v10.2.0`.
 - **Carried to M6 (final review, 2026-10-01).** These are recorded in the roadmap's M6 scope:
   - a MERGE over `merge_memory_limit` is `Transient` but fails the same way every time (D-M4.14);
   - `table_state`'s `marker: None` doesn't mean "no own commit" (a truncate's DELETE carries none);

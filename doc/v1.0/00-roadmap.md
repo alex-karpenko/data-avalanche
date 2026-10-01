@@ -534,7 +534,8 @@ pub const DELTA_MIN_DATE, DELTA_MAX_DATE: i32; pub const DELTA_MIN_MICROS, DELTA
    1000 commits, or at a cleaned-up file. If the position covers the set, the result is
    `SkippedCovered`.
 3. **Truncate**, when the set has one: a DELETE commit with the `txn` but no position. It is
-   retried when files remain, because delta-rs ignores OPTIMIZE's `data_change=false` actions.
+   retried when files remain: delta-rs 1.0 doesn't refuse a predicate-less DELETE that a
+   concurrent OPTIMIZE outran (it declares no read; probe P11a).
 4. **Write.** One MERGE on the identifier with unchanged masks, carrying the `txn` and the
    position. A set that changes no row gets a marker-only commit instead.
 
