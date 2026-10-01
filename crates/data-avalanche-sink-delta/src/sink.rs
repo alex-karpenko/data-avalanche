@@ -340,6 +340,19 @@ impl Sink for DeltaSink {
                 marker.pipeline_id, self.config.pipeline_id
             )));
         }
+        self.attempts(&cs, &marker, true).await
+    }
+}
+
+impl DeltaSink {
+    /// Up to [`COMMIT_ATTEMPTS`] tries at a checked commit. `refresh` as in [`Self::attempt`]:
+    /// only a test leaves the table stale, to lose every race.
+    async fn attempts(
+        &self,
+        cs: &TableChangeSet,
+        marker: &CommitMarker,
+        refresh: bool,
+    ) -> Result<CommitOutcome, SinkError> {
         let mut guard = self.lock(&cs.table).await?;
         let h = guard.as_mut().expect("opened by lock");
         let mut lost = String::new();
@@ -347,7 +360,7 @@ impl Sink for DeltaSink {
             if attempt > 0 {
                 self.count(|s| s.retries += 1);
             }
-            match self.attempt(h, &cs, &marker, true).await? {
+            match self.attempt(h, cs, marker, refresh).await? {
                 Step::Done(outcome) => {
                     self.count(|s| match outcome {
                         CommitOutcome::Committed { .. } => s.commits += 1,
@@ -494,6 +507,110 @@ mod tests {
         assert!(matches!(err, SinkError::Permanent { .. }), "{err}");
         let state = s.table_state(&cs.table).await.unwrap();
         assert_eq!(state.marker, None, "nothing committed");
+    }
+
+    /// Seeds rows 1 and 2, then compacts the table behind the sink's back: a commit on the sink's
+    /// stale handle loses the race.
+    async fn seeded_then_optimized(dir: &tempfile::TempDir) -> DeltaSink {
+        let s = sink(dir);
+        s.ensure_table(&spec(&orders())).await.unwrap();
+        for (end, id) in [(10, 1), (20, 2)] {
+            let cs = rows(end, &[id]);
+            s.commit(cs.clone(), marker(1, &cs)).await.unwrap();
+        }
+        let url = local(dir).table_url(orders().table()).unwrap();
+        let t = deltalake::open_table(url).await.unwrap();
+        t.optimize().await.unwrap();
+        s
+    }
+
+    async fn ids(s: &DeltaSink) -> Vec<i64> {
+        use arrow_array::cast::AsArray;
+        let c = s.content(orders().table()).await.unwrap().unwrap();
+        c.column(0)
+            .as_primitive::<arrow_array::types::Int64Type>()
+            .values()
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn three_lost_races_in_a_row_are_transient() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = seeded_then_optimized(&dir).await;
+        let update = rows(30, &[1, 3]);
+        let err = s
+            .attempts(&update, &marker(1, &update), false)
+            .await
+            .unwrap_err();
+        assert!(err.is_transient(), "{err}");
+        assert!(err.to_string().contains("lost 3 races"), "{err}");
+        assert_eq!(s.stats().retries, 2, "two retries after the first try");
+        assert_eq!(ids(&s).await, [1, 2], "nothing landed");
+    }
+
+    /// A truncate set loses a race to another writer of the pipeline (same epoch: its `txn`
+    /// conflicts with the DELETE), retries on the re-read table and ends with only its rows.
+    #[tokio::test]
+    async fn a_truncate_that_loses_a_race_is_retried_and_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        let (s, other) = (sink(&dir), sink(&dir));
+        s.ensure_table(&spec(&orders())).await.unwrap();
+        let seed = rows(10, &[1, 2]);
+        s.commit(seed.clone(), marker(1, &seed)).await.unwrap();
+        let theirs = rows(20, &[5]);
+        other
+            .commit(theirs.clone(), marker(1, &theirs))
+            .await
+            .unwrap();
+        let mut t = rows(30, &[3]);
+        t.truncate = true;
+        match stale_attempt(&s, &t, 1).await {
+            Step::Retry(reason) => assert!(reason.contains("Concurrent transaction"), "{reason}"),
+            Step::Done(o) => panic!("{o:?}"),
+        }
+        assert_eq!(ids(&s).await, [1, 2, 5], "the lost DELETE didn't land");
+        let out = s.commit(t.clone(), marker(1, &t)).await.unwrap();
+        assert!(matches!(out, CommitOutcome::Committed { .. }), "{out:?}");
+        assert_eq!(ids(&s).await, [3]);
+        let state = s.table_state(&t.table).await.unwrap();
+        assert_eq!(
+            state.marker.unwrap().committed_position,
+            SourcePosition::Pg(Lsn(30))
+        );
+        assert_eq!(
+            s.commit(t.clone(), marker(1, &t)).await.unwrap(),
+            CommitOutcome::SkippedCovered
+        );
+    }
+
+    /// D-M4.8: the truncate's DELETE carries the fence but no position, so a crash before its
+    /// MERGE replays both (the scenario `a_crash_after_the_truncate_delete_replays_both`).
+    #[tokio::test]
+    async fn the_truncate_delete_is_fenced_but_not_positioned() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = sink(&dir);
+        s.ensure_table(&spec(&orders())).await.unwrap();
+        let seed = rows(10, &[1]);
+        s.commit(seed.clone(), marker(1, &seed)).await.unwrap();
+        let mut t = rows(20, &[2]);
+        t.truncate = true;
+        let CommitOutcome::Committed { version } =
+            s.commit(t.clone(), marker(1, &t)).await.unwrap()
+        else {
+            panic!("committed")
+        };
+        let url = local(&dir).table_url(orders().table()).unwrap();
+        let table = deltalake::open_table(url).await.unwrap();
+        let delete = table
+            .log_store()
+            .read_commit_entry(version - 1)
+            .await
+            .unwrap()
+            .unwrap();
+        let text = String::from_utf8(delete.to_vec()).unwrap();
+        assert!(text.contains(r#""operation":"DELETE""#), "{text}");
+        assert!(text.contains(&app_id("p")), "fenced: {text}");
+        assert_eq!(crate::marker::own_position(&delete, "p").unwrap(), None);
     }
 
     #[tokio::test]

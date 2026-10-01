@@ -6,8 +6,9 @@ use std::time::Duration;
 use data_avalanche_core::{
     ColumnSchema, ColumnValueType, CommitOutcome, SchemaChange, SchemaDelta, Sink,
 };
-use data_avalanche_sink_delta::{DeltaLocation, TableDefaults};
-use deltalake::kernel::{DataType, StructField};
+use data_avalanche_sink_delta::{DeltaLocation, EPOCH_KEY, PIPELINE_KEY, TableDefaults, app_id};
+use deltalake::kernel::transaction::CommitProperties;
+use deltalake::kernel::{DataType, StructField, Transaction};
 use deltalake::{DeltaTable, TableProperty};
 
 use crate::common::{commit, cs, items, lsn, owned, rows, sink, spec, upserts};
@@ -235,4 +236,52 @@ async fn a_live_handle_recovers_from_a_table_recreated_behind_it() {
     .await;
     assert!(matches!(out, CommitOutcome::Committed { .. }), "{out:?}");
     assert_eq!(rows(&s).await, owned(&[(9, Some("re"))]));
+}
+
+/// D-M4.8: a crash between a truncate's DELETE and its MERGE. The DELETE carries the fence but no
+/// position, so the table is empty while its marker still says the pre-truncate position; the
+/// replay applies both, and a second replay is skipped. (Were the DELETE positioned, the guard
+/// would skip the replay and the rows would be lost.)
+#[tokio::test]
+async fn a_crash_after_the_truncate_delete_replays_both() {
+    let (_dir, location) = local();
+    let s = sink(location.clone(), TableDefaults::default());
+    s.ensure_table(&spec()).await.unwrap();
+    commit(
+        &s,
+        cs(
+            10,
+            vec![upserts(&[(1, Some("a")), (2, Some("b"))], None)],
+            vec![],
+        ),
+        3,
+    )
+    .await;
+    // The DELETE lands as the sink writes it, then the process dies.
+    let props = CommitProperties::default()
+        .with_application_transaction(Transaction::new(app_id("p"), 3))
+        .with_metadata([
+            (PIPELINE_KEY.to_string(), serde_json::Value::from("p")),
+            (EPOCH_KEY.to_string(), serde_json::Value::from(3)),
+        ]);
+    let table = deltalake::open_table(location.table_url(&items()).unwrap())
+        .await
+        .unwrap();
+    table.delete().with_commit_properties(props).await.unwrap();
+    let fresh = sink(location, TableDefaults::default());
+    assert_eq!(rows(&fresh).await, vec![]);
+    let marker = fresh.table_state(&items()).await.unwrap().marker.unwrap();
+    assert_eq!(
+        (marker.owner_epoch, marker.committed_position),
+        (3, lsn(10))
+    );
+    let mut replay = cs(20, vec![upserts(&[(3, Some("c"))], None)], vec![]);
+    replay.truncate = true;
+    let out = commit(&fresh, replay.clone(), 3).await;
+    assert!(matches!(out, CommitOutcome::Committed { .. }), "{out:?}");
+    assert_eq!(rows(&fresh).await, owned(&[(3, Some("c"))]));
+    assert_eq!(
+        commit(&fresh, replay, 3).await,
+        CommitOutcome::SkippedCovered
+    );
 }
