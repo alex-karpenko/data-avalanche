@@ -154,6 +154,7 @@ the arrow.
 | Q-M5-10 | libpq treats `sslmode=require` with a root CA file as `verify-ca`. Should `require` with `ssl_ca` set check the chain? | **No: `require` encrypts without checking the chain**, on both connections, whether or not `ssl_ca` is set (D-M5.16). Only `verify-ca` and `verify-full` check it |
 | Q-M5-12 (2026-10-01, during execution) | An override other than `string` or a decimal on a numeric column had to equal the mapped type: `int → int64` halted, and `timestamp_ntz_as: timestamp` had no per-column form | **Lossless conversions at Hop 1** (Task 5b): integer widening, an integer to a decimal with room, `float32 → float64`, `timestamp_ntz ↔ timestamp_tz`, `date → timestamp_*`, lists element by element, through one table in core for every source; anything else halts (`SCHEMA_MISMATCH`). Config §9.3 lists them |
 | Q-M5-13 (2026-10-01, during execution) | PostgreSQL doesn't publish `UNLOGGED` tables, but channel A selected them: a managed publication refused the pipeline, and under `FOR ALL TABLES` the table was snapshotted once and then never changed | **Like a table without an identifier**: a glob-matched unlogged table is skipped with a warning, a named one halts (`TABLE_NOT_REPLICABLE`, new in core). Config §11.2 lists the precondition |
+| Q-M5-14 (2026-10-01, during execution) | Task 8's review: pgoutput reads the publication as of each change's WAL position, so repairing it at start doesn't cover the WAL a `Resume` replays; a mixed-case publication name streamed nothing; `retained_bytes` measured from `confirmed_flush`; two pipelines on one managed publication drop each other's tables; Phase 5 acknowledged before persisting | **A repair that rewrites the publication re-snapshots (slot recreated); added tables are reported (`Prepared::added`) for M6 to snapshot; the publication name is quoted for pgoutput; `retained_bytes` from `restart_lsn`; V-059 is an error when a sharing pipeline is `managed`; Data-Flow Phase 5 persists before acknowledging** |
 
 **Rulings where the specs are silent** (each is pinned by a test). **Plan approved 2026-10-01**, with these rulings (roadmap D-IMPL-12):
 
@@ -172,8 +173,8 @@ the arrow.
 | D-M5.11 | Selection. System schemas (`pg_*`, `information_schema`) are never matched. A glob `*` stays inside one name segment and is case-sensitive. An explicit name that matches nothing warns. Generated columns (`attgenerated <> ''`) are left out | Config §9.3; pgoutput doesn't send generated columns | Task 6 (`globs_stay_inside_a_name`, `selection`) |
 | D-M5.12 | Identifier. The override, else the primary key. It must lie within the replica identity (an index, FULL, or the default primary key), else the table halts (`IDENTIFIER_NOT_IN_REPLICA_IDENTITY`). No identifier: a glob-matched table is skipped with a warning, a named one halts. An unlogged table the same way, halting `TABLE_NOT_REPLICABLE` (Q-M5-13) | Ghost_Row_Dedup §PK policy; a delete must carry the identifier | Task 6 (`identifiers_and_replica_identity`), Task 7 (`channel_a_resolves_checks_and_skips`) |
 | D-M5.13 | The slot state table (`decide`). Checkpoint and slot → `Resume`, except: another plugin or database → `Refuse`; invalidated, or `confirmed_flush` past the checkpoint → `Recreate(PositionLost)` under `managed`, `Refuse` under `require_existing`. A checkpoint and no slot → `Create(PositionLost)` under `managed`, else `Refuse`. A slot and no checkpoint (an orphan) → `Refuse` under `on_orphan: halt`; `Adopt` (advance to the current WAL, then snapshot) under `adopt_resnapshot`, `require_existing` included; an invalidated orphan → `Recreate(AdoptedOrphan)` under `managed`, else `Refuse`. Neither → `Create(FirstStart)` under `managed`, else `Refuse` | Postgres_Slot… §1–§3. A slot past the checkpoint has released WAL the pipeline still needs | Task 8 (the seven `decide` tests, the integration cells) |
-| D-M5.14 | Publication. Under `managed`: create it when absent, `ADD`/`DROP TABLE` to match the tracked set, and set `publish = 'insert, update, delete, truncate'` and `publish_via_partition_root = false`. Under `require_existing`, or for a `FOR ALL TABLES` publication: never change it, warn on each difference, except one. With `publish_via_partition_root = true` and a tracked table that is a partition, `prepare` is refused (`Permanent`), naming the partitions and the `ALTER PUBLICATION` that fixes it | D-15.4. A partition's changes would arrive under its untracked parent's name and be dropped: silent loss, so a refusal, not a warning (Q-M5-5) | Task 8 (`the_publication_follows_the_table_set`, `require_existing_never_creates`, `a_root_publication_of_tracked_partitions_is_refused`) |
-| D-M5.15 | `prepare` reconciles the publication, then the slot. Creating a slot (it waits for running transactions) is bounded by `timeouts.snapshot`; every other catalog call by `timeouts.command`. `reset_position` drops and recreates the slot (refused under `require_existing`). `teardown` drops the slot and the publication only under `managed` with `auto_cleanup`. `retained_bytes` is `pg_current_wal_lsn() - confirmed_flush_lsn` | The `max_wal_lag_bytes` guard (V-104) compares against it in M6 | Task 8 (`reset_teardown_and_retained_wal`) |
+| D-M5.14 | Publication. Under `managed`: create it when absent, `ADD`/`DROP TABLE` to match the tracked set, and set `publish = 'insert, update, delete, truncate'` and `publish_via_partition_root = false`. Under `require_existing`, or for a `FOR ALL TABLES` publication: never change it, warn on each difference, except one. With `publish_via_partition_root = true` and a tracked table that is a partition, `prepare` is refused (`Permanent`), naming the partitions and the `ALTER PUBLICATION` that fixes it. A `managed` repair that changes what is published for every table (created, operations, `publish_via_partition_root`) turns a `Resume` into `Recreate(PositionLost)`; tables it adds come back in `Prepared::added` (Q-M5-14) | D-15.4. A partition's changes would arrive under its untracked parent's name and be dropped: silent loss, so a refusal, not a warning (Q-M5-5) | Task 8 (`the_publication_follows_the_table_set`, `require_existing_never_creates`, `a_root_publication_of_tracked_partitions_is_refused`) |
+| D-M5.15 | `prepare` reconciles the publication, then the slot. Creating a slot (it waits for running transactions) is bounded by `timeouts.snapshot`; every other catalog call by `timeouts.command`. `reset_position` drops and recreates the slot (refused under `require_existing`). `teardown` drops the slot and the publication only under `managed` with `auto_cleanup`. `retained_bytes` is `pg_current_wal_lsn() - restart_lsn`, the WAL the slot keeps on disk (Task 8 fix). Advancing an orphan (`Adopt`) is bounded by `timeouts.snapshot` too | The `max_wal_lag_bytes` guard (V-104) compares against it in M6 | Task 8 (`reset_teardown_and_retained_wal`) |
 | D-M5.16 | TLS. `allow` connects as `prefer` (the replication crate has no `allow`; both accept either kind). `require` and `prefer` encrypt but don't verify the chain (signatures are still checked), even with `ssl_ca` set (Q-M5-10). `verify-ca` checks the chain and ignores the name. `verify-full` checks both. The trust roots are `ssl_ca`, else the webpki roots. `ssl_cert` and `ssl_key` go together | Config §9.1; one meaning of each mode on both connections | Task 2 (`modes_map_to_both_clients`, `bad_material_is_refused_by_name`), Task 13 |
 | D-M5.17 | Snapshot reads. They use the simple-query protocol, so values are the output-function text pgoutput sends (`true::text` is `true`, pgoutput sends `t`). Columns are qualified by the alias `src`, so an output name can't shadow a key. Collatable keys compare under `COLLATE "C"`. Key values are quoted literals cast to the column's `format_type` text; a `"char"` key goes through a signed byte. A column changed under the snapshot (gone, or a different type) → `Transient`: read again once the stream's signal caught up. `fetch_rows` sends `FETCH_BATCH` = 1000 keys per statement | Snapshot_Resumability §2; a snapshot row must equal the streamed row of the same data | Task 10 |
 | D-M5.18 | Channel C (`augment`). It takes the hint's columns (names and types, from the stream) and finds each in the catalog by name, else by the `attnum` it had in the cached schema; that `attnum` and the nullability come from the catalog. A column found neither way halts the table. `diff` matches by `attnum`, so a new name on the same `attnum` is a proven rename. A type change carries `narrowed` (a shorter length or lower precision of the same logical type). A table gone from the catalog → `[TableDropped]` and no schema | §0 (scope a change to its signal) and §6 (rename proof) | Task 11 |
@@ -7520,7 +7521,8 @@ git commit -m "feat(source-pg): the slot state machine and publication reconcili
   - `common` adds `first_stream(&PgConnector)`, `collect(&mut PgStream, commits, secs)` and
     `each(&Client, &[String])`.
 
-D-M5.2, D-M5.3, D-M5.4, D-M5.6, D-M5.7. The stream turns pgoutput into `StreamItem`s:
+D-M5.2, D-M5.3, D-M5.4, D-M5.6, D-M5.7. `a_mixed_case_publication_streams` pins the quoted
+publication name (Task 8's fix, C2). The stream turns pgoutput into `StreamItem`s:
 
 - Every change carries the commit LSN as its position and its own `wal_start` as its sequence.
 - `Commit` carries `end_lsn`, the position to acknowledge.
@@ -8573,6 +8575,31 @@ async fn untracked_tables_busy_slots_and_keepalives() {
     s.close().await.unwrap();
     cleanup(&a, &n).await;
 }
+
+/// A publication named with capitals is created quoted (`"It_Mixed_Pub"`), so the stream asks
+/// for it quoted: pgoutput would fold `It_Mixed_Pub` to `it_mixed_pub` and stream nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mixed_case_publication_streams() {
+    require_it!();
+    let a = admin().await;
+    let mut n = fresh(&a, "mixed_pub", "CREATE TABLE t (id int PRIMARY KEY);").await;
+    n.publication = "It_Mixed_Pub".into();
+    a.batch_execute("DROP PUBLICATION IF EXISTS \"It_Mixed_Pub\"")
+        .await
+        .unwrap();
+    let c = connector(&pipeline(&n, &["*"], "", ""));
+    let (mut s, _, _) = first_stream(&c).await;
+    a.execute(&format!("INSERT INTO {}.t VALUES (1)", n.schema), &[])
+        .await
+        .unwrap();
+    let items = collect(&mut s, 1, 20).await;
+    assert_eq!(changes(&items).len(), 1, "{items:?}");
+    s.close().await.unwrap();
+    a.batch_execute("DROP PUBLICATION \"It_Mixed_Pub\"")
+        .await
+        .unwrap();
+    cleanup(&a, &n).await;
+}
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -9145,7 +9172,7 @@ Expected: PASS. `data-avalanche-source-pg` unit tests: 60.
 
 Run, with `test-infra/up.sh` running: `DATA_AVALANCHE_IT=1 cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 22 tests.
+Expected: PASS, 25 tests.
 
 Run: `cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all --check`
 
@@ -9834,7 +9861,7 @@ Expected: PASS. `data-avalanche-source-pg` unit tests: 61.
 
 Run, with `test-infra/up.sh` running: `DATA_AVALANCHE_IT=1 cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 27 tests.
+Expected: PASS, 30 tests.
 
 Run: `cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all --check`
 
@@ -10570,7 +10597,7 @@ Expected: PASS. `data-avalanche-source-pg` unit tests: 66.
 
 Run, with `test-infra/up.sh` running: `DATA_AVALANCHE_IT=1 cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 29 tests.
+Expected: PASS, 32 tests.
 
 Run: `cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all --check`
 
@@ -11268,13 +11295,13 @@ async fn overrides_convert_through_stream_and_snapshot() {
 
 Run: `cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 31 tests. Without `DATA_AVALANCHE_IT` every test returns at once. These tests drive the code of Tasks 2–11, so nothing fails first. A failure in Step 3 is a defect in that code: stop and report it.
+Expected: PASS, 34 tests. Without `DATA_AVALANCHE_IT` every test returns at once. These tests drive the code of Tasks 2–11, so nothing fails first. A failure in Step 3 is a defect in that code: stop and report it.
 
 - [ ] **Step 3: Run them against PostgreSQL**
 
 Run: `test-infra/up.sh`, then `DATA_AVALANCHE_IT=1 cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 31 tests.
+Expected: PASS, 34 tests.
 
 - [ ] **Step 4: Run the gates**
 
@@ -11697,7 +11724,7 @@ diff --git a/test-infra/README.md b/test-infra/README.md
 +
 +```sh
 +docker compose -f test-infra/compose.yaml --profile matrix up -d --wait postgres-14
-+DATA_AVALANCHE_IT=1 DATA_AVALANCHE_PG_PORT=55414 cargo test -p data-avalanche-source-pg --test pg -- --skip tls::
++DATA_AVALANCHE_IT=1 DATA_AVALANCHE_PG_PORT=55414 cargo test -p data-avalanche-source-pg --test pg --test slot_invalidation -- --skip tls::
 +```
 +
 +`postgres-tls` refuses every TCP connection without TLS. At each start it makes a throwaway CA, a
@@ -11749,7 +11776,7 @@ jobs:
       - name: Start PostgreSQL ${{ matrix.version }}
         run: docker compose -f test-infra/compose.yaml --profile matrix up -d --wait "postgres-${{ matrix.version }}"
       - name: PostgreSQL source tests
-        run: cargo test --locked -p data-avalanche-source-pg --test pg -- --test-threads=1 --skip tls::
+        run: cargo test --locked -p data-avalanche-source-pg --test pg --test slot_invalidation -- --test-threads=1 --skip tls::
       - name: Container logs on failure
         if: failure()
         run: docker compose -f test-infra/compose.yaml --profile matrix logs --no-color "postgres-${{ matrix.version }}"
@@ -11762,22 +11789,22 @@ jobs:
 
 Run: `cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 35 tests. Without `DATA_AVALANCHE_IT` every test returns at once. These tests drive the code of Tasks 2–11, so nothing fails first. A failure in Step 3 is a defect in that code: stop and report it.
+Expected: PASS, 38 tests. Without `DATA_AVALANCHE_IT` every test returns at once. These tests drive the code of Tasks 2–11, so nothing fails first. A failure in Step 3 is a defect in that code: stop and report it.
 
 - [ ] **Step 3: Run them against PostgreSQL**
 
 Run: `test-infra/up.sh` (it now starts `postgres-tls` too), then `DATA_AVALANCHE_IT=1 cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 35 tests.
+Expected: PASS, 38 tests.
 
 Then the nightly matrix by hand, one server at a time (55414…55417):
 
 ```bash
 docker compose -f test-infra/compose.yaml --profile matrix up -d --wait postgres-14
-DATA_AVALANCHE_IT=1 DATA_AVALANCHE_PG_PORT=55414 cargo test -p data-avalanche-source-pg --test pg -- --skip tls::
+DATA_AVALANCHE_IT=1 DATA_AVALANCHE_PG_PORT=55414 cargo test -p data-avalanche-source-pg --test pg --test slot_invalidation -- --skip tls::
 ```
 
-Expected: PASS on each, 31 tests.
+Expected: PASS on each, 34 tests, and the `slot_invalidation` test.
 
 - [ ] **Step 4: Run the gates**
 
@@ -11952,3 +11979,32 @@ Tests: `unlogged_tables_are_skipped_or_halted` (unit); `channel_a_resolves_check
 31 integration tests each without TLS; the workspace passes 633. Task 11's `connector.rs` diff is
 regenerated against the fixed file (it applied at an offset of 7 lines). Counts: each later task's
 `data-avalanche-source-pg` unit-test count is four higher than its block shows.
+
+**Task 8: the publication repair, the publication's name, the WAL measure** (`83187ec`; found by the
+task review, owner decision Q-M5-14, 2026-10-01). Measured on PostgreSQL 18 and 14 before the fix:
+- **A repaired publication doesn't cover the WAL a resume replays.** pgoutput reads the publication
+  as of each change's position. A change made before the publication existed: PostgreSQL 18 skips
+  it with `WARNING: skipped loading publication`; 14 fails with `publication … does not exist`. So
+  a `managed` repair that rewrites the publication (created; operations restored;
+  `publish_via_partition_root` cleared) turns `Resume` into `Recreate(PositionLost)`, with a
+  warning. Tables the repair adds return in the new `Prepared::added` (core), for M6 to snapshot.
+  `reconcile_publication` returns `Reconciled { rewritten, added, warnings }`.
+- **A mixed-case publication name streamed nothing.** `"MyPub"` was created quoted, but pgoutput got
+  `publication_names 'MyPub'`, folded it to `mypub`, and streamed nothing on 18 (an error on 14).
+  `Connector::replication` (Task 2's file) now passes the quoted name; its unit test checks
+  `"\"MyPub\""`, and Task 9's `a_mixed_case_publication_streams` checks the stream.
+- `retained_bytes` measures from `restart_lsn`, the WAL the slot keeps on disk, which trails
+  `confirmed_flush_lsn` while an older transaction is open.
+- Advancing an adopted orphan is bounded by `timeouts.snapshot`: it decodes the orphan's backlog.
+- V-059 (config crate): a publication shared within one source database is an error when a sharing
+  pipeline is `managed` (`ErrorAndWarning`); config §13 and Data-Flow Phase 5 were changed with
+  the owner's approval.
+
+Tests: `a_repaired_publication_re_snapshots` and `a_slot_of_another_plugin_is_refused` (the
+plan's prose promised the plugin cell); `the_publication_follows_the_table_set` checks
+`Prepared::added`; the new test binary `slot_invalidation` invalidates a slot through
+`max_slot_wal_keep_size` and checks the recreate. It is its own binary because the setting is
+server-wide: cargo never runs it beside the `pg` tests, and the nightly runs it too. Measured on
+the verified workspace: PostgreSQL 14–18 pass 34 integration tests each without TLS, and
+`slot_invalidation` on each; the workspace passes 637. Counts: Task 8's integration tests are 13;
+each later integration count is three higher than before (two slot tests, one stream test).
