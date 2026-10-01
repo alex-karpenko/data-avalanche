@@ -38,9 +38,21 @@ fn mask_name(column: &str) -> String {
 }
 
 /// Checks the change set against the table: every column of the set is a column of the table
-/// holding the same Hop 2 type (the set may lack columns: soft-dropped, or added after it). Returns
-/// each set column's Delta type.
+/// holding the same Hop 2 type (the set may lack columns: soft-dropped, or added after it), and
+/// every NOT NULL column of the table (the identifier, the lineage) is in the set: the MERGE writes
+/// a lacking column NULL, which delta-rs would refuse the same way on every replay. Returns each
+/// set column's Delta type.
 pub fn check_columns(cs: &TableChangeSet, table: &StructType) -> Result<Vec<DeltaType>, SinkError> {
+    if let Some(missing) = table
+        .fields()
+        .find(|c| !c.is_nullable() && cs.schema.field_with_name(c.name()).is_err())
+    {
+        return Err(permanent(format!(
+            "the change set lacks column {:?} of {}, which is NOT NULL",
+            missing.name(),
+            cs.table
+        )));
+    }
     cs.schema
         .fields()
         .iter()
@@ -567,6 +579,68 @@ mod tests {
         merge(h.table().clone(), &cs, &types, props(1, 20), Some(1 << 30))
             .await
             .unwrap();
+    }
+
+    /// `orders`' upsert schema without the lineage columns (`_op`, `_ts`, …), which the table
+    /// holds NOT NULL.
+    fn without_lineage() -> TableChangeSet {
+        let fields: Vec<_> = full()
+            .fields()
+            .iter()
+            .filter(|f| !f.name().starts_with('_'))
+            .cloned()
+            .collect();
+        let narrow = Arc::new(Schema::new(fields));
+        let mut cs = change_set(10, vec![upserts(&narrow, &[(1, Some("a"))], None)], vec![]);
+        cs.schema = narrow;
+        cs
+    }
+
+    #[tokio::test]
+    async fn a_set_without_a_not_null_table_column_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = created(&dir).await;
+        let snapshot = h.table().snapshot().unwrap();
+        let err = check_columns(&without_lineage(), snapshot.schema().as_ref()).unwrap_err();
+        assert!(matches!(err, SinkError::Permanent { .. }), "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("\"_op\"") && text.contains("NOT NULL"),
+            "{text}"
+        );
+    }
+
+    /// delta-rs's own invariant check (here: NULL into a NOT NULL column, reached by skipping
+    /// `check_columns`) fails inside DataFusion and comes back as a `Generic` text. It must class
+    /// `Permanent`; a delta-rs that rewords it fails this test.
+    #[tokio::test]
+    async fn a_merge_that_breaks_a_table_invariant_is_permanent() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = created(&dir).await;
+        let cs = without_lineage();
+        let snapshot = h.table().snapshot().unwrap();
+        let types: Vec<DeltaType> = cs
+            .schema
+            .fields()
+            .iter()
+            .map(|f| {
+                snapshot
+                    .schema()
+                    .field(f.name())
+                    .unwrap()
+                    .data_type()
+                    .clone()
+            })
+            .collect();
+        let err = merge(h.table().clone(), &cs, &types, props(1, 10), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, deltalake::DeltaTableError::Generic(_)),
+            "{err:?}"
+        );
+        let err = crate::error::sink_error(err);
+        assert!(matches!(err, SinkError::Permanent { .. }), "{err}");
     }
 
     #[tokio::test]

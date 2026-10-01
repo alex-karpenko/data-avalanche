@@ -12,7 +12,7 @@ use data_avalanche_core::{
 };
 use deltalake::DeltaTableError;
 use deltalake::kernel::Transaction;
-use deltalake::kernel::transaction::{CommitProperties, TransactionError};
+use deltalake::kernel::transaction::{CommitConflictError, CommitProperties, TransactionError};
 use deltalake::operations::merge::MergeMetrics;
 use tokio::sync::OwnedMutexGuard;
 
@@ -75,15 +75,29 @@ enum Step {
     Retry(String),
 }
 
-/// A lost race is retried; any other failure is the call's result.
+/// A lost race is retried; any other failure is the call's result. The races are the conflicts
+/// another commit landing first causes (deltalake-core 1.0 `conflict_checker.rs`; a
+/// `ProtocolChanged` re-reads, and an unsupported new protocol then fails as
+/// `UnsupportedTableFeatures`) and a version taken first. A `Predicate` conflict or a corrupt
+/// snapshot fails the same way again, so `sink_error` classes it.
 fn race_or_fail(e: DeltaTableError) -> Result<Step, SinkError> {
+    use CommitConflictError as C;
     use TransactionError as T;
     match &e {
         DeltaTableError::Transaction {
-            source: T::CommitConflict(_) | T::MaxCommitAttempts(_) | T::VersionAlreadyExists(_),
+            source:
+                T::CommitConflict(
+                    C::ConcurrentAppend
+                    | C::ConcurrentDeleteRead
+                    | C::ConcurrentDeleteDelete
+                    | C::MetadataChanged
+                    | C::ConcurrentTransaction
+                    | C::ProtocolChanged(_),
+                )
+                | T::MaxCommitAttempts(_)
+                | T::VersionAlreadyExists(_),
         }
-        | DeltaTableError::VersionAlreadyExists(_)
-        | DeltaTableError::VersionMismatch(..) => Ok(Step::Retry(e.to_string())),
+        | DeltaTableError::VersionAlreadyExists(_) => Ok(Step::Retry(e.to_string())),
         _ => Err(sink_error(e)),
     }
 }
@@ -432,6 +446,51 @@ mod tests {
             state.marker.unwrap().committed_position,
             SourcePosition::Pg(Lsn(30))
         );
+    }
+
+    #[test]
+    fn only_lost_races_are_retried() {
+        use CommitConflictError as C;
+        let conflict = |c| DeltaTableError::Transaction {
+            source: TransactionError::CommitConflict(c),
+        };
+        assert!(matches!(
+            race_or_fail(conflict(C::ConcurrentTransaction)),
+            Ok(Step::Retry(_))
+        ));
+        assert!(matches!(
+            race_or_fail(DeltaTableError::VersionAlreadyExists(3)),
+            Ok(Step::Retry(_))
+        ));
+        let predicate = conflict(C::Predicate {
+            source: "a bad predicate".into(),
+        });
+        assert!(matches!(
+            race_or_fail(predicate),
+            Err(SinkError::Permanent { .. })
+        ));
+    }
+
+    /// A set without the lineage columns fails the same way on every replay: `Permanent`, and no
+    /// version is written.
+    #[tokio::test]
+    async fn a_set_without_the_lineage_columns_is_permanent() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = sink(&dir);
+        s.ensure_table(&spec(&orders())).await.unwrap();
+        let fields: Vec<_> = data_avalanche_core::upsert_schema(&orders())
+            .fields()
+            .iter()
+            .filter(|f| !f.name().starts_with('_'))
+            .cloned()
+            .collect();
+        let narrow = Arc::new(arrow_schema::Schema::new(fields));
+        let mut cs = change_set(10, vec![upserts(&narrow, &[(1, Some("a"))], None)], vec![]);
+        cs.schema = narrow;
+        let err = s.commit(cs.clone(), marker(1, &cs)).await.unwrap_err();
+        assert!(matches!(err, SinkError::Permanent { .. }), "{err}");
+        let state = s.table_state(&cs.table).await.unwrap();
+        assert_eq!(state.marker, None, "nothing committed");
     }
 
     #[tokio::test]
