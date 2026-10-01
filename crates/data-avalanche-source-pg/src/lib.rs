@@ -7,6 +7,7 @@
 mod connect;
 #[allow(dead_code)] // the stream (Task 9) is the caller
 mod error;
+pub mod pgoutput;
 #[cfg(test)]
 mod test_support;
 #[allow(dead_code)] // `PgConnector` (Task 7) is the caller
