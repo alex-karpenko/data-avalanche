@@ -28,9 +28,20 @@ pub const IDENTIFIER_KEY: &str = "data-avalanche.identifier";
 
 pub(crate) struct TableHandle {
     table: DeltaTable,
-    /// The newest commit of this pipeline the handle knows: version and position. The walk-back
-    /// stops there, so a steady stream of own commits costs no reads.
-    known: Option<(u64, SourcePosition)>,
+    /// The storage options the table was opened with, to re-open it from scratch.
+    options: HashMap<String, String>,
+    /// The newest commit of this pipeline the handle knows. The walk-back stops there, so a
+    /// steady stream of own commits costs no reads.
+    known: Option<Known>,
+}
+
+/// An own commit the handle knows: the table it went to (`metaData.id`, new for a table dropped
+/// and re-created under the same root), its version and its position.
+#[derive(Debug, Clone)]
+struct Known {
+    table_id: String,
+    version: u64,
+    position: SourcePosition,
 }
 
 impl std::fmt::Debug for TableHandle {
@@ -51,10 +62,14 @@ impl TableHandle {
             std::fs::create_dir_all(&path)
                 .map_err(|e| permanent(format!("{}: {e}", path.display())))?;
         }
-        let table = DeltaTable::try_from_url_with_storage_options(url, options)
+        let table = DeltaTable::try_from_url_with_storage_options(url, options.clone())
             .await
             .map_err(sink_error)?;
-        Ok(Self { table, known: None })
+        Ok(Self {
+            table,
+            options,
+            known: None,
+        })
     }
 
     pub fn table(&self) -> &DeltaTable {
@@ -67,16 +82,34 @@ impl TableHandle {
     }
 
     /// Loads the newest version; `false` when the location holds no Delta table.
+    ///
+    /// A table dropped (and maybe re-created) behind the handle is another table: what the handle
+    /// knew of the old one is forgotten. When the loaded snapshot can't be brought forward (its
+    /// log is gone), the table is re-opened from scratch once.
     pub async fn refresh(&mut self) -> Result<bool, SinkError> {
         let log = self.table.log_store();
         if !log.is_delta_table_location().await.map_err(sink_error)? {
+            self.known = None;
             return Ok(false);
         }
-        self.table
-            .update_incremental(None)
-            .await
-            .map_err(sink_error)?;
-        Ok(true)
+        if self.table.update_incremental(None).await.is_ok() {
+            return Ok(true);
+        }
+        self.reopen().await
+    }
+
+    /// Re-opens the table from scratch (a fresh handle on the same URL and options, loaded) and
+    /// forgets the known commit; `false` when the location holds no Delta table any more.
+    async fn reopen(&mut self) -> Result<bool, SinkError> {
+        self.known = None;
+        let fresh = DeltaTable::try_from_url_with_storage_options(
+            self.table.table_url().clone(),
+            self.options.clone(),
+        )
+        .await
+        .map_err(sink_error)?;
+        self.table = fresh;
+        Ok(self.table.version().is_some())
     }
 
     /// The loaded version (0 before the first load).
@@ -168,11 +201,16 @@ impl TableHandle {
         match created {
             Ok(table) => {
                 self.table = table;
+                // A new table holds no own commit.
+                self.known = None;
                 Ok(())
             }
             // Another writer created it between the check and the commit.
             Err(e) => match self.refresh().await {
-                Ok(true) => Ok(()),
+                Ok(true) => {
+                    self.known = None;
+                    Ok(())
+                }
                 _ => Err(sink_error(e)),
             },
         }
@@ -195,15 +233,29 @@ impl TableHandle {
     }
 
     /// The fence: the owner epoch of the latest commit of `pipeline_id` (its `txn` version).
-    pub async fn fence_epoch(&self, pipeline_id: &str) -> Result<Option<u64>, SinkError> {
-        let snapshot = self.table.snapshot().map_err(sink_error)?;
-        let version = snapshot
-            .transaction_version(self.table.log_store().as_ref(), app_id(pipeline_id))
-            .await
-            .map_err(sink_error)?;
+    ///
+    /// The read replays the loaded snapshot's log. When that fails, the table is re-opened and read
+    /// once more: a table dropped and re-created behind the handle leaves a snapshot whose log is
+    /// gone, which `update_incremental` doesn't notice when the new table has no newer version.
+    pub async fn fence_epoch(&mut self, pipeline_id: &str) -> Result<Option<u64>, SinkError> {
+        let version = match self.txn_version(pipeline_id).await {
+            Ok(v) => v,
+            Err(_) => {
+                self.reopen().await?;
+                self.txn_version(pipeline_id).await?
+            }
+        };
         version
             .map(|v| u64::try_from(v).map_err(|_| permanent(format!("txn version {v}"))))
             .transpose()
+    }
+
+    async fn txn_version(&self, pipeline_id: &str) -> Result<Option<i64>, SinkError> {
+        let snapshot = self.table.snapshot().map_err(sink_error)?;
+        snapshot
+            .transaction_version(self.table.log_store().as_ref(), app_id(pipeline_id))
+            .await
+            .map_err(sink_error)
     }
 
     /// The position of the newest commit of `pipeline_id`, walking back past foreign commits.
@@ -213,27 +265,53 @@ impl TableHandle {
         pipeline_id: &str,
     ) -> Result<Option<SourcePosition>, SinkError> {
         let latest = self.version();
-        let stop = self.known.as_ref().map(|(v, _)| *v);
+        let table_id = self.table_id()?;
+        // A commit known of another table (dropped and re-created under the same root), or of a
+        // version this log doesn't reach, says nothing about this one: neither a stop nor a
+        // fallback.
+        if self
+            .known
+            .as_ref()
+            .is_some_and(|k| k.table_id != table_id || k.version > latest)
+        {
+            self.known = None;
+        }
+        let stop = self.known.as_ref().map(|k| k.version);
         let log = self.table.log_store();
         match walk_back(log.as_ref(), latest, stop, pipeline_id)
             .await
             .map_err(permanent)?
         {
             WalkBack::Found { version, position } => {
-                self.known = Some((version, position.clone()));
+                self.known = Some(Known {
+                    table_id,
+                    version,
+                    position: position.clone(),
+                });
                 Ok(Some(position))
             }
             // A missing commit file ends the walk; an older known position is still a safe
             // guard (it skips less).
             WalkBack::Reached | WalkBack::NotFound => {
-                Ok(self.known.as_ref().map(|(_, p)| p.clone()))
+                Ok(self.known.as_ref().map(|k| k.position.clone()))
             }
         }
     }
 
-    /// Records an own commit this handle just wrote.
+    /// The loaded table's identity (`metaData.id`).
+    fn table_id(&self) -> Result<String, SinkError> {
+        let snapshot = self.table.snapshot().map_err(sink_error)?;
+        Ok(snapshot.metadata().id().to_string())
+    }
+
+    /// Records an own commit this handle just wrote, to the table it holds. Without a loaded
+    /// table nothing is recorded (the walk-back then reads further, which is always safe).
     pub fn remember(&mut self, version: u64, position: SourcePosition) {
-        self.known = Some((version, position));
+        self.known = self.table_id().ok().map(|table_id| Known {
+            table_id,
+            version,
+            position,
+        });
     }
 
     /// Every row in Hop 2 terms, in identifier order: the Delta counterpart of `MemorySink::content`.

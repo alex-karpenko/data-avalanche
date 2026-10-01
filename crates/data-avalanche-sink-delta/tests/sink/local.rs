@@ -3,12 +3,14 @@
 
 use std::time::Duration;
 
-use data_avalanche_core::{ColumnSchema, ColumnValueType, SchemaChange, SchemaDelta, Sink};
+use data_avalanche_core::{
+    ColumnSchema, ColumnValueType, CommitOutcome, SchemaChange, SchemaDelta, Sink,
+};
 use data_avalanche_sink_delta::{DeltaLocation, TableDefaults};
 use deltalake::kernel::{DataType, StructField};
 use deltalake::{DeltaTable, TableProperty};
 
-use crate::common::{commit, cs, items, lsn, sink, spec, upserts};
+use crate::common::{commit, cs, items, lsn, owned, rows, sink, spec, upserts};
 use crate::scenarios;
 
 fn local() -> (tempfile::TempDir, DeltaLocation) {
@@ -170,4 +172,67 @@ async fn random_keys_rewrite_more_files_than_a_key_range() {
         (rnd_files, rnd_copied),
         (FILES as u64, (total - CHANGES) as u64)
     );
+}
+
+/// Commits rows 1, 2, 3 at positions 10, 20, 30, then removes the table directory (an operator
+/// dropping the table to re-snapshot it).
+async fn three_commits_then_drop(
+    dir: &tempfile::TempDir,
+    s: &data_avalanche_sink_delta::DeltaSink,
+) {
+    s.ensure_table(&spec()).await.unwrap();
+    for (end, id) in [(10, 1), (20, 2), (30, 3)] {
+        commit(
+            s,
+            cs(end, vec![upserts(&[(id, Some("a"))], None)], vec![]),
+            1,
+        )
+        .await;
+    }
+    std::fs::remove_dir_all(dir.path().join("public/items")).unwrap();
+}
+
+/// A table dropped and re-created behind the sink is a new table: the position the sink cached
+/// for the old one (30) must not skip a commit to the new one (review Task 9 M2).
+#[tokio::test]
+async fn a_recreated_table_is_not_skipped_by_the_old_position() {
+    let (dir, location) = local();
+    let s = sink(location, TableDefaults::default());
+    three_commits_then_drop(&dir, &s).await;
+    let state = s.table_state(&items()).await.unwrap();
+    assert!(!state.exists);
+    s.ensure_table(&spec()).await.unwrap();
+    let state = s.table_state(&items()).await.unwrap();
+    assert_eq!(state.marker, None, "a new table has no own commit");
+    let out = commit(
+        &s,
+        cs(25, vec![upserts(&[(9, Some("re"))], None)], vec![]),
+        1,
+    )
+    .await;
+    assert!(matches!(out, CommitOutcome::Committed { .. }), "{out:?}");
+    assert_eq!(rows(&s).await, owned(&[(9, Some("re"))]));
+    let marker = s.table_state(&items()).await.unwrap().marker.unwrap();
+    assert_eq!(marker.committed_position, lsn(25));
+}
+
+/// Another writer re-creates the table between two calls of this sink: the live handle's stale
+/// snapshot can't be updated incrementally, so the sink re-opens the table and commits.
+#[tokio::test]
+async fn a_live_handle_recovers_from_a_table_recreated_behind_it() {
+    let (dir, location) = local();
+    let s = sink(location.clone(), TableDefaults::default());
+    three_commits_then_drop(&dir, &s).await;
+    sink(location, TableDefaults::default())
+        .ensure_table(&spec())
+        .await
+        .unwrap();
+    let out = commit(
+        &s,
+        cs(40, vec![upserts(&[(9, Some("re"))], None)], vec![]),
+        1,
+    )
+    .await;
+    assert!(matches!(out, CommitOutcome::Committed { .. }), "{out:?}");
+    assert_eq!(rows(&s).await, owned(&[(9, Some("re"))]));
 }
