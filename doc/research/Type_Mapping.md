@@ -168,8 +168,8 @@ via SQL `LIKE` and `CAST` in engines like Spark or Trino.
 | PostgreSQL Type | OID | ColumnValue | Arrow | Iceberg | Notes |
 |----------------|-----|------------|-------|---------|-------|
 | `uuid` | 2950 | `Uuid(Uuid)` | `FixedSizeBinary(16)` | `uuid` | Stored as 16 raw bytes; iceberg-rust maps `FixedSizeBinary(16)` → `uuid` |
-| `json` | 114 | `Json(serde_json::Value)` | `Utf8` | `string` | Serialized as compact JSON string |
-| `jsonb` | 3802 | `Json(serde_json::Value)` | `Utf8` | `string` | Semantically same as json after decode |
+| `json` | 114 | `Json(serde_json::Value)` | `Utf8` | `string` | Serialized as compact JSON string; numbers keep every digit (serde_json `arbitrary_precision`, Q-M5-11) |
+| `jsonb` | 3802 | `Json(serde_json::Value)` | `Utf8` | `string` | Semantically same as json after decode; its `numeric` numbers keep every digit (Q-M5-11) |
 | `bit(n)` | 1560 | `Bytes(Vec<u8>)` | `Binary` | `fixed(⌈n/8⌉)` | MSB-first packed |
 | `varbit(n)` | 1562 | `Bytes(Vec<u8>)` | `Binary` | `binary` | PostgreSQL's binary form: a 4-byte big-endian bit count, then the bits packed MSB-first, the last byte zero-padded (Q-M5-9) |
 | User-defined `ENUM` | varies | `Text(String)` | `Utf8` | `string` | pgoutput sends the label string, not the OID index |
