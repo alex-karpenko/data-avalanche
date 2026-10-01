@@ -1,5 +1,5 @@
 ---
-updated: 2026-09-30
+updated: 2026-10-01
 domain: Architecture
 tags: [sink, multi-sink, delta-lake, delta-rs, iceberg, merge, upsert, capabilities, configuration, arrow]
 resolves: [DA-SINK-1, DA-X-5, DA-X-3]
@@ -65,7 +65,7 @@ All rows marked **✅src** were verified by reading the published **`deltalake-c
 | **Application transactions** (idempotent streaming marker) | `CommitProperties::with_application_transaction(Transaction{app_id, version})` → Delta `txn` action | ✅src |
 | Concurrent commits touching the **same `app_id` conflict** | conflict checker tracks `read_app_ids` from `Action::Txn` | ✅src (semantics 🧪) |
 | Low-level commit of arbitrary actions (escape hatch) | `CommitBuilder::with_actions(Vec<Action>)` public | ✅src |
-| **Truncate** (delete all rows) | `DeleteBuilder` without predicate → `Remove` for all files (metadata-only) | ✅src |
+| **Truncate** (delete all rows) | `DeleteBuilder` without predicate → `Remove` for all files (metadata-only) | ✅src — **but not refused when a foreign OPTIMIZE lands between its read and its commit** (probe P11a): the compacted file survives, so the sink must check the table is empty after the DELETE (§7.2 step 1) |
 | Atomic commit on **S3** without an external lock | conditional put (`If-None-Match`) is the default; **DynamoDB log store removed in 1.0** (discussion #4482) | ✅src |
 | Atomic commit on **GCS / Azure** | object_store put-if-absent (native) | ✅ (🧪 real-service run) |
 | Add column | `add_columns()` op; `with_merge_schema(true)` on MERGE; `SchemaMode::Merge` on write | ✅ probe P7a — **but refused on column-mapping tables** (P7b) |
@@ -356,6 +356,11 @@ D-MS.5 is accepted, **changelog mode** ships on the current crate (append `I/U/D
 **Per flush, per table — one Delta commit:**
 
 1. If `truncate`: `DeleteBuilder` (no predicate) commit first — metadata-only — then continue.
+   If the table still holds files after that DELETE, a concurrent commit with only
+   `data_change=false` actions (an OPTIMIZE) landed between the read and the commit. delta-rs
+   1.0 doesn't refuse it, because a predicate-less DELETE declares no read (probe P11a). Treat it as
+   a lost race: re-read, re-fence, truncate again (M4, D-M4.8 deviation). The DELETE carries the
+   `txn` but no position, so the guard never skips the retry.
 2. Build the MERGE source = `upserts` ∪ `deletes` with a boolean `__data_avalanche_del` column
    (deletes carry only identifier + before-image partition columns; other columns NULL).
 3. `MergeBuilder` with predicate `t.<id cols> = s.<id cols>` (+ partition-pruning disjunct
@@ -565,6 +570,7 @@ P1, P2, P4, P6, P8 are the gates whose failure would change the Delta design; th
 | P10 types + independent cross-read | ✅ all Hop-3b types exact through append **and** MERGE; DuckDB 1.5.5 `delta_scan` (delta-kernel) reads identical types/values; tz vs ntz semantics preserved. **Finding:** a `timestamp_ntz` column puts the table at reader v3 / writer v7 (`timestampNtz` feature); without it the table stays at reader 1 / writer 2 (P10b) — gap DA-MS-8 |
 | P8 real clouds — **S3** (2026-09-26, us-east-1) | ✅ commit = one `PUT _delta_log/<N>.json` with `If-None-Match: *` (object_store 0.13 default, no DynamoDB, no tmp+rename). **P8a** raw put-if-absent: 10 rounds × 16 → exactly 1 winner, content = winner's · **P8b** same-version MERGE race, retries off: 5 rounds × 8 → exactly one version, no stray v+2, content = base + winner only · **P8c** 8 owners MERGE one row, retries on → 1 lands, losers stopped by the *data* conflict check · **P8e** 8 owners append disjoint rows → 1 lands, losers stopped by the **`txn` fence alone** (`Concurrent transaction failed`) · **P8d** 8 foreign appends, retries on → all land on contiguous versions, 800/800 rows. Losers leave orphan Parquet (reclaimed by VACUUM). |
 | P8 real clouds — **GCS** (2026-09-26, `gs://leasetest`, US) | ✅ same probe, same results: commit = one create-only PUT with `x-goog-if-generation-match: 0`; P8a 10 × 16 → single winner, all losers a clean `AlreadyExists` (no 429 surfaced); P8b exactly one version per round, winner's content only; P8c data conflict; **P8e `txn` fence alone**; P8d 8/8 appends, 800/800 rows |
+| P11 truncate / MERGE outran by a foreign OPTIMIZE (2026-10-01, local) | **P11a ❌** the stale predicate-less DELETE commits with no conflict, and the compacted file keeps every row: deltalake-core 1.0 checks added files only against a declared read (a DELETE without a predicate declares none), and its remove checks skip `data_change=false` removes. **P11b ✅** a stale MERGE is refused (`ConcurrentAppend`). The sink retries a truncate that leaves files (§7.2 step 1) |
 | P8 real clouds — **Azure Blob** (2026-09-26, `dataavalanchetest`, flat namespace) | ✅ same probe, same results: commit = one `If-None-Match: *` Put Blob; P8a 10 × 16 → single winner; P8b exactly one version per round, winner's content only; P8c data conflict; **P8e `txn` fence alone**; P8d 8/8 appends, 800/800 rows. ADLS Gen2 (HNS) not run — no difference expected (same Blob endpoint + precondition) |
 
 **P6 interpretation.** Delta MERGE cost per flush is ∝ *(number of files whose key range contains a
