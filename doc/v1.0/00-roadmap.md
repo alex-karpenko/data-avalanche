@@ -771,7 +771,9 @@ Detailed plan: `M0-foundations.md`.
     record the intent to create it first, so the next start knows the slot is its own (Task 8 review).
   - Persist the checkpoint before acknowledging it to PostgreSQL (Data-Flow Phase 5, Q-M5-14): a slot
     confirmed past the checkpoint reads as a lost position.
-  - Snapshot every table in `Prepared::added` under `StartPlan::Resume` (Q-M5-14).
+  - Snapshot every table in `Prepared::added` under `StartPlan::Resume` (Q-M5-14), and persist those
+    snapshot requests as soon as `prepare` returns: the publication already carries the tables, so a
+    retried `prepare` no longer reports them.
   - A quick restart can meet `55006` (the slot is still active for the old walsender, up to
     `wal_sender_timeout`): retry it, bounded, while the lease is held.
   - The reconnect backoff: a stream error ends the stream, and the pipeline reopens it from the

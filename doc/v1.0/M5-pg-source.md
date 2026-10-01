@@ -12008,3 +12008,16 @@ server-wide: cargo never runs it beside the `pg` tests, and the nightly runs it 
 the verified workspace: PostgreSQL 14–18 pass 34 integration tests each without TLS, and
 `slot_invalidation` on each; the workspace passes 637. Counts: Task 8's integration tests are 13;
 each later integration count is three higher than before (two slot tests, one stream test).
+
+Fix round 2 (`c4be91f`, from the re-review). `prepare` reads and decides before it changes
+anything: `reconcile_publication` only returns the statements (`Reconciled::sql`), and
+`apply_publication` runs them after the slot decision. A refusal leaves the publication as it was.
+A rewriting repair drops the slot first, then changes the publication, then creates the slot, so a
+`Transient` failure and a retry find no slot and re-snapshot, instead of resuming over the WAL the
+old publication didn't publish. `publish_via_partition_root` counts as rewriting only while a
+tracked table is a partition. V-059's uniqueness covers names that need quoting too. The
+invalidation test restores `max_slot_wal_keep_size` on every failure path, and resets it first.
+`Prepared::added` can't be made durable by the source: a retry after the `ADD TABLE` committed
+reports nothing, so M6 records those snapshot requests as soon as `prepare` returns (roadmap M6).
+Measured: PostgreSQL 14–18 pass 34 integration tests each and `slot_invalidation`; the workspace
+passes 637 on the verified workspace, 602 on the branch.
