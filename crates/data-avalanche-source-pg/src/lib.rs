@@ -3,6 +3,7 @@
 //! (`Type_Mapping.md`), the slot and publication lifecycle (`Postgres_Slot…`), catalog channels
 //! A, C and D (`Schema_Change…` §3) and keyset snapshot chunks (`Snapshot_Resumability…`).
 
+pub mod catalog;
 #[allow(dead_code)] // `PgConnector` (Task 7) is the caller
 mod connect;
 #[allow(dead_code)] // the stream (Task 9) is the caller
