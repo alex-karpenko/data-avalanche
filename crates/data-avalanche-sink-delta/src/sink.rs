@@ -237,6 +237,18 @@ impl DeltaSink {
                 Err(e) => return race_or_fail(e),
             };
             h.set_table(table.clone());
+            // A commit delta-rs doesn't count as a conflict can outrun the DELETE: deltalake-core
+            // 1.0 `conflict_checker.rs` skips `data_change=false` actions, so a concurrent OPTIMIZE's
+            // compacted file survives a DELETE of the files it replaced. The table isn't empty, so
+            // this lost the race: the retry re-reads the table, re-runs the fence and the guard
+            // (the DELETE has no position, D-M4.8) and truncates again.
+            if table.snapshot().map_err(sink_error)?.log_data().num_files() > 0 {
+                return Ok(Step::Retry(
+                    "the truncate left files a concurrent commit wrote (an OPTIMIZE, which \
+                     delta-rs doesn't treat as a conflict)"
+                        .into(),
+                ));
+            }
         }
         let before = table.version();
         if cs.upsert_rows() + cs.delete_rows() > 0 {
@@ -593,6 +605,49 @@ mod tests {
             s.commit(t.clone(), marker(1, &t)).await.unwrap(),
             CommitOutcome::SkippedCovered
         );
+    }
+
+    /// A foreign OPTIMIZE lands between the read and the truncate's DELETE. delta-rs doesn't see a
+    /// conflict (the compaction's actions are `data_change=false`), so the DELETE commits and the
+    /// compacted file survives it: the attempt must retry, not land a table that still holds rows.
+    #[tokio::test]
+    async fn a_truncate_that_a_foreign_optimize_outran_is_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = seeded_then_optimized(&dir).await;
+        let mut t = rows(30, &[3]);
+        t.truncate = true;
+        match stale_attempt(&s, &t, 1).await {
+            Step::Retry(reason) => assert!(reason.contains("OPTIMIZE"), "{reason}"),
+            Step::Done(o) => panic!("{o:?}, rows {:?}", ids(&s).await),
+        }
+        let out = s.commit(t.clone(), marker(1, &t)).await.unwrap();
+        assert!(matches!(out, CommitOutcome::Committed { .. }), "{out:?}");
+        assert_eq!(ids(&s).await, [3]);
+        let state = s.table_state(&t.table).await.unwrap();
+        assert_eq!(
+            state.marker.unwrap().committed_position,
+            SourcePosition::Pg(Lsn(30))
+        );
+        assert_eq!(
+            s.commit(t.clone(), marker(1, &t)).await.unwrap(),
+            CommitOutcome::SkippedCovered
+        );
+    }
+
+    /// A truncate of an empty table writes no DELETE, and no retry: the MERGE is the one commit.
+    #[tokio::test]
+    async fn a_truncate_of_an_empty_table_costs_no_extra_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = sink(&dir);
+        s.ensure_table(&spec(&orders())).await.unwrap();
+        let mut t = rows(10, &[1]);
+        t.truncate = true;
+        assert_eq!(
+            s.commit(t.clone(), marker(1, &t)).await.unwrap(),
+            CommitOutcome::Committed { version: 1 }
+        );
+        assert_eq!(s.stats().retries, 0);
+        assert_eq!(ids(&s).await, [1]);
     }
 
     /// D-M4.8: the truncate's DELETE carries the fence but no position, so a crash before its
