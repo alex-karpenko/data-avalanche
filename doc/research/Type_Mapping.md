@@ -1,5 +1,5 @@
 ---
-updated: 2026-09-30
+updated: 2026-10-01
 domain: Data Types
 tags: [data-types, mapping, arrow, iceberg, delta-lake, multi-sink, postgres, mysql, cdc]
 resolves: G-18
@@ -171,20 +171,28 @@ via SQL `LIKE` and `CAST` in engines like Spark or Trino.
 | `json` | 114 | `Json(serde_json::Value)` | `Utf8` | `string` | Serialized as compact JSON string |
 | `jsonb` | 3802 | `Json(serde_json::Value)` | `Utf8` | `string` | Semantically same as json after decode |
 | `bit(n)` | 1560 | `Bytes(Vec<u8>)` | `Binary` | `fixed(⌈n/8⌉)` | MSB-first packed |
-| `varbit(n)` | 1562 | `Bytes(Vec<u8>)` | `Binary` | `binary` | Length-prefixed |
+| `varbit(n)` | 1562 | `Bytes(Vec<u8>)` | `Binary` | `binary` | PostgreSQL's binary form: a 4-byte big-endian bit count, then the bits packed MSB-first, the last byte zero-padded (Q-M5-9) |
 | User-defined `ENUM` | varies | `Text(String)` | `Utf8` | `string` | pgoutput sends the label string, not the OID index |
 | `hstore` | 16935 (ext) | `Json(serde_json::Value)` | `Utf8` | `string` | Decoded as `{"key":"val"}` JSON object |
 | `any[]` (array of type T) | varies | `Array { element_type, values }` | `List<T_arrow>` | `list<T_iceberg>` | Element type resolved from OID; nested arrays supported recursively |
-| PostGIS `geometry` / `geography` | ext | `Bytes(Vec<u8>)` | `Binary` | `binary` | WKB (Well-Known Binary) format |
+| PostGIS `geometry` / `geography` | ext | `Bytes(Vec<u8>)` | `Binary` | `binary` | EWKB (WKB with the SRID): the hex text pgoutput sends, decoded to bytes (M5 D-M5.10) |
 | Composite / user-defined | varies | `Text(String)` | `Utf8` | `string` | Serialized as `(f1,f2,...)` PG text; ⚠ consider `Bytes` for non-UTF data |
 
 ### PostgreSQL-Specific Decision Notes
 
 **Numeric precision cap.** Iceberg `decimal` supports a maximum of 38 significant digits.
-PostgreSQL `numeric` is unconstrained. Mapping rule:
+PostgreSQL `numeric` is unconstrained. Mapping rule (M5 D-M5.9, Q-M5-8):
 - If `P ≤ 38`: map to `Decimal128(P, S)` as-is.
-- If `P > 38` or precision is unspecified (`numeric` without args): store as `Text(String)` →
-  `Utf8` → Iceberg `string`. Emit a `WARN`-level log at schema resolution time.
+- A negative scale (PostgreSQL 15+, `numeric(P,-S)`) widens to `Decimal128(P+|S|, 0)`, since
+  Delta and Iceberg require scale ≥ 0. A scale above the precision (`numeric(2,4)`) maps to
+  `Decimal128(S, S)`.
+- If `P > 38`: under `numeric_overflow_action: string`, store as `Text(String)` → `Utf8` →
+  `string`, with a warning at schema resolution; under `error`, the table halts at resolution.
+- If precision is unspecified (`numeric` without args): under `string`, text as above; under
+  `error`, `Decimal128(38, 18)`, and a value that doesn't fit halts the table
+  (`NUMERIC_OVERFLOW`). V-079 warns about this at resolution.
+- `NaN` and `±Infinity` have no decimal form: a column holding one halts its table
+  (`SCHEMA_MISMATCH`); `column_type_overrides: string` keeps them as text.
 
 **TOAST columns.** When a large column (`text`, `bytea`, `jsonb`) is unchanged in an `UPDATE`
 event, pgoutput emits an "unchanged TOAST" sentinel instead of the value. The pipeline must
