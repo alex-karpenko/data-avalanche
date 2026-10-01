@@ -681,7 +681,7 @@ source:
 
 | Field | Type | Required | Default | Mutability | Notes |
 |---|---|---|---|---|---|
-| `publication` | string | yes | — | PR | PG publication name. Must be a valid identifier; unique per source DB across pipelines (V-059). Auto-created/maintained by the app. |
+| `publication` | string | yes | — | PR | PG publication name. Must be a valid identifier; unique per source DB across pipelines (V-059). Auto-created/maintained by the app. Case-sensitive: the app always quotes it (`MyPub` is the publication `"MyPub"`). |
 | `slot` | string | yes | — | PR | Logical replication slot name. Charset `^[a-z_][a-z0-9_]{0,62}$` (PG constraint); **unique** per source host+db across pipelines (V-058). |
 | `auto_cleanup` | bool | no | `true` | R | Drop the slot & publication when the pipeline is deleted. Teardown-time policy flag only — consulted at deletion/`id`-change, not on the live path, so a change applies in place with no restart. |
 | `heartbeat` | Duration | no | `60s` | R | StandbyStatusUpdate interval; keeps the connection alive and prevents WAL-lag-as-inactivity. |
@@ -1326,7 +1326,7 @@ errors.
 | V-056 | `pipeline.id` | Unique across all pipelines. | error | config |
 | V-057 | pipeline name (map key) | Matches `^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`. | error | pipeline |
 | V-058 | `source.postgres.slot` | Matches `^[a-z_][a-z0-9_]{0,62}$`; unique per source server (`host` + `port`) across pipelines — PostgreSQL scopes slot names to the server, not the database. | error | config |
-| V-059 | `source.postgres.publication` | Valid identifier; uniqueness per source database (`host` + `port` + `db`) recommended. | warning | pipeline |
+| V-059 | `source.postgres.publication` | Valid identifier (`warning` when it needs quoting). Unique per source database (`host` + `port` + `db`) across pipelines: `error` when a pipeline sharing it has `slot_management: managed` (it reconciles the publication to its own tables, dropping the others'), `warning` otherwise (Q-M5-14). | error / warning | pipeline |
 | V-060 | `defaults` | Must not set per-pipeline-unique resource names (`postgres.publication`, `postgres.slot`, `id`). | error | config |
 
 ### 13.8 Reload-time & cluster
