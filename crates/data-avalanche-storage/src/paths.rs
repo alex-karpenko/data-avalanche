@@ -27,15 +27,29 @@ pub fn join(segments: &[&str]) -> String {
 /// `%XX`, and a name of `.` or `..` has its dots escaped. Everything else (including `.` inside a
 /// name and non-ASCII text) is kept, so ordinary names map to themselves.
 pub fn escape_segment(ident: &str) -> String {
+    escape_with(ident, '%')
+}
+
+/// Makes a database identifier safe as one segment of a table root: `%`, `/`, `~` and control
+/// characters become `~XX`, and a name of `.` or `..` has its dots escaped. A table root never
+/// holds a `%`: delta-kernel readers (delta-rs, DuckDB) percent-decode a table's path a second
+/// time, so `a%25b` would be read as `a%b` (Q-M4-5). Ordinary names map to themselves.
+pub fn escape_table_segment(ident: &str) -> String {
+    escape_with(ident, '~')
+}
+
+/// `mark` followed by two upper-case hex digits per UTF-8 byte, for `%`, `/`, `mark` itself and
+/// control characters.
+fn escape_with(ident: &str, mark: char) -> String {
     if ident == "." || ident == ".." {
-        return ident.replace('.', "%2E");
+        return ident.replace('.', &format!("{mark}2E"));
     }
     let mut out = String::with_capacity(ident.len());
     for c in ident.chars() {
-        if c == '%' || c == '/' || c.is_control() {
+        if c == '%' || c == '/' || c == mark || c.is_control() {
             let mut buf = [0u8; 4];
             for byte in c.encode_utf8(&mut buf).bytes() {
-                out.push_str(&format!("%{byte:02X}"));
+                out.push_str(&format!("{mark}{byte:02X}"));
             }
         } else {
             out.push(c);
@@ -44,16 +58,17 @@ pub fn escape_segment(ident: &str) -> String {
     out
 }
 
-/// `<sink.bucket>/<sink.prefix>/<schema>/<table>/`: one table's root, for every sink format. For
-/// MySQL, `schema` is the database (`source.db`). A schema named exactly
-/// [`COLOCATED_STATE_DIR`] has its leading dot escaped (`%2Epipeline-state`), so a table never
-/// lands inside co-located pipeline state under the same `sink.prefix`.
+/// `<sink.bucket>/<sink.prefix>/<schema>/<table>/`: one table's root, for every sink format, with
+/// each name through [`escape_table_segment`]. For MySQL, `schema` is the database (`source.db`).
+/// A schema named exactly [`COLOCATED_STATE_DIR`] has its leading dot escaped
+/// (`~2Epipeline-state`), so a table never lands inside co-located pipeline state under the same
+/// `sink.prefix`.
 pub fn table_root(sink_bucket: &str, sink_prefix: &str, schema: &str, table: &str) -> Location {
-    let schema = match escape_segment(schema) {
-        s if s == COLOCATED_STATE_DIR => format!("%2E{}", &s[1..]),
+    let schema = match escape_table_segment(schema) {
+        s if s == COLOCATED_STATE_DIR => format!("~2E{}", &s[1..]),
         s => s,
     };
-    let table = escape_segment(table);
+    let table = escape_table_segment(table);
     Location {
         bucket: sink_bucket.to_owned(),
         root: join(&[sink_prefix, &schema, &table]),
@@ -131,16 +146,42 @@ mod tests {
             table_root("b", "p", "продажи", "Заказы 2026").root,
             "p/продажи/Заказы 2026"
         );
-        assert_eq!(table_root("b", "p", "a/b", "50%").root, "p/a%2Fb/50%25");
-        assert_eq!(table_root("b", "p", "..", ".").root, "p/%2E%2E/%2E");
-        assert_eq!(table_root("b", "p", "s", "t\n").root, "p/s/t%0A");
+        assert_eq!(table_root("b", "p", "a/b", "50%").root, "p/a~2Fb/50~25");
+        assert_eq!(table_root("b", "p", "..", ".").root, "p/~2E~2E/~2E");
+        assert_eq!(table_root("b", "p", "s", "t\n").root, "p/s/t~0A");
+        assert_eq!(
+            table_root("b", "p", "~user", "a~2F").root,
+            "p/~7Euser/a~7E2F"
+        );
+    }
+
+    #[test]
+    fn a_table_root_never_holds_a_percent() {
+        for name in [
+            "50%",
+            "%2F",
+            "a/b",
+            "~",
+            "..",
+            "t\u{7f}",
+            "Заказы 2026",
+            "a b+c#d?e",
+        ] {
+            let root = table_root("b", "p", name, name).root;
+            assert!(!root.contains('%'), "{name:?} → {root:?}");
+        }
+        assert_eq!(
+            escape_segment("a/b 50%"),
+            "a%2Fb 50%25",
+            "state keys keep `%XX`"
+        );
     }
 
     #[test]
     fn a_schema_named_like_the_state_marker_never_lands_in_colocated_state() {
         let state = colocated_state("lake", "p").root;
         let root = table_root("lake", "p", COLOCATED_STATE_DIR, "replication").root;
-        assert_eq!(root, "p/%2Epipeline-state/replication");
+        assert_eq!(root, "p/~2Epipeline-state/replication");
         assert!(!root.starts_with(&format!("{state}/")));
         // Only the schema segment can collide; the rest map as before.
         assert_eq!(

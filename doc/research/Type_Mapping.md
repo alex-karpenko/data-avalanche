@@ -299,8 +299,16 @@ Arrow maximum/minimum of the column's Arrow type: `Date32` → `i32::MIN` / `i32
 | `date` / `timestamp` / `timestamptz` `infinity` | Arrow maximum |
 | `timestamp[tz]` beyond the i64-µs range (294247–294276 AD) | Arrow maximum |
 
-The clamped values are valid Arrow and Parquet values. Some query engines can't render years that
-far out; the M4 type round-trip test (source → Delta → DuckDB `delta_scan`) pins what readers see.
+The clamped values are valid Arrow values, and Hop 2 carries them unchanged.
+
+**Delta sink — clamp again to the Delta range (Q-M4-2, decided 2026-09-30).** The Delta protocol
+covers 0001-01-01 … 9999-12-31 23:59:59.999999. delta-rs 1.0 panics writing a `Date32` of
+`i32::MIN` (in its statistics), and readers fail beyond the range (DuckDB: "Date out of range in
+timestamp conversion"). So Hop 3b clamps every `date`, `timestamp` and `timestamp_ntz` cell to
+that range: PostgreSQL `±infinity` lands on `0001-01-01` / `9999-12-31` (and
+`… 23:59:59.999999` for timestamps). A `timestamp_ntz` stored as `string` is not clamped; its
+text form covers all of `i64`. The M4 round trip (Task 13) reads the bounds back through delta-rs
+and DuckDB `delta_scan`.
 
 **MySQL / MariaDB — NULL for "no date", halt for invalid dates.** Measured 2026-09-26: MySQL 8.4's
 default `sql_mode` rejects all of the values below, but any session can relax it
@@ -426,7 +434,7 @@ those columns inside its own Hop 3 (the accumulator is unchanged).
 | `Date32` | `date` | No |
 | `Time64(Microsecond)` (`time`) | `string` `HH:MM:SS.ffffff` | **Yes** — D-MS.8; override to `int64` for µs-since-midnight |
 | `Timestamp(Microsecond, Some("UTC"))` (`timestamp_tz`) | `timestamp` | No |
-| `Timestamp(Microsecond, None)` (`timestamp_ntz`) | `timestamp_ntz` (table feature `timestampNtz`; default) — or per `sink.delta.timestamp_ntz_as`: `timestamp` (wall clock as UTC instant) / `string` | Only for `timestamp` / `string` (DA-MS-8) |
+| `Timestamp(Microsecond, None)` (`timestamp_ntz`) | `timestamp_ntz` (table feature `timestampNtz`; default) — or per `sink.delta.timestamp_ntz_as`: `timestamp` (wall clock as UTC instant) / `string` (`YYYY-MM-DD HH:MM:SS.ffffff`, any `i64`) | Only for `timestamp` / `string` (DA-MS-8) |
 | `FixedSizeBinary(16)` (`uuid`) | `string` (canonical 36-char, lowercase) | **Yes** |
 | `FixedSizeBinary(n)`, n ≠ 16 | `binary` | **Yes** (cast) |
 | `List<T>` (incl. `set` → `list<string>`) | `array<T>` | No |
@@ -439,6 +447,18 @@ DuckDB's `delta_scan` (delta-kernel). **Interop note:** a `timestamp_ntz` column
 reader v3 / writer v7 (`timestampNtz` table feature); readers without table-feature support cannot
 open it (gap DA-MS-8). **Decided (D-MS.16):** keep `timestamp_ntz` by default; `sink.delta.timestamp_ntz_as:
 timestamp | string` is the explicit escape hatch for legacy-reader estates (config V-114).
+
+**Decided for the v1 sink (M4, `doc/v1.0/M4-delta-sink.md` D-M4.1–D-M4.3, 2026-09-30):**
+- Every column the sink creates carries its logical type in the Delta column metadata
+  (`data-avalanche.type`), plus the Hop 2 tag. Reading a table's schema back therefore gives the Hop 2
+  field exactly, although a Delta `string` may hold a uuid, a time or a `timestamp_ntz`.
+- The conversion follows the table's column type, not the current `timestamp_ntz_as`: an existing
+  column keeps its representation.
+- Date and timestamp cells are clamped to the Delta range (§Date/time edge values, Q-M4-2).
+- A negative decimal scale (`numeric(p,-s)`) is refused at Hop 3b: Delta requires scale ≥ 0. M5's
+  Hop 1 widens such a column to scale 0 so it never reaches the sink.
+- Hop 2 produces `FixedSizeBinary` only for uuid and no `Struct` or `Int8` (M3 D-M3.5), so those
+  rows of the table above don't arise in v1.
 
 ---
 

@@ -72,6 +72,8 @@ jobs:
             printf '%s' "$GCP_SA_KEY" > "$RUNNER_TEMP/gcs-key.json"
             echo "GOOGLE_SERVICE_ACCOUNT_PATH=$RUNNER_TEMP/gcs-key.json" >> "$GITHUB_ENV"
           fi
+      # uv runs the DuckDB cross-read of the Delta sink (R-12, crates/data-avalanche-sink-delta).
+      - uses: astral-sh/setup-uv@v10.2.0
       - name: Start test infrastructure
         run: test-infra/up.sh
       - name: Integration tests

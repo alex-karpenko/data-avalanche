@@ -1,5 +1,5 @@
 ---
-updated: 2026-09-30
+updated: 2026-10-01
 domain: Architecture
 tags: [v1, implementation-plan, roadmap, milestones, workspace, crates, interfaces, test-strategy, ci, risks]
 sources: []
@@ -124,7 +124,7 @@ Rules:
 
 | Purpose | Crate | Pin | Evidence |
 |---|---|---|---|
-| Delta sink | `deltalake` (features `datafusion`, `rustls`, `s3`, `gcs`, `azure`) | `=1.0.0` | delta P1–P10, P8 on S3/GCS/Azure |
+| Delta sink | `deltalake` (features `datafusion`, `rustls`, `s3`, `gcs`, `azure`) + `deltalake-core` | `=1.0.0` both (Q-M4-1: the `deltalake` facade asks for `deltalake-core = "1.0"`, which resolves to 1.1; the direct pin keeps the engine the probes ran on) | delta P1–P10, P8 on S3/GCS/Azure |
 | Object storage / CAS | `object_store` | `0.14.2` (bumped from 0.13.2 on 2026-09-26; deltalake 1.0 requires `^0.13.2`, so M4 adds a second copy, R-13) | API checked; RustFS/Azurite/real-GCS CAS re-run on 0.14.2; T1–T10 re-proof in M2 |
 | Arrow | `arrow` / `parquet` | `59` (as resolved by deltalake) | P9 |
 | PG replication transport | `pgwire-replication` | `=0.4.1` | S-PG0–8 |
@@ -273,7 +273,7 @@ pub struct TableChangeSet {
 }
 impl TableChangeSet {
     // Upsert batches: schema's fields, then the same unchanged masks (non-identifier columns) in every batch;
-    // delete batches start with the identifier; a key at most once across both; no NULL key;
+    // a non-empty identifier; delete batches start with it; a key at most once across both; no NULL key;
     // the range doesn't run backwards; a slice's range ends at txn_start.
     pub fn validate(&self) -> Result<(), ChangeSetError>;
     pub fn upsert_rows(&self) -> usize; pub fn delete_rows(&self) -> usize; pub fn is_empty(&self) -> bool;
@@ -358,6 +358,7 @@ pub enum StoreError { Conflict { key }, Contention { key }, Transient { key, rea
 - There is no `NotFound`: `get` of a missing object is `Ok(None)`, and an `update` of a missing object is `Conflict` (D-M2.2).
 - `Contention` (S3's 409) and `Transient` on a conditional write are **unknown outcomes**: the write may have landed.
 - The path rules follow config §10: `table_root`, `colocated_state`, `explicit_state`, `globals_state` and `escape_segment`, each returning a `Location { bucket, root }`.
+- `table_root` escapes names with `escape_table_segment` (`~XX`; M4 Q-M4-5): a table root never holds a `%`, because delta-kernel readers decode a table path twice. `escape_segment` (`%XX`) stays for state keys and snapshot file names.
 - `OpenError` and `BucketSpec`'s `Debug` never show an option value.
 
 **State** (`data-avalanche-state`): every document is pretty JSON with `version` first and `deny_unknown_fields`. A document with another schema version is `StateError::UnsupportedVersion`; a malformed one is `Corrupt`. Neither is ever treated as absent.
@@ -489,6 +490,66 @@ orchestrator uses the `Accumulator`. Deferred to later milestones (M3 plan, Devi
 binlog-file position is taken from the event, not the commit boundary (M6); a rename inside an open
 transaction NULLs the renamed column's open values; `add_table` doesn't mark a table halted when its
 buffer can't be created.
+
+### 3.10 The Delta sink (`data-avalanche-sink-delta`, landed in M4)
+
+Path-based Delta tables on delta-rs 1.0 (no catalog in v1). The crate root is the whole public
+surface. Everything else (`convert`, `marker`, `types`, the table handle, the MERGE) is private.
+
+```rust
+pub struct DeltaSinkConfig { pub pipeline_id: String, pub location: DeltaLocation, pub table: TableDefaults,
+                             pub merge_memory_limit: Option<usize> }        // None: no DataFusion memory ceiling
+pub enum DeltaLocation {                                                     // Debug hides option values
+    Local { root: PathBuf },
+    Bucket { backend: Backend, bucket: String, prefix: String, options: Vec<(String, String)> },
+}
+impl DeltaLocation {
+    pub fn table_url(&self, table: &TableRef) -> Result<Url, SinkError>;    // config §10 table_root (~XX names); Permanent if invalid
+    pub fn storage_options(&self, env: impl IntoIterator<Item = (String, String)>) -> HashMap<String, String>;  // Azure: AZURE_* merged
+}
+pub struct TableDefaults { pub checkpoint_interval: u64, pub log_retention: Duration,
+                           pub timestamp_ntz_as: NtzAs, pub table_properties: BTreeMap<String, String> }
+pub enum NtzAs { TimestampNtz, Timestamp, String }
+
+pub struct DeltaSink;                                   // impl Sink: kind Delta; Mirror, AddColumn, Identity transforms
+impl DeltaSink {
+    pub fn new(config: DeltaSinkConfig) -> Self;        // registers the S3/GCS/Azure handlers once
+    pub fn stats(&self) -> DeltaStats;
+    pub async fn content(&self, table: &TableRef) -> Result<Option<RecordBatch>, SinkError>;  // Hop 2 rows, key order
+}
+pub struct DeltaStats { pub commits, pub skipped, pub fenced, pub retries, pub rows_inserted, pub rows_updated,
+                        pub rows_deleted, pub rows_copied, pub files_added, pub files_removed: u64 }   // M10 exports them
+pub const COMMIT_ATTEMPTS: usize = 3;
+pub fn app_id(pipeline_id: &str) -> String;            // the fence's txn app id: data-avalanche/<pipeline>/owner
+pub const POSITION_KEY, EPOCH_KEY, PIPELINE_KEY: &str;  // commitInfo entries of the marker
+pub const TYPE_KEY, IDENTIFIER_KEY: &str;              // Delta column / table metadata: logical type, identifier
+pub const DELETE_FLAG: &str;                           // the MERGE source's delete flag column
+pub const DELTA_MIN_DATE, DELTA_MAX_DATE: i32; pub const DELTA_MIN_MICROS, DELTA_MAX_MICROS: i64;   // Hop 3b clamp (Q-M4-2)
+```
+
+`commit` (per table, one at a time) runs these steps:
+1. **Fence pre-check.** The snapshot's `txn` version for `app_id` is compared with the marker's
+   epoch; a greater one gives `Fenced`.
+2. **Guard.** The walk-back over own `commitInfo` entries stops at the cached own version, after
+   1000 commits, or at a cleaned-up file. If the position covers the set, the result is
+   `SkippedCovered`.
+3. **Truncate**, when the set has one: a DELETE commit with the `txn` but no position. It is
+   retried when files remain: delta-rs 1.0 doesn't refuse a predicate-less DELETE that a
+   concurrent OPTIMIZE outran (it declares no read; probe P11a).
+4. **Write.** One MERGE on the identifier with unchanged masks, carrying the `txn` and the
+   position. A set that changes no row gets a marker-only commit instead.
+
+Errors:
+- A real race (the six `CommitConflict` race variants, `MaxCommitAttempts`, `VersionAlreadyExists`)
+  is retried up to `COMMIT_ATTEMPTS` times, then becomes `Transient`. A zombie that loses a race
+  ends `Fenced`.
+- `Permanent`: data or table errors, Delta validation failures, the other conflict variants,
+  unsupported features, invalid locations.
+- `Transient`: storage and network errors, and a MERGE over `merge_memory_limit`.
+
+`table_state` reads the Hop 2 schema back from the column metadata. Its `marker` is `None` when no
+positioned own commit is in reach. The rulings are D-M4.1…15 (D-IMPL-11), with the plan's
+deviations.
 
 ---
 
@@ -667,6 +728,18 @@ Detailed plan: `M0-foundations.md`.
   - Binary: `data-avalanche run --config <path>` with CLI log overrides, and a minimal HTTP listener serving
     `/health/live`, `/health/ready` and `/metrics`.
   - Metrics for everything built so far.
+- **Carried from M4** (`M4-delta-sink.md`, Deviations):
+  - Route a MERGE that fails over `merge_memory_limit` (`Transient`, but the same set fails the
+    same way every time) to a smaller flush or a table halt, and add the config key.
+  - `marker: None` from `table_state` doesn't mean "no own commit": a truncate's DELETE carries
+    none.
+  - Re-open a Delta table handle after repeated `Transient` errors. This covers a table
+    re-created behind a live handle, `evolve` on such a handle included. A table dropped between
+    `refresh` and the re-open comes back `Permanent` (`NotATable`) and should be `NoTable`.
+  - Refuse a commit whose identifier differs from the table's recorded `data-avalanche.identifier`,
+    together with the identifier-change path.
+  - `Sink::evolve` carries no marker, so a zombie's ADD COLUMN isn't fenced. It is idempotent, but
+    the trait question is open.
 - **Deps:** M1, M2, M3, M4, M5.
 - **Exit:** the **slice-1 E2E suite** passes on PG 18 + RustFS and nightly on PG 14–17. See §5.3 for
   the scenario list.
@@ -869,7 +942,7 @@ fake-gcs FAIL (risk R-3).
 | R-1 | `memberlist` 0.8.5 has never been probed (TLS, metadata size, Lifeguard, runtime-agnostic API) | medium / high | M8 opens with a probe gate; `foca` 2.0 as fallback; everything above membership consumes an owner function, so the swap is contained |
 | R-2 | `object_store` CAS behaves differently from the proven native clients (GCS generation, S3 409, Azure MI) | low / high | T1–T10 re-proof on real clouds in M2 before any lease code depends on it; the proven per-backend stores in `prototypes/lease-conformance` are the fallback. **Re-proven 2026-09-29** on `object_store` 0.14.2 through `Leases` (`tests/lease_conformance.rs`): in memory, RustFS, Azurite, real GCS, real S3 and real Azure all PASS (S3 and Azure: `cloud.yml` run 36604762684) |
 | R-3 | An emulator's conditional writes are incomplete | ~~medium~~ low / low | Measured 2026-09-26: RustFS and Azurite honour Create and Update preconditions; fake-gcs doesn't serve `object_store` at all, so it's replaced by a real bucket (P-10). Real GCS via `object_store` passed the same checks (2026-09-26). Re-checked with `object_store` 0.14.2 the same day: fake-gcs 1.56.1 (= `latest`) still fails the plain PUT. Closed |
-| R-12 | Clamped PG edge dates (Arrow min/max, Q-M5-1) are valid Parquet but some engines can't render years ±5.8M / ±294k | medium / low | M4 type round-trip reads them through DuckDB `delta_scan`; the operator docs list the clamping and the engines checked |
+| R-12 | Clamped PG edge dates (Arrow min/max, Q-M5-1) are valid Parquet but some engines can't render years ±5.8M / ±294k | medium / low | M4 clamps `date` / `timestamp` / `timestamp_ntz` cells to the Delta range 0001-01-01 … 9999-12-31 23:59:59.999999 in Hop 3b (Q-M4-2), and its type round trip reads the bounds through DuckDB `delta_scan`. DuckDB 1.5.6 can't open a table path with non-ASCII text (Q-M4-6). The operator docs (M11) list the clamping, that limit and the engines checked |
 | R-11 | The real GCS bucket makes PR CI depend on credentials, network and cost | low / low | Per-test unique prefixes plus cleanup, a 1-day lifecycle rule on `data-avalanche-it/`, a dedicated CI bucket and service account; fork PRs skip GCS with a notice (P-10) |
 | R-4 | File/position MySQL mode (new per P-4) has unknown resume edge cases (rotation, restart, failover invalidates positions) | medium / medium | Probe S-MY10 opens M7; a changed source server halts the pipeline (`BINLOG_SOURCE_CHANGED`, Q-M7-2) and the operator docs give the recovery (switch to `gtid` or re-snapshot) |
 | R-5 | Delta MERGE cost under random-key churn (D-MS.15) | known / medium | Merge metrics (M4), flush guidance (M11 docs), measured in M12 |
@@ -878,7 +951,7 @@ fake-gcs FAIL (risk R-3).
 | R-8 | `pgwire-replication` =0.4.1 is a young crate (proto v1 only) | medium / medium | Thin wrapper; the decoder is ours; a fork path is documented |
 | R-9 | `serde-saphyr` lacks a strictness or error-location feature the spec needs | ~~low / medium~~ closed | Verified in M1 planning (2026-09-27) against the full M1 implementation in a scratch workspace: every needed feature is there (§2.1). Closed; `serde_yaml_ng` not needed |
 | R-10 | TOAST carry-forward across batches depends on the MERGE update expression (D-IMPL-3) | medium / high | M4 test with an unchanged TOAST column across two flushes; `re_query` strategy as the alternative |
-| R-13 | Two `object_store` versions after M4: ours at 0.14, deltalake 1.0 at `^0.13.2`. Store handles can't be shared across them (e.g. passing our store to delta-rs), and `quick-xml` 0.39.4 (RUSTSEC-2026-0194/0195, fixed in 0.41) comes back through deltalake's copy | known / low | Keep the two apart: the storage crate owns 0.14 for lease/state/config; the Delta sink builds its stores through deltalake's own API. The non-blocking `cargo audit` step reports the advisories. Move to one version when a deltalake release accepts 0.14 (check at M4) |
+| R-13 | Two `object_store` versions after M4: ours at 0.14, deltalake 1.0 at `^0.13.2`. Store handles can't be shared across them (e.g. passing our store to delta-rs), and `quick-xml` 0.39.4 (RUSTSEC-2026-0194/0195, fixed in 0.41) comes back through deltalake's copy | known / low | Keep the two apart: the storage crate owns 0.14 for lease/state/config; the Delta sink builds its stores through deltalake's own API. The non-blocking `cargo audit` step reports the advisories. Move to one version when a deltalake release accepts 0.14. Re-checked at M4 planning (2026-09-30): `deltalake` 1.1.0 still requires `^0.13.2` |
 
 ---
 
@@ -961,6 +1034,7 @@ the naming below (2026-09-26).**
 | D-IMPL-8 | M1 config rulings **D-M1.1…D-M1.15** (listed in `M1-configuration.md` §Decisions and rulings, each pinned by a test). Among them: `Leaf<T>` replaces §4 M1's `Resolvable<T>`; templates allowed in union discriminators; a defaults catalog `type` dropped when the pipeline picks a block; required fields without a V-rule reported as `PARSE`; V-069/V-087 have no failing input in v1; the validate endpoint never returns the resolved config. D-M1.5, D-M1.12 and D-M1.14 were changed at review (Q-M1-4…6) | The spec is silent on these; each choice is the one that keeps a hand-written config valid or safe | M1 — **approved 2026-09-27** |
 | D-IMPL-9 | M2 storage/state rulings **D-M2.1…D-M2.15** (listed in `M2-storage-and-state.md` §Decisions and rulings, each pinned by a test). Among them: `StoreError` is `Conflict` / `Contention` / `Transient` / `Permanent` with no `NotFound` (§3.5 now shows the landed interface); `Timeouts::COORDINATION` bounds a storage call to about 8 s; the lease tombstone keeps `owner_epoch`; config snapshots are the raw text under a content-addressed name with a `blake3:` hash | The specs and research docs are silent on these; each keeps the lease and state safe under races, hangs and hand-edited objects | M2 — **approved 2026-09-28** |
 | D-IMPL-10 | M3 core data-path rulings **D-M3.1…D-M3.18** (listed in `M3-core-data-path.md` §Decisions and rulings, each pinned by a test). Among them: unchanged TOAST fills from the row's previous image, under its old key after a key change; Hop 2 uses `Utf8`/`Binary` with 512 MiB batch rollover; a flush takes only complete transactions and covers `checkpoint..=frontier`; barriers return `FlushRequired` (seal → flush → apply); a split slice ends at its transaction's start and is guard-skipped only when the stored position is strictly past it | The specs are silent on these, or (D-M3.14) were wrong; the property tests prove replay convergence | M3 — **approved 2026-09-30** |
+| D-IMPL-11 | M4 Delta-sink rulings **D-M4.1…D-M4.15** (listed in `M4-delta-sink.md` §Decisions and rulings, each pinned by a test). Among them: every column carries its logical type in the Delta column metadata, so `table_state` reads Hop 2 back; the MERGE matches on the identifier only (no partition pruning); a zombie that loses a race is retried and ends `Fenced`; the walk-back stops at the cached own version, after 1000 commits or at a cleaned-up commit file; a truncate's DELETE carries no position; a set that changes no row gets a marker-only commit | The specs are silent on these; each keeps the fence, the guard or the round trip exact | M4 — **approved 2026-09-30** |
 
 ### 9.1 Questions answered at plan review (2026-09-26)
 
@@ -983,6 +1057,12 @@ the naming below (2026-09-26).**
 | Q-M3-2 (2026-09-29) | `_seq` must sort in source order as text | **A fixed-width form for the `_seq` column only** (`SourceSeq::lineage_text`); `Display` stays canonical | `M3-core-data-path.md`; spec edit S-N |
 | Q-M3-3 (2026-09-29) | `Time(NaiveTime)` can't hold PG `24:00:00` or MySQL `TIME` intervals | **`ColumnValue::Time(i64)`, signed µs** | `M3-core-data-path.md`; `Type_Mapping.md` §Date/time edge values |
 | Q-M3-4 (2026-09-29) | Does the target keep the source's `NOT NULL`? | **No: identifier columns NOT NULL, every other column nullable** | `M3-core-data-path.md`; spec edit S-O |
+| Q-M4-1 (2026-09-30) | `deltalake` 1.0.0 pulls `deltalake-core` 1.1.0 | **Pin `deltalake-core =1.0.0` directly** (§2.1) | `M4-delta-sink.md` |
+| Q-M4-2 (2026-09-30) | delta-rs can't write `Date32` `i32::MIN` (PG `-infinity` after Q-M5-1), and readers can't show years beyond 9999 | **The Delta sink clamps `date` / `timestamp` / `timestamp_ntz` cells to the Delta range** (0001-01-01 … 9999-12-31 23:59:59.999999) in Hop 3b; PG `±infinity` lands on the bounds. Revises Q-M5-1 for Delta | `Type_Mapping.md` §Date/time edge values; `M4-delta-sink.md` |
+| Q-M4-3 (2026-09-30) | Truncate as one commit or two? | **As the spec says: a DELETE commit, then the MERGE** | `M4-delta-sink.md` D-M4.8 |
+| Q-M4-4 (2026-09-30) | Where do the M4 integration tests run? | **Local and RustFS (the exit), plus Azurite, the DuckDB cross-read in CI, and real GCS in PR CI** | `M4-delta-sink.md` Tasks 10–13 |
+| Q-M4-5 (2026-09-30) | delta-kernel decodes a table path twice, so `%XX` escapes break tables named with `%`, `/`, a control character, `.`/`..` | **Table roots escape with `~XX`** (`escape_table_segment`); state keys keep `%XX` | §3.5; `M4-delta-sink.md` Task 1; `M2-storage-and-state.md` D-M2.4 |
+| Q-M4-6 (2026-09-30) | DuckDB can't open a Delta table under a non-ASCII path | **Keep non-ASCII names verbatim**; the operator docs list the limit (R-12) | `M4-delta-sink.md` |
 | Q-M9-1 | Snapshot-job persistence | **Persisted in the pipeline state location** (`snapshots/jobs/<job_id>.json`); listed after a restart or failover via `GET /v1/pipelines/{id}/snapshots`; a running job continues on the new owner from its chunk cursors | `Data-Flow.md` §On-Demand Snapshot + State Layout; System-Overview and API_RBAC endpoint tables |
 
 ### 9.2 Open questions (answer before the named milestone)
