@@ -33,6 +33,8 @@ pub struct SplitInfo {
 /// Multi_Sink §6.2).
 ///
 /// Invariants ([`TableChangeSet::validate`]):
+/// - `identifier` names at least one column (a table without a key halts before it gets here,
+///   Ghost_Row_Dedup §3);
 /// - every upsert batch has `schema`'s fields, then zero or more unchanged-mask columns
 ///   ([`UNCHANGED_MASK_PREFIX`]), the same for every batch;
 /// - every delete batch starts with the identifier columns;
@@ -80,6 +82,9 @@ impl TableChangeSet {
             table: self.table.clone(),
             detail,
         };
+        if self.identifier.is_empty() {
+            return Err(err("a change set with no identifier columns".into()));
+        }
         let canonical = self.schema.fields();
         let mut upsert_extra: Option<Vec<String>> = None;
         for b in &self.upserts {
@@ -276,6 +281,13 @@ mod tests {
     fn identifier_values_are_never_null() {
         let d = detail(cs(vec![], vec![deletes(&[None])]));
         assert!(d.contains("NULL in identifier column \"id\""), "{d}");
+    }
+
+    #[test]
+    fn a_change_set_has_an_identifier() {
+        let mut c = cs(vec![upserts(&[1], None)], vec![]);
+        c.identifier.clear();
+        assert!(detail(c).contains("no identifier columns"));
     }
 
     #[test]
