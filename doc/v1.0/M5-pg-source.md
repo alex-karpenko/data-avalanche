@@ -4352,7 +4352,7 @@ The conversions keep every value of the source type:
 - `timestamp_ntz` ↔ `timestamp_tz`: the wall clock read as UTC, as `timestamp_ntz_as: timestamp`
   does;
 - `date` → `timestamp_ntz` or `timestamp_tz`: midnight. `±infinity` stays infinite, and a date
-  beyond 294276 AD clamps like a timestamp there (Q-M5-1);
+  from 294247 AD on (past the `i64` microsecond range) clamps like a timestamp there (Q-M5-1);
 - `list<T>` → `list<U>`, element by element.
 
 Anything else still halts at resolution (`SCHEMA_MISMATCH`), and `string` stays the way out. That
