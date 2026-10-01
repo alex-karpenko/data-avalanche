@@ -172,6 +172,7 @@ impl PgConnector {
         let mut schemas = self.schemas(&oids).await?;
         let mut out = ResolvedTables {
             skipped: selection.skipped,
+            halted: selection.halted,
             warnings: selection.warnings,
             ..ResolvedTables::default()
         };
@@ -202,7 +203,13 @@ impl PgConnector {
                 Err(reason) => out.halted.push((relation.table, reason)),
             }
         }
-        let resolved: Vec<TableRef> = out.tables.iter().map(|s| s.table().clone()).collect();
+        // Halted tables are in the set: their per-table config keys aren't stale (V-106).
+        let resolved: Vec<TableRef> = out
+            .tables
+            .iter()
+            .map(|s| s.table().clone())
+            .chain(out.halted.iter().map(|(t, _)| t.clone()))
+            .collect();
         let mut report = check_table_set(&self.pipeline, &resolved);
         report.extend(check_unbounded_numeric(&self.pipeline, &unconstrained));
         if let Some(e) = report.errors.first() {

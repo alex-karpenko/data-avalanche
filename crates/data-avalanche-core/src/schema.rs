@@ -117,6 +117,8 @@ pub enum HaltReason {
     SchemaMismatch { column: String, detail: String },
     #[error("identifier column {column:?} is NULL")]
     NullIdentifier { column: String },
+    #[error("the source can't replicate this table: {reason}")]
+    NotReplicable { reason: String },
 }
 
 impl HaltReason {
@@ -134,6 +136,7 @@ impl HaltReason {
             Self::InvalidDateValue { .. } => "INVALID_DATE_VALUE",
             Self::SchemaMismatch { .. } => "SCHEMA_MISMATCH",
             Self::NullIdentifier { .. } => "NULL_IDENTIFIER",
+            Self::NotReplicable { .. } => "TABLE_NOT_REPLICABLE",
         }
     }
 }
@@ -422,6 +425,7 @@ mod tests {
                 detail: "d".into(),
             },
             HaltReason::NullIdentifier { column: "c".into() },
+            HaltReason::NotReplicable { reason: "r".into() },
         ];
         let codes: std::collections::BTreeSet<_> = all.iter().map(HaltReason::code).collect();
         assert_eq!(codes.len(), all.len());

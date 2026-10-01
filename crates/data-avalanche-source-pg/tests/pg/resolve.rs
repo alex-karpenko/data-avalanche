@@ -32,7 +32,7 @@ async fn preflight_refuses_a_user_who_cant_log_in() {
     };
     let e = connector(&p).preflight().await.unwrap_err();
     assert!(
-        matches!(&e, data_avalanche_core::SourceError::Permanent(m) if m.contains("28")),
+        matches!(&e, data_avalanche_core::SourceError::Permanent(m) if m.contains("SQLSTATE 28")),
         "an authentication failure is permanent: {e:?}"
     );
     cleanup(&a, &n).await;
@@ -56,6 +56,8 @@ const DDL: &str = "
     CREATE TABLE events (id int, at date, PRIMARY KEY (id, at)) PARTITION BY RANGE (at);
     CREATE TABLE events_2024 PARTITION OF events FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
     CREATE TABLE tmp_x (id int PRIMARY KEY);
+    CREATE UNLOGGED TABLE cache (id int PRIMARY KEY);
+    CREATE UNLOGGED TABLE cache_named (id int PRIMARY KEY);
 ";
 
 #[tokio::test]
@@ -64,9 +66,15 @@ async fn channel_a_resolves_checks_and_skips() {
     let a = admin().await;
     let n = fresh(&a, "resolve", DDL).await;
     let s = &n.schema;
-    let tables =
-        format!("      exclude: [{s}.tmp_*]\n      primary_key: {{ {s}.by_index: [code] }}");
-    let c = connector(&pipeline(&n, &["*", "nopk_named", "missing"], &tables, ""));
+    let tables = format!(
+        "      exclude: [{s}.tmp_*]\n      primary_key: {{ {s}.by_index: [code], {s}.nothing: [id] }}"
+    );
+    let c = connector(&pipeline(
+        &n,
+        &["*", "nopk_named", "cache_named", "missing"],
+        &tables,
+        "",
+    ));
     let r = resolved(&c).await;
 
     let names: Vec<&str> = r.tables.iter().map(|t| t.table().name.as_str()).collect();
@@ -135,6 +143,11 @@ async fn channel_a_resolves_checks_and_skips() {
     assert!(r.warnings.contains(&wide), "{:?}", r.warnings);
     let missing = format!("tables.include {s}.missing matches no table");
     assert!(r.warnings.contains(&missing), "{:?}", r.warnings);
+    assert!(
+        !r.warnings.iter().any(|w| w.starts_with("V-106")),
+        "a halted table's primary_key entry isn't stale: {:?}",
+        r.warnings
+    );
 
     let halted: Vec<(&str, &str)> = r
         .halted
@@ -144,13 +157,14 @@ async fn channel_a_resolves_checks_and_skips() {
     assert_eq!(
         halted,
         [
+            ("cache_named", "TABLE_NOT_REPLICABLE"),
             ("nopk_named", "NO_IDENTIFIER"),
             ("nothing", "IDENTIFIER_NOT_IN_REPLICA_IDENTITY"),
             ("reserved", "RESERVED_COLUMN_COLLISION"),
         ]
     );
     assert_eq!(
-        r.halted[1].1,
+        r.halted[2].1,
         HaltReason::IdentifierNotInReplicaIdentity {
             missing: vec!["id".into()]
         }
@@ -158,8 +172,8 @@ async fn channel_a_resolves_checks_and_skips() {
     let skipped: Vec<&str> = r.skipped.iter().map(|(t, _)| t.name.as_str()).collect();
     assert_eq!(
         skipped,
-        ["events", "nopk"],
-        "a partitioned parent and a glob-matched PK-less table"
+        ["cache", "events", "nopk"],
+        "a glob-matched unlogged table, a partitioned parent and a glob-matched PK-less table"
     );
     cleanup(&a, &n).await;
 }

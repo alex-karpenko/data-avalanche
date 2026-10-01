@@ -37,6 +37,8 @@ pub struct Relation {
     pub table: TableRef,
     /// `r` table (including a leaf partition), `p` partitioned table.
     pub kind: u8,
+    /// `relpersistence = 'p'`. PostgreSQL doesn't replicate an unlogged table.
+    pub logged: bool,
 }
 
 /// What the globs selected.
@@ -45,12 +47,16 @@ pub struct Selection {
     /// Tables to describe; `true` when a pattern without `*` named the table.
     pub tables: Vec<(Relation, bool)>,
     pub skipped: Vec<(TableRef, String)>,
+    /// Named tables the source can't replicate.
+    pub halted: Vec<(TableRef, HaltReason)>,
     pub warnings: Vec<String>,
 }
 
 /// Applies `include` minus `exclude` to the catalog's tables. A partitioned parent isn't a table
 /// of its own (Q-M5-5): it is skipped with a warning naming its partitions as the way to track
-/// it. An include pattern that matches nothing warns.
+/// it. An unlogged table isn't replicated by PostgreSQL: skipped with a warning when a glob found
+/// it, halted (`TABLE_NOT_REPLICABLE`) when its name was listed. An include pattern that matches
+/// nothing warns.
 pub fn select(include: &[String], exclude: &[String], relations: &[Relation]) -> Selection {
     let mut out = Selection::default();
     for p in include {
@@ -75,6 +81,19 @@ pub fn select(include: &[String], exclude: &[String], relations: &[Relation]) ->
                 "a partitioned table: its changes arrive under its partitions; include those"
                     .into(),
             ));
+            continue;
+        }
+        if !r.logged {
+            let why =
+                "an unlogged table: PostgreSQL doesn't replicate it (ALTER TABLE … SET LOGGED)";
+            if explicit {
+                out.halted.push((
+                    r.table.clone(),
+                    HaltReason::NotReplicable { reason: why.into() },
+                ));
+            } else {
+                out.skipped.push((r.table.clone(), why.into()));
+            }
             continue;
         }
         out.tables.push((r.clone(), explicit));
@@ -226,7 +245,7 @@ pub fn table_schema(
 pub async fn relations(client: &Client) -> Result<Vec<Relation>, tokio_postgres::Error> {
     let rows = client
         .query(
-            "SELECT c.oid, n.nspname, c.relname, c.relkind::text
+            "SELECT c.oid, n.nspname, c.relname, c.relkind::text, c.relpersistence = 'p'
                FROM pg_catalog.pg_class c
                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
               WHERE c.relkind IN ('r', 'p')
@@ -241,6 +260,7 @@ pub async fn relations(client: &Client) -> Result<Vec<Relation>, tokio_postgres:
             oid: r.get(0),
             table: TableRef::new(r.get::<_, String>(1), r.get::<_, String>(2)),
             kind: r.get::<_, String>(3).as_bytes()[0],
+            logged: r.get(4),
         })
         .collect())
 }
@@ -410,6 +430,7 @@ mod tests {
             oid,
             table: TableRef::new(s, t),
             kind,
+            logged: true,
         }
     }
 
@@ -457,6 +478,28 @@ mod tests {
         );
         let explicit = select(&s(&["public.*", "public.orders"]), &[], &relations[..1]);
         assert!(explicit.tables[0].1, "an exact name wins over a glob");
+    }
+
+    #[test]
+    fn unlogged_tables_are_skipped_or_halted() {
+        let unlogged = |oid, t| Relation {
+            logged: false,
+            ..rel(oid, "public", t, b'r')
+        };
+        let relations = [
+            rel(1, "public", "orders", b'r'),
+            unlogged(2, "cache"),
+            unlogged(3, "cache_named"),
+        ];
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let sel = select(&s(&["public.*", "public.cache_named"]), &[], &relations);
+        let got: Vec<u32> = sel.tables.iter().map(|(r, _)| r.oid).collect();
+        assert_eq!(got, [1]);
+        assert_eq!(sel.skipped.len(), 1, "a glob-matched unlogged table");
+        assert_eq!(sel.skipped[0].0, TableRef::new("public", "cache"));
+        assert_eq!(sel.halted.len(), 1, "a named unlogged table");
+        assert_eq!(sel.halted[0].0, TableRef::new("public", "cache_named"));
+        assert_eq!(sel.halted[0].1.code(), "TABLE_NOT_REPLICABLE");
     }
 
     fn attr(
