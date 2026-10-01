@@ -152,6 +152,7 @@ the arrow.
 | Q-M5-8 | A bare `numeric` under `numeric_overflow_action: error` | **`decimal(38,18)`, halting per value**: a value that doesn't fit halts the table (`NUMERIC_OVERFLOW`); V-079 warns at resolution |
 | Q-M5-9 | The `varbit` value layout ("length-prefixed") | **PostgreSQL's binary form**: a 4-byte big-endian bit count, then the bits packed MSB-first, the last byte zero-padded |
 | Q-M5-10 | libpq treats `sslmode=require` with a root CA file as `verify-ca`. Should `require` with `ssl_ca` set check the chain? | **No: `require` encrypts without checking the chain**, on both connections, whether or not `ssl_ca` is set (D-M5.16). Only `verify-ca` and `verify-full` check it |
+| Q-M5-12 (2026-10-01, during execution) | An override other than `string` or a decimal on a numeric column had to equal the mapped type: `int → int64` halted, and `timestamp_ntz_as: timestamp` had no per-column form | **Lossless conversions at Hop 1** (Task 5b): integer widening, an integer to a decimal with room, `float32 → float64`, `timestamp_ntz ↔ timestamp_tz`, `date → timestamp_*`, lists element by element, through one table in core for every source; anything else halts (`SCHEMA_MISMATCH`). Config §9.3 lists them |
 
 **Rulings where the specs are silent** (each is pinned by a test). **Plan approved 2026-10-01**, with these rulings (roadmap D-IMPL-12):
 
@@ -166,7 +167,7 @@ the arrow.
 | D-M5.7 | The stream passes every transaction boundary, empty ones included (PostgreSQL 14 sends a Begin/Commit for each transaction of the database; 15 and later skip empty ones). Changes to untracked tables are dropped. Keep-alives come only between transactions | D-IMPL-2: idle tables advance with the frontier, and WAL is released on an idle pipeline | Task 9 (`untracked_tables_busy_slots_and_keepalives`) |
 | D-M5.8 | Preflight requires PostgreSQL ≥ 14, `wal_level = logical`, a UTF8 database and SELECT on the catalog. A role without the REPLICATION attribute gets a warning, not a refusal | Managed services grant replication through role membership (`rds_replication`); the replication connection itself is the real check | Task 7 (`preflight_accepts_the_test_server`, `preflight_refuses_a_user_who_cant_log_in`) |
 | D-M5.9 | Numerics. `numeric(P,S)` with P ≤ 38 → `decimal(P,S)`. A negative scale → `decimal(P+|S|, 0)`. S > P → `decimal(S,S)`. P > 38 under `string` → text with a warning, and under `error` → a halt at resolution. A bare `numeric` → text under `string`, `decimal(38,18)` under `error` (Q-M5-8). NaN and `±Infinity` → `SCHEMA_MISMATCH` halt. `money` → `decimal(19,2)` | Type_Mapping's cap, filled in where it is silent | Task 4, Task 5 (`numeric_precision_rules`) |
-| D-M5.10 | Overrides. `string` reads the column as its PostgreSQL text. `decimal(P,S)` on a `numeric` or `money` base (through domains) decodes as that decimal. Any other override must be Hop 2-compatible with the column's mapped type, or the table halts (`SCHEMA_MISMATCH`). Other fallbacks: multi-dimensional arrays halt; array bound decorations are dropped; PostGIS hex EWKB → bytes; hstore → a JSON object; unknown types → their text with a warning | Config §9.3 `column_type_overrides`; the fallback chain of Type_Mapping | Task 5 (`overrides`, `user_and_extension_types`, `arrays_follow_their_element`) |
+| D-M5.10 | Overrides. `string` reads the column as its PostgreSQL text. `decimal(P,S)` on a `numeric` or `money` base (through domains) decodes as that decimal. Any other override must be Hop 2-compatible with the column's mapped type or a lossless conversion (Q-M5-12, Task 5b), or the table halts (`SCHEMA_MISMATCH`). Other fallbacks: multi-dimensional arrays halt; array bound decorations are dropped; PostGIS hex EWKB → bytes; hstore → a JSON object; unknown types → their text with a warning | Config §9.3 `column_type_overrides`; the fallback chain of Type_Mapping | Task 5 (`overrides`, `user_and_extension_types`, `arrays_follow_their_element`), Task 5b (`overrides_convert_losslessly`) |
 | D-M5.11 | Selection. System schemas (`pg_*`, `information_schema`) are never matched. A glob `*` stays inside one name segment and is case-sensitive. An explicit name that matches nothing warns. Generated columns (`attgenerated <> ''`) are left out | Config §9.3; pgoutput doesn't send generated columns | Task 6 (`globs_stay_inside_a_name`, `selection`) |
 | D-M5.12 | Identifier. The override, else the primary key. It must lie within the replica identity (an index, FULL, or the default primary key), else the table halts (`IDENTIFIER_NOT_IN_REPLICA_IDENTITY`). No identifier: a glob-matched table is skipped with a warning, a named one halts | Ghost_Row_Dedup §PK policy; a delete must carry the identifier | Task 6 (`identifiers_and_replica_identity`), Task 7 (`channel_a_resolves_checks_and_skips`) |
 | D-M5.13 | The slot state table (`decide`). Checkpoint and slot → `Resume`, except: another plugin or database → `Refuse`; invalidated, or `confirmed_flush` past the checkpoint → `Recreate(PositionLost)` under `managed`, `Refuse` under `require_existing`. A checkpoint and no slot → `Create(PositionLost)` under `managed`, else `Refuse`. A slot and no checkpoint (an orphan) → `Refuse` under `on_orphan: halt`; `Adopt` (advance to the current WAL, then snapshot) under `adopt_resnapshot`, `require_existing` included; an invalidated orphan → `Recreate(AdoptedOrphan)` under `managed`, else `Refuse`. Neither → `Create(FirstStart)` under `managed`, else `Refuse` | Postgres_Slot… §1–§3. A slot past the checkpoint has released WAL the pipeline still needs | Task 8 (the seven `decide` tests, the integration cells) |
@@ -224,6 +225,7 @@ No spec edit is needed. Config §9.3's numeric text already allows Q-M5-8 (V-079
 |---|---|
 | `Cargo.toml` | Workspace: the new crate; `pgwire-replication`, `tokio-postgres-rustls`, `webpki-roots` |
 | `crates/data-avalanche-core/src/source.rs`, `…/lib.rs` | The source contract: `SourceConnector`, `ChangeStream`, `StreamItem`, `SourceError`, the result types, `identifier_values` |
+| `crates/data-avalanche-core/src/convert.rs` | The lossless override conversions: `conversion`, `ColumnValue::convert` (Q-M5-12) |
 | `crates/data-avalanche-source-pg/Cargo.toml` | The crate and its dependencies |
 | `…-source-pg/src/lib.rs` | Modules, root re-exports, crate docs |
 | `…-source-pg/src/error.rs` | SQLSTATE and client-error classes → `SourceError` |
@@ -4313,6 +4315,591 @@ Expected: no warnings, no output.
 git add crates/data-avalanche-source-pg/src/lib.rs \
   crates/data-avalanche-source-pg/src/types.rs
 git commit -m "feat(source-pg): type planning"
+```
+
+---
+
+### Task 5b: Lossless override conversions (Q-M5-12)
+
+**Files:**
+- Create: `crates/data-avalanche-core/src/convert.rs`
+- Modify: `crates/data-avalanche-core/src/lib.rs`
+- Modify: `crates/data-avalanche-source-pg/src/value.rs`
+- Modify: `crates/data-avalanche-source-pg/src/types.rs`
+
+**Interfaces:**
+- Consumes: `ColumnValue`, `ColumnValueType`, `Decimal`, `LogicalType` (core); `Decode`, `decode`
+  (Task 4); `plan_column` (Task 5).
+- Produces:
+  - core: `conversion(&ColumnValueType, &LogicalType) -> Option<ColumnValueType>` (re-exported at
+    the root) and `ColumnValue::convert(self, &ColumnValueType) -> ColumnValue`. The MySQL source
+    (M7) plans with the same pair.
+  - source-pg: `Decode::Convert { from: Box<Decode>, to: ColumnValueType }`. `plan_column` plans a
+    lossless conversion where it used to halt.
+
+Added during execution, after Task 5's review (owner decision Q-M5-12, 2026-10-01). Until now an
+override other than `string` or a decimal on a numeric column had to equal the column's mapped type,
+or the table halted. So `int → int64` halted, and `timestamp_ntz_as: timestamp` had no per-column
+form, although config §9.3 says a per-column override takes precedence over it. Hop 2 converts
+nothing (D-M3.6), so the conversion happens at Hop 1: the decoder decodes as before, then converts.
+
+The conversions keep every value of the source type:
+- `int16` → `int32`, `int64`, `float64`; `int32` → `int64`, `float64`;
+- an integer → `decimal(P,S)` with room for every value: `P - S` at least 5 (`int16`), 10 (`int32`)
+  or 19 (`int64`);
+- `float32` → `float64`, through the shortest decimal text (`0.1` stays `0.1`, as PostgreSQL prints
+  it, not `0.10000000149011612`);
+- `timestamp_ntz` ↔ `timestamp_tz`: the wall clock read as UTC, as `timestamp_ntz_as: timestamp`
+  does;
+- `date` → `timestamp_ntz` or `timestamp_tz`: midnight. `±infinity` stays infinite, and a date
+  beyond 294276 AD clamps like a timestamp there (Q-M5-1);
+- `list<T>` → `list<U>`, element by element.
+
+Anything else still halts at resolution (`SCHEMA_MISMATCH`), and `string` stays the way out. That
+covers narrowing, a float to a decimal, a decimal to a float, `int64` → `float64`, `timestamp` →
+`date`, and text parsed as `uuid` or `json`. A converted key column still works for snapshot chunks: the cursor
+goes back to PostgreSQL as the converted value's text, cast to the column's type:
+- `'5'::int4` for an `int64` value;
+- a `+00` text read as a `date` or `timestamp`, which ignores the zone;
+- a zone-less text read as a `timestamptz`, under the pinned `TimeZone=UTC`.
+
+Task 12's `overrides_convert_through_stream_and_snapshot` checks this on a live server.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `crates/data-avalanche-core/src/convert.rs` with only its test module. The implementation goes above it in Step 3:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ColumnValue as C;
+    use ColumnValueType as V;
+    use LogicalType as L;
+
+    fn dec(precision: u8, scale: i8) -> L {
+        L::Decimal { precision, scale }
+    }
+
+    #[test]
+    fn integers_widen() {
+        assert_eq!(conversion(&V::Int16, &L::Int32), Some(V::Int32));
+        assert_eq!(conversion(&V::Int16, &L::Int64), Some(V::Int64));
+        assert_eq!(conversion(&V::Int32, &L::Int64), Some(V::Int64));
+        assert_eq!(conversion(&V::Int32, &L::Float64), Some(V::Float64));
+        assert_eq!(conversion(&V::Float32, &L::Float64), Some(V::Float64));
+        assert_eq!(C::Int16(i16::MIN).convert(&V::Int64), C::Int64(-32_768));
+        assert_eq!(
+            C::Int32(i32::MAX).convert(&V::Int64),
+            C::Int64(2_147_483_647)
+        );
+        assert_eq!(C::Int32(-7).convert(&V::Float64), C::Float64(-7.0));
+        assert_eq!(C::Float32(0.1).convert(&V::Float64), C::Float64(0.1));
+        assert_eq!(
+            C::Float32(f32::NEG_INFINITY).convert(&V::Float64),
+            C::Float64(f64::NEG_INFINITY)
+        );
+        assert!(matches!(
+            C::Float32(f32::NAN).convert(&V::Float64),
+            C::Float64(f) if f.is_nan()
+        ));
+    }
+
+    #[test]
+    fn integers_to_decimals_with_room() {
+        assert_eq!(
+            conversion(&V::Int32, &dec(12, 2)),
+            Some(V::Numeric {
+                precision: 12,
+                scale: 2
+            })
+        );
+        assert_eq!(
+            conversion(&V::Int32, &dec(11, 2)),
+            None,
+            "10 digits need P - S ≥ 10"
+        );
+        assert!(conversion(&V::Int16, &dec(5, 0)).is_some());
+        assert!(conversion(&V::Int64, &dec(19, 0)).is_some());
+        assert_eq!(conversion(&V::Int64, &dec(38, 20)), None);
+        let v = C::Int64(i64::MIN).convert(&V::Numeric {
+            precision: 19,
+            scale: 0,
+        });
+        assert_eq!(v, C::Numeric(Decimal::new(i64::MIN.into(), 0)));
+        assert!(v.fits(&V::Numeric {
+            precision: 19,
+            scale: 0
+        }));
+        assert!(
+            C::Int32(5)
+                .convert(&V::Numeric {
+                    precision: 12,
+                    scale: 2
+                })
+                .fits(&V::Numeric {
+                    precision: 12,
+                    scale: 2
+                })
+        );
+    }
+
+    #[test]
+    fn timestamps_and_dates() {
+        let (ntz, tz) = (
+            V::Timestamp { with_tz: false },
+            V::Timestamp { with_tz: true },
+        );
+        assert_eq!(conversion(&ntz, &L::TimestampTz), Some(tz.clone()));
+        assert_eq!(conversion(&tz, &L::TimestampNtz), Some(ntz.clone()));
+        assert_eq!(conversion(&V::Date, &L::TimestampTz), Some(tz.clone()));
+        assert_eq!(conversion(&V::Date, &L::TimestampNtz), Some(ntz.clone()));
+        let at = C::Timestamp {
+            micros: 1_700_000_000_000_000,
+            with_tz: false,
+        };
+        assert_eq!(
+            at.convert(&tz),
+            C::Timestamp {
+                micros: 1_700_000_000_000_000,
+                with_tz: true
+            },
+            "the wall clock read as UTC"
+        );
+        assert_eq!(
+            C::Date(19_723).convert(&ntz),
+            C::Timestamp {
+                micros: 19_723 * DAY_MICROS,
+                with_tz: false
+            }
+        );
+        assert_eq!(
+            C::Date(-1).convert(&tz),
+            C::Timestamp {
+                micros: -DAY_MICROS,
+                with_tz: true
+            }
+        );
+        for (d, micros) in [
+            (i32::MAX, i64::MAX),
+            (i32::MIN, i64::MIN),
+            (2_000_000_000, i64::MAX),
+            (-2_000_000_000, i64::MIN),
+        ] {
+            assert_eq!(
+                C::Date(d).convert(&tz),
+                C::Timestamp {
+                    micros,
+                    with_tz: true
+                },
+                "±infinity and dates beyond the range clamp"
+            );
+        }
+    }
+
+    #[test]
+    fn lists_convert_their_elements() {
+        let to = conversion(&V::Array(Box::new(V::Int32)), &L::List(Box::new(L::Int64)));
+        assert_eq!(to, Some(V::Array(Box::new(V::Int64))));
+        let v = C::Array {
+            element_type: V::Int32,
+            values: vec![C::Int32(1), C::Null],
+        };
+        assert_eq!(
+            v.convert(to.as_ref().unwrap()),
+            C::Array {
+                element_type: V::Int64,
+                values: vec![C::Int64(1), C::Null]
+            }
+        );
+        assert_eq!(
+            conversion(&V::Array(Box::new(V::Int64)), &L::List(Box::new(L::Int32))),
+            None
+        );
+    }
+
+    #[test]
+    fn nothing_else_converts() {
+        for (from, to) in [
+            (V::Int64, L::Int32),
+            (V::Int32, L::Int16),
+            (V::Int64, L::Float64),
+            (V::Int32, L::Float32),
+            (V::Float64, L::Float32),
+            (V::Float64, dec(38, 10)),
+            (
+                V::Numeric {
+                    precision: 10,
+                    scale: 2,
+                },
+                L::Float64,
+            ),
+            (V::Timestamp { with_tz: false }, L::Date),
+            (V::Timestamp { with_tz: false }, L::TimestampNtz),
+            (V::Text, L::Uuid),
+            (V::Text, L::Json),
+            (V::Bool, L::Int32),
+            (V::UInt64, L::Float64),
+            (V::Int32, L::List(Box::new(L::Int32))),
+        ] {
+            assert_eq!(conversion(&from, &to), None, "{from:?} → {to}");
+        }
+        assert_eq!(C::Null.convert(&V::Int64), C::Null);
+        assert_eq!(C::Unchanged.convert(&V::Int64), C::Unchanged);
+    }
+}
+```
+
+Change `crates/data-avalanche-core/src/lib.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-core/src/lib.rs b/crates/data-avalanche-core/src/lib.rs
+--- a/crates/data-avalanche-core/src/lib.rs
++++ b/crates/data-avalanche-core/src/lib.rs
+@@ -9,6 +9,7 @@
+ pub mod change_set;
+ pub mod classify;
+ pub mod columnar;
++pub mod convert;
+ pub mod decimal;
+ pub mod event;
+ pub mod logical;
+@@ -25,6 +26,7 @@
+     LIST_ELEMENT, LOGICAL_TAG, UNCHANGED_MASK_PREFIX, added_column_field, arrow_type, column_field,
+     delete_schema, lineage_fields, logical_tag, unchanged_mask_field, upsert_schema,
+ };
++pub use convert::conversion;
+ pub use decimal::{Decimal, DecimalError, MAX_DECIMAL_PRECISION};
+ pub use event::{CdcEvent, EventShapeError, Op, SourceSeq, TransactionBoundary};
+ pub use logical::{LogicalType, LogicalTypeError, MAX_LIST_DEPTH};
+```
+
+Change `crates/data-avalanche-source-pg/src/types.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-source-pg/src/types.rs b/crates/data-avalanche-source-pg/src/types.rs
+--- a/crates/data-avalanche-source-pg/src/types.rs
++++ b/crates/data-avalanche-source-pg/src/types.rs
+@@ -746,6 +746,74 @@
+     }
+ 
+     #[test]
++    fn overrides_convert_losslessly() {
++        let c = catalog();
++        let col = |oid, over: LogicalType| plan_column("c", oid, -1, &c, S, Some(&over));
++        let wide = col(23, LogicalType::Int64).unwrap();
++        assert_eq!(
++            (wide.value_type, wide.logical, wide.decode),
++            (
++                V::Int64,
++                LogicalType::Int64,
++                Decode::Convert {
++                    from: Box::new(Decode::Int32),
++                    to: V::Int64
++                }
++            )
++        );
++        let tz = col(1114, LogicalType::TimestampTz).unwrap();
++        assert_eq!(tz.value_type, V::Timestamp { with_tz: true });
++        let midnight = col(1082, LogicalType::TimestampNtz).unwrap();
++        assert_eq!(midnight.value_type, V::Timestamp { with_tz: false });
++        let money = col(
++            21,
++            LogicalType::Decimal {
++                precision: 7,
++                scale: 2,
++            },
++        )
++        .unwrap();
++        assert_eq!(
++            money.value_type,
++            V::Numeric {
++                precision: 7,
++                scale: 2
++            }
++        );
++        let list = col(1007, LogicalType::List(Box::new(LogicalType::Int64))).unwrap();
++        assert_eq!(list.value_type, V::Array(Box::new(V::Int64)));
++        assert_eq!(
++            crate::value::decode(&list.decode, "{1,NULL,-2147483648}").unwrap(),
++            data_avalanche_core::ColumnValue::Array {
++                element_type: V::Int64,
++                values: vec![
++                    data_avalanche_core::ColumnValue::Int64(1),
++                    data_avalanche_core::ColumnValue::Null,
++                    data_avalanche_core::ColumnValue::Int64(-2_147_483_648),
++                ],
++            }
++        );
++        for (oid, over) in [
++            (20, LogicalType::Int32),
++            (
++                23,
++                LogicalType::Decimal {
++                    precision: 9,
++                    scale: 0,
++                },
++            ),
++            (1114, LogicalType::Date),
++            (25, LogicalType::Uuid),
++        ] {
++            assert_eq!(
++                col(oid, over).unwrap_err().code(),
++                "SCHEMA_MISMATCH",
++                "oid {oid}: lossy or parsing"
++            );
++        }
++    }
++
++    #[test]
+     fn a_decimal_list_override_rescues_a_numeric_array() {
+         let c = catalog();
+         let list = |p, s| {
+@@ -786,11 +854,11 @@
+             })),
+             "an array of a numeric domain"
+         );
+-        let e = col(1007, -1, S, &list(38, 10)).unwrap_err();
++        let e = col(1000, -1, S, &list(38, 10)).unwrap_err();
+         assert_eq!(
+             e.code(),
+             "SCHEMA_MISMATCH",
+-            "an int4[] isn't a numeric array"
+-        );
+-    }
+-}
++            "a bool[] isn't a numeric array"
++        );
++    }
++}
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cargo test -p data-avalanche-core --lib convert::`
+
+Expected: FAIL to compile. The first errors:
+
+```text
+error[E0432]: unresolved import `convert::conversion`
+error[E0432]: unresolved import `ColumnValue`
+error[E0432]: unresolved import `ColumnValueType`
+error[E0432]: unresolved import `LogicalType`
+```
+
+- [ ] **Step 3: Implement**
+
+Add the implementation to `crates/data-avalanche-core/src/convert.rs`, above the test module:
+
+```rust
+//! The conversions a `tables.column_type_overrides` entry may ask for (config §9.3), applied by
+//! the source at Hop 1: Hop 2 converts nothing (D-M3.6). Only conversions that keep every value of
+//! the source type are offered; anything else is `string`, a decimal override or a halt.
+
+use crate::{ColumnValue, ColumnValueType, Decimal, LogicalType};
+
+/// Microseconds in a day.
+const DAY_MICROS: i64 = 86_400_000_000;
+
+/// The value type a column of `from` is converted to for an override of `to`, or `None` when no
+/// conversion applies (the types already match, or the conversion could lose a value):
+/// - `int16` → `int32`, `int64`, `float64`; `int32` → `int64`, `float64`;
+/// - an integer → `decimal(P,S)` with room for its every value: `P - S` at least 5 (`int16`), 10
+///   (`int32`) or 19 (`int64`);
+/// - `float32` → `float64`;
+/// - `timestamp_ntz` ↔ `timestamp_tz`: the wall clock read as UTC, as `timestamp_ntz_as:
+///   timestamp` does;
+/// - `date` → `timestamp_ntz` or `timestamp_tz`: midnight;
+/// - `list<T>` → `list<U>`: element by element.
+pub fn conversion(from: &ColumnValueType, to: &LogicalType) -> Option<ColumnValueType> {
+    use ColumnValueType as V;
+    use LogicalType as L;
+    let digits = |t: &V| match t {
+        V::Int16 => Some(5),
+        V::Int32 => Some(10),
+        V::Int64 => Some(19),
+        _ => None,
+    };
+    Some(match (from, to) {
+        (V::Int16, L::Int32) => V::Int32,
+        (V::Int16 | V::Int32, L::Int64) => V::Int64,
+        (V::Int16 | V::Int32 | V::Float32, L::Float64) => V::Float64,
+        (t, L::Decimal { precision, scale })
+            if digits(t).is_some_and(|d| i16::from(*precision) - i16::from(*scale) >= d) =>
+        {
+            V::Numeric {
+                precision: *precision,
+                scale: *scale,
+            }
+        }
+        (V::Timestamp { with_tz: false }, L::TimestampTz) => V::Timestamp { with_tz: true },
+        (V::Timestamp { with_tz: true }, L::TimestampNtz) => V::Timestamp { with_tz: false },
+        (V::Date, L::TimestampTz) => V::Timestamp { with_tz: true },
+        (V::Date, L::TimestampNtz) => V::Timestamp { with_tz: false },
+        (V::Array(e), L::List(l)) => V::Array(Box::new(conversion(e, l)?)),
+        _ => return None,
+    })
+}
+
+impl ColumnValue {
+    /// The value as type `to`, which [`conversion`] returned for the value's own type. NULL and
+    /// [`ColumnValue::Unchanged`] stay as they are. A `float32` becomes the `float64` of its
+    /// shortest decimal form (`0.1` stays `0.1`, as PostgreSQL prints it). A date beyond the
+    /// `i64` microsecond range clamps to `i64` MAX/MIN, as a timestamp there does (Q-M5-1).
+    pub fn convert(self, to: &ColumnValueType) -> ColumnValue {
+        use ColumnValue as C;
+        use ColumnValueType as V;
+        match (self, to) {
+            (C::Int16(i), V::Int32) => C::Int32(i.into()),
+            (C::Int16(i), V::Int64) => C::Int64(i.into()),
+            (C::Int32(i), V::Int64) => C::Int64(i.into()),
+            (C::Int16(i), V::Float64) => C::Float64(i.into()),
+            (C::Int32(i), V::Float64) => C::Float64(i.into()),
+            (C::Float32(f), V::Float64) => C::Float64(
+                f.to_string()
+                    .parse()
+                    .expect("an f32's text is an f64's text"),
+            ),
+            (C::Int16(i), V::Numeric { .. }) => C::Numeric(Decimal::new(i.into(), 0)),
+            (C::Int32(i), V::Numeric { .. }) => C::Numeric(Decimal::new(i.into(), 0)),
+            (C::Int64(i), V::Numeric { .. }) => C::Numeric(Decimal::new(i.into(), 0)),
+            (C::Timestamp { micros, .. }, V::Timestamp { with_tz }) => C::Timestamp {
+                micros,
+                with_tz: *with_tz,
+            },
+            (C::Date(d), V::Timestamp { with_tz }) => C::Timestamp {
+                micros: match d {
+                    i32::MAX => i64::MAX,
+                    i32::MIN => i64::MIN,
+                    d => i64::from(d).checked_mul(DAY_MICROS).unwrap_or(if d < 0 {
+                        i64::MIN
+                    } else {
+                        i64::MAX
+                    }),
+                },
+                with_tz: *with_tz,
+            },
+            (C::Array { values, .. }, V::Array(e)) => C::Array {
+                element_type: e.as_ref().clone(),
+                values: values.into_iter().map(|v| v.convert(e)).collect(),
+            },
+            (v, _) => v,
+        }
+    }
+}
+```
+
+Change `crates/data-avalanche-source-pg/src/value.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-source-pg/src/value.rs b/crates/data-avalanche-source-pg/src/value.rs
+--- a/crates/data-avalanche-source-pg/src/value.rs
++++ b/crates/data-avalanche-source-pg/src/value.rs
+@@ -48,6 +48,12 @@
+         element_type: ColumnValueType,
+         delimiter: u8,
+     },
++    /// Decoded as `from`, then converted to `to` for a `column_type_overrides` entry
++    /// ([`data_avalanche_core::conversion`]).
++    Convert {
++        from: Box<Decode>,
++        to: ColumnValueType,
++    },
+ }
+ 
+ /// Why a value can't be decoded.
+@@ -119,6 +125,7 @@
+                 values,
+             }
+         }
++        Decode::Convert { from, to } => decode(from, text)?.convert(to),
+     })
+ }
+ 
+```
+
+Change `crates/data-avalanche-source-pg/src/types.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-source-pg/src/types.rs b/crates/data-avalanche-source-pg/src/types.rs
+--- a/crates/data-avalanche-source-pg/src/types.rs
++++ b/crates/data-avalanche-source-pg/src/types.rs
+@@ -8,7 +8,7 @@
+ use data_avalanche_config::NumericOverflowAction;
+ use data_avalanche_core::{
+     ColumnValueType as V, HaltReason, LogicalType, MAX_DECIMAL_PRECISION, canonical_logical,
+-    hop2_compatible,
++    conversion, hop2_compatible,
+ };
+ 
+ use crate::value::Decode;
+@@ -277,8 +277,9 @@
+ /// - `decimal(P,S)` on a `numeric` or `money` column decodes it as that decimal, whatever its
+ ///   declared precision (the V-079 remedy), and `list<decimal(P,S)>` does the same for an array
+ ///   of them;
+-/// - any other override must be one Hop 2 can store the column's values as
+-///   ([`hop2_compatible`]); otherwise the table halts (`SCHEMA_MISMATCH`).
++/// - any other override is either one Hop 2 can store the column's values as
++///   ([`hop2_compatible`]), or a lossless [`conversion`], which the decoder applies; otherwise the
++///   table halts (`SCHEMA_MISMATCH`).
+ pub fn plan_column(
+     column: &str,
+     oid: u32,
+@@ -318,19 +319,27 @@
+         Some(l) => {
+             // The `string` action plans an over-wide numeric as text; the override decides here.
+             let p = plan_or_halt(NumericOverflowAction::String)?;
+-            if !hop2_compatible(&p.value_type, l) {
++            let (value_type, decode) = if hop2_compatible(&p.value_type, l) {
++                (p.value_type, p.decode)
++            } else if let Some(to) = conversion(&p.value_type, l) {
++                let decode = Decode::Convert {
++                    from: Box::new(p.decode),
++                    to: to.clone(),
++                };
++                (to, decode)
++            } else {
+                 return Err(HaltReason::SchemaMismatch {
+                     column: column.to_owned(),
+                     detail: format!(
+-                        "column_type_overrides {l} doesn't fit values of {:?}; use string or a compatible type",
++                        "column_type_overrides {l} doesn't fit values of {:?}; use string, a compatible type or a lossless conversion",
+                         p.value_type
+                     ),
+                 });
+-            }
++            };
+             Ok(ColumnPlan {
+                 logical: l.clone(),
+-                value_type: p.value_type,
+-                decode: p.decode,
++                value_type,
++                decode,
+                 read_as_text: None,
+                 unconstrained_numeric: false,
+             })
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `cargo test -p data-avalanche-core --lib convert::`
+
+Expected: PASS. `data-avalanche-core` `convert` tests: 5.
+
+Run: `cargo test -p data-avalanche-source-pg --lib`
+
+Expected: PASS. `data-avalanche-source-pg` unit tests: 43.
+
+Run: `cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all --check`
+
+Expected: no warnings, no output.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/data-avalanche-core/src/convert.rs crates/data-avalanche-core/src/lib.rs \
+  crates/data-avalanche-source-pg/src/value.rs crates/data-avalanche-source-pg/src/types.rs
+git commit -m "feat(core): lossless override conversions, applied by the PostgreSQL decoder"
 ```
 
 ---
@@ -10018,6 +10605,10 @@ numerics, NaN under `string`, unicode, multi-byte delimiters), then read both wa
 snapshotted. The two must be equal, and equal to the expected `ColumnValue`s. Negative numeric
 scales exist only on PostgreSQL 15 and later, so those columns are added there only.
 
+A second test, `overrides_convert_through_stream_and_snapshot`, runs the lossless override
+conversions of Task 5b both ways. Four converted columns form the key, and the snapshot reads
+one row per chunk, so every cursor goes back to PostgreSQL as converted values.
+
 - [ ] **Step 1: Write the round trip**
 
 Replace `crates/data-avalanche-source-pg/tests/pg/main.rs` with:
@@ -10535,19 +11126,154 @@ async fn every_mapped_type_round_trips_through_stream_and_snapshot() {
     s.close().await.unwrap();
     cleanup(&a, &n).await;
 }
+
+/// Config §9.3's lossless conversions, through the stream and through snapshot chunks of one row.
+/// Four of the converted columns form the key, so each chunk's cursor goes back to PostgreSQL as
+/// converted values: an `int8` for an `int4`, a `timestamptz` text for a `date` and a
+/// `timestamp`, a zone-less text for a `timestamptz`.
+#[tokio::test(flavor = "multi_thread")]
+async fn overrides_convert_through_stream_and_snapshot() {
+    require_it!();
+    const DAY: i64 = 86_400_000_000;
+    const HOUR: i64 = 3_600_000_000;
+    let a = admin().await;
+    let n = fresh(
+        &a,
+        "convert",
+        "CREATE TABLE t (id int, d date, ts timestamp, tstz timestamptz, s smallint, f real,
+                         a int[], PRIMARY KEY (id, d, ts, tstz));",
+    )
+    .await;
+    let overrides = format!(
+        "      column_type_overrides: {{ {s}.t.id: int64, {s}.t.d: timestamp_tz, \
+         {s}.t.ts: timestamp_tz, {s}.t.tstz: timestamp_ntz, {s}.t.s: \"decimal(7,2)\", \
+         {s}.t.f: float64, {s}.t.a: \"list<int64>\" }}",
+        s = n.schema
+    );
+    let c = connector(&pipeline(&n, &["*"], &overrides, ""));
+    let (mut s, tables, _) = first_stream(&c).await;
+    let t = &tables[0];
+    let types: Vec<(&str, T)> = t
+        .columns()
+        .iter()
+        .map(|c| (c.name.as_str(), c.value_type.clone()))
+        .collect();
+    assert_eq!(
+        types,
+        [
+            ("id", T::Int64),
+            ("d", T::Timestamp { with_tz: true }),
+            ("ts", T::Timestamp { with_tz: true }),
+            ("tstz", T::Timestamp { with_tz: false }),
+            (
+                "s",
+                T::Numeric {
+                    precision: 7,
+                    scale: 2
+                }
+            ),
+            ("f", T::Float64),
+            ("a", T::Array(Box::new(T::Int64))),
+        ]
+    );
+
+    // The key's order is decided by each of its parts in turn.
+    let keys = [
+        (1, "2024-01-01", "2024-01-01 10:00", "2024-01-01 10:00+00"),
+        (1, "2024-01-01", "2024-01-01 10:00", "2024-01-01 11:00+00"),
+        (1, "2024-01-01", "2024-01-01 11:00", "2024-01-01 09:00+00"),
+        (1, "2024-01-02", "2024-01-01 09:00", "2024-01-01 09:00+00"),
+        (2, "2023-12-31", "2023-12-31 23:00", "2023-12-31 23:00+00"),
+    ];
+    let mut inserts = vec![
+        "SET TimeZone = 'America/St_Johns'".to_string(),
+        format!("SET search_path = {}", n.schema),
+        "BEGIN".into(),
+    ];
+    for (id, d, ts, tstz) in keys {
+        inserts.push(format!(
+            "INSERT INTO t VALUES ({id}, '{d}', '{ts}', '{tstz}', -32768, 0.1, '{{1,NULL}}')"
+        ));
+    }
+    inserts.push("COMMIT".into());
+    a.batch_execute(&inserts.join(";\n")).await.unwrap();
+
+    let micros = |day: i64, hour: i64| day * DAY + hour * HOUR;
+    let expected: Vec<Row> = [
+        (1, 19_723, 10, 10),
+        (1, 19_723, 10, 11),
+        (1, 19_723, 11, 9),
+        (1, 19_724, 9, 9),
+        (2, 19_722, 23, 23),
+    ]
+    .into_iter()
+    .map(|(id, day, ts, tstz)| {
+        let ts_day = if id == 2 { 19_722 } else { 19_723 };
+        Row(vec![
+            ("id".into(), V::Int64(id)),
+            (
+                "d".into(),
+                V::Timestamp {
+                    micros: micros(day, 0),
+                    with_tz: true,
+                },
+            ),
+            (
+                "ts".into(),
+                V::Timestamp {
+                    micros: micros(ts_day, ts),
+                    with_tz: true,
+                },
+            ),
+            (
+                "tstz".into(),
+                V::Timestamp {
+                    micros: micros(ts_day, tstz),
+                    with_tz: false,
+                },
+            ),
+            ("s".into(), dec(-32_768, 0)),
+            ("f".into(), V::Float64(0.1)),
+            ("a".into(), array(T::Int64, vec![V::Int64(1), V::Null])),
+        ])
+    })
+    .collect();
+
+    let items = collect(&mut s, 1, 30).await;
+    let streamed: Vec<Row> = items
+        .iter()
+        .filter_map(|i| match i {
+            StreamItem::Change(e) => e.after.clone(),
+            StreamItem::TableHalt { reason, .. } => panic!("halted: {reason}"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(streamed, expected, "the stream");
+    let mut snapshot = vec![];
+    let mut cursor: Option<KeysetCursor> = None;
+    loop {
+        let chunk = c.read_chunk(t, cursor.as_ref(), 1).await.unwrap();
+        let Some(next) = chunk.next else { break };
+        snapshot.extend(chunk.rows);
+        cursor = Some(next);
+    }
+    assert_eq!(snapshot, expected, "snapshot chunks of one row");
+    s.close().await.unwrap();
+    cleanup(&a, &n).await;
+}
 ```
 
 - [ ] **Step 2: Run the tests**
 
 Run: `cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 30 tests. Without `DATA_AVALANCHE_IT` every test returns at once. These tests drive the code of Tasks 2–11, so nothing fails first. A failure in Step 3 is a defect in that code: stop and report it.
+Expected: PASS, 31 tests. Without `DATA_AVALANCHE_IT` every test returns at once. These tests drive the code of Tasks 2–11, so nothing fails first. A failure in Step 3 is a defect in that code: stop and report it.
 
 - [ ] **Step 3: Run them against PostgreSQL**
 
 Run: `test-infra/up.sh`, then `DATA_AVALANCHE_IT=1 cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 30 tests.
+Expected: PASS, 31 tests.
 
 - [ ] **Step 4: Run the gates**
 
@@ -11035,13 +11761,13 @@ jobs:
 
 Run: `cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 34 tests. Without `DATA_AVALANCHE_IT` every test returns at once. These tests drive the code of Tasks 2–11, so nothing fails first. A failure in Step 3 is a defect in that code: stop and report it.
+Expected: PASS, 35 tests. Without `DATA_AVALANCHE_IT` every test returns at once. These tests drive the code of Tasks 2–11, so nothing fails first. A failure in Step 3 is a defect in that code: stop and report it.
 
 - [ ] **Step 3: Run them against PostgreSQL**
 
 Run: `test-infra/up.sh` (it now starts `postgres-tls` too), then `DATA_AVALANCHE_IT=1 cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 34 tests.
+Expected: PASS, 35 tests.
 
 Then the nightly matrix by hand, one server at a time (55414…55417):
 
@@ -11050,7 +11776,7 @@ docker compose -f test-infra/compose.yaml --profile matrix up -d --wait postgres
 DATA_AVALANCHE_IT=1 DATA_AVALANCHE_PG_PORT=55414 cargo test -p data-avalanche-source-pg --test pg -- --skip tls::
 ```
 
-Expected: PASS on each, 30 tests.
+Expected: PASS on each, 31 tests.
 
 - [ ] **Step 4: Run the gates**
 
@@ -11193,3 +11919,14 @@ The test fails once the crate forgives the mismatch, which is the signal to drop
   element as the decimal named. The new test is `a_decimal_list_override_rescues_a_numeric_array`,
   so Task 5's unit-test count is 42, and each later task's count is two higher than its block
   shows.
+
+**Task 5b added: lossless override conversions** (owner decision Q-M5-12, 2026-10-01). The Task 5
+review found that an override had to equal the column's mapped type, which config §9.3's
+`timestamp_ntz_as` row contradicts. Task 5b (before Task 6) adds the conversions; Task 12 gains
+`overrides_convert_through_stream_and_snapshot`. Task 5's `a_decimal_list_override_rescues_a_numeric_array`
+changes its negative case from `int4[]` (now a lossless conversion to `list<decimal(38,10)>`) to
+`bool[]`. Measured before approval, on the verified workspace: PostgreSQL 14–18 pass 31 integration
+tests each without TLS, and the workspace passes 632 tests. Task 5b replayed on a fresh clone of the
+branch at `88b7c58`. Counts after it: `data-avalanche-source-pg` unit tests 43, so each later task's
+count is three higher than its block shows. Integration tests: Task 12 31, Task 13 35 (31 on each of
+PostgreSQL 14–17).
