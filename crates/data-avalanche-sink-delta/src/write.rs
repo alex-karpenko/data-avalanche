@@ -40,9 +40,28 @@ fn mask_name(column: &str) -> String {
 /// Checks the change set against the table: every column of the set is a column of the table
 /// holding the same Hop 2 type (the set may lack columns: soft-dropped, or added after it), and
 /// every NOT NULL column of the table (the identifier, the lineage) is in the set: the MERGE writes
-/// a lacking column NULL, which delta-rs would refuse the same way on every replay. Returns each
-/// set column's Delta type.
+/// a lacking column NULL, which delta-rs would refuse the same way on every replay. Each delete
+/// batch's key columns hold the set's types (the MERGE source converts them by the set's schema).
+/// Returns each set column's Delta type.
 pub fn check_columns(cs: &TableChangeSet, table: &StructType) -> Result<Vec<DeltaType>, SinkError> {
+    for b in &cs.deletes {
+        for (k, key) in b.schema().fields().iter().zip(&cs.identifier) {
+            let want = cs.schema.field_with_name(key).map_err(|_| {
+                permanent(format!(
+                    "identifier column {key:?} isn't in the change set of {}",
+                    cs.table
+                ))
+            })?;
+            if k.data_type() != want.data_type() {
+                return Err(permanent(format!(
+                    "a delete batch of {} holds {key:?} as {}, the change set has {}",
+                    cs.table,
+                    k.data_type(),
+                    want.data_type()
+                )));
+            }
+        }
+    }
     if let Some(missing) = table
         .fields()
         .find(|c| !c.is_nullable() && cs.schema.field_with_name(c.name()).is_err())
@@ -212,7 +231,7 @@ pub async fn merge(
             None => eq,
         });
     }
-    let on = on.expect("a change set has an identifier");
+    let on = on.ok_or_else(|| invalid("a change set without identifier columns"))?;
     let mut updates = Vec::new();
     let mut inserts = Vec::new();
     for (name, t) in &columns {
@@ -641,6 +660,41 @@ mod tests {
         );
         let err = crate::error::sink_error(err);
         assert!(matches!(err, SinkError::Permanent { .. }), "{err}");
+    }
+
+    /// A hand-built set without identifier columns (core's `validate` refuses it first) is an
+    /// error of the MERGE, not a panic.
+    #[tokio::test]
+    async fn a_merge_without_an_identifier_is_permanent() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = created(&dir).await;
+        let mut cs = change_set(10, vec![upserts(&full(), &[(1, Some("a"))], None)], vec![]);
+        let snapshot = h.table().snapshot().unwrap();
+        let types = check_columns(&cs, snapshot.schema().as_ref()).unwrap();
+        cs.identifier.clear();
+        let err = merge(h.table().clone(), &cs, &types, props(1, 10), None)
+            .await
+            .unwrap_err();
+        let err = crate::error::sink_error(err);
+        assert!(matches!(err, SinkError::Permanent { .. }), "{err}");
+    }
+
+    /// A delete batch's key columns must hold the set's types: the MERGE source converts them by
+    /// the set's schema.
+    #[tokio::test]
+    async fn a_delete_key_of_another_type_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = created(&dir).await;
+        let snapshot = h.table().snapshot().unwrap();
+        let text_key = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)])),
+            vec![Arc::new(arrow_array::StringArray::from(vec!["1"]))],
+        )
+        .unwrap();
+        let cs = change_set(10, vec![], vec![text_key]);
+        let err = check_columns(&cs, snapshot.schema().as_ref()).unwrap_err();
+        assert!(matches!(err, SinkError::Permanent { .. }), "{err}");
+        assert!(err.to_string().contains("delete batch"), "{err}");
     }
 
     #[tokio::test]

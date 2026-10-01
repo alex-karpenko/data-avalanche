@@ -11,7 +11,7 @@ use crate::common::{commit, cs, deletes, items, lsn, owned, rows, schema, sink, 
 
 /// A handle on the sink's table as another writer (an external engine) would open it.
 async fn foreign(location: &DeltaLocation) -> DeltaTable {
-    let url = location.table_url(&items());
+    let url = location.table_url(&items()).unwrap();
     let mut t = DeltaTable::try_from_url_with_storage_options(
         url,
         location.storage_options(std::env::vars()),

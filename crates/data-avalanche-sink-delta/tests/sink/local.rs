@@ -64,7 +64,7 @@ async fn escaped_names_land_under_the_storage_crates_keys() {
 #[tokio::test]
 async fn delta_rs_still_refuses_add_column_under_column_mapping() {
     let (_dir, location) = local();
-    let url = location.table_url(&items());
+    let url = location.table_url(&items()).unwrap();
     std::fs::create_dir_all(url.to_file_path().unwrap()).unwrap();
     DeltaTable::try_from_url(url)
         .await

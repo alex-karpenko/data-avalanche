@@ -17,6 +17,7 @@ use deltalake::operations::merge::MergeMetrics;
 use tokio::sync::OwnedMutexGuard;
 
 use crate::DeltaSinkConfig;
+use crate::config::utf8_vars;
 use crate::error::{permanent, sink_error};
 use crate::evolve::evolve;
 use crate::marker::{app_id, commit_metadata};
@@ -110,7 +111,9 @@ impl DeltaSink {
             deltalake::gcp::register_handlers(None);
             deltalake::azure::register_handlers(None);
         });
-        let options = config.location.storage_options(std::env::vars());
+        let options = config
+            .location
+            .storage_options(utf8_vars(std::env::vars_os()));
         Self {
             capabilities: SinkCapabilities {
                 write_modes: [WriteMode::Mirror].into(),
@@ -143,7 +146,7 @@ impl DeltaSink {
         };
         let mut guard = slot.lock_owned().await;
         if guard.is_none() {
-            let url = self.config.location.table_url(table);
+            let url = self.config.location.table_url(table)?;
             *guard = Some(TableHandle::open(url, self.options.clone()).await?);
         }
         Ok(guard)
@@ -431,7 +434,7 @@ mod tests {
             s.commit(cs.clone(), marker(1, &cs)).await.unwrap();
         }
         // Someone compacts the table behind the sink's back.
-        let url = local(&dir).table_url(&orders().table().clone());
+        let url = local(&dir).table_url(orders().table()).unwrap();
         let t = deltalake::open_table(url).await.unwrap();
         t.optimize().await.unwrap();
         let update = rows(30, &[1]);

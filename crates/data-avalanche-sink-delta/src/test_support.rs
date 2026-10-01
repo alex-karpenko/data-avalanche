@@ -44,7 +44,7 @@ pub(crate) fn local(dir: &tempfile::TempDir) -> DeltaLocation {
 }
 
 pub(crate) async fn handle(dir: &tempfile::TempDir, table: &TableRef) -> TableHandle {
-    TableHandle::open(local(dir).table_url(table), HashMap::new())
+    TableHandle::open(local(dir).table_url(table).unwrap(), HashMap::new())
         .await
         .unwrap()
 }

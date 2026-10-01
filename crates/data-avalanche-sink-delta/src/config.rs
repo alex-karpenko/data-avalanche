@@ -2,12 +2,15 @@
 //! table is created with (config §9.4.3). The runtime (M6) fills this from the resolved config.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use data_avalanche_core::TableRef;
+use data_avalanche_core::{SinkError, TableRef};
 use data_avalanche_storage::{Backend, table_root};
 use url::Url;
+
+use crate::error::permanent;
 
 /// How a source `timestamp without time zone` column is stored in a **new** Delta table
 /// (`sink.delta.timestamp_ntz_as`, D-MS.16). An existing column keeps its type.
@@ -93,11 +96,17 @@ impl std::fmt::Debug for DeltaLocation {
 impl DeltaLocation {
     /// The table's root as a URL with a trailing `/`. The segments are the storage crate's
     /// (`table_root`: config §10, `~XX` escapes, never a `%`), percent-encoded for the URL; the
-    /// object keys are exactly those segments.
-    pub fn table_url(&self, table: &TableRef) -> Url {
+    /// object keys are exactly those segments. A location that makes no URL (a relative local
+    /// root, a bucket that isn't a URL host) is a `Permanent` error.
+    pub fn table_url(&self, table: &TableRef) -> Result<Url, SinkError> {
         let (mut url, root) = match self {
             Self::Local { root } => (
-                Url::from_directory_path(root).expect("the local root is an absolute path"),
+                Url::from_directory_path(root).map_err(|()| {
+                    permanent(format!(
+                        "the local root {} isn't an absolute path",
+                        root.display()
+                    ))
+                })?,
                 table_root("", "", &table.schema, &table.name).root,
             ),
             Self::Bucket {
@@ -111,8 +120,9 @@ impl DeltaLocation {
                     Backend::Gcs => "gs",
                     Backend::Azure { .. } => "az",
                 };
-                let base = Url::parse(&format!("{scheme}://{bucket}/"))
-                    .expect("a bucket name is a valid URL host");
+                let base = Url::parse(&format!("{scheme}://{bucket}/")).map_err(|e| {
+                    permanent(format!("the bucket {bucket:?} isn't a URL host: {e}"))
+                })?;
                 (
                     base,
                     table_root(bucket, prefix, &table.schema, &table.name).root,
@@ -127,12 +137,14 @@ impl DeltaLocation {
             }
             segments.push("");
         }
-        url
+        Ok(url)
     }
 
-    /// The options delta-rs opens a table with. delta-rs reads the `AWS_*` and `GOOGLE_*`
-    /// variables itself but not `AZURE_*`, so for Azure they are added here (lower-cased, as
-    /// `object_store` spells its keys); an explicit option wins.
+    /// The options delta-rs opens a table with; `env` is the process environment
+    /// ([`utf8_vars`]). delta-rs reads the `AWS_*` and `GOOGLE_*` variables itself, and of
+    /// `AZURE_*` only the credential keys, not the others (`use_emulator`, the endpoint, …), so
+    /// for Azure every `AZURE_*` variable is added here (lower-cased, as `object_store` spells its
+    /// keys; one it doesn't know is dropped); an explicit option wins.
     pub fn storage_options(
         &self,
         env: impl IntoIterator<Item = (String, String)>,
@@ -159,6 +171,14 @@ impl DeltaLocation {
         }
         out
     }
+}
+
+/// The environment pairs that are UTF-8 (`std::env::vars` would panic on one that isn't).
+pub(crate) fn utf8_vars(
+    vars: impl IntoIterator<Item = (OsString, OsString)>,
+) -> impl Iterator<Item = (String, String)> {
+    vars.into_iter()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
 }
 
 /// Everything a [`crate::DeltaSink`] needs.
@@ -190,16 +210,17 @@ mod tests {
     fn table_urls_follow_config_section_10() {
         let t = TableRef::new("public", "orders");
         assert_eq!(
-            bucket(Backend::S3, vec![]).table_url(&t).as_str(),
+            bucket(Backend::S3, vec![]).table_url(&t).unwrap().as_str(),
             "s3://lake/orders/v1/public/orders/"
         );
         assert_eq!(
-            bucket(Backend::Gcs, vec![]).table_url(&t).as_str(),
+            bucket(Backend::Gcs, vec![]).table_url(&t).unwrap().as_str(),
             "gs://lake/orders/v1/public/orders/"
         );
         assert_eq!(
             bucket(Backend::Azure { account: None }, vec![])
                 .table_url(&t)
+                .unwrap()
                 .as_str(),
             "az://lake/orders/v1/public/orders/"
         );
@@ -207,9 +228,45 @@ mod tests {
             root: PathBuf::from("/data/lake"),
         };
         assert_eq!(
-            local.table_url(&t).as_str(),
+            local.table_url(&t).unwrap().as_str(),
             "file:///data/lake/public/orders/"
         );
+    }
+
+    #[test]
+    fn a_location_that_makes_no_url_is_a_permanent_error() {
+        let t = TableRef::new("public", "orders");
+        let relative = DeltaLocation::Local {
+            root: PathBuf::from("relative/lake"),
+        };
+        let err = relative.table_url(&t).unwrap_err();
+        assert!(matches!(err, SinkError::Permanent { .. }), "{err}");
+        assert!(err.to_string().contains("relative/lake"), "{err}");
+        let mut bad = bucket(Backend::S3, vec![]);
+        if let DeltaLocation::Bucket { bucket, .. } = &mut bad {
+            *bucket = "not a host".into();
+        }
+        let err = bad.table_url(&t).unwrap_err();
+        assert!(matches!(err, SinkError::Permanent { .. }), "{err}");
+        assert!(err.to_string().contains("not a host"), "{err}");
+    }
+
+    /// The environment is read as `OsString`s: a pair that isn't UTF-8 is skipped, not a panic.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_environment_variable_is_skipped() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let vars = vec![
+            (OsString::from("AZURE_TENANT_ID"), OsString::from("tenant")),
+            (
+                OsString::from("AZURE_CLIENT_ID"),
+                OsString::from_vec(vec![0xff, 0xfe]),
+            ),
+            (OsString::from_vec(vec![0xff]), OsString::from("x")),
+        ];
+        let got: Vec<_> = utf8_vars(vars).collect();
+        assert_eq!(got, [("AZURE_TENANT_ID".to_string(), "tenant".to_string())]);
     }
 
     #[test]
@@ -217,7 +274,7 @@ mod tests {
         // `table_root` escapes `%` and `/` as `~XX` (Q-M4-5); the URL encodes a space and
         // non-ASCII text, which delta-rs decodes back.
         let t = TableRef::new("50%", "a/b c.ü");
-        let url = bucket(Backend::S3, vec![]).table_url(&t);
+        let url = bucket(Backend::S3, vec![]).table_url(&t).unwrap();
         assert_eq!(url.as_str(), "s3://lake/orders/v1/50~25/a~2Fb%20c.%C3%BC/");
         let empty_prefix = DeltaLocation::Bucket {
             backend: Backend::S3,
@@ -226,7 +283,10 @@ mod tests {
             options: vec![],
         };
         assert_eq!(
-            empty_prefix.table_url(&TableRef::new("s", "t")).as_str(),
+            empty_prefix
+                .table_url(&TableRef::new("s", "t"))
+                .unwrap()
+                .as_str(),
             "s3://lake/s/t/"
         );
     }
