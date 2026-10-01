@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use data_avalanche_config::NumericOverflowAction;
 use data_avalanche_core::{
     ColumnValueType as V, HaltReason, LogicalType, MAX_DECIMAL_PRECISION, canonical_logical,
-    hop2_compatible,
+    conversion, hop2_compatible,
 };
 
 use crate::value::Decode;
@@ -277,8 +277,9 @@ pub struct ColumnPlan {
 /// - `decimal(P,S)` on a `numeric` or `money` column decodes it as that decimal, whatever its
 ///   declared precision (the V-079 remedy), and `list<decimal(P,S)>` does the same for an array
 ///   of them;
-/// - any other override must be one Hop 2 can store the column's values as
-///   ([`hop2_compatible`]); otherwise the table halts (`SCHEMA_MISMATCH`).
+/// - any other override is either one Hop 2 can store the column's values as
+///   ([`hop2_compatible`]), or a lossless [`conversion`], which the decoder applies; otherwise the
+///   table halts (`SCHEMA_MISMATCH`).
 pub fn plan_column(
     column: &str,
     oid: u32,
@@ -318,19 +319,27 @@ pub fn plan_column(
         Some(l) => {
             // The `string` action plans an over-wide numeric as text; the override decides here.
             let p = plan_or_halt(NumericOverflowAction::String)?;
-            if !hop2_compatible(&p.value_type, l) {
+            let (value_type, decode) = if hop2_compatible(&p.value_type, l) {
+                (p.value_type, p.decode)
+            } else if let Some(to) = conversion(&p.value_type, l) {
+                let decode = Decode::Convert {
+                    from: Box::new(p.decode),
+                    to: to.clone(),
+                };
+                (to, decode)
+            } else {
                 return Err(HaltReason::SchemaMismatch {
                     column: column.to_owned(),
                     detail: format!(
-                        "column_type_overrides {l} doesn't fit values of {:?}; use string or a compatible type",
+                        "column_type_overrides {l} doesn't fit values of {:?}; use string, a compatible type or a lossless conversion",
                         p.value_type
                     ),
                 });
-            }
+            };
             Ok(ColumnPlan {
                 logical: l.clone(),
-                value_type: p.value_type,
-                decode: p.decode,
+                value_type,
+                decode,
                 read_as_text: None,
                 unconstrained_numeric: false,
             })
@@ -746,6 +755,74 @@ mod tests {
     }
 
     #[test]
+    fn overrides_convert_losslessly() {
+        let c = catalog();
+        let col = |oid, over: LogicalType| plan_column("c", oid, -1, &c, S, Some(&over));
+        let wide = col(23, LogicalType::Int64).unwrap();
+        assert_eq!(
+            (wide.value_type, wide.logical, wide.decode),
+            (
+                V::Int64,
+                LogicalType::Int64,
+                Decode::Convert {
+                    from: Box::new(Decode::Int32),
+                    to: V::Int64
+                }
+            )
+        );
+        let tz = col(1114, LogicalType::TimestampTz).unwrap();
+        assert_eq!(tz.value_type, V::Timestamp { with_tz: true });
+        let midnight = col(1082, LogicalType::TimestampNtz).unwrap();
+        assert_eq!(midnight.value_type, V::Timestamp { with_tz: false });
+        let money = col(
+            21,
+            LogicalType::Decimal {
+                precision: 7,
+                scale: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            money.value_type,
+            V::Numeric {
+                precision: 7,
+                scale: 2
+            }
+        );
+        let list = col(1007, LogicalType::List(Box::new(LogicalType::Int64))).unwrap();
+        assert_eq!(list.value_type, V::Array(Box::new(V::Int64)));
+        assert_eq!(
+            crate::value::decode(&list.decode, "{1,NULL,-2147483648}").unwrap(),
+            data_avalanche_core::ColumnValue::Array {
+                element_type: V::Int64,
+                values: vec![
+                    data_avalanche_core::ColumnValue::Int64(1),
+                    data_avalanche_core::ColumnValue::Null,
+                    data_avalanche_core::ColumnValue::Int64(-2_147_483_648),
+                ],
+            }
+        );
+        for (oid, over) in [
+            (20, LogicalType::Int32),
+            (
+                23,
+                LogicalType::Decimal {
+                    precision: 9,
+                    scale: 0,
+                },
+            ),
+            (1114, LogicalType::Date),
+            (25, LogicalType::Uuid),
+        ] {
+            assert_eq!(
+                col(oid, over).unwrap_err().code(),
+                "SCHEMA_MISMATCH",
+                "oid {oid}: lossy or parsing"
+            );
+        }
+    }
+
+    #[test]
     fn a_decimal_list_override_rescues_a_numeric_array() {
         let c = catalog();
         let list = |p, s| {
@@ -786,11 +863,11 @@ mod tests {
             })),
             "an array of a numeric domain"
         );
-        let e = col(1007, -1, S, &list(38, 10)).unwrap_err();
+        let e = col(1000, -1, S, &list(38, 10)).unwrap_err();
         assert_eq!(
             e.code(),
             "SCHEMA_MISMATCH",
-            "an int4[] isn't a numeric array"
+            "a bool[] isn't a numeric array"
         );
     }
 }

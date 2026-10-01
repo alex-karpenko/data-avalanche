@@ -48,6 +48,12 @@ pub enum Decode {
         element_type: ColumnValueType,
         delimiter: u8,
     },
+    /// Decoded as `from`, then converted to `to` for a `column_type_overrides` entry
+    /// ([`data_avalanche_core::conversion`]).
+    Convert {
+        from: Box<Decode>,
+        to: ColumnValueType,
+    },
 }
 
 /// Why a value can't be decoded.
@@ -119,6 +125,7 @@ pub fn decode(d: &Decode, text: &str) -> Result<ColumnValue, ValueError> {
                 values,
             }
         }
+        Decode::Convert { from, to } => decode(from, text)?.convert(to),
     })
 }
 
