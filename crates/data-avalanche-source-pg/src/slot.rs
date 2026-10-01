@@ -16,6 +16,17 @@ use crate::connect::within;
 use crate::connector::PgConnector;
 use crate::position::{lsn_of, parse_lsn};
 
+/// What [`PgConnector::reconcile_publication`] did and noticed.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Reconciled {
+    /// It created the publication, or changed what it publishes for every table (its operations,
+    /// `publish_via_partition_root`). The WAL before now was decoded under the old definition.
+    pub rewritten: bool,
+    /// Tracked tables it added to the publication.
+    pub added: Vec<TableRef>,
+    pub warnings: Vec<String>,
+}
+
 /// The server's row for the pipeline's slot (`pg_replication_slots`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotState {
@@ -216,7 +227,7 @@ impl PgConnector {
         &self,
         client: &Client,
         tables: &[TableRef],
-    ) -> Result<Vec<String>, SourceError> {
+    ) -> Result<Reconciled, SourceError> {
         let name = &self.pg.publication;
         let managed = self.pg.slot_management == SlotManagement::Managed;
         let row = self
@@ -251,7 +262,10 @@ impl PgConnector {
             self.conn
                 .command("create the publication", client.batch_execute(&sql))
                 .await?;
-            return Ok(vec![]);
+            return Ok(Reconciled {
+                rewritten: true,
+                ..Reconciled::default()
+            });
         };
         let (all_tables, every_op, via_root): (bool, bool, bool) =
             (row.get(0), row.get(1), row.get(2));
@@ -301,7 +315,10 @@ impl PgConnector {
                     "publication {name} doesn't publish every operation; set publish = 'insert, update, delete, truncate'"
                 ));
             }
-            return Ok(warnings);
+            return Ok(Reconciled {
+                warnings,
+                ..Reconciled::default()
+            });
         }
         let mut sql = vec![];
         if !missing.is_empty() {
@@ -324,7 +341,8 @@ impl PgConnector {
                 extra.join(", ")
             ));
         }
-        if !every_op || via_root {
+        let rewritten = !every_op || via_root;
+        if rewritten {
             sql.push(format!(
                 "ALTER PUBLICATION {} SET (publish = 'insert, update, delete, truncate', publish_via_partition_root = false)",
                 ident(name)
@@ -338,7 +356,11 @@ impl PgConnector {
                 )
                 .await?;
         }
-        Ok(warnings)
+        Ok(Reconciled {
+            rewritten,
+            added: missing.into_iter().cloned().collect(),
+            warnings,
+        })
     }
 
     /// The publication first (its changes are decoded with the catalog as of their WAL position,
@@ -350,7 +372,11 @@ impl PgConnector {
     ) -> Result<Prepared, SourceError> {
         let checkpoint = checkpoint.map(lsn_of).transpose()?;
         let client = self.conn.client().await?;
-        let warnings = self.reconcile_publication(&client, tables).await?;
+        let Reconciled {
+            rewritten,
+            added,
+            mut warnings,
+        } = self.reconcile_publication(&client, tables).await?;
         let slot = self
             .conn
             .command(
@@ -358,14 +384,27 @@ impl PgConnector {
                 slot_state(&client, self.slot_name()),
             )
             .await?;
-        let action = decide(
+        let action = match decide(
             checkpoint,
             slot.as_ref(),
             &self.pipeline.source.db,
             self.slot_name(),
             self.pg.slot_management,
             self.pg.slot_on_orphan,
-        );
+        ) {
+            // pgoutput reads the publication as of each change's WAL position: the WAL from the
+            // checkpoint up to now was decoded under the old publication, and what it didn't
+            // publish never reaches the stream. Only `managed` rewrites the publication, so the
+            // slot is ours to recreate.
+            SlotAction::Resume if rewritten => {
+                warnings.push(format!(
+                    "publication {} was created or changed what it publishes: changes since the checkpoint may be missing, so the pipeline re-snapshots",
+                    self.pg.publication
+                ));
+                SlotAction::Recreate(SnapshotReason::PositionLost)
+            }
+            a => a,
+        };
         let snapshot = |from: Lsn, reason| StartPlan::Snapshot {
             from: SourcePosition::Pg(from),
             reason,
@@ -378,21 +417,29 @@ impl PgConnector {
                 snapshot(self.create_slot(&client).await?, reason)
             }
             SlotAction::Adopt => {
-                let row = self
-                    .conn
-                    .command(
-                        "advance the orphan slot",
-                        client.query_one(
-                            "SELECT end_lsn::text FROM pg_replication_slot_advance($1, pg_current_wal_lsn())",
-                            &[&self.slot_name()],
-                        ),
-                    )
-                    .await?;
+                // Advancing decodes the orphan's whole backlog: the snapshot timeout bounds it.
+                let row = within(
+                    "advance the orphan slot",
+                    self.conn.timeouts.snapshot,
+                    client.query_one(
+                        "SELECT end_lsn::text FROM pg_replication_slot_advance($1, pg_current_wal_lsn())",
+                        &[&self.slot_name()],
+                    ),
+                )
+                .await?;
                 snapshot(parse_lsn(row.get(0))?, SnapshotReason::AdoptedOrphan)
             }
             SlotAction::Refuse(m) => return Err(SourceError::Permanent(m)),
         };
-        Ok(Prepared { plan, warnings })
+        let added = match plan {
+            StartPlan::Resume => added,
+            StartPlan::Snapshot { .. } => vec![],
+        };
+        Ok(Prepared {
+            plan,
+            added,
+            warnings,
+        })
     }
 
     /// D-15.3 after [`SourceError::PositionUnreachable`]: drop the slot and create it again;
@@ -430,9 +477,9 @@ impl PgConnector {
             .await
     }
 
-    /// The WAL the slot retains past its confirmed position:
-    /// `pg_current_wal_lsn() - confirmed_flush_lsn`, the `max_wal_lag_bytes` guard's measure.
-    /// `None` without a slot.
+    /// The WAL the slot keeps on the source's disk: `pg_current_wal_lsn() - restart_lsn`, the
+    /// `max_wal_lag_bytes` guard's measure. `restart_lsn` trails `confirmed_flush_lsn` while a
+    /// transaction older than the confirmed position is still open. `None` without a slot.
     pub async fn retained_bytes(&self) -> Result<Option<u64>, SourceError> {
         let client = self.conn.client().await?;
         let row = self
@@ -440,7 +487,7 @@ impl PgConnector {
             .command(
                 "measure the slot's WAL",
                 client.query_opt(
-                    "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)::bigint
+                    "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint
                        FROM pg_catalog.pg_replication_slots WHERE slot_name = $1",
                     &[&self.slot_name()],
                 ),

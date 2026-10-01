@@ -73,9 +73,30 @@ pub fn cases() -> Vec<Case> {
         case("V-059", Warning, "publication needs quoting", || {
             pg_delta().set("/pipelines/p/source/postgres/publication", json!("p-pub"))
         }),
-        case("V-059", Warning, "publication shared", || {
+        case("V-059", Error, "publication shared, managed", || {
             two_pipelines().set("/pipelines/q/source/postgres/publication", json!("p_pub"))
         }),
+        case(
+            "V-059",
+            Warning,
+            "publication shared, require_existing",
+            || {
+                let mut doc =
+                    two_pipelines().set("/pipelines/q/source/postgres/publication", json!("p_pub"));
+                for p in ["p", "q"] {
+                    doc = doc
+                        .set(
+                            &format!("/pipelines/{p}/source/postgres/slot_management"),
+                            json!("require_existing"),
+                        )
+                        .set(
+                            &format!("/pipelines/{p}/source/postgres/auto_cleanup"),
+                            json!(false),
+                        );
+                }
+                doc
+            },
+        ),
         case("V-059", Silent, "own publication", two_pipelines),
         case("V-060", Error, "slot in defaults", || {
             pg_delta().set("/defaults/source/postgres/slot", json!("s"))

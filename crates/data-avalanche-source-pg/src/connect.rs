@@ -135,7 +135,9 @@ impl Connector {
             self.password.clone(),
             self.db.clone(),
             slot,
-            publication,
+            // Quoted: pgoutput reads `publication_names` as identifiers and folds an unquoted
+            // `MyPub` to `mypub`, which the publication created as `"MyPub"` isn't.
+            crate::slot::ident(publication).as_str(),
         )
         .with_port(self.port)
         .with_tls(replication_tls(self.ssl_mode, &self.files))
@@ -193,10 +195,14 @@ mod tests {
     #[test]
     fn the_replication_connection_pins_the_same_session() {
         let c = Connector::new(&pipeline("public.t").source).unwrap();
-        let r = c.replication("s", "p", Lsn(0x10), Duration::from_secs(7));
+        let r = c.replication("s", "MyPub", Lsn(0x10), Duration::from_secs(7));
         assert_eq!(r.options.as_deref(), Some(SESSION_OPTIONS));
         assert_eq!(r.slot, "s");
-        assert_eq!(r.publication.names(), ["p"]);
+        assert_eq!(
+            r.publication.names(),
+            ["\"MyPub\""],
+            "quoted, or pgoutput folds it to mypub"
+        );
         assert_eq!(r.start_lsn, Lsn(0x10));
         assert_eq!(r.status_interval, Duration::from_secs(7));
         assert_eq!(r.idle_wakeup_interval, Duration::from_secs(7));

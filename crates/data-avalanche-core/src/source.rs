@@ -91,6 +91,11 @@ pub enum StartPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prepared {
     pub plan: StartPlan,
+    /// Under [`StartPlan::Resume`], the tracked tables the source began publishing at this start
+    /// (PostgreSQL: added to the publication). Their changes before now never reached the stream,
+    /// so each needs a snapshot, whether it is new to the pipeline or was dropped from the
+    /// publication behind its back. Empty when the plan snapshots every table.
+    pub added: Vec<TableRef>,
     pub warnings: Vec<String>,
 }
 
@@ -378,6 +383,7 @@ mod tests {
             };
             Ok(Prepared {
                 plan,
+                added: vec![],
                 warnings: vec![],
             })
         }

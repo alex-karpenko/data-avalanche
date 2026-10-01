@@ -196,30 +196,115 @@ async fn the_publication_follows_the_table_set() {
         .await
         .unwrap();
     let start = from(&p.plan, SnapshotReason::FirstStart);
-    a.batch_execute(&format!(
-        "ALTER PUBLICATION {} SET (publish = 'insert')",
-        n.publication
-    ))
-    .await
-    .unwrap();
+    assert!(p.added.is_empty(), "a first start snapshots every table");
+
+    // A table joins and one leaves: resume; the joining table is reported for its snapshot.
     let p = c
         .prepare(Some(&start), &[n.table("b"), n.table("c")])
         .await
         .unwrap();
     assert_eq!(p.plan, StartPlan::Resume);
+    assert_eq!(p.added, [n.table("c")]);
     assert_eq!(published(&a, &n).await, ["b", "c"]);
-    let ops: bool = a
-        .query_one(
+    let empty: [TableRef; 0] = [];
+    c.prepare(Some(&start), &empty).await.unwrap();
+    assert!(published(&a, &n).await.is_empty());
+    cleanup(&a, &n).await;
+}
+
+/// pgoutput reads the publication as of each change's WAL position. A publication repaired at
+/// start covers only what follows, so resuming from the checkpoint would miss what lies between:
+/// the slot is recreated and every table snapshotted instead.
+#[tokio::test]
+async fn a_repaired_publication_re_snapshots() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(&a, "slot_repair", DDL).await;
+    let c = connector(&pipeline(&n, &["*"], "", ""));
+    let tables = [n.table("a")];
+    let p = c.prepare(None, &tables).await.unwrap();
+    let start = from(&p.plan, SnapshotReason::FirstStart);
+    let ops = || async {
+        a.query_one(
             "SELECT pubinsert AND pubupdate AND pubdelete AND pubtruncate FROM pg_publication WHERE pubname = $1",
             &[&n.publication],
         )
         .await
         .unwrap()
+        .get::<_, bool>(0)
+    };
+
+    // Fewer operations: a delete made now would never be published.
+    a.batch_execute(&format!(
+        "ALTER PUBLICATION {} SET (publish = 'insert'); DELETE FROM {}.a",
+        n.publication, n.schema
+    ))
+    .await
+    .unwrap();
+    let p = c.prepare(Some(&start), &tables).await.unwrap();
+    let again = from(&p.plan, SnapshotReason::PositionLost);
+    assert!(ops().await, "every operation published again");
+    assert!(
+        p.warnings.iter().any(|w| w.contains("re-snapshots")),
+        "{:?}",
+        p.warnings
+    );
+    assert!(p.added.is_empty());
+    let SourcePosition::Pg(at) = &again else {
+        unreachable!()
+    };
+    assert_eq!(confirmed(&a, &n).await, Some(*at), "the slot was recreated");
+
+    // A publication dropped behind the pipeline's back: created again, the same way.
+    a.batch_execute(&format!("DROP PUBLICATION {}", n.publication))
+        .await
+        .unwrap();
+    let p = c.prepare(Some(&again), &tables).await.unwrap();
+    from(&p.plan, SnapshotReason::PositionLost);
+    assert_eq!(published(&a, &n).await, ["a"]);
+
+    // Nothing to repair: resume.
+    let SourcePosition::Pg(now) = from(&p.plan, SnapshotReason::PositionLost) else {
+        unreachable!()
+    };
+    let p = c
+        .prepare(Some(&SourcePosition::Pg(now)), &tables)
+        .await
+        .unwrap();
+    assert_eq!(p.plan, StartPlan::Resume);
+    cleanup(&a, &n).await;
+}
+
+#[tokio::test]
+async fn a_slot_of_another_plugin_is_refused() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(&a, "slot_plugin", DDL).await;
+    let at: String = a
+        .query_one(
+            "SELECT lsn::text FROM pg_create_logical_replication_slot($1, 'test_decoding')",
+            &[&n.slot],
+        )
+        .await
+        .unwrap()
         .get(0);
-    assert!(ops, "every operation published again");
-    let empty: [TableRef; 0] = [];
-    c.prepare(Some(&start), &empty).await.unwrap();
-    assert!(published(&a, &n).await.is_empty());
+    let at = SourcePosition::Pg(at.parse().unwrap());
+    let c = connector(&pipeline(&n, &["*"], "", ""));
+    permanent(
+        c.prepare(Some(&at), &[n.table("a")]).await.unwrap_err(),
+        "uses the test_decoding plugin, not pgoutput",
+    );
+    let adopt = connector(&pipeline(
+        &n,
+        &["*"],
+        "",
+        ", slot_on_orphan: adopt_resnapshot",
+    ));
+    permanent(
+        adopt.prepare(None, &[n.table("a")]).await.unwrap_err(),
+        "test_decoding",
+    );
+    assert!(confirmed(&a, &n).await.is_some(), "a slot not ours is kept");
     cleanup(&a, &n).await;
 }
 

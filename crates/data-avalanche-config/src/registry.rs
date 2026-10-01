@@ -498,11 +498,11 @@ pub const RULES: &[RuleMeta] = &[
     ),
     rule(
         "V-059",
-        Warning,
+        ErrorAndWarning,
         "pipeline",
         Config,
         r#"source.postgres.publication"#,
-        r#"Valid identifier; uniqueness per source database (host + port + db) recommended."#,
+        r#"Valid identifier (warning when it needs quoting); unique per source database (host + port + db) across pipelines: an error when a sharing pipeline has slot_management managed, a warning otherwise."#,
     ),
     rule(
         "V-060",
