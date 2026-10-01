@@ -24,6 +24,8 @@ position carrier.
 | P10 | Hop-3b type round-trip (append + MERGE), read back by delta-rs **and cross-read by DuckDB** | ✅ all 15 columns, exact types and values — see below |
 | P10b | protocol of the same table without `timestamp_ntz` | ✅ reader 1 / writer 2 (so `timestamp_ntz` alone raises it to 3 / 7) |
 | P8 | commit atomicity on **real S3** (us-east-1), **GCS** (US) and **Azure Blob** — see below | ✅ P8a–P8e on all three |
+| P11a | a truncate (delete-all) read **before** a foreign OPTIMIZE, committed after it (2026-10-01, debug build) | ❌ **no conflict**: the stale DELETE commits (removes the 4 files OPTIMIZE already removed) and the compacted file keeps all 4 rows — see below (asserted as found, so a fixed delta-rs flips the test) |
+| P11b | the same race for a sink MERGE (2026-10-01) | ✅ refused: `ConcurrentAppend` ("a concurrent transactions added new data"); nothing of the stale MERGE lands |
 
 ### P6 — write amplification (the Delta cost model, measured)
 
@@ -37,6 +39,35 @@ table (≈200× amplification for 5k changes). Cost per flush ∝ table size for
 ∝ change volume for time/sequence-correlated updates. (delta-rs reports `files scanned=0 skipped=40`
 for (b) while removing 40 files — the scan/skip metrics are unreliable; use `files_removed` /
 `rows_copied`.)
+
+### P11 — a truncate outran by a foreign OPTIMIZE (`tests/probe_merge.rs`, 2026-10-01)
+
+Found by the M4 sink's tests (`doc/v1.0/M4-delta-sink.md`, Deviations, final review) and reproduced
+here against the bare crate. Setup: four single-row files; a handle loads the table (the truncate's
+read); a second handle runs `optimize()` (4 files removed, 1 added, all `data_change=false`); then the
+first handle commits.
+
+- **P11a, the predicate-less DELETE, commits.** `DeleteMetrics { num_removed_files: 4,
+  num_deleted_rows: Some(4) }`, history `[DELETE, OPTIMIZE]`, and the table still reads rows 0–3: the
+  DELETE removed the pre-compaction files, and the compacted file is untouched.
+- **P11b, the MERGE, is refused** with `ConcurrentAppend`.
+
+Why, in deltalake-core 1.0 (`kernel/transaction/conflict_checker.rs`, `protocol/mod.rs`):
+- The added-files check (`check_for_added_files_that_should_have_been_read_by_current_txn`) counts
+  OPTIMIZE's added file (`changed_data_added_files` excludes only blind appends). But it applies only
+  when the losing commit declares a read: a read predicate, or `read_whole_table`. A DELETE without a
+  predicate has `read_predicate() == None`, and `read_whole_table()` is true only for a MERGE without
+  a predicate. So the truncate declares no read, and the check finds nothing. The MERGE declares its
+  join predicate, so the compacted file conflicts.
+- The two remove checks consider only the winner's removes with `data_change = true`. OPTIMIZE's
+  removes are `data_change = false`, so they never conflict.
+
+Consequence for the sink: delta-rs can't be trusted to refuse a stale truncate. After its DELETE the
+M4 sink checks that the table holds no files, and treats any that remain as a lost race: it re-reads,
+re-fences and truncates again (D-M4.8 deviation, `4023bf7` on `feat/claude/m4-delta-sink`). That check
+covers any commit that leaves files behind the truncate, not only OPTIMIZE. Because the DELETE declares
+no read, a foreign append racing it is likely not refused either; that case isn't probed (writes to a
+mirrored table by others are outside the sink's contract, and the sink's own writes are fenced by `txn`).
 
 ### Also checked (outside this crate)
 

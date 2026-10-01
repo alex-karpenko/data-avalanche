@@ -445,3 +445,68 @@ async fn p7b_column_mapping_name_blocks_add_column() {
         .expect_err("delta-rs 1.0: ADD COLUMN unsupported under column mapping");
     println!("P7b add-column on column-mapped table: {err}");
 }
+
+/// P11a — a truncate (delete-all) built on a snapshot read before a foreign OPTIMIZE. In delta-rs 1.0
+/// a DELETE without a predicate declares no read, so the added-files check doesn't look at the
+/// compacted file, and the remove checks skip OPTIMIZE's `data_change=false` removes
+/// (`conflict_checker.rs`, `protocol/mod.rs`): the stale DELETE commits and the compacted file keeps
+/// the rows.
+/// Asserted as found, so a delta-rs that detects the conflict flips the test (the M4 sink retries
+/// a truncate that leaves files, `doc/v1.0/M4-delta-sink.md` Deviations).
+#[tokio::test]
+async fn p11a_stale_truncate_outran_by_optimize_keeps_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = table_url(&dir, "p11a");
+    let mut t = create_table(&url, vec![]).await;
+    for k in 0..4 {
+        t = append(t, &[k], "old").await; // one file per row
+    }
+    let stale = t.clone(); // the truncate's read
+    let (_t, om) = reopen(&url).await.optimize().await.unwrap();
+    println!("P11a optimize: files added {} removed {}", om.num_files_added, om.num_files_removed);
+    assert!(om.num_files_removed > 1);
+
+    let r = stale.delete().await;
+    println!("P11a stale delete: {:?}", r.as_ref().map(|(_, m)| m).map_err(|e| e.to_string()));
+    let (_, dm) = r.expect("the stale truncate commits: no conflict is raised");
+    println!("P11a stale delete removed {} files", dm.num_removed_files);
+
+    let t = reopen(&url).await;
+    let hist: Vec<_> = t.history(Some(2)).try_collect().await.unwrap();
+    println!("P11a last ops: {:?}", hist.iter().map(|c| c.operation.clone()).collect::<Vec<_>>());
+    let rows = contents(&t).await;
+    println!("P11a rows after the truncate: {rows:?}");
+    assert_eq!(rows.len(), 4, "the compacted file survives the stale truncate");
+    assert!(t.snapshot().unwrap().log_data().num_files() > 0);
+}
+
+/// P11b — the same race for a sink MERGE (a stale snapshot, a foreign OPTIMIZE, then the MERGE):
+/// what delta-rs 1.0 does when the MERGE's read predates the compaction.
+#[tokio::test]
+async fn p11b_stale_merge_outran_by_optimize() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = table_url(&dir, "p11b");
+    let mut t = create_table(&url, vec![]).await;
+    for k in 1..=4 {
+        t = append(t, &[k], "old").await;
+    }
+    let stale = t.clone();
+    let (_t, om) = reopen(&url).await.optimize().await.unwrap();
+    assert!(om.num_files_removed > 1);
+
+    let cs = ChangeSet { upserts: vec![(1, "new".into())], deletes: vec![2], seq_base: 500 };
+    let r = sink_commit(stale, &cs, 1, "pg:0/B").await;
+    println!("P11b stale merge: {:?}", r.as_ref().map(|(_, m)| m).map_err(|e| format!("{e:#}")));
+
+    let t = reopen(&url).await;
+    let rows = contents(&t).await;
+    println!("P11b rows: {rows:?}");
+    match r {
+        Ok(_) => panic!("P11b: the stale MERGE committed; rows {rows:?}"),
+        Err(e) => {
+            let e = format!("{e:#}");
+            assert!(e.contains("ommit") || e.contains("onflict") || e.contains("oncurrent"), "{e}");
+            assert_eq!(rows.len(), 4, "nothing of the stale MERGE landed");
+        }
+    }
+}
