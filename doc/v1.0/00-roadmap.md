@@ -74,7 +74,7 @@ data-avalanche/
 ├── .github/workflows/            ci.yml (per change) · nightly.yml (matrix) · cloud.yml (real clouds, scheduled/manual)
 ├── test-infra/compose.yaml       PG 14–18, MySQL 8.4, MariaDB 10.11/11.4/11.8, RustFS, Azurite (GCS = real bucket)
 ├── crates/
-│   ├── data-avalanche-core/           domain types: values, events, positions, schema model, change set, Sink trait, errors
+│   ├── data-avalanche-core/           domain types: values, events, positions, schema model, change set, Sink and source traits, errors
 │   ├── data-avalanche-config/         YAML model, strict parse, env substitution, merge, V-rules, resolution, diff
 │   ├── data-avalanche-storage/        object_store backends from globals.cloud, path rules (config §10), VersionedStore (CAS)
 │   ├── data-avalanche-state/          per-pipeline state files + globals.state (anchor, config generations)
@@ -103,7 +103,7 @@ data-avalanche/
 ```
 data-avalanche (bin) ─► api ─► cluster ─► pipeline ─► core
       │             │        │          │  ▲
-      │             │        │          ├──┼── source-pg ─► core
+      │             │        │          ├──┼── source-pg ─► core, config
       │             │        │          ├──┼── source-mysql ─► core
       │             │        │          └──┼── sink-delta ─► core, storage
       │             │        └─► state ─► storage ─► core
@@ -127,8 +127,8 @@ Rules:
 | Delta sink | `deltalake` (features `datafusion`, `rustls`, `s3`, `gcs`, `azure`) + `deltalake-core` | `=1.0.0` both (Q-M4-1: the `deltalake` facade asks for `deltalake-core = "1.0"`, which resolves to 1.1; the direct pin keeps the engine the probes ran on) | delta P1–P10, P8 on S3/GCS/Azure |
 | Object storage / CAS | `object_store` | `0.14.2` (bumped from 0.13.2 on 2026-09-26; deltalake 1.0 requires `^0.13.2`, so M4 adds a second copy, R-13) | API checked; RustFS/Azurite/real-GCS CAS re-run on 0.14.2; T1–T10 re-proof in M2 |
 | Arrow | `arrow` / `parquet` | `59` (as resolved by deltalake) | P9 |
-| PG replication transport | `pgwire-replication` | `=0.4.1` | S-PG0–8 |
-| PG SQL (catalog, chunks) | `tokio-postgres` + `tokio-postgres-rustls` | `0.7` | S-PG probes |
+| PG replication transport | `pgwire-replication` (`default-features = false`, features `tls-rustls`, `scram`, `md5`) | `=0.4.1` | S-PG0–8, re-run as M5's regression tests |
+| PG SQL (catalog, chunks) | `tokio-postgres` + `tokio-postgres-rustls` (trust roots `webpki-roots` 1) | `0.7` / `0.14` | S-PG probes; M5's integration suite |
 | MySQL binlog + SQL | `mysql_async` / `mysql_common` | `=0.37.1` / `=0.37.3` | S-MY0–9 |
 | DDL classifier | `sqlparser` | latest 0.x, pinned in M7 | MySQL_DDL_Classifier §5 |
 | YAML 1.2 (serde) | `serde-saphyr` (`deserialize` only) | `=1.3.0` | Verified in M1 planning (2026-09-27): strict booleans, duplicate-key errors, `Spanned` locations, unknown-key errors with location. One trap: `${…}` inside a flow collection must be quoted (M1 Review Focus 1). R-9 closed |
@@ -382,29 +382,52 @@ pub enum StoreError { Conflict { key }, Contention { key }, Transient { key, rea
 
 Lease release is a **tombstone write** (object_store has no conditional delete). T1–T10 prove the lease CAS on every backend (`tests/lease_conformance.rs`, `test-infra/README.md`).
 
-### 3.6 Source connector (`data-avalanche-pipeline` owns the trait; each source crate implements it)
+### 3.6 Source connector (`data-avalanche-core` owns the trait, Q-M5-2; each source crate implements it; defined in M5)
+
+`data-avalanche-core::source` (M5 Task 1; D-M5.1 lists where it differs from the first sketch):
 
 ```rust
 #[async_trait]
-pub trait SourceConnector: Send + Sync {
-    async fn preflight(&self) -> Result<Preflight, SourceError>;                               // config §11.2 source rows
-    async fn resolve_tables(&self, f: &TableFilter) -> Result<Vec<ResolvedTable>, SourceError>; // channel A (+ skips/halts)
-    async fn current_position(&self) -> Result<SourcePosition, SourceError>;                  // watermarks lw/hw
+pub trait SourceConnector: Send + Sync {                    // built from the resolved Pipeline
+    async fn preflight(&self) -> Result<Preflight, SourceError>;                    // config §11.2 pipeline rows
+    async fn resolve_tables(&self) -> Result<ResolvedTables, SourceError>;         // channel A: tables, halted, skipped, warnings
+    async fn prepare(&self, checkpoint: Option<&SourcePosition>, tables: &[TableRef])
+        -> Result<Prepared, SourceError>;                                           // publication + slot state machine → StartPlan
+    async fn reset_position(&self) -> Result<SourcePosition, SourceError>;         // after PositionUnreachable (D-15.3)
+    async fn retained_bytes(&self) -> Result<Option<u64>, SourceError>;            // the max_wal_lag_bytes measure
+    async fn current_position(&self) -> Result<SourcePosition, SourceError>;       // watermarks lw/hw
     async fn read_chunk(&self, t: &TableSchema, after: Option<&KeysetCursor>, limit: usize) -> Result<Chunk, SourceError>;
-    async fn open_stream(&self, from: &SourcePosition, tables: &[TableRef]) -> Result<Box<dyn ChangeStream>, SourceError>;
-    async fn describe(&self, t: &TableRef) -> Result<Option<TableSchema>, SourceError>;         // channel C; None = gone
-    async fn rescan(&self, tables: &[TableRef]) -> Result<RescanReport, SourceError>;          // channel D
+    async fn fetch_rows(&self, t: &TableSchema, keys: &[Row]) -> Result<Vec<Row>, SourceError>;  // toast_strategy: re_query
+    async fn open_stream(&self, from: &SourcePosition, tables: &[TableSchema]) -> Result<Box<dyn ChangeStream>, SourceError>;
+    async fn augment(&self, cached: &TableSchema, hint: &SchemaHint)
+        -> Result<(SchemaDelta, Option<TableSchema>), SourceError>;                // channel C; None = dropped
+    async fn rescan(&self, known: &[TableSchema]) -> Result<RescanReport, SourceError>;  // channel D
+    async fn teardown(&self) -> Result<(), SourceError>;                           // auto_cleanup
 }
 #[async_trait]
 pub trait ChangeStream: Send {
-    async fn next(&mut self) -> Result<StreamItem, SourceError>;
-    async fn acknowledge(&mut self, durable: &SourcePosition) -> Result<(), SourceError>;       // PG status update; MySQL no-op
+    async fn next(&mut self) -> Result<StreamItem, SourceError>;                   // an error ends the stream
+    async fn acknowledge(&mut self, durable: &SourcePosition) -> Result<(), SourceError>;  // PG status update; MySQL no-op
+    async fn close(self: Box<Self>) -> Result<(), SourceError>;
 }
-pub enum StreamItem { Begin { xid: u64, commit_pos: SourcePosition, commit_ts_micros: i64 },
+pub enum StreamItem { Begin { xid: u64, commit_ts_micros: i64 },                  // no commit position: known at Commit
                       Change(CdcEvent), Truncate { tables: Vec<TableRef>, seq: SourceSeq },
-                      SchemaSignal { table: TableRef, seq: SourceSeq, hint: SchemaHint },       // PG Relation diff / MySQL DDL
+                      SchemaSignal { table: TableRef, seq: SourceSeq, hint: SchemaHint },  // PG Relation diff / MySQL DDL
+                      TableHalt { table: TableRef, seq: SourceSeq, reason: HaltReason },  // an undecodable change
                       Commit(TransactionBoundary), KeepAlive(SourcePosition) }
+pub enum SchemaHint { Columns(Vec<ColumnSchema>), Ddl(String) }
+pub enum StartPlan { Resume, Snapshot { from: SourcePosition, reason: SnapshotReason } }  // FirstStart | PositionLost | AdoptedOrphan
+pub struct Prepared { pub plan: StartPlan, pub warnings: Vec<String> }
+pub enum SourceError { Transient(String), Permanent(String),
+                       PositionUnreachable { position: String, detail: String },
+                       TableHalt { table: TableRef, reason: HaltReason } }
 ```
+
+Also: `Preflight { server_version, warnings }`, `ResolvedTables { tables, halted, skipped, warnings }`,
+`KeysetCursor { key: Row, collation }`, `Chunk { rows, next }`, `RescanReport { dropped, changed,
+halted }`, `identifier_values(&TableSchema, &Row)`. PostgreSQL positions (D-M5.2): a change's
+`source_pos` is its transaction's commit LSN, its `seq` the XLogData `wal_start`; `Commit` carries
+the `end_lsn` that is acknowledged and resumed from.
 
 ### 3.7 Cluster (Clustering §19–§20)
 
@@ -687,19 +710,20 @@ Detailed plan: `M0-foundations.md`.
 ### M5 — PostgreSQL source (`data-avalanche-source-pg`)
 
 - **Scope:**
-  - pgoutput v1 decoder, production grade: all messages, text and binary tuples, unchanged-TOAST,
-    origin, type messages.
+  - pgoutput v1 decoder, production grade: all messages, text tuples (Q-M5-3: the stream never
+    asks for binary, and a binary datum is a protocol error), unchanged-TOAST, origin, type messages.
   - OID → `ColumnValue` decode for the whole Type_Mapping PG table, plus the unsupported-type fallback
     chain, `numeric` precision cap and array element resolution.
-  - Replication client wrapper: session pinning, status/wakeup interval = heartbeat, acknowledgment,
-    reconnect with backoff.
+  - Replication client wrapper: session pinning, status/wakeup interval = heartbeat, acknowledgment.
+    The stream doesn't reconnect by itself: a `Transient` error ends it, and M6 reopens from the
+    checkpoint with its backoff (M5 D-M5.4).
   - Slot state machine (D-15.1–15.3: managed / require_existing, orphan policy, WAL-gone → re-snapshot).
   - Publication reconciliation (D-15.4).
   - Preflight checks (config §11.2 PG rows).
   - Catalog channels: A (baseline, identifier, replica identity, reserved names), C (`attnum` diff,
     rename proof), D (batched rescan, **dropped OID → `TableDropped`**).
   - Keyset chunk reader with a `COLLATE "C"` cursor and `pg_current_wal_lsn()` watermarks.
-  - `max_wal_lag_bytes` guard.
+  - The `max_wal_lag_bytes` measure (`retained_bytes`); the halt is M6's.
 - **Deps:** M1, M3.
 - **Exit:**
   - Against PG 18 (every change) and PG 14–17 (nightly), every probe gate S-PG0…8 has a regression test.
@@ -740,6 +764,15 @@ Detailed plan: `M0-foundations.md`.
     together with the identifier-change path.
   - `Sink::evolve` carries no marker, so a zombie's ADD COLUMN isn't fenced. It is idempotent, but
     the trait question is open.
+- **Carried from M5** (`M5-pg-source.md`):
+  - Persist the start position right after `prepare` creates the slot. A crash before the first
+    checkpoint otherwise leaves an orphan slot, and the next start meets `slot_on_orphan`.
+  - The reconnect backoff: a stream error ends the stream, and the pipeline reopens it from the
+    checkpoint (D-M5.4).
+  - The `max_wal_lag_bytes` halt, comparing against `SourceConnector::retained_bytes` (V-104).
+  - Keep-alives can arrive often (each heartbeat, and on every server keep-alive); don't do per-item
+    work that assumes they are rare.
+  - `toast_strategy: re_query` calls `fetch_rows` (Q-M5-6).
 - **Deps:** M1, M2, M3, M4, M5.
 - **Exit:** the **slice-1 E2E suite** passes on PG 18 + RustFS and nightly on PG 14–17. See §5.3 for
   the scenario list.
@@ -888,8 +921,10 @@ preconditions (re-checked 2026-09-26 with `object_store` 0.14.2: still `400 inva
 fake-gcs issue #994 still open), so GCS tests use a real bucket (P-10; `DATA_AVALANCHE_GCS_BUCKET` + `GOOGLE_SERVICE_ACCOUNT_PATH`,
 opt-out `DATA_AVALANCHE_SKIP_GCS=1`).
 Profile `matrix` adds `postgres-14…17`, `mariadb-1011` and `mariadb-114`; profile `init` holds the
-one-shot bucket/container creators. Later milestones add `postgres-tls` (M5, a CA-signed
-certificate, as S-PG8 needed) and `mysql-84-nogtid` (M7, GTID **off** for file/position tests).
+one-shot bucket/container creators. M5 adds `postgres-tls` to the default profile (port 55419: TLS
+required on every TCP connection; a throwaway CA, server certificate and client certificate made at
+each start, the CA and client pair written to the git-ignored `test-infra/.tls/`). M7 adds
+`mysql-84-nogtid` (GTID **off** for file/position tests).
 Every service uses a fixed, non-default host port listed in `test-infra/README.md`; Azurite keeps
 10000 because `object_store`'s emulator mode targets `127.0.0.1:10000`. Source servers are configured
 as the preconditions require: PG `wal_level=logical`; MySQL/MariaDB ROW / FULL image / FULL metadata /
@@ -929,7 +964,9 @@ fake-gcs FAIL (risk R-3).
   annotation, but never fails the job. Requires secret
   `GCP_SA_KEY` (service-account JSON, `roles/storage.objectAdmin` on the bucket) and variable
   `DATA_AVALANCHE_GCS_BUCKET`, documented in `test-infra/README.md` and in the workflow comments.
-- `nightly.yml`: full DB matrix, full E2E, longer property-test case counts.
+- `nightly.yml` (scheduled + manual; from M5): full DB matrix (M5: the PostgreSQL source suite on
+  PostgreSQL 14–17, one job each, through `DATA_AVALANCHE_PG_PORT`), full E2E, longer property-test
+  case counts.
 - `cloud.yml` (weekly + manual): T1–T10 and the Delta P8 re-run on real S3/GCS/Azure, plus one E2E per
   cloud. Credentials are repository secrets injected as env vars; nothing is printed.
 
@@ -1035,6 +1072,7 @@ the naming below (2026-09-26).**
 | D-IMPL-9 | M2 storage/state rulings **D-M2.1…D-M2.15** (listed in `M2-storage-and-state.md` §Decisions and rulings, each pinned by a test). Among them: `StoreError` is `Conflict` / `Contention` / `Transient` / `Permanent` with no `NotFound` (§3.5 now shows the landed interface); `Timeouts::COORDINATION` bounds a storage call to about 8 s; the lease tombstone keeps `owner_epoch`; config snapshots are the raw text under a content-addressed name with a `blake3:` hash | The specs and research docs are silent on these; each keeps the lease and state safe under races, hangs and hand-edited objects | M2 — **approved 2026-09-28** |
 | D-IMPL-10 | M3 core data-path rulings **D-M3.1…D-M3.18** (listed in `M3-core-data-path.md` §Decisions and rulings, each pinned by a test). Among them: unchanged TOAST fills from the row's previous image, under its old key after a key change; Hop 2 uses `Utf8`/`Binary` with 512 MiB batch rollover; a flush takes only complete transactions and covers `checkpoint..=frontier`; barriers return `FlushRequired` (seal → flush → apply); a split slice ends at its transaction's start and is guard-skipped only when the stored position is strictly past it | The specs are silent on these, or (D-M3.14) were wrong; the property tests prove replay convergence | M3 — **approved 2026-09-30** |
 | D-IMPL-11 | M4 Delta-sink rulings **D-M4.1…D-M4.15** (listed in `M4-delta-sink.md` §Decisions and rulings, each pinned by a test). Among them: every column carries its logical type in the Delta column metadata, so `table_state` reads Hop 2 back; the MERGE matches on the identifier only (no partition pruning); a zombie that loses a race is retried and ends `Fenced`; the walk-back stops at the cached own version, after 1000 commits or at a cleaned-up commit file; a truncate's DELETE carries no position; a set that changes no row gets a marker-only commit | The specs are silent on these; each keeps the fence, the guard or the round trip exact | M4 — **approved 2026-09-30** |
+| D-IMPL-12 | M5 PostgreSQL-source rulings **D-M5.1…D-M5.19** (listed in `M5-pg-source.md` §Decisions and rulings, each pinned by a test). Among them: the source contract lives in core with `prepare`, `augment`, `fetch_rows` and `TableHalt` (§3.6); a change's position is its commit LSN, `Commit` carries the `end_lsn` that is acknowledged; a Relation signal is emitted with the next change's sequence; the stream doesn't reconnect by itself; the slot state table as one function; a publication the pipeline can't change that publishes via the partition root while tracking a partition is refused; snapshot rows are read as output-function text, keys in `COLLATE "C"` | The specs are silent on these; each keeps the stream's positions, the slot or the round trip exact | M5 — **approved 2026-10-01** |
 
 ### 9.1 Questions answered at plan review (2026-09-26)
 
@@ -1063,6 +1101,15 @@ the naming below (2026-09-26).**
 | Q-M4-4 (2026-09-30) | Where do the M4 integration tests run? | **Local and RustFS (the exit), plus Azurite, the DuckDB cross-read in CI, and real GCS in PR CI** | `M4-delta-sink.md` Tasks 10–13 |
 | Q-M4-5 (2026-09-30) | delta-kernel decodes a table path twice, so `%XX` escapes break tables named with `%`, `/`, a control character, `.`/`..` | **Table roots escape with `~XX`** (`escape_table_segment`); state keys keep `%XX` | §3.5; `M4-delta-sink.md` Task 1; `M2-storage-and-state.md` D-M2.4 |
 | Q-M4-6 (2026-09-30) | DuckDB can't open a Delta table under a non-ASCII path | **Keep non-ASCII names verbatim**; the operator docs list the limit (R-12) | `M4-delta-sink.md` |
+| Q-M5-2 (2026-10-01) | Where does the source trait live? | **In `data-avalanche-core`**, next to `Sink` (§3.6) | `M5-pg-source.md` |
+| Q-M5-3 (2026-10-01) | Binary tuples? | **Text only**; a binary datum is a protocol error | `M5-pg-source.md`; §4 M5 |
+| Q-M5-4 (2026-10-01) | `pgwire-replication` takes TLS files; config allows inline PEM | **An inline PEM becomes a private temporary file** (0600 in a 0700 directory, removed on drop) | `M5-pg-source.md` |
+| Q-M5-5 (2026-10-01) | Partitioned tables | **The leaves replicate as tables**; a partitioned parent is skipped with a warning; `publish_via_partition_root = false`, and a publication the pipeline can't change that publishes via the root while a partition is tracked is refused | `M5-pg-source.md` D-M5.14 |
+| Q-M5-6 (2026-10-01) | Who builds the `re_query` keyed re-read? | **M5 adds `fetch_rows`**; M6 calls it | §3.6 |
+| Q-M5-7 (2026-10-01) | Where do PostgreSQL 14–17 run? | **`nightly.yml`**, one job per version | §5.4 |
+| Q-M5-8 (2026-10-01) | A bare `numeric` under `numeric_overflow_action: error` | **`decimal(38,18)`, halting per value** (`NUMERIC_OVERFLOW`) | `Type_Mapping.md` §PostgreSQL-specific notes |
+| Q-M5-9 (2026-10-01) | The `varbit` value layout | **PostgreSQL's binary form**: a 4-byte big-endian bit count, then the bits packed MSB-first | `Type_Mapping.md` |
+| Q-M5-10 (2026-10-01) | `sslmode=require` with `ssl_ca` set: check the chain, as libpq does? | **No**: `require` encrypts without checking the chain on both connections; only `verify-ca` / `verify-full` check it | `M5-pg-source.md` D-M5.16 |
 | Q-M9-1 | Snapshot-job persistence | **Persisted in the pipeline state location** (`snapshots/jobs/<job_id>.json`); listed after a restart or failover via `GET /v1/pipelines/{id}/snapshots`; a running job continues on the new owner from its chunk cursors | `Data-Flow.md` §On-Demand Snapshot + State Layout; System-Overview and API_RBAC endpoint tables |
 
 ### 9.2 Open questions (answer before the named milestone)

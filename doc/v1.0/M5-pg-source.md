@@ -153,7 +153,7 @@ the arrow.
 | Q-M5-9 | The `varbit` value layout ("length-prefixed") | **PostgreSQL's binary form**: a 4-byte big-endian bit count, then the bits packed MSB-first, the last byte zero-padded |
 | Q-M5-10 | libpq treats `sslmode=require` with a root CA file as `verify-ca`. Should `require` with `ssl_ca` set check the chain? | **No: `require` encrypts without checking the chain**, on both connections, whether or not `ssl_ca` is set (D-M5.16). Only `verify-ca` and `verify-full` check it |
 
-**Rulings where the specs are silent** (each is pinned by a test):
+**Rulings where the specs are silent** (each is pinned by a test). **Plan approved 2026-10-01**, with these rulings (roadmap D-IMPL-12):
 
 | # | Ruling | Why | Pinned by |
 |---|---|---|---|
@@ -192,8 +192,8 @@ the arrow.
   the first `recv`. A server error reads `"<message> (SQLSTATE xxxxx)"`. The walsender's
   `application_name` is fixed to `pgwire-replication`.
 
-**Documents this plan changes** (applied with the plan commit once it is approved, in a
-`research:` commit and an `infra:` commit):
+**Documents this plan changes** (applied at plan approval, 2026-10-01, in a `research:` commit and
+an `infra:` commit; `test-infra/README.md` changes in Task 13):
 
 - Roadmap:
   - §2: the source contract lives in core (Q-M5-2).
