@@ -11177,3 +11177,19 @@ The test fails once the crate forgives the mismatch, which is the signal to drop
   round trip, and the Delta type round trip with the DuckDB cross-read all pass with the feature.
   The new test is `json_numbers_keep_their_digits`, so Task 4's unit-test count is 35, and each
   later task's count is one higher than its block shows.
+
+**Task 5: two fixes to the planned code** (`ce1cb9c`; found by the task review, owner decision
+2026-10-01):
+
+- **`int2vector` and `oidvector` are read as text.** Their `pg_type` category is `A`, so the plan
+  treated them as arrays. Their text has no braces, though (`1 2 3`, measured on PostgreSQL 18), so
+  every value failed and the table halted with `SCHEMA_MISMATCH`. OIDs 22 and 30 are now in
+  `TEXT_OIDS`, and `built_in_scalars` checks them. `TEXT_OIDS` now has one comment line per group
+  (rustfmt had moved each comment to the end of the previous group).
+- **A `list<decimal(P,S)>` override rescues a `numeric[]` column** (D-M5.10 extended). The planned
+  decimal override looked only at the column's base type, so an array of `numeric` or `money` got
+  `SCHEMA_MISMATCH`. That left the V-079 remedy unusable for a bare or over-wide `numeric[]`.
+  `decimal_override` now follows an array to its element, through domains, and decodes each
+  element as the decimal named. The new test is `a_decimal_list_override_rescues_a_numeric_array`,
+  so Task 5's unit-test count is 42, and each later task's count is two higher than its block
+  shows.
