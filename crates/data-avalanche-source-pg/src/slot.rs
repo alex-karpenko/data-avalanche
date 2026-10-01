@@ -16,13 +16,17 @@ use crate::connect::within;
 use crate::connector::PgConnector;
 use crate::position::{lsn_of, parse_lsn};
 
-/// What [`PgConnector::reconcile_publication`] did and noticed.
+/// What [`PgConnector::reconcile_publication`] would change, and what it noticed. Nothing is
+/// applied until `prepare` has decided about the slot.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Reconciled {
-    /// It created the publication, or changed what it publishes for every table (its operations,
-    /// `publish_via_partition_root`). The WAL before now was decoded under the old definition.
+    /// The statements that bring the publication in line (`managed` only), in order.
+    pub sql: Vec<String>,
+    /// They create the publication, or change what it publishes for tracked tables (its
+    /// operations; `publish_via_partition_root` while a tracked table is a partition). The WAL
+    /// before now was decoded under the old definition.
     pub rewritten: bool,
-    /// Tracked tables it added to the publication.
+    /// Tracked tables they add to the publication.
     pub added: Vec<TableRef>,
     pub warnings: Vec<String>,
 }
@@ -222,7 +226,8 @@ impl PgConnector {
     /// (created when absent, then `ALTER PUBLICATION … ADD/DROP TABLE` and `SET`); under
     /// `require_existing`, it must exist and a tracked table it doesn't publish warns. A
     /// publication this can't change (`require_existing`, `FOR ALL TABLES`) that publishes via the
-    /// partition root while a tracked table is a partition is refused.
+    /// partition root while a tracked table is a partition is refused. Reads only: the statements
+    /// come back in [`Reconciled::sql`].
     pub(crate) async fn reconcile_publication(
         &self,
         client: &Client,
@@ -259,10 +264,8 @@ impl PgConnector {
                     list.join(", ")
                 )
             };
-            self.conn
-                .command("create the publication", client.batch_execute(&sql))
-                .await?;
             return Ok(Reconciled {
+                sql: vec![sql],
                 rewritten: true,
                 ..Reconciled::default()
             });
@@ -341,30 +344,46 @@ impl PgConnector {
                 extra.join(", ")
             ));
         }
-        let rewritten = !every_op || via_root;
-        if rewritten {
+        if !every_op || via_root {
             sql.push(format!(
                 "ALTER PUBLICATION {} SET (publish = 'insert, update, delete, truncate', publish_via_partition_root = false)",
                 ident(name)
             ));
         }
-        if !sql.is_empty() {
-            self.conn
-                .command(
-                    "reconcile the publication",
-                    client.batch_execute(&sql.join("; ")),
-                )
-                .await?;
-        }
+        // Publishing via the root mattered only for tracked partitions: their changes arrived
+        // under the parent's name.
+        let partitioned = via_root
+            && !self
+                .conn
+                .command("find partitions", partitions(client, tables))
+                .await?
+                .is_empty();
         Ok(Reconciled {
-            rewritten,
+            sql,
+            rewritten: !every_op || partitioned,
             added: missing.into_iter().cloned().collect(),
             warnings,
         })
     }
 
-    /// The publication first (its changes are decoded with the catalog as of their WAL position,
-    /// so it must exist before the slot's start), then the slot state machine.
+    /// Runs [`Reconciled::sql`] as one implicit transaction: all of it or none.
+    async fn apply_publication(&self, client: &Client, sql: &[String]) -> Result<(), SourceError> {
+        if sql.is_empty() {
+            return Ok(());
+        }
+        self.conn
+            .command(
+                "reconcile the publication",
+                client.batch_execute(&sql.join("; ")),
+            )
+            .await
+    }
+
+    /// The slot state machine, with the publication's repair (its changes are decoded with the
+    /// catalog as of their WAL position, so it must be in place before a new slot's start). The
+    /// order survives a retry: a refusal changes nothing; a repair that rewrites the publication
+    /// drops the slot before it changes the publication, so a retry finds no slot and re-snapshots
+    /// rather than resuming over WAL the old publication didn't publish.
     pub async fn prepare(
         &self,
         checkpoint: Option<&SourcePosition>,
@@ -373,6 +392,7 @@ impl PgConnector {
         let checkpoint = checkpoint.map(lsn_of).transpose()?;
         let client = self.conn.client().await?;
         let Reconciled {
+            sql,
             rewritten,
             added,
             mut warnings,
@@ -409,11 +429,16 @@ impl PgConnector {
             from: SourcePosition::Pg(from),
             reason,
         };
+        if let SlotAction::Refuse(m) = action {
+            return Err(SourceError::Permanent(m));
+        }
+        if let SlotAction::Recreate(_) = action {
+            self.drop_slot(&client).await?;
+        }
+        self.apply_publication(&client, &sql).await?;
         let plan = match action {
             SlotAction::Resume => StartPlan::Resume,
-            SlotAction::Create(reason) => snapshot(self.create_slot(&client).await?, reason),
-            SlotAction::Recreate(reason) => {
-                self.drop_slot(&client).await?;
+            SlotAction::Create(reason) | SlotAction::Recreate(reason) => {
                 snapshot(self.create_slot(&client).await?, reason)
             }
             SlotAction::Adopt => {
@@ -429,7 +454,7 @@ impl PgConnector {
                 .await?;
                 snapshot(parse_lsn(row.get(0))?, SnapshotReason::AdoptedOrphan)
             }
-            SlotAction::Refuse(m) => return Err(SourceError::Permanent(m)),
+            SlotAction::Refuse(_) => unreachable!("refused above"),
         };
         let added = match plan {
             StartPlan::Resume => added,

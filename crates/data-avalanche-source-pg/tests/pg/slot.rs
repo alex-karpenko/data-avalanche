@@ -305,6 +305,16 @@ async fn a_slot_of_another_plugin_is_refused() {
         "test_decoding",
     );
     assert!(confirmed(&a, &n).await.is_some(), "a slot not ours is kept");
+    assert!(
+        a.query_opt(
+            "SELECT 1 FROM pg_publication WHERE pubname = $1",
+            &[&n.publication]
+        )
+        .await
+        .unwrap()
+        .is_none(),
+        "a refusal changes nothing, not even the publication"
+    );
     cleanup(&a, &n).await;
 }
 

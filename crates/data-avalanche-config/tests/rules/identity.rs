@@ -78,6 +78,22 @@ pub fn cases() -> Vec<Case> {
         }),
         case(
             "V-059",
+            Error,
+            "a quoted publication shared, managed",
+            || {
+                two_pipelines()
+                    .set(
+                        "/pipelines/p/source/postgres/publication",
+                        json!("Orders-Pub"),
+                    )
+                    .set(
+                        "/pipelines/q/source/postgres/publication",
+                        json!("Orders-Pub"),
+                    )
+            },
+        ),
+        case(
+            "V-059",
             Warning,
             "publication shared, require_existing",
             || {

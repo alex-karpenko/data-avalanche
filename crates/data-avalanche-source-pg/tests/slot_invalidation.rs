@@ -28,38 +28,42 @@ async fn an_invalidated_slot_is_recreated() {
         panic!("a first start snapshots")
     };
 
-    // WAL past the slot, beyond a 1 MB allowance, then a checkpoint removes it.
-    // ALTER SYSTEM can't run in the implicit transaction of a multi-statement batch.
-    for sql in [
-        "ALTER SYSTEM SET max_slot_wal_keep_size = '1MB'",
-        "SELECT pg_reload_conf()",
-    ] {
-        a.batch_execute(sql).await.unwrap();
-    }
-    for _ in 0..3 {
-        a.batch_execute(&format!(
-            "INSERT INTO {}.t DEFAULT VALUES; SELECT pg_switch_wal()",
-            n.schema
-        ))
-        .await
-        .unwrap();
-    }
-    let lost = a.batch_execute("CHECKPOINT").await.map(|_| ());
-    let status: Option<String> = a
-        .query_one(
+    // WAL past the slot, beyond a 1 MB allowance, then a checkpoint removes it. Every step is
+    // fallible, not panicking, so the setting is restored whatever happens; the first reset undoes
+    // an earlier run that died before its own. ALTER SYSTEM can't run in the implicit transaction
+    // of a multi-statement batch, hence one statement per call.
+    let keep = |size: &'static str| {
+        let a = &a;
+        async move {
+            let set = match size {
+                "default" => "ALTER SYSTEM RESET max_slot_wal_keep_size".to_string(),
+                s => format!("ALTER SYSTEM SET max_slot_wal_keep_size = '{s}'"),
+            };
+            a.batch_execute(&set).await?;
+            a.batch_execute("SELECT pg_reload_conf()").await
+        }
+    };
+    keep("default").await.unwrap();
+    let invalidate = async {
+        keep("1MB").await?;
+        for _ in 0..3 {
+            a.batch_execute(&format!(
+                "INSERT INTO {}.t DEFAULT VALUES; SELECT pg_switch_wal()",
+                n.schema
+            ))
+            .await?;
+        }
+        a.batch_execute("CHECKPOINT").await?;
+        a.query_one(
             "SELECT wal_status FROM pg_replication_slots WHERE slot_name = $1",
             &[&n.slot],
         )
         .await
-        .unwrap()
-        .get(0);
-    for sql in [
-        "ALTER SYSTEM RESET max_slot_wal_keep_size",
-        "SELECT pg_reload_conf()",
-    ] {
-        a.batch_execute(sql).await.unwrap();
+        .map(|r| r.get::<_, Option<String>>(0))
     }
-    lost.unwrap();
+    .await;
+    keep("default").await.unwrap();
+    let status = invalidate.unwrap();
     assert_eq!(status.as_deref(), Some("lost"));
 
     let p = c.prepare(Some(&from), &tables).await.unwrap();

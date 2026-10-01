@@ -195,9 +195,9 @@ pub trait SourceConnector: Send + Sync {
     /// new consistent position to snapshot from and stream after.
     async fn reset_position(&self) -> Result<SourcePosition, SourceError>;
 
-    /// How many bytes of log the source keeps for the pipeline beyond its acknowledged position
-    /// (PostgreSQL: WAL the slot retains, the `max_wal_lag_bytes` guard). `None` when the source
-    /// keeps nothing for it.
+    /// How many bytes of log the source keeps on disk for the pipeline (PostgreSQL: the WAL from
+    /// the slot's `restart_lsn`, the `max_wal_lag_bytes` guard). `None` when the source keeps
+    /// nothing for it.
     async fn retained_bytes(&self) -> Result<Option<u64>, SourceError>;
 
     /// The source's current position: a snapshot chunk's low and high watermarks.

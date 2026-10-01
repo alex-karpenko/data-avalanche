@@ -208,7 +208,9 @@ pub(crate) fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut
                         shown(l, &publication)
                     ),
                 );
-            } else if let (Some((host_leaf, host)), Some((port_leaf, port)), Some((db_leaf, db))) =
+            }
+            // Uniqueness applies to every name, quoted or not.
+            if let (Some((host_leaf, host)), Some((port_leaf, port)), Some((db_leaf, db))) =
                 (&host, &port, &db)
             {
                 let publication_shown = shown(l, &publication);
