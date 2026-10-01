@@ -364,6 +364,29 @@ Any column type encountered that is not in the tables above follows this priorit
          continue processing other columns in the table
 ```
 
+**Override conversions (Q-M5-12, 2026-10-01).** Step 1 is applied by the source decoder at Hop 1,
+since Hop 2 converts nothing (D-M3.6). An override equal to the column's mapped type changes
+nothing. `string` keeps the source's text, and `decimal(P,S)` on a numeric/decimal column (or
+`list<decimal(P,S)>` on an array of them) decodes as that decimal, halting `NUMERIC_OVERFLOW` per
+value that doesn't fit. Otherwise the override must be one of the lossless conversions in
+`data-avalanche-core` (`conversion`, `ColumnValue::convert`), which keep every value of the source
+type:
+
+| From | To |
+|---|---|
+| `int16` | `int32`, `int64`, `float64`, `decimal(P,S)` with `P − S ≥ 5` |
+| `int32` | `int64`, `float64`, `decimal(P,S)` with `P − S ≥ 10` |
+| `int64` | `decimal(P,S)` with `P − S ≥ 19` |
+| `float32` | `float64`, through the shortest decimal text (`0.1` stays `0.1`) |
+| `timestamp_ntz` | `timestamp_tz`: the wall clock read as UTC (as `timestamp_ntz_as: timestamp`) |
+| `timestamp_tz` | `timestamp_ntz`: the UTC wall clock |
+| `date` | `timestamp_ntz`, `timestamp_tz`: midnight; `±infinity` stays infinite, beyond 294276 AD clamps (Q-M5-1) |
+| `list<T>` | `list<U>` when `T → U` is one of the above |
+
+Any other override halts the table at resolution (`SCHEMA_MISMATCH`). That covers narrowing, a
+float to a decimal, a decimal to a float, `int64 → float64`, `timestamp → date`, and text parsed as
+`uuid` or `json`.
+
 This policy ensures no data is silently lost. All fallbacks are logged at `WARN` or above so
 operators know which columns require attention.
 
