@@ -568,6 +568,21 @@ mod tests {
     }
 
     #[test]
+    fn json_numbers_keep_their_digits() {
+        // jsonb numbers are `numeric`: serde_json's `arbitrary_precision` keeps their digits.
+        for n in [
+            "12345678901234567890123".to_owned(),
+            "0.10000000000000000000001".to_owned(),
+            format!("1{}", "0".repeat(400)),
+        ] {
+            let V::Json(v) = ok(Decode::Json, &format!(r#"{{"a": {n}}}"#)) else {
+                panic!("not json");
+            };
+            assert_eq!(v.to_string(), format!(r#"{{"a":{n}}}"#));
+        }
+    }
+
+    #[test]
     fn numerics_and_money() {
         assert_eq!(
             ok(Decode::Numeric, "-12.340"),
