@@ -137,7 +137,7 @@ Rules:
 | Metrics | `prometheus-client` | | |
 | Tracing | `tracing`, `tracing-subscriber`, `opentelemetry-otlp` | | |
 | CLI | `clap` `4` | | |
-| Misc | `thiserror` 2, `async-trait`, `bytes`, `chrono`, `uuid`, `serde_json`, `humantime`, `xxhash-rust` (ring hash, anchor `hash_algo: xxh3`), `proptest` (dev) | | |
+| Misc | `thiserror` 2, `async-trait`, `bytes`, `chrono`, `uuid`, `serde_json` (feature `arbitrary_precision`: JSON numbers keep every digit, Q-M5-11), `humantime`, `xxhash-rust` (ring hash, anchor `hash_algo: xxh3`), `proptest` (dev) | | |
 
 ---
 
@@ -1110,6 +1110,7 @@ the naming below (2026-09-26).**
 | Q-M5-8 (2026-10-01) | A bare `numeric` under `numeric_overflow_action: error` | **`decimal(38,18)`, halting per value** (`NUMERIC_OVERFLOW`) | `Type_Mapping.md` §PostgreSQL-specific notes |
 | Q-M5-9 (2026-10-01) | The `varbit` value layout | **PostgreSQL's binary form**: a 4-byte big-endian bit count, then the bits packed MSB-first | `Type_Mapping.md` |
 | Q-M5-10 (2026-10-01) | `sslmode=require` with `ssl_ca` set: check the chain, as libpq does? | **No**: `require` encrypts without checking the chain on both connections; only `verify-ca` / `verify-full` check it | `M5-pg-source.md` D-M5.16 |
+| Q-M5-11 (2026-10-01) | JSON numbers went through `f64` (rounded beyond 15–17 digits; beyond the `f64` range the table halted) | **serde_json `arbitrary_precision`, workspace-wide**: `jsonb` numbers are `numeric` and keep every digit | §2.1; `Type_Mapping.md`; `M5-pg-source.md` Deviations, Task 4 |
 | Q-M9-1 | Snapshot-job persistence | **Persisted in the pipeline state location** (`snapshots/jobs/<job_id>.json`); listed after a restart or failover via `GET /v1/pipelines/{id}/snapshots`; a running job continues on the new owner from its chunk cursors | `Data-Flow.md` §On-Demand Snapshot + State Layout; System-Overview and API_RBAC endpoint tables |
 
 ### 9.2 Open questions (answer before the named milestone)

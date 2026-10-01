@@ -11161,3 +11161,19 @@ Owner ruling (2026-10-01): keep the code and pin the difference with a test. Tas
 `verify_ca_by_an_unnamed_address_passes_the_catalog_but_not_the_stream`, and `postgres-tls`'s
 server certificate now names `localhost` only, so connecting by `127.0.0.1` is a name mismatch.
 The test fails once the crate forgives the mismatch, which is the signal to drop this deviation.
+
+**Task 4: two fixes to the planned code** (both found by the task review):
+
+- **Out-of-range timestamps clamp** (`aba85ec`). The planned `timestamp()` halted the table when
+  an instant didn't fit in `i64` microseconds (PostgreSQL stores 294247–294276 AD). Q-M5-1 and
+  Type_Mapping §Date/time edge values say those clamp to the Arrow maximum, so the code now
+  computes in `i128` and clamps. The unit test expects `i64::MAX` for `294276-12-31
+  23:59:59.999999`.
+- **JSON numbers keep their digits** (`fedfc22`, owner decision Q-M5-11, 2026-10-01). Without
+  serde_json's `arbitrary_precision`, every JSON number went through `f64`. A 23-digit integer was
+  rounded, `0.10000000000000000000001` became `0.1`, and a 401-digit number halted the table,
+  though `jsonb` numbers are `numeric`. The workspace now builds `serde_json` with
+  `arbitrary_precision`. Measured before deciding: the whole workspace suite, the PostgreSQL type
+  round trip, and the Delta type round trip with the DuckDB cross-read all pass with the feature.
+  The new test is `json_numbers_keep_their_digits`, so Task 4's unit-test count is 35, and each
+  later task's count is one higher than its block shows.
