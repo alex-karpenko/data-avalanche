@@ -10580,13 +10580,15 @@ git commit -m "test(source-pg): the type round trip"
 - Produces: the `postgres-tls` service (port 55419) and `nightly.yml`.
 
 S-PG8 and Q-M5-7. `postgres-tls` refuses any TCP connection without TLS. At each start it
-makes a throwaway CA, a server certificate for `localhost` and `127.0.0.1`, and a client
-certificate for the role `avalanche_cert`. It writes the CA and the client pair to the git-ignored
+makes a throwaway CA, a server certificate for `localhost` only, and a client certificate for the
+role `avalanche_cert`. It writes the CA and the client pair to the git-ignored
 `test-infra/.tls/`; the server key stays in the container. The tests check, in `pg_stat_ssl`, that
 the catalog and the replication connection both run over TLS: once under `verify-full` with an
 inline CA, and once with a client certificate and an inline key (written to private files for the
 replication connection, Q-M5-4). A foreign CA (under `verify-full` and `verify-ca`) and `disable`
-are refused as `Permanent`.
+are refused as `Permanent`. `verify-ca` by `127.0.0.1`, a name the certificate lacks, passes on
+the catalog connection and is refused on the stream: this pins the Task 2 deviation
+(pgwire-replication 0.4.1 checks the name under `verify-ca`).
 
 `nightly.yml` runs the suite on PostgreSQL 14–17, one job each, through `DATA_AVALANCHE_PG_PORT`.
 The TLS tests need `postgres-tls` and run in `ci.yml` only.
@@ -10664,9 +10666,9 @@ async fn admin() -> Client {
     client
 }
 
-/// A pipeline on `postgres-tls` as `user`, with `ssl` (YAML flow entries) and `env` for its
-/// `${…}` references.
-fn pipeline(n: &Names, user: &str, ssl: &str, env: &[(&str, String)]) -> Pipeline {
+/// A pipeline on `postgres-tls` at `host` as `user`, with `ssl` (YAML flow entries) and `env` for
+/// its `${…}` references. The server certificate names `localhost` only.
+fn pipeline(n: &Names, host: &str, user: &str, ssl: &str, env: &[(&str, String)]) -> Pipeline {
     let yaml = format!(
         r#"
 config_version: 1
@@ -10676,7 +10678,7 @@ pipelines:
   p:
     id: p
     source:
-      host: localhost
+      host: {host}
       port: {PORT}
       db: avalanche
       user: {user}
@@ -10755,6 +10757,7 @@ async fn verify_full_with_an_inline_ca_encrypts_both_connections() {
     let n = fresh(&a, "tls_full", "CREATE TABLE t (id int PRIMARY KEY);").await;
     let p = pipeline(
         &n,
+        "localhost",
         "avalanche",
         "ssl_mode: verify-full\n      ssl_ca: \"${CA}\"",
         &[("CA", read("ca.crt"))],
@@ -10777,6 +10780,7 @@ async fn a_client_certificate_with_an_inline_key_authenticates_both_connections(
     let ca = material("ca.crt").to_string_lossy().into_owned();
     let p = pipeline(
         &n,
+        "localhost",
         "avalanche_cert",
         "ssl_mode: verify-full\n      ssl_ca: \"${CA}\"\n      ssl_cert: \"${CERT}\"\n      ssl_key: \"${KEY}\"",
         &[
@@ -10792,6 +10796,37 @@ async fn a_client_certificate_with_an_inline_key_authenticates_both_connections(
         assert!(ssl);
         assert_eq!(dn.as_deref(), Some("/CN=avalanche_cert"));
     }
+    cleanup(&a, &n).await;
+}
+
+/// `verify-ca` ignores the host name on the catalog connection (D-M5.16) but not on the
+/// replication connection: pgwire-replication 0.4.1 forgives only rustls's `NotValidForName`, and
+/// rustls 0.23 reports `NotValidForNameContext` (the plan's Deviations, Task 2). This pins the
+/// difference: once the crate forgives the mismatch, the stream connects and this test fails.
+#[tokio::test]
+async fn verify_ca_by_an_unnamed_address_passes_the_catalog_but_not_the_stream() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(&a, "tls_verify_ca", "CREATE TABLE t (id int PRIMARY KEY);").await;
+    let p = pipeline(
+        &n,
+        "127.0.0.1",
+        "avalanche",
+        "ssl_mode: verify-ca\n      ssl_ca: \"${CA}\"",
+        &[("CA", read("ca.crt"))],
+    );
+    let c = connector(&p);
+    c.preflight()
+        .await
+        .expect("the catalog connection ignores the name");
+    let (mut s, _, _) = first_stream(&c).await;
+    match s.next().await {
+        Err(SourceError::Permanent(detail)) => {
+            assert!(detail.contains("not valid for name"), "{detail}")
+        }
+        other => panic!("the stream should refuse the name, got {other:?}"),
+    }
+    drop(s);
     cleanup(&a, &n).await;
 }
 
@@ -10819,7 +10854,7 @@ async fn a_wrong_ca_or_no_tls_is_refused() {
         ),
         ("no TLS", "ssl_mode: disable", vec![]),
     ] {
-        let c = connector(&pipeline(&n, "avalanche", ssl, &env));
+        let c = connector(&pipeline(&n, "localhost", "avalanche", ssl, &env));
         match c.preflight().await {
             Err(SourceError::Permanent(detail)) => eprintln!("{what}: {detail}"),
             other => panic!("{what}: a permanent error expected, got {other:?}"),
@@ -10855,10 +10890,11 @@ Create `test-infra/postgres-tls.sh`:
 
 ```bash
 #!/usr/bin/env bash
-# Entrypoint of the `postgres-tls` service: a fresh throwaway CA, server certificate (localhost,
-# 127.0.0.1) and client certificate (CN avalanche_cert) at every start, then PostgreSQL with TLS
-# required for every TCP connection. The CA and the client pair are copied to /tls (bind-mounted
-# from the git-ignored test-infra/.tls) for the tests; the server key stays in the container.
+# Entrypoint of the `postgres-tls` service: a fresh throwaway CA, server certificate (localhost
+# only, so a connection by 127.0.0.1 is a name mismatch) and client certificate (CN
+# avalanche_cert) at every start, then PostgreSQL with TLS required for every TCP connection. The
+# CA and the client pair are copied to /tls (bind-mounted from the git-ignored test-infra/.tls)
+# for the tests; the server key stays in the container.
 set -euo pipefail
 server=/var/lib/postgresql/tls
 mkdir -p "$server" /tls
@@ -10868,7 +10904,7 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 
   -subj "/CN=data-avalanche test CA" -keyout ca.key -out ca.crt 2>/dev/null
 openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -subj "/CN=localhost" \
   -keyout server.key -out server.csr 2>/dev/null
-printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\n' > server.ext
+printf 'subjectAltName=DNS:localhost\n' > server.ext
 openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 30 \
   -extfile server.ext -out server.crt 2>/dev/null
 openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -subj "/CN=avalanche_cert" \
@@ -10918,7 +10954,7 @@ diff --git a/test-infra/README.md b/test-infra/README.md
  | mysql-84 | mysql:8.4 (GTID on) | 53384 | root / avalanche, db `avalanche` | default |
  | mariadb-118 | mariadb:11.8 (`gtid_strict_mode=1`) | 53318 | root / avalanche | default |
  | mariadb-114, mariadb-1011 | mariadb:11.4, 10.11 | 53314, 53311 | root / avalanche | matrix |
-@@ -19,8 +20,24 @@
+@@ -19,8 +20,25 @@
  Bucket / container `data-avalanche-test` is created by the `init` profile (`up.sh` runs it). Azurite keeps
  port 10000 because `object_store`'s emulator mode always targets `127.0.0.1:10000`.
  
@@ -10938,7 +10974,8 @@ diff --git a/test-infra/README.md b/test-infra/README.md
 +```
 +
 +`postgres-tls` refuses every TCP connection without TLS. At each start it makes a throwaway CA, a
-+server certificate for `localhost` and `127.0.0.1`, and a client certificate for the role
++server certificate for `localhost` only (a connection by `127.0.0.1` is a name mismatch, which
++the `verify-ca` test needs), and a client certificate for the role
 +`avalanche_cert`, which authenticates by certificate (`pg_hba` `cert`). It writes the CA and the
 +client pair to `test-infra/.tls/` (git-ignored) for the TLS tests; the server key stays in the
 +container. Nothing is committed.
@@ -10998,13 +11035,13 @@ jobs:
 
 Run: `cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 33 tests. Without `DATA_AVALANCHE_IT` every test returns at once. These tests drive the code of Tasks 2–11, so nothing fails first. A failure in Step 3 is a defect in that code: stop and report it.
+Expected: PASS, 34 tests. Without `DATA_AVALANCHE_IT` every test returns at once. These tests drive the code of Tasks 2–11, so nothing fails first. A failure in Step 3 is a defect in that code: stop and report it.
 
 - [ ] **Step 3: Run them against PostgreSQL**
 
 Run: `test-infra/up.sh` (it now starts `postgres-tls` too), then `DATA_AVALANCHE_IT=1 cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 33 tests.
+Expected: PASS, 34 tests.
 
 Then the nightly matrix by hand, one server at a time (55414…55417):
 
@@ -11042,15 +11079,17 @@ The task blocks above were replayed in order on a fresh clone of the milestone b
 shown and ran each step's command. Every expected failure and every count above is that replay's
 output. Outside `doc/`, the replayed tree equals the verified workspace. Measured along the way:
 
-- **PostgreSQL 18** (`postgres-18`, `postgres-tls`): 33 integration tests pass (Task 13's run).
+- **PostgreSQL 18** (`postgres-18`, `postgres-tls`): 34 integration tests pass (Task 13's run).
 - **PostgreSQL 14, 15, 16, 17** (the `matrix` profile): 30 integration tests pass on each,
   the TLS tests skipped (the nightly command). PostgreSQL 14 needed the empty-transaction handling
   of D-M5.7 in the tests' idle loop.
 - **TLS** (Task 13): `pg_stat_ssl` shows TLS on the catalog connections and the walsender, under
   `verify-full` with an inline CA, and with a client certificate whose key is inline. A foreign CA
   fails with `invalid peer certificate: UnknownIssuer`. `disable` is refused by `pg_hba`
-  (SQLSTATE 28000). Both are `Permanent`.
-- **Workspace:** 622 tests pass with plain `cargo test --workspace`. Clippy, fmt and
+  (SQLSTATE 28000). Both are `Permanent`. `verify-ca` by `127.0.0.1` (a name the certificate
+  lacks) passes on the catalog connection; the stream is refused with `certificate not valid for
+  name "127.0.0.1"` (the Task 2 deviation, re-measured 2026-10-01).
+- **Workspace:** 623 tests pass with plain `cargo test --workspace`. Clippy, fmt and
   rustdoc (`-D warnings`) are clean.
 - **Not run while planning:** the CI workflows themselves. GitHub schedules and dispatches a
   workflow only from the default branch, so `nightly.yml` first runs after the merge. Until then
@@ -11117,3 +11156,8 @@ Also noted for M6 (DA-DEP-5): pgwire-replication installs `ring` as the process-
 provider when none is installed (`src/tls/rustls.rs:173`) and builds its config from the process
 default. The binary must install aws-lc-rs before the first replication connection. The tests do,
 through `data_avalanche_testkit::install_crypto_provider`.
+
+Owner ruling (2026-10-01): keep the code and pin the difference with a test. Task 13 gained
+`verify_ca_by_an_unnamed_address_passes_the_catalog_but_not_the_stream`, and `postgres-tls`'s
+server certificate now names `localhost` only, so connecting by `127.0.0.1` is a name mismatch.
+The test fails once the crate forgives the mismatch, which is the signal to drop this deviation.
