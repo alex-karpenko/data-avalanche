@@ -153,3 +153,66 @@ pub async fn cleanup(admin: &Client, n: &Names) {
 pub async fn resolved(c: &PgConnector) -> data_avalanche_core::ResolvedTables {
     c.resolve_tables().await.expect("resolve tables")
 }
+
+/// A stream on a first start: resolve the tables, prepare (creating the slot and publication),
+/// open the stream from the slot's start.
+pub async fn first_stream(
+    c: &PgConnector,
+) -> (
+    Box<data_avalanche_source_pg::PgStream>,
+    Vec<data_avalanche_core::TableSchema>,
+    data_avalanche_core::SourcePosition,
+) {
+    let r = resolved(c).await;
+    let refs: Vec<TableRef> = r.tables.iter().map(|t| t.table().clone()).collect();
+    let p = c.prepare(None, &refs).await.expect("prepare");
+    let data_avalanche_core::StartPlan::Snapshot { from, .. } = p.plan else {
+        panic!("a first start snapshots")
+    };
+    let s = c
+        .open_stream(&from, &r.tables)
+        .await
+        .expect("open the stream");
+    (s, r.tables, from)
+}
+
+/// Items until `commits` transactions with items committed, or a panic after `secs` seconds.
+/// Keep-alives and empty transactions (PostgreSQL 14 sends them, 15 and later don't) are left out.
+pub async fn collect(
+    s: &mut data_avalanche_source_pg::PgStream,
+    commits: usize,
+    secs: u64,
+) -> Vec<data_avalanche_core::StreamItem> {
+    use data_avalanche_core::{ChangeStream, StreamItem};
+    let mut out: Vec<StreamItem> = vec![];
+    let mut seen = 0;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while seen < commits {
+        let item = tokio::time::timeout_at(deadline, s.next())
+            .await
+            .unwrap_or_else(|_| panic!("{seen}/{commits} commits after {secs}s: {out:?}"))
+            .expect("stream item");
+        match item {
+            StreamItem::KeepAlive(_) => continue,
+            StreamItem::Commit(_) if matches!(out.last(), Some(StreamItem::Begin { .. })) => {
+                out.pop();
+                continue;
+            }
+            StreamItem::Commit(_) => seen += 1,
+            _ => {}
+        }
+        out.push(item);
+    }
+    out
+}
+
+/// Runs each statement as its own transaction (one `batch_execute` of several statements is a
+/// single implicit transaction).
+pub async fn each(admin: &Client, statements: &[String]) {
+    for s in statements {
+        admin
+            .batch_execute(s)
+            .await
+            .unwrap_or_else(|e| panic!("{s}: {e}"));
+    }
+}

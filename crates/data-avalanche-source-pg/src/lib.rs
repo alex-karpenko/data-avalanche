@@ -4,15 +4,13 @@
 //! A, C and D (`Schema_Change…` §3) and keyset snapshot chunks (`Snapshot_Resumability…`).
 
 pub mod catalog;
-#[allow(dead_code)] // the stream (Task 9) is the caller
 mod connect;
 mod connector;
-#[allow(dead_code)] // the stream (Task 9) is the caller
 mod error;
 pub mod pgoutput;
-#[allow(dead_code)] // the stream (Task 9) is the caller
 mod position;
 mod slot;
+mod stream;
 #[cfg(test)]
 mod test_support;
 mod tls;
@@ -21,3 +19,4 @@ pub mod value;
 
 pub use connect::{APPLICATION_NAME, SESSION_OPTIONS};
 pub use connector::{MIN_SERVER_VERSION, PgConnector};
+pub use stream::{PG_EPOCH_MICROS, PgStream};

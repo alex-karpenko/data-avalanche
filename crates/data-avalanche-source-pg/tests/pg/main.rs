@@ -5,3 +5,4 @@
 mod common;
 mod resolve;
 mod slot;
+mod stream;
