@@ -1098,6 +1098,7 @@ on.
 |---|---|---|---|
 | Both | Configured source credentials hold **SELECT on `information_schema` / system catalogs** (over a regular, non-replication connection) | error → halt pipeline | Detection channels A/C/D query the source catalog; the replication credential is reused — no separate read role. |
 | PostgreSQL | **`REPLICA IDENTITY` ≠ `NOTHING`** on tracked tables | error → halt table | Delete/update keying (pre-existing requirement). |
+| PostgreSQL | Tracked tables are **logged** (`relpersistence = 'p'`; not `UNLOGGED`) | error → halt table (`TABLE_NOT_REPLICABLE`, explicit table) / warning + skip (glob-matched) | PostgreSQL doesn't publish unlogged tables: such a table would be snapshotted once and then never change. |
 | MySQL | **`binlog_format = ROW`** | error → halt pipeline | Granular row-level change capture. |
 | MySQL | **`binlog_row_image = FULL`** | error → halt pipeline | Complete before-images / equality-delete keys. |
 | MySQL | **`binlog_row_metadata = FULL`** | warning → continue | Column names/PK/ENUM strings in `TABLE_MAP`; if absent, names fall back to the catalog query (channel C). |
