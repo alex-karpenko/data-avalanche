@@ -76,18 +76,28 @@ pub enum PlanError {
 
 /// Built-in types kept as their PostgreSQL text (`Type_Mapping.md`: network, geometric, range,
 /// text-search, XML, interval, `timetz`, identifier and system types).
+#[rustfmt::skip]
 const TEXT_OIDS: &[u32] = &[
     // timetz, interval, xml, jsonpath
-    1266, 1186, 142, 4072, // inet, cidr, macaddr, macaddr8
-    869, 650, 829, 774, // point, lseg, path, box, polygon, line, circle
-    600, 601, 602, 603, 604, 628, 718, // tsvector, tsquery
-    3614, 3615, // ranges
-    3904, 3906, 3908, 3910, 3912, 3926, // multiranges
-    4451, 4532, 4533, 4534, 4535,
-    4536, // xid, xid8, cid, tid, pg_lsn, txid_snapshot, pg_snapshot
-    28, 5069, 29, 27, 3220, 2970, 5038, // reg* types
-    24, 2202, 2203, 2204, 2205, 2206, 4096, 4089, 3734, 3769, 4191, // aclitem
+    1266, 1186, 142, 4072,
+    // inet, cidr, macaddr, macaddr8
+    869, 650, 829, 774,
+    // point, lseg, path, box, polygon, line, circle
+    600, 601, 602, 603, 604, 628, 718,
+    // tsvector, tsquery
+    3614, 3615,
+    // ranges
+    3904, 3906, 3908, 3910, 3912, 3926,
+    // multiranges
+    4451, 4532, 4533, 4534, 4535, 4536,
+    // xid, xid8, cid, tid, pg_lsn, txid_snapshot, pg_snapshot
+    28, 5069, 29, 27, 3220, 2970, 5038,
+    // reg* types
+    24, 2202, 2203, 2204, 2205, 2206, 4096, 4089, 3734, 3769, 4191,
+    // aclitem
     1033,
+    // int2vector, oidvector: category `A`, but their text is space-separated, without braces
+    22, 30,
 ];
 
 /// Extension types kept as text without a warning (they are text already).
@@ -204,20 +214,10 @@ pub fn plan(
         }
         b'e' | b'c' | b'r' | b'm' => Plan::text(),
         _ if t.category == b'A' && t.element != 0 => {
-            let e = types.get(&t.element);
             let element = plan(t.element, typmod, types, action)?;
-            let delimiter = match e {
-                Some(e) => e.delimiter,
-                None if t.element == 603 => b';',
-                None => b',',
-            };
             Plan {
                 value_type: V::Array(Box::new(element.value_type.clone())),
-                decode: Decode::Array {
-                    element: Box::new(element.decode),
-                    element_type: element.value_type,
-                    delimiter,
-                },
+                decode: array_of(t.element, types, element.value_type, element.decode),
                 ..element
             }
         }
@@ -231,6 +231,20 @@ pub fn plan(
             ..Plan::text()
         },
     })
+}
+
+/// The [`Decode`] of an array whose elements, of type `element`, decode as `decode`.
+fn array_of(element: u32, types: &TypeCatalog, element_type: V, decode: Decode) -> Decode {
+    let delimiter = match types.get(&element) {
+        Some(e) => e.delimiter,
+        None if element == 603 => b';',
+        None => b',',
+    };
+    Decode::Array {
+        element: Box::new(decode),
+        element_type,
+        delimiter,
+    }
 }
 
 /// The OIDs `plan` will look up in the catalog for a column of type `oid`, given what is known.
@@ -261,7 +275,8 @@ pub struct ColumnPlan {
 /// Plans `column` with its `tables.column_type_overrides` entry, if any (config §9.3):
 /// - `string` keeps the column's PostgreSQL text (`value_type` Text);
 /// - `decimal(P,S)` on a `numeric` or `money` column decodes it as that decimal, whatever its
-///   declared precision (the V-079 remedy);
+///   declared precision (the V-079 remedy), and `list<decimal(P,S)>` does the same for an array
+///   of them;
 /// - any other override must be one Hop 2 can store the column's values as
 ///   ([`hop2_compatible`]); otherwise the table halts (`SCHEMA_MISMATCH`).
 pub fn plan_column(
@@ -283,29 +298,20 @@ pub fn plan_column(
             },
         })
     };
-    let decimal_source = matches!(base_oid(oid, types), 1700 | 790);
+    if let Some((value_type, decode)) = over.and_then(|l| decimal_override(oid, types, l)) {
+        return Ok(ColumnPlan {
+            logical: canonical_logical(&value_type),
+            value_type,
+            decode,
+            read_as_text: None,
+            unconstrained_numeric: false,
+        });
+    }
     match over {
         Some(LogicalType::String) => Ok(ColumnPlan {
             value_type: V::Text,
             logical: LogicalType::String,
             decode: Decode::Text,
-            read_as_text: None,
-            unconstrained_numeric: false,
-        }),
-        Some(LogicalType::Decimal { precision, scale }) if decimal_source => Ok(ColumnPlan {
-            value_type: V::Numeric {
-                precision: *precision,
-                scale: *scale,
-            },
-            logical: LogicalType::Decimal {
-                precision: *precision,
-                scale: *scale,
-            },
-            decode: if base_oid(oid, types) == 790 {
-                Decode::Money
-            } else {
-                Decode::Numeric
-            },
             read_as_text: None,
             unconstrained_numeric: false,
         }),
@@ -339,6 +345,40 @@ pub fn plan_column(
                 unconstrained_numeric: p.unconstrained_numeric,
             })
         }
+    }
+}
+
+/// A `decimal(P,S)` override on a `numeric` or `money` column, or a `list<…>` of one on an array
+/// of them, through domains: the value type and decoding it asks for, whatever the declared
+/// precision. `None` when the override isn't of that shape.
+fn decimal_override(oid: u32, types: &TypeCatalog, over: &LogicalType) -> Option<(V, Decode)> {
+    let base = base_oid(oid, types);
+    match over {
+        LogicalType::Decimal { precision, scale } if matches!(base, 1700 | 790) => {
+            let decode = if base == 790 {
+                Decode::Money
+            } else {
+                Decode::Numeric
+            };
+            Some((
+                V::Numeric {
+                    precision: *precision,
+                    scale: *scale,
+                },
+                decode,
+            ))
+        }
+        LogicalType::List(e) => {
+            let t = types
+                .get(&base)
+                .filter(|t| t.category == b'A' && t.element != 0)?;
+            let (element_type, decode) = decimal_override(t.element, types, e)?;
+            Some((
+                V::Array(Box::new(element_type.clone())),
+                array_of(t.element, types, element_type, decode),
+            ))
+        }
+        _ => None,
     }
 }
 
@@ -453,6 +493,8 @@ mod tests {
             (4451, V::Text),
             (3614, V::Text),
             (142, V::Text),
+            (22, V::Text),
+            (30, V::Text),
         ] {
             let p = plan(oid, -1, &c, S).unwrap();
             assert_eq!(p.value_type, t, "oid {oid}");
@@ -701,5 +743,54 @@ mod tests {
         let plain = col(1700, -1, S, None).unwrap();
         assert!(plain.unconstrained_numeric);
         assert_eq!(plain.logical, LogicalType::String);
+    }
+
+    #[test]
+    fn a_decimal_list_override_rescues_a_numeric_array() {
+        let c = catalog();
+        let list = |p, s| {
+            LogicalType::List(Box::new(LogicalType::Decimal {
+                precision: p,
+                scale: s,
+            }))
+        };
+        let col = |oid, typmod, action, over: &LogicalType| {
+            plan_column("c", oid, typmod, &c, action, Some(over))
+        };
+        let numeric = V::Numeric {
+            precision: 38,
+            scale: 10,
+        };
+        for action in [S, E] {
+            for typmod in [-1, numeric_mod(50, 2)] {
+                let p = col(1231, typmod, action, &list(38, 10)).unwrap();
+                assert_eq!(p.value_type, V::Array(Box::new(numeric.clone())));
+                assert_eq!(p.logical, list(38, 10));
+                assert_eq!(
+                    p.decode,
+                    Decode::Array {
+                        element: Box::new(Decode::Numeric),
+                        element_type: numeric.clone(),
+                        delimiter: b',',
+                    }
+                );
+                assert!(!p.unconstrained_numeric);
+            }
+        }
+        let domain = col(70011, -1, S, &list(20, 4)).unwrap();
+        assert_eq!(
+            domain.value_type,
+            V::Array(Box::new(V::Numeric {
+                precision: 20,
+                scale: 4
+            })),
+            "an array of a numeric domain"
+        );
+        let e = col(1007, -1, S, &list(38, 10)).unwrap_err();
+        assert_eq!(
+            e.code(),
+            "SCHEMA_MISMATCH",
+            "an int4[] isn't a numeric array"
+        );
     }
 }
