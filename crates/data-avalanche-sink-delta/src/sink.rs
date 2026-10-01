@@ -43,7 +43,7 @@ pub struct DeltaStats {
     /// (`data_avalanche_sink_merge_rows_copied`).
     pub rows_copied: u64,
     pub files_added: u64,
-    /// Files a MERGE replaced (`data_avalanche_sink_merge_files_rewritten`).
+    /// Files a MERGE replaced or a truncate removed (`data_avalanche_sink_merge_files_rewritten`).
     pub files_removed: u64,
 }
 
@@ -163,19 +163,24 @@ impl DeltaSink {
         h.content().await.map(Some)
     }
 
+    /// One write's commit properties: the fence's `txn` (the owner epoch as the `i64` version
+    /// Delta stores, `txn_version`) and the marker's `commitInfo`.
     fn props(
         &self,
-        epoch: u64,
+        marker: &CommitMarker,
+        txn_version: i64,
         position: Option<&SourcePosition>,
-    ) -> Result<CommitProperties, SinkError> {
-        let version =
-            i64::try_from(epoch).map_err(|_| permanent(format!("owner epoch {epoch}")))?;
-        Ok(CommitProperties::default()
+    ) -> CommitProperties {
+        CommitProperties::default()
             .with_application_transaction(Transaction::new(
                 app_id(&self.config.pipeline_id),
-                version,
+                txn_version,
             ))
-            .with_metadata(commit_metadata(&self.config.pipeline_id, epoch, position)))
+            .with_metadata(commit_metadata(
+                &self.config.pipeline_id,
+                marker.owner_epoch,
+                position,
+            ))
     }
 
     /// One try at a commit, from the fence to the marker. `refresh` re-reads the table first;
@@ -216,18 +221,26 @@ impl DeltaSink {
             Some(p) => p.union(&cs.position.end)?,
             None => cs.position.end.clone(),
         };
+        let txn_version = i64::try_from(marker.owner_epoch)
+            .map_err(|_| permanent(format!("owner epoch {}", marker.owner_epoch)))?;
         let mut table = h.table().clone();
         if cs.truncate {
             // The clear carries the fence but no position: a crash before the MERGE replays both.
-            table = match truncate(table, self.props(marker.owner_epoch, None)?).await {
-                Ok(t) => t,
+            table = match truncate(table, self.props(marker, txn_version, None)).await {
+                Ok((t, metrics)) => {
+                    self.count(|s| {
+                        s.files_removed += metrics.num_removed_files as u64;
+                        s.rows_deleted += metrics.num_deleted_rows.unwrap_or(0) as u64;
+                    });
+                    t
+                }
                 Err(e) => return race_or_fail(e),
             };
             h.set_table(table.clone());
         }
         let before = table.version();
         if cs.upsert_rows() + cs.delete_rows() > 0 {
-            let props = self.props(marker.owner_epoch, Some(&position))?;
+            let props = self.props(marker, txn_version, Some(&position));
             match merge(table, cs, &types, props, self.config.merge_memory_limit).await {
                 Ok((t, metrics)) => {
                     self.count(|s| s.add(&metrics));
@@ -241,9 +254,8 @@ impl DeltaSink {
             table.version().expect("a written table is loaded")
         } else {
             // Nothing changed a row: a marker-only commit still moves the position.
-            let props = self.props(marker.owner_epoch, Some(&position))?;
-            let epoch = i64::try_from(marker.owner_epoch).unwrap_or(i64::MAX);
-            match marker_only(&table, props, &app_id(pipeline), epoch).await {
+            let props = self.props(marker, txn_version, Some(&position));
+            match marker_only(&table, props, &app_id(pipeline), txn_version).await {
                 Ok(v) => v,
                 Err(e) => return race_or_fail(e),
             }

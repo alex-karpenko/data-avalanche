@@ -129,8 +129,19 @@ pub async fn truncate_then_rows(location: DeltaLocation) {
         vec![deletes(&[1])],
     );
     t.truncate = true;
+    let before = s.stats();
     commit(&s, t.clone(), 1).await;
     assert_eq!(rows(&s).await, owned(&[(3, Some("c"))]));
+    let after = s.stats();
+    // The truncate's DELETE counts: it removed the one file holding rows 1 and 2.
+    assert_eq!(
+        (
+            after.files_removed - before.files_removed,
+            after.rows_deleted - before.rows_deleted,
+            after.rows_inserted - before.rows_inserted,
+        ),
+        (1, 2, 1)
+    );
     let mut clear = cs(30, vec![], vec![]);
     clear.truncate = true;
     commit(&s, clear, 1).await;

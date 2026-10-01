@@ -308,7 +308,7 @@ async fn duckdb_reads_the_table() {
     assert_eq!(
         cell(0, "u64"),
         Some("18446744073709551608"),
-        "decimal(20,0)"
+        "the exact u64 text read back from decimal(20,0)"
     );
     assert_eq!(cell(0, "u"), Some("abababab-abab-abab-abab-abababababab"));
     assert_eq!(cell(0, "t"), Some("12:34:56.789019"), "time as text");

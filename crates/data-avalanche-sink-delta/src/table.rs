@@ -20,7 +20,7 @@ use crate::TableDefaults;
 use crate::convert::from_delta;
 use crate::error::{permanent, sink_error};
 use crate::marker::{WalkBack, app_id, walk_back};
-use crate::types::{column_logical, delta_field, hop2_schema};
+use crate::types::{column_logical, delta_field, hop2_schema, physical_type};
 
 /// Table property holding the identifier columns (a JSON array), so the table can be read in key
 /// order without its `TableSchema`.
@@ -348,7 +348,7 @@ impl TableHandle {
                 })
                 .collect::<Result<_, _>>()?;
             let logical = column_logical(delta).map_err(permanent)?;
-            let physical = crate::types::physical_type(delta.data_type()).map_err(permanent)?;
+            let physical = physical_type(delta.data_type()).map_err(permanent)?;
             let mut read = Vec::new();
             for p in &parts {
                 read.push(arrow_cast::cast(p, &physical).map_err(|e| permanent(e.to_string()))?);

@@ -15,6 +15,7 @@ use deltalake::datafusion::prelude::SessionContext;
 use deltalake::delta_datafusion::DeltaSessionContext;
 use deltalake::kernel::transaction::{CommitBuilder, CommitProperties};
 use deltalake::kernel::{DataType as DeltaType, StructType};
+use deltalake::operations::delete::DeleteMetrics;
 use deltalake::operations::merge::MergeMetrics;
 use deltalake::protocol::{DeltaOperation, OutputMode};
 
@@ -276,13 +277,13 @@ pub async fn merge(
         .await
 }
 
-/// Removes every row (a TRUNCATE): metadata-only, one commit.
+/// Removes every row (a TRUNCATE): metadata-only, one commit. The metrics count the removed
+/// files and, when delta-rs knows them from the file metadata, the deleted rows.
 pub async fn truncate(
     table: DeltaTable,
     props: CommitProperties,
-) -> Result<DeltaTable, deltalake::DeltaTableError> {
-    let (table, _) = table.delete().with_commit_properties(props).await?;
-    Ok(table)
+) -> Result<(DeltaTable, DeleteMetrics), deltalake::DeltaTableError> {
+    table.delete().with_commit_properties(props).await
 }
 
 /// A commit with no data: just the `txn` and the `commitInfo` in `props`. It moves the table's
@@ -532,7 +533,8 @@ mod tests {
         .await;
         let files_before = h.table().snapshot().unwrap().log_data().num_files();
         assert!(files_before > 0);
-        let table = truncate(h.table().clone(), props(1, 20)).await.unwrap();
+        let (table, metrics) = truncate(h.table().clone(), props(1, 20)).await.unwrap();
+        assert_eq!(metrics.num_removed_files, files_before);
         h.set_table(table);
         assert_eq!(rows(&h).await, vec![]);
         let commit = h

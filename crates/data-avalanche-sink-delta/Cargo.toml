@@ -19,6 +19,7 @@ async-trait.workspace = true
 data-avalanche-core.workspace = true
 data-avalanche-storage.workspace = true
 deltalake.workspace = true
+# Pin-only (roadmap Q-M4-1): holds deltalake's core at the proven version; not used directly.
 deltalake-core.workspace = true
 futures-util.workspace = true
 serde_json.workspace = true

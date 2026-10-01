@@ -79,6 +79,7 @@ impl Both {
                 .await
                 .unwrap();
             let d = self.delta.commit(cs, marker).await.unwrap();
+            // Only the skipped bit compares: the two sinks number their versions differently.
             let skipped = |o: &CommitOutcome| matches!(o, CommitOutcome::SkippedCovered);
             assert_eq!(skipped(&m), skipped(&d), "{m:?} vs {d:?}");
         }

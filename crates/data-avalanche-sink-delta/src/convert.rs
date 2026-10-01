@@ -394,6 +394,12 @@ mod tests {
     }
 
     #[test]
+    fn the_date_bounds_are_the_first_and_last_day_of_delta_s_range() {
+        assert_eq!(civil_from_days(DELTA_MIN_DATE.into()), (1, 1, 1));
+        assert_eq!(civil_from_days(DELTA_MAX_DATE.into()), (9999, 12, 31));
+    }
+
+    #[test]
     fn ntz_as_string_renders_and_parses_the_whole_range() {
         assert_eq!(ntz_text(0), "1970-01-01 00:00:00.000000");
         assert_eq!(ntz_text(-1), "1969-12-31 23:59:59.999999");
