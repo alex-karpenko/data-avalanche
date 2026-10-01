@@ -151,6 +151,7 @@ the arrow.
 | Q-M5-7 | Where do PostgreSQL 14–17 run? | **A new `nightly.yml`** (scheduled and on dispatch), one job per version |
 | Q-M5-8 | A bare `numeric` under `numeric_overflow_action: error` | **`decimal(38,18)`, halting per value**: a value that doesn't fit halts the table (`NUMERIC_OVERFLOW`); V-079 warns at resolution |
 | Q-M5-9 | The `varbit` value layout ("length-prefixed") | **PostgreSQL's binary form**: a 4-byte big-endian bit count, then the bits packed MSB-first, the last byte zero-padded |
+| Q-M5-10 | libpq treats `sslmode=require` with a root CA file as `verify-ca`. Should `require` with `ssl_ca` set check the chain? | **No: `require` encrypts without checking the chain**, on both connections, whether or not `ssl_ca` is set (D-M5.16). Only `verify-ca` and `verify-full` check it |
 
 **Rulings where the specs are silent** (each is pinned by a test):
 
@@ -171,16 +172,10 @@ the arrow.
 | D-M5.13 | The slot state table (`decide`). Checkpoint and slot → `Resume`, except: another plugin or database → `Refuse`; invalidated, or `confirmed_flush` past the checkpoint → `Recreate(PositionLost)` under `managed`, `Refuse` under `require_existing`. A checkpoint and no slot → `Create(PositionLost)` under `managed`, else `Refuse`. A slot and no checkpoint (an orphan) → `Refuse` under `on_orphan: halt`; `Adopt` (advance to the current WAL, then snapshot) under `adopt_resnapshot`, `require_existing` included; an invalidated orphan → `Recreate(AdoptedOrphan)` under `managed`, else `Refuse`. Neither → `Create(FirstStart)` under `managed`, else `Refuse` | Postgres_Slot… §1–§3. A slot past the checkpoint has released WAL the pipeline still needs | Task 8 (the seven `decide` tests, the integration cells) |
 | D-M5.14 | Publication. Under `managed`: create it when absent, `ADD`/`DROP TABLE` to match the tracked set, and set `publish = 'insert, update, delete, truncate'` and `publish_via_partition_root = false`. Under `require_existing`, or for a `FOR ALL TABLES` publication: never change it, warn on each difference | D-15.4 | Task 8 (`the_publication_follows_the_table_set`, `require_existing_never_creates`) |
 | D-M5.15 | `prepare` reconciles the publication, then the slot. Creating a slot (it waits for running transactions) is bounded by `timeouts.snapshot`; every other catalog call by `timeouts.command`. `reset_position` drops and recreates the slot (refused under `require_existing`). `teardown` drops the slot and the publication only under `managed` with `auto_cleanup`. `retained_bytes` is `pg_current_wal_lsn() - confirmed_flush_lsn` | The `max_wal_lag_bytes` guard (V-104) compares against it in M6 | Task 8 (`reset_teardown_and_retained_wal`) |
-| D-M5.16 | TLS. `allow` connects as `prefer` (the replication crate has no `allow`; both accept either kind). `require` and `prefer` encrypt but don't verify the chain (signatures are still checked). `verify-ca` checks the chain and ignores the name. `verify-full` checks both. The trust roots are `ssl_ca`, else the webpki roots. `ssl_cert` and `ssl_key` go together | Config §9.1; one meaning of each mode on both connections | Task 2 (`modes_map_to_both_clients`, `bad_material_is_refused_by_name`), Task 13 |
+| D-M5.16 | TLS. `allow` connects as `prefer` (the replication crate has no `allow`; both accept either kind). `require` and `prefer` encrypt but don't verify the chain (signatures are still checked), even with `ssl_ca` set (Q-M5-10). `verify-ca` checks the chain and ignores the name. `verify-full` checks both. The trust roots are `ssl_ca`, else the webpki roots. `ssl_cert` and `ssl_key` go together | Config §9.1; one meaning of each mode on both connections | Task 2 (`modes_map_to_both_clients`, `bad_material_is_refused_by_name`), Task 13 |
 | D-M5.17 | Snapshot reads. They use the simple-query protocol, so values are the output-function text pgoutput sends (`true::text` is `true`, pgoutput sends `t`). Columns are qualified by the alias `src`, so an output name can't shadow a key. Collatable keys compare under `COLLATE "C"`. Key values are quoted literals cast to the column's `format_type` text; a `"char"` key goes through a signed byte. A column changed under the snapshot (gone, or a different type) → `Transient`: read again once the stream's signal caught up. `fetch_rows` sends `FETCH_BATCH` = 1000 keys per statement | Snapshot_Resumability §2; a snapshot row must equal the streamed row of the same data | Task 10 |
 | D-M5.18 | Channel C (`augment`). It takes the hint's columns (names and types, from the stream) and finds each in the catalog by name, else by the `attnum` it had in the cached schema; that `attnum` and the nullability come from the catalog. A column found neither way halts the table. `diff` matches by `attnum`, so a new name on the same `attnum` is a proven rename. A type change carries `narrowed` (a shorter length or lower precision of the same logical type). A table gone from the catalog → `[TableDropped]` and no schema | §0 (scope a change to its signal) and §6 (rename proof) | Task 11 |
 | D-M5.19 | Channel D (`rescan`). One batched read of the tracked tables. It reports tables gone from `pg_class` as dropped, tables whose catalog schema differs as changed (with that schema, for freshness and alerting only), and tables that now fail planning as halted | §2.1 `TABLE_DROPPED`; the rescan never applies a change itself | Task 11 (`channel_d_finds_dropped_changed_and_broken_tables`) |
-
-**Open question (asked with this plan):**
-
-- **Q-M5-10:** libpq treats `sslmode=require` with a root CA file as `verify-ca`. Under D-M5.16,
-  `require` with `ssl_ca` set encrypts without checking the chain on both connections. Keep that,
-  or verify the chain whenever `ssl_ca` is given, as libpq does? The spec lists the modes only.
 
 **Measured while planning** (recorded in the tasks and the docs):
 
@@ -210,7 +205,7 @@ the arrow.
     - the `max_wal_lag_bytes` halt on `retained_bytes`;
     - keep-alives can arrive often (each heartbeat, and on every server keep-alive).
   - §5.2: `postgres-tls`. §5.4: `nightly.yml`.
-  - §9: D-IMPL-12 for D-M5.1…19. §9.1: Q-M5-2…9.
+  - §9: D-IMPL-12 for D-M5.1…19. §9.1: Q-M5-2…10.
 - `Type_Mapping.md`: the numeric rules of D-M5.9 and Q-M5-8 in §PostgreSQL-specific notes; the
   `varbit` layout (Q-M5-9); PostGIS as hex EWKB decoded to bytes.
 - `test-infra/README.md` (Task 13): `postgres-tls`, `DATA_AVALANCHE_PG_PORT`, the nightly run.
@@ -10907,7 +10902,7 @@ The roadmap's M5 exit criteria, and where each is met:
   - §2.1's pins;
   - §4 M5's scope notes and M6's "Carried from M5";
   - §5.2 and §5.4;
-  - §9.1 Q-M5-2…9 (and Q-M5-10 once answered);
+  - §9.1 Q-M5-2…10;
   - D-IMPL-12 for the rulings D-M5.1…19.
 - [ ] `Type_Mapping.md` records the numeric rules (D-M5.9, Q-M5-8), the `varbit` layout (Q-M5-9)
   and the PostGIS form.
