@@ -11099,4 +11099,21 @@ The roadmap's M5 exit criteria, and where each is met:
 
 ## Deviations during execution
 
-None yet.
+**Task 2: `verify-ca` on the replication connection also checks the host name** (found by the
+task review, confirmed in the crate source). The code is as planned; D-M5.16 doesn't hold for
+the replication connection in two respects:
+
+- pgwire-replication 0.4.1's `verify-ca` verifier forgives only `CertificateError::NotValidForName`
+  (`src/tls/rustls.rs:453`). rustls 0.23.45 reports a name mismatch as `NotValidForNameContext`,
+  so the mismatch is fatal there. On the replication connection `verify-ca` behaves like
+  `verify-full`. A pipeline that connects by a name its server certificate doesn't carry works on
+  the catalog connection and is refused, `Permanent`, on the stream. It fails closed. Our code
+  can't route around it: `TlsConfig` takes only paths and a mode.
+- Under `require` and `prefer`, the crate's verifier skips the handshake-signature checks
+  (`src/tls/rustls.rs:395-411`). "Signatures are still checked" holds for the catalog connection
+  only. With the chain unchecked in those modes, this adds no real exposure.
+
+Also noted for M6 (DA-DEP-5): pgwire-replication installs `ring` as the process-wide rustls
+provider when none is installed (`src/tls/rustls.rs:173`) and builds its config from the process
+default. The binary must install aws-lc-rs before the first replication connection. The tests do,
+through `data_avalanche_testkit::install_crypto_provider`.
