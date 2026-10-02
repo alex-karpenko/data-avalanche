@@ -2,11 +2,14 @@
 
 use std::collections::BTreeMap;
 
+use async_trait::async_trait;
 use data_avalanche_config::{
     Pipeline, Postgres, SourceType, check_table_set, check_unbounded_numeric,
 };
 use data_avalanche_core::{
-    HaltReason, Preflight, ResolvedTables, SourceError, SourcePosition, TableRef, TableSchema,
+    ChangeStream, Chunk, HaltReason, KeysetCursor, Preflight, Prepared, RescanReport,
+    ResolvedTables, Row, SchemaDelta, SchemaHint, SourceConnector, SourceError, SourcePosition,
+    TableRef, TableSchema,
 };
 use tokio::sync::Mutex;
 
@@ -23,7 +26,6 @@ pub const MIN_SERVER_VERSION: i32 = 140_000;
 #[derive(Debug)]
 pub struct PgConnector {
     pub(crate) pipeline: Pipeline,
-    #[allow(dead_code)] // the slot lifecycle (Task 8) reads it
     pub(crate) pg: Postgres,
     pub(crate) conn: Connector,
     /// `pg_type` rows fetched so far.
@@ -248,10 +250,87 @@ impl PgConnector {
     }
 }
 
+/// The trait is the inherent methods of the modules: `catalog` and here (channel A), `slot`
+/// (the lifecycle), `snapshot`, `stream`, `schema` (channels C and D).
+#[async_trait]
+impl SourceConnector for PgConnector {
+    async fn preflight(&self) -> Result<Preflight, SourceError> {
+        PgConnector::preflight(self).await
+    }
+
+    async fn resolve_tables(&self) -> Result<ResolvedTables, SourceError> {
+        PgConnector::resolve_tables(self).await
+    }
+
+    async fn prepare(
+        &self,
+        checkpoint: Option<&SourcePosition>,
+        tables: &[TableRef],
+    ) -> Result<Prepared, SourceError> {
+        PgConnector::prepare(self, checkpoint, tables).await
+    }
+
+    async fn reset_position(&self) -> Result<SourcePosition, SourceError> {
+        PgConnector::reset_position(self).await
+    }
+
+    async fn retained_bytes(&self) -> Result<Option<u64>, SourceError> {
+        PgConnector::retained_bytes(self).await
+    }
+
+    async fn current_position(&self) -> Result<SourcePosition, SourceError> {
+        PgConnector::current_position(self).await
+    }
+
+    async fn read_chunk(
+        &self,
+        table: &TableSchema,
+        after: Option<&KeysetCursor>,
+        limit: usize,
+    ) -> Result<Chunk, SourceError> {
+        PgConnector::read_chunk(self, table, after, limit).await
+    }
+
+    async fn fetch_rows(&self, table: &TableSchema, keys: &[Row]) -> Result<Vec<Row>, SourceError> {
+        PgConnector::fetch_rows(self, table, keys).await
+    }
+
+    async fn open_stream(
+        &self,
+        from: &SourcePosition,
+        tables: &[TableSchema],
+    ) -> Result<Box<dyn ChangeStream>, SourceError> {
+        Ok(PgConnector::open_stream(self, from, tables).await?)
+    }
+
+    async fn augment(
+        &self,
+        cached: &TableSchema,
+        hint: &SchemaHint,
+    ) -> Result<(SchemaDelta, Option<TableSchema>), SourceError> {
+        PgConnector::augment(self, cached, hint).await
+    }
+
+    async fn rescan(&self, known: &[TableSchema]) -> Result<RescanReport, SourceError> {
+        PgConnector::rescan(self, known).await
+    }
+
+    async fn teardown(&self) -> Result<(), SourceError> {
+        PgConnector::teardown(self).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::pipeline;
+
+    #[test]
+    fn a_connector_is_a_source_connector() {
+        let c: Box<dyn SourceConnector> =
+            Box::new(PgConnector::new(&pipeline("public.t")).unwrap());
+        drop(c);
+    }
 
     #[test]
     fn only_postgres_pipelines() {

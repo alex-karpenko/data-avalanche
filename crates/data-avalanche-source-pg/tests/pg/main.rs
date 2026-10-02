@@ -4,6 +4,7 @@
 
 mod common;
 mod resolve;
+mod schema;
 mod slot;
 mod snapshot;
 mod stream;

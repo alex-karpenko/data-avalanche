@@ -9,6 +9,7 @@ mod connector;
 mod error;
 pub mod pgoutput;
 mod position;
+mod schema;
 mod slot;
 mod snapshot;
 mod stream;
