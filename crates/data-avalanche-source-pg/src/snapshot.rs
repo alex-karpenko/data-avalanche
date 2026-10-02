@@ -35,6 +35,8 @@ pub(crate) struct ReadColumn {
     type_text: String,
     /// The collation a key comparison uses; `None` for a type without one.
     collation: Option<KeyCollation>,
+    /// One of the table's identifier columns: a value that clamps halts the table (Q-M5-18).
+    identifier: bool,
 }
 
 /// The collation a text key column is ordered and compared in (Snapshot_Resumability §2): one
@@ -130,6 +132,7 @@ async fn read_plan(c: &PgConnector, schema: &TableSchema) -> Result<Vec<ReadColu
             decode: p.decode,
             type_text: r.get(3),
             collation,
+            identifier: schema.identifier().contains(&col.name),
         });
     }
     Ok(out)
@@ -243,6 +246,9 @@ fn decode_row(
             }),
             ValueError::Unrepresentable(detail) => mismatch(detail),
         })?;
+        if c.identifier && text.is_some_and(|t| value::clamped(&v, t)) {
+            return Err(mismatch(value::CLAMPED_KEY.into()));
+        }
         out.push((c.name.clone(), v));
     }
     Ok(Row(out))
@@ -411,6 +417,7 @@ mod tests {
             decode: Decode::Text,
             type_text: type_text.into(),
             collation,
+            identifier: false,
         }
     }
 

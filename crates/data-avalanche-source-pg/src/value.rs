@@ -80,6 +80,22 @@ fn bad(what: &str, text: &str) -> ValueError {
     ValueError::Unrepresentable(format!("{what} {text:?}"))
 }
 
+/// Why an identifier value that clamps halts its table (Q-M5-18).
+pub(crate) const CLAMPED_KEY: &str = "an instant past the microseconds a timestamp holds \
+    (294247 AD) clamps, and can't key a row: distinct keys would merge";
+
+/// Whether `value`, decoded from `text`, is a clamped instant: past the `i64` microseconds
+/// (Q-M5-1), not `±infinity`, which decodes to the same bound.
+pub(crate) fn clamped(value: &ColumnValue, text: &str) -> bool {
+    matches!(
+        value,
+        ColumnValue::Timestamp {
+            micros: i64::MAX | i64::MIN,
+            ..
+        }
+    ) && !matches!(text, "infinity" | "-infinity")
+}
+
 /// Decodes the text of one value.
 pub fn decode(d: &Decode, text: &str) -> Result<ColumnValue, ValueError> {
     use ColumnValue as V;
@@ -688,6 +704,15 @@ mod tests {
             timestamp("0001-01-01 00:00:00 BC", false),
             Ok(-62_167_219_200_000_000)
         );
+        let at = |micros| ColumnValue::Timestamp {
+            micros,
+            with_tz: false,
+        };
+        assert!(clamped(&at(i64::MAX), "294250-01-01 00:00:00"));
+        assert!(clamped(&at(i64::MAX), "300000-01-01"), "a date converted");
+        assert!(!clamped(&at(i64::MAX), "infinity"));
+        assert!(!clamped(&at(i64::MIN), "-infinity"));
+        assert!(!clamped(&at(0), "1970-01-01 00:00:00"));
         assert_eq!(timestamp("infinity", true), Ok(i64::MAX));
         assert_eq!(timestamp("-infinity", false), Ok(i64::MIN));
         assert_eq!(

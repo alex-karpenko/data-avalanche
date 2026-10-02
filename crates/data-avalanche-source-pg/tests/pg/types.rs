@@ -1,10 +1,12 @@
 //! S-PG7 as a regression, and the M5 exit's type round trip: every mapped PostgreSQL type
 //! (`Type_Mapping.md`) inserted, then read through the stream and through a snapshot chunk. Both
 //! give the expected values, and the same ones. The writer's session uses another time zone,
-//! date style and interval style than the pinned ones.
+//! date style and interval style than the pinned ones (they change how its literals parse, not
+//! how either read prints; Task 2 tests the pins).
 
 use data_avalanche_core::{
-    ChangeStream, ColumnValue as V, ColumnValueType as T, Decimal, KeysetCursor, Row, StreamItem,
+    ChangeStream, ColumnValue as V, ColumnValueType as T, Decimal, HaltReason, KeysetCursor, Row,
+    SourceError, StreamItem,
 };
 use data_avalanche_testkit::require_it;
 use serde_json::json;
@@ -77,7 +79,13 @@ fn cases(server_version: i32) -> Vec<Case> {
         case(
             "ch",
             "\"char\"",
-            vec![("'a'", V::Int16(97)), ("'Z'", V::Int16(90))],
+            vec![
+                ("'a'", V::Int16(97)),
+                ("'Z'", V::Int16(90)),
+                // Not '\377': PostgreSQL 14 reads that as a backslash.
+                ("(-1)::int4::\"char\"", V::Int16(255)),
+                ("''", V::Int16(0)),
+            ],
         ),
         case(
             "f4",
@@ -85,6 +93,7 @@ fn cases(server_version: i32) -> Vec<Case> {
             vec![
                 ("1.5", V::Float32(1.5)),
                 ("'-Infinity'", V::Float32(f32::NEG_INFINITY)),
+                ("'NaN'", V::Float32(f32::NAN)),
             ],
         ),
         case(
@@ -93,6 +102,7 @@ fn cases(server_version: i32) -> Vec<Case> {
             vec![
                 ("0.1", V::Float64(0.1)),
                 ("'Infinity'", V::Float64(f64::INFINITY)),
+                ("'NaN'", V::Float64(f64::NAN)),
             ],
         ),
         case(
@@ -102,6 +112,36 @@ fn cases(server_version: i32) -> Vec<Case> {
                 ("123456789.123", dec(123_456_789_123, 3)),
                 ("-0.001", dec(-1, 3)),
             ],
+        ),
+        case(
+            "n38",
+            "numeric(38,0)",
+            vec![
+                (
+                    "99999999999999999999999999999999999999",
+                    dec(10i128.pow(38) - 1, 0),
+                ),
+                (
+                    "-99999999999999999999999999999999999999",
+                    dec(1 - 10i128.pow(38), 0),
+                ),
+            ],
+        ),
+        case(
+            "n38s",
+            "numeric(38,38)",
+            vec![(
+                "0.99999999999999999999999999999999999999",
+                dec(10i128.pow(38) - 1, 38),
+            )],
+        ),
+        case(
+            "n40",
+            "numeric(40,2)",
+            vec![(
+                "12345678901234567890123456789012345678.90",
+                text("12345678901234567890123456789012345678.90"),
+            )],
         ),
         case(
             "nb",
@@ -117,6 +157,7 @@ fn cases(server_version: i32) -> Vec<Case> {
             vec![
                 ("1234.56", dec(123_456, 2)),
                 ("'-92233720368547758.08'", dec(i64::MIN.into(), 2)),
+                ("'92233720368547758.07'", dec(i64::MAX.into(), 2)),
             ],
         ),
         case(
@@ -150,6 +191,8 @@ fn cases(server_version: i32) -> Vec<Case> {
                 ("'2024-02-29'", V::Date(19_782)),
                 ("'4714-11-24 BC'", V::Date(-2_440_588)),
                 ("'infinity'", V::Date(i32::MAX)),
+                ("'5874897-12-31'", V::Date(2_145_042_905)),
+                ("'-infinity'", V::Date(i32::MIN)),
             ],
         ),
         case(
@@ -190,6 +233,21 @@ fn cases(server_version: i32) -> Vec<Case> {
                         with_tz: false,
                     },
                 ),
+                (
+                    "'infinity'",
+                    V::Timestamp {
+                        micros: i64::MAX,
+                        with_tz: false,
+                    },
+                ),
+                (
+                    // Past i64 microseconds: a column that isn't the key clamps (Q-M5-1).
+                    "'294276-12-31 23:59:59.999999'",
+                    V::Timestamp {
+                        micros: i64::MAX,
+                        with_tz: false,
+                    },
+                ),
             ],
         ),
         case(
@@ -207,6 +265,13 @@ fn cases(server_version: i32) -> Vec<Case> {
                     "'infinity'",
                     V::Timestamp {
                         micros: i64::MAX,
+                        with_tz: true,
+                    },
+                ),
+                (
+                    "'-infinity'",
+                    V::Timestamp {
+                        micros: i64::MIN,
                         with_tz: true,
                     },
                 ),
@@ -306,7 +371,13 @@ fn cases(server_version: i32) -> Vec<Case> {
         case(
             "hs",
             "public.hstore",
-            vec![("'a=>1, b=>NULL'", V::Json(json!({"a": "1", "b": null})))],
+            vec![
+                ("'a=>1, b=>NULL'", V::Json(json!({"a": "1", "b": null}))),
+                (
+                    r#"'"ключ"=>"знач ✓", "a\"b"=>"c\\d", "x y"=>"", "=>"=>","'"#,
+                    V::Json(json!({"ключ": "знач ✓", "a\"b": "c\\d", "x y": "", "=>": ","})),
+                ),
+            ],
         ),
         case(
             "ai",
@@ -317,15 +388,36 @@ fn cases(server_version: i32) -> Vec<Case> {
                     array(T::Int32, vec![V::Int32(1), V::Null, V::Int32(3)]),
                 ),
                 ("'{}'", array(T::Int32, vec![])),
+                (
+                    "'[0:1]={1,2}'",
+                    array(T::Int32, vec![V::Int32(1), V::Int32(2)]),
+                ),
             ],
         ),
         case(
             "at",
             "text[]",
-            vec![(
-                r#"'{a,"b c",NULL,"NULL"}'"#,
-                array(T::Text, vec![text("a"), text("b c"), V::Null, text("NULL")]),
-            )],
+            vec![
+                (
+                    r#"'{a,"b c",NULL,"NULL"}'"#,
+                    array(T::Text, vec![text("a"), text("b c"), V::Null, text("NULL")]),
+                ),
+                (
+                    r#"'{"héllo ✓","a\"b","c\\d","{x}","",",;"," sp "}'"#,
+                    array(
+                        T::Text,
+                        vec![
+                            text("héllo ✓"),
+                            text("a\"b"),
+                            text("c\\d"),
+                            text("{x}"),
+                            text(""),
+                            text(",;"),
+                            text(" sp "),
+                        ],
+                    ),
+                ),
+            ],
         ),
         case(
             "an",
@@ -373,6 +465,16 @@ fn cases(server_version: i32) -> Vec<Case> {
 
 fn rows(cases: &[Case]) -> usize {
     cases.iter().map(|c| c.values.len()).max().unwrap() + 1
+}
+
+/// Equal, or both a NaN (which `PartialEq` never finds equal).
+fn same(a: &(String, V), b: &(String, V)) -> bool {
+    a.0 == b.0
+        && match (&a.1, &b.1) {
+            (V::Float32(x), V::Float32(y)) if x.is_nan() => y.is_nan(),
+            (V::Float64(x), V::Float64(y)) if x.is_nan() => y.is_nan(),
+            (x, y) => x == y,
+        }
 }
 
 /// Row `i` as expected: the id, then each column's value, NULL past its list.
@@ -466,19 +568,20 @@ async fn every_mapped_type_round_trips_through_stream_and_snapshot() {
     assert_eq!(snapshot.len(), rows(&cases));
     for i in 0..rows(&cases) {
         let want = expected(&cases, i);
-        for (j, (column, value)) in want.0.iter().enumerate() {
-            assert_eq!(
-                &streamed[i].0[j],
-                &(column.clone(), value.clone()),
-                "stream row {i}"
+        for (j, w) in want.0.iter().enumerate() {
+            assert!(
+                same(&streamed[i].0[j], w),
+                "stream row {i}: {:?} vs {w:?}",
+                streamed[i].0[j]
             );
-            assert_eq!(
-                &snapshot[i].0[j],
-                &(column.clone(), value.clone()),
-                "snapshot row {i}"
+            assert!(
+                same(&snapshot[i].0[j], w),
+                "snapshot row {i}: {:?} vs {w:?}",
+                snapshot[i].0[j]
             );
         }
         assert_eq!(streamed[i].0.len(), want.0.len());
+        assert_eq!(snapshot[i].0.len(), want.0.len());
     }
     // Every value fits the column type the schema declares.
     for r in &snapshot {
@@ -626,6 +729,146 @@ async fn overrides_convert_through_stream_and_snapshot() {
         cursor = Some(next);
     }
     assert_eq!(snapshot, expected, "snapshot chunks of one row");
+    s.close().await.unwrap();
+    cleanup(&a, &n).await;
+}
+
+/// Overrides through both reads: `string` (D-M5.10) on types that otherwise decode, a decimal on
+/// `numeric` and `money`, and the Q-M5-12 conversions the test above leaves out. A decimal keeps
+/// the value's own scale; the declared type bounds it (`ColumnValue::fits`).
+#[tokio::test(flavor = "multi_thread")]
+async fn string_and_decimal_overrides_through_stream_and_snapshot() {
+    require_it!();
+    const DAY: i64 = 86_400_000_000;
+    let a = admin().await;
+    let n = fresh(
+        &a,
+        "convert_more",
+        "CREATE TABLE t (id int PRIMARY KEY, b bool, ch \"char\", tt timestamptz, iv interval,
+                         am int4[], at text[], n numeric(8,2), nb numeric, m money, s int2,
+                         i int4, dt date, big int8);",
+    )
+    .await;
+    let overrides = format!(
+        "      column_type_overrides: {{ {s}.t.b: string, {s}.t.ch: string, {s}.t.tt: string, \
+         {s}.t.iv: string, {s}.t.am: string, {s}.t.at: string, {s}.t.n: \"decimal(10,4)\", \
+         {s}.t.nb: \"decimal(38,10)\", {s}.t.m: \"decimal(20,3)\", {s}.t.s: int32, \
+         {s}.t.i: float64, {s}.t.dt: timestamp_ntz, {s}.t.big: \"decimal(25,2)\" }}",
+        s = n.schema
+    );
+    let c = connector(&pipeline(&n, &["*"], &overrides, ""));
+    let (mut s, tables, _) = first_stream(&c).await;
+    let t = &tables[0];
+    a.batch_execute(&format!(
+        "SET search_path = {};
+         INSERT INTO t VALUES
+           (1, true, 'a', '2024-02-29 12:34:56.789012+03', '1 day 02:03:04', '{{{{1,2}},{{3,NULL}}}}',
+            '{{a,\"b c\"}}', 1.5, 123.456, 1234.56, -32768, 2147483647, '2024-01-01',
+            9223372036854775807),
+           (2, false, 'Z', '-infinity', '-1 mon', '{{}}', '{{}}', -999999.99, 0, '-0.01', 32767,
+            -2147483648, 'infinity', -9223372036854775808);",
+        n.schema
+    ))
+    .await
+    .unwrap();
+    let ts = |micros| V::Timestamp {
+        micros,
+        with_tz: false,
+    };
+    let expected = vec![
+        Row(vec![
+            ("id".into(), V::Int32(1)),
+            ("b".into(), text("t")),
+            ("ch".into(), text("a")),
+            ("tt".into(), text("2024-02-29 09:34:56.789012+00")),
+            ("iv".into(), text("P1DT2H3M4S")),
+            ("am".into(), text("{{1,2},{3,NULL}}")),
+            ("at".into(), text("{a,\"b c\"}")),
+            ("n".into(), dec(150, 2)),
+            ("nb".into(), dec(123_456, 3)),
+            ("m".into(), dec(123_456, 2)),
+            ("s".into(), V::Int32(-32_768)),
+            ("i".into(), V::Float64(2_147_483_647.0)),
+            ("dt".into(), ts(19_723 * DAY)),
+            ("big".into(), dec(i64::MAX.into(), 0)),
+        ]),
+        Row(vec![
+            ("id".into(), V::Int32(2)),
+            ("b".into(), text("f")),
+            ("ch".into(), text("Z")),
+            ("tt".into(), text("-infinity")),
+            ("iv".into(), text("P-1M")),
+            ("am".into(), text("{}")),
+            ("at".into(), text("{}")),
+            ("n".into(), dec(-99_999_999, 2)),
+            ("nb".into(), dec(0, 0)),
+            ("m".into(), dec(-1, 2)),
+            ("s".into(), V::Int32(32_767)),
+            ("i".into(), V::Float64(-2_147_483_648.0)),
+            ("dt".into(), ts(i64::MAX)),
+            ("big".into(), dec(i64::MIN.into(), 0)),
+        ]),
+    ];
+    let items = collect(&mut s, 1, 30).await;
+    let streamed: Vec<Row> = items
+        .iter()
+        .filter_map(|i| match i {
+            StreamItem::Change(e) => e.after.clone(),
+            StreamItem::TableHalt { reason, .. } => panic!("halted: {reason}"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(streamed, expected, "the stream");
+    let chunk = c.read_chunk(t, None, 10).await.unwrap();
+    assert_eq!(chunk.rows, expected, "the snapshot");
+    s.close().await.unwrap();
+    cleanup(&a, &n).await;
+}
+
+/// Q-M5-18: a key that clamps past the microseconds a timestamp holds halts the table, in the
+/// stream and in the snapshot; `±infinity` keys a row.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clamped_timestamp_key_halts_the_table() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(
+        &a,
+        "clamped_key",
+        "CREATE TABLE t (ts timestamp PRIMARY KEY, v int);
+         INSERT INTO t VALUES ('2024-01-01', 1), ('-infinity', 0), ('infinity', 2);",
+    )
+    .await;
+    let c = connector(&pipeline(&n, &["*"], "", ""));
+    let (mut s, tables, _) = first_stream(&c).await;
+    let t = &tables[0];
+    let mut rows = 0;
+    let mut cursor: Option<KeysetCursor> = None;
+    loop {
+        let chunk = c.read_chunk(t, cursor.as_ref(), 1).await.unwrap();
+        let Some(next) = chunk.next else { break };
+        rows += chunk.rows.len();
+        cursor = Some(next);
+    }
+    assert_eq!(rows, 3, "infinity keys page");
+    a.execute(
+        &format!("INSERT INTO {}.t VALUES ('294250-01-01', 3)", n.schema),
+        &[],
+    )
+    .await
+    .unwrap();
+    let halt =
+        |r: &HaltReason| matches!(r, HaltReason::SchemaMismatch { column, .. } if column == "ts");
+    let items = collect(&mut s, 1, 20).await;
+    assert!(
+        items
+            .iter()
+            .any(|i| matches!(i, StreamItem::TableHalt { reason, .. } if halt(reason))),
+        "{items:?}"
+    );
+    match c.read_chunk(t, None, 10).await {
+        Err(SourceError::TableHalt { reason, .. }) if halt(&reason) => {}
+        other => panic!("the snapshot halts: {other:?}"),
+    }
     s.close().await.unwrap();
     cleanup(&a, &n).await;
 }

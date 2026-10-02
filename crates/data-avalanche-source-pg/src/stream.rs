@@ -42,6 +42,8 @@ pub const PG_EPOCH_MICROS: i64 = 946_684_800_000_000;
 struct StreamColumn {
     name: String,
     key: bool,
+    /// One of the table's identifier columns: a value that clamps halts the table (Q-M5-18).
+    identifier: bool,
     decode: Decode,
 }
 
@@ -297,6 +299,7 @@ impl PgStream {
         )
         .await?;
         let type_names = self.type_names(&columns).await?;
+        let identifier = self.known[&table].identifier.clone();
         let key = table_key(&table);
         let mut schema = Vec::with_capacity(columns.len());
         let mut stream = Vec::with_capacity(columns.len());
@@ -325,6 +328,7 @@ impl PgStream {
                     stream.push(StreamColumn {
                         name: c.name.clone(),
                         key: c.key,
+                        identifier: identifier.contains(&c.name),
                         decode: p.decode,
                     });
                 }
@@ -451,6 +455,12 @@ impl PgStream {
                         }
                     };
                     match value::decode(&c.decode, &text) {
+                        Ok(v) if c.identifier && value::clamped(&v, &text) => {
+                            return Ok(Err(HaltReason::SchemaMismatch {
+                                column: c.name.clone(),
+                                detail: value::CLAMPED_KEY.into(),
+                            }));
+                        }
                         Ok(v) => v,
                         Err(ValueError::Overflow) => {
                             return Ok(Err(HaltReason::NumericOverflow {
@@ -713,6 +723,7 @@ mod tests {
         StreamColumn {
             name: name.into(),
             key,
+            identifier: key,
             decode,
         }
     }
@@ -772,6 +783,33 @@ mod tests {
             PgStream::row(&[col("t", false, Decode::Text)], vec![latin1], false).unwrap(),
             Err(HaltReason::SchemaMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn a_clamped_identifier_halts_the_table() {
+        let ts = || Decode::Timestamp { with_tz: false };
+        let far = || vec![text("294250-01-01 00:00:00")];
+        assert_eq!(
+            PgStream::row(&[col("k", true, ts())], far(), false).unwrap(),
+            Err(HaltReason::SchemaMismatch {
+                column: "k".into(),
+                detail: value::CLAMPED_KEY.into()
+            })
+        );
+        let clamped = ColumnValue::Timestamp {
+            micros: i64::MAX,
+            with_tz: false,
+        };
+        assert_eq!(
+            PgStream::row(&[col("v", false, ts())], far(), false).unwrap(),
+            Ok(Row(vec![("v".into(), clamped.clone())])),
+            "another column clamps (Q-M5-1)"
+        );
+        assert_eq!(
+            PgStream::row(&[col("k", true, ts())], vec![text("infinity")], false).unwrap(),
+            Ok(Row(vec![("k".into(), clamped)])),
+            "infinity keys a row"
+        );
     }
 
     #[test]
