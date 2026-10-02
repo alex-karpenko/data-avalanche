@@ -143,7 +143,7 @@ the arrow.
 
 | # | Question | Answer |
 |---|---|---|
-| Q-M5-1 (2026-09-26) | PostgreSQL `±infinity` for `date` / `timestamp[tz]` | **Clamp to the Arrow min/max**; out-of-range timestamps clamp too (the Delta sink then clamps to its range, Q-M4-2) |
+| Q-M5-1 (2026-09-26) | PostgreSQL `±infinity` for `date` / `timestamp[tz]` | **Clamp to the Arrow min/max**; out-of-range timestamps clamp too (the Delta sink then clamps to its range, Q-M4-2); an identifier value that clamps halts the table instead (Q-M5-18) |
 | Q-M5-2 | Where does the source trait live? Roadmap §3.6 puts it in `data-avalanche-pipeline` | **In `data-avalanche-core`**, next to `Sink`; the source crates depend on core only |
 | Q-M5-3 | Binary tuples (roadmap: "text and binary tuples") | **Text only.** The stream never asks for binary; a binary datum is a protocol error |
 | Q-M5-4 | `pgwire-replication` takes TLS material as file paths; config allows inline PEM | **An inline PEM becomes a private temporary file** (0600 in a 0700 directory, removed when the connector is dropped); a path PEM is used where it is |
@@ -159,6 +159,7 @@ the arrow.
 | Q-M5-15 (2026-10-02, during execution) | Task 9's review: `next` lost a Relation message when `select!` cancelled it at a catalog query; channel B didn't see a primary key or replica identity change; tables were matched by name, so a renamed or swapped table went on silently; PostgreSQL 14 sends a `"char"` byte above 127 raw; `close` returned before the server released the slot | **`next` cancel-safe (the event kept until handled; catalog queries under `timeouts.command`); the replica identity compared in channel B; a name and OID that part halt the table (`TABLE_DROPPED`, `Schema_Change…` §7); the raw byte decodes; `close` waits for the slot's release** |
 | Q-M5-16 (2026-10-02, during execution) | Task 10's review: a text key in the database's collation made every chunk a full scan and sort (the `"C"` pin has no index); PostgreSQL 14 prints a `"char"` byte above 127 raw, which panicked the read; a domain over `"char"` key looped; a timed-out chunk kept the shared catalog connection busy | **A text key orders in its own collation when deterministic, `"C"` with a start warning when not (Snapshot_Resumability §2 amended); `"char"` read as its code; domains keyed by the decoder; `SET LOCAL statement_timeout` on every read** |
 | Q-M5-17 (2026-10-02, during execution) | Task 11's review: with the catalog ahead of the stream, `scope` placed columns by their current names, so a rename chain or a swap after the signal gave a silent wrong delta; a table set `UNLOGGED` (allowed under `FOR ALL TABLES`) went unnoticed; an add/backfill/drop migration halted; `Schema_Change…` §7.2 halted on any replica identity change, the code only on an identifier change | **A placement that is a guess halts; a column dropped since the signal keeps its `attnum`; an unlogged table doesn't plan (C and D halt it); §7.2 amended: only the identifier, or a replica identity that no longer covers it, halts** |
+| Q-M5-18 (2026-10-02, during execution) | Task 12's review: a timestamp key past the microseconds a timestamp holds (294247–294276 AD, or a `date` converted past it) clamps to `i64::MAX`, the same value as `'infinity'`: distinct keys merge into one identifier, and a snapshot cursor there ends the scan early (measured: 2 of 4 rows) | **An identifier value that clamps halts the table (`SCHEMA_MISMATCH`), in the stream and in the snapshot; `±infinity` keys and other columns are unchanged; the type round trip gains the missing edge values and overrides** |
 
 **Rulings where the specs are silent** (each is pinned by a test). **Plan approved 2026-10-01**, with these rulings (roadmap D-IMPL-12):
 
@@ -2795,6 +2796,15 @@ mod tests {
             timestamp("0001-01-01 00:00:00 BC", false),
             Ok(-62_167_219_200_000_000)
         );
+        let at = |micros| ColumnValue::Timestamp {
+            micros,
+            with_tz: false,
+        };
+        assert!(clamped(&at(i64::MAX), "294250-01-01 00:00:00"));
+        assert!(clamped(&at(i64::MAX), "300000-01-01"), "a date converted");
+        assert!(!clamped(&at(i64::MAX), "infinity"));
+        assert!(!clamped(&at(i64::MIN), "-infinity"));
+        assert!(!clamped(&at(0), "1970-01-01 00:00:00"));
         assert_eq!(timestamp("infinity", true), Ok(i64::MAX));
         assert_eq!(timestamp("-infinity", false), Ok(i64::MIN));
         assert_eq!(
@@ -3065,6 +3075,22 @@ pub enum ValueError {
 
 fn bad(what: &str, text: &str) -> ValueError {
     ValueError::Unrepresentable(format!("{what} {text:?}"))
+}
+
+/// Why an identifier value that clamps halts its table (Q-M5-18).
+pub(crate) const CLAMPED_KEY: &str = "an instant past the microseconds a timestamp holds \
+    (294247 AD) clamps, and can't key a row: distinct keys would merge";
+
+/// Whether `value`, decoded from `text`, is a clamped instant: past the `i64` microseconds
+/// (Q-M5-1), not `±infinity`, which decodes to the same bound.
+pub(crate) fn clamped(value: &ColumnValue, text: &str) -> bool {
+    matches!(
+        value,
+        ColumnValue::Timestamp {
+            micros: i64::MAX | i64::MIN,
+            ..
+        }
+    ) && !matches!(text, "infinity" | "-infinity")
 }
 
 /// Decodes the text of one value.
@@ -4803,7 +4829,7 @@ Change `crates/data-avalanche-source-pg/src/value.rs`:
 diff --git a/crates/data-avalanche-source-pg/src/value.rs b/crates/data-avalanche-source-pg/src/value.rs
 --- a/crates/data-avalanche-source-pg/src/value.rs
 +++ b/crates/data-avalanche-source-pg/src/value.rs
-@@ -48,6 +48,12 @@
+@@ -48,6 +48,23 @@
          element_type: ColumnValueType,
          delimiter: u8,
      },
@@ -4813,10 +4839,21 @@ diff --git a/crates/data-avalanche-source-pg/src/value.rs b/crates/data-avalanch
 +        from: Box<Decode>,
 +        to: ColumnValueType,
 +    },
++}
++
++impl Decode {
++    /// Whether this reads a `"char"` (directly or before a conversion).
++    pub(crate) fn reads_char(&self) -> bool {
++        match self {
++            Decode::Char => true,
++            Decode::Convert { from, .. } => from.reads_char(),
++            _ => false,
++        }
++    }
  }
  
  /// Why a value can't be decoded.
-@@ -119,6 +125,7 @@
+@@ -135,6 +152,7 @@
                  values,
              }
          }
@@ -7591,6 +7628,7 @@ mod tests {
         StreamColumn {
             name: name.into(),
             key,
+            identifier: key,
             decode,
         }
     }
@@ -7650,6 +7688,33 @@ mod tests {
             PgStream::row(&[col("t", false, Decode::Text)], vec![latin1], false).unwrap(),
             Err(HaltReason::SchemaMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn a_clamped_identifier_halts_the_table() {
+        let ts = || Decode::Timestamp { with_tz: false };
+        let far = || vec![text("294250-01-01 00:00:00")];
+        assert_eq!(
+            PgStream::row(&[col("k", true, ts())], far(), false).unwrap(),
+            Err(HaltReason::SchemaMismatch {
+                column: "k".into(),
+                detail: value::CLAMPED_KEY.into()
+            })
+        );
+        let clamped = ColumnValue::Timestamp {
+            micros: i64::MAX,
+            with_tz: false,
+        };
+        assert_eq!(
+            PgStream::row(&[col("v", false, ts())], far(), false).unwrap(),
+            Ok(Row(vec![("v".into(), clamped.clone())])),
+            "another column clamps (Q-M5-1)"
+        );
+        assert_eq!(
+            PgStream::row(&[col("k", true, ts())], vec![text("infinity")], false).unwrap(),
+            Ok(Row(vec![("k".into(), clamped)])),
+            "infinity keys a row"
+        );
     }
 
     #[test]
@@ -8909,6 +8974,8 @@ pub const PG_EPOCH_MICROS: i64 = 946_684_800_000_000;
 struct StreamColumn {
     name: String,
     key: bool,
+    /// One of the table's identifier columns: a value that clamps halts the table (Q-M5-18).
+    identifier: bool,
     decode: Decode,
 }
 
@@ -8965,15 +9032,6 @@ struct Known {
     oid: Option<u32>,
     /// Halted: its changes are skipped, under any OID.
     halted: bool,
-}
-
-/// Whether `decode` reads a `"char"` (directly or before a conversion).
-fn reads_char(decode: &Decode) -> bool {
-    match decode {
-        Decode::Char => true,
-        Decode::Convert { from, .. } => reads_char(from),
-        _ => false,
-    }
 }
 
 /// The stream of one `open_stream` call.
@@ -9173,6 +9231,7 @@ impl PgStream {
         )
         .await?;
         let type_names = self.type_names(&columns).await?;
+        let identifier = self.known[&table].identifier.clone();
         let key = table_key(&table);
         let mut schema = Vec::with_capacity(columns.len());
         let mut stream = Vec::with_capacity(columns.len());
@@ -9201,6 +9260,7 @@ impl PgStream {
                     stream.push(StreamColumn {
                         name: c.name.clone(),
                         key: c.key,
+                        identifier: identifier.contains(&c.name),
                         decode: p.decode,
                     });
                 }
@@ -9316,7 +9376,7 @@ impl PgStream {
                         Ok(text) => Cow::Borrowed(text),
                         // PostgreSQL 14 sends a `"char"` byte above 127 as itself; 15 and later
                         // send `\ooo`.
-                        Err(_) if bytes.len() == 1 && reads_char(&c.decode) => {
+                        Err(_) if bytes.len() == 1 && c.decode.reads_char() => {
                             Cow::Owned(format!("\\{:03o}", bytes[0]))
                         }
                         Err(_) => {
@@ -9327,6 +9387,12 @@ impl PgStream {
                         }
                     };
                     match value::decode(&c.decode, &text) {
+                        Ok(v) if c.identifier && value::clamped(&v, &text) => {
+                            return Ok(Err(HaltReason::SchemaMismatch {
+                                column: c.name.clone(),
+                                detail: value::CLAMPED_KEY.into(),
+                            }));
+                        }
                         Ok(v) => v,
                         Err(ValueError::Overflow) => {
                             return Ok(Err(HaltReason::NumericOverflow {
@@ -9586,7 +9652,7 @@ impl ChangeStream for PgStream {
 
 Run: `cargo test -p data-avalanche-source-pg --lib`
 
-Expected: PASS. `data-avalanche-source-pg` unit tests: 60.
+Expected: PASS. `data-avalanche-source-pg` unit tests: 61.
 
 Run, with `test-infra/up.sh` running: `DATA_AVALANCHE_IT=1 cargo test -p data-avalanche-source-pg --test pg`
 
@@ -9677,6 +9743,7 @@ mod tests {
             decode: Decode::Text,
             type_text: type_text.into(),
             collation,
+            identifier: false,
         }
     }
 
@@ -10169,6 +10236,8 @@ pub(crate) struct ReadColumn {
     type_text: String,
     /// The collation a key comparison uses; `None` for a type without one.
     collation: Option<KeyCollation>,
+    /// One of the table's identifier columns: a value that clamps halts the table (Q-M5-18).
+    identifier: bool,
 }
 
 /// The collation a text key column is ordered and compared in (Snapshot_Resumability §2): one
@@ -10264,6 +10333,7 @@ async fn read_plan(c: &PgConnector, schema: &TableSchema) -> Result<Vec<ReadColu
             decode: p.decode,
             type_text: r.get(3),
             collation,
+            identifier: schema.identifier().contains(&col.name),
         });
     }
     Ok(out)
@@ -10377,6 +10447,9 @@ fn decode_row(
             }),
             ValueError::Unrepresentable(detail) => mismatch(detail),
         })?;
+        if c.identifier && text.is_some_and(|t| value::clamped(&v, t)) {
+            return Err(mismatch(value::CLAMPED_KEY.into()));
+        }
         out.push((c.name.clone(), v));
     }
     Ok(Row(out))
@@ -10540,7 +10613,7 @@ impl PgConnector {
 
 Run: `cargo test -p data-avalanche-source-pg --lib`
 
-Expected: PASS. `data-avalanche-source-pg` unit tests: 61.
+Expected: PASS. `data-avalanche-source-pg` unit tests: 62.
 
 Run, with `test-infra/up.sh` running: `DATA_AVALANCHE_IT=1 cargo test -p data-avalanche-source-pg --test pg`
 
@@ -11692,7 +11765,7 @@ diff --git a/crates/data-avalanche-source-pg/src/connector.rs b/crates/data-aval
 
 Run: `cargo test -p data-avalanche-source-pg --lib`
 
-Expected: PASS. `data-avalanche-source-pg` unit tests: 66.
+Expected: PASS. `data-avalanche-source-pg` unit tests: 67.
 
 Run, with `test-infra/up.sh` running: `DATA_AVALANCHE_IT=1 cargo test -p data-avalanche-source-pg --test pg`
 
@@ -11734,7 +11807,11 @@ scales exist only on PostgreSQL 15 and later, so those columns are added there o
 
 A second test, `overrides_convert_through_stream_and_snapshot`, runs the lossless override
 conversions of Task 5b both ways. Four converted columns form the key, and the snapshot reads
-one row per chunk, so every cursor goes back to PostgreSQL as converted values.
+one row per chunk, so every cursor goes back to PostgreSQL as converted values. A third,
+`string_and_decimal_overrides_through_stream_and_snapshot`, runs `string` on types that otherwise
+decode, `decimal(P,S)` on `numeric` and `money`, and the remaining conversions at their bounds. A
+fourth, `a_clamped_timestamp_key_halts_the_table`, pins Q-M5-18: a key past the microseconds a
+timestamp holds halts the table in the stream and in the snapshot, and `±infinity` keys page.
 
 - [ ] **Step 1: Write the round trip**
 
@@ -11760,10 +11837,12 @@ Create `crates/data-avalanche-source-pg/tests/pg/types.rs`:
 //! S-PG7 as a regression, and the M5 exit's type round trip: every mapped PostgreSQL type
 //! (`Type_Mapping.md`) inserted, then read through the stream and through a snapshot chunk. Both
 //! give the expected values, and the same ones. The writer's session uses another time zone,
-//! date style and interval style than the pinned ones.
+//! date style and interval style than the pinned ones (they change how its literals parse, not
+//! how either read prints; Task 2 tests the pins).
 
 use data_avalanche_core::{
-    ChangeStream, ColumnValue as V, ColumnValueType as T, Decimal, KeysetCursor, Row, StreamItem,
+    ChangeStream, ColumnValue as V, ColumnValueType as T, Decimal, HaltReason, KeysetCursor, Row,
+    SourceError, StreamItem,
 };
 use data_avalanche_testkit::require_it;
 use serde_json::json;
@@ -11836,7 +11915,13 @@ fn cases(server_version: i32) -> Vec<Case> {
         case(
             "ch",
             "\"char\"",
-            vec![("'a'", V::Int16(97)), ("'Z'", V::Int16(90))],
+            vec![
+                ("'a'", V::Int16(97)),
+                ("'Z'", V::Int16(90)),
+                // Not '\377': PostgreSQL 14 reads that as a backslash.
+                ("(-1)::int4::\"char\"", V::Int16(255)),
+                ("''", V::Int16(0)),
+            ],
         ),
         case(
             "f4",
@@ -11844,6 +11929,7 @@ fn cases(server_version: i32) -> Vec<Case> {
             vec![
                 ("1.5", V::Float32(1.5)),
                 ("'-Infinity'", V::Float32(f32::NEG_INFINITY)),
+                ("'NaN'", V::Float32(f32::NAN)),
             ],
         ),
         case(
@@ -11852,6 +11938,7 @@ fn cases(server_version: i32) -> Vec<Case> {
             vec![
                 ("0.1", V::Float64(0.1)),
                 ("'Infinity'", V::Float64(f64::INFINITY)),
+                ("'NaN'", V::Float64(f64::NAN)),
             ],
         ),
         case(
@@ -11861,6 +11948,36 @@ fn cases(server_version: i32) -> Vec<Case> {
                 ("123456789.123", dec(123_456_789_123, 3)),
                 ("-0.001", dec(-1, 3)),
             ],
+        ),
+        case(
+            "n38",
+            "numeric(38,0)",
+            vec![
+                (
+                    "99999999999999999999999999999999999999",
+                    dec(10i128.pow(38) - 1, 0),
+                ),
+                (
+                    "-99999999999999999999999999999999999999",
+                    dec(1 - 10i128.pow(38), 0),
+                ),
+            ],
+        ),
+        case(
+            "n38s",
+            "numeric(38,38)",
+            vec![(
+                "0.99999999999999999999999999999999999999",
+                dec(10i128.pow(38) - 1, 38),
+            )],
+        ),
+        case(
+            "n40",
+            "numeric(40,2)",
+            vec![(
+                "12345678901234567890123456789012345678.90",
+                text("12345678901234567890123456789012345678.90"),
+            )],
         ),
         case(
             "nb",
@@ -11876,6 +11993,7 @@ fn cases(server_version: i32) -> Vec<Case> {
             vec![
                 ("1234.56", dec(123_456, 2)),
                 ("'-92233720368547758.08'", dec(i64::MIN.into(), 2)),
+                ("'92233720368547758.07'", dec(i64::MAX.into(), 2)),
             ],
         ),
         case(
@@ -11909,6 +12027,8 @@ fn cases(server_version: i32) -> Vec<Case> {
                 ("'2024-02-29'", V::Date(19_782)),
                 ("'4714-11-24 BC'", V::Date(-2_440_588)),
                 ("'infinity'", V::Date(i32::MAX)),
+                ("'5874897-12-31'", V::Date(2_145_042_905)),
+                ("'-infinity'", V::Date(i32::MIN)),
             ],
         ),
         case(
@@ -11949,6 +12069,21 @@ fn cases(server_version: i32) -> Vec<Case> {
                         with_tz: false,
                     },
                 ),
+                (
+                    "'infinity'",
+                    V::Timestamp {
+                        micros: i64::MAX,
+                        with_tz: false,
+                    },
+                ),
+                (
+                    // Past i64 microseconds: a column that isn't the key clamps (Q-M5-1).
+                    "'294276-12-31 23:59:59.999999'",
+                    V::Timestamp {
+                        micros: i64::MAX,
+                        with_tz: false,
+                    },
+                ),
             ],
         ),
         case(
@@ -11966,6 +12101,13 @@ fn cases(server_version: i32) -> Vec<Case> {
                     "'infinity'",
                     V::Timestamp {
                         micros: i64::MAX,
+                        with_tz: true,
+                    },
+                ),
+                (
+                    "'-infinity'",
+                    V::Timestamp {
+                        micros: i64::MIN,
                         with_tz: true,
                     },
                 ),
@@ -12065,7 +12207,13 @@ fn cases(server_version: i32) -> Vec<Case> {
         case(
             "hs",
             "public.hstore",
-            vec![("'a=>1, b=>NULL'", V::Json(json!({"a": "1", "b": null})))],
+            vec![
+                ("'a=>1, b=>NULL'", V::Json(json!({"a": "1", "b": null}))),
+                (
+                    r#"'"ключ"=>"знач ✓", "a\"b"=>"c\\d", "x y"=>"", "=>"=>","'"#,
+                    V::Json(json!({"ключ": "знач ✓", "a\"b": "c\\d", "x y": "", "=>": ","})),
+                ),
+            ],
         ),
         case(
             "ai",
@@ -12076,15 +12224,36 @@ fn cases(server_version: i32) -> Vec<Case> {
                     array(T::Int32, vec![V::Int32(1), V::Null, V::Int32(3)]),
                 ),
                 ("'{}'", array(T::Int32, vec![])),
+                (
+                    "'[0:1]={1,2}'",
+                    array(T::Int32, vec![V::Int32(1), V::Int32(2)]),
+                ),
             ],
         ),
         case(
             "at",
             "text[]",
-            vec![(
-                r#"'{a,"b c",NULL,"NULL"}'"#,
-                array(T::Text, vec![text("a"), text("b c"), V::Null, text("NULL")]),
-            )],
+            vec![
+                (
+                    r#"'{a,"b c",NULL,"NULL"}'"#,
+                    array(T::Text, vec![text("a"), text("b c"), V::Null, text("NULL")]),
+                ),
+                (
+                    r#"'{"héllo ✓","a\"b","c\\d","{x}","",",;"," sp "}'"#,
+                    array(
+                        T::Text,
+                        vec![
+                            text("héllo ✓"),
+                            text("a\"b"),
+                            text("c\\d"),
+                            text("{x}"),
+                            text(""),
+                            text(",;"),
+                            text(" sp "),
+                        ],
+                    ),
+                ),
+            ],
         ),
         case(
             "an",
@@ -12132,6 +12301,16 @@ fn cases(server_version: i32) -> Vec<Case> {
 
 fn rows(cases: &[Case]) -> usize {
     cases.iter().map(|c| c.values.len()).max().unwrap() + 1
+}
+
+/// Equal, or both a NaN (which `PartialEq` never finds equal).
+fn same(a: &(String, V), b: &(String, V)) -> bool {
+    a.0 == b.0
+        && match (&a.1, &b.1) {
+            (V::Float32(x), V::Float32(y)) if x.is_nan() => y.is_nan(),
+            (V::Float64(x), V::Float64(y)) if x.is_nan() => y.is_nan(),
+            (x, y) => x == y,
+        }
 }
 
 /// Row `i` as expected: the id, then each column's value, NULL past its list.
@@ -12225,19 +12404,20 @@ async fn every_mapped_type_round_trips_through_stream_and_snapshot() {
     assert_eq!(snapshot.len(), rows(&cases));
     for i in 0..rows(&cases) {
         let want = expected(&cases, i);
-        for (j, (column, value)) in want.0.iter().enumerate() {
-            assert_eq!(
-                &streamed[i].0[j],
-                &(column.clone(), value.clone()),
-                "stream row {i}"
+        for (j, w) in want.0.iter().enumerate() {
+            assert!(
+                same(&streamed[i].0[j], w),
+                "stream row {i}: {:?} vs {w:?}",
+                streamed[i].0[j]
             );
-            assert_eq!(
-                &snapshot[i].0[j],
-                &(column.clone(), value.clone()),
-                "snapshot row {i}"
+            assert!(
+                same(&snapshot[i].0[j], w),
+                "snapshot row {i}: {:?} vs {w:?}",
+                snapshot[i].0[j]
             );
         }
         assert_eq!(streamed[i].0.len(), want.0.len());
+        assert_eq!(snapshot[i].0.len(), want.0.len());
     }
     // Every value fits the column type the schema declares.
     for r in &snapshot {
@@ -12388,19 +12568,159 @@ async fn overrides_convert_through_stream_and_snapshot() {
     s.close().await.unwrap();
     cleanup(&a, &n).await;
 }
+
+/// Overrides through both reads: `string` (D-M5.10) on types that otherwise decode, a decimal on
+/// `numeric` and `money`, and the Q-M5-12 conversions the test above leaves out. A decimal keeps
+/// the value's own scale; the declared type bounds it (`ColumnValue::fits`).
+#[tokio::test(flavor = "multi_thread")]
+async fn string_and_decimal_overrides_through_stream_and_snapshot() {
+    require_it!();
+    const DAY: i64 = 86_400_000_000;
+    let a = admin().await;
+    let n = fresh(
+        &a,
+        "convert_more",
+        "CREATE TABLE t (id int PRIMARY KEY, b bool, ch \"char\", tt timestamptz, iv interval,
+                         am int4[], at text[], n numeric(8,2), nb numeric, m money, s int2,
+                         i int4, dt date, big int8);",
+    )
+    .await;
+    let overrides = format!(
+        "      column_type_overrides: {{ {s}.t.b: string, {s}.t.ch: string, {s}.t.tt: string, \
+         {s}.t.iv: string, {s}.t.am: string, {s}.t.at: string, {s}.t.n: \"decimal(10,4)\", \
+         {s}.t.nb: \"decimal(38,10)\", {s}.t.m: \"decimal(20,3)\", {s}.t.s: int32, \
+         {s}.t.i: float64, {s}.t.dt: timestamp_ntz, {s}.t.big: \"decimal(25,2)\" }}",
+        s = n.schema
+    );
+    let c = connector(&pipeline(&n, &["*"], &overrides, ""));
+    let (mut s, tables, _) = first_stream(&c).await;
+    let t = &tables[0];
+    a.batch_execute(&format!(
+        "SET search_path = {};
+         INSERT INTO t VALUES
+           (1, true, 'a', '2024-02-29 12:34:56.789012+03', '1 day 02:03:04', '{{{{1,2}},{{3,NULL}}}}',
+            '{{a,\"b c\"}}', 1.5, 123.456, 1234.56, -32768, 2147483647, '2024-01-01',
+            9223372036854775807),
+           (2, false, 'Z', '-infinity', '-1 mon', '{{}}', '{{}}', -999999.99, 0, '-0.01', 32767,
+            -2147483648, 'infinity', -9223372036854775808);",
+        n.schema
+    ))
+    .await
+    .unwrap();
+    let ts = |micros| V::Timestamp {
+        micros,
+        with_tz: false,
+    };
+    let expected = vec![
+        Row(vec![
+            ("id".into(), V::Int32(1)),
+            ("b".into(), text("t")),
+            ("ch".into(), text("a")),
+            ("tt".into(), text("2024-02-29 09:34:56.789012+00")),
+            ("iv".into(), text("P1DT2H3M4S")),
+            ("am".into(), text("{{1,2},{3,NULL}}")),
+            ("at".into(), text("{a,\"b c\"}")),
+            ("n".into(), dec(150, 2)),
+            ("nb".into(), dec(123_456, 3)),
+            ("m".into(), dec(123_456, 2)),
+            ("s".into(), V::Int32(-32_768)),
+            ("i".into(), V::Float64(2_147_483_647.0)),
+            ("dt".into(), ts(19_723 * DAY)),
+            ("big".into(), dec(i64::MAX.into(), 0)),
+        ]),
+        Row(vec![
+            ("id".into(), V::Int32(2)),
+            ("b".into(), text("f")),
+            ("ch".into(), text("Z")),
+            ("tt".into(), text("-infinity")),
+            ("iv".into(), text("P-1M")),
+            ("am".into(), text("{}")),
+            ("at".into(), text("{}")),
+            ("n".into(), dec(-99_999_999, 2)),
+            ("nb".into(), dec(0, 0)),
+            ("m".into(), dec(-1, 2)),
+            ("s".into(), V::Int32(32_767)),
+            ("i".into(), V::Float64(-2_147_483_648.0)),
+            ("dt".into(), ts(i64::MAX)),
+            ("big".into(), dec(i64::MIN.into(), 0)),
+        ]),
+    ];
+    let items = collect(&mut s, 1, 30).await;
+    let streamed: Vec<Row> = items
+        .iter()
+        .filter_map(|i| match i {
+            StreamItem::Change(e) => e.after.clone(),
+            StreamItem::TableHalt { reason, .. } => panic!("halted: {reason}"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(streamed, expected, "the stream");
+    let chunk = c.read_chunk(t, None, 10).await.unwrap();
+    assert_eq!(chunk.rows, expected, "the snapshot");
+    s.close().await.unwrap();
+    cleanup(&a, &n).await;
+}
+
+/// Q-M5-18: a key that clamps past the microseconds a timestamp holds halts the table, in the
+/// stream and in the snapshot; `±infinity` keys a row.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clamped_timestamp_key_halts_the_table() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(
+        &a,
+        "clamped_key",
+        "CREATE TABLE t (ts timestamp PRIMARY KEY, v int);
+         INSERT INTO t VALUES ('2024-01-01', 1), ('-infinity', 0), ('infinity', 2);",
+    )
+    .await;
+    let c = connector(&pipeline(&n, &["*"], "", ""));
+    let (mut s, tables, _) = first_stream(&c).await;
+    let t = &tables[0];
+    let mut rows = 0;
+    let mut cursor: Option<KeysetCursor> = None;
+    loop {
+        let chunk = c.read_chunk(t, cursor.as_ref(), 1).await.unwrap();
+        let Some(next) = chunk.next else { break };
+        rows += chunk.rows.len();
+        cursor = Some(next);
+    }
+    assert_eq!(rows, 3, "infinity keys page");
+    a.execute(
+        &format!("INSERT INTO {}.t VALUES ('294250-01-01', 3)", n.schema),
+        &[],
+    )
+    .await
+    .unwrap();
+    let halt =
+        |r: &HaltReason| matches!(r, HaltReason::SchemaMismatch { column, .. } if column == "ts");
+    let items = collect(&mut s, 1, 20).await;
+    assert!(
+        items
+            .iter()
+            .any(|i| matches!(i, StreamItem::TableHalt { reason, .. } if halt(reason))),
+        "{items:?}"
+    );
+    match c.read_chunk(t, None, 10).await {
+        Err(SourceError::TableHalt { reason, .. }) if halt(&reason) => {}
+        other => panic!("the snapshot halts: {other:?}"),
+    }
+    s.close().await.unwrap();
+    cleanup(&a, &n).await;
+}
 ```
 
 - [ ] **Step 2: Run the tests**
 
 Run: `cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 41 tests. Without `DATA_AVALANCHE_IT` every test returns at once. These tests drive the code of Tasks 2–11, so nothing fails first. A failure in Step 3 is a defect in that code: stop and report it.
+Expected: PASS, 43 tests. Without `DATA_AVALANCHE_IT` every test returns at once. These tests drive the code of Tasks 2–11, so nothing fails first. A failure in Step 3 is a defect in that code: stop and report it.
 
 - [ ] **Step 3: Run them against PostgreSQL**
 
 Run: `test-infra/up.sh`, then `DATA_AVALANCHE_IT=1 cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 41 tests.
+Expected: PASS, 43 tests.
 
 - [ ] **Step 4: Run the gates**
 
@@ -12888,13 +13208,13 @@ jobs:
 
 Run: `cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 45 tests. Without `DATA_AVALANCHE_IT` every test returns at once. These tests drive the code of Tasks 2–11, so nothing fails first. A failure in Step 3 is a defect in that code: stop and report it.
+Expected: PASS, 47 tests. Without `DATA_AVALANCHE_IT` every test returns at once. These tests drive the code of Tasks 2–11, so nothing fails first. A failure in Step 3 is a defect in that code: stop and report it.
 
 - [ ] **Step 3: Run them against PostgreSQL**
 
 Run: `test-infra/up.sh` (it now starts `postgres-tls` too), then `DATA_AVALANCHE_IT=1 cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 45 tests.
+Expected: PASS, 47 tests.
 
 Then the nightly matrix by hand, one server at a time (55414…55417):
 
@@ -12903,7 +13223,7 @@ docker compose -f test-infra/compose.yaml --profile matrix up -d --wait postgres
 DATA_AVALANCHE_IT=1 DATA_AVALANCHE_PG_PORT=55414 cargo test -p data-avalanche-source-pg --test pg --test slot_invalidation -- --skip tls::
 ```
 
-Expected: PASS on each, 41 tests, and the `slot_invalidation` test.
+Expected: PASS on each, 43 tests, and the `slot_invalidation` test.
 
 - [ ] **Step 4: Run the gates**
 
@@ -13277,3 +13597,30 @@ signal and dropped after it reads as a drop after the signal. The re-review argu
 placement can be silently wrong. Left for the whole-branch review: a `require_existing` publication with a
 column list (PostgreSQL 15+) or PostgreSQL 18's `publish_generated_columns` makes channel C halt the
 table on every signal (fail-safe); reconcile could warn or refuse.
+
+**Task 12: a clamped key halts the table, and the round trip's gaps** (`412ef25`; found by the task
+review, owner decision Q-M5-18, 2026-10-02):
+- **Distinct keys merged.** Q-M5-1 clamps a timestamp past the `i64` microseconds (PostgreSQL
+  stores up to 294276 AD) to `i64::MAX`, which is also `'infinity'`. In a key column, two rows
+  became one identifier, and a snapshot cursor at the clamp read as `'infinity'` and ended the
+  scan (the reviewer measured 2 rows of 4 on PostgreSQL 18). An identifier column whose value
+  clamps now halts the table, `SCHEMA_MISMATCH`, in the stream (`StreamColumn.identifier`, Task 9)
+  and in the snapshot (`ReadColumn.identifier`, Task 10); `value::clamped` tells a clamp from
+  `±infinity` by the text (Task 4). Other columns still clamp. Unit test
+  `a_clamped_identifier_halts_the_table`; the `data-avalanche-source-pg` unit count after Task 11
+  is 77.
+- **The round trip's gaps.** `every_mapped_type_round_trips_through_stream_and_snapshot` gains
+  38-digit numerics (`numeric(38,0)` at ±(10³⁸−1), `numeric(38,38)`, `numeric(40,2)` as text), the
+  last date and `-infinity`, `timestamp` `infinity` and a non-key clamp, `timestamptz`
+  `-infinity`, `money`'s maximum, float `NaN` (compared NaN-aware), a `"char"` byte above 127 and
+  the empty `"char"`, unicode and escapes in `text[]` and `hstore`, an array with explicit
+  bounds, and a row length check on the snapshot. New tests:
+  `string_and_decimal_overrides_through_stream_and_snapshot` (a `decimal(P,S)` value keeps its own
+  scale; the declared type bounds it, as in Task 5b) and `a_clamped_timestamp_key_halts_the_table`.
+  Measured on the verified workspace: PostgreSQL 14–18 pass 43 integration tests each and
+  `slot_invalidation`; the workspace passes 653.
+- **A plan correction.** Task 10's fix moved `reads_char` from the stream to `Decode::reads_char`
+  in `value.rs`, but the plan's Task 5b diff and Task 9 code didn't show the move; they do now.
+  Task 4's code with Task 5b's diff now gives the final `value.rs` but for Task 4's own two fixes
+  above (the timestamp clamp, `aba85ec`; JSON digits, `fedfc22`, with the workspace `Cargo.toml`
+  feature), which stay recorded here only.
