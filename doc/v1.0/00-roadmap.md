@@ -806,6 +806,14 @@ Detailed plan: `M0-foundations.md`.
     (autovacuum included), GRANT, index changes. If a signal is a flush barrier, budget for it.
     Each extra signal while the stream lags the catalog is another chance to meet Q-M5-17's
     fail-safe halts.
+  - Keep DataFusion out of the crates that don't need it (Q-M5-24). Only `data-avalanche-sink-delta`
+    depends on `deltalake`, and its tree is 413 of the 580 crates in the lockfile (DataFusion 292,
+    the AWS SDK about 40 more; `source-pg` is 168, `core` 43). The rules:
+    - the pipeline crate depends on the `Sink` trait in core, not on `sink-delta`;
+    - only the binary crate links `sink-delta`;
+    - no other crate takes it as a dev-dependency.
+
+    Then `cargo test -p` on any other crate never compiles DataFusion.
 - **Deps:** M1, M2, M3, M4, M5.
 - **Exit:** the **slice-1 E2E suite** passes on PG 18 + RustFS and weekly on PG 14–17. See §5.3 for
   the scenario list.
@@ -922,6 +930,19 @@ Detailed plan: `M0-foundations.md`.
   - The weekly DB version matrix green for 4 consecutive runs (Q-M5-23).
   - A dependency audit: `cargo audit` clean, or every remaining advisory triaged and recorded (the CI
     step is non-blocking, so this is where the audit is enforced).
+  - Compile time and the dependency tree (Q-M5-24), checked against a measurement:
+    - `cargo build --timings`, to see what dominates: DataFusion, `aws-lc-sys` (a C build, through
+      `deltalake-aws`'s `aws-config`) or linking;
+    - the dev profile: dependencies already build without debug info; try `debug =
+      "line-tables-only"` for workspace crates, and weigh `opt-level = 1` for dependencies (faster
+      DataFusion tests, slower full builds);
+    - CI: one build shared between the `check` and `integration` jobs (one cache key, or `cargo
+      nextest archive`). This can land earlier, once PR CI time hurts;
+    - upstream: what the delta-rs release current then offers, or a request for it.
+      `deltalake-core` 1.0 takes DataFusion's default features, so we can't turn off its optional
+      parts (the bzip2/xz/gzip codecs). The AWS SDK also comes in when S3 commits need only a
+      conditional PUT;
+    - the M6 dependency rule (above) still holds.
   - Tag `v1.0.0`.
 - **Deps:** all of the above.
 - **Exit:** the acceptance checklist in §8.
@@ -1082,6 +1103,8 @@ implements them.
 - [ ] Real-cloud E2E on S3, GCS and Azure.
 - [ ] Container image and Helm chart published; kind smoke deploy green.
 - [ ] Documentation site builds strict; runbooks reviewed.
+- [ ] Compile time and dependency tree reviewed against a `cargo build --timings` measurement (M12,
+      Q-M5-24).
 - [ ] Gap tracker updated: implementation-surfaced gaps recorded, v1 rows closed with pointers to code
       and tests.
 
@@ -1156,6 +1179,7 @@ the naming below (2026-09-26).**
 | Q-M5-21 (2026-10-02) | The whole-branch review's second round: a table renamed away and back lost the writes in between; NULL-key rows past the first chunk were skipped; the snapshot's OID check missed a table with none of the cached columns and a dropped schema | **A tracked OID under an untracked name halts the table; a nullable identifier column halts it; the snapshot resolves the OID first (`to_regclass`); smaller fixes to timeouts and rescan** | `M5-pg-source.md` Q-M5-21, Deviations |
 | Q-M5-22 (2026-10-02) | The whole-branch review's third round: PostgreSQL 18 sets `attnotnull` under `NOT NULL … NOT VALID`, so an override key on such a column skipped its NULL rows | **An unvalidated not-null constraint counts as nullable at resolve and in the snapshot; a dropped-schema test; the cache-lock wait goes to DA-SRC-17** | `M5-pg-source.md` Q-M5-22, Deviations |
 | Q-M5-23 (2026-10-02) | How often does the PostgreSQL 14–17 matrix run? | **Weekly (Mondays 03:41 UTC) and on manual dispatch, as `weekly.yml`; the v1 release needs 4 weekly runs green in a row** | §2, §5.4, §8, M12 exit |
+| Q-M5-24 (2026-10-02) | DataFusion (34 sub-crates) and the AWS SDK come in through `deltalake`: can the dependency tree and compile time shrink? | **Nothing to remove from our manifests: the sub-crates are transitive, and MERGE needs `deltalake`'s `datafusion` feature. From M6, only the binary links `sink-delta`. The rest is measured and tuned just before release (M12): timings, profiles, CI build sharing (earlier if CI time hurts), upstream** | M6 scope; M12 scope; §8 |
 | Q-M9-1 | Snapshot-job persistence | **Persisted in the pipeline state location** (`snapshots/jobs/<job_id>.json`); listed after a restart or failover via `GET /v1/pipelines/{id}/snapshots`; a running job continues on the new owner from its chunk cursors | `Data-Flow.md` §On-Demand Snapshot + State Layout; System-Overview and API_RBAC endpoint tables |
 
 ### 9.2 Open questions (answer before the named milestone)
