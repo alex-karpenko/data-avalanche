@@ -81,11 +81,12 @@ fn bad(what: &str, text: &str) -> ValueError {
 }
 
 /// Why an identifier value that clamps halts its table (Q-M5-18).
-pub(crate) const CLAMPED_KEY: &str = "an instant past the microseconds a timestamp holds \
-    (294247 AD) clamps, and can't key a row: distinct keys would merge";
+pub(crate) const CLAMPED_KEY: &str = "an instant at or past the last microsecond a timestamp \
+    holds (294247-01-10 04:00:54.775807 UTC) clamps to the value of infinity, and can't key a \
+    row: distinct keys would merge";
 
-/// Whether `value`, decoded from `text`, is a clamped instant: past the `i64` microseconds
-/// (Q-M5-1), not `±infinity`, which decodes to the same bound.
+/// Whether `value`, decoded from `text`, is a clamped instant: at or past the last `i64`
+/// microsecond (Q-M5-1), not `±infinity`, which decodes to the same bound.
 pub(crate) fn clamped(value: &ColumnValue, text: &str) -> bool {
     matches!(
         value,
@@ -709,6 +710,12 @@ mod tests {
             with_tz: false,
         };
         assert!(clamped(&at(i64::MAX), "294250-01-01 00:00:00"));
+        // The last microsecond itself is the value of infinity.
+        assert_eq!(
+            timestamp("294247-01-10 04:00:54.775807", false),
+            Ok(i64::MAX)
+        );
+        assert!(clamped(&at(i64::MAX), "294247-01-10 04:00:54.775807"));
         assert!(clamped(&at(i64::MAX), "300000-01-01"), "a date converted");
         assert!(!clamped(&at(i64::MAX), "infinity"));
         assert!(!clamped(&at(i64::MIN), "-infinity"));

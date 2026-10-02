@@ -8,7 +8,8 @@
 //! - `timestamp_ntz` → `string`: `YYYY-MM-DD HH:MM:SS.ffffff`;
 //! - `date`, `timestamp`, `timestamp_ntz` cells are clamped to the Delta protocol's range,
 //!   0001-01-01 … 9999-12-31 23:59:59.999999 (Q-M4-2): delta-rs can't write dates much beyond it
-//!   and readers can't read them. PostgreSQL `±infinity` lands on the bounds;
+//!   and readers can't read them. PostgreSQL `±infinity` lands on the bounds. An identifier cell
+//!   isn't clamped: [`clamped_key`] finds it, and the table halts (Q-M5-19);
 //! - lists convert element-wise; every other pair is the same Arrow type on both sides.
 
 use std::sync::Arc;
@@ -40,6 +41,35 @@ fn is_string(d: &DeltaType) -> bool {
 
 fn mismatch(logical: &LogicalType, delta: &DeltaType) -> String {
     format!("a {logical} column can't be stored as Delta {delta}")
+}
+
+/// The first cell of an identifier column that [`to_delta`] would clamp, as text: clamped, two
+/// keys would become one (Q-M5-19). `None` when every cell is in the Delta range, or when the pair
+/// doesn't clamp.
+pub fn clamped_key(array: &ArrayRef, logical: &LogicalType, delta: &DeltaType) -> Option<String> {
+    use LogicalType as L;
+    use PrimitiveType as P;
+    match (logical, delta) {
+        (L::Date, DeltaType::Primitive(P::Date)) => array
+            .as_primitive::<Date32Type>()
+            .iter()
+            .flatten()
+            .find(|d| !(DELTA_MIN_DATE..=DELTA_MAX_DATE).contains(d))
+            .map(|d| {
+                let (y, m, d) = civil_from_days(d.into());
+                format!("date {y:04}-{m:02}-{d:02}")
+            }),
+        (
+            L::TimestampTz | L::TimestampNtz,
+            DeltaType::Primitive(P::Timestamp | P::TimestampNtz),
+        ) => array
+            .as_primitive::<TimestampMicrosecondType>()
+            .iter()
+            .flatten()
+            .find(|t| !(DELTA_MIN_MICROS..=DELTA_MAX_MICROS).contains(t))
+            .map(|t| format!("timestamp {}", ntz_text(t))),
+        _ => None,
+    }
 }
 
 /// Converts a Hop 2 column of `logical` type to the Arrow array delta-rs writes into a column of
@@ -391,6 +421,44 @@ mod tests {
             DELTA_MAX_MICROS
         );
         assert!(to_delta(&tz, &LogicalType::TimestampTz, &DeltaType::TIMESTAMP_NTZ).is_err());
+    }
+
+    #[test]
+    fn a_key_the_delta_range_would_clamp_is_found() {
+        let d: ArrayRef = Arc::new(Date32Array::from(vec![
+            Some(DELTA_MIN_DATE),
+            None,
+            Some(DELTA_MAX_DATE),
+        ]));
+        assert_eq!(clamped_key(&d, &LogicalType::Date, &DeltaType::DATE), None);
+        let d: ArrayRef = Arc::new(Date32Array::from(vec![0, DELTA_MAX_DATE + 1, i32::MIN]));
+        assert_eq!(
+            clamped_key(&d, &LogicalType::Date, &DeltaType::DATE).as_deref(),
+            Some("date 10000-01-01")
+        );
+        let ts: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
+            DELTA_MIN_MICROS,
+            DELTA_MAX_MICROS,
+        ]));
+        for delta in [DeltaType::TIMESTAMP_NTZ, DeltaType::TIMESTAMP] {
+            assert_eq!(clamped_key(&ts, &LogicalType::TimestampNtz, &delta), None);
+        }
+        let ts: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
+            DELTA_MIN_MICROS - 1,
+            i64::MAX,
+        ]));
+        assert_eq!(
+            clamped_key(&ts, &LogicalType::TimestampNtz, &DeltaType::TIMESTAMP_NTZ).as_deref(),
+            Some("timestamp 0000-12-31 23:59:59.999999")
+        );
+        let tz: ArrayRef =
+            Arc::new(TimestampMicrosecondArray::from(vec![i64::MAX]).with_timezone("UTC"));
+        assert!(clamped_key(&tz, &LogicalType::TimestampTz, &DeltaType::TIMESTAMP).is_some());
+        // Stored as text, a timestamp isn't clamped.
+        assert_eq!(
+            clamped_key(&tz, &LogicalType::TimestampNtz, &DeltaType::STRING),
+            None
+        );
     }
 
     #[test]

@@ -759,6 +759,32 @@ async fn string_and_decimal_overrides_through_stream_and_snapshot() {
     let c = connector(&pipeline(&n, &["*"], &overrides, ""));
     let (mut s, tables, _) = first_stream(&c).await;
     let t = &tables[0];
+    let num = |precision: u8, scale: i8| T::Numeric { precision, scale };
+    let types: Vec<(&str, T)> = t
+        .columns()
+        .iter()
+        .map(|c| (c.name.as_str(), c.value_type.clone()))
+        .collect();
+    assert_eq!(
+        types,
+        [
+            ("id", T::Int32),
+            ("b", T::Text),
+            ("ch", T::Text),
+            ("tt", T::Text),
+            ("iv", T::Text),
+            ("am", T::Text),
+            ("at", T::Text),
+            ("n", num(10, 4)),
+            ("nb", num(38, 10)),
+            ("m", num(20, 3)),
+            ("s", T::Int32),
+            ("i", T::Float64),
+            ("dt", T::Timestamp { with_tz: false }),
+            ("big", num(25, 2)),
+        ],
+        "each override is the declared type"
+    );
     a.batch_execute(&format!(
         "SET search_path = {};
          INSERT INTO t VALUES
@@ -821,12 +847,17 @@ async fn string_and_decimal_overrides_through_stream_and_snapshot() {
     assert_eq!(streamed, expected, "the stream");
     let chunk = c.read_chunk(t, None, 10).await.unwrap();
     assert_eq!(chunk.rows, expected, "the snapshot");
+    for row in &expected {
+        for ((column, value), (_, ty)) in row.0.iter().zip(&types) {
+            assert!(value.fits(ty), "{column}: {value:?} fits {ty:?}");
+        }
+    }
     s.close().await.unwrap();
     cleanup(&a, &n).await;
 }
 
-/// Q-M5-18: a key that clamps past the microseconds a timestamp holds halts the table, in the
-/// stream and in the snapshot; `±infinity` keys a row.
+/// Q-M5-18: a key at or past the last microsecond a timestamp holds halts the table, in the stream
+/// (a new row's key, a delete's old key) and in the snapshot; `±infinity` keys page.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_clamped_timestamp_key_halts_the_table() {
     require_it!();
@@ -835,39 +866,76 @@ async fn a_clamped_timestamp_key_halts_the_table() {
         &a,
         "clamped_key",
         "CREATE TABLE t (ts timestamp PRIMARY KEY, v int);
-         INSERT INTO t VALUES ('2024-01-01', 1), ('-infinity', 0), ('infinity', 2);",
+         INSERT INTO t VALUES ('2024-01-01', 1), ('-infinity', 0), ('infinity', 2);
+         CREATE TABLE z (tz timestamptz PRIMARY KEY);
+         CREATE TABLE k (id int, ts timestamp, PRIMARY KEY (id, ts));
+         CREATE TABLE d (d date PRIMARY KEY);
+         CREATE TABLE o (ts timestamp PRIMARY KEY);
+         INSERT INTO o VALUES ('294250-01-01');",
     )
     .await;
-    let c = connector(&pipeline(&n, &["*"], "", ""));
+    let overrides = format!(
+        "      column_type_overrides: {{ {}.d.d: timestamp_ntz }}",
+        n.schema
+    );
+    let c = connector(&pipeline(&n, &["*"], &overrides, ""));
     let (mut s, tables, _) = first_stream(&c).await;
-    let t = &tables[0];
+    let table = |name: &str| tables.iter().find(|t| t.table().name == name).unwrap();
+    let halt = |r: &HaltReason, col: &str| {
+        matches!(r, HaltReason::SchemaMismatch { column, detail }
+            if column == col && detail.contains("can't key a row"))
+    };
     let mut rows = 0;
     let mut cursor: Option<KeysetCursor> = None;
     loop {
-        let chunk = c.read_chunk(t, cursor.as_ref(), 1).await.unwrap();
+        let chunk = c.read_chunk(table("t"), cursor.as_ref(), 1).await.unwrap();
         let Some(next) = chunk.next else { break };
         rows += chunk.rows.len();
         cursor = Some(next);
     }
     assert_eq!(rows, 3, "infinity keys page");
-    a.execute(
-        &format!("INSERT INTO {}.t VALUES ('294250-01-01', 3)", n.schema),
-        &[],
-    )
+    match c.read_chunk(table("o"), None, 10).await {
+        Err(SourceError::TableHalt { reason, .. }) if halt(&reason, "ts") => {}
+        other => panic!("o: the snapshot halts: {other:?}"),
+    }
+    // One transaction: a key past the range, the last microsecond (with an offset), a composite
+    // key, a date converted to a timestamp, and a delete's old key.
+    a.batch_execute(&format!(
+        "SET search_path = {};
+         INSERT INTO t VALUES ('294250-01-01', 3);
+         INSERT INTO z VALUES ('294247-01-10 09:30:54.775807+05:30');
+         INSERT INTO k VALUES (1, '294276-12-31 23:59:59.999999');
+         INSERT INTO d VALUES ('300000-01-01');
+         DELETE FROM o;",
+        n.schema
+    ))
     .await
     .unwrap();
-    let halt =
-        |r: &HaltReason| matches!(r, HaltReason::SchemaMismatch { column, .. } if column == "ts");
     let items = collect(&mut s, 1, 20).await;
+    for (name, column) in [
+        ("t", "ts"),
+        ("z", "tz"),
+        ("k", "ts"),
+        ("d", "d"),
+        ("o", "ts"),
+    ] {
+        assert!(
+            items
+                .iter()
+                .any(|i| matches!(i, StreamItem::TableHalt { table, reason, .. }
+                if table.name == name && halt(reason, column))),
+            "{name}: the stream halts: {items:?}"
+        );
+    }
     assert!(
-        items
-            .iter()
-            .any(|i| matches!(i, StreamItem::TableHalt { reason, .. } if halt(reason))),
-        "{items:?}"
+        !items.iter().any(|i| matches!(i, StreamItem::Change(_))),
+        "no change of a halted table: {items:?}"
     );
-    match c.read_chunk(t, None, 10).await {
-        Err(SourceError::TableHalt { reason, .. }) if halt(&reason) => {}
-        other => panic!("the snapshot halts: {other:?}"),
+    for (name, column) in [("t", "ts"), ("z", "tz"), ("k", "ts"), ("d", "d")] {
+        match c.read_chunk(table(name), None, 10).await {
+            Err(SourceError::TableHalt { reason, .. }) if halt(&reason, column) => {}
+            other => panic!("{name}: the snapshot halts: {other:?}"),
+        }
     }
     s.close().await.unwrap();
     cleanup(&a, &n).await;
