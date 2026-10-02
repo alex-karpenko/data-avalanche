@@ -750,9 +750,15 @@ async fn key_and_identity_changes_signal() {
         })
         .collect();
     assert_eq!(
-        kinds,
-        ["change", "signal", "change", "signal", "change", "change"],
+        kinds[..5],
+        ["change", "signal", "change", "signal", "change"],
         "no signal for the first Relation message: its key is the opening identifier"
+    );
+    // Under REPLICA IDENTITY FULL every Relation message signals, and pgoutput may send one again
+    // after a cache invalidation: a signal can come before the delete too.
+    assert!(
+        matches!(kinds[5..], ["change"] | ["signal", "change"]),
+        "{kinds:?}"
     );
     let c = changes(&items);
     assert_eq!(c[0].after.as_ref().unwrap().get("c"), Some(&V::Int16(195)));
@@ -764,6 +770,45 @@ async fn key_and_identity_changes_signal() {
             ("c", V::Null)
         ])),
         "REPLICA IDENTITY FULL: the whole old row"
+    );
+    s.close().await.unwrap();
+    cleanup(&a, &n).await;
+}
+
+/// A table replaced under its name before the session saw it halts: the stream starts with each
+/// table's OID from its schema, so a reconnect (a new session) doesn't adopt the new table.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_table_replaced_before_the_session_saw_it_halts() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(
+        &a,
+        "stream_replaced",
+        "CREATE TABLE u (id int PRIMARY KEY); CREATE TABLE u_new (id int PRIMARY KEY);",
+    )
+    .await;
+    let c = connector(&pipeline(&n, &["u"], "", ""));
+    let (mut s, _, _) = first_stream(&c).await;
+    let sc = &n.schema;
+    each(
+        &a,
+        &[
+            format!("ALTER PUBLICATION {} ADD TABLE {sc}.u_new", n.publication),
+            format!(
+                "BEGIN; ALTER TABLE {sc}.u RENAME TO u_old; ALTER TABLE {sc}.u_new RENAME TO u; COMMIT"
+            ),
+            format!("INSERT INTO {sc}.u VALUES (1)"),
+        ],
+    )
+    .await;
+    let items = collect(&mut s, 1, 20).await;
+    assert!(
+        items.iter().any(|i| matches!(i, StreamItem::TableHalt { table, reason: HaltReason::TableDropped, .. } if table.name == "u")),
+        "{items:?}"
+    );
+    assert!(
+        !items.iter().any(|i| matches!(i, StreamItem::Change(_))),
+        "{items:?}"
     );
     s.close().await.unwrap();
     cleanup(&a, &n).await;

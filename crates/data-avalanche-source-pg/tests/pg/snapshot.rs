@@ -10,6 +10,57 @@ use data_avalanche_testkit::require_it;
 
 use crate::common::{admin, cleanup, connector, fresh, pipeline, resolved};
 
+/// Final review I3: a table dropped under the snapshot halts that table (`TABLE_DROPPED`), and a
+/// key column that lost NOT NULL and holds a NULL halts it (`NULL_IDENTIFIER`): neither stops the
+/// pipeline.
+#[tokio::test]
+async fn a_dropped_table_or_a_null_key_halts_only_its_table() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(
+        &a,
+        "snapshot_halts",
+        "CREATE TABLE d (id int PRIMARY KEY);
+         CREATE TABLE k (k int NOT NULL, v int);
+         ALTER TABLE k REPLICA IDENTITY FULL;",
+    )
+    .await;
+    let tables = format!("      primary_key: {{ {}.k: [k] }}", n.schema);
+    let c = connector(&pipeline(&n, &["*"], &tables, ""));
+    let r = resolved(&c).await;
+    let table = |name: &str| r.tables.iter().find(|t| t.table().name == name).unwrap();
+    let sc = &n.schema;
+    a.batch_execute(&format!(
+        "DROP TABLE {sc}.d;
+         ALTER TABLE {sc}.k ALTER COLUMN k DROP NOT NULL;
+         INSERT INTO {sc}.k VALUES (1, 1), (NULL, 2);"
+    ))
+    .await
+    .unwrap();
+    let dropped = |r: Result<(), SourceError>| {
+        matches!(
+            r,
+            Err(SourceError::TableHalt {
+                reason: HaltReason::TableDropped,
+                ..
+            })
+        )
+    };
+    let chunk = c.read_chunk(table("d"), None, 10).await.map(|_| ());
+    assert!(dropped(chunk.clone()), "read_chunk: {chunk:?}");
+    let key = Row(vec![("id".into(), V::Int32(1))]);
+    let rows = c.fetch_rows(table("d"), &[key]).await.map(|_| ());
+    assert!(dropped(rows.clone()), "fetch_rows: {rows:?}");
+    match c.read_chunk(table("k"), None, 10).await {
+        Err(SourceError::TableHalt {
+            reason: HaltReason::NullIdentifier { column },
+            ..
+        }) => assert_eq!(column, "k"),
+        other => panic!("a NULL key halts the table: {other:?}"),
+    }
+    cleanup(&a, &n).await;
+}
+
 /// Every row of `table`, chunk by chunk.
 async fn read_all(c: &PgConnector, table: &TableSchema, limit: usize) -> (Vec<Row>, usize) {
     let mut rows = vec![];

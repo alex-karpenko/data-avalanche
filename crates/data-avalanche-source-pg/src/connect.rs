@@ -15,6 +15,17 @@ use tokio_postgres::Client;
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::error::{sql_error, timed_out};
+
+/// How much longer the client waits than a server-side timeout (`statement_timeout`,
+/// `lock_timeout`): the server cancels a slow statement first, so the shared catalog connection
+/// is free again when the client gives up.
+pub(crate) const SERVER_FIRST: Duration = Duration::from_secs(5);
+
+/// `d` as a server-side timeout in milliseconds: at least 1 (0 turns a timeout off) and at most
+/// what the setting holds (`i32::MAX`).
+pub(crate) fn server_millis(d: Duration) -> u128 {
+    d.as_millis().clamp(1, i32::MAX as u128)
+}
 use crate::tls::{PemFiles, control_ssl_mode, control_tls, replication_tls};
 
 /// Session settings on both connections: UTC instants, ISO dates, ISO-8601 intervals, round-trip
@@ -44,7 +55,11 @@ pub(crate) struct Connector {
 
 impl Connector {
     pub(crate) fn new(source: &Source) -> Result<Self, SourceError> {
-        let files = PemFiles::new(source).map_err(SourceError::Permanent)?;
+        // Inline PEMs go to private files only for a connection that uses TLS.
+        let files = match source.ssl_mode {
+            SslMode::Disable => PemFiles::default(),
+            _ => PemFiles::new(source).map_err(SourceError::Permanent)?,
+        };
         let tls = match source.ssl_mode {
             SslMode::Disable => None,
             _ => Some(MakeRustlsConnect::new(
@@ -117,7 +132,41 @@ impl Connector {
         what: &str,
         f: impl Future<Output = Result<T, tokio_postgres::Error>>,
     ) -> Result<T, SourceError> {
-        within(what, self.timeouts.command, f).await
+        self.bounded(what, self.timeouts.command, f).await
+    }
+
+    /// `f`, on the shared catalog connection, under a client-side timeout. A timeout abandons the
+    /// connection: the server is asked to cancel the statement, and the next call connects
+    /// afresh, so a retry doesn't queue behind a statement the server still runs.
+    pub(crate) async fn bounded<T>(
+        &self,
+        what: &str,
+        after: Duration,
+        f: impl Future<Output = Result<T, tokio_postgres::Error>>,
+    ) -> Result<T, SourceError> {
+        match tokio::time::timeout(after, f).await {
+            Ok(r) => r.map_err(sql_error),
+            Err(_) => {
+                self.abandon().await;
+                Err(timed_out(what, after))
+            }
+        }
+    }
+
+    /// Drops the cached catalog connection and asks the server to cancel what it runs there,
+    /// within `timeouts.connect`; a cancel that fails changes nothing.
+    async fn abandon(&self) {
+        let Some(client) = self.client.lock().await.take() else {
+            return;
+        };
+        let token = client.cancel_token();
+        let _ = tokio::time::timeout(self.timeouts.connect, async {
+            match &self.tls {
+                None => token.cancel_query(tokio_postgres::NoTls).await,
+                Some(tls) => token.cancel_query(tls.clone()).await,
+            }
+        })
+        .await;
     }
 
     /// The replication connection for `slot` and `publication`, starting after `start`. The status
@@ -176,6 +225,21 @@ pub(crate) async fn within<T>(
 mod tests {
     use super::*;
     use crate::test_support::pipeline;
+
+    #[test]
+    fn server_timeouts_stay_in_the_settings_range() {
+        assert_eq!(
+            server_millis(Duration::ZERO),
+            1,
+            "0 would turn the timeout off"
+        );
+        assert_eq!(server_millis(Duration::from_micros(10)), 1);
+        assert_eq!(server_millis(Duration::from_secs(30)), 30_000);
+        assert_eq!(
+            server_millis(Duration::from_secs(10_000_000)),
+            i32::MAX as u128
+        );
+    }
 
     #[test]
     fn the_catalog_connection_pins_the_session() {

@@ -1,6 +1,8 @@
 //! The slot state machine cell by cell (`Postgres_Slot…` §1–§3, the M5 exit) and publication
 //! reconciliation (§4) against a live server.
 
+use std::time::Duration;
+
 use data_avalanche_core::position::Lsn;
 use data_avalanche_core::{SnapshotReason, SourceError, SourcePosition, StartPlan, TableRef};
 use data_avalanche_testkit::require_it;
@@ -209,6 +211,45 @@ async fn the_publication_follows_the_table_set() {
     let empty: [TableRef; 0] = [];
     c.prepare(Some(&start), &empty).await.unwrap();
     assert!(published(&a, &n).await.is_empty());
+    cleanup(&a, &n).await;
+}
+
+/// Final review I2: a publication change that waits on a table's lock is cancelled by the server,
+/// not left to commit after the client gave up. The retry adds the table again and reports it for
+/// its snapshot; without the server's timeout the abandoned change committed once the lock was
+/// free, and the retry reported nothing.
+#[tokio::test]
+async fn a_publication_change_blocked_by_a_lock_is_retried_whole() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(&a, "slot_lock", DDL).await;
+    let mut p = pipeline(&n, &["*"], "", "");
+    p.source.timeouts.command = Duration::from_secs(1);
+    let c = connector(&p);
+    let first = c.prepare(None, &[n.table("a")]).await.unwrap();
+    let start = from(&first.plan, SnapshotReason::FirstStart);
+    let holder = admin().await;
+    holder
+        .batch_execute(&format!(
+            "BEGIN; LOCK TABLE {}.b IN ACCESS EXCLUSIVE MODE",
+            n.schema
+        ))
+        .await
+        .unwrap();
+    let err = c
+        .prepare(Some(&start), &[n.table("a"), n.table("b")])
+        .await
+        .unwrap_err();
+    assert!(err.is_transient(), "{err}");
+    holder.batch_execute("COMMIT").await.unwrap();
+    // Time for a change the server didn't cancel to commit.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let p = c
+        .prepare(Some(&start), &[n.table("a"), n.table("b")])
+        .await
+        .unwrap();
+    assert_eq!(p.plan, StartPlan::Resume);
+    assert_eq!(p.added, [n.table("b")]);
     cleanup(&a, &n).await;
 }
 

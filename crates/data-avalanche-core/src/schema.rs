@@ -148,6 +148,7 @@ pub struct TableSchema {
     table: TableRef,
     columns: Vec<ColumnSchema>,
     identifier: Vec<String>,
+    source_id: Option<u64>,
 }
 
 impl TableSchema {
@@ -214,7 +215,21 @@ impl TableSchema {
             table,
             columns,
             identifier,
+            source_id: None,
         })
+    }
+
+    /// The source's own identity of the table (PostgreSQL: the relation OID), which outlives a
+    /// rename and changes when a table is dropped and another takes its name: the table this
+    /// schema describes is gone when the name now has another identity (`Schema_Change…` §2.1).
+    pub fn with_source_id(mut self, id: u64) -> Self {
+        self.source_id = Some(id);
+        self
+    }
+
+    /// See [`TableSchema::with_source_id`]; `None` for a source without one.
+    pub fn source_id(&self) -> Option<u64> {
+        self.source_id
     }
 
     pub fn table(&self) -> &TableRef {
@@ -434,5 +449,14 @@ mod tests {
                 .to_string()
                 .contains("tables.column_type_overrides: {c: string}")
         );
+    }
+
+    #[test]
+    fn a_source_id_is_kept_and_tells_tables_apart() {
+        let s = TableSchema::new(t(), cols(), vec!["id".into()]).unwrap();
+        assert_eq!(s.source_id(), None);
+        let a = s.clone().with_source_id(7);
+        assert_eq!(a.source_id(), Some(7));
+        assert_ne!(a, s.with_source_id(8), "another table under the name");
     }
 }

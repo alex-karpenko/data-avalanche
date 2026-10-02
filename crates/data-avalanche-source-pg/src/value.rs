@@ -68,11 +68,13 @@ impl Decode {
 }
 
 /// Why a value can't be decoded.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ValueError {
     /// The value doesn't fit its decimal column (`NUMERIC_OVERFLOW`).
+    #[error("the value doesn't fit its decimal column")]
     Overflow,
     /// The value has no representation in the column's type (`SCHEMA_MISMATCH`).
+    #[error("{0}")]
     Unrepresentable(String),
 }
 

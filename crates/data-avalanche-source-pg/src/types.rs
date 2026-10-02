@@ -65,12 +65,14 @@ impl Plan {
 }
 
 /// Why a column can't be planned.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PlanError {
     /// `numeric(P,S)` beyond 38 digits under `numeric_overflow_action: error`.
+    #[error("a numeric beyond 38 digits under numeric_overflow_action: error")]
     NumericOverflow,
     /// A type OID with no `pg_type` row in the catalog given: the caller fetches it and plans
     /// again.
+    #[error("type OID {0} isn't in the type catalog")]
     Missing(u32),
 }
 

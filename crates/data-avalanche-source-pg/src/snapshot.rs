@@ -5,26 +5,21 @@
 //! a streamed row of the same data are equal. (A `::text` cast isn't the output function:
 //! `true::text` is `true`, pgoutput sends `t`.)
 
-use std::time::Duration;
-
 use data_avalanche_core::{
     Chunk, ColumnValue, HaltReason, KeysetCursor, Row, SourceError, TableSchema, identifier_values,
 };
 use tokio_postgres::SimpleQueryMessage;
 
 use crate::catalog::{load_types, table_key};
-use crate::connect::within;
+use crate::connect::{SERVER_FIRST, server_millis};
 use crate::connector::PgConnector;
+use crate::error::sqlstate;
 use crate::slot::{ident, qualified};
 use crate::types::plan_column;
 use crate::value::{self, Decode, ValueError, text_of};
 
 /// Keys per `fetch_rows` statement, which bounds its size.
 pub const FETCH_BATCH: usize = 1000;
-
-/// How much longer the client waits than the server's `statement_timeout`: the server cancels a
-/// slow read first, so the shared catalog connection is free again when the client gives up.
-const SERVER_FIRST: Duration = Duration::from_secs(5);
 
 /// How to read one column of a table.
 #[derive(Debug, Clone)]
@@ -71,7 +66,7 @@ async fn read_plan(c: &PgConnector, schema: &TableSchema) -> Result<Vec<ReadColu
             client.query(
                 "SELECT a.attname, a.atttypid, a.atttypmod,
                         pg_catalog.format_type(a.atttypid, a.atttypmod), co.collname::text,
-                        co.collisdeterministic
+                        co.collisdeterministic, a.attrelid::int8
                    FROM pg_catalog.pg_attribute a
                    LEFT JOIN pg_catalog.pg_collation co ON co.oid = a.attcollation
                   WHERE a.attrelid = $1::text::regclass AND a.attname = ANY($2)
@@ -79,7 +74,13 @@ async fn read_plan(c: &PgConnector, schema: &TableSchema) -> Result<Vec<ReadColu
                 &[&qualified(schema.table()), &names],
             ),
         )
-        .await?;
+        .await
+        .map_err(|e| dropped(schema, e))?;
+    if let Some(id) = schema.source_id()
+        && rows.iter().any(|r| r.get::<_, i64>(6) as u64 != id)
+    {
+        return Err(halt_dropped(schema));
+    }
     let mut types = c.types.lock().await;
     c.conn
         .command(
@@ -267,9 +268,13 @@ async fn rows(
     let command = c.conn.timeouts.command;
     let sql = format!(
         "SET LOCAL statement_timeout = {}; {sql}",
-        command.as_millis()
+        server_millis(command)
     );
-    let messages = within(what, command + SERVER_FIRST, client.simple_query(&sql)).await?;
+    let messages = c
+        .conn
+        .bounded(what, command + SERVER_FIRST, client.simple_query(&sql))
+        .await
+        .map_err(|e| dropped(schema, e))?;
     messages
         .iter()
         .filter_map(|m| match m {
@@ -277,6 +282,35 @@ async fn rows(
             _ => None,
         })
         .collect()
+}
+
+/// The first identifier column `row` holds NULL in.
+fn null_key(schema: &TableSchema, row: &Row) -> String {
+    schema
+        .identifier()
+        .iter()
+        .find(|k| {
+            row.0
+                .iter()
+                .any(|(n, v)| n == *k && matches!(v, ColumnValue::Null))
+        })
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn halt_dropped(schema: &TableSchema) -> SourceError {
+    SourceError::TableHalt {
+        table: schema.table().clone(),
+        reason: HaltReason::TableDropped,
+    }
+}
+
+/// A table gone from the catalog (SQLSTATE 42P01) halts that table, not the pipeline (§2.1).
+fn dropped(schema: &TableSchema, e: SourceError) -> SourceError {
+    match &e {
+        SourceError::Permanent(m) if sqlstate(m) == Some("42P01") => halt_dropped(schema),
+        _ => e,
+    }
 }
 
 /// The identifier's read columns, in identifier order.
@@ -355,8 +389,12 @@ impl PgConnector {
         let next = match rows.last() {
             None => None,
             Some(last) => Some(KeysetCursor {
-                key: identifier_values(table, last).ok_or_else(|| {
-                    SourceError::Permanent(format!("{}: a row with a NULL key", table.table()))
+                // NULLs sort last, so a chunk holding one ends with one.
+                key: identifier_values(table, last).ok_or_else(|| SourceError::TableHalt {
+                    table: table.table().clone(),
+                    reason: HaltReason::NullIdentifier {
+                        column: null_key(table, last),
+                    },
                 })?,
                 collation,
             }),

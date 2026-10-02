@@ -241,13 +241,15 @@ async fn channel_c_classifies_identity_changes() {
         &a,
         "channel_c_identity",
         "CREATE TABLE k (id int PRIMARY KEY, code int NOT NULL);
-         CREATE TABLE f (id int PRIMARY KEY, v int);",
+         CREATE TABLE f (id int PRIMARY KEY, v int);
+         CREATE TABLE g (id int PRIMARY KEY, code int NOT NULL);
+         ALTER TABLE g REPLICA IDENTITY FULL;",
     )
     .await;
     let c: Box<dyn SourceConnector> = Box::new(connector(&pipeline(&n, &["*"], "", "")));
     let r = c.resolve_tables().await.unwrap();
     let p = c
-        .prepare(None, &[n.table("k"), n.table("f")])
+        .prepare(None, &[n.table("k"), n.table("f"), n.table("g")])
         .await
         .unwrap();
     let StartPlan::Snapshot { from, .. } = p.plan else {
@@ -264,10 +266,14 @@ async fn channel_c_classifies_identity_changes() {
             format!("INSERT INTO {sc}.f VALUES (0, 0)"),
             format!("ALTER TABLE {sc}.f REPLICA IDENTITY FULL"),
             format!("INSERT INTO {sc}.f VALUES (1, 1)"),
+            // Under REPLICA IDENTITY FULL, pgoutput flags every column as a key: the primary
+            // key's change shows only in the catalog (final review I4).
+            format!("ALTER TABLE {sc}.g DROP CONSTRAINT g_pkey, ADD PRIMARY KEY (code)"),
+            format!("INSERT INTO {sc}.g VALUES (1, 1)"),
         ],
     )
     .await;
-    let hints = signals(&mut s, 2).await;
+    let hints = signals(&mut s, 3).await;
     let k = cached(&r.tables, "k");
     let (delta, _) = c.augment(k, &hints["k"]).await.unwrap();
     assert!(
@@ -284,6 +290,65 @@ async fn channel_c_classifies_identity_changes() {
         .await
         .unwrap();
     assert!(delta.changes.is_empty(), "{delta:?}");
+    let (delta, _) = c
+        .augment(cached(&r.tables, "g"), &hints["g"])
+        .await
+        .unwrap();
+    assert!(
+        delta.changes.contains(&SchemaChange::IdentifierChanged),
+        "{delta:?}"
+    );
     s.close().await.unwrap();
+    cleanup(&a, &n).await;
+}
+
+/// `Schema_Change…` §2.1, §7.2 (final review C1): a tracked table dropped and created again under
+/// its name is another table. Channel D reports it dropped, channel C reads `TableDropped` and a
+/// snapshot read halts it, though the stream never sees the new table (dropping a table takes it
+/// out of the managed publication).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_table_dropped_and_created_again_is_dropped() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(
+        &a,
+        "channel_d_recreated",
+        "CREATE TABLE t (id int PRIMARY KEY); CREATE TABLE u (id int PRIMARY KEY);",
+    )
+    .await;
+    let c: Box<dyn SourceConnector> = Box::new(connector(&pipeline(&n, &["*"], "", "")));
+    let r = c.resolve_tables().await.unwrap();
+    c.prepare(None, &[n.table("t"), n.table("u")])
+        .await
+        .unwrap();
+    let sc = &n.schema;
+    each(
+        &a,
+        &[
+            format!("DROP TABLE {sc}.t"),
+            format!("CREATE TABLE {sc}.t (id int PRIMARY KEY)"),
+        ],
+    )
+    .await;
+    let report = c.rescan(&r.tables).await.unwrap();
+    assert_eq!(report.dropped, [n.table("t")]);
+    assert!(
+        report.changed.is_empty() && report.halted.is_empty(),
+        "{report:?}"
+    );
+    let t = cached(&r.tables, "t");
+    let (delta, schema) = c
+        .augment(t, &SchemaHint::Columns(t.columns().to_vec()))
+        .await
+        .unwrap();
+    assert_eq!(delta.changes, [SchemaChange::TableDropped]);
+    assert!(schema.is_none());
+    match c.read_chunk(t, None, 10).await {
+        Err(SourceError::TableHalt {
+            reason: HaltReason::TableDropped,
+            ..
+        }) => {}
+        other => panic!("the snapshot halts the table: {other:?}"),
+    }
     cleanup(&a, &n).await;
 }

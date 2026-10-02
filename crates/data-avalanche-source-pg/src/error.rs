@@ -46,6 +46,11 @@ fn classify(code: Option<&str>, message: String, position: Option<String>) -> So
 pub(crate) fn replication_error(e: PgWireError, position: Option<String>) -> SourceError {
     match e {
         PgWireError::Io(_) | PgWireError::Task(_) => SourceError::Transient(e.to_string()),
+        // A `next` cancelled while the ended worker was being joined: the next call reports the
+        // worker's own error as this. Reopening the stream recovers.
+        PgWireError::Internal(ref m) if m.contains("already joined") => {
+            SourceError::Transient(e.to_string())
+        }
         PgWireError::Server(m) => classify(sqlstate(&m).map(str::to_owned).as_deref(), m, position),
         other => SourceError::Permanent(other.to_string()),
     }
@@ -194,6 +199,14 @@ mod tests {
                 SourceError::Permanent(_)
             ));
         }
+    }
+
+    #[test]
+    fn a_worker_joined_twice_is_transient() {
+        let e = PgWireError::Internal("replication worker already joined".into());
+        assert!(replication_error(e, None).is_transient());
+        let e = PgWireError::Internal("something else".into());
+        assert!(!replication_error(e, None).is_transient());
     }
 
     #[test]

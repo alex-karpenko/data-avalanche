@@ -117,14 +117,33 @@ fn unclamped_key(
     }
 }
 
+/// Every identifier cell of the set, upserts and deletes, is in the Delta range (Q-M5-19). The
+/// commit checks it before it writes anything, a truncate's DELETE included.
+pub fn check_keys(cs: &TableChangeSet, types: &[DeltaType]) -> Result<(), SinkError> {
+    for (i, (f, t)) in cs.schema.fields().iter().zip(types).enumerate() {
+        let Some(k) = cs.identifier.iter().position(|k| k == f.name()) else {
+            continue;
+        };
+        let logical = logical_of(f).map_err(permanent)?;
+        for b in &cs.upserts {
+            unclamped_key(cs, f.name(), b.column(i), &logical, t)?;
+        }
+        for b in &cs.deletes {
+            unclamped_key(cs, f.name(), b.column(k), &logical, t)?;
+        }
+    }
+    Ok(())
+}
+
 /// The MERGE source: the upserts, then the deletes, in the table's physical types, each row with
 /// [`DELETE_FLAG`] and the upserts' unchanged masks (`false` on delete rows). Every field is
 /// nullable; a delete row carries only its identifier. An identifier cell the Delta range would
-/// clamp is an error.
+/// clamp is an error ([`check_keys`]).
 pub fn merge_source(
     cs: &TableChangeSet,
     types: &[DeltaType],
 ) -> Result<Vec<RecordBatch>, SinkError> {
+    check_keys(cs, types)?;
     let masks: Vec<String> = cs
         .upserts
         .first()
@@ -155,9 +174,6 @@ pub fn merge_source(
         let mut columns = Vec::new();
         for (i, (f, t)) in cs.schema.fields().iter().zip(types).enumerate() {
             let logical = logical_of(f).map_err(permanent)?;
-            if cs.identifier.contains(f.name()) {
-                unclamped_key(cs, f.name(), b.column(i), &logical, t)?;
-            }
             columns.push(to_delta(b.column(i), &logical, t).map_err(permanent)?);
         }
         for m in &masks {
@@ -176,7 +192,6 @@ pub fn merge_source(
             columns.push(match cs.identifier.iter().position(|k| k == f.name()) {
                 Some(k) => {
                     let logical = logical_of(f).map_err(permanent)?;
-                    unclamped_key(cs, f.name(), b.column(k), &logical, t)?;
                     to_delta(b.column(k), &logical, t).map_err(permanent)?
                 }
                 None => new_null_array(&physical, rows),

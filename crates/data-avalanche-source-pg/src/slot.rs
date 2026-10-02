@@ -12,7 +12,7 @@ use data_avalanche_core::{
 use tokio_postgres::Client;
 
 use crate::catalog::table_key;
-use crate::connect::within;
+use crate::connect::{SERVER_FIRST, server_millis};
 use crate::connector::PgConnector;
 use crate::position::{lsn_of, parse_lsn};
 
@@ -197,15 +197,17 @@ impl PgConnector {
     async fn create_slot(&self, client: &Client) -> Result<Lsn, SourceError> {
         // Creating a slot waits for the transactions running at that moment: the snapshot timeout
         // bounds it, not the command timeout.
-        let row = within(
-            "create the replication slot",
-            self.conn.timeouts.snapshot,
-            client.query_one(
-                "SELECT lsn::text FROM pg_create_logical_replication_slot($1, 'pgoutput')",
-                &[&self.slot_name()],
-            ),
-        )
-        .await?;
+        let row = self
+            .conn
+            .bounded(
+                "create the replication slot",
+                self.conn.timeouts.snapshot,
+                client.query_one(
+                    "SELECT lsn::text FROM pg_create_logical_replication_slot($1, 'pgoutput')",
+                    &[&self.slot_name()],
+                ),
+            )
+            .await?;
         parse_lsn(row.get(0))
     }
 
@@ -366,15 +368,25 @@ impl PgConnector {
         })
     }
 
-    /// Runs [`Reconciled::sql`] as one implicit transaction: all of it or none.
+    /// Runs [`Reconciled::sql`] as one implicit transaction: all of it or none. The server bounds
+    /// it (`lock_timeout`, `statement_timeout`), so a change that waits on a table's lock is
+    /// cancelled, not left to commit after its reply was lost: the retry then reports the table as
+    /// added again.
     async fn apply_publication(&self, client: &Client, sql: &[String]) -> Result<(), SourceError> {
         if sql.is_empty() {
             return Ok(());
         }
+        let command = self.conn.timeouts.command;
+        let ms = server_millis(command);
+        let batch = format!(
+            "SET LOCAL lock_timeout = {ms}; SET LOCAL statement_timeout = {ms}; {}",
+            sql.join("; ")
+        );
         self.conn
-            .command(
+            .bounded(
                 "reconcile the publication",
-                client.batch_execute(&sql.join("; ")),
+                command + SERVER_FIRST,
+                client.batch_execute(&batch),
             )
             .await
     }
@@ -443,7 +455,7 @@ impl PgConnector {
             }
             SlotAction::Adopt => {
                 // Advancing decodes the orphan's whole backlog: the snapshot timeout bounds it.
-                let row = within(
+                let row = self.conn.bounded(
                     "advance the orphan slot",
                     self.conn.timeouts.snapshot,
                     client.query_one(

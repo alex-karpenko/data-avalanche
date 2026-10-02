@@ -73,7 +73,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 /// The replication connection's TLS (`ssl_mode: allow` connects like `prefer`: the crate has no
-/// `allow`, and both accept either kind of connection — D-M5.4).
+/// `allow`, and both accept either kind of connection — D-M5.16).
 pub(crate) fn replication_tls(mode: SslMode, files: &PemFiles) -> TlsConfig {
     let mut tls = match mode {
         SslMode::Disable => TlsConfig::disabled(),

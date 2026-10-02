@@ -212,7 +212,8 @@ pub fn table_schema(
         .get(&key)
         .cloned()
         .unwrap_or_else(|| d.primary_key.clone());
-    let schema = TableSchema::new(d.table.clone(), columns, identifier)?;
+    let schema =
+        TableSchema::new(d.table.clone(), columns, identifier)?.with_source_id(d.oid.into());
     let identity = identity_columns(d);
     let missing: Vec<String> = schema
         .identifier()

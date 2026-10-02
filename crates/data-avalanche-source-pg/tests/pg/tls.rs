@@ -17,6 +17,10 @@ use crate::common::{Names, cleanup, collect, connector, first_stream, fresh};
 
 const PORT: u16 = 55419;
 
+/// The tests run one at a time: [`sessions`] counts every catalog session of a user on the
+/// server, so another TLS test's sessions would show in it.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn material(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../test-infra/.tls")
@@ -136,6 +140,7 @@ async fn stream_one(
 #[tokio::test]
 async fn verify_full_with_an_inline_ca_encrypts_both_connections() {
     require_it!();
+    let _serial = SERIAL.lock().await;
     let a = admin().await;
     let n = fresh(&a, "tls_full", "CREATE TABLE t (id int PRIMARY KEY);").await;
     let p = pipeline(
@@ -156,6 +161,7 @@ async fn verify_full_with_an_inline_ca_encrypts_both_connections() {
 #[tokio::test]
 async fn a_client_certificate_with_an_inline_key_authenticates_both_connections() {
     require_it!();
+    let _serial = SERIAL.lock().await;
     let a = admin().await;
     let n = fresh(&a, "tls_cert", "CREATE TABLE t (id int PRIMARY KEY);").await;
     // The CA by path (passed through), the certificate and key inline (written to private files
@@ -173,7 +179,12 @@ async fn a_client_certificate_with_an_inline_key_authenticates_both_connections(
         ],
     );
     let seen = stream_one(&a, &p, &n).await;
-    assert_eq!(seen.len(), 3, "{seen:?}");
+    let kinds: Vec<&str> = seen.iter().map(|s| s.1.as_str()).collect();
+    assert_eq!(
+        kinds,
+        ["client backend", "client backend", "walsender"],
+        "the replication connection presents the certificate too: {seen:?}"
+    );
     for (user, _, ssl, dn) in &seen {
         assert_eq!(user, "avalanche_cert");
         assert!(ssl);
@@ -189,6 +200,7 @@ async fn a_client_certificate_with_an_inline_key_authenticates_both_connections(
 #[tokio::test]
 async fn verify_ca_by_an_unnamed_address_passes_the_catalog_but_not_the_stream() {
     require_it!();
+    let _serial = SERIAL.lock().await;
     let a = admin().await;
     let n = fresh(&a, "tls_verify_ca", "CREATE TABLE t (id int PRIMARY KEY);").await;
     let p = pipeline(
@@ -216,6 +228,7 @@ async fn verify_ca_by_an_unnamed_address_passes_the_catalog_but_not_the_stream()
 #[tokio::test]
 async fn a_wrong_ca_or_no_tls_is_refused() {
     require_it!();
+    let _serial = SERIAL.lock().await;
     let n = Names::new("tls_refused");
     let other_ca = {
         use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
@@ -224,22 +237,28 @@ async fn a_wrong_ca_or_no_tls_is_refused() {
         ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         ca.self_signed(&key).unwrap().pem()
     };
-    for (what, ssl, env) in [
+    // Each refusal for its own reason: the server's chain is unknown, or pg_hba refuses a
+    // connection without TLS.
+    for (what, ssl, env, reason) in [
         (
             "a foreign CA",
             "ssl_mode: verify-full\n      ssl_ca: \"${CA}\"",
             vec![("CA", other_ca.clone())],
+            "UnknownIssuer",
         ),
         (
             "a foreign CA, chain only",
             "ssl_mode: verify-ca\n      ssl_ca: \"${CA}\"",
             vec![("CA", other_ca)],
+            "UnknownIssuer",
         ),
-        ("no TLS", "ssl_mode: disable", vec![]),
+        ("no TLS", "ssl_mode: disable", vec![], "(SQLSTATE 28000)"),
     ] {
         let c = connector(&pipeline(&n, "localhost", "avalanche", ssl, &env));
         match c.preflight().await {
-            Err(SourceError::Permanent(detail)) => eprintln!("{what}: {detail}"),
+            Err(SourceError::Permanent(detail)) => {
+                assert!(detail.contains(reason), "{what}: {detail}")
+            }
             other => panic!("{what}: a permanent error expected, got {other:?}"),
         }
     }

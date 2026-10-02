@@ -160,7 +160,19 @@ pub fn scope(
                 })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    TableSchema::new(cached.table().clone(), columns, identifier)
+    let new = TableSchema::new(cached.table().clone(), columns, identifier)?;
+    Ok(match now.source_id() {
+        Some(id) => new.with_source_id(id),
+        None => new,
+    })
+}
+
+/// Whether the catalog's table under `cached`'s name is another table: dropped (or renamed away)
+/// and its name taken (`Schema_Change…` §2.1, §7.2: a re-created table doesn't resume).
+fn replaced(cached: &TableSchema, now_oid: u32) -> bool {
+    cached
+        .source_id()
+        .is_some_and(|id| id != u64::from(now_oid))
 }
 
 /// `cached` → `new` as changes, columns matched by `attnum`: the same `attnum` under another name
@@ -221,8 +233,13 @@ pub fn diff(cached: &TableSchema, new: &TableSchema) -> Vec<SchemaChange> {
 }
 
 impl PgConnector {
-    /// The table's schema as the catalog has it now; `None` when it was dropped.
-    async fn current(&self, table: &TableRef) -> Result<Option<TableSchema>, SourceError> {
+    /// The table's schema as the catalog has it now; `None` when `cached`'s table was dropped,
+    /// another taking its name or not.
+    async fn current(
+        &self,
+        table: &TableRef,
+        cached: &TableSchema,
+    ) -> Result<Option<TableSchema>, SourceError> {
         let client = self.conn.client().await?;
         let oids = self
             .conn
@@ -231,7 +248,7 @@ impl PgConnector {
                 catalog::oids_by_name(&client, std::slice::from_ref(table)),
             )
             .await?;
-        let Some(oid) = oids.get(table) else {
+        let Some(oid) = oids.get(table).filter(|oid| !replaced(cached, **oid)) else {
             return Ok(None);
         };
         let mut schemas = self.schemas(&[*oid]).await?;
@@ -259,7 +276,7 @@ impl PgConnector {
                 table_key(&table)
             )));
         };
-        let Some(now) = self.current(&table).await? else {
+        let Some(now) = self.current(&table, cached).await? else {
             return Ok((
                 SchemaDelta {
                     table,
@@ -276,9 +293,10 @@ impl PgConnector {
         Ok((SchemaDelta { table, changes }, Some(new)))
     }
 
-    /// Channel D: one batched catalog read of the tracked tables. A table gone from `pg_class`
-    /// is dropped (§2.1, `TABLE_DROPPED`); a table whose catalog schema differs is reported with
-    /// its current schema, for freshness and alerting only.
+    /// Channel D: one batched catalog read of the tracked tables. A table gone from `pg_class`,
+    /// or whose name another table took, is dropped (§2.1, `TABLE_DROPPED`); a table whose
+    /// catalog schema differs is reported with its current schema, for freshness and alerting
+    /// only.
     pub async fn rescan(&self, known: &[TableSchema]) -> Result<RescanReport, SourceError> {
         let client = self.conn.client().await?;
         let tables: Vec<TableRef> = known.iter().map(|s| s.table().clone()).collect();
@@ -291,7 +309,8 @@ impl PgConnector {
         let mut report = RescanReport::default();
         for k in known {
             let t = k.table();
-            match oids.get(t).and_then(|oid| schemas.remove(oid)) {
+            let oid = oids.get(t).filter(|oid| !replaced(k, **oid));
+            match oid.and_then(|oid| schemas.remove(oid)) {
                 None => report.dropped.push(t.clone()),
                 Some((_, Err(reason))) => report.halted.push((t.clone(), reason)),
                 Some((_, Ok((now, _)))) if *k != now => report.changed.push(now),

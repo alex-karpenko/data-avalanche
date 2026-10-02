@@ -19,7 +19,11 @@ mod tls;
 pub mod types;
 pub mod value;
 
+pub use catalog::{Attribute, Described, Notes, Relation, Selection};
 pub use connect::{APPLICATION_NAME, SESSION_OPTIONS};
 pub use connector::{MIN_SERVER_VERSION, PgConnector};
+pub use pgoutput::{Datum, Message, OldKind, RelationColumn};
 pub use snapshot::FETCH_BATCH;
 pub use stream::{PG_EPOCH_MICROS, PgStream};
+pub use types::{ColumnPlan, Plan, PlanError, TypeCatalog, TypeInfo};
+pub use value::{Decode, ValueError};

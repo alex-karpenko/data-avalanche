@@ -51,10 +51,11 @@ pub struct Preflight {
 pub struct ResolvedTables {
     /// Tables to replicate, with their baseline schemas, in table order.
     pub tables: Vec<TableSchema>,
-    /// Tables named without a glob that can't be replicated: each halts at start.
+    /// Tables that can't be replicated and halt at start: one named without a glob, or one a
+    /// glob matched that fails a check a glob doesn't skip it for.
     pub halted: Vec<(TableRef, HaltReason)>,
-    /// Tables a glob matched that can't be replicated (no identifier, a partitioned parent): each
-    /// is left out with a warning.
+    /// Tables a glob matched that can't be replicated (no identifier, a partitioned parent, an
+    /// unlogged table): each is left out with a warning.
     pub skipped: Vec<(TableRef, String)>,
     /// Pipeline-level warnings found while resolving (V-079 unconstrained numerics, unknown types
     /// read as text).
@@ -104,7 +105,9 @@ pub struct Prepared {
 #[derive(Debug, Clone, PartialEq)]
 pub struct KeysetCursor {
     pub key: Row,
-    /// `"C"` for PostgreSQL when an identifier column is text; `None` otherwise.
+    /// The collations the text identifier columns were ordered in, comma-joined in identifier
+    /// order (PostgreSQL: a column's own deterministic collation, else `"C"`); `None` when no
+    /// identifier column is text.
     pub collation: Option<String>,
 }
 

@@ -188,7 +188,8 @@ impl PgStream {
                         shape: shape_of(s.columns()),
                         identifier: s.identifier().iter().cloned().collect(),
                         identity: None,
-                        oid: None,
+                        // A table the catalog had under another OID doesn't resume (C1).
+                        oid: s.source_id().and_then(|id| u32::try_from(id).ok()),
                         halted: false,
                     };
                     (s.table().clone(), known)
@@ -360,7 +361,10 @@ impl PgStream {
             (replica_identity, keys)
         });
         let shape = shape_of(&schema);
-        let changed = known.shape != shape || before != identity;
+        // Under REPLICA IDENTITY FULL, pgoutput flags every column as a key, so a primary key
+        // changed shows nowhere in the message: each of the table's Relation messages signals,
+        // and channel C reads the identifier from the catalog (§7.2).
+        let changed = known.shape != shape || before != identity || replica_identity == b'f';
         known.shape = shape;
         known.identity = Some(identity);
         let signal = changed.then_some(SchemaHint::Columns(schema));
