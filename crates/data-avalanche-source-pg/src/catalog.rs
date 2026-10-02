@@ -84,8 +84,7 @@ pub fn select(include: &[String], exclude: &[String], relations: &[Relation]) ->
             continue;
         }
         if !r.logged {
-            let why =
-                "an unlogged table: PostgreSQL doesn't replicate it (ALTER TABLE … SET LOGGED)";
+            let why = UNLOGGED;
             if explicit {
                 out.halted.push((
                     r.table.clone(),
@@ -117,6 +116,10 @@ pub struct Attribute {
     pub nondeterministic: Option<String>,
 }
 
+/// Why an unlogged table isn't replicated.
+const UNLOGGED: &str =
+    "an unlogged table: PostgreSQL doesn't replicate it (ALTER TABLE … SET LOGGED)";
+
 /// A table as the catalog describes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Described {
@@ -124,6 +127,8 @@ pub struct Described {
     pub table: TableRef,
     /// `relreplident`: `d` default (the primary key), `n` nothing, `f` full, `i` index.
     pub replica_identity: u8,
+    /// `relpersistence = 'p'`: an unlogged table isn't replicated, so it doesn't plan.
+    pub logged: bool,
     pub columns: Vec<Attribute>,
     pub primary_key: Vec<String>,
     /// The columns of the `REPLICA IDENTITY USING INDEX` index.
@@ -167,6 +172,11 @@ pub fn table_schema(
     tables: &Tables,
     types: &TypeCatalog,
 ) -> Result<(TableSchema, Notes), HaltReason> {
+    if !d.logged {
+        return Err(HaltReason::NotReplicable {
+            reason: UNLOGGED.into(),
+        });
+    }
     let key = table_key(&d.table);
     let mut notes = Notes::default();
     let mut columns = Vec::with_capacity(d.columns.len());
@@ -318,7 +328,7 @@ pub async fn describe(
     let mut out: BTreeMap<u32, Described> = BTreeMap::new();
     for r in client
         .query(
-            "SELECT c.oid, n.nspname, c.relname, c.relreplident::text
+            "SELECT c.oid, n.nspname, c.relname, c.relreplident::text, c.relpersistence = 'p'
                FROM pg_catalog.pg_class c
                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
               WHERE c.oid = ANY($1)",
@@ -333,6 +343,7 @@ pub async fn describe(
                 oid,
                 table: TableRef::new(r.get::<_, String>(1), r.get::<_, String>(2)),
                 replica_identity: r.get::<_, String>(3).as_bytes()[0],
+                logged: r.get(4),
                 columns: vec![],
                 primary_key: vec![],
                 identity_index: vec![],
@@ -545,6 +556,7 @@ mod tests {
             oid: 1,
             table: TableRef::new("public", "orders"),
             replica_identity,
+            logged: true,
             columns: vec![
                 attr(1, "id", 20, -1, true, "bigint"),
                 attr(2, "code", 25, -1, true, "text"),
@@ -582,6 +594,16 @@ mod tests {
         );
         assert_eq!(notes.unconstrained, ["amount"]);
         assert!(notes.c_ordered_keys.is_empty());
+    }
+
+    #[test]
+    fn an_unlogged_table_doesnt_plan() {
+        let mut d = orders(b'd');
+        d.logged = false;
+        assert_eq!(
+            schema_of(&d, "").unwrap_err().code(),
+            "TABLE_NOT_REPLICABLE"
+        );
     }
 
     #[test]

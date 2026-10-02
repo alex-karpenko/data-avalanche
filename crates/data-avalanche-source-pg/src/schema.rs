@@ -10,11 +10,20 @@ use crate::catalog::{self, table_key};
 use crate::connector::PgConnector;
 
 /// The first length or precision in a type's text: `character varying(100)` → 100,
-/// `timestamp(3) with time zone` → 3; `None` without one (unbounded, or the type's default).
+/// `timestamp(3) with time zone` → 3. A time type without one has the default precision, 6;
+/// another type without one is unbounded (`None`).
 fn bound(type_text: &str) -> Option<i64> {
-    let open = type_text.find('(')?;
-    let close = type_text[open..].find([')', ','])? + open;
-    type_text[open + 1..close].trim().parse().ok()
+    let explicit = || {
+        let open = type_text.find('(')?;
+        let close = type_text[open..].find([')', ','])? + open;
+        type_text[open + 1..close].trim().parse().ok()
+    };
+    explicit().or_else(|| {
+        ["timestamp", "time", "interval"]
+            .iter()
+            .any(|t| type_text.starts_with(t))
+            .then_some(6)
+    })
 }
 
 /// Whether `to` holds fewer values than `from` when both map to the same logical type: a shorter
@@ -33,32 +42,76 @@ pub fn narrowed(from: &ColumnSchema, to: &ColumnSchema) -> bool {
 
 /// The schema the stream's columns imply (§0: scoped to the change, never the catalog's "now"):
 /// each hint column takes its type from the stream and its identity (`attnum`) and nullability
-/// from the catalog, found by name, else by the `attnum` it had in `cached` (a later rename). A
-/// column found neither way can't be placed: the table halts rather than guess.
+/// from the catalog. It is found by name; else by the `attnum` it had in `cached` (renamed since
+/// the signal), or with that `attnum` when the catalog no longer has it (dropped since the signal:
+/// an `attnum` is never reused). The catalog may be ahead of the stream, so a placement that
+/// doesn't fit the stream's columns is a guess, and the table halts (Q-M5-17):
+/// - two columns on one `attnum`, or `attnum`s out of the stream's order (pgoutput sends them in
+///   `attnum` order): renames or a swap since the signal;
+/// - a name on another `attnum` than in `cached` while that one still exists and no stream column
+///   holds it: renamed away, and the name taken, since the signal.
+///
+/// A column found no way halts too.
 pub fn scope(
     cached: &TableSchema,
     hint: &[ColumnSchema],
     now: &TableSchema,
 ) -> Result<TableSchema, HaltReason> {
-    let by_ordinal = |o: Option<i32>| {
+    let in_now = |o: Option<i32>| {
         now.columns()
             .iter()
             .find(|c| o.is_some() && c.source_ordinal == o)
     };
-    let mut columns = Vec::with_capacity(hint.len());
+    let guess = |column: &str, why: &str| HaltReason::SchemaMismatch {
+        column: column.into(),
+        detail: format!("{why}; re-snapshot"),
+    };
+    let mut columns: Vec<ColumnSchema> = Vec::with_capacity(hint.len());
+    let mut by_name = vec![];
     for h in hint {
-        let catalog = now
-            .column(&h.name)
-            .or_else(|| cached.column(&h.name).and_then(|c| by_ordinal(c.source_ordinal)))
-            .ok_or_else(|| HaltReason::SchemaMismatch {
-                column: h.name.clone(),
-                detail: "the stream carries a column the catalog doesn't have by that name or position; re-snapshot".into(),
-            })?;
+        let (ordinal, nullable) = if let Some(c) = now.column(&h.name) {
+            by_name.push(columns.len());
+            (c.source_ordinal, c.nullable)
+        } else if let Some(was) = cached.column(&h.name) {
+            match in_now(was.source_ordinal) {
+                Some(c) => (c.source_ordinal, c.nullable),
+                None => (was.source_ordinal, was.nullable),
+            }
+        } else {
+            return Err(guess(
+                &h.name,
+                "the stream carries a column the catalog doesn't have by that name or position",
+            ));
+        };
+        let ordinal = ordinal.ok_or_else(|| guess(&h.name, "a column without an attnum"))?;
+        if let Some(last) = columns.last()
+            && last.source_ordinal >= Some(ordinal)
+        {
+            return Err(guess(
+                &h.name,
+                "the catalog, ahead of the stream, doesn't place its columns in their order",
+            ));
+        }
         columns.push(ColumnSchema {
-            nullable: catalog.nullable,
-            source_ordinal: catalog.source_ordinal,
+            nullable,
+            source_ordinal: Some(ordinal),
             ..h.clone()
         });
+    }
+    for &i in &by_name {
+        let c = &columns[i];
+        if let Some(was) = cached.column(&c.name)
+            && was.source_ordinal != c.source_ordinal
+            && in_now(was.source_ordinal).is_some()
+            && !columns
+                .iter()
+                .any(|o| o.source_ordinal == was.source_ordinal)
+        {
+            return Err(guess(
+                &c.name,
+                "the catalog, ahead of the stream, has the name on another column",
+            ));
+        }
     }
     let identifier = now
         .identifier()
@@ -255,6 +308,17 @@ mod tests {
         assert_eq!(bound("numeric(10,2)"), Some(10));
         assert_eq!(bound("timestamp(3) with time zone"), Some(3));
         assert_eq!(bound("text"), None);
+        assert_eq!(bound("timestamp without time zone"), Some(6), "the default");
+        assert_eq!(bound("interval"), Some(6));
+        let ts = |t: &str| col("t", V::Timestamp { with_tz: false }, t, 4);
+        assert!(!narrowed(
+            &ts("timestamp without time zone"),
+            &ts("timestamp(6) without time zone")
+        ));
+        assert!(narrowed(
+            &ts("timestamp without time zone"),
+            &ts("timestamp(3) without time zone")
+        ));
         let a = |t: &str| col("a", V::Text, t, 2);
         assert!(narrowed(
             &a("character varying(100)"),
@@ -356,6 +420,105 @@ mod tests {
         assert_eq!(
             scope(&base(), &unknown, &now).unwrap_err().code(),
             "SCHEMA_MISMATCH"
+        );
+    }
+
+    #[test]
+    fn scope_halts_where_the_catalog_ahead_would_be_a_guess() {
+        let id = || col("id", V::Int32, "integer", 1).not_null();
+        let hint = vec![
+            ColumnSchema::new("id", V::Int32, "integer"),
+            ColumnSchema::new("a", V::Text, "character varying(100)"),
+            ColumnSchema::new("b", V::Int32, "integer"),
+        ];
+        let halts = |now: TableSchema| scope(&base(), &hint, &now).unwrap_err().code();
+        // `a` → `x`, then `b` → `a`, after the signal: `a` and `b` land on attnum 3.
+        let chain = table(
+            vec![
+                id(),
+                col("x", V::Text, "character varying(100)", 2),
+                col("a", V::Int32, "integer", 3),
+            ],
+            &["id"],
+        );
+        assert_eq!(halts(chain), "SCHEMA_MISMATCH");
+        // `a` and `b` swapped after the signal: attnums out of order.
+        let swap = table(
+            vec![
+                id(),
+                col("b", V::Text, "character varying(100)", 2),
+                col("a", V::Int32, "integer", 3),
+            ],
+            &["id"],
+        );
+        assert_eq!(halts(swap), "SCHEMA_MISMATCH");
+        // `b` renamed away and a new `b` added after the signal: in order, but `b` names
+        // another column while its own still exists.
+        let taken = table(
+            vec![
+                id(),
+                col("a", V::Text, "character varying(100)", 2),
+                col("b_old", V::Int32, "integer", 3),
+                col("b", V::Int32, "integer", 4),
+            ],
+            &["id"],
+        );
+        assert_eq!(halts(taken), "SCHEMA_MISMATCH");
+        // Before the signal, `a` → `x` then `b` → `a`: the stream has the new names, and the
+        // placement fits.
+        let before = vec![
+            ColumnSchema::new("id", V::Int32, "integer"),
+            ColumnSchema::new("x", V::Text, "character varying(100)"),
+            ColumnSchema::new("a", V::Int32, "integer"),
+        ];
+        let now = table(
+            vec![
+                id(),
+                col("x", V::Text, "character varying(100)", 2),
+                col("a", V::Int32, "integer", 3),
+            ],
+            &["id"],
+        );
+        let scoped = scope(&base(), &before, &now).unwrap();
+        assert_eq!(
+            diff(&base(), &scoped),
+            vec![
+                SchemaChange::RenameColumn {
+                    from: "a".into(),
+                    to: "x".into(),
+                    proven: true
+                },
+                SchemaChange::RenameColumn {
+                    from: "b".into(),
+                    to: "a".into(),
+                    proven: true
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn scope_keeps_a_column_dropped_after_the_signal() {
+        // Expand and contract: `c` added (the signal), then `b` dropped in the catalog.
+        let hint = vec![
+            ColumnSchema::new("id", V::Int32, "integer"),
+            ColumnSchema::new("a", V::Text, "character varying(100)"),
+            ColumnSchema::new("b", V::Int32, "integer"),
+            ColumnSchema::new("c", V::Bool, "boolean"),
+        ];
+        let now = table(
+            vec![
+                col("id", V::Int32, "integer", 1).not_null(),
+                col("a", V::Text, "character varying(100)", 2),
+                col("c", V::Bool, "boolean", 4),
+            ],
+            &["id"],
+        );
+        let scoped = scope(&base(), &hint, &now).unwrap();
+        assert_eq!(scoped.column("b").unwrap().source_ordinal, Some(3));
+        assert_eq!(
+            diff(&base(), &scoped),
+            vec![SchemaChange::AddColumn(scoped.columns()[3].clone())]
         );
     }
 }
