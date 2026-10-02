@@ -13728,7 +13728,8 @@ review, owner decision Q-M5-18, 2026-10-02):
   `string_and_decimal_overrides_through_stream_and_snapshot` (a `decimal(P,S)` value keeps its own
   scale; the declared type bounds it, as in Task 5b) and `a_clamped_timestamp_key_halts_the_table`.
   Measured on the verified workspace: PostgreSQL 14–18 pass 43 integration tests each and
-  `slot_invalidation`; the workspace passes 653.
+  `slot_invalidation`. On the branch, `cargo test --workspace` passes 649 (the verified workspace
+  holds Task 13's tests too).
 - **A plan correction.** Task 10's fix moved `reads_char` from the stream to `Decode::reads_char`
   in `value.rs`, but the plan's Task 5b diff and Task 9 code didn't show the move; they do now.
   Task 4's code with Task 5b's diff now gives the final `value.rs` but for Task 4's own two fixes
@@ -13756,4 +13757,4 @@ of round 1, owner decision Q-M5-19, 2026-10-02):
   `timestamptz` key at the last microsecond written with an offset, a composite key, a `date` key
   converted to `timestamp_ntz`, a delete's old key, and the halt's detail.
   Measured on the verified workspace: PostgreSQL 14–18 pass 43 integration tests each and
-  `slot_invalidation`; the workspace passes 655.
+  `slot_invalidation`. On the branch, `cargo test --workspace` passes 651.
