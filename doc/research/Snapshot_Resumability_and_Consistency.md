@@ -98,7 +98,8 @@ table). So a text key orders and compares in its own collation when that is dete
 **binary collation** (`COLLATE "C"` in PostgreSQL, `_bin` / `utf8mb4_bin` in MySQL) when it isn't,
 with a warning at start: no index serves that order, so each chunk scans the table unless one is
 added (`CREATE INDEX … (k COLLATE "C")`). The collations are recorded in the cursor; a cursor of
-other collations (the key's collation changed mid-snapshot) restarts the table's snapshot.
+other collations (the key's collation changed mid-snapshot) halts the table for an operator
+re-snapshot (`SCHEMA_MISMATCH`).
 (Revised 2026-10-02, Q-M5-16: the earlier unconditional binary pin made every chunk of a key in
 the database's default collation a full scan and sort, measured on PostgreSQL 18. A collation
 library upgraded mid-snapshot without a reindex can reorder the keys; that breaks the server's own

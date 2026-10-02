@@ -36,7 +36,8 @@ regression test, on PostgreSQL 18 on every change and on PostgreSQL 14–17 nigh
   - `connector`: `PgConnector`, the preflight, channel A and the `SourceConnector` impl.
   - `slot`: the slot state machine and publication reconciliation.
   - `stream`: `PgStream`, pgoutput → `StreamItem`; acknowledgment.
-  - `snapshot`: keyset chunks in `COLLATE "C"` order, and the keyed re-read.
+  - `snapshot`: keyset chunks in the key's own deterministic collation (`COLLATE "C"` otherwise),
+    and the keyed re-read.
   - `schema`: channel C (`augment`, the `attnum` diff) and channel D (`rescan`).
 - **Tests:**
   - Unit tests in each module run without a server.
@@ -122,8 +123,8 @@ the arrow.
 3. **Keys that sort differently than the server's collation.** These are text with mixed case,
    accents and quotes, `"char"` above 127, numerics, and composite keys. A chunk cursor must
    resume exactly, with no row skipped or read twice → Task 10
-   (`text_keys_page_in_the_c_collation`, `composite_keys_of_every_key_type_resume_exactly`,
-   `keys_compare_in_the_c_collation`).
+   (`text_keys_page_in_one_deterministic_collation`, `composite_keys_of_every_key_type_resume_exactly`,
+   `keys_compare_in_one_deterministic_collation`, `a_domain_over_char_key_resumes`).
 4. **Values at the edges of what PostgreSQL prints.** These are `±infinity`, BC dates,
    `24:00:00`, numerics of 38+ digits, NaN, negative scales, varbit, unicode in arrays and hstore,
    and invalid UTF-8. Each decodes to the agreed value or halts only its table → Task 4
