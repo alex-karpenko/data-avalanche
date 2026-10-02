@@ -329,7 +329,8 @@ and DuckDB `delta_scan`.
 outside the Delta range (two BC dates, two from 10000 AD, or `infinity` and
 `9999-12-31 23:59:59.999999`) would become one in the MERGE. Hop 3b checks each identifier column
 first: a cell outside the range is a `Permanent` sink error, and the table halts. So on Delta, a
-`date` or `timestamp` key holding `±infinity` halts its table; a column that isn't a key clamps.
+`date` or `timestamp` key holding `±infinity` halts its table (unless a `timestamp_ntz` is stored
+as `string`, whose text keeps every key distinct); a column that isn't a key clamps.
 
 **MySQL / MariaDB — NULL for "no date", halt for invalid dates.** Measured 2026-09-26: MySQL 8.4's
 default `sql_mode` rejects all of the values below, but any session can relax it
