@@ -156,6 +156,7 @@ the arrow.
 | Q-M5-13 (2026-10-01, during execution) | PostgreSQL doesn't publish `UNLOGGED` tables, but channel A selected them: a managed publication refused the pipeline, and under `FOR ALL TABLES` the table was snapshotted once and then never changed | **Like a table without an identifier**: a glob-matched unlogged table is skipped with a warning, a named one halts (`TABLE_NOT_REPLICABLE`, new in core). Config §11.2 lists the precondition |
 | Q-M5-14 (2026-10-01, during execution) | Task 8's review: pgoutput reads the publication as of each change's WAL position, so repairing it at start doesn't cover the WAL a `Resume` replays; a mixed-case publication name streamed nothing; `retained_bytes` measured from `confirmed_flush`; two pipelines on one managed publication drop each other's tables; Phase 5 acknowledged before persisting | **A repair that rewrites the publication re-snapshots (slot recreated); added tables are reported (`Prepared::added`) for M6 to snapshot; the publication name is quoted for pgoutput; `retained_bytes` from `restart_lsn`; V-059 is an error when a sharing pipeline is `managed`; Data-Flow Phase 5 persists before acknowledging** |
 | Q-M5-15 (2026-10-02, during execution) | Task 9's review: `next` lost a Relation message when `select!` cancelled it at a catalog query; channel B didn't see a primary key or replica identity change; tables were matched by name, so a renamed or swapped table went on silently; PostgreSQL 14 sends a `"char"` byte above 127 raw; `close` returned before the server released the slot | **`next` cancel-safe (the event kept until handled; catalog queries under `timeouts.command`); the replica identity compared in channel B; a name and OID that part halt the table (`TABLE_DROPPED`, `Schema_Change…` §7); the raw byte decodes; `close` waits for the slot's release** |
+| Q-M5-16 (2026-10-02, during execution) | Task 10's review: a text key in the database's collation made every chunk a full scan and sort (the `"C"` pin has no index); PostgreSQL 14 prints a `"char"` byte above 127 raw, which panicked the read; a domain over `"char"` key looped; a timed-out chunk kept the shared catalog connection busy | **A text key orders in its own collation when deterministic, `"C"` with a start warning when not (Snapshot_Resumability §2 amended); `"char"` read as its code; domains keyed by the decoder; `SET LOCAL statement_timeout` on every read** |
 
 **Rulings where the specs are silent** (each is pinned by a test). **Plan approved 2026-10-01**, with these rulings (roadmap D-IMPL-12):
 
@@ -177,7 +178,7 @@ the arrow.
 | D-M5.14 | Publication. Under `managed`: create it when absent, `ADD`/`DROP TABLE` to match the tracked set, and set `publish = 'insert, update, delete, truncate'` and `publish_via_partition_root = false`. Under `require_existing`, or for a `FOR ALL TABLES` publication: never change it, warn on each difference, except one. With `publish_via_partition_root = true` and a tracked table that is a partition, `prepare` is refused (`Permanent`), naming the partitions and the `ALTER PUBLICATION` that fixes it. A `managed` repair that changes what is published for every table (created, operations, `publish_via_partition_root`) turns a `Resume` into `Recreate(PositionLost)`; tables it adds come back in `Prepared::added` (Q-M5-14) | D-15.4. A partition's changes would arrive under its untracked parent's name and be dropped: silent loss, so a refusal, not a warning (Q-M5-5) | Task 8 (`the_publication_follows_the_table_set`, `require_existing_never_creates`, `a_root_publication_of_tracked_partitions_is_refused`) |
 | D-M5.15 | `prepare` reconciles the publication, then the slot. Creating a slot (it waits for running transactions) is bounded by `timeouts.snapshot`; every other catalog call by `timeouts.command`. `reset_position` drops and recreates the slot (refused under `require_existing`). `teardown` drops the slot and the publication only under `managed` with `auto_cleanup`. `retained_bytes` is `pg_current_wal_lsn() - restart_lsn`, the WAL the slot keeps on disk (Task 8 fix). Advancing an orphan (`Adopt`) is bounded by `timeouts.snapshot` too | The `max_wal_lag_bytes` guard (V-104) compares against it in M6 | Task 8 (`reset_teardown_and_retained_wal`) |
 | D-M5.16 | TLS. `allow` connects as `prefer` (the replication crate has no `allow`; both accept either kind). `require` and `prefer` encrypt but don't verify the chain (signatures are still checked), even with `ssl_ca` set (Q-M5-10). `verify-ca` checks the chain and ignores the name. `verify-full` checks both. The trust roots are `ssl_ca`, else the webpki roots. `ssl_cert` and `ssl_key` go together | Config §9.1; one meaning of each mode on both connections | Task 2 (`modes_map_to_both_clients`, `bad_material_is_refused_by_name`), Task 13 |
-| D-M5.17 | Snapshot reads. They use the simple-query protocol, so values are the output-function text pgoutput sends (`true::text` is `true`, pgoutput sends `t`). Columns are qualified by the alias `src`, so an output name can't shadow a key. Collatable keys compare under `COLLATE "C"`. Key values are quoted literals cast to the column's `format_type` text; a `"char"` key goes through a signed byte. A column changed under the snapshot (gone, or a different type) → `Transient`: read again once the stream's signal caught up. `fetch_rows` sends `FETCH_BATCH` = 1000 keys per statement | Snapshot_Resumability §2; a snapshot row must equal the streamed row of the same data | Task 10 |
+| D-M5.17 | Snapshot reads. They use the simple-query protocol, so values are the output-function text pgoutput sends (`true::text` is `true`, pgoutput sends `t`). Columns are qualified by the alias `src`, so an output name can't shadow a key. A text key compares in its own collation when that is deterministic (its index serves the chunk), in `COLLATE "C"` otherwise, with a warning at resolution; the cursor records the collations, and a cursor of others halts the table (Q-M5-16). Key values are quoted literals cast to the column's `format_type` text; a `"char"` (or a domain over one) is read as its code and keyed through a signed byte. Each read carries `SET LOCAL statement_timeout` = `timeouts.command`, so the server cancels it first. A column changed under the snapshot (gone, or a different type) → `Transient`: read again once the stream's signal caught up. `fetch_rows` sends `FETCH_BATCH` = 1000 keys per statement | Snapshot_Resumability §2; a snapshot row must equal the streamed row of the same data | Task 10 |
 | D-M5.18 | Channel C (`augment`). It takes the hint's columns (names and types, from the stream) and finds each in the catalog by name, else by the `attnum` it had in the cached schema; that `attnum` and the nullability come from the catalog. A column found neither way halts the table. `diff` matches by `attnum`, so a new name on the same `attnum` is a proven rename. A type change carries `narrowed` (a shorter length or lower precision of the same logical type). A table gone from the catalog → `[TableDropped]` and no schema | §0 (scope a change to its signal) and §6 (rename proof) | Task 11 |
 | D-M5.19 | Channel D (`rescan`). One batched read of the tracked tables. It reports tables gone from `pg_class` as dropped, tables whose catalog schema differs as changed (with that schema, for freshness and alerting only), and tables that now fail planning as halted | §2.1 `TABLE_DROPPED`; the rescan never applies a change itself | Task 11 (`channel_d_finds_dropped_changed_and_broken_tables`) |
 
@@ -9621,11 +9622,14 @@ git commit -m "feat(source-pg): the change stream"
   Option<&KeysetCursor>, limit) -> Chunk` and `fetch_rows(&TableSchema, &[Row]) -> Vec<Row>`.
 
 D-M5.17, Q-M5-6. A chunk is one statement, `WHERE (key) > (cursor) ORDER BY key LIMIT n`.
-Text keys compare under `COLLATE "C"`, the cursor's collation. Rows are read over the
+A text key compares in its own collation when that is deterministic (its index serves the
+chunk), in `COLLATE "C"` otherwise; the cursor records the collations (Q-M5-16). A `"char"` is
+read as its code. Each read carries `SET LOCAL statement_timeout`. Rows are read over the
 simple-query protocol, so values are the output-function text pgoutput also sends, and a snapshot
 row equals the streamed row of the same data. The integration tests read a table in chunks of
 every size and check the union equals the table. They cover a composite key with text, a `"char"`
-key past 127, and a column changed under the snapshot (`Transient`).
+key past 127, and a column changed under the snapshot (`Transient`), a key in a
+nondeterministic collation, a domain over `"char"`, and a read cancelled by the server.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -9665,38 +9669,68 @@ Create `crates/data-avalanche-source-pg/src/snapshot.rs` with only its test modu
 mod tests {
     use super::*;
 
-    fn rc(name: &str, type_text: &str, collatable: bool) -> ReadColumn {
+    fn rc(name: &str, type_text: &str, collation: Option<KeyCollation>) -> ReadColumn {
         ReadColumn {
             name: name.into(),
             decode: Decode::Text,
             type_text: type_text.into(),
-            collatable,
+            collation,
+        }
+    }
+
+    fn char_column(name: &str, type_text: &str) -> ReadColumn {
+        ReadColumn {
+            decode: Decode::Char,
+            ..rc(name, type_text, None)
         }
     }
 
     #[test]
-    fn keys_compare_in_the_c_collation() {
+    fn keys_compare_in_one_deterministic_collation() {
+        let own = || Some(KeyCollation::Own("en_US.utf8".into()));
         assert_eq!(
-            key_expr(&rc("code", "text", true)),
+            key_expr(&rc("code", "text", Some(KeyCollation::C))),
             "src.\"code\" COLLATE \"C\""
         );
-        assert_eq!(key_expr(&rc("id", "bigint", false)), "src.\"id\"");
+        assert_eq!(key_expr(&rc("code", "text", own())), "src.\"code\"");
+        assert_eq!(key_expr(&rc("id", "bigint", None)), "src.\"id\"");
         assert_eq!(
-            key_value(&rc("code", "character varying(10)", true), "it's"),
+            key_value(
+                &rc("code", "character varying(10)", Some(KeyCollation::C)),
+                "it's"
+            ),
             "'it''s'::character varying(10) COLLATE \"C\""
         );
         assert_eq!(
-            key_value(&rc("id", "numeric(10,2)", false), "1.50"),
+            key_value(&rc("code", "character varying(10)", own()), "it's"),
+            "'it''s'::character varying(10)",
+            "the column's own collation wins over the literal's"
+        );
+        assert_eq!(
+            key_value(&rc("id", "numeric(10,2)", None), "1.50"),
             "'1.50'::numeric(10,2)"
         );
         assert_eq!(
-            key_value(&rc("c", "\"char\"", false), "255"),
+            key_value(&char_column("c", "\"char\""), "255"),
             "(('255'::int4 + 128) % 256 - 128)::\"char\""
         );
         assert_eq!(
-            select_list(&[rc("a b", "text", true), rc("c", "int", false)]),
-            "src.\"a b\", src.\"c\""
+            key_value(&char_column("c", "it.flag"), "97"),
+            "(('97'::int4 + 128) % 256 - 128)::\"char\"::it.flag",
+            "a domain over \"char\""
         );
+        assert_eq!(
+            select_list(&[rc("a b", "text", own()), char_column("c", "\"char\"")]),
+            "src.\"a b\", ((src.\"c\")::\"char\"::int4 + 256) % 256"
+        );
+        let a = rc("a", "text", own());
+        let b = rc("b", "text", Some(KeyCollation::C));
+        let id = rc("id", "int", None);
+        assert_eq!(
+            cursor_collation(&[&a, &id, &b]).as_deref(),
+            Some("en_US.utf8,C")
+        );
+        assert_eq!(cursor_collation(&[&id]), None);
         assert_eq!(
             quote("a'b\\c"),
             "'a''b\\c'",
@@ -9725,8 +9759,10 @@ Create `crates/data-avalanche-source-pg/tests/pg/snapshot.rs`:
 ```rust
 //! Snapshot chunks and keyed re-reads against a live server (Snapshot_Resumability §1–§2).
 
+use std::time::Duration;
+
 use data_avalanche_core::{
-    ColumnValue as V, KeysetCursor, Row, SourceError, TableSchema, identifier_values,
+    ColumnValue as V, HaltReason, KeysetCursor, Row, SourceError, TableSchema, identifier_values,
 };
 use data_avalanche_source_pg::{FETCH_BATCH, PgConnector};
 use data_avalanche_testkit::require_it;
@@ -9744,6 +9780,7 @@ async fn read_all(c: &PgConnector, table: &TableSchema, limit: usize) -> (Vec<Ro
             .await
             .expect("chunk");
         chunks += 1;
+        assert!(chunks <= 10_000, "the cursor doesn't advance");
         assert!(chunk.rows.len() <= limit);
         let Some(next) = chunk.next else {
             assert!(chunk.rows.is_empty());
@@ -9798,36 +9835,99 @@ async fn chunks_walk_the_table_in_key_order() {
     cleanup(&a, &n).await;
 }
 
-#[tokio::test]
-async fn text_keys_page_in_the_c_collation() {
-    require_it!();
-    let a = admin().await;
-    let n = fresh(
-        &a,
-        "chunks_c",
-        "CREATE TABLE t (code text COLLATE \"en_US.utf8\" PRIMARY KEY);
-         INSERT INTO t VALUES ('b'), ('B'), ('a'), ('Z'), ('é'), ('a b'), ('ab');",
-    )
-    .await;
-    let c = connector(&pipeline(&n, &["*"], "", ""));
-    let t = &resolved(&c).await.tables[0];
-    let (rows, _) = read_all(&c, t, 2).await;
-    let codes: Vec<String> = rows
-        .iter()
+fn texts(rows: &[Row]) -> Vec<String> {
+    rows.iter()
         .map(|r| match r.get("code") {
             Some(V::Text(s)) => s.clone(),
             other => panic!("{other:?}"),
         })
-        .collect();
-    let mut bytewise = codes.clone();
-    bytewise.sort();
+        .collect()
+}
+
+/// Snapshot_Resumability §2: a text key pages in its own collation when it is deterministic (its
+/// index serves the order), in `"C"` when it isn't, with a warning at resolution. The cursor
+/// records the collation; a cursor of another one halts the table.
+#[tokio::test]
+async fn text_keys_page_in_one_deterministic_collation() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(
+        &a,
+        "chunks_collation",
+        "CREATE COLLATION folding (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+         CREATE TABLE \"Codes\" (code text COLLATE \"en_US.utf8\" PRIMARY KEY);
+         CREATE TABLE folded (code text COLLATE folding PRIMARY KEY);
+         INSERT INTO \"Codes\" VALUES ('b'), ('B'), ('a'), ('Z'), ('é'), ('a b'), ('ab');
+         INSERT INTO folded VALUES ('b'), ('A'), ('é'), ('Z'), ('a b');",
+    )
+    .await;
+    let c = connector(&pipeline(&n, &["*"], "", ""));
+    let r = resolved(&c).await;
+    let table = |name: &str| {
+        r.tables
+            .iter()
+            .find(|t| t.table().name == name)
+            .unwrap()
+            .clone()
+    };
+    let server = |sql: String| {
+        let a = &a;
+        async move {
+            a.query(&sql, &[])
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.get::<_, String>(0))
+                .collect::<Vec<_>>()
+        }
+    };
+
+    let codes = table("Codes");
+    let (rows, _) = read_all(&c, &codes, 2).await;
     assert_eq!(
-        codes, bytewise,
-        "byte order, whatever the column's collation"
+        texts(&rows),
+        server(format!(
+            "SELECT code FROM {}.\"Codes\" ORDER BY code",
+            n.schema
+        ))
+        .await,
+        "every row once, in the column's own collation"
     );
-    assert_eq!(codes.len(), 7, "every row once");
-    let chunk = c.read_chunk(t, None, 2).await.unwrap();
+    let chunk = c.read_chunk(&codes, None, 2).await.unwrap();
+    let cursor = chunk.next.unwrap();
+    assert_eq!(cursor.collation.as_deref(), Some("en_US.utf8"));
+    let stale = KeysetCursor {
+        collation: Some("C".into()),
+        ..cursor
+    };
+    match c.read_chunk(&codes, Some(&stale), 2).await {
+        Err(SourceError::TableHalt {
+            reason: HaltReason::SchemaMismatch { detail, .. },
+            ..
+        }) => assert!(detail.contains("re-snapshot"), "{detail}"),
+        other => panic!("a cursor of another collation halts: {other:?}"),
+    }
+
+    let folded = table("folded");
+    let (rows, _) = read_all(&c, &folded, 1).await;
+    assert_eq!(
+        texts(&rows),
+        server(format!(
+            "SELECT code FROM {}.folded ORDER BY code COLLATE \"C\"",
+            n.schema
+        ))
+        .await,
+        "a nondeterministic collation pages in byte order"
+    );
+    let chunk = c.read_chunk(&folded, None, 1).await.unwrap();
     assert_eq!(chunk.next.unwrap().collation.as_deref(), Some("C"));
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains(".folded.code") && w.contains("nondeterministic")),
+        "{:?}",
+        r.warnings
+    );
     cleanup(&a, &n).await;
 }
 
@@ -9847,7 +9947,7 @@ async fn composite_keys_of_every_key_type_resume_exactly() {
                 (VALUES (-1.5), (0), (12345678.99)) AS n(n),
                 (VALUES ('00000000-0000-0000-0000-000000000001'::uuid)) AS u(u),
                 (VALUES ('\\x00'::bytea), ('\\xff')) AS b(b),
-                (VALUES ('a'::\"char\"), ('\\377')) AS c(c),
+                (VALUES ('a'::\"char\"), ((-1)::int4::\"char\")) AS c(c),
                 (VALUES ('x'), ('x y')) AS v(v);",
     )
     .await;
@@ -9866,6 +9966,38 @@ async fn composite_keys_of_every_key_type_resume_exactly() {
         "the cursor never skips or repeats a row"
     );
     assert_eq!(one_by_one, all);
+    let high = one_by_one
+        .iter()
+        .filter(|r| r.get("c") == Some(&V::Int16(255)))
+        .count();
+    assert_eq!(
+        high as i64 * 2,
+        expected,
+        "the \"char\" byte 255 (PostgreSQL 14 prints it raw)"
+    );
+    cleanup(&a, &n).await;
+}
+
+/// A key of a domain over `"char"` travels as its byte too.
+#[tokio::test]
+async fn a_domain_over_char_key_resumes() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(
+        &a,
+        "chunks_domain",
+        "CREATE DOMAIN flag AS \"char\";
+         CREATE TABLE t (k flag PRIMARY KEY);
+         INSERT INTO t VALUES ('a'), ('b'), ((-1)::int4::\"char\");",
+    )
+    .await;
+    let c = connector(&pipeline(&n, &["*"], "", ""));
+    let t = &resolved(&c).await.tables[0];
+    let (rows, _) = read_all(&c, t, 1).await;
+    let keys: Vec<&V> = rows.iter().map(|r| r.get("k").unwrap()).collect();
+    assert_eq!(keys, [&V::Int16(97), &V::Int16(98), &V::Int16(255)]);
+    let again = c.fetch_rows(t, &rows).await.unwrap();
+    assert_eq!(again.len(), 3);
     cleanup(&a, &n).await;
 }
 
@@ -9930,10 +10062,52 @@ async fn a_table_changed_under_the_snapshot_is_retried() {
     .await
     .unwrap();
     let t = resolved(&c).await.tables[0].clone();
+    a.batch_execute(&format!(
+        "ALTER TABLE {}.t ALTER COLUMN v TYPE bigint USING 0",
+        n.schema
+    ))
+    .await
+    .unwrap();
+    match c.read_chunk(&t, None, 10).await {
+        Err(SourceError::Transient(m)) => assert!(m.contains("column v is now"), "{m}"),
+        other => panic!("transient expected: {other:?}"),
+    }
+    let t = resolved(&c).await.tables[0].clone();
     assert!(
         c.read_chunk(&t, None, 10).await.is_ok(),
         "the current schema reads"
     );
+    cleanup(&a, &n).await;
+}
+
+/// The server cancels a chunk read past `timeouts.command`, so the catalog connection the reads
+/// share is free right after: a client-side timeout alone would leave the statement running.
+#[tokio::test]
+async fn a_timed_out_chunk_frees_the_connection() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(&a, "chunks_timeout", "CREATE TABLE t (id int PRIMARY KEY);").await;
+    let mut p = pipeline(&n, &["*"], "", "");
+    p.source.timeouts.command = Duration::from_secs(1);
+    let c = connector(&p);
+    let t = &resolved(&c).await.tables[0];
+    let locker = admin().await;
+    locker
+        .batch_execute(&format!(
+            "BEGIN; LOCK TABLE {}.t IN ACCESS EXCLUSIVE MODE",
+            n.schema
+        ))
+        .await
+        .unwrap();
+    match c.read_chunk(t, None, 10).await {
+        Err(SourceError::Transient(m)) => assert!(m.contains("57014"), "{m}"),
+        other => panic!("a statement timeout is transient: {other:?}"),
+    }
+    tokio::time::timeout(Duration::from_secs(2), c.current_position())
+        .await
+        .expect("the connection is free while the lock is still held")
+        .unwrap();
+    locker.batch_execute("ROLLBACK").await.unwrap();
     cleanup(&a, &n).await;
 }
 ```
@@ -9956,12 +10130,14 @@ error[E0433]: cannot find type `Decode` in this scope
 Add the implementation to `crates/data-avalanche-source-pg/src/snapshot.rs`, above the test module:
 
 ```rust
-//! Snapshot reads (Snapshot_Resumability §1–§2, §6): keyset chunks in identifier order, text
-//! identifier columns ordered with `COLLATE "C"`, and the keyed re-read `toast_strategy: re_query`
-//! uses. Rows are read over the simple-query protocol, whose values are the types' output-function
+//! Snapshot reads (Snapshot_Resumability §1–§2, §6): keyset chunks in identifier order, a text
+//! identifier column ordered in its own collation when that is deterministic (its index serves the
+//! order) and in `"C"` otherwise, and the keyed re-read `toast_strategy: re_query` uses. Rows are read over the simple-query protocol, whose values are the types' output-function
 //! text, the same text pgoutput sends; they are decoded like stream values, so a snapshot row and
 //! a streamed row of the same data are equal. (A `::text` cast isn't the output function:
 //! `true::text` is `true`, pgoutput sends `t`.)
+
+use std::time::Duration;
 
 use data_avalanche_core::{
     Chunk, ColumnValue, HaltReason, KeysetCursor, Row, SourceError, TableSchema, identifier_values,
@@ -9969,6 +10145,7 @@ use data_avalanche_core::{
 use tokio_postgres::SimpleQueryMessage;
 
 use crate::catalog::{load_types, table_key};
+use crate::connect::within;
 use crate::connector::PgConnector;
 use crate::slot::{ident, qualified};
 use crate::types::plan_column;
@@ -9977,6 +10154,10 @@ use crate::value::{self, Decode, ValueError, text_of};
 /// Keys per `fetch_rows` statement, which bounds its size.
 pub const FETCH_BATCH: usize = 1000;
 
+/// How much longer the client waits than the server's `statement_timeout`: the server cancels a
+/// slow read first, so the shared catalog connection is free again when the client gives up.
+const SERVER_FIRST: Duration = Duration::from_secs(5);
+
 /// How to read one column of a table.
 #[derive(Debug, Clone)]
 pub(crate) struct ReadColumn {
@@ -9984,7 +10165,27 @@ pub(crate) struct ReadColumn {
     decode: Decode,
     /// The catalog's type text, for casting a key value.
     type_text: String,
-    collatable: bool,
+    /// The collation a key comparison uses; `None` for a type without one.
+    collation: Option<KeyCollation>,
+}
+
+/// The collation a text key column is ordered and compared in (Snapshot_Resumability §2): one
+/// deterministic collation for both, so the order and the cursor agree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KeyCollation {
+    /// The column's own, deterministic: its index serves the order.
+    Own(String),
+    /// A nondeterministic collation's column, compared in `"C"`.
+    C,
+}
+
+impl KeyCollation {
+    fn name(&self) -> &str {
+        match self {
+            KeyCollation::Own(name) => name,
+            KeyCollation::C => "C",
+        }
+    }
 }
 
 /// The read plan of a table, checked against `schema`: every column still exists and decodes to
@@ -9999,9 +10200,10 @@ async fn read_plan(c: &PgConnector, schema: &TableSchema) -> Result<Vec<ReadColu
             "read the table's columns",
             client.query(
                 "SELECT a.attname, a.atttypid, a.atttypmod,
-                        pg_catalog.format_type(a.atttypid, a.atttypmod), t.typcollation <> 0
+                        pg_catalog.format_type(a.atttypid, a.atttypmod), co.collname::text,
+                        co.collisdeterministic
                    FROM pg_catalog.pg_attribute a
-                   JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+                   LEFT JOIN pg_catalog.pg_collation co ON co.oid = a.attcollation
                   WHERE a.attrelid = $1::text::regclass AND a.attname = ANY($2)
                     AND a.attnum > 0 AND NOT a.attisdropped",
                 &[&qualified(schema.table()), &names],
@@ -10050,11 +10252,16 @@ async fn read_plan(c: &PgConnector, schema: &TableSchema) -> Result<Vec<ReadColu
                 col.name, p.value_type, col.value_type
             )));
         }
+        let collation = match (r.get::<_, Option<String>>(4), r.get::<_, Option<bool>>(5)) {
+            (Some(name), Some(true)) => Some(KeyCollation::Own(name)),
+            (Some(_), _) => Some(KeyCollation::C),
+            (None, _) => None,
+        };
         out.push(ReadColumn {
             name: col.name.clone(),
             decode: p.decode,
             type_text: r.get(3),
-            collatable: r.get(4),
+            collation,
         });
     }
     Ok(out)
@@ -10063,21 +10270,30 @@ async fn read_plan(c: &PgConnector, schema: &TableSchema) -> Result<Vec<ReadColu
 /// The table's alias in snapshot queries. Columns are qualified with it.
 const ALIAS: &str = "src";
 
-/// The select list: every column, in schema order.
+/// The select list: every column, in schema order. A `"char"` is read as its byte, 0–255:
+/// PostgreSQL 14 prints a byte above 127 as itself, which isn't UTF-8.
 fn select_list(columns: &[ReadColumn]) -> String {
     columns
         .iter()
-        .map(|c| format!("{ALIAS}.{}", ident(&c.name)))
+        .map(|c| {
+            if c.decode.reads_char() {
+                format!("(({ALIAS}.{})::\"char\"::int4 + 256) % 256", ident(&c.name))
+            } else {
+                format!("{ALIAS}.{}", ident(&c.name))
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-/// A key column in a comparison: `COLLATE "C"` on a collatable column (Snapshot_Resumability §2).
+/// A key column in a comparison: `COLLATE "C"` on a column of a nondeterministic collation, its
+/// own collation otherwise (Snapshot_Resumability §2).
 fn key_expr(c: &ReadColumn) -> String {
-    if c.collatable {
-        format!("{ALIAS}.{} COLLATE \"C\"", ident(&c.name))
+    let column = format!("{ALIAS}.{}", ident(&c.name));
+    if c.collation == Some(KeyCollation::C) {
+        format!("{column} COLLATE \"C\"")
     } else {
-        format!("{ALIAS}.{}", ident(&c.name))
+        column
     }
 }
 
@@ -10086,24 +10302,39 @@ fn quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "''"))
 }
 
-/// A key value of the column's type: its text, cast. A `"char"` travels as its byte, 0–255, and
-/// the `int4` → `"char"` cast takes a signed byte.
+/// A key value of the column's type: its text, cast. A `"char"` (or a domain over one) travels
+/// as its byte, 0–255, and the `int4` → `"char"` cast takes a signed byte.
 fn cast(c: &ReadColumn, text: &str) -> String {
-    if c.type_text == "\"char\"" {
-        format!("(({}::int4 + 128) % 256 - 128)::\"char\"", quote(text))
+    if c.decode.reads_char() {
+        let byte = format!("(({}::int4 + 128) % 256 - 128)::\"char\"", quote(text));
+        if c.type_text == "\"char\"" {
+            byte
+        } else {
+            format!("{byte}::{}", c.type_text)
+        }
     } else {
         format!("{}::{}", quote(text), c.type_text)
     }
 }
 
-/// A key value in a keyset comparison: [`cast`], collated like the column's [`key_expr`].
+/// A key value in a keyset comparison: [`cast`], collated like the column's [`key_expr`]. A cast
+/// literal's collation yields to the column's own.
 fn key_value(c: &ReadColumn, text: &str) -> String {
     let cast = cast(c, text);
-    if c.collatable {
+    if c.collation == Some(KeyCollation::C) {
         format!("{cast} COLLATE \"C\"")
     } else {
         cast
     }
+}
+
+/// The key's collations, for the cursor: one name per collatable identifier column, in order.
+fn cursor_collation(keys: &[&ReadColumn]) -> Option<String> {
+    let names: Vec<&str> = keys
+        .iter()
+        .filter_map(|c| c.collation.as_ref().map(KeyCollation::name))
+        .collect();
+    (!names.is_empty()).then(|| names.join(","))
 }
 
 fn decode_row(
@@ -10113,27 +10344,44 @@ fn decode_row(
 ) -> Result<Row, SourceError> {
     let mut out = Vec::with_capacity(columns.len());
     for (i, c) in columns.iter().enumerate() {
-        let v = match row.get(i) {
-            None => ColumnValue::Null,
-            Some(text) => value::decode(&c.decode, text).map_err(|e| SourceError::TableHalt {
-                table: schema.table().clone(),
-                reason: match e {
-                    ValueError::Overflow => HaltReason::NumericOverflow {
-                        column: c.name.clone(),
-                    },
-                    ValueError::Unrepresentable(detail) => HaltReason::SchemaMismatch {
-                        column: c.name.clone(),
-                        detail,
-                    },
-                },
-            })?,
+        let halt = |reason| SourceError::TableHalt {
+            table: schema.table().clone(),
+            reason,
         };
+        let mismatch = |detail: String| {
+            halt(HaltReason::SchemaMismatch {
+                column: c.name.clone(),
+                detail,
+            })
+        };
+        // A `"char"[]` element above 127 on PostgreSQL 14 isn't UTF-8 either: the table halts,
+        // as in the stream.
+        let text = row
+            .try_get(i)
+            .map_err(|_| mismatch("the value isn't valid UTF-8".into()))?;
+        let decoded = match text {
+            None => Ok(ColumnValue::Null),
+            Some(code) if c.decode.reads_char() => {
+                let byte: u8 = code
+                    .parse()
+                    .map_err(|_| mismatch(format!("not a \"char\" code: {code:?}")))?;
+                value::decode(&c.decode, &format!("\\{byte:03o}"))
+            }
+            Some(text) => value::decode(&c.decode, text),
+        };
+        let v = decoded.map_err(|e| match e {
+            ValueError::Overflow => halt(HaltReason::NumericOverflow {
+                column: c.name.clone(),
+            }),
+            ValueError::Unrepresentable(detail) => mismatch(detail),
+        })?;
         out.push((c.name.clone(), v));
     }
     Ok(Row(out))
 }
 
-/// Runs `sql` and decodes its rows.
+/// Runs `sql` and decodes its rows. The server cancels it after `timeouts.command`
+/// (`statement_timeout`, local to the statement's implicit transaction).
 async fn rows(
     c: &PgConnector,
     what: &str,
@@ -10142,7 +10390,12 @@ async fn rows(
     sql: &str,
 ) -> Result<Vec<Row>, SourceError> {
     let client = c.conn.client().await?;
-    let messages = c.conn.command(what, client.simple_query(sql)).await?;
+    let command = c.conn.timeouts.command;
+    let sql = format!(
+        "SET LOCAL statement_timeout = {}; {sql}",
+        command.as_millis()
+    );
+    let messages = within(what, command + SERVER_FIRST, client.simple_query(&sql)).await?;
     messages
         .iter()
         .filter_map(|m| match m {
@@ -10193,12 +10446,26 @@ impl PgConnector {
     ) -> Result<Chunk, SourceError> {
         let columns = read_plan(self, table).await?;
         let keys = key_columns(table, &columns);
+        let collation = cursor_collation(&keys);
         let mut sql = format!(
             "SELECT {} FROM {} AS {ALIAS}",
             select_list(&columns),
             qualified(table.table())
         );
         if let Some(cursor) = after {
+            if cursor.collation != collation {
+                return Err(SourceError::TableHalt {
+                    table: table.table().clone(),
+                    reason: HaltReason::SchemaMismatch {
+                        column: table.identifier().join(","),
+                        detail: format!(
+                            "the key's collation is {collation:?}, the snapshot's cursor was \
+                             ordered by {:?}; re-snapshot the table",
+                            cursor.collation
+                        ),
+                    },
+                });
+            }
             let texts = key_texts(&cursor.key, table)?;
             let left: Vec<String> = keys.iter().map(|c| key_expr(c)).collect();
             let right: Vec<String> = keys
@@ -10211,7 +10478,6 @@ impl PgConnector {
         let order: Vec<String> = keys.iter().map(|c| key_expr(c)).collect();
         sql += &format!(" ORDER BY {} LIMIT {limit}", order.join(", "));
         let rows = rows(self, "read a snapshot chunk", table, &columns, &sql).await?;
-        let collation = keys.iter().any(|c| c.collatable).then(|| "C".to_owned());
         let next = match rows.last() {
             None => None,
             Some(last) => Some(KeysetCursor {
@@ -10276,7 +10542,7 @@ Expected: PASS. `data-avalanche-source-pg` unit tests: 61.
 
 Run, with `test-infra/up.sh` running: `DATA_AVALANCHE_IT=1 cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 33 tests.
+Expected: PASS, 35 tests.
 
 Run: `cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all --check`
 
@@ -10914,7 +11180,7 @@ diff --git a/crates/data-avalanche-source-pg/src/connector.rs b/crates/data-aval
      pub(crate) pg: Postgres,
      pub(crate) conn: Connector,
      /// `pg_type` rows fetched so far.
-@@ -241,10 +243,87 @@
+@@ -248,10 +250,87 @@
      }
  }
  
@@ -11012,7 +11278,7 @@ Expected: PASS. `data-avalanche-source-pg` unit tests: 66.
 
 Run, with `test-infra/up.sh` running: `DATA_AVALANCHE_IT=1 cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 35 tests.
+Expected: PASS, 37 tests.
 
 Run: `cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all --check`
 
@@ -11710,13 +11976,13 @@ async fn overrides_convert_through_stream_and_snapshot() {
 
 Run: `cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 37 tests. Without `DATA_AVALANCHE_IT` every test returns at once. These tests drive the code of Tasks 2–11, so nothing fails first. A failure in Step 3 is a defect in that code: stop and report it.
+Expected: PASS, 39 tests. Without `DATA_AVALANCHE_IT` every test returns at once. These tests drive the code of Tasks 2–11, so nothing fails first. A failure in Step 3 is a defect in that code: stop and report it.
 
 - [ ] **Step 3: Run them against PostgreSQL**
 
 Run: `test-infra/up.sh`, then `DATA_AVALANCHE_IT=1 cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 37 tests.
+Expected: PASS, 39 tests.
 
 - [ ] **Step 4: Run the gates**
 
@@ -12204,13 +12470,13 @@ jobs:
 
 Run: `cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 41 tests. Without `DATA_AVALANCHE_IT` every test returns at once. These tests drive the code of Tasks 2–11, so nothing fails first. A failure in Step 3 is a defect in that code: stop and report it.
+Expected: PASS, 43 tests. Without `DATA_AVALANCHE_IT` every test returns at once. These tests drive the code of Tasks 2–11, so nothing fails first. A failure in Step 3 is a defect in that code: stop and report it.
 
 - [ ] **Step 3: Run them against PostgreSQL**
 
 Run: `test-infra/up.sh` (it now starts `postgres-tls` too), then `DATA_AVALANCHE_IT=1 cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 41 tests.
+Expected: PASS, 43 tests.
 
 Then the nightly matrix by hand, one server at a time (55414…55417):
 
@@ -12219,7 +12485,7 @@ docker compose -f test-infra/compose.yaml --profile matrix up -d --wait postgres
 DATA_AVALANCHE_IT=1 DATA_AVALANCHE_PG_PORT=55414 cargo test -p data-avalanche-source-pg --test pg --test slot_invalidation -- --skip tls::
 ```
 
-Expected: PASS on each, 37 tests, and the `slot_invalidation` test.
+Expected: PASS on each, 39 tests, and the `slot_invalidation` test.
 
 - [ ] **Step 4: Run the gates**
 
@@ -12476,3 +12742,43 @@ each later task's `data-avalanche-source-pg` unit-test count is five higher than
 (Task 7's fix four, this one). Left for the whole-branch review: the client's read-ahead is bounded
 in events (8 192), not bytes; a `next` cancelled while the client joins its ended worker reports
 `replication worker already joined` (`Internal`, permanent) instead of the worker's error.
+
+**Task 10: the key's collation, `"char"` on PostgreSQL 14, the read timeout** (`b271469`; found by
+the task review, owner decision Q-M5-16, 2026-10-02):
+- **Every chunk was a full scan for most text keys.** Snapshot_Resumability §2 pinned keyset order
+  to `COLLATE "C"`; a primary key in the database's collation has no index in `"C"`, so each chunk
+  scanned and sorted the table (the reviewer measured 17.8 ms against 0.28 ms on 200 000 rows; a
+  large table's chunk could pass `timeouts.command` and retry for ever). §2's requirement is one
+  deterministic collation for the order and the cursor. Now a text key orders in its own collation
+  when that is deterministic, and its index serves the chunk. A key in a nondeterministic collation
+  orders in `"C"`, and `resolve_tables` warns, naming the index that avoids the scan (`Notes`
+  gains `c_ordered_keys`, from the catalog's `pg_collation`; Task 6's and Task 7's files). The
+  cursor records the collations, one per text key column; a cursor of others halts the table
+  (`SCHEMA_MISMATCH`, re-snapshot). Snapshot_Resumability §2 says so now.
+- **PostgreSQL 14 prints a `"char"` byte above 127 raw.** It isn't UTF-8, and
+  `SimpleQueryRow::get` panicked. The snapshot reads a `"char"` as its code
+  (`((src.c)::"char"::int4 + 256) % 256`) and decodes it as `\ooo`; any value that isn't UTF-8
+  (a `"char"[]` element) halts the table, as in the stream. The test's `'\377'::"char"` is a
+  backslash on 14, so the old test never had a byte above 127 there; it inserts
+  `(-1)::int4::"char"` now.
+- **A domain over `"char"` as a key looped:** the cursor cast went by the type text. It goes by the
+  decoder now (`Decode::reads_char`, moved from the stream to `value.rs`).
+- **A timed-out chunk kept the shared catalog connection busy:** the client stopped waiting, the
+  server didn't stop. Each read now runs as `SET LOCAL statement_timeout = <timeouts.command>;
+  SELECT …` (one simple query, so the setting ends with it; measured on PostgreSQL 14 and 18), and
+  the client waits 5 s longer.
+- Tests: `text_keys_page_in_one_deterministic_collation` (a mixed-case table in `en_US.utf8`, an ICU
+  nondeterministic key, a stale cursor), `a_domain_over_char_key_resumes`,
+  `a_timed_out_chunk_frees_the_connection` (a locked table; the next catalog call answers while the
+  lock is held); the composite-key test counts the byte-255 rows; the drift test asserts the
+  type-change `Transient`; `read_all` fails a cursor that doesn't advance. With the original
+  `snapshot.rs`, the four new checks fail on PostgreSQL 14. Unit: `keys_in_a_nondeterministic_collation_are_noted`.
+
+Measured on the verified workspace: PostgreSQL 14–18 pass 39 integration tests each without TLS
+and `slot_invalidation` on each; the workspace passes 644. Task 11's `connector.rs` diff is
+regenerated against the fixed file. Counts: Task 10's integration tests are 35, each later
+integration count is two higher than before; each later task's unit-test count is six higher than
+its block shows. Left for the whole-branch review: `bit`/`varbit` keys (their key text isn't
+valid input for the type); a key column that loses `NOT NULL` isn't re-checked; `E''` literals
+would make quoting independent of `standard_conforming_strings`; no byte budget per chunk;
+`read_chunk` with `limit` 0 reads as the table's end.

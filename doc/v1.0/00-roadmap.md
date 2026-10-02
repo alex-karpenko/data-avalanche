@@ -778,6 +778,9 @@ Detailed plan: `M0-foundations.md`.
     `wal_sender_timeout`): retry it, bounded, while the lease is held.
   - Open a stream only from a persisted checkpoint or the slot's own start: opening reports the
     start position as flushed at once (Task 9 review).
+  - A snapshot chunk's `Transient` "changed under the snapshot" waits for the stream's schema; an
+    idle table's only catches up at channel D's rescan (60 min by default). Run a rescan of that
+    table on it (Task 10 review).
   - The reconnect backoff: a stream error ends the stream, and the pipeline reopens it from the
     checkpoint (D-M5.4).
   - The `max_wal_lag_bytes` halt, comparing against `SourceConnector::retained_bytes` (V-104).
@@ -1126,6 +1129,7 @@ the naming below (2026-09-26).**
 | Q-M5-13 (2026-10-01) | PostgreSQL doesn't publish `UNLOGGED` tables; channel A selected them | **Skipped with a warning when a glob matched, halted (`TABLE_NOT_REPLICABLE`) when named** | config §11.2; `M5-pg-source.md` Deviations, Task 7 |
 | Q-M5-14 (2026-10-01) | Task 8's review: a publication repaired at start doesn't cover the WAL a resume replays; a mixed-case publication streamed nothing; WAL retention measured from `confirmed_flush`; managed pipelines sharing a publication; Phase 5 acknowledged before persisting | **Re-snapshot after a rewriting repair, `Prepared::added` for added tables, a quoted publication name, `restart_lsn`, V-059 an error under `managed`, persist before acknowledging** | §3.6; M6 carried items; Data-Flow Phase 5; config §13; `M5-pg-source.md` Deviations, Task 8 |
 | Q-M5-15 (2026-10-02) | Task 9's review: `next` not cancel-safe; channel B blind to key and replica identity changes; tables matched by name, not OID; PostgreSQL 14's raw `"char"` bytes; `close` before the slot's release | **A cancel-safe `next`; the replica identity compared; a parted name and OID halt (`TABLE_DROPPED`); the raw byte decodes; `close` waits for the release** | §3.6; `Schema_Change…` §7; `M5-pg-source.md` Deviations, Task 9 |
+| Q-M5-16 (2026-10-02) | Task 10's review: a `"C"`-pinned text key made every chunk a full scan; PostgreSQL 14's raw `"char"` bytes panicked the read; a domain over `"char"` key looped; a timed-out chunk kept the catalog connection busy | **A text key in its own deterministic collation (`"C"` and a warning otherwise); `"char"` read as its code; server-side `statement_timeout`** | Snapshot_Resumability §2; `M5-pg-source.md` D-M5.17, Deviations, Task 10 |
 | Q-M9-1 | Snapshot-job persistence | **Persisted in the pipeline state location** (`snapshots/jobs/<job_id>.json`); listed after a restart or failover via `GET /v1/pipelines/{id}/snapshots`; a running job continues on the new owner from its chunk cursors | `Data-Flow.md` §On-Demand Snapshot + State Layout; System-Overview and API_RBAC endpoint tables |
 
 ### 9.2 Open questions (answer before the named milestone)
