@@ -164,13 +164,14 @@ async fn channel_c_with_the_catalog_ahead() {
         &a,
         "channel_c_ahead",
         "CREATE TABLE t (id int PRIMARY KEY, a int, b int);
-         CREATE TABLE u (id int PRIMARY KEY, a int, b int);",
+         CREATE TABLE u (id int PRIMARY KEY, a int, b int);
+         CREATE TABLE v (id int PRIMARY KEY, a int, b int);",
     )
     .await;
     let c: Box<dyn SourceConnector> = Box::new(connector(&pipeline(&n, &["*"], "", "")));
     let r = c.resolve_tables().await.unwrap();
     let p = c
-        .prepare(None, &[n.table("t"), n.table("u")])
+        .prepare(None, &[n.table("t"), n.table("u"), n.table("v")])
         .await
         .unwrap();
     let StartPlan::Snapshot { from, .. } = p.plan else {
@@ -181,18 +182,23 @@ async fn channel_c_with_the_catalog_ahead() {
     each(
         &a,
         &[
+            // v: a column replaced (dropped, another renamed into its name), then a write.
+            format!("ALTER TABLE {sc}.v DROP COLUMN a"),
+            format!("ALTER TABLE {sc}.v RENAME COLUMN b TO a"),
+            format!("INSERT INTO {sc}.v VALUES (1, 1)"),
             format!("ALTER TABLE {sc}.t ADD COLUMN c int"),
             format!("INSERT INTO {sc}.t VALUES (1, 1, 1, 1)"),
             format!("ALTER TABLE {sc}.u ADD COLUMN c int"),
             format!("INSERT INTO {sc}.u VALUES (1, 1, 1, 1)"),
-            // After the signals: expand and contract on t, a rename chain on u.
+            // After the signals: expand and contract on t, a rename chain on u, a rename on v.
             format!("ALTER TABLE {sc}.t DROP COLUMN b"),
             format!("ALTER TABLE {sc}.u RENAME COLUMN a TO x"),
             format!("ALTER TABLE {sc}.u RENAME COLUMN b TO a"),
+            format!("ALTER TABLE {sc}.v RENAME COLUMN a TO x"),
         ],
     )
     .await;
-    let hints = signals(&mut s, 2).await;
+    let hints = signals(&mut s, 3).await;
     let (delta, new) = c
         .augment(cached(&r.tables, "t"), &hints["t"])
         .await
@@ -203,12 +209,14 @@ async fn channel_c_with_the_catalog_ahead() {
         [SchemaChange::AddColumn(new.column("c").unwrap().clone())],
         "the later drop isn't in this change"
     );
-    match c.augment(cached(&r.tables, "u"), &hints["u"]).await {
-        Err(SourceError::TableHalt {
-            reason: HaltReason::SchemaMismatch { .. },
-            ..
-        }) => {}
-        other => panic!("a guess halts the table: {other:?}"),
+    for table in ["u", "v"] {
+        match c.augment(cached(&r.tables, table), &hints[table]).await {
+            Err(SourceError::TableHalt {
+                reason: HaltReason::SchemaMismatch { .. },
+                ..
+            }) => {}
+            other => panic!("{table}: a guess halts the table: {other:?}"),
+        }
     }
     s.close().await.unwrap();
     cleanup(&a, &n).await;

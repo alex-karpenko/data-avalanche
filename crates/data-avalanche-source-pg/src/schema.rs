@@ -19,10 +19,8 @@ fn bound(type_text: &str) -> Option<i64> {
         type_text[open + 1..close].trim().parse().ok()
     };
     explicit().or_else(|| {
-        ["timestamp", "time", "interval"]
-            .iter()
-            .any(|t| type_text.starts_with(t))
-            .then_some(6)
+        let word = type_text.split(['(', ' ', '[']).next().unwrap_or_default();
+        matches!(word, "timestamp" | "time" | "interval").then_some(6)
     })
 }
 
@@ -48,8 +46,10 @@ pub fn narrowed(from: &ColumnSchema, to: &ColumnSchema) -> bool {
 /// doesn't fit the stream's columns is a guess, and the table halts (Q-M5-17):
 /// - two columns on one `attnum`, or `attnum`s out of the stream's order (pgoutput sends them in
 ///   `attnum` order): renames or a swap since the signal;
-/// - a name on another `attnum` than in `cached` while that one still exists and no stream column
-///   holds it: renamed away, and the name taken, since the signal.
+/// - a column of `cached` the catalog still has, with no stream column on it: it existed at the
+///   signal, so the stream carries it under some name (renamed away, and its name taken);
+/// - a column placed as dropped since the signal while another column of `cached` is gone too and
+///   placed nowhere: either could be the one the name meant.
 ///
 /// A column found no way halts too.
 pub fn scope(
@@ -67,15 +67,17 @@ pub fn scope(
         detail: format!("{why}; re-snapshot"),
     };
     let mut columns: Vec<ColumnSchema> = Vec::with_capacity(hint.len());
-    let mut by_name = vec![];
+    let mut dropped_since = false;
     for h in hint {
         let (ordinal, nullable) = if let Some(c) = now.column(&h.name) {
-            by_name.push(columns.len());
             (c.source_ordinal, c.nullable)
         } else if let Some(was) = cached.column(&h.name) {
             match in_now(was.source_ordinal) {
                 Some(c) => (c.source_ordinal, c.nullable),
-                None => (was.source_ordinal, was.nullable),
+                None => {
+                    dropped_since = true;
+                    (was.source_ordinal, was.nullable)
+                }
             }
         } else {
             return Err(guess(
@@ -98,18 +100,19 @@ pub fn scope(
             ..h.clone()
         });
     }
-    for &i in &by_name {
-        let c = &columns[i];
-        if let Some(was) = cached.column(&c.name)
-            && was.source_ordinal != c.source_ordinal
-            && in_now(was.source_ordinal).is_some()
-            && !columns
-                .iter()
-                .any(|o| o.source_ordinal == was.source_ordinal)
-        {
+    let placed = |o: Option<i32>| columns.iter().any(|c| c.source_ordinal == o);
+    for was in cached.columns() {
+        let gone = in_now(was.source_ordinal).is_none();
+        if !gone && !placed(was.source_ordinal) {
             return Err(guess(
-                &c.name,
-                "the catalog, ahead of the stream, has the name on another column",
+                &was.name,
+                "the catalog, ahead of the stream, has a column no stream column is placed on",
+            ));
+        }
+        if dropped_since && gone && !placed(was.source_ordinal) {
+            return Err(guess(
+                &was.name,
+                "two columns are gone from the catalog, and the stream's names don't say which",
             ));
         }
     }
@@ -310,6 +313,8 @@ mod tests {
         assert_eq!(bound("text"), None);
         assert_eq!(bound("timestamp without time zone"), Some(6), "the default");
         assert_eq!(bound("interval"), Some(6));
+        assert_eq!(bound("time with time zone[]"), Some(6));
+        assert_eq!(bound("timeslot"), None, "a user type");
         let ts = |t: &str| col("t", V::Timestamp { with_tz: false }, t, 4);
         assert!(!narrowed(
             &ts("timestamp without time zone"),
@@ -464,6 +469,23 @@ mod tests {
             &["id"],
         );
         assert_eq!(halts(taken), "SCHEMA_MISMATCH");
+        // Before the signal `a` dropped and `b` renamed to `a` (the stream has `id, a`); after
+        // it, `a` renamed to `x`, or dropped. Placing `a` as dropped since the signal would read
+        // as `DropColumn b`.
+        let replaced = vec![
+            ColumnSchema::new("id", V::Int32, "integer"),
+            ColumnSchema::new("a", V::Int32, "integer"),
+        ];
+        let renamed = table(vec![id(), col("x", V::Int32, "integer", 3)], &["id"]);
+        assert_eq!(
+            scope(&base(), &replaced, &renamed).unwrap_err().code(),
+            "SCHEMA_MISMATCH"
+        );
+        let dropped = table(vec![id()], &["id"]);
+        assert_eq!(
+            scope(&base(), &replaced, &dropped).unwrap_err().code(),
+            "SCHEMA_MISMATCH"
+        );
         // Before the signal, `a` → `x` then `b` → `a`: the stream has the new names, and the
         // placement fits.
         let before = vec![
