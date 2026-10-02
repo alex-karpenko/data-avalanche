@@ -10,6 +10,7 @@ mod error;
 pub mod pgoutput;
 mod position;
 mod slot;
+mod snapshot;
 mod stream;
 #[cfg(test)]
 mod test_support;
@@ -19,4 +20,5 @@ pub mod value;
 
 pub use connect::{APPLICATION_NAME, SESSION_OPTIONS};
 pub use connector::{MIN_SERVER_VERSION, PgConnector};
+pub use snapshot::FETCH_BATCH;
 pub use stream::{PG_EPOCH_MICROS, PgStream};
