@@ -1,5 +1,5 @@
 ---
-updated: 2026-09-26
+updated: 2026-10-02
 domain: Architecture
 tags: [gap-analysis, design, re-derivation, spec-readiness, blockers, open-decisions]
 resolves: []
@@ -1472,3 +1472,21 @@ min/max; MySQL/MariaDB all-zero dates → NULL, zero-in-part or impossible dates
 
 **Result:** no gap status changes. One question remains open for M9 planning: Q-M9-2 (resolving a
 job ID to its pipeline for `GET /v1/snapshots/{job_id}`).
+
+## 27. M5 PostgreSQL source — carried from its whole-branch review (2026-10-02)
+
+M5 (`doc/v1.0/M5-pg-source.md`) built `data-avalanche-source-pg`. Its rulings are the plan's
+Decisions table (Q-M5-1…Q-M5-20, D-M5.1…D-M5.19). The whole-branch review's Critical and Important
+findings were fixed before the PR (Q-M5-20), except the watermark, which needs M6's merge window
+and a spec amendment. These are the items it carried.
+
+### 27.1 New gaps
+
+| ID | Title | Sev | Status | Note |
+|---|---|---|---|---|
+| DA-SNAP-9 | The snapshot watermark can't order a chunk's MVCC snapshot against the stream | 🟡 | 🆕 🟥 | `pg_current_wal_lsn()` watermarks miss a commit whose WAL precedes `lw` but which isn't visible to the chunk yet (synchronous replication widens it): a stale chunk row can overwrite a newer streamed change. Fix in M6: watermarks from `pg_current_snapshot()` in `Chunk`, the window by xid; amend Snapshot_Resumability §1. Reasoned, not measured. |
+| DA-SRC-13 | Publication blind spots | 🟢 | 🆕 🟥 | Unchecked at reconcile: PG15+ row filters and column lists (a column list makes channel C halt at every signal), PG18 `publish_generated_columns`, extra tables under `require_existing` / `FOR ALL TABLES` (D-M5.14 says warn), a managed `DROP TABLE` of a `TABLES IN SCHEMA` member (42704), `via_root` refused when only the leaf is published, the old publication after a rename. |
+| DA-SRC-14 | `bit` / `varbit` / PostGIS keys | 🟢 | 🆕 🟥 | `text_of` isn't valid input for those types, so a snapshot's second chunk fails `Permanent`. Refuse such keys at resolution, or render them. |
+| DA-SRC-15 | Snapshot collation and chunk edges | 🟢 | 🆕 🟥 | A domain with its own collation in a column declared with another (42P22 from the second chunk); the cursor's collation name isn't schema-qualified; a `COLLATE "C"` identity index on a non-C column isn't warned; no byte budget per chunk; `limit` 0 reads as the end; no `E''` literals. |
+| DA-SRC-16 | The replication connection's timeouts | 🟢 | 🆕 🟥 | `pgwire-replication` sets no TCP keep-alive, connect timeout or idle deadline: a black-holed peer stalls `next` until the kernel gives up. M6: a watchdog of a few heartbeats; read-ahead is 8192 events, not bytes (`with_buffer_size`). |
+| DA-SRC-17 | Source edges PostgreSQL doesn't produce, and small gaps | 🟢 | 🆕 🟥 | Crafted date/time text can overflow `i64`; loose parsing; hstore/PostGIS matched by name; no cycle guard in type planning; `convert` without a scale guard; a `string` override on a `"char"` above 127 halts on PG14 only; `char(n)` under `string` keeps its spaces; an interval's fields narrowed aren't seen; the catalog driver's errors and the server's detail aren't reported (no logging in the crate yet); a retry after dropping an invalidated orphan reports `FirstStart`; only the first V-113 error; a standby isn't refused by name; a glob table set `UNLOGGED` mid-resolve halts. |
