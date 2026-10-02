@@ -163,6 +163,7 @@ the arrow.
 | Q-M5-19 (2026-10-02, during execution) | Task 12's re-review: the Delta sink clamps every `date` / `timestamp` cell to the Delta range in Hop 3b (Q-M4-2), keys included, so distinct keys still merged: BC keys, keys from 10000 AD, and `±infinity` against the bounds | **The Delta sink halts the table (`Permanent`) on an identifier cell outside the Delta range, `±infinity` keys included; other columns still clamp** |
 | Q-M5-20 (2026-10-02, whole-branch review) | The whole-branch review: a table dropped and created again under its name stopped replicating silently (channels A, C and D found tables by name; a restart left ghost rows); a timed-out catalog statement kept the shared connection, and a publication change could commit after its reply was lost; a table dropped under the snapshot, or a NULL key, stopped the pipeline; a primary key changed under REPLICA IDENTITY FULL never signalled; the snapshot watermark can't order a chunk against a commit visible after its WAL record | **`TableSchema` carries the source's table identity (`source_id`, PostgreSQL: the OID): another OID under the name is `TABLE_DROPPED` in channels B, C, D and the snapshot; a timeout drops and cancels the catalog connection, and the publication change runs under server-side lock and statement timeouts; 42P01 and a NULL key halt the table; every Relation message of a FULL table signals; the watermark goes to M6 (DA-SNAP-9)** |
 | Q-M5-21 (2026-10-02, whole-branch review, second round) | The scoped re-review of the first round: a tracked table renamed away and back lost the writes made in between; rows with a NULL key past the first chunk were skipped silently; the snapshot's OID check missed a table re-created with none of the cached columns, and a dropped schema; a timeout could abandon a connection its call didn't use; the publication batch could outlast its client budget; rescan flagged a schema without `source_id` as changed every scan | **A Relation message with a tracked table's OID under an untracked name halts that table (`TABLE_DROPPED`); an identifier column that is nullable now halts the table (`IDENTIFIER_NOT_USABLE`); the snapshot resolves the OID first (`to_regclass`) and reads the columns by it; a timeout abandons only the connection its call started on; the batch's budget is `command` × statements + 5 s; rescan compares without the identity when the cache has none** |
+| Q-M5-22 (2026-10-02, whole-branch review, third round) | The scoped re-review of the second round: PostgreSQL 18 sets `attnotnull` under `NOT NULL … NOT VALID`, though older rows may still be NULL, so an override key on such a column passed resolve and the snapshot's check, and the snapshot skipped its NULL rows; the dropped-schema case had no test; `bounded` takes the connection-cache lock before its timer starts | **An unvalidated not-null constraint counts as nullable (`catalog::NOT_NULL`, in `describe` and `read_plan`); a dropped-schema case in the snapshot test; the lock wait goes to the gap tracker (DA-SRC-17)** |
 
 **Rulings where the specs are silent** (each is pinned by a test). **Plan approved 2026-10-01**, with these rulings (roadmap D-IMPL-12):
 
@@ -13359,9 +13360,9 @@ git commit -m "test(source-pg): TLS end to end, and PostgreSQL 14-17 nightly"
 
 ## Verified during planning (2026-10-01)
 
-Measured again at the end of execution (2026-10-02, after the whole-branch review's two fix
-rounds): PostgreSQL 18 with `postgres-tls` passes 52 integration tests; PostgreSQL 14–17 pass 48
-each and `slot_invalidation`; `cargo test --workspace` passes 665. The counts below are the
+Measured again at the end of execution (2026-10-02, after the whole-branch review's three fix
+rounds): PostgreSQL 18 with `postgres-tls` passes 53 integration tests; PostgreSQL 14–17 pass 49
+each and `slot_invalidation`; `cargo test --workspace` passes 666. The counts below are the
 planning replay's.
 
 The task blocks above were replayed in order on a fresh clone of the milestone branch
@@ -13887,3 +13888,28 @@ Measured on the verified workspace after the second round:
 - PostgreSQL 14–17 pass 48 each, and `slot_invalidation` passes.
 - No slots are left on any server.
 - `cargo test --workspace` passes 665.
+
+**The whole-branch review, third round** (Q-M5-22, commit `0d74f27`). The scoped re-review of the
+second round found every item addressed, with no regression, and three new minor items. The
+owner approved the following (2026-10-02):
+
+- **A key under `NOT NULL … NOT VALID` (PostgreSQL 18) still skipped its NULL rows.** PostgreSQL
+  18 sets `attnotnull` under an unvalidated not-null constraint, though rows from before it may
+  still be NULL (measured: `attnotnull = t`, `convalidated = f`). An override key on such a column
+  passed resolve and N8's check. `catalog::NOT_NULL` treats such a column as nullable, in
+  `describe` (so resolve, augment and rescan see it) and in `read_plan`. Before 18 no not-null
+  constraint is catalogued, so the test never matches there. Test:
+  `a_not_null_constraint_not_validated_is_nullable`, at resolve and in a snapshot read. It
+  returns early before PostgreSQL 18. Undoing either use makes it fail.
+- **The dropped-schema case had no test.** `a_dropped_table_or_a_null_key_halts_only_its_table`
+  drops the schema at its end: `read_chunk` and `fetch_rows` halt `TABLE_DROPPED`. With the OID
+  read by `::regclass` and 3F000 unmapped, only this assertion fails.
+- **Carried:** `bounded` takes the connection-cache lock before its timer starts, so a call
+  queued behind another task's reconnect waits longer than its budget. This affects latency only
+  (DA-SRC-17).
+
+Measured on the verified workspace after the third round:
+- PostgreSQL 18 with `postgres-tls` passes 53 integration tests.
+- PostgreSQL 14–17 pass 49 each, and `slot_invalidation` passes.
+- No slots are left on any server.
+- `cargo test --workspace` passes 666.
