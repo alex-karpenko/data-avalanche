@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-01
+updated: 2026-10-02
 domain: Architecture
 status: Specification (supersedes the Configuration_file_model.md draft)
 tags: [architecture, configuration, spec, validation, multi-sink, iceberg, delta-lake]
@@ -1182,11 +1182,19 @@ config), and any `warning` loads and logs. There is no partial or per-pipeline a
 statically-invalid config.
 
 The **Locus** column says *where* the problem is, so the validation endpoint can group its
-report (`config`-level vs a named `pipeline`) and point the operator to the right place. A
-`pipeline`-locus **error still rejects the whole config** — locus is diagnostic, not a blast
-radius. `reload` locus marks a rule that can only fire on reload. A diagnostic for a value written
-in `defaults` (§8.6) has locus `config` and a `defaults.…` path, whatever the rule's Locus column
-says: that column describes the rule as it applies to a pipeline.
+report (`config`-level vs a named `pipeline`) and point the operator to the right place. It takes
+one of four values:
+
+- `config`: the config as a whole;
+- `pipeline`: a named pipeline;
+- `config / pipeline`: either, wherever the value is written (an unset `${VAR}`, V-063);
+- `reload`: a rule that can only fire on reload.
+
+The column doesn't say when a rule runs (at startup, at schema resolution); the rule's text and
+section do. A `pipeline`-locus **error still rejects the whole config** — locus is diagnostic, not
+a blast radius. A diagnostic for a value written in `defaults` (§8.6) has locus `config` and a
+`defaults.…` path, whatever the rule's Locus column says: that column describes the rule as it
+applies to a pipeline.
 
 A diagnostic that no V-rule covers carries `PARSE` or `TYPE` in place of a rule ID. `PARSE` covers
 YAML syntax or structure, an unknown key, and a required field with no rule of its own. `TYPE`
@@ -1288,7 +1296,7 @@ errors.
 | V-098 | `globals.tracing.sample_ratio > 0` without `otlp_endpoint` | Sampling configured but tracing disabled. | warning | config |
 | V-103 | `source.postgres.slot_management = require_existing` | Requires `auto_cleanup = false` (the app must not drop a slot it did not create). | error | pipeline |
 | V-106 | `tables.primary_key` / `tables.partitioning` keys | Same key form as `snapshots.overrides` (full `schema.table` / MySQL bare name, no globs — V-033/V-064); column lists non-empty. A key not in the resolved table set → `warning` (as V-034). | error / warning | pipeline |
-| V-113 | `sink.iceberg.catalog.glue.strip_schema = true` | Two resolved tables share a bare name across schemas. Evaluated when the table set is resolved (start / table-set change); refuses the pipeline naming the collision. | error | pipeline (resolution) |
+| V-113 | `sink.iceberg.catalog.glue.strip_schema = true` | Two resolved tables share a bare name across schemas. Evaluated when the table set is resolved (start / table-set change); refuses the pipeline naming the collision. | error | pipeline |
 | V-077 | `source.toast_strategy = re_query` with `tables.snapshots.mode = always` | `re_query` on high-volume snapshots may saturate the control connection pool. | warning | pipeline |
 
 ### 13.5 Catalog authentication (the 9 rules from `Catalog_Auth_Research.md`)
@@ -1334,9 +1342,9 @@ errors.
 | ID | Path / Scope | Rule | Severity | Locus |
 |---|---|---|---|---|
 | V-061 | any PROC-class field | Changed during a live reload. | error | reload |
-| V-062 | `globals.cluster.tokens` | Differs from the cluster-established value in `globals.state`. | error | config (startup) |
-| V-076 | `globals.cluster.lock_backend` | Differs from the cluster-established value in the `globals.state` anchor. | error | config (startup) |
-| V-094 | `globals.cluster.lease_duration` | Differs from the cluster-established value in the `globals.state` anchor (`lease_duration_ms`). | error | config (startup) |
+| V-062 | `globals.cluster.tokens` | Differs from the cluster-established value in `globals.state`. | error | config |
+| V-076 | `globals.cluster.lock_backend` | Differs from the cluster-established value in the `globals.state` anchor. | error | config |
+| V-094 | `globals.cluster.lease_duration` | Differs from the cluster-established value in the `globals.state` anchor (`lease_duration_ms`). | error | config |
 
 ### 13.9 Resolution / materialization (Phase 2 — §11)
 
