@@ -56,6 +56,17 @@ pub enum Decode {
     },
 }
 
+impl Decode {
+    /// Whether this reads a `"char"` (directly or before a conversion).
+    pub(crate) fn reads_char(&self) -> bool {
+        match self {
+            Decode::Char => true,
+            Decode::Convert { from, .. } => from.reads_char(),
+            _ => false,
+        }
+    }
+}
+
 /// Why a value can't be decoded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValueError {

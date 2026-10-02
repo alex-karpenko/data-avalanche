@@ -112,6 +112,9 @@ pub struct Attribute {
     pub not_null: bool,
     /// `format_type(atttypid, atttypmod)`.
     pub type_text: String,
+    /// The column's collation when it is nondeterministic: a snapshot orders such a key column
+    /// by `"C"` (Snapshot_Resumability §2).
+    pub nondeterministic: Option<String>,
 }
 
 /// A table as the catalog describes it.
@@ -139,6 +142,9 @@ pub struct Notes {
     pub read_as_text: Vec<(String, String)>,
     /// `numeric` columns without a declared precision (V-079).
     pub unconstrained: Vec<String>,
+    /// Identifier columns in a nondeterministic collation: `(column, collation)`. Snapshot chunks
+    /// order them by `"C"`, which their index doesn't serve.
+    pub c_ordered_keys: Vec<(String, String)>,
 }
 
 /// The replica identity's columns.
@@ -206,6 +212,16 @@ pub fn table_schema(
         .collect();
     if !missing.is_empty() {
         return Err(HaltReason::IdentifierNotInReplicaIdentity { missing });
+    }
+    for k in schema.identifier() {
+        if let Some(collation) = d
+            .columns
+            .iter()
+            .find(|a| &a.name == k)
+            .and_then(|a| a.nondeterministic.clone())
+        {
+            notes.c_ordered_keys.push((k.clone(), collation));
+        }
     }
     for f in tables.partitioning.get(&key).into_iter().flatten() {
         let temporal = !matches!(
@@ -326,8 +342,10 @@ pub async fn describe(
     for r in client
         .query(
             "SELECT a.attrelid, a.attnum, a.attname, a.atttypid, a.atttypmod, a.attnotnull,
-                    pg_catalog.format_type(a.atttypid, a.atttypmod)
+                    pg_catalog.format_type(a.atttypid, a.atttypmod),
+                    CASE WHEN NOT co.collisdeterministic THEN co.collname::text END
                FROM pg_catalog.pg_attribute a
+               LEFT JOIN pg_catalog.pg_collation co ON co.oid = a.attcollation
               WHERE a.attrelid = ANY($1) AND a.attnum > 0 AND NOT a.attisdropped
                 AND a.attgenerated = ''
               ORDER BY a.attrelid, a.attnum",
@@ -343,6 +361,7 @@ pub async fn describe(
                 typmod: r.get(4),
                 not_null: r.get(5),
                 type_text: r.get(6),
+                nondeterministic: r.get(7),
             });
         }
     }
@@ -517,6 +536,7 @@ mod tests {
             typmod,
             not_null,
             type_text: text.into(),
+            nondeterministic: None,
         }
     }
 
@@ -561,6 +581,20 @@ mod tests {
             "bare numeric under `string`"
         );
         assert_eq!(notes.unconstrained, ["amount"]);
+        assert!(notes.c_ordered_keys.is_empty());
+    }
+
+    #[test]
+    fn keys_in_a_nondeterministic_collation_are_noted() {
+        let mut d = orders(b'i');
+        d.columns[1].nondeterministic = Some("ci".into());
+        let over = "      primary_key: { public.orders: [code] }";
+        let (_, notes) = schema_of(&d, over).unwrap();
+        assert_eq!(notes.c_ordered_keys, [("code".into(), "ci".into())]);
+        let mut full = orders(b'f');
+        full.columns[1].nondeterministic = Some("ci".into());
+        let (_, notes) = schema_of(&full, "").unwrap();
+        assert!(notes.c_ordered_keys.is_empty(), "only identifier columns");
     }
 
     #[test]

@@ -100,15 +100,6 @@ struct Known {
     halted: bool,
 }
 
-/// Whether `decode` reads a `"char"` (directly or before a conversion).
-fn reads_char(decode: &Decode) -> bool {
-    match decode {
-        Decode::Char => true,
-        Decode::Convert { from, .. } => reads_char(from),
-        _ => false,
-    }
-}
-
 /// The stream of one `open_stream` call.
 pub struct PgStream {
     client: ReplicationClient,
@@ -449,7 +440,7 @@ impl PgStream {
                         Ok(text) => Cow::Borrowed(text),
                         // PostgreSQL 14 sends a `"char"` byte above 127 as itself; 15 and later
                         // send `\ooo`.
-                        Err(_) if bytes.len() == 1 && reads_char(&c.decode) => {
+                        Err(_) if bytes.len() == 1 && c.decode.reads_char() => {
                             Cow::Owned(format!("\\{:03o}", bytes[0]))
                         }
                         Err(_) => {

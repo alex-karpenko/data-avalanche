@@ -188,6 +188,13 @@ impl PgConnector {
                         out.warnings
                             .push(format!("{key}.{column}: {ty} is read as text"));
                     }
+                    for (column, collation) in notes.c_ordered_keys {
+                        out.warnings.push(format!(
+                            "{key}.{column}: the key's collation {collation} is nondeterministic, \
+                             so snapshot chunks order it by \"C\": each chunk scans the table \
+                             unless an index has ({column} COLLATE \"C\")"
+                        ));
+                    }
                     unconstrained.extend(
                         notes
                             .unconstrained
