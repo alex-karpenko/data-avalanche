@@ -227,7 +227,7 @@ impl ColumnSchema { pub fn new(name, value_type, source_type) -> Self /* canonic
 pub fn canonical_logical(t: &ColumnValueType) -> LogicalType;             // UInt64 → decimal(20,0), …
 pub fn hop2_compatible(value_type: &ColumnValueType, logical: &LogicalType) -> bool;   // an override Hop 2 can store
 
-pub struct TableSchema { /* private: table, columns, identifier */ }
+pub struct TableSchema { /* private: table, columns, identifier, source_id */ }
 impl TableSchema {
     // Checks, in order: no reserved name; a non-empty identifier; identifier columns listed once, present,
     // NOT NULL, non-floating, primitive; unique names; every logical type hop2_compatible.
@@ -235,6 +235,9 @@ impl TableSchema {
     pub fn table(&self) -> &TableRef; pub fn columns(&self) -> &[ColumnSchema]; pub fn identifier(&self) -> &[String];
     pub fn column(&self, name: &str) -> Option<&ColumnSchema>; pub fn index_of(&self, name: &str) -> Option<usize>;
     pub fn is_identifier(&self, name: &str) -> bool;
+    // The source's identity of the table (PostgreSQL: the relation OID); another one under the name
+    // is a dropped table (Q-M5-20). Kept in the cached schema.
+    pub fn with_source_id(self, id: u64) -> Self; pub fn source_id(&self) -> Option<u64>;
 }
 pub enum HaltReason {                        // code(): the SCREAMING_SNAKE name, e.g. NULL_IDENTIFIER
     ReservedColumnCollision { column }, TableDropped, UnsafeDdl { detail }, NoIdentifier,
@@ -787,6 +790,19 @@ Detailed plan: `M0-foundations.md`.
   - Keep-alives can arrive often (each heartbeat, and on every server keep-alive); don't do per-item
     work that assumes they are rare.
   - `toast_strategy: re_query` calls `fetch_rows` (Q-M5-6).
+  - Persist each cached `TableSchema` with its `source_id` (Q-M5-20): a table dropped and created
+    again while the pipeline is down is found only against the identity the cache kept.
+  - Record the tables a `prepare` will add before calling it: a reply lost after the publication
+    change committed reports nothing on the retry (Q-M5-20, I2).
+  - The snapshot's merge window (DA-SNAP-9): a chunk's watermarks must order its MVCC snapshot
+    against the stream, by `pg_current_snapshot()`, not the WAL position alone; amend
+    Snapshot_Resumability §1.
+  - A stream's `close` can fail (its catalog connection dead) and waits up to `timeouts.command`
+    while another walsender holds the slot: the teardown tolerates both.
+  - The replication connection has no keep-alive or idle deadline: a watchdog on `next` (a few
+    heartbeats) ends a stalled stream so it reopens.
+  - Under REPLICA IDENTITY FULL every Relation message signals (Q-M5-20): about one channel C read
+    per FULL table per session.
 - **Deps:** M1, M2, M3, M4, M5.
 - **Exit:** the **slice-1 E2E suite** passes on PG 18 + RustFS and nightly on PG 14–17. See §5.3 for
   the scenario list.
@@ -1133,6 +1149,7 @@ the naming below (2026-09-26).**
 | Q-M5-17 (2026-10-02) | Task 11's review: channel C placed columns by the catalog's current names (a rename after the signal gave a silent wrong delta); a table set `UNLOGGED` went unnoticed; §7.2 vs the code on replica identity | **A placement that is a guess halts; a later drop keeps its `attnum`; unlogged tables halt in C and D; §7.2 amended (only the identifier halts)** | `Schema_Change…` §7.2; `M5-pg-source.md` D-M5.18, D-M5.19, Deviations, Task 11 |
 | Q-M5-18 (2026-10-02) | Task 12's review: a timestamp key past the i64 microseconds clamps to the value of `'infinity'`, so distinct keys merge and a snapshot ends early | **An identifier value that clamps halts the table (`SCHEMA_MISMATCH`); `±infinity` and other columns unchanged** | `Type_Mapping.md` §Date/time edge values; `M5-pg-source.md` Q-M5-1, Deviations, Tasks 4, 9, 10, 12 |
 | Q-M5-19 (2026-10-02) | Task 12's re-review: the Delta sink clamps key cells to the Delta range (Q-M4-2), so distinct keys merge (BC, 10000 AD on, `±infinity` against the bounds) | **The Delta sink halts the table on an identifier cell outside the Delta range; other columns still clamp** | `Type_Mapping.md` §Date/time edge values; `data-avalanche-sink-delta` `merge_source`; `M5-pg-source.md` Deviations |
+| Q-M5-20 (2026-10-02) | The whole-branch review: a re-created table stopped replicating silently; a timed-out catalog statement kept the shared connection; one table's failure stopped a snapshot; a key changed under REPLICA IDENTITY FULL never signalled | **`TableSchema.source_id` (the OID) tells a re-created table; timeouts drop and cancel the connection, the publication change runs under server-side timeouts; those failures halt the table; every FULL Relation message signals; the watermark goes to M6 (DA-SNAP-9)** | `M5-pg-source.md` Q-M5-20, Deviations; §3 `TableSchema`; M6 "Carried from M5" |
 | Q-M9-1 | Snapshot-job persistence | **Persisted in the pipeline state location** (`snapshots/jobs/<job_id>.json`); listed after a restart or failover via `GET /v1/pipelines/{id}/snapshots`; a running job continues on the new owner from its chunk cursors | `Data-Flow.md` §On-Demand Snapshot + State Layout; System-Overview and API_RBAC endpoint tables |
 
 ### 9.2 Open questions (answer before the named milestone)

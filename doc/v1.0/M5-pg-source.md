@@ -161,6 +161,7 @@ the arrow.
 | Q-M5-17 (2026-10-02, during execution) | Task 11's review: with the catalog ahead of the stream, `scope` placed columns by their current names, so a rename chain or a swap after the signal gave a silent wrong delta; a table set `UNLOGGED` (allowed under `FOR ALL TABLES`) went unnoticed; an add/backfill/drop migration halted; `Schema_Change…` §7.2 halted on any replica identity change, the code only on an identifier change | **A placement that is a guess halts; a column dropped since the signal keeps its `attnum`; an unlogged table doesn't plan (C and D halt it); §7.2 amended: only the identifier, or a replica identity that no longer covers it, halts** |
 | Q-M5-18 (2026-10-02, during execution) | Task 12's review: a timestamp key past the microseconds a timestamp holds (294247–294276 AD, or a `date` converted past it) clamps to `i64::MAX`, the same value as `'infinity'`: distinct keys merge into one identifier, and a snapshot cursor there ends the scan early (measured: 2 of 4 rows) | **An identifier value that clamps halts the table (`SCHEMA_MISMATCH`), in the stream and in the snapshot; `±infinity` keys and other columns are unchanged; the type round trip gains the missing edge values and overrides** |
 | Q-M5-19 (2026-10-02, during execution) | Task 12's re-review: the Delta sink clamps every `date` / `timestamp` cell to the Delta range in Hop 3b (Q-M4-2), keys included, so distinct keys still merged: BC keys, keys from 10000 AD, and `±infinity` against the bounds | **The Delta sink halts the table (`Permanent`) on an identifier cell outside the Delta range, `±infinity` keys included; other columns still clamp** |
+| Q-M5-20 (2026-10-02, whole-branch review) | The whole-branch review: a table dropped and created again under its name stopped replicating silently (channels A, C and D found tables by name; a restart left ghost rows); a timed-out catalog statement kept the shared connection, and a publication change could commit after its reply was lost; a table dropped under the snapshot, or a NULL key, stopped the pipeline; a primary key changed under REPLICA IDENTITY FULL never signalled; the snapshot watermark can't order a chunk against a commit visible after its WAL record | **`TableSchema` carries the source's table identity (`source_id`, PostgreSQL: the OID): another OID under the name is `TABLE_DROPPED` in channels B, C, D and the snapshot; a timeout drops and cancels the catalog connection, and the publication change runs under server-side lock and statement timeouts; 42P01 and a NULL key halt the table; every Relation message of a FULL table signals; the watermark goes to M6 (DA-SNAP-9)** |
 
 **Rulings where the specs are silent** (each is pinned by a test). **Plan approved 2026-10-01**, with these rulings (roadmap D-IMPL-12):
 
@@ -13357,6 +13358,11 @@ git commit -m "test(source-pg): TLS end to end, and PostgreSQL 14-17 nightly"
 
 ## Verified during planning (2026-10-01)
 
+Measured again at the end of execution (2026-10-02, after the whole-branch review's fixes):
+PostgreSQL 18 with `postgres-tls` passes 51 integration tests; PostgreSQL 14–17 pass 47 each
+and `slot_invalidation`; `cargo test --workspace` passes 663. The counts below are the
+planning replay's.
+
 The task blocks above were replayed in order on a fresh clone of the milestone branch
 (`origin/main` `9502c8c` plus the plan commits). The replay applied each task's files exactly as
 shown and ran each step's command. Every expected failure and every count above is that replay's
@@ -13382,18 +13388,18 @@ output. Outside `doc/`, the replayed tree equals the verified workspace. Measure
 
 The roadmap's M5 exit criteria, and where each is met:
 
-- [ ] **Every probe gate S-PG0…8 has a regression test, against PostgreSQL 18 on every change and
+- [x] **Every probe gate S-PG0…8 has a regression test, against PostgreSQL 18 on every change and
   PostgreSQL 14–17 nightly**:
   - S-PG0…S-PG6: Task 9 (`s_pg0_an_insert_round_trips` … `s_pg6_a_table_added_to_the_publication_mid_stream`);
   - S-PG7: Task 12 (`every_mapped_type_round_trips_through_stream_and_snapshot`);
   - S-PG8: Task 13 (`tls.rs`);
   - PostgreSQL 18 in `ci.yml`'s integration job; 14–17 in `nightly.yml` (Task 13).
-- [ ] **A type round-trip suite covers every mapped type**: Task 12, with Task 4's property tests
+- [x] **A type round-trip suite covers every mapped type**: Task 12, with Task 4's property tests
   for the date and timestamp ranges.
-- [ ] **The slot state-machine table is exercised cell by cell**: Task 8 (`decide`'s seven unit
+- [x] **The slot state-machine table is exercised cell by cell**: Task 8 (`decide`'s seven unit
   tests, and the integration cells: first start, resume, lost slot, orphan under each policy,
-  `require_existing`).
-- [ ] The M5 scope items not in the exit list, each with its test:
+  `require_existing`), and `slot_invalidation` (a slot the server invalidated).
+- [x] The M5 scope items not in the exit list, each with its test:
   - the pgoutput decoder (Task 3; text tuples only, Q-M5-3);
   - Hop 1 and the fallback chain, the numeric cap, array elements (Tasks 4, 5, 12);
   - the replication wrapper: session pinning, status interval, acknowledgment (Tasks 2, 9);
@@ -13402,22 +13408,22 @@ The roadmap's M5 exit criteria, and where each is met:
   - channels A, C and D (Tasks 6, 7, 11);
   - the keyset chunk reader and the watermark (Tasks 7, 10);
   - the `max_wal_lag_bytes` measure, `retained_bytes` (Task 8). The halt is M6's.
-- [ ] `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
+- [x] `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo fmt --all --check` and `RUSTDOCFLAGS="-D warnings" cargo doc -p data-avalanche-source-pg
   -p data-avalanche-core --no-deps` are clean.
-- [ ] The integration job of PR CI is green (`postgres-18` and `postgres-tls` included). The
-  by-hand matrix run of Task 13 is green on the final tree. `nightly.yml` is dispatched once on
+- [ ] The integration job of PR CI is green (`postgres-18` and `postgres-tls` included): open
+  until the PR runs. The by-hand matrix run is green on the final tree (above). `nightly.yml` is dispatched once on
   `main` after the merge.
-- [ ] Roadmap updates:
+- [x] Roadmap updates:
   - §2 and §3.6 (the contract in core, D-M5.1);
   - §2.1's pins;
   - §4 M5's scope notes and M6's "Carried from M5";
   - §5.2 and §5.4;
   - §9.1 Q-M5-2…10;
   - D-IMPL-12 for the rulings D-M5.1…19.
-- [ ] `Type_Mapping.md` records the numeric rules (D-M5.9, Q-M5-8), the `varbit` layout (Q-M5-9)
+- [x] `Type_Mapping.md` records the numeric rules (D-M5.9, Q-M5-8), the `varbit` layout (Q-M5-9)
   and the PostGIS form.
-- [ ] `doc/v1.0/README.md` lists this plan and its status.
+- [x] `doc/v1.0/README.md` lists this plan and its status.
 
 ## Deviations during execution
 
@@ -13758,3 +13764,65 @@ of round 1, owner decision Q-M5-19, 2026-10-02):
   converted to `timestamp_ntz`, a delete's old key, and the halt's detail.
   Measured on the verified workspace: PostgreSQL 14–18 pass 43 integration tests each and
   `slot_invalidation`. On the branch, `cargo test --workspace` passes 651.
+
+**The whole-branch review and its fixes** (`c7bda84`; owner decision Q-M5-20, 2026-10-02). The review
+(`opus`, every commit since `origin/main`) found one Critical, four Important and twenty Minor
+items; each finding below was confirmed in the code, and C1 and I3 were measured on PostgreSQL 18.
+- **C1: a table dropped and created again under its name stopped replicating silently.** Dropping
+  a table takes it out of the managed publication, so the stream never saw the new one, and
+  channels A, C and D found tables by name: `rescan` reported nothing. After a restart the
+  publication repair added the table back and asked for a snapshot over the dropped table's rows.
+  A rename swap behaved the same way whenever the session hadn't seen the table yet, as after every
+  reconnect. `TableSchema` now carries the source's identity of the table (`with_source_id`,
+  `source_id`; PostgreSQL fills the relation OID in `table_schema`, and channel C's schema keeps
+  the catalog's). Another OID under the name is `TABLE_DROPPED`: in `rescan`, in `augment`, in a
+  snapshot read (`read_plan` checks `attrelid`), and in the stream, which seeds each table's OID
+  binding from its schema. M6 persists the identity with the cached schema (roadmap, "Carried from
+  M5"). Tests: `a_table_dropped_and_created_again_is_dropped`,
+  `a_table_replaced_before_the_session_saw_it_halts`, core
+  `a_source_id_is_kept_and_tells_tables_apart`.
+- **I2: a timed-out statement kept the shared catalog connection.** `tokio-postgres` doesn't cancel
+  a statement whose future is dropped, so retries queued behind it, and an `ALTER PUBLICATION … ADD
+  TABLE` waiting on a lock committed after the client gave up: the retry found the table published
+  and reported nothing to snapshot. A client-side timeout on the shared connection now drops it and
+  sends the server a cancel (`Connector::bounded`), and the publication change runs under `SET LOCAL
+  lock_timeout` and `statement_timeout` (the client waits 5 s longer). Measured: the cancel alone is
+  racy (it returns once sent; with the lock released right after the timeout the change still
+  committed), so the server-side timeout is what holds; the test pins it
+  (`a_publication_change_blocked_by_a_lock_is_retried_whole`). A reply lost after the change
+  committed is still possible; M6 records the tables before `prepare` (roadmap).
+- **I3: one table's failure stopped the pipeline.** A table dropped under the snapshot (SQLSTATE
+  42P01) and a NULL key (a key column that lost `NOT NULL`) were `Permanent`; they halt the table
+  now (`TABLE_DROPPED`, `NULL_IDENTIFIER`). Test: `a_dropped_table_or_a_null_key_halts_only_its_table`.
+- **I4: a primary key changed under `REPLICA IDENTITY FULL` never signalled.** pgoutput flags every
+  column as a key under FULL, so the change showed nowhere in the stream, and channel D reports it
+  for freshness only. Every Relation message of a FULL table signals now, the first of a session
+  included (a key changed while the pipeline was down, or before a reconnect); channel C reads the
+  identifier from the catalog and finds `IdentifierChanged`. Cost: one catalog read per FULL table
+  per session and per DDL, and pgoutput sometimes sends a Relation message again after a cache
+  invalidation (measured: an extra signal in two full PostgreSQL 18 runs of nine; `key_and_identity_changes_signal`
+  allows it). Test: `channel_c_classifies_identity_changes` gains table `g`.
+- **I1: the snapshot watermark** (`pg_current_wal_lsn()`) can't order a chunk's MVCC snapshot
+  against a commit whose WAL record precedes the watermark but which isn't visible yet (synchronous
+  replication widens the window), so a stale chunk row could overwrite a newer streamed change. Not
+  measured (it needs a synchronous standby). The fix (watermarks from `pg_current_snapshot()`, which
+  `Chunk` would carry, and a Snapshot_Resumability §1 amendment) goes with M6's window logic:
+  DA-SNAP-9.
+- **Minors fixed:** the public types of `catalog`, `pgoutput`, `types` and `value` are re-exported
+  at the crate root, and `ValueError` and `PlanError` derive `thiserror`; inline PEMs are written
+  only for a TLS connection; a `next` cancelled while the ended worker was joined is `Transient`;
+  server-side timeouts are clamped to 1 ms … `i32::MAX` ms; core docs of `ResolvedTables` and
+  `KeysetCursor` match the code, and `tls.rs` cites D-M5.16; the Delta sink checks a set's keys
+  (`check_keys`) before a truncate's DELETE, so a key outside its range doesn't leave the table
+  cleared (`a_truncate_set_with_a_key_outside_the_delta_range_changes_nothing`); the TLS tests run
+  one at a time, pin each refusal's reason (`UnknownIssuer`, SQLSTATE 28000) and the client
+  certificate's sessions; `postgres-tls.sh` shows `openssl`'s errors and says why `client.key` is
+  `644` and when the role is created.
+- **Minors carried** to the gap tracker (§27) and the roadmap's M6 notes: publication blind spots,
+  bit/varbit/PostGIS keys, snapshot collation edges, the replication connection's timeouts, the
+  close of a stream whose catalog connection is dead, overrides on `"char"` text, defensive parsing,
+  the driver's errors (the crate has no logging yet), and small test gaps.
+
+Measured on the verified workspace: PostgreSQL 18 with `postgres-tls` passes 51 integration
+tests, PostgreSQL 14–17 pass 47 each and `slot_invalidation`; `cargo test --workspace` passes 663.
+Each fix's test fails with that fix undone.
