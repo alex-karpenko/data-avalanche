@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-01
+updated: 2026-10-02
 domain: Architecture
 tags: [v1, implementation-plan, roadmap, milestones, workspace, crates, interfaces, test-strategy, ci, risks]
 sources: []
@@ -406,7 +406,7 @@ pub trait SourceConnector: Send + Sync {                    // built from the re
 }
 #[async_trait]
 pub trait ChangeStream: Send {
-    async fn next(&mut self) -> Result<StreamItem, SourceError>;                   // an error ends the stream
+    async fn next(&mut self) -> Result<StreamItem, SourceError>;                   // an error ends the stream; cancel-safe
     async fn acknowledge(&mut self, durable: &SourcePosition) -> Result<(), SourceError>;  // PG status update; MySQL no-op
     async fn close(self: Box<Self>) -> Result<(), SourceError>;
 }
@@ -776,6 +776,8 @@ Detailed plan: `M0-foundations.md`.
     retried `prepare` no longer reports them.
   - A quick restart can meet `55006` (the slot is still active for the old walsender, up to
     `wal_sender_timeout`): retry it, bounded, while the lease is held.
+  - Open a stream only from a persisted checkpoint or the slot's own start: opening reports the
+    start position as flushed at once (Task 9 review).
   - The reconnect backoff: a stream error ends the stream, and the pipeline reopens it from the
     checkpoint (D-M5.4).
   - The `max_wal_lag_bytes` halt, comparing against `SourceConnector::retained_bytes` (V-104).
@@ -1123,6 +1125,7 @@ the naming below (2026-09-26).**
 | Q-M5-12 (2026-10-01) | A `column_type_overrides` entry had to equal the column's mapped type (except `string` and decimals): `int → int64` halted, and `timestamp_ntz_as: timestamp` had no per-column form | **Lossless conversions at Hop 1**, one table in core (`conversion`, `ColumnValue::convert`) for every source: integer widening, an integer to a decimal with room, `float32 → float64`, `timestamp_ntz ↔ timestamp_tz`, `date → timestamp_*`, lists element by element; anything else halts (`SCHEMA_MISMATCH`) | config §9.3; `Type_Mapping.md`; `M5-pg-source.md` Task 5b |
 | Q-M5-13 (2026-10-01) | PostgreSQL doesn't publish `UNLOGGED` tables; channel A selected them | **Skipped with a warning when a glob matched, halted (`TABLE_NOT_REPLICABLE`) when named** | config §11.2; `M5-pg-source.md` Deviations, Task 7 |
 | Q-M5-14 (2026-10-01) | Task 8's review: a publication repaired at start doesn't cover the WAL a resume replays; a mixed-case publication streamed nothing; WAL retention measured from `confirmed_flush`; managed pipelines sharing a publication; Phase 5 acknowledged before persisting | **Re-snapshot after a rewriting repair, `Prepared::added` for added tables, a quoted publication name, `restart_lsn`, V-059 an error under `managed`, persist before acknowledging** | §3.6; M6 carried items; Data-Flow Phase 5; config §13; `M5-pg-source.md` Deviations, Task 8 |
+| Q-M5-15 (2026-10-02) | Task 9's review: `next` not cancel-safe; channel B blind to key and replica identity changes; tables matched by name, not OID; PostgreSQL 14's raw `"char"` bytes; `close` before the slot's release | **A cancel-safe `next`; the replica identity compared; a parted name and OID halt (`TABLE_DROPPED`); the raw byte decodes; `close` waits for the release** | §3.6; `Schema_Change…` §7; `M5-pg-source.md` Deviations, Task 9 |
 | Q-M9-1 | Snapshot-job persistence | **Persisted in the pipeline state location** (`snapshots/jobs/<job_id>.json`); listed after a restart or failover via `GET /v1/pipelines/{id}/snapshots`; a running job continues on the new owner from its chunk cursors | `Data-Flow.md` §On-Demand Snapshot + State Layout; System-Overview and API_RBAC endpoint tables |
 
 ### 9.2 Open questions (answer before the named milestone)

@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-01
+updated: 2026-10-02
 domain: Data Flow
 tags: [v1, implementation-plan, m5, postgresql, pgoutput, logical-replication, slot, publication, snapshot, type-mapping, tls]
 resolves: []
@@ -155,6 +155,7 @@ the arrow.
 | Q-M5-12 (2026-10-01, during execution) | An override other than `string` or a decimal on a numeric column had to equal the mapped type: `int → int64` halted, and `timestamp_ntz_as: timestamp` had no per-column form | **Lossless conversions at Hop 1** (Task 5b): integer widening, an integer to a decimal with room, `float32 → float64`, `timestamp_ntz ↔ timestamp_tz`, `date → timestamp_*`, lists element by element, through one table in core for every source; anything else halts (`SCHEMA_MISMATCH`). Config §9.3 lists them |
 | Q-M5-13 (2026-10-01, during execution) | PostgreSQL doesn't publish `UNLOGGED` tables, but channel A selected them: a managed publication refused the pipeline, and under `FOR ALL TABLES` the table was snapshotted once and then never changed | **Like a table without an identifier**: a glob-matched unlogged table is skipped with a warning, a named one halts (`TABLE_NOT_REPLICABLE`, new in core). Config §11.2 lists the precondition |
 | Q-M5-14 (2026-10-01, during execution) | Task 8's review: pgoutput reads the publication as of each change's WAL position, so repairing it at start doesn't cover the WAL a `Resume` replays; a mixed-case publication name streamed nothing; `retained_bytes` measured from `confirmed_flush`; two pipelines on one managed publication drop each other's tables; Phase 5 acknowledged before persisting | **A repair that rewrites the publication re-snapshots (slot recreated); added tables are reported (`Prepared::added`) for M6 to snapshot; the publication name is quoted for pgoutput; `retained_bytes` from `restart_lsn`; V-059 is an error when a sharing pipeline is `managed`; Data-Flow Phase 5 persists before acknowledging** |
+| Q-M5-15 (2026-10-02, during execution) | Task 9's review: `next` lost a Relation message when `select!` cancelled it at a catalog query; channel B didn't see a primary key or replica identity change; tables were matched by name, so a renamed or swapped table went on silently; PostgreSQL 14 sends a `"char"` byte above 127 raw; `close` returned before the server released the slot | **`next` cancel-safe (the event kept until handled; catalog queries under `timeouts.command`); the replica identity compared in channel B; a name and OID that part halt the table (`TABLE_DROPPED`, `Schema_Change…` §7); the raw byte decodes; `close` waits for the slot's release** |
 
 **Rulings where the specs are silent** (each is pinned by a test). **Plan approved 2026-10-01**, with these rulings (roadmap D-IMPL-12):
 
@@ -820,7 +821,9 @@ pub trait SourceConnector: Send + Sync {
 /// The change stream of one [`SourceConnector::open_stream`] call.
 #[async_trait]
 pub trait ChangeStream: Send {
-    /// The next item. An error ends the stream; reopen from the checkpoint.
+    /// The next item. An error ends the stream; reopen from the checkpoint. Cancel-safe: the
+    /// event loop runs it in `tokio::select!` (Data-Flow Phase 2a), and a call dropped before it
+    /// returns loses nothing.
     async fn next(&mut self) -> Result<StreamItem, SourceError>;
 
     /// Tells the source that everything up to `durable` is committed to the sink, so it can free
@@ -7505,6 +7508,7 @@ git commit -m "feat(source-pg): the slot state machine and publication reconcili
 ### Task 9: The change stream
 
 **Files:**
+- Modify: `crates/data-avalanche-core/src/source.rs` (the `ChangeStream::next` doc: cancel-safe)
 - Modify: `crates/data-avalanche-source-pg/src/lib.rs`
 - Create: `crates/data-avalanche-source-pg/src/stream.rs`
 - Modify: `crates/data-avalanche-source-pg/tests/pg/main.rs`
@@ -7529,6 +7533,12 @@ publication name (Task 8's fix, C2). The stream turns pgoutput into `StreamItem`
 - A Relation message whose columns differ from the cached schema becomes a `SchemaSignal`. It is
   emitted with the next change's sequence, because Relation messages carry `wal_start` 0.
 - A table whose new columns can't be planned halts with `TableHalt` at the same point.
+- A changed replica identity (setting or key columns) signals too: the first Relation message
+  of a session against the opening identifier, later ones against the last (Q-M5-15).
+- A tracked table whose name and relation OID part within the session (renamed away, or
+  another table under its name) halts with `TABLE_DROPPED` (Q-M5-15).
+- `next` is cancel-safe: the event it is handling stays in the stream until handled.
+- `close` waits, up to `timeouts.command`, until the server releases the slot.
 - Tables outside the tracked set are dropped silently.
 - `acknowledge` sends the position as written, flushed and applied, and never moves it back.
 
@@ -7637,6 +7647,24 @@ mod tests {
             PgStream::row(&[col("t", false, Decode::Text)], vec![latin1], false).unwrap(),
             Err(HaltReason::SchemaMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn a_raw_char_byte_decodes() {
+        // PostgreSQL 14 sends "char" 0xC3 as the byte itself (measured).
+        let raw = || vec![Datum::Text(bytes::Bytes::from_static(&[0xc3]))];
+        assert_eq!(
+            PgStream::row(&[col("c", false, Decode::Char)], raw(), false).unwrap(),
+            Ok(Row(vec![("c".into(), ColumnValue::Int16(195))]))
+        );
+        let wider = Decode::Convert {
+            from: Box::new(Decode::Char),
+            to: ColumnValueType::Int64,
+        };
+        assert_eq!(
+            PgStream::row(&[col("c", false, wider)], raw(), false).unwrap(),
+            Ok(Row(vec![("c".into(), ColumnValue::Int64(195))]))
+        );
     }
 
     #[test]
@@ -7804,9 +7832,10 @@ pub fn connector(p: &Pipeline) -> PgConnector {
 
 /// The test's slot, publication and schema, dropped at the end of a passing test.
 pub async fn cleanup(admin: &Client, n: &Names) {
+    release(admin, &n.slot).await;
     admin
         .execute(
-            "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1 AND NOT active",
+            "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1",
             &[&n.slot],
         )
         .await
@@ -7818,6 +7847,30 @@ pub async fn cleanup(admin: &Client, n: &Names) {
         ))
         .await
         .expect("drop the test schema");
+}
+
+/// Waits until no walsender holds `slot`, terminating one that still does after 5 s (a stream
+/// dropped without `close`).
+pub async fn release(admin: &Client, slot: &str) {
+    for i in 0..100 {
+        let pid: Option<i32> = admin
+            .query_one(
+                "SELECT (SELECT active_pid FROM pg_replication_slots WHERE slot_name = $1)",
+                &[&slot],
+            )
+            .await
+            .expect("read the test slot")
+            .get(0);
+        let Some(pid) = pid else { return };
+        if i == 50 {
+            admin
+                .execute("SELECT pg_terminate_backend($1)", &[&pid])
+                .await
+                .expect("terminate the walsender");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("slot {slot} is still active");
 }
 
 /// `connector`'s resolved tables, by name.
@@ -7899,8 +7952,8 @@ use std::time::Duration;
 
 use data_avalanche_core::position::Lsn;
 use data_avalanche_core::{
-    CdcEvent, ChangeStream, ColumnValue as V, HaltReason, Op, Row, SchemaHint, SourceError,
-    SourcePosition, SourceSeq, StreamItem, TableRef,
+    CdcEvent, ChangeStream, ColumnValue as V, Decimal, HaltReason, Op, Row, SchemaHint,
+    SourceError, SourcePosition, SourceSeq, StreamItem, TableRef,
 };
 use data_avalanche_testkit::require_it;
 
@@ -8210,27 +8263,33 @@ async fn s_pg5_a_stalled_consumer_survives() {
     let n = fresh(&a, "s_pg5", "CREATE TABLE t (id bigint PRIMARY KEY);").await;
     let c = connector(&pipeline(&n, &["*"], "", ""));
     let (mut s, _, _) = first_stream(&c).await;
-    // Server-wide, so other tests' streams see it too: their status interval is 1 s.
+    // Server-wide, so other tests' streams see it too: their status interval is 1 s. The stalled
+    // half runs as its own task, so the setting is reset when it fails too.
     a.batch_execute("ALTER SYSTEM SET wal_sender_timeout = '3s'")
         .await
         .unwrap();
     a.batch_execute("SELECT pg_reload_conf()").await.unwrap();
-    // 10 000 changes overflow the client's 8 192-event buffer.
-    a.execute(
-        &format!(
-            "INSERT INTO {}.t SELECT g FROM generate_series(1, 10000) g",
-            n.schema
-        ),
-        &[],
-    )
-    .await
-    .unwrap();
-    tokio::time::sleep(Duration::from_secs(10)).await;
-    let items = collect(&mut s, 1, 60).await;
+    let schema = n.schema.clone();
+    let stalled = tokio::spawn(async move {
+        // 10 000 changes overflow the client's 8 192-event buffer.
+        admin()
+            .await
+            .execute(
+                &format!("INSERT INTO {schema}.t SELECT g FROM generate_series(1, 10000) g"),
+                &[],
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let items = collect(&mut s, 1, 60).await;
+        (s, items)
+    })
+    .await;
     a.batch_execute("ALTER SYSTEM RESET wal_sender_timeout")
         .await
         .unwrap();
     a.batch_execute("SELECT pg_reload_conf()").await.unwrap();
+    let (s, items) = stalled.unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()));
     assert_eq!(changes(&items).len(), 10_000);
     s.close().await.unwrap();
     cleanup(&a, &n).await;
@@ -8284,8 +8343,6 @@ async fn s_pg6_a_table_added_to_the_publication_mid_stream() {
     cleanup(&a, &n).await;
 }
 
-/// Channel B: a changed column list signals before the change that carries it; an unchanged one
-/// doesn't.
 /// Q-M5-5: partitions replicate as tables. A write through the parent arrives under its leaf, a
 /// row whose partition key moves it arrives as a delete in one leaf and an insert in the other, and
 /// a TRUNCATE of the parent truncates the leaves.
@@ -8367,6 +8424,8 @@ async fn partition_changes_arrive_under_their_leaves() {
     cleanup(&a, &n).await;
 }
 
+/// Channel B: a changed column list signals before the change that carries it; an unchanged one
+/// doesn't.
 #[tokio::test(flavor = "multi_thread")]
 async fn relation_changes_signal_before_the_next_change() {
     require_it!();
@@ -8600,6 +8659,189 @@ async fn a_mixed_case_publication_streams() {
         .unwrap();
     cleanup(&a, &n).await;
 }
+
+/// Channel B: a changed primary key or replica identity signals (channel C halts the table on
+/// an identifier change). A `"char"` byte above 127 decodes (PostgreSQL 14 sends it raw).
+#[tokio::test(flavor = "multi_thread")]
+async fn key_and_identity_changes_signal() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(
+        &a,
+        "stream_keys",
+        "CREATE TABLE t (id int PRIMARY KEY, code int NOT NULL, c \"char\");",
+    )
+    .await;
+    let c = connector(&pipeline(&n, &["*"], "", ""));
+    let (mut s, _, _) = first_stream(&c).await;
+    let sc = &n.schema;
+    each(
+        &a,
+        &[
+            format!("INSERT INTO {sc}.t VALUES (1, 1, chr(195)::\"char\")"),
+            format!("ALTER TABLE {sc}.t DROP CONSTRAINT t_pkey, ADD PRIMARY KEY (code)"),
+            format!("INSERT INTO {sc}.t VALUES (2, 2)"),
+            format!("ALTER TABLE {sc}.t REPLICA IDENTITY FULL"),
+            format!("INSERT INTO {sc}.t VALUES (3, 3)"),
+            format!("DELETE FROM {sc}.t WHERE code = 3"),
+        ],
+    )
+    .await;
+    let items = collect(&mut s, 4, 20).await;
+    let kinds: Vec<&str> = items
+        .iter()
+        .filter_map(|i| match i {
+            StreamItem::SchemaSignal { .. } => Some("signal"),
+            StreamItem::Change(_) => Some("change"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        ["change", "signal", "change", "signal", "change", "change"],
+        "no signal for the first Relation message: its key is the opening identifier"
+    );
+    let c = changes(&items);
+    assert_eq!(c[0].after.as_ref().unwrap().get("c"), Some(&V::Int16(195)));
+    assert_eq!(
+        c[3].before,
+        Some(row(&[
+            ("id", V::Int32(3)),
+            ("code", V::Int32(3)),
+            ("c", V::Null)
+        ])),
+        "REPLICA IDENTITY FULL: the whole old row"
+    );
+    s.close().await.unwrap();
+    cleanup(&a, &n).await;
+}
+
+/// A tracked table renamed away, or replaced by another table under its name, halts
+/// (`TABLE_DROPPED`): a re-created table doesn't resume (`Schema_Change…` §7).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_renamed_or_replaced_table_halts() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(
+        &a,
+        "stream_renames",
+        "CREATE TABLE t (id int PRIMARY KEY);
+         CREATE TABLE u (id int PRIMARY KEY);
+         CREATE TABLE u_new (id int PRIMARY KEY);",
+    )
+    .await;
+    let c = connector(&pipeline(&n, &["t", "u"], "", ""));
+    let (mut s, _, _) = first_stream(&c).await;
+    let sc = &n.schema;
+    each(
+        &a,
+        &[
+            format!("INSERT INTO {sc}.t VALUES (1)"),
+            format!("INSERT INTO {sc}.u VALUES (1)"),
+            format!("ALTER PUBLICATION {} ADD TABLE {sc}.u_new", n.publication),
+            format!("ALTER TABLE {sc}.t RENAME TO t_old"),
+            format!("INSERT INTO {sc}.t_old VALUES (2)"),
+            format!(
+                "BEGIN; ALTER TABLE {sc}.u RENAME TO u_old; ALTER TABLE {sc}.u_new RENAME TO u; COMMIT"
+            ),
+            format!("INSERT INTO {sc}.u VALUES (2)"),
+            format!("INSERT INTO {sc}.u_old VALUES (3)"),
+            format!("INSERT INTO {sc}.t_old VALUES (3)"),
+            format!("INSERT INTO {sc}.u VALUES (3)"),
+        ],
+    )
+    .await;
+    // Four transactions with items: two changes, two halts; the later ones are skipped.
+    let items = collect(&mut s, 4, 20).await;
+    let got: Vec<String> = items
+        .iter()
+        .filter_map(|i| match i {
+            StreamItem::Change(e) => Some(format!("change {}", e.table.name)),
+            StreamItem::TableHalt { table, reason, .. } => {
+                Some(format!("halt {} {}", table.name, reason.code()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [
+            "change t",
+            "change u",
+            "halt t TABLE_DROPPED",
+            "halt u TABLE_DROPPED"
+        ]
+    );
+    // Nothing more: the halted tables' later changes are skipped under either OID.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while let Ok(item) = tokio::time::timeout_at(deadline, s.next()).await {
+        let item = item.unwrap();
+        assert!(
+            matches!(
+                item,
+                StreamItem::KeepAlive(_) | StreamItem::Begin { .. } | StreamItem::Commit(_)
+            ),
+            "{item:?}"
+        );
+    }
+    s.close().await.unwrap();
+    cleanup(&a, &n).await;
+}
+
+/// `next` is cancel-safe: calls dropped at every await, the Relation message's catalog queries
+/// among them, lose nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn next_is_cancel_safe() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(&a, "stream_cancel", "CREATE TABLE t (id int PRIMARY KEY);").await;
+    let c = connector(&pipeline(&n, &["*"], "", ""));
+    let (mut s, _, _) = first_stream(&c).await;
+    let sc = &n.schema;
+    each(
+        &a,
+        &[
+            // A type the stream hasn't read yet: its Relation message queries the catalog.
+            format!("ALTER TABLE {sc}.t ADD COLUMN w numeric(7,3)"),
+            format!("INSERT INTO {sc}.t VALUES (1, 1.5)"),
+        ],
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await; // the events are in the client's buffer
+    let mut items = vec![];
+    let mut cancelled = 0;
+    let mut wait = Duration::from_micros(20);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !items.iter().any(|i| matches!(i, StreamItem::Change(_))) {
+        assert!(tokio::time::Instant::now() < deadline, "{items:?}");
+        match tokio::time::timeout(wait, s.next()).await {
+            Ok(item) => items.push(item.expect("stream item")),
+            Err(_) => {
+                cancelled += 1;
+                wait = (wait * 2).min(Duration::from_millis(200));
+            }
+        }
+    }
+    assert!(cancelled > 0, "no call was cancelled");
+    let kinds: Vec<&str> = items
+        .iter()
+        .filter_map(|i| match i {
+            StreamItem::SchemaSignal { .. } => Some("signal"),
+            StreamItem::Change(_) => Some("change"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(kinds, ["signal", "change"], "{items:?}");
+    assert_eq!(
+        changes(&items)[0].after,
+        Some(row(&[
+            ("id", V::Int32(1)),
+            ("w", V::Numeric(Decimal::parse("1.500").unwrap()))
+        ]))
+    );
+    s.close().await.unwrap();
+    cleanup(&a, &n).await;
+}
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -8624,9 +8866,17 @@ Add the implementation to `crates/data-avalanche-source-pg/src/stream.rs`, above
 //! messages → `StreamItem`s. Relation messages are channel B (`Schema_Change…` §3): a tracked
 //! table whose columns differ from what the stream last saw gets a `SchemaSignal` before its next
 //! change, at that change's position. A Relation message carries no position of its own: its
-//! `XLogData` start is 0 (measured on PostgreSQL 18, D-M5.3).
+//! `XLogData` start is 0 (measured on PostgreSQL 18, D-M5.3). A changed replica identity signals
+//! too, and a tracked table whose name and relation OID part within the session halts
+//! (`TABLE_DROPPED`, `Schema_Change…` §7).
+//!
+//! `next` is cancel-safe (Data-Flow Phase 2a runs it in `tokio::select!`): the event it is
+//! handling stays in the stream until handled, so a call dropped at a Relation message's catalog
+//! query handles the message again on the next call.
 
-use std::collections::{HashMap, VecDeque};
+use std::borrow::Cow;
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use data_avalanche_config::Tables;
@@ -8640,8 +8890,9 @@ use pgwire_replication::{ReplicationClient, ReplicationEvent};
 use tokio_postgres::Client;
 
 use crate::catalog::{load_types, table_key};
+use crate::connect::within;
 use crate::connector::PgConnector;
-use crate::error::{protocol, replication_error, sql_error};
+use crate::error::{protocol, replication_error};
 use crate::pgoutput::{Datum, Message, OldKind, RelationColumn, decode};
 use crate::position::{from_wire, lsn_of, to_wire};
 use crate::types::{TypeCatalog, plan_column};
@@ -8694,6 +8945,34 @@ fn shape_of(columns: &[ColumnSchema]) -> Shape {
         .collect()
 }
 
+/// The replica identity of a Relation message: its setting (`d` default, `n` nothing, `f` full,
+/// `i` index) and the columns it flags as key.
+type Identity = (u8, BTreeSet<String>);
+
+/// What the stream knows about a table it was opened for.
+#[derive(Debug)]
+struct Known {
+    /// Its shape when the stream last saw it.
+    shape: Shape,
+    /// Its identifier when the stream opened.
+    identifier: BTreeSet<String>,
+    /// Its replica identity in its last Relation message of this session.
+    identity: Option<Identity>,
+    /// Its relation OID, bound by its first Relation message of this session.
+    oid: Option<u32>,
+    /// Halted: its changes are skipped, under any OID.
+    halted: bool,
+}
+
+/// Whether `decode` reads a `"char"` (directly or before a conversion).
+fn reads_char(decode: &Decode) -> bool {
+    match decode {
+        Decode::Char => true,
+        Decode::Convert { from, .. } => reads_char(from),
+        _ => false,
+    }
+}
+
 /// The stream of one `open_stream` call.
 pub struct PgStream {
     client: ReplicationClient,
@@ -8701,12 +8980,17 @@ pub struct PgStream {
     catalog: Client,
     types: TypeCatalog,
     tables: Tables,
-    /// The shape each tracked table had when the stream last saw it.
-    shapes: HashMap<TableRef, Shape>,
+    /// The tables the stream was opened for.
+    known: HashMap<TableRef, Known>,
     relations: HashMap<u32, RelationState>,
     type_names: HashMap<(u32, i32), String>,
     txn: Option<Txn>,
     pending: VecDeque<StreamItem>,
+    /// The event `next` is handling, until it is handled (cancel safety).
+    inflight: Option<ReplicationEvent>,
+    slot: String,
+    /// `timeouts.command`: the catalog queries, and the wait for the slot's release.
+    command: Duration,
     start: Lsn,
     acknowledged: Lsn,
 }
@@ -8716,7 +9000,7 @@ impl std::fmt::Debug for PgStream {
         f.debug_struct("PgStream")
             .field("start", &self.start)
             .field("acknowledged", &self.acknowledged)
-            .field("tables", &self.shapes.len())
+            .field("tables", &self.known.len())
             .finish_non_exhaustive()
     }
 }
@@ -8747,6 +9031,7 @@ impl PgConnector {
             types,
             self.pipeline.tables.clone(),
             tables,
+            (self.pg.slot.clone(), self.conn.timeouts.command),
             start,
         )))
     }
@@ -8759,6 +9044,7 @@ impl PgStream {
         types: TypeCatalog,
         tables: Tables,
         schemas: &[TableSchema],
+        (slot, command): (String, Duration),
         start: Lsn,
     ) -> Self {
         Self {
@@ -8766,14 +9052,26 @@ impl PgStream {
             catalog,
             types,
             tables,
-            shapes: schemas
+            known: schemas
                 .iter()
-                .map(|s| (s.table().clone(), shape_of(s.columns())))
+                .map(|s| {
+                    let known = Known {
+                        shape: shape_of(s.columns()),
+                        identifier: s.identifier().iter().cloned().collect(),
+                        identity: None,
+                        oid: None,
+                        halted: false,
+                    };
+                    (s.table().clone(), known)
+                })
                 .collect(),
             relations: HashMap::new(),
             type_names: HashMap::new(),
             txn: None,
             pending: VecDeque::new(),
+            inflight: None,
+            slot,
+            command,
             start,
             acknowledged: start,
         }
@@ -8789,15 +9087,16 @@ impl PgStream {
         if !wanted.is_empty() {
             let oids: Vec<u32> = wanted.iter().map(|w| w.0).collect();
             let mods: Vec<i32> = wanted.iter().map(|w| w.1).collect();
-            let rows = self
-                .catalog
-                .query(
+            let rows = within(
+                "read type names",
+                self.command,
+                self.catalog.query(
                     "SELECT x.o, x.m, pg_catalog.format_type(x.o, x.m)
                        FROM unnest($1::oid[], $2::int4[]) AS x(o, m)",
                     &[&oids, &mods],
-                )
-                .await
-                .map_err(sql_error)?;
+                ),
+            )
+            .await?;
             for r in rows {
                 self.type_names.insert((r.get(0), r.get(1)), r.get(2));
             }
@@ -8808,28 +9107,68 @@ impl PgStream {
             .collect())
     }
 
-    /// Channel B: a Relation message. A tracked table will get a `SchemaSignal` when its shape
-    /// changed, or a `TableHalt` when a column can't be planned any more ([`Self::announce`]).
+    /// Channel B: a Relation message. A tracked table will get a `SchemaSignal` when its shape or
+    /// replica identity changed, or a `TableHalt` when a column can't be planned any more or the
+    /// table's name and OID parted ([`Self::announce`]). Everything before the catalog queries is
+    /// idempotent, so a message handled again after a cancelled `next` ends the same way.
     async fn relation(
         &mut self,
         oid: u32,
         table: TableRef,
+        replica_identity: u8,
         columns: Vec<RelationColumn>,
     ) -> Result<(), SourceError> {
-        if !self.shapes.contains_key(&table) {
+        match self.relations.get(&oid) {
+            Some(RelationState::Halted) => return Ok(()),
+            // A tracked table's OID under another name: the table was renamed away. Channel D
+            // finds it dropped too.
+            Some(RelationState::Tracked { table: was, .. }) if *was != table => {
+                let was = was.clone();
+                self.relations.insert(
+                    oid,
+                    RelationState::Halting {
+                        table: was,
+                        reason: HaltReason::TableDropped,
+                    },
+                );
+                return Ok(());
+            }
+            Some(RelationState::Halting { table: was, .. }) if *was != table => return Ok(()),
+            _ => {}
+        }
+        let Some(known) = self.known.get_mut(&table) else {
             self.relations.insert(oid, RelationState::Untracked);
             return Ok(());
-        }
-        if let Some(RelationState::Halted) = self.relations.get(&oid) {
+        };
+        if known.halted {
+            self.relations.insert(oid, RelationState::Halted);
             return Ok(());
         }
-        load_types(
-            &self.catalog,
-            columns.iter().map(|c| c.type_oid),
-            &mut self.types,
+        match known.oid {
+            // A tracked table's name on another OID: the table was dropped or renamed away and
+            // another took its name. A re-created table doesn't resume (`Schema_Change…` §7).
+            Some(bound) if bound != oid => {
+                self.relations.insert(
+                    oid,
+                    RelationState::Halting {
+                        table,
+                        reason: HaltReason::TableDropped,
+                    },
+                );
+                return Ok(());
+            }
+            _ => known.oid = Some(oid),
+        }
+        within(
+            "load types",
+            self.command,
+            load_types(
+                &self.catalog,
+                columns.iter().map(|c| c.type_oid),
+                &mut self.types,
+            ),
         )
-        .await
-        .map_err(sql_error)?;
+        .await?;
         let type_names = self.type_names(&columns).await?;
         let key = table_key(&table);
         let mut schema = Vec::with_capacity(columns.len());
@@ -8869,11 +9208,31 @@ impl PgStream {
                 }
             }
         }
-        let shape = shape_of(&schema);
-        let signal = (self.shapes.get(&table) != Some(&shape)).then(|| {
-            self.shapes.insert(table.clone(), shape);
-            SchemaHint::Columns(schema)
+        let identity: Identity = (
+            replica_identity,
+            columns
+                .iter()
+                .filter(|c| c.key)
+                .map(|c| c.name.clone())
+                .collect(),
+        );
+        let known = self.known.get_mut(&table).expect("a tracked table");
+        // Before its first Relation message, a table's replica identity is the one its schema
+        // implies: every column under REPLICA IDENTITY FULL, else its identifier. Another index
+        // as the identity signals once per session; channel C finds nothing changed.
+        let before = known.identity.take().unwrap_or_else(|| {
+            let keys = if replica_identity == b'f' {
+                columns.iter().map(|c| c.name.clone()).collect()
+            } else {
+                known.identifier.clone()
+            };
+            (replica_identity, keys)
         });
+        let shape = shape_of(&schema);
+        let changed = known.shape != shape || before != identity;
+        known.shape = shape;
+        known.identity = Some(identity);
+        let signal = changed.then_some(SchemaHint::Columns(schema));
         self.relations.insert(
             oid,
             RelationState::Tracked {
@@ -8885,9 +9244,28 @@ impl PgStream {
         Ok(())
     }
 
+    /// Halts `table` at `seq`, once: its changes are skipped from here on, under any OID.
+    fn halt(&mut self, oid: u32, table: TableRef, seq: SourceSeq, reason: HaltReason) {
+        self.relations.insert(oid, RelationState::Halted);
+        let Some(known) = self.known.get_mut(&table) else {
+            return;
+        };
+        if !std::mem::replace(&mut known.halted, true) {
+            self.pending
+                .push_back(StreamItem::TableHalt { table, seq, reason });
+        }
+    }
+
     /// Before a change or TRUNCATE of `oid` at `seq`: the signal or halt its last Relation message
     /// left.
     fn announce(&mut self, oid: u32, seq: SourceSeq) {
+        if let Some(RelationState::Tracked { table, .. }) = self.relations.get(&oid)
+            && self.known.get(table).is_some_and(|k| k.halted)
+        {
+            // Halted under its other OID.
+            self.relations.insert(oid, RelationState::Halted);
+            return;
+        }
         match self.relations.get_mut(&oid) {
             Some(RelationState::Tracked { table, signal, .. }) => {
                 if let Some(hint) = signal.take() {
@@ -8902,8 +9280,7 @@ impl PgStream {
                 else {
                     unreachable!("matched above")
                 };
-                self.pending
-                    .push_back(StreamItem::TableHalt { table, seq, reason });
+                self.halt(oid, table, seq, reason);
             }
             _ => {}
         }
@@ -8932,13 +9309,21 @@ impl PgStream {
                 Datum::Null => ColumnValue::Null,
                 Datum::Unchanged => ColumnValue::Unchanged,
                 Datum::Text(bytes) => {
-                    let Ok(text) = std::str::from_utf8(&bytes) else {
-                        return Ok(Err(HaltReason::SchemaMismatch {
-                            column: c.name.clone(),
-                            detail: "the value isn't valid UTF-8".into(),
-                        }));
+                    let text = match std::str::from_utf8(&bytes) {
+                        Ok(text) => Cow::Borrowed(text),
+                        // PostgreSQL 14 sends a `"char"` byte above 127 as itself; 15 and later
+                        // send `\ooo`.
+                        Err(_) if bytes.len() == 1 && reads_char(&c.decode) => {
+                            Cow::Owned(format!("\\{:03o}", bytes[0]))
+                        }
+                        Err(_) => {
+                            return Ok(Err(HaltReason::SchemaMismatch {
+                                column: c.name.clone(),
+                                detail: "the value isn't valid UTF-8".into(),
+                            }));
+                        }
                     };
-                    match value::decode(&c.decode, text) {
+                    match value::decode(&c.decode, &text) {
                         Ok(v) => v,
                         Err(ValueError::Overflow) => {
                             return Ok(Err(HaltReason::NumericOverflow {
@@ -8996,9 +9381,7 @@ impl PgStream {
             _ => None,
         };
         if let Some(reason) = halt(&before).or_else(|| halt(&after)) {
-            self.relations.insert(relation, RelationState::Halted);
-            self.pending
-                .push_back(StreamItem::TableHalt { table, seq, reason });
+            self.halt(relation, table, seq, reason);
             return Ok(());
         }
         self.pending.push_back(StreamItem::Change(CdcEvent {
@@ -9021,15 +9404,15 @@ impl PgStream {
                 oid,
                 namespace,
                 name,
+                replica_identity,
                 columns,
-                ..
             } => {
                 let schema = if namespace.is_empty() {
                     "pg_catalog".into()
                 } else {
                     namespace
                 };
-                self.relation(oid, TableRef::new(schema, name), columns)
+                self.relation(oid, TableRef::new(schema, name), replica_identity, columns)
                     .await?;
             }
             Message::Insert { relation, new } => {
@@ -9132,15 +9515,22 @@ impl ChangeStream for PgStream {
             if let Some(item) = self.pending.pop_front() {
                 return Ok(item);
             }
-            match self.client.recv().await {
-                Ok(Some(ev)) => self.event(ev).await?,
-                Ok(None) => {
-                    return Err(SourceError::Transient(
-                        "the replication stream ended".into(),
-                    ));
-                }
-                Err(e) => return Err(replication_error(e, Some(self.acknowledged.to_string()))),
-            }
+            let ev = match &self.inflight {
+                Some(ev) => ev.clone(),
+                None => match self.client.recv().await {
+                    Ok(Some(ev)) => self.inflight.insert(ev).clone(),
+                    Ok(None) => {
+                        return Err(SourceError::Transient(
+                            "the replication stream ended".into(),
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(replication_error(e, Some(self.acknowledged.to_string())));
+                    }
+                },
+            };
+            self.event(ev).await?;
+            self.inflight = None;
         }
     }
 
@@ -9155,11 +9545,36 @@ impl ChangeStream for PgStream {
         Ok(())
     }
 
+    /// Ends the stream, then waits up to `timeouts.command` for the server to release the slot:
+    /// its walsender lets go after the client has left, and a stream reopened before then fails
+    /// with `55006` (measured on PostgreSQL 18).
     async fn close(mut self: Box<Self>) -> Result<(), SourceError> {
         self.client
             .shutdown()
             .await
-            .map_err(|e| replication_error(e, None))
+            .map_err(|e| replication_error(e, None))?;
+        let deadline = tokio::time::Instant::now() + self.command;
+        loop {
+            let row = within(
+                "read the slot",
+                self.command,
+                self.catalog.query_opt(
+                    "SELECT active FROM pg_catalog.pg_replication_slots WHERE slot_name = $1",
+                    &[&self.slot],
+                ),
+            )
+            .await?;
+            if !row.is_some_and(|r| r.get::<_, bool>(0)) {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(SourceError::Transient(format!(
+                    "slot {} is still active {:?} after the stream closed",
+                    self.slot, self.command
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 }
 ```
@@ -9172,7 +9587,7 @@ Expected: PASS. `data-avalanche-source-pg` unit tests: 60.
 
 Run, with `test-infra/up.sh` running: `DATA_AVALANCHE_IT=1 cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 25 tests.
+Expected: PASS, 28 tests.
 
 Run: `cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all --check`
 
@@ -9861,7 +10276,7 @@ Expected: PASS. `data-avalanche-source-pg` unit tests: 61.
 
 Run, with `test-infra/up.sh` running: `DATA_AVALANCHE_IT=1 cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 30 tests.
+Expected: PASS, 33 tests.
 
 Run: `cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all --check`
 
@@ -10597,7 +11012,7 @@ Expected: PASS. `data-avalanche-source-pg` unit tests: 66.
 
 Run, with `test-infra/up.sh` running: `DATA_AVALANCHE_IT=1 cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 32 tests.
+Expected: PASS, 35 tests.
 
 Run: `cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all --check`
 
@@ -11295,13 +11710,13 @@ async fn overrides_convert_through_stream_and_snapshot() {
 
 Run: `cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 34 tests. Without `DATA_AVALANCHE_IT` every test returns at once. These tests drive the code of Tasks 2–11, so nothing fails first. A failure in Step 3 is a defect in that code: stop and report it.
+Expected: PASS, 37 tests. Without `DATA_AVALANCHE_IT` every test returns at once. These tests drive the code of Tasks 2–11, so nothing fails first. A failure in Step 3 is a defect in that code: stop and report it.
 
 - [ ] **Step 3: Run them against PostgreSQL**
 
 Run: `test-infra/up.sh`, then `DATA_AVALANCHE_IT=1 cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 34 tests.
+Expected: PASS, 37 tests.
 
 - [ ] **Step 4: Run the gates**
 
@@ -11789,13 +12204,13 @@ jobs:
 
 Run: `cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 38 tests. Without `DATA_AVALANCHE_IT` every test returns at once. These tests drive the code of Tasks 2–11, so nothing fails first. A failure in Step 3 is a defect in that code: stop and report it.
+Expected: PASS, 41 tests. Without `DATA_AVALANCHE_IT` every test returns at once. These tests drive the code of Tasks 2–11, so nothing fails first. A failure in Step 3 is a defect in that code: stop and report it.
 
 - [ ] **Step 3: Run them against PostgreSQL**
 
 Run: `test-infra/up.sh` (it now starts `postgres-tls` too), then `DATA_AVALANCHE_IT=1 cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 38 tests.
+Expected: PASS, 41 tests.
 
 Then the nightly matrix by hand, one server at a time (55414…55417):
 
@@ -11804,7 +12219,7 @@ docker compose -f test-infra/compose.yaml --profile matrix up -d --wait postgres
 DATA_AVALANCHE_IT=1 DATA_AVALANCHE_PG_PORT=55414 cargo test -p data-avalanche-source-pg --test pg --test slot_invalidation -- --skip tls::
 ```
 
-Expected: PASS on each, 34 tests, and the `slot_invalidation` test.
+Expected: PASS on each, 37 tests, and the `slot_invalidation` test.
 
 - [ ] **Step 4: Run the gates**
 
@@ -12021,3 +12436,43 @@ invalidation test restores `max_slot_wal_keep_size` on every failure path, and r
 reports nothing, so M6 records those snapshot requests as soon as `prepare` returns (roadmap M6).
 Measured: PostgreSQL 14–18 pass 34 integration tests each and `slot_invalidation`; the workspace
 passes 637 on the verified workspace, 602 on the branch.
+
+**Task 9: cancel safety, the replica identity, renamed tables, the slot on close** (`1c117be`;
+found by the task review, owner decision Q-M5-15, 2026-10-02):
+- **`next` wasn't cancel-safe.** It took an event from the client, then awaited two catalog
+  queries for a Relation message. Data-Flow Phase 2a runs `next` in `tokio::select!`; a call dropped
+  there lost the message. The next change then failed (`a change of relation N before its Relation
+  message`, permanent), or, after a same-width `RENAME COLUMN`, decoded under the old name with no
+  signal. Now the event stays in the stream until handled; handling a Relation message again is
+  idempotent. The queries run under `timeouts.command`. Core documents `ChangeStream::next` as
+  cancel-safe (Task 1's file; the M7 stream owes the same).
+- **Channel B missed key changes.** It compared names and types only. After `DROP CONSTRAINT
+  t_pkey, ADD PRIMARY KEY (code)` no signal went out, and later `K` images carried `code` only.
+  Now the replica identity (setting, key columns) is compared too: a table's first Relation message
+  of a session against its opening identifier (all columns under `FULL`), later ones against the
+  last. A difference signals; channel C finds `IdentifierChanged` and halts. Another index as the
+  identity signals once per session, and channel C finds nothing.
+- **Tables were matched by name.** A table renamed away dropped its changes until channel D
+  noticed; a table swapped in under the name (pg-osc) streamed as the old one, though §7 says a
+  re-created table doesn't resume. Now, within a session, a tracked table's name on another OID, or
+  its OID under another name, halts it (`TABLE_DROPPED`); its later changes are skipped under
+  either OID. `Schema_Change…` §7 names channel B for it (spec edit, owner-approved).
+- PostgreSQL 14 sends a `"char"` byte above 127 as the raw byte (measured: `c3`), which isn't
+  UTF-8; it decodes as `\ooo` now. A `"char"[]` with such a byte still halts.
+- **`close` returned before the server released the slot.** The walsender lets the slot go after
+  the client has left; tests that dropped the slot `AND NOT active` right after `close` left it
+  behind, and a reopen right after `close` could meet `55006`. `close` now waits, up to
+  `timeouts.command`, until `pg_replication_slots.active` is false. The test `cleanup` waits too
+  (terminating a walsender still active after 5 s) and drops the slot unconditionally.
+- Tests: `key_and_identity_changes_signal` (with the raw `"char"`), `a_renamed_or_replaced_table_halts`,
+  `next_is_cancel_safe` (calls dropped at growing timeouts; without the fix it fails with the
+  protocol error above). `s_pg5` resets `wal_sender_timeout` when it fails (the stalled half runs as
+  its own task). A misplaced doc comment moved to `relation_changes_signal_before_the_next_change`.
+
+Measured on the verified workspace: PostgreSQL 14–18 pass 37 integration tests each without TLS
+and `slot_invalidation` on each, with no test slot left behind; the workspace passes 641. Counts:
+Task 9's integration tests are 28, and each later integration count is three higher than before;
+each later task's `data-avalanche-source-pg` unit-test count is five higher than its block shows
+(Task 7's fix four, this one). Left for the whole-branch review: the client's read-ahead is bounded
+in events (8 192), not bytes; a `next` cancelled while the client joins its ended worker reports
+`replication worker already joined` (`Internal`, permanent) instead of the worker's error.
