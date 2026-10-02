@@ -181,7 +181,7 @@ the arrow.
 | D-M5.15 | `prepare` reconciles the publication, then the slot. Creating a slot (it waits for running transactions) is bounded by `timeouts.snapshot`; every other catalog call by `timeouts.command`. `reset_position` drops and recreates the slot (refused under `require_existing`). `teardown` drops the slot and the publication only under `managed` with `auto_cleanup`. `retained_bytes` is `pg_current_wal_lsn() - restart_lsn`, the WAL the slot keeps on disk (Task 8 fix). Advancing an orphan (`Adopt`) is bounded by `timeouts.snapshot` too | The `max_wal_lag_bytes` guard (V-104) compares against it in M6 | Task 8 (`reset_teardown_and_retained_wal`) |
 | D-M5.16 | TLS. `allow` connects as `prefer` (the replication crate has no `allow`; both accept either kind). `require` and `prefer` encrypt but don't verify the chain (signatures are still checked), even with `ssl_ca` set (Q-M5-10). `verify-ca` checks the chain and ignores the name. `verify-full` checks both. The trust roots are `ssl_ca`, else the webpki roots. `ssl_cert` and `ssl_key` go together | Config §9.1; one meaning of each mode on both connections | Task 2 (`modes_map_to_both_clients`, `bad_material_is_refused_by_name`), Task 13 |
 | D-M5.17 | Snapshot reads. They use the simple-query protocol, so values are the output-function text pgoutput sends (`true::text` is `true`, pgoutput sends `t`). Columns are qualified by the alias `src`, so an output name can't shadow a key. A text key compares in its own collation when that is deterministic (its index serves the chunk), in `COLLATE "C"` otherwise, with a warning at resolution; the cursor records the collations, and a cursor of others halts the table (Q-M5-16). Key values are quoted literals cast to the column's `format_type` text; a `"char"` (or a domain over one) is read as its code and keyed through a signed byte. Each read carries `SET LOCAL statement_timeout` = `timeouts.command`, so the server cancels it first. A column changed under the snapshot (gone, or a different type) → `Transient`: read again once the stream's signal caught up. `fetch_rows` sends `FETCH_BATCH` = 1000 keys per statement | Snapshot_Resumability §2; a snapshot row must equal the streamed row of the same data | Task 10 |
-| D-M5.18 | Channel C (`augment`). It takes the hint's columns (names and types, from the stream) and finds each in the catalog by name, else by the `attnum` it had in the cached schema; that `attnum` and the nullability come from the catalog. A column found neither way halts the table. A column dropped since the signal keeps its cached `attnum` (an `attnum` is never reused). The catalog may be ahead of the stream, so a placement that is a guess halts the table: two columns on one `attnum`, `attnum`s out of the stream's order (pgoutput sends `attnum` order), a column of the cached schema the catalog still has with no stream column on it (it existed at the signal), or a column placed as dropped since the signal while another cached column is gone too and placed nowhere (Q-M5-17). A later DDL that breaks planning halts the table at an earlier signal too (fail-safe). `diff` matches by `attnum`, so a new name on the same `attnum` is a proven rename. A type change carries `narrowed` (a shorter length or lower precision of the same logical type). A table gone from the catalog → `[TableDropped]` and no schema | §0 (scope a change to its signal) and §6 (rename proof) | Task 11 |
+| D-M5.18 | Channel C (`augment`). It takes the hint's columns (names and types, from the stream) and finds each in the catalog by name, else by the `attnum` it had in the cached schema; that `attnum` and the nullability come from the catalog. A column found neither way halts the table. A column dropped since the signal keeps its cached `attnum` (an `attnum` is never reused). The catalog may be ahead of the stream, so a placement that is a guess halts the table: two columns on one `attnum`, `attnum`s out of the stream's order (pgoutput sends `attnum` order), a column of the cached schema the catalog still has with no stream column on it (it existed at the signal), a column placed as dropped since the signal while another cached column is gone too and placed nowhere, a catalog column below the highest placed column the catalog still has with no stream column on it (it existed at the signal), or a column placed as dropped since the signal while a catalog column has no stream column on it (Q-M5-17). A later DDL that breaks planning halts the table at an earlier signal too (fail-safe). `diff` matches by `attnum`, so a new name on the same `attnum` is a proven rename. A type change carries `narrowed` (a shorter length or lower precision of the same logical type). A table gone from the catalog → `[TableDropped]` and no schema | §0 (scope a change to its signal) and §6 (rename proof) | Task 11 |
 | D-M5.19 | Channel D (`rescan`). One batched read of the tracked tables. It reports tables gone from `pg_class` as dropped, tables whose catalog schema differs as changed (with that schema, for freshness and alerting only), and tables that now fail planning as halted, an unlogged table among them (`TABLE_NOT_REPLICABLE`, Q-M5-17) | §2.1 `TABLE_DROPPED`; the rescan never applies a change itself | Task 11 (`channel_d_finds_dropped_changed_and_broken_tables`) |
 
 **Measured while planning** (recorded in the tasks and the docs):
@@ -10871,6 +10871,45 @@ mod tests {
     }
 
     #[test]
+    fn scope_halts_on_a_name_re_added_since_the_signal() {
+        // `c` added at the signal; after it, `c` renamed to `x` and a new `c` added: the stream's
+        // `c` would land on the new one.
+        let hint = vec![
+            ColumnSchema::new("id", V::Int32, "integer"),
+            ColumnSchema::new("a", V::Text, "character varying(100)"),
+            ColumnSchema::new("b", V::Int32, "integer"),
+            ColumnSchema::new("c", V::Int32, "integer"),
+        ];
+        let mut columns = base().columns().to_vec();
+        columns.push(col("x", V::Int32, "integer", 4));
+        columns.push(col("c", V::Int32, "integer", 5));
+        let now = table(columns, &["id"]);
+        assert_eq!(
+            scope(&base(), &hint, &now).unwrap_err().code(),
+            "SCHEMA_MISMATCH"
+        );
+        // `b` dropped and re-added before the signal, then renamed to `x` after it: the same
+        // inputs as `b` dropped and `x` added after the signal.
+        let hint = vec![
+            ColumnSchema::new("id", V::Int32, "integer"),
+            ColumnSchema::new("a", V::Text, "character varying(100)"),
+            ColumnSchema::new("b", V::Int32, "integer"),
+        ];
+        let now = table(
+            vec![
+                col("id", V::Int32, "integer", 1).not_null(),
+                col("a", V::Text, "character varying(100)", 2),
+                col("x", V::Int32, "integer", 4),
+            ],
+            &["id"],
+        );
+        assert_eq!(
+            scope(&base(), &hint, &now).unwrap_err().code(),
+            "SCHEMA_MISMATCH"
+        );
+    }
+
+    #[test]
     fn scope_keeps_a_column_dropped_after_the_signal() {
         // Expand and contract: `c` added (the signal), then `b` dropped in the catalog.
         let hint = vec![
@@ -11082,13 +11121,17 @@ async fn channel_c_with_the_catalog_ahead() {
         "channel_c_ahead",
         "CREATE TABLE t (id int PRIMARY KEY, a int, b int);
          CREATE TABLE u (id int PRIMARY KEY, a int, b int);
-         CREATE TABLE v (id int PRIMARY KEY, a int, b int);",
+         CREATE TABLE v (id int PRIMARY KEY, a int, b int);
+         CREATE TABLE w (id int PRIMARY KEY, b int);",
     )
     .await;
     let c: Box<dyn SourceConnector> = Box::new(connector(&pipeline(&n, &["*"], "", "")));
     let r = c.resolve_tables().await.unwrap();
     let p = c
-        .prepare(None, &[n.table("t"), n.table("u"), n.table("v")])
+        .prepare(
+            None,
+            &[n.table("t"), n.table("u"), n.table("v"), n.table("w")],
+        )
         .await
         .unwrap();
     let StartPlan::Snapshot { from, .. } = p.plan else {
@@ -11107,15 +11150,20 @@ async fn channel_c_with_the_catalog_ahead() {
             format!("INSERT INTO {sc}.t VALUES (1, 1, 1, 1)"),
             format!("ALTER TABLE {sc}.u ADD COLUMN c int"),
             format!("INSERT INTO {sc}.u VALUES (1, 1, 1, 1)"),
-            // After the signals: expand and contract on t, a rename chain on u, a rename on v.
+            format!("ALTER TABLE {sc}.w ADD COLUMN a int"),
+            format!("INSERT INTO {sc}.w VALUES (1, 1, 1)"),
+            // After the signals: expand and contract on t, a rename chain on u, a rename on v,
+            // the added column renamed and its name re-added on w.
             format!("ALTER TABLE {sc}.t DROP COLUMN b"),
             format!("ALTER TABLE {sc}.u RENAME COLUMN a TO x"),
             format!("ALTER TABLE {sc}.u RENAME COLUMN b TO a"),
             format!("ALTER TABLE {sc}.v RENAME COLUMN a TO x"),
+            format!("ALTER TABLE {sc}.w RENAME COLUMN a TO x"),
+            format!("ALTER TABLE {sc}.w ADD COLUMN a int"),
         ],
     )
     .await;
-    let hints = signals(&mut s, 3).await;
+    let hints = signals(&mut s, 4).await;
     let (delta, new) = c
         .augment(cached(&r.tables, "t"), &hints["t"])
         .await
@@ -11126,7 +11174,7 @@ async fn channel_c_with_the_catalog_ahead() {
         [SchemaChange::AddColumn(new.column("c").unwrap().clone())],
         "the later drop isn't in this change"
     );
-    for table in ["u", "v"] {
+    for table in ["u", "v", "w"] {
         match c.augment(cached(&r.tables, table), &hints[table]).await {
             Err(SourceError::TableHalt {
                 reason: HaltReason::SchemaMismatch { .. },
@@ -11266,7 +11314,12 @@ pub fn narrowed(from: &ColumnSchema, to: &ColumnSchema) -> bool {
 /// - a column of `cached` the catalog still has, with no stream column on it: it existed at the
 ///   signal, so the stream carries it under some name (renamed away, and its name taken);
 /// - a column placed as dropped since the signal while another column of `cached` is gone too and
-///   placed nowhere: either could be the one the name meant.
+///   placed nowhere: either could be the one the name meant;
+/// - a column of the catalog with no stream column on it, below the highest placed column the
+///   catalog still has: created before that one, it existed at the signal (a name re-added since);
+/// - a column placed as dropped since the signal while a column of the catalog has no stream
+///   column on it: a drop and an add since the signal read the same as a column re-added before it
+///   and renamed since.
 ///
 /// A column found no way halts too.
 pub fn scope(
@@ -11330,6 +11383,30 @@ pub fn scope(
             return Err(guess(
                 &was.name,
                 "two columns are gone from the catalog, and the stream's names don't say which",
+            ));
+        }
+    }
+    let top = columns
+        .iter()
+        .filter(|c| in_now(c.source_ordinal).is_some())
+        .filter_map(|c| c.source_ordinal)
+        .max();
+    for c in now.columns() {
+        if placed(c.source_ordinal) {
+            continue;
+        }
+        if c.source_ordinal < top {
+            return Err(guess(
+                &c.name,
+                "the catalog, ahead of the stream, has a column older than one the stream carries, \
+                 and no stream column is placed on it",
+            ));
+        }
+        if dropped_since {
+            return Err(guess(
+                &c.name,
+                "a column dropped and one added since the signal read the same as a column \
+                 re-added before it",
             ));
         }
     }
@@ -13178,3 +13255,22 @@ whole-branch review: a column dropped and re-added under one name after the sign
 `DropColumn` + `AddColumn` (the catalog can't tell it from the same change before the signal);
 a glob-matched table set `UNLOGGED` between channel A's list and its describe halts instead of
 being skipped.
+
+**Task 11, round 3: a name re-added since the signal** (`cd586bd`; found by the re-review of round
+2, within Q-M5-17; present since round 1). A column added at the signal, renamed after it, and its
+name re-added: the stream's column landed on the new column, `[AddColumn a]` on the wrong `attnum`,
+and the next signal read the rename as an add (measured on PostgreSQL 18). A catalog column below
+the highest placed column the catalog still has was created before it, so it existed at the signal:
+with no stream column on it, the table halts. And a column dropped and re-added before the signal,
+then renamed after it, read as no change; those inputs equal a drop and an add after the signal, so
+a placement as dropped since the signal halts when a catalog column has no stream column on it
+(that halts the legitimate drop-and-add after the signal too: fail-safe). Tests:
+`channel_c_with_the_catalog_ahead` gains table `w`; unit test
+`scope_halts_on_a_name_re_added_since_the_signal`. The `data-avalanche-source-pg` unit count after
+Task 11 is 76. Measured on the verified workspace: PostgreSQL 14–18 pass 41 integration tests each
+and `slot_invalidation`; the workspace passes 650. Known limits, which the catalog can't tell from
+legitimate changes: a column dropped and re-added under one name after the signal reads as
+`DropColumn` + `AddColumn`; a column re-added before the signal and dropped after it reads as a
+drop after the signal. Left for the whole-branch review: a `require_existing` publication with a
+column list (PostgreSQL 15+) or PostgreSQL 18's `publish_generated_columns` makes channel C halt the
+table on every signal (fail-safe); reconcile could warn or refuse.
