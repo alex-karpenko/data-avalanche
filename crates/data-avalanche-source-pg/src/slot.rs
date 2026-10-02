@@ -382,10 +382,12 @@ impl PgConnector {
             "SET LOCAL lock_timeout = {ms}; SET LOCAL statement_timeout = {ms}; {}",
             sql.join("; ")
         );
+        // The server bounds each statement and each lock wait by `command`.
+        let budget = command.saturating_mul(sql.len() as u32) + SERVER_FIRST;
         self.conn
             .bounded(
                 "reconcile the publication",
-                command + SERVER_FIRST,
+                budget,
                 client.batch_execute(&batch),
             )
             .await

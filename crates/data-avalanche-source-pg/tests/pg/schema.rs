@@ -313,12 +313,13 @@ async fn a_table_dropped_and_created_again_is_dropped() {
     let n = fresh(
         &a,
         "channel_d_recreated",
-        "CREATE TABLE t (id int PRIMARY KEY); CREATE TABLE u (id int PRIMARY KEY);",
+        "CREATE TABLE t (id int PRIMARY KEY); CREATE TABLE u (id int PRIMARY KEY);
+         CREATE TABLE v (id int PRIMARY KEY);",
     )
     .await;
     let c: Box<dyn SourceConnector> = Box::new(connector(&pipeline(&n, &["*"], "", "")));
     let r = c.resolve_tables().await.unwrap();
-    c.prepare(None, &[n.table("t"), n.table("u")])
+    c.prepare(None, &[n.table("t"), n.table("u"), n.table("v")])
         .await
         .unwrap();
     let sc = &n.schema;
@@ -327,11 +328,14 @@ async fn a_table_dropped_and_created_again_is_dropped() {
         &[
             format!("DROP TABLE {sc}.t"),
             format!("CREATE TABLE {sc}.t (id int PRIMARY KEY)"),
+            // Another table under the name with none of the cached columns.
+            format!("DROP TABLE {sc}.v"),
+            format!("CREATE TABLE {sc}.v (x int PRIMARY KEY)"),
         ],
     )
     .await;
     let report = c.rescan(&r.tables).await.unwrap();
-    assert_eq!(report.dropped, [n.table("t")]);
+    assert_eq!(report.dropped, [n.table("t"), n.table("v")]);
     assert!(
         report.changed.is_empty() && report.halted.is_empty(),
         "{report:?}"
@@ -349,6 +353,13 @@ async fn a_table_dropped_and_created_again_is_dropped() {
             ..
         }) => {}
         other => panic!("the snapshot halts the table: {other:?}"),
+    }
+    match c.read_chunk(cached(&r.tables, "v"), None, 10).await {
+        Err(SourceError::TableHalt {
+            reason: HaltReason::TableDropped,
+            ..
+        }) => {}
+        other => panic!("v: the snapshot halts the table: {other:?}"),
     }
     cleanup(&a, &n).await;
 }

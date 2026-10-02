@@ -775,6 +775,41 @@ async fn key_and_identity_changes_signal() {
     cleanup(&a, &n).await;
 }
 
+/// A tracked table renamed away before the session saw it halts, though it comes back under its
+/// name: its changes under the other name would be lost (final re-review I-1).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_table_renamed_away_and_back_halts() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(&a, "stream_away", "CREATE TABLE u (id int PRIMARY KEY);").await;
+    let c = connector(&pipeline(&n, &["u"], "", ""));
+    let (mut s, _, _) = first_stream(&c).await;
+    let sc = &n.schema;
+    each(
+        &a,
+        &[
+            format!("ALTER TABLE {sc}.u RENAME TO u_tmp"),
+            format!("INSERT INTO {sc}.u_tmp VALUES (1)"),
+            format!("ALTER TABLE {sc}.u_tmp RENAME TO u"),
+            format!("INSERT INTO {sc}.u VALUES (2)"),
+        ],
+    )
+    .await;
+    let items = collect(&mut s, 1, 20).await;
+    assert!(
+        items.iter().any(|i| matches!(i, StreamItem::TableHalt { table, reason: HaltReason::TableDropped, .. } if table.name == "u")),
+        "{items:?}"
+    );
+    // Nothing more: the halted table's later change is skipped.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while let Ok(item) = tokio::time::timeout_at(deadline, s.next()).await {
+        let item = item.unwrap();
+        assert!(!matches!(item, StreamItem::Change(_)), "{item:?}");
+    }
+    s.close().await.unwrap();
+    cleanup(&a, &n).await;
+}
+
 /// A table replaced under its name before the session saw it halts: the stream starts with each
 /// table's OID from its schema, so a reconnect (a new session) doesn't adopt the new table.
 #[tokio::test(flavor = "multi_thread")]

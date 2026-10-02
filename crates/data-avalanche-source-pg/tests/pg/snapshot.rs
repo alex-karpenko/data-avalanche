@@ -10,9 +10,9 @@ use data_avalanche_testkit::require_it;
 
 use crate::common::{admin, cleanup, connector, fresh, pipeline, resolved};
 
-/// Final review I3: a table dropped under the snapshot halts that table (`TABLE_DROPPED`), and a
-/// key column that lost NOT NULL and holds a NULL halts it (`NULL_IDENTIFIER`): neither stops the
-/// pipeline.
+/// Final review I3: a table dropped under the snapshot halts that table (`TABLE_DROPPED`), and so
+/// does a key column that lost NOT NULL (`IDENTIFIER_NOT_USABLE`): a NULL key sorts after every
+/// cursor, and its rows would be skipped. Neither stops the pipeline.
 #[tokio::test]
 async fn a_dropped_table_or_a_null_key_halts_only_its_table() {
     require_it!();
@@ -51,12 +51,16 @@ async fn a_dropped_table_or_a_null_key_halts_only_its_table() {
     let key = Row(vec![("id".into(), V::Int32(1))]);
     let rows = c.fetch_rows(table("d"), &[key]).await.map(|_| ());
     assert!(dropped(rows.clone()), "fetch_rows: {rows:?}");
-    match c.read_chunk(table("k"), None, 10).await {
+    // The NULL row is the last of three: a cursor never reaches it.
+    a.execute(&format!("INSERT INTO {sc}.k VALUES (2, 3)"), &[])
+        .await
+        .unwrap();
+    match c.read_chunk(table("k"), None, 1).await {
         Err(SourceError::TableHalt {
-            reason: HaltReason::NullIdentifier { column },
+            reason: HaltReason::IdentifierNotUsable { column, .. },
             ..
         }) => assert_eq!(column, "k"),
-        other => panic!("a NULL key halts the table: {other:?}"),
+        other => panic!("a nullable key halts the table: {other:?}"),
     }
     cleanup(&a, &n).await;
 }

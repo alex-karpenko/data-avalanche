@@ -144,21 +144,32 @@ impl Connector {
         after: Duration,
         f: impl Future<Output = Result<T, tokio_postgres::Error>>,
     ) -> Result<T, SourceError> {
+        // The connection `f` runs on: the caller has just taken it from [`Self::client`]. Had
+        // another call replaced it in between, a timeout abandons the newer one.
+        let at_start = self.client.lock().await.clone();
         match tokio::time::timeout(after, f).await {
             Ok(r) => r.map_err(sql_error),
             Err(_) => {
-                self.abandon().await;
+                if let Some(client) = at_start {
+                    self.abandon(&client).await;
+                }
                 Err(timed_out(what, after))
             }
         }
     }
 
-    /// Drops the cached catalog connection and asks the server to cancel what it runs there,
-    /// within `timeouts.connect`; a cancel that fails changes nothing.
-    async fn abandon(&self) {
-        let Some(client) = self.client.lock().await.take() else {
-            return;
-        };
+    /// Drops `client` from the cache and asks the server to cancel what it runs there, within
+    /// `timeouts.connect`; a cancel that fails changes nothing. A client another call abandoned
+    /// already, and one connected since, are left alone. Calls that share the connection can see
+    /// their own statement cancelled: each is retried.
+    async fn abandon(&self, client: &Arc<Client>) {
+        {
+            let mut slot = self.client.lock().await;
+            if !slot.as_ref().is_some_and(|c| Arc::ptr_eq(c, client)) {
+                return;
+            }
+            *slot = None;
+        }
         let token = client.cancel_token();
         let _ = tokio::time::timeout(self.timeouts.connect, async {
             match &self.tls {

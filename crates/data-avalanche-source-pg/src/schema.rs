@@ -167,6 +167,15 @@ pub fn scope(
     })
 }
 
+/// `cached` and `now` describe the table alike. A cached schema without the source's identity
+/// (persisted without it, or another source's) compares without it.
+fn unchanged(cached: &TableSchema, now: &TableSchema) -> bool {
+    match (cached.source_id(), now.source_id()) {
+        (None, Some(id)) => cached.clone().with_source_id(id) == *now,
+        _ => cached == now,
+    }
+}
+
 /// Whether the catalog's table under `cached`'s name is another table: dropped (or renamed away)
 /// and its name taken (`Schema_Change…` §2.1, §7.2: a re-created table doesn't resume).
 fn replaced(cached: &TableSchema, now_oid: u32) -> bool {
@@ -313,7 +322,7 @@ impl PgConnector {
             match oid.and_then(|oid| schemas.remove(oid)) {
                 None => report.dropped.push(t.clone()),
                 Some((_, Err(reason))) => report.halted.push((t.clone(), reason)),
-                Some((_, Ok((now, _)))) if *k != now => report.changed.push(now),
+                Some((_, Ok((now, _)))) if !unchanged(k, &now) => report.changed.push(now),
                 Some(_) => {}
             }
         }
@@ -340,6 +349,19 @@ mod tests {
             id.iter().map(|s| s.to_string()).collect(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_schema_without_the_identity_compares_without_it() {
+        assert!(unchanged(&base(), &base().with_source_id(5)));
+        assert!(unchanged(
+            &base().with_source_id(5),
+            &base().with_source_id(5)
+        ));
+        assert!(!unchanged(
+            &base().with_source_id(4),
+            &base().with_source_id(5)
+        ));
     }
 
     fn base() -> TableSchema {

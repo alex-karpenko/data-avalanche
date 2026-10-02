@@ -53,11 +53,31 @@ impl KeyCollation {
     }
 }
 
-/// The read plan of a table, checked against `schema`: every column still exists and decodes to
-/// the type the schema says. A difference is transient: the stream's schema signal hasn't caught
-/// up with the catalog yet.
+/// The read plan of a table, checked against `schema`: the table is still the one the schema
+/// describes, and every column still exists and decodes to the type the schema says. A table gone,
+/// or another under its name, halts it; a key column that became nullable halts it (a NULL key
+/// sorts after every cursor, so its rows would be skipped). Another difference is transient: the
+/// stream's schema signal hasn't caught up with the catalog yet.
 async fn read_plan(c: &PgConnector, schema: &TableSchema) -> Result<Vec<ReadColumn>, SourceError> {
     let client = c.conn.client().await?;
+    // NULL when the table or its schema is gone: `to_regclass` doesn't raise (§2.1).
+    let found = c
+        .conn
+        .command(
+            "find the table",
+            client.query_one(
+                "SELECT pg_catalog.to_regclass($1)::oid",
+                &[&qualified(schema.table())],
+            ),
+        )
+        .await
+        .map_err(|e| dropped(schema, e))?;
+    let Some(oid) = found.get::<_, Option<u32>>(0) else {
+        return Err(halt_dropped(schema));
+    };
+    if schema.source_id().is_some_and(|id| id != u64::from(oid)) {
+        return Err(halt_dropped(schema));
+    }
     let names: Vec<&str> = schema.columns().iter().map(|c| c.name.as_str()).collect();
     let rows = c
         .conn
@@ -66,21 +86,16 @@ async fn read_plan(c: &PgConnector, schema: &TableSchema) -> Result<Vec<ReadColu
             client.query(
                 "SELECT a.attname, a.atttypid, a.atttypmod,
                         pg_catalog.format_type(a.atttypid, a.atttypmod), co.collname::text,
-                        co.collisdeterministic, a.attrelid::int8
+                        co.collisdeterministic, a.attnotnull
                    FROM pg_catalog.pg_attribute a
                    LEFT JOIN pg_catalog.pg_collation co ON co.oid = a.attcollation
-                  WHERE a.attrelid = $1::text::regclass AND a.attname = ANY($2)
+                  WHERE a.attrelid = $1 AND a.attname = ANY($2)
                     AND a.attnum > 0 AND NOT a.attisdropped",
-                &[&qualified(schema.table()), &names],
+                &[&oid, &names],
             ),
         )
         .await
         .map_err(|e| dropped(schema, e))?;
-    if let Some(id) = schema.source_id()
-        && rows.iter().any(|r| r.get::<_, i64>(6) as u64 != id)
-    {
-        return Err(halt_dropped(schema));
-    }
     let mut types = c.types.lock().await;
     c.conn
         .command(
@@ -100,6 +115,15 @@ async fn read_plan(c: &PgConnector, schema: &TableSchema) -> Result<Vec<ReadColu
             .iter()
             .find(|r| r.get::<_, &str>(0) == col.name)
             .ok_or_else(|| changed(format!("column {} is gone", col.name)))?;
+        if schema.is_identifier(&col.name) && !r.get::<_, bool>(6) {
+            return Err(SourceError::TableHalt {
+                table: schema.table().clone(),
+                reason: HaltReason::IdentifierNotUsable {
+                    column: col.name.clone(),
+                    reason: "it is nullable now".into(),
+                },
+            });
+        }
         let over = c
             .pipeline
             .tables
@@ -305,10 +329,13 @@ fn halt_dropped(schema: &TableSchema) -> SourceError {
     }
 }
 
-/// A table gone from the catalog (SQLSTATE 42P01) halts that table, not the pipeline (§2.1).
+/// A table, or its schema, gone from the catalog (SQLSTATE 42P01, 3F000) halts that table, not
+/// the pipeline (§2.1).
 fn dropped(schema: &TableSchema, e: SourceError) -> SourceError {
     match &e {
-        SourceError::Permanent(m) if sqlstate(m) == Some("42P01") => halt_dropped(schema),
+        SourceError::Permanent(m) if matches!(sqlstate(m), Some("42P01" | "3F000")) => {
+            halt_dropped(schema)
+        }
         _ => e,
     }
 }
@@ -389,7 +416,7 @@ impl PgConnector {
         let next = match rows.last() {
             None => None,
             Some(last) => Some(KeysetCursor {
-                // NULLs sort last, so a chunk holding one ends with one.
+                // A key column nullable now halts in `read_plan`; this is the backstop.
                 key: identifier_values(table, last).ok_or_else(|| SourceError::TableHalt {
                     table: table.table().clone(),
                     reason: HaltReason::NullIdentifier {

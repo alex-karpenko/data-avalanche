@@ -267,7 +267,18 @@ impl PgStream {
             _ => {}
         }
         let Some(known) = self.known.get_mut(&table) else {
-            self.relations.insert(oid, RelationState::Untracked);
+            // A tracked table's OID under a name that isn't tracked: the table was renamed away.
+            // Its changes under the new name would never arrive, and a rename back would hide that
+            // (`Schema_Change…` §7).
+            let state = match self.known.iter().find(|(_, k)| k.oid == Some(oid)) {
+                Some((_, k)) if k.halted => RelationState::Halted,
+                Some((was, _)) => RelationState::Halting {
+                    table: was.clone(),
+                    reason: HaltReason::TableDropped,
+                },
+                None => RelationState::Untracked,
+            };
+            self.relations.insert(oid, state);
             return Ok(());
         };
         if known.halted {
