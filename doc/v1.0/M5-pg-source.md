@@ -13269,8 +13269,11 @@ a placement as dropped since the signal halts when a catalog column has no strea
 `scope_halts_on_a_name_re_added_since_the_signal`. The `data-avalanche-source-pg` unit count after
 Task 11 is 76. Measured on the verified workspace: PostgreSQL 14–18 pass 41 integration tests each
 and `slot_invalidation`; the workspace passes 650. Known limits, which the catalog can't tell from
-legitimate changes: a column dropped and re-added under one name after the signal reads as
-`DropColumn` + `AddColumn`; a column re-added before the signal and dropped after it reads as a
-drop after the signal. Left for the whole-branch review: a `require_existing` publication with a
+legitimate changes (the same changes made before the signal give the same inputs, and halting
+them would halt those too): a column dropped after the signal whose name a later column then takes,
+by `ADD` or by `RENAME` of a later column, places the stream's columns on the wrong `attnum`s (for
+example `DROP a; RENAME b TO a; ADD b` after a signal that added `b`); a column re-added before the
+signal and dropped after it reads as a drop after the signal. The re-review argued no other
+placement can be silently wrong. Left for the whole-branch review: a `require_existing` publication with a
 column list (PostgreSQL 15+) or PostgreSQL 18's `publish_generated_columns` makes channel C halt the
 table on every signal (fail-safe); reconcile could warn or refuse.
