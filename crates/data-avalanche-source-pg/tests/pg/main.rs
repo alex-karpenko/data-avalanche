@@ -8,3 +8,4 @@ mod schema;
 mod slot;
 mod snapshot;
 mod stream;
+mod types;
