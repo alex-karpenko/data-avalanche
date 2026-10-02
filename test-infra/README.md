@@ -26,7 +26,7 @@ Added by a later milestone: `mysql-84-nogtid` (M7, file/position mode).
 
 The PostgreSQL source's tests (`crates/data-avalanche-source-pg/tests/pg`) run against
 `postgres-18`; `DATA_AVALANCHE_PG_PORT` points them at another server, and
-`.github/workflows/nightly.yml` runs them on PostgreSQL 14–17 every night (and on manual dispatch):
+`.github/workflows/weekly.yml` runs them on PostgreSQL 14–17 every Monday (and on manual dispatch):
 
 ```sh
 docker compose -f test-infra/compose.yaml --profile matrix up -d --wait postgres-14

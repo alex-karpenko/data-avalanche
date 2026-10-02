@@ -10,7 +10,7 @@ use data_avalanche_source_pg::PgConnector;
 use tokio_postgres::{Client, NoTls};
 
 /// The PostgreSQL port under test: `DATA_AVALANCHE_PG_PORT`, else `postgres-18` (55418). The
-/// nightly matrix sets it for PostgreSQL 14–17.
+/// weekly matrix sets it for PostgreSQL 14–17.
 pub fn port() -> u16 {
     std::env::var("DATA_AVALANCHE_PG_PORT")
         .ok()
