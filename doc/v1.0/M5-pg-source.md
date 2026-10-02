@@ -160,6 +160,7 @@ the arrow.
 | Q-M5-16 (2026-10-02, during execution) | Task 10's review: a text key in the database's collation made every chunk a full scan and sort (the `"C"` pin has no index); PostgreSQL 14 prints a `"char"` byte above 127 raw, which panicked the read; a domain over `"char"` key looped; a timed-out chunk kept the shared catalog connection busy | **A text key orders in its own collation when deterministic, `"C"` with a start warning when not (Snapshot_Resumability §2 amended); `"char"` read as its code; domains keyed by the decoder; `SET LOCAL statement_timeout` on every read** |
 | Q-M5-17 (2026-10-02, during execution) | Task 11's review: with the catalog ahead of the stream, `scope` placed columns by their current names, so a rename chain or a swap after the signal gave a silent wrong delta; a table set `UNLOGGED` (allowed under `FOR ALL TABLES`) went unnoticed; an add/backfill/drop migration halted; `Schema_Change…` §7.2 halted on any replica identity change, the code only on an identifier change | **A placement that is a guess halts; a column dropped since the signal keeps its `attnum`; an unlogged table doesn't plan (C and D halt it); §7.2 amended: only the identifier, or a replica identity that no longer covers it, halts** |
 | Q-M5-18 (2026-10-02, during execution) | Task 12's review: a timestamp key past the microseconds a timestamp holds (294247–294276 AD, or a `date` converted past it) clamps to `i64::MAX`, the same value as `'infinity'`: distinct keys merge into one identifier, and a snapshot cursor there ends the scan early (measured: 2 of 4 rows) | **An identifier value that clamps halts the table (`SCHEMA_MISMATCH`), in the stream and in the snapshot; `±infinity` keys and other columns are unchanged; the type round trip gains the missing edge values and overrides** |
+| Q-M5-19 (2026-10-02, during execution) | Task 12's re-review: the Delta sink clamps every `date` / `timestamp` cell to the Delta range in Hop 3b (Q-M4-2), keys included, so distinct keys still merged: BC keys, keys from 10000 AD, and `±infinity` against the bounds | **The Delta sink halts the table (`Permanent`) on an identifier cell outside the Delta range, `±infinity` keys included; other columns still clamp** |
 
 **Rulings where the specs are silent** (each is pinned by a test). **Plan approved 2026-10-01**, with these rulings (roadmap D-IMPL-12):
 
@@ -2796,15 +2797,6 @@ mod tests {
             timestamp("0001-01-01 00:00:00 BC", false),
             Ok(-62_167_219_200_000_000)
         );
-        let at = |micros| ColumnValue::Timestamp {
-            micros,
-            with_tz: false,
-        };
-        assert!(clamped(&at(i64::MAX), "294250-01-01 00:00:00"));
-        assert!(clamped(&at(i64::MAX), "300000-01-01"), "a date converted");
-        assert!(!clamped(&at(i64::MAX), "infinity"));
-        assert!(!clamped(&at(i64::MIN), "-infinity"));
-        assert!(!clamped(&at(0), "1970-01-01 00:00:00"));
         assert_eq!(timestamp("infinity", true), Ok(i64::MAX));
         assert_eq!(timestamp("-infinity", false), Ok(i64::MIN));
         assert_eq!(
@@ -3075,22 +3067,6 @@ pub enum ValueError {
 
 fn bad(what: &str, text: &str) -> ValueError {
     ValueError::Unrepresentable(format!("{what} {text:?}"))
-}
-
-/// Why an identifier value that clamps halts its table (Q-M5-18).
-pub(crate) const CLAMPED_KEY: &str = "an instant past the microseconds a timestamp holds \
-    (294247 AD) clamps, and can't key a row: distinct keys would merge";
-
-/// Whether `value`, decoded from `text`, is a clamped instant: past the `i64` microseconds
-/// (Q-M5-1), not `±infinity`, which decodes to the same bound.
-pub(crate) fn clamped(value: &ColumnValue, text: &str) -> bool {
-    matches!(
-        value,
-        ColumnValue::Timestamp {
-            micros: i64::MAX | i64::MIN,
-            ..
-        }
-    ) && !matches!(text, "infinity" | "-infinity")
 }
 
 /// Decodes the text of one value.
@@ -4829,7 +4805,7 @@ Change `crates/data-avalanche-source-pg/src/value.rs`:
 diff --git a/crates/data-avalanche-source-pg/src/value.rs b/crates/data-avalanche-source-pg/src/value.rs
 --- a/crates/data-avalanche-source-pg/src/value.rs
 +++ b/crates/data-avalanche-source-pg/src/value.rs
-@@ -48,6 +48,23 @@
+@@ -48,6 +48,12 @@
          element_type: ColumnValueType,
          delimiter: u8,
      },
@@ -4839,21 +4815,10 @@ diff --git a/crates/data-avalanche-source-pg/src/value.rs b/crates/data-avalanch
 +        from: Box<Decode>,
 +        to: ColumnValueType,
 +    },
-+}
-+
-+impl Decode {
-+    /// Whether this reads a `"char"` (directly or before a conversion).
-+    pub(crate) fn reads_char(&self) -> bool {
-+        match self {
-+            Decode::Char => true,
-+            Decode::Convert { from, .. } => from.reads_char(),
-+            _ => false,
-+        }
-+    }
  }
  
  /// Why a value can't be decoded.
-@@ -135,6 +152,7 @@
+@@ -119,6 +125,7 @@
                  values,
              }
          }
@@ -7551,6 +7516,7 @@ git commit -m "feat(source-pg): the slot state machine and publication reconcili
 - Modify: `crates/data-avalanche-core/src/source.rs` (the `ChangeStream::next` doc: cancel-safe)
 - Modify: `crates/data-avalanche-source-pg/src/lib.rs`
 - Create: `crates/data-avalanche-source-pg/src/stream.rs`
+- Modify: `crates/data-avalanche-source-pg/src/value.rs` (`Decode::reads_char`, `clamped`)
 - Modify: `crates/data-avalanche-source-pg/tests/pg/main.rs`
 - Modify: `crates/data-avalanche-source-pg/tests/pg/common.rs`
 - Create: `crates/data-avalanche-source-pg/tests/pg/stream.rs`
@@ -8927,6 +8893,79 @@ error[E0422]: cannot find struct, variant or union type `StreamColumn` in this s
 
 - [ ] **Step 3: Implement**
 
+Change `crates/data-avalanche-source-pg/src/value.rs`: the stream is the first caller of `Decode::reads_char` and of
+`clamped`, which tells a key that clamps (Q-M5-18) from `±infinity`:
+
+```diff
+diff --git a/crates/data-avalanche-source-pg/src/value.rs b/crates/data-avalanche-source-pg/src/value.rs
+--- a/crates/data-avalanche-source-pg/src/value.rs
++++ b/crates/data-avalanche-source-pg/src/value.rs
+@@ -56,6 +56,17 @@
+     },
+ }
+ 
++impl Decode {
++    /// Whether this reads a `"char"` (directly or before a conversion).
++    pub(crate) fn reads_char(&self) -> bool {
++        match self {
++            Decode::Char => true,
++            Decode::Convert { from, .. } => from.reads_char(),
++            _ => false,
++        }
++    }
++}
++
+ /// Why a value can't be decoded.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum ValueError {
+@@ -67,6 +78,23 @@
+ 
+ fn bad(what: &str, text: &str) -> ValueError {
+     ValueError::Unrepresentable(format!("{what} {text:?}"))
++}
++
++/// Why an identifier value that clamps halts its table (Q-M5-18).
++pub(crate) const CLAMPED_KEY: &str = "an instant at or past the last microsecond a timestamp \
++    holds (294247-01-10 04:00:54.775807 UTC) clamps to the value of infinity, and can't key a \
++    row: distinct keys would merge";
++
++/// Whether `value`, decoded from `text`, is a clamped instant: at or past the last `i64`
++/// microsecond (Q-M5-1), not `±infinity`, which decodes to the same bound.
++pub(crate) fn clamped(value: &ColumnValue, text: &str) -> bool {
++    matches!(
++        value,
++        ColumnValue::Timestamp {
++            micros: i64::MAX | i64::MIN,
++            ..
++        }
++    ) && !matches!(text, "infinity" | "-infinity")
+ }
+ 
+ /// Decodes the text of one value.
+@@ -662,6 +690,21 @@
+             timestamp("0001-01-01 00:00:00 BC", false),
+             Ok(-62_167_219_200_000_000)
+         );
++        let at = |micros| ColumnValue::Timestamp {
++            micros,
++            with_tz: false,
++        };
++        assert!(clamped(&at(i64::MAX), "294250-01-01 00:00:00"));
++        // The last microsecond itself is the value of infinity.
++        assert_eq!(
++            timestamp("294247-01-10 04:00:54.775807", false),
++            Ok(i64::MAX)
++        );
++        assert!(clamped(&at(i64::MAX), "294247-01-10 04:00:54.775807"));
++        assert!(clamped(&at(i64::MAX), "300000-01-01"), "a date converted");
++        assert!(!clamped(&at(i64::MAX), "infinity"));
++        assert!(!clamped(&at(i64::MIN), "-infinity"));
++        assert!(!clamped(&at(0), "1970-01-01 00:00:00"));
+         assert_eq!(timestamp("infinity", true), Ok(i64::MAX));
+         assert_eq!(timestamp("-infinity", false), Ok(i64::MIN));
+         assert_eq!(
+```
+
 Add the implementation to `crates/data-avalanche-source-pg/src/stream.rs`, above the test module:
 
 ```rust
@@ -9667,6 +9706,7 @@ Expected: no warnings, no output.
 ```bash
 git add crates/data-avalanche-source-pg/src/lib.rs \
   crates/data-avalanche-source-pg/src/stream.rs \
+  crates/data-avalanche-source-pg/src/value.rs \
   crates/data-avalanche-source-pg/tests/pg/main.rs \
   crates/data-avalanche-source-pg/tests/pg/common.rs \
   crates/data-avalanche-source-pg/tests/pg/stream.rs
@@ -11810,8 +11850,10 @@ conversions of Task 5b both ways. Four converted columns form the key, and the s
 one row per chunk, so every cursor goes back to PostgreSQL as converted values. A third,
 `string_and_decimal_overrides_through_stream_and_snapshot`, runs `string` on types that otherwise
 decode, `decimal(P,S)` on `numeric` and `money`, and the remaining conversions at their bounds. A
-fourth, `a_clamped_timestamp_key_halts_the_table`, pins Q-M5-18: a key past the microseconds a
-timestamp holds halts the table in the stream and in the snapshot, and `±infinity` keys page.
+fourth, `a_clamped_timestamp_key_halts_the_table`, pins Q-M5-18: a key at or past the last
+microsecond a timestamp holds halts the table in the stream (a new row's key, a delete's old key;
+`timestamp`, `timestamptz`, a composite key, a `date` converted) and in the snapshot, and
+`±infinity` keys page.
 
 - [ ] **Step 1: Write the round trip**
 
@@ -12595,6 +12637,32 @@ async fn string_and_decimal_overrides_through_stream_and_snapshot() {
     let c = connector(&pipeline(&n, &["*"], &overrides, ""));
     let (mut s, tables, _) = first_stream(&c).await;
     let t = &tables[0];
+    let num = |precision: u8, scale: i8| T::Numeric { precision, scale };
+    let types: Vec<(&str, T)> = t
+        .columns()
+        .iter()
+        .map(|c| (c.name.as_str(), c.value_type.clone()))
+        .collect();
+    assert_eq!(
+        types,
+        [
+            ("id", T::Int32),
+            ("b", T::Text),
+            ("ch", T::Text),
+            ("tt", T::Text),
+            ("iv", T::Text),
+            ("am", T::Text),
+            ("at", T::Text),
+            ("n", num(10, 4)),
+            ("nb", num(38, 10)),
+            ("m", num(20, 3)),
+            ("s", T::Int32),
+            ("i", T::Float64),
+            ("dt", T::Timestamp { with_tz: false }),
+            ("big", num(25, 2)),
+        ],
+        "each override is the declared type"
+    );
     a.batch_execute(&format!(
         "SET search_path = {};
          INSERT INTO t VALUES
@@ -12657,12 +12725,17 @@ async fn string_and_decimal_overrides_through_stream_and_snapshot() {
     assert_eq!(streamed, expected, "the stream");
     let chunk = c.read_chunk(t, None, 10).await.unwrap();
     assert_eq!(chunk.rows, expected, "the snapshot");
+    for row in &expected {
+        for ((column, value), (_, ty)) in row.0.iter().zip(&types) {
+            assert!(value.fits(ty), "{column}: {value:?} fits {ty:?}");
+        }
+    }
     s.close().await.unwrap();
     cleanup(&a, &n).await;
 }
 
-/// Q-M5-18: a key that clamps past the microseconds a timestamp holds halts the table, in the
-/// stream and in the snapshot; `±infinity` keys a row.
+/// Q-M5-18: a key at or past the last microsecond a timestamp holds halts the table, in the stream
+/// (a new row's key, a delete's old key) and in the snapshot; `±infinity` keys page.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_clamped_timestamp_key_halts_the_table() {
     require_it!();
@@ -12671,39 +12744,76 @@ async fn a_clamped_timestamp_key_halts_the_table() {
         &a,
         "clamped_key",
         "CREATE TABLE t (ts timestamp PRIMARY KEY, v int);
-         INSERT INTO t VALUES ('2024-01-01', 1), ('-infinity', 0), ('infinity', 2);",
+         INSERT INTO t VALUES ('2024-01-01', 1), ('-infinity', 0), ('infinity', 2);
+         CREATE TABLE z (tz timestamptz PRIMARY KEY);
+         CREATE TABLE k (id int, ts timestamp, PRIMARY KEY (id, ts));
+         CREATE TABLE d (d date PRIMARY KEY);
+         CREATE TABLE o (ts timestamp PRIMARY KEY);
+         INSERT INTO o VALUES ('294250-01-01');",
     )
     .await;
-    let c = connector(&pipeline(&n, &["*"], "", ""));
+    let overrides = format!(
+        "      column_type_overrides: {{ {}.d.d: timestamp_ntz }}",
+        n.schema
+    );
+    let c = connector(&pipeline(&n, &["*"], &overrides, ""));
     let (mut s, tables, _) = first_stream(&c).await;
-    let t = &tables[0];
+    let table = |name: &str| tables.iter().find(|t| t.table().name == name).unwrap();
+    let halt = |r: &HaltReason, col: &str| {
+        matches!(r, HaltReason::SchemaMismatch { column, detail }
+            if column == col && detail.contains("can't key a row"))
+    };
     let mut rows = 0;
     let mut cursor: Option<KeysetCursor> = None;
     loop {
-        let chunk = c.read_chunk(t, cursor.as_ref(), 1).await.unwrap();
+        let chunk = c.read_chunk(table("t"), cursor.as_ref(), 1).await.unwrap();
         let Some(next) = chunk.next else { break };
         rows += chunk.rows.len();
         cursor = Some(next);
     }
     assert_eq!(rows, 3, "infinity keys page");
-    a.execute(
-        &format!("INSERT INTO {}.t VALUES ('294250-01-01', 3)", n.schema),
-        &[],
-    )
+    match c.read_chunk(table("o"), None, 10).await {
+        Err(SourceError::TableHalt { reason, .. }) if halt(&reason, "ts") => {}
+        other => panic!("o: the snapshot halts: {other:?}"),
+    }
+    // One transaction: a key past the range, the last microsecond (with an offset), a composite
+    // key, a date converted to a timestamp, and a delete's old key.
+    a.batch_execute(&format!(
+        "SET search_path = {};
+         INSERT INTO t VALUES ('294250-01-01', 3);
+         INSERT INTO z VALUES ('294247-01-10 09:30:54.775807+05:30');
+         INSERT INTO k VALUES (1, '294276-12-31 23:59:59.999999');
+         INSERT INTO d VALUES ('300000-01-01');
+         DELETE FROM o;",
+        n.schema
+    ))
     .await
     .unwrap();
-    let halt =
-        |r: &HaltReason| matches!(r, HaltReason::SchemaMismatch { column, .. } if column == "ts");
     let items = collect(&mut s, 1, 20).await;
+    for (name, column) in [
+        ("t", "ts"),
+        ("z", "tz"),
+        ("k", "ts"),
+        ("d", "d"),
+        ("o", "ts"),
+    ] {
+        assert!(
+            items
+                .iter()
+                .any(|i| matches!(i, StreamItem::TableHalt { table, reason, .. }
+                if table.name == name && halt(reason, column))),
+            "{name}: the stream halts: {items:?}"
+        );
+    }
     assert!(
-        items
-            .iter()
-            .any(|i| matches!(i, StreamItem::TableHalt { reason, .. } if halt(reason))),
-        "{items:?}"
+        !items.iter().any(|i| matches!(i, StreamItem::Change(_))),
+        "no change of a halted table: {items:?}"
     );
-    match c.read_chunk(t, None, 10).await {
-        Err(SourceError::TableHalt { reason, .. }) if halt(&reason) => {}
-        other => panic!("the snapshot halts: {other:?}"),
+    for (name, column) in [("t", "ts"), ("z", "tz"), ("k", "ts"), ("d", "d")] {
+        match c.read_chunk(table(name), None, 10).await {
+            Err(SourceError::TableHalt { reason, .. }) if halt(&reason, column) => {}
+            other => panic!("{name}: the snapshot halts: {other:?}"),
+        }
     }
     s.close().await.unwrap();
     cleanup(&a, &n).await;
@@ -13624,3 +13734,26 @@ review, owner decision Q-M5-18, 2026-10-02):
   Task 4's code with Task 5b's diff now gives the final `value.rs` but for Task 4's own two fixes
   above (the timestamp clamp, `aba85ec`; JSON digits, `fedfc22`, with the workspace `Cargo.toml`
   feature), which stay recorded here only.
+
+**Task 12, round 2: the Delta sink's keys; the plan's helpers** (`537e2f1`; found by the re-review
+of round 1, owner decision Q-M5-19, 2026-10-02):
+- **Keys merged in the sink too.** Hop 3b clamps every `date`, `timestamp` and `timestamp_ntz` cell
+  to 0001-01-01 … 9999-12-31 23:59:59.999999 (Q-M4-2), identifier columns included: two BC keys,
+  two keys from 10000 AD, or `infinity` and `9999-12-31 23:59:59.999999` became one key in the
+  MERGE. `data-avalanche-sink-delta`'s `merge_source` now checks each identifier column
+  (`convert::clamped_key`) before converting it, upserts and deletes alike; a cell outside the range
+  is `Permanent`, and the table halts. On Delta, a `date` or `timestamp` key holding `±infinity`
+  halts its table. A column that isn't a key still clamps. Tests (outside this plan, in the M4
+  crate): `convert::a_key_the_delta_range_would_clamp_is_found`,
+  `write::a_key_outside_the_delta_range_is_permanent`.
+- **The helpers had no caller until Task 9** (M-1): as round 1 placed them, `clamped`,
+  `CLAMPED_KEY` (Task 4) and `Decode::reads_char` (Task 5b) were `pub(crate)` and unused, and
+  Tasks 4–8 failed the `-D warnings` gate. Task 9 adds them now, as a diff of `value.rs`; Tasks 4
+  and 5b are as before round 1.
+- **Wording and tests** (M-2 … M-4): the last microsecond itself, `294247-01-10 04:00:54.775807`,
+  equals `infinity` and halts; the halt says "at or past" (unit assertion). The overrides test
+  asserts each declared type and that every value fits it. The clamped-key test adds a
+  `timestamptz` key at the last microsecond written with an offset, a composite key, a `date` key
+  converted to `timestamp_ntz`, a delete's old key, and the halt's detail.
+  Measured on the verified workspace: PostgreSQL 14–18 pass 43 integration tests each and
+  `slot_invalidation`; the workspace passes 655.
