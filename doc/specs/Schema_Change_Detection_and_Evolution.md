@@ -304,7 +304,8 @@ transaction boundary via §8.
 | Cross-family change (`int→varchar`, `timestamp→date`) | **Unsafe** | — | — | halt table |
 | `nullable → NOT NULL` | **Ignorable** | none | none | none: target columns are always nullable (§7.3) |
 | `NOT NULL → nullable` | **Ignorable** | none | none | none |
-| Change PK / `REPLICA IDENTITY` / unique key | **Unsafe** | — | — | halt table; operator re-snapshot |
+| Change of the identifier (the primary key, or the `tables.primary_key` columns), or a `REPLICA IDENTITY` that no longer covers it | **Unsafe** | — | — | halt table; operator re-snapshot |
+| Another `REPLICA IDENTITY` or unique-key change (e.g. `DEFAULT` → `FULL` over the same key) | **Ignorable** | none | none | none: before-images carry more columns; keying is unchanged (Q-M5-17) |
 | `ADD COLUMN` / `RENAME COLUMN` to a **reserved lineage name** (`_op`, `_ts`, `_lsn`, `_seq`, `_source_db`, `_pipeline`, `__data_avalanche_*`; case-insensitive) | **Unsafe** | — | — | halt table `RESERVED_COLUMN_COLLISION` (config §5) |
 | `DROP TABLE` (tracked) | **Unsafe** | — (target kept) | — (target kept) | halt table `TABLE_DROPPED`; the target is never dropped. A re-created table of the same name (new OID) does **not** auto-resume; it needs an operator re-snapshot. Detection — PG: channel B within a stream session (the table's name on another OID, or its OID under another name; a table renamed away halts the same way), channel D / A (§2.1); MySQL: channel B |
 | MySQL `ENUM`/`SET` **add** values (append-only) | Ignorable\*\* | none | none | decoded value set widens; verify mapping (G-18) |
