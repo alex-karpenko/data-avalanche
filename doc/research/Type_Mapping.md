@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-01
+updated: 2026-10-02
 domain: Data Types
 tags: [data-types, mapping, arrow, iceberg, delta-lake, multi-sink, postgres, mysql, cdc]
 resolves: G-18
@@ -308,6 +308,12 @@ Arrow maximum/minimum of the column's Arrow type: `Date32` → `i32::MIN` / `i32
 | `timestamp[tz]` beyond the i64-µs range (294247–294276 AD) | Arrow maximum |
 
 The clamped values are valid Arrow values, and Hop 2 carries them unchanged.
+
+**A key doesn't clamp (Q-M5-18, decided 2026-10-02).** A clamped timestamp equals the value of
+`infinity`, so two key values past the i64-µs range would become one identifier, and a snapshot
+cursor there would read as `infinity` and end the scan. When an identifier column's value clamps,
+the source halts the table (`SCHEMA_MISMATCH`), in the stream and in the snapshot. `±infinity` keys
+rows as usual; other columns still clamp.
 
 **Delta sink — clamp again to the Delta range (Q-M4-2, decided 2026-09-30).** The Delta protocol
 covers 0001-01-01 … 9999-12-31 23:59:59.999999. delta-rs 1.0 panics writing a `Date32` of
