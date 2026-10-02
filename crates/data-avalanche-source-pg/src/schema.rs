@@ -49,7 +49,12 @@ pub fn narrowed(from: &ColumnSchema, to: &ColumnSchema) -> bool {
 /// - a column of `cached` the catalog still has, with no stream column on it: it existed at the
 ///   signal, so the stream carries it under some name (renamed away, and its name taken);
 /// - a column placed as dropped since the signal while another column of `cached` is gone too and
-///   placed nowhere: either could be the one the name meant.
+///   placed nowhere: either could be the one the name meant;
+/// - a column of the catalog with no stream column on it, below the highest placed column the
+///   catalog still has: created before that one, it existed at the signal (a name re-added since);
+/// - a column placed as dropped since the signal while a column of the catalog has no stream
+///   column on it: a drop and an add since the signal read the same as a column re-added before it
+///   and renamed since.
 ///
 /// A column found no way halts too.
 pub fn scope(
@@ -113,6 +118,30 @@ pub fn scope(
             return Err(guess(
                 &was.name,
                 "two columns are gone from the catalog, and the stream's names don't say which",
+            ));
+        }
+    }
+    let top = columns
+        .iter()
+        .filter(|c| in_now(c.source_ordinal).is_some())
+        .filter_map(|c| c.source_ordinal)
+        .max();
+    for c in now.columns() {
+        if placed(c.source_ordinal) {
+            continue;
+        }
+        if c.source_ordinal < top {
+            return Err(guess(
+                &c.name,
+                "the catalog, ahead of the stream, has a column older than one the stream carries, \
+                 and no stream column is placed on it",
+            ));
+        }
+        if dropped_since {
+            return Err(guess(
+                &c.name,
+                "a column dropped and one added since the signal read the same as a column \
+                 re-added before it",
             ));
         }
     }
@@ -516,6 +545,45 @@ mod tests {
                     proven: true
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn scope_halts_on_a_name_re_added_since_the_signal() {
+        // `c` added at the signal; after it, `c` renamed to `x` and a new `c` added: the stream's
+        // `c` would land on the new one.
+        let hint = vec![
+            ColumnSchema::new("id", V::Int32, "integer"),
+            ColumnSchema::new("a", V::Text, "character varying(100)"),
+            ColumnSchema::new("b", V::Int32, "integer"),
+            ColumnSchema::new("c", V::Int32, "integer"),
+        ];
+        let mut columns = base().columns().to_vec();
+        columns.push(col("x", V::Int32, "integer", 4));
+        columns.push(col("c", V::Int32, "integer", 5));
+        let now = table(columns, &["id"]);
+        assert_eq!(
+            scope(&base(), &hint, &now).unwrap_err().code(),
+            "SCHEMA_MISMATCH"
+        );
+        // `b` dropped and re-added before the signal, then renamed to `x` after it: the same
+        // inputs as `b` dropped and `x` added after the signal.
+        let hint = vec![
+            ColumnSchema::new("id", V::Int32, "integer"),
+            ColumnSchema::new("a", V::Text, "character varying(100)"),
+            ColumnSchema::new("b", V::Int32, "integer"),
+        ];
+        let now = table(
+            vec![
+                col("id", V::Int32, "integer", 1).not_null(),
+                col("a", V::Text, "character varying(100)", 2),
+                col("x", V::Int32, "integer", 4),
+            ],
+            &["id"],
+        );
+        assert_eq!(
+            scope(&base(), &hint, &now).unwrap_err().code(),
+            "SCHEMA_MISMATCH"
         );
     }
 
