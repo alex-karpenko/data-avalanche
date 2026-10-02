@@ -320,6 +320,15 @@ pub async fn oids_by_name(
         .collect())
 }
 
+/// Whether the column `a` (a `pg_attribute` row) holds no NULL. PostgreSQL 18 sets `attnotnull`
+/// under a `NOT NULL … NOT VALID` constraint too, though rows from before it may still be NULL; an
+/// unvalidated constraint counts as nullable. Before 18 no not-null constraint is catalogued, so
+/// the test never matches.
+pub(crate) const NOT_NULL: &str = "(a.attnotnull AND NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_constraint nn
+     WHERE nn.conrelid = a.attrelid AND nn.contype = 'n' AND NOT nn.convalidated
+       AND nn.conkey[1] = a.attnum))";
+
 /// Describes the tables with these OIDs in three batched queries. An OID with no table is left
 /// out (the table was dropped).
 pub async fn describe(
@@ -353,14 +362,16 @@ pub async fn describe(
     }
     for r in client
         .query(
-            "SELECT a.attrelid, a.attnum, a.attname, a.atttypid, a.atttypmod, a.attnotnull,
-                    pg_catalog.format_type(a.atttypid, a.atttypmod),
-                    CASE WHEN NOT co.collisdeterministic THEN co.collname::text END
-               FROM pg_catalog.pg_attribute a
-               LEFT JOIN pg_catalog.pg_collation co ON co.oid = a.attcollation
-              WHERE a.attrelid = ANY($1) AND a.attnum > 0 AND NOT a.attisdropped
-                AND a.attgenerated = ''
-              ORDER BY a.attrelid, a.attnum",
+            &format!(
+                "SELECT a.attrelid, a.attnum, a.attname, a.atttypid, a.atttypmod, {NOT_NULL},
+                        pg_catalog.format_type(a.atttypid, a.atttypmod),
+                        CASE WHEN NOT co.collisdeterministic THEN co.collname::text END
+                   FROM pg_catalog.pg_attribute a
+                   LEFT JOIN pg_catalog.pg_collation co ON co.oid = a.attcollation
+                  WHERE a.attrelid = ANY($1) AND a.attnum > 0 AND NOT a.attisdropped
+                    AND a.attgenerated = ''
+                  ORDER BY a.attrelid, a.attnum"
+            ),
             &[&oids],
         )
         .await?

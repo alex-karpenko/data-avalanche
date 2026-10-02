@@ -62,6 +62,69 @@ async fn a_dropped_table_or_a_null_key_halts_only_its_table() {
         }) => assert_eq!(column, "k"),
         other => panic!("a nullable key halts the table: {other:?}"),
     }
+    // The table's schema dropped: `to_regclass` finds nothing (the second round's re-review).
+    a.batch_execute(&format!("DROP SCHEMA {sc} CASCADE"))
+        .await
+        .unwrap();
+    let chunk = c.read_chunk(table("k"), None, 10).await.map(|_| ());
+    assert!(dropped(chunk.clone()), "read_chunk, schema gone: {chunk:?}");
+    let key = Row(vec![("k".into(), V::Int32(1))]);
+    let rows = c.fetch_rows(table("k"), &[key]).await.map(|_| ());
+    assert!(dropped(rows.clone()), "fetch_rows, schema gone: {rows:?}");
+    cleanup(&a, &n).await;
+}
+
+/// PostgreSQL 18 sets `attnotnull` under `NOT NULL … NOT VALID`, though older rows may still be
+/// NULL: such a key column is nullable, at resolve and in a snapshot read (the second round's
+/// re-review). Older servers have no such constraint; the test passes there without running.
+#[tokio::test]
+async fn a_not_null_constraint_not_validated_is_nullable() {
+    require_it!();
+    let a = admin().await;
+    let version: i32 = a
+        .query_one("SELECT current_setting('server_version_num')::int", &[])
+        .await
+        .unwrap()
+        .get(0);
+    if version < 180_000 {
+        return;
+    }
+    let n = fresh(
+        &a,
+        "snapshot_not_valid",
+        "CREATE TABLE r (k int, v int);
+         INSERT INTO r VALUES (1, 1), (NULL, 2);
+         ALTER TABLE r ADD CONSTRAINT r_nn NOT NULL k NOT VALID;
+         ALTER TABLE r REPLICA IDENTITY FULL;
+         CREATE TABLE s (k int NOT NULL, v int);
+         ALTER TABLE s REPLICA IDENTITY FULL;",
+    )
+    .await;
+    let tables = format!("      primary_key: {{ {0}.r: [k], {0}.s: [k] }}", n.schema);
+    let c = connector(&pipeline(&n, &["r", "s"], &tables, ""));
+    let r = resolved(&c).await;
+    assert!(
+        r.halted.iter().any(|(t, h)| t.name == "r"
+            && matches!(h, HaltReason::IdentifierNotUsable { column, .. } if column == "k")),
+        "{:?}",
+        r.halted
+    );
+    let s = r.tables.iter().find(|t| t.table().name == "s").unwrap();
+    let sc = &n.schema;
+    a.batch_execute(&format!(
+        "ALTER TABLE {sc}.s ALTER COLUMN k DROP NOT NULL;
+         INSERT INTO {sc}.s VALUES (1, 1), (2, 2), (NULL, 3);
+         ALTER TABLE {sc}.s ADD CONSTRAINT s_nn NOT NULL k NOT VALID;"
+    ))
+    .await
+    .unwrap();
+    match c.read_chunk(s, None, 1).await {
+        Err(SourceError::TableHalt {
+            reason: HaltReason::IdentifierNotUsable { column, .. },
+            ..
+        }) => assert_eq!(column, "k"),
+        other => panic!("a key under a constraint not validated halts the table: {other:?}"),
+    }
     cleanup(&a, &n).await;
 }
 

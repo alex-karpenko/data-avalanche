@@ -10,7 +10,7 @@ use data_avalanche_core::{
 };
 use tokio_postgres::SimpleQueryMessage;
 
-use crate::catalog::{load_types, table_key};
+use crate::catalog::{NOT_NULL, load_types, table_key};
 use crate::connect::{SERVER_FIRST, server_millis};
 use crate::connector::PgConnector;
 use crate::error::sqlstate;
@@ -84,13 +84,15 @@ async fn read_plan(c: &PgConnector, schema: &TableSchema) -> Result<Vec<ReadColu
         .command(
             "read the table's columns",
             client.query(
-                "SELECT a.attname, a.atttypid, a.atttypmod,
-                        pg_catalog.format_type(a.atttypid, a.atttypmod), co.collname::text,
-                        co.collisdeterministic, a.attnotnull
-                   FROM pg_catalog.pg_attribute a
-                   LEFT JOIN pg_catalog.pg_collation co ON co.oid = a.attcollation
-                  WHERE a.attrelid = $1 AND a.attname = ANY($2)
-                    AND a.attnum > 0 AND NOT a.attisdropped",
+                &format!(
+                    "SELECT a.attname, a.atttypid, a.atttypmod,
+                            pg_catalog.format_type(a.atttypid, a.atttypmod), co.collname::text,
+                            co.collisdeterministic, {NOT_NULL}
+                       FROM pg_catalog.pg_attribute a
+                       LEFT JOIN pg_catalog.pg_collation co ON co.oid = a.attcollation
+                      WHERE a.attrelid = $1 AND a.attname = ANY($2)
+                        AND a.attnum > 0 AND NOT a.attisdropped"
+                ),
                 &[&oid, &names],
             ),
         )
