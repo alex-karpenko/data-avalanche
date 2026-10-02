@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use data_avalanche_core::position::Lsn;
 use data_avalanche_core::{
-    CdcEvent, ChangeStream, ColumnValue as V, HaltReason, Op, Row, SchemaHint, SourceError,
-    SourcePosition, SourceSeq, StreamItem, TableRef,
+    CdcEvent, ChangeStream, ColumnValue as V, Decimal, HaltReason, Op, Row, SchemaHint,
+    SourceError, SourcePosition, SourceSeq, StreamItem, TableRef,
 };
 use data_avalanche_testkit::require_it;
 
@@ -316,27 +316,33 @@ async fn s_pg5_a_stalled_consumer_survives() {
     let n = fresh(&a, "s_pg5", "CREATE TABLE t (id bigint PRIMARY KEY);").await;
     let c = connector(&pipeline(&n, &["*"], "", ""));
     let (mut s, _, _) = first_stream(&c).await;
-    // Server-wide, so other tests' streams see it too: their status interval is 1 s.
+    // Server-wide, so other tests' streams see it too: their status interval is 1 s. The stalled
+    // half runs as its own task, so the setting is reset when it fails too.
     a.batch_execute("ALTER SYSTEM SET wal_sender_timeout = '3s'")
         .await
         .unwrap();
     a.batch_execute("SELECT pg_reload_conf()").await.unwrap();
-    // 10 000 changes overflow the client's 8 192-event buffer.
-    a.execute(
-        &format!(
-            "INSERT INTO {}.t SELECT g FROM generate_series(1, 10000) g",
-            n.schema
-        ),
-        &[],
-    )
-    .await
-    .unwrap();
-    tokio::time::sleep(Duration::from_secs(10)).await;
-    let items = collect(&mut s, 1, 60).await;
+    let schema = n.schema.clone();
+    let stalled = tokio::spawn(async move {
+        // 10 000 changes overflow the client's 8 192-event buffer.
+        admin()
+            .await
+            .execute(
+                &format!("INSERT INTO {schema}.t SELECT g FROM generate_series(1, 10000) g"),
+                &[],
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let items = collect(&mut s, 1, 60).await;
+        (s, items)
+    })
+    .await;
     a.batch_execute("ALTER SYSTEM RESET wal_sender_timeout")
         .await
         .unwrap();
     a.batch_execute("SELECT pg_reload_conf()").await.unwrap();
+    let (s, items) = stalled.unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()));
     assert_eq!(changes(&items).len(), 10_000);
     s.close().await.unwrap();
     cleanup(&a, &n).await;
@@ -390,8 +396,6 @@ async fn s_pg6_a_table_added_to_the_publication_mid_stream() {
     cleanup(&a, &n).await;
 }
 
-/// Channel B: a changed column list signals before the change that carries it; an unchanged one
-/// doesn't.
 /// Q-M5-5: partitions replicate as tables. A write through the parent arrives under its leaf, a
 /// row whose partition key moves it arrives as a delete in one leaf and an insert in the other, and
 /// a TRUNCATE of the parent truncates the leaves.
@@ -473,6 +477,8 @@ async fn partition_changes_arrive_under_their_leaves() {
     cleanup(&a, &n).await;
 }
 
+/// Channel B: a changed column list signals before the change that carries it; an unchanged one
+/// doesn't.
 #[tokio::test(flavor = "multi_thread")]
 async fn relation_changes_signal_before_the_next_change() {
     require_it!();
@@ -704,5 +710,188 @@ async fn a_mixed_case_publication_streams() {
     a.batch_execute("DROP PUBLICATION \"It_Mixed_Pub\"")
         .await
         .unwrap();
+    cleanup(&a, &n).await;
+}
+
+/// Channel B: a changed primary key or replica identity signals (channel C halts the table on
+/// an identifier change). A `"char"` byte above 127 decodes (PostgreSQL 14 sends it raw).
+#[tokio::test(flavor = "multi_thread")]
+async fn key_and_identity_changes_signal() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(
+        &a,
+        "stream_keys",
+        "CREATE TABLE t (id int PRIMARY KEY, code int NOT NULL, c \"char\");",
+    )
+    .await;
+    let c = connector(&pipeline(&n, &["*"], "", ""));
+    let (mut s, _, _) = first_stream(&c).await;
+    let sc = &n.schema;
+    each(
+        &a,
+        &[
+            format!("INSERT INTO {sc}.t VALUES (1, 1, chr(195)::\"char\")"),
+            format!("ALTER TABLE {sc}.t DROP CONSTRAINT t_pkey, ADD PRIMARY KEY (code)"),
+            format!("INSERT INTO {sc}.t VALUES (2, 2)"),
+            format!("ALTER TABLE {sc}.t REPLICA IDENTITY FULL"),
+            format!("INSERT INTO {sc}.t VALUES (3, 3)"),
+            format!("DELETE FROM {sc}.t WHERE code = 3"),
+        ],
+    )
+    .await;
+    let items = collect(&mut s, 4, 20).await;
+    let kinds: Vec<&str> = items
+        .iter()
+        .filter_map(|i| match i {
+            StreamItem::SchemaSignal { .. } => Some("signal"),
+            StreamItem::Change(_) => Some("change"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        ["change", "signal", "change", "signal", "change", "change"],
+        "no signal for the first Relation message: its key is the opening identifier"
+    );
+    let c = changes(&items);
+    assert_eq!(c[0].after.as_ref().unwrap().get("c"), Some(&V::Int16(195)));
+    assert_eq!(
+        c[3].before,
+        Some(row(&[
+            ("id", V::Int32(3)),
+            ("code", V::Int32(3)),
+            ("c", V::Null)
+        ])),
+        "REPLICA IDENTITY FULL: the whole old row"
+    );
+    s.close().await.unwrap();
+    cleanup(&a, &n).await;
+}
+
+/// A tracked table renamed away, or replaced by another table under its name, halts
+/// (`TABLE_DROPPED`): a re-created table doesn't resume (`Schema_Change…` §7).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_renamed_or_replaced_table_halts() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(
+        &a,
+        "stream_renames",
+        "CREATE TABLE t (id int PRIMARY KEY);
+         CREATE TABLE u (id int PRIMARY KEY);
+         CREATE TABLE u_new (id int PRIMARY KEY);",
+    )
+    .await;
+    let c = connector(&pipeline(&n, &["t", "u"], "", ""));
+    let (mut s, _, _) = first_stream(&c).await;
+    let sc = &n.schema;
+    each(
+        &a,
+        &[
+            format!("INSERT INTO {sc}.t VALUES (1)"),
+            format!("INSERT INTO {sc}.u VALUES (1)"),
+            format!("ALTER PUBLICATION {} ADD TABLE {sc}.u_new", n.publication),
+            format!("ALTER TABLE {sc}.t RENAME TO t_old"),
+            format!("INSERT INTO {sc}.t_old VALUES (2)"),
+            format!(
+                "BEGIN; ALTER TABLE {sc}.u RENAME TO u_old; ALTER TABLE {sc}.u_new RENAME TO u; COMMIT"
+            ),
+            format!("INSERT INTO {sc}.u VALUES (2)"),
+            format!("INSERT INTO {sc}.u_old VALUES (3)"),
+            format!("INSERT INTO {sc}.t_old VALUES (3)"),
+            format!("INSERT INTO {sc}.u VALUES (3)"),
+        ],
+    )
+    .await;
+    // Four transactions with items: two changes, two halts; the later ones are skipped.
+    let items = collect(&mut s, 4, 20).await;
+    let got: Vec<String> = items
+        .iter()
+        .filter_map(|i| match i {
+            StreamItem::Change(e) => Some(format!("change {}", e.table.name)),
+            StreamItem::TableHalt { table, reason, .. } => {
+                Some(format!("halt {} {}", table.name, reason.code()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [
+            "change t",
+            "change u",
+            "halt t TABLE_DROPPED",
+            "halt u TABLE_DROPPED"
+        ]
+    );
+    // Nothing more: the halted tables' later changes are skipped under either OID.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while let Ok(item) = tokio::time::timeout_at(deadline, s.next()).await {
+        let item = item.unwrap();
+        assert!(
+            matches!(
+                item,
+                StreamItem::KeepAlive(_) | StreamItem::Begin { .. } | StreamItem::Commit(_)
+            ),
+            "{item:?}"
+        );
+    }
+    s.close().await.unwrap();
+    cleanup(&a, &n).await;
+}
+
+/// `next` is cancel-safe: calls dropped at every await, the Relation message's catalog queries
+/// among them, lose nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn next_is_cancel_safe() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(&a, "stream_cancel", "CREATE TABLE t (id int PRIMARY KEY);").await;
+    let c = connector(&pipeline(&n, &["*"], "", ""));
+    let (mut s, _, _) = first_stream(&c).await;
+    let sc = &n.schema;
+    each(
+        &a,
+        &[
+            // A type the stream hasn't read yet: its Relation message queries the catalog.
+            format!("ALTER TABLE {sc}.t ADD COLUMN w numeric(7,3)"),
+            format!("INSERT INTO {sc}.t VALUES (1, 1.5)"),
+        ],
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await; // the events are in the client's buffer
+    let mut items = vec![];
+    let mut cancelled = 0;
+    let mut wait = Duration::from_micros(20);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !items.iter().any(|i| matches!(i, StreamItem::Change(_))) {
+        assert!(tokio::time::Instant::now() < deadline, "{items:?}");
+        match tokio::time::timeout(wait, s.next()).await {
+            Ok(item) => items.push(item.expect("stream item")),
+            Err(_) => {
+                cancelled += 1;
+                wait = (wait * 2).min(Duration::from_millis(200));
+            }
+        }
+    }
+    assert!(cancelled > 0, "no call was cancelled");
+    let kinds: Vec<&str> = items
+        .iter()
+        .filter_map(|i| match i {
+            StreamItem::SchemaSignal { .. } => Some("signal"),
+            StreamItem::Change(_) => Some("change"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(kinds, ["signal", "change"], "{items:?}");
+    assert_eq!(
+        changes(&items)[0].after,
+        Some(row(&[
+            ("id", V::Int32(1)),
+            ("w", V::Numeric(Decimal::parse("1.500").unwrap()))
+        ]))
+    );
+    s.close().await.unwrap();
     cleanup(&a, &n).await;
 }

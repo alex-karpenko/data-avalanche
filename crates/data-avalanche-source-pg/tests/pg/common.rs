@@ -133,9 +133,10 @@ pub fn connector(p: &Pipeline) -> PgConnector {
 
 /// The test's slot, publication and schema, dropped at the end of a passing test.
 pub async fn cleanup(admin: &Client, n: &Names) {
+    release(admin, &n.slot).await;
     admin
         .execute(
-            "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1 AND NOT active",
+            "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1",
             &[&n.slot],
         )
         .await
@@ -147,6 +148,30 @@ pub async fn cleanup(admin: &Client, n: &Names) {
         ))
         .await
         .expect("drop the test schema");
+}
+
+/// Waits until no walsender holds `slot`, terminating one that still does after 5 s (a stream
+/// dropped without `close`).
+pub async fn release(admin: &Client, slot: &str) {
+    for i in 0..100 {
+        let pid: Option<i32> = admin
+            .query_one(
+                "SELECT (SELECT active_pid FROM pg_replication_slots WHERE slot_name = $1)",
+                &[&slot],
+            )
+            .await
+            .expect("read the test slot")
+            .get(0);
+        let Some(pid) = pid else { return };
+        if i == 50 {
+            admin
+                .execute("SELECT pg_terminate_backend($1)", &[&pid])
+                .await
+                .expect("terminate the walsender");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("slot {slot} is still active");
 }
 
 /// `connector`'s resolved tables, by name.

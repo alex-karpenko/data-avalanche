@@ -242,7 +242,9 @@ pub trait SourceConnector: Send + Sync {
 /// The change stream of one [`SourceConnector::open_stream`] call.
 #[async_trait]
 pub trait ChangeStream: Send {
-    /// The next item. An error ends the stream; reopen from the checkpoint.
+    /// The next item. An error ends the stream; reopen from the checkpoint. Cancel-safe: the
+    /// event loop runs it in `tokio::select!` (Data-Flow Phase 2a), and a call dropped before it
+    /// returns loses nothing.
     async fn next(&mut self) -> Result<StreamItem, SourceError>;
 
     /// Tells the source that everything up to `durable` is committed to the sink, so it can free

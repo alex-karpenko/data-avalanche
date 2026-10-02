@@ -2,9 +2,17 @@
 //! messages → `StreamItem`s. Relation messages are channel B (`Schema_Change…` §3): a tracked
 //! table whose columns differ from what the stream last saw gets a `SchemaSignal` before its next
 //! change, at that change's position. A Relation message carries no position of its own: its
-//! `XLogData` start is 0 (measured on PostgreSQL 18, D-M5.3).
+//! `XLogData` start is 0 (measured on PostgreSQL 18, D-M5.3). A changed replica identity signals
+//! too, and a tracked table whose name and relation OID part within the session halts
+//! (`TABLE_DROPPED`, `Schema_Change…` §7).
+//!
+//! `next` is cancel-safe (Data-Flow Phase 2a runs it in `tokio::select!`): the event it is
+//! handling stays in the stream until handled, so a call dropped at a Relation message's catalog
+//! query handles the message again on the next call.
 
-use std::collections::{HashMap, VecDeque};
+use std::borrow::Cow;
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use data_avalanche_config::Tables;
@@ -18,8 +26,9 @@ use pgwire_replication::{ReplicationClient, ReplicationEvent};
 use tokio_postgres::Client;
 
 use crate::catalog::{load_types, table_key};
+use crate::connect::within;
 use crate::connector::PgConnector;
-use crate::error::{protocol, replication_error, sql_error};
+use crate::error::{protocol, replication_error};
 use crate::pgoutput::{Datum, Message, OldKind, RelationColumn, decode};
 use crate::position::{from_wire, lsn_of, to_wire};
 use crate::types::{TypeCatalog, plan_column};
@@ -72,6 +81,34 @@ fn shape_of(columns: &[ColumnSchema]) -> Shape {
         .collect()
 }
 
+/// The replica identity of a Relation message: its setting (`d` default, `n` nothing, `f` full,
+/// `i` index) and the columns it flags as key.
+type Identity = (u8, BTreeSet<String>);
+
+/// What the stream knows about a table it was opened for.
+#[derive(Debug)]
+struct Known {
+    /// Its shape when the stream last saw it.
+    shape: Shape,
+    /// Its identifier when the stream opened.
+    identifier: BTreeSet<String>,
+    /// Its replica identity in its last Relation message of this session.
+    identity: Option<Identity>,
+    /// Its relation OID, bound by its first Relation message of this session.
+    oid: Option<u32>,
+    /// Halted: its changes are skipped, under any OID.
+    halted: bool,
+}
+
+/// Whether `decode` reads a `"char"` (directly or before a conversion).
+fn reads_char(decode: &Decode) -> bool {
+    match decode {
+        Decode::Char => true,
+        Decode::Convert { from, .. } => reads_char(from),
+        _ => false,
+    }
+}
+
 /// The stream of one `open_stream` call.
 pub struct PgStream {
     client: ReplicationClient,
@@ -79,12 +116,17 @@ pub struct PgStream {
     catalog: Client,
     types: TypeCatalog,
     tables: Tables,
-    /// The shape each tracked table had when the stream last saw it.
-    shapes: HashMap<TableRef, Shape>,
+    /// The tables the stream was opened for.
+    known: HashMap<TableRef, Known>,
     relations: HashMap<u32, RelationState>,
     type_names: HashMap<(u32, i32), String>,
     txn: Option<Txn>,
     pending: VecDeque<StreamItem>,
+    /// The event `next` is handling, until it is handled (cancel safety).
+    inflight: Option<ReplicationEvent>,
+    slot: String,
+    /// `timeouts.command`: the catalog queries, and the wait for the slot's release.
+    command: Duration,
     start: Lsn,
     acknowledged: Lsn,
 }
@@ -94,7 +136,7 @@ impl std::fmt::Debug for PgStream {
         f.debug_struct("PgStream")
             .field("start", &self.start)
             .field("acknowledged", &self.acknowledged)
-            .field("tables", &self.shapes.len())
+            .field("tables", &self.known.len())
             .finish_non_exhaustive()
     }
 }
@@ -125,6 +167,7 @@ impl PgConnector {
             types,
             self.pipeline.tables.clone(),
             tables,
+            (self.pg.slot.clone(), self.conn.timeouts.command),
             start,
         )))
     }
@@ -137,6 +180,7 @@ impl PgStream {
         types: TypeCatalog,
         tables: Tables,
         schemas: &[TableSchema],
+        (slot, command): (String, Duration),
         start: Lsn,
     ) -> Self {
         Self {
@@ -144,14 +188,26 @@ impl PgStream {
             catalog,
             types,
             tables,
-            shapes: schemas
+            known: schemas
                 .iter()
-                .map(|s| (s.table().clone(), shape_of(s.columns())))
+                .map(|s| {
+                    let known = Known {
+                        shape: shape_of(s.columns()),
+                        identifier: s.identifier().iter().cloned().collect(),
+                        identity: None,
+                        oid: None,
+                        halted: false,
+                    };
+                    (s.table().clone(), known)
+                })
                 .collect(),
             relations: HashMap::new(),
             type_names: HashMap::new(),
             txn: None,
             pending: VecDeque::new(),
+            inflight: None,
+            slot,
+            command,
             start,
             acknowledged: start,
         }
@@ -167,15 +223,16 @@ impl PgStream {
         if !wanted.is_empty() {
             let oids: Vec<u32> = wanted.iter().map(|w| w.0).collect();
             let mods: Vec<i32> = wanted.iter().map(|w| w.1).collect();
-            let rows = self
-                .catalog
-                .query(
+            let rows = within(
+                "read type names",
+                self.command,
+                self.catalog.query(
                     "SELECT x.o, x.m, pg_catalog.format_type(x.o, x.m)
                        FROM unnest($1::oid[], $2::int4[]) AS x(o, m)",
                     &[&oids, &mods],
-                )
-                .await
-                .map_err(sql_error)?;
+                ),
+            )
+            .await?;
             for r in rows {
                 self.type_names.insert((r.get(0), r.get(1)), r.get(2));
             }
@@ -186,28 +243,68 @@ impl PgStream {
             .collect())
     }
 
-    /// Channel B: a Relation message. A tracked table will get a `SchemaSignal` when its shape
-    /// changed, or a `TableHalt` when a column can't be planned any more ([`Self::announce`]).
+    /// Channel B: a Relation message. A tracked table will get a `SchemaSignal` when its shape or
+    /// replica identity changed, or a `TableHalt` when a column can't be planned any more or the
+    /// table's name and OID parted ([`Self::announce`]). Everything before the catalog queries is
+    /// idempotent, so a message handled again after a cancelled `next` ends the same way.
     async fn relation(
         &mut self,
         oid: u32,
         table: TableRef,
+        replica_identity: u8,
         columns: Vec<RelationColumn>,
     ) -> Result<(), SourceError> {
-        if !self.shapes.contains_key(&table) {
+        match self.relations.get(&oid) {
+            Some(RelationState::Halted) => return Ok(()),
+            // A tracked table's OID under another name: the table was renamed away. Channel D
+            // finds it dropped too.
+            Some(RelationState::Tracked { table: was, .. }) if *was != table => {
+                let was = was.clone();
+                self.relations.insert(
+                    oid,
+                    RelationState::Halting {
+                        table: was,
+                        reason: HaltReason::TableDropped,
+                    },
+                );
+                return Ok(());
+            }
+            Some(RelationState::Halting { table: was, .. }) if *was != table => return Ok(()),
+            _ => {}
+        }
+        let Some(known) = self.known.get_mut(&table) else {
             self.relations.insert(oid, RelationState::Untracked);
             return Ok(());
-        }
-        if let Some(RelationState::Halted) = self.relations.get(&oid) {
+        };
+        if known.halted {
+            self.relations.insert(oid, RelationState::Halted);
             return Ok(());
         }
-        load_types(
-            &self.catalog,
-            columns.iter().map(|c| c.type_oid),
-            &mut self.types,
+        match known.oid {
+            // A tracked table's name on another OID: the table was dropped or renamed away and
+            // another took its name. A re-created table doesn't resume (`Schema_Change…` §7).
+            Some(bound) if bound != oid => {
+                self.relations.insert(
+                    oid,
+                    RelationState::Halting {
+                        table,
+                        reason: HaltReason::TableDropped,
+                    },
+                );
+                return Ok(());
+            }
+            _ => known.oid = Some(oid),
+        }
+        within(
+            "load types",
+            self.command,
+            load_types(
+                &self.catalog,
+                columns.iter().map(|c| c.type_oid),
+                &mut self.types,
+            ),
         )
-        .await
-        .map_err(sql_error)?;
+        .await?;
         let type_names = self.type_names(&columns).await?;
         let key = table_key(&table);
         let mut schema = Vec::with_capacity(columns.len());
@@ -247,11 +344,31 @@ impl PgStream {
                 }
             }
         }
-        let shape = shape_of(&schema);
-        let signal = (self.shapes.get(&table) != Some(&shape)).then(|| {
-            self.shapes.insert(table.clone(), shape);
-            SchemaHint::Columns(schema)
+        let identity: Identity = (
+            replica_identity,
+            columns
+                .iter()
+                .filter(|c| c.key)
+                .map(|c| c.name.clone())
+                .collect(),
+        );
+        let known = self.known.get_mut(&table).expect("a tracked table");
+        // Before its first Relation message, a table's replica identity is the one its schema
+        // implies: every column under REPLICA IDENTITY FULL, else its identifier. Another index
+        // as the identity signals once per session; channel C finds nothing changed.
+        let before = known.identity.take().unwrap_or_else(|| {
+            let keys = if replica_identity == b'f' {
+                columns.iter().map(|c| c.name.clone()).collect()
+            } else {
+                known.identifier.clone()
+            };
+            (replica_identity, keys)
         });
+        let shape = shape_of(&schema);
+        let changed = known.shape != shape || before != identity;
+        known.shape = shape;
+        known.identity = Some(identity);
+        let signal = changed.then_some(SchemaHint::Columns(schema));
         self.relations.insert(
             oid,
             RelationState::Tracked {
@@ -263,9 +380,28 @@ impl PgStream {
         Ok(())
     }
 
+    /// Halts `table` at `seq`, once: its changes are skipped from here on, under any OID.
+    fn halt(&mut self, oid: u32, table: TableRef, seq: SourceSeq, reason: HaltReason) {
+        self.relations.insert(oid, RelationState::Halted);
+        let Some(known) = self.known.get_mut(&table) else {
+            return;
+        };
+        if !std::mem::replace(&mut known.halted, true) {
+            self.pending
+                .push_back(StreamItem::TableHalt { table, seq, reason });
+        }
+    }
+
     /// Before a change or TRUNCATE of `oid` at `seq`: the signal or halt its last Relation message
     /// left.
     fn announce(&mut self, oid: u32, seq: SourceSeq) {
+        if let Some(RelationState::Tracked { table, .. }) = self.relations.get(&oid)
+            && self.known.get(table).is_some_and(|k| k.halted)
+        {
+            // Halted under its other OID.
+            self.relations.insert(oid, RelationState::Halted);
+            return;
+        }
         match self.relations.get_mut(&oid) {
             Some(RelationState::Tracked { table, signal, .. }) => {
                 if let Some(hint) = signal.take() {
@@ -280,8 +416,7 @@ impl PgStream {
                 else {
                     unreachable!("matched above")
                 };
-                self.pending
-                    .push_back(StreamItem::TableHalt { table, seq, reason });
+                self.halt(oid, table, seq, reason);
             }
             _ => {}
         }
@@ -310,13 +445,21 @@ impl PgStream {
                 Datum::Null => ColumnValue::Null,
                 Datum::Unchanged => ColumnValue::Unchanged,
                 Datum::Text(bytes) => {
-                    let Ok(text) = std::str::from_utf8(&bytes) else {
-                        return Ok(Err(HaltReason::SchemaMismatch {
-                            column: c.name.clone(),
-                            detail: "the value isn't valid UTF-8".into(),
-                        }));
+                    let text = match std::str::from_utf8(&bytes) {
+                        Ok(text) => Cow::Borrowed(text),
+                        // PostgreSQL 14 sends a `"char"` byte above 127 as itself; 15 and later
+                        // send `\ooo`.
+                        Err(_) if bytes.len() == 1 && reads_char(&c.decode) => {
+                            Cow::Owned(format!("\\{:03o}", bytes[0]))
+                        }
+                        Err(_) => {
+                            return Ok(Err(HaltReason::SchemaMismatch {
+                                column: c.name.clone(),
+                                detail: "the value isn't valid UTF-8".into(),
+                            }));
+                        }
                     };
-                    match value::decode(&c.decode, text) {
+                    match value::decode(&c.decode, &text) {
                         Ok(v) => v,
                         Err(ValueError::Overflow) => {
                             return Ok(Err(HaltReason::NumericOverflow {
@@ -374,9 +517,7 @@ impl PgStream {
             _ => None,
         };
         if let Some(reason) = halt(&before).or_else(|| halt(&after)) {
-            self.relations.insert(relation, RelationState::Halted);
-            self.pending
-                .push_back(StreamItem::TableHalt { table, seq, reason });
+            self.halt(relation, table, seq, reason);
             return Ok(());
         }
         self.pending.push_back(StreamItem::Change(CdcEvent {
@@ -399,15 +540,15 @@ impl PgStream {
                 oid,
                 namespace,
                 name,
+                replica_identity,
                 columns,
-                ..
             } => {
                 let schema = if namespace.is_empty() {
                     "pg_catalog".into()
                 } else {
                     namespace
                 };
-                self.relation(oid, TableRef::new(schema, name), columns)
+                self.relation(oid, TableRef::new(schema, name), replica_identity, columns)
                     .await?;
             }
             Message::Insert { relation, new } => {
@@ -510,15 +651,22 @@ impl ChangeStream for PgStream {
             if let Some(item) = self.pending.pop_front() {
                 return Ok(item);
             }
-            match self.client.recv().await {
-                Ok(Some(ev)) => self.event(ev).await?,
-                Ok(None) => {
-                    return Err(SourceError::Transient(
-                        "the replication stream ended".into(),
-                    ));
-                }
-                Err(e) => return Err(replication_error(e, Some(self.acknowledged.to_string()))),
-            }
+            let ev = match &self.inflight {
+                Some(ev) => ev.clone(),
+                None => match self.client.recv().await {
+                    Ok(Some(ev)) => self.inflight.insert(ev).clone(),
+                    Ok(None) => {
+                        return Err(SourceError::Transient(
+                            "the replication stream ended".into(),
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(replication_error(e, Some(self.acknowledged.to_string())));
+                    }
+                },
+            };
+            self.event(ev).await?;
+            self.inflight = None;
         }
     }
 
@@ -533,11 +681,36 @@ impl ChangeStream for PgStream {
         Ok(())
     }
 
+    /// Ends the stream, then waits up to `timeouts.command` for the server to release the slot:
+    /// its walsender lets go after the client has left, and a stream reopened before then fails
+    /// with `55006` (measured on PostgreSQL 18).
     async fn close(mut self: Box<Self>) -> Result<(), SourceError> {
         self.client
             .shutdown()
             .await
-            .map_err(|e| replication_error(e, None))
+            .map_err(|e| replication_error(e, None))?;
+        let deadline = tokio::time::Instant::now() + self.command;
+        loop {
+            let row = within(
+                "read the slot",
+                self.command,
+                self.catalog.query_opt(
+                    "SELECT active FROM pg_catalog.pg_replication_slots WHERE slot_name = $1",
+                    &[&self.slot],
+                ),
+            )
+            .await?;
+            if !row.is_some_and(|r| r.get::<_, bool>(0)) {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(SourceError::Transient(format!(
+                    "slot {} is still active {:?} after the stream closed",
+                    self.slot, self.command
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 }
 
@@ -608,6 +781,24 @@ mod tests {
             PgStream::row(&[col("t", false, Decode::Text)], vec![latin1], false).unwrap(),
             Err(HaltReason::SchemaMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn a_raw_char_byte_decodes() {
+        // PostgreSQL 14 sends "char" 0xC3 as the byte itself (measured).
+        let raw = || vec![Datum::Text(bytes::Bytes::from_static(&[0xc3]))];
+        assert_eq!(
+            PgStream::row(&[col("c", false, Decode::Char)], raw(), false).unwrap(),
+            Ok(Row(vec![("c".into(), ColumnValue::Int16(195))]))
+        );
+        let wider = Decode::Convert {
+            from: Box::new(Decode::Char),
+            to: ColumnValueType::Int64,
+        };
+        assert_eq!(
+            PgStream::row(&[col("c", false, wider)], raw(), false).unwrap(),
+            Ok(Row(vec![("c".into(), ColumnValue::Int64(195))]))
+        );
     }
 
     #[test]
