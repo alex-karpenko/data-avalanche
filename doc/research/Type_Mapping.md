@@ -309,11 +309,12 @@ Arrow maximum/minimum of the column's Arrow type: `Date32` → `i32::MIN` / `i32
 
 The clamped values are valid Arrow values, and Hop 2 carries them unchanged.
 
-**A key doesn't clamp (Q-M5-18, decided 2026-10-02).** A clamped timestamp equals the value of
-`infinity`, so two key values past the i64-µs range would become one identifier, and a snapshot
-cursor there would read as `infinity` and end the scan. When an identifier column's value clamps,
-the source halts the table (`SCHEMA_MISMATCH`), in the stream and in the snapshot. `±infinity` keys
-rows as usual; other columns still clamp.
+**The source doesn't clamp a key (Q-M5-18, decided 2026-10-02).** A clamped timestamp equals the
+value of `infinity`, so two key values at or past the last i64 microsecond
+(`294247-01-10 04:00:54.775807`) would become one identifier, and a snapshot cursor there would
+read as `infinity` and end the scan. When an identifier column's value clamps, the source halts
+the table (`SCHEMA_MISMATCH`), in the stream and in the snapshot. At the source, `±infinity` keys
+rows as usual (the Delta sink halts them, below); other columns still clamp.
 
 **Delta sink — clamp again to the Delta range (Q-M4-2, decided 2026-09-30).** The Delta protocol
 covers 0001-01-01 … 9999-12-31 23:59:59.999999. delta-rs 1.0 panics writing a `Date32` of
@@ -323,6 +324,12 @@ that range: PostgreSQL `±infinity` lands on `0001-01-01` / `9999-12-31` (and
 `… 23:59:59.999999` for timestamps). A `timestamp_ntz` stored as `string` is not clamped; its
 text form covers all of `i64`. The M4 round trip (Task 13) reads the bounds back through delta-rs
 and DuckDB `delta_scan`.
+
+**The Delta sink doesn't clamp a key either (Q-M5-19, decided 2026-10-02).** Clamped, two keys
+outside the Delta range (two BC dates, two from 10000 AD, or `infinity` and
+`9999-12-31 23:59:59.999999`) would become one in the MERGE. Hop 3b checks each identifier column
+first: a cell outside the range is a `Permanent` sink error, and the table halts. So on Delta, a
+`date` or `timestamp` key holding `±infinity` halts its table; a column that isn't a key clamps.
 
 **MySQL / MariaDB — NULL for "no date", halt for invalid dates.** Measured 2026-09-26: MySQL 8.4's
 default `sql_mode` rejects all of the values below, but any session can relax it
