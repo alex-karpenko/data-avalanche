@@ -22,6 +22,14 @@ services:
   postgres-16: { <<: *pg, image: "postgres:16", ports: ["55416:5432"], profiles: [matrix] }
   postgres-15: { <<: *pg, image: "postgres:15", ports: ["55415:5432"], profiles: [matrix] }
   postgres-14: { <<: *pg, image: "postgres:14", ports: ["55414:5432"], profiles: [matrix] }
+  # TLS required on every TCP connection, throwaway certificates made at start (postgres-tls.sh).
+  postgres-tls:
+    image: "postgres:18"
+    environment: { POSTGRES_USER: avalanche, POSTGRES_PASSWORD: avalanche, POSTGRES_DB: avalanche }
+    entrypoint: ["bash", "/postgres-tls.sh"]
+    volumes: ["./postgres-tls.sh:/postgres-tls.sh:ro", "./.tls:/tls"]
+    ports: ["55419:5432"]
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U avalanche -d avalanche"], interval: 2s, retries: 30 }
 
   mysql-84:
     image: "mysql:8.4"

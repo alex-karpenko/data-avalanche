@@ -10,6 +10,7 @@ on `PATH`; it fetches DuckDB itself.
 |---|---|---|---|---|
 | postgres-18 | postgres:18 | 55418 | avalanche / avalanche, db `avalanche` | default |
 | postgres-14…17 | postgres:14…17 | 55414…55417 | same | matrix |
+| postgres-tls | postgres:18, TLS required (`postgres-tls.sh`) | 55419 | avalanche / avalanche; `avalanche_cert` by client certificate | default |
 | mysql-84 | mysql:8.4 (GTID on) | 53384 | root / avalanche, db `avalanche` | default |
 | mariadb-118 | mariadb:11.8 (`gtid_strict_mode=1`) | 53318 | root / avalanche | default |
 | mariadb-114, mariadb-1011 | mariadb:11.4, 10.11 | 53314, 53311 | root / avalanche | matrix |
@@ -19,8 +20,25 @@ on `PATH`; it fetches DuckDB itself.
 Bucket / container `data-avalanche-test` is created by the `init` profile (`up.sh` runs it). Azurite keeps
 port 10000 because `object_store`'s emulator mode always targets `127.0.0.1:10000`.
 
-Added by later milestones: `postgres-tls` (M5, CA-signed server certificate) and `mysql-84-nogtid`
-(M7, file/position mode).
+Added by a later milestone: `mysql-84-nogtid` (M7, file/position mode).
+
+## PostgreSQL
+
+The PostgreSQL source's tests (`crates/data-avalanche-source-pg/tests/pg`) run against
+`postgres-18`; `DATA_AVALANCHE_PG_PORT` points them at another server, and
+`.github/workflows/nightly.yml` runs them on PostgreSQL 14–17 every night (and on manual dispatch):
+
+```sh
+docker compose -f test-infra/compose.yaml --profile matrix up -d --wait postgres-14
+DATA_AVALANCHE_IT=1 DATA_AVALANCHE_PG_PORT=55414 cargo test -p data-avalanche-source-pg --test pg --test slot_invalidation -- --skip tls::
+```
+
+`postgres-tls` refuses every TCP connection without TLS. At each start it makes a throwaway CA, a
+server certificate for `localhost` only (a connection by `127.0.0.1` is a name mismatch, which
+the `verify-ca` test needs), and a client certificate for the role
+`avalanche_cert`, which authenticates by certificate (`pg_hba` `cert`). It writes the CA and the
+client pair to `test-infra/.tls/` (git-ignored) for the TLS tests; the server key stays in the
+container. Nothing is committed.
 
 ## GCS: a real bucket, not an emulator
 
