@@ -58,7 +58,8 @@
 //!   [`HostPort`]/[`HostPortError`]), [`Secret`], [`Pem`], [`Origin`], [`FileRef`], [`LogFilter`]
 //!   (a resolved `Log.level`), and [`Loc`] (a [`Diagnostic`]'s source location);
 //! - **diagnostics:** [`Report`], [`Diagnostic`], [`Severity`], [`Locus`], [`PARSE`], [`TYPE`];
-//! - **the registry:** [`RULES`], [`RuleMeta`], [`RuleSeverity`], [`RuleInput`], [`rule_meta`];
+//! - **the registry:** [`RULES`], [`RuleMeta`], [`RuleSeverity`], [`RuleLocus`], [`RuleInput`],
+//!   [`rule_meta`];
 //! - **the reload diff:** [`diff`], [`ConfigDiff`], [`FieldChange`], [`PipelineChange`],
 //!   [`Mutability`];
 //! - **external checks:** [`ClusterAnchor`] and the three `check_*` functions;
@@ -95,7 +96,7 @@ pub use leaf::Loc;
 pub use load::{Loaded, load_file, load_str, validate_str};
 pub use material::{FileRef, Origin, Pem};
 pub use mutability::Mutability;
-pub use registry::{RULES, RuleInput, RuleMeta, RuleSeverity, rule_meta};
+pub use registry::{RULES, RuleInput, RuleLocus, RuleMeta, RuleSeverity, rule_meta};
 pub use secret::{FingerprintKey, Secret};
 pub use template::{Env, ProcessEnv};
 pub use units::{ByteSize, ByteSizeError, HostPort, HostPortError};
