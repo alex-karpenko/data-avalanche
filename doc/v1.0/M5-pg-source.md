@@ -158,6 +158,7 @@ the arrow.
 | Q-M5-14 (2026-10-01, during execution) | Task 8's review: pgoutput reads the publication as of each change's WAL position, so repairing it at start doesn't cover the WAL a `Resume` replays; a mixed-case publication name streamed nothing; `retained_bytes` measured from `confirmed_flush`; two pipelines on one managed publication drop each other's tables; Phase 5 acknowledged before persisting | **A repair that rewrites the publication re-snapshots (slot recreated); added tables are reported (`Prepared::added`) for M6 to snapshot; the publication name is quoted for pgoutput; `retained_bytes` from `restart_lsn`; V-059 is an error when a sharing pipeline is `managed`; Data-Flow Phase 5 persists before acknowledging** |
 | Q-M5-15 (2026-10-02, during execution) | Task 9's review: `next` lost a Relation message when `select!` cancelled it at a catalog query; channel B didn't see a primary key or replica identity change; tables were matched by name, so a renamed or swapped table went on silently; PostgreSQL 14 sends a `"char"` byte above 127 raw; `close` returned before the server released the slot | **`next` cancel-safe (the event kept until handled; catalog queries under `timeouts.command`); the replica identity compared in channel B; a name and OID that part halt the table (`TABLE_DROPPED`, `Schema_Change…` §7); the raw byte decodes; `close` waits for the slot's release** |
 | Q-M5-16 (2026-10-02, during execution) | Task 10's review: a text key in the database's collation made every chunk a full scan and sort (the `"C"` pin has no index); PostgreSQL 14 prints a `"char"` byte above 127 raw, which panicked the read; a domain over `"char"` key looped; a timed-out chunk kept the shared catalog connection busy | **A text key orders in its own collation when deterministic, `"C"` with a start warning when not (Snapshot_Resumability §2 amended); `"char"` read as its code; domains keyed by the decoder; `SET LOCAL statement_timeout` on every read** |
+| Q-M5-17 (2026-10-02, during execution) | Task 11's review: with the catalog ahead of the stream, `scope` placed columns by their current names, so a rename chain or a swap after the signal gave a silent wrong delta; a table set `UNLOGGED` (allowed under `FOR ALL TABLES`) went unnoticed; an add/backfill/drop migration halted; `Schema_Change…` §7.2 halted on any replica identity change, the code only on an identifier change | **A placement that is a guess halts; a column dropped since the signal keeps its `attnum`; an unlogged table doesn't plan (C and D halt it); §7.2 amended: only the identifier, or a replica identity that no longer covers it, halts** |
 
 **Rulings where the specs are silent** (each is pinned by a test). **Plan approved 2026-10-01**, with these rulings (roadmap D-IMPL-12):
 
@@ -180,8 +181,8 @@ the arrow.
 | D-M5.15 | `prepare` reconciles the publication, then the slot. Creating a slot (it waits for running transactions) is bounded by `timeouts.snapshot`; every other catalog call by `timeouts.command`. `reset_position` drops and recreates the slot (refused under `require_existing`). `teardown` drops the slot and the publication only under `managed` with `auto_cleanup`. `retained_bytes` is `pg_current_wal_lsn() - restart_lsn`, the WAL the slot keeps on disk (Task 8 fix). Advancing an orphan (`Adopt`) is bounded by `timeouts.snapshot` too | The `max_wal_lag_bytes` guard (V-104) compares against it in M6 | Task 8 (`reset_teardown_and_retained_wal`) |
 | D-M5.16 | TLS. `allow` connects as `prefer` (the replication crate has no `allow`; both accept either kind). `require` and `prefer` encrypt but don't verify the chain (signatures are still checked), even with `ssl_ca` set (Q-M5-10). `verify-ca` checks the chain and ignores the name. `verify-full` checks both. The trust roots are `ssl_ca`, else the webpki roots. `ssl_cert` and `ssl_key` go together | Config §9.1; one meaning of each mode on both connections | Task 2 (`modes_map_to_both_clients`, `bad_material_is_refused_by_name`), Task 13 |
 | D-M5.17 | Snapshot reads. They use the simple-query protocol, so values are the output-function text pgoutput sends (`true::text` is `true`, pgoutput sends `t`). Columns are qualified by the alias `src`, so an output name can't shadow a key. A text key compares in its own collation when that is deterministic (its index serves the chunk), in `COLLATE "C"` otherwise, with a warning at resolution; the cursor records the collations, and a cursor of others halts the table (Q-M5-16). Key values are quoted literals cast to the column's `format_type` text; a `"char"` (or a domain over one) is read as its code and keyed through a signed byte. Each read carries `SET LOCAL statement_timeout` = `timeouts.command`, so the server cancels it first. A column changed under the snapshot (gone, or a different type) → `Transient`: read again once the stream's signal caught up. `fetch_rows` sends `FETCH_BATCH` = 1000 keys per statement | Snapshot_Resumability §2; a snapshot row must equal the streamed row of the same data | Task 10 |
-| D-M5.18 | Channel C (`augment`). It takes the hint's columns (names and types, from the stream) and finds each in the catalog by name, else by the `attnum` it had in the cached schema; that `attnum` and the nullability come from the catalog. A column found neither way halts the table. `diff` matches by `attnum`, so a new name on the same `attnum` is a proven rename. A type change carries `narrowed` (a shorter length or lower precision of the same logical type). A table gone from the catalog → `[TableDropped]` and no schema | §0 (scope a change to its signal) and §6 (rename proof) | Task 11 |
-| D-M5.19 | Channel D (`rescan`). One batched read of the tracked tables. It reports tables gone from `pg_class` as dropped, tables whose catalog schema differs as changed (with that schema, for freshness and alerting only), and tables that now fail planning as halted | §2.1 `TABLE_DROPPED`; the rescan never applies a change itself | Task 11 (`channel_d_finds_dropped_changed_and_broken_tables`) |
+| D-M5.18 | Channel C (`augment`). It takes the hint's columns (names and types, from the stream) and finds each in the catalog by name, else by the `attnum` it had in the cached schema; that `attnum` and the nullability come from the catalog. A column found neither way halts the table. A column dropped since the signal keeps its cached `attnum` (an `attnum` is never reused). The catalog may be ahead of the stream, so a placement that is a guess halts the table: two columns on one `attnum`, `attnum`s out of the stream's order (pgoutput sends `attnum` order), or a name on another `attnum` while its own still exists and no stream column holds it (Q-M5-17). A later DDL that breaks planning halts the table at an earlier signal too (fail-safe). `diff` matches by `attnum`, so a new name on the same `attnum` is a proven rename. A type change carries `narrowed` (a shorter length or lower precision of the same logical type). A table gone from the catalog → `[TableDropped]` and no schema | §0 (scope a change to its signal) and §6 (rename proof) | Task 11 |
+| D-M5.19 | Channel D (`rescan`). One batched read of the tracked tables. It reports tables gone from `pg_class` as dropped, tables whose catalog schema differs as changed (with that schema, for freshness and alerting only), and tables that now fail planning as halted, an unlogged table among them (`TABLE_NOT_REPLICABLE`, Q-M5-17) | §2.1 `TABLE_DROPPED`; the rescan never applies a change itself | Task 11 (`channel_d_finds_dropped_changed_and_broken_tables`) |
 
 **Measured while planning** (recorded in the tasks and the docs):
 
@@ -10583,7 +10584,9 @@ git commit -m "feat(source-pg): keyset snapshot chunks and the keyed re-read"
 D-M5.18, D-M5.19. Channel C turns a stream signal into the change it implies. Names and types
 come from the stream's columns, because the catalog may already be past the stream's position.
 Identity (`attnum`) and nullability come from the catalog. Matched by `attnum`, a column under a
-new name is a proven rename. A table gone from the catalog is `TableDropped`. Channel D reads all
+new name is a proven rename. With the catalog ahead of the stream, a placement that doesn't fit the
+stream's columns is a guess, and the table halts; a column dropped since the signal keeps its
+`attnum` (Q-M5-17). A table gone from the catalog is `TableDropped`. Channel D reads all
 tracked tables in one batch for the idle rescan. `lib.rs` takes its final form.
 
 - [ ] **Step 1: Write the failing tests**
@@ -10659,6 +10662,17 @@ mod tests {
         assert_eq!(bound("numeric(10,2)"), Some(10));
         assert_eq!(bound("timestamp(3) with time zone"), Some(3));
         assert_eq!(bound("text"), None);
+        assert_eq!(bound("timestamp without time zone"), Some(6), "the default");
+        assert_eq!(bound("interval"), Some(6));
+        let ts = |t: &str| col("t", V::Timestamp { with_tz: false }, t, 4);
+        assert!(!narrowed(
+            &ts("timestamp without time zone"),
+            &ts("timestamp(6) without time zone")
+        ));
+        assert!(narrowed(
+            &ts("timestamp without time zone"),
+            &ts("timestamp(3) without time zone")
+        ));
         let a = |t: &str| col("a", V::Text, t, 2);
         assert!(narrowed(
             &a("character varying(100)"),
@@ -10762,6 +10776,105 @@ mod tests {
             "SCHEMA_MISMATCH"
         );
     }
+
+    #[test]
+    fn scope_halts_where_the_catalog_ahead_would_be_a_guess() {
+        let id = || col("id", V::Int32, "integer", 1).not_null();
+        let hint = vec![
+            ColumnSchema::new("id", V::Int32, "integer"),
+            ColumnSchema::new("a", V::Text, "character varying(100)"),
+            ColumnSchema::new("b", V::Int32, "integer"),
+        ];
+        let halts = |now: TableSchema| scope(&base(), &hint, &now).unwrap_err().code();
+        // `a` → `x`, then `b` → `a`, after the signal: `a` and `b` land on attnum 3.
+        let chain = table(
+            vec![
+                id(),
+                col("x", V::Text, "character varying(100)", 2),
+                col("a", V::Int32, "integer", 3),
+            ],
+            &["id"],
+        );
+        assert_eq!(halts(chain), "SCHEMA_MISMATCH");
+        // `a` and `b` swapped after the signal: attnums out of order.
+        let swap = table(
+            vec![
+                id(),
+                col("b", V::Text, "character varying(100)", 2),
+                col("a", V::Int32, "integer", 3),
+            ],
+            &["id"],
+        );
+        assert_eq!(halts(swap), "SCHEMA_MISMATCH");
+        // `b` renamed away and a new `b` added after the signal: in order, but `b` names
+        // another column while its own still exists.
+        let taken = table(
+            vec![
+                id(),
+                col("a", V::Text, "character varying(100)", 2),
+                col("b_old", V::Int32, "integer", 3),
+                col("b", V::Int32, "integer", 4),
+            ],
+            &["id"],
+        );
+        assert_eq!(halts(taken), "SCHEMA_MISMATCH");
+        // Before the signal, `a` → `x` then `b` → `a`: the stream has the new names, and the
+        // placement fits.
+        let before = vec![
+            ColumnSchema::new("id", V::Int32, "integer"),
+            ColumnSchema::new("x", V::Text, "character varying(100)"),
+            ColumnSchema::new("a", V::Int32, "integer"),
+        ];
+        let now = table(
+            vec![
+                id(),
+                col("x", V::Text, "character varying(100)", 2),
+                col("a", V::Int32, "integer", 3),
+            ],
+            &["id"],
+        );
+        let scoped = scope(&base(), &before, &now).unwrap();
+        assert_eq!(
+            diff(&base(), &scoped),
+            vec![
+                SchemaChange::RenameColumn {
+                    from: "a".into(),
+                    to: "x".into(),
+                    proven: true
+                },
+                SchemaChange::RenameColumn {
+                    from: "b".into(),
+                    to: "a".into(),
+                    proven: true
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn scope_keeps_a_column_dropped_after_the_signal() {
+        // Expand and contract: `c` added (the signal), then `b` dropped in the catalog.
+        let hint = vec![
+            ColumnSchema::new("id", V::Int32, "integer"),
+            ColumnSchema::new("a", V::Text, "character varying(100)"),
+            ColumnSchema::new("b", V::Int32, "integer"),
+            ColumnSchema::new("c", V::Bool, "boolean"),
+        ];
+        let now = table(
+            vec![
+                col("id", V::Int32, "integer", 1).not_null(),
+                col("a", V::Text, "character varying(100)", 2),
+                col("c", V::Bool, "boolean", 4),
+            ],
+            &["id"],
+        );
+        let scoped = scope(&base(), &hint, &now).unwrap();
+        assert_eq!(scoped.column("b").unwrap().source_ordinal, Some(3));
+        assert_eq!(
+            diff(&base(), &scoped),
+            vec![SchemaChange::AddColumn(scoped.columns()[3].clone())]
+        );
+    }
 }
 ```
 
@@ -10786,9 +10899,11 @@ Create `crates/data-avalanche-source-pg/tests/pg/schema.rs`:
 //! Channels C and D against a live server, through `dyn SourceConnector` (`Schema_Change…` §3,
 //! §6).
 
+use std::collections::BTreeMap;
+
 use data_avalanche_core::{
-    ColumnValueType as V, DeltaClass, HaltReason, SchemaChange, SchemaHint, SourceConnector,
-    StartPlan, StreamItem, TableRef, classify,
+    ChangeStream, ColumnValueType as V, DeltaClass, HaltReason, SchemaChange, SchemaHint,
+    SourceConnector, SourceError, StartPlan, StreamItem, TableRef, TableSchema, classify,
 };
 use data_avalanche_testkit::require_it;
 
@@ -10872,7 +10987,8 @@ async fn channel_d_finds_dropped_changed_and_broken_tables() {
         &a,
         "channel_d",
         "CREATE TABLE t (id int PRIMARY KEY); CREATE TABLE u (id int PRIMARY KEY);
-         CREATE TABLE w (id int PRIMARY KEY); CREATE TABLE same (id int PRIMARY KEY);",
+         CREATE TABLE w (id int PRIMARY KEY); CREATE TABLE same (id int PRIMARY KEY);
+         CREATE TABLE l (id int PRIMARY KEY);",
     )
     .await;
     let c: Box<dyn SourceConnector> = Box::new(connector(&pipeline(&n, &["*"], "", "")));
@@ -10884,6 +11000,9 @@ async fn channel_d_finds_dropped_changed_and_broken_tables() {
             format!("DROP TABLE {sc}.u"),
             format!("ALTER TABLE {sc}.t ADD COLUMN v bigint"),
             format!("ALTER TABLE {sc}.w REPLICA IDENTITY NOTHING"),
+            // Allowed outside a FOR TABLE publication (under FOR ALL TABLES too): the table
+            // stops publishing.
+            format!("ALTER TABLE {sc}.l SET UNLOGGED"),
         ],
     )
     .await;
@@ -10900,15 +11019,153 @@ async fn channel_d_finds_dropped_changed_and_broken_tables() {
         })
         .collect();
     assert_eq!(changed, [(&n.table("t"), vec![&V::Int32, &V::Int64])]);
+    let mut halted: Vec<(&TableRef, &str)> =
+        report.halted.iter().map(|(t, r)| (t, r.code())).collect();
+    halted.sort();
     assert_eq!(
-        report.halted,
-        [(
-            n.table("w"),
-            HaltReason::IdentifierNotInReplicaIdentity {
-                missing: vec!["id".into()]
-            }
-        )]
+        halted,
+        [
+            (&n.table("l"), "TABLE_NOT_REPLICABLE"),
+            (&n.table("w"), "IDENTIFIER_NOT_IN_REPLICA_IDENTITY")
+        ]
     );
+    cleanup(&a, &n).await;
+}
+
+/// The signals of `tables` (one each), in any order.
+async fn signals(s: &mut Box<dyn ChangeStream>, tables: usize) -> BTreeMap<String, SchemaHint> {
+    let mut out = BTreeMap::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    while out.len() < tables {
+        let item = tokio::time::timeout_at(deadline, s.next())
+            .await
+            .unwrap_or_else(|_| panic!("signals after 20 s: {:?}", out.keys()))
+            .unwrap();
+        if let StreamItem::SchemaSignal { table, hint, .. } = item {
+            out.insert(table.name, hint);
+        }
+    }
+    out
+}
+
+fn cached<'a>(r: &'a [TableSchema], name: &str) -> &'a TableSchema {
+    r.iter().find(|t| t.table().name == name).unwrap()
+}
+
+/// Q-M5-17: with the catalog ahead of the stream, a column dropped since the signal keeps its
+/// place, and renames since the signal that a placement would have to guess halt the table.
+#[tokio::test(flavor = "multi_thread")]
+async fn channel_c_with_the_catalog_ahead() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(
+        &a,
+        "channel_c_ahead",
+        "CREATE TABLE t (id int PRIMARY KEY, a int, b int);
+         CREATE TABLE u (id int PRIMARY KEY, a int, b int);",
+    )
+    .await;
+    let c: Box<dyn SourceConnector> = Box::new(connector(&pipeline(&n, &["*"], "", "")));
+    let r = c.resolve_tables().await.unwrap();
+    let p = c
+        .prepare(None, &[n.table("t"), n.table("u")])
+        .await
+        .unwrap();
+    let StartPlan::Snapshot { from, .. } = p.plan else {
+        panic!()
+    };
+    let mut s = c.open_stream(&from, &r.tables).await.unwrap();
+    let sc = &n.schema;
+    each(
+        &a,
+        &[
+            format!("ALTER TABLE {sc}.t ADD COLUMN c int"),
+            format!("INSERT INTO {sc}.t VALUES (1, 1, 1, 1)"),
+            format!("ALTER TABLE {sc}.u ADD COLUMN c int"),
+            format!("INSERT INTO {sc}.u VALUES (1, 1, 1, 1)"),
+            // After the signals: expand and contract on t, a rename chain on u.
+            format!("ALTER TABLE {sc}.t DROP COLUMN b"),
+            format!("ALTER TABLE {sc}.u RENAME COLUMN a TO x"),
+            format!("ALTER TABLE {sc}.u RENAME COLUMN b TO a"),
+        ],
+    )
+    .await;
+    let hints = signals(&mut s, 2).await;
+    let (delta, new) = c
+        .augment(cached(&r.tables, "t"), &hints["t"])
+        .await
+        .unwrap();
+    let new = new.unwrap();
+    assert_eq!(
+        delta.changes,
+        [SchemaChange::AddColumn(new.column("c").unwrap().clone())],
+        "the later drop isn't in this change"
+    );
+    match c.augment(cached(&r.tables, "u"), &hints["u"]).await {
+        Err(SourceError::TableHalt {
+            reason: HaltReason::SchemaMismatch { .. },
+            ..
+        }) => {}
+        other => panic!("a guess halts the table: {other:?}"),
+    }
+    s.close().await.unwrap();
+    cleanup(&a, &n).await;
+}
+
+/// `Schema_Change…` §7.2 (Q-M5-17): a primary key on other columns is an identifier change
+/// (Unsafe); REPLICA IDENTITY FULL over the same key changes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn channel_c_classifies_identity_changes() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(
+        &a,
+        "channel_c_identity",
+        "CREATE TABLE k (id int PRIMARY KEY, code int NOT NULL);
+         CREATE TABLE f (id int PRIMARY KEY, v int);",
+    )
+    .await;
+    let c: Box<dyn SourceConnector> = Box::new(connector(&pipeline(&n, &["*"], "", "")));
+    let r = c.resolve_tables().await.unwrap();
+    let p = c
+        .prepare(None, &[n.table("k"), n.table("f")])
+        .await
+        .unwrap();
+    let StartPlan::Snapshot { from, .. } = p.plan else {
+        panic!()
+    };
+    let mut s = c.open_stream(&from, &r.tables).await.unwrap();
+    let sc = &n.schema;
+    each(
+        &a,
+        &[
+            format!("ALTER TABLE {sc}.k DROP CONSTRAINT k_pkey, ADD PRIMARY KEY (code)"),
+            format!("INSERT INTO {sc}.k VALUES (1, 1)"),
+            // A change first: the session has seen f under its primary key.
+            format!("INSERT INTO {sc}.f VALUES (0, 0)"),
+            format!("ALTER TABLE {sc}.f REPLICA IDENTITY FULL"),
+            format!("INSERT INTO {sc}.f VALUES (1, 1)"),
+        ],
+    )
+    .await;
+    let hints = signals(&mut s, 2).await;
+    let k = cached(&r.tables, "k");
+    let (delta, _) = c.augment(k, &hints["k"]).await.unwrap();
+    assert!(
+        delta.changes.contains(&SchemaChange::IdentifierChanged),
+        "{delta:?}"
+    );
+    assert!(
+        classify(k, &delta)
+            .iter()
+            .any(|(_, class)| matches!(class, DeltaClass::Unsafe(_)))
+    );
+    let (delta, _) = c
+        .augment(cached(&r.tables, "f"), &hints["f"])
+        .await
+        .unwrap();
+    assert!(delta.changes.is_empty(), "{delta:?}");
+    s.close().await.unwrap();
     cleanup(&a, &n).await;
 }
 ```
@@ -10943,11 +11200,20 @@ use crate::catalog::{self, table_key};
 use crate::connector::PgConnector;
 
 /// The first length or precision in a type's text: `character varying(100)` → 100,
-/// `timestamp(3) with time zone` → 3; `None` without one (unbounded, or the type's default).
+/// `timestamp(3) with time zone` → 3. A time type without one has the default precision, 6;
+/// another type without one is unbounded (`None`).
 fn bound(type_text: &str) -> Option<i64> {
-    let open = type_text.find('(')?;
-    let close = type_text[open..].find([')', ','])? + open;
-    type_text[open + 1..close].trim().parse().ok()
+    let explicit = || {
+        let open = type_text.find('(')?;
+        let close = type_text[open..].find([')', ','])? + open;
+        type_text[open + 1..close].trim().parse().ok()
+    };
+    explicit().or_else(|| {
+        ["timestamp", "time", "interval"]
+            .iter()
+            .any(|t| type_text.starts_with(t))
+            .then_some(6)
+    })
 }
 
 /// Whether `to` holds fewer values than `from` when both map to the same logical type: a shorter
@@ -10966,32 +11232,76 @@ pub fn narrowed(from: &ColumnSchema, to: &ColumnSchema) -> bool {
 
 /// The schema the stream's columns imply (§0: scoped to the change, never the catalog's "now"):
 /// each hint column takes its type from the stream and its identity (`attnum`) and nullability
-/// from the catalog, found by name, else by the `attnum` it had in `cached` (a later rename). A
-/// column found neither way can't be placed: the table halts rather than guess.
+/// from the catalog. It is found by name; else by the `attnum` it had in `cached` (renamed since
+/// the signal), or with that `attnum` when the catalog no longer has it (dropped since the signal:
+/// an `attnum` is never reused). The catalog may be ahead of the stream, so a placement that
+/// doesn't fit the stream's columns is a guess, and the table halts (Q-M5-17):
+/// - two columns on one `attnum`, or `attnum`s out of the stream's order (pgoutput sends them in
+///   `attnum` order): renames or a swap since the signal;
+/// - a name on another `attnum` than in `cached` while that one still exists and no stream column
+///   holds it: renamed away, and the name taken, since the signal.
+///
+/// A column found no way halts too.
 pub fn scope(
     cached: &TableSchema,
     hint: &[ColumnSchema],
     now: &TableSchema,
 ) -> Result<TableSchema, HaltReason> {
-    let by_ordinal = |o: Option<i32>| {
+    let in_now = |o: Option<i32>| {
         now.columns()
             .iter()
             .find(|c| o.is_some() && c.source_ordinal == o)
     };
-    let mut columns = Vec::with_capacity(hint.len());
+    let guess = |column: &str, why: &str| HaltReason::SchemaMismatch {
+        column: column.into(),
+        detail: format!("{why}; re-snapshot"),
+    };
+    let mut columns: Vec<ColumnSchema> = Vec::with_capacity(hint.len());
+    let mut by_name = vec![];
     for h in hint {
-        let catalog = now
-            .column(&h.name)
-            .or_else(|| cached.column(&h.name).and_then(|c| by_ordinal(c.source_ordinal)))
-            .ok_or_else(|| HaltReason::SchemaMismatch {
-                column: h.name.clone(),
-                detail: "the stream carries a column the catalog doesn't have by that name or position; re-snapshot".into(),
-            })?;
+        let (ordinal, nullable) = if let Some(c) = now.column(&h.name) {
+            by_name.push(columns.len());
+            (c.source_ordinal, c.nullable)
+        } else if let Some(was) = cached.column(&h.name) {
+            match in_now(was.source_ordinal) {
+                Some(c) => (c.source_ordinal, c.nullable),
+                None => (was.source_ordinal, was.nullable),
+            }
+        } else {
+            return Err(guess(
+                &h.name,
+                "the stream carries a column the catalog doesn't have by that name or position",
+            ));
+        };
+        let ordinal = ordinal.ok_or_else(|| guess(&h.name, "a column without an attnum"))?;
+        if let Some(last) = columns.last()
+            && last.source_ordinal >= Some(ordinal)
+        {
+            return Err(guess(
+                &h.name,
+                "the catalog, ahead of the stream, doesn't place its columns in their order",
+            ));
+        }
         columns.push(ColumnSchema {
-            nullable: catalog.nullable,
-            source_ordinal: catalog.source_ordinal,
+            nullable,
+            source_ordinal: Some(ordinal),
             ..h.clone()
         });
+    }
+    for &i in &by_name {
+        let c = &columns[i];
+        if let Some(was) = cached.column(&c.name)
+            && was.source_ordinal != c.source_ordinal
+            && in_now(was.source_ordinal).is_some()
+            && !columns
+                .iter()
+                .any(|o| o.source_ordinal == was.source_ordinal)
+        {
+            return Err(guess(
+                &c.name,
+                "the catalog, ahead of the stream, has the name on another column",
+            ));
+        }
     }
     let identifier = now
         .identifier()
@@ -11279,7 +11589,7 @@ Expected: PASS. `data-avalanche-source-pg` unit tests: 66.
 
 Run, with `test-infra/up.sh` running: `DATA_AVALANCHE_IT=1 cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 37 tests.
+Expected: PASS, 39 tests.
 
 Run: `cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all --check`
 
@@ -11977,13 +12287,13 @@ async fn overrides_convert_through_stream_and_snapshot() {
 
 Run: `cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 39 tests. Without `DATA_AVALANCHE_IT` every test returns at once. These tests drive the code of Tasks 2–11, so nothing fails first. A failure in Step 3 is a defect in that code: stop and report it.
+Expected: PASS, 41 tests. Without `DATA_AVALANCHE_IT` every test returns at once. These tests drive the code of Tasks 2–11, so nothing fails first. A failure in Step 3 is a defect in that code: stop and report it.
 
 - [ ] **Step 3: Run them against PostgreSQL**
 
 Run: `test-infra/up.sh`, then `DATA_AVALANCHE_IT=1 cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 39 tests.
+Expected: PASS, 41 tests.
 
 - [ ] **Step 4: Run the gates**
 
@@ -12471,13 +12781,13 @@ jobs:
 
 Run: `cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 43 tests. Without `DATA_AVALANCHE_IT` every test returns at once. These tests drive the code of Tasks 2–11, so nothing fails first. A failure in Step 3 is a defect in that code: stop and report it.
+Expected: PASS, 45 tests. Without `DATA_AVALANCHE_IT` every test returns at once. These tests drive the code of Tasks 2–11, so nothing fails first. A failure in Step 3 is a defect in that code: stop and report it.
 
 - [ ] **Step 3: Run them against PostgreSQL**
 
 Run: `test-infra/up.sh` (it now starts `postgres-tls` too), then `DATA_AVALANCHE_IT=1 cargo test -p data-avalanche-source-pg --test pg`
 
-Expected: PASS, 43 tests.
+Expected: PASS, 45 tests.
 
 Then the nightly matrix by hand, one server at a time (55414…55417):
 
@@ -12486,7 +12796,7 @@ docker compose -f test-infra/compose.yaml --profile matrix up -d --wait postgres
 DATA_AVALANCHE_IT=1 DATA_AVALANCHE_PG_PORT=55414 cargo test -p data-avalanche-source-pg --test pg --test slot_invalidation -- --skip tls::
 ```
 
-Expected: PASS on each, 39 tests, and the `slot_invalidation` test.
+Expected: PASS on each, 41 tests, and the `slot_invalidation` test.
 
 - [ ] **Step 4: Run the gates**
 
@@ -12783,3 +13093,40 @@ its block shows. Left for the whole-branch review: `bit`/`varbit` keys (their ke
 valid input for the type); a key column that loses `NOT NULL` isn't re-checked; `E''` literals
 would make quoting independent of `standard_conforming_strings`; no byte budget per chunk;
 `read_chunk` with `limit` 0 reads as the table's end.
+
+**Task 11: the catalog ahead of the stream, unlogged tables, replica identity** (`43e26ef`; found by
+the task review, owner decision Q-M5-17, 2026-10-02):
+- **A rename after the signal gave a silent wrong delta.** `scope` found each stream column by its
+  current catalog name first. The reviewer measured on PostgreSQL 18: `a → x; b → a` after the
+  signal gave `[DropColumn a, RenameColumn b → a, …]`, all Safe, with two columns on one `attnum`;
+  a swap gave two Safe renames applied at the signal, never corrected. Now the placement is
+  checked: two columns on one `attnum`, `attnum`s out of the stream's order (pgoutput sends
+  `attnum` order), or a name on another `attnum` while its own still exists and no stream column
+  holds it, halt the table (`SCHEMA_MISMATCH`, re-snapshot). Without the catalog ahead the lookup is
+  exact and nothing fires.
+- **An add/backfill/drop migration halted the table** when the drop was already in the catalog: a
+  column dropped since the signal now keeps its cached `attnum`, which PostgreSQL never reuses. Two
+  renames of one column across the signal (`a → b`, signal, `b → c`) still halt.
+- **A table set `UNLOGGED` went unnoticed.** PostgreSQL refuses it for a table in a `FOR TABLE`
+  publication but not under `FOR ALL TABLES`, and the table stops publishing. `Described` carries
+  `logged` (`relpersistence`), and `table_schema` refuses an unlogged table
+  (`TABLE_NOT_REPLICABLE`), so `rescan` reports it halted and `augment` halts it (Task 6's file).
+- `narrowed`: a time type without a precision has the default, 6 (`timestamp` → `timestamp(6)`
+  halted as a narrowing).
+- **`Schema_Change…` §7.2 amended** (owner decision, option a): a change of the identifier (the
+  primary key, or the `tables.primary_key` columns), or a replica identity that no longer covers it,
+  halts; another replica identity or unique-key change is ignorable. That is what the code does;
+  core's `IdentifierChanged` doc says so (Task 1's file).
+- Tests: `channel_c_with_the_catalog_ahead` (a later drop kept, a rename chain halts),
+  `channel_c_classifies_identity_changes` (a primary key moved → `IdentifierChanged`, Unsafe;
+  `FULL` over the same key → nothing); `channel_d_finds_dropped_changed_and_broken_tables` gains an
+  unlogged table; unit tests for the three guesses, a rename chain before the signal (placed), the
+  later drop, the default precision and an unlogged table. With the original code, the unlogged and
+  later-drop checks fail on PostgreSQL 18.
+
+Measured on the verified workspace: PostgreSQL 14–18 pass 41 integration tests each without TLS
+and `slot_invalidation` on each; the workspace passes 649. Counts: Task 11's integration tests are
+39, each later integration count is two higher than before; the `data-avalanche-source-pg` unit
+count after Task 11 is 75, nine higher than its block shows. Left for the whole-branch review:
+narrowing an interval's fields (`interval` → `interval year`) isn't seen; the table schema carries
+no OID, so a table replaced while the pipeline is down resumes silently.
