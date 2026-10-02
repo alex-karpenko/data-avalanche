@@ -22,7 +22,7 @@ use crate::error::{permanent, sink_error};
 use crate::evolve::evolve;
 use crate::marker::{app_id, commit_metadata};
 use crate::table::TableHandle;
-use crate::write::{check_columns, marker_only, merge, truncate};
+use crate::write::{check_columns, check_keys, marker_only, merge, truncate};
 
 /// How many times one `commit` call re-reads the table and tries again after losing a race.
 pub const COMMIT_ATTEMPTS: usize = 3;
@@ -217,6 +217,9 @@ impl DeltaSink {
         }
         let snapshot = h.table().snapshot().map_err(sink_error)?;
         let types = check_columns(cs, snapshot.schema().as_ref())?;
+        // Before the truncate's DELETE: a key that halts the MERGE must not leave the table
+        // cleared.
+        check_keys(cs, &types)?;
         let position = match &stored {
             Some(p) => p.union(&cs.position.end)?,
             None => cs.position.end.clone(),
@@ -650,6 +653,35 @@ mod tests {
             CommitOutcome::Committed { version: 1 }
         );
         assert_eq!(s.stats().retries, 0);
+        assert_eq!(ids(&s).await, [1]);
+    }
+
+    /// Q-M5-19: a key outside the Delta range halts the set before its truncate's DELETE, so the
+    /// table isn't left cleared.
+    #[tokio::test]
+    async fn a_truncate_set_with_a_key_outside_the_delta_range_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = sink(&dir);
+        s.ensure_table(&spec(&orders())).await.unwrap();
+        let seed = rows(10, &[1]);
+        let CommitOutcome::Committed { version } =
+            s.commit(seed.clone(), marker(1, &seed)).await.unwrap()
+        else {
+            panic!("committed")
+        };
+        // `at` is `id` milliseconds: past 9999-12-31, and the set's key.
+        let mut t = rows(20, &[300_000_000_000_000]);
+        t.truncate = true;
+        t.identifier = vec!["at".into()];
+        let err = s.commit(t.clone(), marker(1, &t)).await.unwrap_err();
+        assert!(matches!(err, SinkError::Permanent { .. }), "{err}");
+        assert!(
+            err.to_string().contains("identifier column \"at\""),
+            "{err}"
+        );
+        let url = local(&dir).table_url(orders().table()).unwrap();
+        let table = deltalake::open_table(url).await.unwrap();
+        assert_eq!(table.version(), Some(version), "no commit");
         assert_eq!(ids(&s).await, [1]);
     }
 

@@ -1,0 +1,43 @@
+name: weekly
+
+# The PostgreSQL source against the older supported servers (P-8, Q-M5-7, Q-M5-23): PostgreSQL
+# 14–17, one job each, the `postgres-18` suite of ci.yml re-run through DATA_AVALANCHE_PG_PORT.
+# Weekly (Mondays 03:41 UTC) and on manual dispatch. The TLS tests need `postgres-tls`
+# (PostgreSQL 18) and run in ci.yml only. No secrets.
+
+on:
+  schedule:
+    - cron: "41 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        version: [14, 15, 16, 17]
+    env:
+      DATA_AVALANCHE_IT: "1"
+      DATA_AVALANCHE_SKIP_GCS: "1"
+      DATA_AVALANCHE_PG_PORT: "554${{ matrix.version }}"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - name: Start PostgreSQL ${{ matrix.version }}
+        run: docker compose -f test-infra/compose.yaml --profile matrix up -d --wait "postgres-${{ matrix.version }}"
+      - name: PostgreSQL source tests
+        run: 'cargo test --locked -p data-avalanche-source-pg --test pg --test slot_invalidation -- --test-threads=1 --skip tls::'
+      - name: Container logs on failure
+        if: failure()
+        run: docker compose -f test-infra/compose.yaml --profile matrix logs --no-color "postgres-${{ matrix.version }}"
+      - name: Stop PostgreSQL
+        if: always()
+        run: docker compose -f test-infra/compose.yaml --profile matrix down -v

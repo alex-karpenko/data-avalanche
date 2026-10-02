@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use super::pipeline_at;
 use crate::build::DEFAULT_POSTGRES_PORT;
 use crate::ctx::{At, Ctx, shown, shown_value};
-use crate::enums::SourceType;
+use crate::enums::{SlotManagement, SourceType};
 use crate::leaf::Leaf;
 use crate::path::YamlPath;
 use crate::raw::{RawConfig, RawPipeline};
@@ -16,8 +16,8 @@ type IdEntries<'a> = Vec<(&'a str, String)>;
 /// text.
 type SlotEntries<'a> = Vec<(&'a str, String, String, String)>;
 /// V-059 dedup entries: the pipeline name, then the host's, port's, db's and publication's redacted
-/// display text.
-type PublicationEntries<'a> = Vec<(&'a str, String, String, String, String)>;
+/// display text, and whether the pipeline manages its publication (`slot_management: managed`).
+type PublicationEntries<'a> = Vec<(&'a str, String, String, String, String, bool)>;
 
 /// `^[a-z0-9][a-z0-9_-]{0,62}$` (V-055).
 fn is_pipeline_id(s: &str) -> bool {
@@ -208,7 +208,9 @@ pub(crate) fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut
                         shown(l, &publication)
                     ),
                 );
-            } else if let (Some((host_leaf, host)), Some((port_leaf, port)), Some((db_leaf, db))) =
+            }
+            // Uniqueness applies to every name, quoted or not.
+            if let (Some((host_leaf, host)), Some((port_leaf, port)), Some((db_leaf, db))) =
                 (&host, &port, &db)
             {
                 let publication_shown = shown(l, &publication);
@@ -218,10 +220,19 @@ pub(crate) fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut
                     None => port.to_string(),
                 };
                 let db_shown = shown(*db_leaf, db);
+                let managed =
+                    ctx.peek(&pg.slot_management) != Some(SlotManagement::RequireExisting);
                 publications
                     .entry((host.clone(), *port, db.clone(), publication))
                     .or_default()
-                    .push((name, host_shown, port_shown, db_shown, publication_shown));
+                    .push((
+                        name,
+                        host_shown,
+                        port_shown,
+                        db_shown,
+                        publication_shown,
+                        managed,
+                    ));
             }
         }
     }
@@ -258,22 +269,33 @@ pub(crate) fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut
             );
         }
     }
-    // V-059 (uniqueness recommended per source database: host + port + db)
+    // V-059 (uniqueness per source database: host + port + db). An error when a sharing pipeline
+    // manages the publication: it reconciles the publication to its own tables, dropping the
+    // others', whose changes are then never published (Q-M5-14).
     for ((_, _port, _, _), entries) in publications.iter().filter(|(_, n)| n.len() > 1) {
-        let names: Vec<&str> = entries.iter().map(|(n, _, _, _, _)| *n).collect();
-        for (name, host_shown, port_shown, db_shown, publication_shown) in entries {
-            ctx.warning(
-                "V-059",
-                &pipeline_at(name)
-                    .key("source")
-                    .key("postgres")
-                    .key("publication"),
-                None,
-                format!(
-                    "publication {publication_shown} on server {host_shown}:{port_shown}/{db_shown} is shared by pipelines {}",
-                    names.join(", ")
-                ),
+        let names: Vec<&str> = entries.iter().map(|e| e.0).collect();
+        let managed = entries.iter().any(|e| e.5);
+        for (name, host_shown, port_shown, db_shown, publication_shown, _) in entries {
+            let at = pipeline_at(name)
+                .key("source")
+                .key("postgres")
+                .key("publication");
+            let shared = format!(
+                "publication {publication_shown} on server {host_shown}:{port_shown}/{db_shown} is shared by pipelines {}",
+                names.join(", ")
             );
+            if managed {
+                ctx.error(
+                    "V-059",
+                    &at,
+                    None,
+                    format!(
+                        "{shared}; slot_management managed reconciles it to one pipeline's tables"
+                    ),
+                );
+            } else {
+                ctx.warning("V-059", &at, None, shared);
+            }
         }
     }
 }

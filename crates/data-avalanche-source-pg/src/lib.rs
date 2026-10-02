@@ -1,0 +1,29 @@
+//! The PostgreSQL realization of `data_avalanche_core::SourceConnector` (roadmap M5): pgoutput
+//! protocol v1 over `pgwire-replication`, text-format tuples decoded to `ColumnValue`s
+//! (`Type_Mapping.md`), the slot and publication lifecycle (`Postgres_Slot…`), catalog channels
+//! A, C and D (`Schema_Change…` §3) and keyset snapshot chunks (`Snapshot_Resumability…`).
+
+pub mod catalog;
+mod connect;
+mod connector;
+mod error;
+pub mod pgoutput;
+mod position;
+mod schema;
+mod slot;
+mod snapshot;
+mod stream;
+#[cfg(test)]
+mod test_support;
+mod tls;
+pub mod types;
+pub mod value;
+
+pub use catalog::{Attribute, Described, Notes, Relation, Selection};
+pub use connect::{APPLICATION_NAME, SESSION_OPTIONS};
+pub use connector::{MIN_SERVER_VERSION, PgConnector};
+pub use pgoutput::{Datum, Message, OldKind, RelationColumn};
+pub use snapshot::FETCH_BATCH;
+pub use stream::{PG_EPOCH_MICROS, PgStream};
+pub use types::{ColumnPlan, Plan, PlanError, TypeCatalog, TypeInfo};
+pub use value::{Decode, ValueError};

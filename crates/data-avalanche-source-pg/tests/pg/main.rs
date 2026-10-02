@@ -1,0 +1,12 @@
+//! The PostgreSQL source against a live server (`test-infra/compose.yaml`): `postgres-18` on every
+//! change, PostgreSQL 14–17 weekly (`DATA_AVALANCHE_PG_PORT`). Each test returns at once without
+//! `DATA_AVALANCHE_IT`.
+
+mod common;
+mod resolve;
+mod schema;
+mod slot;
+mod snapshot;
+mod stream;
+mod tls;
+mod types;

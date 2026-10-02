@@ -1,5 +1,5 @@
 ---
-updated: 2026-09-30
+updated: 2026-10-02
 domain: Data Types
 tags: [data-types, mapping, arrow, iceberg, delta-lake, multi-sink, postgres, mysql, cdc]
 resolves: G-18
@@ -168,23 +168,31 @@ via SQL `LIKE` and `CAST` in engines like Spark or Trino.
 | PostgreSQL Type | OID | ColumnValue | Arrow | Iceberg | Notes |
 |----------------|-----|------------|-------|---------|-------|
 | `uuid` | 2950 | `Uuid(Uuid)` | `FixedSizeBinary(16)` | `uuid` | Stored as 16 raw bytes; iceberg-rust maps `FixedSizeBinary(16)` → `uuid` |
-| `json` | 114 | `Json(serde_json::Value)` | `Utf8` | `string` | Serialized as compact JSON string |
-| `jsonb` | 3802 | `Json(serde_json::Value)` | `Utf8` | `string` | Semantically same as json after decode |
+| `json` | 114 | `Json(serde_json::Value)` | `Utf8` | `string` | Serialized as compact JSON string; numbers keep every digit (serde_json `arbitrary_precision`, Q-M5-11) |
+| `jsonb` | 3802 | `Json(serde_json::Value)` | `Utf8` | `string` | Semantically same as json after decode; its `numeric` numbers keep every digit (Q-M5-11) |
 | `bit(n)` | 1560 | `Bytes(Vec<u8>)` | `Binary` | `fixed(⌈n/8⌉)` | MSB-first packed |
-| `varbit(n)` | 1562 | `Bytes(Vec<u8>)` | `Binary` | `binary` | Length-prefixed |
+| `varbit(n)` | 1562 | `Bytes(Vec<u8>)` | `Binary` | `binary` | PostgreSQL's binary form: a 4-byte big-endian bit count, then the bits packed MSB-first, the last byte zero-padded (Q-M5-9) |
 | User-defined `ENUM` | varies | `Text(String)` | `Utf8` | `string` | pgoutput sends the label string, not the OID index |
 | `hstore` | 16935 (ext) | `Json(serde_json::Value)` | `Utf8` | `string` | Decoded as `{"key":"val"}` JSON object |
 | `any[]` (array of type T) | varies | `Array { element_type, values }` | `List<T_arrow>` | `list<T_iceberg>` | Element type resolved from OID; nested arrays supported recursively |
-| PostGIS `geometry` / `geography` | ext | `Bytes(Vec<u8>)` | `Binary` | `binary` | WKB (Well-Known Binary) format |
+| PostGIS `geometry` / `geography` | ext | `Bytes(Vec<u8>)` | `Binary` | `binary` | EWKB (WKB with the SRID): the hex text pgoutput sends, decoded to bytes (M5 D-M5.10) |
 | Composite / user-defined | varies | `Text(String)` | `Utf8` | `string` | Serialized as `(f1,f2,...)` PG text; ⚠ consider `Bytes` for non-UTF data |
 
 ### PostgreSQL-Specific Decision Notes
 
 **Numeric precision cap.** Iceberg `decimal` supports a maximum of 38 significant digits.
-PostgreSQL `numeric` is unconstrained. Mapping rule:
+PostgreSQL `numeric` is unconstrained. Mapping rule (M5 D-M5.9, Q-M5-8):
 - If `P ≤ 38`: map to `Decimal128(P, S)` as-is.
-- If `P > 38` or precision is unspecified (`numeric` without args): store as `Text(String)` →
-  `Utf8` → Iceberg `string`. Emit a `WARN`-level log at schema resolution time.
+- A negative scale (PostgreSQL 15+, `numeric(P,-S)`) widens to `Decimal128(P+|S|, 0)`, since
+  Delta and Iceberg require scale ≥ 0. A scale above the precision (`numeric(2,4)`) maps to
+  `Decimal128(S, S)`.
+- If `P > 38`: under `numeric_overflow_action: string`, store as `Text(String)` → `Utf8` →
+  `string`, with a warning at schema resolution; under `error`, the table halts at resolution.
+- If precision is unspecified (`numeric` without args): under `string`, text as above; under
+  `error`, `Decimal128(38, 18)`, and a value that doesn't fit halts the table
+  (`NUMERIC_OVERFLOW`). V-079 warns about this at resolution.
+- `NaN` and `±Infinity` have no decimal form: a column holding one halts its table
+  (`SCHEMA_MISMATCH`); `column_type_overrides: string` keeps them as text.
 
 **TOAST columns.** When a large column (`text`, `bytea`, `jsonb`) is unchanged in an `UPDATE`
 event, pgoutput emits an "unchanged TOAST" sentinel instead of the value. The pipeline must
@@ -301,6 +309,13 @@ Arrow maximum/minimum of the column's Arrow type: `Date32` → `i32::MIN` / `i32
 
 The clamped values are valid Arrow values, and Hop 2 carries them unchanged.
 
+**The source doesn't clamp a key (Q-M5-18, decided 2026-10-02).** A clamped timestamp equals the
+value of `infinity`, so two key values at or past the last i64 microsecond
+(`294247-01-10 04:00:54.775807`) would become one identifier, and a snapshot cursor there would
+read as `infinity` and end the scan. When an identifier column's value clamps, the source halts
+the table (`SCHEMA_MISMATCH`), in the stream and in the snapshot. At the source, `±infinity` keys
+rows as usual (the Delta sink halts them, below); other columns still clamp.
+
 **Delta sink — clamp again to the Delta range (Q-M4-2, decided 2026-09-30).** The Delta protocol
 covers 0001-01-01 … 9999-12-31 23:59:59.999999. delta-rs 1.0 panics writing a `Date32` of
 `i32::MIN` (in its statistics), and readers fail beyond the range (DuckDB: "Date out of range in
@@ -309,6 +324,13 @@ that range: PostgreSQL `±infinity` lands on `0001-01-01` / `9999-12-31` (and
 `… 23:59:59.999999` for timestamps). A `timestamp_ntz` stored as `string` is not clamped; its
 text form covers all of `i64`. The M4 round trip (Task 13) reads the bounds back through delta-rs
 and DuckDB `delta_scan`.
+
+**The Delta sink doesn't clamp a key either (Q-M5-19, decided 2026-10-02).** Clamped, two keys
+outside the Delta range (two BC dates, two from 10000 AD, or `infinity` and
+`9999-12-31 23:59:59.999999`) would become one in the MERGE. Hop 3b checks each identifier column
+first: a cell outside the range is a `Permanent` sink error, and the table halts. So on Delta, a
+`date` or `timestamp` key holding `±infinity` halts its table (unless a `timestamp_ntz` is stored
+as `string`, whose text keeps every key distinct); a column that isn't a key clamps.
 
 **MySQL / MariaDB — NULL for "no date", halt for invalid dates.** Measured 2026-09-26: MySQL 8.4's
 default `sql_mode` rejects all of the values below, but any session can relax it
@@ -355,6 +377,29 @@ Any column type encountered that is not in the tables above follows this priorit
       → halt the column (treat as NULL for all events); log ERROR
          continue processing other columns in the table
 ```
+
+**Override conversions (Q-M5-12, 2026-10-01).** Step 1 is applied by the source decoder at Hop 1,
+since Hop 2 converts nothing (D-M3.6). An override equal to the column's mapped type changes
+nothing. `string` keeps the source's text, and `decimal(P,S)` on a numeric/decimal column (or
+`list<decimal(P,S)>` on an array of them) decodes as that decimal, halting `NUMERIC_OVERFLOW` per
+value that doesn't fit. Otherwise the override must be one of the lossless conversions in
+`data-avalanche-core` (`conversion`, `ColumnValue::convert`), which keep every value of the source
+type:
+
+| From | To |
+|---|---|
+| `int16` | `int32`, `int64`, `float64`, `decimal(P,S)` with `P − S ≥ 5` |
+| `int32` | `int64`, `float64`, `decimal(P,S)` with `P − S ≥ 10` |
+| `int64` | `decimal(P,S)` with `P − S ≥ 19` |
+| `float32` | `float64`, through the shortest decimal text (`0.1` stays `0.1`) |
+| `timestamp_ntz` | `timestamp_tz`: the wall clock read as UTC (as `timestamp_ntz_as: timestamp`) |
+| `timestamp_tz` | `timestamp_ntz`: the UTC wall clock |
+| `date` | `timestamp_ntz`, `timestamp_tz`: midnight; `±infinity` stays infinite; a date past the i64-µs range (294247 AD on) clamps to the maximum, as a timestamp does (Q-M5-1) |
+| `list<T>` | `list<U>` when `T → U` is one of the above |
+
+Any other override halts the table at resolution (`SCHEMA_MISMATCH`). That covers narrowing, a
+float to a decimal, a decimal to a float, `int64 → float64`, `timestamp → date`, and text parsed as
+`uuid` or `json`.
 
 This policy ensures no data is silently lost. All fallbacks are logged at `WARN` or above so
 operators know which columns require attention.

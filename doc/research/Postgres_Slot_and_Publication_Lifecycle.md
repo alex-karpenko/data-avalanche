@@ -1,5 +1,5 @@
 ---
-updated: 2026-06-20
+updated: 2026-10-01
 domain: Data Flow
 tags: [postgres, replication-slot, publication, lifecycle, wal, re-snapshot, cdc]
 resolves: [G-15]
@@ -93,6 +93,16 @@ config §):
   (never deleted).
 - Under `require_existing`, the publication is likewise expected to pre-exist; the app validates its
   membership covers the tracked set and warns on drift rather than altering it.
+- **A repair covers only the WAL that follows it** (Q-M5-14, measured on PostgreSQL 14 and 18).
+  pgoutput reads the publication as of each change's WAL position: a change made before the
+  publication existed is skipped on 18 (`WARNING: skipped loading publication`) and fails the
+  stream on 14 (`publication … does not exist`). So when a restart from a checkpoint finds the
+  publication missing, or publishing fewer operations, or publishing via the partition root, the
+  repair is followed by a slot recreate and a full re-snapshot, not a resume. A table added to the
+  publication at start is snapshotted on its own (`Prepared::added`).
+- The publication name is a case-sensitive identifier: the app quotes it in SQL and in pgoutput's
+  `publication_names` (an unquoted `MyPub` folds to `mypub`). Two pipelines must not share a
+  publication they manage (V-059): each would reconcile it to its own tables.
 
 ---
 
@@ -101,7 +111,9 @@ config §):
 - **Two workers cannot fight over one slot.** The per-pipeline **lease** (clustering) guarantees a
   single runner, and PostgreSQL itself locks an active slot to one connection
   (`replication slot "…" is active for PID …`). If that error is ever seen, it is treated as fatal —
-  another holder exists — and surfaced, not retried into a busy-loop.
+  another holder exists — and surfaced, not retried into a busy-loop. Amended 2026-10-01 (Task 8
+  review, M6): on a quick restart the old walsender can hold the slot until `wal_sender_timeout`,
+  so the owner of the lease retries it a bounded number of times before treating it as fatal.
 - **External (non-app) collisions cannot be detected.** PG replication slots carry **no ownership
   tag/comment**, so a slot created by an unrelated system under the same name is indistinguishable.
   Mitigation is V-058 naming uniqueness + operator discipline; documented as a known limitation, not

@@ -1,5 +1,5 @@
 ---
-updated: 2026-06-20
+updated: 2026-10-02
 domain: Data Flow
 tags: [snapshot, resumability, incremental-snapshot, watermark, keyset, consistency, on-demand, cdc]
 resolves: [G-6, G-7, G-20]
@@ -92,9 +92,18 @@ keyset key. PK-less tables already halt and never snapshot.
 
 For text/`varchar` identifier columns, the `ORDER BY` and the cursor `>` comparison **must use the
 same deterministic collation**, or the server's ordering and our resume comparison disagree and rows
-are silently skipped or duplicated. Keyset ordering therefore pins to a **binary collation**
-(`COLLATE "C"` in PostgreSQL, `_bin` / `utf8mb4_bin` in MySQL) for the pagination predicate,
-independent of the column's display collation. The pinned collation is recorded in the cursor.
+are silently skipped or duplicated. A column's **own** collation meets that when it is deterministic,
+and its index then serves the chunk (`ORDER BY … LIMIT` walks the index instead of sorting the
+table). So a text key orders and compares in its own collation when that is deterministic, and in a
+**binary collation** (`COLLATE "C"` in PostgreSQL, `_bin` / `utf8mb4_bin` in MySQL) when it isn't,
+with a warning at start: no index serves that order, so each chunk scans the table unless one is
+added (`CREATE INDEX … (k COLLATE "C")`). The collations are recorded in the cursor; a cursor of
+other collations (the key's collation changed mid-snapshot) halts the table for an operator
+re-snapshot (`SCHEMA_MISMATCH`).
+(Revised 2026-10-02, Q-M5-16: the earlier unconditional binary pin made every chunk of a key in
+the database's default collation a full scan and sort, measured on PostgreSQL 18. A collation
+library upgraded mid-snapshot without a reindex can reorder the keys; that breaks the server's own
+indexes too.)
 
 ---
 
@@ -187,7 +196,7 @@ WAL-lag guard interaction).
 | Decision | Resolution |
 |---|---|
 | D-6.1 model | **Incremental chunked** snapshot, stream-first, watermark + upsert reconciliation |
-| D-6.2 cursor | Typed identifier tuple; row-value keyset; **binary-collation** ordering pin; no-key fallback moot (G-13) |
+| D-6.2 cursor | Typed identifier tuple; row-value keyset; one **deterministic collation** for order and cursor (the key's own when deterministic, else binary; Q-M5-16); no-key fallback moot (G-13) |
 | D-6.3 chunking | `snapshot.chunk_size` default 10000; checkpoint per chunk; resume is idempotent |
 | G-7 consistency | Lock-free, convergent; no `RELOAD`/`LOCK TABLES`; no `consistent_snapshot` toggle |
 | G-20 on-demand | Watermark chunk loop, **no stream pause**, no read-point assumption |

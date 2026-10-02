@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-01
+updated: 2026-10-02
 domain: Architecture
 tags: [v1, implementation-plan, roadmap, milestones, workspace, crates, interfaces, test-strategy, ci, risks]
 sources: []
@@ -31,7 +31,7 @@ build on the interfaces that actually landed. That staging was chosen on 2026-09
 | P-5 | Storage client for lease/state/config | **`object_store` everywhere** (0.14.2 since 2026-09-26; deltalake 1.0 still pulls its own 0.13, see R-13). T1–T10 conformance is re-proven on it against real S3/GCS/Azure before the lease is trusted (M2) |
 | P-6 | Deliverables | Binary, **container image**, **Kubernetes manifests + Helm chart**, **CI** (GitHub Actions), **documentation site** (MkDocs): architecture and internal flows, REST API reference, configuration reference with detailed examples, operator runbooks |
 | P-7 | S3 emulator | **RustFS** (not MinIO) |
-| P-8 | Source versions | PostgreSQL 14–18, MySQL 8.4 LTS, MariaDB 10.11 / 11.4 / 11.8 LTS. CI runs the newest of each on every change and the full matrix nightly |
+| P-8 | Source versions | PostgreSQL 14–18, MySQL 8.4 LTS, MariaDB 10.11 / 11.4 / 11.8 LTS. CI runs the newest of each on every change and the full matrix weekly |
 | P-9 | Plan executor | Claude agents, **subagent-driven** (confirmed 2026-09-26): a fresh agent implements each task and a fresh reviewer checks it before the next starts; a whole-branch review closes each milestone. Tasks give exact files, full test code, commands, expected output, and one commit per task |
 | P-10 | GCS test backend | **A real GCS bucket**, locally and in PR CI (fake-gcs-server can't serve `object_store`, measured in M0 planning). CI needs secret `GCP_SA_KEY` and variable `DATA_AVALANCHE_GCS_BUCKET`; fork PRs skip GCS with a notice. S3 and Azure use RustFS and Azurite |
 
@@ -71,10 +71,10 @@ with their own lockfiles.
 data-avalanche/
 ├── Cargo.toml                    workspace: members = ["crates/*", "xtask"], exclude = ["prototypes"]
 ├── rust-toolchain.toml           pinned stable toolchain (1.98.1)
-├── .github/workflows/            ci.yml (per change) · nightly.yml (matrix) · cloud.yml (real clouds, scheduled/manual)
+├── .github/workflows/            ci.yml (per change) · weekly.yml (matrix) · cloud.yml (real clouds, scheduled/manual)
 ├── test-infra/compose.yaml       PG 14–18, MySQL 8.4, MariaDB 10.11/11.4/11.8, RustFS, Azurite (GCS = real bucket)
 ├── crates/
-│   ├── data-avalanche-core/           domain types: values, events, positions, schema model, change set, Sink trait, errors
+│   ├── data-avalanche-core/           domain types: values, events, positions, schema model, change set, Sink and source traits, errors
 │   ├── data-avalanche-config/         YAML model, strict parse, env substitution, merge, V-rules, resolution, diff
 │   ├── data-avalanche-storage/        object_store backends from globals.cloud, path rules (config §10), VersionedStore (CAS)
 │   ├── data-avalanche-state/          per-pipeline state files + globals.state (anchor, config generations)
@@ -103,7 +103,7 @@ data-avalanche/
 ```
 data-avalanche (bin) ─► api ─► cluster ─► pipeline ─► core
       │             │        │          │  ▲
-      │             │        │          ├──┼── source-pg ─► core
+      │             │        │          ├──┼── source-pg ─► core, config
       │             │        │          ├──┼── source-mysql ─► core
       │             │        │          └──┼── sink-delta ─► core, storage
       │             │        └─► state ─► storage ─► core
@@ -127,8 +127,8 @@ Rules:
 | Delta sink | `deltalake` (features `datafusion`, `rustls`, `s3`, `gcs`, `azure`) + `deltalake-core` | `=1.0.0` both (Q-M4-1: the `deltalake` facade asks for `deltalake-core = "1.0"`, which resolves to 1.1; the direct pin keeps the engine the probes ran on) | delta P1–P10, P8 on S3/GCS/Azure |
 | Object storage / CAS | `object_store` | `0.14.2` (bumped from 0.13.2 on 2026-09-26; deltalake 1.0 requires `^0.13.2`, so M4 adds a second copy, R-13) | API checked; RustFS/Azurite/real-GCS CAS re-run on 0.14.2; T1–T10 re-proof in M2 |
 | Arrow | `arrow` / `parquet` | `59` (as resolved by deltalake) | P9 |
-| PG replication transport | `pgwire-replication` | `=0.4.1` | S-PG0–8 |
-| PG SQL (catalog, chunks) | `tokio-postgres` + `tokio-postgres-rustls` | `0.7` | S-PG probes |
+| PG replication transport | `pgwire-replication` (`default-features = false`, features `tls-rustls`, `scram`, `md5`) | `=0.4.1` | S-PG0–8, re-run as M5's regression tests |
+| PG SQL (catalog, chunks) | `tokio-postgres` + `tokio-postgres-rustls` (trust roots `webpki-roots` 1) | `0.7` / `0.14` | S-PG probes; M5's integration suite |
 | MySQL binlog + SQL | `mysql_async` / `mysql_common` | `=0.37.1` / `=0.37.3` | S-MY0–9 |
 | DDL classifier | `sqlparser` | latest 0.x, pinned in M7 | MySQL_DDL_Classifier §5 |
 | YAML 1.2 (serde) | `serde-saphyr` (`deserialize` only) | `=1.3.0` | Verified in M1 planning (2026-09-27): strict booleans, duplicate-key errors, `Spanned` locations, unknown-key errors with location. One trap: `${…}` inside a flow collection must be quoted (M1 Review Focus 1). R-9 closed |
@@ -137,7 +137,7 @@ Rules:
 | Metrics | `prometheus-client` | | |
 | Tracing | `tracing`, `tracing-subscriber`, `opentelemetry-otlp` | | |
 | CLI | `clap` `4` | | |
-| Misc | `thiserror` 2, `async-trait`, `bytes`, `chrono`, `uuid`, `serde_json`, `humantime`, `xxhash-rust` (ring hash, anchor `hash_algo: xxh3`), `proptest` (dev) | | |
+| Misc | `thiserror` 2, `async-trait`, `bytes`, `chrono`, `uuid`, `serde_json` (feature `arbitrary_precision`: JSON numbers keep every digit, Q-M5-11), `humantime`, `xxhash-rust` (ring hash, anchor `hash_algo: xxh3`), `proptest` (dev) | | |
 
 ---
 
@@ -227,7 +227,7 @@ impl ColumnSchema { pub fn new(name, value_type, source_type) -> Self /* canonic
 pub fn canonical_logical(t: &ColumnValueType) -> LogicalType;             // UInt64 → decimal(20,0), …
 pub fn hop2_compatible(value_type: &ColumnValueType, logical: &LogicalType) -> bool;   // an override Hop 2 can store
 
-pub struct TableSchema { /* private: table, columns, identifier */ }
+pub struct TableSchema { /* private: table, columns, identifier, source_id */ }
 impl TableSchema {
     // Checks, in order: no reserved name; a non-empty identifier; identifier columns listed once, present,
     // NOT NULL, non-floating, primitive; unique names; every logical type hop2_compatible.
@@ -235,6 +235,9 @@ impl TableSchema {
     pub fn table(&self) -> &TableRef; pub fn columns(&self) -> &[ColumnSchema]; pub fn identifier(&self) -> &[String];
     pub fn column(&self, name: &str) -> Option<&ColumnSchema>; pub fn index_of(&self, name: &str) -> Option<usize>;
     pub fn is_identifier(&self, name: &str) -> bool;
+    // The source's identity of the table (PostgreSQL: the relation OID); another one under the name
+    // is a dropped table (Q-M5-20). Kept in the cached schema.
+    pub fn with_source_id(self, id: u64) -> Self; pub fn source_id(&self) -> Option<u64>;
 }
 pub enum HaltReason {                        // code(): the SCREAMING_SNAKE name, e.g. NULL_IDENTIFIER
     ReservedColumnCollision { column }, TableDropped, UnsafeDdl { detail }, NoIdentifier,
@@ -382,29 +385,52 @@ pub enum StoreError { Conflict { key }, Contention { key }, Transient { key, rea
 
 Lease release is a **tombstone write** (object_store has no conditional delete). T1–T10 prove the lease CAS on every backend (`tests/lease_conformance.rs`, `test-infra/README.md`).
 
-### 3.6 Source connector (`data-avalanche-pipeline` owns the trait; each source crate implements it)
+### 3.6 Source connector (`data-avalanche-core` owns the trait, Q-M5-2; each source crate implements it; defined in M5)
+
+`data-avalanche-core::source` (M5 Task 1; D-M5.1 lists where it differs from the first sketch):
 
 ```rust
 #[async_trait]
-pub trait SourceConnector: Send + Sync {
-    async fn preflight(&self) -> Result<Preflight, SourceError>;                               // config §11.2 source rows
-    async fn resolve_tables(&self, f: &TableFilter) -> Result<Vec<ResolvedTable>, SourceError>; // channel A (+ skips/halts)
-    async fn current_position(&self) -> Result<SourcePosition, SourceError>;                  // watermarks lw/hw
+pub trait SourceConnector: Send + Sync {                    // built from the resolved Pipeline
+    async fn preflight(&self) -> Result<Preflight, SourceError>;                    // config §11.2 pipeline rows
+    async fn resolve_tables(&self) -> Result<ResolvedTables, SourceError>;         // channel A: tables, halted, skipped, warnings
+    async fn prepare(&self, checkpoint: Option<&SourcePosition>, tables: &[TableRef])
+        -> Result<Prepared, SourceError>;                                           // publication + slot state machine → StartPlan
+    async fn reset_position(&self) -> Result<SourcePosition, SourceError>;         // after PositionUnreachable (D-15.3)
+    async fn retained_bytes(&self) -> Result<Option<u64>, SourceError>;            // the max_wal_lag_bytes measure
+    async fn current_position(&self) -> Result<SourcePosition, SourceError>;       // watermarks lw/hw
     async fn read_chunk(&self, t: &TableSchema, after: Option<&KeysetCursor>, limit: usize) -> Result<Chunk, SourceError>;
-    async fn open_stream(&self, from: &SourcePosition, tables: &[TableRef]) -> Result<Box<dyn ChangeStream>, SourceError>;
-    async fn describe(&self, t: &TableRef) -> Result<Option<TableSchema>, SourceError>;         // channel C; None = gone
-    async fn rescan(&self, tables: &[TableRef]) -> Result<RescanReport, SourceError>;          // channel D
+    async fn fetch_rows(&self, t: &TableSchema, keys: &[Row]) -> Result<Vec<Row>, SourceError>;  // toast_strategy: re_query
+    async fn open_stream(&self, from: &SourcePosition, tables: &[TableSchema]) -> Result<Box<dyn ChangeStream>, SourceError>;
+    async fn augment(&self, cached: &TableSchema, hint: &SchemaHint)
+        -> Result<(SchemaDelta, Option<TableSchema>), SourceError>;                // channel C; None = dropped
+    async fn rescan(&self, known: &[TableSchema]) -> Result<RescanReport, SourceError>;  // channel D
+    async fn teardown(&self) -> Result<(), SourceError>;                           // auto_cleanup
 }
 #[async_trait]
 pub trait ChangeStream: Send {
-    async fn next(&mut self) -> Result<StreamItem, SourceError>;
-    async fn acknowledge(&mut self, durable: &SourcePosition) -> Result<(), SourceError>;       // PG status update; MySQL no-op
+    async fn next(&mut self) -> Result<StreamItem, SourceError>;                   // an error ends the stream; cancel-safe
+    async fn acknowledge(&mut self, durable: &SourcePosition) -> Result<(), SourceError>;  // PG status update; MySQL no-op
+    async fn close(self: Box<Self>) -> Result<(), SourceError>;
 }
-pub enum StreamItem { Begin { xid: u64, commit_pos: SourcePosition, commit_ts_micros: i64 },
+pub enum StreamItem { Begin { xid: u64, commit_ts_micros: i64 },                  // no commit position: known at Commit
                       Change(CdcEvent), Truncate { tables: Vec<TableRef>, seq: SourceSeq },
-                      SchemaSignal { table: TableRef, seq: SourceSeq, hint: SchemaHint },       // PG Relation diff / MySQL DDL
+                      SchemaSignal { table: TableRef, seq: SourceSeq, hint: SchemaHint },  // PG Relation diff / MySQL DDL
+                      TableHalt { table: TableRef, seq: SourceSeq, reason: HaltReason },  // an undecodable change
                       Commit(TransactionBoundary), KeepAlive(SourcePosition) }
+pub enum SchemaHint { Columns(Vec<ColumnSchema>), Ddl(String) }
+pub enum StartPlan { Resume, Snapshot { from: SourcePosition, reason: SnapshotReason } }  // FirstStart | PositionLost | AdoptedOrphan
+pub struct Prepared { pub plan: StartPlan, pub added: Vec<TableRef>, pub warnings: Vec<String> }
+pub enum SourceError { Transient(String), Permanent(String),
+                       PositionUnreachable { position: String, detail: String },
+                       TableHalt { table: TableRef, reason: HaltReason } }
 ```
+
+Also: `Preflight { server_version, warnings }`, `ResolvedTables { tables, halted, skipped, warnings }`,
+`KeysetCursor { key: Row, collation }`, `Chunk { rows, next }`, `RescanReport { dropped, changed,
+halted }`, `identifier_values(&TableSchema, &Row)`. PostgreSQL positions (D-M5.2): a change's
+`source_pos` is its transaction's commit LSN, its `seq` the XLogData `wal_start`; `Commit` carries
+the `end_lsn` that is acknowledged and resumed from.
 
 ### 3.7 Cluster (Clustering §19–§20)
 
@@ -687,22 +713,23 @@ Detailed plan: `M0-foundations.md`.
 ### M5 — PostgreSQL source (`data-avalanche-source-pg`)
 
 - **Scope:**
-  - pgoutput v1 decoder, production grade: all messages, text and binary tuples, unchanged-TOAST,
-    origin, type messages.
+  - pgoutput v1 decoder, production grade: all messages, text tuples (Q-M5-3: the stream never
+    asks for binary, and a binary datum is a protocol error), unchanged-TOAST, origin, type messages.
   - OID → `ColumnValue` decode for the whole Type_Mapping PG table, plus the unsupported-type fallback
     chain, `numeric` precision cap and array element resolution.
-  - Replication client wrapper: session pinning, status/wakeup interval = heartbeat, acknowledgment,
-    reconnect with backoff.
+  - Replication client wrapper: session pinning, status/wakeup interval = heartbeat, acknowledgment.
+    The stream doesn't reconnect by itself: a `Transient` error ends it, and M6 reopens from the
+    checkpoint with its backoff (M5 D-M5.4).
   - Slot state machine (D-15.1–15.3: managed / require_existing, orphan policy, WAL-gone → re-snapshot).
   - Publication reconciliation (D-15.4).
   - Preflight checks (config §11.2 PG rows).
   - Catalog channels: A (baseline, identifier, replica identity, reserved names), C (`attnum` diff,
     rename proof), D (batched rescan, **dropped OID → `TableDropped`**).
   - Keyset chunk reader with a `COLLATE "C"` cursor and `pg_current_wal_lsn()` watermarks.
-  - `max_wal_lag_bytes` guard.
+  - The `max_wal_lag_bytes` measure (`retained_bytes`); the halt is M6's.
 - **Deps:** M1, M3.
 - **Exit:**
-  - Against PG 18 (every change) and PG 14–17 (nightly), every probe gate S-PG0…8 has a regression test.
+  - Against PG 18 (every change) and PG 14–17 (weekly), every probe gate S-PG0…8 has a regression test.
   - A type round-trip suite covers every mapped type.
   - The slot state-machine table is exercised cell by cell.
 
@@ -740,8 +767,55 @@ Detailed plan: `M0-foundations.md`.
     together with the identifier-change path.
   - `Sink::evolve` carries no marker, so a zombie's ADD COLUMN isn't fenced. It is idempotent, but
     the trait question is open.
+- **Carried from M5** (`M5-pg-source.md`):
+  - Persist the start position right after `prepare` creates the slot. A crash before the first
+    checkpoint otherwise leaves an orphan slot, and the next start meets `slot_on_orphan`. The window
+    between creating the slot and that write remains (a crash, or a lost response to the create):
+    record the intent to create it first, so the next start knows the slot is its own (Task 8 review).
+  - Persist the checkpoint before acknowledging it to PostgreSQL (Data-Flow Phase 5, Q-M5-14): a slot
+    confirmed past the checkpoint reads as a lost position.
+  - Snapshot every table in `Prepared::added` under `StartPlan::Resume` (Q-M5-14), and persist those
+    snapshot requests as soon as `prepare` returns: the publication already carries the tables, so a
+    retried `prepare` no longer reports them.
+  - A quick restart can meet `55006` (the slot is still active for the old walsender, up to
+    `wal_sender_timeout`): retry it, bounded, while the lease is held.
+  - Open a stream only from a persisted checkpoint or the slot's own start: opening reports the
+    start position as flushed at once (Task 9 review).
+  - A snapshot chunk's `Transient` "changed under the snapshot" waits for the stream's schema; an
+    idle table's only catches up at channel D's rescan (60 min by default). Run a rescan of that
+    table on it (Task 10 review).
+  - The reconnect backoff: a stream error ends the stream, and the pipeline reopens it from the
+    checkpoint (D-M5.4).
+  - The `max_wal_lag_bytes` halt, comparing against `SourceConnector::retained_bytes` (V-104).
+  - Keep-alives can arrive often (each heartbeat, and on every server keep-alive); don't do per-item
+    work that assumes they are rare.
+  - `toast_strategy: re_query` calls `fetch_rows` (Q-M5-6).
+  - Persist each cached `TableSchema` with its `source_id` (Q-M5-20): a table dropped and created
+    again while the pipeline is down is found only against the identity the cache kept.
+  - Record the tables a `prepare` will add before calling it: a reply lost after the publication
+    change committed reports nothing on the retry (Q-M5-20, I2).
+  - The snapshot's merge window (DA-SNAP-9): a chunk's watermarks must order its MVCC snapshot
+    against the stream, by `pg_current_snapshot()`, not the WAL position alone; amend
+    Snapshot_Resumability §1.
+  - A stream's `close` can fail (its catalog connection dead) and waits up to `timeouts.command`
+    while another walsender holds the slot: the teardown tolerates both.
+  - The replication connection has no keep-alive or idle deadline: a watchdog on `next` (a few
+    heartbeats) ends a stalled stream so it reopens.
+  - Under REPLICA IDENTITY FULL every Relation message signals (Q-M5-20). That is one channel C
+    read per FULL table per session and per relcache invalidation: DDL, VACUUM and ANALYZE
+    (autovacuum included), GRANT, index changes. If a signal is a flush barrier, budget for it.
+    Each extra signal while the stream lags the catalog is another chance to meet Q-M5-17's
+    fail-safe halts.
+  - Keep DataFusion out of the crates that don't need it (Q-M5-24). Only `data-avalanche-sink-delta`
+    depends on `deltalake`, and its tree is 413 of the 580 crates in the lockfile (DataFusion 292,
+    the AWS SDK about 40 more; `source-pg` is 168, `core` 43). The rules:
+    - the pipeline crate depends on the `Sink` trait in core, not on `sink-delta`;
+    - only the binary crate links `sink-delta`;
+    - no other crate takes it as a dev-dependency.
+
+    Then `cargo test -p` on any other crate never compiles DataFusion.
 - **Deps:** M1, M2, M3, M4, M5.
-- **Exit:** the **slice-1 E2E suite** passes on PG 18 + RustFS and nightly on PG 14–17. See §5.3 for
+- **Exit:** the **slice-1 E2E suite** passes on PG 18 + RustFS and weekly on PG 14–17. See §5.3 for
   the scenario list.
 
 ### M7 — MySQL and MariaDB source (`data-avalanche-source-mysql`)
@@ -773,7 +847,7 @@ Detailed plan: `M0-foundations.md`.
 - **Deps:** M6.
 - **Exit:**
   - Slice-1 E2E parity suite on MySQL 8.4 and MariaDB 11.8 (every change) and MariaDB 10.11 / 11.4
-    (nightly), across all three position modes.
+    (weekly), across all three position modes.
   - Payload-check fault injection (corrupted payload) halts with no silent loss.
 
 ### M8 — Cluster (`data-avalanche-cluster`)
@@ -853,9 +927,22 @@ Detailed plan: `M0-foundations.md`.
   - Long soak (24h) with churn.
   - Chaos: storage outage shorter and longer than the lease, source restart, network partition.
   - The real-cloud matrix: S3, GCS, Azure × PG and MySQL.
-  - The nightly DB version matrix green for 7 consecutive runs.
+  - The weekly DB version matrix green for 4 consecutive runs (Q-M5-23).
   - A dependency audit: `cargo audit` clean, or every remaining advisory triaged and recorded (the CI
     step is non-blocking, so this is where the audit is enforced).
+  - Compile time and the dependency tree (Q-M5-24), checked against a measurement:
+    - `cargo build --timings`, to see what dominates: DataFusion, `aws-lc-sys` (a C build, through
+      `deltalake-aws`'s `aws-config`) or linking;
+    - the dev profile: dependencies already build without debug info; try `debug =
+      "line-tables-only"` for workspace crates, and weigh `opt-level = 1` for dependencies (faster
+      DataFusion tests, slower full builds);
+    - CI: one build shared between the `check` and `integration` jobs (one cache key, or `cargo
+      nextest archive`). This can land earlier, once PR CI time hurts;
+    - upstream: what the delta-rs release current then offers, or a request for it.
+      `deltalake-core` 1.0 takes DataFusion's default features, so we can't turn off its optional
+      parts (the bzip2/xz/gzip codecs). The AWS SDK also comes in when S3 commits need only a
+      conditional PUT;
+    - the M6 dependency rule (above) still holds.
   - Tag `v1.0.0`.
 - **Deps:** all of the above.
 - **Exit:** the acceptance checklist in §8.
@@ -870,8 +957,8 @@ Detailed plan: `M0-foundations.md`.
 |---|---|---|
 | Unit + property (`proptest`) | in-crate `#[cfg(test)]` | every change |
 | Contract tests | `data-avalanche-testkit` reference sink / fake source vs real implementations | every change |
-| Integration (containers) | `crates/*/tests/*.rs`, gated on `DATA_AVALANCHE_IT=1`, using `test-infra/compose.yaml` | every change (newest versions), nightly (matrix) |
-| E2E scenarios | `crates/data-avalanche/tests/e2e_*.rs` — real binary against containers | every change (slice suites), nightly (full) |
+| Integration (containers) | `crates/*/tests/*.rs`, gated on `DATA_AVALANCHE_IT=1`, using `test-infra/compose.yaml` | every change (newest versions), weekly (matrix) |
+| E2E scenarios | `crates/data-avalanche/tests/e2e_*.rs` — real binary against containers | every change (slice suites), weekly (full) |
 | Real-cloud | `cloud.yml`, gated on `DATA_AVALANCHE_CLOUD=s3\|azure` + secrets (GCS already runs in `ci.yml`, P-10) | scheduled weekly + manual dispatch + before release |
 | Load / soak / chaos | `xtask bench`, `xtask soak` | M12, then before each release |
 
@@ -888,8 +975,10 @@ preconditions (re-checked 2026-09-26 with `object_store` 0.14.2: still `400 inva
 fake-gcs issue #994 still open), so GCS tests use a real bucket (P-10; `DATA_AVALANCHE_GCS_BUCKET` + `GOOGLE_SERVICE_ACCOUNT_PATH`,
 opt-out `DATA_AVALANCHE_SKIP_GCS=1`).
 Profile `matrix` adds `postgres-14…17`, `mariadb-1011` and `mariadb-114`; profile `init` holds the
-one-shot bucket/container creators. Later milestones add `postgres-tls` (M5, a CA-signed
-certificate, as S-PG8 needed) and `mysql-84-nogtid` (M7, GTID **off** for file/position tests).
+one-shot bucket/container creators. M5 adds `postgres-tls` to the default profile (port 55419: TLS
+required on every TCP connection; a throwaway CA, server certificate and client certificate made at
+each start, the CA and client pair written to the git-ignored `test-infra/.tls/`). M7 adds
+`mysql-84-nogtid` (GTID **off** for file/position tests).
 Every service uses a fixed, non-default host port listed in `test-infra/README.md`; Azurite keeps
 10000 because `object_store`'s emulator mode targets `127.0.0.1:10000`. Source servers are configured
 as the preconditions require: PG `wal_level=logical`; MySQL/MariaDB ROW / FULL image / FULL metadata /
@@ -929,7 +1018,9 @@ fake-gcs FAIL (risk R-3).
   annotation, but never fails the job. Requires secret
   `GCP_SA_KEY` (service-account JSON, `roles/storage.objectAdmin` on the bucket) and variable
   `DATA_AVALANCHE_GCS_BUCKET`, documented in `test-infra/README.md` and in the workflow comments.
-- `nightly.yml`: full DB matrix, full E2E, longer property-test case counts.
+- `weekly.yml` (weekly + manual; from M5, Q-M5-23): full DB matrix (M5: the PostgreSQL source suite on
+  PostgreSQL 14–17, one job each, through `DATA_AVALANCHE_PG_PORT`), full E2E, longer property-test
+  case counts.
 - `cloud.yml` (weekly + manual): T1–T10 and the Delta P8 re-run on real S3/GCS/Azure, plus one E2E per
   cloud. Credentials are repository secrets injected as env vars; nothing is printed.
 
@@ -1005,13 +1096,15 @@ implements them.
 
 ## 8. v1.0.0 acceptance checklist
 
-- [ ] All milestone exit criteria met; CI, nightly and cloud workflows green (nightly 7 in a row).
+- [ ] All milestone exit criteria met; CI, weekly and cloud workflows green (weekly 4 in a row).
 - [ ] D-V1.3 measured: steady-state p99 ≤ 60s and failover recovery ≤ 2 min at default config (M12
       report).
 - [ ] No data loss or duplicate keys in the crash/replay/chaos suites (source vs Delta comparison).
 - [ ] Real-cloud E2E on S3, GCS and Azure.
 - [ ] Container image and Helm chart published; kind smoke deploy green.
 - [ ] Documentation site builds strict; runbooks reviewed.
+- [ ] Compile time and dependency tree reviewed against a `cargo build --timings` measurement (M12,
+      Q-M5-24).
 - [ ] Gap tracker updated: implementation-surfaced gaps recorded, v1 rows closed with pointers to code
       and tests.
 
@@ -1035,6 +1128,7 @@ the naming below (2026-09-26).**
 | D-IMPL-9 | M2 storage/state rulings **D-M2.1…D-M2.15** (listed in `M2-storage-and-state.md` §Decisions and rulings, each pinned by a test). Among them: `StoreError` is `Conflict` / `Contention` / `Transient` / `Permanent` with no `NotFound` (§3.5 now shows the landed interface); `Timeouts::COORDINATION` bounds a storage call to about 8 s; the lease tombstone keeps `owner_epoch`; config snapshots are the raw text under a content-addressed name with a `blake3:` hash | The specs and research docs are silent on these; each keeps the lease and state safe under races, hangs and hand-edited objects | M2 — **approved 2026-09-28** |
 | D-IMPL-10 | M3 core data-path rulings **D-M3.1…D-M3.18** (listed in `M3-core-data-path.md` §Decisions and rulings, each pinned by a test). Among them: unchanged TOAST fills from the row's previous image, under its old key after a key change; Hop 2 uses `Utf8`/`Binary` with 512 MiB batch rollover; a flush takes only complete transactions and covers `checkpoint..=frontier`; barriers return `FlushRequired` (seal → flush → apply); a split slice ends at its transaction's start and is guard-skipped only when the stored position is strictly past it | The specs are silent on these, or (D-M3.14) were wrong; the property tests prove replay convergence | M3 — **approved 2026-09-30** |
 | D-IMPL-11 | M4 Delta-sink rulings **D-M4.1…D-M4.15** (listed in `M4-delta-sink.md` §Decisions and rulings, each pinned by a test). Among them: every column carries its logical type in the Delta column metadata, so `table_state` reads Hop 2 back; the MERGE matches on the identifier only (no partition pruning); a zombie that loses a race is retried and ends `Fenced`; the walk-back stops at the cached own version, after 1000 commits or at a cleaned-up commit file; a truncate's DELETE carries no position; a set that changes no row gets a marker-only commit | The specs are silent on these; each keeps the fence, the guard or the round trip exact | M4 — **approved 2026-09-30** |
+| D-IMPL-12 | M5 PostgreSQL-source rulings **D-M5.1…D-M5.19** (listed in `M5-pg-source.md` §Decisions and rulings, each pinned by a test). Among them: the source contract lives in core with `prepare`, `augment`, `fetch_rows` and `TableHalt` (§3.6); a change's position is its commit LSN, `Commit` carries the `end_lsn` that is acknowledged; a Relation signal is emitted with the next change's sequence; the stream doesn't reconnect by itself; the slot state table as one function; a publication the pipeline can't change that publishes via the partition root while tracking a partition is refused; snapshot rows are read as output-function text, keys in `COLLATE "C"` | The specs are silent on these; each keeps the stream's positions, the slot or the round trip exact | M5 — **approved 2026-10-01** |
 
 ### 9.1 Questions answered at plan review (2026-09-26)
 
@@ -1058,11 +1152,34 @@ the naming below (2026-09-26).**
 | Q-M3-3 (2026-09-29) | `Time(NaiveTime)` can't hold PG `24:00:00` or MySQL `TIME` intervals | **`ColumnValue::Time(i64)`, signed µs** | `M3-core-data-path.md`; `Type_Mapping.md` §Date/time edge values |
 | Q-M3-4 (2026-09-29) | Does the target keep the source's `NOT NULL`? | **No: identifier columns NOT NULL, every other column nullable** | `M3-core-data-path.md`; spec edit S-O |
 | Q-M4-1 (2026-09-30) | `deltalake` 1.0.0 pulls `deltalake-core` 1.1.0 | **Pin `deltalake-core =1.0.0` directly** (§2.1) | `M4-delta-sink.md` |
-| Q-M4-2 (2026-09-30) | delta-rs can't write `Date32` `i32::MIN` (PG `-infinity` after Q-M5-1), and readers can't show years beyond 9999 | **The Delta sink clamps `date` / `timestamp` / `timestamp_ntz` cells to the Delta range** (0001-01-01 … 9999-12-31 23:59:59.999999) in Hop 3b; PG `±infinity` lands on the bounds. Revises Q-M5-1 for Delta | `Type_Mapping.md` §Date/time edge values; `M4-delta-sink.md` |
+| Q-M4-2 (2026-09-30) | delta-rs can't write `Date32` `i32::MIN` (PG `-infinity` after Q-M5-1), and readers can't show years beyond 9999 | **The Delta sink clamps `date` / `timestamp` / `timestamp_ntz` cells to the Delta range** (0001-01-01 … 9999-12-31 23:59:59.999999) in Hop 3b; PG `±infinity` lands on the bounds. Revises Q-M5-1 for Delta; a key cell halts instead (Q-M5-19) | `Type_Mapping.md` §Date/time edge values; `M4-delta-sink.md` |
 | Q-M4-3 (2026-09-30) | Truncate as one commit or two? | **As the spec says: a DELETE commit, then the MERGE** | `M4-delta-sink.md` D-M4.8 |
 | Q-M4-4 (2026-09-30) | Where do the M4 integration tests run? | **Local and RustFS (the exit), plus Azurite, the DuckDB cross-read in CI, and real GCS in PR CI** | `M4-delta-sink.md` Tasks 10–13 |
 | Q-M4-5 (2026-09-30) | delta-kernel decodes a table path twice, so `%XX` escapes break tables named with `%`, `/`, a control character, `.`/`..` | **Table roots escape with `~XX`** (`escape_table_segment`); state keys keep `%XX` | §3.5; `M4-delta-sink.md` Task 1; `M2-storage-and-state.md` D-M2.4 |
 | Q-M4-6 (2026-09-30) | DuckDB can't open a Delta table under a non-ASCII path | **Keep non-ASCII names verbatim**; the operator docs list the limit (R-12) | `M4-delta-sink.md` |
+| Q-M5-2 (2026-10-01) | Where does the source trait live? | **In `data-avalanche-core`**, next to `Sink` (§3.6) | `M5-pg-source.md` |
+| Q-M5-3 (2026-10-01) | Binary tuples? | **Text only**; a binary datum is a protocol error | `M5-pg-source.md`; §4 M5 |
+| Q-M5-4 (2026-10-01) | `pgwire-replication` takes TLS files; config allows inline PEM | **An inline PEM becomes a private temporary file** (0600 in a 0700 directory, removed on drop) | `M5-pg-source.md` |
+| Q-M5-5 (2026-10-01) | Partitioned tables | **The leaves replicate as tables**; a partitioned parent is skipped with a warning; `publish_via_partition_root = false`, and a publication the pipeline can't change that publishes via the root while a partition is tracked is refused | `M5-pg-source.md` D-M5.14 |
+| Q-M5-6 (2026-10-01) | Who builds the `re_query` keyed re-read? | **M5 adds `fetch_rows`**; M6 calls it | §3.6 |
+| Q-M5-7 (2026-10-01) | Where do PostgreSQL 14–17 run? | **`nightly.yml`**, one job per version (weekly as `weekly.yml` since Q-M5-23) | §5.4 |
+| Q-M5-8 (2026-10-01) | A bare `numeric` under `numeric_overflow_action: error` | **`decimal(38,18)`, halting per value** (`NUMERIC_OVERFLOW`) | `Type_Mapping.md` §PostgreSQL-specific notes |
+| Q-M5-9 (2026-10-01) | The `varbit` value layout | **PostgreSQL's binary form**: a 4-byte big-endian bit count, then the bits packed MSB-first | `Type_Mapping.md` |
+| Q-M5-10 (2026-10-01) | `sslmode=require` with `ssl_ca` set: check the chain, as libpq does? | **No**: `require` encrypts without checking the chain on both connections; only `verify-ca` / `verify-full` check it | `M5-pg-source.md` D-M5.16 |
+| Q-M5-11 (2026-10-01) | JSON numbers went through `f64` (rounded beyond 15–17 digits; beyond the `f64` range the table halted) | **serde_json `arbitrary_precision`, workspace-wide**: `jsonb` numbers are `numeric` and keep every digit | §2.1; `Type_Mapping.md`; `M5-pg-source.md` Deviations, Task 4 |
+| Q-M5-12 (2026-10-01) | A `column_type_overrides` entry had to equal the column's mapped type (except `string` and decimals): `int → int64` halted, and `timestamp_ntz_as: timestamp` had no per-column form | **Lossless conversions at Hop 1**, one table in core (`conversion`, `ColumnValue::convert`) for every source: integer widening, an integer to a decimal with room, `float32 → float64`, `timestamp_ntz ↔ timestamp_tz`, `date → timestamp_*`, lists element by element; anything else halts (`SCHEMA_MISMATCH`) | config §9.3; `Type_Mapping.md`; `M5-pg-source.md` Task 5b |
+| Q-M5-13 (2026-10-01) | PostgreSQL doesn't publish `UNLOGGED` tables; channel A selected them | **Skipped with a warning when a glob matched, halted (`TABLE_NOT_REPLICABLE`) when named** | config §11.2; `M5-pg-source.md` Deviations, Task 7 |
+| Q-M5-14 (2026-10-01) | Task 8's review: a publication repaired at start doesn't cover the WAL a resume replays; a mixed-case publication streamed nothing; WAL retention measured from `confirmed_flush`; managed pipelines sharing a publication; Phase 5 acknowledged before persisting | **Re-snapshot after a rewriting repair, `Prepared::added` for added tables, a quoted publication name, `restart_lsn`, V-059 an error under `managed`, persist before acknowledging** | §3.6; M6 carried items; Data-Flow Phase 5; config §13; `M5-pg-source.md` Deviations, Task 8 |
+| Q-M5-15 (2026-10-02) | Task 9's review: `next` not cancel-safe; channel B blind to key and replica identity changes; tables matched by name, not OID; PostgreSQL 14's raw `"char"` bytes; `close` before the slot's release | **A cancel-safe `next`; the replica identity compared; a parted name and OID halt (`TABLE_DROPPED`); the raw byte decodes; `close` waits for the release** | §3.6; `Schema_Change…` §7; `M5-pg-source.md` Deviations, Task 9 |
+| Q-M5-16 (2026-10-02) | Task 10's review: a `"C"`-pinned text key made every chunk a full scan; PostgreSQL 14's raw `"char"` bytes panicked the read; a domain over `"char"` key looped; a timed-out chunk kept the catalog connection busy | **A text key in its own deterministic collation (`"C"` and a warning otherwise); `"char"` read as its code; server-side `statement_timeout`** | Snapshot_Resumability §2; `M5-pg-source.md` D-M5.17, Deviations, Task 10 |
+| Q-M5-17 (2026-10-02) | Task 11's review: channel C placed columns by the catalog's current names (a rename after the signal gave a silent wrong delta); a table set `UNLOGGED` went unnoticed; §7.2 vs the code on replica identity | **A placement that is a guess halts; a later drop keeps its `attnum`; unlogged tables halt in C and D; §7.2 amended (only the identifier halts)** | `Schema_Change…` §7.2; `M5-pg-source.md` D-M5.18, D-M5.19, Deviations, Task 11 |
+| Q-M5-18 (2026-10-02) | Task 12's review: a timestamp key past the i64 microseconds clamps to the value of `'infinity'`, so distinct keys merge and a snapshot ends early | **An identifier value that clamps halts the table (`SCHEMA_MISMATCH`); `±infinity` and other columns unchanged** | `Type_Mapping.md` §Date/time edge values; `M5-pg-source.md` Q-M5-1, Deviations, Tasks 4, 9, 10, 12 |
+| Q-M5-19 (2026-10-02) | Task 12's re-review: the Delta sink clamps key cells to the Delta range (Q-M4-2), so distinct keys merge (BC, 10000 AD on, `±infinity` against the bounds) | **The Delta sink halts the table on an identifier cell outside the Delta range; other columns still clamp** | `Type_Mapping.md` §Date/time edge values; `data-avalanche-sink-delta` `merge_source`; `M5-pg-source.md` Deviations |
+| Q-M5-20 (2026-10-02) | The whole-branch review: a re-created table stopped replicating silently; a timed-out catalog statement kept the shared connection; one table's failure stopped a snapshot; a key changed under REPLICA IDENTITY FULL never signalled | **`TableSchema.source_id` (the OID) tells a re-created table; timeouts drop and cancel the connection, the publication change runs under server-side timeouts; those failures halt the table; every FULL Relation message signals; the watermark goes to M6 (DA-SNAP-9)** | `M5-pg-source.md` Q-M5-20, Deviations; §3 `TableSchema`; M6 "Carried from M5" |
+| Q-M5-21 (2026-10-02) | The whole-branch review's second round: a table renamed away and back lost the writes in between; NULL-key rows past the first chunk were skipped; the snapshot's OID check missed a table with none of the cached columns and a dropped schema | **A tracked OID under an untracked name halts the table; a nullable identifier column halts it; the snapshot resolves the OID first (`to_regclass`); smaller fixes to timeouts and rescan** | `M5-pg-source.md` Q-M5-21, Deviations |
+| Q-M5-22 (2026-10-02) | The whole-branch review's third round: PostgreSQL 18 sets `attnotnull` under `NOT NULL … NOT VALID`, so an override key on such a column skipped its NULL rows | **An unvalidated not-null constraint counts as nullable at resolve and in the snapshot; a dropped-schema test; the cache-lock wait goes to DA-SRC-17** | `M5-pg-source.md` Q-M5-22, Deviations |
+| Q-M5-23 (2026-10-02) | How often does the PostgreSQL 14–17 matrix run? | **Weekly (Mondays 03:41 UTC) and on manual dispatch, as `weekly.yml`; the v1 release needs 4 weekly runs green in a row** | §2, §5.4, §8, M12 exit |
+| Q-M5-24 (2026-10-02) | DataFusion (34 sub-crates) and the AWS SDK come in through `deltalake`: can the dependency tree and compile time shrink? | **Nothing to remove from our manifests: the sub-crates are transitive, and MERGE needs `deltalake`'s `datafusion` feature. From M6, only the binary links `sink-delta`. The rest is measured and tuned just before release (M12): timings, profiles, CI build sharing (earlier if CI time hurts), upstream** | M6 scope; M12 scope; §8 |
 | Q-M9-1 | Snapshot-job persistence | **Persisted in the pipeline state location** (`snapshots/jobs/<job_id>.json`); listed after a restart or failover via `GET /v1/pipelines/{id}/snapshots`; a running job continues on the new owner from its chunk cursors | `Data-Flow.md` §On-Demand Snapshot + State Layout; System-Overview and API_RBAC endpoint tables |
 
 ### 9.2 Open questions (answer before the named milestone)

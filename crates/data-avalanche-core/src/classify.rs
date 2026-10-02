@@ -23,7 +23,9 @@ pub enum SchemaChange {
     },
     SetNotNull(String),
     DropNotNull(String),
-    /// The primary key, REPLICA IDENTITY or `tables.primary_key` identifier changed.
+    /// The identifier (the primary key, or the `tables.primary_key` columns) changed. A replica
+    /// identity that no longer covers it halts the table too; another replica identity change
+    /// is ignorable (`Schema_Change…` §7.2, Q-M5-17).
     IdentifierChanged,
     TableDropped,
     /// MySQL `ENUM`/`SET` gained values at the end (decoded strings keep their meaning).
@@ -101,7 +103,7 @@ fn classify_one(schema: &TableSchema, change: &SchemaChange) -> DeltaClass {
         // reaches the target.
         C::SetNotNull(_) | C::DropNotNull(_) => DeltaClass::Ignorable,
         C::IdentifierChanged => unsafe_ddl(
-            "the primary key / REPLICA IDENTITY / identifier changed; re-snapshot".into(),
+            "the identifier (primary key or tables.primary_key) changed; re-snapshot".into(),
         ),
         C::TableDropped => DeltaClass::Unsafe(HaltReason::TableDropped),
         C::EnumValuesAppended(_) | C::NoTargetEffect(_) => DeltaClass::Ignorable,

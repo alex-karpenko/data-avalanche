@@ -1,2 +1,3 @@
 target/
 prototypes/*/target/
+test-infra/.tls/

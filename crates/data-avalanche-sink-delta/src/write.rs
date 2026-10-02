@@ -19,7 +19,7 @@ use deltalake::operations::delete::DeleteMetrics;
 use deltalake::operations::merge::MergeMetrics;
 use deltalake::protocol::{DeltaOperation, OutputMode};
 
-use crate::convert::to_delta;
+use crate::convert::{clamped_key, to_delta};
 use crate::error::permanent;
 use crate::types::{column_logical, logical_of, physical_type};
 
@@ -98,13 +98,52 @@ pub fn check_columns(cs: &TableChangeSet, table: &StructType) -> Result<Vec<Delt
         .collect()
 }
 
+/// An identifier column's cells must be in the Delta range: clamped, two keys would become one,
+/// and the MERGE would match or insert the wrong rows (Q-M5-19).
+fn unclamped_key(
+    cs: &TableChangeSet,
+    column: &str,
+    array: &ArrayRef,
+    logical: &data_avalanche_core::LogicalType,
+    delta: &DeltaType,
+) -> Result<(), SinkError> {
+    match clamped_key(array, logical, delta) {
+        Some(value) => Err(permanent(format!(
+            "identifier column {column:?} of {} holds {value}, outside the Delta range \
+             0001-01-01 … 9999-12-31 23:59:59.999999: clamped, distinct keys would merge",
+            cs.table
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Every identifier cell of the set, upserts and deletes, is in the Delta range (Q-M5-19). The
+/// commit checks it before it writes anything, a truncate's DELETE included.
+pub fn check_keys(cs: &TableChangeSet, types: &[DeltaType]) -> Result<(), SinkError> {
+    for (i, (f, t)) in cs.schema.fields().iter().zip(types).enumerate() {
+        let Some(k) = cs.identifier.iter().position(|k| k == f.name()) else {
+            continue;
+        };
+        let logical = logical_of(f).map_err(permanent)?;
+        for b in &cs.upserts {
+            unclamped_key(cs, f.name(), b.column(i), &logical, t)?;
+        }
+        for b in &cs.deletes {
+            unclamped_key(cs, f.name(), b.column(k), &logical, t)?;
+        }
+    }
+    Ok(())
+}
+
 /// The MERGE source: the upserts, then the deletes, in the table's physical types, each row with
 /// [`DELETE_FLAG`] and the upserts' unchanged masks (`false` on delete rows). Every field is
-/// nullable; a delete row carries only its identifier.
+/// nullable; a delete row carries only its identifier. An identifier cell the Delta range would
+/// clamp is an error ([`check_keys`]).
 pub fn merge_source(
     cs: &TableChangeSet,
     types: &[DeltaType],
 ) -> Result<Vec<RecordBatch>, SinkError> {
+    check_keys(cs, types)?;
     let masks: Vec<String> = cs
         .upserts
         .first()
@@ -697,6 +736,53 @@ mod tests {
         let err = check_columns(&cs, snapshot.schema().as_ref()).unwrap_err();
         assert!(matches!(err, SinkError::Permanent { .. }), "{err}");
         assert!(err.to_string().contains("delete batch"), "{err}");
+    }
+
+    /// Q-M5-19: a key the Delta range would clamp halts the table (two keys would become one);
+    /// a column that isn't a key still clamps (Q-M4-2).
+    #[tokio::test]
+    async fn a_key_outside_the_delta_range_is_permanent() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = created(&dir).await;
+        // `at` is `id` milliseconds: past 9999-12-31.
+        let far = 300_000_000_000_000;
+        let mut cs = change_set(
+            10,
+            vec![upserts(&full(), &[(far, Some("a"))], None)],
+            vec![],
+        );
+        let snapshot = h.table().snapshot().unwrap();
+        let types = check_columns(&cs, snapshot.schema().as_ref()).unwrap();
+        merge_source(&cs, &types).expect("a column that isn't a key clamps");
+        cs.identifier = vec!["at".into()];
+        let err = merge_source(&cs, &types).unwrap_err();
+        assert!(matches!(err, SinkError::Permanent { .. }), "{err}");
+        assert!(
+            err.to_string().contains("identifier column \"at\""),
+            "{err}"
+        );
+        let at_key = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "at",
+                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+                false,
+            )])),
+            vec![Arc::new(arrow_array::TimestampMicrosecondArray::from(
+                vec![i64::MAX],
+            ))],
+        )
+        .unwrap();
+        let mut cs = change_set(10, vec![], vec![at_key]);
+        cs.identifier = vec!["at".into()];
+        let err = merge(h.table().clone(), &cs, &types, props(1, 10), None)
+            .await
+            .unwrap_err();
+        let err = crate::error::sink_error(err);
+        assert!(matches!(err, SinkError::Permanent { .. }), "{err}");
+        assert!(
+            err.to_string().contains("identifier column \"at\""),
+            "a delete's key: {err}"
+        );
     }
 
     #[tokio::test]

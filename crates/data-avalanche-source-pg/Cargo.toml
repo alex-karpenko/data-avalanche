@@ -1,0 +1,32 @@
+[package]
+name = "data-avalanche-source-pg"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The PostgreSQL source: pgoutput over logical replication, catalog channels, keyset snapshots."
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+data-avalanche-config.workspace = true
+data-avalanche-core.workspace = true
+pgwire-replication.workspace = true
+rustls.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+tokio-postgres.workspace = true
+tokio-postgres-rustls.workspace = true
+uuid.workspace = true
+webpki-roots.workspace = true
+
+[dev-dependencies]
+data-avalanche-testkit.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+proptest.workspace = true
+rcgen.workspace = true

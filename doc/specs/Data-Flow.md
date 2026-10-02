@@ -1,5 +1,5 @@
 ---
-updated: 2026-09-30
+updated: 2026-10-01
 domain: Architecture
 tags: [architecture, data-flow, pipeline, cdc, iceberg, delta-lake, multi-sink, arrow, snapshot, replication]
 sources: []
@@ -567,14 +567,19 @@ After receiving `flush_confirmation(lsn)` from the sink writer:
 **PostgreSQL:**
 ```
 1. Update local confirmed_flush_lsn = lsn
-2. Send StandbyStatusUpdate to PostgreSQL:
+2. Persist confirmed_flush_lsn to state storage
+3. Send StandbyStatusUpdate to PostgreSQL:
    write_lsn  = lsn  (data written to local buffer)
    flush_lsn  = lsn  (data durably committed to the sink)
    apply_lsn  = lsn
-3. PostgreSQL advances the slot's confirmed_flush_lsn
+4. PostgreSQL advances the slot's confirmed_flush_lsn
    → WAL before this point can now be reclaimed
-4. Persist confirmed_flush_lsn to state storage
 ```
+
+Persist before acknowledging (Q-M5-14): the slot must never be confirmed past the persisted
+checkpoint. A slot confirmed past it has released WAL the pipeline may still need, so the next
+start treats the position as lost (`Postgres_Slot…` §1: re-snapshot under `managed`, refuse under
+`require_existing`). A crash between steps 2 and 3 only re-sends the acknowledgment.
 
 **MySQL / MariaDB:**
 ```
@@ -591,7 +596,7 @@ position up to which every complete transaction was part of this flush. It is pe
 only the positions of transactions that touched a table would let an idle table pin the resume
 point forever and block PG WAL release.)
 
-The state storage write (step 4 / step 2) is the crash-safe checkpoint. On restart, the pipeline resumes streaming from the last persisted position, replaying any events not yet flushed. Idempotent sink commits (and the Phase 4 position guard) absorb the resulting duplicates.
+The state storage write (step 2 for both sources) is the crash-safe checkpoint. On restart, the pipeline resumes streaming from the last persisted position, replaying any events not yet flushed. Idempotent sink commits (and the Phase 4 position guard) absorb the resulting duplicates.
 
 ---
 
