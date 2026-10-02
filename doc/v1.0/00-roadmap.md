@@ -31,7 +31,7 @@ build on the interfaces that actually landed. That staging was chosen on 2026-09
 | P-5 | Storage client for lease/state/config | **`object_store` everywhere** (0.14.2 since 2026-09-26; deltalake 1.0 still pulls its own 0.13, see R-13). T1–T10 conformance is re-proven on it against real S3/GCS/Azure before the lease is trusted (M2) |
 | P-6 | Deliverables | Binary, **container image**, **Kubernetes manifests + Helm chart**, **CI** (GitHub Actions), **documentation site** (MkDocs): architecture and internal flows, REST API reference, configuration reference with detailed examples, operator runbooks |
 | P-7 | S3 emulator | **RustFS** (not MinIO) |
-| P-8 | Source versions | PostgreSQL 14–18, MySQL 8.4 LTS, MariaDB 10.11 / 11.4 / 11.8 LTS. CI runs the newest of each on every change and the full matrix nightly |
+| P-8 | Source versions | PostgreSQL 14–18, MySQL 8.4 LTS, MariaDB 10.11 / 11.4 / 11.8 LTS. CI runs the newest of each on every change and the full matrix weekly |
 | P-9 | Plan executor | Claude agents, **subagent-driven** (confirmed 2026-09-26): a fresh agent implements each task and a fresh reviewer checks it before the next starts; a whole-branch review closes each milestone. Tasks give exact files, full test code, commands, expected output, and one commit per task |
 | P-10 | GCS test backend | **A real GCS bucket**, locally and in PR CI (fake-gcs-server can't serve `object_store`, measured in M0 planning). CI needs secret `GCP_SA_KEY` and variable `DATA_AVALANCHE_GCS_BUCKET`; fork PRs skip GCS with a notice. S3 and Azure use RustFS and Azurite |
 
@@ -71,7 +71,7 @@ with their own lockfiles.
 data-avalanche/
 ├── Cargo.toml                    workspace: members = ["crates/*", "xtask"], exclude = ["prototypes"]
 ├── rust-toolchain.toml           pinned stable toolchain (1.98.1)
-├── .github/workflows/            ci.yml (per change) · nightly.yml (matrix) · cloud.yml (real clouds, scheduled/manual)
+├── .github/workflows/            ci.yml (per change) · weekly.yml (matrix) · cloud.yml (real clouds, scheduled/manual)
 ├── test-infra/compose.yaml       PG 14–18, MySQL 8.4, MariaDB 10.11/11.4/11.8, RustFS, Azurite (GCS = real bucket)
 ├── crates/
 │   ├── data-avalanche-core/           domain types: values, events, positions, schema model, change set, Sink and source traits, errors
@@ -729,7 +729,7 @@ Detailed plan: `M0-foundations.md`.
   - The `max_wal_lag_bytes` measure (`retained_bytes`); the halt is M6's.
 - **Deps:** M1, M3.
 - **Exit:**
-  - Against PG 18 (every change) and PG 14–17 (nightly), every probe gate S-PG0…8 has a regression test.
+  - Against PG 18 (every change) and PG 14–17 (weekly), every probe gate S-PG0…8 has a regression test.
   - A type round-trip suite covers every mapped type.
   - The slot state-machine table is exercised cell by cell.
 
@@ -807,7 +807,7 @@ Detailed plan: `M0-foundations.md`.
     Each extra signal while the stream lags the catalog is another chance to meet Q-M5-17's
     fail-safe halts.
 - **Deps:** M1, M2, M3, M4, M5.
-- **Exit:** the **slice-1 E2E suite** passes on PG 18 + RustFS and nightly on PG 14–17. See §5.3 for
+- **Exit:** the **slice-1 E2E suite** passes on PG 18 + RustFS and weekly on PG 14–17. See §5.3 for
   the scenario list.
 
 ### M7 — MySQL and MariaDB source (`data-avalanche-source-mysql`)
@@ -839,7 +839,7 @@ Detailed plan: `M0-foundations.md`.
 - **Deps:** M6.
 - **Exit:**
   - Slice-1 E2E parity suite on MySQL 8.4 and MariaDB 11.8 (every change) and MariaDB 10.11 / 11.4
-    (nightly), across all three position modes.
+    (weekly), across all three position modes.
   - Payload-check fault injection (corrupted payload) halts with no silent loss.
 
 ### M8 — Cluster (`data-avalanche-cluster`)
@@ -919,7 +919,7 @@ Detailed plan: `M0-foundations.md`.
   - Long soak (24h) with churn.
   - Chaos: storage outage shorter and longer than the lease, source restart, network partition.
   - The real-cloud matrix: S3, GCS, Azure × PG and MySQL.
-  - The nightly DB version matrix green for 7 consecutive runs.
+  - The weekly DB version matrix green for 4 consecutive runs (Q-M5-23).
   - A dependency audit: `cargo audit` clean, or every remaining advisory triaged and recorded (the CI
     step is non-blocking, so this is where the audit is enforced).
   - Tag `v1.0.0`.
@@ -936,8 +936,8 @@ Detailed plan: `M0-foundations.md`.
 |---|---|---|
 | Unit + property (`proptest`) | in-crate `#[cfg(test)]` | every change |
 | Contract tests | `data-avalanche-testkit` reference sink / fake source vs real implementations | every change |
-| Integration (containers) | `crates/*/tests/*.rs`, gated on `DATA_AVALANCHE_IT=1`, using `test-infra/compose.yaml` | every change (newest versions), nightly (matrix) |
-| E2E scenarios | `crates/data-avalanche/tests/e2e_*.rs` — real binary against containers | every change (slice suites), nightly (full) |
+| Integration (containers) | `crates/*/tests/*.rs`, gated on `DATA_AVALANCHE_IT=1`, using `test-infra/compose.yaml` | every change (newest versions), weekly (matrix) |
+| E2E scenarios | `crates/data-avalanche/tests/e2e_*.rs` — real binary against containers | every change (slice suites), weekly (full) |
 | Real-cloud | `cloud.yml`, gated on `DATA_AVALANCHE_CLOUD=s3\|azure` + secrets (GCS already runs in `ci.yml`, P-10) | scheduled weekly + manual dispatch + before release |
 | Load / soak / chaos | `xtask bench`, `xtask soak` | M12, then before each release |
 
@@ -997,7 +997,7 @@ fake-gcs FAIL (risk R-3).
   annotation, but never fails the job. Requires secret
   `GCP_SA_KEY` (service-account JSON, `roles/storage.objectAdmin` on the bucket) and variable
   `DATA_AVALANCHE_GCS_BUCKET`, documented in `test-infra/README.md` and in the workflow comments.
-- `nightly.yml` (scheduled + manual; from M5): full DB matrix (M5: the PostgreSQL source suite on
+- `weekly.yml` (weekly + manual; from M5, Q-M5-23): full DB matrix (M5: the PostgreSQL source suite on
   PostgreSQL 14–17, one job each, through `DATA_AVALANCHE_PG_PORT`), full E2E, longer property-test
   case counts.
 - `cloud.yml` (weekly + manual): T1–T10 and the Delta P8 re-run on real S3/GCS/Azure, plus one E2E per
@@ -1075,7 +1075,7 @@ implements them.
 
 ## 8. v1.0.0 acceptance checklist
 
-- [ ] All milestone exit criteria met; CI, nightly and cloud workflows green (nightly 7 in a row).
+- [ ] All milestone exit criteria met; CI, weekly and cloud workflows green (weekly 4 in a row).
 - [ ] D-V1.3 measured: steady-state p99 ≤ 60s and failover recovery ≤ 2 min at default config (M12
       report).
 - [ ] No data loss or duplicate keys in the crash/replay/chaos suites (source vs Delta comparison).
@@ -1139,7 +1139,7 @@ the naming below (2026-09-26).**
 | Q-M5-4 (2026-10-01) | `pgwire-replication` takes TLS files; config allows inline PEM | **An inline PEM becomes a private temporary file** (0600 in a 0700 directory, removed on drop) | `M5-pg-source.md` |
 | Q-M5-5 (2026-10-01) | Partitioned tables | **The leaves replicate as tables**; a partitioned parent is skipped with a warning; `publish_via_partition_root = false`, and a publication the pipeline can't change that publishes via the root while a partition is tracked is refused | `M5-pg-source.md` D-M5.14 |
 | Q-M5-6 (2026-10-01) | Who builds the `re_query` keyed re-read? | **M5 adds `fetch_rows`**; M6 calls it | §3.6 |
-| Q-M5-7 (2026-10-01) | Where do PostgreSQL 14–17 run? | **`nightly.yml`**, one job per version | §5.4 |
+| Q-M5-7 (2026-10-01) | Where do PostgreSQL 14–17 run? | **`nightly.yml`**, one job per version (weekly as `weekly.yml` since Q-M5-23) | §5.4 |
 | Q-M5-8 (2026-10-01) | A bare `numeric` under `numeric_overflow_action: error` | **`decimal(38,18)`, halting per value** (`NUMERIC_OVERFLOW`) | `Type_Mapping.md` §PostgreSQL-specific notes |
 | Q-M5-9 (2026-10-01) | The `varbit` value layout | **PostgreSQL's binary form**: a 4-byte big-endian bit count, then the bits packed MSB-first | `Type_Mapping.md` |
 | Q-M5-10 (2026-10-01) | `sslmode=require` with `ssl_ca` set: check the chain, as libpq does? | **No**: `require` encrypts without checking the chain on both connections; only `verify-ca` / `verify-full` check it | `M5-pg-source.md` D-M5.16 |
@@ -1155,6 +1155,7 @@ the naming below (2026-09-26).**
 | Q-M5-20 (2026-10-02) | The whole-branch review: a re-created table stopped replicating silently; a timed-out catalog statement kept the shared connection; one table's failure stopped a snapshot; a key changed under REPLICA IDENTITY FULL never signalled | **`TableSchema.source_id` (the OID) tells a re-created table; timeouts drop and cancel the connection, the publication change runs under server-side timeouts; those failures halt the table; every FULL Relation message signals; the watermark goes to M6 (DA-SNAP-9)** | `M5-pg-source.md` Q-M5-20, Deviations; §3 `TableSchema`; M6 "Carried from M5" |
 | Q-M5-21 (2026-10-02) | The whole-branch review's second round: a table renamed away and back lost the writes in between; NULL-key rows past the first chunk were skipped; the snapshot's OID check missed a table with none of the cached columns and a dropped schema | **A tracked OID under an untracked name halts the table; a nullable identifier column halts it; the snapshot resolves the OID first (`to_regclass`); smaller fixes to timeouts and rescan** | `M5-pg-source.md` Q-M5-21, Deviations |
 | Q-M5-22 (2026-10-02) | The whole-branch review's third round: PostgreSQL 18 sets `attnotnull` under `NOT NULL … NOT VALID`, so an override key on such a column skipped its NULL rows | **An unvalidated not-null constraint counts as nullable at resolve and in the snapshot; a dropped-schema test; the cache-lock wait goes to DA-SRC-17** | `M5-pg-source.md` Q-M5-22, Deviations |
+| Q-M5-23 (2026-10-02) | How often does the PostgreSQL 14–17 matrix run? | **Weekly (Mondays 03:41 UTC) and on manual dispatch, as `weekly.yml`; the v1 release needs 4 weekly runs green in a row** | §2, §5.4, §8, M12 exit |
 | Q-M9-1 | Snapshot-job persistence | **Persisted in the pipeline state location** (`snapshots/jobs/<job_id>.json`); listed after a restart or failover via `GET /v1/pipelines/{id}/snapshots`; a running job continues on the new owner from its chunk cursors | `Data-Flow.md` §On-Demand Snapshot + State Layout; System-Overview and API_RBAC endpoint tables |
 
 ### 9.2 Open questions (answer before the named milestone)

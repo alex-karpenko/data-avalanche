@@ -14,7 +14,7 @@ sources: []
 implements. The crate turns pgoutput into `StreamItem`s and decodes every mapped type to
 `ColumnValue` (Hop 1). It runs the slot and publication lifecycle and resolves, describes and
 rescans tables (channels A, C, D). It reads keyset snapshot chunks. Every S-PG probe gate gets a
-regression test, on PostgreSQL 18 on every change and on PostgreSQL 14–17 nightly.
+regression test, on PostgreSQL 18 on every change and on PostgreSQL 14–17 weekly.
 
 **Architecture:** One change in core, one new crate.
 
@@ -44,7 +44,7 @@ regression test, on PostgreSQL 18 on every change and on PostgreSQL 14–17 nigh
   - The integration binary `tests/pg` runs against `postgres-18` (`DATA_AVALANCHE_IT`). It covers
     resolution, the slot table, the stream (S-PG0…6), snapshots, channels C and D, the type round
     trip (S-PG7) and TLS (S-PG8, `postgres-tls`).
-  - `nightly.yml` runs the binary on PostgreSQL 14–17.
+  - `weekly.yml` runs the binary on PostgreSQL 14–17.
 
 **Tech Stack:** Rust 1.98.1 (edition 2024).
 
@@ -135,7 +135,7 @@ the arrow.
    reads differently by version (`conflicting` from 16, `invalidation_reason` from 17); negative
    numeric scales exist from 15 → Task 8 (`slot_state` via `to_jsonb`), Task 9
    (`untracked_tables_busy_slots_and_keepalives`), Task 12 (the version-gated columns), Task 13
-   (`nightly.yml`, PostgreSQL 14–17).
+   (`weekly.yml`, PostgreSQL 14–17).
 
 ## Decisions and rulings
 
@@ -164,6 +164,7 @@ the arrow.
 | Q-M5-20 (2026-10-02, whole-branch review) | The whole-branch review: a table dropped and created again under its name stopped replicating silently (channels A, C and D found tables by name; a restart left ghost rows); a timed-out catalog statement kept the shared connection, and a publication change could commit after its reply was lost; a table dropped under the snapshot, or a NULL key, stopped the pipeline; a primary key changed under REPLICA IDENTITY FULL never signalled; the snapshot watermark can't order a chunk against a commit visible after its WAL record | **`TableSchema` carries the source's table identity (`source_id`, PostgreSQL: the OID): another OID under the name is `TABLE_DROPPED` in channels B, C, D and the snapshot; a timeout drops and cancels the catalog connection, and the publication change runs under server-side lock and statement timeouts; 42P01 and a NULL key halt the table; every Relation message of a FULL table signals; the watermark goes to M6 (DA-SNAP-9)** |
 | Q-M5-21 (2026-10-02, whole-branch review, second round) | The scoped re-review of the first round: a tracked table renamed away and back lost the writes made in between; rows with a NULL key past the first chunk were skipped silently; the snapshot's OID check missed a table re-created with none of the cached columns, and a dropped schema; a timeout could abandon a connection its call didn't use; the publication batch could outlast its client budget; rescan flagged a schema without `source_id` as changed every scan | **A Relation message with a tracked table's OID under an untracked name halts that table (`TABLE_DROPPED`); an identifier column that is nullable now halts the table (`IDENTIFIER_NOT_USABLE`); the snapshot resolves the OID first (`to_regclass`) and reads the columns by it; a timeout abandons only the connection its call started on; the batch's budget is `command` × statements + 5 s; rescan compares without the identity when the cache has none** |
 | Q-M5-22 (2026-10-02, whole-branch review, third round) | The scoped re-review of the second round: PostgreSQL 18 sets `attnotnull` under `NOT NULL … NOT VALID`, though older rows may still be NULL, so an override key on such a column passed resolve and the snapshot's check, and the snapshot skipped its NULL rows; the dropped-schema case had no test; `bounded` takes the connection-cache lock before its timer starts | **An unvalidated not-null constraint counts as nullable (`catalog::NOT_NULL`, in `describe` and `read_plan`); a dropped-schema case in the snapshot test; the lock wait goes to the gap tracker (DA-SRC-17)** |
+| Q-M5-23 (2026-10-02, PR review) | The PostgreSQL 14–17 matrix ran every night, and `nightly.yml` didn't parse: line 36 ends in `tls::`, which YAML reads as a mapping key | **Weekly (Mondays 03:41 UTC) and on manual dispatch: `nightly.yml` is renamed `weekly.yml`; the test command is quoted. The v1 release needs 4 weekly runs green in a row (roadmap §8)** |
 
 **Rulings where the specs are silent** (each is pinned by a test). **Plan approved 2026-10-01**, with these rulings (roadmap D-IMPL-12):
 
@@ -219,11 +220,11 @@ an `infra:` commit; `test-infra/README.md` changes in Task 13):
     - the reconnect backoff (D-M5.4);
     - the `max_wal_lag_bytes` halt on `retained_bytes`;
     - keep-alives can arrive often (each heartbeat, and on every server keep-alive).
-  - §5.2: `postgres-tls`. §5.4: `nightly.yml`.
+  - §5.2: `postgres-tls`. §5.4: `weekly.yml`.
   - §9: D-IMPL-12 for D-M5.1…19. §9.1: Q-M5-2…10.
 - `Type_Mapping.md`: the numeric rules of D-M5.9 and Q-M5-8 in §PostgreSQL-specific notes; the
   `varbit` layout (Q-M5-9); PostGIS as hex EWKB decoded to bytes.
-- `test-infra/README.md` (Task 13): `postgres-tls`, `DATA_AVALANCHE_PG_PORT`, the nightly run.
+- `test-infra/README.md` (Task 13): `postgres-tls`, `DATA_AVALANCHE_PG_PORT`, the weekly run.
 
 No spec edit is needed. Config §9.3's numeric text already allows Q-M5-8 (V-079 warns that a bare
 `numeric` may halt under `error`).
@@ -264,8 +265,8 @@ No spec edit is needed. Config §9.3's numeric text already allows Q-M5-8 (V-079
 | `…/tests/pg/tls.rs` | S-PG8: TLS on both connections |
 | `test-infra/compose.yaml`, `test-infra/postgres-tls.sh` | The `postgres-tls` service and its certificate setup |
 | `.gitignore` | `test-infra/.tls/` |
-| `test-infra/README.md` | `postgres-tls`, `DATA_AVALANCHE_PG_PORT`, the nightly run |
-| `.github/workflows/nightly.yml` | PostgreSQL 14–17 |
+| `test-infra/README.md` | `postgres-tls`, `DATA_AVALANCHE_PG_PORT`, the weekly run |
+| `.github/workflows/weekly.yml` | PostgreSQL 14–17 |
 
 ---
 
@@ -13383,7 +13384,7 @@ output. Outside `doc/`, the replayed tree equals the verified workspace. Measure
 - **Workspace:** 623 tests pass with plain `cargo test --workspace`. Clippy, fmt and
   rustdoc (`-D warnings`) are clean.
 - **Not run while planning:** the CI workflows themselves. GitHub schedules and dispatches a
-  workflow only from the default branch, so `nightly.yml` first runs after the merge. Until then
+  workflow only from the default branch, so `weekly.yml` first runs after the merge. Until then
   the matrix is Task 13's by-hand run.
 
 ## M5 exit checklist
@@ -13391,11 +13392,11 @@ output. Outside `doc/`, the replayed tree equals the verified workspace. Measure
 The roadmap's M5 exit criteria, and where each is met:
 
 - [x] **Every probe gate S-PG0…8 has a regression test, against PostgreSQL 18 on every change and
-  PostgreSQL 14–17 nightly**:
+  PostgreSQL 14–17 weekly**:
   - S-PG0…S-PG6: Task 9 (`s_pg0_an_insert_round_trips` … `s_pg6_a_table_added_to_the_publication_mid_stream`);
   - S-PG7: Task 12 (`every_mapped_type_round_trips_through_stream_and_snapshot`);
   - S-PG8: Task 13 (`tls.rs`);
-  - PostgreSQL 18 in `ci.yml`'s integration job; 14–17 in `nightly.yml` (Task 13).
+  - PostgreSQL 18 in `ci.yml`'s integration job; 14–17 in `weekly.yml` (Task 13).
 - [x] **A type round-trip suite covers every mapped type**: Task 12, with Task 4's property tests
   for the date and timestamp ranges.
 - [x] **The slot state-machine table is exercised cell by cell**: Task 8 (`decide`'s seven unit
@@ -13414,7 +13415,7 @@ The roadmap's M5 exit criteria, and where each is met:
   `cargo fmt --all --check` and `RUSTDOCFLAGS="-D warnings" cargo doc -p data-avalanche-source-pg
   -p data-avalanche-core --no-deps` are clean.
 - [ ] The integration job of PR CI is green (`postgres-18` and `postgres-tls` included): open
-  until the PR runs. The by-hand matrix run is green on the final tree (above). `nightly.yml` is dispatched once on
+  until the PR runs. The by-hand matrix run is green on the final tree (above). `weekly.yml` is dispatched once on
   `main` after the merge.
 - [x] Roadmap updates:
   - §2 and §3.6 (the contract in core, D-M5.1);
@@ -13541,7 +13542,7 @@ Tests: `a_repaired_publication_re_snapshots` and `a_slot_of_another_plugin_is_re
 plan's prose promised the plugin cell); `the_publication_follows_the_table_set` checks
 `Prepared::added`; the new test binary `slot_invalidation` invalidates a slot through
 `max_slot_wal_keep_size` and checks the recreate. It is its own binary because the setting is
-server-wide: cargo never runs it beside the `pg` tests, and the nightly runs it too. Measured on
+server-wide: cargo never runs it beside the `pg` tests, and the weekly runs it too. Measured on
 the verified workspace: PostgreSQL 14–18 pass 34 integration tests each without TLS, and
 `slot_invalidation` on each; the workspace passes 637. Counts: Task 8's integration tests are 13;
 each later integration count is three higher than before (two slot tests, one stream test).
@@ -13913,3 +13914,11 @@ Measured on the verified workspace after the third round:
 - PostgreSQL 14–17 pass 49 each, and `slot_invalidation` passes.
 - No slots are left on any server.
 - `cargo test --workspace` passes 666.
+
+**`nightly.yml` didn't parse, and runs weekly now** (Q-M5-23, found in the PR's review). Task
+13's `run:` line ends in `--skip tls::`, and YAML reads a plain scalar's trailing `:` as a mapping
+key, so GitHub rejected the workflow. `ci.yml` and `cloud.yml` parse. The command is quoted now.
+The owner also moved the matrix to a weekly schedule (Mondays 03:41 UTC, and on manual dispatch),
+so the file is renamed `weekly.yml`. The roadmap's release criterion became 4 weekly runs green in
+a row. Task 13's code blocks show `nightly.yml` as it was executed; this plan's other text says
+`weekly.yml`.
