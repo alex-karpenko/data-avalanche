@@ -801,8 +801,11 @@ Detailed plan: `M0-foundations.md`.
     while another walsender holds the slot: the teardown tolerates both.
   - The replication connection has no keep-alive or idle deadline: a watchdog on `next` (a few
     heartbeats) ends a stalled stream so it reopens.
-  - Under REPLICA IDENTITY FULL every Relation message signals (Q-M5-20): about one channel C read
-    per FULL table per session.
+  - Under REPLICA IDENTITY FULL every Relation message signals (Q-M5-20). That is one channel C
+    read per FULL table per session and per relcache invalidation: DDL, VACUUM and ANALYZE
+    (autovacuum included), GRANT, index changes. If a signal is a flush barrier, budget for it.
+    Each extra signal while the stream lags the catalog is another chance to meet Q-M5-17's
+    fail-safe halts.
 - **Deps:** M1, M2, M3, M4, M5.
 - **Exit:** the **slice-1 E2E suite** passes on PG 18 + RustFS and nightly on PG 14–17. See §5.3 for
   the scenario list.
@@ -1150,6 +1153,7 @@ the naming below (2026-09-26).**
 | Q-M5-18 (2026-10-02) | Task 12's review: a timestamp key past the i64 microseconds clamps to the value of `'infinity'`, so distinct keys merge and a snapshot ends early | **An identifier value that clamps halts the table (`SCHEMA_MISMATCH`); `±infinity` and other columns unchanged** | `Type_Mapping.md` §Date/time edge values; `M5-pg-source.md` Q-M5-1, Deviations, Tasks 4, 9, 10, 12 |
 | Q-M5-19 (2026-10-02) | Task 12's re-review: the Delta sink clamps key cells to the Delta range (Q-M4-2), so distinct keys merge (BC, 10000 AD on, `±infinity` against the bounds) | **The Delta sink halts the table on an identifier cell outside the Delta range; other columns still clamp** | `Type_Mapping.md` §Date/time edge values; `data-avalanche-sink-delta` `merge_source`; `M5-pg-source.md` Deviations |
 | Q-M5-20 (2026-10-02) | The whole-branch review: a re-created table stopped replicating silently; a timed-out catalog statement kept the shared connection; one table's failure stopped a snapshot; a key changed under REPLICA IDENTITY FULL never signalled | **`TableSchema.source_id` (the OID) tells a re-created table; timeouts drop and cancel the connection, the publication change runs under server-side timeouts; those failures halt the table; every FULL Relation message signals; the watermark goes to M6 (DA-SNAP-9)** | `M5-pg-source.md` Q-M5-20, Deviations; §3 `TableSchema`; M6 "Carried from M5" |
+| Q-M5-21 (2026-10-02) | The whole-branch review's second round: a table renamed away and back lost the writes in between; NULL-key rows past the first chunk were skipped; the snapshot's OID check missed a table with none of the cached columns and a dropped schema | **A tracked OID under an untracked name halts the table; a nullable identifier column halts it; the snapshot resolves the OID first (`to_regclass`); smaller fixes to timeouts and rescan** | `M5-pg-source.md` Q-M5-21, Deviations |
 | Q-M9-1 | Snapshot-job persistence | **Persisted in the pipeline state location** (`snapshots/jobs/<job_id>.json`); listed after a restart or failover via `GET /v1/pipelines/{id}/snapshots`; a running job continues on the new owner from its chunk cursors | `Data-Flow.md` §On-Demand Snapshot + State Layout; System-Overview and API_RBAC endpoint tables |
 
 ### 9.2 Open questions (answer before the named milestone)

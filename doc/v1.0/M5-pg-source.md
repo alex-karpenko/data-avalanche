@@ -162,6 +162,7 @@ the arrow.
 | Q-M5-18 (2026-10-02, during execution) | Task 12's review: a timestamp key past the microseconds a timestamp holds (294247–294276 AD, or a `date` converted past it) clamps to `i64::MAX`, the same value as `'infinity'`: distinct keys merge into one identifier, and a snapshot cursor there ends the scan early (measured: 2 of 4 rows) | **An identifier value that clamps halts the table (`SCHEMA_MISMATCH`), in the stream and in the snapshot; `±infinity` keys and other columns are unchanged; the type round trip gains the missing edge values and overrides** |
 | Q-M5-19 (2026-10-02, during execution) | Task 12's re-review: the Delta sink clamps every `date` / `timestamp` cell to the Delta range in Hop 3b (Q-M4-2), keys included, so distinct keys still merged: BC keys, keys from 10000 AD, and `±infinity` against the bounds | **The Delta sink halts the table (`Permanent`) on an identifier cell outside the Delta range, `±infinity` keys included; other columns still clamp** |
 | Q-M5-20 (2026-10-02, whole-branch review) | The whole-branch review: a table dropped and created again under its name stopped replicating silently (channels A, C and D found tables by name; a restart left ghost rows); a timed-out catalog statement kept the shared connection, and a publication change could commit after its reply was lost; a table dropped under the snapshot, or a NULL key, stopped the pipeline; a primary key changed under REPLICA IDENTITY FULL never signalled; the snapshot watermark can't order a chunk against a commit visible after its WAL record | **`TableSchema` carries the source's table identity (`source_id`, PostgreSQL: the OID): another OID under the name is `TABLE_DROPPED` in channels B, C, D and the snapshot; a timeout drops and cancels the catalog connection, and the publication change runs under server-side lock and statement timeouts; 42P01 and a NULL key halt the table; every Relation message of a FULL table signals; the watermark goes to M6 (DA-SNAP-9)** |
+| Q-M5-21 (2026-10-02, whole-branch review, second round) | The scoped re-review of the first round: a tracked table renamed away and back lost the writes made in between; rows with a NULL key past the first chunk were skipped silently; the snapshot's OID check missed a table re-created with none of the cached columns, and a dropped schema; a timeout could abandon a connection its call didn't use; the publication batch could outlast its client budget; rescan flagged a schema without `source_id` as changed every scan | **A Relation message with a tracked table's OID under an untracked name halts that table (`TABLE_DROPPED`); an identifier column that is nullable now halts the table (`IDENTIFIER_NOT_USABLE`); the snapshot resolves the OID first (`to_regclass`) and reads the columns by it; a timeout abandons only the connection its call started on; the batch's budget is `command` × statements + 5 s; rescan compares without the identity when the cache has none** |
 
 **Rulings where the specs are silent** (each is pinned by a test). **Plan approved 2026-10-01**, with these rulings (roadmap D-IMPL-12):
 
@@ -13358,9 +13359,9 @@ git commit -m "test(source-pg): TLS end to end, and PostgreSQL 14-17 nightly"
 
 ## Verified during planning (2026-10-01)
 
-Measured again at the end of execution (2026-10-02, after the whole-branch review's fixes):
-PostgreSQL 18 with `postgres-tls` passes 51 integration tests; PostgreSQL 14–17 pass 47 each
-and `slot_invalidation`; `cargo test --workspace` passes 663. The counts below are the
+Measured again at the end of execution (2026-10-02, after the whole-branch review's two fix
+rounds): PostgreSQL 18 with `postgres-tls` passes 52 integration tests; PostgreSQL 14–17 pass 48
+each and `slot_invalidation`; `cargo test --workspace` passes 665. The counts below are the
 planning replay's.
 
 The task blocks above were replayed in order on a fresh clone of the milestone branch
@@ -13794,14 +13795,21 @@ items; each finding below was confirmed in the code, and C1 and I3 were measured
 - **I3: one table's failure stopped the pipeline.** A table dropped under the snapshot (SQLSTATE
   42P01) and a NULL key (a key column that lost `NOT NULL`) were `Permanent`; they halt the table
   now (`TABLE_DROPPED`, `NULL_IDENTIFIER`). Test: `a_dropped_table_or_a_null_key_halts_only_its_table`.
+  This round caught a NULL key only in a chunk's last row: a NULL sorts after every cursor, so
+  rows past it were skipped silently. The second round (N8, below) halts on the nullable column.
+  `IDENTIFIER_NOT_USABLE` replaced `NULL_IDENTIFIER` in this test.
 - **I4: a primary key changed under `REPLICA IDENTITY FULL` never signalled.** pgoutput flags every
   column as a key under FULL, so the change showed nowhere in the stream, and channel D reports it
   for freshness only. Every Relation message of a FULL table signals now, the first of a session
   included (a key changed while the pipeline was down, or before a reconnect); channel C reads the
-  identifier from the catalog and finds `IdentifierChanged`. Cost: one catalog read per FULL table
-  per session and per DDL, and pgoutput sometimes sends a Relation message again after a cache
-  invalidation (measured: an extra signal in two full PostgreSQL 18 runs of nine; `key_and_identity_changes_signal`
-  allows it). Test: `channel_c_classifies_identity_changes` gains table `g`.
+  identifier from the catalog and finds `IdentifierChanged`. Cost: one channel C read per FULL
+  table per session and per relcache invalidation. Invalidations come from DDL, VACUUM and
+  ANALYZE (autovacuum included), GRANT and index changes. Measured on PostgreSQL 18: ANALYZE,
+  VACUUM, GRANT and CREATE INDEX each re-sent the Relation message before the next change, and an
+  extra signal appeared in two full runs of nine. There is at most one signal per change. If M6
+  treats a signal as a flush barrier, it budgets for this (roadmap, "Carried from M5").
+  `key_and_identity_changes_signal` allows the extra signal. Test:
+  `channel_c_classifies_identity_changes` gains table `g`.
 - **I1: the snapshot watermark** (`pg_current_wal_lsn()`) can't order a chunk's MVCC snapshot
   against a commit whose WAL record precedes the watermark but which isn't visible yet (synchronous
   replication widens the window), so a stale chunk row could overwrite a newer streamed change. Not
@@ -13821,8 +13829,61 @@ items; each finding below was confirmed in the code, and C1 and I3 were measured
 - **Minors carried** to the gap tracker (§27) and the roadmap's M6 notes: publication blind spots,
   bit/varbit/PostGIS keys, snapshot collation edges, the replication connection's timeouts, the
   close of a stream whose catalog connection is dead, overrides on `"char"` text, defensive parsing,
-  the driver's errors (the crate has no logging yet), and small test gaps.
+  the driver's errors (the crate has no logging yet), and the test gaps (DA-SRC-18: the verifiers
+  and `require` mode, the Delta sink's composite and `Date` keys, the TLS service's drift from
+  `x-pg`).
 
 Measured on the verified workspace: PostgreSQL 18 with `postgres-tls` passes 51 integration
 tests, PostgreSQL 14–17 pass 47 each and `slot_invalidation`; `cargo test --workspace` passes 663.
 Each fix's test fails with that fix undone.
+
+**The whole-branch review, second round** (Q-M5-21, commit `61680d8`). The scoped re-review of the
+first round found one Important item (I-1) and minor ones. The owner approved fixing all of them
+(2026-10-02). Each code fix has a test that fails with the fix undone, except N3 and N4:
+
+- **I-1: a table renamed away and back lost the writes made in between.** A Relation message
+  under a name the stream doesn't track was ignored, even when its OID was a tracked table's. The
+  writes under the other name never arrived, and the rename back hid the loss (measured on
+  PostgreSQL 18). Such a message now halts the tracked table (`TABLE_DROPPED`), or keeps it halted.
+  Test: `a_table_renamed_away_and_back_halts`.
+- **N8: rows with a NULL key past the first chunk were skipped silently.** `(k) > (cursor)` is
+  never true for a NULL. `read_plan` reads `attnotnull` and halts the table when an identifier
+  column is nullable now (`IDENTIFIER_NOT_USABLE`). Only a `tables.primary_key` override can reach
+  this: PostgreSQL refuses `DROP NOT NULL` on primary-key and replica-identity columns. The NULL
+  check on the cursor row stays as a backstop. Test:
+  `a_dropped_table_or_a_null_key_halts_only_its_table` (three rows, chunks of one).
+- **N5: the snapshot's OID check missed two cases:**
+  - A table re-created with none of the cached columns returned no attribute rows, so the check
+    passed and the read retried as transient.
+  - A dropped schema raised 3F000, `Permanent`.
+
+  `read_plan` now resolves the OID first with `to_regclass`, which returns NULL for a missing
+  table or schema (measured on PostgreSQL 14 and 18). A NULL or a different OID halts
+  `TABLE_DROPPED`. The columns are then read by that OID, and `dropped` maps 3F000 too. Test:
+  `a_table_dropped_and_created_again_is_dropped` gains table `v`.
+- **N3: a timeout could abandon a connection its call didn't use** (the re-review measured 57014
+  on another caller's statement). `bounded` notes the cached connection when it starts, and
+  `abandon` drops and cancels only that one, if it is still cached. Two residuals remain:
+  - Calls that share the connection can see their statement cancelled; each is retried.
+  - A connection replaced between `client()` and `bounded` gets the newer one abandoned, as
+    before.
+
+  Threading the client through every call site wasn't worth it. No dedicated test.
+- **N4: the publication batch could outlast its client budget.** The server bounds each
+  statement and lock wait by `command`, but the client waited `command` + 5 s for the whole
+  batch. The budget is now `command` × statements + 5 s. It runs under
+  `a_publication_change_blocked_by_a_lock_is_retried_whole`; no dedicated test.
+- **N6: rescan flagged a cached schema without `source_id` as changed on every scan.**
+  `unchanged` compares without the identity when the cache has none. Test:
+  `a_schema_without_the_identity_compares_without_it`.
+- **Docs:** the FULL-signal cost above and in the roadmap (N7), the I3 text (N8), and the gap
+  tracker (N9):
+  - the dashboard count;
+  - DA-SNAP-9 in §10 and DA-SRC-13…18 in §14;
+  - DA-SRC-18 for the test gaps.
+
+Measured on the verified workspace after the second round:
+- PostgreSQL 18 with `postgres-tls` passes 52 integration tests.
+- PostgreSQL 14–17 pass 48 each, and `slot_invalidation` passes.
+- No slots are left on any server.
+- `cargo test --workspace` passes 665.
