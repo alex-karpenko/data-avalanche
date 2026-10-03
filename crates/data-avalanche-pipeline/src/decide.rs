@@ -18,7 +18,8 @@ pub(crate) enum Plan {
 pub(crate) struct Facts {
     /// The pipeline tracked it before (its schema is cached): it "has a confirmed offset".
     pub tracked_before: bool,
-    /// Its snapshot document says `in_progress`: a snapshot to resume from its cursor.
+    /// Its snapshot document says `in_progress`: a snapshot to resume from its cursor, unless the
+    /// start follows a gap.
     pub in_progress: bool,
     /// The sink has the table (`table_state().exists`, before `ensure_table`).
     pub sink_has_table: bool,
@@ -39,16 +40,18 @@ pub(crate) enum Decision {
 }
 
 /// The decision, and a warning when `never` leaves a gap: the position was lost or the table was
-/// added to the stream at this start, and `never` takes no snapshot (Q-M6a-1).
+/// added to the stream at this start, and `never` takes no snapshot (Q-M6a-1). After a gap (the
+/// position lost, an orphan adopted) a snapshot in progress starts over: rows before its cursor
+/// may have changed in the gap (D-M6a.8).
 pub(crate) fn decide(mode: SnapshotMode, plan: Plan, f: Facts) -> (Decision, Option<String>) {
-    let snapshot = |dump| Decision::Snapshot {
-        resume: f.in_progress,
-        dump,
-    };
     let recovery = matches!(
         plan,
         Plan::Fresh(SnapshotReason::PositionLost | SnapshotReason::AdoptedOrphan)
     );
+    let snapshot = |dump| Decision::Snapshot {
+        resume: f.in_progress && !recovery,
+        dump,
+    };
     match mode {
         SnapshotMode::Never => {
             let gap = if recovery {
@@ -166,6 +169,25 @@ mod tests {
             Decision::Stream,
             "never doesn't snapshot, not even to finish one"
         );
+    }
+
+    #[test]
+    fn a_snapshot_interrupted_before_a_gap_starts_over() {
+        let interrupted = facts(true, true, true, false);
+        for plan in [LOST, ADOPTED] {
+            for (mode, dump) in [
+                (M::Initial, false),
+                (M::Always, false),
+                (M::DumpAlways, true),
+                (M::DumpInitial, true),
+            ] {
+                assert_eq!(
+                    decide(mode, plan, interrupted).0,
+                    snap(false, dump),
+                    "{mode:?} {plan:?}"
+                );
+            }
+        }
     }
 
     #[test]
