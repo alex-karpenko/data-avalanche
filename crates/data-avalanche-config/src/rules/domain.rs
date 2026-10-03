@@ -187,6 +187,27 @@ fn globals(g: &RawGlobals, ctx: &mut Ctx) {
 /// (`cross_field: false`, which skips V-107 — a partition's `n`/`width` against its `transform` —
 /// and V-112's backoff-order half — `base_backoff` against `max_backoff`).
 fn pipeline_fields(at: &At, p: &RawPipeline, ctx: &mut Ctx, cross_field: bool) {
+    // V-118
+    if let Some(t) = p.source.as_ref().and_then(|s| s.timeouts.as_ref()) {
+        let snap_at = at.key("source").key("timeouts").key("snapshot");
+        if let Some((v, loc)) = val(ctx, &t.snapshot, &snap_at)
+            && v < Duration::from_secs(10)
+        {
+            let l = t.snapshot.as_ref().expect("val returned Some");
+            // Duration has no `Display`: redact by hand, like V-112.
+            let shown = if is_templated(l) {
+                format!("{:?} (resolved value hidden)", l.text())
+            } else {
+                crate::units::format_duration(v)
+            };
+            ctx.error(
+                "V-118",
+                &snap_at,
+                loc,
+                format!("timeouts.snapshot must be at least 10s, got {shown}"),
+            );
+        }
+    }
     if let Some(pg) = p.source.as_ref().and_then(|s| s.postgres.as_ref()) {
         // V-104
         let lag_at = at.key("source").key("postgres").key("max_wal_lag_bytes");
