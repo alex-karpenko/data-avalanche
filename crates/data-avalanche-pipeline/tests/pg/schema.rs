@@ -113,3 +113,42 @@ async fn an_idle_table_changed_while_down_is_snapshotted_under_its_new_schema() 
     run.drain().await.unwrap();
     cleanup(&a, &n).await;
 }
+
+/// An `always` table gains a column while the worker is down, and stays idle. PostgreSQL's chunk
+/// read wouldn't fail (it checks the cached columns only), so without a rescan first the
+/// snapshot would read the old columns and leave the new one NULL. The restart rescans before
+/// it reads (D-M6a.11).
+#[tokio::test]
+async fn an_idle_table_that_gained_a_column_while_down_is_snapshotted_with_it() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(
+        &a,
+        "idle_add",
+        "CREATE TABLE t (id bigint PRIMARY KEY, v text);
+         INSERT INTO t VALUES (1, 'a');",
+    )
+    .await;
+    let t = n.table("t");
+    let p = pipeline(&n, &["t"], "mode: always");
+    let lake = Lake::new();
+    let run = start(&p, &lake, None);
+    run.snapshotted().await;
+    run.drain().await.unwrap();
+
+    a.batch_execute(&format!("ALTER TABLE {t} ADD COLUMN w int DEFAULT 7"))
+        .await
+        .unwrap();
+    let run = start(&p, &lake, None);
+    run.snapshotted().await;
+    let b = lake.sink.content(&t).unwrap();
+    let w = b
+        .column_by_name("w")
+        .expect("the added column")
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("int");
+    assert_eq!(w.value(0), 7, "the row read under the new schema");
+    run.drain().await.unwrap();
+    cleanup(&a, &n).await;
+}

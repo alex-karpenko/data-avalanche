@@ -1,6 +1,6 @@
 //! Fixtures for the crate's unit tests.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -402,6 +402,7 @@ impl World {
             tracked: tables.iter().map(|t| TableRef::new("public", *t)).collect(),
             dump_only: false,
             snapshot_started: BTreeMap::new(),
+            drifted: BTreeSet::new(),
         };
         (core, control, status_rx)
     }

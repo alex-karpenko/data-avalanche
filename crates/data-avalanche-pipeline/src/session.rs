@@ -51,6 +51,10 @@ pub(crate) struct Core {
     pub dump_only: bool,
     /// When each table's snapshot began in this run (`timeouts.snapshot`).
     pub snapshot_started: BTreeMap<TableRef, Instant>,
+    /// Tables whose catalog schema moved past the cached one while the pipeline was down (Phase
+    /// 0 on a resume). A snapshot of one reads only once a rescan has brought its schema up to
+    /// date (D-M6a.11).
+    pub drifted: BTreeSet<TableRef>,
 }
 
 impl Core {
@@ -161,6 +165,7 @@ impl<'c> Session<'c> {
             }
         }
         let (mut snaps, retired, warnings) = Snapshots::load(core, &schemas).await?;
+        snaps.hold(&core.drifted);
         for table in &retired {
             acc.halt_table(table);
             schemas.remove(table);
@@ -521,6 +526,16 @@ impl<'c> Session<'c> {
         let Ok(report) = self.core.source.rescan(&known).await else {
             return Ok(None);
         };
+        let named: BTreeSet<&TableRef> = report
+            .changed
+            .iter()
+            .map(TableSchema::table)
+            .chain(&report.dropped)
+            .chain(report.halted.iter().map(|(t, _)| t))
+            .collect();
+        for table in self.snaps.release_unless(&named) {
+            self.core.drifted.remove(&table);
+        }
         if report == RescanReport::default() {
             return Ok(None);
         }
@@ -578,6 +593,9 @@ impl<'c> Session<'c> {
         }
         // Caches the applied schemas without waiting for the tables' next change.
         self.flush()?;
+        for table in self.snaps.release_unless(&BTreeSet::new()) {
+            self.core.drifted.remove(&table);
+        }
         Ok(None)
     }
 

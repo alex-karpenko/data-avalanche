@@ -76,6 +76,9 @@ pub(super) struct Snapshots {
     /// A read failed transiently: the table may have changed under the snapshot with nothing in
     /// the stream to say so (an idle table), so the session rescans (M5 Task 10 review).
     rescan: bool,
+    /// Tables whose schema drifted while the pipeline was down: not read until a rescan has
+    /// brought their schema up to date (D-M6a.11).
+    held: BTreeSet<TableRef>,
 }
 
 impl std::fmt::Debug for Snapshots {
@@ -206,7 +209,26 @@ impl Snapshots {
     }
 
     /// The table halted: its snapshot stops.
+    /// Holds the reads of those of `tables` being snapshotted.
+    pub(super) fn hold(&mut self, tables: &BTreeSet<TableRef>) {
+        self.held = tables
+            .iter()
+            .filter(|t| self.tables.contains_key(*t))
+            .cloned()
+            .collect();
+    }
+
+    /// Releases every held table not in `keep`; returns them.
+    pub(super) fn release_unless(&mut self, keep: &BTreeSet<&TableRef>) -> Vec<TableRef> {
+        let (kept, released) = std::mem::take(&mut self.held)
+            .into_iter()
+            .partition(|t| keep.contains(t));
+        self.held = kept;
+        released.into_iter().collect()
+    }
+
     pub(super) fn stop(&mut self, table: &TableRef) {
+        self.held.remove(table);
         self.tables.remove(table);
         self.docs.remove(table);
         if self.tables.is_empty() {
@@ -283,7 +305,11 @@ impl Session<'_> {
             if reading >= self.core.settings.parallelism {
                 break;
             }
-            if snap.reading || snap.done || snap.retry.is_some_and(|(at, _)| at > now) {
+            if snap.reading
+                || snap.done
+                || snap.retry.is_some_and(|(at, _)| at > now)
+                || self.snaps.held.contains(table)
+            {
                 continue;
             }
             let Some(schema) = self.schemas.get(table).cloned() else {
@@ -485,6 +511,13 @@ impl Session<'_> {
 
     /// On the tick: the snapshot timeout, and the in-flight transactions read again when due.
     pub(super) async fn snapshot_tick(&mut self) -> Result<Option<End>, WorkerError> {
+        // A held table waits for a rescan; a failed one is tried again at the next tick.
+        if !self.snaps.held.is_empty()
+            && self.rescan.is_none()
+            && let Some(end) = self.rescan().await?
+        {
+            return Ok(Some(end));
+        }
         let now = Instant::now();
         let limit = self.core.settings.snapshot_timeout;
         let late: Vec<TableRef> = self

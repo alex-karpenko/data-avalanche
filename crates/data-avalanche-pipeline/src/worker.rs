@@ -99,6 +99,7 @@ impl PipelineWorker {
             tracked: BTreeSet::new(),
             dump_only: false,
             snapshot_started: BTreeMap::new(),
+            drifted: BTreeSet::new(),
         };
         (Self { core }, WorkerHandle { control, status })
     }
@@ -388,6 +389,7 @@ pub(crate) async fn start(
         .chain(halts.iter().map(|(t, _)| t.clone()))
         .collect();
     let mut tracked = BTreeSet::new();
+    let mut drifted = BTreeSet::new();
     let mut requests = vec![];
     let mut abandoned = vec![];
     let mut schemas = vec![];
@@ -467,6 +469,7 @@ pub(crate) async fn start(
                 }
             }
             Some(c) if matches!(plan, Plan::Resume) && c.columns() != now.columns() => {
+                drifted.insert(table.clone());
                 warnings.push(format!(
                     "table {table}: its schema changed while the pipeline was down; the stream replays the change in order"
                 ));
@@ -543,6 +546,7 @@ pub(crate) async fn start(
         core.docs.save_table_schema(schema).await?;
     }
     core.tracked = tracked;
+    core.drifted = drifted;
     core.dump_only = dump_only;
     core.update(|st| st.warnings.extend(warnings));
     Ok(())
@@ -1081,5 +1085,58 @@ mod tests {
         end.unwrap();
         assert!(*seen.lock().unwrap());
         assert_eq!(w.ids("a"), [1]);
+    }
+
+    /// A table that gained a column while the worker was down, snapshotted again under
+    /// `always`: its reads wait for a rescan to bring the schema up to date, so the snapshot
+    /// reads the new column (D-M6a.11), and no read happens under the old schema.
+    #[tokio::test]
+    async fn a_table_changed_while_down_is_rescanned_before_its_snapshot() {
+        let w = World::new(&["a"]);
+        w.source.load(&t("a"), rows(1..=1));
+        let p = mode("mode: always");
+        let (end, _) = run(&w, &p, async |status| streamed(&status, &w).await).await;
+        assert_eq!(end.unwrap(), Exit::Drained);
+        let noted = TableSchema::new(
+            t("a"),
+            vec![
+                ColumnSchema::new("id", V::Int64, "bigint").not_null(),
+                ColumnSchema::new("doc", V::Text, "text"),
+                ColumnSchema::new("note", V::Text, "text"),
+            ],
+            vec!["id".into()],
+        )
+        .unwrap();
+        w.source.alter(&t("a"), noted);
+        let mut r = row(1, "x");
+        r.0.push((
+            "note".into(),
+            data_avalanche_core::ColumnValue::Text("n".into()),
+        ));
+        w.source.load(&t("a"), vec![r]);
+        let before = w.source.reads(&t("a"));
+        let (end, st) = run(&w, &p, async |status| {
+            wait_until("the snapshot is durable", || {
+                let st = status.borrow();
+                st.phase == Phase::Streaming
+                    && st.snapshots.is_empty()
+                    && w.text("a", "note") == [Some("n".to_owned())]
+            })
+            .await;
+        })
+        .await;
+        assert_eq!(end.unwrap(), Exit::Drained);
+        assert!(
+            st.warnings
+                .iter()
+                .any(|m| m.contains("changed while the pipeline was down")),
+            "{:?}",
+            st.warnings
+        );
+        assert_eq!(
+            w.source.reads(&t("a")) - before,
+            2,
+            "the chunk, then the empty one: none under the old schema"
+        );
     }
 }
