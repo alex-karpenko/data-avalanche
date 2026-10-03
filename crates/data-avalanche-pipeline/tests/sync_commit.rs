@@ -8,14 +8,14 @@
 #[path = "pg/common.rs"]
 mod common;
 
+use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 
 use data_avalanche_testkit::require_it;
+use futures_util::FutureExt;
 use tokio_postgres::NoTls;
 
 use crate::common::{Lake, admin, cleanup, converge, dsn, fresh, pipeline, start};
-
-type Fallible<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[tokio::test]
 async fn a_stalled_synchronous_commit_survives_the_chunk_that_missed_it() {
@@ -41,10 +41,10 @@ async fn a_stalled_synchronous_commit_survives_the_chunk_that_missed_it() {
     run.wait("the snapshot starts", |st| !st.snapshots.is_empty())
         .await;
 
-    // Every step is fallible, not panicking, so the setting is restored whatever happens; the
-    // first reset undoes an earlier run that died before its own. ALTER SYSTEM can't run in a
-    // multi-statement batch, hence one statement per call. Clearing the setting also releases a
-    // writer still waiting.
+    // The guarded section below is caught on an error and on a panic, then the setting is reset,
+    // then the outcome is raised: the setting is restored whatever happens. The first reset undoes
+    // an earlier run that died before its own. ALTER SYSTEM can't run in a multi-statement batch,
+    // hence one statement per call. Clearing the setting also releases a writer still waiting.
     let standby = |names: Option<&'static str>| {
         let a = &a;
         async move {
@@ -57,7 +57,7 @@ async fn a_stalled_synchronous_commit_survives_the_chunk_that_missed_it() {
         }
     };
     standby(None).await.unwrap();
-    let run_stalled: Fallible<_> = async {
+    let run_stalled = AssertUnwindSafe(async {
         standby(Some("phantom_standby")).await?;
         let (w, conn) = tokio_postgres::connect(&dsn(), NoTls).await?;
         tokio::spawn(conn);
@@ -92,11 +92,15 @@ async fn a_stalled_synchronous_commit_survives_the_chunk_that_missed_it() {
         )
         .await?;
         writer.await??;
-        Ok(rows)
-    }
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(rows)
+    })
+    .catch_unwind()
     .await;
     standby(None).await.unwrap();
-    let rows = run_stalled.unwrap();
+    let rows = match run_stalled {
+        Err(panic) => std::panic::resume_unwind(panic),
+        Ok(r) => r.unwrap(),
+    };
 
     assert_eq!(rows.len(), 5000);
     assert_eq!(

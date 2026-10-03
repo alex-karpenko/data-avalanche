@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use data_avalanche_pipeline::{HookAction, HookPoint, Hooks, WorkerError};
+use data_avalanche_pipeline::{HookAction, HookPoint, Hooks, Phase, WorkerError};
 use data_avalanche_testkit::require_it;
 
 use crate::common::{Lake, admin, cleanup, converge, fresh, pipeline, start};
@@ -61,9 +61,15 @@ async fn a_restart_resumes_where_the_last_run_stopped() {
     .unwrap();
     let probe = Arc::new(Probe::default());
     let run = start(&p, &lake, Some(probe.clone()));
+    run.wait("streaming", |st| matches!(st.phase, Phase::Streaming))
+        .await;
+    assert!(
+        run.handle.status.borrow().snapshots.is_empty(),
+        "no second snapshot"
+    );
     converge(&a, &lake, &t).await;
-    assert_eq!(probe.chunks.load(Ordering::SeqCst), 0, "no second snapshot");
     run.drain().await.unwrap();
+    assert_eq!(probe.chunks.load(Ordering::SeqCst), 0, "no second snapshot");
     cleanup(&a, &n).await;
 }
 

@@ -37,7 +37,7 @@ jobs:
       - name: PostgreSQL source tests
         run: 'cargo test --locked -p data-avalanche-source-pg --test pg --test slot_invalidation -- --test-threads=1 --skip tls::'
       - name: Pipeline worker tests
-        run: cargo test --locked -p data-avalanche-pipeline --test pg -- --test-threads=1
+        run: cargo test --locked -p data-avalanche-pipeline --test pg --test sync_commit -- --test-threads=1
       - name: Container logs on failure
         if: failure()
         run: docker compose -f test-infra/compose.yaml --profile matrix logs --no-color "postgres-${{ matrix.version }}"

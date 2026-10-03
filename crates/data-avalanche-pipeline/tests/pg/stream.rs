@@ -18,7 +18,7 @@ async fn inserts_updates_deletes_and_key_changes_reach_the_sink() {
     let lake = Lake::new();
     let run = start(&pipeline(&n, &["t"], "mode: initial"), &lake, None);
     converge(&a, &lake, &t).await;
-    // One statement per call: a multi-statement simple query is a single transaction.
+    // One transaction per call: a multi-statement simple query runs as one transaction.
     for sql in [
         format!("INSERT INTO {t} VALUES (4, 'd')"),
         format!(
