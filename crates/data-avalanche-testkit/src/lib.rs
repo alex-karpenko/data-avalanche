@@ -4,8 +4,10 @@
 
 use std::sync::Arc;
 
+pub mod fake_source;
 pub mod memory_sink;
-pub use memory_sink::MemorySink;
+pub use fake_source::{FakeSource, FakeTxn, Method};
+pub use memory_sink::{MemorySink, SinkOp};
 
 use futures_util::TryStreamExt;
 use object_store::ObjectStore;
