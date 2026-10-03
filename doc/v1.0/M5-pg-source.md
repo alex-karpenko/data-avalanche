@@ -13414,9 +13414,9 @@ The roadmap's M5 exit criteria, and where each is met:
 - [x] `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo fmt --all --check` and `RUSTDOCFLAGS="-D warnings" cargo doc -p data-avalanche-source-pg
   -p data-avalanche-core --no-deps` are clean.
-- [ ] The integration job of PR CI is green (`postgres-18` and `postgres-tls` included): open
-  until the PR runs. The by-hand matrix run is green on the final tree (above). `weekly.yml` is dispatched once on
-  `main` after the merge.
+- [x] The integration job of PR CI is green (`postgres-18` and `postgres-tls` included): PR #5,
+  run 37053627458. `weekly.yml` was dispatched on `main` after the merge and passed on PostgreSQL
+  14–17 (run 37056986838, 2026-10-02).
 - [x] Roadmap updates:
   - §2 and §3.6 (the contract in core, D-M5.1);
   - §2.1's pins;
