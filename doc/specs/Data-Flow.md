@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-01
+updated: 2026-10-03
 domain: Architecture
 tags: [architecture, data-flow, pipeline, cdc, iceberg, delta-lake, multi-sink, arrow, snapshot, replication]
 sources: []
@@ -105,24 +105,32 @@ READ LOCK` model (which could not resume mid-table — an exported snapshot dies
    MySQL — position the binlog stream at the current position (gtid: COM_BINLOG_DUMP_GTID with
            gtid_executed; binlog: COM_BINLOG_DUMP at SHOW BINARY LOG STATUS file:pos); stream immediately.
 
-2. Per table, ordered by the G-13 identifier — chunk loop:
-   a. lw  = current stream position            (pg_current_wal_lsn() / @@gtid_executed /
-                                                 SHOW BINARY LOG STATUS file:pos; read-only)
+2. Per table, ordered by the G-13 identifier — chunk loop, inside the stream session:
+   a. wait until no transaction that was in flight when the session started still writes the
+      table (PG: `pg_locks`, re-checked with backoff): its commit may precede the stream's start
+      and still be invisible to a read
    b. read chunk: SELECT ... WHERE (key) > (cursor) ORDER BY (key) LIMIT chunk_size
-                  in a SHORT read-committed txn; buffer the rows
+                  in a SHORT repeatable-read txn that also records what it sees
+                  (PG: pg_current_snapshot()); buffer the rows
                   rows → CdcEvent { op: Snapshot (_op = r), after: Row, ... }
-   c. hw  = current stream position
-   d. reconcile: as the stream is consumed lw→hw, any streamed change whose identifier is in the
-                 buffered chunk REMOVES that key from the buffer (the live change supersedes the
-                 snapshot read). After hw, emit the surviving buffered rows as snapshot inserts.
-   e. checkpoint the cursor (last row's identifier tuple) to state storage.
+   c. reconcile, when the chunk is emitted (between stream transactions): every stream transaction
+                 applied while the table is being snapshotted is logged with the keys it wrote. A
+                 chunk row whose key a logged transaction wrote, where the read didn't see that
+                 transaction, is dropped: the stream already has the newer change. A logged TRUNCATE
+                 the read didn't see drops the chunk. A source that can't say what a read saw
+                 (MySQL) uses the window: the transactions applied after the read was issued.
+   d. emit: flush the stream's buffered changes, then commit the chunk's surviving rows as their own
+            change set, flagged `snapshot` (Phase 4: the position guard never skips it).
+   e. the cursor (last row's identifier tuple) is persisted with that flush's checkpoint, never
+      before the rows are committed.
 
 3. Last chunk done ⇒ table fully captured (snapshot_status = completed); streaming simply continues.
 ```
 
 **Consistency is convergent, not a frozen instant.** Every table is PK-keyed and written as an upsert
-with keep-last-by-`_seq` (G-13), so a snapshot row that races a concurrent change converges (the
-streamed change carries the higher `_seq` and wins). **No global read lock, no long-held transaction,
+with keep-last-by-`_seq` (G-13), so a snapshot row that races a concurrent change converges: within a
+flush the streamed change carries the higher `_seq` and wins; across flushes the reconciliation (2c)
+keeps a chunk from undoing a change already applied. **No global read lock, no long-held transaction,
 no `EXPORT_SNAPSHOT`/`FLUSH TABLES`** — the snapshot needs only `SELECT` plus the existing replication
 privileges (MySQL `RELOAD`/`LOCK TABLES` are no longer required).
 
@@ -462,7 +470,9 @@ pipeline; lease lost).
 **Position guard (optimization, not correctness):** before committing a table, the sink reads that
 table's own `committed_position` marker — an **engine-tagged** value (PG LSN, or **canonical GTID-set**
 string). If `committed_position.covers(flush.position_for_table)` (PG: `≥`; MySQL: GTID **subset**) the
-table is already committed and is skipped. A split slice (`split` set) ends at its transaction's
+table is already committed and is skipped. A snapshot change set (a chunk's rows, flagged
+`snapshot`) is never skipped: its rows are read now, at a frontier the marker may already cover; the
+fence still applies. A split slice (`split` set) ends at its transaction's
 pinned start, which the stored position equals from the first slice on; a slice is skipped only
 when the stored position is strictly past that start (the transaction's commit, or a later one, has
 landed). On commit, the new value is the `union` of the prior value
@@ -614,10 +624,18 @@ membership, the lease registry) lives separately under `globals.state` per
 ├── pipeline-state.json                          — overall pipeline state version + recorded `sink_type`
 │                                                  (resume refuses a mismatch with `sink.type`)
 ├── replication/
-│   ├── slot.json                                — PG: slot name, confirmed_flush_lsn
+│   ├── slot.json                                — PG: slot name, confirmed_flush_lsn (`0/0`: the intent to
+│   │                                              create the slot, written before a managed first start)
 │   └── position.json                            — MySQL/MariaDB: tagged position (`mysql-gtid:…` /
 │                                                  `mariadb-gtid:…` / `binlog:<file>:<pos>`) + the
 │                                                  source server identity (file/position mode)
+├── schemas/
+│   └── <schema>.<table>.json                    — the table's schema as of the checkpoint (columns, identifier,
+│                                                  source id); written after the checkpoint that covers a
+│                                                  change; finds a table dropped and re-created while down
+├── halts.json                                   — halted tables: table, code, detail, `at` (the sink holds
+│                                                  the table's changes through it); written before the
+│                                                  next checkpoint; a halted table stays halted at start
 └── snapshots/
     ├── <schema>.<table>.json                    — per-table snapshot state (a `.`, `/`, `%` or control character
     │                                              inside a name is escaped as `%XX` in the file name)
@@ -696,7 +714,8 @@ Replication stream error / TCP timeout
 ```
 Sink commit error (network, commit conflict, storage/catalog error)
 │
-├─► Retry with backoff (up to configured max_retries)
+├─► Transient: retry with backoff (1 s → 60 s, jittered), without limit; status DEGRADED while
+│   retrying; the full buffer (`buffer_capacity_rows`) stops reading the source meanwhile
 ├─► On commit conflict (concurrent writer):
 │   ├─► Iceberg: re-load table metadata, re-check marker, re-pin, retry the commit
 │   │   (the commit is pinned to the base the marker was read from — assert main unchanged;
@@ -704,8 +723,9 @@ Sink commit error (network, commit conflict, storage/catalog error)
 │   └─► Delta:   re-load snapshot, re-check marker, retry the MERGE
 │       (ConcurrentTransaction on the owner app_id ⇒ another owner committed ⇒ Fenced)
 ├─► On Fenced: stop the pipeline immediately (lease lost; Clustering §19)
-├─► On persistent failure:
-│   └─► Pause pipeline; record error in state storage
+├─► Permanent (the sink refuses the table's changes): halt that table (SINK_REJECTED), record the
+│   halt before the next checkpoint; the other tables go on
+├─► NoTable, or any other error: stop the pipeline; record the error
 │   └─► Alert via metrics (pipeline_status gauge = error)
 └─► On restart: replay from last confirmed_flush_lsn
 ```
