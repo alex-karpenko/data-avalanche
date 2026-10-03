@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-02
+updated: 2026-10-03
 domain: Architecture
 tags: [gap-analysis, design, re-derivation, spec-readiness, blockers, open-decisions]
 resolves: []
@@ -126,13 +126,13 @@ does not block starting the specification.
 ### Counts (by status)
 
 > Recounted 2026-09-26 (v1 readiness tidy, §26); the 2026-06 figures are superseded. Open count
-> updated 2026-10-02 for the gaps M5 carried (§27).
+> updated 2026-10-02 for the gaps M5 carried (§27), and 2026-10-03 for DA-SNAP-9 (§28).
 
 | Status | Count (v1 scope) | Notes |
 |---|---|---|
 | ✅ Resolved | the large majority | Design closed by a research/spec doc or a probe. |
 | 🔄 Partial | 2 | DA-SNAP-7, DA-SRC-9 (neither blocks the plan); DA-MS-3 is a decided caveat. DA-X-8 ✅ 2026-09-26. |
-| 🟥 Open (v1) | **7** | DA-SNAP-9 and DA-SRC-13…18, carried from M5 (§27); M6 takes DA-SNAP-9. The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
+| 🟥 Open (v1) | **6** | DA-SRC-13…18, carried from M5 (§27). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
 | 🧪 Verify (v1) | **0** | DA-SRC-10/11 proven 2026-09-26 (§21). |
 | ⏭ v2 | 13 | Iceberg-sink items (§26.2). |
 | 🟢 Spec-merge debt | **0** | All applied 2026-09-26 (§26.6): §19.3 S-1…S-6, the DA-X-8 config residual, the D-V1 patches and the Data-Flow Phase 2a probe details. |
@@ -290,7 +290,7 @@ read-point hazard. This is a *change* to `Data-Flow.md` Phase 1, so it carries s
 | DA-SNAP-6 | `snapshot.chunk_size` config field | 🟢 | ✅ | Default 10000; promotion into config owed (§19). Promoted 2026-09-26 as `tables.snapshots.chunk_size` (V-108). | G-6 |
 | DA-SNAP-7 | Snapshot vs WAL/binlog retention coupling | 🟡 | 🔄 | §7 cross-ref — a slow snapshot lengthens the stream backlog; interacts with the WAL-lag guard (G-22) and binlog purge (G-26). Designed but the interaction tuning is an operational note, not a hard rule. | — |
 | DA-SNAP-8 | PK-less table under a **dump-only** mode (snapshot, never stream) | 🟡 | ✅ | The PK-less halt rule (DA-DEDUP-3) is justified by equality-delete keying — but a `dump_*` table is insert-only and never deletes, so the keying argument doesn't apply. Whether a dump-only PK-less table may be snapshotted (or still halts) is **unspecified**. Newly surfaced edge case. **2026-09-26 tidy:** decided by spec: the identifier precondition (config §11.2) applies in every mode — explicit PK-less table halts, glob-matched one is skipped; `tables.surrogate_key` struck (G-30). Dump-only PK-less tables are not supported in v1. | — |
-| DA-SNAP-9 | The snapshot watermark can't order a chunk's MVCC snapshot against the stream | 🟡 | 🆕 🟥 | Carried from M5 (§27): watermarks from `pg_current_snapshot()`, the window by xid; Snapshot_Resumability §1 amendment. M6. | — |
+| DA-SNAP-9 | The snapshot watermark can't order a chunk's MVCC snapshot against the stream | 🟡 | ✅ | Closed 2026-10-03 (§28): each chunk read records its `pg_current_snapshot()`, the writers in flight at the session's start are waited for, and the reconciler drops a chunk row a stream transaction the read didn't see already wrote (Snapshot_Resumability §1.1; Data-Flow Phase 1, S-T). Measured: M6a Task 13's busy-snapshot and stalled-synchronous-commit tests. | — |
 
 ---
 
@@ -1493,10 +1493,29 @@ items it carried. They are mirrored in §10 and §14.
 
 | ID | Title | Sev | Status | Note |
 |---|---|---|---|---|
-| DA-SNAP-9 | The snapshot watermark can't order a chunk's MVCC snapshot against the stream | 🟡 | 🆕 🟥 | `pg_current_wal_lsn()` watermarks miss a commit whose WAL precedes `lw` but which isn't visible to the chunk yet (synchronous replication widens it): a stale chunk row can overwrite a newer streamed change. Fix in M6: watermarks from `pg_current_snapshot()` in `Chunk`, the window by xid; amend Snapshot_Resumability §1. Reasoned, not measured. |
+| DA-SNAP-9 | The snapshot watermark can't order a chunk's MVCC snapshot against the stream | 🟡 | ✅ (§28) | `pg_current_wal_lsn()` watermarks miss a commit whose WAL precedes `lw` but which isn't visible to the chunk yet (synchronous replication widens it): a stale chunk row can overwrite a newer streamed change. Fix in M6: watermarks from `pg_current_snapshot()` in `Chunk`, the window by xid; amend Snapshot_Resumability §1. Reasoned, not measured. |
 | DA-SRC-13 | Publication blind spots | 🟢 | 🆕 🟥 | Unchecked at reconcile: PG15+ row filters and column lists (a column list makes channel C halt at every signal), PG18 `publish_generated_columns`, extra tables under `require_existing` / `FOR ALL TABLES` (D-M5.14 says warn), a managed `DROP TABLE` of a `TABLES IN SCHEMA` member (42704), `via_root` refused when only the leaf is published, the old publication after a rename. |
 | DA-SRC-14 | `bit` / `varbit` / PostGIS keys | 🟢 | 🆕 🟥 | `text_of` isn't valid input for those types, so a snapshot's second chunk fails `Permanent`. Refuse such keys at resolution, or render them. |
 | DA-SRC-15 | Snapshot collation and chunk edges | 🟢 | 🆕 🟥 | A domain with its own collation in a column declared with another (42P22 from the second chunk); the cursor's collation name isn't schema-qualified; a `COLLATE "C"` identity index on a non-C column isn't warned; no byte budget per chunk; `limit` 0 reads as the end; no `E''` literals. |
 | DA-SRC-16 | The replication connection's timeouts | 🟢 | 🆕 🟥 | `pgwire-replication` sets no TCP keep-alive, connect timeout or idle deadline: a black-holed peer stalls `next` until the kernel gives up. M6: a watchdog of a few heartbeats; read-ahead is 8192 events, not bytes (`with_buffer_size`). |
 | DA-SRC-17 | Source edges PostgreSQL doesn't produce, and small gaps | 🟢 | 🆕 🟥 | Crafted date/time text can overflow `i64`; loose parsing; hstore/PostGIS matched by name; no cycle guard in type planning; `convert` without a scale guard; a `string` override on a `"char"` above 127 halts on PG14 only; `char(n)` under `string` keeps its spaces; an interval's fields narrowed aren't seen; the catalog driver's errors and the server's detail aren't reported (no logging in the crate yet); a retry after dropping an invalidated orphan reports `FirstStart`; only the first V-113 error; a standby isn't refused by name; a glob table set `UNLOGGED` mid-resolve halts; `bounded` takes the connection-cache lock before its timer starts, so a call queued behind a reconnect waits longer than its budget (latency only). |
 | DA-SRC-18 | M5 test gaps | 🟢 | 🆕 🟥 | No unit test of the `ChainOnly` / `Unverified` slot verifiers; no `require`-mode integration test; no Delta sink test of a composite or `Date` key end to end; the `postgres-tls` compose service drifts from the `x-pg` anchor (`test-infra/compose.yaml`). |
+
+---
+
+## 28. M6a pipeline worker — DA-SNAP-9 closed (2026-10-03)
+
+M6a (`doc/v1.0/M6a-pipeline-worker.md`, approved 2026-10-03) builds the pipeline worker. Its
+rulings are the plan's Decisions (Q-M6a-1…8, D-M6a.1…11). Spec edits S-R…S-U are applied
+(`Data-Flow.md` §State Layout, §Sink Commit Failure, Phase 1 step 2, Phase 4 §Position guard;
+`Configuration_Specification.md` V-118).
+
+| ID | Change | Evidence |
+|---|---|---|
+| DA-SNAP-9 | 🟥 → ✅. A chunk is read in a short REPEATABLE READ transaction that records `pg_current_snapshot()`. A table's reads wait for the writers in flight at the session's start (Q-M6a-2). At emission, a chunk row is dropped when a stream transaction the read didn't see already wrote its key, and the chunk is dropped on an unseen TRUNCATE; MySQL (no read visibility) gets the window rule. Chunks commit as `snapshot` sets the guard never skips (Q-M6a-6). `Snapshot_Resumability_and_Consistency.md` §1.1 records the model | Measured on PostgreSQL 18 (M6a Tasks 2, 9, 10, 13): the busy-snapshot test (40,000 rows, four writers) fails without the reconciler's filtering; the stalled-synchronous-commit test fails without it and under the window rule |
+| DA-SRC-16 | Stays 🟥. M6a rules the stream watchdog out (D-M6a.9: the spec has none, and a server keep-alive may come only every `wal_sender_timeout / 2`). A black-holed peer's stall is not measured; revisit with the M12 chaos tests | — |
+
+Also settled in M6a, with no gap of their own: the sink's `Transient` retries without limit
+(DEGRADED, backpressure; S-S); `timeouts.snapshot` ≥ 10 s (V-118); a table whose schema drifted
+while the pipeline was down is rescanned before its snapshot reads (Q-M6a-8); a failed chunk read
+on an idle table triggers a rescan (the M5-carried item).
