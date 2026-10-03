@@ -14,7 +14,7 @@ use data_avalanche_core::{
     CdcEvent, ColumnSchema, ColumnValue, ColumnValueType as V, Op, Row, Sink, SourcePosition,
     SourceSeq, TableRef, TableSchema, TableSpec, TransactionBoundary,
 };
-use data_avalanche_state::{DocStore, PipelineDocs, SlotDoc};
+use data_avalanche_state::{DocStore, PipelineDocs, SlotDoc, SnapshotStatus, TableSnapshotDoc};
 use data_avalanche_storage::{ObjectStoreVersioned, ObjectVersion, StoreError, VersionedStore};
 use data_avalanche_testkit::{FakeSource, MemorySink};
 use object_store::memory::InMemory;
@@ -335,6 +335,23 @@ impl World {
             .expect("the checkpoint");
     }
 
+    /// Requests a snapshot of `tables`, as Phase 0 does: `in_progress` with no cursor.
+    pub async fn request(&self, tables: &[&str]) {
+        for t in tables {
+            self.docs
+                .save_table_snapshot(&TableSnapshotDoc {
+                    table: TableRef::new("public", *t),
+                    status: SnapshotStatus::InProgress,
+                    start_position: Some(self.source.wal_end()),
+                    cursor: None,
+                    row_count: None,
+                    completed_at: None,
+                })
+                .await
+                .expect("requested");
+        }
+    }
+
     /// A worker core over `tables` with `p`'s settings.
     pub fn core(
         &self,
@@ -355,6 +372,8 @@ impl World {
             control: control_rx,
             status,
             tracked: tables.iter().map(|t| TableRef::new("public", *t)).collect(),
+            dump_only: false,
+            snapshot_started: BTreeMap::new(),
         };
         (core, control, status_rx)
     }

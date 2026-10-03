@@ -9,6 +9,7 @@ pub mod accumulator;
 pub mod backoff;
 pub mod batch;
 pub mod buffer;
+mod cursor;
 #[allow(
     dead_code,
     reason = "the worker reads it (Task 11); the allow goes there"
@@ -17,10 +18,6 @@ mod decide;
 pub mod error;
 pub mod hooks;
 pub mod policy;
-#[allow(
-    dead_code,
-    reason = "the snapshot runner uses it (Task 10); the allow goes there"
-)]
 mod reconcile;
 #[allow(
     dead_code,

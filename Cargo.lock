@@ -1580,6 +1580,7 @@ dependencies = [
  "arrow-schema",
  "async-trait",
  "bytes",
+ "chrono",
  "data-avalanche-config",
  "data-avalanche-core",
  "data-avalanche-state",

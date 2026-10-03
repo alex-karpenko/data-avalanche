@@ -142,6 +142,14 @@ impl Settings {
             .unwrap_or(self.mode)
     }
 
+    /// A `dump_*` table: it stops once its snapshot is done.
+    pub fn is_dump(&self, t: &TableRef) -> bool {
+        matches!(
+            self.mode(t),
+            SnapshotMode::DumpAlways | SnapshotMode::DumpInitial
+        )
+    }
+
     pub fn partition_by(&self, t: &TableRef) -> Vec<PartitionField> {
         self.partitioning
             .get(&self.key(t))

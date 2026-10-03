@@ -7,6 +7,8 @@
 //! halts. What it held in memory is lost when it ends, and the next session replays it from the
 //! checkpoint.
 
+mod snapshot;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
@@ -17,10 +19,12 @@ use data_avalanche_core::{
     SourceSeq, StreamItem, TableRef, TableSchema, TransactionBoundary, classify, identifier_values,
 };
 use data_avalanche_state::{PipelineDocs, TableHalt};
+use futures_util::StreamExt;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinHandle;
 
+use self::snapshot::Snapshots;
 use crate::settings::Settings;
 use crate::writer::{self, Job, WriterCtx, WriterEvent};
 use crate::{
@@ -40,8 +44,12 @@ pub(crate) struct Core {
     pub tuning: Tuning,
     pub control: mpsc::Receiver<Command>,
     pub status: watch::Sender<WorkerStatus>,
-    /// The tables Phase 0 tracks. A session streams each one unless it is halted.
+    /// The tables Phase 0 tracks. A session streams each one unless it is halted or a done dump.
     pub tracked: BTreeSet<TableRef>,
+    /// Every table of the pipeline is a `dump_*` table: the worker ends once none is left.
+    pub dump_only: bool,
+    /// When each table's snapshot began in this run (`timeouts.snapshot`).
+    pub snapshot_started: BTreeMap<TableRef, Instant>,
 }
 
 impl Core {
@@ -90,6 +98,7 @@ pub(crate) struct Session<'c> {
     last_seq: Option<SourceSeq>,
     /// A rescan's findings, applied once the stream passes the position read after it.
     rescan: Option<(SourcePosition, RescanReport)>,
+    snaps: Snapshots,
     draining: bool,
 }
 
@@ -139,6 +148,18 @@ impl<'c> Session<'c> {
                 Err(e) => return Err(e.into()),
             }
         }
+        let (mut snaps, retired, warnings) = Snapshots::load(core, &schemas).await?;
+        for table in &retired {
+            acc.halt_table(table);
+            schemas.remove(table);
+        }
+        if let Err(e) = snaps.read_in_flight(&*core.source).await {
+            return Ok(Err(e));
+        }
+        let now = Instant::now();
+        for table in snaps.tables() {
+            core.snapshot_started.entry(table.clone()).or_insert(now);
+        }
         let live: Vec<TableSchema> = schemas.values().cloned().collect();
         let stream = match core.source.open_stream(&checkpoint, &live).await {
             Ok(stream) => stream,
@@ -166,6 +187,8 @@ impl<'c> Session<'c> {
             for h in recorded.iter().chain(&halts) {
                 st.halted.insert(h.table.clone(), h.reason.clone());
             }
+            st.warnings.extend(warnings);
+            st.snapshots.extend(snaps.progress());
         });
         Ok(Ok(Self {
             core,
@@ -185,6 +208,7 @@ impl<'c> Session<'c> {
             requery: BTreeMap::new(),
             last_seq: None,
             rescan: None,
+            snaps,
             draining: false,
         }))
     }
@@ -232,7 +256,15 @@ impl<'c> Session<'c> {
             .settings
             .rescan_interval
             .map(|every| tokio::time::interval_at(tokio::time::Instant::now() + every, every));
+        self.issue_reads();
         loop {
+            if self.dumped() {
+                self.flush()?;
+                if let Some(end) = self.until_durable().await? {
+                    return Ok(end);
+                }
+                return Ok(End::Exit(Exit::Dumped));
+            }
             if self.draining && !self.acc.in_transaction() {
                 self.flush()?;
                 if let Some(end) = self.until_durable().await? {
@@ -262,7 +294,18 @@ impl<'c> Session<'c> {
                     }
                     Err(e) => return Ok(End::Source(e)),
                 },
-                _ = tick.tick() => self.due(Instant::now())?,
+                read = self.snaps.reads.next(), if !self.snaps.reads.is_empty() => {
+                    let read = read.expect("not empty");
+                    if let Some(end) = self.chunk_read(read).await? {
+                        return Ok(end);
+                    }
+                }
+                _ = tick.tick() => {
+                    self.due(Instant::now())?;
+                    if let Some(end) = self.snapshot_tick().await? {
+                        return Ok(end);
+                    }
+                }
                 _ = async { rescan.as_mut().expect("guarded").tick().await },
                     if rescan.is_some() && self.rescan.is_none() =>
                 {
@@ -303,6 +346,16 @@ impl<'c> Session<'c> {
             }
             Some(WriterEvent::Durable(cp)) => {
                 self.durable = cp.clone();
+                for (table, dump) in self.snaps.durable(&cp) {
+                    self.core.update(|st| {
+                        st.snapshots.remove(&table);
+                    });
+                    if dump {
+                        // A dump stops once its snapshot is durable.
+                        self.acc.halt_table(&table);
+                        self.schemas.remove(&table);
+                    }
+                }
                 if let Err(e) = self.stream.acknowledge(&cp).await {
                     return Ok(Some(End::Source(e)));
                 }
@@ -317,6 +370,7 @@ impl<'c> Session<'c> {
         match item {
             StreamItem::Begin { xid, .. } => {
                 self.acc.begin(xid)?;
+                self.snaps.begin();
                 self.requery.clear();
                 self.last_seq = None;
             }
@@ -325,9 +379,13 @@ impl<'c> Session<'c> {
                     self.note_unchanged(&e);
                 }
                 self.last_seq = Some(e.change_seq);
+                if let Some(schema) = self.schemas.get(&e.table) {
+                    self.snaps.touch(schema, &e);
+                }
                 self.apply(&e, now)?;
             }
             StreamItem::Truncate { tables, .. } => loop {
+                self.snaps.truncated(&tables);
                 match self.acc.truncate(&tables, now) {
                     Err(AccumulatorError::FlushRequired { .. }) => self.flush()?,
                     Err(AccumulatorError::Halt { table, reason }) => self.halt(table, reason),
@@ -343,6 +401,7 @@ impl<'c> Session<'c> {
                     return Ok(Some(end));
                 }
                 self.acc.commit(&b, now)?;
+                self.snaps.applied(b.xid);
                 let at = b.commit_pos;
                 self.pending_schemas
                     .extend(self.txn_schemas.drain(..).map(|s| (at.clone(), s)));
@@ -360,6 +419,9 @@ impl<'c> Session<'c> {
     async fn boundary(&mut self, now: Instant) -> Result<Option<End>, WorkerError> {
         self.read();
         if let Some(end) = self.caught_up().await? {
+            return Ok(Some(end));
+        }
+        if let Some(end) = self.emit_ready().await? {
             return Ok(Some(end));
         }
         self.due(now)?;
@@ -499,6 +561,11 @@ impl<'c> Session<'c> {
         Ok(None)
     }
 
+    /// Every table is a dump, and every one is done or halted.
+    fn dumped(&self) -> bool {
+        self.core.dump_only && self.schemas.is_empty() && self.snaps.is_empty()
+    }
+
     fn read(&self) {
         let frontier = self.acc.frontier().clone();
         self.core.update(|st| st.read = Some(frontier));
@@ -521,6 +588,7 @@ impl<'c> Session<'c> {
     fn halt(&mut self, table: TableRef, reason: HaltReason) {
         self.acc.halt_table(&table);
         self.schemas.remove(&table);
+        self.snaps.stop(&table);
         self.halts.push(TableHalt {
             table: table.clone(),
             reason: reason.clone(),
@@ -570,6 +638,7 @@ impl<'c> Session<'c> {
             && checkpoint == self.submitted
             && self.halts.is_empty()
             && schemas.is_empty()
+            && !self.snaps.has_docs()
         {
             return Ok(());
         }
@@ -587,7 +656,7 @@ impl<'c> Session<'c> {
             change_sets,
             checkpoint: checkpoint.clone(),
             halts: std::mem::take(&mut self.halts),
-            snapshots: vec![],
+            snapshots: self.snaps.take_docs(&checkpoint),
             schemas,
             permit: None,
         };

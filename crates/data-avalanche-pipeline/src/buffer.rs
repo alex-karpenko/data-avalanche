@@ -70,10 +70,6 @@ fn key_part(v: &ColumnValue) -> Option<KeyPart> {
 
 /// The key of `row` in `schema`, compared as the buffer compares keys; `None` when an identifier
 /// value is missing, NULL or doesn't fit its column.
-#[allow(
-    dead_code,
-    reason = "the snapshot runner keys chunk rows with it (Task 10); the allow goes there"
-)]
 pub(crate) fn identity(schema: &TableSchema, row: &Row) -> Option<Key> {
     schema
         .identifier()
