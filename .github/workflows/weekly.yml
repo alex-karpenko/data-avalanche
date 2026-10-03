@@ -1,7 +1,8 @@
 name: weekly
 
-# The PostgreSQL source against the older supported servers (P-8, Q-M5-7, Q-M5-23): PostgreSQL
-# 14–17, one job each, the `postgres-18` suite of ci.yml re-run through DATA_AVALANCHE_PG_PORT.
+# The PostgreSQL source and the pipeline worker against the older supported servers (P-8, Q-M5-7,
+# Q-M5-23): PostgreSQL 14–17, one job each, the `postgres-18` suites of ci.yml re-run through
+# DATA_AVALANCHE_PG_PORT.
 # Weekly (Mondays 03:41 UTC) and on manual dispatch. The TLS tests need `postgres-tls`
 # (PostgreSQL 18) and run in ci.yml only. No secrets.
 
@@ -35,6 +36,8 @@ jobs:
         run: docker compose -f test-infra/compose.yaml --profile matrix up -d --wait "postgres-${{ matrix.version }}"
       - name: PostgreSQL source tests
         run: 'cargo test --locked -p data-avalanche-source-pg --test pg --test slot_invalidation -- --test-threads=1 --skip tls::'
+      - name: Pipeline worker tests
+        run: cargo test --locked -p data-avalanche-pipeline --test pg -- --test-threads=1
       - name: Container logs on failure
         if: failure()
         run: docker compose -f test-infra/compose.yaml --profile matrix logs --no-color "postgres-${{ matrix.version }}"

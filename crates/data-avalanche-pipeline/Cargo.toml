@@ -28,7 +28,9 @@ uuid.workspace = true
 [dev-dependencies]
 async-trait.workspace = true
 bytes.workspace = true
-object_store.workspace = true
+data-avalanche-source-pg.workspace = true
 data-avalanche-testkit.workspace = true
-tokio.workspace = true
+object_store.workspace = true
 proptest.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
