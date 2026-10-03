@@ -227,6 +227,12 @@ impl Writer {
     async fn state(&mut self, write: Write<'_>) -> Result<(), WorkerError> {
         let mut attempt = 0;
         loop {
+            // Checked before every attempt, like a commit's: a writer that lost its lease while a
+            // write kept failing must not land it later, behind the new owner's (`save_slot`
+            // overwrites).
+            if !self.ctx.guard.may_commit() {
+                return Err(WorkerError::LeaseLost);
+            }
             let docs = &self.ctx.docs;
             let r = match write {
                 Write::Halt(h) => docs.record_halt(h).await.map(drop),
@@ -261,7 +267,7 @@ enum Write<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use data_avalanche_core::position::Lsn;
@@ -302,16 +308,37 @@ mod tests {
         }
     }
 
+    /// A lease that lapses after `n` checks.
+    #[derive(Debug)]
+    struct Lapses(AtomicUsize);
+
+    impl CommitGuard for Lapses {
+        fn may_commit(&self) -> bool {
+            self.0
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+        }
+    }
+
     impl Rig {
         /// Runs the writer over `jobs` to the end and returns its events.
         async fn run(&self, jobs: Vec<Job>, hooks: Arc<dyn Hooks>) -> Vec<WriterEvent> {
+            self.run_guarded(jobs, hooks, self.guard.clone()).await
+        }
+
+        async fn run_guarded(
+            &self,
+            jobs: Vec<Job>,
+            hooks: Arc<dyn Hooks>,
+            guard: Arc<dyn CommitGuard>,
+        ) -> Vec<WriterEvent> {
             let ctx = WriterCtx {
                 sink: Arc::new(self.sink.clone()),
                 docs: self.docs.clone(),
                 slot: "p_slot".into(),
                 pipeline_id: "p".into(),
                 owner_epoch: 1,
-                guard: self.guard.clone(),
+                guard,
                 hooks,
                 backoff: FAST,
             };
@@ -548,6 +575,33 @@ mod tests {
             "{events:?}"
         );
         assert_eq!(rows(&r, "a"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_lease_lost_while_a_state_write_retries_stops_the_writer() {
+        let r = rig(&["a"]).await;
+        r.store.fail_writes(SLOT_KEY, 50);
+        let mut acc = accumulator(&["a"], 100);
+        txn(&mut acc, 1, 200, &[("a", 1, "x")]);
+        // The commit and the checkpoint's first two attempts pass the guard; the lease lapses
+        // while the slot write is being retried.
+        let guard = Arc::new(Lapses(AtomicUsize::new(4)));
+        let events = r
+            .run_guarded(vec![job(acc.flush())], Arc::new(NoHooks), guard)
+            .await;
+        assert!(
+            matches!(
+                events.last(),
+                Some(WriterEvent::Failed(WorkerError::LeaseLost))
+            ),
+            "{events:?}"
+        );
+        assert_eq!(rows(&r, "a"), 1);
+        assert_eq!(
+            r.checkpoint().await,
+            None,
+            "no checkpoint without the lease"
+        );
     }
 
     #[tokio::test]
