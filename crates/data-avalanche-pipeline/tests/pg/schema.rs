@@ -81,3 +81,35 @@ async fn a_dropped_table_halts_and_the_others_go_on() {
     run.drain().await.unwrap();
     cleanup(&a, &n).await;
 }
+
+/// An `always` table loses a column while the worker is down, and stays idle: the restart's
+/// snapshot reads under the cached schema and fails, the rescan this triggers finds the change,
+/// and the snapshot goes on under the new schema (without it, only the 60-minute rescan would).
+#[tokio::test]
+async fn an_idle_table_changed_while_down_is_snapshotted_under_its_new_schema() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(
+        &a,
+        "idle_alter",
+        "CREATE TABLE t (id bigint PRIMARY KEY, v text, extra text);
+         INSERT INTO t VALUES (1, 'a', 'x');",
+    )
+    .await;
+    let t = n.table("t");
+    let p = pipeline(&n, &["t"], "mode: always");
+    let lake = Lake::new();
+    let run = start(&p, &lake, None);
+    run.snapshotted().await;
+    run.drain().await.unwrap();
+
+    a.batch_execute(&format!("ALTER TABLE {t} DROP COLUMN extra"))
+        .await
+        .unwrap();
+    let run = start(&p, &lake, None);
+    run.snapshotted().await;
+    eprintln!("{:?}", *run.handle.status.borrow());
+    assert_eq!(lake.rows(&t), [(1, Some("a".into()))]);
+    run.drain().await.unwrap();
+    cleanup(&a, &n).await;
+}

@@ -73,6 +73,9 @@ pub(super) struct Snapshots {
     docs: BTreeMap<TableRef, TableSnapshotDoc>,
     /// Completions handed to the writer, with the checkpoint of their flush.
     completing: Vec<(SourcePosition, TableRef)>,
+    /// A read failed transiently: the table may have changed under the snapshot with nothing in
+    /// the stream to say so (an idle table), so the session rescans (M5 Task 10 review).
+    rescan: bool,
 }
 
 impl std::fmt::Debug for Snapshots {
@@ -331,6 +334,12 @@ impl Session<'_> {
                 return Ok(Some(end));
             }
         }
+        if std::mem::take(&mut self.snaps.rescan)
+            && self.rescan.is_none()
+            && let Some(end) = self.rescan().await?
+        {
+            return Ok(Some(end));
+        }
         self.issue_reads();
         Ok(None)
     }
@@ -366,6 +375,7 @@ impl Session<'_> {
                 let failed = snap.retry.map_or(0, |(_, n)| n);
                 let delay = self.core.tuning.source_backoff.delay(failed);
                 snap.retry = Some((Instant::now() + delay, failed + 1));
+                self.snaps.rescan = true;
                 return Ok(None);
             }
             Err(e) => {
@@ -862,6 +872,41 @@ mod tests {
         assert!(
             reads.load(Ordering::SeqCst) >= 3,
             "the stale chunk, again, then the empty one"
+        );
+    }
+
+    /// The table changed before its snapshot read it, and no change of it comes through the
+    /// stream: the failed read rescans, and the snapshot goes on under the new schema.
+    #[tokio::test]
+    async fn a_chunk_read_that_meets_a_changed_idle_table_rescans_it() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.source.load(&t("a"), rows(1..=2));
+        w.request(&["a"]).await;
+        w.source.alter(
+            &t("a"),
+            TableSchema::new(
+                t("a"),
+                vec![
+                    ColumnSchema::new("id", V::Int64, "bigint").not_null(),
+                    ColumnSchema::new("doc", V::Text, "text"),
+                    ColumnSchema::new("note", V::Text, "text"),
+                ],
+                vec!["id".into()],
+            )
+            .unwrap(),
+        );
+        let (mut core, control, status) = w.core(&chunks_of(10), &["a"]);
+        core.settings.rescan_interval = None;
+        run(core, control, status, async |status| {
+            snapshot_done(&w, &status, "a").await;
+        })
+        .await;
+        assert_eq!(w.ids("a"), [1, 2]);
+        assert_eq!(
+            w.text("a", "note"),
+            [None, None],
+            "read under the new schema"
         );
     }
 }
