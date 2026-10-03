@@ -53,6 +53,9 @@ pub struct WorkerStatus {
     pub read: Option<SourcePosition>,
     /// The durable checkpoint: what the source was last told it may release.
     pub checkpoint: Option<SourcePosition>,
+    /// The log the source keeps for the pipeline, read every heartbeat (PostgreSQL: the slot's
+    /// retained WAL, `data_avalanche_wal_lag_bytes`).
+    pub retained_bytes: Option<u64>,
     /// Sink commits or state writes are failing and being retried (the last error).
     pub degraded: Option<String>,
     pub halted: BTreeMap<TableRef, HaltReason>,

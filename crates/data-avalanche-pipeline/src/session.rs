@@ -14,9 +14,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use data_avalanche_core::{
-    CdcEvent, ChangeStream, ColumnValue, DeltaClass, EvolveOutcome, HaltReason, Op, RescanReport,
-    Row, SchemaDelta, SchemaHint, Sink, SinkError, SourceConnector, SourceError, SourcePosition,
-    SourceSeq, StreamItem, TableRef, TableSchema, TransactionBoundary, classify, identifier_values,
+    CdcEvent, ChangeStream, ColumnValue, HaltReason, Op, RescanReport, Row, SchemaHint, Sink,
+    SourceConnector, SourceError, SourcePosition, SourceSeq, StreamItem, TableRef, TableSchema,
+    TransactionBoundary, identifier_values,
 };
 use data_avalanche_state::{PipelineDocs, TableHalt};
 use futures_util::StreamExt;
@@ -25,6 +25,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinHandle;
 
 use self::snapshot::Snapshots;
+use crate::schema_change::{Evolver, Planned};
 use crate::settings::Settings;
 use crate::writer::{self, Job, WriterCtx, WriterEvent};
 use crate::{
@@ -55,6 +56,17 @@ pub(crate) struct Core {
 impl Core {
     pub fn update(&self, f: impl FnOnce(&mut WorkerStatus)) {
         self.status.send_modify(f);
+    }
+
+    pub fn evolver(&self) -> Evolver<'_> {
+        Evolver {
+            source: &*self.source,
+            sink: &*self.sink,
+            guard: &*self.guard,
+            tuning: &self.tuning,
+            evolution: self.settings.evolution,
+            status: &self.status,
+        }
     }
 }
 
@@ -251,6 +263,9 @@ impl<'c> Session<'c> {
     async fn event_loop(&mut self) -> Result<End, WorkerError> {
         let mut tick = tokio::time::interval(self.core.tuning.tick);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let every = self.core.settings.heartbeat;
+        let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut rescan = self
             .core
             .settings
@@ -303,6 +318,11 @@ impl<'c> Session<'c> {
                 _ = tick.tick() => {
                     self.due(Instant::now())?;
                     if let Some(end) = self.snapshot_tick().await? {
+                        return Ok(end);
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    if let Some(end) = self.wal_lag().await? {
                         return Ok(end);
                     }
                 }
@@ -561,6 +581,22 @@ impl<'c> Session<'c> {
         Ok(None)
     }
 
+    /// The WAL-retention guard (G-22): the retained log is always reported; past
+    /// `max_wal_lag_bytes` the pipeline stops to protect the source's disk. A failed read waits
+    /// for the next heartbeat.
+    async fn wal_lag(&mut self) -> Result<Option<End>, WorkerError> {
+        let retained = match self.core.source.retained_bytes().await {
+            Ok(retained) => retained,
+            Err(e) if e.is_transient() => return Ok(None),
+            Err(e) => return Ok(Some(End::Source(e))),
+        };
+        self.core.update(|st| st.retained_bytes = retained);
+        match (retained, self.core.settings.max_wal_lag_bytes) {
+            (Some(lag), Some(limit)) if lag > limit => Err(WorkerError::WalLag { lag, limit }),
+            _ => Ok(None),
+        }
+    }
+
     /// Every table is a dump, and every one is done or halted.
     fn dumped(&self) -> bool {
         self.core.dump_only && self.schemas.is_empty() && self.snaps.is_empty()
@@ -707,42 +743,19 @@ impl<'c> Session<'c> {
         let Some(cached) = self.schemas.get(&table).cloned() else {
             return Ok(None);
         };
-        let (delta, now) = match self.augment(&cached, &hint).await {
-            Ok(found) => found,
+        let Planned { now, safe } = match self.core.evolver().plan(&cached, &hint).await {
+            Ok(planned) => planned,
             Err(reason) => {
                 self.halt(table, reason);
                 return Ok(None);
             }
         };
-        let Some(now) = now else {
-            self.halt(table, HaltReason::TableDropped);
-            return Ok(None);
-        };
-        let mut safe = vec![];
-        for (change, class) in classify(&cached, &delta) {
-            match class {
-                DeltaClass::Unsafe(reason) => {
-                    self.halt(table, reason);
-                    return Ok(None);
-                }
-                DeltaClass::Safe => safe.push(change),
-                DeltaClass::Ignorable => {}
-            }
-        }
         if !safe.is_empty() {
-            if !self.core.settings.evolution {
-                self.halt(table, HaltReason::EvolutionDisabled);
-                return Ok(None);
-            }
             self.flush()?;
             if let Some(end) = self.until_durable().await? {
                 return Ok(Some(end));
             }
-            let delta = SchemaDelta {
-                table: table.clone(),
-                changes: safe,
-            };
-            match self.evolve(&delta).await? {
+            match self.core.evolver().evolve(&table, safe).await? {
                 Ok(None) => {}
                 Ok(Some(warning)) => self.core.update(|st| st.warnings.push(warning)),
                 Err(reason) => {
@@ -771,69 +784,6 @@ impl<'c> Session<'c> {
         }
         Ok(None)
     }
-
-    /// Channel C, retried while it fails transiently; a failure halts the table (fail-safe).
-    async fn augment(
-        &mut self,
-        cached: &TableSchema,
-        hint: &SchemaHint,
-    ) -> Result<(SchemaDelta, Option<TableSchema>), HaltReason> {
-        let attempts = self.core.tuning.augment_attempts.max(1);
-        let mut attempt = 0;
-        loop {
-            match self.core.source.augment(cached, hint).await {
-                Ok(found) => return Ok(found),
-                Err(SourceError::TableHalt { reason, .. }) => return Err(reason),
-                Err(e) if e.is_transient() && attempt + 1 < attempts => {
-                    tokio::time::sleep(self.core.tuning.source_backoff.delay(attempt)).await;
-                    attempt += 1;
-                }
-                Err(e) => {
-                    return Err(HaltReason::UnsafeDdl {
-                        detail: format!("the catalog read for a schema change failed: {e}"),
-                    });
-                }
-            }
-        }
-    }
-
-    /// The sink's evolve, retried while it fails transiently. `Ok(Some(warning))` for a degraded
-    /// apply; `Err` halts the table.
-    async fn evolve(
-        &mut self,
-        delta: &SchemaDelta,
-    ) -> Result<Result<Option<String>, HaltReason>, WorkerError> {
-        let mut attempt = 0;
-        loop {
-            if !self.core.guard.may_commit() {
-                return Err(WorkerError::LeaseLost);
-            }
-            let outcome = self.core.sink.evolve(&delta.table, delta).await;
-            if attempt > 0 && outcome.is_ok() {
-                self.core.update(|st| st.degraded = None);
-            }
-            match outcome {
-                Ok(EvolveOutcome::Applied) => return Ok(Ok(None)),
-                Ok(EvolveOutcome::Degraded { warning }) => {
-                    return Ok(Ok(Some(format!("table {}: {warning}", delta.table))));
-                }
-                Ok(EvolveOutcome::Unsupported { reason }) => {
-                    return Ok(Err(HaltReason::EvolutionUnsupported { detail: reason }));
-                }
-                Err(SinkError::Transient { reason }) => {
-                    self.core.update(|st| {
-                        st.degraded = Some(format!("table {}: {reason}", delta.table));
-                    });
-                    tokio::time::sleep(self.core.tuning.sink_backoff.delay(attempt)).await;
-                    attempt += 1;
-                }
-                Err(SinkError::Permanent { reason }) => {
-                    return Ok(Err(HaltReason::SinkRejected { detail: reason }));
-                }
-                Err(e) => return Err(WorkerError::Sink(e)),
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -841,7 +791,7 @@ mod tests {
     use std::time::Duration;
 
     use data_avalanche_core::position::Lsn;
-    use data_avalanche_core::{ColumnSchema, ColumnValue, ColumnValueType as V, Row};
+    use data_avalanche_core::{ColumnSchema, ColumnValue, ColumnValueType as V, Row, SinkError};
     use data_avalanche_testkit::{FakeTxn, Method, SinkOp};
 
     use super::*;
@@ -1188,6 +1138,32 @@ mod tests {
         .await;
         assert_eq!(st.halted.get(&t("a")), Some(&HaltReason::TableDropped));
         assert_eq!(w.ids("a"), [1, 2, 3], "nothing before the drop is lost");
+    }
+
+    #[tokio::test]
+    async fn the_retained_wal_is_reported_and_bounded() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let p = pipeline("", "flush: { seconds: 0 }", "max_wal_lag_bytes: 64MiB");
+        let (mut core, _control, status) = w.core(&p, &["a"]);
+        core.settings.heartbeat = Duration::from_millis(5);
+        let s = Session::open(&mut core).await.unwrap().unwrap();
+        let driver = async {
+            w.source.set_retained(Some(1024));
+            wait_until("the lag is reported", || {
+                status.borrow().retained_bytes == Some(1024)
+            })
+            .await;
+            w.source.set_retained(Some(65 << 20));
+        };
+        let (end, ()) = tokio::join!(s.run(), driver);
+        assert!(matches!(
+            end,
+            Err(WorkerError::WalLag {
+                lag: 68_157_440,
+                limit: 67_108_864
+            })
+        ));
     }
 
     fn with_note(name: &str) -> TableSchema {

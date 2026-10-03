@@ -152,10 +152,6 @@ impl Snapshots {
         Ok(())
     }
 
-    pub(super) fn is_snapshotting(&self, table: &TableRef) -> bool {
-        self.tables.contains_key(table)
-    }
-
     pub(super) fn tables(&self) -> impl Iterator<Item = &TableRef> {
         self.tables.keys()
     }
