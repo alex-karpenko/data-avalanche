@@ -51,7 +51,7 @@ data-avalanche/
 │   ├── specs/                                     source of truth (Oleksii owns)
 │   │   ├── System-Overview.md                     top-level requirements (incl. Sinks block)
 │   │   ├── Data-Flow.md                           pipeline phases, TableChangeSet, sink contract + realizations
-│   │   ├── Configuration_Specification.md         YAML config model, validation rules V-001…V-117
+│   │   ├── Configuration_Specification.md         YAML config model, validation rules V-001…V-118
 │   │   └── Schema_Change_Detection_and_Evolution.md   DDL detection & per-sink evolution
 │   ├── research/                                  Claude authors, Oleksii reviews
 │   │   ├── Multi_Sink_Architecture_and_Delta_Lake.md   sink abstraction, Delta sink, D-MS.1–16
