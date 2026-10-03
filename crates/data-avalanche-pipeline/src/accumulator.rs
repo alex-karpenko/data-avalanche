@@ -229,8 +229,9 @@ impl Accumulator {
     }
 
     /// A table's new schema (`Schema_Change…` §8), after the classifier found the change safe and
-    /// the sink evolved the table. [`AccumulatorError::FlushRequired`] when the table has committed
-    /// changes still in the old shape. A halted table is skipped.
+    /// the sink evolved the table, or found it ignorable. [`AccumulatorError::FlushRequired`] when
+    /// the table has committed changes in a shape the new schema changes. A halted table is
+    /// skipped.
     pub fn set_schema(
         &mut self,
         schema: TableSchema,

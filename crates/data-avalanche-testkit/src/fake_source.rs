@@ -613,6 +613,11 @@ fn diff(cached: &TableSchema, now: &TableSchema) -> Vec<SchemaChange> {
                 to: n.clone(),
                 narrowed: false,
             }),
+            Some(n) if n.nullable != c.nullable => changes.push(if n.nullable {
+                SchemaChange::DropNotNull(c.name.clone())
+            } else {
+                SchemaChange::SetNotNull(c.name.clone())
+            }),
             Some(_) => {}
         }
     }

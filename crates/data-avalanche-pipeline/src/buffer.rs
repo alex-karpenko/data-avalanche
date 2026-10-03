@@ -457,15 +457,26 @@ impl TableBuffer {
     }
 
     /// A schema change (`Schema_Change…` §8: seal → flush → apply). The committed layer must have
-    /// been flushed ([`AccumulatorError::FlushRequired`] otherwise); the open transaction's rows
-    /// are carried over by column name: a new column is NULL, a dropped one goes, a widened one is
-    /// widened. The identifier can't change (the classifier halts that).
+    /// been flushed ([`AccumulatorError::FlushRequired`] otherwise), unless the change keeps every
+    /// column, in order, with its logical type, and the identifier (an Ignorable change): its rows
+    /// then read the same under the new schema and stay. The open transaction's rows are carried
+    /// over by column name: a new column is NULL, a dropped one goes, a widened one is widened.
+    /// The identifier can't change (the classifier halts that).
     pub fn set_schema(
         &mut self,
         schema: TableSchema,
         delete_extra: &[String],
     ) -> Result<(), AccumulatorError> {
-        self.flush_required()?;
+        let same_shape = schema.identifier() == self.schema.identifier()
+            && schema.columns().len() == self.schema.columns().len()
+            && schema
+                .columns()
+                .iter()
+                .zip(self.schema.columns())
+                .all(|(new, old)| new.name == old.name && new.logical == old.logical);
+        if !same_shape {
+            self.flush_required()?;
+        }
         if schema.identifier() != self.schema.identifier() {
             return Err(self.halt(HaltReason::UnsafeDdl {
                 detail: "the identifier changed".into(),
@@ -1089,10 +1100,28 @@ mod tests {
         b.commit_txn();
         b.apply(&insert(2, 2, "open")).unwrap();
         assert!(is_flush_required(b.truncate()));
-        assert!(is_flush_required(b.set_schema(schema(), &[])));
+        let mut fewer = schema().columns().to_vec();
+        fewer.pop();
+        let fewer = TableSchema::new(TableRef::new("public", "t"), fewer, vec!["id".into()]);
+        assert!(is_flush_required(b.set_schema(fewer.unwrap(), &[])));
         assert_eq!(b.open_events(), 1, "nothing changed");
         b.take_committed();
         b.truncate().unwrap();
+    }
+
+    #[test]
+    fn an_ignorable_change_keeps_the_committed_layer() {
+        let mut b = buffer();
+        b.apply(&insert(1, 1, "a")).unwrap();
+        b.commit_txn();
+        let mut columns = schema().columns().to_vec();
+        columns[1] = ColumnSchema::new("doc", V::Text, "varchar(100)").not_null();
+        let ignorable = TableSchema::new(TableRef::new("public", "t"), columns, vec!["id".into()]);
+        b.set_schema(ignorable.unwrap(), &["region".into()])
+            .unwrap();
+        assert_eq!(b.schema().columns()[1].source_type, "varchar(100)");
+        assert_eq!(b.committed_events(), 1, "no flush");
+        assert_eq!(b.take_committed()[0].values[1], text("a"));
     }
 
     #[test]

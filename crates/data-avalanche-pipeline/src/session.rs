@@ -297,7 +297,9 @@ impl<'c> Session<'c> {
             let permits = self.permits.clone();
             tokio::select! {
                 biased;
-                cmd = self.core.control.recv() => self.command(cmd)?,
+                // Not once draining: a closed channel is ready at every poll, and would starve
+                // the stream that must finish the open transaction.
+                cmd = self.core.control.recv(), if !self.draining => self.command(cmd)?,
                 ev = self.events.recv() => {
                     if let Some(end) = self.writer_event(ev).await? {
                         return Ok(end);
@@ -751,8 +753,13 @@ impl<'c> Session<'c> {
         Ok(None)
     }
 
-    /// `Schema_Change…` §8.1 at the signal's position: the catalog read (channel C), the
-    /// classification, then for a Safe change seal → flush → evolve, and the rebuild.
+    /// `Schema_Change…` §8.1 at the signal's position: the catalog read (channel C) and the
+    /// classification come first. An Ignorable change only rebuilds: no flush, no evolve. A Safe
+    /// change flushes what is buffered and waits until it is durable, then evolves the sink and
+    /// rebuilds. A change that halts the table (Unsafe, any with evolution off, a dropped table, a
+    /// failed catalog read) flushes and waits the same way, so the table's committed rows reach
+    /// the sink, then halts it at that flush's checkpoint. In an open transaction the change applies where the stream met it: the
+    /// committed rows flush, and the transaction goes on under the new schema.
     async fn schema_signal(
         &mut self,
         table: TableRef,
@@ -761,7 +768,23 @@ impl<'c> Session<'c> {
         let Some(cached) = self.schemas.get(&table).cloned() else {
             return Ok(None);
         };
-        let Planned { now, safe } = match self.core.evolver().plan(&cached, &hint).await {
+        let planned = self.core.evolver().plan(&cached, &hint).await;
+        if planned.as_ref().is_ok_and(|p| p.now == cached) {
+            // A signal with nothing behind it (REPLICA IDENTITY FULL signals at every Relation
+            // message): no flush, no evolve, no cache write.
+            return Ok(None);
+        }
+        if !matches!(&planned, Ok(p) if p.safe.is_empty()) {
+            self.flush()?;
+            if let Some(end) = self.until_durable().await? {
+                return Ok(Some(end));
+            }
+            if !self.schemas.contains_key(&table) {
+                // The sink refused the flush and the writer halted the table meanwhile.
+                return Ok(None);
+            }
+        }
+        let Planned { now, safe } = match planned {
             Ok(planned) => planned,
             Err(reason) => {
                 self.halt(table, reason);
@@ -769,10 +792,6 @@ impl<'c> Session<'c> {
             }
         };
         if !safe.is_empty() {
-            self.flush()?;
-            if let Some(end) = self.until_durable().await? {
-                return Ok(Some(end));
-            }
             match self.core.evolver().evolve(&table, safe).await? {
                 Ok(None) => {}
                 Ok(Some(warning)) => self.core.update(|st| st.warnings.push(warning)),
@@ -902,6 +921,39 @@ mod tests {
         assert!(matches!(end.unwrap(), End::Exit(Exit::Drained)));
         assert_eq!(w.ids("a"), [1]);
         assert_eq!(checkpoint(&w).await, lsn_of(&w.source.wal_end()));
+    }
+
+    #[tokio::test]
+    async fn a_drain_with_the_handle_gone_finishes_the_open_transaction() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let p = pipeline(
+            "",
+            "flush: { seconds: 0 }, max_transaction_batch_rows: 2, buffer_capacity_rows: 1",
+            "",
+        );
+        let (mut core, control, _status) = w.core(&p, &["a"]);
+        let s = Session::open(&mut core).await.unwrap().unwrap();
+        w.sink.hold_commits();
+        let mut txn = FakeTxn::new();
+        for id in 1..=6 {
+            txn = txn.insert(&t("a"), row(id, "x"));
+        }
+        w.source.commit(txn);
+        let driver = async {
+            // A slice is in the writer and the next waits for room: the transaction is open.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            control.send(Command::Drain).await.unwrap();
+            drop(control);
+            w.sink.release_commits();
+        };
+        let (end, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(s.run(), driver)
+        })
+        .await
+        .expect("the drain ends");
+        assert!(matches!(end.unwrap(), End::Exit(Exit::Drained)));
+        assert_eq!(w.ids("a"), [1, 2, 3, 4, 5, 6]);
     }
 
     #[tokio::test]
@@ -1224,6 +1276,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_signal_that_changes_nothing_neither_flushes_nor_evolves() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let p = pipeline("", "flush: { seconds: 3600 }", "");
+        let (mut core, _control, _status) = w.core(&p, &["a"]);
+        let mut s = Session::open(&mut core).await.unwrap().unwrap();
+        let at = lsn_of(&w.source.wal_end()).0 + 0x100;
+        crate::test_support::txn(&mut s.acc, 900, at, &[("a", 1, "x")]);
+        let submitted = s.submitted.clone();
+        let version = w.sink.version(&t("a"));
+        let cached = s.schemas[&t("a")].clone();
+        let hint = SchemaHint::Columns(cached.columns().to_vec());
+        assert!(s.schema_signal(t("a"), hint).await.unwrap().is_none());
+        assert_eq!(s.submitted, submitted, "no flush");
+        assert!(s.queued.is_empty());
+        assert_eq!(w.sink.version(&t("a")), version, "no evolve");
+        assert!(s.pending_schemas.is_empty() && s.txn_schemas.is_empty());
+    }
+
+    #[tokio::test]
     async fn a_safe_change_halts_when_evolution_is_off() {
         let w = World::new(&["a"]);
         w.started(&["a"]).await;
@@ -1246,27 +1318,178 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unsafe_change_halts_the_table() {
+    async fn an_ignorable_change_neither_flushes_nor_evolves() {
         let w = World::new(&["a"]);
         w.started(&["a"]).await;
-        let int_doc = TableSchema::new(
+        let p = pipeline("", "flush: { seconds: 3600 }", "");
+        let (mut core, _control, _status) = w.core(&p, &["a"]);
+        let mut s = Session::open(&mut core).await.unwrap().unwrap();
+        let at = lsn_of(&w.source.wal_end()).0 + 0x100;
+        crate::test_support::txn(&mut s.acc, 900, at, &[("a", 1, "x")]);
+        let submitted = s.submitted.clone();
+        let version = w.sink.version(&t("a"));
+        let not_null = TableSchema::new(
             t("a"),
+            vec![
+                ColumnSchema::new("id", V::Int64, "bigint").not_null(),
+                ColumnSchema::new("doc", V::Text, "text").not_null(),
+            ],
+            vec!["id".into()],
+        )
+        .unwrap();
+        w.source.alter(&t("a"), not_null);
+        let hint = SchemaHint::Columns(w.source.schema(&t("a")).columns().to_vec());
+        assert!(s.schema_signal(t("a"), hint).await.unwrap().is_none());
+        assert_eq!(s.submitted, submitted, "no flush");
+        assert!(s.queued.is_empty());
+        assert_eq!(w.sink.version(&t("a")), version, "no evolve");
+        assert!(!s.schemas[&t("a")].column("doc").unwrap().nullable);
+        s.flush().unwrap();
+        assert!(s.until_durable().await.unwrap().is_none());
+        assert_eq!(w.ids("a"), [1], "the buffered row keeps its place");
+        let cached = w.docs.table_schema(&t("a")).await.unwrap().unwrap().doc;
+        assert!(!cached.column("doc").unwrap().nullable, "cached with it");
+    }
+
+    fn int_doc(name: &str) -> TableSchema {
+        TableSchema::new(
+            t(name),
             vec![
                 ColumnSchema::new("id", V::Int64, "bigint").not_null(),
                 ColumnSchema::new("doc", V::Int64, "bigint"),
             ],
             vec!["id".into()],
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    fn int_row(id: i64) -> Row {
+        Row(vec![
+            ("id".into(), ColumnValue::Int64(id)),
+            ("doc".into(), ColumnValue::Int64(7)),
+        ])
+    }
+
+    /// A change to `a` that halts it (`p`, the catalog becomes `altered`, the next row is
+    /// `next(id)`) while `a` and `b` have committed rows buffered. `a`'s rows reach the sink
+    /// before it halts, and the halt holds from that flush's checkpoint. A restart neither loses
+    /// nor repeats a row.
+    async fn halts_after_the_earlier_rows(
+        p: &data_avalanche_config::Pipeline,
+        altered: TableSchema,
+        next: fn(i64) -> Row,
+        want: fn(&HaltReason) -> bool,
+    ) {
+        let w = World::new(&["a", "b"]);
+        w.started(&["a", "b"]).await;
+        let mut before = None;
+        let (end, st) = session(&w, p, &["a", "b"], async |status| {
+            w.source.commit(
+                FakeTxn::new()
+                    .insert(&t("a"), row(1, "x"))
+                    .insert(&t("a"), row(2, "x"))
+                    .insert(&t("b"), row(1, "y")),
+            );
+            before = Some(w.source.wal_end());
+            w.source.alter(&t("a"), altered);
+            w.source.commit(
+                FakeTxn::new()
+                    .insert(&t("a"), next(3))
+                    .insert(&t("b"), row(2, "y")),
+            );
+            let end = w.source.wal_end();
+            wait_until("it is read", || status.borrow().read.as_ref() == Some(&end)).await;
+        })
+        .await;
+        end.unwrap();
+        let before = before.expect("driven");
+        assert!(want(&st.halted[&t("a")]), "{:?}", st.halted);
+        assert_eq!(w.ids("a"), [1, 2], "the rows before the change are in");
+        assert_eq!((w.ids("b"), w.sink.version(&t("a"))), (vec![1, 2], Some(1)));
+        let halts = w.docs.halts().await.unwrap().tables;
+        assert_eq!(halts.len(), 1);
+        assert_eq!((&halts[0].table, &halts[0].at), (&t("a"), &before));
+        assert!(want(&halts[0].reason));
+
+        let (end, st) = session(&w, p, &["a", "b"], async |status| {
+            w.source.commit(
+                FakeTxn::new()
+                    .insert(&t("a"), next(4))
+                    .insert(&t("b"), row(3, "y")),
+            );
+            let end = w.source.wal_end();
+            wait_until("it is read", || status.borrow().read.as_ref() == Some(&end)).await;
+        })
+        .await;
+        end.unwrap();
+        assert!(st.halted.contains_key(&t("a")));
+        assert_eq!(
+            (w.ids("a"), w.sink.version(&t("a"))),
+            (vec![1, 2], Some(1)),
+            "the restart neither loses nor rewrites a row"
+        );
+        assert_eq!(w.ids("b"), [1, 2, 3]);
+        assert_eq!(w.docs.halts().await.unwrap().tables, halts);
+    }
+
+    #[tokio::test]
+    async fn an_unsafe_change_halts_after_the_tables_earlier_rows_are_durable() {
+        let p = pipeline("", "flush: { seconds: 3600 }", "");
+        halts_after_the_earlier_rows(&p, int_doc("a"), int_row, |r| {
+            matches!(r, HaltReason::UnsafeDdl { .. })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_change_with_evolution_off_halts_after_the_tables_earlier_rows_are_durable() {
+        let p = Yaml {
+            pipeline: "\n    schema_evolution: { enabled: false }",
+            sink: "flush: { seconds: 3600 }",
+            ..Yaml::default()
+        }
+        .build();
+        halts_after_the_earlier_rows(&p, with_note("a"), noted, |r| {
+            *r == HaltReason::EvolutionDisabled
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_sink_refusal_of_the_flush_before_a_halt_keeps_its_reason() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.sink
+            .fail(SinkOp::Commit, Some(&t("a")), 1, || SinkError::Permanent {
+                reason: "refused".into(),
+            });
+        let p = pipeline("", "flush: { seconds: 3600 }", "");
+        let (end, st) = session(&w, &p, &["a"], async |status| {
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+            w.source.alter(&t("a"), int_doc("a"));
+            w.source.commit(FakeTxn::new().insert(&t("a"), int_row(2)));
+            let end = w.source.wal_end();
+            wait_until("it is read", || status.borrow().read.as_ref() == Some(&end)).await;
+        })
+        .await;
+        end.unwrap();
+        let halts = w.docs.halts().await.unwrap().tables;
+        assert!(
+            matches!(
+                st.halted.get(&t("a")),
+                Some(HaltReason::SinkRejected { .. })
+            ) && matches!(&halts[..], [h] if matches!(h.reason, HaltReason::SinkRejected { .. })),
+            "{halts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unsafe_change_halts_the_table() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
         let (end, st) = session(&w, &flush_each(), &["a"], async |status| {
-            w.source.alter(&t("a"), int_doc);
-            w.source.commit(FakeTxn::new().insert(
-                &t("a"),
-                Row(vec![
-                    ("id".into(), ColumnValue::Int64(1)),
-                    ("doc".into(), ColumnValue::Int64(7)),
-                ]),
-            ));
+            w.source.alter(&t("a"), int_doc("a"));
+            w.source.commit(FakeTxn::new().insert(&t("a"), int_row(1)));
             let end = w.source.wal_end();
             wait_until("it is read", || status.borrow().read.as_ref() == Some(&end)).await;
         })
