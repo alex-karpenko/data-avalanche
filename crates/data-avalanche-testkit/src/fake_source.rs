@@ -1,6 +1,8 @@
 //! A scripted source (roadmap M6a): an in-memory database with a write-ahead log, a replication
 //! slot and MVCC visibility, behind the `SourceConnector` contract, so pipeline tests run the
-//! whole worker without PostgreSQL. Positions are PostgreSQL LSNs.
+//! whole worker without PostgreSQL. Positions are PostgreSQL LSNs: like pgoutput, a change
+//! carries its commit record's start and the `Commit` the record's end, 8 bytes on, which is what
+//! a stream acknowledges and resumes from.
 //!
 //! - Tests commit transactions ([`FakeTxn`]): the rows change and the log grows; an open stream
 //!   delivers them. [`FakeSource::commit_stalled`] commits one that the stream delivers but a
@@ -78,13 +80,15 @@ impl FakeTxn {
     }
 
     /// Updates the row with `row`'s key; a [`ColumnValue::Unchanged`] in it keeps the stored
-    /// value and is streamed as unchanged.
+    /// value and is streamed as unchanged. Streamed without a before-image, as PostgreSQL sends it
+    /// under REPLICA IDENTITY DEFAULT.
     pub fn update(mut self, table: &TableRef, row: Row) -> Self {
         self.ops.push(FakeOp::Update(table.clone(), row));
         self
     }
 
-    /// Moves the row with key `old` to `row`'s key (a PK-changing UPDATE).
+    /// Moves the row with key `old` to `row`'s key (a PK-changing UPDATE), streamed with `old` as
+    /// its before-image.
     pub fn update_key(mut self, table: &TableRef, old: Row, row: Row) -> Self {
         self.ops.push(FakeOp::Move(table.clone(), old, row));
         self
@@ -488,8 +492,7 @@ impl Db {
                         })
                         .collect());
                     write(self, &t, key, Some(merged));
-                    let before = identifier_values(&schema, &row);
-                    changes.push(self.change(&t, Op::Update, before, Some(row), seq()));
+                    changes.push(self.change(&t, Op::Update, None, Some(row), seq()));
                 }
                 FakeOp::Move(t, old, row) => {
                     let schema = self.schema(&t);
@@ -513,13 +516,14 @@ impl Db {
                 }
             }
         }
-        let commit = Lsn(next + 0x10);
+        let commit_lsn = Lsn(next + 0x10);
+        let commit = Lsn(next + 0x18);
         self.wal_end = commit;
         for c in &mut changes {
             if let WalChange::Change { event, .. } = c {
                 event.xid = xid;
                 event.commit_ts_micros = ts;
-                event.source_pos = SourcePosition::Pg(commit);
+                event.source_pos = SourcePosition::Pg(commit_lsn);
             }
         }
         self.wal.push(WalEntry::Txn {
@@ -1042,7 +1046,12 @@ mod tests {
         let StreamItem::Commit(b) = &got[2] else {
             panic!()
         };
-        assert_eq!(e.source_pos, b.commit_pos);
+        // PostgreSQL: a change carries its commit record's start, the Commit the record's end.
+        let (SourcePosition::Pg(at), SourcePosition::Pg(end)) = (&e.source_pos, &b.commit_pos)
+        else {
+            panic!("{got:?}")
+        };
+        assert_eq!(end.0, at.0 + 8);
         let chunk = src.read_chunk(&tables[0], None, 10).await.unwrap();
         assert_eq!(chunk.rows, vec![row(1, "a"), row(2, "b")]);
         s.acknowledge(&b.commit_pos).await.unwrap();
@@ -1115,6 +1124,11 @@ mod tests {
             panic!()
         };
         assert_eq!(e.after.as_ref().unwrap().get("v"), Some(&Val::Unchanged));
+        // REPLICA IDENTITY DEFAULT: no old tuple unless the key changes.
+        assert_eq!(e.before, None);
+        let StreamItem::Change(e) = &got[3] else {
+            panic!()
+        };
         assert_eq!(e.before, Some(key(1)));
         assert!(matches!(&got[5], StreamItem::Truncate { tables, .. } if tables == &[t()]));
         assert!(src.rows(&t()).is_empty());
