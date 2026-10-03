@@ -1,8 +1,8 @@
 ---
-updated: 2026-10-02
+updated: 2026-10-03
 domain: Data Flow
 tags: [snapshot, resumability, incremental-snapshot, watermark, keyset, consistency, on-demand, cdc]
-resolves: [G-6, G-7, G-20]
+resolves: [G-6, G-7, G-20, DA-SNAP-9]
 ---
 
 # Snapshot Resumability and Consistency (Incremental Chunked Model)
@@ -60,10 +60,48 @@ Order of operations flips from "snapshot then stream" to **"stream first, snapsh
    e. **Checkpoint** the cursor (last row's identifier tuple) to state storage.
 3. When the last chunk completes, the table is fully captured; streaming simply continues.
 
-Because every table is PK-keyed and written as an **upsert with keep-last-by-`_seq`** (G-13), the
-watermark step is belt-and-suspenders: even a snapshot row that races a concurrent change converges,
-since the streamed change carries a higher `_seq` and wins. **No global read lock, no long-held
-transaction.**
+Because every table is PK-keyed and written as an **upsert with keep-last-by-`_seq`** (G-13), a
+snapshot row that races a concurrent change **in the same flush** converges: the streamed change
+carries a higher `_seq` and wins. Across flushes it doesn't: a chunk row committed after the
+stream's change overwrites it. Steps 2a–2d above don't close that window; §1.1 replaces them.
+**No global read lock, no long-held transaction.**
+
+### §1.1 — The merge window, as built (DA-SNAP-9; M6a, 2026-10-03)
+
+A WAL position doesn't say what a chunk's read saw. Two cases break the `lw`/`hw` reconciliation:
+
+- A transaction commits while the chunk is being read. The stream may decode and apply it before
+  the chunk is emitted, while the read didn't see it.
+- A **synchronous commit** waiting for its standby is in the WAL, so the stream already delivers
+  it. It is not yet visible to any snapshot, so a read issued later still doesn't see it. Measured
+  on PostgreSQL 18 (`data-avalanche-source-pg`'s `tests/sync_commit`, M6a Task 2).
+
+The chunk loop the pipeline runs instead (Data-Flow Phase 1 step 2, spec edit S-T):
+
+1. **Writers in flight at the session's start.** Their commits may precede the stream's start yet
+   be invisible to a read. A table's chunks are read only once none of its writers listed by
+   `in_flight()` (PG: `pg_locks`) is still in flight, re-checked with backoff 0.5 s → 10 s (Q-M6a-2).
+2. **The read records what it saw.** Each chunk is read in a short REPEATABLE READ transaction that
+   first takes `pg_current_snapshot()` (`xmin`, `xmax`, `xip`).
+3. **Reconcile at emission**, between stream transactions. Every stream transaction applied while
+   a table is being snapshotted is logged with the keys it wrote in those tables, and its
+   TRUNCATEs. A chunk row whose key a logged transaction wrote, where the chunk's snapshot doesn't
+   see that transaction, is dropped: the stream already has the newer change. An unseen TRUNCATE
+   drops the chunk. A logged entry is kept until a chunk proves it visible, and until every read
+   still outstanding was issued after that proof: a read issued earlier may hold an older snapshot.
+   A source that can't say what a read saw (MySQL, `visibility: None`) uses the window rule: the
+   transactions applied after the read was issued.
+4. **Emit.** The stream's buffered changes are flushed first. Then the chunk's rows are committed
+   as their own change set, flagged `snapshot`. The position guard never skips such a set: its
+   rows are read now, at a frontier the table's marker may already cover (Q-M6a-6). The cursor
+   document rides the same flush.
+5. **A schema that drifted while the pipeline was down** holds the table's reads until a rescan has
+   brought its schema up to date (Q-M6a-8). A read that fails because the table changed under it
+   triggers a rescan too.
+
+Evidence (`crates/data-avalanche-pipeline`, M6a): the reconciler's unit tests; the busy-snapshot
+test (40,000 rows, four concurrent writers) fails without the reconciler's filtering; the
+stalled-synchronous-commit test fails without it and under the window rule.
 
 ---
 
@@ -161,8 +199,8 @@ mechanism. Idempotent upserts mean re-reading existing keys simply re-writes the
 | Concern | PostgreSQL | MySQL |
 |---|---|---|
 | Stream start | logical slot `start_lsn` | binlog at `gtid_executed` |
-| Low/high watermark | `pg_current_wal_lsn()` | `@@gtid_executed` (or `SHOW MASTER STATUS`) |
-| Chunk read isolation | `READ COMMITTED` short txn | `READ COMMITTED` short txn |
+| What a chunk's read saw | `pg_current_snapshot()` in the chunk's transaction (§1.1) | none: the window rule (§1.1) |
+| Chunk read isolation | `REPEATABLE READ` short txn | `READ COMMITTED` short txn |
 | Privileges removed | `EXPORT_SNAPSHOT` no longer load-bearing for snapshot consistency | **`RELOAD` / `LOCK TABLES` no longer needed** |
 | Long-txn / bloat risk | eliminated (short per-chunk txns) | eliminated |
 
@@ -195,7 +233,7 @@ WAL-lag guard interaction).
 
 | Decision | Resolution |
 |---|---|
-| D-6.1 model | **Incremental chunked** snapshot, stream-first, watermark + upsert reconciliation |
+| D-6.1 model | **Incremental chunked** snapshot, stream-first; reconciled by what each read saw (§1.1, DA-SNAP-9) + upsert |
 | D-6.2 cursor | Typed identifier tuple; row-value keyset; one **deterministic collation** for order and cursor (the key's own when deterministic, else binary; Q-M5-16); no-key fallback moot (G-13) |
 | D-6.3 chunking | `snapshot.chunk_size` default 10000; checkpoint per chunk; resume is idempotent |
 | G-7 consistency | Lock-free, convergent; no `RELOAD`/`LOCK TABLES`; no `consistent_snapshot` toggle |
