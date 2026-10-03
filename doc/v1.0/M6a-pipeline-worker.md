@@ -24,7 +24,7 @@ M6 is split in two (owner decision, 2026-10-02). **M6a** (this plan) is the work
 `PipelineController`, the binary with `run --config`, the HTTP health and metrics listener, the
 M4-carried Delta items, and the slice-1 E2E suite on RustFS (§5.3), which is M6's exit.
 
-**Architecture:** Small changes in four crates, then the worker in `data-avalanche-pipeline`.
+**Architecture:** Small changes in five crates, then the worker in `data-avalanche-pipeline`.
 
 - **`data-avalanche-core`**:
   - `Chunk::visibility` (`ChunkVisibility::Xids(XidSnapshot)`, `XidSnapshot::sees`) and
@@ -38,6 +38,7 @@ M4-carried Delta items, and the slice-1 E2E suite on RustFS (§5.3), which is M6
   `Contended`.
 - **`data-avalanche-state`**: the schema cache (`schemas/<schema>.<table>.json`), the halt
   registry (`halts.json`) and the slot-creation intent (`confirmed_flush_lsn` `0/0`).
+- **`data-avalanche-config`**: V-118, `timeouts.snapshot` ≥ 10 s (Q-M6a-7).
 - **`data-avalanche-testkit`**: `FakeSource`, a scripted `SourceConnector` with an in-memory
   table store, MVCC-style chunk visibility and stalled commits; `MemorySink` faults, a commit hold
   and a takeover.
@@ -151,7 +152,10 @@ the arrow.
    `an_unsafe_change_halts_the_table`, `a_failed_catalog_read_halts_the_table`), Task 8 (`a_rescan_evolves_an_idle_tables_change`,
    `a_dropped_table_halts_once_the_stream_has_its_last_changes`), Task 10
    (`a_chunk_read_under_the_old_schema_is_read_again`), Task 11 (`a_table_dropped_while_down_halts`,
-   `a_table_created_again_while_down_halts`), Task 13 (`a_dropped_table_halts_and_the_others_go_on`), Task 14.
+   `a_table_created_again_while_down_halts`), Task 13 (`a_dropped_table_halts_and_the_others_go_on`), Task 14
+   (`an_idle_table_changed_while_down_is_snapshotted_under_its_new_schema`), Task 16
+   (`a_table_changed_while_down_is_rescanned_before_its_snapshot`,
+   `an_idle_table_that_gained_a_column_while_down_is_snapshotted_with_it`).
 5. **A sink or a state store that fails for a while, and a slot another reader holds.** Sink
    `Transient` retries forever with DEGRADED status and backpressure (Q-M6a-5). A state write
    retries. A busy slot (`55006`) is retried within a window, and a lost position resets and
@@ -162,7 +166,7 @@ the arrow.
 
 ## Decisions and rulings
 
-**Asked and answered (2026-10-02 and 2026-10-03):**
+**Asked and answered (2026-10-02 and 2026-10-03; the plan approved 2026-10-03):**
 
 | # | Question | Answer |
 |---|---|---|
@@ -172,6 +176,8 @@ the arrow.
 | Q-M6a-4 | When does a channel-D rescan's `changed` schema apply? | **After the stream catches up**: the position read right after the rescan; a change the stream applied meanwhile is skipped |
 | Q-M6a-5 | A sink commit that keeps failing `Transient` | **Retry forever**, backoff 1 s → 60 s with jitter, status DEGRADED while retrying; backpressure through `buffer_capacity_rows` stops reading the stream. Data-Flow §Sink Commit Failure changes (S-S below) |
 | Q-M6a-6 | Chunk rows emitted at a frontier the table's marker covers (an idle source, or a replay) are skipped by the guard: silent loss while the cursor advances | **A snapshot flag on the change set.** `CommitMarker::covers` never skips a snapshot set; the fence still applies; `validate` refuses a snapshot set with deletes, a truncate or a split. The worker flushes the stream's changes before a chunk, then commits the chunk as its own set (S-T below) |
+| Q-M6a-7 | `timeouts.snapshot: 0` halts every snapshot at once (the duration is literal) | **A V-rule: at least 10 s** (V-118, Task 15; spec edit S-U) |
+| Q-M6a-8 | A table whose schema changed while the worker was down (an idle table under `always`, or a resumed snapshot): a snapshot under the cached columns leaves an added column NULL | **Rescan before snapshotting** (Task 16, D-M6a.11) |
 
 **Rulings made while building** (each pinned by a test; D-IMPL-13 in the roadmap):
 
@@ -225,12 +231,14 @@ the arrow.
 - **D-M6a.10 — WAL lag** (G-22, V-104). `retained_bytes` is read at every heartbeat and always
   reported in the status. Past `max_wal_lag_bytes` the worker ends with `WorkerError::WalLag`. A
   failed read waits for the next heartbeat.
-- **D-M6a.11 — An added column under a snapshot.** An `ADD COLUMN` while the worker is down, on
-  a table nothing writes, doesn't fail PostgreSQL's chunk read: it checks the cached columns
-  only. The snapshot reads the cached columns, so the added column stays NULL in those rows
-  (Schema_Change §7.2: "historical rows read NULL"). The column arrives with the table's next
-  signal or rescan. A dropped or retyped column fails the read, and the read's rescan (Task 14)
-  catches up.
+- **D-M6a.11 — A schema that drifted while down, under a snapshot** (Q-M6a-8). On a resume,
+  Phase 0 records each table whose catalog schema moved past the cached one. A snapshot of such a
+  table holds its reads until a rescan has brought the schema up to date. A table the rescan
+  doesn't name is released at once; a table it names is released once the report has applied,
+  after the stream catches up. Without it, an `ADD COLUMN` on an idle table would be read under
+  the cached columns: PostgreSQL's chunk read checks only those, so the new column would stay
+  NULL in every snapshotted row. A column dropped or retyped while the worker runs fails the read
+  instead, and the read's rescan (Task 14) catches up.
 
 **Facts measured while building** (outrank memory):
 
@@ -242,8 +250,8 @@ the arrow.
 - `snapshots.mode` defaults to `never` (config §9.3): the live tests ask for `initial`.
 - A drain mid-snapshot leaves the snapshot in progress; the next run resumes it from its cursor.
 
-**Documents this plan changes** (applied at plan approval, in an `infra:` commit and a
-`research:` commit; the gap tracker in a `gap:` commit):
+**Documents this plan changes** (applied at plan approval, 2026-10-03, in an `infra:` commit and
+a `research:` commit; the gap tracker in a `gap:` commit):
 
 - Roadmap:
   - §2: the dependency diagram. `pipeline → core, config, state, storage`; only the binary
@@ -255,24 +263,20 @@ the arrow.
   - §4 M6 split into **M6a** (this plan; the "Carried from M5" items it closes are marked) and
     **M6b**: the lease and renewer, `PipelineController`, the binary, HTTP, metrics, the
     lifecycle's persisted desired state, "Carried from M4", and the E2E exit.
-  - §9: D-IMPL-13 for D-M6a.1…11. §9.1: Q-M6a-1…6.
+  - §7: S-R…S-U. §9: D-IMPL-13 for D-M6a.1…11. §9.1: Q-M6a-1…8.
 - `doc/v1.0/README.md`: the M6a row; the `M6-…` row becomes `M6b-…`.
 - `Snapshot_Resumability_and_Consistency.md` §1: the merge window closed by each chunk's xid
   snapshot, the reconciler, and the wait for the writers in flight at session start (DA-SNAP-9).
 - `CDC_Design_Gap_Analysis_v1.md`: DA-SNAP-9 ✅ (this plan, Tasks 9, 10 and 13); a dated section.
 
-**Spec edits proposed** (need approval; applied in a `spec:` commit before Task 1):
+**Spec edits** (approved 2026-10-03; applied in a `spec:` commit on the milestone branch):
 
 | # | Spec | Change | From |
 |---|---|---|---|
 | S-R | `Data-Flow.md` §State Layout | Add `schemas/<schema>.<table>.json` (the cached `TableSchema` as of the checkpoint, with its source id; written after the checkpoint that covers the change) and `halts.json` (the table halt registry: table, code, detail, `at`). Add to `replication/slot.json`: `confirmed_flush_lsn` `0/0` is the intent to create the slot, written before a managed first-start `prepare` | M5 carried items, D-M6a.1 |
 | S-S | `Data-Flow.md` §Sink Commit Failure | "Retry with backoff (up to configured max_retries)" → "Retry `Transient` with backoff 1 s → 60 s and jitter, without limit; the status is DEGRADED while retrying, and the full buffer (`buffer_capacity_rows`) stops reading the source". "On persistent failure: pause pipeline; record error" → "A `Permanent` error halts the table (`SINK_REJECTED`); `NoTable` and any other error end the pipeline" | Q-M6a-5 |
 | S-T | `Data-Flow.md` Phase 1 step 2 and its consistency paragraph; Phase 4 §Position guard | Step 2's lw/hw watermark reconciliation becomes the one built here: (a) wait for the writers in flight at the session start; (b) read the chunk in a short repeatable-read transaction that records what it sees (`pg_current_snapshot()`); (c) at emission, drop a chunk row whose key a stream transaction wrote that the read didn't see, and the whole chunk on an unseen TRUNCATE (MySQL, without read visibility: the transactions applied after the read was issued); (d) flush the stream's buffered changes, then commit the chunk as its own change set, flagged `snapshot`; (e) persist the cursor with that flush's checkpoint. The consistency paragraph says why `_seq` alone isn't enough across flushes. The guard never skips a snapshot set (its rows are read now, at a frontier the marker may cover); the fence still applies | DA-SNAP-9, Q-M6a-2, Q-M6a-6 |
-
-**Open question** (doesn't block the plan; the code takes the literal reading):
-
-- Q-M6a-7: `timeouts.snapshot: 0` halts every snapshot at once (the duration is literal). Should
-  a V-rule require `≥ 1s`, or should `0` mean "no timeout"? No V-rule covers it today.
+| S-U | `Configuration_Specification.md` §9.1 `timeouts.snapshot`, §13.3, §15 | `timeouts.snapshot` is at least `10s`: new rule **V-118** (error, pipeline) | Q-M6a-7 |
 
 ---
 
@@ -285,6 +289,7 @@ the arrow.
 | `…-core/src/schema.rs`, `…/logical.rs`, `…/value.rs` | `HaltReason::{SinkRejected, SnapshotTimeout}`; serde for `TableSchema` |
 | `crates/data-avalanche-source-pg/src/snapshot.rs`, `…/connector.rs`, `…/error.rs` | A chunk's xid snapshot; `in_flight`; `55006` → `Contended` |
 | `crates/data-avalanche-state/src/tables.rs`, `…/pipeline.rs`, `…/snapshot.rs` | The schema cache, the halt registry, `SlotDoc::intent` |
+| `crates/data-avalanche-config/src/registry.rs`, `…/src/rules/domain.rs` | V-118 |
 | `crates/data-avalanche-testkit/src/fake_source.rs`, `…/memory_sink.rs` | `FakeSource`, `FakeTxn`, `Method`; `MemorySink` faults, hold and takeover |
 | `crates/data-avalanche-pipeline/src/settings.rs` | `Settings` from the resolved `Pipeline` |
 | `…-pipeline/src/decide.rs` | `decide`: the per-table snapshot decision |
@@ -12702,6 +12707,550 @@ git commit -m "feat(pipeline): a chunk read that fails transiently rescans, so a
 ```
 
 
+### Task 15: Config: `timeouts.snapshot` is at least 10s (V-118)
+
+**Files:**
+- Modify: `crates/data-avalanche-config/src/registry.rs`, `…/src/rules/domain.rs`,
+  `…/tests/rules/domain.rs`
+
+**Interfaces:**
+- Consumes: the rule registry and the domain checks (M1).
+- Produces: rule **V-118** (error, locus pipeline, input config): `source.timeouts.snapshot` ≥
+  `10s`, checked on each pipeline and on `defaults` alone. `RULES` holds 113 rules.
+
+Q-M6a-7 (answered 2026-10-03). A literal `0` would halt every snapshot at once, so the
+shortest timeout is 10 s. Spec edit S-U adds the row to Configuration_Specification §9.1 and §13.3.
+Like V-112's backoff check, the message hides a templated value.
+
+- [ ] **Step 1: Write the failing tests**
+
+Change `crates/data-avalanche-config/src/registry.rs` (its tests):
+
+```diff
+diff --git a/crates/data-avalanche-config/src/registry.rs b/crates/data-avalanche-config/src/registry.rs
+--- a/crates/data-avalanche-config/src/registry.rs
++++ b/crates/data-avalanche-config/src/registry.rs
+@@ -1009,7 +1009,7 @@ mod tests {
+ 
+     #[test]
+     fn has_every_spec_rule_once_in_order() {
+-        assert_eq!(RULES.len(), 112);
++        assert_eq!(RULES.len(), 113);
+         assert!(
+             RULES.windows(2).all(|w| w[0].id < w[1].id),
+             "sorted, no duplicates"
+```
+
+Change `crates/data-avalanche-config/tests/rules/domain.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-config/tests/rules/domain.rs b/crates/data-avalanche-config/tests/rules/domain.rs
+--- a/crates/data-avalanche-config/tests/rules/domain.rs
++++ b/crates/data-avalanche-config/tests/rules/domain.rs
+@@ -314,6 +314,15 @@ pub fn cases() -> Vec<Case> {
+         case("V-111", Silent, "capacity 1", || {
+             pg_delta().set("/pipelines/p/sink/buffer_capacity_rows", json!(1))
+         }),
++        case("V-118", Error, "snapshot timeout 5s", || {
++            pg_delta().set("/pipelines/p/source/timeouts/snapshot", json!("5s"))
++        }),
++        case("V-118", Error, "snapshot timeout 0s", || {
++            pg_delta().set("/pipelines/p/source/timeouts/snapshot", json!("0s"))
++        }),
++        case("V-118", Silent, "snapshot timeout 10s", || {
++            pg_delta().set("/pipelines/p/source/timeouts/snapshot", json!("10s"))
++        }),
+         case("V-112", Error, "no attempts", || {
+             pg_iceberg().set(
+                 "/pipelines/p/sink/iceberg/catalog/retry/max_attempts",
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+```bash
+cargo test -p data-avalanche-config --no-fail-fast
+```
+
+Expected:
+
+FAIL:
+
+```text
+test result: FAILED. 80 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 43 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+failures:
+    registry::tests::has_every_spec_rule_once_in_order
+    rule_cases
+```
+
+- [ ] **Step 3: Implement**
+
+Change `crates/data-avalanche-config/src/registry.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-config/src/registry.rs b/crates/data-avalanche-config/src/registry.rs
+--- a/crates/data-avalanche-config/src/registry.rs
++++ b/crates/data-avalanche-config/src/registry.rs
+@@ -996,6 +996,14 @@ pub const RULES: &[RuleMeta] = &[
+         r#"tables.include/exclude globs, when source.type = postgres"#,
+         r#"Must be schema.table: one . between a non-empty schema part and a non-empty table part (globs allowed within each part)."#,
+     ),
++    rule(
++        "V-118",
++        Error,
++        L::Pipeline,
++        Config,
++        r#"source.timeouts.snapshot"#,
++        r#"≥ 10s."#,
++    ),
+ ];
+ 
+ /// The registry entry for `id` (`"V-007"`).
+```
+
+Change `crates/data-avalanche-config/src/rules/domain.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-config/src/rules/domain.rs b/crates/data-avalanche-config/src/rules/domain.rs
+--- a/crates/data-avalanche-config/src/rules/domain.rs
++++ b/crates/data-avalanche-config/src/rules/domain.rs
+@@ -187,6 +187,27 @@ fn globals(g: &RawGlobals, ctx: &mut Ctx) {
+ /// (`cross_field: false`, which skips V-107 — a partition's `n`/`width` against its `transform` —
+ /// and V-112's backoff-order half — `base_backoff` against `max_backoff`).
+ fn pipeline_fields(at: &At, p: &RawPipeline, ctx: &mut Ctx, cross_field: bool) {
++    // V-118
++    if let Some(t) = p.source.as_ref().and_then(|s| s.timeouts.as_ref()) {
++        let snap_at = at.key("source").key("timeouts").key("snapshot");
++        if let Some((v, loc)) = val(ctx, &t.snapshot, &snap_at)
++            && v < Duration::from_secs(10)
++        {
++            let l = t.snapshot.as_ref().expect("val returned Some");
++            // Duration has no `Display`: redact by hand, like V-112.
++            let shown = if is_templated(l) {
++                format!("{:?} (resolved value hidden)", l.text())
++            } else {
++                crate::units::format_duration(v)
++            };
++            ctx.error(
++                "V-118",
++                &snap_at,
++                loc,
++                format!("timeouts.snapshot must be at least 10s, got {shown}"),
++            );
++        }
++    }
+     if let Some(pg) = p.source.as_ref().and_then(|s| s.postgres.as_ref()) {
+         // V-104
+         let lag_at = at.key("source").key("postgres").key("max_wal_lag_bytes");
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+```bash
+cargo test -p data-avalanche-config
+```
+
+Expected:
+
+PASS:
+
+```text
+test result: ok. 81 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 43 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+Then the quality gates: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add -A
+git commit -m "feat(config): V-118, timeouts.snapshot is at least 10s"
+```
+
+
+### Task 16: A table that drifted while down is rescanned before its snapshot reads
+
+**Files:**
+- Modify: `crates/data-avalanche-pipeline/src/session.rs`, `…/session/snapshot.rs`, `…/worker.rs`,
+  `…/test_support.rs`, `…/tests/pg/schema.rs`
+
+**Interfaces:**
+- Consumes: Task 11's Phase 0 drift check, Task 8's rescan, Task 10's runner.
+- Produces (crate): `Core::drifted: BTreeSet<TableRef>` (Phase 0: the tables whose catalog schema
+  moved past the cached one on a resume); `Snapshots::hold(&BTreeSet<TableRef>)` and
+  `release_unless(&BTreeSet<&TableRef>) -> Vec<TableRef>`.
+
+D-M6a.11 (answered 2026-10-03: rescan before snapshotting). A held table is not read. The
+session rescans at the next tick, and again at each tick while a round fails. A held table the
+rescan doesn't name is released at once. One it names is released once the report has applied,
+after the stream catches up. A halt or drop releases it too. Without this, PostgreSQL reads an
+idle table that gained a column under the cached columns, and the column stays NULL in every
+snapshotted row.
+
+Measured while planning: with the hold disabled, the unit test reads three times (one under the
+old schema), and the live test finds no `w` column.
+
+- [ ] **Step 1: Write the failing tests**
+
+Change `crates/data-avalanche-pipeline/src/test_support.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-pipeline/src/test_support.rs b/crates/data-avalanche-pipeline/src/test_support.rs
+--- a/crates/data-avalanche-pipeline/src/test_support.rs
++++ b/crates/data-avalanche-pipeline/src/test_support.rs
+@@ -1,6 +1,6 @@
+ //! Fixtures for the crate's unit tests.
+ 
+-use std::collections::BTreeMap;
++use std::collections::{BTreeMap, BTreeSet};
+ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+ use std::sync::{Arc, Mutex};
+ use std::time::{Duration, Instant};
+@@ -402,6 +402,7 @@ impl World {
+             tracked: tables.iter().map(|t| TableRef::new("public", *t)).collect(),
+             dump_only: false,
+             snapshot_started: BTreeMap::new(),
++            drifted: BTreeSet::new(),
+         };
+         (core, control, status_rx)
+     }
+```
+
+Change `crates/data-avalanche-pipeline/src/worker.rs` (its tests):
+
+```diff
+diff --git a/crates/data-avalanche-pipeline/src/worker.rs b/crates/data-avalanche-pipeline/src/worker.rs
+--- a/crates/data-avalanche-pipeline/src/worker.rs
++++ b/crates/data-avalanche-pipeline/src/worker.rs
+@@ -1082,4 +1082,57 @@ mod tests {
+         assert!(*seen.lock().unwrap());
+         assert_eq!(w.ids("a"), [1]);
+     }
++
++    /// A table that gained a column while the worker was down, snapshotted again under
++    /// `always`: its reads wait for a rescan to bring the schema up to date, so the snapshot
++    /// reads the new column (D-M6a.11), and no read happens under the old schema.
++    #[tokio::test]
++    async fn a_table_changed_while_down_is_rescanned_before_its_snapshot() {
++        let w = World::new(&["a"]);
++        w.source.load(&t("a"), rows(1..=1));
++        let p = mode("mode: always");
++        let (end, _) = run(&w, &p, async |status| streamed(&status, &w).await).await;
++        assert_eq!(end.unwrap(), Exit::Drained);
++        let noted = TableSchema::new(
++            t("a"),
++            vec![
++                ColumnSchema::new("id", V::Int64, "bigint").not_null(),
++                ColumnSchema::new("doc", V::Text, "text"),
++                ColumnSchema::new("note", V::Text, "text"),
++            ],
++            vec!["id".into()],
++        )
++        .unwrap();
++        w.source.alter(&t("a"), noted);
++        let mut r = row(1, "x");
++        r.0.push((
++            "note".into(),
++            data_avalanche_core::ColumnValue::Text("n".into()),
++        ));
++        w.source.load(&t("a"), vec![r]);
++        let before = w.source.reads(&t("a"));
++        let (end, st) = run(&w, &p, async |status| {
++            wait_until("the snapshot is durable", || {
++                let st = status.borrow();
++                st.phase == Phase::Streaming
++                    && st.snapshots.is_empty()
++                    && w.text("a", "note") == [Some("n".to_owned())]
++            })
++            .await;
++        })
++        .await;
++        assert_eq!(end.unwrap(), Exit::Drained);
++        assert!(
++            st.warnings
++                .iter()
++                .any(|m| m.contains("changed while the pipeline was down")),
++            "{:?}",
++            st.warnings
++        );
++        assert_eq!(
++            w.source.reads(&t("a")) - before,
++            2,
++            "the chunk, then the empty one: none under the old schema"
++        );
++    }
+ }
+```
+
+Change `crates/data-avalanche-pipeline/tests/pg/schema.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-pipeline/tests/pg/schema.rs b/crates/data-avalanche-pipeline/tests/pg/schema.rs
+--- a/crates/data-avalanche-pipeline/tests/pg/schema.rs
++++ b/crates/data-avalanche-pipeline/tests/pg/schema.rs
+@@ -113,3 +113,42 @@ async fn an_idle_table_changed_while_down_is_snapshotted_under_its_new_schema()
+     run.drain().await.unwrap();
+     cleanup(&a, &n).await;
+ }
++
++/// An `always` table gains a column while the worker is down, and stays idle. PostgreSQL's chunk
++/// read wouldn't fail (it checks the cached columns only), so without a rescan first the
++/// snapshot would read the old columns and leave the new one NULL. The restart rescans before
++/// it reads (D-M6a.11).
++#[tokio::test]
++async fn an_idle_table_that_gained_a_column_while_down_is_snapshotted_with_it() {
++    require_it!();
++    let a = admin().await;
++    let n = fresh(
++        &a,
++        "idle_add",
++        "CREATE TABLE t (id bigint PRIMARY KEY, v text);
++         INSERT INTO t VALUES (1, 'a');",
++    )
++    .await;
++    let t = n.table("t");
++    let p = pipeline(&n, &["t"], "mode: always");
++    let lake = Lake::new();
++    let run = start(&p, &lake, None);
++    run.snapshotted().await;
++    run.drain().await.unwrap();
++
++    a.batch_execute(&format!("ALTER TABLE {t} ADD COLUMN w int DEFAULT 7"))
++        .await
++        .unwrap();
++    let run = start(&p, &lake, None);
++    run.snapshotted().await;
++    let b = lake.sink.content(&t).unwrap();
++    let w = b
++        .column_by_name("w")
++        .expect("the added column")
++        .as_any()
++        .downcast_ref::<Int32Array>()
++        .expect("int");
++    assert_eq!(w.value(0), 7, "the row read under the new schema");
++    run.drain().await.unwrap();
++    cleanup(&a, &n).await;
++}
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+```bash
+cargo test -p data-avalanche-pipeline --lib
+```
+
+Expected:
+
+FAIL to compile (1 error); the first:
+
+```text
+error[E0560]: struct `Core` has no field named `drifted`
+```
+
+- [ ] **Step 3: Implement**
+
+Change `crates/data-avalanche-pipeline/src/session.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-pipeline/src/session.rs b/crates/data-avalanche-pipeline/src/session.rs
+--- a/crates/data-avalanche-pipeline/src/session.rs
++++ b/crates/data-avalanche-pipeline/src/session.rs
+@@ -51,6 +51,10 @@ pub(crate) struct Core {
+     pub dump_only: bool,
+     /// When each table's snapshot began in this run (`timeouts.snapshot`).
+     pub snapshot_started: BTreeMap<TableRef, Instant>,
++    /// Tables whose catalog schema moved past the cached one while the pipeline was down (Phase
++    /// 0 on a resume). A snapshot of one reads only once a rescan has brought its schema up to
++    /// date (D-M6a.11).
++    pub drifted: BTreeSet<TableRef>,
+ }
+ 
+ impl Core {
+@@ -161,6 +165,7 @@ impl<'c> Session<'c> {
+             }
+         }
+         let (mut snaps, retired, warnings) = Snapshots::load(core, &schemas).await?;
++        snaps.hold(&core.drifted);
+         for table in &retired {
+             acc.halt_table(table);
+             schemas.remove(table);
+@@ -521,6 +526,16 @@ impl<'c> Session<'c> {
+         let Ok(report) = self.core.source.rescan(&known).await else {
+             return Ok(None);
+         };
++        let named: BTreeSet<&TableRef> = report
++            .changed
++            .iter()
++            .map(TableSchema::table)
++            .chain(&report.dropped)
++            .chain(report.halted.iter().map(|(t, _)| t))
++            .collect();
++        for table in self.snaps.release_unless(&named) {
++            self.core.drifted.remove(&table);
++        }
+         if report == RescanReport::default() {
+             return Ok(None);
+         }
+@@ -578,6 +593,9 @@ impl<'c> Session<'c> {
+         }
+         // Caches the applied schemas without waiting for the tables' next change.
+         self.flush()?;
++        for table in self.snaps.release_unless(&BTreeSet::new()) {
++            self.core.drifted.remove(&table);
++        }
+         Ok(None)
+     }
+ 
+```
+
+Change `crates/data-avalanche-pipeline/src/session/snapshot.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-pipeline/src/session/snapshot.rs b/crates/data-avalanche-pipeline/src/session/snapshot.rs
+--- a/crates/data-avalanche-pipeline/src/session/snapshot.rs
++++ b/crates/data-avalanche-pipeline/src/session/snapshot.rs
+@@ -76,6 +76,9 @@ pub(super) struct Snapshots {
+     /// A read failed transiently: the table may have changed under the snapshot with nothing in
+     /// the stream to say so (an idle table), so the session rescans (M5 Task 10 review).
+     rescan: bool,
++    /// Tables whose schema drifted while the pipeline was down: not read until a rescan has
++    /// brought their schema up to date (D-M6a.11).
++    held: BTreeSet<TableRef>,
+ }
+ 
+ impl std::fmt::Debug for Snapshots {
+@@ -206,7 +209,26 @@ impl Snapshots {
+     }
+ 
+     /// The table halted: its snapshot stops.
++    /// Holds the reads of those of `tables` being snapshotted.
++    pub(super) fn hold(&mut self, tables: &BTreeSet<TableRef>) {
++        self.held = tables
++            .iter()
++            .filter(|t| self.tables.contains_key(*t))
++            .cloned()
++            .collect();
++    }
++
++    /// Releases every held table not in `keep`; returns them.
++    pub(super) fn release_unless(&mut self, keep: &BTreeSet<&TableRef>) -> Vec<TableRef> {
++        let (kept, released) = std::mem::take(&mut self.held)
++            .into_iter()
++            .partition(|t| keep.contains(t));
++        self.held = kept;
++        released.into_iter().collect()
++    }
++
+     pub(super) fn stop(&mut self, table: &TableRef) {
++        self.held.remove(table);
+         self.tables.remove(table);
+         self.docs.remove(table);
+         if self.tables.is_empty() {
+@@ -283,7 +305,11 @@ impl Session<'_> {
+             if reading >= self.core.settings.parallelism {
+                 break;
+             }
+-            if snap.reading || snap.done || snap.retry.is_some_and(|(at, _)| at > now) {
++            if snap.reading
++                || snap.done
++                || snap.retry.is_some_and(|(at, _)| at > now)
++                || self.snaps.held.contains(table)
++            {
+                 continue;
+             }
+             let Some(schema) = self.schemas.get(table).cloned() else {
+@@ -485,6 +511,13 @@ impl Session<'_> {
+ 
+     /// On the tick: the snapshot timeout, and the in-flight transactions read again when due.
+     pub(super) async fn snapshot_tick(&mut self) -> Result<Option<End>, WorkerError> {
++        // A held table waits for a rescan; a failed one is tried again at the next tick.
++        if !self.snaps.held.is_empty()
++            && self.rescan.is_none()
++            && let Some(end) = self.rescan().await?
++        {
++            return Ok(Some(end));
++        }
+         let now = Instant::now();
+         let limit = self.core.settings.snapshot_timeout;
+         let late: Vec<TableRef> = self
+```
+
+Change `crates/data-avalanche-pipeline/src/worker.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-pipeline/src/worker.rs b/crates/data-avalanche-pipeline/src/worker.rs
+--- a/crates/data-avalanche-pipeline/src/worker.rs
++++ b/crates/data-avalanche-pipeline/src/worker.rs
+@@ -99,6 +99,7 @@ impl PipelineWorker {
+             tracked: BTreeSet::new(),
+             dump_only: false,
+             snapshot_started: BTreeMap::new(),
++            drifted: BTreeSet::new(),
+         };
+         (Self { core }, WorkerHandle { control, status })
+     }
+@@ -388,6 +389,7 @@ pub(crate) async fn start(
+         .chain(halts.iter().map(|(t, _)| t.clone()))
+         .collect();
+     let mut tracked = BTreeSet::new();
++    let mut drifted = BTreeSet::new();
+     let mut requests = vec![];
+     let mut abandoned = vec![];
+     let mut schemas = vec![];
+@@ -467,6 +469,7 @@ pub(crate) async fn start(
+                 }
+             }
+             Some(c) if matches!(plan, Plan::Resume) && c.columns() != now.columns() => {
++                drifted.insert(table.clone());
+                 warnings.push(format!(
+                     "table {table}: its schema changed while the pipeline was down; the stream replays the change in order"
+                 ));
+@@ -543,6 +546,7 @@ pub(crate) async fn start(
+         core.docs.save_table_schema(schema).await?;
+     }
+     core.tracked = tracked;
++    core.drifted = drifted;
+     core.dump_only = dump_only;
+     core.update(|st| st.warnings.extend(warnings));
+     Ok(())
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+```bash
+cargo test -p data-avalanche-pipeline --lib
+DATA_AVALANCHE_IT=1 DATA_AVALANCHE_SKIP_GCS=1 cargo test -p data-avalanche-pipeline --test pg schema::
+```
+
+Expected:
+
+PASS:
+
+```text
+test result: ok. 124 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.55s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 1.34s
+```
+
+Then the quality gates: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add -A
+git commit -m "feat(pipeline): a table whose schema drifted while the pipeline was down is rescanned before its snapshot reads"
+```
+
+
 ## Verified during planning (2026-10-03)
 
 The task blocks above were replayed in order on a fresh clone of the milestone branch
@@ -12710,13 +13259,15 @@ command. Every expected failure and every count above is that replay's output. S
 ran against PostgreSQL 14. The replayed tree equals the verified workspace, `Cargo.lock` included.
 Measured along the way:
 
-- **Each task commit on its own** passes `cargo fmt --all --check`, `cargo clippy --workspace
-  --all-targets -- -D warnings` and `cargo test --workspace` (hermetic). The workspace grows from
-  666 tests (M5) to 777.
+- **Each task commit on its own** (Tasks 1–14) passes `cargo fmt --all --check`, `cargo clippy
+  --workspace --all-targets -- -D warnings` and `cargo test --workspace` (hermetic); Tasks 15 and
+  16 pass the replay's gates. After Task 16, `cargo test --workspace` passes 779 tests (666 after
+  M5).
 - **The emulator run** (`DATA_AVALANCHE_IT=1`, `DATA_AVALANCHE_SKIP_GCS=1`, `--test-threads=1`, the
   TLS tests skipped: the scratch clone has no `test-infra/.tls`) passes on every binary of the
-  workspace, the pipeline's `tests/pg` (8) and `tests/sync_commit` included. Task 14 adds a ninth
-  `tests/pg` test, run on PostgreSQL 18 in its Step 4.
+  workspace, the pipeline's `tests/pg` (8) and `tests/sync_commit` included. Tasks 14 and 16 add
+  a ninth and a tenth `tests/pg` test; `tests/pg` (10) then passed three runs in a row on
+  PostgreSQL 18.
 - **PostgreSQL 14** (`postgres-14`): `tests/pg` and `tests/sync_commit` pass.
 - **Stability:** the pipeline's unit tests passed eight runs in a row; `tests/pg` passed eight
   runs in a row on PostgreSQL 18.
@@ -12724,6 +13275,8 @@ Measured along the way:
   the crash test fails. Without the reconciler's filtering, the busy-snapshot test fails (3 of 3)
   and `tests/sync_commit` fails (2 of 2). Under the window rule `tests/sync_commit` fails (2 of 2).
   Without Task 14's rescan flag, its live test times out with the snapshot at `rows_done: 0`.
+  Without Task 16's hold, its unit test reads three times and its live test finds no `w`
+  column.
 - **Not run while planning:** the CI workflows themselves. `weekly.yml` first runs `tests/pg` on
   PostgreSQL 15–17 after the merge.
 
@@ -12736,7 +13289,8 @@ M6a's own exit (M6's exit, the slice-1 E2E suite, is M6b's):
   - Phase 0: state load and the recorded `sink_type`, resolution, preflight, the D-V1.4
     Iceberg refusal, the per-table snapshot decision (Tasks 5, 11);
   - snapshots: stream-first chunk loop, reconciliation, cursor per chunk, `parallelism`, the
-    per-table timeout, dump modes (Tasks 9, 10, 14);
+    per-table timeout and its V-118 floor, dump modes, a rescan before reading a table that
+    drifted while down (Tasks 9, 10, 14, 15, 16);
   - streaming, the sink writer, acknowledgment after the durable checkpoint (D-IMPL-2) (Tasks
     6, 7);
   - the schema apply protocol §8, DDL replay included (Tasks 7, 11);

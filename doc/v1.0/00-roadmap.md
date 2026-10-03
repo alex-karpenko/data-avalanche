@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-02
+updated: 2026-10-03
 domain: Architecture
 tags: [v1, implementation-plan, roadmap, milestones, workspace, crates, interfaces, test-strategy, ci, risks]
 sources: []
@@ -101,20 +101,22 @@ data-avalanche/
 **Dependency direction** (arrows point at dependencies; nothing points up):
 
 ```
-data-avalanche (bin) ─► api ─► cluster ─► pipeline ─► core
-      │             │        │          │  ▲
-      │             │        │          ├──┼── source-pg ─► core, config
-      │             │        │          ├──┼── source-mysql ─► core
-      │             │        │          └──┼── sink-delta ─► core, storage
+data-avalanche (bin) ─► api ─► cluster ─► pipeline ─► core, config, state, storage
+      │             │        │
       │             │        └─► state ─► storage ─► core
-      └────────────►┴────────┴─► config ─► core            telemetry ◄─ (all runtime crates)
+      ├─► source-pg ─► core, config
+      ├─► source-mysql ─► core
+      ├─► sink-delta ─► core, storage
+      └────────────►┴─► config ─► core                         telemetry ◄─ (all runtime crates)
 ```
 
 Rules:
 - `data-avalanche-core` has **no I/O** and no async runtime dependency beyond trait definitions
   (`async-trait`).
-- Source crates never depend on sink crates, or the reverse. Only `data-avalanche-pipeline` joins them,
-  through `core` traits.
+- Source crates never depend on sink crates, or the reverse. `data-avalanche-pipeline` joins them at
+  run time through `core`'s traits and depends on neither; only the binary links them (Q-M5-24). No
+  other crate takes `sink-delta`, even as a dev-dependency; the pipeline's live tests take
+  `source-pg` as a dev-dependency.
 - One `arrow` major workspace-wide (**59**, pinned by `deltalake =1.0.0`), per D-MS.14.
 - Every binary calls `rustls::crypto::CryptoProvider::install_default()` (aws-lc-rs) before any TLS
   (DA-DEP-5).
@@ -215,9 +217,10 @@ pub enum PositionError { DialectMismatch { left, right }, DifferentBinlogSeries 
 pub enum SourceSeq { Pg(Lsn), Binlog { file_index: u64, end_log_pos: u64 } }   // total order within one stream
 ```
 
-### 3.3 Schema model and change set (Schema_Change §7, Multi_Sink §6.2; landed in M3)
+### 3.3 Schema model and change set (Schema_Change §7, Multi_Sink §6.2; landed in M3, extended in M6a)
 
 `M3-core-data-path.md` D-M3.1…18 and its "Deviations during execution" are the rulings behind this.
+M6a adds the `snapshot` flag, two halt codes, and serde for `TableSchema` and `HaltReason` (D-IMPL-13).
 
 ```rust
 pub struct ColumnSchema { pub name: String, pub value_type: ColumnValueType, pub logical: LogicalType,
@@ -227,7 +230,7 @@ impl ColumnSchema { pub fn new(name, value_type, source_type) -> Self /* canonic
 pub fn canonical_logical(t: &ColumnValueType) -> LogicalType;             // UInt64 → decimal(20,0), …
 pub fn hop2_compatible(value_type: &ColumnValueType, logical: &LogicalType) -> bool;   // an override Hop 2 can store
 
-pub struct TableSchema { /* private: table, columns, identifier, source_id */ }
+pub struct TableSchema { /* private: table, columns, identifier, source_id */ }   // serde: checked like new() on load
 impl TableSchema {
     // Checks, in order: no reserved name; a non-empty identifier; identifier columns listed once, present,
     // NOT NULL, non-floating, primitive; unique names; every logical type hop2_compatible.
@@ -246,7 +249,10 @@ pub enum HaltReason {                        // code(): the SCREAMING_SNAKE name
     InvalidDateValue { column, raw },        // MySQL/MariaDB zero-in-part / invalid dates (Q-M7-1)
     SchemaMismatch { column, detail },       // a value or buffered row that doesn't fit the schema
     NullIdentifier { column },               // NULL or unsent key value
-}
+    NotReplicable { reason },                // TABLE_NOT_REPLICABLE: a named UNLOGGED table (Q-M5-13)
+    SinkRejected { detail },                 // a Permanent commit or evolve error (M6a, D-M6a.3)
+    SnapshotTimeout { limit_secs: u64 },     // timeouts.snapshot exceeded in one run (Q-M6a-3)
+}   // serde: tagged by code, {"code": "UNSAFE_DDL", "detail": …} (the halt registry, §3.5)
 // Pipeline-scope halts (not per table): BINLOG_PAYLOAD_INVALID (D-V1.6), BINLOG_SOURCE_CHANGED (Q-M7-2)
 
 pub enum SchemaChange { AddColumn(ColumnSchema), DropColumn(String), RenameColumn { from, to, proven: bool },
@@ -273,11 +279,13 @@ pub struct TableChangeSet {
     pub table: TableRef, pub schema: SchemaRef /* upsert_schema */, pub identifier: Vec<String>,
     pub truncate: bool, pub upserts: Vec<RecordBatch>, pub deletes: Vec<RecordBatch>,
     pub position: PositionRange, pub split: Option<SplitInfo>,
+    pub snapshot: bool,          // chunk rows read now: the guard never skips them (Q-M6a-6)
 }
 impl TableChangeSet {
     // Upsert batches: schema's fields, then the same unchanged masks (non-identifier columns) in every batch;
     // a non-empty identifier; delete batches start with it; a key at most once across both; no NULL key;
-    // the range doesn't run backwards; a slice's range ends at txn_start.
+    // the range doesn't run backwards; a slice's range ends at txn_start; a snapshot set only upserts
+    // (no deletes, truncate or slice).
     pub fn validate(&self) -> Result<(), ChangeSetError>;
     pub fn upsert_rows(&self) -> usize; pub fn delete_rows(&self) -> usize; pub fn is_empty(&self) -> bool;
 }
@@ -313,11 +321,12 @@ impl SinkCapabilities { pub fn refusal(&self, mode: WriteMode, partition_by: &[P
 pub struct TableSpec { pub table: TableRef, pub schema: SchemaRef /* upsert_schema */, pub identifier: Vec<String>,
                        pub partition_by: Vec<PartitionField> }
 impl TableSpec { pub fn new(schema: &TableSchema, partition_by: Vec<PartitionField>) -> Result<Self, HaltReason>; }
+// A partition column is a source column or a lineage column (`day(_ts)`, config §9.3; M6a).
 pub struct CommitMarker { pub owner_epoch: u64, pub committed_position: SourcePosition, pub pipeline_id: String }
 impl CommitMarker {
     pub fn fences(&self, ours: &CommitMarker) -> bool;   // stored.owner_epoch > ours.owner_epoch
-    // Guard (D-M3.14, S-P): split None → stored covers cs.position.end;
-    // split Some → stored strictly past txn_start (covers it and isn't equal).
+    // Guard (D-M3.14, S-P): a snapshot set → never covered (Q-M6a-6, S-T; the fence still applies);
+    // split None → stored covers cs.position.end; split Some → stored strictly past txn_start.
     pub fn covers(&self, cs: &TableChangeSet) -> Result<bool, PositionError>;
 }
 pub struct SinkTableState { pub exists: bool, pub schema: Option<SchemaRef> /* Hop 2 terms, soft-drops stay */,
@@ -381,11 +390,17 @@ pub enum StoreError { Conflict { key }, Contention { key }, Transient { key, rea
   - `slot` / `save_slot` for PostgreSQL;
   - `position` / `save_position` for MySQL and MariaDB, recording `ServerIdentity`;
   - `table_snapshot` / `save_table_snapshot` (Data-Flow §State Layout as amended by S-M);
-  - `create_snapshot_job` / `save_snapshot_job` / `snapshot_job` / `snapshot_jobs`.
+  - `create_snapshot_job` / `save_snapshot_job` / `snapshot_job` / `snapshot_jobs`;
+  - from M6a (S-R): the schema cache, `table_schema` / `table_schemas` / `save_table_schema`
+    (`schemas/<schema>.<table>.json`, `table_schema_key`; a stored schema that names another table
+    is `Corrupt`); the halt registry, `halts` / `record_halt` / `clear_halt` (`halts.json`,
+    `HaltsDoc { tables: Vec<TableHalt> }`, `TableHalt { table, reason: HaltReason, at:
+    SourcePosition }`); and the slot-creation intent, `SlotDoc::intent(slot_name)` /
+    `is_intent()` (`confirmed_flush_lsn` `0/0`, written before a managed first start's `prepare`).
 
 Lease release is a **tombstone write** (object_store has no conditional delete). T1–T10 prove the lease CAS on every backend (`tests/lease_conformance.rs`, `test-infra/README.md`).
 
-### 3.6 Source connector (`data-avalanche-core` owns the trait, Q-M5-2; each source crate implements it; defined in M5)
+### 3.6 Source connector (`data-avalanche-core` owns the trait, Q-M5-2; each source crate implements it; defined in M5, extended in M6a)
 
 `data-avalanche-core::source` (M5 Task 1; D-M5.1 lists where it differs from the first sketch):
 
@@ -398,7 +413,8 @@ pub trait SourceConnector: Send + Sync {                    // built from the re
         -> Result<Prepared, SourceError>;                                           // publication + slot state machine → StartPlan
     async fn reset_position(&self) -> Result<SourcePosition, SourceError>;         // after PositionUnreachable (D-15.3)
     async fn retained_bytes(&self) -> Result<Option<u64>, SourceError>;            // the max_wal_lag_bytes measure
-    async fn current_position(&self) -> Result<SourcePosition, SourceError>;       // watermarks lw/hw
+    async fn current_position(&self) -> Result<SourcePosition, SourceError>;       // a rescan's catch-up mark (Q-M6a-4)
+    async fn in_flight(&self) -> Result<Option<Vec<InFlightTxn>>, SourceError>;   // M6a; default None (DA-SNAP-9)
     async fn read_chunk(&self, t: &TableSchema, after: Option<&KeysetCursor>, limit: usize) -> Result<Chunk, SourceError>;
     async fn fetch_rows(&self, t: &TableSchema, keys: &[Row]) -> Result<Vec<Row>, SourceError>;  // toast_strategy: re_query
     async fn open_stream(&self, from: &SourcePosition, tables: &[TableSchema]) -> Result<Box<dyn ChangeStream>, SourceError>;
@@ -421,14 +437,20 @@ pub enum StreamItem { Begin { xid: u64, commit_ts_micros: i64 },                
 pub enum SchemaHint { Columns(Vec<ColumnSchema>), Ddl(String) }
 pub enum StartPlan { Resume, Snapshot { from: SourcePosition, reason: SnapshotReason } }  // FirstStart | PositionLost | AdoptedOrphan
 pub struct Prepared { pub plan: StartPlan, pub added: Vec<TableRef>, pub warnings: Vec<String> }
-pub enum SourceError { Transient(String), Permanent(String),
+pub enum SourceError { Transient(String), Permanent(String), Contended(String) /* M6a: PG 55006 */,
                        PositionUnreachable { position: String, detail: String },
                        TableHalt { table: TableRef, reason: HaltReason } }
 ```
 
 Also: `Preflight { server_version, warnings }`, `ResolvedTables { tables, halted, skipped, warnings }`,
-`KeysetCursor { key: Row, collation }`, `Chunk { rows, next }`, `RescanReport { dropped, changed,
-halted }`, `identifier_values(&TableSchema, &Row)`. PostgreSQL positions (D-M5.2): a change's
+`KeysetCursor { key: Row, collation }`, `Chunk { rows, next, visibility: Option<ChunkVisibility> }`,
+`RescanReport { dropped, changed, halted }` (the pipeline applies a `changed` schema only once the
+stream has passed `current_position` read after the rescan, Q-M6a-4), `identifier_values(&TableSchema,
+&Row)`. From M6a (DA-SNAP-9): `ChunkVisibility::Xids(XidSnapshot)`, `XidSnapshot { xmin, xmax, xip }`
+with `sees(xid)` (a full `xid8` or the stream's 32-bit xid), `InFlightTxn { xid, tables: Vec<u64> }`
+(tables by `source_id`). PostgreSQL reads each chunk in a REPEATABLE READ transaction that records
+`pg_current_snapshot()`, and `in_flight` lists writers from `pg_locks`; a source with `None`
+(MySQL) falls back to the window rule. PostgreSQL positions (D-M5.2): a change's
 `source_pos` is its transaction's commit LSN, its `seq` the XLogData `wal_start`; `Commit` carries
 the `end_lsn` that is acknowledged and resumed from.
 
@@ -437,8 +459,8 @@ the `end_lsn` that is acknowledged and resumed from.
 `LeaseStore` over `VersionedStore` (acquire / renew / takeover-evaluate / release). A `Renewer` state
 machine (`Held | Renewing | Degraded | Lost`) exposes `may_commit()` = state ∈ {Held, Degraded} ∧
 now < deadline. `PipelineController` is the sole lease writer and owns the `PipelineWorker`.
-`ClusterReconciler` pushes `Own/DontOwn` targets. The same types run in single-node mode; M6 ships them
-with a self-only ring.
+`ClusterReconciler` pushes `Own/DontOwn` targets. The same types run in single-node mode; M6b ships them
+with a self-only ring, behind M6a's `CommitGuard` (§3.11).
 
 ### 3.8 Configuration (`data-avalanche-config`, landed in M1)
 
@@ -577,6 +599,60 @@ Errors:
 positioned own commit is in reach. The rulings are D-M4.1…15 (D-IMPL-11), with the plan's
 deviations.
 
+### 3.11 The pipeline worker (`data-avalanche-pipeline`, M6a)
+
+`M6a-pipeline-worker.md` D-M6a.1…11 (D-IMPL-13) are the rulings behind this. One worker runs one
+pipeline's whole data path, from a `SourceConnector` to a `Sink`:
+
+```rust
+pub struct WorkerDeps { pub source: Arc<dyn SourceConnector>, pub sink: Arc<dyn Sink>, pub docs: PipelineDocs,
+                        pub owner_epoch: u64 /* every commit's marker */, pub guard: Arc<dyn CommitGuard>,
+                        pub hooks: Arc<dyn Hooks> }
+impl WorkerDeps { pub fn new(source, sink, docs) -> Self; }          // epoch 1, Unguarded, NoHooks
+pub struct PipelineWorker { /* private */ }
+impl PipelineWorker {
+    pub fn new(pipeline: &Pipeline /* resolved, §3.8 */, deps: WorkerDeps, tuning: Tuning) -> (Self, WorkerHandle);
+    pub async fn run(self) -> Result<Exit, WorkerError>;              // until Drain (or the handle drops), Dumped, or an error
+}
+pub struct WorkerHandle { pub control: mpsc::Sender<Command>, pub status: watch::Receiver<WorkerStatus> }
+pub enum Command { Drain /* flush, make durable, close: Exit::Drained */, Flush }
+pub enum Exit { Drained, Dumped /* every table a dump_* table, done */ }
+pub enum Phase { Starting, Streaming, Reconnecting { error: String }, Draining }
+pub struct WorkerStatus { pub phase: Phase, pub read: Option<SourcePosition>, pub checkpoint: Option<SourcePosition>,
+                          pub retained_bytes: Option<u64>, pub degraded: Option<String> /* the last retried error */,
+                          pub halted: BTreeMap<TableRef, HaltReason>, pub snapshots: BTreeMap<TableRef, SnapshotProgress>,
+                          pub warnings: Vec<String> }
+pub struct SnapshotProgress { pub rows_done: u64 }
+pub struct Tuning { pub source_backoff: Backoff, pub sink_backoff: Backoff, pub in_flight_backoff: Backoff /* 0.5 s → 10 s */,
+                    pub contended_window: Duration /* 120 s */, pub tick: Duration /* 1 s */, pub augment_attempts: u32 /* 3 */ }
+pub struct Backoff { pub first: Duration, pub max: Duration }       // default 1 s → 60 s; delay(attempt): jittered upper half
+pub trait CommitGuard: Send + Sync + Debug { fn may_commit(&self) -> bool; }   // M6b: the lease renewer; Unguarded
+pub trait Hooks: Send + Sync + Debug { fn at(&self, point: &HookPoint) -> HookAction; }  // crash tests; NoHooks
+pub enum HookPoint { SinkCommitted { table }, CheckpointPersisted { position }, ChunkEmitted { table } }
+pub enum HookAction { Continue, Crash /* → WorkerError::Crashed, nothing more written */ }
+pub enum WorkerError { Refused(String) /* Phase 0: sink type, Iceberg (D-V1.4), capabilities */, Source(SourceError),
+                       Contended { waited, detail }, Sink(SinkError), State(StateError), Fenced { table, current_epoch },
+                       LeaseLost, TransactionTooLarge { bytes, limit }, WalLag { lag, limit }, Accumulator(AccumulatorError),
+                       Crashed(HookPoint) }
+```
+
+- **Phase 0** loads state and the recorded `sink_type`, resolves the tables (channel A), runs the
+  source and sink preflight, writes the slot intent before a managed first start's `prepare`, and
+  decides each table's snapshot. A table whose cached schema drifted while the worker was down is
+  warned about on a resume, and a snapshot of it waits for a rescan (D-M6a.11).
+- **A stream session** accumulates and flushes (§3.9), and runs snapshots inside the session.
+  A chunk is reconciled against the stream by what its read saw, then committed as its own
+  `snapshot` set after the stream's buffered changes (DA-SNAP-9, S-T). The session also applies
+  schema changes (§8, channels C and D) and halts tables. Its WAL-lag guard ends the worker
+  with `WalLag` past `max_wal_lag_bytes`.
+- **The sink writer** works in a fixed order. It commits every table of a flush, then persists
+  the halts, the checkpoint, snapshot progress and schema caches. Only then is the source
+  acknowledged. A sink `Transient` retries forever (DEGRADED, backpressure through
+  `buffer_capacity_rows`); `Permanent` halts the table `SINK_REJECTED`; `Fenced` ends the worker
+  (S-S).
+- **Between sessions**, a transient source error reconnects after `source_backoff`. A busy slot
+  is retried within `contended_window`. A lost position is reset and re-snapshotted.
+
 ---
 
 ## 4. Milestones
@@ -587,13 +663,14 @@ to `main` in a milestone until its exit criteria hold on CI.
 ```
 M0 ──► M1 ──┐
   ├──► M2 ──┼──► M4 ──┐
-  └──► M3 ──┴──► M5 ──┴──► M6 (slice 1: PG→Delta single node) ──► M7 ──┐
+  └──► M3 ──┴──► M5 ──┴──► M6a ─► M6b (slice 1, single node)  ──► M7 ──┐
                                                           ├──► M8 ──────┼──► M9 ──► M11 ──► M12 (v1.0.0)
-                                                          └──► M10 (continuous from M6) ────┘
+                                                          └──► M10 (continuous from M6b) ───┘
 ```
 
 Parallel lanes after M0: **{M1}**, **{M2}** and **{M3}** are independent. M4 needs M2 and M3. M5 needs
-M1 and M3.
+M1 and M3. M6 is split in two (owner decision, 2026-10-02): **M6a**, the pipeline worker as a
+library, and **M6b**, the single-node control around it and slice 1's exit.
 
 ### M0 — Foundations
 
@@ -733,28 +810,73 @@ Detailed plan: `M0-foundations.md`.
   - A type round-trip suite covers every mapped type.
   - The slot state-machine table is exercised cell by cell.
 
-### M6 — Pipeline runtime and single-node control (**slice 1: PG → Delta, single node**)
+### M6a — Pipeline worker (`data-avalanche-pipeline`)
+
+Plan: `M6a-pipeline-worker.md` (approved 2026-10-03). The worker as a library (§3.11); everything
+that needs the control plane is M6b's.
 
 - **Scope:**
-  - `PipelineWorker` task graph (Data-Flow concurrency model), with bounded channels
+  - `PipelineWorker` task graph (Data-Flow concurrency model), with bounded backpressure
     (`buffer_capacity_rows`).
-  - Phase 0: state load, `snapshot_mode` evaluation per table, table resolution, sink preflight,
-    D-V1.4 Iceberg refusal, recorded `sink_type` check.
-  - Snapshot orchestration: stream-first chunk loop, lw/hw reconciliation against the live stream,
-    cursor checkpoint per chunk, `parallelism`, per-table timeout, dump modes.
-  - Streaming, the sink writer and Phase 5 acknowledgment.
-  - **Checkpoint = flush frontier, persisted after every table in the flush reports Committed or
-    SkippedCovered** (D-IMPL-2).
+  - Phase 0: state load, recorded `sink_type` check, table resolution, source and sink preflight,
+    D-V1.4 Iceberg refusal, the per-table snapshot decision (`snapshots.mode`).
+  - Snapshot orchestration inside the stream session: stream-first chunk loop; each chunk
+    reconciled against the stream by what its read saw (DA-SNAP-9, S-T); the cursor persisted
+    with the chunk's flush; `parallelism`; per-table timeout (`SNAPSHOT_TIMEOUT`, V-118 ≥ 10 s,
+    S-U); dump modes; a rescan before reading a table that drifted while down (D-M6a.11).
+  - Streaming, the ordered sink writer and Phase 5 acknowledgment. **The checkpoint is the flush
+    frontier, persisted after every table in the flush reports Committed or SkippedCovered**
+    (D-IMPL-2), then acknowledged.
   - Schema apply protocol §8 (seal → flush → classify → evolve → rebuild → resume), including DDL
-    idempotency on replay.
-  - Per-table halt registry with reasons.
-  - Error paths: source reconnect, sink retry → DEGRADED, Fenced → stop.
-  - Lifecycle state machine: desired state persisted; pause, stop and resume flush to a boundary.
-  - Lease + renewer + `PipelineController` in single-node form: self-only ring, one `ClusterReconciler`
-    tick.
+    idempotency on replay; channels C and D.
+  - Per-table halt registry with reasons, and the schema cache (S-R).
+  - Error paths: source reconnect, sink `Transient` retried with DEGRADED status (S-S), a
+    `Permanent` commit halting its table, `Fenced` → stop.
+  - `Command::Drain` / `Command::Flush`, and the `CommitGuard` seam the lease plugs into.
+- **Carried from M5** (`M5-pg-source.md`); M6a closes each, as marked:
+  - ✅ Persist the start position right after `prepare` creates the slot, and record the intent
+    to create it first (`SlotDoc::intent`; M6a Tasks 3, 11).
+  - ✅ Persist the checkpoint before acknowledging it to PostgreSQL (Tasks 6, 7).
+  - ✅ Snapshot every table in `Prepared::added` under `StartPlan::Resume`, and persist those
+    requests before the checkpoint (Task 11, D-M6a.8).
+  - ✅ A quick restart's `55006`: `SourceError::Contended`, retried within `contended_window`
+    (120 s) (Tasks 2, 11).
+  - ✅ Open a stream only from a persisted checkpoint or the slot's own start (Tasks 7, 11).
+  - ✅ A chunk's "changed under the snapshot" on an idle table runs a rescan (Task 14).
+  - ✅ The reconnect backoff (Task 11).
+  - ✅ The `max_wal_lag_bytes` guard: the worker ends with `WalLag` (Tasks 7, 11, D-M6a.10).
+  - ✅ Keep-alives cost one position update, nothing more (Task 7).
+  - ✅ `toast_strategy: re_query` calls `fetch_rows` (Task 8, D-M6a.6).
+  - ✅ Each cached `TableSchema` persisted with its `source_id` (Tasks 3, 11).
+  - ✅ Record the tables a `prepare` will add before calling it: a table added by config stays
+    untracked until its schema is cached (Task 11, D-M6a.8).
+  - ✅ The snapshot's merge window (DA-SNAP-9): each chunk's `pg_current_snapshot()`, the wait
+    for writers in flight at session start, reconciliation at emission (Tasks 1, 2, 9, 10, 13;
+    Snapshot_Resumability §1.1).
+  - ✅ A failing stream `close` is tolerated (Task 7). `teardown` is M9's (pipeline deletion).
+  - ✗ The stream watchdog: ruled out (D-M6a.9). The spec has none, and pgwire's idle feedback
+    surfaces a dead connection as an error.
+  - ✅ REPLICA IDENTITY FULL signals: a signal whose classification finds no Safe change neither
+    flushes nor evolves (Task 7).
+  - ✅ DataFusion stays out (Q-M5-24): the pipeline depends on neither `sink-delta` nor a source
+    crate (§2).
+- **Deps:** M1, M2, M3, M5. M4 is merged, but the worker doesn't link `sink-delta`: it is tested
+  against the testkit's `MemorySink`.
+- **Exit:** the worker's unit tests (a scripted `FakeSource`, the `MemorySink`, crash hooks at
+  every durable step) pass hermetically; `tests/pg` and `tests/sync_commit` pass against PG 18 on
+  every change, and `tests/pg` weekly on PG 14–17.
+
+### M6b — Single-node control (**slice 1: PG → Delta, single node**)
+
+- **Scope:**
+  - Lifecycle state machine: desired state persisted; pause, stop and resume flush to a boundary
+    (through M6a's `Command::Drain`).
+  - Lease + renewer + `PipelineController` in single-node form, behind M6a's `CommitGuard`:
+    self-only ring, one `ClusterReconciler` tick.
   - Binary: `data-avalanche run --config <path>` with CLI log overrides, and a minimal HTTP listener serving
-    `/health/live`, `/health/ready` and `/metrics`.
-  - Metrics for everything built so far.
+    `/health/live`, `/health/ready` and `/metrics`. The only crate that links `sink-delta` and
+    `source-pg` (§2).
+  - Metrics for everything built so far (the worker's `WorkerStatus` included).
 - **Carried from M4** (`M4-delta-sink.md`, Deviations):
   - Route a MERGE that fails over `merge_memory_limit` (`Transient`, but the same set fails the
     same way every time) to a smaller flush or a table halt, and add the config key.
@@ -767,54 +889,7 @@ Detailed plan: `M0-foundations.md`.
     together with the identifier-change path.
   - `Sink::evolve` carries no marker, so a zombie's ADD COLUMN isn't fenced. It is idempotent, but
     the trait question is open.
-- **Carried from M5** (`M5-pg-source.md`):
-  - Persist the start position right after `prepare` creates the slot. A crash before the first
-    checkpoint otherwise leaves an orphan slot, and the next start meets `slot_on_orphan`. The window
-    between creating the slot and that write remains (a crash, or a lost response to the create):
-    record the intent to create it first, so the next start knows the slot is its own (Task 8 review).
-  - Persist the checkpoint before acknowledging it to PostgreSQL (Data-Flow Phase 5, Q-M5-14): a slot
-    confirmed past the checkpoint reads as a lost position.
-  - Snapshot every table in `Prepared::added` under `StartPlan::Resume` (Q-M5-14), and persist those
-    snapshot requests as soon as `prepare` returns: the publication already carries the tables, so a
-    retried `prepare` no longer reports them.
-  - A quick restart can meet `55006` (the slot is still active for the old walsender, up to
-    `wal_sender_timeout`): retry it, bounded, while the lease is held.
-  - Open a stream only from a persisted checkpoint or the slot's own start: opening reports the
-    start position as flushed at once (Task 9 review).
-  - A snapshot chunk's `Transient` "changed under the snapshot" waits for the stream's schema; an
-    idle table's only catches up at channel D's rescan (60 min by default). Run a rescan of that
-    table on it (Task 10 review).
-  - The reconnect backoff: a stream error ends the stream, and the pipeline reopens it from the
-    checkpoint (D-M5.4).
-  - The `max_wal_lag_bytes` halt, comparing against `SourceConnector::retained_bytes` (V-104).
-  - Keep-alives can arrive often (each heartbeat, and on every server keep-alive); don't do per-item
-    work that assumes they are rare.
-  - `toast_strategy: re_query` calls `fetch_rows` (Q-M5-6).
-  - Persist each cached `TableSchema` with its `source_id` (Q-M5-20): a table dropped and created
-    again while the pipeline is down is found only against the identity the cache kept.
-  - Record the tables a `prepare` will add before calling it: a reply lost after the publication
-    change committed reports nothing on the retry (Q-M5-20, I2).
-  - The snapshot's merge window (DA-SNAP-9): a chunk's watermarks must order its MVCC snapshot
-    against the stream, by `pg_current_snapshot()`, not the WAL position alone; amend
-    Snapshot_Resumability §1.
-  - A stream's `close` can fail (its catalog connection dead) and waits up to `timeouts.command`
-    while another walsender holds the slot: the teardown tolerates both.
-  - The replication connection has no keep-alive or idle deadline: a watchdog on `next` (a few
-    heartbeats) ends a stalled stream so it reopens.
-  - Under REPLICA IDENTITY FULL every Relation message signals (Q-M5-20). That is one channel C
-    read per FULL table per session and per relcache invalidation: DDL, VACUUM and ANALYZE
-    (autovacuum included), GRANT, index changes. If a signal is a flush barrier, budget for it.
-    Each extra signal while the stream lags the catalog is another chance to meet Q-M5-17's
-    fail-safe halts.
-  - Keep DataFusion out of the crates that don't need it (Q-M5-24). Only `data-avalanche-sink-delta`
-    depends on `deltalake`, and its tree is 413 of the 580 crates in the lockfile (DataFusion 292,
-    the AWS SDK about 40 more; `source-pg` is 168, `core` 43). The rules:
-    - the pipeline crate depends on the `Sink` trait in core, not on `sink-delta`;
-    - only the binary crate links `sink-delta`;
-    - no other crate takes it as a dev-dependency.
-
-    Then `cargo test -p` on any other crate never compiles DataFusion.
-- **Deps:** M1, M2, M3, M4, M5.
+- **Deps:** M4, M6a.
 - **Exit:** the **slice-1 E2E suite** passes on PG 18 + RustFS and weekly on PG 14–17. See §5.3 for
   the scenario list.
 
@@ -844,7 +919,7 @@ Detailed plan: `M0-foundations.md`.
   - Chunk reader with `utf8mb4_bin` ordering.
   - `binlog_purge_action`.
   - Spec edits for P-4 land before this milestone.
-- **Deps:** M6.
+- **Deps:** M6b.
 - **Exit:**
   - Slice-1 E2E parity suite on MySQL 8.4 and MariaDB 11.8 (every change) and MariaDB 10.11 / 11.4
     (weekly), across all three position modes.
@@ -862,7 +937,7 @@ Detailed plan: `M0-foundations.md`.
   - Config-generation coordinator: publish via CAS, gossip nudge plus poll, cold-start adoption (D-3).
   - Anchor validation (V-062 / V-076 / V-094).
   - Discovery: `static` and `dns` with periodic re-resolve.
-- **Deps:** M2, M6.
+- **Deps:** M2, M6b.
 - **Exit:** a multi-node E2E suite with 3 in-process nodes plus a docker-compose 3-node run. It covers:
   - kill → takeover within the D-6 window, with no double commit (verified from Delta `txn` versions);
   - graceful leave → immediate acquire;
@@ -883,7 +958,7 @@ Detailed plan: `M0-foundations.md`.
     Q-M9-1), lifecycle actions with `409`, config
     validate/reload/status (per-node applied generation), cluster status, leave and shutdown.
   - OpenAPI generated with `utoipa`, served at `/v1/openapi.json`.
-- **Deps:** M6 (M8 for reload propagation and cluster endpoints).
+- **Deps:** M6b (M8 for reload propagation and cluster endpoints).
 - **Exit:** an endpoint × role matrix test (401 vs 403); lifecycle transitions and `409`s; the OpenAPI
   document is validated and snapshot-tested.
 
@@ -895,7 +970,7 @@ Detailed plan: `M0-foundations.md`.
     in JSON logs.
   - `globals.log` level/format, overridden by CLI.
   - Example Prometheus alert rules (lag > 60s for 5 min, lease degraded, halted tables, WAL lag).
-- **Deps:** M6; runs continuously alongside M7–M9.
+- **Deps:** M6b; runs continuously alongside M7–M9.
 - **Exit:** a metric catalogue test asserts every mandatory series exists with the right labels; a
   tracing smoke test runs against an OTLP collector container.
 
@@ -942,7 +1017,7 @@ Detailed plan: `M0-foundations.md`.
       `deltalake-core` 1.0 takes DataFusion's default features, so we can't turn off its optional
       parts (the bzip2/xz/gzip codecs). The AWS SDK also comes in when S3 commits need only a
       conditional PUT;
-    - the M6 dependency rule (above) still holds.
+    - the M6a dependency rule (§2) still holds.
   - Tag `v1.0.0`.
 - **Deps:** all of the above.
 - **Exit:** the acceptance checklist in §8.
@@ -990,7 +1065,7 @@ init tools `amazon/aws-cli:2.37.4`, `mcr.microsoft.com/azure-cli:2.90.0-azurelin
 create/update measured 2026-09-26: **RustFS PASS, Azurite PASS, real GCS PASS** (via `object_store`),
 fake-gcs FAIL (risk R-3).
 
-### 5.3 Slice-1 E2E scenarios (M6 exit, then reused as the parity suite in M7)
+### 5.3 Slice-1 E2E scenarios (M6b exit, then reused as the parity suite in M7)
 
 1. Snapshot modes: `initial` on an empty sink; `initial` with state present; `always`; `never`;
    `dump_always`; `dump_initial` (all three table-state cases).
@@ -1089,6 +1164,16 @@ implements them.
 
 **S-Q: approved and applied on 2026-09-30.** The M3 final-review fix wave implements it; M5's decoder follows its before-image rule.
 
+| # | Spec | Change | From | Before |
+|---|---|---|---|---|
+| S-R | `Data-Flow.md` §State Layout | Add `schemas/<schema>.<table>.json` (the cached `TableSchema` as of the checkpoint, with its source id) and `halts.json` (the table halt registry: table, code, detail, `at`); `replication/slot.json`'s `confirmed_flush_lsn` `0/0` is the intent to create the slot, written before a managed first start | M5 carried items, D-M6a.1 | M6a |
+| S-S | `Data-Flow.md` §Sink Commit Failure | `Transient` retried with backoff 1 s → 60 s and jitter, without limit, DEGRADED while retrying, the full buffer stops reading the source; `Permanent` halts the table (`SINK_REJECTED`); `NoTable` and any other error stop the pipeline | Q-M6a-5 | M6a |
+| S-T | `Data-Flow.md` Phase 1 step 2 and its consistency paragraph; Phase 4 §Position guard | The lw/hw watermark reconciliation becomes the one M6a builds: wait for the writers in flight at session start; read each chunk in a short repeatable-read transaction that records what it sees; at emission drop rows (or the chunk, on a TRUNCATE) that an unseen stream transaction wrote; flush the stream's buffered changes, then commit the chunk as a `snapshot` set; persist the cursor with that flush. The guard never skips a snapshot set | DA-SNAP-9, Q-M6a-2, Q-M6a-6 | M6a |
+| S-U | `Configuration_Specification.md` §9.1 `timeouts.snapshot`, §13.3, §15 | New rule **V-118**: `timeouts.snapshot` is at least `10s` (error, pipeline) | Q-M6a-7 | M6a |
+
+**S-R…S-U: approved and applied on 2026-10-03** (spec §15 item 24 records S-U). The M6a plan
+implements them.
+
 `Type_Mapping.md` (research) still names `mysql-binlog-connector-rust` as the MySQL decoder, but
 `mysql_async` replaced it. That research-doc fix is applied (2026-09-26).
 
@@ -1129,6 +1214,7 @@ the naming below (2026-09-26).**
 | D-IMPL-10 | M3 core data-path rulings **D-M3.1…D-M3.18** (listed in `M3-core-data-path.md` §Decisions and rulings, each pinned by a test). Among them: unchanged TOAST fills from the row's previous image, under its old key after a key change; Hop 2 uses `Utf8`/`Binary` with 512 MiB batch rollover; a flush takes only complete transactions and covers `checkpoint..=frontier`; barriers return `FlushRequired` (seal → flush → apply); a split slice ends at its transaction's start and is guard-skipped only when the stored position is strictly past it | The specs are silent on these, or (D-M3.14) were wrong; the property tests prove replay convergence | M3 — **approved 2026-09-30** |
 | D-IMPL-11 | M4 Delta-sink rulings **D-M4.1…D-M4.15** (listed in `M4-delta-sink.md` §Decisions and rulings, each pinned by a test). Among them: every column carries its logical type in the Delta column metadata, so `table_state` reads Hop 2 back; the MERGE matches on the identifier only (no partition pruning); a zombie that loses a race is retried and ends `Fenced`; the walk-back stops at the cached own version, after 1000 commits or at a cleaned-up commit file; a truncate's DELETE carries no position; a set that changes no row gets a marker-only commit | The specs are silent on these; each keeps the fence, the guard or the round trip exact | M4 — **approved 2026-09-30** |
 | D-IMPL-12 | M5 PostgreSQL-source rulings **D-M5.1…D-M5.19** (listed in `M5-pg-source.md` §Decisions and rulings, each pinned by a test). Among them: the source contract lives in core with `prepare`, `augment`, `fetch_rows` and `TableHalt` (§3.6); a change's position is its commit LSN, `Commit` carries the `end_lsn` that is acknowledged; a Relation signal is emitted with the next change's sequence; the stream doesn't reconnect by itself; the slot state table as one function; a publication the pipeline can't change that publishes via the partition root while tracking a partition is refused; snapshot rows are read as output-function text, keys in `COLLATE "C"` | The specs are silent on these; each keeps the stream's positions, the slot or the round trip exact | M5 — **approved 2026-10-01** |
+| D-IMPL-13 | M6a pipeline-worker rulings **D-M6a.1…D-M6a.11** (listed in `M6a-pipeline-worker.md` §Decisions and rulings, each pinned by a test). Among them: a halt's `at` is the accumulator checkpoint, persisted before the next checkpoint, and a persisted halt keeps the table halted at every start until M9's re-snapshot; a failed channel-C catalog read halts the table `UNSAFE_DDL`; `Permanent` from `evolve` halts `SINK_REJECTED`; state-store `Transient`/`Contention` retry like a sink `Transient`; channel D's dropped and halted tables also wait for the stream to catch up; a chunk read under a schema the table has since left is read again, and its cursor rides the chunk's own flush; after a gap a snapshot in progress starts over; a mid-run `PositionUnreachable` resets the position and reruns Phase 0; no stream watchdog; the WAL-lag guard ends the worker; a table that drifted while down is rescanned before its snapshot reads | The specs are silent on these; each keeps the checkpoint, the halt or the snapshot exact across a crash | M6a — **approved 2026-10-03** |
 
 ### 9.1 Questions answered at plan review (2026-09-26)
 
@@ -1181,6 +1267,14 @@ the naming below (2026-09-26).**
 | Q-M5-23 (2026-10-02) | How often does the PostgreSQL 14–17 matrix run? | **Weekly (Mondays 03:41 UTC) and on manual dispatch, as `weekly.yml`; the v1 release needs 4 weekly runs green in a row** | §2, §5.4, §8, M12 exit |
 | Q-M5-24 (2026-10-02) | DataFusion (34 sub-crates) and the AWS SDK come in through `deltalake`: can the dependency tree and compile time shrink? | **Nothing to remove from our manifests: the sub-crates are transitive, and MERGE needs `deltalake`'s `datafusion` feature. From M6, only the binary links `sink-delta`. The rest is measured and tuned just before release (M12): timings, profiles, CI build sharing (earlier if CI time hurts), upstream** | M6 scope; M12 scope; §8 |
 | Q-M9-1 | Snapshot-job persistence | **Persisted in the pipeline state location** (`snapshots/jobs/<job_id>.json`); listed after a restart or failover via `GET /v1/pipelines/{id}/snapshots`; a running job continues on the new owner from its chunk cursors | `Data-Flow.md` §On-Demand Snapshot + State Layout; System-Overview and API_RBAC endpoint tables |
+| Q-M6a-1 (2026-10-02) | `snapshots.mode: never` and a recovery case (the position lost, an orphan adopted, a table added) | **No snapshot.** A warning names the gap: the table may miss changes from before the new position | `M6a-pipeline-worker.md` Task 5 |
+| Q-M6a-2 (2026-10-02) | Writers in flight when a session starts: their commits may predate the stream's start and be invisible to a chunk (DA-SNAP-9) | **Wait per table**: `in_flight()` at session start; a table's chunks are read only once none of its writers is still in flight (re-read with backoff 0.5 s → 10 s) | §3.6; spec edit S-T; M6a Task 10 |
+| Q-M6a-3 (2026-10-02) | `timeouts.snapshot` exceeded | **Halt the table `SNAPSHOT_TIMEOUT`** and mark its snapshot document `broken`; the clock is per table within one run | §3.3; M6a Task 10 |
+| Q-M6a-4 (2026-10-02) | When does a channel-D rescan's `changed` schema apply? | **After the stream catches up** to the position read right after the rescan; a change the stream applied meanwhile is skipped | §3.6; M6a Task 8 |
+| Q-M6a-5 (2026-10-02) | A sink commit that keeps failing `Transient` | **Retry forever**, backoff 1 s → 60 s with jitter, DEGRADED while retrying; backpressure through `buffer_capacity_rows` | spec edit S-S; M6a Task 6 |
+| Q-M6a-6 (2026-10-02) | Chunk rows emitted at a frontier the table's marker covers are skipped by the guard: silent loss while the cursor advances | **A snapshot flag on the change set**: `covers` never skips it, the fence still applies, `validate` refuses deletes, truncate or a split in it; the stream's changes flush before a chunk | §3.3, §3.4; spec edit S-T; M6a Tasks 1, 10 |
+| Q-M6a-7 (2026-10-03) | `timeouts.snapshot: 0` halts every snapshot at once | **A V-rule: at least 10 s** (V-118) | spec edit S-U; M6a Task 15 |
+| Q-M6a-8 (2026-10-03) | A table whose schema changed while the worker was down, under a snapshot: read under the cached columns, an added column stays NULL | **Rescan before snapshotting** | D-M6a.11; M6a Task 16 |
 
 ### 9.2 Open questions (answer before the named milestone)
 
