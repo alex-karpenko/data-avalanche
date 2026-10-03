@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::doc::{Document, StateError, Versioned};
 use crate::pipeline::PipelineDocs;
+use crate::tables::table_key;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -101,12 +102,7 @@ impl Document for SnapshotJobDoc {
 /// `snapshots/<schema>.<table>.json`. Each name is escaped as a key segment and its dots become
 /// `%2E`, so the `.` between them is unambiguous (`a.b` + `c` ≠ `a` + `b.c`).
 pub fn table_snapshot_key(table: &TableRef) -> String {
-    let part = |s: &str| escape_segment(s).replace('.', "%2E");
-    format!(
-        "snapshots/{}.{}.json",
-        part(&table.schema),
-        part(&table.name)
-    )
+    table_key("snapshots", table)
 }
 
 pub const JOBS_PREFIX: &str = "snapshots/jobs";
