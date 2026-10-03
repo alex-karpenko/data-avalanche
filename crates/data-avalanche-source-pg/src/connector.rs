@@ -7,7 +7,7 @@ use data_avalanche_config::{
     Pipeline, Postgres, SourceType, check_table_set, check_unbounded_numeric,
 };
 use data_avalanche_core::{
-    ChangeStream, Chunk, HaltReason, KeysetCursor, Preflight, Prepared, RescanReport,
+    ChangeStream, Chunk, HaltReason, InFlightTxn, KeysetCursor, Preflight, Prepared, RescanReport,
     ResolvedTables, Row, SchemaDelta, SchemaHint, SourceConnector, SourceError, SourcePosition,
     TableRef, TableSchema,
 };
@@ -280,6 +280,10 @@ impl SourceConnector for PgConnector {
 
     async fn current_position(&self) -> Result<SourcePosition, SourceError> {
         PgConnector::current_position(self).await
+    }
+
+    async fn in_flight(&self) -> Result<Option<Vec<InFlightTxn>>, SourceError> {
+        PgConnector::in_flight(self).await
     }
 
     async fn read_chunk(

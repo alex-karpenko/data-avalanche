@@ -4,9 +4,15 @@
 //! text, the same text pgoutput sends; they are decoded like stream values, so a snapshot row and
 //! a streamed row of the same data are equal. (A `::text` cast isn't the output function:
 //! `true::text` is `true`, pgoutput sends `t`.)
+//!
+//! A chunk is read in one REPEATABLE READ transaction together with its MVCC snapshot
+//! (`pg_current_snapshot()`), and `in_flight` lists the transactions in progress with the tables
+//! they write: the pipeline orders a chunk against the stream by transaction visibility, not by
+//! WAL position (DA-SNAP-9).
 
 use data_avalanche_core::{
-    Chunk, ColumnValue, HaltReason, KeysetCursor, Row, SourceError, TableSchema, identifier_values,
+    Chunk, ChunkVisibility, ColumnValue, HaltReason, InFlightTxn, KeysetCursor, Row, SourceError,
+    TableSchema, XidSnapshot, identifier_values,
 };
 use tokio_postgres::SimpleQueryMessage;
 
@@ -281,8 +287,41 @@ fn decode_row(
     Ok(Row(out))
 }
 
-/// Runs `sql` and decodes its rows. The server cancels it after `timeouts.command`
-/// (`statement_timeout`, local to the statement's implicit transaction).
+/// Runs `sql`, one or more statements in one implicit transaction. The server cancels each after
+/// `timeouts.command` (`statement_timeout`, local to the transaction).
+async fn simple_query(
+    c: &PgConnector,
+    what: &str,
+    schema: &TableSchema,
+    sql: &str,
+) -> Result<Vec<SimpleQueryMessage>, SourceError> {
+    let client = c.conn.client().await?;
+    let command = c.conn.timeouts.command;
+    let sql = format!(
+        "SET LOCAL statement_timeout = {}; {sql}",
+        server_millis(command)
+    );
+    c.conn
+        .bounded(what, command + SERVER_FIRST, client.simple_query(&sql))
+        .await
+        .map_err(|e| dropped(schema, e))
+}
+
+fn decode_rows<'a>(
+    schema: &TableSchema,
+    columns: &[ReadColumn],
+    messages: impl IntoIterator<Item = &'a SimpleQueryMessage>,
+) -> Result<Vec<Row>, SourceError> {
+    messages
+        .into_iter()
+        .filter_map(|m| match m {
+            SimpleQueryMessage::Row(r) => Some(decode_row(schema, columns, r)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Runs `sql` and decodes its rows.
 async fn rows(
     c: &PgConnector,
     what: &str,
@@ -290,25 +329,43 @@ async fn rows(
     columns: &[ReadColumn],
     sql: &str,
 ) -> Result<Vec<Row>, SourceError> {
-    let client = c.conn.client().await?;
-    let command = c.conn.timeouts.command;
-    let sql = format!(
-        "SET LOCAL statement_timeout = {}; {sql}",
-        server_millis(command)
-    );
-    let messages = c
-        .conn
-        .bounded(what, command + SERVER_FIRST, client.simple_query(&sql))
-        .await
-        .map_err(|e| dropped(schema, e))?;
-    messages
-        .iter()
-        .filter_map(|m| match m {
-            SimpleQueryMessage::Row(r) => Some(decode_row(schema, columns, r)),
-            _ => None,
-        })
-        .collect()
+    let messages = simple_query(c, what, schema, sql).await?;
+    decode_rows(schema, columns, &messages)
 }
+
+/// A `pg_snapshot` in its text form, `xmin:xmax:xip,…` (`735:740:736,738`).
+fn parse_snapshot(text: &str) -> Result<XidSnapshot, SourceError> {
+    let bad = || SourceError::Permanent(format!("unexpected pg_current_snapshot() {text:?}"));
+    let mut parts = text.splitn(3, ':');
+    let mut xid =
+        || -> Result<u64, SourceError> { parts.next().ok_or_else(bad)?.parse().map_err(|_| bad()) };
+    let (xmin, xmax) = (xid()?, xid()?);
+    let xip = match parts.next().ok_or_else(bad)? {
+        "" => vec![],
+        list => list
+            .split(',')
+            .map(|x| x.parse().map_err(|_| bad()))
+            .collect::<Result<_, _>>()?,
+    };
+    Ok(XidSnapshot { xmin, xmax, xip })
+}
+
+/// Every transaction id `pg_locks` holds (top-level and subtransactions), with the relations of
+/// this database its virtual transaction holds a write lock on. One scan of the lock table.
+const IN_FLIGHT: &str = "WITH l AS MATERIALIZED (SELECT * FROM pg_catalog.pg_locks)
+    SELECT x.transactionid::text,
+           COALESCE(pg_catalog.array_agg(DISTINCT r.relation::int8)
+                      FILTER (WHERE r.relation IS NOT NULL), '{}')
+      FROM l x
+      LEFT JOIN l r
+        ON r.virtualtransaction = x.virtualtransaction
+       AND r.locktype = 'relation'
+       AND r.database = (SELECT oid FROM pg_catalog.pg_database
+                          WHERE datname = pg_catalog.current_database())
+       AND r.mode IN ('RowExclusiveLock', 'ShareRowExclusiveLock', 'ExclusiveLock',
+                      'AccessExclusiveLock')
+     WHERE x.locktype = 'transactionid' AND x.mode = 'ExclusiveLock'
+     GROUP BY x.transactionid::text";
 
 /// The first identifier column `row` holds NULL in.
 fn null_key(schema: &TableSchema, row: &Row) -> String {
@@ -373,8 +430,9 @@ fn key_texts(key: &Row, schema: &TableSchema) -> Result<Vec<String>, SourceError
 }
 
 impl PgConnector {
-    /// One chunk: `SELECT … WHERE (key) > (cursor) ORDER BY key LIMIT n`, a single statement, so
-    /// one READ COMMITTED snapshot (Snapshot_Resumability §1).
+    /// One chunk: `SELECT … WHERE (key) > (cursor) ORDER BY key LIMIT n` in a REPEATABLE READ
+    /// transaction, after `pg_current_snapshot()`: the chunk's [`ChunkVisibility`] is the snapshot
+    /// its rows were read in (DA-SNAP-9).
     pub async fn read_chunk(
         &self,
         table: &TableSchema,
@@ -414,7 +472,31 @@ impl PgConnector {
         }
         let order: Vec<String> = keys.iter().map(|c| key_expr(c)).collect();
         sql += &format!(" ORDER BY {} LIMIT {limit}", order.join(", "));
-        let rows = rows(self, "read a snapshot chunk", table, &columns, &sql).await?;
+        // The first query of a REPEATABLE READ transaction takes its snapshot; the chunk reads in
+        // the same one.
+        let sql = format!(
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;
+             SELECT pg_catalog.pg_current_snapshot()::text; {sql}"
+        );
+        let messages = simple_query(self, "read a snapshot chunk", table, &sql).await?;
+        // Each SELECT's rows follow its row description: the snapshot's, then the chunk's.
+        let mut selects = messages
+            .split_inclusive(|m| matches!(m, SimpleQueryMessage::CommandComplete(_)))
+            .filter(|s| {
+                s.iter()
+                    .any(|m| matches!(m, SimpleQueryMessage::RowDescription(_)))
+            });
+        let snapshot = selects
+            .next()
+            .and_then(|s| {
+                s.iter().find_map(|m| match m {
+                    SimpleQueryMessage::Row(r) => r.get(0),
+                    _ => None,
+                })
+            })
+            .ok_or_else(|| SourceError::Permanent("no pg_current_snapshot() row".into()))?;
+        let visibility = ChunkVisibility::Xids(parse_snapshot(snapshot)?);
+        let rows = decode_rows(table, &columns, selects.next().unwrap_or_default())?;
         let next = match rows.last() {
             None => None,
             Some(last) => Some(KeysetCursor {
@@ -431,8 +513,39 @@ impl PgConnector {
         Ok(Chunk {
             rows,
             next,
-            visibility: None,
+            visibility: Some(visibility),
         })
+    }
+
+    /// The transactions in progress now with the tables they write (DA-SNAP-9): every
+    /// transaction id `pg_locks` holds, with the relations its virtual transaction holds a write
+    /// lock on in this database. A synchronous commit waiting for its standby keeps both until it
+    /// is visible (measured on PostgreSQL 18). The ids are 32-bit, like the stream's.
+    pub async fn in_flight(&self) -> Result<Option<Vec<InFlightTxn>>, SourceError> {
+        let client = self.conn.client().await?;
+        let rows = self
+            .conn
+            .command(
+                "read the transactions in progress",
+                client.query(IN_FLIGHT, &[]),
+            )
+            .await?;
+        rows.iter()
+            .map(|r| {
+                let xid: String = r.get(0);
+                Ok(InFlightTxn {
+                    xid: xid.parse().map_err(|_| {
+                        SourceError::Permanent(format!("unexpected transaction id {xid:?}"))
+                    })?,
+                    tables: r
+                        .get::<_, Vec<i64>>(1)
+                        .into_iter()
+                        .map(|t| t as u64)
+                        .collect(),
+                })
+            })
+            .collect::<Result<_, _>>()
+            .map(Some)
     }
 
     /// The current rows of these keys (`toast_strategy: re_query`, Q-M5-6), [`FETCH_BATCH`] keys
@@ -496,6 +609,29 @@ mod tests {
         ReadColumn {
             decode: Decode::Char,
             ..rc(name, type_text, None)
+        }
+    }
+
+    #[test]
+    fn snapshots_parse_from_their_text() {
+        assert_eq!(
+            parse_snapshot("735:740:736,738").unwrap(),
+            XidSnapshot {
+                xmin: 735,
+                xmax: 740,
+                xip: vec![736, 738]
+            }
+        );
+        assert_eq!(
+            parse_snapshot("4294967306:4294967306:").unwrap(),
+            XidSnapshot {
+                xmin: 4_294_967_306,
+                xmax: 4_294_967_306,
+                xip: vec![]
+            }
+        );
+        for bad in ["", "1:2", "a:2:", "1:2:x", "1:2:3,"] {
+            assert!(parse_snapshot(bad).is_err(), "{bad:?}");
         }
     }
 

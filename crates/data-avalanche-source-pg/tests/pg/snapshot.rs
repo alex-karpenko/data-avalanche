@@ -3,12 +3,71 @@
 use std::time::Duration;
 
 use data_avalanche_core::{
-    ColumnValue as V, HaltReason, KeysetCursor, Row, SourceError, TableSchema, identifier_values,
+    ChunkVisibility, ColumnValue as V, HaltReason, KeysetCursor, Row, SourceError, TableSchema,
+    identifier_values,
 };
 use data_avalanche_source_pg::{FETCH_BATCH, PgConnector};
 use data_avalanche_testkit::require_it;
 
 use crate::common::{admin, cleanup, connector, fresh, pipeline, resolved};
+
+/// DA-SNAP-9: a chunk is read in one REPEATABLE READ transaction with its snapshot, which doesn't
+/// see a transaction still open; `in_flight` lists that transaction with the table it writes.
+/// Once it commits, the next chunk sees it and its row.
+#[tokio::test]
+async fn a_chunk_carries_its_snapshot_and_in_flight_lists_open_writers() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(
+        &a,
+        "snapshot_visibility",
+        "CREATE TABLE t (id int PRIMARY KEY, v int NOT NULL);
+         INSERT INTO t VALUES (1, 0), (2, 0);",
+    )
+    .await;
+    let c = connector(&pipeline(&n, &["t"], "", ""));
+    let r = resolved(&c).await;
+    let t = &r.tables[0];
+    let oid = t.source_id().expect("PostgreSQL tables carry their OID");
+    let w = admin().await;
+    w.batch_execute(&format!(
+        "BEGIN; UPDATE {}.t SET v = 1 WHERE id = 1",
+        n.schema
+    ))
+    .await
+    .unwrap();
+    let xid: String = w
+        .query_one("SELECT pg_current_xact_id()::text", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let full: u64 = xid.parse().unwrap();
+    let short = full & 0xFFFF_FFFF;
+
+    let open = c.in_flight().await.unwrap().expect("PostgreSQL lists them");
+    let writer = open
+        .iter()
+        .find(|x| x.xid == short)
+        .unwrap_or_else(|| panic!("{short} in flight: {open:?}"));
+    assert!(writer.tables.contains(&oid), "{writer:?} writes {oid}");
+    let before = c.read_chunk(t, None, 10).await.unwrap();
+    let Some(ChunkVisibility::Xids(s)) = &before.visibility else {
+        panic!("a PostgreSQL chunk carries its snapshot: {before:?}")
+    };
+    assert!(!s.sees(short) && !s.sees(full), "{s:?} doesn't see {full}");
+    assert_eq!(before.rows[0].get("v"), Some(&V::Int32(0)));
+
+    w.batch_execute("COMMIT").await.unwrap();
+    let after = c.read_chunk(t, None, 10).await.unwrap();
+    let Some(ChunkVisibility::Xids(s)) = &after.visibility else {
+        panic!("{after:?}")
+    };
+    assert!(s.sees(short), "{s:?} sees the committed {short}");
+    assert_eq!(after.rows[0].get("v"), Some(&V::Int32(1)));
+    let open = c.in_flight().await.unwrap().unwrap();
+    assert!(open.iter().all(|x| x.xid != short), "{open:?}");
+    cleanup(&a, &n).await;
+}
 
 /// Final review I3: a table dropped under the snapshot halts that table (`TABLE_DROPPED`), and so
 /// does a key column that lost NOT NULL (`IDENTIFIER_NOT_USABLE`): a NULL key sorts after every

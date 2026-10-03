@@ -33,9 +33,9 @@ fn classify(code: Option<&str>, message: String, position: Option<String>) -> So
             position: position.unwrap_or_default(),
             detail: message,
         },
-        // `replication slot "…" is active for PID …` (55006): another holder exists. Fatal, never
-        // retried into a busy loop (Postgres_Slot… D-15.5).
-        Some("55006") => SourceError::Permanent(message),
+        // `replication slot "…" is active for PID …` (55006): another holder exists. The pipeline
+        // retries it for a bounded time, never into a busy loop (Postgres_Slot… D-15.5).
+        Some("55006") => SourceError::Contended(message),
         Some(c) if transient_state(c) => SourceError::Transient(message),
         _ => SourceError::Permanent(message),
     }
@@ -131,12 +131,12 @@ mod tests {
     }
 
     #[test]
-    fn a_busy_slot_is_fatal() {
+    fn a_busy_slot_is_contended() {
         let e = replication_error(
             server("replication slot \"s\" is active for PID 42 (SQLSTATE 55006)"),
             None,
         );
-        assert!(matches!(e, SourceError::Permanent(m) if m.contains("active for PID")));
+        assert!(matches!(e, SourceError::Contended(m) if m.contains("active for PID")));
     }
 
     #[test]
