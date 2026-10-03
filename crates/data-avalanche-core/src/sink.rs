@@ -10,8 +10,8 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::{
-    ChangeSetError, HaltReason, PositionError, SchemaDelta, SourcePosition, TableChangeSet,
-    TableRef, TableSchema, upsert_schema,
+    ChangeSetError, HaltReason, LINEAGE_COLUMNS, PositionError, SchemaDelta, SourcePosition,
+    TableChangeSet, TableRef, TableSchema, upsert_schema,
 };
 
 /// The table format a sink writes (`sink.type`). The text is what pipeline state records as
@@ -124,7 +124,8 @@ impl SinkCapabilities {
     }
 }
 
-/// What `ensure_table` creates when the table is absent.
+/// What `ensure_table` creates when the table is absent. A partition column is a source column or
+/// a lineage column (`_ts`, config §9.3).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableSpec {
     pub table: TableRef,
@@ -139,10 +140,9 @@ impl TableSpec {
         schema: &TableSchema,
         partition_by: Vec<PartitionField>,
     ) -> Result<Self, HaltReason> {
-        if let Some(p) = partition_by
-            .iter()
-            .find(|p| schema.column(&p.column).is_none())
-        {
+        if let Some(p) = partition_by.iter().find(|p| {
+            schema.column(&p.column).is_none() && !LINEAGE_COLUMNS.contains(&p.column.as_str())
+        }) {
             return Err(HaltReason::SchemaMismatch {
                 column: p.column.clone(),
                 detail: "a partition column that isn't in the table".into(),
@@ -181,7 +181,13 @@ impl CommitMarker {
     /// It is skipped only when the marker is strictly past `txn_start`: the transaction's commit (or
     /// a later one) has landed, and re-applying the slice would roll its rows back to their state
     /// inside the transaction.
+    ///
+    /// A snapshot set is never skipped: its rows are read now, not replayed history, and its range
+    /// is the stream's frontier, which the marker may cover already.
     pub fn covers(&self, cs: &TableChangeSet) -> Result<bool, PositionError> {
+        if cs.snapshot {
+            return Ok(false);
+        }
         let stored = &self.committed_position;
         match &cs.split {
             Some(split) => Ok(stored.covers(&split.txn_start)? && !split.txn_start.covers(stored)?),
@@ -329,6 +335,7 @@ mod tests {
                 end: SourcePosition::Pg(Lsn(end)),
             },
             split,
+            snapshot: false,
         }
     }
 
@@ -384,6 +391,17 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code(), "SCHEMA_MISMATCH");
+        let by_commit_time = TableSpec::new(
+            &table(),
+            vec![PartitionField {
+                column: "_ts".into(),
+                transform: PartitionTransform::Day,
+            }],
+        );
+        assert!(
+            by_commit_time.is_ok(),
+            "a lineage column is in the upsert schema (config §9.3: `day(_ts)`)"
+        );
     }
 
     #[test]
@@ -406,6 +424,17 @@ mod tests {
         assert!(stored.covers(&change_set(100, None)).unwrap());
         assert!(stored.covers(&change_set(60, None)).unwrap());
         assert!(!stored.covers(&change_set(101, None)).unwrap());
+    }
+
+    #[test]
+    fn the_guard_never_skips_a_snapshot_set() {
+        let mut chunk = change_set(100, None);
+        chunk.snapshot = true;
+        assert!(
+            !marker(1, 100).covers(&chunk).unwrap(),
+            "chunk rows are read now, at a frontier the marker covers"
+        );
+        assert!(!marker(1, 500).covers(&chunk).unwrap());
     }
 
     #[test]

@@ -417,6 +417,7 @@ mod tests {
                 end: SourcePosition::Pg(Lsn(end)),
             },
             split: None,
+            snapshot: false,
         }
     }
 

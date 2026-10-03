@@ -428,7 +428,11 @@ impl PgConnector {
                 collation,
             }),
         };
-        Ok(Chunk { rows, next })
+        Ok(Chunk {
+            rows,
+            next,
+            visibility: None,
+        })
     }
 
     /// The current rows of these keys (`toast_strategy: re_query`, Q-M5-6), [`FETCH_BATCH`] keys

@@ -110,6 +110,7 @@ pub(crate) fn change_set(end: u64, up: Vec<RecordBatch>, del: Vec<RecordBatch>) 
             end: SourcePosition::Pg(Lsn(end)),
         },
         split: None,
+        snapshot: false,
     }
 }
 

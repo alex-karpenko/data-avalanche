@@ -549,6 +549,7 @@ impl TableBuffer {
             deletes,
             position,
             split,
+            snapshot: false,
         }
     }
 }

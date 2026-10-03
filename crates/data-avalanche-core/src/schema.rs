@@ -1,10 +1,12 @@
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{ColumnValueType, LogicalType, TableRef, first_reserved_collision};
 
 /// One source column (`Schema_Change…` §7): what the decoder produces (`value_type`), what the
 /// target stores (`logical`, Hop 2), and the source's own description.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ColumnSchema {
     pub name: String,
     pub value_type: ColumnValueType,
@@ -84,41 +86,67 @@ pub fn hop2_compatible(value_type: &ColumnValueType, logical: &LogicalType) -> b
 
 /// Why a table stops replicating while the other tables of its pipeline continue (`Schema_Change…`
 /// §7.2, config §5, `Type_Mapping.md`). [`HaltReason::code`] is the stable identifier for status,
-/// logs and metrics.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+/// logs and metrics; the pipeline's state stores a halt tagged by it (`{"code": "UNSAFE_DDL",
+/// "detail": …}`).
+#[derive(Debug, Clone, PartialEq, Eq, Error, Serialize, Deserialize)]
+#[serde(tag = "code", deny_unknown_fields)]
 pub enum HaltReason {
     #[error(
         "column {column:?} collides with a reserved lineage or internal column name; rename it at the source"
     )]
+    #[serde(rename = "RESERVED_COLUMN_COLLISION")]
     ReservedColumnCollision { column: String },
     #[error(
         "the table was dropped at the source; the target is kept, and a re-created table needs an operator re-snapshot"
     )]
+    #[serde(rename = "TABLE_DROPPED")]
     TableDropped,
     #[error("unsafe schema change: {detail}")]
+    #[serde(rename = "UNSAFE_DDL")]
     UnsafeDdl { detail: String },
     #[error("the table has no primary key and no tables.primary_key override")]
+    #[serde(rename = "NO_IDENTIFIER")]
     NoIdentifier,
     #[error("identifier column {column:?} can't be a key: {reason}")]
+    #[serde(rename = "IDENTIFIER_NOT_USABLE")]
     IdentifierNotUsable { column: String, reason: String },
     #[error("identifier columns {missing:?} are not in the table's REPLICA IDENTITY")]
+    #[serde(rename = "IDENTIFIER_NOT_IN_REPLICA_IDENTITY")]
     IdentifierNotInReplicaIdentity { missing: Vec<String> },
     #[error("the sink can't apply this schema change: {detail}")]
+    #[serde(rename = "EVOLUTION_UNSUPPORTED")]
     EvolutionUnsupported { detail: String },
     #[error("the schema changed and schema_evolution.enabled is false")]
+    #[serde(rename = "EVOLUTION_DISABLED")]
     EvolutionDisabled,
     #[error("a value in column {column:?} doesn't fit its decimal type")]
+    #[serde(rename = "NUMERIC_OVERFLOW")]
     NumericOverflow { column: String },
     #[error(
         "column {column:?} holds the invalid date {raw:?}; set tables.column_type_overrides: {{{column}: string}} or fix the source rows"
     )]
+    #[serde(rename = "INVALID_DATE_VALUE")]
     InvalidDateValue { column: String, raw: String },
     #[error("column {column:?}: {detail}")]
+    #[serde(rename = "SCHEMA_MISMATCH")]
     SchemaMismatch { column: String, detail: String },
     #[error("identifier column {column:?} is NULL")]
+    #[serde(rename = "NULL_IDENTIFIER")]
     NullIdentifier { column: String },
     #[error("the source can't replicate this table: {reason}")]
+    #[serde(rename = "TABLE_NOT_REPLICABLE")]
     NotReplicable { reason: String },
+    /// The sink refused a change set for good (a `Permanent` commit error): retrying would fail
+    /// the same way (a key outside the Delta range, Q-M5-19).
+    #[error("the sink refused the table's changes: {detail}")]
+    #[serde(rename = "SINK_REJECTED")]
+    SinkRejected { detail: String },
+    /// The table's snapshot ran longer than `source.timeouts.snapshot` in one run.
+    #[error(
+        "the table's snapshot didn't finish within timeouts.snapshot ({limit_secs} s); raise it and re-snapshot the table"
+    )]
+    #[serde(rename = "SNAPSHOT_TIMEOUT")]
+    SnapshotTimeout { limit_secs: u64 },
 }
 
 impl HaltReason {
@@ -137,18 +165,56 @@ impl HaltReason {
             Self::SchemaMismatch { .. } => "SCHEMA_MISMATCH",
             Self::NullIdentifier { .. } => "NULL_IDENTIFIER",
             Self::NotReplicable { .. } => "TABLE_NOT_REPLICABLE",
+            Self::SinkRejected { .. } => "SINK_REJECTED",
+            Self::SnapshotTimeout { .. } => "SNAPSHOT_TIMEOUT",
         }
     }
 }
 
 /// A source table's schema as of one stream position: its columns in source order and the
-/// identifier (inferred PK or `tables.primary_key`) that keys upserts and deletes (G-13).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// identifier (inferred PK or `tables.primary_key`) that keys upserts and deletes (G-13). The
+/// pipeline's schema cache stores it as JSON; a stored schema is checked like a new one
+/// ([`TableSchema::new`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "StoredTableSchema", into = "StoredTableSchema")]
 pub struct TableSchema {
     table: TableRef,
     columns: Vec<ColumnSchema>,
     identifier: Vec<String>,
     source_id: Option<u64>,
+}
+
+/// [`TableSchema`]'s stored form.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredTableSchema {
+    table: TableRef,
+    columns: Vec<ColumnSchema>,
+    identifier: Vec<String>,
+    source_id: Option<u64>,
+}
+
+impl From<TableSchema> for StoredTableSchema {
+    fn from(s: TableSchema) -> Self {
+        Self {
+            table: s.table,
+            columns: s.columns,
+            identifier: s.identifier,
+            source_id: s.source_id,
+        }
+    }
+}
+
+impl TryFrom<StoredTableSchema> for TableSchema {
+    type Error = HaltReason;
+
+    fn try_from(s: StoredTableSchema) -> Result<Self, HaltReason> {
+        let schema = TableSchema::new(s.table, s.columns, s.identifier)?;
+        Ok(match s.source_id {
+            Some(id) => schema.with_source_id(id),
+            None => schema,
+        })
+    }
 }
 
 impl TableSchema {
@@ -414,9 +480,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn every_halt_reason_has_a_distinct_code() {
-        let all = [
+    fn every_halt_reason() -> Vec<HaltReason> {
+        vec![
             HaltReason::ReservedColumnCollision { column: "c".into() },
             HaltReason::TableDropped,
             HaltReason::UnsafeDdl { detail: "d".into() },
@@ -441,7 +506,14 @@ mod tests {
             },
             HaltReason::NullIdentifier { column: "c".into() },
             HaltReason::NotReplicable { reason: "r".into() },
-        ];
+            HaltReason::SinkRejected { detail: "d".into() },
+            HaltReason::SnapshotTimeout { limit_secs: 21_600 },
+        ]
+    }
+
+    #[test]
+    fn every_halt_reason_has_a_distinct_code() {
+        let all = every_halt_reason();
         let codes: std::collections::BTreeSet<_> = all.iter().map(HaltReason::code).collect();
         assert_eq!(codes.len(), all.len());
         assert!(
@@ -458,5 +530,93 @@ mod tests {
         let a = s.clone().with_source_id(7);
         assert_eq!(a.source_id(), Some(7));
         assert_ne!(a, s.with_source_id(8), "another table under the name");
+    }
+    #[test]
+    fn halt_reasons_serialize_tagged_by_their_code() {
+        for r in every_halt_reason() {
+            let json = serde_json::to_value(&r).unwrap();
+            assert_eq!(json["code"], r.code(), "{r:?}");
+            assert_eq!(serde_json::from_value::<HaltReason>(json).unwrap(), r);
+        }
+        assert_eq!(
+            serde_json::to_string(&HaltReason::UnsafeDdl { detail: "x".into() }).unwrap(),
+            r#"{"code":"UNSAFE_DDL","detail":"x"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&HaltReason::TableDropped).unwrap(),
+            r#"{"code":"TABLE_DROPPED"}"#
+        );
+        let unknown =
+            serde_json::from_str::<HaltReason>(r#"{"code":"UNSAFE_DDL","detail":"x","y":1}"#);
+        // A unit variant's extra fields go unchecked: serde's internally tagged enums don't
+        // apply `deny_unknown_fields` to them.
+        assert!(unknown.is_err(), "unknown fields are refused");
+    }
+
+    #[test]
+    fn a_table_schema_round_trips_through_json() {
+        let mut c = cols();
+        c[0].source_ordinal = Some(1);
+        c.push(ColumnSchema::new(
+            "tags",
+            V::Array(Box::new(V::Text)),
+            "text[]",
+        ));
+        c.push(ColumnSchema::new(
+            "at",
+            V::Timestamp { with_tz: true },
+            "timestamp with time zone",
+        ));
+        let s = TableSchema::new(t(), c, vec!["id".into()])
+            .unwrap()
+            .with_source_id(16384);
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(
+            json["table"],
+            serde_json::json!({"schema": "public", "name": "orders"})
+        );
+        assert_eq!(json["identifier"], serde_json::json!(["id"]));
+        assert_eq!(json["source_id"], 16384);
+        assert_eq!(
+            json["columns"][0],
+            serde_json::json!({
+                "name": "id", "value_type": "int64", "logical": "int64", "nullable": false,
+                "source_type": "bigint", "source_ordinal": 1
+            })
+        );
+        assert_eq!(
+            json["columns"][1]["value_type"],
+            serde_json::json!({"numeric": {"precision": 10, "scale": 2}})
+        );
+        assert_eq!(json["columns"][1]["logical"], "decimal(10,2)");
+        assert_eq!(
+            json["columns"][3]["value_type"],
+            serde_json::json!({"array": "text"})
+        );
+        assert_eq!(
+            json["columns"][4]["value_type"],
+            serde_json::json!({"timestamp": {"with_tz": true}})
+        );
+        assert_eq!(serde_json::from_value::<TableSchema>(json).unwrap(), s);
+    }
+
+    #[test]
+    fn a_stored_schema_is_checked_like_a_new_one() {
+        let s = TableSchema::new(t(), cols(), vec!["id".into()]).unwrap();
+        let mut json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["source_id"], serde_json::Value::Null);
+        json["identifier"] = serde_json::json!(["note"]);
+        let e = serde_json::from_value::<TableSchema>(json.clone()).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("identifier column \"note\" can't be a key: it is nullable"),
+            "{e}"
+        );
+        json["identifier"] = serde_json::json!(["id"]);
+        json["columns"][0]["extra"] = serde_json::json!(1);
+        assert!(
+            serde_json::from_value::<TableSchema>(json).is_err(),
+            "unknown fields are refused"
+        );
     }
 }
