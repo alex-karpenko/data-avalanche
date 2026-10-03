@@ -19,9 +19,15 @@ pub mod hooks;
 pub mod policy;
 #[allow(
     dead_code,
+    reason = "the worker runs it (Task 11); the allow goes there"
+)]
+mod session;
+#[allow(
+    dead_code,
     reason = "the worker reads it (Task 11); the allow goes there"
 )]
 mod settings;
+pub mod status;
 #[cfg(test)]
 mod test_support;
 #[allow(
@@ -37,3 +43,4 @@ pub use buffer::{CollapsedRow, RowKind, TableBuffer};
 pub use error::{AccumulatorError, WorkerError};
 pub use hooks::{CommitGuard, HookAction, HookPoint, Hooks, NoHooks, Unguarded};
 pub use policy::{FlushPolicy, FlushReason, TxnLimits};
+pub use status::{Command, Exit, Phase, SnapshotProgress, Tuning, WorkerStatus};

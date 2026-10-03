@@ -3,34 +3,64 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use arrow_array::Int64Array;
 use async_trait::async_trait;
 use bytes::Bytes;
 use data_avalanche_config::{FingerprintKey, Pipeline, load_str};
 use data_avalanche_core::position::Lsn;
 use data_avalanche_core::{
-    CdcEvent, ColumnSchema, ColumnValue, ColumnValueType as V, Op, Row, SourcePosition, SourceSeq,
-    TableRef, TableSchema, TransactionBoundary,
+    CdcEvent, ColumnSchema, ColumnValue, ColumnValueType as V, Op, Row, Sink, SourcePosition,
+    SourceSeq, TableRef, TableSchema, TableSpec, TransactionBoundary,
 };
-use data_avalanche_state::{DocStore, PipelineDocs};
+use data_avalanche_state::{DocStore, PipelineDocs, SlotDoc};
 use data_avalanche_storage::{ObjectStoreVersioned, ObjectVersion, StoreError, VersionedStore};
+use data_avalanche_testkit::{FakeSource, MemorySink};
 use object_store::memory::InMemory;
+use tokio::sync::{mpsc, watch};
 
-use crate::{Accumulator, CommitGuard, FlushPolicy, HookAction, HookPoint, Hooks, Lineage};
+use crate::session::Core;
+use crate::settings::Settings;
+use crate::{
+    Accumulator, Backoff, Command, CommitGuard, FlushPolicy, HookAction, HookPoint, Hooks, Lineage,
+    NoHooks, Tuning, Unguarded, WorkerStatus,
+};
 
 /// A PostgreSQL → Delta pipeline `p` reading `public.*`, with more `tables` keys (YAML lines
 /// indented six spaces), more `sink` and `postgres` keys (YAML flow entries).
 pub(crate) fn pipeline(tables: &str, sink: &str, postgres: &str) -> Pipeline {
-    let sep = |s: &str| {
-        if s.is_empty() {
-            String::new()
-        } else {
-            format!(", {s}")
-        }
-    };
-    let yaml = format!(
-        r#"
+    Yaml {
+        tables,
+        sink,
+        postgres,
+        ..Yaml::default()
+    }
+    .build()
+}
+
+/// The test pipeline's extra YAML. `pipeline`, `source` and `tables` are lines (each starting
+/// with a newline, indented four, six and six spaces); `sink` and `postgres` are flow entries.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Yaml<'a> {
+    pub pipeline: &'a str,
+    pub source: &'a str,
+    pub postgres: &'a str,
+    pub tables: &'a str,
+    pub sink: &'a str,
+}
+
+impl Yaml<'_> {
+    pub fn build(self) -> Pipeline {
+        let sep = |s: &str| {
+            if s.is_empty() {
+                String::new()
+            } else {
+                format!(", {s}")
+            }
+        };
+        let yaml = format!(
+            r#"
 config_version: 1
 globals:
   state: {{ bucket: app-state }}
@@ -44,25 +74,29 @@ pipelines:
       user: avalanche
       password: avalanche
       ssl_mode: disable
-      postgres: {{ publication: p_pub, slot: p_slot{postgres} }}
+      postgres: {{ publication: p_pub, slot: p_slot{postgres} }}{source}
     tables:
       include: [public.*]{tables}
-    sink: {{ type: delta, bucket: lake, delta: {{}}{sink} }}
+    sink: {{ type: delta, bucket: lake, delta: {{}}{sink} }}{top}
 "#,
-        postgres = sep(postgres),
-        sink = sep(sink),
-    );
-    load_str(
-        &yaml,
-        &BTreeMap::new(),
-        &FingerprintKey::from_bytes([1; 32]),
-    )
-    .unwrap_or_else(|r| panic!("test pipeline: {r:?}"))
-    .config
-    .pipelines
-    .into_values()
-    .next()
-    .expect("one pipeline")
+            postgres = sep(self.postgres),
+            source = self.source,
+            tables = self.tables,
+            sink = sep(self.sink),
+            top = self.pipeline,
+        );
+        load_str(
+            &yaml,
+            &BTreeMap::new(),
+            &FingerprintKey::from_bytes([1; 32]),
+        )
+        .unwrap_or_else(|r| panic!("test pipeline: {r:?}"))
+        .config
+        .pipelines
+        .into_values()
+        .next()
+        .expect("one pipeline")
+    }
 }
 
 /// `public.<name>`: `id bigint` (the key) and `doc text`.
@@ -228,4 +262,118 @@ impl CommitGuard for Switch {
     fn may_commit(&self) -> bool {
         !self.0.load(Ordering::SeqCst)
     }
+}
+
+/// Fast retries and ticks for tests.
+pub(crate) fn fast() -> Tuning {
+    let ms = |first, max| Backoff {
+        first: Duration::from_millis(first),
+        max: Duration::from_millis(max),
+    };
+    Tuning {
+        source_backoff: ms(1, 4),
+        sink_backoff: ms(1, 4),
+        in_flight_backoff: ms(1, 4),
+        contended_window: Duration::from_millis(200),
+        tick: Duration::from_millis(5),
+        augment_attempts: 3,
+    }
+}
+
+/// Polls `cond` until it holds; panics after five seconds.
+pub(crate) async fn wait_until(what: &str, cond: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !cond() {
+        assert!(Instant::now() < deadline, "timed out waiting until {what}");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+/// A source, a sink and the pipeline's state documents.
+#[derive(Debug, Clone)]
+pub(crate) struct World {
+    pub source: FakeSource,
+    pub sink: MemorySink,
+    pub docs: PipelineDocs,
+}
+
+impl World {
+    /// A source holding `tables` (each [`schema`]).
+    pub fn new(tables: &[&str]) -> Self {
+        Self::with(tables.iter().map(|t| schema(t)).collect())
+    }
+
+    pub fn with(tables: Vec<TableSchema>) -> Self {
+        let (docs, _) = docs();
+        Self {
+            source: FakeSource::new(tables),
+            sink: MemorySink::new(),
+            docs,
+        }
+    }
+
+    /// What Phase 0 leaves for a stream session over `tables`: the sink tables, the cached
+    /// schemas and the checkpoint at the log's end.
+    pub async fn started(&self, tables: &[&str]) {
+        for t in tables {
+            let s = self.source.schema(&TableRef::new("public", *t));
+            self.sink
+                .ensure_table(&TableSpec::new(&s, vec![]).expect("a spec"))
+                .await
+                .expect("a table");
+            self.docs.save_table_schema(&s).await.expect("cached");
+        }
+        let SourcePosition::Pg(end) = self.source.wal_end() else {
+            unreachable!("the fake speaks PostgreSQL")
+        };
+        self.docs
+            .save_slot(&SlotDoc {
+                slot_name: "p_slot".into(),
+                confirmed_flush_lsn: end,
+            })
+            .await
+            .expect("the checkpoint");
+    }
+
+    /// A worker core over `tables` with `p`'s settings.
+    pub fn core(
+        &self,
+        p: &Pipeline,
+        tables: &[&str],
+    ) -> (Core, mpsc::Sender<Command>, watch::Receiver<WorkerStatus>) {
+        let (control, control_rx) = mpsc::channel(8);
+        let (status, status_rx) = watch::channel(WorkerStatus::default());
+        let core = Core {
+            settings: Settings::new(p),
+            source: Arc::new(self.source.clone()),
+            sink: Arc::new(self.sink.clone()),
+            docs: self.docs.clone(),
+            owner_epoch: 1,
+            guard: Arc::new(Unguarded),
+            hooks: Arc::new(NoHooks),
+            tuning: fast(),
+            control: control_rx,
+            status,
+            tracked: tables.iter().map(|t| TableRef::new("public", *t)).collect(),
+        };
+        (core, control, status_rx)
+    }
+
+    /// The table's `id` values in the sink, in key order.
+    pub fn ids(&self, table: &str) -> Vec<i64> {
+        let Some(b) = self.sink.content(&TableRef::new("public", table)) else {
+            return vec![];
+        };
+        let ids = b
+            .column_by_name("id")
+            .expect("an id column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("bigint ids");
+        ids.values().to_vec()
+    }
+}
+
+pub(crate) fn t(name: &str) -> TableRef {
+    TableRef::new("public", name)
 }

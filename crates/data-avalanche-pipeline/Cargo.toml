@@ -20,7 +20,7 @@ data-avalanche-storage.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync", "rt"] }
+tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
 
 [dev-dependencies]
 async-trait.workspace = true
