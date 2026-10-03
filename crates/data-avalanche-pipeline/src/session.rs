@@ -12,8 +12,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use data_avalanche_core::{
-    ChangeStream, DeltaClass, EvolveOutcome, HaltReason, SchemaDelta, SchemaHint, Sink, SinkError,
-    SourceConnector, SourceError, SourcePosition, StreamItem, TableRef, TableSchema, classify,
+    CdcEvent, ChangeStream, ColumnValue, DeltaClass, EvolveOutcome, HaltReason, Op, RescanReport,
+    Row, SchemaDelta, SchemaHint, Sink, SinkError, SourceConnector, SourceError, SourcePosition,
+    SourceSeq, StreamItem, TableRef, TableSchema, TransactionBoundary, classify, identifier_values,
 };
 use data_avalanche_state::{PipelineDocs, TableHalt};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -83,6 +84,12 @@ pub(crate) struct Session<'c> {
     txn_schemas: Vec<TableSchema>,
     /// Schema changes of committed transactions, each cached once a checkpoint covers it.
     pending_schemas: Vec<(SourcePosition, TableSchema)>,
+    /// `toast_strategy: re_query`: the keys whose UPDATE in the open transaction carried
+    /// unchanged values, and the transaction's last change.
+    requery: BTreeMap<TableRef, Vec<Row>>,
+    last_seq: Option<SourceSeq>,
+    /// A rescan's findings, applied once the stream passes the position read after it.
+    rescan: Option<(SourcePosition, RescanReport)>,
     draining: bool,
 }
 
@@ -175,6 +182,9 @@ impl<'c> Session<'c> {
             halts,
             txn_schemas: vec![],
             pending_schemas: vec![],
+            requery: BTreeMap::new(),
+            last_seq: None,
+            rescan: None,
             draining: false,
         }))
     }
@@ -217,6 +227,11 @@ impl<'c> Session<'c> {
     async fn event_loop(&mut self) -> Result<End, WorkerError> {
         let mut tick = tokio::time::interval(self.core.tuning.tick);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut rescan = self
+            .core
+            .settings
+            .rescan_interval
+            .map(|every| tokio::time::interval_at(tokio::time::Instant::now() + every, every));
         loop {
             if self.draining && !self.acc.in_transaction() {
                 self.flush()?;
@@ -248,6 +263,13 @@ impl<'c> Session<'c> {
                     Err(e) => return Ok(End::Source(e)),
                 },
                 _ = tick.tick() => self.due(Instant::now())?,
+                _ = async { rescan.as_mut().expect("guarded").tick().await },
+                    if rescan.is_some() && self.rescan.is_none() =>
+                {
+                    if let Some(end) = self.rescan().await? {
+                        return Ok(end);
+                    }
+                }
             }
         }
     }
@@ -293,17 +315,17 @@ impl<'c> Session<'c> {
     async fn item(&mut self, item: StreamItem) -> Result<Option<End>, WorkerError> {
         let now = Instant::now();
         match item {
-            StreamItem::Begin { xid, .. } => self.acc.begin(xid)?,
+            StreamItem::Begin { xid, .. } => {
+                self.acc.begin(xid)?;
+                self.requery.clear();
+                self.last_seq = None;
+            }
             StreamItem::Change(e) => {
-                loop {
-                    match self.acc.apply(&e, now) {
-                        Err(AccumulatorError::SplitRequired) => self.split()?,
-                        r => break self.absorb(r)?,
-                    }
+                if self.core.settings.re_query {
+                    self.note_unchanged(&e);
                 }
-                if self.acc.due(now) == Some(FlushReason::Split) {
-                    self.split()?;
-                }
+                self.last_seq = Some(e.change_seq);
+                self.apply(&e, now)?;
             }
             StreamItem::Truncate { tables, .. } => loop {
                 match self.acc.truncate(&tables, now) {
@@ -317,19 +339,163 @@ impl<'c> Session<'c> {
             }
             StreamItem::TableHalt { table, reason, .. } => self.halt(table, reason),
             StreamItem::Commit(b) => {
+                if let Some(end) = self.re_query(&b).await? {
+                    return Ok(Some(end));
+                }
                 self.acc.commit(&b, now)?;
                 let at = b.commit_pos;
                 self.pending_schemas
                     .extend(self.txn_schemas.drain(..).map(|s| (at.clone(), s)));
-                self.read();
-                self.due(now)?;
+                return self.boundary(now).await;
             }
             StreamItem::KeepAlive(p) => {
                 self.acc.keepalive(&p, now)?;
-                self.read();
-                self.due(now)?;
+                return self.boundary(now).await;
             }
         }
+        Ok(None)
+    }
+
+    /// Between transactions: what waited for the stream to get here, then the flush policy.
+    async fn boundary(&mut self, now: Instant) -> Result<Option<End>, WorkerError> {
+        self.read();
+        if let Some(end) = self.caught_up().await? {
+            return Ok(Some(end));
+        }
+        self.due(now)?;
+        Ok(None)
+    }
+
+    fn apply(&mut self, e: &CdcEvent, now: Instant) -> Result<(), WorkerError> {
+        loop {
+            match self.acc.apply(e, now) {
+                Err(AccumulatorError::SplitRequired) => self.split()?,
+                r => break self.absorb(r)?,
+            }
+        }
+        if self.acc.due(now) == Some(FlushReason::Split) {
+            self.split()?;
+        }
+        Ok(())
+    }
+
+    /// Notes an UPDATE's key when the source sent some of its values as unchanged.
+    fn note_unchanged(&mut self, e: &CdcEvent) {
+        let Some(after) = &e.after else { return };
+        if e.op != Op::Update || !after.0.iter().any(|(_, v)| *v == ColumnValue::Unchanged) {
+            return;
+        }
+        let Some(key) = self
+            .schemas
+            .get(&e.table)
+            .and_then(|s| identifier_values(s, after))
+        else {
+            return;
+        };
+        let keys = self.requery.entry(e.table.clone()).or_default();
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+
+    /// `toast_strategy: re_query` at the commit: reads the current rows of the noted keys and
+    /// applies them as the transaction's last change (Data-Flow §TOAST). A key whose row is gone
+    /// is left to the delete that follows in the stream.
+    async fn re_query(&mut self, b: &TransactionBoundary) -> Result<Option<End>, WorkerError> {
+        let Some(seq) = self.last_seq else {
+            return Ok(None);
+        };
+        for (table, keys) in std::mem::take(&mut self.requery) {
+            let Some(schema) = self.schemas.get(&table).cloned() else {
+                continue;
+            };
+            match self.core.source.fetch_rows(&schema, &keys).await {
+                Ok(rows) => {
+                    for row in rows {
+                        let e = CdcEvent {
+                            op: Op::Update,
+                            table: table.clone(),
+                            before: None,
+                            after: Some(row),
+                            source_pos: b.commit_pos.clone(),
+                            change_seq: seq,
+                            xid: b.xid,
+                            commit_ts_micros: b.commit_ts_micros,
+                        };
+                        self.apply(&e, Instant::now())?;
+                    }
+                }
+                Err(SourceError::TableHalt { table, reason }) => self.halt(table, reason),
+                Err(e) => return Ok(Some(End::Source(e))),
+            }
+        }
+        Ok(None)
+    }
+
+    /// Channel D: one catalog read of the streamed tables, and the source's position after it. A
+    /// failed round waits for the next.
+    async fn rescan(&mut self) -> Result<Option<End>, WorkerError> {
+        let known: Vec<TableSchema> = self.schemas.values().cloned().collect();
+        let Ok(report) = self.core.source.rescan(&known).await else {
+            return Ok(None);
+        };
+        if report == RescanReport::default() {
+            return Ok(None);
+        }
+        let Ok(after) = self.core.source.current_position().await else {
+            return Ok(None);
+        };
+        self.rescan = Some((after, report));
+        if self.acc.in_transaction() {
+            return Ok(None);
+        }
+        self.caught_up().await
+    }
+
+    /// Applies a rescan's findings once the stream has passed the position read after it (Q-M6a-4):
+    /// every change the stream holds for those tables is in by then. A change the stream applied
+    /// on its own meanwhile is skipped.
+    async fn caught_up(&mut self) -> Result<Option<End>, WorkerError> {
+        let Some((after, _)) = &self.rescan else {
+            return Ok(None);
+        };
+        if !self
+            .acc
+            .frontier()
+            .covers(after)
+            .map_err(AccumulatorError::from)?
+        {
+            return Ok(None);
+        }
+        let (_, report) = self.rescan.take().expect("checked above");
+        // The tables' changes up to here are good: flush them before the halts drop what is
+        // buffered.
+        self.flush()?;
+        for table in report.dropped {
+            if self.schemas.contains_key(&table) {
+                self.halt(table, HaltReason::TableDropped);
+            }
+        }
+        for (table, reason) in report.halted {
+            if self.schemas.contains_key(&table) {
+                self.halt(table, reason);
+            }
+        }
+        for now in report.changed {
+            let table = now.table().clone();
+            let Some(cached) = self.schemas.get(&table) else {
+                continue;
+            };
+            if cached.columns() == now.columns() && cached.identifier() == now.identifier() {
+                continue;
+            }
+            let hint = SchemaHint::Columns(now.columns().to_vec());
+            if let Some(end) = self.schema_signal(table, hint).await? {
+                return Ok(Some(end));
+            }
+        }
+        // Caches the applied schemas without waiting for the tables' next change.
+        self.flush()?;
         Ok(None)
     }
 
@@ -860,6 +1026,99 @@ mod tests {
             "the worker reopens it"
         );
         assert_eq!(w.ids("a"), [1]);
+    }
+
+    #[tokio::test]
+    async fn re_query_reads_the_values_the_stream_left_unchanged() {
+        for (strategy, want) in [("re_query", Some("big")), ("carry_forward", None)] {
+            let w = World::new(&["a"]);
+            w.started(&["a"]).await;
+            w.source.load(&t("a"), vec![row(1, "big")]);
+            let source = format!("\n      toast_strategy: {strategy}");
+            let p = Yaml {
+                source: &source,
+                sink: "flush: { seconds: 0 }",
+                ..Yaml::default()
+            }
+            .build();
+            let (end, _) = session(&w, &p, &["a"], async |status| {
+                let unchanged = Row(vec![
+                    ("id".into(), ColumnValue::Int64(1)),
+                    ("doc".into(), ColumnValue::Unchanged),
+                ]);
+                w.source.commit(FakeTxn::new().update(&t("a"), unchanged));
+                durable(&status, w.source.wal_end()).await;
+            })
+            .await;
+            end.unwrap();
+            assert_eq!(
+                w.text("a", "doc"),
+                [want.map(String::from)],
+                "{strategy}: the sink has no row to keep the value from"
+            );
+        }
+    }
+
+    /// A session over `w` with channel D every few milliseconds.
+    async fn rescanning<F: Future<Output = ()>>(
+        w: &World,
+        p: &data_avalanche_config::Pipeline,
+        drive: impl FnOnce(watch::Receiver<WorkerStatus>) -> F,
+    ) -> WorkerStatus {
+        let (mut core, control, status) = w.core(p, &["a"]);
+        core.settings.rescan_interval = Some(Duration::from_millis(5));
+        let s = Session::open(&mut core).await.unwrap().unwrap();
+        let watching = status.clone();
+        let driver = async move {
+            drive(watching).await;
+            let _ = control.send(Command::Drain).await;
+        };
+        let (end, ()) = tokio::join!(s.run(), driver);
+        end.unwrap();
+        status.borrow().clone()
+    }
+
+    #[tokio::test]
+    async fn a_rescan_evolves_an_idle_tables_change() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        rescanning(&w, &flush_each(), async |_| {
+            w.source.alter(&t("a"), with_note("a"));
+            wait_until("the sink has the column", || {
+                w.sink
+                    .content(&t("a"))
+                    .is_some_and(|c| c.column_by_name("note").is_some())
+            })
+            .await;
+        })
+        .await;
+        let cached = w.docs.table_schema(&t("a")).await.unwrap().unwrap().doc;
+        assert!(cached.column("note").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_table_halts_once_the_stream_has_its_last_changes() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let p = pipeline("", "flush: { seconds: 0 }, buffer_capacity_rows: 1", "");
+        w.sink.hold_commits();
+        let st = rescanning(&w, &p, async |status| {
+            for id in 1..=3 {
+                w.source
+                    .commit(FakeTxn::new().insert(&t("a"), row(id, "x")));
+            }
+            w.source.drop_table(&t("a"));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                status.borrow().halted.is_empty(),
+                "the stream hasn't read the third insert yet"
+            );
+            w.sink.release_commits();
+            wait_until("the table halts", || !status.borrow().halted.is_empty()).await;
+        })
+        .await;
+        assert_eq!(st.halted.get(&t("a")), Some(&HaltReason::TableDropped));
+        assert_eq!(w.ids("a"), [1, 2, 3], "nothing before the drop is lost");
     }
 
     fn with_note(name: &str) -> TableSchema {

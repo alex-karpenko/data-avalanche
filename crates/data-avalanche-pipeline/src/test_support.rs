@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use arrow_array::Int64Array;
+use arrow_array::{Array, Int64Array, StringArray};
 use async_trait::async_trait;
 use bytes::Bytes;
 use data_avalanche_config::{FingerprintKey, Pipeline, load_str};
@@ -357,6 +357,22 @@ impl World {
             tracked: tables.iter().map(|t| TableRef::new("public", *t)).collect(),
         };
         (core, control, status_rx)
+    }
+
+    /// The table's text `column` in the sink, in key order.
+    pub fn text(&self, table: &str, column: &str) -> Vec<Option<String>> {
+        let Some(b) = self.sink.content(&TableRef::new("public", table)) else {
+            return vec![];
+        };
+        let values = b
+            .column_by_name(column)
+            .expect("the column")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("a text column");
+        (0..values.len())
+            .map(|i| values.is_valid(i).then(|| values.value(i).to_owned()))
+            .collect()
     }
 
     /// The table's `id` values in the sink, in key order.
