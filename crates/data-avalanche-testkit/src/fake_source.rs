@@ -605,20 +605,22 @@ fn shape(columns: &[ColumnSchema]) -> Vec<(String, data_avalanche_core::ColumnVa
 fn diff(cached: &TableSchema, now: &TableSchema) -> Vec<SchemaChange> {
     let mut changes = vec![];
     for c in cached.columns() {
-        match now.column(&c.name) {
-            None => changes.push(SchemaChange::DropColumn(c.name.clone())),
-            Some(n) if n.value_type != c.value_type => changes.push(SchemaChange::ChangeType {
+        let Some(n) = now.column(&c.name) else {
+            changes.push(SchemaChange::DropColumn(c.name.clone()));
+            continue;
+        };
+        if n.value_type != c.value_type {
+            changes.push(SchemaChange::ChangeType {
                 column: c.name.clone(),
                 from: c.clone(),
                 to: n.clone(),
                 narrowed: false,
-            }),
-            Some(n) if n.nullable != c.nullable => changes.push(if n.nullable {
-                SchemaChange::DropNotNull(c.name.clone())
-            } else {
-                SchemaChange::SetNotNull(c.name.clone())
-            }),
-            Some(_) => {}
+            });
+        }
+        match (c.nullable, n.nullable) {
+            (true, false) => changes.push(SchemaChange::SetNotNull(c.name.clone())),
+            (false, true) => changes.push(SchemaChange::DropNotNull(c.name.clone())),
+            _ => {}
         }
     }
     for c in now.columns() {

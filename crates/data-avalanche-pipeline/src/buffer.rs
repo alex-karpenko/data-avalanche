@@ -456,12 +456,12 @@ impl TableBuffer {
         Ok(())
     }
 
-    /// A schema change (`Schema_Change…` §8: seal → flush → apply). The committed layer must have
-    /// been flushed ([`AccumulatorError::FlushRequired`] otherwise), unless the change keeps every
-    /// column, in order, with its logical type, and the identifier (an Ignorable change): its rows
-    /// then read the same under the new schema and stay. The open transaction's rows are carried
-    /// over by column name: a new column is NULL, a dropped one goes, a widened one is widened.
-    /// The identifier can't change (the classifier halts that).
+    /// A schema change (`Schema_Change…` §8). The committed layer must have been flushed
+    /// ([`AccumulatorError::FlushRequired`] otherwise), unless the change keeps every column, in
+    /// order, with its logical type, and the identifier (an Ignorable change): its rows then read
+    /// the same under the new schema and stay. The open transaction's rows are carried over by
+    /// column name: a new column is NULL, a dropped one goes, a widened one is widened. The
+    /// identifier can't change (the classifier halts that).
     pub fn set_schema(
         &mut self,
         schema: TableSchema,
@@ -474,7 +474,17 @@ impl TableBuffer {
                 .iter()
                 .zip(self.schema.columns())
                 .all(|(new, old)| new.name == old.name && new.logical == old.logical);
-        if !same_shape {
+        if same_shape {
+            // Hop 2 stores a value in the variant its logical type reads (`hop2_compatible`), so
+            // the committed rows conform to the new columns as they are.
+            debug_assert!(self.committed.values().all(|row| {
+                schema
+                    .columns()
+                    .iter()
+                    .zip(&row.values)
+                    .all(|(c, v)| conform_value(v.clone(), &c.value_type, &c.logical).is_ok())
+            }));
+        } else {
             self.flush_required()?;
         }
         if schema.identifier() != self.schema.identifier() {

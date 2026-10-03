@@ -758,8 +758,9 @@ impl<'c> Session<'c> {
     /// change flushes what is buffered and waits until it is durable, then evolves the sink and
     /// rebuilds. A change that halts the table (Unsafe, any with evolution off, a dropped table, a
     /// failed catalog read) flushes and waits the same way, so the table's committed rows reach
-    /// the sink, then halts it at that flush's checkpoint. In an open transaction the change applies where the stream met it: the
-    /// committed rows flush, and the transaction goes on under the new schema.
+    /// the sink, then halts it at that flush's checkpoint. In an open transaction the change
+    /// applies where the stream met it: the committed rows flush, and the transaction goes on
+    /// under the new schema.
     async fn schema_signal(
         &mut self,
         table: TableRef,
@@ -1275,6 +1276,14 @@ mod tests {
         assert_eq!(cached.source_id(), w.source.schema(&t("a")).source_id());
     }
 
+    /// The table's next evolve fails `Permanent`: an evolve would halt it `SINK_REJECTED`.
+    fn evolve_fails(w: &World) {
+        w.sink
+            .fail(SinkOp::Evolve, Some(&t("a")), 1, || SinkError::Permanent {
+                reason: "evolved".into(),
+            });
+    }
+
     #[tokio::test]
     async fn a_signal_that_changes_nothing_neither_flushes_nor_evolves() {
         let w = World::new(&["a"]);
@@ -1285,13 +1294,16 @@ mod tests {
         let at = lsn_of(&w.source.wal_end()).0 + 0x100;
         crate::test_support::txn(&mut s.acc, 900, at, &[("a", 1, "x")]);
         let submitted = s.submitted.clone();
-        let version = w.sink.version(&t("a"));
+        evolve_fails(&w);
         let cached = s.schemas[&t("a")].clone();
         let hint = SchemaHint::Columns(cached.columns().to_vec());
         assert!(s.schema_signal(t("a"), hint).await.unwrap().is_none());
         assert_eq!(s.submitted, submitted, "no flush");
         assert!(s.queued.is_empty());
-        assert_eq!(w.sink.version(&t("a")), version, "no evolve");
+        assert!(
+            s.schemas.contains_key(&t("a")) && s.halts.is_empty(),
+            "no evolve"
+        );
         assert!(s.pending_schemas.is_empty() && s.txn_schemas.is_empty());
     }
 
@@ -1327,7 +1339,7 @@ mod tests {
         let at = lsn_of(&w.source.wal_end()).0 + 0x100;
         crate::test_support::txn(&mut s.acc, 900, at, &[("a", 1, "x")]);
         let submitted = s.submitted.clone();
-        let version = w.sink.version(&t("a"));
+        evolve_fails(&w);
         let not_null = TableSchema::new(
             t("a"),
             vec![
@@ -1342,7 +1354,10 @@ mod tests {
         assert!(s.schema_signal(t("a"), hint).await.unwrap().is_none());
         assert_eq!(s.submitted, submitted, "no flush");
         assert!(s.queued.is_empty());
-        assert_eq!(w.sink.version(&t("a")), version, "no evolve");
+        assert!(
+            s.schemas.contains_key(&t("a")) && s.halts.is_empty(),
+            "no evolve"
+        );
         assert!(!s.schemas[&t("a")].column("doc").unwrap().nullable);
         s.flush().unwrap();
         assert!(s.until_durable().await.unwrap().is_none());
@@ -1453,6 +1468,62 @@ mod tests {
             *r == HaltReason::EvolutionDisabled
         })
         .await;
+    }
+
+    /// A crash once the rows before an unsafe change are durable, before the halt is recorded:
+    /// the restart replays the change from the halt's `at` and halts the table there again.
+    #[tokio::test]
+    async fn a_crash_between_the_pre_halt_flush_and_the_halt_replays_from_at() {
+        let w = World::new(&["a", "b"]);
+        w.started(&["a", "b"]).await;
+        let p = pipeline("", "flush: { seconds: 3600 }", "");
+        let (mut core, _control, _status) = w.core(&p, &["a", "b"]);
+        core.hooks = Arc::new(crate::test_support::CrashAt(|h| {
+            matches!(h, crate::HookPoint::CheckpointPersisted { .. })
+        }));
+        let s = Session::open(&mut core).await.unwrap().unwrap();
+        w.source.commit(
+            FakeTxn::new()
+                .insert(&t("a"), row(1, "x"))
+                .insert(&t("a"), row(2, "x"))
+                .insert(&t("b"), row(1, "y")),
+        );
+        let before = w.source.wal_end();
+        w.source.alter(&t("a"), int_doc("a"));
+        w.source.commit(
+            FakeTxn::new()
+                .insert(&t("a"), int_row(3))
+                .insert(&t("b"), row(2, "y")),
+        );
+        let end = tokio::time::timeout(Duration::from_secs(5), s.run())
+            .await
+            .expect("the crash ends it");
+        assert!(matches!(end, Err(WorkerError::Crashed(_))), "{end:?}");
+        assert_eq!(checkpoint(&w).await, lsn_of(&before));
+        assert!(w.docs.halts().await.unwrap().tables.is_empty());
+        assert_eq!((w.ids("a"), w.sink.version(&t("a"))), (vec![1, 2], Some(1)));
+
+        let (end, st) = session(&w, &p, &["a", "b"], async |status| {
+            let end = w.source.wal_end();
+            wait_until("it is read", || status.borrow().read.as_ref() == Some(&end)).await;
+        })
+        .await;
+        end.unwrap();
+        assert!(matches!(
+            st.halted.get(&t("a")),
+            Some(HaltReason::UnsafeDdl { .. })
+        ));
+        let halts = w.docs.halts().await.unwrap().tables;
+        assert!(
+            matches!(&halts[..], [h] if h.table == t("a") && h.at == before),
+            "{halts:?}"
+        );
+        assert_eq!(
+            (w.ids("a"), w.sink.version(&t("a"))),
+            (vec![1, 2], Some(1)),
+            "the replay neither loses nor rewrites a row"
+        );
+        assert_eq!(w.ids("b"), [1, 2]);
     }
 
     #[tokio::test]
