@@ -6,6 +6,7 @@
 //! the source, runs the snapshots, hands change sets to the sink and persists the checkpoint.
 
 pub mod accumulator;
+pub mod backoff;
 pub mod batch;
 pub mod buffer;
 #[allow(
@@ -23,8 +24,14 @@ pub mod policy;
 mod settings;
 #[cfg(test)]
 mod test_support;
+#[allow(
+    dead_code,
+    reason = "the worker runs it (Task 11); the allow goes there"
+)]
+mod writer;
 
 pub use accumulator::{Accumulator, Flush};
+pub use backoff::Backoff;
 pub use batch::{Lineage, MAX_BATCH_BYTES};
 pub use buffer::{CollapsedRow, RowKind, TableBuffer};
 pub use error::{AccumulatorError, WorkerError};

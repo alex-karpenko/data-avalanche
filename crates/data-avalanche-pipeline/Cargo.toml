@@ -16,12 +16,16 @@ arrow-schema.workspace = true
 data-avalanche-config.workspace = true
 data-avalanche-core.workspace = true
 data-avalanche-state.workspace = true
+data-avalanche-storage.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "rt"] }
 
 [dev-dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+object_store.workspace = true
 data-avalanche-testkit.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
