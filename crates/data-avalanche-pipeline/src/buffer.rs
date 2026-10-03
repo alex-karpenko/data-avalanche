@@ -37,7 +37,7 @@ pub struct CollapsedRow {
 /// JSON ([`TableSchema::new`]), and decimals are rescaled to the column's scale on the way in, so
 /// equal values have one representation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct Key(Vec<KeyPart>);
+pub(crate) struct Key(Vec<KeyPart>);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum KeyPart {
@@ -66,6 +66,25 @@ fn key_part(v: &ColumnValue) -> Option<KeyPart> {
             return None;
         }
     })
+}
+
+/// The key of `row` in `schema`, compared as the buffer compares keys; `None` when an identifier
+/// value is missing, NULL or doesn't fit its column.
+#[allow(
+    dead_code,
+    reason = "the snapshot runner keys chunk rows with it (Task 10); the allow goes there"
+)]
+pub(crate) fn identity(schema: &TableSchema, row: &Row) -> Option<Key> {
+    schema
+        .identifier()
+        .iter()
+        .map(|name| {
+            let c = schema.column(name)?;
+            let v = conform_value(row.get(name)?.clone(), &c.value_type, &c.logical).ok()?;
+            key_part(&v)
+        })
+        .collect::<Option<_>>()
+        .map(Key)
 }
 
 /// Rough in-memory size of a row, for the flush `bytes` trigger and the transaction buffer ceiling.
@@ -1184,5 +1203,38 @@ mod tests {
         let err = TableBuffer::new(schema(), &["nope".into()]).unwrap_err();
         assert_eq!(err.code(), "SCHEMA_MISMATCH");
         assert_eq!(buffer().delete_columns(), [0, 2]);
+    }
+
+    #[test]
+    fn a_rows_identity_is_its_key_as_the_buffer_compares_it() {
+        let s = TableSchema::new(
+            TableRef::new("public", "n"),
+            vec![
+                ColumnSchema::new(
+                    "k",
+                    V::Numeric {
+                        precision: 6,
+                        scale: 2,
+                    },
+                    "numeric(6,2)",
+                )
+                .not_null(),
+                ColumnSchema::new("v", V::Text, "text"),
+            ],
+            vec!["k".into()],
+        )
+        .unwrap();
+        let key = |d| Row(vec![("k".into(), ColumnValue::Numeric(d))]);
+        assert_eq!(
+            identity(&s, &key(Decimal::new(15, 1))),
+            identity(&s, &key(Decimal::new(150, 2))),
+            "1.5 and 1.50 are one key"
+        );
+        assert!(identity(&s, &key(Decimal::new(15, 1))).is_some());
+        assert_eq!(identity(&s, &Row(vec![("v".into(), text("x"))])), None);
+        assert_eq!(
+            identity(&s, &Row(vec![("k".into(), ColumnValue::Null)])),
+            None
+        );
     }
 }

@@ -19,6 +19,11 @@ pub mod hooks;
 pub mod policy;
 #[allow(
     dead_code,
+    reason = "the snapshot runner uses it (Task 10); the allow goes there"
+)]
+mod reconcile;
+#[allow(
+    dead_code,
     reason = "the worker runs it (Task 11); the allow goes there"
 )]
 mod session;
