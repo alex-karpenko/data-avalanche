@@ -555,6 +555,7 @@ mod tests {
     use data_avalanche_testkit::{FakeTxn, Method};
 
     use super::*;
+    use crate::HookPoint;
     use crate::test_support::{World, Yaml, fast, row, t, wait_until};
 
     fn rows(ids: std::ops::RangeInclusive<i64>) -> Vec<Row> {
@@ -873,5 +874,212 @@ mod tests {
         assert!(state.schema.unwrap().field_with_name("note").is_ok());
         let cached = w.docs.table_schema(&t("a")).await.unwrap().unwrap().doc;
         assert!(cached.column("note").is_some());
+    }
+
+    /// Runs a worker with `deps` until `drive` returns, then drains it.
+    async fn run_with<F: Future<Output = ()>>(
+        p: &Pipeline,
+        deps: WorkerDeps,
+        drive: impl FnOnce(WorkerHandle) -> F,
+    ) -> Result<Exit, WorkerError> {
+        let (worker, handle) = PipelineWorker::new(p, deps, fast());
+        let control = handle.control.clone();
+        let driver = async move {
+            drive(handle).await;
+            let _ = control.send(Command::Drain).await;
+        };
+        let (end, ()) = tokio::join!(worker.run(), driver);
+        end
+    }
+
+    fn deps(w: &World) -> WorkerDeps {
+        WorkerDeps::new(
+            Arc::new(w.source.clone()),
+            Arc::new(w.sink.clone()),
+            w.docs.clone(),
+        )
+    }
+
+    /// The source's rows of `table`, as the sink's `id`s and `doc`s.
+    fn source_rows(w: &World, table: &str) -> (Vec<i64>, Vec<Option<String>>) {
+        let rows = w.source.rows(&t(table));
+        let ids = rows
+            .iter()
+            .map(|r| match r.get("id") {
+                Some(data_avalanche_core::ColumnValue::Int64(i)) => *i,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        let docs = rows
+            .iter()
+            .map(|r| match r.get("doc") {
+                Some(data_avalanche_core::ColumnValue::Text(d)) => Some(d.clone()),
+                _ => None,
+            })
+            .collect();
+        (ids, docs)
+    }
+
+    /// A crash at each point leaves state a restart finishes from: the sink ends equal to the
+    /// source.
+    #[tokio::test]
+    async fn a_restart_after_a_crash_at_any_point_converges() {
+        type At = fn(&HookPoint) -> bool;
+        let points: [(&str, At, usize); 4] = [
+            (
+                "after a commit",
+                |p| matches!(p, HookPoint::SinkCommitted { .. }),
+                2,
+            ),
+            (
+                "after a checkpoint",
+                |p| matches!(p, HookPoint::CheckpointPersisted { .. }),
+                2,
+            ),
+            (
+                "after a chunk",
+                |p| matches!(p, HookPoint::ChunkEmitted { .. }),
+                2,
+            ),
+            (
+                "after the last chunk",
+                |p| matches!(p, HookPoint::ChunkEmitted { .. }),
+                4,
+            ),
+        ];
+        for (name, when, n) in points {
+            let w = World::new(&["a"]);
+            w.source.load(&t("a"), rows(1..=6));
+            let p = mode("mode: initial, chunk_size: 2");
+            let mut crashing = deps(&w);
+            crashing.hooks = Arc::new(crate::test_support::CrashAfter::new(when, n));
+            let end = run_with(&p, crashing, async |h| {
+                w.source.commit(
+                    FakeTxn::new()
+                        .update(&t("a"), row(2, "streamed"))
+                        .insert(&t("a"), row(8, "streamed")),
+                );
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    let mut st = h.status.clone();
+                    let _ = st.wait_for(|_| false).await;
+                })
+                .await;
+            })
+            .await;
+            assert!(
+                matches!(end, Err(WorkerError::Crashed(_))),
+                "{name}: {end:?}"
+            );
+            w.source.commit(FakeTxn::new().delete(
+                &t("a"),
+                Row(vec![(
+                    "id".into(),
+                    data_avalanche_core::ColumnValue::Int64(1),
+                )]),
+            ));
+            let end = run_with(&p, deps(&w), async |h| streamed(&h.status, &w).await).await;
+            assert_eq!(end.unwrap(), Exit::Drained, "{name}");
+            let (ids, docs) = source_rows(&w, "a");
+            assert_eq!(w.ids("a"), ids, "{name}");
+            assert_eq!(w.text("a", "doc"), docs, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_newer_owner_stops_the_worker() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let end = run_with(&mode("mode: never"), deps(&w), async |h| {
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+            streamed(&h.status, &w).await;
+            w.sink.take_over(&t("a"), 9);
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(2, "x")));
+            let mut st = h.status.clone();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), st.wait_for(|_| false))
+                .await;
+        })
+        .await;
+        assert!(
+            matches!(
+                end,
+                Err(WorkerError::Fenced {
+                    current_epoch: 9,
+                    ..
+                })
+            ),
+            "{end:?}"
+        );
+        assert_eq!(w.ids("a"), [1]);
+    }
+
+    #[tokio::test]
+    async fn a_lost_lease_stops_the_worker_before_its_next_commit() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let guard = Arc::new(crate::test_support::Switch::default());
+        let mut d = deps(&w);
+        d.guard = guard.clone();
+        let end = run_with(&mode("mode: never"), d, async |h| {
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+            streamed(&h.status, &w).await;
+            guard.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(2, "x")));
+            let mut st = h.status.clone();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), st.wait_for(|_| false))
+                .await;
+        })
+        .await;
+        assert!(matches!(end, Err(WorkerError::LeaseLost)), "{end:?}");
+        assert_eq!(w.ids("a"), [1]);
+    }
+
+    #[tokio::test]
+    async fn a_flush_command_flushes_now() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let p = Yaml {
+            sink: "flush: { seconds: 3600 }",
+            ..Yaml::default()
+        }
+        .build();
+        let end = run_with(&p, deps(&w), async |h| {
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+            let end = w.source.wal_end();
+            wait_until("it is read", || {
+                h.status.borrow().read.as_ref() == Some(&end)
+            })
+            .await;
+            assert!(w.ids("a").is_empty());
+            h.control.send(Command::Flush).await.unwrap();
+            streamed(&h.status, &w).await;
+            assert_eq!(w.ids("a"), [1], "flushed before the drain");
+        })
+        .await;
+        end.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failing_sink_shows_degraded_until_it_recovers() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.sink
+            .fail(data_avalanche_testkit::SinkOp::Commit, None, 3, || {
+                SinkError::Transient {
+                    reason: "throttled".into(),
+                }
+            });
+        let seen = std::sync::Mutex::new(false);
+        let end = run_with(&mode("mode: never"), deps(&w), async |h| {
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+            let mut st = h.status.clone();
+            let _ = st.wait_for(|s| s.degraded.is_some()).await;
+            *seen.lock().unwrap() = true;
+            streamed(&h.status, &w).await;
+            assert_eq!(h.status.borrow().degraded, None);
+        })
+        .await;
+        end.unwrap();
+        assert!(*seen.lock().unwrap());
+        assert_eq!(w.ids("a"), [1]);
     }
 }

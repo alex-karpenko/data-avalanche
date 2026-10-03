@@ -1,7 +1,7 @@
 //! Fixtures for the crate's unit tests.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -237,6 +237,34 @@ impl VersionedStore for FlakyStore {
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
         self.inner.list(prefix).await
+    }
+}
+
+/// Crashes at the `n`th hook point `when` matches (1 = the first).
+#[derive(Debug)]
+pub(crate) struct CrashAfter {
+    pub when: fn(&HookPoint) -> bool,
+    pub n: usize,
+    pub seen: AtomicUsize,
+}
+
+impl CrashAfter {
+    pub fn new(when: fn(&HookPoint) -> bool, n: usize) -> Self {
+        Self {
+            when,
+            n,
+            seen: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl Hooks for CrashAfter {
+    fn at(&self, point: &HookPoint) -> HookAction {
+        if (self.when)(point) && self.seen.fetch_add(1, Ordering::SeqCst) + 1 == self.n {
+            HookAction::Crash
+        } else {
+            HookAction::Continue
+        }
     }
 }
 
