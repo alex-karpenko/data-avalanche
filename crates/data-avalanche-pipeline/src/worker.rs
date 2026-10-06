@@ -102,6 +102,7 @@ impl PipelineWorker {
             snapshot_started: BTreeMap::new(),
             drifted: BTreeSet::new(),
             rescan_failing: Streak::default(),
+            requery_failing: BTreeMap::new(),
         };
         (Self { core }, WorkerHandle { control, status })
     }

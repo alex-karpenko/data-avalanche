@@ -193,6 +193,7 @@ struct Db {
     acknowledged: Vec<SourcePosition>,
     opened: Vec<SourcePosition>,
     reads: BTreeMap<TableRef, usize>,
+    fetches: BTreeMap<TableRef, usize>,
     prepares: Vec<Option<SourcePosition>>,
 }
 
@@ -234,6 +235,7 @@ impl FakeSource {
             acknowledged: vec![],
             opened: vec![],
             reads: BTreeMap::new(),
+            fetches: BTreeMap::new(),
             prepares: vec![],
         };
         for t in tables {
@@ -410,6 +412,11 @@ impl FakeSource {
     /// Chunk reads of `table` so far.
     pub fn reads(&self, table: &TableRef) -> usize {
         self.db().reads.get(table).copied().unwrap_or(0)
+    }
+
+    /// `fetch_rows` calls for `table` so far, failed ones included.
+    pub fn fetches(&self, table: &TableRef) -> usize {
+        self.db().fetches.get(table).copied().unwrap_or(0)
     }
 
     /// The slot's confirmed position; `None` without a slot.
@@ -621,24 +628,40 @@ fn shape(columns: &[ColumnSchema]) -> Vec<(String, data_avalanche_core::ColumnVa
         .collect()
 }
 
-/// The catalog's schema of the columns the stream carries (`hint`), in its order; a column the
-/// catalog dropped since keeps its cached form.
-fn scoped(cached: &TableSchema, hint: &[ColumnSchema], now: &TableSchema) -> TableSchema {
-    let columns = hint
-        .iter()
-        .map(|h| {
-            now.column(&h.name)
-                .or_else(|| cached.column(&h.name))
-                .unwrap_or(h)
-                .clone()
-        })
-        .collect();
-    let scoped = TableSchema::new(now.table().clone(), columns, now.identifier().to_vec())
-        .expect("the hint carries the identifier");
-    match now.source_id() {
+/// The columns the stream carries (`hint`), in its order, as PostgreSQL's `scope` reads them: the
+/// stream's types, and the nullability and ordinal of the catalog's column of that name (or the
+/// cached one, for a column the catalog dropped since). A column known to neither is a guess the
+/// table halts on.
+fn scoped(
+    cached: &TableSchema,
+    hint: &[ColumnSchema],
+    now: &TableSchema,
+) -> Result<TableSchema, SourceError> {
+    let table = now.table().clone();
+    let mut columns = Vec::with_capacity(hint.len());
+    for h in hint {
+        let Some(known) = now.column(&h.name).or_else(|| cached.column(&h.name)) else {
+            return Err(SourceError::TableHalt {
+                table,
+                reason: HaltReason::SchemaMismatch {
+                    column: h.name.clone(),
+                    detail: "the stream carries a column the catalog doesn't have; re-snapshot"
+                        .into(),
+                },
+            });
+        };
+        columns.push(ColumnSchema {
+            nullable: known.nullable,
+            source_ordinal: known.source_ordinal,
+            ..h.clone()
+        });
+    }
+    let scoped = TableSchema::new(table.clone(), columns, now.identifier().to_vec())
+        .map_err(|reason| SourceError::Permanent(format!("{table}: {reason}")))?;
+    Ok(match now.source_id() {
         Some(id) => scoped.with_source_id(id),
         None => scoped,
-    }
+    })
 }
 
 fn diff(cached: &TableSchema, now: &TableSchema) -> Vec<SchemaChange> {
@@ -832,6 +855,7 @@ impl SourceConnector for FakeSource {
     }
 
     async fn fetch_rows(&self, table: &TableSchema, keys: &[Row]) -> Result<Vec<Row>, SourceError> {
+        *self.db().fetches.entry(table.table().clone()).or_default() += 1;
         self.take_fault(Method::FetchRows)?;
         let visible = self.db().visible(table.table());
         Ok(keys
@@ -876,7 +900,7 @@ impl SourceConnector for FakeSource {
             ),
             Some(now) => {
                 let now = match hint {
-                    SchemaHint::Columns(columns) => scoped(cached, columns, now),
+                    SchemaHint::Columns(columns) => scoped(cached, columns, now)?,
                     SchemaHint::Ddl(_) => now.clone(),
                 };
                 (
@@ -1075,6 +1099,64 @@ mod tests {
             out.push(s.next().await.unwrap());
         }
         out
+    }
+
+    /// A `Columns` hint behind the catalog, as PostgreSQL's `scope` reads it: the stream's types
+    /// and columns, the catalog's nullability; a column known to neither halts the table.
+    #[tokio::test]
+    async fn augment_reads_a_columns_hint_as_postgresql_does() {
+        let src = FakeSource::new(vec![schema()]);
+        let cached = src.schema(&t());
+        let ahead = TableSchema::new(
+            t(),
+            vec![
+                ColumnSchema::new("id", V::Int64, "bigint").not_null(),
+                ColumnSchema::new("v", V::Text, "text").not_null(),
+                ColumnSchema::new("w", V::Text, "text"),
+            ],
+            vec!["id".into()],
+        )
+        .unwrap();
+        src.alter(&t(), ahead);
+        let hint = vec![
+            ColumnSchema::new("id", V::Int64, "bigint"),
+            ColumnSchema::new("v", V::Text, "character varying(9)"),
+        ];
+        let (delta, now) = src
+            .augment(&cached, &SchemaHint::Columns(hint))
+            .await
+            .unwrap();
+        let now = now.unwrap();
+        let got: Vec<(&str, &str, bool)> = now
+            .columns()
+            .iter()
+            .map(|c| (c.name.as_str(), c.source_type.as_str(), c.nullable))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("id", "bigint", false),
+                ("v", "character varying(9)", false)
+            ],
+            "not `w`, the stream's type, the catalog's nullability"
+        );
+        assert_eq!(now.source_id(), cached.source_id());
+        assert_eq!(delta.changes, [SchemaChange::SetNotNull("v".into())]);
+        let unknown = vec![
+            ColumnSchema::new("id", V::Int64, "bigint"),
+            ColumnSchema::new("q", V::Text, "text"),
+        ];
+        match src.augment(&cached, &SchemaHint::Columns(unknown)).await {
+            Err(SourceError::TableHalt { reason, .. }) => {
+                assert_eq!(reason.code(), "SCHEMA_MISMATCH")
+            }
+            other => panic!("{other:?}"),
+        }
+        let keyless = vec![ColumnSchema::new("v", V::Text, "text")];
+        assert!(matches!(
+            src.augment(&cached, &SchemaHint::Columns(keyless)).await,
+            Err(SourceError::Permanent(_))
+        ));
     }
 
     #[tokio::test]

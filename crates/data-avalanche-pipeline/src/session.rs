@@ -58,6 +58,9 @@ pub(crate) struct Core {
     pub drifted: BTreeSet<TableRef>,
     /// Channel D's failing rounds. It outlives a session: a reconnect doesn't start a streak.
     pub rescan_failing: Streak,
+    /// `toast_strategy: re_query`: the tables whose fetch is failing. Like `rescan_failing` it
+    /// outlives a session, so the replay after a reconnect doesn't warn or back off again.
+    pub requery_failing: BTreeMap<TableRef, Streak>,
 }
 
 impl Core {
@@ -499,15 +502,21 @@ impl<'c> Session<'c> {
     /// applies them as the transaction's last change (Data-Flow §TOAST). A key whose row is gone
     /// is left to the delete that follows in the stream. A failed read is tried
     /// `augment_attempts` times (the cached schema may name a column dropped since); then the
-    /// values stay masked and the sink keeps the ones it has, as with `carry_forward`.
+    /// values stay masked, as with `carry_forward`, and the table's failure streak begins: while
+    /// it lasts, a commit tries the read once, with no backoff, and warns nothing more.
     async fn re_query(&mut self, b: &TransactionBoundary) -> Result<Option<End>, WorkerError> {
         let Some(seq) = self.last_seq else {
             return Ok(None);
         };
-        let attempts = self.core.tuning.augment_attempts.max(1);
         for (table, keys) in std::mem::take(&mut self.requery) {
             let Some(schema) = self.schemas.get(&table).cloned() else {
                 continue;
+            };
+            let failing = self.core.requery_failing.get(&table);
+            let attempts = if failing.is_some_and(|streak| streak.failures() > 0) {
+                1
+            } else {
+                self.core.tuning.augment_attempts.max(1)
             };
             let mut attempt = 0;
             let fetched = loop {
@@ -523,6 +532,7 @@ impl<'c> Session<'c> {
             };
             match fetched {
                 Ok(rows) => {
+                    self.core.requery_failing.remove(&table);
                     for row in rows {
                         let e = CdcEvent {
                             op: Op::Update,
@@ -540,10 +550,12 @@ impl<'c> Session<'c> {
                 Err(SourceError::TableHalt { table, reason }) => self.halt(table, reason),
                 Err(e @ SourceError::Permanent(_)) => return Ok(Some(End::Source(e))),
                 Err(e) => {
-                    let warning = format!(
-                        "table {table}: re_query couldn't read the current rows ({e}) after {attempts} attempts; the unchanged values stay masked and the sink keeps its own"
-                    );
-                    self.core.update(|st| st.warnings.push(warning));
+                    let streak = self.core.requery_failing.entry(table.clone()).or_default();
+                    streak.failed(&self.core.status, || {
+                        format!(
+                            "table {table}: re_query couldn't read the current rows ({e}) after {attempts} attempts; the unchanged values stay masked: the sink keeps the values it holds (a row it doesn't hold, or a changed key, gets NULL)"
+                        )
+                    });
                 }
             }
         }
@@ -607,7 +619,9 @@ impl<'c> Session<'c> {
     /// Applies a rescan's findings once the stream has passed the position read after it (Q-M6a-4):
     /// every change the stream holds for those tables is in by then. A table whose cached schema
     /// moved since the rescan is skipped: the stream applied a change on its own meanwhile, and the
-    /// finding may be older than it.
+    /// finding may be older than it. Any other table is read again, and its finding applies only
+    /// if it still holds: the catalog may have moved since, or the cache moved and came back. A
+    /// skipped table is found again by the next round.
     async fn caught_up(&mut self) -> Result<Option<End>, WorkerError> {
         let Some((after, ..)) = &self.rescan else {
             return Ok(None);
@@ -636,13 +650,24 @@ impl<'c> Session<'c> {
         }
         for now in report.changed {
             let table = now.table().clone();
-            let Some(cached) = self.schemas.get(&table) else {
+            let Some(cached) = self.schemas.get(&table).cloned() else {
                 continue;
             };
-            if at_rescan.get(&table) != Some(cached)
+            if at_rescan.get(&table) != Some(&cached)
                 || (cached.columns() == now.columns() && cached.identifier() == now.identifier())
             {
                 continue;
+            }
+            match self.core.source.rescan(std::slice::from_ref(&cached)).await {
+                Ok(fresh)
+                    if fresh.changed.as_slice() == std::slice::from_ref(&now)
+                        && fresh.dropped.is_empty()
+                        && fresh.halted.is_empty() => {}
+                Ok(_) => continue,
+                Err(e) => {
+                    self.rescan_failed(&e);
+                    continue;
+                }
             }
             let hint = SchemaHint::Columns(now.columns().to_vec());
             if let Some(end) = self.schema_signal(table, hint).await? {
@@ -1205,36 +1230,59 @@ mod tests {
         }
     }
 
+    /// `public.<name>`: `id`, `doc` and `v text`, which an UPDATE changes while `doc` stays
+    /// unchanged TOAST.
+    fn with_v(name: &str) -> TableSchema {
+        let mut columns = crate::test_support::schema(name).columns().to_vec();
+        columns.push(ColumnSchema::new("v", V::Text, "text"));
+        TableSchema::new(t(name), columns, vec!["id".into()]).unwrap()
+    }
+
+    fn v_row(id: i64, doc: &str, v: &str) -> Row {
+        let mut r = row(id, doc);
+        r.0.push(("v".into(), ColumnValue::Text(v.into())));
+        r
+    }
+
+    /// An UPDATE of `v` that leaves `doc` unchanged.
+    fn toasted(id: i64, v: &str) -> Row {
+        Row(vec![
+            ("id".into(), ColumnValue::Int64(id)),
+            ("doc".into(), ColumnValue::Unchanged),
+            ("v".into(), ColumnValue::Text(v.into())),
+        ])
+    }
+
+    fn re_querying() -> data_avalanche_config::Pipeline {
+        Yaml {
+            source: "\n      toast_strategy: re_query",
+            sink: "flush: { seconds: 0 }",
+            ..Yaml::default()
+        }
+        .build()
+    }
+
     /// `toast_strategy: re_query` with the fetch failing transiently `failures` times: the sink
-    /// has `old`, the source `new`. Three attempts read it; after them the value stays masked and
-    /// the sink keeps `old`, with a warning, and the session goes on.
+    /// has `doc` `old`, the source `new`. Three attempts read it. After them the UPDATE commits
+    /// masked: `v` lands, `doc` keeps `old`, a warning names the table, and nothing halts.
     #[tokio::test]
     async fn re_query_retries_a_failed_fetch_then_keeps_the_value_masked() {
         for (failures, want) in [(2, "new"), (3, "old")] {
-            let w = World::new(&["a"]);
+            let w = World::with(vec![with_v("a")]);
             w.started(&["a"]).await;
-            let p = Yaml {
-                source: "\n      toast_strategy: re_query",
-                sink: "flush: { seconds: 0 }",
-                ..Yaml::default()
-            }
-            .build();
-            let (end, st) = session(&w, &p, &["a"], async |status| {
+            let (end, st) = session(&w, &re_querying(), &["a"], async |status| {
                 w.source
-                    .commit(FakeTxn::new().insert(&t("a"), row(1, "old")));
+                    .commit(FakeTxn::new().insert(&t("a"), v_row(1, "old", "0")));
                 durable(&status, w.source.wal_end()).await;
-                w.source.load(&t("a"), vec![row(1, "new")]);
+                w.source.load(&t("a"), vec![v_row(1, "new", "0")]);
                 for _ in 0..failures {
                     w.source.fail(
                         Method::FetchRows,
                         SourceError::Transient("column doc is gone".into()),
                     );
                 }
-                let unchanged = Row(vec![
-                    ("id".into(), ColumnValue::Int64(1)),
-                    ("doc".into(), ColumnValue::Unchanged),
-                ]);
-                w.source.commit(FakeTxn::new().update(&t("a"), unchanged));
+                w.source
+                    .commit(FakeTxn::new().update(&t("a"), toasted(1, "1")));
                 durable(&status, w.source.wal_end()).await;
             })
             .await;
@@ -1242,10 +1290,11 @@ mod tests {
                 matches!(end.unwrap(), End::Exit(Exit::Drained)),
                 "{failures} failures: the session goes on"
             );
+            assert!(st.halted.is_empty(), "{failures} failures: {:?}", st.halted);
             assert_eq!(
-                w.text("a", "doc"),
-                [Some(want.to_owned())],
-                "{failures} failures"
+                (w.text("a", "doc"), w.text("a", "v")),
+                (vec![Some(want.to_owned())], vec![Some("1".to_owned())]),
+                "{failures} failures: the UPDATE commits"
             );
             let warned: Vec<&String> = st
                 .warnings
@@ -1259,6 +1308,59 @@ mod tests {
                 st.warnings
             );
         }
+    }
+
+    /// A table whose re_query fetch keeps failing: the streak's first commit tries three times
+    /// and warns; the next tries once, with no backoff, and warns nothing more. A fetch that
+    /// succeeds ends the streak: the next failure tries three times and warns again.
+    #[tokio::test]
+    async fn a_failing_re_query_fetch_warns_once_per_streak_and_tries_once_while_failing() {
+        let w = World::with(vec![with_v("a")]);
+        w.started(&["a"]).await;
+        let (end, st) = session(&w, &re_querying(), &["a"], async |status| {
+            w.source
+                .commit(FakeTxn::new().insert(&t("a"), v_row(1, "old", "0")));
+            durable(&status, w.source.wal_end()).await;
+            w.source.load(&t("a"), vec![v_row(1, "new", "0")]);
+            // Commits an UPDATE of `v` while the next `failures` fetches fail; returns the
+            // fetches it took.
+            let update = async |v: &str, failures: usize| {
+                let before = w.source.fetches(&t("a"));
+                for _ in 0..failures {
+                    w.source.fail(
+                        Method::FetchRows,
+                        SourceError::Transient("column doc is gone".into()),
+                    );
+                }
+                w.source
+                    .commit(FakeTxn::new().update(&t("a"), toasted(1, v)));
+                durable(&status, w.source.wal_end()).await;
+                w.source.fetches(&t("a")) - before
+            };
+            assert_eq!(update("1", 3).await, 3, "a streak begins: three attempts");
+            assert_eq!(update("2", 1).await, 1, "while it fails: one attempt");
+            assert_eq!(status.borrow().warnings.len(), 1, "one warning per streak");
+            assert_eq!(w.text("a", "doc"), [Some("old".to_owned())], "masked");
+            assert_eq!(update("3", 0).await, 1);
+            assert_eq!(
+                w.text("a", "doc"),
+                [Some("new".to_owned())],
+                "the read succeeds"
+            );
+            assert_eq!(
+                update("4", 3).await,
+                3,
+                "a new streak: three attempts again"
+            );
+        })
+        .await;
+        end.unwrap();
+        assert!(st.halted.is_empty(), "{:?}", st.halted);
+        assert_eq!(st.warnings.len(), 2, "{:?}", st.warnings);
+        assert_eq!(
+            (w.text("a", "doc"), w.text("a", "v")),
+            (vec![Some("new".to_owned())], vec![Some("4".to_owned())])
+        );
     }
 
     /// A session over `w` with channel D every few milliseconds.
@@ -1369,16 +1471,18 @@ mod tests {
         TableSchema::new(t(name), columns, vec!["id".into()]).unwrap()
     }
 
-    /// Channel D (Q-M6a-4): a rescan finds `a` with `note`. Before the stream passes the position
-    /// read after it, the stream applies a newer shape, `note` and `extra`. The catch-up skips
-    /// `a`: its finding is older than the cache, and would drop `extra`.
+    /// Channel D (Q-M6a-4): a rescan finds `a` and the idle `b` with `note`. Before the stream
+    /// passes the position read after it, the stream applies a newer shape of `a`, `note` and
+    /// `extra`. The catch-up skips `a`: its finding is older than the cache, and would drop
+    /// `extra`. It applies `b`'s.
     #[tokio::test]
     async fn a_catch_up_skips_a_table_whose_cache_moved_since_the_rescan() {
-        let w = World::new(&["a"]);
-        w.started(&["a"]).await;
-        let (mut core, control, status) = w.core(&flush_each(), &["a"]);
+        let w = World::new(&["a", "b"]);
+        w.started(&["a", "b"]).await;
+        let (mut core, control, status) = w.core(&flush_each(), &["a", "b"]);
         let mut s = Session::open(&mut core).await.unwrap().unwrap();
         w.source.alter(&t("a"), with_note("a"));
+        w.source.alter(&t("b"), with_note("b"));
         w.source.after_next_rescan(|src| {
             src.alter(&t("a"), with_extra("a"));
             let mut r = noted(1);
@@ -1398,10 +1502,96 @@ mod tests {
         let cached = w.docs.table_schema(&t("a")).await.unwrap().unwrap().doc;
         assert_eq!(cached, w.source.schema(&t("a")), "no column dropped");
         assert_eq!(w.ids("a"), [1]);
+        let cached = w.docs.table_schema(&t("b")).await.unwrap().unwrap().doc;
+        assert_eq!(cached, w.source.schema(&t("b")), "the catch-up ran");
+    }
+
+    /// `public.<name>`: `id`, `doc` and `extra text`.
+    fn extra_only(name: &str) -> TableSchema {
+        let mut columns = crate::test_support::schema(name).columns().to_vec();
+        columns.push(ColumnSchema::new("extra", V::Text, "text"));
+        TableSchema::new(t(name), columns, vec!["id".into()]).unwrap()
+    }
+
+    /// Reads the stream into `s` until its frontier is `to`.
+    async fn pump(s: &mut Session<'_>, to: &SourcePosition) {
+        while s.acc.frontier() != to {
+            let item = s.stream.next().await.unwrap();
+            assert!(s.item(item).await.unwrap().is_none());
+        }
+    }
+
+    /// Asserts that nothing halted and `a`'s schema is the catalog's.
+    fn current(s: &Session<'_>, w: &World) {
+        let st = s.core.status.borrow().clone();
+        assert!(st.halted.is_empty(), "{st:?}");
+        assert_eq!(s.schemas[&t("a")], w.source.schema(&t("a")));
+    }
+
+    /// Channel D, change and revert (ABA): a rescan finds `a` with `note`. Before the catch-up
+    /// the stream moves the cache to `note` and back (a DROP COLUMN), and the catalog moves on to
+    /// `note` and `extra`. The cache equals its copy from the rescan, but the finding is stale:
+    /// the catch-up reads `a` again and skips it, and the next round applies the current shape.
+    #[tokio::test]
+    async fn a_catch_up_skips_a_finding_the_cache_moved_away_from_and_back() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let (mut core, _control, _status) = w.core(&flush_each(), &["a"]);
+        let mut s = Session::open(&mut core).await.unwrap().unwrap();
+        let base = s.schemas[&t("a")].clone();
+        w.source.alter(&t("a"), with_note("a"));
+        w.source.after_next_rescan(|src| {
+            src.commit(FakeTxn::new().insert(&t("a"), noted(1)));
+            src.alter(&t("a"), crate::test_support::schema("a"));
+            src.commit(FakeTxn::new().insert(&t("a"), row(2, "x")));
+            src.alter(&t("a"), with_extra("a"));
+        });
+        assert!(s.rescan().await.unwrap().is_none());
+        pump(&mut s, &w.source.wal_end()).await;
+        assert!(s.rescan.is_none(), "the catch-up ran");
+        assert_eq!(
+            s.schemas[&t("a")],
+            base,
+            "the cache came back, and nothing applied"
+        );
+        assert!(s.core.status.borrow().halted.is_empty());
+        assert!(s.rescan().await.unwrap().is_none());
+        current(&s, &w);
+    }
+
+    /// Channel D, the catalog moves after the rescan: a rescan finds `a` with `note` (an ADD
+    /// COLUMN); before the catch-up `note` is dropped again and `extra` added, with nothing
+    /// streamed. The finding is stale: the catch-up reads `a` again and skips it, and the next
+    /// round applies the current shape.
+    #[tokio::test]
+    async fn a_catch_up_skips_a_finding_the_catalog_moved_on_from() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let (mut core, _control, _status) = w.core(&flush_each(), &["a"]);
+        let mut s = Session::open(&mut core).await.unwrap().unwrap();
+        let base = s.schemas[&t("a")].clone();
+        w.source.alter(&t("a"), with_note("a"));
+        w.source
+            .after_next_rescan(|src| src.alter(&t("a"), extra_only("a")));
+        assert!(s.rescan().await.unwrap().is_none());
+        assert!(
+            s.rescan.is_none(),
+            "the stream is at the position: the catch-up ran"
+        );
+        assert!(
+            s.core.status.borrow().halted.is_empty(),
+            "{:?}",
+            s.core.status.borrow().halted
+        );
+        assert_eq!(s.schemas[&t("a")], base, "nothing applied");
+        assert!(s.rescan().await.unwrap().is_none());
+        current(&s, &w);
+        assert!(s.core.status.borrow().warnings.is_empty());
     }
 
     /// A failed rescan round warns once per streak: the rescan failing twice warns once; a round
     /// that succeeds ends the streak, and the position read after a rescan failing warns again.
+    /// A full round (a finding, its position, its catch-up) ends that streak too.
     #[tokio::test]
     async fn a_failing_rescan_warns_once_per_streak() {
         let w = World::new(&["a"]);
@@ -1434,6 +1624,17 @@ mod tests {
         let second = warnings(&s);
         assert_eq!(second.len(), 2, "a new streak: {second:?}");
         assert!(second[1].contains("position unread"), "{second:?}");
+        assert!(s.rescan().await.unwrap().is_none());
+        assert!(s.rescan.is_none() && s.schemas[&t("a")].column("note").is_some());
+        assert_eq!(warnings(&s), second, "a full round succeeds");
+        w.source.fail(
+            Method::Rescan,
+            SourceError::Transient("catalog busy again".into()),
+        );
+        assert!(s.rescan().await.unwrap().is_none());
+        let third = warnings(&s);
+        assert_eq!(third.len(), 3, "it ended the streak: {third:?}");
+        assert!(third[2].contains("catalog busy again"), "{third:?}");
     }
 
     fn noted(id: i64) -> Row {

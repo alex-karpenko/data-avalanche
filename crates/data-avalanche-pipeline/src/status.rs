@@ -69,7 +69,7 @@ pub struct WorkerStatus {
 /// and nothing more is added until a success ends the streak.
 #[derive(Debug, Default)]
 pub(crate) struct Streak {
-    failing: bool,
+    failures: u32,
 }
 
 impl Streak {
@@ -78,14 +78,20 @@ impl Streak {
         status: &watch::Sender<WorkerStatus>,
         warning: impl FnOnce() -> String,
     ) {
-        if !std::mem::replace(&mut self.failing, true) {
+        self.failures = self.failures.saturating_add(1);
+        if self.failures == 1 {
             let warning = warning();
             status.send_modify(|st| st.warnings.push(warning));
         }
     }
 
     pub fn succeeded(&mut self) {
-        self.failing = false;
+        self.failures = 0;
+    }
+
+    /// The streak's failures so far; 0 when it isn't failing.
+    pub fn failures(&self) -> u32 {
+        self.failures
     }
 }
 

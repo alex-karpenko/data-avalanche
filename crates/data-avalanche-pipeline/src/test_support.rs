@@ -405,6 +405,7 @@ impl World {
             snapshot_started: BTreeMap::new(),
             drifted: BTreeSet::new(),
             rescan_failing: Streak::default(),
+            requery_failing: BTreeMap::new(),
         };
         (core, control, status_rx)
     }
