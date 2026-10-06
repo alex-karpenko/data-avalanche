@@ -71,8 +71,8 @@ pub(super) struct Snapshots {
     recheck: Option<(Instant, u32)>,
     /// Snapshot documents for the next flush, the latest per table.
     docs: BTreeMap<TableRef, TableSnapshotDoc>,
-    /// Completions handed to the writer, with the checkpoint of their flush.
-    completing: Vec<(SourcePosition, TableRef)>,
+    /// Completions handed to the writer, with the number of the job that carries them.
+    completing: Vec<(u64, TableRef)>,
     /// A read failed transiently: the table may have changed under the snapshot with nothing in
     /// the stream to say so (an idle table), so the session rescans (M5 Task 10 review).
     rescan: bool,
@@ -236,12 +236,12 @@ impl Snapshots {
         }
     }
 
-    /// The documents for the next flush, whose checkpoint is `checkpoint`.
-    pub(super) fn take_docs(&mut self, checkpoint: &SourcePosition) -> Vec<TableSnapshotDoc> {
+    /// The documents for the next flush, carried by job `job`.
+    pub(super) fn take_docs(&mut self, job: u64) -> Vec<TableSnapshotDoc> {
         let docs: Vec<TableSnapshotDoc> = std::mem::take(&mut self.docs).into_values().collect();
         for d in &docs {
             if d.status == SnapshotStatus::Completed {
-                self.completing.push((checkpoint.clone(), d.table.clone()));
+                self.completing.push((job, d.table.clone()));
             }
         }
         docs
@@ -251,11 +251,12 @@ impl Snapshots {
         !self.docs.is_empty()
     }
 
-    /// The tables whose completion is durable at `checkpoint`, each with whether it is a dump.
-    pub(super) fn durable(&mut self, checkpoint: &SourcePosition) -> Vec<(TableRef, bool)> {
+    /// The tables whose completion is durable once jobs up to `job` are, each with whether it is
+    /// a dump.
+    pub(super) fn durable(&mut self, job: u64) -> Vec<(TableRef, bool)> {
         let mut done = vec![];
-        self.completing.retain(|(at, table)| {
-            if checkpoint.covers(at).unwrap_or(false) {
+        self.completing.retain(|(n, table)| {
+            if *n <= job {
                 done.push(table.clone());
                 false
             } else {
@@ -520,12 +521,14 @@ impl Session<'_> {
         }
         let now = Instant::now();
         let limit = self.core.settings.snapshot_timeout;
+        // A halted table's snapshot stopped with the halt, and the halt's reason stays.
         let late: Vec<TableRef> = self
             .snaps
             .tables
             .iter()
             .filter(|(t, s)| {
                 !s.done
+                    && self.schemas.contains_key(*t)
                     && self
                         .core
                         .snapshot_started
@@ -573,19 +576,19 @@ impl Session<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use data_avalanche_config::Pipeline;
-    use data_avalanche_core::{ColumnSchema, ColumnValue, ColumnValueType as V, Row};
+    use data_avalanche_core::{ColumnSchema, ColumnValue, ColumnValueType as V, Row, SinkError};
     use data_avalanche_state::{CursorKey, SnapshotCursor};
-    use data_avalanche_testkit::FakeTxn;
+    use data_avalanche_testkit::{FakeSource, FakeTxn, MemorySink, SinkOp};
     use tokio::sync::watch;
 
     use super::*;
     use crate::session::Core;
     use crate::test_support::{World, Yaml, row, t, wait_until};
-    use crate::{Command, Exit, WorkerStatus};
+    use crate::{Command, Exit, Hooks, WorkerStatus};
 
     fn chunks_of(n: u64) -> Pipeline {
         let tables = format!("\n      snapshots: {{ chunk_size: {n} }}");
@@ -941,5 +944,164 @@ mod tests {
             [None, None],
             "read under the new schema"
         );
+    }
+
+    /// Holds the sink's commits again once one change set is committed.
+    #[derive(Debug)]
+    struct HoldAgain {
+        sink: MemorySink,
+        armed: AtomicBool,
+    }
+
+    impl Hooks for HoldAgain {
+        fn at(&self, point: &HookPoint) -> HookAction {
+            if matches!(point, HookPoint::SinkCommitted { .. })
+                && self.armed.swap(false, Ordering::SeqCst)
+            {
+                self.sink.hold_commits();
+            }
+            HookAction::Continue
+        }
+    }
+
+    /// Every chunk is emitted at one frontier while the sink holds the commits, so every job has
+    /// the same checkpoint. Once the first is durable, the others still wait in the writer: the
+    /// snapshot isn't done until the last one, which carries the completion, is durable.
+    #[tokio::test]
+    async fn a_snapshot_is_done_only_once_its_last_job_is_durable() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.source.load(&t("a"), rows(1..=6));
+        w.request(&["a"]).await;
+        w.sink.hold_commits();
+        let (mut core, control, status) = w.core(&chunks_of(2), &["a"]);
+        core.hooks = Arc::new(HoldAgain {
+            sink: w.sink.clone(),
+            armed: true.into(),
+        });
+        run(core, control, status, async |status| {
+            wait_until("every chunk is emitted", || w.source.reads(&t("a")) == 4).await;
+            w.sink.release_commits();
+            wait_until("the first job is durable", || {
+                !w.source.acknowledged().is_empty()
+            })
+            .await;
+            assert_eq!(w.ids("a"), [1, 2], "the next jobs wait in the writer");
+            assert!(
+                status.borrow().snapshots.contains_key(&t("a")),
+                "the completion isn't durable: {:?}",
+                status.borrow()
+            );
+            w.sink.release_commits();
+            snapshot_done(&w, &status, "a").await;
+            assert_eq!(w.ids("a"), [1, 2, 3, 4, 5, 6]);
+        })
+        .await;
+        assert_eq!(doc(&w, "a").await.status, SnapshotStatus::Completed);
+    }
+
+    /// A Safe change arrives while chunk jobs wait in the writer, at the checkpoint the session
+    /// started from: the sink evolves only once they are durable.
+    #[tokio::test]
+    async fn a_safe_change_evolves_only_once_the_chunk_jobs_are_durable() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.source.load(&t("a"), rows(1..=4));
+        w.request(&["a"]).await;
+        w.sink.hold_commits();
+        let noted = TableSchema::new(
+            t("a"),
+            vec![
+                ColumnSchema::new("id", V::Int64, "bigint").not_null(),
+                ColumnSchema::new("doc", V::Text, "text"),
+                ColumnSchema::new("note", V::Text, "text"),
+            ],
+            vec!["id".into()],
+        )
+        .unwrap();
+        let evolved = || {
+            w.sink
+                .content(&t("a"))
+                .is_some_and(|c| c.column_by_name("note").is_some())
+        };
+        let (core, control, status) = w.core(&chunks_of(2), &["a"]);
+        run(core, control, status, async |status| {
+            wait_until("every chunk is emitted", || w.source.reads(&t("a")) == 3).await;
+            w.source.alter(&t("a"), noted);
+            let mut r = row(9, "s");
+            r.0.push(("note".into(), ColumnValue::Text("n".into())));
+            w.source.commit(FakeTxn::new().insert(&t("a"), r));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!evolved(), "the chunk jobs aren't durable");
+            w.sink.release_commits();
+            wait_until("every row is in", || w.ids("a") == [1, 2, 3, 4, 9]).await;
+            snapshot_done(&w, &status, "a").await;
+        })
+        .await;
+        assert!(evolved());
+        assert_eq!(
+            w.text("a", "note"),
+            [None, None, None, None, Some("n".to_owned())]
+        );
+    }
+
+    /// Holds the source's chunk reads once a chunk is emitted.
+    #[derive(Debug)]
+    struct HoldReads(FakeSource);
+
+    impl Hooks for HoldReads {
+        fn at(&self, point: &HookPoint) -> HookAction {
+            if matches!(point, HookPoint::ChunkEmitted { .. }) {
+                self.0.hold_reads();
+            }
+            HookAction::Continue
+        }
+    }
+
+    /// The sink refuses a dump table's first chunk while the next is being read: the writer halts
+    /// the table, its snapshot stops, and the worker ends `Dumped` with the halt's reason kept.
+    #[tokio::test]
+    async fn a_writer_halt_stops_the_tables_snapshot() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.source.load(&t("a"), rows(1..=3));
+        w.request(&["a"]).await;
+        w.sink
+            .fail(SinkOp::Commit, Some(&t("a")), 1, || SinkError::Permanent {
+                reason: "refused".into(),
+            });
+        let p = Yaml {
+            tables: "\n      snapshots: { mode: dump_always, chunk_size: 2 }",
+            sink: "flush: { seconds: 0 }",
+            ..Yaml::default()
+        }
+        .build();
+        let (mut core, _control, status) = w.core(&p, &["a"]);
+        core.dump_only = true;
+        core.hooks = Arc::new(HoldReads(w.source.clone()));
+        core.settings.snapshot_timeout = Duration::from_millis(50);
+        let s = Session::open(&mut core).await.unwrap().unwrap();
+        let end = tokio::time::timeout(Duration::from_secs(5), s.run())
+            .await
+            .expect("the dump ends")
+            .unwrap();
+        w.source.release_reads();
+        assert!(matches!(end, End::Exit(Exit::Dumped)), "{end:?}");
+        assert_eq!(
+            w.source.reads(&t("a")),
+            2,
+            "the second chunk was being read"
+        );
+        let rejected = |r: &HaltReason| matches!(r, HaltReason::SinkRejected { .. });
+        let st = status.borrow().clone();
+        assert!(st.halted.get(&t("a")).is_some_and(rejected), "{st:?}");
+        assert!(st.snapshots.is_empty(), "{st:?}");
+        let halts = w.docs.halts().await.unwrap().tables;
+        assert!(
+            matches!(&halts[..], [h] if rejected(&h.reason)),
+            "{halts:?}"
+        );
+        assert_ne!(doc(&w, "a").await.status, SnapshotStatus::Broken);
+        assert!(w.ids("a").is_empty());
     }
 }

@@ -85,12 +85,18 @@ pub async fn fresh(admin: &Client, test: &str, ddl: &str) -> Names {
 /// A pipeline on the test server reading `include`, with `snapshots` settings (YAML flow
 /// entries; the mode defaults to `never`). It flushes at every transaction.
 pub fn pipeline(n: &Names, include: &[&str], snapshots: &str) -> Pipeline {
-    pipeline_with(n, include, snapshots, "")
+    pipeline_with(n, include, snapshots, "", "")
 }
 
-/// [`pipeline`] with more pipeline keys (YAML lines indented four spaces, each starting with a
-/// newline).
-pub fn pipeline_with(n: &Names, include: &[&str], snapshots: &str, more: &str) -> Pipeline {
+/// [`pipeline`] with more `sink` keys (YAML flow entries, each starting with a comma) and more
+/// pipeline keys (YAML lines indented four spaces, each starting with a newline).
+pub fn pipeline_with(
+    n: &Names,
+    include: &[&str],
+    snapshots: &str,
+    sink: &str,
+    more: &str,
+) -> Pipeline {
     let include: Vec<String> = include
         .iter()
         .map(|i| format!("{}.{i}", n.schema))
@@ -114,7 +120,7 @@ pipelines:
     tables:
       include: [{include}]
       snapshots: {{ {snapshots} }}
-    sink: {{ type: delta, bucket: lake, delta: {{}}, flush: {{ seconds: 0 }} }}{more}
+    sink: {{ type: delta, bucket: lake, delta: {{}}, flush: {{ seconds: 0 }}{sink} }}{more}
 "#,
         port = port(),
         publication = n.publication,

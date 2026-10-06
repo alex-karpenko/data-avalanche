@@ -107,7 +107,12 @@ pub(crate) struct Session<'c> {
     queued: VecDeque<(Job, u32)>,
     /// The checkpoint of the last flush handed on.
     submitted: SourcePosition,
-    durable: SourcePosition,
+    /// Jobs handed on, queued ones included: each job's number, from 1, in order. Consecutive
+    /// jobs may share a checkpoint (chunks are emitted at the frontier), so durability counts
+    /// jobs, not positions.
+    handed: u64,
+    /// Jobs durable: the writer runs them in order and reports each once.
+    durable: u64,
     /// Halts since the last flush, recorded with the next one.
     halts: Vec<TableHalt>,
     /// The open transaction's schema changes.
@@ -228,8 +233,9 @@ impl<'c> Session<'c> {
             writer,
             permits: Arc::new(Semaphore::new(rows)),
             queued: VecDeque::new(),
-            submitted: checkpoint.clone(),
-            durable: checkpoint,
+            submitted: checkpoint,
+            handed: 0,
+            durable: 0,
             halts,
             txn_schemas: vec![],
             pending_schemas: vec![],
@@ -373,7 +379,9 @@ impl<'c> Session<'c> {
             Some(WriterEvent::Halted(h)) => {
                 self.acc.halt_table(&h.table);
                 self.schemas.remove(&h.table);
+                self.snaps.stop(&h.table);
                 self.core.update(|st| {
+                    st.snapshots.remove(&h.table);
                     st.halted.insert(h.table, h.reason);
                 });
                 Ok(None)
@@ -383,8 +391,8 @@ impl<'c> Session<'c> {
                 Ok(None)
             }
             Some(WriterEvent::Durable(cp)) => {
-                self.durable = cp.clone();
-                for (table, dump) in self.snaps.durable(&cp) {
+                self.durable += 1;
+                for (table, dump) in self.snaps.durable(self.durable) {
                     self.core.update(|st| {
                         st.snapshots.remove(&table);
                     });
@@ -732,8 +740,9 @@ impl<'c> Session<'c> {
         }
     }
 
-    /// Stops the table: its buffered changes go, its later ones are dropped, and the halt is
-    /// recorded before the next checkpoint. The sink holds its changes through the checkpoint.
+    /// Stops the table: its buffered changes go, its later ones are dropped, its snapshot stops,
+    /// and the halt is recorded before the next checkpoint. The sink holds its changes through the
+    /// checkpoint.
     fn halt(&mut self, table: TableRef, reason: HaltReason) {
         self.acc.halt_table(&table);
         self.schemas.remove(&table);
@@ -744,6 +753,7 @@ impl<'c> Session<'c> {
             at: self.acc.checkpoint().clone(),
         });
         self.core.update(|st| {
+            st.snapshots.remove(&table);
             st.halted.insert(table, reason);
         });
     }
@@ -801,11 +811,12 @@ impl<'c> Session<'c> {
             .buffer_rows
             .min(Semaphore::MAX_PERMITS as u64);
         let need = u32::try_from((rows as u64).min(cap)).unwrap_or(u32::MAX);
+        self.handed += 1;
         let job = Job {
             change_sets,
             checkpoint: checkpoint.clone(),
             halts: std::mem::take(&mut self.halts),
-            snapshots: self.snaps.take_docs(&checkpoint),
+            snapshots: self.snaps.take_docs(self.handed),
             schemas,
             permit: None,
         };
@@ -826,9 +837,9 @@ impl<'c> Session<'c> {
         }
     }
 
-    /// Waits until every flush handed on is durable.
+    /// Waits until every job handed on is durable.
     async fn until_durable(&mut self) -> Result<Option<End>, WorkerError> {
-        while self.durable != self.submitted || !self.queued.is_empty() {
+        while self.durable < self.handed {
             let need = self.queued.front().map_or(0, |(_, n)| *n);
             let permits = self.permits.clone();
             tokio::select! {
@@ -1533,11 +1544,18 @@ mod tests {
         }
     }
 
-    /// Asserts that nothing halted and `a`'s schema is the catalog's.
-    fn current(s: &Session<'_>, w: &World) {
+    /// `name`'s cached schema document once every job handed on is durable.
+    async fn persisted(s: &mut Session<'_>, w: &World, name: &str) -> TableSchema {
+        assert!(s.until_durable().await.unwrap().is_none());
+        w.docs.table_schema(&t(name)).await.unwrap().unwrap().doc
+    }
+
+    /// Asserts that nothing halted and `a`'s schema is the catalog's, in memory and cached.
+    async fn current(s: &mut Session<'_>, w: &World) {
         let st = s.core.status.borrow().clone();
         assert!(st.halted.is_empty(), "{st:?}");
         assert_eq!(s.schemas[&t("a")], w.source.schema(&t("a")));
+        assert_eq!(persisted(s, w, "a").await, w.source.schema(&t("a")));
     }
 
     /// Channel D, change and revert (ABA): a rescan finds `a` with `note`. Before the catch-up
@@ -1566,9 +1584,10 @@ mod tests {
             base,
             "the cache came back, and nothing applied"
         );
+        assert_eq!(persisted(&mut s, &w, "a").await, base);
         assert!(s.core.status.borrow().halted.is_empty());
         assert!(s.rescan().await.unwrap().is_none());
-        current(&s, &w);
+        current(&mut s, &w).await;
     }
 
     /// Channel D, the catalog moves after the rescan: a rescan finds `a` with `note` (an ADD
@@ -1596,8 +1615,9 @@ mod tests {
             s.core.status.borrow().halted
         );
         assert_eq!(s.schemas[&t("a")], base, "nothing applied");
+        assert_eq!(persisted(&mut s, &w, "a").await, base, "nothing cached");
         assert!(s.rescan().await.unwrap().is_none());
-        current(&s, &w);
+        current(&mut s, &w).await;
         assert!(s.core.status.borrow().warnings.is_empty());
     }
 
@@ -1631,6 +1651,10 @@ mod tests {
         );
         assert_eq!(s.schemas[&t("a")].columns(), base("a"), "not applied");
         assert_eq!(s.schemas[&t("b")].columns(), base("b"), "not applied");
+        for name in ["a", "b"] {
+            let cached = persisted(&mut s, &w, name).await;
+            assert_eq!(cached.columns(), base(name), "{name}: not cached");
+        }
         assert!(s.core.drifted.contains(&t("a")), "still held");
         let warnings = s.core.status.borrow().warnings.clone();
         assert!(
@@ -1638,8 +1662,11 @@ mod tests {
             "{warnings:?}"
         );
         assert!(s.rescan().await.unwrap().is_none());
-        assert_eq!(s.schemas[&t("a")], w.source.schema(&t("a")));
-        assert_eq!(s.schemas[&t("b")], w.source.schema(&t("b")));
+        for name in ["a", "b"] {
+            assert_eq!(s.schemas[&t(name)], w.source.schema(&t(name)));
+            let cached = persisted(&mut s, &w, name).await;
+            assert_eq!(cached, w.source.schema(&t(name)), "{name}: cached");
+        }
         assert!(s.core.drifted.is_empty(), "released");
         assert!(s.core.status.borrow().halted.is_empty());
         assert_eq!(s.core.status.borrow().warnings, warnings);

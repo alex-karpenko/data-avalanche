@@ -15,7 +15,7 @@ use data_avalanche_testkit::require_it;
 use futures_util::FutureExt;
 use tokio_postgres::NoTls;
 
-use crate::common::{Lake, admin, cleanup, converge, dsn, fresh, pipeline, start};
+use crate::common::{Lake, admin, cleanup, converge, dsn, fresh, pipeline_with, start};
 
 #[tokio::test]
 async fn a_stalled_synchronous_commit_survives_the_chunk_that_missed_it() {
@@ -30,14 +30,18 @@ async fn a_stalled_synchronous_commit_survives_the_chunk_that_missed_it() {
     .await;
     let t = n.table("t");
     let lake = Lake::new();
-    // The first chunks wait in the writer, so the snapshot is still reading when the stalled
-    // commit is streamed.
+    // The sink holds the first chunk's commit, and the buffer holds one chunk: the next chunk
+    // waits for room, and the snapshot reads no further until the release. It is far from the
+    // stalled row when the stream applies the commit after the release.
     lake.sink.hold_commits();
-    let run = start(
-        &pipeline(&n, &["t"], "mode: initial, chunk_size: 10"),
-        &lake,
-        None,
+    let p = pipeline_with(
+        &n,
+        &["t"],
+        "mode: initial, chunk_size: 10",
+        ", buffer_capacity_rows: 10",
+        "",
     );
+    let run = start(&p, &lake, None);
     run.wait("the snapshot starts", |st| !st.snapshots.is_empty())
         .await;
 
@@ -82,6 +86,11 @@ async fn a_stalled_synchronous_commit_survives_the_chunk_that_missed_it() {
         if !waiting {
             return Err("no writer waiting for the standby".into());
         }
+        let rows_done = run.handle.status.borrow().snapshots[&t].rows_done;
+        assert!(
+            rows_done < 4990,
+            "the snapshot read past the stalled row: {rows_done}"
+        );
         lake.sink.release_commits();
         // The snapshot finishes while the commit is still invisible to every read.
         run.wait("the snapshot is done", |st| st.snapshots.is_empty())

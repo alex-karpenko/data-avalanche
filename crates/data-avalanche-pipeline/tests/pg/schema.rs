@@ -58,6 +58,7 @@ async fn a_dropped_table_halts_and_the_others_go_on() {
         &n,
         &["gone", "kept"],
         "",
+        "",
         "\n    schema_evolution: { rescan_interval: 1s }",
     );
     let run = start(&p, &lake, None);
