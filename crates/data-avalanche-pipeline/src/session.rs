@@ -621,7 +621,8 @@ impl<'c> Session<'c> {
     /// moved since the rescan is skipped: the stream applied a change on its own meanwhile, and the
     /// finding may be older than it. Any other table is read again, and its finding applies only
     /// if it still holds: the catalog may have moved since, or the cache moved and came back. A
-    /// skipped table is found again by the next round.
+    /// failed read ends the reads: the tables left are skipped too. A skipped table is found again
+    /// by the next round, and a held one stays held until then.
     async fn caught_up(&mut self) -> Result<Option<End>, WorkerError> {
         let Some((after, ..)) = &self.rescan else {
             return Ok(None);
@@ -648,6 +649,8 @@ impl<'c> Session<'c> {
                 self.halt(table, reason);
             }
         }
+        let mut unapplied = BTreeSet::new();
+        let mut catalog_down = false;
         for now in report.changed {
             let table = now.table().clone();
             let Some(cached) = self.schemas.get(&table).cloned() else {
@@ -658,14 +661,23 @@ impl<'c> Session<'c> {
             {
                 continue;
             }
+            if catalog_down {
+                unapplied.insert(table);
+                continue;
+            }
             match self.core.source.rescan(std::slice::from_ref(&cached)).await {
                 Ok(fresh)
                     if fresh.changed.as_slice() == std::slice::from_ref(&now)
                         && fresh.dropped.is_empty()
                         && fresh.halted.is_empty() => {}
-                Ok(_) => continue,
+                Ok(_) => {
+                    unapplied.insert(table);
+                    continue;
+                }
                 Err(e) => {
                     self.rescan_failed(&e);
+                    catalog_down = true;
+                    unapplied.insert(table);
                     continue;
                 }
             }
@@ -676,7 +688,7 @@ impl<'c> Session<'c> {
         }
         // Caches the applied schemas without waiting for the tables' next change.
         self.flush()?;
-        for table in self.snaps.release_unless(&BTreeSet::new()) {
+        for table in self.snaps.release_unless(&unapplied.iter().collect()) {
             self.core.drifted.remove(&table);
         }
         Ok(None)
@@ -1587,6 +1599,50 @@ mod tests {
         assert!(s.rescan().await.unwrap().is_none());
         current(&s, &w);
         assert!(s.core.status.borrow().warnings.is_empty());
+    }
+
+    /// A catch-up's re-read fails: `a`, held for its snapshot, isn't applied and stays held; the
+    /// failure warns once; `b`, changed in the same round, isn't read after it. The next round
+    /// applies both and releases `a`.
+    #[tokio::test]
+    async fn a_failed_re_read_ends_the_catch_up_and_the_next_round_applies_it() {
+        let w = World::new(&["a", "b"]);
+        w.started(&["a", "b"]).await;
+        w.request(&["a"]).await;
+        let (mut core, _control, _status) = w.core(&flush_each(), &["a", "b"]);
+        core.drifted.insert(t("a"));
+        let mut s = Session::open(&mut core).await.unwrap().unwrap();
+        let base = |name: &str| crate::test_support::schema(name).columns().to_vec();
+        w.source.alter(&t("a"), with_note("a"));
+        w.source.alter(&t("b"), with_note("b"));
+        w.source.after_next_rescan(|src| {
+            src.fail(
+                Method::Rescan,
+                SourceError::Transient("catalog down".into()),
+            )
+        });
+        let before = w.source.rescans();
+        assert!(s.rescan().await.unwrap().is_none());
+        assert!(s.rescan.is_none(), "the catch-up ran");
+        assert_eq!(
+            w.source.rescans() - before,
+            2,
+            "the round and `a`'s re-read: `b` isn't read"
+        );
+        assert_eq!(s.schemas[&t("a")].columns(), base("a"), "not applied");
+        assert_eq!(s.schemas[&t("b")].columns(), base("b"), "not applied");
+        assert!(s.core.drifted.contains(&t("a")), "still held");
+        let warnings = s.core.status.borrow().warnings.clone();
+        assert!(
+            matches!(&warnings[..], [w] if w.contains("catalog down")),
+            "{warnings:?}"
+        );
+        assert!(s.rescan().await.unwrap().is_none());
+        assert_eq!(s.schemas[&t("a")], w.source.schema(&t("a")));
+        assert_eq!(s.schemas[&t("b")], w.source.schema(&t("b")));
+        assert!(s.core.drifted.is_empty(), "released");
+        assert!(s.core.status.borrow().halted.is_empty());
+        assert_eq!(s.core.status.borrow().warnings, warnings);
     }
 
     /// A failed rescan round warns once per streak: the rescan failing twice warns once; a round

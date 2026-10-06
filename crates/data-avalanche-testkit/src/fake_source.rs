@@ -193,6 +193,7 @@ struct Db {
     acknowledged: Vec<SourcePosition>,
     opened: Vec<SourcePosition>,
     reads: BTreeMap<TableRef, usize>,
+    rescans: usize,
     fetches: BTreeMap<TableRef, usize>,
     prepares: Vec<Option<SourcePosition>>,
 }
@@ -235,6 +236,7 @@ impl FakeSource {
             acknowledged: vec![],
             opened: vec![],
             reads: BTreeMap::new(),
+            rescans: 0,
             fetches: BTreeMap::new(),
             prepares: vec![],
         };
@@ -412,6 +414,11 @@ impl FakeSource {
     /// Chunk reads of `table` so far.
     pub fn reads(&self, table: &TableRef) -> usize {
         self.db().reads.get(table).copied().unwrap_or(0)
+    }
+
+    /// `rescan` calls so far, failed ones included.
+    pub fn rescans(&self) -> usize {
+        self.db().rescans
     }
 
     /// `fetch_rows` calls for `table` so far, failed ones included.
@@ -630,8 +637,8 @@ fn shape(columns: &[ColumnSchema]) -> Vec<(String, data_avalanche_core::ColumnVa
 
 /// The columns the stream carries (`hint`), in its order, as PostgreSQL's `scope` reads them: the
 /// stream's types, and the nullability and ordinal of the catalog's column of that name (or the
-/// cached one, for a column the catalog dropped since). A column known to neither is a guess the
-/// table halts on.
+/// cached one, for a column the catalog dropped since). A column known to neither, or an
+/// identifier column the stream doesn't carry, is a guess the table halts on.
 fn scoped(
     cached: &TableSchema,
     hint: &[ColumnSchema],
@@ -656,8 +663,22 @@ fn scoped(
             ..h.clone()
         });
     }
-    let scoped = TableSchema::new(table.clone(), columns, now.identifier().to_vec())
-        .map_err(|reason| SourceError::Permanent(format!("{table}: {reason}")))?;
+    let halt = |reason| SourceError::TableHalt {
+        table: table.clone(),
+        reason,
+    };
+    if let Some(k) = now
+        .identifier()
+        .iter()
+        .find(|k| !columns.iter().any(|c| &c.name == *k))
+    {
+        return Err(halt(HaltReason::SchemaMismatch {
+            column: k.clone(),
+            detail: "the identifier column isn't in the stream's columns".into(),
+        }));
+    }
+    let scoped =
+        TableSchema::new(table.clone(), columns, now.identifier().to_vec()).map_err(halt)?;
     Ok(match now.source_id() {
         Some(id) => scoped.with_source_id(id),
         None => scoped,
@@ -915,6 +936,7 @@ impl SourceConnector for FakeSource {
     }
 
     async fn rescan(&self, known: &[TableSchema]) -> Result<RescanReport, SourceError> {
+        self.db().rescans += 1;
         self.take_fault(Method::Rescan)?;
         let mut db = self.db();
         let mut report = RescanReport::default();
@@ -1153,10 +1175,13 @@ mod tests {
             other => panic!("{other:?}"),
         }
         let keyless = vec![ColumnSchema::new("v", V::Text, "text")];
-        assert!(matches!(
-            src.augment(&cached, &SchemaHint::Columns(keyless)).await,
-            Err(SourceError::Permanent(_))
-        ));
+        match src.augment(&cached, &SchemaHint::Columns(keyless)).await {
+            Err(SourceError::TableHalt {
+                reason: HaltReason::SchemaMismatch { column, .. },
+                ..
+            }) => assert_eq!(column, "id", "the table halts, not the worker"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[tokio::test]
