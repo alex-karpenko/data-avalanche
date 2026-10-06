@@ -11,7 +11,9 @@
 //! - The slot follows `Postgres_Slot…` §1 in short: a first start creates it, a checkpoint the slot
 //!   is past (or a lost slot) recreates it, and `acknowledge` moves it.
 //! - [`FakeSource::alter`] changes a table's schema: the stream signals it before the table's next
-//!   change, `augment` diffs by column name and `rescan` reports it.
+//!   change, `augment` diffs by column name and `rescan` reports it. Like PostgreSQL's, `augment`
+//!   keeps to the columns a `Columns` hint names, so a catalog ahead of the hint adds nothing.
+//!   [`FakeSource::after_next_rescan`] acts between a rescan and the position read after it.
 //! - [`FakeSource::fail`] makes the next call of one method fail; [`FakeSource::hold_reads`]
 //!   holds chunk reads after they took their snapshot, so a test can commit while one is out.
 //!
@@ -159,6 +161,15 @@ impl WalEntry {
     }
 }
 
+/// A test's action, run once inside a source call.
+struct Action(Box<dyn FnOnce(&FakeSource) + Send>);
+
+impl std::fmt::Debug for Action {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Action")
+    }
+}
+
 #[derive(Debug)]
 struct Db {
     catalog: BTreeMap<TableRef, TableSchema>,
@@ -178,6 +189,7 @@ struct Db {
     retained: Option<Option<u64>>,
     faults: Vec<(Method, SourceError)>,
     hold_reads: bool,
+    after_rescan: Option<Action>,
     acknowledged: Vec<SourcePosition>,
     opened: Vec<SourcePosition>,
     reads: BTreeMap<TableRef, usize>,
@@ -218,6 +230,7 @@ impl FakeSource {
             retained: None,
             faults: vec![],
             hold_reads: false,
+            after_rescan: None,
             acknowledged: vec![],
             opened: vec![],
             reads: BTreeMap::new(),
@@ -366,6 +379,12 @@ impl FakeSource {
     /// Chunk reads wait, after taking their snapshot, until [`Self::release_reads`].
     pub fn hold_reads(&self) {
         self.db().hold_reads = true;
+    }
+
+    /// Runs `f` once, inside the next `rescan`, after it has read the catalog: a change made
+    /// between a rescan and the position read after it.
+    pub fn after_next_rescan(&self, f: impl FnOnce(&FakeSource) + Send + 'static) {
+        self.db().after_rescan = Some(Action(Box::new(f)));
     }
 
     pub fn release_reads(&self) {
@@ -602,6 +621,26 @@ fn shape(columns: &[ColumnSchema]) -> Vec<(String, data_avalanche_core::ColumnVa
         .collect()
 }
 
+/// The catalog's schema of the columns the stream carries (`hint`), in its order; a column the
+/// catalog dropped since keeps its cached form.
+fn scoped(cached: &TableSchema, hint: &[ColumnSchema], now: &TableSchema) -> TableSchema {
+    let columns = hint
+        .iter()
+        .map(|h| {
+            now.column(&h.name)
+                .or_else(|| cached.column(&h.name))
+                .unwrap_or(h)
+                .clone()
+        })
+        .collect();
+    let scoped = TableSchema::new(now.table().clone(), columns, now.identifier().to_vec())
+        .expect("the hint carries the identifier");
+    match now.source_id() {
+        Some(id) => scoped.with_source_id(id),
+        None => scoped,
+    }
+}
+
 fn diff(cached: &TableSchema, now: &TableSchema) -> Vec<SchemaChange> {
     let mut changes = vec![];
     for c in cached.columns() {
@@ -823,7 +862,7 @@ impl SourceConnector for FakeSource {
     async fn augment(
         &self,
         cached: &TableSchema,
-        _hint: &SchemaHint,
+        hint: &SchemaHint,
     ) -> Result<(SchemaDelta, Option<TableSchema>), SourceError> {
         self.take_fault(Method::Augment)?;
         let table = cached.table().clone();
@@ -835,19 +874,25 @@ impl SourceConnector for FakeSource {
                 },
                 None,
             ),
-            Some(now) => (
-                SchemaDelta {
-                    table,
-                    changes: diff(cached, now),
-                },
-                Some(now.clone()),
-            ),
+            Some(now) => {
+                let now = match hint {
+                    SchemaHint::Columns(columns) => scoped(cached, columns, now),
+                    SchemaHint::Ddl(_) => now.clone(),
+                };
+                (
+                    SchemaDelta {
+                        table,
+                        changes: diff(cached, &now),
+                    },
+                    Some(now),
+                )
+            }
         })
     }
 
     async fn rescan(&self, known: &[TableSchema]) -> Result<RescanReport, SourceError> {
         self.take_fault(Method::Rescan)?;
-        let db = self.db();
+        let mut db = self.db();
         let mut report = RescanReport::default();
         for k in known {
             match db.catalog.get(k.table()) {
@@ -860,6 +905,11 @@ impl SourceConnector for FakeSource {
                 }
                 Some(_) => {}
             }
+        }
+        let after = db.after_rescan.take();
+        drop(db);
+        if let Some(Action(f)) = after {
+            f(self);
         }
         Ok(report)
     }

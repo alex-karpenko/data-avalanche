@@ -22,6 +22,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::session::Core;
 use crate::settings::Settings;
+use crate::status::Streak;
 use crate::{
     Accumulator, Backoff, Command, CommitGuard, FlushPolicy, HookAction, HookPoint, Hooks, Lineage,
     NoHooks, Tuning, Unguarded, WorkerStatus,
@@ -403,6 +404,7 @@ impl World {
             dump_only: false,
             snapshot_started: BTreeMap::new(),
             drifted: BTreeSet::new(),
+            rescan_failing: Streak::default(),
         };
         (core, control, status_rx)
     }

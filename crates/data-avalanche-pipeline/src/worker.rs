@@ -22,6 +22,7 @@ use crate::decide::{Decision, Facts, Plan, decide};
 use crate::schema_change::Planned;
 use crate::session::{Core, End, Session};
 use crate::settings::Settings;
+use crate::status::Streak;
 use crate::{
     Command, CommitGuard, Exit, Hooks, NoHooks, Phase, Tuning, Unguarded, WorkerError, WorkerStatus,
 };
@@ -100,6 +101,7 @@ impl PipelineWorker {
             dump_only: false,
             snapshot_started: BTreeMap::new(),
             drifted: BTreeSet::new(),
+            rescan_failing: Streak::default(),
         };
         (Self { core }, WorkerHandle { control, status })
     }

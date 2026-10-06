@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use data_avalanche_core::{HaltReason, SourcePosition, TableRef};
+use tokio::sync::watch;
 
 use crate::Backoff;
 
@@ -62,6 +63,30 @@ pub struct WorkerStatus {
     pub snapshots: BTreeMap<TableRef, SnapshotProgress>,
     /// Warnings since the start: drift, a `never` gap, a degraded evolve.
     pub warnings: Vec<String>,
+}
+
+/// A check that keeps failing warns once: the first failure of a streak adds a status warning,
+/// and nothing more is added until a success ends the streak.
+#[derive(Debug, Default)]
+pub(crate) struct Streak {
+    failing: bool,
+}
+
+impl Streak {
+    pub fn failed(
+        &mut self,
+        status: &watch::Sender<WorkerStatus>,
+        warning: impl FnOnce() -> String,
+    ) {
+        if !std::mem::replace(&mut self.failing, true) {
+            let warning = warning();
+            status.send_modify(|st| st.warnings.push(warning));
+        }
+    }
+
+    pub fn succeeded(&mut self) {
+        self.failing = false;
+    }
 }
 
 /// The worker's internal timings.
