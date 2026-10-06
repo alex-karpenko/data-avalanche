@@ -859,6 +859,7 @@ mod tests {
             st.halted.get(&t("a")),
             Some(&HaltReason::SnapshotTimeout { limit_secs: 0 })
         );
+        assert!(st.snapshots.is_empty(), "{st:?}");
         assert_eq!(doc(&w, "a").await.status, SnapshotStatus::Broken);
         assert_eq!(w.docs.halts().await.unwrap().tables[0].table, t("a"));
         assert!(w.ids("a").is_empty());
@@ -1079,7 +1080,7 @@ mod tests {
         let (mut core, _control, status) = w.core(&p, &["a"]);
         core.dump_only = true;
         core.hooks = Arc::new(HoldReads(w.source.clone()));
-        core.settings.snapshot_timeout = Duration::from_millis(50);
+        core.settings.snapshot_timeout = Duration::from_millis(200);
         let s = Session::open(&mut core).await.unwrap().unwrap();
         let end = tokio::time::timeout(Duration::from_secs(5), s.run())
             .await
@@ -1101,7 +1102,7 @@ mod tests {
             matches!(&halts[..], [h] if rejected(&h.reason)),
             "{halts:?}"
         );
-        assert_ne!(doc(&w, "a").await.status, SnapshotStatus::Broken);
+        assert_eq!(doc(&w, "a").await.status, SnapshotStatus::InProgress);
         assert!(w.ids("a").is_empty());
     }
 }

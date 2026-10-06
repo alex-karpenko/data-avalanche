@@ -46,7 +46,9 @@ pub(crate) enum WriterEvent {
     /// A commit or a state write failed and is being retried (`Some`, the last error), or
     /// succeeded again (`None`).
     Degraded(Option<String>),
-    /// Everything up to the checkpoint is durable: acknowledge it to the source.
+    /// Everything up to the checkpoint is durable: acknowledge it to the source. Exactly one per
+    /// job, in job order, a job with refused change sets included: the session counts them to
+    /// know which jobs are durable (consecutive jobs may share a checkpoint).
     Durable(SourcePosition),
     /// The writer stopped; no further event follows.
     Failed(WorkerError),

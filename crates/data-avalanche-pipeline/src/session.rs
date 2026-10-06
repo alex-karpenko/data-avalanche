@@ -392,6 +392,7 @@ impl<'c> Session<'c> {
             }
             Some(WriterEvent::Durable(cp)) => {
                 self.durable += 1;
+                debug_assert!(self.durable <= self.handed, "one Durable per job");
                 for (table, dump) in self.snaps.durable(self.durable) {
                     self.core.update(|st| {
                         st.snapshots.remove(&table);
