@@ -19,7 +19,6 @@ use data_avalanche_core::{
     TransactionBoundary, identifier_values,
 };
 use data_avalanche_state::{PipelineDocs, TableHalt};
-use futures_util::StreamExt;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinHandle;
@@ -255,7 +254,10 @@ impl<'c> Session<'c> {
     /// Runs the session to its end. Flushes already handed to the writer are made durable before
     /// it returns, unless it fails.
     pub async fn run(mut self) -> Result<End, WorkerError> {
-        match self.event_loop().await {
+        let ended = self.event_loop().await;
+        // The chunk reads still out are aborted: the next session reads again from the cursors.
+        self.snaps.reads.abort_all();
+        match ended {
             Ok(end) => {
                 let end = self.finish(end).await?;
                 Ok(end)
@@ -338,8 +340,12 @@ impl<'c> Session<'c> {
                     }
                     Err(e) => return Ok(End::Source(e)),
                 },
-                read = self.snaps.reads.next(), if !self.snaps.reads.is_empty() => {
-                    let read = read.expect("not empty");
+                read = self.snaps.reads.join_next(), if !self.snaps.reads.is_empty() => {
+                    // Nothing aborts a read while the loop runs: one that ended without its
+                    // chunk panicked, a bug, which ends the worker like the writer's.
+                    let read = read.expect("not empty").map_err(|e| {
+                        protocol(format!("a chunk read ended without its chunk: {e}"))
+                    })?;
                     if let Some(end) = self.chunk_read(read).await? {
                         return Ok(end);
                     }

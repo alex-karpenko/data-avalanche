@@ -24,8 +24,7 @@ use data_avalanche_core::{
     SourceSeq, TableRef, TableSchema, TransactionBoundary,
 };
 use data_avalanche_state::{SnapshotStatus, TableSnapshotDoc};
-use futures_util::future::BoxFuture;
-use futures_util::stream::FuturesUnordered;
+use tokio::task::JoinSet;
 
 use super::{End, Session, protocol};
 use crate::buffer::identity;
@@ -60,7 +59,11 @@ pub(super) struct Read {
 #[derive(Default)]
 pub(super) struct Snapshots {
     tables: BTreeMap<TableRef, Snap>,
-    pub(super) reads: FuturesUnordered<BoxFuture<'static, Read>>,
+    /// The chunk reads, each a task of its own: a read shares the source's connection with the
+    /// calls the session awaits inline (a PostgreSQL catalog client answers one response at a
+    /// time), so it must be polled whatever the session awaits (Task 13 review I3). Dropped with
+    /// the session, they are aborted.
+    pub(super) reads: JoinSet<Read>,
     ready: VecDeque<Read>,
     reconciler: Reconciler,
     /// What the open stream transaction wrote in the tables being snapshotted.
@@ -325,7 +328,7 @@ impl Session<'_> {
             let after = snap.cursor.clone();
             let limit = self.core.settings.chunk_size;
             let table = table.clone();
-            self.snaps.reads.push(Box::pin(async move {
+            self.snaps.reads.spawn(async move {
                 let read_at_micros = micros_now();
                 let result = source.read_chunk(&schema, after.as_ref(), limit).await;
                 Read {
@@ -335,7 +338,7 @@ impl Session<'_> {
                     result,
                     read_at_micros,
                 }
-            }));
+            });
             snap.reading = true;
             reading += 1;
         }
@@ -354,15 +357,16 @@ impl Session<'_> {
         self.emit_ready().await
     }
 
-    /// Emits the chunks read so far; called between transactions.
+    /// Emits the chunks read so far, then runs the rescan a failed read asked for; called between
+    /// transactions. While a rescan's findings are pending, the request waits for them to apply.
     pub(super) async fn emit_ready(&mut self) -> Result<Option<End>, WorkerError> {
         while let Some(read) = self.snaps.ready.pop_front() {
             if let Some(end) = self.emit(read)? {
                 return Ok(Some(end));
             }
         }
-        if std::mem::take(&mut self.snaps.rescan)
-            && self.rescan.is_none()
+        if self.rescan.is_none()
+            && std::mem::take(&mut self.snaps.rescan)
             && let Some(end) = self.rescan().await?
         {
             return Ok(Some(end));
@@ -635,16 +639,23 @@ mod tests {
         w.docs.table_snapshot(&t(table)).await.unwrap().unwrap().doc
     }
 
+    /// The stream inserts a key below the first chunk while it is being read: no chunk reads it.
     #[tokio::test]
     async fn a_snapshot_reads_the_table_in_chunks_while_streaming() {
         let w = World::new(&["a"]);
         w.started(&["a"]).await;
         w.source.load(&t("a"), rows(1..=5));
         w.request(&["a"]).await;
+        w.source.hold_reads();
         let (core, control, status) = w.core(&chunks_of(2), &["a"]);
         let (end, _) = run(core, control, status, async |status| {
-            w.source.commit(FakeTxn::new().insert(&t("a"), row(9, "s")));
-            wait_until("every row is in", || w.ids("a") == [1, 2, 3, 4, 5, 9]).await;
+            wait_until("the first chunk is being read", || {
+                w.source.reads(&t("a")) == 1
+            })
+            .await;
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(0, "s")));
+            w.source.release_reads();
+            wait_until("every row is in", || w.ids("a") == [0, 1, 2, 3, 4, 5]).await;
             snapshot_done(&w, &status, "a").await;
         })
         .await;
@@ -945,6 +956,27 @@ mod tests {
             [None, None],
             "read under the new schema"
         );
+    }
+
+    /// Chunk reads share the source's connection with the heartbeat's `retained_bytes`, which the
+    /// session awaits inline: a read hands back its rows only while that call waits, so the reads
+    /// must be polled while the session awaits it (Task 13 review I3).
+    #[tokio::test]
+    async fn a_chunk_read_goes_on_while_the_session_awaits_the_source() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.source.load(&t("a"), rows(1..=5));
+        w.request(&["a"]).await;
+        w.source.share_connection();
+        let (mut core, control, status) = w.core(&chunks_of(2), &["a"]);
+        core.settings.heartbeat = Duration::from_millis(10);
+        let (end, _) = run(core, control, status, async |status| {
+            snapshot_done(&w, &status, "a").await;
+        })
+        .await;
+        assert!(matches!(end, End::Exit(Exit::Drained)));
+        assert_eq!(w.ids("a"), [1, 2, 3, 4, 5]);
+        assert_eq!(w.source.reads(&t("a")), 4);
     }
 
     /// Holds the sink's commits again once one change set is committed.

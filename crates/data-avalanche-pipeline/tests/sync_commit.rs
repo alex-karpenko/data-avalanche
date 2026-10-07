@@ -38,6 +38,7 @@ async fn a_stalled_synchronous_commit_survives_the_chunk_that_missed_it() {
         &n,
         &["t"],
         "mode: initial, chunk_size: 10",
+        "",
         ", buffer_capacity_rows: 10",
         "",
     );

@@ -16,6 +16,8 @@
 //!   [`FakeSource::after_next_rescan`] acts between a rescan and the position read after it.
 //! - [`FakeSource::fail`] makes the next call of one method fail; [`FakeSource::hold_reads`]
 //!   holds chunk reads after they took their snapshot, so a test can commit while one is out.
+//!   [`FakeSource::share_connection`] makes chunk reads and other calls wait on each other, as
+//!   they do on PostgreSQL's one catalog client.
 //!
 //! Keys are integer or text identifier columns. The fake trusts its tests: a change of a key a
 //! stalled transaction holds, or a key that isn't an integer or text, panics.
@@ -161,6 +163,24 @@ impl WalEntry {
     }
 }
 
+/// A chunk read holding its rows on the shared connection ([`FakeSource::share_connection`]),
+/// until it is dropped.
+struct HalfRead<'a>(&'a FakeSource);
+
+impl<'a> HalfRead<'a> {
+    fn new(source: &'a FakeSource) -> Self {
+        source.db().half_read += 1;
+        Self(source)
+    }
+}
+
+impl Drop for HalfRead<'_> {
+    fn drop(&mut self) {
+        self.0.db().half_read -= 1;
+        self.0.wake.notify_waiters();
+    }
+}
+
 /// A test's action, run once inside a source call.
 struct Action(Box<dyn FnOnce(&FakeSource) + Send>);
 
@@ -189,6 +209,11 @@ struct Db {
     retained: Option<Option<u64>>,
     faults: Vec<(Method, SourceError)>,
     hold_reads: bool,
+    /// [`FakeSource::share_connection`]: on, the chunk reads holding their rows, and the calls
+    /// waiting on the connection.
+    shared: bool,
+    half_read: usize,
+    waiting: usize,
     after_rescan: Option<Action>,
     acknowledged: Vec<SourcePosition>,
     opened: Vec<SourcePosition>,
@@ -232,6 +257,9 @@ impl FakeSource {
             retained: None,
             faults: vec![],
             hold_reads: false,
+            shared: false,
+            half_read: 0,
+            waiting: 0,
             after_rescan: None,
             acknowledged: vec![],
             opened: vec![],
@@ -383,6 +411,35 @@ impl FakeSource {
     /// Chunk reads wait, after taking their snapshot, until [`Self::release_reads`].
     pub fn hold_reads(&self) {
         self.db().hold_reads = true;
+    }
+
+    /// Chunk reads, `retained_bytes` and `in_flight` share one connection from now on, as they do
+    /// on PostgreSQL's catalog client, whose response channel holds one message: a read that has
+    /// its rows hands them back only while one of those calls waits on the connection, and the
+    /// call waits until no read is half done. A caller that awaits such a call without polling
+    /// its reads deadlocks.
+    pub fn share_connection(&self) {
+        self.db().shared = true;
+    }
+
+    /// A call waits on the shared connection until no chunk read is half done.
+    async fn connection(&self) {
+        {
+            let mut db = self.db();
+            if !db.shared {
+                return;
+            }
+            db.waiting += 1;
+        }
+        self.wake.notify_waiters();
+        loop {
+            let done = self.wake.notified();
+            if self.db().half_read == 0 {
+                break;
+            }
+            done.await;
+        }
+        self.db().waiting -= 1;
     }
 
     /// Runs `f` once, inside the next `rescan`, after it has read the catalog: a change made
@@ -787,6 +844,7 @@ impl SourceConnector for FakeSource {
 
     async fn retained_bytes(&self) -> Result<Option<u64>, SourceError> {
         self.take_fault(Method::RetainedBytes)?;
+        self.connection().await;
         let db = self.db();
         Ok(match db.retained {
             Some(r) => r,
@@ -803,6 +861,7 @@ impl SourceConnector for FakeSource {
         &self,
     ) -> Result<Option<Vec<data_avalanche_core::InFlightTxn>>, SourceError> {
         self.take_fault(Method::InFlight)?;
+        self.connection().await;
         let db = self.db();
         let id = |t: &TableRef| db.catalog.get(t).and_then(TableSchema::source_id);
         let mut out: Vec<InFlightTxn> = db
@@ -863,6 +922,16 @@ impl SourceConnector for FakeSource {
                 break;
             }
             held.await;
+        }
+        if self.db().shared {
+            let _half = HalfRead::new(self);
+            loop {
+                let called = self.wake.notified();
+                if self.db().waiting > 0 {
+                    break;
+                }
+                called.await;
+            }
         }
         let next = rows.last().map(|r| KeysetCursor {
             key: identifier_values(table, r).expect("a key"),

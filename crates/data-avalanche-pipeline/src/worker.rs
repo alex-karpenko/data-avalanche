@@ -491,7 +491,7 @@ pub(crate) async fn start(
             Some(c) if matches!(plan, Plan::Resume) && c.columns() != now.columns() => {
                 drifted.insert(table.clone());
                 warnings.push(format!(
-                    "table {table}: its schema changed while the pipeline was down; the stream replays the change in order"
+                    "table {table}: its schema changed while the pipeline was down; the stream applies the change in order, or a catalog rescan does for an idle table; if it is being snapshotted, it is held and rescanned before the snapshot reads it"
                 ));
                 schema = c.clone();
             }

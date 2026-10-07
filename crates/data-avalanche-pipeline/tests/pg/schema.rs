@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use arrow_array::{Array, Int32Array};
 use data_avalanche_core::HaltReason;
 use data_avalanche_testkit::require_it;
@@ -39,8 +41,9 @@ async fn an_added_column_reaches_the_sink() {
     cleanup(&a, &n).await;
 }
 
-/// Channel D finds the table gone; it halts once the stream has passed the rescan, after its
-/// last change is in the sink.
+/// Channel D finds the table gone; it halts once the stream has passed the rescan, and its last
+/// change reaches the sink. The halt is in the status when it is handed to the writer, before the
+/// flush ahead of it is durable, so the sink is polled.
 #[tokio::test]
 async fn a_dropped_table_halts_and_the_others_go_on() {
     require_it!();
@@ -59,6 +62,7 @@ async fn a_dropped_table_halts_and_the_others_go_on() {
         &["gone", "kept"],
         "",
         "",
+        "",
         "\n    schema_evolution: { rescan_interval: 1s }",
     );
     let run = start(&p, &lake, None);
@@ -74,7 +78,15 @@ async fn a_dropped_table_halts_and_the_others_go_on() {
         st.halted.get(&gone) == Some(&HaltReason::TableDropped)
     })
     .await;
-    assert_eq!(lake.rows(&gone), [(1, Some("x".into()))], "its last change");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while lake.rows(&gone) != [(1, Some("x".into()))] {
+        assert!(
+            Instant::now() < deadline,
+            "its last change: {:?}",
+            lake.rows(&gone)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     a.batch_execute(&format!("INSERT INTO {kept} VALUES (2, 'z')"))
         .await
         .unwrap();

@@ -85,15 +85,17 @@ pub async fn fresh(admin: &Client, test: &str, ddl: &str) -> Names {
 /// A pipeline on the test server reading `include`, with `snapshots` settings (YAML flow
 /// entries; the mode defaults to `never`). It flushes at every transaction.
 pub fn pipeline(n: &Names, include: &[&str], snapshots: &str) -> Pipeline {
-    pipeline_with(n, include, snapshots, "", "")
+    pipeline_with(n, include, snapshots, "", "", "")
 }
 
-/// [`pipeline`] with more `sink` keys (YAML flow entries, each starting with a comma) and more
-/// pipeline keys (YAML lines indented four spaces, each starting with a newline).
+/// [`pipeline`] with more `source` keys (YAML lines indented six spaces, each starting with a
+/// newline), more `sink` keys (YAML flow entries, each starting with a comma) and more pipeline
+/// keys (YAML lines indented four spaces, each starting with a newline).
 pub fn pipeline_with(
     n: &Names,
     include: &[&str],
     snapshots: &str,
+    source: &str,
     sink: &str,
     more: &str,
 ) -> Pipeline {
@@ -116,7 +118,7 @@ pipelines:
       user: avalanche
       password: avalanche
       ssl_mode: disable
-      postgres: {{ publication: {publication}, slot: {slot}, heartbeat: 1s }}
+      postgres: {{ publication: {publication}, slot: {slot}, heartbeat: 1s }}{source}
     tables:
       include: [{include}]
       snapshots: {{ {snapshots} }}
