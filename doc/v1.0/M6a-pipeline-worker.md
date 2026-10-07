@@ -13302,7 +13302,7 @@ Measured along the way:
 
 M6a's own exit (M6's exit, the slice-1 E2E suite, is M6b's):
 
-- [ ] **The worker as a library** (roadmap §4 M6 scope, the parts that don't need the control
+- [x] **The worker as a library** (roadmap §4 M6 scope, the parts that don't need the control
   plane):
   - Phase 0: state load and the recorded `sink_type`, resolution, preflight, the D-V1.4
     Iceberg refusal, the per-table snapshot decision (Tasks 5, 11);
@@ -13314,7 +13314,7 @@ M6a's own exit (M6's exit, the slice-1 E2E suite, is M6b's):
   - the schema apply protocol §8, DDL replay included (Tasks 7, 11);
   - the per-table halt registry (Tasks 3, 6, 7);
   - error paths: source reconnect, sink retry → DEGRADED, `Fenced` → stop (Tasks 6, 11, 12).
-- [ ] **Carried from M5**, each closed:
+- [x] **Carried from M5**, each closed:
   - the start position persisted with `prepare`, and the slot intent first (Tasks 3, 11);
   - the checkpoint persisted before it is acknowledged (Tasks 6, 7);
   - `Prepared::added` snapshotted under `Resume`, the requests persisted before the checkpoint,
@@ -13332,16 +13332,16 @@ M6a's own exit (M6's exit, the slice-1 E2E suite, is M6b's):
   - REPLICA IDENTITY FULL signals: a signal whose classification finds no Safe change neither
     flushes nor evolves (Task 7);
   - DataFusion stays out: the pipeline doesn't depend on `sink-delta` (Global Constraints).
-- [ ] **Moved to M6b:** the lease, renewer and `PipelineController` (the `CommitGuard` seam is
+- [x] **Moved to M6b:** the lease, renewer and `PipelineController` (the `CommitGuard` seam is
   here); the lifecycle's persisted desired state (here: `Command::Drain`); the binary, HTTP and
   metrics; "Carried from M4"; the slice-1 E2E suite on RustFS.
-- [ ] `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
+- [x] `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo fmt --all --check` and `RUSTDOCFLAGS="-D warnings" cargo doc -p data-avalanche-pipeline
   --no-deps` are clean.
 - [ ] The integration job of PR CI is green (`tests/pg`, `tests/sync_commit` and
   `tests/sync_drop` included); `weekly.yml` runs `tests/pg`, `tests/sync_commit` and
   `tests/sync_drop` on PostgreSQL 14–17 after the merge.
-- [ ] The documents and spec edits listed under Decisions are applied; `doc/v1.0/README.md`
+- [x] The documents and spec edits listed under Decisions are applied; `doc/v1.0/README.md`
   lists this plan and its status.
 
 ## Deviations during execution
@@ -13351,7 +13351,7 @@ Executed 2026-10-03…07 on `feat/claude/m6a-pipeline-worker`. The 16 tasks were
 task reviews found defects in the planned code; the owner ruled on each, and most landed as the
 post-Task-16 fix batches A–F, one fix commit each plus test follow-ups. Counts in the task blocks
 are therefore behind: after the last batch the pipeline's unit tests number 158 and the hermetic
-workspace 817; `tests/pg` has 10 tests, `tests/sync_commit` 1 and the new `tests/sync_drop` 1.
+workspace 817 (173 and 832 after the whole-branch review); `tests/pg` has 10 tests, `tests/sync_commit` 1 and the new `tests/sync_drop` 1.
 
 **Task 1: `Contended` isn't transient** (prose only). The Task 1 interface list said
 `is_transient()` is true for `SourceError::Contended`; the code and its test say false, and the
@@ -13449,7 +13449,35 @@ owner rulings 2026-10-03 and 06).
   synchronous standby; it runs in PR CI and weekly. 42883/42804 (a retyped key) stay `Permanent`:
   no test showed them.
 
-Open for the whole-branch review: the minor items each review deferred, among
-them a non-drop 42703 now retrying silently until `SnapshotTimeout`, an unsupported logical type
-halting the table where Phase 0 step 4 says refuse the pipeline, Phase 0 writes not gated by
-`may_commit` (M6b), and `re_query`'s `TableHalt` halting without a flush first.
+**Whole-branch review** (2026-10-07; `4d297d4`, `b078e0d`; owner rulings 2026-10-07). The review
+found 1 Critical, 3 Important and 14 Minor issues; its scoped re-review approved the fixes and
+found residuals, fixed in a second round.
+- **C1:** `Core::snapshot_started` was never reset, so a re-snapshot after a lost position halted
+  `SNAPSHOT_TIMEOUT` at the first tick in any run older than `timeouts.snapshot`. It is reset when
+  a table's snapshot is requested from scratch.
+- **I1:** the biased `select!` put the stream above chunk results, the tick, the WAL-lag heartbeat
+  and the rescan; a stream that stays ready starved them. The stream arm is now after them.
+- **I2:** `status.snapshots` kept a table whose completion became durable during `finish()`; `open`
+  now replaces the snapshot status, and `finish()` handles `Durable` and `Halted` for the status.
+- **I3:** a table waiting for in-flight writers, or held across rescan rounds, warns once per wait,
+  naming the blocking xids; the status reports the reconciler log's size. Bounding the log is
+  DA-SNAP-11.
+- **M1 (owner ruling):** every halt flushes the table's committed rows first and rides the next job
+  with `at` = that checkpoint (stream and `re_query` `TableHalt`s, the accumulator's data halts);
+  the accumulator keeps a halted table's rows until the halt takes them, and the writer keeps its
+  own `SINK_REJECTED` over a later halt.
+- **Minors fixed:** a failing chunk read warns once per streak; a misfit cursor resets `rows_done`;
+  Phase 0 records a snapshot request only for a table that survived its checks; sleep-based test
+  assertions replaced; a stream `TableHalt` of a table already halted no longer overwrites its
+  halt (a table dropped and re-created moved `at` past rows the sink lacked).
+- **M7 (owner ruling):** Data-Flow Phase 0 step 4 amended (`2e33d4e`): a table the sink can't
+  represent halts that table.
+- **Recorded** (gap tracker §28.2): DA-SNAP-11 (the reconciler log's bound), DA-SNAP-12
+  (`parallelism > 1` on one PostgreSQL connection), DA-SNAP-13 (a wiped state baselines nothing),
+  DA-SRC-19 (which permanent read errors are table-scoped, M13). Carried to M6b as notes: warnings
+  that grow and repeat across reruns and reconnects, `finish()` not acknowledging the durable
+  checkpoint, `until_durable` not polling control, and a Delta test of a snapshot set at a covered
+  frontier (the slice-1 E2E).
+
+After the review: 832 workspace tests; `tests/pg` (10), `tests/sync_commit` and `tests/sync_drop`
+pass on PostgreSQL 18 and 14.

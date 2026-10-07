@@ -1549,7 +1549,7 @@ table). These items the review recorded rather than fixed (owner ruling 2026-10-
 | DA-SRC-19 | Which permanent chunk-read errors are table-scoped | 🟢 | Whole-branch review M13, Batch F N-1 | Rule per SQLSTATE in M7/M9 |
 
 Carried to M6b as notes, not gaps: the status's warnings grow and repeat across Phase 0 reruns
-(presentation and caps belong to the HTTP status); `finish()` doesn't acknowledge the durable
+and reconnects (presentation and caps belong to the HTTP status); `finish()` doesn't acknowledge the durable
 checkpoint and the error path doesn't close the stream (harmless: the next session starts from the
 slot document); `until_durable` polls neither control nor the stream (a drain during a long sink
 outage inside a schema signal waits for the sink); the Delta sink has no test of a snapshot set
