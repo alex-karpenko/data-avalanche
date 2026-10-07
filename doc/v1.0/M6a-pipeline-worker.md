@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-03
+updated: 2026-10-07
 domain: Data Flow
 tags: [v1, implementation-plan, m6a, pipeline-worker, snapshot, checkpoint, schema-evolution, halts, crash-recovery, postgresql]
 resolves: [DA-SNAP-9]
@@ -229,16 +229,28 @@ the arrow.
   - No stream stall watchdog. The spec has none, a server keep-alive may come only every
     `wal_sender_timeout / 2`, and pgwire's idle feedback surfaces a dead connection as an error.
 - **D-M6a.10 — WAL lag** (G-22, V-104). `retained_bytes` is read at every heartbeat and always
-  reported in the status. Past `max_wal_lag_bytes` the worker ends with `WorkerError::WalLag`. A
-  failed read waits for the next heartbeat.
+  reported in the status. Past `max_wal_lag_bytes` the worker ends with `WorkerError::WalLag`. Any
+  failed read, transient or permanent, waits for the next heartbeat and the pipeline keeps
+  running. A permanent failure adds one warning per failure streak ("the WAL-lag guard is blind",
+  with the error; it names `max_wal_lag_bytes` only when a limit is set). A successful read ends the
+  streak. (Owner ruling 2026-10-03, built in the post-Task-16 Batch D.)
 - **D-M6a.11 — A schema that drifted while down, under a snapshot** (Q-M6a-8). On a resume,
   Phase 0 records each table whose catalog schema moved past the cached one. A snapshot of such a
   table holds its reads until a rescan has brought the schema up to date. A table the rescan
-  doesn't name is released at once; a table it names is released once the report has applied,
-  after the stream catches up. Without it, an `ADD COLUMN` on an idle table would be read under
+  doesn't name is released once any schema change the stream applied to it has been handed to
+  the writer (at once, if none); a table it names is released once the report has applied, after
+  the stream catches up. A table the catch-up skips (its re-read failed, or its cache moved) stays
+  held for the next round. A pending schema of a held table is flushed at the rescan itself, so a
+  quiet table isn't held until the next timed flush (or forever, with `flush.seconds: null`). A
+  failing round is retried with `source_backoff` and warns once per failure streak; a halt or a
+  drop releases the table. Without the hold, an `ADD COLUMN` on an idle table would be read under
   the cached columns: PostgreSQL's chunk read checks only those, so the new column would stay
   NULL in every snapshotted row. A column dropped or retyped while the worker runs fails the read
-  instead, and the read's rescan (Task 14) catches up.
+  instead, transiently, and the read's rescan (Task 14) catches up. That includes a `DROP COLUMN`
+  that takes its lock before the chunk's `SELECT` but becomes visible only after the read's catalog
+  check (SQLSTATE 42703, routine with a synchronous standby): source-pg maps it to the same
+  transient error (owner ruling 2026-10-07). (The release conditions after the first sentence
+  were refined in the post-Task-16 Batches B and F.)
 
 **Facts measured while building** (outrank memory):
 
@@ -328,7 +340,8 @@ a `research:` commit; the gap tracker in a `gap:` commit):
     Option<ChunkVisibility>`.
   - `InFlightTxn { xid, tables: Vec<u64> }`; `SourceConnector::in_flight() ->
     Result<Option<Vec<InFlightTxn>>, SourceError>`, default `Ok(None)`.
-  - `SourceError::Contended(String)` (transient: `is_transient()` is true).
+  - `SourceError::Contended(String)` (not transient: `is_transient()` is false; the worker
+    retries it within `contended_window`, D-M6a.9).
   - `HaltReason::SinkRejected { detail }` (`SINK_REJECTED`) and `SnapshotTimeout { limit_secs }`
     (`SNAPSHOT_TIMEOUT`).
   - `TableChangeSet::snapshot: bool`; `validate` refuses a snapshot set with deletes, a truncate
@@ -13277,6 +13290,11 @@ Measured along the way:
   Without Task 14's rescan flag, its live test times out with the snapshot at `rows_done: 0`.
   Without Task 16's hold, its unit test reads three times and its live test finds no `w`
   column.
+  *Superseded during execution* (see Deviations, Batches C and F): after Task 16 the Task 14 live
+  test no longer reached Task 14's path (the drifted table is held and rescanned before any read);
+  it now drops the column mid-snapshot, and without the flag it times out with `rows_done` stuck
+  at 1. `tests/sync_commit` doesn't discriminate the durability counting added in Batch C (unit
+  tests do); it still fails under the window rule.
 - **Not run while planning:** the CI workflows themselves. `weekly.yml` first runs `tests/pg` on
   PostgreSQL 15–17 after the merge.
 
@@ -13320,7 +13338,118 @@ M6a's own exit (M6's exit, the slice-1 E2E suite, is M6b's):
 - [ ] `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo fmt --all --check` and `RUSTDOCFLAGS="-D warnings" cargo doc -p data-avalanche-pipeline
   --no-deps` are clean.
-- [ ] The integration job of PR CI is green (`tests/pg`, `tests/sync_commit` included);
-  `weekly.yml` runs `tests/pg` on PostgreSQL 14–17 after the merge.
+- [ ] The integration job of PR CI is green (`tests/pg`, `tests/sync_commit` and
+  `tests/sync_drop` included); `weekly.yml` runs `tests/pg`, `tests/sync_commit` and
+  `tests/sync_drop` on PostgreSQL 14–17 after the merge.
 - [ ] The documents and spec edits listed under Decisions are applied; `doc/v1.0/README.md`
   lists this plan and its status.
+
+## Deviations during execution
+
+Executed 2026-10-03…07 on `feat/claude/m6a-pipeline-worker`. The 16 tasks were applied as written
+(each task commit's tree was compared with the verified workspace), except for the fixes below. The
+task reviews found defects in the planned code; the owner ruled on each, and most landed as the
+post-Task-16 fix batches A–F, one fix commit each plus test follow-ups. Counts in the task blocks
+are therefore behind: after the last batch the pipeline's unit tests number 158 and the hermetic
+workspace 817; `tests/pg` has 10 tests, `tests/sync_commit` 1 and the new `tests/sync_drop` 1.
+
+**Task 1: `Contended` isn't transient** (prose only). The Task 1 interface list said
+`is_transient()` is true for `SourceError::Contended`; the code and its test say false, and the
+worker retries it within `contended_window` (D-M6a.9). The list is corrected in place.
+
+**Task 4: the fake follows pgoutput** (`f67af56`, owner-approved). A change carries its commit
+record's start and the `Commit` the record's end, 8 bytes on; a plain UPDATE streams no
+before-image (REPLICA IDENTITY DEFAULT).
+
+**Task 5: a snapshot in progress starts over after a gap** (`355c554`, D-M6a.8). `decide`
+resumed an in-progress snapshot under a lost position or an adopted orphan; rows before its cursor
+may have changed in the gap. Now `resume` is `in_progress && !recovery`.
+
+**Task 6: the writer checks the lease before every state write** (`6a83cb5`). A state write retried
+through a storage outage could land after the lease was lost and move the slot document behind
+the new owner's checkpoint. Also: Task 6's interface line names `mpsc::Receiver<Job>`; the code
+(and the later tasks' blocks) use unbounded channels.
+
+**Task 13: `sync_commit` restores the server after a panic** (`25aa152`). Its reset ran only on
+the error path; a panic left `synchronous_standby_names` set, which survives restarts. The restart
+test can't pass vacuously any more, and `weekly.yml` runs `sync_commit` too.
+
+**Task 15: V-118 on `defaults` alone** (`2d3cb16`). The planned cases set only the pipeline path;
+a case where `defaults` is short and the pipeline overrides it now pins the `defaults` pass, and
+`9999ms` pins the sub-second bound.
+
+**Batch A — schema signals** (`03de15f`, `fe98335`; Task 7 review, owner rulings 2026-10-03).
+- The control branch is polled only while not draining: with the handle dropped, `recv()` returned
+  `Ready(None)` on every poll and starved the stream mid-transaction (a livelock).
+- §8.1 order: a signal classifies first. A no-change or Ignorable signal neither flushes nor
+  evolves (`TableBuffer::set_schema` keeps a same-shape schema without a flush). A Safe change
+  flushes, waits for durability, then evolves. An Unsafe change, or a Safe one with evolution off,
+  flushes the table's rows before the change, waits, then halts at that flush's checkpoint (the
+  planned code dropped those rows). Spec `Schema_Change_Detection_and_Evolution` §8.1 amended to
+  match (`3ec48ab`).
+- A crash between the pre-halt flush and the halt's record replays from `at` (tested).
+
+**Batch B — re_query, channel D, rescan failures** (`2a86eb1`, `b4ac9c0`, `06c153a`; Task 8 review,
+owner rulings 2026-10-03 and 06).
+- A `re_query` fetch that fails (neither `TableHalt` nor `Permanent`) is tried three times with
+  backoff, then the columns stay masked (carry_forward's handling) and the status warns once per
+  table streak; while the streak lasts each commit tries once, without backoff. The planned code
+  ended the session, which looped for the whole pipeline after a `DROP COLUMN`. Data-Flow §TOAST
+  amended (`3ec48ab`).
+- Channel D keeps each table's cached schema as it was at the rescan; at catch-up it re-reads the
+  table and applies the finding only if it is unchanged and the cache hasn't moved, else it skips
+  the table for the next round. A failed re-read ends that catch-up.
+- A failed rescan round warns once per streak; the rescan timer uses `MissedTickBehavior::Delay`.
+- `status::Streak` is the shared once-per-streak helper. The FakeSource scopes a `Columns` hint
+  like PostgreSQL's `scope` (types from the hint, nullability from the catalog; an unknown column
+  or a hint without the key halts the table).
+
+**Batch C — durability counts jobs** (`97b1331`, `a2f3366`; Task 10 review, owner ruling
+2026-10-03; Task 13 review).
+- Consecutive chunk jobs can share a checkpoint, so durability by position fired one job early:
+  `until_durable` returned with chunk MERGEs still queued (an evolve could land under an old-shape
+  commit) and a snapshot was reported done with rows missing (631 of 5000, measured). The session
+  now numbers the jobs it hands the writer; the writer emits exactly one `Durable` per job, in
+  order; `until_durable` and a snapshot's completion wait by number.
+- A writer halt stops the table's snapshot (a dump worker ends `Dumped`, the halt stays
+  `SINK_REJECTED`); every halt drops the table from `status.snapshots`.
+- `sync_commit` runs with `buffer_capacity_rows: 10` and asserts its stall holds; it doesn't
+  discriminate the job counting live (measured: 3 of 3 passes with the counting reverted), so unit
+  tests guard that.
+
+**Batch D — Phase 0 and the WAL-lag guard** (`cb63e19`, `6252647`; Task 11 review, owner rulings
+2026-10-03 and 07).
+- On a Fresh start Phase 0 saves the schema caches before the slot document (a crash between left
+  `Resume` with a stale cache).
+- Phase 0's rescan of gone tables warns once per failure streak; a start with nothing gone ends
+  the streak.
+- `retained_bytes`: D-M6a.10 as amended above.
+- The writer keeps no snapshot document of a table it refused (a refused dump table ended with a
+  `Completed` document).
+
+**Batch E — spawned chunk reads** (`65bb699`, `e015e2e`; Task 13 review I3, Task 14 review).
+- Chunk reads shared the catalog client with queries the session awaits inline (the WAL-lag read,
+  the in-flight recheck, rescans). tokio-postgres holds one response message per request, so an
+  inline query behind a half-read chunk deadlocked until `timeouts.command` (30 s; 2 of 11 busy
+  runs). Each read now runs as its own task in a `JoinSet`, aborted on drop.
+- The busy test proves its writers overlap the snapshot; the dropped-table test polls the sink for
+  durability; Task 14's flag is no longer taken while a rescan is pending; the drift warning holds
+  with periodic rescans off.
+
+**Batch F — the drift hold** (`59dc20b`, `b0cffb9`; Task 16 review, owner ruling 2026-10-07).
+- Task 16 had voided Task 14's live test (see the verification note above); it now drops the
+  column mid-snapshot.
+- The release paths are tested with a FakeSource stream-hold knob. A held table the catch-up skips
+  stays held; an unnamed one waits until its stream-applied schema change is with the writer; a
+  held table's pending schema flushes at the rescan; a failing round backs off and warns once per
+  streak, and the streak ends with the hold. D-M6a.11 is amended above.
+- SQLSTATE 42703 from a chunk read (a `DROP COLUMN` locked before the `SELECT`, visible only after
+  the read's catalog check) ended the whole worker as `Permanent`; source-pg now maps it to the
+  transient "changed under the snapshot". `tests/sync_drop` reproduces the window with a phantom
+  synchronous standby; it runs in PR CI and weekly. 42883/42804 (a retyped key) stay `Permanent`:
+  no test showed them.
+
+Open for the whole-branch review: the minor items each review deferred, among
+them a non-drop 42703 now retrying silently until `SnapshotTimeout`, an unsupported logical type
+halting the table where Phase 0 step 4 says refuse the pipeline, Phase 0 writes not gated by
+`may_commit` (M6b), and `re_query`'s `TableHalt` halting without a flush first.
