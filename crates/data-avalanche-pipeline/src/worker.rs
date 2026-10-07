@@ -1318,39 +1318,49 @@ mod tests {
     }
 
     /// A re-snapshot after a lost position is timed from its own start, not from the run's first
-    /// snapshot of the table (final review C1): the run is older than `timeouts.snapshot` when
-    /// the position is lost, and the table snapshots again without a `SNAPSHOT_TIMEOUT` halt.
+    /// snapshot of the table (final review C1). The run's first snapshot of `a` began longer ago
+    /// than `timeouts.snapshot`; Phase 0 reruns after a lost position, and the snapshot it
+    /// requests runs without a `SNAPSHOT_TIMEOUT` halt. The old start is set directly, so only
+    /// the re-snapshot runs under the limit, with seconds to spare, and `a`'s read is held until
+    /// a tick has checked the limit: `b`, which an open writer blocks, is rechecked at the tick,
+    /// after the limit check (re-review N4).
     #[tokio::test]
     async fn a_snapshot_after_a_lost_position_is_timed_from_its_own_start() {
-        let w = World::new(&["a"]);
+        let w = World::new(&["a", "b"]);
+        w.started(&["a", "b"]).await;
         w.source.load(&t("a"), rows(1..=2));
-        let (mut worker, handle) = PipelineWorker::new(&mode("mode: initial"), deps(&w), fast());
-        let limit = std::time::Duration::from_millis(500);
-        worker.core.settings.snapshot_timeout = limit;
-        let status = handle.status.clone();
+        w.source.load(&t("b"), rows(1..=2));
+        let (mut core, control, status) = w.core(&mode("mode: initial"), &[]);
+        let limit = std::time::Duration::from_secs(5);
+        core.settings.snapshot_timeout = limit;
+        // `a` reads while `b` waits for its writer.
+        core.settings.parallelism = 2;
+        let long_ago = Instant::now()
+            .checked_sub(limit * 2)
+            .expect("the clock is past ten seconds");
+        core.snapshot_started.insert(t("a"), long_ago);
+        w.source.lose_slot();
+        let from = core.source.reset_position().await.unwrap();
+        start(&mut core, Some(from)).await.unwrap();
+        let xid = w.source.open_writer(&[t("b")]);
+        w.source.hold_reads();
+        let before = w.source.in_flights();
+        let session = Session::open(&mut core).await.unwrap().unwrap();
         let driver = async {
-            streamed(&status, &w).await;
-            // The run outlives the limit.
-            tokio::time::sleep(limit + std::time::Duration::from_millis(100)).await;
-            let reads = w.source.reads(&t("a"));
-            // The snapshot can't end before the session's first tick.
-            w.source.hold_reads();
-            w.source.lose_slot();
-            w.source
-                .commit(FakeTxn::new().insert(&t("a"), row(7, "lost")));
-            wait_until("the table is snapshotted again", || {
-                w.source.reads(&t("a")) > reads
+            wait_until("a tick has rechecked `b`'s writer", || {
+                w.source.in_flights() >= before + 2
             })
             .await;
             w.source.release_reads();
+            w.source.abort_writer(xid);
             streamed(&status, &w).await;
-            let _ = handle.control.send(Command::Drain).await;
+            control.send(Command::Drain).await.unwrap();
         };
-        let (end, ()) = tokio::join!(worker.run(), driver);
-        assert_eq!(end.unwrap(), Exit::Drained);
+        let (end, ()) = tokio::join!(session.run(), driver);
+        assert!(matches!(end.unwrap(), End::Exit(Exit::Drained)));
         let st = status.borrow().clone();
         assert!(st.halted.is_empty(), "halted: {:?}", st.halted);
-        assert_eq!(w.ids("a"), [1, 2, 7]);
+        assert_eq!((w.ids("a"), w.ids("b")), (vec![1, 2], vec![1, 2]));
         let doc = w.docs.table_snapshot(&t("a")).await.unwrap().unwrap().doc;
         assert_eq!(doc.status, SnapshotStatus::Completed);
     }

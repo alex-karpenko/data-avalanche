@@ -243,6 +243,7 @@ struct Db {
     opened: Vec<SourcePosition>,
     reads: BTreeMap<TableRef, usize>,
     rescans: usize,
+    in_flights: usize,
     fetches: BTreeMap<TableRef, usize>,
     prepares: Vec<Option<SourcePosition>>,
 }
@@ -291,6 +292,7 @@ impl FakeSource {
             opened: vec![],
             reads: BTreeMap::new(),
             rescans: 0,
+            in_flights: 0,
             fetches: BTreeMap::new(),
             prepares: vec![],
         };
@@ -519,6 +521,11 @@ impl FakeSource {
     /// `rescan` calls so far, failed ones included.
     pub fn rescans(&self) -> usize {
         self.db().rescans
+    }
+
+    /// `in_flight` calls that answered so far.
+    pub fn in_flights(&self) -> usize {
+        self.db().in_flights
     }
 
     /// `fetch_rows` calls for `table` so far, failed ones included.
@@ -905,7 +912,8 @@ impl SourceConnector for FakeSource {
     ) -> Result<Option<Vec<data_avalanche_core::InFlightTxn>>, SourceError> {
         self.take_fault(Method::InFlight)?;
         self.connection().await;
-        let db = self.db();
+        let mut db = self.db();
+        db.in_flights += 1;
         let id = |t: &TableRef| db.catalog.get(t).and_then(TableSchema::source_id);
         let mut out: Vec<InFlightTxn> = db
             .stalled

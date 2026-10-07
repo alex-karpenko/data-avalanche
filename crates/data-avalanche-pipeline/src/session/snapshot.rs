@@ -706,6 +706,16 @@ mod tests {
             .collect()
     }
 
+    /// Waits until the session has read the in-flight writers again twice since `before` calls
+    /// (its open's read included): at least one recheck has found the writer still in flight,
+    /// and the reads it allowed have run (re-review N2).
+    async fn rechecked(w: &World, before: usize) {
+        wait_until("two rechecks of the writers", || {
+            w.source.in_flights() >= before + 3
+        })
+        .await;
+    }
+
     async fn doc(w: &World, table: &str) -> TableSnapshotDoc {
         w.docs.table_snapshot(&t(table)).await.unwrap().unwrap().doc
     }
@@ -829,11 +839,13 @@ mod tests {
         assert_eq!(w.text("a", "doc"), [Some("new".to_owned())]);
         w.request(&["a"]).await;
         let (core, control, status) = w.core(&chunks_of(10), &["a"]);
+        let before = w.source.in_flights();
         run(core, control, status, async |status| {
             wait_until("the table waits for the writer", || {
                 !writer_waits(&status.borrow()).is_empty()
             })
             .await;
+            rechecked(&w, before).await;
             assert_eq!(w.source.reads(&t("a")), 0, "the writer is still in flight");
             w.source.release(xid);
             snapshot_done(&w, &status, "a").await;
@@ -853,12 +865,14 @@ mod tests {
         w.request(&["a"]).await;
         let xid = w.source.open_writer(&[t("a")]);
         let (core, control, status) = w.core(&chunks_of(10), &["a"]);
+        let before = w.source.in_flights();
         run(core, control, status, async |status| {
             wait_until("the table waits for the writer", || {
                 !writer_waits(&status.borrow()).is_empty()
             })
             .await;
-            assert_eq!(w.source.reads(&t("a")), 0);
+            rechecked(&w, before).await;
+            assert_eq!(w.source.reads(&t("a")), 0, "the writer is still in flight");
             w.source
                 .commit_writer(xid, FakeTxn::new().update(&t("a"), row(2, "new")));
             snapshot_done(&w, &status, "a").await;

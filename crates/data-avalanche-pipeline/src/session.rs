@@ -481,7 +481,14 @@ impl<'c> Session<'c> {
             StreamItem::SchemaSignal { table, hint, .. } => {
                 return self.schema_signal(table, hint).await;
             }
-            StreamItem::TableHalt { table, reason, .. } => self.halt(table, reason)?,
+            // A table already halted (by the session, channel D or the writer) keeps its halt:
+            // another would replace its reason, and its `at` with one past rows the sink
+            // doesn't hold (re-review N1).
+            StreamItem::TableHalt { table, reason, .. } => {
+                if self.schemas.contains_key(&table) {
+                    self.halt(table, reason)?;
+                }
+            }
             StreamItem::Commit(b) => {
                 if let Some(end) = self.re_query(&b).await? {
                     return Ok(Some(end));
@@ -2451,6 +2458,65 @@ mod tests {
             "the halt holds from the flush's checkpoint: {halts:?}"
         );
         assert_eq!(status.borrow().halted.get(&t("a")), Some(&reason));
+    }
+
+    /// A stream `TableHalt` for a table already halted leaves its halt alone (re-review N1): the
+    /// table halted on a row it couldn't take, the checkpoint moved on, then the stream halts it
+    /// again (a table dropped and re-created). The reason and `at` stay the first halt's.
+    #[tokio::test]
+    async fn a_stream_halt_of_a_halted_table_keeps_the_first_halt() {
+        let w = World::new(&["a", "b"]);
+        w.started(&["a", "b"]).await;
+        let start = w.source.wal_end();
+        let p = pipeline("", "flush: { seconds: 3600 }", "");
+        let (mut core, _control, status) = w.core(&p, &["a", "b"]);
+        let mut s = Session::open(&mut core).await.unwrap().unwrap();
+        let mut bad = row(1, "x");
+        bad.0.push(("zzz".into(), ColumnValue::Int64(1)));
+        w.source.commit(FakeTxn::new().insert(&t("a"), bad));
+        w.source.commit(FakeTxn::new().insert(&t("b"), row(1, "y")));
+        let moved = w.source.wal_end();
+        pump(&mut s, &moved).await;
+        s.flush().unwrap();
+        assert!(s.until_durable().await.unwrap().is_none());
+        let first = w.docs.halts().await.unwrap().tables;
+        assert!(
+            matches!(&first[..], [h] if h.table == t("a") && h.at == start
+                && matches!(h.reason, HaltReason::SchemaMismatch { .. })),
+            "{first:?}"
+        );
+        let after = SourcePosition::Pg(Lsn(lsn_of(&moved).0 + 0x10));
+        let items = [
+            StreamItem::Begin {
+                xid: 900,
+                commit_ts_micros: 1,
+            },
+            StreamItem::TableHalt {
+                table: t("a"),
+                seq: SourceSeq::Pg(lsn_of(&moved)),
+                reason: HaltReason::TableDropped,
+            },
+            StreamItem::Commit(TransactionBoundary {
+                xid: 900,
+                commit_pos: after,
+                commit_ts_micros: 1,
+            }),
+        ];
+        for item in items {
+            assert!(s.item(item).await.unwrap().is_none());
+        }
+        s.flush().unwrap();
+        assert!(s.until_durable().await.unwrap().is_none());
+        assert_eq!(w.docs.halts().await.unwrap().tables, first);
+        assert!(
+            matches!(
+                status.borrow().halted.get(&t("a")),
+                Some(HaltReason::SchemaMismatch { .. })
+            ),
+            "{:?}",
+            status.borrow().halted
+        );
+        assert_eq!(w.ids("b"), [1]);
     }
 
     /// A held table that stays held across rescan rounds warns once (final review I3), at its
