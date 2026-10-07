@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-03
+updated: 2026-10-07
 domain: Architecture
 tags: [gap-analysis, design, re-derivation, spec-readiness, blockers, open-decisions]
 resolves: []
@@ -126,13 +126,14 @@ does not block starting the specification.
 ### Counts (by status)
 
 > Recounted 2026-09-26 (v1 readiness tidy, §26); the 2026-06 figures are superseded. Open count
-> updated 2026-10-02 for the gaps M5 carried (§27), and 2026-10-03 for DA-SNAP-9 and DA-SNAP-10 (§28).
+> updated 2026-10-02 for the gaps M5 carried (§27), 2026-10-03 for DA-SNAP-9 and DA-SNAP-10 (§28),
+> and 2026-10-07 for the M6a whole-branch review (§28.2).
 
 | Status | Count (v1 scope) | Notes |
 |---|---|---|
 | ✅ Resolved | the large majority | Design closed by a research/spec doc or a probe. |
 | 🔄 Partial | 2 | DA-SNAP-7, DA-SRC-9 (neither blocks the plan); DA-MS-3 is a decided caveat. DA-X-8 ✅ 2026-09-26. |
-| 🟥 Open (v1) | **7** | DA-SRC-13…18, carried from M5 (§27); DA-SNAP-10 🆕 2026-10-03 (§28.1). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
+| 🟥 Open (v1) | **11** | DA-SRC-13…18, carried from M5 (§27); DA-SNAP-10 🆕 2026-10-03 (§28.1); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
 | 🧪 Verify (v1) | **0** | DA-SRC-10/11 proven 2026-09-26 (§21). |
 | ⏭ v2 | 13 | Iceberg-sink items (§26.2). |
 | 🟢 Spec-merge debt | **0** | All applied 2026-09-26 (§26.6): §19.3 S-1…S-6, the DA-X-8 config residual, the D-V1 patches and the Data-Flow Phase 2a probe details. |
@@ -292,6 +293,9 @@ read-point hazard. This is a *change* to `Data-Flow.md` Phase 1, so it carries s
 | DA-SNAP-8 | PK-less table under a **dump-only** mode (snapshot, never stream) | 🟡 | ✅ | The PK-less halt rule (DA-DEDUP-3) is justified by equality-delete keying — but a `dump_*` table is insert-only and never deletes, so the keying argument doesn't apply. Whether a dump-only PK-less table may be snapshotted (or still halts) is **unspecified**. Newly surfaced edge case. **2026-09-26 tidy:** decided by spec: the identifier precondition (config §11.2) applies in every mode — explicit PK-less table halts, glob-matched one is skipped; `tables.surrogate_key` struck (G-30). Dump-only PK-less tables are not supported in v1. | — |
 | DA-SNAP-9 | The snapshot watermark can't order a chunk's MVCC snapshot against the stream | 🟡 | ✅ | Closed 2026-10-03 (§28): each chunk read records its `pg_current_snapshot()`, the writers in flight at the session's start are waited for, and the reconciler drops a chunk row a stream transaction the read didn't see already wrote (Snapshot_Resumability §1.1; Data-Flow Phase 1, S-T). Measured: M6a Task 13's busy-snapshot and stalled-synchronous-commit tests. | — |
 | DA-SNAP-10 | 🆕 MySQL's window rule may miss a transaction the binlog delivered before InnoDB made it visible | 🟡 | 🟥 | §28.1. MySQL/MariaDB chunks carry no read visibility, so the reconciler uses the window rule: only transactions applied after a read was issued are filtered. Group commit makes the binlog readable (sync stage) before the InnoDB commit (commit stage); semi-sync `AFTER_SYNC` waits for the replica ack between them, up to `rpl_semi_sync_source_timeout`. A transaction applied from the binlog before a chunk is issued can then still be invisible to that chunk's read, and a stale chunk row would undo it, the MySQL analogue of DA-SNAP-9's stalled synchronous commit. Reasoned (M6a Task 9 review), not measured. Close before M7: an S-MY probe that stalls a semi-sync ack, then the fix (e.g. a per-read visibility signal, or waiting for in-flight commits as Q-M6a-2 does on PostgreSQL). | — |
+| DA-SNAP-11 | 🆕 The reconciler's log is unbounded while a snapshotting table's reads wait | 🟢 | 🟥 | §28.2. Every stream transaction that writes a snapshotting table is logged with its keys until a chunk proves it visible. While the table's reads wait (an in-flight writer at session start, a drift hold), no chunk is reconciled and the log grows with every key written, for up to `timeouts.snapshot`. M6a warns once per wait and reports the log's size in the status (M6b's gauge); bounding it (coalesce per table, or skip logging until a read can be issued) is open. | — |
+| DA-SNAP-12 | 🆕 `parallelism > 1` reads chunks one after another on PostgreSQL | 🟢 | 🟥 | §28.2. Chunk reads share the one catalog connection, so they pipeline rather than run in parallel; each read's client-side bound starts at spawn, so a read queued behind slow chunks can time out and the abandoned connection fails its neighbours. Fix: a small read pool or a connection per concurrent read. | — |
+| DA-SNAP-13 | 🆕 A wiped state with an existing sink table baselines nothing | 🟢 | 🟥 | §28.2. With no cached schema, Phase 0 doesn't baseline (§8.2) against the sink table's schema; a shape mismatch surfaces later as `SINK_REJECTED` (visible, not silent). Only the adopted-orphan case with a cache is covered. | — |
 
 ---
 
@@ -382,6 +386,7 @@ the MySQL path with one genuine correctness dependency.
 | DA-SRC-16 | The replication connection's timeouts | 🟢 | 🆕 🟥 | Carried from M5; detail in §27. | — |
 | DA-SRC-17 | Source edges PostgreSQL doesn't produce, and small gaps | 🟢 | 🆕 🟥 | Carried from M5; detail in §27. | — |
 | DA-SRC-18 | M5 test gaps | 🟢 | 🆕 🟥 | Carried from M5; detail in §27. | — |
+| DA-SRC-19 | 🆕 Which permanent chunk-read errors are table-scoped | 🟢 | 🟥 | §28.2. A permanent chunk-read error ends the whole pipeline (D-M6a.7); a retyped key's 42883/42804 would loop it through restarts though only that table's read is broken. A non-drop 42703 (e.g. a quoting bug) now retries as "changed under the snapshot" until `SNAPSHOT_TIMEOUT`, with a warning per streak. Rule per SQLSTATE which errors halt the table and which end the pipeline, with MySQL's in view (M7/M9). | — |
 
 ---
 
@@ -1526,3 +1531,27 @@ on an idle table triggers a rescan (the M5-carried item).
 | ID | Gap | Severity | Surfaced by | Next |
 |---|---|---|---|---|
 | DA-SNAP-10 | MySQL's window rule may miss a transaction the binlog delivered before InnoDB made it visible (group commit's sync stage before its commit stage; semi-sync `AFTER_SYNC` holds the gap open for the replica ack) | 🟡 | M6a Task 9 review (the reconciler implements the spec's window rule exactly) | An S-MY probe before M7: stall a semi-sync ack, apply the binlog event, read a chunk issued after it; then rule on the fix. Owner agreed to record it, 2026-10-03 |
+
+### 28.2 New gaps from the M6a whole-branch review (2026-10-07)
+
+M6a was executed 2026-10-03…07: 16 tasks, six post-Task-16 fix batches from the task reviews'
+owner rulings, and a whole-branch review whose Critical and Important findings were fixed before
+the PR (the plan's "Deviations during execution"). Spec edits: Schema_Change §8.1 (classify first;
+an unsafe change flushes before it halts; a change applies at its stream position), Data-Flow
+§TOAST (`re_query`'s fallback) and Phase 0 step 4 (a table the sink can't represent halts that
+table). These items the review recorded rather than fixed (owner ruling 2026-10-07):
+
+| ID | Gap | Severity | Surfaced by | Next |
+|---|---|---|---|---|
+| DA-SNAP-11 | The reconciler's log is unbounded while a snapshotting table's reads wait | 🟢 | Whole-branch review I3 (Task 9 deferral) | Bound it (coalesce per table, or skip logging until a read can be issued — check against the stalled synchronous commit first); M6b exports the reported size as a gauge |
+| DA-SNAP-12 | `parallelism > 1` reads chunks one after another on PostgreSQL, and a queued read spends its timeout budget | 🟢 | Whole-branch review M3 | A small read pool, or a connection per concurrent read |
+| DA-SNAP-13 | A wiped state with an existing sink table baselines nothing | 🟢 | Whole-branch review M6 (Task 11 deferral) | Baseline against the sink's schema when no cache exists, or document the `SINK_REJECTED` outcome |
+| DA-SRC-19 | Which permanent chunk-read errors are table-scoped | 🟢 | Whole-branch review M13, Batch F N-1 | Rule per SQLSTATE in M7/M9 |
+
+Carried to M6b as notes, not gaps: the status's warnings grow and repeat across Phase 0 reruns
+(presentation and caps belong to the HTTP status); `finish()` doesn't acknowledge the durable
+checkpoint and the error path doesn't close the stream (harmless: the next session starts from the
+slot document); `until_durable` polls neither control nor the stream (a drain during a long sink
+outage inside a schema signal waits for the sink); the Delta sink has no test of a snapshot set
+committed at a covered frontier (the slice-1 E2E suite on RustFS should emit a chunk on an idle
+source).
