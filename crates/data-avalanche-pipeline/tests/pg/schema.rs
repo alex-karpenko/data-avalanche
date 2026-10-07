@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use arrow_array::{Array, Int32Array};
 use data_avalanche_core::HaltReason;
@@ -78,14 +78,14 @@ async fn a_dropped_table_halts_and_the_others_go_on() {
         st.halted.get(&gone) == Some(&HaltReason::TableDropped)
     })
     .await;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while lake.rows(&gone) != [(1, Some("x".into()))] {
         assert!(
-            Instant::now() < deadline,
+            tokio::time::Instant::now() < deadline,
             "its last change: {:?}",
             lake.rows(&gone)
         );
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     a.batch_execute(&format!("INSERT INTO {kept} VALUES (2, 'z')"))
         .await

@@ -490,8 +490,15 @@ pub(crate) async fn start(
             }
             Some(c) if matches!(plan, Plan::Resume) && c.columns() != now.columns() => {
                 drifted.insert(table.clone());
+                let idle = match core.settings.rescan_interval {
+                    Some(every) => format!(
+                        "or, for an idle table, the next periodic rescan does (within {}s)",
+                        every.as_secs()
+                    ),
+                    None => "and with periodic rescans off (rescan_interval 0) an idle table keeps its cached schema until a change of it streams".to_owned(),
+                };
                 warnings.push(format!(
-                    "table {table}: its schema changed while the pipeline was down; the stream applies the change in order, or a catalog rescan does for an idle table; if it is being snapshotted, it is held and rescanned before the snapshot reads it"
+                    "table {table}: its schema changed while the pipeline was down; the stream applies the change in order {idle}; if it is being snapshotted, it is held and rescanned before the snapshot reads it"
                 ));
                 schema = c.clone();
             }

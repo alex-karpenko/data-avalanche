@@ -181,6 +181,24 @@ impl Drop for HalfRead<'_> {
     }
 }
 
+/// A call waiting on the shared connection ([`FakeSource::share_connection`]), until it is
+/// dropped: a call cancelled mid-wait stops waiting too.
+struct Waiting<'a>(&'a FakeSource);
+
+impl<'a> Waiting<'a> {
+    fn new(source: &'a FakeSource) -> Self {
+        source.db().waiting += 1;
+        source.wake.notify_waiters();
+        Self(source)
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.db().waiting -= 1;
+    }
+}
+
 /// A test's action, run once inside a source call.
 struct Action(Box<dyn FnOnce(&FakeSource) + Send>);
 
@@ -424,14 +442,10 @@ impl FakeSource {
 
     /// A call waits on the shared connection until no chunk read is half done.
     async fn connection(&self) {
-        {
-            let mut db = self.db();
-            if !db.shared {
-                return;
-            }
-            db.waiting += 1;
+        if !self.db().shared {
+            return;
         }
-        self.wake.notify_waiters();
+        let _waiting = Waiting::new(self);
         loop {
             let done = self.wake.notified();
             if self.db().half_read == 0 {
@@ -439,7 +453,6 @@ impl FakeSource {
             }
             done.await;
         }
-        self.db().waiting -= 1;
     }
 
     /// Runs `f` once, inside the next `rescan`, after it has read the catalog: a change made

@@ -11,7 +11,8 @@ use crate::common::{
 /// Writers change the table while it is being snapshotted: updates, deletes and inserts in many
 /// small transactions, over keys chunks have and haven't reached yet. A chunk's read races the
 /// stream: a change it didn't see may already be applied when it is emitted (DA-SNAP-9). The
-/// writers start once the snapshot runs and write until it is done.
+/// writers start once the snapshot runs and write until it is done; one of them must start
+/// before the last full chunk is emitted.
 ///
 /// Chunk reads share the catalog connection with the queries the session awaits inline, such as
 /// the heartbeat's: a read nobody polled would stall such a query until the command timeout
@@ -37,24 +38,31 @@ async fn a_snapshot_under_concurrent_writes_ends_equal_to_the_source() {
         "",
         "",
     );
+    // Connected before the snapshot starts, so the writers start together.
+    let mut clients = vec![];
+    for _ in 0..4 {
+        let (c, conn) = tokio_postgres::connect(&dsn(), NoTls).await.unwrap();
+        tokio::spawn(conn);
+        clients.push(c);
+    }
     let begun = Instant::now();
     let run = start(&p, &lake, None);
     run.wait("the snapshot starts", |st| st.snapshots.contains_key(&t))
         .await;
     let mut writers = vec![];
-    for w in 0..4u64 {
-        let (c, conn) = tokio_postgres::connect(&dsn(), NoTls).await.unwrap();
-        tokio::spawn(conn);
+    for (w, c) in (0..4u64).zip(clients) {
         let t = t.clone();
         let status = run.handle.status.clone();
         writers.push(tokio::spawn(async move {
             // A fixed pseudo-random walk over the keys per writer, so a failure replays.
             let mut x: u64 = 0x2545_f491_4f6c_dd1d ^ (w + 1);
-            let mut written = 0;
+            // The snapshot's progress at this writer's first write.
+            let mut first = None;
             for i in 0..10_000 {
-                if !status.borrow().snapshots.contains_key(&t) {
+                let Some(progress) = status.borrow().snapshots.get(&t).copied() else {
                     break;
-                }
+                };
+                first.get_or_insert(progress.rows_done);
                 x ^= x << 13;
                 x ^= x >> 7;
                 x ^= x << 17;
@@ -68,16 +76,18 @@ async fn a_snapshot_under_concurrent_writes_ends_equal_to_the_source() {
                     ),
                 };
                 c.batch_execute(&sql).await.unwrap();
-                written += 1;
             }
-            written
+            first
         }));
     }
-    let mut written = 0;
+    let mut firsts = vec![];
     for w in writers {
-        written += w.await.unwrap();
+        firsts.push(w.await.unwrap());
     }
-    assert!(written > 0, "no write began while the snapshot ran");
+    assert!(
+        firsts.iter().flatten().any(|&rows_done| rows_done < 38_000),
+        "no write began before the last full chunk was emitted: {firsts:?}"
+    );
     converge(&a, &lake, &t).await;
     let took = begun.elapsed();
     assert!(
