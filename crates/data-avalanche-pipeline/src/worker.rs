@@ -328,8 +328,10 @@ pub(crate) async fn start(
         .cloned()
         .collect();
     // A failed rescan halts nothing: the next start checks the tables again. The first failure of
-    // a streak warns.
-    if !gone.is_empty() {
+    // a streak warns; a rescan that succeeds, or nothing gone to check, ends the streak.
+    if gone.is_empty() {
+        core.gone_failing.succeeded();
+    } else {
         match source.rescan(&gone).await {
             Ok(report) => {
                 core.gone_failing.succeeded();
@@ -1154,6 +1156,13 @@ mod tests {
             matches!(end, Err(WorkerError::Crashed(HookPoint::SchemasCached))),
             "{end:?}"
         );
+        let cached = w.docs.table_schema(&t("a")).await.unwrap().unwrap().doc;
+        assert_eq!(cached, w.source.schema(&t("a")), "cached before the crash");
+        assert_eq!(
+            SourcePosition::Pg(slot_lsn(&w).await),
+            before,
+            "not yet the checkpoint"
+        );
         let (end, st) = run(&w, &p, async |status| streamed(&status, &w).await).await;
         assert_eq!(end.unwrap(), Exit::Drained);
         assert_eq!(
@@ -1176,11 +1185,12 @@ mod tests {
 
     /// Phase 0's rescan of the tables gone from the source's list warns once per failure streak:
     /// two failing starts warn once and halt nothing; a start whose rescan succeeds halts the
-    /// dropped table and ends the streak, so the next failure warns again.
+    /// dropped table and ends the streak, so the next failure warns again. A start with nothing
+    /// gone ends the streak too.
     #[tokio::test]
     async fn a_failing_rescan_of_gone_tables_warns_once_per_streak() {
-        let w = World::new(&["a", "b", "c"]);
-        w.started(&["a", "b", "c"]).await;
+        let w = World::new(&["a", "b", "c", "d"]);
+        w.started(&["a", "b", "c", "d"]).await;
         w.source.drop_table(&t("b"));
         let (mut core, _control, status) = w.core(&mode("mode: never"), &[]);
         let gone = || -> Vec<String> {
@@ -1224,6 +1234,21 @@ mod tests {
         assert!(
             second[1].contains("public.c") && second[1].contains("catalog busy again"),
             "{second:?}"
+        );
+        w.source.create_table(crate::test_support::schema("c"));
+        start(&mut core, None).await.unwrap();
+        assert_eq!(gone(), second, "nothing gone: no rescan, no warning");
+        w.source.drop_table(&t("d"));
+        w.source.fail(
+            Method::Rescan,
+            SourceError::Transient("catalog busy once more".into()),
+        );
+        start(&mut core, None).await.unwrap();
+        let third = gone();
+        assert_eq!(third.len(), 3, "nothing gone ended the streak: {third:?}");
+        assert!(
+            third[2].contains("public.d") && third[2].contains("catalog busy once more"),
+            "{third:?}"
         );
     }
 

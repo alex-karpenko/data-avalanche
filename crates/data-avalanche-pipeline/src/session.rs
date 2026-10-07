@@ -713,9 +713,14 @@ impl<'c> Session<'c> {
             Ok(retained) => retained,
             Err(e) if e.is_transient() => return Ok(()),
             Err(e) => {
+                let blind = if self.core.settings.max_wal_lag_bytes.is_some() {
+                    "max_wal_lag_bytes isn't enforced"
+                } else {
+                    "the retained WAL isn't reported"
+                };
                 self.core.wal_lag_failing.failed(&self.core.status, || {
                     format!(
-                        "the WAL-lag guard is blind: the source's retained log can't be read ({e}); max_wal_lag_bytes isn't enforced until a read succeeds"
+                        "the WAL-lag guard is blind: the source's retained log can't be read ({e}); {blind} until a read succeeds"
                     )
                 });
                 return Ok(());
@@ -1539,6 +1544,35 @@ mod tests {
         let (end, ()) = tokio::join!(s.run(), driver);
         assert!(matches!(end.unwrap(), End::Exit(Exit::Drained)));
         assert_eq!(w.ids("a"), [1, 2]);
+    }
+
+    /// The blind warning names what is blind: the bound when `max_wal_lag_bytes` is set, else the
+    /// reported lag.
+    #[tokio::test]
+    async fn the_blind_warning_names_what_is_blind() {
+        for (postgres, tail) in [
+            (
+                "max_wal_lag_bytes: 64MiB",
+                "max_wal_lag_bytes isn't enforced until a read succeeds",
+            ),
+            ("", "the retained WAL isn't reported until a read succeeds"),
+        ] {
+            let w = World::new(&["a"]);
+            w.started(&["a"]).await;
+            let p = pipeline("", "flush: { seconds: 0 }", postgres);
+            let (mut core, _control, status) = w.core(&p, &["a"]);
+            let mut s = Session::open(&mut core).await.unwrap().unwrap();
+            w.source.fail(
+                Method::RetainedBytes,
+                SourceError::Permanent("permission denied".into()),
+            );
+            s.wal_lag().await.unwrap();
+            let warnings = status.borrow().warnings.clone();
+            assert!(
+                matches!(&warnings[..], [m] if m.starts_with("the WAL-lag guard is blind") && m.ends_with(tail)),
+                "{postgres:?}: {warnings:?}"
+            );
+        }
     }
 
     fn with_note(name: &str) -> TableSchema {
