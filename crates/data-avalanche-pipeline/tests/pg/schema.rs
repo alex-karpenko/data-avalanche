@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use arrow_array::{Array, Int32Array};
+use arrow_array::{Array, Int32Array, StringArray};
 use data_avalanche_core::HaltReason;
 use data_avalanche_testkit::require_it;
 
@@ -95,34 +95,62 @@ async fn a_dropped_table_halts_and_the_others_go_on() {
     cleanup(&a, &n).await;
 }
 
-/// An `always` table loses a column while the worker is down, and stays idle: the restart's
-/// snapshot reads under the cached schema and fails, the rescan this triggers finds the change,
-/// and the snapshot goes on under the new schema (without it, only the 60-minute rescan would).
+/// A column is dropped while the table's snapshot runs (Task 14, the run-time case of
+/// D-M6a.11): the next chunk read under the cached schema fails transiently ("column extra is
+/// gone"), the rescan the failure asks for finds the drop, and once the stream has passed it the
+/// snapshot reads on under the new schema. The sink soft-drops `extra`: it keeps the column, and
+/// the rows read after the drop have it NULL. Without the rescan the reads would fail until the
+/// 60-minute periodic rescan.
 #[tokio::test]
-async fn an_idle_table_changed_while_down_is_snapshotted_under_its_new_schema() {
+async fn a_column_dropped_while_the_snapshot_runs_is_soft_dropped() {
     require_it!();
     let a = admin().await;
     let n = fresh(
         &a,
-        "idle_alter",
+        "drop_mid_snapshot",
         "CREATE TABLE t (id bigint PRIMARY KEY, v text, extra text);
-         INSERT INTO t VALUES (1, 'a', 'x');",
+         INSERT INTO t SELECT i, 'v' || i, 'x' || i FROM generate_series(1, 200) i;",
     )
     .await;
     let t = n.table("t");
-    let p = pipeline(&n, &["t"], "mode: always");
+    let p = pipeline(&n, &["t"], "mode: initial, chunk_size: 1");
     let lake = Lake::new();
     let run = start(&p, &lake, None);
-    run.snapshotted().await;
-    run.drain().await.unwrap();
-
+    run.wait("the snapshot has emitted a row", |st| {
+        st.snapshots.get(&t).is_some_and(|s| s.rows_done >= 1)
+    })
+    .await;
     a.batch_execute(&format!("ALTER TABLE {t} DROP COLUMN extra"))
         .await
         .unwrap();
-    let run = start(&p, &lake, None);
+    // One read at a time, a row each: rows 199 and 200 not emitted yet means the read of row 200
+    // starts after the drop.
+    let done = run
+        .handle
+        .status
+        .borrow()
+        .snapshots
+        .get(&t)
+        .map(|s| s.rows_done);
+    assert!(
+        done.is_some_and(|d| d <= 198),
+        "the snapshot reads on after the drop: {done:?}"
+    );
     run.snapshotted().await;
-    eprintln!("{:?}", *run.handle.status.borrow());
-    assert_eq!(lake.rows(&t), [(1, Some("a".into()))]);
+    converge(&a, &lake, &t).await;
+    let st = run.handle.status.borrow().clone();
+    assert!(st.halted.is_empty(), "{st:?}");
+    let dropped = format!("table {t}: column \"extra\" soft-dropped: kept, written NULL");
+    assert_eq!(st.warnings, [dropped], "{st:?}");
+    let b = lake.sink.content(&t).unwrap();
+    let extra = b
+        .column_by_name("extra")
+        .expect("soft-dropped: the sink keeps it")
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("text");
+    assert_eq!(extra.value(0), "x1", "read before the drop");
+    assert!(extra.is_null(199), "read after the drop");
     run.drain().await.unwrap();
     cleanup(&a, &n).await;
 }

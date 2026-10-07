@@ -17,7 +17,8 @@
 //! - [`FakeSource::fail`] makes the next call of one method fail; [`FakeSource::hold_reads`]
 //!   holds chunk reads after they took their snapshot, so a test can commit while one is out.
 //!   [`FakeSource::share_connection`] makes chunk reads and other calls wait on each other, as
-//!   they do on PostgreSQL's one catalog client.
+//!   they do on PostgreSQL's one catalog client. [`FakeSource::hold_stream`] holds the streams
+//!   while the log grows, so the source's position runs ahead of what they delivered.
 //!
 //! Keys are integer or text identifier columns. The fake trusts its tests: a change of a key a
 //! stalled transaction holds, or a key that isn't an integer or text, panics.
@@ -227,6 +228,7 @@ struct Db {
     retained: Option<Option<u64>>,
     faults: Vec<(Method, SourceError)>,
     hold_reads: bool,
+    hold_stream: bool,
     /// [`FakeSource::share_connection`]: on, the chunk reads holding their rows, and the calls
     /// waiting on the connection.
     shared: bool,
@@ -275,6 +277,7 @@ impl FakeSource {
             retained: None,
             faults: vec![],
             hold_reads: false,
+            hold_stream: false,
             shared: false,
             half_read: 0,
             waiting: 0,
@@ -463,6 +466,17 @@ impl FakeSource {
 
     pub fn release_reads(&self) {
         self.db().hold_reads = false;
+        self.wake.notify_waiters();
+    }
+
+    /// Open streams deliver nothing until [`Self::release_stream`], while commits and keep-alives
+    /// still move the log's end: `current_position` runs ahead of the streams.
+    pub fn hold_stream(&self) {
+        self.db().hold_stream = true;
+    }
+
+    pub fn release_stream(&self) {
+        self.db().hold_stream = false;
         self.wake.notify_waiters();
     }
 
@@ -1137,14 +1151,16 @@ impl ChangeStream for FakeStream {
                         detail: "the fake slot lost its position".into(),
                     });
                 }
-                if let Some(item) = self.pending.pop_front() {
-                    return Ok(item);
-                }
-                if let Some(i) = db.faults.iter().position(|(m, _)| *m == Method::Next) {
-                    return Err(db.faults.remove(i).1);
-                }
-                if self.fill(&db) {
-                    continue;
+                if !db.hold_stream {
+                    if let Some(item) = self.pending.pop_front() {
+                        return Ok(item);
+                    }
+                    if let Some(i) = db.faults.iter().position(|(m, _)| *m == Method::Next) {
+                        return Err(db.faults.remove(i).1);
+                    }
+                    if self.fill(&db) {
+                        continue;
+                    }
                 }
             }
             wake.await;
@@ -1469,5 +1485,20 @@ mod tests {
             panic!()
         };
         assert!(!snap.sees(xid), "committed after the snapshot");
+    }
+
+    /// A held stream delivers nothing while the log grows; released, it delivers what it held.
+    #[tokio::test]
+    async fn a_held_stream_falls_behind_the_position() {
+        let src = FakeSource::new(vec![schema()]);
+        let tables = src.resolve_tables().await.unwrap().tables;
+        let mut s = src.open_stream(&src.wal_end(), &tables).await.unwrap();
+        src.hold_stream();
+        src.keepalive();
+        let at = src.current_position().await.unwrap();
+        let held = tokio::time::timeout(std::time::Duration::from_millis(20), s.next()).await;
+        assert!(held.is_err(), "held: {held:?}");
+        src.release_stream();
+        assert_eq!(s.next().await.unwrap(), StreamItem::KeepAlive(at));
     }
 }

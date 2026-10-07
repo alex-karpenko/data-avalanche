@@ -82,6 +82,8 @@ pub(super) struct Snapshots {
     /// Tables whose schema drifted while the pipeline was down: not read until a rescan has
     /// brought their schema up to date (D-M6a.11).
     held: BTreeSet<TableRef>,
+    /// After a failed rescan round while tables are held: the next round not before this.
+    pub(super) held_retry: Option<Instant>,
 }
 
 impl std::fmt::Debug for Snapshots {
@@ -211,7 +213,6 @@ impl Snapshots {
         }
     }
 
-    /// The table halted: its snapshot stops.
     /// Holds the reads of those of `tables` being snapshotted.
     pub(super) fn hold(&mut self, tables: &BTreeSet<TableRef>) {
         self.held = tables
@@ -219,6 +220,11 @@ impl Snapshots {
             .filter(|t| self.tables.contains_key(*t))
             .cloned()
             .collect();
+    }
+
+    /// The tables held for a rescan.
+    pub(super) fn held(&self) -> &BTreeSet<TableRef> {
+        &self.held
     }
 
     /// Releases every held table not in `keep`; returns them.
@@ -230,6 +236,7 @@ impl Snapshots {
         released.into_iter().collect()
     }
 
+    /// The table halted: its snapshot stops.
     pub(super) fn stop(&mut self, table: &TableRef) {
         self.held.remove(table);
         self.tables.remove(table);
@@ -516,9 +523,10 @@ impl Session<'_> {
 
     /// On the tick: the snapshot timeout, and the in-flight transactions read again when due.
     pub(super) async fn snapshot_tick(&mut self) -> Result<Option<End>, WorkerError> {
-        // A held table waits for a rescan; a failed one is tried again at the next tick.
+        // A held table waits for a rescan; a failed round is tried again after a backoff.
         if !self.snaps.held.is_empty()
             && self.rescan.is_none()
+            && self.snaps.held_retry.is_none_or(|at| at <= Instant::now())
             && let Some(end) = self.rescan().await?
         {
             return Ok(Some(end));
@@ -586,13 +594,13 @@ mod tests {
     use data_avalanche_config::Pipeline;
     use data_avalanche_core::{ColumnSchema, ColumnValue, ColumnValueType as V, Row, SinkError};
     use data_avalanche_state::{CursorKey, SnapshotCursor};
-    use data_avalanche_testkit::{FakeSource, FakeTxn, MemorySink, SinkOp};
+    use data_avalanche_testkit::{FakeSource, FakeTxn, MemorySink, Method, SinkOp};
     use tokio::sync::watch;
 
     use super::*;
     use crate::session::Core;
     use crate::test_support::{World, Yaml, row, t, wait_until};
-    use crate::{Command, Exit, Hooks, WorkerStatus};
+    use crate::{Backoff, Command, Exit, Hooks, WorkerStatus};
 
     fn chunks_of(n: u64) -> Pipeline {
         let tables = format!("\n      snapshots: {{ chunk_size: {n} }}");
@@ -1076,6 +1084,277 @@ mod tests {
             w.text("a", "note"),
             [None, None, None, None, Some("n".to_owned())]
         );
+    }
+
+    /// `public.a` with `note text`.
+    fn with_note() -> TableSchema {
+        TableSchema::new(
+            t("a"),
+            vec![
+                ColumnSchema::new("id", V::Int64, "bigint").not_null(),
+                ColumnSchema::new("doc", V::Text, "text"),
+                ColumnSchema::new("note", V::Text, "text"),
+            ],
+            vec!["id".into()],
+        )
+        .unwrap()
+    }
+
+    /// [`with_note`] and `extra text`.
+    fn with_extra() -> TableSchema {
+        let mut columns = with_note().columns().to_vec();
+        columns.push(ColumnSchema::new("extra", V::Text, "text"));
+        TableSchema::new(t("a"), columns, vec!["id".into()]).unwrap()
+    }
+
+    fn noted(id: i64) -> Row {
+        let mut r = row(id, "s");
+        r.0.push(("note".into(), ColumnValue::Text("n".into())));
+        r
+    }
+
+    /// D-M6a.11, the unnamed release: `a` drifted, but its cache is the catalog's, so the rescan
+    /// names nothing. The first round fails and is tried again; the second releases `a` at the
+    /// rescan, and the snapshot reads it as it would any table.
+    #[tokio::test]
+    async fn a_held_table_the_rescan_doesnt_name_is_released_at_the_rescan() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.source.load(&t("a"), rows(1..=2));
+        w.request(&["a"]).await;
+        w.source.fail(
+            Method::Rescan,
+            SourceError::Transient("catalog busy".into()),
+        );
+        let (mut core, control, status) = w.core(&chunks_of(10), &["a"]);
+        core.drifted.insert(t("a"));
+        run(core, control, status, async |status| {
+            snapshot_done(&w, &status, "a").await;
+        })
+        .await;
+        assert_eq!(
+            w.source.rescans(),
+            2,
+            "the failed round, then the one that released `a`"
+        );
+        assert_eq!(w.source.reads(&t("a")), 2, "the chunk, then the empty one");
+        assert_eq!(w.ids("a"), [1, 2]);
+    }
+
+    /// D-M6a.11, the named release: `a` gained `note` while the pipeline was down. The source's
+    /// position is ahead of the stream, so the rescan's finding waits for it, and `a` isn't read
+    /// meanwhile: its cache still lacks `note`. Once the stream catches up the finding applies,
+    /// and only then is `a` released.
+    #[tokio::test]
+    async fn a_held_table_is_released_only_once_its_finding_applied() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.source.load(&t("a"), rows(1..=2));
+        w.request(&["a"]).await;
+        w.source.alter(&t("a"), with_note());
+        w.source.hold_stream();
+        w.source.keepalive();
+        let (mut core, control, status) = w.core(&chunks_of(10), &["a"]);
+        core.drifted.insert(t("a"));
+        run(core, control, status, async |status| {
+            wait_until("the rescan found the change", || w.source.rescans() == 1).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(
+                w.source.reads(&t("a")),
+                0,
+                "the finding waits for the stream"
+            );
+            w.source.release_stream();
+            snapshot_done(&w, &status, "a").await;
+        })
+        .await;
+        assert_eq!(
+            w.source.reads(&t("a")),
+            2,
+            "under the new schema: the chunk, then the empty one"
+        );
+        assert_eq!(w.text("a", "note"), [None, None]);
+    }
+
+    /// Task 14's rescan waits for a pending finding (Task 14 review M1): `b`'s read fails while
+    /// `a`'s finding waits for the stream. The rescan the failure asks for runs right after the
+    /// finding applies, not after `b`'s next read fails (its backoff outlasts the test).
+    #[tokio::test]
+    async fn a_failed_read_while_a_finding_waits_rescans_once_it_applied() {
+        let w = World::new(&["a", "b"]);
+        w.started(&["a", "b"]).await;
+        w.source.load(&t("a"), rows(1..=2));
+        w.source.load(&t("b"), rows(1..=2));
+        w.request(&["a", "b"]).await;
+        w.source.alter(&t("a"), with_note());
+        w.source.hold_stream();
+        w.source.keepalive();
+        w.source.hold_reads();
+        let (mut core, control, status) = w.core(&chunks_of(10), &["a", "b"]);
+        core.drifted.insert(t("a"));
+        core.tuning.source_backoff = Backoff {
+            first: Duration::from_secs(20),
+            max: Duration::from_secs(20),
+        };
+        run(core, control, status, async |status| {
+            wait_until("`b`'s first chunk is being read", || {
+                w.source.reads(&t("b")) == 1
+            })
+            .await;
+            wait_until("the rescan found `a`'s change", || w.source.rescans() == 1).await;
+            w.source.fail(
+                Method::ReadChunk,
+                SourceError::Transient("connection reset".into()),
+            );
+            w.source.release_reads();
+            wait_until("`b`'s first chunk is emitted", || {
+                status
+                    .borrow()
+                    .snapshots
+                    .get(&t("b"))
+                    .is_some_and(|p| p.rows_done == 2)
+            })
+            .await;
+            // `b`'s next read fails at once (a failed read isn't counted).
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(w.source.rescans(), 1, "the finding is pending");
+            w.source.release_stream();
+            // The round, the catch-up's re-read of `a`, then the rescan `b`'s failure asked for.
+            wait_until("the failed read's rescan ran", || w.source.rescans() == 3).await;
+            snapshot_done(&w, &status, "a").await;
+        })
+        .await;
+        assert_eq!(w.source.reads(&t("b")), 1, "`b`'s retry is still to come");
+    }
+
+    /// A held table the catch-up skips because the stream moved its cache since the rescan stays
+    /// held. While the pipeline was down, `a` gained `note`, a row was written with it, and `a`
+    /// gained `extra`. The rescan finds `extra` and `note` against the old cache; the stream then
+    /// applies `note` alone. The finding is older than the cache, and the cache is still behind
+    /// the catalog: read now, the snapshot would miss `extra` (PostgreSQL's read checks only the
+    /// cached columns). The next round applies `extra` before the snapshot reads.
+    #[tokio::test]
+    async fn a_held_table_whose_cache_moved_since_the_rescan_stays_held() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.source.load(&t("a"), rows(1..=2));
+        w.request(&["a"]).await;
+        w.source.alter(&t("a"), with_note());
+        w.source.commit(FakeTxn::new().insert(&t("a"), noted(9)));
+        w.source.alter(&t("a"), with_extra());
+        w.source.hold_stream();
+        let (mut core, control, status) = w.core(&chunks_of(10), &["a"]);
+        core.drifted.insert(t("a"));
+        run(core, control, status, async |status| {
+            wait_until("the rescan found the change", || w.source.rescans() == 1).await;
+            w.source.release_stream();
+            snapshot_done(&w, &status, "a").await;
+        })
+        .await;
+        assert_eq!(
+            w.source.reads(&t("a")),
+            2,
+            "read under the catalog's schema only: the chunk, then the empty one"
+        );
+        assert_eq!(w.ids("a"), [1, 2, 9]);
+        assert_eq!(w.text("a", "extra"), [None, None, None]);
+        let cached = w.docs.table_schema(&t("a")).await.unwrap().unwrap().doc;
+        assert_eq!(cached, w.source.schema(&t("a")));
+    }
+
+    /// A held table the rescan doesn't name because the stream already brought its cache up to
+    /// date stays held until that cache is handed to the writer (M-2): a session ending before
+    /// would leave the old schema cached, and the next one wouldn't hold the table. The flush
+    /// policy holds the change back until a `Flush`.
+    #[tokio::test]
+    async fn a_held_table_waits_until_its_new_cache_is_handed_on() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.source.load(&t("a"), rows(1..=2));
+        w.request(&["a"]).await;
+        w.source.alter(&t("a"), with_note());
+        w.source.commit(FakeTxn::new().insert(&t("a"), noted(9)));
+        let p = Yaml {
+            tables: "\n      snapshots: { chunk_size: 10 }",
+            sink: "flush: { seconds: 3600 }",
+            ..Yaml::default()
+        }
+        .build();
+        let (mut core, control, status) = w.core(&p, &["a"]);
+        core.drifted.insert(t("a"));
+        let flush = control.clone();
+        run(core, control, status, async |status| {
+            let end = w.source.wal_end();
+            wait_until("the stream applied the change", || {
+                status.borrow().read.as_ref() == Some(&end)
+            })
+            .await;
+            // Ten ticks: a round at each.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(w.source.reads(&t("a")), 0, "the new cache isn't handed on");
+            flush.send(Command::Flush).await.unwrap();
+            snapshot_done(&w, &status, "a").await;
+        })
+        .await;
+        assert_eq!(w.source.reads(&t("a")), 2);
+        assert_eq!(w.ids("a"), [1, 2, 9]);
+    }
+
+    /// A held table's rescan keeps failing: a failed round is tried again after a backoff, not at
+    /// every tick, and the streak warns once that the table's snapshot waits. The round that
+    /// succeeds releases it.
+    #[tokio::test]
+    async fn a_held_tables_failing_rescan_backs_off_and_warns_once() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.source.load(&t("a"), rows(1..=2));
+        w.request(&["a"]).await;
+        for _ in 0..2 {
+            w.source.fail(
+                Method::Rescan,
+                SourceError::Transient("catalog busy".into()),
+            );
+        }
+        let (mut core, control, status) = w.core(&chunks_of(10), &["a"]);
+        core.drifted.insert(t("a"));
+        core.tuning.source_backoff = Backoff {
+            first: Duration::from_millis(400),
+            max: Duration::from_millis(400),
+        };
+        let waits = |st: &WorkerStatus| -> Vec<String> {
+            st.warnings
+                .iter()
+                .filter(|m| m.contains("wait for a catalog rescan"))
+                .cloned()
+                .collect()
+        };
+        let (_, st) = run(core, control, status, async |status| {
+            wait_until("the first round failed", || {
+                !waits(&status.borrow()).is_empty()
+            })
+            .await;
+            // Twenty ticks, within the backoff (200–400 ms).
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(
+                w.source.rescans(),
+                1,
+                "the next round waits for the backoff"
+            );
+            snapshot_done(&w, &status, "a").await;
+        })
+        .await;
+        assert_eq!(
+            w.source.rescans(),
+            3,
+            "two failed rounds, then the one that released `a`"
+        );
+        let warned = waits(&st);
+        assert!(
+            matches!(&warned[..], [m] if m.contains("public.a") && m.contains("catalog busy")),
+            "one warning for the streak: {:?}",
+            st.warnings
+        );
+        assert_eq!(w.source.reads(&t("a")), 2);
     }
 
     /// Holds the source's chunk reads once a chunk is emitted.

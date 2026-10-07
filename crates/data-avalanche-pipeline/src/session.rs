@@ -57,6 +57,9 @@ pub(crate) struct Core {
     pub drifted: BTreeSet<TableRef>,
     /// Channel D's failing rounds. It outlives a session: a reconnect doesn't start a streak.
     pub rescan_failing: Streak,
+    /// The failing rounds while tables are held for a rescan (D-M6a.11). Like `rescan_failing`
+    /// it outlives a session; it also sets the held tables' backoff.
+    pub held_failing: Streak,
     /// `toast_strategy: re_query`: the tables whose fetch is failing. Like `rescan_failing` it
     /// outlives a session, so the replay after a reconnect doesn't warn or back off again.
     pub requery_failing: BTreeMap<TableRef, Streak>,
@@ -581,6 +584,9 @@ impl<'c> Session<'c> {
     /// Channel D: one catalog read of the streamed tables, and the source's position after it. A
     /// failed round waits for the next; the first of a streak warns that dropped-table detection
     /// is paused.
+    ///
+    /// A held table the rescan doesn't name has its cache up to date, and is released, unless
+    /// the stream brought it there with a change no flush has handed on yet: it waits for that.
     async fn rescan(&mut self) -> Result<Option<End>, WorkerError> {
         let known: Vec<TableSchema> = self.schemas.values().cloned().collect();
         let report = match self.core.source.rescan(&known).await {
@@ -590,18 +596,23 @@ impl<'c> Session<'c> {
                 return Ok(None);
             }
         };
-        let named: BTreeSet<&TableRef> = report
+        let kept: BTreeSet<&TableRef> = report
             .changed
             .iter()
             .map(TableSchema::table)
             .chain(&report.dropped)
             .chain(report.halted.iter().map(|(t, _)| t))
+            .chain(self.pending_schemas.iter().map(|(_, s)| s.table()))
+            .chain(self.txn_schemas.iter().map(TableSchema::table))
             .collect();
-        for table in self.snaps.release_unless(&named) {
+        // The released tables' cached schemas are durable, or in jobs handed to the writer, which
+        // `finish()` drains before the session ends: the next session opens with them cached and
+        // needn't hold the tables (M-2).
+        for table in self.snaps.release_unless(&kept) {
             self.core.drifted.remove(&table);
         }
         if report == RescanReport::default() {
-            self.core.rescan_failing.succeeded();
+            self.rescan_succeeded();
             return Ok(None);
         }
         let after = match self.core.source.current_position().await {
@@ -611,7 +622,7 @@ impl<'c> Session<'c> {
                 return Ok(None);
             }
         };
-        self.core.rescan_failing.succeeded();
+        self.rescan_succeeded();
         let cached = known
             .into_iter()
             .filter(|k| report.changed.iter().any(|c| c.table() == k.table()))
@@ -624,21 +635,44 @@ impl<'c> Session<'c> {
         self.caught_up().await
     }
 
+    /// A failed round. While tables are held, the next round waits for a backoff, and the first
+    /// failure of a streak warns that their snapshots wait (Task 16 review M-1).
     fn rescan_failed(&mut self, e: &SourceError) {
         self.core.rescan_failing.failed(&self.core.status, || {
             format!(
                 "a catalog rescan failed ({e}): dropped-table detection is paused until a rescan succeeds"
             )
         });
+        let held = self.snaps.held();
+        if held.is_empty() {
+            return;
+        }
+        let names: Vec<String> = held.iter().map(ToString::to_string).collect();
+        self.core.held_failing.failed(&self.core.status, || {
+            format!(
+                "the snapshots of {} wait for a catalog rescan, which failed ({e}): they read nothing until a rescan succeeds; it is tried again with backoff",
+                names.join(", ")
+            )
+        });
+        let failed = self.core.held_failing.failures();
+        let delay = self.core.tuning.source_backoff.delay(failed - 1);
+        self.snaps.held_retry = Some(Instant::now() + delay);
+    }
+
+    fn rescan_succeeded(&mut self) {
+        self.core.rescan_failing.succeeded();
+        self.core.held_failing.succeeded();
+        self.snaps.held_retry = None;
     }
 
     /// Applies a rescan's findings once the stream has passed the position read after it (Q-M6a-4):
     /// every change the stream holds for those tables is in by then. A table whose cached schema
     /// moved since the rescan is skipped: the stream applied a change on its own meanwhile, and the
-    /// finding may be older than it. Any other table is read again, and its finding applies only
-    /// if it still holds: the catalog may have moved since, or the cache moved and came back. A
-    /// failed read ends the reads: the tables left are skipped too. A skipped table is found again
-    /// by the next round, and a held one stays held until then.
+    /// finding may be older than it, while the cache may still be behind the catalog. Any other
+    /// table is read again, and its finding applies only if it still holds: the catalog may have
+    /// moved since, or the cache moved and came back. A failed read ends the reads: the tables
+    /// left are skipped too. A skipped table is found again by the next round, and a held one
+    /// stays held until then.
     async fn caught_up(&mut self) -> Result<Option<End>, WorkerError> {
         let Some((after, ..)) = &self.rescan else {
             return Ok(None);
@@ -666,18 +700,16 @@ impl<'c> Session<'c> {
             }
         }
         let mut unapplied = BTreeSet::new();
-        let mut catalog_down = false;
+        let mut failed = None;
         for now in report.changed {
             let table = now.table().clone();
             let Some(cached) = self.schemas.get(&table).cloned() else {
                 continue;
             };
-            if at_rescan.get(&table) != Some(&cached)
-                || (cached.columns() == now.columns() && cached.identifier() == now.identifier())
-            {
+            if cached.columns() == now.columns() && cached.identifier() == now.identifier() {
                 continue;
             }
-            if catalog_down {
+            if at_rescan.get(&table) != Some(&cached) || failed.is_some() {
                 unapplied.insert(table);
                 continue;
             }
@@ -691,8 +723,7 @@ impl<'c> Session<'c> {
                     continue;
                 }
                 Err(e) => {
-                    self.rescan_failed(&e);
-                    catalog_down = true;
+                    failed = Some(e);
                     unapplied.insert(table);
                     continue;
                 }
@@ -704,8 +735,15 @@ impl<'c> Session<'c> {
         }
         // Caches the applied schemas without waiting for the tables' next change.
         self.flush()?;
+        // The released tables' cached schemas are in the jobs just handed to the writer, which
+        // `finish()` drains before the session ends: the next session opens with them cached and
+        // needn't hold the tables (M-2).
         for table in self.snaps.release_unless(&unapplied.iter().collect()) {
             self.core.drifted.remove(&table);
+        }
+        // Reported once the release is done, so it names only the tables still held.
+        if let Some(e) = failed {
+            self.rescan_failed(&e);
         }
         Ok(None)
     }
@@ -1729,8 +1767,8 @@ mod tests {
     }
 
     /// A catch-up's re-read fails: `a`, held for its snapshot, isn't applied and stays held; the
-    /// failure warns once; `b`, changed in the same round, isn't read after it. The next round
-    /// applies both and releases `a`.
+    /// failure warns once, and once that `a`'s snapshot waits; `b`, changed in the same round,
+    /// isn't read after it. The next round applies both and releases `a`.
     #[tokio::test]
     async fn a_failed_re_read_ends_the_catch_up_and_the_next_round_applies_it() {
         let w = World::new(&["a", "b"]);
@@ -1765,10 +1803,13 @@ mod tests {
         assert!(s.core.drifted.contains(&t("a")), "still held");
         let warnings = s.core.status.borrow().warnings.clone();
         assert!(
-            matches!(&warnings[..], [w] if w.contains("catalog down")),
-            "{warnings:?}"
+            matches!(&warnings[..], [d, h] if d.contains("catalog down")
+                && h.contains("the snapshots of public.a wait") && h.contains("catalog down")),
+            "channel D's warning and the held table's: {warnings:?}"
         );
+        assert!(s.snaps.held_retry.is_some(), "the held table backs off");
         assert!(s.rescan().await.unwrap().is_none());
+        assert!(s.snaps.held_retry.is_none(), "the streak ended");
         for name in ["a", "b"] {
             assert_eq!(s.schemas[&t(name)], w.source.schema(&t(name)));
             let cached = persisted(&mut s, &w, name).await;

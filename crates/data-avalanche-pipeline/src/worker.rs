@@ -103,6 +103,7 @@ impl PipelineWorker {
             snapshot_started: BTreeMap::new(),
             drifted: BTreeSet::new(),
             rescan_failing: Streak::default(),
+            held_failing: Streak::default(),
             requery_failing: BTreeMap::new(),
             gone_failing: Streak::default(),
             wal_lag_failing: Streak::default(),
@@ -948,14 +949,14 @@ mod tests {
         let ids = rows
             .iter()
             .map(|r| match r.get("id") {
-                Some(data_avalanche_core::ColumnValue::Int64(i)) => *i,
+                Some(ColumnValue::Int64(i)) => *i,
                 other => panic!("{other:?}"),
             })
             .collect();
         let docs = rows
             .iter()
             .map(|r| match r.get("doc") {
-                Some(data_avalanche_core::ColumnValue::Text(d)) => Some(d.clone()),
+                Some(ColumnValue::Text(d)) => Some(d.clone()),
                 _ => None,
             })
             .collect();
@@ -1012,13 +1013,9 @@ mod tests {
                 matches!(end, Err(WorkerError::Crashed(_))),
                 "{name}: {end:?}"
             );
-            w.source.commit(FakeTxn::new().delete(
-                &t("a"),
-                Row(vec![(
-                    "id".into(),
-                    data_avalanche_core::ColumnValue::Int64(1),
-                )]),
-            ));
+            w.source.commit(
+                FakeTxn::new().delete(&t("a"), Row(vec![("id".into(), ColumnValue::Int64(1))])),
+            );
             let end = run_with(&p, deps(&w), async |h| streamed(&h.status, &w).await).await;
             assert_eq!(end.unwrap(), Exit::Drained, "{name}");
             let (ids, docs) = source_rows(&w, "a");
@@ -1281,10 +1278,7 @@ mod tests {
         .unwrap();
         w.source.alter(&t("a"), noted);
         let mut r = row(1, "x");
-        r.0.push((
-            "note".into(),
-            data_avalanche_core::ColumnValue::Text("n".into()),
-        ));
+        r.0.push(("note".into(), ColumnValue::Text("n".into())));
         w.source.load(&t("a"), vec![r]);
         let before = w.source.reads(&t("a"));
         let (end, st) = run(&w, &p, async |status| {
