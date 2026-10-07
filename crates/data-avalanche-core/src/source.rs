@@ -28,6 +28,12 @@ pub enum SourceError {
     /// One table can't be replicated; the pipeline's other tables continue.
     #[error("table {table}: {reason}")]
     TableHalt { table: TableRef, reason: HaltReason },
+    /// Another reader holds the stream position (PostgreSQL: the slot is active for another
+    /// walsender, SQLSTATE 55006). A quick restart meets it until the old session's walsender
+    /// times out (`wal_sender_timeout`): the pipeline retries for a bounded time while it holds
+    /// the lease, then gives up (`Postgres_Slot…` D-15.5).
+    #[error("the source's stream position is held by another reader: {0}")]
+    Contended(String),
 }
 
 impl SourceError {
@@ -117,6 +123,66 @@ pub struct Chunk {
     pub rows: Vec<Row>,
     /// The cursor after the last row; `None` when the chunk is empty (the table is done).
     pub next: Option<KeysetCursor>,
+    /// Which source transactions the rows reflect, so the pipeline can order them against the
+    /// stream (DA-SNAP-9). `None`: the source can't say, and the pipeline falls back to the
+    /// watermark window.
+    pub visibility: Option<ChunkVisibility>,
+}
+
+/// What a chunk's rows reflect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChunkVisibility {
+    /// PostgreSQL: the MVCC snapshot the chunk was read in (`pg_current_snapshot()` inside its
+    /// REPEATABLE READ transaction). A transaction whose commit the stream already delivered can
+    /// still be invisible to it: a synchronous commit waiting for its standby is decoded before
+    /// it is visible (measured on PostgreSQL 18).
+    Xids(XidSnapshot),
+}
+
+/// A PostgreSQL snapshot (`pg_snapshot`): full 64-bit transaction ids (`xid8`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XidSnapshot {
+    /// The oldest transaction still in progress; every one before it has completed.
+    pub xmin: u64,
+    /// One past the newest completed transaction; it and every later one hadn't completed.
+    pub xmax: u64,
+    /// The transactions in `xmin..xmax` still in progress.
+    pub xip: Vec<u64>,
+}
+
+impl XidSnapshot {
+    /// True when transaction `xid` had completed (committed or aborted) when the snapshot was
+    /// taken: a committed one's changes are in the rows. `xid` may be a full id or the 32-bit
+    /// one the stream carries, which is placed in the epoch that puts it nearest to `xmax`.
+    pub fn sees(&self, xid: u64) -> bool {
+        let xid = self.full(xid);
+        xid < self.xmin || (xid < self.xmax && !self.xip.contains(&xid))
+    }
+
+    fn full(&self, xid: u64) -> u64 {
+        const EPOCH: u64 = 1 << 32;
+        const HALF: u64 = 1 << 31;
+        if xid >= EPOCH {
+            return xid;
+        }
+        let candidate = (self.xmax & !(EPOCH - 1)) | xid;
+        if candidate > self.xmax.saturating_add(HALF) && candidate >= EPOCH {
+            candidate - EPOCH
+        } else if candidate.saturating_add(HALF) < self.xmax {
+            candidate + EPOCH
+        } else {
+            candidate
+        }
+    }
+}
+
+/// A transaction in progress at the source ([`SourceConnector::in_flight`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InFlightTxn {
+    /// Its id, as [`StreamItem::Begin`] carries it.
+    pub xid: u64,
+    /// The tables it holds a write lock on, by [`TableSchema::source_id`].
+    pub tables: Vec<u64>,
 }
 
 /// What an in-band schema signal carries (`Schema_Change…` §3 channel B). It says when and where;
@@ -168,8 +234,9 @@ pub enum StreamItem {
 pub struct RescanReport {
     /// Tables gone from the source catalog: each halts with `TABLE_DROPPED`.
     pub dropped: Vec<TableRef>,
-    /// Tables whose catalog schema differs from the known one: the current schemas. Freshness and
-    /// alerting only; the stream's signals apply changes in order.
+    /// Tables whose catalog schema differs from the known one: the current schemas. The stream's
+    /// signals apply changes in order; the pipeline applies one of these only once the stream has
+    /// passed the position after the rescan and no signal did it (an idle table).
     pub changed: Vec<TableSchema>,
     /// Tables that can't be described any more (identifier lost, …).
     pub halted: Vec<(TableRef, HaltReason)>,
@@ -203,8 +270,18 @@ pub trait SourceConnector: Send + Sync {
     /// nothing for it.
     async fn retained_bytes(&self) -> Result<Option<u64>, SourceError>;
 
-    /// The source's current position: a snapshot chunk's low and high watermarks.
+    /// The source's current position: a snapshot chunk's low and high watermarks, and the point
+    /// the stream must pass before a rescan's change is applied.
     async fn current_position(&self) -> Result<SourcePosition, SourceError>;
+
+    /// The transactions in progress now, each with the tables it writes (DA-SNAP-9). Read when a
+    /// stream session opens: one of them may have committed before the session and be applied
+    /// to the sink already while still invisible to a chunk (a synchronous commit waiting for its
+    /// standby), so a table's chunks wait until none of them writes it. `None` for a source whose
+    /// chunks carry no [`ChunkVisibility`].
+    async fn in_flight(&self) -> Result<Option<Vec<InFlightTxn>>, SourceError> {
+        Ok(None)
+    }
 
     /// Up to `limit` rows of `table` after `after`, in identifier order.
     async fn read_chunk(
@@ -410,6 +487,7 @@ mod tests {
             Ok(Chunk {
                 rows: vec![],
                 next: None,
+                visibility: None,
             })
         }
         async fn fetch_rows(&self, _: &TableSchema, _: &[Row]) -> Result<Vec<Row>, SourceError> {
@@ -497,6 +575,66 @@ mod tests {
         block_on(stream.acknowledge(&b.commit_pos)).unwrap();
         assert!(block_on(stream.next()).unwrap_err().is_transient());
         block_on(stream.close()).unwrap();
+        assert_eq!(
+            block_on(source.in_flight()).unwrap(),
+            None,
+            "a source without chunk visibility"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_sees_the_transactions_completed_before_it() {
+        // `pg_current_snapshot()` = `100:105:100,103`.
+        let s = XidSnapshot {
+            xmin: 100,
+            xmax: 105,
+            xip: vec![100, 103],
+        };
+        for (xid, seen) in [
+            (99, true),
+            (100, false),
+            (101, true),
+            (103, false),
+            (104, true),
+            (105, false),
+            (106, false),
+        ] {
+            assert_eq!(s.sees(xid), seen, "{xid}");
+        }
+    }
+
+    #[test]
+    fn a_32_bit_xid_is_placed_next_to_the_snapshot() {
+        // Epoch 1: an xid8 is 2^32 + the 32-bit xid the stream sends.
+        let e = 1u64 << 32;
+        let s = XidSnapshot {
+            xmin: e + 10,
+            xmax: e + 20,
+            xip: vec![e + 15],
+        };
+        assert!(s.sees(5), "epoch 1's 5 is below xmin");
+        assert!(!s.sees(15));
+        assert!(!s.sees(25));
+        assert!(!s.sees(e + 15), "a full xid is taken as it is");
+        assert!(s.sees(e + 16));
+        // Just past the wraparound: the stream's 0xFFFF_FFF0 is epoch 0's.
+        let w = XidSnapshot {
+            xmin: e + 1,
+            xmax: e + 3,
+            xip: vec![],
+        };
+        assert!(w.sees(0xFFFF_FFF0));
+        assert!(!w.sees(3));
+    }
+
+    #[test]
+    fn contended_is_retried_by_the_pipeline_not_as_transient() {
+        let e = SourceError::Contended("replication slot \"s\" is active".into());
+        assert!(!e.is_transient());
+        assert_eq!(
+            e.to_string(),
+            "the source's stream position is held by another reader: replication slot \"s\" is active"
+        );
     }
 
     /// Polls a future that never waits (the test connector's methods are all ready at once).

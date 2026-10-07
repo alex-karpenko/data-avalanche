@@ -613,7 +613,7 @@ async fn an_undecodable_value_halts_only_its_table() {
     cleanup(&a, &n).await;
 }
 
-/// Tables the stream wasn't opened for are skipped; a busy slot is a permanent error; an idle
+/// Tables the stream wasn't opened for are skipped; a busy slot is contended; an idle
 /// stream reports the WAL end in keep-alives.
 #[tokio::test(flavor = "multi_thread")]
 async fn untracked_tables_busy_slots_and_keepalives() {
@@ -662,8 +662,8 @@ async fn untracked_tables_busy_slots_and_keepalives() {
 
     let mut busy = c.open_stream(&from, &only_a).await.unwrap();
     match busy.next().await {
-        Err(SourceError::Permanent(m)) => assert!(m.contains("is active for PID"), "{m}"),
-        other => panic!("a busy slot is permanent: {other:?}"),
+        Err(SourceError::Contended(m)) => assert!(m.contains("is active for PID"), "{m}"),
+        other => panic!("a busy slot is contended: {other:?}"),
     }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);

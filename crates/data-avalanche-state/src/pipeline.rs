@@ -53,6 +53,23 @@ impl Document for SlotDoc {
     const SCHEMA_VERSION: u64 = 1;
 }
 
+impl SlotDoc {
+    /// Recorded before a first start's `prepare` creates the slot: `confirmed_flush_lsn` `0/0`,
+    /// which no slot has. A start that finds it knows a slot of this name is its own (created, then
+    /// the start ended before it recorded the slot's position), so the slot is recreated and the
+    /// start is a first start again, not an orphan's.
+    pub fn intent(slot_name: &str) -> Self {
+        Self {
+            slot_name: slot_name.to_owned(),
+            confirmed_flush_lsn: Lsn(0),
+        }
+    }
+
+    pub fn is_intent(&self) -> bool {
+        self.confirmed_flush_lsn == Lsn(0)
+    }
+}
+
 /// The source server a MySQL / MariaDB position was read from. File/position mode refuses to
 /// resume against a different server (`BINLOG_SOURCE_CHANGED`, Q-M7-2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -324,6 +341,21 @@ mod tests {
         };
         p.save_slot(&later).await.unwrap();
         assert_eq!(p.slot().await.unwrap().unwrap().doc, later);
+    }
+
+    #[test]
+    fn a_slot_intent_is_the_zero_position() {
+        let intent = SlotDoc::intent("data_avalanche_orders");
+        assert!(intent.is_intent());
+        assert_eq!(
+            json(&intent),
+            "{\n  \"version\": 1,\n  \"slot_name\": \"data_avalanche_orders\",\n  \"confirmed_flush_lsn\": \"0/0\"\n}"
+        );
+        let started = SlotDoc {
+            confirmed_flush_lsn: "0/16B3748".parse().unwrap(),
+            ..intent
+        };
+        assert!(!started.is_intent());
     }
 
     #[tokio::test]

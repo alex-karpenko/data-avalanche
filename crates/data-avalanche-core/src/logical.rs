@@ -1,6 +1,7 @@
 use std::fmt;
 use std::str::FromStr;
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 use crate::MAX_DECIMAL_PRECISION;
@@ -139,6 +140,21 @@ impl fmt::Display for LogicalType {
     }
 }
 
+/// Stored as its text (`"decimal(10,2)"`, `"list<int64>"`).
+impl Serialize for LogicalType {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for LogicalType {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,5 +259,14 @@ mod tests {
         let err = "decimal(99,1)".parse::<LogicalType>().unwrap_err();
         assert_eq!(err.input, "decimal(99,1)");
         assert!(err.to_string().contains("decimal(99,1)"));
+    }
+    #[test]
+    fn serializes_as_its_text() {
+        let t: LogicalType = "list<decimal(10,2)>".parse().unwrap();
+        let json = serde_json::to_string(&t).unwrap();
+        assert_eq!(json, r#""list<decimal(10,2)>""#);
+        assert_eq!(serde_json::from_str::<LogicalType>(&json).unwrap(), t);
+        let e = serde_json::from_str::<LogicalType>(r#""timestamp""#).unwrap_err();
+        assert!(e.to_string().contains("invalid logical type"), "{e}");
     }
 }

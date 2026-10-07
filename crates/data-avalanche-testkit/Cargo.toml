@@ -19,6 +19,7 @@ data-avalanche-core.workspace = true
 futures-util.workspace = true
 object_store.workspace = true
 rustls.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 uuid.workspace = true
 
 [dev-dependencies]

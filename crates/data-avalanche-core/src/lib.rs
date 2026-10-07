@@ -37,9 +37,9 @@ pub use sink::{
     SinkCapabilities, SinkError, SinkKind, SinkTableState, TableSpec, TransformKind, WriteMode,
 };
 pub use source::{
-    ChangeStream, Chunk, KeysetCursor, Preflight, Prepared, RescanReport, ResolvedTables,
-    SchemaHint, SnapshotReason, SourceConnector, SourceError, StartPlan, StreamItem,
-    identifier_values,
+    ChangeStream, Chunk, ChunkVisibility, InFlightTxn, KeysetCursor, Preflight, Prepared,
+    RescanReport, ResolvedTables, SchemaHint, SnapshotReason, SourceConnector, SourceError,
+    StartPlan, StreamItem, XidSnapshot, identifier_values,
 };
 pub use table::{
     INTERNAL_COLUMN_PREFIX, LINEAGE_COLUMNS, TableRef, first_reserved_collision, is_reserved_column,

@@ -996,6 +996,14 @@ pub const RULES: &[RuleMeta] = &[
         r#"tables.include/exclude globs, when source.type = postgres"#,
         r#"Must be schema.table: one . between a non-empty schema part and a non-empty table part (globs allowed within each part)."#,
     ),
+    rule(
+        "V-118",
+        Error,
+        L::Pipeline,
+        Config,
+        r#"source.timeouts.snapshot"#,
+        r#"≥ 10s."#,
+    ),
 ];
 
 /// The registry entry for `id` (`"V-007"`).
@@ -1009,7 +1017,7 @@ mod tests {
 
     #[test]
     fn has_every_spec_rule_once_in_order() {
-        assert_eq!(RULES.len(), 112);
+        assert_eq!(RULES.len(), 113);
         assert!(
             RULES.windows(2).all(|w| w[0].id < w[1].id),
             "sorted, no duplicates"

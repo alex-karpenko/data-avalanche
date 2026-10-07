@@ -314,6 +314,31 @@ pub fn cases() -> Vec<Case> {
         case("V-111", Silent, "capacity 1", || {
             pg_delta().set("/pipelines/p/sink/buffer_capacity_rows", json!(1))
         }),
+        case("V-118", Error, "snapshot timeout 5s", || {
+            pg_delta().set("/pipelines/p/source/timeouts/snapshot", json!("5s"))
+        }),
+        case("V-118", Error, "snapshot timeout 0s", || {
+            pg_delta().set("/pipelines/p/source/timeouts/snapshot", json!("0s"))
+        }),
+        case("V-118", Silent, "snapshot timeout 10s", || {
+            pg_delta().set("/pipelines/p/source/timeouts/snapshot", json!("10s"))
+        }),
+        case("V-118", Error, "snapshot timeout 9999ms", || {
+            pg_delta().set("/pipelines/p/source/timeouts/snapshot", json!("9999ms"))
+        }),
+        case("V-118", Error, "defaults snapshot timeout 5s", || {
+            pg_delta().set("/defaults/source/timeouts/snapshot", json!("5s"))
+        }),
+        case(
+            "V-118",
+            Error,
+            "defaults 5s, pipeline overrides to 20s",
+            || {
+                pg_delta()
+                    .set("/defaults/source/timeouts/snapshot", json!("5s"))
+                    .set("/pipelines/p/source/timeouts/snapshot", json!("20s"))
+            },
+        ),
         case("V-112", Error, "no attempts", || {
             pg_iceberg().set(
                 "/pipelines/p/sink/iceberg/catalog/retry/max_attempts",

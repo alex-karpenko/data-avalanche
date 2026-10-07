@@ -40,7 +40,8 @@ pub struct SplitInfo {
 /// - every delete batch starts with the identifier columns;
 /// - a key appears at most once across `upserts` and `deletes` (a PK-changing UPDATE is two keys);
 /// - identifier values are never NULL;
-/// - the range doesn't run backwards, and a slice's range ends at its `txn_start`.
+/// - the range doesn't run backwards, and a slice's range ends at its `txn_start`;
+/// - a snapshot set only upserts: no deletes, no truncate, not a slice.
 #[derive(Debug, Clone)]
 pub struct TableChangeSet {
     pub table: TableRef,
@@ -53,6 +54,10 @@ pub struct TableChangeSet {
     pub deletes: Vec<RecordBatch>,
     pub position: PositionRange,
     pub split: Option<SplitInfo>,
+    /// Snapshot chunk rows, read from the source now rather than replayed from the stream: the
+    /// position guard never skips them ([`crate::CommitMarker::covers`]). A chunk is emitted at
+    /// the stream's frontier, which the table's marker may already cover (Q-M6a-6).
+    pub snapshot: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -145,6 +150,11 @@ impl TableChangeSet {
                     "position range from {start} to {end} doesn't compare: {e}"
                 )));
             }
+        }
+        if self.snapshot && (self.truncate || self.split.is_some() || self.delete_rows() > 0) {
+            return Err(err(
+                "a snapshot set carries upserts only: no deletes, truncate or slice".into(),
+            ));
         }
         if let Some(split) = &self.split
             && self.position.end != split.txn_start
@@ -247,6 +257,7 @@ mod tests {
                 end: SourcePosition::Pg(Lsn(20)),
             },
             split: None,
+            snapshot: false,
         }
     }
 
@@ -317,6 +328,31 @@ mod tests {
         c.validate().unwrap();
         c.position.end = SourcePosition::Pg(Lsn(30));
         assert!(detail(c).contains("instead of its transaction start"));
+    }
+
+    #[test]
+    fn a_snapshot_set_only_upserts() {
+        let mut c = cs(vec![upserts(&[1], None)], vec![]);
+        c.snapshot = true;
+        c.validate().unwrap();
+        let refused = |f: fn(&mut TableChangeSet)| {
+            let mut c = cs(vec![upserts(&[1], None)], vec![]);
+            c.snapshot = true;
+            f(&mut c);
+            detail(c)
+        };
+        for d in [
+            refused(|c| c.deletes = vec![deletes(&[Some(2)])]),
+            refused(|c| c.truncate = true),
+            refused(|c| {
+                c.split = Some(SplitInfo {
+                    txn_start: SourcePosition::Pg(Lsn(20)),
+                    slice: 1,
+                });
+            }),
+        ] {
+            assert!(d.contains("upserts only"), "{d}");
+        }
     }
 
     #[test]

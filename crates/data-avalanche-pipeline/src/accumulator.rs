@@ -117,16 +117,28 @@ impl Accumulator {
     }
 
     /// Stops a table after a halt: its buffered changes are dropped and its later events ignored.
-    /// A halt the accumulator returns has already done this; calling it again changes nothing.
+    /// Calling it again changes nothing.
     pub fn halt_table(&mut self, table: &TableRef) {
         self.tables.remove(table);
         self.halted.insert(table.clone());
     }
 
-    /// Halts the table of a [`AccumulatorError::Halt`] before handing the error on.
+    /// Whether the table has committed changes no flush has taken yet.
+    pub fn has_committed(&self, table: &TableRef) -> bool {
+        self.tables
+            .get(table)
+            .is_some_and(|b| b.committed_events() > 0)
+    }
+
+    /// Halts the table of a [`AccumulatorError::Halt`] before handing the error on: its open
+    /// transaction's changes are dropped and its later events ignored. Its committed changes stay
+    /// for a flush until [`Self::halt_table`], so the caller can hand them to the sink first.
     fn halting<T>(&mut self, r: Result<T, AccumulatorError>) -> Result<T, AccumulatorError> {
         if let Err(AccumulatorError::Halt { table, .. }) = &r {
-            self.halt_table(table);
+            if let Some(b) = self.tables.get_mut(table) {
+                b.discard_open();
+            }
+            self.halted.insert(table.clone());
         }
         r
     }
@@ -152,8 +164,8 @@ impl Accumulator {
     /// it is reached is refused with [`AccumulatorError::SplitRequired`] and nothing changes —
     /// split, commit the slice, then apply the event again. The split empties the open
     /// transaction, so the retry always makes progress. An [`AccumulatorError::Halt`] has already
-    /// stopped the table ([`Self::halt_table`]), as it has from [`Self::truncate`] and
-    /// [`Self::set_schema`].
+    /// stopped the table, as it has from [`Self::truncate`] and [`Self::set_schema`]: its later
+    /// events are ignored, and only its committed changes stay, until [`Self::halt_table`].
     pub fn apply(&mut self, event: &CdcEvent, now: Instant) -> Result<(), AccumulatorError> {
         let Some(txn) = &mut self.txn else {
             return Err(protocol(format!(
@@ -229,8 +241,9 @@ impl Accumulator {
     }
 
     /// A table's new schema (`Schema_Change…` §8), after the classifier found the change safe and
-    /// the sink evolved the table. [`AccumulatorError::FlushRequired`] when the table has committed
-    /// changes still in the old shape. A halted table is skipped.
+    /// the sink evolved the table, or found it ignorable. [`AccumulatorError::FlushRequired`] when
+    /// the table has committed changes in a shape the new schema changes. A halted table is
+    /// skipped.
     pub fn set_schema(
         &mut self,
         schema: TableSchema,
@@ -895,6 +908,37 @@ mod tests {
         assert_eq!(f.change_sets[0].table, table("b"));
         a.halt_table(&table("a"));
         a.halt_table(&table("a"));
+    }
+
+    /// A halt keeps the table's committed changes for a flush before `halt_table`; its open
+    /// transaction's changes go.
+    #[test]
+    fn a_halt_keeps_the_tables_committed_changes_until_halt_table() {
+        let t0 = Instant::now();
+        let mut a = acc(FlushPolicy::default());
+        a.begin(1).unwrap();
+        a.apply(&insert("a", 1, 1, 1), t0).unwrap();
+        a.commit(&boundary(1, 200), t0).unwrap();
+        a.begin(2).unwrap();
+        a.apply(&insert("a", 2, 2, 2), t0).unwrap();
+        let mut bad = insert("a", 2, 3, 3);
+        bad.after.as_mut().unwrap().0[0].1 = ColumnValue::Null;
+        let err = a.apply(&bad, t0).unwrap_err();
+        assert!(matches!(err, AccumulatorError::Halt { .. }), "{err}");
+        assert!(a.has_committed(&table("a")));
+        assert_eq!(a.open_events(), 0, "the open transaction's changes went");
+        let f = a.flush();
+        assert_eq!(f.change_sets.len(), 1);
+        assert_eq!(f.change_sets[0].upsert_rows(), 1, "transaction 1's row");
+        assert_eq!(f.checkpoint, boundary(1, 200).commit_pos);
+        a.halt_table(&table("a"));
+        assert!(!a.has_committed(&table("a")));
+        a.apply(&insert("a", 2, 4, 4), t0).unwrap();
+        a.commit(&boundary(2, 300), t0).unwrap();
+        assert!(
+            a.flush().change_sets.is_empty(),
+            "its later changes are ignored"
+        );
     }
 
     #[test]

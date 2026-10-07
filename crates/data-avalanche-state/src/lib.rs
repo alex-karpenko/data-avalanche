@@ -25,9 +25,10 @@
 //!
 //! Per pipeline (one [`PipelineDocs`] rooted at the pipeline's state location):
 //! [`PipelineDocs::open`] creates or checks `pipeline-state.json` (refusing another pipeline's
-//! state or a changed `sink_type`), the desired state, `replication/slot.json` (PostgreSQL),
-//! `replication/position.json` (MySQL / MariaDB, with the source server identity), per-table
-//! snapshot state and on-demand snapshot jobs.
+//! state or a changed `sink_type`), the desired state, `replication/slot.json` (PostgreSQL, with
+//! the intent recorded before a first start creates the slot), `replication/position.json` (MySQL /
+//! MariaDB, with the source server identity), per-table snapshot state, on-demand snapshot jobs,
+//! the schema cache (`schemas/<schema>.<table>.json`) and the halt registry (`halts.json`).
 
 mod anchor;
 mod doc;
@@ -35,6 +36,7 @@ mod generation;
 mod lease;
 mod pipeline;
 mod snapshot;
+mod tables;
 #[cfg(test)]
 mod test_support;
 
@@ -53,3 +55,4 @@ pub use snapshot::{
     CursorKey, JOBS_PREFIX, JobStatus, JobTable, SnapshotCursor, SnapshotJobDoc, SnapshotStatus,
     TableSnapshotDoc, job_key, table_snapshot_key,
 };
+pub use tables::{HALTS_KEY, HaltsDoc, SCHEMAS_PREFIX, TableHalt, table_schema_key};

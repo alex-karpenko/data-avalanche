@@ -37,7 +37,7 @@ pub struct CollapsedRow {
 /// JSON ([`TableSchema::new`]), and decimals are rescaled to the column's scale on the way in, so
 /// equal values have one representation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct Key(Vec<KeyPart>);
+pub(crate) struct Key(Vec<KeyPart>);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum KeyPart {
@@ -66,6 +66,21 @@ fn key_part(v: &ColumnValue) -> Option<KeyPart> {
             return None;
         }
     })
+}
+
+/// The key of `row` in `schema`, compared as the buffer compares keys; `None` when an identifier
+/// value is missing, NULL or doesn't fit its column.
+pub(crate) fn identity(schema: &TableSchema, row: &Row) -> Option<Key> {
+    schema
+        .identifier()
+        .iter()
+        .map(|name| {
+            let c = schema.column(name)?;
+            let v = conform_value(row.get(name)?.clone(), &c.value_type, &c.logical).ok()?;
+            key_part(&v)
+        })
+        .collect::<Option<_>>()
+        .map(Key)
 }
 
 /// Rough in-memory size of a row, for the flush `bytes` trigger and the transaction buffer ceiling.
@@ -441,16 +456,37 @@ impl TableBuffer {
         Ok(())
     }
 
-    /// A schema change (`Schema_Change…` §8: seal → flush → apply). The committed layer must have
-    /// been flushed ([`AccumulatorError::FlushRequired`] otherwise); the open transaction's rows
-    /// are carried over by column name: a new column is NULL, a dropped one goes, a widened one is
-    /// widened. The identifier can't change (the classifier halts that).
+    /// A schema change (`Schema_Change…` §8). The committed layer must have been flushed
+    /// ([`AccumulatorError::FlushRequired`] otherwise), unless the change keeps every column, in
+    /// order, with its logical type, and the identifier (an Ignorable change): its rows then read
+    /// the same under the new schema and stay. The open transaction's rows are carried over by
+    /// column name: a new column is NULL, a dropped one goes, a widened one is widened. The
+    /// identifier can't change (the classifier halts that).
     pub fn set_schema(
         &mut self,
         schema: TableSchema,
         delete_extra: &[String],
     ) -> Result<(), AccumulatorError> {
-        self.flush_required()?;
+        let same_shape = schema.identifier() == self.schema.identifier()
+            && schema.columns().len() == self.schema.columns().len()
+            && schema
+                .columns()
+                .iter()
+                .zip(self.schema.columns())
+                .all(|(new, old)| new.name == old.name && new.logical == old.logical);
+        if same_shape {
+            // Hop 2 stores a value in the variant its logical type reads (`hop2_compatible`), so
+            // the committed rows conform to the new columns as they are.
+            debug_assert!(self.committed.values().all(|row| {
+                schema
+                    .columns()
+                    .iter()
+                    .zip(&row.values)
+                    .all(|(c, v)| conform_value(v.clone(), &c.value_type, &c.logical).is_ok())
+            }));
+        } else {
+            self.flush_required()?;
+        }
         if schema.identifier() != self.schema.identifier() {
             return Err(self.halt(HaltReason::UnsafeDdl {
                 detail: "the identifier changed".into(),
@@ -496,6 +532,14 @@ impl TableBuffer {
         self.open = open;
         self.open_bytes = open_bytes;
         Ok(())
+    }
+
+    /// Drops the open transaction's rows (a halt of the table): the committed layer stays.
+    pub fn discard_open(&mut self) {
+        self.open.clear();
+        self.open_bytes = 0;
+        self.open_events = 0;
+        self.open_truncate = false;
     }
 
     /// The source committed the open transaction: its rows join the committed layer.
@@ -549,6 +593,7 @@ impl TableBuffer {
             deletes,
             position,
             split,
+            snapshot: false,
         }
     }
 }
@@ -1073,10 +1118,28 @@ mod tests {
         b.commit_txn();
         b.apply(&insert(2, 2, "open")).unwrap();
         assert!(is_flush_required(b.truncate()));
-        assert!(is_flush_required(b.set_schema(schema(), &[])));
+        let mut fewer = schema().columns().to_vec();
+        fewer.pop();
+        let fewer = TableSchema::new(TableRef::new("public", "t"), fewer, vec!["id".into()]);
+        assert!(is_flush_required(b.set_schema(fewer.unwrap(), &[])));
         assert_eq!(b.open_events(), 1, "nothing changed");
         b.take_committed();
         b.truncate().unwrap();
+    }
+
+    #[test]
+    fn an_ignorable_change_keeps_the_committed_layer() {
+        let mut b = buffer();
+        b.apply(&insert(1, 1, "a")).unwrap();
+        b.commit_txn();
+        let mut columns = schema().columns().to_vec();
+        columns[1] = ColumnSchema::new("doc", V::Text, "varchar(100)").not_null();
+        let ignorable = TableSchema::new(TableRef::new("public", "t"), columns, vec!["id".into()]);
+        b.set_schema(ignorable.unwrap(), &["region".into()])
+            .unwrap();
+        assert_eq!(b.schema().columns()[1].source_type, "varchar(100)");
+        assert_eq!(b.committed_events(), 1, "no flush");
+        assert_eq!(b.take_committed()[0].values[1], text("a"));
     }
 
     #[test]
@@ -1183,5 +1246,38 @@ mod tests {
         let err = TableBuffer::new(schema(), &["nope".into()]).unwrap_err();
         assert_eq!(err.code(), "SCHEMA_MISMATCH");
         assert_eq!(buffer().delete_columns(), [0, 2]);
+    }
+
+    #[test]
+    fn a_rows_identity_is_its_key_as_the_buffer_compares_it() {
+        let s = TableSchema::new(
+            TableRef::new("public", "n"),
+            vec![
+                ColumnSchema::new(
+                    "k",
+                    V::Numeric {
+                        precision: 6,
+                        scale: 2,
+                    },
+                    "numeric(6,2)",
+                )
+                .not_null(),
+                ColumnSchema::new("v", V::Text, "text"),
+            ],
+            vec!["k".into()],
+        )
+        .unwrap();
+        let key = |d| Row(vec![("k".into(), ColumnValue::Numeric(d))]);
+        assert_eq!(
+            identity(&s, &key(Decimal::new(15, 1))),
+            identity(&s, &key(Decimal::new(150, 2))),
+            "1.5 and 1.50 are one key"
+        );
+        assert!(identity(&s, &key(Decimal::new(15, 1))).is_some());
+        assert_eq!(identity(&s, &Row(vec![("v".into(), text("x"))])), None);
+        assert_eq!(
+            identity(&s, &Row(vec![("k".into(), ColumnValue::Null)])),
+            None
+        );
     }
 }

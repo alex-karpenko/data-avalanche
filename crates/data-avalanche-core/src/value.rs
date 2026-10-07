@@ -1,9 +1,13 @@
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::Decimal;
 
-/// The type of a column as decoded from the source (Hop 1 output, `Type_Mapping.md`).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// The type of a column as decoded from the source (Hop 1 output, `Type_Mapping.md`). Stored in
+/// the pipeline's schema cache as `"int64"`, `{"numeric": {"precision": 10, "scale": 2}}`,
+/// `{"array": "text"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ColumnValueType {
     Bool,
     Int16,

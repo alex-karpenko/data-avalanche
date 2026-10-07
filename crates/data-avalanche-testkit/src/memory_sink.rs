@@ -17,6 +17,7 @@ use data_avalanche_core::{
     SinkCapabilities, SinkError, SinkKind, SinkTableState, TableChangeSet, TableRef, TableSpec,
     TransformKind, UNCHANGED_MASK_PREFIX, WriteMode, added_column_field,
 };
+use tokio::sync::watch;
 
 #[derive(Debug)]
 struct MemTable {
@@ -157,11 +158,42 @@ fn permanent(reason: String) -> SinkError {
     SinkError::Permanent { reason }
 }
 
+/// The sink call a [`MemorySink::fail`] fault fires in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SinkOp {
+    TableState,
+    EnsureTable,
+    Evolve,
+    Commit,
+}
+
+/// A failure the next matching calls report, before they change anything.
+struct Fault {
+    op: SinkOp,
+    /// `None`: any table.
+    table: Option<TableRef>,
+    remaining: usize,
+    error: Box<dyn Fn() -> SinkError + Send>,
+}
+
+impl std::fmt::Debug for Fault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Fault")
+            .field("op", &self.op)
+            .field("table", &self.table)
+            .field("remaining", &self.remaining)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The reference sink. Cloning shares the tables.
 #[derive(Debug, Clone)]
 pub struct MemorySink {
     capabilities: SinkCapabilities,
     tables: Arc<Mutex<BTreeMap<TableRef, MemTable>>>,
+    faults: Arc<Mutex<Vec<Fault>>>,
+    /// While set, commits wait before they start.
+    held: Arc<watch::Sender<bool>>,
 }
 
 impl Default for MemorySink {
@@ -188,7 +220,73 @@ impl MemorySink {
                 .into(),
             },
             tables: Arc::default(),
+            faults: Arc::default(),
+            held: Arc::new(watch::Sender::new(false)),
         }
+    }
+
+    /// The next `times` calls of `op` (for `table`, or any table) fail with `error()` and change
+    /// nothing.
+    pub fn fail(
+        &self,
+        op: SinkOp,
+        table: Option<&TableRef>,
+        times: usize,
+        error: impl Fn() -> SinkError + Send + 'static,
+    ) {
+        self.faults
+            .lock()
+            .expect("no test panics while holding the lock")
+            .push(Fault {
+                op,
+                table: table.cloned(),
+                remaining: times,
+                error: Box::new(error),
+            });
+    }
+
+    fn fault(&self, op: SinkOp, table: &TableRef) -> Result<(), SinkError> {
+        let mut faults = self
+            .faults
+            .lock()
+            .expect("no test panics while holding the lock");
+        let Some(f) = faults
+            .iter_mut()
+            .find(|f| f.op == op && f.remaining > 0 && f.table.as_ref().is_none_or(|t| t == table))
+        else {
+            return Ok(());
+        };
+        f.remaining -= 1;
+        Err((f.error)())
+    }
+
+    /// Commits wait, before they change anything, until [`Self::release_commits`].
+    pub fn hold_commits(&self) {
+        self.held.send_replace(true);
+    }
+
+    pub fn release_commits(&self) {
+        self.held.send_replace(false);
+    }
+
+    /// The commits waiting for [`Self::release_commits`] now.
+    pub fn waiting_commits(&self) -> usize {
+        self.held.receiver_count()
+    }
+
+    /// A newer owner (`epoch`) has written `table`: this pipeline's next commit with an older
+    /// epoch is `Fenced`.
+    pub fn take_over(&self, table: &TableRef, epoch: u64) {
+        let mut tables = self.tables();
+        let t = tables.get_mut(table).expect("a table");
+        if let Some(m) = &mut t.marker {
+            m.owner_epoch = epoch;
+        }
+    }
+
+    /// The marker of the table's last commit.
+    pub fn marker(&self, table: &TableRef) -> Option<CommitMarker> {
+        self.tables().get(table).and_then(|t| t.marker.clone())
     }
 
     fn tables(&self) -> MutexGuard<'_, BTreeMap<TableRef, MemTable>> {
@@ -220,6 +318,7 @@ impl Sink for MemorySink {
     }
 
     async fn table_state(&self, table: &TableRef) -> Result<SinkTableState, SinkError> {
+        self.fault(SinkOp::TableState, table)?;
         Ok(match self.tables().get(table) {
             Some(t) => SinkTableState {
                 exists: true,
@@ -235,6 +334,7 @@ impl Sink for MemorySink {
     }
 
     async fn ensure_table(&self, spec: &TableSpec) -> Result<(), SinkError> {
+        self.fault(SinkOp::EnsureTable, &spec.table)?;
         self.tables()
             .entry(spec.table.clone())
             .or_insert_with(|| MemTable {
@@ -252,6 +352,7 @@ impl Sink for MemorySink {
         table: &TableRef,
         delta: &SchemaDelta,
     ) -> Result<EvolveOutcome, SinkError> {
+        self.fault(SinkOp::Evolve, table)?;
         let mut tables = self.tables();
         let t = tables.get_mut(table).ok_or_else(|| SinkError::NoTable {
             table: table.clone(),
@@ -306,6 +407,9 @@ impl Sink for MemorySink {
         cs: TableChangeSet,
         marker: CommitMarker,
     ) -> Result<CommitOutcome, SinkError> {
+        let mut held = self.held.subscribe();
+        let _ = held.wait_for(|h| !h).await;
+        self.fault(SinkOp::Commit, &cs.table)?;
         cs.validate()?;
         if marker.committed_position != cs.position.end {
             return Err(permanent(format!(
@@ -417,6 +521,7 @@ mod tests {
                 end: SourcePosition::Pg(Lsn(end)),
             },
             split: None,
+            snapshot: false,
         }
     }
 
@@ -539,6 +644,56 @@ mod tests {
             CommitOutcome::Fenced { current_epoch: 7 }
         );
         assert_eq!(rows(&sink), owned(&[(1, Some("new"))]));
+    }
+
+    #[tokio::test]
+    async fn faults_fail_matching_calls_and_change_nothing() {
+        let sink = sink().await;
+        let t = TableRef::new("public", "t");
+        sink.fail(SinkOp::Commit, Some(&t), 2, || SinkError::Transient {
+            reason: "throttled".into(),
+        });
+        let set = cs(10, vec![upserts(&[(1, Some("a"))], None)], vec![]);
+        let m = marker(1, 10);
+        for _ in 0..2 {
+            let e = sink.commit(set.clone(), m.clone()).await.unwrap_err();
+            assert!(e.is_transient(), "{e}");
+        }
+        assert_eq!(sink.version(&t), Some(0), "nothing written");
+        assert_eq!(
+            sink.commit(set, m).await.unwrap(),
+            CommitOutcome::Committed { version: 1 }
+        );
+        sink.fail(SinkOp::TableState, None, 1, || SinkError::Permanent {
+            reason: "gone".into(),
+        });
+        assert!(sink.table_state(&t).await.is_err());
+        assert!(sink.table_state(&t).await.is_ok());
+        assert_eq!(sink.marker(&t).unwrap().owner_epoch, 1);
+        sink.take_over(&t, 9);
+        let later = cs(20, vec![upserts(&[(1, Some("b"))], None)], vec![]);
+        assert_eq!(
+            commit(&sink, later, 1).await,
+            CommitOutcome::Fenced { current_epoch: 9 }
+        );
+    }
+
+    #[tokio::test]
+    async fn held_commits_wait_for_the_release() {
+        let sink = sink().await;
+        let t = TableRef::new("public", "t");
+        sink.hold_commits();
+        let held = sink.clone();
+        let commit = tokio::spawn(async move {
+            let set = cs(10, vec![upserts(&[(1, Some("a"))], None)], vec![]);
+            held.commit(set, marker(1, 10)).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!commit.is_finished());
+        assert_eq!(sink.version(&t), Some(0));
+        sink.release_commits();
+        assert!(commit.await.unwrap().is_ok());
+        assert_eq!(sink.version(&t), Some(1));
     }
 
     #[tokio::test]

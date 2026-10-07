@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-02
+updated: 2026-10-03
 domain: Architecture
 status: Specification (supersedes the Configuration_file_model.md draft)
 tags: [architecture, configuration, spec, validation, multi-sink, iceberg, delta-lake]
@@ -671,7 +671,7 @@ source:
 | `ssl_cert` / `ssl_key` / `ssl_ca` | PEM/path | no | — | PR | §4.4. |
 | `timeouts.connect` | Duration | no | `10s` | PR | |
 | `timeouts.command` | Duration | no | `30s` | PR | |
-| `timeouts.snapshot` | Duration | no | `6h` | PR | **Per-table** snapshot timeout. |
+| `timeouts.snapshot` | Duration | no | `6h` | PR | **Per-table** snapshot timeout. At least `10s` (V-118). |
 | `toast_strategy` | enum `carry_forward`\|`re_query` | no | `carry_forward` | PR | **PostgreSQL only.** Handling of unchanged TOAST(out-of-line) columns in UPDATE events: `carry_forward` reuses the last known value; `re_query` re-fetches the row over the control connection. `re_query` on high-volume snapshots may saturate the control pool (V-077 warning). Ignored for MySQL. See `research/Type_Mapping.md`. |
 
 > **CHANGE (vs draft):** `ssl-mode`/`ssl-cert`/`ssl-key`/`ssl-ca` renamed to snake_case
@@ -1271,6 +1271,7 @@ errors.
 | V-114 | `sink.delta.timestamp_ntz_as` | ∈ {timestamp_ntz, timestamp, string}. | error | pipeline |
 | V-115 | `sink.iceberg.catalog.type` / `sink.iceberg.catalog.hive` | `hive` → `error`: the pinned iceberg-rust HMS catalog cannot commit (`update_table` is `FeatureUnsupported`; DA-CAT-6). Lifted when a pinned release implements it and the iceberg-capability probe passes against a real HMS. | error | pipeline |
 | V-116 | `sink.iceberg.catalog.rest.auth` | `sigv4` → `error`: the pinned iceberg-rust REST client has no SigV4 signing (DA-CAT-7; upstream #3082/#3092). `none`/`bearer`/`oauth2` unaffected; on AWS use `catalog.glue`. Lifted when a pinned release carries SigV4 and it is probed against the Glue or S3 Tables REST endpoint. | error | pipeline |
+| V-118 | `source.timeouts.snapshot` | ≥ 10s. | error | pipeline |
 
 ### 13.4 Cross-field / conditional
 
@@ -1599,6 +1600,9 @@ Every deviation, so nothing is silent:
     and a required field is checked after merge; new §8.6 (validation of `defaults` on its own);
     §6.2 cluster-anchor `fingerprint_key` and keyed fingerprints (§11.1); diagnostics never show
     env-resolved values; §13 intro: a diagnostic for a `defaults` value has locus `config`.
+24. **M6a planning (2026-10-03, `v1.0/00-roadmap.md` §7 S-U)** — new rule **V-118**:
+    `source.timeouts.snapshot` is at least `10s` (§9.1, §13.3); a `0` would halt every snapshot at
+    once.
 
 None of these change the **decided** catalog-auth schema (hive Thrift `none/ldap/kerberos`;
 rest HTTP `none/bearer/oauth2/sigv4`) — those are reproduced verbatim from

@@ -90,6 +90,7 @@ pub fn cs(end: u64, up: Vec<RecordBatch>, del: Vec<RecordBatch>) -> TableChangeS
             end: SourcePosition::Pg(Lsn(end)),
         },
         split: None,
+        snapshot: false,
     }
 }
 

@@ -13,12 +13,24 @@ workspace = true
 arrow-array.workspace = true
 arrow-buffer.workspace = true
 arrow-schema.workspace = true
+chrono.workspace = true
+data-avalanche-config.workspace = true
 data-avalanche-core.workspace = true
+data-avalanche-state.workspace = true
+data-avalanche-storage.workspace = true
+getrandom.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
+uuid.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+data-avalanche-source-pg.workspace = true
 data-avalanche-testkit.workspace = true
-tokio.workspace = true
-serde_json.workspace = true
-uuid.workspace = true
+futures-util.workspace = true
+object_store.workspace = true
 proptest.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
