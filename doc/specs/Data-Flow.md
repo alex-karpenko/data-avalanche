@@ -73,9 +73,12 @@ On worker start (or when a pipeline is assigned via the consistent hash ring), t
 
 4. Sink preflight (per pipeline):
    ├── capability assertion — the sink confirms it supports everything this pipeline's config
-   │   needs (write mode, partition transforms, logical types of the resolved tables); otherwise
-   │   the pipeline is refused with the named capability (e.g. "Iceberg mirror mode requires a
-   │   delete-capable commit action")
+   │   needs (write mode, partition transforms); otherwise the pipeline is refused with the
+   │   named capability (e.g. "Iceberg mirror mode requires a delete-capable commit action")
+   ├── per resolved table (a table-scoped problem halts that table only; other tables run):
+   │   a column whose logical type the sink can't represent → `SINK_REJECTED` (the sink's
+   │   reason names the column and type); a partition column the table doesn't have →
+   │   `SCHEMA_MISMATCH`
    ├── v1: `sink.type: iceberg` → pipeline refused ("the Iceberg sink ships in v2"); other
    │   pipelines run
    ├── pipeline state's recorded `sink_type` must equal `sink.type` (a change re-seeds; §State Layout)
