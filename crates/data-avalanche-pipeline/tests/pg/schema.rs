@@ -96,8 +96,10 @@ async fn a_dropped_table_halts_and_the_others_go_on() {
 }
 
 /// A column is dropped while the table's snapshot runs (Task 14, the run-time case of
-/// D-M6a.11): the next chunk read under the cached schema fails transiently ("column extra is
-/// gone"), the rescan the failure asks for finds the drop, and once the stream has passed it the
+/// D-M6a.11): the next chunk read under the cached schema fails transiently. Usually its read
+/// plan finds the column gone; when the drop commits between the plan and the query, the query
+/// fails with SQLSTATE 42703, mapped transient the same way (`sync_drop.rs` forces that case).
+/// The rescan the failure asks for finds the drop, and once the stream has passed it the
 /// snapshot reads on under the new schema. The sink soft-drops `extra`: it keeps the column, and
 /// the rows read after the drop have it NULL. Without the rescan the reads would fail until the
 /// 60-minute periodic rescan.

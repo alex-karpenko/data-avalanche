@@ -1263,11 +1263,52 @@ mod tests {
     }
 
     /// A held table the rescan doesn't name because the stream already brought its cache up to
-    /// date stays held until that cache is handed to the writer (M-2): a session ending before
-    /// would leave the old schema cached, and the next one wouldn't hold the table. The flush
-    /// policy holds the change back until a `Flush`.
+    /// date: the rescan hands that cache to the writer before it releases the table, whatever the
+    /// flush policy (M-2). A session that ends right after, before any other flush, leaves the
+    /// new schema cached, so the next session needn't hold the table.
     #[tokio::test]
-    async fn a_held_table_waits_until_its_new_cache_is_handed_on() {
+    async fn a_held_tables_new_cache_is_handed_on_at_its_release() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.source.load(&t("a"), rows(1..=2));
+        w.request(&["a"]).await;
+        w.source.alter(&t("a"), with_note());
+        w.source.commit(FakeTxn::new().insert(&t("a"), noted(9)));
+        w.source.hold_reads();
+        let p = Yaml {
+            tables: "\n      snapshots: { chunk_size: 10 }",
+            sink: "flush: { seconds: 3600 }",
+            ..Yaml::default()
+        }
+        .build();
+        let (mut core, _control, _status) = w.core(&p, &["a"]);
+        core.drifted.insert(t("a"));
+        let s = Session::open(&mut core).await.unwrap().unwrap();
+        let driver = async {
+            wait_until("`a` is released and read", || w.source.reads(&t("a")) == 1).await;
+            w.source.fail(
+                Method::Next,
+                SourceError::Transient("connection reset".into()),
+            );
+        };
+        let (end, ()) = tokio::join!(s.run(), driver);
+        w.source.release_reads();
+        assert!(matches!(end.unwrap(), End::Source(_)));
+        assert_eq!(w.source.rescans(), 1, "the first round released `a`");
+        assert!(core.drifted.is_empty());
+        let cached = w.docs.table_schema(&t("a")).await.unwrap().unwrap().doc;
+        assert_eq!(cached, w.source.schema(&t("a")), "the new schema is cached");
+        assert_eq!(
+            w.ids("a"),
+            [9],
+            "the stream's row, flushed with it; no chunk"
+        );
+    }
+
+    /// The same with `flush.seconds: null` and a quiet table: no flush policy hands the stream's
+    /// change on, and the table is still released at the first round and snapshotted.
+    #[tokio::test]
+    async fn a_quiet_held_table_is_snapshotted_with_no_flush_interval() {
         let w = World::new(&["a"]);
         w.started(&["a"]).await;
         w.source.load(&t("a"), rows(1..=2));
@@ -1276,26 +1317,19 @@ mod tests {
         w.source.commit(FakeTxn::new().insert(&t("a"), noted(9)));
         let p = Yaml {
             tables: "\n      snapshots: { chunk_size: 10 }",
-            sink: "flush: { seconds: 3600 }",
+            sink: "flush: { seconds: null, rows: 100000 }",
             ..Yaml::default()
         }
         .build();
         let (mut core, control, status) = w.core(&p, &["a"]);
         core.drifted.insert(t("a"));
-        let flush = control.clone();
-        run(core, control, status, async |status| {
-            let end = w.source.wal_end();
-            wait_until("the stream applied the change", || {
-                status.borrow().read.as_ref() == Some(&end)
-            })
-            .await;
-            // Ten ticks: a round at each.
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            assert_eq!(w.source.reads(&t("a")), 0, "the new cache isn't handed on");
-            flush.send(Command::Flush).await.unwrap();
+        core.settings.snapshot_timeout = Duration::from_secs(3);
+        let (_, st) = run(core, control, status, async |status| {
             snapshot_done(&w, &status, "a").await;
         })
         .await;
+        assert!(st.halted.is_empty(), "{st:?}");
+        assert_eq!(w.source.rescans(), 1, "the first round released `a`");
         assert_eq!(w.source.reads(&t("a")), 2);
         assert_eq!(w.ids("a"), [1, 2, 9]);
     }
@@ -1355,6 +1389,46 @@ mod tests {
             st.warnings
         );
         assert_eq!(w.source.reads(&t("a")), 2);
+    }
+
+    /// A hold that ends with its rounds still failing ends their streak (Task 16 F review M-2):
+    /// the held table halts on its snapshot timeout, and a later hold would start a streak of
+    /// its own, with its own warning and backoff.
+    #[tokio::test]
+    async fn a_hold_that_ends_ends_its_failure_streak() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.source.load(&t("a"), rows(1..=2));
+        w.request(&["a"]).await;
+        for _ in 0..200 {
+            w.source.fail(
+                Method::Rescan,
+                SourceError::Transient("catalog busy".into()),
+            );
+        }
+        let (mut core, control, status) = w.core(&chunks_of(10), &["a"]);
+        core.drifted.insert(t("a"));
+        core.settings.snapshot_timeout = Duration::from_millis(100);
+        let s = Session::open(&mut core).await.unwrap().unwrap();
+        let driver = async {
+            wait_until("the held table halts", || {
+                !status.borrow().halted.is_empty()
+            })
+            .await;
+            control.send(Command::Drain).await.unwrap();
+        };
+        let (end, ()) = tokio::join!(s.run(), driver);
+        assert!(matches!(end.unwrap(), End::Exit(Exit::Drained)));
+        assert_eq!(
+            status.borrow().halted.get(&t("a")),
+            Some(&HaltReason::SnapshotTimeout { limit_secs: 0 })
+        );
+        assert!(w.source.rescans() > 1, "the rounds failed");
+        assert_eq!(
+            core.held_failing.failures(),
+            0,
+            "the streak ended with the hold"
+        );
     }
 
     /// Holds the source's chunk reads once a chunk is emitted.

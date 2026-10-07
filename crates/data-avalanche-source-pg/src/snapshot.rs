@@ -112,17 +112,12 @@ async fn read_plan(c: &PgConnector, schema: &TableSchema) -> Result<Vec<ReadColu
         )
         .await?;
     let key = table_key(schema.table());
-    let changed = |detail: String| {
-        SourceError::Transient(format!(
-            "{key} changed under the snapshot: {detail}; read again once the stream's schema caught up"
-        ))
-    };
     let mut out = Vec::with_capacity(names.len());
     for col in schema.columns() {
         let r = rows
             .iter()
             .find(|r| r.get::<_, &str>(0) == col.name)
-            .ok_or_else(|| changed(format!("column {} is gone", col.name)))?;
+            .ok_or_else(|| changed(schema, format!("column {} is gone", col.name)))?;
         if schema.is_identifier(&col.name) && !r.get::<_, bool>(6) {
             return Err(SourceError::TableHalt {
                 table: schema.table().clone(),
@@ -150,10 +145,13 @@ async fn read_plan(c: &PgConnector, schema: &TableSchema) -> Result<Vec<ReadColu
             reason: h,
         })?;
         if p.value_type != col.value_type {
-            return Err(changed(format!(
-                "column {} is now {:?}, the schema has {:?}",
-                col.name, p.value_type, col.value_type
-            )));
+            return Err(changed(
+                schema,
+                format!(
+                    "column {} is now {:?}, the schema has {:?}",
+                    col.name, p.value_type, col.value_type
+                ),
+            ));
         }
         let collation = match (r.get::<_, Option<String>>(4), r.get::<_, Option<bool>>(5)) {
             (Some(name), Some(true)) => Some(KeyCollation::Own(name)),
@@ -388,13 +386,25 @@ fn halt_dropped(schema: &TableSchema) -> SourceError {
     }
 }
 
+/// The table's columns differ from `schema`'s: transient, since the stream's schema signal hasn't
+/// caught up with the catalog yet.
+fn changed(schema: &TableSchema, detail: String) -> SourceError {
+    SourceError::Transient(format!(
+        "{} changed under the snapshot: {detail}; read again once the stream's schema caught up",
+        table_key(schema.table())
+    ))
+}
+
 /// A table, or its schema, gone from the catalog (SQLSTATE 42P01, 3F000) halts that table, not
-/// the pipeline (§2.1).
+/// the pipeline (§2.1). A column gone (42703) is `read_plan`'s own finding come late: dropped
+/// after the plan's catalog read and before the query took its lock, it is transient the same
+/// way.
 fn dropped(schema: &TableSchema, e: SourceError) -> SourceError {
     match &e {
         SourceError::Permanent(m) if matches!(sqlstate(m), Some("42P01" | "3F000")) => {
             halt_dropped(schema)
         }
+        SourceError::Permanent(m) if sqlstate(m) == Some("42703") => changed(schema, m.clone()),
         _ => e,
     }
 }
@@ -593,7 +603,53 @@ impl PgConnector {
 
 #[cfg(test)]
 mod tests {
+    use data_avalanche_core::{ColumnSchema, ColumnValueType, TableRef};
+
     use super::*;
+
+    /// `s.t`: `id bigint` (the key) and `extra text`.
+    fn schema() -> TableSchema {
+        TableSchema::new(
+            TableRef::new("s", "t"),
+            vec![
+                ColumnSchema::new("id", ColumnValueType::Int64, "bigint").not_null(),
+                ColumnSchema::new("extra", ColumnValueType::Text, "text"),
+            ],
+            vec!["id".into()],
+        )
+        .unwrap()
+    }
+
+    /// A chunk query that meets a column dropped after its read plan (SQLSTATE 42703) is the plan's
+    /// own finding come late: transient, so the pipeline rescans and reads again (owner ruling,
+    /// Batch F concern 4). A table gone still halts it; other errors pass as they are.
+    #[test]
+    fn a_column_gone_under_the_query_is_transient() {
+        let gone =
+            SourceError::Permanent("column src.extra does not exist (SQLSTATE 42703)".into());
+        match dropped(&schema(), gone) {
+            SourceError::Transient(m) => assert!(
+                m.contains("changed under the snapshot")
+                    && m.contains("column src.extra does not exist"),
+                "{m}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        let table =
+            SourceError::Permanent("relation \"s.t\" does not exist (SQLSTATE 42P01)".into());
+        assert!(matches!(
+            dropped(&schema(), table),
+            SourceError::TableHalt {
+                reason: HaltReason::TableDropped,
+                ..
+            }
+        ));
+        let other = SourceError::Permanent("permission denied (SQLSTATE 42501)".into());
+        assert!(matches!(
+            dropped(&schema(), other),
+            SourceError::Permanent(_)
+        ));
+    }
 
     fn rc(name: &str, type_text: &str, collation: Option<KeyCollation>) -> ReadColumn {
         ReadColumn {

@@ -58,7 +58,8 @@ pub(crate) struct Core {
     /// Channel D's failing rounds. It outlives a session: a reconnect doesn't start a streak.
     pub rescan_failing: Streak,
     /// The failing rounds while tables are held for a rescan (D-M6a.11). Like `rescan_failing`
-    /// it outlives a session; it also sets the held tables' backoff.
+    /// it outlives a session; it also sets the held tables' backoff. It ends with a round that
+    /// succeeds, or when no table is held any more.
     pub held_failing: Streak,
     /// `toast_strategy: re_query`: the tables whose fetch is failing. Like `rescan_failing` it
     /// outlives a session, so the replay after a reconnect doesn't warn or back off again.
@@ -390,6 +391,7 @@ impl<'c> Session<'c> {
                 self.acc.halt_table(&h.table);
                 self.schemas.remove(&h.table);
                 self.snaps.stop(&h.table);
+                self.hold_ended();
                 self.core.update(|st| {
                     st.snapshots.remove(&h.table);
                     st.halted.insert(h.table, h.reason);
@@ -585,8 +587,10 @@ impl<'c> Session<'c> {
     /// failed round waits for the next; the first of a streak warns that dropped-table detection
     /// is paused.
     ///
-    /// A held table the rescan doesn't name has its cache up to date, and is released, unless
-    /// the stream brought it there with a change no flush has handed on yet: it waits for that.
+    /// A held table the rescan doesn't name has its cache up to date, and is released. When the
+    /// stream brought it there with a change no flush has handed on yet, the rescan flushes it
+    /// first, whatever the flush policy: a policy with no interval might never do it. A change
+    /// in the open transaction keeps the table held until a round after its commit.
     async fn rescan(&mut self) -> Result<Option<End>, WorkerError> {
         let known: Vec<TableSchema> = self.schemas.values().cloned().collect();
         let report = match self.core.source.rescan(&known).await {
@@ -596,6 +600,15 @@ impl<'c> Session<'c> {
                 return Ok(None);
             }
         };
+        let held = self.snaps.held();
+        if self
+            .pending_schemas
+            .iter()
+            .any(|(_, s)| held.contains(s.table()))
+        {
+            // The flush's checkpoint is the frontier, which covers every pending change.
+            self.flush()?;
+        }
         let kept: BTreeSet<&TableRef> = report
             .changed
             .iter()
@@ -605,12 +618,13 @@ impl<'c> Session<'c> {
             .chain(self.pending_schemas.iter().map(|(_, s)| s.table()))
             .chain(self.txn_schemas.iter().map(TableSchema::table))
             .collect();
-        // The released tables' cached schemas are durable, or in jobs handed to the writer, which
-        // `finish()` drains before the session ends: the next session opens with them cached and
-        // needn't hold the tables (M-2).
+        // The released tables' cached schemas are durable, or in jobs handed to the writer (the
+        // flush above), which `finish()` drains before the session ends: the next session opens
+        // with them cached and needn't hold the tables (M-2).
         for table in self.snaps.release_unless(&kept) {
             self.core.drifted.remove(&table);
         }
+        self.hold_ended();
         if report == RescanReport::default() {
             self.rescan_succeeded();
             return Ok(None);
@@ -657,6 +671,14 @@ impl<'c> Session<'c> {
         let failed = self.core.held_failing.failures();
         let delay = self.core.tuning.source_backoff.delay(failed - 1);
         self.snaps.held_retry = Some(Instant::now() + delay);
+    }
+
+    /// Once no table is held, the hold's failure streak is over: a later hold (a Phase 0 after a
+    /// lost position) starts its own, with its own warning and backoff.
+    fn hold_ended(&mut self) {
+        if self.snaps.held().is_empty() {
+            self.core.held_failing.succeeded();
+        }
     }
 
     fn rescan_succeeded(&mut self) {
@@ -741,6 +763,7 @@ impl<'c> Session<'c> {
         for table in self.snaps.release_unless(&unapplied.iter().collect()) {
             self.core.drifted.remove(&table);
         }
+        self.hold_ended();
         // Reported once the release is done, so it names only the tables still held.
         if let Some(e) = failed {
             self.rescan_failed(&e);
@@ -807,6 +830,7 @@ impl<'c> Session<'c> {
         self.acc.halt_table(&table);
         self.schemas.remove(&table);
         self.snaps.stop(&table);
+        self.hold_ended();
         self.halts.push(TableHalt {
             table: table.clone(),
             reason: reason.clone(),

@@ -470,7 +470,8 @@ impl FakeSource {
     }
 
     /// Open streams deliver nothing until [`Self::release_stream`], while commits and keep-alives
-    /// still move the log's end: `current_position` runs ahead of the streams.
+    /// still move the log's end: `current_position` runs ahead of the streams. An armed
+    /// `Method::Next` fault waits too, as a lagging stream raises nothing.
     pub fn hold_stream(&self) {
         self.db().hold_stream = true;
     }
