@@ -1,5 +1,5 @@
 ---
-updated: 2026-09-26
+updated: 2026-10-07
 domain: Architecture
 tags: [architecture, design, system, multi-sink, iceberg, delta-lake, v1-scope]
 sources: []
@@ -190,7 +190,7 @@ The open questions from the first draft of this document are all closed. Each ro
 | OQ-ST2 | Object-storage consistency | Conditional writes throughout: versioned state files and the lease use compare-and-swap; Delta commits are create-only PUTs (no DynamoDB) — proven on all three clouds | Clustering §5; `research/Multi_Sink_Architecture_and_Delta_Lake.md` §10.1 (P8) |
 | OQ-ST3 | State file layout | Small files per concern under the per-pipeline root (pipeline state, replication position, per-table snapshot state); cross-pipeline data under `globals.state` | `Data-Flow.md` §State Layout |
 | OQ-DT1 | Type mapping | Full DB → Arrow → sink mapping, per sink | `research/Type_Mapping.md` |
-| OQ-DT2 | DDL during replication | Detect at a transaction boundary → flush → evolve → resume; a non-replayable gap → re-snapshot | `Schema_Change_Detection_and_Evolution.md` §8 |
+| OQ-DT2 | DDL during replication | At the change's stream position: classify → flush → evolve → resume; a non-replayable gap → re-snapshot | `Schema_Change_Detection_and_Evolution.md` §8 |
 | OQ-DT3 | Supported evolution operations | Safe / Unsafe / Ignorable classification with a per-sink action; Unsafe halts the table | Schema_Change §7.2 |
 | OQ-IC1 | Iceberg COW vs MOR | MOR with equality deletes (COW for new tables only) — v2, with the Iceberg sink; the v1 Delta sink uses MERGE | `research/Ghost_Row_Dedup_and_Primary_Keys.md` §5 |
 | OQ-IC2 | Iceberg catalog | Glue, Hive Metastore and REST, chosen per pipeline (v2); HMS and REST-SigV4 are gated on the pinned crate (V-115/V-116) | `research/Catalog_Auth_Research.md`; Config §13 |

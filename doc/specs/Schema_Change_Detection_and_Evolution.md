@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-02
+updated: 2026-10-07
 domain: Architecture
 tags: [architecture, schema-evolution, ddl, cdc, postgresql, mysql, iceberg, delta-lake, multi-sink, arrow]
 status: design reviewed & approved — unified trigger→augment→diff model
@@ -288,8 +288,8 @@ rename-column or type-widening operation. Hence:
 ### 7.2 DDL classification table (the G-19 contract)
 
 Each normalized delta is **Safe** (auto-evolve, within the sink's capabilities), **Unsafe** (halt
-the table per the `enabled`/halt contract, G-19b), or **Ignorable** (no target action). Applied at a
-transaction boundary via §8.
+the table per the `enabled`/halt contract, G-19b), or **Ignorable** (no target action). Applied at
+the change's stream position via §8.
 
 | Source DDL | Class | Iceberg action | Delta action | Arrow / data handling |
 |---|---|---|---|---|
@@ -332,21 +332,26 @@ columns are NOT NULL.
 
 ## 8. Apply protocol (resolves OQ-DT2)
 
-### 8.1 Steady-state: detect-at-boundary → flush → evolve → rebuild → resume
+### 8.1 Steady-state: classify → flush → evolve → rebuild → resume
 
-Schema changes apply **only at a transaction boundary**, never mid-transaction — the same
-invariant used for flushing.
+A schema change applies at its exact stream position B. Rows of T committed before B flush under
+the old schema. A transaction still open at B continues under the new schema: pgoutput sends the
+Relation message ahead of the first row that uses the new shape, so B can fall inside a
+transaction. Flushing stays boundary-only (Data-Flow, flush decision): the flush in step 3 takes
+the complete transactions before B, never part of the open one. Classification comes first, so a
+change that needs nothing from the sink costs no flush.
 
 ```
-On a normalized delta D for table T at transaction boundary B:
+On a normalized delta D for table T at stream position B:
 
-1. SEAL    finalize T's current RecordBatch under the OLD schema.
-2. FLUSH   commit it to the sink under the pre-change target schema (Phase 4);
-           obtain flush_confirmation.
-3. CLASSIFY D → Safe | Unsafe | Ignorable (§7.2).
-              ├─ Ignorable → goto 6.
-              └─ Unsafe (or evolution disabled) → halt table T only,
-                 log error, emit metric; other tables keep running (G-19b).
+1. CLASSIFY D → Safe | Unsafe | Ignorable (§7.2). A D that changes nothing is Ignorable.
+              └─ Ignorable → goto 6; nothing flushes, nothing halts (evolution on or off).
+2. SEAL    finalize T's current RecordBatch under the OLD schema.
+3. FLUSH   commit T's rows committed before B to the sink under the pre-change target schema
+           (Phase 4); wait for flush_confirmation.
+              └─ Unsafe, or Safe while evolution is disabled → halt table T only, at that
+                 flush's checkpoint: T's rows before B are in the sink, none after. Log error,
+                 emit metric; other tables keep running (G-19b).
 4. EVOLVE  sink.evolve(D), idempotently (§8.3), scoped to D's columns only — never the
            whole "now" catalog schema (§0).
            ├─ Applied / Degraded (warn + metric) → continue.
@@ -485,7 +490,7 @@ Replace §9.5.1 `catalog.schema_evolution` with two fields *(now §9.7, pipeline
 | **G-19** (DDL safe/unsafe classification) | ✅ Resolve by adopting the §7.2 classification table as the contract. |
 | **G-19a** (MySQL DDL handling) | 🔽 Reduce scope — from full ALTER-delta parser to a DDL **classifier + table-name extractor** (+ optional `RENAME`/`CHANGE` keyword for rename intent); the full delta now comes from catalog augmentation (§3 channel C). Still required, materially de-risked. |
 | **G-19b** (evolution disabled / unsafe behavior) | ✅ Reaffirm — halt the changed table only, continue others (§8.1). |
-| **OQ-DT2** (DDL during live replication) | ✅ Resolve — apply protocol §8 (detect-at-boundary → flush → evolve → rebuild → resume; startup & non-replayable-gap §8.2). |
+| **OQ-DT2** (DDL during live replication) | ✅ Resolve — apply protocol §8 (classify → flush → evolve → rebuild → resume, at the change's stream position; startup & non-replayable-gap §8.2). |
 | **OQ-DT3** (supported evolution operations) | ✅ Resolve — Iceberg safe-set + classification (§7.1–§7.2). |
 | Source-SELECT precondition | 🆕 New item — ties to the config rule in 12.1; replication user must hold SELECT. |
 | **DT-R1** (PG detection framing) | ✅ Close — `method` removed; four-channel model (§3). |

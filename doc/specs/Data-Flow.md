@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-03
+updated: 2026-10-07
 domain: Architecture
 tags: [architecture, data-flow, pipeline, cdc, iceberg, delta-lake, multi-sink, arrow, snapshot, replication]
 sources: []
@@ -210,6 +210,13 @@ Replication connection (replication protocol, not SQL)
      DEFAULT or USING INDEX): the value is not copied from the old key's row. A table whose key can
      change and that has TOAST columns needs REPLICA IDENTITY FULL or `toast_strategy: re_query`.
 - **`re_query`** re-fetches the row over the control connection (V-077 warns on heavy snapshots).
+  A fetch that fails is tried three times in all, with backoff. If every attempt fails, the
+  columns stay masked and are written as under `carry_forward` (steps 3–4: the sink keeps the
+  value it holds; a row it doesn't hold, or a changed key, gets NULL). The status warns once per
+  failure streak, naming the table. While a table's streak lasts, each further commit tries the
+  fetch once, without backoff, so a fetch that keeps failing (e.g. the stream is behind a
+  `DROP COLUMN`) doesn't stall the pipeline; the first success ends the streak. A fetch that
+  finds the table gone halts the table; a permanent error ends the session.
 
 
 ---
