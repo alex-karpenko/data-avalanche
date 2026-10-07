@@ -269,6 +269,11 @@ impl MemorySink {
         self.held.send_replace(false);
     }
 
+    /// The commits waiting for [`Self::release_commits`] now.
+    pub fn waiting_commits(&self) -> usize {
+        self.held.receiver_count()
+    }
+
     /// A newer owner (`epoch`) has written `table`: this pipeline's next commit with an older
     /// epoch is `Fenced`.
     pub fn take_over(&self, table: &TableRef, epoch: u64) {

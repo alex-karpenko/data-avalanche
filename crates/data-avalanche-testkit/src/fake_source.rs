@@ -19,6 +19,8 @@
 //!   [`FakeSource::share_connection`] makes chunk reads and other calls wait on each other, as
 //!   they do on PostgreSQL's one catalog client. [`FakeSource::hold_stream`] holds the streams
 //!   while the log grows, so the source's position runs ahead of what they delivered.
+//!   [`FakeSource::flood_stream`] makes the streams always ready, like a replication channel
+//!   with a backlog.
 //!
 //! Keys are integer or text identifier columns. The fake trusts its tests: a change of a key a
 //! stalled transaction holds, or a key that isn't an integer or text, panics.
@@ -229,6 +231,8 @@ struct Db {
     faults: Vec<(Method, SourceError)>,
     hold_reads: bool,
     hold_stream: bool,
+    /// [`FakeSource::flood_stream`].
+    flood: bool,
     /// [`FakeSource::share_connection`]: on, the chunk reads holding their rows, and the calls
     /// waiting on the connection.
     shared: bool,
@@ -278,6 +282,7 @@ impl FakeSource {
             faults: vec![],
             hold_reads: false,
             hold_stream: false,
+            flood: false,
             shared: false,
             half_read: 0,
             waiting: 0,
@@ -478,6 +483,16 @@ impl FakeSource {
 
     pub fn release_stream(&self) {
         self.db().hold_stream = false;
+        self.wake.notify_waiters();
+    }
+
+    /// Open streams never wait from now on: with nothing else to deliver, `next` returns a
+    /// keep-alive at the log's end. Each `next` first spends a unit of the task's cooperative
+    /// budget, as a read of a tokio channel does, so the reading task yields only once the budget
+    /// is spent, and its stream is ready again whenever it is polled: a source with a backlog
+    /// (PostgreSQL's read-ahead channel, full).
+    pub fn flood_stream(&self) {
+        self.db().flood = true;
         self.wake.notify_waiters();
     }
 
@@ -1142,6 +1157,9 @@ impl FakeStream {
 impl ChangeStream for FakeStream {
     async fn next(&mut self) -> Result<StreamItem, SourceError> {
         let source = self.source.clone();
+        if source.db().flood {
+            tokio::task::coop::consume_budget().await;
+        }
         loop {
             let wake = source.wake.notified();
             {
@@ -1161,6 +1179,9 @@ impl ChangeStream for FakeStream {
                     }
                     if self.fill(&db) {
                         continue;
+                    }
+                    if db.flood {
+                        return Ok(StreamItem::KeepAlive(SourcePosition::Pg(db.wal_end)));
                     }
                 }
             }

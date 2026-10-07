@@ -31,5 +31,5 @@ pub use buffer::{CollapsedRow, RowKind, TableBuffer};
 pub use error::{AccumulatorError, WorkerError};
 pub use hooks::{CommitGuard, HookAction, HookPoint, Hooks, NoHooks, Unguarded};
 pub use policy::{FlushPolicy, FlushReason, TxnLimits};
-pub use status::{Command, Exit, Phase, SnapshotProgress, Tuning, WorkerStatus};
+pub use status::{Command, Exit, Phase, ReconcileLog, SnapshotProgress, Tuning, WorkerStatus};
 pub use worker::{PipelineWorker, WorkerDeps, WorkerHandle};

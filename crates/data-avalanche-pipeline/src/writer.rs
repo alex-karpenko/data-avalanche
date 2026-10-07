@@ -131,7 +131,14 @@ impl Writer {
     }
 
     async fn job(&mut self, job: Job) -> Result<(), WorkerError> {
-        let mut halts = job.halts;
+        // A table the sink refused keeps that halt, its reason and its `at`: a halt the session
+        // sends after it (one whose flush the sink refused, final review M1) would claim the
+        // sink holds the refused rows.
+        let mut halts: Vec<TableHalt> = job
+            .halts
+            .into_iter()
+            .filter(|h| !self.rejected.contains(&h.table))
+            .collect();
         for cs in job.change_sets {
             if self.rejected.contains(&cs.table) {
                 continue;

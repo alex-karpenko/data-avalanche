@@ -131,8 +131,13 @@ async fn a_column_dropped_under_a_chunk_query_retries_the_read() {
     converge(&a, &lake, &t).await;
     let st = run.handle.status.borrow().clone();
     assert!(st.halted.is_empty(), "{st:?}");
+    // The failed reads warn once, then the sink's soft drop (final review M2).
+    let failed = format!("table {t}: a snapshot chunk read failed (");
     let dropped = format!("table {t}: column \"extra\" soft-dropped: kept, written NULL");
-    assert_eq!(st.warnings, [dropped], "{st:?}");
+    assert!(
+        matches!(&st.warnings[..], [f, d] if f.starts_with(&failed) && f.contains("extra") && *d == dropped),
+        "{st:?}"
+    );
     run.drain().await.unwrap();
     cleanup(&a, &n).await;
 }

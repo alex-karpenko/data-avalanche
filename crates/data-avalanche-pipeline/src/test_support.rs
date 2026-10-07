@@ -409,6 +409,8 @@ impl World {
             requery_failing: BTreeMap::new(),
             gone_failing: Streak::default(),
             wal_lag_failing: Streak::default(),
+            writers_waited: BTreeSet::new(),
+            read_failing: BTreeMap::new(),
         };
         (core, control, status_rx)
     }

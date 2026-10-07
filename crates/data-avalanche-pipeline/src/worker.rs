@@ -107,6 +107,8 @@ impl PipelineWorker {
             requery_failing: BTreeMap::new(),
             gone_failing: Streak::default(),
             wal_lag_failing: Streak::default(),
+            writers_waited: BTreeSet::new(),
+            read_failing: BTreeMap::new(),
         };
         (Self { core }, WorkerHandle { control, status })
     }
@@ -441,10 +443,12 @@ pub(crate) async fn start(
         if let Some(w) = warning {
             warnings.push(format!("table {table}: {w}"));
         }
+        // A request is pushed once the table passed the checks below that can halt it: a table
+        // halted in this pass gets no `in_progress` document (final review M5).
+        let request = matches!(decision, Decision::Snapshot { resume: false, .. });
         match decision {
             Decision::Stop => continue,
             Decision::Stream if in_progress => abandoned.push(table.clone()),
-            Decision::Snapshot { resume: false, .. } => requests.push(table.clone()),
             _ => {}
         }
         // The sink table: created when absent, baselined to the schema now after a gap in the
@@ -520,6 +524,9 @@ pub(crate) async fn start(
         if !tracked_before || matches!(plan, Plan::Fresh(_)) {
             schemas.push(schema);
         }
+        if request {
+            requests.push(table.clone());
+        }
         tracked.insert(table.clone());
     }
 
@@ -544,6 +551,10 @@ pub(crate) async fn start(
                 completed_at: None,
             })
             .await?;
+        // A snapshot requested from scratch starts its `timeouts.snapshot` clock again at the
+        // next session's open: a re-snapshot after a lost position isn't timed from the run's
+        // first snapshot of the table (final review C1).
+        core.snapshot_started.remove(table);
     }
     for table in &abandoned {
         core.docs
@@ -1304,5 +1315,69 @@ mod tests {
             2,
             "the chunk, then the empty one: none under the old schema"
         );
+    }
+
+    /// A re-snapshot after a lost position is timed from its own start, not from the run's first
+    /// snapshot of the table (final review C1): the run is older than `timeouts.snapshot` when
+    /// the position is lost, and the table snapshots again without a `SNAPSHOT_TIMEOUT` halt.
+    #[tokio::test]
+    async fn a_snapshot_after_a_lost_position_is_timed_from_its_own_start() {
+        let w = World::new(&["a"]);
+        w.source.load(&t("a"), rows(1..=2));
+        let (mut worker, handle) = PipelineWorker::new(&mode("mode: initial"), deps(&w), fast());
+        let limit = std::time::Duration::from_millis(500);
+        worker.core.settings.snapshot_timeout = limit;
+        let status = handle.status.clone();
+        let driver = async {
+            streamed(&status, &w).await;
+            // The run outlives the limit.
+            tokio::time::sleep(limit + std::time::Duration::from_millis(100)).await;
+            let reads = w.source.reads(&t("a"));
+            // The snapshot can't end before the session's first tick.
+            w.source.hold_reads();
+            w.source.lose_slot();
+            w.source
+                .commit(FakeTxn::new().insert(&t("a"), row(7, "lost")));
+            wait_until("the table is snapshotted again", || {
+                w.source.reads(&t("a")) > reads
+            })
+            .await;
+            w.source.release_reads();
+            streamed(&status, &w).await;
+            let _ = handle.control.send(Command::Drain).await;
+        };
+        let (end, ()) = tokio::join!(worker.run(), driver);
+        assert_eq!(end.unwrap(), Exit::Drained);
+        let st = status.borrow().clone();
+        assert!(st.halted.is_empty(), "halted: {:?}", st.halted);
+        assert_eq!(w.ids("a"), [1, 2, 7]);
+        let doc = w.docs.table_snapshot(&t("a")).await.unwrap().unwrap().doc;
+        assert_eq!(doc.status, SnapshotStatus::Completed);
+    }
+
+    /// A table Phase 0 halts after deciding to snapshot it gets no `in_progress` document (final
+    /// review M5): the sink refuses to create it.
+    #[tokio::test]
+    async fn a_table_halted_in_phase_0_gets_no_snapshot_request() {
+        let w = World::new(&["a", "b"]);
+        w.sink.fail(
+            data_avalanche_testkit::SinkOp::EnsureTable,
+            Some(&t("a")),
+            1,
+            || SinkError::Permanent {
+                reason: "refused".into(),
+            },
+        );
+        let (mut core, _control, _status) = w.core(&mode("mode: initial"), &[]);
+        start(&mut core, None).await.unwrap();
+        let halts = w.docs.halts().await.unwrap().tables;
+        assert!(
+            matches!(&halts[..], [h] if h.table == t("a")
+                && matches!(h.reason, HaltReason::SinkRejected { .. })),
+            "{halts:?}"
+        );
+        assert_eq!(w.docs.table_snapshot(&t("a")).await.unwrap(), None);
+        let b = w.docs.table_snapshot(&t("b")).await.unwrap().unwrap().doc;
+        assert_eq!(b.status, SnapshotStatus::InProgress);
     }
 }

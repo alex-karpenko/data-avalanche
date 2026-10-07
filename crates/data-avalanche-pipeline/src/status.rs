@@ -47,6 +47,18 @@ pub struct SnapshotProgress {
     pub rows_done: u64,
 }
 
+/// The snapshot reconciler's log (DA-SNAP-9): the stream transactions kept to check chunks
+/// against, and the keys they wrote in the tables being snapshotted. It grows while a table's
+/// reads wait (an in-flight writer, a held table) and empties once no snapshot runs. Unbounded
+/// for now: M6b reports it as a gauge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReconcileLog {
+    /// Logged transactions.
+    pub entries: usize,
+    /// The keys they wrote, summed over the transactions.
+    pub keys: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct WorkerStatus {
     pub phase: Phase,
@@ -61,6 +73,8 @@ pub struct WorkerStatus {
     pub degraded: Option<String>,
     pub halted: BTreeMap<TableRef, HaltReason>,
     pub snapshots: BTreeMap<TableRef, SnapshotProgress>,
+    /// The snapshot reconciler's log, as of the last stream boundary or tick.
+    pub reconcile_log: ReconcileLog,
     /// Warnings since the start: drift, a `never` gap, a degraded evolve.
     pub warnings: Vec<String>,
 }

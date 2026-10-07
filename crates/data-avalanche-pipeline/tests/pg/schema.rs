@@ -142,8 +142,13 @@ async fn a_column_dropped_while_the_snapshot_runs_is_soft_dropped() {
     converge(&a, &lake, &t).await;
     let st = run.handle.status.borrow().clone();
     assert!(st.halted.is_empty(), "{st:?}");
+    // The failed reads warn once, then the sink's soft drop (final review M2).
+    let failed = format!("table {t}: a snapshot chunk read failed (");
     let dropped = format!("table {t}: column \"extra\" soft-dropped: kept, written NULL");
-    assert_eq!(st.warnings, [dropped], "{st:?}");
+    assert!(
+        matches!(&st.warnings[..], [f, d] if f.starts_with(&failed) && f.contains("extra") && *d == dropped),
+        "{st:?}"
+    );
     let b = lake.sink.content(&t).unwrap();
     let extra = b
         .column_by_name("extra")

@@ -534,6 +534,14 @@ impl TableBuffer {
         Ok(())
     }
 
+    /// Drops the open transaction's rows (a halt of the table): the committed layer stays.
+    pub fn discard_open(&mut self) {
+        self.open.clear();
+        self.open_bytes = 0;
+        self.open_events = 0;
+        self.open_truncate = false;
+    }
+
     /// The source committed the open transaction: its rows join the committed layer.
     pub fn commit_txn(&mut self) {
         if std::mem::take(&mut self.open_truncate) {

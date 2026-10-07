@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use data_avalanche_core::{ChunkVisibility, Row, TableRef};
 
+use crate::ReconcileLog;
 use crate::buffer::Key;
 
 /// What one stream transaction wrote in the tables being snapshotted.
@@ -36,6 +37,10 @@ impl Touched {
 
     fn is_empty(&self) -> bool {
         self.keys.is_empty() && self.truncated.is_empty()
+    }
+
+    fn key_count(&self) -> usize {
+        self.keys.values().map(HashSet::len).sum()
     }
 }
 
@@ -62,6 +67,8 @@ pub(crate) struct Reconciler {
     clock: u64,
     next_id: u64,
     log: Vec<Entry>,
+    /// The keys the log's entries hold, summed.
+    keys: usize,
     /// The chunks being read: id → when issued.
     outstanding: BTreeMap<u64, u64>,
 }
@@ -76,6 +83,7 @@ impl Reconciler {
     pub fn applied(&mut self, xid: u64, touched: Touched) {
         let at = self.tick();
         if !touched.is_empty() {
+            self.keys += touched.key_count();
             self.log.push(Entry {
                 at,
                 xid,
@@ -141,9 +149,16 @@ impl Reconciler {
                 .collect()
         };
         let horizon = self.outstanding.values().min().copied().unwrap_or(u64::MAX);
-        self.log.retain(|e| match visibility {
-            Some(_) => e.seen.is_none_or(|seen| seen >= horizon),
-            None => e.at >= horizon,
+        let keys = &mut self.keys;
+        self.log.retain(|e| {
+            let keep = match visibility {
+                Some(_) => e.seen.is_none_or(|seen| seen >= horizon),
+                None => e.at >= horizon,
+            };
+            if !keep {
+                *keys -= e.touched.key_count();
+            }
+            keep
         });
         kept
     }
@@ -151,7 +166,16 @@ impl Reconciler {
     /// No snapshot runs any more: nothing needs the log.
     pub fn clear(&mut self) {
         self.log.clear();
+        self.keys = 0;
         self.outstanding.clear();
+    }
+
+    /// The log's size: its transactions and their keys.
+    pub fn size(&self) -> ReconcileLog {
+        ReconcileLog {
+            entries: self.log.len(),
+            keys: self.keys,
+        }
     }
 
     #[cfg(test)]
@@ -282,6 +306,34 @@ mod tests {
         let e = r.issue();
         r.reconcile(e, &t("a"), Some(&snap(701, &[])), chunk(&[]));
         assert!(r.logged().is_empty());
+    }
+
+    /// The log's size counts its transactions and their keys, and follows the pruning.
+    #[test]
+    fn the_logs_size_follows_its_entries() {
+        let mut r = Reconciler::default();
+        let c = r.issue();
+        r.applied(700, wrote("a", &[1, 2]));
+        r.applied(701, wrote("a", &[2, 3]));
+        r.applied(702, Touched::default());
+        assert_eq!(
+            r.size(),
+            ReconcileLog {
+                entries: 2,
+                keys: 4
+            }
+        );
+        r.reconcile(c, &t("a"), Some(&snap(701, &[])), chunk(&[]));
+        assert_eq!(
+            r.size(),
+            ReconcileLog {
+                entries: 1,
+                keys: 2
+            },
+            "700 proven visible"
+        );
+        r.clear();
+        assert_eq!(r.size(), ReconcileLog::default());
     }
 
     #[test]

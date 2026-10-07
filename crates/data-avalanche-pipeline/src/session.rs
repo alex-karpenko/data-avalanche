@@ -49,7 +49,8 @@ pub(crate) struct Core {
     pub tracked: BTreeSet<TableRef>,
     /// Every table of the pipeline is a `dump_*` table: the worker ends once none is left.
     pub dump_only: bool,
-    /// When each table's snapshot began in this run (`timeouts.snapshot`).
+    /// When each table's snapshot began in this run (`timeouts.snapshot`): at the first session
+    /// that runs it after Phase 0 requested it from scratch.
     pub snapshot_started: BTreeMap<TableRef, Instant>,
     /// Tables whose catalog schema moved past the cached one while the pipeline was down (Phase
     /// 0 on a resume). A snapshot of one reads only once a rescan has brought its schema up to
@@ -69,6 +70,14 @@ pub(crate) struct Core {
     pub gone_failing: Streak,
     /// The WAL-lag guard's permanently failing reads. Like `rescan_failing` it outlives a session.
     pub wal_lag_failing: Streak,
+    /// The snapshot tables whose reads wait for writers in flight at a session's start
+    /// (Q-M6a-2), warned once per wait. A wait ends once the table may be read; like
+    /// `rescan_failing` it outlives a session, so a reconnect that finds the table still waiting
+    /// warns nothing more.
+    pub writers_waited: BTreeSet<TableRef>,
+    /// The tables whose chunk reads are failing, a streak each. Like `requery_failing` it outlives
+    /// a session.
+    pub read_failing: BTreeMap<TableRef, Streak>,
 }
 
 impl Core {
@@ -229,7 +238,9 @@ impl<'c> Session<'c> {
                 st.halted.insert(h.table.clone(), h.reason.clone());
             }
             st.warnings.extend(warnings);
-            st.snapshots.extend(snaps.progress());
+            // Replaced, not extended: a snapshot an earlier session finished, or ended with a
+            // completion this session's state shows durable, is over.
+            st.snapshots = snaps.progress().collect();
         });
         Ok(Ok(Self {
             core,
@@ -283,10 +294,21 @@ impl<'c> Session<'c> {
             match ev {
                 WriterEvent::Failed(e) => return Err(e),
                 WriterEvent::Halted(h) => self.core.update(|st| {
+                    st.snapshots.remove(&h.table);
                     st.halted.insert(h.table, h.reason);
                 }),
                 WriterEvent::Degraded(why) => self.core.update(|st| st.degraded = why),
-                WriterEvent::Durable(cp) => self.core.update(|st| st.checkpoint = Some(cp)),
+                WriterEvent::Durable(cp) => {
+                    // A completion durable now ends its snapshot, as in the loop.
+                    self.durable += 1;
+                    let done = self.snaps.durable(self.durable);
+                    self.core.update(|st| {
+                        for (table, _) in done {
+                            st.snapshots.remove(&table);
+                        }
+                        st.checkpoint = Some(cp);
+                    });
+                }
             }
         }
         let _ = self.stream.close().await;
@@ -323,6 +345,11 @@ impl<'c> Session<'c> {
             let reading = self.queued.is_empty();
             let need = self.queued.front().map_or(0, |(_, n)| *n);
             let permits = self.permits.clone();
+            // Biased: control, the writer's events and the buffer's room first; then the chunk
+            // reads, the tick, the heartbeat and the rescans, each rarely ready; the stream last.
+            // A stream with a backlog is ready at every poll, and above them it would starve
+            // them: finished chunks unemitted, the snapshot timeout running on, no in-flight
+            // recheck, the WAL-lag guard blind (final review I1).
             tokio::select! {
                 biased;
                 // Not once draining: a closed channel is ready at every poll, and would starve
@@ -336,14 +363,6 @@ impl<'c> Session<'c> {
                 p = permits.acquire_many_owned(need), if !reading => {
                     self.send_front(p.expect("the semaphore isn't closed"));
                 }
-                item = self.stream.next(), if reading => match item {
-                    Ok(item) => {
-                        if let Some(end) = self.item(item).await? {
-                            return Ok(end);
-                        }
-                    }
-                    Err(e) => return Ok(End::Source(e)),
-                },
                 read = self.snaps.reads.join_next(), if !self.snaps.reads.is_empty() => {
                     // Nothing aborts a read while the loop runs: one that ended without its
                     // chunk panicked, a bug, which ends the worker like the writer's.
@@ -368,6 +387,14 @@ impl<'c> Session<'c> {
                         return Ok(end);
                     }
                 }
+                item = self.stream.next(), if reading => match item {
+                    Ok(item) => {
+                        if let Some(end) = self.item(item).await? {
+                            return Ok(end);
+                        }
+                    }
+                    Err(e) => return Ok(End::Source(e)),
+                },
             }
         }
     }
@@ -447,14 +474,14 @@ impl<'c> Session<'c> {
                 self.snaps.truncated(&tables);
                 match self.acc.truncate(&tables, now) {
                     Err(AccumulatorError::FlushRequired { .. }) => self.flush()?,
-                    Err(AccumulatorError::Halt { table, reason }) => self.halt(table, reason),
+                    Err(AccumulatorError::Halt { table, reason }) => self.halt(table, reason)?,
                     r => break self.absorb(r)?,
                 }
             },
             StreamItem::SchemaSignal { table, hint, .. } => {
                 return self.schema_signal(table, hint).await;
             }
-            StreamItem::TableHalt { table, reason, .. } => self.halt(table, reason),
+            StreamItem::TableHalt { table, reason, .. } => self.halt(table, reason)?,
             StreamItem::Commit(b) => {
                 if let Some(end) = self.re_query(&b).await? {
                     return Ok(Some(end));
@@ -477,6 +504,7 @@ impl<'c> Session<'c> {
     /// Between transactions: what waited for the stream to get here, then the flush policy.
     async fn boundary(&mut self, now: Instant) -> Result<Option<End>, WorkerError> {
         self.read();
+        self.report_log();
         if let Some(end) = self.caught_up().await? {
             return Ok(Some(end));
         }
@@ -568,7 +596,7 @@ impl<'c> Session<'c> {
                         self.apply(&e, Instant::now())?;
                     }
                 }
-                Err(SourceError::TableHalt { table, reason }) => self.halt(table, reason),
+                Err(SourceError::TableHalt { table, reason }) => self.halt(table, reason)?,
                 Err(e @ SourceError::Permanent(_)) => return Ok(Some(End::Source(e))),
                 Err(e) => {
                     let streak = self.core.requery_failing.entry(table.clone()).or_default();
@@ -627,6 +655,7 @@ impl<'c> Session<'c> {
         self.hold_ended();
         if report == RescanReport::default() {
             self.rescan_succeeded();
+            self.held_round_ended();
             return Ok(None);
         }
         let after = match self.core.source.current_position().await {
@@ -681,6 +710,19 @@ impl<'c> Session<'c> {
         }
     }
 
+    /// A round ended without a failure. A table it leaves held has waited through it; the second
+    /// such round of one hold warns, once (final review I3): the table reads nothing, and only a
+    /// failing round warned so far. The hold's count ends with its release.
+    fn held_round_ended(&mut self) {
+        for (table, rounds) in self.snaps.held_round() {
+            self.core.update(|st| {
+                st.warnings.push(format!(
+                    "table {table}: its snapshot is still held after {rounds} catalog rescans: its schema changed while the pipeline was down, and its cached schema hasn't caught up with the catalog (the catalog keeps changing, or the stream has yet to commit a change of it); it reads nothing until a rescan finds the cache up to date"
+                ));
+            });
+        }
+    }
+
     fn rescan_succeeded(&mut self) {
         self.core.rescan_failing.succeeded();
         self.core.held_failing.succeeded();
@@ -713,12 +755,12 @@ impl<'c> Session<'c> {
         self.flush()?;
         for table in report.dropped {
             if self.schemas.contains_key(&table) {
-                self.halt(table, HaltReason::TableDropped);
+                self.halt(table, HaltReason::TableDropped)?;
             }
         }
         for (table, reason) in report.halted {
             if self.schemas.contains_key(&table) {
-                self.halt(table, reason);
+                self.halt(table, reason)?;
             }
         }
         let mut unapplied = BTreeSet::new();
@@ -765,8 +807,9 @@ impl<'c> Session<'c> {
         }
         self.hold_ended();
         // Reported once the release is done, so it names only the tables still held.
-        if let Some(e) = failed {
-            self.rescan_failed(&e);
+        match failed {
+            Some(e) => self.rescan_failed(&e),
+            None => self.held_round_ended(),
         }
         Ok(None)
     }
@@ -811,25 +854,38 @@ impl<'c> Session<'c> {
         self.core.update(|st| st.read = Some(frontier));
     }
 
+    /// The reconciler log's size into the status, when it changed (I3).
+    pub(super) fn report_log(&self) {
+        let size = self.snaps.log_size();
+        self.core.status.send_if_modified(|st| {
+            let changed = st.reconcile_log != size;
+            st.reconcile_log = size;
+            changed
+        });
+    }
+
     /// A table halt is the table's alone; anything else ends the worker.
     fn absorb(&mut self, r: Result<(), AccumulatorError>) -> Result<(), WorkerError> {
         match r {
             Ok(()) => Ok(()),
-            Err(AccumulatorError::Halt { table, reason }) => {
-                self.halt(table, reason);
-                Ok(())
-            }
+            Err(AccumulatorError::Halt { table, reason }) => self.halt(table, reason),
             Err(e) => Err(e.into()),
         }
     }
 
-    /// Stops the table: its buffered changes go, its later ones are dropped, its snapshot stops,
-    /// and the halt is recorded before the next checkpoint. The sink holds its changes through the
-    /// checkpoint.
-    fn halt(&mut self, table: TableRef, reason: HaltReason) {
+    /// Stops the table. Its committed changes are flushed first (the owner's ruling on the final
+    /// review's M1), so the halt holds from that flush's checkpoint and rides the next job: the
+    /// writer runs jobs in order, so nothing waits. Then the open transaction's changes of it go,
+    /// its later ones are dropped, its snapshot stops, and the halt is recorded before the next
+    /// checkpoint. The sink holds its changes through the checkpoint.
+    fn halt(&mut self, table: TableRef, reason: HaltReason) -> Result<(), WorkerError> {
+        if self.acc.has_committed(&table) {
+            self.flush()?;
+        }
         self.acc.halt_table(&table);
         self.schemas.remove(&table);
         self.snaps.stop(&table);
+        self.core.writers_waited.remove(&table);
         self.hold_ended();
         self.halts.push(TableHalt {
             table: table.clone(),
@@ -840,6 +896,7 @@ impl<'c> Session<'c> {
             st.snapshots.remove(&table);
             st.halted.insert(table, reason);
         });
+        Ok(())
     }
 
     fn due(&mut self, now: Instant) -> Result<(), WorkerError> {
@@ -976,7 +1033,7 @@ impl<'c> Session<'c> {
         let Planned { now, safe } = match planned {
             Ok(planned) => planned,
             Err(reason) => {
-                self.halt(table, reason);
+                self.halt(table, reason)?;
                 return Ok(None);
             }
         };
@@ -985,7 +1042,7 @@ impl<'c> Session<'c> {
                 Ok(None) => {}
                 Ok(Some(warning)) => self.core.update(|st| st.warnings.push(warning)),
                 Err(reason) => {
-                    self.halt(table, reason);
+                    self.halt(table, reason)?;
                     return Ok(None);
                 }
             }
@@ -995,7 +1052,7 @@ impl<'c> Session<'c> {
             match self.acc.set_schema(now.clone(), &extra) {
                 Err(AccumulatorError::FlushRequired { .. }) => self.flush()?,
                 Err(AccumulatorError::Halt { table, reason }) => {
-                    self.halt(table, reason);
+                    self.halt(table, reason)?;
                     return Ok(None);
                 }
                 r => break r?,
@@ -1130,8 +1187,12 @@ mod tests {
         }
         w.source.commit(txn);
         let driver = async {
-            // A slice is in the writer and the next waits for room: the transaction is open.
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            // A slice waits in the sink and the next for room in the buffer: the transaction is
+            // open.
+            wait_until("a slice waits in the sink", || {
+                w.sink.waiting_commits() == 1
+            })
+            .await;
             control.send(Command::Drain).await.unwrap();
             drop(control);
             w.sink.release_commits();
@@ -2247,6 +2308,199 @@ mod tests {
             st.halted.get(&t("w")),
             Some(HaltReason::EvolutionUnsupported { .. })
         ));
+    }
+
+    /// A row that halts its table (final review M1): the table's committed rows flush first, so
+    /// the sink has them, and the halt holds from that flush's checkpoint.
+    #[tokio::test]
+    async fn a_data_halt_flushes_the_tables_committed_rows_first() {
+        let w = World::new(&["a", "b"]);
+        w.started(&["a", "b"]).await;
+        let p = pipeline("", "flush: { seconds: 3600 }", "");
+        let mut before = None;
+        let (end, st) = session(&w, &p, &["a", "b"], async |status| {
+            w.source.commit(
+                FakeTxn::new()
+                    .insert(&t("a"), row(1, "x"))
+                    .insert(&t("a"), row(2, "x"))
+                    .insert(&t("b"), row(1, "y")),
+            );
+            before = Some(w.source.wal_end());
+            let mut bad = row(3, "x");
+            bad.0.push(("zzz".into(), ColumnValue::Int64(1)));
+            w.source.commit(
+                FakeTxn::new()
+                    .insert(&t("b"), row(2, "y"))
+                    .insert(&t("a"), bad),
+            );
+            let end = w.source.wal_end();
+            wait_until("it is read", || status.borrow().read.as_ref() == Some(&end)).await;
+        })
+        .await;
+        end.unwrap();
+        let before = before.expect("driven");
+        assert!(
+            matches!(
+                st.halted.get(&t("a")),
+                Some(HaltReason::SchemaMismatch { .. })
+            ),
+            "{:?}",
+            st.halted
+        );
+        assert_eq!(
+            w.ids("a"),
+            [1, 2],
+            "the rows committed before the halt are in"
+        );
+        assert_eq!(w.ids("b"), [1, 2]);
+        let halts = w.docs.halts().await.unwrap().tables;
+        assert!(
+            matches!(&halts[..], [h] if h.table == t("a") && h.at == before),
+            "the halt holds from the flush's checkpoint: {halts:?}"
+        );
+    }
+
+    /// The sink refuses the flush a data halt hands on first: the table keeps the sink's halt,
+    /// with its reason and the `at` before the refused rows, not the data halt's.
+    #[tokio::test]
+    async fn a_sink_refusal_of_a_halts_flush_keeps_the_sinks_halt() {
+        let w = World::new(&["a", "b"]);
+        w.started(&["a", "b"]).await;
+        let start = w.source.wal_end();
+        w.sink
+            .fail(SinkOp::Commit, Some(&t("a")), 1, || SinkError::Permanent {
+                reason: "refused".into(),
+            });
+        let p = pipeline("", "flush: { seconds: 3600 }", "");
+        let (end, st) = session(&w, &p, &["a", "b"], async |status| {
+            w.source.commit(
+                FakeTxn::new()
+                    .insert(&t("a"), row(1, "x"))
+                    .insert(&t("b"), row(1, "y")),
+            );
+            let mut bad = row(2, "x");
+            bad.0.push(("zzz".into(), ColumnValue::Int64(1)));
+            w.source.commit(FakeTxn::new().insert(&t("a"), bad));
+            let end = w.source.wal_end();
+            wait_until("it is read", || status.borrow().read.as_ref() == Some(&end)).await;
+        })
+        .await;
+        end.unwrap();
+        let rejected = |r: &HaltReason| matches!(r, HaltReason::SinkRejected { .. });
+        assert!(st.halted.get(&t("a")).is_some_and(rejected), "{st:?}");
+        let halts = w.docs.halts().await.unwrap().tables;
+        assert!(
+            matches!(&halts[..], [h] if h.table == t("a") && rejected(&h.reason) && h.at == start),
+            "{halts:?}"
+        );
+        assert_eq!((w.ids("a"), w.ids("b")), (vec![], vec![1]));
+    }
+
+    /// A table the stream halts (a value it can't decode; final review M1): its committed rows
+    /// flush first, and the halt holds from that flush's checkpoint.
+    #[tokio::test]
+    async fn a_stream_halt_flushes_the_tables_committed_rows_first() {
+        let w = World::new(&["a", "b"]);
+        w.started(&["a", "b"]).await;
+        let p = pipeline("", "flush: { seconds: 3600 }", "");
+        let (mut core, _control, status) = w.core(&p, &["a", "b"]);
+        let mut s = Session::open(&mut core).await.unwrap().unwrap();
+        w.source.commit(
+            FakeTxn::new()
+                .insert(&t("a"), row(1, "x"))
+                .insert(&t("a"), row(2, "x"))
+                .insert(&t("b"), row(1, "y")),
+        );
+        let before = w.source.wal_end();
+        pump(&mut s, &before).await;
+        let after = SourcePosition::Pg(Lsn(lsn_of(&before).0 + 0x10));
+        let reason = HaltReason::SchemaMismatch {
+            column: "doc".into(),
+            detail: "a value the decoder can't read".into(),
+        };
+        let items = [
+            StreamItem::Begin {
+                xid: 900,
+                commit_ts_micros: 1,
+            },
+            StreamItem::TableHalt {
+                table: t("a"),
+                seq: SourceSeq::Pg(lsn_of(&before)),
+                reason: reason.clone(),
+            },
+            StreamItem::Commit(TransactionBoundary {
+                xid: 900,
+                commit_pos: after.clone(),
+                commit_ts_micros: 1,
+            }),
+        ];
+        for item in items {
+            assert!(s.item(item).await.unwrap().is_none());
+        }
+        s.flush().unwrap();
+        assert!(s.until_durable().await.unwrap().is_none());
+        assert_eq!(
+            w.ids("a"),
+            [1, 2],
+            "the rows committed before the halt are in"
+        );
+        assert_eq!(w.ids("b"), [1]);
+        let halts = w.docs.halts().await.unwrap().tables;
+        assert!(
+            matches!(&halts[..], [h] if h.table == t("a") && h.at == before && h.reason == reason),
+            "the halt holds from the flush's checkpoint: {halts:?}"
+        );
+        assert_eq!(status.borrow().halted.get(&t("a")), Some(&reason));
+    }
+
+    /// A held table that stays held across rescan rounds warns once (final review I3), at its
+    /// second round: each round's finding is stale by its catch-up, as the catalog keeps
+    /// changing. A third round warns nothing more, and the round that applies the change
+    /// releases it.
+    #[tokio::test]
+    async fn a_table_held_across_rounds_warns_once() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.request(&["a"]).await;
+        let (mut core, _control, _status) = w.core(&flush_each(), &["a"]);
+        core.drifted.insert(t("a"));
+        let mut s = Session::open(&mut core).await.unwrap().unwrap();
+        let held = |s: &Session<'_>| -> Vec<String> {
+            s.core
+                .status
+                .borrow()
+                .warnings
+                .iter()
+                .filter(|m| m.contains("is still held"))
+                .cloned()
+                .collect()
+        };
+        w.source.alter(&t("a"), with_note("a"));
+        let rounds = [
+            (1, extra_only("a")),
+            (2, with_note("a")),
+            (3, extra_only("a")),
+        ];
+        for (round, next) in rounds {
+            w.source
+                .after_next_rescan(move |src| src.alter(&t("a"), next));
+            assert!(s.rescan().await.unwrap().is_none());
+            assert!(s.rescan.is_none(), "round {round}: the catch-up ran");
+            assert!(
+                s.snaps.held().contains(&t("a")),
+                "round {round}: the finding was stale"
+            );
+            assert_eq!(held(&s).len(), usize::from(round >= 2), "round {round}");
+        }
+        let warned = held(&s);
+        assert!(
+            matches!(&warned[..], [m] if m.contains("public.a") && m.contains("after 2 catalog rescans")),
+            "{warned:?}"
+        );
+        assert!(s.rescan().await.unwrap().is_none());
+        assert!(s.snaps.held().is_empty(), "released");
+        current(&mut s, &w).await;
+        assert_eq!(held(&s), warned, "one warning for the hold");
     }
 
     #[tokio::test]

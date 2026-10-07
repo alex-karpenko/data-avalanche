@@ -30,7 +30,7 @@ use super::{End, Session, protocol};
 use crate::buffer::identity;
 use crate::cursor;
 use crate::reconcile::{Reconciler, Ticket, Touched};
-use crate::{HookAction, HookPoint, SnapshotProgress, TxnLimits, WorkerError};
+use crate::{HookAction, HookPoint, ReconcileLog, SnapshotProgress, TxnLimits, WorkerError};
 
 /// One table's snapshot in this session.
 #[derive(Debug)]
@@ -84,6 +84,8 @@ pub(super) struct Snapshots {
     held: BTreeSet<TableRef>,
     /// After a failed rescan round while tables are held: the next round not before this.
     pub(super) held_retry: Option<Instant>,
+    /// The rounds each held table has waited through so far (I3's warning).
+    held_rounds: BTreeMap<TableRef, u32>,
 }
 
 impl std::fmt::Debug for Snapshots {
@@ -116,7 +118,8 @@ impl Snapshots {
                     retired.insert(table.clone());
                 }
                 SnapshotStatus::InProgress => {
-                    let cursor = match &v.doc.cursor {
+                    let mut doc = v.doc;
+                    let cursor = match &doc.cursor {
                         None => None,
                         Some(c) => match cursor::from_doc(schema, c) {
                             Ok(c) => Some(c),
@@ -124,6 +127,8 @@ impl Snapshots {
                                 warnings.push(format!(
                                     "table {table}: the snapshot starts over, its cursor doesn't fit: {why}"
                                 ));
+                                // Its rows done go with it: the count starts over too.
+                                doc.cursor = None;
                                 None
                             }
                         },
@@ -132,7 +137,7 @@ impl Snapshots {
                         table.clone(),
                         Snap {
                             dump,
-                            doc: v.doc,
+                            doc,
                             cursor,
                             reading: false,
                             done: false,
@@ -229,15 +234,39 @@ impl Snapshots {
 
     /// Releases every held table not in `keep`; returns them.
     pub(super) fn release_unless(&mut self, keep: &BTreeSet<&TableRef>) -> Vec<TableRef> {
-        let (kept, released) = std::mem::take(&mut self.held)
-            .into_iter()
-            .partition(|t| keep.contains(t));
+        let (kept, released): (BTreeSet<TableRef>, BTreeSet<TableRef>) =
+            std::mem::take(&mut self.held)
+                .into_iter()
+                .partition(|t| keep.contains(t));
         self.held = kept;
+        for t in &released {
+            self.held_rounds.remove(t);
+        }
         released.into_iter().collect()
+    }
+
+    /// A rescan round ended without a failure: each held table waited through one more. Returns
+    /// the tables that reach their second round now, with the count.
+    pub(super) fn held_round(&mut self) -> Vec<(TableRef, u32)> {
+        let mut second = vec![];
+        for t in &self.held {
+            let rounds = self.held_rounds.entry(t.clone()).or_default();
+            *rounds += 1;
+            if *rounds == 2 {
+                second.push((t.clone(), *rounds));
+            }
+        }
+        second
+    }
+
+    /// The reconciler log's size.
+    pub(super) fn log_size(&self) -> ReconcileLog {
+        self.reconciler.size()
     }
 
     /// The table halted: its snapshot stops.
     pub(super) fn stop(&mut self, table: &TableRef) {
+        self.held_rounds.remove(table);
         self.held.remove(table);
         self.tables.remove(table);
         self.docs.remove(table);
@@ -303,14 +332,14 @@ fn first_seq(at: &SourcePosition) -> SourceSeq {
 
 impl Session<'_> {
     /// Starts the chunk reads that may start: one per table, `parallelism` at a time, none while
-    /// the buffer is full, none for a table an in-flight transaction writes.
+    /// the buffer is full, none for a table an in-flight transaction writes. A table's wait for
+    /// such writers warns once, naming them (final review I3); it ends once the table may be read.
     pub(super) fn issue_reads(&mut self) {
         if !self.queued.is_empty() {
             return;
         }
         let now = Instant::now();
         let mut reading = self.snaps.tables.values().filter(|s| s.reading).count();
-        let blocked: BTreeSet<u64> = self.snaps.in_flight.values().flatten().copied().collect();
         let mut wait_for_writers = false;
         for (table, snap) in &mut self.snaps.tables {
             if reading >= self.core.settings.parallelism {
@@ -326,10 +355,26 @@ impl Session<'_> {
             let Some(schema) = self.schemas.get(table).cloned() else {
                 continue;
             };
-            if schema.source_id().is_some_and(|id| blocked.contains(&id)) {
+            let writers: Vec<String> = schema.source_id().map_or_else(Vec::new, |id| {
+                self.snaps
+                    .in_flight
+                    .iter()
+                    .filter(|(_, tables)| tables.contains(&id))
+                    .map(|(xid, _)| xid.to_string())
+                    .collect()
+            });
+            if !writers.is_empty() {
                 wait_for_writers = true;
+                if self.core.writers_waited.insert(table.clone()) {
+                    let warning = format!(
+                        "table {table}: its snapshot waits for transactions that were in flight when the stream session started and write it (xids {}): it reads nothing until they end; a long-running or idle-in-transaction session holds one (pg_stat_activity, backend_xid), or a prepared transaction (pg_prepared_xacts)",
+                        writers.join(", ")
+                    );
+                    self.core.update(|st| st.warnings.push(warning));
+                }
                 continue;
             }
+            self.core.writers_waited.remove(table);
             let ticket = self.snaps.reconciler.issue();
             let source = Arc::clone(&self.core.source);
             let after = snap.cursor.clone();
@@ -405,7 +450,7 @@ impl Session<'_> {
             }
             Err(SourceError::TableHalt { reason, .. }) => {
                 self.snaps.reconciler.cancel(ticket);
-                self.halt(table, reason);
+                self.halt(table, reason)?;
                 return Ok(None);
             }
             Err(e) if e.is_transient() => {
@@ -414,6 +459,13 @@ impl Session<'_> {
                 let delay = self.core.tuning.source_backoff.delay(failed);
                 snap.retry = Some((Instant::now() + delay, failed + 1));
                 self.snaps.rescan = true;
+                // The first failure of the table's streak warns; a read that succeeds ends it.
+                let streak = self.core.read_failing.entry(table.clone()).or_default();
+                streak.failed(&self.core.status, || {
+                    format!(
+                        "table {table}: a snapshot chunk read failed ({e}): it is tried again with backoff, and the snapshot reads nothing more until a read succeeds"
+                    )
+                });
                 return Ok(None);
             }
             Err(e) => {
@@ -422,6 +474,7 @@ impl Session<'_> {
             }
         };
         snap.retry = None;
+        self.core.read_failing.remove(&table);
         let mut keyed = Vec::with_capacity(chunk.rows.len());
         for row in chunk.rows.iter().cloned() {
             let Some(key) = identity(&schema, &row) else {
@@ -557,9 +610,10 @@ impl Session<'_> {
                 HaltReason::SnapshotTimeout {
                     limit_secs: limit.as_secs(),
                 },
-            );
+            )?;
             self.snaps.docs.insert(table, doc);
         }
+        self.report_log();
         if let Some((at, n)) = self.snaps.recheck
             && at <= now
         {
@@ -600,7 +654,7 @@ mod tests {
     use super::*;
     use crate::session::Core;
     use crate::test_support::{World, Yaml, row, t, wait_until};
-    use crate::{Backoff, Command, Exit, Hooks, WorkerStatus};
+    use crate::{Backoff, Command, Exit, Hooks, ReconcileLog, WorkerStatus};
 
     fn chunks_of(n: u64) -> Pipeline {
         let tables = format!("\n      snapshots: {{ chunk_size: {n} }}");
@@ -641,6 +695,15 @@ mod tests {
             !st.snapshots.contains_key(&t(table)) && st.checkpoint.is_some()
         })
         .await;
+    }
+
+    /// The status warnings that a table's snapshot waits for in-flight writers.
+    fn writer_waits(st: &WorkerStatus) -> Vec<String> {
+        st.warnings
+            .iter()
+            .filter(|m| m.contains("in flight when the stream session started"))
+            .cloned()
+            .collect()
     }
 
     async fn doc(w: &World, table: &str) -> TableSnapshotDoc {
@@ -767,7 +830,10 @@ mod tests {
         w.request(&["a"]).await;
         let (core, control, status) = w.core(&chunks_of(10), &["a"]);
         run(core, control, status, async |status| {
-            tokio::time::sleep(Duration::from_millis(30)).await;
+            wait_until("the table waits for the writer", || {
+                !writer_waits(&status.borrow()).is_empty()
+            })
+            .await;
             assert_eq!(w.source.reads(&t("a")), 0, "the writer is still in flight");
             w.source.release(xid);
             snapshot_done(&w, &status, "a").await;
@@ -788,7 +854,10 @@ mod tests {
         let xid = w.source.open_writer(&[t("a")]);
         let (core, control, status) = w.core(&chunks_of(10), &["a"]);
         run(core, control, status, async |status| {
-            tokio::time::sleep(Duration::from_millis(30)).await;
+            wait_until("the table waits for the writer", || {
+                !writer_waits(&status.borrow()).is_empty()
+            })
+            .await;
             assert_eq!(w.source.reads(&t("a")), 0);
             w.source
                 .commit_writer(xid, FakeTxn::new().update(&t("a"), row(2, "new")));
@@ -1336,7 +1405,8 @@ mod tests {
 
     /// A held table's rescan keeps failing: a failed round is tried again after a backoff, not at
     /// every tick, and the streak warns once that the table's snapshot waits. The round that
-    /// succeeds releases it.
+    /// succeeds releases it. The session's ticks are driven by hand, and the backoff is checked
+    /// at its instant, not by sleeping through part of it (final review M11).
     #[tokio::test]
     async fn a_held_tables_failing_rescan_backs_off_and_warns_once() {
         let w = World::new(&["a"]);
@@ -1362,26 +1432,37 @@ mod tests {
                 .cloned()
                 .collect()
         };
-        let (_, st) = run(core, control, status, async |status| {
-            wait_until("the first round failed", || {
-                !waits(&status.borrow()).is_empty()
-            })
-            .await;
-            // Twenty ticks, within the backoff (200–400 ms).
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            assert_eq!(
-                w.source.rescans(),
-                1,
-                "the next round waits for the backoff"
-            );
-            snapshot_done(&w, &status, "a").await;
-        })
-        .await;
+        let mut s = Session::open(&mut core).await.unwrap().unwrap();
+        let failed = Instant::now();
+        assert!(s.snapshot_tick().await.unwrap().is_none());
+        assert_eq!(w.source.rescans(), 1, "the first round fails");
+        let retry = s.snaps.held_retry.expect("the next round backs off");
+        assert!(
+            retry >= failed + Duration::from_millis(200),
+            "the backoff's floor is 200 ms: {:?}",
+            retry.duration_since(failed)
+        );
+        assert!(s.snapshot_tick().await.unwrap().is_none());
         assert_eq!(
             w.source.rescans(),
-            3,
-            "two failed rounds, then the one that released `a`"
+            1,
+            "a tick before the backoff's instant doesn't rescan"
         );
+        for rounds in [2, 3] {
+            // The backoff's instant has come.
+            s.snaps.held_retry = Some(Instant::now());
+            assert!(s.snapshot_tick().await.unwrap().is_none());
+            assert_eq!(w.source.rescans(), rounds);
+        }
+        assert!(s.snaps.held().is_empty(), "the third round released `a`");
+        let driver = async {
+            snapshot_done(&w, &status, "a").await;
+            control.send(Command::Drain).await.unwrap();
+        };
+        let (end, ()) = tokio::join!(s.run(), driver);
+        assert!(matches!(end.unwrap(), End::Exit(Exit::Drained)));
+        assert_eq!(w.source.rescans(), 3, "nothing held, no round");
+        let st = status.borrow().clone();
         let warned = waits(&st);
         assert!(
             matches!(&warned[..], [m] if m.contains("public.a") && m.contains("catalog busy")),
@@ -1489,5 +1570,281 @@ mod tests {
         );
         assert_eq!(doc(&w, "a").await.status, SnapshotStatus::InProgress);
         assert!(w.ids("a").is_empty());
+    }
+
+    /// A stream with a backlog is ready whenever the session polls it (final review I1): a chunk
+    /// read that has finished is emitted all the same, and the tick runs: it reads the in-flight
+    /// writers again, and `b`, freed by a rollback the stream never carries, is read.
+    #[tokio::test]
+    async fn a_stream_with_a_backlog_starves_neither_the_reads_nor_the_tick() {
+        let w = World::new(&["a", "b"]);
+        w.started(&["a", "b"]).await;
+        w.source.load(&t("a"), rows(1..=2));
+        w.source.load(&t("b"), rows(1..=2));
+        w.request(&["a", "b"]).await;
+        let xid = w.source.open_writer(&[t("b")]);
+        w.source.flood_stream();
+        let (core, control, status) = w.core(&chunks_of(10), &["a", "b"]);
+        let (end, _) = run(core, control, status, async |status| {
+            snapshot_done(&w, &status, "a").await;
+            w.source.abort_writer(xid);
+            snapshot_done(&w, &status, "b").await;
+        })
+        .await;
+        assert!(matches!(end, End::Exit(Exit::Drained)));
+        assert_eq!((w.ids("a"), w.ids("b")), (vec![1, 2], vec![1, 2]));
+    }
+
+    /// Arms a transient failure of the stream's next item when the `n`th chunk is emitted.
+    #[derive(Debug)]
+    struct EndStreamAt {
+        source: FakeSource,
+        n: usize,
+        seen: AtomicUsize,
+    }
+
+    impl Hooks for EndStreamAt {
+        fn at(&self, point: &HookPoint) -> HookAction {
+            if matches!(point, HookPoint::ChunkEmitted { .. })
+                && self.seen.fetch_add(1, Ordering::SeqCst) + 1 == self.n
+            {
+                self.source
+                    .fail(Method::Next, SourceError::Transient("reset".into()));
+            }
+            HookAction::Continue
+        }
+    }
+
+    /// The stream fails right after the completion is handed to the writer, so the completion is
+    /// durable only while the session ends: `finish()` ends the snapshot in the status, as the
+    /// loop does (final review I2). And a session's status shows only its own snapshots, whatever
+    /// an earlier session left there.
+    #[tokio::test]
+    async fn a_completion_durable_as_the_session_ends_leaves_the_status() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.source.load(&t("a"), rows(1..=3));
+        w.request(&["a"]).await;
+        let (mut core, _control, status) = w.core(&chunks_of(10), &["a"]);
+        core.hooks = Arc::new(EndStreamAt {
+            source: w.source.clone(),
+            n: 2,
+            seen: AtomicUsize::new(0),
+        });
+        let s = Session::open(&mut core).await.unwrap().unwrap();
+        let end = tokio::time::timeout(Duration::from_secs(5), s.run())
+            .await
+            .expect("the stream fails")
+            .unwrap();
+        assert!(
+            matches!(end, End::Source(SourceError::Transient(_))),
+            "{end:?}"
+        );
+        assert_eq!(doc(&w, "a").await.status, SnapshotStatus::Completed);
+        assert!(
+            status.borrow().snapshots.is_empty(),
+            "{:?}",
+            status.borrow().snapshots
+        );
+        core.update(|st| {
+            st.snapshots
+                .insert(t("gone"), SnapshotProgress { rows_done: 7 });
+        });
+        let _next = Session::open(&mut core).await.unwrap().unwrap();
+        assert!(
+            status.borrow().snapshots.is_empty(),
+            "{:?}",
+            status.borrow().snapshots
+        );
+    }
+
+    /// A table's wait for the writers in flight at the session start warns once, naming them and
+    /// where to look (final review I3), however often its reads are checked meanwhile. The
+    /// warning ends with the wait: a later wait warns again.
+    #[tokio::test]
+    async fn a_wait_for_in_flight_writers_warns_once_per_wait() {
+        let w = World::new(&["a", "b"]);
+        w.started(&["a", "b"]).await;
+        w.source.load(&t("a"), rows(1..=2));
+        let (mut core, control, status) = w.core(&chunks_of(10), &["a", "b"]);
+        for wait in 1..=2 {
+            w.request(&["a"]).await;
+            let xid = w.source.open_writer(&[t("a")]);
+            let reads = w.source.reads(&t("a"));
+            let s = Session::open(&mut core).await.unwrap().unwrap();
+            let driver = async {
+                wait_until("the table waits", || {
+                    writer_waits(&status.borrow()).len() == wait
+                })
+                .await;
+                // Each boundary checks the reads again.
+                for id in 1..=3 {
+                    w.source
+                        .commit(FakeTxn::new().insert(&t("b"), row(id, "b")));
+                }
+                let end = w.source.wal_end();
+                wait_until("the commits are durable", || {
+                    status.borrow().checkpoint.as_ref() == Some(&end)
+                })
+                .await;
+                let waits = writer_waits(&status.borrow());
+                assert_eq!(waits.len(), wait, "wait {wait}: {waits:?}");
+                let m = &waits[wait - 1];
+                assert!(
+                    m.contains("public.a")
+                        && m.contains(&format!("xids {xid})"))
+                        && m.contains("pg_stat_activity")
+                        && m.contains("pg_prepared_xacts"),
+                    "{m}"
+                );
+                assert_eq!(w.source.reads(&t("a")), reads, "wait {wait}: not read");
+                w.source.abort_writer(xid);
+                snapshot_done(&w, &status, "a").await;
+                control.send(Command::Drain).await.unwrap();
+            };
+            let (end, ()) = tokio::join!(s.run(), driver);
+            assert!(matches!(end.unwrap(), End::Exit(Exit::Drained)));
+        }
+        assert_eq!(w.ids("a"), [1, 2]);
+    }
+
+    /// The reconciler's log size is reported (final review I3): it grows with the stream's
+    /// changes of a table whose chunk is out, and empties once no snapshot runs.
+    #[tokio::test]
+    async fn the_reconciler_logs_size_is_reported() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.source.load(&t("a"), rows(1..=3));
+        w.request(&["a"]).await;
+        w.source.hold_reads();
+        let (core, control, status) = w.core(&chunks_of(10), &["a"]);
+        run(core, control, status, async |status| {
+            wait_until("the chunk is being read", || w.source.reads(&t("a")) == 1).await;
+            w.source.commit(
+                FakeTxn::new()
+                    .update(&t("a"), row(1, "s"))
+                    .update(&t("a"), row(2, "s")),
+            );
+            w.source.commit(FakeTxn::new().update(&t("a"), row(2, "t")));
+            let logged = ReconcileLog {
+                entries: 2,
+                keys: 3,
+            };
+            wait_until("the log is reported", || {
+                status.borrow().reconcile_log == logged
+            })
+            .await;
+            w.source.release_reads();
+            snapshot_done(&w, &status, "a").await;
+            wait_until("the empty log is reported", || {
+                status.borrow().reconcile_log == ReconcileLog::default()
+            })
+            .await;
+        })
+        .await;
+        assert_eq!(
+            w.text("a", "doc"),
+            [Some("s"), Some("t"), Some("x")].map(|d| d.map(String::from))
+        );
+    }
+
+    /// Hands the next chunk read a failure once a chunk is emitted.
+    #[derive(Debug)]
+    struct FailNextRead(FakeSource, AtomicBool);
+
+    impl Hooks for FailNextRead {
+        fn at(&self, point: &HookPoint) -> HookAction {
+            if matches!(point, HookPoint::ChunkEmitted { .. })
+                && self.1.swap(false, Ordering::SeqCst)
+            {
+                self.0.fail(
+                    Method::ReadChunk,
+                    SourceError::Transient("reset again".into()),
+                );
+            }
+            HookAction::Continue
+        }
+    }
+
+    /// Failing chunk reads warn once per streak, with the error (final review M2): two failures
+    /// in a row warn once; a read that succeeds ends the streak, so the next failure warns again.
+    #[tokio::test]
+    async fn a_failing_chunk_read_warns_once_per_streak() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.source.load(&t("a"), rows(1..=4));
+        w.request(&["a"]).await;
+        for _ in 0..2 {
+            w.source.fail(
+                Method::ReadChunk,
+                SourceError::Transient("connection reset".into()),
+            );
+        }
+        let (mut core, control, status) = w.core(&chunks_of(2), &["a"]);
+        core.hooks = Arc::new(FailNextRead(w.source.clone(), AtomicBool::new(true)));
+        let (_, st) = run(core, control, status, async |status| {
+            snapshot_done(&w, &status, "a").await;
+        })
+        .await;
+        let failed: Vec<&String> = st
+            .warnings
+            .iter()
+            .filter(|m| m.contains("a snapshot chunk read failed"))
+            .collect();
+        assert!(
+            matches!(&failed[..], [one, two] if one.contains("public.a")
+                && one.contains("connection reset") && two.contains("reset again")),
+            "{:?}",
+            st.warnings
+        );
+        assert_eq!(w.ids("a"), [1, 2, 3, 4]);
+        assert!(st.halted.is_empty(), "{st:?}");
+    }
+
+    /// A saved cursor that no longer fits the table's identifier: the snapshot starts over, and
+    /// so does its row count (final review M4).
+    #[tokio::test]
+    async fn a_cursor_that_no_longer_fits_starts_the_count_over() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.source.load(&t("a"), rows(1..=3));
+        w.docs
+            .save_table_snapshot(&TableSnapshotDoc {
+                table: t("a"),
+                status: SnapshotStatus::InProgress,
+                start_position: None,
+                cursor: Some(SnapshotCursor {
+                    key: vec![CursorKey {
+                        col: "old_id".into(),
+                        val: 2.into(),
+                        ty: "bigint".into(),
+                    }],
+                    chunk_size: 2,
+                    rows_done: 2,
+                    collation: None,
+                }),
+                row_count: None,
+                completed_at: None,
+            })
+            .await
+            .unwrap();
+        let (core, control, status) = w.core(&chunks_of(2), &["a"]);
+        let (_, st) = run(core, control, status, async |status| {
+            snapshot_done(&w, &status, "a").await;
+        })
+        .await;
+        assert!(
+            st.warnings
+                .iter()
+                .any(|m| m.contains("its cursor doesn't fit")),
+            "{:?}",
+            st.warnings
+        );
+        let d = doc(&w, "a").await;
+        assert_eq!(
+            (d.status, d.row_count),
+            (SnapshotStatus::Completed, Some(3))
+        );
+        assert_eq!(w.ids("a"), [1, 2, 3]);
     }
 }
