@@ -61,6 +61,11 @@ pub(crate) struct Core {
     /// `toast_strategy: re_query`: the tables whose fetch is failing. Like `rescan_failing` it
     /// outlives a session, so the replay after a reconnect doesn't warn or back off again.
     pub requery_failing: BTreeMap<TableRef, Streak>,
+    /// Phase 0's failing rescans of the tables gone from the source's list (a start after a lost
+    /// position continues the streak).
+    pub gone_failing: Streak,
+    /// The WAL-lag guard's permanently failing reads. Like `rescan_failing` it outlives a session.
+    pub wal_lag_failing: Streak,
 }
 
 impl Core {
@@ -345,11 +350,7 @@ impl<'c> Session<'c> {
                         return Ok(end);
                     }
                 }
-                _ = heartbeat.tick() => {
-                    if let Some(end) = self.wal_lag().await? {
-                        return Ok(end);
-                    }
-                }
+                _ = heartbeat.tick() => self.wal_lag().await?,
                 _ = async { rescan.as_mut().expect("guarded").tick().await },
                     if rescan.is_some() && self.rescan.is_none() =>
                 {
@@ -705,17 +706,26 @@ impl<'c> Session<'c> {
 
     /// The WAL-retention guard (G-22): the retained log is always reported; past
     /// `max_wal_lag_bytes` the pipeline stops to protect the source's disk. A failed read waits
-    /// for the next heartbeat.
-    async fn wal_lag(&mut self) -> Result<Option<End>, WorkerError> {
+    /// for the next heartbeat, and the pipeline keeps running. The first permanent failure of a
+    /// streak warns that the guard is blind; a read that succeeds ends the streak.
+    async fn wal_lag(&mut self) -> Result<(), WorkerError> {
         let retained = match self.core.source.retained_bytes().await {
             Ok(retained) => retained,
-            Err(e) if e.is_transient() => return Ok(None),
-            Err(e) => return Ok(Some(End::Source(e))),
+            Err(e) if e.is_transient() => return Ok(()),
+            Err(e) => {
+                self.core.wal_lag_failing.failed(&self.core.status, || {
+                    format!(
+                        "the WAL-lag guard is blind: the source's retained log can't be read ({e}); max_wal_lag_bytes isn't enforced until a read succeeds"
+                    )
+                });
+                return Ok(());
+            }
         };
+        self.core.wal_lag_failing.succeeded();
         self.core.update(|st| st.retained_bytes = retained);
         match (retained, self.core.settings.max_wal_lag_bytes) {
             (Some(lag), Some(limit)) if lag > limit => Err(WorkerError::WalLag { lag, limit }),
-            _ => Ok(None),
+            _ => Ok(()),
         }
     }
 
@@ -1473,6 +1483,62 @@ mod tests {
                 limit: 67_108_864
             })
         ));
+    }
+
+    /// A failed read of the retained log waits for the next heartbeat. A transient one warns
+    /// nothing; permanent ones on consecutive heartbeats warn once that the WAL-lag guard is
+    /// blind, and the session keeps streaming. A read that succeeds ends the streak.
+    #[tokio::test]
+    async fn a_failing_wal_lag_read_warns_once_per_streak_and_keeps_streaming() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let p = pipeline("", "flush: { seconds: 0 }", "max_wal_lag_bytes: 64MiB");
+        let (mut core, control, status) = w.core(&p, &["a"]);
+        core.settings.heartbeat = Duration::from_millis(5);
+        let s = Session::open(&mut core).await.unwrap().unwrap();
+        let blind = || -> Vec<String> {
+            status
+                .borrow()
+                .warnings
+                .iter()
+                .filter(|m| m.contains("the WAL-lag guard is blind"))
+                .cloned()
+                .collect()
+        };
+        let driver = async {
+            w.source.fail(
+                Method::RetainedBytes,
+                SourceError::Transient("reset".into()),
+            );
+            for _ in 0..2 {
+                w.source.fail(
+                    Method::RetainedBytes,
+                    SourceError::Permanent("permission denied".into()),
+                );
+            }
+            w.source.set_retained(Some(1024));
+            wait_until("a read succeeds", || {
+                status.borrow().retained_bytes == Some(1024)
+            })
+            .await;
+            let first = blind();
+            assert_eq!(first.len(), 1, "{:?}", status.borrow().warnings);
+            assert!(first[0].contains("permission denied"), "{first:?}");
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+            durable(&status, w.source.wal_end()).await;
+            w.source.fail(
+                Method::RetainedBytes,
+                SourceError::Permanent("permission denied again".into()),
+            );
+            wait_until("a new streak warns", || blind().len() == 2).await;
+            assert!(blind()[1].contains("permission denied again"));
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(2, "x")));
+            durable(&status, w.source.wal_end()).await;
+            control.send(Command::Drain).await.unwrap();
+        };
+        let (end, ()) = tokio::join!(s.run(), driver);
+        assert!(matches!(end.unwrap(), End::Exit(Exit::Drained)));
+        assert_eq!(w.ids("a"), [1, 2]);
     }
 
     fn with_note(name: &str) -> TableSchema {

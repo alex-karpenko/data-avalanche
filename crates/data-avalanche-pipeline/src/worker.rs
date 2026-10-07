@@ -24,7 +24,8 @@ use crate::session::{Core, End, Session};
 use crate::settings::Settings;
 use crate::status::Streak;
 use crate::{
-    Command, CommitGuard, Exit, Hooks, NoHooks, Phase, Tuning, Unguarded, WorkerError, WorkerStatus,
+    Command, CommitGuard, Exit, HookAction, HookPoint, Hooks, NoHooks, Phase, Tuning, Unguarded,
+    WorkerError, WorkerStatus,
 };
 
 /// What a worker runs against.
@@ -103,6 +104,8 @@ impl PipelineWorker {
             drifted: BTreeSet::new(),
             rescan_failing: Streak::default(),
             requery_failing: BTreeMap::new(),
+            gone_failing: Streak::default(),
+            wal_lag_failing: Streak::default(),
         };
         (Self { core }, WorkerHandle { control, status })
     }
@@ -232,8 +235,8 @@ where
 
 /// Data-Flow Phase 0, or its rerun after the stream position was lost mid-run (`lost` holds the
 /// new position `reset_position` returned). Leaves the core tracking the tables to stream, with
-/// every decision persisted: halts and snapshot requests first, then the checkpoint, then the
-/// cached schemas.
+/// every decision persisted: halts and snapshot requests first, then the cached schemas, then a
+/// fresh start's checkpoint.
 pub(crate) async fn start(
     core: &mut Core,
     lost: Option<SourcePosition>,
@@ -324,15 +327,27 @@ pub(crate) async fn start(
         .filter(|c| !resolved_tables.contains_key(c.table()) && !recorded.contains(c.table()))
         .cloned()
         .collect();
-    if !gone.is_empty()
-        && let Ok(report) = source.rescan(&gone).await
-    {
-        halts.extend(
-            report
-                .dropped
-                .into_iter()
-                .map(|t| (t, HaltReason::TableDropped)),
-        );
+    // A failed rescan halts nothing: the next start checks the tables again. The first failure of
+    // a streak warns.
+    if !gone.is_empty() {
+        match source.rescan(&gone).await {
+            Ok(report) => {
+                core.gone_failing.succeeded();
+                halts.extend(
+                    report
+                        .dropped
+                        .into_iter()
+                        .map(|t| (t, HaltReason::TableDropped)),
+                );
+            }
+            Err(e) => core.gone_failing.failed(&core.status, || {
+                let tables: Vec<String> = gone.iter().map(|g| g.table().to_string()).collect();
+                format!(
+                    "the source no longer lists {}, and the rescan that checks whether they were dropped failed ({e}): none is halted; the next start checks again",
+                    tables.join(", ")
+                )
+            }),
+        }
     }
     for (table, now) in &resolved_tables {
         if let Some(c) = cached.get(table)
@@ -532,21 +547,32 @@ pub(crate) async fn start(
             })
             .await?;
     }
-    if !matches!(plan, Plan::Resume) {
-        let SourcePosition::Pg(lsn) = at else {
-            return Err(WorkerError::Refused(format!(
-                "the source started at {at}, not a PostgreSQL position"
-            )));
-        };
-        core.docs
-            .save_slot(&SlotDoc {
+    let fresh = match plan {
+        Plan::Resume => None,
+        Plan::Fresh(_) => {
+            let SourcePosition::Pg(lsn) = at else {
+                return Err(WorkerError::Refused(format!(
+                    "the source started at {at}, not a PostgreSQL position"
+                )));
+            };
+            Some(SlotDoc {
                 slot_name: slot,
                 confirmed_flush_lsn: lsn,
             })
-            .await?;
-    }
+        }
+    };
+    // The schemas before a fresh start's checkpoint: a restart in between still finds the
+    // checkpoint before it and starts fresh again. The other way round, it would resume from the
+    // new checkpoint under the cache of before the baseline, as if the stream still held the
+    // change.
     for schema in &schemas {
         core.docs.save_table_schema(schema).await?;
+    }
+    if let Some(doc) = fresh {
+        if core.hooks.at(&HookPoint::SchemasCached) == HookAction::Crash {
+            return Err(WorkerError::Crashed(HookPoint::SchemasCached));
+        }
+        core.docs.save_slot(&doc).await?;
     }
     core.tracked = tracked;
     core.drifted = drifted;
@@ -558,12 +584,12 @@ pub(crate) async fn start(
 #[cfg(test)]
 mod tests {
     use data_avalanche_core::position::Lsn;
-    use data_avalanche_core::{ColumnSchema, ColumnValueType as V, Row};
+    use data_avalanche_core::{ColumnSchema, ColumnValue, ColumnValueType as V, Row};
     use data_avalanche_testkit::{FakeTxn, Method};
 
     use super::*;
     use crate::HookPoint;
-    use crate::test_support::{World, Yaml, fast, row, t, wait_until};
+    use crate::test_support::{CrashAt, World, Yaml, fast, row, t, wait_until};
 
     fn rows(ids: std::ops::RangeInclusive<i64>) -> Vec<Row> {
         ids.map(|id| row(id, "x")).collect()
@@ -1088,6 +1114,117 @@ mod tests {
         end.unwrap();
         assert!(*seen.lock().unwrap());
         assert_eq!(w.ids("a"), [1]);
+    }
+
+    fn noted() -> TableSchema {
+        TableSchema::new(
+            t("a"),
+            vec![
+                ColumnSchema::new("id", V::Int64, "bigint").not_null(),
+                ColumnSchema::new("doc", V::Text, "text"),
+                ColumnSchema::new("note", V::Text, "text"),
+            ],
+            vec!["id".into()],
+        )
+        .unwrap()
+    }
+
+    /// A fresh start caches the baselined schemas before it persists its new checkpoint: a crash
+    /// in between leaves the checkpoint before it, so the next start is fresh again rather than a
+    /// resume under a stale cache, and the sink converges.
+    #[tokio::test]
+    async fn a_crash_between_a_fresh_starts_schemas_and_checkpoint_starts_fresh_again() {
+        let w = World::new(&["a"]);
+        w.source.load(&t("a"), rows(1..=2));
+        let p = mode("mode: initial");
+        run(&w, &p, async |status| streamed(&status, &w).await)
+            .await
+            .0
+            .unwrap();
+        let before = w.source.wal_end();
+        w.source.alter(&t("a"), noted());
+        let mut r = row(3, "x");
+        r.0.push(("note".into(), ColumnValue::Text("n".into())));
+        w.source.commit(FakeTxn::new().insert(&t("a"), r));
+        w.source.lose_slot();
+        let mut crashing = deps(&w);
+        crashing.hooks = Arc::new(CrashAt(|p| matches!(p, HookPoint::SchemasCached)));
+        let end = run_with(&p, crashing, async |_| {}).await;
+        assert!(
+            matches!(end, Err(WorkerError::Crashed(HookPoint::SchemasCached))),
+            "{end:?}"
+        );
+        let (end, st) = run(&w, &p, async |status| streamed(&status, &w).await).await;
+        assert_eq!(end.unwrap(), Exit::Drained);
+        assert_eq!(
+            w.source.prepares().last(),
+            Some(&Some(before)),
+            "the checkpoint before the crash: the start is fresh again"
+        );
+        assert!(
+            !st.warnings
+                .iter()
+                .any(|m| m.contains("changed while the pipeline was down")),
+            "{:?}",
+            st.warnings
+        );
+        let cached = w.docs.table_schema(&t("a")).await.unwrap().unwrap().doc;
+        assert_eq!(cached, w.source.schema(&t("a")));
+        assert_eq!(w.ids("a"), [1, 2, 3]);
+        assert_eq!(w.text("a", "note"), [None, None, Some("n".to_owned())]);
+    }
+
+    /// Phase 0's rescan of the tables gone from the source's list warns once per failure streak:
+    /// two failing starts warn once and halt nothing; a start whose rescan succeeds halts the
+    /// dropped table and ends the streak, so the next failure warns again.
+    #[tokio::test]
+    async fn a_failing_rescan_of_gone_tables_warns_once_per_streak() {
+        let w = World::new(&["a", "b", "c"]);
+        w.started(&["a", "b", "c"]).await;
+        w.source.drop_table(&t("b"));
+        let (mut core, _control, status) = w.core(&mode("mode: never"), &[]);
+        let gone = || -> Vec<String> {
+            status
+                .borrow()
+                .warnings
+                .iter()
+                .filter(|m| m.contains("the source no longer lists"))
+                .cloned()
+                .collect()
+        };
+        for _ in 0..2 {
+            w.source.fail(
+                Method::Rescan,
+                SourceError::Transient("catalog busy".into()),
+            );
+            start(&mut core, None).await.unwrap();
+        }
+        let first = gone();
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert!(
+            first[0].contains("public.b") && first[0].contains("catalog busy"),
+            "{first:?}"
+        );
+        assert!(w.docs.halts().await.unwrap().tables.is_empty());
+        start(&mut core, None).await.unwrap();
+        assert_eq!(gone(), first, "a rescan that succeeds warns nothing");
+        let halts = w.docs.halts().await.unwrap().tables;
+        assert!(
+            matches!(&halts[..], [h] if h.table == t("b") && h.reason == HaltReason::TableDropped),
+            "{halts:?}"
+        );
+        w.source.drop_table(&t("c"));
+        w.source.fail(
+            Method::Rescan,
+            SourceError::Transient("catalog busy again".into()),
+        );
+        start(&mut core, None).await.unwrap();
+        let second = gone();
+        assert_eq!(second.len(), 2, "a new streak: {second:?}");
+        assert!(
+            second[1].contains("public.c") && second[1].contains("catalog busy again"),
+            "{second:?}"
+        );
     }
 
     /// A table that gained a column while the worker was down, snapshotted again under

@@ -99,7 +99,7 @@ pub(crate) async fn run(
 
 struct Writer {
     ctx: WriterCtx,
-    /// Tables the sink refused: their later change sets are dropped.
+    /// Tables the sink refused: their later change sets and snapshot documents are dropped.
     rejected: BTreeSet<TableRef>,
     events: UnboundedSender<WriterEvent>,
     degraded: bool,
@@ -159,7 +159,12 @@ impl Writer {
         self.hook(HookPoint::CheckpointPersisted {
             position: job.checkpoint.clone(),
         })?;
+        // A refused table's progress isn't in the sink: its document stays as it was. The table
+        // is in `rejected` already when this job's change set was the one refused.
         for doc in &job.snapshots {
+            if self.rejected.contains(&doc.table) {
+                continue;
+            }
             self.state(Write::Snapshot(doc)).await?;
         }
         for schema in &job.schemas {
@@ -274,7 +279,7 @@ mod tests {
 
     use data_avalanche_core::position::Lsn;
     use data_avalanche_core::{SinkTableState, TableSpec};
-    use data_avalanche_state::{SLOT_KEY, SnapshotStatus};
+    use data_avalanche_state::{SLOT_KEY, SnapshotCursor, SnapshotStatus};
     use data_avalanche_testkit::{MemorySink, SinkOp};
     use tokio::sync::mpsc;
 
@@ -539,6 +544,57 @@ mod tests {
         );
         assert_eq!((rows(&r, "a"), rows(&r, "b")), (0, 2));
         assert_eq!(r.docs.halts().await.unwrap().tables, vec![halt]);
+    }
+
+    fn progress_doc(t: &str, rows_done: u64) -> TableSnapshotDoc {
+        TableSnapshotDoc {
+            status: SnapshotStatus::InProgress,
+            row_count: None,
+            cursor: Some(SnapshotCursor {
+                key: vec![],
+                chunk_size: 1,
+                rows_done,
+                collation: None,
+            }),
+            ..snapshot_doc(t)
+        }
+    }
+
+    /// A dump table's chunk the sink refuses: the table's snapshot documents in that job and the
+    /// later ones are dropped, so it keeps its last one from before the refusal (never
+    /// `Completed`), while the other table's documents advance. Each job is still durable once.
+    #[tokio::test]
+    async fn a_refused_tables_snapshot_docs_are_dropped_with_its_change_sets() {
+        let r = rig(&["a", "b"]).await;
+        let (a, b) = (TableRef::new("public", "a"), TableRef::new("public", "b"));
+        let mut acc = accumulator(&["a", "b"], 100);
+        txn(&mut acc, 1, 200, &[("a", 1, "x"), ("b", 1, "y")]);
+        let mut first = job(acc.flush());
+        first.snapshots = vec![progress_doc("a", 1), progress_doc("b", 1)];
+        r.run(vec![first], Arc::new(NoHooks)).await;
+        r.sink
+            .fail(SinkOp::Commit, Some(&a), 1, || SinkError::Permanent {
+                reason: "refused".into(),
+            });
+        txn(&mut acc, 2, 300, &[("a", 2, "x"), ("b", 2, "y")]);
+        let mut refused = job(acc.flush());
+        refused.snapshots = vec![progress_doc("a", 2), progress_doc("b", 2)];
+        txn(&mut acc, 3, 400, &[("b", 3, "y")]);
+        let mut last = job(acc.flush());
+        last.snapshots = vec![snapshot_doc("a"), snapshot_doc("b")];
+        let events = r.run(vec![refused, last], Arc::new(NoHooks)).await;
+        assert!(
+            matches!(
+                &events[..],
+                [WriterEvent::Halted(h), WriterEvent::Durable(_), WriterEvent::Durable(p)]
+                    if h.table == a && *p == lsn(400)
+            ),
+            "{events:?}"
+        );
+        let doc_a = r.docs.table_snapshot(&a).await.unwrap().unwrap().doc;
+        assert_eq!(doc_a, progress_doc("a", 1), "the last before the refusal");
+        let doc_b = r.docs.table_snapshot(&b).await.unwrap().unwrap().doc;
+        assert_eq!(doc_b, snapshot_doc("b"));
     }
 
     #[tokio::test]

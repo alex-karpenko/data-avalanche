@@ -31,6 +31,8 @@ pub enum HookPoint {
     CheckpointPersisted { position: SourcePosition },
     /// A snapshot chunk of the table is in the accumulator; its cursor isn't persisted yet.
     ChunkEmitted { table: TableRef },
+    /// A fresh start (Phase 0) cached the tables' schemas; its new checkpoint isn't persisted yet.
+    SchemasCached,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
