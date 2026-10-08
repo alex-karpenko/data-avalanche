@@ -124,6 +124,16 @@ fn protocol(detail: String) -> WorkerError {
     AccumulatorError::Protocol { detail }.into()
 }
 
+/// The session's writer task, aborted when the session is dropped: a worker cut off mid-flush
+/// (its task aborted, say past `drain_timeout`) leaves no writer committing on its own.
+struct WriterTask(JoinHandle<()>);
+
+impl Drop for WriterTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub(crate) struct Session<'c> {
     core: &'c mut Core,
     acc: Accumulator,
@@ -132,7 +142,7 @@ pub(crate) struct Session<'c> {
     stream: Box<dyn ChangeStream>,
     jobs: UnboundedSender<Job>,
     events: UnboundedReceiver<WriterEvent>,
-    writer: JoinHandle<()>,
+    writer: WriterTask,
     /// `buffer_capacity_rows`: rows handed to the writer and not yet durable.
     permits: Arc<Semaphore>,
     /// Flushes waiting for room in the buffer, in order. The stream isn't read meanwhile.
@@ -266,7 +276,7 @@ impl<'c> Session<'c> {
             stream,
             jobs,
             events,
-            writer,
+            writer: WriterTask(writer),
             permits: Arc::new(Semaphore::new(rows)),
             queued: VecDeque::new(),
             submitted: checkpoint,
@@ -296,7 +306,7 @@ impl<'c> Session<'c> {
                 Ok(end)
             }
             Err(e) => {
-                self.writer.abort();
+                self.writer.0.abort();
                 Err(e)
             }
         }

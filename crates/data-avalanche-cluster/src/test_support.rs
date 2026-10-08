@@ -58,6 +58,8 @@ struct Script {
     always: Option<Fault>,
     /// How long every read takes.
     read_delay: Duration,
+    /// The next reads that fail transiently.
+    failed_reads: usize,
 }
 
 /// An in-memory store whose writes (`create`, `update`, `put`) fail as scripted.
@@ -87,6 +89,11 @@ impl ScriptedStore {
     /// Every read from now on answers after `delay`.
     pub fn slow_reads(&self, delay: Duration) {
         self.lock().read_delay = delay;
+    }
+
+    /// The next `n` reads fail transiently.
+    pub fn fail_reads(&self, n: usize) {
+        self.lock().failed_reads = n;
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Script> {
@@ -128,8 +135,19 @@ impl ScriptedStore {
 #[async_trait]
 impl VersionedStore for ScriptedStore {
     async fn get(&self, key: &str) -> Result<Option<(Bytes, ObjectVersion)>, StoreError> {
-        let delay = self.lock().read_delay;
+        let (delay, fail) = {
+            let mut s = self.lock();
+            let fail = s.failed_reads > 0;
+            s.failed_reads = s.failed_reads.saturating_sub(1);
+            (s.read_delay, fail)
+        };
         tokio::time::sleep(delay).await;
+        if fail {
+            return Err(StoreError::Transient {
+                key: key.to_owned(),
+                reason: "injected".into(),
+            });
+        }
         self.inner.get(key).await
     }
 
