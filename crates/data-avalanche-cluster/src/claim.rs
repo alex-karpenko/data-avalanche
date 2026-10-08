@@ -1,7 +1,8 @@
 //! Getting a pipeline's lease and giving it back (Clustering §5.3, §8.3). A free lease (absent,
 //! or a released tombstone) is acquired at once. A live holder's lease is taken over only after
 //! it stayed unchanged for a full `lease_duration` on this node's clock: a holder that renews in
-//! the meantime keeps it.
+//! the meantime keeps it. A lease naming this process (its node id and incarnation) is its own
+//! earlier term, taken over at once under the next epoch.
 
 use chrono::Utc;
 use data_avalanche_state::{Acquired, Holder, LeaseDoc, Leases, StateError, Versioned};
@@ -77,7 +78,8 @@ impl Claim {
         // A lease naming this holder is this process's own earlier term: one its renewer gave up
         // as lost, or an earlier step's write that landed behind its error. No one else holds
         // it, so it is taken over at once, under the next epoch: a new term never shares an
-        // epoch with a worker that already ran.
+        // epoch with a worker that already ran. This rests on (node id, incarnation) naming one
+        // process: the incarnation is its start in milliseconds, so a restarted process waits.
         if !seen.doc.is_held_by(&self.holder) {
             // The wait runs from when the version was read, never from before: a renewal that
             // landed while the read was in flight must count.
@@ -337,6 +339,24 @@ mod tests {
             takeover_at,
             sent + Duration::from_secs(2) + timing().duration
         );
+    }
+
+    /// A restarted process has the node id of the lease's holder but another incarnation: the
+    /// holder may still be alive, so it waits a full lease duration like any other node.
+    #[tokio::test(start_paused = true)]
+    async fn a_restarted_process_waits_a_full_lease_duration() {
+        let store = ScriptedStore::new();
+        acquired(&leases(&store), "b").await;
+        let reborn = Holder {
+            node_id: "b".into(),
+            incarnation: 2,
+        };
+        let mut b = Claim::new(leases(&store), "p", reborn, timing());
+        assert!(matches!(b.step().await.unwrap(), Claimed::HeldBy { .. }));
+        advance(14_990).await;
+        assert!(matches!(b.step().await.unwrap(), Claimed::HeldBy { .. }));
+        advance(10).await;
+        assert_eq!(epoch(&b.step().await.unwrap()), 2);
     }
 
     #[tokio::test(start_paused = true)]
