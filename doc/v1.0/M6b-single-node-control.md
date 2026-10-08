@@ -14676,14 +14676,18 @@ per task, against the `test-infra` services (PostgreSQL 18 and 14, RustFS, Azuri
   Committed after Task 9's commit as `fix(cluster): a lease naming this holder after a write
   that landed behind an error is renewed at once; written and the takeover wait are pinned by
   tests` and `fix(cluster): a lease naming this holder is taken over at once under the next
-  epoch, never renewed: a new term never shares an epoch with a worker that ran`. The review's
-  other notes are parked in the SDD ledger.
+  epoch, never renewed: a new term never shares an epoch with a worker that ran`. The
+  re-review found the incarnation half of the self check untested (comparing the node id alone
+  passed every test); round 3 adds `a_restarted_process_waits_a_full_lease_duration` and states
+  the premise, (node id, incarnation) naming one process, in the code: `test(cluster): a
+  restarted process waits a full lease duration; the self takeover's premise is documented`.
+  The review's other notes are parked in the SDD ledger.
 - **Task 10, changed before its execution (2026-10-08).** Round 2 above uncovered a stale
   status: after `Left::Lost`, the controller went back to claiming and, while every claim
   failed, kept reporting `Running` under the lost lease (before, the claim answered `HeldBy`
   naming this node, which set standby). `Left::Lost` now sets `Standby { holder: None }`, which
   also drops the pipeline's series. Task 10's code below carries it. At the last task the
-  workspace has 926 tests; the cluster crate's counts at Tasks 9 and 10 are 5 higher than their
+  workspace has 927 tests; the cluster crate's counts from Task 9 on are 6 higher than their
   Step 4 text shows (the Task 8 and Task 9 fixes' tests).
 
 ### After Task 1: the review fix
@@ -15354,4 +15358,58 @@ index dfe4a99..6c0ef96 100644
          let Claimed::Mine { written, .. } = mine else {
              unreachable!()
          };
+```
+
+Change `crates/data-avalanche-cluster/src/claim.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-cluster/src/claim.rs b/crates/data-avalanche-cluster/src/claim.rs
+index 6c0ef96..12fdddb 100644
+--- a/crates/data-avalanche-cluster/src/claim.rs
++++ b/crates/data-avalanche-cluster/src/claim.rs
+@@ -1,7 +1,8 @@
+ //! Getting a pipeline's lease and giving it back (Clustering §5.3, §8.3). A free lease (absent,
+ //! or a released tombstone) is acquired at once. A live holder's lease is taken over only after
+ //! it stayed unchanged for a full `lease_duration` on this node's clock: a holder that renews in
+-//! the meantime keeps it.
++//! the meantime keeps it. A lease naming this process (its node id and incarnation) is its own
++//! earlier term, taken over at once under the next epoch.
+ 
+ use chrono::Utc;
+ use data_avalanche_state::{Acquired, Holder, LeaseDoc, Leases, StateError, Versioned};
+@@ -77,7 +78,8 @@ impl Claim {
+         // A lease naming this holder is this process's own earlier term: one its renewer gave up
+         // as lost, or an earlier step's write that landed behind its error. No one else holds
+         // it, so it is taken over at once, under the next epoch: a new term never shares an
+-        // epoch with a worker that already ran.
++        // epoch with a worker that already ran. This rests on (node id, incarnation) naming one
++        // process: the incarnation is its start in milliseconds, so a restarted process waits.
+         if !seen.doc.is_held_by(&self.holder) {
+             // The wait runs from when the version was read, never from before: a renewal that
+             // landed while the read was in flight must count.
+@@ -339,6 +341,24 @@ mod tests {
+         );
+     }
+ 
++    /// A restarted process has the node id of the lease's holder but another incarnation: the
++    /// holder may still be alive, so it waits a full lease duration like any other node.
++    #[tokio::test(start_paused = true)]
++    async fn a_restarted_process_waits_a_full_lease_duration() {
++        let store = ScriptedStore::new();
++        acquired(&leases(&store), "b").await;
++        let reborn = Holder {
++            node_id: "b".into(),
++            incarnation: 2,
++        };
++        let mut b = Claim::new(leases(&store), "p", reborn, timing());
++        assert!(matches!(b.step().await.unwrap(), Claimed::HeldBy { .. }));
++        advance(14_990).await;
++        assert!(matches!(b.step().await.unwrap(), Claimed::HeldBy { .. }));
++        advance(10).await;
++        assert_eq!(epoch(&b.step().await.unwrap()), 2);
++    }
++
+     #[tokio::test(start_paused = true)]
+     async fn a_takeover_that_failed_is_tried_again_at_the_next_step() {
+         let store = ScriptedStore::new();
 ```
