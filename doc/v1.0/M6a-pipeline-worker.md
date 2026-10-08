@@ -13341,7 +13341,8 @@ M6a's own exit (M6's exit, the slice-1 E2E suite, is M6b's):
 - [x] The integration job of PR CI is green (`tests/pg`, `tests/sync_commit` and
   `tests/sync_drop` included): PR #7, run 37627666606; merged 2026-10-07 (`f681150`).
   `weekly.yml` runs `tests/pg`, `tests/sync_commit` and `tests/sync_drop` on PostgreSQL 14–17
-  from its first run after the merge.
+  from its first run after the merge: green, run 37740839634 (manual dispatch on `main` at
+  `f681150`, 2026-10-08).
 - [x] The documents and spec edits listed under Decisions are applied; `doc/v1.0/README.md`
   lists this plan and its status.
 

@@ -313,8 +313,8 @@ in the task after the arrow.
 - **F-5 Catalogue names.** The catalogue lists `sink_merge_*` without `_total`, but
   `source_reconnects_total` with it. The patch below makes the catalogue the exposed sample
   names.
-- **F-6** `weekly.yml` hasn't run since M6a's merge (it runs on Mondays). Its first M6b run
-  includes the E2E suite.
+- **F-6** Closed: `weekly.yml` ran green on `main` after M6a's merge (run 37740839634,
+  2026-10-08, `f681150`, by manual dispatch). Its first run with M6b includes the E2E suite.
 
 ### Proposed spec patches (need approval; drafted on scratch copies)
 
