@@ -72,36 +72,30 @@ impl Claim {
                     written: sent,
                 });
             }
-            Acquired::HeldBy(seen) if seen.doc.is_held_by(&self.holder) => {
-                // An earlier step's write landed behind its error: the lease is this node's.
-                // It is renewed, so `written` is a send time this step saw (a later one than
-                // the landed write's would let the renewer's first deadline outlast the lease).
-                self.watched = None;
-                let sent = Instant::now();
-                let lease = self.leases.renew(&seen, Utc::now()).await?;
-                return Ok(Claimed::Mine {
-                    lease,
-                    written: sent,
-                });
-            }
             Acquired::HeldBy(seen) => seen,
         };
-        // The wait runs from when the version was read, never from before: a renewal that
-        // landed while the read was in flight must count.
-        let read = Instant::now();
-        let since = match &self.watched {
-            Some((version, since)) if *version == seen.version => *since,
-            _ => {
-                self.watched = Some((seen.version.clone(), read));
-                read
+        // A lease naming this holder is this process's own earlier term: one its renewer gave up
+        // as lost, or an earlier step's write that landed behind its error. No one else holds
+        // it, so it is taken over at once, under the next epoch: a new term never shares an
+        // epoch with a worker that already ran.
+        if !seen.doc.is_held_by(&self.holder) {
+            // The wait runs from when the version was read, never from before: a renewal that
+            // landed while the read was in flight must count.
+            let read = Instant::now();
+            let since = match &self.watched {
+                Some((version, since)) if *version == seen.version => *since,
+                _ => {
+                    self.watched = Some((seen.version.clone(), read));
+                    read
+                }
+            };
+            let takeover_at = since + self.timing.duration;
+            if read < takeover_at {
+                return Ok(Claimed::HeldBy {
+                    node_id: seen.doc.holder_node_id,
+                    takeover_at,
+                });
             }
-        };
-        let takeover_at = since + self.timing.duration;
-        if read < takeover_at {
-            return Ok(Claimed::HeldBy {
-                node_id: seen.doc.holder_node_id,
-                takeover_at,
-            });
         }
         let sent = Instant::now();
         match self
@@ -276,8 +270,8 @@ mod tests {
     }
 
     /// An acquire whose write landed behind an error: the next step finds the lease naming this
-    /// holder, and it is this node's at once (renewed, the epoch unchanged, `written` when the
-    /// renewal was sent), never taken over.
+    /// holder and takes it over at once, under the next epoch (`written` when that write was
+    /// sent), never after a lease duration.
     #[tokio::test(start_paused = true)]
     async fn an_acquire_that_landed_behind_an_error_is_this_nodes() {
         let store = ScriptedStore::new();
@@ -287,14 +281,14 @@ mod tests {
             lands: true,
         });
         assert!(b.step().await.is_err());
-        // The renewal is slow: `written` is still when it was sent.
+        // The takeover is slow: `written` is still when it was sent.
         store.fail_next(Fault {
             kind: Kind::Slow(Duration::from_secs(2)),
             lands: true,
         });
         let before = Instant::now();
         let mine = b.step().await.unwrap();
-        assert_eq!(epoch(&mine), 1);
+        assert_eq!(epoch(&mine), 2);
         let Claimed::Mine { written, .. } = mine else {
             unreachable!()
         };
