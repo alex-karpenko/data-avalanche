@@ -218,15 +218,16 @@ pub(crate) fn metrics() -> (Metrics, Arc<PipelineMetrics>) {
     (m, Arc::new(p))
 }
 
-/// The test pipeline `p` over `public.*` of a fake PostgreSQL source, flushing at every boundary.
-pub(crate) fn pipeline() -> data_avalanche_config::Pipeline {
-    let yaml = r#"
-config_version: 1
-globals:
-  state: { bucket: app-state }
-pipelines:
-  p:
-    id: p
+/// A config with one pipeline per id, each over `public.*` of a fake PostgreSQL source (slot
+/// `<id>_slot`), flushing at every boundary.
+pub(crate) fn config(ids: &[&str]) -> data_avalanche_config::ResolvedConfig {
+    let mut yaml = String::from(
+        "config_version: 1\nglobals:\n  state: { bucket: app-state }\n  cluster: { memberlist: { node_name: n1 } }\npipelines:\n",
+    );
+    for id in ids {
+        yaml.push_str(&format!(
+            r#"  {id}:
+    id: {id}
     source:
       host: 127.0.0.1
       port: 55418
@@ -234,23 +235,26 @@ pipelines:
       user: avalanche
       password: avalanche
       ssl_mode: disable
-      postgres: { publication: p_pub, slot: p_slot }
+      postgres: {{ publication: {id}_pub, slot: {id}_slot }}
     tables:
       include: [public.*]
-      snapshots: { mode: initial }
-    sink: { type: delta, bucket: lake, delta: {}, flush: { seconds: 0 } }
-"#;
+      snapshots: {{ mode: initial }}
+    sink: {{ type: delta, bucket: lake, prefix: {id}, delta: {{}}, flush: {{ seconds: 0 }} }}
+"#
+        ));
+    }
     data_avalanche_config::load_str(
-        yaml,
+        &yaml,
         &std::collections::BTreeMap::new(),
         &data_avalanche_config::FingerprintKey::from_bytes([1; 32]),
     )
-    .unwrap_or_else(|r| panic!("test pipeline: {r:?}"))
+    .unwrap_or_else(|r| panic!("test config: {r:?}"))
     .config
-    .pipelines
-    .into_values()
-    .next()
-    .expect("one pipeline")
+}
+
+/// The test pipeline `p`.
+pub(crate) fn pipeline() -> data_avalanche_config::Pipeline {
+    config(&["p"]).pipelines.remove("p").expect("pipeline p")
 }
 
 /// `public.<name>`: `id bigint` (the key) and `doc text`.
@@ -341,6 +345,7 @@ pub(crate) fn settings() -> crate::ControllerSettings {
         timing: timing(),
         drain_timeout: Duration::from_secs(5),
         restart: ms(100, 1_000),
+        start_jitter: Duration::from_millis(500),
         tuning: Tuning {
             source_backoff: ms(1, 5),
             sink_backoff: ms(1, 5),

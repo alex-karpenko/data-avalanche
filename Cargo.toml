@@ -69,6 +69,7 @@ tokio-postgres-rustls = "0.14"
 webpki-roots = "1"
 # The binary's control plane (M6b): metrics (roadmap §2.1).
 prometheus-client = "=0.25.1"
+gethostname = "1.1"
 
 # Dependencies build without debug info: DataFusion's full debug build is over 6 GB, which fills
 # CI runners. Workspace crates keep it.

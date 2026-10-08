@@ -92,6 +92,9 @@ pub struct ControllerSettings {
     pub drain_timeout: Duration,
     /// Between reruns of a worker that ended with a transient error.
     pub restart: Backoff,
+    /// Each Phase 0 starts after a random wait below this, so starts that the cap lets through
+    /// together don't reconnect together (Clustering §20.2).
+    pub start_jitter: Duration,
     pub tuning: Tuning,
 }
 
@@ -133,6 +136,17 @@ enum Left {
     Released,
     /// The target channel closed: the process is shutting down.
     Shutdown,
+}
+
+/// A random wait in `[0, max)`.
+fn jitter(max: Duration) -> Duration {
+    let nanos = u64::try_from(max.as_nanos()).unwrap_or(u64::MAX);
+    match nanos {
+        0 => Duration::ZERO,
+        n => Duration::from_nanos(
+            getrandom::u64().expect("the OS random number generator is unavailable") % n,
+        ),
+    }
 }
 
 /// What woke the owned loop.
@@ -486,10 +500,14 @@ impl PipelineController {
         };
         let (worker, handle) =
             PipelineWorker::new(&self.pipeline, deps, self.settings.tuning.clone());
+        let jitter = jitter(self.settings.start_jitter);
         tracing::info!(pipeline = %self.pipeline.name, "worker started");
         Ok(Running {
             handle,
-            task: tokio::spawn(worker.run()),
+            task: tokio::spawn(async move {
+                tokio::time::sleep(jitter).await;
+                worker.run().await
+            }),
             sink: parts.sink,
             permit: Some(permit),
             paused: false,
@@ -667,6 +685,13 @@ mod tests {
     }
 
     const P: &str = r#"pipeline="p",source_host="127.0.0.1",source_db="avalanche""#;
+
+    #[test]
+    fn a_start_jitter_stays_below_its_bound() {
+        assert_eq!(jitter(Duration::ZERO), Duration::ZERO);
+        let max = Duration::from_millis(500);
+        assert!((0..200).all(|_| jitter(max) < max));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn an_owned_pipeline_runs_under_its_lease() {

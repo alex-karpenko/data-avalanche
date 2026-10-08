@@ -6,6 +6,7 @@
 pub mod claim;
 pub mod controller;
 pub mod lease;
+pub mod reconciler;
 #[cfg(test)]
 mod test_support;
 
@@ -15,3 +16,4 @@ pub use controller::{
     Target, WorkerFactory,
 };
 pub use lease::{LeaseGuard, LeaseRun, LeaseTiming, RenewEnd, RenewState};
+pub use reconciler::{ClusterReconciler, node_identity};
