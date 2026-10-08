@@ -4,6 +4,7 @@ use data_avalanche_core::{
     EventShapeError, HaltReason, PositionError, SinkError, SourceError, TableRef,
 };
 use data_avalanche_state::StateError;
+use data_avalanche_storage::StoreError;
 use thiserror::Error;
 
 use crate::hooks::HookPoint;
@@ -67,7 +68,7 @@ pub enum WorkerError {
     /// A newer owner wrote the table; this worker must stop (Clustering §19).
     #[error("table {table} has a newer owner (epoch {current_epoch}): this worker stops")]
     Fenced { table: TableRef, current_epoch: u64 },
-    /// The commit guard refused a commit: the lease is no longer held.
+    /// The commit guard refused a commit or a write: the lease is no longer held.
     #[error("the lease is no longer held: this worker stops before its next commit")]
     LeaseLost,
     /// One transaction outgrew `max_transaction_buffer_bytes` with splitting off
@@ -85,6 +86,41 @@ pub enum WorkerError {
     /// A test hook stopped the worker (`HookAction::Crash`).
     #[error("crashed at {0:?}")]
     Crashed(HookPoint),
+}
+
+/// What the pipeline's controller does once its worker ends with an error (Q-M6b-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recovery {
+    /// Run the worker again, Phase 0 included, after a backoff: the storage or the source may
+    /// answer next time.
+    Retry,
+    /// The lease is gone, or a newer owner wrote a table: stop and go back to the lease.
+    Lease,
+    /// The pipeline is in `ERROR` until an operator acts (the process restarts, or M9's
+    /// restart): rerunning it would fail the same way.
+    Error,
+}
+
+impl WorkerError {
+    pub fn recovery(&self) -> Recovery {
+        match self {
+            Self::State(StateError::Store(
+                StoreError::Transient { .. } | StoreError::Contention { .. },
+            ))
+            | Self::Contended { .. } => Recovery::Retry,
+            Self::Source(e) if e.is_transient() => Recovery::Retry,
+            Self::Sink(e) if e.is_transient() => Recovery::Retry,
+            Self::Fenced { .. } | Self::LeaseLost => Recovery::Lease,
+            Self::Refused(_)
+            | Self::Source(_)
+            | Self::Sink(_)
+            | Self::State(_)
+            | Self::TransactionTooLarge { .. }
+            | Self::WalLag { .. }
+            | Self::Accumulator(_)
+            | Self::Crashed(_) => Recovery::Error,
+        }
+    }
 }
 
 impl From<AccumulatorError> for WorkerError {
@@ -119,5 +155,72 @@ mod tests {
             detail: "nested".into(),
         });
         assert!(matches!(e, WorkerError::Accumulator(_)), "{e}");
+    }
+
+    #[test]
+    fn each_error_names_its_recovery() {
+        let store = |e| WorkerError::State(StateError::Store(e));
+        let cases = [
+            (
+                store(StoreError::Transient {
+                    key: "k".into(),
+                    reason: "503".into(),
+                }),
+                Recovery::Retry,
+            ),
+            (
+                WorkerError::Contended {
+                    waited: Duration::from_secs(120),
+                    detail: "55006".into(),
+                },
+                Recovery::Retry,
+            ),
+            (
+                WorkerError::Source(SourceError::Transient("reset".into())),
+                Recovery::Retry,
+            ),
+            (
+                WorkerError::Sink(SinkError::Transient {
+                    reason: "503".into(),
+                }),
+                Recovery::Retry,
+            ),
+            (
+                WorkerError::Fenced {
+                    table: TableRef::new("public", "a"),
+                    current_epoch: 2,
+                },
+                Recovery::Lease,
+            ),
+            (WorkerError::LeaseLost, Recovery::Lease),
+            (WorkerError::Refused("iceberg".into()), Recovery::Error),
+            (
+                WorkerError::Source(SourceError::Permanent("privilege".into())),
+                Recovery::Error,
+            ),
+            (
+                WorkerError::Sink(SinkError::Permanent {
+                    reason: "malformed".into(),
+                }),
+                Recovery::Error,
+            ),
+            (
+                WorkerError::WalLag {
+                    lag: 2048,
+                    limit: 1024,
+                },
+                Recovery::Error,
+            ),
+            (
+                WorkerError::TransactionTooLarge {
+                    bytes: 2048,
+                    limit: 1024,
+                },
+                Recovery::Error,
+            ),
+        ];
+        for (e, want) in cases {
+            assert_eq!(e.recovery(), want, "{e}");
+        }
     }
 }

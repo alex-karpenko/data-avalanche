@@ -85,8 +85,34 @@ pub struct WorkerStatus {
     pub snapshots: BTreeMap<TableRef, SnapshotProgress>,
     /// The snapshot reconciler's log, as of the last stream boundary or tick.
     pub reconcile_log: ReconcileLog,
-    /// Warnings since the start: drift, a `never` gap, a degraded evolve.
+    /// Warnings since the start: drift, a `never` gap, a degraded evolve. Each text once, the
+    /// latest [`MAX_WARNINGS`]; add them with [`WorkerStatus::warn`].
     pub warnings: Vec<String>,
+    /// Warnings dropped to keep [`MAX_WARNINGS`].
+    pub warnings_dropped: u64,
+    /// Stream sessions reopened after a source failure (`data_avalanche_source_reconnects_total`).
+    pub reconnects: u64,
+}
+
+/// The warnings a status keeps.
+pub const MAX_WARNINGS: usize = 50;
+
+impl WorkerStatus {
+    /// Adds a warning as the latest. One the status already shows moves to the end instead: a
+    /// rerun of Phase 0, a reconnect or a new failing streak that finds the same thing again adds
+    /// nothing. Past [`MAX_WARNINGS`] the oldest goes.
+    pub fn warn(&mut self, warning: String) {
+        if let Some(at) = self.warnings.iter().position(|w| *w == warning) {
+            let again = self.warnings.remove(at);
+            self.warnings.push(again);
+            return;
+        }
+        self.warnings.push(warning);
+        if self.warnings.len() > MAX_WARNINGS {
+            self.warnings.remove(0);
+            self.warnings_dropped += 1;
+        }
+    }
 }
 
 /// A check that keeps failing warns once: the first failure of a streak adds a status warning,
@@ -105,7 +131,7 @@ impl Streak {
         self.failures = self.failures.saturating_add(1);
         if self.failures == 1 {
             let warning = warning();
-            status.send_modify(|st| st.warnings.push(warning));
+            status.send_modify(|st| st.warn(warning));
         }
     }
 
@@ -149,5 +175,31 @@ impl Default for Tuning {
             tick: Duration::from_secs(1),
             augment_attempts: 3,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_warning_shows_once_as_of_its_latest() {
+        let mut st = WorkerStatus::default();
+        st.warn("a".into());
+        st.warn("b".into());
+        st.warn("a".into());
+        assert_eq!(st.warnings, ["b", "a"]);
+        assert_eq!(st.warnings_dropped, 0);
+    }
+
+    #[test]
+    fn past_the_cap_the_oldest_warning_goes() {
+        let mut st = WorkerStatus::default();
+        for i in 0..MAX_WARNINGS + 2 {
+            st.warn(format!("w{i}"));
+        }
+        assert_eq!(st.warnings.len(), MAX_WARNINGS);
+        assert_eq!(st.warnings.first().map(String::as_str), Some("w2"));
+        assert_eq!(st.warnings_dropped, 2);
     }
 }

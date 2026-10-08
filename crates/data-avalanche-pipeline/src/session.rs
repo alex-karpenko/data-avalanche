@@ -89,6 +89,16 @@ impl Core {
         self.status.send_modify(f);
     }
 
+    /// Asked before each write Phase 0 makes (state documents, the slot, a sink table), as the
+    /// writer asks before each commit: a worker whose lease lapsed writes nothing more.
+    pub fn may_write(&self) -> Result<(), WorkerError> {
+        if self.guard.may_commit() {
+            Ok(())
+        } else {
+            Err(WorkerError::LeaseLost)
+        }
+    }
+
     pub fn evolver(&self) -> Evolver<'_> {
         Evolver {
             source: &*self.source,
@@ -244,7 +254,7 @@ impl<'c> Session<'c> {
             for h in recorded.iter().chain(&halts) {
                 st.halted.insert(h.table.clone(), h.reason.clone());
             }
-            st.warnings.extend(warnings);
+            warnings.into_iter().for_each(|w| st.warn(w));
             // Replaced, not extended: a snapshot an earlier session finished, or ended with a
             // completion this session's state shows durable, is over.
             st.snapshots = snaps.progress().collect();
@@ -761,7 +771,7 @@ impl<'c> Session<'c> {
     fn held_round_ended(&mut self) {
         for (table, rounds) in self.snaps.held_round() {
             self.core.update(|st| {
-                st.warnings.push(format!(
+                st.warn(format!(
                     "table {table}: its snapshot is still held after {rounds} catalog rescans: its schema changed while the pipeline was down, and its cached schema hasn't caught up with the catalog (the catalog keeps changing, or the stream has yet to commit a change of it); it reads nothing until a rescan finds the cache up to date"
                 ));
             });
@@ -1085,7 +1095,7 @@ impl<'c> Session<'c> {
         if !safe.is_empty() {
             match self.core.evolver().evolve(&table, safe).await? {
                 Ok(None) => {}
-                Ok(Some(warning)) => self.core.update(|st| st.warnings.push(warning)),
+                Ok(Some(warning)) => self.core.update(|st| st.warn(warning)),
                 Err(reason) => {
                     self.halt(table, reason)?;
                     return Ok(None);
@@ -1212,6 +1222,11 @@ mod tests {
         assert!(matches!(end.unwrap(), End::Exit(Exit::Drained)));
         assert_eq!(w.ids("a"), [1]);
         assert_eq!(checkpoint(&w).await, lsn_of(&w.source.wal_end()));
+        assert_eq!(
+            w.source.acknowledged().last(),
+            Some(&w.source.wal_end()),
+            "the drain's last flush is acknowledged before the stream closes"
+        );
     }
 
     #[tokio::test]
@@ -1629,7 +1644,8 @@ mod tests {
 
     /// A table whose re_query fetch keeps failing: the streak's first commit tries three times
     /// and warns; the next tries once, with no backoff, and warns nothing more. A fetch that
-    /// succeeds ends the streak: the next failure tries three times and warns again.
+    /// succeeds ends the streak: the next failure tries three times and warns again, a warning
+    /// the status already shows, once.
     #[tokio::test]
     async fn a_failing_re_query_fetch_warns_once_per_streak_and_tries_once_while_failing() {
         let w = World::with(vec![with_v("a")]);
@@ -1673,7 +1689,7 @@ mod tests {
         .await;
         end.unwrap();
         assert!(st.halted.is_empty(), "{:?}", st.halted);
-        assert_eq!(st.warnings.len(), 2, "{:?}", st.warnings);
+        assert_eq!(st.warnings.len(), 1, "{:?}", st.warnings);
         assert_eq!(
             (w.text("a", "doc"), w.text("a", "v")),
             (vec![Some("new".to_owned())], vec![Some("4".to_owned())])

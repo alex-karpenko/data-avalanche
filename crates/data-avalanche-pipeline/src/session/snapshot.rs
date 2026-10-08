@@ -370,7 +370,7 @@ impl Session<'_> {
                         "table {table}: its snapshot waits for transactions that were in flight when the stream session started and write it (xids {}): it reads nothing until they end; a long-running or idle-in-transaction session holds one (pg_stat_activity, backend_xid), or a prepared transaction (pg_prepared_xacts)",
                         writers.join(", ")
                     );
-                    self.core.update(|st| st.warnings.push(warning));
+                    self.core.update(|st| st.warn(warning));
                 }
                 continue;
             }

@@ -28,7 +28,7 @@ pub use accumulator::{Accumulator, Flush};
 pub use backoff::Backoff;
 pub use batch::{Lineage, MAX_BATCH_BYTES};
 pub use buffer::{CollapsedRow, RowKind, TableBuffer};
-pub use error::{AccumulatorError, WorkerError};
+pub use error::{AccumulatorError, Recovery, WorkerError};
 pub use hooks::{CommitGuard, HookAction, HookPoint, Hooks, NoHooks, Unguarded};
 pub use policy::{FlushPolicy, FlushReason, TxnLimits};
 pub use status::{Command, Exit, Phase, ReconcileLog, SnapshotProgress, Tuning, WorkerStatus};

@@ -293,6 +293,18 @@ impl CommitGuard for Switch {
     }
 }
 
+/// A commit guard that answers yes `n` times, then no: the lease lapses at the `n + 1`th write.
+#[derive(Debug)]
+pub(crate) struct Countdown(pub AtomicUsize);
+
+impl CommitGuard for Countdown {
+    fn may_commit(&self) -> bool {
+        self.0
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+    }
+}
+
 /// Fast retries and ticks for tests.
 pub(crate) fn fast() -> Tuning {
     let ms = |first, max| Backoff {
