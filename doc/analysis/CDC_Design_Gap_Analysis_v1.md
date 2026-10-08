@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-07
+updated: 2026-10-08
 domain: Architecture
 tags: [gap-analysis, design, re-derivation, spec-readiness, blockers, open-decisions]
 resolves: []
@@ -127,13 +127,14 @@ does not block starting the specification.
 
 > Recounted 2026-09-26 (v1 readiness tidy, §26); the 2026-06 figures are superseded. Open count
 > updated 2026-10-02 for the gaps M5 carried (§27), 2026-10-03 for DA-SNAP-9 and DA-SNAP-10 (§28),
-> and 2026-10-07 for the M6a whole-branch review (§28.2).
+> 2026-10-07 for the M6a whole-branch review (§28.2), and 2026-10-08 for M6b's planning findings
+> (§29).
 
 | Status | Count (v1 scope) | Notes |
 |---|---|---|
 | ✅ Resolved | the large majority | Design closed by a research/spec doc or a probe. |
-| 🔄 Partial | 2 | DA-SNAP-7, DA-SRC-9 (neither blocks the plan); DA-MS-3 is a decided caveat. DA-X-8 ✅ 2026-09-26. |
-| 🟥 Open (v1) | **11** | DA-SRC-13…18, carried from M5 (§27); DA-SNAP-10 🆕 2026-10-03 (§28.1); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
+| 🔄 Partial | 4 | DA-SNAP-7, DA-SRC-9 (neither blocks the plan); DA-SRC-16 and DA-X-12 🆕, each built by an M6b task (§29). DA-MS-3 is a decided caveat. DA-X-8 ✅ 2026-09-26. |
+| 🟥 Open (v1) | **10** | DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-10 🆕 2026-10-03 (§28.1); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
 | 🧪 Verify (v1) | **0** | DA-SRC-10/11 proven 2026-09-26 (§21). |
 | ⏭ v2 | 13 | Iceberg-sink items (§26.2). |
 | 🟢 Spec-merge debt | **0** | All applied 2026-09-26 (§26.6): §19.3 S-1…S-6, the DA-X-8 config residual, the D-V1 patches and the Data-Flow Phase 2a probe details. |
@@ -383,7 +384,7 @@ the MySQL path with one genuine correctness dependency.
 | DA-SRC-13 | Publication blind spots | 🟢 | 🆕 🟥 | Carried from M5; detail in §27. | — |
 | DA-SRC-14 | `bit` / `varbit` / PostGIS keys | 🟢 | 🆕 🟥 | Carried from M5; detail in §27. | — |
 | DA-SRC-15 | Snapshot collation and chunk edges | 🟢 | 🆕 🟥 | Carried from M5; detail in §27. | — |
-| DA-SRC-16 | The replication connection's timeouts | 🟢 | 🆕 🟥 | Carried from M5; detail in §27. | — |
+| DA-SRC-16 | The replication connection's timeouts | 🟢 | 🔄 | Carried from M5; detail in §27. M6b Task 22 builds the stream watchdog and bounds the catalog connect (§29). | — |
 | DA-SRC-17 | Source edges PostgreSQL doesn't produce, and small gaps | 🟢 | 🆕 🟥 | Carried from M5; detail in §27. | — |
 | DA-SRC-18 | M5 test gaps | 🟢 | 🆕 🟥 | Carried from M5; detail in §27. | — |
 | DA-SRC-19 | 🆕 Which permanent chunk-read errors are table-scoped | 🟢 | 🟥 | §28.2. A permanent chunk-read error ends the whole pipeline (D-M6a.7); a retyped key's 42883/42804 would loop it through restarts though only that table's read is broken. A non-drop 42703 (e.g. a quoting bug) now retries as "changed under the snapshot" until `SNAPSHOT_TIMEOUT`, with a warning per streak. Rule per SQLSTATE which errors halt the table and which end the pipeline, with MySQL's in view (M7/M9). | — |
@@ -1555,3 +1556,30 @@ slot document); `until_durable` polls neither control nor the stream (a drain du
 outage inside a schema signal waits for the sink); the Delta sink has no test of a snapshot set
 committed at a covered frontier (the slice-1 E2E suite on RustFS should emit a chunk on an idle
 source).
+
+---
+
+## 29. M6b single-node control — the planning findings answered (2026-10-08)
+
+M6b's plan (`doc/v1.0/M6b-single-node-control.md`, in review) put six findings to the owner, who
+answered them on 2026-10-08 (the plan's Q-M6b-9…13). Spec edits approved and applied:
+`Configuration_Specification.md` §9.4.3 and V-119 (`sink.delta.merge_memory_limit`) and the
+`System-Overview.md` Observability catalogue (the exposed sample names). Proposed with the new
+tasks, awaiting approval: `Data-Flow.md` Phase 4 (the guard compares a table's last change), and
+notes in `Configuration_Specification.md` §6.4, §9.2 and §9.2.1.
+
+| ID | Change | Evidence |
+|---|---|---|
+| DA-SRC-16 | 🟥 → 🔄. Q-M6b-11 reverses D-M6a.9: M6b Task 22 builds a stream watchdog. A stream silent for 3 heartbeats while 3 heartbeat reads of the slot in a row fail or find no reader (`active`) ends the session, and the worker reconnects; a read still out counts neither way (it may wait behind a chunk read). The catalog connect is bounded by `timeouts.connect` as a whole. Closes when the task lands. Still open: no TCP keep-alive on the replication socket (it wouldn't catch a frozen server, which answers TCP), and the read-ahead counts events, not bytes | Measured 2026-10-08, PostgreSQL 14 frozen with `docker pause` for 150 s under a running pipeline: status `running`, no reconnect, nothing logged; tokio-postgres's `connect_timeout` bounds only the TCP connect, so a reconnect waits in the startup. With the task (scratch): the E2E scenario reconnects during the freeze, logs the reason, and converges after the unpause |
+| DA-SNAP-11 | Stays 🟥, advanced: M6b Task 7 exports the reconciler log's size (`data_avalanche_reconcile_log_entries`, `data_avalanche_reconcile_log_keys`). Bounding the log stays open | M6b plan, Task 7 |
+
+Also answered, with no gap of their own: the Delta libraries log only warnings at a bare `info`,
+and the sink no longer provokes the kernel's ERROR on an absent table (Q-M6b-10, Task 23); a stop
+and a resume rerun an ERROR pipeline, as a process restart would, until M9's restart verb
+(Q-M6b-12, `Pipeline_Lifecycle_State_Machine.md` §3).
+
+### 29.1 New gaps
+
+| ID | Gap | Severity | Surfaced by | Next |
+|---|---|---|---|---|
+| DA-X-12 | 🔄 The position guard compared a change set's end, the flush frontier, so a replay after a crash was rarely skipped: keep-alives and other databases' WAL move the frontier past the table's marker. The whole replay was merged again: correct (the MERGE is idempotent, Data-Flow: "optimization, not correctness"), but at full cost | 🟢 | M6b planning, the crash scenarios (marker `0/409EA098` against a replay ending at `0/409EA1B0`) | M6b Task 21: the set carries its table's last change, which the guard compares; the marker stays the frontier, as Data-Flow's checkpoint rule requires. Measured in scratch: the replay was a third Delta commit before, and is skipped after. Closes when the task lands, with the Data-Flow Phase 4 patch |
