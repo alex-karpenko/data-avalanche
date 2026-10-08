@@ -14627,6 +14627,22 @@ per task, against the `test-infra` services (PostgreSQL 18 and 14, RustFS, Azuri
   the txn it writes`. Task 2's evolve hunk is rebased on it (it calls `self.props`); no other
   task's code changes. The review's three minor notes are parked in the SDD ledger.
 
+- **Task 6, the review fix (2026-10-08).** The task review found that three gated Phase 0
+  writes, `reset_position`, `prepare` and `ensure_table`, asked `may_write()` once and were then
+  retried on `Transient` without asking again: a lease that lapsed during a transient outage could
+  still let the write land, the slot recreated or advanced included (Review Focus 1). The writer
+  and the evolver already ask before every try. `write_retry` now asks the guard before every
+  try (`retry` is `write_retry` with no gate), and `sink_retry` takes the same gate. The test
+  `a_lease_lost_while_a_write_is_retried_stops_the_retry` fails without it (`prepare` landed: 3
+  writes, not 2; and, with the sink gate asked only on the first try, `ensure_table` landed: 4,
+  not 3). The same review found that a `SourceError::Contended` from Phase 0 (`prepare` meeting
+  the slot active for another PID) was classified `Error`, while Q-M6b-3 retries `Contended`: it
+  is `Retry` now, with a case in `each_error_names_its_recovery`. Committed after Task 6's
+  commit as `fix(pipeline): a Phase 0 write retried while it fails transiently asks the lease
+  before every try; a contended slot in Phase 0 is retried`. No later task's code changes; at
+  the last task the workspace has 921 tests (920 + 1). The review's other notes are parked in
+  the SDD ledger.
+
 ### After Task 1: the review fix
 
 Change `crates/data-avalanche-sink-delta/src/sink.rs`:
@@ -14725,4 +14741,220 @@ index 2278506..58d91f6 100644
          let err = evolve(stale, &add_note(), NtzAs::default(), props)
              .await
              .map(|(_, o)| o)
+```
+
+### After Task 6: the review fix
+
+Change `crates/data-avalanche-pipeline/src/error.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-pipeline/src/error.rs b/crates/data-avalanche-pipeline/src/error.rs
+index 109e45f..0d06f4d 100644
+--- a/crates/data-avalanche-pipeline/src/error.rs
++++ b/crates/data-avalanche-pipeline/src/error.rs
+@@ -108,7 +108,9 @@ impl WorkerError {
+                 StoreError::Transient { .. } | StoreError::Contention { .. },
+             ))
+             | Self::Contended { .. } => Recovery::Retry,
+-            Self::Source(e) if e.is_transient() => Recovery::Retry,
++            Self::Source(e) if e.is_transient() || matches!(e, SourceError::Contended(_)) => {
++                Recovery::Retry
++            }
+             Self::Sink(e) if e.is_transient() => Recovery::Retry,
+             Self::Fenced { .. } | Self::LeaseLost => Recovery::Lease,
+             Self::Refused(_)
+@@ -179,6 +181,11 @@ mod tests {
+                 WorkerError::Source(SourceError::Transient("reset".into())),
+                 Recovery::Retry,
+             ),
++            // Phase 0's `prepare` met the slot active for another PID.
++            (
++                WorkerError::Source(SourceError::Contended("slot active".into())),
++                Recovery::Retry,
++            ),
+             (
+                 WorkerError::Sink(SinkError::Transient {
+                     reason: "503".into(),
+```
+
+Change `crates/data-avalanche-pipeline/src/worker.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-pipeline/src/worker.rs b/crates/data-avalanche-pipeline/src/worker.rs
+index f6b0afe..f99400a 100644
+--- a/crates/data-avalanche-pipeline/src/worker.rs
++++ b/crates/data-avalanche-pipeline/src/worker.rs
+@@ -160,8 +160,12 @@ impl PipelineWorker {
+                         "the source lost the stream position {position} ({detail}): the stream restarts at a new position and the tables are snapshotted again"
+                     );
+                     core.update(|st| st.warn(warning));
+-                    core.may_write()?;
+-                    let from = retry(&core.tuning, || core.source.reset_position()).await?;
++                    let from = write_retry(
++                        &core.tuning,
++                        || core.may_write(),
++                        || core.source.reset_position(),
++                    )
++                    .await?;
+                     start(core, Some(from)).await?;
+                     attempt = 0;
+                     continue;
+@@ -206,13 +210,30 @@ async fn drained_while(core: &mut Core, delay: std::time::Duration) -> bool {
+ }
+ 
+ /// A source call, retried while it fails transiently.
+-async fn retry<T, F, Fut>(tuning: &Tuning, mut call: F) -> Result<T, WorkerError>
++async fn retry<T, F, Fut>(tuning: &Tuning, call: F) -> Result<T, WorkerError>
+ where
+     F: FnMut() -> Fut,
+     Fut: Future<Output = Result<T, SourceError>>,
++{
++    write_retry(tuning, || Ok(()), call).await
++}
++
++/// A source write, retried while it fails transiently: `may_write` (`Core::may_write`) is asked
++/// before every try, as the writer asks before each commit, so a lease that lapses during the
++/// retries stops the write.
++async fn write_retry<T, G, F, Fut>(
++    tuning: &Tuning,
++    may_write: G,
++    mut call: F,
++) -> Result<T, WorkerError>
++where
++    G: Fn() -> Result<(), WorkerError>,
++    F: FnMut() -> Fut,
++    Fut: Future<Output = Result<T, SourceError>>,
+ {
+     let mut attempt = 0;
+     loop {
++        may_write()?;
+         match call().await {
+             Ok(v) => return Ok(v),
+             Err(e) if e.is_transient() => {
+@@ -224,20 +245,27 @@ where
+     }
+ }
+ 
+-/// A sink call, retried while it fails transiently.
+-async fn sink_retry<T, F, Fut>(tuning: &Tuning, mut call: F) -> Result<T, SinkError>
++/// A sink call, retried while it fails transiently. A write passes `Core::may_write` as
++/// `may_write`, asked before every try (as in [`write_retry`]); a read passes `|| Ok(())`.
++async fn sink_retry<T, G, F, Fut>(
++    tuning: &Tuning,
++    may_write: G,
++    mut call: F,
++) -> Result<T, WorkerError>
+ where
++    G: Fn() -> Result<(), WorkerError>,
+     F: FnMut() -> Fut,
+     Fut: Future<Output = Result<T, SinkError>>,
+ {
+     let mut attempt = 0;
+     loop {
++        may_write()?;
+         match call().await {
+             Err(e) if e.is_transient() => {
+                 tokio::time::sleep(tuning.sink_backoff.delay(attempt)).await;
+                 attempt += 1;
+             }
+-            r => return r,
++            r => return r.map_err(WorkerError::Sink),
+         }
+     }
+ }
+@@ -386,8 +414,12 @@ pub(crate) async fn start(
+             }
+             let refs: Vec<TableRef> = resolved_tables.keys().cloned().collect();
+             // `prepare` may create, recreate or advance the slot.
+-            core.may_write()?;
+-            let prepared = retry(&tuning, || source.prepare(checkpoint.as_ref(), &refs)).await?;
++            let prepared = write_retry(
++                &tuning,
++                || core.may_write(),
++                || source.prepare(checkpoint.as_ref(), &refs),
++            )
++            .await?;
+             warnings.extend(prepared.warnings);
+             match prepared.plan {
+                 StartPlan::Resume => {
+@@ -434,9 +466,7 @@ pub(crate) async fn start(
+             tracked.insert(table.clone());
+             continue;
+         }
+-        let state = sink_retry(&tuning, || sink.table_state(table))
+-            .await
+-            .map_err(WorkerError::Sink)?;
++        let state = sink_retry(&tuning, || Ok(()), || sink.table_state(table)).await?;
+         let doc = core.docs.table_snapshot(table).await?.map(|v| v.doc);
+         let in_progress = doc
+             .as_ref()
+@@ -521,15 +551,14 @@ pub(crate) async fn start(
+             _ => {}
+         }
+         if !state.exists {
+-            core.may_write()?;
+-            match sink_retry(&tuning, || sink.ensure_table(&spec)).await {
++            match sink_retry(&tuning, || core.may_write(), || sink.ensure_table(&spec)).await {
+                 Ok(()) => {}
+-                Err(SinkError::Permanent { reason }) => {
++                Err(WorkerError::Sink(SinkError::Permanent { reason })) => {
+                     halts.push((table.clone(), HaltReason::SinkRejected { detail: reason }));
+                     tracked.insert(table.clone());
+                     continue;
+                 }
+-                Err(e) => return Err(WorkerError::Sink(e)),
++                Err(e) => return Err(e),
+             }
+         }
+         if !tracked_before || matches!(plan, Plan::Fresh(_)) {
+@@ -622,7 +651,7 @@ pub(crate) async fn start(
+ mod tests {
+     use data_avalanche_core::position::Lsn;
+     use data_avalanche_core::{ColumnSchema, ColumnValue, ColumnValueType as V, Row};
+-    use data_avalanche_testkit::{FakeTxn, Method};
++    use data_avalanche_testkit::{FakeTxn, Method, SinkOp};
+ 
+     use super::*;
+     use crate::test_support::{Countdown, CrashAt, World, Yaml, fast, row, t, wait_until};
+@@ -1245,6 +1274,40 @@ mod tests {
+         }
+     }
+ 
++    /// A write retried while it fails transiently asks the guard before every try, as the writer
++    /// does: the lease lapsing between two tries of `prepare` (the third write) or `ensure_table`
++    /// (the fourth) stops it there, and the write never lands.
++    #[tokio::test]
++    async fn a_lease_lost_while_a_write_is_retried_stops_the_retry() {
++        for n in [3, 4] {
++            let w = World::new(&["a"]);
++            w.source.load(&t("a"), rows(1..=3));
++            if n == 3 {
++                for _ in 0..3 {
++                    w.source
++                        .fail(Method::Prepare, SourceError::Transient("down".into()));
++                }
++            } else {
++                w.sink
++                    .fail(SinkOp::EnsureTable, None, 3, || SinkError::Transient {
++                        reason: "down".into(),
++                    });
++            }
++            let mut d = deps(&w);
++            d.guard = Arc::new(Countdown(AtomicUsize::new(n)));
++            let (worker, _handle) = PipelineWorker::new(&mode("mode: initial"), d, fast());
++            let end = tokio::time::timeout(Duration::from_secs(5), worker.run())
++                .await
++                .expect("the lease lapses within Phase 0");
++            assert!(matches!(end, Err(WorkerError::LeaseLost)), "{n}: {end:?}");
++            assert_eq!(
++                phase_0_writes(&w).await,
++                n - 1,
++                "{n}: the retried write never landed"
++            );
++        }
++    }
++
+     /// A lost stream position is replaced only under the lease: `reset_position` recreates the
+     /// slot, a write like Phase 0's.
+     #[tokio::test]
 ```
