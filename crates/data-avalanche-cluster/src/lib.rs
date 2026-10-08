@@ -1,0 +1,10 @@
+//! Who runs each pipeline (Clustering §19–§20): the lease, its renewer and the commit guard it
+//! answers, the controller that runs a pipeline's worker while it holds the lease, and the
+//! reconciler that tells each controller whether to own. M6b runs them single-node: a self-only
+//! ring, so every pipeline's target is "own".
+
+pub mod lease;
+#[cfg(test)]
+mod test_support;
+
+pub use lease::{LeaseGuard, LeaseRun, LeaseTiming, RenewEnd, RenewState};

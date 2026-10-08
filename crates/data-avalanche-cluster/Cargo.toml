@@ -1,0 +1,25 @@
+[package]
+name = "data-avalanche-cluster"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Pipeline ownership for data-avalanche: the lease and its renewer, the pipeline controller and the cluster reconciler."
+
+[lints]
+workspace = true
+
+[dependencies]
+chrono.workspace = true
+data-avalanche-config.workspace = true
+data-avalanche-pipeline.workspace = true
+data-avalanche-state.workspace = true
+data-avalanche-storage.workspace = true
+data-avalanche-telemetry.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+object_store.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
