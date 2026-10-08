@@ -164,10 +164,10 @@ impl DeltaSink {
     }
 
     /// One write's commit properties: the fence's `txn` (the owner epoch as the `i64` version
-    /// Delta stores, `txn_version`) and the marker's `commitInfo`.
+    /// Delta stores, `txn_version`) and the `commitInfo`.
     fn props(
         &self,
-        marker: &CommitMarker,
+        owner_epoch: u64,
         txn_version: i64,
         position: Option<&SourcePosition>,
     ) -> CommitProperties {
@@ -178,7 +178,7 @@ impl DeltaSink {
             ))
             .with_metadata(commit_metadata(
                 &self.config.pipeline_id,
-                marker.owner_epoch,
+                owner_epoch,
                 position,
             ))
     }
@@ -229,7 +229,7 @@ impl DeltaSink {
         let mut table = h.table().clone();
         if cs.truncate {
             // The clear carries the fence but no position: a crash before the MERGE replays both.
-            table = match truncate(table, self.props(marker, txn_version, None)).await {
+            table = match truncate(table, self.props(marker.owner_epoch, txn_version, None)).await {
                 Ok((t, metrics)) => {
                     self.count(|s| {
                         s.files_removed += metrics.num_removed_files as u64;
@@ -257,7 +257,7 @@ impl DeltaSink {
         }
         let before = table.version();
         if cs.upsert_rows() + cs.delete_rows() > 0 {
-            let props = self.props(marker, txn_version, Some(&position));
+            let props = self.props(marker.owner_epoch, txn_version, Some(&position));
             match merge(table, cs, &types, props, self.config.merge_memory_limit).await {
                 Ok((t, metrics)) => {
                     self.count(|s| s.add(&metrics));
@@ -271,7 +271,7 @@ impl DeltaSink {
             table.version().expect("a written table is loaded")
         } else {
             // Nothing changed a row: a marker-only commit still moves the position.
-            let props = self.props(marker, txn_version, Some(&position));
+            let props = self.props(marker.owner_epoch, txn_version, Some(&position));
             match marker_only(&table, props, &app_id(pipeline), txn_version).await {
                 Ok(v) => v,
                 Err(e) => return race_or_fail(e),
@@ -357,14 +357,11 @@ impl Sink for DeltaSink {
         // finds the newer epoch.
         let txn_version = i64::try_from(owner_epoch)
             .map_err(|_| permanent(format!("owner epoch {owner_epoch}")))?;
-        let props = CommitProperties::default()
-            .with_application_transaction(Transaction::new(app_id(pipeline), txn_version))
-            .with_metadata(commit_metadata(pipeline, owner_epoch, None));
         let (t, outcome) = evolve(
             h.table().clone(),
             delta,
             self.config.table.timestamp_ntz_as,
-            props,
+            self.props(owner_epoch, txn_version, None),
         )
         .await?;
         h.set_table(t);
@@ -523,9 +520,13 @@ mod tests {
         let out = zombie.evolve(orders().table(), &add_note(), 5).await;
         assert_eq!(out.unwrap(), EvolveOutcome::Fenced { current_epoch: 6 });
         assert_eq!(columns(&zombie).await, before, "nothing added");
-        let out = owner.evolve(orders().table(), &add_note(), 6).await;
+        // The ADD COLUMN carries the fence: a write of an older owner after it is fenced.
+        let out = owner.evolve(orders().table(), &add_note(), 7).await;
         assert_eq!(out.unwrap(), EvolveOutcome::Applied);
         assert_eq!(columns(&owner).await, before + 1);
+        let late = rows(30, &[3]);
+        let out = owner.commit(late.clone(), marker(6, &late)).await;
+        assert_eq!(out.unwrap(), CommitOutcome::Fenced { current_epoch: 7 });
     }
 
     #[tokio::test]
@@ -548,7 +549,7 @@ mod tests {
             .commit(theirs.clone(), marker(6, &theirs))
             .await
             .unwrap();
-        let props = zombie.props(&marker(5, &first), 5, None);
+        let props = zombie.props(5, 5, None);
         let err = evolve(stale, &add_note(), NtzAs::default(), props)
             .await
             .map(|(_, o)| o)
