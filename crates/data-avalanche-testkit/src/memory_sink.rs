@@ -351,12 +351,18 @@ impl Sink for MemorySink {
         &self,
         table: &TableRef,
         delta: &SchemaDelta,
+        owner_epoch: u64,
     ) -> Result<EvolveOutcome, SinkError> {
         self.fault(SinkOp::Evolve, table)?;
         let mut tables = self.tables();
         let t = tables.get_mut(table).ok_or_else(|| SinkError::NoTable {
             table: table.clone(),
         })?;
+        if let Some(stored) = t.marker.as_ref().filter(|m| m.owner_epoch > owner_epoch) {
+            return Ok(EvolveOutcome::Fenced {
+                current_epoch: stored.owner_epoch,
+            });
+        }
         let mut added = Vec::new();
         let mut warnings = Vec::new();
         for change in &delta.changes {
@@ -781,9 +787,12 @@ mod tests {
             V::Int32,
             "integer",
         ))]);
-        assert_eq!(sink.evolve(&t, &add).await.unwrap(), EvolveOutcome::Applied);
         assert_eq!(
-            sink.evolve(&t, &add).await.unwrap(),
+            sink.evolve(&t, &add, 1).await.unwrap(),
+            EvolveOutcome::Applied
+        );
+        assert_eq!(
+            sink.evolve(&t, &add, 1).await.unwrap(),
             EvolveOutcome::Applied,
             "replay"
         );
@@ -796,7 +805,7 @@ mod tests {
 
         let drop = delta(vec![SchemaChange::DropColumn("doc".into())]);
         assert!(matches!(
-            sink.evolve(&t, &drop).await.unwrap(),
+            sink.evolve(&t, &drop, 1).await.unwrap(),
             EvolveOutcome::Degraded { .. }
         ));
         let mut narrower = cs(20, vec![], vec![]);
@@ -821,9 +830,39 @@ mod tests {
             narrowed: false,
         }]);
         assert!(matches!(
-            sink.evolve(&t, &widen).await.unwrap(),
+            sink.evolve(&t, &widen, 1).await.unwrap(),
             EvolveOutcome::Unsupported { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn an_evolve_of_a_table_a_newer_owner_wrote_is_fenced() {
+        let sink = sink().await;
+        let t = TableRef::new("public", "t");
+        commit(
+            &sink,
+            cs(10, vec![upserts(&[(1, Some("a"))], None)], vec![]),
+            2,
+        )
+        .await;
+        let add = SchemaDelta {
+            table: t.clone(),
+            changes: vec![SchemaChange::AddColumn(ColumnSchema::new(
+                "n",
+                V::Int32,
+                "integer",
+            ))],
+        };
+        assert_eq!(
+            sink.evolve(&t, &add, 1).await.unwrap(),
+            EvolveOutcome::Fenced { current_epoch: 2 }
+        );
+        let state = sink.table_state(&t).await.unwrap();
+        assert_eq!(state.schema.unwrap().fields().len(), 2, "nothing added");
+        assert_eq!(
+            sink.evolve(&t, &add, 2).await.unwrap(),
+            EvolveOutcome::Applied
+        );
     }
 
     #[tokio::test]

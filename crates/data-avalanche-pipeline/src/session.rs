@@ -90,6 +90,7 @@ impl Core {
             source: &*self.source,
             sink: &*self.sink,
             guard: &*self.guard,
+            owner_epoch: self.owner_epoch,
             tuning: &self.tuning,
             evolution: self.settings.evolution,
             status: &self.status,

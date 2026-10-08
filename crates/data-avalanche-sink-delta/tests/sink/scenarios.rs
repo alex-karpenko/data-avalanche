@@ -176,7 +176,7 @@ pub async fn evolution(location: DeltaLocation) {
         ))],
     };
     assert_eq!(
-        s.evolve(&items(), &add).await.unwrap(),
+        s.evolve(&items(), &add, 1).await.unwrap(),
         EvolveOutcome::Applied
     );
     commit(
@@ -196,7 +196,7 @@ pub async fn evolution(location: DeltaLocation) {
         changes: vec![SchemaChange::DropColumn("doc".into())],
     };
     assert!(matches!(
-        s.evolve(&items(), &drop).await.unwrap(),
+        s.evolve(&items(), &drop, 1).await.unwrap(),
         EvolveOutcome::Degraded { .. }
     ));
     let mut narrow = cs(30, vec![], vec![]);

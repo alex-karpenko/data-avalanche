@@ -1062,6 +1062,42 @@ mod tests {
         assert_eq!(w.ids("a"), [1]);
     }
 
+    /// A newer owner wrote the table: the evolve of a column the stream added is fenced, the
+    /// worker stops, and nothing of the transaction lands.
+    #[tokio::test]
+    async fn a_newer_owner_stops_the_worker_at_an_evolve() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let end = run_with(&mode("mode: never"), deps(&w), async |h| {
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+            streamed(&h.status, &w).await;
+            w.sink.take_over(&t("a"), 9);
+            w.source.alter(&t("a"), noted());
+            let mut r = row(2, "x");
+            r.0.push(("note".into(), ColumnValue::Text("n".into())));
+            w.source.commit(FakeTxn::new().insert(&t("a"), r));
+            // The status channel closes when the worker ends.
+            let mut st = h.status.clone();
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(10), st.wait_for(|_| false))
+                    .await;
+        })
+        .await;
+        assert!(
+            matches!(
+                end,
+                Err(WorkerError::Fenced {
+                    current_epoch: 9,
+                    ..
+                })
+            ),
+            "{end:?}"
+        );
+        assert_eq!(w.ids("a"), [1]);
+        let content = w.sink.content(&t("a")).unwrap();
+        assert!(content.column_by_name("note").is_none(), "nothing evolved");
+    }
+
     #[tokio::test]
     async fn a_lost_lease_stops_the_worker_before_its_next_commit() {
         let w = World::new(&["a"]);

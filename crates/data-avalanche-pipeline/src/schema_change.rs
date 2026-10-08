@@ -21,6 +21,8 @@ pub(crate) struct Evolver<'a> {
     pub source: &'a dyn SourceConnector,
     pub sink: &'a dyn Sink,
     pub guard: &'a dyn CommitGuard,
+    /// The lease epoch the sink's evolve is fenced with.
+    pub owner_epoch: u64,
     pub tuning: &'a Tuning,
     pub evolution: bool,
     pub status: &'a watch::Sender<WorkerStatus>,
@@ -85,7 +87,7 @@ impl Evolver<'_> {
             if !self.guard.may_commit() {
                 return Err(WorkerError::LeaseLost);
             }
-            let outcome = self.sink.evolve(table, &delta).await;
+            let outcome = self.sink.evolve(table, &delta, self.owner_epoch).await;
             if attempt > 0 && outcome.is_ok() {
                 self.status.send_modify(|st| st.degraded = None);
             }
@@ -96,6 +98,12 @@ impl Evolver<'_> {
                 }
                 Ok(EvolveOutcome::Unsupported { reason }) => {
                     return Ok(Err(HaltReason::EvolutionUnsupported { detail: reason }));
+                }
+                Ok(EvolveOutcome::Fenced { current_epoch }) => {
+                    return Err(WorkerError::Fenced {
+                        table: table.clone(),
+                        current_epoch,
+                    });
                 }
                 Err(SinkError::Transient { reason }) => {
                     self.status

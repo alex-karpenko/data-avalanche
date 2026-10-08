@@ -14,17 +14,19 @@ use data_avalanche_core::{
 };
 use deltalake::DeltaTable;
 use deltalake::kernel::StructField;
+use deltalake::kernel::transaction::CommitProperties;
 
 use crate::NtzAs;
 use crate::error::{permanent, sink_error};
 use crate::types::{delta_field, hop2_field};
 
-/// Applies `delta` to `table`. The table is returned as it is after the change (unchanged when
-/// nothing was added).
+/// Applies `delta` to `table`, committing with `props` (the caller's fence). The table is
+/// returned as it is after the change (unchanged when nothing was added).
 pub async fn evolve(
     table: DeltaTable,
     delta: &SchemaDelta,
     ntz: NtzAs,
+    props: CommitProperties,
 ) -> Result<(DeltaTable, EvolveOutcome), SinkError> {
     let schema = table.snapshot().map_err(sink_error)?.schema();
     let mut added: Vec<StructField> = Vec::new();
@@ -96,6 +98,7 @@ pub async fn evolve(
         table
             .add_columns()
             .with_fields(added)
+            .with_commit_properties(props)
             .await
             .map_err(sink_error)?
     };
@@ -134,9 +137,14 @@ mod tests {
     }
 
     async fn apply(h: &mut TableHandle, changes: Vec<SchemaChange>) -> EvolveOutcome {
-        let (table, outcome) = evolve(h.table().clone(), &delta(changes), NtzAs::default())
-            .await
-            .unwrap();
+        let (table, outcome) = evolve(
+            h.table().clone(),
+            &delta(changes),
+            NtzAs::default(),
+            CommitProperties::default(),
+        )
+        .await
+        .unwrap();
         h.set_table(table);
         outcome
     }

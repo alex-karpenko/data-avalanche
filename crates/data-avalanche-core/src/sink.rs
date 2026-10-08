@@ -220,6 +220,11 @@ pub enum EvolveOutcome {
     Unsupported {
         reason: String,
     },
+    /// A newer owner has written the table: nothing changed, and this worker must stop the
+    /// pipeline, as after a fenced commit (Clustering §19).
+    Fenced {
+        current_epoch: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -274,10 +279,14 @@ pub trait Sink: Send + Sync {
     async fn table_state(&self, table: &TableRef) -> Result<SinkTableState, SinkError>;
     /// Creates the table when it's absent; a present table is left as it is.
     async fn ensure_table(&self, spec: &TableSpec) -> Result<(), SinkError>;
+    /// Applies a schema delta, idempotently. `owner_epoch` is the writer's lease epoch: a table a
+    /// newer owner has written is [`EvolveOutcome::Fenced`] and changes nothing, so a zombie
+    /// can't alter a table its successor writes (the fence of [`Sink::commit`]).
     async fn evolve(
         &self,
         table: &TableRef,
         delta: &SchemaDelta,
+        owner_epoch: u64,
     ) -> Result<EvolveOutcome, SinkError>;
     /// Commits one change set, in this order:
     /// 1. [`TableChangeSet::validate`] ([`SinkError::InvalidChangeSet`]);

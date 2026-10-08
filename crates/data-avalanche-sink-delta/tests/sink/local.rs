@@ -84,7 +84,7 @@ async fn delta_rs_still_refuses_add_column_under_column_mapping() {
             "integer",
         ))],
     };
-    let err = s.evolve(&items(), &add).await.unwrap_err();
+    let err = s.evolve(&items(), &add, 1).await.unwrap_err();
     assert!(err.to_string().contains("Column mapping"), "{err}");
 }
 

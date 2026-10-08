@@ -337,6 +337,7 @@ impl Sink for DeltaSink {
         &self,
         table: &TableRef,
         delta: &SchemaDelta,
+        owner_epoch: u64,
     ) -> Result<EvolveOutcome, SinkError> {
         let mut guard = self.lock(table).await?;
         let h = guard.as_mut().expect("opened by lock");
@@ -345,8 +346,27 @@ impl Sink for DeltaSink {
                 table: table.clone(),
             });
         }
-        let (t, outcome) =
-            evolve(h.table().clone(), delta, self.config.table.timestamp_ntz_as).await?;
+        let pipeline = &self.config.pipeline_id;
+        if let Some(current) = h.fence_epoch(pipeline).await?.filter(|e| *e > owner_epoch) {
+            return Ok(EvolveOutcome::Fenced {
+                current_epoch: current,
+            });
+        }
+        // The ADD COLUMN carries the fence's `txn` (no position): a commit of a newer owner that
+        // lands after the check above conflicts with it (`ConcurrentTransaction`), and the retry
+        // finds the newer epoch.
+        let txn_version = i64::try_from(owner_epoch)
+            .map_err(|_| permanent(format!("owner epoch {owner_epoch}")))?;
+        let props = CommitProperties::default()
+            .with_application_transaction(Transaction::new(app_id(pipeline), txn_version))
+            .with_metadata(commit_metadata(pipeline, owner_epoch, None));
+        let (t, outcome) = evolve(
+            h.table().clone(),
+            delta,
+            self.config.table.timestamp_ntz_as,
+            props,
+        )
+        .await?;
         h.set_table(t);
         Ok(outcome)
     }
@@ -412,8 +432,8 @@ mod tests {
     use data_avalanche_core::position::Lsn;
 
     use super::*;
-    use crate::TableDefaults;
     use crate::test_support::{change_set, local, marker, orders, spec, upserts};
+    use crate::{NtzAs, TableDefaults};
 
     fn sink(dir: &tempfile::TempDir) -> DeltaSink {
         DeltaSink::new(DeltaSinkConfig {
@@ -464,6 +484,79 @@ mod tests {
         let out = zombie.commit(late.clone(), marker(5, &late)).await.unwrap();
         assert_eq!(out, CommitOutcome::Fenced { current_epoch: 6 });
         assert_eq!(zombie.stats().fenced, 1);
+    }
+
+    fn add_note() -> SchemaDelta {
+        SchemaDelta {
+            table: orders().table().clone(),
+            changes: vec![data_avalanche_core::SchemaChange::AddColumn(
+                data_avalanche_core::ColumnSchema::new(
+                    "note",
+                    data_avalanche_core::ColumnValueType::Text,
+                    "text",
+                ),
+            )],
+        }
+    }
+
+    async fn columns(s: &DeltaSink) -> usize {
+        let state = s.table_state(orders().table()).await.unwrap();
+        state.schema.unwrap().fields().len()
+    }
+
+    #[tokio::test]
+    async fn an_evolve_of_a_table_a_newer_owner_wrote_is_fenced() {
+        let dir = tempfile::tempdir().unwrap();
+        let (zombie, owner) = (sink(&dir), sink(&dir));
+        zombie.ensure_table(&spec(&orders())).await.unwrap();
+        let first = rows(10, &[1]);
+        zombie
+            .commit(first.clone(), marker(5, &first))
+            .await
+            .unwrap();
+        let theirs = rows(20, &[2]);
+        owner
+            .commit(theirs.clone(), marker(6, &theirs))
+            .await
+            .unwrap();
+        let before = columns(&zombie).await;
+        let out = zombie.evolve(orders().table(), &add_note(), 5).await;
+        assert_eq!(out.unwrap(), EvolveOutcome::Fenced { current_epoch: 6 });
+        assert_eq!(columns(&zombie).await, before, "nothing added");
+        let out = owner.evolve(orders().table(), &add_note(), 6).await;
+        assert_eq!(out.unwrap(), EvolveOutcome::Applied);
+        assert_eq!(columns(&owner).await, before + 1);
+    }
+
+    #[tokio::test]
+    async fn an_evolve_that_races_a_newer_owners_commit_fails_and_its_retry_is_fenced() {
+        let dir = tempfile::tempdir().unwrap();
+        let (zombie, owner) = (sink(&dir), sink(&dir));
+        zombie.ensure_table(&spec(&orders())).await.unwrap();
+        let first = rows(10, &[1]);
+        zombie
+            .commit(first.clone(), marker(5, &first))
+            .await
+            .unwrap();
+        // The zombie read the table (and passed the fence) before the new owner's commit.
+        let stale = {
+            let mut guard = zombie.lock(orders().table()).await.unwrap();
+            guard.as_mut().unwrap().table().clone()
+        };
+        let theirs = rows(20, &[2]);
+        owner
+            .commit(theirs.clone(), marker(6, &theirs))
+            .await
+            .unwrap();
+        let props = zombie.props(&marker(5, &first), 5, None);
+        let err = evolve(stale, &add_note(), NtzAs::default(), props)
+            .await
+            .map(|(_, o)| o)
+            .unwrap_err();
+        assert!(err.is_transient(), "{err}");
+        assert!(err.to_string().contains("Concurrent transaction"), "{err}");
+        let out = zombie.evolve(orders().table(), &add_note(), 5).await;
+        assert_eq!(out.unwrap(), EvolveOutcome::Fenced { current_epoch: 6 });
     }
 
     #[tokio::test]
