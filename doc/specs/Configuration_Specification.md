@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-03
+updated: 2026-10-08
 domain: Architecture
 status: Specification (supersedes the Configuration_file_model.md draft)
 tags: [architecture, configuration, spec, validation, multi-sink, iceberg, delta-lake]
@@ -806,6 +806,7 @@ Constraints: all three `null` is an **error** (V-035). `seconds: null` with at l
 #### 9.4.3 `sink.delta` (iff `type = delta`)
 
 Settings apply when the sink **creates** a table; existing tables keep their properties.
+`merge_memory_limit` is the exception: it bounds every MERGE.
 
 | Field | Type | Required | Default | Mutability | Notes |
 |---|---|---|---|---|---|
@@ -813,6 +814,7 @@ Settings apply when the sink **creates** a table; existing tables keep their pro
 | `checkpoint_interval` | integer | no | `10` | PR (new tables) | → `delta.checkpointInterval`. ≥ 1. |
 | `log_retention` | Duration | no | `30d` | PR (new tables) | → `delta.logRetentionDuration`. Expired-log cleanup runs as a post-commit hook (format metadata housekeeping). |
 | `timestamp_ntz_as` | enum `timestamp_ntz`\|`timestamp`\|`string` | no | `timestamp_ntz` | PR (new tables) | Delta type for source `timestamp without time zone` columns (DA-MS-8). `timestamp_ntz`: exact semantics, but the table is created at **reader v3 / writer v7** (`timestampNtz` table feature) — engines without table-feature support cannot read it. `timestamp`: the wall-clock value stored as a UTC instant; keeps the protocol at reader 1 / writer 2, loses the no-time-zone marker. `string`: `YYYY-MM-DD HH:MM:SS.ffffff`. A per-column `tables.column_type_overrides` entry takes precedence. Existing tables keep their column type. V-114. |
+| `merge_memory_limit` | ByteSize \| null | no | `null` | PR | Memory ceiling of one table's MERGE (DataFusion's memory pool). `null` = no ceiling. A MERGE that needs more fails the same way on every replay, so the failure is permanent: the table halts `SINK_REJECTED`, its reason naming this key; raise it, or lower the `flush` bounds, then re-snapshot the table. ≥ 16 MiB when set (V-119). |
 | `table_properties` | map<string,string> | no | `{}` | PR (new tables) | Passthrough of table properties. `delta.*` keys must be on the allow-list (V-093): `delta.dataSkippingNumIndexedCols`, `delta.dataSkippingStatsColumns`, `delta.deletedFileRetentionDuration`, `delta.targetFileSize`, `delta.tuneFileSizesForRewrites`, `delta.checkpoint.writeStatsAsJson`, `delta.checkpoint.writeStatsAsStruct`. Keys without the `delta.` prefix pass through unchanged. |
 | `catalog.type` | enum `none`\|`glue`\|`unity`\|`hive` | no | `none` | PR | Catalog **registration** of Delta tables. v1 implements `none` (path-based tables); other values are reserved (V-088). |
 
@@ -1272,6 +1274,7 @@ errors.
 | V-115 | `sink.iceberg.catalog.type` / `sink.iceberg.catalog.hive` | `hive` → `error`: the pinned iceberg-rust HMS catalog cannot commit (`update_table` is `FeatureUnsupported`; DA-CAT-6). Lifted when a pinned release implements it and the iceberg-capability probe passes against a real HMS. | error | pipeline |
 | V-116 | `sink.iceberg.catalog.rest.auth` | `sigv4` → `error`: the pinned iceberg-rust REST client has no SigV4 signing (DA-CAT-7; upstream #3082/#3092). `none`/`bearer`/`oauth2` unaffected; on AWS use `catalog.glue`. Lifted when a pinned release carries SigV4 and it is probed against the Glue or S3 Tables REST endpoint. | error | pipeline |
 | V-118 | `source.timeouts.snapshot` | ≥ 10s. | error | pipeline |
+| V-119 | `sink.delta.merge_memory_limit` | ≥ 16 MiB when set. | error | pipeline |
 
 ### 13.4 Cross-field / conditional
 
