@@ -21,6 +21,8 @@ pub(crate) enum Kind {
     Permanent,
     /// The write never answers.
     Hang,
+    /// The write lands after this long, and answers.
+    Slow(Duration),
 }
 
 /// A failed write. `lands`: the write goes through, then the error comes back (an unknown
@@ -40,7 +42,7 @@ impl Fault {
                 reason: "injected".into(),
             },
             Kind::Contention => StoreError::Contention { key },
-            Kind::Permanent | Kind::Hang => StoreError::Permanent {
+            Kind::Permanent | Kind::Hang | Kind::Slow(_) => StoreError::Permanent {
                 key,
                 reason: "injected".into(),
             },
@@ -100,6 +102,13 @@ impl ScriptedStore {
             Some(Fault {
                 kind: Kind::Hang, ..
             }) => std::future::pending().await,
+            Some(Fault {
+                kind: Kind::Slow(after),
+                ..
+            }) => {
+                tokio::time::sleep(after).await;
+                write.await
+            }
             Some(f) if f.lands => {
                 write.await?;
                 Err(f.error(key))

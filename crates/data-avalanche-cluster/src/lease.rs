@@ -444,6 +444,60 @@ mod tests {
         }
     }
 
+    /// A slow write proves the lease only from when it was sent: the deadline counts from
+    /// before the write, never from its answer.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_renewal_s_deadline_counts_from_before_the_write() {
+        let store = ScriptedStore::new();
+        let lease = acquired(&leases(&store), "a").await;
+        store.fail_next(Fault {
+            kind: Kind::Slow(Duration::from_secs(3)),
+            lands: true,
+        });
+        store.fail_always(Some(Fault {
+            kind: Kind::Transient,
+            lands: false,
+        }));
+        let (run, _m) = start(&store, lease);
+        advance(8_010).await;
+        assert_eq!(
+            run.guard.state(),
+            RenewState::Held,
+            "sent at 5 s, answered at 8 s"
+        );
+        advance(9_730).await;
+        assert!(run.guard.may_commit());
+        advance(20).await;
+        assert!(!run.guard.may_commit(), "the deadline is 5 s + 12.75 s");
+    }
+
+    /// After a write whose outcome is unknown, the lease read back names another holder: it was
+    /// taken meanwhile, and is lost (never adopted).
+    #[tokio::test(start_paused = true)]
+    async fn a_lease_taken_while_a_renewal_s_outcome_is_unknown_is_lost() {
+        let store = ScriptedStore::new();
+        let ls = leases(&store);
+        let lease = acquired(&ls, "a").await;
+        store.fail_next(Fault {
+            kind: Kind::Contention,
+            lands: false,
+        });
+        let (run, _m) = start(&store, lease);
+        advance(5_010).await;
+        assert_eq!(run.guard.state(), RenewState::Degraded);
+        let seen = ls.observe("p").await.unwrap().unwrap();
+        ls.take_over(&seen, &holder("b"), timing().duration, Utc::now())
+            .await
+            .unwrap();
+        advance(1_000).await;
+        assert_eq!(run.guard.state(), RenewState::Lost);
+        assert!(!run.guard.may_commit());
+        match run.stop().await {
+            RenewEnd::Lost { reason } => assert!(reason.contains("another holder"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_renewal_that_landed_behind_an_error_is_still_held() {
         let store = ScriptedStore::new();
