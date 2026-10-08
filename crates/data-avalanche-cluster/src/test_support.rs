@@ -56,6 +56,8 @@ struct Script {
     next: VecDeque<Fault>,
     /// Every write fails so, once `next` is empty.
     always: Option<Fault>,
+    /// How long every read takes.
+    read_delay: Duration,
 }
 
 /// An in-memory store whose writes (`create`, `update`, `put`) fail as scripted.
@@ -80,6 +82,11 @@ impl ScriptedStore {
 
     pub fn fail_always(&self, fault: Option<Fault>) {
         self.lock().always = fault;
+    }
+
+    /// Every read from now on answers after `delay`.
+    pub fn slow_reads(&self, delay: Duration) {
+        self.lock().read_delay = delay;
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Script> {
@@ -121,6 +128,8 @@ impl ScriptedStore {
 #[async_trait]
 impl VersionedStore for ScriptedStore {
     async fn get(&self, key: &str) -> Result<Option<(Bytes, ObjectVersion)>, StoreError> {
+        let delay = self.lock().read_delay;
+        tokio::time::sleep(delay).await;
         self.inner.get(key).await
     }
 

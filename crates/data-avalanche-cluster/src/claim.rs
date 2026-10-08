@@ -72,6 +72,18 @@ impl Claim {
                     written: sent,
                 });
             }
+            Acquired::HeldBy(seen) if seen.doc.is_held_by(&self.holder) => {
+                // An earlier step's write landed behind its error: the lease is this node's.
+                // It is renewed, so `written` is a send time this step saw (a later one than
+                // the landed write's would let the renewer's first deadline outlast the lease).
+                self.watched = None;
+                let sent = Instant::now();
+                let lease = self.leases.renew(&seen, Utc::now()).await?;
+                return Ok(Claimed::Mine {
+                    lease,
+                    written: sent,
+                });
+            }
             Acquired::HeldBy(seen) => seen,
         };
         // The wait runs from when the version was read, never from before: a renewal that
@@ -261,6 +273,76 @@ mod tests {
             lands: true,
         });
         assert_eq!(epoch(&b.step().await.unwrap()), 2);
+    }
+
+    /// An acquire whose write landed behind an error: the next step finds the lease naming this
+    /// holder, and it is this node's at once (renewed, the epoch unchanged, `written` when the
+    /// renewal was sent), never taken over.
+    #[tokio::test(start_paused = true)]
+    async fn an_acquire_that_landed_behind_an_error_is_this_nodes() {
+        let store = ScriptedStore::new();
+        let mut b = claim(&store, "b");
+        store.fail_next(Fault {
+            kind: Kind::Transient,
+            lands: true,
+        });
+        assert!(b.step().await.is_err());
+        // The renewal is slow: `written` is still when it was sent.
+        store.fail_next(Fault {
+            kind: Kind::Slow(Duration::from_secs(2)),
+            lands: true,
+        });
+        let before = Instant::now();
+        let mine = b.step().await.unwrap();
+        assert_eq!(epoch(&mine), 1);
+        let Claimed::Mine { written, .. } = mine else {
+            unreachable!()
+        };
+        assert_eq!(written, before);
+    }
+
+    /// `written` is taken before the write is sent, whether it acquires or takes over: a slow
+    /// write mustn't move the renewer's first deadline past what the lease allows.
+    #[tokio::test(start_paused = true)]
+    async fn written_is_taken_before_the_write() {
+        let store = ScriptedStore::new();
+        let slow = Fault {
+            kind: Kind::Slow(Duration::from_secs(2)),
+            lands: true,
+        };
+        let mut a = claim(&store, "a");
+        let before = Instant::now();
+        store.fail_next(slow);
+        let Claimed::Mine { written, .. } = a.step().await.unwrap() else {
+            panic!("acquired")
+        };
+        assert_eq!(written, before, "the acquire's write was sent at once");
+        let mut b = claim(&store, "b");
+        b.step().await.unwrap();
+        advance(15_000).await;
+        let before = Instant::now();
+        store.fail_next(slow);
+        let Claimed::Mine { written, .. } = b.step().await.unwrap() else {
+            panic!("taken over")
+        };
+        assert_eq!(written, before, "the takeover's write was sent at once");
+    }
+
+    /// The takeover wait runs from when the holder's lease was read, not from when the read was
+    /// sent: a renewal landing while the read is in flight counts.
+    #[tokio::test(start_paused = true)]
+    async fn the_takeover_wait_runs_from_when_the_read_returned() {
+        let store = ScriptedStore::new();
+        acquired(&leases(&store), "a").await;
+        store.slow_reads(Duration::from_secs(2));
+        let sent = Instant::now();
+        let Claimed::HeldBy { takeover_at, .. } = claim(&store, "b").step().await.unwrap() else {
+            panic!("held by a")
+        };
+        assert_eq!(
+            takeover_at,
+            sent + Duration::from_secs(2) + timing().duration
+        );
     }
 
     #[tokio::test(start_paused = true)]
