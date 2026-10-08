@@ -14643,6 +14643,18 @@ per task, against the `test-infra` services (PostgreSQL 18 and 14, RustFS, Azuri
   the last task the workspace has 921 tests (920 + 1). The review's other notes are parked in
   the SDD ledger.
 
+- **Task 8, the review fix (2026-10-08).** The task review ran two mutations that every test
+  survived: the deadline taken from the renewal's answer instead of from before its write
+  (Review Focus 1: a slow write would extend the guard past what the store granted), and a
+  lease read back after an unknown outcome adopted whatever holder it names (Review Focus 2: a
+  false hold). Two tests now pin them, with a `Kind::Slow` fault in `ScriptedStore`:
+  `a_slow_renewal_s_deadline_counts_from_before_the_write` and
+  `a_lease_taken_while_a_renewal_s_outcome_is_unknown_is_lost`; each fails under its mutation.
+  The code is unchanged. Committed after Task 8's commit as `test(cluster): a slow renewal's
+  deadline counts from before the write; a lease taken while a renewal's outcome is unknown is
+  lost`. The cluster crate has 10 lease tests at Task 8 and 31 tests at the last task; the
+  workspace, 923. The review's other notes are parked in the SDD ledger.
+
 ### After Task 1: the review fix
 
 Change `crates/data-avalanche-sink-delta/src/sink.rs`:
@@ -14957,4 +14969,117 @@ index f6b0afe..f99400a 100644
      /// A lost stream position is replaced only under the lease: `reset_position` recreates the
      /// slot, a write like Phase 0's.
      #[tokio::test]
+```
+
+### After Task 8: the review fix
+
+Change `crates/data-avalanche-cluster/src/lease.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-cluster/src/lease.rs b/crates/data-avalanche-cluster/src/lease.rs
+index 36f1b48..436a7fb 100644
+--- a/crates/data-avalanche-cluster/src/lease.rs
++++ b/crates/data-avalanche-cluster/src/lease.rs
+@@ -444,6 +444,60 @@ mod tests {
+         }
+     }
+ 
++    /// A slow write proves the lease only from when it was sent: the deadline counts from
++    /// before the write, never from its answer.
++    #[tokio::test(start_paused = true)]
++    async fn a_slow_renewal_s_deadline_counts_from_before_the_write() {
++        let store = ScriptedStore::new();
++        let lease = acquired(&leases(&store), "a").await;
++        store.fail_next(Fault {
++            kind: Kind::Slow(Duration::from_secs(3)),
++            lands: true,
++        });
++        store.fail_always(Some(Fault {
++            kind: Kind::Transient,
++            lands: false,
++        }));
++        let (run, _m) = start(&store, lease);
++        advance(8_010).await;
++        assert_eq!(
++            run.guard.state(),
++            RenewState::Held,
++            "sent at 5 s, answered at 8 s"
++        );
++        advance(9_730).await;
++        assert!(run.guard.may_commit());
++        advance(20).await;
++        assert!(!run.guard.may_commit(), "the deadline is 5 s + 12.75 s");
++    }
++
++    /// After a write whose outcome is unknown, the lease read back names another holder: it was
++    /// taken meanwhile, and is lost (never adopted).
++    #[tokio::test(start_paused = true)]
++    async fn a_lease_taken_while_a_renewal_s_outcome_is_unknown_is_lost() {
++        let store = ScriptedStore::new();
++        let ls = leases(&store);
++        let lease = acquired(&ls, "a").await;
++        store.fail_next(Fault {
++            kind: Kind::Contention,
++            lands: false,
++        });
++        let (run, _m) = start(&store, lease);
++        advance(5_010).await;
++        assert_eq!(run.guard.state(), RenewState::Degraded);
++        let seen = ls.observe("p").await.unwrap().unwrap();
++        ls.take_over(&seen, &holder("b"), timing().duration, Utc::now())
++            .await
++            .unwrap();
++        advance(1_000).await;
++        assert_eq!(run.guard.state(), RenewState::Lost);
++        assert!(!run.guard.may_commit());
++        match run.stop().await {
++            RenewEnd::Lost { reason } => assert!(reason.contains("another holder"), "{reason}"),
++            other => panic!("{other:?}"),
++        }
++    }
++
+     #[tokio::test(start_paused = true)]
+     async fn a_renewal_that_landed_behind_an_error_is_still_held() {
+         let store = ScriptedStore::new();
+```
+
+Change `crates/data-avalanche-cluster/src/test_support.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-cluster/src/test_support.rs b/crates/data-avalanche-cluster/src/test_support.rs
+index df03330..18b1981 100644
+--- a/crates/data-avalanche-cluster/src/test_support.rs
++++ b/crates/data-avalanche-cluster/src/test_support.rs
+@@ -21,6 +21,8 @@ pub(crate) enum Kind {
+     Permanent,
+     /// The write never answers.
+     Hang,
++    /// The write lands after this long, and answers.
++    Slow(Duration),
+ }
+ 
+ /// A failed write. `lands`: the write goes through, then the error comes back (an unknown
+@@ -40,7 +42,7 @@ impl Fault {
+                 reason: "injected".into(),
+             },
+             Kind::Contention => StoreError::Contention { key },
+-            Kind::Permanent | Kind::Hang => StoreError::Permanent {
++            Kind::Permanent | Kind::Hang | Kind::Slow(_) => StoreError::Permanent {
+                 key,
+                 reason: "injected".into(),
+             },
+@@ -100,6 +102,13 @@ impl ScriptedStore {
+             Some(Fault {
+                 kind: Kind::Hang, ..
+             }) => std::future::pending().await,
++            Some(Fault {
++                kind: Kind::Slow(after),
++                ..
++            }) => {
++                tokio::time::sleep(after).await;
++                write.await
++            }
+             Some(f) if f.lands => {
+                 write.await?;
+                 Err(f.error(key))
 ```
