@@ -1564,9 +1564,9 @@ source).
 M6b's plan (`doc/v1.0/M6b-single-node-control.md`, in review) put six findings to the owner, who
 answered them on 2026-10-08 (the plan's Q-M6b-9…13). Spec edits approved and applied:
 `Configuration_Specification.md` §9.4.3 and V-119 (`sink.delta.merge_memory_limit`) and the
-`System-Overview.md` Observability catalogue (the exposed sample names). Proposed with the new
-tasks, awaiting approval: `Data-Flow.md` Phase 4 (the guard compares a table's last change), and
-notes in `Configuration_Specification.md` §6.4, §9.2 and §9.2.1.
+`System-Overview.md` Observability catalogue (the exposed sample names); with the new tasks,
+`Data-Flow.md` Phase 4 (the guard compares a table's last change) and notes in
+`Configuration_Specification.md` §6.4, §9.2 and §9.2.1. The plan was approved the same day.
 
 | ID | Change | Evidence |
 |---|---|---|
@@ -1582,4 +1582,4 @@ and a resume rerun an ERROR pipeline, as a process restart would, until M9's res
 
 | ID | Gap | Severity | Surfaced by | Next |
 |---|---|---|---|---|
-| DA-X-12 | 🔄 The position guard compared a change set's end, the flush frontier, so a replay after a crash was rarely skipped: keep-alives and other databases' WAL move the frontier past the table's marker. The whole replay was merged again: correct (the MERGE is idempotent, Data-Flow: "optimization, not correctness"), but at full cost | 🟢 | M6b planning, the crash scenarios (marker `0/409EA098` against a replay ending at `0/409EA1B0`) | M6b Task 21: the set carries its table's last change, which the guard compares; the marker stays the frontier, as Data-Flow's checkpoint rule requires. Measured in scratch: the replay was a third Delta commit before, and is skipped after. Closes when the task lands, with the Data-Flow Phase 4 patch |
+| DA-X-12 | 🔄 The position guard compared a change set's end, the flush frontier, so a replay after a crash was rarely skipped: keep-alives and other databases' WAL move the frontier past the table's marker. The whole replay was merged again: correct (the MERGE is idempotent, Data-Flow: "optimization, not correctness"), but at full cost | 🟢 | M6b planning, the crash scenarios (marker `0/409EA098` against a replay ending at `0/409EA1B0`) | M6b Task 21: the set carries its table's last change, which the guard compares; the marker stays the frontier, as Data-Flow's checkpoint rule requires. Measured in scratch: the replay was a third Delta commit before, and is skipped after. Closes when the task lands (the Data-Flow Phase 4 patch is applied) |
