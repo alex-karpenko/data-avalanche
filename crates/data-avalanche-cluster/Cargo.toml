@@ -12,14 +12,18 @@ workspace = true
 [dependencies]
 chrono.workspace = true
 data-avalanche-config.workspace = true
+data-avalanche-core.workspace = true
 data-avalanche-pipeline.workspace = true
 data-avalanche-state.workspace = true
 data-avalanche-storage.workspace = true
 data-avalanche-telemetry.workspace = true
 tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true
 
 [dev-dependencies]
+arrow-array.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
+data-avalanche-testkit.workspace = true
 object_store.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

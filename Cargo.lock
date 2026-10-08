@@ -1542,16 +1542,20 @@ dependencies = [
 name = "data-avalanche-cluster"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
  "async-trait",
  "bytes",
  "chrono",
  "data-avalanche-config",
+ "data-avalanche-core",
  "data-avalanche-pipeline",
  "data-avalanche-state",
  "data-avalanche-storage",
  "data-avalanche-telemetry",
+ "data-avalanche-testkit",
  "object_store 0.14.2",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
