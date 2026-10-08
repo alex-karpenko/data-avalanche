@@ -388,7 +388,7 @@ error, to accommodate that topology.
 
 | Field | Type | Required | Default | Mutability | Notes |
 |---|---|---|---|---|---|
-| `level` | string | no | `info` | R | `trace`\|`debug`\|`info`\|`warn`\|`error`; per-module granularity allowed (`tracing` EnvFilter syntax, e.g. `info,rustcdc::sink=debug`). Hot-changeable. |
+| `level` | string | no | `info` | R | `trace`\|`debug`\|`info`\|`warn`\|`error`; per-module granularity allowed (`tracing` EnvFilter syntax, e.g. `info,rustcdc::sink=debug`). A bare level of `info` or quieter also caps the Delta libraries: `buoyant_kernel` and `deltalake_core` at `warn`, `deltalake_core::operations::merge` at `error`; a filter that names one of them is taken as written. Hot-changeable. |
 | `format` | enum `json`\|`compact`\|`pretty` | no | `json` | R | Output format on stderr. |
 
 > Note: `System-Overview.md` states log level/format are command-line parameters. This spec
@@ -669,7 +669,7 @@ source:
 | `credentials_file` | path | yes (resolvable) | — | PR | Alternative to `user`/`password` (§4.6): path to JSON `{user, password}`. Mutually exclusive with them (V-065). Rotating the file's contents + reload rotates the DB credentials without a process restart. |
 | `ssl_mode` | enum | no | `require` | PR | `disable`\|`allow`\|`prefer`\|`require`\|`verify-ca`\|`verify-full`. `allow` is **invalid for MySQL** (V-030). |
 | `ssl_cert` / `ssl_key` / `ssl_ca` | PEM/path | no | — | PR | §4.4. |
-| `timeouts.connect` | Duration | no | `10s` | PR | |
+| `timeouts.connect` | Duration | no | `10s` | PR | The whole connection setup: TCP, TLS, startup and authentication. |
 | `timeouts.command` | Duration | no | `30s` | PR | |
 | `timeouts.snapshot` | Duration | no | `6h` | PR | **Per-table** snapshot timeout. At least `10s` (V-118). |
 | `toast_strategy` | enum `carry_forward`\|`re_query` | no | `carry_forward` | PR | **PostgreSQL only.** Handling of unchanged TOAST(out-of-line) columns in UPDATE events: `carry_forward` reuses the last known value; `re_query` re-fetches the row over the control connection. `re_query` on high-volume snapshots may saturate the control pool (V-077 warning). Ignored for MySQL. See `research/Type_Mapping.md`. |
@@ -684,7 +684,7 @@ source:
 | `publication` | string | yes | — | PR | PG publication name. Must be a valid identifier; unique per source DB across pipelines (V-059). Auto-created/maintained by the app. Case-sensitive: the app always quotes it (`MyPub` is the publication `"MyPub"`). |
 | `slot` | string | yes | — | PR | Logical replication slot name. Charset `^[a-z_][a-z0-9_]{0,62}$` (PG constraint); **unique** per source host+db across pipelines (V-058). |
 | `auto_cleanup` | bool | no | `true` | R | Drop the slot & publication when the pipeline is deleted. Teardown-time policy flag only — consulted at deletion/`id`-change, not on the live path, so a change applies in place with no restart. |
-| `heartbeat` | Duration | no | `60s` | R | StandbyStatusUpdate interval; keeps the connection alive and prevents WAL-lag-as-inactivity. |
+| `heartbeat` | Duration | no | `60s` | R | StandbyStatusUpdate interval; keeps the connection alive and prevents WAL-lag-as-inactivity. Also paces the stream watchdog: a stream silent for 3 heartbeats while the heartbeat's reads of the slot fail or find no reader is reconnected (DA-SRC-16). |
 | `slot_management` | enum `managed`\|`require_existing` | no | `managed` | PR | `managed`: create the slot if absent, reuse if present, drop on delete per `auto_cleanup`. `require_existing`: never create (DBA-owned slot; error if absent) and **requires `auto_cleanup: false`** (V-103). `research/Postgres_Slot_and_Publication_Lifecycle.md` §2. |
 | `slot_on_orphan` | enum `halt`\|`adopt_resnapshot` | no | `halt` | R | Slot exists but the pipeline has no state for it. `halt`: refuse to start, naming the slot. `adopt_resnapshot`: take ownership, restart from a fresh consistent point and incrementally re-snapshot all tables. Resume-from-slot without a snapshot is never offered. (Slot-lifecycle doc §1.1; named `slot_on_orphan` because `slot` is the slot-name string.) |
 | `max_wal_lag_bytes` | ByteSize \| null | no | `null` | R | WAL-retention guard (G-22). `data_avalanche_wal_lag_bytes` is always emitted; when set and exceeded the pipeline **halts** to protect the source disk. `null` = alert only. ≥ 64 MiB when set (V-104). |

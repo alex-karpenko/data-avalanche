@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-07
+updated: 2026-10-08
 domain: Architecture
 tags: [architecture, data-flow, pipeline, cdc, iceberg, delta-lake, multi-sink, arrow, snapshot, replication]
 sources: []
@@ -479,8 +479,11 @@ pipeline; lease lost).
 
 **Position guard (optimization, not correctness):** before committing a table, the sink reads that
 table's own `committed_position` marker — an **engine-tagged** value (PG LSN, or **canonical GTID-set**
-string). If `committed_position.covers(flush.position_for_table)` (PG: `≥`; MySQL: GTID **subset**) the
-table is already committed and is skipped. A snapshot change set (a chunk's rows, flagged
+string). If `committed_position.covers(flush.last_change_for_table)` (PG: `≥`; MySQL: GTID **subset**)
+the table is already committed and is skipped. `last_change_for_table` is the commit position of the
+flush's last transaction that wrote the table, not the flush frontier: a replay's flush may read past
+the marker (a keep-alive, another table's transaction) while carrying only transactions the table has.
+A snapshot change set (a chunk's rows, flagged
 `snapshot`) is never skipped: its rows are read now, at a frontier the marker may already cover; the
 fence still applies. A split slice (`split` set) ends at its transaction's
 pinned start, which the stored position equals from the first slice on; a slice is skipped only
