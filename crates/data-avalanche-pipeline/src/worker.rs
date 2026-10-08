@@ -160,8 +160,12 @@ impl PipelineWorker {
                         "the source lost the stream position {position} ({detail}): the stream restarts at a new position and the tables are snapshotted again"
                     );
                     core.update(|st| st.warn(warning));
-                    core.may_write()?;
-                    let from = retry(&core.tuning, || core.source.reset_position()).await?;
+                    let from = write_retry(
+                        &core.tuning,
+                        || core.may_write(),
+                        || core.source.reset_position(),
+                    )
+                    .await?;
                     start(core, Some(from)).await?;
                     attempt = 0;
                     continue;
@@ -206,13 +210,30 @@ async fn drained_while(core: &mut Core, delay: std::time::Duration) -> bool {
 }
 
 /// A source call, retried while it fails transiently.
-async fn retry<T, F, Fut>(tuning: &Tuning, mut call: F) -> Result<T, WorkerError>
+async fn retry<T, F, Fut>(tuning: &Tuning, call: F) -> Result<T, WorkerError>
 where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, SourceError>>,
+{
+    write_retry(tuning, || Ok(()), call).await
+}
+
+/// A source write, retried while it fails transiently: `may_write` (`Core::may_write`) is asked
+/// before every try, as the writer asks before each commit, so a lease that lapses during the
+/// retries stops the write.
+async fn write_retry<T, G, F, Fut>(
+    tuning: &Tuning,
+    may_write: G,
+    mut call: F,
+) -> Result<T, WorkerError>
+where
+    G: Fn() -> Result<(), WorkerError>,
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, SourceError>>,
 {
     let mut attempt = 0;
     loop {
+        may_write()?;
         match call().await {
             Ok(v) => return Ok(v),
             Err(e) if e.is_transient() => {
@@ -224,20 +245,27 @@ where
     }
 }
 
-/// A sink call, retried while it fails transiently.
-async fn sink_retry<T, F, Fut>(tuning: &Tuning, mut call: F) -> Result<T, SinkError>
+/// A sink call, retried while it fails transiently. A write passes `Core::may_write` as
+/// `may_write`, asked before every try (as in [`write_retry`]); a read passes `|| Ok(())`.
+async fn sink_retry<T, G, F, Fut>(
+    tuning: &Tuning,
+    may_write: G,
+    mut call: F,
+) -> Result<T, WorkerError>
 where
+    G: Fn() -> Result<(), WorkerError>,
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, SinkError>>,
 {
     let mut attempt = 0;
     loop {
+        may_write()?;
         match call().await {
             Err(e) if e.is_transient() => {
                 tokio::time::sleep(tuning.sink_backoff.delay(attempt)).await;
                 attempt += 1;
             }
-            r => return r,
+            r => return r.map_err(WorkerError::Sink),
         }
     }
 }
@@ -386,8 +414,12 @@ pub(crate) async fn start(
             }
             let refs: Vec<TableRef> = resolved_tables.keys().cloned().collect();
             // `prepare` may create, recreate or advance the slot.
-            core.may_write()?;
-            let prepared = retry(&tuning, || source.prepare(checkpoint.as_ref(), &refs)).await?;
+            let prepared = write_retry(
+                &tuning,
+                || core.may_write(),
+                || source.prepare(checkpoint.as_ref(), &refs),
+            )
+            .await?;
             warnings.extend(prepared.warnings);
             match prepared.plan {
                 StartPlan::Resume => {
@@ -434,9 +466,7 @@ pub(crate) async fn start(
             tracked.insert(table.clone());
             continue;
         }
-        let state = sink_retry(&tuning, || sink.table_state(table))
-            .await
-            .map_err(WorkerError::Sink)?;
+        let state = sink_retry(&tuning, || Ok(()), || sink.table_state(table)).await?;
         let doc = core.docs.table_snapshot(table).await?.map(|v| v.doc);
         let in_progress = doc
             .as_ref()
@@ -521,15 +551,14 @@ pub(crate) async fn start(
             _ => {}
         }
         if !state.exists {
-            core.may_write()?;
-            match sink_retry(&tuning, || sink.ensure_table(&spec)).await {
+            match sink_retry(&tuning, || core.may_write(), || sink.ensure_table(&spec)).await {
                 Ok(()) => {}
-                Err(SinkError::Permanent { reason }) => {
+                Err(WorkerError::Sink(SinkError::Permanent { reason })) => {
                     halts.push((table.clone(), HaltReason::SinkRejected { detail: reason }));
                     tracked.insert(table.clone());
                     continue;
                 }
-                Err(e) => return Err(WorkerError::Sink(e)),
+                Err(e) => return Err(e),
             }
         }
         if !tracked_before || matches!(plan, Plan::Fresh(_)) {
@@ -622,7 +651,7 @@ pub(crate) async fn start(
 mod tests {
     use data_avalanche_core::position::Lsn;
     use data_avalanche_core::{ColumnSchema, ColumnValue, ColumnValueType as V, Row};
-    use data_avalanche_testkit::{FakeTxn, Method};
+    use data_avalanche_testkit::{FakeTxn, Method, SinkOp};
 
     use super::*;
     use crate::test_support::{Countdown, CrashAt, World, Yaml, fast, row, t, wait_until};
@@ -1242,6 +1271,40 @@ mod tests {
             let (end, _) = run(&w, &p, async |status| streamed(&status, &w).await).await;
             assert_eq!(end.unwrap(), Exit::Drained, "{n}");
             assert_eq!(w.ids("a"), [1, 2, 3], "{n}");
+        }
+    }
+
+    /// A write retried while it fails transiently asks the guard before every try, as the writer
+    /// does: the lease lapsing between two tries of `prepare` (the third write) or `ensure_table`
+    /// (the fourth) stops it there, and the write never lands.
+    #[tokio::test]
+    async fn a_lease_lost_while_a_write_is_retried_stops_the_retry() {
+        for n in [3, 4] {
+            let w = World::new(&["a"]);
+            w.source.load(&t("a"), rows(1..=3));
+            if n == 3 {
+                for _ in 0..3 {
+                    w.source
+                        .fail(Method::Prepare, SourceError::Transient("down".into()));
+                }
+            } else {
+                w.sink
+                    .fail(SinkOp::EnsureTable, None, 3, || SinkError::Transient {
+                        reason: "down".into(),
+                    });
+            }
+            let mut d = deps(&w);
+            d.guard = Arc::new(Countdown(AtomicUsize::new(n)));
+            let (worker, _handle) = PipelineWorker::new(&mode("mode: initial"), d, fast());
+            let end = tokio::time::timeout(Duration::from_secs(5), worker.run())
+                .await
+                .expect("the lease lapses within Phase 0");
+            assert!(matches!(end, Err(WorkerError::LeaseLost)), "{n}: {end:?}");
+            assert_eq!(
+                phase_0_writes(&w).await,
+                n - 1,
+                "{n}: the retried write never landed"
+            );
         }
     }
 

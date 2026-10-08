@@ -108,7 +108,9 @@ impl WorkerError {
                 StoreError::Transient { .. } | StoreError::Contention { .. },
             ))
             | Self::Contended { .. } => Recovery::Retry,
-            Self::Source(e) if e.is_transient() => Recovery::Retry,
+            Self::Source(e) if e.is_transient() || matches!(e, SourceError::Contended(_)) => {
+                Recovery::Retry
+            }
             Self::Sink(e) if e.is_transient() => Recovery::Retry,
             Self::Fenced { .. } | Self::LeaseLost => Recovery::Lease,
             Self::Refused(_)
@@ -177,6 +179,11 @@ mod tests {
             ),
             (
                 WorkerError::Source(SourceError::Transient("reset".into())),
+                Recovery::Retry,
+            ),
+            // Phase 0's `prepare` met the slot active for another PID.
+            (
+                WorkerError::Source(SourceError::Contended("slot active".into())),
                 Recovery::Retry,
             ),
             (
