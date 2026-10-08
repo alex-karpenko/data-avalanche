@@ -335,7 +335,7 @@ impl Session<'_> {
     /// the buffer is full, none for a table an in-flight transaction writes. A table's wait for
     /// such writers warns once, naming them (final review I3); it ends once the table may be read.
     pub(super) fn issue_reads(&mut self) {
-        if !self.queued.is_empty() {
+        if !self.queued.is_empty() || self.core.pause {
             return;
         }
         let now = Instant::now();
@@ -654,7 +654,7 @@ mod tests {
     use super::*;
     use crate::session::Core;
     use crate::test_support::{World, Yaml, row, t, wait_until};
-    use crate::{Backoff, Command, Exit, Hooks, ReconcileLog, WorkerStatus};
+    use crate::{Backoff, Command, Exit, Hooks, Phase, ReconcileLog, WorkerStatus};
 
     fn chunks_of(n: u64) -> Pipeline {
         let tables = format!("\n      snapshots: {{ chunk_size: {n} }}");
@@ -686,6 +686,37 @@ mod tests {
         let (end, ()) = tokio::join!(s.run(), driver);
         let last = status.borrow().clone();
         (end.unwrap(), last)
+    }
+
+    /// A pause holds a running snapshot: no chunk is read, and its time doesn't count against
+    /// `timeouts.snapshot` (the clock moves on by the time spent paused).
+    #[tokio::test]
+    async fn a_pause_stops_the_snapshot_and_its_clock() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.source.load(&t("a"), rows(1..=5));
+        w.request(&["a"]).await;
+        let (mut core, control, status) = w.core(&chunks_of(2), &["a"]);
+        core.pause = true;
+        let opened = Instant::now();
+        let s = Session::open(&mut core).await.unwrap().unwrap();
+        let driver = async {
+            wait_until("parked", || status.borrow().phase == Phase::Paused).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(w.source.reads(&t("a")), 0, "no chunk is read while paused");
+            control.send(Command::Resume).await.unwrap();
+            snapshot_done(&w, &status, "a").await;
+            control.send(Command::Drain).await.unwrap();
+        };
+        let (end, ()) = tokio::join!(s.run(), driver);
+        assert!(matches!(end.unwrap(), End::Exit(Exit::Drained)));
+        assert_eq!(w.ids("a"), [1, 2, 3, 4, 5]);
+        let started = core.snapshot_started[&t("a")];
+        assert!(
+            started.duration_since(opened) >= Duration::from_millis(200),
+            "the pause is added back: {:?}",
+            started.duration_since(opened)
+        );
     }
 
     async fn snapshot_done(w: &World, status: &watch::Receiver<WorkerStatus>, table: &str) {

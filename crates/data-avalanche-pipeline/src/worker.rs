@@ -109,6 +109,7 @@ impl PipelineWorker {
             wal_lag_failing: Streak::default(),
             writers_waited: BTreeSet::new(),
             read_failing: BTreeMap::new(),
+            pause: false,
         };
         (Self { core }, WorkerHandle { control, status })
     }
@@ -193,6 +194,9 @@ async fn drained_while(core: &mut Core, delay: std::time::Duration) -> bool {
             () = &mut sleep => return false,
             cmd = core.control.recv() => match cmd {
                 Some(Command::Flush) => {}
+                // The next session parks (or reads) as it opens.
+                Some(Command::Pause) => core.pause = true,
+                Some(Command::Resume) => core.pause = false,
                 Some(Command::Drain) | None => return true,
             },
         }
@@ -609,8 +613,9 @@ mod tests {
     use data_avalanche_testkit::{FakeTxn, Method};
 
     use super::*;
-    use crate::HookPoint;
     use crate::test_support::{CrashAt, World, Yaml, fast, row, t, wait_until};
+    use crate::{Backoff, HookPoint};
+    use std::time::Duration;
 
     fn rows(ids: std::ops::RangeInclusive<i64>) -> Vec<Row> {
         ids.map(|id| row(id, "x")).collect()
@@ -842,6 +847,44 @@ mod tests {
         end.unwrap();
         assert_eq!(w.ids("a"), [1, 2]);
         assert_eq!(w.source.opened().len(), 2);
+    }
+
+    /// A pause that arrives between sessions (the reconnect's backoff) holds the next session as
+    /// it opens; a resume reads again.
+    #[tokio::test]
+    async fn a_pause_during_a_reconnect_parks_the_next_session() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let tuning = Tuning {
+            source_backoff: Backoff {
+                first: Duration::from_millis(300),
+                max: Duration::from_millis(300),
+            },
+            ..fast()
+        };
+        let (worker, handle) = PipelineWorker::new(&mode("mode: never"), deps(&w), tuning);
+        let driver = async {
+            w.source
+                .fail(Method::Next, SourceError::Transient("reset".into()));
+            wait_until("reconnecting", || {
+                matches!(handle.status.borrow().phase, Phase::Reconnecting { .. })
+            })
+            .await;
+            handle.control.send(Command::Pause).await.unwrap();
+            wait_until("the next session parks", || {
+                handle.status.borrow().phase == Phase::Paused
+            })
+            .await;
+            assert_eq!(w.source.opened().len(), 2, "a new session, parked");
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(w.ids("a").is_empty(), "nothing is read while paused");
+            handle.control.send(Command::Resume).await.unwrap();
+            wait_until("the row lands", || w.ids("a") == [1]).await;
+            handle.control.send(Command::Drain).await.unwrap();
+        };
+        let (end, ()) = tokio::join!(worker.run(), driver);
+        assert!(matches!(end, Ok(Exit::Drained)), "{end:?}");
     }
 
     #[tokio::test]

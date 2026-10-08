@@ -99,6 +99,27 @@ pub fn pipeline_with(
     sink: &str,
     more: &str,
 ) -> Pipeline {
+    load_pipeline(&pipeline_yaml(n, include, snapshots, source, sink, more))
+}
+
+/// [`pipeline`] (mode `never`), connecting as `user` (password the same as the name).
+pub fn pipeline_as(n: &Names, include: &[&str], user: &str) -> Pipeline {
+    let yaml = pipeline_yaml(n, include, "mode: never", "", "", "").replace(
+        "user: avalanche\n      password: avalanche",
+        &format!("user: {user}\n      password: {user}"),
+    );
+    assert!(yaml.contains(&format!("user: {user}")), "{yaml}");
+    load_pipeline(&yaml)
+}
+
+fn pipeline_yaml(
+    n: &Names,
+    include: &[&str],
+    snapshots: &str,
+    source: &str,
+    sink: &str,
+    more: &str,
+) -> String {
     let include: Vec<String> = include
         .iter()
         .map(|i| format!("{}.{i}", n.schema))
@@ -129,17 +150,17 @@ pipelines:
         slot = n.slot,
         include = include.join(", "),
     );
-    load_str(
-        &yaml,
-        &BTreeMap::new(),
-        &FingerprintKey::from_bytes([1; 32]),
-    )
-    .unwrap_or_else(|r| panic!("test pipeline: {r:?}"))
-    .config
-    .pipelines
-    .into_values()
-    .next()
-    .expect("one pipeline")
+    yaml
+}
+
+fn load_pipeline(yaml: &str) -> Pipeline {
+    load_str(yaml, &BTreeMap::new(), &FingerprintKey::from_bytes([1; 32]))
+        .unwrap_or_else(|r| panic!("test pipeline: {r:?}"))
+        .config
+        .pipelines
+        .into_values()
+        .next()
+        .expect("one pipeline")
 }
 
 /// The sink and the state documents a pipeline keeps across its runs.

@@ -411,6 +411,7 @@ impl World {
             wal_lag_failing: Streak::default(),
             writers_waited: BTreeSet::new(),
             read_failing: BTreeMap::new(),
+            pause: false,
         };
         (core, control, status_rx)
     }

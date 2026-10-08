@@ -78,6 +78,10 @@ pub(crate) struct Core {
     /// The tables whose chunk reads are failing, a streak each. Like `requery_failing` it outlives
     /// a session.
     pub read_failing: BTreeMap<TableRef, Streak>,
+    /// [`Command::Pause`] is in force: a session finishes its open transaction, makes it durable
+    /// and reads nothing more until [`Command::Resume`]. It outlives a session, so a reconnect
+    /// while paused stays paused.
+    pub pause: bool,
 }
 
 impl Core {
@@ -150,6 +154,8 @@ pub(crate) struct Session<'c> {
     )>,
     snaps: Snapshots,
     draining: bool,
+    /// When this session parked for [`Command::Pause`], with everything it read durable.
+    paused: Option<Instant>,
 }
 
 impl<'c> Session<'c> {
@@ -264,6 +270,7 @@ impl<'c> Session<'c> {
             rescan: None,
             snaps,
             draining: false,
+            paused: None,
         }))
     }
 
@@ -343,7 +350,18 @@ impl<'c> Session<'c> {
                 }
                 return Ok(End::Exit(Exit::Drained));
             }
-            let reading = self.queued.is_empty();
+            if self.core.pause && self.paused.is_none() && !self.acc.in_transaction() {
+                self.flush()?;
+                if let Some(end) = self.until_durable().await? {
+                    return Ok(end);
+                }
+                self.paused = Some(Instant::now());
+                self.core.update(|st| st.phase = Phase::Paused);
+            }
+            // Pausing (the open transaction still to finish) or paused: no chunk is read, no
+            // rescan runs, the snapshot clock stands. Paused: the stream isn't read either.
+            let parked = self.core.pause;
+            let reading = self.queued.is_empty() && self.paused.is_none();
             let need = self.queued.front().map_or(0, |(_, n)| *n);
             let permits = self.permits.clone();
             // Biased: control, the writer's events and the buffer's room first; then the chunk
@@ -361,10 +379,12 @@ impl<'c> Session<'c> {
                         return Ok(end);
                     }
                 }
-                p = permits.acquire_many_owned(need), if !reading => {
+                // Only for a queued job: an empty queue needs no permit, and would make this
+                // arm ready at every poll while paused.
+                p = permits.acquire_many_owned(need), if !self.queued.is_empty() => {
                     self.send_front(p.expect("the semaphore isn't closed"));
                 }
-                read = self.snaps.reads.join_next(), if !self.snaps.reads.is_empty() => {
+                read = self.snaps.reads.join_next(), if !self.snaps.reads.is_empty() && !parked => {
                     // Nothing aborts a read while the loop runs: one that ended without its
                     // chunk panicked, a bug, which ends the worker like the writer's.
                     let read = read.expect("not empty").map_err(|e| {
@@ -376,13 +396,13 @@ impl<'c> Session<'c> {
                 }
                 _ = tick.tick() => {
                     self.due(Instant::now())?;
-                    if let Some(end) = self.snapshot_tick().await? {
+                    if !parked && let Some(end) = self.snapshot_tick().await? {
                         return Ok(end);
                     }
                 }
                 _ = heartbeat.tick() => self.wal_lag().await?,
                 _ = async { rescan.as_mut().expect("guarded").tick().await },
-                    if rescan.is_some() && self.rescan.is_none() =>
+                    if rescan.is_some() && self.rescan.is_none() && !parked =>
                 {
                     if let Some(end) = self.rescan().await? {
                         return Ok(end);
@@ -406,6 +426,23 @@ impl<'c> Session<'c> {
             Some(Command::Drain) | None => {
                 self.draining = true;
                 self.core.update(|st| st.phase = Phase::Draining);
+                Ok(())
+            }
+            Some(Command::Pause) => {
+                self.core.pause = true;
+                Ok(())
+            }
+            Some(Command::Resume) => {
+                self.core.pause = false;
+                if let Some(at) = self.paused.take() {
+                    // The snapshot timeout counts reading time: the pause is added back.
+                    let held = at.elapsed();
+                    for started in self.core.snapshot_started.values_mut() {
+                        *started += held;
+                    }
+                    self.core.update(|st| st.phase = Phase::Streaming);
+                    self.issue_reads();
+                }
                 Ok(())
             }
         }
@@ -1212,6 +1249,110 @@ mod tests {
         .expect("the drain ends");
         assert!(matches!(end.unwrap(), End::Exit(Exit::Drained)));
         assert_eq!(w.ids("a"), [1, 2, 3, 4, 5, 6]);
+    }
+
+    /// A pause arrives with a transaction open (a slice in the sink, the next waiting for room):
+    /// the session finishes the transaction and makes it durable, then reads nothing until it is
+    /// resumed.
+    #[tokio::test]
+    async fn a_pause_finishes_the_open_transaction_then_reads_nothing_until_resumed() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let p = pipeline(
+            "",
+            "flush: { seconds: 0 }, max_transaction_batch_rows: 2, buffer_capacity_rows: 1",
+            "",
+        );
+        let (mut core, control, status) = w.core(&p, &["a"]);
+        let s = Session::open(&mut core).await.unwrap().unwrap();
+        w.sink.hold_commits();
+        let mut txn = FakeTxn::new();
+        for id in 1..=6 {
+            txn = txn.insert(&t("a"), row(id, "x"));
+        }
+        w.source.commit(txn);
+        let first = w.source.wal_end();
+        let driver = async {
+            wait_until("a slice waits in the sink", || {
+                w.sink.waiting_commits() == 1
+            })
+            .await;
+            control.send(Command::Pause).await.unwrap();
+            w.sink.release_commits();
+            wait_until("paused", || status.borrow().phase == Phase::Paused).await;
+            assert_eq!(w.ids("a"), [1, 2, 3, 4, 5, 6], "the transaction is in");
+            assert_eq!(status.borrow().checkpoint.as_ref(), Some(&first));
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(7, "x")));
+            let second = w.source.wal_end();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(
+                status.borrow().read.as_ref(),
+                Some(&first),
+                "nothing is read while paused"
+            );
+            control.send(Command::Resume).await.unwrap();
+            durable(&status, second).await;
+            assert_eq!(status.borrow().phase, Phase::Streaming);
+            control.send(Command::Drain).await.unwrap();
+        };
+        let (end, ()) = tokio::join!(s.run(), driver);
+        assert!(matches!(end.unwrap(), End::Exit(Exit::Drained)));
+        assert_eq!(w.ids("a"), [1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    /// A paused session waits on its timers and nothing else: ten seconds pass on the paused
+    /// clock, which advances only while every task is idle. A session that spins keeps it still,
+    /// and a real two-second watchdog fails the test.
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_session_idles() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let (mut core, control, status) = w.core(&flush_each(), &["a"]);
+        core.pause = true;
+        let s = Session::open(&mut core).await.unwrap().unwrap();
+        let driver = async {
+            wait_until("parked", || status.borrow().phase == Phase::Paused).await;
+            let (spun, spinning) = tokio::sync::oneshot::channel::<()>();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                let _ = spun.send(());
+            });
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(10)) => {}
+                _ = spinning => panic!("the paused session spins: the paused clock stood still"),
+            }
+            control.send(Command::Drain).await.unwrap();
+        };
+        let (end, ()) = tokio::join!(s.run(), driver);
+        assert!(matches!(end.unwrap(), End::Exit(Exit::Drained)));
+    }
+
+    #[tokio::test]
+    async fn a_drain_while_paused_ends_at_once() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let (end, last) = session(&w, &flush_each(), &["a"], async |status| {
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+            let first = w.source.wal_end();
+            durable(&status, first).await;
+        })
+        .await;
+        assert!(matches!(end.unwrap(), End::Exit(Exit::Drained)));
+        let _ = last;
+        let (mut core, control, status) = w.core(&flush_each(), &["a"]);
+        core.pause = true;
+        let s = Session::open(&mut core).await.unwrap().unwrap();
+        let driver = async {
+            wait_until("a session that opens paused parks", || {
+                status.borrow().phase == Phase::Paused
+            })
+            .await;
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(2, "x")));
+            control.send(Command::Drain).await.unwrap();
+        };
+        let (end, ()) = tokio::join!(s.run(), driver);
+        assert!(matches!(end.unwrap(), End::Exit(Exit::Drained)));
+        assert_eq!(w.ids("a"), [1], "the paused session read nothing more");
     }
 
     #[tokio::test]

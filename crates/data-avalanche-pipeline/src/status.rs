@@ -13,10 +13,17 @@ use crate::Backoff;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     /// Finish the open transaction, flush, make it durable, close the stream and end with
-    /// [`Exit::Drained`] (pause, stop and failover hand-off, Pipeline_Lifecycle §4).
+    /// [`Exit::Drained`] (stop and failover hand-off, Pipeline_Lifecycle §2, §4).
     Drain,
     /// Flush now, whatever the flush policy says.
     Flush,
+    /// Finish the open transaction, flush and make it durable, then hold: nothing more is read
+    /// from the stream, no chunk is read, no rescan runs, and the snapshot timeout's clock
+    /// stops. The source connection stays open (warm) and the WAL-lag guard keeps watching
+    /// (Pipeline_Lifecycle §2 `PAUSED`, Q-M6b-1).
+    Pause,
+    /// Read again after a [`Command::Pause`].
+    Resume,
 }
 
 /// How a worker ended without an error.
@@ -38,6 +45,9 @@ pub enum Phase {
         error: String,
     },
     Draining,
+    /// Everything read is durable and nothing more is read until [`Command::Resume`]; the
+    /// source connection stays open.
+    Paused,
 }
 
 /// A running table snapshot.
