@@ -44,9 +44,13 @@ pub(crate) fn local(dir: &tempfile::TempDir) -> DeltaLocation {
 }
 
 pub(crate) async fn handle(dir: &tempfile::TempDir, table: &TableRef) -> TableHandle {
-    TableHandle::open(local(dir).table_url(table).unwrap(), HashMap::new())
-        .await
-        .unwrap()
+    TableHandle::open(
+        table.clone(),
+        local(dir).table_url(table).unwrap(),
+        HashMap::new(),
+    )
+    .await
+    .unwrap()
 }
 
 /// One `orders` row: `ref` is 16 bytes of `id`, `at` is `id` ms, `doc` as given.

@@ -285,3 +285,9 @@ async fn a_crash_after_the_truncate_delete_replays_both() {
         CommitOutcome::SkippedCovered
     );
 }
+
+#[tokio::test]
+async fn a_live_handle_recovers_from_a_table_recreated_past_its_version() {
+    let (_dir, location) = local();
+    scenarios::recreated_past_a_live_handle(location).await;
+}

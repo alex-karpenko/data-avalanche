@@ -205,7 +205,11 @@ pub struct SinkTableState {
     /// lineage columns), plus every column `evolve` added. Soft-dropped columns stay. Not the
     /// sink's physical (Hop 3) types.
     pub schema: Option<SchemaRef>,
-    /// The marker of the latest commit this pipeline made to the table.
+    /// The marker of the latest positioned commit this pipeline made to the table. `None` says
+    /// only that no such commit is found, not that the pipeline never wrote the table: a
+    /// truncate's DELETE carries the fence but no position, so a crash before its MERGE leaves
+    /// an own commit without one, and a walk-back stops at a cleaned-up log. Nothing decides
+    /// "the pipeline never wrote here" from it.
     pub marker: Option<CommitMarker>,
 }
 

@@ -7,11 +7,11 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_row::{RowConverter, SortField};
 use arrow_schema::SchemaRef;
-use data_avalanche_core::{PartitionTransform, SinkError, SourcePosition, TableSpec};
+use data_avalanche_core::{PartitionTransform, SinkError, SourcePosition, TableRef, TableSpec};
 use deltalake::DeltaTable;
 use deltalake::datafusion::prelude::SessionContext;
-use deltalake::logstore::object_store::ObjectStore;
 use deltalake::logstore::object_store::path::Path;
+use deltalake::logstore::object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
 use deltalake::protocol::SaveMode;
 use futures_util::TryStreamExt;
 use url::Url;
@@ -27,12 +27,24 @@ use crate::types::{column_logical, delta_field, hop2_schema, physical_type};
 pub const IDENTIFIER_KEY: &str = "data-avalanche.identifier";
 
 pub(crate) struct TableHandle {
+    /// The source table this Delta table mirrors.
+    name: TableRef,
     table: DeltaTable,
     /// The storage options the table was opened with, to re-open it from scratch.
     options: HashMap<String, String>,
     /// The newest commit of this pipeline the handle knows. The walk-back stops there, so a
     /// steady stream of own commits costs no reads.
     known: Option<Known>,
+    /// A commit file of the log the handle loaded, as the store described it then. A table
+    /// dropped and re-created behind the handle holds another file there, or none (Q-M6b-8).
+    seen: Option<Seen>,
+}
+
+/// One commit file's identity in the store: its e-tag, size and modification time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Seen {
+    version: u64,
+    meta: ObjectMeta,
 }
 
 /// An own commit the handle knows: the table it went to (`metaData.id`, new for a table dropped
@@ -47,6 +59,7 @@ struct Known {
 impl std::fmt::Debug for TableHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TableHandle")
+            .field("name", &self.name)
             .field("url", self.table.table_url())
             .field("version", &self.table.version())
             .field("known", &self.known)
@@ -55,9 +68,13 @@ impl std::fmt::Debug for TableHandle {
 }
 
 impl TableHandle {
-    /// A handle on `url`; nothing is read yet. A local root is created first: delta-rs refuses a
-    /// `file://` location that doesn't exist.
-    pub async fn open(url: Url, options: HashMap<String, String>) -> Result<Self, SinkError> {
+    /// A handle on `url`, where `name` is mirrored; the table is loaded when it exists. A local
+    /// root is created first: delta-rs refuses a `file://` location that doesn't exist.
+    pub async fn open(
+        name: TableRef,
+        url: Url,
+        options: HashMap<String, String>,
+    ) -> Result<Self, SinkError> {
         if let Ok(path) = url.to_file_path() {
             std::fs::create_dir_all(&path)
                 .map_err(|e| permanent(format!("{}: {e}", path.display())))?;
@@ -65,11 +82,45 @@ impl TableHandle {
         let table = DeltaTable::try_from_url_with_storage_options(url, options.clone())
             .await
             .map_err(sink_error)?;
-        Ok(Self {
+        let mut handle = Self {
+            name,
             table,
             options,
             known: None,
-        })
+            seen: None,
+        };
+        handle.see().await?;
+        Ok(handle)
+    }
+
+    /// The store's description of the commit file at `version`; `None` when it's gone.
+    async fn describe(&self, version: u64) -> Result<Option<Seen>, SinkError> {
+        let store = self.table.log_store().object_store(None);
+        let path = Path::from(format!("_delta_log/{version:020}.json"));
+        match store.head(&path).await {
+            Ok(meta) => Ok(Some(Seen { version, meta })),
+            Err(deltalake::logstore::object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(sink_error(e.into())),
+        }
+    }
+
+    /// Records the loaded version's commit file, when nothing is recorded yet.
+    async fn see(&mut self) -> Result<(), SinkError> {
+        if self.seen.is_none()
+            && let Some(version) = self.table.version()
+        {
+            self.seen = self.describe(version).await?;
+        }
+        Ok(())
+    }
+
+    /// True while the recorded commit file is still the one the handle loaded: the log is the
+    /// same log. One HEAD per call.
+    async fn same_log(&self) -> Result<bool, SinkError> {
+        match &self.seen {
+            None => Ok(true),
+            Some(seen) => Ok(self.describe(seen.version).await?.as_ref() == Some(seen)),
+        }
     }
 
     pub fn table(&self) -> &DeltaTable {
@@ -84,15 +135,20 @@ impl TableHandle {
     /// Loads the newest version; `false` when the location holds no Delta table.
     ///
     /// A table dropped (and maybe re-created) behind the handle is another table: what the handle
-    /// knew of the old one is forgotten. When the loaded snapshot can't be brought forward (its
-    /// log is gone), the table is re-opened from scratch once.
+    /// knew of the old one is forgotten, and it is re-opened from scratch. That shows as a
+    /// recorded commit file the store now describes otherwise, or as a loaded snapshot that
+    /// can't be brought forward (its log is gone). Brought forward over a re-created table's
+    /// longer log, the old snapshot would hold the old table's files and miss the new one's
+    /// (Q-M6b-8).
     pub async fn refresh(&mut self) -> Result<bool, SinkError> {
         let log = self.table.log_store();
         if !log.is_delta_table_location().await.map_err(sink_error)? {
             self.known = None;
+            self.seen = None;
             return Ok(false);
         }
-        if self.table.update_incremental(None).await.is_ok() {
+        if self.same_log().await? && self.table.update_incremental(None).await.is_ok() {
+            self.see().await?;
             return Ok(true);
         }
         self.reopen().await
@@ -101,14 +157,8 @@ impl TableHandle {
     /// Re-opens the table from scratch (a fresh handle on the same URL and options, loaded) and
     /// forgets the known commit; `false` when the location holds no Delta table any more.
     async fn reopen(&mut self) -> Result<bool, SinkError> {
-        self.known = None;
-        let fresh = DeltaTable::try_from_url_with_storage_options(
-            self.table.table_url().clone(),
-            self.options.clone(),
-        )
-        .await
-        .map_err(sink_error)?;
-        self.table = fresh;
+        let url = self.table.table_url().clone();
+        *self = Self::open(self.name.clone(), url, self.options.clone()).await?;
         Ok(self.table.version().is_some())
     }
 
@@ -203,7 +253,8 @@ impl TableHandle {
                 self.table = table;
                 // A new table holds no own commit.
                 self.known = None;
-                Ok(())
+                self.seen = None;
+                self.see().await
             }
             // Another writer created it between the check and the commit.
             Err(e) => match self.refresh().await {
@@ -241,7 +292,12 @@ impl TableHandle {
         let version = match self.txn_version(pipeline_id).await {
             Ok(v) => v,
             Err(_) => {
-                self.reopen().await?;
+                // Dropped since the refresh: no table, not a delta-rs `NotATable` (`Permanent`).
+                if !self.reopen().await? {
+                    return Err(SinkError::NoTable {
+                        table: self.name.clone(),
+                    });
+                }
                 self.txn_version(pipeline_id).await?
             }
         };
@@ -561,6 +617,40 @@ mod tests {
         std::fs::write(meta.join("00001-abc.metadata.json"), "{}").unwrap();
         let found = h.foreign_format().await.unwrap().unwrap();
         assert!(found.contains("Iceberg"), "{found}");
+    }
+
+    /// The table is dropped after the handle's last refresh: the fence's read fails, the re-open
+    /// finds nothing, and the table is missing (`NoTable`), not a `Permanent` delta-rs error.
+    #[tokio::test]
+    async fn a_table_dropped_since_the_refresh_is_no_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = created(&dir, &TableDefaults::default()).await;
+        own_append(&mut h, &[1], 4, 0x10).await;
+        std::fs::remove_dir_all(dir.path().join("public/orders")).unwrap();
+        let err = h.fence_epoch("p").await.unwrap_err();
+        assert!(
+            matches!(err, SinkError::NoTable { ref table } if table == &t()),
+            "{err}"
+        );
+    }
+
+    /// The handle notices a log that isn't the one it loaded, by the commit file it recorded.
+    #[tokio::test]
+    async fn a_refresh_reopens_a_table_whose_log_was_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = created(&dir, &TableDefaults::default()).await;
+        own_append(&mut h, &[1], 4, 0x10).await;
+        assert!(h.refresh().await.unwrap());
+        assert!(h.same_log().await.unwrap());
+        std::fs::remove_dir_all(dir.path().join("public/orders")).unwrap();
+        let mut other = created(&dir, &TableDefaults::default()).await;
+        for id in 2..=4 {
+            own_append(&mut other, &[id], 1, 0x100).await;
+        }
+        assert!(!h.same_log().await.unwrap());
+        assert!(h.refresh().await.unwrap());
+        assert_eq!(h.version(), other.version());
+        assert!(h.same_log().await.unwrap());
     }
 
     #[tokio::test]

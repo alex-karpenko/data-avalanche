@@ -28,6 +28,7 @@ async fn run_all(location: impl Fn(String) -> DeltaLocation, prefix: &str) {
     scenarios::fence_and_guard_survive_a_foreign_optimize(at("fence")).await;
     scenarios::truncate_then_rows(at("truncate")).await;
     scenarios::evolution(at("evolution")).await;
+    scenarios::recreated_past_a_live_handle(at("recreated")).await;
     scenarios::masks_and_empty_sets(at("masks")).await;
     scenarios::escaped_names(at("escaped"), scenarios::odd_names()).await;
 }

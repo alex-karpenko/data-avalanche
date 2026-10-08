@@ -147,20 +147,36 @@ impl DeltaSink {
         let mut guard = slot.lock_owned().await;
         if guard.is_none() {
             let url = self.config.location.table_url(table)?;
-            *guard = Some(TableHandle::open(url, self.options.clone()).await?);
+            *guard = Some(TableHandle::open(table.clone(), url, self.options.clone()).await?);
         }
         Ok(guard)
+    }
+
+    /// Runs `f` on the table's handle. A `Transient` failure drops the handle, so the next call
+    /// opens the table afresh: a handle delta-rs can't bring forward recovers without a restart.
+    async fn with_table<T>(
+        &self,
+        table: &TableRef,
+        f: impl AsyncFnOnce(&mut TableHandle) -> Result<T, SinkError>,
+    ) -> Result<T, SinkError> {
+        let mut guard = self.lock(table).await?;
+        let out = f(guard.as_mut().expect("opened by lock")).await;
+        if matches!(out, Err(SinkError::Transient { .. })) {
+            *guard = None;
+        }
+        out
     }
 
     /// The table's rows in Hop 2 terms and identifier order (every column, lineage included);
     /// `None` when the table doesn't exist. The Delta counterpart of `MemorySink::content`.
     pub async fn content(&self, table: &TableRef) -> Result<Option<RecordBatch>, SinkError> {
-        let mut guard = self.lock(table).await?;
-        let h = guard.as_mut().expect("opened by lock");
-        if !h.refresh().await? {
-            return Ok(None);
-        }
-        h.content().await.map(Some)
+        self.with_table(table, async |h| {
+            if !h.refresh().await? {
+                return Ok(None);
+            }
+            h.content().await.map(Some)
+        })
+        .await
     }
 
     /// One write's commit properties: the fence's `txn` (the owner epoch as the `i64` version
@@ -293,44 +309,46 @@ impl Sink for DeltaSink {
     }
 
     async fn table_state(&self, table: &TableRef) -> Result<SinkTableState, SinkError> {
-        let mut guard = self.lock(table).await?;
-        let h = guard.as_mut().expect("opened by lock");
-        if !h.refresh().await? {
-            if let Some(reason) = h.foreign_format().await? {
-                return Err(permanent(reason));
+        self.with_table(table, async |h| {
+            if !h.refresh().await? {
+                if let Some(reason) = h.foreign_format().await? {
+                    return Err(permanent(reason));
+                }
+                return Ok(SinkTableState {
+                    exists: false,
+                    schema: None,
+                    marker: None,
+                });
             }
-            return Ok(SinkTableState {
-                exists: false,
-                schema: None,
-                marker: None,
-            });
-        }
-        let pipeline = &self.config.pipeline_id;
-        let epoch = h.fence_epoch(pipeline).await?;
-        let position = h.stored_position(pipeline).await?;
-        Ok(SinkTableState {
-            exists: true,
-            schema: Some(h.schema()?),
-            marker: epoch
-                .zip(position)
-                .map(|(owner_epoch, committed_position)| CommitMarker {
-                    owner_epoch,
-                    committed_position,
-                    pipeline_id: pipeline.clone(),
-                }),
+            let pipeline = &self.config.pipeline_id;
+            let epoch = h.fence_epoch(pipeline).await?;
+            let position = h.stored_position(pipeline).await?;
+            Ok(SinkTableState {
+                exists: true,
+                schema: Some(h.schema()?),
+                marker: epoch
+                    .zip(position)
+                    .map(|(owner_epoch, committed_position)| CommitMarker {
+                        owner_epoch,
+                        committed_position,
+                        pipeline_id: pipeline.clone(),
+                    }),
+            })
         })
+        .await
     }
 
     async fn ensure_table(&self, spec: &TableSpec) -> Result<(), SinkError> {
-        let mut guard = self.lock(&spec.table).await?;
-        let h = guard.as_mut().expect("opened by lock");
-        if h.refresh().await? {
-            return Ok(());
-        }
-        if let Some(reason) = h.foreign_format().await? {
-            return Err(permanent(reason));
-        }
-        h.create(spec, &self.config.table).await
+        self.with_table(&spec.table, async |h| {
+            if h.refresh().await? {
+                return Ok(());
+            }
+            if let Some(reason) = h.foreign_format().await? {
+                return Err(permanent(reason));
+            }
+            h.create(spec, &self.config.table).await
+        })
+        .await
     }
 
     async fn evolve(
@@ -339,33 +357,34 @@ impl Sink for DeltaSink {
         delta: &SchemaDelta,
         owner_epoch: u64,
     ) -> Result<EvolveOutcome, SinkError> {
-        let mut guard = self.lock(table).await?;
-        let h = guard.as_mut().expect("opened by lock");
-        if !h.refresh().await? {
-            return Err(SinkError::NoTable {
-                table: table.clone(),
-            });
-        }
-        let pipeline = &self.config.pipeline_id;
-        if let Some(current) = h.fence_epoch(pipeline).await?.filter(|e| *e > owner_epoch) {
-            return Ok(EvolveOutcome::Fenced {
-                current_epoch: current,
-            });
-        }
-        // The ADD COLUMN carries the fence's `txn` (no position): a commit of a newer owner that
-        // lands after the check above conflicts with it (`ConcurrentTransaction`), and the retry
-        // finds the newer epoch.
-        let txn_version = i64::try_from(owner_epoch)
-            .map_err(|_| permanent(format!("owner epoch {owner_epoch}")))?;
-        let (t, outcome) = evolve(
-            h.table().clone(),
-            delta,
-            self.config.table.timestamp_ntz_as,
-            self.props(owner_epoch, txn_version, None),
-        )
-        .await?;
-        h.set_table(t);
-        Ok(outcome)
+        self.with_table(table, async |h| {
+            if !h.refresh().await? {
+                return Err(SinkError::NoTable {
+                    table: table.clone(),
+                });
+            }
+            let pipeline = &self.config.pipeline_id;
+            if let Some(current) = h.fence_epoch(pipeline).await?.filter(|e| *e > owner_epoch) {
+                return Ok(EvolveOutcome::Fenced {
+                    current_epoch: current,
+                });
+            }
+            // The ADD COLUMN carries the fence's `txn` (no position): a commit of a newer owner
+            // that lands after the check above conflicts with it (`ConcurrentTransaction`), and
+            // the retry finds the newer epoch.
+            let txn_version = i64::try_from(owner_epoch)
+                .map_err(|_| permanent(format!("owner epoch {owner_epoch}")))?;
+            let (t, outcome) = evolve(
+                h.table().clone(),
+                delta,
+                self.config.table.timestamp_ntz_as,
+                self.props(owner_epoch, txn_version, None),
+            )
+            .await?;
+            h.set_table(t);
+            Ok(outcome)
+        })
+        .await
     }
 
     async fn commit(
@@ -399,28 +418,29 @@ impl DeltaSink {
         marker: &CommitMarker,
         refresh: bool,
     ) -> Result<CommitOutcome, SinkError> {
-        let mut guard = self.lock(&cs.table).await?;
-        let h = guard.as_mut().expect("opened by lock");
-        let mut lost = String::new();
-        for attempt in 0..COMMIT_ATTEMPTS {
-            if attempt > 0 {
-                self.count(|s| s.retries += 1);
-            }
-            match self.attempt(h, cs, marker, refresh).await? {
-                Step::Done(outcome) => {
-                    self.count(|s| match outcome {
-                        CommitOutcome::Committed { .. } => s.commits += 1,
-                        CommitOutcome::SkippedCovered => s.skipped += 1,
-                        CommitOutcome::Fenced { .. } => s.fenced += 1,
-                    });
-                    return Ok(outcome);
+        self.with_table(&cs.table, async |h| {
+            let mut lost = String::new();
+            for attempt in 0..COMMIT_ATTEMPTS {
+                if attempt > 0 {
+                    self.count(|s| s.retries += 1);
                 }
-                Step::Retry(reason) => lost = reason,
+                match self.attempt(h, cs, marker, refresh).await? {
+                    Step::Done(outcome) => {
+                        self.count(|s| match outcome {
+                            CommitOutcome::Committed { .. } => s.commits += 1,
+                            CommitOutcome::SkippedCovered => s.skipped += 1,
+                            CommitOutcome::Fenced { .. } => s.fenced += 1,
+                        });
+                        return Ok(outcome);
+                    }
+                    Step::Retry(reason) => lost = reason,
+                }
             }
-        }
-        Err(SinkError::Transient {
-            reason: format!("the commit lost {COMMIT_ATTEMPTS} races in a row, last: {lost}"),
+            Err(SinkError::Transient {
+                reason: format!("the commit lost {COMMIT_ATTEMPTS} races in a row, last: {lost}"),
+            })
         })
+        .await
     }
 }
 
@@ -558,6 +578,33 @@ mod tests {
         assert!(err.to_string().contains("Concurrent transaction"), "{err}");
         let out = zombie.evolve(orders().table(), &add_note(), 5).await;
         assert_eq!(out.unwrap(), EvolveOutcome::Fenced { current_epoch: 6 });
+    }
+
+    /// A call that fails `Transient` drops the table's handle; the next call opens the table
+    /// afresh and lands.
+    #[tokio::test]
+    async fn a_transient_failure_drops_the_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let (s, other) = (sink(&dir), sink(&dir));
+        s.ensure_table(&spec(&orders())).await.unwrap();
+        let first = rows(10, &[1]);
+        s.commit(first.clone(), marker(1, &first)).await.unwrap();
+        let theirs = rows(20, &[2]);
+        other
+            .commit(theirs.clone(), marker(1, &theirs))
+            .await
+            .unwrap();
+        // Without re-reading, every attempt loses its race: `Transient`.
+        let late = rows(30, &[3]);
+        let err = s
+            .attempts(&late, &marker(1, &late), false)
+            .await
+            .unwrap_err();
+        assert!(err.is_transient(), "{err}");
+        let slot = s.tables.lock().unwrap().get(&late.table).cloned().unwrap();
+        assert!(slot.lock().await.is_none(), "the handle is dropped");
+        let out = s.commit(late.clone(), marker(1, &late)).await.unwrap();
+        assert!(matches!(out, CommitOutcome::Committed { .. }), "{out:?}");
     }
 
     #[tokio::test]
