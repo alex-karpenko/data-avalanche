@@ -14690,6 +14690,28 @@ per task, against the `test-infra` services (PostgreSQL 18 and 14, RustFS, Azuri
   workspace has 927 tests; the cluster crate's counts from Task 9 on are 6 higher than their
   Step 4 text shows (the Task 8 and Task 9 fixes' tests).
 
+- **Task 10, the review fix (2026-10-08).** The task review's probes found three faults and
+  two untested requirements:
+  - A drain cut off at `drain_timeout` aborted the worker task, but its writer, a task of its
+    own, went on committing, and the lease was released at once: a commit landed 770 ms after
+    the release (Review Focus 1; Clustering §8.3 says to let the lease expire). The session's
+    writer is now aborted when the session is dropped (`WriterTask`); the controller awaits the
+    aborted worker, and releases the lease only after a clean drain, else lets it expire.
+  - A desired state that couldn't be read when the lease was taken counted as "running", so a
+    stopped or paused pipeline started. It is unknown now, and nothing starts until a read
+    succeeds.
+  - Once in `ERROR` (or dumped) with a retry's time past, the retry's arm was ready at every
+    turn: the controller spun. That arm now waits only while a worker may start.
+  - No test covered the `Lease` recovery or that a stop drains (mapping `Lease` to `Error`, or
+    the drain to an abort, passed every test).
+  Five tests pin them, each failing under its mutation, with a `ScriptedStore::fail_reads`
+  knob. The drain's `Command::Drain` send also moved inside its timeout. Committed after
+  Task 10's commit as `fix(cluster): a cut-off drain ends the worker's writer and leaves the
+  lease to expire; nothing starts on an unread desired state; a past retry never spins; the
+  lease and drain paths are tested`. No later task's code changes; at the last task the
+  workspace has 932 tests, and the cluster crate's counts from Task 10 on are 11 higher than
+  their Step 4 text shows. The review's other notes are parked in the SDD ledger.
+
 ### After Task 1: the review fix
 
 Change `crates/data-avalanche-sink-delta/src/sink.rs`:
@@ -15412,4 +15434,491 @@ index 6c0ef96..12fdddb 100644
      #[tokio::test(start_paused = true)]
      async fn a_takeover_that_failed_is_tried_again_at_the_next_step() {
          let store = ScriptedStore::new();
+```
+
+### After Task 10: the review fix
+
+Change `crates/data-avalanche-cluster/src/controller.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-cluster/src/controller.rs b/crates/data-avalanche-cluster/src/controller.rs
+index 8d99fbc..5e88cbe 100644
+--- a/crates/data-avalanche-cluster/src/controller.rs
++++ b/crates/data-avalanche-cluster/src/controller.rs
+@@ -267,13 +267,16 @@ impl PipelineController {
+         let mut dumped = false;
+         let mut retry: Option<(Instant, String)> = None;
+         let mut failures: u32 = 0;
+-        let mut desired = self.desired(DesiredState::Running).await;
++        // Unknown until a read succeeds: nothing starts on a guess (a stopped or paused pipeline
++        // must not run because its state document was unreadable once).
++        let mut desired = self.desired().await;
+         let mut poll = tokio::time::interval(self.settings.timing.renewal_interval);
+         poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+         poll.tick().await;
+         loop {
+-            if desired == DesiredState::Stopped {
++            if desired == Some(DesiredState::Stopped) {
+                 if let Some(w) = worker.take() {
++                    // Cut off or not, the worker and its writer are gone: the lease stays held.
+                     self.drain(w).await;
+                 }
+                 // A stop clears an error: the resume after it runs the pipeline again.
+@@ -284,11 +287,11 @@ impl PipelineController {
+             }
+             if let Some(w) = worker.as_mut() {
+                 match desired {
+-                    DesiredState::Paused if !w.paused => {
++                    Some(DesiredState::Paused) if !w.paused => {
+                         let _ = w.handle.control.send(Command::Pause).await;
+                         w.paused = true;
+                     }
+-                    DesiredState::Running if w.paused => {
++                    Some(DesiredState::Running) if w.paused => {
+                         let _ = w.handle.control.send(Command::Resume).await;
+                         w.paused = false;
+                     }
+@@ -296,11 +299,14 @@ impl PipelineController {
+                 }
+             }
+             let due = retry.as_ref().map(|(at, _)| *at);
+-            let want_start = worker.is_none()
+-                && desired != DesiredState::Stopped
++            // A worker may run: no error, not dumped, and a desired state read that isn't
++            // "stopped". Only then does a retry's time matter (else its arm would be ready at
++            // every turn).
++            let may_run = worker.is_none()
+                 && error.is_none()
+                 && !dumped
+-                && due.is_none_or(|at| Instant::now() >= at);
++                && desired.is_some_and(|d| d != DesiredState::Stopped);
++            let want_start = may_run && due.is_none_or(|at| Instant::now() >= at);
+             self.publish(
+                 &run,
+                 worker.as_ref(),
+@@ -310,7 +316,6 @@ impl PipelineController {
+                 retry.as_ref().map(|(_, e)| e.as_str()),
+             );
+             let starts = Arc::clone(&self.starts);
+-            let idle = worker.is_none();
+             let event = {
+                 let (task, status) = match worker.as_mut() {
+                     Some(Running { task, handle, .. }) => (Some(task), Some(&mut handle.status)),
+@@ -340,7 +345,7 @@ impl PipelineController {
+                             Some(at) => tokio::time::sleep_until(at).await,
+                             None => std::future::pending().await,
+                         }
+-                    }, if idle && !want_start => Event::Due,
++                    }, if may_run && !want_start => Event::Due,
+                     _ = poll.tick() => Event::Poll,
+                 }
+             };
+@@ -348,6 +353,8 @@ impl PipelineController {
+                 Event::Lost => {
+                     if let Some(w) = worker.take() {
+                         w.task.abort();
++                        // Ended (dropped) before the next term starts: its writer goes with it.
++                        let _ = w.task.await;
+                         self.metrics.worker_ended();
+                     }
+                     let reason = match run.stop().await {
+@@ -359,10 +366,21 @@ impl PipelineController {
+                 }
+                 Event::Target { closed } => {
+                     if closed || *target.borrow() == Target::DontOwn {
+-                        if let Some(w) = worker.take() {
+-                            self.drain(w).await;
++                        let drained = match worker.take() {
++                            Some(w) => self.drain(w).await,
++                            None => true,
++                        };
++                        if drained {
++                            self.give_back(run).await;
++                        } else {
++                            // Clustering §8.3: a worker cut off may have left a write in
++                            // flight; the lease expires instead of being handed over now.
++                            let _ = run.stop().await;
++                            tracing::warn!(
++                                pipeline = %self.pipeline.name,
++                                "lease left to expire after the drain was cut off"
++                            );
+                         }
+-                        self.give_back(run).await;
+                         self.standby(None);
+                         return if closed {
+                             Left::Shutdown
+@@ -434,7 +452,7 @@ impl PipelineController {
+                 },
+                 Event::Due => {}
+                 Event::Poll => {
+-                    desired = self.desired(desired).await;
++                    desired = self.desired().await.or(desired);
+                     if let Some(w) = worker.as_mut() {
+                         self.observe(w);
+                     }
+@@ -443,15 +461,15 @@ impl PipelineController {
+         }
+     }
+ 
+-    /// The persisted desired state; on a failed read, the last one known. A pipeline never
+-    /// started has none yet: it runs.
+-    async fn desired(&self, last: DesiredState) -> DesiredState {
++    /// The persisted desired state, `None` on a failed read. A pipeline never started has none
++    /// yet: it runs.
++    async fn desired(&self) -> Option<DesiredState> {
+         match self.docs.state().await {
+-            Ok(Some(v)) => v.doc.desired_state,
+-            Ok(None) => DesiredState::Running,
++            Ok(Some(v)) => Some(v.doc.desired_state),
++            Ok(None) => Some(DesiredState::Running),
+             Err(e) => {
+                 tracing::warn!(pipeline = %self.pipeline.name, "desired state unread: {e}");
+-                last
++                None
+             }
+         }
+     }
+@@ -480,15 +498,27 @@ impl PipelineController {
+     }
+ 
+     /// A stop or a hand-off: the worker flushes and ends within `drain_timeout`, else it is cut
+-    /// off (what it read past the durable checkpoint is read again by the next run).
+-    async fn drain(&self, mut w: Running) {
+-        let _ = w.handle.control.send(Command::Drain).await;
+-        match tokio::time::timeout(self.settings.drain_timeout, &mut w.task).await {
+-            Ok(Ok(Ok(_))) => tracing::info!(pipeline = %self.pipeline.name, "worker drained"),
++    /// off (what it read past the durable checkpoint is read again by the next run). True when
++    /// it ended on its own; either way it has ended, its writer with it, when this returns.
++    async fn drain(&self, mut w: Running) -> bool {
++        let ended = tokio::time::timeout(self.settings.drain_timeout, async {
++            let _ = w.handle.control.send(Command::Drain).await;
++            (&mut w.task).await
++        })
++        .await;
++        let drained = match ended {
++            Ok(Ok(Ok(_))) => {
++                tracing::info!(pipeline = %self.pipeline.name, "worker drained");
++                true
++            }
+             Ok(Ok(Err(e))) => {
+                 tracing::warn!(pipeline = %self.pipeline.name, "worker ended draining: {e}");
++                true
++            }
++            Ok(Err(e)) => {
++                tracing::error!(pipeline = %self.pipeline.name, "worker task: {e}");
++                true
+             }
+-            Ok(Err(e)) => tracing::error!(pipeline = %self.pipeline.name, "worker task: {e}"),
+             Err(_) => {
+                 tracing::warn!(
+                     pipeline = %self.pipeline.name,
+@@ -496,10 +526,13 @@ impl PipelineController {
+                     self.settings.drain_timeout
+                 );
+                 w.task.abort();
++                let _ = (&mut w.task).await;
++                false
+             }
+-        }
++        };
+         self.observe(&mut w);
+         self.metrics.worker_ended();
++        drained
+     }
+ 
+     async fn give_back(&self, run: LeaseRun) {
+@@ -556,7 +589,7 @@ impl PipelineController {
+         &self,
+         run: &LeaseRun,
+         worker: Option<&Running>,
+-        desired: DesiredState,
++        desired: Option<DesiredState>,
+         error: Option<&str>,
+         dumped: bool,
+         retrying: Option<&str>,
+@@ -570,7 +603,7 @@ impl PipelineController {
+             Actual::Dumped
+         } else {
+             match (desired, phase) {
+-                (DesiredState::Stopped, _) => Actual::Stopped,
++                (Some(DesiredState::Stopped), _) => Actual::Stopped,
+                 (_, Some(Phase::Paused)) => Actual::Paused,
+                 (_, Some(Phase::Starting)) => Actual::Starting,
+                 (_, Some(_)) => Actual::Running,
+@@ -598,15 +631,29 @@ impl PipelineController {
+ 
+ #[cfg(test)]
+ mod tests {
+-    use data_avalanche_core::{SourceError, TableRef};
+-    use data_avalanche_testkit::{FakeTxn, Method};
++    use data_avalanche_core::{SinkError, SourceError, TableRef};
++    use data_avalanche_testkit::{FakeTxn, Method, SinkOp};
+ 
+     use super::*;
+     use crate::test_support::{
+-        Fault, Kind, ScriptedStore, TestFactory, eventually, holder, leases, node, pipeline_docs,
+-        pipeline_docs_on, row, until,
++        Fault, Kind, ScriptedStore, TestFactory, deps, eventually, holder, leases, node, pipeline,
++        pipeline_docs, pipeline_docs_on, row, until,
+     };
+ 
++    /// A real two-second watchdog over `wait` on the paused clock: a controller that spins keeps
++    /// the paused clock still, and the test fails instead of hanging.
++    async fn idles_through(wait: Duration) {
++        let (spun, spinning) = tokio::sync::oneshot::channel::<()>();
++        std::thread::spawn(move || {
++            std::thread::sleep(std::time::Duration::from_secs(2));
++            let _ = spun.send(());
++        });
++        tokio::select! {
++            () = tokio::time::sleep(wait) => {}
++            _ = spinning => panic!("the controller spins: the paused clock stood still"),
++        }
++    }
++
+     fn t(name: &str) -> TableRef {
+         TableRef::new("public", name)
+     }
+@@ -817,6 +864,137 @@ mod tests {
+         eventually("the row lands", || f.ids("a") == [1]).await;
+     }
+ 
++    /// A stop drains: what the worker read is committed before it ends, though the commit
++    /// waits a while.
++    #[tokio::test(start_paused = true)]
++    async fn a_stop_drains_what_the_worker_read() {
++        let store = ScriptedStore::new();
++        let docs = pipeline_docs();
++        let f = TestFactory::new(&["a"]);
++        let mut d = deps("n1", &store, &f);
++        d.settings.drain_timeout = Duration::from_secs(60);
++        let (c, mut status) = PipelineController::new(pipeline(), docs.clone(), &d);
++        let (_target, rx) = watch::channel(Target::Own);
++        let _task = tokio::spawn(c.run(rx));
++        until(&mut status, "running", is(Actual::Running)).await;
++        f.sink.hold_commits();
++        f.source.commit(FakeTxn::new().insert(&t("a"), row(1)));
++        eventually("the commit waits", || f.sink.waiting_commits() == 1).await;
++        docs.set_desired_state(DesiredState::Stopped).await.unwrap();
++        // Past the next poll: the drain has begun, and waits for the commit.
++        tokio::time::sleep(Duration::from_secs(6)).await;
++        assert!(f.ids("a").is_empty());
++        f.sink.release_commits();
++        until(&mut status, "stopped", is(Actual::Stopped)).await;
++        assert_eq!(f.ids("a"), [1], "drained before it stopped");
++    }
++
++    /// A drain cut off at `drain_timeout` ends the worker and its writer, and leaves the lease to
++    /// expire (Clustering §8.3): nothing the worker read lands afterwards, and nobody can take
++    /// the lease before its holder's deadline.
++    #[tokio::test(start_paused = true)]
++    async fn a_cut_off_drain_ends_the_writer_and_leaves_the_lease_to_expire() {
++        let store = ScriptedStore::new();
++        let docs = pipeline_docs();
++        let f = TestFactory::new(&["a"]);
++        let mut n = node("n1", &store, &docs, &f);
++        until(&mut n.status, "running", is(Actual::Running)).await;
++        f.sink
++            .fail(SinkOp::Commit, None, 1500, || SinkError::Transient {
++                reason: "down".into(),
++            });
++        f.source.commit(FakeTxn::new().insert(&t("a"), row(1)));
++        tokio::time::sleep(Duration::from_millis(500)).await;
++        n.target.send_replace(Target::DontOwn);
++        until(
++            &mut n.status,
++            "standby",
++            is(Actual::Standby { holder: None }),
++        )
++        .await;
++        let lease = leases(&store).observe("p").await.unwrap().unwrap();
++        assert!(lease.doc.is_held_by(&holder("n1")), "not released");
++        tokio::time::sleep(Duration::from_secs(30)).await;
++        assert!(
++            f.ids("a").is_empty(),
++            "the cut-off writer committed nothing"
++        );
++    }
++
++    /// A worker that ends for the lease (a newer epoch wrote a table) goes back to claiming: the
++    /// next term runs under a new epoch, never `ERROR`.
++    #[tokio::test(start_paused = true)]
++    async fn a_worker_fenced_goes_back_to_the_lease() {
++        let store = ScriptedStore::new();
++        let docs = pipeline_docs();
++        let f = TestFactory::new(&["a"]);
++        let mut n = node("n1", &store, &docs, &f);
++        until(&mut n.status, "running", is(Actual::Running)).await;
++        f.source.commit(FakeTxn::new().insert(&t("a"), row(1)));
++        eventually("the first row lands", || f.ids("a") == [1]).await;
++        f.sink.take_over(&t("a"), 2);
++        f.source.commit(FakeTxn::new().insert(&t("a"), row(2)));
++        until(&mut n.status, "running under epoch 2", |s| {
++            s.actual == Some(Actual::Running) && s.owner_epoch == Some(2)
++        })
++        .await;
++        eventually("the second row lands", || f.ids("a") == [1, 2]).await;
++    }
++
++    /// A worker that failed transiently, then a start that fails for good: `ERROR` holds, and
++    /// the controller waits idle (its retry's time is past, but nothing may start).
++    #[tokio::test(start_paused = true)]
++    async fn an_error_after_a_retry_idles() {
++        #[derive(Debug)]
++        struct SecondFails(TestFactory);
++        impl WorkerFactory for SecondFails {
++            fn build(&self, p: &Pipeline) -> Result<Parts, String> {
++                let parts = self.0.build(p)?;
++                if self.0.builds() >= 2 {
++                    return Err("boom".into());
++                }
++                Ok(parts)
++            }
++        }
++        let store = ScriptedStore::new();
++        let state = ScriptedStore::new();
++        let docs = pipeline_docs_on(&state);
++        state.fail_next(Fault {
++            kind: Kind::Transient,
++            lands: false,
++        });
++        let f = TestFactory::new(&["a"]);
++        let mut d = deps("n1", &store, &f);
++        d.factory = Arc::new(SecondFails(f.clone()));
++        let (c, mut status) = PipelineController::new(pipeline(), docs, &d);
++        let (_target, rx) = watch::channel(Target::Own);
++        let _task = tokio::spawn(c.run(rx));
++        until(
++            &mut status,
++            "error",
++            |s| matches!(&s.actual, Some(Actual::Error { error }) if error.contains("boom")),
++        )
++        .await;
++        idles_through(Duration::from_secs(10)).await;
++        assert_eq!(f.builds(), 2);
++    }
++
++    /// The desired state couldn't be read when the lease was taken: nothing starts until a read
++    /// says what to run (here, nothing: the pipeline is stopped).
++    #[tokio::test(start_paused = true)]
++    async fn an_unread_desired_state_starts_nothing() {
++        let store = ScriptedStore::new();
++        let state = ScriptedStore::new();
++        let docs = pipeline_docs_on(&state);
++        docs.open("p", "delta").await.unwrap();
++        docs.set_desired_state(DesiredState::Stopped).await.unwrap();
++        state.fail_reads(1);
++        let f = TestFactory::new(&["a"]);
++        let mut n = node("n1", &store, &docs, &f);
++        until(&mut n.status, "stopped", is(Actual::Stopped)).await;
++        assert_eq!(f.builds(), 0);
++    }
++
+     #[tokio::test(start_paused = true)]
+     async fn a_dont_own_target_drains_releases_and_drops_the_series() {
+         let store = ScriptedStore::new();
+```
+
+Change `crates/data-avalanche-cluster/src/test_support.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-cluster/src/test_support.rs b/crates/data-avalanche-cluster/src/test_support.rs
+index faf41cb..3b73a96 100644
+--- a/crates/data-avalanche-cluster/src/test_support.rs
++++ b/crates/data-avalanche-cluster/src/test_support.rs
+@@ -58,6 +58,8 @@ struct Script {
+     always: Option<Fault>,
+     /// How long every read takes.
+     read_delay: Duration,
++    /// The next reads that fail transiently.
++    failed_reads: usize,
+ }
+ 
+ /// An in-memory store whose writes (`create`, `update`, `put`) fail as scripted.
+@@ -89,6 +91,11 @@ impl ScriptedStore {
+         self.lock().read_delay = delay;
+     }
+ 
++    /// The next `n` reads fail transiently.
++    pub fn fail_reads(&self, n: usize) {
++        self.lock().failed_reads = n;
++    }
++
+     fn lock(&self) -> std::sync::MutexGuard<'_, Script> {
+         self.script
+             .lock()
+@@ -128,8 +135,19 @@ impl ScriptedStore {
+ #[async_trait]
+ impl VersionedStore for ScriptedStore {
+     async fn get(&self, key: &str) -> Result<Option<(Bytes, ObjectVersion)>, StoreError> {
+-        let delay = self.lock().read_delay;
++        let (delay, fail) = {
++            let mut s = self.lock();
++            let fail = s.failed_reads > 0;
++            s.failed_reads = s.failed_reads.saturating_sub(1);
++            (s.read_delay, fail)
++        };
+         tokio::time::sleep(delay).await;
++        if fail {
++            return Err(StoreError::Transient {
++                key: key.to_owned(),
++                reason: "injected".into(),
++            });
++        }
+         self.inner.get(key).await
+     }
+ 
+```
+
+Change `crates/data-avalanche-pipeline/src/session.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-pipeline/src/session.rs b/crates/data-avalanche-pipeline/src/session.rs
+index 10e44c1..f8fa383 100644
+--- a/crates/data-avalanche-pipeline/src/session.rs
++++ b/crates/data-avalanche-pipeline/src/session.rs
+@@ -124,6 +124,16 @@ fn protocol(detail: String) -> WorkerError {
+     AccumulatorError::Protocol { detail }.into()
+ }
+ 
++/// The session's writer task, aborted when the session is dropped: a worker cut off mid-flush
++/// (its task aborted, say past `drain_timeout`) leaves no writer committing on its own.
++struct WriterTask(JoinHandle<()>);
++
++impl Drop for WriterTask {
++    fn drop(&mut self) {
++        self.0.abort();
++    }
++}
++
+ pub(crate) struct Session<'c> {
+     core: &'c mut Core,
+     acc: Accumulator,
+@@ -132,7 +142,7 @@ pub(crate) struct Session<'c> {
+     stream: Box<dyn ChangeStream>,
+     jobs: UnboundedSender<Job>,
+     events: UnboundedReceiver<WriterEvent>,
+-    writer: JoinHandle<()>,
++    writer: WriterTask,
+     /// `buffer_capacity_rows`: rows handed to the writer and not yet durable.
+     permits: Arc<Semaphore>,
+     /// Flushes waiting for room in the buffer, in order. The stream isn't read meanwhile.
+@@ -266,7 +276,7 @@ impl<'c> Session<'c> {
+             stream,
+             jobs,
+             events,
+-            writer,
++            writer: WriterTask(writer),
+             permits: Arc::new(Semaphore::new(rows)),
+             queued: VecDeque::new(),
+             submitted: checkpoint,
+@@ -296,7 +306,7 @@ impl<'c> Session<'c> {
+                 Ok(end)
+             }
+             Err(e) => {
+-                self.writer.abort();
++                self.writer.0.abort();
+                 Err(e)
+             }
+         }
 ```
