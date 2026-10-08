@@ -3,8 +3,10 @@
 //! reconciler that tells each controller whether to own. M6b runs them single-node: a self-only
 //! ring, so every pipeline's target is "own".
 
+pub mod claim;
 pub mod lease;
 #[cfg(test)]
 mod test_support;
 
+pub use claim::{Claim, Claimed, release};
 pub use lease::{LeaseGuard, LeaseRun, LeaseTiming, RenewEnd, RenewState};
