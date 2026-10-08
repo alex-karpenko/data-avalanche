@@ -1,8 +1,8 @@
 ---
 updated: 2026-10-08
 domain: Clustering
-tags: [v1, implementation-plan, m6b, single-node, lease, renewer, pipeline-controller, lifecycle, binary, http, metrics, e2e, delta, postgresql]
-resolves: [DA-SNAP-11]
+tags: [v1, implementation-plan, m6b, single-node, lease, renewer, pipeline-controller, lifecycle, binary, http, metrics, e2e, delta, postgresql, position-guard, watchdog]
+resolves: [DA-SNAP-11, DA-SRC-16, DA-X-12]
 sources: []
 ---
 
@@ -18,7 +18,10 @@ This means:
 - a single-node `ClusterReconciler`;
 - the binary `data-avalanche run --config <path>`, with a minimal HTTP listener
   (`/health/live`, `/health/ready`, `/metrics`) and the metrics for everything built so far;
-- the five items carried from M4 and M6a's notes.
+- the five items carried from M4 and M6a's notes;
+- the owner's answers to the planning findings (2026-10-08): the position guard skips a
+  replayed transaction, a watchdog reconnects a stream whose source stopped answering, and the
+  Delta libraries stay quiet at `info`.
 
 The exit is the slice-1 E2E suite (roadmap §5.3, all 10 scenarios): the binary as a process
 against PostgreSQL 18 and RustFS on every pull request, and against PostgreSQL 14–17 weekly.
@@ -26,6 +29,9 @@ against PostgreSQL 18 and RustFS on every pull request, and against PostgreSQL 1
 **Architecture:** Small changes in five existing crates, then three new crates.
 
 - **`data-avalanche-core`**:
+  - A change set carries its table's last change (`PositionRange::last_change`), which the
+    position guard compares; the marker still records the frontier (Q-M6b-9).
+  - `SourceConnector::retained` reports the slot's retained WAL and whether a stream reads it.
   - `Sink::evolve` takes the writer's `owner_epoch` and can answer `EvolveOutcome::Fenced`
     (Q-M6b-7).
   - `Sink::stats` reports a sink's MERGE cost (`SinkStats`).
@@ -37,6 +43,9 @@ against PostgreSQL 18 and RustFS on every pull request, and against PostgreSQL 1
   - A table dropped since the refresh is `NoTable`.
   - A change set keyed otherwise than the table is refused.
   - A MERGE over `merge_memory_limit` is `Permanent`, so its table halts (Q-M6b-6).
+  - A table is loaded only when its log exists, so a first start logs no kernel error.
+- **`data-avalanche-source-pg`**: the catalog connect is bounded by `timeouts.connect` as a
+  whole; the heartbeat's read of the slot reports `active`.
 - **`data-avalanche-config`**: `sink.delta.merge_memory_limit` and V-119 (≥ 16 MiB when set).
 - **`data-avalanche-pipeline`** (the worker):
   - `Command::Pause` and `Command::Resume`: the pause finishes the open transaction, flushes,
@@ -44,6 +53,8 @@ against PostgreSQL 18 and RustFS on every pull request, and against PostgreSQL 1
   - Every Phase 0 state write is gated by the `CommitGuard`.
   - Warnings are kept once each and capped.
   - `WorkerError::recovery()` classifies every error as `Retry`, `Lease` or `Error` (Q-M6b-3).
+  - The heartbeat's read runs beside the loop, and a watchdog ends a session whose stream is
+    silent while the source doesn't answer, so the worker reconnects (Q-M6b-11, DA-SRC-16).
 - **`data-avalanche-state`**: `PipelineDocs::state()` reads `pipeline-state.json`, which holds
   the desired state.
 - **`data-avalanche-telemetry`** (new): the OpenMetrics registry and the M6b series. It depends
@@ -56,7 +67,8 @@ against PostgreSQL 18 and RustFS on every pull request, and against PostgreSQL 1
     rerun, standby or ERROR.
   - `reconciler`: `ClusterReconciler` with a self-only ring, and this node's identity.
 - **`data-avalanche`** (new, the binary):
-  - the CLI, logs, and the M2 startup sequence against real buckets;
+  - the CLI, logs (a bare `info` caps the Delta libraries, Q-M6b-10), and the M2 startup
+    sequence against real buckets;
   - the wiring of `source-pg` and `sink-delta` (the only crate that links both);
   - the HTTP listener and the signal handling;
   - behind the `e2e-hooks` feature, crash points that abort the process (Q-M6b-5).
@@ -66,7 +78,7 @@ against PostgreSQL 18 and RustFS on every pull request, and against PostgreSQL 1
   - Live Delta tests on the local directory, RustFS and Azurite.
   - The pipeline's `tests/pg` gains a pause test.
   - `crates/data-avalanche/tests/e2e` runs the binary as a process against PostgreSQL and RustFS:
-    25 scenarios, about 5 minutes. `ci.yml` runs it on every pull request, and `weekly.yml` runs
+    26 scenarios, about 5 minutes. `ci.yml` runs it on every pull request, and `weekly.yml` runs
     it on PostgreSQL 14–17.
 
 **Tech Stack:** Rust 1.98.1 (edition 2024). New external crates (exact pins in `Cargo.toml`):
@@ -93,10 +105,12 @@ added), `tokio` (`signal`, `net`; `test-util` as a dev feature in `pipeline` and
 - `doc/specs/Configuration_Specification.md`: §6.3 `globals.api` (health and metrics
   unauthenticated, `tls`), §6.4 `globals.log`, §6.5 `globals.cluster` (`lease_duration`,
   `lease_renewal_interval`, `lease_safety_margin`, `max_concurrent_takeovers`,
-  `drain_timeout`, `memberlist.node_name`), §9.2.1 `source.postgres` (`max_wal_lag_bytes`), §9.3
+  `drain_timeout`, `memberlist.node_name`), §9.2 `source` (`timeouts`), §9.2.1 `source.postgres`
+  (`heartbeat`, `max_wal_lag_bytes`), §9.3
   `tables` (`snapshots.mode`), §9.4 `sink` (`max_transaction_*`), §9.4.3 `sink.delta`, §13.3,
   V-073.
-- `doc/specs/Data-Flow.md`: Phase 0, Phase 4 (fence, position guard), Phase 5, §Error Paths.
+- `doc/specs/Data-Flow.md`: Phase 0, Phase 4 (fence, position guard), Phase 5 (the checkpoint
+  rule), §Error Paths.
 - `doc/research/Clustering_Architecture_Research.md`: §3.4 (node id and incarnation), §5.2–5.3
   (the lease protocol), §10 (single-node), §19 (renew outcomes, the safety deadline, the
   renewer, commit gating), §20.1–20.2 (controller and reconciler; takeover rate limiting).
@@ -134,6 +148,8 @@ added), `tokio` (`signal`, `net`; `test-util` as a dev feature in `pipeline` and
   - The E2E binary needs `--features e2e-hooks` and `--test-threads=1`.
   - One E2E test changes a server-wide setting (`max_slot_wal_keep_size`), and it restores the
     setting before any assertion.
+  - One E2E test freezes the PostgreSQL container (`docker pause`); a guard unpauses it on
+    every path out of the test, a panic included.
 - **`e2e-hooks` is test-only:** off by default and never in a release build. Without it, the
   process can't be crashed by an environment variable.
 - **Credentials:** the tests use the compose services' fixed test credentials (testkit
@@ -177,6 +193,12 @@ in the task after the arrow.
    → Task 2 `a_live_handle_recovers_from_a_table_recreated_past_its_version`,
    `a_table_dropped_since_the_refresh_is_no_table`; Task 15
    `dump_initial_dumps_until_the_lake_has_it`.
+6. **A source that stops answering without closing the connection.** A frozen server or a
+   dropped flow keeps the socket open: the pipeline must notice and reconnect, without mistaking
+   an idle source for a dead one or a slow chunk read for a frozen server.
+   → Task 22 `a_silent_stream_whose_source_doesn_t_answer_ends_the_session`,
+   `silence_alone_is_an_idle_source`, `a_stalled_heartbeat_read_holds_up_nothing`,
+   `a_source_that_stops_answering_is_reconnected_to`.
 
 ## Decisions and rulings
 
@@ -192,6 +214,16 @@ in the task after the arrow.
 | Q-M6b-6 | A MERGE over `merge_memory_limit`? | **Halt the table.** The new key `sink.delta.merge_memory_limit` (V-119, ≥ 16 MiB when set). The DataFusion pool's refusal is `Permanent`, naming the key, so the writer halts the table `SINK_REJECTED`. Spec patch below. | Task 4 |
 | Q-M6b-7 | Is `Sink::evolve` fenced? | **Yes.** It takes `owner_epoch`. A table a newer owner wrote answers `EvolveOutcome::Fenced` and changes nothing; the worker stops as after a fenced commit. | Task 1 |
 | Q-M6b-8 | A Delta table re-created behind a live handle? | **Detect it at refresh.** The handle remembers the e-tag of the commit file at its version. Before an incremental update it HEADs that file: a different or missing file means another table, so the handle re-opens from scratch. Any `Transient` drops the handle (M4's ruling). Measured first: delta-rs merges the old file list with the new log, a commit lands on the wrong view, and the next read fails on a missing file. | Task 2 |
+
+### Owner rulings on the planning findings (2026-10-08)
+
+| # | Finding | Ruling | Where |
+|---|---|---|---|
+| Q-M6b-9 | F-1: the position guard rarely skips a replay | **Build the fix in M6b.** The guard compares the set's last change; the marker stays the frontier (Data-Flow's checkpoint rule). Gap DA-X-12 | Task 21 |
+| Q-M6b-10 | F-2: Delta library log noise | **Hide it at the global `info` level.** A bare `info` (or quieter) caps the Delta libraries; the sink stops provoking the kernel's ERROR on an absent table | Task 23 |
+| Q-M6b-11 | F-3: DA-SRC-16 | **In M6b.** A watchdog on the stream, decided by the heartbeat's read of the slot; the catalog connect bounded as a whole | Task 22 |
+| Q-M6b-12 | F-4: a stop and a resume rerun an ERROR pipeline | **Accept and document** (option a): it behaves as a process restart until M9's restart verb. `Pipeline_Lifecycle_State_Machine.md` §3 names the transition | D-M6b.6 |
+| Q-M6b-13 | F-5: catalogue names | **The catalogue is the exposed sample names.** The System-Overview patch, and the config patch (V-119), approved as drafted | Tasks 4, 7 |
 
 ### Decisions made while verifying (D-M6b)
 
@@ -227,7 +259,8 @@ in the task after the arrow.
     deleted) as released.
 - **D-M6b.6 The controller:**
   - It polls the desired state.
-  - Stopped clears an ERROR: a stop and a resume rerun an ERROR pipeline, as a restart would.
+  - Stopped clears an ERROR: a stop and a resume rerun an ERROR pipeline, as a restart would
+    (Q-M6b-12).
   - `Exit::Dumped` → `Actual::Dumped`, shown as `stopped`. The lease is kept, and a restart
     dumps again under `dump_always`.
   - Retry uses `Backoff` (1 s → 60 s).
@@ -289,34 +322,31 @@ in the task after the arrow.
   - RustFS takes the standard `AWS_*` variables (`AWS_ENDPOINT_URL`, `AWS_ALLOW_HTTP`), which
     both `object_store` 0.14 (state) and deltalake's 0.13 accept. Measured.
 
-### Findings for the owner (not decided here)
+### Findings for the owner (answered 2026-10-08)
 
-- **F-1 The position guard rarely skips a replay after a crash.**
-  - A table set's `position.end` is the flush's frontier (the accumulator's `flush`). Keep-alives
-    and other databases' WAL move the frontier past the replayed transaction.
+- **F-1 The position guard rarely skipped a replay after a crash** → Q-M6b-9, Task 21.
+  - A table set's `position.end` is the flush's frontier, and keep-alives and other databases'
+    WAL move it past the replayed transaction.
   - Measured (Task 17): marker `0/409EA098` against a replay ending at `0/409EA1B0`; marker
     `0/40C2CD78` against `0/40C2CDB0`, even with the replay flushed alone.
-  - It is correct, because the MERGE is idempotent (Data-Flow: "optimization, not correctness"),
-    but the whole replay is re-merged, at a cost proportional to the files it touches.
-  - Option: a table's end is the last transaction that touched it, which is still ≤ the
-    frontier. A gap row (DA-X-*) is proposed.
-- **F-2 delta-kernel log noise.**
-  - `buoyant_kernel` logs at INFO on every scan.
-  - It logs an ERROR, "No files in log segment", whenever an absent table is opened (Phase 0's
-    `table_state` of a table not created yet).
-  - The E2E config uses `info,buoyant_kernel=warn`. Default log filters belong to M10. Should
-    the default `globals.log.level` carry that directive now?
-- **F-3 DA-SRC-16** (a watchdog for a silent replication connection, marked "M6") is in neither
-  M6a nor this plan. Add it to M6b, or carry it on?
-- **F-4 A stop and a resume rerun an ERROR pipeline** (D-M6b.6). Without M9's restart verb, this
-  is the operator's way out of ERROR. Lifecycle §3 doesn't name the transition.
-- **F-5 Catalogue names.** The catalogue lists `sink_merge_*` without `_total`, but
-  `source_reconnects_total` with it. The patch below makes the catalogue the exposed sample
-  names.
+  - Correct, because the MERGE is idempotent, but the whole replay was re-merged.
+  - Data-Flow's checkpoint rule sets each table's marker to the frontier, "including tables no
+    transaction touched", so that an idle table can't pin the resume point. So the end stays the
+    frontier, and the set carries its last change beside it for the guard.
+- **F-2 Delta library log noise** → Q-M6b-10, Task 23. At `info` a restart run logged 25 lines,
+  about 20 of them from `buoyant_kernel` and `deltalake_core`, plus the kernel's ERROR "No files
+  in log segment" for every absent table a first start opens.
+- **F-3 DA-SRC-16** → Q-M6b-11, Task 22. Measured: PostgreSQL 14 frozen for 150 s under a
+  running pipeline; status `running`, no reconnect, nothing logged, and the catalog reconnect
+  would have waited in the startup forever.
+- **F-4 A stop and a resume rerun an ERROR pipeline** → Q-M6b-12.
+- **F-5 Catalogue names** → Q-M6b-13.
 - **F-6** Closed: `weekly.yml` ran green on `main` after M6a's merge (run 37740839634,
   2026-10-08, `f681150`, by manual dispatch). Its first run with M6b includes the E2E suite.
 
-### Proposed spec patches (need approval; drafted on scratch copies)
+### Spec patches
+
+Approved 2026-10-08 (Q-M6b-13), applied with this plan:
 
 `doc/specs/Configuration_Specification.md` (§9.4.3, §13.3):
 
@@ -346,13 +376,41 @@ in the task after the arrow.
 +| Status | `data_avalanche_pipeline_status` (running / paused / stopped / error), `data_avalanche_halted_tables` |
 ```
 
+Proposed 2026-10-08 with Tasks 21–23 (need approval; drafted on scratch copies):
+
+`doc/specs/Data-Flow.md` (Phase 4, position guard):
+
+```diff
+-string). If `committed_position.covers(flush.position_for_table)` (PG: `≥`; MySQL: GTID **subset**) the
+-table is already committed and is skipped. A snapshot change set (a chunk's rows, flagged
++string). If `committed_position.covers(flush.last_change_for_table)` (PG: `≥`; MySQL: GTID **subset**)
++the table is already committed and is skipped. `last_change_for_table` is the commit position of the
++flush's last transaction that wrote the table, not the flush frontier: a replay's flush may read past
++the marker (a keep-alive, another table's transaction) while carrying only transactions the table has.
++A snapshot change set (a chunk's rows, flagged
+```
+
+`doc/specs/Configuration_Specification.md` (§6.4, §9.2, §9.2.1):
+
+```diff
+-| `level` | … | `trace`\|`debug`\|`info`\|`warn`\|`error`; per-module granularity allowed (`tracing` EnvFilter syntax, e.g. `info,rustcdc::sink=debug`). Hot-changeable. |
++| `level` | … | `trace`\|`debug`\|`info`\|`warn`\|`error`; per-module granularity allowed (`tracing` EnvFilter syntax, e.g. `info,rustcdc::sink=debug`). A bare level of `info` or quieter also caps the Delta libraries: `buoyant_kernel` and `deltalake_core` at `warn`, `deltalake_core::operations::merge` at `error`; a filter that names one of them is taken as written. Hot-changeable. |
+-| `timeouts.connect` | Duration | no | `10s` | PR | |
++| `timeouts.connect` | Duration | no | `10s` | PR | The whole connection setup: TCP, TLS, startup and authentication. |
+-| `heartbeat` | … | StandbyStatusUpdate interval; keeps the connection alive and prevents WAL-lag-as-inactivity. |
++| `heartbeat` | … | StandbyStatusUpdate interval; keeps the connection alive and prevents WAL-lag-as-inactivity. Also paces the stream watchdog: a stream silent for 3 heartbeats while the heartbeat's reads of the slot fail or find no reader is reconnected (DA-SRC-16). |
+```
+
 ### Proposed roadmap updates (applied with the plan's approval)
 
+- §3.3: `PositionRange::last_change`, which the guard compares (`CommitMarker::covers`).
 - §3.4:
   - `evolve(&self, table, delta, owner_epoch: u64)` and `EvolveOutcome::Fenced { current_epoch }`;
   - `fn stats(&self) -> SinkStats { files_rewritten, rows_copied }` (default zeros);
   - commit step 3b: a set keyed otherwise than the table's identifier is refused;
   - the `marker: None` contract.
+- §3.6: `SourceConnector::retained` → `Option<RetainedLog { bytes, streamed }>`
+  (was `retained_bytes`); the catalog connect bounded by `timeouts.connect`.
 - §3.7: what M6b ships —
   - `LeaseTiming`, `LeaseRun`, `LeaseGuard` (`Held | Degraded | Lost`; "Renewing" is no
     state, since a renewal in flight leaves the state as it was);
@@ -360,15 +418,18 @@ in the task after the arrow.
   - `PipelineController`, `WorkerFactory`, `ClusterReconciler::start`, `node_identity`.
 - §3.10:
   - a MERGE over `merge_memory_limit` is `Permanent`;
+  - a table is loaded only when its `_delta_log/` lists a log file;
   - the refresh's e-tag check and the re-open after any `Transient`;
   - `NoTable` for a table dropped since the refresh.
 - §3.11:
   - `Command::{Pause, Resume}` and `Phase::Paused`;
   - `WorkerStatus { reconcile_log, warnings_dropped, reconnects }`;
   - `HookPoint::SchemasCached`;
-  - `Recovery` and `WorkerError::recovery()`.
+  - `Recovery` and `WorkerError::recovery()`;
+  - the stream watchdog (`SILENT_HEARTBEATS`), the heartbeat read beside the loop.
 - A new §3.12 "Telemetry and the binary": `Metrics`, `PipelineMetrics`, `CONTENT_TYPE`;
-  `run(RunArgs)`, `Fatal`, the exit codes, the HTTP endpoints, `DATA_AVALANCHE_E2E_CRASH`.
+  `run(RunArgs)`, `Fatal`, the exit codes, the HTTP endpoints, `DATA_AVALANCHE_E2E_CRASH`, the
+  Delta libraries' log caps.
 - §4 M6b: the exit as measured; D-IMPL-14 → this plan's D-M6b.1…13.
 
 ## File Structure
@@ -385,11 +446,12 @@ crates/data-avalanche-cluster/       Tasks 8–11
   src/lease.rs                       LeaseTiming, the renewer, LeaseGuard (CommitGuard), LeaseRun
   src/claim.rs                       Claim (acquire / takeover), release
   src/controller.rs                  PipelineController, WorkerFactory, Actual, ControllerDeps
+                                     (each reconnect logged with its reason, Task 22)
   src/reconciler.rs                  ClusterReconciler (self-only ring), node_identity
   src/test_support.rs                ScriptedStore, test configs and factories (cfg(test))
 crates/data-avalanche/               Tasks 12–20
   src/main.rs                        crypto provider, runtime, exit code
-  src/lib.rs, cli.rs, logging.rs     the command line, globals.log
+  src/lib.rs, cli.rs, logging.rs     the command line, globals.log (the Delta libraries' caps, Task 23)
   src/run.rs                         the startup sequence, signals, shutdown
   src/startup.rs                     buckets, state locations, the M2 join
   src/wiring.rs                      Factory: PgConnector + DeltaSink per pipeline
@@ -398,7 +460,8 @@ crates/data-avalanche/               Tasks 12–20
   tests/cli.rs                       exit codes of the built binary
   tests/e2e/main.rs, harness.rs      the E2E world: schema, slot, prefix, config, process
   tests/e2e/smoke.rs, snapshots.rs, streaming.rs, toast.rs, crashes.rs, schema.rs, types.rs,
-  lifecycle.rs, guards.rs            scenarios 1–10 (Tasks 14–20)
+  lifecycle.rs, guards.rs            scenarios 1–10 (Tasks 14–20; Tasks 21–23 extend crashes.rs,
+                                     guards.rs and smoke.rs)
   tests/e2e/duckdb_read.py           DuckDB delta_scan on RustFS (Task 19)
 ```
 
@@ -406,13 +469,14 @@ Changed crates:
 
 | Crate | Files | Tasks |
 |---|---|---|
-| `data-avalanche-core` | `src/sink.rs` (evolve's epoch, `Fenced`, the identifier step, `SinkStats`, the marker doc), `src/lib.rs` | 1, 2, 3, 7 |
-| `data-avalanche-sink-delta` | `src/sink.rs`, `src/evolve.rs`, `src/table.rs` (the refresh check, `open`), `src/error.rs`, `src/config.rs`, `src/test_support.rs`, `tests/sink/{local,scenarios,stores}.rs` | 1, 2, 3, 4, 7 |
+| `data-avalanche-core` | `src/sink.rs` (evolve's epoch, `Fenced`, the identifier step, `SinkStats`, the marker doc, the guard's last change), `src/change_set.rs` (`PositionRange::last_change`), `src/source.rs` (`RetainedLog`), `src/lib.rs` | 1, 2, 3, 7, 21, 22 |
+| `data-avalanche-sink-delta` | `src/sink.rs`, `src/evolve.rs`, `src/table.rs` (the refresh check, `open`), `src/error.rs`, `src/config.rs`, `src/test_support.rs`, `tests/sink/{common,local,scenarios,stores}.rs` | 1, 2, 3, 4, 7, 21, 23 |
+| `data-avalanche-source-pg` | `src/connect.rs` (the bounded connect), `src/slot.rs` + `src/connector.rs` (`retained`), `tests/pg/slot.rs` | 22 |
 | `data-avalanche-config` | `src/{raw,merge,build,resolved,registry}.rs`, `src/rules/domain.rs`, `tests/load.rs`, `tests/rules/domain.rs` | 4 |
-| `data-avalanche-pipeline` | `src/{session,session/snapshot,status,worker,error,hooks,lib,schema_change,test_support}.rs`, `tests/pg/{main,common,pause}.rs`, `Cargo.toml` (tokio `test-util`, dev) | 1, 3, 5, 6 |
+| `data-avalanche-pipeline` | `src/{session,session/snapshot,status,worker,error,hooks,lib,schema_change,test_support}.rs`, `src/accumulator.rs` + `src/buffer.rs` (the last change), `src/watchdog.rs` (new), `tests/pg/{main,common,pause}.rs`, `Cargo.toml` (tokio `test-util`, dev) | 1, 3, 5, 6, 21, 22 |
 | `data-avalanche-state` | `src/pipeline.rs` (`PipelineDocs::state`) | 6 |
-| `data-avalanche-testkit` | `src/memory_sink.rs` (the evolve fence, the identifier step) | 1, 3 |
-| CI | `.github/workflows/ci.yml` (Task 14), `weekly.yml` (Task 21) | 14, 21 |
+| `data-avalanche-testkit` | `src/memory_sink.rs` (the evolve fence, the identifier step), `src/fake_source.rs` (`retained`, `detach_stream`, `stall_retained`) | 1, 3, 21, 22 |
+| CI | `.github/workflows/ci.yml` (Task 14), `weekly.yml` (Task 24) | 14, 24 |
 
 ---
 
@@ -1979,7 +2043,7 @@ git commit -m "fix(sink-delta): a change set keyed otherwise than its table is r
 
 Q-M6b-6. The same change set needs the same memory on every replay, so a retry can't
 succeed: `Permanent` lets the writer halt the table (`SINK_REJECTED`) instead of retrying
-forever. The spec rows are in "Proposed spec patches".
+forever. The spec rows are in "Spec patches".
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -11818,7 +11882,8 @@ async fn switch_wal(e: &E2e, n: usize) -> Result<(), tokio_postgres::Error> {
 }
 
 /// An open transaction pins the slot while the WAL grows past `max_wal_lag_bytes`: the pipeline
-/// stops with an error, to protect the source's disk.
+/// stops with an error, to protect the source's disk. The lag is read once per heartbeat, so the
+/// heartbeat is short: at the default 60 s the first read could fall past the wait.
 #[tokio::test]
 async fn retained_wal_past_the_limit_stops_the_pipeline() {
     require_it!();
@@ -11827,7 +11892,7 @@ async fn retained_wal_past_the_limit_stops_the_pipeline() {
         TABLES,
         Options {
             tables: ", exclude: [e2e_guard_wal.pad], snapshots: { mode: never }",
-            postgres: ", max_wal_lag_bytes: 64MiB",
+            postgres: ", max_wal_lag_bytes: 64MiB, heartbeat: 5s",
             ..Options::default()
         },
     )
@@ -12319,7 +12384,7 @@ Expected:
 PASS:
 
 ```text
-test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 115.86s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 65.81s
 ```
 
 Then the quality gates: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`. Also `cargo clippy -p data-avalanche --features e2e-hooks --all-targets -- -D warnings`.
@@ -12332,13 +12397,2052 @@ git commit -m "test(e2e): scenarios 7-10: pause/stop/resume across a restart, a 
 ```
 
 
-### Task 21: CI: the E2E suite weekly on PostgreSQL 14–17
+### Task 21: The position guard compares a table's last change, not the flush frontier
+
+**Files:**
+- Modify: `crates/data-avalanche-core/src/change_set.rs`, `crates/data-avalanche-core/src/sink.rs`, `crates/data-avalanche-pipeline/src/accumulator.rs`, `crates/data-avalanche-pipeline/src/buffer.rs`, `crates/data-avalanche-sink-delta/src/test_support.rs`, `crates/data-avalanche-sink-delta/tests/sink/common.rs`, `crates/data-avalanche-testkit/src/memory_sink.rs`, `crates/data-avalanche/tests/e2e/crashes.rs`
+
+**Interfaces:**
+- Consumes: `PositionRange` and `CommitMarker::covers` (core, M3), the accumulator (M6a).
+- Produces:
+  - `PositionRange { start, end, last_change: SourcePosition }`: the commit position of the
+    range's last transaction that wrote the table. `validate` refuses a `last_change` outside
+    `start..=end`.
+  - `CommitMarker::covers` compares `last_change` (a split slice keeps its own rule; a
+    snapshot set is still never skipped). The marker still records `end`, the frontier.
+  - The accumulator records each table's last change at the commit (a slice: the transaction's
+    start) and hands it on per change set.
+
+The owner's answer to F-1 (2026-10-08): build the fix in M6b. Data-Flow's checkpoint rule
+keeps every table's `committed_position` at the flush frontier (an idle table must not pin the
+resume point), so the marker doesn't change: only what the guard compares does. A replay carries
+the same transactions with the same commit positions, so its last change is one the marker
+covers, whatever keep-alive moved its frontier. Measured: the crash scenario's replay was a third
+Delta commit before the fix and is skipped after it. The Data-Flow Phase 4 patch is
+under "Spec patches".
+
+- [ ] **Step 1: Write the failing tests**
+
+Change `crates/data-avalanche-core/src/change_set.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-core/src/change_set.rs b/crates/data-avalanche-core/src/change_set.rs
+--- a/crates/data-avalanche-core/src/change_set.rs
++++ b/crates/data-avalanche-core/src/change_set.rs
+@@ -255,6 +255,7 @@ mod tests {
+             position: PositionRange {
+                 start: SourcePosition::Pg(Lsn(10)),
+                 end: SourcePosition::Pg(Lsn(20)),
++                last_change: SourcePosition::Pg(Lsn(15)),
+             },
+             split: None,
+             snapshot: false,
+@@ -362,6 +363,21 @@ mod tests {
+         assert!(detail(c).contains("before it starts"));
+     }
+ 
++    #[test]
++    fn the_last_change_is_inside_the_range() {
++        for (lsn, ok) in [(10, true), (15, true), (20, true), (9, false), (21, false)] {
++            let mut c = cs(vec![], vec![]);
++            c.position.last_change = SourcePosition::Pg(Lsn(lsn));
++            match c.validate() {
++                Ok(()) => assert!(ok, "{lsn} accepted"),
++                Err(e) => {
++                    assert!(!ok, "{lsn}: {}", e.detail);
++                    assert!(e.detail.contains("outside the range"), "{}", e.detail);
++                }
++            }
++        }
++    }
++
+     #[test]
+     fn a_range_across_dialects_names_both() {
+         let mut c = cs(vec![], vec![]);
+```
+
+Change `crates/data-avalanche-core/src/sink.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-core/src/sink.rs b/crates/data-avalanche-core/src/sink.rs
+--- a/crates/data-avalanche-core/src/sink.rs
++++ b/crates/data-avalanche-core/src/sink.rs
+@@ -351,6 +351,10 @@ mod tests {
+     }
+ 
+     fn change_set(end: u64, split: Option<SplitInfo>) -> TableChangeSet {
++        ranged(end, end, split)
++    }
++
++    fn ranged(last_change: u64, end: u64, split: Option<SplitInfo>) -> TableChangeSet {
+         let t = table();
+         TableChangeSet {
+             table: t.table().clone(),
+@@ -362,6 +366,7 @@ mod tests {
+             position: PositionRange {
+                 start: SourcePosition::Pg(Lsn(1)),
+                 end: SourcePosition::Pg(Lsn(end)),
++                last_change: SourcePosition::Pg(Lsn(last_change)),
+             },
+             split,
+             snapshot: false,
+@@ -455,6 +460,20 @@ mod tests {
+         assert!(!stored.covers(&change_set(101, None)).unwrap());
+     }
+ 
++    #[test]
++    fn the_guard_compares_the_last_change_not_the_frontier() {
++        let stored = marker(1, 100);
++        assert!(
++            stored.covers(&ranged(90, 120, None)).unwrap(),
++            "a replay whose flush read past the marker carries only what the table has"
++        );
++        assert!(stored.covers(&ranged(100, 120, None)).unwrap());
++        assert!(
++            !stored.covers(&ranged(110, 120, None)).unwrap(),
++            "a transaction past the marker is owed"
++        );
++    }
++
+     #[test]
+     fn the_guard_never_skips_a_snapshot_set() {
+         let mut chunk = change_set(100, None);
+```
+
+Change `crates/data-avalanche-pipeline/src/accumulator.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-pipeline/src/accumulator.rs b/crates/data-avalanche-pipeline/src/accumulator.rs
+--- a/crates/data-avalanche-pipeline/src/accumulator.rs
++++ b/crates/data-avalanche-pipeline/src/accumulator.rs
+@@ -505,6 +505,12 @@ mod tests {
+                 (&lsn(100), &lsn(300))
+             );
+         }
++        let last: Vec<_> = f
++            .change_sets
++            .iter()
++            .map(|cs| (cs.table.name.as_str(), &cs.position.last_change))
++            .collect();
++        assert_eq!(last, [("a", &lsn(300)), ("b", &lsn(200))]);
+         assert_eq!(f.change_sets[0].upsert_rows(), 2);
+         txn(&mut a, 3, 400, &[("b", 5)], t0);
+         let f = a.flush();
+@@ -661,6 +667,28 @@ mod tests {
+         assert_eq!(f.checkpoint, lsn(200));
+     }
+ 
++    #[test]
++    fn a_keepalive_moves_the_end_but_not_the_last_change() {
++        let t0 = Instant::now();
++        let mut a = acc(FlushPolicy::default());
++        txn(&mut a, 1, 200, &[("a", 1)], t0);
++        a.keepalive(&lsn(250), t0).unwrap();
++        let f = a.flush();
++        let cs = &f.change_sets[0];
++        cs.validate().unwrap();
++        assert_eq!(
++            (&cs.position.end, &cs.position.last_change),
++            (&lsn(250), &lsn(200))
++        );
++        assert_eq!(f.checkpoint, lsn(250));
++        txn(&mut a, 2, 300, &[("a", 2)], t0);
++        assert_eq!(
++            a.flush().change_sets[0].position.last_change,
++            lsn(300),
++            "the next flush starts afresh"
++        );
++    }
++
+     #[test]
+     fn stream_protocol_violations_are_errors() {
+         let t0 = Instant::now();
+@@ -822,8 +850,12 @@ mod tests {
+                 Some((&lsn(200), 1))
+             );
+             assert_eq!(
+-                (&cs.position.start, &cs.position.end),
+-                (&lsn(100), &lsn(200))
++                (
++                    &cs.position.start,
++                    &cs.position.end,
++                    &cs.position.last_change
++                ),
++                (&lsn(100), &lsn(200), &lsn(200))
+             );
+         }
+         assert_eq!(
+@@ -843,6 +875,7 @@ mod tests {
+         a.commit(&boundary(2, 300), t0).unwrap();
+         let rest = a.flush();
+         assert_eq!(rest.checkpoint, lsn(300));
++        assert_eq!(rest.change_sets[0].position.last_change, lsn(300));
+         assert!(
+             rest.change_sets[0].split.is_none(),
+             "the rest is a regular flush"
+```
+
+Change `crates/data-avalanche-pipeline/src/buffer.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-pipeline/src/buffer.rs b/crates/data-avalanche-pipeline/src/buffer.rs
+--- a/crates/data-avalanche-pipeline/src/buffer.rs
++++ b/crates/data-avalanche-pipeline/src/buffer.rs
+@@ -1079,6 +1079,7 @@ mod tests {
+         PositionRange {
+             start: SourcePosition::Pg(Lsn(0)),
+             end: SourcePosition::Pg(Lsn(1000)),
++            last_change: SourcePosition::Pg(Lsn(1000)),
+         }
+     }
+ 
+```
+
+Change `crates/data-avalanche-sink-delta/src/test_support.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-sink-delta/src/test_support.rs b/crates/data-avalanche-sink-delta/src/test_support.rs
+--- a/crates/data-avalanche-sink-delta/src/test_support.rs
++++ b/crates/data-avalanche-sink-delta/src/test_support.rs
+@@ -112,6 +112,7 @@ pub(crate) fn change_set(end: u64, up: Vec<RecordBatch>, del: Vec<RecordBatch>)
+         position: PositionRange {
+             start: SourcePosition::Pg(Lsn(0)),
+             end: SourcePosition::Pg(Lsn(end)),
++            last_change: SourcePosition::Pg(Lsn(end)),
+         },
+         split: None,
+         snapshot: false,
+```
+
+Change `crates/data-avalanche-sink-delta/tests/sink/common.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-sink-delta/tests/sink/common.rs b/crates/data-avalanche-sink-delta/tests/sink/common.rs
+--- a/crates/data-avalanche-sink-delta/tests/sink/common.rs
++++ b/crates/data-avalanche-sink-delta/tests/sink/common.rs
+@@ -88,6 +88,7 @@ pub fn cs(end: u64, up: Vec<RecordBatch>, del: Vec<RecordBatch>) -> TableChangeS
+         position: PositionRange {
+             start: SourcePosition::Pg(Lsn(0)),
+             end: SourcePosition::Pg(Lsn(end)),
++            last_change: SourcePosition::Pg(Lsn(end)),
+         },
+         split: None,
+         snapshot: false,
+```
+
+Change `crates/data-avalanche-testkit/src/memory_sink.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-testkit/src/memory_sink.rs b/crates/data-avalanche-testkit/src/memory_sink.rs
+--- a/crates/data-avalanche-testkit/src/memory_sink.rs
++++ b/crates/data-avalanche-testkit/src/memory_sink.rs
+@@ -531,6 +531,7 @@ mod tests {
+             position: PositionRange {
+                 start: SourcePosition::Pg(Lsn(0)),
+                 end: SourcePosition::Pg(Lsn(end)),
++                last_change: SourcePosition::Pg(Lsn(end)),
+             },
+             split: None,
+             snapshot: false,
+@@ -633,6 +634,7 @@ mod tests {
+             c.position = PositionRange {
+                 start: end.clone(),
+                 end: end.clone(),
++                last_change: end.clone(),
+             };
+             commit(&sink, c, 1).await;
+         }
+```
+
+Change `crates/data-avalanche/tests/e2e/crashes.rs`:
+
+```diff
+diff --git a/crates/data-avalanche/tests/e2e/crashes.rs b/crates/data-avalanche/tests/e2e/crashes.rs
+--- a/crates/data-avalanche/tests/e2e/crashes.rs
++++ b/crates/data-avalanche/tests/e2e/crashes.rs
+@@ -58,12 +58,11 @@ async fn a_crash_mid_snapshot_resumes_it() {
+     e.cleanup().await;
+ }
+ 
+-/// A crash after a commit, before its checkpoint: the restart reads the transaction again and
+-/// commits it again, which the MERGE makes a no-op on the content. (The commit marker skips a
+-/// replay only when its flush ends at the marker; the flush ends at the stream's frontier, which
+-/// a keep-alive moves past the transaction.)
++/// A crash after a commit, before its checkpoint: the restart reads the transaction again, and
++/// the position guard skips it: the table's marker covers the transaction's commit, though the
++/// replay's flush may end past the marker (a keep-alive).
+ #[tokio::test]
+-async fn a_crash_between_a_commit_and_its_checkpoint_replays_it_idempotently() {
++async fn a_crash_between_a_commit_and_its_checkpoint_skips_the_replay() {
+     require_it!();
+     let e = E2e::new(
+         "crash_commit",
+@@ -86,11 +85,17 @@ async fn a_crash_between_a_commit_and_its_checkpoint_replays_it_idempotently() {
+     assert!(!status.success(), "aborted at the crash point: {status}");
+     e.mirrored("items", COLS).await;
+     let marker = e.marker("items").await;
++    let commits = e.commits("items").await;
+ 
+     let mut p = e.start(&[]);
+     p.ready().await;
+     e.acknowledged(&marker).await;
+     e.mirrored("items", COLS).await;
++    assert_eq!(
++        e.commits("items").await,
++        commits,
++        "the replay is skipped, not merged again"
++    );
+     assert_eq!(e.ids("items").await, (1..=100).collect::<Vec<i64>>());
+     e.exec("DELETE FROM items WHERE id > 50").await;
+     e.mirrored("items", COLS).await;
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+```bash
+DATA_AVALANCHE_IT=1 DATA_AVALANCHE_SKIP_GCS=1 cargo test -p data-avalanche-core -p data-avalanche-pipeline &&
+  DATA_AVALANCHE_IT=1 DATA_AVALANCHE_SKIP_GCS=1 cargo test -p data-avalanche --features e2e-hooks --test e2e -- --test-threads=1 crashes::a_crash_between_a_commit
+```
+
+Expected:
+
+FAIL to compile (3 errors); the first:
+
+```text
+error[E0560]: struct `change_set::PositionRange` has no field named `last_change`
+error[E0609]: no field `last_change` on type `change_set::PositionRange`
+… and 1 more
+```
+
+- [ ] **Step 3: Implement**
+
+Change `crates/data-avalanche-core/src/change_set.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-core/src/change_set.rs b/crates/data-avalanche-core/src/change_set.rs
+--- a/crates/data-avalanche-core/src/change_set.rs
++++ b/crates/data-avalanche-core/src/change_set.rs
+@@ -8,12 +8,17 @@ use thiserror::Error;
+ use crate::{SourcePosition, TableRef, UNCHANGED_MASK_PREFIX};
+ 
+ /// The stream range a flush covers: changes after `start` (the previous checkpoint) up to and
+-/// including `end`. `end` is what the sink records as the table's `committed_position` and what
+-/// the position guard compares (Delivery §3).
++/// including `end`. `end` is what the sink records as the table's `committed_position` (the flush
++/// frontier, Data-Flow §Checkpoint rule); `last_change` is what the position guard compares
++/// (Delivery §3).
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct PositionRange {
+     pub start: SourcePosition,
+     pub end: SourcePosition,
++    /// The commit position of the range's last transaction that wrote this table: at most `end`,
++    /// which a keep-alive or another table's transaction moves past it. A replay of the same
++    /// transactions has the same `last_change` whatever its frontier, so the guard skips it.
++    pub last_change: SourcePosition,
+ }
+ 
+ /// Marks a slice of an oversized transaction flushed before the source commit (split commits,
+@@ -40,7 +45,8 @@ pub struct SplitInfo {
+ /// - every delete batch starts with the identifier columns;
+ /// - a key appears at most once across `upserts` and `deletes` (a PK-changing UPDATE is two keys);
+ /// - identifier values are never NULL;
+-/// - the range doesn't run backwards, and a slice's range ends at its `txn_start`;
++/// - the range doesn't run backwards, `last_change` is inside it, and a slice's range ends at its
++///   `txn_start`;
+ /// - a snapshot set only upserts: no deletes, no truncate, not a slice.
+ #[derive(Debug, Clone)]
+ pub struct TableChangeSet {
+@@ -151,6 +157,20 @@ impl TableChangeSet {
+                 )));
+             }
+         }
++        let last = &self.position.last_change;
++        match (last.covers(start), end.covers(last)) {
++            (Ok(true), Ok(true)) => {}
++            (Err(e), _) | (_, Err(e)) => {
++                return Err(err(format!(
++                    "last change {last} doesn't compare with the range from {start} to {end}: {e}"
++                )));
++            }
++            _ => {
++                return Err(err(format!(
++                    "last change {last} is outside the range from {start} to {end}"
++                )));
++            }
++        }
+         if self.snapshot && (self.truncate || self.split.is_some() || self.delete_rows() > 0) {
+             return Err(err(
+                 "a snapshot set carries upserts only: no deletes, truncate or slice".into(),
+```
+
+Change `crates/data-avalanche-core/src/sink.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-core/src/sink.rs b/crates/data-avalanche-core/src/sink.rs
+--- a/crates/data-avalanche-core/src/sink.rs
++++ b/crates/data-avalanche-core/src/sink.rs
+@@ -176,6 +176,10 @@ impl CommitMarker {
+     /// commit is skipped (Delivery §3). Committing again would only repeat an idempotent write,
+     /// except for replayed history, which the guard is what keeps out.
+     ///
++    /// The marker covers the set's `last_change`, not its `end`: the end is the flush's frontier,
++    /// which a replay's flush may read past the marker (a keep-alive, another table's
++    /// transaction) while carrying only the transactions the table already has.
++    ///
+     /// A split slice ends at its pinned `txn_start`, which the marker equals from the transaction's
+     /// first slice on, so "covers the end" can't tell a slice still owed from one already applied.
+     /// It is skipped only when the marker is strictly past `txn_start`: the transaction's commit (or
+@@ -191,7 +195,7 @@ impl CommitMarker {
+         let stored = &self.committed_position;
+         match &cs.split {
+             Some(split) => Ok(stored.covers(&split.txn_start)? && !split.txn_start.covers(stored)?),
+-            None => stored.covers(&cs.position.end),
++            None => stored.covers(&cs.position.last_change),
+         }
+     }
+ }
+```
+
+Change `crates/data-avalanche-pipeline/src/accumulator.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-pipeline/src/accumulator.rs b/crates/data-avalanche-pipeline/src/accumulator.rs
+--- a/crates/data-avalanche-pipeline/src/accumulator.rs
++++ b/crates/data-avalanche-pipeline/src/accumulator.rs
+@@ -4,7 +4,10 @@
+ //! Positions: the **frontier** is the commit position of the last complete transaction (or a
+ //! keep-alive past it); the **checkpoint** is the frontier of the last flush. A flush covers
+ //! `checkpoint..=frontier` and moves the checkpoint to the frontier, which is where the pipeline
+-//! resumes once every change set of the flush is committed.
++//! resumes once every change set of the flush is committed. Each table's change set also carries
++//! its **last change**: the commit position of the last transaction that wrote the table, which
++//! the sink's position guard compares (a replay's frontier may be past the table's marker while
++//! its transactions aren't).
+ 
+ use std::collections::{BTreeMap, BTreeSet};
+ use std::time::{Duration, Instant};
+@@ -42,6 +45,9 @@ pub struct Accumulator {
+     tables: BTreeMap<TableRef, TableBuffer>,
+     /// Halted tables: their events are dropped.
+     halted: BTreeSet<TableRef>,
++    /// Per table with changes no flush has taken: the commit position of the last transaction
++    /// that wrote it (a slice's: the transaction's start).
++    last_change: BTreeMap<TableRef, SourcePosition>,
+     txn: Option<OpenTxn>,
+     checkpoint: SourcePosition,
+     frontier: SourcePosition,
+@@ -58,6 +64,7 @@ impl Accumulator {
+             limits: TxnLimits::default(),
+             tables: BTreeMap::new(),
+             halted: BTreeSet::new(),
++            last_change: BTreeMap::new(),
+             txn: None,
+             checkpoint: resume_from.clone(),
+             frontier: resume_from,
+@@ -120,6 +127,7 @@ impl Accumulator {
+     /// Calling it again changes nothing.
+     pub fn halt_table(&mut self, table: &TableRef) {
+         self.tables.remove(table);
++        self.last_change.remove(table);
+         self.halted.insert(table.clone());
+     }
+ 
+@@ -277,9 +285,7 @@ impl Accumulator {
+         }
+         self.advance(&boundary.commit_pos)?;
+         let txn = self.txn.take().expect("checked above");
+-        for buffer in self.tables.values_mut() {
+-            buffer.commit_txn();
+-        }
++        self.commit_open(&boundary.commit_pos);
+         let since = txn.first_event_at.unwrap_or(now);
+         self.flushable_since = Some(self.flushable_since.map_or(since, |s| s.min(since)));
+         Ok(())
+@@ -347,19 +353,41 @@ impl Accumulator {
+         None
+     }
+ 
++    /// Moves every buffer's open transaction to its committed layer; a table it wrote has its
++    /// last change at `at`.
++    fn commit_open(&mut self, at: &SourcePosition) {
++        for (table, buffer) in &mut self.tables {
++            if buffer.open_events() > 0 {
++                self.last_change.insert(table.clone(), at.clone());
++            }
++            buffer.commit_txn();
++        }
++    }
++
++    /// Takes the committed layers of the tables that have changes as change sets.
++    fn take(&mut self, split: Option<SplitInfo>) -> Vec<TableChangeSet> {
++        let (start, end) = (&self.checkpoint, &self.frontier);
++        self.tables
++            .iter_mut()
++            .filter(|(_, b)| b.committed_events() > 0)
++            .map(|(table, b)| {
++                let position = PositionRange {
++                    start: start.clone(),
++                    end: end.clone(),
++                    last_change: self
++                        .last_change
++                        .remove(table)
++                        .unwrap_or_else(|| end.clone()),
++                };
++                b.flush(&self.lineage, position, split.clone())
++            })
++            .collect()
++    }
++
+     /// Takes every complete transaction as change sets covering `checkpoint..=frontier`; an open
+     /// transaction stays buffered.
+     pub fn flush(&mut self) -> Flush {
+-        let position = PositionRange {
+-            start: self.checkpoint.clone(),
+-            end: self.frontier.clone(),
+-        };
+-        let change_sets = self
+-            .tables
+-            .values_mut()
+-            .filter(|b| b.committed_events() > 0)
+-            .map(|b| b.flush(&self.lineage, position.clone(), None))
+-            .collect();
++        let change_sets = self.take(None);
+         self.checkpoint = self.frontier.clone();
+         self.flushable_since = None;
+         Flush {
+@@ -383,17 +411,9 @@ impl Accumulator {
+             txn_start: self.frontier.clone(),
+             slice: txn.slices,
+         };
+-        let position = PositionRange {
+-            start: self.checkpoint.clone(),
+-            end: self.frontier.clone(),
+-        };
+-        let mut change_sets = Vec::new();
+-        for b in self.tables.values_mut() {
+-            b.commit_txn();
+-            if b.committed_events() > 0 {
+-                change_sets.push(b.flush(&self.lineage, position.clone(), Some(split.clone())));
+-            }
+-        }
++        let start = split.txn_start.clone();
++        self.commit_open(&start);
++        let change_sets = self.take(Some(split));
+         self.checkpoint = self.frontier.clone();
+         self.flushable_since = None;
+         Ok(Flush {
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+```bash
+DATA_AVALANCHE_IT=1 DATA_AVALANCHE_SKIP_GCS=1 cargo test -p data-avalanche-core -p data-avalanche-pipeline &&
+  DATA_AVALANCHE_IT=1 DATA_AVALANCHE_SKIP_GCS=1 cargo test -p data-avalanche --features e2e-hooks --test e2e -- --test-threads=1 crashes::a_crash_between_a_commit
+```
+
+Expected:
+
+PASS:
+
+```text
+test result: ok. 149 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 186 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.14s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.45s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.83s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.32s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 51.65s
+```
+
+Then the quality gates: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add -A
+git commit -m "fix(core): the position guard compares a table's last change, not the flush frontier: a replay whose flush read past the marker is skipped (F-1)"
+```
+
+
+### Task 22: The stream watchdog, and a bounded catalog connect
+
+**Files:**
+- Create: `crates/data-avalanche-pipeline/src/watchdog.rs`
+- Modify: `crates/data-avalanche-cluster/src/controller.rs`, `crates/data-avalanche-core/src/lib.rs`, `crates/data-avalanche-core/src/source.rs`, `crates/data-avalanche-pipeline/src/lib.rs`, `crates/data-avalanche-pipeline/src/session.rs`, `crates/data-avalanche-pipeline/src/session/snapshot.rs`, `crates/data-avalanche-pipeline/src/worker.rs`, `crates/data-avalanche-source-pg/src/connect.rs`, `crates/data-avalanche-source-pg/src/connector.rs`, `crates/data-avalanche-source-pg/src/slot.rs`, `crates/data-avalanche-source-pg/tests/pg/slot.rs`, `crates/data-avalanche-testkit/src/fake_source.rs`, `crates/data-avalanche/tests/e2e/guards.rs`, `crates/data-avalanche/tests/e2e/harness.rs`
+
+**Interfaces:**
+- Consumes: the session's heartbeat (M6a), `SourceConnector` (core), `Connector` (source-pg).
+- Produces:
+  - `SourceConnector::retained(&self) -> Result<Option<RetainedLog>, SourceError>`, replacing
+    `retained_bytes`; `RetainedLog { bytes: u64, streamed: bool }` (PostgreSQL: the slot's
+    `active`).
+  - The session runs the heartbeat's read beside its loop (a `JoinSet`, one read at a time).
+    A stream silent for `SILENT_HEARTBEATS` (3) heartbeats while 3 reads in a row failed or
+    found no reader ends the session with `SourceError::Transient("the source isn't
+    answering: …")`, and the worker reconnects. A read still out counts neither way.
+  - `Connector::connect` is bounded by `timeouts.connect` as a whole (TCP, TLS, startup,
+    authentication).
+  - The worker sets `reconnects` and `Phase::Reconnecting { error }` in one status update; the
+    controller logs each reconnect with its reason.
+  - testkit: `Method::Retained`, `FakeSource::detach_stream`, `FakeSource::stall_retained`.
+  - The E2E harness: `Options::source` (keys beyond the connection).
+
+The owner's answer to F-3 (2026-10-08): DA-SRC-16 in M6b.
+- **Measured before the fix:** PostgreSQL 14 frozen with `docker pause` for 150 s under a running
+  pipeline (heartbeat 5 s). Status stayed `running`, the reconnects counter stayed 0, and
+  nothing was logged: a heartbeat read's transient failure is dropped silently. A paused
+  container still answers TCP, so a keep-alive wouldn't have told either.
+- **The connect:** tokio-postgres's `connect_timeout` bounds only the TCP connect. Against a
+  server that accepts and never answers, the startup waits forever, holding the shared
+  connection's lock (`a_connect_to_a_server_that_never_answers_times_out` fails without the
+  bound).
+- **After the fix:** the E2E scenario (heartbeat 1 s, timeouts 2 s) logs the reconnect and its
+  reason during the freeze and converges after the unpause, 27 s for the whole scenario.
+- The config patch notes the watchdog under `heartbeat` and `timeouts.connect`.
+- **Also run at execution:** `cargo test -p data-avalanche-source-pg -- --test-threads=1 tls::`
+  (with `DATA_AVALANCHE_IT=1`). The bounded connect wraps the TLS connect too, and the planning
+  workspace couldn't run these tests: they read `test-infra/.tls`, which only the repository
+  has.
+
+- [ ] **Step 1: Write the failing tests**
+
+Change `crates/data-avalanche-core/src/source.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-core/src/source.rs b/crates/data-avalanche-core/src/source.rs
+--- a/crates/data-avalanche-core/src/source.rs
++++ b/crates/data-avalanche-core/src/source.rs
+@@ -469,7 +469,7 @@ mod tests {
+                 warnings: vec![],
+             })
+         }
+-        async fn retained_bytes(&self) -> Result<Option<u64>, SourceError> {
++        async fn retained(&self) -> Result<Option<RetainedLog>, SourceError> {
+             Ok(None)
+         }
+         async fn reset_position(&self) -> Result<SourcePosition, SourceError> {
+```
+
+Change `crates/data-avalanche-pipeline/src/lib.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-pipeline/src/lib.rs b/crates/data-avalanche-pipeline/src/lib.rs
+--- a/crates/data-avalanche-pipeline/src/lib.rs
++++ b/crates/data-avalanche-pipeline/src/lib.rs
+@@ -23,6 +23,7 @@ pub mod status;
+ mod test_support;
+ pub mod worker;
+ mod writer;
++mod watchdog;
+ 
+ pub use accumulator::{Accumulator, Flush};
+ pub use backoff::Backoff;
+```
+
+Change `crates/data-avalanche-pipeline/src/session.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-pipeline/src/session.rs b/crates/data-avalanche-pipeline/src/session.rs
+--- a/crates/data-avalanche-pipeline/src/session.rs
++++ b/crates/data-avalanche-pipeline/src/session.rs
+@@ -1805,13 +1805,11 @@ mod tests {
+                 .collect()
+         };
+         let driver = async {
+-            w.source.fail(
+-                Method::RetainedBytes,
+-                SourceError::Transient("reset".into()),
+-            );
++            w.source
++                .fail(Method::Retained, SourceError::Transient("reset".into()));
+             for _ in 0..2 {
+                 w.source.fail(
+-                    Method::RetainedBytes,
++                    Method::Retained,
+                     SourceError::Permanent("permission denied".into()),
+                 );
+             }
+@@ -1826,7 +1824,7 @@ mod tests {
+             w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+             durable(&status, w.source.wal_end()).await;
+             w.source.fail(
+-                Method::RetainedBytes,
++                Method::Retained,
+                 SourceError::Permanent("permission denied again".into()),
+             );
+             wait_until("a new streak warns", || blind().len() == 2).await;
+@@ -1840,6 +1838,71 @@ mod tests {
+         assert_eq!(w.ids("a"), [1, 2]);
+     }
+ 
++    /// A source that stops answering (a frozen server, DA-SRC-16): the stream is silent and the
++    /// heartbeat's reads time out, so the session ends as a transient source error and the
++    /// worker reconnects.
++    #[tokio::test]
++    async fn a_silent_stream_whose_source_doesn_t_answer_ends_the_session() {
++        let w = World::new(&["a"]);
++        w.started(&["a"]).await;
++        let p = pipeline("", "flush: { seconds: 0 }", "");
++        let (mut core, _control, _status) = w.core(&p, &["a"]);
++        core.settings.heartbeat = Duration::from_millis(5);
++        for _ in 0..10 {
++            w.source.fail(
++                Method::Retained,
++                SourceError::Transient("measure the slot's WAL timed out after 30s".into()),
++            );
++        }
++        let s = Session::open(&mut core).await.unwrap().unwrap();
++        let end = s.run().await.unwrap();
++        let End::Source(SourceError::Transient(why)) = end else {
++            panic!("{end:?}")
++        };
++        assert!(why.starts_with("the source isn't answering"), "{why}");
++        assert!(why.contains("timed out after 30s"), "{why}");
++    }
++
++    /// The server dropped the stream without the client hearing of it: the slot has no reader.
++    #[tokio::test]
++    async fn a_silent_stream_on_a_slot_no_stream_reads_ends_the_session() {
++        let w = World::new(&["a"]);
++        w.started(&["a"]).await;
++        let p = pipeline("", "flush: { seconds: 0 }", "");
++        let (mut core, _control, _status) = w.core(&p, &["a"]);
++        core.settings.heartbeat = Duration::from_millis(5);
++        let s = Session::open(&mut core).await.unwrap().unwrap();
++        w.source.set_retained(Some(0));
++        w.source.detach_stream();
++        let end = s.run().await.unwrap();
++        let End::Source(SourceError::Transient(why)) = end else {
++            panic!("{end:?}")
++        };
++        assert!(why.contains("no stream reads the slot"), "{why}");
++    }
++
++    /// A heartbeat read that never comes back holds up neither the stream nor a drain, and
++    /// counts against nothing: it may wait behind a chunk read on a shared connection.
++    #[tokio::test]
++    async fn a_stalled_heartbeat_read_holds_up_nothing() {
++        let w = World::new(&["a"]);
++        w.started(&["a"]).await;
++        let p = pipeline("", "flush: { seconds: 0 }", "");
++        let (mut core, control, status) = w.core(&p, &["a"]);
++        core.settings.heartbeat = Duration::from_millis(5);
++        w.source.stall_retained();
++        let s = Session::open(&mut core).await.unwrap().unwrap();
++        let driver = async {
++            tokio::time::sleep(Duration::from_millis(100)).await;
++            w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
++            durable(&status, w.source.wal_end()).await;
++            control.send(Command::Drain).await.unwrap();
++        };
++        let (end, ()) = tokio::join!(s.run(), driver);
++        assert!(matches!(end.unwrap(), End::Exit(Exit::Drained)));
++        assert_eq!(w.ids("a"), [1]);
++    }
++
+     /// The blind warning names what is blind: the bound when `max_wal_lag_bytes` is set, else the
+     /// reported lag.
+     #[tokio::test]
+@@ -1856,11 +1919,8 @@ mod tests {
+             let p = pipeline("", "flush: { seconds: 0 }", postgres);
+             let (mut core, _control, status) = w.core(&p, &["a"]);
+             let mut s = Session::open(&mut core).await.unwrap().unwrap();
+-            w.source.fail(
+-                Method::RetainedBytes,
+-                SourceError::Permanent("permission denied".into()),
+-            );
+-            s.wal_lag().await.unwrap();
++            s.wal_lag(Ok(Err(SourceError::Permanent("permission denied".into()))))
++                .unwrap();
+             let warnings = status.borrow().warnings.clone();
+             assert!(
+                 matches!(&warnings[..], [m] if m.starts_with("the WAL-lag guard is blind") && m.ends_with(tail)),
+```
+
+Change `crates/data-avalanche-pipeline/src/session/snapshot.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-pipeline/src/session/snapshot.rs b/crates/data-avalanche-pipeline/src/session/snapshot.rs
+--- a/crates/data-avalanche-pipeline/src/session/snapshot.rs
++++ b/crates/data-avalanche-pipeline/src/session/snapshot.rs
+@@ -1080,9 +1080,9 @@ mod tests {
+         );
+     }
+ 
+-    /// Chunk reads share the source's connection with the heartbeat's `retained_bytes`, which the
+-    /// session awaits inline: a read hands back its rows only while that call waits, so the reads
+-    /// must be polled while the session awaits it (Task 13 review I3).
++    /// Chunk reads share the source's connection with the heartbeat's `retained`: a read hands
++    /// back its rows only while that call waits, so the reads must be polled while the call is
++    /// out (Task 13 review I3).
+     #[tokio::test]
+     async fn a_chunk_read_goes_on_while_the_session_awaits_the_source() {
+         let w = World::new(&["a"]);
+```
+
+Create `crates/data-avalanche-pipeline/src/watchdog.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failed(w: &mut Watchdog) {
+        w.answered(Some("timed out".into()));
+    }
+
+    #[test]
+    fn a_silent_stream_while_the_reads_fail_ends_the_session() {
+        let mut w = Watchdog::default();
+        for _ in 0..SILENT_HEARTBEATS - 1 {
+            failed(&mut w);
+            assert_eq!(w.beat(true), None);
+        }
+        failed(&mut w);
+        let why = w.beat(true).unwrap();
+        assert!(why.contains("no stream message for 3 heartbeats"), "{why}");
+        assert!(why.contains("timed out"), "{why}");
+    }
+
+    #[test]
+    fn silence_alone_is_an_idle_source() {
+        let mut w = Watchdog::default();
+        for _ in 0..10 {
+            w.answered(None);
+            assert_eq!(w.beat(true), None);
+        }
+    }
+
+    #[test]
+    fn failing_reads_beside_a_live_stream_are_the_catalog_s_trouble() {
+        let mut w = Watchdog::default();
+        for _ in 0..10 {
+            failed(&mut w);
+            w.heard();
+            assert_eq!(w.beat(true), None);
+        }
+    }
+
+    #[test]
+    fn a_session_that_doesn_t_read_isn_t_silent() {
+        let mut w = Watchdog::default();
+        for _ in 0..10 {
+            failed(&mut w);
+            assert_eq!(w.beat(false), None, "paused, or waiting for room");
+        }
+        failed(&mut w);
+        assert_eq!(w.beat(true), None, "the count starts again");
+    }
+
+    #[test]
+    fn an_answer_or_a_message_starts_the_count_again() {
+        let mut w = Watchdog::default();
+        for _ in 0..SILENT_HEARTBEATS - 1 {
+            failed(&mut w);
+            w.beat(true);
+        }
+        w.answered(None);
+        failed(&mut w);
+        assert_eq!(w.beat(true), None, "one unanswered read since the answer");
+        w.heard();
+        failed(&mut w);
+        failed(&mut w);
+        assert_eq!(w.beat(true), None, "the message reset the silence");
+    }
+}
+```
+
+Change `crates/data-avalanche-source-pg/src/connect.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-source-pg/src/connect.rs b/crates/data-avalanche-source-pg/src/connect.rs
+--- a/crates/data-avalanche-source-pg/src/connect.rs
++++ b/crates/data-avalanche-source-pg/src/connect.rs
+@@ -267,6 +267,33 @@ mod tests {
+         );
+     }
+ 
++    /// A server that accepts the connection and never answers: the startup times out.
++    #[tokio::test]
++    async fn a_connect_to_a_server_that_never_answers_times_out() {
++        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let port = listener.local_addr().unwrap().port();
++        let held = tokio::spawn(async move {
++            let mut sockets = vec![];
++            while let Ok((s, _)) = listener.accept().await {
++                sockets.push(s);
++            }
++        });
++        let mut source = pipeline("public.t").source;
++        source.port = port;
++        source.timeouts.connect = Duration::from_millis(300);
++        let c = Connector::new(&source).unwrap();
++        let err = tokio::time::timeout(Duration::from_secs(5), c.client())
++            .await
++            .expect("the startup is bounded by timeouts.connect")
++            .unwrap_err();
++        assert!(err.is_transient(), "{err}");
++        assert!(
++            err.to_string().contains("connect to the source timed out"),
++            "{err}"
++        );
++        held.abort();
++    }
++
+     #[test]
+     fn the_replication_connection_pins_the_same_session() {
+         let c = Connector::new(&pipeline("public.t").source).unwrap();
+```
+
+Change `crates/data-avalanche-source-pg/tests/pg/slot.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-source-pg/tests/pg/slot.rs b/crates/data-avalanche-source-pg/tests/pg/slot.rs
+--- a/crates/data-avalanche-source-pg/tests/pg/slot.rs
++++ b/crates/data-avalanche-source-pg/tests/pg/slot.rs
+@@ -8,7 +8,7 @@ use data_avalanche_core::{SnapshotReason, SourceError, SourcePosition, StartPlan
+ use data_avalanche_testkit::require_it;
+ use tokio_postgres::Client;
+ 
+-use crate::common::{Names, admin, cleanup, connector, fresh, pipeline};
++use crate::common::{Names, admin, cleanup, connector, first_stream, fresh, pipeline};
+ 
+ const DDL: &str = "CREATE TABLE a (id int PRIMARY KEY); CREATE TABLE b (id int PRIMARY KEY);
+                    CREATE TABLE c (id int PRIMARY KEY);";
+@@ -423,13 +423,43 @@ async fn a_root_publication_of_tracked_partitions_is_refused() {
+     cleanup(&a, &n).await;
+ }
+ 
++/// The heartbeat's read says whether a stream reads the slot: the stream watchdog's evidence
++/// that a silent stream is still there (DA-SRC-16).
++#[tokio::test]
++async fn the_retained_log_says_whether_a_stream_reads_the_slot() {
++    require_it!();
++    let a = admin().await;
++    let n = fresh(&a, "slot_streamed", DDL).await;
++    let c = connector(&pipeline(&n, &["*"], "", ""));
++    let streamed = async |want: bool| {
++        let deadline = std::time::Instant::now() + Duration::from_secs(30);
++        loop {
++            let log = c.retained().await.unwrap().expect("the slot");
++            if log.streamed == want {
++                return;
++            }
++            assert!(
++                std::time::Instant::now() < deadline,
++                "streamed stayed {}",
++                log.streamed
++            );
++            tokio::time::sleep(Duration::from_millis(100)).await;
++        }
++    };
++    let (stream, _, _) = first_stream(&c).await;
++    streamed(true).await;
++    drop(stream);
++    streamed(false).await;
++    cleanup(&a, &n).await;
++}
++
+ #[tokio::test]
+ async fn reset_teardown_and_retained_wal() {
+     require_it!();
+     let a = admin().await;
+     let n = fresh(&a, "slot_reset", DDL).await;
+     let c = connector(&pipeline(&n, &["*"], "", ""));
+-    assert_eq!(c.retained_bytes().await.unwrap(), None, "no slot yet");
++    assert_eq!(c.retained().await.unwrap(), None, "no slot yet");
+     let p = c.prepare(None, &[n.table("a")]).await.unwrap();
+     let start = from(&p.plan, SnapshotReason::FirstStart);
+     a.execute(
+@@ -441,8 +471,9 @@ async fn reset_teardown_and_retained_wal() {
+     )
+     .await
+     .unwrap();
+-    let retained = c.retained_bytes().await.unwrap().unwrap();
+-    assert!(retained > 0, "WAL written since the slot's position");
++    let retained = c.retained().await.unwrap().unwrap();
++    assert!(retained.bytes > 0, "WAL written since the slot's position");
++    assert!(!retained.streamed, "no stream reads the slot");
+ 
+     let SourcePosition::Pg(fresh_at) = c.reset_position().await.unwrap() else {
+         panic!("a PostgreSQL position")
+```
+
+Change `crates/data-avalanche-testkit/src/fake_source.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-testkit/src/fake_source.rs b/crates/data-avalanche-testkit/src/fake_source.rs
+--- a/crates/data-avalanche-testkit/src/fake_source.rs
++++ b/crates/data-avalanche-testkit/src/fake_source.rs
+@@ -32,8 +32,8 @@ use async_trait::async_trait;
+ use data_avalanche_core::position::Lsn;
+ use data_avalanche_core::{
+     CdcEvent, ChangeStream, Chunk, ChunkVisibility, ColumnSchema, ColumnValue, HaltReason,
+-    InFlightTxn, KeysetCursor, Op, Preflight, Prepared, RescanReport, ResolvedTables, Row,
+-    SchemaChange, SchemaDelta, SchemaHint, SnapshotReason, SourceConnector, SourceError,
++    InFlightTxn, KeysetCursor, Op, Preflight, Prepared, RescanReport, ResolvedTables, RetainedLog,
++    Row, SchemaChange, SchemaDelta, SchemaHint, SnapshotReason, SourceConnector, SourceError,
+     SourcePosition, SourceSeq, StartPlan, StreamItem, TableRef, TableSchema, TransactionBoundary,
+     XidSnapshot, identifier_values,
+ };
+@@ -46,7 +46,7 @@ pub enum Method {
+     ResolveTables,
+     Prepare,
+     ResetPosition,
+-    RetainedBytes,
++    Retained,
+     CurrentPosition,
+     InFlight,
+     ReadChunk,
+@@ -228,6 +228,10 @@ struct Db {
+     slot_lost: bool,
+     added: Vec<TableRef>,
+     retained: Option<Option<u64>>,
++    /// [`FakeSource::detach_stream`].
++    detached: bool,
++    /// [`FakeSource::stall_retained`].
++    retained_stalled: bool,
+     faults: Vec<(Method, SourceError)>,
+     hold_reads: bool,
+     hold_stream: bool,
+@@ -280,6 +284,8 @@ impl FakeSource {
+             slot_lost: false,
+             added: vec![],
+             retained: None,
++            detached: false,
++            retained_stalled: false,
+             faults: vec![],
+             hold_reads: false,
+             hold_stream: false,
+@@ -425,11 +431,22 @@ impl FakeSource {
+         self.db().added = tables.to_vec();
+     }
+ 
+-    /// What `retained_bytes` reports from now on (by default, the log from the slot to its end).
++    /// The bytes `retained` reports from now on (by default, the log from the slot to its end).
+     pub fn set_retained(&self, bytes: Option<u64>) {
+         self.db().retained = Some(bytes);
+     }
+ 
++    /// `retained` reports that no stream reads the slot, whatever the open streams do: a stream
++    /// the source dropped without the client hearing of it (DA-SRC-16).
++    pub fn detach_stream(&self) {
++        self.db().detached = true;
++    }
++
++    /// `retained` calls wait forever from now on: a source that accepts and never answers.
++    pub fn stall_retained(&self) {
++        self.db().retained_stalled = true;
++    }
++
+     /// The next call of `method` fails with `error`.
+     pub fn fail(&self, method: Method, error: SourceError) {
+         self.db().faults.push((method, error));
+@@ -441,7 +458,7 @@ impl FakeSource {
+         self.db().hold_reads = true;
+     }
+ 
+-    /// Chunk reads, `retained_bytes` and `in_flight` share one connection from now on, as they do
++    /// Chunk reads, `retained` and `in_flight` share one connection from now on, as they do
+     /// on PostgreSQL's catalog client, whose response channel holds one message: a read that has
+     /// its rows hands them back only while one of those calls waits on the connection, and the
+     /// call waits until no read is half done. A caller that awaits such a call without polling
+@@ -892,14 +909,21 @@ impl SourceConnector for FakeSource {
+         Ok(SourcePosition::Pg(db.wal_end))
+     }
+ 
+-    async fn retained_bytes(&self) -> Result<Option<u64>, SourceError> {
+-        self.take_fault(Method::RetainedBytes)?;
++    async fn retained(&self) -> Result<Option<RetainedLog>, SourceError> {
++        self.take_fault(Method::Retained)?;
++        if self.db().retained_stalled {
++            std::future::pending::<()>().await;
++        }
+         self.connection().await;
+         let db = self.db();
+-        Ok(match db.retained {
++        let bytes = match db.retained {
+             Some(r) => r,
+             None => db.slot.map(|s| db.wal_end.0.saturating_sub(s.0)),
+-        })
++        };
++        Ok(bytes.map(|bytes| RetainedLog {
++            bytes,
++            streamed: !db.detached,
++        }))
+     }
+ 
+     async fn current_position(&self) -> Result<SourcePosition, SourceError> {
+```
+
+Change `crates/data-avalanche/tests/e2e/guards.rs`:
+
+```diff
+diff --git a/crates/data-avalanche/tests/e2e/guards.rs b/crates/data-avalanche/tests/e2e/guards.rs
+--- a/crates/data-avalanche/tests/e2e/guards.rs
++++ b/crates/data-avalanche/tests/e2e/guards.rs
+@@ -1,9 +1,12 @@
+-//! Scenario 10, the guards: the WAL a slot retains, the open transaction's buffer, and a slot
+-//! whose WAL is gone.
++//! Scenario 10, the guards: the WAL a slot retains, the open transaction's buffer, a slot whose
++//! WAL is gone, and a source that stops answering.
++
++use std::process::{Command, Stdio};
++use std::time::Duration;
+ 
+ use data_avalanche_testkit::require_it;
+ 
+-use crate::harness::{E2e, Options, admin};
++use crate::harness::{E2e, Options, admin, eventually, pg_port};
+ 
+ const TABLES: &str = "CREATE TABLE items (id bigint PRIMARY KEY, doc text);
+      CREATE TABLE pad (id bigserial PRIMARY KEY, doc text);";
+@@ -156,3 +159,86 @@ async fn a_slot_whose_wal_is_gone_is_snapshotted_again() {
+     assert!(p.terminate().await.success());
+     e.cleanup().await;
+ }
++
++/// The server under test, frozen (`docker pause`) until dropped, on every path out of the test:
++/// a server that keeps its connections open and never answers.
++struct Frozen(String);
++
++impl Frozen {
++    fn new() -> Self {
++        // test-infra/compose.yaml: project `data-avalanche-test`, `postgres-<major>` on 554<major>.
++        let name = format!("data-avalanche-test-postgres-{}-1", pg_port() - 55400);
++        docker("pause", &name);
++        Self(name)
++    }
++}
++
++impl Drop for Frozen {
++    fn drop(&mut self) {
++        docker("unpause", &self.0);
++    }
++}
++
++fn docker(verb: &str, container: &str) {
++    let status = Command::new("docker")
++        .args([verb, container])
++        .stdout(Stdio::null())
++        .status()
++        .expect("docker runs");
++    assert!(status.success(), "docker {verb} {container}: {status}");
++}
++
++/// The reconnects counter's value.
++fn reconnects(metrics: &str) -> u64 {
++    metrics
++        .lines()
++        .find_map(|l| {
++            l.strip_prefix("data_avalanche_source_reconnects_total{")
++                .and_then(|rest| rest.rsplit_once(' '))
++                .map(|(_, v)| v.parse().expect("a count"))
++        })
++        .expect("the reconnects series")
++}
++
++/// A source that stops answering (DA-SRC-16): the stream goes silent and the heartbeat's reads
++/// time out, so the session ends and the pipeline reconnects, again and again while the server
++/// is frozen; once it answers, the pipeline streams again.
++#[tokio::test]
++async fn a_source_that_stops_answering_is_reconnected_to() {
++    require_it!();
++    let e = E2e::new(
++        "guard_frozen",
++        "CREATE TABLE items (id bigint PRIMARY KEY, doc text);",
++        Options {
++            tables: ", snapshots: { mode: never }",
++            source: "timeouts: { connect: 2s, command: 2s }",
++            postgres: ", heartbeat: 1s",
++            ..Options::default()
++        },
++    )
++    .await;
++    let mut p = e.start(&[]);
++    p.ready().await;
++    e.streaming().await;
++    e.exec("INSERT INTO items VALUES (1, 'before')").await;
++    e.mirrored("items", &["id", "doc"]).await;
++    assert_eq!(reconnects(&p.metrics().await), 0);
++    {
++        let _frozen = Frozen::new();
++        eventually("a reconnect", Duration::from_secs(60), async || {
++            reconnects(&p.metrics().await) >= 1
++        })
++        .await;
++        p.metric(&e.status("running")).await;
++    }
++    e.exec("INSERT INTO items VALUES (2, 'after')").await;
++    e.mirrored("items", &["id", "doc"]).await;
++    assert!(
++        p.log()
++            .contains("reconnecting to the source: the source isn't answering"),
++        "{}",
++        p.log()
++    );
++    assert!(p.terminate().await.success());
++    e.cleanup().await;
++}
+```
+
+Change `crates/data-avalanche/tests/e2e/harness.rs`:
+
+```diff
+diff --git a/crates/data-avalanche/tests/e2e/harness.rs b/crates/data-avalanche/tests/e2e/harness.rs
+--- a/crates/data-avalanche/tests/e2e/harness.rs
++++ b/crates/data-avalanche/tests/e2e/harness.rs
+@@ -70,6 +70,8 @@ pub struct Options<'a> {
+     pub tables: &'a str,
+     /// `sink` entries, e.g. `, flush: { rows: 10 }`.
+     pub sink: &'a str,
++    /// `source` keys beyond the connection, one YAML line, e.g. `timeouts: { command: 2s }`.
++    pub source: &'a str,
+     /// `source.postgres` entries.
+     pub postgres: &'a str,
+     /// Pipeline keys beyond `source`, `tables` and `sink`, one YAML line, e.g.
+@@ -167,6 +169,7 @@ pipelines:
+       user: avalanche
+       password: avalanche
+       ssl_mode: disable
++      {source}
+       postgres: {{ publication: {schema}_pub, slot: {schema}{postgres} }}
+     tables: {{ include: [{schema}.*]{tables} }}
+     sink: {{ type: delta, bucket: {bucket}, prefix: {prefix}/lake, delta: {{}}, flush: {{ seconds: 1 }}{sink} }}
+@@ -178,6 +181,7 @@ pipelines:
+             test = self.test,
+             pg = pg_port(),
+             schema = self.schema,
++            source = o.source,
+             postgres = o.postgres,
+             tables = o.tables,
+             sink = o.sink,
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+```bash
+DATA_AVALANCHE_IT=1 DATA_AVALANCHE_SKIP_GCS=1 cargo test -p data-avalanche-pipeline --lib &&
+  DATA_AVALANCHE_IT=1 DATA_AVALANCHE_SKIP_GCS=1 cargo test -p data-avalanche-source-pg -- retained a_connect_to &&
+  DATA_AVALANCHE_IT=1 DATA_AVALANCHE_SKIP_GCS=1 cargo test -p data-avalanche --features e2e-hooks --test e2e -- --test-threads=1 guards::a_source_that_stops
+```
+
+Expected:
+
+FAIL to compile (3 errors); the first:
+
+```text
+error[E0432]: unresolved import `data_avalanche_core::RetainedLog`
+error[E0407]: method `retained` is not a member of trait `SourceConnector`
+error[E0046]: not all trait items implemented, missing: `retained_bytes`
+```
+
+- [ ] **Step 3: Implement**
+
+Change `crates/data-avalanche-cluster/src/controller.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-cluster/src/controller.rs b/crates/data-avalanche-cluster/src/controller.rs
+--- a/crates/data-avalanche-cluster/src/controller.rs
++++ b/crates/data-avalanche-cluster/src/controller.rs
+@@ -171,6 +171,8 @@ struct Running {
+     paused: bool,
+     /// The warnings already logged.
+     logged: HashSet<String>,
++    /// The worker's reconnects already logged.
++    reconnects: u64,
+ }
+ 
+ impl PipelineController {
+@@ -489,6 +491,7 @@ impl PipelineController {
+             permit: Some(permit),
+             paused: false,
+             logged: HashSet::new(),
++            reconnects: 0,
+         })
+     }
+ 
+@@ -530,7 +533,7 @@ impl PipelineController {
+         }
+     }
+ 
+-    /// The worker's status into the metrics, and its new warnings into the log.
++    /// The worker's status into the metrics, and its new warnings and reconnects into the log.
+     fn observe(&self, w: &mut Running) {
+         let st = w.handle.status.borrow().clone();
+         for warning in &st.warnings {
+@@ -538,6 +541,12 @@ impl PipelineController {
+                 tracing::warn!(pipeline = %self.pipeline.name, "{warning}");
+             }
+         }
++        if st.reconnects > w.reconnects {
++            w.reconnects = st.reconnects;
++            if let Phase::Reconnecting { error } = &st.phase {
++                tracing::warn!(pipeline = %self.pipeline.name, "reconnecting to the source: {error}");
++            }
++        }
+         let m = &self.metrics;
+         m.wal_lag_bytes(st.retained_bytes);
+         m.halted_tables(st.halted.len());
+```
+
+Change `crates/data-avalanche-core/src/lib.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-core/src/lib.rs b/crates/data-avalanche-core/src/lib.rs
+--- a/crates/data-avalanche-core/src/lib.rs
++++ b/crates/data-avalanche-core/src/lib.rs
+@@ -39,8 +39,8 @@ pub use sink::{
+ };
+ pub use source::{
+     ChangeStream, Chunk, ChunkVisibility, InFlightTxn, KeysetCursor, Preflight, Prepared,
+-    RescanReport, ResolvedTables, SchemaHint, SnapshotReason, SourceConnector, SourceError,
+-    StartPlan, StreamItem, XidSnapshot, identifier_values,
++    RescanReport, ResolvedTables, RetainedLog, SchemaHint, SnapshotReason, SourceConnector,
++    SourceError, StartPlan, StreamItem, XidSnapshot, identifier_values,
+ };
+ pub use table::{
+     INTERNAL_COLUMN_PREFIX, LINEAGE_COLUMNS, TableRef, first_reserved_collision, is_reserved_column,
+```
+
+Change `crates/data-avalanche-core/src/source.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-core/src/source.rs b/crates/data-avalanche-core/src/source.rs
+--- a/crates/data-avalanche-core/src/source.rs
++++ b/crates/data-avalanche-core/src/source.rs
+@@ -230,6 +230,17 @@ pub enum StreamItem {
+ }
+ 
+ /// The tables channel D found changed since `known` (`Schema_Change…` §3).
++/// The log the source keeps for the pipeline, read every heartbeat (PostgreSQL: the slot).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct RetainedLog {
++    /// Bytes kept on the source's disk (PostgreSQL: the WAL from the slot's `restart_lsn`, the
++    /// `max_wal_lag_bytes` guard).
++    pub bytes: u64,
++    /// A stream reads it now (PostgreSQL: the slot is `active`). A session whose stream is open
++    /// but which reads `false` has lost its stream without hearing of it (DA-SRC-16).
++    pub streamed: bool,
++}
++
+ #[derive(Debug, Clone, PartialEq, Eq, Default)]
+ pub struct RescanReport {
+     /// Tables gone from the source catalog: each halts with `TABLE_DROPPED`.
+@@ -265,10 +276,8 @@ pub trait SourceConnector: Send + Sync {
+     /// new consistent position to snapshot from and stream after.
+     async fn reset_position(&self) -> Result<SourcePosition, SourceError>;
+ 
+-    /// How many bytes of log the source keeps on disk for the pipeline (PostgreSQL: the WAL from
+-    /// the slot's `restart_lsn`, the `max_wal_lag_bytes` guard). `None` when the source keeps
+-    /// nothing for it.
+-    async fn retained_bytes(&self) -> Result<Option<u64>, SourceError>;
++    /// The log the source keeps for the pipeline. `None` when the source keeps nothing for it.
++    async fn retained(&self) -> Result<Option<RetainedLog>, SourceError>;
+ 
+     /// The source's current position: a snapshot chunk's low and high watermarks, and the point
+     /// the stream must pass before a rescan's change is applied.
+```
+
+Change `crates/data-avalanche-pipeline/src/lib.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-pipeline/src/lib.rs b/crates/data-avalanche-pipeline/src/lib.rs
+--- a/crates/data-avalanche-pipeline/src/lib.rs
++++ b/crates/data-avalanche-pipeline/src/lib.rs
+@@ -21,9 +21,9 @@ mod settings;
+ pub mod status;
+ #[cfg(test)]
+ mod test_support;
++mod watchdog;
+ pub mod worker;
+ mod writer;
+-mod watchdog;
+ 
+ pub use accumulator::{Accumulator, Flush};
+ pub use backoff::Backoff;
+```
+
+Change `crates/data-avalanche-pipeline/src/session.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-pipeline/src/session.rs b/crates/data-avalanche-pipeline/src/session.rs
+--- a/crates/data-avalanche-pipeline/src/session.rs
++++ b/crates/data-avalanche-pipeline/src/session.rs
+@@ -14,19 +14,20 @@ use std::sync::Arc;
+ use std::time::Instant;
+ 
+ use data_avalanche_core::{
+-    CdcEvent, ChangeStream, ColumnValue, HaltReason, Op, RescanReport, Row, SchemaHint, Sink,
+-    SourceConnector, SourceError, SourcePosition, SourceSeq, StreamItem, TableRef, TableSchema,
+-    TransactionBoundary, identifier_values,
++    CdcEvent, ChangeStream, ColumnValue, HaltReason, Op, RescanReport, RetainedLog, Row,
++    SchemaHint, Sink, SourceConnector, SourceError, SourcePosition, SourceSeq, StreamItem,
++    TableRef, TableSchema, TransactionBoundary, identifier_values,
+ };
+ use data_avalanche_state::{PipelineDocs, TableHalt};
+ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+ use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+-use tokio::task::JoinHandle;
++use tokio::task::{JoinError, JoinHandle, JoinSet};
+ 
+ use self::snapshot::Snapshots;
+ use crate::schema_change::{Evolver, Planned};
+ use crate::settings::Settings;
+ use crate::status::Streak;
++use crate::watchdog::Watchdog;
+ use crate::writer::{self, Job, WriterCtx, WriterEvent};
+ use crate::{
+     Accumulator, AccumulatorError, Command, CommitGuard, Exit, FlushReason, Hooks, Phase, Tuning,
+@@ -166,6 +167,10 @@ pub(crate) struct Session<'c> {
+     draining: bool,
+     /// When this session parked for [`Command::Pause`], with everything it read durable.
+     paused: Option<Instant>,
++    /// The heartbeat's read of the source's log, one at a time, run beside the loop: a source
++    /// that doesn't answer holds up neither the stream nor a drain (DA-SRC-16).
++    retained_read: JoinSet<Result<Option<RetainedLog>, SourceError>>,
++    watchdog: Watchdog,
+ }
+ 
+ impl<'c> Session<'c> {
+@@ -281,6 +286,8 @@ impl<'c> Session<'c> {
+             snaps,
+             draining: false,
+             paused: None,
++            retained_read: JoinSet::new(),
++            watchdog: Watchdog::default(),
+         }))
+     }
+ 
+@@ -410,7 +417,14 @@ impl<'c> Session<'c> {
+                         return Ok(end);
+                     }
+                 }
+-                _ = heartbeat.tick() => self.wal_lag().await?,
++                _ = heartbeat.tick() => {
++                    if let Some(end) = self.heartbeat() {
++                        return Ok(end);
++                    }
++                }
++                read = self.retained_read.join_next(), if !self.retained_read.is_empty() => {
++                    self.wal_lag(read.expect("not empty"))?;
++                }
+                 _ = async { rescan.as_mut().expect("guarded").tick().await },
+                     if rescan.is_some() && self.rescan.is_none() && !parked =>
+                 {
+@@ -420,6 +434,7 @@ impl<'c> Session<'c> {
+                 }
+                 item = self.stream.next(), if reading => match item {
+                     Ok(item) => {
++                        self.watchdog.heard();
+                         if let Some(end) = self.item(item).await? {
+                             return Ok(end);
+                         }
+@@ -869,15 +884,44 @@ impl<'c> Session<'c> {
+         Ok(None)
+     }
+ 
+-    /// The WAL-retention guard (G-22): the retained log is always reported; past
+-    /// `max_wal_lag_bytes` the pipeline stops to protect the source's disk. A failed read waits
+-    /// for the next heartbeat, and the pipeline keeps running. The first permanent failure of a
+-    /// streak warns that the guard is blind; a read that succeeds ends the streak.
+-    async fn wal_lag(&mut self) -> Result<(), WorkerError> {
+-        let retained = match self.core.source.retained_bytes().await {
++    /// A heartbeat: the next read of the source's log goes out unless one still is, and the
++    /// watchdog counts. `Some` ends the session: the source isn't answering, so the worker
++    /// reconnects.
++    fn heartbeat(&mut self) -> Option<End> {
++        if self.retained_read.is_empty() {
++            let source = self.core.source.clone();
++            self.retained_read
++                .spawn(async move { source.retained().await });
++        }
++        let reading = self.queued.is_empty() && self.paused.is_none();
++        let why = self.watchdog.beat(reading)?;
++        Some(End::Source(SourceError::Transient(why)))
++    }
++
++    /// A heartbeat's read of the source's log came back. The WAL-retention guard (G-22): the
++    /// retained log is always reported; past `max_wal_lag_bytes` the pipeline stops to protect
++    /// the source's disk. A failed read waits for the next heartbeat, and the pipeline keeps
++    /// running. The first permanent failure of a streak warns that the guard is blind; a read
++    /// that succeeds ends the streak. The watchdog hears whether the source answered: a
++    /// transient failure, or a slot no stream reads, is no answer.
++    fn wal_lag(
++        &mut self,
++        read: Result<Result<Option<RetainedLog>, SourceError>, JoinError>,
++    ) -> Result<(), WorkerError> {
++        let read = read.map_err(|e| {
++            protocol(format!(
++                "the heartbeat's read ended without its answer: {e}"
++            ))
++        })?;
++        let retained = match read {
+             Ok(retained) => retained,
+-            Err(e) if e.is_transient() => return Ok(()),
++            Err(e) if e.is_transient() => {
++                self.watchdog.answered(Some(e.to_string()));
++                return Ok(());
++            }
+             Err(e) => {
++                // The source answered, with a refusal.
++                self.watchdog.answered(None);
+                 let blind = if self.core.settings.max_wal_lag_bytes.is_some() {
+                     "max_wal_lag_bytes isn't enforced"
+                 } else {
+@@ -892,6 +936,12 @@ impl<'c> Session<'c> {
+             }
+         };
+         self.core.wal_lag_failing.succeeded();
++        self.watchdog.answered(
++            retained
++                .is_some_and(|r| !r.streamed)
++                .then(|| "no stream reads the slot".to_owned()),
++        );
++        let retained = retained.map(|r| r.bytes);
+         self.core.update(|st| st.retained_bytes = retained);
+         match (retained, self.core.settings.max_wal_lag_bytes) {
+             (Some(lag), Some(limit)) if lag > limit => Err(WorkerError::WalLag { lag, limit }),
+```
+
+Change `crates/data-avalanche-pipeline/src/watchdog.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-pipeline/src/watchdog.rs b/crates/data-avalanche-pipeline/src/watchdog.rs
+--- a/crates/data-avalanche-pipeline/src/watchdog.rs
++++ b/crates/data-avalanche-pipeline/src/watchdog.rs
+@@ -1,3 +1,61 @@
++//! The stream watchdog (DA-SRC-16): a stream that stays silent while the source stops answering
++//! ends the session, and the worker reconnects. Silence alone proves nothing (an idle server with
++//! `wal_sender_timeout = 0` sends nothing), so the heartbeat's read of the source's log decides: it
++//! failed (a frozen server times it out), or it found no stream on the slot (the server dropped the
++//! connection without the client hearing of it).
++
++/// Heartbeats the stream may stay silent while the heartbeat's reads go unanswered.
++pub(crate) const SILENT_HEARTBEATS: u32 = 3;
++
++#[derive(Debug, Default)]
++pub(crate) struct Watchdog {
++    /// A stream item since the last heartbeat.
++    heard: bool,
++    /// Consecutive heartbeats without a stream item while the session read the stream.
++    silent: u32,
++    /// Consecutive heartbeat reads that failed or found no stream, and the last one's finding.
++    unanswered: u32,
++    why: String,
++}
++
++impl Watchdog {
++    /// A stream item arrived.
++    pub(crate) fn heard(&mut self) {
++        self.heard = true;
++        self.silent = 0;
++    }
++
++    /// A heartbeat read completed: `failure` is what was wrong with it, `None` when the source
++    /// answered and a stream reads the slot. A read still out counts neither way: it may wait
++    /// behind a chunk read on a shared connection, which `timeouts.command` bounds.
++    pub(crate) fn answered(&mut self, failure: Option<String>) {
++        match failure {
++            None => self.unanswered = 0,
++            Some(why) => {
++                self.unanswered += 1;
++                self.why = why;
++            }
++        }
++    }
++
++    /// A heartbeat. `reading`: the session reads the stream (not paused, no flush waiting for
++    /// room), so a silent stream is the source's doing. `Some(reason)` when the session must end.
++    pub(crate) fn beat(&mut self, reading: bool) -> Option<String> {
++        if reading && !self.heard {
++            self.silent += 1;
++        } else {
++            self.silent = 0;
++        }
++        self.heard = false;
++        (self.silent >= SILENT_HEARTBEATS && self.unanswered >= SILENT_HEARTBEATS).then(|| {
++            format!(
++                "the source isn't answering: no stream message for {} heartbeats, and the last {} reads of its log failed ({})",
++                self.silent, self.unanswered, self.why
++            )
++        })
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+```
+
+Change `crates/data-avalanche-pipeline/src/worker.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-pipeline/src/worker.rs b/crates/data-avalanche-pipeline/src/worker.rs
+--- a/crates/data-avalanche-pipeline/src/worker.rs
++++ b/crates/data-avalanche-pipeline/src/worker.rs
+@@ -141,12 +141,17 @@ impl PipelineWorker {
+             if opened.elapsed() >= core.tuning.source_backoff.max {
+                 attempt = 0;
+             }
+-            core.update(|st| st.reconnects += 1);
+-            match failed {
+-                SourceError::Transient(error) => {
+-                    contended_since = None;
+-                    core.update(|st| st.phase = Phase::Reconnecting { error });
++            // One update: an observer that sees the count sees its reason.
++            core.update(|st| {
++                st.reconnects += 1;
++                if let SourceError::Transient(error) = &failed {
++                    st.phase = Phase::Reconnecting {
++                        error: error.clone(),
++                    };
+                 }
++            });
++            match failed {
++                SourceError::Transient(_) => contended_since = None,
+                 SourceError::Contended(detail) => {
+                     let since = *contended_since.get_or_insert_with(Instant::now);
+                     let waited = since.elapsed();
+```
+
+Change `crates/data-avalanche-source-pg/src/connect.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-source-pg/src/connect.rs b/crates/data-avalanche-source-pg/src/connect.rs
+--- a/crates/data-avalanche-source-pg/src/connect.rs
++++ b/crates/data-avalanche-source-pg/src/connect.rs
+@@ -94,8 +94,18 @@ impl Connector {
+         c
+     }
+ 
+-    /// A new catalog connection, its driver task spawned.
++    /// A new catalog connection, its driver task spawned, within `timeouts.connect`: the
++    /// driver's own `connect_timeout` bounds only the TCP connect, and a server that accepts the
++    /// connection but never answers (frozen, behind a black hole) would hold the startup, and
++    /// every call queued behind the shared connection, forever (DA-SRC-16).
+     pub(crate) async fn connect(&self) -> Result<Client, SourceError> {
++        let after = self.timeouts.connect;
++        tokio::time::timeout(after, self.open())
++            .await
++            .map_err(|_| timed_out("connect to the source", after))?
++    }
++
++    async fn open(&self) -> Result<Client, SourceError> {
+         let config = self.control_config();
+         let client = match &self.tls {
+             None => {
+```
+
+Change `crates/data-avalanche-source-pg/src/connector.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-source-pg/src/connector.rs b/crates/data-avalanche-source-pg/src/connector.rs
+--- a/crates/data-avalanche-source-pg/src/connector.rs
++++ b/crates/data-avalanche-source-pg/src/connector.rs
+@@ -8,8 +8,8 @@ use data_avalanche_config::{
+ };
+ use data_avalanche_core::{
+     ChangeStream, Chunk, HaltReason, InFlightTxn, KeysetCursor, Preflight, Prepared, RescanReport,
+-    ResolvedTables, Row, SchemaDelta, SchemaHint, SourceConnector, SourceError, SourcePosition,
+-    TableRef, TableSchema,
++    ResolvedTables, RetainedLog, Row, SchemaDelta, SchemaHint, SourceConnector, SourceError,
++    SourcePosition, TableRef, TableSchema,
+ };
+ use tokio::sync::Mutex;
+ 
+@@ -274,8 +274,8 @@ impl SourceConnector for PgConnector {
+         PgConnector::reset_position(self).await
+     }
+ 
+-    async fn retained_bytes(&self) -> Result<Option<u64>, SourceError> {
+-        PgConnector::retained_bytes(self).await
++    async fn retained(&self) -> Result<Option<RetainedLog>, SourceError> {
++        PgConnector::retained(self).await
+     }
+ 
+     async fn current_position(&self) -> Result<SourcePosition, SourceError> {
+```
+
+Change `crates/data-avalanche-source-pg/src/slot.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-source-pg/src/slot.rs b/crates/data-avalanche-source-pg/src/slot.rs
+--- a/crates/data-avalanche-source-pg/src/slot.rs
++++ b/crates/data-avalanche-source-pg/src/slot.rs
+@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
+ use data_avalanche_config::{SlotManagement, SlotOnOrphan};
+ use data_avalanche_core::position::Lsn;
+ use data_avalanche_core::{
+-    Prepared, SnapshotReason, SourceError, SourcePosition, StartPlan, TableRef,
++    Prepared, RetainedLog, SnapshotReason, SourceError, SourcePosition, StartPlan, TableRef,
+ };
+ use tokio_postgres::Client;
+ 
+@@ -517,24 +517,29 @@ impl PgConnector {
+     }
+ 
+     /// The WAL the slot keeps on the source's disk: `pg_current_wal_lsn() - restart_lsn`, the
+-    /// `max_wal_lag_bytes` guard's measure. `restart_lsn` trails `confirmed_flush_lsn` while a
+-    /// transaction older than the confirmed position is still open. `None` without a slot.
+-    pub async fn retained_bytes(&self) -> Result<Option<u64>, SourceError> {
++    /// `max_wal_lag_bytes` guard's measure, and whether a walsender reads the slot (`active`).
++    /// `restart_lsn` trails `confirmed_flush_lsn` while a transaction older than the confirmed
++    /// position is still open. `None` without a slot, or with a slot that lost its WAL.
++    pub async fn retained(&self) -> Result<Option<RetainedLog>, SourceError> {
+         let client = self.conn.client().await?;
+         let row = self
+             .conn
+             .command(
+                 "measure the slot's WAL",
+                 client.query_opt(
+-                    "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint
++                    "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint, active
+                        FROM pg_catalog.pg_replication_slots WHERE slot_name = $1",
+                     &[&self.slot_name()],
+                 ),
+             )
+             .await?;
+-        Ok(row
+-            .and_then(|r| r.get::<_, Option<i64>>(0))
+-            .map(|b| u64::try_from(b).unwrap_or(0)))
++        Ok(row.and_then(|r| {
++            let bytes = r.get::<_, Option<i64>>(0)?;
++            Some(RetainedLog {
++                bytes: u64::try_from(bytes).unwrap_or(0),
++                streamed: r.get(1),
++            })
++        }))
+     }
+ }
+ 
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+```bash
+DATA_AVALANCHE_IT=1 DATA_AVALANCHE_SKIP_GCS=1 cargo test -p data-avalanche-pipeline --lib &&
+  DATA_AVALANCHE_IT=1 DATA_AVALANCHE_SKIP_GCS=1 cargo test -p data-avalanche-source-pg -- retained a_connect_to &&
+  DATA_AVALANCHE_IT=1 DATA_AVALANCHE_SKIP_GCS=1 cargo test -p data-avalanche --features e2e-hooks --test e2e -- --test-threads=1 guards::a_source_that_stops
+```
+
+Expected:
+
+PASS:
+
+```text
+test result: ok. 194 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.64s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 82 filtered out; finished in 0.31s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 53 filtered out; finished in 0.38s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 25 filtered out; finished in 24.79s
+```
+
+Then the quality gates: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add -A
+git commit -m "fix(pipeline): the stream watchdog: a silent stream whose source doesn't answer ends the session and the worker reconnects; the catalog connect is bounded by timeouts.connect (DA-SRC-16)"
+```
+
+
+### Task 23: Quiet Delta library logs at info, and no kernel error for an absent table
+
+**Files:**
+- Modify: `crates/data-avalanche-sink-delta/src/table.rs`, `crates/data-avalanche/src/logging.rs`, `crates/data-avalanche/tests/e2e/harness.rs`, `crates/data-avalanche/tests/e2e/smoke.rs`
+
+**Interfaces:**
+- Consumes: the binary's `logging` (Task 12), `TableHandle::open` (sink-delta, M4).
+- Produces:
+  - `logging::quieted(filter: &str) -> String`: a filter whose bare level is `info` or quieter
+    and that names neither Delta library gains `buoyant_kernel=warn`, `deltalake_core=warn`,
+    `deltalake_core::operations::merge=error` (never louder than the level). `init` installs it.
+  - `TableHandle::open` builds the table without loading it, and loads it only when
+    `_delta_log/` lists a log file.
+  - The E2E config logs at plain `info`.
+
+The owner's answer to F-2 (2026-10-08): hide the noise at the global `info` level.
+- **Measured before the fix:** of a restart run's 25 log lines, about 20 came from the Delta
+  libraries: the kernel's INFO on every snapshot build, the MERGE's INFO, its WARN "Missing
+  target skipped-file metric" on every MERGE, and the commit's INFO.
+- **The ERROR:** delta-rs's `try_from_url_with_storage_options` loads first and accepts an
+  absent table after, and the kernel logs "No files in log segment" for every table a first
+  start creates. The LIST before the load (one per uncached table) is what `refresh` does
+  already.
+- The config patch notes the caps under `globals.log.level`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Change `crates/data-avalanche/src/logging.rs`:
+
+```diff
+diff --git a/crates/data-avalanche/src/logging.rs b/crates/data-avalanche/src/logging.rs
+--- a/crates/data-avalanche/src/logging.rs
++++ b/crates/data-avalanche/src/logging.rs
+@@ -56,6 +56,44 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn a_bare_level_quiets_the_delta_libraries() {
++        assert_eq!(
++            quieted("info"),
++            "info,buoyant_kernel=warn,deltalake_core=warn,deltalake_core::operations::merge=error"
++        );
++        assert_eq!(
++            quieted("info,data_avalanche=debug"),
++            "info,data_avalanche=debug,buoyant_kernel=warn,deltalake_core=warn,deltalake_core::operations::merge=error"
++        );
++        assert_eq!(
++            quieted("warn"),
++            "warn,deltalake_core::operations::merge=error",
++            "never louder than the level"
++        );
++        assert_eq!(quieted("error"), "error");
++    }
++
++    #[test]
++    fn a_filter_that_names_a_library_or_asks_for_more_is_kept() {
++        for f in [
++            "debug",
++            "trace",
++            "info,deltalake_core=info",
++            "info,buoyant_kernel=debug",
++            "data_avalanche=debug",
++        ] {
++            assert_eq!(quieted(f), f);
++        }
++    }
++
++    #[test]
++    fn the_quieted_filter_parses() {
++        for f in ["info", "warn", "info,data_avalanche_cluster=debug"] {
++            EnvFilter::builder().parse(quieted(f)).unwrap();
++        }
++    }
++
+     #[test]
+     fn the_command_line_overrides_the_config() {
+         let log = Log {
+```
+
+Change `crates/data-avalanche/tests/e2e/harness.rs`:
+
+```diff
+diff --git a/crates/data-avalanche/tests/e2e/harness.rs b/crates/data-avalanche/tests/e2e/harness.rs
+--- a/crates/data-avalanche/tests/e2e/harness.rs
++++ b/crates/data-avalanche/tests/e2e/harness.rs
+@@ -153,7 +153,7 @@ globals:
+   cloud: aws
+   state: {{ bucket: {bucket}, prefix: {prefix}/globals }}
+   api: {{ address: "127.0.0.1:@PORT@" }}
+-  log: {{ level: "info,buoyant_kernel=warn", format: compact }}
++  log: {{ level: info, format: compact }}
+   cluster:
+     lease_duration: 6s
+     lease_renewal_interval: 2s
+```
+
+Change `crates/data-avalanche/tests/e2e/smoke.rs`:
+
+```diff
+diff --git a/crates/data-avalanche/tests/e2e/smoke.rs b/crates/data-avalanche/tests/e2e/smoke.rs
+--- a/crates/data-avalanche/tests/e2e/smoke.rs
++++ b/crates/data-avalanche/tests/e2e/smoke.rs
+@@ -22,6 +22,14 @@ async fn a_pipeline_runs_stops_on_sigterm_and_resumes() {
+     e.converged("items").await;
+     e.exec("INSERT INTO items VALUES (3, 'c'); UPDATE items SET doc = 'A' WHERE id = 1; DELETE FROM items WHERE id = 2").await;
+     e.converged("items").await;
++    // At `info`, a first start that creates its table logs no error, and the Delta libraries
++    // only what they warn of (config §6.4).
++    let log = p.log();
++    assert!(!log.contains("ERROR"), "{log}");
++    assert!(
++        !log.contains("buoyant_kernel") && !log.contains("deltalake_core"),
++        "{log}"
++    );
+     let labels = r#"pipeline="smoke",source_host="127.0.0.1",source_db="avalanche""#;
+     p.metric(&format!(
+         r#"data_avalanche_pipeline_status{{{labels},status="running"}} 1"#
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+```bash
+DATA_AVALANCHE_IT=1 DATA_AVALANCHE_SKIP_GCS=1 cargo test -p data-avalanche --lib &&
+  DATA_AVALANCHE_IT=1 DATA_AVALANCHE_SKIP_GCS=1 cargo test -p data-avalanche --features e2e-hooks --test e2e -- --test-threads=1 smoke::
+```
+
+Expected:
+
+FAIL to compile (6 errors); the first:
+
+```text
+error[E0425]: cannot find function `quieted` in this scope
+… and 5 more
+```
+
+- [ ] **Step 3: Implement**
+
+Change `crates/data-avalanche-sink-delta/src/table.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-sink-delta/src/table.rs b/crates/data-avalanche-sink-delta/src/table.rs
+--- a/crates/data-avalanche-sink-delta/src/table.rs
++++ b/crates/data-avalanche-sink-delta/src/table.rs
+@@ -8,11 +8,11 @@ use arrow_array::{ArrayRef, RecordBatch};
+ use arrow_row::{RowConverter, SortField};
+ use arrow_schema::SchemaRef;
+ use data_avalanche_core::{PartitionTransform, SinkError, SourcePosition, TableRef, TableSpec};
+-use deltalake::DeltaTable;
+ use deltalake::datafusion::prelude::SessionContext;
+ use deltalake::logstore::object_store::path::Path;
+ use deltalake::logstore::object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
+ use deltalake::protocol::SaveMode;
++use deltalake::{DeltaTable, DeltaTableBuilder, DeltaTableError};
+ use futures_util::TryStreamExt;
+ use url::Url;
+ 
+@@ -70,6 +70,10 @@ impl std::fmt::Debug for TableHandle {
+ impl TableHandle {
+     /// A handle on `url`, where `name` is mirrored; the table is loaded when it exists. A local
+     /// root is created first: delta-rs refuses a `file://` location that doesn't exist.
++    ///
++    /// Loaded only when the location holds a log (one LIST): delta-rs's own "load, else accept
++    /// an absent table" makes the kernel log an ERROR ("No files in log segment") for every
++    /// table a first start creates.
+     pub async fn open(
+         name: TableRef,
+         url: Url,
+@@ -79,9 +83,21 @@ impl TableHandle {
+             std::fs::create_dir_all(&path)
+                 .map_err(|e| permanent(format!("{}: {e}", path.display())))?;
+         }
+-        let table = DeltaTable::try_from_url_with_storage_options(url, options.clone())
+-            .await
++        let mut table = DeltaTableBuilder::from_url(url)
++            .and_then(|b| b.with_storage_options(options.clone()).build())
+             .map_err(sink_error)?;
++        if table
++            .log_store()
++            .is_delta_table_location()
++            .await
++            .map_err(sink_error)?
++        {
++            match table.load().await {
++                // Dropped since the LIST: absent, as if the LIST had found nothing.
++                Ok(()) | Err(DeltaTableError::NotATable(_)) => {}
++                Err(e) => return Err(sink_error(e)),
++            }
++        }
+         let mut handle = Self {
+             name,
+             table,
+```
+
+Change `crates/data-avalanche/src/logging.rs`:
+
+```diff
+diff --git a/crates/data-avalanche/src/logging.rs b/crates/data-avalanche/src/logging.rs
+--- a/crates/data-avalanche/src/logging.rs
++++ b/crates/data-avalanche/src/logging.rs
+@@ -2,6 +2,7 @@
+ 
+ use data_avalanche_config::{Log, LogFormat};
+ use tracing_subscriber::EnvFilter;
++use tracing_subscriber::filter::LevelFilter;
+ 
+ use crate::{LogFormatArg, RunArgs};
+ 
+@@ -20,6 +21,43 @@ pub(crate) fn settings(log: &Log, args: &RunArgs) -> (String, LogFormat) {
+     (level, format)
+ }
+ 
++/// The Delta libraries' targets, and the most each logs under a level of `info` or quieter:
++/// their INFO traces every snapshot build, MERGE and commit, and the MERGE warns "Missing target
++/// skipped-file metric" on every run (config §6.4).
++const QUIET: &[(&str, LevelFilter)] = &[
++    ("buoyant_kernel", LevelFilter::WARN),
++    ("deltalake_core", LevelFilter::WARN),
++    ("deltalake_core::operations::merge", LevelFilter::ERROR),
++];
++
++/// `filter` with [`QUIET`]'s caps added when its bare level is `info` or quieter and it names
++/// neither library: a filter that names one, or a `debug` or `trace` level, is the operator's.
++pub(crate) fn quieted(filter: &str) -> String {
++    let directives: Vec<&str> = filter.split(',').map(str::trim).collect();
++    if directives
++        .iter()
++        .any(|d| d.starts_with("buoyant_kernel") || d.starts_with("deltalake"))
++    {
++        return filter.to_owned();
++    }
++    let Some(level) = directives
++        .iter()
++        .rev()
++        .find_map(|d| d.parse::<LevelFilter>().ok())
++    else {
++        return filter.to_owned();
++    };
++    let mut out = filter.to_owned();
++    if level <= LevelFilter::INFO {
++        for (target, most) in QUIET {
++            if level > *most {
++                out.push_str(&format!(",{target}={most}"));
++            }
++        }
++    }
++    out
++}
++
+ /// Installs the process's subscriber; logs go to stderr.
+ ///
+ /// # Errors
+@@ -27,7 +65,7 @@ pub(crate) fn settings(log: &Log, args: &RunArgs) -> (String, LogFormat) {
+ pub(crate) fn init(log: &Log, args: &RunArgs) -> Result<(), String> {
+     let (level, format) = settings(log, args);
+     let filter = EnvFilter::builder()
+-        .parse(&level)
++        .parse(quieted(&level))
+         .map_err(|e| format!("--log-level {level:?} isn't a log filter: {e}"))?;
+     let builder = tracing_subscriber::fmt()
+         .with_env_filter(filter)
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+```bash
+DATA_AVALANCHE_IT=1 DATA_AVALANCHE_SKIP_GCS=1 cargo test -p data-avalanche --lib &&
+  DATA_AVALANCHE_IT=1 DATA_AVALANCHE_SKIP_GCS=1 cargo test -p data-avalanche --features e2e-hooks --test e2e -- --test-threads=1 smoke::
+```
+
+Expected:
+
+PASS:
+
+```text
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 25 filtered out; finished in 15.82s
+```
+
+Then the quality gates: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add -A
+git commit -m "feat(data-avalanche): a plain info level quiets the Delta libraries; the Delta sink opens an absent table without the kernel's error (F-2)"
+```
+
+
+### Task 24: CI: the E2E suite weekly on PostgreSQL 14–17
 
 **Files:**
 - Modify: `.github/workflows/weekly.yml`
 
 **Interfaces:**
-- Consumes: `tests/e2e` (Tasks 14–20), `weekly.yml` (M5).
+- Consumes: `tests/e2e` (Tasks 14–23), `weekly.yml` (M5).
 - Produces: the weekly matrix job starts RustFS (and its bucket) beside `postgres-N`, installs
   `uv`, and runs "Slice-1 E2E" after the worker tests; 60-minute timeout.
 
@@ -12433,17 +14537,22 @@ per task, against the `test-infra` services (PostgreSQL 18 and 14, RustFS, Azuri
 
 - **The tasks' code blocks** are the scratch commits' diffs. Each task's Step 1 tree (its tests,
   the previous task's code) was committed and its command run: the "Expected" failures and
-  passes above are those runs' output. Tasks 1–14 fail at Step 2 (to compile, or in their new
-  tests) and pass at Step 4; Tasks 15–21 pass as written.
+  passes above are those runs' output. Tasks 1–14 and 21–23 fail at Step 2 (to compile, or in
+  their new tests) and pass at Step 4; Tasks 15–20 and 24 pass as written. Tasks 21–24 were
+  added on 2026-10-08 with the owner's answers to F-1…F-3.
 - **Workspace at the last task:**
   - `cargo fmt --all --check` and both clippy runs are clean.
-  - `cargo test --workspace`: 904 passed.
-  - The integration run (`DATA_AVALANCHE_IT=1`, GCS skipped): 754 passed. The three `source-pg`
-    TLS tests couldn't run there: they need `test-infra/.tls`, which the scratch workspace
-    doesn't carry, and M6b doesn't change `source-pg`.
-- **The E2E suite** (25 scenarios, `--test-threads=1`): green twice in a row on PostgreSQL 18 +
-  RustFS (314 s each), and once on PostgreSQL 14 (316 s). PostgreSQL 15–17 weren't run locally;
-  `weekly.yml` runs them.
+  - `cargo test --workspace`: 920 passed.
+  - The integration run (`DATA_AVALANCHE_IT=1`, GCS skipped, `--no-fail-fast`): 911 passed. The
+    three `source-pg` TLS tests couldn't run there: they need `test-infra/.tls`, which the
+    scratch workspace doesn't carry. Task 22 changes the catalog connect they use, so Task 22
+    runs them at execution.
+- **The E2E suite** (26 scenarios, `--test-threads=1`): green twice in a row on PostgreSQL 18 + RustFS (286 s each), and once on
+  PostgreSQL 14 (347 s). PostgreSQL 15–17 weren't run locally; `weekly.yml` runs them.
+  - One earlier PostgreSQL 18 run failed in `retained_wal_past_the_limit_stops_the_pipeline`: at
+    the default 60 s heartbeat, the lag is first read 60 s into the session, and the test waits
+    60 s for the error. Run alone, it took 69 s each time and failed once in three. Task 20's
+    scenario now runs at a 5 s heartbeat.
 - **Mutation checks** (each mutation made the named test fail, then was reverted):
   - Task 5: the reading gate removed → `a_pause_finishes_the_open_transaction_then_reads_nothing_until_resumed`;
     the snapshot clock shift removed → `a_pause_stops_the_snapshot_and_its_clock`; the permit
@@ -12457,6 +14566,13 @@ per task, against the `test-infra` services (PostgreSQL 18 and 14, RustFS, Azuri
     ("the idle source's snapshot chunk is committed").
   - Task 16: the unchanged-column mask removed (`batch.rs`) → the across-batch TOAST check
     (`"NULL"`, length 4); the in-batch fill removed (`buffer.rs`) → the within-batch check.
+  - Task 21: the guard comparing `end` again → `a_crash_between_a_commit_and_its_checkpoint_skips_the_replay`
+    (3 Delta commits, not 2).
+  - Task 22: the watchdog's verdict ignored → `a_source_that_stops_answering_is_reconnected_to`
+    (no reconnect within 60 s); the connect bound lifted → `a_connect_to_a_server_that_never_answers_times_out`;
+    a read still out counted as unanswered → `a_stalled_heartbeat_read_holds_up_nothing`.
+  - Task 23: `quieted` dropped from `init` → the smoke scenario (Delta library lines); the
+    LIST before the load removed → the smoke scenario (the kernel's ERROR).
 - **Live facts the plan relies on:**
   - `ALTER ROLE … SET wal_sender_timeout = '2s'` applies to a replication connection on 18 and
     14; a paused worker keeps the same `active_pid` past it (Task 5).
@@ -12468,16 +14584,21 @@ per task, against the `test-infra` services (PostgreSQL 18 and 14, RustFS, Azuri
   - With `buffer_capacity_rows` at the chunk size, a crash at the sixth chunk finds four chunks
     committed and the cursor at 2,000 rows. Without the cap, a crash at the fourth found no
     chunk committed (Task 17).
-  - The commit marker does not skip a replay whose flush also read a keep-alive (F-1).
+  - Before Task 21, the commit marker didn't skip a replay whose flush also read a keep-alive
+    (F-1). With it, the replay adds no Delta commit.
+  - A container frozen with `docker pause` keeps its TCP connections and never answers. Before
+    Task 22, a pipeline on a PostgreSQL 14 frozen for 150 s stayed `running`, with no reconnect
+    and nothing logged. A local listener that accepts and never answers holds tokio-postgres's
+    startup past `connect_timeout`.
   - DuckDB 1.5.6 reads the Delta tables on RustFS through an S3 secret (path style, no SSL),
     printing `timestamptz` in the session's zone (pinned to UTC, Task 19).
-  - Leftovers: after every run, no `e2e%` slot, schema or publication on either server, no
+  - Leftovers: after every green run, no `e2e%` slot, schema or publication on either server, no
     `data-avalanche-it/e2e-*` prefix on RustFS, `max_slot_wal_keep_size` back to `-1`, and
     `synchronous_standby_names` empty.
 
 ## M6b exit checklist
 
-- [ ] Tasks 1–21 committed, each reviewed (one implementer and one reviewer per task, P-9).
+- [ ] Tasks 1–24 committed, each reviewed (one implementer and one reviewer per task, P-9).
 - [ ] The whole-branch review and its fixes.
 - [ ] Workspace gates green: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets
       -- -D warnings`; the same with `-p data-avalanche --features e2e-hooks`; `cargo test
@@ -12485,11 +14606,14 @@ per task, against the `test-infra` services (PostgreSQL 18 and 14, RustFS, Azuri
 - [ ] The slice-1 E2E suite green on PostgreSQL 18 + RustFS in PR CI.
 - [ ] `weekly.yml` green on PostgreSQL 14–17 with the E2E step (a manual dispatch on the branch,
       or the first Monday run after the merge).
-- [ ] The approved spec patches applied (config §9.4.3 and V-119; the System-Overview
-      catalogue).
+- [x] The approved spec patches applied (config §9.4.3 and V-119; the System-Overview
+      catalogue), 2026-10-08.
+- [ ] The Tasks 21–23 spec patches applied once approved (Data-Flow Phase 4; config §6.4, §9.2,
+      §9.2.1).
 - [ ] The roadmap updates applied; README status.
-- [ ] Gap tracker: F-1 recorded; DA-SNAP-11 advanced (the gauges); the owner's answers on
-      F-2…F-4 recorded.
+- [x] Gap tracker: the owner's answers recorded (§29, 2026-10-08): DA-X-12 new, DA-SRC-16 🔄,
+      DA-SNAP-11 advanced.
+- [ ] Gap tracker at the exit: DA-X-12 and DA-SRC-16 closed by Tasks 21 and 22.
 - [ ] `.superpowers/sdd/M6a-pipeline-worker/` deleted (kept until M6 is finished).
 - [ ] The milestone PR opened against `main`; Oleksii merges.
 
