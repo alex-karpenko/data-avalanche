@@ -389,6 +389,22 @@ fn sink(s: &RawSink, at: &At, ctx: &mut Ctx, cross_field: bool) {
     );
     if let Some(d) = &s.delta {
         let d_at = at.key("delta");
+        // V-119
+        let mem_at = d_at.key("merge_memory_limit");
+        if let Some(Some(l)) = &d.merge_memory_limit
+            && let Some(v) = ctx.value(l, &mem_at)
+            && v.bytes() < 16 * ByteSize::MIB
+        {
+            ctx.error(
+                "V-119",
+                &mem_at,
+                l.loc(),
+                format!(
+                    "merge_memory_limit must be at least 16MiB when set, got {}",
+                    shown_value(l, &v)
+                ),
+            );
+        }
         // V-092, V-088
         if let Some((ColumnMapping::Name, loc)) =
             val(ctx, &d.column_mapping, &d_at.key("column_mapping"))

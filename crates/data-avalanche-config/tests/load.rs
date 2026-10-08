@@ -186,6 +186,21 @@ fn absent_mysql_and_delta_blocks_take_every_default() {
     let delta = p.sink.delta.as_ref().unwrap();
     assert_eq!(delta.checkpoint_interval, 10);
     assert_eq!(delta.column_mapping, ColumnMapping::None);
+    assert_eq!(delta.merge_memory_limit, None, "no ceiling by default");
+}
+
+#[test]
+fn a_merge_memory_limit_resolves_to_bytes() {
+    let yaml = MINIMAL.replace("delta: {}", "delta: { merge_memory_limit: 256MiB }");
+    assert!(yaml.contains("merge_memory_limit"), "{yaml}");
+    let loaded =
+        load_str(&yaml, &env(&[("PW", "pw")]), &fp_key()).unwrap_or_else(|r| panic!("{r:#?}"));
+    let delta = loaded.config.pipelines["orders"]
+        .sink
+        .delta
+        .clone()
+        .unwrap();
+    assert_eq!(delta.merge_memory_limit, Some(256 << 20));
 }
 
 #[test]

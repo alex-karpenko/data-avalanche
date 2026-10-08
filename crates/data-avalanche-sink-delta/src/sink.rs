@@ -630,6 +630,33 @@ mod tests {
         assert_eq!(state.marker, None, "nothing committed");
     }
 
+    /// A MERGE over `merge_memory_limit` is refused `Permanent`, naming the key: retrying the same
+    /// set would fail the same way forever. Nothing is written.
+    #[tokio::test]
+    async fn a_merge_over_the_memory_limit_is_permanent() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = DeltaSink::new(DeltaSinkConfig {
+            merge_memory_limit: Some(64 << 10),
+            ..sink(&dir).config
+        });
+        s.ensure_table(&spec(&orders())).await.unwrap();
+        let seed = rows(10, &(0..20_000).collect::<Vec<_>>());
+        let ok = sink(&dir);
+        ok.commit(seed.clone(), marker(1, &seed)).await.unwrap();
+        let again = rows(20, &(0..20_000).collect::<Vec<_>>());
+        let err = s
+            .commit(again.clone(), marker(1, &again))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SinkError::Permanent { .. }), "{err}");
+        assert!(err.to_string().contains("merge_memory_limit"), "{err}");
+        let state = s.table_state(&again.table).await.unwrap();
+        assert_eq!(
+            state.marker.unwrap().committed_position,
+            SourcePosition::Pg(Lsn(10))
+        );
+    }
+
     #[tokio::test]
     async fn a_race_with_a_foreign_optimize_is_retried_and_lands() {
         let dir = tempfile::tempdir().unwrap();
