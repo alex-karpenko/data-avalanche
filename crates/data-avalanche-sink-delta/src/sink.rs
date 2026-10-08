@@ -7,8 +7,8 @@ use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use data_avalanche_core::{
     CommitMarker, CommitOutcome, EvolveOutcome, SchemaDelta, SchemaOp, Sink, SinkCapabilities,
-    SinkError, SinkKind, SinkTableState, SourcePosition, TableChangeSet, TableRef, TableSpec,
-    TransformKind, WriteMode,
+    SinkError, SinkKind, SinkStats, SinkTableState, SourcePosition, TableChangeSet, TableRef,
+    TableSpec, TransformKind, WriteMode,
 };
 use deltalake::DeltaTableError;
 use deltalake::kernel::Transaction;
@@ -313,6 +313,14 @@ impl Sink for DeltaSink {
 
     fn capabilities(&self) -> &SinkCapabilities {
         &self.capabilities
+    }
+
+    fn stats(&self) -> SinkStats {
+        let s = DeltaSink::stats(self);
+        SinkStats {
+            files_rewritten: s.files_removed,
+            rows_copied: s.rows_copied,
+        }
     }
 
     async fn table_state(&self, table: &TableRef) -> Result<SinkTableState, SinkError> {

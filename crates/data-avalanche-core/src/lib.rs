@@ -34,7 +34,8 @@ pub use position::{PositionError, SourcePosition};
 pub use schema::{ColumnSchema, HaltReason, TableSchema, canonical_logical, hop2_compatible};
 pub use sink::{
     CommitMarker, CommitOutcome, EvolveOutcome, PartitionField, PartitionTransform, SchemaOp, Sink,
-    SinkCapabilities, SinkError, SinkKind, SinkTableState, TableSpec, TransformKind, WriteMode,
+    SinkCapabilities, SinkError, SinkKind, SinkStats, SinkTableState, TableSpec, TransformKind,
+    WriteMode,
 };
 pub use source::{
     ChangeStream, Chunk, ChunkVisibility, InFlightTxn, KeysetCursor, Preflight, Prepared,

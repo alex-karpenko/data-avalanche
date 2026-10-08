@@ -1,0 +1,13 @@
+[package]
+name = "data-avalanche-telemetry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Metrics for data-avalanche: the Prometheus registry and the catalogue's series."
+
+[lints]
+workspace = true
+
+[dependencies]
+prometheus-client.workspace = true

@@ -2,7 +2,7 @@
 
 use data_avalanche_core::{
     ColumnSchema, ColumnValueType, CommitOutcome, EvolveOutcome, SchemaChange, SchemaDelta, Sink,
-    TableRef, TableSchema, TableSpec,
+    SinkStats, TableRef, TableSchema, TableSpec,
 };
 use data_avalanche_sink_delta::{DeltaLocation, TableDefaults};
 use deltalake::DeltaTable;
@@ -143,6 +143,14 @@ pub async fn truncate_then_rows(location: DeltaLocation) {
             after.rows_inserted - before.rows_inserted,
         ),
         (1, 2, 1)
+    );
+    // The sink-neutral totals the metrics read.
+    assert_eq!(
+        Sink::stats(&s),
+        SinkStats {
+            files_rewritten: after.files_removed,
+            rows_copied: after.rows_copied,
+        }
     );
     let mut clear = cs(30, vec![], vec![]);
     clear.truncate = true;

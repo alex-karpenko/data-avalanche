@@ -231,6 +231,17 @@ pub enum EvolveOutcome {
     },
 }
 
+/// What a sink has done since it was built, for the metrics (System-Overview §Observability: the
+/// MERGE cost signals, D-MS.15). A sink that doesn't measure them reports zeros.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SinkStats {
+    /// Files a commit replaced or removed (`data_avalanche_sink_merge_files_rewritten`).
+    pub files_rewritten: u64,
+    /// Rows rewritten unchanged because they share a file with a changed row
+    /// (`data_avalanche_sink_merge_rows_copied`).
+    pub rows_copied: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommitOutcome {
     Committed {
@@ -280,6 +291,10 @@ impl SinkError {
 pub trait Sink: Send + Sync {
     fn kind(&self) -> SinkKind;
     fn capabilities(&self) -> &SinkCapabilities;
+    /// Totals since the sink was built.
+    fn stats(&self) -> SinkStats {
+        SinkStats::default()
+    }
     async fn table_state(&self, table: &TableRef) -> Result<SinkTableState, SinkError>;
     /// Creates the table when it's absent; a present table is left as it is.
     async fn ensure_table(&self, spec: &TableSpec) -> Result<(), SinkError>;
