@@ -6609,7 +6609,7 @@ Change `crates/data-avalanche-cluster/src/controller.rs`:
 diff --git a/crates/data-avalanche-cluster/src/controller.rs b/crates/data-avalanche-cluster/src/controller.rs
 --- a/crates/data-avalanche-cluster/src/controller.rs
 +++ b/crates/data-avalanche-cluster/src/controller.rs
-@@ -1,3 +1,596 @@
+@@ -1,3 +1,601 @@
 +//! One pipeline's controller (Clustering §20, Pipeline_Lifecycle §5): the only writer of the
 +//! pipeline's lease. While its target is "own" it claims the lease, then runs the pipeline's
 +//! worker under it and reconciles the worker toward the persisted desired state, polled every
@@ -6838,7 +6838,12 @@ diff --git a/crates/data-avalanche-cluster/src/controller.rs b/crates/data-avala
 +                    );
 +                    match self.owned(run, &mut target).await {
 +                        Left::Shutdown => return,
-+                        Left::Lost | Left::Released => continue,
++                        // Not this node's until a step says otherwise, though claiming fails.
++                        Left::Lost => {
++                            self.standby(None);
++                            continue;
++                        }
++                        Left::Released => continue,
 +                    }
 +                }
 +                Ok(Claimed::HeldBy {
@@ -14653,7 +14658,33 @@ per task, against the `test-infra` services (PostgreSQL 18 and 14, RustFS, Azuri
   The code is unchanged. Committed after Task 8's commit as `test(cluster): a slow renewal's
   deadline counts from before the write; a lease taken while a renewal's outcome is unknown is
   lost`. The cluster crate has 10 lease tests at Task 8 and 31 tests at the last task; the
-  workspace, 923. The review's other notes are parked in the SDD ledger.
+  workspace, 923. A lease read back as absent (`Ok(None)` after an unknown outcome) has no test:
+  `ScriptedStore` can't delete, so that one-line arm is checked by reading only. The review's
+  other notes are parked in the SDD ledger.
+
+- **Task 9, the review fix in two rounds (2026-10-08).** The task review found that `step`
+  read an `Acquired::HeldBy` naming this holder (an earlier write that landed behind its error)
+  as another node's lease: the node waited a full `lease_duration`, then took its own lease
+  over. It also found that `written` (taken before the write) and the takeover wait (from when
+  the read returned) survived mutation. Round 1 renewed a self-held lease at once and added
+  three tests, with a `ScriptedStore::slow_reads` knob; every mutation fails one. At the last
+  task, Task 10's `a_lost_lease_stops_the_worker_and_the_lease_is_claimed_again` then failed:
+  the lease its renewer gave up as lost came back under the same epoch, shared with the worker
+  that had run. Round 2: a lease naming this holder is this process's own earlier term, taken
+  over at once under the next epoch, never renewed, so a new term never shares an epoch with a
+  worker that already ran (a restarted process has another incarnation and waits as before).
+  Committed after Task 9's commit as `fix(cluster): a lease naming this holder after a write
+  that landed behind an error is renewed at once; written and the takeover wait are pinned by
+  tests` and `fix(cluster): a lease naming this holder is taken over at once under the next
+  epoch, never renewed: a new term never shares an epoch with a worker that ran`. The review's
+  other notes are parked in the SDD ledger.
+- **Task 10, changed before its execution (2026-10-08).** Round 2 above uncovered a stale
+  status: after `Left::Lost`, the controller went back to claiming and, while every claim
+  failed, kept reporting `Running` under the lost lease (before, the claim answered `HeldBy`
+  naming this node, which set standby). `Left::Lost` now sets `Standby { holder: None }`, which
+  also drops the pipeline's series. Task 10's code below carries it. At the last task the
+  workspace has 926 tests; the cluster crate's counts at Tasks 9 and 10 are 5 higher than their
+  Step 4 text shows (the Task 8 and Task 9 fixes' tests).
 
 ### After Task 1: the review fix
 
@@ -15082,4 +15113,245 @@ index df03330..18b1981 100644
              Some(f) if f.lands => {
                  write.await?;
                  Err(f.error(key))
+```
+
+### After Task 9: the review fix
+
+Change `crates/data-avalanche-cluster/src/claim.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-cluster/src/claim.rs b/crates/data-avalanche-cluster/src/claim.rs
+index 1df67d0..dfe4a99 100644
+--- a/crates/data-avalanche-cluster/src/claim.rs
++++ b/crates/data-avalanche-cluster/src/claim.rs
+@@ -72,6 +72,18 @@ impl Claim {
+                     written: sent,
+                 });
+             }
++            Acquired::HeldBy(seen) if seen.doc.is_held_by(&self.holder) => {
++                // An earlier step's write landed behind its error: the lease is this node's.
++                // It is renewed, so `written` is a send time this step saw (a later one than
++                // the landed write's would let the renewer's first deadline outlast the lease).
++                self.watched = None;
++                let sent = Instant::now();
++                let lease = self.leases.renew(&seen, Utc::now()).await?;
++                return Ok(Claimed::Mine {
++                    lease,
++                    written: sent,
++                });
++            }
+             Acquired::HeldBy(seen) => seen,
+         };
+         // The wait runs from when the version was read, never from before: a renewal that
+@@ -263,6 +275,76 @@ mod tests {
+         assert_eq!(epoch(&b.step().await.unwrap()), 2);
+     }
+ 
++    /// An acquire whose write landed behind an error: the next step finds the lease naming this
++    /// holder, and it is this node's at once (renewed, the epoch unchanged, `written` when the
++    /// renewal was sent), never taken over.
++    #[tokio::test(start_paused = true)]
++    async fn an_acquire_that_landed_behind_an_error_is_this_nodes() {
++        let store = ScriptedStore::new();
++        let mut b = claim(&store, "b");
++        store.fail_next(Fault {
++            kind: Kind::Transient,
++            lands: true,
++        });
++        assert!(b.step().await.is_err());
++        // The renewal is slow: `written` is still when it was sent.
++        store.fail_next(Fault {
++            kind: Kind::Slow(Duration::from_secs(2)),
++            lands: true,
++        });
++        let before = Instant::now();
++        let mine = b.step().await.unwrap();
++        assert_eq!(epoch(&mine), 1);
++        let Claimed::Mine { written, .. } = mine else {
++            unreachable!()
++        };
++        assert_eq!(written, before);
++    }
++
++    /// `written` is taken before the write is sent, whether it acquires or takes over: a slow
++    /// write mustn't move the renewer's first deadline past what the lease allows.
++    #[tokio::test(start_paused = true)]
++    async fn written_is_taken_before_the_write() {
++        let store = ScriptedStore::new();
++        let slow = Fault {
++            kind: Kind::Slow(Duration::from_secs(2)),
++            lands: true,
++        };
++        let mut a = claim(&store, "a");
++        let before = Instant::now();
++        store.fail_next(slow);
++        let Claimed::Mine { written, .. } = a.step().await.unwrap() else {
++            panic!("acquired")
++        };
++        assert_eq!(written, before, "the acquire's write was sent at once");
++        let mut b = claim(&store, "b");
++        b.step().await.unwrap();
++        advance(15_000).await;
++        let before = Instant::now();
++        store.fail_next(slow);
++        let Claimed::Mine { written, .. } = b.step().await.unwrap() else {
++            panic!("taken over")
++        };
++        assert_eq!(written, before, "the takeover's write was sent at once");
++    }
++
++    /// The takeover wait runs from when the holder's lease was read, not from when the read was
++    /// sent: a renewal landing while the read is in flight counts.
++    #[tokio::test(start_paused = true)]
++    async fn the_takeover_wait_runs_from_when_the_read_returned() {
++        let store = ScriptedStore::new();
++        acquired(&leases(&store), "a").await;
++        store.slow_reads(Duration::from_secs(2));
++        let sent = Instant::now();
++        let Claimed::HeldBy { takeover_at, .. } = claim(&store, "b").step().await.unwrap() else {
++            panic!("held by a")
++        };
++        assert_eq!(
++            takeover_at,
++            sent + Duration::from_secs(2) + timing().duration
++        );
++    }
++
+     #[tokio::test(start_paused = true)]
+     async fn a_takeover_that_failed_is_tried_again_at_the_next_step() {
+         let store = ScriptedStore::new();
+```
+
+Change `crates/data-avalanche-cluster/src/test_support.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-cluster/src/test_support.rs b/crates/data-avalanche-cluster/src/test_support.rs
+index 18b1981..5e0623b 100644
+--- a/crates/data-avalanche-cluster/src/test_support.rs
++++ b/crates/data-avalanche-cluster/src/test_support.rs
+@@ -56,6 +56,8 @@ struct Script {
+     next: VecDeque<Fault>,
+     /// Every write fails so, once `next` is empty.
+     always: Option<Fault>,
++    /// How long every read takes.
++    read_delay: Duration,
+ }
+ 
+ /// An in-memory store whose writes (`create`, `update`, `put`) fail as scripted.
+@@ -82,6 +84,11 @@ impl ScriptedStore {
+         self.lock().always = fault;
+     }
+ 
++    /// Every read from now on answers after `delay`.
++    pub fn slow_reads(&self, delay: Duration) {
++        self.lock().read_delay = delay;
++    }
++
+     fn lock(&self) -> std::sync::MutexGuard<'_, Script> {
+         self.script
+             .lock()
+@@ -121,6 +128,8 @@ impl ScriptedStore {
+ #[async_trait]
+ impl VersionedStore for ScriptedStore {
+     async fn get(&self, key: &str) -> Result<Option<(Bytes, ObjectVersion)>, StoreError> {
++        let delay = self.lock().read_delay;
++        tokio::time::sleep(delay).await;
+         self.inner.get(key).await
+     }
+ 
+```
+
+Change `crates/data-avalanche-cluster/src/claim.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-cluster/src/claim.rs b/crates/data-avalanche-cluster/src/claim.rs
+index dfe4a99..6c0ef96 100644
+--- a/crates/data-avalanche-cluster/src/claim.rs
++++ b/crates/data-avalanche-cluster/src/claim.rs
+@@ -72,36 +72,30 @@ impl Claim {
+                     written: sent,
+                 });
+             }
+-            Acquired::HeldBy(seen) if seen.doc.is_held_by(&self.holder) => {
+-                // An earlier step's write landed behind its error: the lease is this node's.
+-                // It is renewed, so `written` is a send time this step saw (a later one than
+-                // the landed write's would let the renewer's first deadline outlast the lease).
+-                self.watched = None;
+-                let sent = Instant::now();
+-                let lease = self.leases.renew(&seen, Utc::now()).await?;
+-                return Ok(Claimed::Mine {
+-                    lease,
+-                    written: sent,
+-                });
+-            }
+             Acquired::HeldBy(seen) => seen,
+         };
+-        // The wait runs from when the version was read, never from before: a renewal that
+-        // landed while the read was in flight must count.
+-        let read = Instant::now();
+-        let since = match &self.watched {
+-            Some((version, since)) if *version == seen.version => *since,
+-            _ => {
+-                self.watched = Some((seen.version.clone(), read));
+-                read
++        // A lease naming this holder is this process's own earlier term: one its renewer gave up
++        // as lost, or an earlier step's write that landed behind its error. No one else holds
++        // it, so it is taken over at once, under the next epoch: a new term never shares an
++        // epoch with a worker that already ran.
++        if !seen.doc.is_held_by(&self.holder) {
++            // The wait runs from when the version was read, never from before: a renewal that
++            // landed while the read was in flight must count.
++            let read = Instant::now();
++            let since = match &self.watched {
++                Some((version, since)) if *version == seen.version => *since,
++                _ => {
++                    self.watched = Some((seen.version.clone(), read));
++                    read
++                }
++            };
++            let takeover_at = since + self.timing.duration;
++            if read < takeover_at {
++                return Ok(Claimed::HeldBy {
++                    node_id: seen.doc.holder_node_id,
++                    takeover_at,
++                });
+             }
+-        };
+-        let takeover_at = since + self.timing.duration;
+-        if read < takeover_at {
+-            return Ok(Claimed::HeldBy {
+-                node_id: seen.doc.holder_node_id,
+-                takeover_at,
+-            });
+         }
+         let sent = Instant::now();
+         match self
+@@ -276,8 +270,8 @@ mod tests {
+     }
+ 
+     /// An acquire whose write landed behind an error: the next step finds the lease naming this
+-    /// holder, and it is this node's at once (renewed, the epoch unchanged, `written` when the
+-    /// renewal was sent), never taken over.
++    /// holder and takes it over at once, under the next epoch (`written` when that write was
++    /// sent), never after a lease duration.
+     #[tokio::test(start_paused = true)]
+     async fn an_acquire_that_landed_behind_an_error_is_this_nodes() {
+         let store = ScriptedStore::new();
+@@ -287,14 +281,14 @@ mod tests {
+             lands: true,
+         });
+         assert!(b.step().await.is_err());
+-        // The renewal is slow: `written` is still when it was sent.
++        // The takeover is slow: `written` is still when it was sent.
+         store.fail_next(Fault {
+             kind: Kind::Slow(Duration::from_secs(2)),
+             lands: true,
+         });
+         let before = Instant::now();
+         let mine = b.step().await.unwrap();
+-        assert_eq!(epoch(&mine), 1);
++        assert_eq!(epoch(&mine), 2);
+         let Claimed::Mine { written, .. } = mine else {
+             unreachable!()
+         };
 ```
