@@ -231,6 +231,13 @@ impl DeltaSink {
                 return Ok(Step::Done(CommitOutcome::SkippedCovered));
             }
         }
+        let recorded = h.identifier()?;
+        if !recorded.is_empty() && recorded != cs.identifier {
+            return Err(permanent(format!(
+                "the change set is keyed by {:?}, the table by {:?}",
+                cs.identifier, recorded
+            )));
+        }
         let snapshot = h.table().snapshot().map_err(sink_error)?;
         let types = check_columns(cs, snapshot.schema().as_ref())?;
         // Before the truncate's DELETE: a key that halts the MERGE must not leave the table
@@ -607,6 +614,22 @@ mod tests {
         assert!(matches!(out, CommitOutcome::Committed { .. }), "{out:?}");
     }
 
+    /// A table created under another key refuses a set (the source's key, or its override,
+    /// changed since): merging on the set's key would duplicate rows. Nothing is written.
+    #[tokio::test]
+    async fn a_set_keyed_otherwise_than_the_table_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = sink(&dir);
+        s.ensure_table(&spec(&orders())).await.unwrap();
+        let mut cs = rows(10, &[1]);
+        cs.identifier = vec!["id".into(), "doc".into()];
+        let err = s.commit(cs.clone(), marker(1, &cs)).await.unwrap_err();
+        assert!(matches!(err, SinkError::Permanent { .. }), "{err}");
+        assert!(err.to_string().contains("keyed by"), "{err}");
+        let state = s.table_state(&cs.table).await.unwrap();
+        assert_eq!(state.marker, None, "nothing committed");
+    }
+
     #[tokio::test]
     async fn a_race_with_a_foreign_optimize_is_retried_and_lands() {
         let dir = tempfile::tempdir().unwrap();
@@ -803,14 +826,18 @@ mod tests {
     async fn a_truncate_set_with_a_key_outside_the_delta_range_changes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let s = sink(&dir);
-        s.ensure_table(&spec(&orders())).await.unwrap();
-        let seed = rows(10, &[1]);
+        // A table keyed by `at`, which is `id` milliseconds.
+        let mut keyed = spec(&orders());
+        keyed.identifier = vec!["at".into()];
+        s.ensure_table(&keyed).await.unwrap();
+        let mut seed = rows(10, &[1]);
+        seed.identifier = vec!["at".into()];
         let CommitOutcome::Committed { version } =
             s.commit(seed.clone(), marker(1, &seed)).await.unwrap()
         else {
             panic!("committed")
         };
-        // `at` is `id` milliseconds: past 9999-12-31, and the set's key.
+        // Past 9999-12-31, and the set's key.
         let mut t = rows(20, &[300_000_000_000_000]);
         t.truncate = true;
         t.identifier = vec!["at".into()];

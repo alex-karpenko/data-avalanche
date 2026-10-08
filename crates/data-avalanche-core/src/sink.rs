@@ -298,7 +298,8 @@ pub trait Sink: Send + Sync {
     /// 3. [`SinkError::NoTable`] when the table is absent;
     /// 4. the fence, then the guard, against the stored marker: a [`CommitOutcome::Fenced`] or
     ///    [`CommitOutcome::SkippedCovered`] commit changes nothing;
-    /// 5. every column of the set must be in the table with the same type;
+    /// 5. the set's identifier must be the one the table was created with, and every column of
+    ///    the set must be in the table with the same type;
     /// 6. apply, as one table version: the truncate clear, then the deletes, then the upserts;
     /// 7. store the marker with the **union** of the prior stored position and the new one.
     async fn commit(

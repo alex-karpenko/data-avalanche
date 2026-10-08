@@ -66,6 +66,12 @@ impl MemTable {
     /// Every column of the change set exists in the table with the same type; the table may have
     /// more (soft-dropped columns, written NULL).
     fn check_schema(&self, cs: &TableChangeSet) -> Result<(), SinkError> {
+        if cs.identifier != self.identifier {
+            return Err(permanent(format!(
+                "the change set is keyed by {:?}, the table by {:?}",
+                cs.identifier, self.identifier
+            )));
+        }
         for f in cs.schema.fields() {
             match self.schema.field_with_name(f.name()) {
                 Ok(t) if t.data_type() == f.data_type() => {}
@@ -863,6 +869,19 @@ mod tests {
             sink.evolve(&t, &add, 2).await.unwrap(),
             EvolveOutcome::Applied
         );
+    }
+
+    /// A table keyed otherwise than the set (the source's key, or its override, changed since
+    /// the table was created) refuses it: merging on another key would duplicate rows.
+    #[tokio::test]
+    async fn a_set_keyed_otherwise_than_the_table_is_refused() {
+        let sink = sink().await;
+        let mut c = cs(10, vec![upserts(&[(1, Some("a"))], None)], vec![]);
+        c.identifier = vec!["id".into(), "doc".into()];
+        let err = sink.commit(c, marker(1, 10)).await.unwrap_err();
+        assert!(matches!(err, SinkError::Permanent { .. }), "{err}");
+        assert!(err.to_string().contains("keyed by"), "{err}");
+        assert_eq!(sink.version(&TableRef::new("public", "t")), Some(0));
     }
 
     #[tokio::test]

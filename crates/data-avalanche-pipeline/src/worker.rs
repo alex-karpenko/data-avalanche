@@ -1098,6 +1098,34 @@ mod tests {
         assert!(content.column_by_name("note").is_none(), "nothing evolved");
     }
 
+    /// The sink holds the table under another key (the source's key, or its override, changed
+    /// since the table was created): its first commit is refused, the table halts
+    /// `SINK_REJECTED` naming both keys, and the other tables go on.
+    #[tokio::test]
+    async fn a_sink_table_keyed_otherwise_halts_the_table() {
+        let w = World::new(&["a", "b"]);
+        let mut spec = TableSpec::new(&w.source.schema(&t("a")), vec![]).unwrap();
+        spec.identifier = vec!["id".into(), "doc".into()];
+        w.sink.ensure_table(&spec).await.unwrap();
+        let (end, st) = run(&w, &mode("mode: never"), async |status| {
+            w.source.commit(
+                FakeTxn::new()
+                    .insert(&t("a"), row(1, "x"))
+                    .insert(&t("b"), row(1, "x")),
+            );
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        match st.halted.get(&t("a")) {
+            Some(HaltReason::SinkRejected { detail }) => {
+                assert!(detail.contains("keyed by"), "{detail}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(w.ids("b"), [1]);
+    }
+
     #[tokio::test]
     async fn a_lost_lease_stops_the_worker_before_its_next_commit() {
         let w = World::new(&["a"]);
