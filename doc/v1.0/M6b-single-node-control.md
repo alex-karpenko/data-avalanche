@@ -346,7 +346,7 @@ in the task after the arrow.
 
 ### Spec patches
 
-Approved 2026-10-08 (Q-M6b-13), applied with this plan:
+Approved 2026-10-08 (Q-M6b-13) and applied:
 
 `doc/specs/Configuration_Specification.md` (§9.4.3, §13.3):
 
@@ -376,7 +376,7 @@ Approved 2026-10-08 (Q-M6b-13), applied with this plan:
 +| Status | `data_avalanche_pipeline_status` (running / paused / stopped / error), `data_avalanche_halted_tables` |
 ```
 
-Proposed 2026-10-08 with Tasks 21–23 (need approval; drafted on scratch copies):
+Proposed 2026-10-08 with Tasks 21–23, approved and applied the same day:
 
 `doc/specs/Data-Flow.md` (Phase 4, position guard):
 
@@ -401,7 +401,7 @@ Proposed 2026-10-08 with Tasks 21–23 (need approval; drafted on scratch copies
 +| `heartbeat` | … | StandbyStatusUpdate interval; keeps the connection alive and prevents WAL-lag-as-inactivity. Also paces the stream watchdog: a stream silent for 3 heartbeats while the heartbeat's reads of the slot fail or find no reader is reconnected (DA-SRC-16). |
 ```
 
-### Proposed roadmap updates (applied with the plan's approval)
+### Roadmap updates (applied 2026-10-08, with the plan's approval)
 
 - §3.3: `PositionRange::last_change`, which the guard compares (`CommitMarker::covers`).
 - §3.4:
@@ -430,7 +430,8 @@ Proposed 2026-10-08 with Tasks 21–23 (need approval; drafted on scratch copies
 - A new §3.12 "Telemetry and the binary": `Metrics`, `PipelineMetrics`, `CONTENT_TYPE`;
   `run(RunArgs)`, `Fatal`, the exit codes, the HTTP endpoints, `DATA_AVALANCHE_E2E_CRASH`, the
   Delta libraries' log caps.
-- §4 M6b: the exit as measured; D-IMPL-14 → this plan's D-M6b.1…13.
+- §4 M6b: the exit as measured; D-IMPL-14 → this plan's Q-M6b-1…13 and D-M6b.1…13.
+- §5.3 scenario 10: a frozen source reconnected to.
 
 ## File Structure
 
@@ -14608,9 +14609,10 @@ per task, against the `test-infra` services (PostgreSQL 18 and 14, RustFS, Azuri
       or the first Monday run after the merge).
 - [x] The approved spec patches applied (config §9.4.3 and V-119; the System-Overview
       catalogue), 2026-10-08.
-- [ ] The Tasks 21–23 spec patches applied once approved (Data-Flow Phase 4; config §6.4, §9.2,
-      §9.2.1).
-- [ ] The roadmap updates applied; README status.
+- [x] The Tasks 21–23 spec patches applied (Data-Flow Phase 4; config §6.4, §9.2, §9.2.1),
+      2026-10-08.
+- [x] The roadmap updates applied (2026-10-08).
+- [ ] README status at the exit.
 - [x] Gap tracker: the owner's answers recorded (§29, 2026-10-08): DA-X-12 new, DA-SRC-16 🔄,
       DA-SNAP-11 advanced.
 - [ ] Gap tracker at the exit: DA-X-12 and DA-SRC-16 closed by Tasks 21 and 22.
