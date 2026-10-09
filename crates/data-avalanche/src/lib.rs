@@ -4,6 +4,7 @@
 //! SIGTERM or SIGINT, and lets every lease go on the way out.
 
 mod cli;
+mod http;
 mod logging;
 mod run;
 mod startup;

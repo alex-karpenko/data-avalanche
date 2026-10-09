@@ -1,6 +1,8 @@
 //! `data-avalanche run`.
 
+use std::future::IntoFuture;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use data_avalanche_cluster::{
@@ -13,8 +15,9 @@ use data_avalanche_pipeline::{Backoff, Tuning};
 use data_avalanche_state::Leases;
 use data_avalanche_telemetry::Metrics;
 use thiserror::Error;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, oneshot};
 
+use crate::http::{self, Http};
 use crate::startup::{Buckets, join};
 use crate::{Factory, RunArgs, logging};
 
@@ -100,6 +103,24 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     if let Some(why) = unsupported(&first.config) {
         return Err(Fatal::Config(why));
     }
+    // The listener answers from here: live at once, ready once every controller runs.
+    let metrics = Metrics::new();
+    let ready = Arc::new(AtomicBool::new(false));
+    let listener = http::bind(&first.config.globals.api.address).await?;
+    let (stop_http, http_stopped) = oneshot::channel::<()>();
+    let server = tokio::spawn(
+        axum::serve(
+            listener,
+            http::router(Http {
+                metrics: metrics.clone(),
+                ready: Arc::clone(&ready),
+            }),
+        )
+        .with_graceful_shutdown(async {
+            let _ = http_stopped.await;
+        })
+        .into_future(),
+    );
     let holder = node_identity(&first.config.globals.cluster, started).map_err(Fatal::Config)?;
     let buckets = Buckets::new(&first.config.globals);
     let joined = join(&buckets, &holder.node_id, &text, &first.config).await?;
@@ -114,7 +135,6 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         "joined the cluster"
     );
 
-    let metrics = Metrics::new();
     let c = &config.globals.cluster;
     let deps = ControllerDeps {
         leases: Leases::new(joined.globals),
@@ -131,9 +151,13 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         pipelines.push((p.clone(), buckets.pipeline_docs(p)?));
     }
     let reconciler = ClusterReconciler::start(pipelines, &deps);
+    ready.store(true, Ordering::SeqCst);
     shutdown_signal().await;
     tracing::info!("shutting down: draining every pipeline and releasing its lease");
+    ready.store(false, Ordering::SeqCst);
     reconciler.shutdown().await;
+    let _ = stop_http.send(());
+    let _ = server.await;
     tracing::info!("stopped");
     Ok(())
 }
