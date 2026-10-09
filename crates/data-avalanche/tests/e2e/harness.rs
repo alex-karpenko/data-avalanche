@@ -9,7 +9,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::Int64Type;
 use arrow_array::{Array, RecordBatch};
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
-use data_avalanche_core::TableRef;
+use data_avalanche_core::{Sink, TableRef};
 use data_avalanche_sink_delta::{DeltaLocation, DeltaSink, DeltaSinkConfig};
 use data_avalanche_state::{DocStore, LeaseDoc, Leases, PipelineDocs, TableSnapshotDoc, Versioned};
 use data_avalanche_storage::{Backend, ObjectStoreVersioned, colocated_state, table_root};
@@ -322,6 +322,36 @@ pipelines:
         .await;
     }
 
+    /// The position the table's latest commit marker names, as PostgreSQL text (`0/16B3748`).
+    pub async fn marker(&self, table: &str) -> String {
+        self.lake()
+            .table_state(&self.table(table))
+            .await
+            .expect("the lake reads")
+            .marker
+            .expect("a commit marker")
+            .committed_position
+            .untagged()
+    }
+
+    /// Waits until the slot's acknowledged position reaches `lsn`: everything before it is
+    /// committed and checkpointed.
+    pub async fn acknowledged(&self, lsn: &str) {
+        let what = format!("the slot acknowledges {lsn}");
+        eventually(&what, Duration::from_secs(60), async || {
+            self.admin
+                .query_opt(
+                    "SELECT 1 FROM pg_replication_slots
+                     WHERE slot_name = $1 AND confirmed_flush_lsn >= $2::text::pg_lsn",
+                    &[&self.schema, &lsn],
+                )
+                .await
+                .expect("slots read")
+                .is_some()
+        })
+        .await;
+    }
+
     pub async fn exec(&self, sql: &str) {
         self.admin
             .batch_execute(&format!(
@@ -526,6 +556,17 @@ impl Proc {
         let pid = self.child.id().to_string();
         let sent = Command::new("kill")
             .args(["-TERM", &pid])
+            .status()
+            .expect("kill runs");
+        assert!(sent.success());
+        self.exit().await
+    }
+
+    /// `kill -9`, as a host failure would.
+    pub async fn kill(mut self) -> ExitStatus {
+        let pid = self.child.id().to_string();
+        let sent = Command::new("kill")
+            .args(["-KILL", &pid])
             .status()
             .expect("kill runs");
         assert!(sent.success());
