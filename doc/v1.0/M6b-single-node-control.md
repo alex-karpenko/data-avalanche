@@ -12677,10 +12677,10 @@ diff --git a/crates/data-avalanche/tests/e2e/crashes.rs b/crates/data-avalanche/
      require_it!();
      let e = E2e::new(
          "crash_commit",
-@@ -86,11 +85,17 @@ async fn a_crash_between_a_commit_and_its_checkpoint_replays_it_idempotently() {
-     assert!(!status.success(), "aborted at the crash point: {status}");
-     e.mirrored("items", COLS).await;
-     let marker = e.marker("items").await;
+@@ -90,11 +89,17 @@ async fn a_crash_between_a_commit_and_its_checkpoint_replays_it_idempotently() {
+         !e.acknowledges(&marker).await,
+         "the crash came before the ack"
+     );
 +    let commits = e.commits("items").await;
  
      let mut p = e.start(&[]);
@@ -14712,6 +14712,21 @@ per task, against the `test-infra` services (PostgreSQL 18 and 14, RustFS, Azuri
   workspace has 932 tests, and the cluster crate's counts from Task 10 on are 11 higher than
   their Step 4 text shows. The review's other notes are parked in the SDD ledger.
 
+- **Task 17, the review fix (2026-10-09).** The task review found the checkpoint-before-ack
+  scenario open to a keep-alive: `checkpoint_persisted:1` aborts at the first checkpoint of any
+  kind, and on an idle stream a keep-alive moves the frontier, so a flush with no change set
+  persists a checkpoint. A keep-alive read before the INSERT aborts the process before the
+  INSERT, and the test times out: with a 20 s pause before the INSERT, it did, at
+  `CheckpointPersisted` with nothing committed. The scenario now makes the slot with a plain
+  start, stops it, writes the INSERT while the process is down, and only then starts with the
+  crash point (green with a 20 s pause before that start). Both replay scenarios also check, with
+  a new `E2e::acknowledges`, that the slot hadn't acknowledged the marker at the crash, so
+  neither passes on an early ack. Committed after Task 17's commit as `test(e2e): the
+  checkpoint-before-ack crash waits for its transaction, not a keep-alive's checkpoint; both
+  replay scenarios check the slot was not acknowledged at the crash`. Task 21's `crashes.rs`
+  hunk below carries the new check as context; no other later task's code changes. The
+  review's other notes are parked in the SDD ledger.
+
 ### After Task 1: the review fix
 
 Change `crates/data-avalanche-sink-delta/src/sink.rs`:
@@ -15921,4 +15936,93 @@ index 10e44c1..f8fa383 100644
                  Err(e)
              }
          }
+```
+
+### After Task 17: the review fix
+
+Change `crates/data-avalanche/tests/e2e/crashes.rs`:
+
+```diff
+diff --git a/crates/data-avalanche/tests/e2e/crashes.rs b/crates/data-avalanche/tests/e2e/crashes.rs
+--- a/crates/data-avalanche/tests/e2e/crashes.rs
++++ b/crates/data-avalanche/tests/e2e/crashes.rs
+@@ -86,6 +86,10 @@ async fn a_crash_between_a_commit_and_its_checkpoint_replays_it_idempotently() {
+     assert!(!status.success(), "aborted at the crash point: {status}");
+     e.mirrored("items", COLS).await;
+     let marker = e.marker("items").await;
++    assert!(
++        !e.acknowledges(&marker).await,
++        "the crash came before the ack"
++    );
+ 
+     let mut p = e.start(&[]);
+     p.ready().await;
+@@ -153,13 +157,23 @@ async fn a_crash_between_the_checkpoint_and_the_ack_skips_the_resent_transaction
+         },
+     )
+     .await;
+-    let mut p = e.start(&[(CRASH, "checkpoint_persisted:1")]);
++    // The slot is made first, and the transaction is in the WAL before the process with the
++    // crash point starts: its first checkpoint is the transaction's. On an idle stream, a
++    // keep-alive alone would move the frontier and persist a checkpoint first.
++    let mut p = e.start(&[]);
+     p.ready().await;
+     e.streaming().await;
++    assert!(p.terminate().await.success());
+     e.exec("INSERT INTO items VALUES (1, 'a'), (2, 'b')").await;
++    let mut p = e.start(&[(CRASH, "checkpoint_persisted:1")]);
+     let status = p.exit().await;
+     assert!(!status.success(), "aborted at the crash point: {status}");
+     e.mirrored("items", COLS).await;
++    let marker = e.marker("items").await;
++    assert!(
++        !e.acknowledges(&marker).await,
++        "the crash came before the ack"
++    );
+     let commits = e.commits("items").await;
+ 
+     let mut p = e.start(&[]);
+```
+
+Change `crates/data-avalanche/tests/e2e/harness.rs`:
+
+```diff
+diff --git a/crates/data-avalanche/tests/e2e/harness.rs b/crates/data-avalanche/tests/e2e/harness.rs
+--- a/crates/data-avalanche/tests/e2e/harness.rs
++++ b/crates/data-avalanche/tests/e2e/harness.rs
+@@ -334,20 +334,25 @@ pipelines:
+             .untagged()
+     }
+ 
++    /// Whether the slot's acknowledged position has reached `lsn`.
++    pub async fn acknowledges(&self, lsn: &str) -> bool {
++        self.admin
++            .query_opt(
++                "SELECT 1 FROM pg_replication_slots
++                 WHERE slot_name = $1 AND confirmed_flush_lsn >= $2::text::pg_lsn",
++                &[&self.schema, &lsn],
++            )
++            .await
++            .expect("slots read")
++            .is_some()
++    }
++
+     /// Waits until the slot's acknowledged position reaches `lsn`: everything before it is
+     /// committed and checkpointed.
+     pub async fn acknowledged(&self, lsn: &str) {
+         let what = format!("the slot acknowledges {lsn}");
+         eventually(&what, Duration::from_secs(60), async || {
+-            self.admin
+-                .query_opt(
+-                    "SELECT 1 FROM pg_replication_slots
+-                     WHERE slot_name = $1 AND confirmed_flush_lsn >= $2::text::pg_lsn",
+-                    &[&self.schema, &lsn],
+-                )
+-                .await
+-                .expect("slots read")
+-                .is_some()
++            self.acknowledges(lsn).await
+         })
+         .await;
+     }
 ```
