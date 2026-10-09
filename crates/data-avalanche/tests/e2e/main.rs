@@ -7,3 +7,5 @@
 mod harness;
 mod smoke;
 mod snapshots;
+mod streaming;
+mod toast;

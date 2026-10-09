@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int64Type;
 use arrow_array::{Array, RecordBatch};
+use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use data_avalanche_core::TableRef;
 use data_avalanche_sink_delta::{DeltaLocation, DeltaSink, DeltaSinkConfig};
 use data_avalanche_state::{DocStore, LeaseDoc, Leases, PipelineDocs, TableSnapshotDoc, Versioned};
@@ -245,6 +246,55 @@ pipelines:
             .iter()
             .map(|r| r.get::<_, i64>(0))
             .collect()
+    }
+
+    /// The lake's `cols` of `table` as text (`NULL` for a null), in key order.
+    pub async fn rows(&self, table: &str, cols: &[&str]) -> Vec<Vec<String>> {
+        let Some(b) = self.content(table).await else {
+            return vec![];
+        };
+        let options = FormatOptions::default().with_null("NULL");
+        let columns: Vec<_> = cols
+            .iter()
+            .map(|c| {
+                let a = b
+                    .column_by_name(c)
+                    .unwrap_or_else(|| panic!("the lake's {table} has no column {c}"));
+                ArrayFormatter::try_new(a.as_ref(), &options).expect("a formatter")
+            })
+            .collect();
+        (0..b.num_rows())
+            .map(|i| columns.iter().map(|f| f.value(i).to_string()).collect())
+            .collect()
+    }
+
+    /// The source's `cols` of `table` as text (`NULL` for a null), in key order.
+    pub async fn source_rows(&self, table: &str, cols: &[&str]) -> Vec<Vec<String>> {
+        let list = cols
+            .iter()
+            .map(|c| format!("coalesce({c}::text, 'NULL')"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.admin
+            .query(
+                &format!("SELECT {list} FROM {}.{table} ORDER BY id", self.schema),
+                &[],
+            )
+            .await
+            .expect("the source reads")
+            .iter()
+            .map(|r| (0..cols.len()).map(|i| r.get::<_, String>(i)).collect())
+            .collect()
+    }
+
+    /// Waits until the lake's `table` has the source's rows, compared on `cols`.
+    pub async fn mirrored(&self, table: &str, cols: &[&str]) {
+        let want = self.source_rows(table, cols).await;
+        let what = format!("{table} has the source's {} rows on {cols:?}", want.len());
+        eventually(&what, Duration::from_secs(60), async || {
+            self.rows(table, cols).await == want
+        })
+        .await;
     }
 
     /// Waits until the lake's `table` has exactly the source's ids.
