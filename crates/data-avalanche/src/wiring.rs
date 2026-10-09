@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use data_avalanche_cluster::{Parts, WorkerFactory};
 use data_avalanche_config::{Globals, Pipeline, SinkType, TimestampNtzAs};
-use data_avalanche_pipeline::NoHooks;
+use data_avalanche_pipeline::{Hooks, NoHooks};
 use data_avalanche_sink_delta::{DeltaLocation, DeltaSink, DeltaSinkConfig, NtzAs, TableDefaults};
 use data_avalanche_source_pg::PgConnector;
 
@@ -46,14 +46,32 @@ pub fn delta_config(globals: &Globals, p: &Pipeline) -> Result<DeltaSinkConfig, 
 #[derive(Debug)]
 pub struct Factory {
     globals: Globals,
+    hooks: Arc<dyn Hooks>,
 }
 
 impl Factory {
-    pub fn new(globals: &Globals) -> Self {
-        Self {
+    /// # Errors
+    /// With the `e2e-hooks` feature: a `DATA_AVALANCHE_E2E_CRASH` that names no crash point.
+    pub fn new(globals: &Globals) -> Result<Self, String> {
+        Ok(Self {
             globals: globals.clone(),
-        }
+            hooks: hooks()?,
+        })
     }
+}
+
+#[cfg(feature = "e2e-hooks")]
+fn hooks() -> Result<Arc<dyn Hooks>, String> {
+    match std::env::var(crate::crash::CRASH_VAR) {
+        Ok(v) if !v.is_empty() => Ok(Arc::new(crate::crash::CrashAt::parse(&v)?)),
+        _ => Ok(Arc::new(NoHooks)),
+    }
+}
+
+#[cfg(not(feature = "e2e-hooks"))]
+#[allow(clippy::unnecessary_wraps)]
+fn hooks() -> Result<Arc<dyn Hooks>, String> {
+    Ok(Arc::new(NoHooks))
 }
 
 impl WorkerFactory for Factory {
@@ -66,7 +84,7 @@ impl WorkerFactory for Factory {
         Ok(Parts {
             source: Arc::new(source),
             sink: Arc::new(sink),
-            hooks: Arc::new(NoHooks),
+            hooks: Arc::clone(&self.hooks),
         })
     }
 }
@@ -106,7 +124,7 @@ mod tests {
         let c = config();
         let mut p = c.pipelines["orders"].clone();
         p.sink.kind = SinkType::Iceberg;
-        let e = Factory::new(&c.globals).build(&p).unwrap_err();
+        let e = Factory::new(&c.globals).unwrap().build(&p).unwrap_err();
         assert!(e.contains("v2"), "{e}");
     }
 }

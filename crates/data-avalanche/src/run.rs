@@ -139,7 +139,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     let deps = ControllerDeps {
         leases: Leases::new(joined.globals),
         holder,
-        factory: Arc::new(Factory::new(&config.globals)),
+        factory: Arc::new(Factory::new(&config.globals).map_err(Fatal::Config)?),
         metrics: metrics.clone(),
         settings: settings(&config),
         starts: Arc::new(Semaphore::new(

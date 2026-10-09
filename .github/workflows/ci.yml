@@ -78,6 +78,9 @@ jobs:
         run: test-infra/up.sh
       - name: Integration tests
         run: cargo test --locked --workspace -- --test-threads=1
+      # The slice-1 E2E suite (roadmap §5.3): the binary as a process, built with its crash points.
+      - name: Slice-1 E2E
+        run: cargo test --locked -p data-avalanche --features e2e-hooks --test e2e -- --test-threads=1
       - name: Container logs on failure
         if: failure()
         run: docker compose -f test-infra/compose.yaml logs --no-color

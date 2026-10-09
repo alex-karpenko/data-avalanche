@@ -4,6 +4,8 @@
 //! SIGTERM or SIGINT, and lets every lease go on the way out.
 
 mod cli;
+#[cfg(feature = "e2e-hooks")]
+pub mod crash;
 mod http;
 mod logging;
 mod run;

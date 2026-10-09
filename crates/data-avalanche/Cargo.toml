@@ -28,5 +28,18 @@ tokio = { workspace = true, features = ["signal", "net"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt", "json"] }
 
+[features]
+# E2E crash points (Q-M6b-5): DATA_AVALANCHE_E2E_CRASH aborts the process at a worker hook point.
+e2e-hooks = []
+
 [dev-dependencies]
+arrow-array.workspace = true
+data-avalanche-core.workspace = true
+data-avalanche-testkit.workspace = true
 tempfile.workspace = true
+tokio-postgres.workspace = true
+
+[[test]]
+name = "e2e"
+path = "tests/e2e/main.rs"
+required-features = ["e2e-hooks"]

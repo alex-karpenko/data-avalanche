@@ -1678,22 +1678,26 @@ dependencies = [
 name = "data-avalanche"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
  "axum",
  "chrono",
  "clap",
  "data-avalanche-cluster",
  "data-avalanche-config",
+ "data-avalanche-core",
  "data-avalanche-pipeline",
  "data-avalanche-sink-delta",
  "data-avalanche-source-pg",
  "data-avalanche-state",
  "data-avalanche-storage",
  "data-avalanche-telemetry",
+ "data-avalanche-testkit",
  "object_store 0.14.2",
  "rustls",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-postgres",
  "tracing",
  "tracing-subscriber",
 ]
