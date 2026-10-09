@@ -334,20 +334,25 @@ pipelines:
             .untagged()
     }
 
+    /// Whether the slot's acknowledged position has reached `lsn`.
+    pub async fn acknowledges(&self, lsn: &str) -> bool {
+        self.admin
+            .query_opt(
+                "SELECT 1 FROM pg_replication_slots
+                 WHERE slot_name = $1 AND confirmed_flush_lsn >= $2::text::pg_lsn",
+                &[&self.schema, &lsn],
+            )
+            .await
+            .expect("slots read")
+            .is_some()
+    }
+
     /// Waits until the slot's acknowledged position reaches `lsn`: everything before it is
     /// committed and checkpointed.
     pub async fn acknowledged(&self, lsn: &str) {
         let what = format!("the slot acknowledges {lsn}");
         eventually(&what, Duration::from_secs(60), async || {
-            self.admin
-                .query_opt(
-                    "SELECT 1 FROM pg_replication_slots
-                     WHERE slot_name = $1 AND confirmed_flush_lsn >= $2::text::pg_lsn",
-                    &[&self.schema, &lsn],
-                )
-                .await
-                .expect("slots read")
-                .is_some()
+            self.acknowledges(lsn).await
         })
         .await;
     }

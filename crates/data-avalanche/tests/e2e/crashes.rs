@@ -86,6 +86,10 @@ async fn a_crash_between_a_commit_and_its_checkpoint_replays_it_idempotently() {
     assert!(!status.success(), "aborted at the crash point: {status}");
     e.mirrored("items", COLS).await;
     let marker = e.marker("items").await;
+    assert!(
+        !e.acknowledges(&marker).await,
+        "the crash came before the ack"
+    );
 
     let mut p = e.start(&[]);
     p.ready().await;
@@ -153,13 +157,23 @@ async fn a_crash_between_the_checkpoint_and_the_ack_skips_the_resent_transaction
         },
     )
     .await;
-    let mut p = e.start(&[(CRASH, "checkpoint_persisted:1")]);
+    // The slot is made first, and the transaction is in the WAL before the process with the
+    // crash point starts: its first checkpoint is the transaction's. On an idle stream, a
+    // keep-alive alone would move the frontier and persist a checkpoint first.
+    let mut p = e.start(&[]);
     p.ready().await;
     e.streaming().await;
+    assert!(p.terminate().await.success());
     e.exec("INSERT INTO items VALUES (1, 'a'), (2, 'b')").await;
+    let mut p = e.start(&[(CRASH, "checkpoint_persisted:1")]);
     let status = p.exit().await;
     assert!(!status.success(), "aborted at the crash point: {status}");
     e.mirrored("items", COLS).await;
+    let marker = e.marker("items").await;
+    assert!(
+        !e.acknowledges(&marker).await,
+        "the crash came before the ack"
+    );
     let commits = e.commits("items").await;
 
     let mut p = e.start(&[]);
