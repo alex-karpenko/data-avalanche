@@ -1692,6 +1692,7 @@ dependencies = [
  "data-avalanche-storage",
  "data-avalanche-telemetry",
  "data-avalanche-testkit",
+ "futures-util",
  "object_store 0.14.2",
  "rustls",
  "tempfile",

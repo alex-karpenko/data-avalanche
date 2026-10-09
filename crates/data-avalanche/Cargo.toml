@@ -36,6 +36,7 @@ e2e-hooks = []
 arrow-array.workspace = true
 data-avalanche-core.workspace = true
 data-avalanche-testkit.workspace = true
+futures-util.workspace = true
 tempfile.workspace = true
 tokio-postgres.workspace = true
 

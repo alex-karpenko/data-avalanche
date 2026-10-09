@@ -10,12 +10,13 @@ use arrow_array::types::Int64Type;
 use arrow_array::{Array, RecordBatch};
 use data_avalanche_core::TableRef;
 use data_avalanche_sink_delta::{DeltaLocation, DeltaSink, DeltaSinkConfig};
-use data_avalanche_state::{DocStore, LeaseDoc, Leases, Versioned};
-use data_avalanche_storage::{Backend, ObjectStoreVersioned};
+use data_avalanche_state::{DocStore, LeaseDoc, Leases, PipelineDocs, TableSnapshotDoc, Versioned};
+use data_avalanche_storage::{Backend, ObjectStoreVersioned, colocated_state, table_root};
 use data_avalanche_testkit::endpoints::{
     RUSTFS_ACCESS_KEY, RUSTFS_SECRET_KEY, RUSTFS_URL, TEST_BUCKET,
 };
 use data_avalanche_testkit::{delete_prefix, stores, unique_prefix};
+use futures_util::TryStreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_postgres::{Client, NoTls};
 
@@ -195,7 +196,7 @@ pipelines:
             location: DeltaLocation::Bucket {
                 backend: Backend::S3,
                 bucket: TEST_BUCKET.into(),
-                prefix: format!("{}/lake", self.prefix),
+                prefix: self.lake_prefix(),
                 options: vec![
                     opt("endpoint", RUSTFS_URL),
                     opt("allow_http", "true"),
@@ -256,6 +257,21 @@ pipelines:
         .await;
     }
 
+    /// Waits until the pipeline's slot streams to a walsender: from here on, a change is read.
+    pub async fn streaming(&self) {
+        eventually("the slot streams", Duration::from_secs(60), async || {
+            self.admin
+                .query_opt(
+                    "SELECT 1 FROM pg_replication_slots WHERE slot_name = $1 AND active",
+                    &[&self.schema],
+                )
+                .await
+                .expect("slots read")
+                .is_some()
+        })
+        .await;
+    }
+
     pub async fn exec(&self, sql: &str) {
         self.admin
             .batch_execute(&format!(
@@ -266,15 +282,91 @@ pipelines:
             .unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
 
+    fn docs_at(&self, root: &str) -> DocStore {
+        let store = ObjectStoreVersioned::new(stores::rustfs(), root).expect("a root");
+        DocStore::new(std::sync::Arc::new(store))
+    }
+
     /// The pipeline's lease in `globals.state`.
     pub async fn lease(&self) -> Option<Versioned<LeaseDoc>> {
-        let store =
-            ObjectStoreVersioned::new(stores::rustfs(), &format!("{}/globals", self.prefix))
-                .expect("a root");
-        Leases::new(DocStore::new(std::sync::Arc::new(store)))
+        Leases::new(self.docs_at(&format!("{}/globals", self.prefix)))
             .observe(&self.test)
             .await
             .expect("the lease reads")
+    }
+
+    /// The pipeline's own documents, co-located with the lake (`<sink.prefix>/.pipeline-state`).
+    pub fn docs(&self) -> PipelineDocs {
+        let at = colocated_state(TEST_BUCKET, &self.lake_prefix());
+        PipelineDocs::new(self.docs_at(&at.root))
+    }
+
+    /// The table's snapshot document.
+    pub async fn snapshot(&self, table: &str) -> Option<TableSnapshotDoc> {
+        self.docs()
+            .table_snapshot(&self.table(table))
+            .await
+            .expect("the snapshot document reads")
+            .map(|v| v.doc)
+    }
+
+    /// Waits until the table's snapshot is completed (`completed_at` set, and not `before`'s),
+    /// and returns its document.
+    pub async fn completed(
+        &self,
+        table: &str,
+        before: Option<&TableSnapshotDoc>,
+    ) -> TableSnapshotDoc {
+        let before = before.and_then(|b| b.completed_at);
+        let until = Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Some(s) = self.snapshot(table).await
+                && s.completed_at.is_some()
+                && s.completed_at != before
+            {
+                return s;
+            }
+            assert!(
+                Instant::now() < until,
+                "timed out waiting for {table}'s snapshot"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    fn lake_prefix(&self) -> String {
+        format!("{}/lake", self.prefix)
+    }
+
+    fn table_root(&self, table: &str) -> String {
+        table_root(TEST_BUCKET, &self.lake_prefix(), &self.schema, table).root
+    }
+
+    /// The Delta table's commits: its `_delta_log/*.json` files.
+    pub async fn commits(&self, table: &str) -> usize {
+        let log = object_store::path::Path::from(format!("{}/_delta_log", self.table_root(table)));
+        let files: Vec<_> = stores::rustfs()
+            .list(Some(&log))
+            .try_collect()
+            .await
+            .expect("the log lists");
+        files
+            .iter()
+            .filter(|m| m.location.extension() == Some("json"))
+            .count()
+    }
+
+    /// Deletes the Delta table from the lake, as an operator would.
+    pub async fn drop_lake_table(&self, table: &str) {
+        delete_prefix(stores::rustfs().as_ref(), &self.table_root(table)).await;
+    }
+
+    /// The `data_avalanche_pipeline_status` line for `status`, set.
+    pub fn status(&self, status: &str) -> String {
+        format!(
+            r#"data_avalanche_pipeline_status{{pipeline="{}",source_host="127.0.0.1",source_db="avalanche",status="{status}"}} 1"#,
+            self.test
+        )
     }
 
     /// Drops the slot, the publication, the schema and the prefix.

@@ -6,3 +6,4 @@
 
 mod harness;
 mod smoke;
+mod snapshots;
