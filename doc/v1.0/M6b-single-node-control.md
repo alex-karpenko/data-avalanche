@@ -14738,6 +14738,17 @@ per task, against the `test-infra` services (PostgreSQL 18 and 14, RustFS, Azuri
   commit as `test(e2e): the types scenario pins each Delta column's type as DuckDB reads it, not only
   its text`. No later task's code changes. The review's other notes are parked in the SDD ledger.
 
+- **Task 20, the review fix (2026-10-13).** The task review found the lease scenario's standby
+  check too early: it looked 4 s after the second process came up, and `lease_duration` is 6 s, so
+  a standby that ignored the holder's renewals (counting from its first sight of the lease) would
+  take over only after the check, and the scenario passed. With that mutation in `claim.rs`
+  (`Some((_, since))`), the scenario as planned stayed green. The check now runs 10 s in, past a
+  lease duration and a renewal interval, and asserts the lease still names `n1` at epoch 1 before
+  the metric: green as written, red under the mutation (the lease at `("n2", 2)` while `n1`
+  renewed it). Committed after Task 20's commit as `test(e2e): the second process is checked past
+  a full lease duration: a standby takes over only a lease that stopped changing`. No later
+  task's code changes. The review's other notes are parked in the SDD ledger.
+
 ### After Task 1: the review fix
 
 Change `crates/data-avalanche-sink-delta/src/sink.rs`:
@@ -16210,4 +16221,32 @@ diff --git a/crates/data-avalanche/tests/e2e/types.rs b/crates/data-avalanche/te
      assert_eq!(
          cells(2),
          cells(0),
+```
+
+### After Task 20: the review fix
+
+Change `crates/data-avalanche/tests/e2e/lifecycle.rs`:
+
+```diff
+diff --git a/crates/data-avalanche/tests/e2e/lifecycle.rs b/crates/data-avalanche/tests/e2e/lifecycle.rs
+--- a/crates/data-avalanche/tests/e2e/lifecycle.rs
++++ b/crates/data-avalanche/tests/e2e/lifecycle.rs
+@@ -108,13 +108,15 @@ async fn a_second_process_takes_over_after_the_first_dies() {
+     let mut b = e.start_node("n2");
+     b.ready().await;
+     a.metric("data_avalanche_owned_pipelines 1").await;
+-    tokio::time::sleep(Duration::from_secs(4)).await;
+-    b.metric("data_avalanche_owned_pipelines 0").await;
++    // Past a lease duration (6 s) and a renewal interval (2 s) since n2 first saw the lease: n2
++    // takes over only a lease that stopped changing, and n1 renews it.
++    tokio::time::sleep(Duration::from_secs(10)).await;
+     let lease = e.lease().await.expect("a lease").doc;
+     assert_eq!(
+         (lease.holder_node_id.as_str(), lease.owner_epoch),
+         ("n1", 1)
+     );
++    b.metric("data_avalanche_owned_pipelines 0").await;
+     e.exec("INSERT INTO items VALUES (1, 'a')").await;
+     e.converged("items").await;
+ 
 ```
