@@ -14804,6 +14804,13 @@ per task, against the `test-infra` services (PostgreSQL 18 and 14, RustFS, Azuri
       pass under a rewrite; the DuckDB extension is fetched from the network.
     - The review ruled the other parked task Minors cosmetic, fail-safe or covered elsewhere.
 
+- **The PR's first CI run (2026-10-13).** The `integration` job ran out of disk at the slice-1
+  E2E step, after every integration test had passed. The runner's disk holds the workspace's test
+  build, but not the E2E build on top of it. `weekly.yml` builds three packages and passed on
+  PostgreSQL 14–17. The branch had never run in CI before, so Task 14's E2E step hadn't run in PR
+  CI until then. Owner ruling: the `integration` job first frees the runner's preinstalled SDKs
+  that nothing uses (`ci: free the integration runner's disk for the E2E build`).
+
 ### After Task 1: the review fix
 
 Change `crates/data-avalanche-sink-delta/src/sink.rs`:

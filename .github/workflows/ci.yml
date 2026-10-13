@@ -59,6 +59,13 @@ jobs:
       DATA_AVALANCHE_IT: "1"
       DATA_AVALANCHE_GCS_BUCKET: ${{ vars.DATA_AVALANCHE_GCS_BUCKET }}
     steps:
+      # The workspace's test build and then the E2E build don't fit on the runner's disk beside
+      # its preinstalled SDKs, which nothing here uses.
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v2
       - name: GCS credentials
