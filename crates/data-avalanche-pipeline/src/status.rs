@@ -40,7 +40,8 @@ pub enum Phase {
     #[default]
     Starting,
     Streaming,
-    /// The stream failed transiently; the worker reopens it after a backoff.
+    /// The stream failed transiently, or another reader holds its position; the worker reopens
+    /// it after a backoff.
     Reconnecting {
         error: String,
     },

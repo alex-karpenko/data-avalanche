@@ -141,30 +141,37 @@ impl PipelineWorker {
             if opened.elapsed() >= core.tuning.source_backoff.max {
                 attempt = 0;
             }
-            // One update: an observer that sees the count sees its reason.
-            core.update(|st| {
-                st.reconnects += 1;
-                if let SourceError::Transient(error) = &failed {
-                    st.phase = Phase::Reconnecting {
-                        error: error.clone(),
-                    };
-                }
-            });
+            // A reconnect is counted once it is decided, in one update with its reason: an
+            // observer that sees the count sees why.
             match failed {
-                SourceError::Transient(_) => contended_since = None,
+                SourceError::Transient(error) => {
+                    contended_since = None;
+                    core.update(|st| {
+                        st.reconnects += 1;
+                        st.phase = Phase::Reconnecting { error };
+                    });
+                }
                 SourceError::Contended(detail) => {
                     let since = *contended_since.get_or_insert_with(Instant::now);
                     let waited = since.elapsed();
                     if waited >= core.tuning.contended_window {
                         return Err(WorkerError::Contended { waited, detail });
                     }
+                    let error = SourceError::Contended(detail).to_string();
+                    core.update(|st| {
+                        st.reconnects += 1;
+                        st.phase = Phase::Reconnecting { error };
+                    });
                 }
                 SourceError::PositionUnreachable { position, detail } => {
                     contended_since = None;
                     let warning = format!(
                         "the source lost the stream position {position} ({detail}): the stream restarts at a new position and the tables are snapshotted again"
                     );
-                    core.update(|st| st.warn(warning));
+                    core.update(|st| {
+                        st.reconnects += 1;
+                        st.warn(warning);
+                    });
                     let from = write_retry(
                         &core.tuning,
                         || core.may_write(),
@@ -962,6 +969,70 @@ mod tests {
         })
         .await;
         assert!(matches!(end, Err(WorkerError::Contended { .. })), "{end:?}");
+    }
+
+    /// A source error that ends the worker is no reconnect: neither a permanent one nor a busy
+    /// slot past its window counts toward `reconnects`.
+    #[tokio::test]
+    async fn a_fatal_source_error_counts_no_reconnect() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.source.fail(
+            Method::OpenStream,
+            SourceError::Permanent("permission denied".into()),
+        );
+        let (end, st) = run(&w, &mode("mode: never"), async |_| {}).await;
+        assert!(
+            matches!(end, Err(WorkerError::Source(SourceError::Permanent(_)))),
+            "{end:?}"
+        );
+        assert_eq!(st.reconnects, 0);
+
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.source
+            .fail(Method::OpenStream, SourceError::Contended("active".into()));
+        let tuning = Tuning {
+            contended_window: Duration::ZERO,
+            ..fast()
+        };
+        let (worker, handle) = PipelineWorker::new(&mode("mode: never"), deps(&w), tuning);
+        let end = worker.run().await;
+        assert!(matches!(end, Err(WorkerError::Contended { .. })), "{end:?}");
+        assert_eq!(handle.status.borrow().reconnects, 0);
+    }
+
+    /// A busy slot's reconnect is counted with its reason, as a transient failure's is: the
+    /// owner logs a reconnect by the `Reconnecting` phase beside the count.
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_slot_reconnect_reports_its_reason() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.source.fail(
+            Method::OpenStream,
+            SourceError::Contended("replication slot \"s\" is active for PID 7".into()),
+        );
+        let tuning = Tuning {
+            source_backoff: Backoff {
+                first: Duration::from_secs(10),
+                max: Duration::from_secs(10),
+            },
+            ..fast()
+        };
+        let (worker, handle) = PipelineWorker::new(&mode("mode: never"), deps(&w), tuning);
+        let driver = async {
+            wait_until("one reconnect", || handle.status.borrow().reconnects == 1).await;
+            match &handle.status.borrow().phase {
+                Phase::Reconnecting { error } => {
+                    assert!(error.contains("held by another reader"), "{error}");
+                    assert!(error.contains("active for PID 7"), "{error}");
+                }
+                other => panic!("{other:?}"),
+            }
+            handle.control.send(Command::Drain).await.unwrap();
+        };
+        let (end, ()) = tokio::join!(worker.run(), driver);
+        assert!(matches!(end, Ok(Exit::Drained)), "{end:?}");
     }
 
     #[tokio::test]
