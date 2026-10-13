@@ -14749,6 +14749,18 @@ per task, against the `test-infra` services (PostgreSQL 18 and 14, RustFS, Azuri
   a full lease duration: a standby takes over only a lease that stopped changing`. No later
   task's code changes. The review's other notes are parked in the SDD ledger.
 
+- **Task 22, the review fix (2026-10-13).** The task review found the session's half of the
+  paused-session invariant untested: the watchdog's own test pins that a beat while not reading
+  resets the count, but passing `reading = true` while paused (`self.queued.is_empty()` alone)
+  left all 195 pipeline tests green. The same expression was also written twice, at the stream
+  gate and at the heartbeat. One `Session::reads_stream` now serves both, and
+  `a_paused_session_outlives_a_source_that_doesn_t_answer` (paused clock, a paused session over a
+  slot with no reader, then a drain) pins it: green as written, red under the mutation ("the
+  source isn't answering"). Committed after Task 22's commit as `test(pipeline): a paused session
+  outlives a source that doesn't answer; the stream gate and the watchdog share one
+  reads-the-stream check`. No later task's code changes; the workspace has one test more from
+  here on. The review's other notes are parked in the SDD ledger.
+
 ### After Task 1: the review fix
 
 Change `crates/data-avalanche-sink-delta/src/sink.rs`:
@@ -16249,4 +16261,72 @@ diff --git a/crates/data-avalanche/tests/e2e/lifecycle.rs b/crates/data-avalanch
      e.exec("INSERT INTO items VALUES (1, 'a')").await;
      e.converged("items").await;
  
+```
+
+### After Task 22: the review fix
+
+Change `crates/data-avalanche-pipeline/src/session.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-pipeline/src/session.rs b/crates/data-avalanche-pipeline/src/session.rs
+--- a/crates/data-avalanche-pipeline/src/session.rs
++++ b/crates/data-avalanche-pipeline/src/session.rs
+@@ -388,7 +388,7 @@ impl<'c> Session<'c> {
+             // Pausing (the open transaction still to finish) or paused: no chunk is read, no
+             // rescan runs, the snapshot clock stands. Paused: the stream isn't read either.
+             let parked = self.core.pause;
+-            let reading = self.queued.is_empty() && self.paused.is_none();
++            let reading = self.reads_stream();
+             let need = self.queued.front().map_or(0, |(_, n)| *n);
+             let permits = self.permits.clone();
+             // Biased: control, the writer's events and the buffer's room first; then the chunk
+@@ -903,11 +903,17 @@ impl<'c> Session<'c> {
+             self.retained_read
+                 .spawn(async move { source.retained().await });
+         }
+-        let reading = self.queued.is_empty() && self.paused.is_none();
+-        let why = self.watchdog.beat(reading)?;
++        let why = self.watchdog.beat(self.reads_stream())?;
+         Some(End::Source(SourceError::Transient(why)))
+     }
+ 
++    /// Whether the session reads the stream now: not paused, and no flush waiting for room. The
++    /// stream gate and the watchdog share it: a stream the session doesn't read is silent by its
++    /// own doing, and proves nothing about the source.
++    fn reads_stream(&self) -> bool {
++        self.queued.is_empty() && self.paused.is_none()
++    }
++
+     /// A heartbeat's read of the source's log came back. The WAL-retention guard (G-22): the
+     /// retained log is always reported; past `max_wal_lag_bytes` the pipeline stops to protect
+     /// the source's disk. A failed read waits for the next heartbeat, and the pipeline keeps
+@@ -1941,6 +1947,28 @@ mod tests {
+         assert!(why.contains("no stream reads the slot"), "{why}");
+     }
+ 
++    /// A paused session reads no stream, so a silent stream proves nothing about the source:
++    /// the watchdog leaves it be, though the slot has no reader (Review Focus 3).
++    #[tokio::test(start_paused = true)]
++    async fn a_paused_session_outlives_a_source_that_doesn_t_answer() {
++        let w = World::new(&["a"]);
++        w.started(&["a"]).await;
++        let (mut core, control, status) = w.core(&flush_each(), &["a"]);
++        core.settings.heartbeat = Duration::from_millis(5);
++        core.pause = true;
++        let s = Session::open(&mut core).await.unwrap().unwrap();
++        w.source.set_retained(Some(0));
++        w.source.detach_stream();
++        let driver = async {
++            wait_until("parked", || status.borrow().phase == Phase::Paused).await;
++            tokio::time::sleep(Duration::from_millis(200)).await;
++            control.send(Command::Drain).await.unwrap();
++        };
++        let (end, ()) = tokio::join!(s.run(), driver);
++        let end = end.unwrap();
++        assert!(matches!(end, End::Exit(Exit::Drained)), "{end:?}");
++    }
++
+     /// A heartbeat read that never comes back holds up neither the stream nor a drain, and
+     /// counts against nothing: it may wait behind a chunk read on a shared connection.
+     #[tokio::test]
 ```
