@@ -1,5 +1,5 @@
-"""Reads a Delta table on S3 (RustFS) with DuckDB's delta_scan and prints every cell as text, as
-JSON rows in `id` order.
+"""Reads a Delta table on S3 (RustFS) with DuckDB's delta_scan and prints its columns, their DuckDB
+types and every cell as text, as JSON rows in `id` order.
 
 Used by tests/e2e/types.rs. Run: uv run --no-project --with duckdb==1.5.6 python duckdb_read.py
 <s3 table url>, with DUCKDB_S3_ENDPOINT (host:port), DUCKDB_S3_KEY_ID and DUCKDB_S3_SECRET set.
@@ -29,7 +29,9 @@ con.sql(
 # timestamptz cells print in UTC, whatever the host's zone.
 con.sql("SET TimeZone = 'UTC'")
 scan = f"delta_scan({quote(sys.argv[1])})"
-names = con.sql(f"SELECT * FROM {scan}").columns
+table = con.sql(f"SELECT * FROM {scan}")
+names = table.columns
+types = [str(t) for t in table.types]
 cols = ", ".join(f'"{c}"::VARCHAR' for c in names)
 rows = con.sql(f"SELECT {cols} FROM {scan} ORDER BY id").fetchall()
-print(json.dumps({"columns": names, "rows": [list(r) for r in rows]}))
+print(json.dumps({"columns": names, "types": types, "rows": [list(r) for r in rows]}))
