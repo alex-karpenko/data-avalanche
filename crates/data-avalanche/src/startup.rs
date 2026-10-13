@@ -32,6 +32,18 @@ pub(crate) fn backend(globals: &Globals) -> Backend {
     }
 }
 
+/// A backend as the config names it; there is no credential to leave out.
+fn named(b: &Backend) -> String {
+    match b {
+        Backend::S3 => "cloud aws".to_owned(),
+        Backend::Gcs => "cloud google".to_owned(),
+        Backend::Azure { account: Some(a) } => format!("cloud azure, account {a}"),
+        Backend::Azure { account: None } => {
+            "cloud azure, the account from AZURE_STORAGE_ACCOUNT_NAME".to_owned()
+        }
+    }
+}
+
 /// Where a pipeline's state lives (config §10).
 pub(crate) fn state_location(p: &Pipeline) -> Location {
     match &p.state {
@@ -144,13 +156,28 @@ pub(crate) async fn join(
     let config = load_str(&generation.text, &data_avalanche_config::ProcessEnv, &key)
         .map_err(|r| Fatal::Config(crate::run::render(&r)))?
         .config;
+    // The buckets open the state on this file's backend and the sink opens the tables on the
+    // generation's: the two must be one backend.
+    let (file, adopted) = (backend(g), backend(&config.globals));
+    if file != adopted {
+        return Err(Fatal::Config(format!(
+            "this node's file names storage on {}, but the cluster runs config generation {} on {}: set globals.cloud and globals.azure in the file as the generation has them",
+            named(&file),
+            generation.pointer.doc.generation,
+            named(&adopted)
+        )));
+    }
     Ok(Joined { config, globals })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use object_store::memory::InMemory;
+
     use super::*;
-    use crate::run::tests::config;
+    use crate::run::tests::{CONFIG, config};
 
     #[test]
     fn the_cloud_names_the_backend_and_the_state_sits_beside_the_tables() {
@@ -166,5 +193,47 @@ mod tests {
         );
         let at = state_location(&c.pipelines["orders"]);
         assert_eq!(at, colocated_state("lake", "shop"));
+    }
+
+    /// Buckets on `text`'s backend whose every bucket is `store`.
+    fn buckets(text: &str, store: &Arc<dyn ObjectStore>) -> (Buckets, ResolvedConfig) {
+        let file = load_str(text, &BTreeMap::new(), &FingerprintKey::from_bytes([1; 32]))
+            .unwrap_or_else(|r| panic!("{}", crate::run::render(&r)))
+            .config;
+        let buckets = Buckets::new(&file.globals);
+        buckets
+            .opened
+            .lock()
+            .unwrap()
+            .insert(file.globals.state.bucket.clone(), Arc::clone(store));
+        (buckets, file)
+    }
+
+    /// A file that names another backend than the generation the cluster runs is refused: the
+    /// state would be opened on the file's backend, the tables on the generation's.
+    #[tokio::test]
+    async fn a_file_on_another_backend_than_the_generation_is_refused() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (b, file) = buckets(CONFIG, &store);
+        join(&b, "node-a", CONFIG, &file).await.unwrap();
+        let other = CONFIG.replace("drain_timeout: 45s", "drain_timeout: 40s");
+        let (b, file) = buckets(&other, &store);
+        join(&b, "node-b", &other, &file).await.unwrap();
+
+        let azure = CONFIG.replace(
+            "cloud: aws",
+            "cloud: azure\n  azure: { account_name: acct }",
+        );
+        let (b, file) = buckets(&azure, &store);
+        match join(&b, "node-c", &azure, &file).await {
+            Err(e @ Fatal::Config(_)) => {
+                let why = e.to_string();
+                assert!(why.contains("azure, account acct"), "{why}");
+                assert!(why.contains("aws"), "{why}");
+                assert_eq!(e.exit_code(), 2);
+            }
+            Err(e) => panic!("{e:?}"),
+            Ok(_) => panic!("a file on another backend joined the cluster"),
+        }
     }
 }
