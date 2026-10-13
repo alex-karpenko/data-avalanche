@@ -14598,9 +14598,9 @@ per task, against the `test-infra` services (PostgreSQL 18 and 14, RustFS, Azuri
 
 ## M6b exit checklist
 
-- [ ] Tasks 1–24 committed, each reviewed (one implementer and one reviewer per task, P-9).
-- [ ] The whole-branch review and its fixes.
-- [ ] Workspace gates green: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets
+- [x] Tasks 1–24 committed, each reviewed (one implementer and one reviewer per task, P-9).
+- [x] The whole-branch review and its fixes (2026-10-13).
+- [x] Workspace gates green (2026-10-13, at `390341c`; 936 workspace tests): `cargo fmt --all --check`; `cargo clippy --workspace --all-targets
       -- -D warnings`; the same with `-p data-avalanche --features e2e-hooks`; `cargo test
       --workspace`; the integration run (`DATA_AVALANCHE_IT=1`).
 - [ ] The slice-1 E2E suite green on PostgreSQL 18 + RustFS in PR CI.
@@ -14611,11 +14611,12 @@ per task, against the `test-infra` services (PostgreSQL 18 and 14, RustFS, Azuri
 - [x] The Tasks 21–23 spec patches applied (Data-Flow Phase 4; config §6.4, §9.2, §9.2.1),
       2026-10-08.
 - [x] The roadmap updates applied (2026-10-08).
-- [ ] README status at the exit.
+- [x] README status at the exit.
 - [x] Gap tracker: the owner's answers recorded (§29, 2026-10-08): DA-X-12 new, DA-SRC-16 🔄,
       DA-SNAP-11 advanced.
-- [ ] Gap tracker at the exit: DA-X-12 and DA-SRC-16 closed by Tasks 21 and 22.
-- [ ] `.superpowers/sdd/M6a-pipeline-worker/` deleted (kept until M6 is finished).
+- [x] Gap tracker at the exit: DA-X-12 and DA-SRC-16 closed by Tasks 21 and 22; DA-CLUS-14,
+      DA-API-11, DA-OPS-7 and DA-SRC-20 recorded (§30, 2026-10-13).
+- [x] `.superpowers/sdd/M6a-pipeline-worker/` deleted (kept until M6 is finished).
 - [ ] The milestone PR opened against `main`; Oleksii merges.
 
 ## Deviations during execution
@@ -14760,6 +14761,48 @@ per task, against the `test-infra` services (PostgreSQL 18 and 14, RustFS, Azuri
   outlives a source that doesn't answer; the stream gate and the watchdog share one
   reads-the-stream check`. No later task's code changes; the workspace has one test more from
   here on. The review's other notes are parked in the SDD ledger.
+
+- **Task 7, the expected failure (2026-10-08).** Step 2 expects one compile error, the
+  unresolved `data_avalanche_telemetry` (E0432). The run gave that one first and two more: core's
+  `SinkStats` unresolved, and an E0782 in sink-delta. Step 1 already uses names that Step 3 adds,
+  in a new crate as well as in core, so the split of Step 1 from Step 3 isn't clean. The final
+  tree is unaffected.
+
+- **The whole-branch review (2026-10-13; `477719c`…`390341c`; owner rulings 2026-10-13).** The
+  review found no Critical, 1 Important and 8 Minor issues, and it triaged every parked task
+  finding: only the Task 14 CI gap had to be fixed before the merge. Its scoped re-review approved
+  the fixes. The fixed items:
+  - **I-1:** CI ran neither the `e2e-hooks` clippy gate nor the crash parser's unit test, so
+    `crash.rs` and `tests/e2e` were never linted in CI. The gap came from Task 14's ci.yml hunk.
+    The `check` job now runs both, and the `integration` job is bounded at 60 minutes.
+  - **M-2:** a fatal source error (permanent, or a busy slot past `contended_window`) counted a
+    reconnect that never happened. A busy-slot reconnect now reports a `Reconnecting` phase with
+    its reason, so the controller logs it.
+  - **M-3:** the state buckets took their backend from the local file, and the sink took its
+    backend from the adopted generation. `join` now refuses a file whose backend differs
+    (`Fatal::Config`, exit 2) and names both backends.
+  - **M-6:** the doc comments on `RenewFailure::{Lost, Conflict}`, the controller's drain and
+    `Leases::take_over` now say what the code does.
+  - **Tests:** the 50,000-row transaction is now checked as exactly one Delta commit, not by polls
+    alone. `E2e::new` resets `max_slot_wal_keep_size`, so a run killed mid-scenario can't leave it
+    set.
+  - **Accepted (M-4):** the watchdog and pause unit tests that wait on the real clock (Task 5 M1,
+    Task 22 M2) stay as exceptions to the paused-clock constraint. Their risk is a false pass,
+    not a flake.
+  - **Carried as notes:**
+    - M-1 (M8): a fenced worker whose lease still names this process takes it over at the stored
+      epoch + 1. When the lease store and the lake disagree, it climbs one worker run per epoch;
+      carry the fence's `current_epoch` into the takeover.
+    - M-5 (M8): `String` errors in the cluster crate's public API.
+    - M-7 (M8/M10): an unsupervised controller task panic, with readiness staying 200.
+    - M-8 (M9): a stop and a resume inside one poll interval don't clear `ERROR`.
+    - Task 21 M4: the position guard assumes positions never move backwards, which a PostgreSQL
+      failover breaks. It is recorded as its own gap, DA-SRC-20 (owner ruling 2026-10-13).
+    - Operability, for M10: a second signal does nothing during the drain, and a listener that
+      dies at runtime goes unlogged.
+    - E2E debt: two System-Overview table-state cases have no scenario; the TRUNCATE check would
+      pass under a rewrite; the DuckDB extension is fetched from the network.
+    - The review ruled the other parked task Minors cosmetic, fail-safe or covered elsewhere.
 
 ### After Task 1: the review fix
 
