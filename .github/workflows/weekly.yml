@@ -1,8 +1,9 @@
 name: weekly
 
-# The PostgreSQL source and the pipeline worker against the older supported servers (P-8, Q-M5-7,
-# Q-M5-23): PostgreSQL 14–17, one job each, the `postgres-18` suites of ci.yml re-run through
-# DATA_AVALANCHE_PG_PORT.
+# The PostgreSQL source, the pipeline worker and the slice-1 E2E suite against the older supported
+# servers (P-8, Q-M5-7, Q-M5-23, roadmap §4 M6b exit): PostgreSQL 14–17, one job each, the
+# `postgres-18` suites of ci.yml re-run through DATA_AVALANCHE_PG_PORT. The E2E suite also needs
+# RustFS and uv (its DuckDB read).
 # Weekly (Mondays 03:41 UTC) and on manual dispatch. The TLS tests need `postgres-tls`
 # (PostgreSQL 18) and run in ci.yml only. No secrets.
 
@@ -20,7 +21,7 @@ env:
 jobs:
   postgres:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -32,15 +33,20 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v2
-      - name: Start PostgreSQL ${{ matrix.version }}
-        run: docker compose -f test-infra/compose.yaml --profile matrix up -d --wait "postgres-${{ matrix.version }}"
+      - uses: astral-sh/setup-uv@v10.2.0
+      - name: Start PostgreSQL ${{ matrix.version }} and RustFS
+        run: |
+          docker compose -f test-infra/compose.yaml --profile matrix up -d --wait "postgres-${{ matrix.version }}" rustfs
+          docker compose -f test-infra/compose.yaml --profile init run --rm rustfs-init
       - name: PostgreSQL source tests
         run: 'cargo test --locked -p data-avalanche-source-pg --test pg --test slot_invalidation -- --test-threads=1 --skip tls::'
       - name: Pipeline worker tests
         run: cargo test --locked -p data-avalanche-pipeline --test pg --test sync_commit --test sync_drop -- --test-threads=1
+      - name: Slice-1 E2E
+        run: cargo test --locked -p data-avalanche --features e2e-hooks --test e2e -- --test-threads=1
       - name: Container logs on failure
         if: failure()
-        run: docker compose -f test-infra/compose.yaml --profile matrix logs --no-color "postgres-${{ matrix.version }}"
-      - name: Stop PostgreSQL
+        run: docker compose -f test-infra/compose.yaml --profile matrix logs --no-color "postgres-${{ matrix.version }}" rustfs
+      - name: Stop the containers
         if: always()
         run: docker compose -f test-infra/compose.yaml --profile matrix down -v
