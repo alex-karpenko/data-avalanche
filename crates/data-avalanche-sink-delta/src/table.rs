@@ -8,11 +8,11 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_row::{RowConverter, SortField};
 use arrow_schema::SchemaRef;
 use data_avalanche_core::{PartitionTransform, SinkError, SourcePosition, TableRef, TableSpec};
-use deltalake::DeltaTable;
 use deltalake::datafusion::prelude::SessionContext;
 use deltalake::logstore::object_store::path::Path;
 use deltalake::logstore::object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
 use deltalake::protocol::SaveMode;
+use deltalake::{DeltaTable, DeltaTableBuilder, DeltaTableError};
 use futures_util::TryStreamExt;
 use url::Url;
 
@@ -70,6 +70,10 @@ impl std::fmt::Debug for TableHandle {
 impl TableHandle {
     /// A handle on `url`, where `name` is mirrored; the table is loaded when it exists. A local
     /// root is created first: delta-rs refuses a `file://` location that doesn't exist.
+    ///
+    /// Loaded only when the location holds a log (one LIST): delta-rs's own "load, else accept
+    /// an absent table" makes the kernel log an ERROR ("No files in log segment") for every
+    /// table a first start creates.
     pub async fn open(
         name: TableRef,
         url: Url,
@@ -79,9 +83,21 @@ impl TableHandle {
             std::fs::create_dir_all(&path)
                 .map_err(|e| permanent(format!("{}: {e}", path.display())))?;
         }
-        let table = DeltaTable::try_from_url_with_storage_options(url, options.clone())
-            .await
+        let mut table = DeltaTableBuilder::from_url(url)
+            .and_then(|b| b.with_storage_options(options.clone()).build())
             .map_err(sink_error)?;
+        if table
+            .log_store()
+            .is_delta_table_location()
+            .await
+            .map_err(sink_error)?
+        {
+            match table.load().await {
+                // Dropped since the LIST: absent, as if the LIST had found nothing.
+                Ok(()) | Err(DeltaTableError::NotATable(_)) => {}
+                Err(e) => return Err(sink_error(e)),
+            }
+        }
         let mut handle = Self {
             name,
             table,

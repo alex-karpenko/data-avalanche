@@ -153,7 +153,7 @@ globals:
   cloud: aws
   state: {{ bucket: {bucket}, prefix: {prefix}/globals }}
   api: {{ address: "127.0.0.1:@PORT@" }}
-  log: {{ level: "info,buoyant_kernel=warn", format: compact }}
+  log: {{ level: info, format: compact }}
   cluster:
     lease_duration: 6s
     lease_renewal_interval: 2s

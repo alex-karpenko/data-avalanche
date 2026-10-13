@@ -22,6 +22,14 @@ async fn a_pipeline_runs_stops_on_sigterm_and_resumes() {
     e.converged("items").await;
     e.exec("INSERT INTO items VALUES (3, 'c'); UPDATE items SET doc = 'A' WHERE id = 1; DELETE FROM items WHERE id = 2").await;
     e.converged("items").await;
+    // At `info`, a first start that creates its table logs no error, and the Delta libraries
+    // only what they warn of (config §6.4).
+    let log = p.log();
+    assert!(!log.contains("ERROR"), "{log}");
+    assert!(
+        !log.contains("buoyant_kernel") && !log.contains("deltalake_core"),
+        "{log}"
+    );
     let labels = r#"pipeline="smoke",source_host="127.0.0.1",source_db="avalanche""#;
     p.metric(&format!(
         r#"data_avalanche_pipeline_status{{{labels},status="running"}} 1"#
