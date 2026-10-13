@@ -61,7 +61,7 @@ async fn row_changes_and_transaction_shapes_are_mirrored() {
     e.cleanup().await;
 }
 
-/// A 50,000-row transaction is never seen in part.
+/// A 50,000-row transaction is never seen in part: it lands in one Delta commit.
 #[tokio::test]
 async fn a_large_transaction_lands_at_once() {
     require_it!();
@@ -77,6 +77,7 @@ async fn a_large_transaction_lands_at_once() {
     let mut p = e.start(&[]);
     p.ready().await;
     e.streaming().await;
+    let before = e.commits("bulk").await;
     e.exec("INSERT INTO bulk SELECT g, 'row ' || g FROM generate_series(1, 50000) g")
         .await;
     let until = Instant::now() + Duration::from_secs(120);
@@ -90,6 +91,11 @@ async fn a_large_transaction_lands_at_once() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     e.mirrored("bulk", COLS).await;
+    assert_eq!(
+        e.commits("bulk").await,
+        before + 1,
+        "the transaction is one commit"
+    );
     assert!(p.terminate().await.success());
     e.cleanup().await;
 }

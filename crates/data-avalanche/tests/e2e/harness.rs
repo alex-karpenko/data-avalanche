@@ -95,10 +95,20 @@ pub struct E2e {
 }
 
 impl E2e {
-    /// Drops what an earlier run of `test` left in PostgreSQL, creates schema `e2e_<test>` and
-    /// runs `ddl` in it, and writes the config.
+    /// Resets the server-wide `max_slot_wal_keep_size`, drops what an earlier run of `test` left
+    /// in PostgreSQL, creates schema `e2e_<test>` and runs `ddl` in it, and writes the config.
     pub async fn new(test: &str, ddl: &str, o: Options<'_>) -> Self {
         let admin = admin().await;
+        // A scenario sets it (guards.rs) and restores it, but a run killed in between leaves it
+        // set for the next. ALTER SYSTEM runs outside a transaction: one per call.
+        admin
+            .batch_execute("ALTER SYSTEM RESET max_slot_wal_keep_size")
+            .await
+            .expect("max_slot_wal_keep_size reset");
+        admin
+            .batch_execute("SELECT pg_reload_conf()")
+            .await
+            .expect("the configuration reloaded");
         let schema = format!("e2e_{test}");
         drop_slot(&admin, &schema).await;
         admin
