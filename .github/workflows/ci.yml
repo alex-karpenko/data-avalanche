@@ -28,6 +28,12 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Unit and property tests
         run: cargo test --locked --workspace
+      # The binary's e2e-hooks feature (its crash points, the E2E suite's sources): the two steps
+      # above build without it, and the e2e test target requires it.
+      - name: Clippy (e2e-hooks)
+        run: cargo clippy --locked -p data-avalanche --features e2e-hooks --all-targets -- -D warnings
+      - name: Unit tests (e2e-hooks)
+        run: cargo test --locked -p data-avalanche --features e2e-hooks --lib
       # RustSec advisory audit of Cargo.lock. Non-blocking by design: a vulnerable dependency is
       # reported (warning annotation + failed step) but never fails the job.
       - name: Install cargo-audit
@@ -47,6 +53,7 @@ jobs:
   # On a same-repository PR, a missing secret/variable fails the job.
   integration:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     needs: check
     env:
       DATA_AVALANCHE_IT: "1"
