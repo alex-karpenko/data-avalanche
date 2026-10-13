@@ -472,6 +472,11 @@ pipelines:
         table_root(TEST_BUCKET, &self.lake_prefix(), &self.schema, table).root
     }
 
+    /// The Delta table's root as an `s3://` URL.
+    pub fn table_url(&self, table: &str) -> String {
+        format!("s3://{TEST_BUCKET}/{}", self.table_root(table))
+    }
+
     /// The Delta table's commits: its `_delta_log/*.json` files.
     pub async fn commits(&self, table: &str) -> usize {
         self.log(table).await.len()
