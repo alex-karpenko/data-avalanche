@@ -1,0 +1,192 @@
+//! Scenarios 7–9: the desired state across a restart, one pipeline under one lease with a second
+//! process waiting, and an Iceberg pipeline refused beside a running Delta one.
+
+use std::time::Duration;
+
+use data_avalanche_state::DesiredState;
+use data_avalanche_testkit::require_it;
+
+use crate::harness::{E2e, Options, eventually};
+
+const ITEMS: &str = "CREATE TABLE items (id bigint PRIMARY KEY, doc text);";
+
+fn never() -> Options<'static> {
+    Options {
+        tables: ", snapshots: { mode: never }",
+        ..Options::default()
+    }
+}
+
+/// The slot has a walsender: the source connection is open.
+async fn slot_active(e: &E2e) -> bool {
+    e.admin
+        .query_one(
+            "SELECT coalesce(bool_or(active), false) FROM pg_replication_slots WHERE slot_name = $1",
+            &[&e.schema],
+        )
+        .await
+        .expect("slots read")
+        .get(0)
+}
+
+/// Pause holds the stream with the source connection open; stop closes it and is kept across a
+/// restart; resume reads on from where each left off.
+#[tokio::test]
+async fn pause_stop_and_resume_hold_across_a_restart() {
+    require_it!();
+    let e = E2e::new("life_states", ITEMS, never()).await;
+    let mut p = e.start(&[]);
+    p.ready().await;
+    e.streaming().await;
+    e.exec("INSERT INTO items VALUES (1, 'a')").await;
+    e.converged("items").await;
+
+    e.docs()
+        .set_desired_state(DesiredState::Paused)
+        .await
+        .expect("paused");
+    p.metric(&e.status("paused")).await;
+    e.exec("INSERT INTO items VALUES (2, 'b')").await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(e.ids("items").await, [1], "nothing is read while paused");
+    assert!(
+        slot_active(&e).await,
+        "a paused pipeline keeps the source warm"
+    );
+
+    e.docs()
+        .set_desired_state(DesiredState::Running)
+        .await
+        .expect("running");
+    p.metric(&e.status("running")).await;
+    e.converged("items").await;
+
+    e.docs()
+        .set_desired_state(DesiredState::Stopped)
+        .await
+        .expect("stopped");
+    p.metric(&e.status("stopped")).await;
+    eventually(
+        "the slot is released",
+        Duration::from_secs(30),
+        async || !slot_active(&e).await,
+    )
+    .await;
+    assert!(p.terminate().await.success());
+
+    e.exec("INSERT INTO items VALUES (3, 'c')").await;
+    let mut p = e.start(&[]);
+    p.ready().await;
+    p.metric(&e.status("stopped")).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        e.ids("items").await,
+        [1, 2],
+        "still stopped after a restart"
+    );
+    assert!(!slot_active(&e).await);
+
+    e.docs()
+        .set_desired_state(DesiredState::Running)
+        .await
+        .expect("running");
+    p.metric(&e.status("running")).await;
+    e.converged("items").await;
+    assert!(p.terminate().await.success());
+    e.cleanup().await;
+}
+
+/// A second process waits while the first holds the lease, and takes over after a `kill -9`
+/// once the lease runs out, with the next owner epoch.
+#[tokio::test]
+async fn a_second_process_takes_over_after_the_first_dies() {
+    require_it!();
+    let e = E2e::new("life_lease", ITEMS, never()).await;
+    let mut a = e.start(&[]);
+    a.ready().await;
+    e.streaming().await;
+    let mut b = e.start_node("n2");
+    b.ready().await;
+    a.metric("data_avalanche_owned_pipelines 1").await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    b.metric("data_avalanche_owned_pipelines 0").await;
+    let lease = e.lease().await.expect("a lease").doc;
+    assert_eq!(
+        (lease.holder_node_id.as_str(), lease.owner_epoch),
+        ("n1", 1)
+    );
+    e.exec("INSERT INTO items VALUES (1, 'a')").await;
+    e.converged("items").await;
+
+    let status = a.kill().await;
+    assert!(!status.success());
+    e.exec("INSERT INTO items VALUES (2, 'b')").await;
+    b.metric("data_avalanche_owned_pipelines 1").await;
+    e.converged("items").await;
+    let lease = e.lease().await.expect("a lease").doc;
+    assert_eq!(
+        (lease.holder_node_id.as_str(), lease.owner_epoch),
+        ("n2", 2)
+    );
+    assert!(b.terminate().await.success());
+    e.cleanup().await;
+}
+
+/// An Iceberg pipeline is refused (its status is error) while the Delta pipeline beside it runs.
+#[tokio::test]
+async fn an_iceberg_pipeline_is_refused_beside_a_running_one() {
+    require_it!();
+    let e = E2e::new(
+        "life_iceberg",
+        ITEMS,
+        Options {
+            tables: ", snapshots: { mode: never }",
+            pipelines: r#"  ice:
+    id: ice
+    source:
+      host: 127.0.0.1
+      port: @PG@
+      db: avalanche
+      user: avalanche
+      password: avalanche
+      ssl_mode: disable
+      postgres: { publication: @SCHEMA@_ice_pub, slot: @SCHEMA@_ice }
+    tables: { include: [@SCHEMA@.*] }
+    sink:
+      type: iceberg
+      bucket: @BUCKET@
+      prefix: @PREFIX@/ice
+      iceberg: { catalog: { glue: { name: "123" } } }"#,
+            ..Options::default()
+        },
+    )
+    .await;
+    let mut p = e.start(&[]);
+    p.ready().await;
+    p.metric(
+        r#"data_avalanche_pipeline_status{pipeline="ice",source_host="127.0.0.1",source_db="avalanche",status="error"} 1"#,
+    )
+    .await;
+    e.streaming().await;
+    e.exec("INSERT INTO items VALUES (1, 'a')").await;
+    e.converged("items").await;
+    p.metric(&e.status("running")).await;
+    assert!(
+        p.log().contains("the Iceberg sink ships in v2"),
+        "{}",
+        p.log()
+    );
+    let ice_slot = format!("{}_ice", e.schema);
+    let slots: i64 = e
+        .admin
+        .query_one(
+            "SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1",
+            &[&ice_slot],
+        )
+        .await
+        .expect("slots read")
+        .get(0);
+    assert_eq!(slots, 0, "the refused pipeline touched no source");
+    assert!(p.terminate().await.success());
+    e.cleanup().await;
+}

@@ -75,14 +75,20 @@ pub struct Options<'a> {
     /// Pipeline keys beyond `source`, `tables` and `sink`, one YAML line, e.g.
     /// `schema_evolution: { rescan_interval: 2s }`.
     pub pipeline: &'a str,
+    /// More pipelines, YAML under `pipelines:` (2-space indent); `@SCHEMA@`, `@PREFIX@`, `@PG@`
+    /// and `@BUCKET@` are replaced.
+    pub pipelines: &'a str,
 }
 
 pub struct E2e {
     pub test: String,
     pub schema: String,
     prefix: String,
+    /// The first node's (`n1`) API port.
     port: u16,
     dir: tempfile::TempDir,
+    /// The config with `@NODE@` and `@PORT@` to fill per node.
+    template: String,
     pub admin: Client,
 }
 
@@ -104,31 +110,53 @@ impl E2e {
             ))
             .await
             .expect("test DDL");
-        let e = Self {
+        let mut e = Self {
             test: test.to_owned(),
             schema,
             prefix: unique_prefix(&format!("e2e-{test}")),
             port: free_port(),
             dir: tempfile::tempdir().expect("a temp dir"),
+            template: String::new(),
             admin,
         };
-        std::fs::write(e.config_path(), e.yaml(&o)).expect("the config file");
+        e.template = e.yaml(&o);
+        e.write_config("n1", e.port);
         e
     }
 
-    pub fn config_path(&self) -> PathBuf {
-        self.dir.path().join("config.yaml")
+    fn config_path(&self, node: &str) -> PathBuf {
+        self.dir.path().join(format!("config-{node}.yaml"))
+    }
+
+    fn write_config(&self, node: &str, port: u16) -> PathBuf {
+        let path = self.config_path(node);
+        let text = self
+            .template
+            .replace("@NODE@", node)
+            .replace("@PORT@", &port.to_string());
+        std::fs::write(&path, text).expect("the config file");
+        path
     }
 
     fn yaml(&self, o: &Options<'_>) -> String {
+        let more = o
+            .pipelines
+            .replace("@SCHEMA@", &self.schema)
+            .replace("@PREFIX@", &self.prefix)
+            .replace("@PG@", &pg_port().to_string())
+            .replace("@BUCKET@", TEST_BUCKET);
         format!(
             r#"config_version: 1
 globals:
   cloud: aws
   state: {{ bucket: {bucket}, prefix: {prefix}/globals }}
-  api: {{ address: "127.0.0.1:{port}" }}
+  api: {{ address: "127.0.0.1:@PORT@" }}
   log: {{ level: "info,buoyant_kernel=warn", format: compact }}
-  cluster: {{ lease_duration: 6s, lease_renewal_interval: 2s, drain_timeout: 30s }}
+  cluster:
+    lease_duration: 6s
+    lease_renewal_interval: 2s
+    drain_timeout: 30s
+    memberlist: {{ node_name: "@NODE@" }}
 pipelines:
   {test}:
     id: {test}
@@ -143,10 +171,10 @@ pipelines:
     tables: {{ include: [{schema}.*]{tables} }}
     sink: {{ type: delta, bucket: {bucket}, prefix: {prefix}/lake, delta: {{}}, flush: {{ seconds: 1 }}{sink} }}
     {pipeline}
+{more}
 "#,
             bucket = TEST_BUCKET,
             prefix = self.prefix,
-            port = self.port,
             test = self.test,
             pg = pg_port(),
             schema = self.schema,
@@ -157,8 +185,19 @@ pipelines:
         )
     }
 
-    /// Starts the binary; `env` adds variables (a crash point).
+    /// Starts the binary as node `n1`; `env` adds variables (a crash point).
     pub fn start(&self, env: &[(&str, &str)]) -> Proc {
+        self.spawn(&self.config_path("n1"), self.port, env)
+    }
+
+    /// Starts the binary as another node, with its own name and API port.
+    pub fn start_node(&self, node: &str) -> Proc {
+        let port = free_port();
+        let path = self.write_config(node, port);
+        self.spawn(&path, port, &[])
+    }
+
+    fn spawn(&self, config: &std::path::Path, port: u16, env: &[(&str, &str)]) -> Proc {
         let log = self.dir.path().join(format!(
             "run-{}.log",
             std::time::SystemTime::now()
@@ -170,7 +209,7 @@ pipelines:
         let err = out.try_clone().expect("the log file");
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_data-avalanche"));
         cmd.args(["run", "--config"])
-            .arg(self.config_path())
+            .arg(config)
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("AWS_ACCESS_KEY_ID", RUSTFS_ACCESS_KEY)
@@ -187,7 +226,7 @@ pipelines:
         }
         Proc {
             child: cmd.spawn().expect("the binary starts"),
-            port: self.port,
+            port,
             log,
         }
     }

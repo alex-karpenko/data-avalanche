@@ -5,7 +5,9 @@
 //! `cargo test -p data-avalanche --features e2e-hooks --test e2e -- --test-threads=1`
 
 mod crashes;
+mod guards;
 mod harness;
+mod lifecycle;
 mod schema;
 mod smoke;
 mod snapshots;
