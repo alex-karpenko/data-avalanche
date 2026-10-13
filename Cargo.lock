@@ -1696,6 +1696,7 @@ dependencies = [
  "futures-util",
  "object_store 0.14.2",
  "rustls",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

@@ -38,6 +38,7 @@ arrow-cast.workspace = true
 data-avalanche-core.workspace = true
 data-avalanche-testkit.workspace = true
 futures-util.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true
 tokio-postgres.workspace = true
 

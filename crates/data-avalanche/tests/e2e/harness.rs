@@ -11,7 +11,9 @@ use arrow_array::{Array, RecordBatch};
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use data_avalanche_core::{Sink, TableRef};
 use data_avalanche_sink_delta::{DeltaLocation, DeltaSink, DeltaSinkConfig};
-use data_avalanche_state::{DocStore, LeaseDoc, Leases, PipelineDocs, TableSnapshotDoc, Versioned};
+use data_avalanche_state::{
+    DocStore, HaltsDoc, LeaseDoc, Leases, PipelineDocs, TableSnapshotDoc, Versioned,
+};
 use data_avalanche_storage::{Backend, ObjectStoreVersioned, colocated_state, table_root};
 use data_avalanche_testkit::endpoints::{
     RUSTFS_ACCESS_KEY, RUSTFS_SECRET_KEY, RUSTFS_URL, TEST_BUCKET,
@@ -70,6 +72,9 @@ pub struct Options<'a> {
     pub sink: &'a str,
     /// `source.postgres` entries.
     pub postgres: &'a str,
+    /// Pipeline keys beyond `source`, `tables` and `sink`, one YAML line, e.g.
+    /// `schema_evolution: { rescan_interval: 2s }`.
+    pub pipeline: &'a str,
 }
 
 pub struct E2e {
@@ -137,6 +142,7 @@ pipelines:
       postgres: {{ publication: {schema}_pub, slot: {schema}{postgres} }}
     tables: {{ include: [{schema}.*]{tables} }}
     sink: {{ type: delta, bucket: {bucket}, prefix: {prefix}/lake, delta: {{}}, flush: {{ seconds: 1 }}{sink} }}
+    {pipeline}
 "#,
             bucket = TEST_BUCKET,
             prefix = self.prefix,
@@ -147,6 +153,7 @@ pipelines:
             postgres = o.postgres,
             tables = o.tables,
             sink = o.sink,
+            pipeline = o.pipeline,
         )
     }
 
@@ -419,6 +426,44 @@ pipelines:
         }
     }
 
+    /// The pipeline's halt registry.
+    pub async fn halts(&self) -> HaltsDoc {
+        self.docs().halts().await.expect("the halts read")
+    }
+
+    /// The Delta table's commits in version order, each its actions.
+    pub async fn log(&self, table: &str) -> Vec<Vec<serde_json::Value>> {
+        let store = stores::rustfs();
+        let log = object_store::path::Path::from(format!("{}/_delta_log", self.table_root(table)));
+        let mut files: Vec<_> = store
+            .list(Some(&log))
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("the log lists")
+            .into_iter()
+            .map(|m| m.location)
+            .filter(|l| l.extension() == Some("json"))
+            .collect();
+        files.sort();
+        let mut commits = vec![];
+        for f in files {
+            let bytes = store
+                .get_opts(&f, object_store::GetOptions::default())
+                .await
+                .expect("a commit")
+                .bytes()
+                .await
+                .expect("a commit");
+            let text = String::from_utf8(bytes.to_vec()).expect("UTF-8");
+            commits.push(
+                text.lines()
+                    .map(|l| serde_json::from_str(l).expect("an action"))
+                    .collect(),
+            );
+        }
+        commits
+    }
+
     fn lake_prefix(&self) -> String {
         format!("{}/lake", self.prefix)
     }
@@ -429,16 +474,7 @@ pipelines:
 
     /// The Delta table's commits: its `_delta_log/*.json` files.
     pub async fn commits(&self, table: &str) -> usize {
-        let log = object_store::path::Path::from(format!("{}/_delta_log", self.table_root(table)));
-        let files: Vec<_> = stores::rustfs()
-            .list(Some(&log))
-            .try_collect()
-            .await
-            .expect("the log lists");
-        files
-            .iter()
-            .filter(|m| m.location.extension() == Some("json"))
-            .count()
+        self.log(table).await.len()
     }
 
     /// Deletes the Delta table from the lake, as an operator would.

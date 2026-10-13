@@ -6,6 +6,7 @@
 
 mod crashes;
 mod harness;
+mod schema;
 mod smoke;
 mod snapshots;
 mod streaming;
