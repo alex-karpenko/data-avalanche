@@ -73,9 +73,12 @@ impl LeaseState {
 pub enum RenewFailure {
     /// The store didn't answer: the renewer retries until the deadline.
     Transient,
-    /// The lease changed under the renewer.
+    /// Concurrent conditional writes on the lease (`StoreError::Contention`): the outcome is
+    /// unknown, and the renewer reads the lease before it retries. A lease that really changed
+    /// (a 412) counts as `Lost`.
     Conflict,
-    /// The deadline passed.
+    /// The lease is gone: the deadline passed, or the lease was taken, deleted or refused for
+    /// good.
     Lost,
 }
 

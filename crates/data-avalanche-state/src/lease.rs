@@ -217,7 +217,8 @@ impl Leases {
         check_pipeline_id(&key, pipeline_id, self.docs.load(&key).await?)
     }
 
-    /// Takes over a lease the caller has observed unchanged for a full lease duration (§5.3): a
+    /// Takes over a lease the caller has observed unchanged for a full lease duration (§5.3), or
+    /// one that already names `holder` (this process's own earlier term), which needs no wait: a
     /// CAS write from `observed.version` naming `holder`, with `owner_epoch + 1`.
     ///
     /// # Errors

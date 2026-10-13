@@ -520,7 +520,8 @@ impl PipelineController {
 
     /// A stop or a hand-off: the worker flushes and ends within `drain_timeout`, else it is cut
     /// off (what it read past the durable checkpoint is read again by the next run). True when
-    /// it ended on its own; either way it has ended, its writer with it, when this returns.
+    /// it ended on its own; either way the worker has ended when this returns. A cut-off
+    /// worker's writer is aborted with it, not waited for.
     async fn drain(&self, mut w: Running) -> bool {
         let ended = tokio::time::timeout(self.settings.drain_timeout, async {
             let _ = w.handle.control.send(Command::Drain).await;
