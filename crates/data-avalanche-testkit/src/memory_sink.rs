@@ -531,6 +531,7 @@ mod tests {
             position: PositionRange {
                 start: SourcePosition::Pg(Lsn(0)),
                 end: SourcePosition::Pg(Lsn(end)),
+                last_change: SourcePosition::Pg(Lsn(end)),
             },
             split: None,
             snapshot: false,
@@ -633,6 +634,7 @@ mod tests {
             c.position = PositionRange {
                 start: end.clone(),
                 end: end.clone(),
+                last_change: end.clone(),
             };
             commit(&sink, c, 1).await;
         }

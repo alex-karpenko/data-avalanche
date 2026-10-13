@@ -8,12 +8,17 @@ use thiserror::Error;
 use crate::{SourcePosition, TableRef, UNCHANGED_MASK_PREFIX};
 
 /// The stream range a flush covers: changes after `start` (the previous checkpoint) up to and
-/// including `end`. `end` is what the sink records as the table's `committed_position` and what
-/// the position guard compares (Delivery §3).
+/// including `end`. `end` is what the sink records as the table's `committed_position` (the flush
+/// frontier, Data-Flow §Checkpoint rule); `last_change` is what the position guard compares
+/// (Delivery §3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PositionRange {
     pub start: SourcePosition,
     pub end: SourcePosition,
+    /// The commit position of the range's last transaction that wrote this table: at most `end`,
+    /// which a keep-alive or another table's transaction moves past it. A replay of the same
+    /// transactions has the same `last_change` whatever its frontier, so the guard skips it.
+    pub last_change: SourcePosition,
 }
 
 /// Marks a slice of an oversized transaction flushed before the source commit (split commits,
@@ -40,7 +45,8 @@ pub struct SplitInfo {
 /// - every delete batch starts with the identifier columns;
 /// - a key appears at most once across `upserts` and `deletes` (a PK-changing UPDATE is two keys);
 /// - identifier values are never NULL;
-/// - the range doesn't run backwards, and a slice's range ends at its `txn_start`;
+/// - the range doesn't run backwards, `last_change` is inside it, and a slice's range ends at its
+///   `txn_start`;
 /// - a snapshot set only upserts: no deletes, no truncate, not a slice.
 #[derive(Debug, Clone)]
 pub struct TableChangeSet {
@@ -151,6 +157,20 @@ impl TableChangeSet {
                 )));
             }
         }
+        let last = &self.position.last_change;
+        match (last.covers(start), end.covers(last)) {
+            (Ok(true), Ok(true)) => {}
+            (Err(e), _) | (_, Err(e)) => {
+                return Err(err(format!(
+                    "last change {last} doesn't compare with the range from {start} to {end}: {e}"
+                )));
+            }
+            _ => {
+                return Err(err(format!(
+                    "last change {last} is outside the range from {start} to {end}"
+                )));
+            }
+        }
         if self.snapshot && (self.truncate || self.split.is_some() || self.delete_rows() > 0) {
             return Err(err(
                 "a snapshot set carries upserts only: no deletes, truncate or slice".into(),
@@ -255,6 +275,7 @@ mod tests {
             position: PositionRange {
                 start: SourcePosition::Pg(Lsn(10)),
                 end: SourcePosition::Pg(Lsn(20)),
+                last_change: SourcePosition::Pg(Lsn(15)),
             },
             split: None,
             snapshot: false,
@@ -360,6 +381,21 @@ mod tests {
         let mut c = cs(vec![], vec![]);
         c.position.end = SourcePosition::Pg(Lsn(5));
         assert!(detail(c).contains("before it starts"));
+    }
+
+    #[test]
+    fn the_last_change_is_inside_the_range() {
+        for (lsn, ok) in [(10, true), (15, true), (20, true), (9, false), (21, false)] {
+            let mut c = cs(vec![], vec![]);
+            c.position.last_change = SourcePosition::Pg(Lsn(lsn));
+            match c.validate() {
+                Ok(()) => assert!(ok, "{lsn} accepted"),
+                Err(e) => {
+                    assert!(!ok, "{lsn}: {}", e.detail);
+                    assert!(e.detail.contains("outside the range"), "{}", e.detail);
+                }
+            }
+        }
     }
 
     #[test]

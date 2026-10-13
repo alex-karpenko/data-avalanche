@@ -176,6 +176,10 @@ impl CommitMarker {
     /// commit is skipped (Delivery §3). Committing again would only repeat an idempotent write,
     /// except for replayed history, which the guard is what keeps out.
     ///
+    /// The marker covers the set's `last_change`, not its `end`: the end is the flush's frontier,
+    /// which a replay's flush may read past the marker (a keep-alive, another table's
+    /// transaction) while carrying only the transactions the table already has.
+    ///
     /// A split slice ends at its pinned `txn_start`, which the marker equals from the transaction's
     /// first slice on, so "covers the end" can't tell a slice still owed from one already applied.
     /// It is skipped only when the marker is strictly past `txn_start`: the transaction's commit (or
@@ -191,7 +195,7 @@ impl CommitMarker {
         let stored = &self.committed_position;
         match &cs.split {
             Some(split) => Ok(stored.covers(&split.txn_start)? && !split.txn_start.covers(stored)?),
-            None => stored.covers(&cs.position.end),
+            None => stored.covers(&cs.position.last_change),
         }
     }
 }
@@ -351,6 +355,10 @@ mod tests {
     }
 
     fn change_set(end: u64, split: Option<SplitInfo>) -> TableChangeSet {
+        ranged(end, end, split)
+    }
+
+    fn ranged(last_change: u64, end: u64, split: Option<SplitInfo>) -> TableChangeSet {
         let t = table();
         TableChangeSet {
             table: t.table().clone(),
@@ -362,6 +370,7 @@ mod tests {
             position: PositionRange {
                 start: SourcePosition::Pg(Lsn(1)),
                 end: SourcePosition::Pg(Lsn(end)),
+                last_change: SourcePosition::Pg(Lsn(last_change)),
             },
             split,
             snapshot: false,
@@ -453,6 +462,20 @@ mod tests {
         assert!(stored.covers(&change_set(100, None)).unwrap());
         assert!(stored.covers(&change_set(60, None)).unwrap());
         assert!(!stored.covers(&change_set(101, None)).unwrap());
+    }
+
+    #[test]
+    fn the_guard_compares_the_last_change_not_the_frontier() {
+        let stored = marker(1, 100);
+        assert!(
+            stored.covers(&ranged(90, 120, None)).unwrap(),
+            "a replay whose flush read past the marker carries only what the table has"
+        );
+        assert!(stored.covers(&ranged(100, 120, None)).unwrap());
+        assert!(
+            !stored.covers(&ranged(110, 120, None)).unwrap(),
+            "a transaction past the marker is owed"
+        );
     }
 
     #[test]

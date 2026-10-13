@@ -58,12 +58,11 @@ async fn a_crash_mid_snapshot_resumes_it() {
     e.cleanup().await;
 }
 
-/// A crash after a commit, before its checkpoint: the restart reads the transaction again and
-/// commits it again, which the MERGE makes a no-op on the content. (The commit marker skips a
-/// replay only when its flush ends at the marker; the flush ends at the stream's frontier, which
-/// a keep-alive moves past the transaction.)
+/// A crash after a commit, before its checkpoint: the restart reads the transaction again, and
+/// the position guard skips it: the table's marker covers the transaction's commit, though the
+/// replay's flush may end past the marker (a keep-alive).
 #[tokio::test]
-async fn a_crash_between_a_commit_and_its_checkpoint_replays_it_idempotently() {
+async fn a_crash_between_a_commit_and_its_checkpoint_skips_the_replay() {
     require_it!();
     let e = E2e::new(
         "crash_commit",
@@ -90,11 +89,17 @@ async fn a_crash_between_a_commit_and_its_checkpoint_replays_it_idempotently() {
         !e.acknowledges(&marker).await,
         "the crash came before the ack"
     );
+    let commits = e.commits("items").await;
 
     let mut p = e.start(&[]);
     p.ready().await;
     e.acknowledged(&marker).await;
     e.mirrored("items", COLS).await;
+    assert_eq!(
+        e.commits("items").await,
+        commits,
+        "the replay is skipped, not merged again"
+    );
     assert_eq!(e.ids("items").await, (1..=100).collect::<Vec<i64>>());
     e.exec("DELETE FROM items WHERE id > 50").await;
     e.mirrored("items", COLS).await;

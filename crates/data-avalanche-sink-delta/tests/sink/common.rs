@@ -88,6 +88,7 @@ pub fn cs(end: u64, up: Vec<RecordBatch>, del: Vec<RecordBatch>) -> TableChangeS
         position: PositionRange {
             start: SourcePosition::Pg(Lsn(0)),
             end: SourcePosition::Pg(Lsn(end)),
+            last_change: SourcePosition::Pg(Lsn(end)),
         },
         split: None,
         snapshot: false,

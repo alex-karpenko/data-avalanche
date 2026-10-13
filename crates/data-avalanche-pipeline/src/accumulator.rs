@@ -4,7 +4,10 @@
 //! Positions: the **frontier** is the commit position of the last complete transaction (or a
 //! keep-alive past it); the **checkpoint** is the frontier of the last flush. A flush covers
 //! `checkpoint..=frontier` and moves the checkpoint to the frontier, which is where the pipeline
-//! resumes once every change set of the flush is committed.
+//! resumes once every change set of the flush is committed. Each table's change set also carries
+//! its **last change**: the commit position of the last transaction that wrote the table, which
+//! the sink's position guard compares (a replay's frontier may be past the table's marker while
+//! its transactions aren't).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -42,6 +45,9 @@ pub struct Accumulator {
     tables: BTreeMap<TableRef, TableBuffer>,
     /// Halted tables: their events are dropped.
     halted: BTreeSet<TableRef>,
+    /// Per table with changes no flush has taken: the commit position of the last transaction
+    /// that wrote it (a slice's: the transaction's start).
+    last_change: BTreeMap<TableRef, SourcePosition>,
     txn: Option<OpenTxn>,
     checkpoint: SourcePosition,
     frontier: SourcePosition,
@@ -58,6 +64,7 @@ impl Accumulator {
             limits: TxnLimits::default(),
             tables: BTreeMap::new(),
             halted: BTreeSet::new(),
+            last_change: BTreeMap::new(),
             txn: None,
             checkpoint: resume_from.clone(),
             frontier: resume_from,
@@ -120,6 +127,7 @@ impl Accumulator {
     /// Calling it again changes nothing.
     pub fn halt_table(&mut self, table: &TableRef) {
         self.tables.remove(table);
+        self.last_change.remove(table);
         self.halted.insert(table.clone());
     }
 
@@ -277,9 +285,7 @@ impl Accumulator {
         }
         self.advance(&boundary.commit_pos)?;
         let txn = self.txn.take().expect("checked above");
-        for buffer in self.tables.values_mut() {
-            buffer.commit_txn();
-        }
+        self.commit_open(&boundary.commit_pos);
         let since = txn.first_event_at.unwrap_or(now);
         self.flushable_since = Some(self.flushable_since.map_or(since, |s| s.min(since)));
         Ok(())
@@ -347,19 +353,41 @@ impl Accumulator {
         None
     }
 
+    /// Moves every buffer's open transaction to its committed layer; a table it wrote has its
+    /// last change at `at`.
+    fn commit_open(&mut self, at: &SourcePosition) {
+        for (table, buffer) in &mut self.tables {
+            if buffer.open_events() > 0 {
+                self.last_change.insert(table.clone(), at.clone());
+            }
+            buffer.commit_txn();
+        }
+    }
+
+    /// Takes the committed layers of the tables that have changes as change sets.
+    fn take(&mut self, split: Option<SplitInfo>) -> Vec<TableChangeSet> {
+        let (start, end) = (&self.checkpoint, &self.frontier);
+        self.tables
+            .iter_mut()
+            .filter(|(_, b)| b.committed_events() > 0)
+            .map(|(table, b)| {
+                let position = PositionRange {
+                    start: start.clone(),
+                    end: end.clone(),
+                    last_change: self
+                        .last_change
+                        .remove(table)
+                        .unwrap_or_else(|| end.clone()),
+                };
+                b.flush(&self.lineage, position, split.clone())
+            })
+            .collect()
+    }
+
     /// Takes every complete transaction as change sets covering `checkpoint..=frontier`; an open
     /// transaction stays buffered.
     pub fn flush(&mut self) -> Flush {
-        let position = PositionRange {
-            start: self.checkpoint.clone(),
-            end: self.frontier.clone(),
-        };
-        let change_sets = self
-            .tables
-            .values_mut()
-            .filter(|b| b.committed_events() > 0)
-            .map(|b| b.flush(&self.lineage, position.clone(), None))
-            .collect();
+        let change_sets = self.take(None);
         self.checkpoint = self.frontier.clone();
         self.flushable_since = None;
         Flush {
@@ -383,17 +411,9 @@ impl Accumulator {
             txn_start: self.frontier.clone(),
             slice: txn.slices,
         };
-        let position = PositionRange {
-            start: self.checkpoint.clone(),
-            end: self.frontier.clone(),
-        };
-        let mut change_sets = Vec::new();
-        for b in self.tables.values_mut() {
-            b.commit_txn();
-            if b.committed_events() > 0 {
-                change_sets.push(b.flush(&self.lineage, position.clone(), Some(split.clone())));
-            }
-        }
+        let start = split.txn_start.clone();
+        self.commit_open(&start);
+        let change_sets = self.take(Some(split));
         self.checkpoint = self.frontier.clone();
         self.flushable_since = None;
         Ok(Flush {
@@ -505,6 +525,12 @@ mod tests {
                 (&lsn(100), &lsn(300))
             );
         }
+        let last: Vec<_> = f
+            .change_sets
+            .iter()
+            .map(|cs| (cs.table.name.as_str(), &cs.position.last_change))
+            .collect();
+        assert_eq!(last, [("a", &lsn(300)), ("b", &lsn(200))]);
         assert_eq!(f.change_sets[0].upsert_rows(), 2);
         txn(&mut a, 3, 400, &[("b", 5)], t0);
         let f = a.flush();
@@ -659,6 +685,28 @@ mod tests {
             "an empty transaction only moves the checkpoint"
         );
         assert_eq!(f.checkpoint, lsn(200));
+    }
+
+    #[test]
+    fn a_keepalive_moves_the_end_but_not_the_last_change() {
+        let t0 = Instant::now();
+        let mut a = acc(FlushPolicy::default());
+        txn(&mut a, 1, 200, &[("a", 1)], t0);
+        a.keepalive(&lsn(250), t0).unwrap();
+        let f = a.flush();
+        let cs = &f.change_sets[0];
+        cs.validate().unwrap();
+        assert_eq!(
+            (&cs.position.end, &cs.position.last_change),
+            (&lsn(250), &lsn(200))
+        );
+        assert_eq!(f.checkpoint, lsn(250));
+        txn(&mut a, 2, 300, &[("a", 2)], t0);
+        assert_eq!(
+            a.flush().change_sets[0].position.last_change,
+            lsn(300),
+            "the next flush starts afresh"
+        );
     }
 
     #[test]
@@ -822,8 +870,12 @@ mod tests {
                 Some((&lsn(200), 1))
             );
             assert_eq!(
-                (&cs.position.start, &cs.position.end),
-                (&lsn(100), &lsn(200))
+                (
+                    &cs.position.start,
+                    &cs.position.end,
+                    &cs.position.last_change
+                ),
+                (&lsn(100), &lsn(200), &lsn(200))
             );
         }
         assert_eq!(
@@ -843,6 +895,7 @@ mod tests {
         a.commit(&boundary(2, 300), t0).unwrap();
         let rest = a.flush();
         assert_eq!(rest.checkpoint, lsn(300));
+        assert_eq!(rest.change_sets[0].position.last_change, lsn(300));
         assert!(
             rest.change_sets[0].split.is_none(),
             "the rest is a regular flush"
