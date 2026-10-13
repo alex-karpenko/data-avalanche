@@ -14727,6 +14727,17 @@ per task, against the `test-infra` services (PostgreSQL 18 and 14, RustFS, Azuri
   hunk below carries the new check as context; no other later task's code changes. The
   review's other notes are parked in the SDD ledger.
 
+- **Task 19, the review fix (2026-10-13).** The task review found that the types scenario compared
+  each cell's text only, not its column's type: a column written as a Delta `string` instead of a
+  `decimal`, a `date` or an integer prints the same text, and passed. With
+  `column_type_overrides: { e2e_types.types.n: string }`, the scenario as planned stayed green.
+  `duckdb_read.py` now prints each column's DuckDB type too, and `EXPECTED` pins it per column, from
+  `Type_Mapping.md` Hop 3b (`DECIMAL(12,3)`, `DATE`, `TIMESTAMP` for `timestamp_ntz`, `TIMESTAMP WITH
+  TIME ZONE`, `VARCHAR` for `time`, `uuid`, JSON and the other text-serialized types, `INTEGER[]`, …):
+  green as written, and red under the override (`n` read as `VARCHAR`). Committed after Task 19's
+  commit as `test(e2e): the types scenario pins each Delta column's type as DuckDB reads it, not only
+  its text`. No later task's code changes. The review's other notes are parked in the SDD ledger.
+
 ### After Task 1: the review fix
 
 Change `crates/data-avalanche-sink-delta/src/sink.rs`:
@@ -16025,4 +16036,178 @@ diff --git a/crates/data-avalanche/tests/e2e/harness.rs b/crates/data-avalanche/
          })
          .await;
      }
+```
+
+### After Task 19: the review fix
+
+Change `crates/data-avalanche/tests/e2e/duckdb_read.py`:
+
+```diff
+diff --git a/crates/data-avalanche/tests/e2e/duckdb_read.py b/crates/data-avalanche/tests/e2e/duckdb_read.py
+--- a/crates/data-avalanche/tests/e2e/duckdb_read.py
++++ b/crates/data-avalanche/tests/e2e/duckdb_read.py
+@@ -1,5 +1,5 @@
+-"""Reads a Delta table on S3 (RustFS) with DuckDB's delta_scan and prints every cell as text, as
+-JSON rows in `id` order.
++"""Reads a Delta table on S3 (RustFS) with DuckDB's delta_scan and prints its columns, their DuckDB
++types and every cell as text, as JSON rows in `id` order.
+ 
+ Used by tests/e2e/types.rs. Run: uv run --no-project --with duckdb==1.5.6 python duckdb_read.py
+ <s3 table url>, with DUCKDB_S3_ENDPOINT (host:port), DUCKDB_S3_KEY_ID and DUCKDB_S3_SECRET set.
+@@ -29,7 +29,9 @@ con.sql(
+ # timestamptz cells print in UTC, whatever the host's zone.
+ con.sql("SET TimeZone = 'UTC'")
+ scan = f"delta_scan({quote(sys.argv[1])})"
+-names = con.sql(f"SELECT * FROM {scan}").columns
++table = con.sql(f"SELECT * FROM {scan}")
++names = table.columns
++types = [str(t) for t in table.types]
+ cols = ", ".join(f'"{c}"::VARCHAR' for c in names)
+ rows = con.sql(f"SELECT {cols} FROM {scan} ORDER BY id").fetchall()
+-print(json.dumps({"columns": names, "rows": [list(r) for r in rows]}))
++print(json.dumps({"columns": names, "types": types, "rows": [list(r) for r in rows]}))
+```
+
+Change `crates/data-avalanche/tests/e2e/types.rs`:
+
+```diff
+diff --git a/crates/data-avalanche/tests/e2e/types.rs b/crates/data-avalanche/tests/e2e/types.rs
+--- a/crates/data-avalanche/tests/e2e/types.rs
++++ b/crates/data-avalanche/tests/e2e/types.rs
+@@ -33,59 +33,70 @@ const ROW_B: &str = "false, 32767, -2147483648, -9223372036854775808, 0, '-Infin
+     '00000000-0000-0000-0000-000000000000', 'null', '[]', '::1',
+     'empty', '{}', '{}', 'sad'";
+ 
+-/// Per column, DuckDB's text of [`ROW_A`] and [`ROW_B`] (`Type_Mapping.md`: `char(n)` without its
+-/// padding, `time` and `interval` as text, compact JSON, ranges, `inet` and enums as text).
+-const EXPECTED: &[[&str; 3]] = &[
+-    ["b", "true", "false"],
+-    ["i2", "-32768", "32767"],
+-    ["i4", "2147483647", "-2147483648"],
+-    ["i8", "9223372036854775807", "-9223372036854775808"],
+-    ["o", "4294967295", "0"],
+-    ["f4", "1.5", "-inf"],
+-    ["f8", "0.1", "nan"],
+-    ["n", "123456789.123", "-0.001"],
++/// Per column, the Delta column's type as DuckDB reads it, and DuckDB's text of [`ROW_A`] and
++/// [`ROW_B`] (`Type_Mapping.md` Hop 3b: `numeric` without a precision, `time`, `timetz`,
++/// `interval`, `uuid`, JSON, ranges, `inet` and enums as strings, `char(n)` without its padding,
++/// `timestamp` as `timestamp_ntz`, `timestamptz` as `timestamp`, compact JSON).
++const EXPECTED: &[[&str; 4]] = &[
++    ["b", "BOOLEAN", "true", "false"],
++    ["i2", "SMALLINT", "-32768", "32767"],
++    ["i4", "INTEGER", "2147483647", "-2147483648"],
++    [
++        "i8",
++        "BIGINT",
++        "9223372036854775807",
++        "-9223372036854775808",
++    ],
++    ["o", "BIGINT", "4294967295", "0"],
++    ["f4", "FLOAT", "1.5", "-inf"],
++    ["f8", "DOUBLE", "0.1", "nan"],
++    ["n", "DECIMAL(12,3)", "123456789.123", "-0.001"],
+     [
+         "n38",
++        "DECIMAL(38,0)",
+         "99999999999999999999999999999999999999",
+         "-99999999999999999999999999999999999999",
+     ],
+-    ["nb", "12345.6789", "0"],
+-    ["m", "12.34", "-1.00"],
+-    ["bp", "ab", "abcde"],
+-    ["vc", "hello", ""],
+-    ["tx", "it's", ""],
+-    ["by", "\\xDE\\xAD\\xBE\\xEF", ""],
+-    ["d", "2024-02-29", "1970-01-01"],
+-    ["tm", "12:34:56.789012", "00:00:00.000000"],
+-    ["tz", "12:00:00+05:30", "23:59:59-08"],
++    ["nb", "VARCHAR", "12345.6789", "0"],
++    ["m", "DECIMAL(19,2)", "12.34", "-1.00"],
++    ["bp", "VARCHAR", "ab", "abcde"],
++    ["vc", "VARCHAR", "hello", ""],
++    ["tx", "VARCHAR", "it's", ""],
++    ["by", "BLOB", "\\xDE\\xAD\\xBE\\xEF", ""],
++    ["d", "DATE", "2024-02-29", "1970-01-01"],
++    ["tm", "VARCHAR", "12:34:56.789012", "00:00:00.000000"],
++    ["tz", "VARCHAR", "12:00:00+05:30", "23:59:59-08"],
+     [
+         "ts",
++        "TIMESTAMP",
+         "2024-02-29 12:34:56.789012",
+         "1969-12-31 23:59:59.999999",
+     ],
+     [
+         "tt",
++        "TIMESTAMP WITH TIME ZONE",
+         "2024-02-29 12:34:56.789012+00",
+         "1970-01-01 00:00:00+00",
+     ],
+-    ["iv", "P1Y2M3DT4H5M6S", "P-1D"],
++    ["iv", "VARCHAR", "P1Y2M3DT4H5M6S", "P-1D"],
+     [
+         "u",
++        "VARCHAR",
+         "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+         "00000000-0000-0000-0000-000000000000",
+     ],
+-    ["j", "{\"a\":1}", "null"],
+-    ["jb", "{\"b\":[1,2]}", "[]"],
+-    ["ip", "192.168.0.1/24", "::1"],
+-    ["r", "[1,10)", "empty"],
+-    ["ai", "[1, 2, NULL]", "[]"],
+-    ["at", "[x, y z]", "[]"],
+-    ["e", "happy", "sad"],
++    ["j", "VARCHAR", "{\"a\":1}", "null"],
++    ["jb", "VARCHAR", "{\"b\":[1,2]}", "[]"],
++    ["ip", "VARCHAR", "192.168.0.1/24", "::1"],
++    ["r", "VARCHAR", "[1,10)", "empty"],
++    ["ai", "INTEGER[]", "[1, 2, NULL]", "[]"],
++    ["at", "VARCHAR[]", "[x, y z]", "[]"],
++    ["e", "VARCHAR", "happy", "sad"],
+ ];
+ 
+-/// DuckDB's `delta_scan` of a lake table: the column names and every cell as text, rows in key
+-/// order. Needs `uv` (the CI integration job installs it).
+-fn duckdb_read(url: &str) -> (Vec<String>, Vec<Vec<Option<String>>>) {
++/// DuckDB's `delta_scan` of a lake table: the column names, their DuckDB types and every cell as
++/// text, rows in key order. Needs `uv` (the CI integration job installs it).
++fn duckdb_read(url: &str) -> (Vec<String>, Vec<String>, Vec<Vec<Option<String>>>) {
+     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/e2e/duckdb_read.py");
+     let out = std::process::Command::new("uv")
+         .args([
+@@ -114,6 +125,7 @@ fn duckdb_read(url: &str) -> (Vec<String>, Vec<Vec<Option<String>>>) {
+     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("JSON");
+     (
+         serde_json::from_value(v["columns"].clone()).expect("columns"),
++        serde_json::from_value(v["types"].clone()).expect("types"),
+         serde_json::from_value(v["rows"].clone()).expect("rows"),
+     )
+ }
+@@ -140,7 +152,7 @@ async fn every_type_family_reads_back_in_duckdb() {
+     e.converged("types").await;
+     assert!(p.terminate().await.success());
+ 
+-    let (columns, rows) = duckdb_read(&e.table_url("types"));
++    let (columns, types, rows) = duckdb_read(&e.table_url("types"));
+     assert_eq!(rows.len(), 4);
+     let source: Vec<usize> = (0..columns.len())
+         .filter(|&i| columns[i] != "id" && !columns[i].starts_with('_'))
+@@ -157,8 +169,14 @@ async fn every_type_family_reads_back_in_duckdb() {
+     let want = |i: usize| -> Vec<(&str, Option<&str>)> {
+         EXPECTED.iter().map(|c| (c[0], Some(c[i]))).collect()
+     };
+-    assert_eq!(named(0), want(1), "row 1, from the snapshot");
+-    assert_eq!(named(1), want(2), "row 2, from the snapshot");
++    let typed: Vec<(&str, &str)> = source
++        .iter()
++        .map(|&i| (columns[i].as_str(), types[i].as_str()))
++        .collect();
++    let want_types: Vec<(&str, &str)> = EXPECTED.iter().map(|c| (c[0], c[1])).collect();
++    assert_eq!(typed, want_types, "the Delta column types");
++    assert_eq!(named(0), want(2), "row 1, from the snapshot");
++    assert_eq!(named(1), want(3), "row 2, from the snapshot");
+     assert_eq!(
+         cells(2),
+         cells(0),
 ```
