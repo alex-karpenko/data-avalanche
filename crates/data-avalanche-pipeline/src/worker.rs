@@ -141,12 +141,17 @@ impl PipelineWorker {
             if opened.elapsed() >= core.tuning.source_backoff.max {
                 attempt = 0;
             }
-            core.update(|st| st.reconnects += 1);
-            match failed {
-                SourceError::Transient(error) => {
-                    contended_since = None;
-                    core.update(|st| st.phase = Phase::Reconnecting { error });
+            // One update: an observer that sees the count sees its reason.
+            core.update(|st| {
+                st.reconnects += 1;
+                if let SourceError::Transient(error) = &failed {
+                    st.phase = Phase::Reconnecting {
+                        error: error.clone(),
+                    };
                 }
+            });
+            match failed {
+                SourceError::Transient(_) => contended_since = None,
                 SourceError::Contended(detail) => {
                     let since = *contended_since.get_or_insert_with(Instant::now);
                     let waited = since.elapsed();

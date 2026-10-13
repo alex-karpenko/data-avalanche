@@ -171,6 +171,8 @@ struct Running {
     paused: bool,
     /// The warnings already logged.
     logged: HashSet<String>,
+    /// The worker's reconnects already logged.
+    reconnects: u64,
 }
 
 impl PipelineController {
@@ -512,6 +514,7 @@ impl PipelineController {
             permit: Some(permit),
             paused: false,
             logged: HashSet::new(),
+            reconnects: 0,
         })
     }
 
@@ -568,12 +571,18 @@ impl PipelineController {
         }
     }
 
-    /// The worker's status into the metrics, and its new warnings into the log.
+    /// The worker's status into the metrics, and its new warnings and reconnects into the log.
     fn observe(&self, w: &mut Running) {
         let st = w.handle.status.borrow().clone();
         for warning in &st.warnings {
             if w.logged.insert(warning.clone()) {
                 tracing::warn!(pipeline = %self.pipeline.name, "{warning}");
+            }
+        }
+        if st.reconnects > w.reconnects {
+            w.reconnects = st.reconnects;
+            if let Phase::Reconnecting { error } = &st.phase {
+                tracing::warn!(pipeline = %self.pipeline.name, "reconnecting to the source: {error}");
             }
         }
         let m = &self.metrics;

@@ -21,6 +21,7 @@ mod settings;
 pub mod status;
 #[cfg(test)]
 mod test_support;
+mod watchdog;
 pub mod worker;
 mod writer;
 

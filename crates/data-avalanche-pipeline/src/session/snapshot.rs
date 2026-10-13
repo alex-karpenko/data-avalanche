@@ -1080,9 +1080,9 @@ mod tests {
         );
     }
 
-    /// Chunk reads share the source's connection with the heartbeat's `retained_bytes`, which the
-    /// session awaits inline: a read hands back its rows only while that call waits, so the reads
-    /// must be polled while the session awaits it (Task 13 review I3).
+    /// Chunk reads share the source's connection with the heartbeat's `retained`: a read hands
+    /// back its rows only while that call waits, so the reads must be polled while the call is
+    /// out (Task 13 review I3).
     #[tokio::test]
     async fn a_chunk_read_goes_on_while_the_session_awaits_the_source() {
         let w = World::new(&["a"]);

@@ -8,8 +8,8 @@ use data_avalanche_config::{
 };
 use data_avalanche_core::{
     ChangeStream, Chunk, HaltReason, InFlightTxn, KeysetCursor, Preflight, Prepared, RescanReport,
-    ResolvedTables, Row, SchemaDelta, SchemaHint, SourceConnector, SourceError, SourcePosition,
-    TableRef, TableSchema,
+    ResolvedTables, RetainedLog, Row, SchemaDelta, SchemaHint, SourceConnector, SourceError,
+    SourcePosition, TableRef, TableSchema,
 };
 use tokio::sync::Mutex;
 
@@ -274,8 +274,8 @@ impl SourceConnector for PgConnector {
         PgConnector::reset_position(self).await
     }
 
-    async fn retained_bytes(&self) -> Result<Option<u64>, SourceError> {
-        PgConnector::retained_bytes(self).await
+    async fn retained(&self) -> Result<Option<RetainedLog>, SourceError> {
+        PgConnector::retained(self).await
     }
 
     async fn current_position(&self) -> Result<SourcePosition, SourceError> {

@@ -94,8 +94,18 @@ impl Connector {
         c
     }
 
-    /// A new catalog connection, its driver task spawned.
+    /// A new catalog connection, its driver task spawned, within `timeouts.connect`: the
+    /// driver's own `connect_timeout` bounds only the TCP connect, and a server that accepts the
+    /// connection but never answers (frozen, behind a black hole) would hold the startup, and
+    /// every call queued behind the shared connection, forever (DA-SRC-16).
     pub(crate) async fn connect(&self) -> Result<Client, SourceError> {
+        let after = self.timeouts.connect;
+        tokio::time::timeout(after, self.open())
+            .await
+            .map_err(|_| timed_out("connect to the source", after))?
+    }
+
+    async fn open(&self) -> Result<Client, SourceError> {
         let config = self.control_config();
         let client = match &self.tls {
             None => {
@@ -265,6 +275,33 @@ mod tests {
             config.get_ssl_mode(),
             tokio_postgres::config::SslMode::Disable
         );
+    }
+
+    /// A server that accepts the connection and never answers: the startup times out.
+    #[tokio::test]
+    async fn a_connect_to_a_server_that_never_answers_times_out() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let held = tokio::spawn(async move {
+            let mut sockets = vec![];
+            while let Ok((s, _)) = listener.accept().await {
+                sockets.push(s);
+            }
+        });
+        let mut source = pipeline("public.t").source;
+        source.port = port;
+        source.timeouts.connect = Duration::from_millis(300);
+        let c = Connector::new(&source).unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(5), c.client())
+            .await
+            .expect("the startup is bounded by timeouts.connect")
+            .unwrap_err();
+        assert!(err.is_transient(), "{err}");
+        assert!(
+            err.to_string().contains("connect to the source timed out"),
+            "{err}"
+        );
+        held.abort();
     }
 
     #[test]

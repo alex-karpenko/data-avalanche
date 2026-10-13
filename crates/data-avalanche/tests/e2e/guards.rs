@@ -1,9 +1,12 @@
-//! Scenario 10, the guards: the WAL a slot retains, the open transaction's buffer, and a slot
-//! whose WAL is gone.
+//! Scenario 10, the guards: the WAL a slot retains, the open transaction's buffer, a slot whose
+//! WAL is gone, and a source that stops answering.
+
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use data_avalanche_testkit::require_it;
 
-use crate::harness::{E2e, Options, admin};
+use crate::harness::{E2e, Options, admin, eventually, pg_port};
 
 const TABLES: &str = "CREATE TABLE items (id bigint PRIMARY KEY, doc text);
      CREATE TABLE pad (id bigserial PRIMARY KEY, doc text);";
@@ -153,6 +156,89 @@ async fn a_slot_whose_wal_is_gone_is_snapshotted_again() {
     e.converged("items").await;
     e.exec("INSERT INTO items VALUES (4, 'd')").await;
     e.converged("items").await;
+    assert!(p.terminate().await.success());
+    e.cleanup().await;
+}
+
+/// The server under test, frozen (`docker pause`) until dropped, on every path out of the test:
+/// a server that keeps its connections open and never answers.
+struct Frozen(String);
+
+impl Frozen {
+    fn new() -> Self {
+        // test-infra/compose.yaml: project `data-avalanche-test`, `postgres-<major>` on 554<major>.
+        let name = format!("data-avalanche-test-postgres-{}-1", pg_port() - 55400);
+        docker("pause", &name);
+        Self(name)
+    }
+}
+
+impl Drop for Frozen {
+    fn drop(&mut self) {
+        docker("unpause", &self.0);
+    }
+}
+
+fn docker(verb: &str, container: &str) {
+    let status = Command::new("docker")
+        .args([verb, container])
+        .stdout(Stdio::null())
+        .status()
+        .expect("docker runs");
+    assert!(status.success(), "docker {verb} {container}: {status}");
+}
+
+/// The reconnects counter's value.
+fn reconnects(metrics: &str) -> u64 {
+    metrics
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("data_avalanche_source_reconnects_total{")
+                .and_then(|rest| rest.rsplit_once(' '))
+                .map(|(_, v)| v.parse().expect("a count"))
+        })
+        .expect("the reconnects series")
+}
+
+/// A source that stops answering (DA-SRC-16): the stream goes silent and the heartbeat's reads
+/// time out, so the session ends and the pipeline reconnects, again and again while the server
+/// is frozen; once it answers, the pipeline streams again.
+#[tokio::test]
+async fn a_source_that_stops_answering_is_reconnected_to() {
+    require_it!();
+    let e = E2e::new(
+        "guard_frozen",
+        "CREATE TABLE items (id bigint PRIMARY KEY, doc text);",
+        Options {
+            tables: ", snapshots: { mode: never }",
+            source: "timeouts: { connect: 2s, command: 2s }",
+            postgres: ", heartbeat: 1s",
+            ..Options::default()
+        },
+    )
+    .await;
+    let mut p = e.start(&[]);
+    p.ready().await;
+    e.streaming().await;
+    e.exec("INSERT INTO items VALUES (1, 'before')").await;
+    e.mirrored("items", &["id", "doc"]).await;
+    assert_eq!(reconnects(&p.metrics().await), 0);
+    {
+        let _frozen = Frozen::new();
+        eventually("a reconnect", Duration::from_secs(60), async || {
+            reconnects(&p.metrics().await) >= 1
+        })
+        .await;
+        p.metric(&e.status("running")).await;
+    }
+    e.exec("INSERT INTO items VALUES (2, 'after')").await;
+    e.mirrored("items", &["id", "doc"]).await;
+    assert!(
+        p.log()
+            .contains("reconnecting to the source: the source isn't answering"),
+        "{}",
+        p.log()
+    );
     assert!(p.terminate().await.success());
     e.cleanup().await;
 }

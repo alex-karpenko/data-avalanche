@@ -70,6 +70,8 @@ pub struct Options<'a> {
     pub tables: &'a str,
     /// `sink` entries, e.g. `, flush: { rows: 10 }`.
     pub sink: &'a str,
+    /// `source` keys beyond the connection, one YAML line, e.g. `timeouts: { command: 2s }`.
+    pub source: &'a str,
     /// `source.postgres` entries.
     pub postgres: &'a str,
     /// Pipeline keys beyond `source`, `tables` and `sink`, one YAML line, e.g.
@@ -167,6 +169,7 @@ pipelines:
       user: avalanche
       password: avalanche
       ssl_mode: disable
+      {source}
       postgres: {{ publication: {schema}_pub, slot: {schema}{postgres} }}
     tables: {{ include: [{schema}.*]{tables} }}
     sink: {{ type: delta, bucket: {bucket}, prefix: {prefix}/lake, delta: {{}}, flush: {{ seconds: 1 }}{sink} }}
@@ -178,6 +181,7 @@ pipelines:
             test = self.test,
             pg = pg_port(),
             schema = self.schema,
+            source = o.source,
             postgres = o.postgres,
             tables = o.tables,
             sink = o.sink,

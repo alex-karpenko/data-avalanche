@@ -14,19 +14,20 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use data_avalanche_core::{
-    CdcEvent, ChangeStream, ColumnValue, HaltReason, Op, RescanReport, Row, SchemaHint, Sink,
-    SourceConnector, SourceError, SourcePosition, SourceSeq, StreamItem, TableRef, TableSchema,
-    TransactionBoundary, identifier_values,
+    CdcEvent, ChangeStream, ColumnValue, HaltReason, Op, RescanReport, RetainedLog, Row,
+    SchemaHint, Sink, SourceConnector, SourceError, SourcePosition, SourceSeq, StreamItem,
+    TableRef, TableSchema, TransactionBoundary, identifier_values,
 };
 use data_avalanche_state::{PipelineDocs, TableHalt};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle, JoinSet};
 
 use self::snapshot::Snapshots;
 use crate::schema_change::{Evolver, Planned};
 use crate::settings::Settings;
 use crate::status::Streak;
+use crate::watchdog::Watchdog;
 use crate::writer::{self, Job, WriterCtx, WriterEvent};
 use crate::{
     Accumulator, AccumulatorError, Command, CommitGuard, Exit, FlushReason, Hooks, Phase, Tuning,
@@ -176,6 +177,10 @@ pub(crate) struct Session<'c> {
     draining: bool,
     /// When this session parked for [`Command::Pause`], with everything it read durable.
     paused: Option<Instant>,
+    /// The heartbeat's read of the source's log, one at a time, run beside the loop: a source
+    /// that doesn't answer holds up neither the stream nor a drain (DA-SRC-16).
+    retained_read: JoinSet<Result<Option<RetainedLog>, SourceError>>,
+    watchdog: Watchdog,
 }
 
 impl<'c> Session<'c> {
@@ -291,6 +296,8 @@ impl<'c> Session<'c> {
             snaps,
             draining: false,
             paused: None,
+            retained_read: JoinSet::new(),
+            watchdog: Watchdog::default(),
         }))
     }
 
@@ -420,7 +427,14 @@ impl<'c> Session<'c> {
                         return Ok(end);
                     }
                 }
-                _ = heartbeat.tick() => self.wal_lag().await?,
+                _ = heartbeat.tick() => {
+                    if let Some(end) = self.heartbeat() {
+                        return Ok(end);
+                    }
+                }
+                read = self.retained_read.join_next(), if !self.retained_read.is_empty() => {
+                    self.wal_lag(read.expect("not empty"))?;
+                }
                 _ = async { rescan.as_mut().expect("guarded").tick().await },
                     if rescan.is_some() && self.rescan.is_none() && !parked =>
                 {
@@ -430,6 +444,7 @@ impl<'c> Session<'c> {
                 }
                 item = self.stream.next(), if reading => match item {
                     Ok(item) => {
+                        self.watchdog.heard();
                         if let Some(end) = self.item(item).await? {
                             return Ok(end);
                         }
@@ -879,15 +894,44 @@ impl<'c> Session<'c> {
         Ok(None)
     }
 
-    /// The WAL-retention guard (G-22): the retained log is always reported; past
-    /// `max_wal_lag_bytes` the pipeline stops to protect the source's disk. A failed read waits
-    /// for the next heartbeat, and the pipeline keeps running. The first permanent failure of a
-    /// streak warns that the guard is blind; a read that succeeds ends the streak.
-    async fn wal_lag(&mut self) -> Result<(), WorkerError> {
-        let retained = match self.core.source.retained_bytes().await {
+    /// A heartbeat: the next read of the source's log goes out unless one still is, and the
+    /// watchdog counts. `Some` ends the session: the source isn't answering, so the worker
+    /// reconnects.
+    fn heartbeat(&mut self) -> Option<End> {
+        if self.retained_read.is_empty() {
+            let source = self.core.source.clone();
+            self.retained_read
+                .spawn(async move { source.retained().await });
+        }
+        let reading = self.queued.is_empty() && self.paused.is_none();
+        let why = self.watchdog.beat(reading)?;
+        Some(End::Source(SourceError::Transient(why)))
+    }
+
+    /// A heartbeat's read of the source's log came back. The WAL-retention guard (G-22): the
+    /// retained log is always reported; past `max_wal_lag_bytes` the pipeline stops to protect
+    /// the source's disk. A failed read waits for the next heartbeat, and the pipeline keeps
+    /// running. The first permanent failure of a streak warns that the guard is blind; a read
+    /// that succeeds ends the streak. The watchdog hears whether the source answered: a
+    /// transient failure, or a slot no stream reads, is no answer.
+    fn wal_lag(
+        &mut self,
+        read: Result<Result<Option<RetainedLog>, SourceError>, JoinError>,
+    ) -> Result<(), WorkerError> {
+        let read = read.map_err(|e| {
+            protocol(format!(
+                "the heartbeat's read ended without its answer: {e}"
+            ))
+        })?;
+        let retained = match read {
             Ok(retained) => retained,
-            Err(e) if e.is_transient() => return Ok(()),
+            Err(e) if e.is_transient() => {
+                self.watchdog.answered(Some(e.to_string()));
+                return Ok(());
+            }
             Err(e) => {
+                // The source answered, with a refusal.
+                self.watchdog.answered(None);
                 let blind = if self.core.settings.max_wal_lag_bytes.is_some() {
                     "max_wal_lag_bytes isn't enforced"
                 } else {
@@ -902,6 +946,12 @@ impl<'c> Session<'c> {
             }
         };
         self.core.wal_lag_failing.succeeded();
+        self.watchdog.answered(
+            retained
+                .is_some_and(|r| !r.streamed)
+                .then(|| "no stream reads the slot".to_owned()),
+        );
+        let retained = retained.map(|r| r.bytes);
         self.core.update(|st| st.retained_bytes = retained);
         match (retained, self.core.settings.max_wal_lag_bytes) {
             (Some(lag), Some(limit)) if lag > limit => Err(WorkerError::WalLag { lag, limit }),
@@ -1815,13 +1865,11 @@ mod tests {
                 .collect()
         };
         let driver = async {
-            w.source.fail(
-                Method::RetainedBytes,
-                SourceError::Transient("reset".into()),
-            );
+            w.source
+                .fail(Method::Retained, SourceError::Transient("reset".into()));
             for _ in 0..2 {
                 w.source.fail(
-                    Method::RetainedBytes,
+                    Method::Retained,
                     SourceError::Permanent("permission denied".into()),
                 );
             }
@@ -1836,7 +1884,7 @@ mod tests {
             w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
             durable(&status, w.source.wal_end()).await;
             w.source.fail(
-                Method::RetainedBytes,
+                Method::Retained,
                 SourceError::Permanent("permission denied again".into()),
             );
             wait_until("a new streak warns", || blind().len() == 2).await;
@@ -1848,6 +1896,71 @@ mod tests {
         let (end, ()) = tokio::join!(s.run(), driver);
         assert!(matches!(end.unwrap(), End::Exit(Exit::Drained)));
         assert_eq!(w.ids("a"), [1, 2]);
+    }
+
+    /// A source that stops answering (a frozen server, DA-SRC-16): the stream is silent and the
+    /// heartbeat's reads time out, so the session ends as a transient source error and the
+    /// worker reconnects.
+    #[tokio::test]
+    async fn a_silent_stream_whose_source_doesn_t_answer_ends_the_session() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let p = pipeline("", "flush: { seconds: 0 }", "");
+        let (mut core, _control, _status) = w.core(&p, &["a"]);
+        core.settings.heartbeat = Duration::from_millis(5);
+        for _ in 0..10 {
+            w.source.fail(
+                Method::Retained,
+                SourceError::Transient("measure the slot's WAL timed out after 30s".into()),
+            );
+        }
+        let s = Session::open(&mut core).await.unwrap().unwrap();
+        let end = s.run().await.unwrap();
+        let End::Source(SourceError::Transient(why)) = end else {
+            panic!("{end:?}")
+        };
+        assert!(why.starts_with("the source isn't answering"), "{why}");
+        assert!(why.contains("timed out after 30s"), "{why}");
+    }
+
+    /// The server dropped the stream without the client hearing of it: the slot has no reader.
+    #[tokio::test]
+    async fn a_silent_stream_on_a_slot_no_stream_reads_ends_the_session() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let p = pipeline("", "flush: { seconds: 0 }", "");
+        let (mut core, _control, _status) = w.core(&p, &["a"]);
+        core.settings.heartbeat = Duration::from_millis(5);
+        let s = Session::open(&mut core).await.unwrap().unwrap();
+        w.source.set_retained(Some(0));
+        w.source.detach_stream();
+        let end = s.run().await.unwrap();
+        let End::Source(SourceError::Transient(why)) = end else {
+            panic!("{end:?}")
+        };
+        assert!(why.contains("no stream reads the slot"), "{why}");
+    }
+
+    /// A heartbeat read that never comes back holds up neither the stream nor a drain, and
+    /// counts against nothing: it may wait behind a chunk read on a shared connection.
+    #[tokio::test]
+    async fn a_stalled_heartbeat_read_holds_up_nothing() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let p = pipeline("", "flush: { seconds: 0 }", "");
+        let (mut core, control, status) = w.core(&p, &["a"]);
+        core.settings.heartbeat = Duration::from_millis(5);
+        w.source.stall_retained();
+        let s = Session::open(&mut core).await.unwrap().unwrap();
+        let driver = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+            durable(&status, w.source.wal_end()).await;
+            control.send(Command::Drain).await.unwrap();
+        };
+        let (end, ()) = tokio::join!(s.run(), driver);
+        assert!(matches!(end.unwrap(), End::Exit(Exit::Drained)));
+        assert_eq!(w.ids("a"), [1]);
     }
 
     /// The blind warning names what is blind: the bound when `max_wal_lag_bytes` is set, else the
@@ -1866,11 +1979,8 @@ mod tests {
             let p = pipeline("", "flush: { seconds: 0 }", postgres);
             let (mut core, _control, status) = w.core(&p, &["a"]);
             let mut s = Session::open(&mut core).await.unwrap().unwrap();
-            w.source.fail(
-                Method::RetainedBytes,
-                SourceError::Permanent("permission denied".into()),
-            );
-            s.wal_lag().await.unwrap();
+            s.wal_lag(Ok(Err(SourceError::Permanent("permission denied".into()))))
+                .unwrap();
             let warnings = status.borrow().warnings.clone();
             assert!(
                 matches!(&warnings[..], [m] if m.starts_with("the WAL-lag guard is blind") && m.ends_with(tail)),
