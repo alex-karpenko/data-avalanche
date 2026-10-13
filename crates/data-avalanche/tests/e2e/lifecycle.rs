@@ -108,13 +108,15 @@ async fn a_second_process_takes_over_after_the_first_dies() {
     let mut b = e.start_node("n2");
     b.ready().await;
     a.metric("data_avalanche_owned_pipelines 1").await;
-    tokio::time::sleep(Duration::from_secs(4)).await;
-    b.metric("data_avalanche_owned_pipelines 0").await;
+    // Past a lease duration (6 s) and a renewal interval (2 s) since n2 first saw the lease: n2
+    // takes over only a lease that stopped changing, and n1 renews it.
+    tokio::time::sleep(Duration::from_secs(10)).await;
     let lease = e.lease().await.expect("a lease").doc;
     assert_eq!(
         (lease.holder_node_id.as_str(), lease.owner_epoch),
         ("n1", 1)
     );
+    b.metric("data_avalanche_owned_pipelines 0").await;
     e.exec("INSERT INTO items VALUES (1, 'a')").await;
     e.converged("items").await;
 
