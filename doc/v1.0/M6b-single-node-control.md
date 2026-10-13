@@ -14603,9 +14603,9 @@ per task, against the `test-infra` services (PostgreSQL 18 and 14, RustFS, Azuri
 - [x] Workspace gates green (2026-10-13, at `390341c`; 936 workspace tests): `cargo fmt --all --check`; `cargo clippy --workspace --all-targets
       -- -D warnings`; the same with `-p data-avalanche --features e2e-hooks`; `cargo test
       --workspace`; the integration run (`DATA_AVALANCHE_IT=1`).
-- [ ] The slice-1 E2E suite green on PostgreSQL 18 + RustFS in PR CI.
-- [ ] `weekly.yml` green on PostgreSQL 14–17 with the E2E step (a manual dispatch on the branch,
-      or the first Monday run after the merge).
+- [x] The slice-1 E2E suite green on PostgreSQL 18 + RustFS in PR CI (PR #8, 2026-10-13: 26/26).
+- [x] `weekly.yml` green on PostgreSQL 14–17 with the E2E step (a manual dispatch on the branch,
+      or the first Monday run after the merge): the manual dispatch, 2026-10-13.
 - [x] The approved spec patches applied (config §9.4.3 and V-119; the System-Overview
       catalogue), 2026-10-08.
 - [x] The Tasks 21–23 spec patches applied (Data-Flow Phase 4; config §6.4, §9.2, §9.2.1),
@@ -14617,7 +14617,7 @@ per task, against the `test-infra` services (PostgreSQL 18 and 14, RustFS, Azuri
 - [x] Gap tracker at the exit: DA-X-12 and DA-SRC-16 closed by Tasks 21 and 22; DA-CLUS-14,
       DA-API-11, DA-OPS-7 and DA-SRC-20 recorded (§30, 2026-10-13).
 - [x] `.superpowers/sdd/M6a-pipeline-worker/` deleted (kept until M6 is finished).
-- [ ] The milestone PR opened against `main`; Oleksii merges.
+- [x] The milestone PR opened against `main` (PR #8, 2026-10-13); Oleksii merges.
 
 ## Deviations during execution
 
