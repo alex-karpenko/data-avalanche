@@ -7,8 +7,10 @@
 mod connect;
 mod connector;
 mod error;
+pub mod position;
 pub mod server;
 
 pub use connect::SESSION_SETUP;
 pub use connector::MySqlConnector;
+pub use position::{BinaryLog, Mode, Retention, bytes_after, purged};
 pub use server::{Flavour, Settings, check_settings, grants_replication, version_of};
