@@ -12,6 +12,8 @@ on `PATH`; it fetches DuckDB itself.
 | postgres-14…17 | postgres:14…17 | 55414…55417 | same | matrix |
 | postgres-tls | postgres:18, TLS required (`postgres-tls.sh`) | 55419 | avalanche / avalanche; `avalanche_cert` by client certificate | default |
 | mysql-84 | mysql:8.4 (GTID on) | 53384 | root / avalanche, db `avalanche` | default |
+| mysql-84-nogtid | mysql:8.4 (GTID off: `replication_type: binlog`; TLS off) | 53385 | same | default |
+| mysql-tls | mysql:8.4 (GTID on), TLS required (`mysql-tls.sh`) | 53386 | root / avalanche; `avalanche_cert` / `unused` with its client certificate | default |
 | mariadb-118 | mariadb:11.8 (`gtid_strict_mode=1`) | 53318 | root / avalanche | default |
 | mariadb-114, mariadb-1011 | mariadb:11.4, 10.11 | 53314, 53311 | root / avalanche | matrix |
 | rustfs (S3) | rustfs/rustfs:1.0.0 | 59000 | avalanche / avalanche-secret | default |
@@ -20,7 +22,9 @@ on `PATH`; it fetches DuckDB itself.
 Bucket / container `data-avalanche-test` is created by the `init` profile (`up.sh` runs it). Azurite keeps
 port 10000 because `object_store`'s emulator mode always targets `127.0.0.1:10000`.
 
-Added by a later milestone: `mysql-84-nogtid` (M7, file/position mode).
+`mysql-tls` writes its throwaway CA and client pair to `test-infra/.tls/mysql/` at each start; its
+server certificate names `localhost` only, so a `verify-full` connection to `127.0.0.1` fails by
+design.
 
 ## PostgreSQL
 
