@@ -31,11 +31,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use async_trait::async_trait;
 use data_avalanche_core::position::Lsn;
 use data_avalanche_core::{
-    CdcEvent, ChangeStream, Chunk, ChunkVisibility, ColumnSchema, ColumnValue, HaltReason,
-    InFlightTxn, KeysetCursor, Op, Preflight, Prepared, RescanReport, ResolvedTables, RetainedLog,
-    Row, SchemaChange, SchemaDelta, SchemaHint, SnapshotReason, SourceConnector, SourceError,
-    SourcePosition, SourceSeq, StartPlan, StreamItem, TableRef, TableSchema, TransactionBoundary,
-    XidSnapshot, identifier_values,
+    CdcEvent, ChangeStream, Checkpoint, Chunk, ChunkVisibility, ColumnSchema, ColumnValue,
+    HaltReason, InFlightTxn, KeysetCursor, Op, Preflight, Prepared, RescanReport, ResolvedTables,
+    RetainedLog, Row, SchemaChange, SchemaDelta, SchemaHint, SnapshotReason, SourceConnector,
+    SourceError, SourcePosition, SourceSeq, StartPlan, StreamItem, TableRef, TableSchema,
+    TransactionBoundary, XidSnapshot, identifier_values,
 };
 use tokio::sync::Notify;
 
@@ -861,13 +861,13 @@ impl SourceConnector for FakeSource {
 
     async fn prepare(
         &self,
-        checkpoint: Option<&SourcePosition>,
+        checkpoint: Option<&Checkpoint>,
         _tables: &[TableRef],
     ) -> Result<Prepared, SourceError> {
         self.take_fault(Method::Prepare)?;
         let mut db = self.db();
-        db.prepares.push(checkpoint.cloned());
-        let checkpoint = checkpoint.map(lsn);
+        db.prepares.push(checkpoint.map(|c| c.position.clone()));
+        let checkpoint = checkpoint.map(|c| lsn(&c.position));
         let reason = match (checkpoint, db.slot) {
             (None, None) => Some(SnapshotReason::FirstStart),
             (None, Some(_)) => {
@@ -885,6 +885,7 @@ impl SourceConnector for FakeSource {
                 plan: StartPlan::Resume,
                 added: std::mem::take(&mut db.added),
                 warnings: vec![],
+                server: None,
             },
             Some(reason) => {
                 db.slot = Some(db.wal_end);
@@ -896,6 +897,7 @@ impl SourceConnector for FakeSource {
                     },
                     added: vec![],
                     warnings: vec![],
+                    server: None,
                 }
             }
         })
@@ -1372,7 +1374,10 @@ mod tests {
         assert_eq!(chunk.rows, vec![row(1, "a"), row(2, "b")]);
         s.acknowledge(&b.commit_pos).await.unwrap();
         assert_eq!(src.slot(), Some(b.commit_pos.clone()));
-        let resumed = src.prepare(Some(&b.commit_pos), &[t()]).await.unwrap();
+        let resumed = src
+            .prepare(Some(&Checkpoint::from(b.commit_pos.clone())), &[t()])
+            .await
+            .unwrap();
         assert_eq!(resumed.plan, StartPlan::Resume);
     }
 
@@ -1507,7 +1512,10 @@ mod tests {
             s.next().await,
             Err(SourceError::PositionUnreachable { .. })
         ));
-        let again = src.prepare(Some(&from), &[t()]).await.unwrap();
+        let again = src
+            .prepare(Some(&Checkpoint::from(from.clone())), &[t()])
+            .await
+            .unwrap();
         assert!(matches!(
             again.plan,
             StartPlan::Snapshot {

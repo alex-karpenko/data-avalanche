@@ -47,9 +47,11 @@ pub use generation::{
     config_snapshot_key,
 };
 pub use lease::{Acquired, Holder, LeaseDoc, Leases, lease_key};
+// The position document's server is core's type (M7a): the source reports it, the state records it.
+pub use data_avalanche_core::ServerIdentity;
 pub use pipeline::{
     DesiredState, PIPELINE_STATE_KEY, POSITION_KEY, PipelineDocs, PipelineStateDoc, PositionDoc,
-    SLOT_KEY, ServerIdentity, SlotDoc,
+    SLOT_KEY, SlotDoc,
 };
 pub use snapshot::{
     CursorKey, JOBS_PREFIX, JobStatus, JobTable, SnapshotCursor, SnapshotJobDoc, SnapshotStatus,

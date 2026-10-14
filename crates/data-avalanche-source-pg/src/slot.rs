@@ -7,7 +7,8 @@ use std::collections::BTreeSet;
 use data_avalanche_config::{SlotManagement, SlotOnOrphan};
 use data_avalanche_core::position::Lsn;
 use data_avalanche_core::{
-    Prepared, RetainedLog, SnapshotReason, SourceError, SourcePosition, StartPlan, TableRef,
+    Checkpoint, Prepared, RetainedLog, SnapshotReason, SourceError, SourcePosition, StartPlan,
+    TableRef,
 };
 use tokio_postgres::Client;
 
@@ -400,10 +401,10 @@ impl PgConnector {
     /// rather than resuming over WAL the old publication didn't publish.
     pub async fn prepare(
         &self,
-        checkpoint: Option<&SourcePosition>,
+        checkpoint: Option<&Checkpoint>,
         tables: &[TableRef],
     ) -> Result<Prepared, SourceError> {
-        let checkpoint = checkpoint.map(lsn_of).transpose()?;
+        let checkpoint = checkpoint.map(|c| lsn_of(&c.position)).transpose()?;
         let client = self.conn.client().await?;
         let Reconciled {
             sql,
@@ -478,6 +479,7 @@ impl PgConnector {
             plan,
             added,
             warnings,
+            server: None,
         })
     }
 

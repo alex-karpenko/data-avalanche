@@ -4,7 +4,9 @@
 use std::time::Duration;
 
 use data_avalanche_core::position::Lsn;
-use data_avalanche_core::{SnapshotReason, SourceError, SourcePosition, StartPlan, TableRef};
+use data_avalanche_core::{
+    Checkpoint, SnapshotReason, SourceError, SourcePosition, StartPlan, TableRef,
+};
 use data_avalanche_testkit::require_it;
 use tokio_postgres::Client;
 
@@ -68,14 +70,20 @@ async fn first_start_then_resume_then_a_lost_slot() {
     assert_eq!(published(&a, &n).await, ["a", "b"]);
 
     // state present × slot present: resume.
-    let p = c.prepare(Some(&start), &tables).await.unwrap();
+    let p = c
+        .prepare(Some(&Checkpoint::from(start.clone())), &tables)
+        .await
+        .unwrap();
     assert_eq!(p.plan, StartPlan::Resume);
 
     // state present × slot absent: recreate, snapshot (D-15.3).
     a.execute("SELECT pg_drop_replication_slot($1)", &[&n.slot])
         .await
         .unwrap();
-    let p = c.prepare(Some(&start), &tables).await.unwrap();
+    let p = c
+        .prepare(Some(&Checkpoint::from(start.clone())), &tables)
+        .await
+        .unwrap();
     let again = from(&p.plan, SnapshotReason::PositionLost);
     assert!(confirmed(&a, &n).await.is_some(), "recreated");
 
@@ -89,7 +97,10 @@ async fn first_start_then_resume_then_a_lost_slot() {
     )
     .await
     .unwrap();
-    let p = c.prepare(Some(&again), &tables).await.unwrap();
+    let p = c
+        .prepare(Some(&Checkpoint::from(again.clone())), &tables)
+        .await
+        .unwrap();
     from(&p.plan, SnapshotReason::PositionLost);
     cleanup(&a, &n).await;
 }
@@ -157,7 +168,10 @@ async fn require_existing_never_creates() {
         .unwrap()
         .get(0);
     let start = SourcePosition::Pg(start.parse().unwrap());
-    let p = c.prepare(Some(&start), &tables).await.unwrap();
+    let p = c
+        .prepare(Some(&Checkpoint::from(start.clone())), &tables)
+        .await
+        .unwrap();
     assert_eq!(p.plan, StartPlan::Resume);
     assert_eq!(
         p.warnings,
@@ -174,7 +188,9 @@ async fn require_existing_never_creates() {
         .await
         .unwrap();
     permanent(
-        c.prepare(Some(&start), &tables).await.unwrap_err(),
+        c.prepare(Some(&Checkpoint::from(start.clone())), &tables)
+            .await
+            .unwrap_err(),
         "require_existing",
     );
     permanent(c.reset_position().await.unwrap_err(), "require_existing");
@@ -202,14 +218,19 @@ async fn the_publication_follows_the_table_set() {
 
     // A table joins and one leaves: resume; the joining table is reported for its snapshot.
     let p = c
-        .prepare(Some(&start), &[n.table("b"), n.table("c")])
+        .prepare(
+            Some(&Checkpoint::from(start.clone())),
+            &[n.table("b"), n.table("c")],
+        )
         .await
         .unwrap();
     assert_eq!(p.plan, StartPlan::Resume);
     assert_eq!(p.added, [n.table("c")]);
     assert_eq!(published(&a, &n).await, ["b", "c"]);
     let empty: [TableRef; 0] = [];
-    c.prepare(Some(&start), &empty).await.unwrap();
+    c.prepare(Some(&Checkpoint::from(start.clone())), &empty)
+        .await
+        .unwrap();
     assert!(published(&a, &n).await.is_empty());
     cleanup(&a, &n).await;
 }
@@ -237,7 +258,10 @@ async fn a_publication_change_blocked_by_a_lock_is_retried_whole() {
         .await
         .unwrap();
     let err = c
-        .prepare(Some(&start), &[n.table("a"), n.table("b")])
+        .prepare(
+            Some(&Checkpoint::from(start.clone())),
+            &[n.table("a"), n.table("b")],
+        )
         .await
         .unwrap_err();
     assert!(err.is_transient(), "{err}");
@@ -245,7 +269,10 @@ async fn a_publication_change_blocked_by_a_lock_is_retried_whole() {
     // Time for a change the server didn't cancel to commit.
     tokio::time::sleep(Duration::from_secs(2)).await;
     let p = c
-        .prepare(Some(&start), &[n.table("a"), n.table("b")])
+        .prepare(
+            Some(&Checkpoint::from(start.clone())),
+            &[n.table("a"), n.table("b")],
+        )
         .await
         .unwrap();
     assert_eq!(p.plan, StartPlan::Resume);
@@ -282,7 +309,10 @@ async fn a_repaired_publication_re_snapshots() {
     ))
     .await
     .unwrap();
-    let p = c.prepare(Some(&start), &tables).await.unwrap();
+    let p = c
+        .prepare(Some(&Checkpoint::from(start.clone())), &tables)
+        .await
+        .unwrap();
     let again = from(&p.plan, SnapshotReason::PositionLost);
     assert!(ops().await, "every operation published again");
     assert!(
@@ -300,7 +330,10 @@ async fn a_repaired_publication_re_snapshots() {
     a.batch_execute(&format!("DROP PUBLICATION {}", n.publication))
         .await
         .unwrap();
-    let p = c.prepare(Some(&again), &tables).await.unwrap();
+    let p = c
+        .prepare(Some(&Checkpoint::from(again.clone())), &tables)
+        .await
+        .unwrap();
     from(&p.plan, SnapshotReason::PositionLost);
     assert_eq!(published(&a, &n).await, ["a"]);
 
@@ -309,7 +342,7 @@ async fn a_repaired_publication_re_snapshots() {
         unreachable!()
     };
     let p = c
-        .prepare(Some(&SourcePosition::Pg(now)), &tables)
+        .prepare(Some(&Checkpoint::from(SourcePosition::Pg(now))), &tables)
         .await
         .unwrap();
     assert_eq!(p.plan, StartPlan::Resume);
@@ -332,7 +365,9 @@ async fn a_slot_of_another_plugin_is_refused() {
     let at = SourcePosition::Pg(at.parse().unwrap());
     let c = connector(&pipeline(&n, &["*"], "", ""));
     permanent(
-        c.prepare(Some(&at), &[n.table("a")]).await.unwrap_err(),
+        c.prepare(Some(&Checkpoint::from(at.clone())), &[n.table("a")])
+            .await
+            .unwrap_err(),
         "uses the test_decoding plugin, not pgoutput",
     );
     let adopt = connector(&pipeline(
@@ -390,7 +425,10 @@ async fn a_root_publication_of_tracked_partitions_is_refused() {
     let postgres = ", slot_management: require_existing, auto_cleanup: false";
     let c = connector(&pipeline(&n, &["*"], "", postgres));
     let e = c
-        .prepare(Some(&start), &[n.table("a"), n.table("events_2024")])
+        .prepare(
+            Some(&Checkpoint::from(start.clone())),
+            &[n.table("a"), n.table("events_2024")],
+        )
         .await
         .unwrap_err();
     permanent(
@@ -400,7 +438,10 @@ async fn a_root_publication_of_tracked_partitions_is_refused() {
             n.schema
         ),
     );
-    let p = c.prepare(Some(&start), &[n.table("a")]).await.unwrap();
+    let p = c
+        .prepare(Some(&Checkpoint::from(start.clone())), &[n.table("a")])
+        .await
+        .unwrap();
     assert_eq!(
         p.plan,
         StartPlan::Resume,
@@ -416,7 +457,10 @@ async fn a_root_publication_of_tracked_partitions_is_refused() {
     .unwrap();
     let c = connector(&pipeline(&n, &["*"], "", ""));
     let e = c
-        .prepare(Some(&start), &[n.table("events_2024")])
+        .prepare(
+            Some(&Checkpoint::from(start.clone())),
+            &[n.table("events_2024")],
+        )
         .await
         .unwrap_err();
     permanent(e, "publish_via_partition_root = false");

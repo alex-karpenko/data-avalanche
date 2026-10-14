@@ -6,7 +6,7 @@
 #[path = "pg/common.rs"]
 mod common;
 
-use data_avalanche_core::{SnapshotReason, StartPlan};
+use data_avalanche_core::{Checkpoint, SnapshotReason, StartPlan};
 use data_avalanche_testkit::require_it;
 
 use crate::common::{admin, cleanup, connector, fresh, pipeline};
@@ -66,7 +66,10 @@ async fn an_invalidated_slot_is_recreated() {
     let status = invalidate.unwrap();
     assert_eq!(status.as_deref(), Some("lost"));
 
-    let p = c.prepare(Some(&from), &tables).await.unwrap();
+    let p = c
+        .prepare(Some(&Checkpoint::from(from.clone())), &tables)
+        .await
+        .unwrap();
     let StartPlan::Snapshot { reason, .. } = p.plan else {
         panic!("a lost slot snapshots: {:?}", p.plan)
     };

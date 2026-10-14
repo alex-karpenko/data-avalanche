@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use data_avalanche_config::{Pipeline, SnapshotMode};
 use data_avalanche_core::{
-    HaltReason, SchemaHint, Sink, SinkError, SinkKind, SnapshotReason, SourceConnector,
+    Checkpoint, HaltReason, SchemaHint, Sink, SinkError, SinkKind, SnapshotReason, SourceConnector,
     SourceError, SourcePosition, StartPlan, TableRef, TableSchema, TableSpec,
 };
 use data_avalanche_state::{
@@ -425,11 +425,12 @@ pub(crate) async fn start(
                 core.docs.save_slot(&SlotDoc::intent(name)).await?;
             }
             let refs: Vec<TableRef> = resolved_tables.keys().cloned().collect();
+            let durable = checkpoint.clone().map(Checkpoint::from);
             // `prepare` may create, recreate or advance the slot.
             let prepared = write_retry(
                 &tuning,
                 || core.may_write(),
-                || source.prepare(checkpoint.as_ref(), &refs),
+                || source.prepare(durable.as_ref(), &refs),
             )
             .await?;
             warnings.extend(prepared.warnings);

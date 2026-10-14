@@ -7,9 +7,9 @@ use data_avalanche_config::{
     Pipeline, Postgres, SourceType, check_table_set, check_unbounded_numeric,
 };
 use data_avalanche_core::{
-    ChangeStream, Chunk, HaltReason, InFlightTxn, KeysetCursor, Preflight, Prepared, RescanReport,
-    ResolvedTables, RetainedLog, Row, SchemaDelta, SchemaHint, SourceConnector, SourceError,
-    SourcePosition, TableRef, TableSchema,
+    ChangeStream, Checkpoint, Chunk, HaltReason, InFlightTxn, KeysetCursor, Preflight, Prepared,
+    RescanReport, ResolvedTables, RetainedLog, Row, SchemaDelta, SchemaHint, SourceConnector,
+    SourceError, SourcePosition, TableRef, TableSchema,
 };
 use tokio::sync::Mutex;
 
@@ -264,7 +264,7 @@ impl SourceConnector for PgConnector {
 
     async fn prepare(
         &self,
-        checkpoint: Option<&SourcePosition>,
+        checkpoint: Option<&Checkpoint>,
         tables: &[TableRef],
     ) -> Result<Prepared, SourceError> {
         PgConnector::prepare(self, checkpoint, tables).await

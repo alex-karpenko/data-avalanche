@@ -38,9 +38,10 @@ pub use sink::{
     WriteMode,
 };
 pub use source::{
-    ChangeStream, Chunk, ChunkVisibility, InFlightTxn, KeysetCursor, Preflight, Prepared,
-    RescanReport, ResolvedTables, RetainedLog, SchemaHint, SnapshotReason, SourceConnector,
-    SourceError, StartPlan, StreamItem, XidSnapshot, identifier_values,
+    ChangeStream, Checkpoint, Chunk, ChunkVisibility, InFlightTxn, KeysetCursor, Preflight,
+    Prepared, RescanReport, ResolvedTables, RetainedLog, SchemaHint, ServerIdentity,
+    SnapshotReason, SourceConnector, SourceError, StartPlan, StreamItem, XidSnapshot,
+    identifier_values,
 };
 pub use table::{
     INTERNAL_COLUMN_PREFIX, LINEAGE_COLUMNS, TableRef, first_reserved_collision, is_reserved_column,
