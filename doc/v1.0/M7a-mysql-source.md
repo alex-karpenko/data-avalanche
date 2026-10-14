@@ -14732,4 +14732,22 @@ git commit -m "ci: the MySQL source on four targets per change, MariaDB 11.4 and
 
 ## Deviations during execution
 
-None yet.
+- **Task 2, placement (2026-10-14).** The V-120 loop in `rules/identity.rs` landed after the
+  V-059 loop instead of before it, and the test helper `two_mysql` after `two_pipelines`. A
+  report sorts its errors and warnings, so the output is the same; no later task touches either
+  file. Kept as committed.
+- **Task 4, the review fixes (2026-10-14, approved by Oleksii).** The task review found two
+  edge cases in the preflight:
+  - Any server error from the binlog status statement was read as a missing privilege, so a
+    server shutting down (1053) or a lock wait halted the pipeline with a "grant …" refusal
+    instead of a retry. Now only an access-denied error (1044, 1142, 1227, `server::access_denied`)
+    is the refusal; any other goes through `error::mysql` like every statement.
+  - `grants_replication` matched `REPLICATION SLAVE` as a substring, so MariaDB's separate
+    `REPLICATION SLAVE ADMIN` (10.5+), which can't dump the binlog, passed. Privilege names are
+    now compared whole.
+
+  Each has a unit test (`only_a_privilege_error_refuses_the_status_statement`, two new
+  assertions in `replication_comes_from_a_global_grant`); the preflight ITs pass on the four
+  targets (the refusal case proves the servers answer 1227). Folded into Task 4's commit. No
+  later task's code changes: they touch only these items' `use` lines. The review's minor notes
+  are parked in the SDD ledger.
