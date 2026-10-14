@@ -44,6 +44,52 @@ services:
       interval: 2s
       retries: 60
 
+  # S-MY10 (file/position mode): MySQL 8.4 with GTID off, the server `replication_type: binlog`
+  # exists for.
+  mysql-nogtid:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: probe
+      MYSQL_DATABASE: probe
+    command: >
+      --server-id=1 --log-bin=mysql-bin --binlog-format=ROW --binlog-row-image=FULL
+      --binlog-row-metadata=FULL --gtid-mode=OFF
+    ports: ["53308:3306"]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-pprobe"]
+      interval: 2s
+      retries: 60
+
+  # S-MY10 / S-MY11 on the MariaDB version v1 tests on every change (roadmap §5.2).
+  mariadb-118:
+    image: mariadb:11.8
+    environment:
+      MARIADB_ROOT_PASSWORD: probe
+      MARIADB_DATABASE: probe
+    command: >
+      --server-id=1 --log-bin=mariadb-bin --binlog-format=ROW --binlog-row-image=FULL
+      --binlog-row-metadata=FULL --gtid-strict-mode=1
+    ports: ["53309:3306"]
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 2s
+      retries: 60
+
+  # The oldest MariaDB the weekly matrix runs (roadmap §5.2).
+  mariadb-1011:
+    image: mariadb:10.11
+    environment:
+      MARIADB_ROOT_PASSWORD: probe
+      MARIADB_DATABASE: probe
+    command: >
+      --server-id=1 --log-bin=mariadb-bin --binlog-format=ROW --binlog-row-image=FULL
+      --binlog-row-metadata=FULL --gtid-strict-mode=1
+    ports: ["53310:3306"]
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 2s
+      retries: 60
+
   # TLS-enabled PostgreSQL for S-PG8: a throwaway CA signs a server cert (CN/SAN localhost,
   # 127.0.0.1) at start — rustls rejects a self-signed cert used as its own CA (CaUsedAsEndEntity).
   # The CA is exported to ./.tls/ca.crt for the client's verify-full check.

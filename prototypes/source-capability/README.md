@@ -8,6 +8,8 @@ write a protocol layer), so these run **before** implementation planning.
 
 Status: **run 2026-09-26 — all gates green on the chosen crates.** PostgreSQL 17: S-PG0…S-PG8 9/9.
 MySQL 8.4 + MariaDB 11.4: candidate (b) `mysql_async` 10/10; candidate (a) fails TLS and MariaDB GTID.
+**M7 planning, 2026-10-14:** positions and the DA-SNAP-10 commit gap (S-MY10, S-MY11) on MySQL 8.4
+(GTID on and off) and MariaDB 10.11 / 11.4 / 11.8: 11/11.
 
 ## Verdict
 
@@ -93,6 +95,54 @@ MariaDB session variables, and per-transaction GTIDs decode exactly (last = `gti
   The process must call `CryptoProvider::install_default()` once at startup (deltalake / object_store
   use rustls too). Found only when both features were built together.
 
+### Findings from the M7 position probes (2026-10-14, S-MY10, S-MY11)
+
+- **F-MY-status — the watermark statement differs.** MySQL 8.4 accepts only `SHOW BINARY LOG
+  STATUS`. MariaDB 10.11 and 11.4 accept only `SHOW BINLOG STATUS` (11.8 accepts both;
+  `SHOW MASTER STATUS` works on all three). Identity: MySQL `@@server_uuid`; MariaDB has no
+  `server_uuid` (error 1193) and `server_uid` changes on restart, so its identity is `@@server_id`
+  alone (every probe server has id 1, so that identity is weak). Flavour: `version()` contains
+  `MariaDB`.
+- **F-MY-dumpstart — what a file/position dump sends first.** A fake Rotate (`log_pos` 0,
+  `next_pos` = the start) and the resent format description (`log_pos` 0); neither is a change. On
+  MariaDB the fake Rotate's name carries the 4 CRC bytes (`mysql_common` parses it before it knows
+  the checksum): strip them. Resuming at (file, end position of an XID) is exact on all five
+  servers, across rotation and restart. After a restart MySQL's old file has no STOP event,
+  MariaDB's has one (type 3).
+- **F-MY-logpos — the header position is not always set.** `log_pos` is 0 for the events inside a
+  MySQL compressed transaction payload (its XID included; the payload event carries the position),
+  and for the Map/Rows events inside a MariaDB 11.4+ transaction (10.11 sets every event). A
+  multi-row event has one position for all its rows. So the order key is computed: the header
+  position where set, otherwise the last set one plus the sizes of the events since; a payload's
+  inner events take the payload's. Measured: it equals the header wherever the header is set, and
+  it is monotonic (MariaDB with `@mariadb_slave_capability=4` omits Annotate_rows events, so the
+  computed key falls short of the next set one, still monotonic). Taking the header as is would put
+  a compressed transaction's rows at offset 0, before earlier changes.
+- **F-MY-purged — a purged start position.** File/position: error 1236 "Could not find first log
+  file name in binary log index file", on the first read (the dump opens lazily). GTID: MySQL 1236
+  "Cannot replicate because the source purged required binary logs…" (`@@gtid_purged` shows it);
+  MariaDB 1236 "Could not find GTID state requested by slave in any binlog files…"
+  (`BINLOG_GTID_POS(<first file>, 4)` shows it). MySQL also uses 1236 for the same-replica-id kick
+  below, so a purge is told by a pre-check (`SHOW BINARY LOGS`, `@@gtid_purged`,
+  `BINLOG_GTID_POS`) plus the message, never by the code alone. MariaDB defers a `PURGE` until its
+  binlog checkpoint ("may be needed for crash recovery"): the probe retries for up to 10 s.
+- **F-MY-heartbeat-pos** — heartbeats are type 27 (v1) on every server: the header `log_pos` is the
+  current position and the body the file name, a keep-alive position in file/position mode.
+  `mysql_common` has no heartbeat variant (raw type 27) and no `HEARTBEAT_V2` (type 41).
+- **F-MY-replica-id — one dump per replica id.** A second dump under the same replica `server_id`
+  ends the first (MySQL 1236 "A replica with the same server_uuid/server_id…", MariaDB 4052), so
+  each pipeline registers its own id (`source.mysql.server_id`, V-120).
+- **F-MY-snap10 — a commit the binlog delivers before it is visible (DA-SNAP-10).** With semi-sync
+  AFTER_SYNC and the replica ack stalled 6 s (MySQL 8.4, MariaDB 10.11 and 11.8): the stream
+  delivers the transaction in ~5 ms, a plain read misses it for the 6 s, and the status position
+  moves past it. MySQL's `gtid_executed` excludes it, MariaDB's `gtid_binlog_pos` includes it. A
+  `LOCK IN SHARE MODE` read in a READ COMMITTED transaction waits the ~6 s, then sees it (MariaDB
+  11.8 rejects `FOR SHARE`). MariaDB's default wait point is AFTER_COMMIT, which has no gap. This is
+  why MySQL snapshot chunks read with `LOCK IN SHARE MODE` (`Data-Flow.md` Phase 1).
+- **F-MY-payload-order** — `mysql_async` yields a payload event, then its inner events (decompressed
+  by `danger_decompress`, empty on error: F-MY-payload). The guard checks the payload before its
+  inner events are used.
+
 ## Gates
 
 Pass criteria are what the CDC design needs (`Data-Flow.md` Phase 2a/2b, `Type_Mapping.md`,
@@ -127,13 +177,34 @@ Pass criteria are what the CDC design needs (`Data-Flow.md` Phase 2a/2b, `Type_M
 | S-MY8 | TLS | a `REQUIRE SSL` account streams | (a) ❌ no TLS (access denied) · (b) ✅ TLS 1.3 |
 | S-MY9 | MariaDB 11.4 | MariaDB GTID (`domain-server-seq`) positioning + row events — **decides DA-SRC-8** | (a) ❌ GTID (file/pos only) · (b) ✅ GTID resume + per-txn GTIDs |
 
+### MySQL / MariaDB positions (M7 planning, 2026-10-14) — `mysql_async` only
+
+`tests/probe_mysql_position.rs`, run on MySQL 8.4 with GTID on and off, and MariaDB 10.11, 11.4 and
+11.8: 11/11 green. The findings are under "Findings from the M7 position probes" below.
+
+| Gate | What | Pass | Status |
+|---|---|---|---|
+| S-MY10a | Watermark, identity, flavour | the status statement each server accepts; a stable server identity; flavour from `version()` | ✅ (F-MY-status) |
+| S-MY10b | File/position resume | resume at (file, end position of an XID) → no loss, no duplicate | ✅ all five |
+| S-MY10c | Rotation | resume across `FLUSH BINARY LOGS`; the Rotate events say where | ✅ |
+| S-MY10d | Server restart | identity unchanged; resume at the old position reaches the new file | ✅ |
+| S-MY10e | Purged file | a position in a purged file fails, and how | ✅ error 1236 on the first read (F-MY-purged) |
+| S-MY10f | Positions inside a transaction | an order key per row that is strictly monotonic, compressed payloads included | ✅ computed (F-MY-logpos) |
+| S-MY10g | Heartbeats | the heartbeat carries the current file and position | ✅ |
+| S-MY10h | Two dumps under one replica id | what happens to the first | ✅ the second ends the first (F-MY-replica-id) |
+| S-MY10i | Order key in GTID dumps | the computed key stays monotonic when the dump skips transactions | ✅ |
+| S-MY10k | GTID position purged | the GTID dump fails, and how | ✅ error 1236 (F-MY-purged) |
+| S-MY11 | A commit delivered before it is visible (DA-SNAP-10) | semi-sync AFTER_SYNC stalled 6 s: what the stream, a plain read and a locking read see | ✅ measured (F-MY-snap10) |
+
 ## Running
 
 ```bash
-docker compose up -d --wait            # postgres:17 :55432, mysql:8.4 :53306, mariadb:11.4 :53307
+docker compose up -d --wait            # postgres:17 :55432, mysql:8.4 :53306, mariadb:11.4 :53307,
+                                       # mysql:8.4 GTID off :53308, mariadb:11.8 :53309, mariadb:10.11 :53310
 cargo test                                                                   # default: no deps, instant
 SRC_PROBE=1 cargo test --features pg    --test probe_pg    -- --nocapture --test-threads=1
 SRC_PROBE=1 cargo test --features mysql --test probe_mysql -- --nocapture --test-threads=1
+SRC_PROBE=1 cargo test --features mysql --test probe_mysql_position -- --nocapture --test-threads=1
 docker compose down -v
 ```
 
