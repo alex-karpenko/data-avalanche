@@ -1114,3 +1114,120 @@ async fn s_my10k_gtid_purged() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// S-MY11b — what the DA-SNAP-10 locking chunk read costs: the privilege it needs, how long it
+/// waits for an open writer of its rows, what bounds that wait, and whom it blocks.
+#[tokio::test]
+async fn s_my11b_locking_read_cost() -> anyhow::Result<()> {
+    if !enabled() {
+        println!("S-MY11b skipped: set SRC_PROBE=1");
+        return Ok(());
+    }
+    const CHUNK: &str =
+        "SELECT id, v FROM my11b WHERE id > 0 ORDER BY id LIMIT 2 LOCK IN SHARE MODE";
+    for s in [MYSQL, MARIADB_1011, MARIADB_118] {
+        let mut c = conn(s).await?;
+        fresh_table(&mut c, "my11b").await?;
+        c.query_drop("INSERT INTO my11b VALUES (1, 1), (2, 2), (3, 3)")
+            .await?;
+        // A replication user with no write privilege at all.
+        c.query_drop("DROP USER IF EXISTS repl_ro").await?;
+        c.query_drop("CREATE USER repl_ro IDENTIFIED BY 'ro'")
+            .await?;
+        c.query_drop("GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO repl_ro")
+            .await?;
+        let ro_url = s.url.replace("root:probe", "repl_ro:ro");
+        let reader = || async {
+            let mut r = mysql_async::Conn::from_url(ro_url.as_str()).await?;
+            r.query_drop("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                .await?;
+            anyhow::Ok(r)
+        };
+
+        // 1. The privilege: SELECT is enough.
+        let mut r = reader().await?;
+        r.query_drop("START TRANSACTION").await?;
+        let rows: Vec<(i64, i64)> = r.query(CHUNK).await?;
+        r.query_drop("COMMIT").await?;
+        assert_eq!(rows, [(1, 1), (2, 2)], "{}: SELECT-only user", s.name);
+
+        // 2. An open writer of a chunk row: the read waits for its commit, then sees its value.
+        let mut w = conn(s).await?;
+        w.query_drop("START TRANSACTION").await?;
+        w.query_drop("UPDATE my11b SET v = 20 WHERE id = 2").await?;
+        let t0 = Instant::now();
+        let read = tokio::spawn(async move {
+            let mut r = r;
+            r.query_drop("START TRANSACTION").await?;
+            let rows: Vec<(i64, i64)> = r.query(CHUNK).await?;
+            r.query_drop("COMMIT").await?;
+            anyhow::Ok((rows, t0.elapsed()))
+        });
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        w.query_drop("COMMIT").await?;
+        let (seen, waited) = read.await??;
+        assert_eq!(
+            seen,
+            [(1, 1), (2, 20)],
+            "{}: waits, then sees the commit",
+            s.name
+        );
+        assert!(
+            waited >= Duration::from_secs(2),
+            "{}: waited {waited:?}",
+            s.name
+        );
+
+        // 3. The wait is bounded by innodb_lock_wait_timeout: error 1205.
+        w.query_drop("START TRANSACTION").await?;
+        w.query_drop("UPDATE my11b SET v = 21 WHERE id = 2").await?;
+        let mut r = reader().await?;
+        r.query_drop("SET SESSION innodb_lock_wait_timeout = 1")
+            .await?;
+        r.query_drop("START TRANSACTION").await?;
+        let t1 = Instant::now();
+        let timed_out = r.query::<(i64, i64), _>(CHUNK).await;
+        let after = t1.elapsed();
+        r.query_drop("ROLLBACK").await?;
+        w.query_drop("COMMIT").await?;
+        let code = match &timed_out {
+            Err(mysql_async::Error::Server(e)) => e.code,
+            other => anyhow::bail!("{}: expected a lock wait timeout, got {other:?}", s.name),
+        };
+        assert_eq!(code, 1205, "{}: lock wait timeout", s.name);
+
+        // 4. Whom a chunk read blocks while its transaction is open: only writers of its rows
+        //    (READ COMMITTED takes no gap locks).
+        r.query_drop("START TRANSACTION").await?;
+        let _held: Vec<(i64, i64)> = r.query(CHUNK).await?;
+        let mut o = conn(s).await?;
+        o.query_drop("SET SESSION innodb_lock_wait_timeout = 1")
+            .await?;
+        let insert = o.query_drop("INSERT INTO my11b VALUES (10, 10)").await;
+        let outside = o.query_drop("UPDATE my11b SET v = 30 WHERE id = 3").await;
+        let inside = o.query_drop("UPDATE my11b SET v = 11 WHERE id = 1").await;
+        r.query_drop("COMMIT").await?;
+        c.query_drop("DROP USER repl_ro").await?;
+        println!(
+            "S-MY11b {}: SELECT-only user reads {rows:?}; an open writer of row 2 held it {waited:?}, then the read saw {seen:?}; \
+             innodb_lock_wait_timeout=1 ended the wait after {after:?} with {code}; while a chunk transaction holds rows 1-2: \
+             insert of id 10 {insert:?}, update of id 3 {outside:?}, update of id 1 {}",
+            s.name,
+            match &inside {
+                Err(mysql_async::Error::Server(e)) => format!("error {}", e.code),
+                other => format!("{other:?}"),
+            }
+        );
+        assert!(
+            insert.is_ok() && outside.is_ok(),
+            "{}: rows outside the chunk aren't blocked",
+            s.name
+        );
+        assert!(
+            matches!(&inside, Err(mysql_async::Error::Server(e)) if e.code == 1205),
+            "{}: a writer of a chunk row waits for the chunk transaction",
+            s.name
+        );
+    }
+    Ok(())
+}

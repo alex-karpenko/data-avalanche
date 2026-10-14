@@ -9,7 +9,8 @@ write a protocol layer), so these run **before** implementation planning.
 Status: **run 2026-09-26 — all gates green on the chosen crates.** PostgreSQL 17: S-PG0…S-PG8 9/9.
 MySQL 8.4 + MariaDB 11.4: candidate (b) `mysql_async` 10/10; candidate (a) fails TLS and MariaDB GTID.
 **M7 planning, 2026-10-14:** positions and the DA-SNAP-10 commit gap (S-MY10, S-MY11) on MySQL 8.4
-(GTID on and off) and MariaDB 10.11 / 11.4 / 11.8: 11/11.
+(GTID on and off) and MariaDB 10.11 / 11.4 / 11.8, and the cost of the locking chunk read
+(S-MY11b): 12/12.
 
 ## Verdict
 
@@ -139,6 +140,13 @@ MariaDB session variables, and per-transaction GTIDs decode exactly (last = `gti
   `LOCK IN SHARE MODE` read in a READ COMMITTED transaction waits the ~6 s, then sees it (MariaDB
   11.8 rejects `FOR SHARE`). MariaDB's default wait point is AFTER_COMMIT, which has no gap. This is
   why MySQL snapshot chunks read with `LOCK IN SHARE MODE` (`Data-Flow.md` Phase 1).
+- **F-MY-lockread — what the locking chunk read costs** (S-MY11b, MySQL 8.4, MariaDB 10.11 and
+  11.8). A user with `SELECT`, `REPLICATION SLAVE` and `REPLICATION CLIENT` only can run it. It
+  waits for any open writer of the rows it reads, not only a stalled semi-sync commit, then sees
+  that writer's committed value; `innodb_lock_wait_timeout` (default 50 s) bounds the wait with
+  error 1205, after which the chunk is read again. While the chunk's transaction is open, a writer
+  of its rows waits, while inserts and writers of other rows don't (READ COMMITTED takes no gap
+  locks). So the read is kept to one statement and its transaction committed at once.
 - **F-MY-payload-order** — `mysql_async` yields a payload event, then its inner events (decompressed
   by `danger_decompress`, empty on error: F-MY-payload). The guard checks the payload before its
   inner events are used.
@@ -180,7 +188,7 @@ Pass criteria are what the CDC design needs (`Data-Flow.md` Phase 2a/2b, `Type_M
 ### MySQL / MariaDB positions (M7 planning, 2026-10-14) — `mysql_async` only
 
 `tests/probe_mysql_position.rs`, run on MySQL 8.4 with GTID on and off, and MariaDB 10.11, 11.4 and
-11.8: 11/11 green. The findings are under "Findings from the M7 position probes" below.
+11.8: 12/12 green. The findings are under "Findings from the M7 position probes" below.
 
 | Gate | What | Pass | Status |
 |---|---|---|---|
@@ -195,6 +203,7 @@ Pass criteria are what the CDC design needs (`Data-Flow.md` Phase 2a/2b, `Type_M
 | S-MY10i | Order key in GTID dumps | the computed key stays monotonic when the dump skips transactions | ✅ |
 | S-MY10k | GTID position purged | the GTID dump fails, and how | ✅ error 1236 (F-MY-purged) |
 | S-MY11 | A commit delivered before it is visible (DA-SNAP-10) | semi-sync AFTER_SYNC stalled 6 s: what the stream, a plain read and a locking read see | ✅ measured (F-MY-snap10) |
+| S-MY11b | The locking chunk read's cost | privilege, wait for an open writer of its rows, what bounds the wait, whom it blocks | ✅ measured (F-MY-lockread) |
 
 ## Running
 
