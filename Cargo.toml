@@ -25,6 +25,7 @@ data-avalanche-state = { path = "crates/data-avalanche-state" }
 data-avalanche-pipeline = { path = "crates/data-avalanche-pipeline" }
 data-avalanche-sink-delta = { path = "crates/data-avalanche-sink-delta" }
 data-avalanche-source-pg = { path = "crates/data-avalanche-source-pg" }
+data-avalanche-source-mysql = { path = "crates/data-avalanche-source-mysql" }
 data-avalanche-telemetry = { path = "crates/data-avalanche-telemetry" }
 data-avalanche-cluster = { path = "crates/data-avalanche-cluster" }
 thiserror = "2"
