@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-07
+updated: 2026-10-14
 domain: Architecture
 tags: [architecture, schema-evolution, ddl, cdc, postgresql, mysql, iceberg, delta-lake, multi-sink, arrow]
 status: design reviewed & approved — unified trigger→augment→diff model
@@ -307,7 +307,9 @@ the change's stream position via §8.
 | Change of the identifier (the primary key, or the `tables.primary_key` columns), or a `REPLICA IDENTITY` that no longer covers it | **Unsafe** | — | — | halt table; operator re-snapshot |
 | Another `REPLICA IDENTITY` or unique-key change (e.g. `DEFAULT` → `FULL` over the same key) | **Ignorable** | none | none | none: before-images carry more columns; keying is unchanged (Q-M5-17) |
 | `ADD COLUMN` / `RENAME COLUMN` to a **reserved lineage name** (`_op`, `_ts`, `_lsn`, `_seq`, `_source_db`, `_pipeline`, `__data_avalanche_*`; case-insensitive) | **Unsafe** | — | — | halt table `RESERVED_COLUMN_COLLISION` (config §5) |
-| `DROP TABLE` (tracked) | **Unsafe** | — (target kept) | — (target kept) | halt table `TABLE_DROPPED`; the target is never dropped. A re-created table of the same name (new OID) does **not** auto-resume; it needs an operator re-snapshot. Detection — PG: channel B within a stream session (the table's name on another OID, or its OID under another name; a table renamed away halts the same way), channel D / A (§2.1); MySQL: channel B |
+| `DROP TABLE` (tracked) | **Unsafe** | — (target kept) | — (target kept) | halt table `TABLE_DROPPED`; the target is never dropped. A re-created table of the same name (new OID) does **not** auto-resume; it needs an operator re-snapshot. Detection — PG: channel B within a stream session (the table's name on another OID, or its OID under another name; a table renamed away halts the same way), channel D / A (§2.1); MySQL: channel B, where a table renamed away halts the same way, except at an online-migration cut-over (next row) |
+| MySQL online-migration **cut-over swap**: one `RENAME TABLE t TO <old>, <shadow> TO t` statement, where `<shadow>` is an untracked table of the same database named as gh-ost (`_t_gho`) or pt-online-schema-change (`_t_new`) names it, after one or more leading `_` | **Safe** if every column delta is | per column delta (rows above) | per column delta (rows above) | the stream follows the table under its name: the shadow's columns are compared with `t`'s as a whole table (a rename isn't provable), and each delta is classified by the rows above. Any other rename of a tracked table away (a two-statement cut-over, another shadow name) halts `TABLE_DROPPED` |
+| MySQL partition or tablespace operation that changes rows without row events (`DROP`, `TRUNCATE`, `EXCHANGE`, `IMPORT`, `DISCARD` or `CONVERT` of a `PARTITION`, `TABLESPACE` or `TABLE`) on a tracked table | **Unsafe** | — | — | halt table `UNSAFE_DDL`; operator re-snapshot. The binlog carries the statement only, so the target would diverge silently |
 | MySQL `ENUM`/`SET` **add** values (append-only) | Ignorable\*\* | none | none | decoded value set widens; verify mapping (G-18) |
 | MySQL `ENUM`/`SET` reorder/remove values | **Unsafe** | — | — | halt (changes decoded string meaning) |
 | Index/comment/storage-params/`AUTO_INCREMENT`/charset w/ same logical type | **Ignorable** | none | none | none |

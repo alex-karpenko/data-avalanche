@@ -698,7 +698,7 @@ source:
 | `tinyint1_detection` | enum `information_schema`\|`none` | no | `information_schema` | PR | Source of the `TINYINT(1)` display-width signal. `none` disables the detection (all `TINYINT` treated as integer); `information_schema` uses the catalog query (always available via channel C). |
 | `binlog_purge_action` | enum `error`\|`re_snapshot` | no | `error` | R | Resume position purged on the server (G-26). `error`: halt with an error (operator decides). `re_snapshot`: automatic recovery via incremental re-snapshot. GTID `replication_type` remains recommended. |
 | `server_id` | integer | no | derived from `id` | PR | The replica server id the binlog dump registers with. The source server ends any other dump registered under the same id (measured, S-MY10), so each pipeline needs its own (V-120). Default: derived from the pipeline `id` — the first four bytes of its BLAKE3 hash, little-endian, with the top bit set (2147483648…4294967295, away from the small ids replicas usually take). Set it when that range collides with the server's own replicas. |
-| `heartbeat` | Duration | no | `60s` | R | The binlog heartbeat period (`@master_heartbeat_period`): an idle server sends a heartbeat this often (V-121). Also paces the stream watchdog, as `postgres.heartbeat` does: a stream silent for 3 heartbeats while the heartbeat's checks fail or find no dump of this pipeline's `server_id` on the server is reconnected (DA-SRC-16). |
+| `heartbeat` | Duration | no | `60s` | R | The binlog heartbeat period (`@master_heartbeat_period`): an idle server sends a heartbeat this often (V-121). Also paces the stream watchdog, as `postgres.heartbeat` does: a stream silent for 3 heartbeats while the heartbeat's checks fail or find no binlog dump of the stream's connection on the server (its connection id in `information_schema.PROCESSLIST`, which a user without `PROCESS` sees for its own connections) is reconnected (DA-SRC-16). |
 
 ### 9.3 `tables`
 
@@ -1614,6 +1614,9 @@ Every deviation, so nothing is silent:
     replica id, derived from the pipeline `id` by default; unique per source server, **V-120**;
     not in `defaults`, V-060) and `source.mysql.heartbeat` (the binlog heartbeat period and the
     stream watchdog's pace, **V-121**) (§9.2.2, §13.3, §13.7).
+26. **M7a planning (2026-10-14, D-M7a.21)** — §9.2.2 `heartbeat`: the watchdog finds the stream's
+    binlog dump by its connection id in `information_schema.PROCESSLIST` (visible to a user
+    without `PROCESS`), not by `server_id`.
 
 None of these change the **decided** catalog-auth schema (hive Thrift `none/ldap/kerberos`;
 rest HTTP `none/bearer/oauth2/sigv4`) — those are reproduced verbatim from
