@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-08
+updated: 2026-10-14
 domain: Architecture
 tags: [v1, implementation-plan, roadmap, milestones, workspace, crates, interfaces, test-strategy, ci, risks]
 sources: []
@@ -131,8 +131,9 @@ Rules:
 | Arrow | `arrow` / `parquet` | `59` (as resolved by deltalake) | P9 |
 | PG replication transport | `pgwire-replication` (`default-features = false`, features `tls-rustls`, `scram`, `md5`) | `=0.4.1` | S-PG0–8, re-run as M5's regression tests |
 | PG SQL (catalog, chunks) | `tokio-postgres` + `tokio-postgres-rustls` (trust roots `webpki-roots` 1) | `0.7` / `0.14` | S-PG probes; M5's integration suite |
-| MySQL binlog + SQL | `mysql_async` / `mysql_common` | `=0.37.1` / `=0.37.3` | S-MY0–9 |
-| DDL classifier | `sqlparser` | latest 0.x, pinned in M7 | MySQL_DDL_Classifier §5 |
+| MySQL binlog + SQL | `mysql_async` (`default-features = false`, features `default-rustls`, `binlog`) / `mysql_common` (dev, building events in tests) | `=0.37.1` / `=0.37.3` | S-MY0–11b; M7a's integration suite |
+| MariaDB compressed events | `flate2` (already in the lockfile through `mysql_common`) | `1` | Q-M7a-5; M7a Task 6 |
+| DDL classifier | `sqlparser` (`default-features = false`, features `std`: no `recursive-protection`, which builds C) | `=0.62.0` | MySQL_DDL_Classifier §5; M7a Task 11 |
 | YAML 1.2 (serde) | `serde-saphyr` (`deserialize` only) | `=1.3.0` | Verified in M1 planning (2026-09-27): strict booleans, duplicate-key errors, `Spanned` locations, unknown-key errors with location. One trap: `${…}` inside a flow collection must be quoted (M1 Review Focus 1). R-9 closed |
 | Membership | `memberlist` `0.8.5` (fallback `foca` `2.0`) | pinned in M8 | **unprobed** — M8 opens with a probe gate |
 | HTTP API | `axum` `0.8` + `utoipa` `6` | | |
@@ -406,7 +407,7 @@ pub enum StoreError { Conflict { key }, Contention { key }, Transient { key, rea
 
 Lease release is a **tombstone write** (object_store has no conditional delete). T1–T10 prove the lease CAS on every backend (`tests/lease_conformance.rs`, `test-infra/README.md`).
 
-### 3.6 Source connector (`data-avalanche-core` owns the trait, Q-M5-2; each source crate implements it; defined in M5, extended in M6a)
+### 3.6 Source connector (`data-avalanche-core` owns the trait, Q-M5-2; each source crate implements it; defined in M5, extended in M6a, M6b and M7a)
 
 `data-avalanche-core::source` (M5 Task 1; D-M5.1 lists where it differs from the first sketch):
 
@@ -415,8 +416,8 @@ Lease release is a **tombstone write** (object_store has no conditional delete).
 pub trait SourceConnector: Send + Sync {                    // built from the resolved Pipeline
     async fn preflight(&self) -> Result<Preflight, SourceError>;                    // config §11.2 pipeline rows
     async fn resolve_tables(&self) -> Result<ResolvedTables, SourceError>;         // channel A: tables, halted, skipped, warnings
-    async fn prepare(&self, checkpoint: Option<&SourcePosition>, tables: &[TableRef])
-        -> Result<Prepared, SourceError>;                                           // publication + slot state machine → StartPlan
+    async fn prepare(&self, checkpoint: Option<&Checkpoint>, tables: &[TableRef])
+        -> Result<Prepared, SourceError>;                                           // PG: publication + slot state machine; MySQL: dialect, server, purge → StartPlan
     async fn reset_position(&self) -> Result<SourcePosition, SourceError>;         // after PositionUnreachable (D-15.3)
     async fn retained(&self) -> Result<Option<RetainedLog>, SourceError>;          // M6b (was retained_bytes): the heartbeat's read
     async fn current_position(&self) -> Result<SourcePosition, SourceError>;       // a rescan's catch-up mark (Q-M6a-4)
@@ -442,7 +443,10 @@ pub enum StreamItem { Begin { xid: u64, commit_ts_micros: i64 },                
                       Commit(TransactionBoundary), KeepAlive(SourcePosition) }
 pub enum SchemaHint { Columns(Vec<ColumnSchema>), Ddl(String) }
 pub enum StartPlan { Resume, Snapshot { from: SourcePosition, reason: SnapshotReason } }  // FirstStart | PositionLost | AdoptedOrphan
-pub struct Prepared { pub plan: StartPlan, pub added: Vec<TableRef>, pub warnings: Vec<String> }
+pub struct Prepared { pub plan: StartPlan, pub added: Vec<TableRef>, pub warnings: Vec<String>,
+                      pub server: Option<ServerIdentity> }                  // M7a: the server the stream reads (MySQL)
+pub struct Checkpoint { pub position: SourcePosition, pub server: Option<ServerIdentity> }  // M7a; From<SourcePosition>
+pub enum ServerIdentity { Mysql { server_uuid: String }, Mariadb { server_id: u32 } }      // M7a: moved from the state crate
 pub enum SourceError { Transient(String), Permanent(String), Contended(String) /* M6a: PG 55006 */,
                        PositionUnreachable { position: String, detail: String },
                        TableHalt { table: TableRef, reason: HaltReason } }
@@ -462,6 +466,17 @@ with `sees(xid)` (a full `xid8` or the stream's 32-bit xid), `InFlightTxn { xid,
 `source_pos` is its transaction's commit LSN, its `seq` the XLogData `wal_start`; `Commit` carries
 the `end_lsn` that is acknowledged and resumed from. M6b bounds the catalog connect by
 `timeouts.connect` as a whole (TCP, TLS, startup, authentication).
+
+From M7a (D-M7a.1, D-M7a.18…22): a checkpoint carries the server it was read from, and `prepare`
+reports the server the stream reads (`Prepared.server`; PostgreSQL records none). The state
+crate re-exports core's `ServerIdentity`, so `replication/position.json` is unchanged; M7b records
+it with the worker's MySQL checkpoint. MySQL positions: a change's `source_pos` (`_lsn`) is its
+transaction's own GTID, or its start `file:pos` in file mode; its `seq` is (file index, computed end
+offset, Q-M7-4); `Commit` carries the cumulative GTID set, the MariaDB state, or the XID's end.
+MySQL `prepare` follows `binlog_purge_action` for a purged or other-dialect checkpoint and halts
+`BINLOG_SOURCE_CHANGED: …` for a file position from another server; `retained` is `bytes` 0 and
+`streamed` from the dump's connection id in `PROCESSLIST`; `fetch_rows` is `Permanent`; `teardown`
+does nothing; chunks carry no visibility (the window rule, with locking reads, Q-M7-3).
 
 ### 3.7 Cluster (Clustering §19–§20)
 
@@ -989,6 +1004,13 @@ that needs the control plane is M6b's.
 
 ### M7 — MySQL and MariaDB source (`data-avalanche-source-mysql`)
 
+Split (Q-M7a-1, 2026-10-14): **M7a** builds the crate and its integration tests
+(`M7a-mysql-source.md`), **M7b** wires it into the worker and runs the E2E parity suite. The scope
+below is M7's; the exit's first two bullets are M7b's, and M7a's exit is the crate's suite on
+MySQL 8.4 (GTIDs on and off) and MariaDB 11.8 (GTID and file/position) per change, MariaDB 11.4
+and 10.11 weekly.
+
+
 - **Scope:**
   - **Probe S-MY10 first:** file/position resume, rotation, watermark via `SHOW BINARY LOG STATUS`
     (MySQL 8.4) / `SHOW BINLOG STATUS` (MariaDB), position behaviour across a server restart, and the
@@ -1006,14 +1028,20 @@ that needs the control plane is M6b's.
   - TABLE_MAP decode with FULL metadata: names, signedness (read correctly), ENUM/SET strings.
   - Type decode for the Type_Mapping MySQL table, including `TINYINT(1)` detection, `UInt64` and
     ENUM/SET.
-  - Two-tier DDL classifier (sqlparser MySqlDialect → tokenizer fallback) routing to channel C;
-    TRUNCATE/DROP/RENAME table handling.
+  - Two-tier DDL classifier routing to channel C: the tokenizer names every statement's tables
+    and verbs, `sqlparser` (MySqlDialect) scopes an ALTER's columns and proves renames (D-M7a.14);
+    TRUNCATE/DROP/RENAME table handling, the online-migration cut-over swap followed (Q-M7a-8/9),
+    row-changing partition operations halt (D-M7a.15).
   - Preflight (config §11.2 MySQL rows).
   - Catalog channels over `information_schema`.
-  - Chunk reader with `utf8mb4_bin` ordering.
+  - Chunk reader in the key's own collation (not `utf8mb4_bin`, which has no index, D-M7a.12),
+    with locking reads (Q-M7-3, DA-SNAP-10).
   - `binlog_purge_action`.
   - Spec edits for P-4 land before this milestone.
-- **Deps:** M6b.
+- **M7b scope:** the worker's MySQL checkpoint (`PositionDoc` with the server from
+  `Prepared.server`, passed back as a `Checkpoint`), the binary's wiring, the `BINLOG_*` pipeline
+  halts in the status, and the E2E suites below.
+- **Deps:** M6b (M7a); M7a (M7b).
 - **Exit:**
   - Slice-1 E2E parity suite on MySQL 8.4 and MariaDB 11.8 (every change) and MariaDB 10.11 / 11.4
     (weekly), across all three position modes.
@@ -1146,8 +1174,13 @@ opt-out `DATA_AVALANCHE_SKIP_GCS=1`).
 Profile `matrix` adds `postgres-14…17`, `mariadb-1011` and `mariadb-114`; profile `init` holds the
 one-shot bucket/container creators. M5 adds `postgres-tls` to the default profile (port 55419: TLS
 required on every TCP connection; a throwaway CA, server certificate and client certificate made at
-each start, the CA and client pair written to the git-ignored `test-infra/.tls/`). M7 adds
-`mysql-84-nogtid` (GTID **off** for file/position tests).
+each start, the CA and client pair written to the git-ignored `test-infra/.tls/`). M7a adds
+`mysql-84-nogtid` (port 53385: GTID **off** for file/position tests, and no TLS for `ssl_mode:
+prefer`'s fallback) and `mysql-tls` (port 53386: TLS required, throwaway certificates in the
+git-ignored `test-infra/.tls/mysql/`). The MySQL source's tests pick a target with
+`DATA_AVALANCHE_MYSQL`: `mysql-84` (default), `mysql-84-nogtid`, `mariadb-118`,
+`mariadb-118-binlog` (`mariadb-118` read with `replication_type: binlog`), and `mariadb-114`,
+`mariadb-1011` weekly.
 Every service uses a fixed, non-default host port listed in `test-infra/README.md`; Azurite keeps
 10000 because `object_store`'s emulator mode targets `127.0.0.1:10000`. Source servers are configured
 as the preconditions require: PG `wal_level=logical`; MySQL/MariaDB ROW / FULL image / FULL metadata /
@@ -1188,9 +1221,12 @@ fake-gcs FAIL (risk R-3).
   annotation, but never fails the job. Requires secret
   `GCP_SA_KEY` (service-account JSON, `roles/storage.objectAdmin` on the bucket) and variable
   `DATA_AVALANCHE_GCS_BUCKET`, documented in `test-infra/README.md` and in the workflow comments.
+  From M7a, a step runs the MySQL source's tests on `mysql-84-nogtid`, `mariadb-118` and
+  `mariadb-118-binlog` (the workspace run covers `mysql-84`).
 - `weekly.yml` (weekly + manual; from M5, Q-M5-23): full DB matrix (M5: the PostgreSQL source suite on
-  PostgreSQL 14–17, one job each, through `DATA_AVALANCHE_PG_PORT`), full E2E, longer property-test
-  case counts.
+  PostgreSQL 14–17, one job each, through `DATA_AVALANCHE_PG_PORT`; M7a: the MySQL source suite on
+  MariaDB 11.4 and 10.11, through `DATA_AVALANCHE_MYSQL`), full E2E, longer property-test case
+  counts.
 - `cloud.yml` (weekly + manual): T1–T10 and the Delta P8 re-run on real S3/GCS/Azure, plus one E2E per
   cloud. Credentials are repository secrets injected as env vars; nothing is printed.
 
@@ -1311,6 +1347,7 @@ the naming below (2026-09-26).**
 | D-IMPL-12 | M5 PostgreSQL-source rulings **D-M5.1…D-M5.19** (listed in `M5-pg-source.md` §Decisions and rulings, each pinned by a test). Among them: the source contract lives in core with `prepare`, `augment`, `fetch_rows` and `TableHalt` (§3.6); a change's position is its commit LSN, `Commit` carries the `end_lsn` that is acknowledged; a Relation signal is emitted with the next change's sequence; the stream doesn't reconnect by itself; the slot state table as one function; a publication the pipeline can't change that publishes via the partition root while tracking a partition is refused; snapshot rows are read as output-function text, keys in `COLLATE "C"` | The specs are silent on these; each keeps the stream's positions, the slot or the round trip exact | M5 — **approved 2026-10-01** |
 | D-IMPL-13 | M6a pipeline-worker rulings **D-M6a.1…D-M6a.11** (listed in `M6a-pipeline-worker.md` §Decisions and rulings, each pinned by a test). Among them: a halt's `at` is the accumulator checkpoint, persisted before the next checkpoint, and a persisted halt keeps the table halted at every start until M9's re-snapshot; a failed channel-C catalog read halts the table `UNSAFE_DDL`; `Permanent` from `evolve` halts `SINK_REJECTED`; state-store `Transient`/`Contention` retry like a sink `Transient`; channel D's dropped and halted tables also wait for the stream to catch up; a chunk read under a schema the table has since left is read again, and its cursor rides the chunk's own flush; after a gap a snapshot in progress starts over; a mid-run `PositionUnreachable` resets the position and reruns Phase 0; no stream watchdog; the WAL-lag guard ends the worker; a table that drifted while down is rescanned before its snapshot reads | The specs are silent on these; each keeps the checkpoint, the halt or the snapshot exact across a crash | M6a — **approved 2026-10-03** |
 | D-IMPL-14 | M6b single-node-control rulings **Q-M6b-1…13 and D-M6b.1…13** (listed in `M6b-single-node-control.md` §Decisions and rulings, each pinned by a test). Among them: the source stays warm on pause; the controller polls `pipeline-state.json` and classifies worker errors (`Retry`, `Lease`, `Error`); `evolve` is fenced; a stale Delta handle is detected by its commit file's e-tag; a MERGE over `merge_memory_limit` halts its table (V-119); the guard compares a table's last change; the stream watchdog (reverses D-M6a.9) | The specs are silent on most; where a ruling touched a spec row, the row was patched with approval (V-119, the metric catalogue, Data-Flow Phase 4, config §6.4, §9.2, §9.2.1) | M6b — **approved 2026-10-08** |
+| D-IMPL-15 | M7a MySQL-source rulings **D-M7a.1…23** (listed in `M7a-mysql-source.md` §Decisions and rulings, each pinned by a test). Among them: a checkpoint carries its source server (§3.6); the replica id derived from BLAKE3(`id`); `verify-ca` fails closed as `verify-full` (DA-SRC-22); one decoder for binlog and chunk values, correcting `mysql_common`'s signed `MEDIUMINT` and `YEAR`; chunk keys in their own collation with the expanded keyset predicate; the tokenizer names every statement's tables, `sqlparser` scopes an ALTER; the stream decodes by the schema as of its position and halts a table it can't read; fail-closed event types, two-phase XA with tracked rows halts; the purge action is one rule at `prepare` and on the dump's refusal; the dump watched by its connection id | The specs are silent on these; where a ruling touched a spec row, the row was patched with approval (`Schema_Change…` §7.2, config §9.2.2) | M7a — **approved 2026-10-14** |
 
 ### 9.1 Questions answered at plan review (2026-09-26)
 
@@ -1371,11 +1408,26 @@ the naming below (2026-09-26).**
 | Q-M6a-6 (2026-10-02) | Chunk rows emitted at a frontier the table's marker covers are skipped by the guard: silent loss while the cursor advances | **A snapshot flag on the change set**: `covers` never skips it, the fence still applies, `validate` refuses deletes, truncate or a split in it; the stream's changes flush before a chunk | §3.3, §3.4; spec edit S-T; M6a Tasks 1, 10 |
 | Q-M6a-7 (2026-10-03) | `timeouts.snapshot: 0` halts every snapshot at once | **A V-rule: at least 10 s** (V-118) | spec edit S-U; M6a Task 15 |
 | Q-M6a-8 (2026-10-03) | A table whose schema changed while the worker was down, under a snapshot: read under the cached columns, an added column stays NULL | **Rescan before snapshotting** | D-M6a.11; M6a Task 16 |
+| Q-M7-3 (2026-10-14) | DA-SNAP-10: a chunk can miss a transaction the stream already delivered (semi-sync `AFTER_SYNC`, S-MY11) | **Locking chunk reads** (`LOCK IN SHARE MODE` in a short READ COMMITTED transaction); the window rule stays | `Data-Flow.md` Phase 1; `Snapshot_Resumability…` §1.1; M7a Task 10 |
+| Q-M7-4 (2026-10-14) | `_seq` when the header's `log_pos` is 0 (S-MY10f), and `_lsn` | **`_seq` = (file index, computed end offset); `_lsn` = the transaction's GTID, or its start `file:pos`** | `Data-Flow.md` Phase 2b, lineage; D-IMPL-5; M7a Tasks 6, 13 |
+| Q-M7-5 (2026-10-14) | Two dumps under one replica id end each other | **`source.mysql.server_id`**, derived from `id` by default; V-120 | config §9.2.2; M7a Task 2 |
+| Q-M7-6 (2026-10-14) | The MySQL heartbeat period | **`source.mysql.heartbeat`** (`60s`), V-121 | config §9.2.2; M7a Tasks 2, 13 |
+| Q-M7a-1 (2026-10-14) | One milestone or two? | **Split M7a / M7b**: the crate and its ITs; then the worker, the wiring and the E2E | §4 M7 |
+| Q-M7a-2 (2026-10-14) | Which charsets? | **UTF-8 family and `latin1` (cp1252)**; `binary` → bytes; any other halts the table | `Type_Mapping.md`; M7a Task 7 |
+| Q-M7a-3 (2026-10-14) | `PARTIAL_JSON` updates | **Apply the diff** to the before image | `Type_Mapping.md`; M7a Task 8 |
+| Q-M7a-4 (2026-10-14) | MariaDB's own types | **`UUID` → uuid, `INET4`/`INET6` → string, `VECTOR` → binary** | `Type_Mapping.md` §MariaDB types; M7a Task 7 |
+| Q-M7a-5 (2026-10-14) | MariaDB `log_bin_compress` | **Decompress the events ourselves** | DA-SRC-23; M7a Task 6 |
+| Q-M7a-6 (2026-10-14) | A checkpoint in another dialect | **Follow `binlog_purge_action`** | M7a Task 14 |
+| Q-M7a-7 (2026-10-14) | `GEOMETRY` | **SRID (4 bytes LE) + WKB, as stored** | `Type_Mapping.md`; M7a Task 7 |
+| Q-M7a-8 (2026-10-14) | An online-migration cut-over swap | **Follow it** | `Schema_Change…` §7.2; M7a Tasks 11, 13 |
+| Q-M7a-9 (2026-10-14) | Which swaps are cut-overs? | **gh-ost `_<t>_gho` and pt-osc `_<t>_new` shadows only**, same database, in one statement | `Schema_Change…` §7.2; M7a Task 11 |
 
 ### 9.2 Open questions (answer before the named milestone)
 
 - Recorded for later plans: M7 — the decoder validates `gno >= 1` before `GtidSet::insert` (anonymous
-  GTID events carry 0, and `insert_range` panics on 0). The two M1 items are settled in M1 Task 1
+  GTID events carry 0, and `insert_range` panics on 0). **Done in M7a Task 13**: an anonymous GTID event
+  starts a transaction without a GTID (its xid from a session counter), and a GTID event with `gno`
+  0 halts the stream (`Permanent`). The two M1 items are settled in M1 Task 1
   (2026-09-27): `MAX_LIST_DEPTH = 8` for `list<T>`, and the public-API convention (root re-exports,
   `Display`+`FromStr` round-trip incl. `FromStr for Decimal`, errors named after what failed) is in
   `data-avalanche-core`'s crate docs.

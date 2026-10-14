@@ -176,7 +176,7 @@ the arrow.
 | Q-M7a-8 | An online-migration cut-over (`RENAME TABLE t TO x, shadow TO t`) | **Follow the swap**: the shadow's columns diffed against `t`'s. Needs a §7.2 row (patch below, for approval) |
 | Q-M7a-9 | Which swaps are cut-overs? | **Tool names only**: an untracked incoming table named gh-ost `_<t>_gho` or pt-online-schema-change `_<t>_new` (one or more leading `_`), same database. Any other swap halts `TABLE_DROPPED` |
 
-**Rulings where the specs are silent** (each is pinned by a test):
+**Rulings where the specs are silent** (each is pinned by a test). **Plan approved 2026-10-14**, with these rulings (roadmap D-IMPL-15) and the two spec patches below:
 
 | # | Ruling | Why | Pinned by |
 |---|---|---|---|
@@ -245,8 +245,7 @@ commit and an `infra:` commit; `test-infra/README.md` changes in Tasks 3 and 16)
 - `test-infra/README.md`: the two services (Task 3), the targets and the global-state binaries
   (Task 16).
 
-**Spec patches proposed** (they need your approval of the text; nothing in a task depends on
-them landing first):
+**Spec patches** (approved and applied 2026-10-14; nothing in a task depends on them):
 
 - `Schema_Change_Detection_and_Evolution.md` §7.2: a row for the cut-over swap (Q-M7a-8, Q-M7a-9),
   the `DROP TABLE` row's MySQL clause pointing at it, and a row for row-changing partition
