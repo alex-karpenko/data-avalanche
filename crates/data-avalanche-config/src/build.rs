@@ -39,6 +39,16 @@ pub(crate) const DEFAULT_FLUSH_BYTES: u64 = 512 * ByteSize::MIB;
 pub(crate) const DEFAULT_POSTGRES_PORT: u16 = 5432;
 pub(crate) const DEFAULT_MYSQL_PORT: u16 = 3306;
 
+/// The default `source.mysql.server_id` (§9.2.2): the first four bytes of the BLAKE3 hash of the
+/// pipeline `id`, little-endian, with the top bit set, so 2147483648…4294967295, away from the
+/// small ids replicas usually take. Stable: a changed derivation would move every pipeline to a
+/// new replica id.
+pub fn derived_server_id(id: &str) -> u32 {
+    let hash = blake3::hash(id.as_bytes());
+    let b = hash.as_bytes();
+    u32::from_le_bytes([b[0], b[1], b[2], b[3]]) | 0x8000_0000
+}
+
 /// A field that has a default: absent → `Some(default)`; present → its value (`None` if unknown
 /// or invalid).
 fn or<T: LeafType>(ctx: &mut Ctx, leaf: &L<T>, at: &At, key: &str, default: T) -> Option<T> {
@@ -639,6 +649,7 @@ fn pipeline(
     let source = source(
         &p.source.clone().unwrap_or_default(),
         &at.key("source"),
+        id.as_deref(),
         ctx,
     );
     let tables = tables(
@@ -698,7 +709,7 @@ fn pipeline(
     })
 }
 
-fn source(s: &RawSource, at: &At, ctx: &mut Ctx) -> Option<Source> {
+fn source(s: &RawSource, at: &At, id: Option<&str>, ctx: &mut Ctx) -> Option<Source> {
     let kind = or(ctx, &s.kind, at, "type", SourceType::Postgres);
     let host = req(ctx, &s.host, at, "host");
     let port = opt(ctx, &s.port, at, "port");
@@ -758,6 +769,7 @@ fn source(s: &RawSource, at: &At, ctx: &mut Ctx) -> Option<Source> {
     let mysql = mysql(
         s.mysql.as_ref().unwrap_or(&RawMysql::default()),
         &at.key("mysql"),
+        id,
         ctx,
     );
     let kind = kind?;
@@ -821,7 +833,9 @@ fn postgres(p: &RawPostgres, at: &At, ctx: &mut Ctx) -> Option<Postgres> {
     })
 }
 
-fn mysql(m: &RawMysql, at: &At, ctx: &mut Ctx) -> Option<Mysql> {
+/// `id`: the pipeline's, `None` when it is missing (V-055 reports it): then so is the derived
+/// `server_id`, and the pipeline doesn't resolve either way.
+fn mysql(m: &RawMysql, at: &At, id: Option<&str>, ctx: &mut Ctx) -> Option<Mysql> {
     let replication_type = or(
         ctx,
         &m.replication_type,
@@ -844,11 +858,18 @@ fn mysql(m: &RawMysql, at: &At, ctx: &mut Ctx) -> Option<Mysql> {
         "binlog_purge_action",
         BinlogPurgeAction::Error,
     );
+    let server_id = match &m.server_id {
+        None => id.map(derived_server_id),
+        Some(l) => ctx.value(l, &at.key("server_id")),
+    };
+    let heartbeat = or(ctx, &m.heartbeat, at, "heartbeat", Duration::from_secs(60));
     Some(Mysql {
         replication_type: replication_type?,
         tinyint1_as_bool: tinyint1_as_bool?,
         tinyint1_detection: tinyint1_detection?,
         binlog_purge_action: binlog_purge_action?,
+        server_id: server_id?,
+        heartbeat: heartbeat?,
     })
 }
 
@@ -1448,6 +1469,17 @@ mod tests {
     /// V-068 / §11 Phase 2: `hive.tls.ca` is only in effect when `tls.enabled` is `true`, the same
     /// gate `api.tls`/`memberlist.tls` use. Unreachable via `load_str` today (V-115 refuses `hive`
     /// in Phase 1), so exercised directly against `hive()`.
+    #[test]
+    fn the_derived_server_id_is_stable_and_in_the_high_range() {
+        // Pinned: a change would re-register every pipeline under a new replica id.
+        // Checked against the BLAKE3 reference implementation (`blake3` 1.0 for Python).
+        assert_eq!(derived_server_id("orders"), 2_328_456_920);
+        for id in ["a", "b", "orders", "events-mysql"] {
+            assert!(derived_server_id(id) >= 1 << 31, "{id}");
+        }
+        assert_ne!(derived_server_id("a"), derived_server_id("b"));
+    }
+
     #[test]
     fn hive_tls_ca_is_not_read_when_tls_is_disabled() {
         let env: BTreeMap<String, String> = BTreeMap::new();

@@ -88,6 +88,7 @@ mod template;
 mod units;
 mod walk;
 
+pub use build::derived_server_id;
 pub use coerce::LogFilter;
 pub use diag::{Diagnostic, Locus, PARSE, Report, Severity, TYPE};
 pub use diff::{ConfigDiff, FieldChange, PipelineChange, diff};

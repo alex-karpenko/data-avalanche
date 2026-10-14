@@ -546,7 +546,7 @@ pub const RULES: &[RuleMeta] = &[
         L::Config,
         Config,
         r#"defaults"#,
-        r#"Must not set per-pipeline-unique resource names (postgres.publication, postgres.slot, id)."#,
+        r#"Must not set per-pipeline-unique resource names (postgres.publication, postgres.slot, mysql.server_id, id)."#,
     ),
     rule(
         "V-061",
@@ -1012,6 +1012,22 @@ pub const RULES: &[RuleMeta] = &[
         r#"sink.delta.merge_memory_limit"#,
         r#"≥ 16 MiB when set."#,
     ),
+    rule(
+        "V-120",
+        Error,
+        L::Config,
+        Config,
+        r#"source.mysql.server_id"#,
+        r#"≥ 1 when set. Unique per source server (host + port) across pipelines, set or derived: two dumps under one id end each other."#,
+    ),
+    rule(
+        "V-121",
+        Error,
+        L::Pipeline,
+        Config,
+        r#"source.mysql.heartbeat"#,
+        r#"Between 1s and 4294967s (the server's heartbeat period range)."#,
+    ),
 ];
 
 /// The registry entry for `id` (`"V-007"`).
@@ -1025,7 +1041,7 @@ mod tests {
 
     #[test]
     fn has_every_spec_rule_once_in_order() {
-        assert_eq!(RULES.len(), 114);
+        assert_eq!(RULES.len(), 116);
         assert!(
             RULES.windows(2).all(|w| w[0].id < w[1].id),
             "sorted, no duplicates"

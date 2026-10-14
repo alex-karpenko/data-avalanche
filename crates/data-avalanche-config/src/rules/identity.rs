@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use super::pipeline_at;
-use crate::build::DEFAULT_POSTGRES_PORT;
+use crate::build::{DEFAULT_MYSQL_PORT, DEFAULT_POSTGRES_PORT, derived_server_id};
 use crate::ctx::{At, Ctx, shown, shown_value};
 use crate::enums::{SlotManagement, SourceType};
 use crate::leaf::Leaf;
@@ -18,6 +18,9 @@ type SlotEntries<'a> = Vec<(&'a str, String, String, String)>;
 /// V-059 dedup entries: the pipeline name, then the host's, port's, db's and publication's redacted
 /// display text, and whether the pipeline manages its publication (`slot_management: managed`).
 type PublicationEntries<'a> = Vec<(&'a str, String, String, String, String, bool)>;
+/// V-120 dedup entries: the pipeline name, then the host's, port's and the server id's redacted
+/// display text (a derived id is shown as such).
+type ServerIdEntries<'a> = Vec<(&'a str, String, String, String)>;
 
 /// `^[a-z0-9][a-z0-9_-]{0,62}$` (V-055).
 fn is_pipeline_id(s: &str) -> bool {
@@ -60,6 +63,7 @@ pub(crate) fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut
     if let Some(d) = &raw.defaults {
         let at = At::config(YamlPath::root().key("defaults"));
         let pg = d.source.as_ref().and_then(|s| s.postgres.as_ref());
+        let my = d.source.as_ref().and_then(|s| s.mysql.as_ref());
         let forbidden = [
             (
                 "id",
@@ -79,6 +83,12 @@ pub(crate) fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut
                 pg.and_then(|p| p.slot.as_ref()).and_then(|l| l.loc()),
                 at.key("source").key("postgres").key("slot"),
                 pg.is_some_and(|p| p.slot.is_some()),
+            ),
+            (
+                "source.mysql.server_id",
+                my.and_then(|m| m.server_id.as_ref()).and_then(|l| l.loc()),
+                at.key("source").key("mysql").key("server_id"),
+                my.is_some_and(|m| m.server_id.is_some()),
             ),
             (
                 "tables.snapshots.overrides",
@@ -113,6 +123,7 @@ pub(crate) fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut
     let mut slots: BTreeMap<(String, u16, String), SlotEntries<'_>> = BTreeMap::new();
     let mut publications: BTreeMap<(String, u16, String, String), PublicationEntries<'_>> =
         BTreeMap::new();
+    let mut server_ids: BTreeMap<(String, u16, u32), ServerIdEntries<'_>> = BTreeMap::new();
     for (name, p) in merged {
         let at = pipeline_at(name);
         // V-057
@@ -146,8 +157,54 @@ pub(crate) fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut
                 }
             }
         }
-        // V-058, V-059
         let Some(src) = &p.source else { continue };
+        // V-120: the binlog dump's replica id, set or derived from `id`, is unique per source
+        // server (`host` + `port`): a second dump under one id ends the first (S-MY10h).
+        if ctx.peek(&src.kind) == Some(SourceType::Mysql) {
+            let my = src.mysql.clone().unwrap_or_default();
+            let my_at = at.key("source").key("mysql");
+            let id = p.id.as_ref().and_then(|l| ctx.text(l, &at.key("id")));
+            let server_id = match &my.server_id {
+                Some(l) => ctx
+                    .value(l, &my_at.key("server_id"))
+                    .map(|v| (v, shown_value(l, &v), l.loc())),
+                None => id.map(|id| {
+                    let v = derived_server_id(&id);
+                    (v, format!("{v} (derived from the id)"), None)
+                }),
+            };
+            if let Some((0, _, loc)) = &server_id {
+                ctx.error(
+                    "V-120",
+                    &At::config(my_at.key("server_id").path),
+                    *loc,
+                    "server_id must be at least 1",
+                );
+            } else if let Some((v, shown_id, _)) = server_id {
+                let host = src
+                    .host
+                    .as_ref()
+                    .and_then(|l| ctx.text(l, &at.key("source").key("host")).map(|t| (l, t)));
+                let port: Option<(Option<&Leaf<u16>>, u16)> = match &src.port {
+                    Some(l) => ctx
+                        .value(l, &at.key("source").key("port"))
+                        .map(|v| (Some(l), v)),
+                    None => Some((None, DEFAULT_MYSQL_PORT)),
+                };
+                if let (Some((host_leaf, host)), Some((port_leaf, port))) = (host, port) {
+                    let host_shown = shown(host_leaf, &host);
+                    let port_shown = match port_leaf {
+                        Some(pl) => shown_value(pl, &port),
+                        None => port.to_string(),
+                    };
+                    server_ids
+                        .entry((host, port, v))
+                        .or_default()
+                        .push((name, host_shown, port_shown, shown_id));
+                }
+            }
+        }
+        // V-058, V-059
         let is_pg = src.kind.is_none() || ctx.peek(&src.kind) == Some(SourceType::Postgres);
         let Some(pg) = src.postgres.as_ref().filter(|_| is_pg) else {
             continue;
@@ -296,6 +353,27 @@ pub(crate) fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut
             } else {
                 ctx.warning("V-059", &at, None, shared);
             }
+        }
+    }
+    // V-120 (uniqueness per source server: host + port)
+    for (_, entries) in server_ids.iter().filter(|(_, n)| n.len() > 1) {
+        let names: Vec<&str> = entries.iter().map(|(n, _, _, _)| *n).collect();
+        for (name, host_shown, port_shown, id_shown) in entries {
+            ctx.error(
+                "V-120",
+                &At::config(
+                    pipeline_at(name)
+                        .path
+                        .key("source")
+                        .key("mysql")
+                        .key("server_id"),
+                ),
+                None,
+                format!(
+                    "server_id {id_shown} on server {host_shown}:{port_shown} is used by pipelines {}: a second binlog dump under one id ends the first",
+                    names.join(", ")
+                ),
+            );
         }
     }
 }

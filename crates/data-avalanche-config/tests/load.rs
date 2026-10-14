@@ -190,6 +190,37 @@ fn absent_mysql_and_delta_blocks_take_every_default() {
 }
 
 #[test]
+fn a_mysql_server_id_and_heartbeat_resolve() {
+    let mysql = |extra: &str| {
+        MINIMAL
+            .replace(
+                "host: db.example.com",
+                "type: mysql\n      host: db.example.com",
+            )
+            .replace(
+                "      postgres: { publication: orders_pub, slot: orders_slot }\n",
+                &format!("      mysql: {{ {extra} }}\n"),
+            )
+            .replace("include: [public.orders]", "include: [orders]")
+    };
+    let resolve = |yaml: String| {
+        let loaded =
+            load_str(&yaml, &env(&[("PW", "pw")]), &fp_key()).unwrap_or_else(|r| panic!("{r:#?}"));
+        loaded.config.pipelines["orders"]
+            .source
+            .mysql
+            .clone()
+            .unwrap()
+    };
+    let derived = resolve(mysql(""));
+    assert_eq!(derived.server_id, derived_server_id("orders"));
+    assert_eq!(derived.heartbeat, Duration::from_secs(60));
+    let set = resolve(mysql("server_id: 42, heartbeat: 5s"));
+    assert_eq!(set.server_id, 42);
+    assert_eq!(set.heartbeat, Duration::from_secs(5));
+}
+
+#[test]
 fn a_merge_memory_limit_resolves_to_bytes() {
     let yaml = MINIMAL.replace("delta: {}", "delta: { merge_memory_limit: 256MiB }");
     assert!(yaml.contains("merge_memory_limit"), "{yaml}");

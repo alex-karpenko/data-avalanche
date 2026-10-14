@@ -101,7 +101,9 @@ merge_struct!(RawMysql {
     replication_type,
     tinyint1_as_bool,
     tinyint1_detection,
-    binlog_purge_action
+    binlog_purge_action,
+    server_id,
+    heartbeat
 });
 merge_struct!(RawTables {
     include,

@@ -323,6 +323,24 @@ pub fn cases() -> Vec<Case> {
         case("V-118", Silent, "snapshot timeout 10s", || {
             pg_delta().set("/pipelines/p/source/timeouts/snapshot", json!("10s"))
         }),
+        case("V-121", Error, "mysql heartbeat 0s", || {
+            mysql_delta().set("/pipelines/p/source/mysql/heartbeat", json!("0s"))
+        }),
+        case("V-121", Error, "mysql heartbeat 500ms", || {
+            mysql_delta().set("/pipelines/p/source/mysql/heartbeat", json!("500ms"))
+        }),
+        case("V-121", Error, "mysql heartbeat 4294968s", || {
+            mysql_delta().set("/pipelines/p/source/mysql/heartbeat", json!("4294968s"))
+        }),
+        case("V-121", Silent, "mysql heartbeat 1s", || {
+            mysql_delta().set("/pipelines/p/source/mysql/heartbeat", json!("1s"))
+        }),
+        case("V-121", Silent, "mysql heartbeat 4294967s", || {
+            mysql_delta().set("/pipelines/p/source/mysql/heartbeat", json!("4294967s"))
+        }),
+        case("V-121", Error, "defaults mysql heartbeat 0s", || {
+            mysql_delta().set("/defaults/source/mysql/heartbeat", json!("0s"))
+        }),
         case("V-119", Error, "merge memory 1MiB", || {
             pg_delta().set("/pipelines/p/sink/delta/merge_memory_limit", json!("1MiB"))
         }),
