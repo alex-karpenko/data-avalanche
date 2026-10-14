@@ -230,6 +230,17 @@ pub enum StreamItem {
 }
 
 /// The tables channel D found changed since `known` (`Schema_Change…` §3).
+/// The log the source keeps for the pipeline, read every heartbeat (PostgreSQL: the slot).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetainedLog {
+    /// Bytes kept on the source's disk (PostgreSQL: the WAL from the slot's `restart_lsn`, the
+    /// `max_wal_lag_bytes` guard).
+    pub bytes: u64,
+    /// A stream reads it now (PostgreSQL: the slot is `active`). A session whose stream is open
+    /// but which reads `false` has lost its stream without hearing of it (DA-SRC-16).
+    pub streamed: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RescanReport {
     /// Tables gone from the source catalog: each halts with `TABLE_DROPPED`.
@@ -265,10 +276,8 @@ pub trait SourceConnector: Send + Sync {
     /// new consistent position to snapshot from and stream after.
     async fn reset_position(&self) -> Result<SourcePosition, SourceError>;
 
-    /// How many bytes of log the source keeps on disk for the pipeline (PostgreSQL: the WAL from
-    /// the slot's `restart_lsn`, the `max_wal_lag_bytes` guard). `None` when the source keeps
-    /// nothing for it.
-    async fn retained_bytes(&self) -> Result<Option<u64>, SourceError>;
+    /// The log the source keeps for the pipeline. `None` when the source keeps nothing for it.
+    async fn retained(&self) -> Result<Option<RetainedLog>, SourceError>;
 
     /// The source's current position: a snapshot chunk's low and high watermarks, and the point
     /// the stream must pass before a rescan's change is applied.
@@ -469,7 +478,7 @@ mod tests {
                 warnings: vec![],
             })
         }
-        async fn retained_bytes(&self) -> Result<Option<u64>, SourceError> {
+        async fn retained(&self) -> Result<Option<RetainedLog>, SourceError> {
             Ok(None)
         }
         async fn reset_position(&self) -> Result<SourcePosition, SourceError> {

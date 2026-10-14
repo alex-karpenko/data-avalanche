@@ -335,7 +335,7 @@ impl Session<'_> {
     /// the buffer is full, none for a table an in-flight transaction writes. A table's wait for
     /// such writers warns once, naming them (final review I3); it ends once the table may be read.
     pub(super) fn issue_reads(&mut self) {
-        if !self.queued.is_empty() {
+        if !self.queued.is_empty() || self.core.pause {
             return;
         }
         let now = Instant::now();
@@ -370,7 +370,7 @@ impl Session<'_> {
                         "table {table}: its snapshot waits for transactions that were in flight when the stream session started and write it (xids {}): it reads nothing until they end; a long-running or idle-in-transaction session holds one (pg_stat_activity, backend_xid), or a prepared transaction (pg_prepared_xacts)",
                         writers.join(", ")
                     );
-                    self.core.update(|st| st.warnings.push(warning));
+                    self.core.update(|st| st.warn(warning));
                 }
                 continue;
             }
@@ -654,7 +654,7 @@ mod tests {
     use super::*;
     use crate::session::Core;
     use crate::test_support::{World, Yaml, row, t, wait_until};
-    use crate::{Backoff, Command, Exit, Hooks, ReconcileLog, WorkerStatus};
+    use crate::{Backoff, Command, Exit, Hooks, Phase, ReconcileLog, WorkerStatus};
 
     fn chunks_of(n: u64) -> Pipeline {
         let tables = format!("\n      snapshots: {{ chunk_size: {n} }}");
@@ -686,6 +686,37 @@ mod tests {
         let (end, ()) = tokio::join!(s.run(), driver);
         let last = status.borrow().clone();
         (end.unwrap(), last)
+    }
+
+    /// A pause holds a running snapshot: no chunk is read, and its time doesn't count against
+    /// `timeouts.snapshot` (the clock moves on by the time spent paused).
+    #[tokio::test]
+    async fn a_pause_stops_the_snapshot_and_its_clock() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.source.load(&t("a"), rows(1..=5));
+        w.request(&["a"]).await;
+        let (mut core, control, status) = w.core(&chunks_of(2), &["a"]);
+        core.pause = true;
+        let opened = Instant::now();
+        let s = Session::open(&mut core).await.unwrap().unwrap();
+        let driver = async {
+            wait_until("parked", || status.borrow().phase == Phase::Paused).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(w.source.reads(&t("a")), 0, "no chunk is read while paused");
+            control.send(Command::Resume).await.unwrap();
+            snapshot_done(&w, &status, "a").await;
+            control.send(Command::Drain).await.unwrap();
+        };
+        let (end, ()) = tokio::join!(s.run(), driver);
+        assert!(matches!(end.unwrap(), End::Exit(Exit::Drained)));
+        assert_eq!(w.ids("a"), [1, 2, 3, 4, 5]);
+        let started = core.snapshot_started[&t("a")];
+        assert!(
+            started.duration_since(opened) >= Duration::from_millis(200),
+            "the pause is added back: {:?}",
+            started.duration_since(opened)
+        );
     }
 
     async fn snapshot_done(w: &World, status: &watch::Receiver<WorkerStatus>, table: &str) {
@@ -1049,9 +1080,9 @@ mod tests {
         );
     }
 
-    /// Chunk reads share the source's connection with the heartbeat's `retained_bytes`, which the
-    /// session awaits inline: a read hands back its rows only while that call waits, so the reads
-    /// must be polled while the session awaits it (Task 13 review I3).
+    /// Chunk reads share the source's connection with the heartbeat's `retained`: a read hands
+    /// back its rows only while that call waits, so the reads must be polled while the call is
+    /// out (Task 13 review I3).
     #[tokio::test]
     async fn a_chunk_read_goes_on_while_the_session_awaits_the_source() {
         let w = World::new(&["a"]);

@@ -8,7 +8,7 @@ use data_avalanche_core::{SnapshotReason, SourceError, SourcePosition, StartPlan
 use data_avalanche_testkit::require_it;
 use tokio_postgres::Client;
 
-use crate::common::{Names, admin, cleanup, connector, fresh, pipeline};
+use crate::common::{Names, admin, cleanup, connector, first_stream, fresh, pipeline};
 
 const DDL: &str = "CREATE TABLE a (id int PRIMARY KEY); CREATE TABLE b (id int PRIMARY KEY);
                    CREATE TABLE c (id int PRIMARY KEY);";
@@ -423,13 +423,43 @@ async fn a_root_publication_of_tracked_partitions_is_refused() {
     cleanup(&a, &n).await;
 }
 
+/// The heartbeat's read says whether a stream reads the slot: the stream watchdog's evidence
+/// that a silent stream is still there (DA-SRC-16).
+#[tokio::test]
+async fn the_retained_log_says_whether_a_stream_reads_the_slot() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(&a, "slot_streamed", DDL).await;
+    let c = connector(&pipeline(&n, &["*"], "", ""));
+    let streamed = async |want: bool| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let log = c.retained().await.unwrap().expect("the slot");
+            if log.streamed == want {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "streamed stayed {}",
+                log.streamed
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
+    let (stream, _, _) = first_stream(&c).await;
+    streamed(true).await;
+    drop(stream);
+    streamed(false).await;
+    cleanup(&a, &n).await;
+}
+
 #[tokio::test]
 async fn reset_teardown_and_retained_wal() {
     require_it!();
     let a = admin().await;
     let n = fresh(&a, "slot_reset", DDL).await;
     let c = connector(&pipeline(&n, &["*"], "", ""));
-    assert_eq!(c.retained_bytes().await.unwrap(), None, "no slot yet");
+    assert_eq!(c.retained().await.unwrap(), None, "no slot yet");
     let p = c.prepare(None, &[n.table("a")]).await.unwrap();
     let start = from(&p.plan, SnapshotReason::FirstStart);
     a.execute(
@@ -441,8 +471,9 @@ async fn reset_teardown_and_retained_wal() {
     )
     .await
     .unwrap();
-    let retained = c.retained_bytes().await.unwrap().unwrap();
-    assert!(retained > 0, "WAL written since the slot's position");
+    let retained = c.retained().await.unwrap().unwrap();
+    assert!(retained.bytes > 0, "WAL written since the slot's position");
+    assert!(!retained.streamed, "no stream reads the slot");
 
     let SourcePosition::Pg(fresh_at) = c.reset_position().await.unwrap() else {
         panic!("a PostgreSQL position")

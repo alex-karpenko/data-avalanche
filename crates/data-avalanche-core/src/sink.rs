@@ -176,6 +176,10 @@ impl CommitMarker {
     /// commit is skipped (Delivery §3). Committing again would only repeat an idempotent write,
     /// except for replayed history, which the guard is what keeps out.
     ///
+    /// The marker covers the set's `last_change`, not its `end`: the end is the flush's frontier,
+    /// which a replay's flush may read past the marker (a keep-alive, another table's
+    /// transaction) while carrying only the transactions the table already has.
+    ///
     /// A split slice ends at its pinned `txn_start`, which the marker equals from the transaction's
     /// first slice on, so "covers the end" can't tell a slice still owed from one already applied.
     /// It is skipped only when the marker is strictly past `txn_start`: the transaction's commit (or
@@ -191,7 +195,7 @@ impl CommitMarker {
         let stored = &self.committed_position;
         match &cs.split {
             Some(split) => Ok(stored.covers(&split.txn_start)? && !split.txn_start.covers(stored)?),
-            None => stored.covers(&cs.position.end),
+            None => stored.covers(&cs.position.last_change),
         }
     }
 }
@@ -205,7 +209,11 @@ pub struct SinkTableState {
     /// lineage columns), plus every column `evolve` added. Soft-dropped columns stay. Not the
     /// sink's physical (Hop 3) types.
     pub schema: Option<SchemaRef>,
-    /// The marker of the latest commit this pipeline made to the table.
+    /// The marker of the latest positioned commit this pipeline made to the table. `None` says
+    /// only that no such commit is found, not that the pipeline never wrote the table: a
+    /// truncate's DELETE carries the fence but no position, so a crash before its MERGE leaves
+    /// an own commit without one, and a walk-back stops at a cleaned-up log. Nothing decides
+    /// "the pipeline never wrote here" from it.
     pub marker: Option<CommitMarker>,
 }
 
@@ -220,6 +228,22 @@ pub enum EvolveOutcome {
     Unsupported {
         reason: String,
     },
+    /// A newer owner has written the table: nothing changed, and this worker must stop the
+    /// pipeline, as after a fenced commit (Clustering §19).
+    Fenced {
+        current_epoch: u64,
+    },
+}
+
+/// What a sink has done since it was built, for the metrics (System-Overview §Observability: the
+/// MERGE cost signals, D-MS.15). A sink that doesn't measure them reports zeros.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SinkStats {
+    /// Files a commit replaced or removed (`data_avalanche_sink_merge_files_rewritten`).
+    pub files_rewritten: u64,
+    /// Rows rewritten unchanged because they share a file with a changed row
+    /// (`data_avalanche_sink_merge_rows_copied`).
+    pub rows_copied: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -271,13 +295,21 @@ impl SinkError {
 pub trait Sink: Send + Sync {
     fn kind(&self) -> SinkKind;
     fn capabilities(&self) -> &SinkCapabilities;
+    /// Totals since the sink was built.
+    fn stats(&self) -> SinkStats {
+        SinkStats::default()
+    }
     async fn table_state(&self, table: &TableRef) -> Result<SinkTableState, SinkError>;
     /// Creates the table when it's absent; a present table is left as it is.
     async fn ensure_table(&self, spec: &TableSpec) -> Result<(), SinkError>;
+    /// Applies a schema delta, idempotently. `owner_epoch` is the writer's lease epoch: a table a
+    /// newer owner has written is [`EvolveOutcome::Fenced`] and changes nothing, so a zombie
+    /// can't alter a table its successor writes (the fence of [`Sink::commit`]).
     async fn evolve(
         &self,
         table: &TableRef,
         delta: &SchemaDelta,
+        owner_epoch: u64,
     ) -> Result<EvolveOutcome, SinkError>;
     /// Commits one change set, in this order:
     /// 1. [`TableChangeSet::validate`] ([`SinkError::InvalidChangeSet`]);
@@ -285,7 +317,8 @@ pub trait Sink: Send + Sync {
     /// 3. [`SinkError::NoTable`] when the table is absent;
     /// 4. the fence, then the guard, against the stored marker: a [`CommitOutcome::Fenced`] or
     ///    [`CommitOutcome::SkippedCovered`] commit changes nothing;
-    /// 5. every column of the set must be in the table with the same type;
+    /// 5. the set's identifier must be the one the table was created with, and every column of
+    ///    the set must be in the table with the same type;
     /// 6. apply, as one table version: the truncate clear, then the deletes, then the upserts;
     /// 7. store the marker with the **union** of the prior stored position and the new one.
     async fn commit(
@@ -322,6 +355,10 @@ mod tests {
     }
 
     fn change_set(end: u64, split: Option<SplitInfo>) -> TableChangeSet {
+        ranged(end, end, split)
+    }
+
+    fn ranged(last_change: u64, end: u64, split: Option<SplitInfo>) -> TableChangeSet {
         let t = table();
         TableChangeSet {
             table: t.table().clone(),
@@ -333,6 +370,7 @@ mod tests {
             position: PositionRange {
                 start: SourcePosition::Pg(Lsn(1)),
                 end: SourcePosition::Pg(Lsn(end)),
+                last_change: SourcePosition::Pg(Lsn(last_change)),
             },
             split,
             snapshot: false,
@@ -424,6 +462,20 @@ mod tests {
         assert!(stored.covers(&change_set(100, None)).unwrap());
         assert!(stored.covers(&change_set(60, None)).unwrap());
         assert!(!stored.covers(&change_set(101, None)).unwrap());
+    }
+
+    #[test]
+    fn the_guard_compares_the_last_change_not_the_frontier() {
+        let stored = marker(1, 100);
+        assert!(
+            stored.covers(&ranged(90, 120, None)).unwrap(),
+            "a replay whose flush read past the marker carries only what the table has"
+        );
+        assert!(stored.covers(&ranged(100, 120, None)).unwrap());
+        assert!(
+            !stored.covers(&ranged(110, 120, None)).unwrap(),
+            "a transaction past the marker is owed"
+        );
     }
 
     #[test]

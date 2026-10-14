@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-07
+updated: 2026-10-13
 domain: Architecture
 tags: [gap-analysis, design, re-derivation, spec-readiness, blockers, open-decisions]
 resolves: []
@@ -127,13 +127,14 @@ does not block starting the specification.
 
 > Recounted 2026-09-26 (v1 readiness tidy, §26); the 2026-06 figures are superseded. Open count
 > updated 2026-10-02 for the gaps M5 carried (§27), 2026-10-03 for DA-SNAP-9 and DA-SNAP-10 (§28),
-> and 2026-10-07 for the M6a whole-branch review (§28.2).
+> 2026-10-07 for the M6a whole-branch review (§28.2), 2026-10-08 for M6b's planning findings
+> (§29), and 2026-10-13 for M6b's exit (§30).
 
 | Status | Count (v1 scope) | Notes |
 |---|---|---|
 | ✅ Resolved | the large majority | Design closed by a research/spec doc or a probe. |
-| 🔄 Partial | 2 | DA-SNAP-7, DA-SRC-9 (neither blocks the plan); DA-MS-3 is a decided caveat. DA-X-8 ✅ 2026-09-26. |
-| 🟥 Open (v1) | **11** | DA-SRC-13…18, carried from M5 (§27); DA-SNAP-10 🆕 2026-10-03 (§28.1); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
+| 🔄 Partial | 2 | DA-SNAP-7, DA-SRC-9 (neither blocks the plan). DA-MS-3 is a decided caveat. DA-X-8 ✅ 2026-09-26; DA-SRC-16 and DA-X-12 ✅ 2026-10-13 (§30). |
+| 🟥 Open (v1) | **14** | DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-10 🆕 2026-10-03 (§28.1); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2); DA-CLUS-14, DA-API-11, DA-OPS-7 and DA-SRC-20 🆕 2026-10-13 (§30.1). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
 | 🧪 Verify (v1) | **0** | DA-SRC-10/11 proven 2026-09-26 (§21). |
 | ⏭ v2 | 13 | Iceberg-sink items (§26.2). |
 | 🟢 Spec-merge debt | **0** | All applied 2026-09-26 (§26.6): §19.3 S-1…S-6, the DA-X-8 config residual, the D-V1 patches and the Data-Flow Phase 2a probe details. |
@@ -383,10 +384,11 @@ the MySQL path with one genuine correctness dependency.
 | DA-SRC-13 | Publication blind spots | 🟢 | 🆕 🟥 | Carried from M5; detail in §27. | — |
 | DA-SRC-14 | `bit` / `varbit` / PostGIS keys | 🟢 | 🆕 🟥 | Carried from M5; detail in §27. | — |
 | DA-SRC-15 | Snapshot collation and chunk edges | 🟢 | 🆕 🟥 | Carried from M5; detail in §27. | — |
-| DA-SRC-16 | The replication connection's timeouts | 🟢 | 🆕 🟥 | Carried from M5; detail in §27. | — |
+| DA-SRC-16 | The replication connection's timeouts | 🟢 | ✅ | Carried from M5; detail in §27. **✅ 2026-10-13** — M6b Task 22: the stream watchdog ends a session whose stream is silent while the slot finds no reader, and the catalog connect is bounded by `timeouts.connect` (§30). | — |
 | DA-SRC-17 | Source edges PostgreSQL doesn't produce, and small gaps | 🟢 | 🆕 🟥 | Carried from M5; detail in §27. | — |
 | DA-SRC-18 | M5 test gaps | 🟢 | 🆕 🟥 | Carried from M5; detail in §27. | — |
 | DA-SRC-19 | 🆕 Which permanent chunk-read errors are table-scoped | 🟢 | 🟥 | §28.2. A permanent chunk-read error ends the whole pipeline (D-M6a.7); a retyped key's 42883/42804 would loop it through restarts though only that table's read is broken. A non-drop 42703 (e.g. a quoting bug) now retries as "changed under the snapshot" until `SNAPSHOT_TIMEOUT`, with a warning per streak. Rule per SQLSTATE which errors halt the table and which end the pipeline, with MySQL's in view (M7/M9). | — |
+| DA-SRC-20 | 🆕 A PostgreSQL source failover moves positions backwards | 🟡 | 🟥 | §30.1. The position guard assumes an LSN only grows. After a failover to a replica whose WAL ends behind the table's marker, the new primary reuses LSNs the lake has already marked, and the guard skips its changes, so data is lost. `Delivery_Guarantee_and_Position_Guard.md` §6 designs a source failover for MySQL only (a new `server_uuid`). Design the PostgreSQL case: detect the timeline or system identifier change, then halt or re-snapshot. | — |
 
 ---
 
@@ -430,6 +432,7 @@ unauthenticated. The auth *mechanism* (jwt/oauth2 verification params) was alrea
 | DA-API-8 | STOPPED keeps its lease (owner idle) | 🟢 | ✅ | §2 — avoids ring churn, immediate resume; cost = one idle renewal. | D-NEW15.1 |
 | DA-API-9 | PAUSE flushes to a clean boundary (no at-risk buffer at failover) | 🟡 | ✅ | §2/§4 — resume is fast (warm, no buffer reconcile). | D-NEW15.3 |
 | DA-API-10 | Reload must not resurrect a paused/stopped pipeline | 🟡 | ✅ | §4 — runtime `desired_state` wins over config's implicit "should run." | §9.6 |
+| DA-API-11 | 🆕 A desired-state change missed between two polls | 🟢 | 🟥 | §30.1. The controller samples `pipeline-state.json` once per renewal interval, so a stop and a resume between two polls don't clear `ERROR` (Lifecycle §3). The M9 API wakes the controller, or the document carries a generation the controller compares. | — |
 
 ---
 
@@ -447,6 +450,7 @@ pinning is the remaining cross-cutting concern.
 | DA-OPS-3 | `glue.strip_schema` collision handling | 🟢 | ✅ | G-11.3 — collision = config error; non-stripped = `schema__table`. | G-11.3 |
 | DA-OPS-4 | Sink/catalog unavailability → DEGRADED back-pressure | 🟡 | ✅ | G-27/G-35 — stop consuming once buffers fill, protect slot/WAL via G-22; recover on next commit; catalog circuit breaker. | G-27, G-35 |
 | DA-OPS-5 | k8s deployment as StatefulSet (not Deployment) | 🟡 | ✅ | Clustering §3.4/§10.2 — stable `node_name` via Downward API; headless Service discovery. | D-1, D-4 |
+| DA-OPS-7 | 🆕 A controller task that panics goes unnoticed | 🟢 | 🟥 | §30.1. The reconciler looks at a controller's task only at shutdown: after a panic the pipeline is unmanaged, its lease expires with no takeover on a single node, and `/health/ready` stays 200. Supervise the tasks (log, mark the pipeline `error`) or fail readiness (M8/M10). | — |
 | DA-OPS-6 | "Restart ≠ apply config" operator footgun | 🟢 | ✅(documented) | Clustering §9.3 D-3 — cloud-generation-wins; a pod restart does **not** apply ConfigMap edits, only `POST /reload` does. Document loudly. | D-3 |
 | DA-DEP-1 | iceberg-rust pinned version & capabilities | 🟡 | ⏭ v2 | `iceberg` 0.10.1, MSRV 1.94 (main has moved to 1.95, #3083; Sources_Index needs refreshing from 1.92). Multiple capability gates ride on the exact version: DA-SINK-1, DA-SINK-2, DA-SCHEMA-8, DA-TYPE-5, DA-SINK-10. Pin and assert at startup. **2026-09-26 tidy:** Iceberg-sink only — deferred with the Iceberg sink to v2. | — |
 | DA-DEP-2 | OpenDAL version exposing conditional writes | 🔴 | ✅ | Clustering §17.2 — `if_match` on writes landed late-2024/early-2025; the `iceberg-storage-opendal` transitive pin must be ≥ that, and capabilities asserted at startup (refuse to start if absent). Part of DA-CLUS-1. **2026-09-26 tidy:** superseded — DA-CLUS-1 closed with a per-backend `LeaseStore` (OpenDAL only on S3, where `if_match` exists; native SDKs for GCS/Azure); the Delta sink uses object_store conditional puts (P8), not OpenDAL. | D-5 |
@@ -1555,3 +1559,57 @@ slot document); `until_durable` polls neither control nor the stream (a drain du
 outage inside a schema signal waits for the sink); the Delta sink has no test of a snapshot set
 committed at a covered frontier (the slice-1 E2E suite on RustFS should emit a chunk on an idle
 source).
+
+---
+
+## 29. M6b single-node control — the planning findings answered (2026-10-08)
+
+M6b's plan (`doc/v1.0/M6b-single-node-control.md`, in review) put six findings to the owner, who
+answered them on 2026-10-08 (the plan's Q-M6b-9…13). Spec edits approved and applied:
+`Configuration_Specification.md` §9.4.3 and V-119 (`sink.delta.merge_memory_limit`) and the
+`System-Overview.md` Observability catalogue (the exposed sample names); with the new tasks,
+`Data-Flow.md` Phase 4 (the guard compares a table's last change) and notes in
+`Configuration_Specification.md` §6.4, §9.2 and §9.2.1. The plan was approved the same day.
+
+| ID | Change | Evidence |
+|---|---|---|
+| DA-SRC-16 | 🟥 → 🔄. Q-M6b-11 reverses D-M6a.9: M6b Task 22 builds a stream watchdog. A stream silent for 3 heartbeats while 3 heartbeat reads of the slot in a row fail or find no reader (`active`) ends the session, and the worker reconnects; a read still out counts neither way (it may wait behind a chunk read). The catalog connect is bounded by `timeouts.connect` as a whole. Closes when the task lands. Still open: no TCP keep-alive on the replication socket (it wouldn't catch a frozen server, which answers TCP), and the read-ahead counts events, not bytes | Measured 2026-10-08, PostgreSQL 14 frozen with `docker pause` for 150 s under a running pipeline: status `running`, no reconnect, nothing logged; tokio-postgres's `connect_timeout` bounds only the TCP connect, so a reconnect waits in the startup. With the task (scratch): the E2E scenario reconnects during the freeze, logs the reason, and converges after the unpause |
+| DA-SNAP-11 | Stays 🟥, advanced: M6b Task 7 exports the reconciler log's size (`data_avalanche_reconcile_log_entries`, `data_avalanche_reconcile_log_keys`). Bounding the log stays open | M6b plan, Task 7 |
+
+Also answered, with no gap of their own: the Delta libraries log only warnings at a bare `info`,
+and the sink no longer provokes the kernel's ERROR on an absent table (Q-M6b-10, Task 23); a stop
+and a resume rerun an ERROR pipeline, as a process restart would, until M9's restart verb
+(Q-M6b-12, `Pipeline_Lifecycle_State_Machine.md` §3).
+
+### 29.1 New gaps
+
+| ID | Gap | Severity | Surfaced by | Next |
+|---|---|---|---|---|
+| DA-X-12 | 🔄 The position guard compared a change set's end, the flush frontier, so a replay after a crash was rarely skipped: keep-alives and other databases' WAL move the frontier past the table's marker. The whole replay was merged again: correct (the MERGE is idempotent, Data-Flow: "optimization, not correctness"), but at full cost | 🟢 | M6b planning, the crash scenarios (marker `0/409EA098` against a replay ending at `0/409EA1B0`) | M6b Task 21: the set carries its table's last change, which the guard compares; the marker stays the frontier, as Data-Flow's checkpoint rule requires. Measured in scratch: the replay was a third Delta commit before, and is skipped after. Closes when the task lands (the Data-Flow Phase 4 patch is applied) |
+
+## 30. M6b single-node control — the exit (2026-10-13)
+
+M6b (`doc/v1.0/M6b-single-node-control.md`) was executed 2026-10-08…13: 24 tasks, review fixes
+on Tasks 1, 6, 8, 9, 10, 17, 19, 20 and 22, and a whole-branch review that found no Critical and
+one Important issue (CI linted neither the `e2e-hooks` feature nor its crash parser), fixed
+before the PR with the cheap Minors (the plan's "Deviations during execution"). The slice-1 E2E
+suite (26 scenarios) passes on PostgreSQL 18 and 14 with RustFS.
+
+| ID | Change | Evidence |
+|---|---|---|
+| DA-X-12 | 🔄 → ✅. The change set carries its table's last change (`PositionRange.last_change`), which the position guard compares; the marker stays the flush frontier. A replay after a crash is skipped. The guard assumes source positions never move backwards; a PostgreSQL failover breaks that assumption, which is tracked as DA-SRC-20 (§30.1) | M6b Task 21; the E2E crash scenario asserts that the replay adds no Delta commit |
+| DA-SRC-16 | 🔄 → ✅. The stream watchdog (3 silent heartbeats while 3 heartbeat reads of the slot fail or find no reader) ends the session and the worker reconnects; a paused session doesn't read the stream and is never ended as silent; the catalog connect is bounded by `timeouts.connect`. Not built, by design: a TCP keep-alive on the replication socket (a frozen server still answers TCP), and a byte-sized read-ahead (it counts 8192 events) | M6b Task 22 and its review fix; the E2E scenario freezes PostgreSQL with `docker pause`, and the pipeline reconnects and converges after the unpause |
+
+### 30.1 New gaps from the M6b whole-branch review
+
+| ID | Gap | Severity | Surfaced by | Next |
+|---|---|---|---|---|
+| DA-CLUS-14 | A lease store and a lake that disagree on the epoch (a moved, restored or deleted `globals.state`): a fenced worker re-takes its own lease at the stored epoch + 1 and climbs one worker run per epoch; with two live lease stores on one lake, the climb defeats the fence | 🟢 | Whole-branch review M-1 (the Task 9 "deleted lease" note) | Carry the fence's `current_epoch` into the next takeover, or go to `ERROR` naming the disagreement (M8) |
+| DA-API-11 | A desired-state change missed between two polls: a stop and a resume inside one renewal interval don't clear `ERROR` | 🟢 | Whole-branch review M-8 | The M9 API wakes the controller, or the state document carries a generation |
+| DA-OPS-7 | A controller task that panics goes unnoticed until shutdown, and readiness stays 200 | 🟢 | Whole-branch review M-7 | Supervise the controller tasks, or fail readiness (M8/M10) |
+| DA-SRC-20 | A PostgreSQL source failover moves positions backwards: after a failover to a replica whose WAL ends behind the table's marker, the guard skips the new primary's changes at LSNs the lake already marked (data loss) | 🟡 | Task 21 review M4; owner ruling 2026-10-13 (its own gap, not a DA-X-12 note) | Design the PostgreSQL case beside MySQL's (`Delivery_Guarantee…` §6): detect the timeline or system-identifier change, then halt or re-snapshot |
+
+Carried as notes, not gaps: the cluster crate's public API returns `String` errors (M8 adds callers);
+a second signal does nothing during the drain, and a listener that dies at runtime goes unlogged
+(M10); the E2E suite lacks two System-Overview table-state cases, its TRUNCATE check would pass
+under a rewrite, and DuckDB fetches its Delta extension from the network.

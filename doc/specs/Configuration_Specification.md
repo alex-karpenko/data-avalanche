@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-03
+updated: 2026-10-08
 domain: Architecture
 status: Specification (supersedes the Configuration_file_model.md draft)
 tags: [architecture, configuration, spec, validation, multi-sink, iceberg, delta-lake]
@@ -388,7 +388,7 @@ error, to accommodate that topology.
 
 | Field | Type | Required | Default | Mutability | Notes |
 |---|---|---|---|---|---|
-| `level` | string | no | `info` | R | `trace`\|`debug`\|`info`\|`warn`\|`error`; per-module granularity allowed (`tracing` EnvFilter syntax, e.g. `info,rustcdc::sink=debug`). Hot-changeable. |
+| `level` | string | no | `info` | R | `trace`\|`debug`\|`info`\|`warn`\|`error`; per-module granularity allowed (`tracing` EnvFilter syntax, e.g. `info,rustcdc::sink=debug`). A bare level of `info` or quieter also caps the Delta libraries: `buoyant_kernel` and `deltalake_core` at `warn`, `deltalake_core::operations::merge` at `error`; a filter that names one of them is taken as written. Hot-changeable. |
 | `format` | enum `json`\|`compact`\|`pretty` | no | `json` | R | Output format on stderr. |
 
 > Note: `System-Overview.md` states log level/format are command-line parameters. This spec
@@ -669,7 +669,7 @@ source:
 | `credentials_file` | path | yes (resolvable) | — | PR | Alternative to `user`/`password` (§4.6): path to JSON `{user, password}`. Mutually exclusive with them (V-065). Rotating the file's contents + reload rotates the DB credentials without a process restart. |
 | `ssl_mode` | enum | no | `require` | PR | `disable`\|`allow`\|`prefer`\|`require`\|`verify-ca`\|`verify-full`. `allow` is **invalid for MySQL** (V-030). |
 | `ssl_cert` / `ssl_key` / `ssl_ca` | PEM/path | no | — | PR | §4.4. |
-| `timeouts.connect` | Duration | no | `10s` | PR | |
+| `timeouts.connect` | Duration | no | `10s` | PR | The whole connection setup: TCP, TLS, startup and authentication. |
 | `timeouts.command` | Duration | no | `30s` | PR | |
 | `timeouts.snapshot` | Duration | no | `6h` | PR | **Per-table** snapshot timeout. At least `10s` (V-118). |
 | `toast_strategy` | enum `carry_forward`\|`re_query` | no | `carry_forward` | PR | **PostgreSQL only.** Handling of unchanged TOAST(out-of-line) columns in UPDATE events: `carry_forward` reuses the last known value; `re_query` re-fetches the row over the control connection. `re_query` on high-volume snapshots may saturate the control pool (V-077 warning). Ignored for MySQL. See `research/Type_Mapping.md`. |
@@ -684,7 +684,7 @@ source:
 | `publication` | string | yes | — | PR | PG publication name. Must be a valid identifier; unique per source DB across pipelines (V-059). Auto-created/maintained by the app. Case-sensitive: the app always quotes it (`MyPub` is the publication `"MyPub"`). |
 | `slot` | string | yes | — | PR | Logical replication slot name. Charset `^[a-z_][a-z0-9_]{0,62}$` (PG constraint); **unique** per source host+db across pipelines (V-058). |
 | `auto_cleanup` | bool | no | `true` | R | Drop the slot & publication when the pipeline is deleted. Teardown-time policy flag only — consulted at deletion/`id`-change, not on the live path, so a change applies in place with no restart. |
-| `heartbeat` | Duration | no | `60s` | R | StandbyStatusUpdate interval; keeps the connection alive and prevents WAL-lag-as-inactivity. |
+| `heartbeat` | Duration | no | `60s` | R | StandbyStatusUpdate interval; keeps the connection alive and prevents WAL-lag-as-inactivity. Also paces the stream watchdog: a stream silent for 3 heartbeats while the heartbeat's reads of the slot fail or find no reader is reconnected (DA-SRC-16). |
 | `slot_management` | enum `managed`\|`require_existing` | no | `managed` | PR | `managed`: create the slot if absent, reuse if present, drop on delete per `auto_cleanup`. `require_existing`: never create (DBA-owned slot; error if absent) and **requires `auto_cleanup: false`** (V-103). `research/Postgres_Slot_and_Publication_Lifecycle.md` §2. |
 | `slot_on_orphan` | enum `halt`\|`adopt_resnapshot` | no | `halt` | R | Slot exists but the pipeline has no state for it. `halt`: refuse to start, naming the slot. `adopt_resnapshot`: take ownership, restart from a fresh consistent point and incrementally re-snapshot all tables. Resume-from-slot without a snapshot is never offered. (Slot-lifecycle doc §1.1; named `slot_on_orphan` because `slot` is the slot-name string.) |
 | `max_wal_lag_bytes` | ByteSize \| null | no | `null` | R | WAL-retention guard (G-22). `data_avalanche_wal_lag_bytes` is always emitted; when set and exceeded the pipeline **halts** to protect the source disk. `null` = alert only. ≥ 64 MiB when set (V-104). |
@@ -806,6 +806,7 @@ Constraints: all three `null` is an **error** (V-035). `seconds: null` with at l
 #### 9.4.3 `sink.delta` (iff `type = delta`)
 
 Settings apply when the sink **creates** a table; existing tables keep their properties.
+`merge_memory_limit` is the exception: it bounds every MERGE.
 
 | Field | Type | Required | Default | Mutability | Notes |
 |---|---|---|---|---|---|
@@ -813,6 +814,7 @@ Settings apply when the sink **creates** a table; existing tables keep their pro
 | `checkpoint_interval` | integer | no | `10` | PR (new tables) | → `delta.checkpointInterval`. ≥ 1. |
 | `log_retention` | Duration | no | `30d` | PR (new tables) | → `delta.logRetentionDuration`. Expired-log cleanup runs as a post-commit hook (format metadata housekeeping). |
 | `timestamp_ntz_as` | enum `timestamp_ntz`\|`timestamp`\|`string` | no | `timestamp_ntz` | PR (new tables) | Delta type for source `timestamp without time zone` columns (DA-MS-8). `timestamp_ntz`: exact semantics, but the table is created at **reader v3 / writer v7** (`timestampNtz` table feature) — engines without table-feature support cannot read it. `timestamp`: the wall-clock value stored as a UTC instant; keeps the protocol at reader 1 / writer 2, loses the no-time-zone marker. `string`: `YYYY-MM-DD HH:MM:SS.ffffff`. A per-column `tables.column_type_overrides` entry takes precedence. Existing tables keep their column type. V-114. |
+| `merge_memory_limit` | ByteSize \| null | no | `null` | PR | Memory ceiling of one table's MERGE (DataFusion's memory pool). `null` = no ceiling. A MERGE that needs more fails the same way on every replay, so the failure is permanent: the table halts `SINK_REJECTED`, its reason naming this key; raise it, or lower the `flush` bounds, then re-snapshot the table. ≥ 16 MiB when set (V-119). |
 | `table_properties` | map<string,string> | no | `{}` | PR (new tables) | Passthrough of table properties. `delta.*` keys must be on the allow-list (V-093): `delta.dataSkippingNumIndexedCols`, `delta.dataSkippingStatsColumns`, `delta.deletedFileRetentionDuration`, `delta.targetFileSize`, `delta.tuneFileSizesForRewrites`, `delta.checkpoint.writeStatsAsJson`, `delta.checkpoint.writeStatsAsStruct`. Keys without the `delta.` prefix pass through unchanged. |
 | `catalog.type` | enum `none`\|`glue`\|`unity`\|`hive` | no | `none` | PR | Catalog **registration** of Delta tables. v1 implements `none` (path-based tables); other values are reserved (V-088). |
 
@@ -1272,6 +1274,7 @@ errors.
 | V-115 | `sink.iceberg.catalog.type` / `sink.iceberg.catalog.hive` | `hive` → `error`: the pinned iceberg-rust HMS catalog cannot commit (`update_table` is `FeatureUnsupported`; DA-CAT-6). Lifted when a pinned release implements it and the iceberg-capability probe passes against a real HMS. | error | pipeline |
 | V-116 | `sink.iceberg.catalog.rest.auth` | `sigv4` → `error`: the pinned iceberg-rust REST client has no SigV4 signing (DA-CAT-7; upstream #3082/#3092). `none`/`bearer`/`oauth2` unaffected; on AWS use `catalog.glue`. Lifted when a pinned release carries SigV4 and it is probed against the Glue or S3 Tables REST endpoint. | error | pipeline |
 | V-118 | `source.timeouts.snapshot` | ≥ 10s. | error | pipeline |
+| V-119 | `sink.delta.merge_memory_limit` | ≥ 16 MiB when set. | error | pipeline |
 
 ### 13.4 Cross-field / conditional
 

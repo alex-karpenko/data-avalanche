@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-07
+updated: 2026-10-08
 domain: Architecture
 tags: [architecture, design, system, multi-sink, iceberg, delta-lake, v1-scope]
 sources: []
@@ -141,16 +141,18 @@ Pause/stop/resume set the pipeline's persisted **desired state**; it survives re
 
 ## Observability catalogue
 
+Names are the exposed sample names (OpenMetrics): a counter's name ends in `_total`.
+
 **Cardinality:** every metric carries `{pipeline, source_host, source_db}`; a `table` label is added only when `sink.metrics.per_table = true`, and then only to a few per-table gauges (snapshot progress, lag). Series count scales with pipelines, not tables, by default. Source: `research/Observability_Metrics_and_Tracing.md`.
 
 | Family | Metrics (mandatory) |
 |---|---|
 | Replication | `data_avalanche_replication_lag_seconds` (headline — see the lag targets in Scope), `data_avalanche_rows_read_total{op}`, `data_avalanche_rows_written_total`, `data_avalanche_flush_duration_seconds`, `data_avalanche_flush_rows`, `data_avalanche_transaction_buffer_bytes` |
 | Source health | `data_avalanche_wal_lag_bytes` (PG) / `data_avalanche_binlog_lag_seconds` (MySQL/MariaDB), `data_avalanche_source_reconnects_total` |
-| Snapshot | `data_avalanche_snapshot_rows_done`, `data_avalanche_snapshot_state`, `data_avalanche_snapshot_chunk_duration_seconds` |
-| Sink | `data_avalanche_sink_commit_duration_seconds{sink_type}`, `data_avalanche_sink_commit_failures_total`; Delta MERGE cost and maintenance signals: `data_avalanche_sink_merge_files_rewritten`, `data_avalanche_sink_merge_rows_copied`, `data_avalanche_sink_soft_dropped_columns` |
+| Snapshot | `data_avalanche_snapshot_rows_done`, `data_avalanche_snapshot_state`, `data_avalanche_snapshot_chunk_duration_seconds`, `data_avalanche_reconcile_log_entries`, `data_avalanche_reconcile_log_keys` (the snapshot reconciler's log, DA-SNAP-11) |
+| Sink | `data_avalanche_sink_commit_duration_seconds{sink_type}`, `data_avalanche_sink_commit_failures_total`; Delta MERGE cost and maintenance signals: `data_avalanche_sink_merge_files_rewritten_total`, `data_avalanche_sink_merge_rows_copied_total`, `data_avalanche_sink_soft_dropped_columns` |
 | Clustering | `data_avalanche_lease_state`, `data_avalanche_lease_renew_failures_total`, `data_avalanche_lease_renew_latency_seconds`, `data_avalanche_cluster_members`, `data_avalanche_owned_pipelines`, `data_avalanche_ring_generation` |
-| Status | `data_avalanche_pipeline_status` (running / paused / stopped / error) |
+| Status | `data_avalanche_pipeline_status` (running / paused / stopped / error), `data_avalanche_halted_tables` |
 
 **Tracing:** a span per flush/commit cycle, per snapshot chunk and per DDL apply (no per-event spans), sampled by `globals.tracing.sample_ratio`.
 

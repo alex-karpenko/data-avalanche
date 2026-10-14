@@ -1,8 +1,8 @@
 ---
-updated: 2026-09-30
+updated: 2026-10-08
 domain: Data Flow
 tags: [delivery-guarantee, exactly-once, gtid, lsn, idempotency, checkpoint, multi-table, cdc]
-resolves: [G-14]
+resolves: [G-14, DA-X-12]
 sources: []
 ---
 
@@ -83,9 +83,12 @@ into the GTID set; `union`/`covers` handle multiple UUIDs naturally.
 ## §3 — Guard scope and the safe resume point (D-14.2)
 
 - **Per-table high-water mark.** Each Iceberg table's snapshot summary carries its own
-  `cdc.committed_position`. The guard compares a flush's per-table position against that table's
-  **latest own** marker (below): if `table.committed_position.covers(flush.position_for_table)` →
-  already committed, skip writing that table. A split-commit slice is the exception: its range
+  `cdc.committed_position`. The guard compares a flush's per-table last change against that
+  table's **latest own** marker (below): if `table.committed_position.covers(flush.last_change_for_table)`
+  → already committed, skip writing that table. The last change is the commit position of the
+  flush's last transaction that wrote the table, not the flush frontier the marker records: a
+  replay's flush may end past the marker (a keep-alive, another table's transaction) while
+  carrying only transactions the table has (DA-X-12, M6b 2026-10-08). A split-commit slice is the exception: its range
   ends at its transaction's pinned start, so it is skipped only when the stored position is
   **strictly past** that start (`Large_Transaction_Handling.md` §1; spec edit S-P).
 - **"Latest own", not "latest" (DA-X-10, 2026-09-26).** Foreign commits (external compaction,

@@ -323,6 +323,15 @@ pub fn cases() -> Vec<Case> {
         case("V-118", Silent, "snapshot timeout 10s", || {
             pg_delta().set("/pipelines/p/source/timeouts/snapshot", json!("10s"))
         }),
+        case("V-119", Error, "merge memory 1MiB", || {
+            pg_delta().set("/pipelines/p/sink/delta/merge_memory_limit", json!("1MiB"))
+        }),
+        case("V-119", Silent, "merge memory 16MiB", || {
+            pg_delta().set("/pipelines/p/sink/delta/merge_memory_limit", json!("16MiB"))
+        }),
+        case("V-119", Silent, "merge memory null", || {
+            pg_delta().set("/pipelines/p/sink/delta/merge_memory_limit", json!(null))
+        }),
         case("V-118", Error, "snapshot timeout 9999ms", || {
             pg_delta().set("/pipelines/p/source/timeouts/snapshot", json!("9999ms"))
         }),

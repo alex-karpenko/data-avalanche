@@ -1004,6 +1004,14 @@ pub const RULES: &[RuleMeta] = &[
         r#"source.timeouts.snapshot"#,
         r#"≥ 10s."#,
     ),
+    rule(
+        "V-119",
+        Error,
+        L::Pipeline,
+        Config,
+        r#"sink.delta.merge_memory_limit"#,
+        r#"≥ 16 MiB when set."#,
+    ),
 ];
 
 /// The registry entry for `id` (`"V-007"`).
@@ -1017,7 +1025,7 @@ mod tests {
 
     #[test]
     fn has_every_spec_rule_once_in_order() {
-        assert_eq!(RULES.len(), 113);
+        assert_eq!(RULES.len(), 114);
         assert!(
             RULES.windows(2).all(|w| w[0].id < w[1].id),
             "sorted, no duplicates"

@@ -109,6 +109,7 @@ impl PipelineWorker {
             wal_lag_failing: Streak::default(),
             writers_waited: BTreeSet::new(),
             read_failing: BTreeMap::new(),
+            pause: false,
         };
         (Self { core }, WorkerHandle { control, status })
     }
@@ -140,10 +141,15 @@ impl PipelineWorker {
             if opened.elapsed() >= core.tuning.source_backoff.max {
                 attempt = 0;
             }
+            // A reconnect is counted once it is decided, in one update with its reason: an
+            // observer that sees the count sees why.
             match failed {
                 SourceError::Transient(error) => {
                     contended_since = None;
-                    core.update(|st| st.phase = Phase::Reconnecting { error });
+                    core.update(|st| {
+                        st.reconnects += 1;
+                        st.phase = Phase::Reconnecting { error };
+                    });
                 }
                 SourceError::Contended(detail) => {
                     let since = *contended_since.get_or_insert_with(Instant::now);
@@ -151,14 +157,27 @@ impl PipelineWorker {
                     if waited >= core.tuning.contended_window {
                         return Err(WorkerError::Contended { waited, detail });
                     }
+                    let error = SourceError::Contended(detail).to_string();
+                    core.update(|st| {
+                        st.reconnects += 1;
+                        st.phase = Phase::Reconnecting { error };
+                    });
                 }
                 SourceError::PositionUnreachable { position, detail } => {
                     contended_since = None;
                     let warning = format!(
                         "the source lost the stream position {position} ({detail}): the stream restarts at a new position and the tables are snapshotted again"
                     );
-                    core.update(|st| st.warnings.push(warning));
-                    let from = retry(&core.tuning, || core.source.reset_position()).await?;
+                    core.update(|st| {
+                        st.reconnects += 1;
+                        st.warn(warning);
+                    });
+                    let from = write_retry(
+                        &core.tuning,
+                        || core.may_write(),
+                        || core.source.reset_position(),
+                    )
+                    .await?;
                     start(core, Some(from)).await?;
                     attempt = 0;
                     continue;
@@ -193,6 +212,9 @@ async fn drained_while(core: &mut Core, delay: std::time::Duration) -> bool {
             () = &mut sleep => return false,
             cmd = core.control.recv() => match cmd {
                 Some(Command::Flush) => {}
+                // The next session parks (or reads) as it opens.
+                Some(Command::Pause) => core.pause = true,
+                Some(Command::Resume) => core.pause = false,
                 Some(Command::Drain) | None => return true,
             },
         }
@@ -200,13 +222,30 @@ async fn drained_while(core: &mut Core, delay: std::time::Duration) -> bool {
 }
 
 /// A source call, retried while it fails transiently.
-async fn retry<T, F, Fut>(tuning: &Tuning, mut call: F) -> Result<T, WorkerError>
+async fn retry<T, F, Fut>(tuning: &Tuning, call: F) -> Result<T, WorkerError>
 where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, SourceError>>,
+{
+    write_retry(tuning, || Ok(()), call).await
+}
+
+/// A source write, retried while it fails transiently: `may_write` (`Core::may_write`) is asked
+/// before every try, as the writer asks before each commit, so a lease that lapses during the
+/// retries stops the write.
+async fn write_retry<T, G, F, Fut>(
+    tuning: &Tuning,
+    may_write: G,
+    mut call: F,
+) -> Result<T, WorkerError>
+where
+    G: Fn() -> Result<(), WorkerError>,
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, SourceError>>,
 {
     let mut attempt = 0;
     loop {
+        may_write()?;
         match call().await {
             Ok(v) => return Ok(v),
             Err(e) if e.is_transient() => {
@@ -218,20 +257,27 @@ where
     }
 }
 
-/// A sink call, retried while it fails transiently.
-async fn sink_retry<T, F, Fut>(tuning: &Tuning, mut call: F) -> Result<T, SinkError>
+/// A sink call, retried while it fails transiently. A write passes `Core::may_write` as
+/// `may_write`, asked before every try (as in [`write_retry`]); a read passes `|| Ok(())`.
+async fn sink_retry<T, G, F, Fut>(
+    tuning: &Tuning,
+    may_write: G,
+    mut call: F,
+) -> Result<T, WorkerError>
 where
+    G: Fn() -> Result<(), WorkerError>,
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, SinkError>>,
 {
     let mut attempt = 0;
     loop {
+        may_write()?;
         match call().await {
             Err(e) if e.is_transient() => {
                 tokio::time::sleep(tuning.sink_backoff.delay(attempt)).await;
                 attempt += 1;
             }
-            r => return r,
+            r => return r.map_err(WorkerError::Sink),
         }
     }
 }
@@ -267,6 +313,7 @@ pub(crate) async fn start(
         SinkKind::Delta => "delta",
         SinkKind::Iceberg => "iceberg",
     };
+    core.may_write()?;
     match core.docs.open(&s.pipeline_id, sink_type).await {
         Ok(_) => {}
         Err(e @ (StateError::SinkTypeMismatch { .. } | StateError::PipelineIdMismatch { .. })) => {
@@ -374,10 +421,17 @@ pub(crate) async fn start(
             if slot_doc.is_none()
                 && let Some(name) = &core.settings.slot_intent
             {
+                core.may_write()?;
                 core.docs.save_slot(&SlotDoc::intent(name)).await?;
             }
             let refs: Vec<TableRef> = resolved_tables.keys().cloned().collect();
-            let prepared = retry(&tuning, || source.prepare(checkpoint.as_ref(), &refs)).await?;
+            // `prepare` may create, recreate or advance the slot.
+            let prepared = write_retry(
+                &tuning,
+                || core.may_write(),
+                || source.prepare(checkpoint.as_ref(), &refs),
+            )
+            .await?;
             warnings.extend(prepared.warnings);
             match prepared.plan {
                 StartPlan::Resume => {
@@ -424,9 +478,7 @@ pub(crate) async fn start(
             tracked.insert(table.clone());
             continue;
         }
-        let state = sink_retry(&tuning, || sink.table_state(table))
-            .await
-            .map_err(WorkerError::Sink)?;
+        let state = sink_retry(&tuning, || Ok(()), || sink.table_state(table)).await?;
         let doc = core.docs.table_snapshot(table).await?.map(|v| v.doc);
         let in_progress = doc
             .as_ref()
@@ -511,14 +563,14 @@ pub(crate) async fn start(
             _ => {}
         }
         if !state.exists {
-            match sink_retry(&tuning, || sink.ensure_table(&spec)).await {
+            match sink_retry(&tuning, || core.may_write(), || sink.ensure_table(&spec)).await {
                 Ok(()) => {}
-                Err(SinkError::Permanent { reason }) => {
+                Err(WorkerError::Sink(SinkError::Permanent { reason })) => {
                     halts.push((table.clone(), HaltReason::SinkRejected { detail: reason }));
                     tracked.insert(table.clone());
                     continue;
                 }
-                Err(e) => return Err(WorkerError::Sink(e)),
+                Err(e) => return Err(e),
             }
         }
         if !tracked_before || matches!(plan, Plan::Fresh(_)) {
@@ -532,6 +584,7 @@ pub(crate) async fn start(
 
     // Persist, in this order: a restart in between redoes what follows.
     for (table, reason) in &halts {
+        core.may_write()?;
         core.docs
             .record_halt(&TableHalt {
                 table: table.clone(),
@@ -541,6 +594,7 @@ pub(crate) async fn start(
             .await?;
     }
     for table in &requests {
+        core.may_write()?;
         core.docs
             .save_table_snapshot(&TableSnapshotDoc {
                 table: table.clone(),
@@ -557,6 +611,7 @@ pub(crate) async fn start(
         core.snapshot_started.remove(table);
     }
     for table in &abandoned {
+        core.may_write()?;
         core.docs
             .save_table_snapshot(&TableSnapshotDoc {
                 table: table.clone(),
@@ -587,18 +642,20 @@ pub(crate) async fn start(
     // new checkpoint under the cache of before the baseline, as if the stream still held the
     // change.
     for schema in &schemas {
+        core.may_write()?;
         core.docs.save_table_schema(schema).await?;
     }
     if let Some(doc) = fresh {
         if core.hooks.at(&HookPoint::SchemasCached) == HookAction::Crash {
             return Err(WorkerError::Crashed(HookPoint::SchemasCached));
         }
+        core.may_write()?;
         core.docs.save_slot(&doc).await?;
     }
     core.tracked = tracked;
     core.drifted = drifted;
     core.dump_only = dump_only;
-    core.update(|st| st.warnings.extend(warnings));
+    core.update(|st| warnings.into_iter().for_each(|w| st.warn(w)));
     Ok(())
 }
 
@@ -606,11 +663,13 @@ pub(crate) async fn start(
 mod tests {
     use data_avalanche_core::position::Lsn;
     use data_avalanche_core::{ColumnSchema, ColumnValue, ColumnValueType as V, Row};
-    use data_avalanche_testkit::{FakeTxn, Method};
+    use data_avalanche_testkit::{FakeTxn, Method, SinkOp};
 
     use super::*;
-    use crate::HookPoint;
-    use crate::test_support::{CrashAt, World, Yaml, fast, row, t, wait_until};
+    use crate::test_support::{Countdown, CrashAt, World, Yaml, fast, row, t, wait_until};
+    use crate::{Backoff, HookPoint};
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
 
     fn rows(ids: std::ops::RangeInclusive<i64>) -> Vec<Row> {
         ids.map(|id| row(id, "x")).collect()
@@ -830,7 +889,7 @@ mod tests {
     async fn a_transient_failure_reopens_the_stream() {
         let w = World::new(&["a"]);
         w.started(&["a"]).await;
-        let (end, _) = run(&w, &mode("mode: never"), async |status| {
+        let (end, st) = run(&w, &mode("mode: never"), async |status| {
             w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
             streamed(&status, &w).await;
             w.source
@@ -842,6 +901,45 @@ mod tests {
         end.unwrap();
         assert_eq!(w.ids("a"), [1, 2]);
         assert_eq!(w.source.opened().len(), 2);
+        assert_eq!(st.reconnects, 1);
+    }
+
+    /// A pause that arrives between sessions (the reconnect's backoff) holds the next session as
+    /// it opens; a resume reads again.
+    #[tokio::test]
+    async fn a_pause_during_a_reconnect_parks_the_next_session() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let tuning = Tuning {
+            source_backoff: Backoff {
+                first: Duration::from_millis(300),
+                max: Duration::from_millis(300),
+            },
+            ..fast()
+        };
+        let (worker, handle) = PipelineWorker::new(&mode("mode: never"), deps(&w), tuning);
+        let driver = async {
+            w.source
+                .fail(Method::Next, SourceError::Transient("reset".into()));
+            wait_until("reconnecting", || {
+                matches!(handle.status.borrow().phase, Phase::Reconnecting { .. })
+            })
+            .await;
+            handle.control.send(Command::Pause).await.unwrap();
+            wait_until("the next session parks", || {
+                handle.status.borrow().phase == Phase::Paused
+            })
+            .await;
+            assert_eq!(w.source.opened().len(), 2, "a new session, parked");
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(w.ids("a").is_empty(), "nothing is read while paused");
+            handle.control.send(Command::Resume).await.unwrap();
+            wait_until("the row lands", || w.ids("a") == [1]).await;
+            handle.control.send(Command::Drain).await.unwrap();
+        };
+        let (end, ()) = tokio::join!(worker.run(), driver);
+        assert!(matches!(end, Ok(Exit::Drained)), "{end:?}");
     }
 
     #[tokio::test]
@@ -871,6 +969,70 @@ mod tests {
         })
         .await;
         assert!(matches!(end, Err(WorkerError::Contended { .. })), "{end:?}");
+    }
+
+    /// A source error that ends the worker is no reconnect: neither a permanent one nor a busy
+    /// slot past its window counts toward `reconnects`.
+    #[tokio::test]
+    async fn a_fatal_source_error_counts_no_reconnect() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.source.fail(
+            Method::OpenStream,
+            SourceError::Permanent("permission denied".into()),
+        );
+        let (end, st) = run(&w, &mode("mode: never"), async |_| {}).await;
+        assert!(
+            matches!(end, Err(WorkerError::Source(SourceError::Permanent(_)))),
+            "{end:?}"
+        );
+        assert_eq!(st.reconnects, 0);
+
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.source
+            .fail(Method::OpenStream, SourceError::Contended("active".into()));
+        let tuning = Tuning {
+            contended_window: Duration::ZERO,
+            ..fast()
+        };
+        let (worker, handle) = PipelineWorker::new(&mode("mode: never"), deps(&w), tuning);
+        let end = worker.run().await;
+        assert!(matches!(end, Err(WorkerError::Contended { .. })), "{end:?}");
+        assert_eq!(handle.status.borrow().reconnects, 0);
+    }
+
+    /// A busy slot's reconnect is counted with its reason, as a transient failure's is: the
+    /// owner logs a reconnect by the `Reconnecting` phase beside the count.
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_slot_reconnect_reports_its_reason() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.source.fail(
+            Method::OpenStream,
+            SourceError::Contended("replication slot \"s\" is active for PID 7".into()),
+        );
+        let tuning = Tuning {
+            source_backoff: Backoff {
+                first: Duration::from_secs(10),
+                max: Duration::from_secs(10),
+            },
+            ..fast()
+        };
+        let (worker, handle) = PipelineWorker::new(&mode("mode: never"), deps(&w), tuning);
+        let driver = async {
+            wait_until("one reconnect", || handle.status.borrow().reconnects == 1).await;
+            match &handle.status.borrow().phase {
+                Phase::Reconnecting { error } => {
+                    assert!(error.contains("held by another reader"), "{error}");
+                    assert!(error.contains("active for PID 7"), "{error}");
+                }
+                other => panic!("{other:?}"),
+            }
+            handle.control.send(Command::Drain).await.unwrap();
+        };
+        let (end, ()) = tokio::join!(worker.run(), driver);
+        assert!(matches!(end, Ok(Exit::Drained)), "{end:?}");
     }
 
     #[tokio::test]
@@ -1062,6 +1224,70 @@ mod tests {
         assert_eq!(w.ids("a"), [1]);
     }
 
+    /// A newer owner wrote the table: the evolve of a column the stream added is fenced, the
+    /// worker stops, and nothing of the transaction lands.
+    #[tokio::test]
+    async fn a_newer_owner_stops_the_worker_at_an_evolve() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let end = run_with(&mode("mode: never"), deps(&w), async |h| {
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+            streamed(&h.status, &w).await;
+            w.sink.take_over(&t("a"), 9);
+            w.source.alter(&t("a"), noted());
+            let mut r = row(2, "x");
+            r.0.push(("note".into(), ColumnValue::Text("n".into())));
+            w.source.commit(FakeTxn::new().insert(&t("a"), r));
+            // The status channel closes when the worker ends.
+            let mut st = h.status.clone();
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(10), st.wait_for(|_| false))
+                    .await;
+        })
+        .await;
+        assert!(
+            matches!(
+                end,
+                Err(WorkerError::Fenced {
+                    current_epoch: 9,
+                    ..
+                })
+            ),
+            "{end:?}"
+        );
+        assert_eq!(w.ids("a"), [1]);
+        let content = w.sink.content(&t("a")).unwrap();
+        assert!(content.column_by_name("note").is_none(), "nothing evolved");
+    }
+
+    /// The sink holds the table under another key (the source's key, or its override, changed
+    /// since the table was created): its first commit is refused, the table halts
+    /// `SINK_REJECTED` naming both keys, and the other tables go on.
+    #[tokio::test]
+    async fn a_sink_table_keyed_otherwise_halts_the_table() {
+        let w = World::new(&["a", "b"]);
+        let mut spec = TableSpec::new(&w.source.schema(&t("a")), vec![]).unwrap();
+        spec.identifier = vec!["id".into(), "doc".into()];
+        w.sink.ensure_table(&spec).await.unwrap();
+        let (end, st) = run(&w, &mode("mode: never"), async |status| {
+            w.source.commit(
+                FakeTxn::new()
+                    .insert(&t("a"), row(1, "x"))
+                    .insert(&t("b"), row(1, "x")),
+            );
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        match st.halted.get(&t("a")) {
+            Some(HaltReason::SinkRejected { detail }) => {
+                assert!(detail.contains("keyed by"), "{detail}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(w.ids("b"), [1]);
+    }
+
     #[tokio::test]
     async fn a_lost_lease_stops_the_worker_before_its_next_commit() {
         let w = World::new(&["a"]);
@@ -1081,6 +1307,106 @@ mod tests {
         .await;
         assert!(matches!(end, Err(WorkerError::LeaseLost)), "{end:?}");
         assert_eq!(w.ids("a"), [1]);
+    }
+
+    /// Phase 0's writes so far on a first start of table `a`, in their order.
+    async fn phase_0_writes(w: &World) -> usize {
+        let slot = w.docs.slot().await.unwrap().map(|v| v.doc);
+        [
+            w.docs.state().await.unwrap().is_some(),
+            slot.is_some(),
+            !w.source.prepares().is_empty(),
+            w.sink.table_state(&t("a")).await.unwrap().exists,
+            w.docs.table_snapshot(&t("a")).await.unwrap().is_some(),
+            w.docs.table_schema(&t("a")).await.unwrap().is_some(),
+            slot.is_some_and(|d| !d.is_intent()),
+        ]
+        .into_iter()
+        .filter(|&written| written)
+        .count()
+    }
+
+    /// A first start writes the pipeline document, the slot intent, the slot (`prepare`), the
+    /// sink table, the snapshot request, the schema and the checkpoint: seven writes, each asked
+    /// of the guard. The lease lapsing before write `n + 1` leaves exactly `n`, and the next start
+    /// completes the pipeline.
+    #[tokio::test]
+    async fn a_lease_lost_before_any_phase_0_write_stops_it_there() {
+        for n in 0..7 {
+            let w = World::new(&["a"]);
+            w.source.load(&t("a"), rows(1..=3));
+            let p = mode("mode: initial");
+            let mut d = deps(&w);
+            d.guard = Arc::new(Countdown(AtomicUsize::new(n)));
+            let (worker, _handle) = PipelineWorker::new(&p, d, fast());
+            let end = tokio::time::timeout(Duration::from_secs(5), worker.run())
+                .await
+                .expect("the lease lapses within Phase 0");
+            assert!(matches!(end, Err(WorkerError::LeaseLost)), "{n}: {end:?}");
+            assert_eq!(phase_0_writes(&w).await, n);
+            let (end, _) = run(&w, &p, async |status| streamed(&status, &w).await).await;
+            assert_eq!(end.unwrap(), Exit::Drained, "{n}");
+            assert_eq!(w.ids("a"), [1, 2, 3], "{n}");
+        }
+    }
+
+    /// A write retried while it fails transiently asks the guard before every try, as the writer
+    /// does: the lease lapsing between two tries of `prepare` (the third write) or `ensure_table`
+    /// (the fourth) stops it there, and the write never lands.
+    #[tokio::test]
+    async fn a_lease_lost_while_a_write_is_retried_stops_the_retry() {
+        for n in [3, 4] {
+            let w = World::new(&["a"]);
+            w.source.load(&t("a"), rows(1..=3));
+            if n == 3 {
+                for _ in 0..3 {
+                    w.source
+                        .fail(Method::Prepare, SourceError::Transient("down".into()));
+                }
+            } else {
+                w.sink
+                    .fail(SinkOp::EnsureTable, None, 3, || SinkError::Transient {
+                        reason: "down".into(),
+                    });
+            }
+            let mut d = deps(&w);
+            d.guard = Arc::new(Countdown(AtomicUsize::new(n)));
+            let (worker, _handle) = PipelineWorker::new(&mode("mode: initial"), d, fast());
+            let end = tokio::time::timeout(Duration::from_secs(5), worker.run())
+                .await
+                .expect("the lease lapses within Phase 0");
+            assert!(matches!(end, Err(WorkerError::LeaseLost)), "{n}: {end:?}");
+            assert_eq!(
+                phase_0_writes(&w).await,
+                n - 1,
+                "{n}: the retried write never landed"
+            );
+        }
+    }
+
+    /// A lost stream position is replaced only under the lease: `reset_position` recreates the
+    /// slot, a write like Phase 0's.
+    #[tokio::test]
+    async fn a_lost_position_is_not_replaced_once_the_lease_lapsed() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let guard = Arc::new(crate::test_support::Switch::default());
+        let mut d = deps(&w);
+        d.guard = guard.clone();
+        let end = run_with(&mode("mode: never"), d, async |h| {
+            streamed(&h.status, &w).await;
+            guard.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            w.source.fail(
+                Method::ResetPosition,
+                SourceError::Permanent("reset_position was called".into()),
+            );
+            w.source.lose_slot();
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+            let mut st = h.status.clone();
+            let _ = tokio::time::timeout(Duration::from_secs(5), st.wait_for(|_| false)).await;
+        })
+        .await;
+        assert!(matches!(end, Err(WorkerError::LeaseLost)), "{end:?}");
     }
 
     #[tokio::test]

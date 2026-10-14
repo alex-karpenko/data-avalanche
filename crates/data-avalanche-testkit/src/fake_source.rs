@@ -32,8 +32,8 @@ use async_trait::async_trait;
 use data_avalanche_core::position::Lsn;
 use data_avalanche_core::{
     CdcEvent, ChangeStream, Chunk, ChunkVisibility, ColumnSchema, ColumnValue, HaltReason,
-    InFlightTxn, KeysetCursor, Op, Preflight, Prepared, RescanReport, ResolvedTables, Row,
-    SchemaChange, SchemaDelta, SchemaHint, SnapshotReason, SourceConnector, SourceError,
+    InFlightTxn, KeysetCursor, Op, Preflight, Prepared, RescanReport, ResolvedTables, RetainedLog,
+    Row, SchemaChange, SchemaDelta, SchemaHint, SnapshotReason, SourceConnector, SourceError,
     SourcePosition, SourceSeq, StartPlan, StreamItem, TableRef, TableSchema, TransactionBoundary,
     XidSnapshot, identifier_values,
 };
@@ -46,7 +46,7 @@ pub enum Method {
     ResolveTables,
     Prepare,
     ResetPosition,
-    RetainedBytes,
+    Retained,
     CurrentPosition,
     InFlight,
     ReadChunk,
@@ -228,6 +228,10 @@ struct Db {
     slot_lost: bool,
     added: Vec<TableRef>,
     retained: Option<Option<u64>>,
+    /// [`FakeSource::detach_stream`].
+    detached: bool,
+    /// [`FakeSource::stall_retained`].
+    retained_stalled: bool,
     faults: Vec<(Method, SourceError)>,
     hold_reads: bool,
     hold_stream: bool,
@@ -280,6 +284,8 @@ impl FakeSource {
             slot_lost: false,
             added: vec![],
             retained: None,
+            detached: false,
+            retained_stalled: false,
             faults: vec![],
             hold_reads: false,
             hold_stream: false,
@@ -425,9 +431,20 @@ impl FakeSource {
         self.db().added = tables.to_vec();
     }
 
-    /// What `retained_bytes` reports from now on (by default, the log from the slot to its end).
+    /// The bytes `retained` reports from now on (by default, the log from the slot to its end).
     pub fn set_retained(&self, bytes: Option<u64>) {
         self.db().retained = Some(bytes);
+    }
+
+    /// `retained` reports that no stream reads the slot, whatever the open streams do: a stream
+    /// the source dropped without the client hearing of it (DA-SRC-16).
+    pub fn detach_stream(&self) {
+        self.db().detached = true;
+    }
+
+    /// `retained` calls wait forever from now on: a source that accepts and never answers.
+    pub fn stall_retained(&self) {
+        self.db().retained_stalled = true;
     }
 
     /// The next call of `method` fails with `error`.
@@ -441,7 +458,7 @@ impl FakeSource {
         self.db().hold_reads = true;
     }
 
-    /// Chunk reads, `retained_bytes` and `in_flight` share one connection from now on, as they do
+    /// Chunk reads, `retained` and `in_flight` share one connection from now on, as they do
     /// on PostgreSQL's catalog client, whose response channel holds one message: a read that has
     /// its rows hands them back only while one of those calls waits on the connection, and the
     /// call waits until no read is half done. A caller that awaits such a call without polling
@@ -892,14 +909,21 @@ impl SourceConnector for FakeSource {
         Ok(SourcePosition::Pg(db.wal_end))
     }
 
-    async fn retained_bytes(&self) -> Result<Option<u64>, SourceError> {
-        self.take_fault(Method::RetainedBytes)?;
+    async fn retained(&self) -> Result<Option<RetainedLog>, SourceError> {
+        self.take_fault(Method::Retained)?;
+        if self.db().retained_stalled {
+            std::future::pending::<()>().await;
+        }
         self.connection().await;
         let db = self.db();
-        Ok(match db.retained {
+        let bytes = match db.retained {
             Some(r) => r,
             None => db.slot.map(|s| db.wal_end.0.saturating_sub(s.0)),
-        })
+        };
+        Ok(bytes.map(|bytes| RetainedLog {
+            bytes,
+            streamed: !db.detached,
+        }))
     }
 
     async fn current_position(&self) -> Result<SourcePosition, SourceError> {

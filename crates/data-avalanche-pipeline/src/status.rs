@@ -13,10 +13,17 @@ use crate::Backoff;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     /// Finish the open transaction, flush, make it durable, close the stream and end with
-    /// [`Exit::Drained`] (pause, stop and failover hand-off, Pipeline_Lifecycle §4).
+    /// [`Exit::Drained`] (stop and failover hand-off, Pipeline_Lifecycle §2, §4).
     Drain,
     /// Flush now, whatever the flush policy says.
     Flush,
+    /// Finish the open transaction, flush and make it durable, then hold: nothing more is read
+    /// from the stream, no chunk is read, no rescan runs, and the snapshot timeout's clock
+    /// stops. The source connection stays open (warm) and the WAL-lag guard keeps watching
+    /// (Pipeline_Lifecycle §2 `PAUSED`, Q-M6b-1).
+    Pause,
+    /// Read again after a [`Command::Pause`].
+    Resume,
 }
 
 /// How a worker ended without an error.
@@ -33,11 +40,15 @@ pub enum Phase {
     #[default]
     Starting,
     Streaming,
-    /// The stream failed transiently; the worker reopens it after a backoff.
+    /// The stream failed transiently, or another reader holds its position; the worker reopens
+    /// it after a backoff.
     Reconnecting {
         error: String,
     },
     Draining,
+    /// Everything read is durable and nothing more is read until [`Command::Resume`]; the
+    /// source connection stays open.
+    Paused,
 }
 
 /// A running table snapshot.
@@ -75,8 +86,34 @@ pub struct WorkerStatus {
     pub snapshots: BTreeMap<TableRef, SnapshotProgress>,
     /// The snapshot reconciler's log, as of the last stream boundary or tick.
     pub reconcile_log: ReconcileLog,
-    /// Warnings since the start: drift, a `never` gap, a degraded evolve.
+    /// Warnings since the start: drift, a `never` gap, a degraded evolve. Each text once, the
+    /// latest [`MAX_WARNINGS`]; add them with [`WorkerStatus::warn`].
     pub warnings: Vec<String>,
+    /// Warnings dropped to keep [`MAX_WARNINGS`].
+    pub warnings_dropped: u64,
+    /// Stream sessions reopened after a source failure (`data_avalanche_source_reconnects_total`).
+    pub reconnects: u64,
+}
+
+/// The warnings a status keeps.
+pub const MAX_WARNINGS: usize = 50;
+
+impl WorkerStatus {
+    /// Adds a warning as the latest. One the status already shows moves to the end instead: a
+    /// rerun of Phase 0, a reconnect or a new failing streak that finds the same thing again adds
+    /// nothing. Past [`MAX_WARNINGS`] the oldest goes.
+    pub fn warn(&mut self, warning: String) {
+        if let Some(at) = self.warnings.iter().position(|w| *w == warning) {
+            let again = self.warnings.remove(at);
+            self.warnings.push(again);
+            return;
+        }
+        self.warnings.push(warning);
+        if self.warnings.len() > MAX_WARNINGS {
+            self.warnings.remove(0);
+            self.warnings_dropped += 1;
+        }
+    }
 }
 
 /// A check that keeps failing warns once: the first failure of a streak adds a status warning,
@@ -95,7 +132,7 @@ impl Streak {
         self.failures = self.failures.saturating_add(1);
         if self.failures == 1 {
             let warning = warning();
-            status.send_modify(|st| st.warnings.push(warning));
+            status.send_modify(|st| st.warn(warning));
         }
     }
 
@@ -139,5 +176,31 @@ impl Default for Tuning {
             tick: Duration::from_secs(1),
             augment_attempts: 3,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_warning_shows_once_as_of_its_latest() {
+        let mut st = WorkerStatus::default();
+        st.warn("a".into());
+        st.warn("b".into());
+        st.warn("a".into());
+        assert_eq!(st.warnings, ["b", "a"]);
+        assert_eq!(st.warnings_dropped, 0);
+    }
+
+    #[test]
+    fn past_the_cap_the_oldest_warning_goes() {
+        let mut st = WorkerStatus::default();
+        for i in 0..MAX_WARNINGS + 2 {
+            st.warn(format!("w{i}"));
+        }
+        assert_eq!(st.warnings.len(), MAX_WARNINGS);
+        assert_eq!(st.warnings.first().map(String::as_str), Some("w2"));
+        assert_eq!(st.warnings_dropped, 2);
     }
 }

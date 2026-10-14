@@ -1353,6 +1353,7 @@ fn delta(d: &RawDelta, at: &At, ctx: &mut Ctx) -> Option<Delta> {
         "type",
         DeltaCatalogType::None,
     );
+    let merge_memory_limit = tri(ctx, &d.merge_memory_limit, at, "merge_memory_limit", None);
     Some(Delta {
         column_mapping: column_mapping?,
         checkpoint_interval: checkpoint_interval?,
@@ -1360,6 +1361,7 @@ fn delta(d: &RawDelta, at: &At, ctx: &mut Ctx) -> Option<Delta> {
         timestamp_ntz_as: timestamp_ntz_as?,
         table_properties: table_properties?,
         catalog_type: catalog_type?,
+        merge_memory_limit: merge_memory_limit?.map(ByteSize::bytes),
     })
 }
 

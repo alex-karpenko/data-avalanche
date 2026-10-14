@@ -1079,6 +1079,7 @@ mod tests {
         PositionRange {
             start: SourcePosition::Pg(Lsn(0)),
             end: SourcePosition::Pg(Lsn(1000)),
+            last_change: SourcePosition::Pg(Lsn(1000)),
         }
     }
 

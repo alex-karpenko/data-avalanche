@@ -66,6 +66,12 @@ impl MemTable {
     /// Every column of the change set exists in the table with the same type; the table may have
     /// more (soft-dropped columns, written NULL).
     fn check_schema(&self, cs: &TableChangeSet) -> Result<(), SinkError> {
+        if cs.identifier != self.identifier {
+            return Err(permanent(format!(
+                "the change set is keyed by {:?}, the table by {:?}",
+                cs.identifier, self.identifier
+            )));
+        }
         for f in cs.schema.fields() {
             match self.schema.field_with_name(f.name()) {
                 Ok(t) if t.data_type() == f.data_type() => {}
@@ -351,12 +357,18 @@ impl Sink for MemorySink {
         &self,
         table: &TableRef,
         delta: &SchemaDelta,
+        owner_epoch: u64,
     ) -> Result<EvolveOutcome, SinkError> {
         self.fault(SinkOp::Evolve, table)?;
         let mut tables = self.tables();
         let t = tables.get_mut(table).ok_or_else(|| SinkError::NoTable {
             table: table.clone(),
         })?;
+        if let Some(stored) = t.marker.as_ref().filter(|m| m.owner_epoch > owner_epoch) {
+            return Ok(EvolveOutcome::Fenced {
+                current_epoch: stored.owner_epoch,
+            });
+        }
         let mut added = Vec::new();
         let mut warnings = Vec::new();
         for change in &delta.changes {
@@ -519,6 +531,7 @@ mod tests {
             position: PositionRange {
                 start: SourcePosition::Pg(Lsn(0)),
                 end: SourcePosition::Pg(Lsn(end)),
+                last_change: SourcePosition::Pg(Lsn(end)),
             },
             split: None,
             snapshot: false,
@@ -621,6 +634,7 @@ mod tests {
             c.position = PositionRange {
                 start: end.clone(),
                 end: end.clone(),
+                last_change: end.clone(),
             };
             commit(&sink, c, 1).await;
         }
@@ -781,9 +795,12 @@ mod tests {
             V::Int32,
             "integer",
         ))]);
-        assert_eq!(sink.evolve(&t, &add).await.unwrap(), EvolveOutcome::Applied);
         assert_eq!(
-            sink.evolve(&t, &add).await.unwrap(),
+            sink.evolve(&t, &add, 1).await.unwrap(),
+            EvolveOutcome::Applied
+        );
+        assert_eq!(
+            sink.evolve(&t, &add, 1).await.unwrap(),
             EvolveOutcome::Applied,
             "replay"
         );
@@ -796,7 +813,7 @@ mod tests {
 
         let drop = delta(vec![SchemaChange::DropColumn("doc".into())]);
         assert!(matches!(
-            sink.evolve(&t, &drop).await.unwrap(),
+            sink.evolve(&t, &drop, 1).await.unwrap(),
             EvolveOutcome::Degraded { .. }
         ));
         let mut narrower = cs(20, vec![], vec![]);
@@ -821,9 +838,52 @@ mod tests {
             narrowed: false,
         }]);
         assert!(matches!(
-            sink.evolve(&t, &widen).await.unwrap(),
+            sink.evolve(&t, &widen, 1).await.unwrap(),
             EvolveOutcome::Unsupported { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn an_evolve_of_a_table_a_newer_owner_wrote_is_fenced() {
+        let sink = sink().await;
+        let t = TableRef::new("public", "t");
+        commit(
+            &sink,
+            cs(10, vec![upserts(&[(1, Some("a"))], None)], vec![]),
+            2,
+        )
+        .await;
+        let add = SchemaDelta {
+            table: t.clone(),
+            changes: vec![SchemaChange::AddColumn(ColumnSchema::new(
+                "n",
+                V::Int32,
+                "integer",
+            ))],
+        };
+        assert_eq!(
+            sink.evolve(&t, &add, 1).await.unwrap(),
+            EvolveOutcome::Fenced { current_epoch: 2 }
+        );
+        let state = sink.table_state(&t).await.unwrap();
+        assert_eq!(state.schema.unwrap().fields().len(), 2, "nothing added");
+        assert_eq!(
+            sink.evolve(&t, &add, 2).await.unwrap(),
+            EvolveOutcome::Applied
+        );
+    }
+
+    /// A table keyed otherwise than the set (the source's key, or its override, changed since
+    /// the table was created) refuses it: merging on another key would duplicate rows.
+    #[tokio::test]
+    async fn a_set_keyed_otherwise_than_the_table_is_refused() {
+        let sink = sink().await;
+        let mut c = cs(10, vec![upserts(&[(1, Some("a"))], None)], vec![]);
+        c.identifier = vec!["id".into(), "doc".into()];
+        let err = sink.commit(c, marker(1, 10)).await.unwrap_err();
+        assert!(matches!(err, SinkError::Permanent { .. }), "{err}");
+        assert!(err.to_string().contains("keyed by"), "{err}");
+        assert_eq!(sink.version(&TableRef::new("public", "t")), Some(0));
     }
 
     #[tokio::test]

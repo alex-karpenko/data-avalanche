@@ -20,12 +20,25 @@ fn failed_validation(text: &str) -> bool {
     text.contains("failed validation check") || text.contains("validation check failed")
 }
 
+/// DataFusion's memory pool refused an allocation (`ResourcesExhausted`, which reaches us as
+/// `Generic` text). The pool is bounded only by `merge_memory_limit`, and the same set needs
+/// the same memory on every replay.
+fn out_of_memory(text: &str) -> bool {
+    text.contains("Resources exhausted")
+}
+
 pub(crate) fn sink_error(e: DeltaTableError) -> SinkError {
     use CommitConflictError as C;
     use DeltaTableError as E;
     let reason = e.to_string();
     match e {
         E::Generic(text) if failed_validation(&text) => SinkError::Permanent { reason },
+        E::Generic(text) if out_of_memory(&text) => SinkError::Permanent {
+            reason: format!(
+                "the MERGE needs more memory than sink.delta.merge_memory_limit allows (raise it, or \
+                 flush fewer rows per commit): {text}"
+            ),
+        },
         // The conflicts that aren't a lost race: retrying reads the same table and fails again.
         E::Transaction {
             source:
@@ -97,5 +110,11 @@ mod tests {
             "External error: Invalid data found: 1 rows failed validation check.".into(),
         ));
         assert!(matches!(e, SinkError::Permanent { .. }), "{e}");
+        // DataFusion's memory pool, past `merge_memory_limit`.
+        let e = sink_error(DeltaTableError::Generic(
+            "Resources exhausted: Failed to allocate additional 1.0 MB for HashJoinInput".into(),
+        ));
+        assert!(matches!(e, SinkError::Permanent { .. }), "{e}");
+        assert!(e.to_string().contains("merge_memory_limit"), "{e}");
     }
 }

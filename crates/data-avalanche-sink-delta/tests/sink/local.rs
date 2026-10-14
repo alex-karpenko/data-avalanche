@@ -84,7 +84,7 @@ async fn delta_rs_still_refuses_add_column_under_column_mapping() {
             "integer",
         ))],
     };
-    let err = s.evolve(&items(), &add).await.unwrap_err();
+    let err = s.evolve(&items(), &add, 1).await.unwrap_err();
     assert!(err.to_string().contains("Column mapping"), "{err}");
 }
 
@@ -284,4 +284,10 @@ async fn a_crash_after_the_truncate_delete_replays_both() {
         commit(&fresh, replay, 3).await,
         CommitOutcome::SkippedCovered
     );
+}
+
+#[tokio::test]
+async fn a_live_handle_recovers_from_a_table_recreated_past_its_version() {
+    let (_dir, location) = local();
+    scenarios::recreated_past_a_live_handle(location).await;
 }

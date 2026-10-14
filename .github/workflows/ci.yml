@@ -28,6 +28,12 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Unit and property tests
         run: cargo test --locked --workspace
+      # The binary's e2e-hooks feature (its crash points, the E2E suite's sources): the two steps
+      # above build without it, and the e2e test target requires it.
+      - name: Clippy (e2e-hooks)
+        run: cargo clippy --locked -p data-avalanche --features e2e-hooks --all-targets -- -D warnings
+      - name: Unit tests (e2e-hooks)
+        run: cargo test --locked -p data-avalanche --features e2e-hooks --lib
       # RustSec advisory audit of Cargo.lock. Non-blocking by design: a vulnerable dependency is
       # reported (warning annotation + failed step) but never fails the job.
       - name: Install cargo-audit
@@ -47,11 +53,19 @@ jobs:
   # On a same-repository PR, a missing secret/variable fails the job.
   integration:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     needs: check
     env:
       DATA_AVALANCHE_IT: "1"
       DATA_AVALANCHE_GCS_BUCKET: ${{ vars.DATA_AVALANCHE_GCS_BUCKET }}
     steps:
+      # The workspace's test build and then the E2E build don't fit on the runner's disk beside
+      # its preinstalled SDKs, which nothing here uses.
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v2
       - name: GCS credentials
@@ -78,6 +92,9 @@ jobs:
         run: test-infra/up.sh
       - name: Integration tests
         run: cargo test --locked --workspace -- --test-threads=1
+      # The slice-1 E2E suite (roadmap §5.3): the binary as a process, built with its crash points.
+      - name: Slice-1 E2E
+        run: cargo test --locked -p data-avalanche --features e2e-hooks --test e2e -- --test-threads=1
       - name: Container logs on failure
         if: failure()
         run: docker compose -f test-infra/compose.yaml logs --no-color

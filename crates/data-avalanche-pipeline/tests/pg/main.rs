@@ -3,6 +3,7 @@
 //! documents are in memory. Each test returns at once without `DATA_AVALANCHE_IT`.
 
 mod common;
+mod pause;
 mod recovery;
 mod schema;
 mod snapshot;

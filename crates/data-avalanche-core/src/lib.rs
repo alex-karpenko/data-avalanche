@@ -34,12 +34,13 @@ pub use position::{PositionError, SourcePosition};
 pub use schema::{ColumnSchema, HaltReason, TableSchema, canonical_logical, hop2_compatible};
 pub use sink::{
     CommitMarker, CommitOutcome, EvolveOutcome, PartitionField, PartitionTransform, SchemaOp, Sink,
-    SinkCapabilities, SinkError, SinkKind, SinkTableState, TableSpec, TransformKind, WriteMode,
+    SinkCapabilities, SinkError, SinkKind, SinkStats, SinkTableState, TableSpec, TransformKind,
+    WriteMode,
 };
 pub use source::{
     ChangeStream, Chunk, ChunkVisibility, InFlightTxn, KeysetCursor, Preflight, Prepared,
-    RescanReport, ResolvedTables, SchemaHint, SnapshotReason, SourceConnector, SourceError,
-    StartPlan, StreamItem, XidSnapshot, identifier_values,
+    RescanReport, ResolvedTables, RetainedLog, SchemaHint, SnapshotReason, SourceConnector,
+    SourceError, StartPlan, StreamItem, XidSnapshot, identifier_values,
 };
 pub use table::{
     INTERNAL_COLUMN_PREFIX, LINEAGE_COLUMNS, TableRef, first_reserved_collision, is_reserved_column,

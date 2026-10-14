@@ -2,10 +2,12 @@
 
 use data_avalanche_core::{
     ColumnSchema, ColumnValueType, CommitOutcome, EvolveOutcome, SchemaChange, SchemaDelta, Sink,
-    TableRef, TableSchema, TableSpec,
+    SinkStats, TableRef, TableSchema, TableSpec,
 };
 use data_avalanche_sink_delta::{DeltaLocation, TableDefaults};
 use deltalake::DeltaTable;
+use deltalake::logstore::object_store::{ObjectStore, ObjectStoreExt};
+use futures_util::TryStreamExt;
 
 use crate::common::{commit, cs, deletes, items, lsn, owned, rows, schema, sink, spec, upserts};
 
@@ -142,6 +144,14 @@ pub async fn truncate_then_rows(location: DeltaLocation) {
         ),
         (1, 2, 1)
     );
+    // The sink-neutral totals the metrics read.
+    assert_eq!(
+        Sink::stats(&s),
+        SinkStats {
+            files_rewritten: after.files_removed,
+            rows_copied: after.rows_copied,
+        }
+    );
     let mut clear = cs(30, vec![], vec![]);
     clear.truncate = true;
     commit(&s, clear, 1).await;
@@ -176,7 +186,7 @@ pub async fn evolution(location: DeltaLocation) {
         ))],
     };
     assert_eq!(
-        s.evolve(&items(), &add).await.unwrap(),
+        s.evolve(&items(), &add, 1).await.unwrap(),
         EvolveOutcome::Applied
     );
     commit(
@@ -196,7 +206,7 @@ pub async fn evolution(location: DeltaLocation) {
         changes: vec![SchemaChange::DropColumn("doc".into())],
     };
     assert!(matches!(
-        s.evolve(&items(), &drop).await.unwrap(),
+        s.evolve(&items(), &drop, 1).await.unwrap(),
         EvolveOutcome::Degraded { .. }
     ));
     let mut narrow = cs(30, vec![], vec![]);
@@ -268,4 +278,68 @@ pub async fn escaped_names(location: DeltaLocation, odd: TableRef) -> TableRef {
     assert!(state.exists);
     assert_eq!(state.marker.unwrap().committed_position, lsn(10));
     odd
+}
+
+/// Removes every object of the table, as an operator dropping it does.
+async fn drop_table(location: &DeltaLocation) {
+    let store = foreign(location).await.log_store().object_store(None);
+    let objects: Vec<_> = store.list(None).try_collect().await.unwrap();
+    for o in objects {
+        store.delete(&o.location).await.unwrap();
+    }
+}
+
+/// Another writer drops the table, re-creates it and commits past the live handle's version.
+/// Brought forward incrementally, the handle would hold the old table's files and miss the new
+/// one's first commits (Q-M6b-8). The sink sees the log is another log and re-opens the table, so
+/// an upsert of a key in a file the old view lacks updates it rather than adding it twice.
+pub async fn recreated_past_a_live_handle(location: DeltaLocation) {
+    let s = sink(location.clone(), TableDefaults::default());
+    s.ensure_table(&spec()).await.unwrap();
+    for (end, id) in [(10, 1), (20, 2), (30, 3)] {
+        commit(
+            &s,
+            cs(end, vec![upserts(&[(id, Some("a"))], None)], vec![]),
+            1,
+        )
+        .await;
+    }
+    drop_table(&location).await;
+    let other = sink(location, TableDefaults::default());
+    other.ensure_table(&spec()).await.unwrap();
+    for id in 1..=6 {
+        commit(
+            &other,
+            cs(
+                id as u64 * 10,
+                vec![upserts(&[(id, Some("o"))], None)],
+                vec![],
+            ),
+            1,
+        )
+        .await;
+    }
+    let out = commit(
+        &s,
+        cs(
+            1000,
+            vec![upserts(&[(2, Some("re")), (9, Some("re"))], None)],
+            vec![],
+        ),
+        1,
+    )
+    .await;
+    assert!(matches!(out, CommitOutcome::Committed { .. }), "{out:?}");
+    assert_eq!(
+        rows(&s).await,
+        owned(&[
+            (1, Some("o")),
+            (2, Some("re")),
+            (3, Some("o")),
+            (4, Some("o")),
+            (5, Some("o")),
+            (6, Some("o")),
+            (9, Some("re")),
+        ])
+    );
 }

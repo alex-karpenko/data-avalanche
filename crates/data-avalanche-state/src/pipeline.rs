@@ -166,6 +166,15 @@ impl PipelineDocs {
         }
     }
 
+    /// The pipeline's state document, read without creating it: `None` before the first start.
+    /// The controller polls it for the desired state (Q-M6b-2).
+    ///
+    /// # Errors
+    /// A storage or decode failure.
+    pub async fn state(&self) -> Result<Option<Versioned<PipelineStateDoc>>, StateError> {
+        self.docs.load(PIPELINE_STATE_KEY).await
+    }
+
     /// Records a pause / resume / stop (Pipeline_Lifecycle §4).
     ///
     /// # Errors
@@ -294,6 +303,7 @@ mod tests {
             p.set_desired_state(DesiredState::Paused).await.is_err(),
             "not opened yet"
         );
+        assert!(p.state().await.unwrap().is_none(), "nothing created");
         p.open("orders", "delta").await.unwrap();
         for s in [
             DesiredState::Paused,
@@ -301,6 +311,7 @@ mod tests {
             DesiredState::Running,
         ] {
             assert_eq!(p.set_desired_state(s).await.unwrap().doc.desired_state, s);
+            assert_eq!(p.state().await.unwrap().unwrap().doc.desired_state, s);
             assert_eq!(
                 p.open("orders", "delta").await.unwrap().doc.desired_state,
                 s,

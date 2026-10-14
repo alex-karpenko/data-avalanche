@@ -188,8 +188,9 @@ pub struct DeltaSinkConfig {
     pub pipeline_id: String,
     pub location: DeltaLocation,
     pub table: TableDefaults,
-    /// A DataFusion memory ceiling for one MERGE (R-6). A MERGE that needs more fails
-    /// (`Transient`) instead of growing the process. `None`: no ceiling.
+    /// A DataFusion memory ceiling for one MERGE (R-6, `sink.delta.merge_memory_limit`). A MERGE
+    /// that needs more fails `Permanent` instead of growing the process: the same set fails the
+    /// same way on every replay, so its table halts. `None`: no ceiling.
     pub merge_memory_limit: Option<usize>,
 }
 

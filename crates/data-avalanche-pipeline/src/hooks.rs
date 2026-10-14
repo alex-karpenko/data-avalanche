@@ -5,9 +5,10 @@ use std::fmt::Debug;
 
 use data_avalanche_core::{SourcePosition, TableRef};
 
-/// Asked before every sink commit. M6b's lease renewer answers `false` once the lease's renewal
-/// safety deadline passed (Clustering §19): the worker then stops with `LeaseLost` and writes
-/// nothing more.
+/// Asked before every sink commit and state write, Phase 0's included (the slot, the sink table,
+/// the state documents). The lease renewer answers `false` once the lease's renewal safety
+/// deadline passed (Clustering §19): the worker then stops with `LeaseLost` and writes nothing
+/// more.
 pub trait CommitGuard: Send + Sync + Debug {
     fn may_commit(&self) -> bool;
 }

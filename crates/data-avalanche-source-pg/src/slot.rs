@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use data_avalanche_config::{SlotManagement, SlotOnOrphan};
 use data_avalanche_core::position::Lsn;
 use data_avalanche_core::{
-    Prepared, SnapshotReason, SourceError, SourcePosition, StartPlan, TableRef,
+    Prepared, RetainedLog, SnapshotReason, SourceError, SourcePosition, StartPlan, TableRef,
 };
 use tokio_postgres::Client;
 
@@ -517,24 +517,29 @@ impl PgConnector {
     }
 
     /// The WAL the slot keeps on the source's disk: `pg_current_wal_lsn() - restart_lsn`, the
-    /// `max_wal_lag_bytes` guard's measure. `restart_lsn` trails `confirmed_flush_lsn` while a
-    /// transaction older than the confirmed position is still open. `None` without a slot.
-    pub async fn retained_bytes(&self) -> Result<Option<u64>, SourceError> {
+    /// `max_wal_lag_bytes` guard's measure, and whether a walsender reads the slot (`active`).
+    /// `restart_lsn` trails `confirmed_flush_lsn` while a transaction older than the confirmed
+    /// position is still open. `None` without a slot, or with a slot that lost its WAL.
+    pub async fn retained(&self) -> Result<Option<RetainedLog>, SourceError> {
         let client = self.conn.client().await?;
         let row = self
             .conn
             .command(
                 "measure the slot's WAL",
                 client.query_opt(
-                    "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint
+                    "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint, active
                        FROM pg_catalog.pg_replication_slots WHERE slot_name = $1",
                     &[&self.slot_name()],
                 ),
             )
             .await?;
-        Ok(row
-            .and_then(|r| r.get::<_, Option<i64>>(0))
-            .map(|b| u64::try_from(b).unwrap_or(0)))
+        Ok(row.and_then(|r| {
+            let bytes = r.get::<_, Option<i64>>(0)?;
+            Some(RetainedLog {
+                bytes: u64::try_from(bytes).unwrap_or(0),
+                streamed: r.get(1),
+            })
+        }))
     }
 }
 

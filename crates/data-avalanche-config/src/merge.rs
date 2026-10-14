@@ -177,7 +177,8 @@ merge_struct!(RawDelta {
     log_retention,
     timestamp_ntz_as,
     table_properties,
-    catalog
+    catalog,
+    merge_memory_limit
 });
 merge_struct!(RawDeltaCatalog { kind });
 merge_struct!(RawSchemaEvolution {

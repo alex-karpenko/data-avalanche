@@ -399,6 +399,8 @@ pub(crate) struct RawDelta {
     pub timestamp_ntz_as: L<TimestampNtzAs>,
     pub table_properties: Option<BTreeMap<String, Leaf<String>>>,
     pub catalog: Option<RawDeltaCatalog>,
+    #[serde(default, deserialize_with = "tri")]
+    pub merge_memory_limit: Tri<ByteSize>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

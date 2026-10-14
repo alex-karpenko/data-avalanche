@@ -44,9 +44,13 @@ pub(crate) fn local(dir: &tempfile::TempDir) -> DeltaLocation {
 }
 
 pub(crate) async fn handle(dir: &tempfile::TempDir, table: &TableRef) -> TableHandle {
-    TableHandle::open(local(dir).table_url(table).unwrap(), HashMap::new())
-        .await
-        .unwrap()
+    TableHandle::open(
+        table.clone(),
+        local(dir).table_url(table).unwrap(),
+        HashMap::new(),
+    )
+    .await
+    .unwrap()
 }
 
 /// One `orders` row: `ref` is 16 bytes of `id`, `at` is `id` ms, `doc` as given.
@@ -108,6 +112,7 @@ pub(crate) fn change_set(end: u64, up: Vec<RecordBatch>, del: Vec<RecordBatch>) 
         position: PositionRange {
             start: SourcePosition::Pg(Lsn(0)),
             end: SourcePosition::Pg(Lsn(end)),
+            last_change: SourcePosition::Pg(Lsn(end)),
         },
         split: None,
         snapshot: false,

@@ -14,19 +14,20 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use data_avalanche_core::{
-    CdcEvent, ChangeStream, ColumnValue, HaltReason, Op, RescanReport, Row, SchemaHint, Sink,
-    SourceConnector, SourceError, SourcePosition, SourceSeq, StreamItem, TableRef, TableSchema,
-    TransactionBoundary, identifier_values,
+    CdcEvent, ChangeStream, ColumnValue, HaltReason, Op, RescanReport, RetainedLog, Row,
+    SchemaHint, Sink, SourceConnector, SourceError, SourcePosition, SourceSeq, StreamItem,
+    TableRef, TableSchema, TransactionBoundary, identifier_values,
 };
 use data_avalanche_state::{PipelineDocs, TableHalt};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle, JoinSet};
 
 use self::snapshot::Snapshots;
 use crate::schema_change::{Evolver, Planned};
 use crate::settings::Settings;
 use crate::status::Streak;
+use crate::watchdog::Watchdog;
 use crate::writer::{self, Job, WriterCtx, WriterEvent};
 use crate::{
     Accumulator, AccumulatorError, Command, CommitGuard, Exit, FlushReason, Hooks, Phase, Tuning,
@@ -78,6 +79,10 @@ pub(crate) struct Core {
     /// The tables whose chunk reads are failing, a streak each. Like `requery_failing` it outlives
     /// a session.
     pub read_failing: BTreeMap<TableRef, Streak>,
+    /// [`Command::Pause`] is in force: a session finishes its open transaction, makes it durable
+    /// and reads nothing more until [`Command::Resume`]. It outlives a session, so a reconnect
+    /// while paused stays paused.
+    pub pause: bool,
 }
 
 impl Core {
@@ -85,11 +90,22 @@ impl Core {
         self.status.send_modify(f);
     }
 
+    /// Asked before each write Phase 0 makes (state documents, the slot, a sink table), as the
+    /// writer asks before each commit: a worker whose lease lapsed writes nothing more.
+    pub fn may_write(&self) -> Result<(), WorkerError> {
+        if self.guard.may_commit() {
+            Ok(())
+        } else {
+            Err(WorkerError::LeaseLost)
+        }
+    }
+
     pub fn evolver(&self) -> Evolver<'_> {
         Evolver {
             source: &*self.source,
             sink: &*self.sink,
             guard: &*self.guard,
+            owner_epoch: self.owner_epoch,
             tuning: &self.tuning,
             evolution: self.settings.evolution,
             status: &self.status,
@@ -109,6 +125,16 @@ fn protocol(detail: String) -> WorkerError {
     AccumulatorError::Protocol { detail }.into()
 }
 
+/// The session's writer task, aborted when the session is dropped: a worker cut off mid-flush
+/// (its task aborted, say past `drain_timeout`) leaves no writer committing on its own.
+struct WriterTask(JoinHandle<()>);
+
+impl Drop for WriterTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub(crate) struct Session<'c> {
     core: &'c mut Core,
     acc: Accumulator,
@@ -117,7 +143,7 @@ pub(crate) struct Session<'c> {
     stream: Box<dyn ChangeStream>,
     jobs: UnboundedSender<Job>,
     events: UnboundedReceiver<WriterEvent>,
-    writer: JoinHandle<()>,
+    writer: WriterTask,
     /// `buffer_capacity_rows`: rows handed to the writer and not yet durable.
     permits: Arc<Semaphore>,
     /// Flushes waiting for room in the buffer, in order. The stream isn't read meanwhile.
@@ -149,6 +175,12 @@ pub(crate) struct Session<'c> {
     )>,
     snaps: Snapshots,
     draining: bool,
+    /// When this session parked for [`Command::Pause`], with everything it read durable.
+    paused: Option<Instant>,
+    /// The heartbeat's read of the source's log, one at a time, run beside the loop: a source
+    /// that doesn't answer holds up neither the stream nor a drain (DA-SRC-16).
+    retained_read: JoinSet<Result<Option<RetainedLog>, SourceError>>,
+    watchdog: Watchdog,
 }
 
 impl<'c> Session<'c> {
@@ -237,7 +269,7 @@ impl<'c> Session<'c> {
             for h in recorded.iter().chain(&halts) {
                 st.halted.insert(h.table.clone(), h.reason.clone());
             }
-            st.warnings.extend(warnings);
+            warnings.into_iter().for_each(|w| st.warn(w));
             // Replaced, not extended: a snapshot an earlier session finished, or ended with a
             // completion this session's state shows durable, is over.
             st.snapshots = snaps.progress().collect();
@@ -249,7 +281,7 @@ impl<'c> Session<'c> {
             stream,
             jobs,
             events,
-            writer,
+            writer: WriterTask(writer),
             permits: Arc::new(Semaphore::new(rows)),
             queued: VecDeque::new(),
             submitted: checkpoint,
@@ -263,6 +295,9 @@ impl<'c> Session<'c> {
             rescan: None,
             snaps,
             draining: false,
+            paused: None,
+            retained_read: JoinSet::new(),
+            watchdog: Watchdog::default(),
         }))
     }
 
@@ -278,7 +313,7 @@ impl<'c> Session<'c> {
                 Ok(end)
             }
             Err(e) => {
-                self.writer.abort();
+                self.writer.0.abort();
                 Err(e)
             }
         }
@@ -342,7 +377,18 @@ impl<'c> Session<'c> {
                 }
                 return Ok(End::Exit(Exit::Drained));
             }
-            let reading = self.queued.is_empty();
+            if self.core.pause && self.paused.is_none() && !self.acc.in_transaction() {
+                self.flush()?;
+                if let Some(end) = self.until_durable().await? {
+                    return Ok(end);
+                }
+                self.paused = Some(Instant::now());
+                self.core.update(|st| st.phase = Phase::Paused);
+            }
+            // Pausing (the open transaction still to finish) or paused: no chunk is read, no
+            // rescan runs, the snapshot clock stands. Paused: the stream isn't read either.
+            let parked = self.core.pause;
+            let reading = self.reads_stream();
             let need = self.queued.front().map_or(0, |(_, n)| *n);
             let permits = self.permits.clone();
             // Biased: control, the writer's events and the buffer's room first; then the chunk
@@ -360,10 +406,12 @@ impl<'c> Session<'c> {
                         return Ok(end);
                     }
                 }
-                p = permits.acquire_many_owned(need), if !reading => {
+                // Only for a queued job: an empty queue needs no permit, and would make this
+                // arm ready at every poll while paused.
+                p = permits.acquire_many_owned(need), if !self.queued.is_empty() => {
                     self.send_front(p.expect("the semaphore isn't closed"));
                 }
-                read = self.snaps.reads.join_next(), if !self.snaps.reads.is_empty() => {
+                read = self.snaps.reads.join_next(), if !self.snaps.reads.is_empty() && !parked => {
                     // Nothing aborts a read while the loop runs: one that ended without its
                     // chunk panicked, a bug, which ends the worker like the writer's.
                     let read = read.expect("not empty").map_err(|e| {
@@ -375,13 +423,20 @@ impl<'c> Session<'c> {
                 }
                 _ = tick.tick() => {
                     self.due(Instant::now())?;
-                    if let Some(end) = self.snapshot_tick().await? {
+                    if !parked && let Some(end) = self.snapshot_tick().await? {
                         return Ok(end);
                     }
                 }
-                _ = heartbeat.tick() => self.wal_lag().await?,
+                _ = heartbeat.tick() => {
+                    if let Some(end) = self.heartbeat() {
+                        return Ok(end);
+                    }
+                }
+                read = self.retained_read.join_next(), if !self.retained_read.is_empty() => {
+                    self.wal_lag(read.expect("not empty"))?;
+                }
                 _ = async { rescan.as_mut().expect("guarded").tick().await },
-                    if rescan.is_some() && self.rescan.is_none() =>
+                    if rescan.is_some() && self.rescan.is_none() && !parked =>
                 {
                     if let Some(end) = self.rescan().await? {
                         return Ok(end);
@@ -389,6 +444,7 @@ impl<'c> Session<'c> {
                 }
                 item = self.stream.next(), if reading => match item {
                     Ok(item) => {
+                        self.watchdog.heard();
                         if let Some(end) = self.item(item).await? {
                             return Ok(end);
                         }
@@ -405,6 +461,23 @@ impl<'c> Session<'c> {
             Some(Command::Drain) | None => {
                 self.draining = true;
                 self.core.update(|st| st.phase = Phase::Draining);
+                Ok(())
+            }
+            Some(Command::Pause) => {
+                self.core.pause = true;
+                Ok(())
+            }
+            Some(Command::Resume) => {
+                self.core.pause = false;
+                if let Some(at) = self.paused.take() {
+                    // The snapshot timeout counts reading time: the pause is added back.
+                    let held = at.elapsed();
+                    for started in self.core.snapshot_started.values_mut() {
+                        *started += held;
+                    }
+                    self.core.update(|st| st.phase = Phase::Streaming);
+                    self.issue_reads();
+                }
                 Ok(())
             }
         }
@@ -723,7 +796,7 @@ impl<'c> Session<'c> {
     fn held_round_ended(&mut self) {
         for (table, rounds) in self.snaps.held_round() {
             self.core.update(|st| {
-                st.warnings.push(format!(
+                st.warn(format!(
                     "table {table}: its snapshot is still held after {rounds} catalog rescans: its schema changed while the pipeline was down, and its cached schema hasn't caught up with the catalog (the catalog keeps changing, or the stream has yet to commit a change of it); it reads nothing until a rescan finds the cache up to date"
                 ));
             });
@@ -821,15 +894,50 @@ impl<'c> Session<'c> {
         Ok(None)
     }
 
-    /// The WAL-retention guard (G-22): the retained log is always reported; past
-    /// `max_wal_lag_bytes` the pipeline stops to protect the source's disk. A failed read waits
-    /// for the next heartbeat, and the pipeline keeps running. The first permanent failure of a
-    /// streak warns that the guard is blind; a read that succeeds ends the streak.
-    async fn wal_lag(&mut self) -> Result<(), WorkerError> {
-        let retained = match self.core.source.retained_bytes().await {
+    /// A heartbeat: the next read of the source's log goes out unless one still is, and the
+    /// watchdog counts. `Some` ends the session: the source isn't answering, so the worker
+    /// reconnects.
+    fn heartbeat(&mut self) -> Option<End> {
+        if self.retained_read.is_empty() {
+            let source = self.core.source.clone();
+            self.retained_read
+                .spawn(async move { source.retained().await });
+        }
+        let why = self.watchdog.beat(self.reads_stream())?;
+        Some(End::Source(SourceError::Transient(why)))
+    }
+
+    /// Whether the session reads the stream now: not paused, and no flush waiting for room. The
+    /// stream gate and the watchdog share it: a stream the session doesn't read is silent by its
+    /// own doing, and proves nothing about the source.
+    fn reads_stream(&self) -> bool {
+        self.queued.is_empty() && self.paused.is_none()
+    }
+
+    /// A heartbeat's read of the source's log came back. The WAL-retention guard (G-22): the
+    /// retained log is always reported; past `max_wal_lag_bytes` the pipeline stops to protect
+    /// the source's disk. A failed read waits for the next heartbeat, and the pipeline keeps
+    /// running. The first permanent failure of a streak warns that the guard is blind; a read
+    /// that succeeds ends the streak. The watchdog hears whether the source answered: a
+    /// transient failure, or a slot no stream reads, is no answer.
+    fn wal_lag(
+        &mut self,
+        read: Result<Result<Option<RetainedLog>, SourceError>, JoinError>,
+    ) -> Result<(), WorkerError> {
+        let read = read.map_err(|e| {
+            protocol(format!(
+                "the heartbeat's read ended without its answer: {e}"
+            ))
+        })?;
+        let retained = match read {
             Ok(retained) => retained,
-            Err(e) if e.is_transient() => return Ok(()),
+            Err(e) if e.is_transient() => {
+                self.watchdog.answered(Some(e.to_string()));
+                return Ok(());
+            }
             Err(e) => {
+                // The source answered, with a refusal.
+                self.watchdog.answered(None);
                 let blind = if self.core.settings.max_wal_lag_bytes.is_some() {
                     "max_wal_lag_bytes isn't enforced"
                 } else {
@@ -844,6 +952,12 @@ impl<'c> Session<'c> {
             }
         };
         self.core.wal_lag_failing.succeeded();
+        self.watchdog.answered(
+            retained
+                .is_some_and(|r| !r.streamed)
+                .then(|| "no stream reads the slot".to_owned()),
+        );
+        let retained = retained.map(|r| r.bytes);
         self.core.update(|st| st.retained_bytes = retained);
         match (retained, self.core.settings.max_wal_lag_bytes) {
             (Some(lag), Some(limit)) if lag > limit => Err(WorkerError::WalLag { lag, limit }),
@@ -1047,7 +1161,7 @@ impl<'c> Session<'c> {
         if !safe.is_empty() {
             match self.core.evolver().evolve(&table, safe).await? {
                 Ok(None) => {}
-                Ok(Some(warning)) => self.core.update(|st| st.warnings.push(warning)),
+                Ok(Some(warning)) => self.core.update(|st| st.warn(warning)),
                 Err(reason) => {
                     self.halt(table, reason)?;
                     return Ok(None);
@@ -1174,6 +1288,11 @@ mod tests {
         assert!(matches!(end.unwrap(), End::Exit(Exit::Drained)));
         assert_eq!(w.ids("a"), [1]);
         assert_eq!(checkpoint(&w).await, lsn_of(&w.source.wal_end()));
+        assert_eq!(
+            w.source.acknowledged().last(),
+            Some(&w.source.wal_end()),
+            "the drain's last flush is acknowledged before the stream closes"
+        );
     }
 
     #[tokio::test]
@@ -1211,6 +1330,110 @@ mod tests {
         .expect("the drain ends");
         assert!(matches!(end.unwrap(), End::Exit(Exit::Drained)));
         assert_eq!(w.ids("a"), [1, 2, 3, 4, 5, 6]);
+    }
+
+    /// A pause arrives with a transaction open (a slice in the sink, the next waiting for room):
+    /// the session finishes the transaction and makes it durable, then reads nothing until it is
+    /// resumed.
+    #[tokio::test]
+    async fn a_pause_finishes_the_open_transaction_then_reads_nothing_until_resumed() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let p = pipeline(
+            "",
+            "flush: { seconds: 0 }, max_transaction_batch_rows: 2, buffer_capacity_rows: 1",
+            "",
+        );
+        let (mut core, control, status) = w.core(&p, &["a"]);
+        let s = Session::open(&mut core).await.unwrap().unwrap();
+        w.sink.hold_commits();
+        let mut txn = FakeTxn::new();
+        for id in 1..=6 {
+            txn = txn.insert(&t("a"), row(id, "x"));
+        }
+        w.source.commit(txn);
+        let first = w.source.wal_end();
+        let driver = async {
+            wait_until("a slice waits in the sink", || {
+                w.sink.waiting_commits() == 1
+            })
+            .await;
+            control.send(Command::Pause).await.unwrap();
+            w.sink.release_commits();
+            wait_until("paused", || status.borrow().phase == Phase::Paused).await;
+            assert_eq!(w.ids("a"), [1, 2, 3, 4, 5, 6], "the transaction is in");
+            assert_eq!(status.borrow().checkpoint.as_ref(), Some(&first));
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(7, "x")));
+            let second = w.source.wal_end();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(
+                status.borrow().read.as_ref(),
+                Some(&first),
+                "nothing is read while paused"
+            );
+            control.send(Command::Resume).await.unwrap();
+            durable(&status, second).await;
+            assert_eq!(status.borrow().phase, Phase::Streaming);
+            control.send(Command::Drain).await.unwrap();
+        };
+        let (end, ()) = tokio::join!(s.run(), driver);
+        assert!(matches!(end.unwrap(), End::Exit(Exit::Drained)));
+        assert_eq!(w.ids("a"), [1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    /// A paused session waits on its timers and nothing else: ten seconds pass on the paused
+    /// clock, which advances only while every task is idle. A session that spins keeps it still,
+    /// and a real two-second watchdog fails the test.
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_session_idles() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let (mut core, control, status) = w.core(&flush_each(), &["a"]);
+        core.pause = true;
+        let s = Session::open(&mut core).await.unwrap().unwrap();
+        let driver = async {
+            wait_until("parked", || status.borrow().phase == Phase::Paused).await;
+            let (spun, spinning) = tokio::sync::oneshot::channel::<()>();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                let _ = spun.send(());
+            });
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(10)) => {}
+                _ = spinning => panic!("the paused session spins: the paused clock stood still"),
+            }
+            control.send(Command::Drain).await.unwrap();
+        };
+        let (end, ()) = tokio::join!(s.run(), driver);
+        assert!(matches!(end.unwrap(), End::Exit(Exit::Drained)));
+    }
+
+    #[tokio::test]
+    async fn a_drain_while_paused_ends_at_once() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let (end, last) = session(&w, &flush_each(), &["a"], async |status| {
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+            let first = w.source.wal_end();
+            durable(&status, first).await;
+        })
+        .await;
+        assert!(matches!(end.unwrap(), End::Exit(Exit::Drained)));
+        let _ = last;
+        let (mut core, control, status) = w.core(&flush_each(), &["a"]);
+        core.pause = true;
+        let s = Session::open(&mut core).await.unwrap().unwrap();
+        let driver = async {
+            wait_until("a session that opens paused parks", || {
+                status.borrow().phase == Phase::Paused
+            })
+            .await;
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(2, "x")));
+            control.send(Command::Drain).await.unwrap();
+        };
+        let (end, ()) = tokio::join!(s.run(), driver);
+        assert!(matches!(end.unwrap(), End::Exit(Exit::Drained)));
+        assert_eq!(w.ids("a"), [1], "the paused session read nothing more");
     }
 
     #[tokio::test]
@@ -1487,7 +1710,8 @@ mod tests {
 
     /// A table whose re_query fetch keeps failing: the streak's first commit tries three times
     /// and warns; the next tries once, with no backoff, and warns nothing more. A fetch that
-    /// succeeds ends the streak: the next failure tries three times and warns again.
+    /// succeeds ends the streak: the next failure tries three times and warns again, a warning
+    /// the status already shows, once.
     #[tokio::test]
     async fn a_failing_re_query_fetch_warns_once_per_streak_and_tries_once_while_failing() {
         let w = World::with(vec![with_v("a")]);
@@ -1531,7 +1755,7 @@ mod tests {
         .await;
         end.unwrap();
         assert!(st.halted.is_empty(), "{:?}", st.halted);
-        assert_eq!(st.warnings.len(), 2, "{:?}", st.warnings);
+        assert_eq!(st.warnings.len(), 1, "{:?}", st.warnings);
         assert_eq!(
             (w.text("a", "doc"), w.text("a", "v")),
             (vec![Some("new".to_owned())], vec![Some("4".to_owned())])
@@ -1647,13 +1871,11 @@ mod tests {
                 .collect()
         };
         let driver = async {
-            w.source.fail(
-                Method::RetainedBytes,
-                SourceError::Transient("reset".into()),
-            );
+            w.source
+                .fail(Method::Retained, SourceError::Transient("reset".into()));
             for _ in 0..2 {
                 w.source.fail(
-                    Method::RetainedBytes,
+                    Method::Retained,
                     SourceError::Permanent("permission denied".into()),
                 );
             }
@@ -1668,7 +1890,7 @@ mod tests {
             w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
             durable(&status, w.source.wal_end()).await;
             w.source.fail(
-                Method::RetainedBytes,
+                Method::Retained,
                 SourceError::Permanent("permission denied again".into()),
             );
             wait_until("a new streak warns", || blind().len() == 2).await;
@@ -1680,6 +1902,93 @@ mod tests {
         let (end, ()) = tokio::join!(s.run(), driver);
         assert!(matches!(end.unwrap(), End::Exit(Exit::Drained)));
         assert_eq!(w.ids("a"), [1, 2]);
+    }
+
+    /// A source that stops answering (a frozen server, DA-SRC-16): the stream is silent and the
+    /// heartbeat's reads time out, so the session ends as a transient source error and the
+    /// worker reconnects.
+    #[tokio::test]
+    async fn a_silent_stream_whose_source_doesn_t_answer_ends_the_session() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let p = pipeline("", "flush: { seconds: 0 }", "");
+        let (mut core, _control, _status) = w.core(&p, &["a"]);
+        core.settings.heartbeat = Duration::from_millis(5);
+        for _ in 0..10 {
+            w.source.fail(
+                Method::Retained,
+                SourceError::Transient("measure the slot's WAL timed out after 30s".into()),
+            );
+        }
+        let s = Session::open(&mut core).await.unwrap().unwrap();
+        let end = s.run().await.unwrap();
+        let End::Source(SourceError::Transient(why)) = end else {
+            panic!("{end:?}")
+        };
+        assert!(why.starts_with("the source isn't answering"), "{why}");
+        assert!(why.contains("timed out after 30s"), "{why}");
+    }
+
+    /// The server dropped the stream without the client hearing of it: the slot has no reader.
+    #[tokio::test]
+    async fn a_silent_stream_on_a_slot_no_stream_reads_ends_the_session() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let p = pipeline("", "flush: { seconds: 0 }", "");
+        let (mut core, _control, _status) = w.core(&p, &["a"]);
+        core.settings.heartbeat = Duration::from_millis(5);
+        let s = Session::open(&mut core).await.unwrap().unwrap();
+        w.source.set_retained(Some(0));
+        w.source.detach_stream();
+        let end = s.run().await.unwrap();
+        let End::Source(SourceError::Transient(why)) = end else {
+            panic!("{end:?}")
+        };
+        assert!(why.contains("no stream reads the slot"), "{why}");
+    }
+
+    /// A paused session reads no stream, so a silent stream proves nothing about the source:
+    /// the watchdog leaves it be, though the slot has no reader (Review Focus 3).
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_session_outlives_a_source_that_doesn_t_answer() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let (mut core, control, status) = w.core(&flush_each(), &["a"]);
+        core.settings.heartbeat = Duration::from_millis(5);
+        core.pause = true;
+        let s = Session::open(&mut core).await.unwrap().unwrap();
+        w.source.set_retained(Some(0));
+        w.source.detach_stream();
+        let driver = async {
+            wait_until("parked", || status.borrow().phase == Phase::Paused).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            control.send(Command::Drain).await.unwrap();
+        };
+        let (end, ()) = tokio::join!(s.run(), driver);
+        let end = end.unwrap();
+        assert!(matches!(end, End::Exit(Exit::Drained)), "{end:?}");
+    }
+
+    /// A heartbeat read that never comes back holds up neither the stream nor a drain, and
+    /// counts against nothing: it may wait behind a chunk read on a shared connection.
+    #[tokio::test]
+    async fn a_stalled_heartbeat_read_holds_up_nothing() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let p = pipeline("", "flush: { seconds: 0 }", "");
+        let (mut core, control, status) = w.core(&p, &["a"]);
+        core.settings.heartbeat = Duration::from_millis(5);
+        w.source.stall_retained();
+        let s = Session::open(&mut core).await.unwrap().unwrap();
+        let driver = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+            durable(&status, w.source.wal_end()).await;
+            control.send(Command::Drain).await.unwrap();
+        };
+        let (end, ()) = tokio::join!(s.run(), driver);
+        assert!(matches!(end.unwrap(), End::Exit(Exit::Drained)));
+        assert_eq!(w.ids("a"), [1]);
     }
 
     /// The blind warning names what is blind: the bound when `max_wal_lag_bytes` is set, else the
@@ -1698,11 +2007,8 @@ mod tests {
             let p = pipeline("", "flush: { seconds: 0 }", postgres);
             let (mut core, _control, status) = w.core(&p, &["a"]);
             let mut s = Session::open(&mut core).await.unwrap().unwrap();
-            w.source.fail(
-                Method::RetainedBytes,
-                SourceError::Permanent("permission denied".into()),
-            );
-            s.wal_lag().await.unwrap();
+            s.wal_lag(Ok(Err(SourceError::Permanent("permission denied".into()))))
+                .unwrap();
             let warnings = status.borrow().warnings.clone();
             assert!(
                 matches!(&warnings[..], [m] if m.starts_with("the WAL-lag guard is blind") && m.ends_with(tail)),

@@ -1,5 +1,5 @@
 ---
-updated: 2026-06-20
+updated: 2026-10-08
 domain: Data Flow
 tags: [lifecycle, state-machine, pause, stop, resume, restart, flush, failover, management-api, cdc]
 resolves: [G-NEW-15]
@@ -65,12 +65,20 @@ This is the single idea that answers every §2.5 question.
 
   restart:  RUNNING ─(drain+flush, §12.4)─► STARTING ─► RUNNING   (valid only on RUNNING)
   flush:    action in RUNNING (and PAUSED is already flushed) — no state change
+
+  out of ERROR:  ERROR ─stop─► STOPPED ─resume─► RUNNING   (reruns from Phase 0, as a restart)
 ```
 
 - **`resume` targets both `PAUSED` and `STOPPED`** → `RUNNING` (answers §2.5).
 - **`restart`** is valid only on a `RUNNING` pipeline; it follows the §12.4 **discard-and-replay**
   policy (drop unflushed batches, replay from last confirmed offset, dedup via G-13/G-14 idempotency)
   — identical to a config-driven restart. On `PAUSED`/`STOPPED` it is rejected (`409`).
+- **Out of `ERROR`** (M6b, owner ruling Q-M6b-12, 2026-10-08). `ERROR` is the controller's
+  actual state, held in memory; the desired state stays what the operator set. A `stop` clears it
+  (actual `STOPPED`), and a `resume` then runs the worker again from Phase 0, as a process restart
+  would. If the cause persists (the WAL still over `max_wal_lag_bytes`, the same oversized
+  transaction), the rerun fails the same way: only an operator triggers it. Until M9's `restart`,
+  this and a process restart are the ways out of `ERROR`.
 - **`flush`** forces an immediate flush and **resets the time-based flush timer and the row/byte
   counters** (closes §9.6). A no-op warning if the buffer is empty.
 

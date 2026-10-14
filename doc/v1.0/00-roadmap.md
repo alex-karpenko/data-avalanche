@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-03
+updated: 2026-10-08
 domain: Architecture
 tags: [v1, implementation-plan, roadmap, milestones, workspace, crates, interfaces, test-strategy, ci, risks]
 sources: []
@@ -273,7 +273,8 @@ pub fn upsert_schema(schema: &TableSchema) -> SchemaRef;                 // sour
 pub fn delete_schema(schema: &TableSchema, extra: &[String]) -> Result<SchemaRef, HaltReason>;   // identifier first
 pub fn unchanged_mask_field(column: &str) -> Field;   // also: lineage_fields(), logical_tag(&ColumnSchema)
 
-pub struct PositionRange { pub start: SourcePosition, pub end: SourcePosition }   // (start, end]
+pub struct PositionRange { pub start: SourcePosition, pub end: SourcePosition,     // (start, end]; end = the flush frontier, the marker
+                          pub last_change: SourcePosition }   // M6b: the table's last transaction in the range, which the guard compares
 pub struct SplitInfo { pub txn_start: SourcePosition, pub slice: u32 }              // slice ranges end at txn_start
 pub struct TableChangeSet {
     pub table: TableRef, pub schema: SchemaRef /* upsert_schema */, pub identifier: Vec<String>,
@@ -284,7 +285,7 @@ pub struct TableChangeSet {
 impl TableChangeSet {
     // Upsert batches: schema's fields, then the same unchanged masks (non-identifier columns) in every batch;
     // a non-empty identifier; delete batches start with it; a key at most once across both; no NULL key;
-    // the range doesn't run backwards; a slice's range ends at txn_start; a snapshot set only upserts
+    // the range doesn't run backwards and holds last_change; a slice's range ends at txn_start; a snapshot set only upserts
     // (no deletes, truncate or slice).
     pub fn validate(&self) -> Result<(), ChangeSetError>;
     pub fn upsert_rows(&self) -> usize; pub fn delete_rows(&self) -> usize; pub fn is_empty(&self) -> bool;
@@ -301,13 +302,16 @@ pub trait Sink: Send + Sync {             // object safe: Arc<dyn Sink>
     fn capabilities(&self) -> &SinkCapabilities;
     async fn table_state(&self, table: &TableRef) -> Result<SinkTableState, SinkError>;
     async fn ensure_table(&self, spec: &TableSpec) -> Result<(), SinkError>;         // a present table is left alone
-    async fn evolve(&self, table: &TableRef, delta: &SchemaDelta) -> Result<EvolveOutcome, SinkError>;
+    fn stats(&self) -> SinkStats { SinkStats::default() }                              // M6b: the MERGE cost, for the metrics
+    async fn evolve(&self, table: &TableRef, delta: &SchemaDelta, owner_epoch: u64)  // M6b: fenced (Q-M6b-7)
+        -> Result<EvolveOutcome, SinkError>;
     async fn commit(&self, cs: TableChangeSet, marker: CommitMarker) -> Result<CommitOutcome, SinkError>;
 }
 // commit, in order (documented on the trait; testkit `MemorySink` is the reference):
 //  1. cs.validate(); 2. refuse a marker whose committed_position != cs.position.end; 3. NoTable;
 //  4. fence, then guard, against the stored marker (Fenced / SkippedCovered change nothing);
-//  5. every column of the set in the table with the same type; a table column missing from the set is written NULL;
+//  5. the set's identifier is the table's (M6b); every column of the set in the table with the same type;
+//     a table column missing from the set is written NULL;
 //  6. one table version: truncate clear → deletes → upserts; a masked cell keeps the stored value (NULL on a new row);
 //  7. store the marker with the UNION of the prior and new positions.
 pub enum SinkKind { Delta, Iceberg }        // as_str(): "delta" | "iceberg" (pipeline state `sink_type`)
@@ -326,12 +330,14 @@ pub struct CommitMarker { pub owner_epoch: u64, pub committed_position: SourcePo
 impl CommitMarker {
     pub fn fences(&self, ours: &CommitMarker) -> bool;   // stored.owner_epoch > ours.owner_epoch
     // Guard (D-M3.14, S-P): a snapshot set → never covered (Q-M6a-6, S-T; the fence still applies);
-    // split None → stored covers cs.position.end; split Some → stored strictly past txn_start.
+    // split None → stored covers cs.position.last_change (M6b, DA-X-12; was end); split Some → stored strictly past txn_start.
     pub fn covers(&self, cs: &TableChangeSet) -> Result<bool, PositionError>;
 }
 pub struct SinkTableState { pub exists: bool, pub schema: Option<SchemaRef> /* Hop 2 terms, soft-drops stay */,
-                            pub marker: Option<CommitMarker> }
-pub enum EvolveOutcome { Applied, Degraded { warning: String }, Unsupported { reason: String } }
+                            pub marker: Option<CommitMarker> }   // None: no positioned own commit in reach, never "never written"
+pub enum EvolveOutcome { Applied, Degraded { warning: String }, Unsupported { reason: String },
+                         Fenced { current_epoch: u64 } }        // M6b: a newer owner wrote the table; nothing changed
+pub struct SinkStats { pub files_rewritten: u64, pub rows_copied: u64 }   // M6b; a sink that doesn't measure reports zeros
 pub enum CommitOutcome { Committed { version: u64 }, SkippedCovered, Fenced { current_epoch: u64 } }
 pub enum SinkError { InvalidChangeSet(ChangeSetError), Position(PositionError), NoTable { table },
                      Transient { reason }, Permanent { reason } }   // is_transient(): Transient only
@@ -412,7 +418,7 @@ pub trait SourceConnector: Send + Sync {                    // built from the re
     async fn prepare(&self, checkpoint: Option<&SourcePosition>, tables: &[TableRef])
         -> Result<Prepared, SourceError>;                                           // publication + slot state machine → StartPlan
     async fn reset_position(&self) -> Result<SourcePosition, SourceError>;         // after PositionUnreachable (D-15.3)
-    async fn retained_bytes(&self) -> Result<Option<u64>, SourceError>;            // the max_wal_lag_bytes measure
+    async fn retained(&self) -> Result<Option<RetainedLog>, SourceError>;          // M6b (was retained_bytes): the heartbeat's read
     async fn current_position(&self) -> Result<SourcePosition, SourceError>;       // a rescan's catch-up mark (Q-M6a-4)
     async fn in_flight(&self) -> Result<Option<Vec<InFlightTxn>>, SourceError>;   // M6a; default None (DA-SNAP-9)
     async fn read_chunk(&self, t: &TableSchema, after: Option<&KeysetCursor>, limit: usize) -> Result<Chunk, SourceError>;
@@ -443,7 +449,9 @@ pub enum SourceError { Transient(String), Permanent(String), Contended(String) /
 ```
 
 Also: `Preflight { server_version, warnings }`, `ResolvedTables { tables, halted, skipped, warnings }`,
-`KeysetCursor { key: Row, collation }`, `Chunk { rows, next, visibility: Option<ChunkVisibility> }`,
+`RetainedLog { bytes, streamed }` (M6b: the `max_wal_lag_bytes` measure, and whether a stream reads
+the slot, the watchdog's evidence, DA-SRC-16), `KeysetCursor { key: Row, collation }`,
+`Chunk { rows, next, visibility: Option<ChunkVisibility> }`,
 `RescanReport { dropped, changed, halted }` (the pipeline applies a `changed` schema only once the
 stream has passed `current_position` read after the rescan, Q-M6a-4), `identifier_values(&TableSchema,
 &Row)`. From M6a (DA-SNAP-9): `ChunkVisibility::Xids(XidSnapshot)`, `XidSnapshot { xmin, xmax, xip }`
@@ -452,7 +460,8 @@ with `sees(xid)` (a full `xid8` or the stream's 32-bit xid), `InFlightTxn { xid,
 `pg_current_snapshot()`, and `in_flight` lists writers from `pg_locks`; a source with `None`
 (MySQL) falls back to the window rule. PostgreSQL positions (D-M5.2): a change's
 `source_pos` is its transaction's commit LSN, its `seq` the XLogData `wal_start`; `Commit` carries
-the `end_lsn` that is acknowledged and resumed from.
+the `end_lsn` that is acknowledged and resumed from. M6b bounds the catalog connect by
+`timeouts.connect` as a whole (TCP, TLS, startup, authentication).
 
 ### 3.7 Cluster (Clustering §19–§20)
 
@@ -461,6 +470,44 @@ machine (`Held | Renewing | Degraded | Lost`) exposes `may_commit()` = state ∈
 now < deadline. `PipelineController` is the sole lease writer and owns the `PipelineWorker`.
 `ClusterReconciler` pushes `Own/DontOwn` targets. The same types run in single-node mode; M6b ships them
 with a self-only ring, behind M6a's `CommitGuard` (§3.11).
+
+What M6b ships (`data-avalanche-cluster`, `M6b-single-node-control.md` D-M6b.4…8):
+
+```rust
+pub struct LeaseTiming { pub duration: Duration, pub renewal_interval: Duration, pub safety_margin: f64 }
+impl LeaseTiming { pub fn new(cluster: &Cluster) -> Self; pub fn deadline(&self, renewed: Instant) -> Instant; }
+pub enum RenewState { Held, Degraded, Lost }   // "Renewing" is no state: a renewal in flight leaves it as it was
+pub struct LeaseGuard;                          // impl CommitGuard: state ∈ {Held, Degraded} ∧ now < deadline, on its own clock
+impl LeaseGuard { pub fn state(&self) -> RenewState; pub async fn lost(&self); }
+pub struct LeaseRun { pub guard: Arc<LeaseGuard>, pub owner_epoch: u64 }   // the renewer task
+impl LeaseRun { pub fn start(leases, lease: Versioned<LeaseDoc>, holder, timing, written: Instant,
+                             metrics: Arc<PipelineMetrics>) -> Self; pub async fn stop(self) -> RenewEnd; }
+pub enum RenewEnd { Stopped(Versioned<LeaseDoc>), Lost { reason: String } }
+pub struct Claim;                               // acquire, and takeover after a full lease duration unrenewed
+impl Claim { pub fn new(leases, pipeline_id: &str, holder, timing) -> Self;
+             pub async fn step(&mut self) -> Result<Claimed, StateError>; }
+pub enum Claimed { Mine { lease: Versioned<LeaseDoc>, written: Instant }, HeldBy { node_id: String, takeover_at: Instant } }
+pub async fn release(leases: &Leases, lease: &Versioned<LeaseDoc>) -> Result<(), StateError>;
+pub trait WorkerFactory: Send + Sync + Debug { fn build(&self, pipeline: &Pipeline) -> Result<Parts, String>; }
+pub struct Parts { pub source: Arc<dyn SourceConnector>, pub sink: Arc<dyn Sink>, pub hooks: Arc<dyn Hooks> }
+pub enum Target { Own, DontOwn }
+pub enum Actual { Standby { holder }, Starting, Running, Paused, Stopped, Dumped, Retrying { error }, Error { error } }
+pub struct ControllerStatus { pub actual: Option<Actual>, pub owner_epoch: Option<u64>, pub lease: Option<RenewState>,
+                              pub worker: Option<WorkerStatus> }
+pub struct ControllerSettings { pub timing, pub drain_timeout, pub restart: Backoff, pub start_jitter, pub tuning }
+pub struct ControllerDeps { pub leases, pub holder, pub factory: Arc<dyn WorkerFactory>, pub metrics: Metrics,
+                            pub settings: ControllerSettings, pub starts: Arc<Semaphore> /* Phase 0 permits */ }
+impl PipelineController { pub fn new(..) -> Self; pub async fn run(self, target: watch::Receiver<Target>); }
+impl ClusterReconciler { pub fn start(pipelines: Vec<(Pipeline, PipelineDocs)>, deps: &ControllerDeps) -> Self;
+                         pub fn statuses(&self) -> BTreeMap<String, watch::Receiver<ControllerStatus>>;
+                         pub async fn shutdown(self); }
+pub fn node_identity(cluster: &Cluster, started: SystemTime) -> Result<Holder, String>;
+```
+
+The controller polls the desired state each `lease_renewal_interval` (Q-M6b-2) and maps a worker
+error by `WorkerError::recovery()`: `Retry` reruns after a backoff, `Lease` stands by, `Error` holds
+ERROR until a stop (Q-M6b-3, Q-M6b-12). It logs each worker warning once and each reconnect with
+its reason.
 
 ### 3.8 Configuration (`data-avalanche-config`, landed in M1)
 
@@ -592,8 +639,15 @@ Errors:
   is retried up to `COMMIT_ATTEMPTS` times, then becomes `Transient`. A zombie that loses a race
   ends `Fenced`.
 - `Permanent`: data or table errors, Delta validation failures, the other conflict variants,
-  unsupported features, invalid locations.
-- `Transient`: storage and network errors, and a MERGE over `merge_memory_limit`.
+  unsupported features, invalid locations, and (M6b, Q-M6b-6) a MERGE over `merge_memory_limit`:
+  the table halts `SINK_REJECTED`.
+- `Transient`: storage and network errors. Any `Transient` drops the cached table handle (M6b).
+
+M6b also:
+- loads a table only when its `_delta_log/` lists a log file (no kernel error for an absent table);
+- detects a table re-created behind a live handle at refresh, by the e-tag of the commit file at
+  the handle's version, and re-opens it (Q-M6b-8); a table dropped since the refresh is `NoTable`;
+- fences `evolve` by the `txn` version (Q-M6b-7), and refuses a set keyed otherwise than the table.
 
 `table_state` reads the Hop 2 schema back from the column metadata. Its `marker` is `None` when no
 positioned own commit is in reach. The rulings are D-M4.1…15 (D-IMPL-11), with the plan's
@@ -615,25 +669,31 @@ impl PipelineWorker {
     pub async fn run(self) -> Result<Exit, WorkerError>;              // until Drain (or the handle drops), Dumped, or an error
 }
 pub struct WorkerHandle { pub control: mpsc::Sender<Command>, pub status: watch::Receiver<WorkerStatus> }
-pub enum Command { Drain /* flush, make durable, close: Exit::Drained */, Flush }
+pub enum Command { Drain /* flush, make durable, close: Exit::Drained */, Flush,
+                   Pause /* M6b: finish the open txn, flush, durable, then read nothing; the connection stays */, Resume }
 pub enum Exit { Drained, Dumped /* every table a dump_* table, done */ }
-pub enum Phase { Starting, Streaming, Reconnecting { error: String }, Draining }
+pub enum Phase { Starting, Streaming, Reconnecting { error: String }, Draining, Paused /* M6b */ }
 pub struct WorkerStatus { pub phase: Phase, pub read: Option<SourcePosition>, pub checkpoint: Option<SourcePosition>,
                           pub retained_bytes: Option<u64>, pub degraded: Option<String> /* the last retried error */,
                           pub halted: BTreeMap<TableRef, HaltReason>, pub snapshots: BTreeMap<TableRef, SnapshotProgress>,
-                          pub warnings: Vec<String> }
+                          pub warnings: Vec<String> /* each once, capped (M6b) */,
+                          pub reconcile_log: ReconcileLog { entries, keys }, pub warnings_dropped: u64,
+                          pub reconnects: u64 }   // the last three: M6b
 pub struct SnapshotProgress { pub rows_done: u64 }
 pub struct Tuning { pub source_backoff: Backoff, pub sink_backoff: Backoff, pub in_flight_backoff: Backoff /* 0.5 s → 10 s */,
                     pub contended_window: Duration /* 120 s */, pub tick: Duration /* 1 s */, pub augment_attempts: u32 /* 3 */ }
 pub struct Backoff { pub first: Duration, pub max: Duration }       // default 1 s → 60 s; delay(attempt): jittered upper half
 pub trait CommitGuard: Send + Sync + Debug { fn may_commit(&self) -> bool; }   // M6b: the lease renewer; Unguarded
 pub trait Hooks: Send + Sync + Debug { fn at(&self, point: &HookPoint) -> HookAction; }  // crash tests; NoHooks
-pub enum HookPoint { SinkCommitted { table }, CheckpointPersisted { position }, ChunkEmitted { table } }
+pub enum HookPoint { SinkCommitted { table }, CheckpointPersisted { position }, ChunkEmitted { table },
+                     SchemasCached /* M6b */ }
 pub enum HookAction { Continue, Crash /* → WorkerError::Crashed, nothing more written */ }
 pub enum WorkerError { Refused(String) /* Phase 0: sink type, Iceberg (D-V1.4), capabilities */, Source(SourceError),
                        Contended { waited, detail }, Sink(SinkError), State(StateError), Fenced { table, current_epoch },
                        LeaseLost, TransactionTooLarge { bytes, limit }, WalLag { lag, limit }, Accumulator(AccumulatorError),
                        Crashed(HookPoint) }
+impl WorkerError { pub fn recovery(&self) -> Recovery; }             // M6b (Q-M6b-3)
+pub enum Recovery { Retry, Lease, Error }
 ```
 
 - **Phase 0** loads state and the recorded `sink_type`, resolves the tables (channel A), runs the
@@ -652,6 +712,36 @@ pub enum WorkerError { Refused(String) /* Phase 0: sink type, Iceberg (D-V1.4), 
   (S-S).
 - **Between sessions**, a transient source error reconnects after `source_backoff`. A busy slot
   is retried within `contended_window`. A lost position is reset and re-snapshotted.
+- **M6b adds:** every Phase 0 state write gated by the `CommitGuard`; pause and resume; the
+  heartbeat's read run beside the loop, and the stream watchdog (`SILENT_HEARTBEATS` = 3: a stream
+  silent for 3 heartbeats while 3 reads in a row fail or find no reader ends the session, and the
+  worker reconnects; DA-SRC-16); each table's last change in its change set (DA-X-12).
+
+### 3.12 Telemetry and the binary (`data-avalanche-telemetry`, `data-avalanche`; M6b)
+
+```rust
+// data-avalanche-telemetry: no workspace dependency; OpenMetrics text via prometheus-client
+pub const CONTENT_TYPE: &str;                        // application/openmetrics-text; version=1.0.0
+pub struct Metrics;                                  // the registry: Clone shares it
+impl Metrics { pub fn new() -> Self; pub fn encode(&self) -> String; pub fn owned_by(&self, delta: i64);
+               pub fn set_cluster_members(&self, n: usize);
+               pub fn pipeline(&self, labels: PipelineLabels, per_table: bool) -> PipelineMetrics; }
+pub struct PipelineMetrics;                          // status, lease, renewals, WAL lag, snapshot rows, halted tables,
+                                                     // the reconciler log, totals (reconnects, MERGE cost); remove()
+pub enum PipelineStatus; pub enum LeaseState; pub enum RenewFailure; pub struct PipelineLabels; pub struct Totals;
+
+// data-avalanche (the binary; the only crate that links source-pg and sink-delta)
+pub async fn run(args: RunArgs) -> Result<(), Fatal>;   // `data-avalanche run --config <path>` [--log-level] [--log-format]
+pub enum Fatal { Config(String) /* exit 2 */, Startup(String) /* exit 1 */ }
+pub struct Factory;                                      // impl WorkerFactory: PgConnector + DeltaSink per pipeline
+```
+
+- HTTP: `/health/live`; `/health/ready` once startup is done and every pipeline's controller
+  runs (not: every pipeline is healthy); `/metrics`. Unauthenticated (config §6.3).
+- Logs: `globals.log`, overridden by the command line; a bare `info` (or quieter) caps the Delta
+  libraries (config §6.4).
+- `DATA_AVALANCHE_E2E_CRASH=<point>[:<n>]` aborts the process at a hook point, only in a build
+  with the `e2e-hooks` feature (Q-M6b-5).
 
 ---
 
@@ -889,9 +979,13 @@ that needs the control plane is M6b's.
     together with the identifier-change path.
   - `Sink::evolve` carries no marker, so a zombie's ADD COLUMN isn't fenced. It is idempotent, but
     the trait question is open.
+- **Owner's answers to the planning findings (2026-10-08):** the position guard compares a
+  table's last change (DA-X-12); a stream watchdog and a bounded catalog connect (DA-SRC-16);
+  the Delta libraries quiet at `info`; a stop and a resume lead out of ERROR.
 - **Deps:** M4, M6a.
 - **Exit:** the **slice-1 E2E suite** passes on PG 18 + RustFS and weekly on PG 14–17. See §5.3 for
-  the scenario list.
+  the scenario list. Measured while planning (`M6b-single-node-control.md`, "Verified"): 26
+  scenarios, green twice on PostgreSQL 18 and once on 14.
 
 ### M7 — MySQL and MariaDB source (`data-avalanche-source-mysql`)
 
@@ -1083,7 +1177,8 @@ fake-gcs FAIL (risk R-3).
 8. Single-node lease: a second process against the same `globals.state` doesn't run the pipeline and
    takes over after the first dies.
 9. Iceberg refusal: an `iceberg` pipeline is refused while a `delta` pipeline in the same config runs.
-10. Guards: `max_wal_lag_bytes` halt; `max_transaction_buffer_bytes` halt; slot WAL-gone → re-snapshot.
+10. Guards: `max_wal_lag_bytes` halt; `max_transaction_buffer_bytes` halt; slot WAL-gone → re-snapshot;
+    a frozen source reconnected to (M6b, DA-SRC-16).
 
 ### 5.4 CI (`.github/workflows/`)
 
@@ -1215,6 +1310,7 @@ the naming below (2026-09-26).**
 | D-IMPL-11 | M4 Delta-sink rulings **D-M4.1…D-M4.15** (listed in `M4-delta-sink.md` §Decisions and rulings, each pinned by a test). Among them: every column carries its logical type in the Delta column metadata, so `table_state` reads Hop 2 back; the MERGE matches on the identifier only (no partition pruning); a zombie that loses a race is retried and ends `Fenced`; the walk-back stops at the cached own version, after 1000 commits or at a cleaned-up commit file; a truncate's DELETE carries no position; a set that changes no row gets a marker-only commit | The specs are silent on these; each keeps the fence, the guard or the round trip exact | M4 — **approved 2026-09-30** |
 | D-IMPL-12 | M5 PostgreSQL-source rulings **D-M5.1…D-M5.19** (listed in `M5-pg-source.md` §Decisions and rulings, each pinned by a test). Among them: the source contract lives in core with `prepare`, `augment`, `fetch_rows` and `TableHalt` (§3.6); a change's position is its commit LSN, `Commit` carries the `end_lsn` that is acknowledged; a Relation signal is emitted with the next change's sequence; the stream doesn't reconnect by itself; the slot state table as one function; a publication the pipeline can't change that publishes via the partition root while tracking a partition is refused; snapshot rows are read as output-function text, keys in `COLLATE "C"` | The specs are silent on these; each keeps the stream's positions, the slot or the round trip exact | M5 — **approved 2026-10-01** |
 | D-IMPL-13 | M6a pipeline-worker rulings **D-M6a.1…D-M6a.11** (listed in `M6a-pipeline-worker.md` §Decisions and rulings, each pinned by a test). Among them: a halt's `at` is the accumulator checkpoint, persisted before the next checkpoint, and a persisted halt keeps the table halted at every start until M9's re-snapshot; a failed channel-C catalog read halts the table `UNSAFE_DDL`; `Permanent` from `evolve` halts `SINK_REJECTED`; state-store `Transient`/`Contention` retry like a sink `Transient`; channel D's dropped and halted tables also wait for the stream to catch up; a chunk read under a schema the table has since left is read again, and its cursor rides the chunk's own flush; after a gap a snapshot in progress starts over; a mid-run `PositionUnreachable` resets the position and reruns Phase 0; no stream watchdog; the WAL-lag guard ends the worker; a table that drifted while down is rescanned before its snapshot reads | The specs are silent on these; each keeps the checkpoint, the halt or the snapshot exact across a crash | M6a — **approved 2026-10-03** |
+| D-IMPL-14 | M6b single-node-control rulings **Q-M6b-1…13 and D-M6b.1…13** (listed in `M6b-single-node-control.md` §Decisions and rulings, each pinned by a test). Among them: the source stays warm on pause; the controller polls `pipeline-state.json` and classifies worker errors (`Retry`, `Lease`, `Error`); `evolve` is fenced; a stale Delta handle is detected by its commit file's e-tag; a MERGE over `merge_memory_limit` halts its table (V-119); the guard compares a table's last change; the stream watchdog (reverses D-M6a.9) | The specs are silent on most; where a ruling touched a spec row, the row was patched with approval (V-119, the metric catalogue, Data-Flow Phase 4, config §6.4, §9.2, §9.2.1) | M6b — **approved 2026-10-08** |
 
 ### 9.1 Questions answered at plan review (2026-09-26)
 

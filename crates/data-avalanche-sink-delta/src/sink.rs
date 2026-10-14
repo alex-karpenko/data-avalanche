@@ -7,8 +7,8 @@ use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use data_avalanche_core::{
     CommitMarker, CommitOutcome, EvolveOutcome, SchemaDelta, SchemaOp, Sink, SinkCapabilities,
-    SinkError, SinkKind, SinkTableState, SourcePosition, TableChangeSet, TableRef, TableSpec,
-    TransformKind, WriteMode,
+    SinkError, SinkKind, SinkStats, SinkTableState, SourcePosition, TableChangeSet, TableRef,
+    TableSpec, TransformKind, WriteMode,
 };
 use deltalake::DeltaTableError;
 use deltalake::kernel::Transaction;
@@ -147,27 +147,43 @@ impl DeltaSink {
         let mut guard = slot.lock_owned().await;
         if guard.is_none() {
             let url = self.config.location.table_url(table)?;
-            *guard = Some(TableHandle::open(url, self.options.clone()).await?);
+            *guard = Some(TableHandle::open(table.clone(), url, self.options.clone()).await?);
         }
         Ok(guard)
+    }
+
+    /// Runs `f` on the table's handle. A `Transient` failure drops the handle, so the next call
+    /// opens the table afresh: a handle delta-rs can't bring forward recovers without a restart.
+    async fn with_table<T>(
+        &self,
+        table: &TableRef,
+        f: impl AsyncFnOnce(&mut TableHandle) -> Result<T, SinkError>,
+    ) -> Result<T, SinkError> {
+        let mut guard = self.lock(table).await?;
+        let out = f(guard.as_mut().expect("opened by lock")).await;
+        if matches!(out, Err(SinkError::Transient { .. })) {
+            *guard = None;
+        }
+        out
     }
 
     /// The table's rows in Hop 2 terms and identifier order (every column, lineage included);
     /// `None` when the table doesn't exist. The Delta counterpart of `MemorySink::content`.
     pub async fn content(&self, table: &TableRef) -> Result<Option<RecordBatch>, SinkError> {
-        let mut guard = self.lock(table).await?;
-        let h = guard.as_mut().expect("opened by lock");
-        if !h.refresh().await? {
-            return Ok(None);
-        }
-        h.content().await.map(Some)
+        self.with_table(table, async |h| {
+            if !h.refresh().await? {
+                return Ok(None);
+            }
+            h.content().await.map(Some)
+        })
+        .await
     }
 
     /// One write's commit properties: the fence's `txn` (the owner epoch as the `i64` version
-    /// Delta stores, `txn_version`) and the marker's `commitInfo`.
+    /// Delta stores, `txn_version`) and the `commitInfo`.
     fn props(
         &self,
-        marker: &CommitMarker,
+        owner_epoch: u64,
         txn_version: i64,
         position: Option<&SourcePosition>,
     ) -> CommitProperties {
@@ -178,7 +194,7 @@ impl DeltaSink {
             ))
             .with_metadata(commit_metadata(
                 &self.config.pipeline_id,
-                marker.owner_epoch,
+                owner_epoch,
                 position,
             ))
     }
@@ -215,6 +231,13 @@ impl DeltaSink {
                 return Ok(Step::Done(CommitOutcome::SkippedCovered));
             }
         }
+        let recorded = h.identifier()?;
+        if !recorded.is_empty() && recorded != cs.identifier {
+            return Err(permanent(format!(
+                "the change set is keyed by {:?}, the table by {:?}",
+                cs.identifier, recorded
+            )));
+        }
         let snapshot = h.table().snapshot().map_err(sink_error)?;
         let types = check_columns(cs, snapshot.schema().as_ref())?;
         // Before the truncate's DELETE: a key that halts the MERGE must not leave the table
@@ -229,7 +252,7 @@ impl DeltaSink {
         let mut table = h.table().clone();
         if cs.truncate {
             // The clear carries the fence but no position: a crash before the MERGE replays both.
-            table = match truncate(table, self.props(marker, txn_version, None)).await {
+            table = match truncate(table, self.props(marker.owner_epoch, txn_version, None)).await {
                 Ok((t, metrics)) => {
                     self.count(|s| {
                         s.files_removed += metrics.num_removed_files as u64;
@@ -257,7 +280,7 @@ impl DeltaSink {
         }
         let before = table.version();
         if cs.upsert_rows() + cs.delete_rows() > 0 {
-            let props = self.props(marker, txn_version, Some(&position));
+            let props = self.props(marker.owner_epoch, txn_version, Some(&position));
             match merge(table, cs, &types, props, self.config.merge_memory_limit).await {
                 Ok((t, metrics)) => {
                     self.count(|s| s.add(&metrics));
@@ -271,7 +294,7 @@ impl DeltaSink {
             table.version().expect("a written table is loaded")
         } else {
             // Nothing changed a row: a marker-only commit still moves the position.
-            let props = self.props(marker, txn_version, Some(&position));
+            let props = self.props(marker.owner_epoch, txn_version, Some(&position));
             match marker_only(&table, props, &app_id(pipeline), txn_version).await {
                 Ok(v) => v,
                 Err(e) => return race_or_fail(e),
@@ -292,63 +315,91 @@ impl Sink for DeltaSink {
         &self.capabilities
     }
 
-    async fn table_state(&self, table: &TableRef) -> Result<SinkTableState, SinkError> {
-        let mut guard = self.lock(table).await?;
-        let h = guard.as_mut().expect("opened by lock");
-        if !h.refresh().await? {
-            if let Some(reason) = h.foreign_format().await? {
-                return Err(permanent(reason));
-            }
-            return Ok(SinkTableState {
-                exists: false,
-                schema: None,
-                marker: None,
-            });
+    fn stats(&self) -> SinkStats {
+        let s = DeltaSink::stats(self);
+        SinkStats {
+            files_rewritten: s.files_removed,
+            rows_copied: s.rows_copied,
         }
-        let pipeline = &self.config.pipeline_id;
-        let epoch = h.fence_epoch(pipeline).await?;
-        let position = h.stored_position(pipeline).await?;
-        Ok(SinkTableState {
-            exists: true,
-            schema: Some(h.schema()?),
-            marker: epoch
-                .zip(position)
-                .map(|(owner_epoch, committed_position)| CommitMarker {
-                    owner_epoch,
-                    committed_position,
-                    pipeline_id: pipeline.clone(),
-                }),
+    }
+
+    async fn table_state(&self, table: &TableRef) -> Result<SinkTableState, SinkError> {
+        self.with_table(table, async |h| {
+            if !h.refresh().await? {
+                if let Some(reason) = h.foreign_format().await? {
+                    return Err(permanent(reason));
+                }
+                return Ok(SinkTableState {
+                    exists: false,
+                    schema: None,
+                    marker: None,
+                });
+            }
+            let pipeline = &self.config.pipeline_id;
+            let epoch = h.fence_epoch(pipeline).await?;
+            let position = h.stored_position(pipeline).await?;
+            Ok(SinkTableState {
+                exists: true,
+                schema: Some(h.schema()?),
+                marker: epoch
+                    .zip(position)
+                    .map(|(owner_epoch, committed_position)| CommitMarker {
+                        owner_epoch,
+                        committed_position,
+                        pipeline_id: pipeline.clone(),
+                    }),
+            })
         })
+        .await
     }
 
     async fn ensure_table(&self, spec: &TableSpec) -> Result<(), SinkError> {
-        let mut guard = self.lock(&spec.table).await?;
-        let h = guard.as_mut().expect("opened by lock");
-        if h.refresh().await? {
-            return Ok(());
-        }
-        if let Some(reason) = h.foreign_format().await? {
-            return Err(permanent(reason));
-        }
-        h.create(spec, &self.config.table).await
+        self.with_table(&spec.table, async |h| {
+            if h.refresh().await? {
+                return Ok(());
+            }
+            if let Some(reason) = h.foreign_format().await? {
+                return Err(permanent(reason));
+            }
+            h.create(spec, &self.config.table).await
+        })
+        .await
     }
 
     async fn evolve(
         &self,
         table: &TableRef,
         delta: &SchemaDelta,
+        owner_epoch: u64,
     ) -> Result<EvolveOutcome, SinkError> {
-        let mut guard = self.lock(table).await?;
-        let h = guard.as_mut().expect("opened by lock");
-        if !h.refresh().await? {
-            return Err(SinkError::NoTable {
-                table: table.clone(),
-            });
-        }
-        let (t, outcome) =
-            evolve(h.table().clone(), delta, self.config.table.timestamp_ntz_as).await?;
-        h.set_table(t);
-        Ok(outcome)
+        self.with_table(table, async |h| {
+            if !h.refresh().await? {
+                return Err(SinkError::NoTable {
+                    table: table.clone(),
+                });
+            }
+            let pipeline = &self.config.pipeline_id;
+            if let Some(current) = h.fence_epoch(pipeline).await?.filter(|e| *e > owner_epoch) {
+                return Ok(EvolveOutcome::Fenced {
+                    current_epoch: current,
+                });
+            }
+            // The ADD COLUMN carries the fence's `txn` (no position): a commit of a newer owner
+            // that lands after the check above conflicts with it (`ConcurrentTransaction`), and
+            // the retry finds the newer epoch.
+            let txn_version = i64::try_from(owner_epoch)
+                .map_err(|_| permanent(format!("owner epoch {owner_epoch}")))?;
+            let (t, outcome) = evolve(
+                h.table().clone(),
+                delta,
+                self.config.table.timestamp_ntz_as,
+                self.props(owner_epoch, txn_version, None),
+            )
+            .await?;
+            h.set_table(t);
+            Ok(outcome)
+        })
+        .await
     }
 
     async fn commit(
@@ -382,28 +433,29 @@ impl DeltaSink {
         marker: &CommitMarker,
         refresh: bool,
     ) -> Result<CommitOutcome, SinkError> {
-        let mut guard = self.lock(&cs.table).await?;
-        let h = guard.as_mut().expect("opened by lock");
-        let mut lost = String::new();
-        for attempt in 0..COMMIT_ATTEMPTS {
-            if attempt > 0 {
-                self.count(|s| s.retries += 1);
-            }
-            match self.attempt(h, cs, marker, refresh).await? {
-                Step::Done(outcome) => {
-                    self.count(|s| match outcome {
-                        CommitOutcome::Committed { .. } => s.commits += 1,
-                        CommitOutcome::SkippedCovered => s.skipped += 1,
-                        CommitOutcome::Fenced { .. } => s.fenced += 1,
-                    });
-                    return Ok(outcome);
+        self.with_table(&cs.table, async |h| {
+            let mut lost = String::new();
+            for attempt in 0..COMMIT_ATTEMPTS {
+                if attempt > 0 {
+                    self.count(|s| s.retries += 1);
                 }
-                Step::Retry(reason) => lost = reason,
+                match self.attempt(h, cs, marker, refresh).await? {
+                    Step::Done(outcome) => {
+                        self.count(|s| match outcome {
+                            CommitOutcome::Committed { .. } => s.commits += 1,
+                            CommitOutcome::SkippedCovered => s.skipped += 1,
+                            CommitOutcome::Fenced { .. } => s.fenced += 1,
+                        });
+                        return Ok(outcome);
+                    }
+                    Step::Retry(reason) => lost = reason,
+                }
             }
-        }
-        Err(SinkError::Transient {
-            reason: format!("the commit lost {COMMIT_ATTEMPTS} races in a row, last: {lost}"),
+            Err(SinkError::Transient {
+                reason: format!("the commit lost {COMMIT_ATTEMPTS} races in a row, last: {lost}"),
+            })
         })
+        .await
     }
 }
 
@@ -412,8 +464,8 @@ mod tests {
     use data_avalanche_core::position::Lsn;
 
     use super::*;
-    use crate::TableDefaults;
     use crate::test_support::{change_set, local, marker, orders, spec, upserts};
+    use crate::{NtzAs, TableDefaults};
 
     fn sink(dir: &tempfile::TempDir) -> DeltaSink {
         DeltaSink::new(DeltaSinkConfig {
@@ -464,6 +516,153 @@ mod tests {
         let out = zombie.commit(late.clone(), marker(5, &late)).await.unwrap();
         assert_eq!(out, CommitOutcome::Fenced { current_epoch: 6 });
         assert_eq!(zombie.stats().fenced, 1);
+    }
+
+    fn add_note() -> SchemaDelta {
+        SchemaDelta {
+            table: orders().table().clone(),
+            changes: vec![data_avalanche_core::SchemaChange::AddColumn(
+                data_avalanche_core::ColumnSchema::new(
+                    "note",
+                    data_avalanche_core::ColumnValueType::Text,
+                    "text",
+                ),
+            )],
+        }
+    }
+
+    async fn columns(s: &DeltaSink) -> usize {
+        let state = s.table_state(orders().table()).await.unwrap();
+        state.schema.unwrap().fields().len()
+    }
+
+    #[tokio::test]
+    async fn an_evolve_of_a_table_a_newer_owner_wrote_is_fenced() {
+        let dir = tempfile::tempdir().unwrap();
+        let (zombie, owner) = (sink(&dir), sink(&dir));
+        zombie.ensure_table(&spec(&orders())).await.unwrap();
+        let first = rows(10, &[1]);
+        zombie
+            .commit(first.clone(), marker(5, &first))
+            .await
+            .unwrap();
+        let theirs = rows(20, &[2]);
+        owner
+            .commit(theirs.clone(), marker(6, &theirs))
+            .await
+            .unwrap();
+        let before = columns(&zombie).await;
+        let out = zombie.evolve(orders().table(), &add_note(), 5).await;
+        assert_eq!(out.unwrap(), EvolveOutcome::Fenced { current_epoch: 6 });
+        assert_eq!(columns(&zombie).await, before, "nothing added");
+        // The ADD COLUMN carries the fence: a write of an older owner after it is fenced.
+        let out = owner.evolve(orders().table(), &add_note(), 7).await;
+        assert_eq!(out.unwrap(), EvolveOutcome::Applied);
+        assert_eq!(columns(&owner).await, before + 1);
+        let late = rows(30, &[3]);
+        let out = owner.commit(late.clone(), marker(6, &late)).await;
+        assert_eq!(out.unwrap(), CommitOutcome::Fenced { current_epoch: 7 });
+    }
+
+    #[tokio::test]
+    async fn an_evolve_that_races_a_newer_owners_commit_fails_and_its_retry_is_fenced() {
+        let dir = tempfile::tempdir().unwrap();
+        let (zombie, owner) = (sink(&dir), sink(&dir));
+        zombie.ensure_table(&spec(&orders())).await.unwrap();
+        let first = rows(10, &[1]);
+        zombie
+            .commit(first.clone(), marker(5, &first))
+            .await
+            .unwrap();
+        // The zombie read the table (and passed the fence) before the new owner's commit.
+        let stale = {
+            let mut guard = zombie.lock(orders().table()).await.unwrap();
+            guard.as_mut().unwrap().table().clone()
+        };
+        let theirs = rows(20, &[2]);
+        owner
+            .commit(theirs.clone(), marker(6, &theirs))
+            .await
+            .unwrap();
+        let props = zombie.props(5, 5, None);
+        let err = evolve(stale, &add_note(), NtzAs::default(), props)
+            .await
+            .map(|(_, o)| o)
+            .unwrap_err();
+        assert!(err.is_transient(), "{err}");
+        assert!(err.to_string().contains("Concurrent transaction"), "{err}");
+        let out = zombie.evolve(orders().table(), &add_note(), 5).await;
+        assert_eq!(out.unwrap(), EvolveOutcome::Fenced { current_epoch: 6 });
+    }
+
+    /// A call that fails `Transient` drops the table's handle; the next call opens the table
+    /// afresh and lands.
+    #[tokio::test]
+    async fn a_transient_failure_drops_the_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let (s, other) = (sink(&dir), sink(&dir));
+        s.ensure_table(&spec(&orders())).await.unwrap();
+        let first = rows(10, &[1]);
+        s.commit(first.clone(), marker(1, &first)).await.unwrap();
+        let theirs = rows(20, &[2]);
+        other
+            .commit(theirs.clone(), marker(1, &theirs))
+            .await
+            .unwrap();
+        // Without re-reading, every attempt loses its race: `Transient`.
+        let late = rows(30, &[3]);
+        let err = s
+            .attempts(&late, &marker(1, &late), false)
+            .await
+            .unwrap_err();
+        assert!(err.is_transient(), "{err}");
+        let slot = s.tables.lock().unwrap().get(&late.table).cloned().unwrap();
+        assert!(slot.lock().await.is_none(), "the handle is dropped");
+        let out = s.commit(late.clone(), marker(1, &late)).await.unwrap();
+        assert!(matches!(out, CommitOutcome::Committed { .. }), "{out:?}");
+    }
+
+    /// A table created under another key refuses a set (the source's key, or its override,
+    /// changed since): merging on the set's key would duplicate rows. Nothing is written.
+    #[tokio::test]
+    async fn a_set_keyed_otherwise_than_the_table_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = sink(&dir);
+        s.ensure_table(&spec(&orders())).await.unwrap();
+        let mut cs = rows(10, &[1]);
+        cs.identifier = vec!["id".into(), "doc".into()];
+        let err = s.commit(cs.clone(), marker(1, &cs)).await.unwrap_err();
+        assert!(matches!(err, SinkError::Permanent { .. }), "{err}");
+        assert!(err.to_string().contains("keyed by"), "{err}");
+        let state = s.table_state(&cs.table).await.unwrap();
+        assert_eq!(state.marker, None, "nothing committed");
+    }
+
+    /// A MERGE over `merge_memory_limit` is refused `Permanent`, naming the key: retrying the same
+    /// set would fail the same way forever. Nothing is written.
+    #[tokio::test]
+    async fn a_merge_over_the_memory_limit_is_permanent() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = DeltaSink::new(DeltaSinkConfig {
+            merge_memory_limit: Some(64 << 10),
+            ..sink(&dir).config
+        });
+        s.ensure_table(&spec(&orders())).await.unwrap();
+        let seed = rows(10, &(0..20_000).collect::<Vec<_>>());
+        let ok = sink(&dir);
+        ok.commit(seed.clone(), marker(1, &seed)).await.unwrap();
+        let again = rows(20, &(0..20_000).collect::<Vec<_>>());
+        let err = s
+            .commit(again.clone(), marker(1, &again))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SinkError::Permanent { .. }), "{err}");
+        assert!(err.to_string().contains("merge_memory_limit"), "{err}");
+        let state = s.table_state(&again.table).await.unwrap();
+        assert_eq!(
+            state.marker.unwrap().committed_position,
+            SourcePosition::Pg(Lsn(10))
+        );
     }
 
     #[tokio::test]
@@ -662,14 +861,18 @@ mod tests {
     async fn a_truncate_set_with_a_key_outside_the_delta_range_changes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let s = sink(&dir);
-        s.ensure_table(&spec(&orders())).await.unwrap();
-        let seed = rows(10, &[1]);
+        // A table keyed by `at`, which is `id` milliseconds.
+        let mut keyed = spec(&orders());
+        keyed.identifier = vec!["at".into()];
+        s.ensure_table(&keyed).await.unwrap();
+        let mut seed = rows(10, &[1]);
+        seed.identifier = vec!["at".into()];
         let CommitOutcome::Committed { version } =
             s.commit(seed.clone(), marker(1, &seed)).await.unwrap()
         else {
             panic!("committed")
         };
-        // `at` is `id` milliseconds: past 9999-12-31, and the set's key.
+        // Past 9999-12-31, and the set's key.
         let mut t = rows(20, &[300_000_000_000_000]);
         t.truncate = true;
         t.identifier = vec!["at".into()];

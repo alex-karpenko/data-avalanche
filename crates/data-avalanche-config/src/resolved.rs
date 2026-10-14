@@ -453,6 +453,9 @@ pub struct Delta {
     pub timestamp_ntz_as: TimestampNtzAs,
     pub table_properties: BTreeMap<String, String>,
     pub catalog_type: DeltaCatalogType,
+    /// The memory one MERGE may take (DataFusion's pool, R-6); `None`: no ceiling. A MERGE that
+    /// needs more halts its table.
+    pub merge_memory_limit: Option<u64>,
 }
 
 /// Where the pipeline's operational state lives (§9.6, §10).
