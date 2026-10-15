@@ -108,7 +108,7 @@ impl CatalogColumn {
         self.column_type.to_ascii_lowercase()
     }
 
-    fn unsigned(&self) -> bool {
+    pub(crate) fn unsigned(&self) -> bool {
         self.keywords().contains("unsigned")
     }
 

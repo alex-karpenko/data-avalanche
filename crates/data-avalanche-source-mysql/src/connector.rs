@@ -1,7 +1,7 @@
 //! `MySqlConnector`: the MySQL or MariaDB source of one pipeline.
 
 use data_avalanche_config::{Mysql, Pipeline, SourceType};
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -14,7 +14,10 @@ use mysql_async::prelude::Queryable;
 use tokio::sync::OnceCell;
 
 use crate::connect::Connector;
-use crate::server::{Flavour, Settings, check_settings, grants_replication};
+use crate::server::{
+    Coverage, Flavour, Fold, Settings, access_denied, check_coverage, check_settings,
+    grants_replication,
+};
 
 /// What a connector and its stream share.
 #[derive(Debug, Default)]
@@ -24,6 +27,8 @@ pub(crate) struct Shared {
     remembered: Mutex<Vec<Remembered>>,
     /// The connection id of the open binlog dump, 0 without one: the watchdog finds the dump by it.
     pub(crate) dump: AtomicU32,
+    /// `lower_case_table_names` isn't 0, as the stream read it at its open.
+    fold: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -48,6 +53,17 @@ impl Shared {
         });
     }
 
+    /// How the server compares table names, as the stream last read it.
+    pub(crate) fn fold(&self) -> Fold {
+        Fold {
+            fold: self.fold.load(Ordering::Relaxed),
+        }
+    }
+
+    pub(crate) fn set_fold(&self, f: Fold) {
+        self.fold.store(f.fold, Ordering::Relaxed);
+    }
+
     /// The stream's answer for this signal, if it read one from the same schema.
     pub(crate) fn take(&self, cached: &TableSchema, sql: &str) -> Option<Change> {
         let mut r = self.remembered.lock().expect("not poisoned");
@@ -69,7 +85,8 @@ pub struct MySqlConnector {
 }
 
 impl MySqlConnector {
-    /// Refuses a pipeline whose source isn't MySQL, and TLS material that doesn't parse.
+    /// Refuses a pipeline whose source isn't MySQL. Nothing connects yet: TLS material is read
+    /// at the first connection, and a certificate or key that doesn't parse fails it.
     pub fn new(pipeline: &Pipeline) -> Result<Self, SourceError> {
         let source = &pipeline.source;
         let mysql = match (source.kind, &source.mysql) {
@@ -123,10 +140,12 @@ impl MySqlConnector {
     }
 
     /// The pipeline-level start checks (config §11.2, the MySQL rows): a supported server
-    /// (P-8) with the binary log on, `binlog_format = ROW`, `binlog_row_image = FULL`, GTIDs on for
-    /// `replication_type: gtid` on MySQL, and a user that can read binlog positions (`REPLICATION
-    /// CLIENT`) and dump the binlog (`REPLICATION SLAVE`). `binlog_row_metadata` other than FULL
-    /// warns.
+    /// (P-8) with the binary log on, `binlog_format = ROW`, `binlog_row_image = FULL`,
+    /// `binlog_row_metadata = FULL`, GTIDs on for `replication_type: gtid` on MySQL, a binlog
+    /// that carries `source.db`'s changes (no `binlog_do_db` / `binlog_ignore_db` leaving it out,
+    /// and a replica that logs what it applies), and a user that can read binlog positions
+    /// (`REPLICATION CLIENT`) and dump the binlog (`REPLICATION SLAVE`). A replica setting the
+    /// user can't check warns.
     pub async fn preflight(&self) -> Result<Preflight, SourceError> {
         let flavour = self.flavour().await?;
         let settings = self
@@ -155,30 +174,41 @@ impl MySqlConnector {
             })
             .await?
             .ok_or_else(|| SourceError::Permanent("the server returned no settings".into()))?;
-        let warnings = check_settings(flavour, self.mysql.replication_type, &settings)
+        let mut warnings = check_settings(flavour, self.mysql.replication_type, &settings)
             .map_err(SourceError::Permanent)?;
         let status = flavour.status_statement();
-        let refused = self
+        let filters = self
             .conn
             .command("preflight", move |c| {
                 Box::pin(async move {
-                    match c.query_drop(status).await {
-                        Ok(()) => Ok(None),
-                        Err(mysql_async::Error::Server(e))
-                            if crate::server::access_denied(e.code) =>
-                        {
-                            Ok(Some(e.message))
+                    match c.query_first::<mysql_async::Row, _>(status).await {
+                        Ok(row) => Ok(Ok(row.map(|r| {
+                            let column = |name: &str| {
+                                r.get_opt::<String, _>(name)
+                                    .and_then(Result::ok)
+                                    .unwrap_or_default()
+                            };
+                            (column("Binlog_Do_DB"), column("Binlog_Ignore_DB"))
+                        }))),
+                        Err(mysql_async::Error::Server(e)) if access_denied(e.code) => {
+                            Ok(Err(e.message))
                         }
                         Err(e) => Err(e),
                     }
                 })
             })
             .await?;
-        if let Some(why) = refused {
-            return Err(SourceError::Permanent(format!(
-                "the user can't read the binlog position ({status}: {why}); grant {}",
-                flavour.status_privilege()
-            )));
+        let (do_db, ignore_db) = match filters {
+            Ok(f) => f.unwrap_or_default(),
+            Err(why) => {
+                return Err(SourceError::Permanent(format!(
+                    "the user can't read the binlog position ({status}: {why}); grant {}",
+                    flavour.status_privilege()
+                )));
+            }
+        };
+        if let Some(w) = self.coverage(flavour, do_db, ignore_db).await? {
+            warnings.push(w);
         }
         if !self.grants_replication(flavour).await? {
             return Err(SourceError::Permanent(
@@ -190,6 +220,64 @@ impl MySqlConnector {
             server_version: settings.version,
             warnings,
         })
+    }
+
+    /// `@@lower_case_table_names`, also kept for channel C's reads.
+    pub(crate) async fn fold(&self) -> Result<Fold, SourceError> {
+        let n: Option<i64> = self
+            .conn
+            .command("read lower_case_table_names", |c| {
+                Box::pin(async move { c.query_first("SELECT @@lower_case_table_names").await })
+            })
+            .await?;
+        let fold = Fold::of(n.unwrap_or_default());
+        self.shared.set_fold(fold);
+        Ok(fold)
+    }
+
+    /// Whether `source.db`'s changes reach the binlog (config §11.2): the binlog filters, and on
+    /// a server with `log_replica_updates` off whether it replicates from another.
+    async fn coverage(
+        &self,
+        flavour: Flavour,
+        do_db: String,
+        ignore_db: String,
+    ) -> Result<Option<String>, SourceError> {
+        let fold = self.fold().await?;
+        let setting = flavour.replica_updates();
+        let replica_updates: Option<i64> = self
+            .conn
+            .command("read the replica settings", move |c| {
+                Box::pin(async move { c.query_first(format!("SELECT @@{setting}")).await })
+            })
+            .await?;
+        let replica_updates = replica_updates == Some(1);
+        let replica = match replica_updates {
+            true => Some(false),
+            false => {
+                let statement = flavour.replica_statement();
+                self.conn
+                    .command("read the replication status", move |c| {
+                        Box::pin(async move {
+                            match c.query::<mysql_async::Row, _>(statement).await {
+                                Ok(rows) => Ok(Some(!rows.is_empty())),
+                                Err(mysql_async::Error::Server(e)) if access_denied(e.code) => {
+                                    Ok(None)
+                                }
+                                Err(e) => Err(e),
+                            }
+                        })
+                    })
+                    .await?
+            }
+        };
+        let c = Coverage {
+            do_db,
+            ignore_db,
+            replica_updates,
+            replica,
+        };
+        check_coverage(flavour, &self.pipeline.source.db, fold, &c).map_err(SourceError::Permanent)
     }
 
     /// `REPLICATION SLAVE` from the user's grants, or from its active roles' (MySQL `SHOW GRANTS`

@@ -1,6 +1,8 @@
 //! The pipeline start checks (config §11.2, the MySQL rows) against the target server: its
 //! settings pass, and a user without the replication privileges is refused, naming the one it
-//! lacks.
+//! lacks. The test servers aren't replicas and filter no database: MySQL logs replica updates,
+//! MariaDB doesn't (its default), and a MariaDB user without SLAVE MONITOR can't read whether the
+//! server replicates, which warns.
 
 use data_avalanche_core::SourceError;
 use data_avalanche_source_mysql::Flavour;
@@ -47,17 +49,28 @@ async fn a_user_without_replication_privileges_is_refused() {
         Flavour::Mysql => "REPLICATION CLIENT",
         Flavour::Mariadb => "BINLOG MONITOR",
     };
-    for (grants, refusal) in [
-        (format!("SELECT ON {}.* ", n.db), Some(status_privilege)),
+    let mariadb = target().flavour == Flavour::Mariadb;
+    let mut cases = vec![
+        (format!("SELECT ON {}.* ", n.db), Some(status_privilege), 0),
         (
             "SELECT, REPLICATION CLIENT ON *.*".to_string(),
             Some("REPLICATION SLAVE"),
+            0,
         ),
         (
             "SELECT, REPLICATION CLIENT, REPLICATION SLAVE ON *.*".to_string(),
             None,
+            usize::from(mariadb),
         ),
-    ] {
+    ];
+    if mariadb {
+        cases.push((
+            "SELECT, REPLICATION CLIENT, REPLICATION SLAVE, SLAVE MONITOR ON *.*".to_string(),
+            None,
+            0,
+        ));
+    }
+    for (grants, refusal, warned) in cases {
         user(&mut a, name, &grants, &[]).await;
         let c = connector(&pipeline_as(
             &n,
@@ -68,7 +81,17 @@ async fn a_user_without_replication_privileges_is_refused() {
             "",
         ));
         match (c.preflight().await, refusal) {
-            (Ok(_), None) => {}
+            (Ok(p), None) => {
+                assert_eq!(p.warnings.len(), warned, "{grants}: {:?}", p.warnings);
+                assert!(
+                    p.warnings
+                        .iter()
+                        .all(|w| w.contains("log_slave_updates is OFF")
+                            && w.contains("grant SLAVE MONITOR")),
+                    "{grants}: {:?}",
+                    p.warnings
+                );
+            }
             (Err(SourceError::Permanent(m)), Some(lacking)) => {
                 assert!(m.contains(lacking), "{grants}: {m}")
             }

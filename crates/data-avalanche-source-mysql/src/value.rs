@@ -172,6 +172,14 @@ fn latin1(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// Text the binlog logged in `charset` (an ENUM or SET label), `None` when it isn't valid there.
+pub(crate) fn text_of(charset: Charset, bytes: &[u8]) -> Option<String> {
+    match charset {
+        Charset::Latin1 => Some(latin1(bytes)),
+        Charset::Utf8 | Charset::Binary => String::from_utf8(bytes.to_vec()).ok(),
+    }
+}
+
 fn utf8(bytes: &[u8]) -> Result<String, ValueError> {
     String::from_utf8(bytes.to_vec()).map_err(|_| bad("text that isn't valid UTF-8"))
 }

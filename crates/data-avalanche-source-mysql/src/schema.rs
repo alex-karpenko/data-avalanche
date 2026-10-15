@@ -22,16 +22,22 @@ use data_avalanche_core::{
 use crate::catalog::{plan_table, table_key};
 use crate::connector::MySqlConnector;
 use crate::ddl::{Renamed, Scope, classify, renamed};
+use crate::server::Fold;
 use crate::types::{CatalogColumn, members};
 
-/// The change a statement makes to `table`: its scope and proven renames. A cut-over swap into the
-/// table's name scopes the whole table, with nothing proven.
-pub fn scope_of(sql: &str, table: &TableRef) -> (Scope, Vec<(String, String)>) {
+/// The change a statement makes to `table`, its name compared as `fold` says: its scope and proven
+/// renames. A cut-over swap into the table's name scopes the whole table, with nothing proven.
+pub fn scope_of(sql: &str, table: &TableRef, fold: Fold) -> (Scope, Vec<(String, String)>) {
     let d = classify(sql, &table.schema);
-    let swapped = renamed(&d.renamed, std::slice::from_ref(table))
+    let renames: Vec<(TableRef, TableRef)> = d
+        .renamed
+        .iter()
+        .map(|(a, b)| (fold.key(a), fold.key(b)))
+        .collect();
+    let swapped = renamed(&renames, &[fold.key(table)])
         .iter()
         .any(|(_, r)| matches!(r, Renamed::Swapped { .. }));
-    match d.altered.iter().find(|a| &a.table == table) {
+    match d.altered.iter().find(|a| fold.same(&a.table, table)) {
         Some(a) if !swapped => (a.scope.clone(), a.renames.clone()),
         _ => (Scope::Table, vec![]),
     }
@@ -326,7 +332,7 @@ impl MySqlConnector {
             ));
         };
         let now = now.map_err(halt)?;
-        let (columns, renames) = scope_of(sql, &table);
+        let (columns, renames) = scope_of(sql, &table, self.shared.fold());
         let new = scope(cached, &columns, &renames, &now).map_err(halt)?;
         let changes = diff(cached, &new, &renames);
         Ok((SchemaDelta { table, changes }, Some(new)))
@@ -683,17 +689,36 @@ mod tests {
     fn a_statement_scopes_its_table() {
         let t = TableRef::new("shop", "orders");
         assert_eq!(
-            scope_of("ALTER TABLE orders ADD COLUMN x INT", &t),
+            scope_of("ALTER TABLE orders ADD COLUMN x INT", &t, Fold::default()),
             (cols(&["x"]), vec![])
         );
         assert_eq!(
-            scope_of("ALTER TABLE orders ENGINE=InnoDB", &t).0,
+            scope_of("ALTER TABLE orders ENGINE=InnoDB", &t, Fold::default()).0,
             Scope::Table
         );
         assert_eq!(
             scope_of(
                 "RENAME TABLE orders TO _orders_del, _orders_gho TO orders",
-                &t
+                &t,
+                Fold::default()
+            ),
+            (Scope::Table, vec![])
+        );
+        // Under lower_case_table_names, a statement's name in another case is the table.
+        let fold = Fold::of(1);
+        assert_eq!(
+            scope_of("ALTER TABLE Orders ADD COLUMN x INT", &t, fold),
+            (cols(&["x"]), vec![])
+        );
+        assert_eq!(
+            scope_of("ALTER TABLE Orders ADD COLUMN x INT", &t, Fold::default()),
+            (Scope::Table, vec![])
+        );
+        assert_eq!(
+            scope_of(
+                "RENAME TABLE Orders TO _orders_del, _Orders_gho TO ORDERS",
+                &t,
+                fold
             ),
             (Scope::Table, vec![])
         );

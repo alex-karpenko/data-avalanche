@@ -13,9 +13,12 @@
 //!   rows it holds.
 //! - **Decoding.** Each tracked table decodes by the as-of-position schema: the pipeline's at
 //!   open, then each statement's channel C answer, read here and remembered for the pipeline's
-//!   `augment` of the same signal. A table map that doesn't match the schema (columns, types,
-//!   names under `binlog_row_metadata = FULL`) halts the table, never misreads a row; so does a
-//!   row image that isn't FULL.
+//!   `augment` of the same signal. A table map that doesn't match the schema halts the table,
+//!   never misreads a row: its columns and types, and what `binlog_row_metadata = FULL` adds
+//!   (names, signedness, character sets, ENUM and SET labels; a table map without names halts
+//!   too). So does a row image that isn't FULL.
+//! - **Names.** Under `lower_case_table_names` other than 0, table and database names compare
+//!   without case.
 //! - **Fail closed.** A compressed transaction that yields less than its size halts the pipeline
 //!   (`BINLOG_PAYLOAD_INVALID`, D-V1.6); so does a two-phase XA prepare of tracked rows (they can
 //!   roll back after they are logged), a rollback logged after tracked rows (MariaDB keeps the
@@ -39,7 +42,8 @@ use data_avalanche_core::{
 };
 use futures_util::StreamExt;
 use mysql_async::binlog::events::{
-    Event, EventData, OptionalMetadataField, RowsEventData, TableMapEvent, TransactionPayloadEvent,
+    DefaultCharset, Event, EventData, OptionalMetadataField, RowsEventData, TableMapEvent,
+    TransactionPayloadEvent,
 };
 use mysql_async::binlog::value::BinlogValue;
 use mysql_async::consts::ColumnType;
@@ -52,18 +56,23 @@ use crate::connector::MySqlConnector;
 use crate::ddl::{Renamed, classify, renamed};
 use crate::error::mysql;
 use crate::position::Mode;
-use crate::server::Flavour;
+use crate::server::{Flavour, Fold};
 use crate::start::purge_action;
-use crate::types::{CatalogColumn, plan_column};
-use crate::value::{Decode, Input, decode_after, halt_reason};
+use crate::types::{CatalogColumn, members, plan_column};
+use crate::value::{Charset, Decode, Input, decode_after, halt_reason, text_of};
 
-/// One column of a tracked table, as the stream decodes it.
-#[derive(Debug, Clone)]
+/// One column of a tracked table, as the stream decodes it and checks table maps against it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Column {
     name: String,
     data_type: String,
     decode: Decode,
     identifier: bool,
+    unsigned: bool,
+    /// The character set, `binary` for a column without one.
+    charset: String,
+    /// An ENUM's or a SET's labels.
+    labels: Option<Vec<String>>,
 }
 
 /// A tracked table: its as-of-position schema and how its columns decode.
@@ -121,6 +130,12 @@ pub struct MySqlStream {
     signals: Option<Signals>,
     /// Ids for anonymous transactions.
     anonymous: u64,
+    /// How the server compares table and database names.
+    fold: Fold,
+    /// The character set of each collation id the server lists.
+    charsets: HashMap<u16, String>,
+    /// The table map each tracked table's schema was last found to match.
+    checked: HashMap<TableRef, TableMapEvent<'static>>,
     /// When the last keep-alive went out.
     kept_alive: Option<Instant>,
 }
@@ -198,40 +213,245 @@ fn arrives_as(data_type: &str) -> &'static [ColumnType] {
     }
 }
 
-/// Whether the table map describes the rows the schema decodes: as many columns, each of a
-/// binlog type its type arrives as, and under `binlog_row_metadata = FULL` the same names.
-fn check_map(tme: &TableMapEvent<'_>, t: &Tracked) -> Result<(), String> {
-    let n = tme.columns_count() as usize;
-    if n != t.columns.len() {
-        return Err(format!(
-            "the binlog's rows have {n} columns, the schema {}",
-            t.columns.len()
-        ));
+/// What a table map says of its columns: each one's binlog type (an ENUM's or a SET's, not the
+/// `STRING` it is logged as) and the optional metadata `binlog_row_metadata = FULL` carries.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct MapMeta {
+    types: Vec<ColumnType>,
+    names: Option<Vec<String>>,
+    /// One per numeric column, in column order: `true` is unsigned.
+    unsigned: Option<Vec<bool>>,
+    /// The collation of each character column, in column order.
+    collations: Option<Vec<u16>>,
+    /// The collation of each ENUM and SET column, in column order.
+    enum_set_collations: Option<Vec<u16>>,
+    /// The labels of each ENUM column, and of each SET column, in column order, as logged.
+    enums: Vec<Vec<Vec<u8>>>,
+    sets: Vec<Vec<Vec<u8>>>,
+}
+
+/// The collations of `n` columns from a default and its exceptions.
+fn expand(d: &DefaultCharset<'_>, n: usize) -> Result<Vec<u16>, String> {
+    let mut out = vec![d.default_charset(); n];
+    for x in d.iter_non_default() {
+        let x = x.map_err(|e| format!("the table map's character sets: {e}"))?;
+        *out.get_mut(x.column_index() as usize)
+            .ok_or("the table map's character sets name a column it hasn't")? = x.charset();
     }
-    for (i, c) in t.columns.iter().enumerate() {
+    Ok(out)
+}
+
+/// Reads what the table map says of its columns.
+fn map_meta(tme: &TableMapEvent<'_>) -> Result<MapMeta, String> {
+    let mut m = MapMeta::default();
+    for i in 0..tme.columns_count() as usize {
         let ty = tme
             .get_column_type(i)
-            .map_err(|e| format!("column {}: {e}", c.name))?
-            .ok_or_else(|| format!("column {}: no binlog type", c.name))?;
-        if !arrives_as(&c.data_type).contains(&ty) {
+            .map_err(|e| format!("column {i}: {e}"))?
+            .ok_or_else(|| format!("column {i}: no binlog type"))?;
+        m.types.push(ty);
+    }
+    let count = |f: fn(&ColumnType) -> bool| m.types.iter().filter(|t| f(t)).count();
+    let (characters, enum_sets) = (
+        count(ColumnType::is_character_type),
+        count(ColumnType::is_enum_or_set_type),
+    );
+    let bad = |e: std::io::Error| format!("the table map's metadata: {e}");
+    for field in tme.iter_optional_meta() {
+        match field.map_err(bad)? {
+            OptionalMetadataField::ColumnName(c) => {
+                m.names = Some(
+                    c.iter_names()
+                        .map(|n| n.map(|n| n.name().into_owned()))
+                        .collect::<Result<_, _>>()
+                        .map_err(bad)?,
+                )
+            }
+            OptionalMetadataField::Signedness(b) => m.unsigned = Some(b.iter().by_vals().collect()),
+            OptionalMetadataField::DefaultCharset(d) => {
+                m.collations = Some(expand(&d, characters)?)
+            }
+            OptionalMetadataField::ColumnCharset(c) => {
+                m.collations = Some(c.iter_charsets().collect::<Result<_, _>>().map_err(bad)?)
+            }
+            OptionalMetadataField::EnumAndSetDefaultCharset(d) => {
+                m.enum_set_collations = Some(expand(&d, enum_sets)?)
+            }
+            OptionalMetadataField::EnumAndSetColumnCharset(c) => {
+                m.enum_set_collations =
+                    Some(c.iter_charsets().collect::<Result<_, _>>().map_err(bad)?)
+            }
+            OptionalMetadataField::EnumStrValue(e) => {
+                for labels in e.iter_values() {
+                    let labels = labels.map_err(bad)?;
+                    m.enums.push(
+                        labels
+                            .values()
+                            .iter()
+                            .map(|v| v.value_raw().to_vec())
+                            .collect(),
+                    );
+                }
+            }
+            OptionalMetadataField::SetStrValue(e) => {
+                for labels in e.iter_values() {
+                    let labels = labels.map_err(bad)?;
+                    m.sets.push(
+                        labels
+                            .values()
+                            .iter()
+                            .map(|v| v.value_raw().to_vec())
+                            .collect(),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(m)
+}
+
+/// A character set's name as both the catalog and the collation table spell it.
+fn charset_name(name: &str) -> &str {
+    match name {
+        "utf8" => "utf8mb3",
+        other => other,
+    }
+}
+
+/// Whether the table map describes the rows the schema decodes (config §11.2): as many columns,
+/// each of a binlog type its type arrives as, and in the metadata `binlog_row_metadata = FULL`
+/// gives, the same names (without case), signedness, character sets (each collation id mapped by
+/// `charsets`, the server's table) and ENUM and SET labels. A table map without names, or without
+/// what it should carry for the columns it has, doesn't describe them.
+fn check_meta(
+    m: &MapMeta,
+    columns: &[Column],
+    charsets: &HashMap<u16, String>,
+) -> Result<(), String> {
+    let n = m.types.len();
+    if n != columns.len() {
+        return Err(format!(
+            "the binlog's rows have {n} columns, the schema {}",
+            columns.len()
+        ));
+    }
+    for (c, ty) in columns.iter().zip(&m.types) {
+        if !arrives_as(&c.data_type).contains(ty) {
             return Err(format!(
                 "column {}: the binlog's rows have {ty:?}, the schema {}",
                 c.name, c.data_type
             ));
         }
     }
-    for field in tme.iter_optional_meta() {
-        if let Ok(OptionalMetadataField::ColumnName(names)) = field {
-            for (i, name) in names.iter_names().enumerate() {
-                let name = name.map_err(|e| format!("column names: {e}"))?;
-                let want = t.columns.get(i).map(|c| c.name.as_str());
-                if Some(name.name().as_ref()) != want {
-                    return Err(format!(
-                        "column {}: the binlog names it {:?}",
-                        want.unwrap_or("?"),
-                        name.name()
-                    ));
-                }
+    let Some(names) = &m.names else {
+        return Err(
+            "the binlog's table map names no columns (binlog_row_metadata isn't FULL)".into(),
+        );
+    };
+    if names.len() != n {
+        return Err(format!(
+            "the binlog's table map names {} of {n} columns",
+            names.len()
+        ));
+    }
+    for (c, name) in columns.iter().zip(names) {
+        if !(c.name == *name || c.name.to_lowercase() == name.to_lowercase()) {
+            return Err(format!("column {}: the binlog names it {name:?}", c.name));
+        }
+    }
+    // Each kind of column with its list in the table map: one entry per column of the kind.
+    let of_kind = |f: fn(&ColumnType) -> bool| -> Vec<&Column> {
+        columns
+            .iter()
+            .zip(&m.types)
+            .filter(|(_, t)| f(t))
+            .map(|(c, _)| c)
+            .collect()
+    };
+    let missing = |what: &str, have: usize, want: usize| {
+        format!("the binlog's table map carries {what} for {have} of {want} columns")
+    };
+    let numeric = of_kind(ColumnType::is_numeric_type);
+    if !numeric.is_empty() {
+        let flags = m.unsigned.as_deref().unwrap_or_default();
+        if flags.len() != numeric.len() {
+            return Err(missing("signedness", flags.len(), numeric.len()));
+        }
+        for (c, unsigned) in numeric.iter().zip(flags) {
+            // The server flags every YEAR unsigned; its values don't depend on it.
+            if c.data_type != "year" && c.unsigned != *unsigned {
+                let sign = |u: bool| if u { "unsigned" } else { "signed" };
+                return Err(format!(
+                    "column {}: the binlog has it {}, the schema {}",
+                    c.name,
+                    sign(*unsigned),
+                    sign(c.unsigned)
+                ));
+            }
+        }
+    }
+    let charset = |c: &Column, id: &u16| match charsets.get(id) {
+        None => Err(format!(
+            "column {}: collation {id} isn't one the server lists",
+            c.name
+        )),
+        Some(cs) if charset_name(cs) != charset_name(&c.charset) => Err(format!(
+            "column {}: the binlog has it in character set {cs}, the schema in {}",
+            c.name, c.charset
+        )),
+        Some(_) => Ok(()),
+    };
+    for (kind, list, what) in [
+        (
+            ColumnType::is_character_type as fn(&ColumnType) -> bool,
+            &m.collations,
+            "character sets",
+        ),
+        (
+            ColumnType::is_enum_or_set_type,
+            &m.enum_set_collations,
+            "ENUM and SET character sets",
+        ),
+    ] {
+        let of = of_kind(kind);
+        if of.is_empty() {
+            continue;
+        }
+        let ids = list.as_deref().unwrap_or_default();
+        if ids.len() != of.len() {
+            return Err(missing(what, ids.len(), of.len()));
+        }
+        for (c, id) in of.iter().zip(ids) {
+            charset(c, id)?;
+        }
+    }
+    for (ty, logged, what) in [
+        (ColumnType::MYSQL_TYPE_ENUM, &m.enums, "ENUM labels"),
+        (ColumnType::MYSQL_TYPE_SET, &m.sets, "SET labels"),
+    ] {
+        let of: Vec<&Column> = columns
+            .iter()
+            .zip(&m.types)
+            .filter(|(_, t)| **t == ty)
+            .map(|(c, _)| c)
+            .collect();
+        if logged.len() != of.len() {
+            return Err(missing(what, logged.len(), of.len()));
+        }
+        for (c, labels) in of.iter().zip(logged) {
+            let Some(cs) = Charset::of(&c.charset) else {
+                return Err(format!(
+                    "column {}: labels in character set {}, which the source doesn't read",
+                    c.name, c.charset
+                ));
+            };
+            let read: Option<Vec<String>> = labels.iter().map(|l| text_of(cs, l)).collect();
+            if read.as_ref() != c.labels.as_ref() {
+                return Err(format!(
+                    "column {}: the binlog's labels are {read:?}, the schema's {:?}",
+                    c.name, c.labels
+                ));
             }
         }
     }
@@ -254,6 +474,104 @@ fn verb(sql: &str) -> String {
         .next()
         .unwrap_or_default()
         .to_ascii_uppercase()
+}
+
+/// What a statement does to the tracked tables (channel B).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct Routed {
+    halts: Vec<(TableRef, HaltReason)>,
+    truncated: Vec<TableRef>,
+    signals: Vec<TableRef>,
+}
+
+/// Routes a statement run in `db`: the halts, truncates and schema signals of the `tracked`
+/// tables it touches, their names compared as `fold` says (`lower_case_table_names`).
+fn route(
+    sql: &str,
+    db: &str,
+    source_db: &str,
+    tracked: &[TableRef],
+    fold: Fold,
+) -> Result<Routed, SourceError> {
+    let d = classify(sql, db);
+    if d.unreadable {
+        return Err(permanent(format!(
+            "a table statement the source can't read the tables of: {sql}"
+        )));
+    }
+    // A trigger or a multi-table statement can reach any table of the source's database:
+    // the pipeline halts when the statement runs there or names it. (A statement in another
+    // database whose trigger writes to the source's isn't seen.)
+    if let Some(named) = &d.logged_as_statement
+        && (fold.eq(db, source_db) || named.iter().any(|n| fold.eq(n, source_db)))
+    {
+        return Err(permanent(format!(
+            "a row change logged as its statement, without its rows (a session's \
+             binlog_format isn't ROW) in {source_db}: {sql}"
+        )));
+    }
+    // The tracked table a statement's name is.
+    let find = |t: &TableRef| tracked.iter().find(|k| fold.same(k, t)).cloned();
+    let mut halts: Vec<(TableRef, HaltReason)> = vec![];
+    if d.dropped_database
+        .as_deref()
+        .is_some_and(|x| fold.eq(x, source_db))
+    {
+        halts.extend(
+            tracked
+                .iter()
+                .map(|t| (t.clone(), HaltReason::TableDropped)),
+        );
+    }
+    for (t, op) in &d.unlogged {
+        if let Some(t) = find(t) {
+            halts.push((
+                t,
+                HaltReason::UnsafeDdl {
+                    detail: format!("{op} changed rows without row events; re-snapshot the table"),
+                },
+            ));
+        }
+    }
+    halts.extend(
+        d.dropped
+            .iter()
+            .filter_map(find)
+            .map(|t| (t, HaltReason::TableDropped)),
+    );
+    let mut signals: Vec<TableRef> = vec![];
+    let renames: Vec<(TableRef, TableRef)> = d
+        .renamed
+        .iter()
+        .map(|(a, b)| (fold.key(a), fold.key(b)))
+        .collect();
+    let keys: Vec<TableRef> = tracked.iter().map(|t| fold.key(t)).collect();
+    for (k, r) in renamed(&renames, &keys) {
+        let t = find(&k).expect("a tracked table's key");
+        match r {
+            Renamed::Gone => halts.push((t, HaltReason::TableDropped)),
+            Renamed::Swapped { .. } => signals.push(t),
+            Renamed::Kept => {}
+        }
+    }
+    let halted = |t: &TableRef| halts.iter().any(|(h, _)| h == t);
+    for t in d.altered.iter().filter_map(|a| find(&a.table)) {
+        if !halted(&t) && !signals.contains(&t) {
+            signals.push(t);
+        }
+    }
+    signals.retain(|t| !halted(t));
+    let truncated: Vec<TableRef> = d
+        .truncated
+        .iter()
+        .filter_map(find)
+        .filter(|t| !halted(t))
+        .collect();
+    Ok(Routed {
+        halts,
+        truncated,
+        signals,
+    })
 }
 
 impl MySqlConnector {
@@ -286,8 +604,13 @@ impl MySqlConnector {
                     ),
                 });
             }
+            let labels =
+                matches!(c.data_type.as_str(), "enum" | "set").then(|| members(&c.column_type));
             columns.push(Column {
                 name: col.name.clone(),
+                unsigned: c.unsigned(),
+                charset: c.charset.clone().unwrap_or_else(|| "binary".into()),
+                labels,
                 data_type: c.data_type,
                 decode: p.decode,
                 identifier,
@@ -299,9 +622,35 @@ impl MySqlConnector {
         })
     }
 
+    /// The character set of each collation id: MySQL's `COLLATIONS`; MariaDB's
+    /// `COLLATION_CHARACTER_SET_APPLICABILITY`, where its 10.10+ collations (`uca1400`) have their
+    /// ids (`COLLATIONS` lists them without one; measured on 10.11, 11.4 and 11.8).
+    async fn charsets(&self, flavour: Flavour) -> Result<HashMap<u16, String>, SourceError> {
+        let table = match flavour {
+            Flavour::Mysql => "COLLATIONS",
+            Flavour::Mariadb => "COLLATION_CHARACTER_SET_APPLICABILITY",
+        };
+        let rows: Vec<(Option<u64>, Option<String>)> = self
+            .conn
+            .command("read the collations", move |c| {
+                Box::pin(async move {
+                    c.query(format!(
+                        "SELECT ID, CHARACTER_SET_NAME FROM information_schema.{table}"
+                    ))
+                    .await
+                })
+            })
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(id, cs)| Some((u16::try_from(id?).ok()?, cs?)))
+            .collect())
+    }
+
     /// Opens the binlog dump after `from` for `tables` as of that position (Data-Flow Phase 2b):
     /// the heartbeat period, the replica id `source.mysql.server_id`, and the position in its
-    /// dialect.
+    /// dialect. The server's name comparison and collations are read once, for the stream's
+    /// routing and table map checks.
     pub async fn open_stream(
         &self,
         from: &SourcePosition,
@@ -310,6 +659,8 @@ impl MySqlConnector {
         let flavour = self.flavour().await?;
         let mode = Mode::of(flavour, self.mysql.replication_type);
         let catalog = self.sibling()?;
+        let fold = catalog.fold().await?;
+        let charsets = catalog.charsets(flavour).await?;
         let mut tracked = HashMap::new();
         for s in tables {
             let t = catalog.track(s).map_err(|reason| SourceError::TableHalt {
@@ -374,6 +725,9 @@ impl MySqlConnector {
             ready: VecDeque::new(),
             signals: None,
             anonymous: 0,
+            fold,
+            charsets,
+            checked: HashMap::new(),
             kept_alive: None,
         })
     }
@@ -417,6 +771,7 @@ impl MySqlStream {
     ) -> Result<(), SourceError> {
         self.begin()?;
         self.tables.remove(table);
+        self.checked.remove(table);
         self.emit(StreamItem::TableHalt {
             table: table.clone(),
             seq,
@@ -733,72 +1088,13 @@ impl MySqlStream {
     /// Routes a statement (channel B): halts, truncates and schema signals for the tracked tables
     /// it touches.
     fn statement(&mut self, sql: &str, db: &str, seq: SourceSeq) -> Result<(), SourceError> {
-        let d = classify(sql, db);
-        if d.unreadable {
-            return Err(permanent(format!(
-                "a table statement the source can't read the tables of: {sql}"
-            )));
-        }
-        // A trigger or a multi-table statement can reach any table of the source's database:
-        // the pipeline halts when the statement runs there or names it. (A statement in another
-        // database whose trigger writes to the source's isn't seen.)
-        if let Some(named) = &d.logged_as_statement {
-            let source_db = &self.catalog.pipeline.source.db;
-            if db == source_db.as_str() || named.iter().any(|n| n == source_db) {
-                return Err(permanent(format!(
-                    "a row change logged as its statement, without its rows (a session's \
-                     binlog_format isn't ROW) in {source_db}: {sql}"
-                )));
-            }
-        }
         let tracked: Vec<TableRef> = self.tables.keys().cloned().collect();
-        let source_db = self.catalog.pipeline.source.db.clone();
-        let mut halts: Vec<(TableRef, HaltReason)> = vec![];
-        if d.dropped_database.as_deref() == Some(source_db.as_str()) {
-            halts.extend(
-                tracked
-                    .iter()
-                    .map(|t| (t.clone(), HaltReason::TableDropped)),
-            );
-        }
-        for (t, op) in &d.unlogged {
-            halts.push((
-                t.clone(),
-                HaltReason::UnsafeDdl {
-                    detail: format!("{op} changed rows without row events; re-snapshot the table"),
-                },
-            ));
-        }
-        halts.extend(
-            d.dropped
-                .iter()
-                .map(|t| (t.clone(), HaltReason::TableDropped)),
-        );
-        let mut signals: Vec<TableRef> = vec![];
-        for (t, r) in renamed(&d.renamed, &tracked) {
-            match r {
-                Renamed::Gone => halts.push((t, HaltReason::TableDropped)),
-                Renamed::Swapped { .. } => signals.push(t),
-                Renamed::Kept => {}
-            }
-        }
-        halts.retain(|(t, _)| self.tables.contains_key(t));
-        let halted = |t: &TableRef| halts.iter().any(|(h, _)| h == t);
-        for a in &d.altered {
-            if self.tables.contains_key(&a.table)
-                && !halted(&a.table)
-                && !signals.contains(&a.table)
-            {
-                signals.push(a.table.clone());
-            }
-        }
-        signals.retain(|t| !halted(t));
-        let truncated: Vec<TableRef> = d
-            .truncated
-            .iter()
-            .filter(|t| self.tables.contains_key(t) && !halted(t))
-            .cloned()
-            .collect();
+        let source_db = &self.catalog.pipeline.source.db;
+        let Routed {
+            halts,
+            truncated,
+            signals,
+        } = route(sql, db, source_db, &tracked, self.fold)?;
         for (t, reason) in halts {
             if self.tables.contains_key(&t) {
                 self.halt(&t, seq, reason)?;
@@ -848,6 +1144,7 @@ impl MySqlStream {
                     self.catalog
                         .shared
                         .remember(&cached, &sql, (delta, now.clone()));
+                    self.checked.remove(&table);
                     match now.map(|n| self.catalog.track(&n)) {
                         None => {
                             self.tables.remove(&table);
@@ -866,11 +1163,23 @@ impl MySqlStream {
                 }
                 Err(SourceError::TableHalt { reason, .. }) => {
                     self.tables.remove(&table);
+                    self.checked.remove(&table);
                     StreamItem::TableHalt { table, seq, reason }
                 }
                 Err(e) => return Err(e),
             };
             self.ready.push_back(item);
+        }
+    }
+
+    /// The tracked table `t` names, its names compared as the server does.
+    fn tracked(&self, t: &TableRef) -> Option<TableRef> {
+        if self.tables.contains_key(t) {
+            return Some(t.clone());
+        }
+        match self.fold.fold {
+            true => self.tables.keys().find(|k| self.fold.same(k, t)).cloned(),
+            false => None,
         }
     }
 
@@ -883,21 +1192,27 @@ impl MySqlStream {
             .get_tme(re.table_id())
             .ok_or_else(|| permanent("a rows event without its table map"))?
             .clone();
-        let table = TableRef::new(tme.database_name(), tme.table_name());
-        let Some(tracked) = self.tables.get(&table).cloned() else {
+        let Some(table) = self.tracked(&TableRef::new(tme.database_name(), tme.table_name()))
+        else {
             return Ok(());
         };
+        let tracked = self.tables.get(&table).cloned().expect("tracked");
         let seq = self.seq(end)?;
         let mismatch = |detail: String| HaltReason::SchemaMismatch {
             column: String::new(),
             detail,
         };
-        if let Err(detail) = check_map(&tme, &tracked) {
-            return self.halt(
-                &table,
-                seq,
-                mismatch(format!("{detail}; re-snapshot the table")),
-            );
+        if self.checked.get(&table) != Some(&tme) {
+            let checked =
+                map_meta(&tme).and_then(|m| check_meta(&m, &tracked.columns, &self.charsets));
+            if let Err(detail) = checked {
+                return self.halt(
+                    &table,
+                    seq,
+                    mismatch(format!("{detail}; re-snapshot the table")),
+                );
+            }
+            self.checked.insert(table.clone(), tme.clone());
         }
         let n = tracked.columns.len();
         let full = re
@@ -1043,6 +1358,242 @@ mod tests {
         assert_eq!(verb("XA START 'x'"), "XA");
         assert_eq!(verb("SAVEPOINT `s`"), "SAVEPOINT");
         assert_eq!(verb("/* c */ ALTER"), "");
+    }
+
+    fn shop(name: &str) -> TableRef {
+        TableRef::new("shop", name)
+    }
+
+    #[test]
+    fn statements_route_by_the_servers_name_comparison() {
+        let tracked = [shop("orders"), shop("items")];
+        let route = |sql: &str, fold: i64| route(sql, "shop", "shop", &tracked, Fold::of(fold));
+        let codes = |r: &Routed| -> Vec<(String, &str)> {
+            r.halts
+                .iter()
+                .map(|(t, h)| (t.name.clone(), h.code()))
+                .collect()
+        };
+        // lower_case_table_names = 1: another case is the same table, the tracked spelling kept.
+        let r = route("TRUNCATE TABLE Orders", 1).unwrap();
+        assert_eq!(r.truncated, [shop("orders")]);
+        let r = route("DROP TABLE Shop.Orders", 1).unwrap();
+        assert_eq!(codes(&r), [("orders".to_owned(), "TABLE_DROPPED")]);
+        let r = route("ALTER TABLE ITEMS ADD COLUMN x INT", 1).unwrap();
+        assert_eq!(r.signals, [shop("items")]);
+        let r = route("RENAME TABLE Orders TO old_orders", 1).unwrap();
+        assert_eq!(codes(&r), [("orders".to_owned(), "TABLE_DROPPED")]);
+        let r = route(
+            "RENAME TABLE Orders TO _orders_del, _Orders_gho TO ORDERS",
+            1,
+        )
+        .unwrap();
+        assert_eq!((r.signals, r.halts), (vec![shop("orders")], vec![]));
+        let r = route("ALTER TABLE Orders DROP PARTITION p0", 1).unwrap();
+        assert_eq!(codes(&r), [("orders".to_owned(), "UNSAFE_DDL")]);
+        let r = route("DROP DATABASE SHOP", 1).unwrap();
+        assert_eq!(r.halts.len(), 2);
+        assert!(route("INSERT INTO t VALUES (1)", 1).is_err());
+        assert!(
+            route_in("other", "INSERT INTO SHOP.t SELECT 1", 1).is_err(),
+            "a qualifier in another case names the source's database"
+        );
+        // lower_case_table_names = 0 (Linux): names are as written, and none of these match.
+        for sql in [
+            "TRUNCATE TABLE Orders",
+            "DROP TABLE Shop.Orders",
+            "ALTER TABLE ITEMS ADD COLUMN x INT",
+            "RENAME TABLE Orders TO old_orders",
+            "DROP DATABASE SHOP",
+        ] {
+            assert_eq!(route(sql, 0).unwrap(), Routed::default(), "{sql}");
+        }
+        assert!(route_in("other", "INSERT INTO SHOP.t SELECT 1", 0).is_ok());
+        // As written, the statements reach the tables either way.
+        assert_eq!(
+            route("TRUNCATE TABLE orders", 0).unwrap().truncated,
+            [shop("orders")]
+        );
+    }
+
+    fn route_in(db: &str, sql: &str, fold: i64) -> Result<Routed, SourceError> {
+        route(sql, db, "shop", &[shop("orders")], Fold::of(fold))
+    }
+
+    fn column(name: &str, data_type: &str, charset: &str) -> Column {
+        Column {
+            name: name.into(),
+            data_type: data_type.into(),
+            decode: Decode::Bool,
+            identifier: false,
+            unsigned: false,
+            charset: charset.into(),
+            labels: None,
+        }
+    }
+
+    /// A table `(id INT UNSIGNED, v VARCHAR latin1, b VARBINARY, e ENUM('Active','ç'), s SET('X'),
+    /// y YEAR)` as the schema has it, and its table map under FULL (measured shapes: YEAR flagged
+    /// unsigned, binary columns in binary's collation 63).
+    fn table() -> (Vec<Column>, MapMeta, HashMap<u16, String>) {
+        use ColumnType::*;
+        let mut id = column("id", "int", "binary");
+        id.unsigned = true;
+        let mut e = column("e", "enum", "utf8mb4");
+        e.labels = Some(vec!["Active".into(), "ç".into()]);
+        let mut st = column("s", "set", "latin1");
+        st.labels = Some(vec!["X".into()]);
+        let columns = vec![
+            id,
+            column("v", "varchar", "latin1"),
+            column("b", "varbinary", "binary"),
+            e,
+            st,
+            column("y", "year", "binary"),
+        ];
+        let m = MapMeta {
+            types: vec![
+                MYSQL_TYPE_LONG,
+                MYSQL_TYPE_VARCHAR,
+                MYSQL_TYPE_VARCHAR,
+                MYSQL_TYPE_ENUM,
+                MYSQL_TYPE_SET,
+                MYSQL_TYPE_YEAR,
+            ],
+            names: Some(["id", "v", "b", "e", "s", "y"].map(String::from).to_vec()),
+            unsigned: Some(vec![true, true]),
+            collations: Some(vec![8, 63]),
+            enum_set_collations: Some(vec![2304, 8]),
+            enums: vec![vec![b"Active".to_vec(), "ç".as_bytes().to_vec()]],
+            sets: vec![vec![b"X".to_vec()]],
+        };
+        let charsets = [(8, "latin1"), (63, "binary"), (2304, "utf8mb4")]
+            .map(|(id, cs)| (id, cs.to_owned()))
+            .into();
+        (columns, m, charsets)
+    }
+
+    #[test]
+    fn a_table_map_under_full_metadata_matches_its_schema() {
+        let (columns, m, charsets) = table();
+        assert_eq!(check_meta(&m, &columns, &charsets), Ok(()));
+        // Names compare without case; utf8 is utf8mb3.
+        let mut upper = m.clone();
+        upper.names.as_mut().unwrap()[1] = "V".into();
+        assert_eq!(check_meta(&upper, &columns, &charsets), Ok(()));
+        let mut c = columns.clone();
+        c[1].charset = "utf8".into();
+        let mut cs = charsets.clone();
+        cs.insert(33, "utf8mb3".into());
+        let mut utf8 = m.clone();
+        utf8.collations = Some(vec![33, 63]);
+        assert_eq!(check_meta(&utf8, &c, &cs), Ok(()));
+    }
+
+    #[test]
+    fn a_table_map_that_differs_from_its_schema_halts() {
+        let (columns, m, charsets) = table();
+        let fails = |m: &MapMeta, columns: &[Column], needle: &str| {
+            let e = check_meta(m, columns, &charsets).unwrap_err();
+            assert!(e.contains(needle), "{needle}: {e}");
+        };
+        let changed = |f: &dyn Fn(&mut MapMeta)| {
+            let mut x = m.clone();
+            f(&mut x);
+            x
+        };
+        // Under MINIMAL or NO_LOG: no names.
+        fails(
+            &changed(&|x| x.names = None),
+            &columns,
+            "the binlog's table map names no columns (binlog_row_metadata isn't FULL)",
+        );
+        fails(
+            &changed(&|x| x.names.as_mut().unwrap()[2] = "w".into()),
+            &columns,
+            "column b: the binlog names it \"w\"",
+        );
+        // Signedness: a flip on an integer halts; YEAR's flag isn't compared.
+        fails(
+            &changed(&|x| x.unsigned = Some(vec![false, true])),
+            &columns,
+            "column id: the binlog has it signed, the schema unsigned",
+        );
+        assert_eq!(
+            check_meta(
+                &changed(&|x| x.unsigned = Some(vec![true, false])),
+                &columns,
+                &charsets
+            ),
+            Ok(())
+        );
+        fails(
+            &changed(&|x| x.unsigned = None),
+            &columns,
+            "carries signedness for 0 of 2 columns",
+        );
+        // Character sets: another set, an unknown collation, a missing list.
+        fails(
+            &changed(&|x| x.collations = Some(vec![2304, 63])),
+            &columns,
+            "column v: the binlog has it in character set utf8mb4, the schema in latin1",
+        );
+        fails(
+            &changed(&|x| x.collations = Some(vec![9999, 63])),
+            &columns,
+            "column v: collation 9999 isn't one the server lists",
+        );
+        fails(
+            &changed(&|x| x.collations = None),
+            &columns,
+            "carries character sets for 0 of 2 columns",
+        );
+        fails(
+            &changed(&|x| x.enum_set_collations = Some(vec![8, 8])),
+            &columns,
+            "column e: the binlog has it in character set latin1",
+        );
+        // ENUM and SET labels: another case, another order, a missing list.
+        fails(
+            &changed(&|x| x.enums[0][0] = b"active".to_vec()),
+            &columns,
+            "column e: the binlog's labels are",
+        );
+        fails(
+            &changed(&|x| x.enums[0].reverse()),
+            &columns,
+            "column e: the binlog's labels are",
+        );
+        fails(
+            &changed(&|x| x.sets[0][0] = b"x".to_vec()),
+            &columns,
+            "column s: the binlog's labels are",
+        );
+        fails(
+            &changed(&|x| x.sets.clear()),
+            &columns,
+            "carries SET labels for 0 of 1 columns",
+        );
+        // A latin1 label reads as latin1: 0xE7 is ç there.
+        let mut latin = columns.clone();
+        latin[4].labels = Some(vec!["ç".into()]);
+        assert_eq!(
+            check_meta(&changed(&|x| x.sets[0][0] = vec![0xE7]), &latin, &charsets),
+            Ok(())
+        );
+        // The count and the types still come first.
+        fails(
+            &changed(&|x| {
+                x.types.pop();
+            }),
+            &columns,
+            "the binlog's rows have 5 columns, the schema 6",
+        );
+        fails(
+            &changed(&|x| x.types[0] = ColumnType::MYSQL_TYPE_LONGLONG),
+            &columns,
+            "column id: the binlog's rows have MYSQL_TYPE_LONGLONG",
+        );
     }
 
     #[test]

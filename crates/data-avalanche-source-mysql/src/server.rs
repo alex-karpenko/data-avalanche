@@ -3,6 +3,7 @@
 //! are pure functions over what the server reported, so every refusal is unit-tested.
 
 use data_avalanche_config::ReplicationType;
+use data_avalanche_core::TableRef;
 
 /// The binlog dialect: GTIDs, status statements, row events and types differ (S-MY10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +44,69 @@ impl Flavour {
         match self {
             Self::Mysql => "REPLICATION CLIENT",
             Self::Mariadb => "BINLOG MONITOR (or REPLICATION CLIENT)",
+        }
+    }
+
+    /// The setting that has a replica log what it applies: MariaDB 10.11–11.8 has only the old
+    /// name (measured).
+    pub fn replica_updates(self) -> &'static str {
+        match self {
+            Self::Mysql => "log_replica_updates",
+            Self::Mariadb => "log_slave_updates",
+        }
+    }
+
+    /// The statement that lists the servers this one replicates from, one row each.
+    pub fn replica_statement(self) -> &'static str {
+        match self {
+            Self::Mysql => "SHOW REPLICA STATUS",
+            Self::Mariadb => "SHOW ALL REPLICAS STATUS",
+        }
+    }
+
+    /// The privilege that statement needs, as the server names it (measured: MySQL 8.4 takes
+    /// REPLICATION CLIENT, MariaDB 10.11–11.8 SLAVE MONITOR).
+    pub fn replica_privilege(self) -> &'static str {
+        match self {
+            Self::Mysql => "REPLICATION CLIENT",
+            Self::Mariadb => "SLAVE MONITOR (REPLICA MONITOR)",
+        }
+    }
+}
+
+/// How the server compares table and database names (`lower_case_table_names`): as written
+/// under 0, without case under 1 and 2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Fold {
+    pub fold: bool,
+}
+
+impl Fold {
+    /// From `@@lower_case_table_names`.
+    pub fn of(lower_case_table_names: i64) -> Self {
+        Self {
+            fold: lower_case_table_names != 0,
+        }
+    }
+
+    /// Whether `a` and `b` name one table or database.
+    pub fn eq(self, a: &str, b: &str) -> bool {
+        match self.fold {
+            true => a == b || a.to_lowercase() == b.to_lowercase(),
+            false => a == b,
+        }
+    }
+
+    /// Whether `a` and `b` are one table.
+    pub fn same(self, a: &TableRef, b: &TableRef) -> bool {
+        self.eq(&a.schema, &b.schema) && self.eq(&a.name, &b.name)
+    }
+
+    /// `t` as the server compares it: lower case when folding.
+    pub fn key(self, t: &TableRef) -> TableRef {
+        match self.fold {
+            true => TableRef::new(t.schema.to_lowercase(), t.name.to_lowercase()),
+            false => t.clone(),
         }
     }
 }
@@ -116,16 +180,72 @@ pub fn check_settings(
             "gtid_mode is {mode}; replication_type: gtid needs gtid_mode = ON (or use replication_type: binlog)"
         ));
     }
-    let mut warnings = vec![];
     match &s.binlog_row_metadata {
-        Some(m) if m.eq_ignore_ascii_case("FULL") => {}
-        other => warnings.push(format!(
-            "binlog_row_metadata is {}; with FULL the binlog names the columns, otherwise the \
-             names come from the catalog",
+        Some(m) if m.eq_ignore_ascii_case("FULL") => Ok(vec![]),
+        other => Err(format!(
+            "binlog_row_metadata is {}; the source needs binlog_row_metadata = FULL (SET GLOBAL \
+             binlog_row_metadata = FULL)",
             other.as_deref().unwrap_or("not available")
         )),
     }
-    Ok(warnings)
+}
+
+/// What the server reports about which changes reach its binlog (config §11.2).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct Coverage {
+    /// The status statement's `Binlog_Do_DB` and `Binlog_Ignore_DB`: comma-separated, empty for
+    /// none.
+    pub(crate) do_db: String,
+    pub(crate) ignore_db: String,
+    /// `log_replica_updates` (MariaDB `log_slave_updates`) is on.
+    pub(crate) replica_updates: bool,
+    /// Whether the server replicates from another; `None` when the user can't read it.
+    pub(crate) replica: Option<bool>,
+}
+
+/// Whether `db`'s changes reach the binlog (config §11.2): `Err` refuses the pipeline when a
+/// binlog filter leaves `db` out, or when the server replicates from another without logging
+/// what it applies; `Ok(Some)` warns when the user can't read whether it replicates.
+pub(crate) fn check_coverage(
+    flavour: Flavour,
+    db: &str,
+    fold: Fold,
+    c: &Coverage,
+) -> Result<Option<String>, String> {
+    let list = |s: &str| -> Vec<String> {
+        s.split(',')
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
+    let (only, ignored) = (list(&c.do_db), list(&c.ignore_db));
+    if !only.is_empty() && !only.iter().any(|d| fold.eq(d, db)) {
+        return Err(format!(
+            "binlog_do_db is {}, without {db}: the binlog doesn't carry the source database's \
+             changes",
+            c.do_db
+        ));
+    }
+    if ignored.iter().any(|d| fold.eq(d, db)) {
+        return Err(format!(
+            "binlog_ignore_db lists {db}: the binlog doesn't carry the source database's changes"
+        ));
+    }
+    let setting = flavour.replica_updates();
+    match (c.replica_updates, c.replica) {
+        (true, _) | (false, Some(false)) => Ok(None),
+        (false, Some(true)) => Err(format!(
+            "this server replicates from another and doesn't log what it applies ({setting} = \
+             OFF): the binlog lacks the replicated changes; set {setting} = ON"
+        )),
+        (false, None) => Ok(Some(format!(
+            "{setting} is OFF, and the user can't read whether this server replicates from \
+             another ({}; grant {}): if it does, the binlog lacks the replicated changes",
+            flavour.replica_statement(),
+            flavour.replica_privilege()
+        ))),
+    }
 }
 
 /// True when `SHOW GRANTS` lines give `REPLICATION SLAVE` on `*.*` (directly or through `ALL
@@ -231,11 +351,95 @@ mod tests {
     }
 
     #[test]
-    fn minimal_row_metadata_warns() {
-        let mut s = settings("8.4.6");
-        s.binlog_row_metadata = Some("MINIMAL".into());
-        let w = check_settings(Flavour::Mysql, ReplicationType::Gtid, &s).unwrap();
-        assert!(w[0].contains("binlog_row_metadata is MINIMAL"), "{w:?}");
+    fn row_metadata_other_than_full_refuses_the_pipeline() {
+        for (flavour, version, m) in [
+            (Flavour::Mysql, "8.4.6", Some("MINIMAL")),
+            (Flavour::Mariadb, "11.8.3-MariaDB", Some("NO_LOG")),
+            (Flavour::Mysql, "8.4.6", None),
+        ] {
+            let mut s = settings(version);
+            s.binlog_row_metadata = m.map(str::to_owned);
+            let e = check_settings(flavour, ReplicationType::Gtid, &s).unwrap_err();
+            assert!(
+                e.starts_with(&format!(
+                    "binlog_row_metadata is {}; the source needs binlog_row_metadata = FULL",
+                    m.unwrap_or("not available")
+                )) && e.contains("SET GLOBAL binlog_row_metadata = FULL"),
+                "{e}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_binlog_must_carry_the_source_database() {
+        let (my, maria) = (Flavour::Mysql, Flavour::Mariadb);
+        let (exact, folded) = (Fold::of(0), Fold::of(1));
+        let cover = |do_db: &str, ignore_db: &str, updates: bool, replica: Option<bool>| Coverage {
+            do_db: do_db.into(),
+            ignore_db: ignore_db.into(),
+            replica_updates: updates,
+            replica,
+        };
+        let ok = cover("", "", true, None);
+        assert_eq!(check_coverage(my, "shop", exact, &ok), Ok(None));
+        // Binlog filters.
+        assert_eq!(
+            check_coverage(my, "shop", exact, &cover("a, shop", "b", true, None)),
+            Ok(None)
+        );
+        let e = check_coverage(my, "shop", exact, &cover("a,b", "", true, None)).unwrap_err();
+        assert!(e.starts_with("binlog_do_db is a,b, without shop"), "{e}");
+        let e = check_coverage(my, "shop", exact, &cover("", "x,shop", true, None)).unwrap_err();
+        assert!(e.starts_with("binlog_ignore_db lists shop"), "{e}");
+        // Names fold under lower_case_table_names, and not otherwise.
+        assert!(check_coverage(my, "shop", exact, &cover("Shop", "", true, None)).is_err());
+        assert_eq!(
+            check_coverage(my, "shop", folded, &cover("Shop", "", true, None)),
+            Ok(None)
+        );
+        assert_eq!(
+            check_coverage(my, "shop", exact, &cover("", "SHOP", true, None)),
+            Ok(None)
+        );
+        assert!(check_coverage(my, "shop", folded, &cover("", "SHOP", true, None)).is_err());
+        // A replica that doesn't log what it applies.
+        assert_eq!(
+            check_coverage(maria, "shop", exact, &cover("", "", false, Some(false))),
+            Ok(None)
+        );
+        let e =
+            check_coverage(maria, "shop", exact, &cover("", "", false, Some(true))).unwrap_err();
+        assert!(
+            e.contains("replicates from another") && e.contains("log_slave_updates = OFF"),
+            "{e}"
+        );
+        let e = check_coverage(my, "shop", exact, &cover("", "", false, Some(true))).unwrap_err();
+        assert!(e.contains("log_replica_updates = OFF"), "{e}");
+        assert_eq!(
+            check_coverage(my, "shop", exact, &cover("", "", true, Some(true))),
+            Ok(None)
+        );
+        // Unreadable: a warning naming the grant.
+        let w = check_coverage(maria, "shop", exact, &cover("", "", false, None))
+            .unwrap()
+            .unwrap();
+        assert!(
+            w.contains("SHOW ALL REPLICAS STATUS") && w.contains("grant SLAVE MONITOR"),
+            "{w}"
+        );
+    }
+
+    #[test]
+    fn names_fold_under_lower_case_table_names() {
+        let (exact, folded) = (Fold::of(0), Fold::of(2));
+        let (a, b) = (
+            TableRef::new("Shop", "Orders"),
+            TableRef::new("shop", "orders"),
+        );
+        assert!(!exact.same(&a, &b) && folded.same(&a, &b));
+        assert_eq!(folded.key(&a), b);
+        assert_eq!(exact.key(&a), a);
+        assert!(folded.eq("ÄB", "äb"));
     }
 
     #[test]
