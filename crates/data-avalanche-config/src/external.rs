@@ -2,20 +2,21 @@
 //! - the cluster anchor from `globals.state` at startup (V-062, V-076, V-094; storage in M2);
 //! - a pipeline's resolved table set at start or on a table-set change (V-034, the warning half of
 //!   V-106, V-113; sources in M5/M7);
-//! - source column types at schema resolution (V-079).
+//! - source column types at schema resolution (V-079);
+//! - a table's schema, for its `tables.partitioning` entry (config §11.2).
 //!
 //! V-061 (a PROC field changed on reload) is part of [`crate::diff()`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use data_avalanche_core::TableRef;
+use data_avalanche_core::{HaltReason, LogicalType, TableRef, TableSchema};
 
 use crate::ctx::{At, Ctx};
 use crate::diag::Report;
 use crate::enums::{LockBackend, NumericOverflowAction, SourceType};
 use crate::path::YamlPath;
-use crate::resolved::{Globals, Pipeline};
+use crate::resolved::{Globals, PartitionField, PartitionTransform, Pipeline};
 use crate::units::format_duration;
 
 /// The values the first node wrote to the `globals.state` cluster anchor (Clustering §5.6). The
@@ -67,6 +68,56 @@ pub fn check_cluster_anchor(globals: &Globals, anchor: &ClusterAnchor) -> Report
         );
     }
     ctx.into_report()
+}
+
+/// A `tables.include`/`exclude` glob against one name (config §9.3): `*` matches within the name
+/// (it doesn't cross a `.`), and matching is case-sensitive.
+pub fn glob_match(pattern: &str, name: &str) -> bool {
+    fn go(p: &[u8], n: &[u8]) -> bool {
+        match p.split_first() {
+            None => n.is_empty(),
+            Some((b'*', rest)) => (0..=n.len()).any(|i| go(rest, &n[i..])),
+            Some((c, rest)) => n.first() == Some(c) && go(rest, &n[1..]),
+        }
+    }
+    go(pattern.as_bytes(), name.as_bytes())
+}
+
+/// A table's `tables.partitioning` entry against its schema (config §11.2): each column exists
+/// (`_ts` always does), and a temporal transform names a date or timestamp column.
+pub fn check_partitioning(
+    schema: &TableSchema,
+    fields: &[PartitionField],
+) -> Result<(), HaltReason> {
+    for f in fields.iter().filter(|f| f.column != "_ts") {
+        let temporal = !matches!(
+            f.transform,
+            PartitionTransform::Identity
+                | PartitionTransform::Bucket { .. }
+                | PartitionTransform::Truncate { .. }
+        );
+        let Some(c) = schema.column(&f.column) else {
+            return Err(HaltReason::SchemaMismatch {
+                column: f.column.clone(),
+                detail: "tables.partitioning names a column the table doesn't have".into(),
+            });
+        };
+        if temporal
+            && !matches!(
+                c.logical,
+                LogicalType::Date | LogicalType::TimestampTz | LogicalType::TimestampNtz
+            )
+        {
+            return Err(HaltReason::SchemaMismatch {
+                column: f.column.clone(),
+                detail: format!(
+                    "a {:?} partition transform needs a date or timestamp column",
+                    f.transform
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// A per-table config key as a table: PG `schema.table`; MySQL `name` in `source.db` (§10).

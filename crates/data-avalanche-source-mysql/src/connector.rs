@@ -12,6 +12,7 @@ use crate::server::{Flavour, Settings, check_settings, grants_replication};
 /// configuration; connections open on first use.
 #[derive(Debug)]
 pub struct MySqlConnector {
+    pub(crate) pipeline: Pipeline,
     pub(crate) mysql: Mysql,
     pub(crate) conn: Connector,
     /// `VERSION()`, read once: the dialect every later statement depends on.
@@ -32,6 +33,7 @@ impl MySqlConnector {
             }
         };
         Ok(Self {
+            pipeline: pipeline.clone(),
             mysql,
             conn: Connector::new(source)?,
             version: OnceCell::new(),

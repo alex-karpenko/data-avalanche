@@ -5,6 +5,7 @@
 //! (`Snapshot_Resumability…` §1.1, DA-SNAP-10).
 
 pub mod binlog;
+pub mod catalog;
 mod connect;
 mod connector;
 mod error;
@@ -15,6 +16,7 @@ pub mod types;
 pub mod value;
 
 pub use binlog::{MariaGtidEvent, Offsets, decompress, rotate_name};
+pub use catalog::{Described, Listed, Notes, Planned, Selection, plan_table, select, table_key};
 pub use connect::SESSION_SETUP;
 pub use connector::MySqlConnector;
 pub use position::{BinaryLog, Mode, Retention, bytes_after, purged};

@@ -6,5 +6,6 @@
 mod common;
 mod position;
 mod preflight;
+mod resolve;
 mod tls;
 mod values;

@@ -27,6 +27,10 @@ pub struct CatalogColumn {
     pub fsp: Option<u32>,
     /// `CHARACTER_MAXIMUM_LENGTH`: `n` of a `BINARY(n)`.
     pub max_length: Option<u64>,
+    /// `ORDINAL_POSITION`, from 1.
+    pub ordinal: u32,
+    /// `IS_NULLABLE`.
+    pub nullable: bool,
 }
 
 impl CatalogColumn {
