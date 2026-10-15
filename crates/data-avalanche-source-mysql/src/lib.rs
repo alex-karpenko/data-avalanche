@@ -10,9 +10,13 @@ mod connector;
 mod error;
 pub mod position;
 pub mod server;
+pub mod types;
+pub mod value;
 
 pub use binlog::{MariaGtidEvent, Offsets, decompress, rotate_name};
 pub use connect::SESSION_SETUP;
 pub use connector::MySqlConnector;
 pub use position::{BinaryLog, Mode, Retention, bytes_after, purged};
 pub use server::{Flavour, Settings, check_settings, grants_replication, version_of};
+pub use types::{CatalogColumn, ColumnPlan, members, plan_column};
+pub use value::{Charset, Decode, Input, ValueError, decode, int_type};
