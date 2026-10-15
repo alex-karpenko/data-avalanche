@@ -7,6 +7,7 @@ mod common;
 mod position;
 mod preflight;
 mod resolve;
+mod roundtrip;
 mod schema;
 mod snapshot;
 mod start;
