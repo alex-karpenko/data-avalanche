@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-14
+updated: 2026-10-15
 domain: Architecture
 tags: [architecture, schema-evolution, ddl, cdc, postgresql, mysql, iceberg, delta-lake, multi-sink, arrow]
 status: design reviewed & approved — unified trigger→augment→diff model
@@ -103,9 +103,13 @@ decision, not whether the decoder tracks layout.
 - **`TABLE_MAP_EVENT` is the physical-layout channel** (column types + nullability), parsed
   by the decoder for (a); file-scoped, resets on `ROTATE_EVENT`.
 - **Column names are conditional.** `TABLE_MAP_EVENT` carries names, PK info, and ENUM/SET
-  strings **only when `binlog_row_metadata = FULL`** (server default `MINIMAL` → positional
-  `@1, @2`). Under `MINIMAL`, names come from the catalog query — which the augment model
-  performs anyway, so this degrades gracefully.
+  strings **only when `binlog_row_metadata = FULL`** (server default MySQL `MINIMAL`, MariaDB
+  `NO_LOG` → positional `@1, @2`). A row is decoded by position against the schema as of its
+  statement, which the augment model builds partly from the catalog read *now*. When the catalog
+  is ahead (a later statement moved, dropped or re-typed a column), same-typed columns would be
+  read into each other without an error, so catalog names are no fallback. FULL is therefore
+  **required** (§9): the stream checks each table map's names, signedness, charsets and ENUM/SET
+  strings against the schema and halts the table on a mismatch, or on a table map without names.
 - **`binlog_row_image = FULL`** is required for complete before-images (delete/update keying).
 
 ---
@@ -400,7 +404,8 @@ too), so:
 | PostgreSQL | `REPLICA IDENTITY` ≠ `NOTHING` | required (already enforced) | delete keying |
 | MySQL | `binlog_format = ROW` | required | granular change capture |
 | MySQL | `binlog_row_image = FULL` | required | complete before-images / equality-delete keys |
-| MySQL | `binlog_row_metadata = FULL` | **recommended** (warn if absent) | names/PK/ENUM strings in `TABLE_MAP`; absent → names come from channel C catalog query |
+| MySQL | `binlog_row_metadata = FULL` | required | names/ENUM strings in `TABLE_MAP`, checked against the decode schema (§2.2); a table map without names halts the table |
+| MySQL | the source database's changes reach the binlog (`binlog_do_db` / `binlog_ignore_db`; a replica's `log_replica_updates` / `log_slave_updates`) | required (a replica whose status can't be read: warn) | otherwise the stream never sees the tables' changes |
 | MySQL | `REPLICATION CLIENT` / `REPLICATION SLAVE` | required | binlog dump |
 
 Validate these at pipeline start and surface a clear error (or warning for the
@@ -442,7 +447,7 @@ Ripple into `Configuration_Specification.md` (deliberate spec edit, touches G-1f
 | G-19a | MySQL `QUERY_EVENT` handling scope | **reduced** to DDL-classify + table-name extract (+ rename-keyword); full-delta parsing not required |
 | DT-R2 | Rename when intent unprovable (MySQL + unparseable DDL) | drop+add + warning |
 | DT-R5 | ENUM/SET representation (string vs ordinal) | string (makes value-add Ignorable) — coordinate with G-18 |
-| DT-R6 | `binlog_row_metadata = FULL` — required or recommended? | recommended; warn + catalog-name fallback |
+| DT-R6 | `binlog_row_metadata = FULL` — required or recommended? | **Resolved (M7a, 2026-10-15)** — required: a positional decode can't fall back to catalog names safely (§2.2) |
 | DT-R7 | `rescan_interval` default and disable semantics | `60m`; `0` disables (NEW) |
 | DT-R8 | Source query connection — reuse replication creds or separate role? | **Resolved** — reuse replication credentials; the replication user must hold SELECT (validated at start, §9) |
 

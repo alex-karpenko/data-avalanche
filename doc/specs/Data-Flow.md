@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-14
+updated: 2026-10-15
 domain: Architecture
 tags: [architecture, data-flow, pipeline, cdc, iceberg, delta-lake, multi-sink, arrow, snapshot, replication]
 sources: []
@@ -142,9 +142,12 @@ keeps a chunk from undoing a change already applied. **No global read lock, no l
 no `EXPORT_SNAPSHOT`/`FLUSH TABLES`** — the snapshot needs only `SELECT` plus the existing replication
 privileges (MySQL `RELOAD`/`LOCK TABLES` are no longer required).
 
-**Cursor & resume.** The resume cursor is a typed identifier tuple; pagination is a row-value
-comparison `WHERE (c1,…) > (v1,…) ORDER BY c1,… LIMIT chunk_size`, with ordering pinned to a **binary
-collation** (`COLLATE "C"` / `utf8mb4_bin`) recorded in the cursor. Crash resume reopens from the
+**Cursor & resume.** The resume cursor is a typed identifier tuple; pagination is a keyset
+comparison in the key's index order, `… ORDER BY c1,… LIMIT chunk_size`. PostgreSQL compares a row
+value, `WHERE (c1,…) > (v1,…)`, a text key of a nondeterministic collation in `COLLATE "C"`. MySQL
+spells the predicate out, `c1 > v1 OR (c1 = v1 AND c2 > v2) …`, each column in its own collation: a
+binary collation has no index, and a row constructor walks the index from its start (measured,
+D-M7a.12). Crash resume reopens from the
 checkpointed cursor; re-reading the in-flight chunk is harmless (upsert idempotency).
 `snapshot.chunk_size` defaults to 10000 (checkpoint per chunk). `parallelism` assigns disjoint tables
 to parallel workers; keyset order is serial within a table.
