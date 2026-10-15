@@ -14751,3 +14751,12 @@ git commit -m "ci: the MySQL source on four targets per change, MariaDB 11.4 and
   targets (the refusal case proves the servers answer 1227). Folded into Task 4's commit. No
   later task's code changes: they touch only these items' `use` lines. The review's minor notes
   are parked in the SDD ledger.
+- **Task 6, the review fix (2026-10-15, approved by Oleksii).** `binlog::inflate` sized its
+  buffer by the uncompressed length in the block's header (up to 4 GiB) before checking anything,
+  and inflated without a limit, so a corrupt block or a zlib bomb could exhaust memory instead of
+  returning the error that halts the pipeline. Now the preallocation is capped at 1 MiB and the
+  inflate reads at most one byte past the header's length, so the existing length check refuses
+  the excess. Two unit tests (`a_header_claiming_more_than_the_block_inflates_is_refused`,
+  `a_block_inflating_past_its_header_is_refused`). Folded into Task 6's commit; no later task
+  touches `binlog.rs`. With Task 4's test, the crate's lib test count from Task 6 on is three
+  above the plan's figures (Task 6: 29, not 26).
