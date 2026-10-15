@@ -128,8 +128,9 @@ pub struct MySqlStream {
     txn: Option<Txn>,
     ready: VecDeque<StreamItem>,
     signals: Option<Signals>,
-    /// Ids for anonymous transactions.
-    anonymous: u64,
+    /// The last `Begin.xid` of a MySQL transaction, or of one without a GTID: a per-session
+    /// counter (D-M7a.19).
+    xids: u64,
     /// How the server compares table and database names.
     fold: Fold,
     /// The character set of each collation id the server lists.
@@ -476,6 +477,19 @@ fn verb(sql: &str) -> String {
         .to_ascii_uppercase()
 }
 
+/// Whether a statement run in `db` can name a table of `source_db`: it runs there, or its text
+/// holds the database's name (without case, so an unquoted or a quoted one alike). One that
+/// can't routes nowhere, unread: most of a busy server's statements are other databases'.
+fn may_name(sql: &str, db: &str, source_db: &str, fold: Fold) -> bool {
+    // A name folded beyond ASCII can't be found bytewise.
+    if fold.eq(db, source_db) || (fold.fold && !source_db.is_ascii()) || source_db.is_empty() {
+        return true;
+    }
+    sql.as_bytes()
+        .windows(source_db.len())
+        .any(|w| w.eq_ignore_ascii_case(source_db.as_bytes()))
+}
+
 /// What a statement does to the tracked tables (channel B).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct Routed {
@@ -493,6 +507,9 @@ fn route(
     tracked: &[TableRef],
     fold: Fold,
 ) -> Result<Routed, SourceError> {
+    if !may_name(sql, db, source_db, fold) {
+        return Ok(Routed::default());
+    }
     let d = classify(sql, db);
     if d.unreadable {
         return Err(permanent(format!(
@@ -724,7 +741,7 @@ impl MySqlConnector {
             txn: None,
             ready: VecDeque::new(),
             signals: None,
-            anonymous: 0,
+            xids: 0,
             fold,
             charsets,
             checked: HashMap::new(),
@@ -744,6 +761,11 @@ impl MySqlStream {
             Some(s) => s.after.push(item),
             None => self.ready.push_back(item),
         }
+    }
+
+    fn next_xid(&mut self) -> u64 {
+        self.xids += 1;
+        self.xids
     }
 
     /// The open transaction's `Begin`, once.
@@ -939,9 +961,9 @@ impl MySqlStream {
                     0 => i64::from(h.timestamp()) * 1_000_000,
                     us => us as i64,
                 };
+                let xid = self.next_xid();
                 if anonymous {
-                    self.anonymous += 1;
-                    return self.start(self.anonymous, ts, Gtid::None, start);
+                    return self.start(xid, ts, Gtid::None, start);
                 }
                 if g.gno() == 0 {
                     return Err(permanent("a GTID event with transaction number 0"));
@@ -950,7 +972,7 @@ impl MySqlStream {
                     uuid: uuid::Uuid::from_bytes(g.sid()),
                     tag: g.tag().map(|t| t.as_str().to_owned()),
                 };
-                self.start(g.gno(), ts, Gtid::Mysql(source, g.gno()), start)
+                self.start(xid, ts, Gtid::Mysql(source, g.gno()), start)
             }
             types::MARIADB_GTID => {
                 let g = MariaGtidEvent::parse(h.server_id(), ev.data()).map_err(permanent)?;
@@ -1030,31 +1052,31 @@ impl MySqlStream {
         let db = q.schema().into_owned();
         if self.txn.is_none() {
             // No GTID event before it: an anonymous transaction.
-            self.anonymous += 1;
+            let xid = self.next_xid();
             let ts = i64::from(ev.header().timestamp()) * 1_000_000;
             self.start(
-                self.anonymous,
+                xid,
                 ts,
                 Gtid::None,
                 end - u64::from(ev.header().event_size()),
             )?;
         }
-        match sql.trim().to_ascii_uppercase().as_str() {
-            "BEGIN" => {
-                if let Some(t) = &mut self.txn {
-                    t.with_begin = true;
-                }
-                return Ok(());
+        let whole = sql.trim();
+        if whole.eq_ignore_ascii_case("BEGIN") {
+            if let Some(t) = &mut self.txn {
+                t.with_begin = true;
             }
-            // MariaDB ends a transaction on a non-transactional engine with COMMIT; a ROLLBACK is
-            // logged when the transaction's non-transactional changes stay, and after the rows of
-            // a transactional table it rolled back (measured on 10.11, 11.4 and 11.8).
-            "COMMIT" => return self.commit(end),
-            "ROLLBACK" => {
-                self.rolled_back("a ROLLBACK", end)?;
-                return self.commit(end);
-            }
-            _ => {}
+            return Ok(());
+        }
+        // MariaDB ends a transaction on a non-transactional engine with COMMIT; a ROLLBACK is
+        // logged when the transaction's non-transactional changes stay, and after the rows of a
+        // transactional table it rolled back (measured on 10.11, 11.4 and 11.8).
+        if whole.eq_ignore_ascii_case("COMMIT") {
+            return self.commit(end);
+        }
+        if whole.eq_ignore_ascii_case("ROLLBACK") {
+            self.rolled_back("a ROLLBACK", end)?;
+            return self.commit(end);
         }
         match verb(&sql).as_str() {
             // A branch's rows come between its START and END, and its prepare ends it; its
@@ -1414,6 +1436,37 @@ mod tests {
             route("TRUNCATE TABLE orders", 0).unwrap().truncated,
             [shop("orders")]
         );
+    }
+
+    #[test]
+    fn other_databases_statements_route_nowhere_unread() {
+        let exact = Fold::default();
+        // Another database's statement that doesn't name the source's: not classified, so even
+        // one the classifier can't read routes nowhere.
+        assert!(!may_name(
+            "ALTER TABLE x ADD COLUMN y INT",
+            "other",
+            "shop",
+            exact
+        ));
+        assert_eq!(
+            route_in("other", "DROP TABLE", 0).unwrap(),
+            Routed::default()
+        );
+        assert!(route_in("shop", "DROP TABLE", 0).is_err());
+        // Naming it, in any case or quoted, still classifies.
+        assert!(may_name("TRUNCATE `SHOP`.orders", "other", "shop", exact));
+        assert_eq!(
+            route_in("other", "TRUNCATE TABLE shop.orders", 0)
+                .unwrap()
+                .truncated,
+            [shop("orders")]
+        );
+        assert!(route_in("other", "INSERT INTO shop.orders SELECT 1", 0).is_err());
+        // In the source's database, or under a fold beyond ASCII, always.
+        assert!(may_name("TRUNCATE orders", "shop", "shop", exact));
+        assert!(may_name("TRUNCATE orders", "SHOP", "shop", Fold::of(1)));
+        assert!(may_name("TRUNCATE x", "other", "çafé", Fold::of(1)));
     }
 
     fn route_in(db: &str, sql: &str, fold: i64) -> Result<Routed, SourceError> {

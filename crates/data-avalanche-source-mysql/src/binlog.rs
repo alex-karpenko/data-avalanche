@@ -84,7 +84,7 @@ impl MariaGtidEvent {
     pub const COMPLETED_XA: u8 = 0x80;
 
     /// From the event body (checksum already off) and the header's server id.
-    pub fn parse(server_id: u32, data: &[u8]) -> Result<Self, String> {
+    pub(crate) fn parse(server_id: u32, data: &[u8]) -> Result<Self, String> {
         if data.len() < 13 {
             return Err(format!("a MariaDB GTID event of {} bytes", data.len()));
         }
@@ -163,7 +163,7 @@ impl Offsets {
     }
 
     /// A ROTATE (real or fake): the next events are in `file` from `pos`.
-    pub fn rotate(&mut self, file: &str, pos: u64) -> Result<(), String> {
+    pub(crate) fn rotate(&mut self, file: &str, pos: u64) -> Result<(), String> {
         if self.in_payload() {
             return Err(self.lost());
         }
@@ -173,7 +173,7 @@ impl Offsets {
     }
 
     /// A heartbeat: it carries no event of the file, and can't come inside a payload.
-    pub fn heartbeat(&self) -> Result<(), String> {
+    pub(crate) fn heartbeat(&self) -> Result<(), String> {
         match self.in_payload() {
             true => Err(self.lost()),
             false => Ok(()),
@@ -181,7 +181,7 @@ impl Offsets {
     }
 
     /// An event of the file with header `log_pos` and `size`: its end offset.
-    pub fn event(&mut self, log_pos: u32, size: u32) -> Result<u64, String> {
+    pub(crate) fn event(&mut self, log_pos: u32, size: u32) -> Result<u64, String> {
         let size = u64::from(size);
         if self.in_payload() {
             if log_pos != 0 {
@@ -205,7 +205,7 @@ impl Offsets {
 
     /// After [`Offsets::event`] for a `TRANSACTION_PAYLOAD`: its events, `uncompressed_size`
     /// bytes, follow. A payload without events is invalid.
-    pub fn payload(&mut self, uncompressed_size: u64) -> Result<(), String> {
+    pub(crate) fn payload(&mut self, uncompressed_size: u64) -> Result<(), String> {
         if uncompressed_size == 0 {
             return Err(format!(
                 "the compressed transaction ending at {}:{} holds no events",
@@ -290,7 +290,7 @@ fn rebuild(e: &Event, ty: u8, data: &[u8]) -> Result<Event, String> {
 /// A MariaDB compressed event as its uncompressed form: read under the plain type, the event
 /// names where its compressed tail starts (the rows, or the statement text); inflated, it is
 /// read again. `None` for an event that isn't one.
-pub fn decompress(e: &Event) -> Result<Option<Event>, String> {
+pub(crate) fn decompress(e: &Event) -> Result<Option<Event>, String> {
     let Some(ty) = plain_type(e.header().event_type_raw()) else {
         return Ok(None);
     };

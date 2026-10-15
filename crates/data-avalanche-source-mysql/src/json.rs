@@ -66,7 +66,7 @@ fn parse(path: &str) -> Result<Vec<Leg>, String> {
 }
 
 /// Applies one diff to `doc`.
-pub fn apply(
+pub(crate) fn apply(
     doc: &mut Value,
     op: JsonDiffOperation,
     path: &str,
@@ -120,7 +120,7 @@ pub fn apply(
 }
 
 /// Applies `diffs` in order to the before image `doc`.
-pub fn apply_all(mut doc: Value, diffs: &[JsonDiff<'_>]) -> Result<Value, String> {
+pub(crate) fn apply_all(mut doc: Value, diffs: &[JsonDiff<'_>]) -> Result<Value, String> {
     for d in diffs {
         let value = d
             .value()

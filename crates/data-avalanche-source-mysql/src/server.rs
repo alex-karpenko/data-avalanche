@@ -144,7 +144,7 @@ pub struct Settings {
 
 /// The pipeline-level checks on `settings` (config §11.2): `Err` refuses the pipeline, the `Ok`
 /// warnings let it start.
-pub fn check_settings(
+pub(crate) fn check_settings(
     flavour: Flavour,
     replication: ReplicationType,
     s: &Settings,
