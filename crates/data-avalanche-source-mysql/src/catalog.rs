@@ -140,7 +140,7 @@ pub fn plan_table(
             value_type: p.value_type.clone(),
             logical: p.logical.clone(),
             nullable: c.nullable,
-            source_type: c.column_type.clone(),
+            source_type: c.source_type(),
             source_ordinal: Some(c.ordinal as i32),
         });
         plans.push(p);

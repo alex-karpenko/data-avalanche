@@ -4,8 +4,8 @@
 
 use data_avalanche_config::NumericOverflowAction;
 use data_avalanche_core::{
-    ColumnValueType as V, HaltReason, LogicalType, MAX_DECIMAL_PRECISION, canonical_logical,
-    conversion, hop2_compatible,
+    ColumnSchema, ColumnValueType as V, HaltReason, LogicalType, MAX_DECIMAL_PRECISION,
+    canonical_logical, conversion, hop2_compatible,
 };
 
 use crate::value::{Charset, Decode, int_type};
@@ -35,7 +35,73 @@ pub struct CatalogColumn {
     pub nullable: bool,
 }
 
+/// The text between a type's parentheses, split at commas: `decimal(10,2)` → `["10", "2"]`.
+fn arguments(column_type: &str) -> Vec<&str> {
+    match (column_type.find('('), column_type.find(')')) {
+        (Some(open), Some(close)) if open < close => column_type[open + 1..close]
+            .split(',')
+            .map(str::trim)
+            .collect(),
+        _ => vec![],
+    }
+}
+
+/// Where a `source_type` names its character set.
+const CHARSET: &str = " character set ";
+
 impl CatalogColumn {
+    /// The schema's `source_type`: `COLUMN_TYPE`, and the character set of a character column
+    /// (`varchar(10) character set latin1`), so that the as-of-position schema is enough to decode
+    /// the stream's values ([`CatalogColumn::from_schema`]).
+    pub fn source_type(&self) -> String {
+        match &self.charset {
+            Some(cs) => format!("{}{CHARSET}{cs}", self.column_type),
+            None => self.column_type.clone(),
+        }
+    }
+
+    /// The column a schema column was planned from, as far as decoding needs it: the type,
+    /// signedness, members, precision, fractional digits, `BINARY` length and character set
+    /// (`source_type`), its position and nullability. Not the collation, which only a snapshot
+    /// read uses (it reads the catalog).
+    pub fn from_schema(c: &ColumnSchema) -> Self {
+        let (column_type, charset) = match c.source_type.rsplit_once(CHARSET) {
+            Some((t, cs))
+                if !cs.is_empty() && cs.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') =>
+            {
+                (t.to_owned(), Some(cs.to_owned()))
+            }
+            _ => (c.source_type.clone(), None),
+        };
+        let data_type = column_type
+            .split(['(', ' '])
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        let args = arguments(&column_type);
+        let number = |i: usize| args.get(i).and_then(|a| a.parse::<u32>().ok());
+        let (mut precision, mut scale, mut fsp, mut max_length) = (None, None, None, None);
+        match data_type.as_str() {
+            "decimal" | "numeric" => (precision, scale) = (number(0), number(1).or(Some(0))),
+            "time" | "datetime" | "timestamp" => fsp = Some(number(0).unwrap_or(0)),
+            "binary" => max_length = number(0).map(u64::from),
+            _ => {}
+        }
+        Self {
+            name: c.name.clone(),
+            data_type,
+            column_type,
+            charset,
+            collation: None,
+            precision,
+            scale,
+            fsp,
+            max_length,
+            ordinal: c.source_ordinal.unwrap_or_default() as u32,
+            nullable: c.nullable,
+        }
+    }
+
     fn unsigned(&self) -> bool {
         self.column_type.contains("unsigned")
     }

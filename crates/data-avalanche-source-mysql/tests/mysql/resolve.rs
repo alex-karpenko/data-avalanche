@@ -1,8 +1,9 @@
 //! Channel A against the target server: the globs select the table set, identifiers decide what
 //! halts and what is skipped, and each column plans per `Type_Mapping.md` (config §11.2).
 
+use data_avalanche_config::NumericOverflowAction;
 use data_avalanche_core::{ColumnValueType as V, HaltReason, TableRef};
-use data_avalanche_source_mysql::Flavour;
+use data_avalanche_source_mysql::{CatalogColumn, Flavour, plan_column, plan_table};
 use data_avalanche_testkit::require_it;
 
 use crate::common::{cleanup, connector, fresh, pipeline, target};
@@ -115,6 +116,34 @@ async fn columns_plan_per_the_type_table() {
         "{siu}"
     );
     assert_eq!(s.column("tm").unwrap().source_ordinal, Some(15));
+    assert!(
+        s.column("c")
+            .unwrap()
+            .source_type
+            .ends_with(" character set latin1"),
+        "{:?}",
+        s.column("c").unwrap().source_type
+    );
+    // The schema alone plans every column as the catalog does: the stream decodes by it.
+    let c = connector(&pipeline(&n, &["t"], "", ""));
+    let described = c.describe(&["t".to_owned()]).await.unwrap();
+    let planned = plan_table(&described["t"], &pipeline(&n, &["t"], "", "").tables, true).unwrap();
+    for (col, plan) in planned.schema.columns().iter().zip(&planned.plans) {
+        let again = plan_column(
+            &CatalogColumn::from_schema(col),
+            true,
+            NumericOverflowAction::String,
+            None,
+            plan.identifier,
+        )
+        .unwrap();
+        assert_eq!(
+            (&again.value_type, &again.decode),
+            (&col.value_type, &plan.decode),
+            "{}",
+            col.name
+        );
+    }
     // tinyint1_as_bool off: TINYINT(1) is an integer.
     let r = connector(&pipeline(&n, &["t"], "", ", tinyint1_as_bool: false"))
         .resolve_tables()
