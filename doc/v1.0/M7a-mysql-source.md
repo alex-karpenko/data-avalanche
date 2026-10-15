@@ -14800,3 +14800,30 @@ git commit -m "ci: the MySQL source on four targets per change, MariaDB 11.4 and
   13's hunk in `schema.rs` (`augment`) is below `scope` and applies unchanged. Known limit, as
   before: when the catalog is ahead by a later statement that moves a column, a scoped column
   is placed by the later order; the table map catches that only by type or (under FULL) name.
+- **Task 13, the review fix (2026-10-15, approved by Oleksii).** Preflight checks
+  `binlog_format = ROW` once, globally, but a session can still set STATEMENT or MIXED. Its
+  `INSERT`, `UPDATE`, `DELETE`, `REPLACE`, `LOAD DATA` (or `WITH … UPDATE/DELETE`) is then
+  logged as a QUERY event with no row events. The classifier read it as harmless, and the stream
+  committed past rows it never saw.
+  - The classifier marks such a statement (`Ddl::logged_as_statement`, with the names it
+    qualifies others with), and the stream halts the pipeline when the statement runs in the
+    source's database or names it. A trigger or a multi-table statement can reach any table
+    there, so the halt is for the pipeline, not one table. A statement in another database is
+    not the source's, so an unrelated application's traffic doesn't stop the pipeline.
+  - Not seen: a statement in another database whose trigger writes into the source's; a
+    qualifier the tokenizer reads as a string (`"shop".t` under `ANSI_QUOTES`) or in another
+    case (`lower_case_table_names`). A MEMORY table the server empties at restart is logged as
+    `DELETE FROM`, and in the source's database it halts (its rows did go without row events).
+  - The new integration test exposed a bug in the plan's stream: MariaDB writes no `BEGIN` event
+    (a transaction's GTID event stands for it), and the stream never took that from the GTID
+    event's standalone flag. A QUERY inside a MariaDB transaction (as statement format writes)
+    committed it early, and its XID then failed the stream ("a commit outside a transaction").
+    The stream now opens the transaction from the GTID event. Under ROW format alone no QUERY
+    comes inside a MariaDB transaction, which is why no earlier test met it.
+
+  Unit assertions in the classifier's tests; one new stream integration test
+  (`a_row_change_logged_as_its_statement_halts_the_stream`: a statement-format transaction in
+  another database streams on, one in the source's database halts). From Task 13 on, the
+  `--test mysql` count is one above the plan's figures (Task 13: 34 per target, stream 8). Folded
+  into Task 13's commit (`ddl.rs` included); Task 14's hunks in `stream.rs` apply unchanged, and
+  no later task touches `ddl.rs` or `tests/mysql/stream.rs`.
