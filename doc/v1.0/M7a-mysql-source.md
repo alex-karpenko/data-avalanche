@@ -14781,3 +14781,22 @@ git commit -m "ci: the MySQL source on four targets per change, MariaDB 11.4 and
   test of table statements); the lib test count is unchanged (Task 11: 64). Folded into Task
   11's commit; no later task touches `ddl.rs`. The review's other notes are parked in the SDD
   ledger.
+- **Task 12, the review fixes (2026-10-15, approved by Oleksii).** `schema::scope` builds the
+  schema as of a statement, which the stream decodes rows by, position for position. Three gaps:
+  - A moved column (`MODIFY x … AFTER y` or `FIRST`, `CHANGE a b … AFTER y`) kept its old place,
+    so rows after it could be read into the wrong columns without an error wherever the types
+    agree: the table map is checked by name only under `binlog_row_metadata = FULL`, which is
+    a warning, not a requirement. Now every scoped column the catalog has goes after its
+    nearest preceding catalog column, in the catalog's order (as an added column already did).
+  - Renames were applied one at a time, so a swap (`CHANGE a b, CHANGE b a`), a chain, or `DROP
+    b, CHANGE a b` left a duplicate name and halted the table. They are applied at once; a
+    column whose name only a rename takes is gone, and `diff` reports its drop before the
+    rename.
+  - `source_ordinal` was copied from the catalog, which, when ahead of the stream, gave
+    duplicates and gaps. Positions are numbered in the result's order.
+
+  One new unit test (`moves_swaps_chains_and_taken_names`), so the lib test count from Task 12
+  on is four above the plan's figures (Task 12: 71, not 67). Folded into Task 12's commit; Task
+  13's hunk in `schema.rs` (`augment`) is below `scope` and applies unchanged. Known limit, as
+  before: when the catalog is ahead by a later statement that moves a column, a scoped column
+  is placed by the later order; the table map catches that only by type or (under FULL) name.
