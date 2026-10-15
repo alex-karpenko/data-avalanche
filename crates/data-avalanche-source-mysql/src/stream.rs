@@ -4,8 +4,11 @@
 //! - **Positions.** A MySQL GTID dump sends the GTID set, a MariaDB one its GTID state through
 //!   `@slave_connect_state`; a file/position dump its file and offset. A transaction's commit
 //!   advances the position: the set gains its GTID, the state its domain's GTID, the file
-//!   position becomes the commit event's end. Every transaction advances it, tracked or not. A
-//!   row's `_lsn` is its transaction's own GTID, or in file/position mode the transaction's start.
+//!   position becomes the commit event's end. Every transaction advances it, tracked or not, and
+//!   one without tracked rows reports it in a keep-alive, at most one a second (a heartbeat comes
+//!   only to an idle dump). In file/position mode a rotate between transactions moves it to the
+//!   next file. A row's `_lsn` is its transaction's own GTID, or in file/position mode the
+//!   transaction's start.
 //! - **Order.** Each event's end offset in its file ([`Offsets`], Q-M7-4) is the `_seq` of the
 //!   rows it holds.
 //! - **Decoding.** Each tracked table decodes by the as-of-position schema: the pipeline's at
@@ -15,14 +18,16 @@
 //!   row image that isn't FULL.
 //! - **Fail closed.** A compressed transaction that yields less than its size halts the pipeline
 //!   (`BINLOG_PAYLOAD_INVALID`, D-V1.6); so does a two-phase XA prepare of tracked rows (they can
-//!   roll back after they are logged), an incident event (the server lost events), and any event
-//!   type the source doesn't read.
+//!   roll back after they are logged), a rollback logged after tracked rows (MariaDB keeps the
+//!   rows a savepoint or a whole rollback undid, measured on 10.11–11.8), an incident event (the
+//!   server lost events), and any event type the source doesn't read.
 //!
 //! [`ChangeStream::next`] is cancel-safe: an event is processed without an await, and the one
 //! await inside a transaction (channel C after a statement) keeps its work until it completes.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use data_avalanche_core::position::{
@@ -116,7 +121,12 @@ pub struct MySqlStream {
     signals: Option<Signals>,
     /// Ids for anonymous transactions.
     anonymous: u64,
+    /// When the last keep-alive went out.
+    kept_alive: Option<Instant>,
 }
+
+/// The least time between two keep-alives after transactions without tracked rows.
+const KEEP_ALIVE_EVERY: Duration = Duration::from_secs(1);
 
 /// A GTID set as the dump request's sid blocks: one per server UUID and tag.
 fn sids(set: &GtidSet) -> Result<Vec<Sid<'static>>, String> {
@@ -364,6 +374,7 @@ impl MySqlConnector {
             ready: VecDeque::new(),
             signals: None,
             anonymous: 0,
+            kept_alive: None,
         })
     }
 }
@@ -481,8 +492,34 @@ impl MySqlStream {
                 commit_ts_micros: txn.commit_ts_micros,
             });
             self.emit(item);
+        } else if self.signals.is_none() {
+            self.keep_alive(false);
         }
         Ok(())
+    }
+
+    /// A keep-alive at the position: on a heartbeat always, after a transaction without tracked
+    /// rows at most once in [`KEEP_ALIVE_EVERY`].
+    fn keep_alive(&mut self, heartbeat: bool) {
+        let now = Instant::now();
+        if heartbeat || self.kept_alive.is_none_or(|t| now - t >= KEEP_ALIVE_EVERY) {
+            self.kept_alive = Some(now);
+            self.ready
+                .push_back(StreamItem::KeepAlive(self.position.clone()));
+        }
+    }
+
+    /// A rollback logged inside a transaction with tracked rows halts the pipeline: the binlog
+    /// kept rows the rollback undid, so the source can't tell which of them stand.
+    fn rolled_back(&self, what: &str, end: u64) -> Result<(), SourceError> {
+        match self.txn.as_ref().is_some_and(|t| t.begun) {
+            true => Err(permanent(format!(
+                "{what} at {}:{end} in a transaction with rows of tracked tables: the binlog \
+                 kept rows the rollback undid, so the source can't tell which rows stand",
+                self.offsets.file()
+            ))),
+            false => Ok(()),
+        }
     }
 
     fn on_event(&mut self, ev: Event) -> Result<(), SourceError> {
@@ -492,8 +529,7 @@ impl MySqlStream {
             types::HEARTBEAT | types::HEARTBEAT_V2 => {
                 self.offsets.heartbeat().map_err(payload_invalid)?;
                 if self.txn.is_none() && self.signals.is_none() {
-                    self.ready
-                        .push_back(StreamItem::KeepAlive(self.position.clone()));
+                    self.keep_alive(true);
                 }
                 return Ok(());
             }
@@ -502,10 +538,19 @@ impl MySqlStream {
                     return Err(permanent("an unreadable ROTATE event"));
                 };
                 let name = String::from_utf8_lossy(rotate_name(r.name_raw())).into_owned();
-                return self
-                    .offsets
+                self.offsets
                     .rotate(&name, r.position())
-                    .map_err(payload_invalid);
+                    .map_err(payload_invalid)?;
+                // Between transactions a file position moves to the next file. The dump's opening
+                // rotate (no `log_pos`) names the file it opened in: the position stays there.
+                let opening = log_pos == 0
+                    && matches!(&self.position, SourcePosition::BinlogFile(p) if p.file() == name);
+                if self.mode == Mode::File && self.txn.is_none() && !opening {
+                    self.position = SourcePosition::BinlogFile(
+                        BinlogFilePos::new(&name, r.position()).map_err(permanent)?,
+                    );
+                }
+                return Ok(());
             }
             // The format description a dump resends at its start isn't in the file there.
             types::FORMAT_DESCRIPTION if log_pos == 0 => return Ok(()),
@@ -647,8 +692,13 @@ impl MySqlStream {
                 return Ok(());
             }
             // MariaDB ends a transaction on a non-transactional engine with COMMIT; a ROLLBACK is
-            // logged when the transaction's non-transactional changes stay.
-            "COMMIT" | "ROLLBACK" => return self.commit(end),
+            // logged when the transaction's non-transactional changes stay, and after the rows of
+            // a transactional table it rolled back (measured on 10.11, 11.4 and 11.8).
+            "COMMIT" => return self.commit(end),
+            "ROLLBACK" => {
+                self.rolled_back("a ROLLBACK", end)?;
+                return self.commit(end);
+            }
             _ => {}
         }
         match verb(&sql).as_str() {
@@ -667,7 +717,9 @@ impl MySqlStream {
                     _ => Ok(()),
                 };
             }
-            "SAVEPOINT" | "ROLLBACK" | "RELEASE" => return Ok(()),
+            // MariaDB logs the rows a `ROLLBACK TO` a savepoint undid, then the statement.
+            "ROLLBACK" => return self.rolled_back("a savepoint rollback", end),
+            "SAVEPOINT" | "RELEASE" => return Ok(()),
             _ => {}
         }
         let seq = self.seq(end)?;

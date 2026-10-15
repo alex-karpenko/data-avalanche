@@ -11,7 +11,7 @@ use data_avalanche_source_mysql::{Flavour, MySqlConnector, MySqlStream};
 use data_avalanche_testkit::require_it;
 use mysql_async::prelude::Queryable;
 
-use crate::common::{cleanup, connector, fresh, pipeline, target};
+use crate::common::{admin_in, cleanup, connector, fresh, pipeline, target};
 
 /// Items until `commits` transactions committed (keep-alives left out).
 async fn items(s: &mut MySqlStream, commits: usize) -> Vec<StreamItem> {
@@ -318,6 +318,148 @@ async fn an_idle_stream_keeps_alive() {
     .expect("a keep-alive within 5 s at a 1 s heartbeat");
     assert!(item.covers(&from).unwrap() || from.covers(&item).unwrap());
     shut(s).await;
+    cleanup(&n).await;
+}
+
+/// The first keep-alive within `within` that `accept` takes.
+async fn kept_alive(
+    s: &mut MySqlStream,
+    within: Duration,
+    accept: impl Fn(&SourcePosition) -> bool,
+) -> SourcePosition {
+    tokio::time::timeout(within, async {
+        loop {
+            match s.next().await.unwrap() {
+                StreamItem::KeepAlive(p) if accept(&p) => return p,
+                StreamItem::Change(e) => panic!("an untracked change: {e:?}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("a keep-alive within {within:?}"))
+}
+
+/// Transactions without tracked rows move the position on in keep-alives, long before a
+/// heartbeat would (60 s here).
+#[tokio::test]
+async fn untracked_writes_keep_alive_before_a_heartbeat() {
+    require_it!();
+    let (n, mut a) = fresh(
+        "stream_untracked",
+        "CREATE TABLE t (id INT PRIMARY KEY); CREATE TABLE u (id INT AUTO_INCREMENT PRIMARY KEY);",
+    )
+    .await;
+    let c = connector(&pipeline(&n, &["t"], "", ", heartbeat: 60s"));
+    let tables = c.resolve_tables().await.unwrap().tables;
+    let mut s = open(&c, &tables).await;
+    a.query_drop("INSERT INTO u VALUES ()").await.unwrap();
+    let after = c.position_now().await.unwrap();
+    // Keep writing: keep-alives are at most one a second, so the one covering `after` may wait
+    // for a later write.
+    let db = n.db.clone();
+    let writer = tokio::spawn(async move {
+        let mut w = admin_in(&db).await;
+        loop {
+            w.query_drop("INSERT INTO u VALUES ()").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    });
+    let p = kept_alive(&mut s, Duration::from_secs(5), |p| {
+        p.covers(&after).unwrap()
+    })
+    .await;
+    writer.abort();
+    assert!(p.covers(&after).unwrap(), "{p} covers {after}");
+    shut(s).await;
+    cleanup(&n).await;
+}
+
+/// In file/position mode a rotate between transactions moves the position to the next file, so a
+/// checkpoint taken while idle doesn't point into a file the server may expire.
+#[tokio::test]
+async fn a_rotate_moves_a_file_position_to_the_next_file() {
+    require_it!();
+    if target().replication != "binlog" {
+        eprintln!("skipped: file/position mode only");
+        return;
+    }
+    let (n, mut a) = fresh("stream_rotate", "CREATE TABLE t (id INT PRIMARY KEY)").await;
+    let c = connector(&pipeline(&n, &["t"], "", ""));
+    let tables = c.resolve_tables().await.unwrap().tables;
+    let mut s = open(&c, &tables).await;
+    a.query_drop("FLUSH BINARY LOGS").await.unwrap();
+    let newest = c.binary_logs().await.unwrap().pop().unwrap().name;
+    kept_alive(
+        &mut s,
+        Duration::from_secs(5),
+        |p| matches!(p, SourcePosition::BinlogFile(f) if f.file() == newest),
+    )
+    .await;
+    shut(s).await;
+    cleanup(&n).await;
+}
+
+/// MariaDB logs the rows a rollback undid in a transaction with non-transactional changes, then
+/// `ROLLBACK TO` (a savepoint) or `ROLLBACK` (the whole transaction): with tracked rows among them
+/// the pipeline halts. MySQL without GTIDs logs none of them; with GTIDs it refuses the
+/// transaction (`enforce_gtid_consistency`). Measured on MySQL 8.4 and MariaDB 10.11–11.8.
+#[tokio::test]
+async fn a_rollback_after_tracked_rows_halts_the_stream() {
+    require_it!();
+    let (n, mut a) = fresh(
+        "stream_rollback",
+        "CREATE TABLE t (id INT PRIMARY KEY) ENGINE = InnoDB;
+         CREATE TABLE m (id INT PRIMARY KEY) ENGINE = MyISAM;",
+    )
+    .await;
+    let c = connector(&pipeline(&n, &["t"], "", ""));
+    let tables = c.resolve_tables().await.unwrap().tables;
+    let to_savepoint = "BEGIN; INSERT INTO t VALUES (1); SAVEPOINT s; INSERT INTO t VALUES (2);
+         INSERT INTO m VALUES (2); ROLLBACK TO s; COMMIT;";
+    let whole = "BEGIN; SAVEPOINT s; INSERT INTO t VALUES (3); INSERT INTO m VALUES (3);
+         ROLLBACK TO s; COMMIT;";
+    if target().flavour == Flavour::Mysql && target().replication == "gtid" {
+        match a.query_drop(whole).await {
+            Err(mysql_async::Error::Server(e)) => assert_eq!(e.code, 1785, "{e}"),
+            other => panic!("refused expected, got {other:?}"),
+        }
+        let _ = a.query_drop("ROLLBACK").await;
+        cleanup(&n).await;
+        return;
+    }
+    for (sql, logged) in [
+        (to_savepoint, "a savepoint rollback"),
+        (whole, "a ROLLBACK"),
+    ] {
+        let mut s = open(&c, &tables).await;
+        a.query_drop(sql).await.unwrap();
+        a.query_drop("INSERT INTO t VALUES (9); DELETE FROM t WHERE id = 9")
+            .await
+            .unwrap();
+        match target().flavour {
+            Flavour::Mariadb => {
+                let e = error(&mut s).await;
+                assert!(
+                    matches!(&e, SourceError::Permanent(m) if m.starts_with(logged) && m.contains("can't tell which rows stand")),
+                    "{e}"
+                );
+            }
+            Flavour::Mysql => {
+                // Only the rows that stand: the savepoint's own transaction keeps row 1.
+                let want: &[i32] = if sql == to_savepoint {
+                    &[1, 9, 9]
+                } else {
+                    &[9, 9]
+                };
+                let got = changes(&items(&mut s, want.len()).await);
+                let ids: Vec<_> = got.iter().map(|(_, id)| id.clone()).collect();
+                let want: Vec<_> = want.iter().map(|i| Some(ColumnValue::Int32(*i))).collect();
+                assert_eq!(ids, want);
+                shut(s).await;
+            }
+        }
+    }
     cleanup(&n).await;
 }
 

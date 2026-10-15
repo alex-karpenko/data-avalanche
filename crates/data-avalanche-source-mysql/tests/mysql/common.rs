@@ -110,7 +110,7 @@ pub async fn fresh(test: &str, ddl: &str) -> (Names, Conn) {
 
 /// A pipeline `n.db` on the target as `user`, reading `include`, with more `source` keys (YAML,
 /// indented six spaces), `mysql` keys (YAML flow entries; a `replication_type` there replaces the
-/// target's) and `tables` keys (indented six).
+/// target's, a `heartbeat` the default 1s) and `tables` keys (indented six).
 pub fn pipeline_as(
     n: &Names,
     user: &str,
@@ -123,6 +123,10 @@ pub fn pipeline_as(
     let replication = match mysql.contains("replication_type") {
         true => String::new(),
         false => format!("replication_type: {}, ", t.replication),
+    };
+    let (heartbeat, mysql) = match mysql.contains("heartbeat") {
+        true => ("", mysql.trim_start_matches(", ")),
+        false => ("heartbeat: 1s", mysql),
     };
     let yaml = format!(
         r#"
@@ -140,7 +144,7 @@ pipelines:
       user: {user}
       password: avalanche
 {source}
-      mysql: {{ {replication}heartbeat: 1s{mysql} }}
+      mysql: {{ {replication}{heartbeat}{mysql} }}
     tables:
       include: [{include}]
 {tables}

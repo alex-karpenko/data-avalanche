@@ -96,13 +96,29 @@ async fn a_checkpoint_in_another_dialect_follows_the_purge_action() {
         other => panic!("a halt, got {other:?}"),
     }
     let recovers = connector(&pipeline(&n, &["t"], "", RE_SNAPSHOT));
-    match prepare(&recovers, &cp).await {
-        Err(SourceError::PositionUnreachable { position, .. }) => {
-            assert_eq!(position, cp.position.to_tagged())
-        }
-        other => panic!("unreachable, got {other:?}"),
-    }
+    re_snapshots(&recovers, &cp).await;
     cleanup(&n).await;
+}
+
+/// Under `re_snapshot`, `prepare` plans a snapshot from the server's position now, with a warning
+/// naming the lost checkpoint.
+async fn re_snapshots(c: &MySqlConnector, cp: &Checkpoint) {
+    let p = SourceConnector::prepare(c, Some(cp), &[])
+        .await
+        .expect("a re-snapshot");
+    let StartPlan::Snapshot { from, reason } = p.plan else {
+        panic!("a snapshot, got {:?}", p.plan)
+    };
+    assert_eq!(reason, SnapshotReason::PositionLost);
+    assert_eq!(from.dialect(), c.mode().await.unwrap().dialect());
+    assert!(
+        p.warnings.len() == 1
+            && p.warnings[0].contains(&cp.position.to_tagged())
+            && p.warnings[0].contains("re_snapshot"),
+        "{:?}",
+        p.warnings
+    );
+    assert_eq!(p.server, Some(c.server_identity().await.unwrap()));
 }
 
 /// File/position mode halts on a checkpoint from another server; GTIDs carry across servers.
@@ -150,10 +166,7 @@ async fn a_purged_file_follows_the_purge_action() {
         other => panic!("a halt, got {other:?}"),
     }
     let recovers = connector(&pipeline(&n, &["t"], "", RE_SNAPSHOT));
-    assert!(matches!(
-        prepare(&recovers, &cp).await,
-        Err(SourceError::PositionUnreachable { .. })
-    ));
+    re_snapshots(&recovers, &cp).await;
     cleanup(&n).await;
 }
 

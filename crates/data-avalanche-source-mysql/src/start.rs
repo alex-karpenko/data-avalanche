@@ -4,9 +4,11 @@
 //! A first start snapshots from the server's write position and records the server. A checkpoint
 //! in another dialect than the pipeline reads now (`replication_type` changed, or the server is
 //! another flavour) and a checkpoint the server can no longer serve both follow
-//! `binlog_purge_action`: `re_snapshot` re-snapshots from a new position, `error` halts. In
-//! file/position mode a checkpoint recorded on another server halts the pipeline
-//! (`BINLOG_SOURCE_CHANGED`): a position in one server's files means nothing in another's.
+//! `binlog_purge_action`: at a start, `re_snapshot` plans a snapshot from the server's position
+//! now (`PositionLost`, with a warning) and `error` halts. A purge the stream meets later (the
+//! dump's error 1236) follows it through [`purge_action`]. In file/position mode a checkpoint
+//! recorded on another server halts the pipeline (`BINLOG_SOURCE_CHANGED`): a position in one
+//! server's files means nothing in another's.
 
 use std::sync::atomic::Ordering;
 
@@ -48,10 +50,11 @@ pub fn same_server(checkpoint: &Checkpoint, now: &ServerIdentity) -> Result<(), 
     )))
 }
 
-/// A position the server can't serve, as `binlog_purge_action` says (G-26): `re_snapshot` keeps
-/// it [`SourceError::PositionUnreachable`], and the pipeline re-snapshots from a new position;
-/// `error` halts the pipeline for the operator. `prepare` and the stream (error 1236, a purge
-/// after `prepare`) both decide by it.
+/// A position the stream can't read on, as `binlog_purge_action` says (G-26): `re_snapshot` keeps
+/// it [`SourceError::PositionUnreachable`], which the pipeline's session answers with a
+/// re-snapshot from a new position; `error` halts the pipeline for the operator. The dump's open
+/// and the stream (error 1236, a purge after `prepare`) decide by it; `prepare` re-snapshots
+/// under `re_snapshot` itself, and halts by it under `error`.
 pub fn purge_action(action: BinlogPurgeAction, e: SourceError) -> SourceError {
     match (action, e) {
         (BinlogPurgeAction::Error, SourceError::PositionUnreachable { position, detail }) => {
@@ -81,24 +84,40 @@ impl MySqlConnector {
                 server: Some(server),
             });
         };
-        let unreachable = |detail| {
-            purge_action(
+        let lost = match dialect_change(mode, &cp.position) {
+            Some(why) => Some(why),
+            None => {
+                if mode == Mode::File {
+                    same_server(cp, &server)?;
+                }
+                let retention = self.retention(&cp.position).await?;
+                purged(&cp.position, &retention)
+            }
+        };
+        if let Some(why) = lost {
+            let position = cp.position.to_tagged();
+            if self.mysql.binlog_purge_action == BinlogPurgeAction::ReSnapshot {
+                return Ok(Prepared {
+                    plan: StartPlan::Snapshot {
+                        from: self.position_now().await?,
+                        reason: SnapshotReason::PositionLost,
+                    },
+                    added: vec![],
+                    warnings: vec![format!(
+                        "the source can't serve the checkpoint {position}: {why}; \
+                         binlog_purge_action is re_snapshot, so the pipeline re-snapshots from \
+                         the server's position now"
+                    )],
+                    server: Some(server),
+                });
+            }
+            return Err(purge_action(
                 self.mysql.binlog_purge_action,
                 SourceError::PositionUnreachable {
-                    position: cp.position.to_tagged(),
-                    detail,
+                    position,
+                    detail: why,
                 },
-            )
-        };
-        if let Some(why) = dialect_change(mode, &cp.position) {
-            return Err(unreachable(why));
-        }
-        if mode == Mode::File {
-            same_server(cp, &server)?;
-        }
-        let retention = self.retention(&cp.position).await?;
-        if let Some(why) = purged(&cp.position, &retention) {
-            return Err(unreachable(why));
+            ));
         }
         Ok(Prepared {
             plan: StartPlan::Resume,

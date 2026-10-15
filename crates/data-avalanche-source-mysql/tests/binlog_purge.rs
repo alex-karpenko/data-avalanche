@@ -1,5 +1,6 @@
-//! A checkpoint the server purged after it was taken follows `binlog_purge_action` (G-26), at
-//! `prepare` and, past `prepare`, on the server's own refusal (error 1236). Its own test binary,
+//! A checkpoint the server purged after it was taken follows `binlog_purge_action` (G-26): at
+//! `prepare` a re-snapshot or a halt, and past `prepare`, on the server's own refusal (error
+//! 1236), an unreachable position or a halt. Its own test binary,
 //! which cargo never runs beside the `mysql` tests: `PURGE BINARY LOGS` removes the binlogs their
 //! streams read.
 
@@ -9,7 +10,9 @@ mod common;
 
 use std::time::Duration;
 
-use data_avalanche_core::{ChangeStream, Checkpoint, SourceConnector, SourceError, StartPlan};
+use data_avalanche_core::{
+    ChangeStream, Checkpoint, SnapshotReason, SourceConnector, SourceError, StartPlan,
+};
 use data_avalanche_testkit::require_it;
 use mysql_async::prelude::Queryable;
 
@@ -70,11 +73,34 @@ async fn a_purged_checkpoint_follows_the_purge_action() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert_eq!(left.len(), 1, "the purge left {left:?}");
-    for (c, re_snapshot) in [(&halts, false), (&recovers, true)] {
-        let e = SourceConnector::prepare(c, Some(&cp), &[])
+    // At a start: `error` halts, `re_snapshot` plans a snapshot, warning of the lost checkpoint.
+    check(
+        false,
+        "prepare",
+        SourceConnector::prepare(&halts, Some(&cp), &[])
             .await
-            .unwrap_err();
-        check(re_snapshot, "prepare", e);
+            .unwrap_err(),
+    );
+    let p = SourceConnector::prepare(&recovers, Some(&cp), &[])
+        .await
+        .expect("a re-snapshot");
+    assert!(
+        matches!(
+            p.plan,
+            StartPlan::Snapshot {
+                reason: SnapshotReason::PositionLost,
+                ..
+            }
+        ),
+        "{:?}",
+        p.plan
+    );
+    assert!(
+        p.warnings.len() == 1 && p.warnings[0].contains(&cp.position.to_tagged()),
+        "{:?}",
+        p.warnings
+    );
+    for (c, re_snapshot) in [(&halts, false), (&recovers, true)] {
         // The server's refusal, for a stream opened without the check.
         let e = ended(SourceConnector::open_stream(c, &cp.position, &tables).await).await;
         check(re_snapshot, "the dump", e);
