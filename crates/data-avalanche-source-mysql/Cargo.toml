@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 data-avalanche-config.workspace = true
 data-avalanche-core.workspace = true
+flate2.workspace = true
 futures-util.workspace = true
 mysql_async.workspace = true
 rustls.workspace = true
@@ -19,5 +20,6 @@ tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]
 data-avalanche-testkit.workspace = true
+mysql_common.workspace = true
 rcgen.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
