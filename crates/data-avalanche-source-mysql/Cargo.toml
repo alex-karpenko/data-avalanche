@@ -10,6 +10,7 @@ description = "The MySQL and MariaDB source: the binlog over mysql_async, catalo
 workspace = true
 
 [dependencies]
+async-trait.workspace = true
 chrono.workspace = true
 data-avalanche-config.workspace = true
 data-avalanche-core.workspace = true

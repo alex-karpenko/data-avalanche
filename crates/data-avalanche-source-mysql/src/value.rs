@@ -9,7 +9,7 @@
 use std::net::Ipv4Addr;
 
 use chrono::{DateTime, NaiveDate};
-use data_avalanche_core::{ColumnValue, ColumnValueType, Decimal, DecimalError};
+use data_avalanche_core::{ColumnValue, ColumnValueType, Decimal, DecimalError, HaltReason};
 use mysql_async::Value;
 use mysql_async::binlog::value::BinlogValue;
 
@@ -643,6 +643,15 @@ fn value(d: &Decode, raw: Raw, identifier: bool) -> Result<ColumnValue, ValueErr
             other => return Err(bad(format!("{d:?} read {other:?}"))),
         },
     })
+}
+
+/// The table halt a value that can't be decoded in `column` causes.
+pub(crate) fn halt_reason(column: String, e: ValueError) -> HaltReason {
+    match e {
+        ValueError::Overflow => HaltReason::NumericOverflow { column },
+        ValueError::InvalidDate { raw } => HaltReason::InvalidDateValue { column, raw },
+        ValueError::Unrepresentable(detail) => HaltReason::SchemaMismatch { column, detail },
+    }
 }
 
 /// Decodes one value of a column planned as `d`; `identifier` marks a column of the table's

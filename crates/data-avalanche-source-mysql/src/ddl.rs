@@ -49,6 +49,9 @@ pub struct Ddl {
     pub unlogged: Vec<(TableRef, String)>,
     /// A table statement neither tier read a table name from.
     pub unreadable: bool,
+    /// A row change logged as its statement (a session's `binlog_format` STATEMENT or MIXED),
+    /// its rows not in the binlog: the names it qualifies others with (`db.t`, `t.c`).
+    pub logged_as_statement: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,6 +280,20 @@ fn read(sql: &str, db: &str) -> Ddl {
         d.unreadable = true;
         d
     };
+    if ["INSERT", "UPDATE", "DELETE", "REPLACE", "LOAD", "WITH"]
+        .iter()
+        .any(|k| w.eat(k))
+    {
+        let named = t
+            .windows(2)
+            .filter_map(|p| match p {
+                [Token::Word(n) | Token::Quoted(n), Token::Punct('.')] => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        d.logged_as_statement = Some(named);
+        return d;
+    }
     if w.eat("ALTER") {
         let _ = w.eat("ONLINE") || w.eat("OFFLINE");
         let _ = w.eat("IGNORE");
@@ -694,6 +711,21 @@ mod tests {
         ] {
             assert_eq!(c(sql), Ddl::default(), "{sql}");
         }
+        for sql in [
+            "INSERT INTO t VALUES (1)",
+            "/* app */ update t SET a = 1",
+            "DELETE t, u FROM t JOIN u USING (id)",
+            "REPLACE INTO t VALUES (1)",
+            "LOAD DATA INFILE 'x' INTO TABLE t",
+            "WITH x AS (SELECT 1) DELETE FROM t",
+        ] {
+            assert_eq!(c(sql).logged_as_statement, Some(vec![]), "{sql}");
+        }
+        assert_eq!(
+            c("INSERT INTO `shop`.t SELECT * FROM other.u /* x.y */").logged_as_statement,
+            Some(vec!["shop".into(), "other".into()])
+        );
+        assert_eq!(c("CREATE TABLE t (id INT)").logged_as_statement, None);
     }
 
     #[test]

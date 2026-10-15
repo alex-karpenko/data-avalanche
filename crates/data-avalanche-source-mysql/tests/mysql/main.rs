@@ -9,5 +9,6 @@ mod preflight;
 mod resolve;
 mod schema;
 mod snapshot;
+mod stream;
 mod tls;
 mod values;

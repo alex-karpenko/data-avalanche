@@ -28,7 +28,7 @@ use mysql_async::{IsolationLevel, TxOpts, Value};
 use crate::catalog::table_key;
 use crate::connector::MySqlConnector;
 use crate::types::{CatalogColumn, plan_column};
-use crate::value::{self, Decode, Input, ValueError};
+use crate::value::{self, Decode, Input};
 
 /// How to read one column of a table.
 #[derive(Debug, Clone)]
@@ -334,18 +334,8 @@ fn decode_row(
     let mut out = Vec::with_capacity(columns.len());
     for (c, v) in columns.iter().zip(&values) {
         let column = c.catalog.name.clone();
-        let decoded = value::decode(&c.decode, Input::Row(v), c.identifier).map_err(|e| {
-            halt(
-                schema,
-                match e {
-                    ValueError::Overflow => HaltReason::NumericOverflow { column },
-                    ValueError::InvalidDate { raw } => HaltReason::InvalidDateValue { column, raw },
-                    ValueError::Unrepresentable(detail) => {
-                        HaltReason::SchemaMismatch { column, detail }
-                    }
-                },
-            )
-        })?;
+        let decoded = value::decode(&c.decode, Input::Row(v), c.identifier)
+            .map_err(|e| halt(schema, value::halt_reason(column, e)))?;
         out.push((c.catalog.name.clone(), decoded));
     }
     Ok(Row(out))

@@ -261,8 +261,24 @@ impl MySqlConnector {
     }
 
     /// Channel C: the change the statement `hint` makes to `cached` (`Schema_Change…` §0, §3,
-    /// §6). A table gone from the catalog is dropped.
+    /// §6). The stream read it already to decode the rows after the statement: that answer, when
+    /// it was read from the same schema; else a fresh read.
     pub async fn augment(
+        &self,
+        cached: &TableSchema,
+        hint: &SchemaHint,
+    ) -> Result<(SchemaDelta, Option<TableSchema>), SourceError> {
+        if let SchemaHint::Ddl(sql) = hint
+            && let Some(change) = self.shared.take(cached, sql)
+        {
+            return Ok(change);
+        }
+        self.read_change(cached, hint).await
+    }
+
+    /// The change the statement `hint` makes to `cached`, read from the catalog now. A table gone
+    /// from the catalog is dropped.
+    pub(crate) async fn read_change(
         &self,
         cached: &TableSchema,
         hint: &SchemaHint,

@@ -1,12 +1,55 @@
 //! `MySqlConnector`: the MySQL or MariaDB source of one pipeline.
 
 use data_avalanche_config::{Mysql, Pipeline, SourceType};
-use data_avalanche_core::{Preflight, SourceError};
+use std::sync::atomic::AtomicU32;
+use std::sync::{Arc, Mutex};
+
+use data_avalanche_core::{Preflight, SchemaDelta, SourceError, TableSchema};
 use mysql_async::prelude::Queryable;
 use tokio::sync::OnceCell;
 
 use crate::connect::Connector;
 use crate::server::{Flavour, Settings, check_settings, grants_replication};
+
+/// What a connector and its stream share.
+#[derive(Debug, Default)]
+pub(crate) struct Shared {
+    /// The change the stream read for a schema signal, kept for the pipeline's `augment` of the
+    /// same signal: one catalog read per statement, and one answer for both.
+    remembered: Mutex<Vec<Remembered>>,
+    /// The connection id of the open binlog dump, 0 without one: the watchdog finds the dump by it.
+    pub(crate) dump: AtomicU32,
+}
+
+#[derive(Debug)]
+struct Remembered {
+    cached: TableSchema,
+    sql: String,
+    change: Change,
+}
+
+/// A channel C answer: the delta, and the schema after it (`None`: the table was dropped).
+pub(crate) type Change = (SchemaDelta, Option<TableSchema>);
+
+impl Shared {
+    /// Keeps the stream's answer for `cached` and `sql`, in place of an older one for the table.
+    pub(crate) fn remember(&self, cached: &TableSchema, sql: &str, change: Change) {
+        let mut r = self.remembered.lock().expect("not poisoned");
+        r.retain(|x| x.cached.table() != cached.table());
+        r.push(Remembered {
+            cached: cached.clone(),
+            sql: sql.to_owned(),
+            change,
+        });
+    }
+
+    /// The stream's answer for this signal, if it read one from the same schema.
+    pub(crate) fn take(&self, cached: &TableSchema, sql: &str) -> Option<Change> {
+        let mut r = self.remembered.lock().expect("not poisoned");
+        let i = r.iter().position(|x| &x.cached == cached && x.sql == sql)?;
+        Some(r.remove(i).change)
+    }
+}
 
 /// The MySQL or MariaDB source of one pipeline (roadmap §3.6). Built from the resolved pipeline
 /// configuration; connections open on first use.
@@ -17,6 +60,7 @@ pub struct MySqlConnector {
     pub(crate) conn: Connector,
     /// `VERSION()`, read once: the dialect every later statement depends on.
     version: OnceCell<String>,
+    pub(crate) shared: Arc<Shared>,
 }
 
 impl MySqlConnector {
@@ -37,6 +81,19 @@ impl MySqlConnector {
             mysql,
             conn: Connector::new(source)?,
             version: OnceCell::new(),
+            shared: Arc::default(),
+        })
+    }
+
+    /// A connector for the stream's catalog reads: its own catalog connection, the same
+    /// configuration, version and shared state.
+    pub(crate) fn sibling(&self) -> Result<Self, SourceError> {
+        Ok(Self {
+            pipeline: self.pipeline.clone(),
+            mysql: self.mysql.clone(),
+            conn: Connector::new(&self.pipeline.source)?,
+            version: self.version.clone(),
+            shared: self.shared.clone(),
         })
     }
 
