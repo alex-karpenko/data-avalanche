@@ -642,6 +642,27 @@ pub fn decode(d: &Decode, input: Input<'_>, identifier: bool) -> Result<ColumnVa
     value(d, r, identifier)
 }
 
+/// Decodes an after image's value, which a partial JSON update logs as diffs against the before
+/// image's (Q-M7a-3): the diffs are applied to `before`, and the full document is the value.
+pub fn decode_after(
+    d: &Decode,
+    before: Option<Input<'_>>,
+    after: Input<'_>,
+    identifier: bool,
+) -> Result<ColumnValue, ValueError> {
+    let Input::Binlog(BinlogValue::JsonDiff(diffs)) = after else {
+        return decode(d, after, identifier);
+    };
+    let before = before.ok_or_else(|| bad("a partial JSON update without a before image"))?;
+    let Raw::Json(doc) = raw(d, before)? else {
+        return Err(bad(
+            "a partial JSON update of a value that isn't a JSON document",
+        ));
+    };
+    let doc = crate::json::apply_all(doc, diffs).map_err(bad)?;
+    value(d, Raw::Json(doc), identifier)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1015,6 +1036,25 @@ mod tests {
         assert!(binlog(&s, b(&[0b1001])).is_err());
         let partial = BinlogValue::JsonDiff(vec![]);
         assert!(decode(&Decode::Json, Input::Binlog(&partial), false).is_err());
+        // With its before image, an empty diff list (a statement that changed nothing) is the
+        // before image; a `string` override renders the document.
+        let before = b(br#"{"a": 1}"#);
+        for (d, want) in [
+            (Decode::Json, ColumnValue::Json(serde_json::json!({"a": 1}))),
+            (
+                Decode::String(Box::new(Decode::Json)),
+                ColumnValue::Text(r#"{"a":1}"#.into()),
+            ),
+        ] {
+            let got = decode_after(
+                &d,
+                Some(Input::Row(&before)),
+                Input::Binlog(&partial),
+                false,
+            );
+            assert_eq!(got.unwrap(), want);
+        }
+        assert!(decode_after(&Decode::Json, None, Input::Binlog(&partial), false).is_err());
     }
 
     #[test]
