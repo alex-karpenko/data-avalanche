@@ -14767,3 +14767,17 @@ git commit -m "ci: the MySQL source on four targets per change, MariaDB 11.4 and
   assertion in the existing test of ENUM, SET and JSON values; the lib test count is unchanged
   (Task 7: 44, the plan's 41 plus the three earlier tests). Folded into Task 7's commit; later
   tasks' hunks in `value.rs` are far from it and apply unchanged.
+- **Task 11, the review fixes (2026-10-15, approved by Oleksii).** Two statements that drop or
+  move a tracked table's rows could pass the classifier as harmless:
+  - `DROP DATABASE` and MariaDB's `CREATE OR REPLACE DATABASE` with a name the tokenizer can't
+    read as an identifier (`"shop"` under `ANSI_QUOTES`, or none) left `dropped_database` empty.
+    Such a statement is now `unreadable`, which halts the pipeline.
+  - `ALTER TABLE p EXCHANGE PARTITION … WITH TABLE x` and MariaDB's `ALTER TABLE p CONVERT TABLE
+    x TO PARTITION …` recorded only `p` as changed without row events. `x` is now in `unlogged`
+    too (in its own schema when qualified), so a tracked `x` halts (`UNSAFE_DDL`); an `x` that
+    can't be read makes the statement `unreadable`.
+
+  Assertions in the existing tests (`partition_operations_that_move_rows_are_unlogged` and the
+  test of table statements); the lib test count is unchanged (Task 11: 64). Folded into Task
+  11's commit; no later task touches `ddl.rs`. The review's other notes are parked in the SDD
+  ledger.
