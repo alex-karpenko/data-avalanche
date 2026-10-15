@@ -27,6 +27,15 @@ impl Mode {
             (ReplicationType::Gtid, Flavour::Mariadb) => Self::MariadbGtid,
         }
     }
+
+    /// The tag of this mode's positions (`SourcePosition::dialect`).
+    pub fn dialect(self) -> &'static str {
+        match self {
+            Self::MysqlGtid => "mysql-gtid",
+            Self::MariadbGtid => "mariadb-gtid",
+            Self::File => "binlog",
+        }
+    }
 }
 
 /// One row of `SHOW BINARY LOGS`.
@@ -208,12 +217,7 @@ impl MySqlConnector {
 
 /// A position the server printed, in `mode`'s dialect.
 pub(crate) fn parse(mode: Mode, text: &str) -> Result<SourcePosition, SourceError> {
-    let tag = match mode {
-        Mode::MysqlGtid => "mysql-gtid",
-        Mode::MariadbGtid => "mariadb-gtid",
-        Mode::File => "binlog",
-    };
-    SourcePosition::parse_tagged(&format!("{tag}:{text}"))
+    SourcePosition::parse_tagged(&format!("{}:{text}", mode.dialect()))
         .map_err(|e| SourceError::Permanent(format!("the server's position: {e}")))
 }
 

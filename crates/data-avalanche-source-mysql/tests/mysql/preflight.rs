@@ -7,7 +7,7 @@ use data_avalanche_source_mysql::Flavour;
 use data_avalanche_testkit::require_it;
 use mysql_async::prelude::Queryable;
 
-use crate::common::{Names, cleanup, connector, fresh, pipeline, pipeline_as, target};
+use crate::common::{Names, cleanup, connector, fresh, pipeline, pipeline_as, target, user};
 
 #[tokio::test]
 async fn the_test_server_passes_preflight() {
@@ -36,24 +36,6 @@ async fn gtid_replication_needs_gtid_mode_on() {
         other => panic!("refused expected, got {other:?}"),
     }
     cleanup(&n).await;
-}
-
-/// A user `it_<test>` with `grants` (and `extra` statements after them), password `avalanche`.
-async fn user(a: &mut mysql_async::Conn, name: &str, grants: &str, extra: &[String]) {
-    a.query_drop(format!("DROP USER IF EXISTS '{name}'@'%'"))
-        .await
-        .unwrap();
-    a.query_drop(format!(
-        "CREATE USER '{name}'@'%' IDENTIFIED BY 'avalanche'"
-    ))
-    .await
-    .unwrap();
-    a.query_drop(format!("GRANT {grants} TO '{name}'@'%'"))
-        .await
-        .unwrap();
-    for s in extra {
-        a.query_drop(s).await.unwrap_or_else(|e| panic!("{s}: {e}"));
-    }
 }
 
 #[tokio::test]

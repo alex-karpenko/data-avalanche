@@ -48,6 +48,7 @@ use crate::ddl::{Renamed, classify, renamed};
 use crate::error::mysql;
 use crate::position::Mode;
 use crate::server::Flavour;
+use crate::start::purge_action;
 use crate::types::{CatalogColumn, plan_column};
 use crate::value::{Decode, Input, decode_after, halt_reason};
 
@@ -308,7 +309,8 @@ impl MySqlConnector {
             tracked.insert(s.table().clone(), t);
         }
         let at = from.to_tagged();
-        let err = |e| mysql(e, Some(&at));
+        let action = self.mysql.binlog_purge_action;
+        let err = |e| purge_action(action, mysql(e, Some(&at)));
         let mut conn = self.conn.connect().await?;
         let id = conn.id();
         conn.query_drop(format!(
@@ -939,7 +941,10 @@ impl ChangeStream for MySqlStream {
             let at = self.position.to_tagged();
             let ev = match self.events.next().await {
                 Some(Ok(ev)) => ev,
-                Some(Err(e)) => return Err(mysql(e, Some(&at))),
+                Some(Err(e)) => {
+                    let action = self.catalog.mysql.binlog_purge_action;
+                    return Err(purge_action(action, mysql(e, Some(&at))));
+                }
                 None => {
                     return Err(SourceError::Transient(
                         "the server ended the binlog stream".into(),

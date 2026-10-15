@@ -4,7 +4,12 @@ use data_avalanche_config::{Mysql, Pipeline, SourceType};
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 
-use data_avalanche_core::{Preflight, SchemaDelta, SourceError, TableSchema};
+use async_trait::async_trait;
+use data_avalanche_core::{
+    ChangeStream, Checkpoint, Chunk, KeysetCursor, Preflight, Prepared, RescanReport,
+    ResolvedTables, RetainedLog, Row, SchemaDelta, SchemaHint, SourceConnector, SourceError,
+    SourcePosition, TableRef, TableSchema,
+};
 use mysql_async::prelude::Queryable;
 use tokio::sync::OnceCell;
 
@@ -210,5 +215,87 @@ impl MySqlConnector {
                 })
             })
             .await
+    }
+}
+
+/// The trait is the inherent methods of the modules: `catalog` (channel A), `start` (the start
+/// position and the dump watch), `position`, `snapshot`, `stream`, `schema` (channels C and D).
+#[async_trait]
+impl SourceConnector for MySqlConnector {
+    async fn preflight(&self) -> Result<Preflight, SourceError> {
+        MySqlConnector::preflight(self).await
+    }
+
+    async fn resolve_tables(&self) -> Result<ResolvedTables, SourceError> {
+        MySqlConnector::resolve_tables(self).await
+    }
+
+    async fn prepare(
+        &self,
+        checkpoint: Option<&Checkpoint>,
+        _tables: &[TableRef],
+    ) -> Result<Prepared, SourceError> {
+        MySqlConnector::prepare(self, checkpoint).await
+    }
+
+    /// The server's write position now: the binlog keeps no position for the pipeline to lose.
+    async fn reset_position(&self) -> Result<SourcePosition, SourceError> {
+        self.position_now().await
+    }
+
+    async fn retained(&self) -> Result<Option<RetainedLog>, SourceError> {
+        MySqlConnector::retained(self).await
+    }
+
+    async fn current_position(&self) -> Result<SourcePosition, SourceError> {
+        self.position_now().await
+    }
+
+    async fn read_chunk(
+        &self,
+        table: &TableSchema,
+        after: Option<&KeysetCursor>,
+        limit: usize,
+    ) -> Result<Chunk, SourceError> {
+        MySqlConnector::read_chunk(self, table, after, limit).await
+    }
+
+    /// `toast_strategy: re_query` is PostgreSQL's: a FULL row image carries every column.
+    async fn fetch_rows(
+        &self,
+        table: &TableSchema,
+        _keys: &[Row],
+    ) -> Result<Vec<Row>, SourceError> {
+        Err(SourceError::Permanent(format!(
+            "table {}: a MySQL source doesn't re-query rows (toast_strategy is PostgreSQL's)",
+            table.table()
+        )))
+    }
+
+    async fn open_stream(
+        &self,
+        from: &SourcePosition,
+        tables: &[TableSchema],
+    ) -> Result<Box<dyn ChangeStream>, SourceError> {
+        Ok(Box::new(
+            MySqlConnector::open_stream(self, from, tables).await?,
+        ))
+    }
+
+    async fn augment(
+        &self,
+        cached: &TableSchema,
+        hint: &SchemaHint,
+    ) -> Result<(SchemaDelta, Option<TableSchema>), SourceError> {
+        MySqlConnector::augment(self, cached, hint).await
+    }
+
+    async fn rescan(&self, known: &[TableSchema]) -> Result<RescanReport, SourceError> {
+        MySqlConnector::rescan(self, known).await
+    }
+
+    /// The source creates nothing for a pipeline: no slot, no publication.
+    async fn teardown(&self) -> Result<(), SourceError> {
+        Ok(())
     }
 }

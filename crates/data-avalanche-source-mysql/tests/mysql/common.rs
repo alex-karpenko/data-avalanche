@@ -174,6 +174,24 @@ pub fn connector(p: &Pipeline) -> MySqlConnector {
     MySqlConnector::new(p).expect("connector")
 }
 
+/// A user `it_<test>` with `grants` (and `extra` statements after them), password `avalanche`.
+pub async fn user(a: &mut mysql_async::Conn, name: &str, grants: &str, extra: &[String]) {
+    a.query_drop(format!("DROP USER IF EXISTS '{name}'@'%'"))
+        .await
+        .unwrap();
+    a.query_drop(format!(
+        "CREATE USER '{name}'@'%' IDENTIFIED BY 'avalanche'"
+    ))
+    .await
+    .unwrap();
+    a.query_drop(format!("GRANT {grants} TO '{name}'@'%'"))
+        .await
+        .unwrap();
+    for s in extra {
+        a.query_drop(s).await.unwrap_or_else(|e| panic!("{s}: {e}"));
+    }
+}
+
 /// The test's database, dropped at the end of a passing test.
 pub async fn cleanup(n: &Names) {
     let mut a = admin_in("avalanche").await;

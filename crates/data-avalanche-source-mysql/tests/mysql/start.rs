@@ -1,0 +1,219 @@
+//! A start's stream position against the target server: the first start, a resume, a checkpoint
+//! in another dialect, from another server or purged, and the heartbeat's watch on the dump.
+
+use std::time::Duration;
+
+use data_avalanche_core::{
+    ChangeStream, Checkpoint, RetainedLog, ServerIdentity, SnapshotReason, SourceConnector,
+    SourceError, SourcePosition, StartPlan,
+};
+use data_avalanche_source_mysql::{Flavour, Mode, MySqlConnector};
+use data_avalanche_testkit::require_it;
+use mysql_async::prelude::Queryable;
+
+use crate::common::{cleanup, connector, fresh, pipeline, pipeline_as, target, user};
+
+const RE_SNAPSHOT: &str = ", binlog_purge_action: re_snapshot";
+
+/// Another server of the target's flavour.
+fn elsewhere() -> ServerIdentity {
+    match target().flavour {
+        Flavour::Mysql => ServerIdentity::Mysql {
+            server_uuid: "00000000-0000-0000-0000-000000000001".into(),
+        },
+        Flavour::Mariadb => ServerIdentity::Mariadb {
+            server_id: u32::MAX,
+        },
+    }
+}
+
+/// A checkpoint `c` can't read: a GTID set where it reads files, a file where it reads GTIDs.
+async fn foreign(c: &MySqlConnector) -> SourcePosition {
+    let tagged = match c.mode().await.unwrap() {
+        Mode::File => "mysql-gtid:3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5",
+        _ => "binlog:binlog.000001:4",
+    };
+    SourcePosition::parse_tagged(tagged).unwrap()
+}
+
+/// `prepare` for `checkpoint` through the trait.
+async fn prepare(c: &MySqlConnector, checkpoint: &Checkpoint) -> Result<StartPlan, SourceError> {
+    SourceConnector::prepare(c, Some(checkpoint), &[])
+        .await
+        .map(|p| p.plan)
+}
+
+#[tokio::test]
+async fn a_first_start_snapshots_and_records_the_server_then_resumes() {
+    require_it!();
+    let (n, _a) = fresh("start_first", "CREATE TABLE t (id INT PRIMARY KEY)").await;
+    let c = connector(&pipeline(&n, &["t"], "", ""));
+    let identity = c.server_identity().await.unwrap();
+    let first = SourceConnector::prepare(&c, None, &[])
+        .await
+        .expect("prepare");
+    let StartPlan::Snapshot { from, reason } = first.plan else {
+        panic!("a snapshot, got {:?}", first.plan)
+    };
+    assert_eq!(reason, SnapshotReason::FirstStart);
+    assert_eq!(from.dialect(), c.mode().await.unwrap().dialect());
+    assert_eq!(first.server.as_ref(), Some(&identity));
+    let again = SourceConnector::prepare(
+        &c,
+        Some(&Checkpoint {
+            position: from.clone(),
+            server: first.server,
+        }),
+        &[],
+    )
+    .await
+    .expect("resume");
+    assert_eq!(again.plan, StartPlan::Resume);
+    assert!(again.added.is_empty() && again.warnings.is_empty());
+    assert_eq!(again.server, Some(identity));
+    // A lost position is replaced by the write position now.
+    let reset = c.reset_position().await.unwrap();
+    assert!(reset.covers(&from).unwrap(), "{reset} covers {from}");
+    cleanup(&n).await;
+}
+
+#[tokio::test]
+async fn a_checkpoint_in_another_dialect_follows_the_purge_action() {
+    require_it!();
+    let (n, _a) = fresh("start_dialect", "").await;
+    let halts = connector(&pipeline(&n, &["t"], "", ""));
+    let cp = Checkpoint {
+        position: foreign(&halts).await,
+        server: Some(halts.server_identity().await.unwrap()),
+    };
+    match prepare(&halts, &cp).await {
+        Err(SourceError::Permanent(m)) => {
+            assert!(
+                m.contains("now reads") && m.contains("binlog_purge_action is error"),
+                "{m}"
+            )
+        }
+        other => panic!("a halt, got {other:?}"),
+    }
+    let recovers = connector(&pipeline(&n, &["t"], "", RE_SNAPSHOT));
+    match prepare(&recovers, &cp).await {
+        Err(SourceError::PositionUnreachable { position, .. }) => {
+            assert_eq!(position, cp.position.to_tagged())
+        }
+        other => panic!("unreachable, got {other:?}"),
+    }
+    cleanup(&n).await;
+}
+
+/// File/position mode halts on a checkpoint from another server; GTIDs carry across servers.
+#[tokio::test]
+async fn a_checkpoint_from_another_server() {
+    require_it!();
+    let (n, _a) = fresh("start_server", "").await;
+    let c = connector(&pipeline(&n, &["t"], "", RE_SNAPSHOT));
+    let position = c.position_now().await.unwrap();
+    for server in [Some(elsewhere()), None] {
+        let cp = Checkpoint {
+            position: position.clone(),
+            server,
+        };
+        match (c.mode().await.unwrap(), prepare(&c, &cp).await) {
+            (Mode::File, Err(SourceError::Permanent(m))) => {
+                assert!(m.starts_with("BINLOG_SOURCE_CHANGED: "), "{m}")
+            }
+            (Mode::MysqlGtid | Mode::MariadbGtid, Ok(StartPlan::Resume)) => {}
+            other => panic!("{cp:?}: {other:?}"),
+        }
+    }
+    cleanup(&n).await;
+}
+
+/// A binlog file the server doesn't hold (GTID purges need a purge on the server:
+/// `tests/mysql_global.rs`).
+#[tokio::test]
+async fn a_purged_file_follows_the_purge_action() {
+    require_it!();
+    let (n, _a) = fresh("start_purged", "").await;
+    let halts = connector(&pipeline(&n, &["t"], "", ""));
+    let SourcePosition::BinlogFile(now) = halts.position_now().await.unwrap() else {
+        return;
+    };
+    let cp = Checkpoint {
+        position: SourcePosition::parse_tagged(&format!("binlog:{}.000000:4", now.base())).unwrap(),
+        server: Some(halts.server_identity().await.unwrap()),
+    };
+    match prepare(&halts, &cp).await {
+        Err(SourceError::Permanent(m)) => assert!(
+            m.contains("is no longer on the server") && m.contains("binlog_purge_action is error"),
+            "{m}"
+        ),
+        other => panic!("a halt, got {other:?}"),
+    }
+    let recovers = connector(&pipeline(&n, &["t"], "", RE_SNAPSHOT));
+    assert!(matches!(
+        prepare(&recovers, &cp).await,
+        Err(SourceError::PositionUnreachable { .. })
+    ));
+    cleanup(&n).await;
+}
+
+/// Polls `retained` until it reads `streamed`.
+async fn watch(c: &MySqlConnector, streamed: bool) {
+    for _ in 0..50 {
+        let r = c.retained().await.expect("retained");
+        if r == Some(RetainedLog { bytes: 0, streamed }) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("retained never read streamed: {streamed}");
+}
+
+/// The watch finds the dump by its connection id, as a user without `PROCESS`; a dump the server
+/// ended reads as not streamed before the stream hears of it (DA-SRC-16).
+#[tokio::test]
+async fn the_watch_finds_the_dump_by_its_connection() {
+    require_it!();
+    let (n, mut a) = fresh("start_watch", "CREATE TABLE t (id INT PRIMARY KEY)").await;
+    let name = "it_start_watch";
+    user(
+        &mut a,
+        name,
+        "SELECT, REPLICATION CLIENT, REPLICATION SLAVE ON *.*",
+        &[],
+    )
+    .await;
+    let c = connector(&pipeline_as(
+        &n,
+        name,
+        "      ssl_mode: disable",
+        "",
+        &["t"],
+        "",
+    ));
+    watch(&c, false).await;
+    let tables = c.resolve_tables().await.unwrap().tables;
+    let from = c.position_now().await.unwrap();
+    let mut s = c.open_stream(&from, &tables).await.expect("stream");
+    watch(&c, true).await;
+    let id = c.dump_id().expect("the dump's id");
+    a.query_drop(format!("KILL {id}")).await.unwrap();
+    watch(&c, false).await;
+    // What the server sent before the kill comes first.
+    let e = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let Err(e) = s.next().await {
+                return e;
+            }
+        }
+    })
+    .await
+    .expect("the stream ends");
+    assert!(e.is_transient(), "{e}");
+    let _ = Box::new(s).close().await;
+    assert_eq!(c.dump_id(), None);
+    a.query_drop(format!("DROP USER '{name}'@'%'"))
+        .await
+        .unwrap();
+    cleanup(&n).await;
+}
