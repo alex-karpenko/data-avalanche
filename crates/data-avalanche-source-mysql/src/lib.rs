@@ -12,6 +12,7 @@ mod error;
 pub mod json;
 pub mod position;
 pub mod server;
+mod snapshot;
 pub mod types;
 pub mod value;
 

@@ -215,7 +215,7 @@ impl MySqlConnector {
                                     "SELECT TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, DATA_TYPE,
                                             COLUMN_TYPE, CHARACTER_SET_NAME, NUMERIC_PRECISION,
                                             NUMERIC_SCALE, DATETIME_PRECISION,
-                                            CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE
+                                            CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE, COLLATION_NAME
                                        FROM information_schema.COLUMNS
                                       WHERE TABLE_SCHEMA = ? AND TABLE_NAME IN ({list})
                                       ORDER BY TABLE_NAME, ORDINAL_POSITION"
@@ -263,6 +263,7 @@ impl MySqlConnector {
                     fsp: r.get(8).flatten(),
                     max_length: r.get(9).flatten(),
                     nullable: r.get::<String, _>(10).is_some_and(|n| n == "YES"),
+                    collation: r.get(11).flatten(),
                 });
             }
             for (table, column) in keys {

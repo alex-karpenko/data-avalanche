@@ -20,6 +20,8 @@ pub struct CatalogColumn {
     pub column_type: String,
     /// `CHARACTER_SET_NAME`, for character columns.
     pub charset: Option<String>,
+    /// `COLLATION_NAME`, for character columns: the order a snapshot reads a text key in.
+    pub collation: Option<String>,
     /// `NUMERIC_PRECISION` / `NUMERIC_SCALE`, for decimals.
     pub precision: Option<u32>,
     pub scale: Option<u32>,

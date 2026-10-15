@@ -562,7 +562,17 @@ fn value(d: &Decode, raw: Raw, identifier: bool) -> Result<ColumnValue, ValueErr
                 },
             }
         }
-        Decode::Bool => V::Bool(raw != Raw::Int(0)),
+        // A key value other than 0 or 1 halts the table: as a boolean, two keys would be one
+        // (as a key value that clamps, Q-M5-18).
+        Decode::Bool => match raw {
+            Raw::Int(n) if identifier && n != 0 && n != 1 => {
+                return Err(bad(format!(
+                    "a TINYINT(1) key value {n} isn't 0 or 1, and two keys would be one boolean; \
+                     turn tinyint1_as_bool off or override the column"
+                )));
+            }
+            raw => V::Bool(raw != Raw::Int(0)),
+        },
         Decode::Int { bits, unsigned } => {
             let Raw::Int(n) = raw else {
                 return Err(bad(format!("an integer read {raw:?}")));
@@ -684,6 +694,18 @@ mod tests {
 
     fn b(s: &[u8]) -> Value {
         Value::Bytes(s.to_vec())
+    }
+
+    #[test]
+    fn a_boolean_key_other_than_0_or_1_is_unrepresentable() {
+        let key = |v| decode(&Decode::Bool, Input::Row(&Value::Int(v)), true);
+        assert_eq!(key(1), Ok(ColumnValue::Bool(true)));
+        assert_eq!(key(0), Ok(ColumnValue::Bool(false)));
+        assert!(matches!(key(2), Err(ValueError::Unrepresentable(_))));
+        assert_eq!(
+            row(&Decode::Bool, Value::Int(2)),
+            Ok(ColumnValue::Bool(true))
+        );
     }
 
     #[test]
