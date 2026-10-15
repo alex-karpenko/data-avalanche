@@ -1827,6 +1827,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "serde_json",
+ "sqlparser",
  "thiserror 2.0.21",
  "tokio",
  "uuid",
