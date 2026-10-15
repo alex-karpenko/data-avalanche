@@ -253,10 +253,8 @@ impl MySqlConnector {
                         .get::<String, _>(3)
                         .unwrap_or_default()
                         .to_ascii_lowercase(),
-                    column_type: r
-                        .get::<String, _>(4)
-                        .unwrap_or_default()
-                        .to_ascii_lowercase(),
+                    // As the server spells it: ENUM and SET labels keep their case.
+                    column_type: r.get(4).unwrap_or_default(),
                     charset: r.get(5).flatten(),
                     precision: r.get(6).flatten(),
                     scale: r.get(7).flatten(),

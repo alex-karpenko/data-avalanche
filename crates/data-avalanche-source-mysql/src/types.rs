@@ -16,7 +16,8 @@ pub struct CatalogColumn {
     pub name: String,
     /// `DATA_TYPE`, lower case: `int`, `varchar`, `enum`, MariaDB `uuid`, `inet6`.
     pub data_type: String,
-    /// `COLUMN_TYPE`: `int unsigned`, `tinyint(1)`, `enum('a','b')`, `binary(4)`.
+    /// `COLUMN_TYPE` as the server spells it: `int unsigned`, `tinyint(1)`, `enum('Active','b')`,
+    /// `binary(4)`. ENUM and SET labels keep their case; keywords compare without it.
     pub column_type: String,
     /// `CHARACTER_SET_NAME`, for character columns.
     pub charset: Option<String>,
@@ -77,7 +78,7 @@ impl CatalogColumn {
             .split(['(', ' '])
             .next()
             .unwrap_or_default()
-            .to_owned();
+            .to_ascii_lowercase();
         let args = arguments(&column_type);
         let number = |i: usize| args.get(i).and_then(|a| a.parse::<u32>().ok());
         let (mut precision, mut scale, mut fsp, mut max_length) = (None, None, None, None);
@@ -102,8 +103,13 @@ impl CatalogColumn {
         }
     }
 
+    /// `COLUMN_TYPE` lower case, for its keywords (not for ENUM or SET labels).
+    fn keywords(&self) -> String {
+        self.column_type.to_ascii_lowercase()
+    }
+
     fn unsigned(&self) -> bool {
-        self.column_type.contains("unsigned")
+        self.keywords().contains("unsigned")
     }
 
     fn fsp(&self) -> u8 {
@@ -187,7 +193,7 @@ fn plan(
     let unsigned = c.unsigned();
     let fsp = c.fsp();
     let (t, d) = match c.data_type.as_str() {
-        "tinyint" if tinyint1_as_bool && !unsigned && c.column_type.starts_with("tinyint(1)") => {
+        "tinyint" if tinyint1_as_bool && !unsigned && c.keywords().starts_with("tinyint(1)") => {
             (V::Bool, Decode::Bool)
         }
         "tinyint" => int(8, unsigned),
@@ -500,6 +506,39 @@ mod tests {
         assert_eq!(members("set('it''s','a,b')"), ["it's", "a,b"]);
         assert_eq!(members("enum('it''s','x\\\\y','')"), ["it's", "x\\y", ""]);
         assert_eq!(members("enum()"), Vec::<String>::new());
+        // Labels keep their case, quoted or doubled.
+        assert_eq!(
+            members("enum('Active','b','It''S','ÇA')"),
+            ["Active", "b", "It'S", "ÇA"]
+        );
+    }
+
+    #[test]
+    fn enum_and_set_labels_keep_their_case_and_keywords_compare_without_it() {
+        assert_eq!(
+            planned(&col("enum", "enum('Active','b')")).1,
+            Decode::Enum {
+                members: vec!["Active".into(), "b".into()]
+            }
+        );
+        assert_eq!(
+            planned(&col("set", "set('X','y')")).1,
+            Decode::Set {
+                members: vec!["X".into(), "y".into()]
+            }
+        );
+        assert_eq!(planned(&col("int", "INT UNSIGNED")).0, V::Int64);
+        assert_eq!(planned(&col("tinyint", "TINYINT(1)")).0, V::Bool);
+        // A schema column planned from its `source_type` keeps the labels too.
+        let c = CatalogColumn::from_schema(&ColumnSchema::new(
+            "e",
+            V::Text,
+            "enum('Active','b') character set utf8mb4",
+        ));
+        assert_eq!(
+            (c.data_type.as_str(), members(&c.column_type)),
+            ("enum", vec!["Active".to_owned(), "b".to_owned()])
+        );
     }
 
     #[test]

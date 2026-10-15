@@ -5,6 +5,9 @@
 //! classifier couldn't read the statement, the whole catalog table is the change, and a rename
 //! reads as a drop and an add (§6, degraded with a warning by the evolver).
 //!
+//! Column names compare without case, as MySQL's do; a result keeps the catalog's spelling, and
+//! a change of case alone (`CHANGE a A`) is a rename.
+//!
 //! The catalog may be ahead of the stream (§0): a scoped change takes only its columns from it.
 //! The stream checks every table map against the schema, so a change taken early (a later DDL's
 //! column) halts the table instead of misreading rows.
@@ -71,6 +74,16 @@ pub fn narrowed(from: &ColumnSchema, to: &ColumnSchema) -> bool {
     }
 }
 
+/// Whether two column names are one: MySQL compares them without case.
+fn same(a: &str, b: &str) -> bool {
+    a == b || a.to_lowercase() == b.to_lowercase()
+}
+
+/// The column of `s` named `name`, without case.
+fn column<'a>(s: &'a TableSchema, name: &str) -> Option<&'a ColumnSchema> {
+    s.columns().iter().find(|c| same(&c.name, name))
+}
+
 fn guess(column: &str, why: &str) -> HaltReason {
     HaltReason::SchemaMismatch {
         column: column.into(),
@@ -96,16 +109,16 @@ pub fn scope(
         return Ok(now.clone());
     };
     for (old, _) in renames {
-        if cached.column(old).is_none() {
+        if column(cached, old).is_none() {
             return Err(guess(old, "a renamed column the schema doesn't have"));
         }
     }
-    let target = |n: &str| renames.iter().find(|(o, _)| o == n).map(|(_, r)| r);
-    let taken = |n: &str| renames.iter().any(|(_, r)| r == n);
+    let target = |n: &str| renames.iter().find(|(o, _)| same(o, n)).map(|(_, r)| r);
+    let taken = |n: &str| renames.iter().any(|(_, r)| same(r, n));
     let mut columns: Vec<ColumnSchema> = vec![];
     for c in cached.columns() {
         match target(&c.name) {
-            Some(new) => match now.column(new) {
+            Some(new) => match column(now, new) {
                 Some(n) => columns.push(n.clone()),
                 None => {
                     return Err(guess(
@@ -118,10 +131,10 @@ pub fn scope(
             None => columns.push(c.clone()),
         }
     }
-    let renamed = |n: &String| renames.iter().any(|(o, r)| o == n || r == n);
+    let renamed = |n: &String| renames.iter().any(|(o, r)| same(o, n) || same(r, n));
     for name in names.iter().filter(|n| !renamed(n)) {
-        let at = columns.iter().position(|c| &c.name == name);
-        match (at, now.column(name)) {
+        let at = columns.iter().position(|c| same(&c.name, name));
+        match (at, column(now, name)) {
             (Some(at), Some(c)) => columns[at] = c.clone(),
             (Some(at), None) => {
                 columns.remove(at);
@@ -137,9 +150,9 @@ pub fn scope(
     }
     // The binlog's rows are positional: each scoped column goes after the nearest column before
     // it in the catalog that the schema has, in the catalog's order.
-    let scoped = |n: &str| names.iter().any(|x| x == n) || taken(n);
+    let scoped = |n: &str| names.iter().any(|x| same(x, n)) || taken(n);
     for c in now.columns().iter().filter(|c| scoped(&c.name)) {
-        let Some(at) = columns.iter().position(|x| x.name == c.name) else {
+        let Some(at) = columns.iter().position(|x| same(&x.name, &c.name)) else {
             continue;
         };
         let moved = columns.remove(at);
@@ -147,7 +160,7 @@ pub fn scope(
             .columns()
             .iter()
             .take_while(|x| x.name != c.name)
-            .filter_map(|x| columns.iter().position(|y| y.name == x.name))
+            .filter_map(|x| columns.iter().position(|y| same(&y.name, &x.name)))
             .last();
         columns.insert(before.map_or(0, |b| b + 1), moved);
     }
@@ -170,7 +183,8 @@ fn members_change(column: &str, from: &CatalogColumn, to: &CatalogColumn) -> Opt
     })
 }
 
-/// `cached` → `new` as changes, columns matched by name and by the proven `renames`.
+/// `cached` → `new` as changes, columns matched by name (without case) and by the proven
+/// `renames`. A column whose name changed only its case is renamed.
 pub fn diff(
     cached: &TableSchema,
     new: &TableSchema,
@@ -180,21 +194,22 @@ pub fn diff(
     fn target<'a>(renames: &'a [(String, String)], name: &'a str) -> &'a str {
         renames
             .iter()
-            .find(|(o, _)| o == name)
+            .find(|(o, _)| same(o, name))
             .map_or(name, |(_, n)| n.as_str())
     }
     // `DROP b, CHANGE a b`: the old `b` goes before `a` takes its name.
-    let taken =
-        |n: &str| !renames.iter().any(|(o, _)| o == n) && renames.iter().any(|(_, r)| r == n);
+    let taken = |n: &str| {
+        !renames.iter().any(|(o, _)| same(o, n)) && renames.iter().any(|(_, r)| same(r, n))
+    };
     for c in cached.columns().iter().filter(|c| taken(&c.name)) {
         changes.push(SchemaChange::DropColumn(c.name.clone()));
     }
     for c in cached.columns().iter().filter(|c| !taken(&c.name)) {
-        let to = target(renames, &c.name);
-        let Some(n) = new.column(to) else {
+        let Some(n) = column(new, target(renames, &c.name)) else {
             changes.push(SchemaChange::DropColumn(c.name.clone()));
             continue;
         };
+        let to = n.name.as_str();
         if to != c.name {
             changes.push(SchemaChange::RenameColumn {
                 from: c.name.clone(),
@@ -226,9 +241,9 @@ pub fn diff(
             _ => {}
         }
     }
-    let renamed_to = |n: &str| renames.iter().any(|(_, r)| r == n);
+    let renamed_to = |n: &str| renames.iter().any(|(_, r)| same(r, n));
     for n in new.columns() {
-        if cached.column(&n.name).is_none() && !renamed_to(&n.name) {
+        if column(cached, &n.name).is_none() && !renamed_to(&n.name) {
             changes.push(SchemaChange::AddColumn(n.clone()));
         }
     }
@@ -238,7 +253,10 @@ pub fn diff(
             .map(|k| target(renames, k).to_owned())
             .collect()
     };
-    if identifier(cached) != new.identifier() {
+    let kept = identifier(cached);
+    if kept.len() != new.identifier().len()
+        || kept.iter().zip(new.identifier()).any(|(a, b)| !same(a, b))
+    {
         changes.push(SchemaChange::IdentifierChanged);
     }
     changes
@@ -558,6 +576,17 @@ mod tests {
             &d[1],
             SchemaChange::ChangeType { narrowed: true, .. }
         ));
+        // A member that changed only its case is a change.
+        let d = diff(
+            &cached,
+            &changed(
+                "enum('A','b') character set utf8mb4",
+                "varchar(100) character set latin1",
+                "decimal(10,2)",
+            ),
+            &[],
+        );
+        assert_eq!(d, [SchemaChange::EnumValuesChanged("e".into())]);
         let mut keyed = cached.columns().to_vec();
         keyed[1].nullable = false;
         let rekeyed = TableSchema::new(
@@ -573,6 +602,49 @@ mod tests {
                 SchemaChange::IdentifierChanged
             ]
         );
+    }
+
+    #[test]
+    fn column_names_compare_without_case() {
+        let cached = table(vec![
+            col("price", V::Int32, "int", 2),
+            col("a", V::Int32, "int", 3),
+        ]);
+        // `MODIFY COLUMN Price BIGINT` on `price`: the column is scoped, in the catalog's spelling.
+        let now = table(vec![
+            col("price", V::Int64, "bigint", 2),
+            col("a", V::Int32, "int", 3),
+        ]);
+        let s = scope(&cached, &cols(&["Price"]), &[], &now).unwrap();
+        assert_eq!(names(&s), ["id", "price", "a"]);
+        assert!(matches!(
+            diff(&cached, &s, &[]).as_slice(),
+            [SchemaChange::ChangeType { column, .. }] if column == "price"
+        ));
+        // `CHANGE a A INT`: a change of case alone stays a rename.
+        let now = table(vec![
+            col("price", V::Int32, "int", 2),
+            col("A", V::Int32, "int", 3),
+        ]);
+        let renames = [("a".to_owned(), "A".to_owned())];
+        let s = scope(&cached, &cols(&["a", "A"]), &renames, &now).unwrap();
+        assert_eq!(names(&s), ["id", "price", "A"]);
+        assert_eq!(
+            diff(&cached, &s, &renames),
+            [SchemaChange::RenameColumn {
+                from: "a".into(),
+                to: "A".into(),
+                proven: true
+            }]
+        );
+        // A statement's spelling of a renamed column finds it too.
+        let renames = [("PRICE".to_owned(), "cost".to_owned())];
+        let now = table(vec![
+            col("cost", V::Int32, "int", 2),
+            col("a", V::Int32, "int", 3),
+        ]);
+        let s = scope(&cached, &cols(&["PRICE", "cost"]), &renames, &now).unwrap();
+        assert_eq!(names(&s), ["id", "cost", "a"]);
     }
 
     #[test]

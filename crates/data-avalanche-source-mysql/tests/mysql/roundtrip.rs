@@ -141,6 +141,9 @@ const COLUMNS: &[Column] = &[
     ("yr", "YEAR", "1901", "2155", "2026"),
     ("en", "ENUM('a','b','ç')", "'a'", "'ç'", "'b'"),
     ("st", "SET('x','y','z')", "''", "'x,y,z'", "'y'"),
+    // Labels keep their case through the binlog's index and bitmap.
+    ("enc", "ENUM('Active','b','Zz')", "'Active'", "'Zz'", "'b'"),
+    ("stc", "SET('X','y')", "'X'", "'X,y'", "'y'"),
     ("bt1", "BIT(1)", "b'0'", "b'1'", "b'1'"),
     ("bt64", "BIT(64)", "0", "18446744073709551615", "5"),
     (
@@ -324,6 +327,10 @@ async fn every_type_reads_the_same_from_the_stream_and_a_chunk() {
     assert_eq!(high.get("b"), Some(&ColumnValue::Bool(true)));
     assert_eq!(high.get("bt64"), Some(&ColumnValue::Bytes(vec![0xff; 8])));
     assert_eq!(chunk.rows[0].get("bi"), Some(&ColumnValue::Int64(i64::MIN)));
+    assert_eq!(
+        chunk.rows[0].get("enc"),
+        Some(&ColumnValue::Text("Active".into()))
+    );
     assert!(
         chunk.rows[2]
             .0

@@ -35,7 +35,8 @@ async fn walk(c: &MySqlConnector, t: &TableSchema, limit: usize) -> (Vec<Row>, V
 
 /// Key types and values chosen where a cursor parameter could go wrong: past `i64`, digits a
 /// double loses, case and accents under the column's collation, latin1 above ASCII, trailing zero
-/// bytes, the clock ranges' ends, negative times, ENUM and SET in member order, BIT as a number.
+/// bytes, the clock ranges' ends, negative times, ENUM (upper-case labels too) and SET in member
+/// order, BIT as a number.
 const KEYS: &[(&str, &str, &str)] = &[
     (
         "bu",
@@ -81,6 +82,7 @@ const KEYS: &[(&str, &str, &str)] = &[
     ),
     ("y", "YEAR", "1901, 2155, '0000', 1999"),
     ("e", "ENUM('z','a','m')", "'z', 'a', 'm'"),
+    ("eu", "ENUM('Zed','a','M')", "'Zed', 'a', 'M'"),
     ("st", "SET('x','y','z')", "'', 'x', 'y,z', 'x,z', 'z'"),
     ("bt", "BIT(10)", "0, 1, 512, 1023, 2"),
     ("f", "FLOAT", "-1.5, 0.1, 3.4e38, 0"),
