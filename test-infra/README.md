@@ -44,6 +44,25 @@ the `verify-ca` test needs), and a client certificate for the role
 client pair to `test-infra/.tls/` (git-ignored) for the TLS tests; the server key stays in the
 container. Nothing is committed.
 
+## MySQL and MariaDB
+
+The MySQL source's tests (`crates/data-avalanche-source-mysql/tests`) read the target
+`DATA_AVALANCHE_MYSQL`: a server of the table above and the replication mode the tests use on it.
+`ci.yml` runs them on every change against `mysql-84` (the default), `mysql-84-nogtid`
+(file/position), `mariadb-118` (GTID) and `mariadb-118-binlog` (`mariadb-118` in file/position
+mode); `.github/workflows/weekly.yml` runs `mariadb-114` and `mariadb-1011` (GTID) every Monday:
+
+```sh
+docker compose -f test-infra/compose.yaml --profile matrix up -d --wait mariadb-114
+DATA_AVALANCHE_IT=1 DATA_AVALANCHE_MYSQL=mariadb-114 cargo test -p data-avalanche-source-mysql --tests
+```
+
+The TLS tests run with the `mysql-84` target only, against `mysql-tls`. Two test binaries change
+server-wide state, and cargo runs each alone, never beside the `mysql` tests: `binlog_purge`
+(`PURGE BINARY LOGS` removes the older binlogs of the target) and `mariadb_compress` (turns
+`log_bin_compress` on, and back to the server default before it asserts). MariaDB keeps a binlog
+it just closed until its binlog checkpoint moves on, so the purge test retries for up to 5 s.
+
 ## GCS: a real bucket, not an emulator
 
 `fake-gcs-server` 1.56.1 rejects `object_store`'s path-style PUT (`400 invalid uploadType`) and
