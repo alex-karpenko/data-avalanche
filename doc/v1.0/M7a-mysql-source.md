@@ -14760,3 +14760,10 @@ git commit -m "ci: the MySQL source on four targets per change, MariaDB 11.4 and
   `a_block_inflating_past_its_header_is_refused`). Folded into Task 6's commit; no later task
   touches `binlog.rs`. With Task 4's test, the crate's lib test count from Task 6 on is three
   above the plan's figures (Task 6: 29, not 26).
+- **Task 7, the review fix (2026-10-15, approved by Oleksii).** A `SET` value from the binlog
+  became labels only for the bits that have members, so a set bit beyond them (a member list
+  older than the row) was dropped without a word, while an `ENUM` index beyond its members is an
+  error. Now such a bit is an error too (`SET bit N of M members`), and the pipeline halts. One
+  assertion in the existing test of ENUM, SET and JSON values; the lib test count is unchanged
+  (Task 7: 44, the plan's 41 plus the three earlier tests). Folded into Task 7's commit; later
+  tasks' hunks in `value.rs` are far from it and apply unchanged.
