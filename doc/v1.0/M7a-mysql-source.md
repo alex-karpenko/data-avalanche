@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-14
+updated: 2026-10-16
 domain: Data Flow
 tags: [v1, implementation-plan, m7a, mysql, mariadb, binlog, gtid, file-position, snapshot, type-mapping, ddl-classifier, tls]
 resolves: []

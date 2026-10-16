@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-14
+updated: 2026-10-16
 domain: Architecture
 tags: [gap-analysis, design, re-derivation, spec-readiness, blockers, open-decisions]
 resolves: []
@@ -128,14 +128,14 @@ does not block starting the specification.
 > Recounted 2026-09-26 (v1 readiness tidy, §26); the 2026-06 figures are superseded. Open count
 > updated 2026-10-02 for the gaps M5 carried (§27), 2026-10-03 for DA-SNAP-9 and DA-SNAP-10 (§28),
 > 2026-10-07 for the M6a whole-branch review (§28.2), 2026-10-08 for M6b's planning findings
-> (§29), 2026-10-13 for M6b's exit (§30), 2026-10-14 for M7's planning (§31), and 2026-10-14 for
-> M7a's plan (§32).
+> (§29), 2026-10-13 for M6b's exit (§30), 2026-10-14 for M7's planning (§31), 2026-10-14 for
+> M7a's plan (§32), and 2026-10-16 for M7a's exit (§33).
 
 | Status | Count (v1 scope) | Notes |
 |---|---|---|
 | ✅ Resolved | the large majority | Design closed by a research/spec doc or a probe. |
 | 🔄 Partial | 3 | DA-SNAP-7, DA-SRC-9 (neither blocks the plan); DA-SNAP-10 2026-10-14 (decided and measured, built and tested in M7a's plan, §31, §32). DA-MS-3 is a decided caveat. DA-X-8 ✅ 2026-09-26; DA-SRC-16 and DA-X-12 ✅ 2026-10-13 (§30). |
-| 🟥 Open (v1) | **17** | DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2); DA-CLUS-14, DA-API-11, DA-OPS-7 and DA-SRC-20 🆕 2026-10-13 (§30.1); DA-SRC-21 🆕 2026-10-14 (§31.2); DA-SRC-22, DA-SNAP-14 and DA-X-13 🆕 2026-10-14 (§32.1). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
+| 🟥 Open (v1) | **20** | DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2); DA-CLUS-14, DA-API-11, DA-OPS-7 and DA-SRC-20 🆕 2026-10-13 (§30.1); DA-SRC-21 🆕 2026-10-14 (§31.2); DA-SRC-22, DA-SNAP-14 and DA-X-13 🆕 2026-10-14 (§32.1); DA-SRC-24…26 🆕 2026-10-16 (§33.1). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
 | 🧪 Verify (v1) | **0** | DA-SRC-10/11 proven 2026-09-26 (§21). |
 | ⏭ v2 | 13 | Iceberg-sink items (§26.2). |
 | 🟢 Spec-merge debt | **0** | All applied 2026-09-26 (§26.6): §19.3 S-1…S-6, the DA-X-8 config residual, the D-V1 patches and the Data-Flow Phase 2a probe details. |
@@ -394,6 +394,9 @@ the MySQL path with one genuine correctness dependency.
 | DA-SRC-22 | 🆕 MySQL `ssl_mode: verify-ca` checks the host name too | 🟢 | 🟥 | §32.1. `mysql_async` 0.37.1 skips the name check only for an error whose text contains `NotValidForName`; rustls 0.23 prints `certificate not valid for name`. So `verify-ca` acts as `verify-full` and refuses a connection by an address the certificate doesn't name. Fails closed (pinned by a test in M7a); M5 met the same in the PostgreSQL replication connection. | — |
 | DA-SRC-23 | 🆕 `mysql_common` reads MariaDB's compressed events as nothing | 🟡 | ✅ | §32. With `log_bin_compress` on, MariaDB writes `QUERY_COMPRESSED` and `*_ROWS_COMPRESSED_V1` events (165–168); `mysql_common` 0.37.3 returns no data for them, a silent loss (measured on 11.8 and 10.11). Closed by design (Q-M7a-5): the source decompresses them itself (M7a Task 6); the v2 types (169–171), never seen, halt. | — |
 | DA-SRC-21 | 🆕 MariaDB's file/position identity is `@@server_id` alone, and ids repeat across servers | 🟢 | 🟥 | §31.2. A pipeline in `binlog` mode pointed at another MariaDB with the same `server_id` resumes at a file and offset that mean nothing there, and BINLOG_SOURCE_CHANGED doesn't fire. Candidate check: compare `BINLOG_GTID_POS(file, pos)` with the GTID state recorded at the position. GTID mode (the default) doesn't depend on it. | — |
+| DA-SRC-24 | 🆕 A Galera node with `log_slave_updates` off isn't detected as a replica | 🟢 | 🟥 | §33.1. The binlog-coverage precondition (config §11.2) reads `SHOW ALL REPLICAS STATUS` when `log_slave_updates` is off; a Galera node applies its peers' writesets without a replica connection, so the status is empty and the check passes, while its binlog lacks the other nodes' changes. Check `wsrep_on` too. | — |
+| DA-SRC-25 | 🆕 A case-only column rename reads as a rename | 🟢 | 🟥 | §33.1. Column names compare without case (as MySQL's do), so a column whose name changed in case alone diffs as a proven `RenameColumn`; the Delta sink doesn't apply renames, so the table halts or degrades for what is, to MySQL, the same column. Candidate: a case-only rename updates the cached name without an evolution. | — |
+| DA-SRC-26 | 🆕 A MariaDB rollback after tracked rows halts the pipeline | 🟢 | 🟥 | §33.1. MariaDB logs the rows a rollback undid in a transaction with non-transactional changes, then `ROLLBACK TO` or `ROLLBACK` (measured, 10.11–11.8); M7a halts on one with tracked rows, since the stream already emitted them. Fail-closed, but a false halt for a tracked MyISAM table (whose rows stand) and an outage for an application using savepoints across engines. Candidate: hold a transaction's rows until its end, drop those after the savepoint, keep a non-transactional table's. | — |
 
 ---
 
@@ -1684,3 +1687,33 @@ the dump is watched by its connection id).
 | DA-SRC-22 | MySQL `verify-ca` checks the host name too (`mysql_async` 0.37.1's name-error match misses rustls 0.23's text): it fails closed, so a `verify-ca` connection by an unnamed address is refused | 🟢 | M7a Task 4 (pinned by `verify_ca_by_an_unnamed_address_is_refused_like_verify_full`) | An upstream fix, or our own rustls verifier for `verify-ca`; the test notices when an upgrade lifts it |
 | DA-SNAP-14 | An `ENUM` key sorts by member index; a member reorder between the DDL and the stream's signal can make the next chunk skip or repeat rows (the chunk's read plan compares value types only) | 🟢 | M7a Task 10 (reasoned, not measured) | Record the members with the cursor and halt the table when they differ, or key an `ENUM` cursor by label |
 | DA-X-13 | One slice-1 E2E run beside a heavy build failed `streaming::a_large_transaction_lands_at_once`: the 50,000-row transaction counted more than one Delta commit, though its rows were never seen in part. Alone and in a full run without the load it passed | 🟢 | M7a planning, on the final scratch tree | Watch CI; if it recurs, find what made the second commit (a marker or position commit beside the transaction's) |
+
+---
+
+## 33. M7a MySQL source — the exit (2026-10-16)
+
+M7a (`doc/v1.0/M7a-mysql-source.md`) was executed 2026-10-14…16: 16 tasks, review fixes on Tasks
+4, 6, 7, 11, 12 and 13, then a whole-branch review with one Critical and five Important findings,
+all fixed before the PR, as were its re-review's residuals (the plan's "Deviations during
+execution"). The Critical: ENUM and SET labels lost their case in the stream. Two spec patches
+(Oleksii, 2026-10-15/16): `binlog_row_metadata = FULL` is required, and the binlog must carry the
+source's changes (no binlog filter; a replica logs what it applies). The crate's suites pass on
+MySQL 8.4 (GTIDs on and off) and MariaDB 11.8 (both modes), 11.4 and 10.11.
+
+| ID | Change | Evidence |
+|---|---|---|
+| DA-SNAP-10 | 🔄 (stays): built and tested; ✅ when M7a merges | M7a Task 10 |
+| DA-SRC-12 | ✅ (stays): the fault-injection E2E is M7b's | M7a Task 6, Task 13 |
+| DT-R6 | Resolved: `binlog_row_metadata = FULL` is required, and each table map is checked against the decode schema (names, signedness, character sets, ENUM/SET labels). A positional decode can't fall back to catalog names: a catalog ahead of the stream would read same-typed columns into each other | `Schema_Change…` §2.2, §9, §11; config §11.2; `tests/row_metadata.rs` |
+
+### 33.1 New gaps
+
+| ID | Gap | Severity | Surfaced by | Next |
+|---|---|---|---|---|
+| DA-SRC-24 | A Galera node with `log_slave_updates` off isn't detected as a replica: its replication status is empty, so the binlog-coverage check passes while the binlog lacks its peers' changes | 🟢 | The whole-branch re-review | Read `wsrep_on` beside the replica status |
+| DA-SRC-25 | A case-only column rename reads as a proven rename, which the Delta sink doesn't apply (the table halts or degrades) | 🟢 | The fix wave (column names compare without case) | Update the cached name without an evolution |
+| DA-SRC-26 | A MariaDB rollback after tracked rows halts the pipeline: MariaDB logs the undone rows in a transaction with non-transactional changes, and the stream has already emitted them | 🟢 | The fix wave's measurement (10.11, 11.4, 11.8) | Hold a transaction's rows to its end and drop those a savepoint rollback undid |
+
+Carried to M7b in the plan's exit checklist: an error when `server_uuid` reads NULL, a
+file/position resume IT, the pipeline dropping a halted table's buffered rows, and `re_snapshot`
+at start end to end through the worker.
