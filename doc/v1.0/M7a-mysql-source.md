@@ -14728,7 +14728,10 @@ git commit -m "ci: the MySQL source on four targets per change, MariaDB 11.4 and
 - [ ] Carried to M7b: the worker's MySQL checkpoint (`PositionDoc` with its server), the binary's
       wiring, the slice-1 parity E2E in the three position modes (MySQL 8.4 and MariaDB 11.8 per
       change, 10.11 / 11.4 weekly), the payload fault-injection E2E, and the status of the
-      `BINLOG_*` pipeline halts.
+      `BINLOG_*` pipeline halts. From the whole-branch review: an error, not an empty identity,
+      when `server_uuid` reads NULL; a file/position resume IT; the pipeline dropping a halted
+      table's buffered rows (a halt mid-rows-event); `re_snapshot` at start end to end through the
+      worker (the source's half is built).
 
 ## Deviations during execution
 
@@ -14827,3 +14830,50 @@ git commit -m "ci: the MySQL source on four targets per change, MariaDB 11.4 and
   `--test mysql` count is one above the plan's figures (Task 13: 34 per target, stream 8). Folded
   into Task 13's commit (`ddl.rs` included); Task 14's hunks in `stream.rs` apply unchanged, and
   no later task touches `ddl.rs` or `tests/mysql/stream.rs`.
+- **The whole-branch review's fixes (2026-10-15/16, approved by Oleksii).** The review found one
+  Critical and five Important issues across the tasks; all were fixed in four commits after Task
+  16, with the spec patches `acecb41` and `3b516e2`:
+  - **ENUM and SET labels kept their case only in snapshot chunks.** The catalog read lowercased
+    `COLUMN_TYPE`, so the stream wrote `'active'` where the source held `'Active'`, and an ENUM key
+    with an upper-case member broke the chunk reads. `COLUMN_TYPE` is kept as the server returns
+    it; keyword tests read a lowercased copy. Column names now compare without case, as MySQL's do.
+  - **`re_snapshot` at start.** `prepare` returned `PositionUnreachable` for a purged or
+    other-dialect checkpoint, which the worker handles only once streaming. It now returns
+    `StartPlan::Snapshot { reason: PositionLost }` with a warning, as the PostgreSQL source does;
+    the dump's own 1236 is unchanged.
+  - **Keep-alives past untracked commits.** The server sends a heartbeat only while the dump is
+    idle, so on a busy server whose tracked tables are rarely written the position never moved.
+    A transaction without tracked rows now sends a keep-alive (at most one a second).
+  - **`binlog_row_metadata = FULL` is required** (DT-R6 resolved; config §11.2, `Schema_Change…`
+    §2.2). A table map without names halts its table, and each table map is checked against the
+    decode schema for names, signedness (YEAR excepted: the server flags it unsigned), character
+    sets (collation ids mapped through `information_schema.COLLATIONS` on MySQL and
+    `COLLATION_CHARACTER_SET_APPLICABILITY` on MariaDB, whose `COLLATIONS` gives the uca1400
+    collations no id; measured) and ENUM/SET labels (only counted in a character set the source
+    doesn't read). The last matching table map is cached.
+  - **The binlog must carry the source's changes** (config §11.2). Any `binlog_do_db` /
+    `binlog_ignore_db` filter refuses the pipeline: the server filters DDL and `TRUNCATE` by the
+    session's database, so even a filter that admits `source.db` can drop them. With
+    `log_replica_updates` (MariaDB `log_slave_updates`, OFF by default) off, a server that
+    replicates from another is refused; a user that can't read the replication status (MariaDB
+    asks for `SLAVE MONITOR`, measured) gets a warning.
+  - **Names fold under `lower_case_table_names` ≠ 0**: table and database names in statements
+    compare without case, so `TRUNCATE TABLE Orders` reaches the tracked `orders`.
+  - **Rollbacks after tracked rows halt.** MariaDB logs the rows a rollback undid in a transaction
+    with non-transactional changes, followed by `ROLLBACK TO` or `ROLLBACK` (measured on 10.11,
+    11.4 and 11.8); the stream had committed them, rows the source doesn't hold. Such a
+    transaction with tracked rows now halts the pipeline. MySQL 8.4 logs none of them, and with
+    GTIDs refuses the transaction (1785).
+  - **Smaller fixes:** file mode follows a rotate between transactions; MySQL's `Begin.xid` is the
+    session counter (D-M7a.19); a statement from another database that doesn't contain the
+    source's name is routed nowhere unread (one the classifier can't read there no longer
+    halts); crate-private functions where nothing outside needs them, and the remaining public
+    type re-exported; doc fixes.
+
+  New tests: unit tests for each check; ITs for the mixed-case labels, `re_snapshot` at start,
+  keep-alives, rollbacks; two new test binaries run alone: `row_metadata` (MINIMAL refused at
+  preflight and halting the stream, FULL restored however the test ends) and `binlog_rotate`
+  (`FLUSH BINARY LOGS`, then the next file's start). From here the lib test count is 85 and
+  `--test mysql` 42 per target. Known limits, parked: a Galera node with `log_slave_updates` off
+  isn't detected as a replica (its replication status is empty); a case-only column rename reads
+  as a rename, which the Delta sink doesn't apply.

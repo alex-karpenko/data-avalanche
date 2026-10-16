@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-14
+updated: 2026-10-16
 domain: Schema Evolution
 tags: [mysql, mariadb, ddl, sqlparser, classifier, channel-c, schema-evolution, rename, online-migration, cdc]
 resolves: [G-19a]
@@ -109,7 +109,8 @@ other order, with the same outcomes:
 | Tier-1 fails, table recovered | trigger channel C; rename → drop+add+warn if not provable |
 | Neither tier recovers a table name | **halt** implicated table(s) (fail-safe). As built (M7a): the pipeline halts, since no table can be named |
 | DDL on untracked table | ignore |
-| `binlog_row_metadata = MINIMAL` | names come from channel C anyway (schema doc §) — unaffected |
+| `binlog_row_metadata = MINIMAL` | refused at start since M7a (config §11.2): channel C's names can't check a positional decode; a table map without names halts the table |
+| Names under `lower_case_table_names` ≠ 0 | table and database names compare without case (as built, M7a); column names always do |
 
 The §0 schema-evolution invariant (apply in stream order, scoped to the implicated change, never
 fast-forward to "now") is preserved: channel B only *locates* the change; channel C *describes* it; the
