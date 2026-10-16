@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-07
+updated: 2026-10-16
 domain: Architecture
 tags: [architecture, schema-evolution, ddl, cdc, postgresql, mysql, iceberg, delta-lake, multi-sink, arrow]
 status: design reviewed & approved — unified trigger→augment→diff model
@@ -103,9 +103,13 @@ decision, not whether the decoder tracks layout.
 - **`TABLE_MAP_EVENT` is the physical-layout channel** (column types + nullability), parsed
   by the decoder for (a); file-scoped, resets on `ROTATE_EVENT`.
 - **Column names are conditional.** `TABLE_MAP_EVENT` carries names, PK info, and ENUM/SET
-  strings **only when `binlog_row_metadata = FULL`** (server default `MINIMAL` → positional
-  `@1, @2`). Under `MINIMAL`, names come from the catalog query — which the augment model
-  performs anyway, so this degrades gracefully.
+  strings **only when `binlog_row_metadata = FULL`** (server default MySQL `MINIMAL`, MariaDB
+  `NO_LOG` → positional `@1, @2`). A row is decoded by position against the schema as of its
+  statement, which the augment model builds partly from the catalog read *now*. When the catalog
+  is ahead (a later statement moved, dropped or re-typed a column), same-typed columns would be
+  read into each other without an error, so catalog names are no fallback. FULL is therefore
+  **required** (§9): the stream checks each table map's names, signedness, charsets and ENUM/SET
+  strings against the schema and halts the table on a mismatch, or on a table map without names.
 - **`binlog_row_image = FULL`** is required for complete before-images (delete/update keying).
 
 ---
@@ -307,7 +311,9 @@ the change's stream position via §8.
 | Change of the identifier (the primary key, or the `tables.primary_key` columns), or a `REPLICA IDENTITY` that no longer covers it | **Unsafe** | — | — | halt table; operator re-snapshot |
 | Another `REPLICA IDENTITY` or unique-key change (e.g. `DEFAULT` → `FULL` over the same key) | **Ignorable** | none | none | none: before-images carry more columns; keying is unchanged (Q-M5-17) |
 | `ADD COLUMN` / `RENAME COLUMN` to a **reserved lineage name** (`_op`, `_ts`, `_lsn`, `_seq`, `_source_db`, `_pipeline`, `__data_avalanche_*`; case-insensitive) | **Unsafe** | — | — | halt table `RESERVED_COLUMN_COLLISION` (config §5) |
-| `DROP TABLE` (tracked) | **Unsafe** | — (target kept) | — (target kept) | halt table `TABLE_DROPPED`; the target is never dropped. A re-created table of the same name (new OID) does **not** auto-resume; it needs an operator re-snapshot. Detection — PG: channel B within a stream session (the table's name on another OID, or its OID under another name; a table renamed away halts the same way), channel D / A (§2.1); MySQL: channel B |
+| `DROP TABLE` (tracked) | **Unsafe** | — (target kept) | — (target kept) | halt table `TABLE_DROPPED`; the target is never dropped. A re-created table of the same name (new OID) does **not** auto-resume; it needs an operator re-snapshot. Detection — PG: channel B within a stream session (the table's name on another OID, or its OID under another name; a table renamed away halts the same way), channel D / A (§2.1); MySQL: channel B, where a table renamed away halts the same way, except at an online-migration cut-over (next row) |
+| MySQL online-migration **cut-over swap**: one `RENAME TABLE t TO <old>, <shadow> TO t` statement, where `<shadow>` is an untracked table of the same database named as gh-ost (`_t_gho`) or pt-online-schema-change (`_t_new`) names it, after one or more leading `_` | **Safe** if every column delta is | per column delta (rows above) | per column delta (rows above) | the stream follows the table under its name: the shadow's columns are compared with `t`'s as a whole table (a rename isn't provable), and each delta is classified by the rows above. Any other rename of a tracked table away (a two-statement cut-over, another shadow name) halts `TABLE_DROPPED` |
+| MySQL partition or tablespace operation that changes rows without row events (`DROP`, `TRUNCATE`, `EXCHANGE`, `IMPORT`, `DISCARD` or `CONVERT` of a `PARTITION`, `TABLESPACE` or `TABLE`) on a tracked table | **Unsafe** | — | — | halt table `UNSAFE_DDL`; operator re-snapshot. The binlog carries the statement only, so the target would diverge silently |
 | MySQL `ENUM`/`SET` **add** values (append-only) | Ignorable\*\* | none | none | decoded value set widens; verify mapping (G-18) |
 | MySQL `ENUM`/`SET` reorder/remove values | **Unsafe** | — | — | halt (changes decoded string meaning) |
 | Index/comment/storage-params/`AUTO_INCREMENT`/charset w/ same logical type | **Ignorable** | none | none | none |
@@ -398,7 +404,8 @@ too), so:
 | PostgreSQL | `REPLICA IDENTITY` ≠ `NOTHING` | required (already enforced) | delete keying |
 | MySQL | `binlog_format = ROW` | required | granular change capture |
 | MySQL | `binlog_row_image = FULL` | required | complete before-images / equality-delete keys |
-| MySQL | `binlog_row_metadata = FULL` | **recommended** (warn if absent) | names/PK/ENUM strings in `TABLE_MAP`; absent → names come from channel C catalog query |
+| MySQL | `binlog_row_metadata = FULL` | required | names/ENUM strings in `TABLE_MAP`, checked against the decode schema (§2.2); a table map without names halts the table |
+| MySQL | the source database's changes reach the binlog: no `binlog_do_db` / `binlog_ignore_db` filter (a statement is filtered by its session's database); a replica's `log_replica_updates` / `log_slave_updates` ON | required (a replica whose status can't be read: warn) | otherwise the stream never sees the tables' changes |
 | MySQL | `REPLICATION CLIENT` / `REPLICATION SLAVE` | required | binlog dump |
 
 Validate these at pipeline start and surface a clear error (or warning for the
@@ -440,7 +447,7 @@ Ripple into `Configuration_Specification.md` (deliberate spec edit, touches G-1f
 | G-19a | MySQL `QUERY_EVENT` handling scope | **reduced** to DDL-classify + table-name extract (+ rename-keyword); full-delta parsing not required |
 | DT-R2 | Rename when intent unprovable (MySQL + unparseable DDL) | drop+add + warning |
 | DT-R5 | ENUM/SET representation (string vs ordinal) | string (makes value-add Ignorable) — coordinate with G-18 |
-| DT-R6 | `binlog_row_metadata = FULL` — required or recommended? | recommended; warn + catalog-name fallback |
+| DT-R6 | `binlog_row_metadata = FULL` — required or recommended? | **Resolved (M7a, 2026-10-15)** — required: a positional decode can't fall back to catalog names safely (§2.2) |
 | DT-R7 | `rescan_interval` default and disable semantics | `60m`; `0` disables (NEW) |
 | DT-R8 | Source query connection — reuse replication creds or separate role? | **Resolved** — reuse replication credentials; the replication user must hold SELECT (validated at start, §9) |
 

@@ -208,6 +208,26 @@ fn pipeline_fields(at: &At, p: &RawPipeline, ctx: &mut Ctx, cross_field: bool) {
             );
         }
     }
+    // V-121: `@master_heartbeat_period`'s range.
+    if let Some(my) = p.source.as_ref().and_then(|s| s.mysql.as_ref()) {
+        let hb_at = at.key("source").key("mysql").key("heartbeat");
+        if let Some((v, loc)) = val(ctx, &my.heartbeat, &hb_at)
+            && !(Duration::from_secs(1)..=Duration::from_secs(4_294_967)).contains(&v)
+        {
+            let l = my.heartbeat.as_ref().expect("val returned Some");
+            let shown = if is_templated(l) {
+                format!("{:?} (resolved value hidden)", l.text())
+            } else {
+                crate::units::format_duration(v)
+            };
+            ctx.error(
+                "V-121",
+                &hb_at,
+                loc,
+                format!("heartbeat must be between 1s and 4294967s, got {shown}"),
+            );
+        }
+    }
     if let Some(pg) = p.source.as_ref().and_then(|s| s.postgres.as_ref()) {
         // V-104
         let lag_at = at.key("source").key("postgres").key("max_wal_lag_bytes");

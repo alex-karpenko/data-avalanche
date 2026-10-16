@@ -1,7 +1,10 @@
 //! The source connector contract (roadmap §3.6, Data-Flow Phases 0–2): what the pipeline asks of a
 //! source engine. Each source crate implements it; nothing here performs I/O.
 
+use std::fmt;
+
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
@@ -93,6 +96,44 @@ pub enum StartPlan {
     },
 }
 
+/// The source server a stream position was read from (MySQL / MariaDB). A binlog file and offset
+/// mean something only on the server that wrote them: in file/position mode a start against
+/// another server halts the pipeline (`BINLOG_SOURCE_CHANGED`, Data-Flow Phase 2b). Its JSON is
+/// the `server` of `replication/position.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "engine", rename_all = "lowercase", deny_unknown_fields)]
+pub enum ServerIdentity {
+    Mysql { server_uuid: String },
+    Mariadb { server_id: u32 },
+}
+
+impl fmt::Display for ServerIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Mysql { server_uuid } => write!(f, "MySQL server {server_uuid}"),
+            Self::Mariadb { server_id } => write!(f, "MariaDB server_id {server_id}"),
+        }
+    }
+}
+
+/// The pipeline's durable stream position, as [`SourceConnector::prepare`] gets it: where the
+/// stream resumes, and the server it was read from when the source records one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checkpoint {
+    pub position: SourcePosition,
+    pub server: Option<ServerIdentity>,
+}
+
+impl From<SourcePosition> for Checkpoint {
+    /// A position with no recorded server (PostgreSQL).
+    fn from(position: SourcePosition) -> Self {
+        Self {
+            position,
+            server: None,
+        }
+    }
+}
+
 /// What [`SourceConnector::prepare`] decided, and what it noticed on the way (publication
 /// membership drift under `slot_management: require_existing`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +145,9 @@ pub struct Prepared {
     /// publication behind its back. Empty when the plan snapshots every table.
     pub added: Vec<TableRef>,
     pub warnings: Vec<String>,
+    /// The server the stream reads, recorded with the checkpoint so the next start can check it
+    /// (MySQL / MariaDB). `None` for a source that records none (PostgreSQL).
+    pub server: Option<ServerIdentity>,
 }
 
 /// A keyset cursor (Snapshot_Resumability §2): the identifier values of the last row read, in
@@ -264,11 +308,12 @@ pub trait SourceConnector: Send + Sync {
     async fn resolve_tables(&self) -> Result<ResolvedTables, SourceError>;
 
     /// Prepares the stream position for a start (PostgreSQL: the publication, then the slot state
-    /// machine). `checkpoint` is the pipeline's durable position, `None` without state; `tables`
-    /// is the tracked set.
+    /// machine; MySQL: the checkpoint's server and whether its binlog is still there).
+    /// `checkpoint` is the pipeline's durable position, `None` without state; `tables` is the
+    /// tracked set.
     async fn prepare(
         &self,
-        checkpoint: Option<&SourcePosition>,
+        checkpoint: Option<&Checkpoint>,
         tables: &[TableRef],
     ) -> Result<Prepared, SourceError>;
 
@@ -462,7 +507,7 @@ mod tests {
         }
         async fn prepare(
             &self,
-            checkpoint: Option<&SourcePosition>,
+            checkpoint: Option<&Checkpoint>,
             _: &[TableRef],
         ) -> Result<Prepared, SourceError> {
             let plan = match checkpoint {
@@ -476,6 +521,7 @@ mod tests {
                 plan,
                 added: vec![],
                 warnings: vec![],
+                server: None,
             })
         }
         async fn retained(&self) -> Result<Option<RetainedLog>, SourceError> {
@@ -634,6 +680,36 @@ mod tests {
         };
         assert!(w.sees(0xFFFF_FFF0));
         assert!(!w.sees(3));
+    }
+
+    #[test]
+    fn a_server_identity_names_its_engine_and_keeps_its_json() {
+        let mysql = ServerIdentity::Mysql {
+            server_uuid: "3e11fa47-71ca-11e1-9e33-c80aa9429562".into(),
+        };
+        let mariadb = ServerIdentity::Mariadb { server_id: 7 };
+        assert_eq!(
+            mysql.to_string(),
+            "MySQL server 3e11fa47-71ca-11e1-9e33-c80aa9429562"
+        );
+        assert_eq!(mariadb.to_string(), "MariaDB server_id 7");
+        let json = serde_json::to_string(&mariadb).unwrap();
+        assert_eq!(json, r#"{"engine":"mariadb","server_id":7}"#);
+        assert_eq!(
+            serde_json::from_str::<ServerIdentity>(&json).unwrap(),
+            mariadb
+        );
+        assert!(
+            serde_json::from_str::<ServerIdentity>(r#"{"engine":"mysql","server_id":7}"#).is_err(),
+            "a field of the other engine is refused"
+        );
+    }
+
+    #[test]
+    fn a_position_alone_is_a_checkpoint_without_a_server() {
+        let c = Checkpoint::from(SourcePosition::Pg(Lsn(0x10)));
+        assert_eq!(c.position, SourcePosition::Pg(Lsn(0x10)));
+        assert_eq!(c.server, None);
     }
 
     #[test]

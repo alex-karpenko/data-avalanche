@@ -3,24 +3,13 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use data_avalanche_config::{PartitionTransform, Tables};
-use data_avalanche_core::{ColumnSchema, HaltReason, LogicalType, TableRef, TableSchema};
+use data_avalanche_config::{Tables, check_partitioning};
+use data_avalanche_core::{ColumnSchema, HaltReason, TableRef, TableSchema};
 use tokio_postgres::Client;
 
 use crate::types::{TypeCatalog, TypeInfo, missing, plan_column};
 
-/// `*` matches within one name (it doesn't cross the `.`); matching is case-sensitive
-/// (config §9.3 glob grammar).
-pub fn glob_match(pattern: &str, name: &str) -> bool {
-    fn go(p: &[u8], n: &[u8]) -> bool {
-        match p.split_first() {
-            None => n.is_empty(),
-            Some((b'*', rest)) => (0..=n.len()).any(|i| go(rest, &n[i..])),
-            Some((c, rest)) => n.first() == Some(c) && go(rest, &n[1..]),
-        }
-    }
-    go(pattern.as_bytes(), name.as_bytes())
-}
+pub use data_avalanche_config::glob_match;
 
 /// A PostgreSQL include/exclude pattern (`schema.table`, V-117) against a table.
 pub fn pattern_matches(pattern: &str, table: &TableRef) -> bool {
@@ -234,36 +223,8 @@ pub fn table_schema(
             notes.c_ordered_keys.push((k.clone(), collation));
         }
     }
-    for f in tables.partitioning.get(&key).into_iter().flatten() {
-        let temporal = !matches!(
-            f.transform,
-            PartitionTransform::Identity
-                | PartitionTransform::Bucket { .. }
-                | PartitionTransform::Truncate { .. }
-        );
-        if f.column == "_ts" {
-            continue;
-        }
-        let Some(c) = schema.column(&f.column) else {
-            return Err(HaltReason::SchemaMismatch {
-                column: f.column.clone(),
-                detail: "tables.partitioning names a column the table doesn't have".into(),
-            });
-        };
-        if temporal
-            && !matches!(
-                c.logical,
-                LogicalType::Date | LogicalType::TimestampTz | LogicalType::TimestampNtz
-            )
-        {
-            return Err(HaltReason::SchemaMismatch {
-                column: f.column.clone(),
-                detail: format!(
-                    "a {:?} partition transform needs a date or timestamp column",
-                    f.transform
-                ),
-            });
-        }
+    if let Some(fields) = tables.partitioning.get(&key) {
+        check_partitioning(&schema, fields)?;
     }
     Ok((schema, notes))
 }
@@ -465,6 +426,7 @@ pub async fn load_types(
 mod tests {
     use super::*;
     use crate::test_support::pipeline_with;
+    use data_avalanche_config::PartitionTransform;
     use data_avalanche_core::ColumnValueType as V;
 
     fn rel(oid: u32, s: &str, t: &str, kind: u8) -> Relation {
@@ -477,13 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn globs_stay_inside_a_name() {
-        assert!(glob_match("*", "orders"));
-        assert!(glob_match("ord*", "orders"));
-        assert!(glob_match("*ers", "orders"));
-        assert!(glob_match("o*r*s", "orders"));
-        assert!(!glob_match("Orders", "orders"), "case-sensitive");
-        assert!(!glob_match("ord", "orders"));
+    fn patterns_match_schema_and_table() {
         let t = TableRef::new("public", "orders");
         assert!(pattern_matches("public.*", &t));
         assert!(pattern_matches("*.orders", &t));

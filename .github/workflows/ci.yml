@@ -92,6 +92,13 @@ jobs:
         run: test-infra/up.sh
       - name: Integration tests
         run: cargo test --locked --workspace -- --test-threads=1
+      # The MySQL source on its other per-change targets (P-8; the run above reads mysql-84):
+      # file/position mode on MySQL 8.4, and MariaDB 11.8 in GTID and file/position mode.
+      - name: MySQL source, other targets
+        run: |
+          for target in mysql-84-nogtid mariadb-118 mariadb-118-binlog; do
+            DATA_AVALANCHE_MYSQL=$target cargo test --locked -p data-avalanche-source-mysql --tests
+          done
       # The slice-1 E2E suite (roadmap §5.3): the binary as a process, built with its crash points.
       - name: Slice-1 E2E
         run: cargo test --locked -p data-avalanche --features e2e-hooks --test e2e -- --test-threads=1

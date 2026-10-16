@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-08
+updated: 2026-10-15
 domain: Architecture
 tags: [architecture, data-flow, pipeline, cdc, iceberg, delta-lake, multi-sink, arrow, snapshot, replication]
 sources: []
@@ -114,7 +114,9 @@ READ LOCK` model (which could not resume mid-table — an exported snapshot dies
       and still be invisible to a read
    b. read chunk: SELECT ... WHERE (key) > (cursor) ORDER BY (key) LIMIT chunk_size
                   in a SHORT repeatable-read txn that also records what it sees
-                  (PG: pg_current_snapshot()); buffer the rows
+                  (PG: pg_current_snapshot()); MySQL: a SHORT read-committed txn whose
+                  read locks the rows (LOCK IN SHARE MODE), so it waits for a writer of
+                  them still committing; buffer the rows
                   rows → CdcEvent { op: Snapshot (_op = r), after: Row, ... }
    c. reconcile, when the chunk is emitted (between stream transactions): every stream transaction
                  applied while the table is being snapshotted is logged with the keys it wrote. A
@@ -122,6 +124,9 @@ READ LOCK` model (which could not resume mid-table — an exported snapshot dies
                  transaction, is dropped: the stream already has the newer change. A logged TRUNCATE
                  the read didn't see drops the chunk. A source that can't say what a read saw
                  (MySQL) uses the window: the transactions applied after the read was issued.
+                 Its locking read already waited for a writer of its rows still committing:
+                 a commit the binlog delivers before it is visible (semi-sync AFTER_SYNC
+                 waiting for the replica ack, DA-SNAP-10, measured S-MY11).
    d. emit: flush the stream's buffered changes, then commit the chunk's surviving rows as their own
             change set, flagged `snapshot` (Phase 4: the position guard never skips it).
    e. the cursor (last row's identifier tuple) is persisted with that flush's checkpoint, never
@@ -137,9 +142,12 @@ keeps a chunk from undoing a change already applied. **No global read lock, no l
 no `EXPORT_SNAPSHOT`/`FLUSH TABLES`** — the snapshot needs only `SELECT` plus the existing replication
 privileges (MySQL `RELOAD`/`LOCK TABLES` are no longer required).
 
-**Cursor & resume.** The resume cursor is a typed identifier tuple; pagination is a row-value
-comparison `WHERE (c1,…) > (v1,…) ORDER BY c1,… LIMIT chunk_size`, with ordering pinned to a **binary
-collation** (`COLLATE "C"` / `utf8mb4_bin`) recorded in the cursor. Crash resume reopens from the
+**Cursor & resume.** The resume cursor is a typed identifier tuple; pagination is a keyset
+comparison in the key's index order, `… ORDER BY c1,… LIMIT chunk_size`. PostgreSQL compares a row
+value, `WHERE (c1,…) > (v1,…)`, a text key of a nondeterministic collation in `COLLATE "C"`. MySQL
+spells the predicate out, `c1 > v1 OR (c1 = v1 AND c2 > v2) …`, each column in its own collation: a
+binary collation has no index, and a row constructor walks the index from its start (measured,
+D-M7a.12). Crash resume reopens from the
 checkpointed cursor; re-reading the in-flight chunk is harmless (upsert idempotency).
 `snapshot.chunk_size` defaults to 10000 (checkpoint per chunk). `parallelism` assigns disjoint tables
 to parallel workers; keyset order is serial within a table.
@@ -238,7 +246,9 @@ Replication connection (binlog dump; replication_type gtid (default) or binlog)
 │            @slave_gtid_strict_mode=1, then COM_BINLOG_DUMP
 │   └─► the server streams only transactions not in the set (gap-free, position-independent)
 │
-├─► SET @master_heartbeat_period before the dump (idle-connection liveness)
+├─► SET @master_heartbeat_period = source.mysql.heartbeat before the dump (idle-connection
+│   liveness); register as replica source.mysql.server_id (a second dump under the same id
+│   ends the first)
 │
 └─► Event loop:
     │
@@ -302,8 +312,12 @@ Connect
     (current file, end_log_pos); ROTATE_EVENT switches the file
 ```
 
-Per-change order (`_seq`) in every MySQL mode is (binlog file index from the `.NNNNNN` suffix,
-`end_log_pos`), totally ordered within one server's log.
+Per-change order (`_seq`) in every MySQL mode is (binlog file index from the `.NNNNNN` suffix, the
+event's end offset in that file). The offset is the event header's `end_log_pos` where the server
+sets it; otherwise the last set position plus the sizes of the events since. MariaDB 11.4 and later
+leave it 0 inside a transaction, and MySQL leaves it 0 for the events inside a compressed
+transaction payload, which all take the payload's offset (measured, S-MY10). It is totally ordered
+within one server's log, and equal only within one transaction, where the later change wins.
 
 ---
 
@@ -318,8 +332,9 @@ CdcEvent {
     before:    Option<Row>,     // old image: present for Update (if FULL/PK) and Delete; carries only
                                 // the columns the source sent (a PG key-only old tuple: the identity columns)
     after:     Option<Row>,     // new image: present for Insert, Update, Snapshot
-    source_pos: SourcePosition, // COMMIT position: LSN (PG) or GtidSet (MySQL)
-    change_seq: SourceSeq,      // PER-CHANGE order: PG change-LSN / MySQL (binlog_file,end_log_pos).
+    source_pos: SourcePosition, // the transaction's position: PG commit LSN; MySQL its GTID
+                                // (gtid mode) or its start file:pos (binlog mode)
+    change_seq: SourceSeq,      // PER-CHANGE order: PG change-LSN / MySQL (file index, end offset).
                                 // Finer than source_pos; the keep-last key for dedup (Ghost_Row §4).
     xid:       u64,             // transaction ID (xid in PG, seq-no in GTID for MySQL)
     commit_ts: DateTime<Utc>,   // server commit timestamp
@@ -824,8 +839,8 @@ Every row written to the sink carries these metadata columns in addition to the 
 |---|---|---|
 | `_op` | `CHAR(1)` | `I` insert, `U` update, `r` snapshot (`D` never appears in mirror mode — deletes remove the row; reserved for the future `changelog` write mode) |
 | `_ts` | `TIMESTAMP WITH TIME ZONE` | source database commit timestamp |
-| `_lsn` | `VARCHAR` | commit LSN string (PG) or GTID string (MySQL) |
-| `_seq` | `VARCHAR` | per-change source order as fixed-width text that sorts like the source order: PostgreSQL `XXXXXXXX/XXXXXXXX` (upper-case hex, 8 + 8 digits), MySQL/MariaDB `<file index, 10 digits>:<end_log_pos, 20 digits>`; keep-last dedup key (G-13) |
+| `_lsn` | `VARCHAR` | the transaction: commit LSN (PG); its GTID in `gtid` mode (MySQL `uuid:n`, MariaDB `domain-server-seq`); its start position `file:pos` in `binlog` mode |
+| `_seq` | `VARCHAR` | per-change source order as fixed-width text that sorts like the source order: PostgreSQL `XXXXXXXX/XXXXXXXX` (upper-case hex, 8 + 8 digits), MySQL/MariaDB `<file index, 10 digits>:<end offset, 20 digits>` (Phase 2b); keep-last dedup key (G-13) |
 | `_source_db` | `VARCHAR` | `host/database` from pipeline source config |
 | `_pipeline` | `VARCHAR` | pipeline name from config |
 

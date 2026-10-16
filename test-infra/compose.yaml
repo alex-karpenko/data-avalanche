@@ -39,6 +39,28 @@ services:
     ports: ["53384:3306"]
     healthcheck: { test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-pavalanche"], interval: 2s, retries: 60 }
 
+  # GTID off: the file/position mode (`replication_type: binlog`) on MySQL (M7a). TLS off too
+  # (`--tls-version=`): the one server here that offers none, for `ssl_mode: prefer`'s fallback.
+  mysql-84-nogtid:
+    image: "mysql:8.4"
+    environment: { MYSQL_ROOT_PASSWORD: avalanche, MYSQL_DATABASE: avalanche }
+    command: ["--server-id=1", "--log-bin=mysql-bin", "--binlog-format=ROW", "--binlog-row-image=FULL",
+              "--binlog-row-metadata=FULL", "--gtid-mode=OFF", "--tls-version="]
+    ports: ["53385:3306"]
+    # Over the socket: without TLS, a TCP login's first caching_sha2_password exchange needs the
+    # server's RSA key, which mysqladmin doesn't ask for.
+    healthcheck: { test: ["CMD", "mysqladmin", "ping", "-uroot", "-pavalanche"], interval: 2s, retries: 60 }
+
+  # TLS required on every TCP connection, throwaway certificates made at start (mysql-tls.sh).
+  mysql-tls:
+    image: "mysql:8.4"
+    environment: { MYSQL_ROOT_PASSWORD: avalanche, MYSQL_DATABASE: avalanche }
+    entrypoint: ["bash", "/mysql-tls.sh"]
+    volumes: ["./mysql-tls.sh:/mysql-tls.sh:ro", "./.tls:/tls"]
+    ports: ["53386:3306"]
+    # mysqladmin connects over the socket, which TLS doesn't apply to.
+    healthcheck: { test: ["CMD", "mysqladmin", "ping", "-uroot", "-pavalanche"], interval: 2s, retries: 60 }
+
   mariadb-118: { <<: *mariadb, image: "mariadb:11.8", ports: ["53318:3306"] }
   mariadb-114: { <<: *mariadb, image: "mariadb:11.4", ports: ["53314:3306"], profiles: [matrix] }
   mariadb-1011: { <<: *mariadb, image: "mariadb:10.11", ports: ["53311:3306"], profiles: [matrix] }

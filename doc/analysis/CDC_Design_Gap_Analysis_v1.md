@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-13
+updated: 2026-10-16
 domain: Architecture
 tags: [gap-analysis, design, re-derivation, spec-readiness, blockers, open-decisions]
 resolves: []
@@ -128,13 +128,14 @@ does not block starting the specification.
 > Recounted 2026-09-26 (v1 readiness tidy, §26); the 2026-06 figures are superseded. Open count
 > updated 2026-10-02 for the gaps M5 carried (§27), 2026-10-03 for DA-SNAP-9 and DA-SNAP-10 (§28),
 > 2026-10-07 for the M6a whole-branch review (§28.2), 2026-10-08 for M6b's planning findings
-> (§29), and 2026-10-13 for M6b's exit (§30).
+> (§29), 2026-10-13 for M6b's exit (§30), 2026-10-14 for M7's planning (§31), 2026-10-14 for
+> M7a's plan (§32), and 2026-10-16 for M7a's exit (§33).
 
 | Status | Count (v1 scope) | Notes |
 |---|---|---|
 | ✅ Resolved | the large majority | Design closed by a research/spec doc or a probe. |
-| 🔄 Partial | 2 | DA-SNAP-7, DA-SRC-9 (neither blocks the plan). DA-MS-3 is a decided caveat. DA-X-8 ✅ 2026-09-26; DA-SRC-16 and DA-X-12 ✅ 2026-10-13 (§30). |
-| 🟥 Open (v1) | **14** | DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-10 🆕 2026-10-03 (§28.1); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2); DA-CLUS-14, DA-API-11, DA-OPS-7 and DA-SRC-20 🆕 2026-10-13 (§30.1). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
+| 🔄 Partial | 3 | DA-SNAP-7, DA-SRC-9 (neither blocks the plan); DA-SNAP-10 2026-10-14 (decided and measured, built and tested in M7a's plan, §31, §32). DA-MS-3 is a decided caveat. DA-X-8 ✅ 2026-09-26; DA-SRC-16 and DA-X-12 ✅ 2026-10-13 (§30). |
+| 🟥 Open (v1) | **20** | DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2); DA-CLUS-14, DA-API-11, DA-OPS-7 and DA-SRC-20 🆕 2026-10-13 (§30.1); DA-SRC-21 🆕 2026-10-14 (§31.2); DA-SRC-22, DA-SNAP-14 and DA-X-13 🆕 2026-10-14 (§32.1); DA-SRC-24…26 🆕 2026-10-16 (§33.1). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
 | 🧪 Verify (v1) | **0** | DA-SRC-10/11 proven 2026-09-26 (§21). |
 | ⏭ v2 | 13 | Iceberg-sink items (§26.2). |
 | 🟢 Spec-merge debt | **0** | All applied 2026-09-26 (§26.6): §19.3 S-1…S-6, the DA-X-8 config residual, the D-V1 patches and the Data-Flow Phase 2a probe details. |
@@ -293,9 +294,10 @@ read-point hazard. This is a *change* to `Data-Flow.md` Phase 1, so it carries s
 | DA-SNAP-7 | Snapshot vs WAL/binlog retention coupling | 🟡 | 🔄 | §7 cross-ref — a slow snapshot lengthens the stream backlog; interacts with the WAL-lag guard (G-22) and binlog purge (G-26). Designed but the interaction tuning is an operational note, not a hard rule. | — |
 | DA-SNAP-8 | PK-less table under a **dump-only** mode (snapshot, never stream) | 🟡 | ✅ | The PK-less halt rule (DA-DEDUP-3) is justified by equality-delete keying — but a `dump_*` table is insert-only and never deletes, so the keying argument doesn't apply. Whether a dump-only PK-less table may be snapshotted (or still halts) is **unspecified**. Newly surfaced edge case. **2026-09-26 tidy:** decided by spec: the identifier precondition (config §11.2) applies in every mode — explicit PK-less table halts, glob-matched one is skipped; `tables.surrogate_key` struck (G-30). Dump-only PK-less tables are not supported in v1. | — |
 | DA-SNAP-9 | The snapshot watermark can't order a chunk's MVCC snapshot against the stream | 🟡 | ✅ | Closed 2026-10-03 (§28): each chunk read records its `pg_current_snapshot()`, the writers in flight at the session's start are waited for, and the reconciler drops a chunk row a stream transaction the read didn't see already wrote (Snapshot_Resumability §1.1; Data-Flow Phase 1, S-T). Measured: M6a Task 13's busy-snapshot and stalled-synchronous-commit tests. | — |
-| DA-SNAP-10 | 🆕 MySQL's window rule may miss a transaction the binlog delivered before InnoDB made it visible | 🟡 | 🟥 | §28.1. MySQL/MariaDB chunks carry no read visibility, so the reconciler uses the window rule: only transactions applied after a read was issued are filtered. Group commit makes the binlog readable (sync stage) before the InnoDB commit (commit stage); semi-sync `AFTER_SYNC` waits for the replica ack between them, up to `rpl_semi_sync_source_timeout`. A transaction applied from the binlog before a chunk is issued can then still be invisible to that chunk's read, and a stale chunk row would undo it, the MySQL analogue of DA-SNAP-9's stalled synchronous commit. Reasoned (M6a Task 9 review), not measured. Close before M7: an S-MY probe that stalls a semi-sync ack, then the fix (e.g. a per-read visibility signal, or waiting for in-flight commits as Q-M6a-2 does on PostgreSQL). | — |
+| DA-SNAP-10 | MySQL's window rule may miss a transaction the binlog delivered before InnoDB made it visible | 🟡 | 🔄 | §28.1. MySQL/MariaDB chunks carry no read visibility, so the reconciler uses the window rule: only transactions applied after a read was issued are filtered. Group commit makes the binlog readable (sync stage) before the InnoDB commit (commit stage); semi-sync `AFTER_SYNC` waits for the replica ack between them, up to `rpl_semi_sync_source_timeout`. A transaction applied from the binlog before a chunk is issued can then still be invisible to that chunk's read, and a stale chunk row would undo it, the MySQL analogue of DA-SNAP-9's stalled synchronous commit. Reasoned (M6a Task 9 review), not measured. Close before M7: an S-MY probe that stalls a semi-sync ack, then the fix (e.g. a per-read visibility signal, or waiting for in-flight commits as Q-M6a-2 does on PostgreSQL). **🔄 2026-10-14 (§31): measured and decided.** S-MY11 measured it on MySQL 8.4 and MariaDB 10.11 / 11.8 (semi-sync AFTER_SYNC; MariaDB's default AFTER_COMMIT has no gap). Fix (Q-M7-3): a MySQL chunk reads with `LOCK IN SHARE MODE` in its short READ COMMITTED transaction, which waits for the stalled commit and sees it (S-MY11; its cost, S-MY11b); `Data-Flow.md` Phase 1 step 2b/2c, `Snapshot_Resumability…` §1.1. Closes when M7 builds it with its test. **2026-10-14 (§32):** built and tested in M7a's plan (Task 10, `a_locking_read_waits_for_a_writer_of_its_rows`, on MySQL 8.4 and MariaDB 11.8); ✅ when M7a merges. | — |
 | DA-SNAP-11 | 🆕 The reconciler's log is unbounded while a snapshotting table's reads wait | 🟢 | 🟥 | §28.2. Every stream transaction that writes a snapshotting table is logged with its keys until a chunk proves it visible. While the table's reads wait (an in-flight writer at session start, a drift hold), no chunk is reconciled and the log grows with every key written, for up to `timeouts.snapshot`. M6a warns once per wait and reports the log's size in the status (M6b's gauge); bounding it (coalesce per table, or skip logging until a read can be issued) is open. | — |
 | DA-SNAP-12 | 🆕 `parallelism > 1` reads chunks one after another on PostgreSQL | 🟢 | 🟥 | §28.2. Chunk reads share the one catalog connection, so they pipeline rather than run in parallel; each read's client-side bound starts at spawn, so a read queued behind slow chunks can time out and the abandoned connection fails its neighbours. Fix: a small read pool or a connection per concurrent read. | — |
+| DA-SNAP-14 | 🆕 An `ENUM` key whose members are reordered during a snapshot | 🟢 | 🟥 | §32.1. An `ENUM` key sorts by member index, and a chunk resumes after its cursor's label at that label's index under the members read for the chunk. A reorder mid-snapshot changes the order, so the next chunk can skip or repeat rows. The stream halts the table at the reorder (§7.2), but a chunk read between the DDL and the signal doesn't notice: the read plan compares value types, text for an `ENUM` either way. | — |
 | DA-SNAP-13 | 🆕 A wiped state with an existing sink table baselines nothing | 🟢 | 🟥 | §28.2. With no cached schema, Phase 0 doesn't baseline (§8.2) against the sink table's schema; a shape mismatch surfaces later as `SINK_REJECTED` (visible, not silent). Only the adopted-orphan case with a cache is covered. | — |
 
 ---
@@ -380,7 +382,7 @@ the MySQL path with one genuine correctness dependency.
 | DA-SRC-9 | TOAST re-query control-connection pool sizing | 🟢 | 🔄 | V-077 warns on `re_query`+high-volume snapshot; concrete pool sizing is an implementation detail, not yet fixed. | — |
 | DA-SRC-10 | **PG replication client crate capability** (`pgwire-replication` named in Sources_Index; never pinned, compiled or probed) | 🔴 | ✅ | Needed: pgoutput proto v1–v4 incl. streamed in-progress txns (`Stream Start/Stop/Commit/Abort`), `Relation`/`Type`/`Truncate` messages, unchanged-TOAST marker, standby status feedback (flush-LSN ack), slot `START_REPLICATION` from an LSN, TLS, keepalives. Probe: `prototypes/source-capability/` (S-gates) against local PostgreSQL. A negative result means writing/forking the protocol layer — a plan-shaping item. **Scaffolded 2026-09-26, source-read:** the crate is **transport-only** — pgoutput decoding (Relation/Insert/Update/Delete/Truncate/Type/Origin) is a stated non-goal, so **the decoder is ours** (bounded v1 work item); `proto_version '1'` is hard-coded with no `streaming` (large txns arrive whole at commit — fine for the design, but `Data-Flow.md` Phase 2a says `'2'`). Gates S-PG0…S-PG8 in `prototypes/source-capability/README.md`. **Proven 2026-09-26** (`prototypes/source-capability/`, PG 17): S-PG0…S-PG8 9/9 — transport, our pgoutput decoder (Relation/Type/Origin/Insert/Update none·K·O/Delete K·O/Truncate), unchanged-TOAST `u`, 50k-row txn whole at commit under proto v1, restart/resume at-least-once, slow consumer survives `wal_sender_timeout`, live `ALTER PUBLICATION ADD TABLE`, 18-type text decode, TLS 1.3 verify-full. **Pin `pgwire-replication =0.4.1`; the pgoutput decoder is a v1 work item.** Implementation rules: `with_wakeup_interval` ≈ status interval (idle acks otherwise lag up to 10 s); pin the walsender session (`TimeZone=UTC`, `DateStyle=ISO`, `IntervalStyle=iso_8601`, `extra_float_digits=3`). | — |
 | DA-SRC-11 | **MySQL binlog client crate capability** (`mysql-binlog-connector-rust` named in Sources_Index; never pinned, compiled or probed) | 🔴 | ✅ | Needed: GTID-set positioning (`COM_BINLOG_DUMP_GTID`), `ROW` events with FULL image, `TABLE_MAP` optional metadata (column names/signedness, `binlog_row_metadata=FULL`), `QUERY_EVENT` (DDL classifier input), CRC32 checksums, heartbeats, MySQL 8.4 `caching_sha2_password` auth + TLS; MariaDB GTID dialect if in v1 scope (DA-SRC-8). Probe: `prototypes/source-capability/` against local MySQL (and MariaDB). **Scaffolded 2026-09-26, source-read:** two candidates probed side by side — (a) `mysql-binlog-connector-rust` 0.3.3 (TLS looks absent, claims ≤ MySQL 8.0.31, has MariaDB GTID events) vs (b) `mysql_async` 0.37.1 binlog stream (TLS ✅, active; MariaDB GTID events not found in `mysql_common`). Neither complete on paper. Gates S-MY0…S-MY9. **Proven 2026-09-26** (MySQL 8.4 + MariaDB 11.4): **pin `mysql_async =0.37.1`** — S-MY0…S-MY9 10/10 (GTID resume, FULL images, optional metadata incl. UNSIGNED, DDL `QUERY_EVENT`, heartbeats via `@master_heartbeat_period`, zstd payloads, type decode, TLS 1.3, MariaDB GTID). **Reject** `mysql-binlog-connector-rust` 0.3.3: no TLS, no MariaDB GTID positioning, `is_signed` carries the *unsigned* bit, `BIGINT UNSIGNED` as `-1`. Own code: MariaDB `GTID_EVENT` (type 162) decode; payload guard (DA-SRC-12). | — |
-| DA-SRC-12 | **`mysql_async` silently drops a compressed transaction it cannot decompress** | 🟡 | ✅ (guard designed) | Found 2026-09-26 (source-read, `mysql_common` 0.37.3 / `mysql_async` 0.37.1): on a zstd error `TransactionPayloadEvent::danger_decompress` returns an **empty buffer**, and `mysql_async` ignores a payload-header parse error (`/* TODO: Log the error */`) — the transaction's rows vanish with no stream error. Rare (corrupt payload / unsupported algorithm) but silent data loss. Guard (v1): validate every `TRANSACTION_PAYLOAD` ourselves — decompressed length == `uncompressed_size`, ≥ 1 inner event — and halt the pipeline on mismatch; offer the fix upstream. **✅ 2026-09-26 — D-V1.6 (`V1_Scope_Decisions.md`):** validate each payload; pipeline halt `BINLOG_PAYLOAD_INVALID`; report upstream. | — |
+| DA-SRC-12 | **`mysql_async` silently drops a compressed transaction it cannot decompress** | 🟡 | ✅ (guard designed) | Found 2026-09-26 (source-read, `mysql_common` 0.37.3 / `mysql_async` 0.37.1): on a zstd error `TransactionPayloadEvent::danger_decompress` returns an **empty buffer**, and `mysql_async` ignores a payload-header parse error (`/* TODO: Log the error */`) — the transaction's rows vanish with no stream error. Rare (corrupt payload / unsupported algorithm) but silent data loss. Guard (v1): validate every `TRANSACTION_PAYLOAD` ourselves — decompressed length == `uncompressed_size`, ≥ 1 inner event — and halt the pipeline on mismatch; offer the fix upstream. **✅ 2026-09-26 — D-V1.6 (`V1_Scope_Decisions.md`):** validate each payload; pipeline halt `BINLOG_PAYLOAD_INVALID`; report upstream. **2026-10-14 (§32):** M7a's plan builds it as a count-down of the payload's `uncompressed_size` by the events it yields (Task 6, measured equal to the decompressed length on MySQL 8.4), halting with a `BINLOG_PAYLOAD_INVALID: ` message; the fault-injection E2E is M7b's. | — |
 | DA-SRC-13 | Publication blind spots | 🟢 | 🆕 🟥 | Carried from M5; detail in §27. | — |
 | DA-SRC-14 | `bit` / `varbit` / PostGIS keys | 🟢 | 🆕 🟥 | Carried from M5; detail in §27. | — |
 | DA-SRC-15 | Snapshot collation and chunk edges | 🟢 | 🆕 🟥 | Carried from M5; detail in §27. | — |
@@ -389,6 +391,12 @@ the MySQL path with one genuine correctness dependency.
 | DA-SRC-18 | M5 test gaps | 🟢 | 🆕 🟥 | Carried from M5; detail in §27. | — |
 | DA-SRC-19 | 🆕 Which permanent chunk-read errors are table-scoped | 🟢 | 🟥 | §28.2. A permanent chunk-read error ends the whole pipeline (D-M6a.7); a retyped key's 42883/42804 would loop it through restarts though only that table's read is broken. A non-drop 42703 (e.g. a quoting bug) now retries as "changed under the snapshot" until `SNAPSHOT_TIMEOUT`, with a warning per streak. Rule per SQLSTATE which errors halt the table and which end the pipeline, with MySQL's in view (M7/M9). | — |
 | DA-SRC-20 | 🆕 A PostgreSQL source failover moves positions backwards | 🟡 | 🟥 | §30.1. The position guard assumes an LSN only grows. After a failover to a replica whose WAL ends behind the table's marker, the new primary reuses LSNs the lake has already marked, and the guard skips its changes, so data is lost. `Delivery_Guarantee_and_Position_Guard.md` §6 designs a source failover for MySQL only (a new `server_uuid`). Design the PostgreSQL case: detect the timeline or system identifier change, then halt or re-snapshot. | — |
+| DA-SRC-22 | 🆕 MySQL `ssl_mode: verify-ca` checks the host name too | 🟢 | 🟥 | §32.1. `mysql_async` 0.37.1 skips the name check only for an error whose text contains `NotValidForName`; rustls 0.23 prints `certificate not valid for name`. So `verify-ca` acts as `verify-full` and refuses a connection by an address the certificate doesn't name. Fails closed (pinned by a test in M7a); M5 met the same in the PostgreSQL replication connection. | — |
+| DA-SRC-23 | 🆕 `mysql_common` reads MariaDB's compressed events as nothing | 🟡 | ✅ | §32. With `log_bin_compress` on, MariaDB writes `QUERY_COMPRESSED` and `*_ROWS_COMPRESSED_V1` events (165–168); `mysql_common` 0.37.3 returns no data for them, a silent loss (measured on 11.8 and 10.11). Closed by design (Q-M7a-5): the source decompresses them itself (M7a Task 6); the v2 types (169–171), never seen, halt. | — |
+| DA-SRC-21 | 🆕 MariaDB's file/position identity is `@@server_id` alone, and ids repeat across servers | 🟢 | 🟥 | §31.2. A pipeline in `binlog` mode pointed at another MariaDB with the same `server_id` resumes at a file and offset that mean nothing there, and BINLOG_SOURCE_CHANGED doesn't fire. Candidate check: compare `BINLOG_GTID_POS(file, pos)` with the GTID state recorded at the position. GTID mode (the default) doesn't depend on it. | — |
+| DA-SRC-24 | 🆕 A Galera node with `log_slave_updates` off isn't detected as a replica | 🟢 | 🟥 | §33.1. The binlog-coverage precondition (config §11.2) reads `SHOW ALL REPLICAS STATUS` when `log_slave_updates` is off; a Galera node applies its peers' writesets without a replica connection, so the status is empty and the check passes, while its binlog lacks the other nodes' changes. Check `wsrep_on` too. | — |
+| DA-SRC-25 | 🆕 A case-only column rename reads as a rename | 🟢 | 🟥 | §33.1. Column names compare without case (as MySQL's do), so a column whose name changed in case alone diffs as a proven `RenameColumn`; the Delta sink doesn't apply renames, so the table halts or degrades for what is, to MySQL, the same column. Candidate: a case-only rename updates the cached name without an evolution. | — |
+| DA-SRC-26 | 🆕 A MariaDB rollback after tracked rows halts the pipeline | 🟢 | 🟥 | §33.1. MariaDB logs the rows a rollback undid in a transaction with non-transactional changes, then `ROLLBACK TO` or `ROLLBACK` (measured, 10.11–11.8); M7a halts on one with tracked rows, since the stream already emitted them. Fail-closed, but a false halt for a tracked MyISAM table (whose rows stand) and an outage for an application using savepoints across engines. Candidate: hold a transaction's rows until its end, drop those after the savepoint, keep a non-transactional table's. | — |
 
 ---
 
@@ -1613,3 +1621,99 @@ Carried as notes, not gaps: the cluster crate's public API returns `String` erro
 a second signal does nothing during the drain, and a listener that dies at runtime goes unlogged
 (M10); the E2E suite lacks two System-Overview table-state cases, its TRUNCATE check would pass
 under a rewrite, and DuckDB fetches its Delta extension from the network.
+
+---
+
+## 31. M7 MySQL source — the planning findings (2026-10-14)
+
+M7 planning ran the position probes S-MY10a…k, S-MY11 and S-MY11b (`prototypes/source-capability`,
+`tests/probe_mysql_position.rs`, 12/12 on MySQL 8.4 with GTID on and off, MariaDB 10.11, 11.4 and
+11.8). Oleksii answered the four questions they raised (Q-M7-3…6), and the spec patches were
+applied (`Data-Flow.md`, `Configuration_Specification.md`, 2026-10-14).
+
+| ID | Change | Evidence |
+|---|---|---|
+| DA-SNAP-10 | 🟥 → 🔄. Measured: the stream delivers a semi-sync AFTER_SYNC commit ~5 ms after it is written, a plain read misses it for the whole stall, and the status position moves past it. Decided (Q-M7-3): MySQL chunk reads take `LOCK IN SHARE MODE` in their READ COMMITTED transaction; the window rule stays. The locking read needs only `SELECT`, waits for any open writer of its rows up to `innodb_lock_wait_timeout` (error 1205 → the chunk is read again), and blocks only writers of its rows. Closes with M7's test | S-MY11, S-MY11b; `Data-Flow.md` Phase 1 step 2b/2c; `Snapshot_Resumability…` §1.1 |
+
+### 31.1 The design points the probes settled (no new gaps)
+
+- **Per-change order (Q-M7-4).** The header `end_log_pos` is 0 inside MariaDB 11.4+ transactions and
+  inside MySQL compressed payloads, so `_seq` taken from the header would put a compressed
+  transaction's rows before earlier changes, and the keep-last collapse would keep a stale row.
+  `_seq` is (file index, computed end offset); `_lsn` is the transaction's GTID, or its start
+  `file:pos` in `binlog` mode (`Data-Flow.md` Phase 2b and lineage, roadmap D-IMPL-5).
+- **The replica id (Q-M7-5).** A second dump under one replica `server_id` ends the first, so
+  `source.mysql.server_id` (derived from the pipeline `id` by default) is unique per source server
+  (V-120).
+- **The heartbeat (Q-M7-6).** `source.mysql.heartbeat` sets `@master_heartbeat_period` and paces the
+  stream watchdog (DA-SRC-16), whose evidence on MySQL is the server listing this pipeline's dump
+  (V-121).
+- **A purged start position** fails with error 1236, which MySQL also uses for the same-replica-id
+  kick: the source tells a purge by a pre-check (`SHOW BINARY LOGS`, `@@gtid_purged`,
+  `BINLOG_GTID_POS`), never by the code alone.
+- **MariaDB's identity** is `@@server_id` alone (no `server_uuid`; `server_uid` changes on restart),
+  and server ids repeat across servers (every probe server has id 1): DA-SRC-21 below.
+- **A stalled commit before the start position.** In `binlog` mode and on MariaDB the start position
+  can already include a commit not yet visible, which the stream then never delivers. A snapshot's
+  locking read waits for it; with `snapshot.mode: never` it is missed, as is everything before the
+  start. Not a gap: `never` starts from the server's position by definition.
+
+### 31.2 New gap
+
+| ID | Gap | Severity | Surfaced by | Next |
+|---|---|---|---|---|
+| DA-SRC-21 | MariaDB in `binlog` (file/position) mode identifies its server by `@@server_id` alone, and ids repeat across servers: a pipeline pointed at another server with the same id resumes at a file and offset that mean nothing there, and BINLOG_SOURCE_CHANGED (`Data-Flow.md` Phase 2b) doesn't fire | 🟢 | S-MY10a (every probe MariaDB has `server_id` 1; no `server_uuid`; `server_uid` changes on restart) | A stronger check: MariaDB writes GTIDs in every mode, so record the GTID state at the position and compare `BINLOG_GTID_POS(file, pos)` on resume. Decide in M7 or later; GTID mode (the default) doesn't depend on it |
+
+## 32. M7a MySQL source — the plan (2026-10-14)
+
+M7 was split (Q-M7a-1): M7a is `data-avalanche-source-mysql` and its tests, M7b the worker's MySQL
+checkpoint, the wiring and the parity E2E. M7a's plan (`doc/v1.0/M7a-mysql-source.md`) was built
+task by task in a scratch workspace and replayed from its code blocks; Oleksii answered Q-M7a-1…9
+and approved the plan and two spec patches (`Schema_Change…` §7.2: the online-migration cut-over
+swap is followed, partition operations that change rows without row events halt; config §9.2.2:
+the dump is watched by its connection id).
+
+| ID | Change | Evidence |
+|---|---|---|
+| DA-SNAP-10 | 🔄 (stays): the locking chunk read is built and tested; ✅ when M7a merges | M7a Task 10 |
+| DA-SRC-12 | ✅ (stays): the payload guard is built and unit-tested; its fault-injection E2E is M7b's | M7a Task 6, Task 13 |
+| DA-SRC-21 | 🟥 (stays): M7a keeps `@@server_id` as MariaDB's identity, and halts on a checkpoint without one | M7a Task 14 |
+| DA-SRC-23 | 🆕 ✅: MariaDB's compressed events, read as nothing by `mysql_common`, are decompressed by the source | M7a Task 6, Task 14 (`compressed_events_decode`) |
+
+### 32.1 New gaps
+
+| ID | Gap | Severity | Surfaced by | Next |
+|---|---|---|---|---|
+| DA-SRC-22 | MySQL `verify-ca` checks the host name too (`mysql_async` 0.37.1's name-error match misses rustls 0.23's text): it fails closed, so a `verify-ca` connection by an unnamed address is refused | 🟢 | M7a Task 4 (pinned by `verify_ca_by_an_unnamed_address_is_refused_like_verify_full`) | An upstream fix, or our own rustls verifier for `verify-ca`; the test notices when an upgrade lifts it |
+| DA-SNAP-14 | An `ENUM` key sorts by member index; a member reorder between the DDL and the stream's signal can make the next chunk skip or repeat rows (the chunk's read plan compares value types only) | 🟢 | M7a Task 10 (reasoned, not measured) | Record the members with the cursor and halt the table when they differ, or key an `ENUM` cursor by label |
+| DA-X-13 | One slice-1 E2E run beside a heavy build failed `streaming::a_large_transaction_lands_at_once`: the 50,000-row transaction counted more than one Delta commit, though its rows were never seen in part. Alone and in a full run without the load it passed | 🟢 | M7a planning, on the final scratch tree | Watch CI; if it recurs, find what made the second commit (a marker or position commit beside the transaction's) |
+
+---
+
+## 33. M7a MySQL source — the exit (2026-10-16)
+
+M7a (`doc/v1.0/M7a-mysql-source.md`) was executed 2026-10-14…16: 16 tasks, review fixes on Tasks
+4, 6, 7, 11, 12 and 13, then a whole-branch review with one Critical and five Important findings,
+all fixed before the PR, as were its re-review's residuals (the plan's "Deviations during
+execution"). The Critical: ENUM and SET labels lost their case in the stream. Two spec patches
+(Oleksii, 2026-10-15/16): `binlog_row_metadata = FULL` is required, and the binlog must carry the
+source's changes (no binlog filter; a replica logs what it applies). The crate's suites pass on
+MySQL 8.4 (GTIDs on and off) and MariaDB 11.8 (both modes), 11.4 and 10.11.
+
+| ID | Change | Evidence |
+|---|---|---|
+| DA-SNAP-10 | 🔄 (stays): built and tested; ✅ when M7a merges | M7a Task 10 |
+| DA-SRC-12 | ✅ (stays): the fault-injection E2E is M7b's | M7a Task 6, Task 13 |
+| DT-R6 | Resolved: `binlog_row_metadata = FULL` is required, and each table map is checked against the decode schema (names, signedness, character sets, ENUM/SET labels). A positional decode can't fall back to catalog names: a catalog ahead of the stream would read same-typed columns into each other | `Schema_Change…` §2.2, §9, §11; config §11.2; `tests/row_metadata.rs` |
+
+### 33.1 New gaps
+
+| ID | Gap | Severity | Surfaced by | Next |
+|---|---|---|---|---|
+| DA-SRC-24 | A Galera node with `log_slave_updates` off isn't detected as a replica: its replication status is empty, so the binlog-coverage check passes while the binlog lacks its peers' changes | 🟢 | The whole-branch re-review | Read `wsrep_on` beside the replica status |
+| DA-SRC-25 | A case-only column rename reads as a proven rename, which the Delta sink doesn't apply (the table halts or degrades) | 🟢 | The fix wave (column names compare without case) | Update the cached name without an evolution |
+| DA-SRC-26 | A MariaDB rollback after tracked rows halts the pipeline: MariaDB logs the undone rows in a transaction with non-transactional changes, and the stream has already emitted them | 🟢 | The fix wave's measurement (10.11, 11.4, 11.8) | Hold a transaction's rows to its end and drop those a savepoint rollback undid |
+
+Carried to M7b in the plan's exit checklist: an error when `server_uuid` reads NULL, a
+file/position resume IT, the pipeline dropping a halted table's buffered rows, and `re_snapshot`
+at start end to end through the worker.

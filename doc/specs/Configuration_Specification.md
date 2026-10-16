@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-08
+updated: 2026-10-16
 domain: Architecture
 status: Specification (supersedes the Configuration_file_model.md draft)
 tags: [architecture, configuration, spec, validation, multi-sink, iceberg, delta-lake]
@@ -697,6 +697,8 @@ source:
 | `tinyint1_as_bool` | bool | no | `true` | PR | Map `TINYINT(1)` columns to logical `bool`. When `true`, requires the display-width from the catalog query (channel C); when `false`, `TINYINT(1)` maps as `TINYINT SIGNED` → `Int16`. See `research/Type_Mapping.md`. |
 | `tinyint1_detection` | enum `information_schema`\|`none` | no | `information_schema` | PR | Source of the `TINYINT(1)` display-width signal. `none` disables the detection (all `TINYINT` treated as integer); `information_schema` uses the catalog query (always available via channel C). |
 | `binlog_purge_action` | enum `error`\|`re_snapshot` | no | `error` | R | Resume position purged on the server (G-26). `error`: halt with an error (operator decides). `re_snapshot`: automatic recovery via incremental re-snapshot. GTID `replication_type` remains recommended. |
+| `server_id` | integer | no | derived from `id` | PR | The replica server id the binlog dump registers with. The source server ends any other dump registered under the same id (measured, S-MY10), so each pipeline needs its own (V-120). Default: derived from the pipeline `id` — the first four bytes of its BLAKE3 hash, little-endian, with the top bit set (2147483648…4294967295, away from the small ids replicas usually take). Set it when that range collides with the server's own replicas. |
+| `heartbeat` | Duration | no | `60s` | R | The binlog heartbeat period (`@master_heartbeat_period`): an idle server sends a heartbeat this often (V-121). Also paces the stream watchdog, as `postgres.heartbeat` does: a stream silent for 3 heartbeats while the heartbeat's checks fail or find no binlog dump of the stream's connection on the server (its connection id in `information_schema.PROCESSLIST`, which a user without `PROCESS` sees for its own connections) is reconnected (DA-SRC-16). |
 
 ### 9.3 `tables`
 
@@ -1103,7 +1105,8 @@ on.
 | PostgreSQL | Tracked tables are **logged** (`relpersistence = 'p'`; not `UNLOGGED`) | error → halt table (`TABLE_NOT_REPLICABLE`, explicit table) / warning + skip (glob-matched) | PostgreSQL doesn't publish unlogged tables: such a table would be snapshotted once and then never change. |
 | MySQL | **`binlog_format = ROW`** | error → halt pipeline | Granular row-level change capture. |
 | MySQL | **`binlog_row_image = FULL`** | error → halt pipeline | Complete before-images / equality-delete keys. |
-| MySQL | **`binlog_row_metadata = FULL`** | warning → continue | Column names/PK/ENUM strings in `TABLE_MAP`; if absent, names fall back to the catalog query (channel C). |
+| MySQL | **`binlog_row_metadata = FULL`** | error → halt pipeline; a table map without column names at run time (the setting turned back) → halt table | Column names and ENUM/SET strings in `TABLE_MAP`. A row is decoded by position against the schema as of its statement, which channel C builds partly from the catalog read later: the stream checks each table map's names, signedness, charsets and ENUM/SET strings against that schema and halts the table on a mismatch, instead of reading same-typed columns into each other (`Schema_Change…` §2.2). |
+| MySQL | **The source database's changes reach the binlog**: no binlog filter (`binlog_do_db` / `binlog_ignore_db` empty); a server that replicates from another logs what it applies (`log_replica_updates`, MariaDB `log_slave_updates` = ON) | error → halt pipeline; a server with the setting OFF whose replication status the user can't read → warning, naming the grant | Otherwise the snapshot copies the tables and the stream never sees a change to them, without an error. Even a filter that lets `source.db` through leaves out its DDL and `TRUNCATE` issued from another default database: the server filters a statement by the session's database, not its tables'. MariaDB's `log_slave_updates` default is OFF. |
 | MySQL | **`REPLICATION CLIENT` / `REPLICATION SLAVE`** privilege | error → halt pipeline | Binlog dump access. |
 | Both | Each table has an **identifier**: an inferred PK, or a `tables.primary_key` override whose columns exist and are top-level, primitive, NOT NULL, non-floating | error → halt table (explicit table) / warning + skip (glob-matched PK-less table) | Upsert/delete keying (G-13, G-30). |
 | PostgreSQL | Identifier columns ⊆ **REPLICA IDENTITY** columns | error → halt table, naming the missing columns | Before-image must carry the old key (`Ghost_Row…` §2). |
@@ -1275,6 +1278,7 @@ errors.
 | V-116 | `sink.iceberg.catalog.rest.auth` | `sigv4` → `error`: the pinned iceberg-rust REST client has no SigV4 signing (DA-CAT-7; upstream #3082/#3092). `none`/`bearer`/`oauth2` unaffected; on AWS use `catalog.glue`. Lifted when a pinned release carries SigV4 and it is probed against the Glue or S3 Tables REST endpoint. | error | pipeline |
 | V-118 | `source.timeouts.snapshot` | ≥ 10s. | error | pipeline |
 | V-119 | `sink.delta.merge_memory_limit` | ≥ 16 MiB when set. | error | pipeline |
+| V-121 | `source.mysql.heartbeat` | Between `1s` and `4294967s` (the server's heartbeat period range). | error | pipeline |
 
 ### 13.4 Cross-field / conditional
 
@@ -1339,7 +1343,8 @@ errors.
 | V-057 | pipeline name (map key) | Matches `^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`. | error | pipeline |
 | V-058 | `source.postgres.slot` | Matches `^[a-z_][a-z0-9_]{0,62}$`; unique per source server (`host` + `port`) across pipelines — PostgreSQL scopes slot names to the server, not the database. | error | config |
 | V-059 | `source.postgres.publication` | Valid identifier (`warning` when it needs quoting). Unique per source database (`host` + `port` + `db`) across pipelines: `error` when a pipeline sharing it has `slot_management: managed` (it reconciles the publication to its own tables, dropping the others'), `warning` otherwise (Q-M5-14). | error / warning | pipeline |
-| V-060 | `defaults` | Must not set per-pipeline-unique resource names (`postgres.publication`, `postgres.slot`, `id`). | error | config |
+| V-060 | `defaults` | Must not set per-pipeline-unique resource names (`postgres.publication`, `postgres.slot`, `mysql.server_id`, `id`). | error | config |
+| V-120 | `source.mysql.server_id` | ≥ 1 when set. Unique per source server (`host` + `port`) across pipelines, set or derived: two dumps under one id end each other. | error | config |
 
 ### 13.8 Reload-time & cluster
 
@@ -1606,6 +1611,13 @@ Every deviation, so nothing is silent:
 24. **M6a planning (2026-10-03, `v1.0/00-roadmap.md` §7 S-U)** — new rule **V-118**:
     `source.timeouts.snapshot` is at least `10s` (§9.1, §13.3); a `0` would halt every snapshot at
     once.
+25. **M7 planning (2026-10-14, Q-M7-5, Q-M7-6)** — `source.mysql.server_id` (the binlog dump's
+    replica id, derived from the pipeline `id` by default; unique per source server, **V-120**;
+    not in `defaults`, V-060) and `source.mysql.heartbeat` (the binlog heartbeat period and the
+    stream watchdog's pace, **V-121**) (§9.2.2, §13.3, §13.7).
+26. **M7a planning (2026-10-14, D-M7a.21)** — §9.2.2 `heartbeat`: the watchdog finds the stream's
+    binlog dump by its connection id in `information_schema.PROCESSLIST` (visible to a user
+    without `PROCESS`), not by `server_id`.
 
 None of these change the **decided** catalog-auth schema (hive Thrift `none/ldap/kerberos`;
 rest HTTP `none/bearer/oauth2/sigv4`) — those are reproduced verbatim from

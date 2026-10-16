@@ -219,6 +219,8 @@ pub(crate) struct RawMysql {
     pub tinyint1_as_bool: L<bool>,
     pub tinyint1_detection: L<Tinyint1Detection>,
     pub binlog_purge_action: L<BinlogPurgeAction>,
+    pub server_id: L<u32>,
+    pub heartbeat: L<Duration>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

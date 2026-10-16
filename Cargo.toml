@@ -25,6 +25,7 @@ data-avalanche-state = { path = "crates/data-avalanche-state" }
 data-avalanche-pipeline = { path = "crates/data-avalanche-pipeline" }
 data-avalanche-sink-delta = { path = "crates/data-avalanche-sink-delta" }
 data-avalanche-source-pg = { path = "crates/data-avalanche-source-pg" }
+data-avalanche-source-mysql = { path = "crates/data-avalanche-source-mysql" }
 data-avalanche-telemetry = { path = "crates/data-avalanche-telemetry" }
 data-avalanche-cluster = { path = "crates/data-avalanche-cluster" }
 thiserror = "2"
@@ -37,6 +38,12 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 object_store = { version = "0.14.2", features = ["aws", "gcp", "azure"] }
 tokio-postgres = "0.7"
 mysql_async = { version = "=0.37.1", default-features = false, features = ["default-rustls", "binlog"] }
+# The MySQL source (roadmap §2.1): the binlog events mysql_async reads, zlib for MariaDB's
+# compressed events (Q-M7a-5), and the DDL classifier's parser (MySQL_DDL_Classifier §5; without
+# `recursive-protection`, whose stack growth builds C code: the parser's recursion limit bounds it).
+mysql_common = { version = "=0.37.3", default-features = false }
+flate2 = "1"
+sqlparser = { version = "=0.62.0", default-features = false, features = ["std"] }
 rustls = { version = "0.23", features = ["aws_lc_rs"] }
 serde-saphyr = { version = "=1.3.0", default-features = false, features = ["deserialize"] }
 humantime = "2.4"

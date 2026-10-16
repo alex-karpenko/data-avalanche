@@ -5,8 +5,8 @@
 use std::fmt::Display;
 use std::str::FromStr;
 
-use data_avalanche_core::SourcePosition;
 use data_avalanche_core::position::Lsn;
+use data_avalanche_core::{ServerIdentity, SourcePosition};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::doc::{CREATE_ATTEMPTS, DocStore, Document, StateError, Versioned};
@@ -68,15 +68,6 @@ impl SlotDoc {
     pub fn is_intent(&self) -> bool {
         self.confirmed_flush_lsn == Lsn(0)
     }
-}
-
-/// The source server a MySQL / MariaDB position was read from. File/position mode refuses to
-/// resume against a different server (`BINLOG_SOURCE_CHANGED`, Q-M7-2).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "engine", rename_all = "lowercase", deny_unknown_fields)]
-pub enum ServerIdentity {
-    Mysql { server_uuid: String },
-    Mariadb { server_id: u32 },
 }
 
 /// MySQL / MariaDB: the stream position (`mysql-gtid:…`, `mariadb-gtid:…`, `binlog:<file>:<pos>`).

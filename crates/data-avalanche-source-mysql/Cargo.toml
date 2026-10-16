@@ -1,0 +1,31 @@
+[package]
+name = "data-avalanche-source-mysql"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The MySQL and MariaDB source: the binlog over mysql_async, catalog channels, locking keyset snapshots."
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+data-avalanche-config.workspace = true
+data-avalanche-core.workspace = true
+flate2.workspace = true
+futures-util.workspace = true
+mysql_async.workspace = true
+rustls.workspace = true
+serde_json.workspace = true
+sqlparser.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+uuid.workspace = true
+
+[dev-dependencies]
+data-avalanche-testkit.workspace = true
+mysql_common.workspace = true
+rcgen.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

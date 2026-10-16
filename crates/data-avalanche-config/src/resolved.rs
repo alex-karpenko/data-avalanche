@@ -261,6 +261,14 @@ pub struct Mysql {
     pub tinyint1_as_bool: bool,
     pub tinyint1_detection: Tinyint1Detection,
     pub binlog_purge_action: BinlogPurgeAction,
+    /// The replica id the binlog dump registers with: set, or [`derived_server_id`] of the
+    /// pipeline `id` (§9.2.2, V-120).
+    ///
+    /// [`derived_server_id`]: crate::derived_server_id
+    pub server_id: u32,
+    /// `@master_heartbeat_period`, and the stream watchdog's pace (§9.2.2, V-121).
+    #[serde(serialize_with = "ser_duration")]
+    pub heartbeat: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

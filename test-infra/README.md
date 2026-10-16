@@ -12,6 +12,8 @@ on `PATH`; it fetches DuckDB itself.
 | postgres-14…17 | postgres:14…17 | 55414…55417 | same | matrix |
 | postgres-tls | postgres:18, TLS required (`postgres-tls.sh`) | 55419 | avalanche / avalanche; `avalanche_cert` by client certificate | default |
 | mysql-84 | mysql:8.4 (GTID on) | 53384 | root / avalanche, db `avalanche` | default |
+| mysql-84-nogtid | mysql:8.4 (GTID off: `replication_type: binlog`; TLS off) | 53385 | same | default |
+| mysql-tls | mysql:8.4 (GTID on), TLS required (`mysql-tls.sh`) | 53386 | root / avalanche; `avalanche_cert` / `unused` with its client certificate | default |
 | mariadb-118 | mariadb:11.8 (`gtid_strict_mode=1`) | 53318 | root / avalanche | default |
 | mariadb-114, mariadb-1011 | mariadb:11.4, 10.11 | 53314, 53311 | root / avalanche | matrix |
 | rustfs (S3) | rustfs/rustfs:1.0.0 | 59000 | avalanche / avalanche-secret | default |
@@ -20,7 +22,9 @@ on `PATH`; it fetches DuckDB itself.
 Bucket / container `data-avalanche-test` is created by the `init` profile (`up.sh` runs it). Azurite keeps
 port 10000 because `object_store`'s emulator mode always targets `127.0.0.1:10000`.
 
-Added by a later milestone: `mysql-84-nogtid` (M7, file/position mode).
+`mysql-tls` writes its throwaway CA and client pair to `test-infra/.tls/mysql/` at each start; its
+server certificate names `localhost` only, so a `verify-full` connection to `127.0.0.1` fails by
+design.
 
 ## PostgreSQL
 
@@ -39,6 +43,28 @@ the `verify-ca` test needs), and a client certificate for the role
 `avalanche_cert`, which authenticates by certificate (`pg_hba` `cert`). It writes the CA and the
 client pair to `test-infra/.tls/` (git-ignored) for the TLS tests; the server key stays in the
 container. Nothing is committed.
+
+## MySQL and MariaDB
+
+The MySQL source's tests (`crates/data-avalanche-source-mysql/tests`) read the target
+`DATA_AVALANCHE_MYSQL`: a server of the table above and the replication mode the tests use on it.
+`ci.yml` runs them on every change against `mysql-84` (the default), `mysql-84-nogtid`
+(file/position), `mariadb-118` (GTID) and `mariadb-118-binlog` (`mariadb-118` in file/position
+mode); `.github/workflows/weekly.yml` runs `mariadb-114` and `mariadb-1011` (GTID) every Monday:
+
+```sh
+docker compose -f test-infra/compose.yaml --profile matrix up -d --wait mariadb-114
+DATA_AVALANCHE_IT=1 DATA_AVALANCHE_MYSQL=mariadb-114 cargo test -p data-avalanche-source-mysql --tests
+```
+
+The TLS tests run with the `mysql-84` target only, against `mysql-tls`. Four test binaries
+change server-wide state or need the server to themselves, and cargo runs each alone, never
+beside the `mysql` tests: `binlog_purge` (`PURGE BINARY LOGS` removes the older binlogs of the
+target), `mariadb_compress` (turns `log_bin_compress` on, and back to the server default before
+it asserts), `row_metadata` (sets `binlog_row_metadata = MINIMAL`, and back to FULL however the
+test ends) and `binlog_rotate` (`FLUSH BINARY LOGS`, then a position no other write moved).
+MariaDB keeps a binlog it just closed until its binlog checkpoint moves on, so the purge test
+retries for up to 5 s.
 
 ## GCS: a real bucket, not an emulator
 

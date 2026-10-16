@@ -2,7 +2,7 @@
 
 use serde_json::{Value, json};
 
-use crate::cases::{Case, Edit, Expect::*, case, pg_delta};
+use crate::cases::{Case, Edit, Expect::*, case, mysql_delta, pg_delta};
 
 /// The base config with a second pipeline `q` copied from `p`, then given its own id, slot and
 /// publication so the two don't collide.
@@ -13,6 +13,14 @@ fn two_pipelines() -> Value {
         .set("/pipelines/q/id", json!("q"))
         .set("/pipelines/q/source/postgres/slot", json!("q_slot"))
         .set("/pipelines/q/source/postgres/publication", json!("q_pub"))
+}
+
+/// Two MySQL pipelines `p` and `q` on one server, each with its own derived `server_id`.
+fn two_mysql() -> Value {
+    let doc = mysql_delta();
+    let q = doc.pointer("/pipelines/p").unwrap().clone();
+    doc.set("/pipelines/q", q)
+        .set("/pipelines/q/id", json!("q"))
 }
 
 pub fn cases() -> Vec<Case> {
@@ -129,5 +137,33 @@ pub fn cases() -> Vec<Case> {
         case("V-060", Silent, "shared settings in defaults", || {
             pg_delta().set("/defaults/source/postgres/heartbeat", json!("30s"))
         }),
+        case("V-060", Error, "mysql server_id in defaults", || {
+            mysql_delta().set("/defaults/source/mysql/server_id", json!(7))
+        }),
+        case("V-060", Silent, "mysql heartbeat in defaults", || {
+            mysql_delta().set("/defaults/source/mysql/heartbeat", json!("30s"))
+        }),
+        case("V-120", Error, "server_id 0", || {
+            mysql_delta().set("/pipelines/p/source/mysql/server_id", json!(0))
+        }),
+        case("V-120", Error, "server_id shared on one server", || {
+            two_mysql()
+                .set("/pipelines/p/source/mysql/server_id", json!(7))
+                .set("/pipelines/q/source/mysql/server_id", json!(7))
+        }),
+        // A set id collides with another pipeline's derived one just the same.
+        case("V-120", Error, "server_id equal to a derived one", || {
+            two_mysql().set(
+                "/pipelines/q/source/mysql/server_id",
+                json!(data_avalanche_config::derived_server_id("p")),
+            )
+        }),
+        case("V-120", Silent, "same server_id on another port", || {
+            two_mysql()
+                .set("/pipelines/p/source/mysql/server_id", json!(7))
+                .set("/pipelines/q/source/mysql/server_id", json!(7))
+                .set("/pipelines/q/source/port", json!(3307))
+        }),
+        case("V-120", Silent, "derived server_ids", two_mysql),
     ]
 }

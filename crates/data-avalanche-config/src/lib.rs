@@ -88,10 +88,14 @@ mod template;
 mod units;
 mod walk;
 
+pub use build::derived_server_id;
 pub use coerce::LogFilter;
 pub use diag::{Diagnostic, Locus, PARSE, Report, Severity, TYPE};
 pub use diff::{ConfigDiff, FieldChange, PipelineChange, diff};
-pub use external::{ClusterAnchor, check_cluster_anchor, check_table_set, check_unbounded_numeric};
+pub use external::{
+    ClusterAnchor, check_cluster_anchor, check_partitioning, check_table_set,
+    check_unbounded_numeric, glob_match,
+};
 pub use leaf::Loc;
 pub use load::{Loaded, load_file, load_str, validate_str};
 pub use material::{FileRef, Origin, Pem};

@@ -1,7 +1,7 @@
 ---
-updated: 2026-10-02
+updated: 2026-10-14
 domain: Data Types
-tags: [data-types, mapping, arrow, iceberg, delta-lake, multi-sink, postgres, mysql, cdc]
+tags: [data-types, mapping, arrow, iceberg, delta-lake, multi-sink, postgres, mysql, mariadb, cdc]
 resolves: G-18
 sources: []
 ---
@@ -216,6 +216,12 @@ see `prototypes/source-capability/`) exposes the column type code and optional m
 supplementary schema data from `information_schema` — this is the primary reason
 `schema_evolution.method: query` is the default for MySQL.
 
+As built in M7a (`M7a-mysql-source.md` Task 7): the decode plan comes from the catalog column
+(`DATA_TYPE`, `COLUMN_TYPE`, charset, precision, scale, fsp), and one decoder reads a value from
+the binlog and from a snapshot chunk alike, so the two agree (Task 15 checks every type both
+ways). The same tables hold for MariaDB, with its own types in §MariaDB types below. The decode
+traps measured on MySQL 8.4, MariaDB 11.8 and 10.11 are listed in §Decode traps.
+
 ### Integer Types
 
 MySQL integers exist in both signed and unsigned variants. Iceberg has no unsigned integer
@@ -261,11 +267,18 @@ When disabled, `TINYINT(1)` maps as `TINYINT SIGNED` → `Int16`.
 | `MEDIUMTEXT` | `Text(String)` | `Utf8` | `string` | Max 16 MiB |
 | `LONGTEXT` | `Text(String)` | `Utf8` | `string` | Max 4 GiB at the server, but a replicated value is at most 1 GiB (`max_allowed_packet`); batches roll over instead of `LargeUtf8` (see Arrow widths at Hop 2) |
 
+**Charsets (Q-M7a-2).** Text columns in the UTF-8 family (`utf8mb4`, `utf8mb3`, `ascii`) and
+`latin1` are read; `latin1` is MySQL's cp1252 (its table equals the server's `CONVERT` for bytes
+1…255, measured), so `0x80` is `€`. A column of charset `binary` reads as bytes. A column of any
+other charset halts the table at resolution, naming the column (remedy: convert the column, or
+override it to `binary`). The binlog carries a text value's raw bytes in the column's charset;
+a chunk reads it converted to UTF-8 (`SET NAMES utf8mb4`).
+
 ### Binary Types
 
 | MySQL Type | ColumnValue | Arrow DataType | Iceberg Type | Notes |
 |-----------|------------|--------------|-----------|-------|
-| `BINARY(n)` | `Bytes(Vec<u8>)` | `Binary` | `fixed(n)` | Right-padded with `\0` |
+| `BINARY(n)` | `Bytes(Vec<u8>)` | `Binary` | `fixed(n)` | Right-padded with `\0`. The binlog strips the trailing zeros; the decoder pads back to `n` |
 | `VARBINARY(n)` | `Bytes(Vec<u8>)` | `Binary` | `binary` | |
 | `TINYBLOB` | `Bytes(Vec<u8>)` | `Binary` | `binary` | Max 255 bytes |
 | `BLOB` | `Bytes(Vec<u8>)` | `Binary` | `binary` | |
@@ -280,18 +293,53 @@ When disabled, `TINYINT(1)` maps as `TINYINT SIGNED` → `Int16`.
 | `TIME[(fsp)]` | `Time(i64)` | `Time64(Microsecond)` | `time` | `fsp` 0–6; an elapsed time, −838:59:59…838:59:59, as signed microseconds (see Date/time edge values) |
 | `DATETIME[(fsp)]` | `Timestamp { value, with_tz: false }` | `Timestamp(Microsecond, None)` | `timestamp` | No timezone; MySQL stores as-is |
 | `TIMESTAMP[(fsp)]` | `Timestamp { value, with_tz: true }` | `Timestamp(Microsecond, Some("UTC"))` | `timestamptz` | MySQL converts to UTC on write; returned as UTC |
-| `YEAR` | `Int32(i32)` | `Int32` | `int` | 4-digit year integer (1901..2155); 0000 is also valid |
+| `YEAR` | `Int32(i32)` | `Int32` | `int` | 4-digit year integer (1901..2155); 0000 is also valid (the binlog's `1900`, see §Decode traps) |
 
 ### Structured and Special Types
 
 | MySQL Type | ColumnValue | Arrow DataType | Iceberg Type | Notes |
 |-----------|------------|--------------|-----------|-------|
-| `JSON` | `Json(serde_json::Value)` | `Utf8` | `string` | MySQL's binary JSON decoded to value, serialized as string |
+| `JSON` | `Json(serde_json::Value)` | `Utf8` | `string` | MySQL's binary JSON decoded to value, serialized as string. A partial update (`binlog_row_value_options = PARTIAL_JSON`) is applied to the before image, so the after image is the whole document (Q-M7a-3) |
 | `ENUM('a','b',...)` | `Text(String)` | `Utf8` | `string` | Binlog TABLE_MAP carries member list; decode integer index to label |
 | `SET('a','b',...)` | `Array { element_type: TextType, values }` | `List<Utf8>` | `list<string>` | Binlog carries bitmask; decode to list of active member labels |
 | `BIT(N)` | `Bytes(Vec<u8>)` | `Binary` | `fixed(⌈N/8⌉)` | MSB-first packed bits; N ∈ 1..64 |
-| `GEOMETRY` | `Bytes(Vec<u8>)` | `Binary` | `binary` | WKB format |
-| `POINT`, `LINESTRING`, `POLYGON`, `MULTIPOINT`, `MULTILINESTRING`, `MULTIPOLYGON`, `GEOMETRYCOLLECTION` | `Bytes(Vec<u8>)` | `Binary` | `binary` | WKB format |
+| `GEOMETRY` | `Bytes(Vec<u8>)` | `Binary` | `binary` | MySQL internal form: SRID (4 bytes LE) + WKB, as stored (Q-M7a-7) |
+| `POINT`, `LINESTRING`, `POLYGON`, `MULTIPOINT`, `MULTILINESTRING`, `MULTIPOLYGON`, `GEOMETRYCOLLECTION` | `Bytes(Vec<u8>)` | `Binary` | `binary` | MySQL internal form: SRID (4 bytes LE) + WKB, as stored (Q-M7a-7) |
+
+### MariaDB types (Q-M7a-4)
+
+MariaDB is read through the MySQL path (D-V1.5). Its own types:
+
+| MariaDB Type | ColumnValue | Arrow DataType | Iceberg Type | Notes |
+|-----------|------------|--------------|-----------|-------|
+| `UUID` (10.7+) | `Uuid(Uuid)` | `FixedSizeBinary(16)` | `uuid` | The binlog carries the 16 bytes in natural order, trailing zeros stripped (padded back); a chunk reads the text |
+| `INET4` (10.10+) | `Text(String)` | `Utf8` | `string` | Dotted quad, as MariaDB prints it |
+| `INET6` | `Text(String)` | `Utf8` | `string` | MariaDB's text, which follows MySQL's `ipv6_to_str`, not RFC 5952: the first longest zero run is compressed even when it is one group, and an IPv4 tail is dotted only after a run of six zero groups or five and `ffff` (ported; 21 fixed and 300 random addresses match 11.8). Trailing zeros stripped in the binlog, padded back |
+| `VECTOR(n)` (11.7+) | `Bytes(Vec<u8>)` | `Binary` | `binary` | n float32 values, little-endian, as stored |
+| `JSON` | `Text(String)` | `Utf8` | `string` | MariaDB's `JSON` is `LONGTEXT` with a check constraint: it plans as text |
+
+A system-versioned table (`WITH SYSTEM VERSIONING`) halts when named and is skipped with a warning
+when a glob matched it: its history rows aren't in the binlog's row events.
+
+### Decode traps (measured in M7a planning, MySQL 8.4, MariaDB 11.8 and 10.11)
+
+`mysql_common` 0.37.3, which `mysql_async` 0.37.1 decodes rows with, gets these wrong or leaves
+them to the caller; the decoder corrects each:
+
+- A signed `MEDIUMINT` arrives without its sign (−8388608 reads as 8388608): sign-extended from
+  24 bits.
+- `YEAR` 0000 arrives as the text `1900` (`mysql_common` adds 1900 to the stored byte): read as 0.
+- `BINARY(n)` and MariaDB's `UUID`, `INET4`, `INET6` arrive with their trailing `0x00` bytes
+  stripped: padded back to the declared length.
+- A `TIMESTAMP` arrives as UTC epoch text (`seconds[.micros]`, `0` for the zero value); a chunk
+  reads it in the session's zone, pinned to `+00:00`.
+- `ENUM` arrives as its member index (0 is the empty string of an invalid value) and `SET` as a
+  bitmap; the members come from the catalog's `COLUMN_TYPE`.
+- MySQL drops the display width from `COLUMN_TYPE` (`smallint unsigned`), MariaDB keeps it
+  (`smallint(5) unsigned`): plans read `DATA_TYPE` and the `unsigned` suffix only. `TINYINT(1)`
+  is detected from `COLUMN_TYPE` on both.
+- MariaDB's compressed events (`log_bin_compress`) read as nothing: the source decompresses them
+  itself (Q-M7a-5).
 
 ---
 

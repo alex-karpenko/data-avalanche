@@ -1,5 +1,5 @@
 ---
-updated: 2026-09-26
+updated: 2026-10-16
 domain: Configuration
 tags: [wal-lag, binlog-purge, backpressure, azure, mariadb, catalog, iam, strip-schema, batch, cdc]
 resolves: [G-22, G-26, G-27, G-34, G-35, G-37, G-38, G-11.3]
@@ -116,7 +116,11 @@ These are mechanical edits to Oleksii-owned spec docs; staged here as ready-to-a
 - **DT-R5 (ENUM/SET representation):** confirmed against G-18 — `ENUM → string`, `SET → list<string>`;
   append-only value additions Ignorable, reorder/remove Unsafe.
 - **DT-R6 (`binlog_row_metadata`):** confirmed **recommended (warn if absent)**, names fall back to
-  channel C — already in config §13.
+  channel C — already in config §13. **Superseded (M7a, 2026-10-15): required.** A row is decoded by
+  position against a schema channel C builds partly from a later catalog read, so catalog names
+  can't stand in for the table map's: same-typed columns would be read into each other. The stream
+  checks each table map's names, signedness, charsets and ENUM/SET strings (config §11.2,
+  `Schema_Change…` §2.2).
 - **DT-R7 (`rescan_interval` default):** confirmed **60m**, `0` disables — already in config §9.7 (formerly §9.5.1).
 
 These residuals had recommendations already; this batch ratifies them — none reopen a gap.

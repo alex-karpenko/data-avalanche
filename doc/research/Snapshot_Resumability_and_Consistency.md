@@ -1,8 +1,8 @@
 ---
-updated: 2026-10-03
+updated: 2026-10-14
 domain: Data Flow
 tags: [snapshot, resumability, incremental-snapshot, watermark, keyset, consistency, on-demand, cdc]
-resolves: [G-6, G-7, G-20, DA-SNAP-9]
+resolves: [G-6, G-7, G-20, DA-SNAP-9, DA-SNAP-10]
 ---
 
 # Snapshot Resumability and Consistency (Incremental Chunked Model)
@@ -103,6 +103,26 @@ Evidence (`crates/data-avalanche-pipeline`, M6a): the reconciler's unit tests; t
 test (40,000 rows, four concurrent writers) fails without the reconciler's filtering; the
 stalled-synchronous-commit test fails without it and under the window rule.
 
+**MySQL: the read locks the rows it reads (DA-SNAP-10; M7 planning, 2026-10-14, Q-M7-3).** The
+window rule alone misses the second case above. A semi-sync commit waiting at AFTER_SYNC for its
+replica's ack is in the binlog, so the stream delivers it, while a read doesn't see it yet: the
+stream applies it first, the window rule finds no newer change, and the chunk's older row
+overwrites it. Measured on MySQL 8.4 and MariaDB 10.11 / 11.8 (`prototypes/source-capability`
+S-MY11): the stream delivered the stalled transaction in ~5 ms and a plain read missed it for the
+6 s stall. MariaDB's default wait point, AFTER_COMMIT, has no such gap; AFTER_SYNC is MySQL's
+default. So a MySQL chunk reads in a short READ COMMITTED transaction **with `LOCK IN SHARE
+MODE`**: the shared row locks wait for any writer of the chunk's rows still committing, the stalled
+commit included, and then read its committed value (S-MY11: the locking read waited the 6 s, then
+saw it). The window rule then holds: a change the stream applies after the read was issued is newer
+than the read, and one the read waited for is in what it read.
+
+What the locking read costs (S-MY11b): `SELECT` alone is enough (no write privilege); it waits for
+*any* open writer of its rows, so a long user transaction delays a chunk, up to
+`innodb_lock_wait_timeout` (default 50 s), when it fails with error 1205 and the chunk is read again
+after a backoff; while the chunk's transaction is open, writers of its rows wait, while inserts and
+writers of other rows don't (READ COMMITTED takes no gap locks). The transaction holds one
+statement and commits at once. (`FOR SHARE` is MySQL-only: MariaDB 11.8 rejects it.)
+
 ---
 
 ## §2 — Cursor format (D-6.2, resolves G-6)
@@ -199,8 +219,8 @@ mechanism. Idempotent upserts mean re-reading existing keys simply re-writes the
 | Concern | PostgreSQL | MySQL |
 |---|---|---|
 | Stream start | logical slot `start_lsn` | binlog at `gtid_executed` |
-| What a chunk's read saw | `pg_current_snapshot()` in the chunk's transaction (§1.1) | none: the window rule (§1.1) |
-| Chunk read isolation | `REPEATABLE READ` short txn | `READ COMMITTED` short txn |
+| What a chunk's read saw | `pg_current_snapshot()` in the chunk's transaction (§1.1) | none: the window rule, with a locking read (§1.1) |
+| Chunk read isolation | `REPEATABLE READ` short txn | `READ COMMITTED` short txn, `LOCK IN SHARE MODE` (§1.1, DA-SNAP-10) |
 | Privileges removed | `EXPORT_SNAPSHOT` no longer load-bearing for snapshot consistency | **`RELOAD` / `LOCK TABLES` no longer needed** |
 | Long-txn / bloat risk | eliminated (short per-chunk txns) | eliminated |
 
@@ -233,7 +253,7 @@ WAL-lag guard interaction).
 
 | Decision | Resolution |
 |---|---|
-| D-6.1 model | **Incremental chunked** snapshot, stream-first; reconciled by what each read saw (§1.1, DA-SNAP-9) + upsert |
+| D-6.1 model | **Incremental chunked** snapshot, stream-first; reconciled by what each read saw (§1.1, DA-SNAP-9) + upsert; MySQL reads lock their rows (DA-SNAP-10) |
 | D-6.2 cursor | Typed identifier tuple; row-value keyset; one **deterministic collation** for order and cursor (the key's own when deterministic, else binary; Q-M5-16); no-key fallback moot (G-13) |
 | D-6.3 chunking | `snapshot.chunk_size` default 10000; checkpoint per chunk; resume is idempotent |
 | G-7 consistency | Lock-free, convergent; no `RELOAD`/`LOCK TABLES`; no `consistent_snapshot` toggle |

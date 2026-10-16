@@ -123,6 +123,9 @@ pub mod endpoints {
     pub const POSTGRES_18: &str =
         "host=127.0.0.1 port=55418 user=avalanche password=avalanche dbname=avalanche";
     pub const MYSQL_84: &str = "mysql://root:avalanche@127.0.0.1:53384/avalanche";
+    pub const MYSQL_84_NOGTID: &str = "mysql://root:avalanche@127.0.0.1:53385/avalanche";
+    /// TLS required: connect with TLS (`require_ssl=true`).
+    pub const MYSQL_TLS: &str = "mysql://root:avalanche@127.0.0.1:53386/avalanche";
     pub const MARIADB_118: &str = "mysql://root:avalanche@127.0.0.1:53318/avalanche";
     pub const RUSTFS_URL: &str = "http://127.0.0.1:59000";
     pub const RUSTFS_ACCESS_KEY: &str = "avalanche";

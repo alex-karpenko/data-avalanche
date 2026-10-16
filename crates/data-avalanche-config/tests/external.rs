@@ -6,10 +6,11 @@ mod support;
 use std::time::Duration;
 
 use data_avalanche_config::{
-    ClusterAnchor, LockBackend, RULES, ResolvedConfig, RuleInput, check_cluster_anchor,
-    check_table_set, check_unbounded_numeric, load_str,
+    ClusterAnchor, LockBackend, PartitionField, PartitionTransform, RULES, ResolvedConfig,
+    RuleInput, check_cluster_anchor, check_partitioning, check_table_set, check_unbounded_numeric,
+    glob_match, load_str,
 };
-use data_avalanche_core::TableRef;
+use data_avalanche_core::{ColumnSchema, ColumnValueType, TableRef, TableSchema};
 use support::{MINIMAL, env, fp_key};
 
 fn load(yaml: &str) -> ResolvedConfig {
@@ -147,6 +148,51 @@ fn unbounded_numeric_v079() {
             .iter()
             .next()
             .is_none()
+    );
+}
+
+#[test]
+fn globs_stay_inside_a_name() {
+    assert!(glob_match("*", "orders"));
+    assert!(glob_match("ord*", "orders"));
+    assert!(glob_match("*ers", "orders"));
+    assert!(glob_match("o*r*s", "orders"));
+    assert!(!glob_match("Orders", "orders"), "case-sensitive");
+    assert!(!glob_match("ord", "orders"));
+}
+
+#[test]
+fn partition_columns_exist_and_temporal_transforms_name_dates() {
+    let schema = TableSchema::new(
+        TableRef::new("shop", "orders"),
+        vec![
+            ColumnSchema::new("id", ColumnValueType::Int64, "bigint").not_null(),
+            ColumnSchema::new("at", ColumnValueType::Date, "date"),
+        ],
+        vec!["id".into()],
+    )
+    .unwrap();
+    let check = |column: &str, transform| {
+        check_partitioning(
+            &schema,
+            &[PartitionField {
+                column: column.into(),
+                transform,
+            }],
+        )
+    };
+    assert!(check("id", PartitionTransform::Identity).is_ok());
+    assert!(check("at", PartitionTransform::Day).is_ok());
+    assert!(check("_ts", PartitionTransform::Hour).is_ok());
+    assert_eq!(
+        check("nope", PartitionTransform::Identity)
+            .unwrap_err()
+            .code(),
+        "SCHEMA_MISMATCH"
+    );
+    assert_eq!(
+        check("id", PartitionTransform::Month).unwrap_err().code(),
+        "SCHEMA_MISMATCH"
     );
 }
 
