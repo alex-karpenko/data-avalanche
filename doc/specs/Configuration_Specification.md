@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-15
+updated: 2026-10-16
 domain: Architecture
 status: Specification (supersedes the Configuration_file_model.md draft)
 tags: [architecture, configuration, spec, validation, multi-sink, iceberg, delta-lake]
@@ -1106,7 +1106,7 @@ on.
 | MySQL | **`binlog_format = ROW`** | error → halt pipeline | Granular row-level change capture. |
 | MySQL | **`binlog_row_image = FULL`** | error → halt pipeline | Complete before-images / equality-delete keys. |
 | MySQL | **`binlog_row_metadata = FULL`** | error → halt pipeline; a table map without column names at run time (the setting turned back) → halt table | Column names and ENUM/SET strings in `TABLE_MAP`. A row is decoded by position against the schema as of its statement, which channel C builds partly from the catalog read later: the stream checks each table map's names, signedness, charsets and ENUM/SET strings against that schema and halts the table on a mismatch, instead of reading same-typed columns into each other (`Schema_Change…` §2.2). |
-| MySQL | **The source database's changes reach the binlog**: `source.db` isn't filtered out by `binlog_do_db` / `binlog_ignore_db`; a server that replicates from another logs what it applies (`log_replica_updates`, MariaDB `log_slave_updates` = ON) | error → halt pipeline; a server with the setting OFF whose replication status the user can't read → warning, naming the grant | Otherwise the snapshot copies the tables and the stream never sees a change to them, without an error. MariaDB's default is OFF. |
+| MySQL | **The source database's changes reach the binlog**: no binlog filter (`binlog_do_db` / `binlog_ignore_db` empty); a server that replicates from another logs what it applies (`log_replica_updates`, MariaDB `log_slave_updates` = ON) | error → halt pipeline; a server with the setting OFF whose replication status the user can't read → warning, naming the grant | Otherwise the snapshot copies the tables and the stream never sees a change to them, without an error. Even a filter that lets `source.db` through leaves out its DDL and `TRUNCATE` issued from another default database: the server filters a statement by the session's database, not its tables'. MariaDB's `log_slave_updates` default is OFF. |
 | MySQL | **`REPLICATION CLIENT` / `REPLICATION SLAVE`** privilege | error → halt pipeline | Binlog dump access. |
 | Both | Each table has an **identifier**: an inferred PK, or a `tables.primary_key` override whose columns exist and are top-level, primitive, NOT NULL, non-floating | error → halt table (explicit table) / warning + skip (glob-matched PK-less table) | Upsert/delete keying (G-13, G-30). |
 | PostgreSQL | Identifier columns ⊆ **REPLICA IDENTITY** columns | error → halt table, naming the missing columns | Before-image must carry the old key (`Ghost_Row…` §2). |

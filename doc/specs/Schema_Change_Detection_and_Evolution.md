@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-15
+updated: 2026-10-16
 domain: Architecture
 tags: [architecture, schema-evolution, ddl, cdc, postgresql, mysql, iceberg, delta-lake, multi-sink, arrow]
 status: design reviewed & approved — unified trigger→augment→diff model
@@ -405,7 +405,7 @@ too), so:
 | MySQL | `binlog_format = ROW` | required | granular change capture |
 | MySQL | `binlog_row_image = FULL` | required | complete before-images / equality-delete keys |
 | MySQL | `binlog_row_metadata = FULL` | required | names/ENUM strings in `TABLE_MAP`, checked against the decode schema (§2.2); a table map without names halts the table |
-| MySQL | the source database's changes reach the binlog (`binlog_do_db` / `binlog_ignore_db`; a replica's `log_replica_updates` / `log_slave_updates`) | required (a replica whose status can't be read: warn) | otherwise the stream never sees the tables' changes |
+| MySQL | the source database's changes reach the binlog: no `binlog_do_db` / `binlog_ignore_db` filter (a statement is filtered by its session's database); a replica's `log_replica_updates` / `log_slave_updates` ON | required (a replica whose status can't be read: warn) | otherwise the stream never sees the tables' changes |
 | MySQL | `REPLICATION CLIENT` / `REPLICATION SLAVE` | required | binlog dump |
 
 Validate these at pipeline start and surface a clear error (or warning for the
