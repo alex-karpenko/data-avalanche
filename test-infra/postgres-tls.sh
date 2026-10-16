@@ -21,8 +21,9 @@ openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -subj "/CN=a
 openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 30 -out client.crt
 chown postgres:postgres server.key && chmod 600 server.key
 # 644: on a Linux host the bind-mounted files are root-owned, and the tests read them as another
-# user. Throwaway material, granting nothing the test password doesn't.
-cp ca.crt client.crt client.key /tls/ && chmod 644 /tls/*
+# user. Throwaway material, granting nothing the test password doesn't. Only these three: /tls
+# also holds mysql-tls's directory, which a 644 would close to the tests.
+cp ca.crt client.crt client.key /tls/ && chmod 644 /tls/ca.crt /tls/client.crt /tls/client.key
 cat > "$server/pg_hba.conf" <<'HBA'
 local     all  all             trust
 hostssl   all  avalanche_cert  all  cert
