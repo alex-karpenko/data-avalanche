@@ -441,11 +441,18 @@ fn check_meta(
             return Err(missing(what, logged.len(), of.len()));
         }
         for (c, labels) in of.iter().zip(logged) {
+            // In a character set the source doesn't read, the labels can only be counted.
             let Some(cs) = Charset::of(&c.charset) else {
-                return Err(format!(
-                    "column {}: labels in character set {}, which the source doesn't read",
-                    c.name, c.charset
-                ));
+                let want = c.labels.as_ref().map(Vec::len);
+                if Some(labels.len()) != want {
+                    return Err(format!(
+                        "column {}: the binlog has {} labels, the schema {}",
+                        c.name,
+                        labels.len(),
+                        want.map_or("none".into(), |n| n.to_string())
+                    ));
+                }
+                continue;
             };
             let read: Option<Vec<String>> = labels.iter().map(|l| text_of(cs, l)).collect();
             if read.as_ref() != c.labels.as_ref() {
@@ -481,8 +488,13 @@ fn verb(sql: &str) -> String {
 /// holds the database's name (without case, so an unquoted or a quoted one alike). One that
 /// can't routes nowhere, unread: most of a busy server's statements are other databases'.
 fn may_name(sql: &str, db: &str, source_db: &str, fold: Fold) -> bool {
-    // A name folded beyond ASCII can't be found bytewise.
-    if fold.eq(db, source_db) || (fold.fold && !source_db.is_ascii()) || source_db.is_empty() {
+    // A name folded beyond ASCII can't be found bytewise, nor one with a quote character, which
+    // a quoted name doubles.
+    if fold.eq(db, source_db)
+        || (fold.fold && !source_db.is_ascii())
+        || source_db.is_empty()
+        || source_db.contains(['`', '"'])
+    {
         return true;
     }
     sql.as_bytes()
@@ -1467,6 +1479,7 @@ mod tests {
         assert!(may_name("TRUNCATE orders", "shop", "shop", exact));
         assert!(may_name("TRUNCATE orders", "SHOP", "shop", Fold::of(1)));
         assert!(may_name("TRUNCATE x", "other", "çafé", Fold::of(1)));
+        assert!(may_name("TRUNCATE `a``b`.orders", "other", "a`b", exact));
     }
 
     fn route_in(db: &str, sql: &str, fold: i64) -> Result<Routed, SourceError> {
@@ -1633,6 +1646,29 @@ mod tests {
         assert_eq!(
             check_meta(&changed(&|x| x.sets[0][0] = vec![0xE7]), &latin, &charsets),
             Ok(())
+        );
+        // In a character set the source doesn't read, only the number of labels.
+        let mut cyrillic = columns.clone();
+        cyrillic[3].charset = "cp1251".into();
+        let mut cs = charsets.clone();
+        cs.insert(51, "cp1251".into());
+        let m1251 = changed(&|x| {
+            x.enum_set_collations = Some(vec![51, 8]);
+            x.enums[0] = vec![vec![0xC0], vec![0xC1]];
+        });
+        assert_eq!(check_meta(&m1251, &cyrillic, &cs), Ok(()));
+        let e = check_meta(
+            &changed(&|x| {
+                x.enum_set_collations = Some(vec![51, 8]);
+                x.enums[0].pop();
+            }),
+            &cyrillic,
+            &cs,
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("column e: the binlog has 1 labels, the schema 2"),
+            "{e}"
         );
         // The count and the types still come first.
         fails(

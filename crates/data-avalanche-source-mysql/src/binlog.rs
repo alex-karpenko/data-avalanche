@@ -4,7 +4,7 @@
 //! - [`MariaGtidEvent`]: MariaDB's `GTID_EVENT` (type 162), which `mysql_common` doesn't read;
 //! - [`Offsets`]: the end offset of each event in its file (the `_seq` order key, Q-M7-4) and the
 //!   check that a compressed transaction yields all of its events (`BINLOG_PAYLOAD_INVALID`);
-//! - [`decompress`]: MariaDB's compressed events (`log_bin_compress`, Q-M7a-5), which
+//! - `decompress`: MariaDB's compressed events (`log_bin_compress`, Q-M7a-5), which
 //!   `mysql_common` reads as nothing.
 
 use std::io::Read;

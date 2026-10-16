@@ -203,34 +203,24 @@ pub(crate) struct Coverage {
     pub(crate) replica: Option<bool>,
 }
 
-/// Whether `db`'s changes reach the binlog (config §11.2): `Err` refuses the pipeline when a
-/// binlog filter leaves `db` out, or when the server replicates from another without logging
-/// what it applies; `Ok(Some)` warns when the user can't read whether it replicates.
-pub(crate) fn check_coverage(
-    flavour: Flavour,
-    db: &str,
-    fold: Fold,
-    c: &Coverage,
-) -> Result<Option<String>, String> {
-    let list = |s: &str| -> Vec<String> {
-        s.split(',')
-            .map(str::trim)
-            .filter(|d| !d.is_empty())
-            .map(str::to_owned)
-            .collect()
-    };
-    let (only, ignored) = (list(&c.do_db), list(&c.ignore_db));
-    if !only.is_empty() && !only.iter().any(|d| fold.eq(d, db)) {
-        return Err(format!(
-            "binlog_do_db is {}, without {db}: the binlog doesn't carry the source database's \
-             changes",
-            c.do_db
-        ));
-    }
-    if ignored.iter().any(|d| fold.eq(d, db)) {
-        return Err(format!(
-            "binlog_ignore_db lists {db}: the binlog doesn't carry the source database's changes"
-        ));
+/// Whether the source database's changes reach the binlog (config §11.2): `Err` refuses the
+/// pipeline under any binlog filter, or when the server replicates from another without logging
+/// what it applies; `Ok(Some)` warns when the user can't read whether it replicates. A filter
+/// that lets the source database through still leaves out its DDL and `TRUNCATE` issued from
+/// another default database: the server filters a statement by the session's database, not by
+/// its tables'.
+pub(crate) fn check_coverage(flavour: Flavour, c: &Coverage) -> Result<Option<String>, String> {
+    for (setting, list) in [
+        ("binlog_do_db", &c.do_db),
+        ("binlog_ignore_db", &c.ignore_db),
+    ] {
+        if !list.trim().is_empty() {
+            return Err(format!(
+                "{setting} is {list}: the server filters a DDL or TRUNCATE statement by the \
+                 session's default database, so one on the source's tables issued from another \
+                 database can be missing from the binlog; remove the binlog filter"
+            ));
+        }
     }
     let setting = flavour.replica_updates();
     match (c.replica_updates, c.replica) {
@@ -373,7 +363,6 @@ mod tests {
     #[test]
     fn the_binlog_must_carry_the_source_database() {
         let (my, maria) = (Flavour::Mysql, Flavour::Mariadb);
-        let (exact, folded) = (Fold::of(0), Fold::of(1));
         let cover = |do_db: &str, ignore_db: &str, updates: bool, replica: Option<bool>| Coverage {
             do_db: do_db.into(),
             ignore_db: ignore_db.into(),
@@ -381,46 +370,33 @@ mod tests {
             replica,
         };
         let ok = cover("", "", true, None);
-        assert_eq!(check_coverage(my, "shop", exact, &ok), Ok(None));
-        // Binlog filters.
-        assert_eq!(
-            check_coverage(my, "shop", exact, &cover("a, shop", "b", true, None)),
-            Ok(None)
+        assert_eq!(check_coverage(my, &ok), Ok(None));
+        // Any binlog filter, even one that lets the source database through.
+        let e = check_coverage(my, &cover("a, shop", "", true, None)).unwrap_err();
+        assert!(
+            e.starts_with("binlog_do_db is a, shop: the server filters"),
+            "{e}"
         );
-        let e = check_coverage(my, "shop", exact, &cover("a,b", "", true, None)).unwrap_err();
-        assert!(e.starts_with("binlog_do_db is a,b, without shop"), "{e}");
-        let e = check_coverage(my, "shop", exact, &cover("", "x,shop", true, None)).unwrap_err();
-        assert!(e.starts_with("binlog_ignore_db lists shop"), "{e}");
-        // Names fold under lower_case_table_names, and not otherwise.
-        assert!(check_coverage(my, "shop", exact, &cover("Shop", "", true, None)).is_err());
-        assert_eq!(
-            check_coverage(my, "shop", folded, &cover("Shop", "", true, None)),
-            Ok(None)
-        );
-        assert_eq!(
-            check_coverage(my, "shop", exact, &cover("", "SHOP", true, None)),
-            Ok(None)
-        );
-        assert!(check_coverage(my, "shop", folded, &cover("", "SHOP", true, None)).is_err());
+        let e = check_coverage(my, &cover("", "other", true, None)).unwrap_err();
+        assert!(e.starts_with("binlog_ignore_db is other"), "{e}");
         // A replica that doesn't log what it applies.
         assert_eq!(
-            check_coverage(maria, "shop", exact, &cover("", "", false, Some(false))),
+            check_coverage(maria, &cover("", "", false, Some(false))),
             Ok(None)
         );
-        let e =
-            check_coverage(maria, "shop", exact, &cover("", "", false, Some(true))).unwrap_err();
+        let e = check_coverage(maria, &cover("", "", false, Some(true))).unwrap_err();
         assert!(
             e.contains("replicates from another") && e.contains("log_slave_updates = OFF"),
             "{e}"
         );
-        let e = check_coverage(my, "shop", exact, &cover("", "", false, Some(true))).unwrap_err();
+        let e = check_coverage(my, &cover("", "", false, Some(true))).unwrap_err();
         assert!(e.contains("log_replica_updates = OFF"), "{e}");
         assert_eq!(
-            check_coverage(my, "shop", exact, &cover("", "", true, Some(true))),
+            check_coverage(my, &cover("", "", true, Some(true))),
             Ok(None)
         );
         // Unreadable: a warning naming the grant.
-        let w = check_coverage(maria, "shop", exact, &cover("", "", false, None))
+        let w = check_coverage(maria, &cover("", "", false, None))
             .unwrap()
             .unwrap();
         assert!(

@@ -235,15 +235,16 @@ impl MySqlConnector {
         Ok(fold)
     }
 
-    /// Whether `source.db`'s changes reach the binlog (config §11.2): the binlog filters, and on
-    /// a server with `log_replica_updates` off whether it replicates from another.
+    /// Whether `source.db`'s changes reach the binlog (config §11.2): no binlog filter, and on a
+    /// server with `log_replica_updates` off whether it replicates from another.
     async fn coverage(
         &self,
         flavour: Flavour,
         do_db: String,
         ignore_db: String,
     ) -> Result<Option<String>, SourceError> {
-        let fold = self.fold().await?;
+        // Channel C's reads compare names by it from here on.
+        self.fold().await?;
         let setting = flavour.replica_updates();
         let replica_updates: Option<i64> = self
             .conn
@@ -277,7 +278,7 @@ impl MySqlConnector {
             replica_updates,
             replica,
         };
-        check_coverage(flavour, &self.pipeline.source.db, fold, &c).map_err(SourceError::Permanent)
+        check_coverage(flavour, &c).map_err(SourceError::Permanent)
     }
 
     /// `REPLICATION SLAVE` from the user's grants, or from its active roles' (MySQL `SHOW GRANTS`

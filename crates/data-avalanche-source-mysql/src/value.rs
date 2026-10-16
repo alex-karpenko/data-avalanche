@@ -4,7 +4,7 @@
 //! a signed `MEDIUMINT`'s sign and reads `YEAR 0000` as `1900`; the binlog carries a `TIMESTAMP` as
 //! epoch text, an `ENUM` as its index, a `SET` as its bitmap, latin1 as its own bytes, and strips
 //! the trailing zero bytes of `BINARY(n)` and MariaDB's `UUID`/`INET4`/`INET6`. Both inputs become
-//! the same [`Raw`] value first, so a row reads the same from either.
+//! the same `Raw` value first, so a row reads the same from either.
 
 use std::net::Ipv4Addr;
 

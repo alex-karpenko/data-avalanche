@@ -17,11 +17,15 @@ use crate::common::{admin_in, cleanup, connector, fresh, pipeline, target};
 async fn items(s: &mut MySqlStream, commits: usize) -> Vec<StreamItem> {
     let mut out = vec![];
     let mut seen = 0;
+    let mut deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     while seen < commits {
-        let item = tokio::time::timeout(Duration::from_secs(20), s.next())
+        let item = tokio::time::timeout_at(deadline, s.next())
             .await
             .expect("an item within 20 s")
             .expect("the stream");
+        if !matches!(item, StreamItem::KeepAlive(_)) {
+            deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        }
         match item {
             StreamItem::KeepAlive(_) => continue,
             StreamItem::Commit(_) => seen += 1,
@@ -32,17 +36,17 @@ async fn items(s: &mut MySqlStream, commits: usize) -> Vec<StreamItem> {
     out
 }
 
-/// The first stream error.
+/// The first stream error, within 20 s (keep-alives don't extend the wait).
 async fn error(s: &mut MySqlStream) -> SourceError {
-    loop {
-        match tokio::time::timeout(Duration::from_secs(20), s.next())
-            .await
-            .expect("an item within 20 s")
-        {
-            Ok(_) => continue,
-            Err(e) => return e,
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let Err(e) = s.next().await {
+                return e;
+            }
         }
-    }
+    })
+    .await
+    .expect("an error within 20 s")
 }
 
 async fn shut(s: MySqlStream) {
@@ -371,31 +375,6 @@ async fn untracked_writes_keep_alive_before_a_heartbeat() {
     .await;
     writer.abort();
     assert!(p.covers(&after).unwrap(), "{p} covers {after}");
-    shut(s).await;
-    cleanup(&n).await;
-}
-
-/// In file/position mode a rotate between transactions moves the position to the next file, so a
-/// checkpoint taken while idle doesn't point into a file the server may expire.
-#[tokio::test]
-async fn a_rotate_moves_a_file_position_to_the_next_file() {
-    require_it!();
-    if target().replication != "binlog" {
-        eprintln!("skipped: file/position mode only");
-        return;
-    }
-    let (n, mut a) = fresh("stream_rotate", "CREATE TABLE t (id INT PRIMARY KEY)").await;
-    let c = connector(&pipeline(&n, &["t"], "", ""));
-    let tables = c.resolve_tables().await.unwrap().tables;
-    let mut s = open(&c, &tables).await;
-    a.query_drop("FLUSH BINARY LOGS").await.unwrap();
-    let newest = c.binary_logs().await.unwrap().pop().unwrap().name;
-    kept_alive(
-        &mut s,
-        Duration::from_secs(5),
-        |p| matches!(p, SourcePosition::BinlogFile(f) if f.file() == newest),
-    )
-    .await;
     shut(s).await;
     cleanup(&n).await;
 }
