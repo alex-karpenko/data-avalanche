@@ -1694,6 +1694,7 @@ dependencies = [
  "data-avalanche-storage",
  "data-avalanche-telemetry",
  "data-avalanche-testkit",
+ "flate2",
  "futures-util",
  "mysql_async",
  "object_store 0.14.2",

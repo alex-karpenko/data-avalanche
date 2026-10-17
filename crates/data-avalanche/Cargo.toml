@@ -38,6 +38,7 @@ e2e-hooks = []
 arrow-array.workspace = true
 arrow-cast.workspace = true
 data-avalanche-testkit.workspace = true
+flate2.workspace = true
 futures-util.workspace = true
 mysql_async.workspace = true
 serde_json.workspace = true

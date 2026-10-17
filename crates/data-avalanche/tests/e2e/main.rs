@@ -10,6 +10,8 @@ mod crashes;
 mod guards;
 mod harness;
 mod lifecycle;
+mod mysql;
+mod proxy;
 mod schema;
 mod smoke;
 mod snapshots;
