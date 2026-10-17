@@ -129,13 +129,13 @@ does not block starting the specification.
 > updated 2026-10-02 for the gaps M5 carried (§27), 2026-10-03 for DA-SNAP-9 and DA-SNAP-10 (§28),
 > 2026-10-07 for the M6a whole-branch review (§28.2), 2026-10-08 for M6b's planning findings
 > (§29), 2026-10-13 for M6b's exit (§30), 2026-10-14 for M7's planning (§31), 2026-10-14 for
-> M7a's plan (§32), and 2026-10-16 for M7a's exit (§33).
+> M7a's plan (§32), 2026-10-16 for M7a's exit (§33), and 2026-10-17 for M7b's plan (§34).
 
 | Status | Count (v1 scope) | Notes |
 |---|---|---|
 | ✅ Resolved | the large majority | Design closed by a research/spec doc or a probe. |
 | 🔄 Partial | 2 | DA-SNAP-7, DA-SRC-9 (neither blocks the plan); DA-SNAP-10 ✅ 2026-10-16 (M7a merged, §33). DA-MS-3 is a decided caveat. DA-X-8 ✅ 2026-09-26; DA-SRC-16 and DA-X-12 ✅ 2026-10-13 (§30). |
-| 🟥 Open (v1) | **20** | DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2); DA-CLUS-14, DA-API-11, DA-OPS-7 and DA-SRC-20 🆕 2026-10-13 (§30.1); DA-SRC-21 🆕 2026-10-14 (§31.2); DA-SRC-22, DA-SNAP-14 and DA-X-13 🆕 2026-10-14 (§32.1); DA-SRC-24…26 🆕 2026-10-16 (§33.1). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
+| 🟥 Open (v1) | **21** | DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2); DA-CLUS-14, DA-API-11, DA-OPS-7 and DA-SRC-20 🆕 2026-10-13 (§30.1); DA-SRC-21 🆕 2026-10-14 (§31.2); DA-SRC-22, DA-SNAP-14 and DA-X-13 🆕 2026-10-14 (§32.1); DA-SRC-24…26 🆕 2026-10-16 (§33.1); DA-OBS-6 🆕 2026-10-17 (§34.1). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
 | 🧪 Verify (v1) | **0** | DA-SRC-10/11 proven 2026-09-26 (§21). |
 | ⏭ v2 | 13 | Iceberg-sink items (§26.2). |
 | 🟢 Spec-merge debt | **0** | All applied 2026-09-26 (§26.6): §19.3 S-1…S-6, the DA-X-8 config residual, the D-V1 patches and the Data-Flow Phase 2a probe details. |
@@ -413,6 +413,7 @@ endpoint), and trace-id/pipeline injection into JSON logs.
 | DA-OBS-3 | Distributed tracing | 🟢 | ✅ | §3 (G-32) — `globals.tracing.otlp_endpoint` (absent⇒off) + `sample_ratio`; batch/commit-granularity spans, no per-event spans. | G-32, OQ-OB1 |
 | DA-OBS-4 | Log/trace correlation | 🟢 | ✅ | §4 — inject `trace_id`/`span_id`/`pipeline` into JSON logs. | §10.3 |
 | DA-OBS-5 | **Numeric end-to-end replication-lag SLA** | 🟡 | ✅ | `Clustering…` §18.6 explicitly leaves OQ-OB2 open as a *tuning input*: a concrete max-lag number is not fixed, which is what grounds the lease-timing profile and flush/checkpoint cadence. Decide a number (and whether failover-time carries its own SLA distinct from steady-state). **✅ 2026-09-26 — D-V1.3 (`V1_Scope_Decisions.md`):** steady-state p99 ≤ 60s, failover ≤ 2 min, at default config; confirm by v1 load test. | OQ-OB2 |
+| DA-OBS-6 | 🆕 The text log writes ANSI colour sequences to a file | 🟢 | 🟥 | §34.1. The binary's `compact` and `pretty` logs colour their output whether or not stderr is a terminal (`tracing-subscriber` 0.3.23's default; `crates/data-avalanche/src/logging.rs`). A log collector or a file gets escape sequences around the level and the fields: a search for `code="BINLOG_…"` misses them. The E2E suite strips them (M7b Task 7). Fix: colour only when stderr is a terminal (and keep `NO_COLOR`); M10 (`globals.log`) or earlier | — |
 
 ---
 
@@ -1717,3 +1718,32 @@ MySQL 8.4 (GTIDs on and off) and MariaDB 11.8 (both modes), 11.4 and 10.11.
 Carried to M7b in the plan's exit checklist: an error when `server_uuid` reads NULL, a
 file/position resume IT, the pipeline dropping a halted table's buffered rows, and `re_snapshot`
 at start end to end through the worker.
+
+---
+
+## 34. M7b MySQL pipeline — the plan (2026-10-17)
+
+M7b's plan (`doc/v1.0/M7b-mysql-pipeline.md`) wires the MySQL source into the worker and the
+binary and runs the slice-1 E2E suite on MySQL and MariaDB. It was built task by task in a scratch
+workspace and replayed from its code blocks to identical trees. Oleksii answered Q-M7b-1…4 and
+approved the plan; it needs no spec change (Data-Flow Phase 5 and §State Layout already describe
+`replication/position.json` as the position with its server).
+
+Two design points surfaced while planning and are fixed in the plan, not recorded as gaps:
+
+- A reconnect opens the stream without `prepare`, so in file/position mode a failover behind the
+  pipeline's address would have streamed another server's binlog from a position that means
+  nothing there. The dump now checks the server on its own connection (D-M7b.7).
+- A position lost while running was replaced without `prepare`, so the new checkpoint had no
+  server. `reset_position` now returns the server with the position (D-M7b.1).
+
+| ID | Change | Evidence |
+|---|---|---|
+| DA-SRC-12 | ✅ (stays): the fault-injection E2E is planned. A test-only proxy corrupts a compressed transaction with its CRC32 recomputed; measured, `mysql_common` 0.37.3 checks no dump event's checksum, so only the payload guard catches it | M7b Task 7 (`a_corrupted_compressed_transaction_halts_the_pipeline`) |
+| DA-SRC-21 | 🟥 (stays): MariaDB's identity is `@@server_id`, and every test-infra server runs `--server-id=1`, so the failover E2E runs on MySQL only (`mysql-84-nogtid` to `mysql-84`) | M7b D-M7b.15 |
+
+### 34.1 New gap
+
+| ID | Gap | Severity | Surfaced by | Next |
+|---|---|---|---|---|
+| DA-OBS-6 | The binary's text log (`compact`, `pretty`) writes ANSI colour sequences to stderr when it isn't a terminal, so a file or a log collector holds escape sequences around the level and the fields | 🟢 | M7b planning: the E2E suite's search for the halt's `code` field missed the log line until the sequences were stripped | Colour only when stderr is a terminal; M10 (`globals.log`) or earlier |
