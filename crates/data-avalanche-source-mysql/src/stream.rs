@@ -37,8 +37,8 @@ use data_avalanche_core::position::{
     BinlogFilePos, GtidSet, GtidSource, MariaGtid, MariaGtidState,
 };
 use data_avalanche_core::{
-    CdcEvent, ChangeStream, HaltReason, Op, Row, SchemaHint, SourceError, SourcePosition,
-    SourceSeq, StreamItem, TableRef, TableSchema, TransactionBoundary,
+    CdcEvent, ChangeStream, Checkpoint, HaltReason, Op, Row, SchemaHint, SourceError,
+    SourcePosition, SourceSeq, StreamItem, TableRef, TableSchema, TransactionBoundary,
 };
 use futures_util::StreamExt;
 use mysql_async::binlog::events::{
@@ -55,9 +55,9 @@ use crate::catalog::table_key;
 use crate::connector::MySqlConnector;
 use crate::ddl::{Renamed, classify, renamed};
 use crate::error::mysql;
-use crate::position::Mode;
+use crate::position::{Mode, identity, identity_query};
 use crate::server::{Flavour, Fold};
-use crate::start::purge_action;
+use crate::start::{purge_action, same_server};
 use crate::types::{CatalogColumn, members, plan_column};
 use crate::value::{Charset, Decode, Input, decode_after, halt_reason, text_of};
 
@@ -679,12 +679,15 @@ impl MySqlConnector {
     /// Opens the binlog dump after `from` for `tables` as of that position (Data-Flow Phase 2b):
     /// the heartbeat period, the replica id `source.mysql.server_id`, and the position in its
     /// dialect. The server's name comparison and collations are read once, for the stream's
-    /// routing and table map checks.
+    /// routing and table map checks. In file/position mode the dump's own connection must reach
+    /// the server `from` was recorded on (`BINLOG_SOURCE_CHANGED`, Q-M7-2): a reconnect after a
+    /// failover reaches another server, whose files the position means nothing in.
     pub async fn open_stream(
         &self,
-        from: &SourcePosition,
+        from: &Checkpoint,
         tables: &[TableSchema],
     ) -> Result<MySqlStream, SourceError> {
+        let (recorded, from) = (from, &from.position);
         let flavour = self.flavour().await?;
         let mode = Mode::of(flavour, self.mysql.replication_type);
         let catalog = self.sibling()?;
@@ -731,6 +734,11 @@ impl MySqlConnector {
                 Offsets::new("", 4)
             }
             (Mode::File, SourcePosition::BinlogFile(p)) => {
+                let answer = conn
+                    .query_first(identity_query(flavour))
+                    .await
+                    .map_err(err)?;
+                same_server(recorded, &identity(flavour, answer)?)?;
                 file = p.file().as_bytes().to_vec();
                 req = req.with_filename(&file[..]).with_pos(p.pos());
                 Offsets::new(p.file(), p.pos())

@@ -329,10 +329,7 @@ impl SourceConnector for MySqlConnector {
 
     /// The server's write position now: the binlog keeps no position for the pipeline to lose.
     async fn reset_position(&self) -> Result<Checkpoint, SourceError> {
-        Ok(Checkpoint {
-            position: self.position_now().await?,
-            server: Some(self.server_identity().await?),
-        })
+        self.checkpoint_now().await
     }
 
     async fn retained(&self) -> Result<Option<RetainedLog>, SourceError> {
@@ -370,7 +367,7 @@ impl SourceConnector for MySqlConnector {
         tables: &[TableSchema],
     ) -> Result<Box<dyn ChangeStream>, SourceError> {
         Ok(Box::new(
-            MySqlConnector::open_stream(self, &from.position, tables).await?,
+            MySqlConnector::open_stream(self, from, tables).await?,
         ))
     }
 

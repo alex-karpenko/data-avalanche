@@ -25,7 +25,7 @@ async fn a_rotate_moves_a_file_position_to_the_next_file() {
     let (n, mut a) = fresh("rotate", "CREATE TABLE t (id INT PRIMARY KEY)").await;
     let c = connector(&pipeline(&n, &["t"], "", ""));
     let tables = c.resolve_tables().await.unwrap().tables;
-    let from = c.position_now().await.unwrap();
+    let from = c.checkpoint_now().await.unwrap();
     let mut s = c.open_stream(&from, &tables).await.unwrap();
     a.query_drop("FLUSH BINARY LOGS").await.unwrap();
     let newest = c.binary_logs().await.unwrap().pop().unwrap().name;
