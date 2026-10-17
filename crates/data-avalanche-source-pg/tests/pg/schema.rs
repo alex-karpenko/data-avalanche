@@ -28,7 +28,10 @@ async fn channel_c_proves_a_rename_scoped_to_the_signal() {
     let StartPlan::Snapshot { from, .. } = p.plan else {
         panic!()
     };
-    let mut s = c.open_stream(&from, &r.tables).await.unwrap();
+    let mut s = c
+        .open_stream(&from.clone().into(), &r.tables)
+        .await
+        .unwrap();
     let sc = &n.schema;
     each(
         &a,
@@ -181,7 +184,10 @@ async fn channel_c_with_the_catalog_ahead() {
     let StartPlan::Snapshot { from, .. } = p.plan else {
         panic!()
     };
-    let mut s = c.open_stream(&from, &r.tables).await.unwrap();
+    let mut s = c
+        .open_stream(&from.clone().into(), &r.tables)
+        .await
+        .unwrap();
     let sc = &n.schema;
     each(
         &a,
@@ -255,7 +261,10 @@ async fn channel_c_classifies_identity_changes() {
     let StartPlan::Snapshot { from, .. } = p.plan else {
         panic!()
     };
-    let mut s = c.open_stream(&from, &r.tables).await.unwrap();
+    let mut s = c
+        .open_stream(&from.clone().into(), &r.tables)
+        .await
+        .unwrap();
     let sc = &n.schema;
     each(
         &a,

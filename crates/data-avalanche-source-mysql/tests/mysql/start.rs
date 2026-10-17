@@ -70,10 +70,15 @@ async fn a_first_start_snapshots_and_records_the_server_then_resumes() {
     .expect("resume");
     assert_eq!(again.plan, StartPlan::Resume);
     assert!(again.added.is_empty() && again.warnings.is_empty());
-    assert_eq!(again.server, Some(identity));
+    assert_eq!(again.server, Some(identity.clone()));
     // A lost position is replaced by the write position now.
     let reset = c.reset_position().await.unwrap();
-    assert!(reset.covers(&from).unwrap(), "{reset} covers {from}");
+    assert!(
+        reset.position.covers(&from).unwrap(),
+        "{} covers {from}",
+        reset.position
+    );
+    assert_eq!(reset.server, Some(identity));
     cleanup(&n).await;
 }
 

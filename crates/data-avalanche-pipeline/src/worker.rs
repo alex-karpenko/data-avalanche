@@ -178,7 +178,7 @@ impl PipelineWorker {
                         || core.source.reset_position(),
                     )
                     .await?;
-                    start(core, Some(from)).await?;
+                    start(core, Some(from.position)).await?;
                     attempt = 0;
                     continue;
                 }
@@ -1668,7 +1668,7 @@ mod tests {
         core.snapshot_started.insert(t("a"), long_ago);
         w.source.lose_slot();
         let from = core.source.reset_position().await.unwrap();
-        start(&mut core, Some(from)).await.unwrap();
+        start(&mut core, Some(from.position)).await.unwrap();
         let xid = w.source.open_writer(&[t("b")]);
         w.source.hold_reads();
         let before = w.source.in_flights();

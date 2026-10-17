@@ -903,12 +903,12 @@ impl SourceConnector for FakeSource {
         })
     }
 
-    async fn reset_position(&self) -> Result<SourcePosition, SourceError> {
+    async fn reset_position(&self) -> Result<Checkpoint, SourceError> {
         self.take_fault(Method::ResetPosition)?;
         let mut db = self.db();
         db.slot = Some(db.wal_end);
         db.slot_lost = false;
-        Ok(SourcePosition::Pg(db.wal_end))
+        Ok(SourcePosition::Pg(db.wal_end).into())
     }
 
     async fn retained(&self) -> Result<Option<RetainedLog>, SourceError> {
@@ -1033,14 +1033,14 @@ impl SourceConnector for FakeSource {
 
     async fn open_stream(
         &self,
-        from: &SourcePosition,
+        from: &Checkpoint,
         tables: &[TableSchema],
     ) -> Result<Box<dyn ChangeStream>, SourceError> {
         self.take_fault(Method::OpenStream)?;
-        self.db().opened.push(from.clone());
+        self.db().opened.push(from.position.clone());
         Ok(Box::new(FakeStream {
             source: self.clone(),
-            after: lsn(from),
+            after: lsn(&from.position),
             next_entry: 0,
             pending: VecDeque::new(),
             known: tables
@@ -1350,7 +1350,7 @@ mod tests {
         assert_eq!(src.slot(), Some(from.clone()));
         let tables = src.resolve_tables().await.unwrap().tables;
         assert_eq!(tables[0].source_id(), Some(1000));
-        let mut s = src.open_stream(&from, &tables).await.unwrap();
+        let mut s = src.open_stream(&from.into(), &tables).await.unwrap();
         src.commit(FakeTxn::new().insert(&t(), row(2, "b")));
         let got = items(&mut s, 3).await;
         assert!(matches!(got[0], StreamItem::Begin { xid: 700, .. }));
@@ -1386,7 +1386,10 @@ mod tests {
         let src = FakeSource::new(vec![schema()]);
         src.load(&t(), vec![row(1, "a")]);
         let tables = src.resolve_tables().await.unwrap().tables;
-        let mut s = src.open_stream(&src.wal_end(), &tables).await.unwrap();
+        let mut s = src
+            .open_stream(&src.wal_end().into(), &tables)
+            .await
+            .unwrap();
         let xid = src.commit_stalled(FakeTxn::new().update(&t(), row(1, "b")));
         let got = items(&mut s, 3).await;
         assert!(matches!(&got[2], StreamItem::Commit(b) if b.xid == xid));
@@ -1417,7 +1420,10 @@ mod tests {
     async fn changes_keys_truncates_and_unchanged_values_stream_as_sent() {
         let src = FakeSource::new(vec![schema()]);
         let tables = src.resolve_tables().await.unwrap().tables;
-        let mut s = src.open_stream(&src.wal_end(), &tables).await.unwrap();
+        let mut s = src
+            .open_stream(&src.wal_end().into(), &tables)
+            .await
+            .unwrap();
         src.commit(
             FakeTxn::new()
                 .insert(&t(), row(1, "a"))
@@ -1459,7 +1465,10 @@ mod tests {
     async fn an_alter_signals_before_the_next_change() {
         let src = FakeSource::new(vec![schema()]);
         let tables = src.resolve_tables().await.unwrap().tables;
-        let mut s = src.open_stream(&src.wal_end(), &tables).await.unwrap();
+        let mut s = src
+            .open_stream(&src.wal_end().into(), &tables)
+            .await
+            .unwrap();
         let wider = TableSchema::new(
             t(),
             vec![
@@ -1506,7 +1515,10 @@ mod tests {
         let StartPlan::Snapshot { from, .. } = p.plan else {
             panic!()
         };
-        let mut s = src.open_stream(&from, &tables).await.unwrap();
+        let mut s = src
+            .open_stream(&from.clone().into(), &tables)
+            .await
+            .unwrap();
         src.lose_slot();
         assert!(matches!(
             s.next().await,
@@ -1554,7 +1566,10 @@ mod tests {
     async fn a_held_stream_falls_behind_the_position() {
         let src = FakeSource::new(vec![schema()]);
         let tables = src.resolve_tables().await.unwrap().tables;
-        let mut s = src.open_stream(&src.wal_end(), &tables).await.unwrap();
+        let mut s = src
+            .open_stream(&src.wal_end().into(), &tables)
+            .await
+            .unwrap();
         src.hold_stream();
         src.keepalive();
         let at = src.current_position().await.unwrap();

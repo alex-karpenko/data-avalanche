@@ -102,7 +102,7 @@ async fn a_purged_checkpoint_follows_the_purge_action() {
     );
     for (c, re_snapshot) in [(&halts, false), (&recovers, true)] {
         // The server's refusal, for a stream opened without the check.
-        let e = ended(SourceConnector::open_stream(c, &cp.position, &tables).await).await;
+        let e = ended(SourceConnector::open_stream(c, &cp, &tables).await).await;
         check(re_snapshot, "the dump", e);
     }
     cleanup(&n).await;

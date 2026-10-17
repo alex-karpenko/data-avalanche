@@ -243,7 +243,11 @@ impl<'c> Session<'c> {
             core.snapshot_started.entry(table.clone()).or_insert(now);
         }
         let live: Vec<TableSchema> = schemas.values().cloned().collect();
-        let stream = match core.source.open_stream(&checkpoint, &live).await {
+        let stream = match core
+            .source
+            .open_stream(&checkpoint.clone().into(), &live)
+            .await
+        {
             Ok(stream) => stream,
             Err(e) => return Ok(Err(e)),
         };

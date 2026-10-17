@@ -43,6 +43,21 @@ impl SourceError {
     pub fn is_transient(&self) -> bool {
         matches!(self, Self::Transient(_))
     }
+
+    /// The code of a pipeline-scope halt: a [`Self::Permanent`] whose message starts with an
+    /// upper-case code and a colon (`BINLOG_PAYLOAD_INVALID: …`, `BINLOG_SOURCE_CHANGED: …`).
+    pub fn halt_code(&self) -> Option<&str> {
+        let Self::Permanent(m) = self else {
+            return None;
+        };
+        let (code, _) = m.split_once(": ")?;
+        let valid = code.contains('_')
+            && code.starts_with(|c: char| c.is_ascii_uppercase())
+            && code
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+        valid.then_some(code)
+    }
 }
 
 /// What a pipeline-level preflight found (config §11.2, the rows that halt a pipeline). A failed
@@ -318,8 +333,9 @@ pub trait SourceConnector: Send + Sync {
     ) -> Result<Prepared, SourceError>;
 
     /// Replaces a lost stream position after [`SourceError::PositionUnreachable`] (D-15.3): the
-    /// new consistent position to snapshot from and stream after.
-    async fn reset_position(&self) -> Result<SourcePosition, SourceError>;
+    /// new consistent position to snapshot from and stream after, with the server it was read
+    /// from when the source records one.
+    async fn reset_position(&self) -> Result<Checkpoint, SourceError>;
 
     /// The log the source keeps for the pipeline. `None` when the source keeps nothing for it.
     async fn retained(&self) -> Result<Option<RetainedLog>, SourceError>;
@@ -349,10 +365,11 @@ pub trait SourceConnector: Send + Sync {
     /// row is left out.
     async fn fetch_rows(&self, table: &TableSchema, keys: &[Row]) -> Result<Vec<Row>, SourceError>;
 
-    /// Opens the change stream after `from`, for `tables` as of that position.
+    /// Opens the change stream after `from`'s position, for `tables` as of that position. A
+    /// source that records the server (MySQL file/position mode) refuses another one.
     async fn open_stream(
         &self,
-        from: &SourcePosition,
+        from: &Checkpoint,
         tables: &[TableSchema],
     ) -> Result<Box<dyn ChangeStream>, SourceError>;
 
@@ -449,6 +466,37 @@ mod tests {
     }
 
     #[test]
+    fn a_pipeline_halt_names_its_code() {
+        let code = |m: &str| {
+            SourceError::Permanent(m.into())
+                .halt_code()
+                .map(str::to_owned)
+        };
+        assert_eq!(
+            code("BINLOG_PAYLOAD_INVALID: the compressed transaction at f:4 yielded 0 bytes"),
+            Some("BINLOG_PAYLOAD_INVALID".into())
+        );
+        assert_eq!(
+            code("BINLOG_SOURCE_CHANGED: binlog position f:4 was recorded on …"),
+            Some("BINLOG_SOURCE_CHANGED".into())
+        );
+        for plain in [
+            "MySQL 8.0.36: the source needs MySQL 8.4 or newer",
+            "the binary log is off (log_bin); the source reads the binlog",
+            "ERROR: no colon space",
+            "binlog_format is MIXED: lower case",
+            "",
+        ] {
+            assert_eq!(code(plain), None, "{plain}");
+        }
+        assert_eq!(
+            SourceError::Transient("BINLOG_PAYLOAD_INVALID: x".into()).halt_code(),
+            None,
+            "only a permanent error halts the pipeline"
+        );
+    }
+
+    #[test]
     fn only_transient_errors_are_retried() {
         assert!(SourceError::Transient("reset".into()).is_transient());
         assert!(!SourceError::Permanent("denied".into()).is_transient());
@@ -527,8 +575,8 @@ mod tests {
         async fn retained(&self) -> Result<Option<RetainedLog>, SourceError> {
             Ok(None)
         }
-        async fn reset_position(&self) -> Result<SourcePosition, SourceError> {
-            Ok(SourcePosition::Pg(Lsn(0x20)))
+        async fn reset_position(&self) -> Result<Checkpoint, SourceError> {
+            Ok(SourcePosition::Pg(Lsn(0x20)).into())
         }
         async fn current_position(&self) -> Result<SourcePosition, SourceError> {
             Ok(SourcePosition::Pg(Lsn(0x30)))
@@ -550,7 +598,7 @@ mod tests {
         }
         async fn open_stream(
             &self,
-            _: &SourcePosition,
+            _: &Checkpoint,
             _: &[TableSchema],
         ) -> Result<Box<dyn ChangeStream>, SourceError> {
             let table = TableRef::new("public", "t");
@@ -614,8 +662,8 @@ mod tests {
                 ..
             }
         ));
-        let mut stream =
-            block_on(source.open_stream(&SourcePosition::Pg(Lsn(0x10)), &[schema()])).unwrap();
+        let from = Checkpoint::from(SourcePosition::Pg(Lsn(0x10)));
+        let mut stream = block_on(source.open_stream(&from, &[schema()])).unwrap();
         assert!(matches!(
             block_on(stream.next()).unwrap(),
             StreamItem::Begin { xid: 7, .. }
