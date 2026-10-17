@@ -3,9 +3,11 @@
 use std::sync::Arc;
 
 use data_avalanche_cluster::{Parts, WorkerFactory};
-use data_avalanche_config::{Globals, Pipeline, SinkType, TimestampNtzAs};
+use data_avalanche_config::{Globals, Pipeline, SinkType, SourceType, TimestampNtzAs};
+use data_avalanche_core::SourceConnector;
 use data_avalanche_pipeline::{Hooks, NoHooks};
 use data_avalanche_sink_delta::{DeltaLocation, DeltaSink, DeltaSinkConfig, NtzAs, TableDefaults};
+use data_avalanche_source_mysql::MySqlConnector;
 use data_avalanche_source_pg::PgConnector;
 
 use crate::startup::backend;
@@ -42,7 +44,8 @@ pub fn delta_config(globals: &Globals, p: &Pipeline) -> Result<DeltaSinkConfig, 
     })
 }
 
-/// Builds the PostgreSQL source and the Delta sink.
+/// Builds the pipeline's source (`source.type`: PostgreSQL, or MySQL / MariaDB) and the Delta
+/// sink.
 #[derive(Debug)]
 pub struct Factory {
     globals: Globals,
@@ -79,10 +82,13 @@ impl WorkerFactory for Factory {
         if p.sink.kind == SinkType::Iceberg {
             return Err("the Iceberg sink ships in v2 (D-V1.4); other pipelines run".into());
         }
-        let source = PgConnector::new(p).map_err(|e| e.to_string())?;
+        let source: Arc<dyn SourceConnector> = match p.source.kind {
+            SourceType::Postgres => Arc::new(PgConnector::new(p).map_err(|e| e.to_string())?),
+            SourceType::Mysql => Arc::new(MySqlConnector::new(p).map_err(|e| e.to_string())?),
+        };
         let sink = DeltaSink::new(delta_config(&self.globals, p)?);
         Ok(Parts {
-            source: Arc::new(source),
+            source,
             sink: Arc::new(sink),
             hooks: Arc::clone(&self.hooks),
         })
@@ -117,6 +123,42 @@ mod tests {
         assert_eq!(d.table.log_retention, Duration::from_secs(30 * 24 * 3600));
         assert_eq!(d.table.timestamp_ntz_as, NtzAs::String);
         assert_eq!(d.merge_memory_limit, Some(64 << 20));
+    }
+
+    /// A `type: mysql` pipeline gets the MySQL source (the PostgreSQL connector refuses it).
+    #[test]
+    fn a_mysql_pipeline_gets_its_parts() {
+        let yaml = r#"
+config_version: 1
+globals: { state: { bucket: app-state } }
+pipelines:
+  shop:
+    id: shop
+    source:
+      type: mysql
+      host: db.example.com
+      db: shop
+      user: cdc
+      password: pw
+      mysql: { replication_type: gtid }
+    tables:
+      include: [orders]
+    sink: { type: delta, bucket: lake, delta: {} }
+"#;
+        let c = data_avalanche_config::load_str(
+            yaml,
+            &std::collections::BTreeMap::new(),
+            &data_avalanche_config::FingerprintKey::from_bytes([1; 32]),
+        )
+        .unwrap_or_else(|r| panic!("{r:?}"))
+        .config;
+        let factory = Factory::new(&c.globals).unwrap();
+        factory
+            .build(&c.pipelines["shop"])
+            .expect("the MySQL parts");
+        factory
+            .build(&config().pipelines["orders"])
+            .expect("the PostgreSQL parts");
     }
 
     #[test]
