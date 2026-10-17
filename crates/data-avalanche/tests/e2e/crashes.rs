@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use data_avalanche_testkit::require_it;
 
-use crate::harness::{E2e, Options, admin};
+use crate::harness::{Db, Doc, E2e, Options, Source};
 
 const COLS: &[&str] = &["id", "doc"];
 const CRASH: &str = "DATA_AVALANCHE_E2E_CRASH";
@@ -19,8 +19,7 @@ async fn a_crash_mid_snapshot_resumes_it() {
     require_it!();
     let e = E2e::new(
         "crash_chunk",
-        "CREATE TABLE items (id bigint PRIMARY KEY, doc text);
-         INSERT INTO items SELECT g, 'row ' || g FROM generate_series(1, 5000) g;",
+        "CREATE TABLE items (id bigint PRIMARY KEY, doc text);",
         Options {
             tables: ", snapshots: { mode: initial, chunk_size: 500 }",
             // One chunk ahead of the writer at most: the chunks before it are committed.
@@ -29,6 +28,7 @@ async fn a_crash_mid_snapshot_resumes_it() {
         },
     )
     .await;
+    e.insert_series("items", 5000, Doc::Row).await;
     let mut p = e.start(&[(CRASH, "chunk_emitted:6")]);
     let status = p.exit().await;
     assert!(!status.success(), "aborted at the crash point: {status}");
@@ -76,10 +76,11 @@ async fn a_crash_between_a_commit_and_its_checkpoint_skips_the_replay() {
     let mut p = e.start(&[(CRASH, "sink_committed:1")]);
     p.ready().await;
     e.streaming().await;
-    e.exec(
-        "INSERT INTO items SELECT g, 'row ' || g FROM generate_series(1, 100) g;
-         UPDATE items SET doc = 'changed' WHERE id % 3 = 0",
-    )
+    // One transaction: MySQL commits each statement of a batch on its own.
+    e.exec(&format!(
+        "BEGIN; {}; UPDATE items SET doc = 'changed' WHERE id % 3 = 0; COMMIT",
+        e.series("items", 100, Doc::Row)
+    ))
     .await;
     let status = p.exit().await;
     assert!(!status.success(), "aborted at the crash point: {status}");
@@ -149,7 +150,8 @@ async fn a_crash_mid_multi_table_flush_completes_it_on_restart() {
 }
 
 /// A crash after the checkpoint, before the source is told: the source sends the transaction
-/// again and it is skipped.
+/// again and it is skipped. MySQL's binlog keeps no position for the pipeline: its checkpoint is
+/// the acknowledgment, so the restart reads on after the transaction and nothing is resent.
 #[tokio::test]
 async fn a_crash_between_the_checkpoint_and_the_ack_skips_the_resent_transaction() {
     require_it!();
@@ -175,10 +177,12 @@ async fn a_crash_between_the_checkpoint_and_the_ack_skips_the_resent_transaction
     assert!(!status.success(), "aborted at the crash point: {status}");
     e.mirrored("items", COLS).await;
     let marker = e.marker("items").await;
-    assert!(
-        !e.acknowledges(&marker).await,
-        "the crash came before the ack"
-    );
+    if e.source.is_postgres() {
+        assert!(
+            !e.acknowledges(&marker).await,
+            "the crash came before the ack"
+        );
+    }
     let commits = e.commits("items").await;
 
     let mut p = e.start(&[]);
@@ -200,16 +204,16 @@ async fn a_kill_under_load_loses_nothing() {
     require_it!();
     let e = E2e::new(
         "crash_kill",
-        "CREATE TABLE items (id bigint PRIMARY KEY, doc text);
-         INSERT INTO items SELECT g, 'row ' || g FROM generate_series(1, 200) g;",
+        "CREATE TABLE items (id bigint PRIMARY KEY, doc text);",
         Options {
             tables: ", snapshots: { mode: initial }",
             ..Options::default()
         },
     )
     .await;
+    e.insert_series("items", 200, Doc::Row).await;
     let stop = Arc::new(AtomicBool::new(false));
-    let writer = tokio::spawn(write_load(e.schema.clone(), Arc::clone(&stop)));
+    let writer = tokio::spawn(write_load(e.source, e.schema.clone(), Arc::clone(&stop)));
     let mut p = e.start(&[]);
     p.ready().await;
     e.completed("items", None).await;
@@ -229,25 +233,27 @@ async fn a_kill_under_load_loses_nothing() {
     e.cleanup().await;
 }
 
-/// Updates, deletes and inserts on keys 1–300 until `stop`, one statement per transaction;
-/// returns how many ran.
-async fn write_load(schema: String, stop: Arc<AtomicBool>) -> u64 {
-    let c = admin().await;
+/// Updates, deletes and inserts on keys 1–300 until `stop`, one statement per transaction, on a
+/// connection of its own; returns how many ran.
+async fn write_load(source: Source, schema: String, stop: Arc<AtomicBool>) -> u64 {
+    let c = Db::connect(source).await;
     let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut ops = 0;
     while !stop.load(Ordering::SeqCst) {
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
-        let id = (x % 300 + 1) as i64;
-        let sql = match x % 3 {
-            0 => format!("UPDATE {schema}.items SET doc = 'u{ops}' WHERE id = $1"),
-            1 => format!("DELETE FROM {schema}.items WHERE id = $1"),
-            _ => format!(
-                "INSERT INTO {schema}.items VALUES ($1, 'i{ops}') ON CONFLICT (id) DO UPDATE SET doc = excluded.doc"
-            ),
+        let id = x % 300 + 1;
+        let upsert = match source {
+            Source::Postgres { .. } => "ON CONFLICT (id) DO UPDATE SET doc = excluded.doc",
+            Source::Mysql(_) => "ON DUPLICATE KEY UPDATE doc = VALUES(doc)",
         };
-        c.execute(&sql, &[&id]).await.expect("a load statement");
+        let sql = match x % 3 {
+            0 => format!("UPDATE {schema}.items SET doc = 'u{ops}' WHERE id = {id}"),
+            1 => format!("DELETE FROM {schema}.items WHERE id = {id}"),
+            _ => format!("INSERT INTO {schema}.items VALUES ({id}, 'i{ops}') {upsert}"),
+        };
+        c.exec(&sql).await.expect("a load statement");
         ops += 1;
         tokio::time::sleep(Duration::from_millis(5)).await;
     }

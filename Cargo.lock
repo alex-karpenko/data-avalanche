@@ -1695,6 +1695,7 @@ dependencies = [
  "data-avalanche-telemetry",
  "data-avalanche-testkit",
  "futures-util",
+ "mysql_async",
  "object_store 0.14.2",
  "rustls",
  "serde_json",

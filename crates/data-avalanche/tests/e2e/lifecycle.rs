@@ -17,24 +17,22 @@ fn never() -> Options<'static> {
     }
 }
 
-/// The slot has a walsender: the source connection is open.
-async fn slot_active(e: &E2e) -> bool {
-    e.admin
-        .query_one(
-            "SELECT coalesce(bool_or(active), false) FROM pg_replication_slots WHERE slot_name = $1",
-            &[&e.schema],
-        )
-        .await
-        .expect("slots read")
-        .get(0)
-}
-
 /// Pause holds the stream with the source connection open; stop closes it and is kept across a
 /// restart; resume reads on from where each left off.
 #[tokio::test]
 async fn pause_stop_and_resume_hold_across_a_restart() {
     require_it!();
-    let e = E2e::new("life_states", ITEMS, never()).await;
+    // MySQL's dump thread sees the stop's closed connection at its next write, a heartbeat at
+    // the latest: 1 s, not the default minute.
+    let e = E2e::new(
+        "life_states",
+        ITEMS,
+        Options {
+            mysql: ", heartbeat: 1s",
+            ..never()
+        },
+    )
+    .await;
     let mut p = e.start(&[]);
     p.ready().await;
     e.streaming().await;
@@ -50,7 +48,7 @@ async fn pause_stop_and_resume_hold_across_a_restart() {
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!(e.ids("items").await, [1], "nothing is read while paused");
     assert!(
-        slot_active(&e).await,
+        e.stream_open().await,
         "a paused pipeline keeps the source warm"
     );
 
@@ -67,9 +65,9 @@ async fn pause_stop_and_resume_hold_across_a_restart() {
         .expect("stopped");
     p.metric(&e.status("stopped")).await;
     eventually(
-        "the slot is released",
+        "the stream is closed",
         Duration::from_secs(30),
-        async || !slot_active(&e).await,
+        async || !e.stream_open().await,
     )
     .await;
     assert!(p.terminate().await.success());
@@ -84,7 +82,7 @@ async fn pause_stop_and_resume_hold_across_a_restart() {
         [1, 2],
         "still stopped after a restart"
     );
-    assert!(!slot_active(&e).await);
+    assert!(!e.stream_open().await);
 
     e.docs()
         .set_desired_state(DesiredState::Running)
@@ -145,15 +143,8 @@ async fn an_iceberg_pipeline_is_refused_beside_a_running_one() {
             tables: ", snapshots: { mode: never }",
             pipelines: r#"  ice:
     id: ice
-    source:
-      host: 127.0.0.1
-      port: @PG@
-      db: avalanche
-      user: avalanche
-      password: avalanche
-      ssl_mode: disable
-      postgres: { publication: @SCHEMA@_ice_pub, slot: @SCHEMA@_ice }
-    tables: { include: [@SCHEMA@.*] }
+@SOURCE(_ice)@
+    tables: { include: ['@INCLUDE@'] }
     sink:
       type: iceberg
       bucket: @BUCKET@
@@ -165,10 +156,7 @@ async fn an_iceberg_pipeline_is_refused_beside_a_running_one() {
     .await;
     let mut p = e.start(&[]);
     p.ready().await;
-    p.metric(
-        r#"data_avalanche_pipeline_status{pipeline="ice",source_host="127.0.0.1",source_db="avalanche",status="error"} 1"#,
-    )
-    .await;
+    p.metric(&e.status_of("ice", "error")).await;
     e.streaming().await;
     e.exec("INSERT INTO items VALUES (1, 'a')").await;
     e.converged("items").await;
@@ -178,17 +166,17 @@ async fn an_iceberg_pipeline_is_refused_beside_a_running_one() {
         "{}",
         p.log()
     );
-    let ice_slot = format!("{}_ice", e.schema);
-    let slots: i64 = e
-        .admin
-        .query_one(
-            "SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1",
-            &[&ice_slot],
-        )
-        .await
-        .expect("slots read")
-        .get(0);
-    assert_eq!(slots, 0, "the refused pipeline touched no source");
+    if e.source.is_postgres() {
+        let ice_slot = format!("{}_ice", e.schema);
+        assert!(
+            !e.db
+                .any(&format!(
+                    "SELECT 1 FROM pg_replication_slots WHERE slot_name = '{ice_slot}'"
+                ))
+                .await,
+            "the refused pipeline touched no source"
+        );
+    }
     assert!(p.terminate().await.success());
     e.cleanup().await;
 }

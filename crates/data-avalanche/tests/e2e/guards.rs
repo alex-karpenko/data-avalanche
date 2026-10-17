@@ -1,12 +1,12 @@
 //! Scenario 10, the guards: the WAL a slot retains, the open transaction's buffer, a slot whose
-//! WAL is gone, and a source that stops answering.
+//! WAL is gone (PostgreSQL), and a source that stops answering.
 
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use data_avalanche_testkit::require_it;
 
-use crate::harness::{E2e, Options, admin, eventually, pg_port};
+use crate::harness::{Db, Doc, E2e, Options, eventually};
 
 const TABLES: &str = "CREATE TABLE items (id bigint PRIMARY KEY, doc text);
      CREATE TABLE pad (id bigserial PRIMARY KEY, doc text);";
@@ -14,7 +14,7 @@ const TABLES: &str = "CREATE TABLE items (id bigint PRIMARY KEY, doc text);
 /// Writes WAL and switches to a new segment, `n` times: each moves the WAL end by up to 16 MiB.
 async fn switch_wal(e: &E2e, n: usize) -> Result<(), tokio_postgres::Error> {
     for _ in 0..n {
-        e.admin
+        e.db.pg()
             .batch_execute(&format!(
                 "INSERT INTO {}.pad (doc) VALUES ('x'); SELECT pg_switch_wal()",
                 e.schema
@@ -30,11 +30,12 @@ async fn switch_wal(e: &E2e, n: usize) -> Result<(), tokio_postgres::Error> {
 #[tokio::test]
 async fn retained_wal_past_the_limit_stops_the_pipeline() {
     require_it!();
+    crate::postgres_only!();
     let e = E2e::new(
         "guard_wal",
         TABLES,
         Options {
-            tables: ", exclude: [e2e_guard_wal.pad], snapshots: { mode: never }",
+            tables: ", exclude: ['@SCHEMA@.pad'], snapshots: { mode: never }",
             postgres: ", max_wal_lag_bytes: 64MiB, heartbeat: 5s",
             ..Options::default()
         },
@@ -43,20 +44,17 @@ async fn retained_wal_past_the_limit_stops_the_pipeline() {
     let mut p = e.start(&[]);
     p.ready().await;
     e.streaming().await;
-    let held = admin().await;
-    held.batch_execute(&format!(
+    let held = Db::connect(e.source).await;
+    held.exec(&format!(
         "BEGIN; INSERT INTO {}.items VALUES (1, 'held')",
         e.schema
     ))
     .await
     .expect("an open transaction");
     switch_wal(&e, 6).await.expect("WAL written");
-    e.admin
-        .batch_execute("CHECKPOINT")
-        .await
-        .expect("a checkpoint");
+    e.db.exec("CHECKPOINT").await.expect("a checkpoint");
     p.metric(&e.status("error")).await;
-    held.batch_execute("ROLLBACK").await.expect("rolled back");
+    held.exec("ROLLBACK").await.expect("rolled back");
     assert!(
         p.log().contains("over max_wal_lag_bytes 67108864"),
         "{}",
@@ -73,7 +71,7 @@ async fn a_transaction_past_the_buffer_ceiling_stops_the_pipeline() {
     require_it!();
     let e = E2e::new(
         "guard_buffer",
-        TABLES,
+        "CREATE TABLE items (id bigint PRIMARY KEY, doc text);",
         Options {
             tables: ", snapshots: { mode: never }",
             sink: ", max_transaction_buffer_bytes: 16MiB",
@@ -84,8 +82,7 @@ async fn a_transaction_past_the_buffer_ceiling_stops_the_pipeline() {
     let mut p = e.start(&[]);
     p.ready().await;
     e.streaming().await;
-    e.exec("INSERT INTO items SELECT g, repeat('x', 300) FROM generate_series(1, 100000) g")
-        .await;
+    e.insert_series("items", 100_000, Doc::Pad(300)).await;
     p.metric(&e.status("error")).await;
     assert!(
         p.log()
@@ -103,11 +100,12 @@ async fn a_transaction_past_the_buffer_ceiling_stops_the_pipeline() {
 #[tokio::test]
 async fn a_slot_whose_wal_is_gone_is_snapshotted_again() {
     require_it!();
+    crate::postgres_only!();
     let e = E2e::new(
         "guard_lost",
         &format!("{TABLES} INSERT INTO items VALUES (1, 'a'), (2, 'b');"),
         Options {
-            tables: ", exclude: [e2e_guard_lost.pad], snapshots: { mode: initial }",
+            tables: ", exclude: ['@SCHEMA@.pad'], snapshots: { mode: initial }",
             ..Options::default()
         },
     )
@@ -127,15 +125,15 @@ async fn a_slot_whose_wal_is_gone_is_snapshotted_again() {
             None => "ALTER SYSTEM RESET max_slot_wal_keep_size".to_owned(),
             Some(s) => format!("ALTER SYSTEM SET max_slot_wal_keep_size = '{s}'"),
         };
-        e.admin.batch_execute(&set).await?;
-        e.admin.batch_execute("SELECT pg_reload_conf()").await
+        e.db.pg().batch_execute(&set).await?;
+        e.db.pg().batch_execute("SELECT pg_reload_conf()").await
     };
     keep(None).await.expect("the default");
     let invalidate = async {
         keep(Some("1MB")).await?;
         switch_wal(&e, 3).await?;
-        e.admin.batch_execute("CHECKPOINT").await?;
-        e.admin
+        e.db.pg().batch_execute("CHECKPOINT").await?;
+        e.db.pg()
             .query_one(
                 "SELECT wal_status FROM pg_replication_slots WHERE slot_name = $1",
                 &[&e.schema],
@@ -165,9 +163,8 @@ async fn a_slot_whose_wal_is_gone_is_snapshotted_again() {
 struct Frozen(String);
 
 impl Frozen {
-    fn new() -> Self {
-        // test-infra/compose.yaml: project `data-avalanche-test`, `postgres-<major>` on 554<major>.
-        let name = format!("data-avalanche-test-postgres-{}-1", pg_port() - 55400);
+    fn new(e: &E2e) -> Self {
+        let name = e.source.container();
         docker("pause", &name);
         Self(name)
     }
@@ -213,6 +210,7 @@ async fn a_source_that_stops_answering_is_reconnected_to() {
             tables: ", snapshots: { mode: never }",
             source: "timeouts: { connect: 2s, command: 2s }",
             postgres: ", heartbeat: 1s",
+            mysql: ", heartbeat: 1s",
             ..Options::default()
         },
     )
@@ -224,7 +222,7 @@ async fn a_source_that_stops_answering_is_reconnected_to() {
     e.mirrored("items", &["id", "doc"]).await;
     assert_eq!(reconnects(&p.metrics().await), 0);
     {
-        let _frozen = Frozen::new();
+        let _frozen = Frozen::new(&e);
         eventually("a reconnect", Duration::from_secs(60), async || {
             reconnects(&p.metrics().await) >= 1
         })
