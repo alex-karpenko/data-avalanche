@@ -139,7 +139,7 @@ after the arrow.
 | Q-M7b-3 | How is a corrupted payload injected? | **A test-only TCP wire proxy** in the E2E suite: it passes packets through and, on request, corrupts the next `TRANSACTION_PAYLOAD` a dump sends (one byte flipped, the CRC32 recomputed) |
 | Q-M7b-4 | How does the status show a pipeline-scope halt? | **A structured code**: `Actual::Error` gains `code: Option<String>`, read from the message's prefix; the `ERROR` log line carries it as a field; no new metric. The E2E asserts `status="error"` and the code |
 
-**Rulings where the plan decides** (each pinned by a test):
+**Rulings where the plan decides** (each pinned by a test). **Plan approved 2026-10-17**, with these rulings (roadmap D-IMPL-16):
 
 | # | Ruling | Why | Pinned by |
 |---|---|---|---|
@@ -184,7 +184,7 @@ after the arrow.
   and `mariadb-118-binlog`, 28 of 33 at first, then the 5 that failed (the CTE ceiling and the
   MariaDB JSON text, both fixed in the blocks below) green on rerun.
 
-**Documents this plan changes** (applied at plan approval, in an `infra:` and a `gap:` commit;
+**Documents this plan changes** (applied 2026-10-17 at plan approval, in an `infra:` and a `gap:` commit;
 `test-infra/README.md` changes in Task 8):
 
 - Roadmap:
