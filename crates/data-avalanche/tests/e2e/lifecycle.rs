@@ -166,6 +166,8 @@ async fn an_iceberg_pipeline_is_refused_beside_a_running_one() {
         "{}",
         p.log()
     );
+    // The refused pipeline opened no stream. On PostgreSQL it has no slot; on MySQL both
+    // pipelines read as the test's user, and the server runs one binlog dump for it.
     if e.source.is_postgres() {
         let ice_slot = format!("{}_ice", e.schema);
         assert!(
@@ -176,6 +178,16 @@ async fn an_iceberg_pipeline_is_refused_beside_a_running_one() {
                 .await,
             "the refused pipeline touched no source"
         );
+    } else {
+        let dumps =
+            e.db.text(&format!(
+                "SELECT 1 FROM information_schema.PROCESSLIST
+                 WHERE USER = '{}' AND COMMAND LIKE 'Binlog Dump%'",
+                e.schema
+            ))
+            .await
+            .expect("the source reads");
+        assert_eq!(dumps.len(), 1, "the refused pipeline touched no source");
     }
     assert!(p.terminate().await.success());
     e.cleanup().await;
