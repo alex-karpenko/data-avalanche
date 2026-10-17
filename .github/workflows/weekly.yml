@@ -5,7 +5,8 @@ name: weekly
 # `postgres-18` suites of ci.yml re-run through DATA_AVALANCHE_PG_PORT. The E2E suite also needs
 # RustFS and uv (its DuckDB read).
 # The MySQL source against the older MariaDB LTS servers (P-8): 11.4 and 10.11, GTID mode, through
-# DATA_AVALANCHE_MYSQL.
+# DATA_AVALANCHE_MYSQL. The slice-1 E2E suite on MariaDB 11.8 in file/position mode and on 11.4
+# and 10.11 (Q-M7b-2; ci.yml runs it on MySQL 8.4 and MariaDB 11.8 per change).
 # Weekly (Mondays 03:41 UTC) and on manual dispatch. The TLS tests need `postgres-tls`
 # (PostgreSQL 18) or `mysql-tls` (MySQL 8.4) and run in ci.yml only. No secrets.
 
@@ -75,6 +76,38 @@ jobs:
       - name: Container logs on failure
         if: failure()
         run: docker compose -f test-infra/compose.yaml --profile matrix logs --no-color "${{ matrix.target }}"
+      - name: Stop the containers
+        if: always()
+        run: docker compose -f test-infra/compose.yaml --profile matrix down -v
+
+  e2e-mysql:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: mariadb-118-binlog, service: mariadb-118 }
+          - { target: mariadb-114, service: mariadb-114 }
+          - { target: mariadb-1011, service: mariadb-1011 }
+    env:
+      DATA_AVALANCHE_IT: "1"
+      DATA_AVALANCHE_SKIP_GCS: "1"
+      DATA_AVALANCHE_E2E_SOURCE: mysql
+      DATA_AVALANCHE_MYSQL: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - uses: astral-sh/setup-uv@v10.2.0
+      - name: Start ${{ matrix.service }} and RustFS
+        run: |
+          docker compose -f test-infra/compose.yaml --profile matrix up -d --wait "${{ matrix.service }}" rustfs
+          docker compose -f test-infra/compose.yaml --profile init run --rm rustfs-init
+      - name: Slice-1 E2E
+        run: cargo test --locked -p data-avalanche --features e2e-hooks --test e2e -- --test-threads=1
+      - name: Container logs on failure
+        if: failure()
+        run: docker compose -f test-infra/compose.yaml --profile matrix logs --no-color "${{ matrix.service }}" rustfs
       - name: Stop the containers
         if: always()
         run: docker compose -f test-infra/compose.yaml --profile matrix down -v
