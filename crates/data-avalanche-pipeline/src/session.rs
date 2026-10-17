@@ -15,8 +15,8 @@ use std::time::Instant;
 
 use data_avalanche_core::{
     CdcEvent, ChangeStream, ColumnValue, HaltReason, Op, RescanReport, RetainedLog, Row,
-    SchemaHint, Sink, SourceConnector, SourceError, SourcePosition, SourceSeq, StreamItem,
-    TableRef, TableSchema, TransactionBoundary, identifier_values,
+    SchemaHint, ServerIdentity, Sink, SourceConnector, SourceError, SourcePosition, SourceSeq,
+    StreamItem, TableRef, TableSchema, TransactionBoundary, identifier_values,
 };
 use data_avalanche_state::{PipelineDocs, TableHalt};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -79,6 +79,9 @@ pub(crate) struct Core {
     /// The tables whose chunk reads are failing, a streak each. Like `requery_failing` it outlives
     /// a session.
     pub read_failing: BTreeMap<TableRef, Streak>,
+    /// The server the checkpoint is recorded with (MySQL; `None` for PostgreSQL): the one the
+    /// last start read, from `prepare` or the reset position. A reconnect keeps it.
+    pub server: Option<ServerIdentity>,
     /// [`Command::Pause`] is in force: a session finishes its open transaction, makes it durable
     /// and reads nothing more until [`Command::Resume`]. It outlives a session, so a reconnect
     /// while paused stays paused.
@@ -187,13 +190,11 @@ impl<'c> Session<'c> {
     /// Loads the durable state and opens the stream at the checkpoint; `Ok(Err)` when the source
     /// fails to open it.
     pub async fn open(core: &'c mut Core) -> Result<Result<Self, SourceError>, WorkerError> {
-        let Some(slot) = core.settings.slot.clone() else {
-            return Err(protocol("a stream session needs a PostgreSQL slot".into()));
-        };
-        let checkpoint = match core.docs.slot().await? {
-            Some(v) if !v.doc.is_intent() => SourcePosition::Pg(v.doc.confirmed_flush_lsn),
+        let from = match core.settings.checkpoint.load(&core.docs).await? {
+            Some(s) if !s.intent => s.checkpoint,
             _ => return Err(protocol("a stream session needs a checkpoint".into())),
         };
+        let checkpoint = from.position.clone();
         let cached: BTreeMap<TableRef, TableSchema> = core
             .docs
             .table_schemas()
@@ -243,11 +244,7 @@ impl<'c> Session<'c> {
             core.snapshot_started.entry(table.clone()).or_insert(now);
         }
         let live: Vec<TableSchema> = schemas.values().cloned().collect();
-        let stream = match core
-            .source
-            .open_stream(&checkpoint.clone().into(), &live)
-            .await
-        {
+        let stream = match core.source.open_stream(&from, &live).await {
             Ok(stream) => stream,
             Err(e) => return Ok(Err(e)),
         };
@@ -256,7 +253,8 @@ impl<'c> Session<'c> {
         let ctx = WriterCtx {
             sink: core.sink.clone(),
             docs: core.docs.clone(),
-            slot,
+            store: core.settings.checkpoint.clone(),
+            server: core.server.clone(),
             pipeline_id: core.settings.pipeline_id.clone(),
             owner_epoch: core.owner_epoch,
             guard: core.guard.clone(),
@@ -923,7 +921,8 @@ impl<'c> Session<'c> {
     /// the source's disk. A failed read waits for the next heartbeat, and the pipeline keeps
     /// running. The first permanent failure of a streak warns that the guard is blind; a read
     /// that succeeds ends the streak. The watchdog hears whether the source answered: a
-    /// transient failure, or a slot no stream reads, is no answer.
+    /// transient failure, or a stream the source doesn't run (a slot no stream reads, no binlog
+    /// dump), is no answer.
     fn wal_lag(
         &mut self,
         read: Result<Result<Option<RetainedLog>, SourceError>, JoinError>,
@@ -956,10 +955,11 @@ impl<'c> Session<'c> {
             }
         };
         self.core.wal_lag_failing.succeeded();
+        let unread = self.core.settings.checkpoint.unread();
         self.watchdog.answered(
             retained
                 .is_some_and(|r| !r.streamed)
-                .then(|| "no stream reads the slot".to_owned()),
+                .then(|| unread.to_owned()),
         );
         let retained = retained.map(|r| r.bytes);
         self.core.update(|st| st.retained_bytes = retained);
@@ -1552,6 +1552,36 @@ mod tests {
         assert_eq!(halts.len(), 1);
         assert_eq!((&halts[0].table, &halts[0].at), (&t("a"), &start));
         assert!(matches!(halts[0].reason, HaltReason::SchemaMismatch { .. }));
+        assert!(st.halted.contains_key(&t("a")));
+    }
+
+    /// A halt mid-transaction (MySQL: a rows event whose later row can't be decoded) drops the
+    /// table's rows of that transaction, before the halt and after it; its committed rows stay
+    /// and the transaction's other tables land.
+    #[tokio::test]
+    async fn a_halt_mid_transaction_drops_the_tables_rows_of_it() {
+        let w = World::new(&["a", "b"]);
+        w.started(&["a", "b"]).await;
+        let (end, st) = session(&w, &flush_each(), &["a", "b"], async |status| {
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+            let mut bad = row(3, "x");
+            bad.0.push(("zzz".into(), ColumnValue::Int64(1)));
+            w.source.commit(
+                FakeTxn::new()
+                    .insert(&t("a"), row(2, "before"))
+                    .insert(&t("b"), row(1, "y"))
+                    .insert(&t("a"), bad)
+                    .insert(&t("a"), row(4, "after"))
+                    .insert(&t("b"), row(2, "y")),
+            );
+            durable(&status, w.source.wal_end()).await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!((w.ids("a"), w.ids("b")), (vec![1], vec![1, 2]));
+        let halts = w.docs.halts().await.unwrap().tables;
+        assert_eq!(halts.len(), 1);
+        assert_eq!(halts[0].table, t("a"));
         assert!(st.halted.contains_key(&t("a")));
     }
 

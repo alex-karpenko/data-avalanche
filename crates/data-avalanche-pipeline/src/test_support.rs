@@ -41,12 +41,15 @@ pub(crate) fn pipeline(tables: &str, sink: &str, postgres: &str) -> Pipeline {
 }
 
 /// The test pipeline's extra YAML. `pipeline`, `source` and `tables` are lines (each starting
-/// with a newline, indented four, six and six spaces); `sink` and `postgres` are flow entries.
+/// with a newline, indented four, six and six spaces); `sink`, `postgres` and `mysql` are flow
+/// entries. With `mysql` set the source is MySQL (`db: public`, so its tables are the fake's
+/// `public.*`), and `postgres` is ignored.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Yaml<'a> {
     pub pipeline: &'a str,
     pub source: &'a str,
     pub postgres: &'a str,
+    pub mysql: Option<&'a str>,
     pub tables: &'a str,
     pub sink: &'a str,
 }
@@ -60,6 +63,24 @@ impl Yaml<'_> {
                 format!(", {s}")
             }
         };
+        let (db, origin, include) = match self.mysql {
+            None => (
+                "avalanche",
+                format!(
+                    "ssl_mode: disable\n      postgres: {{ publication: p_pub, slot: p_slot{} }}",
+                    sep(self.postgres)
+                ),
+                "public.*",
+            ),
+            Some(mysql) => (
+                "public",
+                format!(
+                    "type: mysql\n      mysql: {{ replication_type: gtid{} }}",
+                    sep(mysql)
+                ),
+                "'*'",
+            ),
+        };
         let yaml = format!(
             r#"
 config_version: 1
@@ -71,16 +92,14 @@ pipelines:
     source:
       host: 127.0.0.1
       port: 55418
-      db: avalanche
+      db: {db}
       user: avalanche
       password: avalanche
-      ssl_mode: disable
-      postgres: {{ publication: p_pub, slot: p_slot{postgres} }}{source}
+      {origin}{source}
     tables:
-      include: [public.*]{tables}
+      include: [{include}]{tables}
     sink: {{ type: delta, bucket: lake, delta: {{}}{sink} }}{top}
 "#,
-            postgres = sep(self.postgres),
             source = self.source,
             tables = self.tables,
             sink = sep(self.sink),
@@ -423,6 +442,7 @@ impl World {
             wal_lag_failing: Streak::default(),
             writers_waited: BTreeSet::new(),
             read_failing: BTreeMap::new(),
+            server: None,
             pause: false,
         };
         (core, control, status_rx)

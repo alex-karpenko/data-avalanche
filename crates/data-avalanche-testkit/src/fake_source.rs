@@ -33,9 +33,9 @@ use data_avalanche_core::position::Lsn;
 use data_avalanche_core::{
     CdcEvent, ChangeStream, Checkpoint, Chunk, ChunkVisibility, ColumnSchema, ColumnValue,
     HaltReason, InFlightTxn, KeysetCursor, Op, Preflight, Prepared, RescanReport, ResolvedTables,
-    RetainedLog, Row, SchemaChange, SchemaDelta, SchemaHint, SnapshotReason, SourceConnector,
-    SourceError, SourcePosition, SourceSeq, StartPlan, StreamItem, TableRef, TableSchema,
-    TransactionBoundary, XidSnapshot, identifier_values,
+    RetainedLog, Row, SchemaChange, SchemaDelta, SchemaHint, ServerIdentity, SnapshotReason,
+    SourceConnector, SourceError, SourcePosition, SourceSeq, StartPlan, StreamItem, TableRef,
+    TableSchema, TransactionBoundary, XidSnapshot, identifier_values,
 };
 use tokio::sync::Notify;
 
@@ -244,12 +244,14 @@ struct Db {
     waiting: usize,
     after_rescan: Option<Action>,
     acknowledged: Vec<SourcePosition>,
-    opened: Vec<SourcePosition>,
+    opened: Vec<Checkpoint>,
+    /// [`FakeSource::set_server`].
+    server: Option<ServerIdentity>,
     reads: BTreeMap<TableRef, usize>,
     rescans: usize,
     in_flights: usize,
     fetches: BTreeMap<TableRef, usize>,
-    prepares: Vec<Option<SourcePosition>>,
+    prepares: Vec<Option<Checkpoint>>,
 }
 
 /// The scripted source. Cloning shares the database.
@@ -296,6 +298,7 @@ impl FakeSource {
             after_rescan: None,
             acknowledged: vec![],
             opened: vec![],
+            server: None,
             reads: BTreeMap::new(),
             rescans: 0,
             in_flights: 0,
@@ -522,12 +525,37 @@ impl FakeSource {
 
     /// Where each stream was opened, in order.
     pub fn opened(&self) -> Vec<SourcePosition> {
+        self.db()
+            .opened
+            .iter()
+            .map(|c| c.position.clone())
+            .collect()
+    }
+
+    /// The checkpoint each stream was opened at, with its server, in order.
+    pub fn opened_at(&self) -> Vec<Checkpoint> {
         self.db().opened.clone()
     }
 
-    /// The checkpoint each `prepare` was called with.
+    /// The checkpoint's position each `prepare` was called with.
     pub fn prepares(&self) -> Vec<Option<SourcePosition>> {
+        self.db()
+            .prepares
+            .iter()
+            .map(|c| c.as_ref().map(|c| c.position.clone()))
+            .collect()
+    }
+
+    /// The checkpoint each `prepare` was called with, with its server.
+    pub fn prepared_at(&self) -> Vec<Option<Checkpoint>> {
         self.db().prepares.clone()
+    }
+
+    /// The server `prepare` and `reset_position` report from now on, as a MySQL source does
+    /// (`None`, the default: none, as PostgreSQL). Changing it is a failover: the source answers
+    /// from another server.
+    pub fn set_server(&self, server: Option<ServerIdentity>) {
+        self.db().server = server;
     }
 
     /// Chunk reads of `table` so far.
@@ -866,7 +894,8 @@ impl SourceConnector for FakeSource {
     ) -> Result<Prepared, SourceError> {
         self.take_fault(Method::Prepare)?;
         let mut db = self.db();
-        db.prepares.push(checkpoint.map(|c| c.position.clone()));
+        db.prepares.push(checkpoint.cloned());
+        let server = db.server.clone();
         let checkpoint = checkpoint.map(|c| lsn(&c.position));
         let reason = match (checkpoint, db.slot) {
             (None, None) => Some(SnapshotReason::FirstStart),
@@ -885,7 +914,7 @@ impl SourceConnector for FakeSource {
                 plan: StartPlan::Resume,
                 added: std::mem::take(&mut db.added),
                 warnings: vec![],
-                server: None,
+                server,
             },
             Some(reason) => {
                 db.slot = Some(db.wal_end);
@@ -897,7 +926,7 @@ impl SourceConnector for FakeSource {
                     },
                     added: vec![],
                     warnings: vec![],
-                    server: None,
+                    server,
                 }
             }
         })
@@ -908,7 +937,10 @@ impl SourceConnector for FakeSource {
         let mut db = self.db();
         db.slot = Some(db.wal_end);
         db.slot_lost = false;
-        Ok(SourcePosition::Pg(db.wal_end).into())
+        Ok(Checkpoint {
+            position: SourcePosition::Pg(db.wal_end),
+            server: db.server.clone(),
+        })
     }
 
     async fn retained(&self) -> Result<Option<RetainedLog>, SourceError> {
@@ -1037,7 +1069,7 @@ impl SourceConnector for FakeSource {
         tables: &[TableSchema],
     ) -> Result<Box<dyn ChangeStream>, SourceError> {
         self.take_fault(Method::OpenStream)?;
-        self.db().opened.push(from.position.clone());
+        self.db().opened.push(from.clone());
         Ok(Box::new(FakeStream {
             source: self.clone(),
             after: lsn(&from.position),
@@ -1336,6 +1368,30 @@ mod tests {
             }) => assert_eq!(column, "id", "the table halts, not the worker"),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// With a server set, the fake answers as a MySQL source: `prepare` and `reset_position` name
+    /// it, and the checkpoints it was handed are kept with theirs.
+    #[tokio::test]
+    async fn a_server_is_reported_and_the_checkpoints_kept() {
+        let src = FakeSource::new(vec![schema()]);
+        assert_eq!(src.prepare(None, &[t()]).await.unwrap().server, None);
+        let a = ServerIdentity::Mariadb { server_id: 1 };
+        src.set_server(Some(a.clone()));
+        let at = Checkpoint {
+            position: src.wal_end(),
+            server: Some(a.clone()),
+        };
+        let p = src.prepare(Some(&at), &[t()]).await.unwrap();
+        assert_eq!((p.plan, p.server), (StartPlan::Resume, Some(a.clone())));
+        assert_eq!(src.prepared_at().last(), Some(&Some(at.clone())));
+        assert_eq!(src.prepares().last(), Some(&Some(at.position.clone())));
+        src.open_stream(&at, &[]).await.unwrap();
+        assert_eq!(src.opened_at(), std::slice::from_ref(&at));
+        assert_eq!(src.opened(), [at.position]);
+        let b = ServerIdentity::Mariadb { server_id: 2 };
+        src.set_server(Some(b.clone()));
+        assert_eq!(src.reset_position().await.unwrap().server, Some(b));
     }
 
     #[tokio::test]
