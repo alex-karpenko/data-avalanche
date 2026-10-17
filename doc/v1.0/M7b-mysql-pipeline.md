@@ -5793,4 +5793,11 @@ git commit -m "ci: the slice-1 E2E on MySQL and MariaDB — per change on three 
 
 ## Deviations during execution
 
-None yet.
+- **Task 6, the review fix (2026-10-17, approved by Oleksii).** The task review found that the
+  Iceberg-refusal scenario (`an_iceberg_pipeline_is_refused_beside_a_running_one`) checked "the
+  refused pipeline touched no source" on PostgreSQL only (no slot for it), and nothing on MySQL;
+  the plan gave no reason. Fixed in its own commit (`61e1a6f`): on MySQL both pipelines read as
+  the test's user, so the scenario asserts that the server runs exactly one binlog dump for it.
+  Measured before the fix: it passes on `mysql-84` and `mariadb-118`, and with the expected count
+  set to 0 it fails (`left: 1, right: 0`), so the query sees the running pipeline's dump. After
+  the fix the scenario passes on PostgreSQL 18, `mysql-84` and `mariadb-118`.
