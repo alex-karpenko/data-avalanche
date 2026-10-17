@@ -102,6 +102,15 @@ pub enum Recovery {
 }
 
 impl WorkerError {
+    /// The code of a pipeline-scope halt (`BINLOG_PAYLOAD_INVALID`, `BINLOG_SOURCE_CHANGED`): a
+    /// permanent source error whose message names one ([`SourceError::halt_code`]).
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            Self::Source(e) => e.halt_code(),
+            _ => None,
+        }
+    }
+
     pub fn recovery(&self) -> Recovery {
         match self {
             Self::State(StateError::Store(
@@ -139,6 +148,18 @@ impl From<AccumulatorError> for WorkerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_source_halt_names_its_code() {
+        let halt = WorkerError::Source(SourceError::Permanent(
+            "BINLOG_SOURCE_CHANGED: binlog position f:4 was recorded on another server".into(),
+        ));
+        assert_eq!(halt.code(), Some("BINLOG_SOURCE_CHANGED"));
+        assert_eq!(halt.recovery(), Recovery::Error);
+        let plain = WorkerError::Source(SourceError::Permanent("no privilege".into()));
+        assert_eq!(plain.code(), None);
+        assert_eq!(WorkerError::Refused("BINLOG_X: y".into()).code(), None);
+    }
 
     #[test]
     fn a_transaction_too_large_is_its_own_stop() {

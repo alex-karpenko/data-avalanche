@@ -70,10 +70,19 @@ pub enum Actual {
         error: String,
     },
     /// The worker ended with an error an operator must act on (Q-M6b-3): no rerun until the
-    /// process restarts, or a stop then a resume.
+    /// process restarts, or a stop then a resume. `code` names a pipeline-scope halt
+    /// (`BINLOG_PAYLOAD_INVALID`, `BINLOG_SOURCE_CHANGED`; Q-M7b-4).
     Error {
         error: String,
+        code: Option<String>,
     },
+}
+
+/// Why the pipeline is in `ERROR`: the error, and the halt's code when it names one.
+#[derive(Debug, Clone)]
+struct Failure {
+    error: String,
+    code: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -279,7 +288,7 @@ impl PipelineController {
 
     async fn reconcile(&self, run: LeaseRun, target: &mut watch::Receiver<Target>) -> Left {
         let mut worker: Option<Running> = None;
-        let mut error: Option<String> = None;
+        let mut error: Option<Failure> = None;
         let mut dumped = false;
         let mut retry: Option<(Instant, String)> = None;
         let mut failures: u32 = 0;
@@ -327,7 +336,7 @@ impl PipelineController {
                 &run,
                 worker.as_ref(),
                 desired,
-                error.as_deref(),
+                error.as_ref(),
                 dumped,
                 retry.as_ref().map(|(_, e)| e.as_str()),
             );
@@ -438,11 +447,16 @@ impl PipelineController {
                                 return Left::Lost;
                             }
                             Recovery::Error => {
+                                let code = e.code().map(str::to_owned);
                                 tracing::error!(
                                     pipeline = %self.pipeline.name,
+                                    code = code.as_deref(),
                                     "pipeline in ERROR: {e}"
                                 );
-                                error = Some(e.to_string());
+                                error = Some(Failure {
+                                    error: e.to_string(),
+                                    code,
+                                });
                             }
                         },
                     }
@@ -463,7 +477,10 @@ impl PipelineController {
                     Ok(w) => worker = Some(w),
                     Err(e) => {
                         tracing::error!(pipeline = %self.pipeline.name, "pipeline in ERROR: {e}");
-                        error = Some(e);
+                        error = Some(Failure {
+                            error: e,
+                            code: None,
+                        });
                     }
                 },
                 Event::Due => {}
@@ -618,14 +635,15 @@ impl PipelineController {
         run: &LeaseRun,
         worker: Option<&Running>,
         desired: Option<DesiredState>,
-        error: Option<&str>,
+        error: Option<&Failure>,
         dumped: bool,
         retrying: Option<&str>,
     ) {
         let phase = worker.map(|w| w.handle.status.borrow().phase.clone());
-        let actual = if let Some(e) = error {
+        let actual = if let Some(f) = error {
             Actual::Error {
-                error: e.to_owned(),
+                error: f.error.clone(),
+                code: f.code.clone(),
             }
         } else if dumped {
             Actual::Dumped
@@ -822,6 +840,32 @@ mod tests {
         eventually("the row lands", || f.ids("a") == [7]).await;
     }
 
+    /// A pipeline-scope halt's code rides the `ERROR` state (Q-M7b-4).
+    #[tokio::test(start_paused = true)]
+    async fn a_pipeline_halt_publishes_its_code() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a"]);
+        f.source.fail(
+            Method::Prepare,
+            SourceError::Permanent(
+                "BINLOG_SOURCE_CHANGED: binlog position f:4 was recorded on another server".into(),
+            ),
+        );
+        let mut n = node("n1", &store, &docs, &f);
+        until(&mut n.status, "error", |s| {
+            matches!(
+                &s.actual,
+                Some(Actual::Error { code: Some(c), .. }) if c == "BINLOG_SOURCE_CHANGED"
+            )
+        })
+        .await;
+        assert!(line(
+            &n.metrics.encode(),
+            &format!(r#"data_avalanche_pipeline_status{{{P},status="error"}} 1"#)
+        ));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_permanent_worker_error_holds_until_a_stop_and_a_resume() {
         let store = ScriptedStore::new();
@@ -833,7 +877,7 @@ mod tests {
         );
         let mut n = node("n1", &store, &docs, &f);
         until(&mut n.status, "error", |s| {
-            matches!(&s.actual, Some(Actual::Error { error }) if error.contains("no privilege"))
+            matches!(&s.actual, Some(Actual::Error { error, .. }) if error.contains("no privilege"))
         })
         .await;
         tokio::time::sleep(Duration::from_secs(60)).await;
@@ -1007,7 +1051,7 @@ mod tests {
         until(
             &mut status,
             "error",
-            |s| matches!(&s.actual, Some(Actual::Error { error }) if error.contains("boom")),
+            |s| matches!(&s.actual, Some(Actual::Error { error, .. }) if error.contains("boom")),
         )
         .await;
         idles_through(Duration::from_secs(10)).await;
