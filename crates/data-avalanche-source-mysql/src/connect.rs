@@ -259,14 +259,17 @@ pipelines:
         assert!(!text.contains("hunter2"), "{text}");
     }
 
-    /// A source for the live test server (`DATA_AVALANCHE_MYSQL`, default `mysql-84`).
+    /// A source for the live test server (`DATA_AVALANCHE_MYSQL`, default `mysql-84`): every
+    /// target of `tests/mysql/common.rs`.
     fn live_source() -> Source {
         let name = std::env::var("DATA_AVALANCHE_MYSQL").unwrap_or_else(|_| "mysql-84".into());
         let port = match name.as_str() {
             "mysql-84" => 53384,
             "mysql-84-nogtid" => 53385,
-            "mariadb-118" => 53318,
-            other => panic!("DATA_AVALANCHE_MYSQL={other}: not a target of this test"),
+            "mariadb-118" | "mariadb-118-binlog" => 53318,
+            "mariadb-114" => 53314,
+            "mariadb-1011" => 53311,
+            other => panic!("DATA_AVALANCHE_MYSQL={other}: not a test-infra MySQL target"),
         };
         source_at(
             "127.0.0.1",
