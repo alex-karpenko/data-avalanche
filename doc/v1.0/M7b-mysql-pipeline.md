@@ -1,8 +1,8 @@
 ---
-updated: 2026-10-17
+updated: 2026-10-20
 domain: Data Flow
 tags: [v1, implementation-plan, m7b, mysql, mariadb, checkpoint, server-identity, e2e, fault-injection, binlog]
-resolves: []
+resolves: [DA-SRC-27, DA-X-14]
 sources: []
 ---
 
@@ -5774,20 +5774,22 @@ git commit -m "ci: the slice-1 E2E on MySQL and MariaDB — per change on three 
 
 ## M7b exit checklist
 
-- [ ] A `type: mysql` pipeline runs in the binary. Its first start, restart and lost position
+- [x] A `type: mysql` pipeline runs in the binary. Its first start, restart and lost position
       record the server with the position in `replication/position.json` (Tasks 2, 5).
-- [ ] A file/position reconnect to another server halts `BINLOG_SOURCE_CHANGED` (Tasks 4, 7).
-- [ ] A pipeline halt shows its code in `Actual::Error` and in the `ERROR` log line (Task 3).
+- [x] A file/position reconnect to another server halts `BINLOG_SOURCE_CHANGED` (Tasks 4, 7).
+- [x] A pipeline halt shows its code in `Actual::Error` and in the `ERROR` log line (Task 3).
 - [ ] The slice-1 E2E suite passes on PostgreSQL 18 and, through `ci.yml`'s `e2e-mysql` job, on
       `mysql-84`, `mysql-84-nogtid` and `mariadb-118`. Through `weekly.yml` it passes on
       `mariadb-118-binlog`, `mariadb-114` and `mariadb-1011`.
-- [ ] The payload fault-injection E2E halts with `BINLOG_PAYLOAD_INVALID`, and nothing is lost
+      Measured locally 2026-10-20 on PostgreSQL 18, `mysql-84`, `mysql-84-nogtid` and
+      `mariadb-118` (33 each); the CI jobs run at the PR.
+- [x] The payload fault-injection E2E halts with `BINLOG_PAYLOAD_INVALID`, and nothing is lost
       (Task 7).
-- [ ] M7a's carry items are done: the identity error, the file/position resume IT, the halted
+- [x] M7a's carry items are done: the identity error, the file/position resume IT, the halted
       table's rows (D-M7b.9), and `re_snapshot` at start through the worker.
-- [ ] Every Review Focus line has its passing test.
-- [ ] The documents of "Documents this plan changes" are updated.
-- [ ] The workspace gates pass: `cargo fmt --all --check`, `cargo clippy --workspace
+- [x] Every Review Focus line has its passing test.
+- [x] The documents of "Documents this plan changes" are updated.
+- [x] The workspace gates pass: `cargo fmt --all --check`, `cargo clippy --workspace
       --all-targets -- -D warnings`, `cargo clippy -p data-avalanche --features e2e-hooks
       --all-targets -- -D warnings`, `cargo test --workspace`.
 
@@ -5801,3 +5803,22 @@ git commit -m "ci: the slice-1 E2E on MySQL and MariaDB — per change on three 
   Measured before the fix: it passes on `mysql-84` and `mariadb-118`, and with the expected count
   set to 0 it fails (`left: 1, right: 0`), so the query sees the running pipeline's dump. After
   the fix the scenario passes on PostgreSQL 18, `mysql-84` and `mariadb-118`.
+- **The whole-branch review's fixes (2026-10-20).** The review (no Critical, one Important, five
+  Minor) asked for these fixes outside the task blocks, all made before the PR:
+  - **I-1, DA-SRC-27** (`d1554be`). `Connector::command` kept the catalog connection in its slot
+    while a call ran, so a call dropped mid-query (the session's `select!` drops
+    `MySqlStream::next()` while a DDL's catalog read runs) left the reply unread for the next
+    query. The connection now leaves the slot for the call and goes back only on a value or a
+    non-fatal error. A transient error now names the call; a permanent one keeps its message, so
+    its halt code still reads. The IT `a_call_dropped_mid_query_does_not_poison_the_next`: on the
+    old code the next `SELECT 1` waited 2.8 s for the abandoned `SLEEP(3)` reply.
+  - **M-2** (`d1554be`). `checkpoint_now` reads the server before the position, as `prepare`
+    does: a pair mismatched by a connection replaced between the two reads then halts at the
+    dump's identity check (D-M7b.7) instead of streaming another server's binlog.
+  - **M-1, DA-X-14** (`cded3fa`). The E2E wait `mirrored` treats a lake column it doesn't have
+    yet as "not yet" (`try_rows`); `rows` still panics, naming the columns asked for.
+  - **M-3** (`cded3fa`, and the re-review's residual after it). The purge-under-`error` scenario
+    finds the `pipeline in ERROR` line and asserts it carries no `code=` (D-M7b.16).
+  - **M-4** (`cded3fa`). The crash_ack comment, the `source_block` doc and `corrupt()`'s limit
+    (one packet holds the whole event).
+  - **M-5.** This exit's documents.
