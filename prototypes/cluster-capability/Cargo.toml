@@ -1,0 +1,53 @@
+[package]
+name = "cluster-capability"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Capability probe: the gossip membership layer for the cluster (roadmap R-1, M8 probe gate): memberlist 0.8.5 against foca 2.0"
+
+# Companion to lease-conformance / iceberg-capability / delta-capability / source-capability. Same
+# convention: the crate-dependent probe code is behind features, OFF by default, so a plain
+# `cargo test` stays instant and green. Every probe runs on loopback (no containers).
+#
+#   cargo test --features memberlist --test memberlist_c1_join      -- --nocapture
+#   cargo test --features memberlist --test memberlist_c2_lifecycle -- --nocapture --test-threads=1
+#   cargo test --features memberlist --test memberlist_c5b_reclaim  -- --nocapture
+#   cargo test --features memberlist --test memberlist_c13_reap     -- --nocapture
+#   cargo test --features foca       --test foca_gates              -- --nocapture --test-threads=1
+#
+# Candidates (crates.io, 2026-10-20):
+#   memberlist 0.8.5 (2026-06-23; upstream main is an unreleased rewrite with no tokio net crate)
+#   foca 2.0.0 (2026-08-02; sans-IO SWIM + infection + suspicion, no Lifeguard)
+
+[dependencies]
+bytes = { version = "1", optional = true }
+foca = { version = "=2.0.0", features = ["std", "serde", "postcard-codec"], optional = true }
+memberlist = { version = "=0.8.5", default-features = false, features = ["tokio", "tcp", "tls", "tls-aws-lc-rs", "snappy", "crc32", "dns"], optional = true }
+rand = { version = "0.10", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+smol_str = { version = "0.3", optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+
+[features]
+memberlist = ["dep:memberlist", "dep:smol_str", "dep:tokio"]
+foca = ["dep:foca", "dep:bytes", "dep:rand", "dep:serde", "dep:tokio"]
+
+[[test]]
+name = "memberlist_c1_join"
+required-features = ["memberlist"]
+
+[[test]]
+name = "memberlist_c2_lifecycle"
+required-features = ["memberlist"]
+
+[[test]]
+name = "memberlist_c5b_reclaim"
+required-features = ["memberlist"]
+
+[[test]]
+name = "memberlist_c13_reap"
+required-features = ["memberlist"]
+
+[[test]]
+name = "foca_gates"
+required-features = ["foca"]
