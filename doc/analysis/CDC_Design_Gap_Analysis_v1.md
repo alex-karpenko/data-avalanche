@@ -1769,6 +1769,10 @@ and MariaDB 11.8. No spec change.
 | DA-X-14 | 🟥 → ✅: the E2E wait (`mirrored`) treats a lake column it doesn't have yet as "not yet" (`try_rows`); `rows` still panics for a direct assertion | `harness.rs`; the E2E suite on the four targets |
 | DA-SRC-12 | ✅ (stays): the fault-injection E2E passes on MySQL 8.4 and MariaDB 11.8 | `mysql.rs` `a_corrupted_compressed_transaction_halts_the_pipeline` |
 
-Still open for Oleksii: whether a server that reports no identity (`@@server_uuid` / `@@server_id`
-NULL or empty) halts with a code. Today its message has none, so the status shows `error` without
-a code; the spec names only `BINLOG_PAYLOAD_INVALID` and `BINLOG_SOURCE_CHANGED`.
+Decided (Oleksii, 2026-10-20): a server that reports no identity (`@@server_uuid` / `@@server_id`
+NULL or empty) gets no halt code, and the spec keeps its two (`BINLOG_PAYLOAD_INVALID`,
+`BINLOG_SOURCE_CHANGED`). No real server answers that way: MySQL has set `@@server_uuid` since
+5.6 (generated at first start, read-only), and MariaDB's `@@server_id` is always a number. The
+error guards only something odd on the wire (a proxy, a fork), and its message names the
+variable. GTID mode still requires the identity, though it checks none (a GTID set means the same
+on every server). Relaxing that would be code for a case that doesn't occur.
