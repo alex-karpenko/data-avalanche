@@ -188,12 +188,9 @@ async fn a_purged_checkpoint_halts_under_error() {
         log.contains("binlog_purge_action is error, so the pipeline halts"),
         "{log}"
     );
-    assert!(
-        !plain(&log)
-            .lines()
-            .any(|l| l.contains("pipeline in ERROR") && l.contains("code=")),
-        "{log}"
-    );
+    let text = plain(&log);
+    let halt = text.lines().find(|l| l.contains("pipeline in ERROR"));
+    assert!(halt.is_some_and(|l| !l.contains("code=")), "{log}");
     assert_eq!(e.ids("items").await, [1, 2]);
     assert!(p.terminate().await.success());
     e.cleanup().await;
