@@ -179,9 +179,12 @@ impl MySqlConnector {
     /// The server's write position now, with the server: the checkpoint a start from now
     /// records.
     pub async fn checkpoint_now(&self) -> Result<Checkpoint, SourceError> {
+        // The identity first, as `prepare` reads it: were the connection replaced between the two
+        // reads, a mispaired checkpoint then halts at the dump's identity check (D-M7b.7).
+        let server = self.server_identity().await?;
         Ok(Checkpoint {
             position: self.position_now().await?,
-            server: Some(self.server_identity().await?),
+            server: Some(server),
         })
     }
 

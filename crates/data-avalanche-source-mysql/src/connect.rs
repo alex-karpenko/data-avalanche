@@ -110,31 +110,43 @@ impl Connector {
     }
 
     /// Runs `f` on the shared catalog connection under `timeouts.command`, connecting first when
-    /// there is none. A connection that failed or timed out is dropped: the next call opens
-    /// another.
+    /// there is none. The connection is out of the slot while `f` runs and goes back only when
+    /// the call completes with a value or a non-fatal error: a call dropped before it completes
+    /// (the caller's future cancelled) drops the connection with it, because its reply may be
+    /// half-read or unread, and the next query on it would read that reply as its own (DA-SRC-27).
+    /// A connection that failed fatally or timed out is dropped too: the next call opens another.
     pub(crate) async fn command<T>(
         &self,
         what: &str,
         f: impl for<'c> FnOnce(&'c mut Conn) -> BoxFuture<'c, mysql_async::Result<T>>,
     ) -> Result<T, SourceError> {
         let mut slot = self.catalog.lock().await;
-        if slot.is_none() {
-            *slot = Some(self.connect().await?);
-        }
-        let conn = slot.as_mut().expect("connected above");
-        match tokio::time::timeout(self.command, f(conn)).await {
-            Ok(Ok(v)) => Ok(v),
+        let mut conn = match slot.take() {
+            Some(c) => c,
+            None => self.connect().await?,
+        };
+        match tokio::time::timeout(self.command, f(&mut conn)).await {
+            Ok(Ok(v)) => {
+                *slot = Some(conn);
+                Ok(v)
+            }
             Ok(Err(e)) => {
-                if e.is_fatal() {
-                    *slot = None;
+                if !e.is_fatal() {
+                    *slot = Some(conn);
                 }
-                Err(mysql(e, None))
+                Err(named(what, mysql(e, None)))
             }
-            Err(_) => {
-                *slot = None;
-                Err(timed_out(what, self.command))
-            }
+            Err(_) => Err(timed_out(what, self.command)),
         }
+    }
+}
+
+/// Names the call in a transient error. A permanent one is left as it is: a halt code is read
+/// from the start of its message (`SourceError::halt_code`).
+fn named(what: &str, e: SourceError) -> SourceError {
+    match e {
+        SourceError::Transient(m) => SourceError::Transient(format!("{what}: {m}")),
+        other => other,
     }
 }
 
@@ -142,10 +154,24 @@ impl Connector {
 mod tests {
     use super::*;
     use data_avalanche_config::{FingerprintKey, load_str};
+    use data_avalanche_testkit::require_it;
+    use mysql_async::prelude::Queryable;
     use std::collections::BTreeMap;
 
     /// A source with `ssl` (YAML flow entries) and `env` for its `${…}` references.
     fn source(ssl: &str, env: &[(&str, &str)]) -> Source {
+        source_at("db.example.com", 3306, "shop", "cdc", "hunter2", ssl, env)
+    }
+
+    fn source_at(
+        host: &str,
+        port: u16,
+        db: &str,
+        user: &str,
+        password: &str,
+        ssl: &str,
+        env: &[(&str, &str)],
+    ) -> Source {
         let yaml = format!(
             r#"
 config_version: 1
@@ -156,11 +182,11 @@ pipelines:
     id: p
     source:
       type: mysql
-      host: db.example.com
-      port: 3306
-      db: shop
-      user: cdc
-      password: hunter2
+      host: {host}
+      port: {port}
+      db: {db}
+      user: {user}
+      password: {password}
       {ssl}
       mysql: {{}}
     tables:
@@ -231,5 +257,50 @@ pipelines:
             "{text}"
         );
         assert!(!text.contains("hunter2"), "{text}");
+    }
+
+    /// A source for the live test server (`DATA_AVALANCHE_MYSQL`, default `mysql-84`).
+    fn live_source() -> Source {
+        let name = std::env::var("DATA_AVALANCHE_MYSQL").unwrap_or_else(|_| "mysql-84".into());
+        let port = match name.as_str() {
+            "mysql-84" => 53384,
+            "mysql-84-nogtid" => 53385,
+            "mariadb-118" => 53318,
+            other => panic!("DATA_AVALANCHE_MYSQL={other}: not a target of this test"),
+        };
+        source_at(
+            "127.0.0.1",
+            port,
+            "avalanche",
+            "root",
+            "avalanche",
+            "ssl_mode: disable",
+            &[],
+        )
+    }
+
+    fn one(c: &mut Conn) -> BoxFuture<'_, mysql_async::Result<Option<u8>>> {
+        Box::pin(async move { c.query_first("SELECT 1").await })
+    }
+
+    /// DA-SRC-27: a call dropped mid-query must not leave its half-read connection in the slot.
+    #[tokio::test]
+    async fn a_call_dropped_mid_query_does_not_poison_the_next() {
+        require_it!();
+        let c = Connector::new(&live_source()).unwrap();
+        assert_eq!(c.command("first", one).await.unwrap(), Some(1));
+        let slow = c.command("sleep", |c| {
+            Box::pin(async move { c.query_first::<u8, _>("SELECT SLEEP(3)").await })
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), slow)
+                .await
+                .is_err(),
+            "the call was meant to be dropped mid-query"
+        );
+        let t = std::time::Instant::now();
+        let got = c.command("after", one).await;
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        assert_eq!(got.unwrap(), Some(1));
     }
 }
