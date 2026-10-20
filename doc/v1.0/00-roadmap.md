@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-14
+updated: 2026-10-17
 domain: Architecture
 tags: [v1, implementation-plan, roadmap, milestones, workspace, crates, interfaces, test-strategy, ci, risks]
 sources: []
@@ -407,7 +407,7 @@ pub enum StoreError { Conflict { key }, Contention { key }, Transient { key, rea
 
 Lease release is a **tombstone write** (object_store has no conditional delete). T1–T10 prove the lease CAS on every backend (`tests/lease_conformance.rs`, `test-infra/README.md`).
 
-### 3.6 Source connector (`data-avalanche-core` owns the trait, Q-M5-2; each source crate implements it; defined in M5, extended in M6a, M6b and M7a)
+### 3.6 Source connector (`data-avalanche-core` owns the trait, Q-M5-2; each source crate implements it; defined in M5, extended in M6a, M6b, M7a and M7b)
 
 `data-avalanche-core::source` (M5 Task 1; D-M5.1 lists where it differs from the first sketch):
 
@@ -418,13 +418,13 @@ pub trait SourceConnector: Send + Sync {                    // built from the re
     async fn resolve_tables(&self) -> Result<ResolvedTables, SourceError>;         // channel A: tables, halted, skipped, warnings
     async fn prepare(&self, checkpoint: Option<&Checkpoint>, tables: &[TableRef])
         -> Result<Prepared, SourceError>;                                           // PG: publication + slot state machine; MySQL: dialect, server, purge → StartPlan
-    async fn reset_position(&self) -> Result<SourcePosition, SourceError>;         // after PositionUnreachable (D-15.3)
+    async fn reset_position(&self) -> Result<Checkpoint, SourceError>;             // after PositionUnreachable (D-15.3); M7b: with its server
     async fn retained(&self) -> Result<Option<RetainedLog>, SourceError>;          // M6b (was retained_bytes): the heartbeat's read
     async fn current_position(&self) -> Result<SourcePosition, SourceError>;       // a rescan's catch-up mark (Q-M6a-4)
     async fn in_flight(&self) -> Result<Option<Vec<InFlightTxn>>, SourceError>;   // M6a; default None (DA-SNAP-9)
     async fn read_chunk(&self, t: &TableSchema, after: Option<&KeysetCursor>, limit: usize) -> Result<Chunk, SourceError>;
     async fn fetch_rows(&self, t: &TableSchema, keys: &[Row]) -> Result<Vec<Row>, SourceError>;  // toast_strategy: re_query
-    async fn open_stream(&self, from: &SourcePosition, tables: &[TableSchema]) -> Result<Box<dyn ChangeStream>, SourceError>;
+    async fn open_stream(&self, from: &Checkpoint, tables: &[TableSchema]) -> Result<Box<dyn ChangeStream>, SourceError>;  // M7b: a Checkpoint
     async fn augment(&self, cached: &TableSchema, hint: &SchemaHint)
         -> Result<(SchemaDelta, Option<TableSchema>), SourceError>;                // channel C; None = dropped
     async fn rescan(&self, known: &[TableSchema]) -> Result<RescanReport, SourceError>;  // channel D
@@ -450,6 +450,7 @@ pub enum ServerIdentity { Mysql { server_uuid: String }, Mariadb { server_id: u3
 pub enum SourceError { Transient(String), Permanent(String), Contended(String) /* M6a: PG 55006 */,
                        PositionUnreachable { position: String, detail: String },
                        TableHalt { table: TableRef, reason: HaltReason } }
+impl SourceError { pub fn halt_code(&self) -> Option<&str>; }   // M7b: a Permanent's `CODE: ` prefix (D-M7b.2)
 ```
 
 Also: `Preflight { server_version, warnings }`, `ResolvedTables { tables, halted, skipped, warnings }`,
@@ -477,6 +478,14 @@ MySQL `prepare` follows `binlog_purge_action` for a purged or other-dialect chec
 `BINLOG_SOURCE_CHANGED: …` for a file position from another server; `retained` is `bytes` 0 and
 `streamed` from the dump's connection id in `PROCESSLIST`; `fetch_rows` is `Permanent`; `teardown`
 does nothing; chunks carry no visibility (the window rule, with locking reads, Q-M7-3).
+
+From M7b (D-M7b.1, D-M7b.2, D-M7b.7, D-M7b.8): a reconnect opens the stream without `prepare`, and a
+lost position is replaced without it, so `open_stream` takes the whole checkpoint and
+`reset_position` returns one with the server it read (PostgreSQL: none). In file/position mode
+the MySQL dump reads the identity on its own connection before the dump command and halts
+`BINLOG_SOURCE_CHANGED` on another server or none recorded; GTID modes don't check. A server that
+reports no identity (no row, NULL, empty) is `Permanent`. `halt_code` reads the code D-M7a.8 puts
+at the front of a pipeline-scope halt's message: `[A-Z][A-Z0-9_]*` holding a `_`, then `": "`.
 
 ### 3.7 Cluster (Clustering §19–§20)
 
@@ -506,7 +515,7 @@ pub async fn release(leases: &Leases, lease: &Versioned<LeaseDoc>) -> Result<(),
 pub trait WorkerFactory: Send + Sync + Debug { fn build(&self, pipeline: &Pipeline) -> Result<Parts, String>; }
 pub struct Parts { pub source: Arc<dyn SourceConnector>, pub sink: Arc<dyn Sink>, pub hooks: Arc<dyn Hooks> }
 pub enum Target { Own, DontOwn }
-pub enum Actual { Standby { holder }, Starting, Running, Paused, Stopped, Dumped, Retrying { error }, Error { error } }
+pub enum Actual { Standby { holder }, Starting, Running, Paused, Stopped, Dumped, Retrying { error }, Error { error, code: Option<String> /* M7b */ } }
 pub struct ControllerStatus { pub actual: Option<Actual>, pub owner_epoch: Option<u64>, pub lease: Option<RenewState>,
                               pub worker: Option<WorkerStatus> }
 pub struct ControllerSettings { pub timing, pub drain_timeout, pub restart: Backoff, pub start_jitter, pub tuning }
@@ -522,7 +531,8 @@ pub fn node_identity(cluster: &Cluster, started: SystemTime) -> Result<Holder, S
 The controller polls the desired state each `lease_renewal_interval` (Q-M6b-2) and maps a worker
 error by `WorkerError::recovery()`: `Retry` reruns after a backoff, `Lease` stands by, `Error` holds
 ERROR until a stop (Q-M6b-3, Q-M6b-12). It logs each worker warning once and each reconnect with
-its reason.
+its reason. From M7b (Q-M7b-4), `Error` carries the halt's code (`WorkerError::code`, from a source error
+only), and the `ERROR` log line logs it as the field `code`; no new metric.
 
 ### 3.8 Configuration (`data-avalanche-config`, landed in M1)
 
@@ -707,7 +717,8 @@ pub enum WorkerError { Refused(String) /* Phase 0: sink type, Iceberg (D-V1.4), 
                        Contended { waited, detail }, Sink(SinkError), State(StateError), Fenced { table, current_epoch },
                        LeaseLost, TransactionTooLarge { bytes, limit }, WalLag { lag, limit }, Accumulator(AccumulatorError),
                        Crashed(HookPoint) }
-impl WorkerError { pub fn recovery(&self) -> Recovery; }             // M6b (Q-M6b-3)
+impl WorkerError { pub fn recovery(&self) -> Recovery;              // M6b (Q-M6b-3)
+                   pub fn code(&self) -> Option<&str>; }            // M7b: a source halt's code (Q-M7b-4)
 pub enum Recovery { Retry, Lease, Error }
 ```
 
@@ -731,6 +742,14 @@ pub enum Recovery { Retry, Lease, Error }
   heartbeat's read run beside the loop, and the stream watchdog (`SILENT_HEARTBEATS` = 3: a stream
   silent for 3 heartbeats while 3 reads in a row fail or find no reader ends the session, and the
   worker reconnects; DA-SRC-16); each table's last change in its change set (DA-X-12).
+- **M7b adds** (D-M7b.3…6): the checkpoint goes through one store, read from the source's block:
+  PostgreSQL's slot (`replication/slot.json`, with a managed first start's intent) or MySQL's
+  position document (`replication/position.json`, the position with its server). It replaces
+  `Settings.slot`. The server recorded is the one the last start read (`Prepared.server`, or the
+  reset checkpoint's); a reconnect keeps it. A checkpoint the store can't hold is a protocol
+  error. The heartbeat is `source.postgres.heartbeat` or `source.mysql.heartbeat`, and the
+  watchdog names an unread stream in the source's own terms. The PostgreSQL-only refusal at start
+  is gone.
 
 ### 3.12 Telemetry and the binary (`data-avalanche-telemetry`, `data-avalanche`; M6b)
 
@@ -1038,9 +1057,14 @@ and 10.11 weekly.
     with locking reads (Q-M7-3, DA-SNAP-10).
   - `binlog_purge_action`.
   - Spec edits for P-4 land before this milestone.
-- **M7b scope:** the worker's MySQL checkpoint (`PositionDoc` with the server from
-  `Prepared.server`, passed back as a `Checkpoint`), the binary's wiring, the `BINLOG_*` pipeline
-  halts in the status, and the E2E suites below.
+- **M7b scope** (`M7b-mysql-pipeline.md`, Q-M7b-1…4): the source contract's checkpoint on open and
+  reset (§3.6); the worker's MySQL checkpoint (`PositionDoc` with its server, §3.11); a
+  pipeline halt's code in `Actual::Error` and its log line (§3.7); the file/position dump's server
+  check and an error for no identity; the binary's wiring by `source.type`; the slice-1 E2E suite
+  on either source, with MySQL scenarios (a corrupted payload and a failover through a test-only
+  wire proxy, a purged checkpoint under both actions, the types in DuckDB) and its CI jobs (§5.3,
+  §5.4); M7a's carry items (the identity error, the file/position resume IT, a halted table's
+  rows, `re_snapshot` at start through the worker).
 - **Deps:** M6b (M7a); M7a (M7b).
 - **Exit:**
   - Slice-1 E2E parity suite on MySQL 8.4 and MariaDB 11.8 (every change) and MariaDB 10.11 / 11.4
@@ -1212,6 +1236,15 @@ fake-gcs FAIL (risk R-3).
 9. Iceberg refusal: an `iceberg` pipeline is refused while a `delta` pipeline in the same config runs.
 10. Guards: `max_wal_lag_bytes` halt; `max_transaction_buffer_bytes` halt; slot WAL-gone → re-snapshot;
     a frozen source reconnected to (M6b, DA-SRC-16).
+11. MySQL (M7b): a corrupted compressed transaction halts `BINLOG_PAYLOAD_INVALID` and loses
+    nothing; a purged checkpoint re-snapshots under `re_snapshot` and halts under `error`; a
+    failover in file/position mode halts `BINLOG_SOURCE_CHANGED`; every MySQL type family reads
+    back in DuckDB.
+
+From M7b (Q-M7b-1) one suite runs on either source: `DATA_AVALANCHE_E2E_SOURCE=postgres|mysql`, and
+`DATA_AVALANCHE_MYSQL` for the target. The shared scenarios (1–4, 7–9, and from 10 the buffer
+guard and the frozen source) use dialect helpers. A scenario of one source skips itself on the
+other (PostgreSQL: 5, 6, the WAL guard and a lost slot; MySQL: 11).
 
 ### 5.4 CI (`.github/workflows/`)
 
@@ -1222,10 +1255,13 @@ fake-gcs FAIL (risk R-3).
   `GCP_SA_KEY` (service-account JSON, `roles/storage.objectAdmin` on the bucket) and variable
   `DATA_AVALANCHE_GCS_BUCKET`, documented in `test-infra/README.md` and in the workflow comments.
   From M7a, a step runs the MySQL source's tests on `mysql-84-nogtid`, `mariadb-118` and
-  `mariadb-118-binlog` (the workspace run covers `mysql-84`).
+  `mariadb-118-binlog` (the workspace run covers `mysql-84`). From M7b (Q-M7b-2), an `e2e-mysql`
+  job beside the integration job runs the E2E suite on `mysql-84`, `mysql-84-nogtid` and
+  `mariadb-118`, one matrix entry each.
 - `weekly.yml` (weekly + manual; from M5, Q-M5-23): full DB matrix (M5: the PostgreSQL source suite on
   PostgreSQL 14–17, one job each, through `DATA_AVALANCHE_PG_PORT`; M7a: the MySQL source suite on
-  MariaDB 11.4 and 10.11, through `DATA_AVALANCHE_MYSQL`), full E2E, longer property-test case
+  MariaDB 11.4 and 10.11, through `DATA_AVALANCHE_MYSQL`; M7b: the E2E suite on
+  `mariadb-118-binlog`, `mariadb-114` and `mariadb-1011`), full E2E, longer property-test case
   counts.
 - `cloud.yml` (weekly + manual): T1–T10 and the Delta P8 re-run on real S3/GCS/Azure, plus one E2E per
   cloud. Credentials are repository secrets injected as env vars; nothing is printed.
@@ -1348,6 +1384,7 @@ the naming below (2026-09-26).**
 | D-IMPL-13 | M6a pipeline-worker rulings **D-M6a.1…D-M6a.11** (listed in `M6a-pipeline-worker.md` §Decisions and rulings, each pinned by a test). Among them: a halt's `at` is the accumulator checkpoint, persisted before the next checkpoint, and a persisted halt keeps the table halted at every start until M9's re-snapshot; a failed channel-C catalog read halts the table `UNSAFE_DDL`; `Permanent` from `evolve` halts `SINK_REJECTED`; state-store `Transient`/`Contention` retry like a sink `Transient`; channel D's dropped and halted tables also wait for the stream to catch up; a chunk read under a schema the table has since left is read again, and its cursor rides the chunk's own flush; after a gap a snapshot in progress starts over; a mid-run `PositionUnreachable` resets the position and reruns Phase 0; no stream watchdog; the WAL-lag guard ends the worker; a table that drifted while down is rescanned before its snapshot reads | The specs are silent on these; each keeps the checkpoint, the halt or the snapshot exact across a crash | M6a — **approved 2026-10-03** |
 | D-IMPL-14 | M6b single-node-control rulings **Q-M6b-1…13 and D-M6b.1…13** (listed in `M6b-single-node-control.md` §Decisions and rulings, each pinned by a test). Among them: the source stays warm on pause; the controller polls `pipeline-state.json` and classifies worker errors (`Retry`, `Lease`, `Error`); `evolve` is fenced; a stale Delta handle is detected by its commit file's e-tag; a MERGE over `merge_memory_limit` halts its table (V-119); the guard compares a table's last change; the stream watchdog (reverses D-M6a.9) | The specs are silent on most; where a ruling touched a spec row, the row was patched with approval (V-119, the metric catalogue, Data-Flow Phase 4, config §6.4, §9.2, §9.2.1) | M6b — **approved 2026-10-08** |
 | D-IMPL-15 | M7a MySQL-source rulings **D-M7a.1…23** (listed in `M7a-mysql-source.md` §Decisions and rulings, each pinned by a test). Among them: a checkpoint carries its source server (§3.6); the replica id derived from BLAKE3(`id`); `verify-ca` fails closed as `verify-full` (DA-SRC-22); one decoder for binlog and chunk values, correcting `mysql_common`'s signed `MEDIUMINT` and `YEAR`; chunk keys in their own collation with the expanded keyset predicate; the tokenizer names every statement's tables, `sqlparser` scopes an ALTER; the stream decodes by the schema as of its position and halts a table it can't read; fail-closed event types, two-phase XA with tracked rows halts; the purge action is one rule at `prepare` and on the dump's refusal; the dump watched by its connection id | The specs are silent on these; where a ruling touched a spec row, the row was patched with approval (`Schema_Change…` §7.2, config §9.2.2) | M7a — **approved 2026-10-14** |
+| D-IMPL-16 | M7b MySQL-pipeline rulings **D-M7b.1…16** (listed in `M7b-mysql-pipeline.md` §Decisions and rulings, each pinned by a test). Among them: `open_stream` takes a `Checkpoint` and `reset_position` returns one (§3.6); `SourceError::halt_code` reads a halt's code from its message; the worker's checkpoint goes through one store, slot or position document, and records the server the last start read; a file/position dump checks its server on its own connection; no identity is an error; the binary picks the source by `source.type`; the E2E harness's per-test MySQL database and user, and its dialect helpers; the wire proxy's fault (one compressed byte flipped, the CRC32 recomputed) | The specs are silent on these; each keeps a MySQL checkpoint tied to its server across reconnects and lost positions | M7b — **approved 2026-10-17** |
 
 ### 9.1 Questions answered at plan review (2026-09-26)
 
@@ -1421,6 +1458,10 @@ the naming below (2026-09-26).**
 | Q-M7a-7 (2026-10-14) | `GEOMETRY` | **SRID (4 bytes LE) + WKB, as stored** | `Type_Mapping.md`; M7a Task 7 |
 | Q-M7a-8 (2026-10-14) | An online-migration cut-over swap | **Follow it** | `Schema_Change…` §7.2; M7a Tasks 11, 13 |
 | Q-M7a-9 (2026-10-14) | Which swaps are cut-overs? | **gh-ost `_<t>_gho` and pt-osc `_<t>_new` shadows only**, same database, in one statement | `Schema_Change…` §7.2; M7a Task 11 |
+| Q-M7b-1 (2026-10-17) | How does the E2E suite run on MySQL? | **One suite, two sources**: `DATA_AVALANCHE_E2E_SOURCE` picks the source; shared scenarios use dialect helpers; source-only scenarios skip themselves | §5.3; M7b Task 6 |
+| Q-M7b-2 (2026-10-17) | Which targets, where in CI? | **The three position modes per change, in their own job** (`mysql-84`, `mysql-84-nogtid`, `mariadb-118`); `mariadb-118-binlog`, `mariadb-114`, `mariadb-1011` weekly | §5.4; M7b Task 8 |
+| Q-M7b-3 (2026-10-17) | How is a corrupted payload injected? | **A test-only TCP wire proxy** in the E2E suite (one compressed byte flipped, the CRC32 recomputed) | §5.3; M7b Task 7 |
+| Q-M7b-4 (2026-10-17) | How does the status show a pipeline-scope halt? | **A structured code** in `Actual::Error`, logged as a field; no new metric | §3.7; M7b Task 3 |
 
 ### 9.2 Open questions (answer before the named milestone)
 

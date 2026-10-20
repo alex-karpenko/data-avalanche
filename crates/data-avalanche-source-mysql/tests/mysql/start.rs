@@ -4,10 +4,10 @@
 use std::time::Duration;
 
 use data_avalanche_core::{
-    ChangeStream, Checkpoint, RetainedLog, ServerIdentity, SnapshotReason, SourceConnector,
-    SourceError, SourcePosition, StartPlan,
+    CdcEvent, ChangeStream, Checkpoint, ColumnValue, RetainedLog, ServerIdentity, SnapshotReason,
+    SourceConnector, SourceError, SourcePosition, StartPlan, StreamItem,
 };
-use data_avalanche_source_mysql::{Flavour, Mode, MySqlConnector};
+use data_avalanche_source_mysql::{Flavour, Mode, MySqlConnector, MySqlStream};
 use data_avalanche_testkit::require_it;
 use mysql_async::prelude::Queryable;
 
@@ -70,10 +70,15 @@ async fn a_first_start_snapshots_and_records_the_server_then_resumes() {
     .expect("resume");
     assert_eq!(again.plan, StartPlan::Resume);
     assert!(again.added.is_empty() && again.warnings.is_empty());
-    assert_eq!(again.server, Some(identity));
+    assert_eq!(again.server, Some(identity.clone()));
     // A lost position is replaced by the write position now.
     let reset = c.reset_position().await.unwrap();
-    assert!(reset.covers(&from).unwrap(), "{reset} covers {from}");
+    assert!(
+        reset.position.covers(&from).unwrap(),
+        "{} covers {from}",
+        reset.position
+    );
+    assert_eq!(reset.server, Some(identity));
     cleanup(&n).await;
 }
 
@@ -206,7 +211,7 @@ async fn the_watch_finds_the_dump_by_its_connection() {
     ));
     watch(&c, false).await;
     let tables = c.resolve_tables().await.unwrap().tables;
-    let from = c.position_now().await.unwrap();
+    let from = c.checkpoint_now().await.unwrap();
     let mut s = c.open_stream(&from, &tables).await.expect("stream");
     watch(&c, true).await;
     let id = c.dump_id().expect("the dump's id");
@@ -228,5 +233,94 @@ async fn the_watch_finds_the_dump_by_its_connection() {
     a.query_drop(format!("DROP USER '{name}'@'%'"))
         .await
         .unwrap();
+    cleanup(&n).await;
+}
+
+const FILE: &str = ", replication_type: binlog";
+
+/// The changes up to the stream's next commit, and the commit's position, within 20 s.
+async fn to_commit(s: &mut MySqlStream) -> (Vec<CdcEvent>, SourcePosition) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let mut changes = vec![];
+        loop {
+            match s.next().await.expect("the stream reads") {
+                StreamItem::Change(e) => changes.push(e),
+                StreamItem::Commit(b) => return (changes, b.commit_pos),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("a commit within 20 s")
+}
+
+/// File/position mode resumes after its checkpoint: a restart's `prepare` resumes, and the
+/// stream opened at the checkpoint reads only what came after it.
+#[tokio::test]
+async fn a_file_position_checkpoint_resumes_after_itself() {
+    require_it!();
+    let (n, mut a) = fresh("start_file_resume", "CREATE TABLE t (id INT PRIMARY KEY)").await;
+    let c = connector(&pipeline(&n, &["t"], "", FILE));
+    assert_eq!(c.mode().await.unwrap(), Mode::File);
+    let tables = c.resolve_tables().await.unwrap().tables;
+    let from = c.checkpoint_now().await.unwrap();
+    let mut s = c.open_stream(&from, &tables).await.expect("stream");
+    a.query_drop("INSERT INTO t VALUES (1)").await.unwrap();
+    let (_, end) = to_commit(&mut s).await;
+    Box::new(s).close().await.expect("close");
+    a.query_drop("INSERT INTO t VALUES (2)").await.unwrap();
+    let checkpoint = Checkpoint {
+        position: end,
+        server: from.server.clone(),
+    };
+    assert!(matches!(checkpoint.position, SourcePosition::BinlogFile(_)));
+    assert_eq!(prepare(&c, &checkpoint).await.unwrap(), StartPlan::Resume);
+    let mut s = c.open_stream(&checkpoint, &tables).await.expect("resumed");
+    let (changes, _) = to_commit(&mut s).await;
+    let ids: Vec<_> = changes
+        .iter()
+        .map(|e| e.after.as_ref().and_then(|r| r.get("id").cloned()))
+        .collect();
+    assert_eq!(
+        ids,
+        [Some(ColumnValue::Int32(2))],
+        "the row after the checkpoint, once"
+    );
+    Box::new(s).close().await.expect("close");
+    cleanup(&n).await;
+}
+
+/// In file/position mode the dump checks the server on its own connection: a checkpoint
+/// recorded on another server (a failover behind the same address), or with none, halts the
+/// pipeline before a dump starts. A GTID position isn't checked: GTIDs carry across servers.
+#[tokio::test]
+async fn a_file_position_stream_opens_only_on_its_server() {
+    require_it!();
+    let (n, _a) = fresh("start_file_server", "CREATE TABLE t (id INT PRIMARY KEY)").await;
+    let c = connector(&pipeline(&n, &["t"], "", FILE));
+    let tables = c.resolve_tables().await.unwrap().tables;
+    let now = c.position_now().await.unwrap();
+    for server in [Some(elsewhere()), None] {
+        let cp = Checkpoint {
+            position: now.clone(),
+            server,
+        };
+        match c.open_stream(&cp, &tables).await.err() {
+            Some(SourceError::Permanent(m)) => {
+                assert!(m.starts_with("BINLOG_SOURCE_CHANGED: "), "{m}")
+            }
+            other => panic!("{cp:?}: {other:?}"),
+        }
+    }
+    assert_eq!(c.dump_id(), None, "no dump started");
+    if target().replication == "gtid" {
+        let gtid = connector(&pipeline(&n, &["t"], "", ""));
+        let cp = Checkpoint {
+            position: gtid.position_now().await.unwrap(),
+            server: Some(elsewhere()),
+        };
+        let s = gtid.open_stream(&cp, &tables).await.expect("a GTID stream");
+        Box::new(s).close().await.expect("close");
+    }
     cleanup(&n).await;
 }

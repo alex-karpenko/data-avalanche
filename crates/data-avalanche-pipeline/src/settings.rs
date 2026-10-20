@@ -11,6 +11,7 @@ use data_avalanche_core::{
     PartitionField, PartitionTransform, SinkKind, TableRef, TableSchema, WriteMode,
 };
 
+use crate::checkpoint::Store;
 use crate::{FlushPolicy, Lineage, TxnLimits};
 
 /// Status interval and stall detection when the source has no heartbeat setting.
@@ -30,8 +31,9 @@ pub(crate) struct Settings {
     pub chunk_size: usize,
     /// `source.timeouts.snapshot`: one table's snapshot within one run.
     pub snapshot_timeout: Duration,
-    /// `source.postgres.heartbeat`: the WAL-lag check runs at this interval; a stream with no
-    /// item for three of them is stalled.
+    /// `source.postgres.heartbeat` or `source.mysql.heartbeat`: the source's log is read at this
+    /// interval (PostgreSQL: the WAL-lag check; MySQL: whether the dump still runs); a stream
+    /// with no item for three of them is stalled.
     pub heartbeat: Duration,
     pub max_wal_lag_bytes: Option<u64>,
     /// Channel D; `None` when `rescan_interval` is 0.
@@ -39,11 +41,8 @@ pub(crate) struct Settings {
     pub evolution: bool,
     /// `toast_strategy: re_query`.
     pub re_query: bool,
-    /// PostgreSQL `slot_management: managed`: the slot name, whose creation intent a first start
-    /// records. `None` when the pipeline never creates the slot.
-    pub slot_intent: Option<String>,
-    /// PostgreSQL: the slot holding the checkpoint (`replication/slot.json`).
-    pub slot: Option<String>,
+    /// The document holding the checkpoint.
+    pub checkpoint: Store,
     mode: SnapshotMode,
     overrides: BTreeMap<String, SnapshotMode>,
     partitioning: BTreeMap<String, Vec<PartitionField>>,
@@ -94,16 +93,23 @@ impl Settings {
                 .unwrap_or(usize::MAX)
                 .max(1),
             snapshot_timeout: p.source.timeouts.snapshot,
-            heartbeat: pg.map_or(DEFAULT_HEARTBEAT, |pg| pg.heartbeat),
+            heartbeat: pg
+                .map(|pg| pg.heartbeat)
+                .or(p.source.mysql.as_ref().map(|m| m.heartbeat))
+                .unwrap_or(DEFAULT_HEARTBEAT),
             max_wal_lag_bytes: pg.and_then(|pg| pg.max_wal_lag_bytes),
             rescan_interval: (!p.schema_evolution.rescan_interval.is_zero())
                 .then_some(p.schema_evolution.rescan_interval),
             evolution: p.schema_evolution.enabled,
             re_query: p.source.toast_strategy == ToastStrategy::ReQuery,
-            slot_intent: pg
-                .filter(|pg| pg.slot_management == data_avalanche_config::SlotManagement::Managed)
-                .map(|pg| pg.slot.clone()),
-            slot: pg.map(|pg| pg.slot.clone()),
+            checkpoint: match pg {
+                Some(pg) => Store::Slot {
+                    name: pg.slot.clone(),
+                    intent: (pg.slot_management == data_avalanche_config::SlotManagement::Managed)
+                        .then(|| pg.slot.clone()),
+                },
+                None => Store::Position,
+            },
             mode: p.tables.snapshots.mode,
             overrides: p.tables.snapshots.overrides.clone(),
             partitioning: p
@@ -173,7 +179,7 @@ mod tests {
     use data_avalanche_core::{ColumnSchema, ColumnValueType as V};
 
     use super::*;
-    use crate::test_support::pipeline;
+    use crate::test_support::{Yaml, pipeline};
 
     #[test]
     fn settings_follow_the_pipeline() {
@@ -194,7 +200,13 @@ mod tests {
         assert_eq!(s.heartbeat, Duration::from_secs(5));
         assert_eq!(s.max_wal_lag_bytes, Some(1 << 30));
         assert_eq!(s.rescan_interval, Some(Duration::from_secs(3600)));
-        assert_eq!(s.slot_intent.as_deref(), Some("p_slot"));
+        assert_eq!(
+            s.checkpoint,
+            Store::Slot {
+                name: "p_slot".into(),
+                intent: Some("p_slot".into())
+            }
+        );
         let orders = TableRef::new("public", "orders");
         assert_eq!(s.mode(&orders), SnapshotMode::Initial);
         assert_eq!(s.mode(&TableRef::new("public", "big")), SnapshotMode::Never);
@@ -222,6 +234,32 @@ mod tests {
             "",
             "slot_management: require_existing, auto_cleanup: false",
         );
-        assert_eq!(Settings::new(&p).slot_intent, None);
+        assert_eq!(
+            Settings::new(&p).checkpoint,
+            Store::Slot {
+                name: "p_slot".into(),
+                intent: None
+            }
+        );
+    }
+
+    /// A MySQL pipeline keeps its checkpoint in the position document, reads the dump at
+    /// `mysql.heartbeat`, has no WAL to guard, and keys its tables by bare name (V-064).
+    #[test]
+    fn a_mysql_pipeline_keeps_a_position_document() {
+        let p = Yaml {
+            mysql: Some("heartbeat: 7s"),
+            tables: "\n      snapshots: { overrides: { orders: initial } }",
+            ..Yaml::default()
+        }
+        .build();
+        let s = Settings::new(&p);
+        assert_eq!(s.checkpoint, Store::Position);
+        assert_eq!(s.heartbeat, Duration::from_secs(7));
+        assert_eq!(s.max_wal_lag_bytes, None);
+        assert_eq!(
+            s.mode(&TableRef::new("public", "orders")),
+            SnapshotMode::Initial
+        );
     }
 }

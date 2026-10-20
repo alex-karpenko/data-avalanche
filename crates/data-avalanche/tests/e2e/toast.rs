@@ -24,6 +24,7 @@ fn row(id: u32, n: u32) -> (String, String, usize) {
 #[tokio::test]
 async fn an_update_that_leaves_a_toasted_column_keeps_its_value() {
     require_it!();
+    crate::postgres_only!();
     // EXTERNAL: stored out of line, uncompressed, so the value is TOASTed.
     let e = E2e::new(
         "toast",

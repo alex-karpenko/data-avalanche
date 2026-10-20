@@ -30,11 +30,7 @@ async fn a_pipeline_runs_stops_on_sigterm_and_resumes() {
         !log.contains("buoyant_kernel") && !log.contains("deltalake_core"),
         "{log}"
     );
-    let labels = r#"pipeline="smoke",source_host="127.0.0.1",source_db="avalanche""#;
-    p.metric(&format!(
-        r#"data_avalanche_pipeline_status{{{labels},status="running"}} 1"#
-    ))
-    .await;
+    p.metric(&e.status("running")).await;
     p.metric("data_avalanche_owned_pipelines 1").await;
     assert!(e.lease().await.unwrap().doc.owner_epoch == 1);
 

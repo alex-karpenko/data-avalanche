@@ -66,6 +66,31 @@ test ends) and `binlog_rotate` (`FLUSH BINARY LOGS`, then a position no other wr
 MariaDB keeps a binlog it just closed until its binlog checkpoint moves on, so the purge test
 retries for up to 5 s.
 
+## The slice-1 E2E suite
+
+`crates/data-avalanche/tests/e2e` runs the binary as a process against one source and RustFS.
+The source is PostgreSQL (`postgres-18`, or `DATA_AVALANCHE_PG_PORT`), or with
+`DATA_AVALANCHE_E2E_SOURCE=mysql` the target `DATA_AVALANCHE_MYSQL` names (the table above, default
+`mysql-84`). A scenario of one source only skips itself on the other. `ci.yml` runs the suite on
+PostgreSQL 18 in the integration job and on `mysql-84`, `mysql-84-nogtid` and `mariadb-118` in
+its `e2e-mysql` job; `weekly.yml` runs it on PostgreSQL 14–17 and on `mariadb-118-binlog`,
+`mariadb-114` and `mariadb-1011`:
+
+```sh
+docker compose -f test-infra/compose.yaml up -d --wait mysql-84 rustfs
+docker compose -f test-infra/compose.yaml --profile init run --rm rustfs-init
+DATA_AVALANCHE_IT=1 DATA_AVALANCHE_SKIP_GCS=1 DATA_AVALANCHE_E2E_SOURCE=mysql DATA_AVALANCHE_MYSQL=mysql-84 \
+  cargo test -p data-avalanche --features e2e-hooks --test e2e -- --test-threads=1
+```
+
+On MySQL each test makes a database and a user named `e2e_<test>` (the user's binlog dump shows
+the stream is open). Two scenarios change server-wide state: the purge scenarios purge the
+target's older binlogs, and the failover scenario (on `mysql-84-nogtid`) makes its database and
+user on `mysql-84` too, which must be up. The scenarios that pause a server (`docker pause`) need
+the Docker CLI. The faults no server can be asked for (a corrupted compressed transaction, a
+failover behind one address) come from a test-only TCP proxy in the suite (`proxy.rs`), which
+reads the protocol in the clear: the suite's pipelines use `ssl_mode: disable`.
+
 ## GCS: a real bucket, not an emulator
 
 `fake-gcs-server` 1.56.1 rejects `object_store`'s path-style PUT (`400 invalid uploadType`) and

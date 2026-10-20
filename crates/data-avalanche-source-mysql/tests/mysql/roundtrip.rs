@@ -257,7 +257,7 @@ async fn every_type_reads_the_same_from_the_stream_and_a_chunk() {
     let resolved = c.resolve_tables().await.unwrap();
     assert!(resolved.halted.is_empty(), "{:?}", resolved.halted);
     let tables = resolved.tables;
-    let from = c.position_now().await.unwrap();
+    let from = c.checkpoint_now().await.unwrap();
     let mut s = c.open_stream(&from, &tables).await.expect("stream");
 
     let names: Vec<&str> = columns.iter().map(|c| c.0).collect();

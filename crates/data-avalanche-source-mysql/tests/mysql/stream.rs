@@ -5,7 +5,8 @@
 use std::time::Duration;
 
 use data_avalanche_core::{
-    ChangeStream, ColumnValue, HaltReason, Op, SourceError, SourcePosition, StreamItem, TableSchema,
+    ChangeStream, Checkpoint, ColumnValue, HaltReason, Op, SourceError, SourcePosition, StreamItem,
+    TableSchema,
 };
 use data_avalanche_source_mysql::{Flavour, MySqlConnector, MySqlStream};
 use data_avalanche_testkit::require_it;
@@ -53,8 +54,16 @@ async fn shut(s: MySqlStream) {
     Box::new(s).close().await.expect("close");
 }
 
+/// `position` on `c`'s server, as a checkpoint records it.
+async fn at(c: &MySqlConnector, position: SourcePosition) -> Checkpoint {
+    Checkpoint {
+        position,
+        server: Some(c.server_identity().await.expect("the server's identity")),
+    }
+}
+
 async fn open(c: &MySqlConnector, tables: &[TableSchema]) -> MySqlStream {
-    let from = c.position_now().await.expect("position");
+    let from = c.checkpoint_now().await.expect("position");
     c.open_stream(&from, tables).await.expect("stream")
 }
 
@@ -136,7 +145,10 @@ async fn changes_arrive_as_transactions_and_resume_after_a_commit() {
     assert_eq!(events[0].source_pos, events[1].source_pos);
     shut(s).await;
     // Resume after the second commit: the third transaction, once.
-    let mut s = c.open_stream(&pos[1], &tables).await.unwrap();
+    let mut s = c
+        .open_stream(&at(&c, pos[1].clone()).await, &tables)
+        .await
+        .unwrap();
     let again = items(&mut s, 1).await;
     assert_eq!(changes(&again), [(Op::Delete, Some(ColumnValue::Int32(2)))]);
     shut(s).await;
@@ -501,7 +513,7 @@ async fn mysql_payloads_partial_json_and_tagged_gtids() {
         assert!(last.untagged().contains(":m7a:"), "{last}");
         shut(s).await;
         // A tagged set resumes.
-        let mut s = c.open_stream(&last, &tables).await.unwrap();
+        let mut s = c.open_stream(&at(&c, last).await, &tables).await.unwrap();
         a.query_drop("INSERT INTO t VALUES (5, 'null')")
             .await
             .unwrap();

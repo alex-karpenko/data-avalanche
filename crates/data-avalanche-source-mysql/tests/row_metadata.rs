@@ -47,7 +47,7 @@ async fn row_metadata_other_than_full_refuses_and_halts() {
     let c = connector(&pipeline(&n, &["t"], "", ""));
     c.preflight().await.expect("preflight under FULL");
     let tables = c.resolve_tables().await.unwrap().tables;
-    let from = c.position_now().await.unwrap();
+    let from = c.checkpoint_now().await.unwrap();
     let mut s = c.open_stream(&from, &tables).await.expect("stream");
     if let Err(e) = a
         .query_drop("SET GLOBAL binlog_row_metadata = MINIMAL")

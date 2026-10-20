@@ -28,7 +28,7 @@ async fn compressed_events_decode() {
     .await;
     let c = connector(&pipeline(&n, &["t"], "", ""));
     let tables = c.resolve_tables().await.unwrap().tables;
-    let from = c.position_now().await.unwrap();
+    let from = c.checkpoint_now().await.unwrap();
     let mut s = c.open_stream(&from, &tables).await.expect("stream");
     let long = "x".repeat(300);
     // Compress every event of 10 bytes or more (the least the server takes), from a session opened

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use data_avalanche_testkit::require_it;
 
-use crate::harness::{E2e, Options};
+use crate::harness::{Doc, E2e, Options};
 
 const COLS: &[&str] = &["id", "doc"];
 
@@ -20,7 +20,7 @@ async fn row_changes_and_transaction_shapes_are_mirrored() {
          CREATE TABLE other (id bigint PRIMARY KEY, doc text);
          CREATE TABLE ignored (id bigint PRIMARY KEY);",
         Options {
-            tables: ", exclude: [e2e_stream_rows.ignored], snapshots: { mode: never }",
+            tables: ", exclude: ['@SCHEMA@.ignored'], snapshots: { mode: never }",
             ..Options::default()
         },
     )
@@ -78,8 +78,7 @@ async fn a_large_transaction_lands_at_once() {
     p.ready().await;
     e.streaming().await;
     let before = e.commits("bulk").await;
-    e.exec("INSERT INTO bulk SELECT g, 'row ' || g FROM generate_series(1, 50000) g")
-        .await;
+    e.insert_series("bulk", 50_000, Doc::Row).await;
     let until = Instant::now() + Duration::from_secs(120);
     loop {
         let seen = e.content("bulk").await.map_or(0, |b| b.num_rows());
@@ -118,8 +117,7 @@ async fn a_split_transaction_is_replayed_after_a_crash_between_slices() {
     let mut p = e.start(&[("DATA_AVALANCHE_E2E_CRASH", "sink_committed:2")]);
     p.ready().await;
     e.streaming().await;
-    e.exec("INSERT INTO bulk SELECT g, 'row ' || g FROM generate_series(1, 5000) g")
-        .await;
+    e.insert_series("bulk", 5000, Doc::Row).await;
     let status = p.exit().await;
     assert!(!status.success(), "aborted at the crash point: {status}");
     assert_eq!(

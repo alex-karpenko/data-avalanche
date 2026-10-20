@@ -10,11 +10,9 @@ use std::time::Instant;
 use data_avalanche_config::{Pipeline, SnapshotMode};
 use data_avalanche_core::{
     Checkpoint, HaltReason, SchemaHint, Sink, SinkError, SinkKind, SnapshotReason, SourceConnector,
-    SourceError, SourcePosition, StartPlan, TableRef, TableSchema, TableSpec,
+    SourceError, StartPlan, TableRef, TableSchema, TableSpec,
 };
-use data_avalanche_state::{
-    PipelineDocs, SlotDoc, SnapshotStatus, StateError, TableHalt, TableSnapshotDoc,
-};
+use data_avalanche_state::{PipelineDocs, SnapshotStatus, StateError, TableHalt, TableSnapshotDoc};
 use data_avalanche_storage::StoreError;
 use tokio::sync::{mpsc, watch};
 
@@ -109,6 +107,7 @@ impl PipelineWorker {
             wal_lag_failing: Streak::default(),
             writers_waited: BTreeSet::new(),
             read_failing: BTreeMap::new(),
+            server: None,
             pause: false,
         };
         (Self { core }, WorkerHandle { control, status })
@@ -283,13 +282,10 @@ where
 }
 
 /// Data-Flow Phase 0, or its rerun after the stream position was lost mid-run (`lost` holds the
-/// new position `reset_position` returned). Leaves the core tracking the tables to stream, with
+/// new checkpoint `reset_position` returned). Leaves the core tracking the tables to stream, with
 /// every decision persisted: halts and snapshot requests first, then the cached schemas, then a
-/// fresh start's checkpoint.
-pub(crate) async fn start(
-    core: &mut Core,
-    lost: Option<SourcePosition>,
-) -> Result<(), WorkerError> {
+/// fresh start's checkpoint, recorded with the server the start read (MySQL).
+pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(), WorkerError> {
     core.update(|st| st.phase = Phase::Starting);
     let s = &core.settings;
     if s.sink_kind == SinkKind::Iceberg {
@@ -297,11 +293,6 @@ pub(crate) async fn start(
             "the Iceberg sink ships in v2 (D-V1.4); other pipelines run".into(),
         ));
     }
-    let Some(slot) = s.slot.clone() else {
-        return Err(WorkerError::Refused(
-            "this build streams from PostgreSQL only; the MySQL source arrives with M7".into(),
-        ));
-    };
     if core.sink.kind() != s.sink_kind {
         return Err(WorkerError::Refused(format!(
             "the sink given is {:?}, the config says {:?}",
@@ -363,7 +354,7 @@ pub(crate) async fn start(
         .into_iter()
         .map(|h| h.table)
         .collect();
-    let slot_doc = core.docs.slot().await?.map(|v| v.doc);
+    let stored = core.settings.checkpoint.load(&core.docs).await?;
 
     // New halts, recorded before the checkpoint below.
     let mut halts: Vec<(TableRef, HaltReason)> = resolved.halted.clone();
@@ -411,37 +402,39 @@ pub(crate) async fn start(
     }
 
     // The stream position: prepare, or the one a mid-run recovery got.
-    let intent = slot_doc.as_ref().is_some_and(SlotDoc::is_intent);
-    let checkpoint = slot_doc
-        .as_ref()
-        .map(|d| SourcePosition::Pg(d.confirmed_flush_lsn));
-    let (plan, at, added) = match lost {
-        Some(from) => (Plan::Fresh(SnapshotReason::PositionLost), from, vec![]),
+    let intent = stored.as_ref().is_some_and(|s| s.intent);
+    let checkpoint = stored.map(|s| s.checkpoint);
+    let (plan, at, added, server) = match lost {
+        Some(from) => (
+            Plan::Fresh(SnapshotReason::PositionLost),
+            from.position,
+            vec![],
+            from.server,
+        ),
         None => {
-            if slot_doc.is_none()
-                && let Some(name) = &core.settings.slot_intent
+            if checkpoint.is_none()
+                && let Some(doc) = core.settings.checkpoint.intent()
             {
                 core.may_write()?;
-                core.docs.save_slot(&SlotDoc::intent(name)).await?;
+                core.docs.save_slot(&doc).await?;
             }
             let refs: Vec<TableRef> = resolved_tables.keys().cloned().collect();
-            let durable = checkpoint.clone().map(Checkpoint::from);
             // `prepare` may create, recreate or advance the slot.
             let prepared = write_retry(
                 &tuning,
                 || core.may_write(),
-                || source.prepare(durable.as_ref(), &refs),
+                || source.prepare(checkpoint.as_ref(), &refs),
             )
             .await?;
             warnings.extend(prepared.warnings);
             match prepared.plan {
                 StartPlan::Resume => {
-                    let Some(at) = checkpoint.clone() else {
+                    let Some(at) = checkpoint.as_ref().map(|c| c.position.clone()) else {
                         return Err(WorkerError::Refused(
                             "the source resumes a stream the pipeline has no checkpoint for".into(),
                         ));
                     };
-                    (Plan::Resume, at, prepared.added)
+                    (Plan::Resume, at, prepared.added, prepared.server)
                 }
                 StartPlan::Snapshot { from, reason } => {
                     // A start cut short after the slot was made starts over as a first start.
@@ -450,11 +443,17 @@ pub(crate) async fn start(
                     } else {
                         reason
                     };
-                    (Plan::Fresh(reason), from, vec![])
+                    (Plan::Fresh(reason), from, vec![], prepared.server)
                 }
             }
         }
     };
+    // The checkpoint document now: written at a fresh start, and a check at a resume that the
+    // source gave what the store records (a MySQL source names the server).
+    let doc = core.settings.checkpoint.doc(&Checkpoint {
+        position: at.clone(),
+        server: server.clone(),
+    })?;
     let gap = matches!(
         plan,
         Plan::Fresh(SnapshotReason::PositionLost | SnapshotReason::AdoptedOrphan)
@@ -624,20 +623,7 @@ pub(crate) async fn start(
             })
             .await?;
     }
-    let fresh = match plan {
-        Plan::Resume => None,
-        Plan::Fresh(_) => {
-            let SourcePosition::Pg(lsn) = at else {
-                return Err(WorkerError::Refused(format!(
-                    "the source started at {at}, not a PostgreSQL position"
-                )));
-            };
-            Some(SlotDoc {
-                slot_name: slot,
-                confirmed_flush_lsn: lsn,
-            })
-        }
-    };
+    let fresh = matches!(plan, Plan::Fresh(_)).then_some(doc);
     // The schemas before a fresh start's checkpoint: a restart in between still finds the
     // checkpoint before it and starts fresh again. The other way round, it would resume from the
     // new checkpoint under the cache of before the baseline, as if the stream still held the
@@ -651,8 +637,9 @@ pub(crate) async fn start(
             return Err(WorkerError::Crashed(HookPoint::SchemasCached));
         }
         core.may_write()?;
-        core.docs.save_slot(&doc).await?;
+        doc.save(&core.docs).await?;
     }
+    core.server = server;
     core.tracked = tracked;
     core.drifted = drifted;
     core.dump_only = dump_only;
@@ -663,7 +650,10 @@ pub(crate) async fn start(
 #[cfg(test)]
 mod tests {
     use data_avalanche_core::position::Lsn;
-    use data_avalanche_core::{ColumnSchema, ColumnValue, ColumnValueType as V, Row};
+    use data_avalanche_core::{
+        ColumnSchema, ColumnValue, ColumnValueType as V, Row, ServerIdentity, SourcePosition,
+    };
+    use data_avalanche_state::{PositionDoc, SlotDoc};
     use data_avalanche_testkit::{FakeTxn, Method, SinkOp};
 
     use super::*;
@@ -1058,6 +1048,121 @@ mod tests {
             w.ids("a"),
             [1, 2, 7],
             "the snapshot brings back what the stream lost"
+        );
+        assert!(
+            st.warnings
+                .iter()
+                .any(|w| w.contains("lost the stream position"))
+        );
+    }
+
+    /// A MySQL → Delta pipeline `p` over the fake's `public.*`, its `snapshots` set to `tables`.
+    fn mysql(tables: &str) -> Pipeline {
+        let tables = format!("\n      snapshots: {{ {tables} }}");
+        Yaml {
+            mysql: Some(""),
+            tables: &tables,
+            sink: "flush: { seconds: 0 }",
+            ..Yaml::default()
+        }
+        .build()
+    }
+
+    fn server(id: u32) -> ServerIdentity {
+        ServerIdentity::Mariadb { server_id: id }
+    }
+
+    async fn position(w: &World) -> Option<PositionDoc> {
+        w.docs.position().await.unwrap().map(|v| v.doc)
+    }
+
+    /// A MySQL pipeline's first start records its position in the position document, with the
+    /// server `prepare` named, and every stream opens from it.
+    #[tokio::test]
+    async fn a_mysql_first_start_records_the_server_with_the_position() {
+        let w = World::new(&["a"]);
+        w.source.set_server(Some(server(1)));
+        w.source.load(&t("a"), rows(1..=2));
+        let (end, st) = run(&w, &mysql("mode: initial"), async |status| {
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(9, "s")));
+            streamed(&status, &w).await;
+        })
+        .await;
+        assert_eq!(end.unwrap(), Exit::Drained);
+        assert_eq!(w.ids("a"), [1, 2, 9]);
+        assert_eq!(
+            position(&w).await,
+            Some(PositionDoc {
+                position: w.source.wal_end(),
+                server: server(1)
+            })
+        );
+        assert!(w.docs.slot().await.unwrap().is_none(), "no slot document");
+        let opened = w.source.opened_at();
+        assert!(
+            !opened.is_empty() && opened.iter().all(|c| c.server == Some(server(1))),
+            "{opened:?}"
+        );
+        assert!(st.warnings.is_empty(), "{:?}", st.warnings);
+    }
+
+    /// A restart hands `prepare` the recorded server; the checkpoints after it record the server
+    /// the start reads now (a GTID failover between two runs).
+    #[tokio::test]
+    async fn a_mysql_restart_hands_prepare_the_recorded_server() {
+        let w = World::new(&["a"]);
+        w.source.set_server(Some(server(1)));
+        let p = mysql("mode: initial");
+        run(&w, &p, async |status| streamed(&status, &w).await)
+            .await
+            .0
+            .unwrap();
+        let recorded = position(&w).await.unwrap();
+        w.source.set_server(Some(server(2)));
+        w.source
+            .commit(FakeTxn::new().insert(&t("a"), row(5, "while down")));
+        run(&w, &p, async |status| streamed(&status, &w).await)
+            .await
+            .0
+            .unwrap();
+        assert_eq!(
+            w.source.prepared_at().last(),
+            Some(&Some(Checkpoint {
+                position: recorded.position,
+                server: Some(server(1))
+            }))
+        );
+        assert_eq!(w.ids("a"), [5]);
+        assert_eq!(position(&w).await.unwrap().server, server(2));
+    }
+
+    /// A position lost mid-run restarts at the reset position, recorded with the server the reset
+    /// read, and the stream reopens from it.
+    #[tokio::test]
+    async fn a_lost_mysql_position_records_the_resets_server() {
+        let w = World::new(&["a"]);
+        w.source.set_server(Some(server(1)));
+        w.source.load(&t("a"), rows(1..=2));
+        let (end, st) = run(&w, &mysql("mode: initial"), async |status| {
+            streamed(&status, &w).await;
+            let reads = w.source.reads(&t("a"));
+            w.source.set_server(Some(server(2)));
+            w.source.lose_slot();
+            w.source
+                .commit(FakeTxn::new().insert(&t("a"), row(7, "lost")));
+            wait_until("the table is snapshotted again", || {
+                w.source.reads(&t("a")) > reads
+            })
+            .await;
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!(w.ids("a"), [1, 2, 7]);
+        assert_eq!(position(&w).await.unwrap().server, server(2));
+        assert_eq!(
+            w.source.opened_at().last().and_then(|c| c.server.clone()),
+            Some(server(2))
         );
         assert!(
             st.warnings

@@ -4,11 +4,49 @@
 
 use data_avalanche_config::ReplicationType;
 use data_avalanche_core::position::{BinlogFilePos, GtidSet, MariaGtidState};
-use data_avalanche_core::{ServerIdentity, SourceError, SourcePosition};
+use data_avalanche_core::{Checkpoint, ServerIdentity, SourceError, SourcePosition};
 use mysql_async::prelude::Queryable;
 
 use crate::connector::MySqlConnector;
 use crate::server::Flavour;
+
+/// The statement that reads the server's identity (as text: the query protocol sends every
+/// value as text).
+pub(crate) fn identity_query(flavour: Flavour) -> &'static str {
+    match flavour {
+        Flavour::Mysql => "SELECT @@server_uuid",
+        Flavour::Mariadb => "SELECT @@server_id",
+    }
+}
+
+/// The server's identity from its answer to [`identity_query`]. No row, a NULL or an empty value
+/// is an error, not an empty identity: a checkpoint recorded with one could never be checked
+/// against a server.
+pub(crate) fn identity(
+    flavour: Flavour,
+    answer: Option<Option<String>>,
+) -> Result<ServerIdentity, SourceError> {
+    let var = match flavour {
+        Flavour::Mysql => "server_uuid",
+        Flavour::Mariadb => "server_id",
+    };
+    let value = answer.flatten().filter(|v| !v.is_empty()).ok_or_else(|| {
+        SourceError::Permanent(format!(
+            "the server reports no @@{var}: the stream position can't be recorded with the \
+             server it came from"
+        ))
+    })?;
+    Ok(match flavour {
+        Flavour::Mysql => ServerIdentity::Mysql { server_uuid: value },
+        Flavour::Mariadb => ServerIdentity::Mariadb {
+            server_id: value.parse().map_err(|_| {
+                SourceError::Permanent(format!(
+                    "the server's @@server_id is {value:?}, not a number"
+                ))
+            })?,
+        },
+    })
+}
 
 /// The dialect of a pipeline's positions: a MySQL GTID set, a MariaDB GTID state, or a binlog
 /// file/position (either server, `replication_type: binlog`).
@@ -129,26 +167,25 @@ impl MySqlConnector {
     /// (MariaDB has no server UUID, S-MY10a).
     pub async fn server_identity(&self) -> Result<ServerIdentity, SourceError> {
         let flavour = self.flavour().await?;
-        self.conn
+        let answer = self
+            .conn
             .command("read the server identity", move |c| {
-                Box::pin(async move {
-                    Ok(match flavour {
-                        Flavour::Mysql => ServerIdentity::Mysql {
-                            server_uuid: c
-                                .query_first("SELECT @@server_uuid")
-                                .await?
-                                .unwrap_or_default(),
-                        },
-                        Flavour::Mariadb => ServerIdentity::Mariadb {
-                            server_id: c
-                                .query_first("SELECT @@server_id")
-                                .await?
-                                .unwrap_or_default(),
-                        },
-                    })
-                })
+                Box::pin(async move { c.query_first(identity_query(flavour)).await })
             })
-            .await
+            .await?;
+        identity(flavour, answer)
+    }
+
+    /// The server's write position now, with the server: the checkpoint a start from now
+    /// records.
+    pub async fn checkpoint_now(&self) -> Result<Checkpoint, SourceError> {
+        // The identity first, as `prepare` reads it: were the connection replaced between the two
+        // reads, a mispaired checkpoint then halts at the dump's identity check (D-M7b.7).
+        let server = self.server_identity().await?;
+        Ok(Checkpoint {
+            position: self.position_now().await?,
+            server: Some(server),
+        })
     }
 
     /// `SHOW BINARY LOGS`, oldest first.
@@ -224,6 +261,36 @@ pub(crate) fn parse(mode: Mode, text: &str) -> Result<SourcePosition, SourceErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A NULL, missing or empty identity is an error, not an identity that matches nothing.
+    #[test]
+    fn a_server_that_reports_no_identity_is_an_error() {
+        let uuid = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+        assert_eq!(
+            identity(Flavour::Mysql, Some(Some(uuid.into()))).unwrap(),
+            ServerIdentity::Mysql {
+                server_uuid: uuid.into()
+            }
+        );
+        assert_eq!(
+            identity(Flavour::Mariadb, Some(Some("7".into()))).unwrap(),
+            ServerIdentity::Mariadb { server_id: 7 }
+        );
+        for (flavour, answer) in [
+            (Flavour::Mysql, Some(None)),
+            (Flavour::Mysql, None),
+            (Flavour::Mysql, Some(Some(String::new()))),
+            (Flavour::Mariadb, Some(None)),
+        ] {
+            let e = identity(flavour, answer.clone()).unwrap_err();
+            assert!(
+                matches!(&e, SourceError::Permanent(m) if m.starts_with("the server reports no @@")),
+                "{answer:?}: {e}"
+            );
+        }
+        let e = identity(Flavour::Mariadb, Some(Some("x".into()))).unwrap_err();
+        assert!(e.to_string().contains("not a number"), "{e}");
+    }
 
     fn logs(sizes: &[(&str, u64)]) -> Vec<BinaryLog> {
         sizes

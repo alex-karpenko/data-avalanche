@@ -1,5 +1,7 @@
-//! One E2E test's world: a schema `e2e_<test>` with its slot and publication, a RustFS prefix for
-//! `globals.state` and the lake, a config file, and the binary as a child process.
+//! One E2E test's world on the source under test ([`Source::from_env`]): PostgreSQL's schema
+//! `e2e_<test>` with its slot and publication, or MySQL's database `e2e_<test>` with a user of
+//! that name; a RustFS prefix for `globals.state` and the lake, a config file, and the binary as
+//! a child process.
 
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -9,7 +11,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::Int64Type;
 use arrow_array::{Array, RecordBatch};
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
-use data_avalanche_core::{Sink, TableRef};
+use data_avalanche_core::{Sink, SourcePosition, TableRef};
 use data_avalanche_sink_delta::{DeltaLocation, DeltaSink, DeltaSinkConfig};
 use data_avalanche_state::{
     DocStore, HaltsDoc, LeaseDoc, Leases, PipelineDocs, TableSnapshotDoc, Versioned,
@@ -21,27 +23,8 @@ use data_avalanche_testkit::endpoints::{
 use data_avalanche_testkit::{delete_prefix, stores, unique_prefix};
 use futures_util::TryStreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_postgres::{Client, NoTls};
 
-/// The PostgreSQL port under test: `DATA_AVALANCHE_PG_PORT`, else `postgres-18` (55418).
-pub fn pg_port() -> u16 {
-    std::env::var("DATA_AVALANCHE_PG_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(55418)
-}
-
-pub async fn admin() -> Client {
-    let dsn = format!(
-        "host=127.0.0.1 port={} user=avalanche password=avalanche dbname=avalanche",
-        pg_port()
-    );
-    let (client, conn) = tokio_postgres::connect(&dsn, NoTls)
-        .await
-        .expect("connect to test PostgreSQL");
-    tokio::spawn(conn);
-    client
-}
+pub use crate::source::{Db, Source};
 
 /// Polls `cond` every 100 ms until it holds, for at most `within`.
 pub async fn eventually<F, Fut>(what: &str, within: Duration, mut cond: F)
@@ -66,70 +49,110 @@ fn free_port() -> u16 {
 /// What a test sets beyond the defaults (YAML flow entries, each starting with `, `).
 #[derive(Debug, Clone, Default)]
 pub struct Options<'a> {
-    /// `tables` entries, e.g. `, snapshots: { mode: never }`.
+    /// `tables` entries, e.g. `, snapshots: { mode: never }`. `@SCHEMA@.` qualifies a table
+    /// name as the source's patterns do: `e2e_<test>.` on PostgreSQL, nothing on MySQL (V-064).
     pub tables: &'a str,
     /// `sink` entries, e.g. `, flush: { rows: 10 }`.
     pub sink: &'a str,
     /// `source` keys beyond the connection, one YAML line, e.g. `timeouts: { command: 2s }`.
     pub source: &'a str,
-    /// `source.postgres` entries.
+    /// `source.postgres` entries, on PostgreSQL.
     pub postgres: &'a str,
+    /// `source.mysql` entries, on MySQL.
+    pub mysql: &'a str,
+    /// The port the pipeline connects to, when not the server's (a proxy in front of it).
+    pub port: Option<u16>,
     /// Pipeline keys beyond `source`, `tables` and `sink`, one YAML line, e.g.
     /// `schema_evolution: { rescan_interval: 2s }`.
     pub pipeline: &'a str,
-    /// More pipelines, YAML under `pipelines:` (2-space indent); `@SCHEMA@`, `@PREFIX@`, `@PG@`
-    /// and `@BUCKET@` are replaced.
+    /// More pipelines, YAML under `pipelines:` (2-space indent); `@SCHEMA@`, `@PREFIX@` and
+    /// `@BUCKET@` are replaced, `@INCLUDE@` by the pattern of every table of the test, and a line
+    /// `@SOURCE(<suffix>)@` by the source block ([`E2e::source_block`]).
     pub pipelines: &'a str,
+}
+
+/// The rows [`E2e::insert_series`] gives a key `g`.
+#[derive(Debug, Clone, Copy)]
+pub enum Doc {
+    /// `'row <g>'`.
+    Row,
+    /// `n` times `x`.
+    Pad(u32),
 }
 
 pub struct E2e {
     pub test: String,
+    /// PostgreSQL's schema, MySQL's database: `e2e_<test>`.
     pub schema: String,
+    pub source: Source,
     prefix: String,
     /// The first node's (`n1`) API port.
     port: u16,
     dir: tempfile::TempDir,
     /// The config with `@NODE@` and `@PORT@` to fill per node.
     template: String,
-    pub admin: Client,
+    pub db: Db,
 }
 
 impl E2e {
-    /// Resets the server-wide `max_slot_wal_keep_size`, drops what an earlier run of `test` left
-    /// in PostgreSQL, creates schema `e2e_<test>` and runs `ddl` in it, and writes the config.
+    /// Drops what an earlier run of `test` left in the source, creates its schema (PostgreSQL)
+    /// or database and user (MySQL), runs `ddl` in it, and writes the config. On PostgreSQL it
+    /// resets the server-wide `max_slot_wal_keep_size` first.
     pub async fn new(test: &str, ddl: &str, o: Options<'_>) -> Self {
-        let admin = admin().await;
-        // A scenario sets it (guards.rs) and restores it, but a run killed in between leaves it
-        // set for the next. ALTER SYSTEM runs outside a transaction: one per call.
-        admin
-            .batch_execute("ALTER SYSTEM RESET max_slot_wal_keep_size")
-            .await
-            .expect("max_slot_wal_keep_size reset");
-        admin
-            .batch_execute("SELECT pg_reload_conf()")
-            .await
-            .expect("the configuration reloaded");
+        let source = Source::from_env();
+        let db = Db::connect(source).await;
         let schema = format!("e2e_{test}");
-        drop_slot(&admin, &schema).await;
-        admin
-            .batch_execute(&format!(
-                "DROP PUBLICATION IF EXISTS {schema}_pub;
-                 DROP SCHEMA IF EXISTS {schema} CASCADE;
-                 CREATE SCHEMA {schema};
-                 SET search_path = {schema};
-                 {ddl}
-                 RESET search_path;"
-            ))
-            .await
-            .expect("test DDL");
+        match source {
+            Source::Postgres { .. } => {
+                // A scenario sets it (guards.rs) and restores it, but a run killed in between
+                // leaves it set for the next. ALTER SYSTEM runs outside a transaction: one per
+                // call.
+                for sql in [
+                    "ALTER SYSTEM RESET max_slot_wal_keep_size",
+                    "SELECT pg_reload_conf()",
+                ] {
+                    db.exec(sql).await.expect(sql);
+                }
+                drop_slot(&db, &schema).await;
+                db.exec(&format!(
+                    "DROP PUBLICATION IF EXISTS {schema}_pub;
+                     DROP SCHEMA IF EXISTS {schema} CASCADE;
+                     CREATE SCHEMA {schema};
+                     SET search_path = {schema};
+                     {ddl}
+                     RESET search_path;"
+                ))
+                .await
+                .expect("test DDL");
+            }
+            Source::Mysql(_) => {
+                // The pipeline's own user: its binlog dump is the one in the process list with
+                // that user ([`Self::stream_open`]).
+                db.exec(&format!(
+                    "DROP DATABASE IF EXISTS {schema};
+                     CREATE DATABASE {schema};
+                     DROP USER IF EXISTS '{schema}'@'%';
+                     CREATE USER '{schema}'@'%' IDENTIFIED BY 'avalanche';
+                     GRANT SELECT, REPLICATION CLIENT, REPLICATION SLAVE ON *.* TO '{schema}'@'%';"
+                ))
+                .await
+                .expect("the test database");
+                if !ddl.is_empty() {
+                    db.exec(&format!("USE {schema}; {ddl}"))
+                        .await
+                        .expect("test DDL");
+                }
+            }
+        }
         let mut e = Self {
             test: test.to_owned(),
             schema,
+            source,
             prefix: unique_prefix(&format!("e2e-{test}")),
             port: free_port(),
             dir: tempfile::tempdir().expect("a temp dir"),
             template: String::new(),
-            admin,
+            db,
         };
         e.template = e.yaml(&o);
         e.write_config("n1", e.port);
@@ -150,12 +173,70 @@ impl E2e {
         path
     }
 
+    /// The `source` block of a pipeline named `test` (on PostgreSQL the slot and publication
+    /// `e2e_<test>` take `suffix`; on MySQL it is ignored, both pipelines share the test's
+    /// database and user), indented for a pipeline under `pipelines:`; `extra` is one more line of
+    /// `source` keys and `postgres` / `mysql` their flow entries.
+    pub fn source_block(
+        &self,
+        suffix: &str,
+        port: Option<u16>,
+        extra: &str,
+        postgres: &str,
+        mysql: &str,
+    ) -> String {
+        let s = &self.schema;
+        match self.source {
+            Source::Postgres { port: pg } => format!(
+                "    source:
+      host: 127.0.0.1
+      port: {port}
+      db: avalanche
+      user: avalanche
+      password: avalanche
+      ssl_mode: disable
+      {extra}
+      postgres: {{ publication: {s}{suffix}_pub, slot: {s}{suffix}{postgres} }}",
+                port = port.unwrap_or(pg),
+            ),
+            Source::Mysql(t) => format!(
+                "    source:
+      type: mysql
+      host: 127.0.0.1
+      port: {port}
+      db: {s}
+      user: {s}
+      password: avalanche
+      ssl_mode: disable
+      {extra}
+      mysql: {{ replication_type: {repl}{mysql} }}",
+                port = port.unwrap_or(t.port),
+                repl = t.replication,
+            ),
+        }
+    }
+
+    /// `@SCHEMA@.` as the source's table patterns qualify a name.
+    fn qualify(&self, text: &str) -> String {
+        let q = match self.source {
+            Source::Postgres { .. } => format!("{}.", self.schema),
+            Source::Mysql(_) => String::new(),
+        };
+        text.replace("@SCHEMA@.", &q)
+    }
+
     fn yaml(&self, o: &Options<'_>) -> String {
-        let more = o
-            .pipelines
+        let include = self.qualify("@SCHEMA@.*");
+        let mut more = o.pipelines.to_owned();
+        while let Some(at) = more.find("@SOURCE(") {
+            let end = at + more[at..].find(")@").expect("@SOURCE(<suffix>)@");
+            let block = self.source_block(&more[at + 8..end], None, "", "", "");
+            more.replace_range(at..end + 2, &block);
+        }
+        let more = more
+            .replace("@INCLUDE@", &include)
             .replace("@SCHEMA@", &self.schema)
             .replace("@PREFIX@", &self.prefix)
-            .replace("@PG@", &pg_port().to_string())
             .replace("@BUCKET@", TEST_BUCKET);
         format!(
             r#"config_version: 1
@@ -172,16 +253,8 @@ globals:
 pipelines:
   {test}:
     id: {test}
-    source:
-      host: 127.0.0.1
-      port: {pg}
-      db: avalanche
-      user: avalanche
-      password: avalanche
-      ssl_mode: disable
-      {source}
-      postgres: {{ publication: {schema}_pub, slot: {schema}{postgres} }}
-    tables: {{ include: [{schema}.*]{tables} }}
+{source}
+    tables: {{ include: ['{include}']{tables} }}
     sink: {{ type: delta, bucket: {bucket}, prefix: {prefix}/lake, delta: {{}}, flush: {{ seconds: 1 }}{sink} }}
     {pipeline}
 {more}
@@ -189,11 +262,8 @@ pipelines:
             bucket = TEST_BUCKET,
             prefix = self.prefix,
             test = self.test,
-            pg = pg_port(),
-            schema = self.schema,
-            source = o.source,
-            postgres = o.postgres,
-            tables = o.tables,
+            source = self.source_block("", o.port, o.source, o.postgres, o.mysql),
+            tables = self.qualify(o.tables),
             sink = o.sink,
             pipeline = o.pipeline,
         )
@@ -296,54 +366,59 @@ pipelines:
 
     /// The source table's `id`s, in key order.
     pub async fn source_ids(&self, table: &str) -> Vec<i64> {
-        self.admin
-            .query(
-                &format!("SELECT id FROM {}.{table} ORDER BY id", self.schema),
-                &[],
-            )
+        self.source_rows(table, &["id"])
             .await
-            .expect("the source reads")
             .iter()
-            .map(|r| r.get::<_, i64>(0))
+            .map(|r| r[0].parse().expect("an id"))
             .collect()
     }
 
     /// The lake's `cols` of `table` as text (`NULL` for a null), in key order.
     pub async fn rows(&self, table: &str, cols: &[&str]) -> Vec<Vec<String>> {
+        self.try_rows(table, cols)
+            .await
+            .unwrap_or_else(|| panic!("the lake's {table} has no column among {cols:?}"))
+    }
+
+    /// `rows`, or `None` when the lake's `table` lacks one of `cols` (a pipeline that lags behind
+    /// a DDL: DA-X-14). A missing table is no rows.
+    pub async fn try_rows(&self, table: &str, cols: &[&str]) -> Option<Vec<Vec<String>>> {
         let Some(b) = self.content(table).await else {
-            return vec![];
+            return Some(vec![]);
         };
         let options = FormatOptions::default().with_null("NULL");
         let columns: Vec<_> = cols
             .iter()
             .map(|c| {
-                let a = b
-                    .column_by_name(c)
-                    .unwrap_or_else(|| panic!("the lake's {table} has no column {c}"));
-                ArrayFormatter::try_new(a.as_ref(), &options).expect("a formatter")
+                let a = b.column_by_name(c)?;
+                Some(ArrayFormatter::try_new(a.as_ref(), &options).expect("a formatter"))
             })
-            .collect();
-        (0..b.num_rows())
-            .map(|i| columns.iter().map(|f| f.value(i).to_string()).collect())
-            .collect()
+            .collect::<Option<_>>()?;
+        Some(
+            (0..b.num_rows())
+                .map(|i| columns.iter().map(|f| f.value(i).to_string()).collect())
+                .collect(),
+        )
     }
 
-    /// The source's `cols` of `table` as text (`NULL` for a null), in key order.
+    /// The source's `cols` of `table` as the server prints them (`NULL` for a null), in key
+    /// order.
     pub async fn source_rows(&self, table: &str, cols: &[&str]) -> Vec<Vec<String>> {
-        let list = cols
-            .iter()
-            .map(|c| format!("coalesce({c}::text, 'NULL')"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        self.admin
-            .query(
-                &format!("SELECT {list} FROM {}.{table} ORDER BY id", self.schema),
-                &[],
-            )
+        let sql = format!(
+            "SELECT {} FROM {}.{table} ORDER BY id",
+            cols.join(", "),
+            self.schema
+        );
+        self.db
+            .text(&sql)
             .await
             .expect("the source reads")
-            .iter()
-            .map(|r| (0..cols.len()).map(|i| r.get::<_, String>(i)).collect())
+            .into_iter()
+            .map(|r| {
+                r.into_iter()
+                    .map(|c| c.unwrap_or_else(|| "NULL".into()))
+                    .collect()
+            })
             .collect()
     }
 
@@ -352,7 +427,7 @@ pipelines:
         let want = self.source_rows(table, cols).await;
         let what = format!("{table} has the source's {} rows on {cols:?}", want.len());
         eventually(&what, Duration::from_secs(60), async || {
-            self.rows(table, cols).await == want
+            self.try_rows(table, cols).await.as_ref() == Some(&want)
         })
         .await;
     }
@@ -367,23 +442,33 @@ pipelines:
         .await;
     }
 
-    /// Waits until the pipeline's slot streams to a walsender: from here on, a change is read.
+    /// Whether the source streams to the pipeline now: PostgreSQL's slot has a walsender,
+    /// MySQL runs a binlog dump for the pipeline's user.
+    pub async fn stream_open(&self) -> bool {
+        let sql = match self.source {
+            Source::Postgres { .. } => format!(
+                "SELECT 1 FROM pg_replication_slots WHERE slot_name = '{}' AND active",
+                self.schema
+            ),
+            Source::Mysql(_) => format!(
+                "SELECT 1 FROM information_schema.PROCESSLIST
+                 WHERE USER = '{}' AND COMMAND LIKE 'Binlog Dump%'",
+                self.schema
+            ),
+        };
+        self.db.any(&sql).await
+    }
+
+    /// Waits until the source streams to the pipeline: from here on, a change is read.
     pub async fn streaming(&self) {
-        eventually("the slot streams", Duration::from_secs(60), async || {
-            self.admin
-                .query_opt(
-                    "SELECT 1 FROM pg_replication_slots WHERE slot_name = $1 AND active",
-                    &[&self.schema],
-                )
-                .await
-                .expect("slots read")
-                .is_some()
+        eventually("the source streams", Duration::from_secs(60), async || {
+            self.stream_open().await
         })
         .await;
     }
 
-    /// The position the table's latest commit marker names, as PostgreSQL text (`0/16B3748`).
-    pub async fn marker(&self, table: &str) -> String {
+    /// The position the table's latest commit marker names.
+    pub async fn marker(&self, table: &str) -> SourcePosition {
         self.lake()
             .table_state(&self.table(table))
             .await
@@ -391,40 +476,91 @@ pipelines:
             .marker
             .expect("a commit marker")
             .committed_position
-            .untagged()
     }
 
-    /// Whether the slot's acknowledged position has reached `lsn`.
-    pub async fn acknowledges(&self, lsn: &str) -> bool {
-        self.admin
-            .query_opt(
-                "SELECT 1 FROM pg_replication_slots
-                 WHERE slot_name = $1 AND confirmed_flush_lsn >= $2::text::pg_lsn",
-                &[&self.schema, &lsn],
-            )
-            .await
-            .expect("slots read")
-            .is_some()
+    /// Whether the source's acknowledged position has reached `at`: PostgreSQL's slot, MySQL's
+    /// checkpoint (the binlog keeps no position for the pipeline: the checkpoint is its ack).
+    pub async fn acknowledges(&self, at: &SourcePosition) -> bool {
+        match self.source {
+            Source::Postgres { .. } => {
+                self.db
+                    .any(&format!(
+                        "SELECT 1 FROM pg_replication_slots
+                         WHERE slot_name = '{}' AND confirmed_flush_lsn >= '{}'::pg_lsn",
+                        self.schema,
+                        at.untagged()
+                    ))
+                    .await
+            }
+            Source::Mysql(_) => self
+                .docs()
+                .position()
+                .await
+                .expect("the position reads")
+                .is_some_and(|v| v.doc.position.covers(at).expect("one dialect")),
+        }
     }
 
-    /// Waits until the slot's acknowledged position reaches `lsn`: everything before it is
+    /// Waits until the source's acknowledged position reaches `at`: everything before it is
     /// committed and checkpointed.
-    pub async fn acknowledged(&self, lsn: &str) {
-        let what = format!("the slot acknowledges {lsn}");
+    pub async fn acknowledged(&self, at: &SourcePosition) {
+        let what = format!("the source acknowledges {at}");
         eventually(&what, Duration::from_secs(60), async || {
-            self.acknowledges(lsn).await
+            self.acknowledges(at).await
         })
         .await;
     }
 
+    /// Runs `sql` in the test's schema or database.
     pub async fn exec(&self, sql: &str) {
-        self.admin
-            .batch_execute(&format!(
-                "SET search_path = {}; {sql}; RESET search_path;",
-                self.schema
-            ))
+        let wrapped = match self.source {
+            Source::Postgres { .. } => {
+                format!(
+                    "SET search_path = {}; {sql}; RESET search_path;",
+                    self.schema
+                )
+            }
+            Source::Mysql(_) => format!("USE {}; {sql}", self.schema),
+        };
+        self.db
+            .exec(&wrapped)
             .await
             .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    /// Inserts keys 1..=`n` into `table` (`id`, `doc`) in one statement: one transaction.
+    pub async fn insert_series(&self, table: &str, n: u64, doc: Doc) {
+        self.exec(&self.series(table, n, doc)).await;
+    }
+
+    /// The statement of [`Self::insert_series`] (MySQL: with the session setting before it).
+    pub fn series(&self, table: &str, n: u64, doc: Doc) -> String {
+        match (self.source, doc) {
+            (Source::Postgres { .. }, Doc::Row) => {
+                format!("INSERT INTO {table} SELECT g, 'row ' || g FROM generate_series(1, {n}) g")
+            }
+            (Source::Postgres { .. }, Doc::Pad(w)) => format!(
+                "INSERT INTO {table} SELECT g, repeat('x', {w}) FROM generate_series(1, {n}) g"
+            ),
+            (Source::Mysql(t), doc) => {
+                let doc = match doc {
+                    Doc::Row => "CONCAT('row ', g)".to_owned(),
+                    Doc::Pad(w) => format!("REPEAT('x', {w})"),
+                };
+                // The recursion's ceiling, 1000 by default on both: MySQL's
+                // `cte_max_recursion_depth`, MariaDB's `max_recursive_iterations`.
+                let var = if t.mariadb {
+                    "max_recursive_iterations"
+                } else {
+                    "cte_max_recursion_depth"
+                };
+                let depth = format!("SET SESSION {var} = {n}; ");
+                format!(
+                    "{depth}INSERT INTO {table} (id, doc) WITH RECURSIVE s (g) AS
+                     (SELECT 1 UNION ALL SELECT g + 1 FROM s WHERE g < {n}) SELECT g, {doc} FROM s"
+                )
+            }
+        }
     }
 
     fn docs_at(&self, root: &str) -> DocStore {
@@ -540,30 +676,64 @@ pipelines:
         delete_prefix(stores::rustfs().as_ref(), &self.table_root(table)).await;
     }
 
-    /// The `data_avalanche_pipeline_status` line for `status`, set.
-    pub fn status(&self, status: &str) -> String {
+    /// The metrics' `source_db` label: PostgreSQL's database, MySQL's (the test's).
+    pub fn source_db(&self) -> &str {
+        match self.source {
+            Source::Postgres { .. } => "avalanche",
+            Source::Mysql(_) => &self.schema,
+        }
+    }
+
+    /// The `data_avalanche_pipeline_status` line of pipeline `pipeline` for `status`, set.
+    pub fn status_of(&self, pipeline: &str, status: &str) -> String {
         format!(
-            r#"data_avalanche_pipeline_status{{pipeline="{}",source_host="127.0.0.1",source_db="avalanche",status="{status}"}} 1"#,
-            self.test
+            r#"data_avalanche_pipeline_status{{pipeline="{pipeline}",source_host="127.0.0.1",source_db="{}",status="{status}"}} 1"#,
+            self.source_db()
         )
     }
 
-    /// Drops the slot, the publication, the schema and the prefix.
+    /// The `data_avalanche_pipeline_status` line for `status`, set.
+    pub fn status(&self, status: &str) -> String {
+        self.status_of(&self.test, status)
+    }
+
+    /// The labels of the pipeline's series.
+    pub fn labels(&self) -> String {
+        format!(
+            r#"pipeline="{}",source_host="127.0.0.1",source_db="{}""#,
+            self.test,
+            self.source_db()
+        )
+    }
+
+    /// Drops what the test made in the source, and the prefix.
     pub async fn cleanup(self) {
-        drop_slot(&self.admin, &self.schema).await;
-        self.admin
-            .batch_execute(&format!(
-                "DROP PUBLICATION IF EXISTS {s}_pub; DROP SCHEMA IF EXISTS {s} CASCADE;",
-                s = self.schema
-            ))
-            .await
-            .expect("cleanup");
+        let s = &self.schema;
+        match self.source {
+            Source::Postgres { .. } => {
+                drop_slot(&self.db, s).await;
+                self.db
+                    .exec(&format!(
+                        "DROP PUBLICATION IF EXISTS {s}_pub; DROP SCHEMA IF EXISTS {s} CASCADE;"
+                    ))
+                    .await
+                    .expect("cleanup");
+            }
+            Source::Mysql(_) => self
+                .db
+                .exec(&format!(
+                    "DROP DATABASE IF EXISTS {s}; DROP USER IF EXISTS '{s}'@'%';"
+                ))
+                .await
+                .expect("cleanup"),
+        }
         delete_prefix(stores::rustfs().as_ref(), &self.prefix).await;
     }
 }
 
 /// Drops the slot, waiting for a walsender still holding it to go.
-async fn drop_slot(admin: &Client, slot: &str) {
+async fn drop_slot(db: &Db, slot: &str) {
+    let admin = db.pg();
     for _ in 0..100 {
         let r = admin
             .execute(

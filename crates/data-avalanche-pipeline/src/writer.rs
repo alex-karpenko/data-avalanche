@@ -12,16 +12,17 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use data_avalanche_core::{
-    CommitMarker, CommitOutcome, HaltReason, Sink, SinkError, SourcePosition, TableChangeSet,
-    TableRef, TableSchema,
+    Checkpoint, CommitMarker, CommitOutcome, HaltReason, ServerIdentity, Sink, SinkError,
+    SourcePosition, TableChangeSet, TableRef, TableSchema,
 };
-use data_avalanche_state::{PipelineDocs, SlotDoc, StateError, TableHalt, TableSnapshotDoc};
+use data_avalanche_state::{PipelineDocs, StateError, TableHalt, TableSnapshotDoc};
 use data_avalanche_storage::StoreError;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::backoff::Backoff;
-use crate::{AccumulatorError, CommitGuard, HookAction, HookPoint, Hooks, WorkerError};
+use crate::checkpoint::{Doc, Store};
+use crate::{CommitGuard, HookAction, HookPoint, Hooks, WorkerError};
 
 /// One flush and what becomes durable with it.
 #[derive(Debug)]
@@ -58,8 +59,11 @@ pub(crate) enum WriterEvent {
 pub(crate) struct WriterCtx {
     pub sink: Arc<dyn Sink>,
     pub docs: PipelineDocs,
-    /// The slot whose document holds the checkpoint (PostgreSQL).
-    pub slot: String,
+    /// The document that holds the checkpoint.
+    pub store: Store,
+    /// The server each checkpoint is recorded with (MySQL; `None` for PostgreSQL): the one the
+    /// last start read the stream from.
+    pub server: Option<ServerIdentity>,
     pub pipeline_id: String,
     pub owner_epoch: u64,
     pub guard: Arc<dyn CommitGuard>,
@@ -70,7 +74,7 @@ pub(crate) struct WriterCtx {
 impl std::fmt::Debug for WriterCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WriterCtx")
-            .field("slot", &self.slot)
+            .field("store", &self.store)
             .field("pipeline_id", &self.pipeline_id)
             .field("owner_epoch", &self.owner_epoch)
             .finish_non_exhaustive()
@@ -221,20 +225,14 @@ impl Writer {
     }
 
     async fn save_checkpoint(&mut self, checkpoint: &SourcePosition) -> Result<(), WorkerError> {
-        let SourcePosition::Pg(lsn) = checkpoint else {
-            return Err(AccumulatorError::Protocol {
-                detail: format!("checkpoint {checkpoint} isn't a PostgreSQL position"),
-            }
-            .into());
-        };
+        let doc = self.ctx.store.doc(&Checkpoint {
+            position: checkpoint.clone(),
+            server: self.ctx.server.clone(),
+        })?;
         if !self.ctx.guard.may_commit() {
             return Err(WorkerError::LeaseLost);
         }
-        let doc = SlotDoc {
-            slot_name: self.ctx.slot.clone(),
-            confirmed_flush_lsn: *lsn,
-        };
-        self.state(Write::Slot(&doc)).await
+        self.state(Write::Checkpoint(&doc)).await
     }
 
     /// A state write, retried while it fails transiently.
@@ -242,15 +240,15 @@ impl Writer {
         let mut attempt = 0;
         loop {
             // Checked before every attempt, like a commit's: a writer that lost its lease while a
-            // write kept failing must not land it later, behind the new owner's (`save_slot`
-            // overwrites).
+            // write kept failing must not land it later, behind the new owner's (a checkpoint
+            // write overwrites).
             if !self.ctx.guard.may_commit() {
                 return Err(WorkerError::LeaseLost);
             }
             let docs = &self.ctx.docs;
             let r = match write {
                 Write::Halt(h) => docs.record_halt(h).await.map(drop),
-                Write::Slot(s) => docs.save_slot(s).await.map(drop),
+                Write::Checkpoint(d) => d.save(docs).await,
                 Write::Snapshot(d) => docs.save_table_snapshot(d).await.map(drop),
                 Write::Schema(s) => docs.save_table_schema(s).await.map(drop),
             };
@@ -274,7 +272,7 @@ impl Writer {
 #[derive(Clone, Copy)]
 enum Write<'a> {
     Halt(&'a TableHalt),
-    Slot(&'a SlotDoc),
+    Checkpoint(&'a Doc),
     Snapshot(&'a TableSnapshotDoc),
     Schema(&'a TableSchema),
 }
@@ -286,7 +284,7 @@ mod tests {
 
     use data_avalanche_core::position::Lsn;
     use data_avalanche_core::{SinkTableState, TableSpec};
-    use data_avalanche_state::{SLOT_KEY, SnapshotCursor, SnapshotStatus};
+    use data_avalanche_state::{PositionDoc, SLOT_KEY, SnapshotCursor, SnapshotStatus};
     use data_avalanche_testkit::{MemorySink, SinkOp};
     use tokio::sync::mpsc;
 
@@ -304,6 +302,9 @@ mod tests {
         docs: PipelineDocs,
         store: Arc<FlakyStore>,
         guard: Arc<Switch>,
+        /// The checkpoint's document, and the server it is recorded with.
+        checkpoints: Store,
+        server: Option<ServerIdentity>,
     }
 
     async fn rig(tables: &[&str]) -> Rig {
@@ -319,6 +320,11 @@ mod tests {
             docs,
             store,
             guard: Arc::default(),
+            checkpoints: Store::Slot {
+                name: "p_slot".into(),
+                intent: None,
+            },
+            server: None,
         }
     }
 
@@ -349,7 +355,8 @@ mod tests {
             let ctx = WriterCtx {
                 sink: Arc::new(self.sink.clone()),
                 docs: self.docs.clone(),
-                slot: "p_slot".into(),
+                store: self.checkpoints.clone(),
+                server: self.server.clone(),
                 pipeline_id: "p".into(),
                 owner_epoch: 1,
                 guard,
@@ -451,6 +458,38 @@ mod tests {
             r.docs.table_schema(&a).await.unwrap().unwrap().doc,
             schema("a")
         );
+    }
+
+    /// A MySQL pipeline's checkpoint is the position document, with the server the stream reads.
+    #[tokio::test]
+    async fn a_mysql_checkpoint_is_recorded_with_its_server() {
+        let mut r = rig(&[]).await;
+        let server = ServerIdentity::Mariadb { server_id: 7 };
+        r.checkpoints = Store::Position;
+        r.server = Some(server.clone());
+        let at = SourcePosition::parse_tagged("mariadb-gtid:0-7-42").unwrap();
+        let j = Job {
+            change_sets: vec![],
+            checkpoint: at.clone(),
+            halts: vec![],
+            snapshots: vec![],
+            schemas: vec![],
+            permit: None,
+        };
+        let events = r.run(vec![j], Arc::new(NoHooks)).await;
+        assert!(
+            matches!(&events[..], [WriterEvent::Durable(p)] if *p == at),
+            "{events:?}"
+        );
+        let doc = r.docs.position().await.unwrap().unwrap().doc;
+        assert_eq!(
+            doc,
+            PositionDoc {
+                position: at,
+                server
+            }
+        );
+        assert!(r.docs.slot().await.unwrap().is_none(), "no slot document");
     }
 
     #[tokio::test]

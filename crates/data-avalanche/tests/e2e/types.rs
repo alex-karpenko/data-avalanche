@@ -96,7 +96,7 @@ const EXPECTED: &[[&str; 4]] = &[
 
 /// DuckDB's `delta_scan` of a lake table: the column names, their DuckDB types and every cell as
 /// text, rows in key order. Needs `uv` (the CI integration job installs it).
-fn duckdb_read(url: &str) -> (Vec<String>, Vec<String>, Vec<Vec<Option<String>>>) {
+pub fn duckdb_read(url: &str) -> (Vec<String>, Vec<String>, Vec<Vec<Option<String>>>) {
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/e2e/duckdb_read.py");
     let out = std::process::Command::new("uv")
         .args([
@@ -133,6 +133,7 @@ fn duckdb_read(url: &str) -> (Vec<String>, Vec<String>, Vec<Vec<Option<String>>>
 #[tokio::test]
 async fn every_type_family_reads_back_in_duckdb() {
     require_it!();
+    crate::postgres_only!();
     let e = E2e::new(
         "types",
         &format!("{DDL} INSERT INTO types VALUES (1, {ROW_A}), (2, {ROW_B});"),

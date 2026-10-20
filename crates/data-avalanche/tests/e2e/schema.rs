@@ -108,7 +108,12 @@ async fn unsafe_changes_halt_their_table_only() {
         e.converged(t).await;
     }
 
-    e.exec("ALTER TABLE widen ALTER COLUMN n TYPE bigint; INSERT INTO widen VALUES (2, 2)")
+    let widen = if e.source.is_postgres() {
+        "ALTER TABLE widen ALTER COLUMN n TYPE bigint"
+    } else {
+        "ALTER TABLE widen MODIFY n bigint"
+    };
+    e.exec(&format!("{widen}; INSERT INTO widen VALUES (2, 2)"))
         .await;
     e.exec("ALTER TABLE reserved ADD COLUMN _op text; INSERT INTO reserved VALUES (2, 'b', 'x')")
         .await;
@@ -136,7 +141,7 @@ async fn unsafe_changes_halt_their_table_only() {
             ("widen".into(), "EVOLUTION_UNSUPPORTED"),
         ]
     );
-    let labels = r#"pipeline="schema_halts",source_host="127.0.0.1",source_db="avalanche""#;
+    let labels = e.labels();
     p.metric(&format!("data_avalanche_halted_tables{{{labels}}} 3"))
         .await;
     assert_eq!(e.ids("widen").await, [1], "nothing after the halt");

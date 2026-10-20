@@ -9,6 +9,7 @@ pub mod accumulator;
 pub mod backoff;
 pub mod batch;
 pub mod buffer;
+mod checkpoint;
 mod cursor;
 mod decide;
 pub mod error;
