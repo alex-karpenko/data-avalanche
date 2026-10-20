@@ -164,9 +164,10 @@ async fn a_crash_between_the_checkpoint_and_the_ack_skips_the_resent_transaction
         },
     )
     .await;
-    // The slot is made first, and the transaction is in the WAL before the process with the
-    // crash point starts: its first checkpoint is the transaction's. On an idle stream, a
-    // keep-alive alone would move the frontier and persist a checkpoint first.
+    // The first run makes the source's position (on PostgreSQL the slot, on MySQL the
+    // checkpoint), and the transaction is in the WAL or the binlog before the process with the
+    // crash point starts: its first checkpoint is the transaction's. On an idle PostgreSQL
+    // stream, a keep-alive alone would move the frontier and persist a checkpoint first.
     let mut p = e.start(&[]);
     p.ready().await;
     e.streaming().await;

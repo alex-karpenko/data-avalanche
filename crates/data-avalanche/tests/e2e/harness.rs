@@ -173,8 +173,9 @@ impl E2e {
         path
     }
 
-    /// The `source` block of a pipeline named `test` (the slot and publication `e2e_<test>`
-    /// takes `suffix`), indented for a pipeline under `pipelines:`; `extra` is one more line of
+    /// The `source` block of a pipeline named `test` (on PostgreSQL the slot and publication
+    /// `e2e_<test>` take `suffix`; on MySQL it is ignored, both pipelines share the test's
+    /// database and user), indented for a pipeline under `pipelines:`; `extra` is one more line of
     /// `source` keys and `postgres` / `mysql` their flow entries.
     pub fn source_block(
         &self,
@@ -374,22 +375,30 @@ pipelines:
 
     /// The lake's `cols` of `table` as text (`NULL` for a null), in key order.
     pub async fn rows(&self, table: &str, cols: &[&str]) -> Vec<Vec<String>> {
+        self.try_rows(table, cols)
+            .await
+            .unwrap_or_else(|| panic!("the lake's {table} has no column among {cols:?}"))
+    }
+
+    /// `rows`, or `None` when the lake's `table` lacks one of `cols` (a pipeline that lags behind
+    /// a DDL: DA-X-14). A missing table is no rows.
+    pub async fn try_rows(&self, table: &str, cols: &[&str]) -> Option<Vec<Vec<String>>> {
         let Some(b) = self.content(table).await else {
-            return vec![];
+            return Some(vec![]);
         };
         let options = FormatOptions::default().with_null("NULL");
         let columns: Vec<_> = cols
             .iter()
             .map(|c| {
-                let a = b
-                    .column_by_name(c)
-                    .unwrap_or_else(|| panic!("the lake's {table} has no column {c}"));
-                ArrayFormatter::try_new(a.as_ref(), &options).expect("a formatter")
+                let a = b.column_by_name(c)?;
+                Some(ArrayFormatter::try_new(a.as_ref(), &options).expect("a formatter"))
             })
-            .collect();
-        (0..b.num_rows())
-            .map(|i| columns.iter().map(|f| f.value(i).to_string()).collect())
-            .collect()
+            .collect::<Option<_>>()?;
+        Some(
+            (0..b.num_rows())
+                .map(|i| columns.iter().map(|f| f.value(i).to_string()).collect())
+                .collect(),
+        )
     }
 
     /// The source's `cols` of `table` as the server prints them (`NULL` for a null), in key
@@ -418,7 +427,7 @@ pipelines:
         let want = self.source_rows(table, cols).await;
         let what = format!("{table} has the source's {} rows on {cols:?}", want.len());
         eventually(&what, Duration::from_secs(60), async || {
-            self.rows(table, cols).await == want
+            self.try_rows(table, cols).await.as_ref() == Some(&want)
         })
         .await;
     }

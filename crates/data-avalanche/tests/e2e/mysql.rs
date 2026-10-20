@@ -164,7 +164,8 @@ async fn a_purged_checkpoint_re_snapshots_at_the_start() {
 }
 
 /// Under `binlog_purge_action: error` (the default) the same start halts the pipeline: status
-/// `error`, the lost checkpoint named in the log, the lake as the first run left it.
+/// `error`, the log saying that the purge action halts it and the halt carrying no code
+/// (D-M7b.16), the lake as the first run left it.
 #[tokio::test]
 async fn a_purged_checkpoint_halts_under_error() {
     require_it!();
@@ -185,6 +186,12 @@ async fn a_purged_checkpoint_halts_under_error() {
     let log = p.log();
     assert!(
         log.contains("binlog_purge_action is error, so the pipeline halts"),
+        "{log}"
+    );
+    assert!(
+        !plain(&log)
+            .lines()
+            .any(|l| l.contains("pipeline in ERROR") && l.contains("code=")),
         "{log}"
     );
     assert_eq!(e.ids("items").await, [1, 2]);

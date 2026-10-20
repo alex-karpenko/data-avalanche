@@ -48,7 +48,8 @@ async fn packet(r: &mut (impl AsyncRead + Unpin)) -> std::io::Result<Vec<u8>> {
 
 /// Corrupts `p` when it is a dump's `TRANSACTION_PAYLOAD` event (an OK byte, then the event's
 /// 19-byte header, type at offset 4): one byte of the compressed body flipped and the event's
-/// CRC32 recomputed, so only the decompression can find it.
+/// CRC32 recomputed, so only the decompression can find it. It assumes one packet holds the
+/// whole event (under 16 MiB).
 fn corrupt(p: &mut [u8]) -> bool {
     if p.len() < 4 + 1 + 19 + 4 || p[4] != 0 || p[4 + 1 + 4] != TRANSACTION_PAYLOAD {
         return false;
