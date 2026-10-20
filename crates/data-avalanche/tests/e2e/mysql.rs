@@ -54,11 +54,14 @@ async fn a_corrupted_compressed_transaction_halts_the_pipeline() {
         return;
     }
     let proxy = Proxy::start(t.port).await;
+    // The stream finds the payload's events lost at the next event or heartbeat, and nothing is
+    // written after the corrupted transaction: 1 s, not the default minute (the wait's length).
     let e = E2e::new(
         "my_payload",
         ITEMS,
         Options {
             tables: ", snapshots: { mode: never }",
+            mysql: ", heartbeat: 1s",
             port: Some(proxy.port()),
             ..Options::default()
         },
