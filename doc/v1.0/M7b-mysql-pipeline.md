@@ -5822,3 +5822,14 @@ git commit -m "ci: the slice-1 E2E on MySQL and MariaDB — per change on three 
   - **M-4** (`cded3fa`). The crash_ack comment, the `source_block` doc and `corrupt()`'s limit
     (one packet holds the whole event).
   - **M-5.** This exit's documents.
+- **The PR's first CI run (2026-10-20).** Two jobs failed, both on runs CI made for the first time:
+  - `integration`, "MySQL source, other targets": the review fix's IT
+    (`a_call_dropped_mid_query_does_not_poison_the_next`) knew only three targets and panicked on
+    `mariadb-118-binlog`. It now knows every target of `tests/mysql/common.rs`. Measured: the
+    crate's suites pass on `mariadb-118-binlog`.
+  - `e2e-mysql (mysql-84-nogtid)`: `a_corrupted_compressed_transaction_halts_the_pipeline` timed
+    out on the `error` status 54 ms before the halt came. The stream finds a payload's events
+    lost at the next event or heartbeat, and the scenario writes nothing after the corrupted
+    transaction, so the halt came a heartbeat (the default minute) after it, as long as the
+    wait. The scenario now runs with `heartbeat: 1s`. Measured on `mysql-84-nogtid`: 77.7 s
+    without the change (it passed by the margin), 18.2 s with it.
