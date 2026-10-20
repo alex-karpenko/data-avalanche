@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-17
+updated: 2026-10-20
 domain: Architecture
 tags: [gap-analysis, design, re-derivation, spec-readiness, blockers, open-decisions]
 resolves: []
@@ -129,13 +129,14 @@ does not block starting the specification.
 > updated 2026-10-02 for the gaps M5 carried (§27), 2026-10-03 for DA-SNAP-9 and DA-SNAP-10 (§28),
 > 2026-10-07 for the M6a whole-branch review (§28.2), 2026-10-08 for M6b's planning findings
 > (§29), 2026-10-13 for M6b's exit (§30), 2026-10-14 for M7's planning (§31), 2026-10-14 for
-> M7a's plan (§32), 2026-10-16 for M7a's exit (§33), and 2026-10-17 for M7b's plan (§34).
+> M7a's plan (§32), 2026-10-16 for M7a's exit (§33), 2026-10-17 for M7b's plan (§34), and
+> 2026-10-20 for M7b's exit (§35).
 
 | Status | Count (v1 scope) | Notes |
 |---|---|---|
 | ✅ Resolved | the large majority | Design closed by a research/spec doc or a probe. |
 | 🔄 Partial | 2 | DA-SNAP-7, DA-SRC-9 (neither blocks the plan); DA-SNAP-10 ✅ 2026-10-16 (M7a merged, §33). DA-MS-3 is a decided caveat. DA-X-8 ✅ 2026-09-26; DA-SRC-16 and DA-X-12 ✅ 2026-10-13 (§30). |
-| 🟥 Open (v1) | **23** | DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2); DA-CLUS-14, DA-API-11, DA-OPS-7 and DA-SRC-20 🆕 2026-10-13 (§30.1); DA-SRC-21 🆕 2026-10-14 (§31.2); DA-SRC-22, DA-SNAP-14 and DA-X-13 🆕 2026-10-14 (§32.1); DA-SRC-24…26 🆕 2026-10-16 (§33.1); DA-OBS-6, DA-SRC-27 and DA-X-14 🆕 2026-10-17 (§34.1). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
+| 🟥 Open (v1) | **21** | DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2); DA-CLUS-14, DA-API-11, DA-OPS-7 and DA-SRC-20 🆕 2026-10-13 (§30.1); DA-SRC-21 🆕 2026-10-14 (§31.2); DA-SRC-22, DA-SNAP-14 and DA-X-13 🆕 2026-10-14 (§32.1); DA-SRC-24…26 🆕 2026-10-16 (§33.1); DA-OBS-6 🆕 2026-10-17 (§34.1). DA-SRC-27 and DA-X-14 ✅ 2026-10-20 (§35). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
 | 🧪 Verify (v1) | **0** | DA-SRC-10/11 proven 2026-09-26 (§21). |
 | ⏭ v2 | 13 | Iceberg-sink items (§26.2). |
 | 🟢 Spec-merge debt | **0** | All applied 2026-09-26 (§26.6): §19.3 S-1…S-6, the DA-X-8 config residual, the D-V1 patches and the Data-Flow Phase 2a probe details. |
@@ -397,7 +398,7 @@ the MySQL path with one genuine correctness dependency.
 | DA-SRC-24 | 🆕 A Galera node with `log_slave_updates` off isn't detected as a replica | 🟢 | 🟥 | §33.1. The binlog-coverage precondition (config §11.2) reads `SHOW ALL REPLICAS STATUS` when `log_slave_updates` is off; a Galera node applies its peers' writesets without a replica connection, so the status is empty and the check passes, while its binlog lacks the other nodes' changes. Check `wsrep_on` too. | — |
 | DA-SRC-25 | 🆕 A case-only column rename reads as a rename | 🟢 | 🟥 | §33.1. Column names compare without case (as MySQL's do), so a column whose name changed in case alone diffs as a proven `RenameColumn`; the Delta sink doesn't apply renames, so the table halts or degrades for what is, to MySQL, the same column. Candidate: a case-only rename updates the cached name without an evolution. | — |
 | DA-SRC-26 | 🆕 A MariaDB rollback after tracked rows halts the pipeline | 🟢 | 🟥 | §33.1. MariaDB logs the rows a rollback undid in a transaction with non-transactional changes, then `ROLLBACK TO` or `ROLLBACK` (measured, 10.11–11.8); M7a halts on one with tracked rows, since the stream already emitted them. Fail-closed, but a false halt for a tracked MyISAM table (whose rows stand) and an outage for an application using savepoints across engines. Candidate: hold a transaction's rows until its end, drop those after the savepoint, keep a non-transactional table's. | — |
-| DA-SRC-27 | 🆕 A MySQL stream ended once with "Packets out of sync" | 🟢 | 🟥 | §34.1. In M7b Task 7's E2E run on `mysql-84` the worker logged `reconnecting to the source: Packets out of sync` about 3 s after the pipeline started (`mysql_async`'s `PacketOutOfSync`: a connection read a reply it didn't expect). The reconnect recovered and nothing was lost. The log doesn't name the failing call, and the E2E harness prints a test's log only when it fails, so the frequency is unknown. A candidate cause, unproven: `Connector::command` keeps the shared catalog connection in its slot while a query runs, so a caller dropped mid-query (the session's heartbeat read, aborted when a session ends; an aborted chunk read) leaves a connection with an unread reply for the next query. It doesn't obviously fit this case (no earlier session had ended in the process). Next: name the call in the reconnect's log; take the connection out of the slot for a call and put it back only when the call completes | — |
+| DA-SRC-27 | A MySQL stream ended once with "Packets out of sync" | 🟢 | ✅ | ✅ 2026-10-20 (§35): the candidate cause was real and is fixed. `Connector::command` now takes the catalog connection out of its slot for a call and puts it back only when the call completes, so a call dropped mid-query drops its connection; a transient error names the call. The likeliest trigger was the session's `select!` dropping `MySqlStream::next()` during a DDL's catalog read. An IT drops a call mid-`SLEEP(3)`: on the old code the next query waited 2.8 s for the abandoned reply, now it answers at once (`connect.rs` `a_call_dropped_mid_query_does_not_poison_the_next`). That this was the observed occurrence is inferred, not reproduced; reopen if CI logs it again. The original record: in M7b Task 7's E2E run on `mysql-84` the worker logged `reconnecting to the source: Packets out of sync` about 3 s after the pipeline started (`mysql_async`'s `PacketOutOfSync`: a connection read a reply it didn't expect). The reconnect recovered and nothing was lost. The log doesn't name the failing call, and the E2E harness prints a test's log only when it fails, so the frequency is unknown. A candidate cause, unproven: `Connector::command` keeps the shared catalog connection in its slot while a query runs, so a caller dropped mid-query (the session's heartbeat read, aborted when a session ends; an aborted chunk read) leaves a connection with an unread reply for the next query. It doesn't obviously fit this case (no earlier session had ended in the process). Next: name the call in the reconnect's log; take the connection out of the slot for a call and put it back only when the call completes | — |
 
 ---
 
@@ -1750,3 +1751,24 @@ Two design points surfaced while planning and are fixed in the plan, not recorde
 | DA-OBS-6 | The binary's text log (`compact`, `pretty`) writes ANSI colour sequences to stderr when it isn't a terminal, so a file or a log collector holds escape sequences around the level and the fields | 🟢 | M7b planning: the E2E suite's search for the halt's `code` field missed the log line until the sequences were stripped | Colour only when stderr is a terminal; M10 (`globals.log`) or earlier |
 | DA-SRC-27 | One MySQL stream session ended with `Packets out of sync` (`mysql_async`), 3 s after the pipeline started on `mysql-84`; the reconnect recovered, nothing was lost. Cause unknown: the log doesn't name the call. Candidate: a catalog query whose caller is dropped mid-call leaves the shared connection out of sync (`Connector::command` keeps it in its slot) | 🟢 | M7b Task 7's E2E run (`schema::columns_evolve_and_a_truncate_clears_the_table`, once in four runs on `mysql-84`) | Name the failing call in the reconnect log; return the connection to the slot only when a call completes; watch CI |
 | DA-X-14 | The E2E helper that reads the lake's rows panics when the lake lacks a column, inside `mirrored`'s wait: a pipeline that lags behind a DDL (a reconnect, a slow flush) fails the scenario instead of being waited for. On either source, since M6b | 🟢 | The same run: after DA-SRC-27's reconnect, `the lake's items has no column extra`; alone on rerun the scenario passed | Treat a missing column as "not yet" in the wait (`harness.rs` `rows`) |
+
+---
+
+## 35. M7b MySQL pipeline — the exit (2026-10-20)
+
+M7b (`doc/v1.0/M7b-mysql-pipeline.md`) was executed 2026-10-17…20: eight tasks, one review fix on
+Task 6, then a whole-branch review with no Critical, one Important and five Minor findings. The
+Important finding and four of the Minors were fixed before the PR (the plan's "Deviations during
+execution"); the fifth Minor was this exit's documents. The slice-1 E2E suite passes on
+PostgreSQL 18, MySQL 8.4 (GTIDs on and off) and MariaDB 11.8, and the source's suites on MySQL 8.4
+and MariaDB 11.8. No spec change.
+
+| ID | Change | Evidence |
+|---|---|---|
+| DA-SRC-27 | 🟥 → ✅: a catalog call dropped mid-query left its connection in the shared slot with the reply unread, for the next query to read. The likeliest trigger was a DDL's catalog read inside `MySqlStream::next()`, which the session's `select!` drops when another branch fires. The connection now leaves the slot for the call and goes back only when the call completes; a transient error names the call. That this caused the one logged occurrence is inferred | `connect.rs` `a_call_dropped_mid_query_does_not_poison_the_next` (old code: the next query waited 2.8 s for the abandoned reply); the DDL scenario 5 of 5 alone on `mysql-84` |
+| DA-X-14 | 🟥 → ✅: the E2E wait (`mirrored`) treats a lake column it doesn't have yet as "not yet" (`try_rows`); `rows` still panics for a direct assertion | `harness.rs`; the E2E suite on the four targets |
+| DA-SRC-12 | ✅ (stays): the fault-injection E2E passes on MySQL 8.4 and MariaDB 11.8 | `mysql.rs` `a_corrupted_compressed_transaction_halts_the_pipeline` |
+
+Still open for Oleksii: whether a server that reports no identity (`@@server_uuid` / `@@server_id`
+NULL or empty) halts with a code. Today its message has none, so the status shows `error` without
+a code; the spec names only `BINLOG_PAYLOAD_INVALID` and `BINLOG_SOURCE_CHANGED`.
