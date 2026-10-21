@@ -36,8 +36,8 @@ decision (Q-M8-1, 2026-10-20): **build on foca 2.0.**
    stay stale: `by_id` (public) and the alive handler (`state.rs:444`,
    `&memberlist.nodes[*idx]`) then index past the end and panic, or read another node's state. The
    Go original maps a name to a pointer, so it doesn't have this bug; the Rust port introduced it.
-   A panic in the alive handler ends that task silently. Not reported upstream (an outward-facing
-   action; noted for Oleksii).
+   A panic in the alive handler ends that task silently. Not reported upstream (Oleksii, 2026-10-21:
+   it won't be).
 2. **memberlist hides member states.** `members()` returns the `NodeState` built from the last
    alive message, so `state()` reads `Alive` for a suspect, dead or left node (C3), and
    `notify_leave` hands over the same snapshot: a delegate can't tell a leave from a death. Only
