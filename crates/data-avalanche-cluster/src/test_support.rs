@@ -553,3 +553,169 @@ mod hub_tests {
         a.send(at(9), Bytes::from_static(b"4"));
     }
 }
+
+/// The gossip's timers in the tests: config §6.5.1's defaults, a 5 s push/pull.
+pub(crate) fn gossip_settings() -> crate::GossipSettings {
+    crate::GossipSettings {
+        probe_interval: Duration::from_secs(1),
+        probe_timeout: Duration::from_millis(500),
+        gossip_interval: Duration::from_millis(200),
+        gossip_nodes: 3,
+        push_pull_interval: Duration::from_secs(5),
+        retransmit_factor: 4,
+    }
+}
+
+/// One [`TestFactory`] per pipeline id. The nodes of a [`TestCluster`] share it: a pipeline's
+/// source and sink are the same whichever node runs it, as a database and a lake are.
+#[derive(Debug, Clone)]
+pub(crate) struct ByPipeline(pub std::collections::BTreeMap<String, TestFactory>);
+
+impl crate::WorkerFactory for ByPipeline {
+    fn build(&self, p: &data_avalanche_config::Pipeline) -> Result<crate::Parts, String> {
+        self.0[&p.id].build(p)
+    }
+}
+
+/// `rebalance_stabilization` in the cluster tests.
+pub(crate) const STABLE: Duration = Duration::from_secs(15);
+
+/// In-process nodes: their gossip on one hub, their leases in one store, their pipelines'
+/// sources, sinks and state documents shared.
+#[derive(Debug)]
+pub(crate) struct TestCluster {
+    pub hub: Arc<Hub>,
+    pub store: Arc<ScriptedStore>,
+    pub factories: ByPipeline,
+    ids: Vec<String>,
+    docs: std::collections::BTreeMap<String, data_avalanche_state::PipelineDocs>,
+}
+
+/// One node of a [`TestCluster`]. Dropped, it is a crash.
+#[derive(Debug)]
+pub(crate) struct TestNode {
+    pub name: String,
+    pub gossip: crate::Gossip,
+    pub reconciler: crate::ClusterReconciler,
+}
+
+impl TestCluster {
+    pub fn new(ids: &[&str]) -> Self {
+        Self {
+            hub: Hub::new(),
+            store: ScriptedStore::new(),
+            factories: ByPipeline(
+                ids.iter()
+                    .map(|id| ((*id).to_owned(), TestFactory::new(&["a"])))
+                    .collect(),
+            ),
+            ids: ids.iter().map(|id| (*id).to_owned()).collect(),
+            docs: ids
+                .iter()
+                .map(|id| ((*id).to_owned(), pipeline_docs()))
+                .collect(),
+        }
+    }
+
+    /// Starts `name` at `at(n)` as its `incarnation`, active at once, announcing itself to
+    /// `seed`.
+    pub fn start(&self, name: &str, n: u8, incarnation: u64, seed: Option<SocketAddr>) -> TestNode {
+        let (port, inbox) = self.hub.port(at(n));
+        let me = crate::NodeIdentity {
+            node_id: name.to_owned(),
+            incarnation,
+            rev: 0,
+            addr: at(n),
+            meta: crate::NodeMeta {
+                phase: crate::Phase::Active,
+                config_generation: 1,
+                build: "1.0.0".into(),
+            },
+        };
+        let key = crate::GossipKey::derive(&[7; 32]);
+        let gossip = crate::Gossip::start(me, key, gossip_settings(), Arc::new(port), inbox);
+        if let Some(seed) = seed {
+            gossip.announce(vec![seed]);
+        }
+        let mut deps = deps(
+            name,
+            &self.store,
+            self.factories.0.values().next().expect("a pipeline"),
+        );
+        deps.holder.incarnation = incarnation;
+        deps.factory = Arc::new(self.factories.clone());
+        deps.starts = Arc::new(tokio::sync::Semaphore::new(4));
+        let ids: Vec<&str> = self.ids.iter().map(String::as_str).collect();
+        let mut cfg = config(&ids).pipelines;
+        let pipelines = self
+            .ids
+            .iter()
+            .map(|id| (cfg.remove(id).expect("configured"), self.docs[id].clone()))
+            .collect();
+        let settings = crate::ReconcilerSettings {
+            tokens: 128,
+            stabilization: STABLE,
+            resync: timing().renewal_interval,
+        };
+        let reconciler =
+            crate::ClusterReconciler::start(pipelines, &deps, gossip.members(), settings);
+        TestNode {
+            name: name.to_owned(),
+            gossip,
+            reconciler,
+        }
+    }
+
+    /// Commits a transaction inserting `id` into every pipeline's `public.a`.
+    pub fn insert(&self, id: i64) {
+        for f in self.factories.0.values() {
+            f.source.commit(
+                data_avalanche_testkit::FakeTxn::new()
+                    .insert(&data_avalanche_core::TableRef::new("public", "a"), row(id)),
+            );
+        }
+    }
+
+    /// True when every pipeline's sink holds exactly `ids`.
+    pub fn landed(&self, ids: &[i64]) -> bool {
+        self.factories.0.values().all(|f| f.ids("a") == ids)
+    }
+}
+
+/// The nodes each pipeline's worker runs on (starting or running), by pipeline id.
+pub(crate) fn runners(nodes: &[&TestNode]) -> std::collections::BTreeMap<String, Vec<String>> {
+    use crate::Actual;
+    let mut by: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for n in nodes {
+        for (id, s) in n.reconciler.statuses() {
+            let runs = matches!(s.borrow().actual, Some(Actual::Starting | Actual::Running));
+            let names = by.entry(id).or_default();
+            if runs {
+                names.push(n.name.clone());
+            }
+        }
+    }
+    by
+}
+
+/// Waits (on the test clock) until every pipeline runs on one of `nodes` as `placed` says,
+/// checking at every step that no pipeline runs on two nodes.
+pub(crate) async fn settles(what: &str, nodes: &[&TestNode], placed: impl Fn(&str) -> String) {
+    for _ in 0..12_000 {
+        let now = runners(nodes);
+        for (id, on) in &now {
+            assert!(
+                on.len() <= 1,
+                "{id} runs on {on:?} while waiting until {what}"
+            );
+        }
+        if now
+            .iter()
+            .all(|(id, on)| on.len() == 1 && on[0] == placed(id))
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting until {what}: {:?}", runners(nodes));
+}

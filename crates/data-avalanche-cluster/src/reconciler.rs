@@ -252,20 +252,10 @@ mod tests {
 
     use super::*;
     use crate::test_support::{
-        ScriptedStore, TestFactory, alone, config, deps, eventually, leases, members,
-        pipeline_docs, row, until,
+        ByPipeline, STABLE, ScriptedStore, TestFactory, alone, config, deps, eventually, leases,
+        members, pipeline_docs, row, until,
     };
     use crate::{Parts, Phase, Ring, WorkerFactory};
-
-    /// One [`TestFactory`] per pipeline id.
-    #[derive(Debug)]
-    struct ByPipeline(BTreeMap<String, TestFactory>);
-
-    impl WorkerFactory for ByPipeline {
-        fn build(&self, p: &Pipeline) -> Result<Parts, String> {
-            self.0[&p.id].build(p)
-        }
-    }
 
     fn running(s: &ControllerStatus) -> bool {
         s.actual == Some(Actual::Running)
@@ -274,8 +264,6 @@ mod tests {
     fn standby(s: &ControllerStatus) -> bool {
         matches!(s.actual, Some(Actual::Standby { .. }))
     }
-
-    const STABLE: Duration = Duration::from_secs(15);
 
     fn reconciler_settings() -> ReconcilerSettings {
         ReconcilerSettings {

@@ -7,6 +7,7 @@ pub mod claim;
 pub mod controller;
 pub mod gossip;
 pub mod lease;
+pub mod node;
 pub mod placement;
 pub mod reconciler;
 pub mod ring;
@@ -21,6 +22,7 @@ pub use controller::{
 };
 pub use gossip::{Gossip, GossipSettings, Member, Members, NodeIdentity, NodeMeta, Phase};
 pub use lease::{LeaseGuard, LeaseRun, LeaseTiming, RenewEnd, RenewState};
+pub use node::leave;
 pub use placement::Placement;
 pub use reconciler::{ClusterReconciler, ReconcilerSettings, node_identity};
 pub use ring::Ring;

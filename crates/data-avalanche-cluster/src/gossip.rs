@@ -431,18 +431,7 @@ fn log(r: Result<(), foca::Error>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{Hub, at, eventually};
-
-    fn settings() -> GossipSettings {
-        GossipSettings {
-            probe_interval: Duration::from_secs(1),
-            probe_timeout: Duration::from_millis(500),
-            gossip_interval: Duration::from_millis(200),
-            gossip_nodes: 3,
-            push_pull_interval: Duration::from_secs(5),
-            retransmit_factor: 4,
-        }
-    }
+    use crate::test_support::{Hub, at, eventually, gossip_settings as settings};
 
     fn identity(name: &str, incarnation: u64, addr: SocketAddr) -> NodeIdentity {
         NodeIdentity {
