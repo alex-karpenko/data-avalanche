@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-20
+updated: 2026-10-21
 domain: Architecture
 tags: [gap-analysis, design, re-derivation, spec-readiness, blockers, open-decisions]
 resolves: []
@@ -129,14 +129,14 @@ does not block starting the specification.
 > updated 2026-10-02 for the gaps M5 carried (§27), 2026-10-03 for DA-SNAP-9 and DA-SNAP-10 (§28),
 > 2026-10-07 for the M6a whole-branch review (§28.2), 2026-10-08 for M6b's planning findings
 > (§29), 2026-10-13 for M6b's exit (§30), 2026-10-14 for M7's planning (§31), 2026-10-14 for
-> M7a's plan (§32), 2026-10-16 for M7a's exit (§33), 2026-10-17 for M7b's plan (§34), and
-> 2026-10-20 for M7b's exit (§35).
+> M7a's plan (§32), 2026-10-16 for M7a's exit (§33), 2026-10-17 for M7b's plan (§34),
+> 2026-10-20 for M7b's exit (§35), and 2026-10-21 for M8a's plan (§36).
 
 | Status | Count (v1 scope) | Notes |
 |---|---|---|
 | ✅ Resolved | the large majority | Design closed by a research/spec doc or a probe. |
 | 🔄 Partial | 2 | DA-SNAP-7, DA-SRC-9 (neither blocks the plan); DA-SNAP-10 ✅ 2026-10-16 (M7a merged, §33). DA-MS-3 is a decided caveat. DA-X-8 ✅ 2026-09-26; DA-SRC-16 and DA-X-12 ✅ 2026-10-13 (§30). |
-| 🟥 Open (v1) | **21** | DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2); DA-CLUS-14, DA-API-11, DA-OPS-7 and DA-SRC-20 🆕 2026-10-13 (§30.1); DA-SRC-21 🆕 2026-10-14 (§31.2); DA-SRC-22, DA-SNAP-14 and DA-X-13 🆕 2026-10-14 (§32.1); DA-SRC-24…26 🆕 2026-10-16 (§33.1); DA-OBS-6 🆕 2026-10-17 (§34.1). DA-SRC-27 and DA-X-14 ✅ 2026-10-20 (§35). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
+| 🟥 Open (v1) | **23** | DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2); DA-CLUS-14, DA-API-11, DA-OPS-7 and DA-SRC-20 🆕 2026-10-13 (§30.1); DA-SRC-21 🆕 2026-10-14 (§31.2); DA-SRC-22, DA-SNAP-14 and DA-X-13 🆕 2026-10-14 (§32.1); DA-SRC-24…26 🆕 2026-10-16 (§33.1); DA-OBS-6 🆕 2026-10-17 (§34.1); DA-SRC-28 and DA-OPS-8 🆕 2026-10-21 (§36.1). DA-SRC-27 and DA-X-14 ✅ 2026-10-20 (§35). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
 | 🧪 Verify (v1) | **0** | DA-SRC-10/11 proven 2026-09-26 (§21). |
 | ⏭ v2 | 13 | Iceberg-sink items (§26.2). |
 | 🟢 Spec-merge debt | **0** | All applied 2026-09-26 (§26.6): §19.3 S-1…S-6, the DA-X-8 config residual, the D-V1 patches and the Data-Flow Phase 2a probe details. |
@@ -1776,3 +1776,34 @@ NULL or empty) gets no halt code, and the spec keeps its two (`BINLOG_PAYLOAD_IN
 error guards only something odd on the wire (a proxy, a fork), and its message names the
 variable. GTID mode still requires the identity, though it checks none (a GTID set means the same
 on every server). Relaxing that would be code for a case that doesn't occur.
+
+---
+
+## 36. M8a cluster membership — the plan (2026-10-21)
+
+M8's probe gate (`prototypes/cluster-capability`, 2026-10-20) failed `memberlist` 0.8.5 (C13:
+reaping corrupts its member table) and passed `foca` 2.0 (F1–F8). Oleksii answered Q-M8-1…4
+(2026-10-20): foca with our own actor, packets MAC'd with a key from the anchor, M8 split into
+M8a and M8b, the multi-node E2E as three host processes. M8a's plan
+(`doc/v1.0/M8a-membership.md`) was built task by task in a scratch workspace and replayed from its
+code blocks to an identical tree. Its config patch (§6.5.1 for foca, §6.5.2 and V-054 removed,
+V-122) and the System-Overview rows are spec edits, approved separately.
+
+| ID | Change | Evidence |
+|---|---|---|
+| DA-DEP-4 | ✅ (restated): the gossip crate is `foca` `=2.0.0`, not `memberlist` (it failed the gate). No Lifeguard: SWIM accuracy stays a latency concern (Clustering §3.6, §8.4) | probe C13, F1–F8; roadmap R-1 realized |
+| DA-API-5 | ✅ (restated): the cluster transport is authenticated by a keyed BLAKE3 MAC from the anchor's `fingerprint_key`, not TLS; packets aren't encrypted (they carry no data or secrets). Config §6.5.2 and V-054 go | M8a D-M8a.3; Task 3 (`another_anchor_is_another_key`), Task 4 (`a_node_with_another_key_cant_join`) |
+| DA-CLUS-8 | ✅ (stays): D-11 as built. A ruling beyond §20.3: a `Draining` node is off the ring at once (Clustering §3.3 kept it until its hand-offs completed) | M8a D-M8a.7; Task 5 |
+| DA-CLUS-14 | 🟥 (stays until the exit): planned. The fence's `current_epoch` becomes the claim's floor; one jump, and a second fence after it is an `ERROR` naming another lease store | M8a D-M8a.14; Task 8 |
+| DA-OPS-7 | 🟥 (stays until the exit): planned. A controller that ended unasked is logged and started again on its status channel | M8a D-M8a.11; Task 6 (`a_controller_that_panics_is_started_again`) |
+
+### 36.1 New gaps
+
+| ID | Gap | Severity | Surfaced by | Next |
+|---|---|---|---|---|
+| DA-SRC-28 | A takeover from a holder that stopped without closing its connection (a stop-the-world pause, a VM freeze, a network black hole to the source) can't stream on PostgreSQL until the old walsender ends at `wal_sender_timeout` (60 s by default), then waits for its next busy-slot retry, up to a 60 s backoff step: about two minutes of lag after the lease's 15 s | 🟢 | M8a planning: the E2E pause scenario (a SIGSTOP past the lease) converged after more than 60 s in two of twelve runs on PostgreSQL | Owner's call: terminate the slot's `active_pid` once the lease is ours (the lease proves the other reader is a zombie; the same role may `pg_terminate_backend` its own sessions), or retry a busy slot on a short fixed interval; else document the bound (M11) |
+| DA-OPS-8 | A node runs the cluster's config generation, resolved with its own environment (D-3), so per-node values written as literals in each node's own file (`node_name`, `advertise_addr`, ports) are ignored once a generation exists: the node takes another node's values, and may exit on a port it doesn't own | 🟢 | M8a planning: a second E2E node with its own file exited "Address already in use" on the first node's API port | Per-node values through `${VAR}` (config §6.5.1, M8a's patch); the operator docs (M11); M8b: warn at startup when the node's file and the adopted generation differ in a per-node key |
+
+Not reported upstream (Oleksii, 2026-10-21: it won't be): the `memberlist-core` 0.8.5 `node_map`
+bug (C13, probe README finding 1).
+
