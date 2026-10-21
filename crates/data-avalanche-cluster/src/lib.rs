@@ -10,6 +10,7 @@ pub mod reconciler;
 pub mod ring;
 #[cfg(test)]
 mod test_support;
+pub mod wire;
 
 pub use claim::{Claim, Claimed, release};
 pub use controller::{
@@ -19,3 +20,4 @@ pub use controller::{
 pub use lease::{LeaseGuard, LeaseRun, LeaseTiming, RenewEnd, RenewState};
 pub use reconciler::{ClusterReconciler, node_identity};
 pub use ring::Ring;
+pub use wire::{GossipKey, Udp, Wire};

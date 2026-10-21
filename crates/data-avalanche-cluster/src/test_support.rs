@@ -1,6 +1,8 @@
-//! A store whose writes fail on cue, and the lease fixtures the tests share.
+//! A store whose writes fail on cue, the lease fixtures the tests share, and an in-memory
+//! network for the gossip.
 
 use std::collections::VecDeque;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -436,4 +438,88 @@ pub(crate) async fn eventually(what: &str, cond: impl Fn() -> bool) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("timed out waiting until {what}");
+}
+
+/// An in-memory network for the gossip: an inbox per address, and blocked (from, to) pairs.
+#[derive(Debug, Default)]
+pub(crate) struct Hub {
+    inboxes: Mutex<std::collections::HashMap<SocketAddr, tokio::sync::mpsc::Sender<Bytes>>>,
+    blocked: Mutex<std::collections::HashSet<(SocketAddr, SocketAddr)>>,
+}
+
+/// A node's connection to the hub.
+#[derive(Debug)]
+pub(crate) struct Port {
+    hub: Arc<Hub>,
+    addr: SocketAddr,
+}
+
+impl Hub {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Plugs `addr` in: what it sends goes through the returned port, what it receives to the
+    /// returned inbox.
+    pub fn port(self: &Arc<Self>, addr: SocketAddr) -> (Port, tokio::sync::mpsc::Receiver<Bytes>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(crate::wire::INBOX);
+        self.inboxes.lock().unwrap().insert(addr, tx);
+        let port = Port {
+            hub: Arc::clone(self),
+            addr,
+        };
+        (port, rx)
+    }
+
+    /// Drops all traffic between `a` and `b`, both ways.
+    pub fn cut(&self, a: &[SocketAddr], b: &[SocketAddr]) {
+        let mut blocked = self.blocked.lock().unwrap();
+        for x in a {
+            for y in b {
+                blocked.insert((*x, *y));
+                blocked.insert((*y, *x));
+            }
+        }
+    }
+
+    pub fn heal(&self) {
+        self.blocked.lock().unwrap().clear();
+    }
+}
+
+impl crate::Wire for Port {
+    fn send(&self, to: SocketAddr, packet: Bytes) {
+        if self.hub.blocked.lock().unwrap().contains(&(self.addr, to)) {
+            return;
+        }
+        if let Some(tx) = self.hub.inboxes.lock().unwrap().get(&to) {
+            let _ = tx.try_send(packet);
+        }
+    }
+}
+
+/// `10.0.0.<n>:7946`, a node's address on the hub.
+pub(crate) fn at(n: u8) -> SocketAddr {
+    SocketAddr::from(([10, 0, 0, n], 7946))
+}
+
+mod hub_tests {
+    use super::*;
+    use crate::Wire;
+
+    #[tokio::test]
+    async fn the_hub_delivers_until_cut_and_after_a_heal() {
+        let hub = Hub::new();
+        let (a, _a_in) = hub.port(at(1));
+        let (_b, mut b_in) = hub.port(at(2));
+        a.send(at(2), Bytes::from_static(b"1"));
+        assert_eq!(b_in.recv().await.as_deref(), Some(&b"1"[..]));
+        hub.cut(&[at(1)], &[at(2)]);
+        a.send(at(2), Bytes::from_static(b"2"));
+        assert!(b_in.try_recv().is_err(), "a cut drops the packet");
+        hub.heal();
+        a.send(at(2), Bytes::from_static(b"3"));
+        assert_eq!(b_in.recv().await.as_deref(), Some(&b"3"[..]));
+        a.send(at(9), Bytes::from_static(b"4"));
+    }
 }

@@ -1714,6 +1714,7 @@ version = "0.1.0"
 dependencies = [
  "arrow-array",
  "async-trait",
+ "blake3",
  "bytes",
  "chrono",
  "data-avalanche-config",
