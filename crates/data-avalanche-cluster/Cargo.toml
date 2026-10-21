@@ -19,8 +19,11 @@ data-avalanche-pipeline.workspace = true
 data-avalanche-state.workspace = true
 data-avalanche-storage.workspace = true
 data-avalanche-telemetry.workspace = true
+foca.workspace = true
 gethostname.workspace = true
 getrandom.workspace = true
+rand.workspace = true
+serde.workspace = true
 tokio = { workspace = true, features = ["net", "sync"] }
 tracing.workspace = true
 xxhash-rust.workspace = true

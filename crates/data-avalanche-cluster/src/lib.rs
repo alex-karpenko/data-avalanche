@@ -5,6 +5,7 @@
 
 pub mod claim;
 pub mod controller;
+pub mod gossip;
 pub mod lease;
 pub mod reconciler;
 pub mod ring;
@@ -17,6 +18,7 @@ pub use controller::{
     Actual, ControllerDeps, ControllerSettings, ControllerStatus, Parts, PipelineController,
     Target, WorkerFactory,
 };
+pub use gossip::{Gossip, GossipSettings, Member, Members, NodeIdentity, NodeMeta, Phase};
 pub use lease::{LeaseGuard, LeaseRun, LeaseTiming, RenewEnd, RenewState};
 pub use reconciler::{ClusterReconciler, node_identity};
 pub use ring::Ring;
