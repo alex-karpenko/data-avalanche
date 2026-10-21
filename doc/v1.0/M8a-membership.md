@@ -2,7 +2,7 @@
 updated: 2026-10-21
 domain: Clustering
 tags: [v1, implementation-plan, m8a, cluster, gossip, swim, foca, ring, placement, reconciler, hand-off, discovery, e2e, fault-injection]
-resolves: [DA-CLUS-14, DA-OPS-7, DA-DEP-4]
+resolves: [DA-CLUS-14, DA-OPS-7, DA-DEP-4, DA-SRC-28]
 sources: [SWIM (Cornell), Consistent Hashing]
 ---
 
@@ -26,7 +26,8 @@ leave, discovery, the two items M6b carried (DA-CLUS-14, DA-OPS-7) and the multi
 **M8b** covers config generations at run time (publish, gossip nudge plus poll, adoption) and the
 reload E2E.
 
-**Architecture:** Every new piece lives in `data-avalanche-cluster`; the binary wires them up.
+**Architecture:** Every new piece lives in `data-avalanche-cluster`, and the binary wires them up.
+Task 13's change is in the source contract and the pipeline worker.
 
 - **The config** (Task 1): `globals.cluster.memberlist` describes foca's gossip. The keys only the
   `memberlist` crate used are removed: TCP timeouts, compression, Lifeguard, TLS and
@@ -65,6 +66,9 @@ reload E2E.
 - **The E2E suite** (Task 12, Q-M8-4): three node processes on loopback, each behind a UDP
   forwarder. The scenarios: `kill -9`, a rolling SIGTERM, a partition the forwarders make, and a
   SIGSTOP past the lease.
+- **A busy slot's stale reader** (Task 13, DA-SRC-28, Q-M8-5): a worker that holds its lease and
+  finds its PostgreSQL slot held by another walsender of its own role ends that walsender. It
+  doesn't wait out `wal_sender_timeout`.
 
 **Tech Stack:** Rust 1.98.1 (edition 2024). New external crates (roadmap §2.1):
 - `foca` `=2.0.0` (`default-features = false`, features `std`, `serde`, `postcard-codec`);
@@ -92,6 +96,7 @@ reload E2E.
 - `doc/specs/Configuration_Specification.md`: §6.2 (the anchor), §6.5 (`globals.cluster`),
   §6.5.1 (`memberlist`), §13 (V-054, V-068, V-094…V-096), §14 (the example).
 - `doc/specs/System-Overview.md`: the cluster-state row, OQ-API1 (TLS).
+- `doc/research/Postgres_Slot_and_Publication_Lifecycle.md`: §5 (D-15.5, a busy slot).
 
 ## Global Constraints
 
@@ -146,7 +151,11 @@ task after the arrow.
    (`a_partition_moves_no_pipeline`).
 3. **A stop-the-world pause past the lease** (SIGSTOP, a VM stall). The others take its pipelines
    over. When the paused node resumes, its stale worker is fenced: nothing is committed twice, and
-   it rejoins as a member → Task 12 (`a_paused_holder_loses_its_pipelines_and_rejoins`). A table
+   it rejoins as a member → Task 12 (`a_paused_holder_loses_its_pipelines_and_rejoins`). On
+   PostgreSQL the frozen holder's walsender still holds the slot, and the new holder ends it
+   rather than waiting it out. It ends only its own role's walsender, and only while it holds the
+   lease → Task 13 (`a_busy_slot_s_stale_reader_is_ended`, `a_worker_without_its_lease_ends_no_reader`,
+   `the_slot_s_stale_reader_is_ended`). A table
    whose epoch ran ahead of the lease (a restored `globals.state`) gets one jump, not an endless
    climb → Task 8 (`a_worker_fenced_goes_back_to_the_lease_above_the_tables_epoch`,
    `a_second_fence_past_a_jumped_epoch_is_an_error`).
@@ -173,6 +182,7 @@ task after the arrow.
 | Q-M8-2 | How is the gossip secured? | **A keyed BLAKE3 MAC on every packet**, keyed from the anchor's `fingerprint_key`. No encryption. `memberlist.tls` is dropped (V-054 retired) |
 | Q-M8-3 | One plan or two? | **M8a + M8b**. M8a: gossip, ring, flap rules, caps, leave, discovery, the carried items, the multi-node E2E. M8b: config generations at run time and the reload E2E |
 | Q-M8-4 | How does the E2E run several nodes? | **Three host processes**, UDP forwarders for the partition, SIGSTOP/SIGCONT for the pause, `kill -9` and SIGTERM. The docker-compose 3-node run moves to M11 (the Helm and kind smoke) |
+| Q-M8-5 (2026-10-21) | DA-SRC-28: after a pause past the lease, the new holder can't stream on PostgreSQL until the frozen holder's walsender times out. What then? | **End the stale walsender** (`pg_terminate_backend`), fixed in this plan as Task 13 |
 
 **Rulings where the plan decides** (each pinned by a test):
 
@@ -197,8 +207,9 @@ task after the arrow.
 | D-M8a.17 | **Typed errors.** `ClusterError { NodeName, AdvertiseAddr, Bind { addr, source } }`. The binary maps a bind error to `Fatal::Startup` and the others to `Fatal::Config` | A port taken or an address missing must name what to set | Task 9, Task 11 (`an_address_taken_is_an_error_naming_it`) |
 | D-M8a.18 | **Per-node values come from the environment (D-3).** A node runs the cluster's config generation, resolved with its own environment, not its own file. So a value that differs per node (`node_name`, `advertise_addr`, ports) must be a `${VAR}` in the one config. The E2E harness writes one `config.yaml` and gives each node `E2E_NODE`, `E2E_API_PORT`, `E2E_GOSSIP_PORT` and `E2E_ADVERTISE_PORT`. A `${…}` inside a flow map is quoted | Measured: a second node with its own file adopted the first node's generation, and exited "Address already in use" on that node's port. The config spec (§6.5.1, this plan's patch) and the operator docs (M11) must say so | Task 11 (the lifecycle E2E's two nodes), Task 12 |
 | D-M8a.19 | **The config keys foca doesn't use are removed**, and are now unknown keys: `packet_dial_timeout`, `packet_write_timeout`, `compression_enabled`, `lifeguard_enabled`, `tls` and `dead_node_reclaim_time`. V-054 is retired. V-122: `gossip_interval`, `probe_interval`, `probe_timeout` and `push_pull_interval` above zero, `gossip_nodes` and `retransmit_factor` at least 1, `probe_timeout` below `probe_interval` | foca has no TCP, compression, Lifeguard or TLS. A newer identity wins at once, and a down member is remembered so that a partition can heal, so there is nothing to reclaim. A key that does nothing must not look as if it does | Task 1 (`the_memberlist_only_keys_are_unknown`, the V-122 rows) |
-| D-M8a.20 | **The E2E cluster.** Three processes on loopback, each gossiping on its own port and advertising a `Forwarder`'s port in front of it. `block(&[ports])` drops packets whose source is the other side's ports; `heal()` lets them through again. A scenario has settled when every live node's holders equal the ring's placement over the live nodes, and the members and owned metrics agree. No double commit: each table's commits carry `data-avalanche.owner_epoch` in non-decreasing order. The pause scenario waits up to 150 s for the new holder to converge: on PostgreSQL the paused node's walsender keeps the slot until `wal_sender_timeout` (60 s), and the new holder's next busy-slot retry comes at most a backoff step (60 s) later | foca replies to the advertised address, so a forwarder sees every packet sent to its node (finding 7). Settling on the ring, rather than on a count, catches a scenario that would pass before its hand-offs | Task 12 (the four scenarios) |
+| D-M8a.20 | **The E2E cluster.** Three processes on loopback, each gossiping on its own port and advertising a `Forwarder`'s port in front of it. `block(&[ports])` drops packets whose source is the other side's ports; `heal()` lets them through again. A scenario has settled when every live node's holders equal the ring's placement over the live nodes, and the members and owned metrics agree. No double commit: each table's commits carry `data-avalanche.owner_epoch` in non-decreasing order. The pause scenario waits up to 150 s for the new holder to converge. On PostgreSQL the paused node's walsender keeps the slot until `wal_sender_timeout` (60 s), and the new holder's next busy-slot retry comes at most a backoff step (60 s) later. Task 13 ends that walsender and puts the scenario back on the suite's 60 s wait | foca replies to the advertised address, so a forwarder sees every packet sent to its node (finding 7). Settling on the ring, rather than on a count, catches a scenario that would pass before its hand-offs | Task 12 (the four scenarios) |
 | D-M8a.21 | **The in-process cluster's invariant.** While a Task 10 scenario waits for its placement (`settles`), it checks at every 10 ms of the test clock that no pipeline is `Starting` or `Running` on two nodes | This is the safety property the ring cannot give and the lease must | Task 10 (all four tests) |
+| D-M8a.22 | **A busy slot's stale reader is ended (DA-SRC-28, Q-M8-5).** The worker acts on the first `SourceError::Contended` of a busy spell, when it holds its lease (`may_write`): it calls `SourceConnector::end_other_reader` once, then retries from the first backoff step. On PostgreSQL that ends the walsender holding the slot when it runs as the pipeline's own role, and waits up to 5 s for it to exit (`pg_terminate_backend(pid, 5000)`, PostgreSQL 14+). Some readers can't be ended: another role's, one the server refuses to end, one that didn't exit in time. With one of those, the worker warns and keeps D-15.5's bounded retry. A worker without its lease ends nothing. The default does nothing: MySQL's server ends an older dump with the same server id itself | The lease proves the other reader is stale: a holder that stopped without closing its connection, or this node's own dropped session. Waiting out `wal_sender_timeout` took up to about two minutes after a pause (D-M8a.20). A role may end its own sessions without a grant. The role filter keeps a superuser pipeline role off another system's reader on a same-named slot (D-15.5's external collision) | Task 13 (`a_busy_slot_s_stale_reader_is_ended`, `a_busy_slot_is_retried_for_a_while`, `a_worker_without_its_lease_ends_no_reader`, `the_slot_s_stale_reader_is_ended`); Task 12's pause scenario |
 
 **foca's settings (D-M8a.4)**, for `n` members:
 
@@ -251,8 +262,20 @@ order is fixed on the paused clock.
   - The pause scenario now waits 150 s (D-M8a.20). Ten runs of it alone pass; in four timed ones
     the new holder converged 53–91 s after the takeover. The wait is PostgreSQL's slot, and the
     finding is DA-SRC-28.
-- The whole E2E suite on the final tree: PostgreSQL 18, 37 of 37 (469 s); `mysql-84`, 37 of 37
+- The whole E2E suite after Task 12: PostgreSQL 18, 37 of 37 (469 s); `mysql-84`, 37 of 37
   (381 s).
+- Task 13 (DA-SRC-28):
+  - The pause scenario, back on the 60 s wait, passes 10 of 10 runs alone on PostgreSQL 18, at
+    47–50 s a run. With the 150 s wait and no Task 13, runs took 92–148 s.
+  - The whole E2E suite: PostgreSQL 18, 37 of 37 (425 s); `mysql-84`, 37 of 37 (387 s).
+  - The source-pg suite on PostgreSQL 18 (`tests/pg`): 53 of 56 pass. The other three are the TLS
+    tests, which need compose's CA, and the scratch clone has none; Task 13 doesn't touch TLS.
+    The pipeline crate's suites: 226 of 226.
+  - Mutation checks: without the lease check, `a_worker_without_its_lease_ends_no_reader` fails.
+    Without the role filter, `the_slot_s_stale_reader_is_ended` fails, because the superuser
+    test role ends the other role's walsender.
+  - An ended walsender's stream hands out the items it had buffered before its error, so the
+    test reads it to the end.
 - foca's default cadence announces to down members every 65 s; ours is `push_pull_interval` (30 s
   by default). The E2E sets 5 s, so a healed partition rejoins within seconds.
 
@@ -265,16 +288,19 @@ order is fixed on the paused clock.
     - §4 M8: split into M8a and M8b (Q-M8-3); the docker-compose 3-node run moves to M11's kind
       smoke (Q-M8-4).
     - §6: R-1 realized (memberlist failed the gate; the swap was contained).
-    - §9: D-IMPL-17 for D-M8a.1…21. §9.1: Q-M8-1…4.
+    - §3.6 (the source connector): `SourceConnector::end_other_reader` (Task 13).
+    - §9: D-IMPL-17 for D-M8a.1…22. §9.1: Q-M8-1…5.
   - `Clustering_Architecture_Research.md`:
     - §2: foca, not memberlist.
     - §3.3: Draining is off the ring (D-M8a.7); there is no `dead_node_reclaim_time`.
     - §3.6: no Lifeguard. SWIM accuracy stays a latency concern (§8.4).
     - §13: the modules as built.
+  - `Postgres_Slot_and_Publication_Lifecycle.md` §5 (D-15.5): the lease holder ends a stale
+    walsender of its own role (D-M8a.22).
   - `doc/v1.0/README.md`: the M8a row.
   - `CDC_Design_Gap_Analysis_v1.md`: a dated section for M8a's plan, with two new gaps:
     - DA-SRC-28: after a paused holder, a PostgreSQL takeover waits for `wal_sender_timeout`
-      plus a busy-slot backoff;
+      plus a busy-slot backoff. Q-M8-5 answers it with Task 13;
     - DA-OPS-8: per-node literals in a node's own file are ignored once a generation exists
       (D-M8a.18).
 - **Spec edits, which need their own approval** (drafted on scratch copies; the patch is in this
@@ -311,6 +337,10 @@ order is fixed on the paused clock.
 | `crates/data-avalanche-cluster/src/test_support.rs` | `Hub`, `Port`, `TestCluster`, `TestNode`, `settles` |
 | `crates/data-avalanche-cluster/src/cluster_tests.rs` (new) | The three-node in-process scenarios |
 | `crates/data-avalanche-state/src/lease.rs` | `Leases::take_over_at` |
+| `crates/data-avalanche-core/src/source.rs` | `SourceConnector::end_other_reader` (Task 13) |
+| `crates/data-avalanche-source-pg/src/{slot,connector}.rs` | `PgConnector::end_other_reader`: the slot's walsender of the own role ended |
+| `crates/data-avalanche-pipeline/src/worker.rs` | A busy spell's stale reader ended under the lease |
+| `crates/data-avalanche-testkit/src/fake_source.rs` | `Method::EndOtherReader`, `readers_ended` |
 | `crates/data-avalanche-telemetry/src/lib.rs` | `set_ring_generation`, `data_avalanche_ring_generation` |
 | `crates/data-avalanche/src/{startup,run}.rs` | The anchor's key out of startup; the node's gossip, discovery, join, reconciler and leave |
 | `crates/data-avalanche/tests/e2e/harness.rs` | One config with per-node `${E2E_*}` values; spawning nodes with ports; signals |
@@ -7604,14 +7634,572 @@ git commit -m "test(e2e): three nodes as processes — a kill taken over after t
 
 ---
 
+### Task 13: A busy slot's stale reader is ended (DA-SRC-28)
+
+**Files:**
+- Modify: `crates/data-avalanche-core/src/source.rs`
+- Modify: `crates/data-avalanche-pipeline/src/worker.rs`
+- Modify: `crates/data-avalanche-source-pg/src/connector.rs`
+- Modify: `crates/data-avalanche-source-pg/src/slot.rs`
+- Modify (test): `crates/data-avalanche-source-pg/tests/pg/stream.rs`
+- Modify: `crates/data-avalanche-testkit/src/fake_source.rs`
+- Modify (test): `crates/data-avalanche/tests/e2e/cluster.rs`
+- Modify (test): `crates/data-avalanche/tests/e2e/harness.rs`
+
+**Interfaces:**
+- Consumes: M6b's worker loop (`PipelineWorker::run`, `Core::may_write`, `Tuning.contended_window`, `WorkerStatus::warn`); M5's `PgConnector` (`slot_name`, `Connector::command`); the fake source's faults (`FakeSource::fail`, `Method`); Task 12's pause scenario and `E2e::converged`.
+- Produces:
+  - core: `SourceConnector::end_other_reader(&self) -> Result<bool, SourceError>`, by default `Ok(false)`
+  - source-pg: `PgConnector::end_other_reader(&self) -> Result<bool, SourceError>`
+  - testkit: `Method::EndOtherReader`; `FakeSource::readers_ended(&self) -> usize`. A call that ends a reader takes away the busy-slot failures queued for `open_stream`
+
+D-M8a.22. After a pause past the lease, the frozen holder's replication connection stays open, so its walsender holds the slot until `wal_sender_timeout`. The new holder doesn't wait for that. On the first `Contended` of a busy spell, a worker that holds its lease asks the source to end the slot's other reader, then retries from the first backoff step. PostgreSQL ends only a walsender of the pipeline's own role. Task 12's 150 s wait goes back to the suite's 60 s.
+
+- [ ] **Step 1: Write the failing tests**
+
+Change `crates/data-avalanche-pipeline/src/worker.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-pipeline/src/worker.rs b/crates/data-avalanche-pipeline/src/worker.rs
+index 19f5f9f..d37dcd4 100644
+--- a/crates/data-avalanche-pipeline/src/worker.rs
++++ b/crates/data-avalanche-pipeline/src/worker.rs
+@@ -933,10 +933,14 @@ mod tests {
+         assert!(matches!(end, Ok(Exit::Drained)), "{end:?}");
+     }
+ 
++    /// A busy slot whose other reader can't be ended (another role's walsender) is retried for a
++    /// while, then the worker gives up.
+     #[tokio::test]
+     async fn a_busy_slot_is_retried_for_a_while() {
++        let denied = || SourceError::Permanent("permission denied to terminate process".into());
+         let w = World::new(&["a"]);
+         w.started(&["a"]).await;
++        w.source.fail(Method::EndOtherReader, denied());
+         for _ in 0..3 {
+             w.source
+                 .fail(Method::OpenStream, SourceError::Contended("active".into()));
+@@ -951,15 +955,79 @@ mod tests {
+ 
+         let w = World::new(&["a"]);
+         w.started(&["a"]).await;
++        w.source.fail(Method::EndOtherReader, denied());
+         for _ in 0..10_000 {
+             w.source
+                 .fail(Method::OpenStream, SourceError::Contended("active".into()));
+         }
+-        let (end, _) = run(&w, &mode("mode: never"), async |_| {
++        let (end, st) = run(&w, &mode("mode: never"), async |_| {
+             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+         })
+         .await;
+         assert!(matches!(end, Err(WorkerError::Contended { .. })), "{end:?}");
++        assert!(
++            st.warnings.iter().any(|m| m.contains("couldn't end")
++                && m.contains("permission denied to terminate process")),
++            "{:?}",
++            st.warnings
++        );
++        assert_eq!(w.source.readers_ended(), 0);
++    }
++
++    /// DA-SRC-28: under the lease, the slot's other reader is stale (a holder that stopped
++    /// without closing its connection, or this node's own dropped session). The worker ends it
++    /// instead of waiting out `wal_sender_timeout`, and warns.
++    #[tokio::test]
++    async fn a_busy_slot_s_stale_reader_is_ended() {
++        let w = World::new(&["a"]);
++        w.started(&["a"]).await;
++        for _ in 0..10_000 {
++            w.source.fail(
++                Method::OpenStream,
++                SourceError::Contended("replication slot \"s\" is active for PID 7".into()),
++            );
++        }
++        let (end, st) = run(&w, &mode("mode: never"), async |status| {
++            w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
++            streamed(&status, &w).await;
++        })
++        .await;
++        end.unwrap();
++        assert_eq!(w.ids("a"), [1]);
++        assert_eq!(w.source.readers_ended(), 1);
++        assert!(
++            st.warnings
++                .iter()
++                .any(|m| m.contains("ended the stream position's other reader")
++                    && m.contains("active for PID 7")),
++            "{:?}",
++            st.warnings
++        );
++    }
++
++    /// A worker whose lease lapsed ends no reader: the other reader may be the new holder's.
++    #[tokio::test]
++    async fn a_worker_without_its_lease_ends_no_reader() {
++        let w = World::new(&["a"]);
++        w.started(&["a"]).await;
++        let guard = Arc::new(crate::test_support::Switch::default());
++        let mut d = deps(&w);
++        d.guard = guard.clone();
++        let end = run_with(&mode("mode: never"), d, async |h| {
++            streamed(&h.status, &w).await;
++            guard.0.store(true, std::sync::atomic::Ordering::SeqCst);
++            for _ in 0..10_000 {
++                w.source
++                    .fail(Method::OpenStream, SourceError::Contended("active".into()));
++            }
++            w.source
++                .fail(Method::Next, SourceError::Transient("reset".into()));
++            let mut st = h.status.clone();
++            let _ = tokio::time::timeout(Duration::from_secs(5), st.wait_for(|_| false)).await;
++        })
++        .await;
++        assert!(matches!(end, Err(WorkerError::Contended { .. })), "{end:?}");
++        assert_eq!(w.source.readers_ended(), 0);
+     }
+ 
+     /// A source error that ends the worker is no reconnect: neither a permanent one nor a busy
+```
+
+Change `crates/data-avalanche-source-pg/tests/pg/stream.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-source-pg/tests/pg/stream.rs b/crates/data-avalanche-source-pg/tests/pg/stream.rs
+index 5087f83..0cc00f3 100644
+--- a/crates/data-avalanche-source-pg/tests/pg/stream.rs
++++ b/crates/data-avalanche-source-pg/tests/pg/stream.rs
+@@ -10,7 +10,9 @@ use data_avalanche_core::{
+ };
+ use data_avalanche_testkit::require_it;
+ 
+-use crate::common::{admin, cleanup, collect, connector, each, first_stream, fresh, pipeline};
++use crate::common::{
++    admin, cleanup, collect, connector, each, first_stream, fresh, pipeline, release,
++};
+ 
+ fn changes(items: &[StreamItem]) -> Vec<&CdcEvent> {
+     items
+@@ -688,6 +690,76 @@ async fn untracked_tables_busy_slots_and_keepalives() {
+     cleanup(&a, &n).await;
+ }
+ 
++/// DA-SRC-28: the slot's other reader, a walsender of the pipeline's own role, is ended, and the
++/// stream opens at once instead of after `wal_sender_timeout`. Another role's reader isn't the
++/// pipeline's (the test's role is a superuser, which could end it), and an idle slot has none.
++#[tokio::test(flavor = "multi_thread")]
++async fn the_slot_s_stale_reader_is_ended() {
++    require_it!();
++    let a = admin().await;
++    let n = fresh(&a, "stream_stale", "CREATE TABLE a (id int PRIMARY KEY);").await;
++    let c = connector(&pipeline(&n, &["*"], "", ""));
++    let (mut stale, tables, from) = first_stream(&c).await;
++    each(&a, &[format!("INSERT INTO {}.a VALUES (1)", n.schema)]).await;
++    collect(&mut stale, 1, 20).await;
++
++    let mut busy = c.open_stream(&from, &tables).await.unwrap();
++    match busy.next().await {
++        Err(SourceError::Contended(_)) => {}
++        other => panic!("a busy slot is contended: {other:?}"),
++    }
++    assert!(
++        c.end_other_reader().await.unwrap(),
++        "the stale reader is ended"
++    );
++    let mut s = c.open_stream(&from, &tables).await.unwrap();
++    let items = collect(&mut s, 1, 20).await;
++    assert_eq!(changes(&items).len(), 1, "{items:?}");
++    // The stale stream ends in an error once the items it had buffered are read.
++    tokio::time::timeout(Duration::from_secs(10), async {
++        while stale.next().await.is_ok() {}
++    })
++    .await
++    .expect("the stale reader's session is gone");
++    s.close().await.unwrap();
++    release(&a, &n.slot).await;
++
++    a.batch_execute(&format!(
++        "DROP ROLE IF EXISTS it_other_reader;
++         CREATE ROLE it_other_reader LOGIN REPLICATION PASSWORD 'other';
++         GRANT USAGE ON SCHEMA {s} TO it_other_reader;
++         GRANT SELECT ON ALL TABLES IN SCHEMA {s} TO it_other_reader;",
++        s = n.schema
++    ))
++    .await
++    .expect("another replication role");
++    let mut p = pipeline(&n, &["*"], "", "");
++    p.source.credentials = data_avalanche_config::Credentials::Inline {
++        user: "it_other_reader".into(),
++        password: data_avalanche_config::Secret::new(
++            "other",
++            &data_avalanche_config::FingerprintKey::from_bytes([1; 32]),
++        ),
++    };
++    let mut foreign = connector(&p).open_stream(&from, &tables).await.unwrap();
++    each(&a, &[format!("INSERT INTO {}.a VALUES (2)", n.schema)]).await;
++    collect(&mut foreign, 1, 20).await;
++    assert!(
++        !c.end_other_reader().await.unwrap(),
++        "another role's reader isn't the pipeline's"
++    );
++    foreign.close().await.unwrap();
++    release(&a, &n.slot).await;
++    assert!(
++        !c.end_other_reader().await.unwrap(),
++        "an idle slot has no other reader"
++    );
++    cleanup(&a, &n).await;
++    a.batch_execute("DROP ROLE it_other_reader")
++        .await
++        .expect("drop the other role");
++}
++
+ /// A publication named with capitals is created quoted (`"It_Mixed_Pub"`), so the stream asks
+ /// for it quoted: pgoutput would fold `It_Mixed_Pub` to `it_mixed_pub` and stream nothing.
+ #[tokio::test(flavor = "multi_thread")]
+```
+
+- [ ] **Step 2: Run them to see them fail**
+
+Run: `cargo test -p data-avalanche-pipeline --lib worker::` and `DATA_AVALANCHE_IT=1 DATA_AVALANCHE_SKIP_GCS=1 cargo test -p data-avalanche-source-pg --test pg stream::`
+
+Expected: FAIL to compile: `Method::EndOtherReader`, `FakeSource::readers_ended` and `PgConnector::end_other_reader` don't exist yet.
+
+```text
+error[E0599]: no variant, associated function, or constant named `EndOtherReader` found for enum `data_avalanche_testkit::Method` in the current scope
+error[E0599]: no method named `readers_ended` found for struct `FakeSource` in the current scope
+error: could not compile `data-avalanche-pipeline` (lib test) due to 5 previous errors
+```
+
+```text
+error[E0599]: no method named `end_other_reader` found for struct `PgConnector` in the current scope
+error: could not compile `data-avalanche-source-pg` (test "pg") due to 3 previous errors
+```
+
+- [ ] **Step 3: End the stale reader**
+
+Change `crates/data-avalanche-core/src/source.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-core/src/source.rs b/crates/data-avalanche-core/src/source.rs
+index 6d52f00..9c5e839 100644
+--- a/crates/data-avalanche-core/src/source.rs
++++ b/crates/data-avalanche-core/src/source.rs
+@@ -33,8 +33,10 @@ pub enum SourceError {
+     TableHalt { table: TableRef, reason: HaltReason },
+     /// Another reader holds the stream position (PostgreSQL: the slot is active for another
+     /// walsender, SQLSTATE 55006). A quick restart meets it until the old session's walsender
+-    /// times out (`wal_sender_timeout`): the pipeline retries for a bounded time while it holds
+-    /// the lease, then gives up (`Postgres_Slot…` D-15.5).
++    /// times out (`wal_sender_timeout`), and so does a takeover from a holder that stopped without
++    /// closing its connection. The lease holder ends that reader when the source can
++    /// ([`SourceConnector::end_other_reader`], DA-SRC-28), and retries for a bounded time, then
++    /// gives up (`Postgres_Slot…` D-15.5).
+     #[error("the source's stream position is held by another reader: {0}")]
+     Contended(String),
+ }
+@@ -373,6 +375,15 @@ pub trait SourceConnector: Send + Sync {
+         tables: &[TableSchema],
+     ) -> Result<Box<dyn ChangeStream>, SourceError>;
+ 
++    /// Ends the session that holds the stream position for another reader, when the source can
++    /// tell it is the pipeline's own: a holder that stopped without closing its connection, or
++    /// this node's own dropped session (DA-SRC-28). Called by the lease holder only, after a
++    /// [`SourceError::Contended`]. `Ok(true)` when one was ended. A source whose server ends the
++    /// old reader itself (MySQL: a new dump with the same server id) has none to end.
++    async fn end_other_reader(&self) -> Result<bool, SourceError> {
++        Ok(false)
++    }
++
+     /// Channel C: the change a schema signal implicates, against the `cached` as-of-position
+     /// schema, scoped to the hint (`Schema_Change…` §0). Returns the delta and the new schema
+     /// (`None` when the table was dropped).
+```
+
+Change `crates/data-avalanche-pipeline/src/worker.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-pipeline/src/worker.rs b/crates/data-avalanche-pipeline/src/worker.rs
+index d37dcd4..c9c841b 100644
+--- a/crates/data-avalanche-pipeline/src/worker.rs
++++ b/crates/data-avalanche-pipeline/src/worker.rs
+@@ -1,7 +1,8 @@
+ //! The pipeline worker (Data-Flow Phases 0–5): Phase 0 once, then stream sessions until a drain,
+ //! a finished dump or an error. Between sessions it decides what a source failure means: a
+-//! transient one reopens the stream after a backoff, a busy slot is retried for a bounded time,
+-//! and a lost position is replaced and every table snapshotted again.
++//! transient one reopens the stream after a backoff, a busy slot's stale reader is ended and the
++//! slot retried for a bounded time, and a lost position is replaced and every table snapshotted
++//! again.
+ 
+ use std::collections::{BTreeMap, BTreeSet};
+ use std::sync::Arc;
+@@ -151,11 +152,31 @@ impl PipelineWorker {
+                     });
+                 }
+                 SourceError::Contended(detail) => {
++                    let first = contended_since.is_none();
+                     let since = *contended_since.get_or_insert_with(Instant::now);
+                     let waited = since.elapsed();
+                     if waited >= core.tuning.contended_window {
+                         return Err(WorkerError::Contended { waited, detail });
+                     }
++                    // DA-SRC-28: under the lease, the other reader is a stale session. It is
++                    // ended once a busy spell, and the stream retried from the first backoff step.
++                    if first && core.may_write().is_ok() {
++                        let warning = match core.source.end_other_reader().await {
++                            Ok(true) => {
++                                attempt = 0;
++                                Some(format!(
++                                    "ended the stream position's other reader, a session the lease outlived ({detail})"
++                                ))
++                            }
++                            Ok(false) => None,
++                            Err(e) => Some(format!(
++                                "couldn't end the stream position's other reader ({e}): retrying until it lets go"
++                            )),
++                        };
++                        if let Some(warning) = warning {
++                            core.update(|st| st.warn(warning));
++                        }
++                    }
+                     let error = SourceError::Contended(detail).to_string();
+                     core.update(|st| {
+                         st.reconnects += 1;
+```
+
+Change `crates/data-avalanche-source-pg/src/connector.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-source-pg/src/connector.rs b/crates/data-avalanche-source-pg/src/connector.rs
+index e66643a..1e88281 100644
+--- a/crates/data-avalanche-source-pg/src/connector.rs
++++ b/crates/data-avalanche-source-pg/src/connector.rs
+@@ -309,6 +309,10 @@ impl SourceConnector for PgConnector {
+         Ok(PgConnector::open_stream(self, &from.position, tables).await?)
+     }
+ 
++    async fn end_other_reader(&self) -> Result<bool, SourceError> {
++        PgConnector::end_other_reader(self).await
++    }
++
+     async fn augment(
+         &self,
+         cached: &TableSchema,
+```
+
+Change `crates/data-avalanche-source-pg/src/slot.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-source-pg/src/slot.rs b/crates/data-avalanche-source-pg/src/slot.rs
+index 6a8c368..50a8220 100644
+--- a/crates/data-avalanche-source-pg/src/slot.rs
++++ b/crates/data-avalanche-source-pg/src/slot.rs
+@@ -518,6 +518,28 @@ impl PgConnector {
+             .await
+     }
+ 
++    /// Ends the walsender that holds the slot when it runs as the pipeline's own role, and waits up
++    /// to 5 s for it to exit (`pg_terminate_backend(pid, timeout)`, PostgreSQL 14+): a role may
++    /// end its own sessions without a grant. `false` when no session of the role holds the slot,
++    /// or it didn't exit in time (DA-SRC-28).
++    pub async fn end_other_reader(&self) -> Result<bool, SourceError> {
++        let client = self.conn.client().await?;
++        let row = self
++            .conn
++            .command(
++                "end the slot's other reader",
++                client.query_opt(
++                    "SELECT pg_catalog.pg_terminate_backend(a.pid, 5000)
++                       FROM pg_catalog.pg_replication_slots s
++                       JOIN pg_catalog.pg_stat_activity a ON a.pid = s.active_pid
++                      WHERE s.slot_name = $1 AND a.usename = current_user",
++                    &[&self.slot_name()],
++                ),
++            )
++            .await?;
++        Ok(row.is_some_and(|r| r.get(0)))
++    }
++
+     /// The WAL the slot keeps on the source's disk: `pg_current_wal_lsn() - restart_lsn`, the
+     /// `max_wal_lag_bytes` guard's measure, and whether a walsender reads the slot (`active`).
+     /// `restart_lsn` trails `confirmed_flush_lsn` while a transaction older than the confirmed
+```
+
+Change `crates/data-avalanche-testkit/src/fake_source.rs`:
+
+```diff
+diff --git a/crates/data-avalanche-testkit/src/fake_source.rs b/crates/data-avalanche-testkit/src/fake_source.rs
+index 6857c9c..bcd32af 100644
+--- a/crates/data-avalanche-testkit/src/fake_source.rs
++++ b/crates/data-avalanche-testkit/src/fake_source.rs
+@@ -54,6 +54,7 @@ pub enum Method {
+     OpenStream,
+     /// A stream's `next`, after the items it has already queued.
+     Next,
++    EndOtherReader,
+     Augment,
+     Rescan,
+ }
+@@ -250,6 +251,7 @@ struct Db {
+     reads: BTreeMap<TableRef, usize>,
+     rescans: usize,
+     in_flights: usize,
++    readers_ended: usize,
+     fetches: BTreeMap<TableRef, usize>,
+     prepares: Vec<Option<Checkpoint>>,
+ }
+@@ -302,6 +304,7 @@ impl FakeSource {
+             reads: BTreeMap::new(),
+             rescans: 0,
+             in_flights: 0,
++            readers_ended: 0,
+             fetches: BTreeMap::new(),
+             prepares: vec![],
+         };
+@@ -573,6 +576,12 @@ impl FakeSource {
+         self.db().in_flights
+     }
+ 
++    /// `end_other_reader` calls that ended a reader: each takes away the busy-slot failures
++    /// queued for `open_stream`.
++    pub fn readers_ended(&self) -> usize {
++        self.db().readers_ended
++    }
++
+     /// `fetch_rows` calls for `table` so far, failed ones included.
+     pub fn fetches(&self, table: &TableRef) -> usize {
+         self.db().fetches.get(table).copied().unwrap_or(0)
+@@ -1082,6 +1091,17 @@ impl SourceConnector for FakeSource {
+         }))
+     }
+ 
++    async fn end_other_reader(&self) -> Result<bool, SourceError> {
++        self.take_fault(Method::EndOtherReader)?;
++        let mut db = self.db();
++        let before = db.faults.len();
++        db.faults
++            .retain(|(m, e)| !(*m == Method::OpenStream && matches!(e, SourceError::Contended(_))));
++        let ended = db.faults.len() < before;
++        db.readers_ended += usize::from(ended);
++        Ok(ended)
++    }
++
+     async fn augment(
+         &self,
+         cached: &TableSchema,
+```
+
+Change `crates/data-avalanche/tests/e2e/cluster.rs`:
+
+```diff
+diff --git a/crates/data-avalanche/tests/e2e/cluster.rs b/crates/data-avalanche/tests/e2e/cluster.rs
+index 076ca6b..0fc79cc 100644
+--- a/crates/data-avalanche/tests/e2e/cluster.rs
++++ b/crates/data-avalanche/tests/e2e/cluster.rs
+@@ -334,11 +334,9 @@ async fn a_paused_holder_loses_its_pipelines_and_rejoins() {
+         },
+     )
+     .await;
+-    // The paused node's replication connection stays open, so on PostgreSQL its walsender keeps
+-    // the slot until `wal_sender_timeout` (60 s) ends it; the new holder streams at its next
+-    // busy-slot retry after that, at most a backoff step (60 s) later (`Postgres_Slot…` D-15.5).
+-    c.e.converged_within("items", Duration::from_secs(150))
+-        .await;
++    // The paused node's replication connection stays open: on PostgreSQL its walsender holds the
++    // slot until the new holder ends it (DA-SRC-28), not until `wal_sender_timeout`.
++    c.e.converged("items").await;
+     tokio::time::sleep(Duration::from_secs(5)).await;
+     c.nodes[i].proc.as_ref().unwrap().signal("CONT");
+     c.e.exec("INSERT INTO items VALUES (3, 'c')").await;
+```
+
+Change `crates/data-avalanche/tests/e2e/harness.rs`:
+
+```diff
+diff --git a/crates/data-avalanche/tests/e2e/harness.rs b/crates/data-avalanche/tests/e2e/harness.rs
+index c9846a6..1f0b7fa 100644
+--- a/crates/data-avalanche/tests/e2e/harness.rs
++++ b/crates/data-avalanche/tests/e2e/harness.rs
+@@ -451,14 +451,12 @@ pipelines:
+ 
+     /// Waits until the lake's `table` has exactly the source's ids.
+     pub async fn converged(&self, table: &str) {
+-        self.converged_within(table, Duration::from_secs(60)).await;
+-    }
+-
+-    /// [`Self::converged`], waiting at most `within`.
+-    pub async fn converged_within(&self, table: &str, within: Duration) {
+         let want = self.source_ids(table).await;
+         let what = format!("{table} has the source's {} rows", want.len());
+-        eventually(&what, within, async || self.ids(table).await == want).await;
++        eventually(&what, Duration::from_secs(60), async || {
++            self.ids(table).await == want
++        })
++        .await;
+     }
+ 
+     /// Whether the source streams to the pipeline now: PostgreSQL's slot has a walsender,
+```
+
+- [ ] **Step 4: Run the tests and the cluster scenarios**
+
+Run: `cargo test -p data-avalanche-pipeline --lib worker::`
+
+Expected: PASS, 37 tests.
+
+```text
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 174 filtered out; finished in 0.53s
+```
+
+Run: `DATA_AVALANCHE_IT=1 DATA_AVALANCHE_SKIP_GCS=1 cargo test -p data-avalanche-source-pg --test pg stream::`
+
+Expected: PASS, 18 tests.
+
+```text
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 38 filtered out; finished in 11.71s
+```
+
+Run: `DATA_AVALANCHE_IT=1 DATA_AVALANCHE_SKIP_GCS=1 cargo test -p data-avalanche --features e2e-hooks --test e2e -- --test-threads=1 cluster::`
+
+Expected: PASS, 4 tests.
+
+```text
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 33 filtered out; finished in 142.23s
+```
+
+Run: `cargo test --workspace`
+
+Expected: PASS, every test binary (1142 tests in all).
+
+Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo clippy -p data-avalanche --features e2e-hooks --all-targets -- -D warnings`
+
+Expected: no output, no warnings.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/data-avalanche-core/src/source.rs \
+  crates/data-avalanche-pipeline/src/worker.rs \
+  crates/data-avalanche-source-pg/src/connector.rs \
+  crates/data-avalanche-source-pg/src/slot.rs \
+  crates/data-avalanche-source-pg/tests/pg/stream.rs \
+  crates/data-avalanche-testkit/src/fake_source.rs \
+  crates/data-avalanche/tests/e2e/cluster.rs \
+  crates/data-avalanche/tests/e2e/harness.rs
+git commit -m "fix(pipeline): a busy slot's stale reader is ended under the lease — PostgreSQL ends the slot's walsender of the pipeline's own role (DA-SRC-28, Q-M8-5); the pause scenario back on the suite's 60 s wait"
+```
+
+---
+
 ## Exit
 
 - [ ] Three nodes spread their pipelines by the ring, and each pipeline runs on one node (Tasks 10, 12).
 - [ ] A killed node's pipelines are taken over after the lease, with no double commit (Task 12).
 - [ ] A leave hands every pipeline off without a lease wait; a rolling restart loses nothing, with hand-offs capped (Tasks 6, 7, 12).
-- [ ] A partition with storage reachable moves no pipeline; a pause past the lease is fenced and rejoins (Tasks 10, 12).
+- [ ] A partition with storage reachable moves no pipeline; a pause past the lease is fenced and rejoins (Tasks 10, 12), and on PostgreSQL its new holder streams without waiting out `wal_sender_timeout` (Task 13).
 - [ ] A node of another cluster can't join (Tasks 3, 4).
-- [ ] DA-CLUS-14 (Task 8) and DA-OPS-7 (Task 6) are closed.
+- [ ] DA-CLUS-14 (Task 8), DA-OPS-7 (Task 6) and DA-SRC-28 (Task 13) are closed.
 - [ ] The E2E suite passes on PostgreSQL 18 and, through `ci.yml`'s jobs, on `mysql-84`, `mysql-84-nogtid` and `mariadb-118`.
 - [ ] Every Review Focus line has its passing test.
 - [ ] The documents of "Documents this plan changes" are updated, and the spec patch is applied once approved.
