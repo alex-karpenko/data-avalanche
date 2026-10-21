@@ -1,7 +1,7 @@
 ---
 title: Clustering Architecture Research
 status: Research / Design proposal (input for further elaboration)
-updated: 2026-09-28
+updated: 2026-10-21
 domain: Architecture / Distributed Systems
 tags: [clustering, gossip, swim, memberlist, consistent-hashing, lease, split-brain, rebalancing, config-propagation]
 closes_or_advances: [G-8, G-9, G-2, G-17, G-23, G-36, "OQ-CL1", "OQ-CL3", "OQ-CL4", "OQ-API3", "OQ-P3", "5.1", "5.2"]
@@ -98,6 +98,16 @@ what makes that work.
 
 ## 2. What `memberlist` does and does not give us
 
+> **Superseded for the implementation (M8 probe gate, 2026-10-20; Q-M8-1).** `memberlist` 0.8.5
+> failed the gate (`prototypes/cluster-capability`: reaping corrupts its member table, C13; member
+> states hidden; its TLS leaves the UDP gossip unauthenticated). v1 builds on **`foca` 2.0** (SWIM,
+> indirect probes, suspicion, infection-style dissemination), driven by our own tokio actor over
+> UDP. What this section asks of the layer still holds; what changes: node metadata rides in foca's
+> identity (a change is a new identity, seen as a rename); there is no push/pull TCP sync (foca
+> announces periodically, and to down members, which heals partitions); no Lifeguard (§3.6); the
+> packets carry a keyed BLAKE3 MAC from the anchor's `fingerprint_key` instead of TLS (Q-M8-2).
+> The modules as built: §13 and `doc/v1.0/M8a-membership.md`.
+
 Grounding the design in the actual library (the Rust `memberlist` crate, `al8n/memberlist`, a port
 of HashiCorp's Go `memberlist`):
 
@@ -191,6 +201,8 @@ Two orthogonal status axes, kept separate on purpose:
 - **Reachability/liveness (owned by SWIM):** `alive | suspect | dead | left`. We do not invent this;
   we read it from `memberlist`. `suspect` is the "probably gone but unconfirmed" state;
   `dead_node_reclaim_time` (30s, config) bounds how long a dead entry lingers before reclamation.
+  *(M8a: foca's `Alive | Suspect | Down`; a newer identity under the same name wins at once, so
+  there is no reclaim time and the key is removed, D-M8a.19.)*
   `left` is the *graceful* departure marker (see §3.5) and is distinct from `dead`.
 - **Application phase (owned by us, in NodeMeta):** `Joining | Active | Draining | Leaving`.
   `Joining` = process up, gossip joined, but not yet accepting pipeline ownership (still loading
@@ -202,6 +214,10 @@ The ring-ownership computation considers a node only if it is `alive`/`left==fal
 `phase ∈ {Active, Draining}` with appropriate handling (a `Draining` node keeps ownership only until
 its handoffs complete). This prevents a half-initialized `Joining` node from being assigned work
 before it is ready.
+
+> **M8a ruling (D-M8a.7):** only `Active` is placed. A `Draining` node leaves the ring at once: the
+> owners-to-be claim while it drains, and each lease is acquired as soon as the drain releases it.
+> The single-runner guarantee is the lease's in both readings, so nothing safety-relevant changes.
 
 ### 3.4 `node_id` stability and incarnation (the Quickwit lesson)
 
@@ -261,6 +277,12 @@ Scuttlebutt camp without switching libraries.** Rationale:
 - We **borrow** the generation-tagged identity idea (§3.4 `incarnation`) regardless.
 
 **Config action:** enable Lifeguard explicitly; record this decision in the architecture doc.
+
+> **M8a (2026-10-20):** foca has no Lifeguard, and `lifeguard_enabled` is removed (D-M8a.19). The
+> rationale above carries the loss: SWIM accuracy is a latency concern (§8.4), a false "down" costs
+> a takeover attempt the lease refuses, and the suspicion window grows with the cluster
+> (`4 · max(1, log10 n) · probe_interval`). The probe measured a 15 s pause as down after 5.8–6.8 s
+> and back 8–9 s after it resumed (F7).
 
 ---
 
@@ -864,6 +886,12 @@ ClusterManager (one per worker)
   wiring the "renew-or-stop" rule into the data path.
 
 ---
+
+> **As built in M8a** (`data-avalanche-cluster`): `wire` (the MAC, `Udp`), `gossip` (the foca actor,
+> `Members`), `ring`, `placement` (eligibility and stabilization), `reconciler` (targets, the hand-off
+> cap, supervision), `controller` and `claim` (M6b's, with the hand-off permit and the epoch floor),
+> `node` (join and leave), `discovery` (seeds, the advertised address), `error`. The binary binds
+> the UDP socket, derives the key from the anchor, and on SIGTERM leaves.
 
 ## 14. How this maps to the open gaps
 
