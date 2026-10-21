@@ -138,15 +138,6 @@ pub fn cases() -> Vec<Case> {
                 json!({"enabled": true, "cert": cert(), "key": key()}),
             )
         }),
-        case("V-054", Error, "gossip tls without cert", || {
-            pg_delta().set(
-                "/globals/cluster/memberlist/tls",
-                json!({"enabled": true, "key": key()}),
-            )
-        }),
-        case("V-054", Silent, "gossip tls disabled", || {
-            pg_delta().set("/globals/cluster/memberlist/tls", json!({"enabled": false}))
-        }),
         case("V-099", Error, "unknown role", || {
             pg_delta().set("/globals/api", json!({
                 "auth": "jwt", "jwt": {"issuer": "https://idp", "jwks_url": "https://idp/certs"},

@@ -95,8 +95,6 @@ impl Files {
 /// references set.
 pub fn spec_example(files: &Files) -> (String, BTreeMap<String, String>) {
     files.write("api.crt", cert());
-    files.write("gossip.crt", cert());
-    files.write("gossip-ca.crt", cert());
     let creds = files.write(
         "events-db.json",
         r#"{"user": "events", "password": "events-pw"}"#,
@@ -105,7 +103,6 @@ pub fn spec_example(files: &Files) -> (String, BTreeMap<String, String>) {
     let env = env(&[
         ("ACCOUNT_ID", "123456789012"),
         ("API_TLS_KEY", key()),
-        ("GOSSIP_TLS_KEY", key()),
         ("CATALOG_CLIENT_ID", "cdc-client"),
         ("CATALOG_CLIENT_SECRET", "client-secret"),
         ("ORDERS_DB_PASSWORD", "orders-pw"),

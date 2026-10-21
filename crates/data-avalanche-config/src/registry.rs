@@ -493,14 +493,6 @@ pub const RULES: &[RuleMeta] = &[
         r#"Requires cert + key."#,
     ),
     rule(
-        "V-054",
-        Error,
-        L::Config,
-        Config,
-        r#"globals.cluster.memberlist.tls.enabled = true"#,
-        r#"Requires cert + key."#,
-    ),
-    rule(
         "V-055",
         Error,
         L::Pipeline,
@@ -609,7 +601,7 @@ pub const RULES: &[RuleMeta] = &[
         Error,
         L::ConfigOrPipeline,
         Resolution,
-        r#"TLS material (cert/key/ca across globals.api, memberlist, source.ssl_*, sink.iceberg.catalog.*)"#,
+        r#"TLS material (cert/key/ca across globals.api, source.ssl_*, sink.iceberg.catalog.*)"#,
         r#"Resolved value (inline / file / env) is non-empty and parses as valid PEM (and a private key where a key is expected)."#,
     ),
     rule(
@@ -1028,6 +1020,14 @@ pub const RULES: &[RuleMeta] = &[
         r#"source.mysql.heartbeat"#,
         r#"Between 1s and 4294967s (the server's heartbeat period range)."#,
     ),
+    rule(
+        "V-122",
+        Error,
+        L::Config,
+        Config,
+        r#"globals.cluster.memberlist timers"#,
+        r#"gossip_interval, probe_interval, probe_timeout and push_pull_interval above zero; gossip_nodes and retransmit_factor at least 1; probe_timeout below probe_interval."#,
+    ),
 ];
 
 /// The registry entry for `id` (`"V-007"`).
@@ -1046,8 +1046,8 @@ mod tests {
             RULES.windows(2).all(|w| w[0].id < w[1].id),
             "sorted, no duplicates"
         );
-        // IDs retired by the spec (§15 item 18) or never allocated in it.
-        for gone in ["V-024", "V-031", "V-032", "V-039", "V-090"] {
+        // IDs retired by the spec (§15 items 18 and 27) or never allocated in it.
+        for gone in ["V-024", "V-031", "V-032", "V-039", "V-054", "V-090"] {
             assert!(rule_meta(gone).is_none(), "{gone}");
         }
         assert_eq!(

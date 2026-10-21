@@ -215,6 +215,36 @@ pub fn cases() -> Vec<Case> {
         case("V-074", Silent, "takeovers 1", || {
             pg_delta().set("/globals/cluster/max_concurrent_takeovers", json!(1))
         }),
+        case("V-122", Error, "gossip interval 0s", || {
+            pg_delta().set("/globals/cluster/memberlist/gossip_interval", json!("0s"))
+        }),
+        case("V-122", Error, "push pull interval 0s", || {
+            pg_delta().set(
+                "/globals/cluster/memberlist/push_pull_interval",
+                json!("0s"),
+            )
+        }),
+        case("V-122", Error, "gossip nodes 0", || {
+            pg_delta().set("/globals/cluster/memberlist/gossip_nodes", json!(0))
+        }),
+        case("V-122", Error, "retransmit factor 0", || {
+            pg_delta().set("/globals/cluster/memberlist/retransmit_factor", json!(0))
+        }),
+        case("V-122", Error, "probe timeout at the interval", || {
+            pg_delta().set("/globals/cluster/memberlist/probe_timeout", json!("1s"))
+        }),
+        case(
+            "V-122",
+            Error,
+            "probe interval below the default timeout",
+            || pg_delta().set("/globals/cluster/memberlist/probe_interval", json!("400ms")),
+        ),
+        case("V-122", Silent, "probe timeout below the interval", || {
+            pg_delta().set(
+                "/globals/cluster/memberlist",
+                json!({"probe_interval": "2s", "probe_timeout": "1500ms", "gossip_nodes": 1}),
+            )
+        }),
         case("V-097", Error, "ratio 1.5", || {
             pg_delta().set(
                 "/globals/tracing",
