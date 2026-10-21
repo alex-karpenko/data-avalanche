@@ -553,6 +553,12 @@ mod tests {
         until(st.get_mut("p").unwrap(), "running", running).await;
         assert_eq!(st["p"].borrow().owner_epoch, Some(2));
         assert_eq!(fs["p"].builds(), 1, "the panicking build counted none");
+        let text = d.metrics.encode();
+        assert!(
+            text.lines()
+                .any(|l| l == "data_avalanche_owned_pipelines 1"),
+            "{text}"
+        );
         r.shutdown().await;
     }
 }

@@ -196,6 +196,22 @@ impl Drop for Running {
     }
 }
 
+/// The owned-pipelines gauge for as long as it lives: a panic or an abort decrements it too.
+struct Owned(Metrics);
+
+impl Owned {
+    fn new(node: &Metrics) -> Self {
+        node.owned_by(1);
+        Self(node.clone())
+    }
+}
+
+impl Drop for Owned {
+    fn drop(&mut self) {
+        self.0.owned_by(-1);
+    }
+}
+
 impl PipelineController {
     /// `docs` are the pipeline's state documents.
     pub fn new(
@@ -301,10 +317,8 @@ impl PipelineController {
 
     /// Holds the lease and reconciles the worker until the lease is lost or let go.
     async fn owned(&self, run: LeaseRun, target: &mut watch::Receiver<Target>) -> Left {
-        self.node.owned_by(1);
-        let left = self.reconcile(run, target).await;
-        self.node.owned_by(-1);
-        left
+        let _owned = Owned::new(&self.node);
+        self.reconcile(run, target).await
     }
 
     async fn reconcile(&self, run: LeaseRun, target: &mut watch::Receiver<Target>) -> Left {
