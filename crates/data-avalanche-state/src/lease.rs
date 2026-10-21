@@ -235,6 +235,24 @@ impl Leases {
         lease_duration: Duration,
         now: DateTime<Utc>,
     ) -> Result<Versioned<LeaseDoc>, StateError> {
+        self.take_over_at(observed, holder, lease_duration, now, 0)
+            .await
+    }
+
+    /// [`Self::take_over`] under an epoch of at least `at_least`: the lake has seen a later
+    /// epoch than the lease names (DA-CLUS-14), and a term must never share an epoch with a
+    /// writer that already ran.
+    ///
+    /// # Errors
+    /// As [`Self::take_over`].
+    pub async fn take_over_at(
+        &self,
+        observed: &Versioned<LeaseDoc>,
+        holder: &Holder,
+        lease_duration: Duration,
+        now: DateTime<Utc>,
+        at_least: u64,
+    ) -> Result<Versioned<LeaseDoc>, StateError> {
         let Some(epoch) = observed.doc.owner_epoch.checked_add(1) else {
             return Err(StateError::Corrupt {
                 key: lease_key(&observed.doc.pipeline_id),
@@ -242,6 +260,7 @@ impl Leases {
                 reason: "owner_epoch is at its maximum".to_owned(),
             });
         };
+        let epoch = epoch.max(at_least);
         let doc = Self::new_doc(
             &observed.doc.pipeline_id,
             holder,
@@ -573,6 +592,23 @@ mod tests {
         assert!(
             matches!(&e, StateError::Corrupt { kind: "lease", reason, .. } if reason.contains("maximum")),
             "{e:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn take_over_at_jumps_to_the_floor_and_never_below_the_next_epoch() {
+        let l = leases();
+        mine(&l, "orders", "a").await;
+        let observed = l.observe("orders").await.unwrap().unwrap();
+        let b = l
+            .take_over_at(&observed, &node("b"), DUR, t(20), 6)
+            .await
+            .unwrap();
+        assert_eq!(b.doc.owner_epoch, 6);
+        let c = l.take_over_at(&b, &node("c"), DUR, t(21), 3).await.unwrap();
+        assert_eq!(
+            c.doc.owner_epoch, 7,
+            "a floor below the next epoch changes nothing"
         );
     }
 

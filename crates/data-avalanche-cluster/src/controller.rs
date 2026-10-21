@@ -144,6 +144,9 @@ pub struct PipelineController {
 enum Left {
     /// The lease is gone: claim it again.
     Lost,
+    /// A table was written at `current_epoch`, past this lease's epoch: claim again, and take
+    /// this process's own lease over above it (DA-CLUS-14).
+    Fenced { current_epoch: u64 },
     /// The target became "don't own": the lease is released.
     Released,
     /// The target channel closed: the process is shutting down.
@@ -272,7 +275,11 @@ impl PipelineController {
                 continue;
             }
             let wait = match claim.step().await {
-                Ok(Claimed::Mine { lease, written }) => {
+                Ok(Claimed::Mine {
+                    lease,
+                    written,
+                    jumped,
+                }) => {
                     tracing::info!(
                         pipeline = %self.pipeline.name,
                         owner_epoch = lease.doc.owner_epoch,
@@ -286,8 +293,13 @@ impl PipelineController {
                         written,
                         Arc::clone(&self.metrics),
                     );
-                    match self.owned(run, &mut target).await {
+                    match self.owned(run, jumped, &mut target).await {
                         Left::Shutdown => return,
+                        Left::Fenced { current_epoch } => {
+                            claim.at_least(current_epoch.saturating_add(1));
+                            self.standby(None);
+                            continue;
+                        }
                         // Not this node's until a step says otherwise, though claiming fails.
                         Left::Lost => {
                             self.standby(None);
@@ -316,12 +328,23 @@ impl PipelineController {
     }
 
     /// Holds the lease and reconciles the worker until the lease is lost or let go.
-    async fn owned(&self, run: LeaseRun, target: &mut watch::Receiver<Target>) -> Left {
+    /// `jumped`: the term's epoch was raised past the lease's to clear a table's (DA-CLUS-14).
+    async fn owned(
+        &self,
+        run: LeaseRun,
+        jumped: bool,
+        target: &mut watch::Receiver<Target>,
+    ) -> Left {
         let _owned = Owned::new(&self.node);
-        self.reconcile(run, target).await
+        self.reconcile(run, jumped, target).await
     }
 
-    async fn reconcile(&self, run: LeaseRun, target: &mut watch::Receiver<Target>) -> Left {
+    async fn reconcile(
+        &self,
+        run: LeaseRun,
+        jumped: bool,
+        target: &mut watch::Receiver<Target>,
+    ) -> Left {
         let mut worker: Option<Running> = None;
         let mut error: Option<Failure> = None;
         let mut dumped = false;
@@ -471,14 +494,41 @@ impl PipelineController {
                                 );
                                 retry = Some((at, e.to_string()));
                             }
-                            Recovery::Lease => {
-                                tracing::error!(
-                                    pipeline = %self.pipeline.name,
-                                    "worker stopped for the lease: {e}"
-                                );
-                                let _ = run.stop().await;
-                                return Left::Lost;
-                            }
+                            Recovery::Lease => match e {
+                                // DA-CLUS-14: the term already jumped past the table's epoch,
+                                // and the table moved past it again. Another lease store
+                                // writes to this lake; climbing on would defeat the fence.
+                                WorkerError::Fenced {
+                                    table,
+                                    current_epoch,
+                                } if jumped => {
+                                    let why = format!(
+                                        "{table} was written at owner epoch {current_epoch}, past this lease's {}, which had already been raised past the table's: another lease store (another globals.state) writes to this lake. Let one cluster write it, then stop and resume the pipeline",
+                                        run.owner_epoch
+                                    );
+                                    tracing::error!(pipeline = %self.pipeline.name, "pipeline in ERROR: {why}");
+                                    error = Some(Failure {
+                                        error: why,
+                                        code: None,
+                                    });
+                                }
+                                WorkerError::Fenced { current_epoch, .. } => {
+                                    tracing::error!(
+                                        pipeline = %self.pipeline.name,
+                                        "worker stopped for the lease: {e}"
+                                    );
+                                    let _ = run.stop().await;
+                                    return Left::Fenced { current_epoch };
+                                }
+                                e => {
+                                    tracing::error!(
+                                        pipeline = %self.pipeline.name,
+                                        "worker stopped for the lease: {e}"
+                                    );
+                                    let _ = run.stop().await;
+                                    return Left::Lost;
+                                }
+                            },
                             Recovery::Error => {
                                 let code = e.code().map(str::to_owned);
                                 tracing::error!(
@@ -1053,10 +1103,12 @@ mod tests {
         );
     }
 
-    /// A worker that ends for the lease (a newer epoch wrote a table) goes back to claiming: the
-    /// next term runs under a new epoch, never `ERROR`.
+    /// A worker that ends for the lease (a newer epoch wrote a table) goes back to claiming. The
+    /// lease still names this node, at epoch 1, while the table was written at 5 (a moved or
+    /// restored `globals.state`, DA-CLUS-14): the next term jumps to 6 at once, not one epoch
+    /// per worker run.
     #[tokio::test(start_paused = true)]
-    async fn a_worker_fenced_goes_back_to_the_lease() {
+    async fn a_worker_fenced_goes_back_to_the_lease_above_the_tables_epoch() {
         let store = ScriptedStore::new();
         let docs = pipeline_docs();
         let f = TestFactory::new(&["a"]);
@@ -1064,13 +1116,51 @@ mod tests {
         until(&mut n.status, "running", is(Actual::Running)).await;
         f.source.commit(FakeTxn::new().insert(&t("a"), row(1)));
         eventually("the first row lands", || f.ids("a") == [1]).await;
-        f.sink.take_over(&t("a"), 2);
+        f.sink.take_over(&t("a"), 5);
         f.source.commit(FakeTxn::new().insert(&t("a"), row(2)));
-        until(&mut n.status, "running under epoch 2", |s| {
-            s.actual == Some(Actual::Running) && s.owner_epoch == Some(2)
+        until(&mut n.status, "running under epoch 6", |s| {
+            s.actual == Some(Actual::Running) && s.owner_epoch == Some(6)
         })
         .await;
         eventually("the second row lands", || f.ids("a") == [1, 2]).await;
+        assert_eq!(f.builds(), 2, "one worker run per fence");
+    }
+
+    /// The table moves past the jumped epoch again: another lease store writes to the lake.
+    /// The pipeline goes to `ERROR` and keeps its lease, rather than climbing.
+    #[tokio::test(start_paused = true)]
+    async fn a_second_fence_past_a_jumped_epoch_is_an_error() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a"]);
+        let mut n = node("n1", &store, &docs, &f);
+        until(&mut n.status, "running", is(Actual::Running)).await;
+        f.source.commit(FakeTxn::new().insert(&t("a"), row(1)));
+        eventually("the first row lands", || f.ids("a") == [1]).await;
+        f.sink.take_over(&t("a"), 5);
+        f.source.commit(FakeTxn::new().insert(&t("a"), row(2)));
+        until(&mut n.status, "running under epoch 6", |s| {
+            s.owner_epoch == Some(6)
+        })
+        .await;
+        eventually("the second row lands", || f.ids("a") == [1, 2]).await;
+        f.sink.take_over(&t("a"), 9);
+        f.source.commit(FakeTxn::new().insert(&t("a"), row(3)));
+        until(&mut n.status, "ERROR", |s| {
+            matches!(s.actual, Some(Actual::Error { .. }))
+        })
+        .await;
+        let Some(Actual::Error { error, code }) = n.status.borrow().actual.clone() else {
+            unreachable!()
+        };
+        assert!(error.contains("another lease store"), "{error}");
+        assert_eq!(code, None);
+        assert_eq!(n.status.borrow().owner_epoch, Some(6), "the lease is kept");
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(f.builds(), 2, "no climb");
+        assert_eq!(f.ids("a"), [1, 2]);
+        let lease = leases(&store).observe("p").await.unwrap().unwrap();
+        assert_eq!((lease.doc.owner_epoch, lease.doc.released), (6, false));
     }
 
     /// A worker that failed transiently, then a start that fails for good: `ERROR` holds, and
