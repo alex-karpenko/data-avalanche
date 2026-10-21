@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-16
+updated: 2026-10-21
 domain: Architecture
 status: Specification (supersedes the Configuration_file_model.md draft)
 tags: [architecture, configuration, spec, validation, multi-sink, iceberg, delta-lake]
@@ -193,7 +193,7 @@ where `PG_PORT=5432` yields the integer `5432`; a non-numeric value is a type er
 Fields named `cert`, `key`, `ca` accept **either** a filesystem path **or** inline PEM data
 **or** an `${ENV}` reference resolving to either. Detection: a value beginning with
 `-----BEGIN` is treated as inline PEM; otherwise it is a path. This applies uniformly to
-`globals.api.tls`, `globals.cluster.memberlist.tls`, `source.ssl_*`, and `sink.iceberg.catalog.*.tls`.
+`globals.api.tls`, `source.ssl_*`, and `sink.iceberg.catalog.*.tls`.
 
 ### 4.5 Booleans, lists, maps
 
@@ -435,8 +435,15 @@ process accidentally attaching to the same `globals.state` bucket (e.g. a rollin
 
 #### 6.5.1 `globals.cluster.memberlist`
 
-SWIM gossip transport (the `memberlist` crate). All fields are **PROC** (transport binding and
-gossip timers are fixed for a process lifetime) unless noted.
+SWIM gossip over UDP (the `foca` crate, driven by the cluster crate; Q-M8-1): probes, indirect
+probes, suspicion and infection-style dissemination. All fields are **PROC** (transport binding and
+gossip timers are fixed for a process lifetime) unless noted. The block keeps its name.
+
+Every gossip packet carries a keyed BLAKE3 MAC; the key is derived from the cluster anchor's
+`fingerprint_key` (§6.2), so every node that reads the cluster's `globals.state` has it and no
+config carries it. A packet whose MAC doesn't match is dropped: a node of another cluster (or of
+this cluster on another `globals.state`) can't join or disturb it. The packets aren't encrypted:
+they carry node names, addresses, phases and the config generation, never data or secrets.
 
 | Field | Type | Required | Default | Notes |
 |---|---|---|---|---|
@@ -445,19 +452,21 @@ gossip timers are fixed for a process lifetime) unless noted.
 | `advertise_addr` | string | no | `""` (bind_addr or first private IP) | Address advertised to peers. |
 | `advertise_port` | integer | no | `7946` | Port advertised to peers. |
 | `bind_addr` | list<ip> | no | `[0.0.0.0]` | Listen addresses. |
-| `bind_port` | integer | no | `7946` | UDP/TCP gossip port. |
-| `packet_dial_timeout` | Duration | no | `5s` | |
-| `packet_write_timeout` | Duration | no | `5s` | |
-| `compression_enabled` | bool | no | `true` | Snappy compression for gossip. |
-| `gossip_interval` | Duration | no | `200ms` | |
-| `gossip_nodes` | integer | no | `3` | Peers gossiped per interval. |
-| `probe_interval` | Duration | no | `1s` | |
-| `probe_timeout` | Duration | no | `500ms` | |
-| `dead_node_reclaim_time` | Duration | no | `30s` | Bounds the stale-membership window (relevant to split-brain, G-8). |
-| `push_pull_interval` | Duration | no | `30s` | Full-state sync cadence. |
-| `retransmit_factor` | integer | no | `4` | Retransmit multiplier. |
-| `lifeguard_enabled` | bool | no | `true` | Lifeguard extensions to SWIM (local health aware probing/suspicion; G-23). Recommended equal cluster-wide. |
-| `tls` | object | no | `{enabled:false}` | §6.5.2. |
+| `bind_port` | integer | no | `7946` | UDP gossip port. |
+| `gossip_interval` | Duration | no | `200ms` | How often a node sends its pending updates (V-122). |
+| `gossip_nodes` | integer | no | `3` | Peers gossiped per interval (V-122). |
+| `probe_interval` | Duration | no | `1s` | How often a node probes a peer; a suspect is declared down after `4 · max(1, log10 n) · probe_interval` for `n` members (V-122). Recommended equal cluster-wide. |
+| `probe_timeout` | Duration | no | `500ms` | How long a probe waits for its answer before probing indirectly; below `probe_interval` (V-122). |
+| `push_pull_interval` | Duration | no | `30s` | How often a node asks a peer for the members it knows, and announces itself to the members it holds down, so a healed partition rejoins (V-122). |
+| `retransmit_factor` | integer | no | `4` | An update is sent `retransmit_factor · ceil(log10(n + 1))` times for `n` members (V-122). |
+
+memberlist's TCP, compression, Lifeguard and TLS settings (`packet_dial_timeout`,
+`packet_write_timeout`, `compression_enabled`, `lifeguard_enabled`, `tls`) and
+`dead_node_reclaim_time` are not keys (§15 item 27): the gossip runs on UDP alone, a restarted node
+at a new address is accepted at once (its identity is newer), and a down member is remembered so
+that a partition heals. On Kubernetes the per-node values (`node_name`, `advertise_addr`) come from
+the pod's environment through `${VAR}` (§4.3): a node runs the cluster's config generation, not its
+own file (`Clustering_Architecture_Research.md` §9.3).
 
 **`node_name` sourcing (D-1).** `node_name` is the node's stable identity for both gossip and
 consistent-hash ring placement, so it must be **stable across restarts of the same logical worker**
@@ -467,18 +476,6 @@ changing pod names would reshuffle the derived ring on every restart. For **stan
 use a persisted-once UUID on a durable path, falling back to `${HOSTNAME}` only when no durable volume
 exists. A restarted process keeps its `node_name` but bumps a per-process `incarnation` so peers
 discard its stale in-flight gossip.
-
-#### 6.5.2 `globals.cluster.memberlist.tls`
-
-| Field | Type | Required | Default | Notes |
-|---|---|---|---|---|
-| `enabled` | bool | no | `false` | |
-| `cert` | PEM/path | conditional | — | Required when `enabled`. |
-| `key` | PEM/path | conditional | — | Required when `enabled`. |
-| `ca` | PEM/path | no | — | Custom CA. Presence implies peer-certificate verification (mutual TLS); absence = server trust via system store. |
-
-> Fixes the draft's `cat:` → `ca:` typo (already corrected upstream; restated here as the
-> canonical field name).
 
 ### 6.6 `globals.tracing`
 
@@ -1033,8 +1030,8 @@ value, and the result is checked for **presence** (non-empty) and **content vali
   non-empty file (V-069).
 - A file reference is read only when the setting that uses it is in effect; an unused one is not
   read and cannot fail the load. In effect means: `globals.api` `credentials_file` / `jwt` /
-  `oauth2` material only for the matching `auth` mode; `tls.cert`/`key`/`ca` (`globals.api.tls`,
-  `memberlist.tls`) only when that block's `enabled` is `true`; `source.ssl_cert`/`ssl_key`/`ssl_ca`
+  `oauth2` material only for the matching `auth` mode; `tls.cert`/`key`/`ca` (`globals.api.tls`)
+  only when that block's `enabled` is `true`; `source.ssl_cert`/`ssl_key`/`ssl_ca`
   only when `ssl_mode` ≠ `disable`; catalog auth material only for the matching catalog `auth` mode;
   catalog TLS material (`sink.iceberg.catalog.*.tls`) only when that block's `enabled` is `true`
   (a block with no `enabled` field is always in effect).
@@ -1279,6 +1276,7 @@ errors.
 | V-118 | `source.timeouts.snapshot` | ≥ 10s. | error | pipeline |
 | V-119 | `sink.delta.merge_memory_limit` | ≥ 16 MiB when set. | error | pipeline |
 | V-121 | `source.mysql.heartbeat` | Between `1s` and `4294967s` (the server's heartbeat period range). | error | pipeline |
+| V-122 | `globals.cluster.memberlist` gossip timers | `gossip_interval`, `probe_interval`, `probe_timeout` and `push_pull_interval` above zero; `gossip_nodes` and `retransmit_factor` at least 1; `probe_timeout` below `probe_interval`. | error | config |
 
 ### 13.4 Cross-field / conditional
 
@@ -1332,7 +1330,6 @@ errors.
 | V-099 | `globals.api.role_mapping` | Keys ∈ {viewer, operator, admin}; values are lists of strings. | error | config |
 | V-100 | `globals.api.role_mapping` with `auth ∈ {none, basic}` | Ignored — roles come from the open mode / single basic principal. | warning | config |
 | V-053 | `globals.api.tls.enabled = true` | Requires `cert` + `key`. | error | config |
-| V-054 | `globals.cluster.memberlist.tls.enabled = true` | Requires `cert` + `key`. | error | config |
 
 ### 13.7 Identity / naming
 
@@ -1366,7 +1363,7 @@ a runtime concern, §1.4).
 | V-063 | any `${VAR}` | Unset with no `:-default`. | error | config / pipeline |
 | V-067 | any `credentials_file` (incl. `oauth2.credentials_file`) | Resolved path exists and is readable; content is non-empty, valid JSON, and contains the required non-empty fields (`user`+`password`, or `client_id`+`client_secret`). Checked only when the setting that uses it is in effect (§11). | error | config / pipeline |
 | V-071 | `sink.iceberg.catalog.rest.token_file` | Resolved path exists and is readable; content (the raw token, trailing whitespace trimmed) is non-empty. | error | pipeline |
-| V-068 | TLS material (`cert`/`key`/`ca` across `globals.api`, `memberlist`, `source.ssl_*`, `sink.iceberg.catalog.*`) | Resolved value (inline / file / env) is non-empty and parses as valid PEM (and a private key where a key is expected). Checked only when the setting that uses it is in effect (§11). | error | config / pipeline |
+| V-068 | TLS material (`cert`/`key`/`ca` across `globals.api`, `source.ssl_*`, `sink.iceberg.catalog.*`) | Resolved value (inline / file / env) is non-empty and parses as valid PEM (and a private key where a key is expected). Checked only when the setting that uses it is in effect (§11). | error | config / pipeline |
 | V-069 | any other referenced file (e.g. `sink.iceberg.catalog.hive.kerberos.keytab`) | Resolved path exists, is readable, and is non-empty. Checked only when the setting that uses it is in effect (§11). | error | pipeline |
 | V-078 | `tables.column_type_overrides` values | Each value parses in the sink-neutral logical type grammar (§9.3); else error `"invalid logical type <value> in column_type_overrides for <table>.<column>"`. | error | pipeline |
 | V-079 | `tables.numeric_overflow_action = error` with any source `numeric` column lacking declared precision | Such a column may halt the table unexpectedly under `error`; consider a `column_type_overrides` entry. (Emitted at schema resolution.) | warning | pipeline |
@@ -1421,13 +1418,6 @@ globals:
       probe_interval: 1s
       probe_timeout: 500ms
       push_pull_interval: 30s
-      dead_node_reclaim_time: 30s
-      compression_enabled: true
-      tls:
-        enabled: true
-        cert: /etc/cdc/tls/gossip.crt
-        key: ${GOSSIP_TLS_KEY}
-        ca: /etc/cdc/tls/gossip-ca.crt
   tracing:
     otlp_endpoint: http://otel-collector.observability:4317
     sample_ratio: 0.05
@@ -1579,7 +1569,7 @@ Every deviation, so nothing is silent:
     **V-083…V-093**. Source: `research/Multi_Sink_Architecture_and_Delta_Lake.md`.
 
 20. **Research-field promotion (2026-09-26, gap report §19.1 C-1…C-16)** — cluster lease /
-    rebalance / discovery fields (§6.5, `lifeguard_enabled` §6.5.1); `globals.tracing` (§6.6);
+    rebalance / discovery fields (§6.5, `lifeguard_enabled` §6.5.1, removed in item 27); `globals.tracing` (§6.6);
     `globals.azure.account_name` (§6.7); `globals.api.role_mapping` + RBAC pointer (§6.3);
     `source.postgres.slot_management` / `slot_on_orphan` / `max_wal_lag_bytes`;
     `source.mysql.binlog_purge_action`; `tables.snapshots.chunk_size`, `tables.primary_key`,
@@ -1618,6 +1608,13 @@ Every deviation, so nothing is silent:
 26. **M7a planning (2026-10-14, D-M7a.21)** — §9.2.2 `heartbeat`: the watchdog finds the stream's
     binlog dump by its connection id in `information_schema.PROCESSLIST` (visible to a user
     without `PROCESS`), not by `server_id`.
+27. **M8a planning (2026-10-21, Q-M8-1, Q-M8-2)** — the gossip is `foca` over UDP, not the
+    `memberlist` crate (it failed the M8 probe gate). §6.5.1 loses the keys only `memberlist`
+    used (`packet_dial_timeout`, `packet_write_timeout`, `compression_enabled`,
+    `lifeguard_enabled`) and `dead_node_reclaim_time` (a node's newer identity is accepted at
+    once; a down member is remembered so a partition heals); §6.5.2 `memberlist.tls` is removed
+    with **V-054**: gossip packets carry a MAC keyed from the anchor instead. New rule **V-122**
+    (the gossip timers). The block keeps the name `memberlist`.
 
 None of these change the **decided** catalog-auth schema (hive Thrift `none/ldap/kerberos`;
 rest HTTP `none/bearer/oauth2/sigv4`) — those are reproduced verbatim from
