@@ -21,6 +21,7 @@ gethostname.workspace = true
 getrandom.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
+xxhash-rust.workspace = true
 
 [dev-dependencies]
 arrow-array.workspace = true

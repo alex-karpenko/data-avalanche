@@ -79,6 +79,8 @@ prometheus-client = "=0.25.1"
 gethostname = "1.1"
 clap = { version = "4.6.7", features = ["derive"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+# The cluster (M8a, roadmap §2.1): the ring's hash (the anchor's `hash_algo: xxh3`).
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 # Dependencies build without debug info: DataFusion's full debug build is over 6 GB, which fills
 # CI runners. Workspace crates keep it.

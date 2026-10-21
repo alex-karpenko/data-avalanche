@@ -7,6 +7,7 @@ pub mod claim;
 pub mod controller;
 pub mod lease;
 pub mod reconciler;
+pub mod ring;
 #[cfg(test)]
 mod test_support;
 
@@ -17,3 +18,4 @@ pub use controller::{
 };
 pub use lease::{LeaseGuard, LeaseRun, LeaseTiming, RenewEnd, RenewState};
 pub use reconciler::{ClusterReconciler, node_identity};
+pub use ring::Ring;
