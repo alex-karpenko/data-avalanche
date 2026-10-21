@@ -345,6 +345,7 @@ impl PipelineController {
         jumped: bool,
         target: &mut watch::Receiver<Target>,
     ) -> Left {
+        let mut jumped = jumped;
         let mut worker: Option<Running> = None;
         let mut error: Option<Failure> = None;
         let mut dumped = false;
@@ -362,8 +363,10 @@ impl PipelineController {
                     // Cut off or not, the worker and its writer are gone: the lease stays held.
                     self.drain(w).await;
                 }
-                // A stop clears an error: the resume after it runs the pipeline again.
+                // A stop clears an error: the resume after it runs the pipeline again. It also
+                // spends the jump: the next fence climbs once more, as the ERROR's remedy says.
                 error = None;
+                jumped = false;
                 dumped = false;
                 retry = None;
                 failures = 0;
@@ -1161,6 +1164,47 @@ mod tests {
         assert_eq!(f.ids("a"), [1, 2]);
         let lease = leases(&store).observe("p").await.unwrap().unwrap();
         assert_eq!((lease.doc.owner_epoch, lease.doc.released), (6, false));
+    }
+
+    /// The ERROR's remedy: a stop and a resume. The stop spends the jump, so the resume's fence
+    /// (the table at 9, the lease at 6) climbs once more, to 10.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_and_resume_after_the_error_jumps_once_more() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a"]);
+        let mut n = node("n1", &store, &docs, &f);
+        until(&mut n.status, "running", is(Actual::Running)).await;
+        f.source.commit(FakeTxn::new().insert(&t("a"), row(1)));
+        eventually("the first row lands", || f.ids("a") == [1]).await;
+        f.sink.take_over(&t("a"), 5);
+        f.source.commit(FakeTxn::new().insert(&t("a"), row(2)));
+        until(&mut n.status, "running under epoch 6", |s| {
+            s.owner_epoch == Some(6)
+        })
+        .await;
+        eventually("the second row lands", || f.ids("a") == [1, 2]).await;
+        f.sink.take_over(&t("a"), 9);
+        f.source.commit(FakeTxn::new().insert(&t("a"), row(3)));
+        until(&mut n.status, "ERROR", |s| {
+            matches!(s.actual, Some(Actual::Error { .. }))
+        })
+        .await;
+        docs.set_desired_state(DesiredState::Stopped).await.unwrap();
+        until(&mut n.status, "stopped", is(Actual::Stopped)).await;
+        docs.set_desired_state(DesiredState::Running).await.unwrap();
+        until(&mut n.status, "running under epoch 10", |s| {
+            s.actual == Some(Actual::Running) && s.owner_epoch == Some(10)
+        })
+        .await;
+        eventually("the third row lands", || f.ids("a") == [1, 2, 3]).await;
+        assert_eq!(
+            f.builds(),
+            4,
+            "one run per epoch, and the resume's fenced one"
+        );
+        let lease = leases(&store).observe("p").await.unwrap().unwrap();
+        assert_eq!((lease.doc.owner_epoch, lease.doc.released), (10, false));
     }
 
     /// A worker that failed transiently, then a start that fails for good: `ERROR` holds, and
