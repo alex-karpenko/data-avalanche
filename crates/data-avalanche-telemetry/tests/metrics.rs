@@ -148,12 +148,14 @@ fn a_pipeline_the_node_no_longer_owns_loses_its_series() {
     });
     m.owned_by(1);
     m.set_cluster_members(1);
+    m.set_ring_generation(3);
     p.remove();
     m.owned_by(-1);
     let text = m.encode();
     assert!(!text.contains("orders"), "{text}");
     assert!(text.contains("data_avalanche_owned_pipelines 0"), "{text}");
     assert!(text.contains("data_avalanche_cluster_members 1"), "{text}");
+    assert!(text.contains("data_avalanche_ring_generation 3"), "{text}");
 }
 
 #[test]

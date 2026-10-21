@@ -120,6 +120,8 @@ pub struct ControllerDeps {
     pub settings: ControllerSettings,
     /// Caps the workers in Phase 0 at once (`max_concurrent_takeovers`).
     pub starts: Arc<Semaphore>,
+    /// Caps the workers handed off at once (`max_concurrent_handoffs`, Clustering §8.5).
+    pub handoffs: Arc<Semaphore>,
 }
 
 /// One pipeline's controller.
@@ -134,6 +136,7 @@ pub struct PipelineController {
     metrics: Arc<PipelineMetrics>,
     settings: ControllerSettings,
     starts: Arc<Semaphore>,
+    handoffs: Arc<Semaphore>,
     status: watch::Sender<ControllerStatus>,
 }
 
@@ -165,6 +168,7 @@ enum Event {
     Ended(Result<Result<Exit, WorkerError>, tokio::task::JoinError>),
     Status { open: bool },
     Start(OwnedSemaphorePermit),
+    HandOff(OwnedSemaphorePermit),
     Due,
     Poll,
 }
@@ -184,6 +188,14 @@ struct Running {
     reconnects: u64,
 }
 
+/// A worker never outlives its controller: a controller that panics drops its `Running`, and
+/// the worker task goes with it before the next controller claims the lease (DA-OPS-7).
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 impl PipelineController {
     /// `docs` are the pipeline's state documents.
     pub fn new(
@@ -192,6 +204,17 @@ impl PipelineController {
         deps: &ControllerDeps,
     ) -> (Self, watch::Receiver<ControllerStatus>) {
         let (status, rx) = watch::channel(ControllerStatus::default());
+        (Self::reporting(pipeline, docs, deps, status), rx)
+    }
+
+    /// A controller that publishes its status into `status`: a controller started again after
+    /// its task ended keeps its predecessor's channel.
+    pub fn reporting(
+        pipeline: Pipeline,
+        docs: PipelineDocs,
+        deps: &ControllerDeps,
+        status: watch::Sender<ControllerStatus>,
+    ) -> Self {
         let labels = PipelineLabels {
             pipeline: pipeline.name.clone(),
             source_host: pipeline.source.host.clone(),
@@ -201,21 +224,19 @@ impl PipelineController {
             deps.metrics
                 .pipeline(labels, pipeline.sink.metrics.per_table),
         );
-        (
-            Self {
-                pipeline,
-                docs,
-                leases: deps.leases.clone(),
-                holder: deps.holder.clone(),
-                factory: Arc::clone(&deps.factory),
-                node: deps.metrics.clone(),
-                metrics,
-                settings: deps.settings.clone(),
-                starts: Arc::clone(&deps.starts),
-                status,
-            },
-            rx,
-        )
+        Self {
+            pipeline,
+            docs,
+            leases: deps.leases.clone(),
+            holder: deps.holder.clone(),
+            factory: Arc::clone(&deps.factory),
+            node: deps.metrics.clone(),
+            metrics,
+            settings: deps.settings.clone(),
+            starts: Arc::clone(&deps.starts),
+            handoffs: Arc::clone(&deps.handoffs),
+            status,
+        }
     }
 
     /// Runs until the target channel closes; the lease is released on the way out.
@@ -323,11 +344,20 @@ impl PipelineController {
                     _ => {}
                 }
             }
+            // "Don't own": with nothing to drain the lease goes back now; a worker is handed off
+            // once a hand-off permit is free, unless the target turns back to "own" first.
+            let hand_off = *target.borrow() == Target::DontOwn;
+            if hand_off && worker.is_none() {
+                self.give_back(run).await;
+                self.standby(None);
+                return Left::Released;
+            }
             let due = retry.as_ref().map(|(at, _)| *at);
             // A worker may run: no error, not dumped, and a desired state read that isn't
             // "stopped". Only then does a retry's time matter (else its arm would be ready at
             // every turn).
             let may_run = worker.is_none()
+                && !hand_off
                 && error.is_none()
                 && !dumped
                 && desired.is_some_and(|d| d != DesiredState::Stopped);
@@ -341,6 +371,7 @@ impl PipelineController {
                 retry.as_ref().map(|(_, e)| e.as_str()),
             );
             let starts = Arc::clone(&self.starts);
+            let handoffs = Arc::clone(&self.handoffs);
             let event = {
                 let (task, status) = match worker.as_mut() {
                     Some(Running { task, handle, .. }) => (Some(task), Some(&mut handle.status)),
@@ -365,6 +396,9 @@ impl PipelineController {
                     permit = starts.acquire_owned(), if want_start => {
                         Event::Start(permit.expect("the start semaphore isn't closed"))
                     }
+                    permit = handoffs.acquire_owned(), if hand_off => {
+                        Event::HandOff(permit.expect("the hand-off semaphore isn't closed"))
+                    }
                     () = async {
                         match due {
                             Some(at) => tokio::time::sleep_until(at).await,
@@ -376,10 +410,10 @@ impl PipelineController {
             };
             match event {
                 Event::Lost => {
-                    if let Some(w) = worker.take() {
+                    if let Some(mut w) = worker.take() {
                         w.task.abort();
                         // Ended (dropped) before the next term starts: its writer goes with it.
-                        let _ = w.task.await;
+                        let _ = (&mut w.task).await;
                         self.metrics.worker_ended();
                     }
                     let reason = match run.stop().await {
@@ -389,30 +423,15 @@ impl PipelineController {
                     tracing::error!(pipeline = %self.pipeline.name, "lease lost: {reason}");
                     return Left::Lost;
                 }
-                Event::Target { closed } => {
-                    if closed || *target.borrow() == Target::DontOwn {
-                        let drained = match worker.take() {
-                            Some(w) => self.drain(w).await,
-                            None => true,
-                        };
-                        if drained {
-                            self.give_back(run).await;
-                        } else {
-                            // Clustering §8.3: a worker cut off may have left a write in
-                            // flight; the lease expires instead of being handed over now.
-                            let _ = run.stop().await;
-                            tracing::warn!(
-                                pipeline = %self.pipeline.name,
-                                "lease left to expire after the drain was cut off"
-                            );
-                        }
-                        self.standby(None);
-                        return if closed {
-                            Left::Shutdown
-                        } else {
-                            Left::Released
-                        };
-                    }
+                // A shutdown drains at once; "don't own" waits for its hand-off permit.
+                Event::Target { closed: true } => {
+                    self.let_go(run, worker.take()).await;
+                    return Left::Shutdown;
+                }
+                Event::Target { closed: false } => {}
+                Event::HandOff(_permit) => {
+                    self.let_go(run, worker.take()).await;
+                    return Left::Released;
                 }
                 Event::Ended(ended) => {
                     let mut w = worker.take().expect("a worker ended");
@@ -572,6 +591,26 @@ impl PipelineController {
         self.observe(&mut w);
         self.metrics.worker_ended();
         drained
+    }
+
+    /// Drains the worker and releases the lease; a worker cut off leaves it to expire.
+    async fn let_go(&self, run: LeaseRun, worker: Option<Running>) {
+        let drained = match worker {
+            Some(w) => self.drain(w).await,
+            None => true,
+        };
+        if drained {
+            self.give_back(run).await;
+        } else {
+            // Clustering §8.3: a worker cut off may have left a write in flight; the lease
+            // expires instead of being handed over now.
+            let _ = run.stop().await;
+            tracing::warn!(
+                pipeline = %self.pipeline.name,
+                "lease left to expire after the drain was cut off"
+            );
+        }
+        self.standby(None);
     }
 
     async fn give_back(&self, run: LeaseRun) {

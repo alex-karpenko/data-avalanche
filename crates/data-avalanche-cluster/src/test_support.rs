@@ -393,6 +393,7 @@ pub(crate) fn deps(
         metrics: Metrics::new(),
         settings: settings(),
         starts: Arc::new(tokio::sync::Semaphore::new(1)),
+        handoffs: Arc::new(tokio::sync::Semaphore::new(2)),
     }
 }
 
@@ -501,6 +502,35 @@ impl crate::Wire for Port {
 /// `10.0.0.<n>:7946`, a node's address on the hub.
 pub(crate) fn at(n: u8) -> SocketAddr {
     SocketAddr::from(([10, 0, 0, n], 7946))
+}
+
+/// `me`'s view of the members: each `(name, phase, suspect)`, the n-th at `at(n)`.
+pub(crate) fn members(me: &str, nodes: &[(&str, crate::Phase, bool)]) -> crate::Members {
+    let nodes = nodes
+        .iter()
+        .zip(1..)
+        .map(|((name, phase, suspect), n)| {
+            let member = crate::Member {
+                addr: at(n),
+                meta: crate::NodeMeta {
+                    phase: *phase,
+                    config_generation: 1,
+                    build: "1.0.0".into(),
+                },
+                suspect: *suspect,
+            };
+            ((*name).to_owned(), member)
+        })
+        .collect();
+    crate::Members {
+        me: me.into(),
+        nodes,
+    }
+}
+
+/// `me` alone, active.
+pub(crate) fn alone(me: &str) -> crate::Members {
+    members(me, &[(me, crate::Phase::Active, false)])
 }
 
 mod hub_tests {

@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use data_avalanche_cluster::{
-    ClusterReconciler, ControllerDeps, ControllerSettings, LeaseTiming, node_identity,
+    ClusterReconciler, ControllerDeps, ControllerSettings, LeaseTiming, Member, Members, NodeMeta,
+    Phase, ReconcilerSettings, node_identity,
 };
 use data_avalanche_config::{
     Diagnostic, FingerprintKey, ProcessEnv, Report, ResolvedConfig, Severity, load_str,
@@ -15,7 +16,7 @@ use data_avalanche_pipeline::{Backoff, Tuning};
 use data_avalanche_state::Leases;
 use data_avalanche_telemetry::Metrics;
 use thiserror::Error;
-use tokio::sync::{Semaphore, oneshot};
+use tokio::sync::{Semaphore, oneshot, watch};
 
 use crate::http::{self, Http};
 use crate::startup::{Buckets, join};
@@ -145,12 +146,30 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         starts: Arc::new(Semaphore::new(
             usize::try_from(c.max_concurrent_takeovers).unwrap_or(usize::MAX),
         )),
+        handoffs: Arc::new(Semaphore::new(
+            usize::try_from(c.max_concurrent_handoffs).unwrap_or(usize::MAX),
+        )),
     };
+    // This node alone until the gossip runs.
+    let me = Member {
+        addr: ([0, 0, 0, 0], 0).into(),
+        meta: NodeMeta {
+            phase: Phase::Active,
+            config_generation: 0,
+            build: env!("CARGO_PKG_VERSION").to_owned(),
+        },
+        suspect: false,
+    };
+    let (_alone, members) = watch::channel(Members {
+        me: deps.holder.node_id.clone(),
+        nodes: [(deps.holder.node_id.clone(), me)].into(),
+    });
     let mut pipelines = Vec::new();
     for p in config.pipelines.values() {
         pipelines.push((p.clone(), buckets.pipeline_docs(p)?));
     }
-    let reconciler = ClusterReconciler::start(pipelines, &deps);
+    let reconciler =
+        ClusterReconciler::start(pipelines, &deps, members, ReconcilerSettings::new(c));
     ready.store(true, Ordering::SeqCst);
     shutdown_signal().await;
     tracing::info!("shutting down: draining every pipeline and releasing its lease");

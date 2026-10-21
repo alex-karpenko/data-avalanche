@@ -104,34 +104,9 @@ impl Placement {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::at;
-    use crate::{Member, NodeMeta};
+    use crate::test_support::members;
 
     const STABLE: Duration = Duration::from_secs(15);
-
-    /// `me`'s view: each `(name, phase, suspect)`.
-    fn members(me: &str, nodes: &[(&str, Phase, bool)]) -> Members {
-        let nodes = nodes
-            .iter()
-            .enumerate()
-            .map(|(i, (name, phase, suspect))| {
-                let member = Member {
-                    addr: at(u8::try_from(i).unwrap() + 1),
-                    meta: NodeMeta {
-                        phase: *phase,
-                        config_generation: 1,
-                        build: "1.0.0".into(),
-                    },
-                    suspect: *suspect,
-                };
-                ((*name).to_owned(), member)
-            })
-            .collect();
-        Members {
-            me: me.into(),
-            nodes,
-        }
-    }
 
     use Phase::{Active, Draining, Joining};
 

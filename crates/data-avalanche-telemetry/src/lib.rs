@@ -131,6 +131,7 @@ struct Families {
     lease_renew_latency: HistogramFamily,
     owned_pipelines: Gauge,
     cluster_members: Gauge,
+    ring_generation: Gauge,
     wal_lag_bytes: Family<Labels, Gauge>,
     source_reconnects: Family<Labels, Counter>,
     snapshot_rows_done: Family<Labels, Gauge>,
@@ -168,6 +169,7 @@ impl Metrics {
             lease_renew_latency: Family::new_with_constructor(renew_latency),
             owned_pipelines: Gauge::default(),
             cluster_members: Gauge::default(),
+            ring_generation: Gauge::default(),
             wal_lag_bytes: Family::default(),
             source_reconnects: Family::default(),
             snapshot_rows_done: Family::default(),
@@ -208,6 +210,11 @@ impl Metrics {
             "cluster_members",
             "Members of the cluster this node sees",
             f.cluster_members.clone(),
+        );
+        r.register(
+            "ring_generation",
+            "Changes of the ring's nodes since this node started",
+            f.ring_generation.clone(),
         );
         r.register(
             "wal_lag_bytes",
@@ -269,6 +276,10 @@ impl Metrics {
 
     pub fn set_cluster_members(&self, n: usize) {
         self.families.cluster_members.set(gauge(n as u64));
+    }
+
+    pub fn set_ring_generation(&self, generation: u64) {
+        self.families.ring_generation.set(gauge(generation));
     }
 
     /// The handle that sets one pipeline's series. `per_table` is `sink.metrics.per_table`.
