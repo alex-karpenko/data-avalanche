@@ -4,9 +4,10 @@
 //! one that becomes eligible (a join, a rejoin) is added only once it stayed eligible for
 //! `rebalance_stabilization`, so a flapping node never grabs and drops pipelines.
 //!
-//! An empty ring is filled at once: a node that starts, having joined the gossip, takes the
-//! eligible peers it finds as they are (their rings already hold them), and itself at once only
-//! when it has no eligible peer (a lone node, or the first of a cold start).
+//! A ring with no surviving node is filled at once, in the same update that emptied it: a node
+//! that starts, having joined the gossip, takes the eligible peers it finds as they are (their
+//! rings already hold them), and itself at once only when it has no eligible peer (a lone node,
+//! or the first of a cold start).
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -51,7 +52,14 @@ impl Placement {
         for name in &eligible {
             self.eligible.entry((*name).to_owned()).or_insert(now);
         }
-        let mut next: Vec<&str> = if self.ring.is_empty() {
+        let survivors: Vec<&str> = self
+            .ring
+            .nodes()
+            .iter()
+            .map(String::as_str)
+            .filter(|n| self.eligible.contains_key(*n))
+            .collect();
+        let mut next: Vec<&str> = if survivors.is_empty() {
             let peers: Vec<&str> = eligible
                 .iter()
                 .copied()
@@ -59,12 +67,7 @@ impl Placement {
                 .collect();
             if peers.is_empty() { eligible } else { peers }
         } else {
-            self.ring
-                .nodes()
-                .iter()
-                .map(String::as_str)
-                .filter(|n| self.eligible.contains_key(*n))
-                .collect()
+            survivors
         };
         for (name, since) in &self.eligible {
             if now.duration_since(*since) >= self.stabilization && !next.contains(&name.as_str()) {
@@ -229,5 +232,24 @@ mod tests {
         assert!(p.update(&members("a", &[("a", Draining, false)]), later));
         assert!(p.ring().is_empty());
         assert_eq!(p.ring().owner("orders"), None);
+    }
+
+    #[test]
+    fn a_ring_whose_nodes_all_go_is_filled_at_once() {
+        let mut p = Placement::new(128, STABLE);
+        let t = Instant::now();
+        let three = [
+            ("a", Active, false),
+            ("b", Active, false),
+            ("c", Active, false),
+        ];
+        p.update(&members("c", &three), t);
+        assert_eq!(nodes(&p), ["a", "b"]);
+        // c has waited 5 s of its 15 s, and a and b go down in the same update.
+        assert!(p.update(
+            &members("c", &[("c", Active, false)]),
+            t + Duration::from_secs(5)
+        ));
+        assert_eq!(nodes(&p), ["c"]);
     }
 }
