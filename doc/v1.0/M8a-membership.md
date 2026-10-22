@@ -8245,3 +8245,15 @@ two; after Task 13's fix, three; after the whole-branch review's fixes, 1150, ag
 suite passed 37/37 on PostgreSQL 18 (381 s) and on MySQL 8.4 (423 s), with no stray process; the
 workspace runs 1150 tests and the gates are clean. `mysql-84-nogtid` and `mariadb-118` run in the
 PR's CI.
+
+**The PR's first CI run** (at 3b821c9) failed one scenario on PostgreSQL 18, `mysql-84` and
+`mysql-84-nogtid` (`mariadb-118` passed): the pause's wait for the paused node's
+`lease_renew_failures_total{class="lost"}`. The loss was counted, but the controller's standby
+right after it dropped every series of the pipeline, that counter included (since M7), so the
+count lived only for the controller's teardown: local runs caught it, CI didn't, and a scrape
+would almost never see a lost lease. Fixed in the product (Oleksii's choice), c03f974: the standby
+keeps `lease_renew_failures_total`, a counter for the node's whole run, and drops the rest; a
+later term counts on. Tests: `a_lost_lease_stops_the_worker_and_the_lease_is_claimed_again` asserts
+the count in the standby and in the next term, and the telemetry removal test keeps the renew
+failures and counts on after it. The E2E assertion is unchanged; `cluster::` passed 4/4 on
+PostgreSQL 18 and on MySQL 8.4 at c03f974. The workspace still runs 1150 tests.
