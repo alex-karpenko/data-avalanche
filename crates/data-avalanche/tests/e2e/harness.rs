@@ -73,6 +73,11 @@ pub struct Options<'a> {
     /// Pipeline keys beyond `source`, `tables` and `sink`, one YAML line, e.g.
     /// `schema_evolution: { rescan_interval: 2s }`.
     pub pipeline: &'a str,
+    /// `globals.cluster` entries, each `, key: value` a line of the block, e.g.
+    /// `, rebalance_stabilization: 3s`.
+    pub cluster: &'a str,
+    /// `globals.cluster.memberlist` entries, e.g. `, join_members: ["127.0.0.1:7946"]`.
+    pub memberlist: &'a str,
     /// More pipelines, YAML under `pipelines:` (2-space indent); `@SCHEMA@`, `@PREFIX@` and
     /// `@BUCKET@` are replaced, `@INCLUDE@` by the pattern of every table of the test, and a line
     /// `@SOURCE(<suffix>)@` by the source block ([`E2e::source_block`]).
@@ -248,8 +253,8 @@ globals:
   cluster:
     lease_duration: 6s
     lease_renewal_interval: 2s
-    drain_timeout: 30s
-    memberlist: {{ node_name: "${{E2E_NODE}}", bind_addr: [127.0.0.1], bind_port: "${{E2E_GOSSIP_PORT}}", advertise_addr: 127.0.0.1, advertise_port: "${{E2E_ADVERTISE_PORT}}" }}
+    drain_timeout: 30s{cluster}
+    memberlist: {{ node_name: "${{E2E_NODE}}", bind_addr: [127.0.0.1], bind_port: "${{E2E_GOSSIP_PORT}}", advertise_addr: 127.0.0.1, advertise_port: "${{E2E_ADVERTISE_PORT}}"{memberlist} }}
 pipelines:
   {test}:
     id: {test}
@@ -266,6 +271,8 @@ pipelines:
             tables = self.qualify(o.tables),
             sink = o.sink,
             pipeline = o.pipeline,
+            cluster = o.cluster.replace(", ", "\n    "),
+            memberlist = o.memberlist,
         )
     }
 
@@ -276,7 +283,12 @@ pipelines:
 
     /// Starts the binary as another node, with its own name and API port.
     pub fn start_node(&self, node: &str) -> Proc {
-        self.spawn(node, free_port(), &[])
+        self.start_node_with(node, &[])
+    }
+
+    /// [`Self::start_node`] with more variables (a node's gossip ports).
+    pub fn start_node_with(&self, node: &str, env: &[(&str, &str)]) -> Proc {
+        self.spawn(node, free_port(), env)
     }
 
     /// Runs node `node` with its API on `port`, gossiping alone on a loopback port of its own;
@@ -439,12 +451,14 @@ pipelines:
 
     /// Waits until the lake's `table` has exactly the source's ids.
     pub async fn converged(&self, table: &str) {
+        self.converged_within(table, Duration::from_secs(60)).await;
+    }
+
+    /// [`Self::converged`], waiting at most `within`.
+    pub async fn converged_within(&self, table: &str, within: Duration) {
         let want = self.source_ids(table).await;
         let what = format!("{table} has the source's {} rows", want.len());
-        eventually(&what, Duration::from_secs(60), async || {
-            self.ids(table).await == want
-        })
-        .await;
+        eventually(&what, within, async || self.ids(table).await == want).await;
     }
 
     /// Whether the source streams to the pipeline now: PostgreSQL's slot has a walsender,
@@ -575,10 +589,29 @@ pipelines:
 
     /// The pipeline's lease in `globals.state`.
     pub async fn lease(&self) -> Option<Versioned<LeaseDoc>> {
+        self.lease_of(&self.test).await
+    }
+
+    /// Pipeline `id`'s lease in `globals.state`.
+    pub async fn lease_of(&self, id: &str) -> Option<Versioned<LeaseDoc>> {
         Leases::new(self.docs_at(&format!("{}/globals", self.prefix)))
-            .observe(&self.test)
+            .observe(id)
             .await
             .expect("the lease reads")
+    }
+
+    /// Drops the slot and publication of the pipeline whose source block took `suffix`
+    /// ([`Options::pipelines`]' `@SOURCE(<suffix>)@`), on PostgreSQL; [`Self::cleanup`] drops
+    /// only the test's own.
+    pub async fn drop_source(&self, suffix: &str) {
+        if let Source::Postgres { .. } = self.source {
+            let name = format!("{}{suffix}", self.schema);
+            drop_slot(&self.db, &name).await;
+            self.db
+                .exec(&format!("DROP PUBLICATION IF EXISTS {name}_pub"))
+                .await
+                .expect("the publication drops");
+        }
     }
 
     /// The pipeline's own documents, co-located with the lake (`<sink.prefix>/.pipeline-state`).
@@ -834,6 +867,16 @@ impl Proc {
             .expect("kill runs");
         assert!(sent.success());
         self.exit().await
+    }
+
+    /// Sends `signal` (`STOP`, `CONT`): a stop-the-world pause and its end.
+    pub fn signal(&self, signal: &str) {
+        let pid = self.child.id().to_string();
+        let sent = Command::new("kill")
+            .args([&format!("-{signal}"), &pid])
+            .status()
+            .expect("kill runs");
+        assert!(sent.success(), "kill -{signal}");
     }
 
     /// `kill -9`, as a host failure would.
