@@ -702,13 +702,14 @@ impl MySqlConnector {
             tracked.insert(s.table().clone(), t);
         }
         let at = from.to_tagged();
-        let action = self.mysql.binlog_purge_action;
+        let live = self.live();
+        let action = live.binlog_purge_action;
         let err = |e| purge_action(action, mysql(e, Some(&at)));
         let mut conn = self.conn.connect().await?;
         let id = conn.id();
         conn.query_drop(format!(
             "SET @master_heartbeat_period = {}",
-            self.mysql.heartbeat.as_nanos()
+            live.heartbeat.as_nanos()
         ))
         .await
         .map_err(err)?;
@@ -1351,7 +1352,7 @@ impl ChangeStream for MySqlStream {
             let ev = match self.events.next().await {
                 Some(Ok(ev)) => ev,
                 Some(Err(e)) => {
-                    let action = self.catalog.mysql.binlog_purge_action;
+                    let action = self.catalog.live().binlog_purge_action;
                     return Err(purge_action(action, mysql(e, Some(&at))));
                 }
                 None => {

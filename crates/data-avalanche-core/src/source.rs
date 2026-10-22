@@ -1,6 +1,7 @@
 //! The source connector contract (roadmap §3.6, Data-Flow Phases 0–2): what the pipeline asks of a
 //! source engine. Each source crate implements it; nothing here performs I/O.
 
+use std::any::Any;
 use std::fmt;
 
 use async_trait::async_trait;
@@ -399,6 +400,15 @@ pub trait SourceConnector: Send + Sync {
     /// Removes what the source created for the pipeline (PostgreSQL `auto_cleanup`: the slot and
     /// the publication). Called when a pipeline is deleted.
     async fn teardown(&self) -> Result<(), SourceError>;
+
+    /// Takes a reload's settings while the source runs (config §1.2, class R): `pipeline` is
+    /// the reloaded pipeline, a `data_avalanche_config::Pipeline`, which this crate doesn't
+    /// name. A setting read when a connection opens, at a prepare, a resolve or a teardown is
+    /// used from the next one; an open stream keeps what it opened with. A source with nothing
+    /// to take keeps this default, which ignores it.
+    fn reconfigure(&self, pipeline: &dyn Any) {
+        let _ = pipeline;
+    }
 }
 
 /// The change stream of one [`SourceConnector::open_stream`] call.
@@ -665,6 +675,7 @@ mod tests {
     #[test]
     fn the_traits_work_as_trait_objects() {
         let source: Box<dyn SourceConnector> = Box::new(OneTxn);
+        source.reconfigure(&"a source with nothing to take ignores it");
         let prepared = block_on(source.prepare(None, &[])).unwrap();
         assert!(matches!(
             prepared.plan,

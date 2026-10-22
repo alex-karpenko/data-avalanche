@@ -425,7 +425,7 @@ impl PgConnector {
             &self.pipeline.source.db,
             self.slot_name(),
             self.pg.slot_management,
-            self.pg.slot_on_orphan,
+            self.live().slot_on_orphan,
         ) {
             // pgoutput reads the publication as of each change's WAL position: the WAL from the
             // checkpoint up to now was decoded under the old publication, and what it didn't
@@ -502,7 +502,7 @@ impl PgConnector {
     /// otherwise (`require_existing` forces `auto_cleanup: false`, V-103). A slot still streaming
     /// is an error.
     pub async fn teardown(&self) -> Result<(), SourceError> {
-        if !self.pg.auto_cleanup || self.pg.slot_management == SlotManagement::RequireExisting {
+        if !self.live().auto_cleanup || self.pg.slot_management == SlotManagement::RequireExisting {
             return Ok(());
         }
         let client = self.conn.client().await?;

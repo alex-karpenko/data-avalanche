@@ -2,7 +2,7 @@
 //! halts and what is skipped, and each column plans per `Type_Mapping.md` (config §11.2).
 
 use data_avalanche_config::NumericOverflowAction;
-use data_avalanche_core::{ColumnValueType as V, HaltReason, TableRef};
+use data_avalanche_core::{ColumnValueType as V, HaltReason, SourceConnector, TableRef};
 use data_avalanche_source_mysql::{CatalogColumn, Flavour, plan_column, plan_table};
 use data_avalanche_testkit::require_it;
 
@@ -248,5 +248,26 @@ async fn mariadb_types_and_system_versioned_tables() {
         .await
         .unwrap();
     assert_eq!(r.skipped.len(), 1, "a glob skips it");
+    cleanup(&n).await;
+}
+
+/// A reload's table patterns take the connector's next resolve (config §1.2: in place while the
+/// set they resolve to stays the same).
+#[tokio::test]
+async fn a_reloaded_include_takes_the_next_resolve() {
+    require_it!();
+    let (n, _a) = fresh(
+        "resolve_reload",
+        "CREATE TABLE a (id INT PRIMARY KEY); CREATE TABLE b (id INT PRIMARY KEY);",
+    )
+    .await;
+    let c = connector(&pipeline(&n, &["a", "b"], "", ""));
+    let names = |r: data_avalanche_core::ResolvedTables| -> Vec<TableRef> {
+        r.tables.iter().map(|s| s.table().clone()).collect()
+    };
+    let t = |name: &str| TableRef::new(&n.db, name);
+    assert_eq!(names(c.resolve_tables().await.unwrap()), [t("a"), t("b")]);
+    c.reconfigure(&pipeline(&n, &["a"], "", ""));
+    assert_eq!(names(c.resolve_tables().await.unwrap()), [t("a")]);
     cleanup(&n).await;
 }

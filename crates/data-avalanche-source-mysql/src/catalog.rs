@@ -278,8 +278,8 @@ impl MySqlConnector {
     /// skipped with a warning; one named without a glob halts.
     pub async fn resolve_tables(&self) -> Result<ResolvedTables, SourceError> {
         let listed = self.list_tables().await?;
-        let t = &self.pipeline.tables;
-        let selection = select(&t.include, &t.exclude, &listed);
+        let live = self.live();
+        let selection = select(&live.include, &live.exclude, &listed);
         let names: Vec<String> = selection
             .tables
             .iter()
@@ -296,7 +296,7 @@ impl MySqlConnector {
             let Some(d) = described.remove(&listed.table.name) else {
                 continue; // dropped since it was listed
             };
-            match plan_table(&d, t, self.tinyint1_as_bool()) {
+            match plan_table(&d, &self.pipeline.tables, self.tinyint1_as_bool()) {
                 Ok(p) => {
                     for (column, ty) in p.notes.read_as_text {
                         out.warnings.push(format!(

@@ -149,7 +149,7 @@ impl PgConnector {
             &self.pg.slot,
             &self.pg.publication,
             to_wire(start),
-            self.pg.heartbeat,
+            self.live().heartbeat,
         );
         let client = ReplicationClient::connect(config)
             .await
