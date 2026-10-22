@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-21
+updated: 2026-10-22
 domain: Architecture
 status: Specification (supersedes the Configuration_file_model.md draft)
 tags: [architecture, configuration, spec, validation, multi-sink, iceberg, delta-lake]
@@ -447,7 +447,7 @@ they carry node names, addresses, phases and the config generation, never data o
 
 | Field | Type | Required | Default | Notes |
 |---|---|---|---|---|
-| `join_members` | list<host:port> | no | `[]` | Seed addresses to join. Empty = single-node (or wait for inbound joins). |
+| `join_members` | list<host:port> | no | `[]` | Seed addresses to join: each one a peer's advertised address (its `advertise_addr`:`advertise_port`), not a Service, load-balancer or NAT address, which the gossip drops. Empty = single-node (or wait for inbound joins). |
 | `node_name` | string | no | OS hostname | Unique, **stable** node identity; this is also the `node_id` used for consistent-hash ring placement (`Clustering_Architecture_Research.md` §3.4). See the sourcing rule below. |
 | `advertise_addr` | string | no | `""` (bind_addr or first private IP) | Address advertised to peers. |
 | `advertise_port` | integer | no | `7946` | Port advertised to peers. |
