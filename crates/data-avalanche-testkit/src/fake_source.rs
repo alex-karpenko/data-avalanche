@@ -54,6 +54,7 @@ pub enum Method {
     OpenStream,
     /// A stream's `next`, after the items it has already queued.
     Next,
+    /// `end_other_reader`.
     EndOtherReader,
     Augment,
     Rescan,

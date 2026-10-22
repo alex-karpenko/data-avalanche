@@ -125,6 +125,7 @@ impl PipelineWorker {
         start(core, None).await?;
         let mut attempt = 0;
         let mut contended_since: Option<Instant> = None;
+        let mut ended = false;
         loop {
             let opened = Instant::now();
             let failed = match Session::open(core).await {
@@ -159,10 +160,14 @@ impl PipelineWorker {
                         return Err(WorkerError::Contended { waited, detail });
                     }
                     // DA-SRC-28: under the lease, the other reader is a stale session. It is
-                    // ended once a busy spell, and the stream retried from the first backoff step.
-                    if first && core.may_write().is_ok() {
+                    // ended on the first busy attempt of a spell, and the stream retried from the
+                    // first backoff step. At most once a run: two holders that each believe they
+                    // hold the lease can't keep ending each other's stream; the second spell waits
+                    // and gives up with `Contended` after the window.
+                    if first && !ended && core.may_write().is_ok() {
                         let warning = match core.source.end_other_reader().await {
                             Ok(true) => {
+                                ended = true;
                                 attempt = 0;
                                 Some(format!(
                                     "ended the stream position's other reader, a session the lease outlived ({detail})"
@@ -954,8 +959,8 @@ mod tests {
         assert!(matches!(end, Ok(Exit::Drained)), "{end:?}");
     }
 
-    /// A busy slot whose other reader can't be ended (another role's walsender) is retried for a
-    /// while, then the worker gives up.
+    /// A busy slot whose other reader can't be ended (the end itself fails, here "permission
+    /// denied") is retried for a while, then the worker gives up.
     #[tokio::test]
     async fn a_busy_slot_is_retried_for_a_while() {
         let denied = || SourceError::Permanent("permission denied to terminate process".into());
@@ -1024,6 +1029,33 @@ mod tests {
             "{:?}",
             st.warnings
         );
+    }
+
+    /// The stale reader is ended at most once a run: an ended reader that comes back (a second
+    /// holder that believes it holds the lease) is waited out, not ended again.
+    #[tokio::test]
+    async fn an_ended_reader_that_comes_back_is_not_ended_again() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        for _ in 0..10_000 {
+            w.source
+                .fail(Method::OpenStream, SourceError::Contended("active".into()));
+        }
+        let end = run_with(&mode("mode: never"), deps(&w), async |h| {
+            streamed(&h.status, &w).await;
+            assert_eq!(w.source.readers_ended(), 1);
+            for _ in 0..10_000 {
+                w.source
+                    .fail(Method::OpenStream, SourceError::Contended("active".into()));
+            }
+            w.source
+                .fail(Method::Next, SourceError::Transient("reset".into()));
+            let mut st = h.status.clone();
+            let _ = tokio::time::timeout(Duration::from_secs(5), st.wait_for(|_| false)).await;
+        })
+        .await;
+        assert!(matches!(end, Err(WorkerError::Contended { .. })), "{end:?}");
+        assert_eq!(w.source.readers_ended(), 1);
     }
 
     /// A worker whose lease lapsed ends no reader: the other reader may be the new holder's.
