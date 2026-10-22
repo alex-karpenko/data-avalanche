@@ -3,17 +3,18 @@
 //! this node. It never touches a lease; each controller claims and lets go of its own.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use data_avalanche_config::{Cluster, Pipeline};
 use data_avalanche_state::{Holder, PipelineDocs};
-use tokio::sync::{oneshot, watch};
-use tokio::task::JoinHandle;
+use tokio::sync::{Semaphore, mpsc, oneshot, watch};
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::{
     Actual, ClusterError, ControllerDeps, ControllerStatus, Members, PipelineController, Placement,
-    Target,
+    Target, Update,
 };
 
 /// This node as a lease holder (Clustering §3.4, D-1): `node_id` is
@@ -62,6 +63,40 @@ impl ReconcilerSettings {
     }
 }
 
+/// A reload's change to one pipeline (config §12.3).
+#[derive(Debug, Clone)]
+pub enum PipelineReload {
+    /// A new pipeline: its controller starts, on standby until the ring places it here.
+    Add(Pipeline, PipelineDocs),
+    /// The pipeline of this id is gone: [`Update::Remove`].
+    Remove(String),
+    /// [`Update::Reconfigure`].
+    Reconfigure(Pipeline),
+    /// [`Update::Restart`].
+    Restart(Pipeline, PipelineDocs),
+}
+
+/// What a config generation changes on this node's reconciler: its pipelines, and
+/// `globals.cluster`, whose reloadable fields (`rebalance_stabilization`,
+/// `max_concurrent_takeovers`, `max_concurrent_handoffs`, `drain_timeout`) take effect.
+#[derive(Debug, Clone)]
+pub struct Reload {
+    pub pipelines: Vec<PipelineReload>,
+    pub cluster: Cluster,
+}
+
+/// Hands a reload to a running reconciler, from a task that outlives a borrow of it (the
+/// config coordinator).
+#[derive(Debug, Clone)]
+pub struct Reloader(mpsc::UnboundedSender<Reload>);
+
+impl Reloader {
+    /// False when the reconciler has stopped.
+    pub fn apply(&self, reload: Reload) -> bool {
+        self.0.send(reload).is_ok()
+    }
+}
+
 #[derive(Debug)]
 struct Controlled {
     pipeline: Pipeline,
@@ -69,6 +104,8 @@ struct Controlled {
     target: watch::Sender<Target>,
     status: watch::Sender<ControllerStatus>,
     task: JoinHandle<()>,
+    /// The running controller's updates.
+    updates: mpsc::UnboundedSender<Update>,
 }
 
 /// A controller dropped is aborted, its worker with it: a crash, its lease left to expire.
@@ -79,6 +116,19 @@ impl Drop for Controlled {
 }
 
 impl Controlled {
+    fn new(pipeline: Pipeline, docs: PipelineDocs, deps: &ControllerDeps) -> Self {
+        let mut c = Self {
+            pipeline,
+            docs,
+            target: watch::channel(Target::DontOwn).0,
+            status: watch::channel(ControllerStatus::default()).0,
+            task: tokio::spawn(async {}),
+            updates: mpsc::unbounded_channel().0,
+        };
+        c.spawn(deps);
+        c
+    }
+
     fn spawn(&mut self, deps: &ControllerDeps) {
         let controller = PipelineController::reporting(
             self.pipeline.clone(),
@@ -86,7 +136,61 @@ impl Controlled {
             deps,
             self.status.clone(),
         );
+        self.updates = controller.updater();
         self.task = tokio::spawn(controller.run(self.target.subscribe()));
+    }
+
+    /// Tells a removed pipeline's controller, and waits for it to let go of the pipeline. Its
+    /// target stays open meanwhile: a closed one would be a shutdown, which releases the lease
+    /// without cleaning up. Dropped unfinished (a reconciler dropped), it aborts the controller
+    /// as any [`Controlled`] does.
+    async fn remove(mut self) {
+        let _ = self.updates.send(Update::Remove);
+        if let Err(e) = (&mut self.task).await {
+            tracing::error!("a removed pipeline's controller ended abnormally: {e}");
+        }
+    }
+}
+
+/// A permit pool resized by a reload (`max_concurrent_takeovers`, `max_concurrent_handoffs`).
+/// More permits are added at once; fewer are taken back as permits come free, so a permit in
+/// use is never taken away, and until then the pool may let a few more through.
+#[derive(Debug)]
+struct Cap {
+    pool: Arc<Semaphore>,
+    size: usize,
+    /// Permits to take back as they come free.
+    owed: usize,
+}
+
+impl Cap {
+    /// `pool` with no permit in use: its size is what it has available.
+    fn new(pool: &Arc<Semaphore>) -> Self {
+        Self {
+            pool: Arc::clone(pool),
+            size: pool.available_permits(),
+            owed: 0,
+        }
+    }
+
+    fn resize(&mut self, size: usize) {
+        if size >= self.size {
+            let more = size - self.size;
+            let repaid = more.min(self.owed);
+            self.owed -= repaid;
+            self.pool.add_permits(more - repaid);
+        } else {
+            self.owed += self.size - size;
+        }
+        self.size = size;
+        self.settle();
+    }
+
+    /// Takes back the owed permits that are free now.
+    fn settle(&mut self) {
+        if self.owed > 0 {
+            self.owed -= self.pool.forget_permits(self.owed);
+        }
     }
 }
 
@@ -95,7 +199,9 @@ impl Controlled {
 /// worker is aborted and every lease is left to expire.
 #[derive(Debug)]
 pub struct ClusterReconciler {
-    statuses: BTreeMap<String, watch::Receiver<ControllerStatus>>,
+    /// Each pipeline's controller status, as reloads add and remove pipelines.
+    statuses: watch::Receiver<BTreeMap<String, watch::Receiver<ControllerStatus>>>,
+    reloads: mpsc::UnboundedSender<Reload>,
     stop: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
 }
@@ -115,47 +221,49 @@ impl ClusterReconciler {
         members: watch::Receiver<Members>,
         settings: ReconcilerSettings,
     ) -> Self {
-        let mut statuses = BTreeMap::new();
-        let controllers = pipelines
+        let controllers: BTreeMap<String, Controlled> = pipelines
             .into_iter()
-            .map(|(pipeline, docs)| {
-                let id = pipeline.id.clone();
-                let (status, rx) = watch::channel(ControllerStatus::default());
-                statuses.insert(id.clone(), rx);
-                let mut c = Controlled {
-                    pipeline,
-                    docs,
-                    target: watch::channel(Target::DontOwn).0,
-                    status,
-                    task: tokio::spawn(async {}),
-                };
-                c.spawn(deps);
-                (id, c)
-            })
+            .map(|(pipeline, docs)| (pipeline.id.clone(), Controlled::new(pipeline, docs, deps)))
             .collect();
+        let (statuses_tx, statuses) = watch::channel(status_map(&controllers));
+        let (reloads, reloaded) = mpsc::unbounded_channel();
         let (stop, stopped) = oneshot::channel();
         let task = tokio::spawn(reconcile(
-            controllers,
-            deps.clone(),
+            Loop {
+                controllers,
+                deps: deps.clone(),
+                takeovers: Cap::new(&deps.starts),
+                handoffs: Cap::new(&deps.handoffs),
+                statuses: statuses_tx,
+                removing: JoinSet::new(),
+                returning: BTreeMap::new(),
+            },
             members,
             settings,
+            reloaded,
             stopped,
         ));
         Self {
             statuses,
+            reloads,
             stop: Some(stop),
             task,
         }
     }
 
-    /// Each pipeline's controller status, by pipeline id.
+    /// Each pipeline's controller status, by pipeline id, as of now.
     pub fn statuses(&self) -> BTreeMap<String, watch::Receiver<ControllerStatus>> {
-        self.statuses.clone()
+        self.statuses.borrow().clone()
+    }
+
+    /// Where a config generation's changes go.
+    pub fn reloader(&self) -> Reloader {
+        Reloader(self.reloads.clone())
     }
 
     /// Waits until this node holds no pipeline: every controller is on standby.
     pub async fn released(&self) {
-        for status in self.statuses.values() {
+        for status in self.statuses().values() {
             let mut status = status.clone();
             let _ = status
                 .wait_for(|s| matches!(s.actual, Some(Actual::Standby { .. })))
@@ -175,13 +283,128 @@ impl ClusterReconciler {
     }
 }
 
-/// The reconcile loop (Clustering §8.1, §20.1): on every membership change, every due ring
-/// addition and every `resync`, each pipeline's target is "own" iff the ring places it here.
-async fn reconcile(
-    mut controllers: BTreeMap<String, Controlled>,
+fn status_map(
+    controllers: &BTreeMap<String, Controlled>,
+) -> BTreeMap<String, watch::Receiver<ControllerStatus>> {
+    controllers
+        .iter()
+        .map(|(id, c)| (id.clone(), c.status.subscribe()))
+        .collect()
+}
+
+/// The reconcile loop's state.
+struct Loop {
+    controllers: BTreeMap<String, Controlled>,
+    /// The settings new and started-again controllers take: a reload changes them.
     deps: ControllerDeps,
+    takeovers: Cap,
+    handoffs: Cap,
+    statuses: watch::Sender<BTreeMap<String, watch::Receiver<ControllerStatus>>>,
+    /// The controllers of removed pipelines, draining and letting go; each ends with its
+    /// pipeline's id.
+    removing: JoinSet<String>,
+    /// The ids whose removal runs, each with the pipeline a later generation added back under
+    /// it: that one starts when the removal ends, so one controller runs a pipeline at a time.
+    returning: BTreeMap<String, Option<(Pipeline, PipelineDocs)>>,
+}
+
+impl Loop {
+    /// A config generation's changes (config §12.3). A removed pipeline's controller is told
+    /// and left to finish; it is no longer placed or started again.
+    fn reload(&mut self, reload: Reload, placement: &mut Placement) {
+        let c = &reload.cluster;
+        placement.set_stabilization(c.rebalance_stabilization);
+        self.takeovers
+            .resize(usize::try_from(c.max_concurrent_takeovers).unwrap_or(usize::MAX));
+        self.handoffs
+            .resize(usize::try_from(c.max_concurrent_handoffs).unwrap_or(usize::MAX));
+        if self.deps.settings.drain_timeout != c.drain_timeout {
+            self.deps.settings.drain_timeout = c.drain_timeout;
+            for controlled in self.controllers.values() {
+                let _ = controlled
+                    .updates
+                    .send(Update::DrainTimeout(c.drain_timeout));
+            }
+        }
+        for change in reload.pipelines {
+            match change {
+                PipelineReload::Add(pipeline, docs) => {
+                    let id = pipeline.id.clone();
+                    // Not a change a diff makes; the old controller is let go of, as for a
+                    // removal.
+                    if let Some(old) = self.controllers.remove(&id) {
+                        self.remove(old);
+                    }
+                    if let Some(back) = self.returning.get_mut(&id) {
+                        tracing::info!(
+                            pipeline = %pipeline.name,
+                            "pipeline added back: it starts once its removal ends"
+                        );
+                        *back = Some((pipeline, docs));
+                    } else {
+                        tracing::info!(pipeline = %pipeline.name, "pipeline added");
+                        let added = Controlled::new(pipeline, docs, &self.deps);
+                        self.controllers.insert(id, added);
+                    }
+                }
+                PipelineReload::Remove(id) => {
+                    if let Some(old) = self.controllers.remove(&id) {
+                        self.remove(old);
+                    } else if let Some(back) = self.returning.get_mut(&id) {
+                        *back = None;
+                    }
+                }
+                PipelineReload::Reconfigure(pipeline) => {
+                    if let Some(c) = self.controllers.get_mut(&pipeline.id) {
+                        c.pipeline = pipeline.clone();
+                        let _ = c.updates.send(Update::Reconfigure(Box::new(pipeline)));
+                    } else if let Some(Some(back)) = self.returning.get_mut(&pipeline.id) {
+                        back.0 = pipeline;
+                    }
+                }
+                PipelineReload::Restart(pipeline, docs) => {
+                    if let Some(c) = self.controllers.get_mut(&pipeline.id) {
+                        c.pipeline = pipeline.clone();
+                        c.docs = docs.clone();
+                        let _ = c.updates.send(Update::Restart(Box::new(pipeline), docs));
+                    } else if let Some(Some(back)) = self.returning.get_mut(&pipeline.id) {
+                        *back = (pipeline, docs);
+                    }
+                }
+            }
+        }
+        self.statuses.send_replace(status_map(&self.controllers));
+    }
+
+    /// Lets a removed pipeline's controller finish, in the background.
+    fn remove(&mut self, old: Controlled) {
+        let id = old.pipeline.id.clone();
+        self.returning.entry(id.clone()).or_insert(None);
+        self.removing.spawn(async move {
+            old.remove().await;
+            id
+        });
+    }
+
+    /// A removal ended: the pipeline added back under its id, if any, starts now.
+    fn removed(&mut self, id: &str) {
+        if let Some(Some((pipeline, docs))) = self.returning.remove(id) {
+            tracing::info!(pipeline = %pipeline.name, "pipeline added back, its removal done");
+            let added = Controlled::new(pipeline, docs, &self.deps);
+            self.controllers.insert(id.to_owned(), added);
+            self.statuses.send_replace(status_map(&self.controllers));
+        }
+    }
+}
+
+/// The reconcile loop (Clustering §8.1, §20.1): on every membership change, every due ring
+/// addition, every reload and every `resync`, each pipeline's target is "own" iff the ring
+/// places it here.
+async fn reconcile(
+    mut state: Loop,
     mut members: watch::Receiver<Members>,
     settings: ReconcilerSettings,
+    mut reloads: mpsc::UnboundedReceiver<Reload>,
     mut stop: oneshot::Receiver<()>,
 ) {
     let mut placement = Placement::new(settings.tokens, settings.stabilization);
@@ -197,9 +420,12 @@ async fn reconcile(
                 "the ring changed"
             );
         }
+        let deps = &state.deps;
         deps.metrics.set_cluster_members(view.nodes.len());
         deps.metrics.set_ring_generation(placement.generation());
-        for (id, c) in &mut controllers {
+        state.takeovers.settle();
+        state.handoffs.settle();
+        for (id, c) in &mut state.controllers {
             let want = if placement.ring().owner(id) == Some(view.me.as_str()) {
                 Target::Own
             } else {
@@ -214,12 +440,19 @@ async fn reconcile(
                     pipeline = %c.pipeline.name,
                     "the pipeline's controller ended unasked; it is started again"
                 );
-                c.spawn(&deps);
+                c.spawn(deps);
             }
         }
         let due = placement.next_due();
         tokio::select! {
             _ = &mut stop => break,
+            Some(reload) = reloads.recv() => state.reload(reload, &mut placement),
+            // A removed pipeline's controller that ended.
+            Some(ended) = state.removing.join_next() => {
+                if let Ok(id) = ended {
+                    state.removed(&id);
+                }
+            }
             changed = members.changed(), if gossiping => {
                 gossiping = changed.is_ok();
                 if !gossiping {
@@ -236,8 +469,8 @@ async fn reconcile(
         }
     }
     // Every target closes at once (a replaced sender is dropped): the controllers drain
-    // together.
-    let mut controllers: Vec<Controlled> = controllers.into_values().collect();
+    // together, and the removed pipelines' controllers finish.
+    let mut controllers: Vec<Controlled> = state.controllers.into_values().collect();
     for c in &mut controllers {
         c.target = watch::channel(Target::DontOwn).0;
     }
@@ -246,6 +479,7 @@ async fn reconcile(
             tracing::error!("a pipeline controller ended abnormally: {e}");
         }
     }
+    while state.removing.join_next().await.is_some() {}
 }
 
 #[cfg(test)]
@@ -553,6 +787,203 @@ mod tests {
                 .any(|l| l == "data_avalanche_owned_pipelines 1"),
             "{text}"
         );
+        r.shutdown().await;
+    }
+
+    /// `globals.cluster` of the test config, with the drain timeout the tests' controllers
+    /// start with (5 s).
+    fn cluster() -> Cluster {
+        let mut c = config(&["p"]).globals.cluster;
+        c.drain_timeout = Duration::from_secs(5);
+        c
+    }
+
+    /// A reload adds a pipeline, which runs here (the ring places everything on a lone node),
+    /// and removes one, which is drained, cleaned up and released, before a shutdown ends; the
+    /// third runs on.
+    #[tokio::test(start_paused = true)]
+    async fn a_reload_adds_and_removes_pipelines() {
+        let store = ScriptedStore::new();
+        let (fs, d) = factories(&store, &["p", "q", "r"]);
+        let (_, view) = watch::channel(alone("n1"));
+        let r = ClusterReconciler::start(pipelines(&["p", "q"]), &d, view, reconciler_settings());
+        for (_, mut s) in r.statuses() {
+            until(&mut s, "running", running).await;
+        }
+        let added = pipelines(&["r"]).remove(0);
+        assert!(r.reloader().apply(Reload {
+            pipelines: vec![
+                PipelineReload::Add(added.0, added.1),
+                PipelineReload::Remove("q".into()),
+            ],
+            cluster: cluster(),
+        }));
+        eventually("r in, q out", || {
+            let st = r.statuses();
+            st.contains_key("r") && !st.contains_key("q")
+        })
+        .await;
+        until(r.statuses().get_mut("r").unwrap(), "r running", running).await;
+        fs["r"]
+            .source
+            .commit(FakeTxn::new().insert(&TableRef::new("public", "a"), row(1)));
+        eventually("r's row lands", || fs["r"].ids("a") == [1]).await;
+        assert!(running(&r.statuses()["p"].borrow()), "p runs on");
+        r.shutdown().await;
+        assert_eq!(fs["q"].source.teardowns(), 1, "q cleaned up");
+        assert_eq!(fs["p"].source.teardowns(), 0);
+        let q = leases(&store).observe("q").await.unwrap().unwrap();
+        assert!(q.doc.released);
+    }
+
+    /// A pipeline added back while its removal runs starts once the removal ends: the old
+    /// controller drains, tears down and releases first, so one controller runs it at a time.
+    #[tokio::test(start_paused = true)]
+    async fn a_pipeline_added_back_during_its_removal_starts_after_it() {
+        let store = ScriptedStore::new();
+        let (fs, d) = factories(&store, &["p"]);
+        let f = fs["p"].clone();
+        let started = pipelines(&["p"]);
+        let back = started[0].clone();
+        let (_, view) = watch::channel(alone("n1"));
+        let r = ClusterReconciler::start(started, &d, view, reconciler_settings());
+        until(r.statuses().get_mut("p").unwrap(), "running", running).await;
+        f.sink.hold_commits();
+        f.source
+            .commit(FakeTxn::new().insert(&TableRef::new("public", "a"), row(1)));
+        eventually("the commit waits", || f.sink.waiting_commits() == 1).await;
+        for change in [
+            PipelineReload::Remove("p".into()),
+            PipelineReload::Add(back.0, back.1),
+        ] {
+            r.reloader().apply(Reload {
+                pipelines: vec![change],
+                cluster: cluster(),
+            });
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            !r.statuses().contains_key("p"),
+            "not while its removal runs"
+        );
+        assert_eq!(f.builds(), 1);
+        f.sink.release_commits();
+        eventually("p is back", || r.statuses().contains_key("p")).await;
+        assert_eq!(f.source.teardowns(), 1, "torn down before it is back");
+        until(r.statuses().get_mut("p").unwrap(), "running again", running).await;
+        r.shutdown().await;
+    }
+
+    /// A reload's in-place change reaches the running worker; a restart-only one runs a new
+    /// worker.
+    #[tokio::test(start_paused = true)]
+    async fn a_reload_reconfigures_one_pipeline_and_restarts_another() {
+        let store = ScriptedStore::new();
+        let (fs, d) = factories(&store, &["p", "q"]);
+        let (fp, fq) = (fs["p"].clone(), fs["q"].clone());
+        let started = pipelines(&["p", "q"]);
+        let q_docs = started[1].1.clone();
+        let (_, view) = watch::channel(alone("n1"));
+        let r = ClusterReconciler::start(started, &d, view, reconciler_settings());
+        for (_, mut s) in r.statuses() {
+            until(&mut s, "running", running).await;
+        }
+        let mut cfg = config(&["p", "q"]).pipelines;
+        r.reloader().apply(Reload {
+            pipelines: vec![
+                PipelineReload::Reconfigure(cfg.remove("p").unwrap()),
+                PipelineReload::Restart(cfg.remove("q").unwrap(), q_docs),
+            ],
+            cluster: cluster(),
+        });
+        eventually("p reconfigured, q rebuilt", || {
+            fp.source.reconfigures() == 1 && fq.builds() == 2
+        })
+        .await;
+        until(r.statuses().get_mut("q").unwrap(), "q running", running).await;
+        assert_eq!(fp.builds(), 1, "p's worker runs on");
+        r.shutdown().await;
+    }
+
+    /// A reloaded `max_concurrent_handoffs` caps the next hand-offs: from 1 to 2 the two hung
+    /// drains run together, from 2 to 1 one after the other (each cut off at 5 s).
+    #[tokio::test(start_paused = true)]
+    async fn a_reloaded_hand_off_cap_caps_the_next_hand_offs() {
+        for (from, to, least, most) in [(1, 2, 5, 6), (2, 1, 10, 11)] {
+            let store = ScriptedStore::new();
+            let (fs, mut d) = factories(&store, &["p", "q"]);
+            d.handoffs = Arc::new(tokio::sync::Semaphore::new(from));
+            let (tx, view) = watch::channel(alone("n1"));
+            let r =
+                ClusterReconciler::start(pipelines(&["p", "q"]), &d, view, reconciler_settings());
+            let mut st = r.statuses();
+            for s in st.values_mut() {
+                until(s, "running", running).await;
+            }
+            let mut c = cluster();
+            c.max_concurrent_handoffs = to;
+            r.reloader().apply(Reload {
+                pipelines: vec![],
+                cluster: c,
+            });
+            for (i, f) in (1..).zip(fs.values()) {
+                f.sink.hold_commits();
+                f.source
+                    .commit(FakeTxn::new().insert(&TableRef::new("public", "a"), row(i)));
+            }
+            eventually("both commits wait", || {
+                fs.values().all(|f| f.sink.waiting_commits() == 1)
+            })
+            .await;
+            let t = Instant::now();
+            tx.send_replace(members("n1", &[("n1", Phase::Draining, false)]));
+            r.released().await;
+            let took = t.elapsed();
+            assert!(
+                took >= Duration::from_secs(least) && took < Duration::from_secs(most),
+                "cap {from} to {to}: {took:?}"
+            );
+            for f in fs.values() {
+                f.sink.release_commits();
+            }
+            r.shutdown().await;
+        }
+    }
+
+    /// A reloaded `rebalance_stabilization` is the next joiner's wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_reloaded_stabilization_is_the_next_joiners_wait() {
+        let ids = ["orders", "events", "customers", "users"];
+        let store = ScriptedStore::new();
+        let (_, d) = factories(&store, &ids);
+        let (tx, view) = watch::channel(alone("n1"));
+        let r = ClusterReconciler::start(pipelines(&ids), &d, view, reconciler_settings());
+        let mut st = r.statuses();
+        for s in st.values_mut() {
+            until(s, "running", running).await;
+        }
+        let mut c = cluster();
+        c.rebalance_stabilization = Duration::from_secs(3);
+        r.reloader().apply(Reload {
+            pipelines: vec![],
+            cluster: c,
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let two = Ring::new(["n1", "n2"], 128);
+        let moving: Vec<&str> = ids
+            .iter()
+            .copied()
+            .filter(|id| two.owner(id) == Some("n2"))
+            .collect();
+        let t = Instant::now();
+        tx.send_replace(members(
+            "n1",
+            &[("n1", Phase::Active, false), ("n2", Phase::Active, false)],
+        ));
+        for id in &moving {
+            until(st.get_mut(*id).unwrap(), "handed off", standby).await;
+        }
+        assert!(t.elapsed() < STABLE, "{:?}", t.elapsed());
         r.shutdown().await;
     }
 }

@@ -32,6 +32,8 @@ pub use gossip::{
 pub use lease::{LeaseGuard, LeaseRun, LeaseTiming, RenewEnd, RenewState};
 pub use node::{JOIN_WAIT, join, leave};
 pub use placement::Placement;
-pub use reconciler::{ClusterReconciler, ReconcilerSettings, node_identity};
+pub use reconciler::{
+    ClusterReconciler, PipelineReload, ReconcilerSettings, Reload, Reloader, node_identity,
+};
 pub use ring::Ring;
 pub use wire::{GossipKey, Udp, Wire};
