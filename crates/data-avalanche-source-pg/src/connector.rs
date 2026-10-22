@@ -309,6 +309,10 @@ impl SourceConnector for PgConnector {
         Ok(PgConnector::open_stream(self, &from.position, tables).await?)
     }
 
+    async fn end_other_reader(&self) -> Result<bool, SourceError> {
+        PgConnector::end_other_reader(self).await
+    }
+
     async fn augment(
         &self,
         cached: &TableSchema,

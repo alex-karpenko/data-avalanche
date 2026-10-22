@@ -1,7 +1,8 @@
 //! The pipeline worker (Data-Flow Phases 0–5): Phase 0 once, then stream sessions until a drain,
 //! a finished dump or an error. Between sessions it decides what a source failure means: a
-//! transient one reopens the stream after a backoff, a busy slot is retried for a bounded time,
-//! and a lost position is replaced and every table snapshotted again.
+//! transient one reopens the stream after a backoff, a busy slot's stale reader is ended and the
+//! slot retried for a bounded time, and a lost position is replaced and every table snapshotted
+//! again.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -151,10 +152,30 @@ impl PipelineWorker {
                     });
                 }
                 SourceError::Contended(detail) => {
+                    let first = contended_since.is_none();
                     let since = *contended_since.get_or_insert_with(Instant::now);
                     let waited = since.elapsed();
                     if waited >= core.tuning.contended_window {
                         return Err(WorkerError::Contended { waited, detail });
+                    }
+                    // DA-SRC-28: under the lease, the other reader is a stale session. It is
+                    // ended once a busy spell, and the stream retried from the first backoff step.
+                    if first && core.may_write().is_ok() {
+                        let warning = match core.source.end_other_reader().await {
+                            Ok(true) => {
+                                attempt = 0;
+                                Some(format!(
+                                    "ended the stream position's other reader, a session the lease outlived ({detail})"
+                                ))
+                            }
+                            Ok(false) => None,
+                            Err(e) => Some(format!(
+                                "couldn't end the stream position's other reader ({e}): retrying until it lets go"
+                            )),
+                        };
+                        if let Some(warning) = warning {
+                            core.update(|st| st.warn(warning));
+                        }
                     }
                     let error = SourceError::Contended(detail).to_string();
                     core.update(|st| {
@@ -933,10 +954,14 @@ mod tests {
         assert!(matches!(end, Ok(Exit::Drained)), "{end:?}");
     }
 
+    /// A busy slot whose other reader can't be ended (another role's walsender) is retried for a
+    /// while, then the worker gives up.
     #[tokio::test]
     async fn a_busy_slot_is_retried_for_a_while() {
+        let denied = || SourceError::Permanent("permission denied to terminate process".into());
         let w = World::new(&["a"]);
         w.started(&["a"]).await;
+        w.source.fail(Method::EndOtherReader, denied());
         for _ in 0..3 {
             w.source
                 .fail(Method::OpenStream, SourceError::Contended("active".into()));
@@ -951,15 +976,79 @@ mod tests {
 
         let w = World::new(&["a"]);
         w.started(&["a"]).await;
+        w.source.fail(Method::EndOtherReader, denied());
         for _ in 0..10_000 {
             w.source
                 .fail(Method::OpenStream, SourceError::Contended("active".into()));
         }
-        let (end, _) = run(&w, &mode("mode: never"), async |_| {
+        let (end, st) = run(&w, &mode("mode: never"), async |_| {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         })
         .await;
         assert!(matches!(end, Err(WorkerError::Contended { .. })), "{end:?}");
+        assert!(
+            st.warnings.iter().any(|m| m.contains("couldn't end")
+                && m.contains("permission denied to terminate process")),
+            "{:?}",
+            st.warnings
+        );
+        assert_eq!(w.source.readers_ended(), 0);
+    }
+
+    /// DA-SRC-28: under the lease, the slot's other reader is stale (a holder that stopped
+    /// without closing its connection, or this node's own dropped session). The worker ends it
+    /// instead of waiting out `wal_sender_timeout`, and warns.
+    #[tokio::test]
+    async fn a_busy_slot_s_stale_reader_is_ended() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        for _ in 0..10_000 {
+            w.source.fail(
+                Method::OpenStream,
+                SourceError::Contended("replication slot \"s\" is active for PID 7".into()),
+            );
+        }
+        let (end, st) = run(&w, &mode("mode: never"), async |status| {
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!(w.ids("a"), [1]);
+        assert_eq!(w.source.readers_ended(), 1);
+        assert!(
+            st.warnings
+                .iter()
+                .any(|m| m.contains("ended the stream position's other reader")
+                    && m.contains("active for PID 7")),
+            "{:?}",
+            st.warnings
+        );
+    }
+
+    /// A worker whose lease lapsed ends no reader: the other reader may be the new holder's.
+    #[tokio::test]
+    async fn a_worker_without_its_lease_ends_no_reader() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let guard = Arc::new(crate::test_support::Switch::default());
+        let mut d = deps(&w);
+        d.guard = guard.clone();
+        let end = run_with(&mode("mode: never"), d, async |h| {
+            streamed(&h.status, &w).await;
+            guard.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            for _ in 0..10_000 {
+                w.source
+                    .fail(Method::OpenStream, SourceError::Contended("active".into()));
+            }
+            w.source
+                .fail(Method::Next, SourceError::Transient("reset".into()));
+            let mut st = h.status.clone();
+            let _ = tokio::time::timeout(Duration::from_secs(5), st.wait_for(|_| false)).await;
+        })
+        .await;
+        assert!(matches!(end, Err(WorkerError::Contended { .. })), "{end:?}");
+        assert_eq!(w.source.readers_ended(), 0);
     }
 
     /// A source error that ends the worker is no reconnect: neither a permanent one nor a busy

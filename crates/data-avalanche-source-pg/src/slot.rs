@@ -518,6 +518,28 @@ impl PgConnector {
             .await
     }
 
+    /// Ends the walsender that holds the slot when it runs as the pipeline's own role, and waits up
+    /// to 5 s for it to exit (`pg_terminate_backend(pid, timeout)`, PostgreSQL 14+): a role may
+    /// end its own sessions without a grant. `false` when no session of the role holds the slot,
+    /// or it didn't exit in time (DA-SRC-28).
+    pub async fn end_other_reader(&self) -> Result<bool, SourceError> {
+        let client = self.conn.client().await?;
+        let row = self
+            .conn
+            .command(
+                "end the slot's other reader",
+                client.query_opt(
+                    "SELECT pg_catalog.pg_terminate_backend(a.pid, 5000)
+                       FROM pg_catalog.pg_replication_slots s
+                       JOIN pg_catalog.pg_stat_activity a ON a.pid = s.active_pid
+                      WHERE s.slot_name = $1 AND a.usename = current_user",
+                    &[&self.slot_name()],
+                ),
+            )
+            .await?;
+        Ok(row.is_some_and(|r| r.get(0)))
+    }
+
     /// The WAL the slot keeps on the source's disk: `pg_current_wal_lsn() - restart_lsn`, the
     /// `max_wal_lag_bytes` guard's measure, and whether a walsender reads the slot (`active`).
     /// `restart_lsn` trails `confirmed_flush_lsn` while a transaction older than the confirmed

@@ -466,15 +466,11 @@ pipelines:
 
     /// Waits until the lake's `table` has exactly the source's ids.
     pub async fn converged(&self, table: &str) {
-        self.converged_within(table, Duration::from_secs(60)).await;
+        self.converged_in("lake", table, Duration::from_secs(60))
+            .await;
     }
 
-    /// [`Self::converged`], waiting at most `within`.
-    pub async fn converged_within(&self, table: &str, within: Duration) {
-        self.converged_in("lake", table, within).await;
-    }
-
-    /// [`Self::converged_within`] in the lake `lake`.
+    /// [`Self::converged`] in the lake `lake`, waiting at most `within`.
     pub async fn converged_in(&self, lake: &str, table: &str, within: Duration) {
         let want = self.source_ids(table).await;
         let what = format!("{lake}/{table} has the source's {} rows", want.len());

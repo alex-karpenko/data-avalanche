@@ -33,8 +33,10 @@ pub enum SourceError {
     TableHalt { table: TableRef, reason: HaltReason },
     /// Another reader holds the stream position (PostgreSQL: the slot is active for another
     /// walsender, SQLSTATE 55006). A quick restart meets it until the old session's walsender
-    /// times out (`wal_sender_timeout`): the pipeline retries for a bounded time while it holds
-    /// the lease, then gives up (`Postgres_Slot…` D-15.5).
+    /// times out (`wal_sender_timeout`), and so does a takeover from a holder that stopped without
+    /// closing its connection. The lease holder ends that reader when the source can
+    /// ([`SourceConnector::end_other_reader`], DA-SRC-28), and retries for a bounded time, then
+    /// gives up (`Postgres_Slot…` D-15.5).
     #[error("the source's stream position is held by another reader: {0}")]
     Contended(String),
 }
@@ -372,6 +374,15 @@ pub trait SourceConnector: Send + Sync {
         from: &Checkpoint,
         tables: &[TableSchema],
     ) -> Result<Box<dyn ChangeStream>, SourceError>;
+
+    /// Ends the session that holds the stream position for another reader, when the source can
+    /// tell it is the pipeline's own: a holder that stopped without closing its connection, or
+    /// this node's own dropped session (DA-SRC-28). Called by the lease holder only, after a
+    /// [`SourceError::Contended`]. `Ok(true)` when one was ended. A source whose server ends the
+    /// old reader itself (MySQL: a new dump with the same server id) has none to end.
+    async fn end_other_reader(&self) -> Result<bool, SourceError> {
+        Ok(false)
+    }
 
     /// Channel C: the change a schema signal implicates, against the `cached` as-of-position
     /// schema, scoped to the hint (`Schema_Change…` §0). Returns the delta and the new schema

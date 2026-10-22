@@ -10,7 +10,9 @@ use data_avalanche_core::{
 };
 use data_avalanche_testkit::require_it;
 
-use crate::common::{admin, cleanup, collect, connector, each, first_stream, fresh, pipeline};
+use crate::common::{
+    admin, cleanup, collect, connector, each, first_stream, fresh, pipeline, release,
+};
 
 fn changes(items: &[StreamItem]) -> Vec<&CdcEvent> {
     items
@@ -686,6 +688,76 @@ async fn untracked_tables_busy_slots_and_keepalives() {
     );
     s.close().await.unwrap();
     cleanup(&a, &n).await;
+}
+
+/// DA-SRC-28: the slot's other reader, a walsender of the pipeline's own role, is ended, and the
+/// stream opens at once instead of after `wal_sender_timeout`. Another role's reader isn't the
+/// pipeline's (the test's role is a superuser, which could end it), and an idle slot has none.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_slot_s_stale_reader_is_ended() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(&a, "stream_stale", "CREATE TABLE a (id int PRIMARY KEY);").await;
+    let c = connector(&pipeline(&n, &["*"], "", ""));
+    let (mut stale, tables, from) = first_stream(&c).await;
+    each(&a, &[format!("INSERT INTO {}.a VALUES (1)", n.schema)]).await;
+    collect(&mut stale, 1, 20).await;
+
+    let mut busy = c.open_stream(&from, &tables).await.unwrap();
+    match busy.next().await {
+        Err(SourceError::Contended(_)) => {}
+        other => panic!("a busy slot is contended: {other:?}"),
+    }
+    assert!(
+        c.end_other_reader().await.unwrap(),
+        "the stale reader is ended"
+    );
+    let mut s = c.open_stream(&from, &tables).await.unwrap();
+    let items = collect(&mut s, 1, 20).await;
+    assert_eq!(changes(&items).len(), 1, "{items:?}");
+    // The stale stream ends in an error once the items it had buffered are read.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while stale.next().await.is_ok() {}
+    })
+    .await
+    .expect("the stale reader's session is gone");
+    s.close().await.unwrap();
+    release(&a, &n.slot).await;
+
+    a.batch_execute(&format!(
+        "DROP ROLE IF EXISTS it_other_reader;
+         CREATE ROLE it_other_reader LOGIN REPLICATION PASSWORD 'other';
+         GRANT USAGE ON SCHEMA {s} TO it_other_reader;
+         GRANT SELECT ON ALL TABLES IN SCHEMA {s} TO it_other_reader;",
+        s = n.schema
+    ))
+    .await
+    .expect("another replication role");
+    let mut p = pipeline(&n, &["*"], "", "");
+    p.source.credentials = data_avalanche_config::Credentials::Inline {
+        user: "it_other_reader".into(),
+        password: data_avalanche_config::Secret::new(
+            "other",
+            &data_avalanche_config::FingerprintKey::from_bytes([1; 32]),
+        ),
+    };
+    let mut foreign = connector(&p).open_stream(&from, &tables).await.unwrap();
+    each(&a, &[format!("INSERT INTO {}.a VALUES (2)", n.schema)]).await;
+    collect(&mut foreign, 1, 20).await;
+    assert!(
+        !c.end_other_reader().await.unwrap(),
+        "another role's reader isn't the pipeline's"
+    );
+    foreign.close().await.unwrap();
+    release(&a, &n.slot).await;
+    assert!(
+        !c.end_other_reader().await.unwrap(),
+        "an idle slot has no other reader"
+    );
+    cleanup(&a, &n).await;
+    a.batch_execute("DROP ROLE it_other_reader")
+        .await
+        .expect("drop the other role");
 }
 
 /// A publication named with capitals is created quoted (`"It_Mixed_Pub"`), so the stream asks

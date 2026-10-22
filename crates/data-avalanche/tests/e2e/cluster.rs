@@ -393,11 +393,9 @@ async fn a_paused_holder_loses_its_pipelines_and_rejoins() {
         },
     )
     .await;
-    // The paused node's replication connection stays open, so on PostgreSQL its walsender keeps
-    // the slot until `wal_sender_timeout` (60 s) ends it; the new holder streams at its next
-    // busy-slot retry after that, at most a backoff step (60 s) later (`Postgres_Slot…` D-15.5).
-    c.e.converged_within("items", Duration::from_secs(150))
-        .await;
+    // The paused node's replication connection stays open: on PostgreSQL its walsender holds the
+    // slot until the new holder ends it (DA-SRC-28), not until `wal_sender_timeout`.
+    c.e.converged("items").await;
     c.nodes[i].proc.as_ref().unwrap().signal("CONT");
     let test = format!("pipeline=\"{}\"", c.e.test);
     let proc = c.nodes[i].proc.as_ref().unwrap();

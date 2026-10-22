@@ -54,6 +54,7 @@ pub enum Method {
     OpenStream,
     /// A stream's `next`, after the items it has already queued.
     Next,
+    EndOtherReader,
     Augment,
     Rescan,
 }
@@ -250,6 +251,7 @@ struct Db {
     reads: BTreeMap<TableRef, usize>,
     rescans: usize,
     in_flights: usize,
+    readers_ended: usize,
     fetches: BTreeMap<TableRef, usize>,
     prepares: Vec<Option<Checkpoint>>,
 }
@@ -302,6 +304,7 @@ impl FakeSource {
             reads: BTreeMap::new(),
             rescans: 0,
             in_flights: 0,
+            readers_ended: 0,
             fetches: BTreeMap::new(),
             prepares: vec![],
         };
@@ -571,6 +574,12 @@ impl FakeSource {
     /// `in_flight` calls that answered so far.
     pub fn in_flights(&self) -> usize {
         self.db().in_flights
+    }
+
+    /// `end_other_reader` calls that ended a reader: each takes away the busy-slot failures
+    /// queued for `open_stream`.
+    pub fn readers_ended(&self) -> usize {
+        self.db().readers_ended
     }
 
     /// `fetch_rows` calls for `table` so far, failed ones included.
@@ -1080,6 +1089,17 @@ impl SourceConnector for FakeSource {
                 .map(|t| (t.table().clone(), shape(t.columns())))
                 .collect(),
         }))
+    }
+
+    async fn end_other_reader(&self) -> Result<bool, SourceError> {
+        self.take_fault(Method::EndOtherReader)?;
+        let mut db = self.db();
+        let before = db.faults.len();
+        db.faults
+            .retain(|(m, e)| !(*m == Method::OpenStream && matches!(e, SourceError::Contended(_))));
+        let ended = db.faults.len() < before;
+        db.readers_ended += usize::from(ended);
+        Ok(ended)
     }
 
     async fn augment(
