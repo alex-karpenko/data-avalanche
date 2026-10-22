@@ -209,7 +209,7 @@ task after the arrow.
 | D-M8a.19 | **The config keys foca doesn't use are removed**, and are now unknown keys: `packet_dial_timeout`, `packet_write_timeout`, `compression_enabled`, `lifeguard_enabled`, `tls` and `dead_node_reclaim_time`. V-054 is retired. V-122: `gossip_interval`, `probe_interval`, `probe_timeout` and `push_pull_interval` above zero, `gossip_nodes` and `retransmit_factor` at least 1, `probe_timeout` below `probe_interval` | foca has no TCP, compression, Lifeguard or TLS. A newer identity wins at once, and a down member is remembered so that a partition can heal, so there is nothing to reclaim. A key that does nothing must not look as if it does | Task 1 (`the_memberlist_only_keys_are_unknown`, the V-122 rows) |
 | D-M8a.20 | **The E2E cluster.** Three processes on loopback, each gossiping on its own port and advertising a `Forwarder`'s port in front of it. `block(&[ports])` drops packets whose source is the other side's ports; `heal()` lets them through again. A scenario has settled when every live node's holders equal the ring's placement over the live nodes, and the members and owned metrics agree. No double commit: each table's commits carry `data-avalanche.owner_epoch` in non-decreasing order. The pause scenario waits up to 150 s for the new holder to converge. On PostgreSQL the paused node's walsender keeps the slot until `wal_sender_timeout` (60 s), and the new holder's next busy-slot retry comes at most a backoff step (60 s) later. Task 13 ends that walsender and puts the scenario back on the suite's 60 s wait | foca replies to the advertised address, so a forwarder sees every packet sent to its node (finding 7). Settling on the ring, rather than on a count, catches a scenario that would pass before its hand-offs | Task 12 (the four scenarios) |
 | D-M8a.21 | **The in-process cluster's invariant.** While a Task 10 scenario waits for its placement (`settles`), it checks at every 10 ms of the test clock that no pipeline is `Starting` or `Running` on two nodes | This is the safety property the ring cannot give and the lease must | Task 10 (all four tests) |
-| D-M8a.22 | **A busy slot's stale reader is ended (DA-SRC-28, Q-M8-5).** The worker acts on the first `SourceError::Contended` of a busy spell, when it holds its lease (`may_write`): it calls `SourceConnector::end_other_reader`, then retries from the first backoff step. It ends a reader at most once a worker run (a flag spent on `Ok(true)`, amended during execution): two holders that each believe they hold the lease can't end each other's stream in turn, and the second busy spell gives up with `Contended` after the window. On PostgreSQL that ends the walsender holding the slot when it runs as the pipeline's own role, and waits up to 5 s for it to exit (`pg_terminate_backend(pid, 5000)`, PostgreSQL 14+). Some readers can't be ended: another role's, one the server refuses to end, one that didn't exit in time. With one of those, the worker warns and keeps D-15.5's bounded retry. A worker without its lease ends nothing. The default does nothing: MySQL's server ends an older dump with the same server id itself | The lease proves the other reader is stale: a holder that stopped without closing its connection, or this node's own dropped session. Waiting out `wal_sender_timeout` took up to about two minutes after a pause (D-M8a.20). A role may end its own sessions without a grant. The role filter keeps a superuser pipeline role off another system's reader on a same-named slot (D-15.5's external collision) | Task 13 (`a_busy_slot_s_stale_reader_is_ended`, `a_busy_slot_is_retried_for_a_while`, `a_worker_without_its_lease_ends_no_reader`, `the_slot_s_stale_reader_is_ended`); Task 12's pause scenario |
+| D-M8a.22 | **A busy slot's stale reader is ended (DA-SRC-28, Q-M8-5).** The worker acts on the first `SourceError::Contended` of a busy spell, when it holds its lease (`may_write`): it calls `SourceConnector::end_other_reader`, then retries from the first backoff step. It ends a reader at most once a lease term (a flag the term's worker runs share, spent on `Ok(true)`; amended during execution): two holders that each believe they hold the lease can't end each other's stream in turn, and a later busy spell in the term gives up with `Contended` after the window. The cost is liveness only: a session of the node's own that lingers later in the same term is waited out (`contended_window`, 120 s, outlasts PostgreSQL's default `wal_sender_timeout`, 60 s). On PostgreSQL that ends the walsender holding the slot when it runs as the pipeline's own role, and waits up to 5 s for it to exit (`pg_terminate_backend(pid, 5000)`, PostgreSQL 14+). Some readers can't be ended: another role's, one the server refuses to end, one that didn't exit in time. With one of those, the worker warns and keeps D-15.5's bounded retry. A worker without its lease ends nothing. The default does nothing: MySQL's server ends an older dump with the same server id itself | The lease proves the other reader is stale: a holder that stopped without closing its connection, or this node's own dropped session. Waiting out `wal_sender_timeout` took up to about two minutes after a pause (D-M8a.20). A role may end its own sessions without a grant. The role filter keeps a superuser pipeline role off another system's reader on a same-named slot (D-15.5's external collision) | Task 13 (`a_busy_slot_s_stale_reader_is_ended`, `a_busy_slot_is_retried_for_a_while`, `a_worker_without_its_lease_ends_no_reader`, `the_slot_s_stale_reader_is_ended`); Task 12's pause scenario |
 
 **foca's settings (D-M8a.4)**, for `n` members:
 
@@ -8194,16 +8194,16 @@ git commit -m "fix(pipeline): a busy slot's stale reader is ended under the leas
 
 ## Exit
 
-- [ ] Three nodes spread their pipelines by the ring, and each pipeline runs on one node (Tasks 10, 12).
-- [ ] A killed node's pipelines are taken over after the lease, with no double commit (Task 12).
-- [ ] A leave hands every pipeline off without a lease wait; a rolling restart loses nothing, with hand-offs capped (Tasks 6, 7, 12).
-- [ ] A partition with storage reachable moves no pipeline; a pause past the lease is fenced and rejoins (Tasks 10, 12), and on PostgreSQL its new holder streams without waiting out `wal_sender_timeout` (Task 13).
-- [ ] A node of another cluster can't join (Tasks 3, 4).
-- [ ] DA-CLUS-14 (Task 8), DA-OPS-7 (Task 6) and DA-SRC-28 (Task 13) are closed.
-- [ ] The E2E suite passes on PostgreSQL 18 and, through `ci.yml`'s jobs, on `mysql-84`, `mysql-84-nogtid` and `mariadb-118`.
-- [ ] Every Review Focus line has its passing test.
-- [ ] The documents of "Documents this plan changes" are updated, and the spec patch is applied once approved.
-- [ ] The workspace gates pass: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo clippy -p data-avalanche --features e2e-hooks --all-targets -- -D warnings`, `cargo test --workspace`.
+- [x] Three nodes spread their pipelines by the ring, and each pipeline runs on one node (Tasks 10, 12).
+- [x] A killed node's pipelines are taken over after the lease, with no double commit (Task 12).
+- [x] A leave hands every pipeline off without a lease wait; a rolling restart loses nothing, with hand-offs capped (Tasks 6, 7, 12).
+- [x] A partition with storage reachable moves no pipeline; a pause past the lease is fenced and rejoins (Tasks 10, 12), and on PostgreSQL its new holder streams without waiting out `wal_sender_timeout` (Task 13).
+- [x] A node of another cluster can't join (Tasks 3, 4).
+- [x] DA-CLUS-14 (Task 8), DA-OPS-7 (Task 6) and DA-SRC-28 (Task 13) are closed.
+- [ ] The E2E suite passes on PostgreSQL 18 and, through `ci.yml`'s jobs, on `mysql-84`, `mysql-84-nogtid` and `mariadb-118`. (Measured locally on PostgreSQL 18 and `mysql-84`; the other targets run in the PR's CI.)
+- [x] Every Review Focus line has its passing test.
+- [x] The documents of "Documents this plan changes" are updated, and the spec patch is applied once approved.
+- [x] The workspace gates pass: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo clippy -p data-avalanche --features e2e-hooks --all-targets -- -D warnings`, `cargo test --workspace`.
 
 ## Deviations during execution
 
@@ -8221,11 +8221,27 @@ from a task review, and each fix is its own commit after the task's.
 | 10 | 2a28428 | The double-run invariant is checked all along, not only inside `settles`: a checker in `TestCluster` samples every incarnation's statuses (the leaver's included) every 10 ms of the test clock, and each scenario ends with `assert_ran_once`. The rolling restart comes back at a new address (`at(n + 3)`, `TestNode.addr`); the crash's lower bound holds per pipeline for `duration − renewal_interval`; the split wait checks every node. |
 | 11 | — | The brief's "the two-node lifecycle scenario now runs on real gossip" overstates it: the E2E config has no `join_members` until Task 12, so each node gossips alone; the scenario tests the lease-only takeover. |
 | 12 | f37f6fc | The kill's bound is measured at the takeover (each new lease's `acquired_at` against the dead node's last `renewed_at`); the pause asserts the paused node's `lease_renew_failures_total{class="lost"}` and that every pipeline it held moved; `landed()` converges and epoch-checks all three lakes, every commit but `CREATE TABLE` carrying its epoch; a leave's leases are released or taken over when `terminate()` returns; the 5 s sleep before SIGCONT is dropped. The harness gains `lake_in`, `ids_in`, `converged_in` and `log_in`. |
-| 13 | f5a7e24 | D-M8a.22 amended (Oleksii's ruling): the stale reader is ended at most once a worker run, since the ended side's `Transient` starts a new busy spell. Test `an_ended_reader_that_comes_back_is_not_ended_again`. Blocks 8 and 9 were applied over Task 12's fix: no sleep, and `converged_within` removed with `converged` calling `converged_in`. |
+| 13 | f5a7e24 | D-M8a.22 amended (Oleksii's ruling): the stale reader is ended at most once, since the ended side's `Transient` starts a new busy spell. Test `an_ended_reader_that_comes_back_is_not_ended_again`. The whole-branch review found the flag per worker run too narrow (see below). Blocks 8 and 9 were applied over Task 12's fix: no sleep, and `converged_within` removed with `converged` calling `converged_in`. |
+
+**The whole-branch review** (7329b48..353e734): no Critical; two Important, both fixed before
+the PR, with one more finding and two Minors; the other deferred minors left (the SDD ledger has
+each reason).
+
+| Commit | Fix |
+|---|---|
+| b01c06e | The stale reader is ended at most once a **lease term**, not a worker run: `WorkerError::Contended` is retried by the controller under the same lease, and each rerun began with a fresh flag. `WorkerDeps.reader_ended` is one `Arc<AtomicBool>` per `reconcile` call, shared by its runs. Test `a_stale_reader_is_ended_once_a_lease_term`. |
+| 90174f9 | The leave is bounded: a dead gossip (its members channel closed) skips the hand-off, and a drain past `drain_timeout × ceil(pipelines / max_concurrent_handoffs) + 2 × lease_renewal_interval` ends in the uncapped shutdown, which releases only a lease still held after its worker stopped. The reconciler logs once when its gossip stops. Tests `a_leave_whose_gossip_stopped_releases_at_once`, `a_leave_past_its_bound_drains_the_rest`. |
+| 410d793 | The cold-start warning names the likely case first; `Joined`'s `Debug` redacts the anchor's key; `wire.rs` says the MAC doesn't stop a replay. |
+
+Left for later: a process's worst-case stop is now `within + drain_timeout` (130 s with one
+pipeline at the defaults: 60 s + 2 × 5 s, then 60 s), above Kubernetes' default 30 s grace period: M11's operator docs size
+`terminationGracePeriodSeconds` from it.
 
 **Counts.** From Task 5 on, the workspace runs one more test than the plan says; from Task 8 on,
-two; after Task 13's fix, three: 1145 at the end, against the plan's 1142.
+two; after Task 13's fix, three; after the whole-branch review's fixes, 1150, against the plan's
+1142.
 
-**Measured at the end of execution.** The full E2E suite passed 37/37 on PostgreSQL and on MySQL
-8.4 at 89b83ff; after f5a7e24, `cluster::` passed 4/4 on PostgreSQL in 141 s (189 s before
-Task 13). The deferred minors go to the whole-branch review.
+**Measured at the end of execution.** At 410d793 (the whole-branch review's fixes), the full E2E
+suite passed 37/37 on PostgreSQL 18 (381 s) and on MySQL 8.4 (423 s), with no stray process; the
+workspace runs 1150 tests and the gates are clean. `mysql-84-nogtid` and `mariadb-118` run in the
+PR's CI.
