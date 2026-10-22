@@ -1,13 +1,15 @@
 //! `data-avalanche run`.
 
 use std::future::IntoFuture;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use data_avalanche_cluster::{
-    ClusterReconciler, ControllerDeps, ControllerSettings, LeaseTiming, Member, Members, NodeMeta,
-    Phase, ReconcilerSettings, node_identity,
+    ClusterReconciler, ControllerDeps, ControllerSettings, Gossip, GossipKey, GossipSettings,
+    LeaseTiming, NodeIdentity, NodeMeta, Phase, ReconcilerSettings, Seeds, Udp, advertise,
+    discover, interfaces, join as join_gossip, leave, node_identity,
 };
 use data_avalanche_config::{
     Diagnostic, FingerprintKey, ProcessEnv, Report, ResolvedConfig, Severity, load_str,
@@ -16,7 +18,7 @@ use data_avalanche_pipeline::{Backoff, Tuning};
 use data_avalanche_state::Leases;
 use data_avalanche_telemetry::Metrics;
 use thiserror::Error;
-use tokio::sync::{Semaphore, oneshot, watch};
+use tokio::sync::{Semaphore, oneshot};
 
 use crate::http::{self, Http};
 use crate::startup::{Buckets, join};
@@ -151,31 +153,55 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
             usize::try_from(c.max_concurrent_handoffs).unwrap_or(usize::MAX),
         )),
     };
-    // This node alone until the gossip runs.
-    let me = Member {
-        addr: ([0, 0, 0, 0], 0).into(),
-        meta: NodeMeta {
-            phase: Phase::Active,
-            config_generation: 0,
-            build: env!("CARGO_PKG_VERSION").to_owned(),
-        },
-        suspect: false,
-    };
-    let (_alone, members) = watch::channel(Members {
-        me: deps.holder.node_id.clone(),
-        nodes: [(deps.holder.node_id.clone(), me)].into(),
-    });
     let mut pipelines = Vec::new();
     for p in config.pipelines.values() {
         pipelines.push((p.clone(), buckets.pipeline_docs(p)?));
     }
-    let reconciler =
-        ClusterReconciler::start(pipelines, &deps, members, ReconcilerSettings::new(c));
+    // The gossip (Clustering §2–§3): joining until a peer answers, then active.
+    let m = &c.memberlist;
+    let bind: Vec<SocketAddr> = m
+        .bind_addr
+        .iter()
+        .map(|ip| SocketAddr::new(*ip, m.bind_port))
+        .collect();
+    let (udp, inbox) = Udp::bind(&bind)
+        .await
+        .map_err(|e| Fatal::Startup(e.to_string()))?;
+    let addr = advertise(m, &interfaces())
+        .await
+        .map_err(|e| Fatal::Config(e.to_string()))?;
+    let mut own = udp.local_addrs();
+    own.push(addr);
+    let me = NodeIdentity {
+        node_id: deps.holder.node_id.clone(),
+        incarnation: deps.holder.incarnation,
+        rev: 0,
+        addr,
+        meta: NodeMeta {
+            phase: Phase::Joining,
+            config_generation: joined.generation,
+            build: env!("CARGO_PKG_VERSION").to_owned(),
+        },
+    };
+    let key = GossipKey::derive(&joined.fingerprint_key);
+    let gossip = Gossip::start(me, key, GossipSettings::new(m), Arc::new(udp), inbox);
+    tracing::info!(%addr, bound = ?bind, "gossip started");
+    let seeds = Seeds::new(c);
+    let seeded = !seeds.is_empty();
+    let discovery = discover(seeds, own, gossip.announcer(), gossip.members());
+    join_gossip(&gossip, seeded).await;
+    let reconciler = ClusterReconciler::start(
+        pipelines,
+        &deps,
+        gossip.members(),
+        ReconcilerSettings::new(c),
+    );
     ready.store(true, Ordering::SeqCst);
     shutdown_signal().await;
-    tracing::info!("shutting down: draining every pipeline and releasing its lease");
+    tracing::info!("shutting down: handing off every pipeline and releasing its lease");
     ready.store(false, Ordering::SeqCst);
-    reconciler.shutdown().await;
+    discovery.abort();
+    leave(gossip, reconciler).await;
     let _ = stop_http.send(());
     let _ = server.await;
     tracing::info!("stopped");

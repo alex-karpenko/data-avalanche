@@ -105,6 +105,10 @@ impl Buckets {
 pub(crate) struct Joined {
     pub config: ResolvedConfig,
     pub globals: DocStore,
+    /// The anchor's: the gossip's packets are authenticated with a key derived from it.
+    pub fingerprint_key: [u8; 32],
+    /// The config generation the node runs.
+    pub generation: u64,
 }
 
 /// Steps 2–5 of the startup sequence; `first` is the config loaded with a throwaway key.
@@ -167,7 +171,12 @@ pub(crate) async fn join(
             named(&adopted)
         )));
     }
-    Ok(Joined { config, globals })
+    Ok(Joined {
+        config,
+        globals,
+        fingerprint_key: anchor.fingerprint_key,
+        generation: generation.pointer.doc.generation,
+    })
 }
 
 #[cfg(test)]

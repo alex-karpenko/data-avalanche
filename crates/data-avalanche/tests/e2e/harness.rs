@@ -46,6 +46,14 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// A free UDP port on loopback: a node's gossip port.
+pub fn free_udp_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .and_then(|s| s.local_addr())
+        .expect("a free UDP port")
+        .port()
+}
+
 /// What a test sets beyond the defaults (YAML flow entries, each starting with `, `).
 #[derive(Debug, Clone, Default)]
 pub struct Options<'a> {
@@ -89,7 +97,9 @@ pub struct E2e {
     /// The first node's (`n1`) API port.
     port: u16,
     dir: tempfile::TempDir,
-    /// The config with `@NODE@` and `@PORT@` to fill per node.
+    /// The config every node runs; its per-node values come from `E2E_*` variables, as a
+    /// cluster's one config takes them from each pod's environment (D-3: a node runs the
+    /// cluster's generation, not its own file).
     template: String,
     pub db: Db,
 }
@@ -155,22 +165,12 @@ impl E2e {
             db,
         };
         e.template = e.yaml(&o);
-        e.write_config("n1", e.port);
+        std::fs::write(e.config_path(), &e.template).expect("the config file");
         e
     }
 
-    fn config_path(&self, node: &str) -> PathBuf {
-        self.dir.path().join(format!("config-{node}.yaml"))
-    }
-
-    fn write_config(&self, node: &str, port: u16) -> PathBuf {
-        let path = self.config_path(node);
-        let text = self
-            .template
-            .replace("@NODE@", node)
-            .replace("@PORT@", &port.to_string());
-        std::fs::write(&path, text).expect("the config file");
-        path
+    fn config_path(&self) -> PathBuf {
+        self.dir.path().join("config.yaml")
     }
 
     /// The `source` block of a pipeline named `test` (on PostgreSQL the slot and publication
@@ -243,13 +243,13 @@ impl E2e {
 globals:
   cloud: aws
   state: {{ bucket: {bucket}, prefix: {prefix}/globals }}
-  api: {{ address: "127.0.0.1:@PORT@" }}
+  api: {{ address: "127.0.0.1:${{E2E_API_PORT}}" }}
   log: {{ level: info, format: compact }}
   cluster:
     lease_duration: 6s
     lease_renewal_interval: 2s
     drain_timeout: 30s
-    memberlist: {{ node_name: "@NODE@" }}
+    memberlist: {{ node_name: "${{E2E_NODE}}", bind_addr: [127.0.0.1], bind_port: "${{E2E_GOSSIP_PORT}}", advertise_addr: 127.0.0.1, advertise_port: "${{E2E_ADVERTISE_PORT}}" }}
 pipelines:
   {test}:
     id: {test}
@@ -271,17 +271,18 @@ pipelines:
 
     /// Starts the binary as node `n1`; `env` adds variables (a crash point).
     pub fn start(&self, env: &[(&str, &str)]) -> Proc {
-        self.spawn(&self.config_path("n1"), self.port, env)
+        self.spawn("n1", self.port, env)
     }
 
     /// Starts the binary as another node, with its own name and API port.
     pub fn start_node(&self, node: &str) -> Proc {
-        let port = free_port();
-        let path = self.write_config(node, port);
-        self.spawn(&path, port, &[])
+        self.spawn(node, free_port(), &[])
     }
 
-    fn spawn(&self, config: &std::path::Path, port: u16, env: &[(&str, &str)]) -> Proc {
+    /// Runs node `node` with its API on `port`, gossiping alone on a loopback port of its own;
+    /// `env` adds variables (and may set `E2E_ADVERTISE_PORT`).
+    fn spawn(&self, node: &str, port: u16, env: &[(&str, &str)]) -> Proc {
+        let gossip = free_udp_port().to_string();
         let log = self.dir.path().join(format!(
             "run-{}.log",
             std::time::SystemTime::now()
@@ -293,7 +294,7 @@ pipelines:
         let err = out.try_clone().expect("the log file");
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_data-avalanche"));
         cmd.args(["run", "--config"])
-            .arg(config)
+            .arg(self.config_path())
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("AWS_ACCESS_KEY_ID", RUSTFS_ACCESS_KEY)
@@ -302,6 +303,10 @@ pipelines:
             .env("AWS_ENDPOINT_URL", RUSTFS_URL)
             .env("AWS_ALLOW_HTTP", "true")
             .env("RUST_BACKTRACE", "1")
+            .env("E2E_NODE", node)
+            .env("E2E_API_PORT", port.to_string())
+            .env("E2E_GOSSIP_PORT", &gossip)
+            .env("E2E_ADVERTISE_PORT", &gossip)
             .stdin(Stdio::null())
             .stdout(out)
             .stderr(err);

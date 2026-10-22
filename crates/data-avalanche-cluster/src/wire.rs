@@ -5,7 +5,6 @@
 //! tests carry them over a hub instead.
 
 use std::fmt;
-use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -13,6 +12,8 @@ use bytes::{Bytes, BytesMut};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+
+use crate::ClusterError;
 
 /// The MAC's length: a full BLAKE3 output.
 pub const MAC_LEN: usize = 32;
@@ -83,13 +84,17 @@ impl Udp {
     ///
     /// # Errors
     /// An address can't be bound.
-    pub async fn bind(addrs: &[SocketAddr]) -> io::Result<(Self, mpsc::Receiver<Bytes>)> {
+    pub async fn bind(addrs: &[SocketAddr]) -> Result<(Self, mpsc::Receiver<Bytes>), ClusterError> {
         let (inbox, rx) = mpsc::channel(INBOX);
         let (mut sockets, mut readers) = (Vec::new(), Vec::new());
         for addr in addrs {
-            let socket = Arc::new(UdpSocket::bind(addr).await?);
+            let bind = |source| ClusterError::Bind {
+                addr: *addr,
+                source,
+            };
+            let socket = Arc::new(UdpSocket::bind(addr).await.map_err(bind)?);
             let (out, mut queued) = mpsc::channel::<(SocketAddr, Bytes)>(INBOX);
-            sockets.push((socket.local_addr()?, out));
+            sockets.push((socket.local_addr().map_err(bind)?, out));
             let s = Arc::clone(&socket);
             tokio::spawn(async move {
                 while let Some((to, packet)) = queued.recv().await {
@@ -174,6 +179,16 @@ mod tests {
         assert_ne!(ours, theirs);
         assert_eq!(ours.open(&theirs.seal(b"ping")), None);
         assert_eq!(format!("{ours:?}"), "GossipKey(..)");
+    }
+
+    #[tokio::test]
+    async fn an_address_taken_is_an_error_naming_it() {
+        let (a, _in) = Udp::bind(&[SocketAddr::from(([127, 0, 0, 1], 0))])
+            .await
+            .unwrap();
+        let taken = a.local_addrs()[0];
+        let e = Udp::bind(&[taken]).await.unwrap_err();
+        assert!(e.to_string().contains(&taken.to_string()), "{e}");
     }
 
     #[tokio::test]

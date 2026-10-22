@@ -31,6 +31,11 @@ pub enum Seeds {
 }
 
 impl Seeds {
+    /// No seed configured: a node alone until another joins it.
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::Static(seeds) if seeds.is_empty())
+    }
+
     pub fn new(cluster: &Cluster) -> Self {
         let m = &cluster.memberlist;
         match (&cluster.discovery, &cluster.discovery_dns_name) {
