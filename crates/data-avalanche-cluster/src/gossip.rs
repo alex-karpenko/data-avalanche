@@ -221,7 +221,8 @@ enum Command {
 pub struct Announcer(mpsc::UnboundedSender<Command>);
 
 impl Announcer {
-    /// Asks `seeds` to let this node in. A seed is known by its address only.
+    /// Asks `seeds` to let this node in. A seed is known by its address only, and that must be
+    /// the one the seed advertises: foca drops an announce addressed elsewhere.
     pub fn announce(&self, seeds: Vec<SocketAddr>) {
         let _ = self.0.send(Command::Announce(seeds));
     }
@@ -283,11 +284,14 @@ impl Gossip {
         self.members.clone()
     }
 
-    /// Asks `seeds` to let this node in. A seed is known by its address only.
+    /// Asks `seeds` to let this node in. A seed is known by its address only, and that must be
+    /// the one the seed advertises: foca drops an announce addressed elsewhere.
     pub fn announce(&self, seeds: Vec<SocketAddr>) {
         self.announcer().announce(seeds);
     }
 
+    /// A handle that announces for this gossip, for a task that outlives a borrow of it
+    /// (discovery).
     pub fn announcer(&self) -> Announcer {
         Announcer(self.commands.clone())
     }

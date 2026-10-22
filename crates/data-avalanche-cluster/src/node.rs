@@ -16,9 +16,12 @@ pub async fn join(gossip: &Gossip, seeded: bool) {
         let mut members = gossip.members();
         let peer = tokio::time::timeout(JOIN_WAIT, members.wait_for(|m| m.peers() > 0)).await;
         match peer {
-            Ok(_) => tracing::info!("joined the gossip"),
-            Err(_) => tracing::info!(
-                "no gossip seed answered within {JOIN_WAIT:?}: going on alone, still asking"
+            Ok(Ok(_)) => tracing::info!("joined the gossip"),
+            Ok(Err(_)) => tracing::warn!("the gossip stopped before a seed answered"),
+            Err(_) => tracing::warn!(
+                "no gossip seed answered within {JOIN_WAIT:?}: going on alone, still asking (a seed \
+                 must be a peer's advertised address, advertise_addr:advertise_port, not a Service \
+                 or load-balancer address)"
             ),
         }
     }

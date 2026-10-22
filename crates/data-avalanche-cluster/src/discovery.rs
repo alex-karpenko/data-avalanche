@@ -3,6 +3,12 @@
 //! resolves to (a Kubernetes headless Service), at `advertise_port`. Seeds are asked at start and
 //! again every [`REDISCOVER`] while the node has no peer, so a node that lost them all, or
 //! started before them, finds its way back; once joined, SWIM carries the membership.
+//!
+//! A seed is named by the address its peer advertises: that peer's `advertise_addr` at
+//! `advertise_port`. foca accepts an announce only when it is addressed to the receiver's own
+//! identity, so one sent to a Service or load-balancer address, a NAT address, or a bind address
+//! that isn't advertised is dropped without a word. `dns` meets the rule when each pod advertises
+//! its Service A record (by default its first private IPv4) at a shared `advertise_port`.
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
