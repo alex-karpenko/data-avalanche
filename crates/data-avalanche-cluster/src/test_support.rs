@@ -589,6 +589,26 @@ pub(crate) struct TestCluster {
     pub factories: ByPipeline,
     ids: Vec<String>,
     docs: std::collections::BTreeMap<String, data_avalanche_state::PipelineDocs>,
+    registry: Registry,
+    violation: Arc<Mutex<Option<String>>>,
+    checker: tokio::task::JoinHandle<()>,
+}
+
+/// Every status a [`TestCluster`] started: node name, pipeline id, the controller's status.
+type Registry = Arc<
+    Mutex<
+        Vec<(
+            String,
+            String,
+            tokio::sync::watch::Receiver<crate::ControllerStatus>,
+        )>,
+    >,
+>;
+
+impl Drop for TestCluster {
+    fn drop(&mut self) {
+        self.checker.abort();
+    }
 }
 
 /// One node of a [`TestCluster`]. Dropped, it is a crash.
@@ -597,11 +617,48 @@ pub(crate) struct TestNode {
     pub name: String,
     pub gossip: crate::Gossip,
     pub reconciler: crate::ClusterReconciler,
+    pub addr: SocketAddr,
+}
+
+/// Every 10 ms of the test clock, the pipelines running on two or more nodes of `registry`:
+/// the first such sighting goes to `violation`. A status whose controller is gone (a crashed
+/// or left node) counts as not running.
+async fn check_once_running(registry: Registry, violation: Arc<Mutex<Option<String>>>) {
+    use crate::Actual;
+    let t = tokio::time::Instant::now();
+    loop {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let mut by: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for (node, id, rx) in registry.lock().unwrap().iter() {
+            let alive = rx.has_changed().is_ok();
+            if alive && matches!(rx.borrow().actual, Some(Actual::Starting | Actual::Running)) {
+                by.entry(id.clone()).or_default().push(node.clone());
+            }
+        }
+        let mut seen = violation.lock().unwrap();
+        if seen.is_none()
+            && let Some((id, nodes)) = by.iter().find(|(_, nodes)| nodes.len() > 1)
+        {
+            *seen = Some(format!(
+                "{id} ran on {nodes:?} at once, at {:?} of the test clock",
+                t.elapsed()
+            ));
+        }
+    }
 }
 
 impl TestCluster {
+    /// Also starts the checker, which samples the whole test, every 10 ms of the test clock,
+    /// that no pipeline is starting or running on two nodes (D-M8a.21's invariant, beyond
+    /// `settles`); [`Self::assert_ran_once`] reports it. Runs inside a tokio test.
     pub fn new(ids: &[&str]) -> Self {
+        let registry: Registry = Default::default();
+        let violation: Arc<Mutex<Option<String>>> = Default::default();
+        let checker = tokio::spawn(check_once_running(registry.clone(), violation.clone()));
         Self {
+            registry,
+            violation,
+            checker,
             hub: Hub::new(),
             store: ScriptedStore::new(),
             factories: ByPipeline(
@@ -666,10 +723,24 @@ impl TestCluster {
         };
         let reconciler =
             crate::ClusterReconciler::start(pipelines, &deps, gossip.members(), settings);
+        {
+            let mut registry = self.registry.lock().unwrap();
+            for (id, rx) in reconciler.statuses() {
+                registry.push((name.to_owned(), id, rx));
+            }
+        }
         TestNode {
             name: name.to_owned(),
             gossip,
             reconciler,
+            addr: at(n),
+        }
+    }
+
+    /// Panics with the first double run the checker saw, if any.
+    pub fn assert_ran_once(&self) {
+        if let Some(v) = self.violation.lock().unwrap().as_ref() {
+            panic!("{v}");
         }
     }
 

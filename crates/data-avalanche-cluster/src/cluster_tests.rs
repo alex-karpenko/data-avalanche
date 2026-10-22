@@ -1,6 +1,6 @@
 //! Three in-process nodes (their gossip on a hub, their leases in one store, paused time): the
-//! cluster's scenarios, each checking at every step that no pipeline runs on two nodes, and
-//! that the rows committed meanwhile all land.
+//! cluster's scenarios. The cluster's checker samples every 10 ms, all along, that no pipeline
+//! is starting or running on two nodes, and the rows committed meanwhile land.
 
 use std::time::Duration;
 
@@ -72,19 +72,39 @@ async fn three_nodes_spread_the_pipelines_and_each_runs_once() {
         let members = n.gossip.members().borrow().nodes.len();
         assert_eq!(members, 3, "{}", n.name);
     }
+    c.assert_ran_once();
 }
 
 /// `c` crashes: the others see it gone after the suspicion, and take its pipelines once their
-/// leases went a lease_duration unrenewed. The rows committed meanwhile land once.
+/// leases went a lease_duration unrenewed. The rows committed meanwhile land.
 #[tokio::test(start_paused = true)]
 async fn a_crashed_nodes_pipelines_are_taken_over_after_its_lease() {
     let c = TestCluster::new(&IDS);
     let (a, b, n3) = three(&c).await;
     c.insert(1);
     eventually("1 lands", || c.landed(&[1])).await;
+    let c_ids: Vec<String> = runners(&[&a, &b, &n3])
+        .into_iter()
+        .filter(|(_, on)| on == &["c"])
+        .map(|(id, _)| id)
+        .collect();
+    assert!(!c_ids.is_empty(), "c runs nothing");
     let t = Instant::now();
     drop(n3);
     c.insert(2);
+    // c's last renewal was at most a renewal_interval before the drop, so its leases can't
+    // have expired sooner: none of its pipelines moves before then.
+    while t.elapsed() < timing().duration - timing().renewal_interval {
+        let on = runners(&[&a, &b]);
+        for id in &c_ids {
+            assert!(
+                on[id].is_empty(),
+                "{id} taken over after {:?}, before c's lease could expire",
+                t.elapsed()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     settles("on a and b", &[&a, &b], placed(&["a", "b"])).await;
     let took = t.elapsed();
     assert!(
@@ -96,6 +116,7 @@ async fn a_crashed_nodes_pipelines_are_taken_over_after_its_lease() {
         "{took:?}"
     );
     eventually("2 lands", || c.landed(&[1, 2])).await;
+    c.assert_ran_once();
 }
 
 /// `{a, b} | {c}`: each side thinks the other died, but every lease is still renewed, so no
@@ -107,7 +128,9 @@ async fn a_partition_moves_no_pipeline_while_the_leases_hold() {
     let (a, b, n3) = three(&c).await;
     c.hub.cut(&[at(1), at(2)], &[at(3)]);
     eventually("split", || {
-        a.gossip.members().borrow().peers() == 1 && n3.gossip.members().borrow().peers() == 0
+        a.gossip.members().borrow().peers() == 1
+            && b.gossip.members().borrow().peers() == 1
+            && n3.gossip.members().borrow().peers() == 0
     })
     .await;
     c.insert(1);
@@ -124,10 +147,11 @@ async fn a_partition_moves_no_pipeline_while_the_leases_hold() {
     settles("whole again", &[&a, &b, &n3], placed(&["a", "b", "c"])).await;
     c.insert(2);
     eventually("2 lands", || c.landed(&[1, 2])).await;
+    c.assert_ran_once();
 }
 
-/// Every node leaves and comes back as its next incarnation, one at a time: each leave hands
-/// off without a lease wait, and the rows committed throughout land.
+/// Every node leaves and comes back as its next incarnation at a new address, one at a time:
+/// each leave hands off without a lease wait, and the rows committed throughout land.
 #[tokio::test(start_paused = true)]
 async fn a_rolling_restart_keeps_every_pipeline_running_once() {
     let c = TestCluster::new(&IDS);
@@ -146,13 +170,14 @@ async fn a_rolling_restart_keeps_every_pipeline_running_once() {
         left.await.unwrap();
         row += 1;
         c.insert(row);
-        // Back as its next incarnation, seeded by a node that stayed.
-        let seed = if n == 1 { at(2) } else { at(1) };
-        nodes.push(c.start(&name, n, 2, Some(seed)).await);
+        // Back as its next incarnation at a new address, seeded by a node that stayed.
+        let seed = nodes[0].addr;
+        nodes.push(c.start(&name, n + 3, 2, Some(seed)).await);
         tokio::time::sleep(STABLE).await;
         let refs: Vec<&TestNode> = nodes.iter().collect();
         settles(&format!("{name} back"), &refs, placed(&["a", "b", "c"])).await;
     }
     let all: Vec<i64> = (1..=row).collect();
     eventually("every row lands", || c.landed(&all)).await;
+    c.assert_ran_once();
 }
