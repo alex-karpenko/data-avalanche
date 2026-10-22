@@ -4,6 +4,8 @@
 //! lease, and the reconciler that tells each controller whether to own.
 
 pub mod claim;
+#[cfg(test)]
+mod cluster_tests;
 pub mod controller;
 pub mod discovery;
 mod error;

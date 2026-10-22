@@ -117,9 +117,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_leave_hands_every_pipeline_off_without_a_lease_wait() {
         let c = TestCluster::new(&IDS);
-        let a = c.start("a", 1, 1, None);
+        let a = c.start("a", 1, 1, None).await;
         settles("all on a", &[&a], |_| "a".into()).await;
-        let b = c.start("b", 2, 1, Some(at(1)));
+        let b = c.start("b", 2, 1, Some(at(1))).await;
         let two = Ring::new(["a", "b"], 128);
         tokio::time::sleep(STABLE).await;
         settles("spread over a and b", &[&a, &b], |id| {
@@ -151,14 +151,14 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_lone_node_leaves_by_releasing_its_leases() {
         let c = TestCluster::new(&IDS);
-        let a = c.start("a", 1, 1, None);
+        let a = c.start("a", 1, 1, None).await;
         settles("all on a", &[&a], |_| "a".into()).await;
         leave(a.gossip, a.reconciler).await;
         for id in IDS {
             let lease = leases(&c.store).observe(id).await.unwrap().unwrap();
             assert!(lease.doc.released, "{id}");
         }
-        let a2 = c.start("a", 1, 2, None);
+        let a2 = c.start("a", 1, 2, None).await;
         let t = Instant::now();
         settles("all on the next a", &[&a2], |_| "a".into()).await;
         assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());

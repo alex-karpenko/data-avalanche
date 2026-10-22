@@ -617,9 +617,15 @@ impl TestCluster {
         }
     }
 
-    /// Starts `name` at `at(n)` as its `incarnation`, active at once, announcing itself to
-    /// `seed`.
-    pub fn start(&self, name: &str, n: u8, incarnation: u64, seed: Option<SocketAddr>) -> TestNode {
+    /// Starts `name` at `at(n)` as its `incarnation`, as the binary does: its gossip joining,
+    /// announced to `seed`, then [`crate::join`], then its reconciler.
+    pub async fn start(
+        &self,
+        name: &str,
+        n: u8,
+        incarnation: u64,
+        seed: Option<SocketAddr>,
+    ) -> TestNode {
         let (port, inbox) = self.hub.port(at(n));
         let me = crate::NodeIdentity {
             node_id: name.to_owned(),
@@ -627,7 +633,7 @@ impl TestCluster {
             rev: 0,
             addr: at(n),
             meta: crate::NodeMeta {
-                phase: crate::Phase::Active,
+                phase: crate::Phase::Joining,
                 config_generation: 1,
                 build: "1.0.0".into(),
             },
@@ -637,6 +643,7 @@ impl TestCluster {
         if let Some(seed) = seed {
             gossip.announce(vec![seed]);
         }
+        crate::join(&gossip, seed.is_some()).await;
         let mut deps = deps(
             name,
             &self.store,
