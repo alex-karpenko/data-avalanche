@@ -22,8 +22,10 @@ data-avalanche-telemetry.workspace = true
 foca.workspace = true
 gethostname.workspace = true
 getrandom.workspace = true
+if-addrs.workspace = true
 rand.workspace = true
 serde.workspace = true
+thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "sync"] }
 tracing.workspace = true
 xxhash-rust.workspace = true

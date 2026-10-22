@@ -12,7 +12,8 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::{
-    Actual, ControllerDeps, ControllerStatus, Members, PipelineController, Placement, Target,
+    Actual, ClusterError, ControllerDeps, ControllerStatus, Members, PipelineController, Placement,
+    Target,
 };
 
 /// This node as a lease holder (Clustering §3.4, D-1): `node_id` is
@@ -21,19 +22,19 @@ use crate::{
 ///
 /// # Errors
 /// No `node_name` and no usable hostname.
-pub fn node_identity(cluster: &Cluster, started: SystemTime) -> Result<Holder, String> {
+pub fn node_identity(cluster: &Cluster, started: SystemTime) -> Result<Holder, ClusterError> {
     let node_id = match &cluster.memberlist.node_name {
         Some(name) => name.clone(),
-        None => gethostname::gethostname().into_string().map_err(|h| {
-            format!("the hostname {h:?} isn't UTF-8: set globals.cluster.memberlist.node_name")
-        })?,
+        None => gethostname::gethostname()
+            .into_string()
+            .map_err(|h| ClusterError::NodeName(format!("the hostname {h:?} isn't UTF-8")))?,
     };
     if node_id.is_empty() {
-        return Err("the hostname is empty: set globals.cluster.memberlist.node_name".into());
+        return Err(ClusterError::NodeName("the hostname is empty".into()));
     }
     let incarnation = started
         .duration_since(UNIX_EPOCH)
-        .map_err(|e| format!("the clock is before 1970: {e}"))?
+        .map_err(|e| ClusterError::NodeName(format!("the clock is before 1970: {e}")))?
         .as_millis();
     Ok(Holder {
         node_id,

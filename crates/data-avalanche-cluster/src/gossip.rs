@@ -216,6 +216,17 @@ enum Command {
     Leave(oneshot::Sender<()>),
 }
 
+/// Sends a running gossip's announces; cheap to clone.
+#[derive(Debug, Clone)]
+pub struct Announcer(mpsc::UnboundedSender<Command>);
+
+impl Announcer {
+    /// Asks `seeds` to let this node in. A seed is known by its address only.
+    pub fn announce(&self, seeds: Vec<SocketAddr>) {
+        let _ = self.0.send(Command::Announce(seeds));
+    }
+}
+
 /// A running gossip. Dropping it stops the gossip without a leave, as a crash would.
 #[derive(Debug)]
 pub struct Gossip {
@@ -274,7 +285,11 @@ impl Gossip {
 
     /// Asks `seeds` to let this node in. A seed is known by its address only.
     pub fn announce(&self, seeds: Vec<SocketAddr>) {
-        let _ = self.commands.send(Command::Announce(seeds));
+        self.announcer().announce(seeds);
+    }
+
+    pub fn announcer(&self) -> Announcer {
+        Announcer(self.commands.clone())
     }
 
     /// Tells the others this node's new phase.

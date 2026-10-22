@@ -5,6 +5,8 @@
 
 pub mod claim;
 pub mod controller;
+pub mod discovery;
+mod error;
 pub mod gossip;
 pub mod lease;
 pub mod node;
@@ -20,9 +22,13 @@ pub use controller::{
     Actual, ControllerDeps, ControllerSettings, ControllerStatus, Parts, PipelineController,
     Target, WorkerFactory,
 };
-pub use gossip::{Gossip, GossipSettings, Member, Members, NodeIdentity, NodeMeta, Phase};
+pub use discovery::{Seeds, advertise, discover, interfaces};
+pub use error::ClusterError;
+pub use gossip::{
+    Announcer, Gossip, GossipSettings, Member, Members, NodeIdentity, NodeMeta, Phase,
+};
 pub use lease::{LeaseGuard, LeaseRun, LeaseTiming, RenewEnd, RenewState};
-pub use node::leave;
+pub use node::{JOIN_WAIT, join, leave};
 pub use placement::Placement;
 pub use reconciler::{ClusterReconciler, ReconcilerSettings, node_identity};
 pub use ring::Ring;

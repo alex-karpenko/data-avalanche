@@ -1,6 +1,29 @@
-//! A node's way out of the cluster (Clustering §3.5, §8.3).
+//! A node's way into the cluster and out of it (Clustering §3.3, §3.5, §8.3).
+
+use std::time::Duration;
 
 use crate::{ClusterReconciler, Gossip, Phase};
+
+/// How long a starting node with seeds waits for its first peer before it goes on alone.
+pub const JOIN_WAIT: Duration = Duration::from_secs(5);
+
+/// Takes a node that started its gossip as `Joining` to `Active`. With seeds (`seeded`), it
+/// first waits, at most [`JOIN_WAIT`], to hear from a peer: a node that knows the cluster
+/// before its first ring takes the others' rings as they are and waits for its own place
+/// (`Placement`), where a node that knew no one would place everything on itself first.
+pub async fn join(gossip: &Gossip, seeded: bool) {
+    if seeded {
+        let mut members = gossip.members();
+        let peer = tokio::time::timeout(JOIN_WAIT, members.wait_for(|m| m.peers() > 0)).await;
+        match peer {
+            Ok(_) => tracing::info!("joined the gossip"),
+            Err(_) => tracing::info!(
+                "no gossip seed answered within {JOIN_WAIT:?}: going on alone, still asking"
+            ),
+        }
+    }
+    gossip.set_phase(Phase::Active);
+}
 
 /// Leaves the cluster on a shutdown. With peers, the node drains first (Clustering §8.3): its
 /// phase becomes `Draining`, which takes it off every ring at once, so each pipeline it runs is
@@ -30,7 +53,59 @@ mod tests {
 
     use super::*;
     use crate::Ring;
-    use crate::test_support::{STABLE, TestCluster, at, eventually, leases, settles, timing};
+    use crate::test_support::{
+        Hub, STABLE, TestCluster, at, eventually, gossip_settings, leases, settles, timing,
+    };
+
+    fn joining(hub: &std::sync::Arc<Hub>, name: &str, n: u8) -> Gossip {
+        let (port, inbox) = hub.port(at(n));
+        let me = crate::NodeIdentity {
+            node_id: name.into(),
+            incarnation: 1,
+            rev: 0,
+            addr: at(n),
+            meta: crate::NodeMeta {
+                phase: Phase::Joining,
+                config_generation: 1,
+                build: "1.0.0".into(),
+            },
+        };
+        let key = crate::GossipKey::derive(&[7; 32]);
+        Gossip::start(me, key, gossip_settings(), std::sync::Arc::new(port), inbox)
+    }
+
+    fn phase(g: &Gossip, of: &str) -> Option<Phase> {
+        g.members().borrow().nodes.get(of).map(|m| m.meta.phase)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_node_without_seeds_is_active_at_once() {
+        let hub = Hub::new();
+        let a = joining(&hub, "a", 1);
+        let t = Instant::now();
+        join(&a, false).await;
+        assert_eq!(t.elapsed(), Duration::ZERO);
+        eventually("a active", || phase(&a, "a") == Some(Phase::Active)).await;
+    }
+
+    /// A seed that answers: active once a peer is known; one that doesn't: alone after the wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_node_with_seeds_waits_for_a_peer_then_is_active() {
+        let hub = Hub::new();
+        let a = joining(&hub, "a", 1);
+        join(&a, false).await;
+        let b = joining(&hub, "b", 2);
+        b.announce(vec![at(1)]);
+        join(&b, true).await;
+        assert_eq!(b.members().borrow().peers(), 1);
+        eventually("b active on a", || phase(&a, "b") == Some(Phase::Active)).await;
+        let c = joining(&hub, "c", 3);
+        c.announce(vec![at(9)]);
+        let t = Instant::now();
+        join(&c, true).await;
+        assert_eq!(t.elapsed(), JOIN_WAIT);
+        assert_eq!(c.members().borrow().peers(), 0);
+    }
 
     const IDS: [&str; 4] = ["orders", "events", "customers", "users"];
 

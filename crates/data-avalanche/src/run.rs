@@ -122,7 +122,8 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         })
         .into_future(),
     );
-    let holder = node_identity(&first.config.globals.cluster, started).map_err(Fatal::Config)?;
+    let holder = node_identity(&first.config.globals.cluster, started)
+        .map_err(|e| Fatal::Config(e.to_string()))?;
     let buckets = Buckets::new(&first.config.globals);
     let joined = join(&buckets, &holder.node_id, &text, &first.config).await?;
     let config = joined.config;
