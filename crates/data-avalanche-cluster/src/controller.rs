@@ -1089,6 +1089,9 @@ mod tests {
             matches!(s.actual, Some(Actual::Standby { .. }))
         })
         .await;
+        let lost = format!(r#"data_avalanche_lease_renew_failures_total{{{P},class="lost"}} 1"#);
+        let text = n.metrics.encode();
+        assert!(line(&text, &lost), "the loss outlives the standby\n{text}");
         f.source.commit(FakeTxn::new().insert(&t("a"), row(1)));
         tokio::time::sleep(Duration::from_secs(5)).await;
         assert!(
@@ -1099,6 +1102,8 @@ mod tests {
         until(&mut n.status, "running again", is(Actual::Running)).await;
         assert_eq!(n.status.borrow().owner_epoch, Some(2));
         eventually("the row lands", || f.ids("a") == [1]).await;
+        let text = n.metrics.encode();
+        assert!(line(&text, &lost), "the next term counts on\n{text}");
     }
 
     /// A stop drains: what the worker read is committed before it ends, though the commit

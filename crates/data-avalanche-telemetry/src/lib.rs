@@ -83,8 +83,6 @@ pub enum RenewFailure {
 }
 
 impl RenewFailure {
-    const ALL: [Self; 3] = [Self::Transient, Self::Conflict, Self::Lost];
-
     fn label(self) -> &'static str {
         match self {
             Self::Transient => "transient",
@@ -304,7 +302,7 @@ struct Seen {
 }
 
 /// One pipeline's series. The controller that owns the pipeline sets them; [`Self::remove`]
-/// drops them once the node no longer owns it.
+/// drops them, but the renew failures, once the node no longer owns it.
 #[derive(Debug)]
 pub struct PipelineMetrics {
     families: Arc<Families>,
@@ -444,7 +442,9 @@ impl PipelineMetrics {
             .totals = Totals::default();
     }
 
-    /// Drops every series of the pipeline: the node no longer owns it.
+    /// Drops the pipeline's series: the node no longer owns it. The renew failures stay, a
+    /// counter for the node's whole run: the loss that ends an ownership is still scraped after
+    /// it, and a later term counts on.
     pub fn remove(&self) {
         let f = &self.families;
         let base = self.base();
@@ -455,10 +455,6 @@ impl PipelineMetrics {
         for s in LeaseState::ALL {
             f.lease_state
                 .remove(&self.labels.with(&[("state", s.label())]));
-        }
-        for c in RenewFailure::ALL {
-            f.lease_renew_failures
-                .remove(&self.labels.with(&[("class", c.label())]));
         }
         f.lease_renew_latency.remove(&base);
         for family in [
