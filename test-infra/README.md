@@ -91,6 +91,13 @@ the Docker CLI. The faults no server can be asked for (a corrupted compressed tr
 failover behind one address) come from a test-only TCP proxy in the suite (`proxy.rs`), which
 reads the protocol in the clear: the suite's pipelines use `ssl_mode: disable`.
 
+Each binary the suite starts is a node of its own: its name, API port and gossip port come from
+`E2E_*` variables, as a cluster's one config takes them from each pod's environment (a node runs
+the cluster's config generation, not its own file). The cluster scenarios (`cluster.rs`) run
+three nodes as three processes on loopback, each behind a test-only UDP forwarder
+(`forwarder.rs`) that drops a chosen side's gossip (a partition); they also `kill -9`, SIGTERM
+and SIGSTOP the nodes. They need no service beyond the source and RustFS.
+
 ## GCS: a real bucket, not an emulator
 
 `fake-gcs-server` 1.56.1 rejects `object_store`'s path-style PUT (`400 invalid uploadType`) and

@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-20
+updated: 2026-10-22
 domain: Architecture
 tags: [gap-analysis, design, re-derivation, spec-readiness, blockers, open-decisions]
 resolves: []
@@ -129,14 +129,14 @@ does not block starting the specification.
 > updated 2026-10-02 for the gaps M5 carried (§27), 2026-10-03 for DA-SNAP-9 and DA-SNAP-10 (§28),
 > 2026-10-07 for the M6a whole-branch review (§28.2), 2026-10-08 for M6b's planning findings
 > (§29), 2026-10-13 for M6b's exit (§30), 2026-10-14 for M7's planning (§31), 2026-10-14 for
-> M7a's plan (§32), 2026-10-16 for M7a's exit (§33), 2026-10-17 for M7b's plan (§34), and
-> 2026-10-20 for M7b's exit (§35).
+> M7a's plan (§32), 2026-10-16 for M7a's exit (§33), 2026-10-17 for M7b's plan (§34),
+> 2026-10-20 for M7b's exit (§35), 2026-10-21 for M8a's plan (§36), and 2026-10-22 for M8a's exit (§37).
 
 | Status | Count (v1 scope) | Notes |
 |---|---|---|
 | ✅ Resolved | the large majority | Design closed by a research/spec doc or a probe. |
 | 🔄 Partial | 2 | DA-SNAP-7, DA-SRC-9 (neither blocks the plan); DA-SNAP-10 ✅ 2026-10-16 (M7a merged, §33). DA-MS-3 is a decided caveat. DA-X-8 ✅ 2026-09-26; DA-SRC-16 and DA-X-12 ✅ 2026-10-13 (§30). |
-| 🟥 Open (v1) | **21** | DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2); DA-CLUS-14, DA-API-11, DA-OPS-7 and DA-SRC-20 🆕 2026-10-13 (§30.1); DA-SRC-21 🆕 2026-10-14 (§31.2); DA-SRC-22, DA-SNAP-14 and DA-X-13 🆕 2026-10-14 (§32.1); DA-SRC-24…26 🆕 2026-10-16 (§33.1); DA-OBS-6 🆕 2026-10-17 (§34.1). DA-SRC-27 and DA-X-14 ✅ 2026-10-20 (§35). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
+| 🟥 Open (v1) | **20** | DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2); DA-API-11 and DA-SRC-20 🆕 2026-10-13 (§30.1); DA-SRC-21 🆕 2026-10-14 (§31.2); DA-SRC-22, DA-SNAP-14 and DA-X-13 🆕 2026-10-14 (§32.1); DA-SRC-24…26 🆕 2026-10-16 (§33.1); DA-OBS-6 🆕 2026-10-17 (§34.1); DA-OPS-8 🆕 2026-10-21 (§36.1). DA-CLUS-14, DA-OPS-7 and DA-SRC-28 ✅ 2026-10-22 (§37). DA-SRC-27 and DA-X-14 ✅ 2026-10-20 (§35). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
 | 🧪 Verify (v1) | **0** | DA-SRC-10/11 proven 2026-09-26 (§21). |
 | ⏭ v2 | 13 | Iceberg-sink items (§26.2). |
 | 🟢 Spec-merge debt | **0** | All applied 2026-09-26 (§26.6): §19.3 S-1…S-6, the DA-X-8 config residual, the D-V1 patches and the Data-Flow Phase 2a probe details. |
@@ -274,6 +274,7 @@ paper** and is this report's top blocker.
 | DA-CLUS-11 | Lease timing defaults vs failover SLA | 🟡 | ✅ | §18 D-6 — **Balanced** ratified (`lease_duration=15s`, `renewal=5s`, ~20–22s unowned window). Tunable. | D-6 |
 | DA-CLUS-12 | `kubernetes` lock_backend (K8s Lease API) | 🟢 | ✅ (deferred) | Reserved as a future `LeaseStore` impl; **only `storage` is built for v1** (V-075). A genuine but deliberately deferred scope item. **✅ 2026-09-26 — deferral confirmed (`V1_Scope_Decisions.md` §2).** | D-2 |
 | DA-CLUS-13 | Per-source-endpoint takeover bulkhead | 🟢 | ✅ (deferred) | §20.2 notes the sharper risk (many pipelines on one source DB reconnecting together) as a **future** per-endpoint concurrency group; v1 cap is per-node-global. **✅ 2026-09-26 — deferral confirmed (`V1_Scope_Decisions.md` §2).** | D-10 |
+| DA-CLUS-14 | A lease store and a lake that disagree on the epoch (a moved, restored or deleted `globals.state`) | 🟢 | ✅ | ✅ 2026-10-22 (§37): a fenced worker's claim takes its own lease over at `max(stored + 1, current_epoch + 1)` in one step (`Leases::take_over_at`, `Claim::at_least`); a second fence after that jump is an `ERROR` naming another lease store, with the lease kept; a stop spends the jump, so the ERROR's remedy (stop, resume) climbs once more. Another holder's lease is never touched by the floor. M8a Task 8 (D-M8a.14) | — |
 
 ---
 
@@ -399,6 +400,7 @@ the MySQL path with one genuine correctness dependency.
 | DA-SRC-25 | 🆕 A case-only column rename reads as a rename | 🟢 | 🟥 | §33.1. Column names compare without case (as MySQL's do), so a column whose name changed in case alone diffs as a proven `RenameColumn`; the Delta sink doesn't apply renames, so the table halts or degrades for what is, to MySQL, the same column. Candidate: a case-only rename updates the cached name without an evolution. | — |
 | DA-SRC-26 | 🆕 A MariaDB rollback after tracked rows halts the pipeline | 🟢 | 🟥 | §33.1. MariaDB logs the rows a rollback undid in a transaction with non-transactional changes, then `ROLLBACK TO` or `ROLLBACK` (measured, 10.11–11.8); M7a halts on one with tracked rows, since the stream already emitted them. Fail-closed, but a false halt for a tracked MyISAM table (whose rows stand) and an outage for an application using savepoints across engines. Candidate: hold a transaction's rows until its end, drop those after the savepoint, keep a non-transactional table's. | — |
 | DA-SRC-27 | A MySQL stream ended once with "Packets out of sync" | 🟢 | ✅ | ✅ 2026-10-20 (§35): the candidate cause was real and is fixed. `Connector::command` now takes the catalog connection out of its slot for a call and puts it back only when the call completes, so a call dropped mid-query drops its connection; a transient error names the call. The likeliest trigger was the session's `select!` dropping `MySqlStream::next()` during a DDL's catalog read. An IT drops a call mid-`SLEEP(3)`: on the old code the next query waited 2.8 s for the abandoned reply, now it answers at once (`connect.rs` `a_call_dropped_mid_query_does_not_poison_the_next`). That this was the observed occurrence is inferred, not reproduced; reopen if CI logs it again. The original record: in M7b Task 7's E2E run on `mysql-84` the worker logged `reconnecting to the source: Packets out of sync` about 3 s after the pipeline started (`mysql_async`'s `PacketOutOfSync`: a connection read a reply it didn't expect). The reconnect recovered and nothing was lost. The log doesn't name the failing call, and the E2E harness prints a test's log only when it fails, so the frequency is unknown. A candidate cause, unproven: `Connector::command` keeps the shared catalog connection in its slot while a query runs, so a caller dropped mid-query (the session's heartbeat read, aborted when a session ends; an aborted chunk read) leaves a connection with an unread reply for the next query. It doesn't obviously fit this case (no earlier session had ended in the process). Next: name the call in the reconnect's log; take the connection out of the slot for a call and put it back only when the call completes | — |
+| DA-SRC-28 | A takeover after a pause can't stream on PostgreSQL until the old walsender times out | 🟢 | ✅ | ✅ 2026-10-22 (§37): on the first busy attempt of a spell, a worker that holds its lease ends the slot's walsender of the pipeline's own role (`pg_terminate_backend(pid, 5000)`), then retries from the first backoff step. At most once a lease term, so two holders that each believe they hold the lease (two lease stores on one slot) can't end each other in turn: the later spell gives up with `Contended`. Another role's reader is never ended. The E2E pause scenario's wait went from 150 s to the suite's 60 s (4 scenarios: 189 s → 141 s). M8a Task 13 (D-M8a.22) | — |
 
 ---
 
@@ -461,7 +463,7 @@ pinning is the remaining cross-cutting concern.
 | DA-OPS-3 | `glue.strip_schema` collision handling | 🟢 | ✅ | G-11.3 — collision = config error; non-stripped = `schema__table`. | G-11.3 |
 | DA-OPS-4 | Sink/catalog unavailability → DEGRADED back-pressure | 🟡 | ✅ | G-27/G-35 — stop consuming once buffers fill, protect slot/WAL via G-22; recover on next commit; catalog circuit breaker. | G-27, G-35 |
 | DA-OPS-5 | k8s deployment as StatefulSet (not Deployment) | 🟡 | ✅ | Clustering §3.4/§10.2 — stable `node_name` via Downward API; headless Service discovery. | D-1, D-4 |
-| DA-OPS-7 | 🆕 A controller task that panics goes unnoticed | 🟢 | 🟥 | §30.1. The reconciler looks at a controller's task only at shutdown: after a panic the pipeline is unmanaged, its lease expires with no takeover on a single node, and `/health/ready` stays 200. Supervise the tasks (log, mark the pipeline `error`) or fail readiness (M8/M10). | — |
+| DA-OPS-7 | A controller task that panics goes unnoticed | 🟢 | ✅ | ✅ 2026-10-22 (§37): the reconciler supervises its controllers. One that ended unasked (a panic, a return) is logged and started again on its status channel, and a dropped reconciler counts as a crash; the owned-pipelines gauge is held by a guard, so a panic doesn't over-count it. Readiness after a controller panic is not in M8a (DA-OPS-7's other half: M10). M8a Task 6 (D-M8a.11, `a_controller_that_panics_is_started_again`) | — |
 | DA-OPS-6 | "Restart ≠ apply config" operator footgun | 🟢 | ✅(documented) | Clustering §9.3 D-3 — cloud-generation-wins; a pod restart does **not** apply ConfigMap edits, only `POST /reload` does. Document loudly. | D-3 |
 | DA-DEP-1 | iceberg-rust pinned version & capabilities | 🟡 | ⏭ v2 | `iceberg` 0.10.1, MSRV 1.94 (main has moved to 1.95, #3083; Sources_Index needs refreshing from 1.92). Multiple capability gates ride on the exact version: DA-SINK-1, DA-SINK-2, DA-SCHEMA-8, DA-TYPE-5, DA-SINK-10. Pin and assert at startup. **2026-09-26 tidy:** Iceberg-sink only — deferred with the Iceberg sink to v2. | — |
 | DA-DEP-2 | OpenDAL version exposing conditional writes | 🔴 | ✅ | Clustering §17.2 — `if_match` on writes landed late-2024/early-2025; the `iceberg-storage-opendal` transitive pin must be ≥ that, and capabilities asserted at startup (refuse to start if absent). Part of DA-CLUS-1. **2026-09-26 tidy:** superseded — DA-CLUS-1 closed with a per-backend `LeaseStore` (OpenDAL only on S3, where `if_match` exists; native SDKs for GCS/Azure); the Delta sink uses object_store conditional puts (P8), not OpenDAL. | D-5 |
@@ -1776,3 +1778,58 @@ NULL or empty) gets no halt code, and the spec keeps its two (`BINLOG_PAYLOAD_IN
 error guards only something odd on the wire (a proxy, a fork), and its message names the
 variable. GTID mode still requires the identity, though it checks none (a GTID set means the same
 on every server). Relaxing that would be code for a case that doesn't occur.
+
+---
+
+## 36. M8a cluster membership — the plan (2026-10-21)
+
+M8's probe gate (`prototypes/cluster-capability`, 2026-10-20) failed `memberlist` 0.8.5 (C13:
+reaping corrupts its member table) and passed `foca` 2.0 (F1–F8). Oleksii answered Q-M8-1…4
+(2026-10-20): foca with our own actor, packets MAC'd with a key from the anchor, M8 split into
+M8a and M8b, the multi-node E2E as three host processes. M8a's plan
+(`doc/v1.0/M8a-membership.md`) was built task by task in a scratch workspace and replayed from its
+code blocks to an identical tree. Its config patch (§6.5.1 for foca, §6.5.2 and V-054 removed,
+V-122) and the System-Overview rows are spec edits, approved separately.
+
+| ID | Change | Evidence |
+|---|---|---|
+| DA-DEP-4 | ✅ (restated): the gossip crate is `foca` `=2.0.0`, not `memberlist` (it failed the gate). No Lifeguard: SWIM accuracy stays a latency concern (Clustering §3.6, §8.4) | probe C13, F1–F8; roadmap R-1 realized |
+| DA-API-5 | ✅ (restated): the cluster transport is authenticated by a keyed BLAKE3 MAC from the anchor's `fingerprint_key`, not TLS; packets aren't encrypted (they carry no data or secrets). Config §6.5.2 and V-054 go | M8a D-M8a.3; Task 3 (`another_anchor_is_another_key`), Task 4 (`a_node_with_another_key_cant_join`) |
+| DA-CLUS-8 | ✅ (stays): D-11 as built. A ruling beyond §20.3: a `Draining` node is off the ring at once (Clustering §3.3 kept it until its hand-offs completed) | M8a D-M8a.7; Task 5 |
+| DA-CLUS-14 | 🟥 (stays until the exit): planned. The fence's `current_epoch` becomes the claim's floor; one jump, and a second fence after it is an `ERROR` naming another lease store | M8a D-M8a.14; Task 8 |
+| DA-OPS-7 | 🟥 (stays until the exit): planned. A controller that ended unasked is logged and started again on its status channel | M8a D-M8a.11; Task 6 (`a_controller_that_panics_is_started_again`) |
+
+### 36.1 New gaps
+
+| ID | Gap | Severity | Surfaced by | Next |
+|---|---|---|---|---|
+| DA-SRC-28 | A takeover from a holder that stopped without closing its connection (a stop-the-world pause, a VM freeze, a network black hole to the source) can't stream on PostgreSQL until the old walsender ends at `wal_sender_timeout` (60 s by default), then waits for its next busy-slot retry, up to a 60 s backoff step: about two minutes of lag after the lease's 15 s | 🟢 | M8a planning: the E2E pause scenario (a SIGSTOP past the lease) converged after more than 60 s in two of twelve runs on PostgreSQL | Owner's call (2026-10-21, Q-M8-5): end the stale walsender. Planned as M8a Task 13 (D-M8a.22): the lease holder ends the slot's walsender of its own role, once a busy spell |
+| DA-OPS-8 | A node runs the cluster's config generation, resolved with its own environment (D-3), so per-node values written as literals in each node's own file (`node_name`, `advertise_addr`, ports) are ignored once a generation exists: the node takes another node's values, and may exit on a port it doesn't own | 🟢 | M8a planning: a second E2E node with its own file exited "Address already in use" on the first node's API port | Per-node values through `${VAR}` (config §6.5.1, M8a's patch); the operator docs (M11); M8b: warn at startup when the node's file and the adopted generation differ in a per-node key |
+
+Not reported upstream (Oleksii, 2026-10-21: it won't be): the `memberlist-core` 0.8.5 `node_map`
+bug (C13, probe README finding 1).
+
+---
+
+## 37. M8a cluster membership — the exit (2026-10-22)
+
+M8a (`doc/v1.0/M8a-membership.md`) was executed 2026-10-21…22: thirteen tasks, review fixes on
+Tasks 5, 6, 8, 9, 10, 12 and 13, then a whole-branch review with no Critical and two Important
+findings, both fixed before the PR (the plan's "Deviations during execution"). One spec edit,
+approved: `join_members` seeds are peers' advertised addresses (config §6.5.1), since foca drops
+an announce addressed elsewhere. The E2E suite (37 scenarios, the four cluster scenarios on three
+node processes included) passes on PostgreSQL 18 and MySQL 8.4; the other CI targets run on the
+PR.
+
+| ID | Change | Evidence |
+|---|---|---|
+| DA-CLUS-14 | 🟥 → ✅: the claim's floor and one jump; a second fence is an `ERROR` naming another lease store; a stop spends the jump | `claim.rs` `its_own_lease_is_taken_over_at_the_floor`, `the_floor_leaves_another_holders_lease_alone`; `controller.rs` `a_second_fence_past_a_jumped_epoch_is_an_error`, `a_stop_and_resume_after_the_error_jumps_once_more` |
+| DA-OPS-7 | 🟥 → ✅ (the supervision half): a controller that ended unasked is started again; the owned gauge survives a panic. Readiness after a panic stays with M10 | `reconciler.rs` `a_controller_that_panics_is_started_again` |
+| DA-SRC-28 | 🟥 → ✅: a busy slot's stale walsender of the pipeline's own role is ended under the lease, at most once a lease term (amended twice during execution: "once a busy spell" let the ended side end the other back; "once a worker run" didn't hold across the controller's reruns) | `worker.rs` `a_busy_slot_s_stale_reader_is_ended`, `an_ended_reader_that_comes_back_is_not_ended_again`, `a_worker_without_its_lease_ends_no_reader`; `controller.rs` `a_stale_reader_is_ended_once_a_lease_term`; source-pg IT `the_slot_s_stale_reader_is_ended`; E2E `a_paused_holder_loses_its_pipelines_and_rejoins` |
+| DA-CLUS-8 | ✅ (stays): D-11 as built; a ring whose nodes all go is refilled in the same update | `placement.rs` `a_ring_whose_nodes_all_go_is_filled_at_once` |
+| DA-OPS-8 | 🟥 (stays): `holder.node_id` still comes from the node's own file, bind and advertise from the adopted generation; M8b | — |
+
+Noted for M11's operator docs: a node's worst-case stop is now bounded, at
+`drain_timeout × ceil(pipelines / max_concurrent_handoffs) + 2 × lease_renewal_interval` plus one
+`drain_timeout` (130 s with one pipeline at the defaults: 60 s + 2 × 5 s, then 60 s), above Kubernetes' default 30 s
+`terminationGracePeriodSeconds`.

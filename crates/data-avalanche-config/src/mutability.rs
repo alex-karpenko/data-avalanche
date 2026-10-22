@@ -98,7 +98,7 @@ mod tests {
         assert_eq!(classify(&["globals", "cluster", "tokens"]), Some(Proc));
         assert_eq!(classify(&["globals", "cluster", "drain_timeout"]), Some(R));
         assert_eq!(
-            classify(&["globals", "cluster", "memberlist", "tls", "cert", "text"]),
+            classify(&["globals", "cluster", "memberlist", "bind_port"]),
             Some(Proc)
         );
         assert_eq!(classify(&["pipelines", "p", "source", "host"]), Some(Pr));

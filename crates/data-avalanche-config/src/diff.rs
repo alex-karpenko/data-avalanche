@@ -315,8 +315,6 @@ pipelines:
 
     fn spec_example(files: &Files) -> (String, BTreeMap<String, String>) {
         files.write("api.crt", cert());
-        files.write("gossip.crt", cert());
-        files.write("gossip-ca.crt", cert());
         let creds = files.write(
             "events-db.json",
             r#"{"user": "events", "password": "events-pw"}"#,
@@ -325,7 +323,6 @@ pipelines:
         let env = env(&[
             ("ACCOUNT_ID", "123456789012"),
             ("API_TLS_KEY", key()),
-            ("GOSSIP_TLS_KEY", key()),
             ("CATALOG_CLIENT_ID", "cdc-client"),
             ("CATALOG_CLIENT_SECRET", "client-secret"),
             ("ORDERS_DB_PASSWORD", "orders-pw"),
@@ -351,7 +348,7 @@ pipelines:
             .replace(
                 "globals:\n  state: { bucket: app-state }",
                 &format!(
-                    "globals:\n  cloud: azure\n  state: {{ bucket: app-state, prefix: app }}\n  azure: {{ account_name: lakeacct }}\n  api:\n    auth: basic\n    user: admin\n    password: x\n    tls: {{ enabled: true, cert: {c:?}, key: {k:?} }}\n  cluster:\n    memberlist:\n      join_members: [\"a:7946\"]\n      tls: {{ enabled: true, cert: {c:?}, key: {k:?}, ca: {c:?} }}\n  tracing: {{ otlp_endpoint: \"http://otel:4317\" }}",
+                    "globals:\n  cloud: azure\n  state: {{ bucket: app-state, prefix: app }}\n  azure: {{ account_name: lakeacct }}\n  api:\n    auth: basic\n    user: admin\n    password: x\n    tls: {{ enabled: true, cert: {c:?}, key: {k:?} }}\n  cluster:\n    memberlist:\n      join_members: [\"a:7946\"]\n  tracing: {{ otlp_endpoint: \"http://otel:4317\" }}",
                     c = pem_cert,
                     k = pem_key
                 ),

@@ -15,10 +15,11 @@ use crate::LeaseTiming;
 #[derive(Debug)]
 pub enum Claimed {
     /// This node holds the lease; `written` is when its write was sent (the renewer's first
-    /// `last_renew_local`).
+    /// `last_renew_local`). `jumped`: the floor ([`Claim::at_least`]) set its epoch.
     Mine {
         lease: Versioned<LeaseDoc>,
         written: Instant,
+        jumped: bool,
     },
     /// Another holder has it. Unless it renews, a step at or after `takeover_at` takes it over.
     HeldBy {
@@ -36,6 +37,8 @@ pub struct Claim {
     timing: LeaseTiming,
     /// The live holder's lease version this node watches, and when it first read it.
     watched: Option<(ObjectVersion, Instant)>,
+    /// The least epoch this process's own lease is taken over at (DA-CLUS-14); 0 for none.
+    floor: u64,
 }
 
 impl Claim {
@@ -46,7 +49,15 @@ impl Claim {
             holder,
             timing,
             watched: None,
+            floor: 0,
         }
+    }
+
+    /// The next takeover of this process's own lease runs at an epoch of at least `epoch`: a
+    /// table was written at `epoch - 1`, later than the lease knew (DA-CLUS-14). Another
+    /// holder's lease is claimed as ever, and the floor is dropped.
+    pub fn at_least(&mut self, epoch: u64) {
+        self.floor = epoch;
     }
 
     /// One attempt: acquire a free lease, or watch a live one and take it over once it went a
@@ -68,9 +79,11 @@ impl Claim {
         {
             Acquired::Mine(lease) => {
                 self.watched = None;
+                self.floor = 0;
                 return Ok(Claimed::Mine {
                     lease,
                     written: sent,
+                    jumped: false,
                 });
             }
             Acquired::HeldBy(seen) => seen,
@@ -81,6 +94,7 @@ impl Claim {
         // epoch with a worker that already ran. This rests on (node id, incarnation) naming one
         // process: the incarnation is its start in milliseconds, so a restarted process waits.
         if !seen.doc.is_held_by(&self.holder) {
+            self.floor = 0;
             // The wait runs from when the version was read, never from before: a renewal that
             // landed while the read was in flight must count.
             let read = Instant::now();
@@ -99,17 +113,23 @@ impl Claim {
                 });
             }
         }
+        // The floor holds until a takeover lands: a failed write tries it again.
+        let floor = self.floor;
+        let proposed = seen.doc.owner_epoch.checked_add(1).map(|e| e.max(floor));
         let sent = Instant::now();
         match self
             .leases
-            .take_over(&seen, &self.holder, self.timing.duration, Utc::now())
+            .take_over_at(&seen, &self.holder, self.timing.duration, Utc::now(), floor)
             .await
         {
             Ok(lease) => {
                 self.watched = None;
+                self.floor = 0;
+                let jumped = Some(lease.doc.owner_epoch) != seen.doc.owner_epoch.checked_add(1);
                 Ok(Claimed::Mine {
                     lease,
                     written: sent,
+                    jumped,
                 })
             }
             // The holder renewed, or another challenger won: watch again.
@@ -127,13 +147,16 @@ impl Claim {
                 match now {
                     Some(lease)
                         if lease.doc.is_held_by(&self.holder)
-                            && Some(lease.doc.owner_epoch)
-                                == seen.doc.owner_epoch.checked_add(1) =>
+                            && Some(lease.doc.owner_epoch) == proposed =>
                     {
                         self.watched = None;
+                        self.floor = 0;
+                        let jumped =
+                            Some(lease.doc.owner_epoch) != seen.doc.owner_epoch.checked_add(1);
                         Ok(Claimed::Mine {
                             lease,
                             written: sent,
+                            jumped,
                         })
                     }
                     _ => Err(e),
@@ -255,6 +278,46 @@ mod tests {
         assert_eq!(epoch(&mine), 2);
         let stored = leases(&store).observe("p").await.unwrap().unwrap();
         assert!(stored.doc.is_held_by(&holder("b")));
+    }
+
+    /// DA-CLUS-14: the lake saw epoch 5 while this node's own lease names 1. The takeover
+    /// jumps to 6, and keeps the floor through a write that failed.
+    #[tokio::test(start_paused = true)]
+    async fn its_own_lease_is_taken_over_at_the_floor() {
+        let store = ScriptedStore::new();
+        acquired(&leases(&store), "a").await;
+        let mut a = claim(&store, "a");
+        a.at_least(6);
+        store.fail_next(Fault {
+            kind: Kind::Transient,
+            lands: false,
+        });
+        assert!(a.step().await.is_err());
+        let jumped = a.step().await.unwrap();
+        assert!(
+            matches!(jumped, Claimed::Mine { jumped: true, .. }),
+            "{jumped:?}"
+        );
+        assert_eq!(epoch(&jumped), 6);
+        // Spent: the next own takeover is the next epoch.
+        let next = a.step().await.unwrap();
+        assert!(
+            matches!(next, Claimed::Mine { jumped: false, .. }),
+            "{next:?}"
+        );
+        assert_eq!(epoch(&next), 7);
+    }
+
+    /// The floor is for this process's own lease: another holder's is claimed as ever.
+    #[tokio::test(start_paused = true)]
+    async fn the_floor_leaves_another_holders_lease_alone() {
+        let store = ScriptedStore::new();
+        acquired(&leases(&store), "a").await;
+        let mut b = claim(&store, "b");
+        b.at_least(9);
+        assert!(matches!(b.step().await.unwrap(), Claimed::HeldBy { .. }));
+        advance(15_000).await;
+        assert_eq!(epoch(&b.step().await.unwrap()), 2);
     }
 
     #[tokio::test(start_paused = true)]

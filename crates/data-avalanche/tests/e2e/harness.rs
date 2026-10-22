@@ -46,6 +46,14 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// A free UDP port on loopback: a node's gossip port.
+pub fn free_udp_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .and_then(|s| s.local_addr())
+        .expect("a free UDP port")
+        .port()
+}
+
 /// What a test sets beyond the defaults (YAML flow entries, each starting with `, `).
 #[derive(Debug, Clone, Default)]
 pub struct Options<'a> {
@@ -65,6 +73,11 @@ pub struct Options<'a> {
     /// Pipeline keys beyond `source`, `tables` and `sink`, one YAML line, e.g.
     /// `schema_evolution: { rescan_interval: 2s }`.
     pub pipeline: &'a str,
+    /// `globals.cluster` entries, each `, key: value` a line of the block, e.g.
+    /// `, rebalance_stabilization: 3s`.
+    pub cluster: &'a str,
+    /// `globals.cluster.memberlist` entries, e.g. `, join_members: ["127.0.0.1:7946"]`.
+    pub memberlist: &'a str,
     /// More pipelines, YAML under `pipelines:` (2-space indent); `@SCHEMA@`, `@PREFIX@` and
     /// `@BUCKET@` are replaced, `@INCLUDE@` by the pattern of every table of the test, and a line
     /// `@SOURCE(<suffix>)@` by the source block ([`E2e::source_block`]).
@@ -89,7 +102,9 @@ pub struct E2e {
     /// The first node's (`n1`) API port.
     port: u16,
     dir: tempfile::TempDir,
-    /// The config with `@NODE@` and `@PORT@` to fill per node.
+    /// The config every node runs; its per-node values come from `E2E_*` variables, as a
+    /// cluster's one config takes them from each pod's environment (D-3: a node runs the
+    /// cluster's generation, not its own file).
     template: String,
     pub db: Db,
 }
@@ -155,22 +170,12 @@ impl E2e {
             db,
         };
         e.template = e.yaml(&o);
-        e.write_config("n1", e.port);
+        std::fs::write(e.config_path(), &e.template).expect("the config file");
         e
     }
 
-    fn config_path(&self, node: &str) -> PathBuf {
-        self.dir.path().join(format!("config-{node}.yaml"))
-    }
-
-    fn write_config(&self, node: &str, port: u16) -> PathBuf {
-        let path = self.config_path(node);
-        let text = self
-            .template
-            .replace("@NODE@", node)
-            .replace("@PORT@", &port.to_string());
-        std::fs::write(&path, text).expect("the config file");
-        path
+    fn config_path(&self) -> PathBuf {
+        self.dir.path().join("config.yaml")
     }
 
     /// The `source` block of a pipeline named `test` (on PostgreSQL the slot and publication
@@ -243,13 +248,13 @@ impl E2e {
 globals:
   cloud: aws
   state: {{ bucket: {bucket}, prefix: {prefix}/globals }}
-  api: {{ address: "127.0.0.1:@PORT@" }}
+  api: {{ address: "127.0.0.1:${{E2E_API_PORT}}" }}
   log: {{ level: info, format: compact }}
   cluster:
     lease_duration: 6s
     lease_renewal_interval: 2s
-    drain_timeout: 30s
-    memberlist: {{ node_name: "@NODE@" }}
+    drain_timeout: 30s{cluster}
+    memberlist: {{ node_name: "${{E2E_NODE}}", bind_addr: [127.0.0.1], bind_port: "${{E2E_GOSSIP_PORT}}", advertise_addr: 127.0.0.1, advertise_port: "${{E2E_ADVERTISE_PORT}}"{memberlist} }}
 pipelines:
   {test}:
     id: {test}
@@ -266,22 +271,30 @@ pipelines:
             tables = self.qualify(o.tables),
             sink = o.sink,
             pipeline = o.pipeline,
+            cluster = o.cluster.replace(", ", "\n    "),
+            memberlist = o.memberlist,
         )
     }
 
     /// Starts the binary as node `n1`; `env` adds variables (a crash point).
     pub fn start(&self, env: &[(&str, &str)]) -> Proc {
-        self.spawn(&self.config_path("n1"), self.port, env)
+        self.spawn("n1", self.port, env)
     }
 
     /// Starts the binary as another node, with its own name and API port.
     pub fn start_node(&self, node: &str) -> Proc {
-        let port = free_port();
-        let path = self.write_config(node, port);
-        self.spawn(&path, port, &[])
+        self.start_node_with(node, &[])
     }
 
-    fn spawn(&self, config: &std::path::Path, port: u16, env: &[(&str, &str)]) -> Proc {
+    /// [`Self::start_node`] with more variables (a node's gossip ports).
+    pub fn start_node_with(&self, node: &str, env: &[(&str, &str)]) -> Proc {
+        self.spawn(node, free_port(), env)
+    }
+
+    /// Runs node `node` with its API on `port`, gossiping alone on a loopback port of its own;
+    /// `env` adds variables (and may set `E2E_ADVERTISE_PORT`).
+    fn spawn(&self, node: &str, port: u16, env: &[(&str, &str)]) -> Proc {
+        let gossip = free_udp_port().to_string();
         let log = self.dir.path().join(format!(
             "run-{}.log",
             std::time::SystemTime::now()
@@ -293,7 +306,7 @@ pipelines:
         let err = out.try_clone().expect("the log file");
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_data-avalanche"));
         cmd.args(["run", "--config"])
-            .arg(config)
+            .arg(self.config_path())
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("AWS_ACCESS_KEY_ID", RUSTFS_ACCESS_KEY)
@@ -302,6 +315,10 @@ pipelines:
             .env("AWS_ENDPOINT_URL", RUSTFS_URL)
             .env("AWS_ALLOW_HTTP", "true")
             .env("RUST_BACKTRACE", "1")
+            .env("E2E_NODE", node)
+            .env("E2E_API_PORT", port.to_string())
+            .env("E2E_GOSSIP_PORT", &gossip)
+            .env("E2E_ADVERTISE_PORT", &gossip)
             .stdin(Stdio::null())
             .stdout(out)
             .stderr(err);
@@ -321,13 +338,18 @@ pipelines:
 
     /// A reader of the pipeline's Delta tables on RustFS.
     pub fn lake(&self) -> DeltaSink {
+        self.lake_in("lake")
+    }
+
+    /// [`Self::lake`] of the pipeline whose sink prefix ends in `lake` (`lake`, `lake_b`).
+    pub fn lake_in(&self, lake: &str) -> DeltaSink {
         let opt = |k: &str, v: &str| (k.to_owned(), v.to_owned());
         DeltaSink::new(DeltaSinkConfig {
             pipeline_id: self.test.clone(),
             location: DeltaLocation::Bucket {
                 backend: Backend::S3,
                 bucket: TEST_BUCKET.into(),
-                prefix: self.lake_prefix(),
+                prefix: format!("{}/{lake}", self.prefix),
                 options: vec![
                     opt("endpoint", RUSTFS_URL),
                     opt("allow_http", "true"),
@@ -351,7 +373,17 @@ pipelines:
 
     /// The table's `id`s in the lake, in key order.
     pub async fn ids(&self, table: &str) -> Vec<i64> {
-        match self.content(table).await {
+        self.ids_in("lake", table).await
+    }
+
+    /// [`Self::ids`] in the lake `lake`.
+    pub async fn ids_in(&self, lake: &str, table: &str) -> Vec<i64> {
+        let content = self
+            .lake_in(lake)
+            .content(&self.table(table))
+            .await
+            .expect("the lake reads");
+        match content {
             None => vec![],
             Some(b) => {
                 let ids = b
@@ -434,10 +466,16 @@ pipelines:
 
     /// Waits until the lake's `table` has exactly the source's ids.
     pub async fn converged(&self, table: &str) {
+        self.converged_in("lake", table, Duration::from_secs(60))
+            .await;
+    }
+
+    /// [`Self::converged`] in the lake `lake`, waiting at most `within`.
+    pub async fn converged_in(&self, lake: &str, table: &str, within: Duration) {
         let want = self.source_ids(table).await;
-        let what = format!("{table} has the source's {} rows", want.len());
-        eventually(&what, Duration::from_secs(60), async || {
-            self.ids(table).await == want
+        let what = format!("{lake}/{table} has the source's {} rows", want.len());
+        eventually(&what, within, async || {
+            self.ids_in(lake, table).await == want
         })
         .await;
     }
@@ -570,10 +608,29 @@ pipelines:
 
     /// The pipeline's lease in `globals.state`.
     pub async fn lease(&self) -> Option<Versioned<LeaseDoc>> {
+        self.lease_of(&self.test).await
+    }
+
+    /// Pipeline `id`'s lease in `globals.state`.
+    pub async fn lease_of(&self, id: &str) -> Option<Versioned<LeaseDoc>> {
         Leases::new(self.docs_at(&format!("{}/globals", self.prefix)))
-            .observe(&self.test)
+            .observe(id)
             .await
             .expect("the lease reads")
+    }
+
+    /// Drops the slot and publication of the pipeline whose source block took `suffix`
+    /// ([`Options::pipelines`]' `@SOURCE(<suffix>)@`), on PostgreSQL; [`Self::cleanup`] drops
+    /// only the test's own.
+    pub async fn drop_source(&self, suffix: &str) {
+        if let Source::Postgres { .. } = self.source {
+            let name = format!("{}{suffix}", self.schema);
+            drop_slot(&self.db, &name).await;
+            self.db
+                .exec(&format!("DROP PUBLICATION IF EXISTS {name}_pub"))
+                .await
+                .expect("the publication drops");
+        }
     }
 
     /// The pipeline's own documents, co-located with the lake (`<sink.prefix>/.pipeline-state`).
@@ -622,8 +679,20 @@ pipelines:
 
     /// The Delta table's commits in version order, each its actions.
     pub async fn log(&self, table: &str) -> Vec<Vec<serde_json::Value>> {
+        self.log_in("lake", table).await
+    }
+
+    /// [`Self::log`] in the lake `lake`.
+    pub async fn log_in(&self, lake: &str, table: &str) -> Vec<Vec<serde_json::Value>> {
         let store = stores::rustfs();
-        let log = object_store::path::Path::from(format!("{}/_delta_log", self.table_root(table)));
+        let root = table_root(
+            TEST_BUCKET,
+            &format!("{}/{lake}", self.prefix),
+            &self.schema,
+            table,
+        )
+        .root;
+        let log = object_store::path::Path::from(format!("{root}/_delta_log"));
         let mut files: Vec<_> = store
             .list(Some(&log))
             .try_collect::<Vec<_>>()
@@ -829,6 +898,16 @@ impl Proc {
             .expect("kill runs");
         assert!(sent.success());
         self.exit().await
+    }
+
+    /// Sends `signal` (`STOP`, `CONT`): a stop-the-world pause and its end.
+    pub fn signal(&self, signal: &str) {
+        let pid = self.child.id().to_string();
+        let sent = Command::new("kill")
+            .args([&format!("-{signal}"), &pid])
+            .status()
+            .expect("kill runs");
+        assert!(sent.success(), "kill -{signal}");
     }
 
     /// `kill -9`, as a host failure would.

@@ -24,7 +24,7 @@ fn spec_example_resolves() {
     assert_eq!(tls.key.origin, Origin::Inline);
     let cluster = &cfg.globals.cluster;
     assert_eq!(cluster.discovery, Discovery::Dns);
-    assert!(cluster.memberlist.tls.as_ref().unwrap().ca.is_some());
+    assert_eq!(cluster.memberlist.join_members.len(), 1);
     assert_eq!(cfg.globals.tracing.sample_ratio, 0.05);
     assert_eq!(
         cfg.pipelines.keys().collect::<Vec<_>>(),

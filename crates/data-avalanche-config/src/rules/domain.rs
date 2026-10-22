@@ -43,6 +43,71 @@ fn at_least<T: LeafType + PartialOrd + std::fmt::Display>(
     }
 }
 
+/// V-122: timers the gossip can run on. A zero interval would spin it, and a probe that times out
+/// no sooner than the next one starts never fails.
+fn gossip_timers(m: &RawMemberlist, at: &At, ctx: &mut Ctx) {
+    for (leaf, field) in [
+        (&m.gossip_interval, "gossip_interval"),
+        (&m.probe_interval, "probe_interval"),
+        (&m.probe_timeout, "probe_timeout"),
+        (&m.push_pull_interval, "push_pull_interval"),
+    ] {
+        if let Some((v, loc)) = val(ctx, leaf, &at.key(field))
+            && v.is_zero()
+        {
+            ctx.error(
+                "V-122",
+                &at.key(field),
+                loc,
+                format!("{field} must be above zero"),
+            );
+        }
+    }
+    at_least(
+        ctx,
+        "V-122",
+        &m.gossip_nodes,
+        &at.key("gossip_nodes"),
+        1,
+        "gossip_nodes",
+    );
+    at_least(
+        ctx,
+        "V-122",
+        &m.retransmit_factor,
+        &at.key("retransmit_factor"),
+        1,
+        "retransmit_factor",
+    );
+    let interval = m
+        .probe_interval
+        .as_ref()
+        .map_or(Some(Duration::from_secs(1)), |l| {
+            ctx.value(l, &at.key("probe_interval"))
+        });
+    let timeout = m
+        .probe_timeout
+        .as_ref()
+        .map_or(Some(Duration::from_millis(500)), |l| {
+            ctx.value(l, &at.key("probe_timeout"))
+        });
+    if let (Some(i), Some(t)) = (interval, timeout)
+        && t >= i
+    {
+        let loc = m
+            .probe_timeout
+            .as_ref()
+            .or(m.probe_interval.as_ref())
+            .and_then(|l| l.loc());
+        ctx.error(
+            "V-122",
+            &at.key("probe_timeout"),
+            loc,
+            "probe_timeout must be below probe_interval",
+        );
+    }
+}
+
 pub(crate) fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut Ctx) {
     if let Some(g) = &raw.globals {
         globals(g, ctx);
@@ -140,6 +205,9 @@ fn globals(g: &RawGlobals, ctx: &mut Ctx) {
                 loc,
                 "lock_backend kubernetes is reserved and not implemented in v1; use storage",
             );
+        }
+        if let Some(m) = &c.memberlist {
+            gossip_timers(m, &at.key("memberlist"), ctx);
         }
     }
     // V-097

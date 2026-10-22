@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-17
+updated: 2026-10-21
 domain: Architecture
 tags: [v1, implementation-plan, roadmap, milestones, workspace, crates, interfaces, test-strategy, ci, risks]
 sources: []
@@ -135,12 +135,13 @@ Rules:
 | MariaDB compressed events | `flate2` (already in the lockfile through `mysql_common`) | `1` | Q-M7a-5; M7a Task 6 |
 | DDL classifier | `sqlparser` (`default-features = false`, features `std`: no `recursive-protection`, which builds C) | `=0.62.0` | MySQL_DDL_Classifier §5; M7a Task 11 |
 | YAML 1.2 (serde) | `serde-saphyr` (`deserialize` only) | `=1.3.0` | Verified in M1 planning (2026-09-27): strict booleans, duplicate-key errors, `Spanned` locations, unknown-key errors with location. One trap: `${…}` inside a flow collection must be quoted (M1 Review Focus 1). R-9 closed |
-| Membership | `memberlist` `0.8.5` (fallback `foca` `2.0`) | pinned in M8 | **unprobed** — M8 opens with a probe gate |
+| Membership (SWIM) | `foca` (`default-features = false`, features `std`, `serde`, `postcard-codec`) + `rand` (features `std`, `std_rng`, `sys_rng`; foca's random source) | `=2.0.0` / `0.10` | The M8 probe gate (2026-10-20, `prototypes/cluster-capability`): `memberlist` 0.8.5 failed (reaping corrupts its member table, C13), foca passed F1–F8 (Q-M8-1); M8a's gossip and cluster suites |
+| Host addresses | `if-addrs` (an unset `advertise_addr`'s private IPv4) | `0.15` | M8a Task 9 |
 | HTTP API | `axum` `0.8` + `utoipa` `6` | | |
 | Metrics | `prometheus-client` | | |
 | Tracing | `tracing`, `tracing-subscriber`, `opentelemetry-otlp` | | |
 | CLI | `clap` `4` | | |
-| Misc | `thiserror` 2, `async-trait`, `bytes`, `chrono`, `uuid`, `serde_json` (feature `arbitrary_precision`: JSON numbers keep every digit, Q-M5-11), `humantime`, `xxhash-rust` (ring hash, anchor `hash_algo: xxh3`), `proptest` (dev) | | |
+| Misc | `thiserror` 2, `async-trait`, `bytes`, `chrono`, `uuid`, `serde_json` (feature `arbitrary_precision`: JSON numbers keep every digit, Q-M5-11), `humantime`, `xxhash-rust` `0.8` (feature `xxh3`: the ring's hash, anchor `hash_algo: xxh3`; M8a), `proptest` (dev) | | |
 
 ---
 
@@ -425,6 +426,7 @@ pub trait SourceConnector: Send + Sync {                    // built from the re
     async fn read_chunk(&self, t: &TableSchema, after: Option<&KeysetCursor>, limit: usize) -> Result<Chunk, SourceError>;
     async fn fetch_rows(&self, t: &TableSchema, keys: &[Row]) -> Result<Vec<Row>, SourceError>;  // toast_strategy: re_query
     async fn open_stream(&self, from: &Checkpoint, tables: &[TableSchema]) -> Result<Box<dyn ChangeStream>, SourceError>;  // M7b: a Checkpoint
+    async fn end_other_reader(&self) -> Result<bool, SourceError>;                // M8a; default false: the lease holder ends a stale reader (DA-SRC-28)
     async fn augment(&self, cached: &TableSchema, hint: &SchemaHint)
         -> Result<(SchemaDelta, Option<TableSchema>), SourceError>;                // channel C; None = dropped
     async fn rescan(&self, known: &[TableSchema]) -> Result<RescanReport, SourceError>;  // channel D
@@ -533,6 +535,47 @@ error by `WorkerError::recovery()`: `Retry` reruns after a backoff, `Lease` stan
 ERROR until a stop (Q-M6b-3, Q-M6b-12). It logs each worker warning once and each reconnect with
 its reason. From M7b (Q-M7b-4), `Error` carries the halt's code (`WorkerError::code`, from a source error
 only), and the `ERROR` log line logs it as the field `code`; no new metric.
+
+What M8a adds (`M8a-membership.md` D-M8a.1…21): the gossip (foca 2.0 in our actor, Q-M8-1), the
+ring over its members, and the reconciler on the ring.
+
+```rust
+pub struct GossipKey;                            // keyed BLAKE3 MAC from the anchor's fingerprint_key (Q-M8-2)
+impl GossipKey { pub fn derive(fingerprint_key: &[u8; 32]) -> Self; pub fn seal(&self, payload: &[u8]) -> Bytes;
+                 pub fn open<'a>(&self, packet: &'a [u8]) -> Option<&'a [u8]>; }
+pub trait Wire: Send + Sync + Debug + 'static { fn send(&self, to: SocketAddr, packet: Bytes); }
+impl Udp { pub async fn bind(addrs: &[SocketAddr]) -> Result<(Self, mpsc::Receiver<Bytes>), ClusterError>; }
+pub enum Phase { Joining, Active, Draining, Leaving }
+pub struct NodeMeta { pub phase: Phase, pub config_generation: u64, pub build: String }
+pub struct NodeIdentity { pub node_id, pub incarnation: u64, pub rev: u32, pub addr: SocketAddr, pub meta: NodeMeta } // foca's Identity
+pub struct Members { pub me: String, pub nodes: BTreeMap<String, Member> }   // per name, the latest live identity
+pub struct Member { pub addr: SocketAddr, pub meta: NodeMeta, pub suspect: bool }
+impl Gossip { pub fn start(me, key, settings: GossipSettings, wire: Arc<dyn Wire>, inbox) -> Self;
+              pub fn members(&self) -> watch::Receiver<Members>; pub fn announcer(&self) -> Announcer;
+              pub fn set_phase(&self, Phase); pub async fn leave(self); }
+impl Ring { pub fn new<'a>(nodes: impl IntoIterator<Item = &'a str>, tokens: u32) -> Self;
+            pub fn owner(&self, pipeline_id: &str) -> Option<&str>; }  // xxh3 points; first point ≥ xxh3(id)
+impl Placement { pub fn new(tokens, stabilization) -> Self; pub fn update(&mut self, &Members, Instant) -> bool;
+                 pub fn next_due(&self) -> Option<Instant>; pub fn ring(&self) -> &Ring; pub fn generation(&self) -> u64; }
+impl ClusterReconciler { pub fn start(pipelines, deps: &ControllerDeps, members: watch::Receiver<Members>,
+                                      settings: ReconcilerSettings) -> Self;
+                         pub async fn released(&self); pub async fn shutdown(self); }   // a drop is a crash
+pub struct ControllerDeps { /* M6b's, and */ pub handoffs: Arc<Semaphore> /* max_concurrent_handoffs */ }
+impl Claim { pub fn at_least(&mut self, epoch: u64); }      // DA-CLUS-14: the fence's epoch as a floor
+impl Leases { pub async fn take_over_at(&self, observed, holder, lease_duration, now, at_least: u64) -> Result<..>; }
+pub enum Seeds { Static(Vec<HostPort>), Dns { name: String, port: u16 } }
+pub fn discover(seeds, me: Vec<SocketAddr>, announcer: Announcer, members) -> JoinHandle<()>;  // every 5 s while alone
+pub async fn advertise(m: &Memberlist, interfaces: &[IpAddr]) -> Result<SocketAddr, ClusterError>;
+pub async fn join(gossip: &Gossip, seeded: bool);                 // Joining → Active (≤ 5 s for a first peer)
+pub async fn leave(gossip: Gossip, reconciler: ClusterReconciler); // Draining → released → Leaving → leave
+pub enum ClusterError { NodeName(String), AdvertiseAddr(String), Bind { addr, source } }
+```
+
+A node is placed on the ring when it is an `Active` member; it leaves the ring at once when it
+stops being one (gone, `Draining`, `Leaving`), and joins after `rebalance_stabilization` of continuous
+eligibility (D-11). A pipeline's target is `Own` exactly when the ring's owner is this node; a
+hand-off waits for a `max_concurrent_handoffs` permit; a controller that ended unasked is started
+again (DA-OPS-7).
 
 ### 3.8 Configuration (`data-avalanche-config`, landed in M1)
 
@@ -1073,9 +1116,16 @@ and 10.11 weekly.
 
 ### M8 — Cluster (`data-avalanche-cluster`)
 
+M8 is split in two (Q-M8-3, 2026-10-20). **M8a** (`M8a-membership.md`): the gossip (foca 2.0 after
+the probe gate, Q-M8-1; packets MAC'd with a key from the anchor, Q-M8-2), NodeMeta and phases, the
+ring and its flap rules, the hand-off and takeover caps, the leave, discovery, M6b's carried
+DA-CLUS-14 and DA-OPS-7, and the multi-node E2E suite (three host processes, Q-M8-4). **M8b**: the
+config-generation coordinator at run time and the reload E2E. The anchor validation already runs at
+M6b's startup.
+
 - **Scope:**
-  - **Probe gate first:** `memberlist` 0.8.5 over TCP/UDP with TLS; node metadata; join/leave/dead
-    detection; Lifeguard. Fallback: `foca`.
+  - **Probe gate first** (done 2026-10-20, `prototypes/cluster-capability`): `memberlist` 0.8.5 failed
+    (C13); `foca` 2.0 passed F1–F8.
   - NodeMeta, phases and incarnation.
   - Ring derived from membership (xxh3, `tokens`), with flap rules (D-11).
   - `ClusterReconciler`; `PipelineController` takeover-evaluation and planned drain with lease release.
@@ -1084,7 +1134,8 @@ and 10.11 weekly.
   - Anchor validation (V-062 / V-076 / V-094).
   - Discovery: `static` and `dns` with periodic re-resolve.
 - **Deps:** M2, M6b.
-- **Exit:** a multi-node E2E suite with 3 in-process nodes plus a docker-compose 3-node run. It covers:
+- **Exit:** a multi-node E2E suite with 3 in-process nodes plus 3 node processes on one host (Q-M8-4;
+  the docker-compose 3-node run moved to M11's kind smoke). It covers:
   - kill → takeover within the D-6 window, with no double commit (verified from Delta `txn` versions);
   - graceful leave → immediate acquire;
   - a GC-pause simulation (a zombie is fenced);
@@ -1137,7 +1188,8 @@ and 10.11 weekly.
 - **Deps:** M9 (API reference), M10.
 - **Exit:**
   - `helm lint` and `helm template` pass.
-  - A kind-cluster smoke deploy of 3 replicas runs one pipeline end to end.
+  - A kind-cluster smoke deploy of 3 replicas runs one pipeline end to end, and a pod deleted
+    hands its pipelines to the others (the 3-node container run moved from M8, Q-M8-4).
   - `mkdocs build --strict` passes.
   - Every config example in the docs parses and validates (tested by `xtask`).
 
@@ -1272,7 +1324,7 @@ other (PostgreSQL: 5, 6, the WAL guard and a lost slot; MySQL: 11).
 
 | # | Risk | Likelihood / impact | Mitigation (where) |
 |---|---|---|---|
-| R-1 | `memberlist` 0.8.5 has never been probed (TLS, metadata size, Lifeguard, runtime-agnostic API) | medium / high | M8 opens with a probe gate; `foca` 2.0 as fallback; everything above membership consumes an owner function, so the swap is contained |
+| R-1 | `memberlist` 0.8.5 has never been probed (TLS, metadata size, Lifeguard, runtime-agnostic API) | ~~medium / high~~ realized / contained | M8 opens with a probe gate; `foca` 2.0 as fallback; everything above membership consumes an owner function, so the swap is contained. **Realized 2026-10-20**: memberlist failed the gate (reaping corrupts its member table, C13; UDP left unauthenticated by its TLS); M8a builds on foca 2.0 (Q-M8-1). Lost: Lifeguard (SWIM accuracy is a latency concern, Clustering §8.4) |
 | R-2 | `object_store` CAS behaves differently from the proven native clients (GCS generation, S3 409, Azure MI) | low / high | T1–T10 re-proof on real clouds in M2 before any lease code depends on it; the proven per-backend stores in `prototypes/lease-conformance` are the fallback. **Re-proven 2026-09-29** on `object_store` 0.14.2 through `Leases` (`tests/lease_conformance.rs`): in memory, RustFS, Azurite, real GCS, real S3 and real Azure all PASS (S3 and Azure: `cloud.yml` run 36604762684) |
 | R-3 | An emulator's conditional writes are incomplete | ~~medium~~ low / low | Measured 2026-09-26: RustFS and Azurite honour Create and Update preconditions; fake-gcs doesn't serve `object_store` at all, so it's replaced by a real bucket (P-10). Real GCS via `object_store` passed the same checks (2026-09-26). Re-checked with `object_store` 0.14.2 the same day: fake-gcs 1.56.1 (= `latest`) still fails the plain PUT. Closed |
 | R-12 | Clamped PG edge dates (Arrow min/max, Q-M5-1) are valid Parquet but some engines can't render years ±5.8M / ±294k | medium / low | M4 clamps `date` / `timestamp` / `timestamp_ntz` cells to the Delta range 0001-01-01 … 9999-12-31 23:59:59.999999 in Hop 3b (Q-M4-2), and its type round trip reads the bounds through DuckDB `delta_scan`. DuckDB 1.5.6 can't open a table path with non-ASCII text (Q-M4-6). The operator docs (M11) list the clamping, that limit and the engines checked |
@@ -1385,6 +1437,7 @@ the naming below (2026-09-26).**
 | D-IMPL-14 | M6b single-node-control rulings **Q-M6b-1…13 and D-M6b.1…13** (listed in `M6b-single-node-control.md` §Decisions and rulings, each pinned by a test). Among them: the source stays warm on pause; the controller polls `pipeline-state.json` and classifies worker errors (`Retry`, `Lease`, `Error`); `evolve` is fenced; a stale Delta handle is detected by its commit file's e-tag; a MERGE over `merge_memory_limit` halts its table (V-119); the guard compares a table's last change; the stream watchdog (reverses D-M6a.9) | The specs are silent on most; where a ruling touched a spec row, the row was patched with approval (V-119, the metric catalogue, Data-Flow Phase 4, config §6.4, §9.2, §9.2.1) | M6b — **approved 2026-10-08** |
 | D-IMPL-15 | M7a MySQL-source rulings **D-M7a.1…23** (listed in `M7a-mysql-source.md` §Decisions and rulings, each pinned by a test). Among them: a checkpoint carries its source server (§3.6); the replica id derived from BLAKE3(`id`); `verify-ca` fails closed as `verify-full` (DA-SRC-22); one decoder for binlog and chunk values, correcting `mysql_common`'s signed `MEDIUMINT` and `YEAR`; chunk keys in their own collation with the expanded keyset predicate; the tokenizer names every statement's tables, `sqlparser` scopes an ALTER; the stream decodes by the schema as of its position and halts a table it can't read; fail-closed event types, two-phase XA with tracked rows halts; the purge action is one rule at `prepare` and on the dump's refusal; the dump watched by its connection id | The specs are silent on these; where a ruling touched a spec row, the row was patched with approval (`Schema_Change…` §7.2, config §9.2.2) | M7a — **approved 2026-10-14** |
 | D-IMPL-16 | M7b MySQL-pipeline rulings **D-M7b.1…16** (listed in `M7b-mysql-pipeline.md` §Decisions and rulings, each pinned by a test). Among them: `open_stream` takes a `Checkpoint` and `reset_position` returns one (§3.6); `SourceError::halt_code` reads a halt's code from its message; the worker's checkpoint goes through one store, slot or position document, and records the server the last start read; a file/position dump checks its server on its own connection; no identity is an error; the binary picks the source by `source.type`; the E2E harness's per-test MySQL database and user, and its dialect helpers; the wire proxy's fault (one compressed byte flipped, the CRC32 recomputed) | The specs are silent on these; each keeps a MySQL checkpoint tied to its server across reconnects and lost positions | M7b — **approved 2026-10-17** |
+| D-IMPL-17 | M8a membership rulings **D-M8a.1…22** (listed in `M8a-membership.md` §Decisions and rulings, each pinned by a test). Among them: foca's identity keyed by address, members grouped by name at the highest `(incarnation, rev)`; the packet MAC's key derived from the anchor; foca's settings from config §6.5.1; the ring's xxh3 points; placement over the Active members, a `Draining` node off the ring at once, additions after `rebalance_stabilization`; the hand-off permit; a controller that ended unasked started again (DA-OPS-7); a drop is a crash; the leave; the fence's epoch as the claim's floor, once (DA-CLUS-14); discovery while alone, the advertised address; per-node values through `${VAR}` (D-3); a busy slot's stale reader ended by the lease holder (DA-SRC-28) | The specs are silent on these, or (memberlist's keys, gossip TLS) changed by the M8a config patch | M8a — **approved 2026-10-21** |
 
 ### 9.1 Questions answered at plan review (2026-09-26)
 
@@ -1462,6 +1515,11 @@ the naming below (2026-09-26).**
 | Q-M7b-2 (2026-10-17) | Which targets, where in CI? | **The three position modes per change, in their own job** (`mysql-84`, `mysql-84-nogtid`, `mariadb-118`); `mariadb-118-binlog`, `mariadb-114`, `mariadb-1011` weekly | §5.4; M7b Task 8 |
 | Q-M7b-3 (2026-10-17) | How is a corrupted payload injected? | **A test-only TCP wire proxy** in the E2E suite (one compressed byte flipped, the CRC32 recomputed) | §5.3; M7b Task 7 |
 | Q-M7b-4 (2026-10-17) | How does the status show a pipeline-scope halt? | **A structured code** in `Actual::Error`, logged as a field; no new metric | §3.7; M7b Task 3 |
+| Q-M8-1 (2026-10-20) | Which gossip crate, after the probe gate? | **`foca` 2.0 with our own tokio actor** (memberlist 0.8.5 failed, C13) | §2.1, §3.7; M8a Tasks 3–4 |
+| Q-M8-2 (2026-10-20) | How is the gossip secured? | **A keyed BLAKE3 MAC on every packet**, keyed from the anchor's `fingerprint_key`; no encryption; `memberlist.tls` dropped (V-054 retired) | config §6.5.1; M8a Tasks 1, 3 |
+| Q-M8-3 (2026-10-20) | One plan or two? | **M8a + M8b**: membership, placement and the multi-node E2E first; config generations at run time and the reload E2E second | §4 M8 |
+| Q-M8-4 (2026-10-20) | How does the E2E run several nodes? | **Three host processes**, UDP forwarders, SIGSTOP/SIGCONT, `kill -9`, SIGTERM; the compose 3-node run moves to M11 | §4 M8, M11; M8a Task 12 |
+| Q-M8-5 (2026-10-21) | DA-SRC-28: a PostgreSQL takeover from a paused holder waits for `wal_sender_timeout` | **End the stale walsender** (the pipeline's own role, under the lease), in M8a | §3.6; M8a Task 13 |
 
 ### 9.2 Open questions (answer before the named milestone)
 

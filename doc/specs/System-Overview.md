@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-08
+updated: 2026-10-21
 domain: Architecture
 tags: [architecture, design, system, multi-sink, iceberg, delta-lake, v1-scope]
 sources: []
@@ -164,7 +164,7 @@ Names are the exposed sample names (OpenMetrics): a counter's name ends in `_tot
 | In-memory format | Apache Arrow   | Zero-copy, columnar, interoperable            |
 | Table format     | Pluggable per pipeline: Delta Lake (v1), Apache Iceberg (v2) | ACID, time travel, cloud-native; no single-crate hostage (see `research/Multi_Sink_Architecture_and_Delta_Lake.md`) |
 | Sink abstraction | `Sink` trait over a sink-neutral `TableChangeSet` + declared capabilities | Format-independent core; missing capability fails fast at pipeline start |
-| Cluster state    | memberlist (membership) + storage CAS lease (ownership) | Proven, well-understood failure model; the lease is the single-runner guarantee the ring cannot give |
+| Cluster state    | SWIM gossip (`foca`, membership) + storage CAS lease (ownership) | Proven, well-understood failure model; the lease is the single-runner guarantee the ring cannot give |
 | Delivery         | At-least-once delivery, exactly-once effect | Idempotent primary-key upserts absorb replays; the position guard and epoch fence are defense-in-depth |
 | Async runtime    | tokio          | Ecosystem standard for Rust async             |
 
@@ -197,7 +197,7 @@ The open questions from the first draft of this document are all closed. Each ro
 | OQ-IC1 | Iceberg COW vs MOR | MOR with equality deletes (COW for new tables only) — v2, with the Iceberg sink; the v1 Delta sink uses MERGE | `research/Ghost_Row_Dedup_and_Primary_Keys.md` §5 |
 | OQ-IC2 | Iceberg catalog | Glue, Hive Metastore and REST, chosen per pipeline (v2); HMS and REST-SigV4 are gated on the pinned crate (V-115/V-116) | `research/Catalog_Auth_Research.md`; Config §13 |
 | OQ-IC3 | Delivery guarantee | At-least-once delivery, exactly-once effect (idempotent upserts + position guard + epoch fence) | `research/Delivery_Guarantee_and_Position_Guard.md` |
-| OQ-API1 | API TLS / mTLS | API TLS optional (auth without TLS warns, V-052); memberlist TLS, CA present ⇒ mTLS | Config §6.3.2, §6.5.2 |
+| OQ-API1 | API TLS / mTLS | API TLS optional (auth without TLS warns, V-052); gossip packets carry a MAC keyed from the cluster anchor, not TLS | Config §6.3.2, §6.5.1 |
 | OQ-API2 | RBAC roles | `viewer` ⊆ `operator` ⊆ `admin`; see the endpoint table | `research/API_RBAC_and_Versioning.md` |
 | OQ-API3 | Config reload proxy | No proxy — any node accepts a reload; generation pointer + gossip | Clustering §9.2 |
 | OQ-OB1 | Distributed tracing | Optional OTLP, off by default | `research/Observability_Metrics_and_Tracing.md` §3 |

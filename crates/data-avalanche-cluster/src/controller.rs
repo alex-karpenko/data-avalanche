@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use data_avalanche_config::Pipeline;
@@ -120,6 +121,8 @@ pub struct ControllerDeps {
     pub settings: ControllerSettings,
     /// Caps the workers in Phase 0 at once (`max_concurrent_takeovers`).
     pub starts: Arc<Semaphore>,
+    /// Caps the workers handed off at once (`max_concurrent_handoffs`, Clustering §8.5).
+    pub handoffs: Arc<Semaphore>,
 }
 
 /// One pipeline's controller.
@@ -134,6 +137,7 @@ pub struct PipelineController {
     metrics: Arc<PipelineMetrics>,
     settings: ControllerSettings,
     starts: Arc<Semaphore>,
+    handoffs: Arc<Semaphore>,
     status: watch::Sender<ControllerStatus>,
 }
 
@@ -141,6 +145,9 @@ pub struct PipelineController {
 enum Left {
     /// The lease is gone: claim it again.
     Lost,
+    /// A table was written at `current_epoch`, past this lease's epoch: claim again, and take
+    /// this process's own lease over above it (DA-CLUS-14).
+    Fenced { current_epoch: u64 },
     /// The target became "don't own": the lease is released.
     Released,
     /// The target channel closed: the process is shutting down.
@@ -165,6 +172,7 @@ enum Event {
     Ended(Result<Result<Exit, WorkerError>, tokio::task::JoinError>),
     Status { open: bool },
     Start(OwnedSemaphorePermit),
+    HandOff(OwnedSemaphorePermit),
     Due,
     Poll,
 }
@@ -184,6 +192,30 @@ struct Running {
     reconnects: u64,
 }
 
+/// A worker never outlives its controller: a controller that panics drops its `Running`, and
+/// the worker task goes with it before the next controller claims the lease (DA-OPS-7).
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// The owned-pipelines gauge for as long as it lives: a panic or an abort decrements it too.
+struct Owned(Metrics);
+
+impl Owned {
+    fn new(node: &Metrics) -> Self {
+        node.owned_by(1);
+        Self(node.clone())
+    }
+}
+
+impl Drop for Owned {
+    fn drop(&mut self) {
+        self.0.owned_by(-1);
+    }
+}
+
 impl PipelineController {
     /// `docs` are the pipeline's state documents.
     pub fn new(
@@ -192,6 +224,17 @@ impl PipelineController {
         deps: &ControllerDeps,
     ) -> (Self, watch::Receiver<ControllerStatus>) {
         let (status, rx) = watch::channel(ControllerStatus::default());
+        (Self::reporting(pipeline, docs, deps, status), rx)
+    }
+
+    /// A controller that publishes its status into `status`: a controller started again after
+    /// its task ended keeps its predecessor's channel.
+    pub fn reporting(
+        pipeline: Pipeline,
+        docs: PipelineDocs,
+        deps: &ControllerDeps,
+        status: watch::Sender<ControllerStatus>,
+    ) -> Self {
         let labels = PipelineLabels {
             pipeline: pipeline.name.clone(),
             source_host: pipeline.source.host.clone(),
@@ -201,21 +244,19 @@ impl PipelineController {
             deps.metrics
                 .pipeline(labels, pipeline.sink.metrics.per_table),
         );
-        (
-            Self {
-                pipeline,
-                docs,
-                leases: deps.leases.clone(),
-                holder: deps.holder.clone(),
-                factory: Arc::clone(&deps.factory),
-                node: deps.metrics.clone(),
-                metrics,
-                settings: deps.settings.clone(),
-                starts: Arc::clone(&deps.starts),
-                status,
-            },
-            rx,
-        )
+        Self {
+            pipeline,
+            docs,
+            leases: deps.leases.clone(),
+            holder: deps.holder.clone(),
+            factory: Arc::clone(&deps.factory),
+            node: deps.metrics.clone(),
+            metrics,
+            settings: deps.settings.clone(),
+            starts: Arc::clone(&deps.starts),
+            handoffs: Arc::clone(&deps.handoffs),
+            status,
+        }
     }
 
     /// Runs until the target channel closes; the lease is released on the way out.
@@ -235,7 +276,11 @@ impl PipelineController {
                 continue;
             }
             let wait = match claim.step().await {
-                Ok(Claimed::Mine { lease, written }) => {
+                Ok(Claimed::Mine {
+                    lease,
+                    written,
+                    jumped,
+                }) => {
                     tracing::info!(
                         pipeline = %self.pipeline.name,
                         owner_epoch = lease.doc.owner_epoch,
@@ -249,8 +294,13 @@ impl PipelineController {
                         written,
                         Arc::clone(&self.metrics),
                     );
-                    match self.owned(run, &mut target).await {
+                    match self.owned(run, jumped, &mut target).await {
                         Left::Shutdown => return,
+                        Left::Fenced { current_epoch } => {
+                            claim.at_least(current_epoch.saturating_add(1));
+                            self.standby(None);
+                            continue;
+                        }
                         // Not this node's until a step says otherwise, though claiming fails.
                         Left::Lost => {
                             self.standby(None);
@@ -279,19 +329,32 @@ impl PipelineController {
     }
 
     /// Holds the lease and reconciles the worker until the lease is lost or let go.
-    async fn owned(&self, run: LeaseRun, target: &mut watch::Receiver<Target>) -> Left {
-        self.node.owned_by(1);
-        let left = self.reconcile(run, target).await;
-        self.node.owned_by(-1);
-        left
+    /// `jumped`: the term's epoch was raised past the lease's to clear a table's (DA-CLUS-14).
+    async fn owned(
+        &self,
+        run: LeaseRun,
+        jumped: bool,
+        target: &mut watch::Receiver<Target>,
+    ) -> Left {
+        let _owned = Owned::new(&self.node);
+        self.reconcile(run, jumped, target).await
     }
 
-    async fn reconcile(&self, run: LeaseRun, target: &mut watch::Receiver<Target>) -> Left {
+    async fn reconcile(
+        &self,
+        run: LeaseRun,
+        jumped: bool,
+        target: &mut watch::Receiver<Target>,
+    ) -> Left {
+        let mut jumped = jumped;
         let mut worker: Option<Running> = None;
         let mut error: Option<Failure> = None;
         let mut dumped = false;
         let mut retry: Option<(Instant, String)> = None;
         let mut failures: u32 = 0;
+        // One lease term: a stale reader is ended at most once in it, by whichever of its
+        // workers meets it first, a stop and a resume included (DA-SRC-28).
+        let reader_ended = Arc::new(AtomicBool::new(false));
         // Unknown until a read succeeds: nothing starts on a guess (a stopped or paused pipeline
         // must not run because its state document was unreadable once).
         let mut desired = self.desired().await;
@@ -304,8 +367,10 @@ impl PipelineController {
                     // Cut off or not, the worker and its writer are gone: the lease stays held.
                     self.drain(w).await;
                 }
-                // A stop clears an error: the resume after it runs the pipeline again.
+                // A stop clears an error: the resume after it runs the pipeline again. It also
+                // spends the jump: the next fence climbs once more, as the ERROR's remedy says.
                 error = None;
+                jumped = false;
                 dumped = false;
                 retry = None;
                 failures = 0;
@@ -323,11 +388,20 @@ impl PipelineController {
                     _ => {}
                 }
             }
+            // "Don't own": with nothing to drain the lease goes back now; a worker is handed off
+            // once a hand-off permit is free, unless the target turns back to "own" first.
+            let hand_off = *target.borrow() == Target::DontOwn;
+            if hand_off && worker.is_none() {
+                self.give_back(run).await;
+                self.standby(None);
+                return Left::Released;
+            }
             let due = retry.as_ref().map(|(at, _)| *at);
             // A worker may run: no error, not dumped, and a desired state read that isn't
             // "stopped". Only then does a retry's time matter (else its arm would be ready at
             // every turn).
             let may_run = worker.is_none()
+                && !hand_off
                 && error.is_none()
                 && !dumped
                 && desired.is_some_and(|d| d != DesiredState::Stopped);
@@ -341,6 +415,7 @@ impl PipelineController {
                 retry.as_ref().map(|(_, e)| e.as_str()),
             );
             let starts = Arc::clone(&self.starts);
+            let handoffs = Arc::clone(&self.handoffs);
             let event = {
                 let (task, status) = match worker.as_mut() {
                     Some(Running { task, handle, .. }) => (Some(task), Some(&mut handle.status)),
@@ -365,6 +440,9 @@ impl PipelineController {
                     permit = starts.acquire_owned(), if want_start => {
                         Event::Start(permit.expect("the start semaphore isn't closed"))
                     }
+                    permit = handoffs.acquire_owned(), if hand_off => {
+                        Event::HandOff(permit.expect("the hand-off semaphore isn't closed"))
+                    }
                     () = async {
                         match due {
                             Some(at) => tokio::time::sleep_until(at).await,
@@ -376,10 +454,10 @@ impl PipelineController {
             };
             match event {
                 Event::Lost => {
-                    if let Some(w) = worker.take() {
+                    if let Some(mut w) = worker.take() {
                         w.task.abort();
                         // Ended (dropped) before the next term starts: its writer goes with it.
-                        let _ = w.task.await;
+                        let _ = (&mut w.task).await;
                         self.metrics.worker_ended();
                     }
                     let reason = match run.stop().await {
@@ -389,30 +467,15 @@ impl PipelineController {
                     tracing::error!(pipeline = %self.pipeline.name, "lease lost: {reason}");
                     return Left::Lost;
                 }
-                Event::Target { closed } => {
-                    if closed || *target.borrow() == Target::DontOwn {
-                        let drained = match worker.take() {
-                            Some(w) => self.drain(w).await,
-                            None => true,
-                        };
-                        if drained {
-                            self.give_back(run).await;
-                        } else {
-                            // Clustering §8.3: a worker cut off may have left a write in
-                            // flight; the lease expires instead of being handed over now.
-                            let _ = run.stop().await;
-                            tracing::warn!(
-                                pipeline = %self.pipeline.name,
-                                "lease left to expire after the drain was cut off"
-                            );
-                        }
-                        self.standby(None);
-                        return if closed {
-                            Left::Shutdown
-                        } else {
-                            Left::Released
-                        };
-                    }
+                // A shutdown drains at once; "don't own" waits for its hand-off permit.
+                Event::Target { closed: true } => {
+                    self.let_go(run, worker.take()).await;
+                    return Left::Shutdown;
+                }
+                Event::Target { closed: false } => {}
+                Event::HandOff(_permit) => {
+                    self.let_go(run, worker.take()).await;
+                    return Left::Released;
                 }
                 Event::Ended(ended) => {
                     let mut w = worker.take().expect("a worker ended");
@@ -438,14 +501,41 @@ impl PipelineController {
                                 );
                                 retry = Some((at, e.to_string()));
                             }
-                            Recovery::Lease => {
-                                tracing::error!(
-                                    pipeline = %self.pipeline.name,
-                                    "worker stopped for the lease: {e}"
-                                );
-                                let _ = run.stop().await;
-                                return Left::Lost;
-                            }
+                            Recovery::Lease => match e {
+                                // DA-CLUS-14: the term already jumped past the table's epoch,
+                                // and the table moved past it again. Another lease store
+                                // writes to this lake; climbing on would defeat the fence.
+                                WorkerError::Fenced {
+                                    table,
+                                    current_epoch,
+                                } if jumped => {
+                                    let why = format!(
+                                        "{table} was written at owner epoch {current_epoch}, past this lease's {}, which had already been raised past the table's: another lease store (another globals.state) writes to this lake. Let one cluster write it, then stop and resume the pipeline",
+                                        run.owner_epoch
+                                    );
+                                    tracing::error!(pipeline = %self.pipeline.name, "pipeline in ERROR: {why}");
+                                    error = Some(Failure {
+                                        error: why,
+                                        code: None,
+                                    });
+                                }
+                                WorkerError::Fenced { current_epoch, .. } => {
+                                    tracing::error!(
+                                        pipeline = %self.pipeline.name,
+                                        "worker stopped for the lease: {e}"
+                                    );
+                                    let _ = run.stop().await;
+                                    return Left::Fenced { current_epoch };
+                                }
+                                e => {
+                                    tracing::error!(
+                                        pipeline = %self.pipeline.name,
+                                        "worker stopped for the lease: {e}"
+                                    );
+                                    let _ = run.stop().await;
+                                    return Left::Lost;
+                                }
+                            },
                             Recovery::Error => {
                                 let code = e.code().map(str::to_owned);
                                 tracing::error!(
@@ -473,7 +563,7 @@ impl PipelineController {
                         self.observe(w);
                     }
                 }
-                Event::Start(permit) => match self.start(&run, permit) {
+                Event::Start(permit) => match self.start(&run, &reader_ended, permit) {
                     Ok(w) => worker = Some(w),
                     Err(e) => {
                         tracing::error!(pipeline = %self.pipeline.name, "pipeline in ERROR: {e}");
@@ -507,7 +597,13 @@ impl PipelineController {
         }
     }
 
-    fn start(&self, run: &LeaseRun, permit: OwnedSemaphorePermit) -> Result<Running, String> {
+    /// `reader_ended`: the term's [`WorkerDeps::reader_ended`].
+    fn start(
+        &self,
+        run: &LeaseRun,
+        reader_ended: &Arc<AtomicBool>,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<Running, String> {
         let parts = self.factory.build(&self.pipeline)?;
         let deps = WorkerDeps {
             source: parts.source,
@@ -516,6 +612,7 @@ impl PipelineController {
             owner_epoch: run.owner_epoch,
             guard: run.guard.clone(),
             hooks: parts.hooks,
+            reader_ended: Arc::clone(reader_ended),
         };
         let (worker, handle) =
             PipelineWorker::new(&self.pipeline, deps, self.settings.tuning.clone());
@@ -572,6 +669,26 @@ impl PipelineController {
         self.observe(&mut w);
         self.metrics.worker_ended();
         drained
+    }
+
+    /// Drains the worker and releases the lease; a worker cut off leaves it to expire.
+    async fn let_go(&self, run: LeaseRun, worker: Option<Running>) {
+        let drained = match worker {
+            Some(w) => self.drain(w).await,
+            None => true,
+        };
+        if drained {
+            self.give_back(run).await;
+        } else {
+            // Clustering §8.3: a worker cut off may have left a write in flight; the lease
+            // expires instead of being handed over now.
+            let _ = run.stop().await;
+            tracing::warn!(
+                pipeline = %self.pipeline.name,
+                "lease left to expire after the drain was cut off"
+            );
+        }
+        self.standby(None);
     }
 
     async fn give_back(&self, run: LeaseRun) {
@@ -894,6 +1011,47 @@ mod tests {
         assert_eq!(f.builds(), 2);
     }
 
+    /// The stale reader is ended at most once a lease term (DA-SRC-28): a worker that gave up on
+    /// a busy slot is rerun under the same lease, and the rerun waits the slot out too, though
+    /// it is a new worker.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_reader_is_ended_once_a_lease_term() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a"]);
+        let busy = |f: &TestFactory| {
+            for _ in 0..10_000 {
+                f.source
+                    .fail(Method::OpenStream, SourceError::Contended("active".into()));
+            }
+            f.source
+                .fail(Method::Next, SourceError::Transient("reset".into()));
+        };
+        let mut n = node("n1", &store, &docs, &f);
+        until(&mut n.status, "running", is(Actual::Running)).await;
+        // A reconnect meets the busy slot: its reader is ended, and the worker streams on.
+        busy(&f);
+        eventually("the reader is ended", || f.source.readers_ended() == 1).await;
+        f.source.commit(FakeTxn::new().insert(&t("a"), row(1)));
+        eventually("the row lands", || f.ids("a") == [1]).await;
+        assert_eq!(f.builds(), 1);
+        // The slot is busy again: the worker gives up after `contended_window` (200 ms), and is
+        // rerun after the restart backoff (100 ms first); the rerun meets the busy slot.
+        busy(&f);
+        until(
+            &mut n.status,
+            "retrying",
+            |s| matches!(&s.actual, Some(Actual::Retrying { error }) if error.contains("active")),
+        )
+        .await;
+        eventually("the rerun meets the busy slot and gives up", || {
+            f.source.readers_ended() > 1 || f.builds() >= 3
+        })
+        .await;
+        assert_eq!(f.source.readers_ended(), 1, "not ended again in the term");
+        assert_eq!(n.status.borrow().owner_epoch, Some(1), "the same term");
+    }
+
     /// The state store fails Phase 0's first write: the worker ends, and runs again.
     #[tokio::test(start_paused = true)]
     async fn a_transient_worker_error_reruns_it_after_a_backoff() {
@@ -931,6 +1089,9 @@ mod tests {
             matches!(s.actual, Some(Actual::Standby { .. }))
         })
         .await;
+        let lost = format!(r#"data_avalanche_lease_renew_failures_total{{{P},class="lost"}} 1"#);
+        let text = n.metrics.encode();
+        assert!(line(&text, &lost), "the loss outlives the standby\n{text}");
         f.source.commit(FakeTxn::new().insert(&t("a"), row(1)));
         tokio::time::sleep(Duration::from_secs(5)).await;
         assert!(
@@ -941,6 +1102,8 @@ mod tests {
         until(&mut n.status, "running again", is(Actual::Running)).await;
         assert_eq!(n.status.borrow().owner_epoch, Some(2));
         eventually("the row lands", || f.ids("a") == [1]).await;
+        let text = n.metrics.encode();
+        assert!(line(&text, &lost), "the next term counts on\n{text}");
     }
 
     /// A stop drains: what the worker read is committed before it ends, though the commit
@@ -1000,10 +1163,12 @@ mod tests {
         );
     }
 
-    /// A worker that ends for the lease (a newer epoch wrote a table) goes back to claiming: the
-    /// next term runs under a new epoch, never `ERROR`.
+    /// A worker that ends for the lease (a newer epoch wrote a table) goes back to claiming. The
+    /// lease still names this node, at epoch 1, while the table was written at 5 (a moved or
+    /// restored `globals.state`, DA-CLUS-14): the next term jumps to 6 at once, not one epoch
+    /// per worker run.
     #[tokio::test(start_paused = true)]
-    async fn a_worker_fenced_goes_back_to_the_lease() {
+    async fn a_worker_fenced_goes_back_to_the_lease_above_the_tables_epoch() {
         let store = ScriptedStore::new();
         let docs = pipeline_docs();
         let f = TestFactory::new(&["a"]);
@@ -1011,13 +1176,92 @@ mod tests {
         until(&mut n.status, "running", is(Actual::Running)).await;
         f.source.commit(FakeTxn::new().insert(&t("a"), row(1)));
         eventually("the first row lands", || f.ids("a") == [1]).await;
-        f.sink.take_over(&t("a"), 2);
+        f.sink.take_over(&t("a"), 5);
         f.source.commit(FakeTxn::new().insert(&t("a"), row(2)));
-        until(&mut n.status, "running under epoch 2", |s| {
-            s.actual == Some(Actual::Running) && s.owner_epoch == Some(2)
+        until(&mut n.status, "running under epoch 6", |s| {
+            s.actual == Some(Actual::Running) && s.owner_epoch == Some(6)
         })
         .await;
         eventually("the second row lands", || f.ids("a") == [1, 2]).await;
+        assert_eq!(f.builds(), 2, "one worker run per fence");
+    }
+
+    /// The table moves past the jumped epoch again: another lease store writes to the lake.
+    /// The pipeline goes to `ERROR` and keeps its lease, rather than climbing.
+    #[tokio::test(start_paused = true)]
+    async fn a_second_fence_past_a_jumped_epoch_is_an_error() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a"]);
+        let mut n = node("n1", &store, &docs, &f);
+        until(&mut n.status, "running", is(Actual::Running)).await;
+        f.source.commit(FakeTxn::new().insert(&t("a"), row(1)));
+        eventually("the first row lands", || f.ids("a") == [1]).await;
+        f.sink.take_over(&t("a"), 5);
+        f.source.commit(FakeTxn::new().insert(&t("a"), row(2)));
+        until(&mut n.status, "running under epoch 6", |s| {
+            s.owner_epoch == Some(6)
+        })
+        .await;
+        eventually("the second row lands", || f.ids("a") == [1, 2]).await;
+        f.sink.take_over(&t("a"), 9);
+        f.source.commit(FakeTxn::new().insert(&t("a"), row(3)));
+        until(&mut n.status, "ERROR", |s| {
+            matches!(s.actual, Some(Actual::Error { .. }))
+        })
+        .await;
+        let Some(Actual::Error { error, code }) = n.status.borrow().actual.clone() else {
+            unreachable!()
+        };
+        assert!(error.contains("another lease store"), "{error}");
+        assert_eq!(code, None);
+        assert_eq!(n.status.borrow().owner_epoch, Some(6), "the lease is kept");
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(f.builds(), 2, "no climb");
+        assert_eq!(f.ids("a"), [1, 2]);
+        let lease = leases(&store).observe("p").await.unwrap().unwrap();
+        assert_eq!((lease.doc.owner_epoch, lease.doc.released), (6, false));
+    }
+
+    /// The ERROR's remedy: a stop and a resume. The stop spends the jump, so the resume's fence
+    /// (the table at 9, the lease at 6) climbs once more, to 10.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_and_resume_after_the_error_jumps_once_more() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a"]);
+        let mut n = node("n1", &store, &docs, &f);
+        until(&mut n.status, "running", is(Actual::Running)).await;
+        f.source.commit(FakeTxn::new().insert(&t("a"), row(1)));
+        eventually("the first row lands", || f.ids("a") == [1]).await;
+        f.sink.take_over(&t("a"), 5);
+        f.source.commit(FakeTxn::new().insert(&t("a"), row(2)));
+        until(&mut n.status, "running under epoch 6", |s| {
+            s.owner_epoch == Some(6)
+        })
+        .await;
+        eventually("the second row lands", || f.ids("a") == [1, 2]).await;
+        f.sink.take_over(&t("a"), 9);
+        f.source.commit(FakeTxn::new().insert(&t("a"), row(3)));
+        until(&mut n.status, "ERROR", |s| {
+            matches!(s.actual, Some(Actual::Error { .. }))
+        })
+        .await;
+        docs.set_desired_state(DesiredState::Stopped).await.unwrap();
+        until(&mut n.status, "stopped", is(Actual::Stopped)).await;
+        docs.set_desired_state(DesiredState::Running).await.unwrap();
+        until(&mut n.status, "running under epoch 10", |s| {
+            s.actual == Some(Actual::Running) && s.owner_epoch == Some(10)
+        })
+        .await;
+        eventually("the third row lands", || f.ids("a") == [1, 2, 3]).await;
+        assert_eq!(
+            f.builds(),
+            4,
+            "one run per epoch, and the resume's fenced one"
+        );
+        let lease = leases(&store).observe("p").await.unwrap().unwrap();
+        assert_eq!((lease.doc.owner_epoch, lease.doc.released), (10, false));
     }
 
     /// A worker that failed transiently, then a start that fails for good: `ERROR` holds, and

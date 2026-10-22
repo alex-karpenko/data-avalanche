@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-01
+updated: 2026-10-22
 domain: Data Flow
 tags: [postgres, replication-slot, publication, lifecycle, wal, re-snapshot, cdc]
 resolves: [G-15]
@@ -114,6 +114,16 @@ config §):
   another holder exists — and surfaced, not retried into a busy-loop. Amended 2026-10-01 (Task 8
   review, M6): on a quick restart the old walsender can hold the slot until `wal_sender_timeout`,
   so the owner of the lease retries it a bounded number of times before treating it as fatal.
+  Amended 2026-10-21 (M8a Task 13, DA-SRC-28, Q-M8-5): the owner of the lease first ends the walsender
+  holding the slot when it runs as the pipeline's own role (`pg_terminate_backend`, waiting up to
+  5 s). The lease proves that reader is stale: a holder that stopped without closing its connection
+  (a stop-the-world pause) or this node's own dropped session. Without that, a takeover after a
+  pause waited for `wal_sender_timeout` plus a backoff step, about two minutes. A reader of another
+  role is never ended, so the bounded retry still covers it, and so is the external collision
+  below. Amended 2026-10-22 (M8a's whole-branch review): a holder ends such a reader at most once a
+  lease term. Two holders that each believe they hold the lease (two lease stores on one slot) would
+  otherwise end each other in turn, splitting the slot's changes between two lakes; with the limit,
+  the later busy spell gives up loudly with the bounded retry's error.
 - **External (non-app) collisions cannot be detected.** PG replication slots carry **no ownership
   tag/comment**, so a slot created by an unrelated system under the same name is indistinguishable.
   Mitigation is V-058 naming uniqueness + operator discipline; documented as a known limitation, not

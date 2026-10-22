@@ -1,6 +1,8 @@
-//! A store whose writes fail on cue, and the lease fixtures the tests share.
+//! A store whose writes fail on cue, the lease fixtures the tests share, and an in-memory
+//! network for the gossip.
 
 use std::collections::VecDeque;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -391,6 +393,7 @@ pub(crate) fn deps(
         metrics: Metrics::new(),
         settings: settings(),
         starts: Arc::new(tokio::sync::Semaphore::new(1)),
+        handoffs: Arc::new(tokio::sync::Semaphore::new(2)),
     }
 }
 
@@ -436,4 +439,368 @@ pub(crate) async fn eventually(what: &str, cond: impl Fn() -> bool) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("timed out waiting until {what}");
+}
+
+/// An in-memory network for the gossip: an inbox per address, and blocked (from, to) pairs.
+#[derive(Debug, Default)]
+pub(crate) struct Hub {
+    inboxes: Mutex<std::collections::HashMap<SocketAddr, tokio::sync::mpsc::Sender<Bytes>>>,
+    blocked: Mutex<std::collections::HashSet<(SocketAddr, SocketAddr)>>,
+}
+
+/// A node's connection to the hub.
+#[derive(Debug)]
+pub(crate) struct Port {
+    hub: Arc<Hub>,
+    addr: SocketAddr,
+}
+
+impl Hub {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Plugs `addr` in: what it sends goes through the returned port, what it receives to the
+    /// returned inbox.
+    pub fn port(self: &Arc<Self>, addr: SocketAddr) -> (Port, tokio::sync::mpsc::Receiver<Bytes>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(crate::wire::INBOX);
+        self.inboxes.lock().unwrap().insert(addr, tx);
+        let port = Port {
+            hub: Arc::clone(self),
+            addr,
+        };
+        (port, rx)
+    }
+
+    /// Drops all traffic between `a` and `b`, both ways.
+    pub fn cut(&self, a: &[SocketAddr], b: &[SocketAddr]) {
+        let mut blocked = self.blocked.lock().unwrap();
+        for x in a {
+            for y in b {
+                blocked.insert((*x, *y));
+                blocked.insert((*y, *x));
+            }
+        }
+    }
+
+    pub fn heal(&self) {
+        self.blocked.lock().unwrap().clear();
+    }
+}
+
+impl crate::Wire for Port {
+    fn send(&self, to: SocketAddr, packet: Bytes) {
+        if self.hub.blocked.lock().unwrap().contains(&(self.addr, to)) {
+            return;
+        }
+        if let Some(tx) = self.hub.inboxes.lock().unwrap().get(&to) {
+            let _ = tx.try_send(packet);
+        }
+    }
+}
+
+/// `10.0.0.<n>:7946`, a node's address on the hub.
+pub(crate) fn at(n: u8) -> SocketAddr {
+    SocketAddr::from(([10, 0, 0, n], 7946))
+}
+
+/// `me`'s view of the members: each `(name, phase, suspect)`, the n-th at `at(n)`.
+pub(crate) fn members(me: &str, nodes: &[(&str, crate::Phase, bool)]) -> crate::Members {
+    let nodes = nodes
+        .iter()
+        .zip(1..)
+        .map(|((name, phase, suspect), n)| {
+            let member = crate::Member {
+                addr: at(n),
+                meta: crate::NodeMeta {
+                    phase: *phase,
+                    config_generation: 1,
+                    build: "1.0.0".into(),
+                },
+                suspect: *suspect,
+            };
+            ((*name).to_owned(), member)
+        })
+        .collect();
+    crate::Members {
+        me: me.into(),
+        nodes,
+    }
+}
+
+/// `me` alone, active.
+pub(crate) fn alone(me: &str) -> crate::Members {
+    members(me, &[(me, crate::Phase::Active, false)])
+}
+
+mod hub_tests {
+    use super::*;
+    use crate::Wire;
+
+    #[tokio::test]
+    async fn the_hub_delivers_until_cut_and_after_a_heal() {
+        let hub = Hub::new();
+        let (a, _a_in) = hub.port(at(1));
+        let (_b, mut b_in) = hub.port(at(2));
+        a.send(at(2), Bytes::from_static(b"1"));
+        assert_eq!(b_in.recv().await.as_deref(), Some(&b"1"[..]));
+        hub.cut(&[at(1)], &[at(2)]);
+        a.send(at(2), Bytes::from_static(b"2"));
+        assert!(b_in.try_recv().is_err(), "a cut drops the packet");
+        hub.heal();
+        a.send(at(2), Bytes::from_static(b"3"));
+        assert_eq!(b_in.recv().await.as_deref(), Some(&b"3"[..]));
+        a.send(at(9), Bytes::from_static(b"4"));
+    }
+}
+
+/// The gossip's timers in the tests: config §6.5.1's defaults, a 5 s push/pull.
+pub(crate) fn gossip_settings() -> crate::GossipSettings {
+    crate::GossipSettings {
+        probe_interval: Duration::from_secs(1),
+        probe_timeout: Duration::from_millis(500),
+        gossip_interval: Duration::from_millis(200),
+        gossip_nodes: 3,
+        push_pull_interval: Duration::from_secs(5),
+        retransmit_factor: 4,
+    }
+}
+
+/// One [`TestFactory`] per pipeline id. The nodes of a [`TestCluster`] share it: a pipeline's
+/// source and sink are the same whichever node runs it, as a database and a lake are.
+#[derive(Debug, Clone)]
+pub(crate) struct ByPipeline(pub std::collections::BTreeMap<String, TestFactory>);
+
+impl crate::WorkerFactory for ByPipeline {
+    fn build(&self, p: &data_avalanche_config::Pipeline) -> Result<crate::Parts, String> {
+        self.0[&p.id].build(p)
+    }
+}
+
+/// `rebalance_stabilization` in the cluster tests.
+pub(crate) const STABLE: Duration = Duration::from_secs(15);
+
+/// A leave's bound that no test's hand-offs reach.
+pub(crate) const LEAVE_WITHIN: Duration = Duration::from_secs(3600);
+
+/// In-process nodes: their gossip on one hub, their leases in one store, their pipelines'
+/// sources, sinks and state documents shared.
+#[derive(Debug)]
+pub(crate) struct TestCluster {
+    pub hub: Arc<Hub>,
+    pub store: Arc<ScriptedStore>,
+    pub factories: ByPipeline,
+    ids: Vec<String>,
+    docs: std::collections::BTreeMap<String, data_avalanche_state::PipelineDocs>,
+    registry: Registry,
+    violation: Arc<Mutex<Option<String>>>,
+    checker: tokio::task::JoinHandle<()>,
+}
+
+/// Every status a [`TestCluster`] started: node name, pipeline id, the controller's status.
+type Registry = Arc<
+    Mutex<
+        Vec<(
+            String,
+            String,
+            tokio::sync::watch::Receiver<crate::ControllerStatus>,
+        )>,
+    >,
+>;
+
+impl Drop for TestCluster {
+    fn drop(&mut self) {
+        self.checker.abort();
+    }
+}
+
+/// One node of a [`TestCluster`]. Dropped, it is a crash.
+#[derive(Debug)]
+pub(crate) struct TestNode {
+    pub name: String,
+    pub gossip: crate::Gossip,
+    pub reconciler: crate::ClusterReconciler,
+    pub addr: SocketAddr,
+    /// The node's hand-off permits (`max_concurrent_handoffs`): a test that holds them all
+    /// keeps every hand-off from starting.
+    pub handoffs: Arc<tokio::sync::Semaphore>,
+}
+
+/// Every 10 ms of the test clock, the pipelines running on two or more nodes of `registry`:
+/// the first such sighting goes to `violation`. A status whose controller is gone (a crashed
+/// or left node) counts as not running.
+async fn check_once_running(registry: Registry, violation: Arc<Mutex<Option<String>>>) {
+    use crate::Actual;
+    let t = tokio::time::Instant::now();
+    loop {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let mut by: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for (node, id, rx) in registry.lock().unwrap().iter() {
+            let alive = rx.has_changed().is_ok();
+            if alive && matches!(rx.borrow().actual, Some(Actual::Starting | Actual::Running)) {
+                by.entry(id.clone()).or_default().push(node.clone());
+            }
+        }
+        let mut seen = violation.lock().unwrap();
+        if seen.is_none()
+            && let Some((id, nodes)) = by.iter().find(|(_, nodes)| nodes.len() > 1)
+        {
+            *seen = Some(format!(
+                "{id} ran on {nodes:?} at once, at {:?} of the test clock",
+                t.elapsed()
+            ));
+        }
+    }
+}
+
+impl TestCluster {
+    /// Also starts the checker, which samples the whole test, every 10 ms of the test clock,
+    /// that no pipeline is starting or running on two nodes (D-M8a.21's invariant, beyond
+    /// `settles`); [`Self::assert_ran_once`] reports it. Runs inside a tokio test.
+    pub fn new(ids: &[&str]) -> Self {
+        let registry: Registry = Default::default();
+        let violation: Arc<Mutex<Option<String>>> = Default::default();
+        let checker = tokio::spawn(check_once_running(registry.clone(), violation.clone()));
+        Self {
+            registry,
+            violation,
+            checker,
+            hub: Hub::new(),
+            store: ScriptedStore::new(),
+            factories: ByPipeline(
+                ids.iter()
+                    .map(|id| ((*id).to_owned(), TestFactory::new(&["a"])))
+                    .collect(),
+            ),
+            ids: ids.iter().map(|id| (*id).to_owned()).collect(),
+            docs: ids
+                .iter()
+                .map(|id| ((*id).to_owned(), pipeline_docs()))
+                .collect(),
+        }
+    }
+
+    /// Starts `name` at `at(n)` as its `incarnation`, as the binary does: its gossip joining,
+    /// announced to `seed`, then [`crate::join`], then its reconciler.
+    pub async fn start(
+        &self,
+        name: &str,
+        n: u8,
+        incarnation: u64,
+        seed: Option<SocketAddr>,
+    ) -> TestNode {
+        let (port, inbox) = self.hub.port(at(n));
+        let me = crate::NodeIdentity {
+            node_id: name.to_owned(),
+            incarnation,
+            rev: 0,
+            addr: at(n),
+            meta: crate::NodeMeta {
+                phase: crate::Phase::Joining,
+                config_generation: 1,
+                build: "1.0.0".into(),
+            },
+        };
+        let key = crate::GossipKey::derive(&[7; 32]);
+        let gossip = crate::Gossip::start(me, key, gossip_settings(), Arc::new(port), inbox);
+        if let Some(seed) = seed {
+            gossip.announce(vec![seed]);
+        }
+        crate::join(&gossip, seed.is_some()).await;
+        let mut deps = deps(
+            name,
+            &self.store,
+            self.factories.0.values().next().expect("a pipeline"),
+        );
+        deps.holder.incarnation = incarnation;
+        deps.factory = Arc::new(self.factories.clone());
+        deps.starts = Arc::new(tokio::sync::Semaphore::new(4));
+        let ids: Vec<&str> = self.ids.iter().map(String::as_str).collect();
+        let mut cfg = config(&ids).pipelines;
+        let pipelines = self
+            .ids
+            .iter()
+            .map(|id| (cfg.remove(id).expect("configured"), self.docs[id].clone()))
+            .collect();
+        let settings = crate::ReconcilerSettings {
+            tokens: 128,
+            stabilization: STABLE,
+            resync: timing().renewal_interval,
+        };
+        let reconciler =
+            crate::ClusterReconciler::start(pipelines, &deps, gossip.members(), settings);
+        {
+            let mut registry = self.registry.lock().unwrap();
+            for (id, rx) in reconciler.statuses() {
+                registry.push((name.to_owned(), id, rx));
+            }
+        }
+        TestNode {
+            name: name.to_owned(),
+            gossip,
+            reconciler,
+            addr: at(n),
+            handoffs: deps.handoffs,
+        }
+    }
+
+    /// Panics with the first double run the checker saw, if any.
+    pub fn assert_ran_once(&self) {
+        if let Some(v) = self.violation.lock().unwrap().as_ref() {
+            panic!("{v}");
+        }
+    }
+
+    /// Commits a transaction inserting `id` into every pipeline's `public.a`.
+    pub fn insert(&self, id: i64) {
+        for f in self.factories.0.values() {
+            f.source.commit(
+                data_avalanche_testkit::FakeTxn::new()
+                    .insert(&data_avalanche_core::TableRef::new("public", "a"), row(id)),
+            );
+        }
+    }
+
+    /// True when every pipeline's sink holds exactly `ids`.
+    pub fn landed(&self, ids: &[i64]) -> bool {
+        self.factories.0.values().all(|f| f.ids("a") == ids)
+    }
+}
+
+/// The nodes each pipeline's worker runs on (starting or running), by pipeline id.
+pub(crate) fn runners(nodes: &[&TestNode]) -> std::collections::BTreeMap<String, Vec<String>> {
+    use crate::Actual;
+    let mut by: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for n in nodes {
+        for (id, s) in n.reconciler.statuses() {
+            let runs = matches!(s.borrow().actual, Some(Actual::Starting | Actual::Running));
+            let names = by.entry(id).or_default();
+            if runs {
+                names.push(n.name.clone());
+            }
+        }
+    }
+    by
+}
+
+/// Waits (on the test clock) until every pipeline runs on one of `nodes` as `placed` says,
+/// checking at every step that no pipeline runs on two nodes.
+pub(crate) async fn settles(what: &str, nodes: &[&TestNode], placed: impl Fn(&str) -> String) {
+    for _ in 0..12_000 {
+        let now = runners(nodes);
+        for (id, on) in &now {
+            assert!(
+                on.len() <= 1,
+                "{id} runs on {on:?} while waiting until {what}"
+            );
+        }
+        if now
+            .iter()
+            .all(|(id, on)| on.len() == 1 && on[0] == placed(id))
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting until {what}: {:?}", runners(nodes));
 }

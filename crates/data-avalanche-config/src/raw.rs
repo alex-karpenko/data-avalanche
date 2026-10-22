@@ -121,27 +121,12 @@ pub(crate) struct RawMemberlist {
     pub advertise_port: L<u16>,
     pub bind_addr: Option<Vec<Leaf<IpAddr>>>,
     pub bind_port: L<u16>,
-    pub packet_dial_timeout: L<Duration>,
-    pub packet_write_timeout: L<Duration>,
-    pub compression_enabled: L<bool>,
     pub gossip_interval: L<Duration>,
     pub gossip_nodes: L<u32>,
     pub probe_interval: L<Duration>,
     pub probe_timeout: L<Duration>,
-    pub dead_node_reclaim_time: L<Duration>,
     pub push_pull_interval: L<Duration>,
     pub retransmit_factor: L<u32>,
-    pub lifeguard_enabled: L<bool>,
-    pub tls: Option<RawMemberlistTls>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RawMemberlistTls {
-    pub enabled: L<bool>,
-    pub cert: L<String>,
-    pub key: L<String>,
-    pub ca: L<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -444,8 +429,8 @@ mod tests {
         let globals = raw.globals.unwrap();
         let cluster = globals.cluster.unwrap();
         assert_eq!(cluster.lease_duration.unwrap().text(), "15s");
-        let tls = cluster.memberlist.unwrap().tls.unwrap();
-        assert_eq!(tls.key.unwrap().text(), "${GOSSIP_TLS_KEY}");
+        let memberlist = cluster.memberlist.unwrap();
+        assert_eq!(memberlist.gossip_interval.unwrap().text(), "200ms");
         let defaults = raw.defaults.unwrap();
         let rest = defaults
             .sink
@@ -493,7 +478,6 @@ mod tests {
         "globals: {log: {bogus: 1}}",
         "globals: {cluster: {bogus: 1}}",
         "globals: {cluster: {memberlist: {bogus: 1}}}",
-        "globals: {cluster: {memberlist: {tls: {bogus: 1}}}}",
         "globals: {tracing: {bogus: 1}}",
         "globals: {azure: {bogus: 1}}",
         "defaults: {bogus: 1}",
@@ -532,6 +516,29 @@ mod tests {
             assert_eq!(err.rule, PARSE, "{case}");
             assert!(
                 err.message.contains("unknown field `bogus`"),
+                "{case}: {}",
+                err.message
+            );
+        }
+    }
+
+    /// §6.5.1 as of M8a (Q-M8-1): the gossip is foca over UDP, so memberlist's TCP, compression,
+    /// Lifeguard and TLS keys are gone; a config that still sets one is refused, not ignored.
+    #[test]
+    fn the_memberlist_only_keys_are_unknown() {
+        for key in [
+            "tls: {enabled: false}",
+            "lifeguard_enabled: true",
+            "compression_enabled: true",
+            "packet_dial_timeout: 5s",
+            "packet_write_timeout: 5s",
+            "dead_node_reclaim_time: 30s",
+        ] {
+            let case = format!("globals: {{cluster: {{memberlist: {{{key}}}}}}}");
+            let err = parse_document::<RawConfig>(&case).expect_err(&case);
+            assert_eq!(err.rule, PARSE, "{case}");
+            assert!(
+                err.message.contains("unknown field"),
                 "{case}: {}",
                 err.message
             );

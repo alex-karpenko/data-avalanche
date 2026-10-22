@@ -131,12 +131,13 @@ fn snapshot_rows_are_summed_unless_per_table() {
 }
 
 #[test]
-fn a_pipeline_the_node_no_longer_owns_loses_its_series() {
+fn a_pipeline_the_node_no_longer_owns_loses_its_series_but_its_renew_failures() {
     let m = Metrics::new();
     let p = m.pipeline(labels(), true);
     p.status(PipelineStatus::Running);
     p.lease(LeaseState::Held);
     p.renew_failed(RenewFailure::Conflict);
+    p.renew_failed(RenewFailure::Lost);
     p.renewed(Duration::from_millis(5));
     p.wal_lag_bytes(Some(4096));
     p.snapshot_rows_done(&[("public.a".to_owned(), 5)]);
@@ -148,12 +149,34 @@ fn a_pipeline_the_node_no_longer_owns_loses_its_series() {
     });
     m.owned_by(1);
     m.set_cluster_members(1);
+    m.set_ring_generation(3);
     p.remove();
     m.owned_by(-1);
     let text = m.encode();
-    assert!(!text.contains("orders"), "{text}");
+    // A counter stays: the loss that sent the node to standby is still scraped after it.
+    let failures = "data_avalanche_lease_renew_failures_total";
+    assert_eq!(
+        samples(&text, failures),
+        [
+            format!(r#"{failures}{{{L},class="conflict"}} 1"#),
+            format!(r#"{failures}{{{L},class="lost"}} 1"#),
+        ]
+    );
+    assert!(
+        !text
+            .lines()
+            .any(|l| l.contains("orders") && !l.starts_with(failures)),
+        "{text}"
+    );
     assert!(text.contains("data_avalanche_owned_pipelines 0"), "{text}");
     assert!(text.contains("data_avalanche_cluster_members 1"), "{text}");
+    assert!(text.contains("data_avalanche_ring_generation 3"), "{text}");
+    // Owned again: the count goes on from where it was.
+    p.renew_failed(RenewFailure::Lost);
+    assert_eq!(
+        samples(&m.encode(), &format!("{failures}{{{L},class=\"lost\"")),
+        [format!(r#"{failures}{{{L},class="lost"}} 2"#)]
+    );
 }
 
 #[test]

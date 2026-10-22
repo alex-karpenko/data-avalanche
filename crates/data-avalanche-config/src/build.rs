@@ -530,21 +530,6 @@ fn memberlist(m: &RawMemberlist, at: &At, ctx: &mut Ctx) -> Option<Memberlist> {
         some => list(ctx, some, at, "bind_addr"),
     };
     let bind_port = or(ctx, &m.bind_port, at, "bind_port", 7946);
-    let packet_dial_timeout = or(
-        ctx,
-        &m.packet_dial_timeout,
-        at,
-        "packet_dial_timeout",
-        secs(5),
-    );
-    let packet_write_timeout = or(
-        ctx,
-        &m.packet_write_timeout,
-        at,
-        "packet_write_timeout",
-        secs(5),
-    );
-    let compression_enabled = or(ctx, &m.compression_enabled, at, "compression_enabled", true);
     let gossip_interval = or(
         ctx,
         &m.gossip_interval,
@@ -561,13 +546,6 @@ fn memberlist(m: &RawMemberlist, at: &At, ctx: &mut Ctx) -> Option<Memberlist> {
         "probe_timeout",
         Duration::from_millis(500),
     );
-    let dead_node_reclaim_time = or(
-        ctx,
-        &m.dead_node_reclaim_time,
-        at,
-        "dead_node_reclaim_time",
-        secs(30),
-    );
     let push_pull_interval = or(
         ctx,
         &m.push_pull_interval,
@@ -576,44 +554,6 @@ fn memberlist(m: &RawMemberlist, at: &At, ctx: &mut Ctx) -> Option<Memberlist> {
         secs(30),
     );
     let retransmit_factor = or(ctx, &m.retransmit_factor, at, "retransmit_factor", 4);
-    let lifeguard_enabled = or(ctx, &m.lifeguard_enabled, at, "lifeguard_enabled", true);
-    let tls = m.tls.clone().unwrap_or_default();
-    let tls_at = at.key("tls");
-    let enabled = or(ctx, &tls.enabled, &tls_at, "enabled", false);
-    // §11 Phase 2 (G4): `cert`/`key`/`ca` are only in effect when `tls.enabled` is `true` — the PEM
-    // itself is parsed (and any file read) only then — but a present leaf still gets `${VAR}`
-    // substituted either way (V-063).
-    //
-    // G7: when `enabled` itself can't be resolved (`None`), `tls_in_effect` falls back to `false`
-    // — `enabled`'s own spec default — so this reads as "not in effect" either way; the load
-    // already fails on `enabled`'s own coercion rule regardless of which branch runs here.
-    let tls_in_effect = enabled == Some(true);
-    let cert = if tls_in_effect {
-        pem(ctx, &tls.cert, &tls_at, "cert", PemKind::Certificates)
-    } else {
-        touch(ctx, &tls.cert, &tls_at, "cert");
-        Some(None)
-    };
-    let key = if tls_in_effect {
-        pem(ctx, &tls.key, &tls_at, "key", PemKind::PrivateKey)
-    } else {
-        touch(ctx, &tls.key, &tls_at, "key");
-        Some(None)
-    };
-    let ca = if tls_in_effect {
-        pem(ctx, &tls.ca, &tls_at, "ca", PemKind::Certificates)
-    } else {
-        touch(ctx, &tls.ca, &tls_at, "ca");
-        Some(None)
-    };
-    let tls = match enabled? {
-        true => Some(MemberlistTls {
-            cert: cert??,
-            key: key??,
-            ca: ca?,
-        }),
-        false => None,
-    };
     Some(Memberlist {
         join_members: join_members?,
         node_name: node_name?,
@@ -621,18 +561,12 @@ fn memberlist(m: &RawMemberlist, at: &At, ctx: &mut Ctx) -> Option<Memberlist> {
         advertise_port: advertise_port?,
         bind_addr: bind_addr?,
         bind_port: bind_port?,
-        packet_dial_timeout: packet_dial_timeout?,
-        packet_write_timeout: packet_write_timeout?,
-        compression_enabled: compression_enabled?,
         gossip_interval: gossip_interval?,
         gossip_nodes: gossip_nodes?,
         probe_interval: probe_interval?,
         probe_timeout: probe_timeout?,
-        dead_node_reclaim_time: dead_node_reclaim_time?,
         push_pull_interval: push_pull_interval?,
         retransmit_factor: retransmit_factor?,
-        lifeguard_enabled: lifeguard_enabled?,
-        tls,
     })
 }
 
@@ -1182,7 +1116,7 @@ fn hive(h: &RawHive, at: &At, db: Option<&str>, ctx: &mut Ctx) -> Option<Hive> {
     let enabled = or(ctx, &tls.enabled, &tls_at, "enabled", false);
     // §11 Phase 2 / V-068 (G4): `tls.ca` is only in effect when `tls.enabled` is `true` — the PEM
     // itself is parsed (and any file read) only then — but a present leaf still gets `${VAR}`
-    // substituted either way (V-063). Same gate as `globals.api.tls`/`memberlist.tls` above — in
+    // substituted either way (V-063). Same gate as `globals.api.tls` above — in
     // practice unreachable today (V-115 refuses any `hive` block in Phase 1, before Phase 2 ever
     // reads a file here), but kept for when V-115 lifts.
     let ca = if enabled == Some(true) {
@@ -1467,7 +1401,7 @@ mod tests {
     }
 
     /// V-068 / §11 Phase 2: `hive.tls.ca` is only in effect when `tls.enabled` is `true`, the same
-    /// gate `api.tls`/`memberlist.tls` use. Unreachable via `load_str` today (V-115 refuses `hive`
+    /// gate `api.tls` uses. Unreachable via `load_str` today (V-115 refuses `hive`
     /// in Phase 1), so exercised directly against `hive()`.
     #[test]
     fn the_derived_server_id_is_stable_and_in_the_high_range() {

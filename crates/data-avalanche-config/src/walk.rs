@@ -275,24 +275,12 @@ walk_fields!(RawMemberlist {
     advertise_port,
     bind_addr,
     bind_port,
-    packet_dial_timeout,
-    packet_write_timeout,
-    compression_enabled,
     gossip_interval,
     gossip_nodes,
     probe_interval,
     probe_timeout,
-    dead_node_reclaim_time,
     push_pull_interval,
-    retransmit_factor,
-    lifeguard_enabled,
-    tls
-});
-walk_fields!(RawMemberlistTls {
-    enabled,
-    cert,
-    key,
-    ca
+    retransmit_factor
 });
 walk_fields!(RawTracing {
     otlp_endpoint,

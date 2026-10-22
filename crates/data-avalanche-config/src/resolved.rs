@@ -156,11 +156,6 @@ pub struct Memberlist {
     pub bind_addr: Vec<IpAddr>,
     pub bind_port: u16,
     #[serde(serialize_with = "ser_duration")]
-    pub packet_dial_timeout: Duration,
-    #[serde(serialize_with = "ser_duration")]
-    pub packet_write_timeout: Duration,
-    pub compression_enabled: bool,
-    #[serde(serialize_with = "ser_duration")]
     pub gossip_interval: Duration,
     pub gossip_nodes: u32,
     #[serde(serialize_with = "ser_duration")]
@@ -168,21 +163,8 @@ pub struct Memberlist {
     #[serde(serialize_with = "ser_duration")]
     pub probe_timeout: Duration,
     #[serde(serialize_with = "ser_duration")]
-    pub dead_node_reclaim_time: Duration,
-    #[serde(serialize_with = "ser_duration")]
     pub push_pull_interval: Duration,
     pub retransmit_factor: u32,
-    pub lifeguard_enabled: bool,
-    /// `None` = TLS disabled.
-    pub tls: Option<MemberlistTls>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct MemberlistTls {
-    pub cert: Pem,
-    pub key: Pem,
-    /// Presence implies mutual TLS (§6.5.2).
-    pub ca: Option<Pem>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

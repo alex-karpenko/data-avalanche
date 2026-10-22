@@ -83,8 +83,6 @@ pub enum RenewFailure {
 }
 
 impl RenewFailure {
-    const ALL: [Self; 3] = [Self::Transient, Self::Conflict, Self::Lost];
-
     fn label(self) -> &'static str {
         match self {
             Self::Transient => "transient",
@@ -131,6 +129,7 @@ struct Families {
     lease_renew_latency: HistogramFamily,
     owned_pipelines: Gauge,
     cluster_members: Gauge,
+    ring_generation: Gauge,
     wal_lag_bytes: Family<Labels, Gauge>,
     source_reconnects: Family<Labels, Counter>,
     snapshot_rows_done: Family<Labels, Gauge>,
@@ -168,6 +167,7 @@ impl Metrics {
             lease_renew_latency: Family::new_with_constructor(renew_latency),
             owned_pipelines: Gauge::default(),
             cluster_members: Gauge::default(),
+            ring_generation: Gauge::default(),
             wal_lag_bytes: Family::default(),
             source_reconnects: Family::default(),
             snapshot_rows_done: Family::default(),
@@ -208,6 +208,11 @@ impl Metrics {
             "cluster_members",
             "Members of the cluster this node sees",
             f.cluster_members.clone(),
+        );
+        r.register(
+            "ring_generation",
+            "Changes of the ring's nodes since this node started",
+            f.ring_generation.clone(),
         );
         r.register(
             "wal_lag_bytes",
@@ -271,6 +276,10 @@ impl Metrics {
         self.families.cluster_members.set(gauge(n as u64));
     }
 
+    pub fn set_ring_generation(&self, generation: u64) {
+        self.families.ring_generation.set(gauge(generation));
+    }
+
     /// The handle that sets one pipeline's series. `per_table` is `sink.metrics.per_table`.
     pub fn pipeline(&self, labels: PipelineLabels, per_table: bool) -> PipelineMetrics {
         PipelineMetrics {
@@ -293,7 +302,7 @@ struct Seen {
 }
 
 /// One pipeline's series. The controller that owns the pipeline sets them; [`Self::remove`]
-/// drops them once the node no longer owns it.
+/// drops them, but the renew failures, once the node no longer owns it.
 #[derive(Debug)]
 pub struct PipelineMetrics {
     families: Arc<Families>,
@@ -433,7 +442,9 @@ impl PipelineMetrics {
             .totals = Totals::default();
     }
 
-    /// Drops every series of the pipeline: the node no longer owns it.
+    /// Drops the pipeline's series: the node no longer owns it. The renew failures stay, a
+    /// counter for the node's whole run: the loss that ends an ownership is still scraped after
+    /// it, and a later term counts on.
     pub fn remove(&self) {
         let f = &self.families;
         let base = self.base();
@@ -444,10 +455,6 @@ impl PipelineMetrics {
         for s in LeaseState::ALL {
             f.lease_state
                 .remove(&self.labels.with(&[("state", s.label())]));
-        }
-        for c in RenewFailure::ALL {
-            f.lease_renew_failures
-                .remove(&self.labels.with(&[("class", c.label())]));
         }
         f.lease_renew_latency.remove(&base);
         for family in [

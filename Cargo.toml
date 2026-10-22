@@ -79,6 +79,13 @@ prometheus-client = "=0.25.1"
 gethostname = "1.1"
 clap = { version = "4.6.7", features = ["derive"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+# The cluster (M8a, roadmap §2.1): the ring's hash (the anchor's `hash_algo: xxh3`); the SWIM
+# core the gossip drives (Q-M8-1, probe `prototypes/cluster-capability`) and its random source;
+# the host's addresses, for an unset `advertise_addr`.
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+if-addrs = "0.15"
+foca = { version = "=2.0.0", default-features = false, features = ["std", "serde", "postcard-codec"] }
+rand = { version = "0.10", default-features = false, features = ["std", "std_rng", "sys_rng"] }
 
 # Dependencies build without debug info: DataFusion's full debug build is over 6 GB, which fills
 # CI runners. Workspace crates keep it.

@@ -1,12 +1,15 @@
 //! `data-avalanche run`.
 
 use std::future::IntoFuture;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use data_avalanche_cluster::{
-    ClusterReconciler, ControllerDeps, ControllerSettings, LeaseTiming, node_identity,
+    ClusterReconciler, ControllerDeps, ControllerSettings, Gossip, GossipKey, GossipSettings,
+    LeaseTiming, NodeIdentity, NodeMeta, Phase, ReconcilerSettings, Seeds, Udp, advertise,
+    discover, interfaces, join as join_gossip, leave, node_identity,
 };
 use data_avalanche_config::{
     Diagnostic, FingerprintKey, ProcessEnv, Report, ResolvedConfig, Severity, load_str,
@@ -81,6 +84,16 @@ pub(crate) fn settings(config: &ResolvedConfig) -> ControllerSettings {
     }
 }
 
+/// How long a leave waits for its hand-offs: `drain_timeout` for each round of
+/// `max_concurrent_handoffs` pipelines, and two `lease_renewal_interval`s over, which cover one
+/// resync for a controller started again and the release's or the claim's I/O.
+pub(crate) fn leave_within(config: &ResolvedConfig) -> Duration {
+    let c = &config.globals.cluster;
+    let pipelines = u32::try_from(config.pipelines.len()).unwrap_or(u32::MAX);
+    let rounds = pipelines.div_ceil(c.max_concurrent_handoffs.max(1));
+    c.drain_timeout.saturating_mul(rounds) + 2 * c.lease_renewal_interval
+}
+
 /// Runs every pipeline until SIGTERM or SIGINT.
 ///
 /// # Errors
@@ -121,7 +134,8 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         })
         .into_future(),
     );
-    let holder = node_identity(&first.config.globals.cluster, started).map_err(Fatal::Config)?;
+    let holder = node_identity(&first.config.globals.cluster, started)
+        .map_err(|e| Fatal::Config(e.to_string()))?;
     let buckets = Buckets::new(&first.config.globals);
     let joined = join(&buckets, &holder.node_id, &text, &first.config).await?;
     let config = joined.config;
@@ -145,17 +159,59 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         starts: Arc::new(Semaphore::new(
             usize::try_from(c.max_concurrent_takeovers).unwrap_or(usize::MAX),
         )),
+        handoffs: Arc::new(Semaphore::new(
+            usize::try_from(c.max_concurrent_handoffs).unwrap_or(usize::MAX),
+        )),
     };
     let mut pipelines = Vec::new();
     for p in config.pipelines.values() {
         pipelines.push((p.clone(), buckets.pipeline_docs(p)?));
     }
-    let reconciler = ClusterReconciler::start(pipelines, &deps);
+    // The gossip (Clustering §2–§3): joining until a peer answers, then active.
+    let m = &c.memberlist;
+    let bind: Vec<SocketAddr> = m
+        .bind_addr
+        .iter()
+        .map(|ip| SocketAddr::new(*ip, m.bind_port))
+        .collect();
+    let (udp, inbox) = Udp::bind(&bind)
+        .await
+        .map_err(|e| Fatal::Startup(e.to_string()))?;
+    let addr = advertise(m, &interfaces())
+        .await
+        .map_err(|e| Fatal::Config(e.to_string()))?;
+    let mut own = udp.local_addrs();
+    own.push(addr);
+    let me = NodeIdentity {
+        node_id: deps.holder.node_id.clone(),
+        incarnation: deps.holder.incarnation,
+        rev: 0,
+        addr,
+        meta: NodeMeta {
+            phase: Phase::Joining,
+            config_generation: joined.generation,
+            build: env!("CARGO_PKG_VERSION").to_owned(),
+        },
+    };
+    let key = GossipKey::derive(&joined.fingerprint_key);
+    let gossip = Gossip::start(me, key, GossipSettings::new(m), Arc::new(udp), inbox);
+    tracing::info!(%addr, bound = ?bind, "gossip started");
+    let seeds = Seeds::new(c);
+    let seeded = !seeds.is_empty();
+    let discovery = discover(seeds, own, gossip.announcer(), gossip.members());
+    join_gossip(&gossip, seeded).await;
+    let reconciler = ClusterReconciler::start(
+        pipelines,
+        &deps,
+        gossip.members(),
+        ReconcilerSettings::new(c),
+    );
     ready.store(true, Ordering::SeqCst);
     shutdown_signal().await;
-    tracing::info!("shutting down: draining every pipeline and releasing its lease");
+    tracing::info!("shutting down: handing off every pipeline and releasing its lease");
     ready.store(false, Ordering::SeqCst);
-    reconciler.shutdown().await;
+    discovery.abort();
+    leave(gossip, reconciler, leave_within(&config)).await;
     let _ = stop_http.send(());
     let _ = server.await;
     tracing::info!("stopped");
@@ -254,6 +310,21 @@ pipelines:
             key: pem(),
         });
         assert!(unsupported(&c).unwrap().contains("M9"));
+    }
+
+    #[test]
+    fn a_leave_waits_a_drain_timeout_a_hand_off_round_and_two_renewals() {
+        let mut c = config();
+        // One pipeline, two hand-offs at a time: one round of 45 s, and 2 × 10 s.
+        assert_eq!(leave_within(&c), Duration::from_secs(65));
+        let orders = c.pipelines["orders"].clone();
+        for id in ["a", "b", "c", "d", "e"] {
+            c.pipelines.insert(id.into(), orders.clone());
+        }
+        // Six pipelines, two at a time: three rounds; four at a time: two.
+        assert_eq!(leave_within(&c), Duration::from_secs(3 * 45 + 20));
+        c.globals.cluster.max_concurrent_handoffs = 4;
+        assert_eq!(leave_within(&c), Duration::from_secs(2 * 45 + 20));
     }
 
     #[test]

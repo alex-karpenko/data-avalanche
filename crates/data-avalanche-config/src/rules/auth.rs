@@ -61,24 +61,6 @@ pub(crate) fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut
             ctx,
         );
     }
-    if let Some(tls) = g
-        .cluster
-        .as_ref()
-        .and_then(|c| c.memberlist.as_ref())
-        .and_then(|m| m.tls.as_ref())
-        && ctx.peek(&tls.enabled) == Some(true)
-    {
-        // V-054
-        let at = At::config(
-            YamlPath::root()
-                .key("globals")
-                .key("cluster")
-                .key("memberlist")
-                .key("tls"),
-        );
-        require(ctx, "V-054", &at, "cert", &tls.cert, "memberlist TLS");
-        require(ctx, "V-054", &at, "key", &tls.key, "memberlist TLS");
-    }
     for (name, p) in merged {
         let is_iceberg = p
             .sink
