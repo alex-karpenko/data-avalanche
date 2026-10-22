@@ -8200,7 +8200,7 @@ git commit -m "fix(pipeline): a busy slot's stale reader is ended under the leas
 - [x] A partition with storage reachable moves no pipeline; a pause past the lease is fenced and rejoins (Tasks 10, 12), and on PostgreSQL its new holder streams without waiting out `wal_sender_timeout` (Task 13).
 - [x] A node of another cluster can't join (Tasks 3, 4).
 - [x] DA-CLUS-14 (Task 8), DA-OPS-7 (Task 6) and DA-SRC-28 (Task 13) are closed.
-- [ ] The E2E suite passes on PostgreSQL 18 and, through `ci.yml`'s jobs, on `mysql-84`, `mysql-84-nogtid` and `mariadb-118`. (Measured locally on PostgreSQL 18 and `mysql-84`; the other targets run in the PR's CI.)
+- [x] The E2E suite passes on PostgreSQL 18 and, through `ci.yml`'s jobs, on `mysql-84`, `mysql-84-nogtid` and `mariadb-118`. (Measured locally on PostgreSQL 18 and `mysql-84`; every target passed in the PR's CI at c03f974, run 39749330782.)
 - [x] Every Review Focus line has its passing test.
 - [x] The documents of "Documents this plan changes" are updated, and the spec patch is applied once approved.
 - [x] The workspace gates pass: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo clippy -p data-avalanche --features e2e-hooks --all-targets -- -D warnings`, `cargo test --workspace`.
