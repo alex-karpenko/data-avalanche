@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-21
+updated: 2026-10-22
 domain: Architecture
 tags: [v1, implementation-plan, roadmap, milestones, workspace, crates, interfaces, test-strategy, ci, risks]
 sources: []
@@ -489,6 +489,12 @@ the MySQL dump reads the identity on its own connection before the dump command 
 reports no identity (no row, NULL, empty) is `Permanent`. `halt_code` reads the code D-M7a.8 puts
 at the front of a pipeline-scope halt's message: `[A-Z][A-Z0-9_]*` holding a `_`, then `": "`.
 
+From M8b (D-M8b.1): `fn reconfigure(&self, pipeline: &dyn Any)`, a no-op by default, hands the
+running connector a reloaded `data_avalanche_config::Pipeline` (core names no config type).
+PostgreSQL takes `heartbeat`, `slot_on_orphan`, `auto_cleanup` and the table patterns; MySQL takes
+`binlog_purge_action`, `heartbeat` and the table patterns. Each is read at the next connection,
+prepare, resolve or teardown; an open stream keeps what it opened with.
+
 ### 3.7 Cluster (Clustering §19–§20)
 
 `LeaseStore` over `VersionedStore` (acquire / renew / takeover-evaluate / release). A `Renewer` state
@@ -576,6 +582,42 @@ stops being one (gone, `Draining`, `Leaving`), and joins after `rebalance_stabil
 eligibility (D-11). A pipeline's target is `Own` exactly when the ring's owner is this node; a
 hand-off waits for a `max_concurrent_handoffs` permit; a controller that ended unasked is started
 again (DA-OPS-7).
+
+What M8b adds (`M8b-config-generations.md` D-M8b.3…7, D-M8b.11): a controller's update, the
+reconciler's reload, and the config coordinator.
+
+```rust
+pub enum Update { Reconfigure(Box<Pipeline>) /* R: in place */, Restart(Box<Pipeline>, PipelineDocs) /* PR: same lease */,
+                  Remove /* drain, teardown, release */, DrainTimeout(Duration) }
+impl PipelineController { pub fn updater(&self) -> mpsc::UnboundedSender<Update>; }
+pub enum PipelineReload { Add(Pipeline, PipelineDocs), Remove(String), Reconfigure(Pipeline), Restart(Pipeline, PipelineDocs) }
+pub struct Reload { pub pipelines: Vec<PipelineReload>, pub cluster: Cluster }   // the cluster's R fields too
+pub struct Reloader;  impl Reloader { pub fn apply(&self, reload: Reload) -> bool; }
+impl ClusterReconciler { pub fn reloader(&self) -> Reloader; }   // statuses() follow the reloads
+impl Placement { pub fn set_stabilization(&mut self, stabilization: Duration); }
+pub struct Advertiser; impl Advertiser { pub fn set_config_generation(&self, generation: u64); }
+impl Gossip { pub fn advertiser(&self) -> Advertiser; }
+impl Members { pub fn newest_generation(&self) -> u64; }
+pub const PUBLISH_ATTEMPTS: u32 = 5;
+pub struct CoordinatorDeps { pub generations, pub env: Arc<dyn Env + Send + Sync>, pub key: FingerprintKey, pub node_id,
+                             pub docs: Arc<DocsFn>, pub factory, pub reloader: Reloader, pub advertiser: Advertiser,
+                             pub metrics: Metrics, pub globals: Arc<dyn Fn(&Globals) + Send + Sync> }
+pub struct Reloaded { pub generation: u64, pub published: bool }
+pub enum ReloadError { Invalid(Report), Rejected(Report) /* V-061 */, Contended, State(StateError), Stopped }
+impl ConfigCoordinator { pub fn start(config: ResolvedConfig, generation: Versioned<GenerationDoc>, deps: CoordinatorDeps,
+                                      members: watch::Receiver<Members>, poll: Duration) -> Self;
+                         pub fn applied(&self) -> u64; pub async fn config(&self) -> ResolvedConfig;
+                         pub async fn latest(&self) -> Result<Option<u64>, StateError>;
+                         pub async fn reload(&self, text: &str) -> Result<Reloaded, ReloadError>; pub async fn stop(&self); }
+```
+
+A node adopts each newer generation, found by a poll every `lease_renewal_interval` or announced by
+a member's gossiped `config_generation`. It resolves the generation in its own environment, diffs
+it (config §12), and hands the changes to the reconciler. A generation it can't apply is logged
+once and tried again at each poll. A reload publishes the node's file with a CAS on the
+generation pointer, retried up to `PUBLISH_ATTEMPTS` times when another node published first. The
+same text is published again when it resolves differently here. A pipeline added back while its
+removal runs starts once that removal ends.
 
 ### 3.8 Configuration (`data-avalanche-config`, landed in M1)
 
@@ -738,7 +780,8 @@ impl PipelineWorker {
 }
 pub struct WorkerHandle { pub control: mpsc::Sender<Command>, pub status: watch::Receiver<WorkerStatus> }
 pub enum Command { Drain /* flush, make durable, close: Exit::Drained */, Flush,
-                   Pause /* M6b: finish the open txn, flush, durable, then read nothing; the connection stays */, Resume }
+                   Pause /* M6b: finish the open txn, flush, durable, then read nothing; the connection stays */, Resume,
+                   Reconfigure(Box<Pipeline>) /* M8b: a reload's R fields, in place; Command is Clone, not Copy */ }
 pub enum Exit { Drained, Dumped /* every table a dump_* table, done */ }
 pub enum Phase { Starting, Streaming, Reconnecting { error: String }, Draining, Paused /* M6b */ }
 pub struct WorkerStatus { pub phase: Phase, pub read: Option<SourcePosition>, pub checkpoint: Option<SourcePosition>,
@@ -819,6 +862,17 @@ pub struct Factory;                                      // impl WorkerFactory: 
   libraries (config §6.4).
 - `DATA_AVALANCHE_E2E_CRASH=<point>[:<n>]` aborts the process at a hook point, only in a build
   with the `e2e-hooks` feature (Q-M6b-5).
+
+From M8b (D-M8b.3, D-M8b.5, D-M8b.8…10):
+- Telemetry: `PipelineMetrics::relabel(labels, per_table)` (a renamed pipeline) and `forget()` (a
+  removed one); `Metrics::set_config_generation`, the gauge `data_avalanche_config_generation`.
+- HTTP: `POST /v1/config/reload` (202 `{generation}`, 200 unchanged, 422 with the report, 409
+  contended, 503 not running) and `GET /v1/config/status` (`{generation, applied, nodes,
+  converged}`). Unauthenticated until M9 (Q-M8b-1).
+- Logs: a generation's `globals.log` changes the filter and the format at run time, except where
+  the command line set them.
+- Startup warns when the node's file and the adopted generation differ in a per-node key
+  (DA-OPS-8).
 
 ---
 
@@ -1119,9 +1173,10 @@ and 10.11 weekly.
 M8 is split in two (Q-M8-3, 2026-10-20). **M8a** (`M8a-membership.md`): the gossip (foca 2.0 after
 the probe gate, Q-M8-1; packets MAC'd with a key from the anchor, Q-M8-2), NodeMeta and phases, the
 ring and its flap rules, the hand-off and takeover caps, the leave, discovery, M6b's carried
-DA-CLUS-14 and DA-OPS-7, and the multi-node E2E suite (three host processes, Q-M8-4). **M8b**: the
-config-generation coordinator at run time and the reload E2E. The anchor validation already runs at
-M6b's startup.
+DA-CLUS-14 and DA-OPS-7, and the multi-node E2E suite (three host processes, Q-M8-4). **M8b**
+(`M8b-config-generations.md`): the config-generation coordinator at run time, R fields applied in
+place (Q-M8b-2), a removed pipeline cleaned up by its owner (Q-M8b-3), the reload and status
+endpoints (Q-M8b-1), and the reload E2E. The anchor validation already runs at M6b's startup.
 
 - **Scope:**
   - **Probe gate first** (done 2026-10-20, `prototypes/cluster-capability`): `memberlist` 0.8.5 failed
@@ -1152,8 +1207,9 @@ M6b's startup.
   - Every `/v1` endpoint in System-Overview's table, including pipelines list/status with halted-table
     reasons, snapshot jobs (on-demand chunk loop; jobs persisted under `snapshots/jobs/`, listed via
     `GET /v1/pipelines/{id}/snapshots` after a restart or failover, running jobs resumed by the owner —
-    Q-M9-1), lifecycle actions with `409`, config
-    validate/reload/status (per-node applied generation), cluster status, leave and shutdown.
+    Q-M9-1), lifecycle actions with `409`, config validate, config reload and status (these two
+    exist from M8b, unauthenticated: M9 puts them behind auth and RBAC), cluster status, leave and
+    shutdown.
   - OpenAPI generated with `utoipa`, served at `/v1/openapi.json`.
 - **Deps:** M6b (M8 for reload propagation and cluster endpoints).
 - **Exit:** an endpoint × role matrix test (401 vs 403); lifecycle transitions and `409`s; the OpenAPI
@@ -1438,6 +1494,7 @@ the naming below (2026-09-26).**
 | D-IMPL-15 | M7a MySQL-source rulings **D-M7a.1…23** (listed in `M7a-mysql-source.md` §Decisions and rulings, each pinned by a test). Among them: a checkpoint carries its source server (§3.6); the replica id derived from BLAKE3(`id`); `verify-ca` fails closed as `verify-full` (DA-SRC-22); one decoder for binlog and chunk values, correcting `mysql_common`'s signed `MEDIUMINT` and `YEAR`; chunk keys in their own collation with the expanded keyset predicate; the tokenizer names every statement's tables, `sqlparser` scopes an ALTER; the stream decodes by the schema as of its position and halts a table it can't read; fail-closed event types, two-phase XA with tracked rows halts; the purge action is one rule at `prepare` and on the dump's refusal; the dump watched by its connection id | The specs are silent on these; where a ruling touched a spec row, the row was patched with approval (`Schema_Change…` §7.2, config §9.2.2) | M7a — **approved 2026-10-14** |
 | D-IMPL-16 | M7b MySQL-pipeline rulings **D-M7b.1…16** (listed in `M7b-mysql-pipeline.md` §Decisions and rulings, each pinned by a test). Among them: `open_stream` takes a `Checkpoint` and `reset_position` returns one (§3.6); `SourceError::halt_code` reads a halt's code from its message; the worker's checkpoint goes through one store, slot or position document, and records the server the last start read; a file/position dump checks its server on its own connection; no identity is an error; the binary picks the source by `source.type`; the E2E harness's per-test MySQL database and user, and its dialect helpers; the wire proxy's fault (one compressed byte flipped, the CRC32 recomputed) | The specs are silent on these; each keeps a MySQL checkpoint tied to its server across reconnects and lost positions | M7b — **approved 2026-10-17** |
 | D-IMPL-17 | M8a membership rulings **D-M8a.1…22** (listed in `M8a-membership.md` §Decisions and rulings, each pinned by a test). Among them: foca's identity keyed by address, members grouped by name at the highest `(incarnation, rev)`; the packet MAC's key derived from the anchor; foca's settings from config §6.5.1; the ring's xxh3 points; placement over the Active members, a `Draining` node off the ring at once, additions after `rebalance_stabilization`; the hand-off permit; a controller that ended unasked started again (DA-OPS-7); a drop is a crash; the leave; the fence's epoch as the claim's floor, once (DA-CLUS-14); discovery while alone, the advertised address; per-node values through `${VAR}` (D-3); a busy slot's stale reader ended by the lease holder (DA-SRC-28) | The specs are silent on these, or (memberlist's keys, gossip TLS) changed by the M8a config patch | M8a — **approved 2026-10-21** |
+| D-IMPL-18 | M8b config-generation rulings **D-M8b.1…12** (listed in `M8b-config-generations.md` §Decisions and rulings, each pinned by a test). Among them: `SourceConnector::reconfigure` takes the reloaded pipeline as `&dyn Any`; the worker's `Command::Reconfigure`; a controller's `Update` (restart under the same lease, `ERROR` cleared, the desired state kept; a removal's teardown only after a full drain under the lease); the reconciler's `Reload`, the caps resized without revoking a permit, a pipeline added back after its removal; the poll and the gossip nudge; a generation a node can't apply logged once and retried; the reload's check, CAS and retry, the same text published again when it resolves differently; the endpoints' answers; the log changed at run time; DA-OPS-8's warning; the coordinator stopped before the leave | The specs are silent on these | M8b — **approved 2026-10-22** |
 
 ### 9.1 Questions answered at plan review (2026-09-26)
 
@@ -1520,6 +1577,9 @@ the naming below (2026-09-26).**
 | Q-M8-3 (2026-10-20) | One plan or two? | **M8a + M8b**: membership, placement and the multi-node E2E first; config generations at run time and the reload E2E second | §4 M8 |
 | Q-M8-4 (2026-10-20) | How does the E2E run several nodes? | **Three host processes**, UDP forwarders, SIGSTOP/SIGCONT, `kill -9`, SIGTERM; the compose 3-node run moves to M11 | §4 M8, M11; M8a Task 12 |
 | Q-M8-5 (2026-10-21) | DA-SRC-28: a PostgreSQL takeover from a paused holder waits for `wal_sender_timeout` | **End the stale walsender** (the pipeline's own role, under the lease), in M8a | §3.6; M8a Task 13 |
+| Q-M8b-1 (2026-10-22) | How is a reload triggered before M9's API? | **The endpoints now, auth in M9**: `POST /v1/config/reload` and `GET /v1/config/status`, unauthenticated until M9 | §3.12, §4 M9; M8b Task 7 |
+| Q-M8b-2 (2026-10-22) | Which R-class pipeline fields are applied in the running worker? | **All of them in place** | §3.6, §3.11; M8b Tasks 1–3 |
+| Q-M8b-3 (2026-10-22) | Who cleans up a removed pipeline? | **Its owner**: drain, teardown, release; an offline owner leaves an orphan (DA-OPS-9) | §3.7; M8b Task 3 |
 
 ### 9.2 Open questions (answer before the named milestone)
 
