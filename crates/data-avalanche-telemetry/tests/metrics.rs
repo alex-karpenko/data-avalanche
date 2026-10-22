@@ -198,3 +198,54 @@ fn the_gauges_read_what_was_set_last() {
     p.wal_lag_bytes(None);
     assert!(!m.encode().contains("data_avalanche_wal_lag_bytes{"));
 }
+
+/// A renamed pipeline (config §12.3) loses every series under its old name, the renew failures
+/// too; what is set next carries the new name. The same labels again change nothing.
+#[test]
+fn a_relabelled_pipeline_drops_its_old_series() {
+    let m = Metrics::new();
+    let p = m.pipeline(labels(), false);
+    p.status(PipelineStatus::Running);
+    p.renew_failed(RenewFailure::Lost);
+    p.relabel(labels(), false);
+    assert_eq!(
+        samples(&m.encode(), "data_avalanche_lease_renew_failures_total"),
+        [format!(
+            r#"data_avalanche_lease_renew_failures_total{{{L},class="lost"}} 1"#
+        )],
+        "the same labels: nothing changed"
+    );
+    let renamed = PipelineLabels {
+        pipeline: "renamed".into(),
+        ..labels()
+    };
+    p.relabel(renamed, true);
+    p.status(PipelineStatus::Running);
+    p.snapshot_rows_done(&[("public.a".to_owned(), 5)]);
+    let text = m.encode();
+    assert!(!text.contains(r#"pipeline="orders""#), "{text}");
+    let new = r#"pipeline="renamed",source_host="db1",source_db="shop""#;
+    assert!(
+        text.lines()
+            .any(|l| l == format!(r#"data_avalanche_pipeline_status{{{new},status="running"}} 1"#)),
+        "{text}"
+    );
+    assert!(
+        text.lines()
+            .any(|l| l
+                == format!(r#"data_avalanche_snapshot_rows_done{{{new},table="public.a"}} 5"#)),
+        "per_table follows: {text}"
+    );
+}
+
+/// A pipeline removed from the config loses every series, the renew failures too.
+#[test]
+fn a_forgotten_pipeline_keeps_no_series() {
+    let m = Metrics::new();
+    let p = m.pipeline(labels(), false);
+    p.status(PipelineStatus::Running);
+    p.renew_failed(RenewFailure::Lost);
+    p.forget();
+    let text = m.encode();
+    assert!(!text.contains("orders"), "{text}");
+}

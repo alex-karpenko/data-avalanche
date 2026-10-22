@@ -254,6 +254,7 @@ struct Db {
     in_flights: usize,
     readers_ended: usize,
     reconfigures: usize,
+    teardowns: usize,
     fetches: BTreeMap<TableRef, usize>,
     prepares: Vec<Option<Checkpoint>>,
 }
@@ -308,6 +309,7 @@ impl FakeSource {
             in_flights: 0,
             readers_ended: 0,
             reconfigures: 0,
+            teardowns: 0,
             fetches: BTreeMap::new(),
             prepares: vec![],
         };
@@ -588,6 +590,11 @@ impl FakeSource {
     /// `reconfigure` calls so far: a reload's settings handed to the running source.
     pub fn reconfigures(&self) -> usize {
         self.db().reconfigures
+    }
+
+    /// `teardown` calls so far: a removed pipeline's cleanup.
+    pub fn teardowns(&self) -> usize {
+        self.db().teardowns
     }
 
     /// `fetch_rows` calls for `table` so far, failed ones included.
@@ -1167,6 +1174,7 @@ impl SourceConnector for FakeSource {
     }
 
     async fn teardown(&self) -> Result<(), SourceError> {
+        self.db().teardowns += 1;
         Ok(())
     }
 

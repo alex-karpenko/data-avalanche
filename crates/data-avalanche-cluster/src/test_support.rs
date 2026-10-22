@@ -379,6 +379,7 @@ pub(crate) struct Node {
     pub target: tokio::sync::watch::Sender<crate::Target>,
     pub task: tokio::task::JoinHandle<()>,
     pub metrics: Metrics,
+    pub updates: tokio::sync::mpsc::UnboundedSender<crate::Update>,
 }
 
 pub(crate) fn deps(
@@ -409,6 +410,7 @@ pub(crate) fn node(
     Node {
         status,
         target,
+        updates: controller.updater(),
         task: tokio::spawn(controller.run(rx)),
         metrics: deps.metrics,
     }

@@ -83,6 +83,8 @@ pub enum RenewFailure {
 }
 
 impl RenewFailure {
+    const ALL: [Self; 3] = [Self::Transient, Self::Conflict, Self::Lost];
+
     fn label(self) -> &'static str {
         match self {
             Self::Transient => "transient",
@@ -284,8 +286,7 @@ impl Metrics {
     pub fn pipeline(&self, labels: PipelineLabels, per_table: bool) -> PipelineMetrics {
         PipelineMetrics {
             families: Arc::clone(&self.families),
-            labels,
-            per_table,
+            labels: Mutex::new((labels, per_table)),
             seen: Mutex::new(Seen::default()),
         }
     }
@@ -306,19 +307,56 @@ struct Seen {
 #[derive(Debug)]
 pub struct PipelineMetrics {
     families: Arc<Families>,
-    labels: PipelineLabels,
-    per_table: bool,
+    /// The labels, and `sink.metrics.per_table`: a reload may change either
+    /// ([`Self::relabel`]).
+    labels: Mutex<(PipelineLabels, bool)>,
     seen: Mutex<Seen>,
 }
 
 impl PipelineMetrics {
+    fn labels(&self) -> PipelineLabels {
+        self.labels
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .0
+            .clone()
+    }
+
+    fn per_table(&self) -> bool {
+        self.labels.lock().unwrap_or_else(PoisonError::into_inner).1
+    }
+
     fn base(&self) -> Labels {
-        self.labels.with(&[])
+        self.labels().with(&[])
+    }
+
+    /// A renamed pipeline, or a reloaded `sink.metrics.per_table` (config §12.3): every series
+    /// under the old labels goes, the renew failures too, and what is set next carries the new
+    /// ones. The labels in force again change nothing.
+    pub fn relabel(&self, labels: PipelineLabels, per_table: bool) {
+        if *self.labels.lock().unwrap_or_else(PoisonError::into_inner)
+            == (labels.clone(), per_table)
+        {
+            return;
+        }
+        self.forget();
+        *self.labels.lock().unwrap_or_else(PoisonError::into_inner) = (labels, per_table);
+    }
+
+    /// A pipeline gone from the config: every series goes, the renew failures too.
+    pub fn forget(&self) {
+        self.remove();
+        let labels = self.labels();
+        for c in RenewFailure::ALL {
+            self.families
+                .lease_renew_failures
+                .remove(&labels.with(&[("class", c.label())]));
+        }
     }
 
     pub fn status(&self, status: PipelineStatus) {
         for s in PipelineStatus::ALL {
-            let labels = self.labels.with(&[("status", s.label())]);
+            let labels = self.labels().with(&[("status", s.label())]);
             self.families
                 .pipeline_status
                 .get_or_create(&labels)
@@ -328,7 +366,7 @@ impl PipelineMetrics {
 
     pub fn lease(&self, state: LeaseState) {
         for s in LeaseState::ALL {
-            let labels = self.labels.with(&[("state", s.label())]);
+            let labels = self.labels().with(&[("state", s.label())]);
             self.families
                 .lease_state
                 .get_or_create(&labels)
@@ -337,7 +375,7 @@ impl PipelineMetrics {
     }
 
     pub fn renew_failed(&self, class: RenewFailure) {
-        let labels = self.labels.with(&[("class", class.label())]);
+        let labels = self.labels().with(&[("class", class.label())]);
         self.families
             .lease_renew_failures
             .get_or_create(&labels)
@@ -370,7 +408,7 @@ impl PipelineMetrics {
     /// sum. A table whose snapshot ended loses its series.
     pub fn snapshot_rows_done(&self, rows: &[(String, u64)]) {
         let family = &self.families.snapshot_rows_done;
-        if !self.per_table {
+        if !self.per_table() {
             let sum = rows.iter().map(|(_, n)| *n).sum();
             family.get_or_create(&self.base()).set(gauge(sum));
             return;
@@ -378,11 +416,11 @@ impl PipelineMetrics {
         let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
         let now: BTreeSet<String> = rows.iter().map(|(t, _)| t.clone()).collect();
         for gone in seen.tables.difference(&now) {
-            family.remove(&self.labels.with(&[("table", gone)]));
+            family.remove(&self.labels().with(&[("table", gone)]));
         }
         for (table, n) in rows {
             family
-                .get_or_create(&self.labels.with(&[("table", table)]))
+                .get_or_create(&self.labels().with(&[("table", table)]))
                 .set(gauge(*n));
         }
         seen.tables = now;
@@ -450,11 +488,11 @@ impl PipelineMetrics {
         let base = self.base();
         for s in PipelineStatus::ALL {
             f.pipeline_status
-                .remove(&self.labels.with(&[("status", s.label())]));
+                .remove(&self.labels().with(&[("status", s.label())]));
         }
         for s in LeaseState::ALL {
             f.lease_state
-                .remove(&self.labels.with(&[("state", s.label())]));
+                .remove(&self.labels().with(&[("state", s.label())]));
         }
         f.lease_renew_latency.remove(&base);
         for family in [
@@ -476,7 +514,7 @@ impl PipelineMetrics {
         let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
         for table in std::mem::take(&mut seen.tables) {
             f.snapshot_rows_done
-                .remove(&self.labels.with(&[("table", &table)]));
+                .remove(&self.labels().with(&[("table", &table)]));
         }
         seen.totals = Totals::default();
     }

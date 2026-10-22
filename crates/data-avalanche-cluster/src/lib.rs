@@ -22,7 +22,7 @@ pub mod wire;
 pub use claim::{Claim, Claimed, release};
 pub use controller::{
     Actual, ControllerDeps, ControllerSettings, ControllerStatus, Parts, PipelineController,
-    Target, WorkerFactory,
+    Target, Update, WorkerFactory,
 };
 pub use discovery::{Seeds, advertise, discover, interfaces};
 pub use error::ClusterError;
