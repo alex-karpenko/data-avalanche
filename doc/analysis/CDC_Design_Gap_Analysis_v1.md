@@ -130,13 +130,14 @@ does not block starting the specification.
 > 2026-10-07 for the M6a whole-branch review (§28.2), 2026-10-08 for M6b's planning findings
 > (§29), 2026-10-13 for M6b's exit (§30), 2026-10-14 for M7's planning (§31), 2026-10-14 for
 > M7a's plan (§32), 2026-10-16 for M7a's exit (§33), 2026-10-17 for M7b's plan (§34),
-> 2026-10-20 for M7b's exit (§35), 2026-10-21 for M8a's plan (§36), and 2026-10-22 for M8a's exit (§37).
+> 2026-10-20 for M7b's exit (§35), 2026-10-21 for M8a's plan (§36), 2026-10-22 for M8a's exit (§37),
+> and 2026-10-22 for M8b's plan (§38).
 
 | Status | Count (v1 scope) | Notes |
 |---|---|---|
 | ✅ Resolved | the large majority | Design closed by a research/spec doc or a probe. |
-| 🔄 Partial | 2 | DA-SNAP-7, DA-SRC-9 (neither blocks the plan); DA-SNAP-10 ✅ 2026-10-16 (M7a merged, §33). DA-MS-3 is a decided caveat. DA-X-8 ✅ 2026-09-26; DA-SRC-16 and DA-X-12 ✅ 2026-10-13 (§30). |
-| 🟥 Open (v1) | **20** | DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2); DA-API-11 and DA-SRC-20 🆕 2026-10-13 (§30.1); DA-SRC-21 🆕 2026-10-14 (§31.2); DA-SRC-22, DA-SNAP-14 and DA-X-13 🆕 2026-10-14 (§32.1); DA-SRC-24…26 🆕 2026-10-16 (§33.1); DA-OBS-6 🆕 2026-10-17 (§34.1); DA-OPS-8 🆕 2026-10-21 (§36.1). DA-CLUS-14, DA-OPS-7 and DA-SRC-28 ✅ 2026-10-22 (§37). DA-SRC-27 and DA-X-14 ✅ 2026-10-20 (§35). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
+| 🔄 Partial | 3 | DA-SNAP-7, DA-SRC-9 (neither blocks the plan); DA-OPS-8 2026-10-22 (§38: the startup warning; the operator docs in M11); DA-SNAP-10 ✅ 2026-10-16 (M7a merged, §33). DA-MS-3 is a decided caveat. DA-X-8 ✅ 2026-09-26; DA-SRC-16 and DA-X-12 ✅ 2026-10-13 (§30). |
+| 🟥 Open (v1) | **21** | DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2); DA-API-11 and DA-SRC-20 🆕 2026-10-13 (§30.1); DA-SRC-21 🆕 2026-10-14 (§31.2); DA-SRC-22, DA-SNAP-14 and DA-X-13 🆕 2026-10-14 (§32.1); DA-SRC-24…26 🆕 2026-10-16 (§33.1); DA-OBS-6 🆕 2026-10-17 (§34.1); DA-OPS-9 and DA-API-12 🆕 2026-10-22 (§38.1). DA-OPS-8 🔄 2026-10-22 (§38). DA-CLUS-14, DA-OPS-7 and DA-SRC-28 ✅ 2026-10-22 (§37). DA-SRC-27 and DA-X-14 ✅ 2026-10-20 (§35). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
 | 🧪 Verify (v1) | **0** | DA-SRC-10/11 proven 2026-09-26 (§21). |
 | ⏭ v2 | 13 | Iceberg-sink items (§26.2). |
 | 🟢 Spec-merge debt | **0** | All applied 2026-09-26 (§26.6): §19.3 S-1…S-6, the DA-X-8 config residual, the D-V1 patches and the Data-Flow Phase 2a probe details. |
@@ -445,6 +446,7 @@ unauthenticated. The auth *mechanism* (jwt/oauth2 verification params) was alrea
 | DA-API-8 | STOPPED keeps its lease (owner idle) | 🟢 | ✅ | §2 — avoids ring churn, immediate resume; cost = one idle renewal. | D-NEW15.1 |
 | DA-API-9 | PAUSE flushes to a clean boundary (no at-risk buffer at failover) | 🟡 | ✅ | §2/§4 — resume is fast (warm, no buffer reconcile). | D-NEW15.3 |
 | DA-API-10 | Reload must not resurrect a paused/stopped pipeline | 🟡 | ✅ | §4 — runtime `desired_state` wins over config's implicit "should run." | §9.6 |
+| DA-API-12 | 🆕 The reload and status endpoints answer without authentication until M9 | 🟢 | 🟥 | §38.1. Q-M8b-1: `POST /v1/config/reload` and `GET /v1/config/status` serve on `globals.api.address` like `/metrics`, before M9's auth and RBAC. A caller can publish the file that is on the node, not a text of its own. M9 puts them behind the operator and viewer roles (API_RBAC §2). | — |
 | DA-API-11 | 🆕 A desired-state change missed between two polls | 🟢 | 🟥 | §30.1. The controller samples `pipeline-state.json` once per renewal interval, so a stop and a resume between two polls don't clear `ERROR` (Lifecycle §3). The M9 API wakes the controller, or the document carries a generation the controller compares. | — |
 
 ---
@@ -463,6 +465,8 @@ pinning is the remaining cross-cutting concern.
 | DA-OPS-3 | `glue.strip_schema` collision handling | 🟢 | ✅ | G-11.3 — collision = config error; non-stripped = `schema__table`. | G-11.3 |
 | DA-OPS-4 | Sink/catalog unavailability → DEGRADED back-pressure | 🟡 | ✅ | G-27/G-35 — stop consuming once buffers fill, protect slot/WAL via G-22; recover on next commit; catalog circuit breaker. | G-27, G-35 |
 | DA-OPS-5 | k8s deployment as StatefulSet (not Deployment) | 🟡 | ✅ | Clustering §3.4/§10.2 — stable `node_name` via Downward API; headless Service discovery. | D-1, D-4 |
+| DA-OPS-9 | 🆕 A pipeline removed while no node holds its lease isn't torn down | 🟢 | 🟥 | §38.1. Q-M8b-3: the owner drains, tears down (`auto_cleanup`) and releases. With no owner at the removal (it is down, or a hand-off is between release and claim), every node's controller is on standby and just ends, so the PostgreSQL slot and publication stay and the slot keeps WAL (bounded by `max_slot_wal_keep_size`). Config §12.3's "orphan-cleanup … whose owner was offline" design item. | — |
+| DA-OPS-8 | Per-node literals in a node's own file are ignored once a generation exists | 🟢 | 🔄 | §36.1, §38. A node runs the cluster's generation resolved with its own environment (D-3); per-node values go through `${VAR}` (config §6.5.1). M8b warns at startup naming each per-node key that differs, and which value runs; the operator docs stay with M11. | — |
 | DA-OPS-7 | A controller task that panics goes unnoticed | 🟢 | ✅ | ✅ 2026-10-22 (§37): the reconciler supervises its controllers. One that ended unasked (a panic, a return) is logged and started again on its status channel, and a dropped reconciler counts as a crash; the owned-pipelines gauge is held by a guard, so a panic doesn't over-count it. Readiness after a controller panic is not in M8a (DA-OPS-7's other half: M10). M8a Task 6 (D-M8a.11, `a_controller_that_panics_is_started_again`) | — |
 | DA-OPS-6 | "Restart ≠ apply config" operator footgun | 🟢 | ✅(documented) | Clustering §9.3 D-3 — cloud-generation-wins; a pod restart does **not** apply ConfigMap edits, only `POST /reload` does. Document loudly. | D-3 |
 | DA-DEP-1 | iceberg-rust pinned version & capabilities | 🟡 | ⏭ v2 | `iceberg` 0.10.1, MSRV 1.94 (main has moved to 1.95, #3083; Sources_Index needs refreshing from 1.92). Multiple capability gates ride on the exact version: DA-SINK-1, DA-SINK-2, DA-SCHEMA-8, DA-TYPE-5, DA-SINK-10. Pin and assert at startup. **2026-09-26 tidy:** Iceberg-sink only — deferred with the Iceberg sink to v2. | — |
@@ -1833,3 +1837,28 @@ Noted for M11's operator docs: a node's worst-case stop is now bounded, at
 `drain_timeout × ceil(pipelines / max_concurrent_handoffs) + 2 × lease_renewal_interval` plus one
 `drain_timeout` (130 s with one pipeline at the defaults: 60 s + 2 × 5 s, then 60 s), above Kubernetes' default 30 s
 `terminationGracePeriodSeconds`.
+
+## 38. M8b config generations — the plan (2026-10-22)
+
+Oleksii answered Q-M8b-1…3 (2026-10-22, all "Recommended"): the reload and status endpoints now,
+unauthenticated until M9; every R field applied in place; a removed pipeline cleaned up by its
+owner. M8b's plan (`doc/v1.0/M8b-config-generations.md`) was built task by task in a scratch
+workspace and replayed from its code blocks to an identical tree. No spec edit: the specs leave
+the endpoints' answers open.
+
+| ID | Change | Evidence |
+|---|---|---|
+| DA-OPS-8 | 🟥 → 🔄: a node warns at startup naming each per-node key whose value in its file differs from the adopted generation's, which value it runs, and that a reload from it is refused (V-061) until they match. The operator docs stay with M11 | M8b D-M8b.10; Task 7 (`the_per_node_keys_apart_from_the_generation_are_named`) |
+| DA-API-10 | ✅ (restated): a reload's restart keeps the desired state, so a paused or stopped pipeline stays so; `ERROR` is cleared, since the new config may be the fix | M8b D-M8b.3; Task 3 (`a_restart_keeps_a_paused_pipeline_paused`, `a_restart_runs_a_pipeline_in_error_again`) |
+
+Found while planning, and in the plan: a pipeline added back while its removal runs would have
+run beside its draining controller, whose teardown drops the slot (D-M8b.4); the same text with a
+rotated secret would have been answered "unchanged" (D-M8b.7, config §12.1); and a reload's
+table patterns would not have reached the source's later rescans (D-M8b.1).
+
+### 38.1 New gaps
+
+| ID | Gap | Severity | Surfaced by | Next |
+|---|---|---|---|---|
+| DA-OPS-9 | A pipeline removed while no node holds its lease (its owner is down, or a hand-off is between the release and the claim) is torn down by no one: every node's controller is on standby and just ends, so its PostgreSQL slot and publication stay, and the slot keeps WAL | 🟢 | Q-M8b-3; config §12.3's design item | A tombstone for a removed id that the node the ring would place it on cleans up; until then the operator drops the slot (M11's docs) |
+| DA-API-12 | `POST /v1/config/reload` and `GET /v1/config/status` answer without authentication until M9. A caller who reaches `globals.api.address` can publish the file that is on the node (not a text of its own) and read each node's generation | 🟢 | Q-M8b-1 | M9: the operator and viewer roles (API_RBAC §2) |
