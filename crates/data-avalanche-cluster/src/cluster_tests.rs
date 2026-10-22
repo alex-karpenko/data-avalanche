@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::test_support::{
-    STABLE, TestCluster, TestNode, at, eventually, runners, settles, timing,
+    LEAVE_WITHIN, STABLE, TestCluster, TestNode, at, eventually, runners, settles, timing,
 };
 use crate::{Ring, leave};
 
@@ -162,7 +162,7 @@ async fn a_rolling_restart_keeps_every_pipeline_running_once() {
         let gone = nodes.remove(0);
         let (name, n) = (gone.name.clone(), u8::try_from(i + 1).unwrap());
         let t = Instant::now();
-        let left = tokio::spawn(leave(gone.gossip, gone.reconciler));
+        let left = tokio::spawn(leave(gone.gossip, gone.reconciler, LEAVE_WITHIN));
         let rest: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
         let refs: Vec<&TestNode> = nodes.iter().collect();
         settles(&format!("{name} handed off"), &refs, placed(&rest)).await;

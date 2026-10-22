@@ -34,16 +34,34 @@ pub async fn join(gossip: &Gossip, seeded: bool) {
 /// without waiting out the lease; then `Leaving`, and the gossip's leave, which the others see
 /// at once rather than after a suspicion. A node without peers has no one to hand to: its
 /// pipelines drain together and release their leases for the next process.
-pub async fn leave(gossip: Gossip, reconciler: ClusterReconciler) {
-    let peers = gossip.members().borrow().peers();
-    if peers > 0 {
+///
+/// The hand-offs are waited for at most `within`: what is still held then drains at once, each
+/// pipeline within its `drain_timeout`. A gossip that has stopped can't say the node drains (its
+/// targets would never turn): the hand-off is skipped, and every pipeline drains at once.
+pub async fn leave(gossip: Gossip, reconciler: ClusterReconciler, within: Duration) {
+    let mut members = gossip.members();
+    // Err once the actor is gone: it dropped its sender.
+    let alive = members.has_changed().is_ok();
+    let peers = members.borrow().peers();
+    if peers > 0 && alive {
         tracing::info!(peers, "leaving the cluster: handing every pipeline off");
         gossip.set_phase(Phase::Draining);
-        reconciler.released().await;
-        gossip.set_phase(Phase::Leaving);
+        tokio::select! {
+            () = reconciler.released() => gossip.set_phase(Phase::Leaving),
+            _ = members.wait_for(|_| false) => tracing::error!(
+                "the gossip stopped during the drain: what is held drains at once"
+            ),
+            () = tokio::time::sleep(within) => tracing::warn!(
+                ?within,
+                "the hand-offs outlasted their bound: what is held drains at once"
+            ),
+        }
+    } else if peers > 0 {
+        tracing::error!("the gossip has stopped: no hand-off, every pipeline drains at once");
     }
-    // What is still held (a claim that landed during the drain) drains here, uncapped.
+    // What is still held drains here, uncapped (each at most drain_timeout), and is released.
     reconciler.shutdown().await;
+    // At once if the actor is gone: the command, or its reply, is dropped with it.
     gossip.leave().await;
     tracing::info!("left the cluster");
 }
@@ -57,7 +75,8 @@ mod tests {
     use super::*;
     use crate::Ring;
     use crate::test_support::{
-        Hub, STABLE, TestCluster, at, eventually, gossip_settings, leases, settles, timing,
+        Hub, LEAVE_WITHIN, STABLE, TestCluster, TestNode, at, eventually, gossip_settings, leases,
+        settings, settles, timing,
     };
 
     fn joining(hub: &std::sync::Arc<Hub>, name: &str, n: u8) -> Gossip {
@@ -129,7 +148,7 @@ mod tests {
         c.insert(1);
         eventually("1 lands", || c.landed(&[1])).await;
         let t = Instant::now();
-        let left = tokio::spawn(leave(a.gossip, a.reconciler));
+        let left = tokio::spawn(leave(a.gossip, a.reconciler, LEAVE_WITHIN));
         settles("all on b", &[&b], |_| "b".into()).await;
         let took = t.elapsed();
         assert!(took < timing().duration, "{took:?}: a lease wait");
@@ -147,13 +166,88 @@ mod tests {
         );
     }
 
+    /// `a` and `b` settled over the ring: the pipelines `a` runs.
+    async fn spread(c: &TestCluster) -> (TestNode, TestNode, Vec<&'static str>) {
+        let a = c.start("a", 1, 1, None).await;
+        settles("all on a", &[&a], |_| "a".into()).await;
+        let b = c.start("b", 2, 1, Some(at(1))).await;
+        let two = Ring::new(["a", "b"], 128);
+        tokio::time::sleep(STABLE).await;
+        settles("spread over a and b", &[&a, &b], |id| {
+            two.owner(id).unwrap().into()
+        })
+        .await;
+        let on_a = IDS
+            .into_iter()
+            .filter(|id| two.owner(id) == Some("a"))
+            .collect();
+        (a, b, on_a)
+    }
+
+    /// A leave whose gossip stopped hands nothing off, as it can't say it drains: every
+    /// pipeline drains at once and is released, and the peer takes it without a lease wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_leave_whose_gossip_stopped_releases_at_once() {
+        let c = TestCluster::new(&IDS);
+        let (a, b, on_a) = spread(&c).await;
+        assert!(!on_a.is_empty());
+        a.gossip.abort();
+        let members = a.gossip.members();
+        eventually("a's gossip stopped", || members.has_changed().is_err()).await;
+        let within = Duration::from_secs(60);
+        let t = Instant::now();
+        tokio::time::timeout(within * 2, leave(a.gossip, a.reconciler, within))
+            .await
+            .expect("the leave returns");
+        let took = t.elapsed();
+        assert!(took < Duration::from_secs(1), "{took:?}");
+        for id in &on_a {
+            let lease = leases(&c.store).observe(id).await.unwrap().unwrap();
+            assert!(lease.doc.released, "{id}");
+        }
+        settles("all on b", &[&b], |_| "b".into()).await;
+        let took = t.elapsed();
+        assert!(took < timing().duration, "{took:?}: a lease wait");
+    }
+
+    /// A leave whose hand-offs can't finish (no hand-off permit frees) gives up on them at its
+    /// bound: what is held drains at once and is released.
+    #[tokio::test(start_paused = true)]
+    async fn a_leave_past_its_bound_drains_the_rest() {
+        let c = TestCluster::new(&IDS);
+        let (a, _b, on_a) = spread(&c).await;
+        assert!(!on_a.is_empty());
+        let permits = u32::try_from(a.handoffs.available_permits()).unwrap();
+        let _held = a
+            .handoffs
+            .clone()
+            .acquire_many_owned(permits)
+            .await
+            .unwrap();
+        let within = Duration::from_secs(3);
+        let t = Instant::now();
+        tokio::time::timeout(within * 20, leave(a.gossip, a.reconciler, within))
+            .await
+            .expect("the leave returns");
+        let took = t.elapsed();
+        let drain = settings().drain_timeout;
+        assert!(
+            took >= within && took <= within + drain,
+            "{took:?}, bound {within:?}, drain {drain:?}"
+        );
+        for id in &on_a {
+            let lease = leases(&c.store).observe(id).await.unwrap().unwrap();
+            assert!(lease.doc.released, "{id}");
+        }
+    }
+
     /// A lone node's leave releases every lease: the next process acquires them at once.
     #[tokio::test(start_paused = true)]
     async fn a_lone_node_leaves_by_releasing_its_leases() {
         let c = TestCluster::new(&IDS);
         let a = c.start("a", 1, 1, None).await;
         settles("all on a", &[&a], |_| "a".into()).await;
-        leave(a.gossip, a.reconciler).await;
+        leave(a.gossip, a.reconciler, LEAVE_WITHIN).await;
         for id in IDS {
             let lease = leases(&c.store).observe(id).await.unwrap().unwrap();
             assert!(lease.doc.released, "{id}");

@@ -301,6 +301,12 @@ impl Gossip {
         let _ = self.commands.send(Command::Phase(phase));
     }
 
+    /// Stops the gossip as a crash would, keeping the handle: what it sends goes nowhere.
+    #[cfg(test)]
+    pub(crate) fn abort(&self) {
+        self.task.abort();
+    }
+
     /// Leaves the cluster: the others see this node gone at once, not after a suspicion.
     pub async fn leave(self) {
         let (tx, rx) = oneshot::channel();

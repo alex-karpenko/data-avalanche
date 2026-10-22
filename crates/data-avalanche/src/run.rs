@@ -84,6 +84,16 @@ pub(crate) fn settings(config: &ResolvedConfig) -> ControllerSettings {
     }
 }
 
+/// How long a leave waits for its hand-offs: `drain_timeout` for each round of
+/// `max_concurrent_handoffs` pipelines, and two `lease_renewal_interval`s over, which cover one
+/// resync for a controller started again and the release's or the claim's I/O.
+pub(crate) fn leave_within(config: &ResolvedConfig) -> Duration {
+    let c = &config.globals.cluster;
+    let pipelines = u32::try_from(config.pipelines.len()).unwrap_or(u32::MAX);
+    let rounds = pipelines.div_ceil(c.max_concurrent_handoffs.max(1));
+    c.drain_timeout.saturating_mul(rounds) + 2 * c.lease_renewal_interval
+}
+
 /// Runs every pipeline until SIGTERM or SIGINT.
 ///
 /// # Errors
@@ -201,7 +211,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     tracing::info!("shutting down: handing off every pipeline and releasing its lease");
     ready.store(false, Ordering::SeqCst);
     discovery.abort();
-    leave(gossip, reconciler).await;
+    leave(gossip, reconciler, leave_within(&config)).await;
     let _ = stop_http.send(());
     let _ = server.await;
     tracing::info!("stopped");
@@ -300,6 +310,21 @@ pipelines:
             key: pem(),
         });
         assert!(unsupported(&c).unwrap().contains("M9"));
+    }
+
+    #[test]
+    fn a_leave_waits_a_drain_timeout_a_hand_off_round_and_two_renewals() {
+        let mut c = config();
+        // One pipeline, two hand-offs at a time: one round of 45 s, and 2 × 10 s.
+        assert_eq!(leave_within(&c), Duration::from_secs(65));
+        let orders = c.pipelines["orders"].clone();
+        for id in ["a", "b", "c", "d", "e"] {
+            c.pipelines.insert(id.into(), orders.clone());
+        }
+        // Six pipelines, two at a time: three rounds; four at a time: two.
+        assert_eq!(leave_within(&c), Duration::from_secs(3 * 45 + 20));
+        c.globals.cluster.max_concurrent_handoffs = 4;
+        assert_eq!(leave_within(&c), Duration::from_secs(2 * 45 + 20));
     }
 
     #[test]

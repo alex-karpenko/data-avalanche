@@ -580,6 +580,9 @@ impl crate::WorkerFactory for ByPipeline {
 /// `rebalance_stabilization` in the cluster tests.
 pub(crate) const STABLE: Duration = Duration::from_secs(15);
 
+/// A leave's bound that no test's hand-offs reach.
+pub(crate) const LEAVE_WITHIN: Duration = Duration::from_secs(3600);
+
 /// In-process nodes: their gossip on one hub, their leases in one store, their pipelines'
 /// sources, sinks and state documents shared.
 #[derive(Debug)]
@@ -618,6 +621,9 @@ pub(crate) struct TestNode {
     pub gossip: crate::Gossip,
     pub reconciler: crate::ClusterReconciler,
     pub addr: SocketAddr,
+    /// The node's hand-off permits (`max_concurrent_handoffs`): a test that holds them all
+    /// keeps every hand-off from starting.
+    pub handoffs: Arc<tokio::sync::Semaphore>,
 }
 
 /// Every 10 ms of the test clock, the pipelines running on two or more nodes of `registry`:
@@ -734,6 +740,7 @@ impl TestCluster {
             gossip,
             reconciler,
             addr: at(n),
+            handoffs: deps.handoffs,
         }
     }
 

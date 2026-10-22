@@ -220,7 +220,12 @@ async fn reconcile(
         let due = placement.next_due();
         tokio::select! {
             _ = &mut stop => break,
-            changed = members.changed(), if gossiping => gossiping = changed.is_ok(),
+            changed = members.changed(), if gossiping => {
+                gossiping = changed.is_ok();
+                if !gossiping {
+                    tracing::error!("the gossip stopped: placement keeps its last view");
+                }
+            }
             () = async {
                 match due {
                     Some(at) => tokio::time::sleep_until(at).await,
