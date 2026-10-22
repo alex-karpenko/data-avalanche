@@ -101,7 +101,6 @@ impl Buckets {
 }
 
 /// The running config and the `globals.state` documents, once this node has joined.
-#[derive(Debug)]
 pub(crate) struct Joined {
     pub config: ResolvedConfig,
     pub globals: DocStore,
@@ -109,6 +108,18 @@ pub(crate) struct Joined {
     pub fingerprint_key: [u8; 32],
     /// The config generation the node runs.
     pub generation: u64,
+}
+
+/// The anchor's key prints as `..`, as `GossipKey`'s does: a `{joined:?}` logs no secret.
+impl std::fmt::Debug for Joined {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Joined")
+            .field("config", &self.config)
+            .field("globals", &self.globals)
+            .field("fingerprint_key", &format_args!(".."))
+            .field("generation", &self.generation)
+            .finish()
+    }
 }
 
 /// Steps 2–5 of the startup sequence; `first` is the config loaded with a throwaway key.
@@ -216,6 +227,21 @@ mod tests {
             .unwrap()
             .insert(file.globals.state.bucket.clone(), Arc::clone(store));
         (buckets, file)
+    }
+
+    /// The anchor's key never reaches a log through `Joined`'s `Debug`.
+    #[tokio::test]
+    async fn a_joined_node_prints_no_key() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (b, file) = buckets(CONFIG, &store);
+        let joined = join(&b, "node-a", CONFIG, &file).await.unwrap();
+        let printed = format!("{joined:?}");
+        assert!(printed.contains("fingerprint_key: .."), "{printed}");
+        assert!(
+            !printed.contains(&format!("{:?}", joined.fingerprint_key)),
+            "{printed}"
+        );
+        assert!(printed.contains("generation: 1"), "{printed}");
     }
 
     /// A file that names another backend than the generation the cluster runs is refused: the

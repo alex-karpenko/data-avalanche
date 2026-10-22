@@ -19,9 +19,9 @@ pub async fn join(gossip: &Gossip, seeded: bool) {
             Ok(Ok(_)) => tracing::info!("joined the gossip"),
             Ok(Err(_)) => tracing::warn!("the gossip stopped before a seed answered"),
             Err(_) => tracing::warn!(
-                "no gossip seed answered within {JOIN_WAIT:?}: going on alone, still asking (a seed \
-                 must be a peer's advertised address, advertise_addr:advertise_port, not a Service \
-                 or load-balancer address)"
+                "no gossip seed answered within {JOIN_WAIT:?}: going on alone, still asking (if \
+                 peers are running, check that each seed is a peer's advertised address, \
+                 advertise_addr:advertise_port, not a Service or load-balancer address)"
             ),
         }
     }

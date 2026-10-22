@@ -1,8 +1,11 @@
 //! Gossip packets (Q-M8-2). Each packet is foca's bytes followed by a keyed BLAKE3 MAC whose key
 //! is derived from the cluster anchor's fingerprint key: every node that can read `globals.state`
 //! has it, no config carries it, and a packet without a valid MAC is dropped. The packets aren't
-//! encrypted; they carry node names, addresses and phases. They travel over UDP; the in-process
-//! tests carry them over a hub instead.
+//! encrypted; they carry node names, addresses and phases. The MAC authenticates the cluster's
+//! packets but doesn't stop a replay of captured ones: at worst a replay churns membership
+//! (foca's incarnations), and the leases keep placement safe; within Q-M8-2's threat model
+//! (another cluster or stray traffic, not an on-path attacker). They travel over UDP; the
+//! in-process tests carry them over a hub instead.
 
 use std::fmt;
 use std::net::SocketAddr;
