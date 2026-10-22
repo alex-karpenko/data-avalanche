@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use data_avalanche_config::{Pipeline, SnapshotMode};
@@ -38,6 +39,9 @@ pub struct WorkerDeps {
     pub owner_epoch: u64,
     pub guard: Arc<dyn CommitGuard>,
     pub hooks: Arc<dyn Hooks>,
+    /// Whether this lease term already ended the stream position's other reader (DA-SRC-28):
+    /// every worker run of the term shares it.
+    pub reader_ended: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for WorkerDeps {
@@ -58,6 +62,7 @@ impl WorkerDeps {
             owner_epoch: 1,
             guard: Arc::new(Unguarded),
             hooks: Arc::new(NoHooks),
+            reader_ended: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -72,6 +77,8 @@ pub struct WorkerHandle {
 /// One pipeline's worker.
 pub struct PipelineWorker {
     core: Core,
+    /// [`WorkerDeps::reader_ended`].
+    reader_ended: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for PipelineWorker {
@@ -111,7 +118,11 @@ impl PipelineWorker {
             server: None,
             pause: false,
         };
-        (Self { core }, WorkerHandle { control, status })
+        let reader_ended = deps.reader_ended;
+        (
+            Self { core, reader_ended },
+            WorkerHandle { control, status },
+        )
     }
 
     /// Runs the pipeline until a [`Command::Drain`] (or the handle drops), until every `dump_*`
@@ -125,7 +136,6 @@ impl PipelineWorker {
         start(core, None).await?;
         let mut attempt = 0;
         let mut contended_since: Option<Instant> = None;
-        let mut ended = false;
         loop {
             let opened = Instant::now();
             let failed = match Session::open(core).await {
@@ -161,13 +171,15 @@ impl PipelineWorker {
                     }
                     // DA-SRC-28: under the lease, the other reader is a stale session. It is
                     // ended on the first busy attempt of a spell, and the stream retried from the
-                    // first backoff step. At most once a run: two holders that each believe they
-                    // hold the lease can't keep ending each other's stream; the second spell waits
-                    // and gives up with `Contended` after the window.
-                    if first && !ended && core.may_write().is_ok() {
+                    // first backoff step. At most once a lease term: two holders that each
+                    // believe they hold the lease can't keep ending each other's stream; a later
+                    // spell, in this run or a rerun under the same lease, waits and gives up with
+                    // `Contended` after the window.
+                    let ended = &self.reader_ended;
+                    if first && !ended.load(Ordering::SeqCst) && core.may_write().is_ok() {
                         let warning = match core.source.end_other_reader().await {
                             Ok(true) => {
-                                ended = true;
+                                ended.store(true, Ordering::SeqCst);
                                 attempt = 0;
                                 Some(format!(
                                     "ended the stream position's other reader, a session the lease outlived ({detail})"
@@ -1031,7 +1043,7 @@ mod tests {
         );
     }
 
-    /// The stale reader is ended at most once a run: an ended reader that comes back (a second
+    /// The stale reader is ended at most once a term: an ended reader that comes back (a second
     /// holder that believes it holds the lease) is waited out, not ended again.
     #[tokio::test]
     async fn an_ended_reader_that_comes_back_is_not_ended_again() {

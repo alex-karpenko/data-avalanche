@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use data_avalanche_config::Pipeline;
@@ -351,6 +352,9 @@ impl PipelineController {
         let mut dumped = false;
         let mut retry: Option<(Instant, String)> = None;
         let mut failures: u32 = 0;
+        // One lease term: a stale reader is ended at most once in it, by whichever of its
+        // workers meets it first, a stop and a resume included (DA-SRC-28).
+        let reader_ended = Arc::new(AtomicBool::new(false));
         // Unknown until a read succeeds: nothing starts on a guess (a stopped or paused pipeline
         // must not run because its state document was unreadable once).
         let mut desired = self.desired().await;
@@ -559,7 +563,7 @@ impl PipelineController {
                         self.observe(w);
                     }
                 }
-                Event::Start(permit) => match self.start(&run, permit) {
+                Event::Start(permit) => match self.start(&run, &reader_ended, permit) {
                     Ok(w) => worker = Some(w),
                     Err(e) => {
                         tracing::error!(pipeline = %self.pipeline.name, "pipeline in ERROR: {e}");
@@ -593,7 +597,13 @@ impl PipelineController {
         }
     }
 
-    fn start(&self, run: &LeaseRun, permit: OwnedSemaphorePermit) -> Result<Running, String> {
+    /// `reader_ended`: the term's [`WorkerDeps::reader_ended`].
+    fn start(
+        &self,
+        run: &LeaseRun,
+        reader_ended: &Arc<AtomicBool>,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<Running, String> {
         let parts = self.factory.build(&self.pipeline)?;
         let deps = WorkerDeps {
             source: parts.source,
@@ -602,6 +612,7 @@ impl PipelineController {
             owner_epoch: run.owner_epoch,
             guard: run.guard.clone(),
             hooks: parts.hooks,
+            reader_ended: Arc::clone(reader_ended),
         };
         let (worker, handle) =
             PipelineWorker::new(&self.pipeline, deps, self.settings.tuning.clone());
@@ -998,6 +1009,47 @@ mod tests {
         docs.set_desired_state(DesiredState::Running).await.unwrap();
         until(&mut n.status, "running", is(Actual::Running)).await;
         assert_eq!(f.builds(), 2);
+    }
+
+    /// The stale reader is ended at most once a lease term (DA-SRC-28): a worker that gave up on
+    /// a busy slot is rerun under the same lease, and the rerun waits the slot out too, though
+    /// it is a new worker.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_reader_is_ended_once_a_lease_term() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a"]);
+        let busy = |f: &TestFactory| {
+            for _ in 0..10_000 {
+                f.source
+                    .fail(Method::OpenStream, SourceError::Contended("active".into()));
+            }
+            f.source
+                .fail(Method::Next, SourceError::Transient("reset".into()));
+        };
+        let mut n = node("n1", &store, &docs, &f);
+        until(&mut n.status, "running", is(Actual::Running)).await;
+        // A reconnect meets the busy slot: its reader is ended, and the worker streams on.
+        busy(&f);
+        eventually("the reader is ended", || f.source.readers_ended() == 1).await;
+        f.source.commit(FakeTxn::new().insert(&t("a"), row(1)));
+        eventually("the row lands", || f.ids("a") == [1]).await;
+        assert_eq!(f.builds(), 1);
+        // The slot is busy again: the worker gives up after `contended_window` (200 ms), and is
+        // rerun after the restart backoff (100 ms first); the rerun meets the busy slot.
+        busy(&f);
+        until(
+            &mut n.status,
+            "retrying",
+            |s| matches!(&s.actual, Some(Actual::Retrying { error }) if error.contains("active")),
+        )
+        .await;
+        eventually("the rerun meets the busy slot and gives up", || {
+            f.source.readers_ended() > 1 || f.builds() >= 3
+        })
+        .await;
+        assert_eq!(f.source.readers_ended(), 1, "not ended again in the term");
+        assert_eq!(n.status.borrow().owner_epoch, Some(1), "the same term");
     }
 
     /// The state store fails Phase 0's first write: the worker ends, and runs again.
