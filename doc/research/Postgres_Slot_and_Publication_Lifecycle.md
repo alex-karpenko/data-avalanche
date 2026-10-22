@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-21
+updated: 2026-10-22
 domain: Data Flow
 tags: [postgres, replication-slot, publication, lifecycle, wal, re-snapshot, cdc]
 resolves: [G-15]
@@ -120,7 +120,10 @@ config §):
   (a stop-the-world pause) or this node's own dropped session. Without that, a takeover after a
   pause waited for `wal_sender_timeout` plus a backoff step, about two minutes. A reader of another
   role is never ended, so the bounded retry still covers it, and so is the external collision
-  below.
+  below. Amended 2026-10-22 (M8a's whole-branch review): a holder ends such a reader at most once a
+  lease term. Two holders that each believe they hold the lease (two lease stores on one slot) would
+  otherwise end each other in turn, splitting the slot's changes between two lakes; with the limit,
+  the later busy spell gives up loudly with the bounded retry's error.
 - **External (non-app) collisions cannot be detected.** PG replication slots carry **no ownership
   tag/comment**, so a slot created by an unrelated system under the same name is indistinguishable.
   Mitigation is V-058 naming uniqueness + operator discipline; documented as a known limitation, not
