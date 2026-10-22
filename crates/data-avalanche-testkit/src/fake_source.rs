@@ -58,6 +58,8 @@ pub enum Method {
     EndOtherReader,
     Augment,
     Rescan,
+    /// `teardown`.
+    Teardown,
 }
 
 /// One change of a [`FakeTxn`].
@@ -1175,7 +1177,7 @@ impl SourceConnector for FakeSource {
 
     async fn teardown(&self) -> Result<(), SourceError> {
         self.db().teardowns += 1;
-        Ok(())
+        self.take_fault(Method::Teardown)
     }
 
     fn reconfigure(&self, _: &dyn std::any::Any) {

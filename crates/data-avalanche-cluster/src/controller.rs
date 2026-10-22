@@ -802,8 +802,7 @@ impl PipelineController {
                 pipeline = %self.pipeline.name,
                 "removed with its drain cut off: the lease expires, and what the source created for the pipeline stays"
             );
-        } else if run.guard.may_commit() {
-            self.teardown().await;
+        } else if self.teardown(&*run.guard).await {
             self.give_back(run).await;
         } else {
             let _ = run.stop().await;
@@ -818,20 +817,24 @@ impl PipelineController {
 
     /// The source's `teardown` (PostgreSQL's `auto_cleanup`: the slot and the publication),
     /// tried again while the source is busy or doesn't answer, within the contended window: the
-    /// stream a drain closed may hold the slot a moment longer.
-    async fn teardown(&self) {
+    /// stream a drain closed may hold the slot a moment longer. The lease is checked before every
+    /// attempt: false when it was lost, the source then left as it is (its new holder runs it).
+    async fn teardown(&self, guard: &impl CommitGuard) -> bool {
         let source = match self.factory.build(&self.pipeline) {
             Ok(parts) => parts.source,
             Err(e) => {
                 tracing::warn!(pipeline = %self.pipeline.name, "no source to clean up: {e}");
-                return;
+                return true;
             }
         };
         let since = Instant::now();
         let mut attempt = 0;
         loop {
+            if !guard.may_commit() {
+                return false;
+            }
             match source.teardown().await {
-                Ok(()) => return,
+                Ok(()) => return true,
                 Err(SourceError::Transient(_) | SourceError::Contended(_))
                     if since.elapsed() < self.settings.tuning.contended_window =>
                 {
@@ -843,7 +846,7 @@ impl PipelineController {
                         pipeline = %self.pipeline.name,
                         "what the source created for the pipeline stays ({e}): remove it by hand"
                     );
-                    return;
+                    return true;
                 }
             }
         }
@@ -1660,5 +1663,48 @@ mod tests {
         f.sink.release_commits();
         until(&mut n.status, "stopped", is(Actual::Stopped)).await;
         assert_eq!(f.ids("a"), [1], "drained before it stopped");
+    }
+
+    /// A removal's teardown checks the lease before every attempt: once it is lost the source is
+    /// left as it is (its new holder runs it), and the lease isn't released by this node.
+    #[tokio::test(start_paused = true)]
+    async fn a_teardown_stops_once_the_lease_is_lost() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a"]);
+        let mut d = deps("n1", &store, &f);
+        d.settings.tuning.contended_window = Duration::from_secs(3_600);
+        let (c, status) = PipelineController::new(pipeline(), docs.clone(), &d);
+        let (_target, rx) = watch::channel(Target::Own);
+        let updates = c.updater();
+        let mut task = tokio::spawn(c.run(rx));
+        let mut n = status;
+        until(&mut n, "running", is(Actual::Running)).await;
+        for _ in 0..1000 {
+            f.source
+                .fail(Method::Teardown, SourceError::Contended("slot busy".into()));
+        }
+        store.fail_always(Some(Fault {
+            kind: Kind::Transient,
+            lands: false,
+        }));
+        let start = Instant::now();
+        updates.send(Update::Remove).unwrap();
+        tokio::time::timeout(Duration::from_secs(3_000), &mut task)
+            .await
+            .expect("the controller ends")
+            .unwrap();
+        let tried = f.source.teardowns();
+        assert!(tried >= 1, "it tried while the lease held");
+        assert!(
+            start.elapsed() < Duration::from_secs(120),
+            "it stopped with the lease, not with the contended window: {:?}",
+            start.elapsed()
+        );
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        assert_eq!(f.source.teardowns(), tried, "no attempt after the loss");
+        store.fail_always(None);
+        let lease = leases(&store).observe("p").await.unwrap().unwrap();
+        assert!(!lease.doc.released, "this node didn't release it");
     }
 }
