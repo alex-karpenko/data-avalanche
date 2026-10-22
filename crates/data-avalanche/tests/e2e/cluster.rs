@@ -13,6 +13,11 @@ use data_avalanche_testkit::require_it;
 
 use crate::harness::{E2e, Options, Proc, eventually, free_udp_port};
 
+/// The E2E config's `lease_duration` (harness.rs: `lease_duration: 6s`).
+const LEASE: Duration = Duration::from_secs(6);
+/// The `commitInfo.operation` of a table's creation commit.
+const CREATE_OP: &str = "CREATE TABLE";
+
 const ITEMS: &str = "CREATE TABLE items (id bigint PRIMARY KEY, doc text);";
 
 /// The test's pipeline and two more over the same table, each into a lake of its own.
@@ -181,19 +186,32 @@ impl Cluster {
         }
     }
 
-    /// The lake's `items` holds the source's rows, and its owner epochs never went back.
+    /// Every lake's `items` holds the source's rows, and its owner epochs never went back.
     async fn landed(&self) {
-        self.e.converged("items").await;
-        let epochs: Vec<u64> = self
-            .e
-            .log("items")
-            .await
-            .iter()
-            .flatten()
-            .filter_map(|a| a["commitInfo"]["data-avalanche.owner_epoch"].as_u64())
-            .collect();
-        assert!(!epochs.is_empty(), "the commits carry their epoch");
-        assert!(epochs.is_sorted(), "an epoch went back: {epochs:?}");
+        for lake in ["lake", "lake_b", "lake_c"] {
+            self.e
+                .converged_in(lake, "items", Duration::from_secs(60))
+                .await;
+            let log = self.e.log_in(lake, "items").await;
+            assert!(!log.is_empty(), "{lake}: no commits");
+            let mut epochs = Vec::new();
+            for actions in &log {
+                let info = actions
+                    .iter()
+                    .find(|a| a.get("commitInfo").is_some())
+                    .expect("a commit has its commitInfo");
+                match info["commitInfo"]["data-avalanche.owner_epoch"].as_u64() {
+                    Some(e) => epochs.push(e),
+                    // CREATE_OP is the table's creation: it carries no epoch.
+                    None => assert_eq!(
+                        info["commitInfo"]["operation"], CREATE_OP,
+                        "{lake}: a commit without an epoch: {info}"
+                    ),
+                }
+            }
+            assert!(!epochs.is_empty(), "{lake}: the commits carry their epoch");
+            assert!(epochs.is_sorted(), "{lake}: an epoch went back: {epochs:?}");
+        }
     }
 
     async fn stop(mut self) {
@@ -223,6 +241,13 @@ async fn a_killed_nodes_pipelines_are_taken_over() {
     let i = c.index(&victim);
     let t = Instant::now();
     assert!(!c.nodes[i].proc.take().unwrap().kill().await.success());
+    // The victim is dead: each lease it held has its last renewal now.
+    let mut last = BTreeMap::new();
+    for (id, (holder, _)) in &before {
+        if *holder == victim {
+            last.insert(id.clone(), c.e.lease_of(id).await.expect("a lease").doc);
+        }
+    }
     c.e.exec("INSERT INTO items VALUES (2, 'b')").await;
     c.settled().await;
     let took = t.elapsed();
@@ -236,6 +261,14 @@ async fn a_killed_nodes_pipelines_are_taken_over() {
         }
     }
     assert_eq!(after[&c.e.test].1, epoch + 1);
+    for (id, was) in &last {
+        let now = c.e.lease_of(id).await.expect("a lease").doc;
+        let waited = (now.acquired_at - was.renewed_at).to_std().expect("after");
+        assert!(
+            waited >= LEASE,
+            "{id}: taken over {waited:?} after the last renewal"
+        );
+    }
     assert!(
         took >= Duration::from_secs(6),
         "{took:?}: before the lease ran out"
@@ -253,11 +286,26 @@ async fn a_rolling_restart_hands_off_and_loses_nothing() {
     c.start_all().await;
     for (i, row) in (0..3).zip(1..) {
         let name = c.nodes[i].name.clone();
+        let held: Vec<(String, u64)> = c
+            .holders()
+            .await
+            .into_iter()
+            .filter(|(_, (h, _))| *h == name)
+            .map(|(id, (_, e))| (id, e))
+            .collect();
         let t = Instant::now();
         assert!(
             c.nodes[i].proc.take().unwrap().terminate().await.success(),
             "{name}"
         );
+        // Right after the exit: each lease it held is released or taken at a higher epoch.
+        for (id, epoch) in &held {
+            let l = c.e.lease_of(id).await.expect("a lease").doc;
+            assert!(
+                l.released || (l.holder_node_id != name && l.owner_epoch > *epoch),
+                "{name} left {id} neither released nor handed off: {l:?}"
+            );
+        }
         c.settled().await;
         let took = t.elapsed();
         assert!(
@@ -290,6 +338,12 @@ async fn a_partition_moves_no_pipeline() {
         .unwrap()
         .metric("data_avalanche_cluster_members 2")
         .await;
+    c.nodes[1]
+        .proc
+        .as_ref()
+        .unwrap()
+        .metric("data_avalanche_cluster_members 2")
+        .await;
     c.e.exec("INSERT INTO items VALUES (1, 'a')").await;
     let t = Instant::now();
     while t.elapsed() < Duration::from_secs(15) {
@@ -308,10 +362,10 @@ async fn a_partition_moves_no_pipeline() {
     c.stop().await;
 }
 
-/// The holder of the test's pipeline stops for 15 s (SIGSTOP), past its lease: another node
-/// takes it at the next epoch while it is frozen. Back (SIGCONT), the paused node finds its
-/// lease lost and its commits fenced; nothing it wrote goes behind the new owner's epoch, and
-/// it rejoins.
+/// The holder of the test's pipeline stops (SIGSTOP) until its pipelines were taken over, past
+/// their leases, and the rows converged. Back (SIGCONT), the paused node finds its lease lost
+/// (its renewer ends as `lost`) and its commits fenced; nothing it wrote goes behind the new
+/// owner's epoch, and it rejoins.
 #[tokio::test]
 async fn a_paused_holder_loses_its_pipelines_and_rejoins() {
     require_it!();
@@ -319,18 +373,23 @@ async fn a_paused_holder_loses_its_pipelines_and_rejoins() {
     c.start_all().await;
     c.e.exec("INSERT INTO items VALUES (1, 'a')").await;
     c.landed().await;
-    let (victim, epoch) = c.holders().await[&c.e.test].clone();
+    let held = c.holders().await;
+    let (victim, _) = held[&c.e.test].clone();
+    let held: Vec<(String, u64)> = held
+        .into_iter()
+        .filter(|(_, (h, _))| *h == victim)
+        .map(|(id, (_, e))| (id, e))
+        .collect();
     let i = c.index(&victim);
     c.nodes[i].proc.as_ref().unwrap().signal("STOP");
     c.e.exec("INSERT INTO items VALUES (2, 'b')").await;
     eventually(
-        "taken over while paused",
+        "every pipeline taken over while paused",
         Duration::from_secs(30),
         async || {
-            c.holders()
-                .await
-                .get(&c.e.test)
-                .is_some_and(|(_, e)| *e > epoch)
+            let now = c.holders().await;
+            held.iter()
+                .all(|(id, e)| now.get(id).is_some_and(|(_, ne)| ne > e))
         },
     )
     .await;
@@ -339,8 +398,25 @@ async fn a_paused_holder_loses_its_pipelines_and_rejoins() {
     // busy-slot retry after that, at most a backoff step (60 s) later (`Postgres_Slot…` D-15.5).
     c.e.converged_within("items", Duration::from_secs(150))
         .await;
-    tokio::time::sleep(Duration::from_secs(5)).await;
     c.nodes[i].proc.as_ref().unwrap().signal("CONT");
+    let test = format!("pipeline=\"{}\"", c.e.test);
+    let proc = c.nodes[i].proc.as_ref().unwrap();
+    eventually(
+        "the paused node's renewer ended as lost",
+        Duration::from_secs(60),
+        async || {
+            proc.metrics().await.lines().any(|l| {
+                l.starts_with("data_avalanche_lease_renew_failures_total{")
+                    && l.contains(&test)
+                    && l.contains("class=\"lost\"")
+                    && l.rsplit(' ')
+                        .next()
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .is_some_and(|v| v >= 1.0)
+            })
+        },
+    )
+    .await;
     c.e.exec("INSERT INTO items VALUES (3, 'c')").await;
     c.settled().await;
     c.landed().await;

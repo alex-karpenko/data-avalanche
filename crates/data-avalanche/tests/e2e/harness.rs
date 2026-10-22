@@ -338,13 +338,18 @@ pipelines:
 
     /// A reader of the pipeline's Delta tables on RustFS.
     pub fn lake(&self) -> DeltaSink {
+        self.lake_in("lake")
+    }
+
+    /// [`Self::lake`] of the pipeline whose sink prefix ends in `lake` (`lake`, `lake_b`).
+    pub fn lake_in(&self, lake: &str) -> DeltaSink {
         let opt = |k: &str, v: &str| (k.to_owned(), v.to_owned());
         DeltaSink::new(DeltaSinkConfig {
             pipeline_id: self.test.clone(),
             location: DeltaLocation::Bucket {
                 backend: Backend::S3,
                 bucket: TEST_BUCKET.into(),
-                prefix: self.lake_prefix(),
+                prefix: format!("{}/{lake}", self.prefix),
                 options: vec![
                     opt("endpoint", RUSTFS_URL),
                     opt("allow_http", "true"),
@@ -368,7 +373,17 @@ pipelines:
 
     /// The table's `id`s in the lake, in key order.
     pub async fn ids(&self, table: &str) -> Vec<i64> {
-        match self.content(table).await {
+        self.ids_in("lake", table).await
+    }
+
+    /// [`Self::ids`] in the lake `lake`.
+    pub async fn ids_in(&self, lake: &str, table: &str) -> Vec<i64> {
+        let content = self
+            .lake_in(lake)
+            .content(&self.table(table))
+            .await
+            .expect("the lake reads");
+        match content {
             None => vec![],
             Some(b) => {
                 let ids = b
@@ -456,9 +471,17 @@ pipelines:
 
     /// [`Self::converged`], waiting at most `within`.
     pub async fn converged_within(&self, table: &str, within: Duration) {
+        self.converged_in("lake", table, within).await;
+    }
+
+    /// [`Self::converged_within`] in the lake `lake`.
+    pub async fn converged_in(&self, lake: &str, table: &str, within: Duration) {
         let want = self.source_ids(table).await;
-        let what = format!("{table} has the source's {} rows", want.len());
-        eventually(&what, within, async || self.ids(table).await == want).await;
+        let what = format!("{lake}/{table} has the source's {} rows", want.len());
+        eventually(&what, within, async || {
+            self.ids_in(lake, table).await == want
+        })
+        .await;
     }
 
     /// Whether the source streams to the pipeline now: PostgreSQL's slot has a walsender,
@@ -660,8 +683,20 @@ pipelines:
 
     /// The Delta table's commits in version order, each its actions.
     pub async fn log(&self, table: &str) -> Vec<Vec<serde_json::Value>> {
+        self.log_in("lake", table).await
+    }
+
+    /// [`Self::log`] in the lake `lake`.
+    pub async fn log_in(&self, lake: &str, table: &str) -> Vec<Vec<serde_json::Value>> {
         let store = stores::rustfs();
-        let log = object_store::path::Path::from(format!("{}/_delta_log", self.table_root(table)));
+        let root = table_root(
+            TEST_BUCKET,
+            &format!("{}/{lake}", self.prefix),
+            &self.schema,
+            table,
+        )
+        .root;
+        let log = object_store::path::Path::from(format!("{root}/_delta_log"));
         let mut files: Vec<_> = store
             .list(Some(&log))
             .try_collect::<Vec<_>>()
