@@ -77,6 +77,11 @@ impl Accumulator {
         self.policy = policy;
     }
 
+    /// The lineage the next flushes write (a renamed pipeline, config §12.3).
+    pub fn set_lineage(&mut self, lineage: Lineage) {
+        self.lineage = lineage;
+    }
+
     /// The transaction limits (reloadable, like the flush policy). The default never splits.
     pub fn set_txn_limits(&mut self, limits: TxnLimits) {
         self.limits = limits;

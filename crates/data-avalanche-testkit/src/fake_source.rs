@@ -253,6 +253,7 @@ struct Db {
     rescans: usize,
     in_flights: usize,
     readers_ended: usize,
+    reconfigures: usize,
     fetches: BTreeMap<TableRef, usize>,
     prepares: Vec<Option<Checkpoint>>,
 }
@@ -306,6 +307,7 @@ impl FakeSource {
             rescans: 0,
             in_flights: 0,
             readers_ended: 0,
+            reconfigures: 0,
             fetches: BTreeMap::new(),
             prepares: vec![],
         };
@@ -581,6 +583,11 @@ impl FakeSource {
     /// queued for `open_stream`.
     pub fn readers_ended(&self) -> usize {
         self.db().readers_ended
+    }
+
+    /// `reconfigure` calls so far: a reload's settings handed to the running source.
+    pub fn reconfigures(&self) -> usize {
+        self.db().reconfigures
     }
 
     /// `fetch_rows` calls for `table` so far, failed ones included.
@@ -1161,6 +1168,10 @@ impl SourceConnector for FakeSource {
 
     async fn teardown(&self) -> Result<(), SourceError> {
         Ok(())
+    }
+
+    fn reconfigure(&self, _: &dyn std::any::Any) {
+        self.db().reconfigures += 1;
     }
 }
 

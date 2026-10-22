@@ -131,6 +131,21 @@ impl Settings {
         }
     }
 
+    /// Takes `p`'s reloadable fields (config §1.2, class R); the others stay as built.
+    pub fn reconfigure(&mut self, p: &Pipeline) {
+        let next = Self::new(p);
+        self.lineage.pipeline = next.lineage.pipeline;
+        self.flush = next.flush;
+        self.limits = next.limits;
+        self.buffer_rows = next.buffer_rows;
+        self.parallelism = next.parallelism;
+        self.chunk_size = next.chunk_size;
+        self.heartbeat = next.heartbeat;
+        self.max_wal_lag_bytes = next.max_wal_lag_bytes;
+        self.rescan_interval = next.rescan_interval;
+        self.evolution = next.evolution;
+    }
+
     /// The table's key in the `tables` maps: `schema.table` for PostgreSQL, the bare name for
     /// MySQL (V-064).
     fn key(&self, t: &TableRef) -> String {

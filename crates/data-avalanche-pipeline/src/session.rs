@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
+use data_avalanche_config::Pipeline;
 use data_avalanche_core::{
     CdcEvent, ChangeStream, ColumnValue, HaltReason, Op, RescanReport, RetainedLog, Row,
     SchemaHint, ServerIdentity, Sink, SourceConnector, SourceError, SourcePosition, SourceSeq,
@@ -103,6 +104,12 @@ impl Core {
         }
     }
 
+    /// A reload's settings (config §1.2, class R): the worker's, and the source's.
+    pub fn reconfigure(&mut self, p: &Pipeline) {
+        self.settings.reconfigure(p);
+        self.source.reconfigure(p);
+    }
+
     pub fn evolver(&self) -> Evolver<'_> {
         Evolver {
             source: &*self.source,
@@ -122,6 +129,24 @@ pub(crate) enum End {
     Exit(Exit),
     /// The source failed: a transient failure reopens the stream, a lost position recovers it.
     Source(SourceError),
+}
+
+/// `buffer_capacity_rows` as semaphore permits.
+fn buffer_permits(rows: u64) -> usize {
+    usize::try_from(rows)
+        .unwrap_or(usize::MAX)
+        .min(Semaphore::MAX_PERMITS)
+}
+
+/// The heartbeat's and the rescans' timers (none with rescans off), each first due one interval
+/// from now.
+fn timers(s: &Settings) -> (tokio::time::Interval, Option<tokio::time::Interval>) {
+    let every = |every| {
+        let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        timer
+    };
+    (every(s.heartbeat), s.rescan_interval.map(every))
 }
 
 fn protocol(detail: String) -> WorkerError {
@@ -184,6 +209,8 @@ pub(crate) struct Session<'c> {
     /// that doesn't answer holds up neither the stream nor a drain (DA-SRC-16).
     retained_read: JoinSet<Result<Option<RetainedLog>, SourceError>>,
     watchdog: Watchdog,
+    /// A reload changed the heartbeat or the rescan interval: the loop re-arms its timers.
+    retimed: bool,
 }
 
 impl<'c> Session<'c> {
@@ -262,9 +289,7 @@ impl<'c> Session<'c> {
             backoff: core.tuning.sink_backoff,
         };
         let writer = tokio::spawn(writer::run(ctx, jobs_rx, events_tx));
-        let rows = usize::try_from(core.settings.buffer_rows)
-            .unwrap_or(usize::MAX)
-            .min(Semaphore::MAX_PERMITS);
+        let rows = buffer_permits(core.settings.buffer_rows);
         core.update(|st| {
             st.phase = Phase::Streaming;
             st.checkpoint = Some(checkpoint.clone());
@@ -300,6 +325,7 @@ impl<'c> Session<'c> {
             paused: None,
             retained_read: JoinSet::new(),
             watchdog: Watchdog::default(),
+            retimed: false,
         }))
     }
 
@@ -355,16 +381,12 @@ impl<'c> Session<'c> {
     async fn event_loop(&mut self) -> Result<End, WorkerError> {
         let mut tick = tokio::time::interval(self.core.tuning.tick);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let every = self.core.settings.heartbeat;
-        let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
-        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut rescan = self.core.settings.rescan_interval.map(|every| {
-            let mut rescan = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
-            rescan.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            rescan
-        });
+        let (mut heartbeat, mut rescan) = timers(&self.core.settings);
         self.issue_reads();
         loop {
+            if std::mem::take(&mut self.retimed) {
+                (heartbeat, rescan) = timers(&self.core.settings);
+            }
             if self.dumped() {
                 self.flush()?;
                 if let Some(end) = self.until_durable().await? {
@@ -457,6 +479,25 @@ impl<'c> Session<'c> {
         }
     }
 
+    /// Takes a reload's settings in place. The buffer gets a semaphore of the new size: what is
+    /// handed on holds the old one's permits until it is durable, so for that while the buffer
+    /// may hold up to the old size's more; a flush waiting for room waits for at most the new
+    /// size, so it can't wait for ever.
+    fn reconfigure(&mut self, p: &Pipeline) {
+        self.core.reconfigure(p);
+        let s = &self.core.settings;
+        self.acc.set_policy(s.flush);
+        self.acc.set_txn_limits(s.limits);
+        self.acc.set_lineage(s.lineage.clone());
+        let rows = buffer_permits(s.buffer_rows);
+        self.permits = Arc::new(Semaphore::new(rows));
+        let cap = u32::try_from(rows).unwrap_or(u32::MAX);
+        for (_, need) in &mut self.queued {
+            *need = (*need).min(cap);
+        }
+        self.retimed = true;
+    }
+
     fn command(&mut self, cmd: Option<Command>) -> Result<(), WorkerError> {
         match cmd {
             Some(Command::Flush) => self.flush(),
@@ -467,6 +508,10 @@ impl<'c> Session<'c> {
             }
             Some(Command::Pause) => {
                 self.core.pause = true;
+                Ok(())
+            }
+            Some(Command::Reconfigure(p)) => {
+                self.reconfigure(&p);
                 Ok(())
             }
             Some(Command::Resume) => {
