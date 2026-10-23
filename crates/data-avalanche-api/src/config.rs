@@ -115,6 +115,7 @@ mod tests {
             metrics: Metrics::new(),
             ready: Arc::new(AtomicBool::new(true)),
             node,
+            auth: crate::test_support::open(),
         })
         .await;
 

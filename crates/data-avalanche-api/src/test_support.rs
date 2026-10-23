@@ -1,27 +1,38 @@
 //! Test-only helpers shared across `data-avalanche-api`'s unit tests: a client, the listener on a
-//! free port, and a lone node.
+//! free port, a lone node, and an identity provider with keys made at run time.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use axum::Json;
+use axum::extract::State;
+use axum::routing::get as get_route;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 use data_avalanche_cluster::{
     ClusterReconciler, ConfigCoordinator, ControllerDeps, ControllerSettings, CoordinatorDeps,
     Gossip, GossipKey, GossipSettings, LeaseTiming, NodeIdentity, NodeMeta, Parts, Phase,
     ReconcilerSettings, Udp, WorkerFactory,
 };
-use data_avalanche_config::{FingerprintKey, HostPort, Pipeline, ProcessEnv, load_str};
+use data_avalanche_config::{
+    ApiAuth, FingerprintKey, HostPort, Jwt, Pipeline, ProcessEnv, ResolvedConfig, load_str,
+};
 use data_avalanche_pipeline::{Backoff, Tuning};
 use data_avalanche_state::{ConfigGenerations, DocStore, Holder, Leases};
 use data_avalanche_storage::ObjectStoreVersioned;
 use data_avalanche_telemetry::Metrics;
+use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use object_store::memory::InMemory;
-use serde_json::Value;
+use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
+use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
 
-use crate::{Api, Node, bind, router};
+use crate::{Api, Auth, Node, bind, router};
 
 pub(crate) const CONFIG: &str = r#"
 config_version: 1
@@ -46,6 +57,27 @@ pipelines:
       prefix: shop
       delta: { checkpoint_interval: 20, timestamp_ntz_as: string, merge_memory_limit: 64MiB }
 "#;
+
+pub(crate) fn config() -> ResolvedConfig {
+    load_str(CONFIG, &ProcessEnv, &FingerprintKey::from_bytes([1; 32]))
+        .unwrap()
+        .config
+}
+
+/// `globals.api` of [`CONFIG`]: `auth: none`.
+pub(crate) fn open() -> Arc<Auth> {
+    Arc::new(Auth::new(&config().globals.api))
+}
+
+/// The routes' state before the node runs its generation: the `/v1` routes answer 503.
+pub(crate) fn api(auth: Arc<Auth>) -> Api {
+    Api {
+        metrics: Metrics::new(),
+        ready: Arc::new(AtomicBool::new(true)),
+        node: Arc::default(),
+        auth,
+    }
+}
 
 /// A plain HTTP/1.1 request: the status code, the headers, the body.
 pub(crate) async fn request(
@@ -194,4 +226,120 @@ pub(crate) async fn lone(file: PathBuf) -> Lone {
         _reconciler: reconciler,
         _gossip: gossip,
     }
+}
+
+/// An identity provider: ES256 keys made at run time, its JWKS at `/jwks` and its OIDC discovery
+/// document at `/.well-known/openid-configuration`, on a loopback port.
+pub(crate) struct Issuer {
+    pub url: String,
+    keys: Arc<Mutex<Vec<(String, KeyPair)>>>,
+    /// JWKS fetches so far.
+    pub fetches: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+struct Served {
+    url: String,
+    keys: Arc<Mutex<Vec<(String, KeyPair)>>>,
+    fetches: Arc<AtomicUsize>,
+}
+
+fn jwk(kid: &str, key: &KeyPair) -> Value {
+    // An uncompressed P-256 point: 0x04, then x and y.
+    let raw = key.public_key_raw();
+    json!({
+        "kty": "EC", "crv": "P-256", "use": "sig", "alg": "ES256", "kid": kid,
+        "x": URL_SAFE_NO_PAD.encode(&raw[1..33]),
+        "y": URL_SAFE_NO_PAD.encode(&raw[33..65]),
+    })
+}
+
+async fn jwks(State(s): State<Served>) -> Json<Value> {
+    s.fetches.fetch_add(1, Ordering::SeqCst);
+    let keys = s.keys.lock().unwrap();
+    Json(json!({ "keys": keys.iter().map(|(kid, k)| jwk(kid, k)).collect::<Vec<_>>() }))
+}
+
+async fn discovery(State(s): State<Served>) -> Json<Value> {
+    Json(json!({ "issuer": s.url, "jwks_uri": format!("{}/jwks", s.url) }))
+}
+
+impl Issuer {
+    /// Serves one key, `k1`.
+    pub async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let keys = Arc::new(Mutex::new(vec![]));
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let served = Served {
+            url: url.clone(),
+            keys: Arc::clone(&keys),
+            fetches: Arc::clone(&fetches),
+        };
+        let app = axum::Router::new()
+            .route("/jwks", get_route(jwks))
+            .route("/.well-known/openid-configuration", get_route(discovery))
+            .with_state(served);
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let issuer = Self { url, keys, fetches };
+        issuer.add_key("k1");
+        issuer
+    }
+
+    /// A key rotation: the JWKS serves one more key.
+    pub fn add_key(&self, kid: &str) {
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        self.keys.lock().unwrap().push((kid.to_owned(), key));
+    }
+
+    /// `globals.api.jwt` for this issuer, its tokens for audience `cdc`.
+    pub fn jwt(&self, roles_claim: &str) -> Jwt {
+        Jwt {
+            issuer: self.url.clone(),
+            audience: Some("cdc".into()),
+            jwks_url: format!("{}/jwks", self.url),
+            roles_claim: roles_claim.into(),
+        }
+    }
+
+    /// `globals.api` with `auth: jwt` for this issuer.
+    pub fn api(&self, roles_claim: &str) -> data_avalanche_config::Api {
+        let mut api = config().globals.api;
+        api.auth = ApiAuth::Jwt;
+        api.jwt = Some(self.jwt(roles_claim));
+        api
+    }
+
+    /// Claims this issuer's verifier takes, for `sub` alice, expiring in ten minutes.
+    pub fn claims(&self, roles: Value) -> Value {
+        let now = jsonwebtoken::get_current_timestamp();
+        json!({ "iss": self.url, "aud": "cdc", "sub": "alice", "exp": now + 600, "roles": roles })
+    }
+
+    /// `claims` signed with key `kid`.
+    pub fn sign(&self, kid: &str, claims: &Value) -> String {
+        let keys = self.keys.lock().unwrap();
+        let (_, key) = keys
+            .iter()
+            .find(|(k, _)| k == kid)
+            .expect("a key of this issuer");
+        sign_with(key, Some(kid), claims)
+    }
+
+    /// A token with `roles`, signed with `k1`.
+    pub fn token(&self, roles: Value) -> String {
+        self.sign("k1", &self.claims(roles))
+    }
+}
+
+/// `claims` signed with `key` (ES256).
+pub(crate) fn sign_with(key: &KeyPair, kid: Option<&str>, claims: &Value) -> String {
+    let mut header = Header::new(Algorithm::ES256);
+    header.kid = kid.map(str::to_owned);
+    jsonwebtoken::encode(
+        &header,
+        claims,
+        &EncodingKey::from_ec_der(&key.serialize_der()),
+    )
+    .unwrap()
 }

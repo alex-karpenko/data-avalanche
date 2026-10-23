@@ -82,6 +82,12 @@ clap = { version = "4.6.7", features = ["derive"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 # The management API (M9a, roadmap §2.1): TLS on the listener, on the workspace's rustls.
 tokio-rustls = { version = "0.26.5", default-features = false, features = ["aws_lc_rs", "tls12"] }
+# Its auth (config §6.3): JWT verification on aws-lc-rs, the JWKS and OIDC discovery fetched with
+# the reqwest object_store already builds, and basic auth's decode and constant-time compare.
+jsonwebtoken = { version = "=11.1.0", default-features = false, features = ["aws_lc_rs"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
+base64 = "0.22.1"
+subtle = "2.6.1"
 # The cluster (M8a, roadmap §2.1): the ring's hash (the anchor's `hash_algo: xxh3`); the SWIM
 # core the gossip drives (Q-M8-1, probe `prototypes/cluster-capability`) and its random source;
 # the host's addresses, for an unset `advertise_addr`.

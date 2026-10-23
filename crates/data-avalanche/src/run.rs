@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
-use data_avalanche_api::{Api, Node, ServeError, bind, router};
+use data_avalanche_api::{Api, Auth, Node, ServeError, bind, router};
 use data_avalanche_cluster::{
     ClusterReconciler, ConfigCoordinator, ControllerDeps, ControllerSettings, CoordinatorDeps,
     Gossip, GossipKey, GossipSettings, LeaseTiming, NodeIdentity, NodeMeta, Phase,
@@ -110,6 +110,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     let ready = Arc::new(AtomicBool::new(false));
     let node = Arc::new(OnceLock::new());
     let api = &first.config.globals.api;
+    let auth = Arc::new(Auth::new(api));
     let bound = bind(&api.address, api.tls.as_ref())
         .await
         .map_err(|e| match e {
@@ -122,6 +123,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
             metrics: metrics.clone(),
             ready: Arc::clone(&ready),
             node: Arc::clone(&node),
+            auth: Arc::clone(&auth),
         }),
         async {
             let _ = http_stopped.await;
@@ -133,6 +135,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     let joined = join(&buckets, &holder.node_id, &text, &first.config).await?;
     let config = joined.config;
     logger.apply(&config.globals.log);
+    auth.set(&config.globals.api);
     tracing::info!(
         node = %holder.node_id,
         incarnation = holder.incarnation,
@@ -199,7 +202,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     );
     // Each newer config generation, this node's reloads included (Clustering §9).
     let docs = Arc::clone(&buckets);
-    let log = Arc::clone(&logger);
+    let (log, reloaded_auth) = (Arc::clone(&logger), Arc::clone(&auth));
     let coordinator = Arc::new(ConfigCoordinator::start(
         config.clone(),
         joined.generation,
@@ -213,7 +216,10 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
             reloader: reconciler.reloader(),
             advertiser: gossip.advertiser(),
             metrics: metrics.clone(),
-            globals: Arc::new(move |g| log.apply(&g.log)),
+            globals: Arc::new(move |g| {
+                log.apply(&g.log);
+                reloaded_auth.set(&g.api);
+            }),
         },
         gossip.members(),
         c.lease_renewal_interval,

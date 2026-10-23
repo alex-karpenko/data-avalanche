@@ -50,7 +50,8 @@ pub struct CoordinatorDeps {
     pub reloader: Reloader,
     pub advertiser: Advertiser,
     pub metrics: Metrics,
-    /// What a generation's globals change outside the cluster: the binary's log filter.
+    /// What a generation's globals change outside the cluster: the binary's log filter and the
+    /// API's auth.
     pub globals: Arc<dyn Fn(&Globals) + Send + Sync>,
 }
 

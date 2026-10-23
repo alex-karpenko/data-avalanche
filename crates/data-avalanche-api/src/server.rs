@@ -227,6 +227,7 @@ mod tests {
             metrics: Metrics::new(),
             ready: Arc::new(AtomicBool::new(true)),
             node: Arc::new(OnceLock::new()),
+            auth: crate::test_support::open(),
         };
         tokio::spawn(bound.serve(router(api), std::future::pending()));
 
