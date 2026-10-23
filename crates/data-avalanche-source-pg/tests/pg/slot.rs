@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use data_avalanche_core::position::Lsn;
 use data_avalanche_core::{
-    Checkpoint, SnapshotReason, SourceError, SourcePosition, StartPlan, TableRef,
+    Checkpoint, SnapshotReason, SourceConnector, SourceError, SourcePosition, StartPlan, TableRef,
 };
 use data_avalanche_testkit::require_it;
 use tokio_postgres::Client;
@@ -136,6 +136,29 @@ async fn an_orphan_halts_by_default_and_is_adopted_on_request() {
     };
     assert!(at > before, "advanced past the orphan's old position");
     assert_eq!(confirmed(&a, &n).await, Some(at));
+    cleanup(&a, &n).await;
+}
+
+/// A reload's `slot_on_orphan` reaches the running connector: its next prepare adopts the slot
+/// the last one halted on.
+#[tokio::test]
+async fn a_reloaded_orphan_policy_takes_the_next_prepare() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(&a, "slot_orphan_reload", DDL).await;
+    a.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'pgoutput')",
+        &[&n.slot],
+    )
+    .await
+    .unwrap();
+    let tables = [n.table("a")];
+    let c = connector(&pipeline(&n, &["*"], "", ""));
+    permanent(c.prepare(None, &tables).await.unwrap_err(), "orphan");
+    let reloaded = pipeline(&n, &["*"], "", ", slot_on_orphan: adopt_resnapshot");
+    c.reconfigure(&reloaded);
+    let p = c.prepare(None, &tables).await.unwrap();
+    from(&p.plan, SnapshotReason::AdoptedOrphan);
     cleanup(&a, &n).await;
 }
 

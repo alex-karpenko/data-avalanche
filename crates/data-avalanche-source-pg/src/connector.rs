@@ -1,10 +1,13 @@
 //! `PgConnector`: the PostgreSQL source of one pipeline.
 
+use std::any::Any;
 use std::collections::BTreeMap;
+use std::sync::PoisonError;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use data_avalanche_config::{
-    Pipeline, Postgres, SourceType, check_table_set, check_unbounded_numeric,
+    Pipeline, Postgres, SlotOnOrphan, SourceType, Tables, check_table_set, check_unbounded_numeric,
 };
 use data_avalanche_core::{
     ChangeStream, Checkpoint, Chunk, HaltReason, InFlightTxn, KeysetCursor, Preflight, Prepared,
@@ -21,15 +24,44 @@ use crate::types::TypeCatalog;
 /// The oldest server the source supports (P-8).
 pub const MIN_SERVER_VERSION: i32 = 140_000;
 
+/// The settings a reload changes while the connector runs (config §1.2, class R).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Live {
+    /// The replication connection's status interval, from the next stream.
+    pub heartbeat: Duration,
+    /// From the next prepare.
+    pub slot_on_orphan: SlotOnOrphan,
+    /// At the teardown.
+    pub auto_cleanup: bool,
+    /// `tables.include` and `tables.exclude`, from the next resolve: in place only while the
+    /// table set they resolve to is the same (the pipeline restarts otherwise).
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+}
+
+impl Live {
+    fn of(pg: &Postgres, tables: &Tables) -> Self {
+        Self {
+            heartbeat: pg.heartbeat,
+            slot_on_orphan: pg.slot_on_orphan,
+            auto_cleanup: pg.auto_cleanup,
+            include: tables.include.clone(),
+            exclude: tables.exclude.clone(),
+        }
+    }
+}
+
 /// The PostgreSQL source of one pipeline (roadmap §3.6). Built from the resolved pipeline
 /// configuration; connections open on first use.
 #[derive(Debug)]
 pub struct PgConnector {
     pub(crate) pipeline: Pipeline,
+    /// As built: a reload's settings are in `live`.
     pub(crate) pg: Postgres,
     pub(crate) conn: Connector,
     /// `pg_type` rows fetched so far.
     pub(crate) types: Mutex<TypeCatalog>,
+    live: std::sync::Mutex<Live>,
 }
 
 impl PgConnector {
@@ -47,10 +79,19 @@ impl PgConnector {
         };
         Ok(Self {
             pipeline: pipeline.clone(),
+            live: std::sync::Mutex::new(Live::of(&pg, &pipeline.tables)),
             pg,
             conn: Connector::new(source)?,
             types: Mutex::new(TypeCatalog::new()),
         })
+    }
+
+    /// The reloadable settings in force.
+    pub(crate) fn live(&self) -> Live {
+        self.live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// The pipeline-level start checks (config §11.2, `Schema_Change…` §9): the server is
@@ -168,8 +209,8 @@ impl PgConnector {
             .conn
             .command("list tables", catalog::relations(&client))
             .await?;
-        let t = &self.pipeline.tables;
-        let selection = catalog::select(&t.include, &t.exclude, &relations);
+        let live = self.live();
+        let selection = catalog::select(&live.include, &live.exclude, &relations);
         let oids: Vec<u32> = selection.tables.iter().map(|(r, _)| r.oid).collect();
         let mut schemas = self.schemas(&oids).await?;
         let mut out = ResolvedTables {
@@ -328,10 +369,22 @@ impl SourceConnector for PgConnector {
     async fn teardown(&self) -> Result<(), SourceError> {
         PgConnector::teardown(self).await
     }
+
+    fn reconfigure(&self, pipeline: &dyn Any) {
+        if let Some(p) = pipeline.downcast_ref::<Pipeline>()
+            && let Some(pg) = p.source.postgres.as_ref()
+        {
+            *self.live.lock().unwrap_or_else(PoisonError::into_inner) = Live::of(pg, &p.tables);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use data_avalanche_config::SlotOnOrphan;
+
     use super::*;
     use crate::test_support::pipeline;
 
@@ -352,5 +405,48 @@ mod tests {
             e,
             SourceError::Permanent("pipeline p: the source isn't PostgreSQL".into())
         );
+    }
+
+    /// A reload's heartbeat, orphan policy, cleanup and table patterns reach the running
+    /// connector; the slot, restart-only, stays, and what isn't a pipeline is ignored.
+    #[test]
+    fn a_reload_reaches_the_reloadable_settings() {
+        let p = pipeline("public.t");
+        let c = PgConnector::new(&p).unwrap();
+        let mut next = p.clone();
+        let pg = next.source.postgres.as_mut().unwrap();
+        pg.heartbeat = Duration::from_secs(7);
+        pg.slot_on_orphan = SlotOnOrphan::AdoptResnapshot;
+        pg.auto_cleanup = true;
+        pg.slot = "another_slot".into();
+        next.tables.include = vec!["public.t".into(), "public.u".into()];
+        next.tables.exclude = vec!["public.v".into()];
+        c.reconfigure(&next);
+        let live = Live {
+            heartbeat: Duration::from_secs(7),
+            slot_on_orphan: SlotOnOrphan::AdoptResnapshot,
+            auto_cleanup: true,
+            include: vec!["public.t".into(), "public.u".into()],
+            exclude: vec!["public.v".into()],
+        };
+        assert_eq!(c.live(), live);
+        assert_eq!(c.pg.slot, "p_slot");
+        c.reconfigure(&next.source);
+        assert_eq!(c.live(), live, "a source block isn't a pipeline");
+    }
+
+    /// A teardown after a reload turned `auto_cleanup` off keeps the slot: it doesn't even
+    /// connect (the server here doesn't answer).
+    #[tokio::test]
+    async fn a_teardown_after_a_reload_takes_its_auto_cleanup() {
+        let mut p = pipeline("public.t");
+        p.source.port = 1;
+        p.source.postgres.as_mut().unwrap().auto_cleanup = true;
+        let c = PgConnector::new(&p).unwrap();
+        assert!(c.teardown().await.is_err(), "it connects to clean up");
+        let mut next = p.clone();
+        next.source.postgres.as_mut().unwrap().auto_cleanup = false;
+        c.reconfigure(&next);
+        c.teardown().await.unwrap();
     }
 }

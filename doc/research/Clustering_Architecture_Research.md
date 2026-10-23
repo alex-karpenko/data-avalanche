@@ -1,7 +1,7 @@
 ---
 title: Clustering Architecture Research
 status: Research / Design proposal (input for further elaboration)
-updated: 2026-10-21
+updated: 2026-10-22
 domain: Architecture / Distributed Systems
 tags: [clustering, gossip, swim, memberlist, consistent-hashing, lease, split-brain, rebalancing, config-propagation]
 closes_or_advances: [G-8, G-9, G-2, G-17, G-23, G-36, "OQ-CL1", "OQ-CL3", "OQ-CL4", "OQ-API3", "OQ-P3", "5.1", "5.2"]
@@ -708,6 +708,20 @@ request to the owner of X; it publishes the generation and every owner reconcile
 strictly simpler than proxy/redirect/broadcast-of-the-payload and avoids the "who is the owner *right
 now*" race during a reload.
 
+**As built (M8b, `doc/v1.0/M8b-config-generations.md` D-M8b.5…11):**
+- Step 5's poll runs every `lease_renewal_interval`; a member's gossiped `config_generation` above
+  the node's applied one makes it read `generation.json` at once.
+- Step 3's CAS is retried up to 5 times: a lost race, or an outcome the store can't tell, re-reads
+  the pointer, adopts the newer generation, and checks the file against it again.
+- The reload answers 202 `{generation}`, 200 `{generation, unchanged: true}` when the file is the
+  generation's text and resolves the same, 422 with the validation report (invalid, or V-061),
+  409 after the retries, and 503 when `globals.state` fails or the node is stopping. The same text
+  is published again when it resolves differently on the node (a rotated secret, config §12.1), so
+  every node resolves it anew.
+- `GET /v1/config/status` answers `{generation, applied, nodes, converged}` from the gossip: no
+  node calls another.
+- A node stops its coordinator before it leaves, so no generation is adopted during the leave.
+
 ### 9.3 Cold-start precedence (the k8s ConfigMap-lag footgun)
 A node's **mounted file is its input**; the **cloud generation pointer is the distributed runtime
 truth.** On start, a node loads its file, derives a candidate config, then checks
@@ -734,6 +748,12 @@ runs the existing §12 reconcile, which already maps each changed field to R (ap
 (restart pipeline) / PROC (reject, needs process restart). PROC changes that cannot be hot-applied
 are rejected at validation time on worker A *before* a generation is ever published, so the cluster
 never adopts a generation that some nodes cannot apply.
+
+As built (M8b): "some nodes cannot apply" still happens when a node resolves the text differently
+(a `${VAR}` it lacks, a per-node value). Such a node logs the refusal at `ERROR` once per
+generation, keeps running its own, and tries again at each poll, and the status shows the cluster
+not converged. A node whose own file differs from the generation in a per-node key is warned at
+startup (DA-OPS-8), since a reload from it would be refused.
 
 ---
 

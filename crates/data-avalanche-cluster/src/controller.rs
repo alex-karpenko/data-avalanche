@@ -4,21 +4,22 @@
 //! `lease_renewal_interval` (Q-M6b-2). A worker that ends with an error is rerun, stopped for the
 //! lease, or left in `ERROR` (Q-M6b-3).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Debug;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use data_avalanche_config::Pipeline;
-use data_avalanche_core::{Sink, SourceConnector};
+use data_avalanche_core::{Sink, SourceConnector, SourceError};
 use data_avalanche_pipeline::{
-    Backoff, Command, Exit, Hooks, Phase, PipelineWorker, Recovery, Tuning, WorkerDeps,
-    WorkerError, WorkerHandle, WorkerStatus,
+    Backoff, Command, CommitGuard, Exit, Hooks, Phase, PipelineWorker, Recovery, Tuning,
+    WorkerDeps, WorkerError, WorkerHandle, WorkerStatus,
 };
 use data_avalanche_state::{DesiredState, Holder, Leases, PipelineDocs};
+use data_avalanche_storage::ObjectVersion;
 use data_avalanche_telemetry::{Metrics, PipelineLabels, PipelineMetrics, PipelineStatus, Totals};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 
@@ -43,6 +44,24 @@ pub trait WorkerFactory: Send + Sync + Debug {
     /// # Errors
     /// The parts can't be built from the config: the pipeline goes to `ERROR`.
     fn build(&self, pipeline: &Pipeline) -> Result<Parts, String>;
+}
+
+/// A reload's change to one pipeline (config §12.3), for its controller.
+#[derive(Debug, Clone)]
+pub enum Update {
+    /// Only reloadable fields changed (class R): the running worker takes them in place, and
+    /// every later run starts with them.
+    Reconfigure(Box<Pipeline>),
+    /// A restart-only field changed (class PR, §12.4): the running worker is discarded, and the
+    /// next one replays from the checkpoint with the new pipeline and its state documents, under
+    /// the same lease. A pipeline in `ERROR` runs again, the new config may be the fix; the
+    /// desired state stands, so a paused or stopped pipeline stays so.
+    Restart(Box<Pipeline>, PipelineDocs),
+    /// Gone from the config: the worker drains, what the source created for the pipeline goes
+    /// (`auto_cleanup`), the lease is released, and the controller ends.
+    Remove,
+    /// `globals.cluster.drain_timeout`, reloaded.
+    DrainTimeout(Duration),
 }
 
 /// What the reconciler wants of a controller.
@@ -139,6 +158,45 @@ pub struct PipelineController {
     starts: Arc<Semaphore>,
     handoffs: Arc<Semaphore>,
     status: watch::Sender<ControllerStatus>,
+    /// A reload's updates, and the sender [`Self::updater`] hands out: it is kept here, so the
+    /// channel never closes.
+    updates: mpsc::UnboundedReceiver<Update>,
+    updater: mpsc::UnboundedSender<Update>,
+    /// The removed pipelines this one takes the place of: their leases are let go of before
+    /// this one's is first claimed ([`Self::following`]).
+    following: Following,
+}
+
+/// The ids of the removed pipelines a pipeline takes the place of (config §9.1: an `id` change
+/// is delete, then recreate), shared by its reconciler and its controller. The controller clears
+/// it once their leases are let go of, the reconciler drops an id a later generation adds again,
+/// and a controller started again after a panic waits only for what is left.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Following(Arc<Mutex<BTreeSet<String>>>);
+
+impl Following {
+    pub(crate) fn new(ids: impl IntoIterator<Item = String>) -> Self {
+        Self(Arc::new(Mutex::new(ids.into_iter().collect())))
+    }
+
+    /// The ids, as of now.
+    pub(crate) fn ids(&self) -> Vec<String> {
+        self.lock().iter().cloned().collect()
+    }
+
+    fn clear(&self) {
+        self.lock().clear();
+    }
+
+    /// Ends the wait on `id`: a followed id that a later generation adds again names another
+    /// pipeline, the one this pipeline took the place of having been removed in an earlier one.
+    pub(crate) fn forget(&self, id: &str) {
+        self.lock().remove(id);
+    }
+
+    fn lock(&self) -> MutexGuard<'_, BTreeSet<String>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// Why the owned phase ended.
@@ -152,6 +210,18 @@ enum Left {
     Released,
     /// The target channel closed: the process is shutting down.
     Shutdown,
+    /// A reload removed the pipeline: it is let go of for good.
+    Removed,
+}
+
+/// How a [`PipelineController::follow`] ended.
+enum Followed {
+    /// Every followed lease is let go of: the lease is claimed.
+    LetGo,
+    /// The target became "don't own".
+    DontOwn,
+    /// The target closed, or a reload removed the pipeline.
+    End,
 }
 
 /// A random wait in `[0, max)`.
@@ -175,6 +245,16 @@ enum Event {
     HandOff(OwnedSemaphorePermit),
     Due,
     Poll,
+    Update(Update),
+}
+
+/// A pipeline's series labels.
+fn labels(p: &Pipeline) -> PipelineLabels {
+    PipelineLabels {
+        pipeline: p.name.clone(),
+        source_host: p.source.host.clone(),
+        source_db: p.source.db.clone(),
+    }
 }
 
 /// A running worker.
@@ -235,15 +315,11 @@ impl PipelineController {
         deps: &ControllerDeps,
         status: watch::Sender<ControllerStatus>,
     ) -> Self {
-        let labels = PipelineLabels {
-            pipeline: pipeline.name.clone(),
-            source_host: pipeline.source.host.clone(),
-            source_db: pipeline.source.db.clone(),
-        };
         let metrics = Arc::new(
             deps.metrics
-                .pipeline(labels, pipeline.sink.metrics.per_table),
+                .pipeline(labels(&pipeline), pipeline.sink.metrics.per_table),
         );
+        let (updater, updates) = mpsc::unbounded_channel();
         Self {
             pipeline,
             docs,
@@ -256,11 +332,29 @@ impl PipelineController {
             starts: Arc::clone(&deps.starts),
             handoffs: Arc::clone(&deps.handoffs),
             status,
+            updates,
+            updater,
+            following: Following::default(),
         }
     }
 
-    /// Runs until the target channel closes; the lease is released on the way out.
-    pub async fn run(self, mut target: watch::Receiver<Target>) {
+    /// A pipeline that takes the place of the removed pipelines `ids`, in the same reload: a
+    /// changed `id` that keeps the slot, the publication, the sink or the state (config §9.1,
+    /// delete then recreate). Its lease is first claimed once theirs are let go of.
+    #[must_use]
+    pub(crate) fn following(mut self, following: Following) -> Self {
+        self.following = following;
+        self
+    }
+
+    /// Where a reload's updates for this controller go.
+    pub fn updater(&self) -> mpsc::UnboundedSender<Update> {
+        self.updater.clone()
+    }
+
+    /// Runs until the target channel closes, or until a reload removes the pipeline; the lease
+    /// is released on the way out.
+    pub async fn run(mut self, mut target: watch::Receiver<Target>) {
         let mut claim = Claim::new(
             self.leases.clone(),
             &self.pipeline.id,
@@ -270,10 +364,18 @@ impl PipelineController {
         loop {
             if *target.borrow_and_update() == Target::DontOwn {
                 self.standby(None);
-                if target.changed().await.is_err() {
-                    return;
+                tokio::select! {
+                    r = target.changed() => if r.is_err() { return },
+                    Some(u) = self.updates.recv() => if self.take(u) { return },
                 }
                 continue;
+            }
+            if !self.following.ids().is_empty() {
+                match self.follow(&mut target).await {
+                    Followed::LetGo => {}
+                    Followed::DontOwn => continue,
+                    Followed::End => return,
+                }
             }
             let wait = match claim.step().await {
                 Ok(Claimed::Mine {
@@ -295,7 +397,7 @@ impl PipelineController {
                         Arc::clone(&self.metrics),
                     );
                     match self.owned(run, jumped, &mut target).await {
-                        Left::Shutdown => return,
+                        Left::Shutdown | Left::Removed => return,
                         Left::Fenced { current_epoch } => {
                             claim.at_least(current_epoch.saturating_add(1));
                             self.standby(None);
@@ -324,14 +426,124 @@ impl PipelineController {
             tokio::select! {
                 () = tokio::time::sleep_until(wait) => {}
                 r = target.changed() => if r.is_err() { return },
+                Some(u) = self.updates.recv() => if self.take(u) { return },
             }
         }
+    }
+
+    /// Waits until the lease of every pipeline this one takes the place of is let go of: absent,
+    /// released, or unchanged for a full `lease_duration` on this node's clock (its holder is
+    /// gone; the takeover's rule, Clustering §5.3). The leases are read every
+    /// `renewal_interval`, the ids as the reconciler leaves them; meanwhile the controller is on
+    /// standby, and takes its target and its updates. Past three lease durations the wait is
+    /// logged as a warning, once a lease duration.
+    async fn follow(&mut self, target: &mut watch::Receiver<Target>) -> Followed {
+        tracing::info!(
+            pipeline = %self.pipeline.name,
+            follows = ?self.following.ids(),
+            "pipeline waits for the removal of the pipelines it takes the place of"
+        );
+        self.standby(None);
+        let timing = self.settings.timing;
+        let started = Instant::now();
+        let mut warned: Option<Instant> = None;
+        // Each held lease's version, and when this node first read it.
+        let mut watched: BTreeMap<String, (ObjectVersion, Instant)> = BTreeMap::new();
+        loop {
+            // Each id still held, with its holder.
+            let mut held: BTreeMap<String, String> = BTreeMap::new();
+            for id in self.following.ids() {
+                match self.leases.observe(&id).await {
+                    Ok(None) => {}
+                    Ok(Some(lease)) if lease.doc.released => {}
+                    Ok(Some(lease)) => {
+                        let read = Instant::now();
+                        let since = match watched.get(&id) {
+                            Some((version, since)) if *version == lease.version => *since,
+                            _ => {
+                                watched.insert(id.clone(), (lease.version, read));
+                                read
+                            }
+                        };
+                        if read < since + timing.duration {
+                            held.insert(id, lease.doc.holder_node_id);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            pipeline = %self.pipeline.name,
+                            follows = %id,
+                            "the lease of a pipeline this one takes the place of unread: {e}"
+                        );
+                        held.insert(id, "unread".into());
+                    }
+                }
+            }
+            let now = Instant::now();
+            if !held.is_empty()
+                && now >= started + timing.duration * 3
+                && warned.is_none_or(|at| now >= at + timing.duration)
+            {
+                warned = Some(now);
+                tracing::warn!(
+                    pipeline = %self.pipeline.name,
+                    waiting_for = ?held,
+                    "pipeline still waits for the removal of the pipelines it takes the place of: their leases are held"
+                );
+            }
+            if held.is_empty() {
+                self.following.clear();
+                tracing::info!(
+                    pipeline = %self.pipeline.name,
+                    "the pipelines this one takes the place of let go: it claims its lease"
+                );
+                return Followed::LetGo;
+            }
+            tokio::select! {
+                () = tokio::time::sleep(timing.renewal_interval) => {}
+                r = target.changed() => {
+                    if r.is_err() {
+                        return Followed::End;
+                    }
+                    if *target.borrow() == Target::DontOwn {
+                        return Followed::DontOwn;
+                    }
+                }
+                Some(u) = self.updates.recv() => if self.take(u) { return Followed::End },
+            }
+        }
+    }
+
+    /// A reload's update while this node holds no lease for the pipeline: true when it removed
+    /// the pipeline.
+    fn take(&mut self, update: Update) -> bool {
+        match update {
+            Update::Reconfigure(p) => self.reconfigure(*p),
+            Update::Restart(p, docs) => {
+                self.reconfigure(*p);
+                self.docs = docs;
+            }
+            Update::Remove => {
+                self.metrics.forget();
+                tracing::info!(pipeline = %self.pipeline.name, "pipeline removed");
+                return true;
+            }
+            Update::DrainTimeout(d) => self.settings.drain_timeout = d,
+        }
+        false
+    }
+
+    /// The reloaded pipeline, for every later run; its series take a new name, or a new
+    /// `per_table`.
+    fn reconfigure(&mut self, p: Pipeline) {
+        self.metrics.relabel(labels(&p), p.sink.metrics.per_table);
+        self.pipeline = p;
     }
 
     /// Holds the lease and reconciles the worker until the lease is lost or let go.
     /// `jumped`: the term's epoch was raised past the lease's to clear a table's (DA-CLUS-14).
     async fn owned(
-        &self,
+        &mut self,
         run: LeaseRun,
         jumped: bool,
         target: &mut watch::Receiver<Target>,
@@ -341,7 +553,7 @@ impl PipelineController {
     }
 
     async fn reconcile(
-        &self,
+        &mut self,
         run: LeaseRun,
         jumped: bool,
         target: &mut watch::Receiver<Target>,
@@ -450,6 +662,7 @@ impl PipelineController {
                         }
                     }, if may_run && !want_start => Event::Due,
                     _ = poll.tick() => Event::Poll,
+                    Some(u) = self.updates.recv() => Event::Update(u),
                 }
             };
             match event {
@@ -580,6 +793,35 @@ impl PipelineController {
                         self.observe(w);
                     }
                 }
+                Event::Update(Update::Reconfigure(p)) => {
+                    self.reconfigure(*p);
+                    if let Some(w) = worker.as_ref() {
+                        let p = Box::new(self.pipeline.clone());
+                        let _ = w.handle.control.send(Command::Reconfigure(p)).await;
+                    }
+                }
+                Event::Update(Update::Restart(p, docs)) => {
+                    self.reconfigure(*p);
+                    self.docs = docs;
+                    // Discard and replay (§12.4): what the worker read past the durable
+                    // checkpoint is read again by the next one.
+                    if let Some(mut w) = worker.take() {
+                        w.task.abort();
+                        let _ = (&mut w.task).await;
+                        self.metrics.worker_ended();
+                    }
+                    tracing::info!(pipeline = %self.pipeline.name, "restarted for a reload");
+                    error = None;
+                    dumped = false;
+                    retry = None;
+                    failures = 0;
+                    desired = self.desired().await;
+                }
+                Event::Update(Update::Remove) => {
+                    self.remove(run, worker.take()).await;
+                    return Left::Removed;
+                }
+                Event::Update(Update::DrainTimeout(d)) => self.settings.drain_timeout = d,
             }
         }
     }
@@ -689,6 +931,71 @@ impl PipelineController {
             );
         }
         self.standby(None);
+    }
+
+    /// A pipeline gone from the config (§12.3): the worker drains, what the source created for
+    /// the pipeline goes, and the lease is released. A drain cut off, or a lease lost meanwhile,
+    /// leaves the source as it is: a cut-off worker may still hold it, a lost lease's holder runs
+    /// it.
+    async fn remove(&self, run: LeaseRun, worker: Option<Running>) {
+        let drained = match worker {
+            Some(w) => self.drain(w).await,
+            None => true,
+        };
+        if !drained {
+            let _ = run.stop().await;
+            tracing::warn!(
+                pipeline = %self.pipeline.name,
+                "removed with its drain cut off: the lease expires, and what the source created for the pipeline stays"
+            );
+        } else if self.teardown(&*run.guard).await {
+            self.give_back(run).await;
+        } else {
+            let _ = run.stop().await;
+            tracing::warn!(
+                pipeline = %self.pipeline.name,
+                "removed after its lease was lost: what the source created for the pipeline stays"
+            );
+        }
+        self.metrics.forget();
+        tracing::info!(pipeline = %self.pipeline.name, "pipeline removed");
+    }
+
+    /// The source's `teardown` (PostgreSQL's `auto_cleanup`: the slot and the publication),
+    /// tried again while the source is busy or doesn't answer, within the contended window: the
+    /// stream a drain closed may hold the slot a moment longer. The lease is checked before every
+    /// attempt: false when it was lost, the source then left as it is (its new holder runs it).
+    async fn teardown(&self, guard: &impl CommitGuard) -> bool {
+        let source = match self.factory.build(&self.pipeline) {
+            Ok(parts) => parts.source,
+            Err(e) => {
+                tracing::warn!(pipeline = %self.pipeline.name, "no source to clean up: {e}");
+                return true;
+            }
+        };
+        let since = Instant::now();
+        let mut attempt = 0;
+        loop {
+            if !guard.may_commit() {
+                return false;
+            }
+            match source.teardown().await {
+                Ok(()) => return true,
+                Err(SourceError::Transient(_) | SourceError::Contended(_))
+                    if since.elapsed() < self.settings.tuning.contended_window =>
+                {
+                    tokio::time::sleep(self.settings.restart.delay(attempt)).await;
+                    attempt = attempt.saturating_add(1);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        pipeline = %self.pipeline.name,
+                        "what the source created for the pipeline stays ({e}): remove it by hand"
+                    );
+                    return true;
+                }
+            }
+        }
     }
 
     async fn give_back(&self, run: LeaseRun) {
@@ -1340,5 +1647,342 @@ mod tests {
         n.target.send_replace(Target::Own);
         until(&mut n.status, "running", is(Actual::Running)).await;
         assert_eq!(n.status.borrow().owner_epoch, Some(2));
+    }
+
+    /// A reload's reloadable change reaches the running worker in place (config §1.2): the same
+    /// worker, the source told, and the series under the new name only.
+    #[tokio::test(start_paused = true)]
+    async fn a_reconfigure_reaches_the_running_worker() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a"]);
+        let mut n = node("n1", &store, &docs, &f);
+        until(&mut n.status, "running", is(Actual::Running)).await;
+        let mut renamed = pipeline();
+        renamed.name = "renamed".into();
+        n.updates
+            .send(Update::Reconfigure(Box::new(renamed)))
+            .unwrap();
+        eventually("the source takes it", || f.source.reconfigures() == 1).await;
+        f.source.commit(FakeTxn::new().insert(&t("a"), row(1)));
+        eventually("the row lands", || f.ids("a") == [1]).await;
+        assert_eq!(f.builds(), 1, "the same worker");
+        let text = n.metrics.encode();
+        assert!(!text.contains(r#"pipeline="p""#), "{text}");
+        assert!(
+            text.contains(r#"data_avalanche_pipeline_status{pipeline="renamed","#),
+            "{text}"
+        );
+    }
+
+    /// A restart-only change discards the worker and runs a new one from the checkpoint, under
+    /// the same lease.
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_reruns_the_worker_under_the_same_lease() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a"]);
+        let mut n = node("n1", &store, &docs, &f);
+        until(&mut n.status, "running", is(Actual::Running)).await;
+        n.updates
+            .send(Update::Restart(Box::new(pipeline()), docs.clone()))
+            .unwrap();
+        eventually("a new worker", || f.builds() == 2).await;
+        until(&mut n.status, "running again", is(Actual::Running)).await;
+        assert_eq!(n.status.borrow().owner_epoch, Some(1), "the same lease");
+        f.source.commit(FakeTxn::new().insert(&t("a"), row(1)));
+        eventually("the row lands", || f.ids("a") == [1]).await;
+    }
+
+    /// A restart runs a pipeline in `ERROR` again: the reloaded config may be the fix.
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_runs_a_pipeline_in_error_again() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a"]);
+        f.source.fail(
+            Method::Preflight,
+            SourceError::Permanent("no privilege".into()),
+        );
+        let mut n = node("n1", &store, &docs, &f);
+        until(&mut n.status, "error", |s| {
+            matches!(&s.actual, Some(Actual::Error { .. }))
+        })
+        .await;
+        n.updates
+            .send(Update::Restart(Box::new(pipeline()), docs.clone()))
+            .unwrap();
+        until(&mut n.status, "running", is(Actual::Running)).await;
+        assert_eq!(f.builds(), 2);
+    }
+
+    /// A restart doesn't resume a paused pipeline: the new worker parks.
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_keeps_a_paused_pipeline_paused() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a"]);
+        let mut n = node("n1", &store, &docs, &f);
+        until(&mut n.status, "running", is(Actual::Running)).await;
+        docs.set_desired_state(DesiredState::Paused).await.unwrap();
+        until(&mut n.status, "paused", is(Actual::Paused)).await;
+        n.updates
+            .send(Update::Restart(Box::new(pipeline()), docs.clone()))
+            .unwrap();
+        eventually("a new worker", || f.builds() == 2).await;
+        until(&mut n.status, "paused again", is(Actual::Paused)).await;
+        f.source.commit(FakeTxn::new().insert(&t("a"), row(1)));
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert!(f.ids("a").is_empty(), "nothing is read while paused");
+    }
+
+    /// A removed pipeline's worker drains, its source cleans up, its lease is released and its
+    /// series go; the controller ends.
+    #[tokio::test(start_paused = true)]
+    async fn a_removed_pipeline_drains_cleans_up_and_releases() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a"]);
+        let mut n = node("n1", &store, &docs, &f);
+        until(&mut n.status, "running", is(Actual::Running)).await;
+        f.source.commit(FakeTxn::new().insert(&t("a"), row(1)));
+        n.updates.send(Update::Remove).unwrap();
+        tokio::time::timeout(Duration::from_secs(60), &mut n.task)
+            .await
+            .expect("the controller ends")
+            .unwrap();
+        assert_eq!(f.ids("a"), [1], "drained");
+        assert_eq!(f.source.teardowns(), 1);
+        let lease = leases(&store).observe("p").await.unwrap().unwrap();
+        assert!(lease.doc.released);
+        let text = n.metrics.encode();
+        assert!(!text.contains(P), "{text}");
+        assert!(line(&text, "data_avalanche_owned_pipelines 0"), "{text}");
+    }
+
+    /// A pipeline removed where it is on standby ends there: the holder cleans up, not this
+    /// node.
+    #[tokio::test(start_paused = true)]
+    async fn a_pipeline_removed_on_standby_just_ends() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a"]);
+        let mut a = node("n1", &store, &docs, &f);
+        until(&mut a.status, "running", is(Actual::Running)).await;
+        let mut b = node("n2", &store, &docs, &f);
+        until(&mut b.status, "standby", |s| {
+            matches!(s.actual, Some(Actual::Standby { .. }))
+        })
+        .await;
+        b.updates.send(Update::Remove).unwrap();
+        tokio::time::timeout(Duration::from_secs(60), &mut b.task)
+            .await
+            .expect("the standby controller ends")
+            .unwrap();
+        assert_eq!(f.source.teardowns(), 0);
+        let lease = leases(&store).observe("p").await.unwrap().unwrap();
+        assert!(lease.doc.is_held_by(&holder("n1")), "n1 still holds it");
+    }
+
+    /// A followed lease whose holder never renews is let go of once it stayed unchanged for a
+    /// full lease duration (15 s), and one never written at once: only then is the pipeline's
+    /// own lease claimed. The followed lease itself is left as it is.
+    #[tokio::test(start_paused = true)]
+    async fn a_followed_lease_never_renewed_is_let_go_after_a_lease_duration() {
+        let store = ScriptedStore::new();
+        let f = TestFactory::new(&["a"]);
+        leases(&store)
+            .acquire(
+                "x",
+                &holder("n0"),
+                Duration::from_secs(15),
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+        let d = deps("n1", &store, &f);
+        let (c, mut status) = PipelineController::new(pipeline(), pipeline_docs(), &d);
+        let c = c.following(Following::new(["x".into(), "never".into()]));
+        let (_target, rx) = watch::channel(Target::Own);
+        let start = Instant::now();
+        let _task = tokio::spawn(c.run(rx));
+        until(&mut status, "standby", is(Actual::Standby { holder: None })).await;
+        tokio::time::sleep(Duration::from_secs(14)).await;
+        assert!(leases(&store).observe("p").await.unwrap().is_none());
+        assert_eq!(f.builds(), 0);
+        until(&mut status, "running", is(Actual::Running)).await;
+        let took = start.elapsed();
+        assert!(
+            took >= Duration::from_secs(15) && took < Duration::from_secs(21),
+            "{took:?}"
+        );
+        let x = leases(&store).observe("x").await.unwrap().unwrap();
+        assert!(x.doc.is_held_by(&holder("n0")) && !x.doc.released);
+    }
+
+    /// A controller started again after its wait was done (as after a panic) shares the list
+    /// its predecessor cleared: it doesn't wait again, though the followed id's lease is held by
+    /// then.
+    #[tokio::test(start_paused = true)]
+    async fn a_follower_started_again_after_its_wait_waits_no_more() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a"]);
+        let d = deps("n1", &store, &f);
+        let following = Following::new(["x".into()]);
+        let (c, mut status) = PipelineController::new(pipeline(), docs.clone(), &d);
+        let (_target, rx) = watch::channel(Target::Own);
+        let task = tokio::spawn(c.following(following.clone()).run(rx));
+        until(&mut status, "running", is(Actual::Running)).await;
+        assert!(following.ids().is_empty(), "cleared where it is shared");
+        task.abort();
+        leases(&store)
+            .acquire(
+                "x",
+                &holder("n0"),
+                Duration::from_secs(15),
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+        let (c, mut status) = PipelineController::new(pipeline(), docs, &d);
+        let (_target, rx) = watch::channel(Target::Own);
+        let start = Instant::now();
+        let _task = tokio::spawn(c.following(following).run(rx));
+        until(&mut status, "running again", is(Actual::Running)).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    /// A pipeline removed while it waits for the pipelines it takes the place of ends there,
+    /// its lease never claimed.
+    #[tokio::test(start_paused = true)]
+    async fn a_follower_removed_while_it_waits_ends() {
+        let store = ScriptedStore::new();
+        let f = TestFactory::new(&["a"]);
+        leases(&store)
+            .acquire(
+                "x",
+                &holder("n0"),
+                Duration::from_secs(15),
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+        let d = deps("n1", &store, &f);
+        let (c, mut status) = PipelineController::new(pipeline(), pipeline_docs(), &d);
+        let c = c.following(Following::new(["x".into()]));
+        let updates = c.updater();
+        let (_target, rx) = watch::channel(Target::Own);
+        let mut task = tokio::spawn(c.run(rx));
+        until(&mut status, "standby", is(Actual::Standby { holder: None })).await;
+        updates.send(Update::Remove).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), &mut task)
+            .await
+            .expect("the controller ends")
+            .unwrap();
+        assert!(leases(&store).observe("p").await.unwrap().is_none());
+        assert_eq!(f.builds(), 0);
+    }
+
+    /// A reloaded `drain_timeout` is the next drain's: a stop waits for the commit past the
+    /// timeout the controller started with.
+    #[tokio::test(start_paused = true)]
+    async fn a_reloaded_drain_timeout_is_the_next_drains() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a"]);
+        let mut n = node("n1", &store, &docs, &f);
+        until(&mut n.status, "running", is(Actual::Running)).await;
+        n.updates
+            .send(Update::DrainTimeout(Duration::from_secs(60)))
+            .unwrap();
+        f.sink.hold_commits();
+        f.source.commit(FakeTxn::new().insert(&t("a"), row(1)));
+        eventually("the commit waits", || f.sink.waiting_commits() == 1).await;
+        docs.set_desired_state(DesiredState::Stopped).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_ne!(
+            n.status.borrow().actual,
+            Some(Actual::Stopped),
+            "past the 5 s it started with, the drain still waits"
+        );
+        f.sink.release_commits();
+        until(&mut n.status, "stopped", is(Actual::Stopped)).await;
+        assert_eq!(f.ids("a"), [1], "drained before it stopped");
+    }
+
+    /// A removal whose drain is cut off leaves the source and the lease as they are: the cut-off
+    /// worker may still hold the slot, and the lease expires instead of being released.
+    #[tokio::test(start_paused = true)]
+    async fn a_removal_with_its_drain_cut_off_leaves_the_source() {
+        let store = ScriptedStore::new();
+        let f = TestFactory::new(&["a"]);
+        let mut d = deps("n1", &store, &f);
+        d.settings.drain_timeout = Duration::from_secs(1);
+        let (c, mut status) = PipelineController::new(pipeline(), pipeline_docs(), &d);
+        let updates = c.updater();
+        let (_target, rx) = watch::channel(Target::Own);
+        let mut task = tokio::spawn(c.run(rx));
+        until(&mut status, "running", is(Actual::Running)).await;
+        f.sink.hold_commits();
+        f.source.commit(FakeTxn::new().insert(&t("a"), row(1)));
+        eventually("the commit waits", || f.sink.waiting_commits() == 1).await;
+        updates.send(Update::Remove).unwrap();
+        tokio::time::timeout(Duration::from_secs(60), &mut task)
+            .await
+            .expect("the controller ends")
+            .unwrap();
+        assert_eq!(f.source.teardowns(), 0, "the source is left as it is");
+        let lease = leases(&store).observe("p").await.unwrap().unwrap();
+        assert!(!lease.doc.released, "the lease expires, not released");
+        assert!(lease.doc.is_held_by(&holder("n1")));
+        f.sink.release_commits();
+    }
+
+    /// A removal's teardown checks the lease before every attempt: once it is lost the source is
+    /// left as it is (its new holder runs it), and the lease isn't released by this node.
+    #[tokio::test(start_paused = true)]
+    async fn a_teardown_stops_once_the_lease_is_lost() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a"]);
+        let mut d = deps("n1", &store, &f);
+        d.settings.tuning.contended_window = Duration::from_secs(3_600);
+        let (c, status) = PipelineController::new(pipeline(), docs.clone(), &d);
+        let (_target, rx) = watch::channel(Target::Own);
+        let updates = c.updater();
+        let mut task = tokio::spawn(c.run(rx));
+        let mut n = status;
+        until(&mut n, "running", is(Actual::Running)).await;
+        for _ in 0..1000 {
+            f.source
+                .fail(Method::Teardown, SourceError::Contended("slot busy".into()));
+        }
+        store.fail_always(Some(Fault {
+            kind: Kind::Transient,
+            lands: false,
+        }));
+        let start = Instant::now();
+        updates.send(Update::Remove).unwrap();
+        tokio::time::timeout(Duration::from_secs(3_000), &mut task)
+            .await
+            .expect("the controller ends")
+            .unwrap();
+        let tried = f.source.teardowns();
+        assert!(tried >= 1, "it tried while the lease held");
+        assert!(
+            start.elapsed() < Duration::from_secs(120),
+            "it stopped with the lease, not with the contended window: {:?}",
+            start.elapsed()
+        );
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        assert_eq!(f.source.teardowns(), tried, "no attempt after the loss");
+        store.fail_always(None);
+        let lease = leases(&store).observe("p").await.unwrap().unwrap();
+        assert!(!lease.doc.released, "this node didn't release it");
     }
 }

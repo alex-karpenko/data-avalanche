@@ -39,6 +39,12 @@ impl Placement {
         }
     }
 
+    /// A reloaded `rebalance_stabilization`: a joiner already waiting counts its wait against
+    /// it from the next update.
+    pub fn set_stabilization(&mut self, stabilization: Duration) {
+        self.stabilization = stabilization;
+    }
+
     /// Takes in `members` as of `now`. True when the ring's nodes changed.
     pub fn update(&mut self, members: &Members, now: Instant) -> bool {
         let eligible: Vec<&str> = members

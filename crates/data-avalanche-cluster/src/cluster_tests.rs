@@ -7,7 +7,8 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::test_support::{
-    LEAVE_WITHIN, STABLE, TestCluster, TestNode, at, eventually, runners, settles, timing,
+    LEAVE_WITHIN, STABLE, TestCluster, TestNode, at, config_text, eventually, runners, settles,
+    timing,
 };
 use crate::{Ring, leave};
 
@@ -179,5 +180,71 @@ async fn a_rolling_restart_keeps_every_pipeline_running_once() {
     }
     let all: Vec<i64> = (1..=row).collect();
     eventually("every row lands", || c.landed(&all)).await;
+    c.assert_ran_once();
+}
+
+/// A reload on `b` reaches every node (Clustering §9.2): `payments` is removed, its owner
+/// tearing it down once; `audit` is added and placed; `orders` takes a new flush in place;
+/// `customers` moves its sink prefix and restarts under its lease. Rows land throughout.
+#[tokio::test(start_paused = true)]
+async fn a_reload_reaches_every_node_and_each_pipeline_runs_once() {
+    let first = ["orders", "events", "customers", "users", "payments"];
+    let c = TestCluster::with_spares(&first, &["audit"]);
+    let (a, b, n3) = three(&c).await;
+    let nodes = [&a, &b, &n3];
+    c.insert(1);
+    let f = |id: &str| c.factories.0[id].clone();
+    eventually("row 1 lands", || {
+        first.iter().all(|id| f(id).ids("a") == [1])
+    })
+    .await;
+    let builds = |id: &str| f(id).builds.load(std::sync::atomic::Ordering::SeqCst);
+    let (orders, customers) = (builds("orders"), builds("customers"));
+
+    let text = config_text(&["orders", "events", "customers", "users", "audit"])
+        .replace(
+            "prefix: orders, delta: {}, flush: { seconds: 0 }",
+            "prefix: orders, delta: {}, flush: { seconds: 0, rows: 5 }",
+        )
+        .replace("prefix: customers,", "prefix: customers-v2,");
+    let out = b.coordinator.reload(&text).await.unwrap();
+    assert_eq!((out.generation, out.published), (2, true));
+    eventually("every node applies generation 2", || {
+        nodes.iter().all(|n| n.coordinator.applied() == 2)
+    })
+    .await;
+    settles(
+        "audit placed, payments gone",
+        &nodes,
+        placed(&["a", "b", "c"]),
+    )
+    .await;
+    let by = runners(&nodes);
+    assert!(!by.contains_key("payments"), "{by:?}");
+    assert_eq!(by["audit"].len(), 1, "{by:?}");
+    eventually("payments torn down", || {
+        f("payments").source.teardowns() == 1
+    })
+    .await;
+    assert_eq!(f("orders").source.reconfigures(), 1);
+    assert_eq!(builds("orders"), orders, "orders changed in place");
+    assert_eq!(builds("customers"), customers + 1, "customers restarted");
+
+    c.insert(2);
+    let live = ["orders", "events", "customers", "users", "audit"];
+    eventually("row 2 lands", || {
+        live.iter().all(|id| f(id).ids("a") == [1, 2])
+    })
+    .await;
+    assert_eq!(f("payments").ids("a"), [1]);
+    for n in nodes {
+        assert_eq!(
+            n.gossip.members().borrow().newest_generation(),
+            2,
+            "{}",
+            n.name
+        );
+    }
+    assert_eq!(f("payments").source.teardowns(), 1, "the owner alone");
     c.assert_ran_once();
 }

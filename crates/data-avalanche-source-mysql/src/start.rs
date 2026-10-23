@@ -96,7 +96,7 @@ impl MySqlConnector {
         };
         if let Some(why) = lost {
             let position = cp.position.to_tagged();
-            if self.mysql.binlog_purge_action == BinlogPurgeAction::ReSnapshot {
+            if self.live().binlog_purge_action == BinlogPurgeAction::ReSnapshot {
                 return Ok(Prepared {
                     plan: StartPlan::Snapshot {
                         from: self.position_now().await?,
@@ -112,7 +112,7 @@ impl MySqlConnector {
                 });
             }
             return Err(purge_action(
-                self.mysql.binlog_purge_action,
+                self.live().binlog_purge_action,
                 SourceError::PositionUnreachable {
                     position,
                     detail: why,

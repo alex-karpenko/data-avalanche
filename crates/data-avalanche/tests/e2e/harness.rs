@@ -178,6 +178,16 @@ impl E2e {
         self.dir.path().join("config.yaml")
     }
 
+    /// The config file every node reads.
+    pub fn config(&self) -> String {
+        std::fs::read_to_string(self.config_path()).expect("the config file")
+    }
+
+    /// Rewrites the config file: what the next reload publishes (Clustering §9.2).
+    pub fn write_config(&self, text: &str) {
+        std::fs::write(self.config_path(), text).expect("the config file");
+    }
+
     /// The `source` block of a pipeline named `test` (on PostgreSQL the slot and publication
     /// `e2e_<test>` take `suffix`; on MySQL it is ignored, both pipelines share the test's
     /// database and user), indented for a pipeline under `pipelines:`; `extra` is one more line of
@@ -633,6 +643,26 @@ pipelines:
         }
     }
 
+    /// On PostgreSQL, whether the slot of the pipeline whose source block took `suffix` exists;
+    /// `None` on MySQL, which has none.
+    pub async fn slot_exists(&self, suffix: &str) -> Option<bool> {
+        let Source::Postgres { .. } = self.source else {
+            return None;
+        };
+        let slot = format!("{}{suffix}", self.schema);
+        let n = self
+            .db
+            .pg()
+            .query_one(
+                "SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot],
+            )
+            .await
+            .expect("slots read")
+            .get::<_, i64>(0);
+        Some(n > 0)
+    }
+
     /// The pipeline's own documents, co-located with the lake (`<sink.prefix>/.pipeline-state`).
     pub fn docs(&self) -> PipelineDocs {
         let at = colocated_state(TEST_BUCKET, &self.lake_prefix());
@@ -840,11 +870,19 @@ impl Proc {
     }
 
     async fn get(&self, path: &str) -> Option<(u16, String)> {
+        self.request("GET", path).await
+    }
+
+    /// A request without a body: the status code and the body.
+    async fn request(&self, method: &str, path: &str) -> Option<(u16, String)> {
         let mut s = tokio::net::TcpStream::connect(("127.0.0.1", self.port))
             .await
             .ok()?;
         s.write_all(
-            format!("GET {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n").as_bytes(),
+            format!(
+                "{method} {path} HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
         )
         .await
         .ok()?;
@@ -878,6 +916,26 @@ impl Proc {
 
     pub async fn metrics(&self) -> String {
         self.get("/metrics").await.expect("/metrics answers").1
+    }
+
+    /// `POST /v1/config/reload`: the status code and the JSON body.
+    pub async fn reload(&self) -> (u16, serde_json::Value) {
+        let (code, body) = self
+            .request("POST", "/v1/config/reload")
+            .await
+            .expect("the reload answers");
+        let v = serde_json::from_str(&body).unwrap_or_else(|e| panic!("{e}: {body}"));
+        (code, v)
+    }
+
+    /// `GET /v1/config/status`'s JSON body.
+    pub async fn config_status(&self) -> serde_json::Value {
+        let (code, body) = self
+            .get("/v1/config/status")
+            .await
+            .expect("the status answers");
+        assert_eq!(code, 200, "{body}");
+        serde_json::from_str(&body).unwrap_or_else(|e| panic!("{e}: {body}"))
     }
 
     /// Waits until the metrics have a line equal to `line`.

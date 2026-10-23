@@ -1,8 +1,10 @@
 //! `MySqlConnector`: the MySQL or MariaDB source of one pipeline.
 
-use data_avalanche_config::{Mysql, Pipeline, SourceType};
+use data_avalanche_config::{BinlogPurgeAction, Mysql, Pipeline, SourceType, Tables};
+use std::any::Any;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use data_avalanche_core::{
@@ -19,8 +21,32 @@ use crate::server::{
     grants_replication,
 };
 
+/// The settings a reload changes while the connector runs (config §1.2, class R).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Live {
+    /// From the next prepare, and for the open stream's next error.
+    pub binlog_purge_action: BinlogPurgeAction,
+    /// `@master_heartbeat_period`, from the next stream.
+    pub heartbeat: Duration,
+    /// `tables.include` and `tables.exclude`, from the next resolve: in place only while the
+    /// table set they resolve to is the same (the pipeline restarts otherwise).
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+}
+
+impl Live {
+    fn of(m: &Mysql, tables: &Tables) -> Self {
+        Self {
+            binlog_purge_action: m.binlog_purge_action,
+            heartbeat: m.heartbeat,
+            include: tables.include.clone(),
+            exclude: tables.exclude.clone(),
+        }
+    }
+}
+
 /// What a connector and its stream share.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Shared {
     /// The change the stream read for a schema signal, kept for the pipeline's `augment` of the
     /// same signal: one catalog read per statement, and one answer for both.
@@ -29,6 +55,19 @@ pub(crate) struct Shared {
     pub(crate) dump: AtomicU32,
     /// `lower_case_table_names` isn't 0, as the stream read it at its open.
     fold: AtomicBool,
+    /// The reloadable settings in force.
+    live: Mutex<Live>,
+}
+
+impl Shared {
+    fn new(m: &Mysql, tables: &Tables) -> Self {
+        Self {
+            remembered: Mutex::default(),
+            dump: AtomicU32::default(),
+            fold: AtomicBool::default(),
+            live: Mutex::new(Live::of(m, tables)),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -100,11 +139,20 @@ impl MySqlConnector {
         };
         Ok(Self {
             pipeline: pipeline.clone(),
+            shared: Arc::new(Shared::new(&mysql, &pipeline.tables)),
             mysql,
             conn: Connector::new(source)?,
             version: OnceCell::new(),
-            shared: Arc::default(),
         })
+    }
+
+    /// The reloadable settings in force, the same for every sibling.
+    pub(crate) fn live(&self) -> Live {
+        self.shared
+            .live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// A connector for the stream's catalog reads: its own catalog connection, the same
@@ -386,5 +434,80 @@ impl SourceConnector for MySqlConnector {
     /// The source creates nothing for a pipeline: no slot, no publication.
     async fn teardown(&self) -> Result<(), SourceError> {
         Ok(())
+    }
+
+    fn reconfigure(&self, pipeline: &dyn Any) {
+        if let Some(p) = pipeline.downcast_ref::<Pipeline>()
+            && let Some(m) = p.source.mysql.as_ref()
+        {
+            *self
+                .shared
+                .live
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Live::of(m, &p.tables);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    use data_avalanche_config::{BinlogPurgeAction, FingerprintKey, load_str};
+
+    use super::*;
+
+    fn pipeline() -> Pipeline {
+        let yaml = r#"
+config_version: 1
+globals:
+  state: { bucket: app-state }
+pipelines:
+  p:
+    id: p
+    source: { type: mysql, host: db.example.com, db: shop, user: cdc, password: pw, mysql: {} }
+    tables: { include: [t] }
+    sink: { type: delta, bucket: lake, delta: {} }
+"#;
+        load_str(yaml, &BTreeMap::new(), &FingerprintKey::from_bytes([1; 32]))
+            .unwrap_or_else(|r| panic!("test pipeline: {r:?}"))
+            .config
+            .pipelines
+            .into_values()
+            .next()
+            .unwrap()
+    }
+
+    /// A reload's purge action, heartbeat and table patterns reach the running connector and
+    /// the stream's catalog connector beside it; the replica id, restart-only, stays, and what
+    /// isn't a pipeline is ignored.
+    #[test]
+    fn a_reload_reaches_the_reloadable_settings() {
+        let p = pipeline();
+        let c = MySqlConnector::new(&p).unwrap();
+        let sibling = c.sibling().unwrap();
+        let mut next = p.clone();
+        let m = next.source.mysql.as_mut().unwrap();
+        m.binlog_purge_action = BinlogPurgeAction::ReSnapshot;
+        m.heartbeat = Duration::from_secs(7);
+        m.server_id = 4242;
+        next.tables.include = vec!["t".into(), "u".into()];
+        next.tables.exclude = vec!["v".into()];
+        c.reconfigure(&next);
+        let live = Live {
+            binlog_purge_action: BinlogPurgeAction::ReSnapshot,
+            heartbeat: Duration::from_secs(7),
+            include: vec!["t".into(), "u".into()],
+            exclude: vec!["v".into()],
+        };
+        assert_eq!(c.live(), live);
+        assert_eq!(sibling.live(), live, "the stream's catalog takes it too");
+        assert_eq!(
+            c.mysql.server_id,
+            p.source.mysql.as_ref().unwrap().server_id
+        );
+        c.reconfigure(&next.source);
+        assert_eq!(c.live(), live, "a source block isn't a pipeline");
     }
 }

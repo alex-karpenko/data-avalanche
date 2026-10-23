@@ -4,13 +4,14 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use data_avalanche_config::Pipeline;
 use data_avalanche_core::{HaltReason, SourcePosition, TableRef};
 use tokio::sync::watch;
 
 use crate::Backoff;
 
 /// A command to a running worker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     /// Finish the open transaction, flush, make it durable, close the stream and end with
     /// [`Exit::Drained`] (stop and failover hand-off, Pipeline_Lifecycle §2, §4).
@@ -24,6 +25,12 @@ pub enum Command {
     Pause,
     /// Read again after a [`Command::Pause`].
     Resume,
+    /// A reload's settings (config §1.2, class R), taken in place: the flush policy, the
+    /// transaction limits, the buffer, the name in the rows' lineage, the snapshot parallelism and
+    /// chunk size, the heartbeat, the WAL-lag limit and schema evolution, and the source's own
+    /// (`SourceConnector::reconfigure`). The pipeline's other fields are restart-only: a change
+    /// to one restarts the worker instead.
+    Reconfigure(Box<Pipeline>),
 }
 
 /// How a worker ended without an error.

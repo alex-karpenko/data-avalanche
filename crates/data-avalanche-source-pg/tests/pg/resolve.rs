@@ -1,6 +1,8 @@
 //! Preflight and channel A: the globs against a live catalog (config §11.2).
 
-use data_avalanche_core::{ColumnValueType as V, HaltReason, LogicalType, SourcePosition};
+use data_avalanche_core::{
+    ColumnValueType as V, HaltReason, LogicalType, SourceConnector, SourcePosition, TableRef,
+};
 use data_avalanche_testkit::require_it;
 
 use crate::common::{admin, cleanup, connector, fresh, pipeline, resolved};
@@ -244,5 +246,28 @@ async fn the_current_position_moves_with_writes() {
         panic!("PostgreSQL positions")
     };
     assert!(f > b, "{f} after {b}");
+    cleanup(&a, &n).await;
+}
+
+/// A reload's table patterns take the connector's next resolve (config §1.2: in place while the
+/// set they resolve to stays the same).
+#[tokio::test]
+async fn a_reloaded_include_takes_the_next_resolve() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(
+        &a,
+        "resolve_reload",
+        "CREATE TABLE a (id int PRIMARY KEY); CREATE TABLE b (id int PRIMARY KEY);",
+    )
+    .await;
+    let c = connector(&pipeline(&n, &["*"], "", ""));
+    let names = |r: data_avalanche_core::ResolvedTables| -> Vec<TableRef> {
+        r.tables.iter().map(|s| s.table().clone()).collect()
+    };
+    let t = |name: &str| TableRef::new(&n.schema, name);
+    assert_eq!(names(c.resolve_tables().await.unwrap()), [t("a"), t("b")]);
+    c.reconfigure(&pipeline(&n, &["a"], "", ""));
+    assert_eq!(names(c.resolve_tables().await.unwrap()), [t("a")]);
     cleanup(&a, &n).await;
 }

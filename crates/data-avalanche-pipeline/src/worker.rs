@@ -249,9 +249,10 @@ async fn drained_while(core: &mut Core, delay: std::time::Duration) -> bool {
             () = &mut sleep => return false,
             cmd = core.control.recv() => match cmd {
                 Some(Command::Flush) => {}
-                // The next session parks (or reads) as it opens.
+                // The next session parks (or reads) as it opens, with the reload's settings.
                 Some(Command::Pause) => core.pause = true,
                 Some(Command::Resume) => core.pause = false,
+                Some(Command::Reconfigure(p)) => core.reconfigure(&p),
                 Some(Command::Drain) | None => return true,
             },
         }
@@ -1954,5 +1955,148 @@ mod tests {
         assert_eq!(w.docs.table_snapshot(&t("a")).await.unwrap(), None);
         let b = w.docs.table_snapshot(&t("b")).await.unwrap().unwrap().doc;
         assert_eq!(b.status, SnapshotStatus::InProgress);
+    }
+
+    /// A pipeline with `sink` entries and pipeline-level `top` YAML (a line of its own).
+    fn reloadable(sink: &str, top: &str) -> Pipeline {
+        Yaml {
+            tables: "\n      snapshots: { mode: never }",
+            sink,
+            pipeline: top,
+            ..Yaml::default()
+        }
+        .build()
+    }
+
+    /// A reload reaches the running worker (config §1.2, class R): the new flush policy flushes
+    /// the row the old one held, the rows carry the new name, and the source takes its settings,
+    /// all in the same session.
+    #[tokio::test]
+    async fn a_reload_reaches_the_running_worker() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let held = reloadable("flush: { seconds: 3600, rows: 1000 }", "");
+        let (worker, handle) = PipelineWorker::new(&held, deps(&w), fast());
+        let driver = async {
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(w.ids("a").is_empty(), "held by the flush policy");
+            let mut next = reloadable("flush: { seconds: 0 }", "");
+            next.name = "renamed".into();
+            handle
+                .control
+                .send(Command::Reconfigure(Box::new(next)))
+                .await
+                .unwrap();
+            wait_until("the held row lands", || w.ids("a") == [1]).await;
+            assert_eq!(w.text("a", "_pipeline"), [Some("renamed".to_owned())]);
+            assert_eq!(w.source.reconfigures(), 1);
+            assert_eq!(w.source.opened().len(), 1, "the same session");
+            handle.control.send(Command::Drain).await.unwrap();
+        };
+        let (end, ()) = tokio::join!(worker.run(), driver);
+        assert!(matches!(end, Ok(Exit::Drained)), "{end:?}");
+    }
+
+    /// A reload re-arms the session's timers: periodic rescans, off when the session opened, run
+    /// at the new interval.
+    #[tokio::test]
+    async fn a_reload_rearms_the_rescans() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let off = "\n    schema_evolution: { rescan_interval: 0s }";
+        let p = reloadable("flush: { seconds: 0 }", off);
+        let (worker, handle) = PipelineWorker::new(&p, deps(&w), fast());
+        let driver = async {
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+            wait_until("streaming", || w.ids("a") == [1]).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(w.source.rescans(), 0, "rescans are off");
+            let every = "\n    schema_evolution: { rescan_interval: 1s }";
+            let next = reloadable("flush: { seconds: 0 }", every);
+            handle
+                .control
+                .send(Command::Reconfigure(Box::new(next)))
+                .await
+                .unwrap();
+            wait_until("a rescan runs", || w.source.rescans() > 0).await;
+            handle.control.send(Command::Drain).await.unwrap();
+        };
+        let (end, ()) = tokio::join!(worker.run(), driver);
+        assert!(matches!(end, Ok(Exit::Drained)), "{end:?}");
+    }
+
+    /// A buffer made smaller than a flush that waits for room lets it through once there is room
+    /// under the new size: the wait is capped at the new size, so it can't wait for ever.
+    #[tokio::test]
+    async fn a_smaller_buffer_lets_a_waiting_flush_through() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let p = reloadable("flush: { seconds: 0 }, buffer_capacity_rows: 4", "");
+        let (worker, handle) = PipelineWorker::new(&p, deps(&w), fast());
+        let driver = async {
+            w.sink.hold_commits();
+            let mut four = FakeTxn::new();
+            for id in 1..=4 {
+                four = four.insert(&t("a"), row(id, "x"));
+            }
+            w.source.commit(four);
+            wait_until("the first flush waits", || w.sink.waiting_commits() == 1).await;
+            let mut three = FakeTxn::new();
+            for id in 5..=7 {
+                three = three.insert(&t("a"), row(id, "x"));
+            }
+            w.source.commit(three);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let next = reloadable("flush: { seconds: 0 }, buffer_capacity_rows: 2", "");
+            handle
+                .control
+                .send(Command::Reconfigure(Box::new(next)))
+                .await
+                .unwrap();
+            w.sink.release_commits();
+            wait_until("every row lands", || w.ids("a") == [1, 2, 3, 4, 5, 6, 7]).await;
+            handle.control.send(Command::Drain).await.unwrap();
+        };
+        let (end, ()) = tokio::join!(worker.run(), driver);
+        assert!(matches!(end, Ok(Exit::Drained)), "{end:?}");
+    }
+
+    /// A reload that arrives between sessions (the reconnect's backoff) is the next session's.
+    #[tokio::test]
+    async fn a_reload_during_a_reconnect_reaches_the_next_session() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let tuning = Tuning {
+            source_backoff: Backoff {
+                first: Duration::from_millis(300),
+                max: Duration::from_millis(300),
+            },
+            ..fast()
+        };
+        let p = reloadable("flush: { seconds: 0 }", "");
+        let (worker, handle) = PipelineWorker::new(&p, deps(&w), tuning);
+        let driver = async {
+            w.source
+                .fail(Method::Next, SourceError::Transient("reset".into()));
+            wait_until("reconnecting", || {
+                matches!(handle.status.borrow().phase, Phase::Reconnecting { .. })
+            })
+            .await;
+            let mut next = reloadable("flush: { seconds: 0 }", "");
+            next.name = "renamed".into();
+            handle
+                .control
+                .send(Command::Reconfigure(Box::new(next)))
+                .await
+                .unwrap();
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+            wait_until("the row lands", || w.ids("a") == [1]).await;
+            assert_eq!(w.text("a", "_pipeline"), [Some("renamed".to_owned())]);
+            assert_eq!(w.source.reconfigures(), 1);
+            handle.control.send(Command::Drain).await.unwrap();
+        };
+        let (end, ()) = tokio::join!(worker.run(), driver);
+        assert!(matches!(end, Ok(Exit::Drained)), "{end:?}");
     }
 }
