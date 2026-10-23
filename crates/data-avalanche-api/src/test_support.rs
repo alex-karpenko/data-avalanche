@@ -235,6 +235,7 @@ pub(crate) struct Issuer {
     keys: Arc<Mutex<Vec<(String, KeyPair)>>>,
     /// JWKS fetches so far.
     pub fetches: Arc<AtomicUsize>,
+    down: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -242,6 +243,7 @@ struct Served {
     url: String,
     keys: Arc<Mutex<Vec<(String, KeyPair)>>>,
     fetches: Arc<AtomicUsize>,
+    down: Arc<AtomicBool>,
 }
 
 fn jwk(kid: &str, key: &KeyPair) -> Value {
@@ -254,10 +256,15 @@ fn jwk(kid: &str, key: &KeyPair) -> Value {
     })
 }
 
-async fn jwks(State(s): State<Served>) -> Json<Value> {
+async fn jwks(State(s): State<Served>) -> Result<Json<Value>, axum::http::StatusCode> {
     s.fetches.fetch_add(1, Ordering::SeqCst);
+    if s.down.load(Ordering::SeqCst) {
+        return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    }
     let keys = s.keys.lock().unwrap();
-    Json(json!({ "keys": keys.iter().map(|(kid, k)| jwk(kid, k)).collect::<Vec<_>>() }))
+    Ok(Json(
+        json!({ "keys": keys.iter().map(|(kid, k)| jwk(kid, k)).collect::<Vec<_>>() }),
+    ))
 }
 
 async fn discovery(State(s): State<Served>) -> Json<Value> {
@@ -271,7 +278,9 @@ impl Issuer {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let keys = Arc::new(Mutex::new(vec![]));
         let fetches = Arc::new(AtomicUsize::new(0));
+        let down = Arc::new(AtomicBool::new(false));
         let served = Served {
+            down: Arc::clone(&down),
             url: url.clone(),
             keys: Arc::clone(&keys),
             fetches: Arc::clone(&fetches),
@@ -281,7 +290,12 @@ impl Issuer {
             .route("/.well-known/openid-configuration", get_route(discovery))
             .with_state(served);
         tokio::spawn(async move { axum::serve(listener, app).await });
-        let issuer = Self { url, keys, fetches };
+        let issuer = Self {
+            url,
+            keys,
+            fetches,
+            down,
+        };
         issuer.add_key("k1");
         issuer
     }
@@ -290,6 +304,16 @@ impl Issuer {
     pub fn add_key(&self, kid: &str) {
         let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
         self.keys.lock().unwrap().push((kid.to_owned(), key));
+    }
+
+    /// A key withdrawn.
+    pub fn remove_key(&self, kid: &str) {
+        self.keys.lock().unwrap().retain(|(k, _)| k != kid);
+    }
+
+    /// While down, the JWKS answers 500.
+    pub fn set_down(&self, down: bool) {
+        self.down.store(down, Ordering::SeqCst);
     }
 
     /// `globals.api.jwt` for this issuer, its tokens for audience `cdc`.

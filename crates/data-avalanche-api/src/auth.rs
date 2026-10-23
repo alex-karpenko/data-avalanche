@@ -26,6 +26,16 @@ pub const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// A token signed by a key the cached JWKS lacks fetches the JWKS again, at most this often
 /// (a key rotation; a flood of tokens with made-up key ids fetches nothing more).
 pub const REFETCH_AFTER: Duration = Duration::from_secs(30);
+/// A cached JWKS older than this is fetched again at the next verification, even for a token
+/// whose `kid` it holds: an issuer that withdraws a key is heard within this long. A failed fetch
+/// keeps the old keys and is tried again after [`REFETCH_AFTER`].
+pub const KEYS_MAX_AGE: Duration = Duration::from_secs(600);
+
+#[derive(Debug, Clone, Copy)]
+struct Timing {
+    refetch_after: Duration,
+    max_age: Duration,
+}
 
 /// An authenticated caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,7 +88,7 @@ impl Settings {
 enum Mode {
     Open,
     Basic(Credentials),
-    Token(Verifier),
+    Token(Box<Verifier>),
 }
 
 #[derive(Debug)]
@@ -91,22 +101,31 @@ struct Current {
 #[derive(Debug)]
 pub struct Auth {
     current: RwLock<Current>,
-    refetch_after: Duration,
+    timing: Timing,
 }
 
 impl Auth {
     pub fn new(api: &ApiConfig) -> Self {
-        Self::with_refetch_after(api, REFETCH_AFTER)
+        Self::with_timing(api, REFETCH_AFTER, KEYS_MAX_AGE)
     }
 
+    #[cfg(test)]
     pub(crate) fn with_refetch_after(api: &ApiConfig, refetch_after: Duration) -> Self {
+        Self::with_timing(api, refetch_after, KEYS_MAX_AGE)
+    }
+
+    pub(crate) fn with_timing(api: &ApiConfig, refetch_after: Duration, max_age: Duration) -> Self {
+        let timing = Timing {
+            refetch_after,
+            max_age,
+        };
         let settings = Settings::of(api);
         Self {
             current: RwLock::new(Current {
-                mode: Arc::new(mode(&settings, refetch_after)),
+                mode: Arc::new(mode(&settings, timing)),
                 settings,
             }),
-            refetch_after,
+            timing,
         }
     }
 
@@ -115,7 +134,7 @@ impl Auth {
         let settings = Settings::of(api);
         let mut current = self.current.write().unwrap_or_else(PoisonError::into_inner);
         if current.settings != settings {
-            current.mode = Arc::new(mode(&settings, self.refetch_after));
+            current.mode = Arc::new(mode(&settings, self.timing));
             current.settings = settings;
         }
     }
@@ -140,15 +159,15 @@ impl Auth {
     }
 }
 
-fn mode(s: &Settings, refetch_after: Duration) -> Mode {
+fn mode(s: &Settings, timing: Timing) -> Mode {
     let token = |issuer: &str, audience: &Option<String>, roles_claim: &str, keys| {
-        Mode::Token(Verifier {
+        Mode::Token(Box::new(Verifier {
             issuer: issuer.to_owned(),
             audience: audience.clone(),
             roles_claim: roles_claim.to_owned(),
             mapping: s.role_mapping.clone(),
-            keys: Keys::new(keys, refetch_after),
-        })
+            keys: Keys::new(keys, timing),
+        }))
     };
     match (s.auth, &s.credentials, &s.jwt, &s.oauth2) {
         (ApiAuth::Basic, Some(c), _, _) => Mode::Basic(c.clone()),
@@ -241,9 +260,16 @@ impl Verifier {
         let key = self.keys.key(header.kid.as_deref()).await?;
         let mut validation = Validation::new(header.alg);
         validation.set_issuer(&[&self.issuer]);
+        // The library checks `iss` and `aud` only when the token has them: require them.
         match &self.audience {
-            Some(aud) => validation.set_audience(&[aud]),
-            None => validation.validate_aud = false,
+            Some(aud) => {
+                validation.set_audience(&[aud]);
+                validation.set_required_spec_claims(&["exp", "iss", "aud"]);
+            }
+            None => {
+                validation.validate_aud = false;
+                validation.set_required_spec_claims(&["exp", "iss"]);
+            }
         }
         let claims = decode::<Value>(token, &key, &validation)
             .map_err(|e| unauthenticated(BEARER, format!("the token doesn't verify: {e}")))?
@@ -314,20 +340,25 @@ struct Keys {
     source: KeySource,
     http: reqwest::Client,
     cache: Mutex<Cache>,
-    refetch_after: Duration,
+    timing: Timing,
 }
 
 #[derive(Debug, Default)]
 struct Cache {
     set: Option<JwkSet>,
+    /// When `set` was fetched.
+    set_at: Option<Instant>,
+    /// When a fetch was last tried.
     fetched: Option<Instant>,
+    /// Why the last fetch failed, until one succeeds.
+    failure: Option<String>,
 }
 
 impl Keys {
-    fn new(source: KeySource, refetch_after: Duration) -> Self {
+    fn new(source: KeySource, timing: Timing) -> Self {
         Self {
             source,
-            refetch_after,
+            timing,
             http: reqwest::Client::builder()
                 .timeout(FETCH_TIMEOUT)
                 .build()
@@ -336,38 +367,51 @@ impl Keys {
         }
     }
 
-    /// The key a token names (`kid`; without one, the set's only key), fetching the JWKS when
-    /// it isn't cached, or lacks the key and was fetched [`REFETCH_AFTER`] ago or earlier.
+    /// The key a token names (`kid`; without one, the set's only key). The JWKS is fetched when
+    /// none is cached, when the cached one is [`KEYS_MAX_AGE`] old, or when it lacks the key;
+    /// never more often than every [`REFETCH_AFTER`]. A failed fetch keeps an older set; with
+    /// none ever fetched, the keys are unavailable (503).
     async fn key(&self, kid: Option<&str>) -> Result<DecodingKey, Denied> {
         let mut cache = self.cache.lock().await;
-        if let Some(key) = cache.set.as_ref().and_then(|s| find(s, kid)) {
+        let old = cache
+            .set_at
+            .is_some_and(|at| at.elapsed() >= self.timing.max_age);
+        if !old && let Some(key) = cache.set.as_ref().and_then(|s| find(s, kid)) {
             return key;
         }
-        if cache
+        let missing = cache.set.as_ref().is_none_or(|s| find(s, kid).is_none());
+        let may_fetch = cache
             .fetched
-            .is_none_or(|at| at.elapsed() >= self.refetch_after)
-        {
+            .is_none_or(|at| at.elapsed() >= self.timing.refetch_after);
+        if (old || missing) && may_fetch {
             cache.fetched = Some(Instant::now());
             match self.fetch().await {
-                Ok(set) => cache.set = Some(set),
+                Ok(set) => {
+                    cache.set = Some(set);
+                    cache.set_at = Some(Instant::now());
+                    cache.failure = None;
+                }
                 Err(why) => {
-                    tracing::warn!("the API's token keys: {why}");
-                    if cache.set.is_none() {
-                        return Err(Denied::Unavailable(why));
+                    if cache.failure.is_none() {
+                        tracing::warn!("the API's token keys: {why}");
                     }
+                    cache.failure = Some(why);
                 }
             }
         }
-        cache
-            .set
-            .as_ref()
-            .and_then(|s| find(s, kid))
-            .unwrap_or_else(|| {
+        match (&cache.set, &cache.failure) {
+            (None, failure) => {
+                Err(Denied::Unavailable(failure.clone().unwrap_or_else(|| {
+                    "the issuer's keys are not fetched".into()
+                })))
+            }
+            (Some(set), _) => find(set, kid).unwrap_or_else(|| {
                 Err(unauthenticated(
                     BEARER,
                     format!("no key {kid:?} in the issuer's JWKS"),
                 ))
-            })
+            }),
+        }
     }
 
     async fn fetch(&self) -> Result<JwkSet, String> {
@@ -545,6 +589,19 @@ mod tests {
             auth.verify(&with(&|c| c.as_object_mut().unwrap().clear()))
                 .await,
         );
+        // A claim the verifier checks, left out: absent is not accepted.
+        denied_401(
+            auth.verify(&with(&|c| {
+                c.as_object_mut().unwrap().remove("iss");
+            }))
+            .await,
+        );
+        denied_401(
+            auth.verify(&with(&|c| {
+                c.as_object_mut().unwrap().remove("aud");
+            }))
+            .await,
+        );
         // Signed by a key the issuer never published, under a key id it does.
         let stranger = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
         let forged = sign_with(&stranger, Some("k1"), &idp.claims(json!(["admin"])));
@@ -630,10 +687,50 @@ mod tests {
         let url = format!("http://{}/jwks", closed.local_addr().unwrap());
         drop(closed);
         api.jwt.as_mut().unwrap().jwks_url = url;
-        let r = Auth::new(&api)
-            .verify(&bearer(&idp.token(json!(["admin"]))))
-            .await;
-        assert!(matches!(r, Err(Denied::Unavailable(_))), "{r:?}");
+        let auth = Auth::new(&api);
+        let token = bearer(&idp.token(json!(["admin"])));
+        // Again, inside the refetch window: still no keys, still 503.
+        for _ in 0..2 {
+            let r = auth.verify(&token).await;
+            assert!(matches!(r, Err(Denied::Unavailable(_))), "{r:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_withdrawn_key_stops_verifying_once_the_keys_are_old() {
+        let idp = Issuer::start().await;
+        let api = idp.api("roles");
+        let token = bearer(&idp.token(json!(["viewer"])));
+
+        // Young keys are trusted: the withdrawal isn't heard yet.
+        let young = Auth::new(&api);
+        young.verify(&token).await.unwrap();
+        idp.remove_key("k1");
+        idp.add_key("k2");
+        young.verify(&token).await.unwrap();
+        assert_eq!(idp.fetches.load(Ordering::SeqCst), 1);
+
+        // Old keys are fetched again, and the withdrawn one is gone.
+        let old = Auth::with_timing(&api, Duration::ZERO, Duration::ZERO);
+        let k2 = bearer(&idp.sign("k2", &idp.claims(json!(["viewer"]))));
+        old.verify(&k2).await.unwrap();
+        idp.add_key("k1");
+        let token = bearer(&idp.token(json!(["viewer"])));
+        old.verify(&token).await.unwrap();
+        idp.remove_key("k1");
+        denied_401(old.verify(&token).await);
+    }
+
+    #[tokio::test]
+    async fn a_failed_refetch_of_old_keys_keeps_the_old_keys() {
+        let idp = Issuer::start().await;
+        let auth = Auth::with_timing(&idp.api("roles"), Duration::ZERO, Duration::ZERO);
+        let token = bearer(&idp.token(json!(["viewer"])));
+        auth.verify(&token).await.unwrap();
+        idp.set_down(true);
+        auth.verify(&token).await.unwrap();
+        assert_eq!(idp.fetches.load(Ordering::SeqCst), 2, "it did try");
+        idp.set_down(false);
     }
 
     #[tokio::test]

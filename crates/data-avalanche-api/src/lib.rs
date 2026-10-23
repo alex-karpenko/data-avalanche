@@ -30,7 +30,7 @@ use data_avalanche_telemetry::{CONTENT_TYPE, Metrics};
 use serde_json::{Value, json};
 use tokio::sync::watch;
 
-pub use auth::{Auth, FETCH_TIMEOUT, Principal, REFETCH_AFTER};
+pub use auth::{Auth, FETCH_TIMEOUT, KEYS_MAX_AGE, Principal, REFETCH_AFTER};
 pub use server::{Bound, HANDSHAKE_TIMEOUT, ServeError, bind};
 
 use crate::auth::Denied;
