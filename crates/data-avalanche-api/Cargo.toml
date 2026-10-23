@@ -29,6 +29,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "sync", "fs"] }
 tokio-rustls.workspace = true
 tracing.workspace = true
+utoipa.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

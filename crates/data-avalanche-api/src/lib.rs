@@ -11,6 +11,7 @@
 mod auth;
 mod cluster;
 mod config;
+mod openapi;
 mod pipelines;
 mod server;
 #[cfg(test)]
@@ -35,6 +36,7 @@ use tokio::sync::watch;
 
 pub use auth::{Auth, FETCH_TIMEOUT, KEYS_MAX_AGE, Principal, REFETCH_AFTER};
 pub use cluster::{Control, Stop};
+pub use openapi::openapi;
 pub use server::{Bound, HANDSHAKE_TIMEOUT, ServeError, bind};
 
 use crate::auth::Denied;
@@ -74,73 +76,218 @@ impl std::fmt::Debug for Node {
     }
 }
 
-/// A `/v1` route and the least role that may call it (API_RBAC §2).
+/// A `/v1` route: the least role that may call it (API_RBAC §2), and what the OpenAPI document
+/// says of it ([`openapi`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Route {
     pub method: &'static str,
-    /// As the router matches it: `{id}` for a path parameter.
+    /// As the router matches it: `{id}`, a pipeline's id, for a path parameter.
     pub path: &'static str,
     pub role: Role,
+    pub summary: &'static str,
+    /// The request body's content type, when it takes one.
+    pub body: Option<&'static str>,
+    /// Its own answers; 401, 403 and 503 are every route's.
+    pub answers: &'static [(u16, &'static str)],
 }
 
-const fn route(method: &'static str, path: &'static str, role: Role) -> Route {
-    Route { method, path, role }
-}
+const ASKED: (u16, &str) = (202, "asked: the owner acts at its next poll");
+const UNKNOWN: (u16, &str) = (404, "no such pipeline in the generation this node runs");
 
 /// Every `/v1` route, with its handler.
+#[allow(clippy::too_many_lines)]
 fn v1() -> Vec<(Route, MethodRouter<Api>)> {
+    use Role::{Admin, Operator, Viewer};
+    let r = |method, path, role, summary, answers| Route {
+        method,
+        path,
+        role,
+        summary,
+        body: None,
+        answers,
+    };
     vec![
         (
-            route("POST", "/v1/config/validate", Role::Operator),
+            Route {
+                body: Some("application/yaml"),
+                ..r(
+                    "POST",
+                    "/v1/config/validate",
+                    Operator,
+                    "Check a config, the body or else the node's file: what a reload of it would change. Nothing is published",
+                    &[
+                        (200, "it loads: its warnings and the changes"),
+                        (
+                            422,
+                            "invalid, or it changes a restart-only field: the report",
+                        ),
+                    ],
+                )
+            },
             post(config::validate),
         ),
         (
-            route("POST", "/v1/config/reload", Role::Operator),
+            r(
+                "POST",
+                "/v1/config/reload",
+                Operator,
+                "Publish the node's file as the next config generation",
+                &[
+                    (200, "the file is the generation the cluster runs"),
+                    (202, "published: the generation"),
+                    (409, "other nodes published first, every time"),
+                    (
+                        422,
+                        "invalid, or it changes a restart-only field: the report",
+                    ),
+                ],
+            ),
             post(config::reload),
         ),
         (
-            route("GET", "/v1/config/status", Role::Viewer),
+            r(
+                "GET",
+                "/v1/config/status",
+                Viewer,
+                "The generation the cluster runs, and each member's",
+                &[(200, "the generations")],
+            ),
             get(config::status),
         ),
         (
-            route("GET", "/v1/cluster/status", Role::Viewer),
+            r(
+                "GET",
+                "/v1/cluster/status",
+                Viewer,
+                "The members this node sees, and each pipeline's lease holder",
+                &[(200, "the members and the holders")],
+            ),
             get(cluster::status),
         ),
         (
-            route("GET", "/v1/pipelines", Role::Viewer),
+            r(
+                "GET",
+                "/v1/pipelines",
+                Viewer,
+                "Every pipeline: its desired and actual states and its holder",
+                &[(200, "the pipelines")],
+            ),
             get(pipelines::list),
         ),
         (
-            route("GET", "/v1/pipelines/{id}", Role::Viewer),
+            r(
+                "GET",
+                "/v1/pipelines/{id}",
+                Viewer,
+                "A pipeline: its states, its holder, its position and its halted tables",
+                &[(200, "the pipeline"), UNKNOWN],
+            ),
             get(pipelines::get),
         ),
         (
-            route("POST", "/v1/pipelines/{id}/pause", Role::Operator),
+            r(
+                "POST",
+                "/v1/pipelines/{id}/pause",
+                Operator,
+                "Pause: flush to a transaction boundary, then read nothing; the connection and the lease stay",
+                &[
+                    (200, "paused already"),
+                    (202, "the desired state is paused"),
+                    UNKNOWN,
+                    (409, "the pipeline is stopped"),
+                ],
+            ),
             post(pipelines::pause),
         ),
         (
-            route("POST", "/v1/pipelines/{id}/stop", Role::Operator),
+            r(
+                "POST",
+                "/v1/pipelines/{id}/stop",
+                Operator,
+                "Stop: flush, and close the source connection; the lease stays",
+                &[
+                    (200, "stopped already"),
+                    (202, "the desired state is stopped"),
+                    UNKNOWN,
+                ],
+            ),
             post(pipelines::stop),
         ),
         (
-            route("POST", "/v1/pipelines/{id}/resume", Role::Operator),
+            r(
+                "POST",
+                "/v1/pipelines/{id}/resume",
+                Operator,
+                "Resume a paused or stopped pipeline",
+                &[
+                    (200, "running already"),
+                    (202, "the desired state is running"),
+                    UNKNOWN,
+                ],
+            ),
             post(pipelines::resume),
         ),
         (
-            route("POST", "/v1/pipelines/{id}/restart", Role::Operator),
+            r(
+                "POST",
+                "/v1/pipelines/{id}/restart",
+                Operator,
+                "Restart: discard what is unflushed and replay from the checkpoint, under the same lease; a pipeline in ERROR runs again",
+                &[
+                    ASKED,
+                    UNKNOWN,
+                    (409, "paused, stopped, or no node holds the lease"),
+                ],
+            ),
             post(pipelines::restart),
         ),
         (
-            route("POST", "/v1/pipelines/{id}/flush", Role::Operator),
+            r(
+                "POST",
+                "/v1/pipelines/{id}/flush",
+                Operator,
+                "Flush now",
+                &[
+                    (200, "paused: flushed already"),
+                    ASKED,
+                    UNKNOWN,
+                    (409, "stopped, or no node holds the lease"),
+                ],
+            ),
             post(pipelines::flush),
         ),
         (
-            route("POST", "/v1/cluster/leave", Role::Admin),
+            r(
+                "POST",
+                "/v1/cluster/leave",
+                Admin,
+                "Leave the cluster: hand every pipeline off; the process stays up, not ready",
+                &[(202, "the leave is under way"), (409, "leaving already")],
+            ),
             post(cluster::leave),
         ),
         (
-            route("POST", "/v1/admin/shutdown", Role::Admin),
+            r(
+                "POST",
+                "/v1/admin/shutdown",
+                Admin,
+                "Shut down: leave the cluster, then end the process",
+                &[
+                    (202, "the shutdown is under way"),
+                    (409, "shutting down already"),
+                ],
+            ),
             post(cluster::shutdown),
+        ),
+        (
+            r(
+                "GET",
+                "/v1/openapi.json",
+                Viewer,
+                "This document",
+                &[(200, "the OpenAPI document")],
+            ),
+            get(openapi::serve),
         ),
     ]
 }
@@ -276,13 +423,14 @@ mod tests {
                 ("POST", "/v1/pipelines/{id}/flush", Operator),
                 ("POST", "/v1/cluster/leave", Admin),
                 ("POST", "/v1/admin/shutdown", Admin),
+                ("GET", "/v1/openapi.json", Viewer),
             ]
         );
     }
 
     /// Every `/v1` route: 401 without a token or with one that doesn't verify, 403 below its
     /// role or with no role mapped, through at its role and above. Through means past the gate:
-    /// the node doesn't run its generation here, so the route itself answers 503.
+    /// the node doesn't run its generation here, so most routes answer 503 themselves.
     #[tokio::test]
     async fn every_route_turns_away_callers_below_its_role() {
         let idp = Issuer::start().await;
@@ -310,7 +458,11 @@ mod tests {
                 let auth = [("Authorization", token.as_str())];
                 let (code, _, body) = request(addr, r.method, &path, &auth, "").await;
                 if role.is_some_and(|role| role >= r.role) {
-                    assert_eq!(code, 503, "{} {path} as {claim}: {body}", r.method);
+                    assert!(
+                        code != 401 && code != 403,
+                        "{} {path} as {claim}: {code} {body}",
+                        r.method
+                    );
                 } else {
                     assert_eq!(code, 403, "{} {path} as {claim}: {body}", r.method);
                 }
