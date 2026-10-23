@@ -562,10 +562,8 @@ mod tests {
         );
         let (code, v) = post("flush").await;
         assert_eq!(code, 202, "{v}");
-        assert_eq!(
-            json!(docs.requests().await.unwrap().flush.unwrap().id),
-            v["request"]
-        );
+        let flushed = docs.requests().await.unwrap().flush.unwrap().id;
+        assert_eq!(json!(flushed), v["request"]);
 
         assert_eq!(post("pause").await.0, 202);
         let (code, v) = post("restart").await;
@@ -573,6 +571,11 @@ mod tests {
         assert_eq!(
             post("flush").await,
             (200, json!({ "desired_state": "paused", "unchanged": true }))
+        );
+        assert_eq!(
+            docs.requests().await.unwrap().flush.unwrap().id,
+            flushed,
+            "a paused pipeline's flush asks nothing"
         );
         assert_eq!(post("stop").await.0, 202);
         assert_eq!(post("flush").await.0, 409);

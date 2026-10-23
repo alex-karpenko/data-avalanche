@@ -9,7 +9,7 @@ use data_avalanche_cluster::{Checked, ReloadError, Reloaded};
 use data_avalanche_config::Fingerprints;
 use serde_json::json;
 
-use crate::{Api, body, starting};
+use crate::{Api, Failure, Node, body, starting};
 
 /// A refused reload or check: 422 with the report, 409 after the retries, 503 when
 /// `globals.state` fails or the node stops.
@@ -26,6 +26,16 @@ fn refused(e: &ReloadError) -> Response {
     body(code, &v)
 }
 
+/// The node's file (config §12.1), or the 500 of its read.
+async fn node_file(node: &Node) -> Result<String, Failure> {
+    tokio::fs::read_to_string(&node.file).await.map_err(|e| {
+        Failure::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("cannot read config file {}: {e}", node.file.display()),
+        )
+    })
+}
+
 /// Checks a config and publishes nothing (D-M9a.7): the request's body, or the node's file when
 /// the body is empty, loaded in this node's environment and diffed against the generation it
 /// runs. 200 with the warnings and what a reload would change; 422 with the report when it is
@@ -37,14 +47,9 @@ pub(crate) async fn validate(State(api): State<Api>, text: String) -> Response {
         return starting();
     };
     let (text, fingerprints) = if text.trim().is_empty() {
-        match tokio::fs::read_to_string(&node.file).await {
+        match node_file(node).await {
             Ok(text) => (text, Fingerprints::Compared),
-            Err(e) => {
-                return body(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &json!({ "error": format!("cannot read config file {}: {e}", node.file.display()) }),
-                );
-            }
+            Err(failed) => return failed.into(),
         }
     } else {
         (text, Fingerprints::Ignored)
@@ -75,14 +80,9 @@ pub(crate) async fn reload(State(api): State<Api>) -> Response {
     let Some(node) = api.node.get() else {
         return starting();
     };
-    let text = match tokio::fs::read_to_string(&node.file).await {
+    let text = match node_file(node).await {
         Ok(text) => text,
-        Err(e) => {
-            return body(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &json!({ "error": format!("cannot read config file {}: {e}", node.file.display()) }),
-            );
-        }
+        Err(failed) => return failed.into(),
     };
     match node.coordinator.reload(&text).await {
         Ok(Reloaded {

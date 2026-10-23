@@ -268,8 +268,10 @@ impl ConfigCoordinator {
 
     /// What a reload of `text` would change on this node, nothing published (`POST
     /// /v1/config/validate`): the text loaded in this node's environment and diffed against
-    /// the generation this node runs. A table-pattern change counts as a restart here; the
-    /// reload's adoption asks the source whether the table set changed (config §1.2).
+    /// the generation this node runs, which may lag the cluster's ([`Checked::generation`]
+    /// says which it was). A table-pattern change counts as a restart here; the reload's
+    /// adoption asks the source whether the table set changed (config §1.2). An adoption or a
+    /// reload isn't held up by it: the running config is copied, and the lock let go.
     /// `fingerprints` says whether a secret or a file that differs only by its value counts as
     /// a change ([`Fingerprints`]): ignore them for a text a caller supplies, so that the check
     /// doesn't tell whether its secret is the running one.
@@ -282,12 +284,15 @@ impl ConfigCoordinator {
         fingerprints: Fingerprints,
     ) -> Result<Checked, ReloadError> {
         let d = &self.inner.deps;
-        let running = self.inner.running.lock().await;
-        if running.stopped {
-            return Err(ReloadError::Stopped);
-        }
+        let (config, generation) = {
+            let running = self.inner.running.lock().await;
+            if running.stopped {
+                return Err(ReloadError::Stopped);
+            }
+            (running.config.clone(), running.generation.doc.generation)
+        };
         let loaded = load_str(text, &*d.env, &d.key).map_err(ReloadError::Invalid)?;
-        let changes = diff_with(&running.config, &loaded.config, &|_, _| None, fingerprints);
+        let changes = diff_with(&config, &loaded.config, &|_, _| None, fingerprints);
         if changes.is_rejected() {
             return Err(ReloadError::Rejected(changes.report));
         }
@@ -296,7 +301,7 @@ impl ConfigCoordinator {
             warnings.push(w);
         }
         Ok(Checked {
-            generation: running.generation.doc.generation,
+            generation,
             warnings,
             changes,
         })

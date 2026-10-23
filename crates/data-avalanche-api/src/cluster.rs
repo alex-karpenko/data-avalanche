@@ -105,14 +105,19 @@ pub(crate) async fn status(State(api): State<Api>) -> Response {
     )
 }
 
-/// 202 once the leave is asked; 409 when this node leaves, or shuts down, already.
+/// 202 once the leave is asked, naming the node that leaves; 409 when this node leaves, or
+/// shuts down, already.
 pub(crate) async fn leave(State(api): State<Api>, Extension(by): Extension<Principal>) -> Response {
     let Some(node) = api.node.get() else {
         return starting();
     };
     if node.control.ask(Stop::Leave) {
         tracing::info!(by = %by.name, "leaving the cluster, asked through the API");
-        body(StatusCode::ACCEPTED, &json!({ "leaving": true }))
+        let me = node.members.borrow().me.clone();
+        body(
+            StatusCode::ACCEPTED,
+            &json!({ "leaving": true, "node": me }),
+        )
     } else {
         body(
             StatusCode::CONFLICT,
@@ -121,7 +126,8 @@ pub(crate) async fn leave(State(api): State<Api>, Extension(by): Extension<Princ
     }
 }
 
-/// 202 once the shutdown is asked; 409 when it is asked already.
+/// 202 once the shutdown is asked, naming the node that shuts down; 409 when it is asked
+/// already.
 pub(crate) async fn shutdown(
     State(api): State<Api>,
     Extension(by): Extension<Principal>,
@@ -131,7 +137,11 @@ pub(crate) async fn shutdown(
     };
     if node.control.ask(Stop::Shutdown) {
         tracing::info!(by = %by.name, "shutting down, asked through the API");
-        body(StatusCode::ACCEPTED, &json!({ "shutting_down": true }))
+        let me = node.members.borrow().me.clone();
+        body(
+            StatusCode::ACCEPTED,
+            &json!({ "shutting_down": true, "node": me }),
+        )
     } else {
         body(
             StatusCode::CONFLICT,
@@ -210,13 +220,13 @@ mod tests {
 
         assert_eq!(
             json_of(addr, "POST", "/v1/cluster/leave").await,
-            (202, json!({ "leaving": true }))
+            (202, json!({ "leaving": true, "node": "node-a" }))
         );
         assert_eq!(*watched.borrow(), Stop::Leave);
         assert_eq!(json_of(addr, "POST", "/v1/cluster/leave").await.0, 409);
         assert_eq!(
             json_of(addr, "POST", "/v1/admin/shutdown").await,
-            (202, json!({ "shutting_down": true }))
+            (202, json!({ "shutting_down": true, "node": "node-a" }))
         );
         assert_eq!(*watched.borrow(), Stop::Shutdown);
         assert_eq!(json_of(addr, "POST", "/v1/admin/shutdown").await.0, 409);

@@ -101,6 +101,9 @@ fn acceptor(id: &TlsIdentity) -> Result<TlsAcceptor, ServeError> {
     let certs = CertificateDer::pem_slice_iter(id.cert.text.expose().as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| ServeError::Tls(format!("cert: {e}")))?;
+    if certs.is_empty() {
+        return Err(ServeError::Tls("cert: no certificate in the PEM".into()));
+    }
     let key = PrivateKeyDer::from_pem_slice(id.key.text.expose().as_bytes())
         .map_err(|e| ServeError::Tls(format!("key: {e}")))?;
     // The provider is named, not the process default: two are linked (DA-DEP-5).
@@ -129,8 +132,12 @@ impl TlsListener {
         tokio::spawn(async move {
             let mut tcp = tcp;
             loop {
-                // Retries a failed accept after a pause, as axum's plain listener does.
-                let (stream, peer) = Listener::accept(&mut tcp).await;
+                // Retries a failed accept after a pause, as axum's plain listener does. Ends
+                // once the server is done with the listener, so the port is let go at once.
+                let (stream, peer) = tokio::select! {
+                    accepted = Listener::accept(&mut tcp) => accepted,
+                    () = tx.closed() => return,
+                };
                 let (tls, handed) = (tls.clone(), tx.clone());
                 tokio::spawn(async move {
                     match tokio::time::timeout(HANDSHAKE_TIMEOUT, tls.accept(stream)).await {
@@ -141,9 +148,6 @@ impl TlsListener {
                         Err(_) => tracing::debug!(%peer, "TLS handshake timed out"),
                     }
                 });
-                if tx.is_closed() {
-                    return;
-                }
             }
         });
         Ok(Self { addr, done })
@@ -255,6 +259,58 @@ mod tests {
 
         let answer = plain(addr).await;
         assert!(!answer.contains("HTTP/1.1 200"), "{answer}");
+    }
+
+    /// Once the server stops, the accept loop ends with it: the port is free without another
+    /// connection coming.
+    #[tokio::test]
+    async fn a_stopped_tls_listener_releases_its_port() {
+        let (id, _) = identity();
+        let bound = bind(
+            &HostPort {
+                host: "127.0.0.1".into(),
+                port: 0,
+            },
+            Some(&id),
+        )
+        .await
+        .unwrap();
+        let addr = bound.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let api = crate::test_support::api(crate::test_support::open());
+        let served = tokio::spawn(bound.serve(router(api), async {
+            let _ = stopped.await;
+        }));
+        stop.send(()).unwrap();
+        served.await.unwrap().unwrap();
+        let mut free = false;
+        for _ in 0..100 {
+            if TcpListener::bind(addr).await.is_ok() {
+                free = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(free, "{addr} is still bound");
+    }
+
+    #[tokio::test]
+    async fn a_cert_without_a_certificate_is_refused_at_bind() {
+        let (mut id, _) = identity();
+        id.cert = id.key.clone();
+        let err = bind(
+            &HostPort {
+                host: "127.0.0.1".into(),
+                port: 0,
+            },
+            Some(&id),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "globals.api.tls: cert: no certificate in the PEM"
+        );
     }
 
     #[tokio::test]

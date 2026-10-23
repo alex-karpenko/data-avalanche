@@ -629,7 +629,7 @@ async fn a_leave_through_the_api_hands_off_and_stays_up() {
 
     assert_eq!(
         p.call("POST", "/v1/cluster/leave").await,
-        (202, json!({ "leaving": true }))
+        (202, json!({ "leaving": true, "node": leaver }))
     );
     c.settled().await;
     c.e.exec("INSERT INTO items VALUES (2, 'b')").await;
@@ -651,7 +651,7 @@ async fn a_leave_through_the_api_hands_off_and_stays_up() {
 
     assert_eq!(
         p.call("POST", "/v1/admin/shutdown").await,
-        (202, json!({ "shutting_down": true }))
+        (202, json!({ "shutting_down": true, "node": leaver }))
     );
     assert!(p.exit().await.success(), "{}", p.log());
     c.stop().await;

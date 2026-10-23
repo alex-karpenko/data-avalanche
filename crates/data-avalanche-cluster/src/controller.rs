@@ -852,8 +852,11 @@ impl PipelineController {
                     // As a reload's restart: a pipeline in ERROR runs again (Pipeline_Lifecycle
                     // §3), and a paused or stopped one stays so (the API refuses those).
                     if asked.restart {
-                        self.discard(&mut worker).await;
-                        tracing::info!(pipeline = %self.pipeline.name, "restarted on request");
+                        if self.discard(&mut worker).await {
+                            tracing::info!(pipeline = %self.pipeline.name, "restarted on request");
+                        } else {
+                            tracing::info!(pipeline = %self.pipeline.name, "a restart was asked, but no worker runs: the next one starts afresh");
+                        }
                         error = None;
                         dumped = false;
                         retry = None;

@@ -110,11 +110,20 @@ impl PipelineDocs {
         self.docs.load(STATUS_KEY).await
     }
 
+    /// Writes the owner's status, and returns the one stored. A stored status of a later term
+    /// (a higher `owner_epoch`) is kept: a former owner, stalled past its lease, doesn't
+    /// overwrite its successor's.
+    ///
     /// # Errors
     /// A storage or decode failure.
     pub async fn save_status(&self, doc: &StatusDoc) -> Result<Versioned<StatusDoc>, StateError> {
         self.docs
-            .modify(STATUS_KEY, |_: Option<StatusDoc>| Ok(doc.clone()))
+            .modify(STATUS_KEY, |stored: Option<StatusDoc>| {
+                Ok(match stored {
+                    Some(later) if later.owner_epoch > doc.owner_epoch => later,
+                    _ => doc.clone(),
+                })
+            })
             .await
     }
 
@@ -252,6 +261,34 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         assert_eq!(v["version"], 1);
         assert_eq!(v["actual"], "stopped");
+    }
+
+    /// A former owner, stalled past its lease, doesn't overwrite its successor's status.
+    #[tokio::test]
+    async fn a_status_of_an_earlier_term_keeps_the_later_one() {
+        let docs = pipeline();
+        let status = |node: &str, owner_epoch, actual| StatusDoc {
+            holder_node_id: node.into(),
+            owner_epoch,
+            actual,
+            error: None,
+            code: None,
+            degraded: None,
+            written_at: t(1),
+        };
+        let later = status("node-b", 2, ActualState::Running);
+        docs.save_status(&later).await.unwrap();
+        let stale = docs
+            .save_status(&status("node-a", 1, ActualState::Stopped))
+            .await
+            .unwrap();
+        assert_eq!(stale.doc, later, "what is stored is returned");
+        assert_eq!(docs.status().await.unwrap().unwrap().doc, later);
+        let same_term = status("node-b", 2, ActualState::Paused);
+        docs.save_status(&same_term).await.unwrap();
+        let next = status("node-c", 3, ActualState::Starting);
+        docs.save_status(&next).await.unwrap();
+        assert_eq!(docs.status().await.unwrap().unwrap().doc, next);
     }
 
     #[tokio::test]
