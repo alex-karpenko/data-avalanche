@@ -881,6 +881,9 @@ impl PipelineController {
                 Event::Update(Update::Restart(p, docs)) => {
                     self.reconfigure(*p);
                     self.docs = docs;
+                    // The baselines belong to the state location: a reload may move it.
+                    reported = Reported::default();
+                    seen = self.docs.requests().await.ok();
                     self.discard(&mut worker).await;
                     tracing::info!(pipeline = %self.pipeline.name, "restarted for a reload");
                     error = None;
@@ -1943,6 +1946,47 @@ mod tests {
         assert_eq!(n.status.borrow().owner_epoch, Some(1), "the same lease");
         f.source.commit(FakeTxn::new().insert(&t("a"), row(1)));
         eventually("the row lands", || f.ids("a") == [1]).await;
+    }
+
+    /// A reload that moves the state documents: the restart writes its status at the new
+    /// location even when it equals the last one written, and a request waiting there is not
+    /// taken as new.
+    #[tokio::test(start_paused = true)]
+    async fn a_reload_restart_at_new_state_writes_its_status_there() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a"]);
+        // Faults for the first run and the reload's run, both failing the same way.
+        for _ in 0..3 {
+            f.source.fail(
+                Method::Preflight,
+                SourceError::Permanent("no privilege".into()),
+            );
+        }
+        let mut n = node("n1", &store, &docs, &f);
+        until(&mut n.status, "error", |s| {
+            matches!(&s.actual, Some(Actual::Error { .. }))
+        })
+        .await;
+        status_doc_until(&docs, "error", |d| d.actual == ActualState::Error).await;
+        let moved = pipeline_docs();
+        moved.open("p", "delta").await.unwrap();
+        moved.request(Action::Restart, asked("r9")).await.unwrap();
+        n.updates
+            .send(Update::Restart(Box::new(pipeline()), moved.clone()))
+            .unwrap();
+        eventually("a second worker", || f.builds() == 2).await;
+        let there = status_doc_until(&moved, "error at the new location", |d| {
+            d.actual == ActualState::Error
+        })
+        .await;
+        assert_eq!(there.doc.owner_epoch, 1, "the same lease");
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(
+            f.builds(),
+            2,
+            "only the reload's restart; the waiting request is not taken"
+        );
     }
 
     /// A restart runs a pipeline in `ERROR` again: the reloaded config may be the fix.
