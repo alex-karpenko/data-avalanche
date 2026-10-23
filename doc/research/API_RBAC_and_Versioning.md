@@ -63,6 +63,13 @@ Notes:
 - **`config/validate` is operator, not viewer** — it echoes the *resolved* config, which can contain
   resolved secret material; it must not be readable by a status-only principal. (M9a's validate
   returns the report and what a reload would change, never the resolved config; it stays operator.)
+  As built: validate of a posted body doesn't compare secret or file fingerprints
+  (`"secrets_compared": false`), so a body can't confirm a guess at a running secret by whether its
+  path is listed; validate of the node's own file compares them. A body still makes the node read
+  the files it names (`credentials_file`, TLS paths), so an operator learns whether a path the node
+  can read exists and parses, never its content. Its answer still echoes an added pipeline's
+  resolved `id` and `name`, so a body with `id: ${VAR}` shows a node environment variable whose
+  value fits V-055's pattern (DA-API-19).
 - **Config reload = operator** (routine ops). Cluster-destructive ops (`leave`, `shutdown`) = admin.
 - **Pipeline `stop`** releases DB connections/leases but is recoverable, so it stays operator; only
   node-level teardown is admin.
@@ -85,13 +92,31 @@ Notes:
 A missing/invalid token on an authenticated endpoint → **401**; a valid token lacking the required role
 → **403**. Unauthenticated probes (`/health/*`, `/metrics`) never challenge.
 
-As built in M9a (D-M9a.6): a 401 carries `WWW-Authenticate: Basic` or `Bearer` with
-`realm="data-avalanche"`. A token signed with a shared-secret algorithm (HS*) is refused, since no
-secret is configured to check it. When the issuer's keys can't be fetched the answer is **503**,
-not 401: the token may be fine. The keys are cached and fetched again for an unknown `kid` at most
-every 30 s. `oauth2` finds its JWKS through `discovery_url` when it has no `jwks_url`, and checks
-that the discovery document's `issuer` is the configured one; tokens are verified locally (no
-introspection).
+As built in M9a (D-M9a.6, and the review fixes in the plan's deviations):
+
+- A 401 carries `WWW-Authenticate: Basic` or `Bearer` with `realm="data-avalanche"`. `basic`
+  compares fixed-length digests of the credentials, so the comparison doesn't depend on where they
+  differ or on their lengths.
+- A token must carry `exp` and `iss` (the configured issuer), and `aud` when an audience is
+  configured; `nbf` is checked when present. `exp` and `nbf` allow 60 s of clock skew. A token
+  signed with a shared-secret algorithm (HS*) is refused, since no secret is configured to check it.
+- `roles_claim` names the claim by its literal key first (an IdP's namespaced claim such as
+  `https://example.com/roles`), then as a dotted path (`realm_access.roles`).
+- The issuer's keys are cached. A token whose `kid` the cached set holds verifies at once, even
+  while a fetch runs. The set is fetched again once it is ten minutes old, and for an unknown `kid`
+  at most every 30 s; one fetch runs at a time, outside the cache's lock, and a failed fetch keeps
+  the old keys. When no set was ever fetched, or a `kid` is missing and the last fetch failed, the
+  answer is **503**, not 401: the token may be fine. The 503 names no URL or error (those are
+  logged).
+- A reload that leaves the key source alone (the issuer, `jwks_url` or `discovery_url`) keeps the
+  cached keys; a change of `role_mapping`, `roles_claim` or `audience` doesn't refetch them.
+- Auth settings that don't hold together (a mode without its settings) fail closed: every request
+  is refused with 503, and the error is logged. V-049…V-051 refuse such a file at load.
+- `oauth2` finds its JWKS through `discovery_url` when it has no `jwks_url`, and checks that the
+  discovery document's `issuer` is the configured one; tokens are verified locally (no
+  introspection).
+- A node that left the cluster keeps the auth of its last generation until it is stopped
+  (DA-API-14).
 
 ---
 

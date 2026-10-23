@@ -63,7 +63,7 @@ This is the single idea that answers every §2.5 question.
             resume                      stop
   STOPPED ─────────► RUNNING     (resume / start)
 
-  restart:  RUNNING ─(drain+flush, §12.4)─► STARTING ─► RUNNING   (valid only on RUNNING)
+  restart:  RUNNING ─(discard and replay, §12.4)─► STARTING ─► RUNNING   (valid only on RUNNING)
   flush:    action in RUNNING (and PAUSED is already flushed) — no state change
 
   out of ERROR:  ERROR ─stop─► STOPPED ─resume─► RUNNING   (reruns from Phase 0, as a restart)
@@ -88,6 +88,10 @@ This is the single idea that answers every §2.5 question.
     `STOPPED` is illegal.
   - `flush` on `PAUSED` answers `200` unchanged (the pause flushed); on `STOPPED`, or with no lease
     holder, `409`.
+  - A `restart` or `flush` is taken by the holder at its next poll, so its `202` says the request
+    is recorded, not done. A flush taken while no worker runs (`ERROR`, or between retries) is a
+    logged no-op. Each request gets a new id: a client that retries the call after losing the
+    answer asks twice (DA-API-15).
 - **`flush`** forces an immediate flush and **resets the time-based flush timer and the row/byte
   counters** (closes §9.6). A no-op warning if the buffer is empty.
 
