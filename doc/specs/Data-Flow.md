@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-15
+updated: 2026-10-23
 domain: Architecture
 tags: [architecture, data-flow, pipeline, cdc, iceberg, delta-lake, multi-sink, arrow, snapshot, replication]
 sources: []
@@ -651,6 +651,12 @@ membership, the lease registry) lives separately under `globals.state` per
 <per-pipeline state location>/                   (state.prefix | sink.prefix, defaults to pipeline id)
 ├── pipeline-state.json                          — overall pipeline state version + recorded `sink_type`
 │                                                  (resume refuses a mismatch with `sink.type`)
+├── status.json                                  — the owner's view: holder, owner epoch, actual state, error,
+│                                                  halt code, degraded; written by the lease holder when it
+│                                                  changes, read by every node's API under the live lease's epoch
+├── requests.json                                — the last restart and the last flush asked through the API,
+│                                                  each `{id, at}`; the owner takes an id it hasn't seen in its
+│                                                  lease term
 ├── replication/
 │   ├── slot.json                                — PG: slot name, confirmed_flush_lsn (`0/0`: the intent to
 │   │                                              create the slot, written before a managed first start)

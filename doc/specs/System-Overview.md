@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-21
+updated: 2026-10-23
 domain: Architecture
 tags: [architecture, design, system, multi-sink, iceberg, delta-lake, v1-scope]
 sources: []
@@ -121,7 +121,7 @@ Functional endpoints are versioned under `/v1`; probes and metrics are unversion
 |---|---|---|---|
 | Liveness / readiness | `GET /health/live`, `GET /health/ready` | none | |
 | Metrics | `GET /metrics` | none | Prometheus exposition |
-| Config validate | `POST /v1/config/validate` | operator | dry-run of the full load pipeline (parse → validate → resolve) |
+| Config validate | `POST /v1/config/validate` | operator | dry-run of the full load pipeline (parse → validate → resolve) of the body, or of the node's file when the body is empty: the report and what a reload would change; the resolved config is not returned; nothing is published |
 | Config reload | `POST /v1/config/reload` | operator | publishes a new config generation cluster-wide |
 | Config status | `GET /v1/config/status` | viewer | |
 | Cluster status | `GET /v1/cluster/status` | viewer | |
@@ -132,12 +132,13 @@ Functional endpoints are versioned under `/v1`; probes and metrics are unversion
 | Pipeline pause | `POST /v1/pipelines/{id}/pause` | operator | `RUNNING → PAUSED`: flush to a transaction boundary and commit; source connection kept warm; lease kept |
 | Pipeline stop | `POST /v1/pipelines/{id}/stop` | operator | `RUNNING/PAUSED → STOPPED`: flush, close the source connection (PG slot kept); lease kept |
 | Pipeline resume | `POST /v1/pipelines/{id}/resume` | operator | `PAUSED/STOPPED → RUNNING` |
-| Pipeline restart | `POST /v1/pipelines/{id}/restart` | operator | `RUNNING` only: drain, discard unflushed data, replay from the last confirmed position; otherwise `409` |
+| Pipeline restart | `POST /v1/pipelines/{id}/restart` | operator | desired state `RUNNING` only (a pipeline in `ERROR` included: a restart runs it again): drain, discard unflushed data, replay from the last confirmed position; otherwise `409` |
 | Pipeline flush | `POST /v1/pipelines/{id}/flush` | operator | immediate flush; resets the flush timer and counters; no state change |
-| Leave cluster | `POST /v1/cluster/leave` | admin | planned drain and hand-off of owned pipelines |
-| Shutdown | `POST /v1/admin/shutdown` | admin | |
+| Leave cluster | `POST /v1/cluster/leave` | admin | planned drain and hand-off of owned pipelines; the process stays up, not ready, and still answers the API; a process restart joins again |
+| Shutdown | `POST /v1/admin/shutdown` | admin | as SIGTERM: the leave, then the process exits |
+| API description | `GET /v1/openapi.json` | viewer | the OpenAPI 3.1 document of the `/v1` endpoints, each with its min role |
 
-Pause/stop/resume set the pipeline's persisted **desired state**; it survives restarts, failover and config reloads (a reload never resumes a paused or stopped pipeline). Illegal transitions return `409 Conflict` with the current state.
+Pause/stop/resume set the pipeline's persisted **desired state**; it survives restarts, failover and config reloads (a reload never resumes a paused or stopped pipeline). Illegal transitions return `409 Conflict` with the current state; asking for the state the pipeline is in already changes nothing and is not an error. Any node answers any endpoint: a lifecycle action is recorded in the pipeline's state location and the pipeline's owner carries it out at its next poll (restart and flush answer `202`), and a status is read from the same documents.
 
 ## Observability catalogue
 
