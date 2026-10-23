@@ -463,6 +463,14 @@ mod tests {
                         "{} {path} as {claim}: {code} {body}",
                         r.method
                     );
+                    // The handler's own 503, not the gate's.
+                    if code == 503 {
+                        assert_eq!(
+                            body, "{\"error\":\"the node is starting\"}\n",
+                            "{} {path} as {claim}",
+                            r.method
+                        );
+                    }
                 } else {
                     assert_eq!(code, 403, "{} {path} as {claim}: {body}", r.method);
                 }

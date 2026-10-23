@@ -4,7 +4,7 @@
 //! one taken; a token with no role it maps is refused (403), not taken as `viewer`. `oauth2`
 //! finds the JWKS through OIDC discovery when it has no `jwks_url`; tokens are verified locally,
 //! never introspected (no client credentials are configured). The settings are R: [`Auth::set`]
-//! takes a reload's.
+//! takes a reload's. Settings without what their mode reads refuse every request (503).
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
@@ -31,6 +31,11 @@ pub const REFETCH_AFTER: Duration = Duration::from_secs(30);
 /// keeps the old keys and is tried again after [`REFETCH_AFTER`].
 pub const KEYS_MAX_AGE: Duration = Duration::from_secs(600);
 
+/// The 503 while the keys can't be fetched: the reason is logged, not answered.
+const KEYS_UNAVAILABLE: &str = "the token issuer's keys can't be fetched";
+/// The 503 of auth settings without what their mode reads.
+const MISCONFIGURED: &str = "the API's auth settings are inconsistent: every request is refused";
+
 #[derive(Debug, Clone, Copy)]
 struct Timing {
     refetch_after: Duration,
@@ -55,7 +60,8 @@ pub(crate) enum Denied {
     },
     /// 403: verified, but no role this endpoint takes.
     Forbidden(String),
-    /// 503: the issuer's keys can't be fetched, so no token can be verified.
+    /// 503: the issuer's keys can't be fetched, or the auth settings don't hold together, so
+    /// no caller can be verified.
     Unavailable(String),
 }
 
@@ -89,6 +95,8 @@ enum Mode {
     Open,
     Basic(Credentials),
     Token(Box<Verifier>),
+    /// A mode without the settings it reads (V-049…V-051 refuse such a config): fails closed.
+    Refused,
 }
 
 #[derive(Debug)]
@@ -161,6 +169,7 @@ impl Auth {
             }),
             Mode::Basic(credentials) => basic(credentials, headers),
             Mode::Token(verifier) => verifier.verify(headers).await,
+            Mode::Refused => Err(Denied::Unavailable(MISCONFIGURED.into())),
         }
     }
 
@@ -196,6 +205,7 @@ fn mode(s: &Settings, timing: Timing, keys: Option<Arc<Keys>>) -> Mode {
         }))
     };
     match (s.auth, &s.credentials, &s.jwt, &s.oauth2) {
+        (ApiAuth::None, ..) => Mode::Open,
         (ApiAuth::Basic, Some(c), _, _) => Mode::Basic(c.clone()),
         (ApiAuth::Jwt, _, Some(j), _) => token(
             &j.issuer,
@@ -203,20 +213,26 @@ fn mode(s: &Settings, timing: Timing, keys: Option<Arc<Keys>>) -> Mode {
             &j.roles_claim,
             KeySource::Jwks(j.jwks_url.clone()),
         ),
-        (ApiAuth::Oauth2, _, _, Some(o)) => token(
-            &o.issuer,
-            &o.audience,
-            &o.roles_claim,
-            match (&o.jwks_url, &o.discovery_url) {
-                (Some(url), _) => KeySource::Jwks(url.clone()),
-                // V-051 requires one of them.
-                (None, url) => KeySource::Discovery {
-                    url: url.clone().unwrap_or_default(),
+        (ApiAuth::Oauth2, _, _, Some(o)) if o.jwks_url.is_some() || o.discovery_url.is_some() => {
+            token(
+                &o.issuer,
+                &o.audience,
+                &o.roles_claim,
+                match (&o.jwks_url, &o.discovery_url) {
+                    (Some(url), _) => KeySource::Jwks(url.clone()),
+                    (None, url) => KeySource::Discovery {
+                        url: url.clone().unwrap_or_default(),
+                    },
                 },
-            },
-        ),
-        // V-049…V-051 require the settings each mode reads; none means open.
-        _ => Mode::Open,
+            )
+        }
+        // V-049…V-051 require the settings each mode reads: without them, nobody is let in.
+        (auth, ..) => {
+            tracing::error!(
+                "globals.api.auth is {auth:?} without the settings it reads: every API request is refused (503)"
+            );
+            Mode::Refused
+        }
     }
 }
 
@@ -234,6 +250,13 @@ fn credential<'h>(headers: &'h HeaderMap, scheme: &str) -> Option<&'h str> {
     given.eq_ignore_ascii_case(scheme).then(|| rest.trim())
 }
 
+/// Equal in constant time, whatever the lengths: fixed-length digests of both are compared.
+fn same(given: &str, expected: &str) -> subtle::Choice {
+    blake3::hash(given.as_bytes())
+        .as_bytes()
+        .ct_eq(blake3::hash(expected.as_bytes()).as_bytes())
+}
+
 fn basic(c: &Credentials, headers: &HeaderMap) -> Result<Principal, Denied> {
     let given = credential(headers, "Basic")
         .ok_or_else(|| unauthenticated(BASIC, "basic credentials are required"))?;
@@ -246,8 +269,8 @@ fn basic(c: &Credentials, headers: &HeaderMap) -> Result<Principal, Denied> {
         .split_once(':')
         .ok_or_else(|| unauthenticated(BASIC, "the basic credentials don't decode"))?;
     // Both compared in full, whichever differs.
-    let user_ok = user.as_bytes().ct_eq(c.user().as_bytes());
-    let password_ok = password.as_bytes().ct_eq(c.password().expose().as_bytes());
+    let user_ok = same(user, c.user());
+    let password_ok = same(password, c.password().expose());
     if bool::from(user_ok & password_ok) {
         Ok(Principal {
             name: user.to_owned(),
@@ -285,6 +308,8 @@ impl Verifier {
         let key = self.keys.key(header.kid.as_deref()).await?;
         let mut validation = Validation::new(header.alg);
         validation.set_issuer(&[&self.issuer]);
+        // `nbf` too, when the token has one, within the library's leeway (60 s).
+        validation.validate_nbf = true;
         // The library checks `iss` and `aud` only when the token has them: require them.
         match &self.audience {
             Some(aud) => {
@@ -376,8 +401,8 @@ struct Cache {
     set_at: Option<Instant>,
     /// When a fetch was last started.
     fetched: Option<Instant>,
-    /// Why the last fetch failed, until one succeeds.
-    failure: Option<String>,
+    /// The last fetch failed, until one succeeds (its reason is logged).
+    failed: bool,
     /// The fetch under way: its sender is dropped once the outcome is stored.
     in_flight: Option<watch::Receiver<()>>,
 }
@@ -433,16 +458,12 @@ impl Keys {
             let _ = done.changed().await;
         }
         let cache = self.cache();
-        match (
-            cache.set.as_ref().and_then(|s| find(s, kid)),
-            &cache.failure,
-        ) {
-            (Some(key), _) => key,
-            (None, Some(failure)) => Err(Denied::Unavailable(failure.clone())),
-            (None, None) if cache.set.is_none() => Err(Denied::Unavailable(
-                "the issuer's keys are not fetched".into(),
-            )),
-            (None, None) => Err(unauthenticated(
+        match cache.set.as_ref().and_then(|s| find(s, kid)) {
+            Some(key) => key,
+            None if cache.failed || cache.set.is_none() => {
+                Err(Denied::Unavailable(KEYS_UNAVAILABLE.into()))
+            }
+            None => Err(unauthenticated(
                 BEARER,
                 format!("no key {kid:?} in the issuer's JWKS"),
             )),
@@ -462,11 +483,11 @@ impl Keys {
                 Ok(set) => {
                     cache.set = Some(set);
                     cache.set_at = Some(Instant::now());
-                    cache.failure = None;
+                    cache.failed = false;
                 }
                 Err(why) => {
                     tracing::warn!("the API's token keys can't be fetched: {why}");
-                    cache.failure = Some(why);
+                    cache.failed = true;
                 }
             }
             cache.in_flight = None;
@@ -567,6 +588,42 @@ mod tests {
         assert_eq!((p.name.as_str(), p.role), ("anonymous", Role::Admin));
     }
 
+    /// A mode without the settings it reads lets nobody in: 503 for every request.
+    #[tokio::test]
+    async fn auth_settings_that_dont_hold_together_refuse_every_request() {
+        let idp = Issuer::start().await;
+        let jwt_without = {
+            let mut api = idp.api("roles");
+            api.jwt = None;
+            api
+        };
+        let basic_without = {
+            let mut api = config().globals.api;
+            api.auth = ApiAuth::Basic;
+            api
+        };
+        let oauth2_without_urls = {
+            let mut api = config().globals.api;
+            api.auth = ApiAuth::Oauth2;
+            api.oauth2 = Some(ApiOauth2 {
+                issuer: idp.url.clone(),
+                audience: None,
+                jwks_url: None,
+                discovery_url: None,
+                roles_claim: "roles".into(),
+            });
+            api
+        };
+        let token = bearer(&idp.token(json!(["admin"])));
+        for api in [jwt_without, basic_without, oauth2_without_urls] {
+            let auth = Auth::new(&api);
+            for headers in [HeaderMap::new(), token.clone()] {
+                let why = unavailable(auth.verify(&headers).await);
+                assert!(why.contains("inconsistent"), "{:?}: {why}", api.auth);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn basic_lets_its_one_user_in_as_admin() {
         let mut api = config().globals.api;
@@ -660,6 +717,12 @@ mod tests {
         };
         let expired = with(&|c| c["exp"] = json!(now - 120));
         assert!(denied_401(auth.verify(&expired).await).contains("Expired"));
+        // Not before ten minutes from now: past the 60 s leeway. Within it, taken.
+        let early = with(&|c| c["nbf"] = json!(now + 600));
+        assert!(denied_401(auth.verify(&early).await).contains("ImmatureSignature"));
+        auth.verify(&with(&|c| c["nbf"] = json!(now + 30)))
+            .await
+            .unwrap();
         denied_401(
             auth.verify(&with(&|c| c["iss"] = json!("https://elsewhere")))
                 .await,
@@ -755,10 +818,10 @@ mod tests {
 
         // A discovery document of another issuer is not this one's.
         api.oauth2 = Some(oauth2("https://idp.example.com"));
-        match Auth::new(&api).verify(&token).await {
-            Err(Denied::Unavailable(why)) => assert!(why.contains("not the configured"), "{why}"),
-            other => panic!("{other:?}"),
-        }
+        // The reason is logged; the caller isn't told the URL or the error.
+        let why = unavailable(Auth::new(&api).verify(&token).await);
+        assert_eq!(why, "the token issuer's keys can't be fetched");
+        assert!(!why.contains(&idp.url), "{why}");
     }
 
     #[tokio::test]
@@ -774,8 +837,8 @@ mod tests {
         let token = bearer(&idp.token(json!(["admin"])));
         // Again, inside the refetch window: still no keys, still 503.
         for _ in 0..2 {
-            let r = auth.verify(&token).await;
-            assert!(matches!(r, Err(Denied::Unavailable(_))), "{r:?}");
+            let why = unavailable(auth.verify(&token).await);
+            assert_eq!(why, "the token issuer's keys can't be fetched");
         }
     }
 
