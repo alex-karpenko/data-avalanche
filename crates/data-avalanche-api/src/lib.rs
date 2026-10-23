@@ -9,6 +9,7 @@
 //! role is 403.
 
 mod auth;
+mod cluster;
 mod config;
 mod pipelines;
 mod server;
@@ -33,6 +34,7 @@ use serde_json::{Value, json};
 use tokio::sync::watch;
 
 pub use auth::{Auth, FETCH_TIMEOUT, KEYS_MAX_AGE, Principal, REFETCH_AFTER};
+pub use cluster::{Control, Stop};
 pub use server::{Bound, HANDSHAKE_TIMEOUT, ServeError, bind};
 
 use crate::auth::Denied;
@@ -59,6 +61,8 @@ pub struct Node {
     pub docs: Arc<DocsFn>,
     /// The leases in `globals.state`: who holds each pipeline.
     pub leases: Leases,
+    /// The node's leave and shutdown.
+    pub control: Control,
 }
 
 impl std::fmt::Debug for Node {
@@ -87,12 +91,20 @@ const fn route(method: &'static str, path: &'static str, role: Role) -> Route {
 fn v1() -> Vec<(Route, MethodRouter<Api>)> {
     vec![
         (
+            route("POST", "/v1/config/validate", Role::Operator),
+            post(config::validate),
+        ),
+        (
             route("POST", "/v1/config/reload", Role::Operator),
             post(config::reload),
         ),
         (
             route("GET", "/v1/config/status", Role::Viewer),
             get(config::status),
+        ),
+        (
+            route("GET", "/v1/cluster/status", Role::Viewer),
+            get(cluster::status),
         ),
         (
             route("GET", "/v1/pipelines", Role::Viewer),
@@ -121,6 +133,14 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
         (
             route("POST", "/v1/pipelines/{id}/flush", Role::Operator),
             post(pipelines::flush),
+        ),
+        (
+            route("POST", "/v1/cluster/leave", Role::Admin),
+            post(cluster::leave),
+        ),
+        (
+            route("POST", "/v1/admin/shutdown", Role::Admin),
+            post(cluster::shutdown),
         ),
     ]
 }
@@ -235,7 +255,7 @@ mod tests {
     /// API_RBAC §2's matrix, for the routes this build serves.
     #[test]
     fn the_routes_take_the_roles_of_api_rbac() {
-        use Role::{Operator, Viewer};
+        use Role::{Admin, Operator, Viewer};
         let table: Vec<_> = routes()
             .into_iter()
             .map(|r| (r.method, r.path, r.role))
@@ -243,8 +263,10 @@ mod tests {
         assert_eq!(
             table,
             [
+                ("POST", "/v1/config/validate", Operator),
                 ("POST", "/v1/config/reload", Operator),
                 ("GET", "/v1/config/status", Viewer),
+                ("GET", "/v1/cluster/status", Viewer),
                 ("GET", "/v1/pipelines", Viewer),
                 ("GET", "/v1/pipelines/{id}", Viewer),
                 ("POST", "/v1/pipelines/{id}/pause", Operator),
@@ -252,6 +274,8 @@ mod tests {
                 ("POST", "/v1/pipelines/{id}/resume", Operator),
                 ("POST", "/v1/pipelines/{id}/restart", Operator),
                 ("POST", "/v1/pipelines/{id}/flush", Operator),
+                ("POST", "/v1/cluster/leave", Admin),
+                ("POST", "/v1/admin/shutdown", Admin),
             ]
         );
     }

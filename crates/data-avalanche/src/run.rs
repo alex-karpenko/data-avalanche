@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
-use data_avalanche_api::{Api, Auth, Node, ServeError, bind, router};
+use data_avalanche_api::{Api, Auth, Control, Node, ServeError, Stop, bind, router};
 use data_avalanche_cluster::{
     ClusterReconciler, ConfigCoordinator, ControllerDeps, ControllerSettings, CoordinatorDeps,
     DocsFn, Gossip, GossipKey, GossipSettings, LeaseTiming, NodeIdentity, NodeMeta, Phase,
@@ -86,7 +86,8 @@ pub(crate) fn leave_within(config: &ResolvedConfig) -> Duration {
     c.drain_timeout.saturating_mul(rounds) + 2 * c.lease_renewal_interval
 }
 
-/// Runs every pipeline until SIGTERM or SIGINT.
+/// Runs every pipeline until SIGTERM, SIGINT or a shutdown through the API. A leave through the
+/// API leaves the cluster first and keeps the process up (D-M9a.8).
 ///
 /// # Errors
 /// [`Fatal`]: the config is refused, or `globals.state` can't be joined.
@@ -225,22 +226,46 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         gossip.members(),
         c.lease_renewal_interval,
     ));
+    let (control, mut asked) = Control::new();
     let _ = node.set(Node {
         coordinator: Arc::clone(&coordinator),
         members: gossip.members(),
         file: args.config.clone(),
         docs,
         leases: deps.leases.clone(),
+        control,
     });
     ready.store(true, Ordering::SeqCst);
-    shutdown_signal().await;
-    tracing::info!("shutting down: handing off every pipeline and releasing its lease");
-    ready.store(false, Ordering::SeqCst);
-    discovery.abort();
-    // No generation is adopted during the leave; it hands off what the last one configures.
-    coordinator.stop().await;
-    let config = coordinator.config().await;
-    leave(gossip, reconciler, leave_within(&config)).await;
+    let mut cluster = Some((gossip, reconciler, discovery));
+    loop {
+        let stop = tokio::select! {
+            () = shutdown_signal() => Stop::Shutdown,
+            changed = asked.changed() => match changed {
+                Ok(()) => *asked.borrow_and_update(),
+                Err(_) => Stop::Shutdown,
+            },
+        };
+        if stop == Stop::Run {
+            continue;
+        }
+        if let Some((gossip, reconciler, discovery)) = cluster.take() {
+            tracing::info!(
+                "leaving the cluster: handing off every pipeline and releasing its lease"
+            );
+            ready.store(false, Ordering::SeqCst);
+            discovery.abort();
+            // No generation is adopted during the leave; it hands off what the last one
+            // configures.
+            coordinator.stop().await;
+            let config = coordinator.config().await;
+            leave(gossip, reconciler, leave_within(&config)).await;
+        }
+        if stop == Stop::Shutdown {
+            break;
+        }
+        tracing::info!("left the cluster; the process stays up until it is stopped");
+    }
+    tracing::info!("shutting down");
     let _ = stop_http.send(());
     let _ = server.await;
     tracing::info!("stopped");

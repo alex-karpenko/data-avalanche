@@ -26,7 +26,7 @@ pub use controller::{
     Target, Update, WorkerFactory,
 };
 pub use coordinator::{
-    ConfigCoordinator, CoordinatorDeps, DocsFn, PUBLISH_ATTEMPTS, ReloadError, Reloaded,
+    Checked, ConfigCoordinator, CoordinatorDeps, DocsFn, PUBLISH_ATTEMPTS, ReloadError, Reloaded,
 };
 pub use discovery::{Seeds, advertise, discover, interfaces};
 pub use error::ClusterError;

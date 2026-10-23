@@ -1,14 +1,69 @@
-//! `/v1/config`: the reload and its status (Clustering §9.2).
+//! `/v1/config`: the check, the reload and its status (Clustering §9.2).
 
 use std::collections::BTreeMap;
 
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Response;
-use data_avalanche_cluster::{ReloadError, Reloaded};
+use data_avalanche_cluster::{Checked, ReloadError, Reloaded};
 use serde_json::json;
 
 use crate::{Api, body, starting};
+
+/// A refused reload or check: 422 with the report, 409 after the retries, 503 when
+/// `globals.state` fails or the node stops.
+fn refused(e: &ReloadError) -> Response {
+    let code = match e {
+        ReloadError::Invalid(_) | ReloadError::Rejected(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        ReloadError::Contended => StatusCode::CONFLICT,
+        ReloadError::State(_) | ReloadError::Stopped => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    let mut v = json!({ "error": e.to_string() });
+    if let ReloadError::Invalid(r) | ReloadError::Rejected(r) = e {
+        v["report"] = r.to_json();
+    }
+    body(code, &v)
+}
+
+/// Checks a config and publishes nothing (D-M9a.7): the request's body, or the node's file when
+/// the body is empty, loaded in this node's environment and diffed against the generation it
+/// runs. 200 with the warnings and what a reload would change; 422 with the report when it is
+/// invalid or changes a field only a process restart applies. The resolved config, secrets
+/// and all, is not echoed.
+pub(crate) async fn validate(State(api): State<Api>, text: String) -> Response {
+    let Some(node) = api.node.get() else {
+        return starting();
+    };
+    let text = if text.trim().is_empty() {
+        match tokio::fs::read_to_string(&node.file).await {
+            Ok(text) => text,
+            Err(e) => {
+                return body(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &json!({ "error": format!("cannot read config file {}: {e}", node.file.display()) }),
+                );
+            }
+        }
+    } else {
+        text
+    };
+    match node.coordinator.check(&text).await {
+        Ok(Checked {
+            generation,
+            warnings,
+            changes,
+        }) => body(
+            StatusCode::OK,
+            &json!({
+                "valid": true,
+                "against_generation": generation,
+                "warnings": warnings.to_json()["warnings"],
+                "changes": { "globals": changes.globals, "pipelines": changes.pipelines },
+            }),
+        ),
+        Err(e) => refused(&e),
+    }
+}
 
 /// Publishes the node's file as the next config generation: 202 with it, 200 when the file is
 /// the generation the cluster runs already, 422 with the validation report when it is invalid or
@@ -35,20 +90,7 @@ pub(crate) async fn reload(State(api): State<Api>) -> Response {
             StatusCode::OK,
             &json!({ "generation": generation, "unchanged": true }),
         ),
-        Err(e) => {
-            let code = match &e {
-                ReloadError::Invalid(_) | ReloadError::Rejected(_) => {
-                    StatusCode::UNPROCESSABLE_ENTITY
-                }
-                ReloadError::Contended => StatusCode::CONFLICT,
-                ReloadError::State(_) | ReloadError::Stopped => StatusCode::SERVICE_UNAVAILABLE,
-            };
-            let mut v = json!({ "error": e.to_string() });
-            if let ReloadError::Invalid(r) | ReloadError::Rejected(r) = &e {
-                v["report"] = r.to_json();
-            }
-            body(code, &v)
-        }
+        Err(e) => refused(&e),
     }
 }
 
@@ -97,7 +139,54 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
-    use crate::test_support::{CONFIG, json_of, lone, serve};
+    use crate::test_support::{CONFIG, json_of, lone, request, serve};
+
+    #[tokio::test]
+    async fn a_check_says_what_a_reload_would_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.yaml");
+        std::fs::write(&file, CONFIG).unwrap();
+        let lone = lone(file.clone()).await;
+        let node = Arc::new(OnceLock::new());
+        node.set(lone.node.clone()).unwrap();
+        let addr = serve(Api {
+            metrics: Metrics::new(),
+            ready: Arc::new(AtomicBool::new(true)),
+            node,
+            auth: crate::test_support::open(),
+        })
+        .await;
+        let check = |text: String| async move {
+            let (code, _, body) = request(addr, "POST", "/v1/config/validate", &[], &text).await;
+            (code, serde_json::from_str::<Value>(&body).unwrap())
+        };
+
+        let (code, v) = check(String::new()).await;
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(
+            v,
+            json!({ "valid": true, "against_generation": 1, "warnings": [],
+                    "changes": { "globals": [], "pipelines": [] } }),
+            "the node's file, unchanged"
+        );
+        let (code, v) = check(CONFIG.replace("prefix: shop", "prefix: shop2")).await;
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(v["changes"]["pipelines"][0]["change"], "modified", "{v}");
+        assert_eq!(v["changes"]["pipelines"][0]["restart"], true, "{v}");
+        assert!(
+            !v.to_string().contains("\"password\""),
+            "no resolved config: {v}"
+        );
+
+        let (code, v) =
+            check(CONFIG.replace("lease_duration: 30s", "tokens: 64, lease_duration: 30s")).await;
+        assert_eq!(code, 422, "{v}");
+        assert_eq!(v["report"]["errors"][0]["rule"], "V-061", "{v}");
+        let (code, v) = check("pipelines: [".into()).await;
+        assert_eq!((code, &v["report"]["valid"]), (422, &json!(false)), "{v}");
+        let generation = lone.node.coordinator.latest().await.unwrap();
+        assert_eq!(generation, Some(1), "nothing published");
+    }
 
     /// The reload and its status (Clustering §9.2): 200 for the file the cluster runs, 202 and
     /// the next generation for a change, 422 with the report for a file that is invalid or

@@ -32,7 +32,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
 
-use crate::{Api, Auth, Node, bind, router};
+use crate::{Api, Auth, Control, Node, Stop, bind, router};
 
 pub(crate) const CONFIG: &str = r#"
 config_version: 1
@@ -146,6 +146,8 @@ pub(crate) struct Lone {
     pub node: Node,
     /// The leases the node reads: a test takes them as another node would.
     pub leases: Leases,
+    /// What the API asked of the node.
+    pub stops: tokio::sync::watch::Receiver<Stop>,
     pub _reconciler: ClusterReconciler,
     pub _gossip: Gossip,
 }
@@ -221,6 +223,7 @@ pub(crate) async fn lone(file: PathBuf) -> Lone {
         gossip.members(),
         Duration::from_secs(10),
     );
+    let (control, stops) = Control::new();
     Lone {
         node: Node {
             coordinator: Arc::new(coordinator),
@@ -233,8 +236,10 @@ pub(crate) async fn lone(file: PathBuf) -> Lone {
                 Ok(PipelineDocs::new(DocStore::new(Arc::new(store))))
             }),
             leases: leases.clone(),
+            control,
         },
         leases,
+        stops,
         _reconciler: reconciler,
         _gossip: gossip,
     }
