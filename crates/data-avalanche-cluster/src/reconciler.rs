@@ -256,6 +256,14 @@ impl ClusterReconciler {
         self.statuses.borrow().clone()
     }
 
+    /// [`Self::statuses`] as reloads change them.
+    #[cfg(test)]
+    pub(crate) fn watch_statuses(
+        &self,
+    ) -> watch::Receiver<BTreeMap<String, watch::Receiver<ControllerStatus>>> {
+        self.statuses.clone()
+    }
+
     /// Where a config generation's changes go.
     pub fn reloader(&self) -> Reloader {
         Reloader(self.reloads.clone())

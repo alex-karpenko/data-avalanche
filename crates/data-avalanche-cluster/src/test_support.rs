@@ -590,13 +590,15 @@ pub(crate) const STABLE: Duration = Duration::from_secs(15);
 /// A leave's bound that no test's hand-offs reach.
 pub(crate) const LEAVE_WITHIN: Duration = Duration::from_secs(3600);
 
-/// In-process nodes: their gossip on one hub, their leases in one store, their pipelines'
-/// sources, sinks and state documents shared.
+/// In-process nodes: their gossip on one hub, their leases in one store, their config
+/// generations in another, their pipelines' sources, sinks and state documents shared.
 #[derive(Debug)]
 pub(crate) struct TestCluster {
     pub hub: Arc<Hub>,
     pub store: Arc<ScriptedStore>,
     pub factories: ByPipeline,
+    pub generations: data_avalanche_state::ConfigGenerations,
+    /// The pipelines of the first generation.
     ids: Vec<String>,
     docs: std::collections::BTreeMap<String, data_avalanche_state::PipelineDocs>,
     registry: Registry,
@@ -604,15 +606,12 @@ pub(crate) struct TestCluster {
     checker: tokio::task::JoinHandle<()>,
 }
 
-/// Every status a [`TestCluster`] started: node name, pipeline id, the controller's status.
-type Registry = Arc<
-    Mutex<
-        Vec<(
-            String,
-            String,
-            tokio::sync::watch::Receiver<crate::ControllerStatus>,
-        )>,
-    >,
+/// Each node a [`TestCluster`] started, by name: its controllers' statuses as reloads change
+/// them.
+type Registry = Arc<Mutex<Vec<(String, Statuses)>>>;
+
+type Statuses = tokio::sync::watch::Receiver<
+    std::collections::BTreeMap<String, tokio::sync::watch::Receiver<crate::ControllerStatus>>,
 >;
 
 impl Drop for TestCluster {
@@ -627,6 +626,7 @@ pub(crate) struct TestNode {
     pub name: String,
     pub gossip: crate::Gossip,
     pub reconciler: crate::ClusterReconciler,
+    pub coordinator: crate::ConfigCoordinator,
     pub addr: SocketAddr,
     /// The node's hand-off permits (`max_concurrent_handoffs`): a test that holds them all
     /// keeps every hand-off from starting.
@@ -642,10 +642,12 @@ async fn check_once_running(registry: Registry, violation: Arc<Mutex<Option<Stri
     loop {
         tokio::time::sleep(Duration::from_millis(10)).await;
         let mut by: std::collections::BTreeMap<String, Vec<String>> = Default::default();
-        for (node, id, rx) in registry.lock().unwrap().iter() {
-            let alive = rx.has_changed().is_ok();
-            if alive && matches!(rx.borrow().actual, Some(Actual::Starting | Actual::Running)) {
-                by.entry(id.clone()).or_default().push(node.clone());
+        for (node, statuses) in registry.lock().unwrap().iter() {
+            for (id, rx) in statuses.borrow().iter() {
+                let alive = rx.has_changed().is_ok();
+                if alive && matches!(rx.borrow().actual, Some(Actual::Starting | Actual::Running)) {
+                    by.entry(id.clone()).or_default().push(node.clone());
+                }
             }
         }
         let mut seen = violation.lock().unwrap();
@@ -665,6 +667,12 @@ impl TestCluster {
     /// that no pipeline is starting or running on two nodes (D-M8a.21's invariant, beyond
     /// `settles`); [`Self::assert_ran_once`] reports it. Runs inside a tokio test.
     pub fn new(ids: &[&str]) -> Self {
+        Self::with_spares(ids, &[])
+    }
+
+    /// [`Self::new`] with sources, sinks and state documents for `spares` too, pipelines a
+    /// later generation adds.
+    pub fn with_spares(ids: &[&str], spares: &[&str]) -> Self {
         let registry: Registry = Default::default();
         let violation: Arc<Mutex<Option<String>>> = Default::default();
         let checker = tokio::spawn(check_once_running(registry.clone(), violation.clone()));
@@ -676,19 +684,25 @@ impl TestCluster {
             store: ScriptedStore::new(),
             factories: ByPipeline(
                 ids.iter()
+                    .chain(spares)
                     .map(|id| ((*id).to_owned(), TestFactory::new(&["a"])))
                     .collect(),
             ),
+            generations: data_avalanche_state::ConfigGenerations::new(DocStore::new(Arc::new(
+                ObjectStoreVersioned::new(Arc::new(InMemory::new()), "globals").expect("a root"),
+            ))),
             ids: ids.iter().map(|id| (*id).to_owned()).collect(),
             docs: ids
                 .iter()
+                .chain(spares)
                 .map(|id| ((*id).to_owned(), pipeline_docs()))
                 .collect(),
         }
     }
 
-    /// Starts `name` at `at(n)` as its `incarnation`, as the binary does: its gossip joining,
-    /// announced to `seed`, then [`crate::join`], then its reconciler.
+    /// Starts `name` at `at(n)` as its `incarnation`, as the binary does: the config generation
+    /// adopted (the first bootstrapped), its gossip joining, announced to `seed`, then
+    /// [`crate::join`], then its reconciler and its config coordinator.
     pub async fn start(
         &self,
         name: &str,
@@ -696,6 +710,17 @@ impl TestCluster {
         incarnation: u64,
         seed: Option<SocketAddr>,
     ) -> TestNode {
+        let ids: Vec<&str> = self.ids.iter().map(String::as_str).collect();
+        let (first, _) = self
+            .generations
+            .bootstrap_or_adopt(&config_text(&ids), name, Utc::now())
+            .await
+            .expect("a config generation");
+        let key = data_avalanche_config::FingerprintKey::from_bytes([1; 32]);
+        let env = std::collections::BTreeMap::<String, String>::new();
+        let config = data_avalanche_config::load_str(&first.text, &env, &key)
+            .unwrap_or_else(|r| panic!("generation: {r:?}"))
+            .config;
         let (port, inbox) = self.hub.port(at(n));
         let me = crate::NodeIdentity {
             node_id: name.to_owned(),
@@ -704,12 +729,17 @@ impl TestCluster {
             addr: at(n),
             meta: crate::NodeMeta {
                 phase: crate::Phase::Joining,
-                config_generation: 1,
+                config_generation: first.pointer.doc.generation,
                 build: "1.0.0".into(),
             },
         };
-        let key = crate::GossipKey::derive(&[7; 32]);
-        let gossip = crate::Gossip::start(me, key, gossip_settings(), Arc::new(port), inbox);
+        let gossip = crate::Gossip::start(
+            me,
+            crate::GossipKey::derive(&[7; 32]),
+            gossip_settings(),
+            Arc::new(port),
+            inbox,
+        );
         if let Some(seed) = seed {
             gossip.announce(vec![seed]);
         }
@@ -722,12 +752,10 @@ impl TestCluster {
         deps.holder.incarnation = incarnation;
         deps.factory = Arc::new(self.factories.clone());
         deps.starts = Arc::new(tokio::sync::Semaphore::new(4));
-        let ids: Vec<&str> = self.ids.iter().map(String::as_str).collect();
-        let mut cfg = config(&ids).pipelines;
-        let pipelines = self
-            .ids
-            .iter()
-            .map(|id| (cfg.remove(id).expect("configured"), self.docs[id].clone()))
+        let pipelines = config
+            .pipelines
+            .values()
+            .map(|p| (p.clone(), self.docs[&p.id].clone()))
             .collect();
         let settings = crate::ReconcilerSettings {
             tokens: 128,
@@ -736,16 +764,34 @@ impl TestCluster {
         };
         let reconciler =
             crate::ClusterReconciler::start(pipelines, &deps, gossip.members(), settings);
-        {
-            let mut registry = self.registry.lock().unwrap();
-            for (id, rx) in reconciler.statuses() {
-                registry.push((name.to_owned(), id, rx));
-            }
-        }
+        self.registry
+            .lock()
+            .unwrap()
+            .push((name.to_owned(), reconciler.watch_statuses()));
+        let docs = self.docs.clone();
+        let coordinator = crate::ConfigCoordinator::start(
+            config,
+            first.pointer,
+            crate::CoordinatorDeps {
+                generations: self.generations.clone(),
+                env: Arc::new(env),
+                key,
+                node_id: name.to_owned(),
+                docs: Arc::new(move |p| docs.get(&p.id).cloned().ok_or_else(|| p.id.clone())),
+                factory: Arc::new(self.factories.clone()),
+                reloader: reconciler.reloader(),
+                advertiser: gossip.advertiser(),
+                metrics: deps.metrics.clone(),
+                globals: Arc::new(|_| {}),
+            },
+            gossip.members(),
+            timing().renewal_interval,
+        );
         TestNode {
             name: name.to_owned(),
             gossip,
             reconciler,
+            coordinator,
             addr: at(n),
             handoffs: deps.handoffs,
         }
