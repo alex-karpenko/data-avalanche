@@ -147,6 +147,34 @@ other CI targets run on the PR.
 |---|---|---|---|---|
 | DA-OPS-10 | An `id` change that keeps its slot, publication, sink or state is sequenced only within one reload, on the nodes that applied it: the added pipeline waits for the removed one's lease. It starts early when a node starts or joins during the wait, when the removal and the add come in two reloads, when the removal's drain was cut off (the slot stays, and `slot_on_orphan: halt` halts on it), or when a later reload reuses the old id while the removal drains (by up to `drain_timeout` + `contended_window`) | 🟢 | M8b's whole-branch review | A removal tombstone in `globals.state` that every node reads, shared with DA-OPS-9's; until then M11's docs: wait for the old lease's release before reusing the id or its resources |
 
+
+## 40. M9a management API — the plan (2026-10-23)
+
+Oleksii answered Q-M9-A, Q-M9-B, Q-M9-C and Q-M9-2 (2026-10-23, all "Recommended"): M9 split into
+M9a (the API) and M9b (the snapshot jobs); a request reaches the owner through storage, with no
+proxy; a leave keeps the process up and a shutdown is SIGTERM's path; a snapshot job's id embeds
+its pipeline's. Oleksii confirmed D-M9a.4: restart's "`RUNNING` only" is the desired state, so a
+restart takes a pipeline out of `ERROR`. M9a's plan (`doc/v1.0/M9a-management-api.md`) was built
+task by task in a scratch workspace and replayed from its code blocks to an identical tree. Two
+spec patches are proposed with it, awaiting approval: System-Overview's endpoint table (validate,
+restart, leave, shutdown, `GET /v1/openapi.json`) and Data-Flow's state layout (`status.json`,
+`requests.json`).
+
+| ID | Change | Evidence |
+|---|---|---|
+| DA-API-12 | 🟥 → ✅: the reload and status endpoints sit behind the operator and viewer roles with every other `/v1` route | M9a D-M9a.6; Task 4 (`every_route_turns_away_callers_below_its_role`, `the_routes_take_the_roles_of_api_rbac`) |
+| DA-API-11 | 🟥 → ✅: a requested restart takes a pipeline out of `ERROR`, recorded by id and taken at the owner's next poll, so it can't be missed between two polls | M9a D-M9a.4, D-M9a.5; Task 2 (`a_restart_asked_runs_a_pipeline_in_error_again`) |
+| DA-API-7 | ✅ (restated): the lifecycle as built — the same state answers 200 unchanged, only a pause of a stopped pipeline is 409, a flush of a paused one is 200 unchanged | M9a D-M9a.3, D-M9a.4; Task 1 (`the_desired_state_moves_as_the_lifecycle_allows`), Task 5 (`pause_stop_and_resume_move_the_desired_state`, `restart_and_flush_are_asked_of_the_lease_holder`) |
+
+Found while planning, and in the plan: a request made between the owner's term start and its
+first poll (a renewal interval later) would have been taken as the baseline and lost (D-M9a.5); a
+status of the holder's own earlier term would have read as current (D-M9a.2, now in Task 5's
+test); and utoipa 6 doesn't build without its `macros` feature (D-M9a.9).
+
+### 40.1 New gaps
+
+None.
+
 ---
 
 ### Counts (by status)
@@ -157,13 +185,14 @@ other CI targets run on the PR.
 > (§29), 2026-10-13 for M6b's exit (§30), 2026-10-14 for M7's planning (§31), 2026-10-14 for
 > M7a's plan (§32), 2026-10-16 for M7a's exit (§33), 2026-10-17 for M7b's plan (§34),
 > 2026-10-20 for M7b's exit (§35), 2026-10-21 for M8a's plan (§36), 2026-10-22 for M8a's exit (§37),
-> 2026-10-22 for M8b's plan (§38), and 2026-10-23 for M8b's exit (§39).
+> 2026-10-22 for M8b's plan (§38), 2026-10-23 for M8b's exit (§39), and 2026-10-23 for M9a's plan
+> (§40).
 
 | Status | Count (v1 scope) | Notes |
 |---|---|---|
 | ✅ Resolved | the large majority | Design closed by a research/spec doc or a probe. |
 | 🔄 Partial | 3 | DA-SNAP-7, DA-SRC-9 (neither blocks the plan); DA-OPS-8 2026-10-22 (§38: the startup warning; the operator docs in M11); DA-SNAP-10 ✅ 2026-10-16 (M7a merged, §33). DA-MS-3 is a decided caveat. DA-X-8 ✅ 2026-09-26; DA-SRC-16 and DA-X-12 ✅ 2026-10-13 (§30). |
-| 🟥 Open (v1) | **22** | DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2); DA-API-11 and DA-SRC-20 🆕 2026-10-13 (§30.1); DA-SRC-21 🆕 2026-10-14 (§31.2); DA-SRC-22, DA-SNAP-14 and DA-X-13 🆕 2026-10-14 (§32.1); DA-SRC-24…26 🆕 2026-10-16 (§33.1); DA-OBS-6 🆕 2026-10-17 (§34.1); DA-OPS-9 and DA-API-12 🆕 2026-10-22 (§38.1); DA-OPS-10 🆕 2026-10-23 (§39.1). DA-OPS-8 🔄 2026-10-22 (§38). DA-CLUS-14, DA-OPS-7 and DA-SRC-28 ✅ 2026-10-22 (§37). DA-SRC-27 and DA-X-14 ✅ 2026-10-20 (§35). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
+| 🟥 Open (v1) | **20** | DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2); DA-SRC-20 🆕 2026-10-13 (§30.1); DA-SRC-21 🆕 2026-10-14 (§31.2); DA-SRC-22, DA-SNAP-14 and DA-X-13 🆕 2026-10-14 (§32.1); DA-SRC-24…26 🆕 2026-10-16 (§33.1); DA-OBS-6 🆕 2026-10-17 (§34.1); DA-OPS-9 🆕 2026-10-22 (§38.1); DA-OPS-10 🆕 2026-10-23 (§39.1). DA-OPS-8 🔄 2026-10-22 (§38). DA-API-11 and DA-API-12 ✅ 2026-10-23 (§40). DA-CLUS-14, DA-OPS-7 and DA-SRC-28 ✅ 2026-10-22 (§37). DA-SRC-27 and DA-X-14 ✅ 2026-10-20 (§35). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
 | 🧪 Verify (v1) | **0** | DA-SRC-10/11 proven 2026-09-26 (§21). |
 | ⏭ v2 | 13 | Iceberg-sink items (§26.2). |
 | 🟢 Spec-merge debt | **0** | All applied 2026-09-26 (§26.6): §19.3 S-1…S-6, the DA-X-8 config residual, the D-V1 patches and the Data-Flow Phase 2a probe details. |
@@ -472,8 +501,8 @@ unauthenticated. The auth *mechanism* (jwt/oauth2 verification params) was alrea
 | DA-API-8 | STOPPED keeps its lease (owner idle) | 🟢 | ✅ | §2 — avoids ring churn, immediate resume; cost = one idle renewal. | D-NEW15.1 |
 | DA-API-9 | PAUSE flushes to a clean boundary (no at-risk buffer at failover) | 🟡 | ✅ | §2/§4 — resume is fast (warm, no buffer reconcile). | D-NEW15.3 |
 | DA-API-10 | Reload must not resurrect a paused/stopped pipeline | 🟡 | ✅ | §4 — runtime `desired_state` wins over config's implicit "should run." | §9.6 |
-| DA-API-12 | 🆕 The reload and status endpoints answer without authentication until M9 | 🟢 | 🟥 | §38.1. Q-M8b-1: `POST /v1/config/reload` and `GET /v1/config/status` serve on `globals.api.address` like `/metrics`, before M9's auth and RBAC. A caller can publish the file that is on the node, not a text of its own. M9 puts them behind the operator and viewer roles (API_RBAC §2). | — |
-| DA-API-11 | 🆕 A desired-state change missed between two polls | 🟢 | 🟥 | §30.1. The controller samples `pipeline-state.json` once per renewal interval, so a stop and a resume between two polls don't clear `ERROR` (Lifecycle §3). The M9 API wakes the controller, or the document carries a generation the controller compares. | — |
+| DA-API-12 | 🆕 The reload and status endpoints answer without authentication until M9 | 🟢 | ✅ | §40 (M9a's plan): every `/v1` route takes its least role (API_RBAC §2), reload operator and status viewer; M9a Task 4's matrix test turns away every caller below it. §38.1: Q-M8b-1: `POST /v1/config/reload` and `GET /v1/config/status` serve on `globals.api.address` like `/metrics`, before M9's auth and RBAC. A caller can publish the file that is on the node, not a text of its own. M9 puts them behind the operator and viewer roles (API_RBAC §2). | — |
+| DA-API-11 | 🆕 A desired-state change missed between two polls | 🟢 | ✅ | §40 (M9a's plan): a restart request, recorded by id in `requests.json`, takes a pipeline out of `ERROR` without depending on the controller's sampling (D-M9a.4, D-M9a.5); a stop and a resume inside one poll still look like no change, and needn't be seen apart. §30.1: The controller samples `pipeline-state.json` once per renewal interval, so a stop and a resume between two polls don't clear `ERROR` (Lifecycle §3). The M9 API wakes the controller, or the document carries a generation the controller compares. | — |
 
 ---
 
