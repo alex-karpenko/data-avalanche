@@ -470,8 +470,8 @@ mod tests {
             )
         );
 
-        // Another node's status, or the holder's own of an earlier term, is not this term's.
-        for (node, epoch) in [("node-a", 1), ("node-b", 0)] {
+        // Another node's status is not this term's.
+        for (node, epoch) in [("node-a", 1)] {
             docs.save_status(&written(node, epoch, ActualState::Stopped))
                 .await
                 .unwrap();
@@ -483,6 +483,26 @@ mod tests {
         let v = json_of(addr, "GET", "/v1/pipelines/orders").await.1;
         assert_eq!(v["actual_state"], "unowned");
         assert_eq!(v["holder"]["released"], true);
+    }
+
+    #[tokio::test]
+    async fn a_holder_s_status_of_an_earlier_term_is_not_this_term_s() {
+        let (addr, lone, docs, _dir) = served().await;
+        // `held_by` first gives epoch 1: release and take the lease again for epoch 2.
+        let first = held_by(&lone, "node-b").await;
+        lone.leases.release(&first, Utc::now()).await.unwrap();
+        held_by(&lone, "node-b").await;
+        let v = json_of(addr, "GET", "/v1/pipelines/orders").await.1;
+        assert_eq!(v["holder"]["owner_epoch"], 2, "{v}");
+
+        docs.save_status(&written("node-b", 1, ActualState::Stopped))
+            .await
+            .unwrap();
+        let v = json_of(addr, "GET", "/v1/pipelines/orders").await.1;
+        assert_eq!(
+            v["actual_state"], "starting",
+            "the earlier term's status: {v}"
+        );
     }
 
     #[tokio::test]
