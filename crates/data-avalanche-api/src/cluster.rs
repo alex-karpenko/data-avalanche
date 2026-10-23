@@ -39,7 +39,7 @@ impl Control {
     }
 
     /// Asks for `stop` unless it, or more, is asked already: false then.
-    fn ask(&self, stop: Stop) -> bool {
+    pub fn ask(&self, stop: Stop) -> bool {
         self.asked.send_if_modified(|now| {
             let more = stop > *now;
             if more {

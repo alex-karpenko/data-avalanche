@@ -1,6 +1,8 @@
 //! `data-avalanche run`.
 
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
@@ -19,7 +21,7 @@ use data_avalanche_pipeline::{Backoff, Tuning};
 use data_avalanche_state::{ConfigGenerations, Leases};
 use data_avalanche_telemetry::Metrics;
 use thiserror::Error;
-use tokio::sync::{Semaphore, oneshot};
+use tokio::sync::{Semaphore, oneshot, watch};
 
 use crate::startup::{Buckets, join};
 use crate::{Factory, RunArgs, logging};
@@ -226,7 +228,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         gossip.members(),
         c.lease_renewal_interval,
     ));
-    let (control, mut asked) = Control::new();
+    let (control, asked) = Control::new();
     let _ = node.set(Node {
         coordinator: Arc::clone(&coordinator),
         members: gossip.members(),
@@ -237,14 +239,9 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     });
     ready.store(true, Ordering::SeqCst);
     let mut cluster = Some((gossip, reconciler, discovery));
+    let mut stops = Stops::new(Box::pin(shutdown_signal()), asked);
     loop {
-        let stop = tokio::select! {
-            () = shutdown_signal() => Stop::Shutdown,
-            changed = asked.changed() => match changed {
-                Ok(()) => *asked.borrow_and_update(),
-                Err(_) => Stop::Shutdown,
-            },
-        };
+        let stop = stops.next().await;
         if stop == Stop::Run {
             continue;
         }
@@ -270,6 +267,31 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     let _ = server.await;
     tracing::info!("stopped");
     Ok(())
+}
+
+/// What stops the process: a signal, or what the API asked. The signal future is built once and
+/// kept across the loop's passes, so its listeners live through a leave.
+struct Stops {
+    signal: Pin<Box<dyn Future<Output = ()> + Send>>,
+    asked: watch::Receiver<Stop>,
+}
+
+impl Stops {
+    fn new(signal: Pin<Box<dyn Future<Output = ()> + Send>>, asked: watch::Receiver<Stop>) -> Self {
+        Self { signal, asked }
+    }
+
+    async fn next(&mut self) -> Stop {
+        // Biased: the signal is polled first, so its listeners are registered by the first call.
+        tokio::select! {
+            biased;
+            () = self.signal.as_mut() => Stop::Shutdown,
+            changed = self.asked.changed() => match changed {
+                Ok(()) => *self.asked.borrow_and_update(),
+                Err(_) => Stop::Shutdown,
+            },
+        }
+    }
 }
 
 async fn shutdown_signal() {
@@ -300,6 +322,25 @@ pub(crate) mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+
+    /// A signal that arrives while a leave runs (nothing polls the stops) still stops the process.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_signal_during_a_leave_still_stops_the_process() {
+        let (control, asked) = Control::new();
+        let mut stops = Stops::new(Box::pin(shutdown_signal()), asked);
+        assert!(control.ask(Stop::Leave));
+        assert_eq!(stops.next().await, Stop::Leave);
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", &std::process::id().to_string()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), stops.next()).await,
+            Ok(Stop::Shutdown)
+        );
+    }
 
     pub(crate) const CONFIG: &str = r#"
 config_version: 1
