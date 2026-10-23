@@ -1,5 +1,5 @@
 ---
-updated: 2026-09-26
+updated: 2026-10-23
 domain: Auth
 tags: [rbac, api, authorization, roles, jwt, oauth2, versioning, management-api, cdc]
 resolves: [G-16, G-9.1]
@@ -53,6 +53,7 @@ version skew).
 | Pipeline flush | `POST /v1/pipelines/{id}/flush` | operator |
 | Leave cluster | `POST /v1/cluster/leave` | **admin** |
 | Shutdown | `POST /v1/admin/shutdown` | **admin** |
+| API description (added 2026-10-23, M9a) | `GET /v1/openapi.json` | viewer |
 | Liveness | `GET /health/live` | none (unversioned) |
 | Readiness | `GET /health/ready` | none (unversioned) |
 | Metrics | `GET /metrics` | none (unversioned, per System-Overview) |
@@ -60,7 +61,8 @@ version skew).
 Notes:
 
 - **`config/validate` is operator, not viewer** — it echoes the *resolved* config, which can contain
-  resolved secret material; it must not be readable by a status-only principal.
+  resolved secret material; it must not be readable by a status-only principal. (M9a's validate
+  returns the report and what a reload would change, never the resolved config; it stays operator.)
 - **Config reload = operator** (routine ops). Cluster-destructive ops (`leave`, `shutdown`) = admin.
 - **Pipeline `stop`** releases DB connections/leases but is recoverable, so it stays operator; only
   node-level teardown is admin.
@@ -82,6 +84,14 @@ Notes:
 
 A missing/invalid token on an authenticated endpoint → **401**; a valid token lacking the required role
 → **403**. Unauthenticated probes (`/health/*`, `/metrics`) never challenge.
+
+As built in M9a (D-M9a.6): a 401 carries `WWW-Authenticate: Basic` or `Bearer` with
+`realm="data-avalanche"`. A token signed with a shared-secret algorithm (HS*) is refused, since no
+secret is configured to check it. When the issuer's keys can't be fetched the answer is **503**,
+not 401: the token may be fine. The keys are cached and fetched again for an unknown `kid` at most
+every 30 s. `oauth2` finds its JWKS through `discovery_url` when it has no `jwks_url`, and checks
+that the discovery document's `issuer` is the configured one; tokens are verified locally (no
+introspection).
 
 ---
 

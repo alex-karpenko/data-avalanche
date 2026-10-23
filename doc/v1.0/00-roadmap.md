@@ -117,6 +117,8 @@ Rules:
   run time through `core`'s traits and depends on neither; only the binary links them (Q-M5-24). No
   other crate takes `sink-delta`, even as a dev-dependency; the pipeline's live tests take
   `source-pg` as a dev-dependency.
+- `data-avalanche-api` (M9a) reads `state`, `config`, `core` and `telemetry` directly beside
+  `cluster`, and links no source or sink crate: a status is read from the state documents.
 - One `arrow` major workspace-wide (**59**, pinned by `deltalake =1.0.0`), per D-MS.14.
 - Every binary calls `rustls::crypto::CryptoProvider::install_default()` (aws-lc-rs) before any TLS
   (DA-DEP-5).
@@ -405,6 +407,12 @@ pub enum StoreError { Conflict { key }, Contention { key }, Transient { key, rea
     `HaltsDoc { tables: Vec<TableHalt> }`, `TableHalt { table, reason: HaltReason, at:
     SourcePosition }`); and the slot-creation intent, `SlotDoc::intent(slot_name)` /
     `is_intent()` (`confirmed_flush_lsn` `0/0`, written before a managed first start's `prepare`).
+  - from M9a (D-M9a.2…5): the owner's view, `status` / `save_status` (`status.json`, `StatusDoc {
+    holder_node_id, owner_epoch, actual: ActualState, error, code, degraded, written_at }`,
+    trusted only under the live lease's epoch and holder); the requests, `requests` / `request`
+    (`requests.json`, `RequestsDoc { restart, flush: Option<Request { id, at }> }`, the last of
+    each `Action`); and `transition(to) -> Transition { Changed { from }, Unchanged, Refused {
+    current } }`, the desired state's checked compare-and-swap (Pipeline_Lifecycle §3).
 
 Lease release is a **tombstone write** (object_store has no conditional delete). T1–T10 prove the lease CAS on every backend (`tests/lease_conformance.rs`, `test-infra/README.md`).
 
@@ -622,6 +630,13 @@ sharing the removed one's PostgreSQL slot or publication, its sink location or i
 (an `id` change: delete, then recreate, config §9.1), claims only once the removed pipeline's lease
 is released, gone, or unrenewed for a lease duration (M8b's deviations; DA-OPS-10 for what it
 doesn't cover).
+
+From M9a (D-M9a.5, D-M9a.7): the lease holder's controller writes `status.json` at a poll when its
+status changed, and reads `requests.json` when its term starts (the baseline). At each poll a new
+restart id discards the worker and runs a new one under the same lease (`ERROR` cleared, the
+desired state kept); a new flush id sends `Command::Flush`. `ConfigCoordinator::check(&self, text)
+-> Result<Checked { generation, warnings, changes }, ReloadError>` runs a reload's checks without
+the publish.
 
 ### 3.8 Configuration (`data-avalanche-config`, landed in M1)
 
@@ -877,6 +892,13 @@ From M8b (D-M8b.3, D-M8b.5, D-M8b.8…10):
   the command line set them.
 - Startup warns when the node's file and the adopted generation differ in a per-node key
   (DA-OPS-8).
+
+From M9a (D-M9a.1, D-M9a.6, D-M9a.8): the listener and every route move to
+`data-avalanche-api` (`bind`, `Bound::serve`, `ServeError`, `Api`, `Node`, `router`, `routes`,
+`Auth`, `Principal`, `Control`, `Stop`, `openapi`). TLS on the listener; the `/v1` routes behind
+the auth and the least role of API_RBAC §2; the auth follows each generation (`Auth::set`). The
+binary's run loop takes the API's leave (stays up, not ready) and shutdown (exits) as it takes
+SIGTERM.
 
 ---
 
@@ -1204,6 +1226,10 @@ endpoints (Q-M8b-1), and the reload E2E. The anchor validation already runs at M
 
 ### M9 — Management API (`data-avalanche-api`)
 
+Split in two (Q-M9-A): **M9a** (`M9a-management-api.md`) is the API below without the snapshot
+jobs; **M9b** is the snapshot jobs (the worker's chunk loop for requested tables, tables outside
+the config, jobs persisted and resumed, the re-snapshot that clears a persisted halt).
+
 - **Scope:**
   - axum server; TLS (`globals.api.tls`).
   - Auth: none / basic / jwt (JWKS) / oauth2 (OIDC discovery), with `role_mapping`.
@@ -1499,6 +1525,7 @@ the naming below (2026-09-26).**
 | D-IMPL-16 | M7b MySQL-pipeline rulings **D-M7b.1…16** (listed in `M7b-mysql-pipeline.md` §Decisions and rulings, each pinned by a test). Among them: `open_stream` takes a `Checkpoint` and `reset_position` returns one (§3.6); `SourceError::halt_code` reads a halt's code from its message; the worker's checkpoint goes through one store, slot or position document, and records the server the last start read; a file/position dump checks its server on its own connection; no identity is an error; the binary picks the source by `source.type`; the E2E harness's per-test MySQL database and user, and its dialect helpers; the wire proxy's fault (one compressed byte flipped, the CRC32 recomputed) | The specs are silent on these; each keeps a MySQL checkpoint tied to its server across reconnects and lost positions | M7b — **approved 2026-10-17** |
 | D-IMPL-17 | M8a membership rulings **D-M8a.1…22** (listed in `M8a-membership.md` §Decisions and rulings, each pinned by a test). Among them: foca's identity keyed by address, members grouped by name at the highest `(incarnation, rev)`; the packet MAC's key derived from the anchor; foca's settings from config §6.5.1; the ring's xxh3 points; placement over the Active members, a `Draining` node off the ring at once, additions after `rebalance_stabilization`; the hand-off permit; a controller that ended unasked started again (DA-OPS-7); a drop is a crash; the leave; the fence's epoch as the claim's floor, once (DA-CLUS-14); discovery while alone, the advertised address; per-node values through `${VAR}` (D-3); a busy slot's stale reader ended by the lease holder (DA-SRC-28) | The specs are silent on these, or (memberlist's keys, gossip TLS) changed by the M8a config patch | M8a — **approved 2026-10-21** |
 | D-IMPL-18 | M8b config-generation rulings **D-M8b.1…12** (listed in `M8b-config-generations.md` §Decisions and rulings, each pinned by a test). Among them: `SourceConnector::reconfigure` takes the reloaded pipeline as `&dyn Any`; the worker's `Command::Reconfigure`; a controller's `Update` (restart under the same lease, `ERROR` cleared, the desired state kept; a removal's teardown only after a full drain under the lease); the reconciler's `Reload`, the caps resized without revoking a permit, a pipeline added back after its removal; the poll and the gossip nudge; a generation a node can't apply logged once and retried; the reload's check, CAS and retry, the same text published again when it resolves differently; the endpoints' answers; the log changed at run time; DA-OPS-8's warning; the coordinator stopped before the leave | The specs are silent on these | M8b — **approved 2026-10-22** |
+| D-IMPL-19 | M9a management-API rulings **D-M9a.1…10** (listed in `M9a-management-api.md` §Decisions and rulings, each pinned by a test). Among them: the API crate owns the listener, TLS behind axum's `Listener` with a bounded handshake per connection; routing through storage, a status trusted only under the live lease's epoch and holder; the same state answers 200 unchanged, only a pause of a stopped pipeline is 409; restart and flush are requests by id, baselined when the owner's term starts; a restart runs a pipeline in `ERROR` again (desired `RUNNING`, confirmed 2026-10-23); JWKS keys cached and fetched again for an unknown `kid` at most every 30 s, HS* refused, a 503 when the keys can't be fetched; validate never returns the resolved config; a leave stays up; one route table for the router, the role gate and the OpenAPI document | The specs leave these open, or (restart) say `RUNNING` without naming the desired state | M9a — **approved 2026-10-23** |
 
 ### 9.1 Questions answered at plan review (2026-09-26)
 
@@ -1584,6 +1611,10 @@ the naming below (2026-09-26).**
 | Q-M8b-1 (2026-10-22) | How is a reload triggered before M9's API? | **The endpoints now, auth in M9**: `POST /v1/config/reload` and `GET /v1/config/status`, unauthenticated until M9 | §3.12, §4 M9; M8b Task 7 |
 | Q-M8b-2 (2026-10-22) | Which R-class pipeline fields are applied in the running worker? | **All of them in place** | §3.6, §3.11; M8b Tasks 1–3 |
 | Q-M8b-3 (2026-10-22) | Who cleans up a removed pipeline? | **Its owner**: drain, teardown, release; an offline owner leaves an orphan (DA-OPS-9) | §3.7; M8b Task 3 |
+| Q-M9-A (2026-10-23) | One M9 or two? | **M9a + M9b**: the API first; the on-demand snapshot jobs second | §4 M9 |
+| Q-M9-B (2026-10-23) | How does a request on one node reach the pipeline's owner? | **Through storage**: the desired state by CAS, restart and flush as requests the owner takes at its poll, a status document the owner writes; any node answers from storage | §3.5, §3.7; M9a Tasks 1, 2, 5 |
+| Q-M9-C (2026-10-23) | What do leave and shutdown do? | **Leave = the M8a leave, the process stays up** (not ready, the API answers); **shutdown = SIGTERM's path** (leave, exit 0) | §3.12; M9a Task 6 |
+| Q-M9-2 (2026-10-23) | `GET /v1/snapshots/{job_id}` on any node? | **The job id embeds the pipeline id** (`<pipeline_id>~<ulid>`-like), read from storage by any node; no spec edit | M9b |
 
 ### 9.2 Open questions (answer before the named milestone)
 
@@ -1597,4 +1628,5 @@ the naming below (2026-09-26).**
 
 - **Q-M9-2:** `GET /v1/snapshots/{job_id}` is served by any node, but the job lives in one pipeline's
   state location. Either the job ID embeds the pipeline ID so any node can read it from storage, or
-  the status endpoint moves under `/v1/pipelines/{id}/snapshots/{job_id}`. Decide in M9 planning.
+  the status endpoint moves under `/v1/pipelines/{id}/snapshots/{job_id}`. **Answered 2026-10-23**
+  (§9.1): the job id embeds the pipeline id; built in M9b.
