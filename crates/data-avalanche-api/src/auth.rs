@@ -318,18 +318,15 @@ impl Verifier {
     }
 }
 
-/// The strings at a dotted path (`realm_access.roles`): a list of them, or one.
+/// The strings at `path`: a list of them, or one. `path` is a claim's name
+/// (`https://example.com/roles`), or else a dotted path (`realm_access.roles`).
 fn roles(claims: &Value, path: &str) -> Vec<String> {
-    let mut at = claims;
-    for part in path.split('.') {
-        match at.get(part) {
-            Some(next) => at = next,
-            None => return vec![],
-        }
-    }
+    let at = claims
+        .get(path)
+        .or_else(|| path.split('.').try_fold(claims, |at, part| at.get(part)));
     match at {
-        Value::String(s) => vec![s.clone()],
-        Value::Array(items) => items
+        Some(Value::String(s)) => vec![s.clone()],
+        Some(Value::Array(items)) => items
             .iter()
             .filter_map(|v| v.as_str().map(str::to_owned))
             .collect(),
@@ -637,6 +634,18 @@ mod tests {
             auth.verify(&realm(json!(["admin"]))).await,
             Err(Denied::Forbidden(_))
         ));
+    }
+
+    /// A namespaced claim (Auth0's `https://…/roles`) is a name, not a dotted path.
+    #[tokio::test]
+    async fn a_namespaced_roles_claim_is_read_by_its_name() {
+        let idp = Issuer::start().await;
+        let claim = "https://example.com/roles";
+        let auth = Auth::new(&idp.api(claim));
+        let mut claims = idp.claims(json!(null));
+        claims[claim] = json!(["operator"]);
+        let p = auth.verify(&bearer(&idp.sign("k1", &claims))).await;
+        assert_eq!(p.unwrap().role, Role::Operator);
     }
 
     #[tokio::test]
