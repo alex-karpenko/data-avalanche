@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow_array::cast::AsArray;
@@ -22,7 +23,9 @@ use data_avalanche_testkit::endpoints::{
 };
 use data_avalanche_testkit::{delete_prefix, stores, unique_prefix};
 use futures_util::TryStreamExt;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use rustls::pki_types::{CertificateDer, ServerName};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio_rustls::TlsConnector;
 
 pub use crate::source::{Db, Source};
 
@@ -82,6 +85,8 @@ pub struct Options<'a> {
     /// `@BUCKET@` are replaced, `@INCLUDE@` by the pattern of every table of the test, and a line
     /// `@SOURCE(<suffix>)@` by the source block ([`E2e::source_block`]).
     pub pipelines: &'a str,
+    /// `globals.api` entries beyond the address, e.g. `, auth: jwt, jwt: { … }`.
+    pub api: &'a str,
 }
 
 /// The rows [`E2e::insert_series`] gives a key `g`.
@@ -107,6 +112,14 @@ pub struct E2e {
     /// cluster's generation, not its own file).
     template: String,
     pub db: Db,
+    /// How the tests reach each node's API.
+    client: Client,
+}
+
+/// How a test reaches a node's API: plain HTTP, or TLS trusting one certificate.
+#[derive(Clone, Default)]
+struct Client {
+    tls: Option<TlsConnector>,
 }
 
 impl E2e {
@@ -168,6 +181,7 @@ impl E2e {
             dir: tempfile::tempdir().expect("a temp dir"),
             template: String::new(),
             db,
+            client: Client::default(),
         };
         e.template = e.yaml(&o);
         std::fs::write(e.config_path(), &e.template).expect("the config file");
@@ -258,7 +272,7 @@ impl E2e {
 globals:
   cloud: aws
   state: {{ bucket: {bucket}, prefix: {prefix}/globals }}
-  api: {{ address: "127.0.0.1:${{E2E_API_PORT}}" }}
+  api: {{ address: "127.0.0.1:${{E2E_API_PORT}}"{api} }}
   log: {{ level: info, format: compact }}
   cluster:
     lease_duration: 6s
@@ -283,6 +297,7 @@ pipelines:
             pipeline = o.pipeline,
             cluster = o.cluster.replace(", ", "\n    "),
             memberlist = o.memberlist,
+            api = o.api,
         )
     }
 
@@ -339,7 +354,24 @@ pipelines:
             child: cmd.spawn().expect("the binary starts"),
             port,
             log,
+            client: self.client.clone(),
+            token: None,
         }
+    }
+
+    /// The nodes started from now on serve their API with TLS (`globals.api.tls`), on a
+    /// certificate for `127.0.0.1` the tests trust.
+    pub fn trust(&mut self, cert: CertificateDer<'static>) {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).expect("the certificate");
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("TLS versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        self.client.tls = Some(TlsConnector::from(Arc::new(config)));
     }
 
     pub fn table(&self, name: &str) -> TableRef {
@@ -862,6 +894,17 @@ pub struct Proc {
     child: Child,
     port: u16,
     log: PathBuf,
+    client: Client,
+    /// The bearer token of [`Self::call`].
+    token: Option<String>,
+}
+
+/// One HTTP/1.1 exchange on `s`: the answer's text.
+async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(mut s: S, request: &[u8]) -> Option<String> {
+    s.write_all(request).await.ok()?;
+    let mut out = String::new();
+    s.read_to_string(&mut out).await.ok()?;
+    Some(out)
 }
 
 impl Proc {
@@ -873,23 +916,79 @@ impl Proc {
         self.request("GET", path).await
     }
 
-    /// A request without a body: the status code and the body.
+    /// A request without a body, with the token of [`Self::authorize`]: the status code and
+    /// the body.
     async fn request(&self, method: &str, path: &str) -> Option<(u16, String)> {
-        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", self.port))
+        let (code, _, body) = self.send(self.token.as_deref(), method, path, "").await?;
+        Some((code, body))
+    }
+
+    /// A request with `token` as its bearer and `body` (YAML) as its body: the status code,
+    /// the head and the body. `None` when nothing answers.
+    pub async fn send(
+        &self,
+        token: Option<&str>,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> Option<(u16, String, String)> {
+        let auth = token.map_or(String::new(), |t| format!("Authorization: Bearer {t}\r\n"));
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: t\r\n{auth}Content-Type: application/yaml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", self.port))
             .await
             .ok()?;
-        s.write_all(
-            format!(
-                "{method} {path} HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-            )
-            .as_bytes(),
-        )
-        .await
-        .ok()?;
-        let mut out = String::new();
-        s.read_to_string(&mut out).await.ok()?;
+        let out = match &self.client.tls {
+            None => exchange(tcp, request.as_bytes()).await?,
+            Some(tls) => {
+                let name = ServerName::IpAddress(std::net::Ipv4Addr::LOCALHOST.into());
+                exchange(tls.connect(name, tcp).await.ok()?, request.as_bytes()).await?
+            }
+        };
         let (head, body) = out.split_once("\r\n\r\n")?;
-        Some((head.get(9..12)?.parse().ok()?, body.to_owned()))
+        Some((
+            head.get(9..12)?.parse().ok()?,
+            head.to_owned(),
+            body.to_owned(),
+        ))
+    }
+
+    /// [`Self::call`] and the other requests carry `token` as their bearer from now on.
+    pub fn authorize(&mut self, token: &str) {
+        self.token = Some(token.to_owned());
+    }
+
+    /// A request without a body: the status code and the JSON body.
+    pub async fn call(&self, method: &str, path: &str) -> (u16, serde_json::Value) {
+        let (code, body) = self
+            .request(method, path)
+            .await
+            .unwrap_or_else(|| panic!("{method} {path} answers"));
+        let v = serde_json::from_str(&body).unwrap_or_else(|e| panic!("{e}: {body}"));
+        (code, v)
+    }
+
+    /// `GET path`'s status code, `None` when nothing answers.
+    pub async fn answers(&self, path: &str) -> Option<u16> {
+        self.get(path).await.map(|(code, _)| code)
+    }
+
+    /// `POST /v1/pipelines/<id>/<action>`: the status code and the JSON body.
+    pub async fn ask(&self, id: &str, action: &str) -> (u16, serde_json::Value) {
+        self.call("POST", &format!("/v1/pipelines/{id}/{action}"))
+            .await
+    }
+
+    /// Waits until `GET /v1/pipelines/<id>` shows `actual` as the pipeline's actual state: what
+    /// its owner wrote in `status.json`, under the live lease.
+    pub async fn shows(&self, id: &str, actual: &str) {
+        let what = format!("{id} shows {actual}");
+        eventually(&what, Duration::from_secs(60), async || {
+            self.call("GET", &format!("/v1/pipelines/{id}")).await.1["actual_state"] == actual
+        })
+        .await;
     }
 
     /// Waits for `/health/ready`.
@@ -920,22 +1019,14 @@ impl Proc {
 
     /// `POST /v1/config/reload`: the status code and the JSON body.
     pub async fn reload(&self) -> (u16, serde_json::Value) {
-        let (code, body) = self
-            .request("POST", "/v1/config/reload")
-            .await
-            .expect("the reload answers");
-        let v = serde_json::from_str(&body).unwrap_or_else(|e| panic!("{e}: {body}"));
-        (code, v)
+        self.call("POST", "/v1/config/reload").await
     }
 
     /// `GET /v1/config/status`'s JSON body.
     pub async fn config_status(&self) -> serde_json::Value {
-        let (code, body) = self
-            .get("/v1/config/status")
-            .await
-            .expect("the status answers");
-        assert_eq!(code, 200, "{body}");
-        serde_json::from_str(&body).unwrap_or_else(|e| panic!("{e}: {body}"))
+        let (code, v) = self.call("GET", "/v1/config/status").await;
+        assert_eq!(code, 200, "{v}");
+        v
     }
 
     /// Waits until the metrics have a line equal to `line`.

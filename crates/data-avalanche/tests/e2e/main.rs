@@ -6,11 +6,13 @@
 //!
 //! `cargo test -p data-avalanche --features e2e-hooks --test e2e -- --test-threads=1`
 
+mod api;
 mod cluster;
 mod crashes;
 mod forwarder;
 mod guards;
 mod harness;
+mod idp;
 mod lifecycle;
 mod mysql;
 mod proxy;

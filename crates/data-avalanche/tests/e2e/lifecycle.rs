@@ -3,7 +3,6 @@
 
 use std::time::Duration;
 
-use data_avalanche_state::DesiredState;
 use data_avalanche_testkit::require_it;
 
 use crate::harness::{E2e, Options, eventually};
@@ -18,7 +17,7 @@ fn never() -> Options<'static> {
 }
 
 /// Pause holds the stream with the source connection open; stop closes it and is kept across a
-/// restart; resume reads on from where each left off.
+/// restart; resume reads on from where each left off. Each is asked through the API.
 #[tokio::test]
 async fn pause_stop_and_resume_hold_across_a_restart() {
     require_it!();
@@ -39,11 +38,9 @@ async fn pause_stop_and_resume_hold_across_a_restart() {
     e.exec("INSERT INTO items VALUES (1, 'a')").await;
     e.converged("items").await;
 
-    e.docs()
-        .set_desired_state(DesiredState::Paused)
-        .await
-        .expect("paused");
+    assert_eq!(p.ask(&e.test, "pause").await.0, 202);
     p.metric(&e.status("paused")).await;
+    p.shows(&e.test, "paused").await;
     e.exec("INSERT INTO items VALUES (2, 'b')").await;
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!(e.ids("items").await, [1], "nothing is read while paused");
@@ -52,17 +49,11 @@ async fn pause_stop_and_resume_hold_across_a_restart() {
         "a paused pipeline keeps the source warm"
     );
 
-    e.docs()
-        .set_desired_state(DesiredState::Running)
-        .await
-        .expect("running");
+    assert_eq!(p.ask(&e.test, "resume").await.0, 202);
     p.metric(&e.status("running")).await;
     e.converged("items").await;
 
-    e.docs()
-        .set_desired_state(DesiredState::Stopped)
-        .await
-        .expect("stopped");
+    assert_eq!(p.ask(&e.test, "stop").await.0, 202);
     p.metric(&e.status("stopped")).await;
     eventually(
         "the stream is closed",
@@ -76,6 +67,12 @@ async fn pause_stop_and_resume_hold_across_a_restart() {
     let mut p = e.start(&[]);
     p.ready().await;
     p.metric(&e.status("stopped")).await;
+    p.shows(&e.test, "stopped").await;
+    assert_eq!(
+        p.ask(&e.test, "pause").await.0,
+        409,
+        "a stopped pipeline is resumed, not paused"
+    );
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!(
         e.ids("items").await,
@@ -84,10 +81,7 @@ async fn pause_stop_and_resume_hold_across_a_restart() {
     );
     assert!(!e.stream_open().await);
 
-    e.docs()
-        .set_desired_state(DesiredState::Running)
-        .await
-        .expect("running");
+    assert_eq!(p.ask(&e.test, "resume").await.0, 202);
     p.metric(&e.status("running")).await;
     e.converged("items").await;
     assert!(p.terminate().await.success());
