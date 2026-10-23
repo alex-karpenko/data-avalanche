@@ -336,6 +336,8 @@ pub(crate) mod tests {
             .status()
             .unwrap();
         assert!(status.success());
+        // The runtime's driver delivers the signal while nothing listens for it, as during a real leave.
+        tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(5), stops.next()).await,
             Ok(Stop::Shutdown)
