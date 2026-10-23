@@ -11,7 +11,8 @@ use data_avalanche_config::{
     StateLocation, check_cluster_anchor, load_str,
 };
 use data_avalanche_state::{
-    AnchorDoc, ConfigGenerations, DocStore, HashAlgo, PipelineDocs, establish_anchor,
+    AnchorDoc, ConfigGenerations, DocStore, GenerationDoc, HashAlgo, PipelineDocs, Versioned,
+    establish_anchor,
 };
 use data_avalanche_storage::{
     Backend, BucketSpec, Location, ObjectStoreVersioned, Timeouts, colocated_state, explicit_state,
@@ -107,7 +108,7 @@ pub(crate) struct Joined {
     /// The anchor's: the gossip's packets are authenticated with a key derived from it.
     pub fingerprint_key: [u8; 32],
     /// The config generation the node runs.
-    pub generation: u64,
+    pub generation: Versioned<GenerationDoc>,
 }
 
 /// The anchor's key prints as `..`, as `GossipKey`'s does: a `{joined:?}` logs no secret.
@@ -120,6 +121,48 @@ impl std::fmt::Debug for Joined {
             .field("generation", &self.generation)
             .finish()
     }
+}
+
+/// The per-node keys (config §6.5.1) whose value in this node's file isn't the generation's,
+/// each with the one the node takes: its name and its API address are the file's, its gossip's
+/// addresses the generation's (DA-OPS-8).
+pub(crate) fn per_node(file: &ResolvedConfig, generation: &ResolvedConfig) -> Vec<String> {
+    let (f, g) = (
+        &file.globals.cluster.memberlist,
+        &generation.globals.cluster.memberlist,
+    );
+    let keys = [
+        ("memberlist.node_name", f.node_name != g.node_name, "file"),
+        (
+            "memberlist.bind_addr",
+            f.bind_addr != g.bind_addr,
+            "generation",
+        ),
+        (
+            "memberlist.bind_port",
+            f.bind_port != g.bind_port,
+            "generation",
+        ),
+        (
+            "memberlist.advertise_addr",
+            f.advertise_addr != g.advertise_addr,
+            "generation",
+        ),
+        (
+            "memberlist.advertise_port",
+            f.advertise_port != g.advertise_port,
+            "generation",
+        ),
+    ];
+    let mut out: Vec<String> = keys
+        .iter()
+        .filter(|(_, differs, _)| *differs)
+        .map(|(key, _, from)| format!("globals.cluster.{key} (the {from}'s)"))
+        .collect();
+    if file.globals.api.address != generation.globals.api.address {
+        out.push("globals.api.address (the file's)".to_owned());
+    }
+    out
 }
 
 /// Steps 2–5 of the startup sequence; `first` is the config loaded with a throwaway key.
@@ -173,12 +216,21 @@ pub(crate) async fn join(
         .config;
     // The buckets open the state on this file's backend and the sink opens the tables on the
     // generation's: the two must be one backend.
+    let n = generation.pointer.doc.generation;
+    let differ = per_node(first, &config);
+    if !differ.is_empty() {
+        tracing::warn!(
+            generation = n,
+            "this node's file and config generation {n} differ in per-node keys, {}: write per-node values as ${{VAR}} (config §6.5.1); a reload from this node is refused (V-061) until they match",
+            differ.join(", ")
+        );
+    }
     let (file, adopted) = (backend(g), backend(&config.globals));
     if file != adopted {
         return Err(Fatal::Config(format!(
             "this node's file names storage on {}, but the cluster runs config generation {} on {}: set globals.cloud and globals.azure in the file as the generation has them",
             named(&file),
-            generation.pointer.doc.generation,
+            n,
             named(&adopted)
         )));
     }
@@ -186,7 +238,7 @@ pub(crate) async fn join(
         config,
         globals,
         fingerprint_key: anchor.fingerprint_key,
-        generation: generation.pointer.doc.generation,
+        generation: generation.pointer,
     })
 }
 
@@ -270,5 +322,25 @@ mod tests {
             Err(e) => panic!("{e:?}"),
             Ok(_) => panic!("a file on another backend joined the cluster"),
         }
+    }
+
+    /// DA-OPS-8: the per-node keys a file has apart from the generation, and which one runs.
+    #[test]
+    fn the_per_node_keys_apart_from_the_generation_are_named() {
+        let generation = config();
+        assert!(per_node(&generation.clone(), &generation).is_empty());
+        let mut file = generation.clone();
+        file.globals.cluster.memberlist.node_name = Some("node-b".into());
+        file.globals.cluster.memberlist.bind_port = 7947;
+        file.globals.api.address.port = 8081;
+        file.globals.cluster.drain_timeout = Duration::from_secs(1);
+        assert_eq!(
+            per_node(&file, &generation),
+            [
+                "globals.cluster.memberlist.node_name (the file's)",
+                "globals.cluster.memberlist.bind_port (the generation's)",
+                "globals.api.address (the file's)",
+            ]
+        );
     }
 }

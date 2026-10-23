@@ -1,8 +1,14 @@
-//! Logs: `globals.log` (level, format), each overridden by the command line.
+//! Logs: `globals.log` (level, format), each overridden by the command line, and changed by a
+//! config generation (config §1.2: R).
+
+use std::sync::{Mutex, PoisonError};
 
 use data_avalanche_config::{Log, LogFormat};
-use tracing_subscriber::EnvFilter;
+use tracing::Subscriber;
 use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::layer::{Layered, SubscriberExt};
+use tracing_subscriber::{EnvFilter, Layer, Registry, reload};
 
 use crate::{LogFormatArg, RunArgs};
 
@@ -58,24 +64,111 @@ pub(crate) fn quieted(filter: &str) -> String {
     out
 }
 
-/// Installs the process's subscriber; logs go to stderr.
+type Filtered = Layered<reload::Layer<EnvFilter, Registry>, Registry>;
+type Format = Box<dyn Layer<Filtered> + Send + Sync>;
+
+/// The installed logger: its filter and its format change with each config generation's
+/// `globals.log`, except where the command line set them.
+pub(crate) struct Logger {
+    filter: reload::Handle<EnvFilter, Registry>,
+    format: reload::Handle<Format, Filtered>,
+    layer: Box<dyn Fn(LogFormat) -> Format + Send + Sync>,
+    args: RunArgs,
+    /// The level and the format in force.
+    current: Mutex<(String, LogFormat)>,
+}
+
+impl std::fmt::Debug for Logger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Logger")
+            .field("current", &self.current)
+            .finish_non_exhaustive()
+    }
+}
+
+fn filter(level: &str) -> Result<EnvFilter, String> {
+    EnvFilter::builder()
+        .parse(quieted(level))
+        .map_err(|e| format!("{level:?} isn't a log filter: {e}"))
+}
+
+fn layer<W>(format: LogFormat, writer: W) -> Format
+where
+    W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
+{
+    let builder = tracing_subscriber::fmt::layer().with_writer(writer);
+    match format {
+        LogFormat::Json => builder.json().boxed(),
+        LogFormat::Compact => builder.compact().boxed(),
+        LogFormat::Pretty => builder.pretty().boxed(),
+    }
+}
+
+/// The process's subscriber, writing to `writer`, and its [`Logger`].
 ///
 /// # Errors
 /// A `--log-level` that isn't a filter (the config's was checked by V-017).
-pub(crate) fn init(log: &Log, args: &RunArgs) -> Result<(), String> {
+pub(crate) fn build<W>(
+    log: &Log,
+    args: &RunArgs,
+    writer: W,
+) -> Result<(impl Subscriber + Send + Sync + use<W>, Logger), String>
+where
+    W: for<'w> MakeWriter<'w> + Clone + Send + Sync + 'static,
+{
     let (level, format) = settings(log, args);
-    let filter = EnvFilter::builder()
-        .parse(quieted(&level))
-        .map_err(|e| format!("--log-level {level:?} isn't a log filter: {e}"))?;
-    let builder = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr);
-    let installed = match format {
-        LogFormat::Json => builder.json().try_init(),
-        LogFormat::Compact => builder.compact().try_init(),
-        LogFormat::Pretty => builder.pretty().try_init(),
+    let (filter_layer, filter) =
+        reload::Layer::new(filter(&level).map_err(|e| format!("--log-level {e}"))?);
+    let (format_layer, format_handle) = reload::Layer::new(layer(format, writer.clone()));
+    let subscriber = tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(format_layer);
+    let logger = Logger {
+        filter,
+        format: format_handle,
+        layer: Box::new(move |f| layer(f, writer.clone())),
+        args: args.clone(),
+        current: Mutex::new((level, format)),
     };
-    installed.map_err(|e| format!("cannot install the logger: {e}"))
+    Ok((subscriber, logger))
+}
+
+/// Installs the process's subscriber; logs go to stderr.
+///
+/// # Errors
+/// A `--log-level` that isn't a filter, or a subscriber is installed already.
+pub(crate) fn init(log: &Log, args: &RunArgs) -> Result<Logger, String> {
+    let (subscriber, logger) = build(log, args, std::io::stderr)?;
+    tracing::subscriber::set_global_default(subscriber)
+        .map_err(|e| format!("cannot install the logger: {e}"))?;
+    Ok(logger)
+}
+
+impl Logger {
+    /// Takes `log`, a config generation's, where the command line didn't set the level or the
+    /// format.
+    pub fn apply(&self, log: &Log) {
+        let (level, format) = settings(log, &self.args);
+        let mut current = self.current.lock().unwrap_or_else(PoisonError::into_inner);
+        if level != current.0 {
+            match filter(&level).and_then(|f| self.filter.reload(f).map_err(|e| e.to_string())) {
+                Ok(()) => {
+                    tracing::info!("the log level is {level} now");
+                    current.0 = level;
+                }
+                Err(e) => tracing::warn!("the log level stays {}: {e}", current.0),
+            }
+        }
+        if format != current.1 {
+            match self.format.reload((self.layer)(format)) {
+                Ok(()) => {
+                    tracing::info!("the log format is {format} now");
+                    current.1 = format;
+                }
+                Err(e) => tracing::warn!("the log format stays {}: {e}", current.1),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -145,6 +238,87 @@ mod tests {
         assert_eq!(
             settings(&log, &args(Some("debug"), Some(LogFormatArg::Compact))),
             ("debug".to_owned(), LogFormat::Compact)
+        );
+    }
+
+    /// A writer into a shared buffer.
+    #[derive(Debug, Clone, Default)]
+    struct Buf(std::sync::Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'w> MakeWriter<'w> for Buf {
+        type Writer = Buf;
+        fn make_writer(&'w self) -> Buf {
+            self.clone()
+        }
+    }
+
+    impl Buf {
+        /// The lines that contain `what`.
+        fn lines(&self, what: &str) -> Vec<String> {
+            String::from_utf8(self.0.lock().unwrap().clone())
+                .unwrap()
+                .lines()
+                .filter(|l| l.contains(what))
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    fn log(level: &str, format: LogFormat) -> Log {
+        Log {
+            level: LogFilter(level.into()),
+            format,
+        }
+    }
+
+    #[test]
+    fn a_generation_changes_the_level_and_the_format() {
+        let buf = Buf::default();
+        let (subscriber, logger) = build(
+            &log("info", LogFormat::Compact),
+            &args(None, None),
+            buf.clone(),
+        )
+        .unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!("before");
+            logger.apply(&log("debug", LogFormat::Json));
+            tracing::debug!("after");
+        });
+        assert!(buf.lines("before").is_empty());
+        let after = buf.lines("after");
+        assert_eq!(after.len(), 1, "{after:?}");
+        let line: serde_json::Value = serde_json::from_str(&after[0]).unwrap();
+        assert_eq!(line["fields"]["message"], "after");
+    }
+
+    #[test]
+    fn the_command_line_wins_over_a_generation() {
+        let buf = Buf::default();
+        let cli = args(Some("info"), Some(LogFormatArg::Compact));
+        let (subscriber, logger) =
+            build(&log("info", LogFormat::Compact), &cli, buf.clone()).unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            logger.apply(&log("debug", LogFormat::Json));
+            tracing::debug!("quiet");
+            tracing::info!("loud");
+        });
+        assert!(buf.lines("quiet").is_empty());
+        let loud = buf.lines("loud");
+        assert_eq!(loud.len(), 1, "{loud:?}");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&loud[0]).is_err(),
+            "{loud:?}"
         );
     }
 }

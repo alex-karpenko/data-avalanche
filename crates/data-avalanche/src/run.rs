@@ -2,25 +2,26 @@
 
 use std::future::IntoFuture;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use data_avalanche_cluster::{
-    ClusterReconciler, ControllerDeps, ControllerSettings, Gossip, GossipKey, GossipSettings,
-    LeaseTiming, NodeIdentity, NodeMeta, Phase, ReconcilerSettings, Seeds, Udp, advertise,
-    discover, interfaces, join as join_gossip, leave, node_identity,
+    ClusterReconciler, ConfigCoordinator, ControllerDeps, ControllerSettings, CoordinatorDeps,
+    Gossip, GossipKey, GossipSettings, LeaseTiming, NodeIdentity, NodeMeta, Phase,
+    ReconcilerSettings, Seeds, Udp, advertise, discover, interfaces, join as join_gossip, leave,
+    node_identity,
 };
 use data_avalanche_config::{
     Diagnostic, FingerprintKey, ProcessEnv, Report, ResolvedConfig, Severity, load_str,
 };
 use data_avalanche_pipeline::{Backoff, Tuning};
-use data_avalanche_state::Leases;
+use data_avalanche_state::{ConfigGenerations, Leases};
 use data_avalanche_telemetry::Metrics;
 use thiserror::Error;
 use tokio::sync::{Semaphore, oneshot};
 
-use crate::http::{self, Http};
+use crate::http::{self, ConfigApi, Http};
 use crate::startup::{Buckets, join};
 use crate::{Factory, RunArgs, logging};
 
@@ -109,7 +110,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     // 1. A first load with a throwaway key: only globals.state and the cluster settings matter.
     let first = load_str(&text, &ProcessEnv, &FingerprintKey::random())
         .map_err(|r| Fatal::Config(render(&r)))?;
-    logging::init(&first.config.globals.log, &args).map_err(Fatal::Config)?;
+    let logger = Arc::new(logging::init(&first.config.globals.log, &args).map_err(Fatal::Config)?);
     for w in &first.warnings {
         tracing::warn!("config: {}", line(w));
     }
@@ -119,6 +120,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     // The listener answers from here: live at once, ready once every controller runs.
     let metrics = Metrics::new();
     let ready = Arc::new(AtomicBool::new(false));
+    let config_api = Arc::new(OnceLock::new());
     let listener = http::bind(&first.config.globals.api.address).await?;
     let (stop_http, http_stopped) = oneshot::channel::<()>();
     let server = tokio::spawn(
@@ -127,6 +129,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
             http::router(Http {
                 metrics: metrics.clone(),
                 ready: Arc::clone(&ready),
+                config: Arc::clone(&config_api),
             }),
         )
         .with_graceful_shutdown(async {
@@ -136,12 +139,13 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     );
     let holder = node_identity(&first.config.globals.cluster, started)
         .map_err(|e| Fatal::Config(e.to_string()))?;
-    let buckets = Buckets::new(&first.config.globals);
+    let buckets = Arc::new(Buckets::new(&first.config.globals));
     let joined = join(&buckets, &holder.node_id, &text, &first.config).await?;
     let config = joined.config;
     if let Some(why) = unsupported(&config) {
         return Err(Fatal::Config(why));
     }
+    logger.apply(&config.globals.log);
     tracing::info!(
         node = %holder.node_id,
         incarnation = holder.incarnation,
@@ -151,7 +155,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
 
     let c = &config.globals.cluster;
     let deps = ControllerDeps {
-        leases: Leases::new(joined.globals),
+        leases: Leases::new(joined.globals.clone()),
         holder,
         factory: Arc::new(Factory::new(&config.globals).map_err(Fatal::Config)?),
         metrics: metrics.clone(),
@@ -189,7 +193,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         addr,
         meta: NodeMeta {
             phase: Phase::Joining,
-            config_generation: joined.generation,
+            config_generation: joined.generation.doc.generation,
             build: env!("CARGO_PKG_VERSION").to_owned(),
         },
     };
@@ -206,11 +210,40 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         gossip.members(),
         ReconcilerSettings::new(c),
     );
+    // Each newer config generation, this node's reloads included (Clustering §9).
+    let docs = Arc::clone(&buckets);
+    let log = Arc::clone(&logger);
+    let coordinator = Arc::new(ConfigCoordinator::start(
+        config.clone(),
+        joined.generation,
+        CoordinatorDeps {
+            generations: ConfigGenerations::new(joined.globals.clone()),
+            env: Arc::new(ProcessEnv),
+            key: FingerprintKey::from_bytes(joined.fingerprint_key),
+            node_id: deps.holder.node_id.clone(),
+            docs: Arc::new(move |p| docs.pipeline_docs(p).map_err(|e| e.to_string())),
+            factory: Arc::clone(&deps.factory),
+            reloader: reconciler.reloader(),
+            advertiser: gossip.advertiser(),
+            metrics: metrics.clone(),
+            globals: Arc::new(move |g| log.apply(&g.log)),
+        },
+        gossip.members(),
+        c.lease_renewal_interval,
+    ));
+    let _ = config_api.set(ConfigApi {
+        coordinator: Arc::clone(&coordinator),
+        members: gossip.members(),
+        file: args.config.clone(),
+    });
     ready.store(true, Ordering::SeqCst);
     shutdown_signal().await;
     tracing::info!("shutting down: handing off every pipeline and releasing its lease");
     ready.store(false, Ordering::SeqCst);
     discovery.abort();
+    // No generation is adopted during the leave; it hands off what the last one configures.
+    coordinator.stop().await;
+    let config = coordinator.config().await;
     leave(gossip, reconciler, leave_within(&config)).await;
     let _ = stop_http.send(());
     let _ = server.await;
