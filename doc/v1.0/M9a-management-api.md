@@ -8656,18 +8656,88 @@ git commit -m "test(e2e): the API over TLS with tokens and a reloaded role mappi
 ---
 ## Exit
 
-- [ ] Every `/v1` route of System-Overview's table except the snapshot jobs (M9b) answers on any node, behind its least role; the matrix test turns away every caller below it, 401 vs 403 (Tasks 4–7).
-- [ ] Auth `none`, `basic`, `jwt` and `oauth2` with `role_mapping`, and the auth follows a reload (Tasks 4, 8).
-- [ ] TLS on the listener (Tasks 3, 8).
-- [ ] Pause, stop and resume move the desired state, with `409` where Lifecycle §3 forbids; restart and flush are taken by the holder under its lease (Tasks 1, 2, 5, 8).
-- [ ] The pipelines list and status come from storage, with the holder, the position and the halted tables (Task 5).
-- [ ] Config validate publishes nothing and returns no resolved config; cluster status names the members and the holders; a leave stays up, a shutdown exits 0 (Tasks 6, 8).
-- [ ] The OpenAPI document is validated and snapshot-tested (Task 7).
-- [ ] The E2E suite passes on PostgreSQL 18 and, through `ci.yml`'s jobs, on `mysql-84`, `mysql-84-nogtid` and `mariadb-118`.
-- [ ] Every Review Focus line has its passing test.
-- [ ] The documents of "Documents this plan changes" are updated, and the approved spec edits applied.
-- [ ] The workspace gates pass: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo clippy -p data-avalanche --features e2e-hooks --all-targets -- -D warnings`, `cargo test --workspace`.
+- [x] Every `/v1` route of System-Overview's table except the snapshot jobs (M9b) answers on any node, behind its least role; the matrix test turns away every caller below it, 401 vs 403 (Tasks 4–7).
+- [x] Auth `none`, `basic`, `jwt` and `oauth2` with `role_mapping`, and the auth follows a reload (Tasks 4, 8).
+- [x] TLS on the listener (Tasks 3, 8).
+- [x] Pause, stop and resume move the desired state, with `409` where Lifecycle §3 forbids; restart and flush are taken by the holder under its lease (Tasks 1, 2, 5, 8).
+- [x] The pipelines list and status come from storage, with the holder, the position and the halted tables (Task 5).
+- [x] Config validate publishes nothing and returns no resolved config; cluster status names the members and the holders; a leave stays up, a shutdown exits 0 (Tasks 6, 8).
+- [x] The OpenAPI document is snapshot-tested, read back by utoipa, and checked for every route's role, security scheme and common answers (Task 7). (Reworded at the whole-branch review: the test doesn't validate against the OAS 3.1 schema, DA-API-18.)
+- [ ] The E2E suite passes on PostgreSQL 18 and, through `ci.yml`'s jobs, on `mysql-84`, `mysql-84-nogtid` and `mariadb-118`. (Measured locally on PostgreSQL 18 and `mysql-84`, 42/42 each at 9a4e5f0; `mysql-84-nogtid` and `mariadb-118` run in the PR's CI.)
+- [x] Every Review Focus line has its passing test.
+- [x] The documents of "Documents this plan changes" are updated, and the approved spec edits applied.
+- [x] The workspace gates pass: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo clippy -p data-avalanche --features e2e-hooks --all-targets -- -D warnings`, `cargo test --workspace`.
 
 ## Deviations during execution
 
-None yet.
+Recorded from the SDD ledger. Each task's code was applied as verified. Every change below came
+from a review, and each fix is its own commit after the task's. From Task 5 on, the plan's
+`pub use auth::{…}` context line lacks Task 4's `KEYS_MAX_AGE`: that one line was applied by hand
+in Tasks 6 and 7, and no other hunk was adapted.
+
+| Task | Commit | Deviation |
+|---|---|---|
+| 2 | aeab120 | A reload's `Update::Restart` at a new state location takes the status and request baselines anew (`reported` reset, `seen` read from the new documents): the plan kept the old location's, so the new location got no status until it changed, and a request already there would have been taken. Test `a_reload_restart_at_new_state_writes_its_status_there`. |
+| 4 | f729d9f | jsonwebtoken checks `iss` and `aud` only when a token carries them, so a token without them passed. Now `iss` is always required, and `aud` whenever an audience is configured. While no key set was ever fetched the answer is 503 throughout (it was 401 "no key" within `REFETCH_AFTER` of a failed first fetch). The key set has a maximum age, `KEYS_MAX_AGE` = 10 min: an older set is fetched again, and a failed refetch keeps the old keys, retried at most every `REFETCH_AFTER` (D-M9a.6 as built). `Auth::with_timing` (crate-private) sets the times in tests; `Mode::Token` boxes its verifier; the test issuer gained `remove_key` and `set_down`. |
+| 6 | 5005b82, 4e6e498 | The plan's run loop built the signal future inside its `select!` on every pass, so a SIGTERM that arrived during an API-asked leave was lost (tokio delivers a signal to the listeners registered when its driver runs) and the process hung until SIGKILL. The stop sources are now one `Stops`, built before the loop, its signal future pinned across passes and polled first (`biased`), so the first wait registers the listeners. `Control::ask` is public for the binary's test. Test `a_signal_during_a_leave_still_stops_the_process` sends SIGTERM to the test process during a leave and yields to the runtime before it waits again; without the yield the bug's shape passed it (4e6e498). |
+
+**The whole-branch review** (1b97efc..e76d55a): no Critical. Five Important findings, all fixed
+before the PR in one fix wave, together with the cheap minors the review triaged as "fix in this
+PR". The scoped re-review found every finding addressed and no new Critical or Important breakage.
+
+| Commit | Fix |
+|---|---|
+| 1d71c9a | **Validate of a posted body is no longer an oracle for a running secret.** A `Secret` serializes as its keyed fingerprint and the diff lists every path whose value differs, so a body repeating a guess at a secret's path told by its absence from `changes` that the guess was right. With a body, two fingerprints (`blake3:` strings, secrets and file fingerprints alike) now compare equal: `diff_with(…, Fingerprints::Ignored)` in the config crate, `ConfigCoordinator::check(text, fingerprints)`, and `"secrets_compared": false` in the answer. Validate of the node's own file compares them as before. Test `a_check_of_a_body_does_not_tell_whether_its_secret_is_the_running_one`, which also replaces a non-leak assertion that couldn't fail. |
+| d56b7cc | **A JWKS fetch no longer holds the key cache.** The fetch held the cache's lock, so any caller with a made-up `kid` (no credentials needed) made a hanging IdP stall every bearer verification for up to `FETCH_TIMEOUT` once per `REFETCH_AFTER`. Now one fetch runs at a time in its own task, outside the lock. A caller whose key is cached verifies at once, even from an old set while its refetch runs; a caller whose key isn't cached waits for that one fetch. A `kid` missing after a failed (or throttled) refetch answers 503, not 401. Tests: `old_keys_verify_at_once_while_the_issuer_hangs`, `a_made_up_key_id_does_not_hold_up_a_good_token`, `a_key_missing_after_a_failed_refetch_is_unavailable`, `after_a_failed_refetch_an_unknown_key_id_waits_the_refetch_interval`, `without_an_audience_a_token_without_aud_verifies`; the test issuer gained a hang mode. |
+| 768fc1b | **A reload keeps the cached keys unless their source changes** (the issuer, `jwks_url` or `discovery_url`). A `role_mapping`, `roles_claim` or `audience` change used to start with no keys, so a reload during an IdP outage made every bearer caller a 503. Test `a_reload_of_the_role_mapping_keeps_the_keys`. |
+| 5ac4975 | **`roles_claim` names the claim by its literal key first**, then as a dotted path: Auth0's namespaced claims (`https://example.com/roles`) were split at their dots and never found. Test `a_namespaced_roles_claim_is_read_by_its_name`. |
+| dafe228 | Auth settings that don't hold together fail closed (every request 503, logged), where they used to fall open to `none`. `nbf` is checked (60 s leeway). `basic` compares BLAKE3 digests in constant time. The key-fetch 503 names no URL or error (logged at warn). The gate test requires the handler's own 503 body. |
+| 67d87c5 | `save_status` keeps a stored status of a higher `owner_epoch`, so a stalled former owner can't overwrite its successor's for the rest of the term. The 202s of leave and shutdown name the node. `check` loads the body outside the coordinator's lock. "Restarted on request" is logged only when a worker was discarded. A stopped TLS listener lets its port go without waiting for a connection, and a cert PEM with no certificate is refused at bind. The paused-flush test asserts that no request was written; one helper reads the node's file for validate and reload. |
+| 9a4e5f0 | 67d87c5's guard made the holder's-own-earlier-term case of Task 5's status test a refused write, so it passed for the wrong reason. The case is its own test now, `a_holder_s_status_of_an_earlier_term_is_not_this_term_s`, which fails with the epoch check removed from `actual()`. |
+
+**Reworded, not built:** the Exit's "the OpenAPI document is validated" (and roadmap §4 M9's).
+Task 7's test reads the document back through utoipa and checks every route's role, security
+scheme and common answers. It doesn't validate against the OAS 3.1 schema: that needs a vendored
+schema and a new dependency, so it is a follow-up (DA-API-18).
+
+Left for later:
+- **New gaps** (gap tracker §41.1):
+  - DA-API-13: a crashed holder reads as live until takeover;
+  - DA-API-14: a left node keeps its last generation's auth;
+  - DA-API-15: a retried restart or flush call asks twice;
+  - DA-API-16: the JWKS fetch accepts `http`, follows redirects and reads an unbounded body;
+  - DA-API-17: no connection limit on the TLS listener;
+  - DA-API-18: OAS 3.1 schema validation;
+  - DA-API-19 (🟡, found by the final re-review outside the fix diff): validate of a posted body
+    echoes an added pipeline's `${VAR}`-resolved `id`, so an operator can read a node environment
+    variable that fits V-055's pattern.
+- From the re-review, in the fix wave's code:
+  - a panic inside the spawned JWKS fetch would leave it marked in flight, so no fetch would run
+    again until a restart;
+  - an externally deleted lease restarts at epoch 1, and `save_status` then keeps the old,
+    higher-epoch status until the new epoch passes it (the sink's epoch fence trips in that
+    scenario anyway).
+- The review's other minors:
+  - `/v1/pipelines` and `/v1/cluster/status` read one pipeline at a time, and one storage error
+    fails the whole list;
+  - a flush taken while no worker runs is a logged no-op, answered 202 (Lifecycle §3 says so);
+  - a crashed holder's 202s are absorbed by the next term's baseline (DA-API-13);
+  - the snapshot test prints no diff on a mismatch, and a crate version bump needs a bless;
+  - the per-route answer lists in the OpenAPI document are kept by hand (D-M9a.9);
+  - a `kid` present but undecodable counts as found until `KEYS_MAX_AGE`;
+  - no test of a status or requests document at an unsupported version, of a failed status write
+    retried at the next poll, of the 503 paths of validate and the pipeline routes, or of the
+    `position.json` (MySQL) position branch;
+  - the E2E's TLS client panics instead of retrying a node briefly not answering.
+
+**Counts.** The workspace runs more tests than the plan says from Task 2 on (Task 2's fix +1,
+Task 4's +2, Task 6's +1): 1213, 1214, 1227, 1231, 1237, 1240 and 1240 after Tasks 2–8, against
+the plan's 1212, 1213, 1224, 1228, 1233, 1236 and 1236; after the whole-branch review's fixes,
+1254.
+
+**Measured at the end of execution.** At 9a4e5f0 (the whole-branch review's fixes), the full E2E
+suite passed 42/42 on PostgreSQL 18 (530.89 s) and on MySQL 8.4 (477.34 s), with no stray
+process. The workspace runs 1254 tests, and the gates are clean (`cargo fmt --all --check`, both
+clippy runs). The fix wave's run of the four API scenarios on PostgreSQL 18 passed 4/4. At e76d55a
+(Task 8), the four API scenarios passed on PostgreSQL 18 (99.67 s) and MySQL 8.4 (98.78 s).
+`mysql-84-nogtid` and `mariadb-118` run in the PR's CI.

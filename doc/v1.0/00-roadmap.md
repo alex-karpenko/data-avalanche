@@ -1243,7 +1243,8 @@ the config, jobs persisted and resumed, the re-snapshot that clears a persisted 
   - OpenAPI generated with `utoipa`, served at `/v1/openapi.json`.
 - **Deps:** M6b (M8 for reload propagation and cluster endpoints).
 - **Exit:** an endpoint × role matrix test (401 vs 403); lifecycle transitions and `409`s; the OpenAPI
-  document is validated and snapshot-tested.
+  document is snapshot-tested, read back by utoipa, and checked for every route's role, security
+  scheme and common answers (as built in M9a; validation against the OAS 3.1 schema is DA-API-18).
 
 ### M10 — Observability completion (`data-avalanche-telemetry`)
 
