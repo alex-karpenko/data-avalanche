@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-22
+updated: 2026-10-23
 domain: Architecture
 tags: [v1, implementation-plan, roadmap, milestones, workspace, crates, interfaces, test-strategy, ci, risks]
 sources: []
@@ -617,7 +617,11 @@ it (config §12), and hands the changes to the reconciler. A generation it can't
 once and tried again at each poll. A reload publishes the node's file with a CAS on the
 generation pointer, retried up to `PUBLISH_ATTEMPTS` times when another node published first. The
 same text is published again when it resolves differently here. A pipeline added back while its
-removal runs starts once that removal ends.
+removal runs starts once that removal ends. A pipeline added in the same reload as a removal, and
+sharing the removed one's PostgreSQL slot or publication, its sink location or its state location
+(an `id` change: delete, then recreate, config §9.1), claims only once the removed pipeline's lease
+is released, gone, or unrenewed for a lease duration (M8b's deviations; DA-OPS-10 for what it
+doesn't cover).
 
 ### 3.8 Configuration (`data-avalanche-config`, landed in M1)
 

@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-22
+updated: 2026-10-23
 domain: Clustering
 tags: [v1, implementation-plan, m8b, cluster, config-generation, reload, coordinator, mutability, api, e2e]
 resolves: [DA-OPS-8]
@@ -6742,12 +6742,76 @@ git commit -m "test(e2e): a reload on one of three node processes reaches every 
 ---
 ## Exit
 
-- [ ] A reload on any node publishes the next config generation, and every node applies it (Tasks 5, 6, 8).
-- [ ] R fields change in place, in the running worker and source; a PR change restarts the pipeline under its lease; an added pipeline runs where the ring places it; a removed one is drained, torn down by its owner and released (Tasks 1–4, 6, 8).
-- [ ] A PROC change, or a file that doesn't load, is refused with its report, and nothing is published (Tasks 5, 7, 8).
-- [ ] `GET /v1/config/status` reports the cluster's generation and each member's applied one (Tasks 7, 8).
-- [ ] A process restart runs the cluster's generation, not the file; a node whose file differs from the generation in a per-node key is warned at startup (Tasks 7, 8).
-- [ ] The E2E suite passes on PostgreSQL 18 and, through `ci.yml`'s jobs, on `mysql-84`, `mysql-84-nogtid` and `mariadb-118`.
-- [ ] Every Review Focus line has its passing test.
-- [ ] The documents of "Documents this plan changes" are updated.
-- [ ] The workspace gates pass: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo clippy -p data-avalanche --features e2e-hooks --all-targets -- -D warnings`, `cargo test --workspace`.
+- [x] A reload on any node publishes the next config generation, and every node applies it (Tasks 5, 6, 8).
+- [x] R fields change in place, in the running worker and source; a PR change restarts the pipeline under its lease; an added pipeline runs where the ring places it; a removed one is drained, torn down by its owner and released (Tasks 1–4, 6, 8).
+- [x] A PROC change, or a file that doesn't load, is refused with its report, and nothing is published (Tasks 5, 7, 8).
+- [x] `GET /v1/config/status` reports the cluster's generation and each member's applied one (Tasks 7, 8).
+- [x] A process restart runs the cluster's generation, not the file; a node whose file differs from the generation in a per-node key is warned at startup (Tasks 7, 8).
+- [ ] The E2E suite passes on PostgreSQL 18 and, through `ci.yml`'s jobs, on `mysql-84`, `mysql-84-nogtid` and `mariadb-118`. (Measured locally on PostgreSQL 18 and `mysql-84`; the other targets run in the PR's CI.)
+- [x] Every Review Focus line has its passing test.
+- [x] The documents of "Documents this plan changes" are updated.
+- [x] The workspace gates pass: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo clippy -p data-avalanche --features e2e-hooks --all-targets -- -D warnings`, `cargo test --workspace`.
+
+## Deviations during execution
+
+Recorded from the SDD ledger. Each task's code was applied as verified; every change below came
+from a review, and each fix is its own commit after the task's.
+
+| Task | Commit | Deviation |
+|---|---|---|
+| 3 | 04e93c3 | A removal's teardown checks the lease (`may_commit`) before every attempt, not only before the first: the retries run up to `contended_window`, and a lease lost meanwhile would have let the teardown drop a new holder's slot. On a lost lease the teardown stops, warns "removed after its lease was lost" and releases nothing (D-M8b.3: "a lease lost meanwhile leaves the source as it is"). Test `a_teardown_stops_once_the_lease_is_lost`; the testkit's fake source records `Method::Teardown`. |
+
+**The whole-branch review** (4578b24..a514627): no Critical; two Important findings and one Minor,
+all three fixed before the PR. The scoped re-review of those fixes found one more Important, fixed
+in a second round on Oleksii's go. The other minors are left for later, below.
+
+| Commit | Fix |
+|---|---|
+| 775b2f2 | **An `id` change that keeps its resources is sequenced** (Oleksii's choice: sequence it; config §9.1, `id`: delete, then recreate). The diff gave `Remove(X)` and `Add(Y)`, and Y started at once, beside X's drain and teardown: with `slot_on_orphan: halt` Y refused X's slot as an orphan, otherwise X's teardown could drop the slot Y streamed from. Now, in one reload, an added Y *follows* a removed X when `shares(X, Y)`: both PostgreSQL with the same host, port and db and an equal slot or publication; the same sink bucket and prefix; or the same resolved state location (config §10: a co-located state is under the sink prefix). Y's controller waits, before its first claim, until X's lease is absent, released, or unchanged in version for a lease duration (Clustering §5.3's rule: versions, not clocks), read every `renewal_interval`; it still answers its target and updates meanwhile. Every node applies the same reload, so every node computes the same followers. Tests `a_pipeline_shares_a_slot_a_publication_a_sink_or_a_state`, `a_pipeline_taking_a_removed_ones_slot_starts_once_the_removal_lets_go` (X's teardown before Y's first build), `a_pipeline_added_that_shares_nothing_starts_during_a_removal`, `a_followed_lease_never_renewed_is_let_go_after_a_lease_duration`, `a_follower_removed_while_it_waits_ends`. |
+| 92c5f2b | A removal whose drain was cut off by `drain_timeout` leaves the source and the lease as they are: no teardown, no release. Test `a_removal_with_its_drain_cut_off_leaves_the_source`, checked by inverting the branch (the test then fails). |
+| 21083bd | An `Add` for an id that still has a controller restarts it with the added config (logged at `ERROR`), instead of removing it, which tore down its slot. The config diff never produces it; the fallback is no longer destructive. Test `an_add_for_a_running_pipeline_restarts_it` (no teardown, the same `owner_epoch`). |
+| 1d4a13c | **A wait on a removed pipeline ends once a later generation adds its id again.** The re-review found that the list of followed ids, kept by the node for a respawn, was cleared only on the node that finished the wait: once a later reload added a new pipeline under X's id, its lease renewed for ever, and any later move or respawn of Y waited on it for ever, silently on standby. The list is now one `Following` shared by the reconciler's `Controlled` and the controller: every `Add` drops its id from every wait, and the list is cleared when a wait ends. A wait past three lease durations warns once a lease duration. Tests `a_wait_on_an_id_a_later_generation_adds_again_ends`, `a_follower_started_again_after_its_wait_waits_no_more`. |
+
+Left for later:
+- **What the `id`-change sequencing doesn't cover** (DA-OPS-10, gap tracker §39.1):
+  - Only removals in the same reload count. A node that starts or joins during the wait builds Y
+    without one, and an operator who removes X in one reload and adds Y in a later one gets none.
+  - X's lease between two holders: released by one node, not yet claimed by a node that hasn't
+    adopted the reload. Y can start while that node claims X briefly, then removes it. The window
+    is one poll or one gossip nudge, as DA-OPS-9's hand-off.
+  - A removal whose drain was cut off doesn't tear down (92c5f2b), so Y starts after a lease
+    duration with X's slot still there, and with `slot_on_orphan: halt` halts on it.
+  - A later reload that reuses X's id while X still drains ends the wait at once: Y may start up
+    to `drain_timeout` + `contended_window` early. The alternative the re-review suggested, X's
+    `owner_epoch` at the first read, would block a node that first reads after the reused X
+    claimed, for ever again (ruling in the ledger).
+  - An add-back under its own id waits for its own removal only, not also for another removed
+    pipeline it shares with; a removal of a pending add-back is matched with the add-back's
+    config.
+  - The long-wait warning has no test (no log capture in these tests).
+  - M11's operator docs: before reusing a removed pipeline's id, or adding in a later reload a
+    pipeline that takes its slot, publication, sink or state, wait for its lease's release.
+- The review's other minors, for a later milestone:
+  - the session swaps its buffer semaphore and re-arms its timers on every reload, not only when
+    the buffer or the intervals changed;
+  - D-M8b.7's "the same text resolves differently" is diffed against the running config, which
+    differs from the generation's when this node refused that generation;
+  - a generation this node refused is tried again on every membership change, not only at the
+    poll (two `resolve_tables` per changed pipeline each time);
+  - the coordinator's lock is held across the catalog reads of `resolve_tables`, so `config()`
+    and `stop()` wait behind them (bounded by the command timeout);
+  - a generation pointer older than the applied one (a restored bucket) should be logged at
+    `ERROR`; the applied number goes backward;
+  - a loaded file's warnings are dropped, and its docs are checked only after it is published;
+  - `latest()` reads the generation's snapshot text to answer its number;
+  - DA-OPS-9's rolling-deploy variant: a removal adopted during a node's leave.
+
+**Counts.** From Task 3 on, the workspace runs one more test than the plan says (Task 3's fix:
+1170, 1175, 1188, 1189, 1193 and 1193); after the whole-branch review's fixes, 1202, against the
+plan's 1192.
+
+**Measured at the end of execution.** At 1d4a13c (the whole-branch review's fixes), the full E2E
+suite passed 39/39 on PostgreSQL 18 (450.63 s) and on MySQL 8.4 (406.90 s), with no stray process;
+the workspace runs 1202 tests and the gates are clean. Before the second round, at 21083bd, it
+passed 39/39 on PostgreSQL 18 (452.95 s) and MySQL 8.4 (411.10 s). `mysql-84-nogtid` and
+`mariadb-118` run in the PR's CI.
