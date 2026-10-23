@@ -228,7 +228,7 @@ Lifecycle §3 foresees ("Until M9's `restart`, …"). The proposed System-Overvi
       without depending on the controller's sampling (D-M9a.4, D-M9a.5). A stop and a resume
       inside one poll still aren't seen apart, and needn't be;
     - new gaps, if the review finds any.
-- **Spec edits, proposed with the plan (each needs your approval):**
+- **Spec edits, approved and applied 2026-10-23** (`spec:` commit):
   - `System-Overview.md` §Management API endpoints:
     - the validate row: the body or the node's file; no resolved config returned (D-M9a.7);
     - the restart row: desired state `RUNNING`, `ERROR` included (D-M9a.4, raised above);

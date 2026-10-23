@@ -156,7 +156,7 @@ proxy; a leave keeps the process up and a shutdown is SIGTERM's path; a snapshot
 its pipeline's. Oleksii confirmed D-M9a.4: restart's "`RUNNING` only" is the desired state, so a
 restart takes a pipeline out of `ERROR`. M9a's plan (`doc/v1.0/M9a-management-api.md`) was built
 task by task in a scratch workspace and replayed from its code blocks to an identical tree. Two
-spec patches are proposed with it, awaiting approval: System-Overview's endpoint table (validate,
+spec patches came with it, approved and applied the same day: System-Overview's endpoint table (validate,
 restart, leave, shutdown, `GET /v1/openapi.json`) and Data-Flow's state layout (`status.json`,
 `requests.json`).
 
