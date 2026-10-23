@@ -2,7 +2,8 @@
 //! behind a [`Forwarder`], seeded with every node's forwarder. Three pipelines over one table
 //! spread over them. A crash (`kill -9`), a leave (SIGTERM), a partition (the forwarders drop a
 //! side's packets) and a stop-the-world pause (SIGSTOP) each end with every pipeline held by one
-//! live node, every row in the lake, and owner epochs that never go back in the Delta log.
+//! live node, every row in the lake, and owner epochs that never go back in the Delta log. A
+//! reload on one node reaches the three (Clustering §9.2).
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -44,7 +45,21 @@ struct Node {
 /// The nodes are dropped (and print their logs on a failure) before the test's directory.
 struct Cluster {
     nodes: Vec<Node>,
+    /// The pipelines the config runs: the test's, `b`, `c`; a reload changes them.
+    ids: Vec<String>,
     e: E2e,
+}
+
+/// Each pipeline but the test's own has a source suffix and a lake of its name.
+const SPARES: [&str; 3] = ["b", "c", "d"];
+
+/// A pipeline's lake.
+fn lake(test: &str, id: &str) -> String {
+    if id == test {
+        "lake".to_owned()
+    } else {
+        format!("lake_{id}")
+    }
 }
 
 impl Cluster {
@@ -81,10 +96,11 @@ impl Cluster {
             },
         )
         .await;
-        for suffix in ["_b", "_c"] {
-            e.drop_source(suffix).await;
+        for id in SPARES {
+            e.drop_source(&format!("_{id}")).await;
         }
-        Self { nodes, e }
+        let ids = vec![e.test.clone(), "b".into(), "c".into()];
+        Self { nodes, ids, e }
     }
 
     async fn start(&mut self, i: usize) {
@@ -108,8 +124,8 @@ impl Cluster {
         self.settled().await;
     }
 
-    fn ids(&self) -> [String; 3] {
-        [self.e.test.clone(), "b".into(), "c".into()]
+    fn ids(&self) -> Vec<String> {
+        self.ids.clone()
     }
 
     /// Each pipeline's lease: its holder and epoch, unless released.
@@ -188,7 +204,9 @@ impl Cluster {
 
     /// Every lake's `items` holds the source's rows, and its owner epochs never went back.
     async fn landed(&self) {
-        for lake in ["lake", "lake_b", "lake_c"] {
+        for id in self.ids() {
+            let lake = lake(&self.e.test, &id);
+            let lake = lake.as_str();
             self.e
                 .converged_in(lake, "items", Duration::from_secs(60))
                 .await;
@@ -220,8 +238,8 @@ impl Cluster {
                 assert!(p.terminate().await.success(), "{} stops", n.name);
             }
         }
-        for suffix in ["_b", "_c"] {
-            self.e.drop_source(suffix).await;
+        for id in SPARES {
+            self.e.drop_source(&format!("_{id}")).await;
         }
         self.e.cleanup().await;
     }
@@ -418,5 +436,93 @@ async fn a_paused_holder_loses_its_pipelines_and_rejoins() {
     c.e.exec("INSERT INTO items VALUES (3, 'c')").await;
     c.settled().await;
     c.landed().await;
+    c.stop().await;
+}
+
+/// A reload on `n2` (Clustering §9.2): its file removes `c`, adds `d` and renames the test's
+/// pipeline (an R change, config §12.3). Every node applies generation 2 and reports it; `c`'s
+/// owner releases its lease and drops its slot (`auto_cleanup`); `d` runs on the node the ring
+/// places it on, its initial snapshot and its stream together holding every row; the renamed
+/// pipeline keeps its lease and epoch, and is scraped by its new name.
+#[tokio::test]
+async fn a_reload_reaches_every_node() {
+    require_it!();
+    let mut c = Cluster::new("cluster_reload").await;
+    c.start_all().await;
+    c.e.exec("INSERT INTO items VALUES (1, 'a')").await;
+    c.landed().await;
+    let before = c.holders().await;
+    let test = c.e.test.clone();
+
+    let text = c.e.config();
+    let at = text.find("  c:\n").expect("pipeline c");
+    let d = text[at..]
+        .replace("  c:\n    id: c\n", "  d:\n    id: d\n")
+        .replace(&format!("{}_c", c.e.schema), &format!("{}_d", c.e.schema))
+        .replace("/lake_c,", "/lake_d,")
+        // A pipeline reports `running` from its start, before it reads (the status metric):
+        // the snapshot takes what is in the table then, the stream what comes after.
+        .replace("snapshots: { mode: never }", "snapshots: { mode: initial }");
+    let renamed = format!("{test}_renamed");
+    let next = text[..at].replace(
+        &format!("  {test}:\n    id: {test}\n"),
+        &format!("  {renamed}:\n    id: {test}\n"),
+    ) + &d;
+    assert_ne!(next, text);
+    c.e.write_config(&next);
+    let (code, v) = c.nodes[1].proc.as_ref().unwrap().reload().await;
+    assert_eq!(
+        (code, &v),
+        (202, &serde_json::json!({ "generation": 2 })),
+        "{v}"
+    );
+
+    for n in c.live() {
+        let p = n.proc.as_ref().unwrap();
+        p.metric("data_avalanche_config_generation 2").await;
+    }
+    eventually(
+        "every node reports generation 2",
+        Duration::from_secs(30),
+        async || {
+            let s = c.nodes[0].proc.as_ref().unwrap().config_status().await;
+            s["converged"] == true
+                && s["generation"] == 2
+                && s["nodes"].as_object().map(|m| m.len()) == Some(3)
+        },
+    )
+    .await;
+    c.ids = vec![test.clone(), "b".into(), "d".into()];
+    c.settled().await;
+    let after = c.holders().await;
+    assert_eq!(
+        after[&test], before[&test],
+        "renamed in place: the lease and epoch stay"
+    );
+    assert_eq!(after["b"], before["b"]);
+    eventually(
+        "c's lease is released",
+        Duration::from_secs(30),
+        async || c.e.lease_of("c").await.is_some_and(|l| l.doc.released),
+    )
+    .await;
+    if let Some(exists) = c.e.slot_exists("_c").await {
+        assert!(!exists, "c's slot is dropped (auto_cleanup)");
+    }
+    let holder = c.index(&after[&test].0);
+    c.nodes[holder]
+        .proc
+        .as_ref()
+        .unwrap()
+        .metric(&c.e.status_of(&renamed, "running"))
+        .await;
+
+    c.e.exec("INSERT INTO items VALUES (2, 'b')").await;
+    c.landed().await;
+    assert_eq!(
+        c.e.ids_in(&lake(&test, "c"), "items").await,
+        [1],
+        "c is gone"
+    );
     c.stop().await;
 }

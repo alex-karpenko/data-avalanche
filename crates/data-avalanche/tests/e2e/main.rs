@@ -14,6 +14,7 @@ mod harness;
 mod lifecycle;
 mod mysql;
 mod proxy;
+mod reload;
 mod schema;
 mod smoke;
 mod snapshots;

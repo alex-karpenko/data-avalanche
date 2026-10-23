@@ -98,6 +98,11 @@ three nodes as three processes on loopback, each behind a test-only UDP forwarde
 (`forwarder.rs`) that drops a chosen side's gossip (a partition); they also `kill -9`, SIGTERM
 and SIGSTOP the nodes. They need no service beyond the source and RustFS.
 
+The reload scenarios (`cluster.rs`'s `a_reload_reaches_every_node`, and `reload.rs`) rewrite that
+one config file and call `POST /v1/config/reload` on one node; the others adopt the new config
+generation from `globals.state`, and `GET /v1/config/status` reports each node's. The endpoints
+are unauthenticated until M9.
+
 ## GCS: a real bucket, not an emulator
 
 `fake-gcs-server` 1.56.1 rejects `object_store`'s path-style PUT (`400 invalid uploadType`) and
