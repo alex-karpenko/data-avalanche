@@ -1689,9 +1689,9 @@ version = "0.1.0"
 dependencies = [
  "arrow-array",
  "arrow-cast",
- "axum",
  "chrono",
  "clap",
+ "data-avalanche-api",
  "data-avalanche-cluster",
  "data-avalanche-config",
  "data-avalanche-core",
@@ -1715,6 +1715,30 @@ dependencies = [
  "tokio-postgres",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "data-avalanche-api"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "data-avalanche-cluster",
+ "data-avalanche-config",
+ "data-avalanche-pipeline",
+ "data-avalanche-state",
+ "data-avalanche-storage",
+ "data-avalanche-telemetry",
+ "object_store 0.14.2",
+ "rcgen",
+ "rustls",
+ "rustls-pki-types",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
 ]
 
 [[package]]

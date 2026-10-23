@@ -10,9 +10,9 @@ description = "The data-avalanche process: the CLI, the wiring of sources, sinks
 workspace = true
 
 [dependencies]
-axum.workspace = true
 chrono.workspace = true
 clap.workspace = true
+data-avalanche-api.workspace = true
 data-avalanche-cluster.workspace = true
 data-avalanche-config.workspace = true
 data-avalanche-core.workspace = true

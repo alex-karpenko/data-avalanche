@@ -6,7 +6,6 @@
 mod cli;
 #[cfg(feature = "e2e-hooks")]
 pub mod crash;
-mod http;
 mod logging;
 mod run;
 mod startup;

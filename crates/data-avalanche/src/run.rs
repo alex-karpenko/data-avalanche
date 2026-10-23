@@ -1,11 +1,11 @@
 //! `data-avalanche run`.
 
-use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
+use data_avalanche_api::{Api, Node, ServeError, bind, router};
 use data_avalanche_cluster::{
     ClusterReconciler, ConfigCoordinator, ControllerDeps, ControllerSettings, CoordinatorDeps,
     Gossip, GossipKey, GossipSettings, LeaseTiming, NodeIdentity, NodeMeta, Phase,
@@ -21,7 +21,6 @@ use data_avalanche_telemetry::Metrics;
 use thiserror::Error;
 use tokio::sync::{Semaphore, oneshot};
 
-use crate::http::{self, ConfigApi, Http};
 use crate::startup::{Buckets, join};
 use crate::{Factory, RunArgs, logging};
 
@@ -65,14 +64,6 @@ pub(crate) fn render(report: &Report) -> String {
     report.iter().map(line).collect::<Vec<_>>().join("\n")
 }
 
-/// What this build doesn't serve yet, refused before anything starts.
-pub(crate) fn unsupported(config: &ResolvedConfig) -> Option<String> {
-    config.globals.api.tls.as_ref().map(|_| {
-        "globals.api.tls: the API listener serves TLS from M9; this build serves plain HTTP only"
-            .to_owned()
-    })
-}
-
 /// The controllers' timings from `globals.cluster`.
 pub(crate) fn settings(config: &ResolvedConfig) -> ControllerSettings {
     let c = &config.globals.cluster;
@@ -114,37 +105,33 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     for w in &first.warnings {
         tracing::warn!("config: {}", line(w));
     }
-    if let Some(why) = unsupported(&first.config) {
-        return Err(Fatal::Config(why));
-    }
     // The listener answers from here: live at once, ready once every controller runs.
     let metrics = Metrics::new();
     let ready = Arc::new(AtomicBool::new(false));
-    let config_api = Arc::new(OnceLock::new());
-    let listener = http::bind(&first.config.globals.api.address).await?;
+    let node = Arc::new(OnceLock::new());
+    let api = &first.config.globals.api;
+    let bound = bind(&api.address, api.tls.as_ref())
+        .await
+        .map_err(|e| match e {
+            ServeError::Tls(_) => Fatal::Config(e.to_string()),
+            ServeError::Bind { .. } => Fatal::Startup(e.to_string()),
+        })?;
     let (stop_http, http_stopped) = oneshot::channel::<()>();
-    let server = tokio::spawn(
-        axum::serve(
-            listener,
-            http::router(Http {
-                metrics: metrics.clone(),
-                ready: Arc::clone(&ready),
-                config: Arc::clone(&config_api),
-            }),
-        )
-        .with_graceful_shutdown(async {
+    let server = tokio::spawn(bound.serve(
+        router(Api {
+            metrics: metrics.clone(),
+            ready: Arc::clone(&ready),
+            node: Arc::clone(&node),
+        }),
+        async {
             let _ = http_stopped.await;
-        })
-        .into_future(),
-    );
+        },
+    ));
     let holder = node_identity(&first.config.globals.cluster, started)
         .map_err(|e| Fatal::Config(e.to_string()))?;
     let buckets = Arc::new(Buckets::new(&first.config.globals));
     let joined = join(&buckets, &holder.node_id, &text, &first.config).await?;
     let config = joined.config;
-    if let Some(why) = unsupported(&config) {
-        return Err(Fatal::Config(why));
-    }
     logger.apply(&config.globals.log);
     tracing::info!(
         node = %holder.node_id,
@@ -231,7 +218,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         gossip.members(),
         c.lease_renewal_interval,
     ));
-    let _ = config_api.set(ConfigApi {
+    let _ = node.set(Node {
         coordinator: Arc::clone(&coordinator),
         members: gossip.members(),
         file: args.config.clone(),
@@ -277,8 +264,6 @@ async fn shutdown_signal() {
 #[cfg(test)]
 pub(crate) mod tests {
     use std::collections::BTreeMap;
-
-    use data_avalanche_config::{Origin, Pem, Secret, TlsIdentity};
 
     use super::*;
 
@@ -327,22 +312,6 @@ pipelines:
         let text = render(&r);
         assert!(text.starts_with("error "), "{text}");
         assert!(text.contains("bogus"), "{text}");
-    }
-
-    #[test]
-    fn api_tls_is_refused_until_m9() {
-        let mut c = config();
-        assert_eq!(unsupported(&c), None);
-        let key = FingerprintKey::from_bytes([1; 32]);
-        let pem = || Pem {
-            origin: Origin::Inline,
-            text: Secret::new("-----BEGIN-----", &key),
-        };
-        c.globals.api.tls = Some(TlsIdentity {
-            cert: pem(),
-            key: pem(),
-        });
-        assert!(unsupported(&c).unwrap().contains("M9"));
     }
 
     #[test]

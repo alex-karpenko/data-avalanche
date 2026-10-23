@@ -28,6 +28,7 @@ data-avalanche-source-pg = { path = "crates/data-avalanche-source-pg" }
 data-avalanche-source-mysql = { path = "crates/data-avalanche-source-mysql" }
 data-avalanche-telemetry = { path = "crates/data-avalanche-telemetry" }
 data-avalanche-cluster = { path = "crates/data-avalanche-cluster" }
+data-avalanche-api = { path = "crates/data-avalanche-api" }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
@@ -79,6 +80,8 @@ prometheus-client = "=0.25.1"
 gethostname = "1.1"
 clap = { version = "4.6.7", features = ["derive"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+# The management API (M9a, roadmap §2.1): TLS on the listener, on the workspace's rustls.
+tokio-rustls = { version = "0.26.5", default-features = false, features = ["aws_lc_rs", "tls12"] }
 # The cluster (M8a, roadmap §2.1): the ring's hash (the anchor's `hash_algo: xxh3`); the SWIM
 # core the gossip drives (Q-M8-1, probe `prototypes/cluster-capability`) and its random source;
 # the host's addresses, for an unset `advertise_addr`.
