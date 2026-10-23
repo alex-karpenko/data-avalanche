@@ -22,7 +22,7 @@ use data_avalanche_config::{
     ApiAuth, FingerprintKey, HostPort, Jwt, Pipeline, ProcessEnv, ResolvedConfig, load_str,
 };
 use data_avalanche_pipeline::{Backoff, Tuning};
-use data_avalanche_state::{ConfigGenerations, DocStore, Holder, Leases};
+use data_avalanche_state::{ConfigGenerations, DocStore, Holder, Leases, PipelineDocs};
 use data_avalanche_storage::ObjectStoreVersioned;
 use data_avalanche_telemetry::Metrics;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
@@ -144,13 +144,17 @@ impl WorkerFactory for NoWorkers {
 /// loopback port, its reloads reaching a reconciler without pipelines.
 pub(crate) struct Lone {
     pub node: Node,
+    /// The leases the node reads: a test takes them as another node would.
+    pub leases: Leases,
     pub _reconciler: ClusterReconciler,
     pub _gossip: Gossip,
 }
 
 pub(crate) async fn lone(file: PathBuf) -> Lone {
-    let store = ObjectStoreVersioned::new(Arc::new(InMemory::new()), "globals").unwrap();
+    let mem = Arc::new(InMemory::new());
+    let store = ObjectStoreVersioned::new(mem.clone(), "globals").unwrap();
     let docs = DocStore::new(Arc::new(store));
+    let leases = Leases::new(docs.clone());
     let generations = ConfigGenerations::new(docs.clone());
     let (first, _) = generations
         .bootstrap_or_adopt(CONFIG, "node-a", chrono::Utc::now())
@@ -180,7 +184,7 @@ pub(crate) async fn lone(file: PathBuf) -> Lone {
     let metrics = Metrics::new();
     let c = &config.globals.cluster;
     let deps = ControllerDeps {
-        leases: Leases::new(docs),
+        leases: leases.clone(),
         holder: Holder {
             node_id: "node-a".into(),
             incarnation: 1,
@@ -222,7 +226,15 @@ pub(crate) async fn lone(file: PathBuf) -> Lone {
             coordinator: Arc::new(coordinator),
             members: gossip.members(),
             file,
+            docs: Arc::new(move |p| {
+                let root = format!("lake/{}", p.sink.prefix);
+                let store =
+                    ObjectStoreVersioned::new(mem.clone(), &root).map_err(|e| e.to_string())?;
+                Ok(PipelineDocs::new(DocStore::new(Arc::new(store))))
+            }),
+            leases: leases.clone(),
         },
+        leases,
         _reconciler: reconciler,
         _gossip: gossip,
     }

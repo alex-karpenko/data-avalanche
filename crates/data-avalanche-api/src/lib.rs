@@ -10,6 +10,7 @@
 
 mod auth;
 mod config;
+mod pipelines;
 mod server;
 #[cfg(test)]
 mod test_support;
@@ -24,8 +25,9 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, get, post};
-use data_avalanche_cluster::{ConfigCoordinator, Members};
+use data_avalanche_cluster::{ConfigCoordinator, DocsFn, Members};
 use data_avalanche_config::Role;
+use data_avalanche_state::Leases;
 use data_avalanche_telemetry::{CONTENT_TYPE, Metrics};
 use serde_json::{Value, json};
 use tokio::sync::watch;
@@ -47,12 +49,25 @@ pub struct Api {
 }
 
 /// What the `/v1` routes act on, once the node runs its config generation.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Node {
     pub coordinator: Arc<ConfigCoordinator>,
     pub members: watch::Receiver<Members>,
     /// The node's file, read again by each reload (config §12.1).
     pub file: PathBuf,
+    /// A pipeline's state documents.
+    pub docs: Arc<DocsFn>,
+    /// The leases in `globals.state`: who holds each pipeline.
+    pub leases: Leases,
+}
+
+impl std::fmt::Debug for Node {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Node")
+            .field("file", &self.file)
+            .field("leases", &self.leases)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A `/v1` route and the least role that may call it (API_RBAC §2).
@@ -78,6 +93,34 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
         (
             route("GET", "/v1/config/status", Role::Viewer),
             get(config::status),
+        ),
+        (
+            route("GET", "/v1/pipelines", Role::Viewer),
+            get(pipelines::list),
+        ),
+        (
+            route("GET", "/v1/pipelines/{id}", Role::Viewer),
+            get(pipelines::get),
+        ),
+        (
+            route("POST", "/v1/pipelines/{id}/pause", Role::Operator),
+            post(pipelines::pause),
+        ),
+        (
+            route("POST", "/v1/pipelines/{id}/stop", Role::Operator),
+            post(pipelines::stop),
+        ),
+        (
+            route("POST", "/v1/pipelines/{id}/resume", Role::Operator),
+            post(pipelines::resume),
+        ),
+        (
+            route("POST", "/v1/pipelines/{id}/restart", Role::Operator),
+            post(pipelines::restart),
+        ),
+        (
+            route("POST", "/v1/pipelines/{id}/flush", Role::Operator),
+            post(pipelines::flush),
         ),
     ]
 }
@@ -143,6 +186,28 @@ pub(crate) fn body(code: StatusCode, v: &Value) -> Response {
         .into_response()
 }
 
+/// A request that can't be served: its code and `{"error": …}`.
+#[derive(Debug)]
+pub(crate) struct Failure {
+    code: StatusCode,
+    error: String,
+}
+
+impl Failure {
+    pub(crate) fn new(code: StatusCode, error: impl Into<String>) -> Self {
+        Self {
+            code,
+            error: error.into(),
+        }
+    }
+}
+
+impl From<Failure> for Response {
+    fn from(f: Failure) -> Self {
+        body(f.code, &json!({ "error": f.error }))
+    }
+}
+
 pub(crate) fn starting() -> Response {
     body(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -180,6 +245,13 @@ mod tests {
             [
                 ("POST", "/v1/config/reload", Operator),
                 ("GET", "/v1/config/status", Viewer),
+                ("GET", "/v1/pipelines", Viewer),
+                ("GET", "/v1/pipelines/{id}", Viewer),
+                ("POST", "/v1/pipelines/{id}/pause", Operator),
+                ("POST", "/v1/pipelines/{id}/stop", Operator),
+                ("POST", "/v1/pipelines/{id}/resume", Operator),
+                ("POST", "/v1/pipelines/{id}/restart", Operator),
+                ("POST", "/v1/pipelines/{id}/flush", Operator),
             ]
         );
     }

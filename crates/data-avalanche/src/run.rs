@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime};
 use data_avalanche_api::{Api, Auth, Node, ServeError, bind, router};
 use data_avalanche_cluster::{
     ClusterReconciler, ConfigCoordinator, ControllerDeps, ControllerSettings, CoordinatorDeps,
-    Gossip, GossipKey, GossipSettings, LeaseTiming, NodeIdentity, NodeMeta, Phase,
+    DocsFn, Gossip, GossipKey, GossipSettings, LeaseTiming, NodeIdentity, NodeMeta, Phase,
     ReconcilerSettings, Seeds, Udp, advertise, discover, interfaces, join as join_gossip, leave,
     node_identity,
 };
@@ -202,6 +202,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     );
     // Each newer config generation, this node's reloads included (Clustering §9).
     let docs = Arc::clone(&buckets);
+    let docs: Arc<DocsFn> = Arc::new(move |p| docs.pipeline_docs(p).map_err(|e| e.to_string()));
     let (log, reloaded_auth) = (Arc::clone(&logger), Arc::clone(&auth));
     let coordinator = Arc::new(ConfigCoordinator::start(
         config.clone(),
@@ -211,7 +212,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
             env: Arc::new(ProcessEnv),
             key: FingerprintKey::from_bytes(joined.fingerprint_key),
             node_id: deps.holder.node_id.clone(),
-            docs: Arc::new(move |p| docs.pipeline_docs(p).map_err(|e| e.to_string())),
+            docs: Arc::clone(&docs),
             factory: Arc::clone(&deps.factory),
             reloader: reconciler.reloader(),
             advertiser: gossip.advertiser(),
@@ -228,6 +229,8 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         coordinator: Arc::clone(&coordinator),
         members: gossip.members(),
         file: args.config.clone(),
+        docs,
+        leases: deps.leases.clone(),
     });
     ready.store(true, Ordering::SeqCst);
     shutdown_signal().await;
