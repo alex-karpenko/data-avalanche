@@ -28,12 +28,14 @@
 //! state or a changed `sink_type`), the desired state, `replication/slot.json` (PostgreSQL, with
 //! the intent recorded before a first start creates the slot), `replication/position.json` (MySQL /
 //! MariaDB, with the source server identity), per-table snapshot state, on-demand snapshot jobs,
-//! the schema cache (`schemas/<schema>.<table>.json`) and the halt registry (`halts.json`).
+//! the schema cache (`schemas/<schema>.<table>.json`), the halt registry (`halts.json`), and the
+//! management API's `status.json` and `requests.json` with the desired state's transitions.
 
 mod anchor;
 mod doc;
 mod generation;
 mod lease;
+mod lifecycle;
 mod pipeline;
 mod snapshot;
 mod tables;
@@ -47,6 +49,9 @@ pub use generation::{
     config_snapshot_key,
 };
 pub use lease::{Acquired, Holder, LeaseDoc, Leases, lease_key};
+pub use lifecycle::{
+    Action, ActualState, REQUESTS_KEY, Request, RequestsDoc, STATUS_KEY, StatusDoc, Transition,
+};
 // The position document's server is core's type (M7a): the source reports it, the state records it.
 pub use data_avalanche_core::ServerIdentity;
 pub use pipeline::{
