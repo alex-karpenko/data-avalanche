@@ -6,6 +6,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Response;
 use data_avalanche_cluster::{Checked, ReloadError, Reloaded};
+use data_avalanche_config::Fingerprints;
 use serde_json::json;
 
 use crate::{Api, body, starting};
@@ -29,14 +30,15 @@ fn refused(e: &ReloadError) -> Response {
 /// the body is empty, loaded in this node's environment and diffed against the generation it
 /// runs. 200 with the warnings and what a reload would change; 422 with the report when it is
 /// invalid or changes a field only a process restart applies. The resolved config, secrets
-/// and all, is not echoed.
+/// and all, is not echoed. A body's secrets aren't compared with the running ones
+/// (`secrets_compared: false`): whether a guess is the running secret isn't told.
 pub(crate) async fn validate(State(api): State<Api>, text: String) -> Response {
     let Some(node) = api.node.get() else {
         return starting();
     };
-    let text = if text.trim().is_empty() {
+    let (text, fingerprints) = if text.trim().is_empty() {
         match tokio::fs::read_to_string(&node.file).await {
-            Ok(text) => text,
+            Ok(text) => (text, Fingerprints::Compared),
             Err(e) => {
                 return body(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -45,9 +47,9 @@ pub(crate) async fn validate(State(api): State<Api>, text: String) -> Response {
             }
         }
     } else {
-        text
+        (text, Fingerprints::Ignored)
     };
-    match node.coordinator.check(&text).await {
+    match node.coordinator.check(&text, fingerprints).await {
         Ok(Checked {
             generation,
             warnings,
@@ -58,6 +60,7 @@ pub(crate) async fn validate(State(api): State<Api>, text: String) -> Response {
                 "valid": true,
                 "against_generation": generation,
                 "warnings": warnings.to_json()["warnings"],
+                "secrets_compared": fingerprints == Fingerprints::Compared,
                 "changes": { "globals": changes.globals, "pipelines": changes.pipelines },
             }),
         ),
@@ -139,7 +142,7 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
-    use crate::test_support::{CONFIG, json_of, lone, request, serve};
+    use crate::test_support::{CONFIG, Vars, api, json_of, lone, lone_with, open, request, serve};
 
     #[tokio::test]
     async fn a_check_says_what_a_reload_would_change() {
@@ -166,6 +169,7 @@ mod tests {
         assert_eq!(
             v,
             json!({ "valid": true, "against_generation": 1, "warnings": [],
+                    "secrets_compared": true,
                     "changes": { "globals": [], "pipelines": [] } }),
             "the node's file, unchanged"
         );
@@ -173,10 +177,6 @@ mod tests {
         assert_eq!(code, 200, "{v}");
         assert_eq!(v["changes"]["pipelines"][0]["change"], "modified", "{v}");
         assert_eq!(v["changes"]["pipelines"][0]["restart"], true, "{v}");
-        assert!(
-            !v.to_string().contains("\"password\""),
-            "no resolved config: {v}"
-        );
 
         let (code, v) =
             check(CONFIG.replace("lease_duration: 30s", "tokens: 64, lease_duration: 30s")).await;
@@ -186,6 +186,51 @@ mod tests {
         assert_eq!((code, &v["report"]["valid"]), (422, &json!(false)), "{v}");
         let generation = lone.node.coordinator.latest().await.unwrap();
         assert_eq!(generation, Some(1), "nothing published");
+    }
+
+    /// A body is the caller's: the check doesn't tell whether a secret in it is the running one
+    /// (an oracle for a guess otherwise). The node's own file is compared in full, so a rotated
+    /// secret shows. No answer holds a secret's value.
+    #[tokio::test]
+    async fn a_check_of_a_body_does_not_tell_whether_its_secret_is_the_running_one() {
+        let templated = CONFIG.replace("password: pw", "password: ${ORDERS_PASSWORD}");
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.yaml");
+        std::fs::write(&file, &templated).unwrap();
+        let vars = Arc::new(Vars::default());
+        vars.set("ORDERS_PASSWORD", "running-secret-1");
+        let lone = lone_with(file, &templated, Arc::clone(&vars) as _).await;
+        let a = api(open());
+        a.node.set(lone.node.clone()).unwrap();
+        let addr = serve(a).await;
+        let check = |text: String| async move {
+            let (code, _, body) = request(addr, "POST", "/v1/config/validate", &[], &text).await;
+            assert!(
+                !body.contains("running-secret") && !body.contains("wrong-guess"),
+                "no secret's value: {body}"
+            );
+            assert_eq!(code, 200, "{body}");
+            serde_json::from_str::<Value>(&body).unwrap()
+        };
+        let with =
+            |password: &str| CONFIG.replace("password: pw", &format!("password: {password}"));
+
+        let right = check(with("running-secret-1")).await;
+        let wrong = check(with("wrong-guess")).await;
+        assert_eq!(right["changes"], wrong["changes"]);
+        assert_eq!(right["changes"], json!({ "globals": [], "pipelines": [] }));
+        assert_eq!(right["secrets_compared"], false);
+        assert_eq!(wrong["secrets_compared"], false);
+
+        // The node's file, its secret rotated in the environment.
+        vars.set("ORDERS_PASSWORD", "running-secret-2");
+        let v = check(String::new()).await;
+        assert_eq!(v["secrets_compared"], true, "{v}");
+        assert_eq!(
+            v["changes"]["pipelines"][0]["fields"][0]["path"],
+            "pipelines.orders.source.credentials.password",
+            "{v}"
+        );
     }
 
     /// The reload and its status (Clustering §9.2): 200 for the file the cluster runs, 202 and

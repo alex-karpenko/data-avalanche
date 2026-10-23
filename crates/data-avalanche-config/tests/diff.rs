@@ -2,7 +2,9 @@
 
 mod support;
 
-use data_avalanche_config::{Mutability, PipelineChange, ResolvedConfig, diff, load_str};
+use data_avalanche_config::{
+    Fingerprints, Mutability, PipelineChange, ResolvedConfig, diff, diff_with, load_str,
+};
 use support::{Files, MINIMAL, env, fp_key};
 
 fn load(yaml: &str) -> ResolvedConfig {
@@ -117,6 +119,44 @@ fn rotated_credentials_file_is_detected_without_a_text_change() {
         !json.contains("old") && !json.contains("new\""),
         "values never appear: {json}"
     );
+}
+
+/// A candidate a caller posts (`POST /v1/config/validate`) is diffed with the fingerprints
+/// ignored: whether its secret is the running one isn't told, or the diff would be an oracle.
+#[test]
+fn a_secret_s_change_is_not_told_when_fingerprints_are_ignored() {
+    let with = |pw: &str| {
+        load_str(MINIMAL, &env(&[("PW", pw)]), &fp_key())
+            .unwrap_or_else(|r| panic!("{r:#?}"))
+            .config
+    };
+    let (running, guess) = (with("pw"), with("a-guess"));
+    let ignored = diff_with(&running, &guess, &unknown, Fingerprints::Ignored);
+    assert!(ignored.is_empty() && !ignored.is_rejected(), "{ignored:#?}");
+    let compared = diff_with(&running, &guess, &unknown, Fingerprints::Compared);
+    assert_eq!(
+        compared,
+        diff(&running, &guess, &unknown),
+        "diff compares them"
+    );
+    let (restart, fields, _) = modified(&compared);
+    assert!(restart);
+    assert_eq!(
+        fields,
+        [(
+            "pipelines.orders.source.credentials.password".to_string(),
+            Mutability::Pr
+        )]
+    );
+    // Any other change is still told.
+    let moved = load(&MINIMAL.replace("db: shop", "db: shop2"));
+    let (_, fields, _) = modified(&diff_with(
+        &running,
+        &moved,
+        &unknown,
+        Fingerprints::Ignored,
+    ));
+    assert_eq!(fields[0].0, "pipelines.orders.source.db");
 }
 
 #[test]

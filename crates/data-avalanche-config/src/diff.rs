@@ -89,14 +89,33 @@ fn flat<T: Serialize>(prefix: &[&str], v: &T) -> BTreeMap<Vec<String>, Value> {
     out
 }
 
+/// How [`diff_with`] compares two fingerprints (`blake3:<hex>`: a [`crate::Secret`], or a
+/// referenced file's contents).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fingerprints {
+    /// A different fingerprint is a change: a rotated secret or file is reloaded.
+    Compared,
+    /// Any two fingerprints are equal: for a candidate a caller supplies, so that whether its
+    /// secret is the running one isn't told (the diff would be an oracle for a guess).
+    Ignored,
+}
+
+fn is_fingerprint(v: &Value) -> bool {
+    v.as_str().is_some_and(|s| s.starts_with("blake3:"))
+}
+
 /// Paths whose value differs, appears or disappears.
 fn changed_paths(
     old: &BTreeMap<Vec<String>, Value>,
     new: &BTreeMap<Vec<String>, Value>,
+    fingerprints: Fingerprints,
 ) -> Vec<Vec<String>> {
+    let same = |o: &Value, n: &Value| {
+        o == n || (fingerprints == Fingerprints::Ignored && is_fingerprint(o) && is_fingerprint(n))
+    };
     let mut paths: Vec<Vec<String>> = old
         .iter()
-        .filter(|(k, v)| new.get(*k) != Some(v))
+        .filter(|(k, v)| new.get(*k).is_none_or(|n| !same(v, n)))
         .map(|(k, _)| k.clone())
         .chain(new.keys().filter(|k| !old.contains_key(*k)).cloned())
         .collect();
@@ -131,12 +150,24 @@ pub fn diff(
     new: &ResolvedConfig,
     table_set_changed: &dyn Fn(&Pipeline, &Pipeline) -> Option<bool>,
 ) -> ConfigDiff {
+    diff_with(old, new, table_set_changed, Fingerprints::Compared)
+}
+
+/// [`diff`], with the fingerprints compared or not ([`Fingerprints`]). With
+/// [`Fingerprints::Ignored`], a pipeline whose only differences are secrets or file contents is
+/// unchanged.
+pub fn diff_with(
+    old: &ResolvedConfig,
+    new: &ResolvedConfig,
+    table_set_changed: &dyn Fn(&Pipeline, &Pipeline) -> Option<bool>,
+    fingerprints: Fingerprints,
+) -> ConfigDiff {
     let mut out = ConfigDiff::default();
     let mut old_g = flat(&["globals"], &old.globals);
     let mut new_g = flat(&["globals"], &new.globals);
     old_g.insert(vec!["config_version".into()], old.config_version.into());
     new_g.insert(vec!["config_version".into()], new.config_version.into());
-    for path in changed_paths(&old_g, &new_g) {
+    for path in changed_paths(&old_g, &new_g, fingerprints) {
         let class = class_of(&path);
         let text = dotted(&path);
         if class == Mutability::Proc {
@@ -170,7 +201,11 @@ pub fn diff(
             });
             continue;
         };
-        let paths = changed_paths(&flat(&["pipelines", id], o), &flat(&["pipelines", id], n));
+        let paths = changed_paths(
+            &flat(&["pipelines", id], o),
+            &flat(&["pipelines", id], n),
+            fingerprints,
+        );
         if paths.is_empty() {
             continue;
         }

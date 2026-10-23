@@ -60,8 +60,8 @@
 //! - **diagnostics:** [`Report`], [`Diagnostic`], [`Severity`], [`Locus`], [`PARSE`], [`TYPE`];
 //! - **the registry:** [`RULES`], [`RuleMeta`], [`RuleSeverity`], [`RuleLocus`], [`RuleInput`],
 //!   [`rule_meta`];
-//! - **the reload diff:** [`diff`], [`ConfigDiff`], [`FieldChange`], [`PipelineChange`],
-//!   [`Mutability`];
+//! - **the reload diff:** [`diff`], [`diff_with`], [`Fingerprints`], [`ConfigDiff`],
+//!   [`FieldChange`], [`PipelineChange`], [`Mutability`];
 //! - **external checks:** [`ClusterAnchor`] and the three `check_*` functions;
 //! - **env:** [`Env`], [`ProcessEnv`].
 
@@ -91,7 +91,7 @@ mod walk;
 pub use build::derived_server_id;
 pub use coerce::LogFilter;
 pub use diag::{Diagnostic, Locus, PARSE, Report, Severity, TYPE};
-pub use diff::{ConfigDiff, FieldChange, PipelineChange, diff};
+pub use diff::{ConfigDiff, FieldChange, Fingerprints, PipelineChange, diff, diff_with};
 pub use external::{
     ClusterAnchor, check_cluster_anchor, check_partitioning, check_table_set,
     check_unbounded_numeric, glob_match,

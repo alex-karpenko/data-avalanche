@@ -1,6 +1,7 @@
 //! Test-only helpers shared across `data-avalanche-api`'s unit tests: a client, the listener on a
 //! free port, a lone node, and an identity provider with keys made at run time.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -19,7 +20,7 @@ use data_avalanche_cluster::{
     ReconcilerSettings, Udp, WorkerFactory,
 };
 use data_avalanche_config::{
-    ApiAuth, FingerprintKey, HostPort, Jwt, Pipeline, ProcessEnv, ResolvedConfig, load_str,
+    ApiAuth, Env, FingerprintKey, HostPort, Jwt, Pipeline, ProcessEnv, ResolvedConfig, load_str,
 };
 use data_avalanche_pipeline::{Backoff, Tuning};
 use data_avalanche_state::{ConfigGenerations, DocStore, Holder, Leases, PipelineDocs};
@@ -152,18 +153,39 @@ pub(crate) struct Lone {
     pub _gossip: Gossip,
 }
 
+/// `${VAR}` values a test sets, and changes.
+#[derive(Debug, Default)]
+pub(crate) struct Vars(Mutex<BTreeMap<String, String>>);
+
+impl Env for Vars {
+    fn var(&self, name: &str) -> Option<String> {
+        self.0.lock().unwrap().get(name).cloned()
+    }
+}
+
+impl Vars {
+    pub fn set(&self, name: &str, value: &str) {
+        self.0.lock().unwrap().insert(name.into(), value.into());
+    }
+}
+
 pub(crate) async fn lone(file: PathBuf) -> Lone {
+    lone_with(file, CONFIG, Arc::new(ProcessEnv)).await
+}
+
+/// [`lone`], running generation 1 of `text`, resolved in `env`.
+pub(crate) async fn lone_with(file: PathBuf, text: &str, env: Arc<dyn Env + Send + Sync>) -> Lone {
     let mem = Arc::new(InMemory::new());
     let store = ObjectStoreVersioned::new(mem.clone(), "globals").unwrap();
     let docs = DocStore::new(Arc::new(store));
     let leases = Leases::new(docs.clone());
     let generations = ConfigGenerations::new(docs.clone());
     let (first, _) = generations
-        .bootstrap_or_adopt(CONFIG, "node-a", chrono::Utc::now())
+        .bootstrap_or_adopt(text, "node-a", chrono::Utc::now())
         .await
         .unwrap();
     let key = FingerprintKey::from_bytes([1; 32]);
-    let config = load_str(CONFIG, &ProcessEnv, &key).unwrap().config;
+    let config = load_str(text, &*env, &key).unwrap().config;
     let (udp, inbox) = Udp::bind(&["127.0.0.1:0".parse().unwrap()]).await.unwrap();
     let me = NodeIdentity {
         node_id: "node-a".into(),
@@ -210,7 +232,7 @@ pub(crate) async fn lone(file: PathBuf) -> Lone {
         first.pointer,
         CoordinatorDeps {
             generations,
-            env: Arc::new(ProcessEnv),
+            env,
             key,
             node_id: "node-a".into(),
             docs: Arc::new(|p| Err(p.id.clone())),

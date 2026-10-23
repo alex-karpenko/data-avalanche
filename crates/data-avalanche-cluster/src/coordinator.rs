@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use chrono::Utc;
 use data_avalanche_config::{
-    ConfigDiff, Env, FingerprintKey, Globals, Pipeline, PipelineChange, Report, ResolvedConfig,
-    diff, load_str,
+    ConfigDiff, Env, FingerprintKey, Fingerprints, Globals, Pipeline, PipelineChange, Report,
+    ResolvedConfig, diff, diff_with, load_str,
 };
 use data_avalanche_core::TableRef;
 use data_avalanche_state::{
@@ -270,17 +270,24 @@ impl ConfigCoordinator {
     /// /v1/config/validate`): the text loaded in this node's environment and diffed against
     /// the generation this node runs. A table-pattern change counts as a restart here; the
     /// reload's adoption asks the source whether the table set changed (config §1.2).
+    /// `fingerprints` says whether a secret or a file that differs only by its value counts as
+    /// a change ([`Fingerprints`]): ignore them for a text a caller supplies, so that the check
+    /// doesn't tell whether its secret is the running one.
     ///
     /// # Errors
     /// `Invalid`, `Rejected` or `Stopped`, as a reload's.
-    pub async fn check(&self, text: &str) -> Result<Checked, ReloadError> {
+    pub async fn check(
+        &self,
+        text: &str,
+        fingerprints: Fingerprints,
+    ) -> Result<Checked, ReloadError> {
         let d = &self.inner.deps;
         let running = self.inner.running.lock().await;
         if running.stopped {
             return Err(ReloadError::Stopped);
         }
         let loaded = load_str(text, &*d.env, &d.key).map_err(ReloadError::Invalid)?;
-        let changes = diff(&running.config, &loaded.config, &|_, _| None);
+        let changes = diff_with(&running.config, &loaded.config, &|_, _| None, fingerprints);
         if changes.is_rejected() {
             return Err(ReloadError::Rejected(changes.report));
         }
@@ -809,7 +816,7 @@ mod tests {
         let n = lone(&["p"]).await;
         let checked = n
             .coordinator
-            .check(&config_text(&["p", "q"]))
+            .check(&config_text(&["p", "q"]), Fingerprints::Compared)
             .await
             .unwrap();
         assert_eq!(checked.generation, 1);
@@ -819,25 +826,54 @@ mod tests {
             "{:?}",
             checked.changes
         );
-        let same = n.coordinator.check(&config_text(&["p"])).await.unwrap();
+        let same = n
+            .coordinator
+            .check(&config_text(&["p"]), Fingerprints::Compared)
+            .await
+            .unwrap();
         assert!(same.changes.is_empty());
+        // A text a caller supplies: whether its secret is the running one isn't told.
+        let guess = config_text(&["p"]).replace("password: avalanche", "password: a-guess");
+        let check = |f| n.coordinator.check(&guess, f);
+        assert!(
+            check(Fingerprints::Ignored)
+                .await
+                .unwrap()
+                .changes
+                .is_empty()
+        );
+        assert!(
+            !check(Fingerprints::Compared)
+                .await
+                .unwrap()
+                .changes
+                .is_empty()
+        );
         let restart_only = config_text(&["p"]).replace(
             "  state: { bucket: app-state }\n",
             "  state: { bucket: app-state }\n  api: { address: 0.0.0.0:9090 }\n",
         );
-        match n.coordinator.check(&restart_only).await {
+        match n
+            .coordinator
+            .check(&restart_only, Fingerprints::Compared)
+            .await
+        {
             Err(ReloadError::Rejected(r)) => assert!(r.has("V-061"), "{r:?}"),
             other => panic!("{other:?}"),
         }
         assert!(matches!(
-            n.coordinator.check("pipelines: [").await,
+            n.coordinator
+                .check("pipelines: [", Fingerprints::Compared)
+                .await,
             Err(ReloadError::Invalid(_))
         ));
         let pointer = n.generations.current().await.unwrap().unwrap().pointer;
         assert_eq!(pointer.doc.generation, 1, "nothing published");
         n.coordinator.stop().await;
         assert!(matches!(
-            n.coordinator.check(&config_text(&["p"])).await,
+            n.coordinator
+                .check(&config_text(&["p"]), Fingerprints::Compared)
+                .await,
             Err(ReloadError::Stopped)
         ));
     }
