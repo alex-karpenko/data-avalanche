@@ -122,19 +122,25 @@ impl Auth {
         let settings = Settings::of(api);
         Self {
             current: RwLock::new(Current {
-                mode: Arc::new(mode(&settings, timing)),
+                mode: Arc::new(mode(&settings, timing, None)),
                 settings,
             }),
             timing,
         }
     }
 
-    /// Takes a reload's settings. Unchanged ones keep the cached JWKS.
+    /// Takes a reload's settings. Unchanged ones keep the cached JWKS, and so do changed ones
+    /// whose keys come from where they did (the same issuer and JWKS or discovery URL): a
+    /// change of the audience, the roles claim or the role mapping fetches nothing.
     pub fn set(&self, api: &ApiConfig) {
         let settings = Settings::of(api);
         let mut current = self.current.write().unwrap_or_else(PoisonError::into_inner);
         if current.settings != settings {
-            current.mode = Arc::new(mode(&settings, self.timing));
+            let keys = match &*current.mode {
+                Mode::Token(v) => Some(Arc::clone(&v.keys)),
+                _ => None,
+            };
+            current.mode = Arc::new(mode(&settings, self.timing, keys));
             current.settings = settings;
         }
     }
@@ -174,14 +180,19 @@ impl Auth {
     }
 }
 
-fn mode(s: &Settings, timing: Timing) -> Mode {
-    let token = |issuer: &str, audience: &Option<String>, roles_claim: &str, keys| {
+/// The mode of `s`; a token mode takes `keys`, the cached JWKS, when they come from the same
+/// source.
+fn mode(s: &Settings, timing: Timing, keys: Option<Arc<Keys>>) -> Mode {
+    let token = |issuer: &str, audience: &Option<String>, roles_claim: &str, source| {
+        let keys = keys
+            .filter(|k| k.issuer == issuer && k.source == source)
+            .unwrap_or_else(|| Arc::new(Keys::new(issuer, source, timing)));
         Mode::Token(Box::new(Verifier {
             issuer: issuer.to_owned(),
             audience: audience.clone(),
             roles_claim: roles_claim.to_owned(),
             mapping: s.role_mapping.clone(),
-            keys: Arc::new(Keys::new(keys, timing)),
+            keys,
         }))
     };
     match (s.auth, &s.credentials, &s.jwt, &s.oauth2) {
@@ -201,7 +212,6 @@ fn mode(s: &Settings, timing: Timing) -> Mode {
                 // V-051 requires one of them.
                 (None, url) => KeySource::Discovery {
                     url: url.clone().unwrap_or_default(),
-                    issuer: o.issuer.clone(),
                 },
             },
         ),
@@ -339,14 +349,13 @@ fn map(mapping: &BTreeMap<Role, Vec<String>>, idp: &str) -> Option<Role> {
         .max()
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum KeySource {
     Jwks(String),
     /// OIDC discovery: the document's `jwks_uri`, once its `issuer` is found to be the
     /// configured one (OIDC Discovery §4.3).
     Discovery {
         url: String,
-        issuer: String,
     },
 }
 
@@ -355,6 +364,8 @@ enum KeySource {
 /// issuer does.
 #[derive(Debug)]
 struct Keys {
+    /// The configured issuer: a discovery document must name it.
+    issuer: String,
     source: KeySource,
     http: reqwest::Client,
     cache: Mutex<Cache>,
@@ -375,8 +386,9 @@ struct Cache {
 }
 
 impl Keys {
-    fn new(source: KeySource, timing: Timing) -> Self {
+    fn new(issuer: &str, source: KeySource, timing: Timing) -> Self {
         Self {
+            issuer: issuer.to_owned(),
             source,
             timing,
             http: reqwest::Client::builder()
@@ -478,12 +490,13 @@ impl Keys {
     async fn fetch(&self) -> Result<JwkSet, String> {
         let url = match &self.source {
             KeySource::Jwks(url) => url.clone(),
-            KeySource::Discovery { url, issuer } => {
+            KeySource::Discovery { url } => {
                 let doc: Value = self.get(url).await?;
                 let found = doc.get("issuer").and_then(Value::as_str);
-                if found != Some(issuer.as_str()) {
+                if found != Some(self.issuer.as_str()) {
                     return Err(format!(
-                        "{url}: the issuer is {found:?}, not the configured {issuer:?}"
+                        "{url}: the issuer is {found:?}, not the configured {:?}",
+                        self.issuer
                     ));
                 }
                 doc.get("jwks_uri")
@@ -911,7 +924,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_reload_keeps_the_keys_unless_the_auth_settings_change() {
+    async fn a_reload_of_the_role_mapping_keeps_the_keys() {
+        let idp = Issuer::start().await;
+        let api = idp.api("roles");
+        let auth = Auth::new(&api);
+        let token = bearer(&idp.token(json!(["viewer"])));
+        assert_eq!(auth.verify(&token).await.unwrap().role, Role::Viewer);
+        idp.set_down(true);
+        let mut mapped = api.clone();
+        mapped.role_mapping = BTreeMap::from([(Role::Admin, vec!["viewer".into()])]);
+        auth.set(&mapped);
+        let p = auth.verify(&token).await;
+        assert_eq!(
+            p.unwrap().role,
+            Role::Admin,
+            "the new mapping, the old keys"
+        );
+        assert_eq!(idp.fetches.load(Ordering::SeqCst), 1);
+        idp.set_down(false);
+    }
+
+    #[tokio::test]
+    async fn a_reload_keeps_the_keys_unless_their_source_changes() {
         let idp = Issuer::start().await;
         let api = idp.api("roles");
         let auth = Auth::new(&api);
@@ -926,7 +960,16 @@ mod tests {
         other.jwt.as_mut().unwrap().audience = Some("another-api".into());
         auth.set(&other);
         denied_401(auth.verify(&token).await);
-        assert_eq!(idp.fetches.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            idp.fetches.load(Ordering::SeqCst),
+            1,
+            "the keys don't name an audience"
+        );
+        let mut moved = api.clone();
+        moved.jwt.as_mut().unwrap().jwks_url = format!("{}/jwks?again", idp.url);
+        auth.set(&moved);
+        auth.verify(&token).await.unwrap();
+        assert_eq!(idp.fetches.load(Ordering::SeqCst), 2, "another JWKS URL");
         auth.set(&config().globals.api);
         assert_eq!(
             auth.verify(&HeaderMap::new()).await.unwrap().role,
