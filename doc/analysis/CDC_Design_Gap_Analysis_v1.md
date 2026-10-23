@@ -175,6 +175,38 @@ test); and utoipa 6 doesn't build without its `macros` feature (D-M9a.9).
 
 None.
 
+## 41. M9a management API — the exit (2026-10-23)
+
+M9a (`doc/v1.0/M9a-management-api.md`) was executed 2026-10-23: eight tasks, review fixes on
+Tasks 2, 4 and 6, then a whole-branch review with no Critical. Its five Important findings were
+fixed before the PR (the plan's "Deviations during execution"):
+- validate of a posted body was an oracle for a guess at a running secret;
+- a hanging IdP stalled token checks through the key cache's lock;
+- a role-mapping reload dropped the cached keys;
+- a namespaced `roles_claim` couldn't be read;
+- the OpenAPI "validated" claim was more than the test checked (reworded, DA-API-18).
+
+No spec edit beyond the two approved with the plan. The API scenarios pass on PostgreSQL 18 and
+MySQL 8.4; the other CI targets run on the PR.
+
+| ID | Change | Evidence |
+|---|---|---|
+| DA-API-4 | ✅ (restated): validate never returns the resolved config, and with a posted body it doesn't compare secret or file fingerprints, so it can't confirm a guessed secret; a body can still make the node read files it names (existence and parse only, API_RBAC §2) | M9a D-M9a.7; `config.rs` `a_check_of_a_body_does_not_tell_whether_its_secret_is_the_running_one` |
+| DA-API-3 | ✅ (restated): the role binding as built — `iss` always and `aud` when configured, `nbf`, HS* refused, a namespaced `roles_claim` read by its name, settings that don't hold together refuse every request | M9a D-M9a.6; `auth.rs` tests (API_RBAC §3's as-built note) |
+| DA-API-12 | ✅ (stays): every `/v1` route behind its least role, the matrix test over every route and role | Task 4, `every_route_turns_away_callers_below_its_role` |
+
+### 41.1 New gaps
+
+| ID | Gap | Severity | Surfaced by | Next |
+|---|---|---|---|---|
+| DA-API-13 | A holder that crashed without releasing its lease reads as live until another node takes over: `GET /v1/pipelines/{id}` shows its last status, and a restart or flush answers `202` (harmless: the next term's baseline absorbs it and starts a fresh worker). The answer carries `holder.renewed_at` and `status_written_at`; the list view carries neither | 🟢 | M9a's whole-branch review (Task 5) | A `stale` hint needs a skew-tolerant notion of a live lease (`renewed_at` is the holder's wall clock; controllers judge by versions over local time, Clustering §5.3); until then M11's docs |
+| DA-API-14 | A node that left the cluster through the API stays up with the auth of its last generation: its coordinator has stopped, so a later reload's `role_mapping` or credentials don't reach it, and its mutating routes still write the desired state | 🟢 | M9a's whole-branch review | Answer the mutating routes `503` "this node left the cluster", or document it in M11 |
+| DA-API-15 | A restart or flush gets a new request id per HTTP call: a client that retries after losing the answer asks twice, and the owner may restart twice (an extra replay, no loss) | 🟢 | M9a's whole-branch review | An optional client-supplied request id, or M11's docs |
+| DA-API-16 | The JWKS and discovery fetches accept `http`, follow redirects, and read an unbounded body | 🟢 | M9a's Task 4 review | A V-rule warning for a non-`https` key URL (as V-052), no redirects, a body cap |
+| DA-API-17 | The TLS listener spawns a task per connection for its handshake (each bounded at 10 s); nothing caps the number of connections | 🟢 | M9a's Task 3 review | A connection limit on the listener |
+| DA-API-18 | The OpenAPI document is snapshot-tested and read back by utoipa, not validated against the OAS 3.1 schema | 🟢 | M9a's whole-branch review | A dev-check against the vendored OAS 3.1 schema |
+| DA-API-19 | Validate of a posted body echoes an added pipeline's resolved `id` and `name`: a body with `id: ${VAR}` shows the value of any node environment variable that fits V-055's pattern (`^[a-z0-9][a-z0-9_-]{0,62}$`, lowercase hex tokens included), and `db: ${VAR}` tells whether a variable equals the running value. Reload reads only the node's file, so only validate is open to it | 🟡 | M9a's final re-review (outside the fix diff) | Resolve a posted body's `${…}` in identity and other echoed fields as written (no expansion), or refuse `${…}` outside credential fields in a posted body; until then API_RBAC §2's note |
+
 ---
 
 ### Counts (by status)
@@ -185,14 +217,14 @@ None.
 > (§29), 2026-10-13 for M6b's exit (§30), 2026-10-14 for M7's planning (§31), 2026-10-14 for
 > M7a's plan (§32), 2026-10-16 for M7a's exit (§33), 2026-10-17 for M7b's plan (§34),
 > 2026-10-20 for M7b's exit (§35), 2026-10-21 for M8a's plan (§36), 2026-10-22 for M8a's exit (§37),
-> 2026-10-22 for M8b's plan (§38), 2026-10-23 for M8b's exit (§39), and 2026-10-23 for M9a's plan
-> (§40).
+> 2026-10-22 for M8b's plan (§38), 2026-10-23 for M8b's exit (§39), 2026-10-23 for M9a's plan
+> (§40), and 2026-10-23 for M9a's exit (§41).
 
 | Status | Count (v1 scope) | Notes |
 |---|---|---|
 | ✅ Resolved | the large majority | Design closed by a research/spec doc or a probe. |
 | 🔄 Partial | 3 | DA-SNAP-7, DA-SRC-9 (neither blocks the plan); DA-OPS-8 2026-10-22 (§38: the startup warning; the operator docs in M11); DA-SNAP-10 ✅ 2026-10-16 (M7a merged, §33). DA-MS-3 is a decided caveat. DA-X-8 ✅ 2026-09-26; DA-SRC-16 and DA-X-12 ✅ 2026-10-13 (§30). |
-| 🟥 Open (v1) | **20** | DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2); DA-SRC-20 🆕 2026-10-13 (§30.1); DA-SRC-21 🆕 2026-10-14 (§31.2); DA-SRC-22, DA-SNAP-14 and DA-X-13 🆕 2026-10-14 (§32.1); DA-SRC-24…26 🆕 2026-10-16 (§33.1); DA-OBS-6 🆕 2026-10-17 (§34.1); DA-OPS-9 🆕 2026-10-22 (§38.1); DA-OPS-10 🆕 2026-10-23 (§39.1). DA-OPS-8 🔄 2026-10-22 (§38). DA-API-11 and DA-API-12 ✅ 2026-10-23 (§40). DA-CLUS-14, DA-OPS-7 and DA-SRC-28 ✅ 2026-10-22 (§37). DA-SRC-27 and DA-X-14 ✅ 2026-10-20 (§35). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
+| 🟥 Open (v1) | **27** | DA-API-13…19 🆕 2026-10-23 (§41.1); DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2); DA-SRC-20 🆕 2026-10-13 (§30.1); DA-SRC-21 🆕 2026-10-14 (§31.2); DA-SRC-22, DA-SNAP-14 and DA-X-13 🆕 2026-10-14 (§32.1); DA-SRC-24…26 🆕 2026-10-16 (§33.1); DA-OBS-6 🆕 2026-10-17 (§34.1); DA-OPS-9 🆕 2026-10-22 (§38.1); DA-OPS-10 🆕 2026-10-23 (§39.1). DA-OPS-8 🔄 2026-10-22 (§38). DA-API-11 and DA-API-12 ✅ 2026-10-23 (§40). DA-CLUS-14, DA-OPS-7 and DA-SRC-28 ✅ 2026-10-22 (§37). DA-SRC-27 and DA-X-14 ✅ 2026-10-20 (§35). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
 | 🧪 Verify (v1) | **0** | DA-SRC-10/11 proven 2026-09-26 (§21). |
 | ⏭ v2 | 13 | Iceberg-sink items (§26.2). |
 | 🟢 Spec-merge debt | **0** | All applied 2026-09-26 (§26.6): §19.3 S-1…S-6, the DA-X-8 config residual, the D-V1 patches and the Data-Flow Phase 2a probe details. |
@@ -503,6 +535,13 @@ unauthenticated. The auth *mechanism* (jwt/oauth2 verification params) was alrea
 | DA-API-10 | Reload must not resurrect a paused/stopped pipeline | 🟡 | ✅ | §4 — runtime `desired_state` wins over config's implicit "should run." | §9.6 |
 | DA-API-12 | 🆕 The reload and status endpoints answer without authentication until M9 | 🟢 | ✅ | §40 (M9a's plan): every `/v1` route takes its least role (API_RBAC §2), reload operator and status viewer; M9a Task 4's matrix test turns away every caller below it. §38.1: Q-M8b-1: `POST /v1/config/reload` and `GET /v1/config/status` serve on `globals.api.address` like `/metrics`, before M9's auth and RBAC. A caller can publish the file that is on the node, not a text of its own. M9 puts them behind the operator and viewer roles (API_RBAC §2). | — |
 | DA-API-11 | 🆕 A desired-state change missed between two polls | 🟢 | ✅ | §40 (M9a's plan): a restart request, recorded by id in `requests.json`, takes a pipeline out of `ERROR` without depending on the controller's sampling (D-M9a.4, D-M9a.5); a stop and a resume inside one poll still look like no change, and needn't be seen apart. §30.1: The controller samples `pipeline-state.json` once per renewal interval, so a stop and a resume between two polls don't clear `ERROR` (Lifecycle §3). The M9 API wakes the controller, or the document carries a generation the controller compares. | — |
+| DA-API-13 | 🆕 A crashed holder's unreleased lease reads as live until takeover | 🟢 | 🟥 | §41.1 (M9a's exit): GET shows its last status, a restart or flush answers `202` (absorbed by the next term); a `stale` hint needs a skew-tolerant liveness notion. | — |
+| DA-API-14 | 🆕 A node that left the cluster keeps its last generation's auth | 🟢 | 🟥 | §41.1: its coordinator has stopped, so a later reload's roles or credentials don't reach it; refuse its mutating routes, or document it (M11). | — |
+| DA-API-15 | 🆕 A retried restart or flush call asks twice | 🟢 | 🟥 | §41.1: the request id is per HTTP call; an optional client-supplied id, or M11's docs. | — |
+| DA-API-16 | 🆕 The JWKS fetch accepts http, follows redirects, reads an unbounded body | 🟢 | 🟥 | §41.1: a V-rule warning for a non-`https` key URL, no redirects, a body cap. | — |
+| DA-API-17 | 🆕 No connection limit on the TLS listener | 🟢 | 🟥 | §41.1: a handshake task per connection, each bounded at 10 s. | — |
+| DA-API-18 | 🆕 The OpenAPI document isn't validated against the OAS 3.1 schema | 🟢 | 🟥 | §41.1: snapshot-tested and read back by utoipa only. | — |
+| DA-API-19 | 🆕 Validate of a posted body echoes a `${VAR}`-resolved pipeline `id` | 🟡 | 🟥 | §41.1: an operator can read a node env var fitting V-055's pattern; don't expand `${…}` in echoed fields of a posted body. | — |
 
 ---
 
