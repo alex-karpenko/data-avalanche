@@ -6,8 +6,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use data_avalanche_config::{Cluster, Pipeline};
+use data_avalanche_config::{Cluster, Pipeline, StateLocation};
 use data_avalanche_state::{Holder, PipelineDocs};
+use data_avalanche_storage::{Location, colocated_state, explicit_state, join};
 use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior};
@@ -101,6 +102,9 @@ impl Reloader {
 struct Controlled {
     pipeline: Pipeline,
     docs: PipelineDocs,
+    /// The removed pipelines it takes the place of ([`PipelineController::following`]): kept,
+    /// so a controller started again after a panic waits for them too.
+    following: Vec<String>,
     target: watch::Sender<Target>,
     status: watch::Sender<ControllerStatus>,
     task: JoinHandle<()>,
@@ -116,10 +120,16 @@ impl Drop for Controlled {
 }
 
 impl Controlled {
-    fn new(pipeline: Pipeline, docs: PipelineDocs, deps: &ControllerDeps) -> Self {
+    fn new(
+        pipeline: Pipeline,
+        docs: PipelineDocs,
+        following: Vec<String>,
+        deps: &ControllerDeps,
+    ) -> Self {
         let mut c = Self {
             pipeline,
             docs,
+            following,
             target: watch::channel(Target::DontOwn).0,
             status: watch::channel(ControllerStatus::default()).0,
             task: tokio::spawn(async {}),
@@ -135,7 +145,8 @@ impl Controlled {
             self.docs.clone(),
             deps,
             self.status.clone(),
-        );
+        )
+        .following(self.following.clone());
         self.updates = controller.updater();
         self.task = tokio::spawn(controller.run(self.target.subscribe()));
     }
@@ -223,7 +234,10 @@ impl ClusterReconciler {
     ) -> Self {
         let controllers: BTreeMap<String, Controlled> = pipelines
             .into_iter()
-            .map(|(pipeline, docs)| (pipeline.id.clone(), Controlled::new(pipeline, docs, deps)))
+            .map(|(pipeline, docs)| {
+                let id = pipeline.id.clone();
+                (id, Controlled::new(pipeline, docs, Vec::new(), deps))
+            })
             .collect();
         let (statuses_tx, statuses) = watch::channel(status_map(&controllers));
         let (reloads, reloaded) = mpsc::unbounded_channel();
@@ -291,6 +305,37 @@ impl ClusterReconciler {
     }
 }
 
+/// True when `added` takes a place `removed` held, so that it starts only once `removed` is let go
+/// of: an `id` changed, delete then recreate (config §9.1). The same PostgreSQL slot or
+/// publication on the same server, the same sink location, or the same state location.
+fn shares(removed: &Pipeline, added: &Pipeline) -> bool {
+    let (a, b) = (&removed.source, &added.source);
+    let slot = match (&a.postgres, &b.postgres) {
+        (Some(x), Some(y)) => {
+            a.host == b.host
+                && a.port == b.port
+                && a.db == b.db
+                && (x.slot == y.slot || x.publication == y.publication)
+        }
+        _ => false,
+    };
+    let sink = removed.sink.bucket == added.sink.bucket
+        && join(&[&removed.sink.prefix]) == join(&[&added.sink.prefix]);
+    slot || sink || state_location(removed) == state_location(added)
+}
+
+/// Where a pipeline's state lives (config §10): co-located state is under its sink's prefix.
+fn state_location(p: &Pipeline) -> Location {
+    match &p.state {
+        StateLocation::CoLocated => colocated_state(&p.sink.bucket, &p.sink.prefix),
+        StateLocation::Explicit {
+            bucket,
+            parent_prefix,
+            prefix,
+        } => explicit_state(bucket, parent_prefix.as_deref(), prefix),
+    }
+}
+
 fn status_map(
     controllers: &BTreeMap<String, Controlled>,
 ) -> BTreeMap<String, watch::Receiver<ControllerStatus>> {
@@ -334,6 +379,19 @@ impl Loop {
                     .send(Update::DrainTimeout(c.drain_timeout));
             }
         }
+        // The pipelines this reload removes, as configured: an added one that takes the place of
+        // one of them follows it.
+        let removed: Vec<Pipeline> = reload
+            .pipelines
+            .iter()
+            .filter_map(|change| match change {
+                PipelineReload::Remove(id) => match self.controllers.get(id) {
+                    Some(c) => Some(c.pipeline.clone()),
+                    None => self.returning.get(id)?.as_ref().map(|(p, _)| p.clone()),
+                },
+                _ => None,
+            })
+            .collect();
         for change in reload.pipelines {
             match change {
                 PipelineReload::Add(pipeline, docs) => {
@@ -351,7 +409,12 @@ impl Loop {
                         *back = Some((pipeline, docs));
                     } else {
                         tracing::info!(pipeline = %pipeline.name, "pipeline added");
-                        let added = Controlled::new(pipeline, docs, &self.deps);
+                        let following = removed
+                            .iter()
+                            .filter(|r| r.id != id && shares(r, &pipeline))
+                            .map(|r| r.id.clone())
+                            .collect();
+                        let added = Controlled::new(pipeline, docs, following, &self.deps);
                         self.controllers.insert(id, added);
                     }
                 }
@@ -398,7 +461,7 @@ impl Loop {
     fn removed(&mut self, id: &str) {
         if let Some(Some((pipeline, docs))) = self.returning.remove(id) {
             tracing::info!(pipeline = %pipeline.name, "pipeline added back, its removal done");
-            let added = Controlled::new(pipeline, docs, &self.deps);
+            let added = Controlled::new(pipeline, docs, Vec::new(), &self.deps);
             self.controllers.insert(id.to_owned(), added);
             self.statuses.send_replace(status_map(&self.controllers));
         }
@@ -492,8 +555,8 @@ async fn reconcile(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use data_avalanche_core::{SourceError, TableRef};
     use data_avalanche_testkit::{FakeTxn, Method};
@@ -880,6 +943,174 @@ mod tests {
         assert_eq!(f.source.teardowns(), 1, "torn down before it is back");
         until(r.statuses().get_mut("p").unwrap(), "running again", running).await;
         r.shutdown().await;
+    }
+
+    /// `x` and `y` of the test config share nothing; each change to `y` below shares one place
+    /// of `x`'s.
+    #[test]
+    fn a_pipeline_shares_a_slot_a_publication_a_sink_or_a_state() {
+        let mut cfg = config(&["x", "y"]).pipelines;
+        let (x, y) = (cfg.remove("x").unwrap(), cfg.remove("y").unwrap());
+        assert!(!shares(&x, &y));
+        let pg = |f: fn(&mut data_avalanche_config::Postgres)| {
+            let mut y = y.clone();
+            f(y.source.postgres.as_mut().unwrap());
+            y
+        };
+        assert!(shares(&x, &pg(|p| p.slot = "x_slot".into())));
+        assert!(shares(&x, &pg(|p| p.publication = "x_pub".into())));
+        // The same names on another server, or in another database, are other objects.
+        let mut other = pg(|p| p.slot = "x_slot".into());
+        other.source.port += 1;
+        assert!(!shares(&x, &other));
+        let mut other = pg(|p| p.publication = "x_pub".into());
+        other.source.host = "10.0.0.9".into();
+        assert!(!shares(&x, &other));
+        let mut other = pg(|p| p.slot = "x_slot".into());
+        other.source.db = "other".into();
+        assert!(!shares(&x, &other));
+        // MySQL has no slot: the same server is no share; its sink and its state are.
+        let mysql = |p: &Pipeline| {
+            let mut p = p.clone();
+            p.source.kind = data_avalanche_config::SourceType::Mysql;
+            p.source.postgres = None;
+            p
+        };
+        assert!(!shares(&mysql(&x), &mysql(&y)));
+        let mut sink = mysql(&y);
+        sink.sink.prefix = "x/".into();
+        assert!(shares(&mysql(&x), &sink));
+        // The same prefix in another bucket is another sink, and another co-located state.
+        let mut other = y.clone();
+        other.sink.bucket = "other".into();
+        other.sink.prefix = "x".into();
+        assert!(!shares(&x, &other));
+        let explicit = StateLocation::Explicit {
+            bucket: "app-state".into(),
+            parent_prefix: None,
+            prefix: "s".into(),
+        };
+        let (mut xs, mut ys) = (mysql(&x), mysql(&y));
+        xs.state = explicit.clone();
+        ys.state = explicit;
+        assert!(shares(&xs, &ys));
+        // Co-located state is under the sink: `x`'s, when `y` keeps its explicit state there.
+        ys.state = StateLocation::Explicit {
+            bucket: "lake".into(),
+            parent_prefix: None,
+            prefix: "x/.pipeline-state".into(),
+        };
+        assert!(shares(&mysql(&x), &ys));
+    }
+
+    /// Builds as [`ByPipeline`] does, and records, at each build of `follower`'s parts, how many
+    /// teardowns `leader`'s source has had.
+    #[derive(Debug)]
+    struct Ordered {
+        by: ByPipeline,
+        follower: &'static str,
+        leader: &'static str,
+        seen: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl WorkerFactory for Ordered {
+        fn build(&self, p: &Pipeline) -> Result<Parts, String> {
+            if p.id == self.follower {
+                let torn = self.by.0[self.leader].source.teardowns();
+                self.seen.lock().unwrap().push(torn);
+            }
+            self.by.build(p)
+        }
+    }
+
+    /// `x` runs on a lone node, its commit held so that its removal's drain waits (up to
+    /// 60 s); `y`'s parts are built through [`Ordered`].
+    async fn x_with_its_drain_held(
+        store: &Arc<ScriptedStore>,
+    ) -> (
+        ClusterReconciler,
+        BTreeMap<String, TestFactory>,
+        Arc<Mutex<Vec<usize>>>,
+    ) {
+        let (fs, mut d) = factories(store, &["x", "y"]);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        d.factory = Arc::new(Ordered {
+            by: ByPipeline(fs.clone()),
+            follower: "y",
+            leader: "x",
+            seen: Arc::clone(&seen),
+        });
+        d.settings.drain_timeout = Duration::from_secs(60);
+        let (_, view) = watch::channel(alone("n1"));
+        let r = ClusterReconciler::start(pipelines(&["x"]), &d, view, reconciler_settings());
+        until(r.statuses().get_mut("x").unwrap(), "x running", running).await;
+        let fx = &fs["x"];
+        fx.sink.hold_commits();
+        fx.source
+            .commit(FakeTxn::new().insert(&TableRef::new("public", "a"), row(1)));
+        eventually("x's commit waits", || fx.sink.waiting_commits() == 1).await;
+        (r, fs, seen)
+    }
+
+    /// One reload adds `y` and removes `x`, with the 60 s drain timeout.
+    fn replace_x(r: &ClusterReconciler, y: Pipeline, docs: PipelineDocs) {
+        let mut c = cluster();
+        c.drain_timeout = Duration::from_secs(60);
+        assert!(r.reloader().apply(Reload {
+            pipelines: vec![
+                PipelineReload::Add(y, docs),
+                PipelineReload::Remove("x".into()),
+            ],
+            cluster: c,
+        }));
+    }
+
+    /// An `id` change that keeps the slot (config §9.1: delete, then recreate): the pipeline
+    /// under the new id waits while the removed one drains, its lease renewed, and starts once
+    /// the removal tore the source down and released the lease.
+    #[tokio::test(start_paused = true)]
+    async fn a_pipeline_taking_a_removed_ones_slot_starts_once_the_removal_lets_go() {
+        let store = ScriptedStore::new();
+        let (r, fs, seen) = x_with_its_drain_held(&store).await;
+        let (mut y, docs) = pipelines(&["y"]).remove(0);
+        y.source.postgres.as_mut().unwrap().slot = "x_slot".into();
+        replace_x(&r, y, docs);
+        eventually("y in", || r.statuses().contains_key("y")).await;
+        // Past two lease durations: x's lease is renewed meanwhile, so it isn't let go.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(fs["y"].builds(), 0, "not while x's lease is held");
+        assert!(leases(&store).observe("y").await.unwrap().is_none());
+        let x = leases(&store).observe("x").await.unwrap().unwrap();
+        assert!(!x.doc.released);
+        fs["x"].sink.release_commits();
+        until(r.statuses().get_mut("y").unwrap(), "y running", running).await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [1],
+            "x torn down before y's first build"
+        );
+        let x = leases(&store).observe("x").await.unwrap().unwrap();
+        assert!(x.doc.released);
+        let y = leases(&store).observe("y").await.unwrap().unwrap();
+        assert!(y.doc.is_held_by(&crate::test_support::holder("n1")));
+        r.shutdown().await;
+    }
+
+    /// The wait is a follower's only: a pipeline added that shares nothing with the removed one
+    /// starts while the removal still drains.
+    #[tokio::test(start_paused = true)]
+    async fn a_pipeline_added_that_shares_nothing_starts_during_a_removal() {
+        let store = ScriptedStore::new();
+        let (r, fs, seen) = x_with_its_drain_held(&store).await;
+        let (y, docs) = pipelines(&["y"]).remove(0);
+        replace_x(&r, y, docs);
+        eventually("y in", || r.statuses().contains_key("y")).await;
+        until(r.statuses().get_mut("y").unwrap(), "y running", running).await;
+        assert_eq!(fs["x"].sink.waiting_commits(), 1, "x still drains");
+        assert_eq!(*seen.lock().unwrap(), [0]);
+        fs["x"].sink.release_commits();
+        r.shutdown().await;
+        assert_eq!(fs["x"].source.teardowns(), 1);
     }
 
     /// A reload's in-place change reaches the running worker; a restart-only one runs a new
