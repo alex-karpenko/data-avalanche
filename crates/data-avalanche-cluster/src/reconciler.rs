@@ -88,7 +88,7 @@ pub struct Reload {
 /// Hands a reload to a running reconciler, from a task that outlives a borrow of it (the
 /// config coordinator).
 #[derive(Debug, Clone)]
-pub struct Reloader(mpsc::UnboundedSender<Reload>);
+pub struct Reloader(pub(crate) mpsc::UnboundedSender<Reload>);
 
 impl Reloader {
     /// False when the reconciler has stopped.

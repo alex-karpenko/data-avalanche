@@ -7,6 +7,7 @@ pub mod claim;
 #[cfg(test)]
 mod cluster_tests;
 pub mod controller;
+pub mod coordinator;
 pub mod discovery;
 mod error;
 pub mod gossip;
@@ -24,10 +25,13 @@ pub use controller::{
     Actual, ControllerDeps, ControllerSettings, ControllerStatus, Parts, PipelineController,
     Target, Update, WorkerFactory,
 };
+pub use coordinator::{
+    ConfigCoordinator, CoordinatorDeps, DocsFn, PUBLISH_ATTEMPTS, ReloadError, Reloaded,
+};
 pub use discovery::{Seeds, advertise, discover, interfaces};
 pub use error::ClusterError;
 pub use gossip::{
-    Announcer, Gossip, GossipSettings, Member, Members, NodeIdentity, NodeMeta, Phase,
+    Advertiser, Announcer, Gossip, GossipSettings, Member, Members, NodeIdentity, NodeMeta, Phase,
 };
 pub use lease::{LeaseGuard, LeaseRun, LeaseTiming, RenewEnd, RenewState};
 pub use node::{JOIN_WAIT, join, leave};

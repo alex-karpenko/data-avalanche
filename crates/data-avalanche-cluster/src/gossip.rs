@@ -105,6 +105,15 @@ impl Members {
     pub fn peers(&self) -> usize {
         self.nodes.len().saturating_sub(1)
     }
+
+    /// The newest config generation a member applies, this node included (Clustering §9.1).
+    pub fn newest_generation(&self) -> u64 {
+        self.nodes
+            .values()
+            .map(|m| m.meta.config_generation)
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 /// The members `me` sees in foca's membership state: each name's latest identity that isn't
@@ -213,6 +222,7 @@ const WARN_EVERY: Duration = Duration::from_secs(60);
 enum Command {
     Announce(Vec<SocketAddr>),
     Phase(Phase),
+    Generation(u64),
     Leave(oneshot::Sender<()>),
 }
 
@@ -225,6 +235,16 @@ impl Announcer {
     /// the one the seed advertises: foca drops an announce addressed elsewhere.
     pub fn announce(&self, seeds: Vec<SocketAddr>) {
         let _ = self.0.send(Command::Announce(seeds));
+    }
+}
+
+/// Tells the others the config generation this node applies; cheap to clone.
+#[derive(Debug, Clone)]
+pub struct Advertiser(mpsc::UnboundedSender<Command>);
+
+impl Advertiser {
+    pub fn set_config_generation(&self, generation: u64) {
+        let _ = self.0.send(Command::Generation(generation));
     }
 }
 
@@ -301,6 +321,12 @@ impl Gossip {
         let _ = self.commands.send(Command::Phase(phase));
     }
 
+    /// A handle that tells the others this node's config generation, for a task that outlives
+    /// a borrow of the gossip (the config coordinator).
+    pub fn advertiser(&self) -> Advertiser {
+        Advertiser(self.commands.clone())
+    }
+
     /// Stops the gossip as a crash would, keeping the handle: what it sends goes nowhere.
     #[cfg(test)]
     pub(crate) fn abort(&self) {
@@ -361,6 +387,19 @@ impl Actor {
                         let next = NodeIdentity {
                             rev: me.rev.wrapping_add(1),
                             meta: NodeMeta { phase, ..me.meta.clone() },
+                            ..me.clone()
+                        };
+                        log(self.swim.change_identity(next, &mut rt));
+                        None
+                    }
+                    Some(Command::Generation(config_generation)) => {
+                        let me = self.swim.identity();
+                        let next = NodeIdentity {
+                            rev: me.rev.wrapping_add(1),
+                            meta: NodeMeta {
+                                config_generation,
+                                ..me.meta.clone()
+                            },
                             ..me.clone()
                         };
                         log(self.swim.change_identity(next, &mut rt));
@@ -541,6 +580,34 @@ mod tests {
         .await;
         assert_eq!(phase(&b), Some(Phase::Draining), "its own view");
         assert_eq!(names(&a), ["a", "b", "c"], "a phase change is no departure");
+    }
+
+    /// The config generation a node applies reaches every peer (Clustering §9.1), and the
+    /// newest one any member applies is what a coordinator behind reads.
+    #[tokio::test(start_paused = true)]
+    async fn a_config_generation_reaches_every_peer() {
+        let hub = Hub::new();
+        let (a, b, c) = three(&hub).await;
+        assert_eq!(a.members().borrow().newest_generation(), 1);
+        b.advertiser().set_config_generation(2);
+        let generation = |g: &Gossip| {
+            g.members()
+                .borrow()
+                .nodes
+                .get("b")
+                .map(|m| m.meta.config_generation)
+        };
+        eventually("b at 2 on a and c", || {
+            generation(&a) == Some(2) && generation(&c) == Some(2)
+        })
+        .await;
+        assert_eq!(generation(&b), Some(2), "its own view");
+        assert_eq!(a.members().borrow().newest_generation(), 2);
+        assert_eq!(
+            names(&a),
+            ["a", "b", "c"],
+            "a new generation is no departure"
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -131,6 +131,7 @@ struct Families {
     lease_renew_latency: HistogramFamily,
     owned_pipelines: Gauge,
     cluster_members: Gauge,
+    config_generation: Gauge,
     ring_generation: Gauge,
     wal_lag_bytes: Family<Labels, Gauge>,
     source_reconnects: Family<Labels, Counter>,
@@ -169,6 +170,7 @@ impl Metrics {
             lease_renew_latency: Family::new_with_constructor(renew_latency),
             owned_pipelines: Gauge::default(),
             cluster_members: Gauge::default(),
+            config_generation: Gauge::default(),
             ring_generation: Gauge::default(),
             wal_lag_bytes: Family::default(),
             source_reconnects: Family::default(),
@@ -210,6 +212,11 @@ impl Metrics {
             "cluster_members",
             "Members of the cluster this node sees",
             f.cluster_members.clone(),
+        );
+        r.register(
+            "config_generation",
+            "The config generation this node applies",
+            f.config_generation.clone(),
         );
         r.register(
             "ring_generation",
@@ -276,6 +283,10 @@ impl Metrics {
 
     pub fn set_cluster_members(&self, n: usize) {
         self.families.cluster_members.set(gauge(n as u64));
+    }
+
+    pub fn set_config_generation(&self, generation: u64) {
+        self.families.config_generation.set(gauge(generation));
     }
 
     pub fn set_ring_generation(&self, generation: u64) {

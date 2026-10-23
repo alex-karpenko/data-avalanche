@@ -223,6 +223,17 @@ pub(crate) fn metrics() -> (Metrics, Arc<PipelineMetrics>) {
 /// A config with one pipeline per id, each over `public.*` of a fake PostgreSQL source (slot
 /// `<id>_slot`), flushing at every boundary.
 pub(crate) fn config(ids: &[&str]) -> data_avalanche_config::ResolvedConfig {
+    data_avalanche_config::load_str(
+        &config_text(ids),
+        &std::collections::BTreeMap::new(),
+        &data_avalanche_config::FingerprintKey::from_bytes([1; 32]),
+    )
+    .unwrap_or_else(|r| panic!("test config: {r:?}"))
+    .config
+}
+
+/// [`config`]'s text.
+pub(crate) fn config_text(ids: &[&str]) -> String {
     let mut yaml = String::from(
         "config_version: 1\nglobals:\n  state: { bucket: app-state }\n  cluster: { memberlist: { node_name: n1 } }\npipelines:\n",
     );
@@ -245,13 +256,7 @@ pub(crate) fn config(ids: &[&str]) -> data_avalanche_config::ResolvedConfig {
 "#
         ));
     }
-    data_avalanche_config::load_str(
-        &yaml,
-        &std::collections::BTreeMap::new(),
-        &data_avalanche_config::FingerprintKey::from_bytes([1; 32]),
-    )
-    .unwrap_or_else(|r| panic!("test config: {r:?}"))
-    .config
+    yaml
 }
 
 /// The test pipeline `p`.

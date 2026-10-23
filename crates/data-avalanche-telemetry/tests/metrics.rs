@@ -249,3 +249,16 @@ fn a_forgotten_pipeline_keeps_no_series() {
     let text = m.encode();
     assert!(!text.contains("orders"), "{text}");
 }
+
+/// The config generation this node applies (Clustering §9): a node behind the cluster shows it.
+#[test]
+fn the_node_reports_its_config_generation() {
+    let m = Metrics::new();
+    m.set_config_generation(3);
+    let text = m.encode();
+    assert!(
+        text.lines()
+            .any(|l| l == "data_avalanche_config_generation 3"),
+        "{text}"
+    );
+}
