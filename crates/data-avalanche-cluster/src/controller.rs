@@ -1830,6 +1830,34 @@ mod tests {
         assert_eq!(f.ids("a"), [1], "drained before it stopped");
     }
 
+    /// A removal whose drain is cut off leaves the source and the lease as they are: the cut-off
+    /// worker may still hold the slot, and the lease expires instead of being released.
+    #[tokio::test(start_paused = true)]
+    async fn a_removal_with_its_drain_cut_off_leaves_the_source() {
+        let store = ScriptedStore::new();
+        let f = TestFactory::new(&["a"]);
+        let mut d = deps("n1", &store, &f);
+        d.settings.drain_timeout = Duration::from_secs(1);
+        let (c, mut status) = PipelineController::new(pipeline(), pipeline_docs(), &d);
+        let updates = c.updater();
+        let (_target, rx) = watch::channel(Target::Own);
+        let mut task = tokio::spawn(c.run(rx));
+        until(&mut status, "running", is(Actual::Running)).await;
+        f.sink.hold_commits();
+        f.source.commit(FakeTxn::new().insert(&t("a"), row(1)));
+        eventually("the commit waits", || f.sink.waiting_commits() == 1).await;
+        updates.send(Update::Remove).unwrap();
+        tokio::time::timeout(Duration::from_secs(60), &mut task)
+            .await
+            .expect("the controller ends")
+            .unwrap();
+        assert_eq!(f.source.teardowns(), 0, "the source is left as it is");
+        let lease = leases(&store).observe("p").await.unwrap().unwrap();
+        assert!(!lease.doc.released, "the lease expires, not released");
+        assert!(lease.doc.is_held_by(&holder("n1")));
+        f.sink.release_commits();
+    }
+
     /// A removal's teardown checks the lease before every attempt: once it is lost the source is
     /// left as it is (its new holder runs it), and the lease isn't released by this node.
     #[tokio::test(start_paused = true)]
