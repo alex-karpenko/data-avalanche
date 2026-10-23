@@ -4,10 +4,10 @@
 //! `lease_renewal_interval` (Q-M6b-2). A worker that ends with an error is rerun, stopped for the
 //! lease, or left in `ERROR` (Q-M6b-3).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Debug;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use data_avalanche_config::Pipeline;
@@ -162,9 +162,41 @@ pub struct PipelineController {
     /// channel never closes.
     updates: mpsc::UnboundedReceiver<Update>,
     updater: mpsc::UnboundedSender<Update>,
-    /// The ids of the removed pipelines this one takes the place of: their leases are let go of
-    /// before this one's is first claimed ([`Self::following`]).
-    following: Vec<String>,
+    /// The removed pipelines this one takes the place of: their leases are let go of before
+    /// this one's is first claimed ([`Self::following`]).
+    following: Following,
+}
+
+/// The ids of the removed pipelines a pipeline takes the place of (config §9.1: an `id` change
+/// is delete, then recreate), shared by its reconciler and its controller. The controller clears
+/// it once their leases are let go of, the reconciler drops an id a later generation adds again,
+/// and a controller started again after a panic waits only for what is left.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Following(Arc<Mutex<BTreeSet<String>>>);
+
+impl Following {
+    pub(crate) fn new(ids: impl IntoIterator<Item = String>) -> Self {
+        Self(Arc::new(Mutex::new(ids.into_iter().collect())))
+    }
+
+    /// The ids, as of now.
+    pub(crate) fn ids(&self) -> Vec<String> {
+        self.lock().iter().cloned().collect()
+    }
+
+    fn clear(&self) {
+        self.lock().clear();
+    }
+
+    /// Ends the wait on `id`: a followed id that a later generation adds again names another
+    /// pipeline, the one this pipeline took the place of having been removed in an earlier one.
+    pub(crate) fn forget(&self, id: &str) {
+        self.lock().remove(id);
+    }
+
+    fn lock(&self) -> MutexGuard<'_, BTreeSet<String>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// Why the owned phase ended.
@@ -302,7 +334,7 @@ impl PipelineController {
             status,
             updates,
             updater,
-            following: Vec::new(),
+            following: Following::default(),
         }
     }
 
@@ -310,8 +342,8 @@ impl PipelineController {
     /// changed `id` that keeps the slot, the publication, the sink or the state (config §9.1,
     /// delete then recreate). Its lease is first claimed once theirs are let go of.
     #[must_use]
-    pub fn following(mut self, ids: Vec<String>) -> Self {
-        self.following = ids;
+    pub(crate) fn following(mut self, following: Following) -> Self {
+        self.following = following;
         self
     }
 
@@ -338,7 +370,7 @@ impl PipelineController {
                 }
                 continue;
             }
-            if !self.following.is_empty() {
+            if !self.following.ids().is_empty() {
                 match self.follow(&mut target).await {
                     Followed::LetGo => {}
                     Followed::DontOwn => continue,
@@ -402,27 +434,31 @@ impl PipelineController {
     /// Waits until the lease of every pipeline this one takes the place of is let go of: absent,
     /// released, or unchanged for a full `lease_duration` on this node's clock (its holder is
     /// gone; the takeover's rule, Clustering §5.3). The leases are read every
-    /// `renewal_interval`; meanwhile the controller is on standby, and takes its target and its
-    /// updates.
+    /// `renewal_interval`, the ids as the reconciler leaves them; meanwhile the controller is on
+    /// standby, and takes its target and its updates. Past three lease durations the wait is
+    /// logged as a warning, once a lease duration.
     async fn follow(&mut self, target: &mut watch::Receiver<Target>) -> Followed {
         tracing::info!(
             pipeline = %self.pipeline.name,
-            follows = ?self.following,
+            follows = ?self.following.ids(),
             "pipeline waits for the removal of the pipelines it takes the place of"
         );
         self.standby(None);
         let timing = self.settings.timing;
+        let started = Instant::now();
+        let mut warned: Option<Instant> = None;
         // Each held lease's version, and when this node first read it.
         let mut watched: BTreeMap<String, (ObjectVersion, Instant)> = BTreeMap::new();
         loop {
-            let mut held = 0;
-            for id in &self.following {
-                match self.leases.observe(id).await {
+            // Each id still held, with its holder.
+            let mut held: BTreeMap<String, String> = BTreeMap::new();
+            for id in self.following.ids() {
+                match self.leases.observe(&id).await {
                     Ok(None) => {}
                     Ok(Some(lease)) if lease.doc.released => {}
                     Ok(Some(lease)) => {
                         let read = Instant::now();
-                        let since = match watched.get(id) {
+                        let since = match watched.get(&id) {
                             Some((version, since)) if *version == lease.version => *since,
                             _ => {
                                 watched.insert(id.clone(), (lease.version, read));
@@ -430,7 +466,7 @@ impl PipelineController {
                             }
                         };
                         if read < since + timing.duration {
-                            held += 1;
+                            held.insert(id, lease.doc.holder_node_id);
                         }
                     }
                     Err(e) => {
@@ -439,11 +475,23 @@ impl PipelineController {
                             follows = %id,
                             "the lease of a pipeline this one takes the place of unread: {e}"
                         );
-                        held += 1;
+                        held.insert(id, "unread".into());
                     }
                 }
             }
-            if held == 0 {
+            let now = Instant::now();
+            if !held.is_empty()
+                && now >= started + timing.duration * 3
+                && warned.is_none_or(|at| now >= at + timing.duration)
+            {
+                warned = Some(now);
+                tracing::warn!(
+                    pipeline = %self.pipeline.name,
+                    waiting_for = ?held,
+                    "pipeline still waits for the removal of the pipelines it takes the place of: their leases are held"
+                );
+            }
+            if held.is_empty() {
                 self.following.clear();
                 tracing::info!(
                     pipeline = %self.pipeline.name,
@@ -1754,7 +1802,7 @@ mod tests {
             .unwrap();
         let d = deps("n1", &store, &f);
         let (c, mut status) = PipelineController::new(pipeline(), pipeline_docs(), &d);
-        let c = c.following(vec!["x".into(), "never".into()]);
+        let c = c.following(Following::new(["x".into(), "never".into()]));
         let (_target, rx) = watch::channel(Target::Own);
         let start = Instant::now();
         let _task = tokio::spawn(c.run(rx));
@@ -1770,6 +1818,43 @@ mod tests {
         );
         let x = leases(&store).observe("x").await.unwrap().unwrap();
         assert!(x.doc.is_held_by(&holder("n0")) && !x.doc.released);
+    }
+
+    /// A controller started again after its wait was done (as after a panic) shares the list
+    /// its predecessor cleared: it doesn't wait again, though the followed id's lease is held by
+    /// then.
+    #[tokio::test(start_paused = true)]
+    async fn a_follower_started_again_after_its_wait_waits_no_more() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a"]);
+        let d = deps("n1", &store, &f);
+        let following = Following::new(["x".into()]);
+        let (c, mut status) = PipelineController::new(pipeline(), docs.clone(), &d);
+        let (_target, rx) = watch::channel(Target::Own);
+        let task = tokio::spawn(c.following(following.clone()).run(rx));
+        until(&mut status, "running", is(Actual::Running)).await;
+        assert!(following.ids().is_empty(), "cleared where it is shared");
+        task.abort();
+        leases(&store)
+            .acquire(
+                "x",
+                &holder("n0"),
+                Duration::from_secs(15),
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+        let (c, mut status) = PipelineController::new(pipeline(), docs, &d);
+        let (_target, rx) = watch::channel(Target::Own);
+        let start = Instant::now();
+        let _task = tokio::spawn(c.following(following).run(rx));
+        until(&mut status, "running again", is(Actual::Running)).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     /// A pipeline removed while it waits for the pipelines it takes the place of ends there,
@@ -1789,7 +1874,7 @@ mod tests {
             .unwrap();
         let d = deps("n1", &store, &f);
         let (c, mut status) = PipelineController::new(pipeline(), pipeline_docs(), &d);
-        let c = c.following(vec!["x".into()]);
+        let c = c.following(Following::new(["x".into()]));
         let updates = c.updater();
         let (_target, rx) = watch::channel(Target::Own);
         let mut task = tokio::spawn(c.run(rx));

@@ -13,6 +13,7 @@ use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior};
 
+use crate::controller::Following;
 use crate::{
     Actual, ClusterError, ControllerDeps, ControllerStatus, Members, PipelineController, Placement,
     Target, Update,
@@ -102,9 +103,9 @@ impl Reloader {
 struct Controlled {
     pipeline: Pipeline,
     docs: PipelineDocs,
-    /// The removed pipelines it takes the place of ([`PipelineController::following`]): kept,
-    /// so a controller started again after a panic waits for them too.
-    following: Vec<String>,
+    /// The removed pipelines it takes the place of ([`PipelineController::following`]), shared
+    /// with its controller: one started again after a panic waits for what is left of them.
+    following: Following,
     target: watch::Sender<Target>,
     status: watch::Sender<ControllerStatus>,
     task: JoinHandle<()>,
@@ -123,7 +124,7 @@ impl Controlled {
     fn new(
         pipeline: Pipeline,
         docs: PipelineDocs,
-        following: Vec<String>,
+        following: Following,
         deps: &ControllerDeps,
     ) -> Self {
         let mut c = Self {
@@ -236,7 +237,10 @@ impl ClusterReconciler {
             .into_iter()
             .map(|(pipeline, docs)| {
                 let id = pipeline.id.clone();
-                (id, Controlled::new(pipeline, docs, Vec::new(), deps))
+                (
+                    id,
+                    Controlled::new(pipeline, docs, Following::default(), deps),
+                )
             })
             .collect();
         let (statuses_tx, statuses) = watch::channel(status_map(&controllers));
@@ -396,6 +400,11 @@ impl Loop {
             match change {
                 PipelineReload::Add(pipeline, docs) => {
                     let id = pipeline.id.clone();
+                    // A followed id that a later generation adds again names another pipeline:
+                    // the one each follower took the place of was removed in an earlier one.
+                    for c in self.controllers.values() {
+                        c.following.forget(&id);
+                    }
                     // Not a change a diff makes. A removal would tear down what the source
                     // created for the pipeline; a restart under its lease leaves it.
                     if let Some(c) = self.controllers.get_mut(&id) {
@@ -414,11 +423,12 @@ impl Loop {
                         *back = Some((pipeline, docs));
                     } else {
                         tracing::info!(pipeline = %pipeline.name, "pipeline added");
-                        let following = removed
-                            .iter()
-                            .filter(|r| r.id != id && shares(r, &pipeline))
-                            .map(|r| r.id.clone())
-                            .collect();
+                        let following = Following::new(
+                            removed
+                                .iter()
+                                .filter(|r| r.id != id && shares(r, &pipeline))
+                                .map(|r| r.id.clone()),
+                        );
                         let added = Controlled::new(pipeline, docs, following, &self.deps);
                         self.controllers.insert(id, added);
                     }
@@ -466,7 +476,7 @@ impl Loop {
     fn removed(&mut self, id: &str) {
         if let Some(Some((pipeline, docs))) = self.returning.remove(id) {
             tracing::info!(pipeline = %pipeline.name, "pipeline added back, its removal done");
-            let added = Controlled::new(pipeline, docs, Vec::new(), &self.deps);
+            let added = Controlled::new(pipeline, docs, Following::default(), &self.deps);
             self.controllers.insert(id.to_owned(), added);
             self.statuses.send_replace(status_map(&self.controllers));
         }
@@ -1116,6 +1126,37 @@ mod tests {
         fs["x"].sink.release_commits();
         r.shutdown().await;
         assert_eq!(fs["x"].source.teardowns(), 1);
+    }
+
+    /// A followed id that a later generation adds again names another pipeline: the wait on it
+    /// ends, though the lease under that id is still held (here by the removal, still draining;
+    /// next by the pipeline added under the id, which would renew it for good).
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_on_an_id_a_later_generation_adds_again_ends() {
+        let store = ScriptedStore::new();
+        let (r, fs, seen) = x_with_its_drain_held(&store).await;
+        let (mut y, docs) = pipelines(&["y"]).remove(0);
+        y.source.postgres.as_mut().unwrap().slot = "x_slot".into();
+        replace_x(&r, y, docs);
+        eventually("y in", || r.statuses().contains_key("y")).await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(fs["y"].builds(), 0, "y waits for x");
+        let (x, x_docs) = pipelines(&["x"]).remove(0);
+        let mut c = cluster();
+        c.drain_timeout = Duration::from_secs(60);
+        assert!(r.reloader().apply(Reload {
+            pipelines: vec![PipelineReload::Add(x, x_docs)],
+            cluster: c,
+        }));
+        until(r.statuses().get_mut("y").unwrap(), "y running", running).await;
+        assert_eq!(
+            fs["x"].sink.waiting_commits(),
+            1,
+            "x's removal still drains"
+        );
+        assert_eq!(*seen.lock().unwrap(), [0]);
+        fs["x"].sink.release_commits();
+        r.shutdown().await;
     }
 
     /// An `Add` for a pipeline that runs already (not a change a diff makes) restarts it with the
