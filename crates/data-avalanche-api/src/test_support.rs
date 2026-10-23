@@ -275,6 +275,7 @@ pub(crate) struct Issuer {
     /// JWKS fetches so far.
     pub fetches: Arc<AtomicUsize>,
     down: Arc<AtomicBool>,
+    hanging: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -283,6 +284,7 @@ struct Served {
     keys: Arc<Mutex<Vec<(String, KeyPair)>>>,
     fetches: Arc<AtomicUsize>,
     down: Arc<AtomicBool>,
+    hanging: Arc<AtomicBool>,
 }
 
 fn jwk(kid: &str, key: &KeyPair) -> Value {
@@ -297,6 +299,10 @@ fn jwk(kid: &str, key: &KeyPair) -> Value {
 
 async fn jwks(State(s): State<Served>) -> Result<Json<Value>, axum::http::StatusCode> {
     s.fetches.fetch_add(1, Ordering::SeqCst);
+    if s.hanging.load(Ordering::SeqCst) {
+        // Accepted, never answered.
+        std::future::pending::<()>().await;
+    }
     if s.down.load(Ordering::SeqCst) {
         return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
     }
@@ -318,8 +324,10 @@ impl Issuer {
         let keys = Arc::new(Mutex::new(vec![]));
         let fetches = Arc::new(AtomicUsize::new(0));
         let down = Arc::new(AtomicBool::new(false));
+        let hanging = Arc::new(AtomicBool::new(false));
         let served = Served {
             down: Arc::clone(&down),
+            hanging: Arc::clone(&hanging),
             url: url.clone(),
             keys: Arc::clone(&keys),
             fetches: Arc::clone(&fetches),
@@ -334,6 +342,7 @@ impl Issuer {
             keys,
             fetches,
             down,
+            hanging,
         };
         issuer.add_key("k1");
         issuer
@@ -353,6 +362,11 @@ impl Issuer {
     /// While down, the JWKS answers 500.
     pub fn set_down(&self, down: bool) {
         self.down.store(down, Ordering::SeqCst);
+    }
+
+    /// While hanging, the JWKS request is taken and never answered.
+    pub fn set_hanging(&self, hanging: bool) {
+        self.hanging.store(hanging, Ordering::SeqCst);
     }
 
     /// `globals.api.jwt` for this issuer, its tokens for audience `cdc`.

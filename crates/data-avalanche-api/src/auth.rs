@@ -7,7 +7,7 @@
 //! takes a reload's.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use axum::http::HeaderMap;
@@ -19,7 +19,7 @@ use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{AlgorithmFamily, DecodingKey, Validation, decode, decode_header};
 use serde_json::Value;
 use subtle::ConstantTimeEq;
-use tokio::sync::Mutex;
+use tokio::sync::watch;
 
 /// A JWKS fetch, or a discovery, takes at most this long.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -157,6 +157,21 @@ impl Auth {
             Mode::Token(verifier) => verifier.verify(headers).await,
         }
     }
+
+    /// Waits for the JWKS fetch under way, if any.
+    #[cfg(test)]
+    pub(crate) async fn settled(&self) {
+        let mode = Arc::clone(
+            &self
+                .current
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .mode,
+        );
+        if let Mode::Token(v) = &*mode {
+            v.keys.settled().await;
+        }
+    }
 }
 
 fn mode(s: &Settings, timing: Timing) -> Mode {
@@ -166,7 +181,7 @@ fn mode(s: &Settings, timing: Timing) -> Mode {
             audience: audience.clone(),
             roles_claim: roles_claim.to_owned(),
             mapping: s.role_mapping.clone(),
-            keys: Keys::new(keys, timing),
+            keys: Arc::new(Keys::new(keys, timing)),
         }))
     };
     match (s.auth, &s.credentials, &s.jwt, &s.oauth2) {
@@ -239,7 +254,7 @@ struct Verifier {
     audience: Option<String>,
     roles_claim: String,
     mapping: BTreeMap<Role, Vec<String>>,
-    keys: Keys,
+    keys: Arc<Keys>,
 }
 
 impl Verifier {
@@ -335,6 +350,9 @@ enum KeySource {
     },
 }
 
+/// The issuer's JWKS, cached. A fetch runs in a task of its own, one at a time, and the cache's
+/// lock is never held across it: a caller whose key is cached verifies at once, whatever the
+/// issuer does.
 #[derive(Debug)]
 struct Keys {
     source: KeySource,
@@ -348,10 +366,12 @@ struct Cache {
     set: Option<JwkSet>,
     /// When `set` was fetched.
     set_at: Option<Instant>,
-    /// When a fetch was last tried.
+    /// When a fetch was last started.
     fetched: Option<Instant>,
     /// Why the last fetch failed, until one succeeds.
     failure: Option<String>,
+    /// The fetch under way: its sender is dropped once the outcome is stored.
+    in_flight: Option<watch::Receiver<()>>,
 }
 
 impl Keys {
@@ -367,50 +387,91 @@ impl Keys {
         }
     }
 
+    fn cache(&self) -> MutexGuard<'_, Cache> {
+        self.cache.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// The key a token names (`kid`; without one, the set's only key). The JWKS is fetched when
     /// none is cached, when the cached one is [`KEYS_MAX_AGE`] old, or when it lacks the key;
-    /// never more often than every [`REFETCH_AFTER`]. A failed fetch keeps an older set; with
-    /// none ever fetched, the keys are unavailable (503).
-    async fn key(&self, kid: Option<&str>) -> Result<DecodingKey, Denied> {
-        let mut cache = self.cache.lock().await;
-        let old = cache
-            .set_at
-            .is_some_and(|at| at.elapsed() >= self.timing.max_age);
-        if !old && let Some(key) = cache.set.as_ref().and_then(|s| find(s, kid)) {
-            return key;
+    /// never more often than every [`REFETCH_AFTER`], and one fetch at a time. A key the cached
+    /// set holds is taken at once, an old set's too (the fetch runs behind it). Only a caller
+    /// whose key isn't cached waits for the fetch: with no set ever fetched, or with the last
+    /// fetch failed, the keys are unavailable (503); a fetched set that lacks the key is a 401.
+    /// A failed fetch keeps an older set.
+    async fn key(self: &Arc<Self>, kid: Option<&str>) -> Result<DecodingKey, Denied> {
+        let wait = {
+            let mut cache = self.cache();
+            let may_fetch = cache.in_flight.is_none()
+                && cache
+                    .fetched
+                    .is_none_or(|at| at.elapsed() >= self.timing.refetch_after);
+            if let Some(key) = cache.set.as_ref().and_then(|s| find(s, kid)) {
+                let old = cache
+                    .set_at
+                    .is_some_and(|at| at.elapsed() >= self.timing.max_age);
+                if old && may_fetch {
+                    self.start(&mut cache);
+                }
+                return key;
+            }
+            if may_fetch {
+                self.start(&mut cache);
+            }
+            cache.in_flight.clone()
+        };
+        if let Some(mut done) = wait {
+            // Err once the fetch's outcome is stored: its sender is dropped.
+            let _ = done.changed().await;
         }
-        let missing = cache.set.as_ref().is_none_or(|s| find(s, kid).is_none());
-        let may_fetch = cache
-            .fetched
-            .is_none_or(|at| at.elapsed() >= self.timing.refetch_after);
-        if (old || missing) && may_fetch {
-            cache.fetched = Some(Instant::now());
-            match self.fetch().await {
+        let cache = self.cache();
+        match (
+            cache.set.as_ref().and_then(|s| find(s, kid)),
+            &cache.failure,
+        ) {
+            (Some(key), _) => key,
+            (None, Some(failure)) => Err(Denied::Unavailable(failure.clone())),
+            (None, None) if cache.set.is_none() => Err(Denied::Unavailable(
+                "the issuer's keys are not fetched".into(),
+            )),
+            (None, None) => Err(unauthenticated(
+                BEARER,
+                format!("no key {kid:?} in the issuer's JWKS"),
+            )),
+        }
+    }
+
+    /// Starts a fetch, its outcome stored in the cache when it ends.
+    fn start(self: &Arc<Self>, cache: &mut Cache) {
+        cache.fetched = Some(Instant::now());
+        let (done, waited) = watch::channel(());
+        cache.in_flight = Some(waited);
+        let keys = Arc::clone(self);
+        tokio::spawn(async move {
+            let fetched = keys.fetch().await;
+            let mut cache = keys.cache();
+            match fetched {
                 Ok(set) => {
                     cache.set = Some(set);
                     cache.set_at = Some(Instant::now());
                     cache.failure = None;
                 }
                 Err(why) => {
-                    if cache.failure.is_none() {
-                        tracing::warn!("the API's token keys: {why}");
-                    }
+                    tracing::warn!("the API's token keys can't be fetched: {why}");
                     cache.failure = Some(why);
                 }
             }
-        }
-        match (&cache.set, &cache.failure) {
-            (None, failure) => {
-                Err(Denied::Unavailable(failure.clone().unwrap_or_else(|| {
-                    "the issuer's keys are not fetched".into()
-                })))
-            }
-            (Some(set), _) => find(set, kid).unwrap_or_else(|| {
-                Err(unauthenticated(
-                    BEARER,
-                    format!("no key {kid:?} in the issuer's JWKS"),
-                ))
-            }),
+            cache.in_flight = None;
+            drop(cache);
+            drop(done);
+        });
+    }
+
+    /// Waits for the fetch under way, if any.
+    #[cfg(test)]
+    async fn settled(&self) {
+        let in_flight = self.cache().in_flight.clone();
+        if let Some(mut done) = in_flight {
+            let _ = done.changed().await;
         }
     }
 
@@ -718,6 +779,9 @@ mod tests {
         let token = bearer(&idp.token(json!(["viewer"])));
         old.verify(&token).await.unwrap();
         idp.remove_key("k1");
+        // The old set still holds k1: taken at once, the keys fetched again behind it.
+        old.verify(&token).await.unwrap();
+        old.settled().await;
         denied_401(old.verify(&token).await);
     }
 
@@ -729,8 +793,121 @@ mod tests {
         auth.verify(&token).await.unwrap();
         idp.set_down(true);
         auth.verify(&token).await.unwrap();
+        auth.settled().await;
+        assert_eq!(idp.fetches.load(Ordering::SeqCst), 2, "it did try");
+        auth.verify(&token).await.unwrap();
+        idp.set_down(false);
+    }
+
+    /// A token with `claims`, signed by a key the issuer never published, under key id `k9`.
+    fn unknown_kid(idp: &Issuer) -> HeaderMap {
+        let stranger = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        bearer(&sign_with(
+            &stranger,
+            Some("k9"),
+            &idp.claims(json!(["admin"])),
+        ))
+    }
+
+    fn unavailable(r: Result<Principal, Denied>) -> String {
+        match r {
+            Err(Denied::Unavailable(why)) => why,
+            other => panic!("not a 503: {other:?}"),
+        }
+    }
+
+    /// Well under [`FETCH_TIMEOUT`].
+    const AT_ONCE: Duration = Duration::from_secs(2);
+
+    #[tokio::test]
+    async fn old_keys_verify_at_once_while_the_issuer_hangs() {
+        let idp = Issuer::start().await;
+        let auth = Auth::with_timing(&idp.api("roles"), Duration::ZERO, Duration::ZERO);
+        let token = bearer(&idp.token(json!(["viewer"])));
+        auth.verify(&token).await.unwrap();
+        idp.set_hanging(true);
+        for _ in 0..2 {
+            let r = tokio::time::timeout(AT_ONCE, auth.verify(&token))
+                .await
+                .expect("not held up by the issuer's fetch");
+            assert_eq!(r.unwrap().role, Role::Viewer);
+        }
+        // The fetch reaches the issuer, and hangs there; no other starts beside it.
+        while idp.fetches.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        auth.verify(&token).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(idp.fetches.load(Ordering::SeqCst), 2, "one fetch at a time");
+    }
+
+    #[tokio::test]
+    async fn a_made_up_key_id_does_not_hold_up_a_good_token() {
+        let idp = Issuer::start().await;
+        let auth = Arc::new(Auth::with_timing(
+            &idp.api("roles"),
+            Duration::ZERO,
+            Duration::ZERO,
+        ));
+        let token = bearer(&idp.token(json!(["viewer"])));
+        auth.verify(&token).await.unwrap();
+        idp.set_hanging(true);
+        let made_up = tokio::spawn({
+            let (auth, made_up) = (Arc::clone(&auth), unknown_kid(&idp));
+            async move { auth.verify(&made_up).await }
+        });
+        // Until the made-up key id's fetch reaches the issuer, and hangs there.
+        while idp.fetches.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let r = tokio::time::timeout(AT_ONCE, auth.verify(&token))
+            .await
+            .expect("not held up by the made-up key id's fetch");
+        assert_eq!(r.unwrap().role, Role::Viewer);
+        made_up.abort();
+    }
+
+    #[tokio::test]
+    async fn a_key_missing_after_a_failed_refetch_is_unavailable() {
+        let idp = Issuer::start().await;
+        let auth = Auth::with_refetch_after(&idp.api("roles"), Duration::ZERO);
+        auth.verify(&bearer(&idp.token(json!(["viewer"]))))
+            .await
+            .unwrap();
+        idp.set_down(true);
+        unavailable(auth.verify(&unknown_kid(&idp)).await);
         assert_eq!(idp.fetches.load(Ordering::SeqCst), 2, "it did try");
         idp.set_down(false);
+        denied_401(auth.verify(&unknown_kid(&idp)).await);
+    }
+
+    #[tokio::test]
+    async fn after_a_failed_refetch_an_unknown_key_id_waits_the_refetch_interval() {
+        let idp = Issuer::start().await;
+        let interval = Duration::from_millis(300);
+        let auth = Auth::with_refetch_after(&idp.api("roles"), interval);
+        auth.verify(&bearer(&idp.token(json!(["viewer"]))))
+            .await
+            .unwrap();
+        tokio::time::sleep(interval + Duration::from_millis(50)).await;
+        idp.set_down(true);
+        unavailable(auth.verify(&unknown_kid(&idp)).await);
+        assert_eq!(idp.fetches.load(Ordering::SeqCst), 2);
+        // Throttled after the failure: no fetch, and still 503, not "no such key".
+        unavailable(auth.verify(&unknown_kid(&idp)).await);
+        assert_eq!(idp.fetches.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn without_an_audience_a_token_without_aud_verifies() {
+        let idp = Issuer::start().await;
+        let mut api = idp.api("roles");
+        api.jwt.as_mut().unwrap().audience = None;
+        let auth = Auth::new(&api);
+        let mut claims = idp.claims(json!(["operator"]));
+        claims.as_object_mut().unwrap().remove("aud");
+        let p = auth.verify(&bearer(&idp.sign("k1", &claims))).await;
+        assert_eq!(p.unwrap().role, Role::Operator);
     }
 
     #[tokio::test]
