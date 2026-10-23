@@ -6747,7 +6747,7 @@ git commit -m "test(e2e): a reload on one of three node processes reaches every 
 - [x] A PROC change, or a file that doesn't load, is refused with its report, and nothing is published (Tasks 5, 7, 8).
 - [x] `GET /v1/config/status` reports the cluster's generation and each member's applied one (Tasks 7, 8).
 - [x] A process restart runs the cluster's generation, not the file; a node whose file differs from the generation in a per-node key is warned at startup (Tasks 7, 8).
-- [ ] The E2E suite passes on PostgreSQL 18 and, through `ci.yml`'s jobs, on `mysql-84`, `mysql-84-nogtid` and `mariadb-118`. (Measured locally on PostgreSQL 18 and `mysql-84`; the other targets run in the PR's CI.)
+- [x] The E2E suite passes on PostgreSQL 18 and, through `ci.yml`'s jobs, on `mysql-84`, `mysql-84-nogtid` and `mariadb-118`. (Measured locally on PostgreSQL 18 and `mysql-84`; every target passed in the PR's CI at 6227f06, run 39920129413.)
 - [x] Every Review Focus line has its passing test.
 - [x] The documents of "Documents this plan changes" are updated.
 - [x] The workspace gates pass: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo clippy -p data-avalanche --features e2e-hooks --all-targets -- -D warnings`, `cargo test --workspace`.
