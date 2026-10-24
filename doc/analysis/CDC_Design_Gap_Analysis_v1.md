@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-23
+updated: 2026-10-24
 domain: Architecture
 tags: [gap-analysis, design, re-derivation, spec-readiness, blockers, open-decisions]
 resolves: []
@@ -189,11 +189,19 @@ fixed before the PR (the plan's "Deviations during execution"):
 No spec edit beyond the two approved with the plan. The API scenarios pass on PostgreSQL 18 and
 MySQL 8.4; the other CI targets run on the PR.
 
+On 2026-10-24, on Oleksii's request, DA-API-19 (found by the final re-review) was fixed in the same
+PR: a posted body's templated pipeline `id` or `defaults.id` is refused with V-055 before any rule
+runs, so the resolved value is never echoed in `changes` or used to derive a MySQL `server_id`.
+Its review tried every bypass it could name (aliases, merge keys, `defaults`, partial templates,
+quoting, tags, several documents) and found none; the yes-or-no verdicts it noted on other
+`${VAR}` leaves are DA-API-20.
+
 | ID | Change | Evidence |
 |---|---|---|
 | DA-API-4 | ✅ (restated): validate never returns the resolved config, and with a posted body it doesn't compare secret or file fingerprints, so it can't confirm a guessed secret; a body can still make the node read files it names (existence and parse only, API_RBAC §2) | M9a D-M9a.7; `config.rs` `a_check_of_a_body_does_not_tell_whether_its_secret_is_the_running_one` |
 | DA-API-3 | ✅ (restated): the role binding as built — `iss` always and `aud` when configured, `nbf`, HS* refused, a namespaced `roles_claim` read by its name, settings that don't hold together refuse every request | M9a D-M9a.6; `auth.rs` tests (API_RBAC §3's as-built note) |
 | DA-API-12 | ✅ (stays): every `/v1` route behind its least role, the matrix test over every route and role | Task 4, `every_route_turns_away_callers_below_its_role` |
+| DA-API-19 | 🆕 → ✅ (2026-10-24): a posted body's templated `id` is refused before any rule runs | `config.rs` `a_posted_body_s_templated_id_is_refused_without_its_value`; `tests/load.rs` (the V-120 clash, the `$${` escape) |
 
 ### 41.1 New gaps
 
@@ -205,7 +213,8 @@ MySQL 8.4; the other CI targets run on the PR.
 | DA-API-16 | The JWKS and discovery fetches accept `http`, follow redirects, and read an unbounded body | 🟢 | M9a's Task 4 review | A V-rule warning for a non-`https` key URL (as V-052), no redirects, a body cap |
 | DA-API-17 | The TLS listener spawns a task per connection for its handshake (each bounded at 10 s); nothing caps the number of connections | 🟢 | M9a's Task 3 review | A connection limit on the listener |
 | DA-API-18 | The OpenAPI document is snapshot-tested and read back by utoipa, not validated against the OAS 3.1 schema | 🟢 | M9a's whole-branch review | A dev-check against the vendored OAS 3.1 schema |
-| DA-API-19 | Validate of a posted body echoes an added pipeline's resolved `id` and `name`: a body with `id: ${VAR}` shows the value of any node environment variable that fits V-055's pattern (`^[a-z0-9][a-z0-9_-]{0,62}$`, lowercase hex tokens included), and `db: ${VAR}` tells whether a variable equals the running value. Reload reads only the node's file, so only validate is open to it | 🟡 | M9a's final re-review (outside the fix diff) | Resolve a posted body's `${…}` in identity and other echoed fields as written (no expansion), or refuse `${…}` outside credential fields in a posted body; until then API_RBAC §2's note |
+| DA-API-19 ✅ 2026-10-24 (§41) | Validate of a posted body echoes an added pipeline's resolved `id` and `name`: a body with `id: ${VAR}` shows the value of any node environment variable that fits V-055's pattern (`^[a-z0-9][a-z0-9_-]{0,62}$`, lowercase hex tokens included), and `db: ${VAR}` tells whether a variable equals the running value. Reload reads only the node's file, so only validate is open to it | 🟡 | M9a's final re-review (outside the fix diff) | Resolve a posted body's `${…}` in identity and other echoed fields as written (no expansion), or refuse `${…}` outside credential fields in a posted body; until then API_RBAC §2's note |
+| DA-API-20 | Validate of a posted body still checks its other `${VAR}` leaves, so a verdict answers yes or no about a node variable: V-063 whether it is set; V-058, V-059 and V-120 whether it equals another pipeline's slot, publication or `server_id`; a pattern or range check its shape; the diff's field paths whether it equals the running value. One bit per request, online guessing only; no value is echoed | 🟢 | DA-API-19's review (2026-10-24) | Rate-limit validate, or check a posted body's `${…}` leaves only for syntax; until then API_RBAC §2's note |
 
 ---
 
@@ -224,7 +233,7 @@ MySQL 8.4; the other CI targets run on the PR.
 |---|---|---|
 | ✅ Resolved | the large majority | Design closed by a research/spec doc or a probe. |
 | 🔄 Partial | 3 | DA-SNAP-7, DA-SRC-9 (neither blocks the plan); DA-OPS-8 2026-10-22 (§38: the startup warning; the operator docs in M11); DA-SNAP-10 ✅ 2026-10-16 (M7a merged, §33). DA-MS-3 is a decided caveat. DA-X-8 ✅ 2026-09-26; DA-SRC-16 and DA-X-12 ✅ 2026-10-13 (§30). |
-| 🟥 Open (v1) | **27** | DA-API-13…19 🆕 2026-10-23 (§41.1); DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2); DA-SRC-20 🆕 2026-10-13 (§30.1); DA-SRC-21 🆕 2026-10-14 (§31.2); DA-SRC-22, DA-SNAP-14 and DA-X-13 🆕 2026-10-14 (§32.1); DA-SRC-24…26 🆕 2026-10-16 (§33.1); DA-OBS-6 🆕 2026-10-17 (§34.1); DA-OPS-9 🆕 2026-10-22 (§38.1); DA-OPS-10 🆕 2026-10-23 (§39.1). DA-OPS-8 🔄 2026-10-22 (§38). DA-API-11 and DA-API-12 ✅ 2026-10-23 (§40). DA-CLUS-14, DA-OPS-7 and DA-SRC-28 ✅ 2026-10-22 (§37). DA-SRC-27 and DA-X-14 ✅ 2026-10-20 (§35). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
+| 🟥 Open (v1) | **27** | DA-API-13…18 🆕 2026-10-23 and DA-API-20 🆕 2026-10-24 (§41.1); DA-API-19 🆕 2026-10-23, ✅ 2026-10-24 (§41); DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2); DA-SRC-20 🆕 2026-10-13 (§30.1); DA-SRC-21 🆕 2026-10-14 (§31.2); DA-SRC-22, DA-SNAP-14 and DA-X-13 🆕 2026-10-14 (§32.1); DA-SRC-24…26 🆕 2026-10-16 (§33.1); DA-OBS-6 🆕 2026-10-17 (§34.1); DA-OPS-9 🆕 2026-10-22 (§38.1); DA-OPS-10 🆕 2026-10-23 (§39.1). DA-OPS-8 🔄 2026-10-22 (§38). DA-API-11 and DA-API-12 ✅ 2026-10-23 (§40). DA-CLUS-14, DA-OPS-7 and DA-SRC-28 ✅ 2026-10-22 (§37). DA-SRC-27 and DA-X-14 ✅ 2026-10-20 (§35). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
 | 🧪 Verify (v1) | **0** | DA-SRC-10/11 proven 2026-09-26 (§21). |
 | ⏭ v2 | 13 | Iceberg-sink items (§26.2). |
 | 🟢 Spec-merge debt | **0** | All applied 2026-09-26 (§26.6): §19.3 S-1…S-6, the DA-X-8 config residual, the D-V1 patches and the Data-Flow Phase 2a probe details. |
@@ -541,7 +550,8 @@ unauthenticated. The auth *mechanism* (jwt/oauth2 verification params) was alrea
 | DA-API-16 | 🆕 The JWKS fetch accepts http, follows redirects, reads an unbounded body | 🟢 | 🟥 | §41.1: a V-rule warning for a non-`https` key URL, no redirects, a body cap. | — |
 | DA-API-17 | 🆕 No connection limit on the TLS listener | 🟢 | 🟥 | §41.1: a handshake task per connection, each bounded at 10 s. | — |
 | DA-API-18 | 🆕 The OpenAPI document isn't validated against the OAS 3.1 schema | 🟢 | 🟥 | §41.1: snapshot-tested and read back by utoipa only. | — |
-| DA-API-19 | 🆕 Validate of a posted body echoes a `${VAR}`-resolved pipeline `id` | 🟡 | 🟥 | §41.1: an operator can read a node env var fitting V-055's pattern; don't expand `${…}` in echoed fields of a posted body. | — |
+| DA-API-19 | 🆕 Validate of a posted body echoes a `${VAR}`-resolved pipeline `id` | 🟡 | ✅ | §41 (2026-10-24, on Oleksii's request, PR #13): a posted body's templated `id` or `defaults.id` is refused with V-055 before any rule runs, so no expanded id is echoed or used (`load_posted_str`, `ConfigCoordinator::check_posted`); the node-file validate and the reload are unchanged. §41.1: an operator could read a node env var fitting V-055's pattern. | — |
+| DA-API-20 | 🆕 Validate's verdicts on a posted body's other `${VAR}` leaves answer yes or no about a variable | 🟢 | 🟥 | §41.1: V-063 (set or not), the uniqueness rules V-058/V-059/V-120, pattern and range checks, and the diff's field paths tell, one request at a time, whether a variable is set or equals a value; nothing is echoed. | — |
 
 ---
 
