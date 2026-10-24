@@ -2,14 +2,14 @@
 
 use std::collections::BTreeMap;
 
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use data_avalanche_cluster::{Checked, ReloadError, Reloaded};
 use data_avalanche_config::Fingerprints;
 use serde_json::json;
 
-use crate::{Api, Failure, Node, body, starting};
+use crate::{Api, Failure, Node, Principal, body, starting};
 
 /// A refused reload or check: 422 with the report, 409 after the retries, 503 when
 /// `globals.state` fails or the node stops.
@@ -41,39 +41,57 @@ async fn node_file(node: &Node) -> Result<String, Failure> {
 /// runs. 200 with the warnings and what a reload would change; 422 with the report when it is
 /// invalid or changes a field only a process restart applies. The resolved config, secrets
 /// and all, is not echoed. A body's secrets aren't compared with the running ones
-/// (`secrets_compared: false`): whether a guess is the running secret isn't told.
-pub(crate) async fn validate(State(api): State<Api>, text: String) -> Response {
+/// (`secrets_compared: false`): whether a guess is the running secret isn't told. Every validate
+/// is logged at info with its caller, its source, the body's size and the answer's status
+/// (DA-API-20).
+pub(crate) async fn validate(
+    State(api): State<Api>,
+    Extension(by): Extension<Principal>,
+    text: String,
+) -> Response {
     let Some(node) = api.node.get() else {
         return starting();
     };
-    let (checked, fingerprints) = if text.trim().is_empty() {
-        match node_file(node).await {
-            Ok(text) => (node.coordinator.check(&text).await, Fingerprints::Compared),
-            Err(failed) => return failed.into(),
+    let posted = !text.trim().is_empty();
+    let bytes = text.len();
+    let response: Response = 'checked: {
+        let (checked, fingerprints) = if posted {
+            (
+                node.coordinator.check_posted(&text).await,
+                Fingerprints::Ignored,
+            )
+        } else {
+            match node_file(node).await {
+                Ok(file) => (node.coordinator.check(&file).await, Fingerprints::Compared),
+                Err(failed) => break 'checked failed.into(),
+            }
+        };
+        match checked {
+            Ok(Checked {
+                generation,
+                warnings,
+                changes,
+            }) => body(
+                StatusCode::OK,
+                &json!({
+                    "valid": true,
+                    "against_generation": generation,
+                    "warnings": warnings.to_json()["warnings"],
+                    "secrets_compared": fingerprints == Fingerprints::Compared,
+                    "changes": { "globals": changes.globals, "pipelines": changes.pipelines },
+                }),
+            ),
+            Err(e) => refused(&e),
         }
-    } else {
-        (
-            node.coordinator.check_posted(&text).await,
-            Fingerprints::Ignored,
-        )
     };
-    match checked {
-        Ok(Checked {
-            generation,
-            warnings,
-            changes,
-        }) => body(
-            StatusCode::OK,
-            &json!({
-                "valid": true,
-                "against_generation": generation,
-                "warnings": warnings.to_json()["warnings"],
-                "secrets_compared": fingerprints == Fingerprints::Compared,
-                "changes": { "globals": changes.globals, "pipelines": changes.pipelines },
-            }),
-        ),
-        Err(e) => refused(&e),
-    }
+    tracing::info!(
+        by = %by.name,
+        source = if posted { "body" } else { "node file" },
+        bytes = bytes,
+        status = response.status().as_u16(),
+        "config validate through the API"
+    );
+    response
 }
 
 /// Publishes the node's file as the next config generation: 202 with it, 200 when the file is
