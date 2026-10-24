@@ -12,7 +12,7 @@ use std::time::Duration;
 use chrono::Utc;
 use data_avalanche_config::{
     ConfigDiff, Env, FingerprintKey, Fingerprints, Globals, Pipeline, PipelineChange, Report,
-    ResolvedConfig, diff, diff_with, load_str,
+    ResolvedConfig, diff, diff_with, load_posted_str, load_str,
 };
 use data_avalanche_core::TableRef;
 use data_avalanche_state::{
@@ -273,8 +273,8 @@ impl ConfigCoordinator {
     /// adoption asks the source whether the table set changed (config §1.2). An adoption or a
     /// reload isn't held up by it: the running config is copied, and the lock let go.
     /// `fingerprints` says whether a secret or a file that differs only by its value counts as
-    /// a change ([`Fingerprints`]): ignore them for a text a caller supplies, so that the check
-    /// doesn't tell whether its secret is the running one.
+    /// a change ([`Fingerprints`]). This is for the node's own file; a text a caller supplies
+    /// goes through [`Self::check_posted`].
     ///
     /// # Errors
     /// `Invalid`, `Rejected` or `Stopped`, as a reload's.
@@ -282,6 +282,27 @@ impl ConfigCoordinator {
         &self,
         text: &str,
         fingerprints: Fingerprints,
+    ) -> Result<Checked, ReloadError> {
+        self.check_with(text, fingerprints, false).await
+    }
+
+    /// [`Self::check`] for a text a caller supplies (`POST /v1/config/validate` with a body):
+    /// secrets are not compared with the running ones, so that the check doesn't tell whether a
+    /// guess is the running secret, and a pipeline's `id` is taken as written
+    /// ([`load_posted_str`]), so that a `${VAR}` in it can't read this node's environment
+    /// through the answer, which names a pipeline by its id.
+    ///
+    /// # Errors
+    /// `Invalid`, `Rejected` or `Stopped`, as a reload's.
+    pub async fn check_posted(&self, text: &str) -> Result<Checked, ReloadError> {
+        self.check_with(text, Fingerprints::Ignored, true).await
+    }
+
+    async fn check_with(
+        &self,
+        text: &str,
+        fingerprints: Fingerprints,
+        posted: bool,
     ) -> Result<Checked, ReloadError> {
         let d = &self.inner.deps;
         let (config, generation) = {
@@ -291,7 +312,12 @@ impl ConfigCoordinator {
             }
             (running.config.clone(), running.generation.doc.generation)
         };
-        let loaded = load_str(text, &*d.env, &d.key).map_err(ReloadError::Invalid)?;
+        let loaded = if posted {
+            load_posted_str(text, &*d.env, &d.key)
+        } else {
+            load_str(text, &*d.env, &d.key)
+        }
+        .map_err(ReloadError::Invalid)?;
         let changes = diff_with(&config, &loaded.config, &|_, _| None, fingerprints);
         if changes.is_rejected() {
             return Err(ReloadError::Rejected(changes.report));

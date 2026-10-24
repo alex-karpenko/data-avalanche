@@ -50,7 +50,7 @@
 //! `data_avalanche_config::X`, never a module path.
 //!
 //! The surface is:
-//! - **loaders:** [`load_file`], [`load_str`], [`validate_str`], [`Loaded`], [`FingerprintKey`];
+//! - **loaders:** [`load_file`], [`load_str`], [`load_posted_str`] (a posted body: a templated pipeline `id` is refused, not expanded), [`validate_str`], [`Loaded`], [`FingerprintKey`];
 //! - **the resolved model:** every type in the (private) `resolved` module, the config enums and
 //!   their shared `FromStr::Err`, [`EnumValueError`] (public because a public `FromStr` impl's
 //!   associated `Err` type must be, E0446), the value types with their own text grammar
@@ -97,7 +97,7 @@ pub use external::{
     check_unbounded_numeric, glob_match,
 };
 pub use leaf::Loc;
-pub use load::{Loaded, load_file, load_str, validate_str};
+pub use load::{Loaded, load_file, load_posted_str, load_str, validate_str};
 pub use material::{FileRef, Origin, Pem};
 pub use mutability::Mutability;
 pub use registry::{RULES, RuleInput, RuleLocus, RuleMeta, RuleSeverity, rule_meta};

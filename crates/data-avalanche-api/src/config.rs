@@ -46,15 +46,21 @@ pub(crate) async fn validate(State(api): State<Api>, text: String) -> Response {
     let Some(node) = api.node.get() else {
         return starting();
     };
-    let (text, fingerprints) = if text.trim().is_empty() {
+    let (checked, fingerprints) = if text.trim().is_empty() {
         match node_file(node).await {
-            Ok(text) => (text, Fingerprints::Compared),
+            Ok(text) => (
+                node.coordinator.check(&text, Fingerprints::Compared).await,
+                Fingerprints::Compared,
+            ),
             Err(failed) => return failed.into(),
         }
     } else {
-        (text, Fingerprints::Ignored)
+        (
+            node.coordinator.check_posted(&text).await,
+            Fingerprints::Ignored,
+        )
     };
-    match node.coordinator.check(&text, fingerprints).await {
+    match checked {
         Ok(Checked {
             generation,
             warnings,
@@ -231,6 +237,41 @@ mod tests {
             "pipelines.orders.source.credentials.password",
             "{v}"
         );
+    }
+
+    /// A posted body's pipeline id is taken as written (DA-API-19): the answer names a pipeline
+    /// by its id, so expanding a `${VAR}` there would read this node's environment. The node's
+    /// own file is the operator's, and expands.
+    #[tokio::test]
+    async fn a_posted_body_s_templated_id_is_refused_without_its_value() {
+        let templated = CONFIG.replace("id: orders", "id: ${PIPE_ID}");
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.yaml");
+        std::fs::write(&file, &templated).unwrap();
+        let vars = Arc::new(Vars::default());
+        vars.set("PIPE_ID", "sekret-value-1");
+        let lone = lone_with(file, &templated, Arc::clone(&vars) as _).await;
+        let a = api(open());
+        a.node.set(lone.node.clone()).unwrap();
+        let addr = serve(a).await;
+
+        // A body adding a pipeline whose id is a reference.
+        let added = format!(
+            "{CONFIG}  shipments:\n    id: ${{PIPE_ID}}\n    source:\n      host: db.example.com\n      db: ship\n      user: cdc\n      password: pw\n      postgres: {{ publication: s_pub, slot: s_slot }}\n    tables:\n      include: [public.shipments]\n    sink:\n      type: delta\n      bucket: lake\n      prefix: ship\n      delta: {{}}\n"
+        );
+        let (code, _, body) = request(addr, "POST", "/v1/config/validate", &[], &added).await;
+        assert!(!body.contains("sekret-value-1"), "{body}");
+        assert_eq!(code, 422, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["report"]["errors"][0]["rule"], "V-055", "{v}");
+        assert_eq!(
+            v["report"]["errors"][0]["path"], "pipelines.shipments.id",
+            "{v}"
+        );
+
+        // The node's file, whose id is a reference too, is validated as before.
+        let (code, _, body) = request(addr, "POST", "/v1/config/validate", &[], "").await;
+        assert_eq!(code, 200, "{body}");
     }
 
     /// The reload and its status (Clustering §9.2): 200 for the file the cluster runs, 202 and
