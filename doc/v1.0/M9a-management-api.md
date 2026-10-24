@@ -8702,6 +8702,7 @@ found outside the fix diff, fixed in the same PR.
 |---|---|
 | 8d9be8d | **Validate of a posted body takes a pipeline's `id` as written.** It used to expand `${VAR}` in a posted body's `id` and echo the result in `changes` (`Added { id }`, `pipelines.<id>.…`), and derive a MySQL `server_id` from it, so an operator could read any node environment variable that fits V-055's pattern. Now `load_posted_str` refuses a templated pipeline `id` or `defaults.id` with V-055 at its path, showing only the written text, before any rule runs. `ConfigCoordinator::check_posted` uses it; the node-file validate and the reload keep `load_str`. Tests `a_posted_body_s_templated_id_is_refused_without_its_value` (fails with the posted path wired to `load_str`, showing the value) and the config crate's posted-id tests. The review tried aliases, merge keys, `defaults`, partial templates, quoting, tags, several documents and a sequence of pipelines: none gets through. |
 | 620fc41 | The MySQL posted-id test sets up the V-120 clash it guards against (it fails by showing the derived number with the refusal removed), the `$${` escape is tested, and `check` no longer takes `Fingerprints`: only `check_posted` ignores them. |
+| 2144392 | Every config validate is logged at info with its caller, its source (body or node file), the body's size and the answer's status, so a run of guesses through DA-API-20's yes-or-no verdicts shows in the log (Oleksii's choice; the rate limit goes to M12). No log capture in the tree, so no test. |
 
 **Reworded, not built:** the Exit's "the OpenAPI document is validated" (and roadmap §4 M9's).
 Task 7's test reads the document back through utoipa and checks every route's role, security
@@ -8718,7 +8719,8 @@ Left for later:
   - DA-API-18: OAS 3.1 schema validation;
   - DA-API-20: validate's verdicts on a posted body's other `${VAR}` leaves (V-063, the
     uniqueness rules, pattern and range checks, the diff's paths) answer yes or no about a node
-    variable, one request at a time; nothing is echoed. (DA-API-19, the echoed id, is fixed above.)
+    variable, one request at a time; nothing is echoed. Every validate is now logged with its
+    caller, and M12 rate-limits validate. (DA-API-19, the echoed id, is fixed above.)
 - From the re-review, in the fix wave's code:
   - a panic inside the spawned JWKS fetch would leave it marked in flight, so no fetch would run
     again until a restart;

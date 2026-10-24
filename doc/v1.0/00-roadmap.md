@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-23
+updated: 2026-10-24
 domain: Architecture
 tags: [v1, implementation-plan, roadmap, milestones, workspace, crates, interfaces, test-strategy, ci, risks]
 sources: []
@@ -1303,6 +1303,9 @@ the config, jobs persisted and resumed, the re-snapshot that clears a persisted 
       parts (the bzip2/xz/gzip codecs). The AWS SDK also comes in when S3 commits need only a
       conditional PUT;
     - the M6a dependency rule (§2) still holds.
+  - A rate limit on `POST /v1/config/validate` (DA-API-20, Oleksii's choice 2026-10-24): validate
+    of a posted body answers yes or no about the node's `${VAR}`s one request at a time, so its
+    rate bounds an online guess. M9a logs every validate with its caller.
   - Tag `v1.0.0`.
 - **Deps:** all of the above.
 - **Exit:** the acceptance checklist in §8.
