@@ -272,18 +272,14 @@ impl ConfigCoordinator {
     /// says which it was). A table-pattern change counts as a restart here; the reload's
     /// adoption asks the source whether the table set changed (config §1.2). An adoption or a
     /// reload isn't held up by it: the running config is copied, and the lock let go.
-    /// `fingerprints` says whether a secret or a file that differs only by its value counts as
-    /// a change ([`Fingerprints`]). This is for the node's own file; a text a caller supplies
-    /// goes through [`Self::check_posted`].
+    /// A secret or a file that differs only by its value counts as a change. This is for the
+    /// node's own file; a text a caller supplies goes through [`Self::check_posted`], the only
+    /// path that ignores fingerprints.
     ///
     /// # Errors
     /// `Invalid`, `Rejected` or `Stopped`, as a reload's.
-    pub async fn check(
-        &self,
-        text: &str,
-        fingerprints: Fingerprints,
-    ) -> Result<Checked, ReloadError> {
-        self.check_with(text, fingerprints, false).await
+    pub async fn check(&self, text: &str) -> Result<Checked, ReloadError> {
+        self.check_with(text, Fingerprints::Compared, false).await
     }
 
     /// [`Self::check`] for a text a caller supplies (`POST /v1/config/validate` with a body):
@@ -847,7 +843,7 @@ mod tests {
         let n = lone(&["p"]).await;
         let checked = n
             .coordinator
-            .check(&config_text(&["p", "q"]), Fingerprints::Compared)
+            .check(&config_text(&["p", "q"]))
             .await
             .unwrap();
         assert_eq!(checked.generation, 1);
@@ -857,24 +853,21 @@ mod tests {
             "{:?}",
             checked.changes
         );
-        let same = n
-            .coordinator
-            .check(&config_text(&["p"]), Fingerprints::Compared)
-            .await
-            .unwrap();
+        let same = n.coordinator.check(&config_text(&["p"])).await.unwrap();
         assert!(same.changes.is_empty());
         // A text a caller supplies: whether its secret is the running one isn't told.
         let guess = config_text(&["p"]).replace("password: avalanche", "password: a-guess");
-        let check = |f| n.coordinator.check(&guess, f);
         assert!(
-            check(Fingerprints::Ignored)
+            n.coordinator
+                .check_posted(&guess)
                 .await
                 .unwrap()
                 .changes
                 .is_empty()
         );
         assert!(
-            !check(Fingerprints::Compared)
+            !n.coordinator
+                .check(&guess)
                 .await
                 .unwrap()
                 .changes
@@ -884,27 +877,19 @@ mod tests {
             "  state: { bucket: app-state }\n",
             "  state: { bucket: app-state }\n  api: { address: 0.0.0.0:9090 }\n",
         );
-        match n
-            .coordinator
-            .check(&restart_only, Fingerprints::Compared)
-            .await
-        {
+        match n.coordinator.check(&restart_only).await {
             Err(ReloadError::Rejected(r)) => assert!(r.has("V-061"), "{r:?}"),
             other => panic!("{other:?}"),
         }
         assert!(matches!(
-            n.coordinator
-                .check("pipelines: [", Fingerprints::Compared)
-                .await,
+            n.coordinator.check("pipelines: [").await,
             Err(ReloadError::Invalid(_))
         ));
         let pointer = n.generations.current().await.unwrap().unwrap().pointer;
         assert_eq!(pointer.doc.generation, 1, "nothing published");
         n.coordinator.stop().await;
         assert!(matches!(
-            n.coordinator
-                .check(&config_text(&["p"]), Fingerprints::Compared)
-                .await,
+            n.coordinator.check(&config_text(&["p"])).await,
             Err(ReloadError::Stopped)
         ));
     }

@@ -48,10 +48,7 @@ pub(crate) async fn validate(State(api): State<Api>, text: String) -> Response {
     };
     let (checked, fingerprints) = if text.trim().is_empty() {
         match node_file(node).await {
-            Ok(text) => (
-                node.coordinator.check(&text, Fingerprints::Compared).await,
-                Fingerprints::Compared,
-            ),
+            Ok(text) => (node.coordinator.check(&text).await, Fingerprints::Compared),
             Err(failed) => return failed.into(),
         }
     } else {

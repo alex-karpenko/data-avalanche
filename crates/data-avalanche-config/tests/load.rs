@@ -1119,8 +1119,23 @@ fn a_posted_templated_id_is_refused_without_its_value() {
     let loaded = load_str(&yaml, &vars, &fp_key()).unwrap_or_else(|r| panic!("{r:#?}"));
     assert!(loaded.config.pipelines.contains_key("sekret-value-1"));
 
-    // A literal id, and an escaped `$${`, are not templated.
+    // A literal id is not templated.
     load_posted_str(MINIMAL, &vars, &fp_key()).unwrap_or_else(|r| panic!("{r:#?}"));
+
+    // An escaped `$${` is not templated either: it isn't the refusal, it fails V-055's ordinary
+    // pattern check on the unescaped text, and the variable is not read.
+    let escaped = MINIMAL.replace("id: orders", "id: $${PIPE_ID}");
+    let report = load_posted_str(&escaped, &vars, &fp_key()).unwrap_err();
+    let shown = format!("{report:?}{}", report.to_json());
+    assert!(
+        !shown.contains("is not expanded in a posted body"),
+        "{shown}"
+    );
+    assert!(!shown.contains("sekret-value-1"), "{shown}");
+    assert!(
+        report.errors.iter().any(|d| d.rule == "V-055"),
+        "{report:#?}"
+    );
 }
 
 #[test]
@@ -1137,8 +1152,10 @@ fn a_posted_templated_mysql_id_derives_no_server_id() {
         )
         .replace("include: [public.orders]", "include: [orders]")
         .replace("      delta: {}\n", "")
-        // A second pipeline on the same server with a literal id, so a V-120 clash is possible.
-        + "  other:\n    id: other\n    source:\n      type: mysql\n      host: db.example.com\n      db: shop\n      user: cdc\n      password: ${PW}\n    tables:\n      include: [orders]\n    sink:\n      type: delta\n      bucket: lake\n";
+        // A second pipeline on the same server whose explicit `server_id` is the one derived
+        // from the variable's value: a V-120 clash that, if the id were expanded, would print
+        // "<number> (derived from the id)".
+        + &format!("  other:\n    id: other\n    source:\n      type: mysql\n      host: db.example.com\n      db: shop\n      user: cdc\n      password: ${{PW}}\n      mysql: {{ server_id: {} }}\n    tables:\n      include: [orders]\n    sink:\n      type: delta\n      bucket: lake\n", derived_server_id("sekret-value-1"));
     let vars = env(&[("PW", "pw"), ("PIPE_ID", "sekret-value-1")]);
     let report = load_posted_str(&yaml, &vars, &fp_key()).unwrap_err();
     let shown = format!("{report:?}{}", report.to_json());
