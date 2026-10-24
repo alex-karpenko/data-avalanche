@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-23
+updated: 2026-10-24
 domain: Auth
 tags: [rbac, api, authorization, roles, jwt, oauth2, versioning, management-api, cdc]
 resolves: [G-16, G-9.1]
@@ -67,9 +67,12 @@ Notes:
   (`"secrets_compared": false`), so a body can't confirm a guess at a running secret by whether its
   path is listed; validate of the node's own file compares them. A body still makes the node read
   the files it names (`credentials_file`, TLS paths), so an operator learns whether a path the node
-  can read exists and parses, never its content. Its answer still echoes an added pipeline's
-  resolved `id` and `name`, so a body with `id: ${VAR}` shows a node environment variable whose
-  value fits V-055's pattern (DA-API-19).
+  can read exists and parses, never its content. A posted body's pipeline `id` (and
+  `defaults.id`) is taken as written: one that holds a `${…}` is refused with V-055 before any rule
+  runs, so no expanded id is echoed or used to derive anything (DA-API-19). Validate of the node's
+  file expands it as a reload does. Other `${VAR}` leaves of a posted body are still checked, so
+  their verdicts answer yes or no about a variable (set or not, equal to another value or not),
+  one request at a time; no value is echoed (DA-API-20).
 - **Config reload = operator** (routine ops). Cluster-destructive ops (`leave`, `shutdown`) = admin.
 - **Pipeline `stop`** releases DB connections/leases but is recoverable, so it stays operator; only
   node-level teardown is admin.
