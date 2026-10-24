@@ -1096,3 +1096,73 @@ pipelines:
     assert!(!hits[0].message.contains("nope"), "{}", hits[0].message);
     assert!(!report.to_json().to_string().contains("nope"));
 }
+
+/// A posted body's pipeline id is taken as written (DA-API-19): a `${VAR}` in it is refused, and
+/// the variable's value, or a number derived from it, is never shown.
+#[test]
+fn a_posted_templated_id_is_refused_without_its_value() {
+    let yaml = MINIMAL.replace("id: orders", "id: ${PIPE_ID}");
+    let vars = env(&[("PW", "pw"), ("PIPE_ID", "sekret-value-1")]);
+
+    let report = load_posted_str(&yaml, &vars, &fp_key()).unwrap_err();
+    let e = report
+        .errors
+        .iter()
+        .find(|d| d.rule == "V-055" && d.path == "pipelines.orders.id")
+        .unwrap_or_else(|| panic!("no V-055 at pipelines.orders.id: {report:#?}"));
+    assert!(e.message.contains("${PIPE_ID}"), "{}", e.message);
+    assert_eq!(report.errors.len(), 1, "{report:#?}");
+    assert!(!report.to_json().to_string().contains("sekret-value-1"));
+    assert!(!format!("{report:?}").contains("sekret-value-1"));
+
+    // The node's own file path still expands it.
+    let loaded = load_str(&yaml, &vars, &fp_key()).unwrap_or_else(|r| panic!("{r:#?}"));
+    assert!(loaded.config.pipelines.contains_key("sekret-value-1"));
+
+    // A literal id is not templated.
+    load_posted_str(MINIMAL, &vars, &fp_key()).unwrap_or_else(|r| panic!("{r:#?}"));
+
+    // An escaped `$${` is not templated either: it isn't the refusal, it fails V-055's ordinary
+    // pattern check on the unescaped text, and the variable is not read.
+    let escaped = MINIMAL.replace("id: orders", "id: $${PIPE_ID}");
+    let report = load_posted_str(&escaped, &vars, &fp_key()).unwrap_err();
+    let shown = format!("{report:?}{}", report.to_json());
+    assert!(
+        !shown.contains("is not expanded in a posted body"),
+        "{shown}"
+    );
+    assert!(!shown.contains("sekret-value-1"), "{shown}");
+    assert!(
+        report.errors.iter().any(|d| d.rule == "V-055"),
+        "{report:#?}"
+    );
+}
+
+#[test]
+fn a_posted_templated_mysql_id_derives_no_server_id() {
+    let yaml = MINIMAL
+        .replace("id: orders", "id: ${PIPE_ID}")
+        .replace(
+            "host: db.example.com",
+            "type: mysql\n      host: db.example.com",
+        )
+        .replace(
+            "      postgres: { publication: orders_pub, slot: orders_slot }\n",
+            "",
+        )
+        .replace("include: [public.orders]", "include: [orders]")
+        .replace("      delta: {}\n", "")
+        // A second pipeline on the same server whose explicit `server_id` is the one derived
+        // from the variable's value: a V-120 clash that, if the id were expanded, would print
+        // "<number> (derived from the id)".
+        + &format!("  other:\n    id: other\n    source:\n      type: mysql\n      host: db.example.com\n      db: shop\n      user: cdc\n      password: ${{PW}}\n      mysql: {{ server_id: {} }}\n    tables:\n      include: [orders]\n    sink:\n      type: delta\n      bucket: lake\n", derived_server_id("sekret-value-1"));
+    let vars = env(&[("PW", "pw"), ("PIPE_ID", "sekret-value-1")]);
+    let report = load_posted_str(&yaml, &vars, &fp_key()).unwrap_err();
+    let shown = format!("{report:?}{}", report.to_json());
+    assert!(
+        !shown.contains(&derived_server_id("sekret-value-1").to_string()),
+        "{shown}"
+    );
+    assert!(!shown.contains("derived"), "{shown}");
+    assert!(!shown.contains("sekret-value-1"), "{shown}");
+}

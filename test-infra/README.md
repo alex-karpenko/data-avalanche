@@ -100,8 +100,11 @@ and SIGSTOP the nodes. They need no service beyond the source and RustFS.
 
 The reload scenarios (`cluster.rs`'s `a_reload_reaches_every_node`, and `reload.rs`) rewrite that
 one config file and call `POST /v1/config/reload` on one node; the others adopt the new config
-generation from `globals.state`, and `GET /v1/config/status` reports each node's. The endpoints
-are unauthenticated until M9.
+generation from `globals.state`, and `GET /v1/config/status` reports each node's. Those
+scenarios run the API with `auth: none`. The management API scenarios (M9a) need nothing more:
+`api.rs` serves the API over TLS with a certificate generated at run time and checks bearer
+tokens against a JWKS the test serves on loopback (`idp.rs`); `cluster.rs` drives a pipeline
+through a node that doesn't hold it, and leaves and shuts a node down through the API.
 
 ## GCS: a real bucket, not an emulator
 

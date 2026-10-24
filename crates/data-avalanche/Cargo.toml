@@ -10,9 +10,9 @@ description = "The data-avalanche process: the CLI, the wiring of sources, sinks
 workspace = true
 
 [dependencies]
-axum.workspace = true
 chrono.workspace = true
 clap.workspace = true
+data-avalanche-api.workspace = true
 data-avalanche-cluster.workspace = true
 data-avalanche-config.workspace = true
 data-avalanche-core.workspace = true
@@ -38,12 +38,16 @@ e2e-hooks = []
 [dev-dependencies]
 arrow-array.workspace = true
 arrow-cast.workspace = true
+base64.workspace = true
 data-avalanche-testkit.workspace = true
 flate2.workspace = true
 futures-util.workspace = true
+jsonwebtoken.workspace = true
 mysql_async.workspace = true
+rcgen.workspace = true
 tempfile.workspace = true
 tokio-postgres.workspace = true
+tokio-rustls.workspace = true
 
 [[test]]
 name = "e2e"

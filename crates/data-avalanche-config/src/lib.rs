@@ -50,7 +50,7 @@
 //! `data_avalanche_config::X`, never a module path.
 //!
 //! The surface is:
-//! - **loaders:** [`load_file`], [`load_str`], [`validate_str`], [`Loaded`], [`FingerprintKey`];
+//! - **loaders:** [`load_file`], [`load_str`], [`load_posted_str`] (a posted body: a templated pipeline `id` is refused, not expanded), [`validate_str`], [`Loaded`], [`FingerprintKey`];
 //! - **the resolved model:** every type in the (private) `resolved` module, the config enums and
 //!   their shared `FromStr::Err`, [`EnumValueError`] (public because a public `FromStr` impl's
 //!   associated `Err` type must be, E0446), the value types with their own text grammar
@@ -60,8 +60,8 @@
 //! - **diagnostics:** [`Report`], [`Diagnostic`], [`Severity`], [`Locus`], [`PARSE`], [`TYPE`];
 //! - **the registry:** [`RULES`], [`RuleMeta`], [`RuleSeverity`], [`RuleLocus`], [`RuleInput`],
 //!   [`rule_meta`];
-//! - **the reload diff:** [`diff`], [`ConfigDiff`], [`FieldChange`], [`PipelineChange`],
-//!   [`Mutability`];
+//! - **the reload diff:** [`diff`], [`diff_with`], [`Fingerprints`], [`ConfigDiff`],
+//!   [`FieldChange`], [`PipelineChange`], [`Mutability`];
 //! - **external checks:** [`ClusterAnchor`] and the three `check_*` functions;
 //! - **env:** [`Env`], [`ProcessEnv`].
 
@@ -91,13 +91,13 @@ mod walk;
 pub use build::derived_server_id;
 pub use coerce::LogFilter;
 pub use diag::{Diagnostic, Locus, PARSE, Report, Severity, TYPE};
-pub use diff::{ConfigDiff, FieldChange, PipelineChange, diff};
+pub use diff::{ConfigDiff, FieldChange, Fingerprints, PipelineChange, diff, diff_with};
 pub use external::{
     ClusterAnchor, check_cluster_anchor, check_partitioning, check_table_set,
     check_unbounded_numeric, glob_match,
 };
 pub use leaf::Loc;
-pub use load::{Loaded, load_file, load_str, validate_str};
+pub use load::{Loaded, load_file, load_posted_str, load_str, validate_str};
 pub use material::{FileRef, Origin, Pem};
 pub use mutability::Mutability;
 pub use registry::{RULES, RuleInput, RuleLocus, RuleMeta, RuleSeverity, rule_meta};

@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use chrono::Utc;
 use data_avalanche_config::{
-    ConfigDiff, Env, FingerprintKey, Globals, Pipeline, PipelineChange, Report, ResolvedConfig,
-    diff, load_str,
+    ConfigDiff, Env, FingerprintKey, Fingerprints, Globals, Pipeline, PipelineChange, Report,
+    ResolvedConfig, diff, diff_with, load_posted_str, load_str,
 };
 use data_avalanche_core::TableRef;
 use data_avalanche_state::{
@@ -50,7 +50,8 @@ pub struct CoordinatorDeps {
     pub reloader: Reloader,
     pub advertiser: Advertiser,
     pub metrics: Metrics,
-    /// What a generation's globals change outside the cluster: the binary's log filter.
+    /// What a generation's globals change outside the cluster: the binary's log filter and the
+    /// API's auth.
     pub globals: Arc<dyn Fn(&Globals) + Send + Sync>,
 }
 
@@ -69,6 +70,16 @@ pub struct Reloaded {
     pub generation: u64,
     /// False when the file's text is that generation's already: nothing was published.
     pub published: bool,
+}
+
+/// What a reload would do here ([`ConfigCoordinator::check`]).
+#[derive(Debug, Clone)]
+pub struct Checked {
+    /// The generation the changes are against: the one this node runs.
+    pub generation: u64,
+    /// The text's warnings.
+    pub warnings: Report,
+    pub changes: ConfigDiff,
 }
 
 /// Why a reload published nothing.
@@ -253,6 +264,69 @@ impl ConfigCoordinator {
             }
         }
         Err(ReloadError::Contended)
+    }
+
+    /// What a reload of `text` would change on this node, nothing published (`POST
+    /// /v1/config/validate`): the text loaded in this node's environment and diffed against
+    /// the generation this node runs, which may lag the cluster's ([`Checked::generation`]
+    /// says which it was). A table-pattern change counts as a restart here; the reload's
+    /// adoption asks the source whether the table set changed (config §1.2). An adoption or a
+    /// reload isn't held up by it: the running config is copied, and the lock let go.
+    /// A secret or a file that differs only by its value counts as a change. This is for the
+    /// node's own file; a text a caller supplies goes through [`Self::check_posted`], the only
+    /// path that ignores fingerprints.
+    ///
+    /// # Errors
+    /// `Invalid`, `Rejected` or `Stopped`, as a reload's.
+    pub async fn check(&self, text: &str) -> Result<Checked, ReloadError> {
+        self.check_with(text, Fingerprints::Compared, false).await
+    }
+
+    /// [`Self::check`] for a text a caller supplies (`POST /v1/config/validate` with a body):
+    /// secrets are not compared with the running ones, so that the check doesn't tell whether a
+    /// guess is the running secret, and a pipeline's `id` is taken as written
+    /// ([`load_posted_str`]), so that a `${VAR}` in it can't read this node's environment
+    /// through the answer, which names a pipeline by its id.
+    ///
+    /// # Errors
+    /// `Invalid`, `Rejected` or `Stopped`, as a reload's.
+    pub async fn check_posted(&self, text: &str) -> Result<Checked, ReloadError> {
+        self.check_with(text, Fingerprints::Ignored, true).await
+    }
+
+    async fn check_with(
+        &self,
+        text: &str,
+        fingerprints: Fingerprints,
+        posted: bool,
+    ) -> Result<Checked, ReloadError> {
+        let d = &self.inner.deps;
+        let (config, generation) = {
+            let running = self.inner.running.lock().await;
+            if running.stopped {
+                return Err(ReloadError::Stopped);
+            }
+            (running.config.clone(), running.generation.doc.generation)
+        };
+        let loaded = if posted {
+            load_posted_str(text, &*d.env, &d.key)
+        } else {
+            load_str(text, &*d.env, &d.key)
+        }
+        .map_err(ReloadError::Invalid)?;
+        let changes = diff_with(&config, &loaded.config, &|_, _| None, fingerprints);
+        if changes.is_rejected() {
+            return Err(ReloadError::Rejected(changes.report));
+        }
+        let mut warnings = Report::default();
+        for w in loaded.warnings {
+            warnings.push(w);
+        }
+        Ok(Checked {
+            generation,
+            warnings,
+            changes,
+        })
     }
 
     /// Stops watching, after the adoption or reload under way: none follows, and a reload is
@@ -761,6 +835,63 @@ mod tests {
         let r = n.reload().await;
         assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
         assert_eq!(kinds(&r), ["add q"]);
+    }
+
+    /// A check says what a reload would change, and publishes nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_check_says_what_a_reload_would_change_and_publishes_nothing() {
+        let n = lone(&["p"]).await;
+        let checked = n
+            .coordinator
+            .check(&config_text(&["p", "q"]))
+            .await
+            .unwrap();
+        assert_eq!(checked.generation, 1);
+        assert!(checked.warnings.is_ok());
+        assert!(
+            matches!(&checked.changes.pipelines[..], [PipelineChange::Added { id, .. }] if id == "q"),
+            "{:?}",
+            checked.changes
+        );
+        let same = n.coordinator.check(&config_text(&["p"])).await.unwrap();
+        assert!(same.changes.is_empty());
+        // A text a caller supplies: whether its secret is the running one isn't told.
+        let guess = config_text(&["p"]).replace("password: avalanche", "password: a-guess");
+        assert!(
+            n.coordinator
+                .check_posted(&guess)
+                .await
+                .unwrap()
+                .changes
+                .is_empty()
+        );
+        assert!(
+            !n.coordinator
+                .check(&guess)
+                .await
+                .unwrap()
+                .changes
+                .is_empty()
+        );
+        let restart_only = config_text(&["p"]).replace(
+            "  state: { bucket: app-state }\n",
+            "  state: { bucket: app-state }\n  api: { address: 0.0.0.0:9090 }\n",
+        );
+        match n.coordinator.check(&restart_only).await {
+            Err(ReloadError::Rejected(r)) => assert!(r.has("V-061"), "{r:?}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            n.coordinator.check("pipelines: [").await,
+            Err(ReloadError::Invalid(_))
+        ));
+        let pointer = n.generations.current().await.unwrap().unwrap().pointer;
+        assert_eq!(pointer.doc.generation, 1, "nothing published");
+        n.coordinator.stop().await;
+        assert!(matches!(
+            n.coordinator.check(&config_text(&["p"])).await,
+            Err(ReloadError::Stopped)
+        ));
     }
 
     /// A reload publishes the file as the next generation and applies it here: the globals

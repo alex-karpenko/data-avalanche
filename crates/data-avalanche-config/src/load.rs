@@ -4,9 +4,10 @@
 use std::path::Path;
 
 use crate::build::{build, merge_all};
-use crate::ctx::Ctx;
+use crate::ctx::{At, Ctx, is_templated};
 use crate::diag::{Diagnostic, Locus, PARSE, Report, Severity};
 use crate::parse::parse_document;
+use crate::path::YamlPath;
 use crate::raw::RawConfig;
 use crate::resolved::ResolvedConfig;
 use crate::rules;
@@ -120,6 +121,52 @@ pub fn load_str(text: &str, env: &dyn Env, key: &FingerprintKey) -> Result<Loade
         }
         _ => Err(report),
     }
+}
+
+/// [`load_str`] for a config text a caller posts (the validation endpoint's body), which takes a
+/// pipeline's `id` as written. An `id` is echoed back (the diff names the pipeline by it) and a
+/// MySQL pipeline derives its `server_id` from it, so expanding a `${VAR}` there would show the
+/// value of any node environment variable that fits the id pattern, to a caller who can't read
+/// the node's environment. A templated `id` (decided from the written text: `$${` escapes don't
+/// count) is therefore refused at once, one V-055 error per pipeline, before any rule runs, so
+/// nothing derived from an expanded id is ever computed. Everything else resolves as in
+/// [`load_str`]. A map key under `pipelines` is never expanded (it is the YAML key as parsed).
+pub fn load_posted_str(text: &str, env: &dyn Env, key: &FingerprintKey) -> Result<Loaded, Report> {
+    let raw: RawConfig = parse_document(text).map_err(|d| only(*d))?;
+    let mut report = Report::default();
+    let mut refuse = |at: At, written: &str| {
+        let mut ctx = Ctx::structural();
+        ctx.error(
+            "V-055",
+            &at,
+            None,
+            format!(
+                "pipeline id {written:?} is not expanded in a posted body (validate the node's file instead)"
+            ),
+        );
+        report.extend(ctx.into_report());
+    };
+    if let Some(id) = raw
+        .defaults
+        .as_ref()
+        .and_then(|d| d.id.as_ref())
+        .filter(|id| is_templated(id))
+    {
+        refuse(
+            At::config(YamlPath::root().key("defaults").key("id")),
+            id.text(),
+        );
+    }
+    for (name, p) in raw.pipelines.iter().flatten() {
+        if let Some(id) = p.id.as_ref().filter(|id| is_templated(id)) {
+            let at = At::pipeline(name, YamlPath::root().key("pipelines").key(name));
+            refuse(at.key("id"), id.text());
+        }
+    }
+    if !report.is_ok() {
+        return Err(report);
+    }
+    load_str(text, env, key)
 }
 
 /// Loads the config file at `path` (§2: the path comes from the command line). `key` is the same

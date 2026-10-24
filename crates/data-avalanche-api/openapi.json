@@ -1,0 +1,811 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "data-avalanche management API",
+    "description": "`globals.api.auth` decides which credentials a node takes: none, basic (one user, admin), or a bearer JWT whose roles are mapped (config §6.3).",
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/v1/admin/shutdown": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Shut down: leave the cluster, then end the process",
+        "responses": {
+          "202": {
+            "description": "the shutdown is under way",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "409": {
+            "description": "shutting down already",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "admin"
+      }
+    },
+    "/v1/cluster/leave": {
+      "post": {
+        "tags": [
+          "cluster"
+        ],
+        "summary": "Leave the cluster: hand every pipeline off; the process stays up, not ready",
+        "responses": {
+          "202": {
+            "description": "the leave is under way",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "409": {
+            "description": "leaving already",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "admin"
+      }
+    },
+    "/v1/cluster/status": {
+      "get": {
+        "tags": [
+          "cluster"
+        ],
+        "summary": "The members this node sees, and each pipeline's lease holder",
+        "responses": {
+          "200": {
+            "description": "the members and the holders",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "viewer"
+      }
+    },
+    "/v1/config/reload": {
+      "post": {
+        "tags": [
+          "config"
+        ],
+        "summary": "Publish the node's file as the next config generation",
+        "responses": {
+          "200": {
+            "description": "the file is the generation the cluster runs",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "202": {
+            "description": "published: the generation",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "409": {
+            "description": "other nodes published first, every time",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "422": {
+            "description": "invalid, or it changes a restart-only field: the report",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "operator"
+      }
+    },
+    "/v1/config/status": {
+      "get": {
+        "tags": [
+          "config"
+        ],
+        "summary": "The generation the cluster runs, and each member's",
+        "responses": {
+          "200": {
+            "description": "the generations",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "viewer"
+      }
+    },
+    "/v1/config/validate": {
+      "post": {
+        "tags": [
+          "config"
+        ],
+        "summary": "Check a config, the body or else the node's file: what a reload of it would change. Nothing is published",
+        "requestBody": {
+          "content": {
+            "application/yaml": {}
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "description": "it loads: its warnings and the changes",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "422": {
+            "description": "invalid, or it changes a restart-only field: the report",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "operator"
+      }
+    },
+    "/v1/openapi.json": {
+      "get": {
+        "tags": [
+          "openapi.json"
+        ],
+        "summary": "This document",
+        "responses": {
+          "200": {
+            "description": "the OpenAPI document",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "viewer"
+      }
+    },
+    "/v1/pipelines": {
+      "get": {
+        "tags": [
+          "pipelines"
+        ],
+        "summary": "Every pipeline: its desired and actual states and its holder",
+        "responses": {
+          "200": {
+            "description": "the pipelines",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "viewer"
+      }
+    },
+    "/v1/pipelines/{id}": {
+      "get": {
+        "tags": [
+          "pipelines"
+        ],
+        "summary": "A pipeline: its states, its holder, its position and its halted tables",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "the pipeline's id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the pipeline",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "404": {
+            "description": "no such pipeline in the generation this node runs",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "viewer"
+      }
+    },
+    "/v1/pipelines/{id}/flush": {
+      "post": {
+        "tags": [
+          "pipelines"
+        ],
+        "summary": "Flush now",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "the pipeline's id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "paused: flushed already",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "202": {
+            "description": "asked: the owner acts at its next poll",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "404": {
+            "description": "no such pipeline in the generation this node runs",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "409": {
+            "description": "stopped, or no node holds the lease",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "operator"
+      }
+    },
+    "/v1/pipelines/{id}/pause": {
+      "post": {
+        "tags": [
+          "pipelines"
+        ],
+        "summary": "Pause: flush to a transaction boundary, then read nothing; the connection and the lease stay",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "the pipeline's id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "paused already",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "202": {
+            "description": "the desired state is paused",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "404": {
+            "description": "no such pipeline in the generation this node runs",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "409": {
+            "description": "the pipeline is stopped",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "operator"
+      }
+    },
+    "/v1/pipelines/{id}/restart": {
+      "post": {
+        "tags": [
+          "pipelines"
+        ],
+        "summary": "Restart: discard what is unflushed and replay from the checkpoint, under the same lease; a pipeline in ERROR runs again",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "the pipeline's id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "asked: the owner acts at its next poll",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "404": {
+            "description": "no such pipeline in the generation this node runs",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "409": {
+            "description": "paused, stopped, or no node holds the lease",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "operator"
+      }
+    },
+    "/v1/pipelines/{id}/resume": {
+      "post": {
+        "tags": [
+          "pipelines"
+        ],
+        "summary": "Resume a paused or stopped pipeline",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "the pipeline's id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "running already",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "202": {
+            "description": "the desired state is running",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "404": {
+            "description": "no such pipeline in the generation this node runs",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "operator"
+      }
+    },
+    "/v1/pipelines/{id}/stop": {
+      "post": {
+        "tags": [
+          "pipelines"
+        ],
+        "summary": "Stop: flush, and close the source connection; the lease stays",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "the pipeline's id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "stopped already",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "202": {
+            "description": "the desired state is stopped",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "404": {
+            "description": "no such pipeline in the generation this node runs",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "operator"
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "basic": {
+        "type": "http",
+        "scheme": "basic"
+      },
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    }
+  }
+}

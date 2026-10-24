@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-08
+updated: 2026-10-23
 domain: Data Flow
 tags: [lifecycle, state-machine, pause, stop, resume, restart, flush, failover, management-api, cdc]
 resolves: [G-NEW-15]
@@ -63,7 +63,7 @@ This is the single idea that answers every §2.5 question.
             resume                      stop
   STOPPED ─────────► RUNNING     (resume / start)
 
-  restart:  RUNNING ─(drain+flush, §12.4)─► STARTING ─► RUNNING   (valid only on RUNNING)
+  restart:  RUNNING ─(discard and replay, §12.4)─► STARTING ─► RUNNING   (valid only on RUNNING)
   flush:    action in RUNNING (and PAUSED is already flushed) — no state change
 
   out of ERROR:  ERROR ─stop─► STOPPED ─resume─► RUNNING   (reruns from Phase 0, as a restart)
@@ -79,6 +79,19 @@ This is the single idea that answers every §2.5 question.
   would. If the cause persists (the WAL still over `max_wal_lag_bytes`, the same oversized
   transaction), the rerun fails the same way: only an operator triggers it. Until M9's `restart`,
   this and a process restart are the ways out of `ERROR`.
+- **As built in M9a** (D-M9a.3, D-M9a.4, confirmed 2026-10-23):
+  - "`RUNNING` only" for `restart` is the **desired** state. A pipeline whose desired state is
+    running but whose actual state is `ERROR` (or retrying) can be restarted, and the restart runs
+    it again; desired `PAUSED`/`STOPPED`, or no lease holder, is `409`.
+  - Asking for the state the pipeline is in already (`pause` on `PAUSED`) changes nothing and
+    answers `200` with `unchanged`: a retried request must not read as refused. Only `pause` on
+    `STOPPED` is illegal.
+  - `flush` on `PAUSED` answers `200` unchanged (the pause flushed); on `STOPPED`, or with no lease
+    holder, `409`.
+  - A `restart` or `flush` is taken by the holder at its next poll, so its `202` says the request
+    is recorded, not done. A flush taken while no worker runs (`ERROR`, or between retries) is a
+    logged no-op. Each request gets a new id: a client that retries the call after losing the
+    answer asks twice (DA-API-15).
 - **`flush`** forces an immediate flush and **resets the time-based flush timer and the row/byte
   counters** (closes §9.6). A no-op warning if the buffer is empty.
 
@@ -113,6 +126,13 @@ The `PipelineController` (clustering §20) gains `Paused` and `Stopped` actual-s
   via the API on whichever node holds the lease (or is routed by the same generation-pointer mechanism
   as config reload, §9.2 — every node can observe the per-pipeline desired-state change and the owner
   acts).
+- **As built in M9a** (Q-M9-B, D-M9a.2, D-M9a.5): through storage, never by proxy. `pause`, `stop`
+  and `resume` compare-and-swap `desired_state`. `restart` and `flush` are recorded in
+  `requests.json` (the last of each, `{id, at}`, a fresh id per request so a retried write sets
+  the same value). The owner reads the requests when its lease term starts (the baseline) and
+  takes a new id at a poll. It writes `status.json` (actual state, error, halt code, degraded,
+  under its epoch) when its status changes. Any node answers a status from these documents and
+  the lease; a `status.json` of another holder or an earlier epoch is not shown as current.
 
 ---
 

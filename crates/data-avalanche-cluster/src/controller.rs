@@ -2,7 +2,9 @@
 //! pipeline's lease. While its target is "own" it claims the lease, then runs the pipeline's
 //! worker under it and reconciles the worker toward the persisted desired state, polled every
 //! `lease_renewal_interval` (Q-M6b-2). A worker that ends with an error is rerun, stopped for the
-//! lease, or left in `ERROR` (Q-M6b-3).
+//! lease, or left in `ERROR` (Q-M6b-3). At the same poll the owner writes the pipeline's status,
+//! `status.json`, when it changed, and takes the restart and the flush the management API asked
+//! for in `requests.json` (D-M9a.2).
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Debug;
@@ -16,7 +18,9 @@ use data_avalanche_pipeline::{
     Backoff, Command, CommitGuard, Exit, Hooks, Phase, PipelineWorker, Recovery, Tuning,
     WorkerDeps, WorkerError, WorkerHandle, WorkerStatus,
 };
-use data_avalanche_state::{DesiredState, Holder, Leases, PipelineDocs};
+use data_avalanche_state::{
+    ActualState, DesiredState, Holder, Leases, PipelineDocs, RequestsDoc, StatusDoc,
+};
 use data_avalanche_storage::ObjectVersion;
 use data_avalanche_telemetry::{Metrics, PipelineLabels, PipelineMetrics, PipelineStatus, Totals};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
@@ -246,6 +250,52 @@ enum Event {
     Due,
     Poll,
     Update(Update),
+}
+
+/// What [`PipelineController::asked`] found.
+#[derive(Debug, Default)]
+struct Asked {
+    restart: bool,
+    flush: bool,
+}
+
+/// The status this owner last wrote.
+#[derive(Debug, Default)]
+struct Reported {
+    last: Option<StatusDoc>,
+    /// The last write failed: the next failure isn't warned of again.
+    failing: bool,
+}
+
+/// `status.json` for an owned pipeline's status; `None` before the first publish.
+fn status_doc(node_id: &str, s: &ControllerStatus) -> Option<StatusDoc> {
+    let (actual, error, code) = match s.actual.clone()? {
+        Actual::Standby { .. } => return None,
+        Actual::Starting => (ActualState::Starting, None, None),
+        Actual::Running => (ActualState::Running, None, None),
+        Actual::Paused => (ActualState::Paused, None, None),
+        Actual::Stopped => (ActualState::Stopped, None, None),
+        Actual::Dumped => (ActualState::Dumped, None, None),
+        Actual::Retrying { error } => (ActualState::Retrying, Some(error), None),
+        Actual::Error { error, code } => (ActualState::Error, Some(error), code),
+    };
+    Some(StatusDoc {
+        holder_node_id: node_id.to_owned(),
+        owner_epoch: s.owner_epoch?,
+        actual,
+        error,
+        code,
+        degraded: s.worker.as_ref().and_then(|w| w.degraded.clone()),
+        written_at: chrono::Utc::now(),
+    })
+}
+
+/// The same status, whenever it was written.
+fn same(a: &StatusDoc, b: &StatusDoc) -> bool {
+    StatusDoc {
+        written_at: b.written_at,
+        ..a.clone()
+    } == *b
 }
 
 /// A pipeline's series labels.
@@ -570,6 +620,11 @@ impl PipelineController {
         // Unknown until a read succeeds: nothing starts on a guess (a stopped or paused pipeline
         // must not run because its state document was unreadable once).
         let mut desired = self.desired().await;
+        // What is asked already belongs to an earlier term: only later requests are taken. Read
+        // now, not at the first poll a renewal interval away, which would take a request made
+        // meanwhile as seen. A failed read leaves the first poll's read to take note.
+        let mut seen = self.docs.requests().await.ok();
+        let mut reported = Reported::default();
         let mut poll = tokio::time::interval(self.settings.timing.renewal_interval);
         poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
         poll.tick().await;
@@ -792,6 +847,32 @@ impl PipelineController {
                     if let Some(w) = worker.as_mut() {
                         self.observe(w);
                     }
+                    self.report(&mut reported).await;
+                    let asked = self.asked(&mut seen).await;
+                    // As a reload's restart: a pipeline in ERROR runs again (Pipeline_Lifecycle
+                    // §3), and a paused or stopped one stays so (the API refuses those).
+                    if asked.restart {
+                        if self.discard(&mut worker).await {
+                            tracing::info!(pipeline = %self.pipeline.name, "restarted on request");
+                        } else {
+                            tracing::info!(pipeline = %self.pipeline.name, "a restart was asked, but no worker runs: the next one starts afresh");
+                        }
+                        error = None;
+                        dumped = false;
+                        retry = None;
+                        failures = 0;
+                    }
+                    if asked.flush {
+                        match worker.as_ref() {
+                            Some(w) => {
+                                let _ = w.handle.control.send(Command::Flush).await;
+                                tracing::info!(pipeline = %self.pipeline.name, "flushed on request");
+                            }
+                            None => {
+                                tracing::info!(pipeline = %self.pipeline.name, "a flush was asked, but no worker runs");
+                            }
+                        }
+                    }
                 }
                 Event::Update(Update::Reconfigure(p)) => {
                     self.reconfigure(*p);
@@ -803,13 +884,10 @@ impl PipelineController {
                 Event::Update(Update::Restart(p, docs)) => {
                     self.reconfigure(*p);
                     self.docs = docs;
-                    // Discard and replay (§12.4): what the worker read past the durable
-                    // checkpoint is read again by the next one.
-                    if let Some(mut w) = worker.take() {
-                        w.task.abort();
-                        let _ = (&mut w.task).await;
-                        self.metrics.worker_ended();
-                    }
+                    // The baselines belong to the state location: a reload may move it.
+                    reported = Reported::default();
+                    seen = self.docs.requests().await.ok();
+                    self.discard(&mut worker).await;
                     tracing::info!(pipeline = %self.pipeline.name, "restarted for a reload");
                     error = None;
                     dumped = false;
@@ -823,6 +901,62 @@ impl PipelineController {
                 }
                 Event::Update(Update::DrainTimeout(d)) => self.settings.drain_timeout = d,
             }
+        }
+    }
+
+    /// Discard and replay (config §12.4): what the worker read past the durable checkpoint is
+    /// read again by the next one. False when no worker runs.
+    async fn discard(&self, worker: &mut Option<Running>) -> bool {
+        let Some(mut w) = worker.take() else {
+            return false;
+        };
+        w.task.abort();
+        // Ended (dropped) before the next worker starts: its writer goes with it.
+        let _ = (&mut w.task).await;
+        self.metrics.worker_ended();
+        true
+    }
+
+    /// Writes `status.json` when what this owner reports changed since its last write. A failed
+    /// write is warned of once, and tried again at the next poll.
+    async fn report(&self, reported: &mut Reported) {
+        let status = self.status.borrow().clone();
+        let Some(doc) = status_doc(&self.holder.node_id, &status) else {
+            return;
+        };
+        if reported.last.as_ref().is_some_and(|last| same(last, &doc)) {
+            return;
+        }
+        match self.docs.save_status(&doc).await {
+            Ok(_) => {
+                reported.last = Some(doc);
+                reported.failing = false;
+            }
+            Err(e) => {
+                if !reported.failing {
+                    tracing::warn!(pipeline = %self.pipeline.name, "status unwritten, written at the next poll: {e}");
+                }
+                reported.failing = true;
+            }
+        }
+    }
+
+    /// The restart and the flush asked since the last read. The first read of a term only takes
+    /// note of what is there.
+    async fn asked(&self, seen: &mut Option<RequestsDoc>) -> Asked {
+        let now = match self.docs.requests().await {
+            Ok(now) => now,
+            Err(e) => {
+                tracing::warn!(pipeline = %self.pipeline.name, "requests unread: {e}");
+                return Asked::default();
+            }
+        };
+        let Some(before) = seen.replace(now.clone()) else {
+            return Asked::default();
+        };
+        Asked {
+            restart: now.restart.is_some() && now.restart != before.restart,
+            flush: now.flush.is_some() && now.flush != before.flush,
         }
     }
 
@@ -1102,6 +1236,7 @@ impl PipelineController {
 #[cfg(test)]
 mod tests {
     use data_avalanche_core::{SinkError, SourceError, TableRef};
+    use data_avalanche_state::Action;
     use data_avalanche_testkit::{FakeTxn, Method, SinkOp};
 
     use super::*;
@@ -1215,6 +1350,128 @@ mod tests {
         docs.set_desired_state(DesiredState::Running).await.unwrap();
         eventually("the row lands", || f.ids("a") == [1]).await;
         assert_eq!(f.builds(), 2);
+    }
+
+    /// Waits (on the test clock) until `status.json` satisfies `cond`.
+    async fn status_doc_until(
+        docs: &PipelineDocs,
+        what: &str,
+        cond: impl Fn(&StatusDoc) -> bool,
+    ) -> data_avalanche_state::Versioned<StatusDoc> {
+        for _ in 0..1_200 {
+            if let Some(v) = docs.status().await.unwrap()
+                && cond(&v.doc)
+            {
+                return v;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("timed out waiting until {what}: {:?}", docs.status().await);
+    }
+
+    fn asked(id: &str) -> data_avalanche_state::Request {
+        data_avalanche_state::Request {
+            id: id.into(),
+            at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_owner_writes_its_status_when_it_changes() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a"]);
+        let mut n = node("n1", &store, &docs, &f);
+        until(&mut n.status, "running", is(Actual::Running)).await;
+        let running =
+            status_doc_until(&docs, "running", |d| d.actual == ActualState::Running).await;
+        assert_eq!(running.doc.holder_node_id, "n1");
+        assert_eq!(running.doc.owner_epoch, 1);
+        assert_eq!((running.doc.error, running.doc.code), (None, None));
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(
+            docs.status().await.unwrap().unwrap().version,
+            running.version,
+            "an unchanged status isn't written again"
+        );
+        docs.set_desired_state(DesiredState::Paused).await.unwrap();
+        status_doc_until(&docs, "paused", |d| d.actual == ActualState::Paused).await;
+        docs.set_desired_state(DesiredState::Stopped).await.unwrap();
+        status_doc_until(&docs, "stopped", |d| d.actual == ActualState::Stopped).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_asked_runs_a_new_worker_under_the_same_lease() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a"]);
+        let mut n = node("n1", &store, &docs, &f);
+        until(&mut n.status, "running", is(Actual::Running)).await;
+        docs.request(Action::Restart, asked("r1")).await.unwrap();
+        eventually("a second worker", || f.builds() == 2).await;
+        until(&mut n.status, "running again", is(Actual::Running)).await;
+        assert_eq!(n.status.borrow().owner_epoch, Some(1));
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(f.builds(), 2, "one request, one restart");
+        f.source.commit(FakeTxn::new().insert(&t("a"), row(1)));
+        eventually("the row lands", || f.ids("a") == [1]).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_asked_runs_a_pipeline_in_error_again() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a"]);
+        f.source.fail(
+            Method::Preflight,
+            SourceError::Permanent("no privilege".into()),
+        );
+        let mut n = node("n1", &store, &docs, &f);
+        until(&mut n.status, "error", |s| {
+            matches!(&s.actual, Some(Actual::Error { .. }))
+        })
+        .await;
+        let error = status_doc_until(&docs, "error", |d| d.actual == ActualState::Error).await;
+        assert!(
+            error.doc.error.as_deref().unwrap().contains("no privilege"),
+            "{:?}",
+            error.doc
+        );
+        docs.request(Action::Restart, asked("r1")).await.unwrap();
+        until(&mut n.status, "running", is(Actual::Running)).await;
+        assert_eq!(f.builds(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_flush_asked_flushes_at_once() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a"]);
+        let mut p = pipeline();
+        p.sink.flush.seconds = Some(3_600);
+        let deps = deps("n1", &store, &f);
+        let (controller, mut status) = PipelineController::new(p, docs.clone(), &deps);
+        let (_target, rx) = watch::channel(Target::Own);
+        let _task = tokio::spawn(controller.run(rx));
+        until(&mut status, "running", is(Actual::Running)).await;
+        f.source.commit(FakeTxn::new().insert(&t("a"), row(1)));
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert!(f.ids("a").is_empty(), "not flushed before the hour");
+        docs.request(Action::Flush, asked("f1")).await.unwrap();
+        eventually("the row lands", || f.ids("a") == [1]).await;
+        assert_eq!(f.builds(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn requests_from_before_the_term_are_not_taken() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        docs.request(Action::Restart, asked("r1")).await.unwrap();
+        let f = TestFactory::new(&["a"]);
+        let mut n = node("n1", &store, &docs, &f);
+        until(&mut n.status, "running", is(Actual::Running)).await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(f.builds(), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1692,6 +1949,47 @@ mod tests {
         assert_eq!(n.status.borrow().owner_epoch, Some(1), "the same lease");
         f.source.commit(FakeTxn::new().insert(&t("a"), row(1)));
         eventually("the row lands", || f.ids("a") == [1]).await;
+    }
+
+    /// A reload that moves the state documents: the restart writes its status at the new
+    /// location even when it equals the last one written, and a request waiting there is not
+    /// taken as new.
+    #[tokio::test(start_paused = true)]
+    async fn a_reload_restart_at_new_state_writes_its_status_there() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a"]);
+        // Faults for the first run and the reload's run, both failing the same way.
+        for _ in 0..3 {
+            f.source.fail(
+                Method::Preflight,
+                SourceError::Permanent("no privilege".into()),
+            );
+        }
+        let mut n = node("n1", &store, &docs, &f);
+        until(&mut n.status, "error", |s| {
+            matches!(&s.actual, Some(Actual::Error { .. }))
+        })
+        .await;
+        status_doc_until(&docs, "error", |d| d.actual == ActualState::Error).await;
+        let moved = pipeline_docs();
+        moved.open("p", "delta").await.unwrap();
+        moved.request(Action::Restart, asked("r9")).await.unwrap();
+        n.updates
+            .send(Update::Restart(Box::new(pipeline()), moved.clone()))
+            .unwrap();
+        eventually("a second worker", || f.builds() == 2).await;
+        let there = status_doc_until(&moved, "error at the new location", |d| {
+            d.actual == ActualState::Error
+        })
+        .await;
+        assert_eq!(there.doc.owner_epoch, 1, "the same lease");
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(
+            f.builds(),
+            2,
+            "only the reload's restart; the waiting request is not taken"
+        );
     }
 
     /// A restart runs a pipeline in `ERROR` again: the reloaded config may be the fix.

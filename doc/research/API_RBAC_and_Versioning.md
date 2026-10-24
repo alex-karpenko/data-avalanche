@@ -1,5 +1,5 @@
 ---
-updated: 2026-09-26
+updated: 2026-10-24
 domain: Auth
 tags: [rbac, api, authorization, roles, jwt, oauth2, versioning, management-api, cdc]
 resolves: [G-16, G-9.1]
@@ -53,6 +53,7 @@ version skew).
 | Pipeline flush | `POST /v1/pipelines/{id}/flush` | operator |
 | Leave cluster | `POST /v1/cluster/leave` | **admin** |
 | Shutdown | `POST /v1/admin/shutdown` | **admin** |
+| API description (added 2026-10-23, M9a) | `GET /v1/openapi.json` | viewer |
 | Liveness | `GET /health/live` | none (unversioned) |
 | Readiness | `GET /health/ready` | none (unversioned) |
 | Metrics | `GET /metrics` | none (unversioned, per System-Overview) |
@@ -60,7 +61,20 @@ version skew).
 Notes:
 
 - **`config/validate` is operator, not viewer** — it echoes the *resolved* config, which can contain
-  resolved secret material; it must not be readable by a status-only principal.
+  resolved secret material; it must not be readable by a status-only principal. (M9a's validate
+  returns the report and what a reload would change, never the resolved config; it stays operator.)
+  As built: validate of a posted body doesn't compare secret or file fingerprints
+  (`"secrets_compared": false`), so a body can't confirm a guess at a running secret by whether its
+  path is listed; validate of the node's own file compares them. A body still makes the node read
+  the files it names (`credentials_file`, TLS paths), so an operator learns whether a path the node
+  can read exists and parses, never its content. A posted body's pipeline `id` (and
+  `defaults.id`) is taken as written: one that holds a `${…}` is refused with V-055 before any rule
+  runs, so no expanded id is echoed or used to derive anything (DA-API-19). Validate of the node's
+  file expands it as a reload does. Other `${VAR}` leaves of a posted body are still checked, so
+  their verdicts answer yes or no about a variable (set or not, equal to another value or not),
+  one request at a time; no value is echoed (DA-API-20). Every validate is logged at info with
+  its caller, its source (body or node file), the body's size and the answer's status, so a run
+  of guesses shows in the log; M12 rate-limits validate.
 - **Config reload = operator** (routine ops). Cluster-destructive ops (`leave`, `shutdown`) = admin.
 - **Pipeline `stop`** releases DB connections/leases but is recoverable, so it stays operator; only
   node-level teardown is admin.
@@ -82,6 +96,32 @@ Notes:
 
 A missing/invalid token on an authenticated endpoint → **401**; a valid token lacking the required role
 → **403**. Unauthenticated probes (`/health/*`, `/metrics`) never challenge.
+
+As built in M9a (D-M9a.6, and the review fixes in the plan's deviations):
+
+- A 401 carries `WWW-Authenticate: Basic` or `Bearer` with `realm="data-avalanche"`. `basic`
+  compares fixed-length digests of the credentials, so the comparison doesn't depend on where they
+  differ or on their lengths.
+- A token must carry `exp` and `iss` (the configured issuer), and `aud` when an audience is
+  configured; `nbf` is checked when present. `exp` and `nbf` allow 60 s of clock skew. A token
+  signed with a shared-secret algorithm (HS*) is refused, since no secret is configured to check it.
+- `roles_claim` names the claim by its literal key first (an IdP's namespaced claim such as
+  `https://example.com/roles`), then as a dotted path (`realm_access.roles`).
+- The issuer's keys are cached. A token whose `kid` the cached set holds verifies at once, even
+  while a fetch runs. The set is fetched again once it is ten minutes old, and for an unknown `kid`
+  at most every 30 s; one fetch runs at a time, outside the cache's lock, and a failed fetch keeps
+  the old keys. When no set was ever fetched, or a `kid` is missing and the last fetch failed, the
+  answer is **503**, not 401: the token may be fine. The 503 names no URL or error (those are
+  logged).
+- A reload that leaves the key source alone (the issuer, `jwks_url` or `discovery_url`) keeps the
+  cached keys; a change of `role_mapping`, `roles_claim` or `audience` doesn't refetch them.
+- Auth settings that don't hold together (a mode without its settings) fail closed: every request
+  is refused with 503, and the error is logged. V-049…V-051 refuse such a file at load.
+- `oauth2` finds its JWKS through `discovery_url` when it has no `jwks_url`, and checks that the
+  discovery document's `issuer` is the configured one; tokens are verified locally (no
+  introspection).
+- A node that left the cluster keeps the auth of its last generation until it is stopped
+  (DA-API-14).
 
 ---
 

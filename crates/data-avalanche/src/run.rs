@@ -1,14 +1,16 @@
 //! `data-avalanche run`.
 
-use std::future::IntoFuture;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
+use data_avalanche_api::{Api, Auth, Control, Node, ServeError, Stop, bind, router};
 use data_avalanche_cluster::{
     ClusterReconciler, ConfigCoordinator, ControllerDeps, ControllerSettings, CoordinatorDeps,
-    Gossip, GossipKey, GossipSettings, LeaseTiming, NodeIdentity, NodeMeta, Phase,
+    DocsFn, Gossip, GossipKey, GossipSettings, LeaseTiming, NodeIdentity, NodeMeta, Phase,
     ReconcilerSettings, Seeds, Udp, advertise, discover, interfaces, join as join_gossip, leave,
     node_identity,
 };
@@ -19,9 +21,8 @@ use data_avalanche_pipeline::{Backoff, Tuning};
 use data_avalanche_state::{ConfigGenerations, Leases};
 use data_avalanche_telemetry::Metrics;
 use thiserror::Error;
-use tokio::sync::{Semaphore, oneshot};
+use tokio::sync::{Semaphore, oneshot, watch};
 
-use crate::http::{self, ConfigApi, Http};
 use crate::startup::{Buckets, join};
 use crate::{Factory, RunArgs, logging};
 
@@ -65,14 +66,6 @@ pub(crate) fn render(report: &Report) -> String {
     report.iter().map(line).collect::<Vec<_>>().join("\n")
 }
 
-/// What this build doesn't serve yet, refused before anything starts.
-pub(crate) fn unsupported(config: &ResolvedConfig) -> Option<String> {
-    config.globals.api.tls.as_ref().map(|_| {
-        "globals.api.tls: the API listener serves TLS from M9; this build serves plain HTTP only"
-            .to_owned()
-    })
-}
-
 /// The controllers' timings from `globals.cluster`.
 pub(crate) fn settings(config: &ResolvedConfig) -> ControllerSettings {
     let c = &config.globals.cluster;
@@ -95,7 +88,8 @@ pub(crate) fn leave_within(config: &ResolvedConfig) -> Duration {
     c.drain_timeout.saturating_mul(rounds) + 2 * c.lease_renewal_interval
 }
 
-/// Runs every pipeline until SIGTERM or SIGINT.
+/// Runs every pipeline until SIGTERM, SIGINT or a shutdown through the API. A leave through the
+/// API leaves the cluster first and keeps the process up (D-M9a.8).
 ///
 /// # Errors
 /// [`Fatal`]: the config is refused, or `globals.state` can't be joined.
@@ -114,38 +108,37 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     for w in &first.warnings {
         tracing::warn!("config: {}", line(w));
     }
-    if let Some(why) = unsupported(&first.config) {
-        return Err(Fatal::Config(why));
-    }
     // The listener answers from here: live at once, ready once every controller runs.
     let metrics = Metrics::new();
     let ready = Arc::new(AtomicBool::new(false));
-    let config_api = Arc::new(OnceLock::new());
-    let listener = http::bind(&first.config.globals.api.address).await?;
+    let node = Arc::new(OnceLock::new());
+    let api = &first.config.globals.api;
+    let auth = Arc::new(Auth::new(api));
+    let bound = bind(&api.address, api.tls.as_ref())
+        .await
+        .map_err(|e| match e {
+            ServeError::Tls(_) => Fatal::Config(e.to_string()),
+            ServeError::Bind { .. } => Fatal::Startup(e.to_string()),
+        })?;
     let (stop_http, http_stopped) = oneshot::channel::<()>();
-    let server = tokio::spawn(
-        axum::serve(
-            listener,
-            http::router(Http {
-                metrics: metrics.clone(),
-                ready: Arc::clone(&ready),
-                config: Arc::clone(&config_api),
-            }),
-        )
-        .with_graceful_shutdown(async {
+    let server = tokio::spawn(bound.serve(
+        router(Api {
+            metrics: metrics.clone(),
+            ready: Arc::clone(&ready),
+            node: Arc::clone(&node),
+            auth: Arc::clone(&auth),
+        }),
+        async {
             let _ = http_stopped.await;
-        })
-        .into_future(),
-    );
+        },
+    ));
     let holder = node_identity(&first.config.globals.cluster, started)
         .map_err(|e| Fatal::Config(e.to_string()))?;
     let buckets = Arc::new(Buckets::new(&first.config.globals));
     let joined = join(&buckets, &holder.node_id, &text, &first.config).await?;
     let config = joined.config;
-    if let Some(why) = unsupported(&config) {
-        return Err(Fatal::Config(why));
-    }
     logger.apply(&config.globals.log);
+    auth.set(&config.globals.api);
     tracing::info!(
         node = %holder.node_id,
         incarnation = holder.incarnation,
@@ -212,7 +205,8 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     );
     // Each newer config generation, this node's reloads included (Clustering §9).
     let docs = Arc::clone(&buckets);
-    let log = Arc::clone(&logger);
+    let docs: Arc<DocsFn> = Arc::new(move |p| docs.pipeline_docs(p).map_err(|e| e.to_string()));
+    let (log, reloaded_auth) = (Arc::clone(&logger), Arc::clone(&auth));
     let coordinator = Arc::new(ConfigCoordinator::start(
         config.clone(),
         joined.generation,
@@ -221,34 +215,83 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
             env: Arc::new(ProcessEnv),
             key: FingerprintKey::from_bytes(joined.fingerprint_key),
             node_id: deps.holder.node_id.clone(),
-            docs: Arc::new(move |p| docs.pipeline_docs(p).map_err(|e| e.to_string())),
+            docs: Arc::clone(&docs),
             factory: Arc::clone(&deps.factory),
             reloader: reconciler.reloader(),
             advertiser: gossip.advertiser(),
             metrics: metrics.clone(),
-            globals: Arc::new(move |g| log.apply(&g.log)),
+            globals: Arc::new(move |g| {
+                log.apply(&g.log);
+                reloaded_auth.set(&g.api);
+            }),
         },
         gossip.members(),
         c.lease_renewal_interval,
     ));
-    let _ = config_api.set(ConfigApi {
+    let (control, asked) = Control::new();
+    let _ = node.set(Node {
         coordinator: Arc::clone(&coordinator),
         members: gossip.members(),
         file: args.config.clone(),
+        docs,
+        leases: deps.leases.clone(),
+        control,
     });
     ready.store(true, Ordering::SeqCst);
-    shutdown_signal().await;
-    tracing::info!("shutting down: handing off every pipeline and releasing its lease");
-    ready.store(false, Ordering::SeqCst);
-    discovery.abort();
-    // No generation is adopted during the leave; it hands off what the last one configures.
-    coordinator.stop().await;
-    let config = coordinator.config().await;
-    leave(gossip, reconciler, leave_within(&config)).await;
+    let mut cluster = Some((gossip, reconciler, discovery));
+    let mut stops = Stops::new(Box::pin(shutdown_signal()), asked);
+    loop {
+        let stop = stops.next().await;
+        if stop == Stop::Run {
+            continue;
+        }
+        if let Some((gossip, reconciler, discovery)) = cluster.take() {
+            tracing::info!(
+                "leaving the cluster: handing off every pipeline and releasing its lease"
+            );
+            ready.store(false, Ordering::SeqCst);
+            discovery.abort();
+            // No generation is adopted during the leave; it hands off what the last one
+            // configures.
+            coordinator.stop().await;
+            let config = coordinator.config().await;
+            leave(gossip, reconciler, leave_within(&config)).await;
+        }
+        if stop == Stop::Shutdown {
+            break;
+        }
+        tracing::info!("left the cluster; the process stays up until it is stopped");
+    }
+    tracing::info!("shutting down");
     let _ = stop_http.send(());
     let _ = server.await;
     tracing::info!("stopped");
     Ok(())
+}
+
+/// What stops the process: a signal, or what the API asked. The signal future is built once and
+/// kept across the loop's passes, so its listeners live through a leave.
+struct Stops {
+    signal: Pin<Box<dyn Future<Output = ()> + Send>>,
+    asked: watch::Receiver<Stop>,
+}
+
+impl Stops {
+    fn new(signal: Pin<Box<dyn Future<Output = ()> + Send>>, asked: watch::Receiver<Stop>) -> Self {
+        Self { signal, asked }
+    }
+
+    async fn next(&mut self) -> Stop {
+        // Biased: the signal is polled first, so its listeners are registered by the first call.
+        tokio::select! {
+            biased;
+            () = self.signal.as_mut() => Stop::Shutdown,
+            changed = self.asked.changed() => match changed {
+                Ok(()) => *self.asked.borrow_and_update(),
+                Err(_) => Stop::Shutdown,
+            },
+        }
+    }
 }
 
 async fn shutdown_signal() {
@@ -278,9 +321,28 @@ async fn shutdown_signal() {
 pub(crate) mod tests {
     use std::collections::BTreeMap;
 
-    use data_avalanche_config::{Origin, Pem, Secret, TlsIdentity};
-
     use super::*;
+
+    /// A signal that arrives while a leave runs (nothing polls the stops) still stops the process.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_signal_during_a_leave_still_stops_the_process() {
+        let (control, asked) = Control::new();
+        let mut stops = Stops::new(Box::pin(shutdown_signal()), asked);
+        assert!(control.ask(Stop::Leave));
+        assert_eq!(stops.next().await, Stop::Leave);
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", &std::process::id().to_string()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        // The runtime's driver delivers the signal while nothing listens for it, as during a real leave.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), stops.next()).await,
+            Ok(Stop::Shutdown)
+        );
+    }
 
     pub(crate) const CONFIG: &str = r#"
 config_version: 1
@@ -327,22 +389,6 @@ pipelines:
         let text = render(&r);
         assert!(text.starts_with("error "), "{text}");
         assert!(text.contains("bogus"), "{text}");
-    }
-
-    #[test]
-    fn api_tls_is_refused_until_m9() {
-        let mut c = config();
-        assert_eq!(unsupported(&c), None);
-        let key = FingerprintKey::from_bytes([1; 32]);
-        let pem = || Pem {
-            origin: Origin::Inline,
-            text: Secret::new("-----BEGIN-----", &key),
-        };
-        c.globals.api.tls = Some(TlsIdentity {
-            cert: pem(),
-            key: pem(),
-        });
-        assert!(unsupported(&c).unwrap().contains("M9"));
     }
 
     #[test]
