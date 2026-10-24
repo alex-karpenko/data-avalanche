@@ -72,7 +72,9 @@ Notes:
   runs, so no expanded id is echoed or used to derive anything (DA-API-19). Validate of the node's
   file expands it as a reload does. Other `${VAR}` leaves of a posted body are still checked, so
   their verdicts answer yes or no about a variable (set or not, equal to another value or not),
-  one request at a time; no value is echoed (DA-API-20).
+  one request at a time; no value is echoed (DA-API-20). Every validate is logged at info with
+  its caller, its source (body or node file), the body's size and the answer's status, so a run
+  of guesses shows in the log; M12 rate-limits validate.
 - **Config reload = operator** (routine ops). Cluster-destructive ops (`leave`, `shutdown`) = admin.
 - **Pipeline `stop`** releases DB connections/leases but is recoverable, so it stays operator; only
   node-level teardown is admin.
