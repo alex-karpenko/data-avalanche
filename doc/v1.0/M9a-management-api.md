@@ -8687,13 +8687,21 @@ PR". The scoped re-review found every finding addressed and no new Critical or I
 
 | Commit | Fix |
 |---|---|
-| 1d71c9a | **Validate of a posted body is no longer an oracle for a running secret.** A `Secret` serializes as its keyed fingerprint and the diff lists every path whose value differs, so a body repeating a guess at a secret's path told by its absence from `changes` that the guess was right. With a body, two fingerprints (`blake3:` strings, secrets and file fingerprints alike) now compare equal: `diff_with(…, Fingerprints::Ignored)` in the config crate, `ConfigCoordinator::check(text, fingerprints)`, and `"secrets_compared": false` in the answer. Validate of the node's own file compares them as before. Test `a_check_of_a_body_does_not_tell_whether_its_secret_is_the_running_one`, which also replaces a non-leak assertion that couldn't fail. |
+| 1d71c9a | **Validate of a posted body is no longer an oracle for a running secret.** A `Secret` serializes as its keyed fingerprint and the diff lists every path whose value differs, so a body repeating a guess at a secret's path told by its absence from `changes` that the guess was right. With a body, two fingerprints (`blake3:` strings, secrets and file fingerprints alike) now compare equal: `diff_with(…, Fingerprints::Ignored)` in the config crate, `ConfigCoordinator::check_posted` (as named after 620fc41; `check` always compares), and `"secrets_compared": false` in the answer. Validate of the node's own file compares them as before. Test `a_check_of_a_body_does_not_tell_whether_its_secret_is_the_running_one`, which also replaces a non-leak assertion that couldn't fail. |
 | d56b7cc | **A JWKS fetch no longer holds the key cache.** The fetch held the cache's lock, so any caller with a made-up `kid` (no credentials needed) made a hanging IdP stall every bearer verification for up to `FETCH_TIMEOUT` once per `REFETCH_AFTER`. Now one fetch runs at a time in its own task, outside the lock. A caller whose key is cached verifies at once, even from an old set while its refetch runs; a caller whose key isn't cached waits for that one fetch. A `kid` missing after a failed (or throttled) refetch answers 503, not 401. Tests: `old_keys_verify_at_once_while_the_issuer_hangs`, `a_made_up_key_id_does_not_hold_up_a_good_token`, `a_key_missing_after_a_failed_refetch_is_unavailable`, `after_a_failed_refetch_an_unknown_key_id_waits_the_refetch_interval`, `without_an_audience_a_token_without_aud_verifies`; the test issuer gained a hang mode. |
 | 768fc1b | **A reload keeps the cached keys unless their source changes** (the issuer, `jwks_url` or `discovery_url`). A `role_mapping`, `roles_claim` or `audience` change used to start with no keys, so a reload during an IdP outage made every bearer caller a 503. Test `a_reload_of_the_role_mapping_keeps_the_keys`. |
 | 5ac4975 | **`roles_claim` names the claim by its literal key first**, then as a dotted path: Auth0's namespaced claims (`https://example.com/roles`) were split at their dots and never found. Test `a_namespaced_roles_claim_is_read_by_its_name`. |
 | dafe228 | Auth settings that don't hold together fail closed (every request 503, logged), where they used to fall open to `none`. `nbf` is checked (60 s leeway). `basic` compares BLAKE3 digests in constant time. The key-fetch 503 names no URL or error (logged at warn). The gate test requires the handler's own 503 body. |
 | 67d87c5 | `save_status` keeps a stored status of a higher `owner_epoch`, so a stalled former owner can't overwrite its successor's for the rest of the term. The 202s of leave and shutdown name the node. `check` loads the body outside the coordinator's lock. "Restarted on request" is logged only when a worker was discarded. A stopped TLS listener lets its port go without waiting for a connection, and a cert PEM with no certificate is refused at bind. The paused-flush test asserts that no request was written; one helper reads the node's file for validate and reload. |
 | 9a4e5f0 | 67d87c5's guard made the holder's-own-earlier-term case of Task 5's status test a refused write, so it passed for the wrong reason. The case is its own test now, `a_holder_s_status_of_an_earlier_term_is_not_this_term_s`, which fails with the epoch check removed from `actual()`. |
+
+**After the PR was opened** (2026-10-24, on Oleksii's request): the final re-review's DA-API-19,
+found outside the fix diff, fixed in the same PR.
+
+| Commit | Fix |
+|---|---|
+| 8d9be8d | **Validate of a posted body takes a pipeline's `id` as written.** It used to expand `${VAR}` in a posted body's `id` and echo the result in `changes` (`Added { id }`, `pipelines.<id>.…`), and derive a MySQL `server_id` from it, so an operator could read any node environment variable that fits V-055's pattern. Now `load_posted_str` refuses a templated pipeline `id` or `defaults.id` with V-055 at its path, showing only the written text, before any rule runs. `ConfigCoordinator::check_posted` uses it; the node-file validate and the reload keep `load_str`. Tests `a_posted_body_s_templated_id_is_refused_without_its_value` (fails with the posted path wired to `load_str`, showing the value) and the config crate's posted-id tests. The review tried aliases, merge keys, `defaults`, partial templates, quoting, tags, several documents and a sequence of pipelines: none gets through. |
+| 620fc41 | The MySQL posted-id test sets up the V-120 clash it guards against (it fails by showing the derived number with the refusal removed), the `$${` escape is tested, and `check` no longer takes `Fingerprints`: only `check_posted` ignores them. |
 
 **Reworded, not built:** the Exit's "the OpenAPI document is validated" (and roadmap §4 M9's).
 Task 7's test reads the document back through utoipa and checks every route's role, security
@@ -8708,9 +8716,9 @@ Left for later:
   - DA-API-16: the JWKS fetch accepts `http`, follows redirects and reads an unbounded body;
   - DA-API-17: no connection limit on the TLS listener;
   - DA-API-18: OAS 3.1 schema validation;
-  - DA-API-19 (🟡, found by the final re-review outside the fix diff): validate of a posted body
-    echoes an added pipeline's `${VAR}`-resolved `id`, so an operator can read a node environment
-    variable that fits V-055's pattern.
+  - DA-API-20: validate's verdicts on a posted body's other `${VAR}` leaves (V-063, the
+    uniqueness rules, pattern and range checks, the diff's paths) answer yes or no about a node
+    variable, one request at a time; nothing is echoed. (DA-API-19, the echoed id, is fixed above.)
 - From the re-review, in the fix wave's code:
   - a panic inside the spawned JWKS fetch would leave it marked in flight, so no fetch would run
     again until a restart;
@@ -8733,7 +8741,7 @@ Left for later:
 **Counts.** The workspace runs more tests than the plan says from Task 2 on (Task 2's fix +1,
 Task 4's +2, Task 6's +1): 1213, 1214, 1227, 1231, 1237, 1240 and 1240 after Tasks 2–8, against
 the plan's 1212, 1213, 1224, 1228, 1233, 1236 and 1236; after the whole-branch review's fixes,
-1254.
+1254; after DA-API-19's fix, 1257.
 
 **Measured at the end of execution.** At 9a4e5f0 (the whole-branch review's fixes), the full E2E
 suite passed 42/42 on PostgreSQL 18 (530.89 s) and on MySQL 8.4 (477.34 s), with no stray
@@ -8741,3 +8749,5 @@ process. The workspace runs 1254 tests, and the gates are clean (`cargo fmt --al
 clippy runs). The fix wave's run of the four API scenarios on PostgreSQL 18 passed 4/4. At e76d55a
 (Task 8), the four API scenarios passed on PostgreSQL 18 (99.67 s) and MySQL 8.4 (98.78 s).
 `mysql-84-nogtid` and `mariadb-118` run in the PR's CI.
+At 620fc41 (DA-API-19's fix), the workspace runs 1257 tests and the gates are clean; the change is
+confined to validate of a posted body, which the E2E suite doesn't drive.
