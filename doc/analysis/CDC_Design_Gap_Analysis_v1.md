@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-24
+updated: 2026-10-27
 domain: Architecture
 tags: [gap-analysis, design, re-derivation, spec-readiness, blockers, open-decisions]
 resolves: []
@@ -216,6 +216,35 @@ quoting, tags, several documents) and found none; the yes-or-no verdicts it note
 | DA-API-19 ✅ 2026-10-24 (§41) | Validate of a posted body echoes an added pipeline's resolved `id` and `name`: a body with `id: ${VAR}` shows the value of any node environment variable that fits V-055's pattern (`^[a-z0-9][a-z0-9_-]{0,62}$`, lowercase hex tokens included), and `db: ${VAR}` tells whether a variable equals the running value. Reload reads only the node's file, so only validate is open to it | 🟡 | M9a's final re-review (outside the fix diff) | Resolve a posted body's `${…}` in identity and other echoed fields as written (no expansion), or refuse `${…}` outside credential fields in a posted body; until then API_RBAC §2's note |
 | DA-API-20 | Validate of a posted body still checks its other `${VAR}` leaves, so a verdict answers yes or no about a node variable: V-063 whether it is set; V-058, V-059 and V-120 whether it equals another pipeline's slot, publication or `server_id`; a pattern or range check its shape; the diff's field paths whether it equals the running value. One bit per request, online guessing only; no value is echoed. Since 2144392 every validate is logged with its caller, its source, the body's size and the answer's status | 🟢 | DA-API-19's review (2026-10-24) | M12: a rate limit on validate (Oleksii's choice, 2026-10-24; roadmap §4 M12) |
 
+## 42. M9b snapshot jobs — the plan (2026-10-27)
+
+Oleksii answered Q-M9b-1…4 (2026-10-27; three "Recommended", Q-M9b-4 not) and approved the plan
+and its spec patches the same day. A job is asked as a restart under its id, and the new worker's
+Phase 0 takes its tables. A job upserts, with no truncate. A table outside the config is copied,
+not streamed. A job is asked only of a running pipeline whose lease a node holds, `ERROR`
+included. M9b's plan (`doc/v1.0/M9b-snapshot-jobs.md`) was built task by task in a scratch
+workspace and replayed from its code blocks to an identical tree. The spec patches, applied the
+same day: System-Overview's request-snapshot row, and Data-Flow's On-Demand Snapshot Flow and
+the job document's fields.
+
+| ID | Change | Evidence |
+|---|---|---|
+| DA-SCHEMA-10 | 🆕 → 🔄: fixed in the plan (Task 2), ✅ when M9b merges | M9b D-M9b.10; `tests/mysql/schema.rs` `a_baseline_takes_the_whole_table_from_the_catalog`; the E2E halt scenario on `mysql-84`, `mysql-84-nogtid`, `mariadb-118` |
+
+Found while planning, and in the plan: MySQL's channel C refused the column hint every baseline
+passes, so a MySQL table whose columns changed while it couldn't be replayed halted `UNSAFE_DDL`
+instead of being baselined (DA-SCHEMA-10, since M7b); and the kill scenario's first draft would
+have passed against a job already ended.
+
+### 42.1 New gaps
+
+| ID | Gap | Severity | Surfaced by | Next |
+|---|---|---|---|---|
+| DA-SCHEMA-10 | MySQL's channel C refused a `SchemaHint::Columns` (`a column hint on a MySQL source`), and Phase 0's baseline passes one: a fresh start (a purged binlog, an adopted orphan) over a MySQL table whose columns changed halted it `UNSAFE_DDL` instead of baselining it (Schema_Change §8.2), and so would every job that clears a halt | 🟡 | M9b's planning E2E (the halt scenario on every MySQL target) | Fixed in M9b Task 2: a column hint is the whole table, no rename proven (`Scope::Table`) |
+| DA-SNAP-15 | A job upserts (Q-M9b-2): a row deleted at the source while its table was halted or not streamed stays in the lake (a ghost row), and a job doesn't remove it | 🟡 | Q-M9b-2 | M11's docs: drop or move the Delta table before the job; a truncate option (a metadata-only delete before the first chunk, reconciled with the stream) later |
+| DA-SNAP-16 | Job documents accumulate: nothing removes an ended one, and the list route and the ask's `409` check read every job of the pipeline | 🟢 | M9b's planning | A retention (by count or age), or an index of the unfinished jobs |
+| DA-SNAP-17 | A job table that halts while its snapshot runs fails in the job only once the halt reaches `halts.json`, with the session's next flush | 🟢 | M9b's planning (Task 5's test commits to another table to flush) | Write a halt of a job table at once, or M11's docs |
+
 ---
 
 ### Counts (by status)
@@ -227,13 +256,13 @@ quoting, tags, several documents) and found none; the yes-or-no verdicts it note
 > M7a's plan (§32), 2026-10-16 for M7a's exit (§33), 2026-10-17 for M7b's plan (§34),
 > 2026-10-20 for M7b's exit (§35), 2026-10-21 for M8a's plan (§36), 2026-10-22 for M8a's exit (§37),
 > 2026-10-22 for M8b's plan (§38), 2026-10-23 for M8b's exit (§39), 2026-10-23 for M9a's plan
-> (§40), and 2026-10-23 for M9a's exit (§41).
+> (§40), 2026-10-23 for M9a's exit (§41), and 2026-10-27 for M9b's plan (§42).
 
 | Status | Count (v1 scope) | Notes |
 |---|---|---|
 | ✅ Resolved | the large majority | Design closed by a research/spec doc or a probe. |
-| 🔄 Partial | 3 | DA-SNAP-7, DA-SRC-9 (neither blocks the plan); DA-OPS-8 2026-10-22 (§38: the startup warning; the operator docs in M11); DA-SNAP-10 ✅ 2026-10-16 (M7a merged, §33). DA-MS-3 is a decided caveat. DA-X-8 ✅ 2026-09-26; DA-SRC-16 and DA-X-12 ✅ 2026-10-13 (§30). |
-| 🟥 Open (v1) | **27** | DA-API-13…18 🆕 2026-10-23 and DA-API-20 🆕 2026-10-24 (§41.1); DA-API-19 🆕 2026-10-23, ✅ 2026-10-24 (§41); DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2); DA-SRC-20 🆕 2026-10-13 (§30.1); DA-SRC-21 🆕 2026-10-14 (§31.2); DA-SRC-22, DA-SNAP-14 and DA-X-13 🆕 2026-10-14 (§32.1); DA-SRC-24…26 🆕 2026-10-16 (§33.1); DA-OBS-6 🆕 2026-10-17 (§34.1); DA-OPS-9 🆕 2026-10-22 (§38.1); DA-OPS-10 🆕 2026-10-23 (§39.1). DA-OPS-8 🔄 2026-10-22 (§38). DA-API-11 and DA-API-12 ✅ 2026-10-23 (§40). DA-CLUS-14, DA-OPS-7 and DA-SRC-28 ✅ 2026-10-22 (§37). DA-SRC-27 and DA-X-14 ✅ 2026-10-20 (§35). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
+| 🔄 Partial | 4 | DA-SCHEMA-10 2026-10-27 (§42: fixed in M9b's plan, ✅ when it merges); DA-SNAP-7, DA-SRC-9 (neither blocks the plan); DA-OPS-8 2026-10-22 (§38: the startup warning; the operator docs in M11); DA-SNAP-10 ✅ 2026-10-16 (M7a merged, §33). DA-MS-3 is a decided caveat. DA-X-8 ✅ 2026-09-26; DA-SRC-16 and DA-X-12 ✅ 2026-10-13 (§30). |
+| 🟥 Open (v1) | **30** | DA-SNAP-15…17 🆕 2026-10-27 (§42.1); DA-API-13…18 🆕 2026-10-23 and DA-API-20 🆕 2026-10-24 (§41.1); DA-API-19 🆕 2026-10-23, ✅ 2026-10-24 (§41); DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2); DA-SRC-20 🆕 2026-10-13 (§30.1); DA-SRC-21 🆕 2026-10-14 (§31.2); DA-SRC-22, DA-SNAP-14 and DA-X-13 🆕 2026-10-14 (§32.1); DA-SRC-24…26 🆕 2026-10-16 (§33.1); DA-OBS-6 🆕 2026-10-17 (§34.1); DA-OPS-9 🆕 2026-10-22 (§38.1); DA-OPS-10 🆕 2026-10-23 (§39.1). DA-OPS-8 🔄 2026-10-22 (§38). DA-API-11 and DA-API-12 ✅ 2026-10-23 (§40). DA-CLUS-14, DA-OPS-7 and DA-SRC-28 ✅ 2026-10-22 (§37). DA-SRC-27 and DA-X-14 ✅ 2026-10-20 (§35). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
 | 🧪 Verify (v1) | **0** | DA-SRC-10/11 proven 2026-09-26 (§21). |
 | ⏭ v2 | 13 | Iceberg-sink items (§26.2). |
 | 🟢 Spec-merge debt | **0** | All applied 2026-09-26 (§26.6): §19.3 S-1…S-6, the DA-X-8 config residual, the D-V1 patches and the Data-Flow Phase 2a probe details. |
@@ -343,6 +372,7 @@ resume), idempotent replay, and rename resolution. The MySQL classifier is separ
 | DA-SCHEMA-7 | ENUM/SET representation (string vs ordinal) | 🟢 | ✅ | `ENUM→string`, `SET→list<string>`; append-only value adds Ignorable, reorder/remove Unsafe. | DT-R5 |
 | DA-SCHEMA-8 | iceberg-rust drop/rename/type-promotion support | 🟡 | ⏭ v2 | §7.1 implementation note — only `add_column` is mature; **verify** drop/rename/promotion against the pinned crate, route unsupported ops to halt. See §21. **2026-09-26 tidy:** Iceberg-sink only — deferred with the Iceberg sink to v2. | — |
 | DA-SCHEMA-9 | Idempotent DDL replay + checkpoint-after-evolve ordering | 🟡 | ✅ | §8.3 — re-read live Iceberg schema, skip if already applied; advance offset only after schema commit. | — |
+| DA-SCHEMA-10 | 🆕 MySQL's baseline halted a table whose columns changed | 🟡 | 🔄 | §42.1. MySQL's channel C refused the column hint Phase 0's baseline passes, so a fresh start (or a job clearing a halt) halted the table `UNSAFE_DDL` instead of baselining it (§8.2). Fixed in M9b Task 2 (a column hint is the whole table, no rename proven); ✅ when M9b merges. | — |
 
 ---
 
@@ -398,6 +428,9 @@ read-point hazard. This is a *change* to `Data-Flow.md` Phase 1, so it carries s
 | DA-SNAP-12 | 🆕 `parallelism > 1` reads chunks one after another on PostgreSQL | 🟢 | 🟥 | §28.2. Chunk reads share the one catalog connection, so they pipeline rather than run in parallel; each read's client-side bound starts at spawn, so a read queued behind slow chunks can time out and the abandoned connection fails its neighbours. Fix: a small read pool or a connection per concurrent read. | — |
 | DA-SNAP-14 | 🆕 An `ENUM` key whose members are reordered during a snapshot | 🟢 | 🟥 | §32.1. An `ENUM` key sorts by member index, and a chunk resumes after its cursor's label at that label's index under the members read for the chunk. A reorder mid-snapshot changes the order, so the next chunk can skip or repeat rows. The stream halts the table at the reorder (§7.2), but a chunk read between the DDL and the signal doesn't notice: the read plan compares value types, text for an `ENUM` either way. | — |
 | DA-SNAP-13 | 🆕 A wiped state with an existing sink table baselines nothing | 🟢 | 🟥 | §28.2. With no cached schema, Phase 0 doesn't baseline (§8.2) against the sink table's schema; a shape mismatch surfaces later as `SINK_REJECTED` (visible, not silent). Only the adopted-orphan case with a cache is covered. | — |
+| DA-SNAP-15 | 🆕 A job upserts: a row deleted at the source while its table wasn't streamed stays | 🟡 | 🟥 | §42.1. Q-M9b-2: no truncate. M11's docs (drop or move the Delta table first); a truncate option later. | — |
+| DA-SNAP-16 | 🆕 Job documents accumulate, and the list and the ask's check read every one | 🟢 | 🟥 | §42.1. A retention, or an index of the unfinished jobs. | — |
+| DA-SNAP-17 | 🆕 A job table's halt fails the job only with the session's next flush | 🟢 | 🟥 | §42.1. Write a job table's halt at once, or M11's docs. | — |
 
 ---
 
