@@ -138,7 +138,8 @@ pinned by a test in the task after the arrow.
 
 ## Decisions and rulings
 
-**Asked and answered** (2026-10-27; three "Recommended", Q-M9b-4 not):
+**Asked and answered** (2026-10-27; three "Recommended", Q-M9b-4 not). Oleksii approved the plan
+and its spec patches 2026-10-27.
 
 | # | Question | Answer |
 |---|---|---|
@@ -224,7 +225,7 @@ pinned by a test in the task after the arrow.
     - DA-SCHEMA-10 🆕 (MySQL's baseline halted a drifted table), fixed by Task 2; ✅ when M9b merges;
     - DA-SNAP-15 🆕 (a job upserts: ghost rows), DA-SNAP-16 🆕 (job documents accumulate),
       DA-SNAP-17 🆕 (a job's failure shows with the next flush).
-- **Proposed spec patches, for approval** (`spec:` commit, applied only once approved):
+- **Spec edits, approved and applied 2026-10-27** (`spec:` commit):
   - `System-Overview.md` §Management API endpoints, the request-snapshot row: "tables list, no
     globs" → "tables list (the per-table config keys), no globs; refused (`409`) unless the
     desired state is `RUNNING` and a node holds the lease, as a restart (`ERROR` included), or
