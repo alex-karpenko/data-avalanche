@@ -36,6 +36,36 @@ pub struct Selection {
 const VERSIONED: &str = "a MariaDB system-versioned table: its history rows and period columns \
     aren't replicated (DROP SYSTEM VERSIONING, or exclude it)";
 
+/// The tables an on-demand snapshot names, each by its exact name (Data-Flow §On-Demand
+/// Snapshot), in the order given. A table of another database than `db` (`source.db`) isn't the
+/// source's, a name the database lacks is skipped (`no such table`), and a system-versioned
+/// table halts.
+pub fn named(db: &str, tables: &[TableRef], listed: &[Listed]) -> Selection {
+    let mut out = Selection::default();
+    for t in tables {
+        if t.schema != db {
+            out.skipped
+                .push((t.clone(), format!("not in source.db {db}")));
+            continue;
+        }
+        let Some(l) = listed.iter().find(|l| &l.table == t) else {
+            out.skipped.push((t.clone(), "no such table".into()));
+            continue;
+        };
+        if l.versioned {
+            out.halted.push((
+                l.table.clone(),
+                HaltReason::NotReplicable {
+                    reason: VERSIONED.into(),
+                },
+            ));
+        } else {
+            out.tables.push((l.clone(), true));
+        }
+    }
+    out
+}
+
 /// The table's config key: its bare name (V-064).
 pub fn table_key(t: &TableRef) -> &str {
     &t.name
@@ -280,6 +310,33 @@ impl MySqlConnector {
         let listed = self.list_tables().await?;
         let live = self.live();
         let selection = select(&live.include, &live.exclude, &listed);
+        let mut out = self.described(selection).await?;
+        // Halted tables are in the set: their per-table config keys aren't stale (V-106).
+        let resolved: Vec<TableRef> = out
+            .tables
+            .iter()
+            .map(|s| s.table().clone())
+            .chain(out.halted.iter().map(|(t, _)| t.clone()))
+            .collect();
+        let report = check_table_set(&self.pipeline, &resolved);
+        if let Some(e) = report.errors.first() {
+            return Err(SourceError::Permanent(format!(
+                "{} {}: {}",
+                e.rule, e.path, e.message
+            )));
+        }
+        out.warnings.extend(
+            report
+                .warnings
+                .iter()
+                .map(|w| format!("{} {}: {}", w.rule, w.path, w.message)),
+        );
+        Ok(out)
+    }
+
+    /// The tables of `selection`, described: each with its schema, or halted, or skipped (a
+    /// table without a primary key that a glob found).
+    async fn described(&self, selection: Selection) -> Result<ResolvedTables, SourceError> {
         let names: Vec<String> = selection
             .tables
             .iter()
@@ -313,27 +370,18 @@ impl MySqlConnector {
                 Err(reason) => out.halted.push((listed.table, reason)),
             }
         }
-        // Halted tables are in the set: their per-table config keys aren't stale (V-106).
-        let resolved: Vec<TableRef> = out
-            .tables
-            .iter()
-            .map(|s| s.table().clone())
-            .chain(out.halted.iter().map(|(t, _)| t.clone()))
-            .collect();
-        let report = check_table_set(&self.pipeline, &resolved);
-        if let Some(e) = report.errors.first() {
-            return Err(SourceError::Permanent(format!(
-                "{} {}: {}",
-                e.rule, e.path, e.message
-            )));
-        }
-        out.warnings.extend(
-            report
-                .warnings
-                .iter()
-                .map(|w| format!("{} {}: {}", w.rule, w.path, w.message)),
-        );
         Ok(out)
+    }
+
+    /// An on-demand snapshot's tables, by exact name (Data-Flow §On-Demand Snapshot): the
+    /// config's patterns and its table-set checks don't apply.
+    pub async fn describe_tables(
+        &self,
+        tables: &[TableRef],
+    ) -> Result<ResolvedTables, SourceError> {
+        let listed = self.list_tables().await?;
+        self.described(named(&self.pipeline.source.db, tables, &listed))
+            .await
     }
 }
 
@@ -382,5 +430,34 @@ mod tests {
         let globbed = select(&strings(&["*"]), &[], &all);
         assert_eq!(globbed.skipped.len(), 1);
         assert_eq!(globbed.tables.len(), 3);
+    }
+
+    /// An on-demand snapshot names its tables exactly, whatever the config's patterns say; a
+    /// table of another database isn't the source's.
+    #[test]
+    fn named_tables_are_selected_by_their_exact_names() {
+        let all = [listed("orders", false), listed("history", true)];
+        let s = named(
+            "shop",
+            &[
+                TableRef::new("shop", "orders"),
+                TableRef::new("shop", "history"),
+                TableRef::new("shop", "gone"),
+                TableRef::new("other", "orders"),
+            ],
+            &all,
+        );
+        assert_eq!(s.tables, vec![(listed("orders", false), true)]);
+        assert!(matches!(s.halted[0].1, HaltReason::NotReplicable { .. }));
+        assert_eq!(
+            s.skipped,
+            vec![
+                (TableRef::new("shop", "gone"), "no such table".to_string()),
+                (
+                    TableRef::new("other", "orders"),
+                    "not in source.db shop".to_string()
+                ),
+            ]
+        );
     }
 }

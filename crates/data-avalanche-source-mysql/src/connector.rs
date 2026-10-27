@@ -367,6 +367,10 @@ impl SourceConnector for MySqlConnector {
         MySqlConnector::resolve_tables(self).await
     }
 
+    async fn describe_tables(&self, tables: &[TableRef]) -> Result<ResolvedTables, SourceError> {
+        MySqlConnector::describe_tables(self, tables).await
+    }
+
     async fn prepare(
         &self,
         checkpoint: Option<&Checkpoint>,

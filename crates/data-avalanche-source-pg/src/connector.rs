@@ -204,13 +204,41 @@ impl PgConnector {
     /// table checked (config §11.2). A table without an identifier is skipped with a warning when
     /// a glob found it, and halts when its name was listed; every other problem halts the table.
     pub async fn resolve_tables(&self) -> Result<ResolvedTables, SourceError> {
-        let client = self.conn.client().await?;
-        let relations = self
-            .conn
-            .command("list tables", catalog::relations(&client))
-            .await?;
+        let relations = self.relations().await?;
         let live = self.live();
         let selection = catalog::select(&live.include, &live.exclude, &relations);
+        let (mut out, unconstrained) = self.described(selection).await?;
+        // Halted tables are in the set: their per-table config keys aren't stale (V-106).
+        let resolved: Vec<TableRef> = out
+            .tables
+            .iter()
+            .map(|s| s.table().clone())
+            .chain(out.halted.iter().map(|(t, _)| t.clone()))
+            .collect();
+        let mut report = check_table_set(&self.pipeline, &resolved);
+        report.extend(check_unbounded_numeric(&self.pipeline, &unconstrained));
+        if let Some(e) = report.errors.first() {
+            return Err(SourceError::Permanent(format!(
+                "{} {}: {}",
+                e.rule, e.path, e.message
+            )));
+        }
+        out.warnings.extend(
+            report
+                .warnings
+                .iter()
+                .map(|w| format!("{} {}: {}", w.rule, w.path, w.message)),
+        );
+        Ok(out)
+    }
+
+    /// The tables of `selection`, described: each with its schema, or halted, or skipped (a
+    /// table without an identifier that a glob found). Returns the unconstrained numeric columns
+    /// too, for V-079.
+    async fn described(
+        &self,
+        selection: catalog::Selection,
+    ) -> Result<(ResolvedTables, Vec<(TableRef, String)>), SourceError> {
         let oids: Vec<u32> = selection.tables.iter().map(|(r, _)| r.oid).collect();
         let mut schemas = self.schemas(&oids).await?;
         let mut out = ResolvedTables {
@@ -253,28 +281,24 @@ impl PgConnector {
                 Err(reason) => out.halted.push((relation.table, reason)),
             }
         }
-        // Halted tables are in the set: their per-table config keys aren't stale (V-106).
-        let resolved: Vec<TableRef> = out
-            .tables
-            .iter()
-            .map(|s| s.table().clone())
-            .chain(out.halted.iter().map(|(t, _)| t.clone()))
-            .collect();
-        let mut report = check_table_set(&self.pipeline, &resolved);
-        report.extend(check_unbounded_numeric(&self.pipeline, &unconstrained));
-        if let Some(e) = report.errors.first() {
-            return Err(SourceError::Permanent(format!(
-                "{} {}: {}",
-                e.rule, e.path, e.message
-            )));
-        }
-        out.warnings.extend(
-            report
-                .warnings
-                .iter()
-                .map(|w| format!("{} {}: {}", w.rule, w.path, w.message)),
-        );
-        Ok(out)
+        Ok((out, unconstrained))
+    }
+
+    /// An on-demand snapshot's tables, by exact name (Data-Flow §On-Demand Snapshot): the
+    /// config's patterns and its table-set checks don't apply.
+    pub async fn describe_tables(
+        &self,
+        tables: &[TableRef],
+    ) -> Result<ResolvedTables, SourceError> {
+        let relations = self.relations().await?;
+        Ok(self.described(catalog::named(tables, &relations)).await?.0)
+    }
+
+    async fn relations(&self) -> Result<Vec<catalog::Relation>, SourceError> {
+        let client = self.conn.client().await?;
+        self.conn
+            .command("list tables", catalog::relations(&client))
+            .await
     }
 
     /// `pg_current_wal_lsn()`: a snapshot chunk's watermark (Snapshot_Resumability §1).
@@ -301,6 +325,10 @@ impl SourceConnector for PgConnector {
 
     async fn resolve_tables(&self) -> Result<ResolvedTables, SourceError> {
         PgConnector::resolve_tables(self).await
+    }
+
+    async fn describe_tables(&self, tables: &[TableRef]) -> Result<ResolvedTables, SourceError> {
+        PgConnector::describe_tables(self, tables).await
     }
 
     async fn prepare(

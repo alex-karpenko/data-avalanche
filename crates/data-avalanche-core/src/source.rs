@@ -325,6 +325,13 @@ pub trait SourceConnector: Send + Sync {
     /// Channel A: the configured table set, resolved and checked.
     async fn resolve_tables(&self) -> Result<ResolvedTables, SourceError>;
 
+    /// An on-demand snapshot's tables, by exact name, whatever the config's patterns include
+    /// (Data-Flow §On-Demand Snapshot): `tables` are the ones to read; `halted` the ones the
+    /// source can't replicate (no identifier, unlogged, …); `skipped` a name the source doesn't
+    /// have, or one that isn't a table of its own (a partitioned parent). The config's table-set
+    /// checks don't apply: the tables needn't be the pipeline's.
+    async fn describe_tables(&self, tables: &[TableRef]) -> Result<ResolvedTables, SourceError>;
+
     /// Prepares the stream position for a start (PostgreSQL: the publication, then the slot state
     /// machine; MySQL: the checkpoint's server and whether its binlog is still there).
     /// `checkpoint` is the pipeline's durable position, `None` without state; `tables` is the
@@ -573,6 +580,9 @@ mod tests {
                 tables: vec![schema()],
                 ..ResolvedTables::default()
             })
+        }
+        async fn describe_tables(&self, _: &[TableRef]) -> Result<ResolvedTables, SourceError> {
+            Ok(ResolvedTables::default())
         }
         async fn prepare(
             &self,
