@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-24
+updated: 2026-10-27
 domain: Auth
 tags: [rbac, api, authorization, roles, jwt, oauth2, versioning, management-api, cdc]
 resolves: [G-16, G-9.1]
@@ -83,6 +83,13 @@ Notes:
   `desired_state`, `actual_state`, positions and per-table status, including each halted table's reason
   (`TABLE_DROPPED`, `RESERVED_COLUMN_COLLISION`, …). `GET /v1/pipelines` lists the pipelines with
   the same summary. Both are read-only → viewer.
+- **Snapshot jobs (as built in M9b, D-M9b.4, D-M9b.11).** `POST /v1/pipelines/{id}/snapshots`
+  (operator) takes `{"tables": [...]}`, the per-table config keys, no globs, no other field;
+  `202` `{job_id, status, tables}`; `409` unless the desired state is running and a node holds
+  the lease, or while an unfinished job holds one of the tables (the answer names it); `422` for
+  a body it can't take. The job id is `<pipeline id>~<suffix>`, so `GET /v1/snapshots/{job_id}`
+  (viewer) reads the job on any node; `GET /v1/pipelines/{id}/snapshots` (viewer) lists every job.
+  Each ask is logged with its caller.
 
 ---
 

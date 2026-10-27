@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-23
+updated: 2026-10-27
 domain: Data Flow
 tags: [lifecycle, state-machine, pause, stop, resume, restart, flush, failover, management-api, cdc]
 resolves: [G-NEW-15]
@@ -133,6 +133,13 @@ The `PipelineController` (clustering §20) gains `Paused` and `Stopped` actual-s
   takes a new id at a poll. It writes `status.json` (actual state, error, halt code, degraded,
   under its epoch) when its status changes. Any node answers a status from these documents and
   the lease; a `status.json` of another holder or an earlier epoch is not shown as current.
+- **As built in M9b** (Q-M9b-1, Q-M9b-4, D-M9b.3, D-M9b.4): an on-demand snapshot job is asked as
+  a restart. The API writes the job (`snapshots/jobs/<job_id>.json`, queued), then a restart
+  request whose id is the job's; the owner lists the unfinished jobs before it discards the
+  worker, and the new worker's Phase 0 takes them. So a job is refused (`409`) exactly where a
+  restart is: unless the desired state is `RUNNING` and a node holds the lease. A pipeline in
+  `ERROR` takes one, and the job's restart runs it again. The owner also lists the jobs when its
+  term starts, so a job survives the loss of its restart request to a takeover.
 
 ---
 
