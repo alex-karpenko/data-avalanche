@@ -19,6 +19,7 @@ use data_avalanche_storage::StoreError;
 use tokio::sync::{mpsc, watch};
 
 use crate::decide::{Decision, Facts, Plan, decide};
+use crate::jobs::Jobs;
 use crate::schema_change::Planned;
 use crate::session::{Core, End, Session};
 use crate::settings::Settings;
@@ -394,6 +395,9 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
         .map(|h| h.table)
         .collect();
     let stored = core.settings.checkpoint.load(&core.docs).await?;
+    let jobs = Jobs::load(&core.docs).await?;
+    let asked = jobs.asked();
+    let running = jobs.running();
 
     // New halts, recorded before the checkpoint below.
     let mut halts: Vec<(TableRef, HaltReason)> = resolved.halted.clone();
@@ -402,6 +406,13 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
         .into_iter()
         .map(|t| (t.table().clone(), t))
         .collect();
+    // A job asks for a halted table: its halt is cleared once its schema is baselined.
+    let cleared: BTreeSet<TableRef> = recorded
+        .iter()
+        .filter(|t| asked.contains(*t) && resolved_tables.contains_key(*t))
+        .cloned()
+        .collect();
+    let recorded: BTreeSet<TableRef> = recorded.difference(&cleared).cloned().collect();
     let gone: Vec<TableSchema> = cached
         .values()
         .filter(|c| !resolved_tables.contains_key(c.table()) && !recorded.contains(c.table()))
@@ -432,7 +443,9 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
         }
     }
     for (table, now) in &resolved_tables {
-        if let Some(c) = cached.get(table)
+        // A table asked for is baselined to the catalog's, a new source id included.
+        if !asked.contains(table)
+            && let Some(c) = cached.get(table)
             && c.source_id().is_some()
             && c.source_id() != now.source_id()
         {
@@ -530,7 +543,20 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
             sink_has_table: state.exists,
             added: added.contains(table),
         };
-        let (decision, warning) = decide(mode, plan, facts);
+        let dump = matches!(mode, SnapshotMode::DumpAlways | SnapshotMode::DumpInitial);
+        let (decision, warning) = if asked.contains(table) {
+            (
+                Decision::Snapshot {
+                    resume: false,
+                    dump,
+                },
+                None,
+            )
+        } else if running.contains(table) && in_progress {
+            (Decision::Snapshot { resume: !gap, dump }, None)
+        } else {
+            decide(mode, plan, facts)
+        };
         if let Some(w) = warning {
             warnings.push(format!("table {table}: {w}"));
         }
@@ -554,12 +580,15 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
             }
         };
         let mut schema = now.clone();
-        match cached.get(table) {
-            Some(c)
-                if state.exists
-                    && matches!(plan, Plan::Fresh(_))
-                    && c.columns() != now.columns() =>
-            {
+        let baseline = matches!(plan, Plan::Fresh(_)) || cleared.contains(table);
+        // A cleared table's change is planned under its source id now: one created again is
+        // the table the catalog has.
+        let rebased = cached.get(table).map(|c| match now.source_id() {
+            Some(id) if cleared.contains(table) => c.clone().with_source_id(id),
+            _ => c.clone(),
+        });
+        match rebased.as_ref() {
+            Some(c) if state.exists && baseline && c.columns() != now.columns() => {
                 let evolver = core.evolver();
                 let hint = SchemaHint::Columns(now.columns().to_vec());
                 match evolver.plan(c, &hint).await {
@@ -584,6 +613,7 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
                     }
                 }
             }
+            Some(_) if cleared.contains(table) => {}
             Some(c) if matches!(plan, Plan::Resume) && c.columns() != now.columns() => {
                 drifted.insert(table.clone());
                 let idle = match core.settings.rescan_interval {
@@ -612,7 +642,7 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
                 Err(e) => return Err(e),
             }
         }
-        if !tracked_before || matches!(plan, Plan::Fresh(_)) {
+        if !tracked_before || baseline {
             schemas.push(schema);
         }
         if request {
@@ -671,6 +701,26 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
         core.may_write()?;
         core.docs.save_table_schema(schema).await?;
     }
+    // The cleared halts after the baselined schemas: a restart in between finds the table halted
+    // and asked for still, and baselines it again.
+    for table in &cleared {
+        if !halts.iter().any(|(t, _)| t == table) {
+            core.may_write()?;
+            core.docs.clear_halt(table).await?;
+        }
+    }
+    let started: BTreeSet<TableRef> = requests
+        .iter()
+        .filter(|t| asked.contains(*t))
+        .cloned()
+        .collect();
+    let failed: BTreeMap<TableRef, String> = halts
+        .iter()
+        .filter(|(t, _)| asked.contains(t))
+        .map(|(t, reason)| (t.clone(), format!("{}: {reason}", reason.code())))
+        .collect();
+    core.may_write()?;
+    jobs.record(&core.docs, &started, &failed).await?;
     if let Some(doc) = fresh {
         if core.hooks.at(&HookPoint::SchemasCached) == HookAction::Crash {
             return Err(WorkerError::Crashed(HookPoint::SchemasCached));

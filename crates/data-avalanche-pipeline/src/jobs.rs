@@ -1,0 +1,358 @@
+//! Phase 0's part of the on-demand snapshot jobs (Data-Flow §On-Demand Snapshot). A job's
+//! queued tables are asked for: each start snapshots them from their first row, a halted one
+//! with its halt cleared and its schema baselined to the catalog's. A table whose job snapshot
+//! runs keeps running whatever its snapshot mode. Phase 0 records what it did with each asked
+//! table; the owner's controller follows a running one to its end.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use chrono::Utc;
+use data_avalanche_core::TableRef;
+use data_avalanche_state::{JobTableStatus, PipelineDocs, SnapshotJobDoc, StateError};
+
+/// The unfinished jobs, as a start read them.
+#[derive(Debug, Default)]
+pub(crate) struct Jobs {
+    jobs: Vec<SnapshotJobDoc>,
+}
+
+impl Jobs {
+    pub async fn load(docs: &PipelineDocs) -> Result<Self, StateError> {
+        Ok(Self {
+            jobs: docs.unfinished_snapshot_jobs().await?,
+        })
+    }
+
+    fn tables(&self, status: JobTableStatus) -> BTreeSet<TableRef> {
+        self.jobs
+            .iter()
+            .flat_map(|j| &j.tables)
+            .filter(|t| t.status == status)
+            .map(|t| t.table.clone())
+            .collect()
+    }
+
+    /// The tables a job asks for that no start has taken yet.
+    pub fn asked(&self) -> BTreeSet<TableRef> {
+        self.tables(JobTableStatus::Queued)
+    }
+
+    /// The tables whose job snapshot runs.
+    pub fn running(&self) -> BTreeSet<TableRef> {
+        self.tables(JobTableStatus::Running)
+    }
+
+    /// Records what this start did with the asked tables: the `started` ones run, the `failed`
+    /// ones failed with their reason. A table neither started nor failed stays queued.
+    pub async fn record(
+        &self,
+        docs: &PipelineDocs,
+        started: &BTreeSet<TableRef>,
+        failed: &BTreeMap<TableRef, String>,
+    ) -> Result<(), StateError> {
+        let decided = |t: &TableRef| started.contains(t) || failed.contains_key(t);
+        for job in &self.jobs {
+            if !job
+                .tables
+                .iter()
+                .any(|t| t.status == JobTableStatus::Queued && decided(&t.table))
+            {
+                continue;
+            }
+            docs.update_snapshot_job(&job.job_id, |j| {
+                for t in &mut j.tables {
+                    if t.status != JobTableStatus::Queued {
+                        continue;
+                    }
+                    if started.contains(&t.table) {
+                        t.status = JobTableStatus::Running;
+                    } else if let Some(e) = failed.get(&t.table) {
+                        t.status = JobTableStatus::Failed;
+                        t.error = Some(e.clone());
+                    }
+                }
+                j.settle(Utc::now());
+            })
+            .await?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use chrono::Utc;
+    use data_avalanche_config::Pipeline;
+    use data_avalanche_core::{
+        ColumnSchema, ColumnValue, ColumnValueType as V, HaltReason, Row, TableSchema,
+    };
+    use data_avalanche_state::{
+        CursorKey, JobStatus, JobTableStatus, SnapshotCursor, SnapshotJobDoc, SnapshotStatus,
+        TableHalt, TableSnapshotDoc,
+    };
+    use data_avalanche_testkit::FakeTxn;
+    use tokio::sync::watch;
+
+    use crate::test_support::{World, Yaml, fast, row, t, wait_until};
+    use crate::{Command, Exit, Phase, PipelineWorker, WorkerDeps, WorkerError, WorkerStatus};
+
+    fn never(chunk_size: usize) -> Pipeline {
+        let tables = format!("\n      snapshots: {{ mode: never, chunk_size: {chunk_size} }}");
+        Yaml {
+            tables: &tables,
+            sink: "flush: { seconds: 0 }",
+            ..Yaml::default()
+        }
+        .build()
+    }
+
+    fn rows(ids: std::ops::RangeInclusive<i64>) -> Vec<Row> {
+        ids.map(|id| row(id, "x")).collect()
+    }
+
+    async fn ask(w: &World, id: &str, tables: &[&str]) {
+        let doc = SnapshotJobDoc::new(
+            id.into(),
+            tables.iter().map(|n| t(n)).collect(),
+            "ops".into(),
+            Utc::now(),
+        );
+        w.docs.create_snapshot_job(&doc).await.unwrap();
+    }
+
+    async fn job(w: &World, id: &str) -> SnapshotJobDoc {
+        w.docs.snapshot_job(id).await.unwrap().unwrap().doc
+    }
+
+    /// Runs a worker over `w` until `drive` returns, then drains it.
+    async fn run<F: Future<Output = ()>>(
+        w: &World,
+        p: &Pipeline,
+        drive: impl FnOnce(watch::Receiver<WorkerStatus>) -> F,
+    ) -> (Result<Exit, WorkerError>, WorkerStatus) {
+        let deps = WorkerDeps::new(
+            Arc::new(w.source.clone()),
+            Arc::new(w.sink.clone()),
+            w.docs.clone(),
+        );
+        let (worker, handle) = PipelineWorker::new(p, deps, fast());
+        let status = handle.status.clone();
+        let driver = async move {
+            drive(handle.status.clone()).await;
+            let _ = handle.control.send(Command::Drain).await;
+        };
+        let (end, ()) = tokio::join!(worker.run(), driver);
+        let last = status.borrow().clone();
+        (end, last)
+    }
+
+    /// A stream session streams, and everything up to the log's end is durable.
+    async fn streamed(status: &watch::Receiver<WorkerStatus>, w: &World) {
+        let end = w.source.wal_end();
+        wait_until("the log's end is durable", || {
+            let st = status.borrow();
+            st.phase == Phase::Streaming && st.checkpoint.as_ref() == Some(&end)
+        })
+        .await;
+    }
+
+    /// A first run under `mode: never`: the slot, the sink tables, the schemas, the checkpoint.
+    async fn established(w: &World) {
+        let (end, _) = run(w, &never(10), async |status| streamed(&status, w).await).await;
+        end.unwrap();
+    }
+
+    async fn snapshot_status(w: &World, table: &str) -> SnapshotStatus {
+        w.docs
+            .table_snapshot(&t(table))
+            .await
+            .unwrap()
+            .unwrap()
+            .doc
+            .status
+    }
+
+    /// A streamed table asked for is read again from its first row: rows the stream never
+    /// carried (loaded behind its back) reach the sink. The job's table is running; the owner's
+    /// controller sees it to its end.
+    #[tokio::test]
+    async fn a_job_snapshots_a_streamed_table_again_from_scratch() {
+        let w = World::new(&["a", "b"]);
+        established(&w).await;
+        w.source
+            .commit(FakeTxn::new().insert(&t("a"), row(1, "streamed")));
+        w.source.load(&t("a"), rows(5..=7));
+        ask(&w, "p~1", &["a"]).await;
+        let (end, st) = run(&w, &never(10), async |status| {
+            wait_until("the rows land", || w.ids("a") == [1, 5, 6, 7]).await;
+            streamed(&status, &w).await;
+        })
+        .await;
+        assert_eq!(end.unwrap(), Exit::Drained);
+        assert_eq!(snapshot_status(&w, "a").await, SnapshotStatus::Completed);
+        assert_eq!(w.source.reads(&t("b")), 0, "only the job's table");
+        let j = job(&w, "p~1").await;
+        assert_eq!(j.status, JobStatus::Running);
+        assert_eq!(j.tables[0].status, JobTableStatus::Running);
+        assert!(st.warnings.is_empty(), "{:?}", st.warnings);
+    }
+
+    fn noted(id: i64, note: Option<&str>) -> Row {
+        Row(vec![
+            ("id".into(), ColumnValue::Int64(id)),
+            ("doc".into(), ColumnValue::Text("x".into())),
+            (
+                "note".into(),
+                note.map_or(ColumnValue::Null, |n| ColumnValue::Text(n.into())),
+            ),
+        ])
+    }
+
+    fn with_note(name: &str) -> TableSchema {
+        TableSchema::new(
+            t(name),
+            vec![
+                ColumnSchema::new("id", V::Int64, "bigint").not_null(),
+                ColumnSchema::new("doc", V::Text, "text"),
+                ColumnSchema::new("note", V::Text, "text"),
+            ],
+            vec!["id".into()],
+        )
+        .unwrap()
+    }
+
+    /// A halted table asked for (dropped and created again, here with a column more) is
+    /// streamed again: its halt is cleared, its cached schema is the catalog's (the new table's
+    /// source id), its sink table takes the new column, and its rows are read.
+    #[tokio::test]
+    async fn a_job_clears_a_halt_and_baselines_the_table() {
+        let w = World::new(&["a"]);
+        established(&w).await;
+        let old = w.source.schema(&t("a"));
+        w.docs
+            .record_halt(&TableHalt {
+                table: t("a"),
+                reason: HaltReason::TableDropped,
+                at: w.source.wal_end(),
+            })
+            .await
+            .unwrap();
+        w.source.drop_table(&t("a"));
+        w.source.create_table(with_note("a"));
+        w.source.load(&t("a"), vec![noted(1, None), noted(2, None)]);
+        ask(&w, "p~1", &["a"]).await;
+        let (end, st) = run(&w, &never(10), async |status| {
+            wait_until("the rows land", || w.ids("a") == [1, 2]).await;
+            w.source
+                .commit(FakeTxn::new().insert(&t("a"), noted(3, Some("n"))));
+            wait_until("the change streams", || w.ids("a") == [1, 2, 3]).await;
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert!(st.halted.is_empty(), "{:?}", st.halted);
+        assert!(w.docs.halts().await.unwrap().tables.is_empty());
+        let cached = w.docs.table_schema(&t("a")).await.unwrap().unwrap().doc;
+        assert_eq!(cached, w.source.schema(&t("a")));
+        assert_ne!(cached.source_id(), old.source_id());
+        assert_eq!(w.text("a", "note"), [None, None, Some("n".into())]);
+        assert_eq!(
+            job(&w, "p~1").await.tables[0].status,
+            JobTableStatus::Running
+        );
+    }
+
+    /// A table asked for that halts at this start (here its identifier changed) fails in its
+    /// job, with the halt's reason; the job ends once no table is left.
+    #[tokio::test]
+    async fn a_job_table_that_halts_at_the_start_fails() {
+        let w = World::new(&["a", "b"]);
+        established(&w).await;
+        w.docs
+            .record_halt(&TableHalt {
+                table: t("a"),
+                reason: HaltReason::UnsafeDdl {
+                    detail: "the key changed".into(),
+                },
+                at: w.source.wal_end(),
+            })
+            .await
+            .unwrap();
+        // The key moves to `doc`: an identifier change is unsafe (`Schema_Change…` §7.2).
+        let rekeyed = TableSchema::new(
+            t("a"),
+            vec![
+                ColumnSchema::new("id", V::Int64, "bigint").not_null(),
+                ColumnSchema::new("doc", V::Text, "text").not_null(),
+            ],
+            vec!["doc".into()],
+        )
+        .unwrap();
+        w.source.alter(&t("a"), rekeyed);
+        ask(&w, "p~1", &["a"]).await;
+        let (end, st) = run(&w, &never(10), async |status| streamed(&status, &w).await).await;
+        end.unwrap();
+        assert!(st.halted.contains_key(&t("a")));
+        let j = job(&w, "p~1").await;
+        assert_eq!(j.tables[0].status, JobTableStatus::Failed);
+        let error = j.tables[0].error.clone().unwrap();
+        assert!(error.starts_with("UNSAFE_DDL: "), "{error}");
+        assert_eq!(j.status, JobStatus::Failed);
+        assert!(j.finished_at.is_some());
+    }
+
+    /// A job's table whose snapshot runs keeps running at the next start, from its cursor,
+    /// even under `mode: never`, which abandons a snapshot in progress.
+    #[tokio::test]
+    async fn a_running_job_table_resumes_from_its_cursor() {
+        let w = World::new(&["a"]);
+        established(&w).await;
+        w.source.load(&t("a"), rows(1..=4));
+        ask(&w, "p~1", &["a"]).await;
+        w.docs
+            .update_snapshot_job("p~1", |j| {
+                j.tables[0].status = JobTableStatus::Running;
+                j.settle(Utc::now());
+            })
+            .await
+            .unwrap();
+        w.docs
+            .save_table_snapshot(&TableSnapshotDoc {
+                table: t("a"),
+                status: SnapshotStatus::InProgress,
+                start_position: Some(w.source.wal_end()),
+                cursor: Some(SnapshotCursor {
+                    key: vec![CursorKey {
+                        col: "id".into(),
+                        val: 2.into(),
+                        ty: "bigint".into(),
+                    }],
+                    chunk_size: 2,
+                    rows_done: 2,
+                    collation: None,
+                }),
+                row_count: None,
+                completed_at: None,
+            })
+            .await
+            .unwrap();
+        let (end, _) = run(&w, &never(2), async |status| {
+            wait_until("the rest lands", || w.ids("a") == [3, 4]).await;
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!(snapshot_status(&w, "a").await, SnapshotStatus::Completed);
+        assert_eq!(
+            w.ids("a"),
+            [3, 4],
+            "rows 1 and 2 were read by an earlier run"
+        );
+        assert_eq!(
+            job(&w, "p~1").await.tables[0].status,
+            JobTableStatus::Running
+        );
+    }
+}
