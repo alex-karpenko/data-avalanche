@@ -106,6 +106,7 @@ impl PipelineWorker {
             control: control_rx,
             status: status_tx,
             tracked: BTreeSet::new(),
+            copies: BTreeMap::new(),
             dump_only: false,
             snapshot_started: BTreeMap::new(),
             drifted: BTreeSet::new(),
@@ -652,6 +653,69 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
         tracked.insert(table.clone());
     }
 
+    // A job's tables outside the config: copies, described by name, read without the stream
+    // (Q-M9b-3). One running is described again at every start: its schema is cached nowhere.
+    let configured: BTreeSet<&TableRef> = resolved_tables
+        .keys()
+        .chain(resolved.halted.iter().map(|(t, _)| t))
+        .collect();
+    let outside: Vec<TableRef> = asked
+        .iter()
+        .chain(&running)
+        .filter(|t| !configured.contains(t))
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut failed: BTreeMap<TableRef, String> = BTreeMap::new();
+    let mut copies = BTreeMap::new();
+    let mut cleared = cleared;
+    if !outside.is_empty() {
+        let described = retry(&tuning, || source.describe_tables(&outside)).await?;
+        warnings.extend(described.warnings);
+        for (table, reason) in described.halted {
+            failed.insert(table, format!("{}: {reason}", reason.code()));
+        }
+        failed.extend(described.skipped);
+        for schema in described.tables {
+            let table = schema.table().clone();
+            let is_asked = asked.contains(&table);
+            if !is_asked {
+                let doc = core.docs.table_snapshot(&table).await?.map(|v| v.doc);
+                if !doc.is_some_and(|d| d.status == SnapshotStatus::InProgress) {
+                    continue;
+                }
+            }
+            let spec = match TableSpec::new(&schema, core.settings.partition_by(&table)) {
+                Ok(spec) => spec,
+                Err(reason) => {
+                    failed.insert(table, format!("{}: {reason}", reason.code()));
+                    continue;
+                }
+            };
+            let state = sink_retry(&tuning, || Ok(()), || sink.table_state(&table)).await?;
+            if !state.exists {
+                match sink_retry(&tuning, || core.may_write(), || sink.ensure_table(&spec)).await {
+                    Ok(()) => {}
+                    Err(WorkerError::Sink(SinkError::Permanent { reason })) => {
+                        let reason = HaltReason::SinkRejected { detail: reason };
+                        failed.insert(table, format!("{}: {reason}", reason.code()));
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            if is_asked {
+                // A copy halted in an earlier run: the job's start clears it.
+                if recorded.contains(&table) {
+                    cleared.insert(table.clone());
+                }
+                requests.push(table.clone());
+            }
+            copies.insert(table, schema);
+        }
+    }
+
     // Persist, in this order: a restart in between redoes what follows.
     for (table, reason) in &halts {
         core.may_write()?;
@@ -715,11 +779,12 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
         .filter(|t| asked.contains(*t))
         .cloned()
         .collect();
-    let failed: BTreeMap<TableRef, String> = halts
-        .iter()
-        .filter(|(t, _)| asked.contains(t))
-        .map(|(t, reason)| (t.clone(), format!("{}: {reason}", reason.code())))
-        .collect();
+    failed.extend(
+        halts
+            .iter()
+            .filter(|(t, _)| asked.contains(t))
+            .map(|(t, reason)| (t.clone(), format!("{}: {reason}", reason.code()))),
+    );
     core.may_write()?;
     jobs.record(&core.docs, &started, &failed).await?;
     if let Some(doc) = fresh {
@@ -731,6 +796,7 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
     }
     core.server = server;
     core.tracked = tracked;
+    core.copies = copies;
     core.drifted = drifted;
     core.dump_only = dump_only;
     core.update(|st| warnings.into_iter().for_each(|w| st.warn(w)));

@@ -49,6 +49,9 @@ pub(crate) struct Core {
     pub status: watch::Sender<WorkerStatus>,
     /// The tables Phase 0 tracks. A session streams each one unless it is halted or a done dump.
     pub tracked: BTreeSet<TableRef>,
+    /// A job's tables outside the config whose copy runs (Q-M9b-3), with their schemas as Phase
+    /// 0 described them: read like a dump, never streamed, their schemas cached nowhere.
+    pub copies: BTreeMap<TableRef, TableSchema>,
     /// Every table of the pipeline is a `dump_*` table: the worker ends once none is left.
     pub dump_only: bool,
     /// When each table's snapshot began in this run (`timeouts.snapshot`): at the first session
@@ -168,6 +171,8 @@ pub(crate) struct Session<'c> {
     acc: Accumulator,
     /// The streamed tables' schemas as of the frontier.
     schemas: BTreeMap<TableRef, TableSchema>,
+    /// [`Core::copies`] still being read.
+    copies: BTreeMap<TableRef, TableSchema>,
     stream: Box<dyn ChangeStream>,
     jobs: UnboundedSender<Job>,
     events: UnboundedReceiver<WriterEvent>,
@@ -257,7 +262,26 @@ impl<'c> Session<'c> {
                 Err(e) => return Err(e.into()),
             }
         }
-        let (mut snaps, retired, warnings) = Snapshots::load(core, &schemas).await?;
+        let mut copies = BTreeMap::new();
+        for (table, schema) in &core.copies {
+            match acc.add_table(schema.clone(), &s.delete_extra(schema)) {
+                Ok(()) => {
+                    copies.insert(table.clone(), schema.clone());
+                }
+                Err(AccumulatorError::Halt { table, reason }) => halts.push(TableHalt {
+                    table,
+                    reason,
+                    at: checkpoint.clone(),
+                }),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let read: BTreeMap<TableRef, TableSchema> = schemas
+            .iter()
+            .chain(&copies)
+            .map(|(t, s)| (t.clone(), s.clone()))
+            .collect();
+        let (mut snaps, retired, warnings) = Snapshots::load(core, &read).await?;
         snaps.hold(&core.drifted);
         for table in &retired {
             acc.halt_table(table);
@@ -305,6 +329,7 @@ impl<'c> Session<'c> {
             core,
             acc,
             schemas,
+            copies,
             stream,
             jobs,
             events,
@@ -537,6 +562,7 @@ impl<'c> Session<'c> {
             Some(WriterEvent::Halted(h)) => {
                 self.acc.halt_table(&h.table);
                 self.schemas.remove(&h.table);
+                self.copies.remove(&h.table);
                 self.snaps.stop(&h.table);
                 self.hold_ended();
                 self.core.update(|st| {
@@ -557,9 +583,10 @@ impl<'c> Session<'c> {
                         st.snapshots.remove(&table);
                     });
                     if dump {
-                        // A dump stops once its snapshot is durable.
+                        // A dump, or a copy, stops once its snapshot is durable.
                         self.acc.halt_table(&table);
                         self.schemas.remove(&table);
+                        self.copies.remove(&table);
                     }
                 }
                 if let Err(e) = self.stream.acknowledge(&cp).await {
@@ -1014,6 +1041,11 @@ impl<'c> Session<'c> {
         }
     }
 
+    /// The schema a snapshot reads `table` under: a streamed table's, or a copy's.
+    pub(super) fn read_schema(&self, table: &TableRef) -> Option<&TableSchema> {
+        self.schemas.get(table).or_else(|| self.copies.get(table))
+    }
+
     /// Every table is a dump, and every one is done or halted.
     fn dumped(&self) -> bool {
         self.core.dump_only && self.schemas.is_empty() && self.snaps.is_empty()
@@ -1054,6 +1086,7 @@ impl<'c> Session<'c> {
         }
         self.acc.halt_table(&table);
         self.schemas.remove(&table);
+        self.copies.remove(&table);
         self.snaps.stop(&table);
         self.core.writers_waited.remove(&table);
         self.hold_ended();

@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::Utc;
 use data_avalanche_core::TableRef;
-use data_avalanche_state::{JobTableStatus, PipelineDocs, SnapshotJobDoc, StateError};
+use data_avalanche_state::{JobTable, JobTableStatus, PipelineDocs, SnapshotJobDoc, StateError};
 
 /// The unfinished jobs, as a start read them.
 #[derive(Debug, Default)]
@@ -42,33 +42,34 @@ impl Jobs {
         self.tables(JobTableStatus::Running)
     }
 
-    /// Records what this start did with the asked tables: the `started` ones run, the `failed`
-    /// ones failed with their reason. A table neither started nor failed stays queued.
+    /// Records what this start did with the job tables: the asked ones `started` run, and the
+    /// `failed` ones (asked, or running and gone) failed with their reason. An asked table
+    /// neither started nor failed stays queued.
     pub async fn record(
         &self,
         docs: &PipelineDocs,
         started: &BTreeSet<TableRef>,
         failed: &BTreeMap<TableRef, String>,
     ) -> Result<(), StateError> {
-        let decided = |t: &TableRef| started.contains(t) || failed.contains_key(t);
+        let decided = |t: &JobTable| match t.status {
+            JobTableStatus::Queued => started.contains(&t.table) || failed.contains_key(&t.table),
+            JobTableStatus::Running => failed.contains_key(&t.table),
+            _ => false,
+        };
         for job in &self.jobs {
-            if !job
-                .tables
-                .iter()
-                .any(|t| t.status == JobTableStatus::Queued && decided(&t.table))
-            {
+            if !job.tables.iter().any(decided) {
                 continue;
             }
             docs.update_snapshot_job(&job.job_id, |j| {
                 for t in &mut j.tables {
-                    if t.status != JobTableStatus::Queued {
+                    if !decided(t) {
                         continue;
                     }
-                    if started.contains(&t.table) {
-                        t.status = JobTableStatus::Running;
-                    } else if let Some(e) = failed.get(&t.table) {
+                    if let Some(e) = failed.get(&t.table) {
                         t.status = JobTableStatus::Failed;
                         t.error = Some(e.clone());
+                    } else {
+                        t.status = JobTableStatus::Running;
                     }
                 }
                 j.settle(Utc::now());
@@ -384,5 +385,131 @@ mod tests {
             job(&w, "p~1").await.tables[0].status,
             JobTableStatus::Running
         );
+    }
+
+    /// A table outside the config is copied (Q-M9b-3): described by its name, its sink table
+    /// created, its rows read, and never streamed: a change made while the copy runs, to a row
+    /// its first chunk read before, isn't in the sink. Its schema isn't cached, so a later start
+    /// doesn't take it for a table gone; once its copy is done, a restart doesn't read it again.
+    #[tokio::test]
+    async fn a_table_outside_the_config_is_copied_and_not_streamed() {
+        let w = World::new(&["a", "x"]);
+        w.source.outside_config(&t("x"));
+        established(&w).await;
+        w.source.load(&t("x"), rows(1..=3));
+        ask(&w, "p~1", &["x"]).await;
+        w.source.hold_reads();
+        let (end, st) = run(&w, &never(2), async |status| {
+            wait_until("the first chunk is read", || w.source.reads(&t("x")) == 1).await;
+            w.source.commit(
+                FakeTxn::new()
+                    .update(&t("x"), row(1, "changed"))
+                    .insert(&t("a"), row(1, "streamed")),
+            );
+            w.source.release_reads();
+            wait_until("the copy lands", || w.ids("x") == [1, 2, 3]).await;
+            wait_until("the stream moves on", || w.ids("a") == [1]).await;
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!(
+            w.text("x", "doc"),
+            [Some("x".into()), Some("x".into()), Some("x".into())],
+            "a copy isn't streamed"
+        );
+        assert_eq!(snapshot_status(&w, "x").await, SnapshotStatus::Completed);
+        assert!(w.docs.table_schema(&t("x")).await.unwrap().is_none());
+        assert!(st.halted.is_empty() && st.warnings.is_empty(), "{st:?}");
+        assert_eq!(
+            job(&w, "p~1").await.tables[0].status,
+            JobTableStatus::Running
+        );
+        let reads = w.source.reads(&t("x"));
+        let (end, st) = run(&w, &never(2), async |status| streamed(&status, &w).await).await;
+        end.unwrap();
+        assert_eq!(
+            w.source.reads(&t("x")),
+            reads,
+            "a copy done isn't read again"
+        );
+        assert!(st.halted.is_empty(), "{:?}", st.halted);
+    }
+
+    /// A copy whose snapshot runs resumes from its cursor at the next start: its table is
+    /// described again, its schema being cached nowhere.
+    #[tokio::test]
+    async fn a_running_copy_resumes_from_its_cursor() {
+        let w = World::new(&["a", "x"]);
+        w.source.outside_config(&t("x"));
+        established(&w).await;
+        w.source.load(&t("x"), rows(1..=4));
+        ask(&w, "p~1", &["x"]).await;
+        w.docs
+            .update_snapshot_job("p~1", |j| {
+                j.tables[0].status = JobTableStatus::Running;
+                j.settle(Utc::now());
+            })
+            .await
+            .unwrap();
+        let spec = data_avalanche_core::TableSpec::new(&w.source.schema(&t("x")), vec![]).unwrap();
+        data_avalanche_core::Sink::ensure_table(&w.sink, &spec)
+            .await
+            .unwrap();
+        w.docs
+            .save_table_snapshot(&TableSnapshotDoc {
+                table: t("x"),
+                status: SnapshotStatus::InProgress,
+                start_position: Some(w.source.wal_end()),
+                cursor: Some(SnapshotCursor {
+                    key: vec![CursorKey {
+                        col: "id".into(),
+                        val: 2.into(),
+                        ty: "bigint".into(),
+                    }],
+                    chunk_size: 2,
+                    rows_done: 2,
+                    collation: None,
+                }),
+                row_count: None,
+                completed_at: None,
+            })
+            .await
+            .unwrap();
+        let (end, _) = run(&w, &never(2), async |status| {
+            wait_until("the rest lands", || w.ids("x") == [3, 4]).await;
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!(snapshot_status(&w, "x").await, SnapshotStatus::Completed);
+    }
+
+    /// A table the source doesn't have fails in its job, as does a running copy whose table is
+    /// gone at the next start; nothing is halted for them, as they aren't the pipeline's.
+    #[tokio::test]
+    async fn a_table_the_source_lacks_fails_in_its_job() {
+        let w = World::new(&["a", "x"]);
+        w.source.outside_config(&t("x"));
+        established(&w).await;
+        ask(&w, "p~1", &["missing"]).await;
+        ask(&w, "p~2", &["x"]).await;
+        w.docs
+            .update_snapshot_job("p~2", |j| {
+                j.tables[0].status = JobTableStatus::Running;
+                j.settle(Utc::now());
+            })
+            .await
+            .unwrap();
+        w.source.drop_table(&t("x"));
+        let (end, st) = run(&w, &never(2), async |status| streamed(&status, &w).await).await;
+        end.unwrap();
+        for id in ["p~1", "p~2"] {
+            let j = job(&w, id).await;
+            assert_eq!(j.status, JobStatus::Failed, "{id}");
+            assert_eq!(j.tables[0].error.as_deref(), Some("no such table"), "{id}");
+        }
+        assert!(st.halted.is_empty(), "{:?}", st.halted);
+        assert!(w.docs.halts().await.unwrap().tables.is_empty());
     }
 }
