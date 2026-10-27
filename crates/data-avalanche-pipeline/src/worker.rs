@@ -443,8 +443,9 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
         }
     }
     for (table, now) in &resolved_tables {
-        // A table asked for is baselined to the catalog's, a new source id included.
-        if !asked.contains(table)
+        // A cleared table is baselined to the catalog's, a new source id included. One asked for
+        // but not halted yet halts here: the stream's position may predate the drop.
+        if !cleared.contains(table)
             && let Some(c) = cached.get(table)
             && c.source_id().is_some()
             && c.source_id() != now.source_id()

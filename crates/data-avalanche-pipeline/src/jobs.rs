@@ -264,6 +264,36 @@ mod tests {
         );
     }
 
+    /// A table asked for that was dropped and created again while the pipeline was down, its
+    /// halt not recorded yet, halts at this start and fails in its job (`TABLE_DROPPED`): the
+    /// stream's position may predate the drop. A job asked again clears the halt.
+    #[tokio::test]
+    async fn a_table_created_again_halts_and_fails_its_job() {
+        let w = World::new(&["a", "b"]);
+        established(&w).await;
+        w.source.drop_table(&t("a"));
+        w.source.create_table(with_note("a"));
+        w.source.load(&t("a"), vec![noted(1, None)]);
+        ask(&w, "p~1", &["a"]).await;
+        let (end, st) = run(&w, &never(10), async |status| streamed(&status, &w).await).await;
+        end.unwrap();
+        assert_eq!(st.halted.get(&t("a")), Some(&HaltReason::TableDropped));
+        let j = job(&w, "p~1").await;
+        assert_eq!(j.tables[0].status, JobTableStatus::Failed);
+        let error = j.tables[0].error.clone().unwrap();
+        assert!(error.starts_with("TABLE_DROPPED: "), "{error}");
+        ask(&w, "p~2", &["a"]).await;
+        let (end, st) = run(&w, &never(10), async |status| {
+            wait_until("the rows land", || w.ids("a") == [1]).await;
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert!(st.halted.is_empty(), "{:?}", st.halted);
+        let cached = w.docs.table_schema(&t("a")).await.unwrap().unwrap().doc;
+        assert_eq!(cached, w.source.schema(&t("a")));
+    }
+
     /// A table asked for that halts at this start (here its identifier changed) fails in its
     /// job, with the halt's reason; the job ends once no table is left.
     #[tokio::test]
