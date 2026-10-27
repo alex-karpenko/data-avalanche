@@ -3,8 +3,8 @@
 //! worker under it and reconciles the worker toward the persisted desired state, polled every
 //! `lease_renewal_interval` (Q-M6b-2). A worker that ends with an error is rerun, stopped for the
 //! lease, or left in `ERROR` (Q-M6b-3). At the same poll the owner writes the pipeline's status,
-//! `status.json`, when it changed, and takes the restart and the flush the management API asked
-//! for in `requests.json` (D-M9a.2).
+//! `status.json`, when it changed, takes the restart and the flush the management API asked for
+//! in `requests.json` (D-M9a.2), and follows the on-demand snapshot jobs to their end.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Debug;
@@ -27,6 +27,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 
+use crate::jobs::Jobs;
 use crate::{Claim, Claimed, LeaseRun, LeaseTiming, RenewEnd, RenewState, release};
 
 /// A worker's source and sink, built afresh for every run.
@@ -624,6 +625,9 @@ impl PipelineController {
         // now, not at the first poll a renewal interval away, which would take a request made
         // meanwhile as seen. A failed read leaves the first poll's read to take note.
         let mut seen = self.docs.requests().await.ok();
+        // The jobs an earlier term left: this term's first worker takes their queued tables.
+        let mut jobs = Jobs::default();
+        jobs.list(&self.docs, &self.pipeline.name).await;
         let mut reported = Reported::default();
         let mut poll = tokio::time::interval(self.settings.timing.renewal_interval);
         poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -852,6 +856,8 @@ impl PipelineController {
                     // As a reload's restart: a pipeline in ERROR runs again (Pipeline_Lifecycle
                     // §3), and a paused or stopped one stays so (the API refuses those).
                     if asked.restart {
+                        // A snapshot job asks for its restart: the new worker takes its tables.
+                        jobs.list(&self.docs, &self.pipeline.name).await;
                         if self.discard(&mut worker).await {
                             tracing::info!(pipeline = %self.pipeline.name, "restarted on request");
                         } else {
@@ -873,6 +879,7 @@ impl PipelineController {
                             }
                         }
                     }
+                    jobs.poll(&self.docs, &self.pipeline.name).await;
                 }
                 Event::Update(Update::Reconfigure(p)) => {
                     self.reconfigure(*p);
@@ -887,6 +894,7 @@ impl PipelineController {
                     // The baselines belong to the state location: a reload may move it.
                     reported = Reported::default();
                     seen = self.docs.requests().await.ok();
+                    jobs.list(&self.docs, &self.pipeline.name).await;
                     self.discard(&mut worker).await;
                     tracing::info!(pipeline = %self.pipeline.name, "restarted for a reload");
                     error = None;
@@ -1239,6 +1247,8 @@ mod tests {
     use data_avalanche_state::Action;
     use data_avalanche_testkit::{FakeTxn, Method, SinkOp};
 
+    use data_avalanche_state::{JobStatus, JobTableStatus, SnapshotJobDoc};
+
     use super::*;
     use crate::test_support::{
         Fault, Kind, ScriptedStore, TestFactory, deps, eventually, holder, leases, node, pipeline,
@@ -1471,6 +1481,112 @@ mod tests {
         let mut n = node("n1", &store, &docs, &f);
         until(&mut n.status, "running", is(Actual::Running)).await;
         tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(f.builds(), 1);
+    }
+
+    /// Waits (on the test clock) until job `id` satisfies `cond`.
+    async fn job_until(
+        docs: &PipelineDocs,
+        id: &str,
+        what: &str,
+        cond: impl Fn(&SnapshotJobDoc) -> bool,
+    ) -> SnapshotJobDoc {
+        for _ in 0..1_200 {
+            if let Some(v) = docs.snapshot_job(id).await.unwrap()
+                && cond(&v.doc)
+            {
+                return v.doc;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!(
+            "timed out waiting until {what}: {:?}",
+            docs.snapshot_job(id).await
+        );
+    }
+
+    async fn ask_job(docs: &PipelineDocs, id: &str, tables: &[&str]) {
+        let doc = SnapshotJobDoc::new(
+            id.into(),
+            tables.iter().map(|n| t(n)).collect(),
+            "ops".into(),
+            chrono::Utc::now(),
+        );
+        docs.create_snapshot_job(&doc).await.unwrap();
+    }
+
+    /// A job asked through the API: its document, then a restart under the job's id. The owner
+    /// restarts the worker, whose start takes the job's tables, and follows each to its end:
+    /// the job completes with the rows each table read.
+    #[tokio::test(start_paused = true)]
+    async fn a_job_asked_runs_to_its_end() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a", "b"]);
+        let mut n = node("n1", &store, &docs, &f);
+        until(&mut n.status, "running", is(Actual::Running)).await;
+        f.source.load(&t("a"), (1..=3).map(row).collect());
+        ask_job(&docs, "p~1", &["a"]).await;
+        docs.request(Action::Restart, asked("p~1")).await.unwrap();
+        let done = job_until(&docs, "p~1", "the job ends", SnapshotJobDoc::is_finished).await;
+        assert_eq!(done.status, JobStatus::Completed);
+        assert_eq!(done.tables[0].status, JobTableStatus::Completed);
+        assert_eq!(done.tables[0].rows_done, 3);
+        assert!(done.finished_at.is_some());
+        assert_eq!(f.ids("a"), [1, 2, 3]);
+        assert_eq!(f.builds(), 2, "the job's restart");
+    }
+
+    /// A job's table that halts while its snapshot runs fails, with the halt's code, once the
+    /// halt is recorded (with the next flush, here a change of another table's), and the job
+    /// ends failed.
+    #[tokio::test(start_paused = true)]
+    async fn a_job_table_that_halts_fails_the_job() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a", "b"]);
+        let mut n = node("n1", &store, &docs, &f);
+        until(&mut n.status, "running", is(Actual::Running)).await;
+        f.source.fail(
+            Method::ReadChunk,
+            SourceError::TableHalt {
+                table: t("a"),
+                reason: data_avalanche_core::HaltReason::TableDropped,
+            },
+        );
+        ask_job(&docs, "p~1", &["a"]).await;
+        docs.request(Action::Restart, asked("p~1")).await.unwrap();
+        eventually("a second worker", || f.builds() == 2).await;
+        until(&mut n.status, "a halted", |s| {
+            s.worker
+                .as_ref()
+                .is_some_and(|w| w.halted.contains_key(&t("a")))
+        })
+        .await;
+        f.source.commit(FakeTxn::new().insert(&t("b"), row(1)));
+        let done = job_until(&docs, "p~1", "the job ends", SnapshotJobDoc::is_finished).await;
+        assert_eq!(done.status, JobStatus::Failed);
+        let error = done.tables[0].error.clone().unwrap();
+        assert!(error.starts_with("TABLE_DROPPED: "), "{error}");
+        assert_eq!(
+            done.error.as_deref(),
+            Some(format!("1 of 1 tables failed: public.a ({error})").as_str())
+        );
+    }
+
+    /// A job left by an earlier owner is followed by the next: its term's first worker takes
+    /// the queued tables, and the owner sees them to their end without a request.
+    #[tokio::test(start_paused = true)]
+    async fn a_new_owner_follows_the_jobs_it_finds() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a"]);
+        f.source.load(&t("a"), (1..=2).map(row).collect());
+        ask_job(&docs, "p~1", &["a"]).await;
+        let _n = node("n1", &store, &docs, &f);
+        let done = job_until(&docs, "p~1", "the job ends", SnapshotJobDoc::is_finished).await;
+        assert_eq!(done.status, JobStatus::Completed);
+        assert_eq!(f.ids("a"), [1, 2]);
         assert_eq!(f.builds(), 1);
     }
 
