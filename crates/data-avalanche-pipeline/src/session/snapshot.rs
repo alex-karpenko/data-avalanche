@@ -383,12 +383,17 @@ impl Session<'_> {
             self.core.writers_waited.remove(table);
             let ticket = self.snaps.reconciler.issue();
             let source = Arc::clone(&self.core.source);
+            let observer = Arc::clone(&self.core.observer);
             let after = snap.cursor.clone();
             let limit = self.core.settings.chunk_size;
             let table = table.clone();
             self.snaps.reads.spawn(async move {
                 let read_at_micros = micros_now();
+                let started = Instant::now();
                 let result = source.read_chunk(&schema, after.as_ref(), limit).await;
+                if result.is_ok() {
+                    observer.chunk_read(started.elapsed());
+                }
                 Read {
                     table,
                     ticket,
@@ -671,7 +676,7 @@ mod tests {
 
     use super::*;
     use crate::session::Core;
-    use crate::test_support::{World, Yaml, row, t, wait_until};
+    use crate::test_support::{Ears, Heard, World, Yaml, row, t, wait_until};
     use crate::{Backoff, Command, Exit, Hooks, Phase, ReconcileLog, WorkerStatus};
 
     fn chunks_of(n: u64) -> Pipeline {
@@ -801,6 +806,28 @@ mod tests {
             4,
             "two, two, one, then the empty chunk"
         );
+    }
+
+    /// Each chunk read is reported, the last, empty one included.
+    #[tokio::test]
+    async fn each_chunk_read_is_reported() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.source.load(&t("a"), rows(1..=5));
+        w.request(&["a"]).await;
+        let (mut core, control, status) = w.core(&chunks_of(2), &["a"]);
+        let ears = Arc::new(Ears::default());
+        core.observer = ears.clone();
+        run(core, control, status, async |status| {
+            snapshot_done(&w, &status, "a").await;
+        })
+        .await;
+        let chunks = ears
+            .heard()
+            .into_iter()
+            .filter(|h| *h == Heard::ChunkRead)
+            .count();
+        assert_eq!(chunks, 4, "two, two, one, then the empty chunk");
     }
 
     #[tokio::test]

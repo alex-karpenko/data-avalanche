@@ -25,8 +25,8 @@ use crate::session::{Core, End, Session};
 use crate::settings::Settings;
 use crate::status::Streak;
 use crate::{
-    Command, CommitGuard, Exit, HookAction, HookPoint, Hooks, NoHooks, Phase, Tuning, Unguarded,
-    WorkerError, WorkerStatus,
+    Command, CommitGuard, Exit, HookAction, HookPoint, Hooks, NoHooks, NoObserver, Observer, Phase,
+    Tuning, Unguarded, WorkerError, WorkerStatus,
 };
 
 /// What a worker runs against.
@@ -40,6 +40,8 @@ pub struct WorkerDeps {
     pub owner_epoch: u64,
     pub guard: Arc<dyn CommitGuard>,
     pub hooks: Arc<dyn Hooks>,
+    /// Hears the flushes, the commits and the chunk reads (the owner's metrics).
+    pub observer: Arc<dyn Observer>,
     /// Whether this lease term already ended the stream position's other reader (DA-SRC-28):
     /// every worker run of the term shares it.
     pub reader_ended: Arc<AtomicBool>,
@@ -63,6 +65,7 @@ impl WorkerDeps {
             owner_epoch: 1,
             guard: Arc::new(Unguarded),
             hooks: Arc::new(NoHooks),
+            observer: Arc::new(NoObserver),
             reader_ended: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -102,6 +105,7 @@ impl PipelineWorker {
             owner_epoch: deps.owner_epoch,
             guard: deps.guard,
             hooks: deps.hooks,
+            observer: deps.observer,
             tuning,
             control: control_rx,
             status: status_tx,

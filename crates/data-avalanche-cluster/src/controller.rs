@@ -15,8 +15,8 @@ use std::time::Duration;
 use data_avalanche_config::Pipeline;
 use data_avalanche_core::{Sink, SourceConnector, SourceError};
 use data_avalanche_pipeline::{
-    Backoff, Command, CommitGuard, Exit, Hooks, Phase, PipelineWorker, Recovery, Tuning,
-    WorkerDeps, WorkerError, WorkerHandle, WorkerStatus,
+    Backoff, Command, CommitGuard, Exit, Hooks, NoObserver, Phase, PipelineWorker, Recovery,
+    Tuning, WorkerDeps, WorkerError, WorkerHandle, WorkerStatus,
 };
 use data_avalanche_state::{
     ActualState, DesiredState, Holder, Leases, PipelineDocs, RequestsDoc, StatusDoc,
@@ -997,6 +997,7 @@ impl PipelineController {
             owner_epoch: run.owner_epoch,
             guard: run.guard.clone(),
             hooks: parts.hooks,
+            observer: Arc::new(NoObserver),
             reader_ended: Arc::clone(reader_ended),
         };
         let (worker, handle) =

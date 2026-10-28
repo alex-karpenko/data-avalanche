@@ -25,8 +25,45 @@ use crate::settings::Settings;
 use crate::status::Streak;
 use crate::{
     Accumulator, Backoff, Command, CommitGuard, FlushPolicy, HookAction, HookPoint, Hooks, Lineage,
-    NoHooks, Tuning, Unguarded, WorkerStatus,
+    NoHooks, NoObserver, Observer, Tuning, Unguarded, WorkerStatus,
 };
+
+/// What an [`Ears`] observer heard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Heard {
+    Flushed { rows: u64 },
+    Committed { rows: u64 },
+    CommitFailed,
+    ChunkRead,
+}
+
+/// An observer that keeps what it hears, in order.
+#[derive(Debug, Default)]
+pub(crate) struct Ears(Mutex<Vec<Heard>>);
+
+impl Ears {
+    pub fn heard(&self) -> Vec<Heard> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+impl Observer for Ears {
+    fn flushed(&self, rows: u64, _: Duration) {
+        self.0.lock().unwrap().push(Heard::Flushed { rows });
+    }
+
+    fn committed(&self, rows: u64, _: Duration) {
+        self.0.lock().unwrap().push(Heard::Committed { rows });
+    }
+
+    fn commit_failed(&self) {
+        self.0.lock().unwrap().push(Heard::CommitFailed);
+    }
+
+    fn chunk_read(&self, _: Duration) {
+        self.0.lock().unwrap().push(Heard::ChunkRead);
+    }
+}
 
 /// A PostgreSQL → Delta pipeline `p` reading `public.*`, with more `tables` keys (YAML lines
 /// indented six spaces), more `sink` and `postgres` keys (YAML flow entries).
@@ -428,6 +465,7 @@ impl World {
             owner_epoch: 1,
             guard: Arc::new(Unguarded),
             hooks: Arc::new(NoHooks),
+            observer: Arc::new(NoObserver),
             tuning: fast(),
             control: control_rx,
             status,

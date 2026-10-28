@@ -10,6 +10,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Instant;
 
 use data_avalanche_core::{
     Checkpoint, CommitMarker, CommitOutcome, HaltReason, ServerIdentity, Sink, SinkError,
@@ -22,7 +23,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::backoff::Backoff;
 use crate::checkpoint::{Doc, Store};
-use crate::{CommitGuard, HookAction, HookPoint, Hooks, WorkerError};
+use crate::{CommitGuard, HookAction, HookPoint, Hooks, Observer, WorkerError};
 
 /// One flush and what becomes durable with it.
 #[derive(Debug)]
@@ -68,6 +69,7 @@ pub(crate) struct WriterCtx {
     pub owner_epoch: u64,
     pub guard: Arc<dyn CommitGuard>,
     pub hooks: Arc<dyn Hooks>,
+    pub observer: Arc<dyn Observer>,
     pub backoff: Backoff,
 }
 
@@ -135,6 +137,8 @@ impl Writer {
     }
 
     async fn job(&mut self, job: Job) -> Result<(), WorkerError> {
+        let started = Instant::now();
+        let rows = job.change_sets.iter().map(rows_of).sum();
         // A table the sink refused keeps that halt, its reason and its `at`: a halt the session
         // sends after it (one whose flush the sink refused, final review M1) would claim the
         // sink holds the refused rows.
@@ -182,6 +186,7 @@ impl Writer {
             self.state(Write::Schema(schema)).await?;
         }
         drop(job.permit);
+        self.ctx.observer.flushed(rows, started.elapsed());
         let _ = self.events.send(WriterEvent::Durable(job.checkpoint));
         Ok(())
     }
@@ -194,13 +199,25 @@ impl Writer {
             committed_position: cs.position.end.clone(),
             pipeline_id: self.ctx.pipeline_id.clone(),
         };
+        let rows = rows_of(&cs);
+        let observer = Arc::clone(&self.ctx.observer);
         let mut attempt = 0;
         loop {
             if !self.ctx.guard.may_commit() {
                 return Err(WorkerError::LeaseLost);
             }
-            match self.ctx.sink.commit(cs.clone(), marker.clone()).await {
-                Ok(CommitOutcome::Committed { .. } | CommitOutcome::SkippedCovered) => {
+            let at = Instant::now();
+            let outcome = self.ctx.sink.commit(cs.clone(), marker.clone()).await;
+            if outcome.is_err() {
+                observer.commit_failed();
+            }
+            match outcome {
+                Ok(CommitOutcome::Committed { .. }) => {
+                    observer.committed(rows, at.elapsed());
+                    self.degraded(None);
+                    return Ok(None);
+                }
+                Ok(CommitOutcome::SkippedCovered) => {
                     self.degraded(None);
                     return Ok(None);
                 }
@@ -268,6 +285,11 @@ impl Writer {
     }
 }
 
+/// A change set's rows: its upserts and its deletes.
+fn rows_of(cs: &TableChangeSet) -> u64 {
+    (cs.upsert_rows() + cs.delete_rows()) as u64
+}
+
 /// One state document a job writes.
 #[derive(Clone, Copy)]
 enum Write<'a> {
@@ -290,7 +312,9 @@ mod tests {
 
     use super::*;
     use crate::NoHooks;
-    use crate::test_support::{CrashAt, FlakyStore, Switch, accumulator, docs, lsn, schema, txn};
+    use crate::test_support::{
+        CrashAt, Ears, FlakyStore, Heard, Switch, accumulator, docs, lsn, schema, txn,
+    };
 
     const FAST: Backoff = Backoff {
         first: Duration::from_millis(1),
@@ -305,6 +329,7 @@ mod tests {
         /// The checkpoint's document, and the server it is recorded with.
         checkpoints: Store,
         server: Option<ServerIdentity>,
+        ears: Arc<Ears>,
     }
 
     async fn rig(tables: &[&str]) -> Rig {
@@ -325,6 +350,7 @@ mod tests {
                 intent: None,
             },
             server: None,
+            ears: Arc::default(),
         }
     }
 
@@ -361,6 +387,7 @@ mod tests {
                 owner_epoch: 1,
                 guard,
                 hooks,
+                observer: self.ears.clone(),
                 backoff: FAST,
             };
             let (jobs_tx, jobs_rx) = mpsc::unbounded_channel();
@@ -549,6 +576,70 @@ mod tests {
             .collect();
         assert_eq!(shape, ["degraded", "degraded", "recovered", "durable"]);
         assert_eq!(rows(&r, "a"), 1);
+    }
+
+    /// Each commit that landed reports its rows, then the flush reports them all once it is
+    /// durable. A set the sink already holds writes nothing: no commit is reported, the flush is.
+    #[tokio::test]
+    async fn a_flush_reports_each_commit_then_itself() {
+        let r = rig(&["a", "b"]).await;
+        let mut acc = accumulator(&["a", "b"], 100);
+        txn(
+            &mut acc,
+            1,
+            200,
+            &[("a", 1, "x"), ("a", 2, "x"), ("b", 1, "y")],
+        );
+        let f = acc.flush();
+        let again = job(crate::Flush {
+            change_sets: f.change_sets.clone(),
+            checkpoint: f.checkpoint.clone(),
+        });
+        r.run(vec![job(f), again], Arc::new(NoHooks)).await;
+        assert_eq!(
+            r.ears.heard(),
+            [
+                Heard::Committed { rows: 2 },
+                Heard::Committed { rows: 1 },
+                Heard::Flushed { rows: 3 },
+                Heard::Flushed { rows: 3 },
+            ]
+        );
+    }
+
+    /// Every failed attempt counts, the retried ones and the refusal.
+    #[tokio::test]
+    async fn every_failed_commit_attempt_is_reported() {
+        let r = rig(&["a", "b"]).await;
+        r.sink.fail(
+            SinkOp::Commit,
+            Some(&TableRef::new("public", "a")),
+            2,
+            || SinkError::Transient {
+                reason: "throttled".into(),
+            },
+        );
+        r.sink.fail(
+            SinkOp::Commit,
+            Some(&TableRef::new("public", "b")),
+            1,
+            || SinkError::Permanent {
+                reason: "column mismatch".into(),
+            },
+        );
+        let mut acc = accumulator(&["a", "b"], 100);
+        txn(&mut acc, 1, 200, &[("a", 1, "x"), ("b", 1, "y")]);
+        r.run(vec![job(acc.flush())], Arc::new(NoHooks)).await;
+        assert_eq!(
+            r.ears.heard(),
+            [
+                Heard::CommitFailed,
+                Heard::CommitFailed,
+                Heard::Committed { rows: 1 },
+                Heard::CommitFailed,
+                Heard::Flushed { rows: 2 },
+            ]
+        );
     }
 
     #[tokio::test]

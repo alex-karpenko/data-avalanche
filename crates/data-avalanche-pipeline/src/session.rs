@@ -31,8 +31,8 @@ use crate::status::Streak;
 use crate::watchdog::Watchdog;
 use crate::writer::{self, Job, WriterCtx, WriterEvent};
 use crate::{
-    Accumulator, AccumulatorError, Command, CommitGuard, Exit, FlushReason, Hooks, Phase, Tuning,
-    WorkerError, WorkerStatus,
+    Accumulator, AccumulatorError, Command, CommitGuard, Exit, FlushReason, Hooks, Observer, Phase,
+    Tuning, WorkerError, WorkerStatus,
 };
 
 /// What every session of one worker shares.
@@ -44,6 +44,7 @@ pub(crate) struct Core {
     pub owner_epoch: u64,
     pub guard: Arc<dyn CommitGuard>,
     pub hooks: Arc<dyn Hooks>,
+    pub observer: Arc<dyn Observer>,
     pub tuning: Tuning,
     pub control: mpsc::Receiver<Command>,
     pub status: watch::Sender<WorkerStatus>,
@@ -310,6 +311,7 @@ impl<'c> Session<'c> {
             owner_epoch: core.owner_epoch,
             guard: core.guard.clone(),
             hooks: core.hooks.clone(),
+            observer: core.observer.clone(),
             backoff: core.tuning.sink_backoff,
         };
         let writer = tokio::spawn(writer::run(ctx, jobs_rx, events_tx));
