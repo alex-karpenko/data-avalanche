@@ -160,13 +160,20 @@ pub(crate) async fn ask(
         Ok(jobs) => jobs,
         Err(e) => return unavailable(&e),
     };
+    // Two asks of one table at once can both pass this check, and take no lock for it: both
+    // jobs run, the start reads the table once, and both complete (D-M9b.4).
     for j in &unfinished {
         if let Some(t) = j.tables.iter().find(|t| {
             matches!(t.status, JobTableStatus::Queued | JobTableStatus::Running)
                 && tables.contains(&t.table)
         }) {
+            let queued = if j.status == JobStatus::Queued {
+                " (it is queued: a queued job runs at the pipeline's next start, a restart)"
+            } else {
+                ""
+            };
             return conflict(format!(
-                "job {} snapshots {} already; ask again once it ended",
+                "job {} snapshots {} already; ask again once it ended{queued}",
                 j.job_id,
                 table_name(&p, &t.table)
             ));
@@ -230,7 +237,8 @@ pub(crate) async fn get(State(api): State<Api>, Path(job_id): Path<String>) -> R
     };
     let (p, docs) = match find(node, pipeline).await {
         Ok(found) => found,
-        Err(_) => return missing().into(),
+        Err(f) if f.code == StatusCode::NOT_FOUND => return missing().into(),
+        Err(f) => return f.into(),
     };
     match docs.snapshot_job(&job_id).await {
         Ok(Some(v)) => body(StatusCode::OK, &job_json(&p, &v.doc)),
@@ -378,6 +386,19 @@ mod tests {
             error.contains("public.orders") && error.contains(&first),
             "{v}"
         );
+        assert!(error.contains("the pipeline's next start"), "queued: {v}");
+        docs.update_snapshot_job(&first, |j| {
+            j.tables[0].status = JobTableStatus::Running;
+            j.settle(Utc::now());
+        })
+        .await
+        .unwrap();
+        let (code, v) = ask(addr, r#"{"tables": ["public.orders"]}"#).await;
+        assert_eq!(code, 409, "{v}");
+        assert_eq!(
+            v["error"],
+            format!("job {first} snapshots public.orders already; ask again once it ended")
+        );
         docs.update_snapshot_job(&first, |j| {
             j.tables[0].status = JobTableStatus::Completed;
             j.settle(Utc::now());
@@ -441,5 +462,19 @@ mod tests {
             json_of(addr, "GET", "/v1/pipelines/nope/snapshots").await.0,
             404
         );
+    }
+
+    /// A job whose pipeline's state can't be read is a failure of the node, not a job missing.
+    #[tokio::test]
+    async fn a_job_whose_state_can_t_be_read_isn_t_a_404() {
+        let (_, lone, _docs, _dir) = served().await;
+        let mut node = lone.node.clone();
+        node.docs = std::sync::Arc::new(|_| Err("no bucket".into()));
+        let a = api(open());
+        a.node.set(node).unwrap();
+        let addr = serve(a).await;
+        let (code, v) = json_of(addr, "GET", "/v1/snapshots/orders~0190").await;
+        assert_eq!(code, 500, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("no bucket"), "{v}");
     }
 }
