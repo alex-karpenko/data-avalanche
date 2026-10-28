@@ -6460,4 +6460,14 @@ git commit -m "test(e2e): the catalogue scraped live, and the traces read back f
 
 ## Deviations during execution
 
-None yet.
+- **Task 2, a table's commit time** (fix commit after the task's commit). The plan's code reset
+  the timer at each attempt (`let at = Instant::now()` inside the retry loop of
+  `Writer::commit`), so `committed` timed only the attempt that landed. D-M10.2 and the research
+  doc say the time covers the table's commit, retries included. The timer now starts once,
+  before the loop, so the time covers every attempt and the backoff between them;
+  `Observer::committed`'s doc says so. `Ears` records each commit's time apart
+  (`commit_times()`), and `a_commit_is_timed_with_its_retries` pins it: three transient
+  failures under the test backoff take at least 3.5 ms, and the old placement measured about
+  0.2 ms. The writer's tests run on the real clock, so the test asserts a lower bound only. The
+  workspace has 1298 tests after Task 2, one more than Step 4 expects; the later tasks' totals
+  are one higher too.
