@@ -930,7 +930,7 @@ impl MySqlStream {
         match raw {
             types::HEARTBEAT | types::HEARTBEAT_V2 => {
                 self.offsets.heartbeat().map_err(payload_invalid)?;
-                self.catalog.shared.idle();
+                self.catalog.shared.caught_up();
                 if self.txn.is_none() && self.signals.is_none() {
                     self.keep_alive(true);
                 }

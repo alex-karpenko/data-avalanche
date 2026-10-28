@@ -273,6 +273,37 @@ async fn the_binlog_lag_is_the_age_of_the_last_commit_read() {
     cleanup(&n).await;
 }
 
+/// A stream that read to a heartbeat is 0 behind; once the server writes on and the stream
+/// doesn't read it, the lag counts from that heartbeat: the idle flag doesn't hide the stall.
+#[tokio::test]
+async fn an_idle_stream_that_stops_reading_lags_once_the_server_writes_on() {
+    require_it!();
+    let (n, mut a) = fresh("start_stall", "CREATE TABLE t (id INT PRIMARY KEY)").await;
+    let c = connector(&pipeline(&n, &["t"], "", ""));
+    let tables = c.resolve_tables().await.unwrap().tables;
+    let from = c.checkpoint_now().await.unwrap();
+    let mut s = c.open_stream(&from, &tables).await.expect("stream");
+    a.query_drop("INSERT INTO t VALUES (1)").await.unwrap();
+    to_commit(&mut s).await;
+    // The 1 s heartbeat of an idle dump comes as a keep-alive.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !matches!(s.next().await.unwrap(), StreamItem::KeepAlive(_)) {}
+    })
+    .await
+    .expect("a keep-alive within 10 s at a 1 s heartbeat");
+    let lag = async |c: &MySqlConnector| c.retained().await.expect("retained").expect("a log");
+    assert_eq!(lag(&c).await.behind, Some(Duration::ZERO), "caught up");
+    a.query_drop("INSERT INTO t VALUES (2)").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let r = lag(&c).await;
+    assert!(
+        r.behind.is_some_and(|b| b > Duration::ZERO),
+        "the server wrote on, the stream didn't read it: {r:?}"
+    );
+    let _ = Box::new(s).close().await;
+    cleanup(&n).await;
+}
+
 /// The changes up to the stream's next commit, and the commit's position, within 20 s.
 async fn to_commit(s: &mut MySqlStream) -> (Vec<CdcEvent>, SourcePosition) {
     tokio::time::timeout(Duration::from_secs(20), async {

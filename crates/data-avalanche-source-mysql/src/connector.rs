@@ -20,7 +20,7 @@ use crate::server::{
     Coverage, Flavour, Fold, Settings, access_denied, check_coverage, check_settings,
     grants_replication,
 };
-use crate::start::ReadAt;
+use crate::start::{CaughtUp, ReadAt, now_micros};
 
 /// The settings a reload changes while the connector runs (config §1.2, class R).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,7 +82,7 @@ impl Shared {
         *self.read_at() = Some(ReadAt {
             position: from.clone(),
             commit_micros: None,
-            idle: false,
+            caught_up: None,
         });
     }
 
@@ -91,14 +91,27 @@ impl Shared {
         *self.read_at() = Some(ReadAt {
             position: position.clone(),
             commit_micros: Some(commit_micros),
-            idle: false,
+            caught_up: None,
         });
     }
 
-    /// A heartbeat: the dump has nothing more to send.
-    pub(crate) fn idle(&self) {
+    /// A heartbeat: the dump has nothing more to send, as of now.
+    pub(crate) fn caught_up(&self) {
         if let Some(r) = self.read_at().as_mut() {
-            r.idle = true;
+            r.caught_up = Some(CaughtUp {
+                at_micros: now_micros(),
+                head: None,
+            });
+        }
+    }
+
+    /// The server's write position seen at the first check after the heartbeat, kept only if the
+    /// stream is still caught up and has no such position yet.
+    pub(crate) fn caught_up_head(&self, head: &SourcePosition) {
+        if let Some(c) = self.read_at().as_mut().and_then(|r| r.caught_up.as_mut())
+            && c.head.is_none()
+        {
+            c.head = Some(head.clone());
         }
     }
 

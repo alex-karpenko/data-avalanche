@@ -32,27 +32,60 @@ pub(crate) struct ReadAt {
     /// The last transaction's commit time (microseconds since the Unix epoch); `None` before the
     /// stream read one.
     pub commit_micros: Option<i64>,
-    /// A heartbeat came after it: the dump had nothing more to send.
-    pub idle: bool,
+    /// A heartbeat came after it: the dump had nothing more to send. A commit clears it.
+    pub caught_up: Option<CaughtUp>,
+}
+
+/// The stream caught up with the server at a heartbeat. The server's write position isn't known
+/// then, so the first check after it takes the position as the baseline: a write the server makes
+/// between the heartbeat and that check becomes the baseline, and a stall then shows only from
+/// the server's next write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CaughtUp {
+    /// The heartbeat's wall time (microseconds since the Unix epoch).
+    pub at_micros: i64,
+    /// The server's write position at the first check after the heartbeat.
+    pub head: Option<SourcePosition>,
 }
 
 /// How far the stream that read to `read` is behind the server's write position `head` at
-/// `now_micros`: zero once a heartbeat said the dump is idle, or the stream's position covers
-/// `head`; else the age of the last transaction it read. `None` when `head` is unknown, or the
-/// stream is behind without having read a transaction.
+/// `now_micros`, and the baseline to record for a stream that just caught up (even one at `head`:
+/// the baseline is where the server stood then). Zero when the stream's position covers `head`, or
+/// it caught up at a heartbeat and `head` hasn't moved past the baseline since; once `head` moved past it, the time since the heartbeat; else the age of
+/// the last transaction it read. Never negative. `None` when `head` is unknown, or the stream is
+/// behind without having read a transaction.
 pub(crate) fn behind(
     read: &ReadAt,
     head: Option<&SourcePosition>,
     now_micros: i64,
-) -> Option<Duration> {
-    if read.idle || read.position.covers(head?).unwrap_or(false) {
-        return Some(Duration::ZERO);
+) -> (Option<Duration>, Option<SourcePosition>) {
+    let Some(head) = head else {
+        return (None, None);
+    };
+    let since = |micros: i64| {
+        let age = now_micros.saturating_sub(micros);
+        Some(Duration::from_micros(u64::try_from(age).unwrap_or(0)))
+    };
+    let covered = read.position.covers(head).unwrap_or(false);
+    match &read.caught_up {
+        Some(CaughtUp { head: None, .. }) => (Some(Duration::ZERO), Some(head.clone())),
+        _ if covered => (Some(Duration::ZERO), None),
+        Some(CaughtUp {
+            at_micros,
+            head: Some(baseline),
+        }) => (
+            if baseline == head {
+                Some(Duration::ZERO)
+            } else {
+                since(*at_micros)
+            },
+            None,
+        ),
+        None => (read.commit_micros.and_then(since), None),
     }
-    let age = now_micros.saturating_sub(read.commit_micros?);
-    Some(Duration::from_micros(u64::try_from(age).unwrap_or(0)))
 }
 
-fn now_micros() -> i64 {
+pub(crate) fn now_micros() -> i64 {
     let since = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
@@ -200,10 +233,13 @@ impl MySqlConnector {
         };
         let behind = match self.shared.read() {
             None => None,
-            Some(read) if read.idle => Some(Duration::ZERO),
             Some(read) => {
                 let head = self.position_now().await.ok();
-                behind(&read, head.as_ref(), now_micros())
+                let (lag, baseline) = behind(&read, head.as_ref(), now_micros());
+                if let Some(baseline) = baseline {
+                    self.shared.caught_up_head(&baseline);
+                }
+                lag
             }
         };
         Ok(Some(RetainedLog {
@@ -224,40 +260,101 @@ mod tests {
         SourcePosition::BinlogFile(BinlogFilePos::new("binlog.000003", 154).unwrap())
     }
 
-    fn at(pos: u64, commit_micros: Option<i64>, idle: bool) -> ReadAt {
+    fn at(pos: u64, commit_micros: Option<i64>, caught_up: Option<CaughtUp>) -> ReadAt {
         ReadAt {
             position: SourcePosition::BinlogFile(BinlogFilePos::new("binlog.000003", pos).unwrap()),
             commit_micros,
-            idle,
+            caught_up,
         }
     }
 
-    /// At the server's write position, or idle by a heartbeat, the stream is 0 behind; short of
-    /// it, the last transaction it read is as old as the lag. Behind with nothing read, or
-    /// without the server's position, the lag is unknown.
+    fn head(pos: u64) -> SourcePosition {
+        SourcePosition::BinlogFile(BinlogFilePos::new("binlog.000003", pos).unwrap())
+    }
+
+    fn heartbeat(at_micros: i64, baseline: Option<u64>) -> Option<CaughtUp> {
+        Some(CaughtUp {
+            at_micros,
+            head: baseline.map(head),
+        })
+    }
+
+    /// At the server's write position the stream is 0 behind; short of it, the last transaction
+    /// it read is as old as the lag. Behind with nothing read, or without the server's position,
+    /// the lag is unknown.
     #[test]
     fn the_binlog_lag_is_zero_at_the_head_else_the_last_transaction_s_age() {
-        let head = SourcePosition::BinlogFile(BinlogFilePos::new("binlog.000003", 900).unwrap());
+        let h = head(900);
         let now = 10_000_000;
+        let lag = |r: ReadAt, h: Option<&SourcePosition>| behind(&r, h, now).0;
         assert_eq!(
-            behind(&at(900, Some(1_000_000), false), Some(&head), now),
+            lag(at(900, Some(1_000_000), None), Some(&h)),
             Some(Duration::ZERO)
         );
         assert_eq!(
-            behind(&at(500, Some(1_000_000), false), Some(&head), now),
+            lag(at(500, Some(1_000_000), None), Some(&h)),
             Some(Duration::from_secs(9))
         );
+        assert_eq!(lag(at(500, None, None), Some(&h)), None);
+        assert_eq!(lag(at(500, Some(1_000_000), None), None), None);
         assert_eq!(
-            behind(&at(500, Some(1_000_000), true), None, now),
-            Some(Duration::ZERO),
-            "a heartbeat came after it"
-        );
-        assert_eq!(behind(&at(500, None, false), Some(&head), now), None);
-        assert_eq!(behind(&at(500, Some(1_000_000), false), None, now), None);
-        assert_eq!(
-            behind(&at(500, Some(now + 5), false), Some(&head), now),
+            lag(at(500, Some(now + 5), None), Some(&h)),
             Some(Duration::ZERO),
             "a clock behind the server's reads no lag"
+        );
+    }
+
+    /// A stream that caught up at a heartbeat is 0 behind while the server writes nothing more;
+    /// once it writes past what the first check saw, the lag counts from the heartbeat.
+    #[test]
+    fn a_caught_up_stream_lags_from_its_heartbeat_once_the_server_writes_on() {
+        let now = 10_000_000;
+        let (lag, baseline) = behind(
+            &at(500, None, heartbeat(4_000_000, None)),
+            Some(&head(900)),
+            now,
+        );
+        assert_eq!(lag, Some(Duration::ZERO));
+        assert_eq!(
+            baseline,
+            Some(head(900)),
+            "the first check's head is recorded"
+        );
+        let (lag, baseline) = behind(
+            &at(500, None, heartbeat(4_000_000, Some(900))),
+            Some(&head(900)),
+            now,
+        );
+        assert_eq!((lag, baseline), (Some(Duration::ZERO), None));
+        let (lag, baseline) = behind(
+            &at(500, Some(1_000_000), heartbeat(4_000_000, Some(900))),
+            Some(&head(950)),
+            now,
+        );
+        assert_eq!((lag, baseline), (Some(Duration::from_secs(6)), None));
+        let (lag, _) = behind(
+            &at(500, None, heartbeat(now + 5, Some(900))),
+            Some(&head(950)),
+            now,
+        );
+        assert_eq!(lag, Some(Duration::ZERO), "a skewed clock reads no lag");
+        let (lag, _) = behind(&at(500, None, heartbeat(4_000_000, None)), None, now);
+        assert_eq!(lag, None, "no head, no lag");
+        let (lag, _) = behind(
+            &at(950, None, heartbeat(4_000_000, Some(900))),
+            Some(&head(950)),
+            now,
+        );
+        assert_eq!(lag, Some(Duration::ZERO), "the stream covers the head");
+        let (lag, baseline) = behind(
+            &at(900, None, heartbeat(4_000_000, None)),
+            Some(&head(900)),
+            now,
+        );
+        assert_eq!(
+            (lag, baseline),
+            (Some(Duration::ZERO), Some(head(900))),
+            "at the head, the baseline is recorded all the same"
         );
     }
 
