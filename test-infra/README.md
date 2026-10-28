@@ -18,6 +18,7 @@ on `PATH`; it fetches DuckDB itself.
 | mariadb-114, mariadb-1011 | mariadb:11.4, 10.11 | 53314, 53311 | root / avalanche | matrix |
 | rustfs (S3) | rustfs/rustfs:1.0.0 | 59000 | avalanche / avalanche-secret | default |
 | azurite (Azure Blob) | mcr.microsoft.com/azure-storage/azurite:3.37.0 | 10000 | Azurite's public dev account | default |
+| jaeger (OTLP/HTTP collector, query API) | jaegertracing/jaeger:2.21.0 | 54318 (OTLP), 56686 (query) | — | default |
 
 Bucket / container `data-avalanche-test` is created by the `init` profile (`up.sh` runs it). Azurite keeps
 port 10000 because `object_store`'s emulator mode always targets `127.0.0.1:10000`.

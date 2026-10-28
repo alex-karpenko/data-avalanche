@@ -142,15 +142,15 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v2
       # uv runs the type scenario's DuckDB read.
       - uses: astral-sh/setup-uv@v10.2.0
-      - name: Start ${{ matrix.target }}, mysql-84 and RustFS
+      - name: Start ${{ matrix.target }}, mysql-84, RustFS and Jaeger
         run: |
-          docker compose -f test-infra/compose.yaml up -d --wait "${{ matrix.target }}" mysql-84 rustfs
+          docker compose -f test-infra/compose.yaml up -d --wait "${{ matrix.target }}" mysql-84 rustfs jaeger
           docker compose -f test-infra/compose.yaml --profile init run --rm rustfs-init
       - name: Slice-1 E2E
         run: cargo test --locked -p data-avalanche --features e2e-hooks --test e2e -- --test-threads=1
       - name: Container logs on failure
         if: failure()
-        run: docker compose -f test-infra/compose.yaml logs --no-color "${{ matrix.target }}" mysql-84 rustfs
+        run: docker compose -f test-infra/compose.yaml logs --no-color "${{ matrix.target }}" mysql-84 rustfs jaeger
       - name: Stop the containers
         if: always()
         run: docker compose -f test-infra/compose.yaml down -v

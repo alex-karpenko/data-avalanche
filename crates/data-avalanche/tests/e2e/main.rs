@@ -16,6 +16,7 @@ mod idp;
 mod jobs;
 mod lifecycle;
 mod mysql;
+mod observability;
 mod proxy;
 mod reload;
 mod schema;

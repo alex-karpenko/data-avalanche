@@ -87,6 +87,8 @@ pub struct Options<'a> {
     pub pipelines: &'a str,
     /// `globals.api` entries beyond the address, e.g. `, auth: jwt, jwt: { … }`.
     pub api: &'a str,
+    /// More `globals` keys, one YAML line, e.g. `tracing: { otlp_endpoint: … }`.
+    pub globals: &'a str,
 }
 
 /// The rows [`E2e::insert_series`] gives a key `g`.
@@ -279,6 +281,7 @@ globals:
     lease_renewal_interval: 2s
     drain_timeout: 30s{cluster}
     memberlist: {{ node_name: "${{E2E_NODE}}", bind_addr: [127.0.0.1], bind_port: "${{E2E_GOSSIP_PORT}}", advertise_addr: 127.0.0.1, advertise_port: "${{E2E_ADVERTISE_PORT}}"{memberlist} }}
+  {globals}
 pipelines:
   {test}:
     id: {test}
@@ -298,6 +301,7 @@ pipelines:
             cluster = o.cluster.replace(", ", "\n    "),
             memberlist = o.memberlist,
             api = o.api,
+            globals = o.globals,
         )
     }
 

@@ -37,9 +37,9 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v2
       - uses: astral-sh/setup-uv@v10.2.0
-      - name: Start PostgreSQL ${{ matrix.version }} and RustFS
+      - name: Start PostgreSQL ${{ matrix.version }}, RustFS and Jaeger
         run: |
-          docker compose -f test-infra/compose.yaml --profile matrix up -d --wait "postgres-${{ matrix.version }}" rustfs
+          docker compose -f test-infra/compose.yaml --profile matrix up -d --wait "postgres-${{ matrix.version }}" rustfs jaeger
           docker compose -f test-infra/compose.yaml --profile init run --rm rustfs-init
       - name: PostgreSQL source tests
         run: 'cargo test --locked -p data-avalanche-source-pg --test pg --test slot_invalidation -- --test-threads=1 --skip tls::'
@@ -49,7 +49,7 @@ jobs:
         run: cargo test --locked -p data-avalanche --features e2e-hooks --test e2e -- --test-threads=1
       - name: Container logs on failure
         if: failure()
-        run: docker compose -f test-infra/compose.yaml --profile matrix logs --no-color "postgres-${{ matrix.version }}" rustfs
+        run: docker compose -f test-infra/compose.yaml --profile matrix logs --no-color "postgres-${{ matrix.version }}" rustfs jaeger
       - name: Stop the containers
         if: always()
         run: docker compose -f test-infra/compose.yaml --profile matrix down -v
@@ -99,15 +99,15 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v2
       - uses: astral-sh/setup-uv@v10.2.0
-      - name: Start ${{ matrix.service }} and RustFS
+      - name: Start ${{ matrix.service }}, RustFS and Jaeger
         run: |
-          docker compose -f test-infra/compose.yaml --profile matrix up -d --wait "${{ matrix.service }}" rustfs
+          docker compose -f test-infra/compose.yaml --profile matrix up -d --wait "${{ matrix.service }}" rustfs jaeger
           docker compose -f test-infra/compose.yaml --profile init run --rm rustfs-init
       - name: Slice-1 E2E
         run: cargo test --locked -p data-avalanche --features e2e-hooks --test e2e -- --test-threads=1
       - name: Container logs on failure
         if: failure()
-        run: docker compose -f test-infra/compose.yaml --profile matrix logs --no-color "${{ matrix.service }}" rustfs
+        run: docker compose -f test-infra/compose.yaml --profile matrix logs --no-color "${{ matrix.service }}" rustfs jaeger
       - name: Stop the containers
         if: always()
         run: docker compose -f test-infra/compose.yaml --profile matrix down -v
