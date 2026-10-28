@@ -6482,3 +6482,32 @@ git commit -m "test(e2e): the catalogue scraped live, and the traces read back f
   Both drive the session by hand, because the fake sink's `release_commits` can't release a
   single job. The workspace has 1304 tests after Task 3; the later tasks' totals are three
   higher than their Step 4s say.
+- **Task 4, an idle stream's binlog lag** (two commits after the task's commit; Oleksii decided
+  the behaviour 2026-10-28). The task's review found that D-M10.4's "after a server heartbeat,
+  `behind` is 0" stuck: the idle flag cleared only at the next commit read, and `retained()`
+  returned 0 for an idle read without asking the head. A MySQL pipeline that stopped reading
+  after a heartbeat (backpressure, a pause) showed 0 while the server wrote on; so did a long
+  first transaction read after an idle stretch. The spec says "`0` at the server's head", which
+  such a stream isn't.
+
+  What is built:
+  - `ReadAt.idle` became `caught_up: Option<CaughtUp { at_micros, head }>`. A heartbeat stamps
+    the time; a commit read, an open and a close clear it.
+  - `retained()` always asks the head. The first check after a heartbeat records the head it
+    sees as the baseline, before the "covers the head" test: the other order never records one
+    for a stream at the head, and hid the stall in the IT.
+  - The lag is 0 while the head equals the baseline or the stream covers it. Once the head moves
+    past, it is now − the heartbeat's time, clamped at 0. The baseline is written only onto the
+    caught-up period it was read for (matched by `at_micros`).
+  - A write between the heartbeat and the first check becomes the baseline; a stall then shows
+    from the server's next write (documented on `CaughtUp`). A repeated heartbeat resets the time
+    and the baseline.
+
+  Pinned by a unit test (with the old idle short-circuit restored it reads 0 for 6 s), and by an
+  IT, `an_idle_stream_that_stops_reading_lags_once_the_server_writes_on`. The IT waits for a
+  check at the head, then writes a row it doesn't read, and expects a lag above 0. It passed in
+  the MySQL test binary's parallel run: 144 tests, three times on `mysql-84` and once each on
+  `mysql-84-nogtid` and `mariadb-118`. The workspace has 1308 tests after Task 4.
+
+  The spec's definition of `binlog_lag_seconds` gains the idle case, approved separately. The
+  research doc's §2 matches.
