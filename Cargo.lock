@@ -1954,6 +1954,7 @@ dependencies = [
 name = "data-avalanche-telemetry"
 version = "0.1.0"
 dependencies = [
+ "data-avalanche-testkit",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

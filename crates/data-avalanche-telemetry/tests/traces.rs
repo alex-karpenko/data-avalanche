@@ -1,52 +1,11 @@
 //! The OTLP/HTTP export (config §6.6): a sampled span reaches the collector's `/v1/traces`; one
 //! not sampled doesn't; a span's ids are known only when it is sampled.
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
-use std::sync::mpsc;
 use std::time::Duration;
 
 use data_avalanche_telemetry::{Traces, trace_ids};
+use data_avalanche_testkit::otlp_collector as collector;
 use tracing_subscriber::layer::SubscriberExt;
-
-/// A collector on a thread of its own: each request's path and body, answered 200.
-fn collector() -> (String, mpsc::Receiver<(String, Vec<u8>)>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        for conn in listener.incoming() {
-            let mut conn = conn.unwrap();
-            let mut reader = BufReader::new(conn.try_clone().unwrap());
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            let path = line.split(' ').nth(1).unwrap_or_default().to_owned();
-            let mut length = 0;
-            loop {
-                let mut header = String::new();
-                reader.read_line(&mut header).unwrap();
-                if header == "\r\n" {
-                    break;
-                }
-                if let Some(v) = header.to_ascii_lowercase().strip_prefix("content-length:") {
-                    length = v.trim().parse().unwrap();
-                }
-            }
-            let mut body = vec![0; length];
-            reader.read_exact(&mut body).unwrap();
-            conn.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
-                .unwrap();
-            let _ = tx.send((path, body));
-        }
-    });
-    (url, rx)
-}
-
-fn contains(haystack: &[u8], needle: &str) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|w| w == needle.as_bytes())
-}
 
 /// Runs a `pipeline.flush` span with a `sink.commit` inside it under `traces`, and returns the
 /// flush's ids as the layer saw them.
@@ -70,8 +29,8 @@ fn a_sampled_flush_is_exported_to_the_collector() {
     assert!(traces.set(Some(&format!("{url}/")), 1.0).unwrap());
     let ids = flush(&traces);
     traces.shutdown();
-    let (path, body) = requests.recv_timeout(Duration::from_secs(10)).unwrap();
-    assert_eq!(path, "/v1/traces");
+    let request = requests.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(request.path, "/v1/traces");
     for text in [
         "pipeline.flush",
         "sink.commit",
@@ -79,7 +38,7 @@ fn a_sampled_flush_is_exported_to_the_collector() {
         "data-avalanche",
         "node-1",
     ] {
-        assert!(contains(&body, text), "{text}");
+        assert!(request.has(text), "{text}");
     }
     let (trace, span) = ids.expect("a sampled span has ids");
     assert_eq!((trace.len(), span.len()), (32, 16));

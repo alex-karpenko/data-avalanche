@@ -6,8 +6,10 @@ use std::sync::Arc;
 
 pub mod fake_source;
 pub mod memory_sink;
+pub mod otlp;
 pub use fake_source::{FakeSource, FakeTxn, Method};
 pub use memory_sink::{MemorySink, SinkOp};
+pub use otlp::{OtlpRequest, otlp_collector};
 
 use futures_util::TryStreamExt;
 use object_store::ObjectStore;

@@ -104,7 +104,11 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     // 1. A first load with a throwaway key: only globals.state and the cluster settings matter.
     let first = load_str(&text, &ProcessEnv, &FingerprintKey::random())
         .map_err(|r| Fatal::Config(render(&r)))?;
-    let logger = Arc::new(logging::init(&first.config.globals.log, &args).map_err(Fatal::Config)?);
+    let holder = node_identity(&first.config.globals.cluster, started)
+        .map_err(|e| Fatal::Config(e.to_string()))?;
+    let logger = Arc::new(
+        logging::init(&first.config.globals.log, &holder.node_id, &args).map_err(Fatal::Config)?,
+    );
     for w in &first.warnings {
         tracing::warn!("config: {}", line(w));
     }
@@ -132,12 +136,11 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
             let _ = http_stopped.await;
         },
     ));
-    let holder = node_identity(&first.config.globals.cluster, started)
-        .map_err(|e| Fatal::Config(e.to_string()))?;
     let buckets = Arc::new(Buckets::new(&first.config.globals));
     let joined = join(&buckets, &holder.node_id, &text, &first.config).await?;
     let config = joined.config;
     logger.apply(&config.globals.log);
+    logger.trace(&config.globals.tracing);
     auth.set(&config.globals.api);
     tracing::info!(
         node = %holder.node_id,
@@ -222,6 +225,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
             metrics: metrics.clone(),
             globals: Arc::new(move |g| {
                 log.apply(&g.log);
+                log.trace(&g.tracing);
                 reloaded_auth.set(&g.api);
             }),
         },
@@ -266,6 +270,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     let _ = stop_http.send(());
     let _ = server.await;
     tracing::info!("stopped");
+    logger.finish().await;
     Ok(())
 }
 
