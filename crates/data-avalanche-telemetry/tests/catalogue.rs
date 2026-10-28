@@ -179,3 +179,53 @@ fn per_table_adds_the_table_label_to_the_snapshot_series_only() {
         "no other series takes the table label"
     );
 }
+
+/// Each series the text names (`data_avalanche_…`), with the labels its selector matches on.
+fn selectors(text: &str) -> Vec<(String, Vec<String>)> {
+    let mut found = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("data_avalanche_") {
+        rest = &rest[at..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        let name = rest[..end].to_owned();
+        rest = &rest[end..];
+        let mut labels = Vec::new();
+        if let Some(selector) = rest.strip_prefix('{') {
+            let close = selector.find('}').expect("a closed selector");
+            labels = selector[..close]
+                .split(',')
+                .filter_map(|m| m.split_once('=').map(|(l, _)| l.trim().to_owned()))
+                .collect();
+        }
+        found.push((name, labels));
+    }
+    found
+}
+
+/// The example alert rules (`deploy/prometheus/alerts.yaml`, roadmap M10) name only series of
+/// the catalogue, and match only on the labels those carry; promtool runs them in CI.
+#[test]
+fn the_alert_rules_name_only_catalogued_series_and_labels() {
+    let rules = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/prometheus/alerts.yaml"
+    ));
+    let named = selectors(rules);
+    assert_eq!(named.len(), 5, "{named:?}");
+    for (name, labels) in named {
+        let (_, extra) = CATALOGUE
+            .iter()
+            .find(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("{name} isn't in the catalogue"));
+        let carried: Vec<&str> = PIPELINE
+            .iter()
+            .chain(extra.unwrap_or_default())
+            .copied()
+            .collect();
+        for label in labels {
+            assert!(carried.contains(&label.as_str()), "{name} has no {label}");
+        }
+    }
+}
