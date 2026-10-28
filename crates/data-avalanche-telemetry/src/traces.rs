@@ -37,17 +37,21 @@ pub enum TracesError {
 /// credentials in a templated endpoint) and without its query string.
 #[must_use]
 pub fn shown(endpoint: &str) -> String {
-    let end = endpoint.find(['?', '#']).unwrap_or(endpoint.len());
-    let endpoint = &endpoint[..end];
-    let Some((scheme, rest)) = endpoint.split_once("://") else {
+    let (scheme, rest) = endpoint
+        .split_once("://")
+        .map_or(("", endpoint), |(s, r)| (s, r));
+    // Over-redacts on purpose: any `@` ends the userinfo, even one in a path or query, because an
+    // unencoded password may hold `/`, `?` or `#` and a log line must err on the safe side.
+    let rest = rest.rsplit_once('@').map_or(rest, |(_, after)| after);
+    let rest = &rest[..rest.find(['?', '#']).unwrap_or(rest.len())];
+    if scheme.is_empty() && rest.len() == endpoint.len() {
         return endpoint.to_owned();
-    };
-    let authority_end = rest.find('/').unwrap_or(rest.len());
-    let (authority, path) = rest.split_at(authority_end);
-    let host = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
-    format!("{scheme}://{host}{path}")
+    }
+    if endpoint.contains("://") {
+        format!("{scheme}://{rest}")
+    } else {
+        rest.to_owned()
+    }
 }
 
 /// `text` with `endpoint` (an exporter's error may echo it) replaced by its shown form.
@@ -287,11 +291,19 @@ mod tests {
             ("https://u:secret@c:4318/p?k=v", "https://c:4318/p"),
             ("https://u@c:4318", "https://c:4318"),
             ("https://c:4318/p?token=x#f", "https://c:4318/p"),
-            ("http://c:4318/a@b", "http://c:4318/a@b"),
+            ("http://c:4318/a@b", "http://b"),
+            ("https://u:pa/ss@c:4318", "https://c:4318"),
+            ("https://u:pa?ss@c:4318", "https://c:4318"),
+            ("u:secret@c:4318", "c:4318"),
+            ("u:1234/x@c", "c"),
+            ("http://u:p@[::1]:4318/x", "http://[::1]:4318/x"),
             ("http://c:4318", "http://c:4318"),
             ("not a url", "not a url"),
         ] {
             assert_eq!(shown(given), shown_as, "{given}");
+            for secret in ["pa/ss", "pa?ss", "secret", "1234/x"] {
+                assert!(!shown(given).contains(secret), "{given}");
+            }
         }
     }
 
