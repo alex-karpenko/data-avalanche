@@ -6511,3 +6511,16 @@ git commit -m "test(e2e): the catalogue scraped live, and the traces read back f
 
   The spec's definition of `binlog_lag_seconds` gains the idle case (approved and applied 2026-10-28). The
   research doc's §2 matches.
+- **Task 6, the writer's diff over Task 2's fix.** Step 3's diff of `writer.rs` no longer applied:
+  its hunk on `Writer::commit` expects the timer inside the retry loop, where Task 2's fix took it
+  out. The task applied the plan's diff with that hunk re-applied by hand: the timer stays before
+  the loop, now in `attempts`, and the span's `attempts` and `outcome` are recorded as planned.
+  The other 14 diffs applied as given.
+- **Task 6, the resource before the batch thread** (a fix commit after the task's). The task's
+  review found a race in the plan's code. The provider hands the resource to the batch thread as
+  a message, and `Traces::exporter` read it from the `Switch`. A `set()` before the batch
+  thread had applied it built an exporter without `service.name`, `service.instance.id` or
+  `service.version`, which stayed until the endpoint changed. `Traces::new` now seeds the
+  `Switch` with the resource; the SDK applies the same value later.
+  `the_switch_carries_the_resource_before_the_batch_thread_applies_it` pins it: without the seed
+  it failed 5 runs of 5. The workspace has 1317 tests after Task 6.
