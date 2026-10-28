@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-27
+updated: 2026-10-28
 domain: Architecture
 tags: [v1, implementation-plan, m9b, api, snapshot, on-demand-snapshot, snapshot-jobs, halt, re-snapshot, cluster, e2e]
 resolves: [DA-SCHEMA-10]
@@ -132,9 +132,11 @@ pinned by a test in the task after the arrow.
    streamed into the lake later, by this run or a restart; a copy is a point-in-time read → Task 4
    (`a_table_outside_the_config_is_copied_and_not_streamed`), Task 7.
 5. **A typo, or a table dropped while its copy runs.** The job must fail that table with the
-   reason (`no such table`), finish the others, and record no halt the operator then has to clear
-   → Task 4 (`a_table_the_source_lacks_fails_in_its_job`), Task 6
-   (`a_request_names_its_tables_exactly`, for the names that can't be a table at all).
+   reason (`no such table`), finish the others, and record no halt the operator then has to clear (a copy's halt in the session goes at the
+   next start, once its job carries it) → Task 4 (`a_table_the_source_lacks_fails_in_its_job`), Task 6
+   (`a_request_names_its_tables_exactly`, for the names that can't be a table at all); since the
+   whole-branch review, `a_copy_halted_in_a_run_fails_its_job_and_its_halt_goes`,
+   `a_running_copy_halted_before_isn_t_read_again` and `a_copy_that_can_t_be_read_halts_alone`.
 
 ## Decisions and rulings
 
@@ -157,10 +159,10 @@ and its spec patches 2026-10-27.
 | D-M9b.3 | **A job's start** (Q-M9b-1). The API creates the job (`queued`), then requests a restart whose id is the job's. The owner lists the unfinished jobs when its term starts, when it takes a restart (before it discards the worker) and at a reload's restart; a failed listing is retried at the next poll. The new worker's Phase 0 takes the queued tables. This is M9a's restart: unflushed data is discarded and replayed from the confirmed position (Pipeline_Lifecycle §3), and the stream goes on from there. If the restart request can't be written after the job is, the answer is `503` with the job's id: the job runs at the pipeline's next start, and a retry is `409` naming it | A worker's tables are fixed at its start: a job taken by a running worker would need a new command and a mid-session Phase 0. The restart is proven (M9a), keeps every Phase 0 rule in one place, and the job's record survives the window before the owner's poll | Task 5 (`a_job_asked_runs_to_its_end`), Task 6 (`a_job_is_recorded_then_asked_of_the_holder`) |
 | D-M9b.4 | **What the ask refuses** (Q-M9b-4). `409` unless the desired state is running and a node holds the lease (an unreleased lease), like a restart; a pipeline in `ERROR` is accepted. `409` while an unfinished job has one of the tables queued or running, naming that job. `422` for a body that isn't `{"tables": [...]}` (an unknown field, so a `truncate`, is refused), names no table, has a `*`, a PostgreSQL name without its schema, or a MySQL name with a `.`. A name given twice is taken once, in order. `404` for an unknown pipeline, `503` while the node starts. Two asks on two nodes at once can both pass the check: both jobs run, the same rows upserted twice | A job is a restart: a paused or stopped pipeline must not run. The `409` on a held table turns a client's retry into an answer that names the first job, not a second snapshot | Task 6 (`a_job_of_a_paused_or_stopped_pipeline_is_refused`, `a_table_an_unfinished_job_holds_is_refused`, `a_request_names_its_tables_exactly`) |
 | D-M9b.5 | **Phase 0 and a job's table** (Task 3). A queued job table is snapshotted from its first row (`Snapshot { resume: false }`, the dump flag its mode's), whatever its snapshot mode decides. A running job table whose snapshot is in progress resumes from its cursor (`Snapshot { resume: !gap }`: after a gap it starts over, D-M6a). One no longer in progress goes by its mode, and the owner settles it from its snapshot document. Phase 0 records each queued table it requested as running, and each one it halted as failed, with `"<CODE>: <reason>"`; the halt stays | A job's `rows_done` must survive a crash, so a running job keeps its tables in the snapshot through any number of restarts. A table that can't start is the job's failure, visible in the job, and the halt is the table's | Task 3 (all four tests) |
-| D-M9b.6 | **A halted table a job asks for** (Task 3). A recorded halt of a queued job table that the catalog still resolves is cleared: its cached schema takes the catalog's source id (`with_source_id`: a table created again is the table the catalog has now), then is baselined. The change from the cached schema to the catalog's is planned and evolved as at a fresh start (Schema_Change §8.2), and the new schema cached. The source-id `TABLE_DROPPED` check is skipped for a queued job table. Its halt is cleared after the schemas are cached, so a restart in between finds the table halted and asked for still, and baselines it again. An unsafe change halts it again, and the job fails it. The persist order: halts, snapshot documents, the abandoned ones, schemas, the cleared halts, the job record, the checkpoint | D-M6a.1 keeps a persisted halt "until M9's re-snapshot", and Schema_Change §7.2 makes the operator's re-snapshot the way out of `TABLE_DROPPED`, an identifier change and `UNSAFE_DDL` | Task 3 (`a_job_clears_a_halt_and_baselines_the_table`, `a_job_table_that_halts_at_the_start_fails`), Task 7 (`a_job_clears_a_dropped_table_s_halt`) |
+| D-M9b.6 | **A halted table a job asks for** (Task 3). A recorded halt of a queued job table that the catalog still resolves is cleared: its cached schema takes the catalog's source id (`with_source_id`: a table created again is the table the catalog has now), then is baselined. The change from the cached schema to the catalog's is planned and evolved as at a fresh start (Schema_Change §8.2), and the new schema cached. The source-id `TABLE_DROPPED` check is skipped for a cleared table; an asked table with no recorded halt keeps it, so one created again while the pipeline was down halts at this start and its job fails it, and a second job clears the halt (40180b1, see the deviations). Its halt is cleared after the schemas are cached, so a restart in between finds the table halted and asked for still, and baselines it again. An unsafe change halts it again, and the job fails it. The persist order: halts, snapshot documents, the abandoned ones, schemas, the cleared halts, the job record, the checkpoint | D-M6a.1 keeps a persisted halt "until M9's re-snapshot", and Schema_Change §7.2 makes the operator's re-snapshot the way out of `TABLE_DROPPED`, an identifier change and `UNSAFE_DDL` | Task 3 (`a_job_clears_a_halt_and_baselines_the_table`, `a_job_table_that_halts_at_the_start_fails`), Task 7 (`a_job_clears_a_dropped_table_s_halt`) |
 | D-M9b.7 | **A job upserts** (Q-M9b-2). The sink table isn't truncated, and the request has no option for it. A row deleted at the source while the table was halted or not streamed stays in the lake. To start clean, the operator drops or moves the Delta table before asking; the job then creates it | Truncating means a metadata-only delete before the first chunk, reconciled with the stream's concurrent changes; the app never deletes sink data on its own (System-Overview OQ-M2) | Task 7 (`a_job_clears_a_dropped_table_s_halt`: the old row stays), Task 6 (`truncate` is `422`) |
-| D-M9b.8 | **A table outside the config is a copy** (Q-M9b-3, Task 4). The job tables that are neither resolved nor halted by the config are described by name (`describe_tables`). One the source skips (no such table, a partitioned parent, another database) or halts fails in its job, and no halt is recorded. A copy's sink table is ensured when absent (a refusal fails it, `SINK_REJECTED`). A queued copy starts from its first row; a running one resumes from its cursor; one no longer in progress is left to the owner. In the session a copy is added to the accumulator and read as a dump, retired once durable. Its schema is kept apart from the streamed tables', so the stream drops its changes, and it is cached nowhere: it is described again at every start while it runs. A copy that halts in the session records a halt (it fails its job), and a later job asking for it clears it | System-Overview: "may contain table(s) which isn't present in the pipeline config - do snapshot but don't stream data". Without the stream there is nothing to reconcile, so a copy is a read of each chunk as of its read, not of one instant | Task 4 (all three tests), Task 7 (`a_job_reads_a_table_again_and_copies_one_outside_the_config`) |
-| D-M9b.9 | **The owner follows the jobs** (Task 5). At each poll the controller reads `halts.json` once, then for each job it follows, each running table's progress: a halt fails it with `"<CODE>: <reason>"`; an in-progress snapshot gives `rows_done` from its cursor; a completed one completes it with `row_count`; anything else fails it ("its snapshot stopped before it completed"). A job is written only when it changed; one that ended is logged (`snapshot job ended`) and followed no more. A halt reaches `halts.json` with the session's next flush, so a job's failure shows then | The worker records only the start (D-M9b.5). The owner holds the lease and polls already, and the snapshot documents are the durable truth across workers and owners | Task 5 (all four tests) |
+| D-M9b.8 | **A table outside the config is a copy** (Q-M9b-3, Task 4). The job tables that are neither resolved nor halted by the config are described by name (`describe_tables`). One the source skips (no such table, a partitioned parent, another database) or halts fails in its job, and no halt is recorded. A copy's sink table is ensured when absent (a refusal fails it, `SINK_REJECTED`). A queued copy starts from its first row; a running one resumes from its cursor; one no longer in progress is left to the owner. In the session a copy is added to the accumulator and read as a dump, retired once durable. Its schema is kept apart from the streamed tables', so the stream drops its changes, and it is cached nowhere: it is described again at every start while it runs. A copy that halts in the session records a halt, so its job fails it; a read that fails for good halts only the copy (`NOT_REPLICABLE`). At the next start a running copy halted before isn't read again (its job fails it with the halt), and once its job carries the failure the halt of a table neither configured, cached nor read now is cleared (the whole-branch review's fixes, see the deviations) | System-Overview: "may contain table(s) which isn't present in the pipeline config - do snapshot but don't stream data". Without the stream there is nothing to reconcile, so a copy is a read of each chunk as of its read, not of one instant | Task 4 (all three tests), Task 7 (`a_job_reads_a_table_again_and_copies_one_outside_the_config`) |
+| D-M9b.9 | **The owner follows the jobs** (Task 5). At each poll the controller reads the jobs it follows, then `halts.json` once (in that order: the worker clears a halt before it records the table running), then each running table's progress: a halt fails it with `"<CODE>: <reason>"`; an in-progress snapshot gives `rows_done` from its cursor; a completed one completes it with `row_count`; anything else fails it ("its snapshot stopped before it completed"). A job is written only when it changed; one that ended is logged (`snapshot job ended`) and followed no more. A halt reaches `halts.json` with the session's next flush, so a job's failure shows then | The worker records only the start (D-M9b.5). The owner holds the lease and polls already, and the snapshot documents are the durable truth across workers and owners | Task 5 (all four tests) |
 | D-M9b.10 | **Tables by name** (Task 2). `SourceConnector::describe_tables(&[TableRef])` describes the tables in the order given, whatever the config's patterns include, and skips the config's table-set checks. PostgreSQL: a missing table is skipped `no such table`, a partitioned parent skipped as `select` skips it, an unlogged table halted. MySQL: a table of another database is skipped (`not in source.db <db>`), a missing one skipped, a system-versioned one halted. Both halt a table without an identifier (`NO_IDENTIFIER`). **MySQL channel C** takes a `SchemaHint::Columns` as a baseline to the catalog: the whole table, no rename proven (`Scope::Table`) | Phase 0 needs a copy's schema, and the pattern resolver can't find a table the patterns exclude. The MySQL refusal (`a column hint on a MySQL source`) halted every MySQL baseline with a column change `UNSAFE_DDL`, a fresh start's (§8.2) included: DA-SCHEMA-10, found by this plan's E2E on MySQL | Task 2 (all six tests), Task 7 on every MySQL target |
 | D-M9b.11 | **The routes** (Task 6), in M9a's route table, so the router, the role gate and the OpenAPI document take them at once: `POST /v1/pipelines/{id}/snapshots` (operator) answers `202` `{job_id, status, tables}`; `GET /v1/pipelines/{id}/snapshots` (viewer) `{"jobs": [...]}`, oldest request first; `GET /v1/snapshots/{job_id}` (viewer) the job: `{job_id, pipeline, status, tables: [{table, status, rows_done, error}], requested_at, requested_by, finished_at, error}`. Tables are named as the request names them. Each ask is logged with its caller. The OpenAPI document gains the `job_id` path parameter | API_RBAC §2's roles; D-M9a.9's one table | Task 6 (all five tests; the matrix and the OpenAPI snapshot tests) |
 
@@ -201,6 +203,15 @@ and its spec patches 2026-10-27.
 - Job documents accumulate: nothing removes an ended one, and the list and the ask's `409` check
   read every one (DA-SNAP-16).
 - A job upserts (D-M9b.7, DA-SNAP-15).
+- Found at execution (gap tracker §43.1):
+  - A table created again while the pipeline was down takes two jobs: the first fails it
+    `TABLE_DROPPED` and the halt is recorded; the second clears it (40180b1, DA-SNAP-18).
+  - A copy that halts in the session shows among the halted tables, in the status and the
+    metric, until the pipeline's next start clears it (DA-SNAP-19).
+  - A job document that can't be decoded stops the pipeline at its start, as any state
+    document does (`deny_unknown_fields`) (DA-SNAP-20).
+  - A job whose restart request wasn't written stays queued until the pipeline's next
+    start; the `409` of a table it holds says so (DA-SNAP-21).
 
 **Documents this plan changes:**
 
@@ -4650,16 +4661,44 @@ git commit -m "test(e2e): the snapshot jobs — a table read again and one outsi
 
 ## Exit
 
-- [ ] Every task's tests pass, and `cargo test --workspace` (1282 tests).
-- [ ] The source ITs on PostgreSQL 18, `mysql-84`, `mysql-84-nogtid` and `mariadb-118`.
-- [ ] The job scenarios on PostgreSQL 18, `mysql-84`, `mysql-84-nogtid` and `mariadb-118`; the
-  whole E2E suite on PostgreSQL 18.
-- [ ] Roadmap §4 M9's exit, M9b's part: "snapshot jobs (on-demand chunk loop; jobs persisted
+- [x] Every task's tests pass, and `cargo test --workspace` (1289 tests: the plan's 1282, one from
+  Task 3's fix, six from the whole-branch review's).
+- [x] The source ITs on PostgreSQL 18, `mysql-84`, `mysql-84-nogtid` and `mariadb-118` (Task 2,
+  at fa3aeb4; no source code changed after it).
+- [x] The job scenarios on PostgreSQL 18, `mysql-84`, `mysql-84-nogtid` and `mariadb-118`; the
+  whole E2E suite on PostgreSQL 18. (Measured at 2ad110d: the job scenarios 3/3 on each target;
+  the suite 45/45 on PostgreSQL 18.)
+- [x] Roadmap §4 M9's exit, M9b's part: "snapshot jobs (on-demand chunk loop; jobs persisted
   under `snapshots/jobs/`, listed via `GET /v1/pipelines/{id}/snapshots` after a restart or
   failover, running jobs resumed by the owner — Q-M9-1)": Tasks 3–5 and 7.
-- [ ] The OpenAPI snapshot carries the three routes, each with its role (Task 6).
+- [x] The OpenAPI snapshot carries the three routes, each with its role (Task 6).
 - [ ] The PR's CI green on every target.
 
 ## Deviations during execution
 
-None yet.
+Recorded from the SDD ledger. Each task's code was applied as verified: every task's commit has
+the tree of the plan's blocks applied on the commit before it (Task 4's blocks at an offset after
+Task 3's fix). Every change below came from a review, and each fix is its own commit after the
+task's.
+
+| Task | Commit | Deviation |
+|---|---|---|
+| 3 | 40180b1 | The source-id `TABLE_DROPPED` check was skipped for every asked table, but only a cleared one (a recorded halt the job asks for) is rebased and baselined. A table dropped and created again while the pipeline was down, not halted yet and asked for, kept its cached schema under the old source id, and the stream's rescan or the next start halted it after its job ran. Now the check is skipped only for a cleared table (`!cleared.contains`): such a table halts at this start, its job fails it `TABLE_DROPPED`, and a second job clears the halt. Halting and clearing in one pass was not taken: the checkpoint predates the drop, so the stream would replay the old table's events against the new schema, which nothing has verified. D-M9b.6 reworded to match. Test `a_table_created_again_halts_and_fails_its_job`. Workspace totals +1 from here. |
+| 7 | 97c5928 | The kill scenario couldn't tell a job resumed from its cursor from one started over (both end at 1000 rows, upserted). After the restart it now polls until the job ends and asserts `rows_done` never falls below the count seen before the kill: a resume never does, a start-over shows 0. The job ending in the milliseconds between the last poll and the kill stays a known vacuous window; Task 3's `a_running_job_table_resumes_from_its_cursor` pins the resume. |
+
+**The whole-branch review** (b6feacf..97c5928): no Critical. Three Important findings, all fixed
+before the PR in one fix wave, together with the cheap minors it triaged. The scoped re-review
+found every finding addressed and no new breakage. The plan's code blocks keep the planned text
+(Task 6's `409` message among them); the commits below are where the code differs.
+
+| Commit | Fix |
+|---|---|
+| f774f7c | **A halt a job's start cleared no longer fails that job.** The owner read `halts.json` before the job, and the worker clears the halt before it records the table running, so a poll between the two read a running table beside its old halt and failed the re-snapshot with the reason it fixed. The poll now reads the jobs it follows first, then `halts.json` once (D-M9b.9 reworded). A job that is gone is followed no more (logged `snapshot job gone`). Tests `a_halt_the_job_s_start_cleared_doesn_t_fail_the_job` (a store that does the worker's start right after the poll's halts read), `a_job_that_is_gone_is_followed_no_more`. |
+| 5c5db34 | **A copy's failure is its job's alone.** A chunk read of a copy that fails for good (a table outside the config the role can't read) ended the session, so the pipeline went to `ERROR`, and again at every restart while the job ran; now it halts only the copy (`NOT_REPLICABLE`), and the stream goes on. At a start, a running copy with a recorded halt isn't read again: its job fails it with the halt. After the job record, the halt of a table neither configured, cached nor read now is cleared, so a copy's halt no longer stays in `halts.json`, the status and the metric (for a dropped table no job could clear it). D-M9b.8 and Review Focus 5 reworded. The rule also clears the halt of a table taken out of the config before its schema was ever cached, which the pipeline no longer replicates. Tests `a_copy_that_can_t_be_read_halts_alone`, `a_copy_halted_in_a_run_fails_its_job_and_its_halt_goes`, `a_running_copy_halted_before_isn_t_read_again`. |
+| 60712b5 | `GET /v1/snapshots/{job_id}` answers 404 only for a job that isn't there: a pipeline state that can't be built is that failure (test `a_job_whose_state_can_t_be_read_isn_t_a_404`). The `409` of a table a queued job holds adds `(it is queued: a queued job runs at the pipeline's next start, a restart)` (DA-SNAP-21). A comment at the unfinished-jobs check says why two asks racing it need no lock (D-M9b.4). |
+| 2ad110d | `settle` is pinned for a failed table beside a running one, every table failed, a failure with no error and no tables; `is_finished` has its doc comment. |
+
+**Parked, with the review's triage:** the remaining minors of the task reviews (the SDD ledger)
+stay as they are: none changes behavior on a path that exists. Two are accepted edges: an
+undecodable job document stops the start (DA-SNAP-20), and the job's `error` string names a
+MySQL table `db.table` where its `tables[]` use the config key.
