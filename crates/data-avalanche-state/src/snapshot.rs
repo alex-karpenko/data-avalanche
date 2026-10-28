@@ -144,6 +144,7 @@ impl SnapshotJobDoc {
         }
     }
 
+    /// Completed or failed: the job has ended, and [`Self::settle`] leaves it as it is.
     pub fn is_finished(&self) -> bool {
         matches!(self.status, JobStatus::Completed | JobStatus::Failed)
     }
@@ -644,6 +645,31 @@ mod tests {
             doc.error.as_deref(),
             Some("1 of 2 tables failed: public.items (TABLE_DROPPED)")
         );
+
+        let mut doc = two_tables();
+        doc.tables[0].status = JobTableStatus::Failed;
+        doc.tables[1].status = JobTableStatus::Running;
+        assert!(doc.settle(t(6)));
+        assert_eq!(
+            doc.status,
+            JobStatus::Running,
+            "a table failed, one running"
+        );
+        assert_eq!((doc.finished_at, doc.error.as_deref()), (None, None));
+        doc.tables[1].status = JobTableStatus::Failed;
+        doc.tables[1].error = Some("TABLE_DROPPED".into());
+        assert!(doc.settle(t(7)));
+        assert_eq!(doc.status, JobStatus::Failed, "every table failed");
+        assert_eq!(
+            doc.error.as_deref(),
+            Some("2 of 2 tables failed: public.orders, public.items (TABLE_DROPPED)"),
+            "a table failed with no error is named alone"
+        );
+
+        let mut doc = two_tables();
+        doc.tables.clear();
+        assert!(!doc.settle(t(8)), "no tables: queued, as it was");
+        assert_eq!(doc.status, JobStatus::Queued);
     }
 
     #[tokio::test]
