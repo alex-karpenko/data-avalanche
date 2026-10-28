@@ -6524,3 +6524,26 @@ git commit -m "test(e2e): the catalogue scraped live, and the traces read back f
   `Switch` with the resource; the SDK applies the same value later.
   `the_switch_carries_the_resource_before_the_batch_thread_applies_it` pins it: without the seed
   it failed 5 runs of 5. The workspace has 1317 tests after Task 6.
+- **Task 7, the correlation above INFO** (a fix commit after the task's). The task's review found
+  that the plan's format layer lost the JSON correlation at any log level above INFO.
+  - The pipeline's spans are INFO. Under a per-layer filter, the formatter sees only the spans
+    its own filter enables. At `warn`, a WARN line inside a sampled commit had no `trace_id`,
+    `span_id` or `fields.pipeline` (reproduced on tracing-subscriber 0.3.23).
+  - The format layer's filter is now `spans_kept().or(<the log level>)`: the `data_avalanche`
+    spans at INFO and above always pass, and events follow the log level. The combined hint is
+    unbounded, so the INFO callsites stay registered, and the level's reload still works.
+  - `a_warn_level_line_keeps_its_ids_and_its_pipeline` pins it: at `warn` it asserts the ids
+    and the pipeline, and that an INFO event isn't written. It fails without the `.or(…)`.
+- **Task 7, the endpoint without its credentials** (the same fix commit and a second one). The
+  plan logged the resolved `otlp_endpoint` as is: in the info line at each start and reload, in
+  the "traces stay as they were" warning, and in `TracesError::Endpoint`'s Display. An endpoint
+  from `${VAR}` with basic-auth userinfo would have reached the logs.
+  - `telemetry::shown` now shows an endpoint without what precedes its last `@` after the
+    scheme (or from the start, without one), and without its query and fragment. It
+    over-redacts an `@` in a path, the safe side. The exporter still uses the endpoint as given.
+  - The exporter's own error echoes the URL (`invalid endpoint '…/v1/traces'`), so the reason is
+    redacted too.
+  - Unit tests cover userinfo, a user alone, a query, an unencoded `/`, `?` or `#` in the
+    password, no scheme, IPv6 and a plain URL. A Display test checks the password is absent.
+  - The workspace has 1325 tests after Task 7; the MySQL E2E halt scenarios passed on
+    `mysql-84` after the format filter changed.
