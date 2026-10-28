@@ -236,8 +236,8 @@ impl MySqlConnector {
             Some(read) => {
                 let head = self.position_now().await.ok();
                 let (lag, baseline) = behind(&read, head.as_ref(), now_micros());
-                if let Some(baseline) = baseline {
-                    self.shared.caught_up_head(&baseline);
+                if let (Some(baseline), Some(c)) = (baseline, &read.caught_up) {
+                    self.shared.caught_up_head(c.at_micros, &baseline);
                 }
                 lag
             }

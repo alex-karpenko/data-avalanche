@@ -105,10 +105,13 @@ impl Shared {
         }
     }
 
-    /// The server's write position seen at the first check after the heartbeat, kept only if the
-    /// stream is still caught up and has no such position yet.
-    pub(crate) fn caught_up_head(&self, head: &SourcePosition) {
+    /// The server's write position seen at the first check after the heartbeat at `at_micros`,
+    /// kept only if the stream is still in that caught-up period and has no such position yet: a
+    /// commit and a newer heartbeat during the check's query start another period, which a head
+    /// seen for the old one must not baseline.
+    pub(crate) fn caught_up_head(&self, at_micros: i64, head: &SourcePosition) {
         if let Some(c) = self.read_at().as_mut().and_then(|r| r.caught_up.as_mut())
+            && c.at_micros == at_micros
             && c.head.is_none()
         {
             c.head = Some(head.clone());

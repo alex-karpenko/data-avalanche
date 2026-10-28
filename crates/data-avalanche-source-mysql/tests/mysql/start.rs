@@ -285,14 +285,20 @@ async fn an_idle_stream_that_stops_reading_lags_once_the_server_writes_on() {
     let mut s = c.open_stream(&from, &tables).await.expect("stream");
     a.query_drop("INSERT INTO t VALUES (1)").await.unwrap();
     to_commit(&mut s).await;
-    // The 1 s heartbeat of an idle dump comes as a keep-alive.
+    // The 1 s heartbeat of an idle dump comes as a keep-alive; so does the first commit of
+    // another test's database, which isn't a heartbeat and may leave the stream short of the
+    // head. Check at each keep-alive until one finds the stream caught up.
+    let lag = async |c: &MySqlConnector| c.retained().await.expect("retained").expect("a log");
     tokio::time::timeout(Duration::from_secs(10), async {
-        while !matches!(s.next().await.unwrap(), StreamItem::KeepAlive(_)) {}
+        loop {
+            while !matches!(s.next().await.unwrap(), StreamItem::KeepAlive(_)) {}
+            if lag(&c).await.behind == Some(Duration::ZERO) {
+                return;
+            }
+        }
     })
     .await
-    .expect("a keep-alive within 10 s at a 1 s heartbeat");
-    let lag = async |c: &MySqlConnector| c.retained().await.expect("retained").expect("a log");
-    assert_eq!(lag(&c).await.behind, Some(Duration::ZERO), "caught up");
+    .expect("a check at a keep-alive reads 0 behind within 10 s at a 1 s heartbeat");
     a.query_drop("INSERT INTO t VALUES (2)").await.unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
     let r = lag(&c).await;
