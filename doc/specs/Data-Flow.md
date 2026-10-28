@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-23
+updated: 2026-10-27
 domain: Architecture
 tags: [architecture, data-flow, pipeline, cdc, iceberg, delta-lake, multi-sink, arrow, snapshot, replication]
 sources: []
@@ -688,9 +688,10 @@ membership, the lease registry) lives separately under `globals.state` per
     │     "completed_at": null                    // set on completion
     │   }
     ├── ...
-    └── jobs/<job_id>.json                        — on-demand snapshot jobs (tables, status, per-table
-                                                    progress, requested_at/by, finished_at); survive
-                                                    restart and failover
+    └── jobs/<job_id>.json                        — on-demand snapshot jobs, id <pipeline_id>~<suffix>
+                                                    (tables, each with its status, rows_done and
+                                                    error; status; requested_at/by; finished_at;
+                                                    error); survive restart and failover
 ```
 
 ---
@@ -705,13 +706,19 @@ Request payload: { tables: ["schema.orders", "schema.products"] }
                   (exact table names, no globs; may include tables not in pipeline config)
 
 1. Validate: tables list non-empty, no globs.
-   Persist a job record snapshots/jobs/<job_id>.json (status queued) before responding.
-2. For each table: run the Phase-1 chunk loop (watermark lw/hw + keyset chunks) WITHOUT pausing the
-   stream. Tables already in the streaming set keep streaming; the snapshot reconciles against the
-   live stream exactly as at startup.
+   Persist a job record snapshots/jobs/<job_id>.json (status queued) and request a restart of the
+   pipeline's worker under the job's id before responding.
+2. The owner takes the restart at its next poll; the new worker's Phase 0 snapshots each table from
+   its first row, a halted one with its halt cleared and its target baselined to the queried
+   schema (Schema_Change_Detection_and_Evolution.md §8.2). The stream resumes from the confirmed
+   position, as after any restart. For each table: run the Phase-1 chunk loop (watermark lw/hw +
+   keyset chunks) WITHOUT pausing the stream. Tables already in the streaming set keep streaming;
+   the snapshot reconciles against the live stream exactly as at startup.
 3. Tables not in the pipeline config: snapshot is written to the sink but the table is not added to
-   the pipeline's streaming set.
-4. Update snapshot_status = completed in state storage; mark the job completed (or failed, with
+   the pipeline's streaming set. Such a table is described by its exact name and copied: read
+   chunk by chunk, never streamed, so not reconciled.
+4. Update snapshot_status = completed in state storage. The owner follows each table to completed
+   or failed (a halt), from the table's snapshot state, and ends the job (completed, or failed with
    the error).
 5. Return the snapshot job ID; status via GET /v1/snapshots/{job_id}, all jobs of a pipeline via
    GET /v1/pipelines/{id}/snapshots.
@@ -723,7 +730,8 @@ cursors, like the Phase-1 snapshot does after a crash.
 
 There is **no stream pause and no `pause_lsn + 1` assumption**: watermarks reconcile re-snapshotted
 rows against concurrent changes, and idempotent upserts mean re-reading existing keys re-writes the
-same rows. This is also the mechanism for **re-snapshot-after-unsafe-DDL** (`Schema_Change_Detection_
+same rows. A job never truncates the target: a row deleted at the source while the table wasn't
+streamed stays. This is also the mechanism for **re-snapshot-after-unsafe-DDL** (`Schema_Change_Detection_
 and_Evolution.md` §8.2).
 
 ---

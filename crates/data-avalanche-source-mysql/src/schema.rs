@@ -19,7 +19,7 @@ use data_avalanche_core::{
     TableRef, TableSchema,
 };
 
-use crate::catalog::{plan_table, table_key};
+use crate::catalog::plan_table;
 use crate::connector::MySqlConnector;
 use crate::ddl::{Renamed, Scope, classify, renamed};
 use crate::server::Fold;
@@ -300,20 +300,15 @@ impl MySqlConnector {
         self.read_change(cached, hint).await
     }
 
-    /// The change the statement `hint` makes to `cached`, read from the catalog now. A table gone
-    /// from the catalog is dropped.
+    /// The change the statement `hint` makes to `cached`, read from the catalog now. A column
+    /// hint is a baseline to the catalog (a fresh start, a job's cleared halt): no statement, so
+    /// the whole table, with no rename proven. A table gone from the catalog is dropped.
     pub(crate) async fn read_change(
         &self,
         cached: &TableSchema,
         hint: &SchemaHint,
     ) -> Result<(SchemaDelta, Option<TableSchema>), SourceError> {
         let table = cached.table().clone();
-        let SchemaHint::Ddl(sql) = hint else {
-            return Err(SourceError::Permanent(format!(
-                "{}: a column hint on a MySQL source",
-                table_key(&table)
-            )));
-        };
         let halt = |reason| SourceError::TableHalt {
             table: table.clone(),
             reason,
@@ -332,7 +327,10 @@ impl MySqlConnector {
             ));
         };
         let now = now.map_err(halt)?;
-        let (columns, renames) = scope_of(sql, &table, self.shared.fold());
+        let (columns, renames) = match hint {
+            SchemaHint::Ddl(sql) => scope_of(sql, &table, self.shared.fold()),
+            SchemaHint::Columns(_) => (Scope::Table, vec![]),
+        };
         let new = scope(cached, &columns, &renames, &now).map_err(halt)?;
         let changes = diff(cached, &new, &renames);
         Ok((SchemaDelta { table, changes }, Some(new)))

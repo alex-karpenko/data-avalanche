@@ -61,6 +61,39 @@ async fn a_statement_s_change_is_scoped_to_its_columns() {
     cleanup(&n).await;
 }
 
+/// A baseline to the catalog (a fresh start, a job's cleared halt) has no statement: the whole
+/// table's change, with no rename proven.
+#[tokio::test]
+async fn a_baseline_takes_the_whole_table_from_the_catalog() {
+    require_it!();
+    let (n, mut a) = fresh(
+        "schema_baseline",
+        "CREATE TABLE t (id INT PRIMARY KEY, a INT, b VARCHAR(20));",
+    )
+    .await;
+    let c = connector(&pipeline(&n, &["t"], "", ""));
+    let cached = c.resolve_tables().await.unwrap().tables.remove(0);
+    a.query_drop("ALTER TABLE t DROP COLUMN b, ADD COLUMN note TEXT, CHANGE COLUMN a aa INT")
+        .await
+        .unwrap();
+    let catalog = c.resolve_tables().await.unwrap().tables.remove(0);
+    let hint = SchemaHint::Columns(catalog.columns().to_vec());
+    let (delta, now) = c.augment(&cached, &hint).await.unwrap();
+    assert_eq!(now.unwrap().columns(), catalog.columns());
+    assert_eq!(
+        delta.changes,
+        [
+            SchemaChange::DropColumn("a".into()),
+            SchemaChange::DropColumn("b".into()),
+            SchemaChange::AddColumn(catalog.columns()[1].clone()),
+            SchemaChange::AddColumn(catalog.columns()[2].clone()),
+        ],
+        "{:?}",
+        delta.changes
+    );
+    cleanup(&n).await;
+}
+
 #[tokio::test]
 async fn a_dropped_or_swapped_table() {
     require_it!();

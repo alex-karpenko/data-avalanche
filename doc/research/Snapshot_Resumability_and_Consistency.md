@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-14
+updated: 2026-10-28
 domain: Data Flow
 tags: [snapshot, resumability, incremental-snapshot, watermark, keyset, consistency, on-demand, cdc]
 resolves: [G-6, G-7, G-20, DA-SNAP-9, DA-SNAP-10]
@@ -198,6 +198,28 @@ loop run **without pausing the stream**. Watermarks reconcile the re-snapshotted
 concurrent changes; the stream position never has to be "assumed." This also makes
 **re-snapshot-after-unsafe-DDL** (schema-evolution §7.2) and ad-hoc snapshots use the identical
 mechanism. Idempotent upserts mean re-reading existing keys simply re-writes the same rows.
+
+**As built in M9b** (`doc/v1.0/M9b-snapshot-jobs.md`, D-M9b.3…9):
+- A job starts as a **restart of the worker** under the job's id (Q-M9b-1): the owner takes it at
+  its next poll, and the new worker's Phase 0 snapshots each job table from its first row,
+  whatever its snapshot mode. The stream isn't paused beyond that restart: it resumes from the
+  confirmed position, and the chunk loop reconciles as at any start.
+- A **halted** job table is the re-snapshot that clears its halt: its cached schema takes the
+  catalog's source id, is baselined to the catalog (§8.2 of schema-evolution), and the halt is
+  cleared after the new schema is cached. An unsafe change halts it again and fails the job. A
+  table dropped and created again while the pipeline was down, with no halt recorded yet, halts
+  `TABLE_DROPPED` at the job's start and fails that job; a second job clears it (the checkpoint
+  predates the drop, so the table isn't evolved under it in one pass; DA-SNAP-18).
+- A job **upserts** (Q-M9b-2): the target isn't truncated, so a row deleted at the source while
+  the table wasn't streamed stays (DA-SNAP-15); drop or move the target first to start clean.
+- A table **outside the config is a copy** (Q-M9b-3): described by exact name, read chunk by
+  chunk like a dump, never streamed, so there is nothing to reconcile it with: each chunk is
+  read as of its read, not as of one instant. Its schema is cached nowhere. A copy's failure is
+  its job's alone: a read that fails for good halts only the copy, and the pipeline's next start
+  fails a halted running copy in its job and clears the halt (DA-SNAP-19).
+- A running job table resumes from its §2 cursor after a crash or failover; the owner follows
+  each table from its snapshot document and the halt registry (the jobs read before the halts:
+  the worker clears a halt before it records the table running), and ends the job.
 
 ---
 

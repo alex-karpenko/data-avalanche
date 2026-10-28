@@ -14,6 +14,7 @@ mod cursor;
 mod decide;
 pub mod error;
 pub mod hooks;
+mod jobs;
 pub mod policy;
 mod reconcile;
 mod schema_change;

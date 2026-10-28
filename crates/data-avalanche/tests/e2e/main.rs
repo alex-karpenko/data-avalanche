@@ -13,6 +13,7 @@ mod forwarder;
 mod guards;
 mod harness;
 mod idp;
+mod jobs;
 mod lifecycle;
 mod mysql;
 mod proxy;

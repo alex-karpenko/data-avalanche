@@ -271,3 +271,33 @@ async fn a_reloaded_include_takes_the_next_resolve() {
     assert_eq!(names(c.resolve_tables().await.unwrap()), [t("a")]);
     cleanup(&a, &n).await;
 }
+
+/// An on-demand snapshot's tables, by exact name (Data-Flow §On-Demand Snapshot): one outside the
+/// config's patterns is described, one without an identifier halts, one that isn't there is
+/// skipped. Nothing of the config's table-set checks applies.
+#[tokio::test]
+async fn named_tables_are_described_whatever_the_config_includes() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(
+        &a,
+        "describe_named",
+        "CREATE TABLE orders (id bigint PRIMARY KEY, note text);
+         CREATE TABLE extra (id int PRIMARY KEY, v text);
+         CREATE TABLE nopk (a int);",
+    )
+    .await;
+    let c = connector(&pipeline(&n, &["orders"], "", ""));
+    let t = |name: &str| n.table(name);
+    let r = c
+        .describe_tables(&[t("extra"), t("nopk"), t("missing"), t("orders")])
+        .await
+        .expect("describe");
+    let names: Vec<TableRef> = r.tables.iter().map(|s| s.table().clone()).collect();
+    assert_eq!(names, [t("extra"), t("orders")]);
+    assert_eq!(r.tables[0].identifier(), ["id"]);
+    assert!(r.tables[0].source_id().is_some(), "the table's oid");
+    assert_eq!(r.halted, [(t("nopk"), HaltReason::NoIdentifier)]);
+    assert_eq!(r.skipped, [(t("missing"), "no such table".to_string())]);
+    cleanup(&a, &n).await;
+}

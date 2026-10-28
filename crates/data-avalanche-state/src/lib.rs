@@ -59,7 +59,7 @@ pub use pipeline::{
     SLOT_KEY, SlotDoc,
 };
 pub use snapshot::{
-    CursorKey, JOBS_PREFIX, JobStatus, JobTable, SnapshotCursor, SnapshotJobDoc, SnapshotStatus,
-    TableSnapshotDoc, job_key, table_snapshot_key,
+    CursorKey, JOBS_PREFIX, JobStatus, JobTable, JobTableStatus, SnapshotCursor, SnapshotJobDoc,
+    SnapshotStatus, TableSnapshotDoc, job_key, table_snapshot_key,
 };
 pub use tables::{HALTS_KEY, HaltsDoc, SCHEMAS_PREFIX, TableHalt, table_schema_key};

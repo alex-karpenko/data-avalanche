@@ -65,11 +65,7 @@ pub fn select(include: &[String], exclude: &[String], relations: &[Relation]) ->
             continue;
         }
         if r.kind == b'p' {
-            out.skipped.push((
-                r.table.clone(),
-                "a partitioned table: its changes arrive under its partitions; include those"
-                    .into(),
-            ));
+            out.skipped.push((r.table.clone(), PARTITIONED.into()));
             continue;
         }
         if !r.logged {
@@ -88,6 +84,36 @@ pub fn select(include: &[String], exclude: &[String], relations: &[Relation]) ->
     }
     out
 }
+
+/// The tables an on-demand snapshot names, each by its exact name (Data-Flow §On-Demand
+/// Snapshot), in the order given. A name the catalog lacks is skipped (`no such table`), a
+/// partitioned parent is skipped as [`select`] skips it, and an unlogged table halts.
+pub fn named(tables: &[TableRef], relations: &[Relation]) -> Selection {
+    let mut out = Selection::default();
+    for t in tables {
+        let Some(r) = relations.iter().find(|r| &r.table == t) else {
+            out.skipped.push((t.clone(), "no such table".into()));
+            continue;
+        };
+        if r.kind == b'p' {
+            out.skipped.push((r.table.clone(), PARTITIONED.into()));
+        } else if !r.logged {
+            out.halted.push((
+                r.table.clone(),
+                HaltReason::NotReplicable {
+                    reason: UNLOGGED.into(),
+                },
+            ));
+        } else {
+            out.tables.push((r.clone(), true));
+        }
+    }
+    out
+}
+
+/// Why a partitioned parent isn't a table of its own.
+const PARTITIONED: &str =
+    "a partitioned table: its changes arrive under its partitions; include those";
 
 /// One live, stored column (`attnum > 0`, not dropped, not generated: generated columns aren't in
 /// the stream).
@@ -692,5 +718,38 @@ mod tests {
             not_temporal.to_string().contains("date or timestamp"),
             "{not_temporal}"
         );
+    }
+
+    /// An on-demand snapshot names its tables exactly, whatever the config's patterns say
+    /// (Data-Flow §On-Demand Snapshot).
+    #[test]
+    fn named_tables_are_selected_by_their_exact_names() {
+        let relations = [
+            rel(1, "public", "orders", b'r'),
+            rel(2, "public", "events", b'p'),
+            Relation {
+                logged: false,
+                ..rel(3, "public", "cache", b'r')
+            },
+            rel(4, "audit", "orders", b'r'),
+        ];
+        let t = TableRef::new;
+        let sel = named(
+            &[
+                t("audit", "orders"),
+                t("public", "events"),
+                t("public", "cache"),
+                t("public", "missing"),
+            ],
+            &relations,
+        );
+        let got: Vec<(u32, bool)> = sel.tables.iter().map(|(r, e)| (r.oid, *e)).collect();
+        assert_eq!(got, [(4, true)]);
+        let skipped: Vec<&TableRef> = sel.skipped.iter().map(|(t, _)| t).collect();
+        assert_eq!(skipped, [&t("public", "events"), &t("public", "missing")]);
+        assert_eq!(sel.skipped[1].1, "no such table");
+        assert_eq!(sel.halted.len(), 1, "an unlogged table can't be read");
+        assert_eq!(sel.halted[0].0, t("public", "cache"));
+        assert!(sel.warnings.is_empty());
     }
 }

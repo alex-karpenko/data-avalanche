@@ -11,6 +11,7 @@ pub mod coordinator;
 pub mod discovery;
 mod error;
 pub mod gossip;
+mod jobs;
 pub mod lease;
 pub mod node;
 pub mod placement;

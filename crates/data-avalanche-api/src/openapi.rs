@@ -38,15 +38,20 @@ fn operation(r: &Route) -> utoipa::openapi::path::Operation {
         .extensions(Some(
             ExtensionsBuilder::new().add("x-min-role", role).build(),
         ));
-    if r.path.contains("{id}") {
-        op = op.parameter(
-            ParameterBuilder::new()
-                .name("id")
-                .parameter_in(ParameterIn::Path)
-                .required(Required::True)
-                .description(Some("the pipeline's id"))
-                .schema(Some(ObjectBuilder::new().schema_type(Type::String))),
-        );
+    for (name, description) in [
+        ("id", "the pipeline's id"),
+        ("job_id", "the snapshot job's id, `<pipeline id>~<suffix>`"),
+    ] {
+        if r.path.contains(&format!("{{{name}}}")) {
+            op = op.parameter(
+                ParameterBuilder::new()
+                    .name(name)
+                    .parameter_in(ParameterIn::Path)
+                    .required(Required::True)
+                    .description(Some(description))
+                    .schema(Some(ObjectBuilder::new().schema_type(Type::String))),
+            );
+        }
     }
     if let Some(content_type) = r.body {
         op = op.request_body(Some(
@@ -175,8 +180,10 @@ mod tests {
                         "{method} {path} {code}"
                     );
                 }
-                if path.contains("{id}") {
-                    assert_eq!(op["parameters"][0]["name"], "id", "{method} {path}");
+                for name in ["id", "job_id"] {
+                    if path.contains(&format!("{{{name}}}")) {
+                        assert_eq!(op["parameters"][0]["name"], name, "{method} {path}");
+                    }
                 }
             }
         }

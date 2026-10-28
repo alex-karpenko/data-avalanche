@@ -14,6 +14,7 @@ mod config;
 mod openapi;
 mod pipelines;
 mod server;
+mod snapshots;
 #[cfg(test)]
 mod test_support;
 
@@ -257,6 +258,53 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
             post(pipelines::flush),
         ),
         (
+            Route {
+                body: Some("application/json"),
+                ..r(
+                    "POST",
+                    "/v1/pipelines/{id}/snapshots",
+                    Operator,
+                    "Snapshot tables on demand, `{\"tables\": [...]}`, each named exactly; one outside the config is copied, not streamed",
+                    &[
+                        (
+                            202,
+                            "the job is queued: the owner restarts the worker, which takes its tables",
+                        ),
+                        UNKNOWN,
+                        (
+                            409,
+                            "paused, stopped, no node holds the lease, or an unfinished job holds a table",
+                        ),
+                        (
+                            422,
+                            "the body names no table, a glob, or a table not in the source's form",
+                        ),
+                    ],
+                )
+            },
+            post(snapshots::ask),
+        ),
+        (
+            r(
+                "GET",
+                "/v1/pipelines/{id}/snapshots",
+                Viewer,
+                "The pipeline's snapshot jobs, oldest first",
+                &[(200, "the jobs"), UNKNOWN],
+            ),
+            get(snapshots::list),
+        ),
+        (
+            r(
+                "GET",
+                "/v1/snapshots/{job_id}",
+                Viewer,
+                "A snapshot job: its status and each table's",
+                &[(200, "the job"), (404, "no such job")],
+            ),
+            get(snapshots::get),
+        ),
+        (
             r(
                 "POST",
                 "/v1/cluster/leave",
@@ -421,6 +469,9 @@ mod tests {
                 ("POST", "/v1/pipelines/{id}/resume", Operator),
                 ("POST", "/v1/pipelines/{id}/restart", Operator),
                 ("POST", "/v1/pipelines/{id}/flush", Operator),
+                ("POST", "/v1/pipelines/{id}/snapshots", Operator),
+                ("GET", "/v1/pipelines/{id}/snapshots", Viewer),
+                ("GET", "/v1/snapshots/{job_id}", Viewer),
                 ("POST", "/v1/cluster/leave", Admin),
                 ("POST", "/v1/admin/shutdown", Admin),
                 ("GET", "/v1/openapi.json", Viewer),

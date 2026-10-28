@@ -14,6 +14,7 @@
 //!   change, `augment` diffs by column name and `rescan` reports it. Like PostgreSQL's, `augment`
 //!   keeps to the columns a `Columns` hint names, so a catalog ahead of the hint adds nothing.
 //!   [`FakeSource::after_next_rescan`] acts between a rescan and the position read after it.
+//! - [`FakeSource::outside_config`] keeps a table in the catalog that the config doesn't include.
 //! - [`FakeSource::fail`] makes the next call of one method fail; [`FakeSource::hold_reads`]
 //!   holds chunk reads after they took their snapshot, so a test can commit while one is out.
 //!   [`FakeSource::share_connection`] makes chunk reads and other calls wait on each other, as
@@ -44,6 +45,7 @@ use tokio::sync::Notify;
 pub enum Method {
     Preflight,
     ResolveTables,
+    DescribeTables,
     Prepare,
     ResetPosition,
     Retained,
@@ -218,6 +220,8 @@ impl std::fmt::Debug for Action {
 #[derive(Debug)]
 struct Db {
     catalog: BTreeMap<TableRef, TableSchema>,
+    /// [`FakeSource::outside_config`].
+    unconfigured: BTreeSet<TableRef>,
     next_source_id: u64,
     rows: BTreeMap<TableRef, BTreeMap<Key, Row>>,
     /// Stalled transactions: the rows they changed, as they were before (`None`: absent).
@@ -281,6 +285,7 @@ impl FakeSource {
     pub fn new(tables: Vec<TableSchema>) -> Self {
         let mut db = Db {
             catalog: BTreeMap::new(),
+            unconfigured: BTreeSet::new(),
             next_source_id: 1000,
             rows: BTreeMap::new(),
             stalled: BTreeMap::new(),
@@ -418,6 +423,12 @@ impl FakeSource {
                 .collect());
         }
         db.catalog.insert(table.clone(), schema);
+    }
+
+    /// `table` stays in the catalog, but the config doesn't include it: `resolve_tables` leaves
+    /// it out, `describe_tables` finds it.
+    pub fn outside_config(&self, table: &TableRef) {
+        self.db().unconfigured.insert(table.clone());
     }
 
     /// Drops `table` from the catalog (it streams nothing more).
@@ -907,10 +918,29 @@ impl SourceConnector for FakeSource {
 
     async fn resolve_tables(&self) -> Result<ResolvedTables, SourceError> {
         self.take_fault(Method::ResolveTables)?;
+        let db = self.db();
         Ok(ResolvedTables {
-            tables: self.db().catalog.values().cloned().collect(),
+            tables: db
+                .catalog
+                .values()
+                .filter(|t| !db.unconfigured.contains(t.table()))
+                .cloned()
+                .collect(),
             ..ResolvedTables::default()
         })
+    }
+
+    async fn describe_tables(&self, tables: &[TableRef]) -> Result<ResolvedTables, SourceError> {
+        self.take_fault(Method::DescribeTables)?;
+        let db = self.db();
+        let mut out = ResolvedTables::default();
+        for t in tables {
+            match db.catalog.get(t) {
+                Some(schema) => out.tables.push(schema.clone()),
+                None => out.skipped.push((t.clone(), "no such table".into())),
+            }
+        }
+        Ok(out)
     }
 
     async fn prepare(
@@ -1675,5 +1705,37 @@ mod tests {
         assert!(held.is_err(), "held: {held:?}");
         src.release_stream();
         assert_eq!(s.next().await.unwrap(), StreamItem::KeepAlive(at));
+    }
+
+    /// A table the config doesn't include stays in the catalog: the resolve leaves it out, a
+    /// describe by name finds it; a name the catalog lacks is skipped.
+    #[tokio::test]
+    async fn a_table_outside_the_config_is_described_by_its_name() {
+        let extra = TableRef::new("public", "extra");
+        let src = FakeSource::new(vec![
+            schema(),
+            TableSchema::new(
+                extra.clone(),
+                vec![ColumnSchema::new("id", V::Int64, "bigint").not_null()],
+                vec!["id".into()],
+            )
+            .unwrap(),
+        ]);
+        src.outside_config(&extra);
+        let resolved = src.resolve_tables().await.unwrap();
+        let names: Vec<&TableRef> = resolved.tables.iter().map(TableSchema::table).collect();
+        assert_eq!(names, [&t()]);
+        let missing = TableRef::new("public", "missing");
+        let described = src
+            .describe_tables(&[extra.clone(), missing.clone()])
+            .await
+            .unwrap();
+        assert_eq!(described.tables, [src.schema(&extra)]);
+        assert_eq!(described.skipped, [(missing, "no such table".to_string())]);
+        src.fail(
+            Method::DescribeTables,
+            SourceError::Transient("down".into()),
+        );
+        assert!(src.describe_tables(&[extra]).await.is_err());
     }
 }

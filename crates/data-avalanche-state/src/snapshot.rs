@@ -67,7 +67,22 @@ impl Document for TableSnapshotDoc {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobStatus {
+    /// No table has started yet.
     Queued,
+    Running,
+    /// Every table completed.
+    Completed,
+    /// Every table ended, and one or more failed.
+    Failed,
+}
+
+/// Where one requested table of a job is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobTableStatus {
+    /// The owner hasn't started it yet.
+    Queued,
+    /// Its snapshot runs: its document is `in_progress`.
     Running,
     Completed,
     Failed,
@@ -77,8 +92,10 @@ pub enum JobStatus {
 #[serde(deny_unknown_fields)]
 pub struct JobTable {
     pub table: TableRef,
-    pub status: SnapshotStatus,
+    pub status: JobTableStatus,
     pub rows_done: u64,
+    /// Why it failed.
+    pub error: Option<String>,
 }
 
 /// An on-demand snapshot job (Data-Flow §On-Demand Snapshot); survives restart and failover.
@@ -91,12 +108,94 @@ pub struct SnapshotJobDoc {
     pub requested_at: DateTime<Utc>,
     pub requested_by: String,
     pub finished_at: Option<DateTime<Utc>>,
+    /// Which tables failed, once the job ended.
     pub error: Option<String>,
 }
 
 impl Document for SnapshotJobDoc {
     const KIND: &'static str = "snapshot job";
     const SCHEMA_VERSION: u64 = 1;
+}
+
+impl SnapshotJobDoc {
+    /// A job just asked for: it and every table queued.
+    pub fn new(
+        job_id: String,
+        tables: Vec<TableRef>,
+        requested_by: String,
+        requested_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            job_id,
+            status: JobStatus::Queued,
+            tables: tables
+                .into_iter()
+                .map(|table| JobTable {
+                    table,
+                    status: JobTableStatus::Queued,
+                    rows_done: 0,
+                    error: None,
+                })
+                .collect(),
+            requested_at,
+            requested_by,
+            finished_at: None,
+            error: None,
+        }
+    }
+
+    /// Completed or failed: the job has ended, and [`Self::settle`] leaves it as it is.
+    pub fn is_finished(&self) -> bool {
+        matches!(self.status, JobStatus::Completed | JobStatus::Failed)
+    }
+
+    /// Sets the job's status from its tables': queued while every table is, running while one
+    /// is queued or running, then completed or failed, at `now`. A finished job stays as it
+    /// ended. True when it changed.
+    pub fn settle(&mut self, now: DateTime<Utc>) -> bool {
+        if self.is_finished() {
+            return false;
+        }
+        let is = |s: JobTableStatus| move |t: &JobTable| t.status == s;
+        let status = if self.tables.iter().all(is(JobTableStatus::Queued)) {
+            JobStatus::Queued
+        } else if self
+            .tables
+            .iter()
+            .any(|t| matches!(t.status, JobTableStatus::Queued | JobTableStatus::Running))
+        {
+            JobStatus::Running
+        } else if self.tables.iter().all(is(JobTableStatus::Completed)) {
+            JobStatus::Completed
+        } else {
+            JobStatus::Failed
+        };
+        if status == self.status {
+            return false;
+        }
+        self.status = status;
+        if self.is_finished() {
+            self.finished_at = Some(now);
+            let failed: Vec<String> = self
+                .tables
+                .iter()
+                .filter(|t| t.status == JobTableStatus::Failed)
+                .map(|t| match &t.error {
+                    Some(e) => format!("{} ({e})", t.table),
+                    None => t.table.to_string(),
+                })
+                .collect();
+            if !failed.is_empty() {
+                self.error = Some(format!(
+                    "{} of {} tables failed: {}",
+                    failed.len(),
+                    self.tables.len(),
+                    failed.join(", ")
+                ));
+            }
+        }
+        true
+    }
 }
 
 /// `snapshots/<schema>.<table>.json`. Each name is escaped as a key segment and its dots become
@@ -182,6 +281,53 @@ impl PipelineDocs {
         job_id: &str,
     ) -> Result<Option<Versioned<SnapshotJobDoc>>, StateError> {
         self.docs.load(&job_key(job_id)).await
+    }
+
+    /// Changes job `job_id` with `f`, read-modify-write; `None` when there is no such job.
+    ///
+    /// # Errors
+    /// A storage or decode failure, or the last race error once the attempts run out.
+    pub async fn update_snapshot_job<F>(
+        &self,
+        job_id: &str,
+        mut f: F,
+    ) -> Result<Option<SnapshotJobDoc>, StateError>
+    where
+        F: FnMut(&mut SnapshotJobDoc) + Send,
+    {
+        let key = job_key(job_id);
+        if self.docs.load::<SnapshotJobDoc>(&key).await?.is_none() {
+            return Ok(None);
+        }
+        let v = self
+            .docs
+            .modify(&key, |cur: Option<SnapshotJobDoc>| {
+                let Some(mut doc) = cur else {
+                    return Err(StateError::Corrupt {
+                        key: key.clone(),
+                        kind: SnapshotJobDoc::KIND,
+                        reason: "deleted while it was updated".into(),
+                    });
+                };
+                f(&mut doc);
+                Ok(doc)
+            })
+            .await?;
+        Ok(Some(v.doc))
+    }
+
+    /// The jobs not finished yet, oldest request first.
+    ///
+    /// # Errors
+    /// As [`Self::snapshot_jobs`].
+    pub async fn unfinished_snapshot_jobs(&self) -> Result<Vec<SnapshotJobDoc>, StateError> {
+        Ok(self
+            .snapshot_jobs()
+            .await?
+            .into_iter()
+            .map(|v| v.doc)
+            .filter(|j| !j.is_finished())
+            .collect())
     }
 
     /// Every job of this pipeline, oldest request first.
@@ -366,19 +512,12 @@ mod tests {
     }
 
     fn job(id: &str, at: u32) -> SnapshotJobDoc {
-        SnapshotJobDoc {
-            job_id: id.into(),
-            status: JobStatus::Queued,
-            tables: vec![JobTable {
-                table: TableRef::new("public", "orders"),
-                status: SnapshotStatus::None,
-                rows_done: 0,
-            }],
-            requested_at: t(at),
-            requested_by: "admin".into(),
-            finished_at: None,
-            error: None,
-        }
+        SnapshotJobDoc::new(
+            id.into(),
+            vec![TableRef::new("public", "orders")],
+            "admin".into(),
+            t(at),
+        )
     }
 
     #[tokio::test]
@@ -417,5 +556,151 @@ mod tests {
             2,
             "a table named `jobs` isn't a job"
         );
+    }
+
+    fn two_tables() -> SnapshotJobDoc {
+        SnapshotJobDoc::new(
+            "orders~0199".into(),
+            vec![
+                TableRef::new("public", "orders"),
+                TableRef::new("public", "items"),
+            ],
+            "ops".into(),
+            t(0),
+        )
+    }
+
+    #[test]
+    fn a_job_json_shape() {
+        let mut doc = two_tables();
+        doc.tables[0].status = JobTableStatus::Running;
+        doc.tables[0].rows_done = 20_000;
+        doc.tables[1].status = JobTableStatus::Failed;
+        doc.tables[1].error = Some("no such table".into());
+        assert!(doc.settle(t(1)));
+        assert_eq!(
+            String::from_utf8(crate::doc::encode(&doc).to_vec()).unwrap(),
+            r#"{
+  "version": 1,
+  "job_id": "orders~0199",
+  "status": "running",
+  "tables": [
+    {
+      "table": {
+        "schema": "public",
+        "name": "orders"
+      },
+      "status": "running",
+      "rows_done": 20000,
+      "error": null
+    },
+    {
+      "table": {
+        "schema": "public",
+        "name": "items"
+      },
+      "status": "failed",
+      "rows_done": 0,
+      "error": "no such table"
+    }
+  ],
+  "requested_at": "2026-09-28T10:00:00Z",
+  "requested_by": "ops",
+  "finished_at": null,
+  "error": null
+}"#
+        );
+    }
+
+    /// A job is queued until a table starts, running while one is queued or running, then
+    /// completed when every table completed and failed otherwise, naming the failed tables.
+    #[test]
+    fn a_job_settles_once_every_table_ended() {
+        let mut doc = two_tables();
+        assert!(!doc.settle(t(1)), "every table queued: still queued");
+        assert_eq!(doc.status, JobStatus::Queued);
+        doc.tables[0].status = JobTableStatus::Running;
+        assert!(doc.settle(t(1)));
+        assert_eq!(doc.status, JobStatus::Running);
+        assert!(!doc.is_finished());
+        doc.tables[0].status = JobTableStatus::Completed;
+        assert!(!doc.settle(t(2)), "a table still queued: still running");
+        doc.tables[1].status = JobTableStatus::Completed;
+        assert!(doc.settle(t(3)));
+        assert_eq!(doc.status, JobStatus::Completed);
+        assert_eq!(doc.finished_at, Some(t(3)));
+        assert_eq!(doc.error, None);
+        assert!(doc.is_finished());
+        assert!(!doc.settle(t(4)), "a finished job stays as it ended");
+        assert_eq!(doc.finished_at, Some(t(3)));
+
+        let mut doc = two_tables();
+        doc.tables[0].status = JobTableStatus::Completed;
+        doc.tables[1].status = JobTableStatus::Failed;
+        doc.tables[1].error = Some("TABLE_DROPPED".into());
+        assert!(doc.settle(t(5)));
+        assert_eq!(doc.status, JobStatus::Failed);
+        assert_eq!(doc.finished_at, Some(t(5)));
+        assert_eq!(
+            doc.error.as_deref(),
+            Some("1 of 2 tables failed: public.items (TABLE_DROPPED)")
+        );
+
+        let mut doc = two_tables();
+        doc.tables[0].status = JobTableStatus::Failed;
+        doc.tables[1].status = JobTableStatus::Running;
+        assert!(doc.settle(t(6)));
+        assert_eq!(
+            doc.status,
+            JobStatus::Running,
+            "a table failed, one running"
+        );
+        assert_eq!((doc.finished_at, doc.error.as_deref()), (None, None));
+        doc.tables[1].status = JobTableStatus::Failed;
+        doc.tables[1].error = Some("TABLE_DROPPED".into());
+        assert!(doc.settle(t(7)));
+        assert_eq!(doc.status, JobStatus::Failed, "every table failed");
+        assert_eq!(
+            doc.error.as_deref(),
+            Some("2 of 2 tables failed: public.orders, public.items (TABLE_DROPPED)"),
+            "a table failed with no error is named alone"
+        );
+
+        let mut doc = two_tables();
+        doc.tables.clear();
+        assert!(!doc.settle(t(8)), "no tables: queued, as it was");
+        assert_eq!(doc.status, JobStatus::Queued);
+    }
+
+    #[tokio::test]
+    async fn the_unfinished_jobs_leave_out_the_ended_ones() {
+        let p = pipeline();
+        p.create_snapshot_job(&job("a", 1)).await.unwrap();
+        p.create_snapshot_job(&job("b", 2)).await.unwrap();
+        p.create_snapshot_job(&job("c", 3)).await.unwrap();
+        let ended = p
+            .update_snapshot_job("b", |j| {
+                j.tables[0].status = JobTableStatus::Completed;
+                j.settle(t(4));
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ended.status, JobStatus::Completed);
+        assert!(
+            p.update_snapshot_job("nope", |_| {})
+                .await
+                .unwrap()
+                .is_none(),
+            "no such job"
+        );
+        let ids: Vec<String> = p
+            .unfinished_snapshot_jobs()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|j| j.job_id)
+            .collect();
+        assert_eq!(ids, ["a", "c"]);
     }
 }

@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-24
+updated: 2026-10-27
 domain: Architecture
 tags: [v1, implementation-plan, roadmap, milestones, workspace, crates, interfaces, test-strategy, ci, risks]
 sources: []
@@ -413,6 +413,13 @@ pub enum StoreError { Conflict { key }, Contention { key }, Transient { key, rea
     (`requests.json`, `RequestsDoc { restart, flush: Option<Request { id, at }> }`, the last of
     each `Action`); and `transition(to) -> Transition { Changed { from }, Unchanged, Refused {
     current } }`, the desired state's checked compare-and-swap (Pipeline_Lifecycle §3).
+  - from M9b (D-M9b.2): the job document takes a status per table, `JobTable { table, status:
+    JobTableStatus { Queued, Running, Completed, Failed }, rows_done, error }`;
+    `SnapshotJobDoc::new(job_id, tables, requested_by, requested_at)` (all queued),
+    `is_finished`, and `settle(now)`, which derives the job's status from its tables' and, once
+    it ends, sets `finished_at` and `error`; `update_snapshot_job(job_id, f) ->
+    Option<SnapshotJobDoc>` (read-modify-write, `None` when absent) and
+    `unfinished_snapshot_jobs()`. The job id is `<pipeline_id>~<UUID v7 hex>` (Q-M9-2).
 
 Lease release is a **tombstone write** (object_store has no conditional delete). T1–T10 prove the lease CAS on every backend (`tests/lease_conformance.rs`, `test-infra/README.md`).
 
@@ -502,6 +509,15 @@ running connector a reloaded `data_avalanche_config::Pipeline` (core names no co
 PostgreSQL takes `heartbeat`, `slot_on_orphan`, `auto_cleanup` and the table patterns; MySQL takes
 `binlog_purge_action`, `heartbeat` and the table patterns. Each is read at the next connection,
 prepare, resolve or teardown; an open stream keeps what it opened with.
+
+From M9b (D-M9b.10): `async fn describe_tables(&self, tables: &[TableRef]) ->
+Result<ResolvedTables, SourceError>` describes tables by exact name, in the order given, whatever
+the config's patterns include and without its table-set checks (an on-demand snapshot's tables
+outside the config): a missing table is skipped `no such table`; a PostgreSQL partitioned parent
+skipped, an unlogged table halted; a MySQL table of another database skipped, a system-versioned
+one halted; a table without an identifier halted on both. MySQL's channel C takes a
+`SchemaHint::Columns` as a baseline to the catalog: the whole table, no rename proven
+(DA-SCHEMA-10; it was refused, which halted a MySQL baseline with a column change).
 
 ### 3.7 Cluster (Clustering §19–§20)
 
@@ -637,6 +653,13 @@ restart id discards the worker and runs a new one under the same lease (`ERROR` 
 desired state kept); a new flush id sends `Command::Flush`. `ConfigCoordinator::check(&self, text)
 -> Result<Checked { generation, warnings, changes }, ReloadError>` runs a reload's checks without
 the publish.
+
+From M9b (D-M9b.3, D-M9b.9): the controller lists the unfinished snapshot jobs when its term
+starts, when it takes a restart (before the discard: a job comes with a restart under its id) and
+at a reload's restart. At each poll it follows each running job table from `halts.json` and the
+table's snapshot document (a halt fails it with its code; in progress gives `rows_done`;
+completed completes it with `row_count`; anything else fails it), settles the job, and stops
+following one that ended.
 
 ### 3.8 Configuration (`data-avalanche-config`, landed in M1)
 
@@ -855,6 +878,14 @@ pub enum Recovery { Retry, Lease, Error }
   error. The heartbeat is `source.postgres.heartbeat` or `source.mysql.heartbeat`, and the
   watchdog names an unread stream in the source's own terms. The PostgreSQL-only refusal at start
   is gone.
+- **M9b adds** (D-M9b.5, D-M9b.6, D-M9b.8): Phase 0 reads the unfinished snapshot jobs. A queued
+  job table is snapshotted from its first row whatever its mode; a running one in progress
+  resumes from its cursor. A queued table with a recorded halt is rebased to the catalog's
+  source id, baselined (planned and evolved as at a fresh start, its schema cached), and its halt
+  cleared after the schemas. A job table neither resolved nor halted by the config is a copy
+  (`Core::copies`): described by name, its sink table ensured, read in the session as a dump,
+  never streamed, its schema cached nowhere. Phase 0 records each queued table as running or
+  failed before the checkpoint.
 
 ### 3.12 Telemetry and the binary (`data-avalanche-telemetry`, `data-avalanche`; M6b)
 
@@ -899,6 +930,12 @@ From M9a (D-M9a.1, D-M9a.6, D-M9a.8): the listener and every route move to
 the auth and the least role of API_RBAC §2; the auth follows each generation (`Auth::set`). The
 binary's run loop takes the API's leave (stays up, not ready) and shutdown (exits) as it takes
 SIGTERM.
+
+From M9b (D-M9b.1, D-M9b.4, D-M9b.11): the snapshot routes. `POST /v1/pipelines/{id}/snapshots`
+(operator) writes the job, then a restart request under its id, and answers `202`; it is `409`
+unless the desired state is running and a node holds the lease, or while an unfinished job holds
+one of the tables. `GET /v1/pipelines/{id}/snapshots` and `GET /v1/snapshots/{job_id}` (viewer)
+read the jobs from the pipeline's state, on any node.
 
 ---
 
@@ -1227,8 +1264,11 @@ endpoints (Q-M8b-1), and the reload E2E. The anchor validation already runs at M
 ### M9 — Management API (`data-avalanche-api`)
 
 Split in two (Q-M9-A): **M9a** (`M9a-management-api.md`) is the API below without the snapshot
-jobs; **M9b** is the snapshot jobs (the worker's chunk loop for requested tables, tables outside
-the config, jobs persisted and resumed, the re-snapshot that clears a persisted halt).
+jobs; **M9b** (`M9b-snapshot-jobs.md`) is the snapshot jobs (the worker's chunk loop for requested
+tables, tables outside the config, jobs persisted and resumed, the re-snapshot that clears a
+persisted halt). As built in M9b: a job starts as a restart under its id (Q-M9b-1); it upserts,
+with no truncate (Q-M9b-2); a table outside the config is copied, not streamed (Q-M9b-3); a job is
+asked only of a running pipeline whose lease a node holds (Q-M9b-4).
 
 - **Scope:**
   - axum server; TLS (`globals.api.tls`).
@@ -1530,6 +1570,7 @@ the naming below (2026-09-26).**
 | D-IMPL-17 | M8a membership rulings **D-M8a.1…22** (listed in `M8a-membership.md` §Decisions and rulings, each pinned by a test). Among them: foca's identity keyed by address, members grouped by name at the highest `(incarnation, rev)`; the packet MAC's key derived from the anchor; foca's settings from config §6.5.1; the ring's xxh3 points; placement over the Active members, a `Draining` node off the ring at once, additions after `rebalance_stabilization`; the hand-off permit; a controller that ended unasked started again (DA-OPS-7); a drop is a crash; the leave; the fence's epoch as the claim's floor, once (DA-CLUS-14); discovery while alone, the advertised address; per-node values through `${VAR}` (D-3); a busy slot's stale reader ended by the lease holder (DA-SRC-28) | The specs are silent on these, or (memberlist's keys, gossip TLS) changed by the M8a config patch | M8a — **approved 2026-10-21** |
 | D-IMPL-18 | M8b config-generation rulings **D-M8b.1…12** (listed in `M8b-config-generations.md` §Decisions and rulings, each pinned by a test). Among them: `SourceConnector::reconfigure` takes the reloaded pipeline as `&dyn Any`; the worker's `Command::Reconfigure`; a controller's `Update` (restart under the same lease, `ERROR` cleared, the desired state kept; a removal's teardown only after a full drain under the lease); the reconciler's `Reload`, the caps resized without revoking a permit, a pipeline added back after its removal; the poll and the gossip nudge; a generation a node can't apply logged once and retried; the reload's check, CAS and retry, the same text published again when it resolves differently; the endpoints' answers; the log changed at run time; DA-OPS-8's warning; the coordinator stopped before the leave | The specs are silent on these | M8b — **approved 2026-10-22** |
 | D-IMPL-19 | M9a management-API rulings **D-M9a.1…10** (listed in `M9a-management-api.md` §Decisions and rulings, each pinned by a test). Among them: the API crate owns the listener, TLS behind axum's `Listener` with a bounded handshake per connection; routing through storage, a status trusted only under the live lease's epoch and holder; the same state answers 200 unchanged, only a pause of a stopped pipeline is 409; restart and flush are requests by id, baselined when the owner's term starts; a restart runs a pipeline in `ERROR` again (desired `RUNNING`, confirmed 2026-10-23); JWKS keys cached and fetched again for an unknown `kid` at most every 30 s, HS* refused, a 503 when the keys can't be fetched; validate never returns the resolved config; a leave stays up; one route table for the router, the role gate and the OpenAPI document | The specs leave these open, or (restart) say `RUNNING` without naming the desired state | M9a — **approved 2026-10-23** |
+| D-IMPL-20 | M9b snapshot-job rulings **D-M9b.1…11** (listed in `M9b-snapshot-jobs.md` §Decisions and rulings, each pinned by a test). Among them: the job id `<pipeline_id>~<UUID v7>`; a status per job table, the job settled from them; a job asked as a restart under its id, the unfinished jobs listed by the owner at its term's start and at a restart; `409` unless running and held, or while an unfinished job holds a table; a queued job table snapshotted from its first row whatever its mode, a halted one rebased, baselined and its halt cleared; a job upserts; a table outside the config described by name and copied, never streamed, cached nowhere; the owner follows each table from its snapshot document and the halts; `describe_tables`; MySQL's channel C takes a column hint as a catalog baseline (DA-SCHEMA-10) | The specs say what a job does, not how it reaches the worker, which pipelines take one, or what a table outside the config is | M9b — **approved 2026-10-27** |
 
 ### 9.1 Questions answered at plan review (2026-09-26)
 
@@ -1619,6 +1660,10 @@ the naming below (2026-09-26).**
 | Q-M9-B (2026-10-23) | How does a request on one node reach the pipeline's owner? | **Through storage**: the desired state by CAS, restart and flush as requests the owner takes at its poll, a status document the owner writes; any node answers from storage | §3.5, §3.7; M9a Tasks 1, 2, 5 |
 | Q-M9-C (2026-10-23) | What do leave and shutdown do? | **Leave = the M8a leave, the process stays up** (not ready, the API answers); **shutdown = SIGTERM's path** (leave, exit 0) | §3.12; M9a Task 6 |
 | Q-M9-2 (2026-10-23) | `GET /v1/snapshots/{job_id}` on any node? | **The job id embeds the pipeline id** (`<pipeline_id>~<ulid>`-like), read from storage by any node; no spec edit | M9b |
+| Q-M9b-1 (2026-10-27) | How does a job reach the running worker? | **Restart the worker**: a restart request under the job's id; the new worker's Phase 0 takes the job's tables | §3.7, §3.11, §3.12; M9b Tasks 3, 5, 6 |
+| Q-M9b-2 (2026-10-27) | Does a job truncate the sink table first? | **Upsert only, documented**: deleted rows stay; drop or move the Delta table first (DA-SNAP-15) | M9b D-M9b.7 |
+| Q-M9b-3 (2026-10-27) | What is a table outside the config? | **A copy, not streamed**: described by name, read once like a dump, its schema cached nowhere | §3.6, §3.11; M9b Tasks 2, 4 |
+| Q-M9b-4 (2026-10-27) | Which pipelines take a job? | **`409` unless running**: desired state running and the lease held, `ERROR` accepted (the job's restart runs it again) | §3.12; M9b Task 6 |
 
 ### 9.2 Open questions (answer before the named milestone)
 

@@ -99,8 +99,8 @@ impl std::fmt::Debug for Snapshots {
 }
 
 impl Snapshots {
-    /// The snapshot state of the streamed tables. Returns it with the `dump_*` tables whose
-    /// snapshot is done (they aren't streamed) and warnings.
+    /// The snapshot state of the streamed tables and the copies. Returns it with the `dump_*`
+    /// tables whose snapshot is done (they aren't streamed) and warnings.
     pub(super) async fn load(
         core: &super::Core,
         schemas: &BTreeMap<TableRef, TableSchema>,
@@ -112,7 +112,7 @@ impl Snapshots {
             let Some(v) = core.docs.table_snapshot(table).await? else {
                 continue;
             };
-            let dump = core.settings.is_dump(table);
+            let dump = core.settings.is_dump(table) || core.copies.contains_key(table);
             match v.doc.status {
                 SnapshotStatus::Completed if dump => {
                     retired.insert(table.clone());
@@ -352,7 +352,13 @@ impl Session<'_> {
             {
                 continue;
             }
-            let Some(schema) = self.schemas.get(table).cloned() else {
+            // The fields, not `read_schema`: the loop holds `snaps` mutably.
+            let Some(schema) = self
+                .schemas
+                .get(table)
+                .or_else(|| self.copies.get(table))
+                .cloned()
+            else {
                 continue;
             };
             let writers: Vec<String> = schema.source_id().map_or_else(Vec::new, |id| {
@@ -435,7 +441,7 @@ impl Session<'_> {
             result,
             read_at_micros,
         } = read;
-        let current = self.schemas.get(&table).cloned();
+        let current = self.read_schema(&table).cloned();
         let Some(snap) = self.snaps.tables.get_mut(&table) else {
             self.snaps.reconciler.cancel(ticket);
             return Ok(None);
@@ -466,6 +472,18 @@ impl Session<'_> {
                         "table {table}: a snapshot chunk read failed ({e}): it is tried again with backoff, and the snapshot reads nothing more until a read succeeds"
                     )
                 });
+                return Ok(None);
+            }
+            // A copy's read that fails for good (a table outside the config the role can't
+            // read) is the copy's alone: it halts, and its job fails it.
+            Err(e) if self.copies.contains_key(&table) => {
+                self.snaps.reconciler.cancel(ticket);
+                self.halt(
+                    table,
+                    HaltReason::NotReplicable {
+                        reason: e.to_string(),
+                    },
+                )?;
                 return Ok(None);
             }
             Err(e) => {
@@ -593,7 +611,7 @@ impl Session<'_> {
             .iter()
             .filter(|(t, s)| {
                 !s.done
-                    && self.schemas.contains_key(*t)
+                    && self.read_schema(t).is_some()
                     && self
                         .core
                         .snapshot_started

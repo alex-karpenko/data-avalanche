@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-23
+updated: 2026-10-27
 domain: Architecture
 tags: [v1, implementation-plan, m9a, api, auth, rbac, jwt, oauth2, tls, openapi, lifecycle, cluster, e2e]
 resolves: [DA-API-11, DA-API-12]
@@ -8663,7 +8663,7 @@ git commit -m "test(e2e): the API over TLS with tokens and a reloaded role mappi
 - [x] The pipelines list and status come from storage, with the holder, the position and the halted tables (Task 5).
 - [x] Config validate publishes nothing and returns no resolved config; cluster status names the members and the holders; a leave stays up, a shutdown exits 0 (Tasks 6, 8).
 - [x] The OpenAPI document is snapshot-tested, read back by utoipa, and checked for every route's role, security scheme and common answers (Task 7). (Reworded at the whole-branch review: the test doesn't validate against the OAS 3.1 schema, DA-API-18.)
-- [ ] The E2E suite passes on PostgreSQL 18 and, through `ci.yml`'s jobs, on `mysql-84`, `mysql-84-nogtid` and `mariadb-118`. (Measured locally on PostgreSQL 18 and `mysql-84`, 42/42 each at 9a4e5f0; `mysql-84-nogtid` and `mariadb-118` run in the PR's CI.)
+- [x] The E2E suite passes on PostgreSQL 18 and, through `ci.yml`'s jobs, on `mysql-84`, `mysql-84-nogtid` and `mariadb-118`. (Measured locally on PostgreSQL 18 and `mysql-84`, 42/42 each at 9a4e5f0; every target green in the PR's CI, run 40068256865.)
 - [x] Every Review Focus line has its passing test.
 - [x] The documents of "Documents this plan changes" are updated, and the approved spec edits applied.
 - [x] The workspace gates pass: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo clippy -p data-avalanche --features e2e-hooks --all-targets -- -D warnings`, `cargo test --workspace`.

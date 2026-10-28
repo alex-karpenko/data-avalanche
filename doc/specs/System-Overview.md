@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-23
+updated: 2026-10-27
 domain: Architecture
 tags: [architecture, design, system, multi-sink, iceberg, delta-lake, v1-scope]
 sources: []
@@ -126,7 +126,7 @@ Functional endpoints are versioned under `/v1`; probes and metrics are unversion
 | Config status | `GET /v1/config/status` | viewer | |
 | Cluster status | `GET /v1/cluster/status` | viewer | |
 | Pipelines status | `GET /v1/pipelines`, `GET /v1/pipelines/{id}` | viewer | `desired_state`, `actual_state`, positions, per-table status (halted tables with their reason) |
-| Request snapshot | `POST /v1/pipelines/{id}/snapshots` | operator | tables list, no globs |
+| Request snapshot | `POST /v1/pipelines/{id}/snapshots` | operator | tables list (the per-table config keys), no globs; refused (`409`) unless the desired state is `RUNNING` and a node holds the lease, as a restart (`ERROR` included), or while an unfinished job holds one of the tables; `202` with the job's id. The job runs in a restarted worker. It upserts: a row deleted at the source before the job stays (drop or move the sink table first to start clean) |
 | Snapshot job status | `GET /v1/snapshots/{job_id}` | viewer | |
 | List snapshot jobs | `GET /v1/pipelines/{id}/snapshots` | viewer | persisted in the pipeline state location; survive restart and failover |
 | Pipeline pause | `POST /v1/pipelines/{id}/pause` | operator | `RUNNING → PAUSED`: flush to a transaction boundary and commit; source connection kept warm; lease kept |

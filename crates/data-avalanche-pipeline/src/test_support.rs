@@ -432,6 +432,7 @@ impl World {
             control: control_rx,
             status,
             tracked: tables.iter().map(|t| TableRef::new("public", *t)).collect(),
+            copies: BTreeMap::new(),
             dump_only: false,
             snapshot_started: BTreeMap::new(),
             drifted: BTreeSet::new(),

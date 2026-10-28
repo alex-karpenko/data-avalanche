@@ -104,7 +104,9 @@ generation from `globals.state`, and `GET /v1/config/status` reports each node's
 scenarios run the API with `auth: none`. The management API scenarios (M9a) need nothing more:
 `api.rs` serves the API over TLS with a certificate generated at run time and checks bearer
 tokens against a JWKS the test serves on loopback (`idp.rs`); `cluster.rs` drives a pipeline
-through a node that doesn't hold it, and leaves and shuts a node down through the API.
+through a node that doesn't hold it, and leaves and shuts a node down through the API. The
+snapshot-job scenarios (M9b, `jobs.rs`) need nothing more either: they ask for jobs through the
+API, drop and create a table again to halt it, and `kill -9` the process while a job reads.
 
 ## GCS: a real bucket, not an emulator
 
