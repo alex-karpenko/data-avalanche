@@ -13,7 +13,7 @@ use std::time::Duration;
 
 mod traces;
 
-pub use traces::{Traces, TracesError, trace_ids};
+pub use traces::{Traces, TracesError, shown, trace_ids};
 
 use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;

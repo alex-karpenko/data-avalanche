@@ -29,8 +29,34 @@ const SHUTDOWN: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
 pub enum TracesError {
-    #[error("otlp_endpoint {endpoint:?} can't be exported to: {reason}")]
+    #[error("otlp_endpoint {:?} can't be exported to: {}", shown(.endpoint), shown_in(.reason, .endpoint))]
     Endpoint { endpoint: String, reason: String },
+}
+
+/// `endpoint` as it may be logged: without its `user[:password]@` (an operator may put basic-auth
+/// credentials in a templated endpoint) and without its query string.
+#[must_use]
+pub fn shown(endpoint: &str) -> String {
+    let end = endpoint.find(['?', '#']).unwrap_or(endpoint.len());
+    let endpoint = &endpoint[..end];
+    let Some((scheme, rest)) = endpoint.split_once("://") else {
+        return endpoint.to_owned();
+    };
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(authority_end);
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    format!("{scheme}://{host}{path}")
+}
+
+/// `text` with `endpoint` (an exporter's error may echo it) replaced by its shown form.
+fn shown_in(text: &str, endpoint: &str) -> String {
+    let shown = shown(endpoint);
+    if shown == endpoint {
+        return text.to_owned();
+    }
+    text.replace(endpoint, &shown)
 }
 
 /// The OTLP exporter in force, `None` while tracing is off, and the resource every one carries.
@@ -253,5 +279,30 @@ mod tests {
         let resource = current.resource.as_ref().expect("a resource");
         let id = resource.get(&opentelemetry::Key::from_static_str("service.instance.id"));
         assert_eq!(id.map(|v| v.to_string()).as_deref(), Some("node-1"));
+    }
+
+    #[test]
+    fn an_endpoint_is_shown_without_its_credentials_or_query() {
+        for (given, shown_as) in [
+            ("https://u:secret@c:4318/p?k=v", "https://c:4318/p"),
+            ("https://u@c:4318", "https://c:4318"),
+            ("https://c:4318/p?token=x#f", "https://c:4318/p"),
+            ("http://c:4318/a@b", "http://c:4318/a@b"),
+            ("http://c:4318", "http://c:4318"),
+            ("not a url", "not a url"),
+        ] {
+            assert_eq!(shown(given), shown_as, "{given}");
+        }
+    }
+
+    #[test]
+    fn the_error_of_an_endpoint_leaves_out_its_password() {
+        let e = TracesError::Endpoint {
+            endpoint: "https://u:secret@c:4318".to_owned(),
+            reason: "bad url https://u:secret@c:4318/v1/traces".to_owned(),
+        };
+        let text = e.to_string();
+        assert!(!text.contains("secret"), "{text}");
+        assert!(text.contains("c:4318"), "{text}");
     }
 }

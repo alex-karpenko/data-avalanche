@@ -6,11 +6,11 @@
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use data_avalanche_config::{Log, LogFormat, Tracing};
-use data_avalanche_telemetry::{Traces, trace_ids};
+use data_avalanche_telemetry::{Traces, shown, trace_ids};
 use serde_json::Value;
 use tracing::dispatcher::WeakDispatch;
 use tracing::{Dispatch, Event, Level, Subscriber};
-use tracing_subscriber::filter::{LevelFilter, Targets};
+use tracing_subscriber::filter::{FilterExt as _, LevelFilter, Targets, filter_fn};
 use tracing_subscriber::fmt::format::{Format as EventFormat, Json, Writer};
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields, MakeWriter};
 use tracing_subscriber::layer::SubscriberExt;
@@ -110,6 +110,15 @@ fn filter(level: &str) -> Result<EnvFilter, String> {
         .map_err(|e| format!("{level:?} isn't a log filter: {e}"))
 }
 
+/// Passes the pipeline's spans (INFO and above) whatever the log level: a log line is correlated
+/// through the spans the format layer sees, and a `warn` level would hide `pipeline.flush` from
+/// it. Events follow the level alone, and this layer writes no span lines of its own.
+fn spans_kept<S>() -> impl tracing_subscriber::layer::Filter<S> {
+    filter_fn(|m| {
+        m.is_span() && m.target().starts_with("data_avalanche") && *m.level() <= Level::INFO
+    })
+}
+
 /// The process's dispatch, once built: the JSON format reads a span's trace ids through it.
 /// Inside an event a scoped dispatch isn't the current one any more, so it is held, weakly.
 type Process = Arc<OnceLock<WeakDispatch>>;
@@ -158,7 +167,7 @@ where
     let traces = Arc::new(Traces::new(node));
     let (spans_filter, spans) = reload::Layer::new(Targets::new());
     let layers: Vec<Format> = vec![
-        Box::new(format_layer.with_filter(filter_layer)),
+        Box::new(format_layer.with_filter(spans_kept().or(filter_layer))),
         Box::new(traces.layer().with_filter(spans_filter)),
     ];
     let dispatch = Dispatch::new(tracing_subscriber::registry().with(layers));
@@ -295,7 +304,8 @@ impl Logger {
                 }
                 match endpoint {
                     Some(e) => tracing::info!(
-                        "traces go to {e} (OTLP/HTTP), {} of them sampled",
+                        "traces go to {} (OTLP/HTTP), {} of them sampled",
+                        shown(e),
                         tracing.sample_ratio
                     ),
                     None if current.otlp_endpoint.is_some() => tracing::info!("traces are off"),
@@ -530,6 +540,48 @@ mod tests {
             tracing::warn!("outside");
         });
         (buf, logger)
+    }
+
+    /// Above INFO the format layer's own level hides the pipeline's INFO spans, but the lines
+    /// still carry their ids and `pipeline`, and no INFO event is written.
+    #[test]
+    fn a_warn_level_line_keeps_its_ids_and_its_pipeline() {
+        let (url, _requests) = data_avalanche_testkit::otlp_collector();
+        let buf = Buf::default();
+        let (dispatch, logger) = build(
+            &log("warn", LogFormat::Json),
+            "n1",
+            &args(None, None),
+            buf.clone(),
+            false,
+        )
+        .unwrap();
+        tracing::dispatcher::with_default(&dispatch, || {
+            logger.trace(&Tracing {
+                otlp_endpoint: Some(url),
+                sample_ratio: 1.0,
+            });
+            tracing::info_span!("pipeline.flush", pipeline = "orders").in_scope(|| {
+                tracing::info_span!("sink.commit", table = "public.a").in_scope(|| {
+                    tracing::warn!("warned in the commit");
+                    tracing::info!("informed in the commit");
+                });
+            });
+        });
+        logger.traces.shutdown();
+        let inside = line(&buf, "warned in the commit");
+        assert_eq!(
+            inside["trace_id"].as_str().map(str::len),
+            Some(32),
+            "{inside}"
+        );
+        assert_eq!(
+            inside["span_id"].as_str().map(str::len),
+            Some(16),
+            "{inside}"
+        );
+        assert_eq!(inside["fields"]["pipeline"], "orders");
+        assert!(buf.lines("informed in the commit").is_empty());
     }
 
     fn line(buf: &Buf, what: &str) -> serde_json::Value {
