@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use data_avalanche_telemetry::{
-    LeaseState, Metrics, PipelineLabels, PipelineStatus, RenewFailure, Totals,
+    LeaseState, Metrics, PipelineLabels, PipelineStatus, RenewFailure, RowsRead, SnapshotState,
+    Totals,
 };
 
 const L: &str = r#"pipeline="orders",source_host="db1",source_db="shop""#;
@@ -11,6 +12,7 @@ fn labels() -> PipelineLabels {
         pipeline: "orders".into(),
         source_host: "db1".into(),
         source_db: "shop".into(),
+        sink_type: "delta".into(),
     }
 }
 
@@ -83,6 +85,12 @@ fn counters_keep_counting_across_workers() {
         source_reconnects: n,
         sink_merge_files_rewritten: 10 * n,
         sink_merge_rows_copied: 100 * n,
+        rows_read: RowsRead {
+            insert: n,
+            update: 2 * n,
+            delete: 3 * n,
+            snapshot: 5 * n,
+        },
     };
     p.totals(totals(2));
     p.totals(totals(3));
@@ -104,6 +112,15 @@ fn counters_keep_counting_across_workers() {
         [format!(
             "data_avalanche_sink_merge_rows_copied_total{{{L}}} 400"
         )]
+    );
+    assert_eq!(
+        samples(&text, "data_avalanche_rows_read_total"),
+        [
+            format!(r#"data_avalanche_rows_read_total{{{L},op="delete"}} 12"#),
+            format!(r#"data_avalanche_rows_read_total{{{L},op="insert"}} 4"#),
+            format!(r#"data_avalanche_rows_read_total{{{L},op="snapshot"}} 20"#),
+            format!(r#"data_avalanche_rows_read_total{{{L},op="update"}} 8"#),
+        ]
     );
 }
 
@@ -145,8 +162,21 @@ fn a_pipeline_the_node_no_longer_owns_loses_its_series_but_its_renew_failures() 
     p.reconcile_log(3, 9);
     p.totals(Totals {
         source_reconnects: 1,
+        rows_read: RowsRead {
+            insert: 1,
+            ..RowsRead::default()
+        },
         ..Totals::default()
     });
+    p.replication_lag(Duration::from_secs(1));
+    p.binlog_lag(Some(Duration::from_secs(1)));
+    p.transaction_buffer_bytes(1);
+    p.soft_dropped_columns(1);
+    p.snapshot_state(&[("public.a".to_owned(), SnapshotState::Running)]);
+    p.flushed(1, Duration::from_millis(1));
+    p.committed(1, Duration::from_millis(1));
+    p.commit_failed();
+    p.chunk_read(Duration::from_millis(1));
     m.owned_by(1);
     m.set_cluster_members(1);
     m.set_ring_generation(3);
@@ -197,6 +227,85 @@ fn the_gauges_read_what_was_set_last() {
     }
     p.wal_lag_bytes(None);
     assert!(!m.encode().contains("data_avalanche_wal_lag_bytes{"));
+}
+
+#[test]
+fn the_lag_gauges_are_seconds_and_a_binlog_lag_unknown_has_no_series() {
+    let m = Metrics::new();
+    let p = m.pipeline(labels(), false);
+    p.replication_lag(Duration::from_millis(1500));
+    p.binlog_lag(Some(Duration::from_secs(7)));
+    p.transaction_buffer_bytes(2048);
+    p.soft_dropped_columns(2);
+    let text = m.encode();
+    for line in [
+        format!("data_avalanche_replication_lag_seconds{{{L}}} 1.5"),
+        format!("data_avalanche_binlog_lag_seconds{{{L}}} 7.0"),
+        format!("data_avalanche_transaction_buffer_bytes{{{L}}} 2048"),
+        format!("data_avalanche_sink_soft_dropped_columns{{{L}}} 2"),
+    ] {
+        assert!(text.lines().any(|l| l == line), "{line}\n{text}");
+    }
+    p.binlog_lag(None);
+    assert!(!m.encode().contains("data_avalanche_binlog_lag_seconds{"));
+}
+
+/// A flush and a commit are observed when they happen: the histograms count each one, the
+/// commit's series carry the sink type, and a failed attempt counts once.
+#[test]
+fn flushes_and_commits_are_timed_and_counted() {
+    let m = Metrics::new();
+    let p = m.pipeline(labels(), false);
+    p.flushed(40, Duration::from_millis(30));
+    p.flushed(2, Duration::from_millis(10));
+    p.committed(25, Duration::from_millis(20));
+    p.committed(15, Duration::from_millis(20));
+    p.commit_failed();
+    p.chunk_read(Duration::from_millis(8));
+    let text = m.encode();
+    let s = r#"sink_type="delta""#;
+    for line in [
+        format!("data_avalanche_flush_duration_seconds_count{{{L}}} 2"),
+        format!("data_avalanche_flush_rows_count{{{L}}} 2"),
+        format!("data_avalanche_flush_rows_sum{{{L}}} 42.0"),
+        format!("data_avalanche_rows_written_total{{{L}}} 40"),
+        format!("data_avalanche_sink_commit_duration_seconds_count{{{L},{s}}} 2"),
+        format!("data_avalanche_sink_commit_failures_total{{{L},{s}}} 1"),
+        format!("data_avalanche_snapshot_chunk_duration_seconds_count{{{L}}} 1"),
+    ] {
+        assert!(text.lines().any(|l| l == line), "{line}\n{text}");
+    }
+}
+
+#[test]
+fn snapshot_states_are_counted_unless_per_table() {
+    let m = Metrics::new();
+    let tables = [
+        ("public.a".to_owned(), SnapshotState::Running),
+        ("public.b".to_owned(), SnapshotState::Waiting),
+        ("public.c".to_owned(), SnapshotState::Running),
+    ];
+    m.pipeline(labels(), false).snapshot_state(&tables);
+    assert_eq!(
+        samples(&m.encode(), "data_avalanche_snapshot_state"),
+        [
+            format!(r#"data_avalanche_snapshot_state{{{L},state="running"}} 2"#),
+            format!(r#"data_avalanche_snapshot_state{{{L},state="waiting"}} 1"#),
+        ]
+    );
+
+    let m = Metrics::new();
+    let p = m.pipeline(labels(), true);
+    p.snapshot_state(&tables);
+    p.snapshot_state(&tables[1..2]);
+    assert_eq!(
+        samples(&m.encode(), "data_avalanche_snapshot_state"),
+        [
+            format!(r#"data_avalanche_snapshot_state{{{L},table="public.b",state="running"}} 0"#),
+            format!(r#"data_avalanche_snapshot_state{{{L},table="public.b",state="waiting"}} 1"#),
+        ],
+        "a finished snapshot loses its series"
+    );
 }
 
 /// A renamed pipeline (config §12.3) loses every series under its old name, the renew failures

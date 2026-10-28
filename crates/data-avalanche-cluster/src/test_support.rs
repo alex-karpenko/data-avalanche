@@ -214,6 +214,7 @@ pub(crate) fn metrics() -> (Metrics, Arc<PipelineMetrics>) {
             pipeline: "p".into(),
             source_host: "h".into(),
             source_db: "d".into(),
+            sink_type: "delta".into(),
         },
         false,
     );

@@ -305,6 +305,7 @@ fn labels(p: &Pipeline) -> PipelineLabels {
         pipeline: p.name.clone(),
         source_host: p.source.host.clone(),
         source_db: p.source.db.clone(),
+        sink_type: p.sink.kind.as_str().to_owned(),
     }
 }
 
@@ -1184,6 +1185,7 @@ impl PipelineController {
             source_reconnects: st.reconnects,
             sink_merge_files_rewritten: sink.files_rewritten,
             sink_merge_rows_copied: sink.rows_copied,
+            ..Totals::default()
         });
         self.status.send_modify(|s| s.worker = Some(st));
     }
