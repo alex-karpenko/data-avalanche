@@ -6509,5 +6509,5 @@ git commit -m "test(e2e): the catalogue scraped live, and the traces read back f
   the MySQL test binary's parallel run: 144 tests, three times on `mysql-84` and once each on
   `mysql-84-nogtid` and `mariadb-118`. The workspace has 1308 tests after Task 4.
 
-  The spec's definition of `binlog_lag_seconds` gains the idle case, approved separately. The
+  The spec's definition of `binlog_lag_seconds` gains the idle case (approved and applied 2026-10-28). The
   research doc's §2 matches.
