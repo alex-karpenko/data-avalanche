@@ -120,7 +120,6 @@ pub struct Traces {
 impl Traces {
     /// `instance` is the node (`service.instance.id`).
     pub fn new(instance: &str) -> Self {
-        let switch = Switch::default();
         let ratio = Ratio::default();
         let resource = Resource::builder()
             .with_service_name("data-avalanche")
@@ -129,6 +128,12 @@ impl Traces {
                 KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
             ])
             .build();
+        // Seeded here: the batch thread applies the resource through `set_resource` only
+        // eventually, and a `set()` before that would build an exporter without it.
+        let switch = Switch(Arc::new(RwLock::new(Current {
+            exporter: None,
+            resource: Some(resource.clone()),
+        })));
         let provider = SdkTracerProvider::builder()
             .with_batch_exporter(switch.clone())
             .with_sampler(ratio.clone())
@@ -235,4 +240,18 @@ pub fn trace_ids(span: &span::Id, dispatch: &Dispatch) -> Option<(String, String
     let sc = span.span_context();
     (sc.is_valid() && sc.is_sampled())
         .then(|| (sc.trace_id().to_string(), sc.span_id().to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_switch_carries_the_resource_before_the_batch_thread_applies_it() {
+        let traces = Traces::new("node-1");
+        let current = traces.switch.0.read().unwrap();
+        let resource = current.resource.as_ref().expect("a resource");
+        let id = resource.get(&opentelemetry::Key::from_static_str("service.instance.id"));
+        assert_eq!(id.map(|v| v.to_string()).as_deref(), Some("node-1"));
+    }
 }
