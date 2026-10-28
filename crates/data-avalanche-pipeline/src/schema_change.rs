@@ -2,13 +2,29 @@
 //! the sink's evolve. A stream session runs them at a signal's position, with a flush in between.
 //! Phase 0 runs them to baseline a table whose stream position was lost.
 
+use arrow_schema::Schema;
 use data_avalanche_core::{
-    DeltaClass, EvolveOutcome, HaltReason, SchemaChange, SchemaDelta, SchemaHint, Sink, SinkError,
-    SourceConnector, SourceError, TableRef, TableSchema, classify,
+    DeltaClass, EvolveOutcome, HaltReason, INTERNAL_COLUMN_PREFIX, LINEAGE_COLUMNS, SchemaChange,
+    SchemaDelta, SchemaHint, Sink, SinkError, SourceConnector, SourceError, TableRef, TableSchema,
+    classify,
 };
 use tokio::sync::watch;
 
 use crate::{CommitGuard, Tuning, WorkerError, WorkerStatus};
+
+/// The sink table's columns `source` doesn't have, the lineage and internal columns aside:
+/// soft-dropped, kept and written NULL (`data_avalanche_sink_soft_dropped_columns`).
+pub(crate) fn soft_dropped(sink: &Schema, source: &TableSchema) -> usize {
+    sink.fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .filter(|n| {
+            !LINEAGE_COLUMNS.contains(n)
+                && !n.starts_with(INTERNAL_COLUMN_PREFIX)
+                && source.column(n).is_none()
+        })
+        .count()
+}
 
 /// A change to apply: the table's new schema, and the changes the sink must evolve.
 #[derive(Debug)]

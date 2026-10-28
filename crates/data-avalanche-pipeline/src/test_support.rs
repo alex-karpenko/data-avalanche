@@ -25,7 +25,7 @@ use crate::settings::Settings;
 use crate::status::Streak;
 use crate::{
     Accumulator, Backoff, Command, CommitGuard, FlushPolicy, HookAction, HookPoint, Hooks, Lineage,
-    NoHooks, NoObserver, Observer, Tuning, Unguarded, WorkerStatus,
+    NoHooks, NoObserver, Observer, RowsRead, Tuning, Unguarded, WorkerStatus,
 };
 
 /// What an [`Ears`] observer heard.
@@ -489,6 +489,7 @@ impl World {
             read_failing: BTreeMap::new(),
             server: None,
             pause: false,
+            rows_read: RowsRead::default(),
         };
         (core, control, status_rx)
     }

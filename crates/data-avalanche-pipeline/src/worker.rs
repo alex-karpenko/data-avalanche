@@ -20,13 +20,13 @@ use tokio::sync::{mpsc, watch};
 
 use crate::decide::{Decision, Facts, Plan, decide};
 use crate::jobs::Jobs;
-use crate::schema_change::Planned;
+use crate::schema_change::{Planned, soft_dropped};
 use crate::session::{Core, End, Session};
 use crate::settings::Settings;
 use crate::status::Streak;
 use crate::{
     Command, CommitGuard, Exit, HookAction, HookPoint, Hooks, NoHooks, NoObserver, Observer, Phase,
-    Tuning, Unguarded, WorkerError, WorkerStatus,
+    RowsRead, Tuning, Unguarded, WorkerError, WorkerStatus,
 };
 
 /// What a worker runs against.
@@ -123,6 +123,7 @@ impl PipelineWorker {
             read_failing: BTreeMap::new(),
             server: None,
             pause: false,
+            rows_read: RowsRead::default(),
         };
         let reader_ended = deps.reader_ended;
         (
@@ -587,6 +588,7 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
             }
         };
         let mut schema = now.clone();
+        let mut evolved = false;
         let baseline = matches!(plan, Plan::Fresh(_)) || cleared.contains(table);
         // A cleared table's change is planned under its source id now: one created again is
         // the table the catalog has.
@@ -615,6 +617,7 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
                                     continue;
                                 }
                             }
+                            evolved = true;
                         }
                         schema = now;
                     }
@@ -648,6 +651,17 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
                 }
                 Err(e) => return Err(e),
             }
+        }
+        // The sink's soft-dropped columns: the table as read, or as the baseline's evolve left it.
+        match (&state.schema, evolved) {
+            (_, true) => core.count_soft_dropped(&schema).await,
+            (Some(sink_schema), false) => {
+                let n = soft_dropped(sink_schema, &schema);
+                core.update(|st| {
+                    st.soft_dropped.insert(table.clone(), n);
+                });
+            }
+            (None, false) => {}
         }
         if !tracked_before || baseline {
             schemas.push(schema);
@@ -836,7 +850,8 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
 mod tests {
     use data_avalanche_core::position::Lsn;
     use data_avalanche_core::{
-        ColumnSchema, ColumnValue, ColumnValueType as V, Row, ServerIdentity, SourcePosition,
+        ColumnSchema, ColumnValue, ColumnValueType as V, Row, SchemaChange, SchemaDelta,
+        ServerIdentity, SourcePosition,
     };
     use data_avalanche_state::{PositionDoc, SlotDoc};
     use data_avalanche_testkit::{FakeTxn, Method, SinkOp};
@@ -923,6 +938,29 @@ mod tests {
         let doc = w.docs.table_snapshot(&t("a")).await.unwrap().unwrap().doc;
         assert_eq!(doc.status, SnapshotStatus::Completed);
         assert!(st.warnings.is_empty(), "{:?}", st.warnings);
+    }
+
+    /// The start counts the sink's columns the source table doesn't have: soft-dropped, kept and
+    /// written NULL.
+    #[tokio::test]
+    async fn the_start_counts_the_sink_columns_the_source_lacks() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let gone = SchemaDelta {
+            table: t("a"),
+            changes: vec![SchemaChange::AddColumn(ColumnSchema::new(
+                "gone",
+                V::Text,
+                "text",
+            ))],
+        };
+        w.sink.evolve(&t("a"), &gone, 1).await.unwrap();
+        let (end, st) = run(&w, &mode("mode: initial"), async |status| {
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!(st.soft_dropped, BTreeMap::from([(t("a"), 1)]));
     }
 
     #[tokio::test]

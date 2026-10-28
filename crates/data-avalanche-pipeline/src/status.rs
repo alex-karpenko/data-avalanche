@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use data_avalanche_config::Pipeline;
-use data_avalanche_core::{HaltReason, SourcePosition, TableRef};
+use data_avalanche_core::{HaltReason, Op, SourcePosition, TableRef};
 use tokio::sync::watch;
 
 use crate::Backoff;
@@ -63,6 +63,32 @@ pub enum Phase {
 pub struct SnapshotProgress {
     /// Rows emitted, this run and the runs before it.
     pub rows_done: u64,
+    /// It reads nothing until something else ends: a transaction in flight at the session's
+    /// start that writes the table, or a schema change a rescan found
+    /// (`data_avalanche_snapshot_state{state="waiting"}`).
+    pub waiting: bool,
+}
+
+/// Rows read since the worker started (`data_avalanche_rows_read_total{op}`): the stream's
+/// changes by operation, and the snapshot chunks' rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RowsRead {
+    pub insert: u64,
+    pub update: u64,
+    pub delete: u64,
+    pub snapshot: u64,
+}
+
+impl RowsRead {
+    pub fn count(&mut self, op: Op, n: u64) {
+        let total = match op {
+            Op::Insert => &mut self.insert,
+            Op::Update => &mut self.update,
+            Op::Delete => &mut self.delete,
+            Op::Snapshot => &mut self.snapshot,
+        };
+        *total += n;
+    }
 }
 
 /// The snapshot reconciler's log (DA-SNAP-9): the stream transactions kept to check chunks
@@ -100,6 +126,20 @@ pub struct WorkerStatus {
     pub warnings_dropped: u64,
     /// Stream sessions reopened after a source failure (`data_avalanche_source_reconnects_total`).
     pub reconnects: u64,
+    /// The source commit time, in microseconds since the Unix epoch, of the oldest transaction
+    /// read and not yet durable in the sink; `None` when none waits. Its age is
+    /// `data_avalanche_replication_lag_seconds`. Snapshot rows have no commit time and don't
+    /// count. As of the last stream boundary, durable flush or heartbeat.
+    pub unsynced_since_micros: Option<i64>,
+    pub rows_read: RowsRead,
+    /// Bytes the accumulator buffers and hasn't handed to the writer yet, the open transaction's
+    /// included (`data_avalanche_transaction_buffer_bytes`). As of the last stream boundary or
+    /// heartbeat.
+    pub buffer_bytes: u64,
+    /// Per table, the sink's columns the source table no longer has: soft-dropped, kept and
+    /// written NULL (`data_avalanche_sink_soft_dropped_columns`). Counted at the start and after
+    /// each evolve.
+    pub soft_dropped: BTreeMap<TableRef, usize>,
 }
 
 /// The warnings a status keeps.
