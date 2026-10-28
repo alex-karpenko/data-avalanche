@@ -81,8 +81,12 @@ All Prometheus, exposed at `/metrics` (unauthenticated, per System-Overview / RB
   renewal poll, clamped at 0 when the node's clock is behind the source's. It sees only what the
   pipeline read: an unread backlog is the source series' to show.
 - **The binlog lag** (MySQL, MariaDB): the age of the last transaction the stream read, `0` once
-  the stream is at the server's head or a server heartbeat says the dump is idle, with no series
-  without a stream. A MySQL pipeline has no `wal_lag_bytes`; a PostgreSQL one has no binlog lag.
+  the stream is at the server's head, with no series without a stream.
+  - A server heartbeat says the stream caught up. The lag stays `0` while the server's head
+    doesn't move past the head the first check after the heartbeat saw.
+  - Once it moves past, the lag counts from the heartbeat, so a stream that stopped reading
+    after an idle stretch shows its stall.
+  - A MySQL pipeline has no `wal_lag_bytes`; a PostgreSQL one has no binlog lag.
 - **`rows_read_total{op}`**: `insert`, `update`, `delete` for the row changes the stream reads,
   before the collapse; `snapshot` for chunk rows.
 - **`snapshot_state{state}`**: `running`, or `waiting` (held by the source, or behind the previous
