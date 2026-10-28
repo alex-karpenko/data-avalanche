@@ -71,6 +71,29 @@ fn sample(text: &str, name: &str, labels: &str, extra: &str) -> Option<f64> {
         .map(|v| v.parse().expect("a sample's value"))
 }
 
+/// The rows read per `op` (snapshot, insert, update, delete), in that order.
+fn rows_read(text: &str, labels: &str) -> [Option<f64>; 4] {
+    ["snapshot", "insert", "update", "delete"].map(|op| {
+        sample(
+            text,
+            "data_avalanche_rows_read_total",
+            labels,
+            &format!(r#",op="{op}""#),
+        )
+    })
+}
+
+/// Whether the scrape has the source's lag, every series of `LIVE` and the counts of the two
+/// rows of the snapshot and the three changed: the table can show them before the metrics do.
+fn complete(text: &str, labels: &str, lag: &str) -> bool {
+    sample(text, lag, labels, "").is_some()
+        && LIVE
+            .iter()
+            .all(|(name, extra)| sample(text, name, labels, extra).is_some())
+        && rows_read(text, labels) == [Some(2.0), Some(1.0), Some(1.0), Some(1.0)]
+        && sample(text, "data_avalanche_rows_written_total", labels, "") == Some(5.0)
+}
+
 /// The source's lag: the WAL a PostgreSQL slot retains, the age of the last transaction a MySQL
 /// stream read (D-M10.4); and the other one, which the pipeline doesn't have.
 fn lags(e: &E2e) -> (&'static str, &'static str) {
@@ -98,9 +121,11 @@ async fn a_running_pipeline_exports_the_catalogue() {
     e.converged("items").await;
     let labels = e.labels();
     let (lag, other) = lags(&e);
-    eventually("the source's lag", Duration::from_secs(60), async || {
-        sample(&p.metrics().await, lag, &labels, "").is_some()
-    })
+    eventually(
+        "the scrape has every series and the counts",
+        Duration::from_secs(60),
+        async || complete(&p.metrics().await, &labels, lag),
+    )
     .await;
     let text = p.metrics().await;
     for (name, extra) in LIVE {
@@ -116,17 +141,14 @@ async fn a_running_pipeline_exports_the_catalogue() {
     ] {
         assert!(sample(&text, node, "", "").is_some(), "{node}:\n{text}");
     }
-    assert!(!text.contains(&format!("{other}{{")), "{text}");
-    let read = |op: &str| {
-        sample(
-            &text,
-            "data_avalanche_rows_read_total",
-            &labels,
-            &format!(r#",op="{op}""#),
-        )
-    };
+    assert!(
+        !text
+            .lines()
+            .any(|l| l.starts_with(&format!("{other}{{")) || l.starts_with(&format!("{other} "))),
+        "{text}"
+    );
     assert_eq!(
-        ["snapshot", "insert", "update", "delete"].map(read),
+        rows_read(&text, &labels),
         [Some(2.0), Some(1.0), Some(1.0), Some(1.0)],
         "{text}"
     );
