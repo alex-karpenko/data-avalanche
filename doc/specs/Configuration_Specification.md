@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-22
+updated: 2026-10-28
 domain: Architecture
 status: Specification (supersedes the Configuration_file_model.md draft)
 tags: [architecture, configuration, spec, validation, multi-sink, iceberg, delta-lake]
@@ -485,7 +485,7 @@ When tracing is active, `trace_id` / `span_id` are injected into JSON log record
 
 | Field | Type | Required | Default | Mutability | Notes |
 |---|---|---|---|---|---|
-| `otlp_endpoint` | URL | no | — | R | OTLP collector endpoint. **Absent ⇒ tracing disabled** (zero overhead, no error). |
+| `otlp_endpoint` | URL | no | — | R | OTLP/HTTP (protobuf) collector base URL, e.g. `http://otel-collector:4318`; spans are sent to `<endpoint>/v1/traces`. **Absent ⇒ tracing disabled** (zero overhead, no error). An endpoint the exporter can't use is a warning at run time, and the one in force stays. |
 | `sample_ratio` | float [0,1] | no | `0.0` (no endpoint) / `0.05` (endpoint set) | R | Head sampling ratio (V-097). `> 0` without an endpoint warns (V-098). |
 
 ### 6.7 `globals.azure` (`cloud = azure` only)
@@ -1419,7 +1419,7 @@ globals:
       probe_timeout: 500ms
       push_pull_interval: 30s
   tracing:
-    otlp_endpoint: http://otel-collector.observability:4317
+    otlp_endpoint: http://otel-collector.observability:4318
     sample_ratio: 0.05
 
 defaults:
@@ -1615,6 +1615,9 @@ Every deviation, so nothing is silent:
     once; a down member is remembered so a partition heals); §6.5.2 `memberlist.tls` is removed
     with **V-054**: gossip packets carry a MAC keyed from the anchor instead. New rule **V-122**
     (the gossip timers). The block keeps the name `memberlist`.
+28. **M10 planning (2026-10-28, Q-M10-1)** — §6.6 `otlp_endpoint`: OTLP/HTTP with protobuf only
+    (the collector's port 4318), the base URL with `/v1/traces` appended; an endpoint the exporter
+    can't use is a run-time warning, not a V-rule. The §14 example's port is `4318`.
 
 None of these change the **decided** catalog-auth schema (hive Thrift `none/ldap/kerberos`;
 rest HTTP `none/bearer/oauth2/sigv4`) — those are reproduced verbatim from
