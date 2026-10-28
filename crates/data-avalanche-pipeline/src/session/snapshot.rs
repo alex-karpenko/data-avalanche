@@ -25,6 +25,8 @@ use data_avalanche_core::{
 };
 use data_avalanche_state::{SnapshotStatus, TableSnapshotDoc};
 use tokio::task::JoinSet;
+use tracing::Instrument;
+use tracing::field::Empty;
 
 use super::{End, Session, protocol};
 use crate::buffer::identity;
@@ -403,12 +405,21 @@ impl Session<'_> {
             let after = snap.cursor.clone();
             let limit = self.core.settings.chunk_size;
             let table = table.clone();
-            self.snaps.reads.spawn(async move {
+            // A trace per chunk read.
+            let span = tracing::info_span!(
+                parent: None,
+                "snapshot.chunk",
+                pipeline = %self.core.settings.lineage.pipeline,
+                table = %table,
+                rows = Empty,
+            );
+            let read = async move {
                 let read_at_micros = micros_now();
                 let started = Instant::now();
                 let result = source.read_chunk(&schema, after.as_ref(), limit).await;
-                if result.is_ok() {
+                if let Ok(chunk) = &result {
                     observer.chunk_read(started.elapsed());
+                    tracing::Span::current().record("rows", chunk.rows.len());
                 }
                 Read {
                     table,
@@ -417,7 +428,8 @@ impl Session<'_> {
                     result,
                     read_at_micros,
                 }
-            });
+            };
+            self.snaps.reads.spawn(read.instrument(span));
             snap.reading = true;
             reading += 1;
         }
@@ -707,7 +719,7 @@ mod tests {
 
     use super::*;
     use crate::session::Core;
-    use crate::test_support::{Ears, Heard, World, Yaml, row, t, wait_until};
+    use crate::test_support::{Ears, Heard, Spans, World, Yaml, row, t, wait_until};
     use crate::{Backoff, Command, Exit, Hooks, Phase, ReconcileLog, WorkerStatus};
 
     fn chunks_of(n: u64) -> Pipeline {
@@ -839,9 +851,11 @@ mod tests {
         );
     }
 
-    /// Each chunk read is reported, the last, empty one included.
+    /// Each chunk read is reported, the last, empty one included, and is a trace of its own.
     #[tokio::test]
     async fn each_chunk_read_is_reported() {
+        let spans = Spans::default();
+        let _subscriber = spans.install();
         let w = World::new(&["a"]);
         w.started(&["a"]).await;
         w.source.load(&t("a"), rows(1..=5));
@@ -860,6 +874,13 @@ mod tests {
             .count();
         assert_eq!(chunks, 4, "two, two, one, then the empty chunk");
         assert_eq!(st.rows_read.snapshot, 5);
+        let chunk_spans = spans.named("snapshot.chunk");
+        let reads: Vec<_> = chunk_spans
+            .iter()
+            .map(|s| (s.parent, s.field("table"), s.field("rows")))
+            .collect();
+        let read = |rows| (None, Some("public.a"), Some(rows));
+        assert_eq!(reads, [read("2"), read("2"), read("1"), read("0")]);
     }
 
     #[tokio::test]

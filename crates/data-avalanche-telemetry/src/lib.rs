@@ -11,6 +11,10 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+mod traces;
+
+pub use traces::{Traces, TracesError, trace_ids};
+
 use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;

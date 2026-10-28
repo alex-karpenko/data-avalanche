@@ -20,6 +20,8 @@ use data_avalanche_state::{PipelineDocs, StateError, TableHalt, TableSnapshotDoc
 use data_avalanche_storage::StoreError;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tracing::Instrument;
+use tracing::field::Empty;
 
 use crate::backoff::Backoff;
 use crate::checkpoint::{Doc, Store};
@@ -28,6 +30,8 @@ use crate::{CommitGuard, HookAction, HookPoint, Hooks, Observer, WorkerError};
 /// One flush and what becomes durable with it.
 #[derive(Debug)]
 pub(crate) struct Job {
+    /// The pipeline's name, as the flush's span names it.
+    pub pipeline: String,
     pub change_sets: Vec<TableChangeSet>,
     pub checkpoint: SourcePosition,
     /// Halts the event loop found since the last job, recorded before the checkpoint.
@@ -96,7 +100,16 @@ pub(crate) async fn run(
         degraded: false,
     };
     while let Some(job) = jobs.recv().await {
-        if let Err(e) = w.job(job).await {
+        // A trace per flush: its own root, the commits inside it.
+        let span = tracing::info_span!(
+            parent: None,
+            "pipeline.flush",
+            pipeline = %job.pipeline,
+            change_sets = job.change_sets.len(),
+            rows = job.change_sets.iter().map(rows_of).sum::<u64>(),
+            checkpoint = %job.checkpoint,
+        );
+        if let Err(e) = w.job(job).instrument(span).await {
             let _ = w.events.send(WriterEvent::Failed(e));
             return;
         }
@@ -192,21 +205,39 @@ impl Writer {
     }
 
     /// Commits one change set, retrying a transient failure. `Some(detail)` when the sink refused
-    /// it as permanent: the table halts.
+    /// it as permanent: the table halts. Its span records the attempts and how it ended.
     async fn commit(&mut self, cs: TableChangeSet) -> Result<Option<String>, WorkerError> {
+        let rows = rows_of(&cs);
+        let span = tracing::info_span!(
+            "sink.commit",
+            table = %cs.table,
+            rows,
+            attempts = Empty,
+            outcome = Empty,
+        );
+        self.attempts(cs, rows).instrument(span).await
+    }
+
+    async fn attempts(
+        &mut self,
+        cs: TableChangeSet,
+        rows: u64,
+    ) -> Result<Option<String>, WorkerError> {
         let marker = CommitMarker {
             owner_epoch: self.ctx.owner_epoch,
             committed_position: cs.position.end.clone(),
             pipeline_id: self.ctx.pipeline_id.clone(),
         };
-        let rows = rows_of(&cs);
         let observer = Arc::clone(&self.ctx.observer);
+        let span = tracing::Span::current();
         let at = Instant::now();
         let mut attempt = 0;
         loop {
             if !self.ctx.guard.may_commit() {
+                span.record("outcome", "lease lost");
                 return Err(WorkerError::LeaseLost);
             }
+            span.record("attempts", attempt + 1);
             let outcome = self.ctx.sink.commit(cs.clone(), marker.clone()).await;
             if outcome.is_err() {
                 observer.commit_failed();
@@ -214,14 +245,17 @@ impl Writer {
             match outcome {
                 Ok(CommitOutcome::Committed { .. }) => {
                     observer.committed(rows, at.elapsed());
+                    span.record("outcome", "committed");
                     self.degraded(None);
                     return Ok(None);
                 }
                 Ok(CommitOutcome::SkippedCovered) => {
+                    span.record("outcome", "covered");
                     self.degraded(None);
                     return Ok(None);
                 }
                 Ok(CommitOutcome::Fenced { current_epoch }) => {
+                    span.record("outcome", "fenced");
                     return Err(WorkerError::Fenced {
                         table: cs.table,
                         current_epoch,
@@ -233,10 +267,14 @@ impl Writer {
                     attempt += 1;
                 }
                 Err(SinkError::Permanent { reason }) => {
+                    span.record("outcome", "refused");
                     self.degraded(None);
                     return Ok(Some(reason));
                 }
-                Err(e) => return Err(WorkerError::Sink(e)),
+                Err(e) => {
+                    span.record("outcome", "failed");
+                    return Err(WorkerError::Sink(e));
+                }
             }
         }
     }
@@ -313,7 +351,7 @@ mod tests {
     use super::*;
     use crate::NoHooks;
     use crate::test_support::{
-        CrashAt, Ears, FlakyStore, Heard, Switch, accumulator, docs, lsn, schema, txn,
+        CrashAt, Ears, FlakyStore, Heard, Spans, Switch, accumulator, docs, lsn, schema, txn,
     };
 
     const FAST: Backoff = Backoff {
@@ -422,6 +460,7 @@ mod tests {
 
     fn job(flush: crate::Flush) -> Job {
         Job {
+            pipeline: "p".into(),
             change_sets: flush.change_sets,
             checkpoint: flush.checkpoint,
             halts: vec![],
@@ -496,6 +535,7 @@ mod tests {
         r.server = Some(server.clone());
         let at = SourcePosition::parse_tagged("mariadb-gtid:0-7-42").unwrap();
         let j = Job {
+            pipeline: "p".into(),
             change_sets: vec![],
             checkpoint: at.clone(),
             halts: vec![],
@@ -625,6 +665,62 @@ mod tests {
             times[0] >= Duration::from_micros(3500),
             "{:?} leaves out the backoff",
             times[0]
+        );
+    }
+
+    /// A flush is a trace of its own: its commits inside it, each with its attempts and how it
+    /// ended.
+    #[tokio::test]
+    async fn a_flush_is_a_span_with_a_span_per_commit() {
+        let spans = Spans::default();
+        let _subscriber = spans.install();
+        let r = rig(&["a", "b"]).await;
+        r.sink.fail(
+            SinkOp::Commit,
+            Some(&TableRef::new("public", "a")),
+            1,
+            || SinkError::Transient {
+                reason: "throttled".into(),
+            },
+        );
+        let mut acc = accumulator(&["a", "b"], 100);
+        txn(&mut acc, 1, 200, &[("a", 1, "x"), ("b", 1, "y")]);
+        r.run(vec![job(acc.flush())], Arc::new(NoHooks)).await;
+        let [flush] = &spans.named("pipeline.flush")[..] else {
+            panic!("one flush")
+        };
+        assert_eq!(flush.parent, None, "a root");
+        for (field, value) in [("pipeline", "p"), ("change_sets", "2"), ("rows", "2")] {
+            assert_eq!(flush.field(field), Some(value), "{field}");
+        }
+        let commits = spans.named("sink.commit");
+        let seen: Vec<_> = commits
+            .iter()
+            .map(|c| {
+                (
+                    c.parent,
+                    c.field("table"),
+                    c.field("attempts"),
+                    c.field("outcome"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (
+                    Some("pipeline.flush"),
+                    Some("public.a"),
+                    Some("2"),
+                    Some("committed")
+                ),
+                (
+                    Some("pipeline.flush"),
+                    Some("public.b"),
+                    Some("1"),
+                    Some("committed")
+                ),
+            ]
         );
     }
 

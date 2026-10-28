@@ -9,6 +9,8 @@ use data_avalanche_core::{
     classify,
 };
 use tokio::sync::watch;
+use tracing::Instrument;
+use tracing::field::Empty;
 
 use crate::{CommitGuard, Tuning, WorkerError, WorkerStatus};
 
@@ -34,6 +36,8 @@ pub(crate) struct Planned {
 }
 
 pub(crate) struct Evolver<'a> {
+    /// The pipeline's name, as the evolve's span names it.
+    pub pipeline: &'a str,
     pub source: &'a dyn SourceConnector,
     pub sink: &'a dyn Sink,
     pub guard: &'a dyn CommitGuard,
@@ -88,8 +92,33 @@ impl Evolver<'_> {
     }
 
     /// The sink's evolve of the Safe changes, retried while it fails transiently. `Ok(Some)` is a
-    /// degraded apply's warning; `Ok(Err)` halts the table.
+    /// degraded apply's warning; `Ok(Err)` halts the table. A trace of its own, which records how
+    /// it ended.
     pub async fn evolve(
+        &self,
+        table: &TableRef,
+        safe: Vec<SchemaChange>,
+    ) -> Result<Result<Option<String>, HaltReason>, WorkerError> {
+        let span = tracing::info_span!(
+            parent: None,
+            "schema.apply",
+            pipeline = %self.pipeline,
+            table = %table,
+            changes = safe.len(),
+            outcome = Empty,
+        );
+        let applied = self.apply(table, safe).instrument(span.clone()).await;
+        let outcome = match &applied {
+            Ok(Ok(None)) => "applied",
+            Ok(Ok(Some(_))) => "degraded",
+            Ok(Err(_)) => "halted",
+            Err(_) => "failed",
+        };
+        span.record("outcome", outcome);
+        applied
+    }
+
+    async fn apply(
         &self,
         table: &TableRef,
         safe: Vec<SchemaChange>,

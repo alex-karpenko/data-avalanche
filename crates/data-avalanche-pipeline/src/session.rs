@@ -132,6 +132,7 @@ impl Core {
 
     pub fn evolver(&self) -> Evolver<'_> {
         Evolver {
+            pipeline: &self.settings.lineage.pipeline,
             source: &*self.source,
             sink: &*self.sink,
             guard: &*self.guard,
@@ -1230,6 +1231,7 @@ impl<'c> Session<'c> {
         // A slice of a large transaction leaves the rest of it to wait.
         self.unflushed_since = self.open_since;
         let job = Job {
+            pipeline: self.core.settings.lineage.pipeline.clone(),
             change_sets,
             checkpoint: checkpoint.clone(),
             halts: std::mem::take(&mut self.halts),
@@ -1355,7 +1357,7 @@ mod tests {
     use data_avalanche_testkit::{FakeTxn, Method, SinkOp};
 
     use super::*;
-    use crate::test_support::{World, Yaml, pipeline, row, schema, t, wait_until};
+    use crate::test_support::{Spans, World, Yaml, pipeline, row, schema, t, wait_until};
 
     /// Runs a session over `w` until `drive` returns, then drains it.
     async fn session<F: Future<Output = ()>>(
@@ -2601,6 +2603,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_added_column_is_evolved_where_the_stream_meets_it() {
+        let spans = Spans::default();
+        let _subscriber = spans.install();
         let w = World::new(&["a"]);
         w.started(&["a"]).await;
         let (end, _) = session(&w, &flush_each(), &["a"], async |status| {
@@ -2617,6 +2621,18 @@ mod tests {
         let cached = w.docs.table_schema(&t("a")).await.unwrap().unwrap().doc;
         assert!(cached.column("note").is_some(), "cached once durable");
         assert_eq!(cached.source_id(), w.source.schema(&t("a")).source_id());
+        let [apply] = &spans.named("schema.apply")[..] else {
+            panic!("one apply")
+        };
+        assert_eq!(apply.parent, None, "a trace of its own");
+        for (field, value) in [
+            ("pipeline", "p"),
+            ("table", "public.a"),
+            ("changes", "1"),
+            ("outcome", "applied"),
+        ] {
+            assert_eq!(apply.field(field), Some(value), "{field}");
+        }
     }
 
     /// The table's next evolve fails `Permanent`: an evolve would halt it `SINK_REJECTED`.
