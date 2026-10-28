@@ -2,6 +2,7 @@
 //! and copies one outside the config, clears a dropped table's halt, and outlives a kill of the
 //! process that ran it.
 
+use std::cell::Cell;
 use std::time::Duration;
 
 use data_avalanche_testkit::require_it;
@@ -187,15 +188,15 @@ async fn a_job_outlives_a_kill_of_its_process() {
     assert_eq!(code, 202, "{v}");
     let id = v["job_id"].as_str().unwrap().to_owned();
     let path = format!("/v1/snapshots/{id}");
+    let before = Cell::new(0);
     eventually(
         "the job's table reads, partway",
         Duration::from_secs(60),
         async || {
             let job = p.call("GET", &path).await.1;
-            job["status"] == "running"
-                && job["tables"][0]["rows_done"]
-                    .as_u64()
-                    .is_some_and(|n| n > 0 && n < 1_000)
+            let n = job["tables"][0]["rows_done"].as_u64().unwrap_or(0);
+            before.set(n);
+            job["status"] == "running" && n > 0 && n < 1_000
         },
     )
     .await;
@@ -212,7 +213,28 @@ async fn a_job_outlives_a_kill_of_its_process() {
         id.as_str(),
         "listed after the kill"
     );
-    let job = ended(&p, &id).await;
+    // A resume reads on from the cursor: the job's count never falls below the one seen before
+    // the kill, as a snapshot started over from the first row would.
+    let low = Cell::new(u64::MAX);
+    eventually(
+        &format!("job {id} ends"),
+        Duration::from_secs(120),
+        async || {
+            let job = p.call("GET", &path).await.1;
+            if let Some(n) = job["tables"][0]["rows_done"].as_u64() {
+                low.set(low.get().min(n));
+            }
+            job["status"] == "completed" || job["status"] == "failed"
+        },
+    )
+    .await;
+    assert!(
+        low.get() >= before.get(),
+        "rows_done fell from {} to {} after the kill",
+        before.get(),
+        low.get()
+    );
+    let job = p.call("GET", &path).await.1;
     assert_eq!(job["status"], "completed", "{job}");
     assert_eq!(job["tables"][0]["rows_done"], 1_000, "{job}");
     e.converged("items").await;
