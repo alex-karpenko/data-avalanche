@@ -121,7 +121,8 @@ pub fn check_partitioning(
 }
 
 /// A per-table config key as a table: PG `schema.table`; MySQL `name` in `source.db` (§10).
-fn key_table(p: &Pipeline, key: &str) -> Option<TableRef> {
+/// `None` for a PostgreSQL key without its schema.
+pub fn key_table(p: &Pipeline, key: &str) -> Option<TableRef> {
     match p.source.kind {
         SourceType::Postgres => key.split_once('.').map(|(s, t)| TableRef::new(s, t)),
         SourceType::Mysql => Some(TableRef::new(p.source.db.clone(), key)),

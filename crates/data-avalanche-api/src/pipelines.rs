@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use crate::{Api, Failure, Node, Principal, body, starting};
 
 /// What a status read failed on: 503, the store is the answer.
-fn unavailable(e: &StateError) -> Response {
+pub(crate) fn unavailable(e: &StateError) -> Response {
     body(
         StatusCode::SERVICE_UNAVAILABLE,
         &json!({ "error": format!("the pipeline's state: {e}") }),
@@ -27,7 +27,7 @@ fn unavailable(e: &StateError) -> Response {
 }
 
 /// The pipeline with this id in the generation the node runs, and its state documents.
-async fn find(node: &Node, id: &str) -> Result<(Pipeline, PipelineDocs), Failure> {
+pub(crate) async fn find(node: &Node, id: &str) -> Result<(Pipeline, PipelineDocs), Failure> {
     let config = node.coordinator.config().await;
     let Some(p) = config.pipelines.values().find(|p| p.id == id).cloned() else {
         return Err(Failure::new(
@@ -44,7 +44,7 @@ async fn find(node: &Node, id: &str) -> Result<(Pipeline, PipelineDocs), Failure
     Ok((p, docs))
 }
 
-fn desired_name(d: DesiredState) -> &'static str {
+pub(crate) fn desired_name(d: DesiredState) -> &'static str {
     match d {
         DesiredState::Running => "running",
         DesiredState::Paused => "paused",
@@ -82,13 +82,17 @@ fn actual<'s>(
 }
 
 /// The documents a status is read from.
-struct Read {
-    desired: DesiredState,
-    lease: Option<LeaseDoc>,
-    status: Option<StatusDoc>,
+pub(crate) struct Read {
+    pub desired: DesiredState,
+    pub lease: Option<LeaseDoc>,
+    pub status: Option<StatusDoc>,
 }
 
-async fn read(node: &Node, p: &Pipeline, docs: &PipelineDocs) -> Result<Read, StateError> {
+pub(crate) async fn read(
+    node: &Node,
+    p: &Pipeline,
+    docs: &PipelineDocs,
+) -> Result<Read, StateError> {
     let (state, lease, status) =
         tokio::join!(docs.state(), node.leases.observe(&p.id), docs.status());
     Ok(Read {

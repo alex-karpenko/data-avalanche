@@ -728,6 +728,142 @@
         "x-min-role": "operator"
       }
     },
+    "/v1/pipelines/{id}/snapshots": {
+      "get": {
+        "tags": [
+          "pipelines"
+        ],
+        "summary": "The pipeline's snapshot jobs, oldest first",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "the pipeline's id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the jobs",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "404": {
+            "description": "no such pipeline in the generation this node runs",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "viewer"
+      },
+      "post": {
+        "tags": [
+          "pipelines"
+        ],
+        "summary": "Snapshot tables on demand, `{\"tables\": [...]}`, each named exactly; one outside the config is copied, not streamed",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "the pipeline's id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {}
+          },
+          "required": false
+        },
+        "responses": {
+          "202": {
+            "description": "the job is queued: the owner restarts the worker, which takes its tables",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "404": {
+            "description": "no such pipeline in the generation this node runs",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "409": {
+            "description": "paused, stopped, no node holds the lease, or an unfinished job holds a table",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "422": {
+            "description": "the body names no table, a glob, or a table not in the source's form",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "operator"
+      }
+    },
     "/v1/pipelines/{id}/stop": {
       "post": {
         "tags": [
@@ -792,6 +928,66 @@
           }
         ],
         "x-min-role": "operator"
+      }
+    },
+    "/v1/snapshots/{job_id}": {
+      "get": {
+        "tags": [
+          "snapshots"
+        ],
+        "summary": "A snapshot job: its status and each table's",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "description": "the snapshot job's id, `<pipeline id>~<suffix>`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the job",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "404": {
+            "description": "no such job",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "viewer"
       }
     }
   },
