@@ -1077,8 +1077,12 @@ impl<'c> Session<'c> {
                 .is_some_and(|r| !r.streamed)
                 .then(|| unread.to_owned()),
         );
-        let retained = retained.map(|r| r.bytes);
-        self.core.update(|st| st.retained_bytes = retained);
+        let behind = retained.and_then(|r| r.behind);
+        let retained = retained.and_then(|r| r.bytes);
+        self.core.update(|st| {
+            st.retained_bytes = retained;
+            st.source_behind = behind;
+        });
         match (retained, self.core.settings.max_wal_lag_bytes) {
             (Some(lag), Some(limit)) if lag > limit => Err(WorkerError::WalLag { lag, limit }),
             _ => Ok(()),
@@ -2155,8 +2159,10 @@ mod tests {
         let s = Session::open(&mut core).await.unwrap().unwrap();
         let driver = async {
             w.source.set_retained(Some(1024));
+            w.source.set_behind(Some(Duration::from_secs(3)));
             wait_until("the lag is reported", || {
-                status.borrow().retained_bytes == Some(1024)
+                let st = status.borrow();
+                st.retained_bytes == Some(1024) && st.source_behind == Some(Duration::from_secs(3))
             })
             .await;
             w.source.set_retained(Some(65 << 20));

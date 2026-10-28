@@ -11,6 +11,7 @@
 //! server's files means nothing in another's.
 
 use std::sync::atomic::Ordering;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use data_avalanche_config::BinlogPurgeAction;
 use data_avalanche_core::{
@@ -21,6 +22,42 @@ use mysql_async::prelude::Queryable;
 
 use crate::connector::MySqlConnector;
 use crate::position::{Mode, purged};
+
+/// Where the binlog stream has read to, for the heartbeat's lag
+/// (`data_avalanche_binlog_lag_seconds`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReadAt {
+    /// Where the stream opened, then each transaction's end.
+    pub position: SourcePosition,
+    /// The last transaction's commit time (microseconds since the Unix epoch); `None` before the
+    /// stream read one.
+    pub commit_micros: Option<i64>,
+    /// A heartbeat came after it: the dump had nothing more to send.
+    pub idle: bool,
+}
+
+/// How far the stream that read to `read` is behind the server's write position `head` at
+/// `now_micros`: zero once a heartbeat said the dump is idle, or the stream's position covers
+/// `head`; else the age of the last transaction it read. `None` when `head` is unknown, or the
+/// stream is behind without having read a transaction.
+pub(crate) fn behind(
+    read: &ReadAt,
+    head: Option<&SourcePosition>,
+    now_micros: i64,
+) -> Option<Duration> {
+    if read.idle || read.position.covers(head?).unwrap_or(false) {
+        return Some(Duration::ZERO);
+    }
+    let age = now_micros.saturating_sub(read.commit_micros?);
+    Some(Duration::from_micros(u64::try_from(age).unwrap_or(0)))
+}
+
+fn now_micros() -> i64 {
+    let since = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    i64::try_from(since.as_micros()).unwrap_or(i64::MAX)
+}
 
 /// Why `checkpoint` can't be read in `mode`, if it can't.
 pub fn dialect_change(mode: Mode, checkpoint: &SourcePosition) -> Option<String> {
@@ -137,8 +174,9 @@ impl MySqlConnector {
     }
 
     /// The heartbeat's watch on the dump (DA-SRC-16, V-121): whether the server still runs the
-    /// stream's binlog dump, found by its connection id. The server keeps no log for the pipeline
-    /// (its binlogs expire by its own policy), so `bytes` is 0.
+    /// stream's binlog dump, found by its connection id, and how far the stream reads behind the
+    /// server's write position ([`behind`]). The server keeps no log for the pipeline (its
+    /// binlogs expire by its own policy), so `bytes` is `None`.
     pub async fn retained(&self) -> Result<Option<RetainedLog>, SourceError> {
         let id = self.shared.dump.load(Ordering::Relaxed);
         let streamed = match id {
@@ -160,7 +198,19 @@ impl MySqlConnector {
                     .await?
             }
         };
-        Ok(Some(RetainedLog { bytes: 0, streamed }))
+        let behind = match self.shared.read() {
+            None => None,
+            Some(read) if read.idle => Some(Duration::ZERO),
+            Some(read) => {
+                let head = self.position_now().await.ok();
+                behind(&read, head.as_ref(), now_micros())
+            }
+        };
+        Ok(Some(RetainedLog {
+            bytes: None,
+            streamed,
+            behind,
+        }))
     }
 }
 
@@ -172,6 +222,43 @@ mod tests {
 
     fn file() -> SourcePosition {
         SourcePosition::BinlogFile(BinlogFilePos::new("binlog.000003", 154).unwrap())
+    }
+
+    fn at(pos: u64, commit_micros: Option<i64>, idle: bool) -> ReadAt {
+        ReadAt {
+            position: SourcePosition::BinlogFile(BinlogFilePos::new("binlog.000003", pos).unwrap()),
+            commit_micros,
+            idle,
+        }
+    }
+
+    /// At the server's write position, or idle by a heartbeat, the stream is 0 behind; short of
+    /// it, the last transaction it read is as old as the lag. Behind with nothing read, or
+    /// without the server's position, the lag is unknown.
+    #[test]
+    fn the_binlog_lag_is_zero_at_the_head_else_the_last_transaction_s_age() {
+        let head = SourcePosition::BinlogFile(BinlogFilePos::new("binlog.000003", 900).unwrap());
+        let now = 10_000_000;
+        assert_eq!(
+            behind(&at(900, Some(1_000_000), false), Some(&head), now),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            behind(&at(500, Some(1_000_000), false), Some(&head), now),
+            Some(Duration::from_secs(9))
+        );
+        assert_eq!(
+            behind(&at(500, Some(1_000_000), true), None, now),
+            Some(Duration::ZERO),
+            "a heartbeat came after it"
+        );
+        assert_eq!(behind(&at(500, None, false), Some(&head), now), None);
+        assert_eq!(behind(&at(500, Some(1_000_000), false), None, now), None);
+        assert_eq!(
+            behind(&at(500, Some(now + 5), false), Some(&head), now),
+            Some(Duration::ZERO),
+            "a clock behind the server's reads no lag"
+        );
     }
 
     #[test]

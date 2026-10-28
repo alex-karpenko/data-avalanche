@@ -113,6 +113,9 @@ pub struct WorkerStatus {
     /// The log the source keeps for the pipeline, read every heartbeat (PostgreSQL: the slot's
     /// retained WAL, `data_avalanche_wal_lag_bytes`).
     pub retained_bytes: Option<u64>,
+    /// How far the stream reads behind the source's newest change, read every heartbeat (MySQL
+    /// and MariaDB, `data_avalanche_binlog_lag_seconds`).
+    pub source_behind: Option<Duration>,
     /// Sink commits or state writes are failing and being retried (the last error).
     pub degraded: Option<String>,
     pub halted: BTreeMap<TableRef, HaltReason>,

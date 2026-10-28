@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use data_avalanche_core::{
-    CdcEvent, ChangeStream, Checkpoint, ColumnValue, RetainedLog, ServerIdentity, SnapshotReason,
+    CdcEvent, ChangeStream, Checkpoint, ColumnValue, ServerIdentity, SnapshotReason,
     SourceConnector, SourceError, SourcePosition, StartPlan, StreamItem,
 };
 use data_avalanche_source_mysql::{Flavour, Mode, MySqlConnector, MySqlStream};
@@ -179,7 +179,7 @@ async fn a_purged_file_follows_the_purge_action() {
 async fn watch(c: &MySqlConnector, streamed: bool) {
     for _ in 0..50 {
         let r = c.retained().await.expect("retained");
-        if r == Some(RetainedLog { bytes: 0, streamed }) {
+        if r.is_some_and(|r| r.streamed == streamed && r.bytes.is_none()) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -237,6 +237,41 @@ async fn the_watch_finds_the_dump_by_its_connection() {
 }
 
 const FILE: &str = ", replication_type: binlog";
+
+/// The heartbeat's lag: behind the server's write position, the age of the last transaction the
+/// stream read; none without a stream. A MySQL source keeps no log for the pipeline: no bytes.
+/// Other tests write the same server meanwhile, so the stream is never sure to be at its head:
+/// the zero at the head is the unit test's.
+#[tokio::test]
+async fn the_binlog_lag_is_the_age_of_the_last_commit_read() {
+    require_it!();
+    let (n, mut a) = fresh("start_lag", "CREATE TABLE t (id INT PRIMARY KEY)").await;
+    let c = connector(&pipeline(&n, &["t"], "", ""));
+    let lag = async |c: &MySqlConnector| c.retained().await.expect("retained").expect("a log");
+    assert_eq!(lag(&c).await.behind, None, "no stream");
+    let tables = c.resolve_tables().await.unwrap().tables;
+    let from = c.checkpoint_now().await.unwrap();
+    let mut s = c.open_stream(&from, &tables).await.expect("stream");
+    a.query_drop("INSERT INTO t VALUES (1)").await.unwrap();
+    to_commit(&mut s).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    a.query_drop("INSERT INTO t VALUES (2)").await.unwrap();
+    let r = lag(&c).await;
+    assert!(
+        r.behind.is_some_and(|b| b >= Duration::from_secs(1)),
+        "the commit read 2 s ago is the lag: {r:?}"
+    );
+    assert_eq!(r.bytes, None);
+    to_commit(&mut s).await;
+    let r = lag(&c).await;
+    assert!(
+        r.behind.is_some_and(|b| b < Duration::from_secs(2)),
+        "the commit just read is the lag: {r:?}"
+    );
+    let _ = Box::new(s).close().await;
+    assert_eq!(lag(&c).await.behind, None, "closed");
+    cleanup(&n).await;
+}
 
 /// The changes up to the stream's next commit, and the commit's position, within 20 s.
 async fn to_commit(s: &mut MySqlStream) -> (Vec<CdcEvent>, SourcePosition) {

@@ -20,6 +20,7 @@ use crate::server::{
     Coverage, Flavour, Fold, Settings, access_denied, check_coverage, check_settings,
     grants_replication,
 };
+use crate::start::ReadAt;
 
 /// The settings a reload changes while the connector runs (config §1.2, class R).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +58,8 @@ pub(crate) struct Shared {
     fold: AtomicBool,
     /// The reloadable settings in force.
     live: Mutex<Live>,
+    /// Where the open stream has read to, `None` without one: the heartbeat's lag.
+    read: Mutex<Option<ReadAt>>,
 }
 
 impl Shared {
@@ -66,7 +69,45 @@ impl Shared {
             dump: AtomicU32::default(),
             fold: AtomicBool::default(),
             live: Mutex::new(Live::of(m, tables)),
+            read: Mutex::default(),
         }
+    }
+
+    fn read_at(&self) -> std::sync::MutexGuard<'_, Option<ReadAt>> {
+        self.read.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A stream opened at `from`.
+    pub(crate) fn opened(&self, from: &SourcePosition) {
+        *self.read_at() = Some(ReadAt {
+            position: from.clone(),
+            commit_micros: None,
+            idle: false,
+        });
+    }
+
+    /// The stream read a transaction that committed at `commit_micros`, up to `position`.
+    pub(crate) fn read_to(&self, position: &SourcePosition, commit_micros: i64) {
+        *self.read_at() = Some(ReadAt {
+            position: position.clone(),
+            commit_micros: Some(commit_micros),
+            idle: false,
+        });
+    }
+
+    /// A heartbeat: the dump has nothing more to send.
+    pub(crate) fn idle(&self) {
+        if let Some(r) = self.read_at().as_mut() {
+            r.idle = true;
+        }
+    }
+
+    pub(crate) fn closed(&self) {
+        *self.read_at() = None;
+    }
+
+    pub(crate) fn read(&self) -> Option<ReadAt> {
+        self.read_at().clone()
     }
 }
 

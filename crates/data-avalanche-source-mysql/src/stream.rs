@@ -752,6 +752,7 @@ impl MySqlConnector {
         };
         let events = conn.get_binlog_stream(req).await.map_err(err)?;
         self.shared.dump.store(id, Ordering::Relaxed);
+        self.shared.opened(from);
         Ok(MySqlStream {
             events,
             catalog,
@@ -883,6 +884,9 @@ impl MySqlStream {
                 )));
             }
         };
+        self.catalog
+            .shared
+            .read_to(&self.position, txn.commit_ts_micros);
         if txn.begun {
             let item = StreamItem::Commit(TransactionBoundary {
                 xid: txn.xid,
@@ -926,6 +930,7 @@ impl MySqlStream {
         match raw {
             types::HEARTBEAT | types::HEARTBEAT_V2 => {
                 self.offsets.heartbeat().map_err(payload_invalid)?;
+                self.catalog.shared.idle();
                 if self.txn.is_none() && self.signals.is_none() {
                     self.keep_alive(true);
                 }
@@ -1371,6 +1376,7 @@ impl ChangeStream for MySqlStream {
 
     async fn close(self: Box<Self>) -> Result<(), SourceError> {
         self.catalog.shared.dump.store(0, Ordering::Relaxed);
+        self.catalog.shared.closed();
         self.events.close().await.map_err(|e| mysql(e, None))
     }
 }

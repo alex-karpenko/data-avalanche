@@ -28,6 +28,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use data_avalanche_core::position::Lsn;
@@ -236,6 +237,8 @@ struct Db {
     slot_lost: bool,
     added: Vec<TableRef>,
     retained: Option<Option<u64>>,
+    /// [`FakeSource::set_behind`].
+    behind: Option<Duration>,
     /// [`FakeSource::detach_stream`].
     detached: bool,
     /// [`FakeSource::stall_retained`].
@@ -298,6 +301,7 @@ impl FakeSource {
             slot_lost: false,
             added: vec![],
             retained: None,
+            behind: None,
             detached: false,
             retained_stalled: false,
             faults: vec![],
@@ -458,6 +462,11 @@ impl FakeSource {
     /// The bytes `retained` reports from now on (by default, the log from the slot to its end).
     pub fn set_retained(&self, bytes: Option<u64>) {
         self.db().retained = Some(bytes);
+    }
+
+    /// How far behind `retained` says the stream reads from now on (by default, it doesn't say).
+    pub fn set_behind(&self, behind: Option<Duration>) {
+        self.db().behind = behind;
     }
 
     /// `retained` reports that no stream reads the slot, whatever the open streams do: a stream
@@ -1011,8 +1020,9 @@ impl SourceConnector for FakeSource {
             None => db.slot.map(|s| db.wal_end.0.saturating_sub(s.0)),
         };
         Ok(bytes.map(|bytes| RetainedLog {
-            bytes,
+            bytes: Some(bytes),
             streamed: !db.detached,
+            behind: db.behind,
         }))
     }
 

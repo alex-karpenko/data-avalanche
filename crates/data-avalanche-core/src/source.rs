@@ -3,6 +3,7 @@
 
 use std::any::Any;
 use std::fmt;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -296,11 +297,17 @@ pub enum StreamItem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetainedLog {
     /// Bytes kept on the source's disk (PostgreSQL: the WAL from the slot's `restart_lsn`, the
-    /// `max_wal_lag_bytes` guard).
-    pub bytes: u64,
+    /// `max_wal_lag_bytes` guard); `None` when the source keeps no log for the pipeline (MySQL
+    /// and MariaDB: the binlogs expire by the server's own policy).
+    pub bytes: Option<u64>,
     /// A stream reads it now (PostgreSQL: the slot is `active`). A session whose stream is open
     /// but which reads `false` has lost its stream without hearing of it (DA-SRC-16).
     pub streamed: bool,
+    /// How far the stream reads behind the source's newest change (MySQL and MariaDB:
+    /// `data_avalanche_binlog_lag_seconds`): zero once it has read everything there is, else the
+    /// age of the last transaction it read. `None` when the source doesn't say (PostgreSQL), or
+    /// can't yet: no stream, or one behind that hasn't read a transaction.
+    pub behind: Option<Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

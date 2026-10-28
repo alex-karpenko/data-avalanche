@@ -539,8 +539,12 @@ async fn reset_teardown_and_retained_wal() {
     .await
     .unwrap();
     let retained = c.retained().await.unwrap().unwrap();
-    assert!(retained.bytes > 0, "WAL written since the slot's position");
+    assert!(
+        retained.bytes.is_some_and(|b| b > 0),
+        "WAL written since the slot's position"
+    );
     assert!(!retained.streamed, "no stream reads the slot");
+    assert_eq!(retained.behind, None, "the binlog lag is MySQL's");
 
     let SourcePosition::Pg(fresh_at) = c.reset_position().await.unwrap() else {
         panic!("a PostgreSQL position")
