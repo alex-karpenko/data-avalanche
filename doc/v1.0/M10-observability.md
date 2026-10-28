@@ -6471,3 +6471,14 @@ git commit -m "test(e2e): the catalogue scraped live, and the traces read back f
   0.2 ms. The writer's tests run on the real clock, so the test asserts a lower bound only. The
   workspace has 1298 tests after Task 2, one more than Step 4 expects; the later tasks' totals
   are one higher too.
+- **Task 3, two more lag tests** (a test commit after the task's commit). The task's review found
+  that the two cases D-M10.3 names had no test, though the code was right:
+  - `a_slice_of_a_large_transaction_leaves_the_rest_pending`: a slice handed while its
+    transaction is still open, then durable, leaves the lag at that transaction's commit time.
+    It fails without the reset of the lag's start after a slice.
+  - `a_durable_job_leaves_the_next_job_s_lag`: of two queued jobs, the first one durable moves
+    the lag to the second's commit time. It fails when a durable job clears the whole queue.
+
+  Both drive the session by hand, because the fake sink's `release_commits` can't release a
+  single job. The workspace has 1304 tests after Task 3; the later tasks' totals are three
+  higher than their Step 4s say.
