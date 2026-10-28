@@ -474,6 +474,18 @@ impl Session<'_> {
                 });
                 return Ok(None);
             }
+            // A copy's read that fails for good (a table outside the config the role can't
+            // read) is the copy's alone: it halts, and its job fails it.
+            Err(e) if self.copies.contains_key(&table) => {
+                self.snaps.reconciler.cancel(ticket);
+                self.halt(
+                    table,
+                    HaltReason::NotReplicable {
+                        reason: e.to_string(),
+                    },
+                )?;
+                return Ok(None);
+            }
             Err(e) => {
                 self.snaps.reconciler.cancel(ticket);
                 return Ok(Some(End::Source(e)));

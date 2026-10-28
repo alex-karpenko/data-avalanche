@@ -87,13 +87,13 @@ mod tests {
     use chrono::Utc;
     use data_avalanche_config::Pipeline;
     use data_avalanche_core::{
-        ColumnSchema, ColumnValue, ColumnValueType as V, HaltReason, Row, TableSchema,
+        ColumnSchema, ColumnValue, ColumnValueType as V, HaltReason, Row, SourceError, TableSchema,
     };
     use data_avalanche_state::{
         CursorKey, JobStatus, JobTableStatus, SnapshotCursor, SnapshotJobDoc, SnapshotStatus,
         TableHalt, TableSnapshotDoc,
     };
-    use data_avalanche_testkit::FakeTxn;
+    use data_avalanche_testkit::{FakeTxn, Method};
     use tokio::sync::watch;
 
     use crate::test_support::{World, Yaml, fast, row, t, wait_until};
@@ -511,5 +511,124 @@ mod tests {
         }
         assert!(st.halted.is_empty(), "{:?}", st.halted);
         assert!(w.docs.halts().await.unwrap().tables.is_empty());
+    }
+
+    /// A copy whose chunk read fails for good (a table the role can't read) halts, alone: the
+    /// stream goes on, and the copy's halt is recorded with the error.
+    #[tokio::test]
+    async fn a_copy_that_can_t_be_read_halts_alone() {
+        let w = World::new(&["a", "x"]);
+        w.source.outside_config(&t("x"));
+        established(&w).await;
+        w.source.load(&t("x"), rows(1..=3));
+        ask(&w, "p~1", &["x"]).await;
+        w.source.fail(
+            Method::ReadChunk,
+            SourceError::Permanent("permission denied for table x".into()),
+        );
+        let (end, st) = run(&w, &never(2), async |status| {
+            wait_until("the copy halts", || {
+                status.borrow().halted.contains_key(&t("x"))
+            })
+            .await;
+            w.source
+                .commit(FakeTxn::new().insert(&t("a"), row(1, "streamed")));
+            wait_until("the stream moves on", || w.ids("a") == [1]).await;
+            streamed(&status, &w).await;
+        })
+        .await;
+        assert_eq!(end.unwrap(), Exit::Drained);
+        assert_eq!(
+            st.halted.get(&t("x")),
+            Some(&HaltReason::NotReplicable {
+                reason: "permission denied for table x".into()
+            })
+        );
+        let halts = w.docs.halts().await.unwrap().tables;
+        assert_eq!(halts.len(), 1, "{halts:?}");
+        assert_eq!(halts[0].table, t("x"));
+        assert_eq!(halts[0].reason.code(), "TABLE_NOT_REPLICABLE");
+        assert!(w.ids("x").is_empty());
+    }
+
+    /// A copy that halts in a run (here its table is dropped while it is read) fails in its
+    /// job at the next start, with the halt's reason, and its halt goes: no job can clear the
+    /// halt of a table gone, and the pipeline doesn't replicate it.
+    #[tokio::test]
+    async fn a_copy_halted_in_a_run_fails_its_job_and_its_halt_goes() {
+        let w = World::new(&["a", "x"]);
+        w.source.outside_config(&t("x"));
+        established(&w).await;
+        w.source.load(&t("x"), rows(1..=3));
+        ask(&w, "p~1", &["x"]).await;
+        w.source.hold_reads();
+        let (end, _) = run(&w, &never(2), async |status| {
+            wait_until("the first chunk is read", || w.source.reads(&t("x")) == 1).await;
+            w.source.drop_table(&t("x"));
+            w.source.release_reads();
+            wait_until("the copy halts", || {
+                status.borrow().halted.contains_key(&t("x"))
+            })
+            .await;
+            w.source
+                .commit(FakeTxn::new().insert(&t("a"), row(1, "streamed")));
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!(w.docs.halts().await.unwrap().tables.len(), 1);
+        let (end, st) = run(&w, &never(2), async |status| streamed(&status, &w).await).await;
+        end.unwrap();
+        assert!(w.docs.halts().await.unwrap().tables.is_empty());
+        assert!(st.halted.is_empty(), "{:?}", st.halted);
+        let j = job(&w, "p~1").await;
+        assert_eq!(j.status, JobStatus::Failed);
+        let error = j.tables[0].error.clone().unwrap();
+        assert!(error.starts_with("TABLE_DROPPED: "), "{error}");
+    }
+
+    /// A running copy with a recorded halt isn't read again at the next start: it fails in its
+    /// job with the halt's reason.
+    #[tokio::test]
+    async fn a_running_copy_halted_before_isn_t_read_again() {
+        let w = World::new(&["a", "x"]);
+        w.source.outside_config(&t("x"));
+        established(&w).await;
+        w.source.load(&t("x"), rows(1..=4));
+        ask(&w, "p~1", &["x"]).await;
+        w.docs
+            .update_snapshot_job("p~1", |j| {
+                j.tables[0].status = JobTableStatus::Running;
+                j.settle(Utc::now());
+            })
+            .await
+            .unwrap();
+        w.docs
+            .save_table_snapshot(&TableSnapshotDoc {
+                table: t("x"),
+                status: SnapshotStatus::InProgress,
+                start_position: Some(w.source.wal_end()),
+                cursor: None,
+                row_count: None,
+                completed_at: None,
+            })
+            .await
+            .unwrap();
+        w.docs
+            .record_halt(&TableHalt {
+                table: t("x"),
+                reason: HaltReason::SnapshotTimeout { limit_secs: 60 },
+                at: w.source.wal_end(),
+            })
+            .await
+            .unwrap();
+        let (end, _) = run(&w, &never(2), async |status| streamed(&status, &w).await).await;
+        end.unwrap();
+        assert_eq!(w.source.reads(&t("x")), 0, "a halted copy isn't read again");
+        assert!(w.ids("x").is_empty());
+        let j = job(&w, "p~1").await;
+        assert_eq!(j.status, JobStatus::Failed);
+        let error = j.tables[0].error.clone().unwrap();
+        assert!(error.starts_with("SNAPSHOT_TIMEOUT: "), "{error}");
     }
 }

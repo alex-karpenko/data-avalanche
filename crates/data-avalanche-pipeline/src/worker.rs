@@ -387,14 +387,15 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
         .into_iter()
         .map(|t| (t.table().clone(), t))
         .collect();
-    let recorded: BTreeSet<TableRef> = core
+    let recorded_halts: BTreeMap<TableRef, HaltReason> = core
         .docs
         .halts()
         .await?
         .tables
         .into_iter()
-        .map(|h| h.table)
+        .map(|h| (h.table, h.reason))
         .collect();
+    let recorded: BTreeSet<TableRef> = recorded_halts.keys().cloned().collect();
     let stored = core.settings.checkpoint.load(&core.docs).await?;
     let jobs = Jobs::load(&core.docs).await?;
     let asked = jobs.asked();
@@ -659,15 +660,25 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
         .keys()
         .chain(resolved.halted.iter().map(|(t, _)| t))
         .collect();
-    let outside: Vec<TableRef> = asked
+    let mut failed: BTreeMap<TableRef, String> = BTreeMap::new();
+    let mut outside = BTreeSet::new();
+    for table in asked
         .iter()
         .chain(&running)
         .filter(|t| !configured.contains(t))
-        .cloned()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let mut failed: BTreeMap<TableRef, String> = BTreeMap::new();
+    {
+        match recorded_halts.get(table) {
+            // A running copy that halted in an earlier run isn't read again: its job fails it,
+            // with the halt.
+            Some(reason) if !asked.contains(table) => {
+                failed.insert(table.clone(), format!("{}: {reason}", reason.code()));
+            }
+            _ => {
+                outside.insert(table.clone());
+            }
+        }
+    }
+    let outside: Vec<TableRef> = outside.into_iter().collect();
     let mut copies = BTreeMap::new();
     let mut cleared = cleared;
     if !outside.is_empty() {
@@ -787,6 +798,20 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
     );
     core.may_write()?;
     jobs.record(&core.docs, &started, &failed).await?;
+    // A copy's halt goes once its job carries it: the pipeline doesn't replicate the table, and
+    // no job can clear the halt of a table gone. It is the halt of a table neither configured
+    // nor cached (a table taken out of the config keeps its schema) nor read now.
+    for table in recorded_halts.keys() {
+        if !configured.contains(table)
+            && !cached.contains_key(table)
+            && !requests.contains(table)
+            && !copies.contains_key(table)
+            && !cleared.contains(table)
+        {
+            core.may_write()?;
+            core.docs.clear_halt(table).await?;
+        }
+    }
     if let Some(doc) = fresh {
         if core.hooks.at(&HookPoint::SchemasCached) == HookAction::Crash {
             return Err(WorkerError::Crashed(HookPoint::SchemasCached));
