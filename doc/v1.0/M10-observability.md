@@ -134,7 +134,8 @@ monitoring on. Each is pinned by a test in the task after the arrow.
 
 ## Decisions and rulings
 
-**Asked and answered** (2026-10-28, all four "Recommended").
+**Asked and answered** (2026-10-28, all four "Recommended"). Oleksii approved the plan and its
+spec patches 2026-10-28.
 
 | # | Question | Answer |
 |---|---|---|
@@ -250,7 +251,7 @@ monitoring on. Each is pinned by a test in the task after the arrow.
   - `doc/v1.0/README.md`: the M10 row.
   - `CDC_Design_Gap_Analysis_v1.md`, §44 for M10's plan: DA-OBS-6 fixed by Task 7 (✅ when M10
     merges); DA-OBS-7 🆕 (the OTLP export takes no headers).
-- **Spec edits, for approval with the plan** (`spec:` commit):
+- **Spec edits, approved and applied 2026-10-28** (`spec:` commit):
   - `System-Overview.md` §Observability catalogue:
     - the cardinality line: "(snapshot progress, lag)" → "(snapshot progress and snapshot state)"
       (Q-M10-2);

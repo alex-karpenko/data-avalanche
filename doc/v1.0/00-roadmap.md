@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-27
+updated: 2026-10-28
 domain: Architecture
 tags: [v1, implementation-plan, roadmap, milestones, workspace, crates, interfaces, test-strategy, ci, risks]
 sources: []
@@ -472,7 +472,9 @@ impl SourceError { pub fn halt_code(&self) -> Option<&str>; }   // M7b: a Perman
 
 Also: `Preflight { server_version, warnings }`, `ResolvedTables { tables, halted, skipped, warnings }`,
 `RetainedLog { bytes, streamed }` (M6b: the `max_wal_lag_bytes` measure, and whether a stream reads
-the slot, the watchdog's evidence, DA-SRC-16), `KeysetCursor { key: Row, collation }`,
+the slot, the watchdog's evidence, DA-SRC-16; M10, D-M10.4: `bytes: Option<u64>`, `None` on MySQL,
+and `behind: Option<Duration>`, MySQL's binlog lag, the age of the last transaction the stream
+read, `0` at the server's head), `KeysetCursor { key: Row, collation }`,
 `Chunk { rows, next, visibility: Option<ChunkVisibility> }`,
 `RescanReport { dropped, changed, halted }` (the pipeline applies a `changed` schema only once the
 stream has passed `current_position` read after the rescan, Q-M6a-4), `identifier_values(&TableSchema,
@@ -886,6 +888,13 @@ pub enum Recovery { Retry, Lease, Error }
   (`Core::copies`): described by name, its sink table ensured, read in the session as a dump,
   never streamed, its schema cached nowhere. Phase 0 records each queued table as running or
   failed before the checkpoint.
+- **M10 adds** (D-M10.1, D-M10.3, D-M10.5…7, D-M10.11): `pipeline::observe::{Observer,
+  NoObserver}` and `WorkerDeps.observer: Arc<dyn Observer>`, which hears each flush, table commit,
+  failed commit attempt and chunk read. `WorkerStatus` gains `unsynced_since_micros` (the commit
+  time of the oldest change read but not durable), `rows_read: RowsRead`, `buffer_bytes`,
+  `soft_dropped` (per table) and `source_behind`; `SnapshotProgress.waiting`. The worker opens
+  the spans `pipeline.flush` (with a `sink.commit` per table), `snapshot.chunk` and
+  `schema.apply`; it depends on `tracing` only, never on the telemetry crate.
 
 ### 3.12 Telemetry and the binary (`data-avalanche-telemetry`, `data-avalanche`; M6b)
 
@@ -936,6 +945,22 @@ From M9b (D-M9b.1, D-M9b.4, D-M9b.11): the snapshot routes. `POST /v1/pipelines/
 unless the desired state is running and a node holds the lease, or while an unfinished job holds
 one of the tables. `GET /v1/pipelines/{id}/snapshots` and `GET /v1/snapshots/{job_id}` (viewer)
 read the jobs from the pipeline's state, on any node.
+
+From M10 (D-M10.1…16):
+- Telemetry: the rest of the catalogue. `RowOp`, `SnapshotState`, `RowsRead`,
+  `PipelineLabels.sink_type` (on the two commit series only); on `PipelineMetrics`:
+  `replication_lag`, `transaction_buffer_bytes`, `binlog_lag`, `snapshot_state`,
+  `soft_dropped_columns`, `flushed`, `committed`, `commit_failed`, `chunk_read`.
+- Traces: `Traces::{new(instance), set(endpoint, ratio) -> Result<bool, TracesError>, layer(),
+  flush(), shutdown()}`, `TracesError`, `trace_ids(span, dispatch)`. One tracer provider per
+  process; a reload swaps its OTLP/HTTP exporter (`<endpoint>/v1/traces`) and sets its ratio.
+- The controller implements the worker's `Observer` over the pipeline's metrics and computes the
+  lag at each status change and each renewal poll.
+- Logs: the format layer is filtered by the log level, the traces' layer by its own filter
+  (`data_avalanche` at INFO while an endpoint is set). JSON lines carry `trace_id`, `span_id` and
+  `fields.pipeline`. Text logs are in colour only on a terminal, without `NO_COLOR` (DA-OBS-6).
+  `Logger::trace` at start and at each generation; `Logger::finish` at exit.
+- `deploy/prometheus/alerts.yaml`: example alert rules, tested by promtool.
 
 ---
 
@@ -1298,6 +1323,14 @@ asked only of a running pipeline whose lease a node holds (Q-M9b-4).
 - **Exit:** a metric catalogue test asserts every mandatory series exists with the right labels; a
   tracing smoke test runs against an OTLP collector container.
 
+Planned in `M10-observability.md` (9 tasks, Q-M10-4). As planned: OTLP over HTTP with protobuf
+(Q-M10-1); `table` on the snapshot series only (Q-M10-2); the lag is the age of the oldest change
+read but not durable (Q-M10-3); MySQL's binlog lag through `RetainedLog::behind`, and no
+`wal_lag_bytes` on MySQL (D-M10.4); the traces' exporter swapped on reload, behind one provider
+(D-M10.9); the alert rules in `deploy/prometheus/` with promtool in CI (D-M10.15); a Jaeger
+container for the E2E smoke test (D-M10.16). `globals.log` and its CLI overrides landed in M6b and
+M8b; M10 adds colour only on a terminal (DA-OBS-6).
+
 ### M11 — Packaging and documentation
 
 - **Scope:**
@@ -1372,7 +1405,9 @@ Conventions:
 
 ### 5.2 Test infrastructure (`test-infra/compose.yaml`)
 
-Default profile (M0): `postgres-18`, `mysql-84`, `mariadb-118`, `rustfs`, `azurite`. GCS has no
+Default profile (M0): `postgres-18`, `mysql-84`, `mariadb-118`, `rustfs`, `azurite`; M10 adds
+`jaeger` (`jaegertracing/jaeger:2.21.0`, OTLP/HTTP on 54318, the query API on 56686), the E2E
+tracing scenario's collector. GCS has no
 emulator: `fake-gcs-server` 1.56.1 rejects `object_store`'s PUT (`400 invalid uploadType`) and ignores
 preconditions (re-checked 2026-09-26 with `object_store` 0.14.2: still `400 invalid uploadType`; upstream
 fake-gcs issue #994 still open), so GCS tests use a real bucket (P-10; `DATA_AVALANCHE_GCS_BUCKET` + `GOOGLE_SERVICE_ACCOUNT_PATH`,
@@ -1439,7 +1474,8 @@ other (PostgreSQL: 5, 6, the WAL guard and a lost slot; MySQL: 11).
   From M7a, a step runs the MySQL source's tests on `mysql-84-nogtid`, `mariadb-118` and
   `mariadb-118-binlog` (the workspace run covers `mysql-84`). From M7b (Q-M7b-2), an `e2e-mysql`
   job beside the integration job runs the E2E suite on `mysql-84`, `mysql-84-nogtid` and
-  `mariadb-118`, one matrix entry each.
+  `mariadb-118`, one matrix entry each. From M10, the check job runs the alert rules' promtool
+  test (`prom/prometheus:v3.15.0`), and every job that runs the E2E suite starts `jaeger`.
 - `weekly.yml` (weekly + manual; from M5, Q-M5-23): full DB matrix (M5: the PostgreSQL source suite on
   PostgreSQL 14–17, one job each, through `DATA_AVALANCHE_PG_PORT`; M7a: the MySQL source suite on
   MariaDB 11.4 and 10.11, through `DATA_AVALANCHE_MYSQL`; M7b: the E2E suite on
@@ -1571,6 +1607,7 @@ the naming below (2026-09-26).**
 | D-IMPL-18 | M8b config-generation rulings **D-M8b.1…12** (listed in `M8b-config-generations.md` §Decisions and rulings, each pinned by a test). Among them: `SourceConnector::reconfigure` takes the reloaded pipeline as `&dyn Any`; the worker's `Command::Reconfigure`; a controller's `Update` (restart under the same lease, `ERROR` cleared, the desired state kept; a removal's teardown only after a full drain under the lease); the reconciler's `Reload`, the caps resized without revoking a permit, a pipeline added back after its removal; the poll and the gossip nudge; a generation a node can't apply logged once and retried; the reload's check, CAS and retry, the same text published again when it resolves differently; the endpoints' answers; the log changed at run time; DA-OPS-8's warning; the coordinator stopped before the leave | The specs are silent on these | M8b — **approved 2026-10-22** |
 | D-IMPL-19 | M9a management-API rulings **D-M9a.1…10** (listed in `M9a-management-api.md` §Decisions and rulings, each pinned by a test). Among them: the API crate owns the listener, TLS behind axum's `Listener` with a bounded handshake per connection; routing through storage, a status trusted only under the live lease's epoch and holder; the same state answers 200 unchanged, only a pause of a stopped pipeline is 409; restart and flush are requests by id, baselined when the owner's term starts; a restart runs a pipeline in `ERROR` again (desired `RUNNING`, confirmed 2026-10-23); JWKS keys cached and fetched again for an unknown `kid` at most every 30 s, HS* refused, a 503 when the keys can't be fetched; validate never returns the resolved config; a leave stays up; one route table for the router, the role gate and the OpenAPI document | The specs leave these open, or (restart) say `RUNNING` without naming the desired state | M9a — **approved 2026-10-23** |
 | D-IMPL-20 | M9b snapshot-job rulings **D-M9b.1…11** (listed in `M9b-snapshot-jobs.md` §Decisions and rulings, each pinned by a test). Among them: the job id `<pipeline_id>~<UUID v7>`; a status per job table, the job settled from them; a job asked as a restart under its id, the unfinished jobs listed by the owner at its term's start and at a restart; `409` unless running and held, or while an unfinished job holds a table; a queued job table snapshotted from its first row whatever its mode, a halted one rebased, baselined and its halt cleared; a job upserts; a table outside the config described by name and copied, never streamed, cached nowhere; the owner follows each table from its snapshot document and the halts; `describe_tables`; MySQL's channel C takes a column hint as a catalog baseline (DA-SCHEMA-10) | The specs say what a job does, not how it reaches the worker, which pipelines take one, or what a table outside the config is | M9b — **approved 2026-10-27** |
+| D-IMPL-21 | M10 observability rulings **D-M10.1…16** (listed in `M10-observability.md` §Decisions and rulings, each pinned by a test). Among them: the worker's events through an `Observer`, its gauges through `WorkerStatus`; every failed commit attempt counted, a covered commit not; the lag's start in the status and its age computed by the controller, clamped at 0; MySQL's binlog lag the age of the last transaction read, `0` at the head; `snapshot_state` running or waiting; soft drops counted at the start and after each evolve; `sink_type` on the commit series only; one tracer provider with its exporter swapped on reload; a bad endpoint a run-time warning; the four spans and their fields; the traces' own filter; the JSON correlation through a weakly held dispatch; colour only on a terminal; the example alert rules; Jaeger as the E2E collector | The specs name the series, the spans and the correlation, not where each value comes from, how a reload reaches the exporter, or which collector proves it | M10 — **approved 2026-10-28** |
 
 ### 9.1 Questions answered at plan review (2026-09-26)
 
@@ -1664,6 +1701,10 @@ the naming below (2026-09-26).**
 | Q-M9b-2 (2026-10-27) | Does a job truncate the sink table first? | **Upsert only, documented**: deleted rows stay; drop or move the Delta table first (DA-SNAP-15) | M9b D-M9b.7 |
 | Q-M9b-3 (2026-10-27) | What is a table outside the config? | **A copy, not streamed**: described by name, read once like a dump, its schema cached nowhere | §3.6, §3.11; M9b Tasks 2, 4 |
 | Q-M9b-4 (2026-10-27) | Which pipelines take a job? | **`409` unless running**: desired state running and the lease held, `ERROR` accepted (the job's restart runs it again) | §3.12; M9b Task 6 |
+| Q-M10-1 (2026-10-28) | Which OTLP transport? | **OTLP/HTTP with protobuf only**, port 4318, `/v1/traces` appended to the endpoint; no gRPC | config §6.6; M10 Task 6 |
+| Q-M10-2 (2026-10-28) | Which series take `table` under `per_table`? | **Snapshot progress and snapshot state only**; the lag is the pipeline's | System-Overview; M10 Task 1 |
+| Q-M10-3 (2026-10-28) | What is `replication_lag_seconds`? | **The age of the oldest undelivered change**: now minus the commit time of the oldest transaction read but not durable; `0` when none; snapshot rows excluded | System-Overview; M10 Tasks 3, 5 |
+| Q-M10-4 (2026-10-28) | One milestone or two? | **One, about nine tasks** | §4 M10 |
 
 ### 9.2 Open questions (answer before the named milestone)
 
