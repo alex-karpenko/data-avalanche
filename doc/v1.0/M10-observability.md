@@ -6449,11 +6449,11 @@ git commit -m "test(e2e): the catalogue scraped live, and the traces read back f
 
 ## Exit
 
-- [ ] Every task's Step 4 passes, the whole E2E suite on PostgreSQL 18 and the observability
+- [x] Every task's Step 4 passes, the whole E2E suite on PostgreSQL 18 and the observability
   scenarios on `mysql-84`, `mysql-84-nogtid` and `mariadb-118`.
-- [ ] The catalogue test asserts every mandatory series with its labels (Task 1, roadmap M10's
+- [x] The catalogue test asserts every mandatory series with its labels (Task 1, roadmap M10's
   exit).
-- [ ] The tracing smoke test passes against the Jaeger container (Task 9, roadmap M10's exit).
+- [x] The tracing smoke test passes against the Jaeger container (Task 9, roadmap M10's exit).
 - [ ] The promtool test passes in CI's `check` job (Task 8).
 - [ ] The whole-branch review's findings fixed or recorded; the PR's CI green.
 - [ ] DA-OBS-6 ✅ in the gap tracker when M10 merges.
@@ -6547,3 +6547,21 @@ git commit -m "test(e2e): the catalogue scraped live, and the traces read back f
     password, no scheme, IPv6 and a plain URL. A Display test checks the password is absent.
   - The workspace has 1325 tests after Task 7; the MySQL E2E halt scenarios passed on
     `mysql-84` after the format filter changed.
+- **Task 9, the test stage's run.** Step 2 didn't fail: Jaeger was already up, and Task 7 had
+  wired the start's `logger.trace(…)`. The plan's two mutations stood in. Without
+  `logger.trace(…)` the tracing scenario timed out (`a traced flush and its commit`); without the
+  controller's `replication_lag` the catalogue scenario failed.
+- **Task 9, the scrape after the commit** (a test commit after the task's). The task's review
+  found that the catalogue scenario's single scrape raced the commit:
+  - `converged` sees the Delta table before the writer reports the commit, and before the
+    worker's status (the rows read) reaches the metrics. Only the source's lag series was
+    waited for.
+  - One wait now holds until a single scrape has the lag series, every series of `LIVE`, the
+    rows read (2, 1, 1, 1) and the rows written (5). The assertions then run on a scrape as
+    before.
+  - A missing series now fails as the wait's timeout (`the scrape has every series and the
+    counts`), not by its name.
+  - The check that the other source's lag is absent matches line starts.
+  - It passed on PostgreSQL 18 and on `mysql-84`; before it, the two scenarios passed on all four
+    sources and the whole suite on PostgreSQL 18, 46 of 46 (594 s). The workspace has 1326 tests
+    after Task 9.
