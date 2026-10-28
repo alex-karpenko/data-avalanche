@@ -1500,6 +1500,67 @@ mod tests {
         assert_eq!(st.soft_dropped.get(&t("a")), Some(&1), "{st:?}");
     }
 
+    /// A slice of a large transaction leaves the rest of it pending (D-M10.3): the slice is
+    /// durable, the transaction still open, and the lag still starts at its commit time.
+    #[tokio::test]
+    async fn a_slice_of_a_large_transaction_leaves_the_rest_pending() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let p = pipeline(
+            "",
+            "flush: { seconds: 0 }, max_transaction_batch_rows: 2",
+            "",
+        );
+        let (mut core, _control, status) = w.core(&p, &["a"]);
+        let mut s = Session::open(&mut core).await.unwrap().unwrap();
+        let mut txn = FakeTxn::new();
+        for id in 1..=4 {
+            txn = txn.insert(&t("a"), row(id, "x"));
+        }
+        w.source.commit(txn);
+        while s.handed == 0 {
+            let item = s.stream.next().await.unwrap();
+            assert!(s.item(item).await.unwrap().is_none());
+            s.due(Instant::now()).unwrap();
+        }
+        assert!(
+            s.acc.in_transaction(),
+            "the slice leaves the transaction open"
+        );
+        assert!(s.until_durable().await.unwrap().is_none());
+        assert_eq!((s.handed, s.durable), (1, 1));
+        assert!(s.acc.in_transaction());
+        assert_eq!(status.borrow().unsynced_since_micros, Some(FIRST_COMMIT));
+    }
+
+    /// With two jobs queued, the first one durable clears only its own lag: the lag starts at
+    /// the second job's oldest transaction (D-M10.3).
+    #[tokio::test]
+    async fn a_durable_job_leaves_the_next_job_s_lag() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let (mut core, _control, status) = w.core(&flush_each(), &["a"]);
+        let mut s = Session::open(&mut core).await.unwrap().unwrap();
+        w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+        let first = w.source.wal_end();
+        w.source.commit(FakeTxn::new().insert(&t("a"), row(2, "x")));
+        let second = w.source.wal_end();
+        pump(&mut s, &first).await;
+        s.flush().unwrap();
+        pump(&mut s, &second).await;
+        s.flush().unwrap();
+        assert_eq!((s.handed, s.durable), (2, 0));
+        // The writer's events wait in the channel: take the first job's `Durable` only.
+        let ev = s.events.recv().await;
+        assert!(s.writer_event(ev).await.unwrap().is_none());
+        assert_eq!(s.durable, 1);
+        assert_eq!(
+            status.borrow().unsynced_since_micros,
+            Some(FIRST_COMMIT + 1_000),
+            "the second transaction's commit time, a thousand microseconds on"
+        );
+    }
+
     #[tokio::test]
     async fn a_drain_flushes_what_the_policy_held_back() {
         let w = World::new(&["a"]);
