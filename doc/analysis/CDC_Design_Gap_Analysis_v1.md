@@ -266,6 +266,7 @@ scenarios) on PostgreSQL 18, at the review fixes' head.
 | ID | Change | Evidence |
 |---|---|---|
 | DA-SCHEMA-10 | 🔄 (stays): built in Task 2, ✅ when M9b merges | `tests/mysql/schema.rs` `a_baseline_takes_the_whole_table_from_the_catalog`; the E2E halt scenario on every MySQL target |
+| DA-SCHEMA-10 | 🔄 → ✅ 2026-10-28: M9b merged (PR #14, `90b114c`) | PR CI run 40664901310, green on `mysql-84`, `mysql-84-nogtid` and `mariadb-118` |
 
 ### 43.1 New gaps
 
@@ -292,7 +293,7 @@ scenarios) on PostgreSQL 18, at the review fixes' head.
 | Status | Count (v1 scope) | Notes |
 |---|---|---|
 | ✅ Resolved | the large majority | Design closed by a research/spec doc or a probe. |
-| 🔄 Partial | 4 | DA-SCHEMA-10 2026-10-27 (§42: fixed in M9b's plan, ✅ when it merges); DA-SNAP-7, DA-SRC-9 (neither blocks the plan); DA-OPS-8 2026-10-22 (§38: the startup warning; the operator docs in M11); DA-SNAP-10 ✅ 2026-10-16 (M7a merged, §33). DA-MS-3 is a decided caveat. DA-X-8 ✅ 2026-09-26; DA-SRC-16 and DA-X-12 ✅ 2026-10-13 (§30). |
+| 🔄 Partial | 3 | DA-SCHEMA-10 ✅ 2026-10-28 (M9b merged, §43); DA-SNAP-7, DA-SRC-9 (neither blocks the plan); DA-OPS-8 2026-10-22 (§38: the startup warning; the operator docs in M11); DA-SNAP-10 ✅ 2026-10-16 (M7a merged, §33). DA-MS-3 is a decided caveat. DA-X-8 ✅ 2026-09-26; DA-SRC-16 and DA-X-12 ✅ 2026-10-13 (§30). |
 | 🟥 Open (v1) | **34** | DA-SNAP-18…21 🆕 2026-10-28 (§43.1); DA-SNAP-15…17 🆕 2026-10-27 (§42.1); DA-API-13…18 🆕 2026-10-23 and DA-API-20 🆕 2026-10-24 (§41.1); DA-API-19 🆕 2026-10-23, ✅ 2026-10-24 (§41); DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2); DA-SRC-20 🆕 2026-10-13 (§30.1); DA-SRC-21 🆕 2026-10-14 (§31.2); DA-SRC-22, DA-SNAP-14 and DA-X-13 🆕 2026-10-14 (§32.1); DA-SRC-24…26 🆕 2026-10-16 (§33.1); DA-OBS-6 🆕 2026-10-17 (§34.1); DA-OPS-9 🆕 2026-10-22 (§38.1); DA-OPS-10 🆕 2026-10-23 (§39.1). DA-OPS-8 🔄 2026-10-22 (§38). DA-API-11 and DA-API-12 ✅ 2026-10-23 (§40). DA-CLUS-14, DA-OPS-7 and DA-SRC-28 ✅ 2026-10-22 (§37). DA-SRC-27 and DA-X-14 ✅ 2026-10-20 (§35). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
 | 🧪 Verify (v1) | **0** | DA-SRC-10/11 proven 2026-09-26 (§21). |
 | ⏭ v2 | 13 | Iceberg-sink items (§26.2). |
@@ -403,7 +404,7 @@ resume), idempotent replay, and rename resolution. The MySQL classifier is separ
 | DA-SCHEMA-7 | ENUM/SET representation (string vs ordinal) | 🟢 | ✅ | `ENUM→string`, `SET→list<string>`; append-only value adds Ignorable, reorder/remove Unsafe. | DT-R5 |
 | DA-SCHEMA-8 | iceberg-rust drop/rename/type-promotion support | 🟡 | ⏭ v2 | §7.1 implementation note — only `add_column` is mature; **verify** drop/rename/promotion against the pinned crate, route unsupported ops to halt. See §21. **2026-09-26 tidy:** Iceberg-sink only — deferred with the Iceberg sink to v2. | — |
 | DA-SCHEMA-9 | Idempotent DDL replay + checkpoint-after-evolve ordering | 🟡 | ✅ | §8.3 — re-read live Iceberg schema, skip if already applied; advance offset only after schema commit. | — |
-| DA-SCHEMA-10 | 🆕 MySQL's baseline halted a table whose columns changed | 🟡 | 🔄 | §42.1. MySQL's channel C refused the column hint Phase 0's baseline passes, so a fresh start (or a job clearing a halt) halted the table `UNSAFE_DDL` instead of baselining it (§8.2). Fixed in M9b Task 2 (a column hint is the whole table, no rename proven); ✅ when M9b merges. | — |
+| DA-SCHEMA-10 | 🆕 MySQL's baseline halted a table whose columns changed | 🟡 | ✅ | §42.1. MySQL's channel C refused the column hint Phase 0's baseline passes, so a fresh start (or a job clearing a halt) halted the table `UNSAFE_DDL` instead of baselining it (§8.2). Fixed in M9b Task 2 (a column hint is the whole table, no rename proven). **✅ 2026-10-28** — M9b merged (PR #14, `90b114c`), its CI green on every MySQL target (§43). | — |
 
 ---
 
