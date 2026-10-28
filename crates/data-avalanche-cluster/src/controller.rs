@@ -10,19 +10,21 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Debug;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use data_avalanche_config::Pipeline;
 use data_avalanche_core::{Sink, SourceConnector, SourceError};
 use data_avalanche_pipeline::{
-    Backoff, Command, CommitGuard, Exit, Hooks, NoObserver, Phase, PipelineWorker, Recovery,
-    Tuning, WorkerDeps, WorkerError, WorkerHandle, WorkerStatus,
+    Backoff, Command, CommitGuard, Exit, Hooks, Observer, Phase, PipelineWorker, Recovery, Tuning,
+    WorkerDeps, WorkerError, WorkerHandle, WorkerStatus,
 };
 use data_avalanche_state::{
     ActualState, DesiredState, Holder, Leases, PipelineDocs, RequestsDoc, StatusDoc,
 };
 use data_avalanche_storage::ObjectVersion;
-use data_avalanche_telemetry::{Metrics, PipelineLabels, PipelineMetrics, PipelineStatus, Totals};
+use data_avalanche_telemetry::{
+    Metrics, PipelineLabels, PipelineMetrics, PipelineStatus, RowsRead, SnapshotState, Totals,
+};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
@@ -307,6 +309,43 @@ fn labels(p: &Pipeline) -> PipelineLabels {
         source_db: p.source.db.clone(),
         sink_type: p.sink.kind.as_str().to_owned(),
     }
+}
+
+/// The worker's flushes, commits and chunk reads, into the pipeline's series.
+#[derive(Debug)]
+struct Observed(Arc<PipelineMetrics>);
+
+impl Observer for Observed {
+    fn flushed(&self, rows: u64, took: Duration) {
+        self.0.flushed(rows, took);
+    }
+
+    fn committed(&self, rows: u64, took: Duration) {
+        self.0.committed(rows, took);
+    }
+
+    fn commit_failed(&self) {
+        self.0.commit_failed();
+    }
+
+    fn chunk_read(&self, took: Duration) {
+        self.0.chunk_read(took);
+    }
+}
+
+/// `data_avalanche_replication_lag_seconds` at `now_micros`: the age of the oldest change the
+/// worker read and the sink doesn't hold yet, zero when none waits (or the clock is behind the
+/// source's).
+fn lag(unsynced_since_micros: Option<i64>, now_micros: i64) -> Duration {
+    let age = unsynced_since_micros.map_or(0, |since| now_micros.saturating_sub(since));
+    Duration::from_micros(u64::try_from(age).unwrap_or(0))
+}
+
+fn now_micros() -> i64 {
+    let since = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    i64::try_from(since.as_micros()).unwrap_or(i64::MAX)
 }
 
 /// A running worker.
@@ -997,7 +1036,7 @@ impl PipelineController {
             owner_epoch: run.owner_epoch,
             guard: run.guard.clone(),
             hooks: parts.hooks,
-            observer: Arc::new(NoObserver),
+            observer: Arc::new(Observed(Arc::clone(&self.metrics))),
             reader_ended: Arc::clone(reader_ended),
         };
         let (worker, handle) =
@@ -1173,6 +1212,10 @@ impl PipelineController {
         }
         let m = &self.metrics;
         m.wal_lag_bytes(st.retained_bytes);
+        m.binlog_lag(st.source_behind);
+        m.replication_lag(lag(st.unsynced_since_micros, now_micros()));
+        m.transaction_buffer_bytes(st.buffer_bytes);
+        m.soft_dropped_columns(st.soft_dropped.values().sum());
         m.halted_tables(st.halted.len());
         m.reconcile_log(st.reconcile_log.entries, st.reconcile_log.keys);
         let rows: Vec<(String, u64)> = st
@@ -1181,12 +1224,31 @@ impl PipelineController {
             .map(|(t, p)| (t.to_string(), p.rows_done))
             .collect();
         m.snapshot_rows_done(&rows);
+        let states: Vec<(String, SnapshotState)> = st
+            .snapshots
+            .iter()
+            .map(|(t, p)| {
+                let state = if p.waiting {
+                    SnapshotState::Waiting
+                } else {
+                    SnapshotState::Running
+                };
+                (t.to_string(), state)
+            })
+            .collect();
+        m.snapshot_state(&states);
         let sink = w.sink.stats();
+        let read = st.rows_read;
         m.totals(Totals {
             source_reconnects: st.reconnects,
             sink_merge_files_rewritten: sink.files_rewritten,
             sink_merge_rows_copied: sink.rows_copied,
-            ..Totals::default()
+            rows_read: RowsRead {
+                insert: read.insert,
+                update: read.update,
+                delete: read.delete,
+                snapshot: read.snapshot,
+            },
         });
         self.status.send_modify(|s| s.worker = Some(st));
     }
@@ -1285,6 +1347,62 @@ mod tests {
     }
 
     const P: &str = r#"pipeline="p",source_host="127.0.0.1",source_db="avalanche""#;
+
+    #[test]
+    fn the_lag_is_the_oldest_unsynced_change_s_age() {
+        assert_eq!(lag(None, 5_000_000), Duration::ZERO);
+        assert_eq!(lag(Some(2_000_000), 5_000_000), Duration::from_secs(3));
+        assert_eq!(
+            lag(Some(6_000_000), 5_000_000),
+            Duration::ZERO,
+            "a clock behind the source's"
+        );
+    }
+
+    /// The worker's reads, flushes, commits and lag reach the pipeline's series.
+    #[tokio::test(start_paused = true)]
+    async fn the_worker_s_reads_flushes_and_lag_reach_the_metrics() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a"]);
+        f.source.load(&t("a"), vec![row(1)]);
+        let mut n = node("n1", &store, &docs, &f);
+        until(&mut n.status, "running", is(Actual::Running)).await;
+        f.source.commit(FakeTxn::new().insert(&t("a"), row(2)));
+        eventually("rows land", || f.ids("a") == [1, 2]).await;
+        let rows = format!("data_avalanche_rows_written_total{{{P}}} 2");
+        eventually("the commits are counted", || {
+            line(&n.metrics.encode(), &rows)
+        })
+        .await;
+        let text = n.metrics.encode();
+        let sink = r#"sink_type="delta""#;
+        for metric in [
+            format!(r#"data_avalanche_rows_read_total{{{P},op="insert"}} 1"#),
+            format!(r#"data_avalanche_rows_read_total{{{P},op="snapshot"}} 1"#),
+            format!("data_avalanche_replication_lag_seconds{{{P}}} 0.0"),
+            format!("data_avalanche_transaction_buffer_bytes{{{P}}} 0"),
+            format!("data_avalanche_sink_soft_dropped_columns{{{P}}} 0"),
+            format!(r#"data_avalanche_snapshot_state{{{P},state="running"}} 0"#),
+        ] {
+            assert!(line(&text, &metric), "{metric}\n{text}");
+        }
+        for family in [
+            format!("data_avalanche_flush_rows_count{{{P}}} "),
+            format!("data_avalanche_flush_duration_seconds_count{{{P}}} "),
+            format!("data_avalanche_sink_commit_duration_seconds_count{{{P},{sink}}} "),
+            format!("data_avalanche_snapshot_chunk_duration_seconds_count{{{P}}} "),
+        ] {
+            assert!(
+                text.lines().any(|l| l.starts_with(&family)),
+                "{family}\n{text}"
+            );
+        }
+        assert!(
+            !text.contains("data_avalanche_binlog_lag_seconds{"),
+            "a PostgreSQL source has no binlog: {text}"
+        );
+    }
 
     #[test]
     fn a_start_jitter_stays_below_its_bound() {
