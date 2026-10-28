@@ -13,8 +13,9 @@ pub trait Observer: Send + Sync + Debug {
         let _ = (rows, took);
     }
 
-    /// A table's change set was committed: the rows it wrote, and how long the attempt that
-    /// landed took. A set the sink skipped as already covered wrote nothing and isn't reported.
+    /// A table's change set was committed: the rows it wrote, and how long its commit took,
+    /// retries and their backoff included. A set the sink skipped as already covered wrote
+    /// nothing and isn't reported.
     fn committed(&self, rows: u64, took: Duration) {
         let _ = (rows, took);
     }

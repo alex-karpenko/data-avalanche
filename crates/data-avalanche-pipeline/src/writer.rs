@@ -201,12 +201,12 @@ impl Writer {
         };
         let rows = rows_of(&cs);
         let observer = Arc::clone(&self.ctx.observer);
+        let at = Instant::now();
         let mut attempt = 0;
         loop {
             if !self.ctx.guard.may_commit() {
                 return Err(WorkerError::LeaseLost);
             }
-            let at = Instant::now();
             let outcome = self.ctx.sink.commit(cs.clone(), marker.clone()).await;
             if outcome.is_err() {
                 observer.commit_failed();
@@ -604,6 +604,27 @@ mod tests {
                 Heard::Flushed { rows: 3 },
                 Heard::Flushed { rows: 3 },
             ]
+        );
+    }
+
+    /// A commit's time covers its retries and their backoff (D-M10.2): three transient failures
+    /// wait at least 0.5 + 1 + 2 ms before the attempt that lands.
+    #[tokio::test]
+    async fn a_commit_is_timed_with_its_retries() {
+        let r = rig(&["a"]).await;
+        r.sink
+            .fail(SinkOp::Commit, None, 3, || SinkError::Transient {
+                reason: "throttled".into(),
+            });
+        let mut acc = accumulator(&["a"], 100);
+        txn(&mut acc, 1, 200, &[("a", 1, "x")]);
+        r.run(vec![job(acc.flush())], Arc::new(NoHooks)).await;
+        let times = r.ears.commit_times();
+        assert_eq!(times.len(), 1);
+        assert!(
+            times[0] >= Duration::from_micros(3500),
+            "{:?} leaves out the backoff",
+            times[0]
         );
     }
 

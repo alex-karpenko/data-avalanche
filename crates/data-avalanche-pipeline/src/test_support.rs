@@ -39,11 +39,16 @@ pub(crate) enum Heard {
 
 /// An observer that keeps what it hears, in order.
 #[derive(Debug, Default)]
-pub(crate) struct Ears(Mutex<Vec<Heard>>);
+pub(crate) struct Ears(Mutex<Vec<Heard>>, Mutex<Vec<Duration>>);
 
 impl Ears {
     pub fn heard(&self) -> Vec<Heard> {
         self.0.lock().unwrap().clone()
+    }
+
+    /// The time each `committed` reported, in order.
+    pub fn commit_times(&self) -> Vec<Duration> {
+        self.1.lock().unwrap().clone()
     }
 }
 
@@ -52,7 +57,8 @@ impl Observer for Ears {
         self.0.lock().unwrap().push(Heard::Flushed { rows });
     }
 
-    fn committed(&self, rows: u64, _: Duration) {
+    fn committed(&self, rows: u64, took: Duration) {
+        self.1.lock().unwrap().push(took);
         self.0.lock().unwrap().push(Heard::Committed { rows });
     }
 
