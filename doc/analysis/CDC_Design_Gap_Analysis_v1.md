@@ -385,9 +385,8 @@ doc obligations below closed in the tracker. The rulings D-M11b.1…11 are in th
 D-IMPL-23). The planning ran the getting-started walk-through on test-infra's PostgreSQL 18 and
 RustFS, and the pages say what it showed: a managed publication needs the tables' owner, a DBA's
 slot is an orphan at the first start (`slot_on_orphan: adopt_resnapshot`), and a reload doesn't
-restart a pipeline in `error`. Raised, not changed: the config spec's §14 example sets the OTLP
-endpoint to `:4317` (gRPC) while §6.6 and Q-M10-1 say OTLP/HTTP on `:4318` (a spec patch for
-Oleksii's word).
+restart a pipeline in `error`. No spec edit: a suspected `:4317` in the config spec's §14 example
+was a stale reading (it has said OTLP/HTTP's `:4318` since M10, `c418c8a`).
 
 ### 49.1 New gaps
 
