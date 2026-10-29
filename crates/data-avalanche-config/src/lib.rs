@@ -72,6 +72,8 @@ mod diag;
 mod diff;
 mod enums;
 mod external;
+mod field_docs;
+mod keys;
 mod leaf;
 mod load;
 mod material;
@@ -96,6 +98,8 @@ pub use external::{
     ClusterAnchor, check_cluster_anchor, check_partitioning, check_table_set,
     check_unbounded_numeric, glob_match, key_table,
 };
+pub use field_docs::{DocDefault, FIELD_DOCS, FieldDoc};
+pub use keys::{Key, KeyShape, config_keys, key_mutability};
 pub use leaf::Loc;
 pub use load::{Loaded, load_file, load_posted_str, load_str, validate_str};
 pub use material::{FileRef, Origin, Pem};
