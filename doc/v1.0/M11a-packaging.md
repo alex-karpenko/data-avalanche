@@ -135,7 +135,7 @@ by a test in the task after the arrow.
 ## Decisions and rulings
 
 **Asked and answered** (2026-10-29, Q-M11-A…3 each the "Recommended" answer; Q-M11-4 Oleksii's
-choice while planning).
+choice while planning). Oleksii approved the plan 2026-10-29; it needs no spec edit.
 
 | # | Question | Answer |
 |---|---|---|
