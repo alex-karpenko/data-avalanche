@@ -91,8 +91,11 @@ build at all; `xtask` would do the same for every generated page.
   contents, the best tabs and admonitions); Zensical's default theme is the more modern of the two.
 
 Each layout collapses to a single column at phone width. In the 390 px captures the wide
-flowchart and the wide table run past the edge in every tool, so the content needs a
-top-to-bottom flowchart and a narrower table, whichever tool is chosen.
+flowchart and the wide table seemed to run past the edge in every tool, but that was the capture:
+headless Chrome lays a page out at least 500 px wide whatever its window (measured during M11b's
+planning: `innerWidth` 500 at `--window-size=390`), so a 390 px screenshot clips it. At a true
+500 px the Starlight site of M11b keeps its width once each wide table scrolls in its own box (a
+few lines of CSS), and its flowcharts run top to bottom.
 
 ## 5. Findings by tool
 
