@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-28
+updated: 2026-10-29
 domain: Architecture
 tags: [v1, implementation-plan, m10, observability, metrics, prometheus, tracing, otlp, opentelemetry, logs, alerts, jaeger, e2e]
 resolves: [DA-OBS-6]
@@ -156,7 +156,7 @@ spec patches 2026-10-28.
 | D-M10.6 | **`snapshot_state{state}`**: `running` while a table's snapshot reads; `waiting` while it can't: the source holds it, or a table's writers from a previous term are still in flight at the start (Data-Flow Phase 0). Without `per_table`, a count per state; with it, one series per table, one-hot | The two states a table in a snapshot can be in; `completed` is no series (the table left the snapshot) | Task 1 (`snapshot_states_are_counted_unless_per_table`), Task 3 (the waiting assertion in `a_table_waits_for_the_writers_in_flight_at_the_start`) |
 | D-M10.7 | **`sink_soft_dropped_columns`**: the sink columns the source no longer has, the lineage columns and the internal ones (`INTERNAL_COLUMN_PREFIX`) left out. Counted per table at the start (from the sink's table state; re-read after a baseline evolved it) and after each evolve in the stream; the pipeline's series is the sum | A soft drop keeps the column (Schema_Change §7.2, Delta has no drop): the gauge tells the operator what a manual cleanup would remove | Task 3 (`a_dropped_column_is_counted_soft_dropped`, `the_start_counts_the_sink_columns_the_source_lacks`) |
 | D-M10.8 | **`sink_type`** is a label of the two commit series only, as the catalogue writes them; the pipeline's three labels stay on every other series | The catalogue's `{sink_type}`; a label on every series would change every existing dashboard's selectors for one value per pipeline | Task 1 (`every_mandatory_series_is_exported_with_its_labels`) |
-| D-M10.9 | **One tracer provider, its exporter swapped.** `Traces::new(node)` builds the provider once: the resource (`service.name` `data-avalanche`, `service.instance.id` the node, `service.version`), a batch processor over a `Switch` exporter, and a sampler `ParentBased(ratio)` whose ratio is an atomic. `Traces::set(endpoint, ratio)` swaps the exporter (an OTLP/HTTP exporter to `<endpoint>/v1/traces`, or none) and sets the ratio; an endpoint that can't be exported to (not a URL) is `TracesError::Endpoint` and the exporter in force stays. The old exporter is dropped on a thread of its own (the blocking client panics when dropped inside the runtime). `shutdown()` exports what is queued, waiting at most 5 s | `get_otel_context`, which the log correlation needs, finds the OTel layer by downcasting through the subscriber, and `reload::Layer` doesn't forward that downcast: the layer must stay, so what a reload changes is behind it | Task 6 (the five telemetry tests) |
+| D-M10.9 | **One tracer provider, its exporter swapped.** `Traces::new(node)` builds the provider once: the resource (`service.name` `data-avalanche`, `service.instance.id` the node, `service.version`), a batch processor over a `Switch` exporter, and a sampler `ParentBased(ratio)` whose ratio is an atomic. `Traces::set(endpoint, ratio)` swaps the exporter (an OTLP/HTTP exporter to `<endpoint>/v1/traces`, or none) and sets the ratio; an endpoint that can't be exported to (not a URL) is `TracesError::Endpoint` and the exporter in force stays. The old exporter is dropped on a thread of its own: dropping the blocking client blocks, joining the client's runtime thread (reqwest 0.13.5 `blocking/client.rs` `InnerClientHandle::drop`), which must not hold up a tokio worker. `shutdown()` exports what is queued, waiting at most 5 s | `get_otel_context`, which the log correlation needs, finds the OTel layer by downcasting through the subscriber, and `reload::Layer` doesn't forward that downcast: the layer must stay, so what a reload changes is behind it | Task 6 (the five telemetry tests) |
 | D-M10.10 | **A bad endpoint is a warning at run time, not a V-rule.** `globals.tracing.otlp_endpoint` keeps its type check (a URL, V-097/V-098 as they are); an endpoint the exporter refuses at start or at a reload logs `the traces stay as they were: …`, and the pipelines run on | Config §6.6: tracing is optional and off by default; a collector's address must never stop replication | Task 6 (`an_endpoint_that_isn_t_a_url_is_refused_and_the_one_in_force_stays`) |
 | D-M10.11 | **The spans** (target `data_avalanche_pipeline::…`, level INFO): `pipeline.flush`, a root per job, with `pipeline`, `change_sets`, `rows`, `checkpoint`; `sink.commit`, its child per table, with `table`, `rows`, `attempts`, `outcome` (`committed`, `covered`, `fenced`, `refused`, `failed`, `lease lost`); `snapshot.chunk`, a root, with `pipeline`, `table`, `rows`; `schema.apply`, a root, with `pipeline`, `table`, `changes`, `outcome` (`applied`, `degraded`, `halted`, `failed`). The worker has no span of its own, so each flush is a trace of its own | Config §6.6 ("flush → sink commit, snapshot chunk, DDL apply"); a worker's span would make a trace that lasts the worker's life | Task 6 (`a_flush_is_a_span_with_a_span_per_commit`, the span assertions of `each_chunk_read_is_reported` and `an_added_column_is_evolved_where_the_stream_meets_it`), Task 9 |
 | D-M10.12 | **The traces' filter is their own.** The logger's layers are the format layer, filtered by the log level, and the traces' layer, filtered by a `Targets` of its own: `data_avalanche` at INFO while an endpoint is set, nothing otherwise. A log level of `warn` doesn't stop the spans; the Delta libraries' spans never reach the collector | A log level is about log volume; a trace of a pipeline must not depend on it, and the libraries' spans (per file, per scan) would swamp a trace | Task 7 (`the_pipeline_s_spans_are_exported_once_an_endpoint_is_set`) |
@@ -205,8 +205,10 @@ spec patches 2026-10-28.
   - `get_otel_context` returns `None` through a `reload::Layer` (it doesn't forward
     `downcast_raw`); `Vec<Box<dyn Layer>>`, `Box` and `Filtered` do forward it.
   - `opentelemetry-otlp`'s `with_endpoint` takes the URL as given: `/v1/traces` is ours to append.
-  - The blocking HTTP client builds its runtime on a thread of its own, and panics when dropped
-    inside a tokio runtime: the replaced exporter is dropped on a spawned thread.
+  - The blocking HTTP client builds its runtime on a thread of its own, and dropping it blocks,
+    joining that thread (reqwest 0.13.5 `blocking/client.rs` `InnerClientHandle::drop`; it
+    doesn't panic, as an earlier version of this line said): the replaced exporter is dropped on
+    a spawned thread, off the runtime's workers.
   - Jaeger 2.21.0: `/api/services` and `/api/traces` answer 404; `/api/v3/services`,
     `/api/v3/traces` answer, with OTLP JSON (`result.resourceSpans`).
   - The live scrape of a pipeline on PostgreSQL 18 and on `mysql-84` (Task 9): every series of
@@ -6565,3 +6567,30 @@ git commit -m "test(e2e): the catalogue scraped live, and the traces read back f
   - It passed on PostgreSQL 18 and on `mysql-84`; before it, the two scenarios passed on all four
     sources and the whole suite on PostgreSQL 18, 46 of 46 (594 s). The workspace has 1326 tests
     after Task 9.
+- **The whole-branch review's fixes** (2026-10-29, one commit per area after the review).
+  - **I1, a failed export is warned of** (`fix(telemetry)`). The SDK reports a failed export
+    only through `otel_error!`, which is a no-op without `opentelemetry`'s `internal-logs`
+    feature (off). So nothing logged an unreachable or refusing collector, against config §6.6's
+    run-time warning. `Switch::export` now warns itself, with the endpoint through `shown()`
+    and the error through `shown_in()`: at the first failure after a success, then at most every
+    `FAILING_WARNED_EVERY` (5 min), and once at INFO when an export works again. The state lives
+    beside each exporter, so a new endpoint starts afresh. Pinned against the testkit's collector
+    answering 500, at a `user:secret@` endpoint, by driving `Switch::export` on the test's thread.
+    It failed before the fix (no warning), as did a mutation that warns at every failure.
+  - **I2, the lag across a worker restart** (`fix(cluster)`). The gauge froze while no worker
+    ran, and the next worker's first status zeroed it, though what the ended worker read and
+    didn't make durable still counts. The controller keeps the lag's start (`Pending`) for the
+    lease term. A poll with no worker sets the gauge from it. A worker that has shown a change
+    pending is the lag from then on. Before that, the start stays until the worker's frontier is
+    at or past the ended worker's with nothing pending, or until it reads a change again. The
+    session puts the frontier and the lag's start into the status in one change. Two controller
+    tests (a transient `Contended` end and its backoff; a crash after the checkpoint, then a
+    restart and a keep-alive) and a unit test of `carry` pin it; three mutations each fail them.
+    This closes Task 5's "no nonzero-lag growth test".
+  - **M1**: `Traces`'s `Debug` shows the endpoint as `shown()` does. **M2**:
+    `flush_duration_seconds`'s help says the time runs from when the writer took the flush up.
+    **M5**: the Jaeger scenario reads the flush root from the spans its wait saw. **M6**: the
+    reason for dropping the old exporter on a thread is corrected, in the code, in D-M10.9 and
+    above (Task 6's code block keeps its original comment, and Task 1's the original help text).
+  - **M3**: the research doc says when the binlog lag's series is absent. M4 and M7 are parked.
+  - The workspace has 1332 tests after the fixes.
