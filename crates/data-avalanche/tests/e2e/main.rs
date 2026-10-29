@@ -14,6 +14,7 @@ mod guards;
 mod harness;
 mod idp;
 mod jobs;
+mod k3s;
 mod lifecycle;
 mod mysql;
 mod observability;

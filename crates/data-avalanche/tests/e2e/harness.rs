@@ -903,6 +903,21 @@ pub struct Proc {
     token: Option<String>,
 }
 
+/// `GET path` on the API at `127.0.0.1:port`, plain HTTP: the status code and the JSON body,
+/// `None` when nothing answers or the body isn't JSON.
+pub async fn get_json(port: u16, path: &str) -> Option<(u16, serde_json::Value)> {
+    let request = format!("GET {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .ok()?;
+    let out = exchange(tcp, request.as_bytes()).await?;
+    let (head, body) = out.split_once("\r\n\r\n")?;
+    Some((
+        head.get(9..12)?.parse().ok()?,
+        serde_json::from_str(body).ok()?,
+    ))
+}
+
 /// One HTTP/1.1 exchange on `s`: the answer's text.
 async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(mut s: S, request: &[u8]) -> Option<String> {
     s.write_all(request).await.ok()?;

@@ -88,6 +88,31 @@ services:
     image: "jaegertracing/jaeger:2.21.0"
     ports: ["54318:4318", "56686:16686"]
 
+  # The smoke deploy's Kubernetes (M11a): one k3s server, privileged as k3s in a container needs.
+  # Its API on host port 56443, its kubeconfig written to test-infra/.k3s/; the chart's API
+  # NodePort 30080 on host port 58080. Profile k3s: test-infra/k3s.sh starts it.
+  k3s:
+    image: "rancher/k3s:v1.37.1-k3s1"
+    profiles: [k3s]
+    privileged: true
+    # One node name across recreations: the cluster's state outlives the container.
+    hostname: k3s
+    # A test cluster schedules while the host's disk is nearly full (a laptop's Docker VM, a CI
+    # runner): the kubelet evicts only under 1% free.
+    command:
+      - server
+      - --https-listen-port=56443
+      - --disable=traefik,metrics-server,servicelb
+      - --tls-san=127.0.0.1
+      - --node-name=k3s
+      - --kubelet-arg=eviction-hard=nodefs.available<1%,imagefs.available<1%
+      - --kubelet-arg=image-gc-high-threshold=99
+      - --kubelet-arg=image-gc-low-threshold=98
+    environment: { K3S_KUBECONFIG_OUTPUT: /output/kubeconfig.yaml, K3S_KUBECONFIG_MODE: "644" }
+    tmpfs: [/run, /var/run]
+    volumes: ["./.k3s:/output"]
+    ports: ["56443:56443", "58080:30080"]
+
   rustfs-init:
     image: "amazon/aws-cli:2.37.4"
     profiles: [init]

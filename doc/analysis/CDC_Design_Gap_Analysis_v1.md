@@ -316,6 +316,7 @@ and the E2E suite (46 scenarios) on PostgreSQL 18.
 | ID | Change | Evidence |
 |---|---|---|
 | DA-OBS-6 | 🟥 (stays): fixed by Task 7 (0859843); ✅ when M10 merges | as §44 |
+| DA-OBS-6 | 🟥 → ✅ 2026-10-29: M10 merged (PR #15, `550474c`) | PR CI run 40799494685, green on every target |
 
 ### 45.1 New gaps
 
@@ -323,6 +324,43 @@ and the E2E suite (46 scenarios) on PostgreSQL 18.
 |---|---|---|---|---|
 | DA-OBS-8 | `replication_lag_seconds` reads `0` early in two windows until the change is read again: a restarted worker that makes its first re-read change durable before re-reading the next, and a source reconnect inside one worker (its new session starts with nothing pending) | 🟢 | M10's whole-branch re-review | Keep the controller's kept start until the worker's frontier covers it; carry the session's pending start across a reconnect |
 | DA-OBS-9 | The JSON log's `trace_id`/`span_id` are tested under a scoped dispatch only; the binary's global dispatch (`set_global_default`, the weak dispatch) has no end-to-end test | 🟢 | M10's whole-branch review | In the Jaeger E2E, log in JSON and match a line's `trace_id` to a trace the collector returned |
+
+## 46. M11a packaging — the plan (2026-10-29)
+
+`doc/v1.0/M11a-packaging.md`, approved 2026-10-29 with no spec edit; M11 split in two (Q-M11-A),
+M11b (the documentation site) to follow. Four tasks: the image on distroless `cc` (Debian 13, as
+65532, amd64 and arm64; Q-M11-3), the Helm chart (a StatefulSet named for the ring, DNS discovery,
+the config a map or text), the smoke deploy on test-infra's `k3s` service (Q-M11-4), and the
+release to GHCR on a `v*` tag (Q-M11-1). The rulings D-M11a.1…9 are in the plan (roadmap
+D-IMPL-22).
+
+### 46.1 New gaps
+
+| ID | Gap | Severity | Surfaced by | Next |
+|---|---|---|---|---|
+| DA-OPS-11 | The release workflow's first full run is the first tag's (M12's `v1.0.0`): it can't run before it is on `main`, and until then only its builds are proven (the amd64 image per PR, the arm64 one weekly). Its first push creates the GHCR packages private | 🟢 | M11a planning | A manual run on `main` after M11a merges (builds both images, packages the chart, pushes nothing); after the first tag, make the image and chart packages public in the repository's package settings |
+
+## 47. M11a packaging — the whole-branch review (2026-10-29)
+
+M11a was executed 2026-10-29: four tasks, one fix round (Task 4: the SBOM step's GHCR login), and a
+whole-branch review whose three Important findings were fixed before the PR (the plan's
+"Deviations during execution"): the chart is pushed after the image's tags are joined, the
+attestation runs only on a public repository, and the `k3s` job's timeout is 120 minutes (the
+`type=gha` cache keeps the image's layers, not the Dockerfile's cache mounts). No spec edit.
+
+- **DA-OPS-11** (🟥, extended): the repository is private. GitHub offers artifact attestations to
+  a private repository only on Enterprise Cloud, so `release.yml` skips the attestation there; the
+  image keeps BuildKit's in-registry provenance (`mode=max`) and the SBOM. Whether the
+  `ubuntu-24.04-arm` runner serves a private repository is unproven until `weekly.yml`'s
+  `image-arm64` is dispatched. Oleksii's ruling (2026-10-29): the repository goes public, which
+  turns on the attestation and the free arm64 runner and lets a `helm install` pull the packages
+  without `imagePullSecrets`, after a root README warns that it isn't ready for production.
+
+### 47.1 New gaps
+
+| ID | Gap | Severity | Surfaced by | Next |
+|---|---|---|---|---|
+| DA-CLUS-15 | DNS discovery asks its seeds again only while a node has no peer (`discovery.rs`, M8a). With four or more pods started together (the chart's `podManagementPolicy: Parallel`), nodes that each resolved some, not all, of the others can settle in groups that never merge: each has a peer, so none asks again. Each group's ring places every pipeline: the storage lease keeps one holder per pipeline, but the groups contend for the leases and a group's failover can't see the other's nodes | 🟢 | M11a's whole-branch review (declined to judge: M8 code) | Ask the seeds again on a timer while the DNS name returns an address that isn't a member, or join every resolved address each round; the k3s scenario with four pods |
 
 ---
 
@@ -335,13 +373,13 @@ and the E2E suite (46 scenarios) on PostgreSQL 18.
 > M7a's plan (§32), 2026-10-16 for M7a's exit (§33), 2026-10-17 for M7b's plan (§34),
 > 2026-10-20 for M7b's exit (§35), 2026-10-21 for M8a's plan (§36), 2026-10-22 for M8a's exit (§37),
 > 2026-10-22 for M8b's plan (§38), 2026-10-23 for M8b's exit (§39), 2026-10-23 for M9a's plan
-> (§40), 2026-10-23 for M9a's exit (§41), 2026-10-27 for M9b's plan (§42), 2026-10-28 for M9b's exit (§43), 2026-10-28 for M10's plan (§44), and 2026-10-29 for M10's exit (§45).
+> (§40), 2026-10-23 for M9a's exit (§41), 2026-10-27 for M9b's plan (§42), 2026-10-28 for M9b's exit (§43), 2026-10-28 for M10's plan (§44), and 2026-10-29 for M10's exit (§45), and 2026-10-29 for M11a's plan (§46), and 2026-10-29 for M11a's whole-branch review (§47).
 
 | Status | Count (v1 scope) | Notes |
 |---|---|---|
 | ✅ Resolved | the large majority | Design closed by a research/spec doc or a probe. |
 | 🔄 Partial | 3 | DA-SCHEMA-10 ✅ 2026-10-28 (M9b merged, §43); DA-SNAP-7, DA-SRC-9 (neither blocks the plan); DA-OPS-8 2026-10-22 (§38: the startup warning; the operator docs in M11); DA-SNAP-10 ✅ 2026-10-16 (M7a merged, §33). DA-MS-3 is a decided caveat. DA-X-8 ✅ 2026-09-26; DA-SRC-16 and DA-X-12 ✅ 2026-10-13 (§30). |
-| 🟥 Open (v1) | **37** | DA-OBS-8 and DA-OBS-9 🆕 2026-10-29 (§45.1); DA-OBS-7 🆕 2026-10-28 (§44.1); DA-SNAP-18…21 🆕 2026-10-28 (§43.1); DA-SNAP-15…17 🆕 2026-10-27 (§42.1); DA-API-13…18 🆕 2026-10-23 and DA-API-20 🆕 2026-10-24 (§41.1); DA-API-19 🆕 2026-10-23, ✅ 2026-10-24 (§41); DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2); DA-SRC-20 🆕 2026-10-13 (§30.1); DA-SRC-21 🆕 2026-10-14 (§31.2); DA-SRC-22, DA-SNAP-14 and DA-X-13 🆕 2026-10-14 (§32.1); DA-SRC-24…26 🆕 2026-10-16 (§33.1); DA-OBS-6 🆕 2026-10-17 (§34.1; fixed by M10 Task 7, §44); DA-OPS-9 🆕 2026-10-22 (§38.1); DA-OPS-10 🆕 2026-10-23 (§39.1). DA-OPS-8 🔄 2026-10-22 (§38). DA-API-11 and DA-API-12 ✅ 2026-10-23 (§40). DA-CLUS-14, DA-OPS-7 and DA-SRC-28 ✅ 2026-10-22 (§37). DA-SRC-27 and DA-X-14 ✅ 2026-10-20 (§35). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
+| 🟥 Open (v1) | **38** | DA-CLUS-15 🆕 2026-10-29 (§47.1); DA-OPS-11 🆕 2026-10-29 (§46.1), extended (§47); DA-OBS-8 and DA-OBS-9 🆕 2026-10-29 (§45.1); DA-OBS-7 🆕 2026-10-28 (§44.1); DA-SNAP-18…21 🆕 2026-10-28 (§43.1); DA-SNAP-15…17 🆕 2026-10-27 (§42.1); DA-API-13…18 🆕 2026-10-23 and DA-API-20 🆕 2026-10-24 (§41.1); DA-API-19 🆕 2026-10-23, ✅ 2026-10-24 (§41); DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2); DA-SRC-20 🆕 2026-10-13 (§30.1); DA-SRC-21 🆕 2026-10-14 (§31.2); DA-SRC-22, DA-SNAP-14 and DA-X-13 🆕 2026-10-14 (§32.1); DA-SRC-24…26 🆕 2026-10-16 (§33.1); DA-OBS-6 🆕 2026-10-17 (§34.1), ✅ 2026-10-29 (M10 merged, §45); DA-OPS-9 🆕 2026-10-22 (§38.1); DA-OPS-10 🆕 2026-10-23 (§39.1). DA-OPS-8 🔄 2026-10-22 (§38). DA-API-11 and DA-API-12 ✅ 2026-10-23 (§40). DA-CLUS-14, DA-OPS-7 and DA-SRC-28 ✅ 2026-10-22 (§37). DA-SRC-27 and DA-X-14 ✅ 2026-10-20 (§35). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
 | 🧪 Verify (v1) | **0** | DA-SRC-10/11 proven 2026-09-26 (§21). |
 | ⏭ v2 | 13 | Iceberg-sink items (§26.2). |
 | 🟢 Spec-merge debt | **0** | All applied 2026-09-26 (§26.6): §19.3 S-1…S-6, the DA-X-8 config residual, the D-V1 patches and the Data-Flow Phase 2a probe details. |
@@ -481,6 +519,7 @@ paper** and is this report's top blocker.
 | DA-CLUS-12 | `kubernetes` lock_backend (K8s Lease API) | 🟢 | ✅ (deferred) | Reserved as a future `LeaseStore` impl; **only `storage` is built for v1** (V-075). A genuine but deliberately deferred scope item. **✅ 2026-09-26 — deferral confirmed (`V1_Scope_Decisions.md` §2).** | D-2 |
 | DA-CLUS-13 | Per-source-endpoint takeover bulkhead | 🟢 | ✅ (deferred) | §20.2 notes the sharper risk (many pipelines on one source DB reconnecting together) as a **future** per-endpoint concurrency group; v1 cap is per-node-global. **✅ 2026-09-26 — deferral confirmed (`V1_Scope_Decisions.md` §2).** | D-10 |
 | DA-CLUS-14 | A lease store and a lake that disagree on the epoch (a moved, restored or deleted `globals.state`) | 🟢 | ✅ | ✅ 2026-10-22 (§37): a fenced worker's claim takes its own lease over at `max(stored + 1, current_epoch + 1)` in one step (`Leases::take_over_at`, `Claim::at_least`); a second fence after that jump is an `ERROR` naming another lease store, with the lease kept; a stop spends the jump, so the ERROR's remedy (stop, resume) climbs once more. Another holder's lease is never touched by the floor. M8a Task 8 (D-M8a.14) | — |
+| DA-CLUS-15 | 🆕 DNS discovery asks again only while a node has no peer | 🟢 | 🟥 | §47.1. With four or more pods started together (the chart's `Parallel`), nodes that each found some, not all, of the others can form groups that never merge | — |
 
 ---
 
@@ -630,7 +669,7 @@ endpoint), and trace-id/pipeline injection into JSON logs.
 | DA-OBS-3 | Distributed tracing | 🟢 | ✅ | §3 (G-32) — `globals.tracing.otlp_endpoint` (absent⇒off) + `sample_ratio`; batch/commit-granularity spans, no per-event spans. | G-32, OQ-OB1 |
 | DA-OBS-4 | Log/trace correlation | 🟢 | ✅ | §4 — inject `trace_id`/`span_id`/`pipeline` into JSON logs. | §10.3 |
 | DA-OBS-5 | **Numeric end-to-end replication-lag SLA** | 🟡 | ✅ | `Clustering…` §18.6 explicitly leaves OQ-OB2 open as a *tuning input*: a concrete max-lag number is not fixed, which is what grounds the lease-timing profile and flush/checkpoint cadence. Decide a number (and whether failover-time carries its own SLA distinct from steady-state). **✅ 2026-09-26 — D-V1.3 (`V1_Scope_Decisions.md`):** steady-state p99 ≤ 60s, failover ≤ 2 min, at default config; confirm by v1 load test. | OQ-OB2 |
-| DA-OBS-6 | 🆕 The text log writes ANSI colour sequences to a file | 🟢 | 🟥 | §34.1. The binary's `compact` and `pretty` logs colour their output whether or not stderr is a terminal (`tracing-subscriber` 0.3.23's default; `crates/data-avalanche/src/logging.rs`). A log collector or a file gets escape sequences around the level and the fields: a search for `code="BINLOG_…"` misses them. The E2E suite strips them (M7b Task 7). Fix: colour only when stderr is a terminal (and keep `NO_COLOR`); M10 (`globals.log`) or earlier. **M10 Task 7 fixes it (§44); ✅ when M10 merges** | — |
+| DA-OBS-6 | 🆕 The text log writes ANSI colour sequences to a file | 🟢 | ✅ | §34.1. The binary's `compact` and `pretty` logs colour their output whether or not stderr is a terminal (`tracing-subscriber` 0.3.23's default; `crates/data-avalanche/src/logging.rs`). A log collector or a file gets escape sequences around the level and the fields: a search for `code="BINLOG_…"` misses them. The E2E suite strips them (M7b Task 7). Fix: colour only when stderr is a terminal (and keep `NO_COLOR`); M10 (`globals.log`) or earlier. M10 Task 7 fixes it (§44). **✅ 2026-10-29** — M10 merged (PR #15, `550474c`), its CI green (§45). | — |
 | DA-OBS-7 | 🆕 The OTLP export sends no headers | 🟢 | 🟥 | §44.1. `globals.tracing` has no headers, so a collector that wants a token can't take the traces; an `https` endpoint goes through `reqwest` 0.13 with rustls and is untested. Next: `globals.tracing.headers` (secret-resolved) and an `https` IT, after v1 unless needed | — |
 | DA-OBS-8 | 🆕 The lag reads `0` early in two short windows | 🟢 | 🟥 | §45.1. A restarted worker that makes its first re-read change durable before re-reading the next, and a source reconnect inside one worker, show `0` until the change is read again (about a heartbeat on MySQL; on PostgreSQL the re-decode of a large transaction). Next: keep the kept start until the frontier covers it; carry the pending start across a reconnect | — |
 | DA-OBS-9 | 🆕 The JSON correlation's global-dispatch path is untested end to end | 🟢 | 🟥 | §45.1. The logger's tests run under a scoped dispatch; the binary's `set_global_default` path holds by reading `tracing-core` 0.1.36. Next: a JSON-logged line matched to a Jaeger trace in the E2E | — |
@@ -689,6 +728,7 @@ pinning is the remaining cross-cutting concern.
 | DA-OPS-4 | Sink/catalog unavailability → DEGRADED back-pressure | 🟡 | ✅ | G-27/G-35 — stop consuming once buffers fill, protect slot/WAL via G-22; recover on next commit; catalog circuit breaker. | G-27, G-35 |
 | DA-OPS-5 | k8s deployment as StatefulSet (not Deployment) | 🟡 | ✅ | Clustering §3.4/§10.2 — stable `node_name` via Downward API; headless Service discovery. | D-1, D-4 |
 | DA-OPS-10 | 🆕 An `id` change that keeps its resources is sequenced only within one reload, on the nodes that applied it | 🟢 | 🟥 | §39.1. M8b's whole-branch review: an added pipeline sharing a removed one's slot, publication, sink or state waits for the removed one's lease. A node that starts during the wait, a removal and an add in two reloads, a cut-off drain, or the old id reused while the removal drains let it start early. | — |
+| DA-OPS-11 | 🆕 The release workflow's first full run is the first tag's | 🟢 | 🟥 | §46.1. `release.yml` (M11a) runs on a `v*` tag or by hand, and only from `main`: before M12's `v1.0.0` only its builds are proven. The first push creates the GHCR packages private. Next: a manual run on `main` after M11a merges; the packages made public after the first tag §47: the repository is private, so the attestation is skipped (BuildKit's in-registry provenance and the SBOM stay) and the `ubuntu-24.04-arm` runner is unproven until `weekly.yml` is dispatched. Oleksii's ruling 2026-10-29: the repository goes public, after a README with a not-for-production warning lands (PR #17) | — |
 | DA-OPS-9 | 🆕 A pipeline removed while no node holds its lease isn't torn down | 🟢 | 🟥 | §38.1. Q-M8b-3: the owner drains, tears down (`auto_cleanup`) and releases. With no owner at the removal (it is down, or a hand-off is between release and claim), every node's controller is on standby and just ends, so the PostgreSQL slot and publication stay and the slot keeps WAL (bounded by `max_slot_wal_keep_size`). Config §12.3's "orphan-cleanup … whose owner was offline" design item. | — |
 | DA-OPS-8 | Per-node literals in a node's own file are ignored once a generation exists | 🟢 | 🔄 | §36.1, §38. A node runs the cluster's generation resolved with its own environment (D-3); per-node values go through `${VAR}` (config §6.5.1). M8b warns at startup naming each per-node key that differs, and which value runs; the operator docs stay with M11. | — |
 | DA-OPS-7 | A controller task that panics goes unnoticed | 🟢 | ✅ | ✅ 2026-10-22 (§37): the reconciler supervises its controllers. One that ended unasked (a panic, a return) is logged and started again on its status channel, and a dropped reconciler counts as a crash; the owned-pipelines gauge is held by a guard, so a panic doesn't over-count it. Readiness after a controller panic is not in M8a (DA-OPS-7's other half: M10). M8a Task 6 (D-M8a.11, `a_controller_that_panics_is_started_again`) | — |

@@ -40,6 +40,23 @@ jobs:
         run: >-
           docker run --rm -v "$PWD/deploy/prometheus:/rules:ro" --entrypoint promtool
           prom/prometheus:v3.15.0 test rules /rules/alerts.test.yaml
+      # The Helm chart (M11a): lint, render with its example values, and validate the objects
+      # against the Kubernetes API's schemas; packaging.rs validates the example's config.
+      - uses: azure/setup-helm@v5
+        with:
+          version: v4.3.0
+      - name: Helm chart
+        run: |
+          chart=deploy/helm/data-avalanche
+          for values in "$chart"/ci/*-values.yaml; do
+            helm lint --strict "$chart" -f "$values"
+            helm template ci "$chart" -f "$values" \
+              | docker run --rm -i ghcr.io/yannh/kubeconform:v0.8.0 -strict -summary -kubernetes-version 1.37.0 -
+          done
+          # The API's TLS turns the probes to HTTPS.
+          [ "$(helm template ci "$chart" -f "$chart/ci/tls-values.yaml" | grep -c 'scheme: HTTPS')" = 3 ]
+      - name: Workflows
+        run: docker run --rm -v "$PWD:/repo:ro" --workdir /repo rhysd/actionlint:1.7.12 -no-color
       # RustSec advisory audit of Cargo.lock. Non-blocking by design: a vulnerable dependency is
       # reported (warning annotation + failed step) but never fails the job.
       - name: Install cargo-audit
@@ -154,3 +171,59 @@ jobs:
       - name: Stop the containers
         if: always()
         run: docker compose -f test-infra/compose.yaml down -v
+
+  # The smoke deploy (M11a): the image built from deploy/docker/Dockerfile, imported into
+  # test-infra's k3s, and the Helm chart's three pods running a pipeline from PostgreSQL 18 into
+  # RustFS; a deleted pod hands the pipeline to the others. No secrets.
+  k3s:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    needs: check
+    env:
+      DATA_AVALANCHE_IT: "1"
+      DATA_AVALANCHE_SKIP_GCS: "1"
+      DATA_AVALANCHE_K3S: "1"
+      KUBECONFIG: ${{ github.workspace }}/test-infra/.k3s/kubeconfig.yaml
+    steps:
+      - name: Free runner disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - uses: azure/setup-helm@v5
+        with:
+          version: v4.3.0
+      - uses: docker/setup-buildx-action@v4
+      - name: Start PostgreSQL 18 and RustFS
+        run: |
+          docker compose -f test-infra/compose.yaml up -d --wait postgres-18 rustfs
+          docker compose -f test-infra/compose.yaml --profile init run --rm rustfs-init
+      - name: The image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          tags: data-avalanche:k3s
+          load: true
+          # The gha cache holds the layers only: a change under crates/ builds the binary cold.
+          cache-from: type=gha,scope=k3s
+          cache-to: type=gha,mode=max,scope=k3s
+      # rustls's platform verifier reads the distroless CA bundle: S3, GCS and Azure over TLS.
+      - name: The image's CA bundle
+        run: |
+          id=$(docker create data-avalanche:k3s)
+          docker cp "$id:/etc/ssl/certs/ca-certificates.crt" - | tar -tv
+          docker rm "$id"
+      - name: Start k3s, import the image
+        run: test-infra/k3s.sh --no-build
+      - name: The smoke deploy
+        run: >-
+          cargo test --locked -p data-avalanche --features e2e-hooks --test e2e --
+          k3s:: --test-threads=1
+      - name: Pods and logs on failure
+        if: failure()
+        run: |
+          kubectl get pods -o wide || true
+          kubectl logs -l app.kubernetes.io/name=data-avalanche --prefix --tail=200 || true
+      - name: Stop the containers
+        if: always()
+        run: docker compose -f test-infra/compose.yaml --profile k3s down -v

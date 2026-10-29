@@ -8,7 +8,8 @@ name: weekly
 # DATA_AVALANCHE_MYSQL. The slice-1 E2E suite on MariaDB 11.8 in file/position mode and on 11.4
 # and 10.11 (Q-M7b-2; ci.yml runs it on MySQL 8.4 and MariaDB 11.8 per change).
 # Weekly (Mondays 03:41 UTC) and on manual dispatch. The TLS tests need `postgres-tls`
-# (PostgreSQL 18) or `mysql-tls` (MySQL 8.4) and run in ci.yml only. No secrets.
+# (PostgreSQL 18) or `mysql-tls` (MySQL 8.4) and run in ci.yml only. The image is built on linux/arm64
+# (M11a). No secrets.
 
 on:
   schedule:
@@ -111,3 +112,23 @@ jobs:
       - name: Stop the containers
         if: always()
         run: docker compose -f test-infra/compose.yaml --profile matrix down -v
+
+  # The image on linux/arm64 (Q-M11-3), built on an arm64 runner as the release builds it, so a
+  # break shows before a tag; PR CI's k3s job builds linux/amd64. Nothing is pushed.
+  image-arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          platforms: linux/arm64
+          tags: data-avalanche:arm64
+          load: true
+          cache-from: type=gha,scope=linux/arm64
+          cache-to: type=gha,mode=max,scope=linux/arm64
+      - name: The binary runs
+        run: docker run --rm data-avalanche:arm64 --version
