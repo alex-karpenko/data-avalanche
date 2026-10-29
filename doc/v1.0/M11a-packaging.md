@@ -2282,3 +2282,6 @@ git commit -m "ci: the release — on a v* tag, the image for amd64 and arm64 wi
   planning (`.github/workflows/ci.yml`, the chart step's comment; `ci/example-values.yaml`, its
   header): the commit names `packaging.rs`. The block of `ci.yml` also ends the file with a blank
   line, which the commit leaves out.
+- Task 3: Step 3's block of `ci.yml` takes that blank line as context, so it doesn't apply after
+  Task 2's commit; the commit adds the same 55 lines, the blank line before the `k3s` job among
+  them.
