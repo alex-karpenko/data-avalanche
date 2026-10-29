@@ -1,0 +1,189 @@
+name: release
+
+# A v* tag publishes the release (Q-M11-1): the image for linux/amd64 and linux/arm64, each built
+# on a runner of its own architecture, to ghcr.io/<owner>/data-avalanche with an SBOM and a
+# provenance attestation; the Helm chart as an OCI artifact to ghcr.io/<owner>/charts; and a
+# GitHub release with the SBOM. The tag must equal the workspace's version and the chart's.
+# A manual run builds both images and packages the chart without pushing anything.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/data-avalanche
+  CHARTS: oci://ghcr.io/${{ github.repository_owner }}/charts
+  PUBLISH: ${{ github.event_name == 'push' }}
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: version
+        name: The tag, the workspace and the chart agree
+        run: |
+          crate=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          chart=$(sed -n 's/^version: //p' deploy/helm/data-avalanche/Chart.yaml)
+          app=$(sed -n 's/^appVersion: "\(.*\)"/\1/p' deploy/helm/data-avalanche/Chart.yaml)
+          echo "workspace $crate, chart $chart, appVersion $app"
+          [ "$crate" = "$chart" ] && [ "$crate" = "$app" ] || { echo "::error::the workspace, chart and appVersion versions differ"; exit 1; }
+          if [ "$PUBLISH" = true ] && [ "${GITHUB_REF_NAME}" != "v$crate" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} isn't v$crate"; exit 1
+          fi
+          echo "version=$crate" >> "$GITHUB_OUTPUT"
+
+  image:
+    needs: version
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - if: env.PUBLISH == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: VERSION=${{ needs.version.outputs.version }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=${{ env.PUBLISH }}
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+      - if: env.PUBLISH == 'true'
+        name: The digest
+        run: |
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+      - if: env.PUBLISH == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ strategy.job-index }}
+          path: digests/*
+          if-no-files-found: error
+
+  manifest:
+    needs: [version, image]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: push
+        name: The image's tags, over both platforms
+        working-directory: digests
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          tags=(-t "$IMAGE:$VERSION")
+          case "$VERSION" in
+            *-*) ;;  # a pre-release takes its own tag only
+            *) tags+=(-t "$IMAGE:${VERSION%.*}" -t "$IMAGE:latest") ;;
+          esac
+          refs=()
+          for d in *; do refs+=("$IMAGE@sha256:$d"); done
+          docker buildx imagetools create "${tags[@]}" "${refs[@]}"
+          digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  chart:
+    needs: version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v5
+        with:
+          version: v4.3.0
+      - name: Package
+        run: helm package deploy/helm/data-avalanche --destination dist
+      - if: env.PUBLISH == 'true'
+        name: Push
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+          helm push "dist/data-avalanche-${{ needs.version.outputs.version }}.tgz" "$CHARTS"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: chart
+          path: dist/*.tgz
+          if-no-files-found: error
+
+  github-release:
+    needs: [version, manifest, chart]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: read
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: chart
+          path: dist
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: anchore/sbom-action@v0.24.3
+        with:
+          image: ${{ env.IMAGE }}@${{ needs.manifest.outputs.digest }}
+          format: spdx-json
+          output-file: dist/data-avalanche-${{ needs.version.outputs.version }}.spdx.json
+          upload-artifact: false
+      - name: The release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          prerelease=()
+          case "$VERSION" in *-*) prerelease=(--prerelease) ;; esac
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes \
+            --verify-tag "${prerelease[@]}" dist/*

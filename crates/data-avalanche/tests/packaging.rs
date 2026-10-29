@@ -131,3 +131,28 @@ fn a_changed_config_is_said_to_go_through_the_reload() {
     }
     assert!(!chart("templates/statefulset.yaml").contains("checksum/"));
 }
+
+#[test]
+fn the_release_publishes_the_image_the_chart_pulls() {
+    let release = repo(".github/workflows/release.yml");
+    let pulled = value(&chart("values.yaml"), "  repository: ");
+    let owner = pulled
+        .strip_prefix("ghcr.io/")
+        .and_then(|r| r.strip_suffix("/data-avalanche"))
+        .unwrap_or_else(|| panic!("{pulled}"));
+    assert_eq!(owner, "alex-karpenko");
+    assert!(release.contains("IMAGE: ghcr.io/${{ github.repository_owner }}/data-avalanche\n"));
+    assert!(release.contains("CHARTS: oci://ghcr.io/${{ github.repository_owner }}/charts\n"));
+    // Each platform on a runner of its own architecture, as the weekly arm64 build.
+    for (platform, runner) in [
+        ("linux/amd64", "ubuntu-24.04"),
+        ("linux/arm64", "ubuntu-24.04-arm"),
+    ] {
+        assert!(
+            release.contains(&format!(
+                "- platform: {platform}\n            runner: {runner}\n"
+            )),
+            "{platform}"
+        );
+    }
+}
