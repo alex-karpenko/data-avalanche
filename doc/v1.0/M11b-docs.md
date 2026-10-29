@@ -5393,3 +5393,9 @@ git commit -m "gap: v1 §50 — M11b's docs: DA-OPS-8, DA-API-14/15, DA-SNAP-17/
   - `catalog.rest.auth` no longer offers `sigv4` as a mode: V-116 refuses it on the pinned client.
   - The table's text now differs from this plan's Task 1 block in those three strings. Nothing else
     changed, and the tests are the same.
+- **Task 2, the API page's "Answers" paragraph** (`xtask/src/api.rs`, found by the task review,
+  fixed in the task's commit). The paragraph claimed that every route can answer `401` and `403`,
+  and that every `202` runs on the lease holder. Under `auth: none` neither `401` nor `403` occurs.
+  Only a pipeline command or a snapshot job is carried out by the lease holder: a reload is
+  published, and a leave or a shutdown runs on the node called (the routes' own `202` texts). The
+  paragraph now says so, and `reference/api.md` is regenerated.
