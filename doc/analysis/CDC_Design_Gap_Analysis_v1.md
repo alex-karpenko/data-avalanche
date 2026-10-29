@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-28
+updated: 2026-10-29
 domain: Architecture
 tags: [gap-analysis, design, re-derivation, spec-readiness, blockers, open-decisions]
 resolves: []
@@ -297,6 +297,33 @@ Q-M10-1…4; the rulings D-M10.1…16 are in the plan (roadmap D-IMPL-21).
 |---|---|---|---|---|
 | DA-OBS-7 | The OTLP export sends no headers: a collector that wants a token or an API key (a hosted backend) can't take the traces; an `https` endpoint is untested | 🟢 | M10 planning | `globals.tracing.headers` (secret-resolved, R), and an `https` IT; after v1 unless a deployment needs it |
 
+## 45. M10 observability — the exit (2026-10-29)
+
+M10 (`doc/v1.0/M10-observability.md`) was executed 2026-10-28…29: nine tasks, review fixes on
+Tasks 2, 3, 4, 6, 7 and 9, then a whole-branch review with no Critical. Its two Important
+findings were fixed before the PR (the plan's "Deviations during execution"):
+- a failed OTLP export logged nothing (the SDK's `otel_error!` is a no-op without
+  `internal-logs`), against config §6.6's run-time warning; it is now warned of, rate-limited,
+  without the endpoint's credentials;
+- `replication_lag_seconds` froze while no worker ran and dropped to `0` at the next worker's
+  start; the controller now keeps the lag's start across a restart within the lease term.
+
+One spec edit beyond the two approved with the plan: System-Overview's `binlog_lag_seconds` of an
+idle stream (Task 4, Oleksii's ruling, approved and applied). 1332 workspace tests; the
+observability scenarios pass on PostgreSQL 18, `mysql-84`, `mysql-84-nogtid` and `mariadb-118`,
+and the E2E suite (46 scenarios) on PostgreSQL 18.
+
+| ID | Change | Evidence |
+|---|---|---|
+| DA-OBS-6 | 🟥 (stays): fixed by Task 7 (0859843); ✅ when M10 merges | as §44 |
+
+### 45.1 New gaps
+
+| ID | Gap | Severity | Surfaced by | Next |
+|---|---|---|---|---|
+| DA-OBS-8 | `replication_lag_seconds` reads `0` early in two windows until the change is read again: a restarted worker that makes its first re-read change durable before re-reading the next, and a source reconnect inside one worker (its new session starts with nothing pending) | 🟢 | M10's whole-branch re-review | Keep the controller's kept start until the worker's frontier covers it; carry the session's pending start across a reconnect |
+| DA-OBS-9 | The JSON log's `trace_id`/`span_id` are tested under a scoped dispatch only; the binary's global dispatch (`set_global_default`, the weak dispatch) has no end-to-end test | 🟢 | M10's whole-branch review | In the Jaeger E2E, log in JSON and match a line's `trace_id` to a trace the collector returned |
+
 ---
 
 ### Counts (by status)
@@ -308,13 +335,13 @@ Q-M10-1…4; the rulings D-M10.1…16 are in the plan (roadmap D-IMPL-21).
 > M7a's plan (§32), 2026-10-16 for M7a's exit (§33), 2026-10-17 for M7b's plan (§34),
 > 2026-10-20 for M7b's exit (§35), 2026-10-21 for M8a's plan (§36), 2026-10-22 for M8a's exit (§37),
 > 2026-10-22 for M8b's plan (§38), 2026-10-23 for M8b's exit (§39), 2026-10-23 for M9a's plan
-> (§40), 2026-10-23 for M9a's exit (§41), 2026-10-27 for M9b's plan (§42), 2026-10-28 for M9b's exit (§43), and 2026-10-28 for M10's plan (§44).
+> (§40), 2026-10-23 for M9a's exit (§41), 2026-10-27 for M9b's plan (§42), 2026-10-28 for M9b's exit (§43), 2026-10-28 for M10's plan (§44), and 2026-10-29 for M10's exit (§45).
 
 | Status | Count (v1 scope) | Notes |
 |---|---|---|
 | ✅ Resolved | the large majority | Design closed by a research/spec doc or a probe. |
 | 🔄 Partial | 3 | DA-SCHEMA-10 ✅ 2026-10-28 (M9b merged, §43); DA-SNAP-7, DA-SRC-9 (neither blocks the plan); DA-OPS-8 2026-10-22 (§38: the startup warning; the operator docs in M11); DA-SNAP-10 ✅ 2026-10-16 (M7a merged, §33). DA-MS-3 is a decided caveat. DA-X-8 ✅ 2026-09-26; DA-SRC-16 and DA-X-12 ✅ 2026-10-13 (§30). |
-| 🟥 Open (v1) | **35** | DA-OBS-7 🆕 2026-10-28 (§44.1); DA-SNAP-18…21 🆕 2026-10-28 (§43.1); DA-SNAP-15…17 🆕 2026-10-27 (§42.1); DA-API-13…18 🆕 2026-10-23 and DA-API-20 🆕 2026-10-24 (§41.1); DA-API-19 🆕 2026-10-23, ✅ 2026-10-24 (§41); DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2); DA-SRC-20 🆕 2026-10-13 (§30.1); DA-SRC-21 🆕 2026-10-14 (§31.2); DA-SRC-22, DA-SNAP-14 and DA-X-13 🆕 2026-10-14 (§32.1); DA-SRC-24…26 🆕 2026-10-16 (§33.1); DA-OBS-6 🆕 2026-10-17 (§34.1; fixed by M10 Task 7, §44); DA-OPS-9 🆕 2026-10-22 (§38.1); DA-OPS-10 🆕 2026-10-23 (§39.1). DA-OPS-8 🔄 2026-10-22 (§38). DA-API-11 and DA-API-12 ✅ 2026-10-23 (§40). DA-CLUS-14, DA-OPS-7 and DA-SRC-28 ✅ 2026-10-22 (§37). DA-SRC-27 and DA-X-14 ✅ 2026-10-20 (§35). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
+| 🟥 Open (v1) | **37** | DA-OBS-8 and DA-OBS-9 🆕 2026-10-29 (§45.1); DA-OBS-7 🆕 2026-10-28 (§44.1); DA-SNAP-18…21 🆕 2026-10-28 (§43.1); DA-SNAP-15…17 🆕 2026-10-27 (§42.1); DA-API-13…18 🆕 2026-10-23 and DA-API-20 🆕 2026-10-24 (§41.1); DA-API-19 🆕 2026-10-23, ✅ 2026-10-24 (§41); DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2); DA-SRC-20 🆕 2026-10-13 (§30.1); DA-SRC-21 🆕 2026-10-14 (§31.2); DA-SRC-22, DA-SNAP-14 and DA-X-13 🆕 2026-10-14 (§32.1); DA-SRC-24…26 🆕 2026-10-16 (§33.1); DA-OBS-6 🆕 2026-10-17 (§34.1; fixed by M10 Task 7, §44); DA-OPS-9 🆕 2026-10-22 (§38.1); DA-OPS-10 🆕 2026-10-23 (§39.1). DA-OPS-8 🔄 2026-10-22 (§38). DA-API-11 and DA-API-12 ✅ 2026-10-23 (§40). DA-CLUS-14, DA-OPS-7 and DA-SRC-28 ✅ 2026-10-22 (§37). DA-SRC-27 and DA-X-14 ✅ 2026-10-20 (§35). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
 | 🧪 Verify (v1) | **0** | DA-SRC-10/11 proven 2026-09-26 (§21). |
 | ⏭ v2 | 13 | Iceberg-sink items (§26.2). |
 | 🟢 Spec-merge debt | **0** | All applied 2026-09-26 (§26.6): §19.3 S-1…S-6, the DA-X-8 config residual, the D-V1 patches and the Data-Flow Phase 2a probe details. |
@@ -605,6 +632,8 @@ endpoint), and trace-id/pipeline injection into JSON logs.
 | DA-OBS-5 | **Numeric end-to-end replication-lag SLA** | 🟡 | ✅ | `Clustering…` §18.6 explicitly leaves OQ-OB2 open as a *tuning input*: a concrete max-lag number is not fixed, which is what grounds the lease-timing profile and flush/checkpoint cadence. Decide a number (and whether failover-time carries its own SLA distinct from steady-state). **✅ 2026-09-26 — D-V1.3 (`V1_Scope_Decisions.md`):** steady-state p99 ≤ 60s, failover ≤ 2 min, at default config; confirm by v1 load test. | OQ-OB2 |
 | DA-OBS-6 | 🆕 The text log writes ANSI colour sequences to a file | 🟢 | 🟥 | §34.1. The binary's `compact` and `pretty` logs colour their output whether or not stderr is a terminal (`tracing-subscriber` 0.3.23's default; `crates/data-avalanche/src/logging.rs`). A log collector or a file gets escape sequences around the level and the fields: a search for `code="BINLOG_…"` misses them. The E2E suite strips them (M7b Task 7). Fix: colour only when stderr is a terminal (and keep `NO_COLOR`); M10 (`globals.log`) or earlier. **M10 Task 7 fixes it (§44); ✅ when M10 merges** | — |
 | DA-OBS-7 | 🆕 The OTLP export sends no headers | 🟢 | 🟥 | §44.1. `globals.tracing` has no headers, so a collector that wants a token can't take the traces; an `https` endpoint goes through `reqwest` 0.13 with rustls and is untested. Next: `globals.tracing.headers` (secret-resolved) and an `https` IT, after v1 unless needed | — |
+| DA-OBS-8 | 🆕 The lag reads `0` early in two short windows | 🟢 | 🟥 | §45.1. A restarted worker that makes its first re-read change durable before re-reading the next, and a source reconnect inside one worker, show `0` until the change is read again (about a heartbeat on MySQL; on PostgreSQL the re-decode of a large transaction). Next: keep the kept start until the frontier covers it; carry the pending start across a reconnect | — |
+| DA-OBS-9 | 🆕 The JSON correlation's global-dispatch path is untested end to end | 🟢 | 🟥 | §45.1. The logger's tests run under a scoped dispatch; the binary's `set_global_default` path holds by reading `tracing-core` 0.1.36. Next: a JSON-logged line matched to a Jaeger trace in the E2E | — |
 
 ---
 
