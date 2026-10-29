@@ -1,0 +1,14 @@
+# The chart's values for the smoke deploy: the image test-infra/k3s.sh imported, the API on the
+# node's port 30080, small requests. The scenario adds the RustFS endpoint and the config.
+image:
+  repository: data-avalanche
+  tag: k3s
+  pullPolicy: Never
+service:
+  type: NodePort
+  nodePort: 30080
+resources:
+  requests: { cpu: 100m, memory: 256Mi }
+  limits: { memory: 1Gi }
+podDisruptionBudget:
+  enabled: false

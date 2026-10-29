@@ -32,6 +32,12 @@ pub fn gcs_enabled() -> bool {
     it_enabled() && !env_set("DATA_AVALANCHE_SKIP_GCS")
 }
 
+/// True when integration tests are enabled and `DATA_AVALANCHE_K3S` is set: the smoke deploy's
+/// k3s runs (`test-infra/k3s.sh`).
+pub fn k3s_enabled() -> bool {
+    it_enabled() && env_set("DATA_AVALANCHE_K3S")
+}
+
 /// True when `DATA_AVALANCHE_CLOUD` (a comma-separated list, e.g. `s3` or `s3,azure`) names
 /// `cloud`. Real-cloud tests run only in `cloud.yml` or by hand, never in `ci.yml`.
 pub fn cloud_enabled(cloud: &str) -> bool {
@@ -63,6 +69,19 @@ macro_rules! require_it {
     () => {
         if !$crate::it_enabled() {
             eprintln!("skipped: set DATA_AVALANCHE_IT=1 after running test-infra/up.sh");
+            return;
+        }
+    };
+}
+
+/// Returns early unless the smoke deploy's tests are enabled.
+#[macro_export]
+macro_rules! require_k3s {
+    () => {
+        if !$crate::k3s_enabled() {
+            eprintln!(
+                "skipped: set DATA_AVALANCHE_IT=1 and DATA_AVALANCHE_K3S=1 after running test-infra/k3s.sh"
+            );
             return;
         }
     };

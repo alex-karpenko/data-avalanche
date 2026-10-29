@@ -1,3 +1,4 @@
 target/
 prototypes/*/target/
 test-infra/.tls/
+test-infra/.k3s/

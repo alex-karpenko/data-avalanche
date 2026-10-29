@@ -19,6 +19,7 @@ on `PATH`; it fetches DuckDB itself.
 | rustfs (S3) | rustfs/rustfs:1.0.0 | 59000 | avalanche / avalanche-secret | default |
 | azurite (Azure Blob) | mcr.microsoft.com/azure-storage/azurite:3.37.0 | 10000 | Azurite's public dev account | default |
 | jaeger (OTLP/HTTP collector, query API) | jaegertracing/jaeger:2.21.0 | 54318 (OTLP), 56686 (query) | — | default |
+| k3s (the smoke deploy's Kubernetes) | rancher/k3s:v1.37.1-k3s1, privileged | 56443 (API), 58080 (the chart's API NodePort) | kubeconfig in `test-infra/.k3s/` | k3s |
 
 Bucket / container `data-avalanche-test` is created by the `init` profile (`up.sh` runs it). Azurite keeps
 port 10000 because `object_store`'s emulator mode always targets `127.0.0.1:10000`.
@@ -108,6 +109,26 @@ tokens against a JWKS the test serves on loopback (`idp.rs`); `cluster.rs` drive
 through a node that doesn't hold it, and leaves and shuts a node down through the API. The
 snapshot-job scenarios (M9b, `jobs.rs`) need nothing more either: they ask for jobs through the
 API, drop and create a table again to halt it, and `kill -9` the process while a job reads.
+
+## The smoke deploy (k3s)
+
+The Helm chart's scenario (`crates/data-avalanche/tests/e2e/k3s.rs`, M11a) installs the chart
+with three pods on a one-node k3s, runs a pipeline from `postgres-18` into RustFS, and deletes the
+pod that holds it. `test-infra/k3s.sh` starts the `k3s` service (profile `k3s`), waits for its
+node, builds the image from `deploy/docker/Dockerfile` (about 20 minutes the first time) and
+imports it; k3s writes its kubeconfig to `test-infra/.k3s/` (git-ignored). The pods reach
+`postgres-18` and `rustfs` through the chart's `hostAliases`, which the scenario sets from
+`docker inspect`: k3s's DNS doesn't forward to Docker's.
+
+```sh
+test-infra/up.sh && test-infra/k3s.sh
+DATA_AVALANCHE_IT=1 DATA_AVALANCHE_SKIP_GCS=1 DATA_AVALANCHE_K3S=1 \
+  cargo test -p data-avalanche --features e2e-hooks --test e2e -- k3s:: --test-threads=1
+```
+
+The kubelet evicts only under 1% free disk (`compose.yaml`): a laptop's Docker disk is often
+fuller than the default thresholds (10–15%) allow, which taints the node and schedules nothing.
+`test-infra/down.sh` stops k3s with the rest.
 
 ## GCS: a real bucket, not an emulator
 
