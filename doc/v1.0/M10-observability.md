@@ -6457,7 +6457,7 @@ git commit -m "test(e2e): the catalogue scraped live, and the traces read back f
   exit).
 - [x] The tracing smoke test passes against the Jaeger container (Task 9, roadmap M10's exit).
 - [ ] The promtool test passes in CI's `check` job (Task 8).
-- [ ] The whole-branch review's findings fixed or recorded; the PR's CI green.
+- [ ] The whole-branch review's findings fixed or recorded (done 2026-10-29); the PR's CI green.
 - [ ] DA-OBS-6 ✅ in the gap tracker when M10 merges.
 
 ## Deviations during execution
@@ -6593,4 +6593,11 @@ git commit -m "test(e2e): the catalogue scraped live, and the traces read back f
     reason for dropping the old exporter on a thread is corrected, in the code, in D-M10.9 and
     above (Task 6's code block keeps its original comment, and Task 1's the original help text).
   - **M3**: the research doc says when the binlog lag's series is absent. M4 and M7 are parked.
-  - The workspace has 1332 tests after the fixes.
+  - The workspace has 1332 tests after the fixes. The scoped re-review found every finding
+    addressed. It left three Minor edges, accepted and recorded in the research doc:
+    - The lag reads `0` early in two windows, until the change is read again: a restarted
+      worker that makes its first re-read change durable before it re-reads the next, and a
+      source reconnect inside one worker, which predates M10.
+    - A pipeline stopped with a change pending keeps a growing lag, as the definition says.
+  - The observability E2E passed 2 of 2 on PostgreSQL 18 and on MySQL 8.4 after the fixes, and
+    so did the pipeline and cluster crates' integration tests.

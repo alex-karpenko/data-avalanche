@@ -81,8 +81,13 @@ All Prometheus, exposed at `/metrics` (unauthenticated, per System-Overview / RB
   renewal poll, clamped at 0 when the node's clock is behind the source's. It sees only what the
   pipeline read: an unread backlog is the source series' to show.
   - It carries across a worker restart: what an ended worker read and didn't make durable still
-    counts, so the lag grows while no worker runs (a restart's backoff, `ERROR`). The next worker
+    counts, so the lag grows while no worker runs (a restart's backoff, `ERROR`, a stop with a
+    change pending; the example lag alert fires for a pipeline stopped that way). The next worker
     takes over once it reads a change again, or has read as far with nothing pending.
+  - Known edges: it reads `0` early while a restarted worker has made its first re-read change
+    durable before re-reading the next, and after a source reconnect inside one worker, until
+    the change is read again (about a heartbeat on MySQL; on PostgreSQL, the server's re-decode
+    of a large transaction).
 - **The binlog lag** (MySQL, MariaDB): the age of the last transaction the stream read, `0` once
   the stream is at the server's head, with no series without a stream.
   - A server heartbeat says the stream caught up. The lag stays `0` while the server's head
