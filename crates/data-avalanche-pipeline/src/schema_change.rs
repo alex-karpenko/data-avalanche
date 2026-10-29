@@ -2,13 +2,31 @@
 //! the sink's evolve. A stream session runs them at a signal's position, with a flush in between.
 //! Phase 0 runs them to baseline a table whose stream position was lost.
 
+use arrow_schema::Schema;
 use data_avalanche_core::{
-    DeltaClass, EvolveOutcome, HaltReason, SchemaChange, SchemaDelta, SchemaHint, Sink, SinkError,
-    SourceConnector, SourceError, TableRef, TableSchema, classify,
+    DeltaClass, EvolveOutcome, HaltReason, INTERNAL_COLUMN_PREFIX, LINEAGE_COLUMNS, SchemaChange,
+    SchemaDelta, SchemaHint, Sink, SinkError, SourceConnector, SourceError, TableRef, TableSchema,
+    classify,
 };
 use tokio::sync::watch;
+use tracing::Instrument;
+use tracing::field::Empty;
 
 use crate::{CommitGuard, Tuning, WorkerError, WorkerStatus};
+
+/// The sink table's columns `source` doesn't have, the lineage and internal columns aside:
+/// soft-dropped, kept and written NULL (`data_avalanche_sink_soft_dropped_columns`).
+pub(crate) fn soft_dropped(sink: &Schema, source: &TableSchema) -> usize {
+    sink.fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .filter(|n| {
+            !LINEAGE_COLUMNS.contains(n)
+                && !n.starts_with(INTERNAL_COLUMN_PREFIX)
+                && source.column(n).is_none()
+        })
+        .count()
+}
 
 /// A change to apply: the table's new schema, and the changes the sink must evolve.
 #[derive(Debug)]
@@ -18,6 +36,8 @@ pub(crate) struct Planned {
 }
 
 pub(crate) struct Evolver<'a> {
+    /// The pipeline's name, as the evolve's span names it.
+    pub pipeline: &'a str,
     pub source: &'a dyn SourceConnector,
     pub sink: &'a dyn Sink,
     pub guard: &'a dyn CommitGuard,
@@ -72,8 +92,33 @@ impl Evolver<'_> {
     }
 
     /// The sink's evolve of the Safe changes, retried while it fails transiently. `Ok(Some)` is a
-    /// degraded apply's warning; `Ok(Err)` halts the table.
+    /// degraded apply's warning; `Ok(Err)` halts the table. A trace of its own, which records how
+    /// it ended.
     pub async fn evolve(
+        &self,
+        table: &TableRef,
+        safe: Vec<SchemaChange>,
+    ) -> Result<Result<Option<String>, HaltReason>, WorkerError> {
+        let span = tracing::info_span!(
+            parent: None,
+            "schema.apply",
+            pipeline = %self.pipeline,
+            table = %table,
+            changes = safe.len(),
+            outcome = Empty,
+        );
+        let applied = self.apply(table, safe).instrument(span.clone()).await;
+        let outcome = match &applied {
+            Ok(Ok(None)) => "applied",
+            Ok(Ok(Some(_))) => "degraded",
+            Ok(Err(_)) => "halted",
+            Err(_) => "failed",
+        };
+        span.record("outcome", outcome);
+        applied
+    }
+
+    async fn apply(
         &self,
         table: &TableRef,
         safe: Vec<SchemaChange>,

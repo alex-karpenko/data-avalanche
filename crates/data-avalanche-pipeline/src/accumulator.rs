@@ -95,6 +95,14 @@ impl Accumulator {
         self.tables.values().map(TableBuffer::open_bytes).sum()
     }
 
+    /// Bytes buffered and not flushed yet: the committed transactions' and the open one's.
+    pub fn buffered_bytes(&self) -> usize {
+        self.tables
+            .values()
+            .map(|b| b.committed_bytes() + b.open_bytes())
+            .sum()
+    }
+
     pub fn checkpoint(&self) -> &SourcePosition {
         &self.checkpoint
     }

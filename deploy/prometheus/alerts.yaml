@@ -1,0 +1,49 @@
+# Example Prometheus alert rules for data-avalanche (roadmap M10): a starting point, to be tuned
+# to each deployment's thresholds. Every series is in the mandatory catalogue (System-Overview
+# §Observability catalogue); alerts.test.yaml exercises each rule:
+#   promtool test rules deploy/prometheus/alerts.test.yaml
+groups:
+  - name: data-avalanche
+    rules:
+      # The oldest change read but not yet durable in the sink (D-M10.3).
+      - alert: DataAvalancheReplicationLag
+        expr: data_avalanche_replication_lag_seconds > 60
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.pipeline }} is {{ $value | humanizeDuration }} behind its source"
+
+      # A renewal failed and the lease runs on its safety deadline (Clustering §6).
+      - alert: DataAvalancheLeaseDegraded
+        expr: data_avalanche_lease_state{state="degraded"} == 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.pipeline }}'s lease isn't renewed"
+
+      # A table stopped by an unsupported schema change or an unknown type; the pipeline goes on
+      # without it (Data-Flow §halt).
+      - alert: DataAvalancheTablesHalted
+        expr: data_avalanche_halted_tables > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.pipeline }} has {{ $value }} halted tables"
+
+      - alert: DataAvalanchePipelineError
+        expr: data_avalanche_pipeline_status{status="error"} == 1
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.pipeline }} is in ERROR"
+
+      # The WAL a PostgreSQL slot retains for the pipeline: it fills the server's disk.
+      - alert: DataAvalancheWalLag
+        expr: data_avalanche_wal_lag_bytes > 10 * 1024 * 1024 * 1024
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.pipeline }}'s slot retains {{ $value | humanize1024 }}B of WAL"

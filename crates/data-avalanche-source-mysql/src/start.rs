@@ -11,6 +11,7 @@
 //! server's files means nothing in another's.
 
 use std::sync::atomic::Ordering;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use data_avalanche_config::BinlogPurgeAction;
 use data_avalanche_core::{
@@ -21,6 +22,75 @@ use mysql_async::prelude::Queryable;
 
 use crate::connector::MySqlConnector;
 use crate::position::{Mode, purged};
+
+/// Where the binlog stream has read to, for the heartbeat's lag
+/// (`data_avalanche_binlog_lag_seconds`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReadAt {
+    /// Where the stream opened, then each transaction's end.
+    pub position: SourcePosition,
+    /// The last transaction's commit time (microseconds since the Unix epoch); `None` before the
+    /// stream read one.
+    pub commit_micros: Option<i64>,
+    /// A heartbeat came after it: the dump had nothing more to send. A commit clears it.
+    pub caught_up: Option<CaughtUp>,
+}
+
+/// The stream caught up with the server at a heartbeat. The server's write position isn't known
+/// then, so the first check after it takes the position as the baseline: a write the server makes
+/// between the heartbeat and that check becomes the baseline, and a stall then shows only from
+/// the server's next write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CaughtUp {
+    /// The heartbeat's wall time (microseconds since the Unix epoch).
+    pub at_micros: i64,
+    /// The server's write position at the first check after the heartbeat.
+    pub head: Option<SourcePosition>,
+}
+
+/// How far the stream that read to `read` is behind the server's write position `head` at
+/// `now_micros`, and the baseline to record for a stream that just caught up (even one at `head`:
+/// the baseline is where the server stood then). Zero when the stream's position covers `head`, or
+/// it caught up at a heartbeat and `head` hasn't moved past the baseline since; once `head` moved past it, the time since the heartbeat; else the age of
+/// the last transaction it read. Never negative. `None` when `head` is unknown, or the stream is
+/// behind without having read a transaction.
+pub(crate) fn behind(
+    read: &ReadAt,
+    head: Option<&SourcePosition>,
+    now_micros: i64,
+) -> (Option<Duration>, Option<SourcePosition>) {
+    let Some(head) = head else {
+        return (None, None);
+    };
+    let since = |micros: i64| {
+        let age = now_micros.saturating_sub(micros);
+        Some(Duration::from_micros(u64::try_from(age).unwrap_or(0)))
+    };
+    let covered = read.position.covers(head).unwrap_or(false);
+    match &read.caught_up {
+        Some(CaughtUp { head: None, .. }) => (Some(Duration::ZERO), Some(head.clone())),
+        _ if covered => (Some(Duration::ZERO), None),
+        Some(CaughtUp {
+            at_micros,
+            head: Some(baseline),
+        }) => (
+            if baseline == head {
+                Some(Duration::ZERO)
+            } else {
+                since(*at_micros)
+            },
+            None,
+        ),
+        None => (read.commit_micros.and_then(since), None),
+    }
+}
+
+pub(crate) fn now_micros() -> i64 {
+    let since = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    i64::try_from(since.as_micros()).unwrap_or(i64::MAX)
+}
 
 /// Why `checkpoint` can't be read in `mode`, if it can't.
 pub fn dialect_change(mode: Mode, checkpoint: &SourcePosition) -> Option<String> {
@@ -137,8 +207,9 @@ impl MySqlConnector {
     }
 
     /// The heartbeat's watch on the dump (DA-SRC-16, V-121): whether the server still runs the
-    /// stream's binlog dump, found by its connection id. The server keeps no log for the pipeline
-    /// (its binlogs expire by its own policy), so `bytes` is 0.
+    /// stream's binlog dump, found by its connection id, and how far the stream reads behind the
+    /// server's write position ([`behind`]). The server keeps no log for the pipeline (its
+    /// binlogs expire by its own policy), so `bytes` is `None`.
     pub async fn retained(&self) -> Result<Option<RetainedLog>, SourceError> {
         let id = self.shared.dump.load(Ordering::Relaxed);
         let streamed = match id {
@@ -160,7 +231,22 @@ impl MySqlConnector {
                     .await?
             }
         };
-        Ok(Some(RetainedLog { bytes: 0, streamed }))
+        let behind = match self.shared.read() {
+            None => None,
+            Some(read) => {
+                let head = self.position_now().await.ok();
+                let (lag, baseline) = behind(&read, head.as_ref(), now_micros());
+                if let (Some(baseline), Some(c)) = (baseline, &read.caught_up) {
+                    self.shared.caught_up_head(c.at_micros, &baseline);
+                }
+                lag
+            }
+        };
+        Ok(Some(RetainedLog {
+            bytes: None,
+            streamed,
+            behind,
+        }))
     }
 }
 
@@ -172,6 +258,104 @@ mod tests {
 
     fn file() -> SourcePosition {
         SourcePosition::BinlogFile(BinlogFilePos::new("binlog.000003", 154).unwrap())
+    }
+
+    fn at(pos: u64, commit_micros: Option<i64>, caught_up: Option<CaughtUp>) -> ReadAt {
+        ReadAt {
+            position: SourcePosition::BinlogFile(BinlogFilePos::new("binlog.000003", pos).unwrap()),
+            commit_micros,
+            caught_up,
+        }
+    }
+
+    fn head(pos: u64) -> SourcePosition {
+        SourcePosition::BinlogFile(BinlogFilePos::new("binlog.000003", pos).unwrap())
+    }
+
+    fn heartbeat(at_micros: i64, baseline: Option<u64>) -> Option<CaughtUp> {
+        Some(CaughtUp {
+            at_micros,
+            head: baseline.map(head),
+        })
+    }
+
+    /// At the server's write position the stream is 0 behind; short of it, the last transaction
+    /// it read is as old as the lag. Behind with nothing read, or without the server's position,
+    /// the lag is unknown.
+    #[test]
+    fn the_binlog_lag_is_zero_at_the_head_else_the_last_transaction_s_age() {
+        let h = head(900);
+        let now = 10_000_000;
+        let lag = |r: ReadAt, h: Option<&SourcePosition>| behind(&r, h, now).0;
+        assert_eq!(
+            lag(at(900, Some(1_000_000), None), Some(&h)),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            lag(at(500, Some(1_000_000), None), Some(&h)),
+            Some(Duration::from_secs(9))
+        );
+        assert_eq!(lag(at(500, None, None), Some(&h)), None);
+        assert_eq!(lag(at(500, Some(1_000_000), None), None), None);
+        assert_eq!(
+            lag(at(500, Some(now + 5), None), Some(&h)),
+            Some(Duration::ZERO),
+            "a clock behind the server's reads no lag"
+        );
+    }
+
+    /// A stream that caught up at a heartbeat is 0 behind while the server writes nothing more;
+    /// once it writes past what the first check saw, the lag counts from the heartbeat.
+    #[test]
+    fn a_caught_up_stream_lags_from_its_heartbeat_once_the_server_writes_on() {
+        let now = 10_000_000;
+        let (lag, baseline) = behind(
+            &at(500, None, heartbeat(4_000_000, None)),
+            Some(&head(900)),
+            now,
+        );
+        assert_eq!(lag, Some(Duration::ZERO));
+        assert_eq!(
+            baseline,
+            Some(head(900)),
+            "the first check's head is recorded"
+        );
+        let (lag, baseline) = behind(
+            &at(500, None, heartbeat(4_000_000, Some(900))),
+            Some(&head(900)),
+            now,
+        );
+        assert_eq!((lag, baseline), (Some(Duration::ZERO), None));
+        let (lag, baseline) = behind(
+            &at(500, Some(1_000_000), heartbeat(4_000_000, Some(900))),
+            Some(&head(950)),
+            now,
+        );
+        assert_eq!((lag, baseline), (Some(Duration::from_secs(6)), None));
+        let (lag, _) = behind(
+            &at(500, None, heartbeat(now + 5, Some(900))),
+            Some(&head(950)),
+            now,
+        );
+        assert_eq!(lag, Some(Duration::ZERO), "a skewed clock reads no lag");
+        let (lag, _) = behind(&at(500, None, heartbeat(4_000_000, None)), None, now);
+        assert_eq!(lag, None, "no head, no lag");
+        let (lag, _) = behind(
+            &at(950, None, heartbeat(4_000_000, Some(900))),
+            Some(&head(950)),
+            now,
+        );
+        assert_eq!(lag, Some(Duration::ZERO), "the stream covers the head");
+        let (lag, baseline) = behind(
+            &at(900, None, heartbeat(4_000_000, None)),
+            Some(&head(900)),
+            now,
+        );
+        assert_eq!(
+            (lag, baseline),
+            (Some(Duration::ZERO), Some(head(900))),
+            "at the head, the baseline is recorded all the same"
+        );
     }
 
     #[test]

@@ -25,8 +25,169 @@ use crate::settings::Settings;
 use crate::status::Streak;
 use crate::{
     Accumulator, Backoff, Command, CommitGuard, FlushPolicy, HookAction, HookPoint, Hooks, Lineage,
-    NoHooks, Tuning, Unguarded, WorkerStatus,
+    NoHooks, NoObserver, Observer, RowsRead, Tuning, Unguarded, WorkerStatus,
 };
+
+/// A span a test saw: its name, its parent's, and its fields as last recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SeenSpan {
+    pub name: &'static str,
+    pub parent: Option<&'static str>,
+    pub fields: BTreeMap<String, String>,
+}
+
+impl SeenSpan {
+    pub fn field(&self, name: &str) -> Option<&str> {
+        self.fields.get(name).map(String::as_str)
+    }
+}
+
+/// The spans a test's thread made while [`Spans::install`]'s guard lived, in order.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Spans(Arc<Mutex<Vec<(tracing::span::Id, SeenSpan)>>>);
+
+thread_local! {
+    /// The [`Spans`] this thread's spans go to, while a test records them.
+    static RECORDING: std::cell::RefCell<Option<Spans>> = const { std::cell::RefCell::new(None) };
+}
+
+/// [`Spans::install`]'s guard: once it drops, the thread's spans go nowhere.
+pub(crate) struct Recording;
+
+impl Drop for Recording {
+    fn drop(&mut self) {
+        RECORDING.with(|r| r.borrow_mut().take());
+    }
+}
+
+impl Spans {
+    /// Records this thread's spans until the guard drops, through the process's subscriber: one
+    /// [`Recorder`] for the test binary, installed at the first call. A subscriber of the test's
+    /// own would race tracing's callsite cache, which is the process's: a span first met on
+    /// another test's thread, with no subscriber, can be cached as wanted by nobody, and is then
+    /// never seen (one run in two of the crate's tests, measured).
+    pub fn install(&self) -> Recording {
+        static GLOBAL: std::sync::Once = std::sync::Once::new();
+        GLOBAL.call_once(|| {
+            use tracing_subscriber::layer::SubscriberExt;
+            tracing::subscriber::set_global_default(tracing_subscriber::registry().with(Recorder))
+                .expect("the crate's tests install no other global subscriber");
+        });
+        RECORDING.with(|r| *r.borrow_mut() = Some(self.clone()));
+        Recording
+    }
+
+    pub fn named(&self, name: &str) -> Vec<SeenSpan> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, s)| s.name == name)
+            .map(|(_, s)| s.clone())
+            .collect()
+    }
+}
+
+struct Fields<'a>(&'a mut BTreeMap<String, String>);
+
+impl tracing::field::Visit for Fields<'_> {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.insert(field.name().to_owned(), value.to_owned());
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.insert(field.name().to_owned(), format!("{value:?}"));
+    }
+}
+
+/// The test binary's layer: each span goes to its thread's [`Spans`], if a test records them.
+struct Recorder;
+
+impl<S> tracing_subscriber::Layer<S> for Recorder
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let parent = ctx.span(id).and_then(|s| s.parent()).map(|p| p.name());
+        let mut fields = BTreeMap::new();
+        attrs.record(&mut Fields(&mut fields));
+        let seen = SeenSpan {
+            name: attrs.metadata().name(),
+            parent,
+            fields,
+        };
+        RECORDING.with(|r| {
+            if let Some(spans) = &*r.borrow() {
+                spans.0.lock().unwrap().push((id.clone(), seen));
+            }
+        });
+    }
+
+    fn on_record(
+        &self,
+        id: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        _: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        RECORDING.with(|r| {
+            let Some(spans) = &*r.borrow() else {
+                return;
+            };
+            let mut spans = spans.0.lock().unwrap();
+            if let Some((_, s)) = spans.iter_mut().rev().find(|(i, _)| i == id) {
+                values.record(&mut Fields(&mut s.fields));
+            }
+        });
+    }
+}
+
+/// What an [`Ears`] observer heard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Heard {
+    Flushed { rows: u64 },
+    Committed { rows: u64 },
+    CommitFailed,
+    ChunkRead,
+}
+
+/// An observer that keeps what it hears, in order.
+#[derive(Debug, Default)]
+pub(crate) struct Ears(Mutex<Vec<Heard>>, Mutex<Vec<Duration>>);
+
+impl Ears {
+    pub fn heard(&self) -> Vec<Heard> {
+        self.0.lock().unwrap().clone()
+    }
+
+    /// The time each `committed` reported, in order.
+    pub fn commit_times(&self) -> Vec<Duration> {
+        self.1.lock().unwrap().clone()
+    }
+}
+
+impl Observer for Ears {
+    fn flushed(&self, rows: u64, _: Duration) {
+        self.0.lock().unwrap().push(Heard::Flushed { rows });
+    }
+
+    fn committed(&self, rows: u64, took: Duration) {
+        self.1.lock().unwrap().push(took);
+        self.0.lock().unwrap().push(Heard::Committed { rows });
+    }
+
+    fn commit_failed(&self) {
+        self.0.lock().unwrap().push(Heard::CommitFailed);
+    }
+
+    fn chunk_read(&self, _: Duration) {
+        self.0.lock().unwrap().push(Heard::ChunkRead);
+    }
+}
 
 /// A PostgreSQL → Delta pipeline `p` reading `public.*`, with more `tables` keys (YAML lines
 /// indented six spaces), more `sink` and `postgres` keys (YAML flow entries).
@@ -428,6 +589,7 @@ impl World {
             owner_epoch: 1,
             guard: Arc::new(Unguarded),
             hooks: Arc::new(NoHooks),
+            observer: Arc::new(NoObserver),
             tuning: fast(),
             control: control_rx,
             status,
@@ -445,6 +607,7 @@ impl World {
             read_failing: BTreeMap::new(),
             server: None,
             pause: false,
+            rows_read: RowsRead::default(),
         };
         (core, control, status_rx)
     }

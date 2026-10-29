@@ -15,6 +15,7 @@ mod decide;
 pub mod error;
 pub mod hooks;
 mod jobs;
+pub mod observe;
 pub mod policy;
 mod reconcile;
 mod schema_change;
@@ -33,6 +34,9 @@ pub use batch::{Lineage, MAX_BATCH_BYTES};
 pub use buffer::{CollapsedRow, RowKind, TableBuffer};
 pub use error::{AccumulatorError, Recovery, WorkerError};
 pub use hooks::{CommitGuard, HookAction, HookPoint, Hooks, NoHooks, Unguarded};
+pub use observe::{NoObserver, Observer};
 pub use policy::{FlushPolicy, FlushReason, TxnLimits};
-pub use status::{Command, Exit, Phase, ReconcileLog, SnapshotProgress, Tuning, WorkerStatus};
+pub use status::{
+    Command, Exit, Phase, ReconcileLog, RowsRead, SnapshotProgress, Tuning, WorkerStatus,
+};
 pub use worker::{PipelineWorker, WorkerDeps, WorkerHandle};

@@ -82,6 +82,12 @@ services:
     # object_store's emulator mode targets 127.0.0.1:10000, so this port is not remapped.
     ports: ["10000:10000"]
 
+  # An OTLP/HTTP collector the E2E tracing scenario exports to (config §6.6), its traces read back
+  # through Jaeger's query API; in-memory storage.
+  jaeger:
+    image: "jaegertracing/jaeger:2.21.0"
+    ports: ["54318:4318", "56686:16686"]
+
   rustfs-init:
     image: "amazon/aws-cli:2.37.4"
     profiles: [init]

@@ -91,6 +91,12 @@ subtle = "2.6.1"
 # Its OpenAPI document (roadmap §4 M9), built from the route table with the builders. 6.0.0
 # doesn't build without `macros`: its schema module names a type only that feature defines.
 utoipa = { version = "=6.0.0", default-features = false, features = ["macros"] }
+# Traces (M10, Q-M10-1): OTLP over HTTP/protobuf with the workspace's reqwest and prost; the
+# batch exporter's thread exports with the blocking client.
+opentelemetry = { version = "=0.33.1", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "=0.33.1", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "=0.33.1", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
+tracing-opentelemetry = { version = "=0.34.0", default-features = false }
 # The cluster (M8a, roadmap §2.1): the ring's hash (the anchor's `hash_algo: xxh3`); the SWIM
 # core the gossip drives (Q-M8-1, probe `prototypes/cluster-capability`) and its random source;
 # the host's addresses, for an unset `advertise_addr`.

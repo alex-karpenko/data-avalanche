@@ -25,6 +25,8 @@ use data_avalanche_core::{
 };
 use data_avalanche_state::{SnapshotStatus, TableSnapshotDoc};
 use tokio::task::JoinSet;
+use tracing::Instrument;
+use tracing::field::Empty;
 
 use super::{End, Session, protocol};
 use crate::buffer::identity;
@@ -176,7 +178,13 @@ impl Snapshots {
     pub(super) fn progress(&self) -> impl Iterator<Item = (TableRef, SnapshotProgress)> + '_ {
         self.tables.iter().map(|(t, s)| {
             let rows_done = s.doc.cursor.as_ref().map_or(0, |c| c.rows_done);
-            (t.clone(), SnapshotProgress { rows_done })
+            (
+                t.clone(),
+                SnapshotProgress {
+                    rows_done,
+                    waiting: false,
+                },
+            )
         })
     }
 
@@ -339,6 +347,24 @@ impl Session<'_> {
             return;
         }
         let now = Instant::now();
+        // Each table's writers in flight at the session's start, by xid.
+        let writers: BTreeMap<TableRef, Vec<String>> = self
+            .snaps
+            .tables
+            .keys()
+            .filter_map(|table| {
+                let id = self.read_schema(table)?.source_id()?;
+                let xids: Vec<String> = self
+                    .snaps
+                    .in_flight
+                    .iter()
+                    .filter(|(_, tables)| tables.contains(&id))
+                    .map(|(xid, _)| xid.to_string())
+                    .collect();
+                (!xids.is_empty()).then(|| (table.clone(), xids))
+            })
+            .collect();
+        self.report_waiting(&writers);
         let mut reading = self.snaps.tables.values().filter(|s| s.reading).count();
         let mut wait_for_writers = false;
         for (table, snap) in &mut self.snaps.tables {
@@ -361,15 +387,7 @@ impl Session<'_> {
             else {
                 continue;
             };
-            let writers: Vec<String> = schema.source_id().map_or_else(Vec::new, |id| {
-                self.snaps
-                    .in_flight
-                    .iter()
-                    .filter(|(_, tables)| tables.contains(&id))
-                    .map(|(xid, _)| xid.to_string())
-                    .collect()
-            });
-            if !writers.is_empty() {
+            if let Some(writers) = writers.get(table) {
                 wait_for_writers = true;
                 if self.core.writers_waited.insert(table.clone()) {
                     let warning = format!(
@@ -383,12 +401,26 @@ impl Session<'_> {
             self.core.writers_waited.remove(table);
             let ticket = self.snaps.reconciler.issue();
             let source = Arc::clone(&self.core.source);
+            let observer = Arc::clone(&self.core.observer);
             let after = snap.cursor.clone();
             let limit = self.core.settings.chunk_size;
             let table = table.clone();
-            self.snaps.reads.spawn(async move {
+            // A trace per chunk read.
+            let span = tracing::info_span!(
+                parent: None,
+                "snapshot.chunk",
+                pipeline = %self.core.settings.lineage.pipeline,
+                table = %table,
+                rows = Empty,
+            );
+            let read = async move {
                 let read_at_micros = micros_now();
+                let started = Instant::now();
                 let result = source.read_chunk(&schema, after.as_ref(), limit).await;
+                if let Ok(chunk) = &result {
+                    observer.chunk_read(started.elapsed());
+                    tracing::Span::current().record("rows", chunk.rows.len());
+                }
                 Read {
                     table,
                     ticket,
@@ -396,7 +428,8 @@ impl Session<'_> {
                     result,
                     read_at_micros,
                 }
-            });
+            };
+            self.snaps.reads.spawn(read.instrument(span));
             snap.reading = true;
             reading += 1;
         }
@@ -404,6 +437,21 @@ impl Session<'_> {
             let delay = self.core.tuning.in_flight_backoff.delay(0);
             self.snaps.recheck = Some((now + delay, 1));
         }
+    }
+
+    /// Marks the running snapshots that wait in the status: a held table, and one with `writers`
+    /// in flight. Changes the status only when a mark changes.
+    fn report_waiting(&self, writers: &BTreeMap<TableRef, Vec<String>>) {
+        let held = &self.snaps.held;
+        self.core.status.send_if_modified(|st| {
+            let mut changed = false;
+            for (table, p) in &mut st.snapshots {
+                let waiting = held.contains(table) || writers.contains_key(table);
+                changed |= p.waiting != waiting;
+                p.waiting = waiting;
+            }
+            changed
+        });
     }
 
     /// A chunk read finished: it is emitted at the next boundary.
@@ -501,6 +549,7 @@ impl Session<'_> {
             keyed.push((key, row));
         }
         let read = chunk.rows.len() as u64;
+        self.core.rows_read.count(Op::Snapshot, read);
         let kept =
             self.snaps
                 .reconciler
@@ -533,8 +582,7 @@ impl Session<'_> {
         }
         self.snaps.docs.insert(table.clone(), snap.doc.clone());
         self.core.update(|st| {
-            st.snapshots
-                .insert(table.clone(), SnapshotProgress { rows_done });
+            st.snapshots.entry(table.clone()).or_default().rows_done = rows_done;
         });
         if kept.is_empty() {
             self.flush()?;
@@ -671,7 +719,7 @@ mod tests {
 
     use super::*;
     use crate::session::Core;
-    use crate::test_support::{World, Yaml, row, t, wait_until};
+    use crate::test_support::{Ears, Heard, Spans, World, Yaml, row, t, wait_until};
     use crate::{Backoff, Command, Exit, Hooks, Phase, ReconcileLog, WorkerStatus};
 
     fn chunks_of(n: u64) -> Pipeline {
@@ -803,6 +851,38 @@ mod tests {
         );
     }
 
+    /// Each chunk read is reported, the last, empty one included, and is a trace of its own.
+    #[tokio::test]
+    async fn each_chunk_read_is_reported() {
+        let spans = Spans::default();
+        let _subscriber = spans.install();
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.source.load(&t("a"), rows(1..=5));
+        w.request(&["a"]).await;
+        let (mut core, control, status) = w.core(&chunks_of(2), &["a"]);
+        let ears = Arc::new(Ears::default());
+        core.observer = ears.clone();
+        let (_, st) = run(core, control, status, async |status| {
+            snapshot_done(&w, &status, "a").await;
+        })
+        .await;
+        let chunks = ears
+            .heard()
+            .into_iter()
+            .filter(|h| *h == Heard::ChunkRead)
+            .count();
+        assert_eq!(chunks, 4, "two, two, one, then the empty chunk");
+        assert_eq!(st.rows_read.snapshot, 5);
+        let chunk_spans = spans.named("snapshot.chunk");
+        let reads: Vec<_> = chunk_spans
+            .iter()
+            .map(|s| (s.parent, s.field("table"), s.field("rows")))
+            .collect();
+        let read = |rows| (None, Some("public.a"), Some(rows));
+        assert_eq!(reads, [read("2"), read("2"), read("1"), read("0")]);
+    }
+
     #[tokio::test]
     async fn a_stream_change_the_chunk_didnt_see_wins() {
         let w = World::new(&["a"]);
@@ -896,7 +976,16 @@ mod tests {
             .await;
             rechecked(&w, before).await;
             assert_eq!(w.source.reads(&t("a")), 0, "the writer is still in flight");
+            assert!(status.borrow().snapshots[&t("a")].waiting, "it waits");
             w.source.release(xid);
+            wait_until("it reads", || {
+                status
+                    .borrow()
+                    .snapshots
+                    .get(&t("a"))
+                    .is_none_or(|p| !p.waiting)
+            })
+            .await;
             snapshot_done(&w, &status, "a").await;
         })
         .await;
@@ -1710,8 +1799,13 @@ mod tests {
             status.borrow().snapshots
         );
         core.update(|st| {
-            st.snapshots
-                .insert(t("gone"), SnapshotProgress { rows_done: 7 });
+            st.snapshots.insert(
+                t("gone"),
+                SnapshotProgress {
+                    rows_done: 7,
+                    ..SnapshotProgress::default()
+                },
+            );
         });
         let _next = Session::open(&mut core).await.unwrap().unwrap();
         assert!(

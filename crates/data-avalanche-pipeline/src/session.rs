@@ -16,8 +16,8 @@ use std::time::Instant;
 use data_avalanche_config::Pipeline;
 use data_avalanche_core::{
     CdcEvent, ChangeStream, ColumnValue, HaltReason, Op, RescanReport, RetainedLog, Row,
-    SchemaHint, ServerIdentity, Sink, SourceConnector, SourceError, SourcePosition, SourceSeq,
-    StreamItem, TableRef, TableSchema, TransactionBoundary, identifier_values,
+    SchemaHint, ServerIdentity, Sink, SinkTableState, SourceConnector, SourceError, SourcePosition,
+    SourceSeq, StreamItem, TableRef, TableSchema, TransactionBoundary, identifier_values,
 };
 use data_avalanche_state::{PipelineDocs, TableHalt};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -25,14 +25,14 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::{JoinError, JoinHandle, JoinSet};
 
 use self::snapshot::Snapshots;
-use crate::schema_change::{Evolver, Planned};
+use crate::schema_change::{Evolver, Planned, soft_dropped};
 use crate::settings::Settings;
 use crate::status::Streak;
 use crate::watchdog::Watchdog;
 use crate::writer::{self, Job, WriterCtx, WriterEvent};
 use crate::{
-    Accumulator, AccumulatorError, Command, CommitGuard, Exit, FlushReason, Hooks, Phase, Tuning,
-    WorkerError, WorkerStatus,
+    Accumulator, AccumulatorError, Command, CommitGuard, Exit, FlushReason, Hooks, Observer, Phase,
+    RowsRead, Tuning, WorkerError, WorkerStatus,
 };
 
 /// What every session of one worker shares.
@@ -44,6 +44,7 @@ pub(crate) struct Core {
     pub owner_epoch: u64,
     pub guard: Arc<dyn CommitGuard>,
     pub hooks: Arc<dyn Hooks>,
+    pub observer: Arc<dyn Observer>,
     pub tuning: Tuning,
     pub control: mpsc::Receiver<Command>,
     pub status: watch::Sender<WorkerStatus>,
@@ -90,6 +91,8 @@ pub(crate) struct Core {
     /// and reads nothing more until [`Command::Resume`]. It outlives a session, so a reconnect
     /// while paused stays paused.
     pub pause: bool,
+    /// [`WorkerStatus::rows_read`], counted by every session of the worker.
+    pub rows_read: RowsRead,
 }
 
 impl Core {
@@ -113,8 +116,23 @@ impl Core {
         self.source.reconfigure(p);
     }
 
+    /// The sink's soft-dropped columns of `now`'s table into the status, after an evolve; a
+    /// failed read leaves the count as it was.
+    pub async fn count_soft_dropped(&self, now: &TableSchema) {
+        if let Ok(SinkTableState {
+            schema: Some(sink), ..
+        }) = self.sink.table_state(now.table()).await
+        {
+            let n = soft_dropped(&sink, now);
+            self.update(|st| {
+                st.soft_dropped.insert(now.table().clone(), n);
+            });
+        }
+    }
+
     pub fn evolver(&self) -> Evolver<'_> {
         Evolver {
+            pipeline: &self.settings.lineage.pipeline,
             source: &*self.source,
             sink: &*self.sink,
             guard: &*self.guard,
@@ -216,6 +234,13 @@ pub(crate) struct Session<'c> {
     watchdog: Watchdog,
     /// A reload changed the heartbeat or the rescan interval: the loop re-arms its timers.
     retimed: bool,
+    /// The open transaction's commit time (microseconds since the Unix epoch).
+    open_since: Option<i64>,
+    /// The commit time of the oldest transaction read since the last flush handed on.
+    unflushed_since: Option<i64>,
+    /// The jobs handed on and not durable yet, each with the commit time of its oldest
+    /// transaction, in job order.
+    unsynced: VecDeque<(u64, i64)>,
 }
 
 impl<'c> Session<'c> {
@@ -310,6 +335,7 @@ impl<'c> Session<'c> {
             owner_epoch: core.owner_epoch,
             guard: core.guard.clone(),
             hooks: core.hooks.clone(),
+            observer: core.observer.clone(),
             backoff: core.tuning.sink_backoff,
         };
         let writer = tokio::spawn(writer::run(ctx, jobs_rx, events_tx));
@@ -351,6 +377,9 @@ impl<'c> Session<'c> {
             retained_read: JoinSet::new(),
             watchdog: Watchdog::default(),
             retimed: false,
+            open_since: None,
+            unflushed_since: None,
+            unsynced: VecDeque::new(),
         }))
     }
 
@@ -578,6 +607,13 @@ impl<'c> Session<'c> {
             Some(WriterEvent::Durable(cp)) => {
                 self.durable += 1;
                 debug_assert!(self.durable <= self.handed, "one Durable per job");
+                while self
+                    .unsynced
+                    .front()
+                    .is_some_and(|(job, _)| *job <= self.durable)
+                {
+                    self.unsynced.pop_front();
+                }
                 for (table, dump) in self.snaps.durable(self.durable) {
                     self.core.update(|st| {
                         st.snapshots.remove(&table);
@@ -593,6 +629,7 @@ impl<'c> Session<'c> {
                     return Ok(Some(End::Source(e)));
                 }
                 self.core.update(|st| st.checkpoint = Some(cp));
+                self.report_progress();
                 Ok(None)
             }
         }
@@ -601,7 +638,12 @@ impl<'c> Session<'c> {
     async fn item(&mut self, item: StreamItem) -> Result<Option<End>, WorkerError> {
         let now = Instant::now();
         match item {
-            StreamItem::Begin { xid, .. } => {
+            StreamItem::Begin {
+                xid,
+                commit_ts_micros,
+            } => {
+                self.open_since = Some(commit_ts_micros);
+                self.unflushed_since.get_or_insert(commit_ts_micros);
                 self.acc.begin(xid)?;
                 self.snaps.begin();
                 self.requery.clear();
@@ -612,6 +654,7 @@ impl<'c> Session<'c> {
                     self.note_unchanged(&e);
                 }
                 self.last_seq = Some(e.change_seq);
+                self.core.rows_read.count(e.op, 1);
                 if let Some(schema) = self.schemas.get(&e.table) {
                     self.snaps.touch(schema, &e);
                 }
@@ -641,6 +684,7 @@ impl<'c> Session<'c> {
                     return Ok(Some(end));
                 }
                 self.acc.commit(&b, now)?;
+                self.open_since = None;
                 self.snaps.applied(b.xid);
                 let at = b.commit_pos;
                 self.pending_schemas
@@ -977,6 +1021,7 @@ impl<'c> Session<'c> {
             self.retained_read
                 .spawn(async move { source.retained().await });
         }
+        self.report_progress();
         let why = self.watchdog.beat(self.reads_stream())?;
         Some(End::Source(SourceError::Transient(why)))
     }
@@ -1033,8 +1078,12 @@ impl<'c> Session<'c> {
                 .is_some_and(|r| !r.streamed)
                 .then(|| unread.to_owned()),
         );
-        let retained = retained.map(|r| r.bytes);
-        self.core.update(|st| st.retained_bytes = retained);
+        let behind = retained.and_then(|r| r.behind);
+        let retained = retained.and_then(|r| r.bytes);
+        self.core.update(|st| {
+            st.retained_bytes = retained;
+            st.source_behind = behind;
+        });
         match (retained, self.core.settings.max_wal_lag_bytes) {
             (Some(lag), Some(limit)) if lag > limit => Err(WorkerError::WalLag { lag, limit }),
             _ => Ok(()),
@@ -1051,9 +1100,38 @@ impl<'c> Session<'c> {
         self.core.dump_only && self.schemas.is_empty() && self.snaps.is_empty()
     }
 
+    /// The stream's frontier into the status, in one change with the lag's start: an owner that
+    /// sees the frontier move sees what is pending up to it (the controller's kept lag, I2).
     fn read(&self) {
-        let frontier = self.acc.frontier().clone();
-        self.core.update(|st| st.read = Some(frontier));
+        self.progress(Some(self.acc.frontier().clone()));
+    }
+
+    /// The lag's start, the rows read and the buffered bytes into the status, when they changed.
+    fn report_progress(&self) {
+        self.progress(None);
+    }
+
+    /// [`Self::report_progress`], and with `read` the new frontier (always a change).
+    fn progress(&self, read: Option<SourcePosition>) {
+        let since = self.unsynced.front().map(|(_, ts)| *ts);
+        let since = match (since, self.unflushed_since) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let rows_read = self.core.rows_read;
+        let bytes = self.acc.buffered_bytes() as u64;
+        self.core.status.send_if_modified(|st| {
+            let changed = read.is_some()
+                || (st.unsynced_since_micros, st.rows_read, st.buffer_bytes)
+                    != (since, rows_read, bytes);
+            if read.is_some() {
+                st.read = read;
+            }
+            st.unsynced_since_micros = since;
+            st.rows_read = rows_read;
+            st.buffer_bytes = bytes;
+            changed
+        });
     }
 
     /// The reconciler log's size into the status, when it changed (I3).
@@ -1156,7 +1234,13 @@ impl<'c> Session<'c> {
             .min(Semaphore::MAX_PERMITS as u64);
         let need = u32::try_from((rows as u64).min(cap)).unwrap_or(u32::MAX);
         self.handed += 1;
+        if let Some(since) = self.unflushed_since.take() {
+            self.unsynced.push_back((self.handed, since));
+        }
+        // A slice of a large transaction leaves the rest of it to wait.
+        self.unflushed_since = self.open_since;
         let job = Job {
+            pipeline: self.core.settings.lineage.pipeline.clone(),
             change_sets,
             checkpoint: checkpoint.clone(),
             halts: std::mem::take(&mut self.halts),
@@ -1249,6 +1333,7 @@ impl<'c> Session<'c> {
                     return Ok(None);
                 }
             }
+            self.core.count_soft_dropped(&now).await;
         }
         let extra = self.core.settings.delete_extra(&now);
         loop {
@@ -1281,7 +1366,7 @@ mod tests {
     use data_avalanche_testkit::{FakeTxn, Method, SinkOp};
 
     use super::*;
-    use crate::test_support::{World, Yaml, pipeline, row, t, wait_until};
+    use crate::test_support::{Spans, World, Yaml, pipeline, row, schema, t, wait_until};
 
     /// Runs a session over `w` until `drive` returns, then drains it.
     async fn session<F: Future<Output = ()>>(
@@ -1350,6 +1435,145 @@ mod tests {
         assert_eq!(w.source.slot(), Some(end.clone()), "acknowledged");
         assert_eq!(checkpoint(&w).await, lsn_of(&end));
         assert_eq!((st.read, st.checkpoint), (Some(end.clone()), Some(end)));
+    }
+
+    /// The fake source's first commit time.
+    const FIRST_COMMIT: i64 = 1_700_000_000_000_000;
+
+    /// The lag starts at the oldest transaction read and not yet durable: it stays at the first
+    /// one while the policy holds the flush back, and clears once the flush is durable. The rows
+    /// read count by operation, and the buffer holds the unflushed changes' bytes until the
+    /// flush.
+    #[tokio::test]
+    async fn the_status_shows_the_oldest_unsynced_change_the_rows_read_and_the_buffer() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let held = pipeline("", "flush: { seconds: 600 }", "");
+        let (end, _) = session(&w, &held, &["a"], async |status| {
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+            w.source.commit(
+                FakeTxn::new()
+                    .update(&t("a"), row(1, "y"))
+                    .insert(&t("a"), row(2, "x")),
+            );
+            w.source.commit(
+                FakeTxn::new().delete(&t("a"), Row(vec![("id".into(), ColumnValue::Int64(2))])),
+            );
+            let end = w.source.wal_end();
+            wait_until("everything is read", || {
+                status.borrow().read.as_ref() == Some(&end)
+            })
+            .await;
+            let st = status.borrow().clone();
+            assert_eq!(st.unsynced_since_micros, Some(FIRST_COMMIT));
+            assert_eq!(
+                st.rows_read,
+                RowsRead {
+                    insert: 2,
+                    update: 1,
+                    delete: 1,
+                    snapshot: 0
+                }
+            );
+            assert!(st.buffer_bytes > 0, "{st:?}");
+        })
+        .await;
+        end.unwrap();
+    }
+
+    /// Once the flush is durable, nothing waits: no lag, no buffer.
+    #[tokio::test]
+    async fn a_durable_flush_clears_the_lag_and_the_buffer() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let (end, st) = session(&w, &flush_each(), &["a"], async |status| {
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+            durable(&status, w.source.wal_end()).await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!((st.unsynced_since_micros, st.buffer_bytes), (None, 0));
+        assert_eq!(st.rows_read.insert, 1);
+    }
+
+    /// A column the source drops stays in the sink: the evolve's soft-drop is counted.
+    #[tokio::test]
+    async fn a_dropped_column_is_counted_soft_dropped() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let (end, st) = session(&w, &flush_each(), &["a"], async |status| {
+            w.source.alter(&t("a"), with_note("a"));
+            w.source.commit(FakeTxn::new().insert(&t("a"), noted(1)));
+            durable(&status, w.source.wal_end()).await;
+            assert_eq!(status.borrow().soft_dropped.get(&t("a")), Some(&0));
+            w.source.alter(&t("a"), schema("a"));
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(2, "x")));
+            durable(&status, w.source.wal_end()).await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!(st.soft_dropped.get(&t("a")), Some(&1), "{st:?}");
+    }
+
+    /// A slice of a large transaction leaves the rest of it pending (D-M10.3): the slice is
+    /// durable, the transaction still open, and the lag still starts at its commit time.
+    #[tokio::test]
+    async fn a_slice_of_a_large_transaction_leaves_the_rest_pending() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let p = pipeline(
+            "",
+            "flush: { seconds: 0 }, max_transaction_batch_rows: 2",
+            "",
+        );
+        let (mut core, _control, status) = w.core(&p, &["a"]);
+        let mut s = Session::open(&mut core).await.unwrap().unwrap();
+        let mut txn = FakeTxn::new();
+        for id in 1..=4 {
+            txn = txn.insert(&t("a"), row(id, "x"));
+        }
+        w.source.commit(txn);
+        while s.handed == 0 {
+            let item = s.stream.next().await.unwrap();
+            assert!(s.item(item).await.unwrap().is_none());
+            s.due(Instant::now()).unwrap();
+        }
+        assert!(
+            s.acc.in_transaction(),
+            "the slice leaves the transaction open"
+        );
+        assert!(s.until_durable().await.unwrap().is_none());
+        assert_eq!((s.handed, s.durable), (1, 1));
+        assert!(s.acc.in_transaction());
+        assert_eq!(status.borrow().unsynced_since_micros, Some(FIRST_COMMIT));
+    }
+
+    /// With two jobs queued, the first one durable clears only its own lag: the lag starts at
+    /// the second job's oldest transaction (D-M10.3).
+    #[tokio::test]
+    async fn a_durable_job_leaves_the_next_job_s_lag() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let (mut core, _control, status) = w.core(&flush_each(), &["a"]);
+        let mut s = Session::open(&mut core).await.unwrap().unwrap();
+        w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+        let first = w.source.wal_end();
+        w.source.commit(FakeTxn::new().insert(&t("a"), row(2, "x")));
+        let second = w.source.wal_end();
+        pump(&mut s, &first).await;
+        s.flush().unwrap();
+        pump(&mut s, &second).await;
+        s.flush().unwrap();
+        assert_eq!((s.handed, s.durable), (2, 0));
+        // The writer's events wait in the channel: take the first job's `Durable` only.
+        let ev = s.events.recv().await;
+        assert!(s.writer_event(ev).await.unwrap().is_none());
+        assert_eq!(s.durable, 1);
+        assert_eq!(
+            status.borrow().unsynced_since_micros,
+            Some(FIRST_COMMIT + 1_000),
+            "the second transaction's commit time, a thousand microseconds on"
+        );
     }
 
     #[tokio::test]
@@ -1946,8 +2170,10 @@ mod tests {
         let s = Session::open(&mut core).await.unwrap().unwrap();
         let driver = async {
             w.source.set_retained(Some(1024));
+            w.source.set_behind(Some(Duration::from_secs(3)));
             wait_until("the lag is reported", || {
-                status.borrow().retained_bytes == Some(1024)
+                let st = status.borrow();
+                st.retained_bytes == Some(1024) && st.source_behind == Some(Duration::from_secs(3))
             })
             .await;
             w.source.set_retained(Some(65 << 20));
@@ -2386,6 +2612,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_added_column_is_evolved_where_the_stream_meets_it() {
+        let spans = Spans::default();
+        let _subscriber = spans.install();
         let w = World::new(&["a"]);
         w.started(&["a"]).await;
         let (end, _) = session(&w, &flush_each(), &["a"], async |status| {
@@ -2402,6 +2630,18 @@ mod tests {
         let cached = w.docs.table_schema(&t("a")).await.unwrap().unwrap().doc;
         assert!(cached.column("note").is_some(), "cached once durable");
         assert_eq!(cached.source_id(), w.source.schema(&t("a")).source_id());
+        let [apply] = &spans.named("schema.apply")[..] else {
+            panic!("one apply")
+        };
+        assert_eq!(apply.parent, None, "a trace of its own");
+        for (field, value) in [
+            ("pipeline", "p"),
+            ("table", "public.a"),
+            ("changes", "1"),
+            ("outcome", "applied"),
+        ] {
+            assert_eq!(apply.field(field), Some(value), "{field}");
+        }
     }
 
     /// The table's next evolve fails `Permanent`: an evolve would halt it `SINK_REJECTED`.

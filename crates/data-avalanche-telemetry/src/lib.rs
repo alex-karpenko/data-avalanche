@@ -1,14 +1,19 @@
 //! The process's metrics (System-Overview §Observability catalogue): one Prometheus registry, the
-//! node's gauges, and a handle per pipeline that sets that pipeline's series. M6b exports what the
-//! control plane and the worker know so far; M10 completes the catalogue.
+//! node's gauges, and a handle per pipeline that sets that pipeline's series.
 //!
 //! Every pipeline series carries `{pipeline, source_host, source_db}`; a `table` label is added
-//! only with `sink.metrics.per_table`, and only to `snapshot_rows_done`. Counter families get the
-//! OpenMetrics `_total` suffix on their samples (`data_avalanche_source_reconnects_total`).
+//! only with `sink.metrics.per_table`, and only to `snapshot_rows_done` and `snapshot_state`. The
+//! sink's commit series add `sink_type`. Counter families get the OpenMetrics `_total` suffix on
+//! their samples (`data_avalanche_source_reconnects_total`).
 
 use std::collections::BTreeSet;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
+
+mod traces;
+
+pub use traces::{Traces, TracesError, shown, trace_ids};
 
 use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;
@@ -21,6 +26,9 @@ use prometheus_client::registry::Registry;
 type Labels = Vec<(&'static str, String)>;
 
 type HistogramFamily = Family<Labels, Histogram, fn() -> Histogram>;
+
+/// A gauge of seconds.
+type Seconds = Gauge<f64, AtomicU64>;
 
 /// The OpenMetrics text content type `/metrics` answers with.
 pub const CONTENT_TYPE: &str = "application/openmetrics-text; version=1.0.0; charset=utf-8";
@@ -94,12 +102,57 @@ impl RenewFailure {
     }
 }
 
-/// The labels every series of a pipeline carries.
+/// `data_avalanche_rows_read_total{op}`: a change's operation, a snapshot's row included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowOp {
+    Insert,
+    Update,
+    Delete,
+    Snapshot,
+}
+
+impl RowOp {
+    const ALL: [Self; 4] = [Self::Insert, Self::Update, Self::Delete, Self::Snapshot];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Insert => "insert",
+            Self::Update => "update",
+            Self::Delete => "delete",
+            Self::Snapshot => "snapshot",
+        }
+    }
+}
+
+/// `data_avalanche_snapshot_state{state}`: where a running table snapshot is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotState {
+    /// It reads its chunks, or waits for its turn (`snapshot_parallelism`).
+    Running,
+    /// It reads nothing until something else ends: transactions in flight at the session's start
+    /// that write it, or a schema change a rescan found.
+    Waiting,
+}
+
+impl SnapshotState {
+    const ALL: [Self; 2] = [Self::Running, Self::Waiting];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Waiting => "waiting",
+        }
+    }
+}
+
+/// The labels every series of a pipeline carries, and the sink type its commit series add.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelineLabels {
     pub pipeline: String,
     pub source_host: String,
     pub source_db: String,
+    /// `sink.type` (`delta`): the `sink_type` label of the commit series.
+    pub sink_type: String,
 }
 
 impl PipelineLabels {
@@ -112,6 +165,30 @@ impl PipelineLabels {
         labels.extend(extra.iter().map(|(k, v)| (*k, (*v).to_owned())));
         labels
     }
+
+    fn sink(&self) -> Labels {
+        self.with(&[("sink_type", &self.sink_type)])
+    }
+}
+
+/// Rows read by operation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RowsRead {
+    pub insert: u64,
+    pub update: u64,
+    pub delete: u64,
+    pub snapshot: u64,
+}
+
+impl RowsRead {
+    fn get(&self, op: RowOp) -> u64 {
+        match op {
+            RowOp::Insert => self.insert,
+            RowOp::Update => self.update,
+            RowOp::Delete => self.delete,
+            RowOp::Snapshot => self.snapshot,
+        }
+    }
 }
 
 /// Monotonic totals a worker reports since it started. A new worker starts them at zero again;
@@ -121,6 +198,7 @@ pub struct Totals {
     pub source_reconnects: u64,
     pub sink_merge_files_rewritten: u64,
     pub sink_merge_rows_copied: u64,
+    pub rows_read: RowsRead,
 }
 
 #[derive(Debug)]
@@ -141,11 +219,33 @@ struct Families {
     reconcile_log_keys: Family<Labels, Gauge>,
     sink_merge_files_rewritten: Family<Labels, Counter>,
     sink_merge_rows_copied: Family<Labels, Counter>,
+    replication_lag: Family<Labels, Seconds>,
+    rows_read: Family<Labels, Counter>,
+    rows_written: Family<Labels, Counter>,
+    flush_duration: HistogramFamily,
+    flush_rows: HistogramFamily,
+    transaction_buffer_bytes: Family<Labels, Gauge>,
+    binlog_lag: Family<Labels, Seconds>,
+    snapshot_state: Family<Labels, Gauge>,
+    snapshot_chunk_duration: HistogramFamily,
+    sink_commit_duration: HistogramFamily,
+    sink_commit_failures: Family<Labels, Counter>,
+    sink_soft_dropped_columns: Family<Labels, Gauge>,
 }
 
 fn renew_latency() -> Histogram {
     // 5 ms … ~10 s.
     Histogram::new(exponential_buckets(0.005, 2.0, 12))
+}
+
+/// A flush, a commit, a chunk read: 5 ms … ~82 s.
+fn duration() -> Histogram {
+    Histogram::new(exponential_buckets(0.005, 2.0, 15))
+}
+
+/// A flush's rows: 1 … ~1 M.
+fn rows() -> Histogram {
+    Histogram::new(exponential_buckets(1.0, 4.0, 11))
 }
 
 /// The process's registry; cheap to clone.
@@ -180,6 +280,18 @@ impl Metrics {
             reconcile_log_keys: Family::default(),
             sink_merge_files_rewritten: Family::default(),
             sink_merge_rows_copied: Family::default(),
+            replication_lag: Family::default(),
+            rows_read: Family::default(),
+            rows_written: Family::default(),
+            flush_duration: Family::new_with_constructor(duration),
+            flush_rows: Family::new_with_constructor(rows),
+            transaction_buffer_bytes: Family::default(),
+            binlog_lag: Family::default(),
+            snapshot_state: Family::default(),
+            snapshot_chunk_duration: Family::new_with_constructor(duration),
+            sink_commit_duration: Family::new_with_constructor(duration),
+            sink_commit_failures: Family::default(),
+            sink_soft_dropped_columns: Family::default(),
         };
         let f = &families;
         let mut r = Registry::with_prefix("data_avalanche");
@@ -263,6 +375,62 @@ impl Metrics {
             "Rows a MERGE rewrote unchanged because they share a file with a changed row",
             f.sink_merge_rows_copied.clone(),
         );
+        r.register(
+            "replication_lag_seconds",
+            "Age of the oldest change read and not yet in the sink; 0 when none waits",
+            f.replication_lag.clone(),
+        );
+        r.register(
+            "rows_read",
+            "Rows read from the source: the stream's changes by operation, and snapshot rows",
+            f.rows_read.clone(),
+        );
+        r.register(
+            "rows_written",
+            "Rows the sink's commits wrote (upserts and deletes)",
+            f.rows_written.clone(),
+        );
+        r.register(
+            "flush_duration_seconds",
+            "How long a flush took, from when the writer took it up until it was durable",
+            f.flush_duration.clone(),
+        );
+        r.register("flush_rows", "Rows a flush carried", f.flush_rows.clone());
+        r.register(
+            "transaction_buffer_bytes",
+            "Bytes the accumulator buffers and hasn't handed to the writer yet",
+            f.transaction_buffer_bytes.clone(),
+        );
+        r.register(
+            "binlog_lag_seconds",
+            "How far the binlog stream reads behind the server's newest event; 0 once at it",
+            f.binlog_lag.clone(),
+        );
+        r.register(
+            "snapshot_state",
+            "Running table snapshots, by state",
+            f.snapshot_state.clone(),
+        );
+        r.register(
+            "snapshot_chunk_duration_seconds",
+            "How long a snapshot chunk's read took",
+            f.snapshot_chunk_duration.clone(),
+        );
+        r.register(
+            "sink_commit_duration_seconds",
+            "How long a table's commit to the sink took",
+            f.sink_commit_duration.clone(),
+        );
+        r.register(
+            "sink_commit_failures",
+            "Commits to the sink that failed: each retried attempt, and each refusal",
+            f.sink_commit_failures.clone(),
+        );
+        r.register(
+            "sink_soft_dropped_columns",
+            "Sink columns the source no longer has: kept, written NULL",
+            f.sink_soft_dropped_columns.clone(),
+        );
         Self {
             registry: Arc::new(r),
             families: Arc::new(families),
@@ -310,7 +478,10 @@ fn gauge(v: u64) -> i64 {
 #[derive(Debug, Default)]
 struct Seen {
     totals: Totals,
+    /// The tables `snapshot_rows_done` has a series of (with `per_table`).
     tables: BTreeSet<String>,
+    /// The tables `snapshot_state` has series of (with `per_table`).
+    state_tables: BTreeSet<String>,
 }
 
 /// One pipeline's series. The controller that owns the pipeline sets them; [`Self::remove`]
@@ -454,6 +625,111 @@ impl PipelineMetrics {
             .set(gauge(keys as u64));
     }
 
+    /// The age of the oldest change read and not yet durable in the sink (zero when none waits).
+    pub fn replication_lag(&self, lag: Duration) {
+        self.families
+            .replication_lag
+            .get_or_create(&self.base())
+            .set(lag.as_secs_f64());
+    }
+
+    pub fn transaction_buffer_bytes(&self, bytes: u64) {
+        self.families
+            .transaction_buffer_bytes
+            .get_or_create(&self.base())
+            .set(gauge(bytes));
+    }
+
+    /// `None` drops the series: the source isn't a binlog, or its read failed.
+    pub fn binlog_lag(&self, lag: Option<Duration>) {
+        match lag {
+            Some(l) => {
+                self.families
+                    .binlog_lag
+                    .get_or_create(&self.base())
+                    .set(l.as_secs_f64());
+            }
+            None => {
+                self.families.binlog_lag.remove(&self.base());
+            }
+        }
+    }
+
+    /// The running snapshots' states: with `per_table`, each table's series is 1 on its state; else
+    /// each state counts its tables. A table whose snapshot ended loses its series.
+    pub fn snapshot_state(&self, tables: &[(String, SnapshotState)]) {
+        let family = &self.families.snapshot_state;
+        if !self.per_table() {
+            for s in SnapshotState::ALL {
+                let n = tables.iter().filter(|(_, t)| *t == s).count();
+                family
+                    .get_or_create(&self.labels().with(&[("state", s.label())]))
+                    .set(gauge(n as u64));
+            }
+            return;
+        }
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        let now: BTreeSet<String> = tables.iter().map(|(t, _)| t.clone()).collect();
+        for gone in seen.state_tables.difference(&now) {
+            for s in SnapshotState::ALL {
+                family.remove(&self.labels().with(&[("table", gone), ("state", s.label())]));
+            }
+        }
+        for (table, state) in tables {
+            for s in SnapshotState::ALL {
+                family
+                    .get_or_create(
+                        &self
+                            .labels()
+                            .with(&[("table", table), ("state", s.label())]),
+                    )
+                    .set(i64::from(s == *state));
+            }
+        }
+        seen.state_tables = now;
+    }
+
+    pub fn soft_dropped_columns(&self, n: usize) {
+        self.families
+            .sink_soft_dropped_columns
+            .get_or_create(&self.base())
+            .set(gauge(n as u64));
+    }
+
+    /// A flush became durable: its rows, and how long it took.
+    pub fn flushed(&self, rows: u64, took: Duration) {
+        let f = &self.families;
+        let base = self.base();
+        f.flush_rows.get_or_create(&base).observe(rows as f64);
+        f.flush_duration
+            .get_or_create(&base)
+            .observe(took.as_secs_f64());
+    }
+
+    /// A table's commit landed: the rows it wrote, and how long it took.
+    pub fn committed(&self, rows: u64, took: Duration) {
+        let f = &self.families;
+        f.rows_written.get_or_create(&self.base()).inc_by(rows);
+        f.sink_commit_duration
+            .get_or_create(&self.labels().sink())
+            .observe(took.as_secs_f64());
+    }
+
+    /// A commit attempt failed: retried, or refused.
+    pub fn commit_failed(&self) {
+        self.families
+            .sink_commit_failures
+            .get_or_create(&self.labels().sink())
+            .inc();
+    }
+
+    pub fn chunk_read(&self, took: Duration) {
+        self.families
+            .snapshot_chunk_duration
+            .get_or_create(&self.base())
+            .observe(took.as_secs_f64());
+    }
+
     /// The running worker's totals. A total below the last one seen is a new worker's: it counts
     /// from zero.
     pub fn totals(&self, now: Totals) {
@@ -480,6 +756,13 @@ impl PipelineMetrics {
             now.sink_merge_rows_copied,
             last.sink_merge_rows_copied,
         );
+        for op in RowOp::ALL {
+            let (now, last) = (now.rows_read.get(op), last.rows_read.get(op));
+            let by = if now >= last { now - last } else { now };
+            f.rows_read
+                .get_or_create(&self.labels().with(&[("op", op.label())]))
+                .inc_by(by);
+        }
         seen.totals = now;
     }
 
@@ -505,27 +788,59 @@ impl PipelineMetrics {
             f.lease_state
                 .remove(&self.labels().with(&[("state", s.label())]));
         }
-        f.lease_renew_latency.remove(&base);
+        for family in [
+            &f.lease_renew_latency,
+            &f.flush_duration,
+            &f.flush_rows,
+            &f.snapshot_chunk_duration,
+        ] {
+            family.remove(&base);
+        }
+        f.sink_commit_duration.remove(&self.labels().sink());
         for family in [
             &f.wal_lag_bytes,
             &f.halted_tables,
             &f.reconcile_log_entries,
             &f.reconcile_log_keys,
             &f.snapshot_rows_done,
+            &f.transaction_buffer_bytes,
+            &f.sink_soft_dropped_columns,
         ] {
+            family.remove(&base);
+        }
+        for family in [&f.replication_lag, &f.binlog_lag] {
             family.remove(&base);
         }
         for family in [
             &f.source_reconnects,
             &f.sink_merge_files_rewritten,
             &f.sink_merge_rows_copied,
+            &f.rows_written,
         ] {
             family.remove(&base);
+        }
+        f.sink_commit_failures.remove(&self.labels().sink());
+        for op in RowOp::ALL {
+            f.rows_read
+                .remove(&self.labels().with(&[("op", op.label())]));
+        }
+        for s in SnapshotState::ALL {
+            f.snapshot_state
+                .remove(&self.labels().with(&[("state", s.label())]));
         }
         let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
         for table in std::mem::take(&mut seen.tables) {
             f.snapshot_rows_done
                 .remove(&self.labels().with(&[("table", &table)]));
+        }
+        for table in std::mem::take(&mut seen.state_tables) {
+            for s in SnapshotState::ALL {
+                f.snapshot_state.remove(
+                    &self
+                        .labels()
+                        .with(&[("table", &table), ("state", s.label())]),
+                );
+            }
         }
         seen.totals = Totals::default();
     }

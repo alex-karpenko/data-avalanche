@@ -1,0 +1,82 @@
+# promtool test rules deploy/prometheus/alerts.test.yaml (CI: the check job).
+rule_files:
+  - alerts.yaml
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'data_avalanche_replication_lag_seconds{pipeline="orders",source_host="db1",source_db="shop"}'
+        values: "30 90x10"
+      - series: 'data_avalanche_lease_state{pipeline="orders",source_host="db1",source_db="shop",state="degraded"}'
+        values: "0 1x5"
+      - series: 'data_avalanche_halted_tables{pipeline="orders",source_host="db1",source_db="shop"}'
+        values: "0 2"
+      - series: 'data_avalanche_pipeline_status{pipeline="orders",source_host="db1",source_db="shop",status="error"}'
+        values: "0 1"
+      - series: 'data_avalanche_wal_lag_bytes{pipeline="orders",source_host="db1",source_db="shop"}'
+        values: "1073741824 21474836480x15"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: DataAvalancheReplicationLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: DataAvalancheReplicationLag
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              pipeline: orders
+              source_host: db1
+              source_db: shop
+            exp_annotations:
+              summary: "orders is 1m 30s behind its source"
+      - eval_time: 2m
+        alertname: DataAvalancheLeaseDegraded
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: DataAvalancheLeaseDegraded
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              pipeline: orders
+              source_host: db1
+              source_db: shop
+              state: degraded
+            exp_annotations:
+              summary: "orders's lease isn't renewed"
+      - eval_time: 0m
+        alertname: DataAvalancheTablesHalted
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: DataAvalancheTablesHalted
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              pipeline: orders
+              source_host: db1
+              source_db: shop
+            exp_annotations:
+              summary: "orders has 2 halted tables"
+      - eval_time: 1m
+        alertname: DataAvalanchePipelineError
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              pipeline: orders
+              source_host: db1
+              source_db: shop
+              status: error
+            exp_annotations:
+              summary: "orders is in ERROR"
+      - eval_time: 10m
+        alertname: DataAvalancheWalLag
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: DataAvalancheWalLag
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              pipeline: orders
+              source_host: db1
+              source_db: shop
+            exp_annotations:
+              summary: "orders's slot retains 20GiB of WAL"

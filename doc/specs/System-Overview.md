@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-27
+updated: 2026-10-28
 domain: Architecture
 tags: [architecture, design, system, multi-sink, iceberg, delta-lake, v1-scope]
 sources: []
@@ -144,7 +144,7 @@ Pause/stop/resume set the pipeline's persisted **desired state**; it survives re
 
 Names are the exposed sample names (OpenMetrics): a counter's name ends in `_total`.
 
-**Cardinality:** every metric carries `{pipeline, source_host, source_db}`; a `table` label is added only when `sink.metrics.per_table = true`, and then only to a few per-table gauges (snapshot progress, lag). Series count scales with pipelines, not tables, by default. Source: `research/Observability_Metrics_and_Tracing.md`.
+**Cardinality:** every metric carries `{pipeline, source_host, source_db}`; a `table` label is added only when `sink.metrics.per_table = true`, and then only to a few per-table gauges (snapshot progress and snapshot state). Series count scales with pipelines, not tables, by default. Source: `research/Observability_Metrics_and_Tracing.md`.
 
 | Family | Metrics (mandatory) |
 |---|---|
@@ -155,7 +155,9 @@ Names are the exposed sample names (OpenMetrics): a counter's name ends in `_tot
 | Clustering | `data_avalanche_lease_state`, `data_avalanche_lease_renew_failures_total`, `data_avalanche_lease_renew_latency_seconds`, `data_avalanche_cluster_members`, `data_avalanche_owned_pipelines`, `data_avalanche_ring_generation` |
 | Status | `data_avalanche_pipeline_status` (running / paused / stopped / error), `data_avalanche_halted_tables` |
 
-**Tracing:** a span per flush/commit cycle, per snapshot chunk and per DDL apply (no per-event spans), sampled by `globals.tracing.sample_ratio`.
+**Definitions:** `replication_lag_seconds` is the age of the oldest change read but not yet durable in the sink: now minus the source commit time of the oldest transaction read since the last checkpoint, `0` when nothing is pending; snapshot rows don't count. `binlog_lag_seconds` is the age of the last transaction the stream read, `0` at the server's head; once a server heartbeat has shown the stream caught up, it counts from that heartbeat as soon as the server writes past the head the stream was at; a MySQL pipeline has no `wal_lag_bytes`, a PostgreSQL one no `binlog_lag_seconds`. `rows_read_total{op}` counts row changes read (`insert`, `update`, `delete`) and snapshot rows (`snapshot`). `snapshot_state{state}` is `running` or `waiting` (held by the source, or behind the previous term's writers). `sink_commit_failures_total` counts every failed attempt, retried ones included.
+
+**Tracing:** a span per flush/commit cycle, per snapshot chunk and per DDL apply (no per-event spans), sampled by `globals.tracing.sample_ratio`, exported over OTLP/HTTP (protobuf); a JSON log line logged in a sampled span carries its `trace_id` and `span_id`.
 
 ## Key Design Decisions
 

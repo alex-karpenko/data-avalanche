@@ -34,6 +34,12 @@ jobs:
         run: cargo clippy --locked -p data-avalanche --features e2e-hooks --all-targets -- -D warnings
       - name: Unit tests (e2e-hooks)
         run: cargo test --locked -p data-avalanche --features e2e-hooks --lib
+      # The example alert rules against their promtool tests (M10); the catalogue test checks
+      # the series they name.
+      - name: Alert rules
+        run: >-
+          docker run --rm -v "$PWD/deploy/prometheus:/rules:ro" --entrypoint promtool
+          prom/prometheus:v3.15.0 test rules /rules/alerts.test.yaml
       # RustSec advisory audit of Cargo.lock. Non-blocking by design: a vulnerable dependency is
       # reported (warning annotation + failed step) but never fails the job.
       - name: Install cargo-audit
@@ -136,15 +142,15 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v2
       # uv runs the type scenario's DuckDB read.
       - uses: astral-sh/setup-uv@v10.2.0
-      - name: Start ${{ matrix.target }}, mysql-84 and RustFS
+      - name: Start ${{ matrix.target }}, mysql-84, RustFS and Jaeger
         run: |
-          docker compose -f test-infra/compose.yaml up -d --wait "${{ matrix.target }}" mysql-84 rustfs
+          docker compose -f test-infra/compose.yaml up -d --wait "${{ matrix.target }}" mysql-84 rustfs jaeger
           docker compose -f test-infra/compose.yaml --profile init run --rm rustfs-init
       - name: Slice-1 E2E
         run: cargo test --locked -p data-avalanche --features e2e-hooks --test e2e -- --test-threads=1
       - name: Container logs on failure
         if: failure()
-        run: docker compose -f test-infra/compose.yaml logs --no-color "${{ matrix.target }}" mysql-84 rustfs
+        run: docker compose -f test-infra/compose.yaml logs --no-color "${{ matrix.target }}" mysql-84 rustfs jaeger
       - name: Stop the containers
         if: always()
         run: docker compose -f test-infra/compose.yaml down -v

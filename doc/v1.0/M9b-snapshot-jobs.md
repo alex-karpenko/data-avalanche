@@ -4672,7 +4672,7 @@ git commit -m "test(e2e): the snapshot jobs — a table read again and one outsi
   under `snapshots/jobs/`, listed via `GET /v1/pipelines/{id}/snapshots` after a restart or
   failover, running jobs resumed by the owner — Q-M9-1)": Tasks 3–5 and 7.
 - [x] The OpenAPI snapshot carries the three routes, each with its role (Task 6).
-- [ ] The PR's CI green on every target.
+- [x] The PR's CI green on every target (run 40664901310: `check`, `integration` with the E2E suite on PostgreSQL 18, and `e2e-mysql` on `mysql-84`, `mysql-84-nogtid` and `mariadb-118`).
 
 ## Deviations during execution
 

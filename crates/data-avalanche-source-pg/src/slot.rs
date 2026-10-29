@@ -560,8 +560,9 @@ impl PgConnector {
         Ok(row.and_then(|r| {
             let bytes = r.get::<_, Option<i64>>(0)?;
             Some(RetainedLog {
-                bytes: u64::try_from(bytes).unwrap_or(0),
+                bytes: Some(u64::try_from(bytes).unwrap_or(0)),
                 streamed: r.get(1),
+                behind: None,
             })
         }))
     }

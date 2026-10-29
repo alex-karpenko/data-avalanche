@@ -13,32 +13,11 @@ use crate::source::{Db, Source, target};
 const ITEMS: &str = "CREATE TABLE items (id bigint PRIMARY KEY, doc text);";
 const COLS: &[&str] = &["id", "doc"];
 
-/// `text` without its ANSI colour sequences (`ESC [ … m`): the binary colours its log.
-fn plain(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            chars.by_ref().find(|&c| c == 'm');
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// Whether the log has the line of a pipeline in `ERROR` with `code` (Q-M7b-4).
+/// Whether the log has the line of a pipeline in `ERROR` with `code` (Q-M7b-4); the log isn't
+/// in colour, stderr being no terminal (DA-OBS-6).
 fn halted_with(log: &str, code: &str) -> bool {
-    plain(log)
-        .lines()
+    log.lines()
         .any(|l| l.contains("pipeline in ERROR") && l.contains(&format!("code=\"{code}\"")))
-}
-
-#[test]
-fn a_halt_line_is_found_through_its_colours() {
-    let line = "\u{1b}[31mERROR\u{1b}[0m pipeline in ERROR: X_Y: z \u{1b}[3mcode\u{1b}[0m\u{1b}[2m=\u{1b}[0m\"X_Y\"";
-    assert!(halted_with(line, "X_Y"));
-    assert!(!halted_with(line, "X_Z"));
 }
 
 /// A compressed transaction (MySQL's `binlog_transaction_compression`) whose payload the wire
@@ -191,8 +170,7 @@ async fn a_purged_checkpoint_halts_under_error() {
         log.contains("binlog_purge_action is error, so the pipeline halts"),
         "{log}"
     );
-    let text = plain(&log);
-    let halt = text.lines().find(|l| l.contains("pipeline in ERROR"));
+    let halt = log.lines().find(|l| l.contains("pipeline in ERROR"));
     assert!(halt.is_some_and(|l| !l.contains("code=")), "{log}");
     assert_eq!(e.ids("items").await, [1, 2]);
     assert!(p.terminate().await.success());
