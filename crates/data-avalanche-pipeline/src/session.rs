@@ -1100,14 +1100,19 @@ impl<'c> Session<'c> {
         self.core.dump_only && self.schemas.is_empty() && self.snaps.is_empty()
     }
 
+    /// The stream's frontier into the status, in one change with the lag's start: an owner that
+    /// sees the frontier move sees what is pending up to it (the controller's kept lag, I2).
     fn read(&self) {
-        let frontier = self.acc.frontier().clone();
-        self.core.update(|st| st.read = Some(frontier));
-        self.report_progress();
+        self.progress(Some(self.acc.frontier().clone()));
     }
 
     /// The lag's start, the rows read and the buffered bytes into the status, when they changed.
     fn report_progress(&self) {
+        self.progress(None);
+    }
+
+    /// [`Self::report_progress`], and with `read` the new frontier (always a change).
+    fn progress(&self, read: Option<SourcePosition>) {
         let since = self.unsynced.front().map(|(_, ts)| *ts);
         let since = match (since, self.unflushed_since) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -1116,8 +1121,12 @@ impl<'c> Session<'c> {
         let rows_read = self.core.rows_read;
         let bytes = self.acc.buffered_bytes() as u64;
         self.core.status.send_if_modified(|st| {
-            let changed = (st.unsynced_since_micros, st.rows_read, st.buffer_bytes)
-                != (since, rows_read, bytes);
+            let changed = read.is_some()
+                || (st.unsynced_since_micros, st.rows_read, st.buffer_bytes)
+                    != (since, rows_read, bytes);
+            if read.is_some() {
+                st.read = read;
+            }
             st.unsynced_since_micros = since;
             st.rows_read = rows_read;
             st.buffer_bytes = bytes;

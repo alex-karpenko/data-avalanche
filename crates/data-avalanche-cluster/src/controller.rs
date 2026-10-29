@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use data_avalanche_config::Pipeline;
-use data_avalanche_core::{Sink, SourceConnector, SourceError};
+use data_avalanche_core::{Sink, SourceConnector, SourceError, SourcePosition};
 use data_avalanche_pipeline::{
     Backoff, Command, CommitGuard, Exit, Hooks, Observer, Phase, PipelineWorker, Recovery, Tuning,
     WorkerDeps, WorkerError, WorkerHandle, WorkerStatus,
@@ -341,6 +341,40 @@ fn lag(unsynced_since_micros: Option<i64>, now_micros: i64) -> Duration {
     Duration::from_micros(u64::try_from(age).unwrap_or(0))
 }
 
+/// The lag's start kept across the worker runs of one lease term (I2): the source commit time of
+/// the oldest change a worker read and the sink doesn't hold, and how far that worker's stream
+/// had read then (its frontier; its checkpoint before it read a transaction).
+#[derive(Debug, Clone, PartialEq)]
+struct Pending {
+    since: i64,
+    read: Option<SourcePosition>,
+}
+
+/// The kept lag's start after a worker's status `st`. A worker that has shown a change pending
+/// (`shown`) is the lag from then on. Before that, a worker that follows an earlier one is
+/// re-reading from the checkpoint, and the start the earlier one left stays: its changes still
+/// count until this one has read as far again with nothing pending (its stream's frontier at or
+/// past the kept one). A change it reads again first makes it the lag's source instead.
+fn carry(pending: &mut Option<Pending>, shown: &mut bool, st: &WorkerStatus) {
+    *shown |= st.unsynced_since_micros.is_some();
+    if *shown {
+        *pending = st.unsynced_since_micros.map(|since| Pending {
+            since,
+            read: st.read.clone().or_else(|| st.checkpoint.clone()),
+        });
+        return;
+    }
+    let caught_up = pending.as_ref().is_some_and(|p| match (&st.read, &p.read) {
+        // Positions that don't compare (another source kind) say the kept changes are gone.
+        (Some(read), Some(kept)) => read.covers(kept).unwrap_or(true),
+        (Some(_), None) => true,
+        (None, _) => false,
+    });
+    if caught_up {
+        *pending = None;
+    }
+}
+
 fn now_micros() -> i64 {
     let since = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -361,6 +395,8 @@ struct Running {
     logged: HashSet<String>,
     /// The worker's reconnects already logged.
     reconnects: u64,
+    /// It has shown a change pending: its status is the lag's start from then on ([`carry`]).
+    lag_shown: bool,
 }
 
 /// A worker never outlives its controller: a controller that panics drops its `Running`, and
@@ -655,6 +691,9 @@ impl PipelineController {
         let mut dumped = false;
         let mut retry: Option<(Instant, String)> = None;
         let mut failures: u32 = 0;
+        // The lag's start across this term's workers: what one read and didn't make durable still
+        // counts while none runs and while the next one reads it again (I2).
+        let mut pending: Option<Pending> = None;
         // One lease term: a stale reader is ended at most once in it, by whichever of its
         // workers meets it first, a stop and a resume included (DA-SRC-28).
         let reader_ended = Arc::new(AtomicBool::new(false));
@@ -676,7 +715,7 @@ impl PipelineController {
             if desired == Some(DesiredState::Stopped) {
                 if let Some(w) = worker.take() {
                     // Cut off or not, the worker and its writer are gone: the lease stays held.
-                    self.drain(w).await;
+                    self.drain(w, &mut pending).await;
                 }
                 // A stop clears an error: the resume after it runs the pipeline again. It also
                 // spends the jump: the next fence climbs once more, as the ERROR's remedy says.
@@ -791,7 +830,7 @@ impl PipelineController {
                 }
                 Event::Ended(ended) => {
                     let mut w = worker.take().expect("a worker ended");
-                    self.observe(&mut w);
+                    self.observe(&mut w, &mut pending);
                     self.metrics.worker_ended();
                     let ended = ended.unwrap_or_else(|e| {
                         Err(WorkerError::Refused(format!(
@@ -872,7 +911,7 @@ impl PipelineController {
                             failures = 0;
                             retry = None;
                         }
-                        self.observe(w);
+                        self.observe(w, &mut pending);
                     }
                 }
                 Event::Start(permit) => match self.start(&run, &reader_ended, permit) {
@@ -888,8 +927,12 @@ impl PipelineController {
                 Event::Due => {}
                 Event::Poll => {
                     desired = self.desired().await.or(desired);
-                    if let Some(w) = worker.as_mut() {
-                        self.observe(w);
+                    match worker.as_mut() {
+                        Some(w) => self.observe(w, &mut pending),
+                        // No worker runs (a restart's backoff, ERROR): the lag grows on.
+                        None => self
+                            .metrics
+                            .replication_lag(lag(pending.as_ref().map(|p| p.since), now_micros())),
                     }
                     self.report(&mut reported).await;
                     let asked = self.asked(&mut seen).await;
@@ -898,7 +941,7 @@ impl PipelineController {
                     if asked.restart {
                         // A snapshot job asks for its restart: the new worker takes its tables.
                         jobs.list(&self.docs, &self.pipeline.name).await;
-                        if self.discard(&mut worker).await {
+                        if self.discard(&mut worker, &mut pending).await {
                             tracing::info!(pipeline = %self.pipeline.name, "restarted on request");
                         } else {
                             tracing::info!(pipeline = %self.pipeline.name, "a restart was asked, but no worker runs: the next one starts afresh");
@@ -935,7 +978,7 @@ impl PipelineController {
                     reported = Reported::default();
                     seen = self.docs.requests().await.ok();
                     jobs.list(&self.docs, &self.pipeline.name).await;
-                    self.discard(&mut worker).await;
+                    self.discard(&mut worker, &mut pending).await;
                     tracing::info!(pipeline = %self.pipeline.name, "restarted for a reload");
                     error = None;
                     dumped = false;
@@ -954,13 +997,14 @@ impl PipelineController {
 
     /// Discard and replay (config §12.4): what the worker read past the durable checkpoint is
     /// read again by the next one. False when no worker runs.
-    async fn discard(&self, worker: &mut Option<Running>) -> bool {
+    async fn discard(&self, worker: &mut Option<Running>, pending: &mut Option<Pending>) -> bool {
         let Some(mut w) = worker.take() else {
             return false;
         };
         w.task.abort();
         // Ended (dropped) before the next worker starts: its writer goes with it.
         let _ = (&mut w.task).await;
+        self.observe(&mut w, pending);
         self.metrics.worker_ended();
         true
     }
@@ -1054,6 +1098,7 @@ impl PipelineController {
             paused: false,
             logged: HashSet::new(),
             reconnects: 0,
+            lag_shown: false,
         })
     }
 
@@ -1061,7 +1106,7 @@ impl PipelineController {
     /// off (what it read past the durable checkpoint is read again by the next run). True when
     /// it ended on its own; either way the worker has ended when this returns. A cut-off
     /// worker's writer is aborted with it, not waited for.
-    async fn drain(&self, mut w: Running) -> bool {
+    async fn drain(&self, mut w: Running, pending: &mut Option<Pending>) -> bool {
         let ended = tokio::time::timeout(self.settings.drain_timeout, async {
             let _ = w.handle.control.send(Command::Drain).await;
             (&mut w.task).await
@@ -1091,7 +1136,7 @@ impl PipelineController {
                 false
             }
         };
-        self.observe(&mut w);
+        self.observe(&mut w, pending);
         self.metrics.worker_ended();
         drained
     }
@@ -1099,7 +1144,7 @@ impl PipelineController {
     /// Drains the worker and releases the lease; a worker cut off leaves it to expire.
     async fn let_go(&self, run: LeaseRun, worker: Option<Running>) {
         let drained = match worker {
-            Some(w) => self.drain(w).await,
+            Some(w) => self.drain(w, &mut None).await,
             None => true,
         };
         if drained {
@@ -1122,7 +1167,7 @@ impl PipelineController {
     /// it.
     async fn remove(&self, run: LeaseRun, worker: Option<Running>) {
         let drained = match worker {
-            Some(w) => self.drain(w).await,
+            Some(w) => self.drain(w, &mut None).await,
             None => true,
         };
         if !drained {
@@ -1197,7 +1242,7 @@ impl PipelineController {
     }
 
     /// The worker's status into the metrics, and its new warnings and reconnects into the log.
-    fn observe(&self, w: &mut Running) {
+    fn observe(&self, w: &mut Running, pending: &mut Option<Pending>) {
         let st = w.handle.status.borrow().clone();
         for warning in &st.warnings {
             if w.logged.insert(warning.clone()) {
@@ -1213,7 +1258,8 @@ impl PipelineController {
         let m = &self.metrics;
         m.wal_lag_bytes(st.retained_bytes);
         m.binlog_lag(st.source_behind);
-        m.replication_lag(lag(st.unsynced_since_micros, now_micros()));
+        carry(pending, &mut w.lag_shown, &st);
+        m.replication_lag(lag(pending.as_ref().map(|p| p.since), now_micros()));
         m.transaction_buffer_bytes(st.buffer_bytes);
         m.soft_dropped_columns(st.soft_dropped.values().sum());
         m.halted_tables(st.halted.len());
@@ -1309,6 +1355,7 @@ impl PipelineController {
 #[cfg(test)]
 mod tests {
     use data_avalanche_core::{SinkError, SourceError, TableRef};
+    use data_avalanche_pipeline::{HookAction, HookPoint};
     use data_avalanche_state::Action;
     use data_avalanche_testkit::{FakeTxn, Method, SinkOp};
 
@@ -1402,6 +1449,208 @@ mod tests {
             !text.contains("data_avalanche_binlog_lag_seconds{"),
             "a PostgreSQL source has no binlog: {text}"
         );
+    }
+
+    /// A worker that follows one which left a change pending keeps its start until its stream has
+    /// read as far with nothing pending; one that has shown a change pending is the lag itself.
+    #[test]
+    fn the_kept_lag_start_waits_for_the_next_worker_to_read_as_far() {
+        let at = |lsn| Some(SourcePosition::Pg(data_avalanche_core::position::Lsn(lsn)));
+        let kept = Some(Pending {
+            since: 1,
+            read: at(100),
+        });
+        let status = |read, unsynced| WorkerStatus {
+            read,
+            checkpoint: at(40),
+            unsynced_since_micros: unsynced,
+            ..WorkerStatus::default()
+        };
+        let (mut pending, mut shown) = (kept.clone(), false);
+        for (read, what) in [(None, "nothing read yet"), (at(60), "short of it")] {
+            carry(&mut pending, &mut shown, &status(read, None));
+            assert_eq!(pending, kept, "{what}");
+        }
+        carry(&mut pending, &mut shown, &status(at(100), None));
+        assert_eq!(pending, None, "read as far, nothing pending");
+
+        let (mut pending, mut shown) = (kept.clone(), false);
+        carry(&mut pending, &mut shown, &status(at(60), Some(7)));
+        assert_eq!(
+            pending,
+            Some(Pending {
+                since: 7,
+                read: at(60)
+            }),
+            "read again: the worker's own"
+        );
+        carry(&mut pending, &mut shown, &status(at(60), None));
+        assert_eq!(pending, None, "then durable: the worker says so");
+
+        let (mut pending, mut shown) = (None, false);
+        carry(&mut pending, &mut shown, &status(None, Some(9)));
+        assert_eq!(
+            pending.unwrap().read,
+            at(40),
+            "before a frontier, the checkpoint"
+        );
+    }
+
+    /// `data_avalanche_replication_lag_seconds`'s value now.
+    fn lag_of(metrics: &Metrics) -> f64 {
+        let name = format!("data_avalanche_replication_lag_seconds{{{P}}} ");
+        let text = metrics.encode();
+        let value = text
+            .lines()
+            .find_map(|l| l.strip_prefix(&name))
+            .unwrap_or_else(|| panic!("no lag series: {text}"));
+        value.parse().expect("a number")
+    }
+
+    /// I2 (System-Overview §Observability: the oldest change read and not yet durable): a
+    /// worker that ends on a transient error with a change read and not durable leaves the lag
+    /// to grow while no worker runs, and the next worker's early statuses, which show nothing
+    /// pending yet, don't zero it. A worker that reads the change again is the lag from then on.
+    #[tokio::test(start_paused = true)]
+    async fn the_lag_grows_through_a_restart_s_backoff_and_holds_through_the_next_start() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a"]);
+        let mut p = pipeline();
+        p.sink.flush.seconds = Some(3_600);
+        let mut d = deps("n1", &store, &f);
+        d.settings.restart = Backoff {
+            first: Duration::from_secs(20),
+            max: Duration::from_secs(20),
+        };
+        let metrics = d.metrics.clone();
+        let (c, mut status) = PipelineController::new(p, docs.clone(), &d);
+        let (_target, rx) = watch::channel(Target::Own);
+        let _task = tokio::spawn(c.run(rx));
+        until(&mut status, "running", is(Actual::Running)).await;
+        f.source.commit(FakeTxn::new().insert(&t("a"), row(1)));
+        let pending = |s: &ControllerStatus| {
+            s.worker
+                .as_ref()
+                .is_some_and(|w| w.unsynced_since_micros.is_some())
+        };
+        until(&mut status, "a change read and pending", pending).await;
+        assert!(lag_of(&metrics) > 0.0);
+
+        // The stream fails, and its position stays busy past the contended window: the worker
+        // ends with `Contended` (Recovery::Retry) before the change is durable, and so does the
+        // next one. The third ends the other reader and streams.
+        let denied = || SourceError::Permanent("permission denied".into());
+        f.source.fail(Method::EndOtherReader, denied());
+        f.source.fail(Method::EndOtherReader, denied());
+        for _ in 0..10_000 {
+            f.source
+                .fail(Method::OpenStream, SourceError::Contended("active".into()));
+        }
+        f.source
+            .fail(Method::Next, SourceError::Transient("reset".into()));
+        let retrying = |s: &ControllerStatus| matches!(s.actual, Some(Actual::Retrying { .. }));
+        until(&mut status, "the first worker ended", retrying).await;
+        let ended = lag_of(&metrics);
+        assert!(ended > 0.0);
+        // A poll in the backoff, with no worker running.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(retrying(&status.borrow()), "{:?}", status.borrow().actual);
+        let backoff = lag_of(&metrics);
+        assert!(backoff > ended, "the lag grows while no worker runs");
+
+        let second = |s: &ControllerStatus| {
+            f.builds() == 2
+                && s.worker
+                    .as_ref()
+                    .is_some_and(|w| w.unsynced_since_micros.is_none())
+        };
+        until(&mut status, "the second worker's first statuses", second).await;
+        let starting = lag_of(&metrics);
+        assert!(starting >= backoff, "held: {starting} after {backoff}");
+
+        let third = |s: &ControllerStatus| f.builds() == 3 && pending(s);
+        until(&mut status, "the third worker read the change again", third).await;
+        let again = lag_of(&metrics);
+        assert!(
+            again >= starting,
+            "the worker's own: {again} after {starting}"
+        );
+
+        docs.request(Action::Flush, asked("f1")).await.unwrap();
+        eventually("the change lands", || f.ids("a") == [1]).await;
+        eventually("the lag clears", || lag_of(&metrics) == 0.0).await;
+    }
+
+    /// I2 (d): a worker that ended with a change shown pending which was durable after all. The
+    /// next worker finds nothing to read again; once its stream has read as far, the lag clears.
+    #[tokio::test(start_paused = true)]
+    async fn a_restarted_worker_that_finds_nothing_pending_clears_the_kept_lag() {
+        /// Crashes once, at the first checkpoint persisted after it is armed: the change is
+        /// durable, the worker never hears of it.
+        #[derive(Debug, Default)]
+        struct CrashOnce(AtomicBool);
+        impl Hooks for CrashOnce {
+            fn at(&self, point: &HookPoint) -> HookAction {
+                if matches!(point, HookPoint::CheckpointPersisted { .. })
+                    && self.0.swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    return HookAction::Crash;
+                }
+                HookAction::Continue
+            }
+        }
+        #[derive(Debug)]
+        struct Crashing(TestFactory, Arc<CrashOnce>);
+        impl WorkerFactory for Crashing {
+            fn build(&self, p: &Pipeline) -> Result<Parts, String> {
+                let parts = self.0.build(p)?;
+                Ok(Parts {
+                    hooks: Arc::clone(&self.1) as Arc<dyn Hooks>,
+                    ..parts
+                })
+            }
+        }
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a"]);
+        let crash = Arc::new(CrashOnce::default());
+        let mut d = deps("n1", &store, &f);
+        d.factory = Arc::new(Crashing(f.clone(), Arc::clone(&crash)));
+        let metrics = d.metrics.clone();
+        let (c, mut status) = PipelineController::new(pipeline(), docs.clone(), &d);
+        let (_target, rx) = watch::channel(Target::Own);
+        let _task = tokio::spawn(c.run(rx));
+        until(&mut status, "running", is(Actual::Running)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        crash.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        f.source.commit(FakeTxn::new().insert(&t("a"), row(1)));
+        until(&mut status, "the worker crashed", |s| {
+            matches!(&s.actual, Some(Actual::Error { .. }))
+        })
+        .await;
+        assert_eq!(f.ids("a"), [1], "durable");
+        let ended = lag_of(&metrics);
+        assert!(ended > 0.0, "the worker showed the change pending");
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(
+            lag_of(&metrics) > ended,
+            "the lag grows while no worker runs"
+        );
+
+        docs.request(Action::Restart, asked("r1")).await.unwrap();
+        let streaming = |s: &ControllerStatus| {
+            f.builds() == 2
+                && s.worker
+                    .as_ref()
+                    .is_some_and(|w| w.phase == Phase::Streaming && w.read.is_none())
+        };
+        until(&mut status, "the second worker streams", streaming).await;
+        assert!(lag_of(&metrics) > ended, "no evidence yet: the lag holds");
+
+        f.source.keepalive();
+        eventually("the lag clears", || lag_of(&metrics) == 0.0).await;
+        assert_eq!(status.borrow().actual, Some(Actual::Running));
     }
 
     #[test]
