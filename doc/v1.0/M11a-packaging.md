@@ -2266,15 +2266,18 @@ git commit -m "ci: the release — on a v* tag, the image for amd64 and arm64 wi
 
 ## Exit
 
-- [ ] `helm lint` and `helm template` pass on each example, and kubeconform finds the objects
-      valid (CI's `check` job).
-- [ ] The k3s smoke deploy: three pods run one pipeline end to end, and a deleted pod hands it
-      to the others (CI's `k3s` job).
-- [ ] The image builds on linux/amd64 (the `k3s` job) and linux/arm64 (`weekly.yml`'s
-      `image-arm64`, dispatched by hand on the PR's branch); `release.yml` passes actionlint.
-- [ ] The whole-branch review's findings fixed or recorded; the PR's CI green.
-- [ ] After the merge: a manual run of `release.yml` on `main` builds both images and packages the
-      chart (DA-OPS-11).
+- [x] `helm lint` and `helm template` pass on each example, and kubeconform finds the objects
+      valid (CI's `check` job; run 40903743634).
+- [x] The k3s smoke deploy: three pods run one pipeline end to end, and a deleted pod hands it
+      to the others (CI's `k3s` job; run 40903743634, 41 min with the image's cold build).
+- [x] The image builds on linux/amd64 (the `k3s` job) and linux/arm64 (`weekly.yml`'s
+      `image-arm64`, dispatched by hand on the PR's branch); `release.yml` passes actionlint
+      (`image-arm64` 33 min on `ubuntu-24.04-arm`, run 40903481644).
+- [x] The whole-branch review's findings fixed or recorded (2026-10-29); the PR's CI green (run
+      40903743634: `check`, `k3s`, `integration`, and `e2e-mysql` on `mysql-84`,
+      `mysql-84-nogtid` and `mariadb-118`).
+- [x] After the merge: a manual run of `release.yml` on `main` builds both images and packages the
+      chart (DA-OPS-11; run 40918381277, 17 min, nothing pushed).
 
 ## Deviations during execution
 
