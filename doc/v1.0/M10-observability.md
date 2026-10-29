@@ -6456,9 +6456,9 @@ git commit -m "test(e2e): the catalogue scraped live, and the traces read back f
 - [x] The catalogue test asserts every mandatory series with its labels (Task 1, roadmap M10's
   exit).
 - [x] The tracing smoke test passes against the Jaeger container (Task 9, roadmap M10's exit).
-- [ ] The promtool test passes in CI's `check` job (Task 8).
-- [ ] The whole-branch review's findings fixed or recorded (done 2026-10-29); the PR's CI green.
-- [ ] DA-OBS-6 ✅ in the gap tracker when M10 merges.
+- [x] The promtool test passes in CI's `check` job (Task 8; run 40799494685).
+- [x] The whole-branch review's findings fixed or recorded (2026-10-29); the PR's CI green (run 40799494685: `check`, `integration` with the E2E suite on PostgreSQL 18, and `e2e-mysql` on `mysql-84`, `mysql-84-nogtid` and `mariadb-118`).
+- [x] DA-OBS-6 ✅ in the gap tracker when M10 merges (PR #15, `550474c`).
 
 ## Deviations during execution
 
