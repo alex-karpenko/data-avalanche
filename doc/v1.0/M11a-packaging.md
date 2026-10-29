@@ -2289,3 +2289,21 @@ git commit -m "ci: the release — on a v* tag, the image for amd64 and arm64 wi
   joined image from GHCR, which starts private (DA-OPS-11), with no login; the job takes
   `packages: read` and logs in to `ghcr.io` before it, as the image's jobs do. Step 3's block of
   `weekly.yml` also ends the file with a blank line, which the commit leaves out.
+- The whole-branch review (one fix commit, `fix(deploy): the whole-branch review — …`):
+  - The release pushes the chart from `github-release`, after the image's tags are joined, not
+    from the `chart` job in parallel with the builds: a failed build no longer leaves a chart
+    whose image tag doesn't exist. The token, actor and version reach `run:` through `env:`.
+  - The attestation (`attest-build-provenance`) runs only on a public repository: GitHub offers
+    artifact attestations to a private one only on Enterprise Cloud. A private repository's image
+    keeps BuildKit's in-registry provenance and the SBOM (DA-OPS-11).
+  - D-M11a.9's "cached per scope" holds for the image's layers only: `type=gha` doesn't keep the
+    Dockerfile's cache mounts, so a change under `crates/` builds the release binary cold. The
+    `k3s` job's timeout is 120 minutes; the PR's first run measures it.
+  - The chart: its names at most 52 characters (a 50-character release name gave the Service and
+    the headless Service one name); a `clusterDomain` value for the discovery name; no
+    service-account token on the pod under any service account; NOTES' curl with the API's scheme;
+    NOTES and the README on the ConfigMap's propagation delay before a reload; the README names
+    where the examples are (`ci/` isn't packaged) and says to raise the grace with `drain_timeout`.
+  - The SBOM file is named for the platform it covers (`-linux-amd64.spdx.json`); a comment says
+    a patch on an older line moves `X.Y` and `latest` back.
+  - Left for M11b's deploy pages: `minReadySeconds` and the liveness timeout for rolling updates.
