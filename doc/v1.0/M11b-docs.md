@@ -131,8 +131,8 @@ task after the arrow.
 
 **Asked and answered** (2026-10-29). Q-M11b-1 followed a research spike Oleksii asked for
 (`doc/research/Documentation_Site_Generator.md`); Q-M11b-2…6 are each the "Recommended" answer.
-Oleksii approved the plan 2026-10-29, with the chart's `minReadySeconds` (D-M11b.9); F-4's spec
-patch waits for his word.
+Oleksii approved the plan 2026-10-29, with the chart's `minReadySeconds` (D-M11b.9). It needs no
+spec edit (F-4 withdrawn).
 
 | # | Question | Answer |
 |---|---|---|
@@ -167,7 +167,7 @@ committed, §49):
 | F-1 | **A process-restart key written as a literal can't change once the cluster has a generation**: a reload refuses it (V-061, `diff.rs`), and a restarted node adopts the stored generation (`startup.rs`). Only a `${VAR}` value (each node resolves it from its environment) or a file's contents (re-read at start) changes, by a rolling restart. Stuck: `lease_renewal_interval`, `lease_safety_margin`, `discovery`, `discovery_dns_name`, `join_members`, the memberlist timers, `globals.api.tls.enabled`, `globals.azure.account_name` (`tokens`, `lock_backend`, `lease_duration` are pinned by design) | New gap DA-OPS-12 (🟢). The docs give the workaround (write them as `${VAR:-default}`; otherwise a new `globals.state` with every node stopped, untested) |
 | F-2 | **`BINLOG_SOURCE_CHANGED` without GTIDs has no in-place recovery**: its message says "switch to gtid or re-snapshot", but a pipeline in `error` can't take a snapshot job (`409` unless running and held), and `same_server` doesn't follow `binlog_purge_action` | New gap DA-SRC-29 (🟢). The docs: switch to `gtid` with `binlog_purge_action: re_snapshot`, or replace the pipeline (a new `id` and prefix) |
 | F-3 | **Two operator-facing texts are wrong**: the orphan-slot refusal says `slot.on_orphan: adopt_resnapshot` (the key is `source.postgres.slot_on_orphan`; seen in the planning run), and the CLI's `about` says "from PostgreSQL into Delta Lake" (MySQL and MariaDB missing) | New gap DA-OPS-13 (🟢): two one-line fixes, for M12 or a fix PR |
-| F-4 | **The config spec's §14 example sets `otlp_endpoint` to `:4317`**, the OTLP/gRPC port, while §6.6 and Q-M10-1 say OTLP/HTTP on `:4318` | A spec patch, which needs Oleksii's approval; the pages use `:4318` |
+| F-4 | ~~The config spec's §14 example sets `otlp_endpoint` to `:4317`~~ **Withdrawn**: the example has said `:4318` since M10 (`c418c8a`, and §15's note); the finding came from a stale reading | None; the pages use `:4318` |
 | F-5 | **The research doc's 390 px captures were clipped by headless Chrome**, whose layout viewport is at least 500 px whatever the window (measured: `innerWidth` 500 at `--window-size=390`). Its "the wide table runs past the edge in every tool" is that artifact | A `research:` correction to `Documentation_Site_Generator.md` §4, committed with the plan. At 500 px the M11b site keeps its width and each wide table scrolls in its own box (`custom.css`) |
 
 ## Verification (planning, 2026-10-29)
@@ -229,7 +229,7 @@ after the last one equals the one the pages were written in, file for file.
 - `gap: v1 §49 — M11b planning`: the plan, and the new gaps DA-OPS-12, DA-SRC-29, DA-OPS-13
   (F-1…F-3).
 - `research: documentation site generator — the 390 px captures`: F-5's correction.
-F-4 waits for Oleksii's word on the spec.
+F-4 was withdrawn on checking the spec: no spec edit.
 
 ---
 
