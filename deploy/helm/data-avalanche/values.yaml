@@ -1,0 +1,116 @@
+# The data-avalanche config (config_version 1), rendered into the ConfigMap as config.yaml: a
+# map, or the file's text (helm install --set-file config=config.yaml). Required unless
+# existingConfigMap is set. Per-pod values come from the environment the chart
+# sets on every pod:
+#   POD_NAME, POD_IP, POD_NAMESPACE           from the Downward API
+#   DATA_AVALANCHE_DISCOVERY_DNS_NAME          the headless Service's DNS name
+# so the cluster block reads:
+#   globals:
+#     cluster:
+#       discovery: dns
+#       discovery_dns_name: ${DATA_AVALANCHE_DISCOVERY_DNS_NAME}
+#       memberlist:
+#         node_name: ${POD_NAME}
+#         advertise_addr: ${POD_IP}
+# A changed config reaches a running cluster through the API's reload, not a pod restart: a
+# starting node adopts the cluster's latest config generation, not its file.
+config: {}
+
+# A ConfigMap of your own that holds the config under configKey; config is then ignored.
+existingConfigMap: ""
+configKey: config.yaml
+
+# The ports the pods listen on, when the config isn't a map that names them (text, or
+# existingConfigMap): the API (globals.api.address, also /metrics and the probes) and the gossip
+# (memberlist.bind_port, UDP). apiTls: the probes use HTTPS (globals.api.tls.enabled).
+ports:
+  api: 8080
+  gossip: 7946
+apiTls: false
+
+replicaCount: 3
+
+image:
+  repository: ghcr.io/alex-karpenko/data-avalanche
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# Extra environment: the secrets the config's ${VAR}s name.
+env: []
+envFrom: []
+
+serviceAccount:
+  create: true
+  name: ""
+  # For a cloud identity: eks.amazonaws.com/role-arn, iam.gke.io/gcp-service-account, …
+  annotations: {}
+
+service:
+  type: ClusterIP
+  # With type NodePort: the node's port, or empty for one Kubernetes picks.
+  nodePort: null
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    memory: 2Gi
+
+# Above globals.cluster.drain_timeout (60s by default): a deleted pod hands its pipelines off
+# before it is killed.
+terminationGracePeriodSeconds: 90
+
+livenessProbe:
+  httpGet:
+    path: /health/live
+    port: api
+  periodSeconds: 10
+  failureThreshold: 3
+readinessProbe:
+  httpGet:
+    path: /health/ready
+    port: api
+  periodSeconds: 5
+  failureThreshold: 2
+startupProbe:
+  httpGet:
+    path: /health/live
+    port: api
+  periodSeconds: 5
+  failureThreshold: 60
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+# Names the pods resolve to the addresses given, beside the cluster's DNS (e.g. a database
+# outside Kubernetes without a DNS name).
+hostAliases: []
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+extraVolumes: []
+extraVolumeMounts: []

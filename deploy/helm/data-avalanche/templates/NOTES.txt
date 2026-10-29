@@ -1,0 +1,8 @@
+{{ .Values.replicaCount }} data-avalanche node(s) start as the StatefulSet {{ include "data-avalanche.fullname" . }}.
+
+The API, /metrics and the probes: {{ include "data-avalanche.fullname" . }}.{{ .Release.Namespace }}:{{ include "data-avalanche.apiPort" . }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "data-avalanche.fullname" . }} {{ include "data-avalanche.apiPort" . }}
+  curl localhost:{{ include "data-avalanche.apiPort" . }}/v1/cluster/status
+
+A changed config reaches the running cluster through the API's reload (POST /v1/config/reload),
+not through a restart: a starting node adopts the cluster's latest config generation.

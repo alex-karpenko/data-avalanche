@@ -1,0 +1,40 @@
+# A three-node cluster replicating a PostgreSQL database into Delta tables on S3. Checked by
+# `helm lint`, `helm template` and kubeconform in CI, and its config validated by the
+# data-avalanche config crate (crates/data-avalanche/tests/packaging.rs).
+replicaCount: 3
+env:
+  - name: ORDERS_DB_PASSWORD
+    valueFrom:
+      secretKeyRef: { name: orders-db, key: password }
+serviceAccount:
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/data-avalanche
+config:
+  config_version: 1
+  globals:
+    cloud: aws
+    state: { bucket: example-cdc-state, prefix: cdc }
+    api: { address: "0.0.0.0:8080" }
+    log: { level: info, format: json }
+    cluster:
+      discovery: dns
+      discovery_dns_name: ${DATA_AVALANCHE_DISCOVERY_DNS_NAME}
+      memberlist:
+        node_name: ${POD_NAME}
+        advertise_addr: ${POD_IP}
+        bind_port: 7946
+        advertise_port: 7946
+  pipelines:
+    orders:
+      id: orders
+      source:
+        host: orders-db.example.internal
+        db: orders
+        user: cdc
+        password: ${ORDERS_DB_PASSWORD}
+        postgres: { publication: orders_pub, slot: orders_slot }
+      tables: { include: [public.*] }
+      sink:
+        type: delta
+        bucket: example-lake
+        prefix: orders

@@ -3,7 +3,10 @@
 //! release publishes. `helm lint`, `helm template` and kubeconform check the chart itself in CI,
 //! and the E2E suite's k3s scenario runs it.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+
+use data_avalanche_config::{FingerprintKey, load_str, validate_str};
 
 /// A file of the repository, by its path from the root.
 fn repo(file: &str) -> String {
@@ -11,6 +14,10 @@ fn repo(file: &str) -> String {
         .join("../..")
         .join(file);
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+fn chart(file: &str) -> String {
+    repo(&format!("deploy/helm/data-avalanche/{file}"))
 }
 
 /// The value of the first line `<prefix><value>` of `text`, quotes taken off.
@@ -31,4 +38,96 @@ fn the_image_builds_with_the_workspace_s_toolchain() {
         "the build stage isn't rust:{channel}"
     );
     assert!(dockerfile.contains("FROM gcr.io/distroless/cc-debian13:nonroot\n"));
+}
+
+#[test]
+fn the_chart_s_versions_are_the_workspace_s() {
+    // The release refuses a tag unless all three agree (.github/workflows/release.yml).
+    let workspace = value(&repo("Cargo.toml"), "version = ");
+    let chart = chart("Chart.yaml");
+    assert_eq!(value(&chart, "version: "), workspace);
+    assert_eq!(value(&chart, "appVersion: "), workspace);
+    assert_eq!(workspace, env!("CARGO_PKG_VERSION"));
+}
+
+/// The value of a top-level key written as a block: the lines under it, two spaces taken off.
+fn block(values: &str, key: &str) -> String {
+    let start = format!("{key}:");
+    let mut lines = values.lines().skip_while(|l| *l != start).skip(1);
+    let mut text = String::new();
+    for line in lines.by_ref() {
+        if !line.is_empty() && !line.starts_with(' ') {
+            break;
+        }
+        text.push_str(line.strip_prefix("  ").unwrap_or(line));
+        text.push('\n');
+    }
+    assert!(!text.trim().is_empty(), "no {key} block");
+    text
+}
+
+/// What the chart puts in every pod's environment, and the secrets the examples' configs name:
+/// a password, and the API's certificate and key as PEM text, made for the test.
+fn pod_env() -> BTreeMap<String, String> {
+    let tls = rcgen::generate_simple_self_signed(vec!["data-avalanche".into()]).unwrap();
+    [
+        ("POD_NAME", "data-avalanche-0".to_owned()),
+        ("POD_NAMESPACE", "cdc".to_owned()),
+        ("POD_IP", "10.0.0.5".to_owned()),
+        (
+            "DATA_AVALANCHE_DISCOVERY_DNS_NAME",
+            "data-avalanche-headless.cdc.svc.cluster.local".to_owned(),
+        ),
+        ("ORDERS_DB_PASSWORD", "secret".to_owned()),
+        ("API_TLS_CERT", tls.cert.pem()),
+        ("API_TLS_KEY", tls.signing_key.serialize_pem()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v))
+    .collect()
+}
+
+#[test]
+fn the_examples_configs_validate_with_the_pod_s_environment() {
+    for example in ["ci/example-values.yaml", "ci/tls-values.yaml"] {
+        let config = block(&chart(example), "config");
+        let report = validate_str(&config, &pod_env());
+        assert!(report.is_ok(), "{example}: {:#?}\n{config}", report.errors);
+    }
+}
+
+#[test]
+fn the_chart_sets_the_environment_its_values_document() {
+    let statefulset = chart("templates/statefulset.yaml");
+    let values = chart("values.yaml");
+    for name in [
+        "POD_NAME",
+        "POD_NAMESPACE",
+        "POD_IP",
+        "DATA_AVALANCHE_DISCOVERY_DNS_NAME",
+    ] {
+        assert!(statefulset.contains(&format!("- name: {name}\n")), "{name}");
+        assert!(values.contains(name), "values.yaml doesn't document {name}");
+    }
+}
+
+#[test]
+fn a_deleted_pod_has_longer_than_the_drain_to_hand_off() {
+    let config = block(&chart("ci/example-values.yaml"), "config");
+    let loaded = load_str(&config, &pod_env(), &FingerprintKey::from_bytes([0; 32])).unwrap();
+    let drain = loaded.config.globals.cluster.drain_timeout;
+    let grace: u64 = value(&chart("values.yaml"), "terminationGracePeriodSeconds: ")
+        .parse()
+        .unwrap();
+    assert!(grace > drain.as_secs(), "{grace} s, the drain {drain:?}");
+}
+
+#[test]
+fn a_changed_config_is_said_to_go_through_the_reload() {
+    // A starting node adopts the cluster's config generation, not its file (config §12): the
+    // chart restarts nothing on a changed ConfigMap, and tells the operator so.
+    for text in [chart("templates/NOTES.txt"), chart("README.md")] {
+        assert!(text.contains("POST /v1/config/reload"), "{text}");
+    }
+    assert!(!chart("templates/statefulset.yaml").contains("checksum/"));
 }

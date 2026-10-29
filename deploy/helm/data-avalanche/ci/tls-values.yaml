@@ -1,0 +1,30 @@
+# The API with TLS on: the probes must speak HTTPS (CI renders this file and checks it). The
+# certificate and key are PEM text from a Secret (config §4.4).
+config:
+  config_version: 1
+  globals:
+    cloud: aws
+    state: { bucket: example-cdc-state, prefix: cdc }
+    api:
+      address: "0.0.0.0:8443"
+      tls: { enabled: true, cert: "${API_TLS_CERT}", key: "${API_TLS_KEY}" }
+    cluster:
+      discovery: dns
+      discovery_dns_name: ${DATA_AVALANCHE_DISCOVERY_DNS_NAME}
+      memberlist: { node_name: "${POD_NAME}", advertise_addr: "${POD_IP}" }
+  pipelines:
+    orders:
+      id: orders
+      source: { host: orders-db.example.internal, db: orders, user: cdc, password: "${ORDERS_DB_PASSWORD}", postgres: { publication: orders_pub, slot: orders_slot } }
+      tables: { include: [public.*] }
+      sink: { type: delta, bucket: example-lake, prefix: orders }
+env:
+  - name: ORDERS_DB_PASSWORD
+    valueFrom:
+      secretKeyRef: { name: orders-db, key: password }
+  - name: API_TLS_CERT
+    valueFrom:
+      secretKeyRef: { name: data-avalanche-tls, key: tls.crt }
+  - name: API_TLS_KEY
+    valueFrom:
+      secretKeyRef: { name: data-avalanche-tls, key: tls.key }

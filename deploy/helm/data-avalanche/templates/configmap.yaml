@@ -1,0 +1,18 @@
+{{- if not .Values.existingConfigMap }}
+{{- if not .Values.config }}
+{{- fail "config is required (the data-avalanche config), unless existingConfigMap names a ConfigMap of your own" }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "data-avalanche.fullname" . }}
+  labels:
+    {{- include "data-avalanche.labels" . | nindent 4 }}
+data:
+  {{ .Values.configKey }}: |
+    {{- if kindIs "string" .Values.config }}
+    {{- .Values.config | nindent 4 }}
+    {{- else }}
+    {{- toYaml .Values.config | nindent 4 }}
+    {{- end }}
+{{- end }}

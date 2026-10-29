@@ -40,6 +40,23 @@ jobs:
         run: >-
           docker run --rm -v "$PWD/deploy/prometheus:/rules:ro" --entrypoint promtool
           prom/prometheus:v3.15.0 test rules /rules/alerts.test.yaml
+      # The Helm chart (M11a): lint, render with its example values, and validate the objects
+      # against the Kubernetes API's schemas; packaging.rs validates the example's config.
+      - uses: azure/setup-helm@v5
+        with:
+          version: v4.3.0
+      - name: Helm chart
+        run: |
+          chart=deploy/helm/data-avalanche
+          for values in "$chart"/ci/*-values.yaml; do
+            helm lint --strict "$chart" -f "$values"
+            helm template ci "$chart" -f "$values" \
+              | docker run --rm -i ghcr.io/yannh/kubeconform:v0.8.0 -strict -summary -kubernetes-version 1.37.0 -
+          done
+          # The API's TLS turns the probes to HTTPS.
+          [ "$(helm template ci "$chart" -f "$chart/ci/tls-values.yaml" | grep -c 'scheme: HTTPS')" = 3 ]
+      - name: Workflows
+        run: docker run --rm -v "$PWD:/repo:ro" --workdir /repo rhysd/actionlint:1.7.12 -no-color
       # RustSec advisory audit of Cargo.lock. Non-blocking by design: a vulnerable dependency is
       # reported (warning annotation + failed step) but never fails the job.
       - name: Install cargo-audit

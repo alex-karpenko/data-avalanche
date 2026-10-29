@@ -1,0 +1,9 @@
+apiVersion: v2
+name: data-avalanche
+description: Change data capture from PostgreSQL, MySQL and MariaDB into Delta Lake tables
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/alex-karpenko/data-avalanche
+sources:
+  - https://github.com/alex-karpenko/data-avalanche
