@@ -1,9 +1,10 @@
 //! A fake OTLP/HTTP collector (config §6.6), on a thread of its own: it answers every request
-//! 200 and hands over its path and body.
+//! 200 (or the status it is given) and hands over its path and body.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{Arc, mpsc};
 
 /// One export the collector took.
 #[derive(Debug, Clone)]
@@ -27,6 +28,15 @@ impl OtlpRequest {
 /// When it can't bind a port, or a request isn't HTTP/1.1 with a `content-length`.
 #[must_use]
 pub fn otlp_collector() -> (String, mpsc::Receiver<OtlpRequest>) {
+    otlp_collector_answering(Arc::new(AtomicU16::new(200)))
+}
+
+/// A collector that answers each request with the HTTP status `status` holds at the time.
+///
+/// # Panics
+/// As [`otlp_collector`].
+#[must_use]
+pub fn otlp_collector_answering(status: Arc<AtomicU16>) -> (String, mpsc::Receiver<OtlpRequest>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let (tx, rx) = mpsc::channel();
@@ -50,7 +60,8 @@ pub fn otlp_collector() -> (String, mpsc::Receiver<OtlpRequest>) {
             }
             let mut body = vec![0; length];
             reader.read_exact(&mut body).unwrap();
-            conn.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+            let status = status.load(Ordering::Relaxed);
+            conn.write_all(format!("HTTP/1.1 {status} S\r\ncontent-length: 0\r\n\r\n").as_bytes())
                 .unwrap();
             if tx.send(OtlpRequest { path, body }).is_err() {
                 return;

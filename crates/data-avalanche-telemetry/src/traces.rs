@@ -8,9 +8,9 @@
 //! batch exporter runs on a thread of its own and exports with a blocking client.
 
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use opentelemetry::trace::{Link, SpanKind, TraceContextExt, TraceId, TracerProvider};
 use opentelemetry::{Context, KeyValue};
@@ -26,6 +26,9 @@ use tracing_subscriber::registry::LookupSpan;
 
 /// How long a shutdown waits for the spans still queued.
 const SHUTDOWN: Duration = Duration::from_secs(5);
+
+/// While the exports keep failing, how often the failure is warned about again (config §6.6).
+const FAILING_WARNED_EVERY: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, thiserror::Error)]
 pub enum TracesError {
@@ -66,8 +69,77 @@ fn shown_in(text: &str, endpoint: &str) -> String {
 /// The OTLP exporter in force, `None` while tracing is off, and the resource every one carries.
 #[derive(Default)]
 struct Current {
-    exporter: Option<Arc<opentelemetry_otlp::SpanExporter>>,
+    exporter: Option<Arc<Exporter>>,
     resource: Option<Resource>,
+}
+
+/// An OTLP exporter, the endpoint it exports to, and how its exports have gone: a new one starts
+/// as if the last export had worked.
+struct Exporter {
+    otlp: opentelemetry_otlp::SpanExporter,
+    endpoint: String,
+    health: Health,
+}
+
+impl Exporter {
+    /// Logs how an export went (config §6.6: "an endpoint the exporter can't use is a warning
+    /// at run time"): the first failure after a success, then at most every
+    /// [`FAILING_WARNED_EVERY`], and once a success after failures. The SDK reports a failed
+    /// export only through its internal logs, which are off.
+    fn observe(&self, result: &OTelSdkResult) {
+        match result {
+            Err(e) => {
+                if self.health.failed(self.health.since.elapsed()) {
+                    tracing::warn!(
+                        "traces aren't exported to {}: {}",
+                        shown(&self.endpoint),
+                        shown_in(&e.to_string(), &self.endpoint)
+                    );
+                }
+            }
+            Ok(()) => {
+                if self.health.recovered() {
+                    tracing::info!("traces are exported to {} again", shown(&self.endpoint));
+                }
+            }
+        }
+    }
+}
+
+/// Whether an exporter's exports are failing, and when (since `since`, in ms) that was last
+/// warned about.
+struct Health {
+    since: Instant,
+    failing: AtomicBool,
+    warned_ms: AtomicU64,
+}
+
+impl Health {
+    fn new() -> Self {
+        Self {
+            since: Instant::now(),
+            failing: AtomicBool::new(false),
+            warned_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// An export failed at `now` (since `since`): whether to warn about it.
+    fn failed(&self, now: Duration) -> bool {
+        let now = u64::try_from(now.as_millis()).unwrap_or(u64::MAX);
+        let every = u64::try_from(FAILING_WARNED_EVERY.as_millis()).unwrap_or(u64::MAX);
+        let was_failing = self.failing.swap(true, Ordering::Relaxed);
+        let due =
+            !was_failing || now.saturating_sub(self.warned_ms.load(Ordering::Relaxed)) >= every;
+        if due {
+            self.warned_ms.store(now, Ordering::Relaxed);
+        }
+        due
+    }
+
+    /// An export worked: whether the ones before it had failed.
+    fn recovered(&self) -> bool {
+        self.failing.swap(false, Ordering::Relaxed)
+    }
 }
 
 /// The provider's exporter: whichever [`Traces::set`] put in force.
@@ -81,7 +153,7 @@ impl fmt::Debug for Switch {
 }
 
 impl Switch {
-    fn current(&self) -> Option<Arc<opentelemetry_otlp::SpanExporter>> {
+    fn current(&self) -> Option<Arc<Exporter>> {
         self.0
             .read()
             .unwrap_or_else(PoisonError::into_inner)
@@ -92,15 +164,17 @@ impl Switch {
 
 impl SpanExporter for Switch {
     async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
-        match self.current() {
-            Some(exporter) => exporter.export(batch).await,
-            None => Ok(()),
-        }
+        let Some(exporter) = self.current() else {
+            return Ok(());
+        };
+        let result = exporter.otlp.export(batch).await;
+        exporter.observe(&result);
+        result
     }
 
     fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
         self.current()
-            .map_or(Ok(()), |e| e.shutdown_with_timeout(timeout))
+            .map_or(Ok(()), |e| e.otlp.shutdown_with_timeout(timeout))
     }
 
     fn set_resource(&mut self, resource: &Resource) {
@@ -138,13 +212,28 @@ impl ShouldSample for Ratio {
 }
 
 /// The process's traces: exporting nothing until [`Traces::set`] gives them an endpoint.
-#[derive(Debug)]
 pub struct Traces {
     provider: SdkTracerProvider,
     switch: Switch,
     ratio: Ratio,
     /// The endpoint in force.
     endpoint: RwLock<Option<String>>,
+}
+
+/// Shows the endpoint as it may be logged ([`shown`]): an operator may put credentials in it.
+impl fmt::Debug for Traces {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let endpoint = self
+            .endpoint
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_deref()
+            .map(shown);
+        f.debug_struct("Traces")
+            .field("endpoint", &endpoint)
+            .field("sample_ratio", &self.ratio.get())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Traces {
@@ -200,7 +289,8 @@ impl Traces {
                     .exporter,
                 exporter.map(Arc::new),
             );
-            // Its blocking client can't be dropped on an async runtime's thread.
+            // Dropping its blocking client blocks, joining the client's own runtime thread
+            // (reqwest 0.13.5 `InnerClientHandle::drop`): kept off an async runtime's thread.
             if let Some(old) = old {
                 std::thread::spawn(move || drop(old));
             }
@@ -215,7 +305,7 @@ impl Traces {
         Ok(endpoint.is_some())
     }
 
-    fn exporter(&self, endpoint: &str) -> Result<opentelemetry_otlp::SpanExporter, TracesError> {
+    fn exporter(&self, endpoint: &str) -> Result<Exporter, TracesError> {
         let url = format!("{}/v1/traces", endpoint.trim_end_matches('/'));
         let mut exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_http()
@@ -235,7 +325,11 @@ impl Traces {
         if let Some(resource) = resource {
             exporter.set_resource(&resource);
         }
-        Ok(exporter)
+        Ok(Exporter {
+            otlp: exporter,
+            endpoint: endpoint.to_owned(),
+            health: Health::new(),
+        })
     }
 
     /// The `tracing` layer that turns spans into this provider's.
@@ -274,7 +368,162 @@ pub fn trace_ids(span: &span::Id, dispatch: &Dispatch) -> Option<(String, String
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicU16;
+
+    use data_avalanche_testkit::otlp_collector_answering;
+    use tracing_subscriber::layer::SubscriberExt;
+
     use super::*;
+
+    /// The events this crate logs, with their level.
+    #[derive(Clone, Default)]
+    struct Lines(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl Lines {
+        fn at(&self, level: tracing::Level) -> Vec<String> {
+            let lines = self.0.lock().unwrap();
+            lines
+                .iter()
+                .filter(|(l, _)| *l == level)
+                .map(|(_, text)| text.clone())
+                .collect()
+        }
+    }
+
+    impl<S: Subscriber> Layer<S> for Lines {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Message<'a>(&'a mut String);
+            impl tracing::field::Visit for Message<'_> {
+                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+                    if field.name() == "message" {
+                        *self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            if !event
+                .metadata()
+                .target()
+                .starts_with("data_avalanche_telemetry")
+            {
+                return;
+            }
+            let mut text = String::new();
+            event.record(&mut Message(&mut text));
+            self.0
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), text));
+        }
+    }
+
+    /// Polls `future` on this thread to its end: the export the batch thread would run.
+    fn block_on<F: Future>(future: F) -> F::Output {
+        struct Unpark(std::thread::Thread);
+        impl std::task::Wake for Unpark {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+        loop {
+            if let std::task::Poll::Ready(out) = future.as_mut().poll(&mut cx) {
+                return out;
+            }
+            std::thread::park();
+        }
+    }
+
+    /// Config §6.6: an endpoint the exporter can't use is a warning at run time. A collector that
+    /// keeps refusing is warned about once, not at each export, and without its credentials; an
+    /// export that works again says so; the next failure, or a new exporter, warns again.
+    #[test]
+    fn a_failing_export_is_warned_about_once_without_its_credentials() {
+        let status = Arc::new(AtomicU16::new(500));
+        let (url, requests) = otlp_collector_answering(status.clone());
+        let endpoint = url.replace("http://", "http://u:secret@");
+        let traces = Traces::new("node-1");
+        traces.set(Some(&endpoint), 1.0).unwrap();
+        let lines = Lines::default();
+        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(lines.clone()));
+        let export = || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                block_on(traces.switch.export(Vec::new()))
+            })
+        };
+
+        for _ in 0..3 {
+            assert!(export().is_err());
+        }
+        for _ in 0..3 {
+            requests.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+        let warned = lines.at(tracing::Level::WARN);
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(
+            warned[0].contains(&url.replace("http://", "")),
+            "{warned:?}"
+        );
+        assert!(!warned[0].contains("secret"), "{warned:?}");
+        assert!(!warned[0].contains("u:"), "{warned:?}");
+
+        status.store(200, Ordering::Relaxed);
+        assert!(export().is_ok());
+        assert!(export().is_ok());
+        let again = lines.at(tracing::Level::INFO);
+        assert_eq!(again.len(), 1, "{again:?}");
+        assert!(!again[0].contains("secret"), "{again:?}");
+
+        status.store(500, Ordering::Relaxed);
+        assert!(export().is_err());
+        assert!(export().is_err());
+        assert_eq!(lines.at(tracing::Level::WARN).len(), 2);
+
+        traces.set(None, 1.0).unwrap();
+        traces.set(Some(&endpoint), 1.0).unwrap();
+        assert!(export().is_err());
+        assert_eq!(lines.at(tracing::Level::WARN).len(), 3, "a new exporter");
+        assert!(
+            lines
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, text)| !text.contains("secret"))
+        );
+    }
+
+    #[test]
+    fn a_failure_that_lasts_is_warned_about_again_only_after_a_while() {
+        let health = Health::new();
+        let at = |minutes: u64| Duration::from_secs(minutes * 60);
+        assert!(health.failed(at(0)), "the first failure");
+        assert!(!health.failed(at(1)));
+        assert!(!health.failed(at(4)));
+        assert!(health.failed(at(5)), "FAILING_WARNED_EVERY later");
+        assert!(!health.failed(at(9)));
+        assert!(health.recovered());
+        assert!(!health.recovered(), "said once");
+        assert!(health.failed(at(10)), "the first failure after a success");
+    }
+
+    #[test]
+    fn the_debug_of_traces_leaves_out_the_endpoint_s_credentials() {
+        let (url, _requests) = data_avalanche_testkit::otlp_collector();
+        let traces = Traces::new("node-1");
+        let endpoint = format!("{}/?token=t0k", url.replace("http://", "http://u:secret@"));
+        traces.set(Some(&endpoint), 1.0).unwrap();
+        let text = format!("{traces:?}");
+        assert!(text.contains(&url.replace("http://", "")), "{text}");
+        assert!(!text.contains("secret"), "{text}");
+        assert!(!text.contains("t0k"), "{text}");
+    }
 
     #[test]
     fn the_switch_carries_the_resource_before_the_batch_thread_applies_it() {
