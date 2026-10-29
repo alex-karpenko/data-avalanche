@@ -2285,3 +2285,7 @@ git commit -m "ci: the release — on a v* tag, the image for amd64 and arm64 wi
 - Task 3: Step 3's block of `ci.yml` takes that blank line as context, so it doesn't apply after
   Task 2's commit; the commit adds the same 55 lines, the blank line before the `k3s` job among
   them.
+- Task 4 (the task review's Important finding): the `github-release` job's SBOM step pulls the
+  joined image from GHCR, which starts private (DA-OPS-11), with no login; the job takes
+  `packages: read` and logs in to `ghcr.io` before it, as the image's jobs do. Step 3's block of
+  `weekly.yml` also ends the file with a blank line, which the commit leaves out.
