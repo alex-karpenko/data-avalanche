@@ -5386,4 +5386,10 @@ git commit -m "gap: v1 §50 — M11b's docs: DA-OPS-8, DA-API-14/15, DA-SNAP-17/
 
 ## Deviations during execution
 
-(none yet)
+- **Task 1, three `FIELD_DOCS` rows** (found by the task review, fixed in the task's commit):
+  - The two `heartbeat` rows (`postgres`, `mysql`) now give the watchdog's condition, as §9.2.1/§9.2.2
+    of the config spec do. A silent stream is reconnected only while the heartbeat's reads of the slot,
+    or its checks for the binlog dump, fail or find no reader.
+  - `catalog.rest.auth` no longer offers `sigv4` as a mode: V-116 refuses it on the pinned client.
+  - The table's text now differs from this plan's Task 1 block in those three strings. Nothing else
+    changed, and the tests are the same.
