@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-28
+updated: 2026-10-29
 domain: Architecture
 tags: [observability, metrics, prometheus, tracing, otlp, logs, correlation, cardinality, cdc]
 resolves: [G-33, G-32]
@@ -80,12 +80,17 @@ All Prometheus, exposed at `/metrics` (unauthenticated, per System-Overview / RB
   status carries the commit time; the controller computes the age at each status change and each
   renewal poll, clamped at 0 when the node's clock is behind the source's. It sees only what the
   pipeline read: an unread backlog is the source series' to show.
+  - It carries across a worker restart: what an ended worker read and didn't make durable still
+    counts, so the lag grows while no worker runs (a restart's backoff, `ERROR`). The next worker
+    takes over once it reads a change again, or has read as far with nothing pending.
 - **The binlog lag** (MySQL, MariaDB): the age of the last transaction the stream read, `0` once
   the stream is at the server's head, with no series without a stream.
   - A server heartbeat says the stream caught up. The lag stays `0` while the server's head
     doesn't move past the head the first check after the heartbeat saw.
   - Once it moves past, the lag counts from the heartbeat, so a stream that stopped reading
     after an idle stretch shows its stall.
+  - The series is absent while the server's head can't be read, and for a stream reopened behind
+    the head until its first transaction ends.
   - A MySQL pipeline has no `wal_lag_bytes`; a PostgreSQL one has no binlog lag.
 - **`rows_read_total{op}`**: `insert`, `update`, `delete` for the row changes the stream reads,
   before the collapse; `snapshot` for chunk rows.
@@ -122,7 +127,8 @@ All Prometheus, exposed at `/metrics` (unauthenticated, per System-Overview / RB
   reload swaps, and `ParentBased(TraceIdRatioBased)` whose ratio a reload sets. The layer itself
   can't be reloaded: `tracing-opentelemetry`'s `get_otel_context` finds it by downcasting through
   the subscriber, which `reload::Layer` doesn't forward. An endpoint the exporter can't use keeps
-  the one in force, with a warning. At exit the queue is exported, within 5 s.
+  the one in force, with a warning. An export that fails is warned of once, then every 5 min
+  while it fails, and once at INFO when it works again. At exit the queue is exported, within 5 s.
 - **Spans** (`sink.commit` is the sink-neutral name of `iceberg.commit`):
   - `pipeline.flush`: a root per flush; fields `pipeline`, `change_sets`, `rows`, `checkpoint`.
   - `sink.commit`: a child per table; fields `table`, `rows`, `attempts`, `outcome` (`committed`,
