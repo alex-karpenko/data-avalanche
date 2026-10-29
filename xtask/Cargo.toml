@@ -1,0 +1,15 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Repository automation: the documentation site's generated pages (cargo xtask docs)."
+
+[lints]
+workspace = true
+
+[dependencies]
+data-avalanche-config.workspace = true
+data-avalanche-api.workspace = true
+serde_json.workspace = true
