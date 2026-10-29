@@ -392,7 +392,7 @@ impl Metrics {
         );
         r.register(
             "flush_duration_seconds",
-            "How long a flush took, from its hand-off to the writer until it was durable",
+            "How long a flush took, from when the writer took it up until it was durable",
             f.flush_duration.clone(),
         );
         r.register("flush_rows", "Rows a flush carried", f.flush_rows.clone());
