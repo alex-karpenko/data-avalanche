@@ -2278,4 +2278,7 @@ git commit -m "ci: the release — on a v* tag, the image for amd64 and arm64 wi
 
 ## Deviations during execution
 
-(none yet)
+- Task 2: two comments of Step 3's blocks name the tests' file `chart.rs`, its name early in
+  planning (`.github/workflows/ci.yml`, the chart step's comment; `ci/example-values.yaml`, its
+  header): the commit names `packaging.rs`. The block of `ci.yml` also ends the file with a blank
+  line, which the commit leaves out.
