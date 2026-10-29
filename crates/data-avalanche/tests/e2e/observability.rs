@@ -300,14 +300,24 @@ async fn the_flushes_commits_and_chunks_are_traced_to_the_collector() {
                 })
             })
     };
+    // The spans the wait saw: a second query could time out, or come back without the root.
+    let seen = std::cell::RefCell::new(Vec::new());
     eventually(
         "a traced flush and its commit",
         Duration::from_secs(60),
-        async || committed(&traced("pipeline.flush", since).await),
+        async || {
+            let spans = traced("pipeline.flush", since).await;
+            let found = committed(&spans);
+            *seen.borrow_mut() = spans;
+            found
+        },
     )
     .await;
-    let flushes = traced("pipeline.flush", since).await;
-    let (flush, _) = roots(&flushes, "pipeline.flush", &e.test)[0];
+    let flushes = seen.into_inner();
+    let (flush, _) = roots(&flushes, "pipeline.flush", &e.test)
+        .into_iter()
+        .next()
+        .expect("a flush root, as the wait saw");
     assert_eq!(
         flush.resource.get("service.name").map(String::as_str),
         Some("data-avalanche")
