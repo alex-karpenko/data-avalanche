@@ -177,7 +177,7 @@ jobs:
   # RustFS; a deleted pod hands the pipeline to the others. No secrets.
   k3s:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     needs: check
     env:
       DATA_AVALANCHE_IT: "1"
@@ -204,6 +204,7 @@ jobs:
           file: deploy/docker/Dockerfile
           tags: data-avalanche:k3s
           load: true
+          # The gha cache holds the layers only: a change under crates/ builds the binary cold.
           cache-from: type=gha,scope=k3s
           cache-to: type=gha,mode=max,scope=k3s
       # rustls's platform verifier reads the distroless CA bundle: S3, GCS and Azure over TLS.

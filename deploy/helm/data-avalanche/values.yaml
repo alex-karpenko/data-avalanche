@@ -28,6 +28,9 @@ ports:
   gossip: 7946
 apiTls: false
 
+# The cluster's DNS domain, for the discovery name.
+clusterDomain: cluster.local
+
 replicaCount: 3
 
 image:

@@ -2,8 +2,8 @@ name: release
 
 # A v* tag publishes the release (Q-M11-1): the image for linux/amd64 and linux/arm64, each built
 # on a runner of its own architecture, to ghcr.io/<owner>/data-avalanche with an SBOM and a
-# provenance attestation; the Helm chart as an OCI artifact to ghcr.io/<owner>/charts; and a
-# GitHub release with the SBOM. The tag must equal the workspace's version and the chart's.
+# provenance attestation; then, once the image is published, the Helm chart as an OCI artifact to
+# ghcr.io/<owner>/charts; and a GitHub release with the SBOM. The tag must equal the workspace's version and the chart's.
 # A manual run builds both images and packages the chart without pushing anything.
 on:
   push:
@@ -116,6 +116,8 @@ jobs:
         env:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
+          # Every non-pre-release tag moves X.Y and latest, so a patch on an older line moves them back
+          # (accepted until release branches exist).
           tags=(-t "$IMAGE:$VERSION")
           case "$VERSION" in
             *-*) ;;  # a pre-release takes its own tag only
@@ -126,7 +128,10 @@ jobs:
           docker buildx imagetools create "${tags[@]}" "${refs[@]}"
           digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
-      - uses: actions/attest-build-provenance@v4
+      # A private repository has no artifact attestations (outside GitHub Enterprise Cloud): it relies
+      # on BuildKit's in-registry provenance (mode=max) and the SBOM; this step runs once it is public.
+      - if: ${{ !github.event.repository.private }}
+        uses: actions/attest-build-provenance@v4
         with:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.push.outputs.digest }}
@@ -137,7 +142,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
     steps:
       - uses: actions/checkout@v7
       - uses: azure/setup-helm@v5
@@ -145,11 +149,6 @@ jobs:
           version: v4.3.0
       - name: Package
         run: helm package deploy/helm/data-avalanche --destination dist
-      - if: env.PUBLISH == 'true'
-        name: Push
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
-          helm push "dist/data-avalanche-${{ needs.version.outputs.version }}.tgz" "$CHARTS"
       - uses: actions/upload-artifact@v7
         with:
           name: chart
@@ -161,22 +160,33 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      packages: read
+      packages: write
     steps:
       - uses: actions/download-artifact@v8
         with:
           name: chart
           path: dist
+      - uses: azure/setup-helm@v5
+        with:
+          version: v4.3.0
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: The chart
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          echo "$TOKEN" | helm registry login ghcr.io -u "$ACTOR" --password-stdin
+          helm push "dist/data-avalanche-$VERSION.tgz" "$CHARTS"
       - uses: anchore/sbom-action@v0.24.3
         with:
           image: ${{ env.IMAGE }}@${{ needs.manifest.outputs.digest }}
           format: spdx-json
-          output-file: dist/data-avalanche-${{ needs.version.outputs.version }}.spdx.json
+          output-file: dist/data-avalanche-${{ needs.version.outputs.version }}-linux-amd64.spdx.json
           upload-artifact: false
       - name: The release
         env:

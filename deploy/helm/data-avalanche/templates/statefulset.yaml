@@ -25,6 +25,7 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ include "data-avalanche.serviceAccountName" . }}
+      automountServiceAccountToken: false
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -57,7 +58,7 @@ spec:
                 fieldRef:
                   fieldPath: status.podIP
             - name: DATA_AVALANCHE_DISCOVERY_DNS_NAME
-              value: "{{ include "data-avalanche.headless" . }}.$(POD_NAMESPACE).svc.cluster.local"
+              value: "{{ include "data-avalanche.headless" . }}.$(POD_NAMESPACE).svc.{{ .Values.clusterDomain }}"
             {{- with .Values.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

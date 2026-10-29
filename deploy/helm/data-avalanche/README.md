@@ -34,11 +34,14 @@ globals:
 
 Secrets reach the config's `${VAR}`s through `env` or `envFrom`; a cloud identity through
 `serviceAccount.annotations`. `ci/example-values.yaml` is a complete example, `ci/tls-values.yaml`
-one with the API's TLS on.
+one with the API's TLS on; both are in the repository's `deploy/helm/data-avalanche/ci/`.
 
 A changed config reaches a running cluster through the API's reload (`POST /v1/config/reload`),
 not through `helm upgrade` alone: a starting node adopts the cluster's latest config generation,
 not its file (config §12). The chart has no checksum annotation that would restart the pods.
+The kubelet updates a mounted ConfigMap after a delay (up to about a minute), so wait before
+`POST /v1/config/reload`, or call `POST /v1/config/validate` first, which reports what a reload
+would change.
 
 ## Values
 
@@ -47,12 +50,13 @@ not its file (config §12). The chart has no checksum annotation that would rest
 | `config` | `{}` | The config, a map or text. Required unless `existingConfigMap` |
 | `existingConfigMap`, `configKey` | `""`, `config.yaml` | A ConfigMap of your own, and its key |
 | `ports.api`, `ports.gossip`, `apiTls` | `8080`, `7946`, `false` | When the config isn't a map that names them (`globals.api.address`, `memberlist.bind_port`, `globals.api.tls.enabled`) |
+| `clusterDomain` | `cluster.local` | The cluster's DNS domain, for the discovery name |
 | `replicaCount` | `3` | |
 | `image.repository`, `image.tag`, `image.pullPolicy` | `ghcr.io/alex-karpenko/data-avalanche`, the chart's `appVersion`, `IfNotPresent` | |
 | `env`, `envFrom` | `[]` | The secrets the config names |
 | `serviceAccount.create`, `.name`, `.annotations` | `true`, `""`, `{}` | |
 | `service.type`, `.nodePort`, `.annotations` | `ClusterIP`, `null`, `{}` | The API, `/metrics` and the probes |
-| `terminationGracePeriodSeconds` | `90` | Above `drain_timeout` (60 s): a deleted pod hands its pipelines off first |
+| `terminationGracePeriodSeconds` | `90` | Above `drain_timeout` (60 s): a deleted pod hands its pipelines off first; raise it with `globals.cluster.drain_timeout` |
 | `livenessProbe`, `readinessProbe`, `startupProbe` | `/health/live`, `/health/ready`, `/health/live` | HTTPS when the API's TLS is on |
 | `resources` | requests 500m, 1Gi; limit 2Gi | |
 | `podDisruptionBudget.enabled`, `.maxUnavailable` | `true`, `1` | |

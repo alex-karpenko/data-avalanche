@@ -1,14 +1,14 @@
-{{/* The release's name for its objects, at most 63 characters. */}}
+{{/* The release's name for its objects, at most 52 characters: a StatefulSet's pods carry a controller-revision-hash label of the name plus 11. */}}
 {{- define "data-avalanche.fullname" -}}
 {{- if contains .Chart.Name .Release.Name -}}
-{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- .Release.Name | trunc 52 | trimSuffix "-" -}}
 {{- else -}}
-{{- printf "%s-%s" .Release.Name .Chart.Name | trunc 63 | trimSuffix "-" -}}
+{{- printf "%s-%s" .Release.Name .Chart.Name | trunc 52 | trimSuffix "-" -}}
 {{- end -}}
 {{- end -}}
 
 {{- define "data-avalanche.headless" -}}
-{{- printf "%s-headless" (include "data-avalanche.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- printf "%s-headless" (include "data-avalanche.fullname" .) -}}
 {{- end -}}
 
 {{- define "data-avalanche.selectorLabels" -}}
