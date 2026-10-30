@@ -434,6 +434,7 @@ mod tests {
         docs.save_slot(&SlotDoc {
             slot_name: "orders_slot".into(),
             confirmed_flush_lsn: lsn,
+            server: None,
         })
         .await
         .unwrap();

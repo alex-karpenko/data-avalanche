@@ -46,7 +46,11 @@ pub(crate) enum Decision {
 pub(crate) fn decide(mode: SnapshotMode, plan: Plan, f: Facts) -> (Decision, Option<String>) {
     let recovery = matches!(
         plan,
-        Plan::Fresh(SnapshotReason::PositionLost | SnapshotReason::AdoptedOrphan)
+        Plan::Fresh(
+            SnapshotReason::PositionLost
+                | SnapshotReason::AdoptedOrphan
+                | SnapshotReason::SourceChanged
+        )
     );
     let snapshot = |dump| Decision::Snapshot {
         resume: f.in_progress && !recovery,
@@ -54,7 +58,9 @@ pub(crate) fn decide(mode: SnapshotMode, plan: Plan, f: Facts) -> (Decision, Opt
     };
     match mode {
         SnapshotMode::Never => {
-            let gap = if recovery {
+            let gap = if plan == Plan::Fresh(SnapshotReason::SourceChanged) {
+                Some("the source server changed and the stream starts on the new one".to_string())
+            } else if recovery {
                 Some("the stream position was lost and recreated".to_string())
             } else if f.added {
                 Some("the table was added to the stream at this start".to_string())
@@ -92,6 +98,7 @@ mod tests {
     const FIRST: Plan = Plan::Fresh(SnapshotReason::FirstStart);
     const LOST: Plan = Plan::Fresh(SnapshotReason::PositionLost);
     const ADOPTED: Plan = Plan::Fresh(SnapshotReason::AdoptedOrphan);
+    const CHANGED: Plan = Plan::Fresh(SnapshotReason::SourceChanged);
 
     fn facts(tracked_before: bool, in_progress: bool, sink_has_table: bool, added: bool) -> Facts {
         Facts {
@@ -124,6 +131,7 @@ mod tests {
             (M::Initial, RESUME, known, Decision::Stream),
             (M::Initial, LOST, known, snap(false, false)),
             (M::Initial, ADOPTED, known, snap(false, false)),
+            (M::Initial, CHANGED, known, snap(false, false)),
             (
                 M::Initial,
                 RESUME,
@@ -174,7 +182,7 @@ mod tests {
     #[test]
     fn a_snapshot_interrupted_before_a_gap_starts_over() {
         let interrupted = facts(true, true, true, false);
-        for plan in [LOST, ADOPTED] {
+        for plan in [LOST, ADOPTED, CHANGED] {
             for (mode, dump) in [
                 (M::Initial, false),
                 (M::Always, false),
@@ -198,6 +206,9 @@ mod tests {
             assert_eq!(d, Decision::Stream);
             assert!(w.unwrap().contains("position was lost"));
         }
+        let (d, w) = decide(M::Never, CHANGED, known);
+        assert_eq!(d, Decision::Stream);
+        assert!(w.unwrap().contains("source server changed"));
         let (_, w) = decide(M::Never, RESUME, facts(true, false, true, true));
         assert!(w.unwrap().contains("added to the stream"));
         assert_eq!(decide(M::Never, FIRST, Facts::default()).1, None);

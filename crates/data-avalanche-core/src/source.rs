@@ -101,6 +101,12 @@ pub enum SnapshotReason {
     /// No pipeline state, but the source kept a stream position: `on_orphan: adopt_resnapshot`
     /// took it over (D-15.1).
     AdoptedOrphan,
+    /// The checkpoint was read on another server (PostgreSQL: another system identifier or
+    /// timeline; MySQL / MariaDB in file/position mode: another server), and the pipeline's
+    /// `source_change_action` / `binlog_purge_action` is `re_snapshot`. The stream starts from the
+    /// new server's position, and every table's marker is replaced by it first: the new server's
+    /// positions may sit below ones the lake has marked, which the guard would skip (DA-SRC-20).
+    SourceChanged,
 }
 
 /// How streaming starts (Postgres_Slot… §1, the slot state machine).
@@ -115,15 +121,25 @@ pub enum StartPlan {
     },
 }
 
-/// The source server a stream position was read from (MySQL / MariaDB). A binlog file and offset
-/// mean something only on the server that wrote them: in file/position mode a start against
-/// another server halts the pipeline (`BINLOG_SOURCE_CHANGED`, Data-Flow Phase 2b). Its JSON is
-/// the `server` of `replication/position.json`.
+/// The source server a stream position was read from. A binlog file and offset mean something only
+/// on the server that wrote them: in file/position mode a start against another server halts the
+/// pipeline (`BINLOG_SOURCE_CHANGED`, Data-Flow Phase 2b). A PostgreSQL LSN means something only
+/// on its cluster's timeline: a promoted replica keeps the system identifier and starts a new
+/// timeline, whose LSNs may repeat ones the lake has already marked (`WAL_SOURCE_CHANGED`,
+/// DA-SRC-20). Its JSON is the `server` of `replication/position.json` or `replication/slot.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "engine", rename_all = "lowercase", deny_unknown_fields)]
 pub enum ServerIdentity {
-    Mysql { server_uuid: String },
-    Mariadb { server_id: u32 },
+    Mysql {
+        server_uuid: String,
+    },
+    Mariadb {
+        server_id: u32,
+    },
+    Postgres {
+        system_identifier: u64,
+        timeline: u32,
+    },
 }
 
 impl fmt::Display for ServerIdentity {
@@ -131,6 +147,13 @@ impl fmt::Display for ServerIdentity {
         match self {
             Self::Mysql { server_uuid } => write!(f, "MySQL server {server_uuid}"),
             Self::Mariadb { server_id } => write!(f, "MariaDB server_id {server_id}"),
+            Self::Postgres {
+                system_identifier,
+                timeline,
+            } => write!(
+                f,
+                "PostgreSQL system {system_identifier} on timeline {timeline}"
+            ),
         }
     }
 }

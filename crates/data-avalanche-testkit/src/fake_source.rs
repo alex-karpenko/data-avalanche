@@ -258,6 +258,8 @@ struct Db {
     opened: Vec<Checkpoint>,
     /// [`FakeSource::set_server`].
     server: Option<ServerIdentity>,
+    /// [`FakeSource::fail_over`]: the next `prepare` from a checkpoint is a source change.
+    failed_over: bool,
     reads: BTreeMap<TableRef, usize>,
     rescans: usize,
     in_flights: usize,
@@ -315,6 +317,7 @@ impl FakeSource {
             acknowledged: vec![],
             opened: vec![],
             server: None,
+            failed_over: false,
             reads: BTreeMap::new(),
             rescans: 0,
             in_flights: 0,
@@ -452,6 +455,19 @@ impl FakeSource {
     pub fn lose_slot(&self) {
         self.db().slot_lost = true;
         self.wake.notify_waiters();
+    }
+
+    /// A failover to a replica whose WAL ends at `wal_end`, behind the old server's: the WAL past
+    /// it is gone, the slot didn't come over, and `server` answers from now on. The next
+    /// `prepare` from a checkpoint starts from the new server's position, as
+    /// `source_change_action: re_snapshot` does ([`SnapshotReason::SourceChanged`]).
+    pub fn fail_over(&self, server: ServerIdentity, wal_end: Lsn) {
+        let mut db = self.db();
+        db.wal.retain(|e| e.end() <= wal_end);
+        db.wal_end = wal_end;
+        db.slot = None;
+        db.server = Some(server);
+        db.failed_over = true;
     }
 
     /// The tables the next resuming `prepare` reports in `Prepared::added`.
@@ -962,7 +978,9 @@ impl SourceConnector for FakeSource {
         db.prepares.push(checkpoint.cloned());
         let server = db.server.clone();
         let checkpoint = checkpoint.map(|c| lsn(&c.position));
+        let failed_over = std::mem::take(&mut db.failed_over);
         let reason = match (checkpoint, db.slot) {
+            (Some(_), _) if failed_over => Some(SnapshotReason::SourceChanged),
             (None, None) => Some(SnapshotReason::FirstStart),
             (None, Some(_)) => {
                 return Err(SourceError::Permanent(

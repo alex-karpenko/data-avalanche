@@ -116,6 +116,7 @@ pub(crate) fn change_set(end: u64, up: Vec<RecordBatch>, del: Vec<RecordBatch>) 
         },
         split: None,
         snapshot: false,
+        reposition: false,
     }
 }
 

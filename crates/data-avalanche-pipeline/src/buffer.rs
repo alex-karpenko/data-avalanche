@@ -594,6 +594,7 @@ impl TableBuffer {
             position,
             split,
             snapshot: false,
+            reposition: false,
         }
     }
 }

@@ -11,8 +11,9 @@ use std::time::Instant;
 
 use data_avalanche_config::{Pipeline, SnapshotMode};
 use data_avalanche_core::{
-    Checkpoint, HaltReason, SchemaHint, Sink, SinkError, SinkKind, SnapshotReason, SourceConnector,
-    SourceError, StartPlan, TableRef, TableSchema, TableSpec,
+    Checkpoint, CommitMarker, CommitOutcome, HaltReason, PositionRange, SchemaHint, Sink,
+    SinkError, SinkKind, SnapshotReason, SourceConnector, SourceError, SourcePosition, StartPlan,
+    TableChangeSet, TableRef, TableSchema, TableSpec,
 };
 use data_avalanche_state::{PipelineDocs, SnapshotStatus, StateError, TableHalt, TableSnapshotDoc};
 use data_avalanche_storage::StoreError;
@@ -331,6 +332,56 @@ where
 /// new checkpoint `reset_position` returned). Leaves the core tracking the tables to stream, with
 /// every decision persisted: halts and snapshot requests first, then the cached schemas, then a
 /// fresh start's checkpoint, recorded with the server the start read (MySQL).
+/// Moves the table's marker onto `at`, the new server's position (DA-SRC-20): an empty change set
+/// that replaces the marker instead of joining it. A table the lake doesn't hold, or holds no
+/// marker for, has nothing to move.
+async fn reposition(
+    core: &Core,
+    tuning: &Tuning,
+    schema: &TableSchema,
+    at: &SourcePosition,
+) -> Result<(), WorkerError> {
+    let table = schema.table();
+    let state = sink_retry(tuning, || core.may_write(), || core.sink.table_state(table)).await?;
+    let (true, Some(_), Some(columns)) = (state.exists, state.marker, state.schema) else {
+        return Ok(());
+    };
+    let cs = TableChangeSet {
+        table: table.clone(),
+        schema: columns,
+        identifier: schema.identifier().to_vec(),
+        truncate: false,
+        upserts: vec![],
+        deletes: vec![],
+        position: PositionRange {
+            start: at.clone(),
+            end: at.clone(),
+            last_change: at.clone(),
+        },
+        split: None,
+        snapshot: false,
+        reposition: true,
+    };
+    let marker = CommitMarker {
+        owner_epoch: core.owner_epoch,
+        committed_position: at.clone(),
+        pipeline_id: core.settings.pipeline_id.clone(),
+    };
+    let committed = sink_retry(
+        tuning,
+        || core.may_write(),
+        || core.sink.commit(cs.clone(), marker.clone()),
+    )
+    .await?;
+    match committed {
+        CommitOutcome::Fenced { current_epoch } => Err(WorkerError::Fenced {
+            table: table.clone(),
+            current_epoch,
+        }),
+        CommitOutcome::Committed { .. } | CommitOutcome::SkippedCovered => Ok(()),
+    }
+}
+
 pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(), WorkerError> {
     core.update(|st| st.phase = Phase::Starting);
     let s = &core.settings;
@@ -516,7 +567,11 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
     })?;
     let gap = matches!(
         plan,
-        Plan::Fresh(SnapshotReason::PositionLost | SnapshotReason::AdoptedOrphan)
+        Plan::Fresh(
+            SnapshotReason::PositionLost
+                | SnapshotReason::AdoptedOrphan
+                | SnapshotReason::SourceChanged
+        )
     );
 
     // Each table: what this start does with it.
@@ -830,6 +885,17 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
             core.docs.clear_halt(table).await?;
         }
     }
+    // A source change moves every table the lake holds onto the new server's positions before
+    // the checkpoint that names the server: a restart in between still finds the old one
+    // recorded, and repositions them again (DA-SRC-20).
+    if matches!(plan, Plan::Fresh(SnapshotReason::SourceChanged)) {
+        let tables: BTreeSet<&TableRef> = resolved_tables.keys().chain(cached.keys()).collect();
+        for table in tables {
+            if let Some(schema) = cached.get(table).or_else(|| resolved_tables.get(table)) {
+                reposition(core, &tuning, schema, &at).await?;
+            }
+        }
+    }
     if let Some(doc) = fresh {
         if core.hooks.at(&HookPoint::SchemasCached) == HookAction::Crash {
             return Err(WorkerError::Crashed(HookPoint::SchemasCached));
@@ -1020,6 +1086,67 @@ mod tests {
         assert_eq!(w.source.reads(&t("b")), 0);
         assert_eq!(st.warnings.len(), 1, "{:?}", st.warnings);
         assert!(st.warnings[0].contains("public.b") && st.warnings[0].contains("lost"));
+    }
+
+    /// A failover to a replica behind the lake (DA-SRC-20): the new server's LSNs sit below the
+    /// table's marker, and the guard would skip its changes. The source-change start repositions
+    /// the table first, so a change on the new server lands even under `never` (nothing copied).
+    #[tokio::test]
+    async fn a_source_change_repositions_every_table_before_streaming() {
+        let w = World::new(&["a"]);
+        let pg = |timeline| ServerIdentity::Postgres {
+            system_identifier: 7,
+            timeline,
+        };
+        w.source.set_server(Some(pg(1)));
+        w.source.load(&t("a"), rows(1..=2));
+        run(&w, &mode("mode: initial"), async |status| {
+            for id in 3..=6 {
+                w.source
+                    .commit(FakeTxn::new().insert(&t("a"), row(id, "before")));
+            }
+            streamed(&status, &w).await;
+        })
+        .await
+        .0
+        .unwrap();
+        let marked = w.sink.table_state(&t("a")).await.unwrap().marker.unwrap();
+        assert!(
+            marked
+                .committed_position
+                .covers(&SourcePosition::Pg(Lsn(0x110)))
+                .unwrap(),
+            "{marked:?}"
+        );
+        w.source.fail_over(pg(2), Lsn(0x100));
+        let (end, st) = run(&w, &mode("mode: never"), async |status| {
+            streamed(&status, &w).await;
+            w.source
+                .commit(FakeTxn::new().insert(&t("a"), row(9, "on the new server")));
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!(w.ids("a"), [1, 2, 3, 4, 5, 6, 9]);
+        let moved = w.sink.table_state(&t("a")).await.unwrap().marker.unwrap();
+        assert!(
+            !moved
+                .committed_position
+                .covers(&marked.committed_position)
+                .unwrap(),
+            "{moved:?}"
+        );
+        assert_eq!(
+            w.docs.slot().await.unwrap().unwrap().doc.server,
+            Some(pg(2))
+        );
+        assert!(
+            st.warnings
+                .iter()
+                .any(|w| w.contains("source server changed")),
+            "{:?}",
+            st.warnings
+        );
     }
 
     #[tokio::test]

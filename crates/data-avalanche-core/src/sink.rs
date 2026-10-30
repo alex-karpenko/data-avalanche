@@ -187,9 +187,10 @@ impl CommitMarker {
     /// inside the transaction.
     ///
     /// A snapshot set is never skipped: its rows are read now, not replayed history, and its range
-    /// is the stream's frontier, which the marker may cover already.
+    /// is the stream's frontier, which the marker may cover already. Nor is a reposition, whose
+    /// point is to replace the marker.
     pub fn covers(&self, cs: &TableChangeSet) -> Result<bool, PositionError> {
-        if cs.snapshot {
+        if cs.snapshot || cs.reposition {
             return Ok(false);
         }
         let stored = &self.committed_position;
@@ -320,7 +321,8 @@ pub trait Sink: Send + Sync {
     /// 5. the set's identifier must be the one the table was created with, and every column of
     ///    the set must be in the table with the same type;
     /// 6. apply, as one table version: the truncate clear, then the deletes, then the upserts;
-    /// 7. store the marker with the **union** of the prior stored position and the new one.
+    /// 7. store the marker with the **union** of the prior stored position and the new one; a
+    ///    [`TableChangeSet::reposition`] stores its own position instead.
     async fn commit(
         &self,
         cs: TableChangeSet,
@@ -374,6 +376,7 @@ mod tests {
             },
             split,
             snapshot: false,
+            reposition: false,
         }
     }
 
@@ -487,6 +490,14 @@ mod tests {
             "chunk rows are read now, at a frontier the marker covers"
         );
         assert!(!marker(1, 500).covers(&chunk).unwrap());
+    }
+
+    /// A reposition replaces the marker: the marker never covers it, however far past it is.
+    #[test]
+    fn the_guard_never_skips_a_reposition() {
+        let mut moved = change_set(20, None);
+        moved.reposition = true;
+        assert!(!marker(1, 500).covers(&moved).unwrap());
     }
 
     #[test]
