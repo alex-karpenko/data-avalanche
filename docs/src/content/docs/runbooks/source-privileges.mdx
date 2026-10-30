@@ -1,0 +1,137 @@
+---
+title: Source privileges
+description: The roles, grants and server settings a source database needs before a pipeline starts.
+sidebar:
+  order: 1
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+A pipeline checks its source when it starts. A missing privilege or setting stops that pipeline
+(or that table) with a message naming it, and the other pipelines run. Set these up before the
+first start. Storage permissions are in [Storage](/data-avalanche/configuration/storage/#permissions).
+
+<Tabs>
+<TabItem label="PostgreSQL">
+
+**Settings** (`postgresql.conf`; `wal_level` needs a server restart):
+
+```ini
+wal_level = logical
+max_replication_slots = 10      # at least one per pipeline, plus your others
+max_wal_senders = 10
+max_slot_wal_keep_size = 100GB  # so a forgotten slot can't fill the disk
+```
+
+**A role the pipeline manages its slot and publication with** (the default,
+`slot_management: managed`):
+
+```sql
+CREATE ROLE cdc LOGIN REPLICATION PASSWORD '…';
+GRANT CREATE ON DATABASE shop TO cdc;                 -- CREATE PUBLICATION
+GRANT USAGE ON SCHEMA public TO cdc;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO cdc;   -- snapshots and the catalog checks
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO cdc;
+```
+
+This role must own the tables: PostgreSQL lets only a table's owner add it to a publication, and
+without ownership the pipeline stops in `error` with "must be owner of table …". When `cdc`
+doesn't own the tables, have the owner create the slot and the publication, and let the pipeline
+use them as they are:
+
+```sql
+-- as the tables' owner
+CREATE PUBLICATION shop_pub FOR TABLE public.orders, public.order_lines;
+SELECT pg_create_logical_replication_slot('shop_slot', 'pgoutput');
+```
+
+```yaml
+source:
+  postgres:
+    publication: shop_pub
+    slot: shop_slot
+    slot_management: require_existing
+    auto_cleanup: false
+    slot_on_orphan: adopt_resnapshot   # for the first start only
+snapshots:
+  mode: initial
+```
+
+At its first start the pipeline has no state for the slot, so the slot is an orphan, and the
+default `slot_on_orphan: halt` refuses it. `adopt_resnapshot` takes it over: the pipeline moves it
+to the current WAL position and copies the tables as `snapshots.mode` says, hence `initial` above:
+under `never`, the default, none is copied, and you start a snapshot job for each table. Once the
+pipeline runs, set `slot_on_orphan` back to `halt` (a reload applies it), so that a pipeline whose
+state is lost later stops rather than starting over by itself.
+
+With `require_existing`, a table the pipeline replicates but the publication doesn't publish is a
+warning: its changes never arrive. Keep the publication in step with `tables.include`.
+
+On a managed service, follow its guide to logical replication: on Amazon RDS and Aurora the role
+is granted `rds_replication` and `rds.logical_replication` is set; on Cloud SQL the
+`cloudsql.logical_decoding` flag is set.
+
+**Each table**: a primary key (or `tables.primary_key`), a `REPLICA IDENTITY` that covers it, and
+not `UNLOGGED`.
+
+</TabItem>
+<TabItem label="MySQL">
+
+**Settings** (`my.cnf`):
+
+```ini
+log_bin = ON
+binlog_format = ROW
+binlog_row_image = FULL
+binlog_row_metadata = FULL
+gtid_mode = ON                    # for replication_type: gtid
+enforce_gtid_consistency = ON
+log_replica_updates = ON          # when the server replicates from another
+binlog_expire_logs_seconds = 604800  # longer than a pipeline may be stopped
+```
+
+and no `binlog_do_db` or `binlog_ignore_db`.
+
+**A user**:
+
+```sql
+CREATE USER 'cdc'@'%' IDENTIFIED BY '…';
+GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'cdc'@'%';
+```
+
+`SELECT` on `*.*` covers the tables and the catalog; grant it on the pipeline's database
+(`shop.*`) instead to narrow it, keeping `REPLICATION SLAVE` and `REPLICATION CLIENT` global.
+
+</TabItem>
+<TabItem label="MariaDB">
+
+**Settings**:
+
+```ini
+log_bin = ON
+binlog_format = ROW
+binlog_row_image = FULL
+binlog_row_metadata = FULL
+gtid_strict_mode = 1              # for replication_type: gtid
+log_slave_updates = ON            # off by default: needed when the server replicates from another
+```
+
+**A user**:
+
+```sql
+CREATE USER 'cdc'@'%' IDENTIFIED BY '…';
+GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT, SLAVE MONITOR ON *.* TO 'cdc'@'%';
+```
+
+`REPLICATION CLIENT` is MariaDB's `BINLOG MONITOR` since 10.5. `SLAVE MONITOR` lets the pipeline
+read a replica's status to check `log_slave_updates`; without it the pipeline warns.
+
+</TabItem>
+</Tabs>
+
+:::note[Where these come from]
+The PostgreSQL privileges are PostgreSQL's own requirements for slots, publications and reads;
+the project's tests run as a superuser. The MySQL grant passes the pipeline's start checks in the
+project's TLS tests; its other tests run as `root`.
+Report a privilege these pages miss in the issue tracker.
+:::

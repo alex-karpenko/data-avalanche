@@ -84,6 +84,11 @@ resources:
 # before it is killed.
 terminationGracePeriodSeconds: 90
 
+# A rolling update waits this long after a new pod is ready before it replaces the next: the
+# pipelines handed off from the replaced pod come back once the new one has been a member for
+# globals.cluster.rebalance_stabilization (15s by default).
+minReadySeconds: 30
+
 livenessProbe:
   httpGet:
     path: /health/live

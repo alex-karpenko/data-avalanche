@@ -41,6 +41,22 @@ fn the_image_builds_with_the_workspace_s_toolchain() {
 }
 
 #[test]
+fn the_image_s_build_context_holds_every_workspace_member() {
+    // `.dockerignore` lets in only what it names, and cargo reads every member's manifest even
+    // to build one package: a member left out fails the image's build.
+    let members = value(&repo("Cargo.toml"), "members = ");
+    let admitted: Vec<String> = repo(".dockerignore").lines().map(str::to_owned).collect();
+    for member in members.trim_matches(['[', ']']).split(',') {
+        let member = member.trim().trim_matches('"');
+        let dir = member.split('/').next().unwrap();
+        assert!(
+            admitted.contains(&format!("!{dir}/")),
+            "the member {member} isn't in the image's build context (.dockerignore)"
+        );
+    }
+}
+
+#[test]
 fn the_chart_s_versions_are_the_workspace_s() {
     // The release refuses a tag unless all three agree (.github/workflows/release.yml).
     let workspace = value(&repo("Cargo.toml"), "version = ");
@@ -120,6 +136,26 @@ fn a_deleted_pod_has_longer_than_the_drain_to_hand_off() {
         .parse()
         .unwrap();
     assert!(grace > drain.as_secs(), "{grace} s, the drain {drain:?}");
+}
+
+#[test]
+fn a_rollout_waits_for_the_pipelines_to_come_back() {
+    // A new pod gets its pipelines back once it has been a member for rebalance_stabilization;
+    // the next pod rolls only after that (M11b).
+    let config = block(&chart("ci/example-values.yaml"), "config");
+    let loaded = load_str(&config, &pod_env(), &FingerprintKey::from_bytes([0; 32])).unwrap();
+    let settle = loaded.config.globals.cluster.rebalance_stabilization;
+    let ready: u64 = value(&chart("values.yaml"), "minReadySeconds: ")
+        .parse()
+        .unwrap();
+    assert!(
+        ready > settle.as_secs(),
+        "{ready} s, the stabilization {settle:?}"
+    );
+    assert!(
+        chart("templates/statefulset.yaml")
+            .contains("minReadySeconds: {{ .Values.minReadySeconds }}")
+    );
 }
 
 #[test]

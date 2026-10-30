@@ -1,0 +1,11 @@
+/* The reference pages' tables are wide: each scrolls in its own box, so a narrow screen keeps
+   the page's width, and a rule's id (V-001) never breaks at its hyphen. */
+.sl-markdown-content table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+}
+.sl-markdown-content td a[href*='/validation-rules/#'],
+.sl-markdown-content td:first-child {
+  white-space: nowrap;
+}

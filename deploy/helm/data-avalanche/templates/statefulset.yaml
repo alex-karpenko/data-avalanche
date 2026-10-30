@@ -9,6 +9,7 @@ spec:
   serviceName: {{ include "data-avalanche.headless" . }}
   # Every pod starts at once: a pod's name, not its start order, places it on the ring (D-1).
   podManagementPolicy: Parallel
+  minReadySeconds: {{ .Values.minReadySeconds }}
   selector:
     matchLabels:
       {{- include "data-avalanche.selectorLabels" . | nindent 6 }}

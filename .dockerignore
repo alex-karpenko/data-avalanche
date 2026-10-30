@@ -4,4 +4,5 @@
 !Cargo.lock
 !rust-toolchain.toml
 !crates/
+!xtask/
 crates/**/target/

@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-28
+updated: 2026-10-30
 domain: Architecture
 status: Specification (supersedes the Configuration_file_model.md draft)
 tags: [architecture, configuration, spec, validation, multi-sink, iceberg, delta-lake]
@@ -683,7 +683,7 @@ source:
 | `auto_cleanup` | bool | no | `true` | R | Drop the slot & publication when the pipeline is deleted. Teardown-time policy flag only — consulted at deletion/`id`-change, not on the live path, so a change applies in place with no restart. |
 | `heartbeat` | Duration | no | `60s` | R | StandbyStatusUpdate interval; keeps the connection alive and prevents WAL-lag-as-inactivity. Also paces the stream watchdog: a stream silent for 3 heartbeats while the heartbeat's reads of the slot fail or find no reader is reconnected (DA-SRC-16). |
 | `slot_management` | enum `managed`\|`require_existing` | no | `managed` | PR | `managed`: create the slot if absent, reuse if present, drop on delete per `auto_cleanup`. `require_existing`: never create (DBA-owned slot; error if absent) and **requires `auto_cleanup: false`** (V-103). `research/Postgres_Slot_and_Publication_Lifecycle.md` §2. |
-| `slot_on_orphan` | enum `halt`\|`adopt_resnapshot` | no | `halt` | R | Slot exists but the pipeline has no state for it. `halt`: refuse to start, naming the slot. `adopt_resnapshot`: take ownership, restart from a fresh consistent point and incrementally re-snapshot all tables. Resume-from-slot without a snapshot is never offered. (Slot-lifecycle doc §1.1; named `slot_on_orphan` because `slot` is the slot-name string.) |
+| `slot_on_orphan` | enum `halt`\|`adopt_resnapshot` | no | `halt` | R | Slot exists but the pipeline has no state for it. `halt`: refuse to start, naming the slot. `adopt_resnapshot`: take ownership and restart from a fresh consistent point, a recovery: the tables are snapshotted as `snapshots.mode` says for one (Data-Flow Phase 0; `initial`/`always` incrementally re-snapshot all tables), and under `never` none is, a warning naming the gap (Q-M6a-1). Resuming from the orphan as if continuous is never offered. (Slot-lifecycle doc §1.1; named `slot_on_orphan` because `slot` is the slot-name string.) |
 | `max_wal_lag_bytes` | ByteSize \| null | no | `null` | R | WAL-retention guard (G-22). `data_avalanche_wal_lag_bytes` is always emitted; when set and exceeded the pipeline **halts** to protect the source disk. `null` = alert only. ≥ 64 MiB when set (V-104). |
 
 #### 9.2.2 `source.mysql` (iff `type = mysql`)
@@ -693,7 +693,7 @@ source:
 | `replication_type` | enum `binlog`\|`gtid` | no | `gtid` | PR | `gtid`: GTID-positioned stream (MySQL `gtid_executed`, MariaDB `gtid_binlog_pos`); position-independent, gap-free, survives a source failover. Requires GTID on the server (MySQL `gtid_mode=ON`; MariaDB `gtid_strict_mode=1`). `binlog`: file/position stream (`COM_BINLOG_DUMP` at `<file>:<pos>`) for servers without GTID. A file/position is only meaningful on the server that wrote it: when the source server changes (failover, restore), the pipeline **halts** with `BINLOG_SOURCE_CHANGED` (`Data-Flow.md` Phase 2b); recover by switching to `gtid` or re-snapshotting. |
 | `tinyint1_as_bool` | bool | no | `true` | PR | Map `TINYINT(1)` columns to logical `bool`. When `true`, requires the display-width from the catalog query (channel C); when `false`, `TINYINT(1)` maps as `TINYINT SIGNED` → `Int16`. See `research/Type_Mapping.md`. |
 | `tinyint1_detection` | enum `information_schema`\|`none` | no | `information_schema` | PR | Source of the `TINYINT(1)` display-width signal. `none` disables the detection (all `TINYINT` treated as integer); `information_schema` uses the catalog query (always available via channel C). |
-| `binlog_purge_action` | enum `error`\|`re_snapshot` | no | `error` | R | Resume position purged on the server (G-26). `error`: halt with an error (operator decides). `re_snapshot`: automatic recovery via incremental re-snapshot. GTID `replication_type` remains recommended. |
+| `binlog_purge_action` | enum `error`\|`re_snapshot` | no | `error` | R | Resume position purged on the server (G-26). `error`: halt with an error (operator decides). `re_snapshot`: automatic recovery from the server's current position, the tables snapshotted as `snapshots.mode` says for a recovery (`initial`/`always` incrementally re-snapshot; under `never` none is, a warning naming the gap — Q-M6a-1). GTID `replication_type` remains recommended. |
 | `server_id` | integer | no | derived from `id` | PR | The replica server id the binlog dump registers with. The source server ends any other dump registered under the same id (measured, S-MY10), so each pipeline needs its own (V-120). Default: derived from the pipeline `id` — the first four bytes of its BLAKE3 hash, little-endian, with the top bit set (2147483648…4294967295, away from the small ids replicas usually take). Set it when that range collides with the server's own replicas. |
 | `heartbeat` | Duration | no | `60s` | R | The binlog heartbeat period (`@master_heartbeat_period`): an idle server sends a heartbeat this often (V-121). Also paces the stream watchdog, as `postgres.heartbeat` does: a stream silent for 3 heartbeats while the heartbeat's checks fail or find no binlog dump of the stream's connection on the server (its connection id in `information_schema.PROCESSLIST`, which a user without `PROCESS` sees for its own connections) is reconnected (DA-SRC-16). |
 
@@ -1618,6 +1618,10 @@ Every deviation, so nothing is silent:
 28. **M10 planning (2026-10-28, Q-M10-1)** — §6.6 `otlp_endpoint`: OTLP/HTTP with protobuf only
     (the collector's port 4318), the base URL with `/v1/traces` appended; an endpoint the exporter
     can't use is a run-time warning, not a V-rule. The §14 example's port is `4318`.
+29. **M11b review (2026-10-30)** — §9.2.1 `slot_on_orphan: adopt_resnapshot` and §9.2.2
+    `binlog_purge_action: re_snapshot`: the recovery's snapshot follows `snapshots.mode`, as
+    Data-Flow Phase 0 and Q-M6a-1 decided and the code does; under `never` (the default) there is
+    none, and a warning names the gap. The rows said every table is re-snapshotted.
 
 None of these change the **decided** catalog-auth schema (hive Thrift `none/ldap/kerberos`;
 rest HTTP `none/bearer/oauth2/sigv4`) — those are reproduced verbatim from

@@ -1,0 +1,55 @@
+name: docs
+
+# The documentation site (docs/, Starlight): built on every pull request that touches it, built
+# and deployed to GitHub Pages on a push to main (the repository's Pages source is "GitHub
+# Actions"). The build fails on a link to a missing page or anchor (starlight-links-validator).
+# That the generated reference pages match the code is ci.yml's to check: the workspace tests run
+# xtask's `the_generated_pages_are_current` and `every_config_example_in_the_docs_validates`.
+on:
+  pull_request:
+    paths: [docs/**, .github/workflows/docs.yml]
+  push:
+    branches: [main]
+    paths: [docs/**, .github/workflows/docs.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: docs
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: docs/.nvmrc
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - if: github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: docs/dist
+
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

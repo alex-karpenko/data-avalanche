@@ -77,6 +77,19 @@ macro_rules! walk_fields {
                 ); )+
             }
         }
+        impl $crate::keys::Keys for $t {
+            fn keys(&self, path: &str, out: &mut Vec<$crate::keys::Key>) {
+                let $t { $($f),+ } = self;
+                $( $crate::keys::Keys::keys(
+                    $f, &$crate::keys::child(path, $crate::walk::walk_key!($f)), out,
+                ); )+
+            }
+        }
+        impl $crate::keys::Keys for Option<$t> {
+            fn keys(&self, path: &str, out: &mut Vec<$crate::keys::Key>) {
+                $crate::keys::Keys::keys(&$t::default(), path, out);
+            }
+        }
         impl $crate::walk::Walk for Option<$t> {
             fn drop_empty(&mut self, ctx: &$crate::ctx::Ctx) {
                 if let Some(v) = self {
