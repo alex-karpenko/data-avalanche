@@ -5399,3 +5399,8 @@ git commit -m "gap: v1 §50 — M11b's docs: DA-OPS-8, DA-API-14/15, DA-SNAP-17/
   Only a pipeline command or a snapshot job is carried out by the lease holder: a reload is
   published, and a leave or a shutdown runs on the node called (the routes' own `202` texts). The
   paragraph now says so, and `reference/api.md` is regenerated.
+- **Task 3, two sentences** (found by the task review, fixed in the task's commit):
+  - `runbooks/failover.md`: the lag's recovery within 2 minutes is v1's target, as
+    `deployment/observability.md` says, not a measured behaviour.
+  - `deployment/observability.md`'s alert table: `DataAvalancheLeaseDegraded` fires on a lease
+    `degraded` for 2 minutes (`deploy/prometheus/alerts.yaml`), not on a lease unrenewed for 2 minutes.
