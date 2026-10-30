@@ -41,6 +41,22 @@ fn the_image_builds_with_the_workspace_s_toolchain() {
 }
 
 #[test]
+fn the_image_s_build_context_holds_every_workspace_member() {
+    // `.dockerignore` lets in only what it names, and cargo reads every member's manifest even
+    // to build one package: a member left out fails the image's build.
+    let members = value(&repo("Cargo.toml"), "members = ");
+    let admitted: Vec<String> = repo(".dockerignore").lines().map(str::to_owned).collect();
+    for member in members.trim_matches(['[', ']']).split(',') {
+        let member = member.trim().trim_matches('"');
+        let dir = member.split('/').next().unwrap();
+        assert!(
+            admitted.contains(&format!("!{dir}/")),
+            "the member {member} isn't in the image's build context (.dockerignore)"
+        );
+    }
+}
+
+#[test]
 fn the_chart_s_versions_are_the_workspace_s() {
     // The release refuses a tag unless all three agree (.github/workflows/release.yml).
     let workspace = value(&repo("Cargo.toml"), "version = ");
