@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-29
+updated: 2026-10-30
 domain: Architecture
 tags: [v1, implementation-plan, index, conventions]
 ---
@@ -49,6 +49,13 @@ This folder holds the plan for **building** v1. The design it implements is in `
   each milestone. Tasks are sized so an agent that sees only its task can finish it.
 - **Verification before claims.** A result that depends on an external system (a crate's behaviour,
   an emulator, a cloud) is measured, not assumed. Plans say where each number came from.
+- **The site follows the behaviour, in the same milestone** (Oleksii, 2026-10-30). A change an
+  operator can see updates its page on the documentation site (`docs/`) in the milestone that makes
+  it, and the plan lists that page in its file map. That covers a key, a default, a halt code, a
+  recovery, a privilege, a metric or a deployment step. The generated reference (`cargo xtask docs`)
+  is enforced by its staleness test; the hand-written pages (the guides, the architecture, the
+  deployment, the runbooks) are a plan task's, and the whole-branch review checks them against the
+  code. A spec or research edit with no visible effect changes no page.
 
 ## Test gates (all milestones)
 
