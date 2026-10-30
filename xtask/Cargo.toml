@@ -13,3 +13,6 @@ workspace = true
 data-avalanche-config.workspace = true
 data-avalanche-api.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true

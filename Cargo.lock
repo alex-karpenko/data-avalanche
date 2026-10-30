@@ -6972,6 +6972,7 @@ version = "0.1.0"
 dependencies = [
  "data-avalanche-api",
  "data-avalanche-config",
+ "rcgen",
  "serde_json",
 ]
 

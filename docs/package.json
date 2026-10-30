@@ -1,0 +1,18 @@
+{
+  "name": "data-avalanche-docs",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "0.42.7",
+    "astro": "7.4.4",
+    "astro-mermaid": "2.2.0",
+    "mermaid": "12.2.0",
+    "sharp": "0.35.5",
+    "starlight-links-validator": "0.27.0"
+  }
+}

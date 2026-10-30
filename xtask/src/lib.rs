@@ -5,9 +5,12 @@
 
 mod api;
 mod config;
+mod examples;
 mod rules;
 
 use std::path::{Path, PathBuf};
+
+pub use examples::{ConfigExample, config_examples};
 
 /// The site's base path on GitHub Pages (`astro.config.mjs`'s `base`): every link between pages
 /// starts with it, which the links validator checks.

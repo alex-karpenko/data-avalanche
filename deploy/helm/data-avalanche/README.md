@@ -57,6 +57,7 @@ would change.
 | `serviceAccount.create`, `.name`, `.annotations` | `true`, `""`, `{}` | |
 | `service.type`, `.nodePort`, `.annotations` | `ClusterIP`, `null`, `{}` | The API, `/metrics` and the probes |
 | `terminationGracePeriodSeconds` | `90` | Above `drain_timeout` (60 s): a deleted pod hands its pipelines off first; raise it with `globals.cluster.drain_timeout` |
+| `minReadySeconds` | `30` | Above `rebalance_stabilization` (15 s): a rolling update moves on once the replaced pod's pipelines are back |
 | `livenessProbe`, `readinessProbe`, `startupProbe` | `/health/live`, `/health/ready`, `/health/live` | HTTPS when the API's TLS is on |
 | `resources` | requests 500m, 1Gi; limit 2Gi | |
 | `podDisruptionBudget.enabled`, `.maxUnavailable` | `true`, `1` | |

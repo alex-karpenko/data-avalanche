@@ -123,6 +123,26 @@ fn a_deleted_pod_has_longer_than_the_drain_to_hand_off() {
 }
 
 #[test]
+fn a_rollout_waits_for_the_pipelines_to_come_back() {
+    // A new pod gets its pipelines back once it has been a member for rebalance_stabilization;
+    // the next pod rolls only after that (M11b).
+    let config = block(&chart("ci/example-values.yaml"), "config");
+    let loaded = load_str(&config, &pod_env(), &FingerprintKey::from_bytes([0; 32])).unwrap();
+    let settle = loaded.config.globals.cluster.rebalance_stabilization;
+    let ready: u64 = value(&chart("values.yaml"), "minReadySeconds: ")
+        .parse()
+        .unwrap();
+    assert!(
+        ready > settle.as_secs(),
+        "{ready} s, the stabilization {settle:?}"
+    );
+    assert!(
+        chart("templates/statefulset.yaml")
+            .contains("minReadySeconds: {{ .Values.minReadySeconds }}")
+    );
+}
+
+#[test]
 fn a_changed_config_is_said_to_go_through_the_reload() {
     // A starting node adopts the cluster's config generation, not its file (config §12): the
     // chart restarts nothing on a changed ConfigMap, and tells the operator so.
