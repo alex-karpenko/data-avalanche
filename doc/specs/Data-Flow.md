@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-27
+updated: 2026-10-30
 domain: Architecture
 tags: [architecture, data-flow, pipeline, cdc, iceberg, delta-lake, multi-sink, arrow, snapshot, replication]
 sources: []
@@ -191,6 +191,24 @@ Replication connection (replication protocol, not SQL)
 - `FULL`: UPDATE and DELETE carry the complete old row image. Required for tables without a primary key.
 - `NOTHING`: DELETE events are unusable — the sink cannot identify which row to delete. Pipelines should reject tables with `REPLICA IDENTITY NOTHING`.
 
+**The server's identity (DA-SRC-20).** An LSN means something only on the server and the timeline
+that wrote it. A start reads the server's system identifier (`pg_control_system()`) and its
+timeline (the current WAL file's, `pg_walfile_name(pg_current_wal_lsn())`), callable by the
+replication role, and the checkpoint records them. A physical standby has its primary's system
+identifier, so a failover to it shows as a new timeline; its slots stay behind unless synced.
+
+```
+Start with a checkpoint
+├─► no identity recorded (a checkpoint from before it was) → take the connected server's
+├─► the same system and timeline → the slot checks below, as before
+└─► another system or timeline → source.postgres.source_change_action:
+    ├─► error (default): halt the PIPELINE, WAL_SOURCE_CHANGED: "the checkpoint <lsn> was
+    │     read on <old>, and the pipeline now reads <new>"
+    └─► re_snapshot: a recovery from the new server's position — the slot is made there
+          (managed) or the DBA's adopted (require_existing; refused if absent), every table's
+          marker is reset (Phase 4, reposition), the tables snapshotted as snapshots.mode says
+```
+
 **Protocol and client (probe-verified, `prototypes/source-capability/` S-PG0…8):**
 - The client crate (`pgwire-replication`) is transport only; **the pgoutput decoder is ours**.
 - **`proto_version '1'`**, which the pinned crate sends, with no `streaming` option. A large
@@ -301,11 +319,14 @@ Connect
 │     record the identity and SHOW BINARY LOG STATUS (MySQL 8.4) / SHOW BINLOG STATUS (MariaDB)
 │     as the start position; Phase 1 watermarks use the same statement
 ├─► stored position present:
-│   ├─► identity differs from the recorded one → halt the PIPELINE (BINLOG_SOURCE_CHANGED):
-│   │     "binlog position <file>:<pos> was recorded on server <old>, now connected to <new>;
-│   │      file/position cannot be carried across servers — switch to replication_type: gtid
-│   │      or re-snapshot". No automatic recovery (a failover under file/position mode
-│   │      would otherwise silently skip or repeat transactions).
+│   ├─► identity differs from the recorded one, or (MariaDB, whose @@server_id can repeat)
+│   │   BINLOG_GTID_POS(<file>, <pos>) is NULL there → the position is lost; never resumed (a
+│   │   failover under file/position mode would silently skip or repeat transactions), and
+│   │   binlog_purge_action decides:
+│   │   ├─► error: halt the PIPELINE (BINLOG_SOURCE_CHANGED): "binlog position <file>:<pos>
+│   │   │     was recorded on server <old>, now connected to <new>; …"
+│   │   └─► re_snapshot: a recovery from the new server's position; every table's marker is
+│   │         reset (Phase 4, reposition), the tables snapshotted as snapshots.mode says
 │   ├─► file no longer in SHOW BINARY LOGS → binlog_purge_action (error | re_snapshot, G-26)
 │   └─► COM_BINLOG_DUMP at <file>:<pos>
 └─► Event loop as above (GTID events ignored); the position after each XID_EVENT is
@@ -436,6 +457,7 @@ TableChangeSet {
     deletes:    Vec<RecordBatch>,   // ≤1 row per key: identifier (+ before-image partition columns)
     position:   PositionRange,      // per-table source position covered (guard / HWM)
     split:      Option<SplitInfo>,  // oversized-transaction slice marker (checkpoint pinning)
+    reposition: bool,               // a source-change recovery: no rows; the marker becomes position.end
 }
 ```
 
@@ -504,7 +526,12 @@ fence still applies. A split slice (`split` set) ends at its transaction's
 pinned start, which the stored position equals from the first slice on; a slice is skipped only
 when the stored position is strictly past that start (the transaction's commit, or a later one, has
 landed). On commit, the new value is the `union` of the prior value
-and the flush's per-table position. The pipeline **resume checkpoint** persisted to state storage is the
+and the flush's per-table position. A **reposition** change set (`reposition` set, no rows, no truncate, no split) is never skipped
+either, and its commit stores its own position instead of the union: after a source change
+(another PostgreSQL system or timeline, another MySQL server in file/position mode) the new
+server's positions may sort below the stored markers, and the union would skip its changes.
+A recovery from a changed source commits one per table the sink holds a marker for, fenced like
+any commit, before the checkpoint naming the new server is saved and the stream starts. The pipeline **resume checkpoint** persisted to state storage is the
 **laggard** across all tracked tables (PG `min` / MySQL set-intersection); tables ahead skip via the
 guard or are absorbed by idempotency. The epoch rejects a zombie writer; the position skips done work.
 See `research/Delivery_Guarantee_and_Position_Guard.md` (G-14).
@@ -784,7 +811,7 @@ Node dies (SWIM detects via failed probes → marks dead)
 └─► New owner starts each inherited pipeline (Phase 0):
     ├─► Reads state from cloud storage
     └─► Resumes from last confirmed_flush_lsn / persisted MySQL position
-        (file/position mode: a changed source server halts, BINLOG_SOURCE_CHANGED)
+        (a changed source server: source_change_action / binlog_purge_action, Phase 2a/2b)
         (worst-case replay = time since last checkpoint write)
 ```
 
