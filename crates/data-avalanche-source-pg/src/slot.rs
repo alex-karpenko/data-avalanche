@@ -4,11 +4,11 @@
 
 use std::collections::BTreeSet;
 
-use data_avalanche_config::{SlotManagement, SlotOnOrphan};
+use data_avalanche_config::{SlotManagement, SlotOnOrphan, SourceChangeAction};
 use data_avalanche_core::position::Lsn;
 use data_avalanche_core::{
-    Checkpoint, Prepared, RetainedLog, SnapshotReason, SourceError, SourcePosition, StartPlan,
-    TableRef,
+    Checkpoint, Prepared, RetainedLog, ServerIdentity, SnapshotReason, SourceError, SourcePosition,
+    StartPlan, TableRef,
 };
 use tokio_postgres::Client;
 
@@ -52,9 +52,10 @@ pub enum SlotAction {
     Create(SnapshotReason),
     /// Drop the unusable slot and create it again, then snapshot.
     Recreate(SnapshotReason),
-    /// Move the orphan slot to the current WAL position (`pg_replication_slot_advance`), then
-    /// snapshot: `on_orphan: adopt_resnapshot`. Advancing works under `require_existing` too.
-    Adopt,
+    /// Move the slot to the current WAL position (`pg_replication_slot_advance`), then snapshot:
+    /// an orphan under `on_orphan: adopt_resnapshot`, or the slot of a source change. Advancing
+    /// works under `require_existing` too.
+    Adopt(SnapshotReason),
     /// Refuse to start: the operator decides.
     Refuse(String),
 }
@@ -123,7 +124,7 @@ pub fn decide(
                     SlotAction::Recreate(SnapshotReason::AdoptedOrphan)
                 }
                 None if s.invalidated => lost("was invalidated"),
-                None => SlotAction::Adopt,
+                None => SlotAction::Adopt(SnapshotReason::AdoptedOrphan),
             },
         },
         (None, None) if managed => SlotAction::Create(SnapshotReason::FirstStart),
@@ -167,6 +168,64 @@ async fn partitions(
         .collect())
 }
 
+/// The server the stream reads: its system identifier, and the timeline WAL is written on now
+/// (the first eight hex digits of the current WAL file's name). A promotion keeps the identifier
+/// and starts a new timeline at once (measured on PostgreSQL 18, `pg_ctl promote -w`); a standby,
+/// which writes no WAL, reports its last checkpoint's timeline. Every function is open to any
+/// role.
+pub(crate) async fn server_identity(
+    client: &Client,
+) -> Result<(String, String), tokio_postgres::Error> {
+    let row = client
+        .query_one(
+            "SELECT system_identifier::text,
+                    CASE WHEN pg_is_in_recovery()
+                         THEN lpad(to_hex((SELECT timeline_id FROM pg_control_checkpoint())), 8, '0')
+                         ELSE substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8) END
+               FROM pg_control_system()",
+            &[],
+        )
+        .await?;
+    Ok((row.get(0), row.get(1)))
+}
+
+/// [`server_identity`]'s row: the identifier in decimal, the timeline in hex.
+pub fn parse_identity(id: &str, timeline: &str) -> Result<ServerIdentity, SourceError> {
+    let bad = || SourceError::Permanent(format!("the server's identity reads {id}, {timeline}"));
+    Ok(ServerIdentity::Postgres {
+        system_identifier: id.parse().map_err(|_| bad())?,
+        timeline: u32::from_str_radix(timeline, 16).map_err(|_| bad())?,
+    })
+}
+
+/// Whether the checkpoint was read on another server than `now` (DA-SRC-20): `Ok(true)` asks a
+/// source-change start (`source_change_action: re_snapshot`), `error` halts. A checkpoint that
+/// records no server (written before it was recorded) is taken as this server's: the start
+/// records it.
+pub fn source_change(
+    checkpoint: Option<&Checkpoint>,
+    now: &ServerIdentity,
+    action: SourceChangeAction,
+) -> Result<bool, SourceError> {
+    let Some((at, was)) = checkpoint.and_then(|c| c.server.as_ref().map(|s| (&c.position, s)))
+    else {
+        return Ok(false);
+    };
+    if was == now {
+        return Ok(false);
+    }
+    match action {
+        SourceChangeAction::ReSnapshot => Ok(true),
+        SourceChangeAction::Error => Err(SourceError::Permanent(format!(
+            "WAL_SOURCE_CHANGED: the checkpoint {} was read on {was}, and the pipeline now \
+             reads {now}: a promoted replica's LSNs may repeat ones the lake has marked. Set \
+             source_change_action: re_snapshot to start from this server's position, \
+             snapshotting as snapshots.mode says, or point the pipeline back at the old server",
+            at.untagged()
+        ))),
+    }
+}
+
 pub(crate) async fn slot_state(
     client: &Client,
     name: &str,
@@ -188,6 +247,28 @@ pub(crate) async fn slot_state(
         confirmed_flush: r.get::<_, Option<String>>(2).and_then(|t| t.parse().ok()),
         invalidated: r.get(3),
     }))
+}
+
+/// The slot at a source-change start (`source_change_action: re_snapshot`): the stream starts
+/// from the new server's position. `managed` creates the slot there (dropping one that came
+/// over with the failover); `require_existing` takes the DBA's slot, which must exist.
+pub fn on_source_change(
+    slot: Option<&SlotState>,
+    name: &str,
+    management: SlotManagement,
+) -> SlotAction {
+    match (management, slot) {
+        (SlotManagement::Managed, None) => SlotAction::Create(SnapshotReason::SourceChanged),
+        (SlotManagement::Managed, Some(_)) => SlotAction::Recreate(SnapshotReason::SourceChanged),
+        (SlotManagement::RequireExisting, Some(s)) if !s.invalidated => {
+            SlotAction::Adopt(SnapshotReason::SourceChanged)
+        }
+        (SlotManagement::RequireExisting, _) => SlotAction::Refuse(format!(
+            "WAL_SOURCE_CHANGED: the pipeline starts from the new server's position, and \
+             slot_management is require_existing, so replication slot {name} must exist there \
+             and stream: have it created, then restart the pipeline"
+        )),
+    }
 }
 
 impl PgConnector {
@@ -404,8 +485,15 @@ impl PgConnector {
         checkpoint: Option<&Checkpoint>,
         tables: &[TableRef],
     ) -> Result<Prepared, SourceError> {
+        let recorded = checkpoint;
         let checkpoint = checkpoint.map(|c| lsn_of(&c.position)).transpose()?;
         let client = self.conn.client().await?;
+        let (id, timeline) = self
+            .conn
+            .command("read the server's identity", server_identity(&client))
+            .await?;
+        let server = parse_identity(&id, &timeline)?;
+        let changed = source_change(recorded, &server, self.live().source_change_action)?;
         let Reconciled {
             sql,
             rewritten,
@@ -419,14 +507,26 @@ impl PgConnector {
                 slot_state(&client, self.slot_name()),
             )
             .await?;
-        let action = match decide(
-            checkpoint,
-            slot.as_ref(),
-            &self.pipeline.source.db,
-            self.slot_name(),
-            self.pg.slot_management,
-            self.live().slot_on_orphan,
-        ) {
+        let decided = if changed {
+            if let Some(was) = recorded.and_then(|c| c.server.as_ref()) {
+                warnings.push(format!(
+                    "the checkpoint was read on {was}, and the pipeline now reads {server}: \
+                     source_change_action is re_snapshot, so the pipeline re-snapshots from this \
+                     server's position"
+                ));
+            }
+            on_source_change(slot.as_ref(), self.slot_name(), self.pg.slot_management)
+        } else {
+            decide(
+                checkpoint,
+                slot.as_ref(),
+                &self.pipeline.source.db,
+                self.slot_name(),
+                self.pg.slot_management,
+                self.live().slot_on_orphan,
+            )
+        };
+        let action = match decided {
             // pgoutput reads the publication as of each change's WAL position: the WAL from the
             // checkpoint up to now was decoded under the old publication, and what it didn't
             // publish never reaches the stream. Only `managed` rewrites the publication, so the
@@ -456,7 +556,7 @@ impl PgConnector {
             SlotAction::Create(reason) | SlotAction::Recreate(reason) => {
                 snapshot(self.create_slot(&client).await?, reason)
             }
-            SlotAction::Adopt => {
+            SlotAction::Adopt(reason) => {
                 // Advancing decodes the orphan's whole backlog: the snapshot timeout bounds it.
                 let row = self.conn.bounded(
                     "advance the orphan slot",
@@ -467,7 +567,7 @@ impl PgConnector {
                     ),
                 )
                 .await?;
-                snapshot(parse_lsn(row.get(0))?, SnapshotReason::AdoptedOrphan)
+                snapshot(parse_lsn(row.get(0))?, reason)
             }
             SlotAction::Refuse(_) => unreachable!("refused above"),
         };
@@ -479,7 +579,7 @@ impl PgConnector {
             plan,
             added,
             warnings,
-            server: None,
+            server: Some(server),
         })
     }
 
@@ -604,6 +704,78 @@ mod tests {
         }
     }
 
+    fn read_on(lsn: u64, system_identifier: u64, timeline: u32) -> Checkpoint {
+        Checkpoint {
+            position: SourcePosition::Pg(Lsn(lsn)),
+            server: Some(ServerIdentity::Postgres {
+                system_identifier,
+                timeline,
+            }),
+        }
+    }
+
+    #[test]
+    fn the_identity_is_the_system_and_the_timeline() {
+        assert_eq!(
+            parse_identity("7692239610332024875", "00000002").unwrap(),
+            ServerIdentity::Postgres {
+                system_identifier: 7692239610332024875,
+                timeline: 2
+            }
+        );
+        assert!(parse_identity("x", "00000002").is_err());
+        assert!(parse_identity("1", "zz").is_err());
+    }
+
+    /// A promoted replica keeps the system identifier and starts a new timeline (DA-SRC-20).
+    #[test]
+    fn another_timeline_or_system_is_a_source_change() {
+        let now = ServerIdentity::Postgres {
+            system_identifier: 7,
+            timeline: 2,
+        };
+        let promoted = read_on(0x20, 7, 1);
+        let e = source_change(Some(&promoted), &now, SourceChangeAction::Error).unwrap_err();
+        assert!(
+            e.to_string().starts_with(
+                "WAL_SOURCE_CHANGED: the checkpoint 0/20 was read on PostgreSQL system 7 on \
+                 timeline 1, and the pipeline now reads PostgreSQL system 7 on timeline 2"
+            ),
+            "{e}"
+        );
+        assert!(source_change(Some(&promoted), &now, SourceChangeAction::ReSnapshot).unwrap());
+        let another = read_on(0x20, 8, 2);
+        assert!(source_change(Some(&another), &now, SourceChangeAction::ReSnapshot).unwrap());
+        let same = read_on(0x20, 7, 2);
+        assert!(!source_change(Some(&same), &now, SourceChangeAction::Error).unwrap());
+        let unrecorded: Checkpoint = SourcePosition::Pg(Lsn(0x20)).into();
+        assert!(
+            !source_change(Some(&unrecorded), &now, SourceChangeAction::Error).unwrap(),
+            "a checkpoint written before the identity was recorded is taken as this server's"
+        );
+        assert!(!source_change(None, &now, SourceChangeAction::Error).unwrap());
+    }
+
+    #[test]
+    fn a_source_change_starts_from_the_new_server() {
+        assert_eq!(on_source_change(None, "s", M), A::Create(R::SourceChanged));
+        assert_eq!(
+            on_source_change(Some(&slot(0x10)), "s", M),
+            A::Recreate(R::SourceChanged),
+            "a slot that came over with the failover is dropped"
+        );
+        assert_eq!(
+            on_source_change(Some(&slot(0x10)), "s", X),
+            A::Adopt(R::SourceChanged)
+        );
+        refused(on_source_change(None, "s", X), "must exist there");
+        let lost = SlotState {
+            invalidated: true,
+            ..slot(0x10)
+        };
+        refused(on_source_change(Some(&lost), "s", X), "must exist there");
+    }
+
     #[test]
     fn state_and_slot_resume() {
         assert_eq!(d(Some(0x20), Some(slot(0x20)), M, HALT), A::Resume);
@@ -643,10 +815,13 @@ mod tests {
     fn an_orphan_halts_or_is_adopted() {
         refused(d(None, Some(slot(0x10)), M, HALT), "orphan");
         refused(d(None, Some(slot(0x10)), X, HALT), "orphan");
-        assert_eq!(d(None, Some(slot(0x10)), M, ADOPT), A::Adopt);
+        assert_eq!(
+            d(None, Some(slot(0x10)), M, ADOPT),
+            A::Adopt(R::AdoptedOrphan)
+        );
         assert_eq!(
             d(None, Some(slot(0x10)), X, ADOPT),
-            A::Adopt,
+            A::Adopt(R::AdoptedOrphan),
             "advancing isn't recreating"
         );
         let mut gone = slot(0x10);

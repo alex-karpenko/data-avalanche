@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use data_avalanche_config::{
-    Pipeline, Postgres, SlotOnOrphan, SourceType, Tables, check_table_set, check_unbounded_numeric,
+    Pipeline, Postgres, SlotOnOrphan, SourceChangeAction, SourceType, Tables, check_table_set,
+    check_unbounded_numeric,
 };
 use data_avalanche_core::{
     ChangeStream, Checkpoint, Chunk, HaltReason, InFlightTxn, KeysetCursor, Preflight, Prepared,
@@ -31,6 +32,8 @@ pub(crate) struct Live {
     pub heartbeat: Duration,
     /// From the next prepare.
     pub slot_on_orphan: SlotOnOrphan,
+    /// From the next prepare.
+    pub source_change_action: SourceChangeAction,
     /// At the teardown.
     pub auto_cleanup: bool,
     /// `tables.include` and `tables.exclude`, from the next resolve: in place only while the
@@ -44,6 +47,7 @@ impl Live {
         Self {
             heartbeat: pg.heartbeat,
             slot_on_orphan: pg.slot_on_orphan,
+            source_change_action: pg.source_change_action,
             auto_cleanup: pg.auto_cleanup,
             include: tables.include.clone(),
             exclude: tables.exclude.clone(),
@@ -445,6 +449,7 @@ mod tests {
         let pg = next.source.postgres.as_mut().unwrap();
         pg.heartbeat = Duration::from_secs(7);
         pg.slot_on_orphan = SlotOnOrphan::AdoptResnapshot;
+        pg.source_change_action = SourceChangeAction::ReSnapshot;
         pg.auto_cleanup = true;
         pg.slot = "another_slot".into();
         next.tables.include = vec!["public.t".into(), "public.u".into()];
@@ -453,6 +458,7 @@ mod tests {
         let live = Live {
             heartbeat: Duration::from_secs(7),
             slot_on_orphan: SlotOnOrphan::AdoptResnapshot,
+            source_change_action: SourceChangeAction::ReSnapshot,
             auto_cleanup: true,
             include: vec!["public.t".into(), "public.u".into()],
             exclude: vec!["public.v".into()],

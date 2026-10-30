@@ -755,6 +755,13 @@ fn postgres(p: &RawPostgres, at: &At, ctx: &mut Ctx) -> Option<Postgres> {
         "slot_on_orphan",
         SlotOnOrphan::Halt,
     );
+    let source_change_action = or(
+        ctx,
+        &p.source_change_action,
+        at,
+        "source_change_action",
+        SourceChangeAction::Error,
+    );
     let max_wal_lag_bytes = tri(ctx, &p.max_wal_lag_bytes, at, "max_wal_lag_bytes", None);
     Some(Postgres {
         publication: publication?,
@@ -763,6 +770,7 @@ fn postgres(p: &RawPostgres, at: &At, ctx: &mut Ctx) -> Option<Postgres> {
         heartbeat: heartbeat?,
         slot_management: slot_management?,
         slot_on_orphan: slot_on_orphan?,
+        source_change_action: source_change_action?,
         max_wal_lag_bytes: max_wal_lag_bytes?.map(ByteSize::bytes),
     })
 }

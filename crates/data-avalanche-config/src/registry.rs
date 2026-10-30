@@ -1028,6 +1028,14 @@ pub const RULES: &[RuleMeta] = &[
         r#"globals.cluster.memberlist timers"#,
         r#"gossip_interval, probe_interval, probe_timeout and push_pull_interval above zero; gossip_nodes and retransmit_factor at least 1; probe_timeout below probe_interval."#,
     ),
+    rule(
+        "V-123",
+        Error,
+        L::Pipeline,
+        Config,
+        r#"source.postgres.source_change_action"#,
+        r#"∈ {error, re_snapshot}."#,
+    ),
 ];
 
 /// The registry entry for `id` (`"V-007"`).
@@ -1041,7 +1049,7 @@ mod tests {
 
     #[test]
     fn has_every_spec_rule_once_in_order() {
-        assert_eq!(RULES.len(), 116);
+        assert_eq!(RULES.len(), 117);
         assert!(
             RULES.windows(2).all(|w| w[0].id < w[1].id),
             "sorted, no duplicates"

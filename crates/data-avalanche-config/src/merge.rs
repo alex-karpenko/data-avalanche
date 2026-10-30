@@ -95,6 +95,7 @@ merge_struct!(RawPostgres {
     heartbeat,
     slot_management,
     slot_on_orphan,
+    source_change_action,
     max_wal_lag_bytes,
 });
 merge_struct!(RawMysql {

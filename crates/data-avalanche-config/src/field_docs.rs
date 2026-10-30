@@ -400,6 +400,11 @@ pub const FIELD_DOCS: &[FieldDoc] = &[
         "A slot that exists with no state of the pipeline's: `halt` refuses to start, naming it; `adopt_resnapshot` takes it over and starts from the current position, snapshotting as `snapshots.mode` says (none under `never`).",
     ),
     f(
+        "pipelines.*.source.postgres.source_change_action",
+        Value("error"),
+        "A start on a server other than the checkpoint's (another system identifier, or another timeline after a failover): `error` halts `WAL_SOURCE_CHANGED`; `re_snapshot` starts from the new server's position, snapshotting as `snapshots.mode` says (none under `never`).",
+    ),
+    f(
         "pipelines.*.source.postgres.max_wal_lag_bytes",
         Value("null"),
         "Halt the pipeline when its slot holds more WAL than this, to protect the server's disk; at least `64MiB`. `null` only reports `wal_lag_bytes`.",

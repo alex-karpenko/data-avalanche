@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use data_avalanche_core::position::Lsn;
 use data_avalanche_core::{
-    Checkpoint, SnapshotReason, SourceConnector, SourceError, SourcePosition, StartPlan, TableRef,
+    Checkpoint, ServerIdentity, SnapshotReason, SourceConnector, SourceError, SourcePosition,
+    StartPlan, TableRef,
 };
 use data_avalanche_testkit::require_it;
 use tokio_postgres::Client;
@@ -102,6 +103,91 @@ async fn first_start_then_resume_then_a_lost_slot() {
         .await
         .unwrap();
     from(&p.plan, SnapshotReason::PositionLost);
+    cleanup(&a, &n).await;
+}
+
+/// A checkpoint read on another server, another system or another timeline (a promoted
+/// standby), halts with `WAL_SOURCE_CHANGED`; under `source_change_action: re_snapshot` the slot
+/// is made again on the server read now, and the pipeline snapshots from it. A checkpoint with no
+/// server (v0.1.0's) resumes, and records the server (DA-SRC-20).
+#[tokio::test]
+async fn a_checkpoint_from_another_server() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(&a, "slot_server", DDL).await;
+    let tables = [n.table("a")];
+    let halt = connector(&pipeline(&n, &["*"], "", ""));
+    let first = halt.prepare(None, &tables).await.unwrap();
+    let start = from(&first.plan, SnapshotReason::FirstStart);
+    let Some(ServerIdentity::Postgres {
+        system_identifier,
+        timeline,
+    }) = first.server.clone()
+    else {
+        panic!("a PostgreSQL server, got {:?}", first.server)
+    };
+    let p = halt
+        .prepare(Some(&Checkpoint::from(start.clone())), &tables)
+        .await
+        .unwrap();
+    assert_eq!(
+        (p.plan, p.server),
+        (StartPlan::Resume, first.server.clone())
+    );
+
+    let elsewhere = [
+        ServerIdentity::Postgres {
+            system_identifier: system_identifier ^ 1,
+            timeline,
+        },
+        ServerIdentity::Postgres {
+            system_identifier,
+            timeline: timeline + 1,
+        },
+    ];
+    for server in &elsewhere {
+        let cp = Checkpoint {
+            position: start.clone(),
+            server: Some(server.clone()),
+        };
+        permanent(
+            halt.prepare(Some(&cp), &tables).await.unwrap_err(),
+            "WAL_SOURCE_CHANGED",
+        );
+    }
+    a.execute(&format!("INSERT INTO {}.a VALUES (1)", n.schema), &[])
+        .await
+        .unwrap();
+    let recover = connector(&pipeline(
+        &n,
+        &["*"],
+        "",
+        ", source_change_action: re_snapshot",
+    ));
+    let cp = Checkpoint {
+        position: start.clone(),
+        server: Some(elsewhere[1].clone()),
+    };
+    let p = recover.prepare(Some(&cp), &tables).await.unwrap();
+    let SourcePosition::Pg(at) = from(&p.plan, SnapshotReason::SourceChanged) else {
+        panic!("a PostgreSQL position")
+    };
+    assert!(
+        SourcePosition::Pg(at) != start,
+        "made again, at the server's position now"
+    );
+    assert_eq!(confirmed(&a, &n).await, Some(at));
+    assert_eq!(
+        p.server, first.server,
+        "the checkpoint now names this server"
+    );
+    assert!(
+        p.warnings.iter().any(
+            |w| w.contains("source_change_action is re_snapshot, so the pipeline re-snapshots")
+        ),
+        "{:?}",
+        p.warnings
+    );
     cleanup(&a, &n).await;
 }
 

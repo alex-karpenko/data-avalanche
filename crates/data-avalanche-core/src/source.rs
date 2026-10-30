@@ -187,8 +187,8 @@ pub struct Prepared {
     /// publication behind its back. Empty when the plan snapshots every table.
     pub added: Vec<TableRef>,
     pub warnings: Vec<String>,
-    /// The server the stream reads, recorded with the checkpoint so the next start can check it
-    /// (MySQL / MariaDB). `None` for a source that records none (PostgreSQL).
+    /// The server the stream reads, recorded with the checkpoint so the next start can check it.
+    /// `None` for a source that records none.
     pub server: Option<ServerIdentity>,
 }
 
