@@ -448,6 +448,64 @@ Both packages are public: an anonymous pull of either manifest answers 200.
 |---|---|---|
 | DA-OPS-11 | 🟥 → ✅: the release's first full run, on `v0.1.0`; the packages public | `release.yml` run 41034298202; `gh attestation verify oci://ghcr.io/alex-karpenko/data-avalanche:0.1.0` |
 
+## 52. M12a source hardening — the plan (2026-10-30)
+
+M12 is split in three (Q-M12-4): M12a, source correctness and recovery; M12b, cluster, control, API
+and observability hardening, with `cargo audit` and the compile time; M12c, the v1 acceptance and
+`v1.0.0`. Every open gap is processed in M12, fixed or closed with a pointer (Q-M12-1).
+`doc/v1.0/M12a-source-hardening.md` is M12a's plan: twelve tasks for the source gaps below, and a
+spec patch (config §9.1, §9.2.1, §9.2.2, V-123, V-124; Data-Flow Phase 2a/2b, the sink contract's
+`reposition`), approved with the plan. The rulings (Q-M12a-1…4, D-M12a.*) are in the plan, the
+milestone's (Q-M12-1…7) in the roadmap.
+
+The planning measured:
+- **A PostgreSQL 18 promotion** (a `pg_basebackup` standby): the promoted server keeps the
+  primary's system identifier and moves to timeline 2 at once; the logical slot isn't on it (no
+  slot sync). So the checkpoint records both, and a recovery moves every table's marker onto the
+  new server (the guard keeps the union of positions, which skips a lagging replica's LSNs
+  otherwise). The failover E2E fails without the reset (the guard skips the streamed row).
+- **MariaDB 11.8 rollbacks** in ROW format: a transaction with a non-transactional table's rows
+  logs those first, in a group of their own; the transactional group, without `FL_TRANSACTIONAL`,
+  logs the undone rows, then ``ROLLBACK TO `s` `` or `ROLLBACK`. A group of InnoDB tables alone
+  never logs undone rows.
+- **`BINLOG_GTID_POS(file, pos)`** on MariaDB: NULL for an offset off an event boundary, a missing
+  file or an offset past the end; a value at a rotated file's end.
+
+The rows below were already closed elsewhere and their dated rows never updated; they are now (no
+count changes, none was counted open):
+
+| ID | Change | Evidence |
+|---|---|---|
+| DA-SYS-7 | §26.3's row 🆕 🟥 → ✅ | §4 (D-V1.4, 2026-09-26); `wiring.rs` refuses `sink.type: iceberg` naming v2 |
+| DA-SRC-12 | §26.3's row 🆕 🟥 → ✅ | §14 (D-V1.6); M7a's payload guard, M7b's E2E (§35) |
+| DA-SRC-16 | §27.1's row 🆕 🟥 → ✅ | §14 and §30 (M6b Task 22) |
+
+**Recount.** The open set was 35: the 34 🟥 rows of the domain tables (§4–§18) and DA-X-13, which
+has only its §32.1 row. The dated sections' stale rows above had made a count of the table rows
+read 37. With DA-X-15 (§52.1) it is 36.
+
+**What M12a takes** (each closed with a pointer at its exit):
+
+| ID | Task |
+|---|---|
+| DA-SRC-20 | 1–2: the PostgreSQL checkpoint records the server, `WAL_SOURCE_CHANGED`, `source.postgres.source_change_action`, the markers moved onto the new server |
+| DA-SRC-29, DA-SRC-21 | 3: a changed MySQL server follows `binlog_purge_action`; MariaDB's position checked by `BINLOG_GTID_POS` |
+| DA-SRC-30, DA-OPS-13 | 4: a DBA's slot made again is adopted under `slot_on_orphan: adopt_resnapshot`; the refusal's key and the CLI's `about` |
+| DA-SRC-26 | 5: a MariaDB rollback drops the rows it undid |
+| DA-SRC-24, DA-SRC-25, DA-SRC-22 | 6: a Galera node, a case-only rename, `verify-ca` on MySQL (V-124, fails closed; the `mysql_async` fix re-checked at each upgrade) |
+| DA-SRC-14, DA-SRC-19 | 7: `bit`/`varbit` keys refused; a table's chunk-read error halts the table |
+| DA-SNAP-13, DA-SNAP-14, DA-SRC-15 | 8: a wiped state baselines against the sink table; an `ENUM` key reordered; the collation edges |
+| DA-SRC-13 | 9: the publication's blind spots |
+| DA-SRC-17, DA-SRC-9 | 10: the small PostgreSQL edges; one catalog connection serves the re-queries |
+| DA-SRC-18 | 11: the verifier and `require` tests, a composite `date` key, `postgres-tls` on the anchor, the failover E2E on a `replica` compose pair |
+| DA-X-15 | 11: the jobs test waits for the copy's completion |
+
+### 52.1 New gap
+
+| ID | Gap | Severity | Surfaced by | Next |
+|---|---|---|---|---|
+| DA-X-15 | `jobs::tests::a_table_outside_the_config_is_copied_and_not_streamed` fails now and then (2 runs in 30 on the base, 7 in 30 beside a build): it drains the worker once the copied rows land, but the copy is marked done only at its last chunk read, an empty one, so a drain in between leaves its snapshot `InProgress` | 🟢 | M12a planning (the gates, under load) | The test waits until the worker reports no snapshot running (30 runs in 30 then); M12a Task 11 |
+
 ---
 
 ### Counts (by status)
@@ -459,13 +517,13 @@ Both packages are public: an anonymous pull of either manifest answers 200.
 > M7a's plan (§32), 2026-10-16 for M7a's exit (§33), 2026-10-17 for M7b's plan (§34),
 > 2026-10-20 for M7b's exit (§35), 2026-10-21 for M8a's plan (§36), 2026-10-22 for M8a's exit (§37),
 > 2026-10-22 for M8b's plan (§38), 2026-10-23 for M8b's exit (§39), 2026-10-23 for M9a's plan
-> (§40), 2026-10-23 for M9a's exit (§41), 2026-10-27 for M9b's plan (§42), 2026-10-28 for M9b's exit (§43), 2026-10-28 for M10's plan (§44), and 2026-10-29 for M10's exit (§45), and 2026-10-29 for M11a's plan (§46), and 2026-10-29 for M11a's whole-branch review (§47), and 2026-10-29 for M11a's exit (§48), and 2026-10-29 for M11b's plan (§49), and 2026-10-30 for M11b's pages (§50), and 2026-10-30 for M11b's exit and v0.1.0 (§51).
+> (§40), 2026-10-23 for M9a's exit (§41), 2026-10-27 for M9b's plan (§42), 2026-10-28 for M9b's exit (§43), 2026-10-28 for M10's plan (§44), and 2026-10-29 for M10's exit (§45), and 2026-10-29 for M11a's plan (§46), and 2026-10-29 for M11a's whole-branch review (§47), and 2026-10-29 for M11a's exit (§48), and 2026-10-29 for M11b's plan (§49), and 2026-10-30 for M11b's pages (§50), and 2026-10-30 for M11b's exit and v0.1.0 (§51), and 2026-10-30 for M12a's plan (§52).
 
 | Status | Count (v1 scope) | Notes |
 |---|---|---|
 | ✅ Resolved | the large majority | Design closed by a research/spec doc or a probe. |
 | 🔄 Partial | 4 | DA-OPS-10 and DA-SNAP-15 🔄 2026-10-30 (§50); DA-SCHEMA-10 ✅ 2026-10-28 (M9b merged, §43); DA-SNAP-7, DA-SRC-9 (neither blocks the plan); DA-OPS-8 ✅ 2026-10-30 (§50; 🔄 2026-10-22, §38); DA-SNAP-10 ✅ 2026-10-16 (M7a merged, §33). DA-MS-3 is a decided caveat. DA-X-8 ✅ 2026-09-26; DA-SRC-16 and DA-X-12 ✅ 2026-10-13 (§30). |
-| 🟥 Open (v1) | **35** | DA-OPS-11 ✅ 2026-10-30 (§51: `v0.1.0` released, the packages public); DA-SRC-30 🆕 2026-10-30 (§50.1); DA-OPS-10, DA-API-14, DA-API-15, DA-SNAP-15, DA-SNAP-17 and DA-SNAP-18 leave 2026-10-30 (§50; DA-OPS-10 and DA-SNAP-15 as 🔄); DA-CLUS-15 stays; DA-OPS-12, DA-OPS-13 and DA-SRC-29 🆕 2026-10-29 (§49.1); DA-CLUS-15 🆕 2026-10-29 (§47.1); DA-OPS-11 🆕 2026-10-29 (§46.1), extended (§47), the manual run done (§48); DA-OBS-8 and DA-OBS-9 🆕 2026-10-29 (§45.1); DA-OBS-7 🆕 2026-10-28 (§44.1); DA-SNAP-18…21 🆕 2026-10-28 (§43.1); DA-SNAP-15…17 🆕 2026-10-27 (§42.1); DA-API-13…18 🆕 2026-10-23 and DA-API-20 🆕 2026-10-24 (§41.1); DA-API-19 🆕 2026-10-23, ✅ 2026-10-24 (§41); DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2); DA-SRC-20 🆕 2026-10-13 (§30.1); DA-SRC-21 🆕 2026-10-14 (§31.2); DA-SRC-22, DA-SNAP-14 and DA-X-13 🆕 2026-10-14 (§32.1); DA-SRC-24…26 🆕 2026-10-16 (§33.1); DA-OBS-6 🆕 2026-10-17 (§34.1), ✅ 2026-10-29 (M10 merged, §45); DA-OPS-9 🆕 2026-10-22 (§38.1); DA-OPS-10 🆕 2026-10-23 (§39.1). DA-OPS-8 🔄 2026-10-22 (§38). DA-API-11 and DA-API-12 ✅ 2026-10-23 (§40). DA-CLUS-14, DA-OPS-7 and DA-SRC-28 ✅ 2026-10-22 (§37). DA-SRC-27 and DA-X-14 ✅ 2026-10-20 (§35). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
+| 🟥 Open (v1) | **36** | DA-X-15 🆕 2026-10-30 (§52.1). Recounted 2026-10-30 (§52): the 34 domain rows and DA-X-13. DA-OPS-11 ✅ 2026-10-30 (§51: `v0.1.0` released, the packages public); DA-SRC-30 🆕 2026-10-30 (§50.1); DA-OPS-10, DA-API-14, DA-API-15, DA-SNAP-15, DA-SNAP-17 and DA-SNAP-18 leave 2026-10-30 (§50; DA-OPS-10 and DA-SNAP-15 as 🔄); DA-CLUS-15 stays; DA-OPS-12, DA-OPS-13 and DA-SRC-29 🆕 2026-10-29 (§49.1); DA-CLUS-15 🆕 2026-10-29 (§47.1); DA-OPS-11 🆕 2026-10-29 (§46.1), extended (§47), the manual run done (§48); DA-OBS-8 and DA-OBS-9 🆕 2026-10-29 (§45.1); DA-OBS-7 🆕 2026-10-28 (§44.1); DA-SNAP-18…21 🆕 2026-10-28 (§43.1); DA-SNAP-15…17 🆕 2026-10-27 (§42.1); DA-API-13…18 🆕 2026-10-23 and DA-API-20 🆕 2026-10-24 (§41.1); DA-API-19 🆕 2026-10-23, ✅ 2026-10-24 (§41); DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2); DA-SRC-20 🆕 2026-10-13 (§30.1); DA-SRC-21 🆕 2026-10-14 (§31.2); DA-SRC-22, DA-SNAP-14 and DA-X-13 🆕 2026-10-14 (§32.1); DA-SRC-24…26 🆕 2026-10-16 (§33.1); DA-OBS-6 🆕 2026-10-17 (§34.1), ✅ 2026-10-29 (M10 merged, §45); DA-OPS-9 🆕 2026-10-22 (§38.1); DA-OPS-10 🆕 2026-10-23 (§39.1). DA-OPS-8 🔄 2026-10-22 (§38). DA-API-11 and DA-API-12 ✅ 2026-10-23 (§40). DA-CLUS-14, DA-OPS-7 and DA-SRC-28 ✅ 2026-10-22 (§37). DA-SRC-27 and DA-X-14 ✅ 2026-10-20 (§35). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
 | 🧪 Verify (v1) | **0** | DA-SRC-10/11 proven 2026-09-26 (§21). |
 | ⏭ v2 | 13 | Iceberg-sink items (§26.2). |
 | 🟢 Spec-merge debt | **0** | All applied 2026-09-26 (§26.6): §19.3 S-1…S-6, the DA-X-8 config residual, the D-V1 patches and the Data-Flow Phase 2a probe details. |
@@ -1773,8 +1831,8 @@ research, the iceberg-capability probes (G1–G2c) and the V-115/V-116 gates car
 |---|---|---|---|---|
 | DA-SRC-10 | PG replication client crate capability (`pgwire-replication`) | 🔴 | ✅ | Never pinned, compiled or probed. The sink side had three probe rounds; the source side had none. Probe: `prototypes/source-capability/` S-gates. **Proven same day** — S-PG0…8 9/9; decoder is ours. |
 | DA-SRC-11 | MySQL binlog client crate capability (`mysql-binlog-connector-rust`) | 🔴 | ✅ | Same. Also decides DA-SRC-8 (MariaDB GTID dialect) in practice. **Proven same day with `mysql_async`** (S-MY0…9 10/10); `mysql-binlog-connector-rust` rejected. |
-| DA-SYS-7 | v1 scope statement + v1 handling of `sink.type: iceberg` | 🟢 | 🆕 🟥 | Recommendation: keep the enum, refuse at start naming v2 (§20). |
-| DA-SRC-12 | `mysql_async` silently drops an undecompressable compressed transaction | 🟡 | 🆕 🟥 | Guard in our source: validate each `TRANSACTION_PAYLOAD`, halt on mismatch. |
+| DA-SYS-7 | v1 scope statement + v1 handling of `sink.type: iceberg` | 🟢 | ✅ | Recommendation: keep the enum, refuse at start naming v2 (§20). **✅ 2026-09-26** (D-V1.4, §4; this row updated 2026-10-30, §52): the pipeline is refused at start naming v2 (`wiring.rs`). |
+| DA-SRC-12 | `mysql_async` silently drops an undecompressable compressed transaction | 🟡 | ✅ | Guard in our source: validate each `TRANSACTION_PAYLOAD`, halt on mismatch. **✅** (D-V1.6; this row updated 2026-10-30, §52): built in M7a (`binlog.rs`, `BINLOG_PAYLOAD_INVALID`), its fault-injection E2E green since M7b (§35). |
 | DA-DEP-5 | Two rustls crypto providers → panic at first handshake | 🟢 | 🆕 ✅(rule) | Install a process-wide `CryptoProvider` at startup. |
 
 ### 26.4 What stands between here and the v1 implementation plan
@@ -1878,7 +1936,7 @@ items it carried. They are mirrored in §10 and §14.
 | DA-SRC-13 | Publication blind spots | 🟢 | 🆕 🟥 | Unchecked at reconcile: PG15+ row filters and column lists (a column list makes channel C halt at every signal), PG18 `publish_generated_columns`, extra tables under `require_existing` / `FOR ALL TABLES` (D-M5.14 says warn), a managed `DROP TABLE` of a `TABLES IN SCHEMA` member (42704), `via_root` refused when only the leaf is published, the old publication after a rename. |
 | DA-SRC-14 | `bit` / `varbit` / PostGIS keys | 🟢 | 🆕 🟥 | `text_of` isn't valid input for those types, so a snapshot's second chunk fails `Permanent`. Refuse such keys at resolution, or render them. |
 | DA-SRC-15 | Snapshot collation and chunk edges | 🟢 | 🆕 🟥 | A domain with its own collation in a column declared with another (42P22 from the second chunk); the cursor's collation name isn't schema-qualified; a `COLLATE "C"` identity index on a non-C column isn't warned; no byte budget per chunk; `limit` 0 reads as the end; no `E''` literals. |
-| DA-SRC-16 | The replication connection's timeouts | 🟢 | 🆕 🟥 | `pgwire-replication` sets no TCP keep-alive, connect timeout or idle deadline: a black-holed peer stalls `next` until the kernel gives up. M6: a watchdog of a few heartbeats; read-ahead is 8192 events, not bytes (`with_buffer_size`). |
+| DA-SRC-16 | The replication connection's timeouts | 🟢 | ✅ | `pgwire-replication` sets no TCP keep-alive, connect timeout or idle deadline: a black-holed peer stalls `next` until the kernel gives up. M6: a watchdog of a few heartbeats; read-ahead is 8192 events, not bytes (`with_buffer_size`). | **✅ 2026-10-13** (§30, §14; this row updated 2026-10-30, §52): the stream watchdog and the bounded catalog connect (M6b Task 22). |
 | DA-SRC-17 | Source edges PostgreSQL doesn't produce, and small gaps | 🟢 | 🆕 🟥 | Crafted date/time text can overflow `i64`; loose parsing; hstore/PostGIS matched by name; no cycle guard in type planning; `convert` without a scale guard; a `string` override on a `"char"` above 127 halts on PG14 only; `char(n)` under `string` keeps its spaces; an interval's fields narrowed aren't seen; the catalog driver's errors and the server's detail aren't reported (no logging in the crate yet); a retry after dropping an invalidated orphan reports `FirstStart`; only the first V-113 error; a standby isn't refused by name; a glob table set `UNLOGGED` mid-resolve halts; `bounded` takes the connection-cache lock before its timer starts, so a call queued behind a reconnect waits longer than its budget (latency only). |
 | DA-SRC-18 | M5 test gaps | 🟢 | 🆕 🟥 | No unit test of the `ChainOnly` / `Unverified` slot verifiers; no `require`-mode integration test; no Delta sink test of a composite or `Date` key end to end; the `postgres-tls` compose service drifts from the `x-pg` anchor (`test-infra/compose.yaml`). |
 
