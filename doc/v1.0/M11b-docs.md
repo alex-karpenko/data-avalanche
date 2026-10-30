@@ -5420,3 +5420,12 @@ git commit -m "gap: v1 §50 — M11b's docs: DA-OPS-8, DA-API-14/15, DA-SNAP-17/
   - Nine Minors are fixed, the examples test now also counts every `config_version:` line, and
     DA-SRC-29's premise and DA-OPS-8's wording are corrected.
   - Open 35 → 36.
+- **The PR's `k3s` job** failed at the image's build: `failed to load manifest for workspace
+  member /src/xtask`. `.dockerignore` lets in only `Cargo.toml`, `Cargo.lock`,
+  `rust-toolchain.toml` and `crates/`, and cargo reads every member's manifest even to build
+  `-p data-avalanche`. Task 2 added `xtask` to the members outside `crates/`, and no task checked
+  the image's context. The release and weekly builds use the same context, so they would have
+  failed too. Fixed (`110d951`): `!xtask/` in `.dockerignore`, and the packaging test
+  `the_image_s_build_context_holds_every_workspace_member`, which fails while a member is left out.
+  This is a file outside the Global Constraints' list (`xtask/`, `docs/`, the workflow, the chart).
+  The binary is unchanged.
