@@ -328,10 +328,6 @@ where
     }
 }
 
-/// Data-Flow Phase 0, or its rerun after the stream position was lost mid-run (`lost` holds the
-/// new checkpoint `reset_position` returned). Leaves the core tracking the tables to stream, with
-/// every decision persisted: halts and snapshot requests first, then the cached schemas, then a
-/// fresh start's checkpoint, recorded with the server the start read (MySQL).
 /// Moves the table's marker onto `at`, the new server's position (DA-SRC-20): an empty change set
 /// that replaces the marker instead of joining it. A table the lake doesn't hold, or holds no
 /// marker for, has nothing to move.
@@ -382,6 +378,10 @@ async fn reposition(
     }
 }
 
+/// Data-Flow Phase 0, or its rerun after the stream position was lost mid-run (`lost` holds the
+/// new checkpoint `reset_position` returned). Leaves the core tracking the tables to stream, with
+/// every decision persisted: halts and snapshot requests first, then the cached schemas, then a
+/// fresh start's checkpoint, recorded with the server the start read (MySQL).
 pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(), WorkerError> {
     core.update(|st| st.phase = Phase::Starting);
     let s = &core.settings;
