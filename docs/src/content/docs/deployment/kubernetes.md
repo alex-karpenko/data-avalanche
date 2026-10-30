@@ -88,8 +88,9 @@ caught up. Watch the [metrics](/data-avalanche/deployment/observability/) for th
 The StatefulSet replaces its pods one at a time, the highest ordinal first, each once the one before
 is ready. The pipelines of the pod being replaced move to the others (a planned hand-off), and come
 back once the new pod has been a member for `rebalance_stabilization` (15 s). `minReadySeconds`
-(30 s by default) keeps the rollout from moving on before they have: lower it to roll faster, at
-the cost of moving some pipelines twice.
+(30 s by default) paces the rollout, so that a pod's pipelines usually come back before the next pod
+rolls. It doesn't wait for them: lower it to roll faster, at the cost of moving some pipelines
+twice.
 
 The pods start in parallel (`podManagementPolicy: Parallel`), since a pod's name, not its start
 order, places it. With four or more pods started at once, check after a cold start that every node

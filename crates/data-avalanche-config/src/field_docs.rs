@@ -181,7 +181,7 @@ pub const FIELD_DOCS: &[FieldDoc] = &[
     f(
         "globals.cluster.lease_safety_margin",
         Value("0.15"),
-        "The share of `lease_duration` a holder keeps in hand: it stops writing before the lease could lapse.",
+        "The share of `lease_duration` a holder keeps in hand: it stops writing before the lease could lapse. From 0 to 0.5; outside 0.05 to 0.30 warns.",
     ),
     f(
         "globals.cluster.rebalance_stabilization",
@@ -377,7 +377,7 @@ pub const FIELD_DOCS: &[FieldDoc] = &[
     f(
         "pipelines.*.source.postgres.slot",
         Required,
-        "The logical replication slot. Lowercase letters, digits and `_`; unique per server and database across pipelines.",
+        "The logical replication slot. Lowercase letters, digits and `_`; unique per server (host and port) across pipelines.",
     ),
     f(
         "pipelines.*.source.postgres.auto_cleanup",
@@ -397,7 +397,7 @@ pub const FIELD_DOCS: &[FieldDoc] = &[
     f(
         "pipelines.*.source.postgres.slot_on_orphan",
         Value("halt"),
-        "A slot that exists with no state of the pipeline's: `halt` refuses to start, naming it; `adopt_resnapshot` takes it over and snapshots every table again.",
+        "A slot that exists with no state of the pipeline's: `halt` refuses to start, naming it; `adopt_resnapshot` takes it over and starts from the current position, snapshotting as `snapshots.mode` says (none under `never`).",
     ),
     f(
         "pipelines.*.source.postgres.max_wal_lag_bytes",
@@ -422,7 +422,7 @@ pub const FIELD_DOCS: &[FieldDoc] = &[
     f(
         "pipelines.*.source.mysql.binlog_purge_action",
         Value("error"),
-        "When the server purged the binlog the pipeline must resume from: `error` halts; `re_snapshot` snapshots every table again.",
+        "When the server purged the binlog the pipeline must resume from: `error` halts; `re_snapshot` starts from the current position, snapshotting as `snapshots.mode` says (none under `never`).",
     ),
     f(
         "pipelines.*.source.mysql.server_id",

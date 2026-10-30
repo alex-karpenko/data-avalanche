@@ -8,8 +8,11 @@ sidebar:
 ## Metrics
 
 `GET /metrics` on every node, with no credentials, in the Prometheus text format. Each node
-exposes the pipelines it owns. Every series has the labels `pipeline`, `source_host` and
-`source_db`; `sink.metrics.per_table: true` adds a `table` label to the snapshot gauges.
+exposes the pipelines it owns. Every pipeline series has the labels `pipeline`, `source_host` and
+`source_db`; the node's own gauges (`data_avalanche_cluster_members`,
+`data_avalanche_owned_pipelines`, `data_avalanche_ring_generation`,
+`data_avalanche_config_generation`) have none. `sink.metrics.per_table: true` adds a `table` label
+to the snapshot gauges.
 
 | Family | Metrics |
 |---|---|

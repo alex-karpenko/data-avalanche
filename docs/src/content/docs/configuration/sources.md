@@ -34,7 +34,8 @@ Tested on PostgreSQL 14 to 18.
 A table without a key that a pattern matches is skipped with a warning; one named exactly halts.
 
 **The slot and the publication.** `source.postgres.publication` and `slot` name them; both are
-required and unique per database. By default (`slot_management: managed`) the pipeline creates the
+required. A slot name is unique per source server (host and port: V-058), a publication per
+database. By default (`slot_management: managed`) the pipeline creates the
 slot and the publication, keeps the publication's tables equal to the tables it replicates, and
 drops both when the pipeline is removed (`auto_cleanup: true`). With
 `slot_management: require_existing` it creates neither: a DBA creates them, and the pipeline
@@ -55,7 +56,8 @@ the parent's name.
 stopped or failing pipeline grows the server's disk. `data_avalanche_wal_lag_bytes` measures it;
 `source.postgres.max_wal_lag_bytes` halts the pipeline when it passes a bound (the slot stays).
 Set the server's `max_slot_wal_keep_size` too, so a forgotten slot can't fill the disk: a slot past
-it is invalidated, and the pipeline then starts over with a new slot and a snapshot (see
+it is invalidated, and the pipeline then starts over with a new slot and a snapshot as
+`snapshots.mode` says, none under `never` (see
 [A lost position](/data-avalanche/runbooks/position-lost/)).
 
 ## MySQL
@@ -90,7 +92,9 @@ server's replicas.
 
 **A purged binlog.** When the server has purged the binlog a pipeline still needs,
 `binlog_purge_action: error` (the default) stops it for the operator;
-`re_snapshot` starts again from the server's current position and snapshots every table.
+`re_snapshot` starts again from the server's current position and snapshots the tables as
+`snapshots.mode` says: under `never`, the default, none, and the log warns, so start a snapshot
+job for the tables.
 
 **`TINYINT(1)`** is read as a boolean (`tinyint1_as_bool: true`); set it `false` to keep the
 number.

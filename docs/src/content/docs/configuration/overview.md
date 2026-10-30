@@ -51,7 +51,10 @@ pipelines:
 - **`globals`** holds what the whole cluster shares: the cloud, where the cluster keeps its state,
   the API, logging, the cluster's own settings, tracing.
 - **`defaults`** is shaped like a pipeline. It is merged into every pipeline, and the pipeline
-  wins. It may not hold a pipeline's `id`, its publication or its slot, which must be unique.
+  wins. It may not hold a pipeline's `id`, its publication, its slot or its
+  `source.mysql.server_id`, which must be unique (V-060). Its `state.prefix` is a parent prefix,
+  under which each pipeline's state goes, not a value copied as it is (see
+  [Storage](/data-avalanche/configuration/storage/)).
 - **`pipelines`** maps a pipeline's name to its config. It may be empty (`pipelines: {}`): the
   cluster runs and waits.
 

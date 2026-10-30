@@ -53,11 +53,14 @@ source:
     slot_management: require_existing
     auto_cleanup: false
     slot_on_orphan: adopt_resnapshot   # for the first start only
+snapshots:
+  mode: initial
 ```
 
 At its first start the pipeline has no state for the slot, so the slot is an orphan, and the
 default `slot_on_orphan: halt` refuses it. `adopt_resnapshot` takes it over: the pipeline moves it
-to the current WAL position and copies every table, whatever `snapshots.mode` says. Once the
+to the current WAL position and copies the tables as `snapshots.mode` says, hence `initial` above:
+under `never`, the default, none is copied, and you start a snapshot job for each table. Once the
 pipeline runs, set `slot_on_orphan` back to `halt` (a reload applies it), so that a pipeline whose
 state is lost later stops rather than starting over by itself.
 

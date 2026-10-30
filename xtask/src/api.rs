@@ -101,7 +101,7 @@ pub(crate) fn page() -> String {
             }
             if let Some(body) = op["requestBody"]["content"].as_object() {
                 let types: Vec<String> = body.keys().map(|t| format!("`{t}`")).collect();
-                let _ = writeln!(out, "- Body (optional): {}.", types.join(", "));
+                let _ = writeln!(out, "- Body: {}.", types.join(", "));
             }
             out.push_str("\n| Status | When |\n|---|---|\n");
             for (code, answer) in sorted(&op["responses"]) {

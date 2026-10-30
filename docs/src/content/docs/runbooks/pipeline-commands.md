@@ -21,8 +21,8 @@ failovers and config reloads, so a reload never resumes a paused or stopped pipe
 - `202`: recorded; the owner acts at its next poll.
 - `200`: the pipeline is in that state already (or, for `flush`, paused with nothing to flush);
   nothing changes.
-- `409`: the state doesn't allow it (`pause` of a stopped pipeline; `restart` or `flush` of a
-  paused or stopped one, or of one no node holds).
+- `409`: the state doesn't allow it (`pause` of a stopped pipeline; `restart` of a paused or
+  stopped one; `flush` of a stopped one; `restart` or `flush` of one no node holds).
 
 :::caution[A stopped PostgreSQL pipeline grows the server's WAL]
 `stop` keeps the replication slot, which keeps the WAL from the checkpoint on. Watch

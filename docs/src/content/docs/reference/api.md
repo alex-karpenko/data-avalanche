@@ -122,7 +122,7 @@ Snapshot tables on demand, `{"tables": [...]}`, each named exactly; one outside 
 Least role: `operator`.
 
 - Path parameter `id`: the pipeline's id.
-- Body (optional): `application/json`.
+- Body: `application/json`.
 
 | Status | When |
 |---|---|
@@ -197,7 +197,7 @@ Check a config, the body or else the node's file: what a reload of it would chan
 
 Least role: `operator`.
 
-- Body (optional): `application/yaml`.
+- Body: `application/yaml`.
 
 | Status | When |
 |---|---|

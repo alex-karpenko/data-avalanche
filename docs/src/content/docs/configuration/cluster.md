@@ -29,11 +29,13 @@ written as `${VAR}`, which each node resolves from its own environment:
   stay the same across the node's restarts: a pod name of a StatefulSet, or a name kept on the
   host, never a pod IP or a Deployment's random pod name.
 - `memberlist.advertise_addr` (and `advertise_port`): the address the other nodes reach this one
-  at.
+  at. The same goes for `bind_addr` and `bind_port`.
 - the API's `globals.api.address`, when nodes share a host.
 
-A value written as a literal in one node's file is ignored once the cluster has a generation: the
-node takes the generation's, and warns at startup naming each key that differs.
+Once the cluster has a generation, a node takes `node_name` and `api.address` from its own file,
+and the gossip addresses (`bind_addr`, `bind_port`, `advertise_addr`, `advertise_port`) from the
+generation. A value that differs is logged as a warning naming the key and the source the node
+took. So a literal gossip address is ignored; write those as `${VAR}`.
 
 ```yaml
 config_version: 1

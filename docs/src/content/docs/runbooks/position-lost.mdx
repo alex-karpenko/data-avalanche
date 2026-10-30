@@ -9,13 +9,18 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 A pipeline resumes from its checkpoint: a position in the source's log. When the source can no
 longer serve that position, the changes in between are gone, and the only way to a correct table
-is a fresh copy. Depending on its settings the pipeline makes that copy by itself, or stops in
-`error` for you to decide.
+is a fresh copy. Depending on its settings the pipeline starts again from the server's position
+now by itself, or stops in `error` for you to decide.
+
+Whether it then copies the tables follows `snapshots.mode`. With `initial` or `always` it copies
+every table. With `never`, the default, it takes no snapshot: it streams on, the log warns that
+the changes before now are missing, and you copy the tables yourself with a
+[snapshot job](/data-avalanche/runbooks/snapshot-jobs/) for each table the gap touched.
 
 :::caution[A fresh copy keeps rows deleted in the gap]
 The copy upserts every row it reads and deletes nothing: a row deleted at the source during the
 gap stays in the Delta table. When the tables must be exact, stop the pipeline, drop or move its
-Delta tables, then let it copy them.
+Delta tables, then copy them.
 :::
 
 <Tabs>
@@ -43,9 +48,18 @@ A slot past `max_slot_wal_keep_size` is invalidated by the server; a slot can al
 hand, or advanced past the pipeline's checkpoint.
 
 - With `slot_management: managed` (the default) the pipeline creates the slot again at its next
-  start and copies every table afresh, streaming from the new slot. The log says why.
-- With `require_existing` the pipeline stops in `error`: have the slot created again, then
-  restart the pipeline. It copies every table afresh.
+  start and streams from the new slot. It copies the tables as `snapshots.mode` says: under
+  `never` it takes none, and warns. The log says why.
+- With `require_existing` the pipeline stops in `error`, and v1 has no in-place recovery
+  (DA-SRC-30). A slot the DBA creates again is past the pipeline's checkpoint, so it counts as
+  lost and is refused again; the refusal's advice to recreate it and restart is wrong. The path
+  that works:
+  1. Have the DBA drop the slot, if it still exists.
+  2. Set `slot_management: managed` and reload. That restarts the pipeline, even one in `error`.
+     The pipeline creates the slot and recovers as under `managed`, above.
+  3. Once the pipeline runs, set `require_existing` back (keep `auto_cleanup: false`).
+
+  The role already has `REPLICATION`, which streaming needs, and that is enough to create a slot.
 
 ## An orphan slot
 
@@ -53,10 +67,14 @@ The slot exists, but the pipeline has no state: its state location was lost or m
 pipeline took an old slot's name. With `slot_on_orphan: halt` (the default) the pipeline refuses to
 start. Then either:
 
-- drop the slot, for a first start (a snapshot per `snapshots.mode`);
+- under `managed`, drop the slot, for a first start (the pipeline creates it, and copies the
+  tables as `snapshots.mode` says). Under `require_existing` this fails: with no state and no slot
+  the pipeline refuses to start;
 - restore the pipeline's state location, if it was lost by mistake;
 - or set `slot_on_orphan: adopt_resnapshot`: the pipeline takes the slot over, moves it to the
-  current WAL position and copies every table afresh.
+  current WAL position and copies the tables as `snapshots.mode` says (none under `never`, with a
+  warning). `slot_on_orphan` is applied without a restart, so restart a pipeline in `error` with
+  `POST /v1/pipelines/<id>/restart`.
 
 </TabItem>
 <TabItem label="MySQL and MariaDB">
@@ -68,9 +86,11 @@ needs. A pipeline stopped for longer than the server keeps its binlog
 (`binlog_expire_logs_seconds`) meets this when it starts again.
 
 - With `binlog_purge_action: error` (the default) the pipeline waits for you. To copy afresh, set
-  `binlog_purge_action: re_snapshot` (a reload applies it) and restart the pipeline: it streams
-  from the server's position now and copies every table.
-- With `re_snapshot` it does that by itself, with a warning.
+  `binlog_purge_action: re_snapshot` (a reload applies it, without a restart) and restart the
+  pipeline: it streams from the server's position now and copies the tables as `snapshots.mode`
+  says.
+- With `re_snapshot` it does that by itself, with a warning. Under `snapshots.mode: never` no copy
+  follows: start a snapshot job.
 
 ## The server changed (`BINLOG_SOURCE_CHANGED`)
 
@@ -80,8 +100,8 @@ now leads to another server (a failover, a restore), the pipeline stops in `erro
 
 1. Prefer GTIDs: set `replication_type: gtid` (the server needs them on) and
    `binlog_purge_action: re_snapshot`, and reload. The pipeline can't carry a file position over
-   to a GTID one, so it copies every table afresh once, then follows GTIDs, which survive later
-   failovers.
+   to a GTID one, so it starts from the server's position now (and copies the tables as
+   `snapshots.mode` says), then follows GTIDs, which survive later failovers.
 2. Without GTIDs, the position can't be repaired in place: replace the pipeline. Give it a new
    `id` and a new `sink.prefix` (or none, so the prefix is the new `id`), with
    `snapshots.mode: initial`, in one reload. The new pipeline copies every table into fresh Delta

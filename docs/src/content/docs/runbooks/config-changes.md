@@ -29,8 +29,10 @@ sidebar:
    config stays.
 4. Check that every node runs it: `GET /v1/config/status` lists the generation and each member's.
 
-A reload doesn't restart a pipeline in `error`, even when it fixes the cause: once the new
-generation runs, `POST /v1/pipelines/<id>/restart` it.
+A reload whose change to a pipeline is of class *pipeline restart* restarts it, which clears
+`error`. A change of class *applied* (for example `slot_on_orphan`) reaches the running pipeline
+without a restart, so a pipeline in `error` stays there: once the new generation runs,
+`POST /v1/pipelines/<id>/restart` it.
 
 Both calls need the `operator` role. Any node will do, but it publishes **its own file**: send the
 reload to a node whose file is the one you changed.
@@ -45,8 +47,10 @@ follow it with a reload.
 
 The per-node values are the exception: a node resolves the generation's `${VAR}`s with its own
 environment, so `node_name`, `advertise_addr` and secrets passed as `${VAR}` are each node's own.
-A per-node key written as a literal that differs from the generation is ignored, with a warning
-naming it, and a reload from that node is refused until the file matches.
+A gossip address (`bind_addr`, `bind_port`, `advertise_addr`, `advertise_port`) written as a
+literal that differs from the generation is ignored, with a warning naming it; `node_name` and
+`api.address` are the node's file's. A reload from a node is refused until its file matches the
+generation on these keys.
 
 ## Rotate a secret
 

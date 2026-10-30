@@ -35,7 +35,8 @@ docker build -f deploy/docker/Dockerfile -t data-avalanche:dev .
 data-avalanche run --config <file> [--log-level <filter>] [--log-format json|compact|pretty]
 ```
 
-- `--config` names the YAML file. Nothing else is read from the disk.
+- `--config` names the YAML file. Nothing else is read from the disk but the files the config
+  names (credential files, TLS certificates and keys).
 - `--log-level` overrides `globals.log.level`: a level (`info`) or a filter
   (`data_avalanche=debug,warn`).
 - `--log-format` overrides `globals.log.format`.
