@@ -344,9 +344,7 @@ impl SourceConnector for PgConnector {
     }
 
     async fn reset_position(&self) -> Result<Checkpoint, SourceError> {
-        PgConnector::reset_position(self)
-            .await
-            .map(Checkpoint::from)
+        PgConnector::reset_position(self).await
     }
 
     async fn retained(&self) -> Result<Option<RetainedLog>, SourceError> {

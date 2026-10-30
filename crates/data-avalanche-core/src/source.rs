@@ -167,7 +167,7 @@ pub struct Checkpoint {
 }
 
 impl From<SourcePosition> for Checkpoint {
-    /// A position with no recorded server (PostgreSQL).
+    /// A position with no recorded server.
     fn from(position: SourcePosition) -> Self {
         Self {
             position,

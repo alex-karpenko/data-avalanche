@@ -584,9 +584,9 @@ impl PgConnector {
     }
 
     /// D-15.3 after [`SourceError::PositionUnreachable`]: drop the slot and create it again;
-    /// stream from the new position after a re-snapshot. Under `require_existing` the slot isn't
-    /// ours to recreate.
-    pub async fn reset_position(&self) -> Result<SourcePosition, SourceError> {
+    /// stream from the new position after a re-snapshot. The checkpoint names the server it was
+    /// made on. Under `require_existing` the slot isn't ours to recreate.
+    pub async fn reset_position(&self) -> Result<Checkpoint, SourceError> {
         if self.pg.slot_management == SlotManagement::RequireExisting {
             return Err(SourceError::Permanent(format!(
                 "replication slot {} lost its position and slot_management is require_existing: recreate it and restart",
@@ -595,7 +595,15 @@ impl PgConnector {
         }
         let client = self.conn.client().await?;
         self.drop_slot(&client).await?;
-        Ok(SourcePosition::Pg(self.create_slot(&client).await?))
+        let at = self.create_slot(&client).await?;
+        let (id, timeline) = self
+            .conn
+            .command("read the server's identity", server_identity(&client))
+            .await?;
+        Ok(Checkpoint {
+            position: SourcePosition::Pg(at),
+            server: Some(parse_identity(&id, &timeline)?),
+        })
     }
 
     /// `auto_cleanup`: drops the slot and the publication when the pipeline is deleted. Nothing

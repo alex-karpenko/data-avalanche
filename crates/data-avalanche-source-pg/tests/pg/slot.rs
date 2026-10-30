@@ -632,9 +632,12 @@ async fn reset_teardown_and_retained_wal() {
     assert!(!retained.streamed, "no stream reads the slot");
     assert_eq!(retained.behind, None, "the binlog lag is MySQL's");
 
-    let SourcePosition::Pg(fresh_at) = c.reset_position().await.unwrap() else {
+    let reset = c.reset_position().await.unwrap();
+    let SourcePosition::Pg(fresh_at) = reset.position else {
         panic!("a PostgreSQL position")
     };
+    assert!(reset.server.is_some(), "the checkpoint names its server");
+    assert_eq!(reset.server, p.server, "the server prepare reported");
     let SourcePosition::Pg(old) = start else {
         unreachable!()
     };
