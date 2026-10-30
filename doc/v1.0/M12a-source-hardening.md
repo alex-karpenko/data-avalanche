@@ -7561,4 +7561,7 @@ git commit -m "docs: the M12a recoveries — a PostgreSQL failover, a DBA's slot
 
 ## Deviations during execution
 
-None yet.
+- **Task 1** (review fix, `775163c`): Step 3's `worker.rs` block put `reposition` between `start`'s
+  doc comment and `start`, so the doc went to `reposition`. The four doc lines are back above
+  `pub(crate) async fn start`; nothing else moved. Task 8's `worker.rs` hunk is inside `start`,
+  below both, and applies unchanged.
