@@ -7565,3 +7565,9 @@ git commit -m "docs: the M12a recoveries — a PostgreSQL failover, a DBA's slot
   doc comment and `start`, so the doc went to `reposition`. The four doc lines are back above
   `pub(crate) async fn start`; nothing else moved. Task 8's `worker.rs` hunk is inside `start`,
   below both, and applies unchanged.
+- **Task 2** (review fix, `2c031fe`): `reset_position` returned its new checkpoint without a
+  server (`Checkpoint::from`), so after a mid-run `PositionUnreachable` the slot document lost
+  its server until the next restart, and a failover in between would have been adopted.
+  `PgConnector::reset_position` now returns a `Checkpoint` naming the server it read after
+  recreating the slot, as MySQL's does; the lost-slot IT asserts it equals `prepare`'s.
+  Later blocks in `slot.rs`, `tests/pg/slot.rs` and `connector.rs` don't overlap it.
