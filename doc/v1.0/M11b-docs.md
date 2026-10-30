@@ -5407,3 +5407,16 @@ git commit -m "gap: v1 §50 — M11b's docs: DA-OPS-8, DA-API-14/15, DA-SNAP-17/
 - **Task 4, R-12's pointers:** Step 1 points R-12 at `configuration/storage.md` for both the
   non-ASCII limit and the date clamp. The clamp is on `configuration/sink.md` (its type table), so
   R-12 and §50 name `sink.md` for the clamp and `storage.md` for the limit.
+- **The whole-branch review** found the plan's page text promising a re-copy after a recovery: a
+  lost slot, an adopted orphan, or a MySQL purge with `re_snapshot`. Under `snapshots.mode: never`,
+  the default, the code takes none and warns (Q-M6a-1, Data-Flow Phase 0); the planning run used
+  `initial`, so it never met the case. The config spec's §9.2.1/§9.2.2 rows said the same as the
+  pages, and the user approved patching them (`59cc999`). The fixes (`754a11e`):
+  - Every recovery sentence, and the two `FIELD_DOCS` rows, say the snapshot follows the mode.
+  - The `require_existing` runbook says there is no in-place recovery and gives the managed
+    switch (DA-SRC-30, new).
+  - Three more sentences are scoped to what the code does: a reload and a pipeline in `error`,
+    the per-node keys, and a copy never deleting.
+  - Nine Minors are fixed, the examples test now also counts every `config_version:` line, and
+    DA-SRC-29's premise and DA-OPS-8's wording are corrected.
+  - Open 35 → 36.
