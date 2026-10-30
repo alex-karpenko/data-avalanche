@@ -428,6 +428,26 @@ The whole-branch review corrected the recovery pages: a recovery's snapshot foll
 |---|---|---|---|---|
 | DA-SRC-30 | Under `slot_management: require_existing` a lost slot (invalidated or missing) has no in-place recovery: a slot the DBA creates again has a `confirmed_flush_lsn` past the pipeline's checkpoint, so it is lost again and refused again (`slot.rs`), and the refusal's text ("recreate it and restart: the pipeline re-snapshots") says otherwise | 🟢 | the M11b whole-branch review | The refusal's text (with DA-OPS-13), and a way to adopt a DBA's new slot (for example the orphan path for a slot past the checkpoint); until then the docs: drop the slot, set `managed` in one reload, then `require_existing` again (`runbooks/position-lost.mdx`) |
 
+
+## 51. M11b documentation — the exit, and v0.1.0 (2026-10-30)
+
+M11b (`doc/v1.0/M11b-docs.md`) merged 2026-10-30 (PR #18, `554e5a9`). Its PR CI was green on every
+target (`ci.yml` run 41020210010; `docs.yml` run 41020209936). The `k3s` job's first run had found
+the image's build context missing `xtask/`, which was fixed before the merge (`110d951`, with a
+packaging test). The site deploys from `main` (`docs.yml` run 41025275696) to
+<https://alex-karpenko.github.io/data-avalanche/>. `v0.1.0` was tagged on `554e5a9` after a manual
+`release.yml` run on `main` (41031315279), and released (run 41034298202). The release published:
+- the image `0.1.0`, `0.1` and `latest`, for amd64 and arm64;
+- its build-provenance attestation, which `gh attestation verify` accepts;
+- the chart `oci://ghcr.io/alex-karpenko/charts/data-avalanche:0.1.0`;
+- the GitHub release.
+
+Both packages are public: an anonymous pull of either manifest answers 200.
+
+| ID | Change | Evidence |
+|---|---|---|
+| DA-OPS-11 | 🟥 → ✅: the release's first full run, on `v0.1.0`; the packages public | `release.yml` run 41034298202; `gh attestation verify oci://ghcr.io/alex-karpenko/data-avalanche:0.1.0` |
+
 ---
 
 ### Counts (by status)
@@ -439,13 +459,13 @@ The whole-branch review corrected the recovery pages: a recovery's snapshot foll
 > M7a's plan (§32), 2026-10-16 for M7a's exit (§33), 2026-10-17 for M7b's plan (§34),
 > 2026-10-20 for M7b's exit (§35), 2026-10-21 for M8a's plan (§36), 2026-10-22 for M8a's exit (§37),
 > 2026-10-22 for M8b's plan (§38), 2026-10-23 for M8b's exit (§39), 2026-10-23 for M9a's plan
-> (§40), 2026-10-23 for M9a's exit (§41), 2026-10-27 for M9b's plan (§42), 2026-10-28 for M9b's exit (§43), 2026-10-28 for M10's plan (§44), and 2026-10-29 for M10's exit (§45), and 2026-10-29 for M11a's plan (§46), and 2026-10-29 for M11a's whole-branch review (§47), and 2026-10-29 for M11a's exit (§48), and 2026-10-29 for M11b's plan (§49), and 2026-10-30 for M11b's pages (§50).
+> (§40), 2026-10-23 for M9a's exit (§41), 2026-10-27 for M9b's plan (§42), 2026-10-28 for M9b's exit (§43), 2026-10-28 for M10's plan (§44), and 2026-10-29 for M10's exit (§45), and 2026-10-29 for M11a's plan (§46), and 2026-10-29 for M11a's whole-branch review (§47), and 2026-10-29 for M11a's exit (§48), and 2026-10-29 for M11b's plan (§49), and 2026-10-30 for M11b's pages (§50), and 2026-10-30 for M11b's exit and v0.1.0 (§51).
 
 | Status | Count (v1 scope) | Notes |
 |---|---|---|
 | ✅ Resolved | the large majority | Design closed by a research/spec doc or a probe. |
 | 🔄 Partial | 4 | DA-OPS-10 and DA-SNAP-15 🔄 2026-10-30 (§50); DA-SCHEMA-10 ✅ 2026-10-28 (M9b merged, §43); DA-SNAP-7, DA-SRC-9 (neither blocks the plan); DA-OPS-8 ✅ 2026-10-30 (§50; 🔄 2026-10-22, §38); DA-SNAP-10 ✅ 2026-10-16 (M7a merged, §33). DA-MS-3 is a decided caveat. DA-X-8 ✅ 2026-09-26; DA-SRC-16 and DA-X-12 ✅ 2026-10-13 (§30). |
-| 🟥 Open (v1) | **36** | DA-SRC-30 🆕 2026-10-30 (§50.1); DA-OPS-10, DA-API-14, DA-API-15, DA-SNAP-15, DA-SNAP-17 and DA-SNAP-18 leave 2026-10-30 (§50; DA-OPS-10 and DA-SNAP-15 as 🔄); DA-CLUS-15 stays; DA-OPS-12, DA-OPS-13 and DA-SRC-29 🆕 2026-10-29 (§49.1); DA-CLUS-15 🆕 2026-10-29 (§47.1); DA-OPS-11 🆕 2026-10-29 (§46.1), extended (§47), the manual run done (§48); DA-OBS-8 and DA-OBS-9 🆕 2026-10-29 (§45.1); DA-OBS-7 🆕 2026-10-28 (§44.1); DA-SNAP-18…21 🆕 2026-10-28 (§43.1); DA-SNAP-15…17 🆕 2026-10-27 (§42.1); DA-API-13…18 🆕 2026-10-23 and DA-API-20 🆕 2026-10-24 (§41.1); DA-API-19 🆕 2026-10-23, ✅ 2026-10-24 (§41); DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2); DA-SRC-20 🆕 2026-10-13 (§30.1); DA-SRC-21 🆕 2026-10-14 (§31.2); DA-SRC-22, DA-SNAP-14 and DA-X-13 🆕 2026-10-14 (§32.1); DA-SRC-24…26 🆕 2026-10-16 (§33.1); DA-OBS-6 🆕 2026-10-17 (§34.1), ✅ 2026-10-29 (M10 merged, §45); DA-OPS-9 🆕 2026-10-22 (§38.1); DA-OPS-10 🆕 2026-10-23 (§39.1). DA-OPS-8 🔄 2026-10-22 (§38). DA-API-11 and DA-API-12 ✅ 2026-10-23 (§40). DA-CLUS-14, DA-OPS-7 and DA-SRC-28 ✅ 2026-10-22 (§37). DA-SRC-27 and DA-X-14 ✅ 2026-10-20 (§35). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
+| 🟥 Open (v1) | **35** | DA-OPS-11 ✅ 2026-10-30 (§51: `v0.1.0` released, the packages public); DA-SRC-30 🆕 2026-10-30 (§50.1); DA-OPS-10, DA-API-14, DA-API-15, DA-SNAP-15, DA-SNAP-17 and DA-SNAP-18 leave 2026-10-30 (§50; DA-OPS-10 and DA-SNAP-15 as 🔄); DA-CLUS-15 stays; DA-OPS-12, DA-OPS-13 and DA-SRC-29 🆕 2026-10-29 (§49.1); DA-CLUS-15 🆕 2026-10-29 (§47.1); DA-OPS-11 🆕 2026-10-29 (§46.1), extended (§47), the manual run done (§48); DA-OBS-8 and DA-OBS-9 🆕 2026-10-29 (§45.1); DA-OBS-7 🆕 2026-10-28 (§44.1); DA-SNAP-18…21 🆕 2026-10-28 (§43.1); DA-SNAP-15…17 🆕 2026-10-27 (§42.1); DA-API-13…18 🆕 2026-10-23 and DA-API-20 🆕 2026-10-24 (§41.1); DA-API-19 🆕 2026-10-23, ✅ 2026-10-24 (§41); DA-SRC-13…15, 17, 18, carried from M5 (§27); DA-SNAP-11…13 and DA-SRC-19 🆕 2026-10-07 (§28.2); DA-SRC-20 🆕 2026-10-13 (§30.1); DA-SRC-21 🆕 2026-10-14 (§31.2); DA-SRC-22, DA-SNAP-14 and DA-X-13 🆕 2026-10-14 (§32.1); DA-SRC-24…26 🆕 2026-10-16 (§33.1); DA-OBS-6 🆕 2026-10-17 (§34.1), ✅ 2026-10-29 (M10 merged, §45); DA-OPS-9 🆕 2026-10-22 (§38.1); DA-OPS-10 🆕 2026-10-23 (§39.1). DA-OPS-8 🔄 2026-10-22 (§38). DA-API-11 and DA-API-12 ✅ 2026-10-23 (§40). DA-CLUS-14, DA-OPS-7 and DA-SRC-28 ✅ 2026-10-22 (§37). DA-SRC-27 and DA-X-14 ✅ 2026-10-20 (§35). DA-SNAP-9 ✅ 2026-10-03 (§28). The design decisions were all made 2026-09-26 (§26.5, `V1_Scope_Decisions.md`), and the deferrals confirmed. |
 | 🧪 Verify (v1) | **0** | DA-SRC-10/11 proven 2026-09-26 (§21). |
 | ⏭ v2 | 13 | Iceberg-sink items (§26.2). |
 | 🟢 Spec-merge debt | **0** | All applied 2026-09-26 (§26.6): §19.3 S-1…S-6, the DA-X-8 config residual, the D-V1 patches and the Data-Flow Phase 2a probe details. |
@@ -796,7 +816,7 @@ pinning is the remaining cross-cutting concern.
 | DA-OPS-4 | Sink/catalog unavailability → DEGRADED back-pressure | 🟡 | ✅ | G-27/G-35 — stop consuming once buffers fill, protect slot/WAL via G-22; recover on next commit; catalog circuit breaker. | G-27, G-35 |
 | DA-OPS-5 | k8s deployment as StatefulSet (not Deployment) | 🟡 | ✅ | Clustering §3.4/§10.2 — stable `node_name` via Downward API; headless Service discovery. | D-1, D-4 |
 | DA-OPS-10 | 🆕 An `id` change that keeps its resources is sequenced only within one reload, on the nodes that applied it | 🟢 | 🔄 | §39.1. M8b's whole-branch review: an added pipeline sharing a removed one's slot, publication, sink or state waits for the removed one's lease. A node that starts during the wait, a removal and an add in two reloads, a cut-off drain, or the old id reused while the removal drains let it start early. **🔄 2026-10-30 (§50):** `configuration/overview.md` says to wait for the old lease's release, or to do both in one reload; the tombstone stays. | — |
-| DA-OPS-11 | 🆕 The release workflow's first full run is the first tag's | 🟢 | 🟥 | §46.1. `release.yml` (M11a) runs on a `v*` tag or by hand, and only from `main`: before M12's `v1.0.0` only its builds are proven. The first push creates the GHCR packages private. Next: a manual run on `main` after M11a merges; the packages made public after the first tag §47: the repository is private, so the attestation is skipped (BuildKit's in-registry provenance and the SBOM stay) and the `ubuntu-24.04-arm` runner is unproven until `weekly.yml` is dispatched. Oleksii's ruling 2026-10-29: the repository goes public (done, after PR #17's README). §48: the manual run on `main` green (run 40918381277). Next: after the first tag, make the image and chart packages public | — |
+| DA-OPS-11 | 🆕 The release workflow's first full run is the first tag's | 🟢 | ✅ | §46.1. `release.yml` (M11a) runs on a `v*` tag or by hand, and only from `main`: before M12's `v1.0.0` only its builds are proven. The first push creates the GHCR packages private. Next: a manual run on `main` after M11a merges; the packages made public after the first tag §47: the repository is private, so the attestation is skipped (BuildKit's in-registry provenance and the SBOM stay) and the `ubuntu-24.04-arm` runner is unproven until `weekly.yml` is dispatched. Oleksii's ruling 2026-10-29: the repository goes public (done, after PR #17's README). §48: the manual run on `main` green (run 40918381277). Next: after the first tag, make the image and chart packages public. **✅ 2026-10-30 (§51):** `v0.1.0` released by `release.yml` (run 41034298202), its image attested, the image and chart packages public | — |
 | DA-OPS-12 | 🆕 A process-restart key written as a literal can't change once a generation exists | 🟢 | 🟥 | §49.1. A reload refuses it (V-061) and a restarted node adopts the stored generation; only `${VAR}` values and file contents change, by a rolling restart. The docs give the workaround. | — |
 | DA-OPS-13 | 🆕 Two operator-facing texts are wrong (the orphan-slot refusal's key, the CLI's `about`) | 🟢 | 🟥 | §49.1. `slot.on_orphan` for `slot_on_orphan`; MySQL and MariaDB missing from the description. | — |
 | DA-OPS-9 | 🆕 A pipeline removed while no node holds its lease isn't torn down | 🟢 | 🟥 | §38.1. Q-M8b-3: the owner drains, tears down (`auto_cleanup`) and releases. With no owner at the removal (it is down, or a hand-off is between release and claim), every node's controller is on standby and just ends, so the PostgreSQL slot and publication stay and the slot keeps WAL (bounded by `max_slot_wal_keep_size`). Config §12.3's "orphan-cleanup … whose owner was offline" design item. | — |
