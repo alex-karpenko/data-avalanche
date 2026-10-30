@@ -5404,3 +5404,6 @@ git commit -m "gap: v1 §50 — M11b's docs: DA-OPS-8, DA-API-14/15, DA-SNAP-17/
     `deployment/observability.md` says, not a measured behaviour.
   - `deployment/observability.md`'s alert table: `DataAvalancheLeaseDegraded` fires on a lease
     `degraded` for 2 minutes (`deploy/prometheus/alerts.yaml`), not on a lease unrenewed for 2 minutes.
+- **Task 4, R-12's pointers:** Step 1 points R-12 at `configuration/storage.md` for both the
+  non-ASCII limit and the date clamp. The clamp is on `configuration/sink.md` (its type table), so
+  R-12 and §50 name `sink.md` for the clamp and `storage.md` for the limit.
