@@ -395,18 +395,35 @@ fn changed(schema: &TableSchema, detail: String) -> SourceError {
     ))
 }
 
-/// A table, or its schema, gone from the catalog (SQLSTATE 42P01, 3F000) halts that table, not
-/// the pipeline (§2.1). A column gone (42703) is `read_plan`'s own finding come late: dropped
-/// after the plan's catalog read and before the query took its lock, it is transient the same
-/// way.
+/// A table read's error, by SQLSTATE (§2.1, DA-SRC-19). The table, or its schema, gone from the
+/// catalog (42P01, 3F000) halts that table, not the pipeline. A column gone (42703) is
+/// `read_plan`'s own finding come late: dropped after the plan's catalog read and before the
+/// query took its lock, it is transient the same way. An error of this table's read alone halts
+/// the table too (`TABLE_NOT_REPLICABLE`), since a restart reads it the same way: its key no
+/// longer compares with the cursor (42883 no such operator, 42804 a datatype mismatch, 42P22 an
+/// indeterminate collation, 42704 the cursor's collation gone), a value or a cursor literal its
+/// type refuses (class 22), or the role lost `SELECT` on it (42501). Any other permanent error
+/// ends the pipeline.
 fn dropped(schema: &TableSchema, e: SourceError) -> SourceError {
-    match &e {
-        SourceError::Permanent(m) if matches!(sqlstate(m), Some("42P01" | "3F000")) => {
-            halt_dropped(schema)
-        }
-        SourceError::Permanent(m) if sqlstate(m) == Some("42703") => changed(schema, m.clone()),
+    let SourceError::Permanent(m) = &e else {
+        return e;
+    };
+    match sqlstate(m) {
+        Some("42P01" | "3F000") => halt_dropped(schema),
+        Some("42703") => changed(schema, m.clone()),
+        Some(code) if table_scoped(code) => SourceError::TableHalt {
+            table: schema.table().clone(),
+            reason: HaltReason::NotReplicable {
+                reason: format!("its snapshot read fails: {m}"),
+            },
+        },
         _ => e,
     }
+}
+
+/// The SQLSTATEs [`dropped`] halts the table for.
+fn table_scoped(code: &str) -> bool {
+    code.starts_with("22") || matches!(code, "42883" | "42804" | "42P22" | "42704" | "42501")
 }
 
 /// The identifier's read columns, in identifier order.
@@ -644,11 +661,42 @@ mod tests {
                 ..
             }
         ));
-        let other = SourceError::Permanent("permission denied (SQLSTATE 42501)".into());
+        // An error of our own SQL, or the server's, ends the pipeline.
+        for code in ["42601", "XX000", "28000"] {
+            let other = SourceError::Permanent(format!("boom (SQLSTATE {code})"));
+            assert!(
+                matches!(dropped(&schema(), other), SourceError::Permanent(_)),
+                "{code}"
+            );
+        }
         assert!(matches!(
-            dropped(&schema(), other),
-            SourceError::Permanent(_)
+            dropped(&schema(), SourceError::Transient("reset".into())),
+            SourceError::Transient(_)
         ));
+    }
+
+    /// An error of this table's read alone halts the table, not the pipeline: a restart would read
+    /// it the same way (DA-SRC-19).
+    #[test]
+    fn a_read_only_this_table_fails_halts_the_table() {
+        for code in [
+            "42883", "42804", "42P22", "42704", "42501", "22P02", "22003", "22021",
+        ] {
+            let e = SourceError::Permanent(format!("it failed (SQLSTATE {code})"));
+            match dropped(&schema(), e) {
+                SourceError::TableHalt {
+                    table,
+                    reason: HaltReason::NotReplicable { reason },
+                } => {
+                    assert_eq!(table, TableRef::new("s", "t"));
+                    assert_eq!(
+                        reason,
+                        format!("its snapshot read fails: it failed (SQLSTATE {code})")
+                    );
+                }
+                other => panic!("{code}: {other:?}"),
+            }
+        }
     }
 
     fn rc(name: &str, type_text: &str, collation: Option<KeyCollation>) -> ReadColumn {

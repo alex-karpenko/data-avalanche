@@ -355,6 +355,15 @@ fn null_key(schema: &TableSchema, row: &Row) -> String {
 const NO_TABLE: u16 = 1146;
 const NO_COLUMN: u16 = 1054;
 
+/// Server errors of this table's read alone, which halt the table, not the pipeline: a restart
+/// reads it the same way (DA-SRC-19, PostgreSQL's beside it): the user lost `SELECT` on the
+/// table or a column (1142, 1143), the key no longer compares with the cursor (1267, 1271
+/// collations mixed; 1253, 1273 the cursor's collation unknown or another character set's), or
+/// a cursor value its type refuses (1292, 1366). Any other permanent error ends the pipeline.
+pub(crate) fn table_scoped(code: u16) -> bool {
+    matches!(code, 1142 | 1143 | 1267 | 1271 | 1253 | 1273 | 1292 | 1366)
+}
+
 impl MySqlConnector {
     /// One chunk: `SELECT … WHERE <after the cursor> ORDER BY key LIMIT n LOCK IN SHARE MODE` in
     /// a READ COMMITTED transaction that commits at once (DA-SNAP-10).
@@ -421,7 +430,7 @@ impl MySqlConnector {
                             Ok(Ok(rows))
                         }
                         Err(mysql_async::Error::Server(e))
-                            if matches!(e.code, NO_TABLE | NO_COLUMN) =>
+                            if matches!(e.code, NO_TABLE | NO_COLUMN) || table_scoped(e.code) =>
                         {
                             tx.rollback().await?;
                             Ok(Err(e))
@@ -434,7 +443,15 @@ impl MySqlConnector {
         let rows = match read {
             Ok(rows) => rows,
             Err(e) if e.code == NO_TABLE => return Err(halt(table, HaltReason::TableDropped)),
-            Err(e) => return Err(changed(table, e.message)),
+            Err(e) if e.code == NO_COLUMN => return Err(changed(table, e.message)),
+            Err(e) => {
+                return Err(halt(
+                    table,
+                    HaltReason::NotReplicable {
+                        reason: format!("its snapshot read fails: {} ({})", e.message, e.code),
+                    },
+                ));
+            }
         };
         let rows = rows
             .into_iter()
@@ -469,6 +486,18 @@ mod tests {
 
     use super::*;
     use crate::value::Charset;
+
+    /// The errors of this table's read alone halt the table; a table or column gone keeps its own
+    /// path; the rest end the pipeline (DA-SRC-19).
+    #[test]
+    fn a_read_only_this_table_fails_halts_the_table() {
+        for code in [1142, 1143, 1267, 1271, 1253, 1273, 1292, 1366] {
+            assert!(table_scoped(code), "{code}");
+        }
+        for code in [NO_TABLE, NO_COLUMN, 1064, 1205, 2013] {
+            assert!(!table_scoped(code), "{code}");
+        }
+    }
 
     fn column(data_type: &str, decode: Decode) -> ReadColumn {
         ReadColumn {

@@ -8,6 +8,7 @@ use data_avalanche_core::{ColumnSchema, HaltReason, TableRef, TableSchema};
 use tokio_postgres::Client;
 
 use crate::types::{TypeCatalog, TypeInfo, missing, plan_column};
+use crate::value::Decode;
 
 pub use data_avalanche_config::glob_match;
 
@@ -180,8 +181,10 @@ fn identity_columns(d: &Described) -> Vec<&str> {
 /// A table's schema, checked in this order (config §11.2): every column plans
 /// ([`plan_column`]: overrides, numeric caps); the identifier (the `tables.primary_key` entry,
 /// else the primary key) passes [`TableSchema::new`] (reserved names, a non-empty identifier of
-/// usable columns); the identifier is inside the REPLICA IDENTITY; partition columns exist and
-/// temporal transforms name temporal columns.
+/// usable columns); no identifier column is a `bit`, `varbit` or PostGIS one, whose value doesn't
+/// read back as its type's text for a snapshot's cursor (DA-SRC-14; a `string` override reads it
+/// as text, which does); the identifier is inside the REPLICA IDENTITY; partition columns exist
+/// and temporal transforms name temporal columns.
 pub fn table_schema(
     d: &Described,
     tables: &Tables,
@@ -195,6 +198,7 @@ pub fn table_schema(
     let key = table_key(&d.table);
     let mut notes = Notes::default();
     let mut columns = Vec::with_capacity(d.columns.len());
+    let mut uncursored = vec![];
     for a in &d.columns {
         let over = tables
             .column_type_overrides
@@ -213,6 +217,9 @@ pub fn table_schema(
         if p.unconstrained_numeric {
             notes.unconstrained.push(a.name.clone());
         }
+        if matches!(p.decode, Decode::Bit | Decode::VarBit | Decode::HexBytes) {
+            uncursored.push((a.name.as_str(), a.type_text.as_str()));
+        }
         columns.push(ColumnSchema {
             name: a.name.clone(),
             value_type: p.value_type,
@@ -227,6 +234,19 @@ pub fn table_schema(
         .get(&key)
         .cloned()
         .unwrap_or_else(|| d.primary_key.clone());
+    if let Some((column, kind)) = uncursored
+        .iter()
+        .find(|(c, _)| identifier.iter().any(|k| k == c))
+    {
+        return Err(HaltReason::IdentifierNotUsable {
+            column: (*column).to_owned(),
+            reason: format!(
+                "a {kind} key can't resume a snapshot: its value doesn't read back as {kind}; key \
+                 the table by other columns (tables.primary_key), or read the column as text \
+                 (column_type_overrides: string)"
+            ),
+        });
+    }
     let schema =
         TableSchema::new(d.table.clone(), columns, identifier)?.with_source_id(d.oid.into());
     let identity = identity_columns(d);
@@ -588,6 +608,30 @@ mod tests {
         );
         assert_eq!(notes.unconstrained, ["amount"]);
         assert!(notes.c_ordered_keys.is_empty());
+    }
+
+    #[test]
+    fn a_bit_key_is_refused_unless_read_as_text() {
+        let mut d = orders(b'd');
+        d.columns[0] = attr(1, "id", 1560, 8, true, "bit(8)");
+        let e = schema_of(&d, "").unwrap_err();
+        assert!(
+            matches!(&e, HaltReason::IdentifierNotUsable { column, reason }
+                if column == "id" && reason.starts_with("a bit(8) key can't resume a snapshot")),
+            "{e:?}"
+        );
+        d.columns[0] = attr(1, "id", 1562, -1, true, "bit varying");
+        assert_eq!(
+            schema_of(&d, "").unwrap_err().code(),
+            "IDENTIFIER_NOT_USABLE"
+        );
+        let over = "      column_type_overrides: { public.orders.id: string }";
+        assert!(schema_of(&d, over).is_ok(), "read as text, it reads back");
+        let mut other = orders(b'f');
+        other
+            .columns
+            .push(attr(6, "flags", 1560, 8, false, "bit(8)"));
+        assert!(schema_of(&other, "").is_ok(), "not a key");
     }
 
     #[test]
