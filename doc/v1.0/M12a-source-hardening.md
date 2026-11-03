@@ -4004,7 +4004,7 @@ index eaaf954..1eaf06a 100644
 -pub use schema::{diff, narrowed, scope, scope_of};
 +pub use schema::{diff, keep_names, narrowed, scope, scope_of};
  pub use server::{Flavour, Fold, Settings, grants_replication, version_of};
- pub use start::{at_boundary, dialect_change, purge_action, same_server};
+ pub use start::{at_boundary, dialect_change, never_held, purge_action, same_server};
  pub use stream::MySqlStream;
 ```
 
@@ -7571,3 +7571,20 @@ git commit -m "docs: the M12a recoveries — a PostgreSQL failover, a DBA's slot
   `PgConnector::reset_position` now returns a `Checkpoint` naming the server it read after
   recreating the slot, as MySQL's does; the lost-slot IT asserts it equals `prepare`'s.
   Later blocks in `slot.rs`, `tests/pg/slot.rs` and `connector.rs` don't overlap it.
+- **Task 3** (review fix, `5d2c639`, `d5bb2b6`; approved by Oleksii 2026-11-03): two holes in
+  D-M12a.4. (1) A file-mode checkpoint whose file wasn't in `SHOW BINARY LOGS` was always the
+  purge's, so a rebuilt MariaDB (same `server_id`, same base name, numbering restarted) recovered
+  as `PositionLost` without the marker reset, and the sink skipped its changes. Now a missing file
+  with another base name, or after the server's newest binlog, is another server's
+  (`never_held`, both flavours), and only one before the oldest is a purge. (2) The dump's open
+  halted `BINLOG_SOURCE_CHANGED` whatever `binlog_purge_action` said, and a reconnect doesn't run
+  `prepare`, so a failover found at a reconnect halted under `re_snapshot`. Now under
+  `re_snapshot` the dump's open returns the new `SourceError::SourceChanged`, which
+  `WorkerError::recovery` maps to `Retry`: the worker reruns with Phase 0, whose `prepare` plans
+  the recovery. The re-snapshot warning no longer carries the halt's advice, and the list and
+  boundary probe is one helper (`foreign_position`). New tests:
+  `a_file_the_server_could_not_have_purged_is_another_server_s` and the dump's-open
+  `re_snapshot` cases; source-mysql has 145 tests per target (the plan said 142). Task 6's
+  `lib.rs` block now has `never_held` in its context line. Task 12's pages describe file mode
+  with these two rules. The spec patch for Data-Flow Phase 2b and Source Disconnect, and for the
+  Configuration `replication_type` row, is applied separately on approval.
