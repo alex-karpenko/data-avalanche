@@ -188,6 +188,15 @@ fn pipeline(name: &str, p: &RawPipeline, cloud: Option<Cloud>, ctx: &mut Ctx) {
             "ssl_mode allow is not valid for MySQL",
         );
     }
+    // V-124: the pinned client can't skip the host name check alone (DA-SRC-22).
+    if kind == Some(SourceType::Mysql) && ctx.peek(&src.ssl_mode) == Some(SslMode::VerifyCa) {
+        ctx.warning(
+            "V-124",
+            &s_at.key("ssl_mode"),
+            src.ssl_mode.as_ref().and_then(|l| l.loc()),
+            "ssl_mode verify-ca on MySQL also checks the server's host name, as verify-full does: the connection fails unless the certificate names the host",
+        );
+    }
     // V-103
     if let Some(pg) = &src.postgres
         && ctx.peek(&pg.slot_management) == Some(SlotManagement::RequireExisting)

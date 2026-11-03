@@ -8,7 +8,8 @@ sidebar:
 A pipeline reads one database: a PostgreSQL database, or one MySQL or MariaDB database (schema).
 `source.type` picks the engine; the common keys (`host`, `port`, `db`, `user`, `password` or
 `credentials_file`, `ssl_mode`, `timeouts`) are the same for both. `ssl_mode` defaults to
-`require`.
+`require`. On MySQL and MariaDB, `verify-ca` checks the server's host name as well, as
+`verify-full` does (a warning, V-124): use a certificate that names the host you connect to.
 
 The server settings and privileges below are checked when the pipeline starts. A missing one stops
 that pipeline (or that table) with a message naming it; the other pipelines run.

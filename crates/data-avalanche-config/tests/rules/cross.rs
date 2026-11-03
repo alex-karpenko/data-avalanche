@@ -50,6 +50,15 @@ pub fn cases() -> Vec<Case> {
         case("V-030", Silent, "ssl allow on postgres", || {
             pg_delta().set("/pipelines/p/source/ssl_mode", json!("allow"))
         }),
+        case("V-124", Warning, "verify-ca on mysql", || {
+            mysql_delta().set("/pipelines/p/source/ssl_mode", json!("verify-ca"))
+        }),
+        case("V-124", Silent, "verify-ca on postgres", || {
+            pg_delta().set("/pipelines/p/source/ssl_mode", json!("verify-ca"))
+        }),
+        case("V-124", Silent, "verify-full on mysql", || {
+            mysql_delta().set("/pipelines/p/source/ssl_mode", json!("verify-full"))
+        }),
         case("V-073", Error, "renewal 6s of 15s", || {
             pg_delta().set("/globals/cluster/lease_renewal_interval", json!("6s"))
         }),

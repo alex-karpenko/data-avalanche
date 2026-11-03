@@ -169,7 +169,7 @@ Rules for the whole block: [V-001](/data-avalanche/reference/validation-rules/#v
 | `user` | string | — | pipeline restart |  | The replication user, or give `credentials_file`. |
 | `password` | string | — | pipeline restart |  | The user's password; write it as `${VAR}`. Read again at every reconnect. |
 | `credentials_file` | string | — | pipeline restart |  | A JSON file `{"user": …, "password": …}` in place of `user` and `password`; replace its contents and reload to rotate them. |
-| `ssl_mode` | `disable` \| `allow` \| `prefer` \| `require` \| `verify-ca` \| `verify-full` | `require` | pipeline restart | [V-020](/data-avalanche/reference/validation-rules/#v-020) [V-030](/data-avalanche/reference/validation-rules/#v-030) | TLS to the source: `disable`, `allow`, `prefer`, `require`, `verify-ca` or `verify-full`. `allow` isn't valid for MySQL. |
+| `ssl_mode` | `disable` \| `allow` \| `prefer` \| `require` \| `verify-ca` \| `verify-full` | `require` | pipeline restart | [V-020](/data-avalanche/reference/validation-rules/#v-020) [V-030](/data-avalanche/reference/validation-rules/#v-030) [V-124](/data-avalanche/reference/validation-rules/#v-124) | TLS to the source: `disable`, `allow`, `prefer`, `require`, `verify-ca` or `verify-full`. `allow` isn't valid for MySQL, and there `verify-ca` checks the host name too, as `verify-full` does (V-124). |
 | `ssl_cert` | string | — | pipeline restart |  | A client certificate for the source: a path, inline PEM, or `${VAR}`. |
 | `ssl_key` | string | — | pipeline restart |  | The client certificate's key: a path, inline PEM, or `${VAR}`. |
 | `ssl_ca` | string | — | pipeline restart |  | The CA that signed the source's certificate, for `verify-ca` and `verify-full`. |

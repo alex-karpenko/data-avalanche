@@ -1036,6 +1036,14 @@ pub const RULES: &[RuleMeta] = &[
         r#"source.postgres.source_change_action"#,
         r#"∈ {error, re_snapshot}."#,
     ),
+    rule(
+        "V-124",
+        Warning,
+        L::Pipeline,
+        Config,
+        r#"source.ssl_mode = verify-ca, when source.type = mysql"#,
+        r#"The host name is checked too, as with verify-full (DA-SRC-22)."#,
+    ),
 ];
 
 /// The registry entry for `id` (`"V-007"`).
@@ -1049,7 +1057,7 @@ mod tests {
 
     #[test]
     fn has_every_spec_rule_once_in_order() {
-        assert_eq!(RULES.len(), 117);
+        assert_eq!(RULES.len(), 118);
         assert!(
             RULES.windows(2).all(|w| w[0].id < w[1].id),
             "sorted, no duplicates"

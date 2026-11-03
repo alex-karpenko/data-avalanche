@@ -332,7 +332,7 @@ pub const FIELD_DOCS: &[FieldDoc] = &[
     f(
         "pipelines.*.source.ssl_mode",
         Value("require"),
-        "TLS to the source: `disable`, `allow`, `prefer`, `require`, `verify-ca` or `verify-full`. `allow` isn't valid for MySQL.",
+        "TLS to the source: `disable`, `allow`, `prefer`, `require`, `verify-ca` or `verify-full`. `allow` isn't valid for MySQL, and there `verify-ca` checks the host name too, as `verify-full` does (V-124).",
     ),
     f(
         "pipelines.*.source.ssl_cert",

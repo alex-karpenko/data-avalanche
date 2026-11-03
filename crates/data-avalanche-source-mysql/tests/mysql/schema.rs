@@ -161,3 +161,25 @@ async fn the_rescan_reports_dropped_and_changed_tables() {
     assert!(report.halted.is_empty());
     cleanup(&n).await;
 }
+
+/// A column renamed by its case alone is, to MySQL, the same column: it keeps its name, with a
+/// note and no evolution, from a statement and from the rescan alike (DA-SRC-25).
+#[tokio::test]
+async fn a_change_of_case_alone_keeps_the_column_s_name() {
+    require_it!();
+    let (n, mut a) = fresh("schema_case", "CREATE TABLE t (id INT PRIMARY KEY, a INT);").await;
+    let c = connector(&pipeline(&n, &["t"], "", ""));
+    let cached = c.resolve_tables().await.unwrap().tables.remove(0);
+    let sql = "ALTER TABLE t CHANGE a A INT";
+    a.query_drop(sql).await.unwrap();
+    let (delta, now) = c.augment(&cached, &ddl(sql)).await.unwrap();
+    assert!(
+        matches!(delta.changes.as_slice(), [SchemaChange::NoTargetEffect(note)] if note.contains("keeps its name")),
+        "{:?}",
+        delta.changes
+    );
+    assert_eq!(now.as_ref(), Some(&cached));
+    let report = c.rescan(std::slice::from_ref(&cached)).await.unwrap();
+    assert!(report.changed.is_empty(), "{report:?}");
+    cleanup(&n).await;
+}

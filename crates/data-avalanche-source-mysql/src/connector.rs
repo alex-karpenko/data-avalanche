@@ -358,6 +358,19 @@ impl MySqlConnector {
             })
             .await?;
         let replica_updates = replica_updates == Some(1);
+        // MySQL has no such variable; MariaDB has it off unless the node is in a Galera cluster.
+        let galera = !replica_updates
+            && self
+                .conn
+                .command("read wsrep_on", |c| {
+                    Box::pin(async move {
+                        let row: Option<(String, String)> = c
+                            .query_first("SHOW GLOBAL VARIABLES LIKE 'wsrep_on'")
+                            .await?;
+                        Ok(row.is_some_and(|(_, v)| v.eq_ignore_ascii_case("ON")))
+                    })
+                })
+                .await?;
         let replica = match replica_updates {
             true => Some(false),
             false => {
@@ -382,6 +395,7 @@ impl MySqlConnector {
             ignore_db,
             replica_updates,
             replica,
+            galera,
         };
         check_coverage(flavour, &c).map_err(SourceError::Permanent)
     }
