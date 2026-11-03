@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-30
+updated: 2026-11-03
 domain: Architecture
 tags: [architecture, data-flow, pipeline, cdc, iceberg, delta-lake, multi-sink, arrow, snapshot, replication]
 sources: []
@@ -319,16 +319,25 @@ Connect
 │     record the identity and SHOW BINARY LOG STATUS (MySQL 8.4) / SHOW BINLOG STATUS (MariaDB)
 │     as the start position; Phase 1 watermarks use the same statement
 ├─► stored position present:
-│   ├─► identity differs from the recorded one, or (MariaDB, whose @@server_id can repeat)
-│   │   BINLOG_GTID_POS(<file>, <pos>) is NULL there → the position is lost; never resumed (a
-│   │   failover under file/position mode would silently skip or repeat transactions), and
+│   ├─► another server's position → the position is lost; never resumed (a failover under
+│   │   file/position mode would silently skip or repeat transactions). It is another server's
+│   │   when:
+│   │   ├─► the identity differs from the recorded one;
+│   │   ├─► its file isn't in SHOW BINARY LOGS and couldn't have been purged there: another
+│   │   │     base name, or a file after the server's newest (a purge removes the oldest only);
+│   │   └─► (MariaDB, whose @@server_id can repeat) its file is in SHOW BINARY LOGS and
+│   │         BINLOG_GTID_POS(<file>, <pos>) is NULL there (not an event boundary)
 │   │   binlog_purge_action decides:
 │   │   ├─► error: halt the PIPELINE (BINLOG_SOURCE_CHANGED): "binlog position <file>:<pos>
 │   │   │     was recorded on server <old>, now connected to <new>; …"
 │   │   └─► re_snapshot: a recovery from the new server's position; every table's marker is
 │   │         reset (Phase 4, reposition), the tables snapshotted as snapshots.mode says
-│   ├─► file no longer in SHOW BINARY LOGS → binlog_purge_action (error | re_snapshot, G-26)
-│   └─► COM_BINLOG_DUMP at <file>:<pos>
+│   ├─► file no longer in SHOW BINARY LOGS, before the server's oldest → purged:
+│   │     binlog_purge_action (error | re_snapshot, G-26)
+│   └─► COM_BINLOG_DUMP at <file>:<pos>; the dump's connection checks the same (identity,
+│         file, boundary) first, so a reconnect to another server is caught: under error it
+│         halts as above; under re_snapshot the pipeline reruns Phase 0, which plans the
+│         recovery
 └─► Event loop as above (GTID events ignored); the position after each XID_EVENT is
     (current file, end_log_pos); ROTATE_EVENT switches the file
 ```
@@ -776,6 +785,8 @@ Replication stream error / TCP timeout
 └─► Resume from last confirmed_flush_lsn (PG) or the persisted MySQL/MariaDB position
     ─ any events since last confirmed position are replayed
     ─ idempotent sink commits (+ Phase 4 position guard) absorb previously flushed events
+    ─ file/position mode: a reconnect that reaches another server (Phase 2b) halts under
+      binlog_purge_action: error, and reruns Phase 0 under re_snapshot
 ```
 
 ### Sink Commit Failure
