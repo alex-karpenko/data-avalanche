@@ -41,6 +41,13 @@ pub enum SourceError {
     /// gives up (`Postgres_Slot…` D-15.5).
     #[error("the source's stream position is held by another reader: {0}")]
     Contended(String),
+    /// The stream's connection reached another server than the checkpoint's (a failover, a
+    /// moved address, a rebuilt server): a file/position checkpoint means nothing there. The
+    /// pipeline reruns Phase 0, whose `prepare` plans the recovery
+    /// ([`SnapshotReason::SourceChanged`]). Only a source configured to recover returns it;
+    /// otherwise it halts with a [`Self::Permanent`].
+    #[error("{0}")]
+    SourceChanged(String),
 }
 
 impl SourceError {

@@ -57,7 +57,7 @@ use crate::ddl::{Renamed, classify, renamed};
 use crate::error::mysql;
 use crate::position::{Mode, identity, identity_query};
 use crate::server::{Flavour, Fold};
-use crate::start::{BOUNDARY_QUERY, at_boundary, holds, purge_action, same_server};
+use crate::start::{changed_by, foreign_position, purge_action, server_changed};
 use crate::types::{CatalogColumn, members, plan_column};
 use crate::value::{Charset, Decode, Input, decode_after, halt_reason, text_of};
 
@@ -740,16 +740,16 @@ impl MySqlConnector {
                     .await
                     .map_err(err)?;
                 let server = identity(flavour, answer)?;
-                same_server(recorded, &server)?;
-                if flavour == Flavour::Mariadb {
-                    let answer: Option<Option<String>> = conn
-                        .exec_first(BOUNDARY_QUERY, (p.file(), p.pos()))
+                // A server change at a reconnect follows `binlog_purge_action` too: under
+                // `re_snapshot` the pipeline starts again and `prepare` plans the recovery.
+                let foreign = match server_changed(recorded, &server) {
+                    Some(why) => Some(why),
+                    None => foreign_position(&mut conn, flavour, p, &server)
                         .await
-                        .map_err(err)?;
-                    // A file purged since answers NULL too: the dump's refusal is the purge's.
-                    let held = matches!(answer, Some(Some(_)))
-                        || holds(&mut conn, p.file()).await.map_err(err)?;
-                    at_boundary(from, &server, answer, held)?;
+                        .map_err(err)?,
+                };
+                if let Some(why) = foreign {
+                    return Err(changed_by(action, why));
                 }
                 file = p.file().as_bytes().to_vec();
                 req = req.with_filename(&file[..]).with_pos(p.pos());

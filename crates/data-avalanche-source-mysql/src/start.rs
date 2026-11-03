@@ -18,6 +18,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use data_avalanche_config::BinlogPurgeAction;
+use data_avalanche_core::position::BinlogFilePos;
 use data_avalanche_core::{
     Checkpoint, Prepared, RetainedLog, ServerIdentity, SnapshotReason, SourceError, SourcePosition,
     StartPlan,
@@ -25,7 +26,8 @@ use data_avalanche_core::{
 use mysql_async::prelude::Queryable;
 
 use crate::connector::MySqlConnector;
-use crate::position::{Mode, purged};
+use crate::position::{BinaryLog, Mode, purged};
+use crate::server::Flavour;
 
 /// Where the binlog stream has read to, for the heartbeat's lag
 /// (`data_avalanche_binlog_lag_seconds`).
@@ -113,59 +115,143 @@ pub fn dialect_change(mode: Mode, checkpoint: &SourcePosition) -> Option<String>
 /// there ([`at_boundary`]).
 pub(crate) const BOUNDARY_QUERY: &str = "SELECT BINLOG_GTID_POS(?, ?)";
 
-/// File/position mode: the checkpoint must be from the connected server (Q-M7-2).
-pub fn same_server(checkpoint: &Checkpoint, now: &ServerIdentity) -> Result<(), SourceError> {
+/// File/position mode: why the checkpoint isn't from the connected server, or `None` when it is.
+pub(crate) fn server_changed(checkpoint: &Checkpoint, now: &ServerIdentity) -> Option<String> {
     let at = checkpoint.position.untagged();
     let recorded = match &checkpoint.server {
-        Some(s) if s == now => return Ok(()),
+        Some(s) if s == now => return None,
         Some(s) => s.to_string(),
         None => "an unrecorded server".to_owned(),
     };
-    Err(source_changed(format!(
+    Some(format!(
         "binlog position {at} was recorded on {recorded}, now connected to {now}"
-    )))
+    ))
+}
+
+/// File/position mode: the checkpoint must be from the connected server (Q-M7-2). The halt
+/// `binlog_purge_action: error` gives otherwise ([`halt`]).
+pub fn same_server(checkpoint: &Checkpoint, now: &ServerIdentity) -> Result<(), SourceError> {
+    server_changed(checkpoint, now).map_or(Ok(()), |why| Err(halt(why)))
+}
+
+/// A binlog file name split into its series (the base name) and index: `binlog.000003` is
+/// (`binlog`, 3), from the server's list.
+fn series(file: &str) -> Option<(&str, u64)> {
+    let (base, index) = file.rsplit_once('.')?;
+    Some((base, index.parse().ok()?))
+}
+
+/// Whether the connected server, whose binlogs are `logs` (oldest first), could never have held
+/// the checkpoint's file, so the checkpoint is another server's rather than a purge: no log has
+/// its base name, or its index is past the newest log's in its series. A file before the oldest
+/// of its series is a purge ([`crate::purged`]), a file the server holds is its own; an empty
+/// list is left to the purge's checks.
+pub fn never_held(at: &BinlogFilePos, logs: &[BinaryLog]) -> bool {
+    let (base, index) = (at.base(), at.file_index());
+    if logs.is_empty() || logs.iter().any(|l| l.name == at.file()) {
+        return false;
+    }
+    let newest = logs
+        .iter()
+        .filter_map(|l| series(&l.name))
+        .filter(|(b, _)| *b == base)
+        .map(|(_, i)| i)
+        .max();
+    newest.is_none_or(|newest| index > newest)
 }
 
 /// MariaDB file/position mode: whether `at` is an event's boundary in a binlog of the connected
 /// server, from its answer to `SELECT BINLOG_GTID_POS(<file>, <pos>)`: NULL for a file it doesn't
 /// hold, an offset inside an event or past the end (measured on MariaDB 11.8). A checkpoint is
 /// always one: a transaction's end, a file's start. A NULL for a file the server no longer holds
-/// (`held` false, [`holds`]) is a purge since, which the purge's own checks report.
+/// (`held` false) is a purge since, which the purge's own checks report. The halt
+/// `binlog_purge_action: error` gives otherwise ([`halt`]).
 pub fn at_boundary(
     at: &SourcePosition,
     now: &ServerIdentity,
     answer: Option<Option<String>>,
     held: bool,
 ) -> Result<(), SourceError> {
+    off_boundary(at, now, answer, held).map_or(Ok(()), |why| Err(halt(why)))
+}
+
+fn off_boundary(
+    at: &SourcePosition,
+    now: &ServerIdentity,
+    answer: Option<Option<String>>,
+    held: bool,
+) -> Option<String> {
     match answer {
-        Some(Some(_)) => Ok(()),
-        _ if !held => Ok(()),
-        _ => Err(source_changed(format!(
+        Some(Some(_)) => None,
+        _ if !held => None,
+        _ => Some(format!(
             "binlog position {} isn't an event's boundary on {now}, so it was recorded on another \
              server with the same @@server_id",
             at.untagged()
-        ))),
+        )),
     }
 }
 
-/// Whether the server still holds the binlog `file` (`SHOW BINARY LOGS`).
-pub(crate) async fn holds(
+/// Why the checkpoint's file position isn't the connected server's, from one `SHOW BINARY LOGS`
+/// on `c` (and on MariaDB, `BINLOG_GTID_POS`): the file was never on the server ([`never_held`]),
+/// or the position isn't an event's boundary in it ([`at_boundary`]). `None` for a position the
+/// server holds or purged since. One sequence for the start's `prepare` and the dump's open.
+pub(crate) async fn foreign_position(
     c: &mut mysql_async::Conn,
-    file: &str,
-) -> Result<bool, mysql_async::Error> {
+    flavour: Flavour,
+    at: &BinlogFilePos,
+    now: &ServerIdentity,
+) -> Result<Option<String>, mysql_async::Error> {
     let rows: Vec<mysql_async::Row> = c.query("SHOW BINARY LOGS").await?;
-    Ok(rows
-        .iter()
-        .any(|r| r.get::<String, _>(0).as_deref() == Some(file)))
+    let logs: Vec<BinaryLog> = rows
+        .into_iter()
+        .map(|r| BinaryLog {
+            name: r.get(0).unwrap_or_default(),
+            size: r.get(1).unwrap_or_default(),
+        })
+        .collect();
+    if never_held(at, &logs) {
+        let (oldest, newest) = (&logs[0].name, &logs[logs.len() - 1].name);
+        return Ok(Some(format!(
+            "binlog {} was never on {now}: its binlogs run {oldest} … {newest}",
+            at.file()
+        )));
+    }
+    let held = logs.iter().any(|l| l.name == at.file());
+    if flavour != Flavour::Mariadb || !held {
+        return Ok(None);
+    }
+    let answer: Option<Option<String>> =
+        c.exec_first(BOUNDARY_QUERY, (at.file(), at.pos())).await?;
+    Ok(off_boundary(
+        &SourcePosition::BinlogFile(at.clone()),
+        now,
+        answer,
+        held,
+    ))
 }
 
-/// A file/position checkpoint the connected server didn't write, as the pipeline's halt.
-fn source_changed(why: String) -> SourceError {
+/// A file/position checkpoint the connected server didn't write, as the pipeline's halt
+/// (`binlog_purge_action: error`).
+fn halt(why: String) -> SourceError {
     SourceError::Permanent(format!(
         "BINLOG_SOURCE_CHANGED: {why}; file/position cannot be carried across servers — set \
          binlog_purge_action: re_snapshot to re-snapshot from this server, or switch to \
          replication_type: gtid"
     ))
+}
+
+/// A server change the stream's open found, as `binlog_purge_action` says: `error` halts
+/// ([`halt`]); `re_snapshot` is [`SourceError::SourceChanged`], which reruns Phase 0 so that its
+/// `prepare` plans the recovery from this server's position.
+pub(crate) fn changed_by(action: BinlogPurgeAction, why: String) -> SourceError {
+    match action {
+        BinlogPurgeAction::Error => halt(why),
+        BinlogPurgeAction::ReSnapshot => SourceError::SourceChanged(format!(
+            "BINLOG_SOURCE_CHANGED: {why}; binlog_purge_action is re_snapshot, so the pipeline \
+             starts again to recover from this server's position"
+        )),
+    }
 }
 
 /// A position the stream can't read on, as `binlog_purge_action` says (G-26): `re_snapshot` keeps
@@ -206,20 +292,12 @@ impl MySqlConnector {
             Some(why) => Some(why),
             None => {
                 if mode == Mode::File
-                    && let Err(changed) = same_server(cp, &server)
+                    && let Some(why) = self.foreign(cp, &server).await?
                 {
-                    return self.changed(changed, server).await;
+                    return self.changed(why, server).await;
                 }
                 let retention = self.retention(&cp.position).await?;
-                let lost = purged(&cp.position, &retention);
-                if lost.is_none()
-                    && mode == Mode::File
-                    && matches!(server, ServerIdentity::Mariadb { .. })
-                    && let Err(changed) = self.at_boundary(&cp.position, &server).await
-                {
-                    return self.changed(changed, server).await;
-                }
-                lost
+                purged(&cp.position, &retention)
             }
         };
         if let Some(why) = lost {
@@ -255,15 +333,11 @@ impl MySqlConnector {
         })
     }
 
-    /// A file/position checkpoint from another server, as `binlog_purge_action` says: `error`
-    /// halts with `changed`; `re_snapshot` snapshots from the server's position now.
-    async fn changed(
-        &self,
-        changed: SourceError,
-        server: ServerIdentity,
-    ) -> Result<Prepared, SourceError> {
+    /// A file/position checkpoint from another server (`why`), as `binlog_purge_action` says:
+    /// `error` halts; `re_snapshot` snapshots from the server's position now.
+    async fn changed(&self, why: String, server: ServerIdentity) -> Result<Prepared, SourceError> {
         if self.live().binlog_purge_action != BinlogPurgeAction::ReSnapshot {
-            return Err(changed);
+            return Err(halt(why));
         }
         Ok(Prepared {
             plan: StartPlan::Snapshot {
@@ -272,35 +346,34 @@ impl MySqlConnector {
             },
             added: vec![],
             warnings: vec![format!(
-                "{changed}; binlog_purge_action is re_snapshot, so the pipeline re-snapshots from \
-                 the server's position now"
+                "BINLOG_SOURCE_CHANGED: {why}; binlog_purge_action is re_snapshot, so the \
+                 pipeline re-snapshots from the server's position now"
             )],
             server: Some(server),
         })
     }
 
-    /// [`at_boundary`] on the connected server.
-    async fn at_boundary(
+    /// File/position mode: why the checkpoint isn't the connected server's, beyond its
+    /// identity ([`foreign_position`]).
+    async fn foreign(
         &self,
-        at: &SourcePosition,
+        cp: &Checkpoint,
         server: &ServerIdentity,
-    ) -> Result<(), SourceError> {
-        let SourcePosition::BinlogFile(p) = at else {
-            return Ok(());
+    ) -> Result<Option<String>, SourceError> {
+        if let Some(why) = server_changed(cp, server) {
+            return Ok(Some(why));
+        }
+        let SourcePosition::BinlogFile(p) = &cp.position else {
+            return Ok(None);
         };
-        let (file, pos) = (p.file().to_owned(), p.pos());
-        let (answer, held) = self
-            .conn
+        let flavour = self.flavour().await?;
+        let (p, server) = (p.clone(), server.clone());
+        self.conn
             .command("check the position on the server", move |c| {
-                Box::pin(async move {
-                    let answer: Option<Option<String>> =
-                        c.exec_first(BOUNDARY_QUERY, (file.as_str(), pos)).await?;
-                    let held = matches!(answer, Some(Some(_))) || holds(c, &file).await?;
-                    Ok((answer, held))
-                })
+                let (p, server) = (p.clone(), server.clone());
+                Box::pin(async move { foreign_position(c, flavour, &p, &server).await })
             })
-            .await?;
-        at_boundary(at, server, answer, held)
+            .await
     }
 
     /// The connection id of the open binlog dump, `None` without one: the server's
@@ -491,6 +564,37 @@ mod tests {
                 "{e}"
             );
         }
+    }
+
+    fn logs(names: &[&str]) -> Vec<BinaryLog> {
+        names
+            .iter()
+            .map(|n| BinaryLog {
+                name: (*n).to_owned(),
+                size: 100,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_file_the_server_could_not_have_purged_was_never_its() {
+        let held = logs(&["bin.000004", "bin.000005", "bin.000006"]);
+        let at = |f: &str| BinlogFilePos::new(f, 4).unwrap();
+        assert!(never_held(&at("bin.000007"), &held), "after the newest");
+        assert!(
+            never_held(&at("bin.000011"), &held),
+            "well after the newest"
+        );
+        assert!(never_held(&at("other.000001"), &held), "another base name");
+        assert!(
+            !never_held(&at("bin.000002"), &held),
+            "before the oldest: purged"
+        );
+        assert!(!never_held(&at("bin.000005"), &held), "held");
+        assert!(!never_held(&at("bin.000007"), &[]), "no list: the purge's");
+        // A gap inside the series is a purge's too.
+        let gap = logs(&["bin.000002", "bin.000006"]);
+        assert!(!never_held(&at("bin.000004"), &gap));
     }
 
     #[test]
