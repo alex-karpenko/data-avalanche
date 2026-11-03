@@ -444,6 +444,41 @@ async fn a_rollback_drops_the_rows_it_undid() {
     cleanup(&n).await;
 }
 
+/// Held rows past `sink.max_transaction_buffer_bytes` (its floor, 16 MiB, V-110) go out, so a
+/// rollback over them halts the stream as it did before the hold (DA-SRC-26). Only MariaDB holds.
+#[tokio::test]
+async fn a_rollback_past_the_hold_limit_halts() {
+    require_it!();
+    if target().flavour != Flavour::Mariadb {
+        return;
+    }
+    let (n, mut a) = fresh(
+        "stream_rollback_limit",
+        "CREATE TABLE t (id INT PRIMARY KEY, v LONGTEXT) ENGINE = InnoDB;
+         CREATE TABLE m (id INT PRIMARY KEY) ENGINE = MyISAM;",
+    )
+    .await;
+    let mut p = pipeline(&n, &["t", "m"], "", "");
+    p.sink.max_transaction_buffer_bytes = 16 << 20;
+    let c = connector(&p);
+    let tables = c.resolve_tables().await.unwrap().tables;
+    let mut s = open(&c, &tables).await;
+    a.query_drop(
+        "BEGIN; INSERT INTO m VALUES (1); INSERT INTO t VALUES (1, 'a'); SAVEPOINT s;
+         INSERT INTO t SELECT seq + 1, REPEAT('x', 1000000) FROM seq_1_to_24;
+         ROLLBACK TO s; COMMIT;",
+    )
+    .await
+    .unwrap();
+    let e = error(&mut s).await;
+    assert!(
+        matches!(&e, SourceError::Permanent(m) if m.starts_with("a savepoint rollback")
+            && m.contains("can't tell which rows stand")),
+        "{e}"
+    );
+    cleanup(&n).await;
+}
+
 #[tokio::test]
 async fn mysql_payloads_partial_json_and_tagged_gtids() {
     require_it!();

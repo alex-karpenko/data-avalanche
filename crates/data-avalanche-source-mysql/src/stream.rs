@@ -26,10 +26,12 @@
 //! - **Rollbacks (DA-SRC-26).** MariaDB logs the rows a `ROLLBACK TO` a savepoint undid, or a
 //!   whole `ROLLBACK`'s, in a transaction with non-transactional changes (measured on 10.11–11.8),
 //!   whose GTID event lacks `FL_TRANSACTIONAL`. Such a transaction's items are [`Held`] to its
-//!   end, and a rollback drops those it undid: the ones after the logged `SAVEPOINT`, or all. A
-//!   non-transactional table's rows are logged in a transaction of their own and stand; one among
-//!   the undone rows halts the pipeline, as do held rows past `sink.max_transaction_buffer_bytes`
-//!   (they go out unheld, and a rollback over them halts).
+//!   end, and a rollback drops the changes it undid: the ones after the logged `SAVEPOINT`, or
+//!   all. A halt of a table among them stays (the table is no longer tracked). A non-transactional
+//!   table's rows are logged in a transaction of their own and stand; a non-transactional table's
+//!   row among the undone ones halts the pipeline, as does a `ROLLBACK TO` a savepoint the stream
+//!   didn't see logged, and so do held rows past `sink.max_transaction_buffer_bytes`, counted
+//!   decoded as the accumulator counts them (they go out unheld, and a rollback over them halts).
 //!
 //! [`ChangeStream::next`] is cancel-safe: an event is processed without an await, and the one
 //! await inside a transaction (channel C after a statement) keeps its work until it completes.
@@ -120,11 +122,19 @@ struct Held {
     items: Vec<StreamItem>,
     /// Each logged savepoint, lower-case, with the number of items held when it was set.
     savepoints: Vec<(String, usize)>,
-    /// The binlog bytes of the rows events held.
+    /// The decoded bytes of the changes held, as the accumulator counts them.
     bytes: u64,
 }
 
 impl Held {
+    /// Holds `item`, counting a change's row images.
+    fn push(&mut self, item: StreamItem) {
+        if let StreamItem::Change(c) = &item {
+            self.bytes += change_bytes(c);
+        }
+        self.items.push(item);
+    }
+
     /// `SAVEPOINT name`: one of the same name moves here.
     fn savepoint(&mut self, name: String) {
         self.savepoints.retain(|(s, _)| *s != name);
@@ -138,13 +148,16 @@ impl Held {
         }
     }
 
-    /// `ROLLBACK TO name` (`Some`) or `ROLLBACK` (`None`): the items it undid, taken out. A
-    /// savepoint the binlog doesn't hold was set before the transaction's first logged event, so
-    /// the rollback undoes them all; the savepoints after the named one go.
-    fn roll_back(&mut self, name: Option<&str>) -> Vec<StreamItem> {
-        let found = name.and_then(|n| self.savepoints.iter().position(|(s, _)| s == n));
-        let mark = match found {
-            Some(i) => {
+    /// `ROLLBACK TO name` (`Some`) or `ROLLBACK` (`None`): the changes it undid, taken out, and
+    /// the savepoints after the named one gone. A `TableHalt` among the undone items stays, with
+    /// the `Begin` it needs, in order: the table is no longer tracked, so the halt must reach the
+    /// pipeline. `None` for a name the hold doesn't know: the server logs a rollback to a
+    /// savepoint set before the first logged event as a whole `ROLLBACK`, so it is a mismatch
+    /// the stream can't resolve, and nothing is taken out.
+    fn roll_back(&mut self, name: Option<&str>) -> Option<Vec<StreamItem>> {
+        let mark = match name {
+            Some(n) => {
+                let i = self.savepoints.iter().position(|(s, _)| s == n)?;
                 self.savepoints.truncate(i + 1);
                 self.savepoints[i].1
             }
@@ -153,8 +166,33 @@ impl Held {
                 0
             }
         };
-        self.items.split_off(mark)
+        let undone = self.items.split_off(mark);
+        let mut begin = None;
+        let mut halts = vec![];
+        let mut out = vec![];
+        for item in undone {
+            match item {
+                StreamItem::Begin { .. } => begin = Some(item),
+                StreamItem::TableHalt { .. } => halts.push(item),
+                StreamItem::Change(ref c) => {
+                    self.bytes = self.bytes.saturating_sub(change_bytes(c));
+                    out.push(item);
+                }
+                other => out.push(other),
+            }
+        }
+        if !halts.is_empty() {
+            self.items.extend(begin);
+            self.items.extend(halts);
+        }
+        Some(out)
     }
+}
+
+/// The decoded bytes of a change's row images, as the accumulator counts a row.
+fn change_bytes(c: &CdcEvent) -> u64 {
+    let image = |r: &Option<Row>| r.as_ref().map_or(0, Row::bytes);
+    (image(&c.before) + image(&c.after)) as u64
 }
 
 /// The savepoint a `SAVEPOINT`, `ROLLBACK TO` or `RELEASE SAVEPOINT` names, lower-case (names
@@ -162,7 +200,13 @@ impl Held {
 fn savepoint_name(sql: &str) -> String {
     let sql = sql.trim();
     match sql.find('`') {
-        Some(i) => sql[i + 1..].trim_end_matches('`').replace("``", "`"),
+        Some(i) => {
+            let quoted = &sql[i + 1..];
+            quoted
+                .strip_suffix('`')
+                .unwrap_or(quoted)
+                .replace("``", "`")
+        }
         None => sql.split_whitespace().last().unwrap_or_default().to_owned(),
     }
     .to_lowercase()
@@ -804,7 +848,10 @@ impl MySqlConnector {
             tracked.insert(s.table().clone(), t);
         }
         let keys: Vec<TableRef> = tracked.keys().cloned().collect();
-        let transactional = catalog.transactional(&keys, fold).await?;
+        let transactional = match flavour {
+            Flavour::Mariadb => catalog.transactional(&keys, fold).await?,
+            Flavour::Mysql => HashSet::new(),
+        };
         let at = from.to_tagged();
         let live = self.live();
         let action = live.binlog_purge_action;
@@ -899,7 +946,10 @@ impl MySqlStream {
     /// any.
     fn emit(&mut self, item: StreamItem) {
         if let Some(h) = &mut self.held {
-            h.items.push(item);
+            h.push(item);
+            if h.bytes > self.hold_limit {
+                self.unhold();
+            }
             return;
         }
         match &mut self.signals {
@@ -1050,7 +1100,14 @@ impl MySqlStream {
         let Some(h) = &mut self.held else {
             return self.rolled_back(what, end);
         };
-        let undone = h.roll_back(name);
+        let Some(undone) = h.roll_back(name) else {
+            return Err(permanent(format!(
+                "ROLLBACK TO `{}` at {}:{end} names a savepoint the stream didn't see logged: the \
+                 source can't tell which rows stand",
+                name.unwrap_or_default(),
+                self.offsets.file()
+            )));
+        };
         let begun = h
             .items
             .iter()
@@ -1411,12 +1468,6 @@ impl MySqlStream {
     }
 
     fn rows(&mut self, ev: &Event, end: u64) -> Result<(), SourceError> {
-        if let Some(h) = &mut self.held {
-            h.bytes += u64::from(ev.header().event_size());
-            if h.bytes > self.hold_limit {
-                self.unhold();
-            }
-        }
         let Some(EventData::RowsEvent(re)) = ev.read_data().map_err(permanent)? else {
             return Err(permanent("an unreadable rows event"));
         };
@@ -1568,67 +1619,142 @@ impl ChangeStream for MySqlStream {
 
 #[cfg(test)]
 mod tests {
+    use data_avalanche_core::ColumnValue;
+
     use super::*;
 
-    fn held(ids: &[u64]) -> Vec<StreamItem> {
-        ids.iter()
-            .map(|&xid| StreamItem::Begin {
-                xid,
-                commit_ts_micros: 0,
-            })
-            .collect()
+    fn change(id: u64) -> StreamItem {
+        StreamItem::Change(CdcEvent {
+            op: Op::Insert,
+            table: TableRef::new("db", "t"),
+            before: None,
+            after: Some(Row(vec![("id".into(), ColumnValue::Int64(id as i64))])),
+            source_pos: SourcePosition::BinlogFile(BinlogFilePos::new("binlog.000001", 4).unwrap()),
+            change_seq: SourceSeq::binlog("binlog.000001", 4).unwrap(),
+            xid: id,
+            commit_ts_micros: 0,
+        })
     }
 
-    fn xids(items: &[StreamItem]) -> Vec<u64> {
+    fn begin() -> StreamItem {
+        StreamItem::Begin {
+            xid: 0,
+            commit_ts_micros: 0,
+        }
+    }
+
+    fn table_halt() -> StreamItem {
+        StreamItem::TableHalt {
+            table: TableRef::new("db", "t"),
+            seq: SourceSeq::binlog("binlog.000001", 4).unwrap(),
+            reason: HaltReason::TableDropped,
+        }
+    }
+
+    fn held(items: Vec<StreamItem>) -> Held {
+        let mut h = Held::default();
+        for i in items {
+            h.push(i);
+        }
+        h
+    }
+
+    /// A change's id, 0 for a `Begin`, 1000 for a `TableHalt`.
+    fn tags(items: &[StreamItem]) -> Vec<u64> {
         items
             .iter()
             .map(|i| match i {
-                StreamItem::Begin { xid, .. } => *xid,
+                StreamItem::Change(c) => c.xid,
+                StreamItem::Begin { .. } => 0,
+                StreamItem::TableHalt { .. } => 1000,
                 other => panic!("{other:?}"),
             })
             .collect()
     }
 
     /// A rollback to a savepoint takes out what came after it, and the savepoints after it; a
-    /// whole rollback, or one to a savepoint the binlog doesn't hold, takes out everything.
+    /// whole rollback takes out everything; one to a savepoint the hold doesn't know is refused.
     #[test]
     fn a_rollback_takes_out_what_it_undid() {
-        let mut h = Held {
-            items: held(&[1]),
-            ..Held::default()
-        };
+        let mut h = held(vec![change(1)]);
         h.savepoint("a".into());
-        h.items.extend(held(&[2]));
+        h.push(change(2));
         h.savepoint("b".into());
-        h.items.extend(held(&[3]));
-        assert_eq!(xids(&h.roll_back(Some("b"))), [3]);
-        h.items.extend(held(&[4]));
-        assert_eq!(xids(&h.roll_back(Some("a"))), [2, 4]);
+        h.push(change(3));
+        assert_eq!(tags(&h.roll_back(Some("b")).unwrap()), [3]);
+        h.push(change(4));
+        assert_eq!(tags(&h.roll_back(Some("a")).unwrap()), [2, 4]);
         assert_eq!(
             h.savepoints,
             [("a".to_owned(), 1)],
             "b went with the rollback to a"
         );
-        assert_eq!(xids(&h.roll_back(Some("a"))), [] as [u64; 0], "a stays");
-        h.items.extend(held(&[5]));
-        h.release("a");
         assert_eq!(
-            xids(&h.roll_back(Some("a"))),
-            [1, 5],
-            "released: as if never logged"
+            tags(&h.roll_back(Some("a")).unwrap()),
+            [] as [u64; 0],
+            "a stays"
         );
-        h.items = held(&[6]);
+        h.push(change(5));
+        h.release("a");
+        assert!(
+            h.roll_back(Some("a")).is_none(),
+            "a released savepoint is unknown: refused"
+        );
+        assert_eq!(tags(&h.items), [1, 5], "a refusal takes nothing out");
+        assert!(h.roll_back(Some("zz")).is_none(), "so is one never logged");
+        let mut h = held(vec![change(6)]);
         h.savepoint("c".into());
-        h.items.extend(held(&[7]));
+        h.push(change(7));
         h.savepoint("c".into());
-        h.items.extend(held(&[8]));
+        h.push(change(8));
         assert_eq!(
-            xids(&h.roll_back(Some("c"))),
+            tags(&h.roll_back(Some("c")).unwrap()),
             [8],
             "the later c replaced the first"
         );
-        assert_eq!(xids(&h.roll_back(None)), [6, 7]);
+        assert_eq!(tags(&h.roll_back(None).unwrap()), [6, 7]);
         assert!(h.savepoints.is_empty());
+    }
+
+    /// A table's halt among the undone items isn't undone: the table is no longer tracked, so
+    /// the halt stays held (with its `Begin`), in order.
+    #[test]
+    fn a_rollback_keeps_a_table_halt() {
+        let mut h = held(vec![begin(), change(1)]);
+        h.savepoint("s".into());
+        h.push(change(2));
+        h.push(table_halt());
+        h.push(change(3));
+        assert_eq!(tags(&h.roll_back(Some("s")).unwrap()), [2, 3]);
+        assert_eq!(tags(&h.items), [0, 1, 1000]);
+
+        let mut h = held(vec![begin(), change(1), table_halt(), change(2)]);
+        assert_eq!(tags(&h.roll_back(None).unwrap()), [1, 2]);
+        assert_eq!(tags(&h.items), [0, 1000], "the Begin stays with the halt");
+
+        let mut h = held(vec![begin(), change(1)]);
+        assert_eq!(tags(&h.roll_back(None).unwrap()), [1]);
+        assert_eq!(tags(&h.items), [] as [u64; 0], "no halt: nothing stays");
+    }
+
+    /// The hold counts the decoded bytes of the changes it holds, and a rollback gives them back.
+    #[test]
+    fn the_hold_counts_decoded_bytes_and_a_rollback_gives_them_back() {
+        let one = change_bytes(match &change(1) {
+            StreamItem::Change(c) => c,
+            _ => unreachable!(),
+        });
+        assert!(one > 0);
+        let mut h = held(vec![begin(), change(1)]);
+        assert_eq!(h.bytes, one, "a Begin counts nothing");
+        h.savepoint("s".into());
+        h.push(change(2));
+        h.push(change(3));
+        assert_eq!(h.bytes, 3 * one);
+        h.roll_back(Some("s")).unwrap();
+        assert_eq!(h.bytes, one);
+        h.roll_back(None).unwrap();
+        assert_eq!(h.bytes, 0);
     }
 
     #[test]
@@ -1637,6 +1763,11 @@ mod tests {
         assert_eq!(savepoint_name("ROLLBACK TO `a``b`"), "a`b");
         assert_eq!(savepoint_name("ROLLBACK TO SAVEPOINT s2"), "s2");
         assert_eq!(savepoint_name("RELEASE SAVEPOINT `x y`"), "x y");
+        assert_eq!(
+            savepoint_name("ROLLBACK TO `ab```"),
+            "ab`",
+            "a name that ends in a backtick"
+        );
     }
 
     #[test]

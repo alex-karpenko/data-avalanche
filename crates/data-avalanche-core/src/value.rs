@@ -131,7 +131,29 @@ pub fn time_text(micros: i64) -> String {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Row(pub Vec<(String, ColumnValue)>);
 
+/// Rough in-memory size of one value: the enum plus its heap payload.
+fn value_bytes(v: &ColumnValue) -> usize {
+    let payload = match v {
+        ColumnValue::Text(s) => s.len(),
+        ColumnValue::Bytes(b) => b.len(),
+        ColumnValue::Json(j) => j.to_string().len(),
+        ColumnValue::Array { values, .. } => values.iter().map(value_bytes).sum(),
+        _ => 0,
+    };
+    size_of::<ColumnValue>() + payload
+}
+
+/// Rough in-memory size of a row, for the flush `bytes` trigger and the transaction buffer ceiling.
+pub fn row_bytes(values: &[ColumnValue]) -> usize {
+    values.iter().map(value_bytes).sum()
+}
+
 impl Row {
+    /// The size of the row's values, as [`row_bytes`] counts them (the column names aren't).
+    pub fn bytes(&self) -> usize {
+        self.0.iter().map(|(_, v)| value_bytes(v)).sum()
+    }
+
     pub fn get(&self, column: &str) -> Option<&ColumnValue> {
         self.0
             .iter()

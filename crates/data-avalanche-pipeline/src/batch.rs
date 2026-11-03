@@ -12,10 +12,10 @@ use arrow_array::{
 use arrow_buffer::{NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use data_avalanche_core::{
-    ColumnValue, TableSchema, delete_schema, unchanged_mask_field, upsert_schema,
+    ColumnValue, TableSchema, delete_schema, row_bytes, unchanged_mask_field, upsert_schema,
 };
 
-use crate::buffer::{CollapsedRow, RowKind, row_bytes};
+use crate::buffer::{CollapsedRow, RowKind};
 
 /// A batch rolls over before its rows reach this many bytes. One value is at most 1 GiB (the
 /// PostgreSQL and MySQL limits), so a column of one batch stays under the 2 GiB of Arrow's `i32`
