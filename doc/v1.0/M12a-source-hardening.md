@@ -7597,3 +7597,18 @@ git commit -m "docs: the M12a recoveries — a PostgreSQL failover, a DBA's slot
   under `adopt_resnapshot` is refused, a slot behind the checkpoint resumes, `managed` ignores
   `slot_on_orphan`, and a foreign plugin is refused. The IT writes once more after reading the
   slot, and asserts that the adoption advanced it. Tasks 6 and 9's blocks still apply.
+- **Task 5** (review fixes `38e7a51`, `c3776e0`): three holes in D-M12a.6's hold.
+  (1) A `TableHalt` among the undone items went with them. The source had already untracked
+  the table, so its halt never reached the pipeline. A rollback now takes out only the
+  `Change`s, and the `Begin` and every `TableHalt` stay held, in order.
+  (2) A `ROLLBACK TO` a savepoint the hold doesn't know took out everything, including rows
+  that stand. Planning measured that a savepoint before the first logged row is logged as a
+  whole `ROLLBACK`. So an unknown name now halts (permanent, naming it), but only when the hold
+  holds a change.
+  (3) The hold counted binlog event bytes against `sink.max_transaction_buffer_bytes`, while it
+  holds decoded items several times larger. `row_bytes` moved to core. The hold now counts it
+  per held change, adding on hold and taking back on a rollback, as the accumulator counts the
+  same key.
+  Also: a savepoint name ending in an escaped backtick parses right, the engines query runs on
+  MariaDB only, and a new IT, `a_rollback_past_the_hold_limit_halts`, covers the limit.
+  source-mysql has 152 tests per target (the plan said 145).
