@@ -412,7 +412,7 @@ pub const FIELD_DOCS: &[FieldDoc] = &[
     f(
         "pipelines.*.source.mysql.replication_type",
         Value("gtid"),
-        "`gtid` follows GTIDs and survives a failover (MySQL `gtid_mode=ON`, MariaDB `gtid_strict_mode=1`); `binlog` follows file and position, which mean something on one server only: on another, the position is lost, as `binlog_purge_action` says. On both, a position in a file the server couldn't have purged (another base name, or after its newest binlog) is another server's; one before its oldest is a purge. The check runs at each start and each time the stream reconnects.",
+        "`gtid` follows GTIDs and survives a failover (MySQL `gtid_mode=ON`, MariaDB `gtid_strict_mode=1`); `binlog` follows file and position, which mean something on one server only: on another, the position is lost, as `binlog_purge_action` says. With `binlog`, on MySQL and MariaDB alike, a position in a file the server couldn't have purged (another base name, or after its newest binlog) is another server's; one before its oldest is a purge. The check runs at each start and each time the stream reconnects.",
     ),
     f(
         "pipelines.*.source.mysql.tinyint1_as_bool",
