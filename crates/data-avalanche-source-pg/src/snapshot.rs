@@ -395,15 +395,11 @@ fn changed(schema: &TableSchema, detail: String) -> SourceError {
     ))
 }
 
-/// A table read's error, by SQLSTATE (§2.1, DA-SRC-19). The table, or its schema, gone from the
-/// catalog (42P01, 3F000) halts that table, not the pipeline. A column gone (42703) is
-/// `read_plan`'s own finding come late: dropped after the plan's catalog read and before the
-/// query took its lock, it is transient the same way. An error of this table's read alone halts
-/// the table too (`TABLE_NOT_REPLICABLE`), since a restart reads it the same way: its key no
-/// longer compares with the cursor (42883 no such operator, 42804 a datatype mismatch, 42P22 an
-/// indeterminate collation, 42704 the cursor's collation gone), a value or a cursor literal its
-/// type refuses (class 22), or the role lost `SELECT` on it (42501). Any other permanent error
-/// ends the pipeline.
+/// A table read's error, by SQLSTATE (§2.1). The table, or its schema, gone from the catalog
+/// (42P01, 3F000) halts that table, not the pipeline. A column gone (42703) is `read_plan`'s own
+/// finding come late: dropped after the plan's catalog read and before the query took its lock,
+/// it is transient the same way. Any other permanent error ends the session; the chunk read alone
+/// narrows it further ([`chunk_error`]).
 fn dropped(schema: &TableSchema, e: SourceError) -> SourceError {
     let SourceError::Permanent(m) = &e else {
         return e;
@@ -411,17 +407,32 @@ fn dropped(schema: &TableSchema, e: SourceError) -> SourceError {
     match sqlstate(m) {
         Some("42P01" | "3F000") => halt_dropped(schema),
         Some("42703") => changed(schema, m.clone()),
-        Some(code) if table_scoped(code) => SourceError::TableHalt {
-            table: schema.table().clone(),
-            reason: HaltReason::NotReplicable {
-                reason: format!("its snapshot read fails: {m}"),
-            },
-        },
         _ => e,
     }
 }
 
-/// The SQLSTATEs [`dropped`] halts the table for.
+/// A snapshot chunk read's error after [`dropped`] (DA-SRC-19): an error of this table's read
+/// alone halts the table (`TABLE_NOT_REPLICABLE`), since a restart reads it the same way: its key
+/// no longer compares with the cursor (42883 no such operator, 42804 a datatype mismatch, 42P22 an
+/// indeterminate collation, 42704 the cursor's collation gone), a value or a cursor literal its
+/// type refuses (class 22), or the role lost `SELECT` on it (42501). Any other permanent error
+/// ends the pipeline. Only the chunk read: a `re_query` fetch's permanent error ends the session
+/// (Data-Flow, `toast_strategy`).
+fn chunk_error(schema: &TableSchema, e: SourceError) -> SourceError {
+    match &e {
+        SourceError::Permanent(m) if sqlstate(m).is_some_and(table_scoped) => {
+            SourceError::TableHalt {
+                table: schema.table().clone(),
+                reason: HaltReason::NotReplicable {
+                    reason: format!("its snapshot read fails: {m}"),
+                },
+            }
+        }
+        _ => e,
+    }
+}
+
+/// The SQLSTATEs [`chunk_error`] halts the table for.
 fn table_scoped(code: &str) -> bool {
     code.starts_with("22") || matches!(code, "42883" | "42804" | "42P22" | "42704" | "42501")
 }
@@ -505,7 +516,9 @@ impl PgConnector {
             "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;
              SELECT pg_catalog.pg_current_snapshot()::text; {sql}"
         );
-        let messages = simple_query(self, "read a snapshot chunk", table, &sql).await?;
+        let messages = simple_query(self, "read a snapshot chunk", table, &sql)
+            .await
+            .map_err(|e| chunk_error(table, e))?;
         // Each SELECT's rows follow its row description: the snapshot's, then the chunk's.
         let mut selects = messages
             .split_inclusive(|m| matches!(m, SimpleQueryMessage::CommandComplete(_)))
@@ -683,7 +696,7 @@ mod tests {
             "42883", "42804", "42P22", "42704", "42501", "22P02", "22003", "22021",
         ] {
             let e = SourceError::Permanent(format!("it failed (SQLSTATE {code})"));
-            match dropped(&schema(), e) {
+            match chunk_error(&schema(), dropped(&schema(), e)) {
                 SourceError::TableHalt {
                     table,
                     reason: HaltReason::NotReplicable { reason },
@@ -696,6 +709,19 @@ mod tests {
                 }
                 other => panic!("{code}: {other:?}"),
             }
+        }
+    }
+
+    /// A `re_query` fetch maps through `dropped` alone: a table-scoped SQLSTATE stays permanent and
+    /// ends the session (Data-Flow).
+    #[test]
+    fn a_requery_error_of_the_table_ends_the_session() {
+        for code in ["42501", "22P02", "42883"] {
+            let e = SourceError::Permanent(format!("it failed (SQLSTATE {code})"));
+            assert!(
+                matches!(dropped(&schema(), e), SourceError::Permanent(_)),
+                "{code}"
+            );
         }
     }
 
