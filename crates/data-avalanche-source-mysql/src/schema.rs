@@ -5,9 +5,8 @@
 //! classifier couldn't read the statement, the whole catalog table is the change, and a rename
 //! reads as a drop and an add (§6, degraded with a warning by the evolver).
 //!
-//! Column names compare without case, as MySQL's do; a result keeps the catalog's spelling,
-//! except a column whose name changed its case alone (`CHANGE a A`): to MySQL that is the same
-//! column, so it keeps the name it has in the sink, with a note and no evolution (DA-SRC-25).
+//! Column names compare without case, as MySQL's do; a result keeps the catalog's spelling, and
+//! a change of case alone (`CHANGE a A`) is a rename.
 //!
 //! The catalog may be ahead of the stream (§0): a scoped change takes only its columns from it.
 //! The stream checks every table map against the schema, so a change taken early (a later DDL's
@@ -191,8 +190,7 @@ fn members_change(column: &str, from: &CatalogColumn, to: &CatalogColumn) -> Opt
 }
 
 /// `cached` → `new` as changes, columns matched by name (without case) and by the proven
-/// `renames`. A column whose name changed only its case is noted, not renamed: its changes name
-/// it as `cached` does.
+/// `renames`. A column whose name changed only its case is renamed.
 pub fn diff(
     cached: &TableSchema,
     new: &TableSchema,
@@ -217,17 +215,8 @@ pub fn diff(
             changes.push(SchemaChange::DropColumn(c.name.clone()));
             continue;
         };
-        let to = match same(&n.name, &c.name) {
-            true => c.name.as_str(),
-            false => n.name.as_str(),
-        };
-        if n.name != c.name && to == c.name {
-            changes.push(SchemaChange::NoTargetEffect(format!(
-                "column {:?} is now {:?} in the source: MySQL names compare without case, so it \
-                 keeps its name",
-                c.name, n.name
-            )));
-        } else if to != c.name {
+        let to = n.name.as_str();
+        if to != c.name {
             changes.push(SchemaChange::RenameColumn {
                 from: c.name.clone(),
                 to: to.to_owned(),
@@ -277,25 +266,6 @@ pub fn diff(
         changes.push(SchemaChange::IdentifierChanged);
     }
     changes
-}
-
-/// `new` with each column whose name differs from `cached`'s by case alone named as `cached`
-/// names it, in the identifier too ([`diff`] notes the change).
-pub fn keep_names(cached: &TableSchema, new: &TableSchema) -> Result<TableSchema, HaltReason> {
-    let kept = |name: &str| match column(cached, name) {
-        Some(c) => c.name.clone(),
-        None => name.to_owned(),
-    };
-    let columns = new
-        .columns()
-        .iter()
-        .map(|c| ColumnSchema {
-            name: kept(&c.name),
-            ..c.clone()
-        })
-        .collect();
-    let identifier = new.identifier().iter().map(|k| kept(k)).collect();
-    TableSchema::new(new.table().clone(), columns, identifier)
 }
 
 impl MySqlConnector {
@@ -363,7 +333,6 @@ impl MySqlConnector {
         };
         let new = scope(cached, &columns, &renames, &now).map_err(halt)?;
         let changes = diff(cached, &new, &renames);
-        let new = keep_names(cached, &new).map_err(halt)?;
         Ok((SchemaDelta { table, changes }, Some(new)))
     }
 
@@ -379,11 +348,8 @@ impl MySqlConnector {
             match now.remove(&t.name) {
                 None => report.dropped.push(t.clone()),
                 Some(Err(reason)) => report.halted.push((t.clone(), reason)),
-                Some(Ok(s)) => match keep_names(k, &s) {
-                    Ok(s) if s != *k => report.changed.push(s),
-                    Ok(_) => {}
-                    Err(reason) => report.halted.push((t.clone(), reason)),
-                },
+                Some(Ok(s)) if s != *k => report.changed.push(s),
+                Some(Ok(_)) => {}
             }
         }
         Ok(report)
@@ -659,23 +625,22 @@ mod tests {
             diff(&cached, &s, &[]).as_slice(),
             [SchemaChange::ChangeType { column, .. }] if column == "price"
         ));
-        // `CHANGE a A BIGINT`: a change of case alone is the same column, which keeps its name
-        // (DA-SRC-25); its other changes name it so.
+        // `CHANGE a A INT`: a change of case alone stays a rename.
         let now = table(vec![
             col("price", V::Int32, "int", 2),
-            col("A", V::Int64, "bigint", 3),
+            col("A", V::Int32, "int", 3),
         ]);
         let renames = [("a".to_owned(), "A".to_owned())];
         let s = scope(&cached, &cols(&["a", "A"]), &renames, &now).unwrap();
         assert_eq!(names(&s), ["id", "price", "A"]);
-        assert!(matches!(
-            diff(&cached, &s, &renames).as_slice(),
-            [SchemaChange::NoTargetEffect(note), SchemaChange::ChangeType { column, .. }]
-                if note.starts_with("column \"a\" is now \"A\" in the source") && column == "a"
-        ));
-        let kept = keep_names(&cached, &s).unwrap();
-        assert_eq!(names(&kept), ["id", "price", "a"]);
-        assert_eq!(kept.columns()[2].value_type, V::Int64);
+        assert_eq!(
+            diff(&cached, &s, &renames),
+            [SchemaChange::RenameColumn {
+                from: "a".into(),
+                to: "A".into(),
+                proven: true
+            }]
+        );
         // A statement's spelling of a renamed column finds it too.
         let renames = [("PRICE".to_owned(), "cost".to_owned())];
         let now = table(vec![
