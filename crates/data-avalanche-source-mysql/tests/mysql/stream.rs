@@ -392,11 +392,13 @@ async fn untracked_writes_keep_alive_before_a_heartbeat() {
 }
 
 /// MariaDB logs the rows a rollback undid in a transaction with non-transactional changes, then
-/// `ROLLBACK TO` (a savepoint) or `ROLLBACK` (the whole transaction): with tracked rows among them
-/// the pipeline halts. MySQL without GTIDs logs none of them; with GTIDs it refuses the
-/// transaction (`enforce_gtid_consistency`). Measured on MySQL 8.4 and MariaDB 10.11–11.8.
+/// `ROLLBACK TO` (a savepoint) or `ROLLBACK` (the savepoint came before its first logged row):
+/// the stream drops them, and only the rows that stand arrive (DA-SRC-26). The MyISAM table's
+/// rows are logged in a transaction of their own, first, and stand. MySQL without GTIDs logs none
+/// of the undone rows; with GTIDs it refuses the transaction (`enforce_gtid_consistency`).
+/// Measured on MySQL 8.4 and MariaDB 10.11–11.8.
 #[tokio::test]
-async fn a_rollback_after_tracked_rows_halts_the_stream() {
+async fn a_rollback_drops_the_rows_it_undid() {
     require_it!();
     let (n, mut a) = fresh(
         "stream_rollback",
@@ -404,12 +406,15 @@ async fn a_rollback_after_tracked_rows_halts_the_stream() {
          CREATE TABLE m (id INT PRIMARY KEY) ENGINE = MyISAM;",
     )
     .await;
-    let c = connector(&pipeline(&n, &["t"], "", ""));
+    let c = connector(&pipeline(&n, &["t", "m"], "", ""));
     let tables = c.resolve_tables().await.unwrap().tables;
     let to_savepoint = "BEGIN; INSERT INTO t VALUES (1); SAVEPOINT s; INSERT INTO t VALUES (2);
          INSERT INTO m VALUES (2); ROLLBACK TO s; COMMIT;";
     let whole = "BEGIN; SAVEPOINT s; INSERT INTO t VALUES (3); INSERT INTO m VALUES (3);
          ROLLBACK TO s; COMMIT;";
+    let nested = "BEGIN; INSERT INTO t VALUES (4); SAVEPOINT a; INSERT INTO t VALUES (5);
+         SAVEPOINT b; INSERT INTO t VALUES (6); INSERT INTO m VALUES (6); ROLLBACK TO a;
+         INSERT INTO t VALUES (7); COMMIT;";
     if target().flavour == Flavour::Mysql && target().replication == "gtid" {
         match a.query_drop(whole).await {
             Err(mysql_async::Error::Server(e)) => assert_eq!(e.code, 1785, "{e}"),
@@ -419,37 +424,22 @@ async fn a_rollback_after_tracked_rows_halts_the_stream() {
         cleanup(&n).await;
         return;
     }
-    for (sql, logged) in [
-        (to_savepoint, "a savepoint rollback"),
-        (whole, "a ROLLBACK"),
+    // The ids that stand, and their transactions: the MyISAM row's own, then the rest.
+    for (sql, want, commits) in [
+        (to_savepoint, &[2, 1, 9, 9][..], 4),
+        (whole, &[3, 9, 9][..], 3),
+        (nested, &[6, 4, 7, 9, 9][..], 4),
     ] {
         let mut s = open(&c, &tables).await;
         a.query_drop(sql).await.unwrap();
         a.query_drop("INSERT INTO t VALUES (9); DELETE FROM t WHERE id = 9")
             .await
             .unwrap();
-        match target().flavour {
-            Flavour::Mariadb => {
-                let e = error(&mut s).await;
-                assert!(
-                    matches!(&e, SourceError::Permanent(m) if m.starts_with(logged) && m.contains("can't tell which rows stand")),
-                    "{e}"
-                );
-            }
-            Flavour::Mysql => {
-                // Only the rows that stand: the savepoint's own transaction keeps row 1.
-                let want: &[i32] = if sql == to_savepoint {
-                    &[1, 9, 9]
-                } else {
-                    &[9, 9]
-                };
-                let got = changes(&items(&mut s, want.len()).await);
-                let ids: Vec<_> = got.iter().map(|(_, id)| id.clone()).collect();
-                let want: Vec<_> = want.iter().map(|i| Some(ColumnValue::Int32(*i))).collect();
-                assert_eq!(ids, want);
-                shut(s).await;
-            }
-        }
+        let got = changes(&items(&mut s, commits).await);
+        let ids: Vec<_> = got.iter().map(|(_, id)| id.clone()).collect();
+        let want: Vec<_> = want.iter().map(|i| Some(ColumnValue::Int32(*i))).collect();
+        assert_eq!(ids, want, "{sql}");
+        shut(s).await;
     }
     cleanup(&n).await;
 }

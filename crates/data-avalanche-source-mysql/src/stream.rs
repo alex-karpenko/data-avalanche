@@ -21,14 +21,20 @@
 //!   without case.
 //! - **Fail closed.** A compressed transaction that yields less than its size halts the pipeline
 //!   (`BINLOG_PAYLOAD_INVALID`, D-V1.6); so does a two-phase XA prepare of tracked rows (they can
-//!   roll back after they are logged), a rollback logged after tracked rows (MariaDB keeps the
-//!   rows a savepoint or a whole rollback undid, measured on 10.11–11.8), an incident event (the
-//!   server lost events), and any event type the source doesn't read.
+//!   roll back after they are logged), a rollback over tracked rows the stream already gave out,
+//!   an incident event (the server lost events), and any event type the source doesn't read.
+//! - **Rollbacks (DA-SRC-26).** MariaDB logs the rows a `ROLLBACK TO` a savepoint undid, or a
+//!   whole `ROLLBACK`'s, in a transaction with non-transactional changes (measured on 10.11–11.8),
+//!   whose GTID event lacks `FL_TRANSACTIONAL`. Such a transaction's items are [`Held`] to its
+//!   end, and a rollback drops those it undid: the ones after the logged `SAVEPOINT`, or all. A
+//!   non-transactional table's rows are logged in a transaction of their own and stand; one among
+//!   the undone rows halts the pipeline, as do held rows past `sink.max_transaction_buffer_bytes`
+//!   (they go out unheld, and a rollback over them halts).
 //!
 //! [`ChangeStream::next`] is cancel-safe: an event is processed without an await, and the one
 //! await inside a transaction (channel C after a statement) keeps its work until it completes.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -107,6 +113,61 @@ struct Txn {
     begun: bool,
 }
 
+/// The open MariaDB transaction's items, held to its end because it may log rows a rollback
+/// undid (DA-SRC-26).
+#[derive(Debug, Default)]
+struct Held {
+    items: Vec<StreamItem>,
+    /// Each logged savepoint, lower-case, with the number of items held when it was set.
+    savepoints: Vec<(String, usize)>,
+    /// The binlog bytes of the rows events held.
+    bytes: u64,
+}
+
+impl Held {
+    /// `SAVEPOINT name`: one of the same name moves here.
+    fn savepoint(&mut self, name: String) {
+        self.savepoints.retain(|(s, _)| *s != name);
+        self.savepoints.push((name, self.items.len()));
+    }
+
+    /// `RELEASE SAVEPOINT name`: it and the savepoints after it go.
+    fn release(&mut self, name: &str) {
+        if let Some(i) = self.savepoints.iter().position(|(s, _)| s == name) {
+            self.savepoints.truncate(i);
+        }
+    }
+
+    /// `ROLLBACK TO name` (`Some`) or `ROLLBACK` (`None`): the items it undid, taken out. A
+    /// savepoint the binlog doesn't hold was set before the transaction's first logged event, so
+    /// the rollback undoes them all; the savepoints after the named one go.
+    fn roll_back(&mut self, name: Option<&str>) -> Vec<StreamItem> {
+        let found = name.and_then(|n| self.savepoints.iter().position(|(s, _)| s == n));
+        let mark = match found {
+            Some(i) => {
+                self.savepoints.truncate(i + 1);
+                self.savepoints[i].1
+            }
+            None => {
+                self.savepoints.clear();
+                0
+            }
+        };
+        self.items.split_off(mark)
+    }
+}
+
+/// The savepoint a `SAVEPOINT`, `ROLLBACK TO` or `RELEASE SAVEPOINT` names, lower-case (names
+/// compare without case). MariaDB logs it quoted.
+fn savepoint_name(sql: &str) -> String {
+    let sql = sql.trim();
+    match sql.find('`') {
+        Some(i) => sql[i + 1..].trim_end_matches('`').replace("``", "`"),
+        None => sql.split_whitespace().last().unwrap_or_default().to_owned(),
+    }
+    .to_lowercase()
+}
+
 /// A statement's schema signals still to read from the catalog, then what follows them.
 #[derive(Debug)]
 struct Signals {
@@ -139,6 +200,13 @@ pub struct MySqlStream {
     checked: HashMap<TableRef, TableMapEvent<'static>>,
     /// When the last keep-alive went out.
     kept_alive: Option<Instant>,
+    /// The tracked tables whose engine rolls back (InnoDB), read at open: a rollback drops their
+    /// held rows, and halts on another's.
+    transactional: HashSet<TableRef>,
+    /// The open transaction's items, while they are held.
+    held: Option<Held>,
+    /// The most rows-event bytes a transaction holds (`sink.max_transaction_buffer_bytes`).
+    hold_limit: u64,
 }
 
 /// The least time between two keep-alives after transactions without tracked rows.
@@ -676,6 +744,40 @@ impl MySqlConnector {
             .collect())
     }
 
+    /// Which of `tables` roll back a transaction's changes: their engine is InnoDB.
+    async fn transactional(
+        &self,
+        tables: &[TableRef],
+        fold: Fold,
+    ) -> Result<HashSet<TableRef>, SourceError> {
+        let db = self.pipeline.source.db.clone();
+        let rows: Vec<(String, Option<String>)> = self
+            .conn
+            .command("read the tables' engines", move |c| {
+                Box::pin(async move {
+                    c.exec(
+                        "SELECT TABLE_NAME, ENGINE FROM information_schema.TABLES
+                          WHERE TABLE_SCHEMA = ?",
+                        (db,),
+                    )
+                    .await
+                })
+            })
+            .await?;
+        Ok(tables
+            .iter()
+            .filter(|t| {
+                rows.iter().any(|(name, engine)| {
+                    fold.eq(name, &t.name)
+                        && engine
+                            .as_deref()
+                            .is_some_and(|e| e.eq_ignore_ascii_case("InnoDB"))
+                })
+            })
+            .cloned()
+            .collect())
+    }
+
     /// Opens the binlog dump after `from` for `tables` as of that position (Data-Flow Phase 2b):
     /// the heartbeat period, the replica id `source.mysql.server_id`, and the position in its
     /// dialect. The server's name comparison and collations are read once, for the stream's
@@ -701,6 +803,8 @@ impl MySqlConnector {
             })?;
             tracked.insert(s.table().clone(), t);
         }
+        let keys: Vec<TableRef> = tracked.keys().cloned().collect();
+        let transactional = catalog.transactional(&keys, fold).await?;
         let at = from.to_tagged();
         let live = self.live();
         let action = live.binlog_purge_action;
@@ -779,6 +883,9 @@ impl MySqlConnector {
             charsets,
             checked: HashMap::new(),
             kept_alive: None,
+            transactional,
+            held: None,
+            hold_limit: self.pipeline.sink.max_transaction_buffer_bytes,
         })
     }
 }
@@ -788,8 +895,13 @@ impl MySqlStream {
         SourceSeq::binlog(self.offsets.file(), end).map_err(permanent)
     }
 
-    /// Where items of the open transaction go: after a statement's pending signals, if any.
+    /// Where items of the open transaction go: held, or after a statement's pending signals, if
+    /// any.
     fn emit(&mut self, item: StreamItem) {
+        if let Some(h) = &mut self.held {
+            h.items.push(item);
+            return;
+        }
         match &mut self.signals {
             Some(s) => s.after.push(item),
             None => self.ready.push_back(item),
@@ -870,6 +982,7 @@ impl MySqlStream {
     /// The open transaction commits with the event ending at `end`: the position advances, and a
     /// transaction with items ends with its `Commit`.
     fn commit(&mut self, end: u64) -> Result<(), SourceError> {
+        self.unhold();
         let txn = self
             .txn
             .take()
@@ -920,6 +1033,42 @@ impl MySqlStream {
             self.ready
                 .push_back(StreamItem::KeepAlive(self.position.clone()));
         }
+    }
+
+    /// The open transaction's held items go out, in order, and it is no longer held.
+    fn unhold(&mut self) {
+        if let Some(h) = self.held.take() {
+            for item in h.items {
+                self.emit(item);
+            }
+        }
+    }
+
+    /// A rollback (`ROLLBACK TO name`, or `ROLLBACK`) at `end`: a held transaction drops the items
+    /// it undid; one not held halts if it gave out tracked rows ([`Self::rolled_back`]).
+    fn roll_back(&mut self, name: Option<&str>, what: &str, end: u64) -> Result<(), SourceError> {
+        let Some(h) = &mut self.held else {
+            return self.rolled_back(what, end);
+        };
+        let undone = h.roll_back(name);
+        let begun = h
+            .items
+            .iter()
+            .any(|i| matches!(i, StreamItem::Begin { .. }));
+        if let Some(table) = undone.iter().find_map(|i| match i {
+            StreamItem::Change(c) if !self.transactional.contains(&c.table) => Some(&c.table),
+            _ => None,
+        }) {
+            return Err(permanent(format!(
+                "{what} at {}:{end} undid rows of {table}, whose engine doesn't roll back: the \
+                 source can't tell which rows stand",
+                self.offsets.file()
+            )));
+        }
+        if let Some(t) = &mut self.txn {
+            t.begun = begun;
+        }
+        Ok(())
     }
 
     /// A rollback logged inside a transaction with tracked rows halts the pipeline: the binlog
@@ -1021,6 +1170,9 @@ impl MySqlStream {
                 if g.flags & MariaGtidEvent::PREPARED_XA != 0 {
                     t.xa = true;
                 }
+                if !g.standalone() && !g.transactional() {
+                    self.held = Some(Held::default());
+                }
                 Ok(())
             }
             types::QUERY => self.query(&ev, end),
@@ -1112,7 +1264,7 @@ impl MySqlStream {
             return self.commit(end);
         }
         if whole.eq_ignore_ascii_case("ROLLBACK") {
-            self.rolled_back("a ROLLBACK", end)?;
+            self.roll_back(None, "a ROLLBACK", end)?;
             return self.commit(end);
         }
         match verb(&sql).as_str() {
@@ -1132,10 +1284,26 @@ impl MySqlStream {
                 };
             }
             // MariaDB logs the rows a `ROLLBACK TO` a savepoint undid, then the statement.
-            "ROLLBACK" => return self.rolled_back("a savepoint rollback", end),
-            "SAVEPOINT" | "RELEASE" => return Ok(()),
+            "ROLLBACK" => {
+                let name = savepoint_name(&sql);
+                return self.roll_back(Some(&name), "a savepoint rollback", end);
+            }
+            "SAVEPOINT" => {
+                if let Some(h) = &mut self.held {
+                    h.savepoint(savepoint_name(&sql));
+                }
+                return Ok(());
+            }
+            "RELEASE" => {
+                if let Some(h) = &mut self.held {
+                    h.release(&savepoint_name(&sql));
+                }
+                return Ok(());
+            }
             _ => {}
         }
+        // A statement's signals keep their order with the rows before them.
+        self.unhold();
         let seq = self.seq(end)?;
         self.statement(&sql, &db, seq)?;
         if !self.txn.as_ref().is_some_and(|t| t.with_begin) {
@@ -1243,6 +1411,12 @@ impl MySqlStream {
     }
 
     fn rows(&mut self, ev: &Event, end: u64) -> Result<(), SourceError> {
+        if let Some(h) = &mut self.held {
+            h.bytes += u64::from(ev.header().event_size());
+            if h.bytes > self.hold_limit {
+                self.unhold();
+            }
+        }
         let Some(EventData::RowsEvent(re)) = ev.read_data().map_err(permanent)? else {
             return Err(permanent("an unreadable rows event"));
         };
@@ -1395,6 +1569,89 @@ impl ChangeStream for MySqlStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn held(ids: &[u64]) -> Vec<StreamItem> {
+        ids.iter()
+            .map(|&xid| StreamItem::Begin {
+                xid,
+                commit_ts_micros: 0,
+            })
+            .collect()
+    }
+
+    fn xids(items: &[StreamItem]) -> Vec<u64> {
+        items
+            .iter()
+            .map(|i| match i {
+                StreamItem::Begin { xid, .. } => *xid,
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// A rollback to a savepoint takes out what came after it, and the savepoints after it; a
+    /// whole rollback, or one to a savepoint the binlog doesn't hold, takes out everything.
+    #[test]
+    fn a_rollback_takes_out_what_it_undid() {
+        let mut h = Held {
+            items: held(&[1]),
+            ..Held::default()
+        };
+        h.savepoint("a".into());
+        h.items.extend(held(&[2]));
+        h.savepoint("b".into());
+        h.items.extend(held(&[3]));
+        assert_eq!(xids(&h.roll_back(Some("b"))), [3]);
+        h.items.extend(held(&[4]));
+        assert_eq!(xids(&h.roll_back(Some("a"))), [2, 4]);
+        assert_eq!(
+            h.savepoints,
+            [("a".to_owned(), 1)],
+            "b went with the rollback to a"
+        );
+        assert_eq!(xids(&h.roll_back(Some("a"))), [] as [u64; 0], "a stays");
+        h.items.extend(held(&[5]));
+        h.release("a");
+        assert_eq!(
+            xids(&h.roll_back(Some("a"))),
+            [1, 5],
+            "released: as if never logged"
+        );
+        h.items = held(&[6]);
+        h.savepoint("c".into());
+        h.items.extend(held(&[7]));
+        h.savepoint("c".into());
+        h.items.extend(held(&[8]));
+        assert_eq!(
+            xids(&h.roll_back(Some("c"))),
+            [8],
+            "the later c replaced the first"
+        );
+        assert_eq!(xids(&h.roll_back(None)), [6, 7]);
+        assert!(h.savepoints.is_empty());
+    }
+
+    #[test]
+    fn a_savepoint_is_named_without_case_or_quotes() {
+        assert_eq!(savepoint_name("SAVEPOINT `Sp1`"), "sp1");
+        assert_eq!(savepoint_name("ROLLBACK TO `a``b`"), "a`b");
+        assert_eq!(savepoint_name("ROLLBACK TO SAVEPOINT s2"), "s2");
+        assert_eq!(savepoint_name("RELEASE SAVEPOINT `x y`"), "x y");
+    }
+
+    #[test]
+    fn a_mariadb_transaction_says_whether_it_can_roll_back_logged_rows() {
+        let flags = |f: u8| MariaGtidEvent {
+            gtid: MariaGtid {
+                domain: 0,
+                server_id: 1,
+                seq: 1,
+            },
+            flags: f,
+        };
+        assert!(flags(0x0c).transactional(), "trans, allow parallel");
+        assert!(!flags(0x08).transactional());
+    }
 
     #[test]
     fn a_gtid_set_becomes_sid_blocks_per_uuid_and_tag() {
