@@ -392,12 +392,12 @@ pub const FIELD_DOCS: &[FieldDoc] = &[
     f(
         "pipelines.*.source.postgres.slot_management",
         Value("managed"),
-        "`managed` creates the slot when absent; `require_existing` uses a slot a DBA created and needs `auto_cleanup: false`.",
+        "`managed` creates the slot when absent; `require_existing` uses a slot a DBA created and needs `auto_cleanup: false` (a slot the DBA makes again is adopted as `slot_on_orphan` says).",
     ),
     f(
         "pipelines.*.source.postgres.slot_on_orphan",
         Value("halt"),
-        "A slot that exists with no state of the pipeline's: `halt` refuses to start, naming it; `adopt_resnapshot` takes it over and starts from the current position, snapshotting as `snapshots.mode` says (none under `never`).",
+        "A slot that exists with no state of the pipeline's, or under `require_existing` one made again past the pipeline's position: `halt` refuses to start, naming it; `adopt_resnapshot` takes it over and starts from the current position, snapshotting as `snapshots.mode` says (none under `never`).",
     ),
     f(
         "pipelines.*.source.postgres.source_change_action",

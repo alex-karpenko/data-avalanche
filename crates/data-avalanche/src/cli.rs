@@ -8,7 +8,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 #[command(
     name = "data-avalanche",
     version,
-    about = "Change data capture from PostgreSQL into Delta Lake"
+    about = "Change data capture from PostgreSQL, MySQL and MariaDB into Delta Lake"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -62,6 +62,16 @@ mod tests {
         assert_eq!(args.config, PathBuf::from("c.yaml"));
         assert_eq!(args.log_level.as_deref(), Some("debug"));
         assert_eq!(args.log_format, Some(LogFormatArg::Pretty));
+    }
+
+    #[test]
+    fn the_help_names_every_source() {
+        use clap::CommandFactory;
+        let about = Cli::command().get_about().map(|a| a.to_string());
+        assert_eq!(
+            about.as_deref(),
+            Some("Change data capture from PostgreSQL, MySQL and MariaDB into Delta Lake")
+        );
     }
 
     #[test]

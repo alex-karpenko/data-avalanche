@@ -303,6 +303,37 @@ async fn require_existing_never_creates() {
         "require_existing",
     );
     permanent(c.reset_position().await.unwrap_err(), "require_existing");
+
+    // The DBA makes it again, past the checkpoint: refused, then adopted on request (DA-SRC-30).
+    a.execute(&format!("INSERT INTO {}.a VALUES (1)", n.schema), &[])
+        .await
+        .unwrap();
+    a.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'pgoutput')",
+        &[&n.slot],
+    )
+    .await
+    .unwrap();
+    permanent(
+        c.prepare(Some(&Checkpoint::from(start.clone())), &tables)
+            .await
+            .unwrap_err(),
+        "a slot made again",
+    );
+    c.reconfigure(&pipeline(
+        &n,
+        &["*"],
+        "",
+        &format!("{postgres}, slot_on_orphan: adopt_resnapshot"),
+    ));
+    let p = c
+        .prepare(Some(&Checkpoint::from(start.clone())), &tables)
+        .await
+        .unwrap();
+    let SourcePosition::Pg(at) = from(&p.plan, SnapshotReason::PositionLost) else {
+        panic!("a PostgreSQL position")
+    };
+    assert_eq!(confirmed(&a, &n).await, Some(at), "advanced, not recreated");
     c.teardown().await.unwrap();
     assert_eq!(
         published(&a, &n).await,

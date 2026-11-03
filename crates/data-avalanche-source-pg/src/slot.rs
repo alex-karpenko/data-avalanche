@@ -53,15 +53,18 @@ pub enum SlotAction {
     /// Drop the unusable slot and create it again, then snapshot.
     Recreate(SnapshotReason),
     /// Move the slot to the current WAL position (`pg_replication_slot_advance`), then snapshot:
-    /// an orphan under `on_orphan: adopt_resnapshot`, or the slot of a source change. Advancing
-    /// works under `require_existing` too.
+    /// an orphan under `on_orphan: adopt_resnapshot`, under `require_existing` also a slot made
+    /// again past the checkpoint, or the slot of a source change. Advancing works under
+    /// `require_existing` too.
     Adopt(SnapshotReason),
     /// Refuse to start: the operator decides.
     Refuse(String),
 }
 
 /// The slot state machine (`Postgres_Slot…` §1–§3), one cell per combination of pipeline state
-/// (`checkpoint`) and server slot (`slot`).
+/// (`checkpoint`) and server slot (`slot`). Under `require_existing` the pipeline never drops or
+/// creates a slot: one the DBA makes again after the pipeline's was lost starts past the
+/// checkpoint, and is an orphan, adopted under `on_orphan: adopt_resnapshot` (DA-SRC-30).
 pub fn decide(
     checkpoint: Option<Lsn>,
     slot: Option<&SlotState>,
@@ -86,13 +89,14 @@ pub fn decide(
             None
         }
     };
+    // What a DBA does under `require_existing`: make the slot (again), and let the pipeline
+    // adopt it.
+    let remake = "slot_management is require_existing, so create it again, with slot_on_orphan: adopt_resnapshot for the pipeline to adopt it and re-snapshot";
     let lost = |why: &str| {
         if managed {
             SlotAction::Recreate(SnapshotReason::PositionLost)
         } else {
-            SlotAction::Refuse(format!(
-                "replication slot {name} {why}; slot_management is require_existing, so recreate it and restart: the pipeline re-snapshots"
-            ))
+            SlotAction::Refuse(format!("replication slot {name} {why}; drop it: {remake}"))
         }
     };
     match (checkpoint, slot) {
@@ -104,19 +108,25 @@ pub fn decide(
                 return lost("was invalidated");
             }
             match s.confirmed_flush {
-                Some(flushed) if flushed > at => lost(&format!(
-                    "confirmed {flushed}, past the pipeline's checkpoint {at}"
-                )),
+                Some(flushed) if flushed > at => match (managed, orphan) {
+                    (true, _) => SlotAction::Recreate(SnapshotReason::PositionLost),
+                    (false, SlotOnOrphan::AdoptResnapshot) => {
+                        SlotAction::Adopt(SnapshotReason::PositionLost)
+                    }
+                    (false, SlotOnOrphan::Halt) => SlotAction::Refuse(format!(
+                        "replication slot {name} confirmed {flushed}, past the pipeline's checkpoint {at}: the changes between are lost (a slot made again); slot_management is require_existing, so set slot_on_orphan: adopt_resnapshot for the pipeline to adopt it and re-snapshot"
+                    )),
+                },
                 _ => SlotAction::Resume,
             }
         }
         (Some(_), None) if managed => SlotAction::Create(SnapshotReason::PositionLost),
-        (Some(_), None) => SlotAction::Refuse(format!(
-            "replication slot {name} doesn't exist and slot_management is require_existing"
-        )),
+        (Some(_), None) => {
+            SlotAction::Refuse(format!("replication slot {name} doesn't exist; {remake}"))
+        }
         (None, Some(s)) => match orphan {
             SlotOnOrphan::Halt => SlotAction::Refuse(format!(
-                "replication slot {name} exists but the pipeline has no state (an orphan): drop the slot for a first start, restore the pipeline state, or set slot.on_orphan: adopt_resnapshot"
+                "replication slot {name} exists but the pipeline has no state (an orphan): drop the slot for a first start, restore the pipeline state, or set slot_on_orphan: adopt_resnapshot"
             )),
             SlotOnOrphan::AdoptResnapshot => match not_ours(s) {
                 Some(m) => SlotAction::Refuse(m),
@@ -797,7 +807,10 @@ mod tests {
     #[test]
     fn state_without_slot_recreates_under_managed() {
         assert_eq!(d(Some(0x20), None, M, HALT), A::Create(R::PositionLost));
-        refused(d(Some(0x20), None, X, HALT), "doesn't exist");
+        refused(
+            d(Some(0x20), None, X, HALT),
+            "doesn't exist; slot_management is require_existing, so create it again",
+        );
     }
 
     #[test]
@@ -806,22 +819,43 @@ mod tests {
             d(Some(0x10), Some(slot(0x20)), M, HALT),
             A::Recreate(R::PositionLost)
         );
-        refused(
-            d(Some(0x10), Some(slot(0x20)), X, HALT),
-            "past the pipeline's checkpoint",
-        );
         let mut gone = slot(0x10);
         gone.invalidated = true;
         assert_eq!(
             d(Some(0x20), Some(gone.clone()), M, HALT),
             A::Recreate(R::PositionLost)
         );
-        refused(d(Some(0x20), Some(gone), X, HALT), "invalidated");
+        refused(
+            d(Some(0x20), Some(gone), X, HALT),
+            "was invalidated; drop it: slot_management is require_existing, so create it again, with slot_on_orphan: adopt_resnapshot",
+        );
+    }
+
+    /// Under `require_existing` the DBA makes a lost slot again, past the checkpoint: adopted on
+    /// request, like an orphan (DA-SRC-30).
+    #[test]
+    fn a_slot_made_again_under_require_existing_is_adopted_on_request() {
+        refused(
+            d(Some(0x10), Some(slot(0x20)), X, HALT),
+            "confirmed 0/20, past the pipeline's checkpoint 0/10: the changes between are lost (a slot made again); slot_management is require_existing, so set slot_on_orphan: adopt_resnapshot",
+        );
+        assert_eq!(
+            d(Some(0x10), Some(slot(0x20)), X, ADOPT),
+            A::Adopt(R::PositionLost)
+        );
+        assert_eq!(
+            d(Some(0x20), Some(slot(0x20)), X, ADOPT),
+            A::Resume,
+            "at the checkpoint it is the pipeline's own"
+        );
     }
 
     #[test]
     fn an_orphan_halts_or_is_adopted() {
-        refused(d(None, Some(slot(0x10)), M, HALT), "orphan");
+        refused(
+            d(None, Some(slot(0x10)), M, HALT),
+            "(an orphan): drop the slot for a first start, restore the pipeline state, or set slot_on_orphan: adopt_resnapshot",
+        );
         refused(d(None, Some(slot(0x10)), X, HALT), "orphan");
         assert_eq!(
             d(None, Some(slot(0x10)), M, ADOPT),
