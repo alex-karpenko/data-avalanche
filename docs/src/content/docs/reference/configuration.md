@@ -210,10 +210,10 @@ Rules for the whole block: [V-003](/data-avalanche/reference/validation-rules/#v
 
 | Key | Type | Default | On reload | Rules | Description |
 |---|---|---|---|---|---|
-| `replication_type` | `binlog` \| `gtid` | `gtid` | pipeline restart | [V-021](/data-avalanche/reference/validation-rules/#v-021) | `gtid` follows GTIDs and survives a failover (MySQL `gtid_mode=ON`, MariaDB `gtid_strict_mode=1`); `binlog` follows file and position, and halts `BINLOG_SOURCE_CHANGED` when the server changes. |
+| `replication_type` | `binlog` \| `gtid` | `gtid` | pipeline restart | [V-021](/data-avalanche/reference/validation-rules/#v-021) | `gtid` follows GTIDs and survives a failover (MySQL `gtid_mode=ON`, MariaDB `gtid_strict_mode=1`); `binlog` follows file and position, which mean something on one server only: on another, the position is lost, as `binlog_purge_action` says. |
 | `tinyint1_as_bool` | boolean | `true` | pipeline restart |  | Read `TINYINT(1)` columns as booleans. |
 | `tinyint1_detection` | `information_schema` \| `none` | `information_schema` | pipeline restart | [V-081](/data-avalanche/reference/validation-rules/#v-081) | Where `TINYINT(1)` is recognised: the catalog (`information_schema`), or `none` to read every `TINYINT` as an integer. |
-| `binlog_purge_action` | `error` \| `re_snapshot` | `error` | applied | [V-105](/data-avalanche/reference/validation-rules/#v-105) | When the server purged the binlog the pipeline must resume from: `error` halts; `re_snapshot` starts from the current position, snapshotting as `snapshots.mode` says (none under `never`). |
+| `binlog_purge_action` | `error` \| `re_snapshot` | `error` | applied | [V-105](/data-avalanche/reference/validation-rules/#v-105) | When the server can't serve the position the pipeline resumes from (its binlog purged, or under `binlog` another server's): `error` halts; `re_snapshot` starts from the current position, snapshotting as `snapshots.mode` says (none under `never`). |
 | `server_id` | integer | derived from the pipeline's id, in 2147483648…4294967295 | pipeline restart | [V-120](/data-avalanche/reference/validation-rules/#v-120) | The replica id the binlog stream registers with; each pipeline needs its own, or the server ends one of the streams. |
 | `heartbeat` | duration | `60s` | applied | [V-121](/data-avalanche/reference/validation-rules/#v-121) | How often an idle server sends a binlog heartbeat; a stream silent for three heartbeats, while the heartbeat's checks fail or find no binlog dump of its connection on the server, is reconnected. |
 

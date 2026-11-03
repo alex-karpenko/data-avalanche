@@ -7,8 +7,12 @@
 //! `binlog_purge_action`: at a start, `re_snapshot` plans a snapshot from the server's position
 //! now (`PositionLost`, with a warning) and `error` halts. A purge the stream meets later (the
 //! dump's error 1236) follows it through [`purge_action`]. In file/position mode a checkpoint
-//! recorded on another server halts the pipeline (`BINLOG_SOURCE_CHANGED`): a position in one
-//! server's files means nothing in another's.
+//! recorded on another server is lost too (DA-SRC-29): a position in one server's files means
+//! nothing in another's, so it is never resumed. `error` halts the pipeline
+//! (`BINLOG_SOURCE_CHANGED`); `re_snapshot` plans a snapshot from the server's position now
+//! (`SourceChanged`: the pipeline resets every table's marker to it). MariaDB names a server by
+//! `@@server_id` alone, which can repeat, so there a position that isn't an event's boundary on
+//! the server (`BINLOG_GTID_POS` NULL, DA-SRC-21) is another server's too.
 
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -105,6 +109,10 @@ pub fn dialect_change(mode: Mode, checkpoint: &SourcePosition) -> Option<String>
     })
 }
 
+/// MariaDB's GTID state at a binlog position: NULL unless the position is an event's boundary
+/// there ([`at_boundary`]).
+pub(crate) const BOUNDARY_QUERY: &str = "SELECT BINLOG_GTID_POS(?, ?)";
+
 /// File/position mode: the checkpoint must be from the connected server (Q-M7-2).
 pub fn same_server(checkpoint: &Checkpoint, now: &ServerIdentity) -> Result<(), SourceError> {
     let at = checkpoint.position.untagged();
@@ -113,11 +121,51 @@ pub fn same_server(checkpoint: &Checkpoint, now: &ServerIdentity) -> Result<(), 
         Some(s) => s.to_string(),
         None => "an unrecorded server".to_owned(),
     };
-    Err(SourceError::Permanent(format!(
-        "BINLOG_SOURCE_CHANGED: binlog position {at} was recorded on {recorded}, now connected \
-         to {now}; file/position cannot be carried across servers — switch to replication_type: \
-         gtid or re-snapshot"
+    Err(source_changed(format!(
+        "binlog position {at} was recorded on {recorded}, now connected to {now}"
     )))
+}
+
+/// MariaDB file/position mode: whether `at` is an event's boundary in a binlog of the connected
+/// server, from its answer to `SELECT BINLOG_GTID_POS(<file>, <pos>)`: NULL for a file it doesn't
+/// hold, an offset inside an event or past the end (measured on MariaDB 11.8). A checkpoint is
+/// always one: a transaction's end, a file's start. A NULL for a file the server no longer holds
+/// (`held` false, [`holds`]) is a purge since, which the purge's own checks report.
+pub fn at_boundary(
+    at: &SourcePosition,
+    now: &ServerIdentity,
+    answer: Option<Option<String>>,
+    held: bool,
+) -> Result<(), SourceError> {
+    match answer {
+        Some(Some(_)) => Ok(()),
+        _ if !held => Ok(()),
+        _ => Err(source_changed(format!(
+            "binlog position {} isn't an event's boundary on {now}, so it was recorded on another \
+             server with the same @@server_id",
+            at.untagged()
+        ))),
+    }
+}
+
+/// Whether the server still holds the binlog `file` (`SHOW BINARY LOGS`).
+pub(crate) async fn holds(
+    c: &mut mysql_async::Conn,
+    file: &str,
+) -> Result<bool, mysql_async::Error> {
+    let rows: Vec<mysql_async::Row> = c.query("SHOW BINARY LOGS").await?;
+    Ok(rows
+        .iter()
+        .any(|r| r.get::<String, _>(0).as_deref() == Some(file)))
+}
+
+/// A file/position checkpoint the connected server didn't write, as the pipeline's halt.
+fn source_changed(why: String) -> SourceError {
+    SourceError::Permanent(format!(
+        "BINLOG_SOURCE_CHANGED: {why}; file/position cannot be carried across servers — set \
+         binlog_purge_action: re_snapshot to re-snapshot from this server, or switch to \
+         replication_type: gtid"
+    ))
 }
 
 /// A position the stream can't read on, as `binlog_purge_action` says (G-26): `re_snapshot` keeps
@@ -157,11 +205,21 @@ impl MySqlConnector {
         let lost = match dialect_change(mode, &cp.position) {
             Some(why) => Some(why),
             None => {
-                if mode == Mode::File {
-                    same_server(cp, &server)?;
+                if mode == Mode::File
+                    && let Err(changed) = same_server(cp, &server)
+                {
+                    return self.changed(changed, server).await;
                 }
                 let retention = self.retention(&cp.position).await?;
-                purged(&cp.position, &retention)
+                let lost = purged(&cp.position, &retention);
+                if lost.is_none()
+                    && mode == Mode::File
+                    && matches!(server, ServerIdentity::Mariadb { .. })
+                    && let Err(changed) = self.at_boundary(&cp.position, &server).await
+                {
+                    return self.changed(changed, server).await;
+                }
+                lost
             }
         };
         if let Some(why) = lost {
@@ -195,6 +253,54 @@ impl MySqlConnector {
             warnings: vec![],
             server: Some(server),
         })
+    }
+
+    /// A file/position checkpoint from another server, as `binlog_purge_action` says: `error`
+    /// halts with `changed`; `re_snapshot` snapshots from the server's position now.
+    async fn changed(
+        &self,
+        changed: SourceError,
+        server: ServerIdentity,
+    ) -> Result<Prepared, SourceError> {
+        if self.live().binlog_purge_action != BinlogPurgeAction::ReSnapshot {
+            return Err(changed);
+        }
+        Ok(Prepared {
+            plan: StartPlan::Snapshot {
+                from: self.position_now().await?,
+                reason: SnapshotReason::SourceChanged,
+            },
+            added: vec![],
+            warnings: vec![format!(
+                "{changed}; binlog_purge_action is re_snapshot, so the pipeline re-snapshots from \
+                 the server's position now"
+            )],
+            server: Some(server),
+        })
+    }
+
+    /// [`at_boundary`] on the connected server.
+    async fn at_boundary(
+        &self,
+        at: &SourcePosition,
+        server: &ServerIdentity,
+    ) -> Result<(), SourceError> {
+        let SourcePosition::BinlogFile(p) = at else {
+            return Ok(());
+        };
+        let (file, pos) = (p.file().to_owned(), p.pos());
+        let (answer, held) = self
+            .conn
+            .command("check the position on the server", move |c| {
+                Box::pin(async move {
+                    let answer: Option<Option<String>> =
+                        c.exec_first(BOUNDARY_QUERY, (file.as_str(), pos)).await?;
+                    let held = matches!(answer, Some(Some(_))) || holds(c, &file).await?;
+                    Ok((answer, held))
+                })
+            })
+            .await?;
+        at_boundary(at, server, answer, held)
     }
 
     /// The connection id of the open binlog dump, `None` without one: the server's
@@ -380,7 +486,29 @@ mod tests {
         for c in [cp(Some(b)), cp(None)] {
             let e = same_server(&c, &a).unwrap_err();
             assert!(
-                matches!(&e, SourceError::Permanent(m) if m.starts_with("BINLOG_SOURCE_CHANGED: binlog position binlog.000003:154")),
+                matches!(&e, SourceError::Permanent(m) if m.starts_with("BINLOG_SOURCE_CHANGED: binlog position binlog.000003:154")
+                    && m.contains("set binlog_purge_action: re_snapshot")),
+                "{e}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_position_off_an_event_boundary_is_another_server_s() {
+        let a = ServerIdentity::Mariadb { server_id: 1 };
+        assert!(at_boundary(&file(), &a, Some(Some("0-1-20505".into())), true).is_ok());
+        assert!(
+            at_boundary(&file(), &a, Some(Some(String::new())), true).is_ok(),
+            "no GTIDs yet"
+        );
+        assert!(
+            at_boundary(&file(), &a, Some(None), false).is_ok(),
+            "a file purged since is the purge's to report"
+        );
+        for answer in [Some(None), None] {
+            let e = at_boundary(&file(), &a, answer, true).unwrap_err();
+            assert!(
+                matches!(&e, SourceError::Permanent(m) if m.starts_with("BINLOG_SOURCE_CHANGED: binlog position binlog.000003:154 isn't an event's boundary on MariaDB server_id 1")),
                 "{e}"
             );
         }

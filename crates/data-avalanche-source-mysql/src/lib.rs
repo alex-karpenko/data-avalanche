@@ -28,7 +28,7 @@ pub use ddl::{Altered, Ddl, Renamed, Scope, classify, renamed, shadow_of};
 pub use position::{BinaryLog, Mode, Retention, bytes_after, purged};
 pub use schema::{diff, narrowed, scope, scope_of};
 pub use server::{Flavour, Fold, Settings, grants_replication, version_of};
-pub use start::{dialect_change, purge_action, same_server};
+pub use start::{at_boundary, dialect_change, purge_action, same_server};
 pub use stream::MySqlStream;
 pub use types::{CatalogColumn, ColumnPlan, Tinyint1AsBool, members, plan_column};
 pub use value::{Charset, Decode, Input, ValueError, decode, decode_after, int_type};

@@ -57,7 +57,7 @@ use crate::ddl::{Renamed, classify, renamed};
 use crate::error::mysql;
 use crate::position::{Mode, identity, identity_query};
 use crate::server::{Flavour, Fold};
-use crate::start::{purge_action, same_server};
+use crate::start::{BOUNDARY_QUERY, at_boundary, holds, purge_action, same_server};
 use crate::types::{CatalogColumn, members, plan_column};
 use crate::value::{Charset, Decode, Input, decode_after, halt_reason, text_of};
 
@@ -739,7 +739,18 @@ impl MySqlConnector {
                     .query_first(identity_query(flavour))
                     .await
                     .map_err(err)?;
-                same_server(recorded, &identity(flavour, answer)?)?;
+                let server = identity(flavour, answer)?;
+                same_server(recorded, &server)?;
+                if flavour == Flavour::Mariadb {
+                    let answer: Option<Option<String>> = conn
+                        .exec_first(BOUNDARY_QUERY, (p.file(), p.pos()))
+                        .await
+                        .map_err(err)?;
+                    // A file purged since answers NULL too: the dump's refusal is the purge's.
+                    let held = matches!(answer, Some(Some(_)))
+                        || holds(&mut conn, p.file()).await.map_err(err)?;
+                    at_boundary(from, &server, answer, held)?;
+                }
                 file = p.file().as_bytes().to_vec();
                 req = req.with_filename(&file[..]).with_pos(p.pos());
                 Offsets::new(p.file(), p.pos())
