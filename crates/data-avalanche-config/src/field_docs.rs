@@ -392,7 +392,7 @@ pub const FIELD_DOCS: &[FieldDoc] = &[
     f(
         "pipelines.*.source.postgres.slot_management",
         Value("managed"),
-        "`managed` creates the slot when absent; `require_existing` uses a slot a DBA created and needs `auto_cleanup: false` (a slot the DBA makes again is adopted as `slot_on_orphan` says).",
+        "`managed` creates the slot when absent; `require_existing` uses a slot a DBA created and needs `auto_cleanup: false` (a slot the DBA makes again is adopted or refused as `slot_on_orphan` says).",
     ),
     f(
         "pipelines.*.source.postgres.slot_on_orphan",

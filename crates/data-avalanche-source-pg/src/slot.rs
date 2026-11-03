@@ -53,7 +53,7 @@ pub enum SlotAction {
     /// Drop the unusable slot and create it again, then snapshot.
     Recreate(SnapshotReason),
     /// Move the slot to the current WAL position (`pg_replication_slot_advance`), then snapshot:
-    /// an orphan under `on_orphan: adopt_resnapshot`, under `require_existing` also a slot made
+    /// an orphan under `slot_on_orphan: adopt_resnapshot`, under `require_existing` also a slot made
     /// again past the checkpoint, or the slot of a source change. Advancing works under
     /// `require_existing` too.
     Adopt(SnapshotReason),
@@ -64,7 +64,7 @@ pub enum SlotAction {
 /// The slot state machine (`Postgres_Slot…` §1–§3), one cell per combination of pipeline state
 /// (`checkpoint`) and server slot (`slot`). Under `require_existing` the pipeline never drops or
 /// creates a slot: one the DBA makes again after the pipeline's was lost starts past the
-/// checkpoint, and is an orphan, adopted under `on_orphan: adopt_resnapshot` (DA-SRC-30).
+/// checkpoint, and is an orphan, adopted under `slot_on_orphan: adopt_resnapshot` (DA-SRC-30).
 pub fn decide(
     checkpoint: Option<Lsn>,
     slot: Option<&SlotState>,
@@ -114,7 +114,7 @@ pub fn decide(
                         SlotAction::Adopt(SnapshotReason::PositionLost)
                     }
                     (false, SlotOnOrphan::Halt) => SlotAction::Refuse(format!(
-                        "replication slot {name} confirmed {flushed}, past the pipeline's checkpoint {at}: the changes between are lost (a slot made again); slot_management is require_existing, so set slot_on_orphan: adopt_resnapshot for the pipeline to adopt it and re-snapshot"
+                        "replication slot {name} confirmed {flushed}, past the pipeline's checkpoint {at}: the changes between are lost (a slot made again, or moved by something else); slot_management is require_existing, so set slot_on_orphan: adopt_resnapshot for the pipeline to adopt it and re-snapshot"
                     )),
                 },
                 _ => SlotAction::Resume,
@@ -599,7 +599,7 @@ impl PgConnector {
     pub async fn reset_position(&self) -> Result<Checkpoint, SourceError> {
         if self.pg.slot_management == SlotManagement::RequireExisting {
             return Err(SourceError::Permanent(format!(
-                "replication slot {} lost its position and slot_management is require_existing: recreate it and restart",
+                "replication slot {} lost its position; drop it: slot_management is require_existing, so create it again, with slot_on_orphan: adopt_resnapshot for the pipeline to adopt it and re-snapshot",
                 self.slot_name()
             )));
         }
@@ -837,7 +837,7 @@ mod tests {
     fn a_slot_made_again_under_require_existing_is_adopted_on_request() {
         refused(
             d(Some(0x10), Some(slot(0x20)), X, HALT),
-            "confirmed 0/20, past the pipeline's checkpoint 0/10: the changes between are lost (a slot made again); slot_management is require_existing, so set slot_on_orphan: adopt_resnapshot",
+            "confirmed 0/20, past the pipeline's checkpoint 0/10: the changes between are lost (a slot made again, or moved by something else); slot_management is require_existing, so set slot_on_orphan: adopt_resnapshot",
         );
         assert_eq!(
             d(Some(0x10), Some(slot(0x20)), X, ADOPT),
@@ -848,6 +848,25 @@ mod tests {
             A::Resume,
             "at the checkpoint it is the pipeline's own"
         );
+        assert_eq!(
+            d(Some(0x20), Some(slot(0x10)), X, ADOPT),
+            A::Resume,
+            "behind the checkpoint it is the pipeline's own"
+        );
+        let mut gone = slot(0x20);
+        gone.invalidated = true;
+        refused(
+            d(Some(0x20), Some(gone), X, ADOPT),
+            "was invalidated; drop it",
+        );
+        assert_eq!(
+            d(Some(0x10), Some(slot(0x20)), M, ADOPT),
+            d(Some(0x10), Some(slot(0x20)), M, HALT),
+            "managed recreates whatever slot_on_orphan says"
+        );
+        let mut other = slot(0x20);
+        other.plugin = Some("wal2json".into());
+        refused(d(Some(0x10), Some(other), X, ADOPT), "wal2json");
     }
 
     #[test]

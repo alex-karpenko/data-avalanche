@@ -302,7 +302,7 @@ async fn require_existing_never_creates() {
             .unwrap_err(),
         "require_existing",
     );
-    permanent(c.reset_position().await.unwrap_err(), "require_existing");
+    permanent(c.reset_position().await.unwrap_err(), "slot_on_orphan");
 
     // The DBA makes it again, past the checkpoint: refused, then adopted on request (DA-SRC-30).
     a.execute(&format!("INSERT INTO {}.a VALUES (1)", n.schema), &[])
@@ -318,7 +318,7 @@ async fn require_existing_never_creates() {
         c.prepare(Some(&Checkpoint::from(start.clone())), &tables)
             .await
             .unwrap_err(),
-        "a slot made again",
+        "a slot made again, or moved by something else",
     );
     c.reconfigure(&pipeline(
         &n,
@@ -326,6 +326,11 @@ async fn require_existing_never_creates() {
         "",
         &format!("{postgres}, slot_on_orphan: adopt_resnapshot"),
     ));
+    let before = confirmed(&a, &n).await;
+    // The slot starts at the WAL end it was made at: write on, so the advance has somewhere to go.
+    a.execute(&format!("INSERT INTO {}.a VALUES (2)", n.schema), &[])
+        .await
+        .unwrap();
     let p = c
         .prepare(Some(&Checkpoint::from(start.clone())), &tables)
         .await
@@ -333,6 +338,7 @@ async fn require_existing_never_creates() {
     let SourcePosition::Pg(at) = from(&p.plan, SnapshotReason::PositionLost) else {
         panic!("a PostgreSQL position")
     };
+    assert!(before.is_some_and(|b| at > b), "moved forward");
     assert_eq!(confirmed(&a, &n).await, Some(at), "advanced, not recreated");
     c.teardown().await.unwrap();
     assert_eq!(

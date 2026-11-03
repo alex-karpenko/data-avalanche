@@ -105,7 +105,7 @@ pub enum SnapshotReason {
     /// The pipeline has state, but the source lost its stream position (PostgreSQL: the slot is
     /// gone or invalidated). Warn: data was at risk of a retention gap (D-15.3).
     PositionLost,
-    /// No pipeline state, but the source kept a stream position: `on_orphan: adopt_resnapshot`
+    /// No pipeline state, but the source kept a stream position: `slot_on_orphan: adopt_resnapshot`
     /// took it over (D-15.1).
     AdoptedOrphan,
     /// The checkpoint was read on another server (PostgreSQL: another system identifier or
