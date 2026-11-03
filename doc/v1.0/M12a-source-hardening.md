@@ -7588,3 +7588,12 @@ git commit -m "docs: the M12a recoveries — a PostgreSQL failover, a DBA's slot
   `lib.rs` block now has `never_held` in its context line. Task 12's pages describe file mode
   with these two rules. The spec patch for Data-Flow Phase 2b and Source Disconnect, and for the
   Configuration `replication_type` row, is applied separately on approval.
+- **Task 4** (review fix, `4f43600`): `reset_position`'s `require_existing` refusal, reached
+  after a mid-run `PositionUnreachable`, still said "recreate it and restart" and didn't name
+  `slot_on_orphan`. Under the default `halt`, following it met a second refusal. It now reads as
+  `decide`'s `remake` text does. The made-again refusal says "(a slot made again, or moved by
+  something else)". `slot_management`'s field doc says "adopted or refused", as the spec does.
+  Doc comments use `slot_on_orphan`. The unit test pins four more cells: an invalidated slot
+  under `adopt_resnapshot` is refused, a slot behind the checkpoint resumes, `managed` ignores
+  `slot_on_orphan`, and a foreign plugin is refused. The IT writes once more after reading the
+  slot, and asserts that the adoption advanced it. Tasks 6 and 9's blocks still apply.
