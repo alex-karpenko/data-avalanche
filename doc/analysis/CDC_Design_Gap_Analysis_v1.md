@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-30
+updated: 2026-11-03
 domain: Architecture
 tags: [gap-analysis, design, re-derivation, spec-readiness, blockers, open-decisions]
 resolves: []
@@ -492,7 +492,7 @@ read 37. With DA-X-15 (§52.1) it is 36.
 | DA-SRC-29, DA-SRC-21 | 3: a changed MySQL server follows `binlog_purge_action`; MariaDB's position checked by `BINLOG_GTID_POS` |
 | DA-SRC-30, DA-OPS-13 | 4: a DBA's slot made again is adopted under `slot_on_orphan: adopt_resnapshot`; the refusal's key and the CLI's `about` |
 | DA-SRC-26 | 5: a MariaDB rollback drops the rows it undid |
-| DA-SRC-24, DA-SRC-25, DA-SRC-22 | 6: a Galera node, a case-only rename, `verify-ca` on MySQL (V-124, fails closed; the `mysql_async` fix re-checked at each upgrade) |
+| DA-SRC-24, DA-SRC-22 | 6: a Galera node, `verify-ca` on MySQL (V-124, fails closed; the `mysql_async` fix re-checked at each upgrade). DA-SRC-25 (a case-only rename) was withdrawn in the task's review and stays open (§53) |
 | DA-SRC-14, DA-SRC-19 | 7: `bit`/`varbit` keys refused; a table's chunk-read error halts the table |
 | DA-SNAP-13, DA-SNAP-14, DA-SRC-15 | 8: a wiped state baselines against the sink table; an `ENUM` key reordered; the collation edges |
 | DA-SRC-13 | 9: the publication's blind spots |
