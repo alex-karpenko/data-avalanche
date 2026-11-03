@@ -135,6 +135,13 @@ impl Held {
         self.items.push(item);
     }
 
+    /// A change is held: a rollback the hold can't resolve puts rows in doubt.
+    fn has_change(&self) -> bool {
+        self.items
+            .iter()
+            .any(|i| matches!(i, StreamItem::Change(_)))
+    }
+
     /// `SAVEPOINT name`: one of the same name moves here.
     fn savepoint(&mut self, name: String) {
         self.savepoints.retain(|(s, _)| *s != name);
@@ -249,7 +256,8 @@ pub struct MySqlStream {
     transactional: HashSet<TableRef>,
     /// The open transaction's items, while they are held.
     held: Option<Held>,
-    /// The most rows-event bytes a transaction holds (`sink.max_transaction_buffer_bytes`).
+    /// The most decoded bytes of rows a transaction holds, as the accumulator counts them
+    /// (`sink.max_transaction_buffer_bytes`).
     hold_limit: u64,
 }
 
@@ -1101,6 +1109,12 @@ impl MySqlStream {
             return self.rolled_back(what, end);
         };
         let Some(undone) = h.roll_back(name) else {
+            if !h.has_change() {
+                // Nothing tracked is held (another database's rows, a non-tracked table's): no
+                // row stands in doubt.
+                h.savepoints.clear();
+                return Ok(());
+            }
             return Err(permanent(format!(
                 "ROLLBACK TO `{}` at {}:{end} names a savepoint the stream didn't see logged: the \
                  source can't tell which rows stand",
@@ -1735,6 +1749,19 @@ mod tests {
         let mut h = held(vec![begin(), change(1)]);
         assert_eq!(tags(&h.roll_back(None).unwrap()), [1]);
         assert_eq!(tags(&h.items), [] as [u64; 0], "no halt: nothing stays");
+    }
+
+    /// An unknown savepoint puts rows in doubt only if the hold holds a change.
+    #[test]
+    fn an_unknown_savepoint_matters_only_to_a_hold_with_changes() {
+        for mut h in [Held::default(), held(vec![begin()])] {
+            assert!(h.roll_back(Some("zz")).is_none());
+            assert!(!h.has_change());
+        }
+        let mut h = held(vec![begin(), change(1)]);
+        assert!(h.roll_back(Some("zz")).is_none());
+        assert!(h.has_change());
+        assert_eq!(tags(&h.items), [0, 1], "a refusal takes nothing out");
     }
 
     /// The hold counts the decoded bytes of the changes it holds, and a rollback gives them back.
