@@ -270,6 +270,14 @@ impl PgConnector {
                              unless an index has ({column} COLLATE \"C\")"
                         ));
                     }
+                    for (column, collation) in notes.index_ordered_otherwise {
+                        out.warnings.push(format!(
+                            "{key}.{column}: the key's index sorts it in {collation}, not in the \
+                             column's own collation, which snapshot chunks order by: \
+                             each chunk scans the table unless an index has ({column}) in its \
+                             own collation"
+                        ));
+                    }
                     unconstrained.extend(
                         notes
                             .unconstrained

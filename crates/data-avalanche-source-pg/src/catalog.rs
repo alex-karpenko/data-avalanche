@@ -149,6 +149,9 @@ pub struct Described {
     pub primary_key: Vec<String>,
     /// The columns of the `REPLICA IDENTITY USING INDEX` index.
     pub identity_index: Vec<String>,
+    /// The key columns the primary key's or the replica identity's index sorts in another
+    /// collation than the column's own: `(column, the index's collation)`.
+    pub index_collations: Vec<(String, String)>,
 }
 
 /// The table's config keys: `schema.table` (config §9.3).
@@ -166,6 +169,10 @@ pub struct Notes {
     /// Identifier columns in a nondeterministic collation: `(column, collation)`. Snapshot chunks
     /// order them by `"C"`, which their index doesn't serve.
     pub c_ordered_keys: Vec<(String, String)>,
+    /// Identifier columns in a deterministic collation that their key index sorts in another
+    /// (`COLLATE "C"`): `(column, the index's collation)`. Snapshot chunks order them by
+    /// their own, which that index doesn't serve (DA-SRC-15).
+    pub index_ordered_otherwise: Vec<(String, String)>,
 }
 
 /// The replica identity's columns.
@@ -260,13 +267,18 @@ pub fn table_schema(
         return Err(HaltReason::IdentifierNotInReplicaIdentity { missing });
     }
     for k in schema.identifier() {
-        if let Some(collation) = d
-            .columns
-            .iter()
-            .find(|a| &a.name == k)
-            .and_then(|a| a.nondeterministic.clone())
-        {
-            notes.c_ordered_keys.push((k.clone(), collation));
+        let Some(a) = d.columns.iter().find(|a| &a.name == k) else {
+            continue;
+        };
+        match &a.nondeterministic {
+            Some(collation) => notes.c_ordered_keys.push((k.clone(), collation.clone())),
+            None => {
+                if let Some((_, other)) = d.index_collations.iter().find(|(c, _)| c == k) {
+                    notes
+                        .index_ordered_otherwise
+                        .push((k.clone(), other.clone()));
+                }
+            }
         }
     }
     if let Some(fields) = tables.partitioning.get(&key) {
@@ -364,6 +376,7 @@ pub async fn describe(
                 columns: vec![],
                 primary_key: vec![],
                 identity_index: vec![],
+                index_collations: vec![],
             },
         );
     }
@@ -402,8 +415,17 @@ pub async fn describe(
                             FROM unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
                             JOIN pg_catalog.pg_attribute a
                               ON a.attrelid = i.indrelid AND a.attnum = k.attnum
-                           ORDER BY k.ord)
-               FROM pg_catalog.pg_index i
+                           ORDER BY k.ord),
+                    o.columns, o.collations
+               FROM pg_catalog.pg_index i,
+                    LATERAL (SELECT array_agg(a.attname::text ORDER BY k.ord) AS columns,
+                                    array_agg(co.collname::text ORDER BY k.ord) AS collations
+                               FROM unnest(i.indkey::int2[], i.indcollation::oid[])
+                                    WITH ORDINALITY AS k(attnum, coll, ord)
+                               JOIN pg_catalog.pg_attribute a
+                                 ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+                               JOIN pg_catalog.pg_collation co ON co.oid = k.coll
+                              WHERE k.coll <> a.attcollation) AS o
               WHERE i.indrelid = ANY($1) AND (i.indisprimary OR i.indisreplident)",
             &[&oids],
         )
@@ -411,6 +433,17 @@ pub async fn describe(
     {
         if let Some(d) = out.get_mut(&r.get::<_, u32>(0)) {
             let columns: Vec<String> = r.get(3);
+            let other: Option<Vec<String>> = r.get(4);
+            let collations: Option<Vec<String>> = r.get(5);
+            for (column, collation) in other
+                .unwrap_or_default()
+                .into_iter()
+                .zip(collations.unwrap_or_default())
+            {
+                if !d.index_collations.iter().any(|(c, _)| *c == column) {
+                    d.index_collations.push((column, collation));
+                }
+            }
             if r.get::<_, bool>(1) {
                 d.primary_key = columns.clone();
             }
@@ -579,6 +612,7 @@ mod tests {
             ],
             primary_key: vec!["id".into()],
             identity_index: vec!["code".into()],
+            index_collations: vec![],
         }
     }
 
@@ -655,6 +689,23 @@ mod tests {
         full.columns[1].nondeterministic = Some("ci".into());
         let (_, notes) = schema_of(&full, "").unwrap();
         assert!(notes.c_ordered_keys.is_empty(), "only identifier columns");
+    }
+
+    #[test]
+    fn a_key_index_in_another_collation_is_noted() {
+        let mut d = orders(b'i');
+        d.index_collations = vec![("code".into(), "C".into())];
+        let over = "      primary_key: { public.orders: [code] }";
+        let (_, notes) = schema_of(&d, over).unwrap();
+        assert_eq!(notes.index_ordered_otherwise, [("code".into(), "C".into())]);
+        assert!(notes.c_ordered_keys.is_empty());
+        let mut other = orders(b'd');
+        other.index_collations = vec![("code".into(), "C".into())];
+        let (_, notes) = schema_of(&other, "").unwrap();
+        assert!(
+            notes.index_ordered_otherwise.is_empty(),
+            "only identifier columns"
+        );
     }
 
     #[test]

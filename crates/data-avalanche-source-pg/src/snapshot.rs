@@ -44,8 +44,9 @@ pub(crate) struct ReadColumn {
 /// deterministic collation for both, so the order and the cursor agree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum KeyCollation {
-    /// The column's own, deterministic: its index serves the order.
-    Own(String),
+    /// The column's own, deterministic: its index serves the order. `name` is what the cursor
+    /// records; `qualified`, with its schema, what a cursor literal is collated in.
+    Own { name: String, qualified: String },
     /// A nondeterministic collation's column, compared in `"C"`.
     C,
 }
@@ -53,7 +54,7 @@ enum KeyCollation {
 impl KeyCollation {
     fn name(&self) -> &str {
         match self {
-            KeyCollation::Own(name) => name,
+            KeyCollation::Own { name, .. } => name,
             KeyCollation::C => "C",
         }
     }
@@ -93,9 +94,10 @@ async fn read_plan(c: &PgConnector, schema: &TableSchema) -> Result<Vec<ReadColu
                 &format!(
                     "SELECT a.attname, a.atttypid, a.atttypmod,
                             pg_catalog.format_type(a.atttypid, a.atttypmod), co.collname::text,
-                            co.collisdeterministic, {NOT_NULL}
+                            co.collisdeterministic, {NOT_NULL}, cn.nspname::text
                        FROM pg_catalog.pg_attribute a
                        LEFT JOIN pg_catalog.pg_collation co ON co.oid = a.attcollation
+                       LEFT JOIN pg_catalog.pg_namespace cn ON cn.oid = co.collnamespace
                       WHERE a.attrelid = $1 AND a.attname = ANY($2)
                         AND a.attnum > 0 AND NOT a.attisdropped"
                 ),
@@ -154,7 +156,10 @@ async fn read_plan(c: &PgConnector, schema: &TableSchema) -> Result<Vec<ReadColu
             ));
         }
         let collation = match (r.get::<_, Option<String>>(4), r.get::<_, Option<bool>>(5)) {
-            (Some(name), Some(true)) => Some(KeyCollation::Own(name)),
+            (Some(name), Some(true)) => Some(KeyCollation::Own {
+                qualified: format!("{}.{}", ident(r.get(7)), ident(&name)),
+                name,
+            }),
             (Some(_), _) => Some(KeyCollation::C),
             (None, _) => None,
         };
@@ -219,14 +224,15 @@ fn cast(c: &ReadColumn, text: &str) -> String {
     }
 }
 
-/// A key value in a keyset comparison: [`cast`], collated like the column's [`key_expr`]. A cast
-/// literal's collation yields to the column's own.
+/// A key value in a keyset comparison: [`cast`], collated like the column's [`key_expr`], named
+/// with its schema. Explicitly: a cast to a domain with a collation of its own carries that one,
+/// which conflicts with the column's (42P22, DA-SRC-15).
 fn key_value(c: &ReadColumn, text: &str) -> String {
     let cast = cast(c, text);
-    if c.collation == Some(KeyCollation::C) {
-        format!("{cast} COLLATE \"C\"")
-    } else {
-        cast
+    match &c.collation {
+        Some(KeyCollation::C) => format!("{cast} COLLATE \"C\""),
+        Some(KeyCollation::Own { qualified, .. }) => format!("{cast} COLLATE {qualified}"),
+        None => cast,
     }
 }
 
@@ -477,6 +483,12 @@ impl PgConnector {
         after: Option<&KeysetCursor>,
         limit: usize,
     ) -> Result<Chunk, SourceError> {
+        // An empty chunk ends the table: one of no rows asked would end it early (DA-SRC-15).
+        if limit == 0 {
+            return Err(SourceError::Permanent(
+                "a snapshot chunk of 0 rows: chunk_size is at least 1 (V-108)".into(),
+            ));
+        }
         let columns = read_plan(self, table).await?;
         let keys = key_columns(table, &columns);
         let collation = cursor_collation(&keys);
@@ -767,7 +779,12 @@ mod tests {
 
     #[test]
     fn keys_compare_in_one_deterministic_collation() {
-        let own = || Some(KeyCollation::Own("en_US.utf8".into()));
+        let own = || {
+            Some(KeyCollation::Own {
+                name: "en_US.utf8".into(),
+                qualified: "\"pg_catalog\".\"en_US.utf8\"".into(),
+            })
+        };
         assert_eq!(
             key_expr(&rc("code", "text", Some(KeyCollation::C))),
             "src.\"code\" COLLATE \"C\""
@@ -783,8 +800,8 @@ mod tests {
         );
         assert_eq!(
             key_value(&rc("code", "character varying(10)", own()), "it's"),
-            "'it''s'::character varying(10)",
-            "the column's own collation wins over the literal's"
+            "'it''s'::character varying(10) COLLATE \"pg_catalog\".\"en_US.utf8\"",
+            "the column's own collation, named with its schema, over a domain's"
         );
         assert_eq!(
             key_value(&rc("id", "numeric(10,2)", None), "1.50"),

@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::decide::{Decision, Facts, Plan, decide};
 use crate::jobs::Jobs;
-use crate::schema_change::{Planned, soft_dropped};
+use crate::schema_change::{Planned, missing_columns, soft_dropped};
 use crate::session::{Core, End, Session};
 use crate::settings::Settings;
 use crate::status::Streak;
@@ -678,6 +678,36 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
                     }
                 }
             }
+            // No schema cached for a table the sink holds (a wiped state): baselined against the
+            // sink table's columns (DA-SNAP-13).
+            None if state.exists && baseline => {
+                let adds = match state.schema.as_deref().map(|s| missing_columns(s, now)) {
+                    Some(Ok(adds)) => adds,
+                    Some(Err(reason)) => {
+                        halts.push((table.clone(), reason));
+                        tracked.insert(table.clone());
+                        continue;
+                    }
+                    None => vec![],
+                };
+                if !adds.is_empty() {
+                    let evolver = core.evolver();
+                    let applied = match evolver.evolution {
+                        true => evolver.evolve(table, adds).await?,
+                        false => Err(HaltReason::EvolutionDisabled),
+                    };
+                    match applied {
+                        Ok(None) => {}
+                        Ok(Some(w)) => warnings.push(w),
+                        Err(reason) => {
+                            halts.push((table.clone(), reason));
+                            tracked.insert(table.clone());
+                            continue;
+                        }
+                    }
+                    evolved = true;
+                }
+            }
             Some(_) if cleared.contains(table) => {}
             Some(c) if matches!(plan, Plan::Resume) && c.columns() != now.columns() => {
                 drifted.insert(table.clone());
@@ -917,13 +947,15 @@ mod tests {
     use data_avalanche_core::position::Lsn;
     use data_avalanche_core::{
         ColumnSchema, ColumnValue, ColumnValueType as V, Row, SchemaChange, SchemaDelta,
-        ServerIdentity, SourcePosition,
+        ServerIdentity, SourcePosition, upsert_schema,
     };
     use data_avalanche_state::{PositionDoc, SlotDoc};
     use data_avalanche_testkit::{FakeTxn, Method, SinkOp};
 
     use super::*;
-    use crate::test_support::{Countdown, CrashAt, World, Yaml, fast, row, t, wait_until};
+    use crate::test_support::{
+        Countdown, CrashAt, World, Yaml, docs, fast, row, schema, t, wait_until,
+    };
     use crate::{Backoff, HookPoint};
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
@@ -1614,6 +1646,58 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("lost the stream position"))
         );
+    }
+
+    /// The pipeline's state is gone, and the sink still holds its table: the start adds the
+    /// columns the source gained, before the copy writes them (DA-SNAP-13).
+    #[tokio::test]
+    async fn a_wiped_state_baselines_against_the_sink_table() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let noted = TableSchema::new(
+            t("a"),
+            vec![
+                ColumnSchema::new("id", V::Int64, "bigint").not_null(),
+                ColumnSchema::new("doc", V::Text, "text"),
+                ColumnSchema::new("note", V::Text, "text"),
+            ],
+            vec!["id".into()],
+        )
+        .unwrap();
+        w.source.alter(&t("a"), noted);
+        let wiped = World {
+            source: w.source.clone(),
+            sink: w.sink.clone(),
+            docs: docs().0,
+        };
+        let (end, st) = run(&wiped, &mode("mode: initial"), async |status| {
+            streamed(&status, &wiped).await;
+        })
+        .await;
+        end.unwrap();
+        assert!(st.halted.is_empty(), "{:?}", st.halted);
+        let state = w.sink.table_state(&t("a")).await.unwrap();
+        assert!(state.schema.unwrap().field_with_name("note").is_ok());
+    }
+
+    /// A sink table without the source's key column is keyed otherwise: it halts.
+    #[test]
+    fn a_sink_table_without_the_key_column_halts() {
+        let sink = upsert_schema(&schema("a"));
+        let rekeyed = TableSchema::new(
+            t("a"),
+            vec![
+                ColumnSchema::new("uid", V::Int64, "bigint").not_null(),
+                ColumnSchema::new("doc", V::Text, "text"),
+            ],
+            vec!["uid".into()],
+        )
+        .unwrap();
+        assert!(matches!(
+            missing_columns(&sink, &rekeyed),
+            Err(HaltReason::SchemaMismatch { column, .. }) if column == "uid"
+        ));
+        assert!(missing_columns(&sink, &schema("a")).unwrap().is_empty());
     }
 
     #[tokio::test]

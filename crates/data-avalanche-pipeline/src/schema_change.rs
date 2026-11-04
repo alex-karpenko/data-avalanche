@@ -28,6 +28,34 @@ pub(crate) fn soft_dropped(sink: &Schema, source: &TableSchema) -> usize {
         .count()
 }
 
+/// A table the sink holds while the pipeline has no schema cached for it (a wiped state,
+/// DA-SNAP-13): the source's columns the sink table lacks, by name, as the `AddColumn`s that
+/// baseline it before the copy. A column it holds as another type still surfaces at the first
+/// commit (`SINK_REJECTED`); one the source lacks stays, soft-dropped. A key column it lacks can't
+/// be added: the table is keyed otherwise, and halts.
+pub(crate) fn missing_columns(
+    sink: &Schema,
+    source: &TableSchema,
+) -> Result<Vec<SchemaChange>, HaltReason> {
+    let mut adds = vec![];
+    for c in source.columns() {
+        if sink.field_with_name(&c.name).is_ok() {
+            continue;
+        }
+        if source.is_identifier(&c.name) {
+            return Err(HaltReason::SchemaMismatch {
+                column: c.name.clone(),
+                detail:
+                    "the sink table, made by a run whose state is gone, lacks this key column; \
+                         drop the sink table for a new copy"
+                        .into(),
+            });
+        }
+        adds.push(SchemaChange::AddColumn(c.clone()));
+    }
+    Ok(adds)
+}
+
 /// A change to apply: the table's new schema, and the changes the sink must evolve.
 #[derive(Debug)]
 pub(crate) struct Planned {

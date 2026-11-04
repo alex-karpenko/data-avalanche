@@ -27,7 +27,7 @@ use mysql_async::{IsolationLevel, TxOpts, Value};
 
 use crate::catalog::table_key;
 use crate::connector::MySqlConnector;
-use crate::types::{CatalogColumn, plan_column};
+use crate::types::{CatalogColumn, members, plan_column};
 use crate::value::{self, Decode, Input};
 
 /// How to read one column of a table.
@@ -116,6 +116,18 @@ async fn read_plan(
                 ),
             ));
         }
+        // An ENUM or SET key sorts by member index, and a chunk resumes at its cursor's label's
+        // index: members moved since the schema would skip or repeat rows (DA-SNAP-14). The
+        // stream halts the table at the change; until it reaches it, the chunk waits.
+        if identifier && moved(&CatalogColumn::from_schema(col), catalog) {
+            return Err(changed(
+                schema,
+                format!(
+                    "key column {} is now {}, the schema has {}",
+                    col.name, catalog.column_type, col.source_type
+                ),
+            ));
+        }
         out.push(ReadColumn {
             catalog: catalog.clone(),
             decode: p.decode,
@@ -123,6 +135,13 @@ async fn read_plan(
         });
     }
     Ok(out)
+}
+
+/// An ENUM or SET column whose members the catalog no longer lists in the schema's order:
+/// appending keeps every member's index, anything else may not.
+fn moved(schema: &CatalogColumn, catalog: &CatalogColumn) -> bool {
+    matches!(catalog.data_type.as_str(), "enum" | "set")
+        && !members(&catalog.column_type).starts_with(&members(&schema.column_type))
 }
 
 /// The decode an override wraps: the column's own type, which orders the key.
@@ -373,6 +392,12 @@ impl MySqlConnector {
         after: Option<&KeysetCursor>,
         limit: usize,
     ) -> Result<Chunk, SourceError> {
+        // An empty chunk ends the table: one of no rows asked would end it early (DA-SRC-15).
+        if limit == 0 {
+            return Err(SourceError::Permanent(
+                "a snapshot chunk of 0 rows: chunk_size is at least 1 (V-108)".into(),
+            ));
+        }
         let columns = read_plan(self, table).await?;
         let keys = key_columns(table, &columns);
         let collation = cursor_collation(&keys);
@@ -486,6 +511,24 @@ mod tests {
 
     use super::*;
     use crate::value::Charset;
+
+    /// An ENUM or SET key's members moved, not appended, are a change under the snapshot
+    /// (DA-SNAP-14).
+    #[test]
+    fn an_enum_key_s_moved_members_are_seen() {
+        let c = |t: &str| CatalogColumn {
+            data_type: t.split('(').next().unwrap().into(),
+            column_type: t.into(),
+            ..CatalogColumn::default()
+        };
+        let was = c("enum('a','b')");
+        assert!(!moved(&was, &c("enum('a','b')")));
+        assert!(!moved(&was, &c("enum('a','b','c')")), "appended");
+        assert!(moved(&was, &c("enum('b','a')")), "reordered");
+        assert!(moved(&was, &c("enum('a','c','b')")), "inserted");
+        assert!(moved(&c("set('x','y')"), &c("set('y','x')")));
+        assert!(!moved(&c("int"), &c("int")));
+    }
 
     /// The errors of this table's read alone halt the table; a table or column gone keeps its own
     /// path; the rest end the pipeline (DA-SRC-19).

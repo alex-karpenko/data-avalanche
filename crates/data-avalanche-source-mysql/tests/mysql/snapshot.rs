@@ -177,6 +177,10 @@ async fn every_key_type_walks_in_the_servers_order() {
             t.table(),
             cursors[0].collation
         );
+        assert!(
+            matches!(c.read_chunk(t, None, 0).await, Err(SourceError::Permanent(m)) if m.contains("0 rows")),
+            "a chunk of no rows isn't the table's end"
+        );
     }
     cleanup(&n).await;
 }
