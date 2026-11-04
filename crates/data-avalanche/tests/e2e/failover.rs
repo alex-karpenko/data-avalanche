@@ -32,14 +32,15 @@ fn halted_with(log: &str, code: &str) -> bool {
         .any(|l| l.contains("pipeline in ERROR") && l.contains(&format!("code=\"{code}\"")))
 }
 
-/// The keys of `items` on `db`, in order.
-async fn ids(db: &Db, schema: &str) -> Vec<i64> {
-    db.text(&format!("SELECT id FROM {schema}.items ORDER BY id"))
+/// The promoted server's current WAL position.
+async fn wal_lsn(db: &Db) -> u64 {
+    db.text("SELECT (pg_current_wal_lsn() - '0/0'::pg_lsn)::bigint")
         .await
-        .expect("the ids")
-        .into_iter()
-        .map(|r| r[0].as_deref().expect("an id").parse().expect("a number"))
-        .collect()
+        .expect("the LSN")[0][0]
+        .as_deref()
+        .expect("an LSN")
+        .parse::<u64>()
+        .expect("a number")
 }
 
 /// The lake holds `want`, within a minute.
@@ -87,11 +88,18 @@ async fn a_promoted_replica_halts_the_pipeline_then_re_snapshots_on_request() {
     let mut p = e.start(&[]);
     p.ready().await;
     holds(&e, &[1, 2, 3, 4, 5]).await;
+    let first_doc = e.completed("items", None).await;
     e.streaming().await;
     eventually(
         "the replica has 1..5",
         Duration::from_secs(30),
-        async || ids(&standby, &s).await.len() == 5,
+        async || {
+            standby
+                .text(&format!("SELECT id FROM {s}.items"))
+                .await
+                .map(|r| r.len() == 5)
+                .unwrap_or(false)
+        },
     )
     .await;
 
@@ -119,30 +127,28 @@ async fn a_promoted_replica_halts_the_pipeline_then_re_snapshots_on_request() {
     let marker = e.marker("items").await;
 
     // The failover: the replica, promoted, takes writes on a timeline of its own.
-    standby
-        .exec("SELECT pg_promote()")
+    let promoted = standby
+        .text("SELECT pg_promote()")
         .await
         .expect("the promotion");
+    assert_eq!(
+        promoted[0][0].as_deref(),
+        Some("t"),
+        "pg_promote() didn't finish promoting the replica"
+    );
     standby
         .exec(&format!(
             "INSERT INTO {s}.items VALUES (11, 'r'), (12, 'r')"
         ))
         .await
         .expect("writes on the promoted replica");
-    let lsn = standby
-        .text("SELECT (pg_current_wal_lsn() - '0/0'::pg_lsn)::bigint")
-        .await
-        .expect("the LSN")[0][0]
-        .as_deref()
-        .expect("an LSN")
-        .parse::<u64>()
-        .expect("a number");
+    let lsn = wal_lsn(&standby).await;
     let SourcePosition::Pg(Lsn(marked)) = marker else {
         panic!("a PostgreSQL marker: {marker}")
     };
     assert!(
         lsn < marked,
-        "the promoted replica's LSN {lsn} is below the lake's marker {marked}: the guard would skip its changes"
+        "the promoted replica's LSN {lsn} isn't below the lake's marker {marked}: the scenario proves nothing"
     );
 
     // The pipeline moved to the promoted replica (a source change restarts it): its start
@@ -173,6 +179,17 @@ async fn a_promoted_replica_halts_the_pipeline_then_re_snapshots_on_request() {
     assert_eq!(p.reload().await.0, 202);
     assert_eq!(p.ask(&e.test, "restart").await.0, 202);
     p.metric(&e.status("running")).await;
+    // The re-snapshot is over (its last chunk read too), so row 13 below can only come by stream.
+    e.completed("items", Some(&first_doc)).await;
+    // Every table's marker is reset to the new server's position, below the old marker.
+    let reset = e.marker("items").await;
+    let SourcePosition::Pg(Lsn(reset)) = reset else {
+        panic!("a PostgreSQL marker: {reset}")
+    };
+    assert!(
+        reset < marked,
+        "the marker {reset} wasn't reset below the old marker {marked}"
+    );
     // Rows 6–10 are ghosts: the promoted server never had them, and a snapshot adds and
     // updates rows but deletes none.
     holds(&e, &(1..=12).collect::<Vec<_>>()).await;
@@ -181,6 +198,12 @@ async fn a_promoted_replica_halts_the_pipeline_then_re_snapshots_on_request() {
         .await
         .expect("a write after the recovery");
     holds(&e, &(1..=13).collect::<Vec<_>>()).await;
+    // The stream delivered a change at an LSN below the old marker.
+    let streamed = wal_lsn(&standby).await;
+    assert!(
+        streamed < marked,
+        "row 13 at {streamed}, old marker {marked}"
+    );
     let log = p.log();
     assert!(
         log.contains("source_change_action is re_snapshot, so the pipeline re-snapshots"),

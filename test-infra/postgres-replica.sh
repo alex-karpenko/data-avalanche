@@ -12,5 +12,5 @@ chmod 700 "$data"
 if [ ! -s "$data/PG_VERSION" ]; then
   gosu postgres pg_basebackup -h postgres-primary -U avalanche -D "$data" -R -X stream -c fast
 fi
-shift
+[ $# -gt 0 ] && shift
 exec gosu postgres postgres -D "$data" "$@"

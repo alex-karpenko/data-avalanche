@@ -448,7 +448,7 @@ mod tests {
     }
 
     /// `require`, `prefer` and `allow` take any certificate by any name, as libpq does without
-    /// a root certificate, and still check the handshake's signature schemes (DA-SRC-18).
+    /// a root certificate, and offer the provider's signature schemes (DA-SRC-18).
     #[test]
     fn unverified_takes_any_certificate() {
         let (server, _, stranger) = server_material();

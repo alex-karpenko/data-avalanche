@@ -119,7 +119,8 @@ the pipeline to it: the start halts with `WAL_SOURCE_CHANGED`, and under
 `source_change_action: re_snapshot` it re-snapshots from the promoted server. The replica is made
 from the primary's base backup at its first start. The scenario promotes it, so the pair serves
 one run: recreate both before the next (the scenario fails with this hint when the replica isn't
-in recovery).
+in recovery). CI's integration job starts the pair fresh and sets `DATA_AVALANCHE_PG_REPLICA`, so
+it runs the scenario.
 
 ```sh
 docker compose -f test-infra/compose.yaml --profile replica up -d --wait --force-recreate postgres-primary postgres-replica

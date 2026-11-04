@@ -34,7 +34,7 @@ services:
   # A primary and its streaming standby (profile replica), for the failover E2E
   # (crates/data-avalanche/tests/e2e/failover.rs): the test promotes the standby, so the pair is
   # good for one run. Both on tmpfs; recreate both for the next run:
-  #   docker compose --profile replica up -d --force-recreate postgres-primary postgres-replica
+  #   docker compose -f test-infra/compose.yaml --profile replica up -d --wait --force-recreate postgres-primary postgres-replica
   postgres-primary:
     <<: *pg
     image: "postgres:18"
