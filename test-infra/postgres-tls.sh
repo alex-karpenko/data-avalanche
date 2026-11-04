@@ -35,7 +35,7 @@ HBA
 mkdir -p /docker-entrypoint-initdb.d
 echo "CREATE ROLE avalanche_cert SUPERUSER LOGIN REPLICATION PASSWORD 'unused';" \
   > /docker-entrypoint-initdb.d/cert-role.sql
-exec docker-entrypoint.sh postgres -c wal_level=logical -c max_replication_slots=20 \
-  -c max_wal_senders=20 -c ssl=on -c ssl_cert_file="$server/server.crt" \
+# "$@": the compose anchor's command (`postgres` and the settings every PostgreSQL service shares).
+exec docker-entrypoint.sh "$@" -c ssl=on -c ssl_cert_file="$server/server.crt" \
   -c ssl_key_file="$server/server.key" -c ssl_ca_file="$server/ca.crt" \
   -c hba_file="$server/pg_hba.conf"

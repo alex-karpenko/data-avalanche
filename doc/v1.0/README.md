@@ -67,6 +67,7 @@ This folder holds the plan for **building** v1. The design it implements is in `
 | `DATA_AVALANCHE_CLOUD=s3\|azure` (from M2) | Real S3 / Azure conformance runs (`cloud.yml`) |
 | `DATA_AVALANCHE_MYSQL=<target>` (from M7a) | The MySQL or MariaDB server and position mode of the MySQL source's integration tests, and of the E2E suite on MySQL (`test-infra/README.md`; default `mysql-84`) |
 | `DATA_AVALANCHE_E2E_SOURCE=postgres\|mysql` (from M7b) | The source the slice-1 E2E suite runs on (default `postgres`; `mysql` reads `DATA_AVALANCHE_MYSQL`) |
+| `DATA_AVALANCHE_PG_REPLICA=<primary port>:<replica port>` (from M12a) | The PostgreSQL failover E2E scenario on `test-infra`'s `replica` profile (`55420:55421`); unset, it is skipped |
 
 CI secrets and variables are listed in `test-infra/README.md` ("CI requirements") and in the comments
 of `.github/workflows/ci.yml`.

@@ -11,6 +11,7 @@ on `PATH`; it fetches DuckDB itself.
 | postgres-18 | postgres:18 | 55418 | avalanche / avalanche, db `avalanche` | default |
 | postgres-14…17 | postgres:14…17 | 55414…55417 | same | matrix |
 | postgres-tls | postgres:18, TLS required (`postgres-tls.sh`) | 55419 | avalanche / avalanche; `avalanche_cert` by client certificate | default |
+| postgres-primary, postgres-replica | postgres:18, a primary and its streaming standby (`postgres-primary.sh`, `postgres-replica.sh`), on tmpfs | 55420, 55421 | avalanche / avalanche | replica |
 | mysql-84 | mysql:8.4 (GTID on) | 53384 | root / avalanche, db `avalanche` | default |
 | mysql-84-nogtid | mysql:8.4 (GTID off: `replication_type: binlog`; TLS off) | 53385 | same | default |
 | mysql-tls | mysql:8.4 (GTID on), TLS required (`mysql-tls.sh`) | 53386 | root / avalanche; `avalanche_cert` / `unused` with its client certificate | default |
@@ -110,6 +111,22 @@ through a node that doesn't hold it, and leaves and shuts a node down through th
 snapshot-job scenarios (M9b, `jobs.rs`) need nothing more either: they ask for jobs through the
 API, drop and create a table again to halt it, and `kill -9` the process while a job reads.
 
+## The PostgreSQL failover (replica)
+
+The failover scenario (`crates/data-avalanche/tests/e2e/failover.rs`, M12a) runs a pipeline on
+`postgres-primary`, cuts `postgres-replica` off from it, writes on, promotes the replica and moves
+the pipeline to it: the start halts with `WAL_SOURCE_CHANGED`, and under
+`source_change_action: re_snapshot` it re-snapshots from the promoted server. The replica is made
+from the primary's base backup at its first start. The scenario promotes it, so the pair serves
+one run: recreate both before the next (the scenario fails with this hint when the replica isn't
+in recovery).
+
+```sh
+docker compose -f test-infra/compose.yaml --profile replica up -d --wait --force-recreate postgres-primary postgres-replica
+DATA_AVALANCHE_IT=1 DATA_AVALANCHE_SKIP_GCS=1 DATA_AVALANCHE_PG_REPLICA=55420:55421 \
+  cargo test -p data-avalanche --features e2e-hooks --test e2e -- failover:: --test-threads=1
+```
+
 ## The smoke deploy (k3s)
 
 The Helm chart's scenario (`crates/data-avalanche/tests/e2e/k3s.rs`, M11a) installs the chart
@@ -128,7 +145,7 @@ DATA_AVALANCHE_IT=1 DATA_AVALANCHE_SKIP_GCS=1 DATA_AVALANCHE_K3S=1 \
 
 The kubelet evicts only under 1% free disk (`compose.yaml`): a laptop's Docker disk is often
 fuller than the default thresholds (10–15%) allow, which taints the node and schedules nothing.
-`test-infra/down.sh` stops k3s with the rest.
+`test-infra/down.sh` stops k3s and the replica pair with the rest.
 
 ## GCS: a real bucket, not an emulator
 

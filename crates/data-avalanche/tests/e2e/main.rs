@@ -9,6 +9,7 @@
 mod api;
 mod cluster;
 mod crashes;
+mod failover;
 mod forwarder;
 mod guards;
 mod harness;

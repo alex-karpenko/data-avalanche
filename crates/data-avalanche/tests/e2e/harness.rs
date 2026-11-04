@@ -129,7 +129,11 @@ impl E2e {
     /// or database and user (MySQL), runs `ddl` in it, and writes the config. On PostgreSQL it
     /// resets the server-wide `max_slot_wal_keep_size` first.
     pub async fn new(test: &str, ddl: &str, o: Options<'_>) -> Self {
-        let source = Source::from_env();
+        Self::on(Source::from_env(), test, ddl, o).await
+    }
+
+    /// [`Self::new`] on `source` rather than the suite's.
+    pub async fn on(source: Source, test: &str, ddl: &str, o: Options<'_>) -> Self {
         let db = Db::connect(source).await;
         let schema = format!("e2e_{test}");
         match source {
