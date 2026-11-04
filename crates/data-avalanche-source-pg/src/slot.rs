@@ -154,6 +154,107 @@ pub(crate) fn qualified(t: &TableRef) -> String {
     format!("{}.{}", ident(&t.schema), ident(&t.name))
 }
 
+/// What a publication publishes beyond its table list (DA-SRC-13), by server version.
+#[derive(Debug, Default)]
+struct Shape {
+    /// Its tables by name (`pg_publication_rel`): what `DROP TABLE` can take out.
+    members: Vec<TableRef>,
+    /// PostgreSQL 15+: its member tables with a row filter or a column list.
+    filtered: Vec<TableRef>,
+    /// PostgreSQL 15+: the schemas it publishes (`FOR TABLES IN SCHEMA`).
+    schemas: Vec<String>,
+    /// PostgreSQL 18+: `publish_generated_columns = stored`.
+    generated_columns: bool,
+    /// Of `tables`, those with a stored generated column (read when it publishes them).
+    generated: Vec<TableRef>,
+}
+
+async fn publication_shape(
+    client: &Client,
+    name: &str,
+    version: i32,
+    tables: &[TableRef],
+) -> Result<Shape, tokio_postgres::Error> {
+    let table =
+        |r: &tokio_postgres::Row| TableRef::new(r.get::<_, String>(0), r.get::<_, String>(1));
+    let rows = if version >= 150_000 {
+        client
+            .query(
+                "SELECT n.nspname::text, c.relname::text,
+                        r.prqual IS NOT NULL OR r.prattrs IS NOT NULL
+                   FROM pg_catalog.pg_publication_rel r
+                   JOIN pg_catalog.pg_publication p ON p.oid = r.prpubid
+                   JOIN pg_catalog.pg_class c ON c.oid = r.prrelid
+                   JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                  WHERE p.pubname = $1",
+                &[&name],
+            )
+            .await?
+    } else {
+        client
+            .query(
+                "SELECT n.nspname::text, c.relname::text, false
+                   FROM pg_catalog.pg_publication_rel r
+                   JOIN pg_catalog.pg_publication p ON p.oid = r.prpubid
+                   JOIN pg_catalog.pg_class c ON c.oid = r.prrelid
+                   JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                  WHERE p.pubname = $1",
+                &[&name],
+            )
+            .await?
+    };
+    let mut shape = Shape {
+        members: rows.iter().map(table).collect(),
+        filtered: rows.iter().filter(|r| r.get(2)).map(table).collect(),
+        ..Shape::default()
+    };
+    if version >= 150_000 {
+        shape.schemas = client
+            .query(
+                "SELECT n.nspname::text
+                   FROM pg_catalog.pg_publication_namespace pn
+                   JOIN pg_catalog.pg_publication p ON p.oid = pn.pnpubid
+                   JOIN pg_catalog.pg_namespace n ON n.oid = pn.pnnspid
+                  WHERE p.pubname = $1 ORDER BY 1",
+                &[&name],
+            )
+            .await?
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+    }
+    if version >= 180_000 {
+        shape.generated_columns = client
+            .query_one(
+                "SELECT pubgencols = 's' FROM pg_catalog.pg_publication WHERE pubname = $1",
+                &[&name],
+            )
+            .await?
+            .get(0);
+    }
+    if shape.generated_columns {
+        let schemas: Vec<&str> = tables.iter().map(|t| t.schema.as_str()).collect();
+        let names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
+        shape.generated = client
+            .query(
+                "SELECT DISTINCT n.nspname::text, c.relname::text
+                   FROM pg_catalog.pg_class c
+                   JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                   JOIN unnest($1::text[], $2::text[]) AS w(s, t)
+                     ON w.s = n.nspname AND w.t = c.relname
+                   JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
+                  WHERE a.attgenerated = 's' AND NOT a.attisdropped
+                  ORDER BY 1, 2",
+                &[&schemas, &names],
+            )
+            .await?
+            .iter()
+            .map(table)
+            .collect();
+    }
+    Ok(shape)
+}
+
 /// The tables among `tables` that are partitions (`relispartition`).
 async fn partitions(
     client: &Client,
@@ -335,7 +436,7 @@ impl PgConnector {
                 "read the publication",
                 client.query_opt(
                     "SELECT puballtables, pubinsert AND pubupdate AND pubdelete AND pubtruncate,
-                            pubviaroot
+                            pubviaroot, current_setting('server_version_num')::int
                        FROM pg_catalog.pg_publication WHERE pubname = $1",
                     &[name],
                 ),
@@ -364,8 +465,8 @@ impl PgConnector {
                 ..Reconciled::default()
             });
         };
-        let (all_tables, every_op, via_root): (bool, bool, bool) =
-            (row.get(0), row.get(1), row.get(2));
+        let (all_tables, every_op, via_root, version): (bool, bool, bool, i32) =
+            (row.get(0), row.get(1), row.get(2), row.get(3));
         let published: BTreeSet<TableRef> = self
             .conn
             .command(
@@ -384,15 +485,55 @@ impl PgConnector {
             .copied()
             .filter(|t| !published.contains(*t))
             .collect();
+        let shape = self
+            .conn
+            .command(
+                "read what the publication publishes",
+                publication_shape(client, name, version, tables),
+            )
+            .await?;
+        let filtered: Vec<String> = shape
+            .filtered
+            .iter()
+            .filter(|t| wanted.contains(t))
+            .map(table_key)
+            .collect();
         let mut warnings = vec![];
         if !managed || all_tables {
+            // A tracked table's row filter or column list (PostgreSQL 15+) keeps some of its rows
+            // or columns from the stream (DA-SRC-13).
+            if !filtered.is_empty() {
+                return Err(SourceError::Permanent(format!(
+                    "publication {name} publishes {} with a row filter or a column list, so some \
+                     of the changes the pipeline replicates wouldn't arrive; publish the tables \
+                     whole (ALTER PUBLICATION … DROP TABLE, then ADD TABLE without WHERE or a \
+                     column list)",
+                    filtered.join(", ")
+                )));
+            }
+            // PostgreSQL 18 publishes stored generated columns when asked, which the pipeline
+            // doesn't replicate.
+            if shape.generated_columns && !shape.generated.is_empty() {
+                let list: Vec<String> = shape.generated.iter().map(table_key).collect();
+                return Err(SourceError::Permanent(format!(
+                    "publication {name} publishes stored generated columns (of {}), which the \
+                     pipeline doesn't replicate; run ALTER PUBLICATION {} SET \
+                     (publish_generated_columns = none)",
+                    list.join(", "),
+                    ident(name)
+                )));
+            }
             // Q-M5-5: a partition's changes would arrive under its parent's name, which isn't
-            // tracked, so the stream would drop them. Refused, not warned: it would lose data.
+            // tracked, so the stream would drop them. Refused, not warned: it would lose data. A
+            // partition the publication names itself arrives under its own.
             if via_root {
-                let leaves = self
+                let leaves: Vec<TableRef> = self
                     .conn
                     .command("find partitions", partitions(client, tables))
-                    .await?;
+                    .await?
+                    .into_iter()
+                    .filter(|l| !published.contains(l))
+                    .collect();
                 if !leaves.is_empty() {
                     let list: Vec<String> = leaves.iter().map(table_key).collect();
                     return Err(SourceError::Permanent(format!(
@@ -412,35 +553,85 @@ impl PgConnector {
                     "publication {name} doesn't publish every operation; set publish = 'insert, update, delete, truncate'"
                 ));
             }
+            // The server decodes the other tables' changes for the slot, and the stream drops
+            // them (D-M5.14).
+            let others: Vec<String> = published
+                .iter()
+                .filter(|t| !wanted.contains(t))
+                .map(table_key)
+                .collect();
+            if !others.is_empty() {
+                let shown = others
+                    .iter()
+                    .take(5)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let more = match others.len() {
+                    n if n > 5 => format!(" and {} more", n - 5),
+                    _ => String::new(),
+                };
+                warnings.push(format!(
+                    "publication {name} also publishes tables the pipeline doesn't replicate \
+                     ({shown}{more}): the server decodes their changes for the slot, and the \
+                     pipeline drops them"
+                ));
+            }
             return Ok(Reconciled {
                 warnings,
                 ..Reconciled::default()
             });
         }
         let mut sql = vec![];
-        if !missing.is_empty() {
-            let list: Vec<String> = missing.iter().map(|t| qualified(t)).collect();
+        // A row filter, a column list or a schema the publication publishes can't be taken out
+        // table by table (a schema's table isn't a member to drop, 42704): the managed
+        // publication is set to the tracked tables whole.
+        let reset = !filtered.is_empty() || !shape.schemas.is_empty();
+        let list: Vec<String> = tables.iter().map(qualified).collect();
+        if reset && !list.is_empty() {
             sql.push(format!(
-                "ALTER PUBLICATION {} ADD TABLE {}",
+                "ALTER PUBLICATION {} SET TABLE {}",
                 ident(name),
                 list.join(", ")
             ));
+        } else {
+            if !shape.schemas.is_empty() {
+                let schemas: Vec<String> = shape.schemas.iter().map(|s| ident(s)).collect();
+                sql.push(format!(
+                    "ALTER PUBLICATION {} DROP TABLES IN SCHEMA {}",
+                    ident(name),
+                    schemas.join(", ")
+                ));
+            }
+            if !missing.is_empty() {
+                let list: Vec<String> = missing.iter().map(|t| qualified(t)).collect();
+                sql.push(format!(
+                    "ALTER PUBLICATION {} ADD TABLE {}",
+                    ident(name),
+                    list.join(", ")
+                ));
+            }
+            let extra: Vec<String> = shape
+                .members
+                .iter()
+                .filter(|t| !wanted.contains(t))
+                .map(qualified)
+                .collect();
+            if !extra.is_empty() {
+                sql.push(format!(
+                    "ALTER PUBLICATION {} DROP TABLE {}",
+                    ident(name),
+                    extra.join(", ")
+                ));
+            }
         }
-        let extra: Vec<String> = published
-            .iter()
-            .filter(|t| !wanted.contains(t))
-            .map(qualified)
-            .collect();
-        if !extra.is_empty() {
+        if !every_op || via_root || shape.generated_columns {
+            let generated = match shape.generated_columns {
+                true => ", publish_generated_columns = none",
+                false => "",
+            };
             sql.push(format!(
-                "ALTER PUBLICATION {} DROP TABLE {}",
-                ident(name),
-                extra.join(", ")
-            ));
-        }
-        if !every_op || via_root {
-            sql.push(format!(
-                "ALTER PUBLICATION {} SET (publish = 'insert, update, delete, truncate', publish_via_partition_root = false)",
+                "ALTER PUBLICATION {} SET (publish = 'insert, update, delete, truncate', publish_via_partition_root = false{generated})",
                 ident(name)
             ));
         }
@@ -454,7 +645,10 @@ impl PgConnector {
                 .is_empty();
         Ok(Reconciled {
             sql,
-            rewritten: !every_op || partitioned,
+            rewritten: !every_op
+                || partitioned
+                || !filtered.is_empty()
+                || (shape.generated_columns && !shape.generated.is_empty()),
             added: missing.into_iter().cloned().collect(),
             warnings,
         })

@@ -540,6 +540,142 @@ async fn a_slot_of_another_plugin_is_refused() {
     cleanup(&a, &n).await;
 }
 
+/// What a publication publishes besides its table list (DA-SRC-13): a tracked table's row filter
+/// or column list, and stored generated columns (PostgreSQL 18), are refused under
+/// `require_existing` and repaired under `managed`; tables the pipeline doesn't track are warned;
+/// a partition the publication names itself isn't refused for `publish_via_partition_root`; a
+/// managed publication of a schema is set to the tracked tables.
+#[tokio::test]
+async fn a_publication_s_blind_spots_are_refused_warned_or_repaired() {
+    require_it!();
+    let a = admin().await;
+    let version: i32 = a
+        .query_one("SELECT current_setting('server_version_num')::int", &[])
+        .await
+        .unwrap()
+        .get(0);
+    if version < 150_000 {
+        eprintln!("skipped: row filters, column lists and schemas need PostgreSQL 15");
+        return;
+    }
+    let n = fresh(
+        &a,
+        "slot_pub_shape",
+        "CREATE TABLE a (id int PRIMARY KEY, v int);
+         CREATE TABLE b (id int PRIMARY KEY, v int);
+         CREATE TABLE c (id int PRIMARY KEY);
+         CREATE TABLE events (id int, at date, PRIMARY KEY (id, at)) PARTITION BY RANGE (at);
+         CREATE TABLE events_2024 PARTITION OF events FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');",
+    )
+    .await;
+    let s = &n.schema;
+    let start: String = a
+        .query_one(
+            "SELECT lsn::text FROM pg_create_logical_replication_slot($1, 'pgoutput')",
+            &[&n.slot],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let at = Checkpoint::from(SourcePosition::Pg(start.parse().unwrap()));
+    let tracked = [n.table("a"), n.table("b")];
+    let existing = connector(&pipeline(
+        &n,
+        &["*"],
+        "",
+        ", slot_management: require_existing, auto_cleanup: false",
+    ));
+    let publish = |spec: String| {
+        let a = &a;
+        let p = n.publication.clone();
+        async move {
+            a.batch_execute(&format!(
+                "DROP PUBLICATION IF EXISTS {p}; CREATE PUBLICATION {p} {spec}"
+            ))
+            .await
+            .unwrap();
+        }
+    };
+    for spec in [
+        format!("FOR TABLE {s}.a WHERE (id > 0), {s}.b"),
+        format!("FOR TABLE {s}.a, {s}.b (id)"),
+    ] {
+        publish(spec.clone()).await;
+        permanent(
+            existing.prepare(Some(&at), &tracked).await.unwrap_err(),
+            "with a row filter or a column list",
+        );
+    }
+    // A filter on a table the pipeline doesn't track, and the table itself, are only warned.
+    publish(format!("FOR TABLE {s}.a, {s}.b, {s}.c WHERE (id > 0)")).await;
+    let p = existing.prepare(Some(&at), &tracked).await.unwrap();
+    assert_eq!(p.plan, StartPlan::Resume);
+    assert!(
+        p.warnings.iter().any(|w| w.contains(&format!(
+            "also publishes tables the pipeline doesn't replicate ({s}.c)"
+        ))),
+        "{:?}",
+        p.warnings
+    );
+    // A partition named itself arrives under its own name.
+    publish(format!(
+        "FOR TABLE {s}.events_2024 WITH (publish_via_partition_root = true)"
+    ))
+    .await;
+    let p = existing
+        .prepare(Some(&at), &[n.table("events_2024")])
+        .await
+        .unwrap();
+    assert_eq!(p.plan, StartPlan::Resume);
+
+    // Managed: the filter and the schema go, the tracked tables are published whole.
+    publish(format!(
+        "FOR TABLE {s}.a WHERE (id > 0), TABLES IN SCHEMA {s}"
+    ))
+    .await;
+    let managed = connector(&pipeline(&n, &["*"], "", ""));
+    let p = managed.prepare(Some(&at), &tracked).await.unwrap();
+    from(&p.plan, SnapshotReason::PositionLost);
+    assert_eq!(published(&a, &n).await, ["a", "b"]);
+    let filters: i64 = a
+        .query_one(
+            "SELECT count(*) FROM pg_publication_rel r JOIN pg_publication p ON p.oid = r.prpubid
+              WHERE p.pubname = $1 AND (r.prqual IS NOT NULL OR r.prattrs IS NOT NULL)",
+            &[&n.publication],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(filters, 0);
+
+    if version >= 180_000 {
+        a.batch_execute(&format!(
+            "ALTER TABLE {s}.b ADD COLUMN twice int GENERATED ALWAYS AS (v * 2) STORED"
+        ))
+        .await
+        .unwrap();
+        publish(format!(
+            "FOR TABLE {s}.a, {s}.b WITH (publish_generated_columns = stored)"
+        ))
+        .await;
+        permanent(
+            existing.prepare(Some(&at), &tracked).await.unwrap_err(),
+            "publishes stored generated columns",
+        );
+        managed.prepare(Some(&at), &tracked).await.unwrap();
+        let stored: bool = a
+            .query_one(
+                "SELECT pubgencols = 's' FROM pg_publication WHERE pubname = $1",
+                &[&n.publication],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(!stored, "set to none");
+    }
+    cleanup(&a, &n).await;
+}
+
 #[tokio::test]
 async fn a_root_publication_of_tracked_partitions_is_refused() {
     require_it!();
