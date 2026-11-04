@@ -51,22 +51,23 @@ table published with a row filter or a column list (PostgreSQL 15 and later) **h
 the stream, so fixing the publication isn't enough: publish the table whole in one transaction
 (`BEGIN; ALTER PUBLICATION … DROP TABLE …; ALTER PUBLICATION … ADD TABLE …; COMMIT;`), then copy it
 again (see [A halted table](/data-avalanche/runbooks/halted-table/)). Stored generated columns
-(`publish_generated_columns = stored`, PostgreSQL 18) are refused for the whole pipeline, naming
-the `ALTER PUBLICATION` that fixes them.
+(`publish_generated_columns = stored`, PostgreSQL 18) are refused for the whole pipeline when a
+replicated table has one, naming the `ALTER PUBLICATION` that fixes them.
 
 Under `managed` the pipeline makes the publication's tables exactly the tracked set: it drops a
 row filter, a column list, a `TABLES IN SCHEMA` member and any other table, and sets
 `publish_generated_columns = none`. A change to what is published of a tracked table means the WAL
 since the checkpoint was decoded under the old publication, so the pipeline re-snapshots its tables
-as `snapshots.mode` says. A tracked table that wasn't published at all is added and copied alone.
-One that was published through its partitioned root or its schema is added by name, with no copy.
-Tables the publication publishes but the pipeline doesn't replicate are a warning: their changes
-are decoded and dropped.
+as `snapshots.mode` says. A tracked table that wasn't published at all is added and copied alone,
+as `snapshots.mode` says. One that was published through its partitioned root or its schema is added by name, with no copy.
+Under `require_existing` (or `FOR ALL TABLES`), tables the publication publishes but the pipeline
+doesn't replicate are a warning: their changes are decoded and dropped.
 
 **Partitioned tables.** Name the partitions, or a pattern that matches them: each partition
-replicates as its own table. A publication that publishes a replicated partition only through its
-root (`publish_via_partition_root = true`) is refused, since the partition's changes would arrive
-under the parent's name.
+replicates as its own table. Under `require_existing` (or `FOR ALL TABLES`), a publication that
+publishes a replicated partition only through its root (`publish_via_partition_root = true`) is
+refused, since the partition's changes would arrive under the parent's name. A managed publication
+is set to `false`, and the pipeline re-snapshots.
 
 **Large values.** PostgreSQL leaves an unchanged TOASTed value out of an update. With
 `toast_strategy: carry_forward` (the default) the pipeline keeps the value it wrote last;
@@ -121,16 +122,18 @@ a `tables.primary_key` override.
   - servers are told apart by `server_uuid` on MySQL and by `server_id` on MariaDB; on MariaDB the
     position must also be an event boundary of a binlog file the server holds
     (`BINLOG_GTID_POS`);
-  - a checkpoint's file the server doesn't list is a purge's only when it is older than the
+  - a checkpoint's file the server doesn't list is taken as purged only when it is older than the
     server's oldest binlog; a file with another base name, or after the newest, is another
     server's;
   - `binlog_purge_action` decides. `error` (the default) halts the pipeline with
     `BINLOG_SOURCE_CHANGED`. `re_snapshot` starts from the new server's position and copies the
     tables as `snapshots.mode` says; found at a reconnect, the pipeline runs its start again to
     do so (see [A lost position](/data-avalanche/runbooks/position-lost/#the-server-changed-binlog_source_changed)).
-  - A server with the same `server_id` and the same binlog file names, whose file has an event
-    boundary at the checkpoint's offset, can't be told apart. `gtid` doesn't depend on any of
-    this: prefer it.
+
+  Two cases can't be told apart. On MariaDB, a server with the same `server_id` and the same
+  binlog file names, whose file has an event boundary at the checkpoint's offset. On MySQL, a copy
+  of the server with the same `server_uuid` and the same file names. `gtid` doesn't depend on any
+  of this: prefer it.
 
 **`server_id`.** The binlog stream registers as a replica with a server id, and the server ends any
 other stream with the same id. Each pipeline takes its own, derived from its `id` (between

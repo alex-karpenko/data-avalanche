@@ -70,22 +70,22 @@ the tables whole. A replicated table published with a row filter or a column lis
 and later) halts itself: publish it whole in one transaction, then copy it again (see
 [Sources](/data-avalanche/configuration/sources/#postgresql) and
 [A halted table](/data-avalanche/runbooks/halted-table/)). A publication with
-`publish_generated_columns = stored` is refused for the whole pipeline.
+`publish_generated_columns = stored` is refused for the whole pipeline when a replicated table has
+a stored generated column.
 
-A privilege lost later halts the table it was lost on, when a snapshot chunk reads it; the other
+A privilege lost later halts the table it was lost on (MySQL: see its tab), when a snapshot chunk reads it; the other
 tables run on. `SELECT` revoked on one table is the case (PostgreSQL error 42501; MySQL 1142 and
 1143). A revoke on the whole role or schema gives every table the same error, so every table
 halts, and each is copied again once the grant is back (see
 [A halted table](/data-avalanche/runbooks/halted-table/)). A `toast_strategy: re_query` fetch that
 meets the error ends the pipeline's session instead: the pipeline stops in `error`.
 
-A text key in a collation of another schema than `pg_catalog` (a collation you created, or a
-domain with a collation of its own) needs `USAGE` on that collation's schema for the role: the
-snapshot's cursor names the collation with its schema. Without it the chunk read fails with 42501
+A text key whose collation, or whose domain type, lives in a schema other than `pg_catalog` needs
+`USAGE` on that schema for the role: the snapshot's cursor names both with their schema. Without it the chunk read fails with 42501
 and halts the table.
 
 Point the pipeline at the primary: a standby (a server in recovery) is refused on every version
-(see Sources).
+(see [Sources](/data-avalanche/configuration/sources/#postgresql)).
 
 On a managed service, follow its guide to logical replication: on Amazon RDS and Aurora the role
 is granted `rds_replication` and `rds.logical_replication` is set; on Cloud SQL the
@@ -118,6 +118,11 @@ and no `binlog_do_db` or `binlog_ignore_db`.
 CREATE USER 'cdc'@'%' IDENTIFIED BY '…';
 GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'cdc'@'%';
 ```
+
+A privilege lost later, such as `SELECT` revoked on a table (error 1142 or 1143), halts that table
+when a snapshot chunk reads it; the other tables run on. A schema-wide revoke halts every table,
+and each is copied again once the grant is back (see
+[A halted table](/data-avalanche/runbooks/halted-table/)).
 
 `SELECT` on `*.*` covers the tables and the catalog; grant it on the pipeline's database
 (`shop.*`) instead to narrow it, keeping `REPLICATION SLAVE` and `REPLICATION CLIENT` global.

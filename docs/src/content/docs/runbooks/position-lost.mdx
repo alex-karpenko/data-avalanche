@@ -141,8 +141,9 @@ reconnects, not only at a start.
   runs its start again to do so. To recover a stopped pipeline, set it (a reload applies it,
   without a restart) and `POST /v1/pipelines/<id>/restart`.
 
-One case isn't caught: another server with the same `server_id` and the same binlog file names,
-whose file happens to have an event boundary at the checkpoint's offset. Prefer GTIDs: with
+Two cases aren't caught. On MariaDB: another server with the same `server_id` and the same binlog
+file names, whose file happens to have an event boundary at the checkpoint's offset. On MySQL: a
+copy of the server with the same `server_uuid` and the same file names. Prefer GTIDs: with
 `replication_type: gtid` (the server needs them on) a position survives a failover to a replica,
 and none of the above applies. Switching is a reload: the pipeline can't carry a file position
 over to a GTID one, so it starts from the server's position now (with

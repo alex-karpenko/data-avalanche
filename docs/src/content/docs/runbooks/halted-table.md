@@ -71,11 +71,13 @@ new table.
 whole pipeline has stopped and waits for an operator. `GET /v1/pipelines/<id>` gives the reason;
 the common ones:
 
-- the binlog server changed under a file-and-position pipeline (`BINLOG_SOURCE_CHANGED`), or the
-  position was purged (see [A lost position](/data-avalanche/runbooks/position-lost/));
+- the source server changed (`WAL_SOURCE_CHANGED` on PostgreSQL, `BINLOG_SOURCE_CHANGED` under a
+  file-and-position MySQL or MariaDB pipeline), or the position was purged (see [A lost position](/data-avalanche/runbooks/position-lost/));
 - the slot is missing, invalidated or orphaned, and the settings say not to recover by themselves;
 - the WAL behind the slot passed `max_wal_lag_bytes`;
 - a transaction passed `max_transaction_buffer_bytes`;
+- the server is refused at the start: a PostgreSQL standby, or a Galera node without
+  `log_slave_updates`;
 - the sink's table is missing, or a commit failed in a way a retry won't fix.
 
 Fix the cause, then `POST /v1/pipelines/<id>/restart` (or a `stop` and a `resume`). A pipeline in
