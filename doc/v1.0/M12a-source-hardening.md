@@ -340,7 +340,7 @@ The rulings this plan makes (roadmap D-IMPL-24):
 | D-M12a.10 | **A wiped state baselines against the sink table:** the columns the sink table lacks are added (evolved, or `EvolutionDisabled`); a key the sink table lacks halts the table (`SchemaMismatch`). Types aren't compared | `hop2_schema` is lossy under overrides, so a type compare would halt good tables; a real mismatch still fails the commit (`SINK_REJECTED`) | Task 8 (`a_wiped_state_baselines_against_the_sink_table`, `a_sink_table_without_the_key_column_halts`) |
 | D-M12a.11 | **The snapshot's collation edges:** a key literal is collated in its column's own collation, named with its schema (`KeyCollation::Own { name, qualified }`). A key whose index sorts it in another collation is warned. A chunk of 0 rows is refused. An ENUM or SET key whose members moved (not appended) is a change under the snapshot. What stays: no byte budget per chunk (`chunk_size` per table instead, documented); `E''` literals can't occur (the session pins `standard_conforming_strings`) | A domain with its own collation gave 42P22 from the second chunk; a chunk of no rows asked ends a table early; an ENUM key sorts by member index | Task 8 (`a_domain_key_declared_with_another_collation_resumes`, `text_keys_page_in_one_deterministic_collation`, `an_enum_key_s_moved_members_are_seen`) |
 | D-M12a.12 | **The publication's shape** is read at each start. Under `require_existing` or `FOR ALL TABLES`, a tracked table published with a row filter or column list (PG 15+) halts itself (`TABLE_NOT_REPLICABLE`, naming the atomic `DROP`+`ADD` and the re-snapshot: Oleksii's ruling in Task 9's review, 2026-11-04), and stored generated columns (PG 18) are refused with the `ALTER PUBLICATION` that fixes them. Untracked tables are warned. Under `managed` the pipeline repairs it (`SET TABLE`, `DROP TABLES IN SCHEMA`, `publish_generated_columns = none`) and re-snapshots. `publish_via_partition_root` is refused only for a tracked partition the publication doesn't name itself | Each of these drops changes silently. The managed publication is the pipeline's to set | Task 9 (`a_publication_s_blind_spots_are_refused_warned_or_repaired`) |
-| D-M12a.13 | **DA-SRC-17's items:** fixed are every table-set error reported (not the first), the server's detail and hint in an error, a standby refused before PostgreSQL 16 and warned from 16, a bounded call's wait for the connection inside its deadline, the cache's guard dropped before the call (a timeout's `abandon` takes it again), a year past PostgreSQL's range. Recorded as not reachable, with the reason in the tracker: loose parsing, types matched by name, cyclic domains, `convert`'s scale, `"char"` above 127 on PG 14, `char(n)` padding, interval narrowing, the dropped-orphan race | Each fixed item is reachable from a real server; the others are not, or are by design | Task 10 (`a_refusal_names_every_error`, `a_server_error_keeps_its_detail_and_hint`, `a_standby_is_refused_before_16`, `a_bounded_call_waits_for_the_cache_within_its_budget`, `a_call_on_a_frozen_connection_times_out_and_frees_the_cache`, `a_year_past_postgresql_s_range_is_refused`) |
+| D-M12a.13 | **DA-SRC-17's items:** fixed are every table-set error reported (not the first), the server's detail and hint in an error, a standby refused on every version (Oleksii's ruling in Task 10's review: the source reads `pg_current_wal_lsn()` and may change the publication), a bounded call's wait for the connection inside its deadline, the cache's guard dropped before the call (a timeout's `abandon` takes it again), a year past PostgreSQL's range. Recorded as not reachable, with the reason in the tracker: loose parsing, types matched by name, cyclic domains, `convert`'s scale, `"char"` above 127 on PG 14, `char(n)` padding, interval narrowing, the dropped-orphan race | Each fixed item is reachable from a real server; the others are not, or are by design | Task 10 (`a_refusal_names_every_error`, `a_server_error_keeps_its_detail_and_hint`, `a_standby_is_refused_before_16`, `a_bounded_call_waits_for_the_cache_within_its_budget`, `a_call_on_a_frozen_connection_times_out_and_frees_the_cache`, `a_year_past_postgresql_s_range_is_refused`) |
 | D-M12a.14 | **DA-SRC-9:** one catalog connection per pipeline serves channel C, the chunks and the re-queries (batched per commit). V-077 warns; the throughput is measured in M12c's load runs | A pool would serve a rare path (`re_query` under heavy TOAST churn) at the cost of the connection budget every pipeline pays | The tracker (§53) |
 | D-M12a.15 | **The failover E2E's pair is single-use** (`test-infra` profile `replica`, on tmpfs). The test fails with a hint to recreate it when the replica isn't in recovery. CI starts it fresh | A promotion can't be undone in place; a skip would hide a broken pair in CI | Task 11 (`a_promoted_replica_halts_the_pipeline_then_re_snapshots_on_request`) |
 
@@ -7222,10 +7222,10 @@ index e92c221..427feab 100644
 +`snapshots.mode` says; see
 +[A lost position](/data-avalanche/runbooks/position-lost/#a-failover-wal_source_changed).
 +
-+**A standby.** Point the pipeline at the primary. PostgreSQL before 16 can't decode on a standby,
-+so one is refused. From 16 a standby works, with a warning: the primary may remove rows the slot
-+still needs, which invalidates it, unless `hot_standby_feedback` is on with a physical slot on the
-+primary.
++**A standby.** Point the pipeline at the primary: a standby (a server in recovery) is refused on
++every version. The source reads the primary's WAL position and may change the publication, which
++a read-only standby can't. Decoding on a standby (PostgreSQL 16 and later) is planned for a later
++release.
 +
  ## MySQL
  
@@ -7359,8 +7359,8 @@ index b2f2758..73678a0 100644
 +reads it; the other tables run on. Grant it again, then copy the table afresh (see
 +[A halted table](/data-avalanche/runbooks/halted-table/)).
 +
-+Point the pipeline at the primary: a standby before PostgreSQL 16 is refused, and from 16 one
-+works with a warning (see Sources).
++Point the pipeline at the primary: a standby (a server in recovery) is refused on every version
++(see Sources).
  
  On a managed service, follow its guide to logical replication: on Amazon RDS and Aurora the role
  is granted `rds_replication` and `rds.logical_replication` is set; on Cloud SQL the
@@ -7418,7 +7418,7 @@ index a7f3403..1fda885 100644
 +| DA-SNAP-14 | 🟥 → ✅ | MySQL `snapshot.rs` `moved`: a reordered `ENUM`/`SET` key is a change under the snapshot |
 +| DA-SRC-15 | 🟥 → ✅ | `KeyCollation::Own` (a domain's collation, schema-qualified), the index-collation warning, `limit 0` refused; the byte budget documented (`chunk_size` per table), `E''` literals unreachable (`standard_conforming_strings` pinned) |
 +| DA-SRC-13 | 🟥 → ✅ | `slot.rs` `publication_shape`: refused under `require_existing`, repaired under `managed`, extra tables warned; IT `a_publication_s_blind_spots_are_refused_warned_or_repaired` |
-+| DA-SRC-17 | 🟥 → ✅ | fixed: the table-set errors all reported, the server's detail and hint, a standby refused/warned, the bounded call's one deadline, a year past PostgreSQL's range; the rest recorded as not reachable in the plan (Task 10) |
++| DA-SRC-17 | 🟥 → ✅ | fixed: the table-set errors all reported, the server's detail and hint, a standby refused on every version (decoding on one is later work), the bounded call's one deadline, a year past PostgreSQL's range; the rest recorded as not reachable in the plan (Task 10) |
 +| DA-SRC-18 | 🟥 → ✅ | `tls.rs` verifier tests, `require_encrypts_both_connections_without_verifying`, `keys.rs`, `postgres-tls` on `x-pg`, the `replica` profile and `failover.rs` |
 +| DA-X-15 | 🆕 → ✅ | `jobs.rs` `a_table_outside_the_config_is_copied_and_not_streamed` waits for the copy's completion |
 +| DA-SRC-9 | 🔄 → ✅ | decided: one catalog connection per pipeline serves channel C, the chunks and the re-queries (batched per commit); V-077 warns; throughput measured in M12c |
@@ -7475,7 +7475,7 @@ index a7f3403..1fda885 100644
 -| DA-SRC-19 | 🆕 Which permanent chunk-read errors are table-scoped | 🟢 | 🟥 | §28.2. A permanent chunk-read error ends the whole pipeline (D-M6a.7); a retyped key's 42883/42804 would loop it through restarts though only that table's read is broken. A non-drop 42703 (e.g. a quoting bug) now retries as "changed under the snapshot" until `SNAPSHOT_TIMEOUT`, with a warning per streak. Rule per SQLSTATE which errors halt the table and which end the pipeline, with MySQL's in view (M7/M9). | — |
 -| DA-SRC-20 | 🆕 A PostgreSQL source failover moves positions backwards | 🟡 | 🟥 | §30.1. The position guard assumes an LSN only grows. After a failover to a replica whose WAL ends behind the table's marker, the new primary reuses LSNs the lake has already marked, and the guard skips its changes, so data is lost. `Delivery_Guarantee_and_Position_Guard.md` §6 designs a source failover for MySQL only (a new `server_uuid`). Design the PostgreSQL case: detect the timeline or system identifier change, then halt or re-snapshot. | — |
 -| DA-SRC-22 | 🆕 MySQL `ssl_mode: verify-ca` checks the host name too | 🟢 | 🟥 | §32.1. `mysql_async` 0.37.1 skips the name check only for an error whose text contains `NotValidForName`; rustls 0.23 prints `certificate not valid for name`. So `verify-ca` acts as `verify-full` and refuses a connection by an address the certificate doesn't name. Fails closed (pinned by a test in M7a); M5 met the same in the PostgreSQL replication connection. | — |
-+| DA-SRC-17 | Source edges PostgreSQL doesn't produce, and small gaps | 🟢 | ✅ | Carried from M5; detail in §27. **✅ 2026-10-30 (§53):** fixed: the table-set errors all reported, the server's detail and hint, a standby refused/warned, the bounded call's one deadline, a year past PostgreSQL's range; the rest recorded as not reachable in the plan (Task 10). | — |
++| DA-SRC-17 | Source edges PostgreSQL doesn't produce, and small gaps | 🟢 | ✅ | Carried from M5; detail in §27. **✅ 2026-10-30 (§53):** fixed: the table-set errors all reported, the server's detail and hint, a standby refused on every version (decoding on one is later work), the bounded call's one deadline, a year past PostgreSQL's range; the rest recorded as not reachable in the plan (Task 10). | — |
 +| DA-SRC-18 | M5 test gaps | 🟢 | ✅ | Carried from M5; detail in §27. **✅ 2026-10-30 (§53):** `tls.rs` verifier tests, `require_encrypts_both_connections_without_verifying`, `keys.rs`, `postgres-tls` on `x-pg`, the `replica` profile and `failover.rs`. | — |
 +| DA-SRC-19 | 🆕 Which permanent chunk-read errors are table-scoped | 🟢 | ✅ | §28.2. A permanent chunk-read error ends the whole pipeline (D-M6a.7); a retyped key's 42883/42804 would loop it through restarts though only that table's read is broken. A non-drop 42703 (e.g. a quoting bug) now retries as "changed under the snapshot" until `SNAPSHOT_TIMEOUT`, with a warning per streak. Rule per SQLSTATE which errors halt the table and which end the pipeline, with MySQL's in view (M7/M9). **✅ 2026-10-30 (§53):** `snapshot.rs` (both sources) `table_scoped`: a table's SQLSTATE / MySQL error halts the table. | — |
 +| DA-SRC-20 | 🆕 A PostgreSQL source failover moves positions backwards | 🟡 | ✅ | §30.1. The position guard assumes an LSN only grows. After a failover to a replica whose WAL ends behind the table's marker, the new primary reuses LSNs the lake has already marked, and the guard skips its changes, so data is lost. `Delivery_Guarantee_and_Position_Guard.md` §6 designs a source failover for MySQL only (a new `server_uuid`). Design the PostgreSQL case: detect the timeline or system identifier change, then halt or re-snapshot. **✅ 2026-10-30 (§53):** `slot.rs` `source_change` (`WAL_SOURCE_CHANGED`, `source_change_action`), `worker.rs` `reposition`; E2E `failover.rs`. | — |
@@ -7666,3 +7666,17 @@ git commit -m "docs: the M12a recoveries — a PostgreSQL failover, a DBA's slot
 
   source-pg has 151 tests on PG 18, 14 and 17; the plan said 148. Task 12's publication pages
   must say "halts the table" for a filter.
+- **Task 10** (review fix `d3d315f`; Oleksii's ruling, 2026-11-04): a standby is refused on
+  every version. The plan warned from 16, but the source calls `pg_current_wal_lsn()`, which a
+  server in recovery refuses. It does so for the snapshot watermark, the retention/lag read and
+  the orphan advance, and a `managed` publication's DDL fails on a read-only server. So a standby
+  passed preflight, then failed at its first chunk.
+
+  Also:
+  - a timeout while waiting for the catalog connection says so;
+  - the cache-wait test has an outer timeout;
+  - `civil_days` refuses a BC year before PostgreSQL's first date (4714-11-24 BC).
+
+  Task 12's sources page, runbook and tracker rows now say "refused on every version". A spec
+  row for §11.2 awaits Oleksii's approval. source-pg has 156 tests on PG 18, 14 and 17 (the plan
+  said 153).
