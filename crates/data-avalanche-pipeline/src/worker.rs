@@ -213,10 +213,7 @@ impl PipelineWorker {
                     let warning = format!(
                         "the source lost the stream position {position} ({detail}): the stream restarts at a new position and the tables are snapshotted again"
                     );
-                    core.update(|st| {
-                        st.reconnects += 1;
-                        st.warn(warning);
-                    });
+                    core.update(|st| st.reconnects += 1);
                     // The checkpoint whose position was lost, with the server the session read:
                     // on another server the source refuses to replace it (DA-SRC-20), and the
                     // halt or the rerun of Phase 0 its refusal asks ends the worker below.
@@ -237,6 +234,9 @@ impl PipelineWorker {
                         || core.source.reset_position(&lost),
                     )
                     .await?;
+                    // Warned only once the reset holds: a refusal on another server halts or
+                    // reruns Phase 0 instead, and says so itself.
+                    core.update(|st| st.warn(warning));
                     start(core, Some(from)).await?;
                     attempt = 0;
                     continue;
