@@ -595,6 +595,20 @@ needs a measurement first (DA-SNAP-22's row records it).
 | DA-SNAP-22 | The wiped-state baseline's limits. A `Plan::Resume` table with no cached schema whose sink table exists (one re-added to the config) isn't baselined. A sink table holding a non-null key column the source no longer has is accepted, and the first MERGE fails (`SINK_REJECTED`). And a managed repair of a via-root publication re-snapshots every table, even a leaf the publication names itself (kept: `pg_publication_tables` lists only the root under via-root, so narrowing it needs a measurement first) | 🟢 | the M12a whole-branch review (Task 8's M-6; Task 9's partition item) | Baseline any uncached table the sink holds; refuse a non-null sink field the source lacks; measure what a via-root publication reports for a leaf it names, then narrow the re-snapshot |
 | DA-SINK-12 | A case-only `ADD COLUMN` loops the evolver. On the stream path, an `ADD COLUMN` whose name matches a Delta column by case alone (PostgreSQL `"Note"` beside `note`) is rejected by delta-rs as a duplicate. The error is transient, so the evolver retries without end and the pipeline stalls without halting. Predates M12a | 🟢 | the M12a whole-branch review (M-9) | The evolver applies `missing_columns`' case rule and halts `SCHEMA_MISMATCH`; first measure delta-rs's case folding (ASCII or Unicode) and match it: changing the comparison unmeasured could swap the loop for a false halt |
 
+## 55. M12a source hardening — the exit (2026-11-04)
+
+M12a (`doc/v1.0/M12a-source-hardening.md`) merged 2026-11-04 (PR #19, `0309b38`), its PR CI green
+on every target (`ci.yml` run 41822813507: `check`, `integration`, `e2e-mysql` on `mysql-84`,
+`mysql-84-nogtid` and `mariadb-118`, `k3s` 33 min; `docs.yml` run 41822813341), and the site
+deployed from `main` (`docs.yml` run 41834111658). The rows §53 closed stand as written; no count
+changes.
+
+M12's split grows to four plans (Oleksii, 2026-11-04; roadmap Q-M12-8): M12b keeps the roadmap's
+cluster, control, API and observability scope and builds DA-OBS-7, DA-OPS-12 and DA-API-13 rather
+than closing them with a pointer; the gaps M12a's review recorded in the source and the sink
+(DA-SRC-25, 31…36, DA-SNAP-22, DA-SINK-12) get a plan of their own after M12b and before the
+acceptance. DA-OPS-14 stays with the acceptance's load runs.
+
 ---
 
 ### Counts (by status)
@@ -606,7 +620,7 @@ needs a measurement first (DA-SNAP-22's row records it).
 > M7a's plan (§32), 2026-10-16 for M7a's exit (§33), 2026-10-17 for M7b's plan (§34),
 > 2026-10-20 for M7b's exit (§35), 2026-10-21 for M8a's plan (§36), 2026-10-22 for M8a's exit (§37),
 > 2026-10-22 for M8b's plan (§38), 2026-10-23 for M8b's exit (§39), 2026-10-23 for M9a's plan
-> (§40), 2026-10-23 for M9a's exit (§41), 2026-10-27 for M9b's plan (§42), 2026-10-28 for M9b's exit (§43), 2026-10-28 for M10's plan (§44), and 2026-10-29 for M10's exit (§45), and 2026-10-29 for M11a's plan (§46), and 2026-10-29 for M11a's whole-branch review (§47), and 2026-10-29 for M11a's exit (§48), and 2026-10-29 for M11b's plan (§49), and 2026-10-30 for M11b's pages (§50), and 2026-10-30 for M11b's exit and v0.1.0 (§51), and 2026-10-30 for M12a's plan (§52), and 2026-11-04 for M12a's gaps closed (§53), and 2026-11-04 for M12a's whole-branch review (§54).
+> (§40), 2026-10-23 for M9a's exit (§41), 2026-10-27 for M9b's plan (§42), 2026-10-28 for M9b's exit (§43), 2026-10-28 for M10's plan (§44), and 2026-10-29 for M10's exit (§45), and 2026-10-29 for M11a's plan (§46), and 2026-10-29 for M11a's whole-branch review (§47), and 2026-10-29 for M11a's exit (§48), and 2026-10-29 for M11b's plan (§49), and 2026-10-30 for M11b's pages (§50), and 2026-10-30 for M11b's exit and v0.1.0 (§51), and 2026-10-30 for M12a's plan (§52), and 2026-11-04 for M12a's gaps closed (§53), and 2026-11-04 for M12a's whole-branch review (§54), and 2026-11-04 for M12a's exit (§55).
 
 | Status | Count (v1 scope) | Notes |
 |---|---|---|
