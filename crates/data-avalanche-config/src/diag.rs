@@ -87,6 +87,16 @@ impl Report {
         self.iter().any(|d| d.rule == rule)
     }
 
+    /// The errors as one refusal, `rule path: message` each, `; `-separated; `None` without any.
+    pub fn refusal(&self) -> Option<String> {
+        let all: Vec<String> = self
+            .errors
+            .iter()
+            .map(|e| format!("{} {}: {}", e.rule, e.path, e.message))
+            .collect();
+        (!all.is_empty()).then(|| all.join("; "))
+    }
+
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "valid": self.is_ok(),
@@ -125,6 +135,20 @@ mod tests {
         assert_eq!(r.warnings.len(), 1);
         assert!(!r.is_ok());
         assert!(r.has("V-037"));
+    }
+
+    #[test]
+    fn a_refusal_names_every_error() {
+        let mut r = Report::default();
+        assert_eq!(r.refusal(), None);
+        r.push(d("V-037", Severity::Warning, "w"));
+        assert_eq!(r.refusal(), None, "warnings don't refuse");
+        r.push(d("V-113", Severity::Error, "b"));
+        r.push(d("V-113", Severity::Error, "a"));
+        assert_eq!(
+            r.refusal().as_deref(),
+            Some("V-113 a: V-113 at a; V-113 b: V-113 at b")
+        );
     }
 
     #[test]

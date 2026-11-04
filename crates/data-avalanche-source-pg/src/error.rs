@@ -94,7 +94,7 @@ fn chain(e: &(dyn std::error::Error + 'static)) -> String {
 /// A catalog-connection error (`tokio-postgres`).
 pub(crate) fn sql_error(e: tokio_postgres::Error) -> SourceError {
     if let Some(db) = e.as_db_error() {
-        let message = format!("{} (SQLSTATE {})", db.message(), db.code().code());
+        let message = db_message(db.message(), db.detail(), db.hint(), db.code().code());
         return classify(Some(db.code().code()), message, None);
     }
     if tls_failure(&e) {
@@ -102,6 +102,19 @@ pub(crate) fn sql_error(e: tokio_postgres::Error) -> SourceError {
     }
     // Closed connections, I/O and connect timeouts.
     SourceError::Transient(chain(&e))
+}
+
+/// A server error as the pipeline reports it: the message, the server's detail and hint when it
+/// gave them (DA-SRC-17), then the SQLSTATE, last ([`sqlstate`] reads it there).
+fn db_message(message: &str, detail: Option<&str>, hint: Option<&str>, code: &str) -> String {
+    let mut out = message.to_owned();
+    if let Some(d) = detail {
+        out = format!("{out}: {d}");
+    }
+    if let Some(h) = hint {
+        out = format!("{out} (hint: {h})");
+    }
+    format!("{out} (SQLSTATE {code})")
 }
 
 /// A client-side timeout of a catalog or snapshot query.
@@ -118,6 +131,25 @@ pub(crate) fn protocol(detail: impl std::fmt::Display) -> SourceError {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn a_server_error_keeps_its_detail_and_hint() {
+        assert_eq!(
+            db_message("boom", None, None, "XX000"),
+            "boom (SQLSTATE XX000)"
+        );
+        let m = db_message(
+            "permission denied for table t",
+            Some("the role lost SELECT"),
+            Some("GRANT SELECT ON t"),
+            "42501",
+        );
+        assert_eq!(
+            m,
+            "permission denied for table t: the role lost SELECT (hint: GRANT SELECT ON t) (SQLSTATE 42501)"
+        );
+        assert_eq!(sqlstate(&m), Some("42501"));
+    }
 
     fn server(m: &str) -> PgWireError {
         PgWireError::Server(m.into())

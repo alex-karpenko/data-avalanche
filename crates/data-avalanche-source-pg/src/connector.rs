@@ -118,18 +118,20 @@ impl PgConnector {
                               AND has_table_privilege('pg_catalog.pg_attribute', 'SELECT')
                               AND has_table_privilege('pg_catalog.pg_index', 'SELECT')
                               AND has_table_privilege('pg_catalog.pg_type', 'SELECT')
-                              AND has_table_privilege('pg_catalog.pg_namespace', 'SELECT')
+                              AND has_table_privilege('pg_catalog.pg_namespace', 'SELECT'),
+                            pg_is_in_recovery()
                        FROM pg_catalog.pg_database d, pg_catalog.pg_roles r
                       WHERE d.datname = current_database() AND r.rolname = current_user",
                     &[],
                 ),
             )
             .await?;
-        let (num, version, wal_level, encoding, replication, catalogs): (
+        let (num, version, wal_level, encoding, replication, catalogs, recovery): (
             i32,
             String,
             String,
             String,
+            bool,
             bool,
             bool,
         ) = (
@@ -139,6 +141,7 @@ impl PgConnector {
             row.get(3),
             row.get(4),
             row.get(5),
+            row.get(6),
         );
         let refuse = |m: String| Err(SourceError::Permanent(m));
         if num < MIN_SERVER_VERSION {
@@ -162,6 +165,11 @@ impl PgConnector {
             );
         }
         let mut warnings = vec![];
+        match standby(num, recovery) {
+            Err(m) => return refuse(m),
+            Ok(Some(w)) => warnings.push(w),
+            Ok(None) => {}
+        }
         if !replication {
             warnings.push(
                 "the user has neither the REPLICATION attribute nor superuser; the replication connection may be refused".into(),
@@ -222,11 +230,9 @@ impl PgConnector {
             .collect();
         let mut report = check_table_set(&self.pipeline, &resolved);
         report.extend(check_unbounded_numeric(&self.pipeline, &unconstrained));
-        if let Some(e) = report.errors.first() {
-            return Err(SourceError::Permanent(format!(
-                "{} {}: {}",
-                e.rule, e.path, e.message
-            )));
+        // Every error, not the first (DA-SRC-17).
+        if let Some(refusal) = report.refusal() {
+            return Err(SourceError::Permanent(refusal));
         }
         out.warnings.extend(
             report
@@ -328,6 +334,25 @@ impl PgConnector {
     }
 }
 
+/// A standby (in recovery) as a source (DA-SRC-17): PostgreSQL decodes logical changes on one
+/// from 16 on; before, it is refused by name, not by the server's error at the slot's creation.
+fn standby(version_num: i32, in_recovery: bool) -> Result<Option<String>, String> {
+    match (in_recovery, version_num >= 160_000) {
+        (false, _) => Ok(None),
+        (true, false) => Err(
+            "the server is a standby (in recovery), and PostgreSQL before 16 can't decode \
+             logical changes on one; point the pipeline at the primary"
+                .into(),
+        ),
+        (true, true) => Ok(Some(
+            "the server is a standby: its slot is invalidated when the primary removes rows the \
+             slot still needs, unless hot_standby_feedback is on with a physical slot on the \
+             primary"
+                .into(),
+        )),
+    }
+}
+
 /// The trait is the inherent methods of the modules: `catalog` and here (channel A), `slot`
 /// (the lifecycle), `snapshot`, `stream`, `schema` (channels C and D).
 #[async_trait]
@@ -426,6 +451,18 @@ mod tests {
 
     use super::*;
     use crate::test_support::pipeline;
+
+    #[test]
+    fn a_standby_is_refused_before_16() {
+        assert_eq!(standby(150_004, false), Ok(None));
+        let e = standby(150_004, true).unwrap_err();
+        assert!(
+            e.starts_with("the server is a standby (in recovery)"),
+            "{e}"
+        );
+        let w = standby(160_000, true).unwrap().unwrap();
+        assert!(w.contains("hot_standby_feedback"), "{w}");
+    }
 
     #[test]
     fn a_connector_is_a_source_connector() {
