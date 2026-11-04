@@ -1099,6 +1099,7 @@ on.
 | Engine | Requirement | Severity (at start) | Rationale |
 |---|---|---|---|
 | Both | Configured source credentials hold **SELECT on `information_schema` / system catalogs** (over a regular, non-replication connection) | error → halt pipeline | Detection channels A/C/D query the source catalog; the replication credential is reused — no separate read role. |
+| PostgreSQL | The server **isn't a standby** (`pg_is_in_recovery()` is false) | error → halt pipeline | The source reads the primary's WAL position (`pg_current_wal_lsn()`, refused during recovery) and may change the publication, which a read-only standby can't: point the pipeline at the primary. Decoding on a standby (PostgreSQL 16+) is a later feature. |
 | PostgreSQL | **`REPLICA IDENTITY` ≠ `NOTHING`** on tracked tables | error → halt table | Delete/update keying (pre-existing requirement). |
 | PostgreSQL | Tracked tables are **logged** (`relpersistence = 'p'`; not `UNLOGGED`) | error → halt table (`TABLE_NOT_REPLICABLE`, explicit table) / warning + skip (glob-matched) | PostgreSQL doesn't publish unlogged tables: such a table would be snapshotted once and then never change. |
 | MySQL | **`binlog_format = ROW`** | error → halt pipeline | Granular row-level change capture. |
