@@ -19,8 +19,17 @@ use crate::error::{mysql, timed_out};
 pub const SESSION_SETUP: [&str; 2] = ["SET time_zone = '+00:00'", "SET NAMES utf8mb4"];
 
 /// The `ssl_mode` → `mysql_async` TLS options (`allow` is refused for MySQL by V-030 and connects
-/// like `prefer`). `require` and `prefer` encrypt without verifying, `verify-ca` checks the chain
-/// and `verify-full` the chain and the host name. Roots are `ssl_ca`, else the Mozilla roots.
+/// like `prefer`). `require` and `prefer` encrypt without verifying, `verify-ca` is meant to check
+/// the chain alone and `verify-full` the chain and the host name. Roots are `ssl_ca`, else the
+/// Mozilla roots.
+///
+/// `verify-ca` checks the host name too, failing closed (DA-SRC-22, warned by V-124): with rustls,
+/// `mysql_async` 0.37.1 skips the name check by matching `NotValidForName` in the verifier
+/// error's text (`rustls_io.rs`), and rustls 0.23 prints that error as "certificate not valid for
+/// name", so the match never hits; the crate takes no verifier of ours. Re-check this on every
+/// `mysql_async` upgrade: once its skip works, `verify-ca` connects to a certificate that doesn't
+/// name the host (the `tls` IT `verify_ca_by_an_unnamed_address_is_refused_like_verify_full`
+/// fails then), and V-124 and this note go.
 pub(crate) fn ssl_opts(source: &Source) -> Result<Option<SslOpts>, String> {
     if source.ssl_mode == SslMode::Disable {
         return Ok(None);

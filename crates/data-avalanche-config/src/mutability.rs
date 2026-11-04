@@ -49,6 +49,7 @@ pub(crate) const CLASSES: &[(&str, Mutability)] = &[
     ("pipelines.*.source.postgres.auto_cleanup", R),
     ("pipelines.*.source.postgres.heartbeat", R),
     ("pipelines.*.source.postgres.slot_on_orphan", R),
+    ("pipelines.*.source.postgres.source_change_action", R),
     ("pipelines.*.source.postgres.max_wal_lag_bytes", R),
     ("pipelines.*.source.mysql.binlog_purge_action", R),
     ("pipelines.*.source.mysql.heartbeat", R),

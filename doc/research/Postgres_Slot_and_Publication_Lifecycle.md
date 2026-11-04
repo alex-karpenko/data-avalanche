@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-22
+updated: 2026-11-04
 domain: Data Flow
 tags: [postgres, replication-slot, publication, lifecycle, wal, re-snapshot, cdc]
 resolves: [G-15]
@@ -104,6 +104,40 @@ config §):
   `publication_names` (an unquoted `MyPub` folds to `mypub`). Two pipelines must not share a
   publication they manage (V-059): each would reconcile it to its own tables.
 
+**What the publication publishes, not only which tables (DA-SRC-13, M12a, 2026-11-04).** The table
+list is not the whole of a publication: a row filter or a column list on a member (PostgreSQL 15+),
+`FOR TABLES IN SCHEMA` (15+), `publish_via_partition_root`, the operations, and
+`publish_generated_columns = stored` (18+) each keep changes from the stream or change their
+shape. `slot.rs` `publication_shape` reads them from `pg_publication_rel` (`prqual`, `prattrs`),
+`pg_publication_namespace` and `pg_publication` (`pubgencols`), and the reconciliation answers each:
+
+- **`managed`, named tables:** the publication's direct members become exactly the tracked set.
+  `ADD TABLE`/`DROP TABLE` where a member can be named; `ALTER PUBLICATION … SET TABLE <tracked>`
+  where a filter, a column list or a published schema can't be taken out by name (a schema's table
+  isn't a member to drop, 42704). A tracked table it published before through a partitioned root
+  or a schema is added by name and not copied again. The operations and the partition-root flag
+  are set right. All of it runs as one implicit transaction bounded by `lock_timeout` and
+  `statement_timeout`, after the slot decision.
+- **A rewrite re-snapshots.** A repair that changes what a tracked table's changes carried (a
+  filter or a column list on a tracked table, the operations, the partition-root flag while a
+  tracked table is a partition, stored generated columns while a tracked table has one) drops and
+  recreates the slot before it changes the publication, and the pipeline re-snapshots its tables as
+  `snapshots.mode` says (`Reconciled::rewritten`): the WAL before the repair was decoded under the
+  old definition. A via-root repair re-snapshots every table even for a leaf the publication names
+  itself, conservatively: `pg_publication_tables` lists only the root under via-root, so narrowing
+  it needs a measurement first (§54 of the gap tracker).
+- **`require_existing` or `FOR ALL TABLES`** (a publication the app doesn't change): a tracked table
+  published with a row filter or a column list **halts by itself** at resolve (`halt_filtered_tables`,
+  `TABLE_NOT_REPLICABLE`, naming the one-transaction `DROP TABLE` + `ADD TABLE` that publishes it
+  whole), and the other tables go on; once fixed it re-snapshots rather than resuming over WAL the
+  filter decoded. Stored generated columns of a tracked table refuse the pipeline (naming
+  `SET (publish_generated_columns = none)`); via-root while a tracked partition isn't named itself
+  refuses (its changes would arrive under the untracked parent's name); a tracked table not
+  published, or an operation not published, warns.
+- **Untracked tables** the publication also publishes warn (up to five named): the server decodes
+  their changes for the slot and the stream drops them (D-M5.14). A managed publication of named
+  tables drops them.
+
 ---
 
 ## §5 — Mutual exclusion & external collisions (D-15.5)
@@ -157,5 +191,5 @@ machine and the §3 WAL-gone → re-snapshot path; the snapshot is now the incre
 | D-15.1 orphan slot | `on_orphan: halt` (default) \| `adopt_resnapshot`; resume-without-snapshot rejected |
 | D-15.2 creation | `slot_management: managed` (default) \| `require_existing` (DBA-precreated) |
 | D-15.3 WAL-gone | unreachable position ⇒ recreate slot + incremental re-snapshot (G-6); warn/metric |
-| D-15.4 publication | app-maintained explicit list; `ALTER PUBLICATION` reconciles on table-set change |
+| D-15.4 publication | app-maintained explicit list; `ALTER PUBLICATION` reconciles on table-set change, its shape too (filters, column lists, schemas, via-root, operations, generated columns: `SET TABLE` repair under `managed`, a filtered table halted otherwise, a rewrite re-snapshots) |
 | D-15.5 mutual exclusion | lease + PG active-slot lock; external same-name collisions undetectable (documented) |

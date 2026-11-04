@@ -27,7 +27,7 @@ use mysql_async::{IsolationLevel, TxOpts, Value};
 
 use crate::catalog::table_key;
 use crate::connector::MySqlConnector;
-use crate::types::{CatalogColumn, plan_column};
+use crate::types::{CatalogColumn, members, plan_column};
 use crate::value::{self, Decode, Input};
 
 /// How to read one column of a table.
@@ -116,6 +116,18 @@ async fn read_plan(
                 ),
             ));
         }
+        // An ENUM or SET key sorts by member index, and a chunk resumes at its cursor's label's
+        // index: members moved since the schema would skip or repeat rows (DA-SNAP-14). The
+        // stream halts the table at the change; until it reaches it, the chunk waits.
+        if identifier && moved(&CatalogColumn::from_schema(col), catalog) {
+            return Err(changed(
+                schema,
+                format!(
+                    "key column {} is now {}, the schema has {}",
+                    col.name, catalog.column_type, col.source_type
+                ),
+            ));
+        }
         out.push(ReadColumn {
             catalog: catalog.clone(),
             decode: p.decode,
@@ -123,6 +135,13 @@ async fn read_plan(
         });
     }
     Ok(out)
+}
+
+/// An ENUM or SET column whose members the catalog no longer lists in the schema's order:
+/// appending keeps every member's index, anything else may not.
+fn moved(schema: &CatalogColumn, catalog: &CatalogColumn) -> bool {
+    matches!(catalog.data_type.as_str(), "enum" | "set")
+        && !members(&catalog.column_type).starts_with(&members(&schema.column_type))
 }
 
 /// The decode an override wraps: the column's own type, which orders the key.
@@ -355,6 +374,15 @@ fn null_key(schema: &TableSchema, row: &Row) -> String {
 const NO_TABLE: u16 = 1146;
 const NO_COLUMN: u16 = 1054;
 
+/// Server errors of this table's read alone, which halt the table, not the pipeline: a restart
+/// reads it the same way (DA-SRC-19, PostgreSQL's beside it): the user lost `SELECT` on the
+/// table or a column (1142, 1143), the key no longer compares with the cursor (1267, 1271
+/// collations mixed; 1253, 1273 the cursor's collation unknown or another character set's), or
+/// a cursor value its type refuses (1292, 1366). Any other permanent error ends the pipeline.
+pub(crate) fn table_scoped(code: u16) -> bool {
+    matches!(code, 1142 | 1143 | 1267 | 1271 | 1253 | 1273 | 1292 | 1366)
+}
+
 impl MySqlConnector {
     /// One chunk: `SELECT … WHERE <after the cursor> ORDER BY key LIMIT n LOCK IN SHARE MODE` in
     /// a READ COMMITTED transaction that commits at once (DA-SNAP-10).
@@ -364,6 +392,12 @@ impl MySqlConnector {
         after: Option<&KeysetCursor>,
         limit: usize,
     ) -> Result<Chunk, SourceError> {
+        // An empty chunk ends the table: one of no rows asked would end it early (DA-SRC-15).
+        if limit == 0 {
+            return Err(SourceError::Permanent(
+                "a snapshot chunk of 0 rows: chunk_size is at least 1 (V-108)".into(),
+            ));
+        }
         let columns = read_plan(self, table).await?;
         let keys = key_columns(table, &columns);
         let collation = cursor_collation(&keys);
@@ -421,7 +455,7 @@ impl MySqlConnector {
                             Ok(Ok(rows))
                         }
                         Err(mysql_async::Error::Server(e))
-                            if matches!(e.code, NO_TABLE | NO_COLUMN) =>
+                            if matches!(e.code, NO_TABLE | NO_COLUMN) || table_scoped(e.code) =>
                         {
                             tx.rollback().await?;
                             Ok(Err(e))
@@ -434,7 +468,15 @@ impl MySqlConnector {
         let rows = match read {
             Ok(rows) => rows,
             Err(e) if e.code == NO_TABLE => return Err(halt(table, HaltReason::TableDropped)),
-            Err(e) => return Err(changed(table, e.message)),
+            Err(e) if e.code == NO_COLUMN => return Err(changed(table, e.message)),
+            Err(e) => {
+                return Err(halt(
+                    table,
+                    HaltReason::NotReplicable {
+                        reason: format!("its snapshot read fails: {} ({})", e.message, e.code),
+                    },
+                ));
+            }
         };
         let rows = rows
             .into_iter()
@@ -469,6 +511,38 @@ mod tests {
 
     use super::*;
     use crate::value::Charset;
+
+    /// An ENUM or SET key's members moved, not appended, are a change under the snapshot
+    /// (DA-SNAP-14).
+    #[test]
+    fn an_enum_key_s_moved_members_are_seen() {
+        let c = |t: &str| CatalogColumn {
+            data_type: t.split('(').next().unwrap().into(),
+            column_type: t.into(),
+            ..CatalogColumn::default()
+        };
+        let was = c("enum('a','b')");
+        assert!(!moved(&was, &c("enum('a','b')")));
+        assert!(!moved(&was, &c("enum('a','b','c')")), "appended");
+        assert!(moved(&was, &c("enum('b','a')")), "reordered");
+        assert!(moved(&was, &c("enum('a','c','b')")), "inserted");
+        assert!(moved(&c("set('x','y')"), &c("set('y','x')")));
+        assert!(moved(&was, &c("enum('a')")), "removed");
+        assert!(moved(&was, &c("enum('a','x')")), "renamed");
+        assert!(!moved(&c("int"), &c("int")));
+    }
+
+    /// The errors of this table's read alone halt the table; a table or column gone keeps its own
+    /// path; the rest end the pipeline (DA-SRC-19).
+    #[test]
+    fn a_read_only_this_table_fails_halts_the_table() {
+        for code in [1142, 1143, 1267, 1271, 1253, 1273, 1292, 1366] {
+            assert!(table_scoped(code), "{code}");
+        }
+        for code in [NO_TABLE, NO_COLUMN, 1064, 1205, 2013] {
+            assert!(!table_scoped(code), "{code}");
+        }
+    }
 
     fn column(data_type: &str, decode: Decode) -> ReadColumn {
         ReadColumn {

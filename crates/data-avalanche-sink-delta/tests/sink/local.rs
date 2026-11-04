@@ -217,6 +217,36 @@ async fn a_recreated_table_is_not_skipped_by_the_old_position() {
     assert_eq!(marker.committed_position, lsn(25));
 }
 
+/// A source-change start repositions the table onto the new server's positions, which sit below
+/// the marker (a promoted replica's LSNs, DA-SRC-20): before it, a change at 30 is skipped as
+/// covered by 100; after it, the change lands.
+#[tokio::test]
+async fn a_reposition_replaces_the_marker() {
+    let (_dir, location) = local();
+    let s = sink(location, TableDefaults::default());
+    s.ensure_table(&spec()).await.unwrap();
+    commit(
+        &s,
+        cs(100, vec![upserts(&[(1, Some("a"))], None)], vec![]),
+        1,
+    )
+    .await;
+    let late = cs(30, vec![upserts(&[(2, Some("b"))], None)], vec![]);
+    assert_eq!(
+        commit(&s, late.clone(), 1).await,
+        CommitOutcome::SkippedCovered
+    );
+    let mut reposition = cs(20, vec![], vec![]);
+    reposition.reposition = true;
+    let out = commit(&s, reposition, 1).await;
+    assert!(matches!(out, CommitOutcome::Committed { .. }), "{out:?}");
+    let marker = s.table_state(&items()).await.unwrap().marker.unwrap();
+    assert_eq!(marker.committed_position, lsn(20));
+    let out = commit(&s, late, 1).await;
+    assert!(matches!(out, CommitOutcome::Committed { .. }), "{out:?}");
+    assert_eq!(rows(&s).await, owned(&[(1, Some("a")), (2, Some("b"))]));
+}
+
 /// Another writer re-creates the table between two calls of this sink: the live handle's stale
 /// snapshot can't be updated incrementally, so the sink re-opens the table and commits.
 #[tokio::test]

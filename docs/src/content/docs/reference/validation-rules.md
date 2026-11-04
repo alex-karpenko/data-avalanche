@@ -128,3 +128,5 @@ A config with any **error** is rejected whole: at startup the node refuses to st
 | <span id="v-120"></span>V-120 | error | `source.mysql.server_id` | ≥ 1 when set. Unique per source server (host + port) across pipelines, set or derived: two dumps under one id end each other. |
 | <span id="v-121"></span>V-121 | error | `source.mysql.heartbeat` | Between 1s and 4294967s (the server's heartbeat period range). |
 | <span id="v-122"></span>V-122 | error | `globals.cluster.memberlist timers` | gossip_interval, probe_interval, probe_timeout and push_pull_interval above zero; gossip_nodes and retransmit_factor at least 1; probe_timeout below probe_interval. |
+| <span id="v-123"></span>V-123 | error | `source.postgres.source_change_action` | ∈ {error, re_snapshot}. |
+| <span id="v-124"></span>V-124 | warning | `source.ssl_mode = verify-ca, when source.type = mysql` | The host name is checked too, as with verify-full (DA-SRC-22). |

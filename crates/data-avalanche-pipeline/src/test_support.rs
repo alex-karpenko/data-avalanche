@@ -551,6 +551,7 @@ impl World {
             .save_slot(&SlotDoc {
                 slot_name: "p_slot".into(),
                 confirmed_flush_lsn: end,
+                server: None,
             })
             .await
             .expect("the checkpoint");

@@ -332,7 +332,7 @@ pub const FIELD_DOCS: &[FieldDoc] = &[
     f(
         "pipelines.*.source.ssl_mode",
         Value("require"),
-        "TLS to the source: `disable`, `allow`, `prefer`, `require`, `verify-ca` or `verify-full`. `allow` isn't valid for MySQL.",
+        "TLS to the source: `disable`, `allow`, `prefer`, `require`, `verify-ca` or `verify-full`. `allow` isn't valid for MySQL, and there `verify-ca` checks the host name too, as `verify-full` does (V-124).",
     ),
     f(
         "pipelines.*.source.ssl_cert",
@@ -392,12 +392,17 @@ pub const FIELD_DOCS: &[FieldDoc] = &[
     f(
         "pipelines.*.source.postgres.slot_management",
         Value("managed"),
-        "`managed` creates the slot when absent; `require_existing` uses a slot a DBA created and needs `auto_cleanup: false`.",
+        "`managed` creates the slot when absent; `require_existing` uses a slot a DBA created and needs `auto_cleanup: false` (a slot the DBA makes again is adopted or refused as `slot_on_orphan` says).",
     ),
     f(
         "pipelines.*.source.postgres.slot_on_orphan",
         Value("halt"),
-        "A slot that exists with no state of the pipeline's: `halt` refuses to start, naming it; `adopt_resnapshot` takes it over and starts from the current position, snapshotting as `snapshots.mode` says (none under `never`).",
+        "A slot that exists with no state of the pipeline's, or under `require_existing` one made again past the pipeline's position: `halt` refuses to start, naming it; `adopt_resnapshot` takes it over and starts from the current position, snapshotting as `snapshots.mode` says (none under `never`).",
+    ),
+    f(
+        "pipelines.*.source.postgres.source_change_action",
+        Value("error"),
+        "A start on a server other than the checkpoint's (another system identifier, or another timeline after a failover): `error` halts `WAL_SOURCE_CHANGED`; `re_snapshot` starts from the new server's position, snapshotting as `snapshots.mode` says (none under `never`).",
     ),
     f(
         "pipelines.*.source.postgres.max_wal_lag_bytes",
@@ -407,7 +412,7 @@ pub const FIELD_DOCS: &[FieldDoc] = &[
     f(
         "pipelines.*.source.mysql.replication_type",
         Value("gtid"),
-        "`gtid` follows GTIDs and survives a failover (MySQL `gtid_mode=ON`, MariaDB `gtid_strict_mode=1`); `binlog` follows file and position, and halts `BINLOG_SOURCE_CHANGED` when the server changes.",
+        "`gtid` follows GTIDs and survives a failover (MySQL `gtid_mode=ON`, MariaDB `gtid_strict_mode=1`); `binlog` follows file and position, which mean something on one server only: on another, the position is lost, as `binlog_purge_action` says. With `binlog`, on MySQL and MariaDB alike, a position in a file the server couldn't have purged (another base name, or after its newest binlog) is another server's; one before its oldest is a purge. The check runs at each start and each time the stream reconnects.",
     ),
     f(
         "pipelines.*.source.mysql.tinyint1_as_bool",
@@ -422,7 +427,7 @@ pub const FIELD_DOCS: &[FieldDoc] = &[
     f(
         "pipelines.*.source.mysql.binlog_purge_action",
         Value("error"),
-        "When the server purged the binlog the pipeline must resume from: `error` halts; `re_snapshot` starts from the current position, snapshotting as `snapshots.mode` says (none under `never`).",
+        "When the server can't serve the position the pipeline resumes from (its binlog purged, or under `binlog` another server's): `error` halts; `re_snapshot` starts from the current position, snapshotting as `snapshots.mode` says (none under `never`).",
     ),
     f(
         "pipelines.*.source.mysql.server_id",

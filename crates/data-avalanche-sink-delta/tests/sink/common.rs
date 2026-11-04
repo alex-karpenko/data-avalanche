@@ -92,6 +92,7 @@ pub fn cs(end: u64, up: Vec<RecordBatch>, del: Vec<RecordBatch>) -> TableChangeS
         },
         split: None,
         snapshot: false,
+        reposition: false,
     }
 }
 

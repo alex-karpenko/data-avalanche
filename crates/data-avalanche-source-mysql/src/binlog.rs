@@ -79,6 +79,8 @@ pub struct MariaGtidEvent {
 impl MariaGtidEvent {
     /// The statement stands alone: no `BEGIN`, no `XID` (DDL).
     pub const STANDALONE: u8 = 0x01;
+    /// Every change in the transaction can roll back: none is to a non-transactional table.
+    pub const TRANSACTIONAL: u8 = 0x04;
     /// The XA transaction's prepare, and its later commit or rollback.
     pub const PREPARED_XA: u8 = 0x40;
     pub const COMPLETED_XA: u8 = 0x80;
@@ -102,6 +104,12 @@ impl MariaGtidEvent {
 
     pub fn standalone(&self) -> bool {
         self.flags & Self::STANDALONE != 0
+    }
+
+    /// No change in the transaction is to a non-transactional table (`FL_TRANSACTIONAL`): the
+    /// binlog holds no row a rollback undid.
+    pub fn transactional(&self) -> bool {
+        self.flags & Self::TRANSACTIONAL != 0
     }
 
     /// An XA transaction's prepare or completion: its rows can still roll back after the event.

@@ -158,6 +158,22 @@ async fn verify_full_with_an_inline_ca_encrypts_both_connections() {
     cleanup(&a, &n).await;
 }
 
+/// `require` encrypts both connections without checking the certificate, as libpq does: no CA
+/// given, and an address the certificate doesn't name (DA-SRC-18).
+#[tokio::test]
+async fn require_encrypts_both_connections_without_verifying() {
+    require_it!();
+    let _serial = SERIAL.lock().await;
+    let a = admin().await;
+    let n = fresh(&a, "tls_require", "CREATE TABLE t (id int PRIMARY KEY);").await;
+    let p = pipeline(&n, "127.0.0.1", "avalanche", "ssl_mode: require", &[]);
+    let seen = stream_one(&a, &p, &n).await;
+    let kinds: Vec<&str> = seen.iter().map(|s| s.1.as_str()).collect();
+    assert_eq!(kinds, ["client backend", "client backend", "walsender"]);
+    assert!(seen.iter().all(|s| s.2), "both over TLS: {seen:?}");
+    cleanup(&a, &n).await;
+}
+
 #[tokio::test]
 async fn a_client_certificate_with_an_inline_key_authenticates_both_connections() {
     require_it!();

@@ -5,12 +5,13 @@ use std::time::Duration;
 
 use data_avalanche_core::position::Lsn;
 use data_avalanche_core::{
-    Checkpoint, SnapshotReason, SourceConnector, SourceError, SourcePosition, StartPlan, TableRef,
+    Checkpoint, HaltReason, ServerIdentity, SnapshotReason, SourceConnector, SourceError,
+    SourcePosition, StartPlan, TableRef,
 };
 use data_avalanche_testkit::require_it;
 use tokio_postgres::Client;
 
-use crate::common::{Names, admin, cleanup, connector, first_stream, fresh, pipeline};
+use crate::common::{Names, admin, cleanup, connector, first_stream, fresh, pipeline, resolved};
 
 const DDL: &str = "CREATE TABLE a (id int PRIMARY KEY); CREATE TABLE b (id int PRIMARY KEY);
                    CREATE TABLE c (id int PRIMARY KEY);";
@@ -102,6 +103,190 @@ async fn first_start_then_resume_then_a_lost_slot() {
         .await
         .unwrap();
     from(&p.plan, SnapshotReason::PositionLost);
+    cleanup(&a, &n).await;
+}
+
+/// A checkpoint read on another server, another system or another timeline (a promoted
+/// standby), halts with `WAL_SOURCE_CHANGED`; under `source_change_action: re_snapshot` the slot
+/// is made again on the server read now, and the pipeline snapshots from it. A checkpoint with no
+/// server (v0.1.0's) resumes, and records the server (DA-SRC-20).
+#[tokio::test]
+async fn a_checkpoint_from_another_server() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(&a, "slot_server", DDL).await;
+    let tables = [n.table("a")];
+    let halt = connector(&pipeline(&n, &["*"], "", ""));
+    let first = halt.prepare(None, &tables).await.unwrap();
+    let start = from(&first.plan, SnapshotReason::FirstStart);
+    let Some(ServerIdentity::Postgres {
+        system_identifier,
+        timeline,
+    }) = first.server.clone()
+    else {
+        panic!("a PostgreSQL server, got {:?}", first.server)
+    };
+    let p = halt
+        .prepare(Some(&Checkpoint::from(start.clone())), &tables)
+        .await
+        .unwrap();
+    assert_eq!(
+        (p.plan, p.server),
+        (StartPlan::Resume, first.server.clone())
+    );
+
+    let elsewhere = [
+        ServerIdentity::Postgres {
+            system_identifier: system_identifier ^ 1,
+            timeline,
+        },
+        ServerIdentity::Postgres {
+            system_identifier,
+            timeline: timeline + 1,
+        },
+    ];
+    for server in &elsewhere {
+        let cp = Checkpoint {
+            position: start.clone(),
+            server: Some(server.clone()),
+        };
+        permanent(
+            halt.prepare(Some(&cp), &tables).await.unwrap_err(),
+            "WAL_SOURCE_CHANGED",
+        );
+    }
+    a.execute(&format!("INSERT INTO {}.a VALUES (1)", n.schema), &[])
+        .await
+        .unwrap();
+    let recover = connector(&pipeline(
+        &n,
+        &["*"],
+        "",
+        ", source_change_action: re_snapshot",
+    ));
+    let cp = Checkpoint {
+        position: start.clone(),
+        server: Some(elsewhere[1].clone()),
+    };
+    let p = recover.prepare(Some(&cp), &tables).await.unwrap();
+    let SourcePosition::Pg(at) = from(&p.plan, SnapshotReason::SourceChanged) else {
+        panic!("a PostgreSQL position")
+    };
+    assert!(
+        SourcePosition::Pg(at) != start,
+        "made again, at the server's position now"
+    );
+    assert_eq!(confirmed(&a, &n).await, Some(at));
+    assert_eq!(
+        p.server, first.server,
+        "the checkpoint now names this server"
+    );
+    assert!(
+        p.warnings.iter().any(
+            |w| w.contains("source_change_action is re_snapshot, so the pipeline re-snapshots")
+        ),
+        "{:?}",
+        p.warnings
+    );
+    cleanup(&a, &n).await;
+}
+
+/// A stream reconnect, and the reset of a lost position, read the server first (Data-Flow Phase
+/// 2a, Source Disconnect; I-1): a checkpoint read on another system or timeline halts with
+/// `WAL_SOURCE_CHANGED` under `source_change_action: error`, and asks a rerun of Phase 0
+/// (`SourceChanged`) under `re_snapshot`. The slot is neither dropped nor made again; a
+/// checkpoint read on this server, or naming none, opens as before.
+#[tokio::test]
+async fn a_reconnect_to_another_server_halts_or_reruns_phase_0() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(&a, "slot_reconnect", DDL).await;
+    let halt = connector(&pipeline(&n, &["*"], "", ""));
+    let recover = connector(&pipeline(
+        &n,
+        &["*"],
+        "",
+        ", source_change_action: re_snapshot",
+    ));
+    let tables = resolved(&halt).await.tables;
+    let refs: Vec<TableRef> = tables.iter().map(|t| t.table().clone()).collect();
+    let p = halt.prepare(None, &refs).await.unwrap();
+    let start = from(&p.plan, SnapshotReason::FirstStart);
+    let Some(ServerIdentity::Postgres {
+        system_identifier,
+        timeline,
+    }) = p.server.clone()
+    else {
+        panic!("a PostgreSQL server, got {:?}", p.server)
+    };
+    a.execute(&format!("INSERT INTO {}.a VALUES (1)", n.schema), &[])
+        .await
+        .unwrap();
+    let slot = confirmed(&a, &n).await;
+    let elsewhere = [
+        ServerIdentity::Postgres {
+            system_identifier: system_identifier ^ 1,
+            timeline,
+        },
+        ServerIdentity::Postgres {
+            system_identifier,
+            timeline: timeline + 1,
+        },
+    ];
+    for server in &elsewhere {
+        let cp = Checkpoint {
+            position: start.clone(),
+            server: Some(server.clone()),
+        };
+        let e = SourceConnector::open_stream(&halt, &cp, &tables)
+            .await
+            .map(drop)
+            .unwrap_err();
+        permanent(e, "WAL_SOURCE_CHANGED");
+        let e = SourceConnector::open_stream(&recover, &cp, &tables)
+            .await
+            .map(drop)
+            .unwrap_err();
+        match e {
+            SourceError::SourceChanged(m) => assert!(
+                m.starts_with("WAL_SOURCE_CHANGED: ") && m.contains("re_snapshot"),
+                "{m}"
+            ),
+            other => panic!("SourceChanged expected, got {other:?}"),
+        }
+        permanent(
+            halt.reset_position(&cp).await.unwrap_err(),
+            "WAL_SOURCE_CHANGED",
+        );
+        assert!(matches!(
+            recover.reset_position(&cp).await,
+            Err(SourceError::SourceChanged(_))
+        ));
+        assert_eq!(
+            confirmed(&a, &n).await,
+            slot,
+            "the slot is neither dropped nor made again"
+        );
+    }
+    let here = Checkpoint {
+        position: start.clone(),
+        server: p.server.clone(),
+    };
+    for cp in [here, Checkpoint::from(start.clone())] {
+        let s = SourceConnector::open_stream(&halt, &cp, &tables)
+            .await
+            .expect("this server's checkpoint opens");
+        drop(s);
+        // The walsender lets go of the slot before the next open.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while halt.retained().await.unwrap().is_some_and(|l| l.streamed) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the slot stays active"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
     cleanup(&a, &n).await;
 }
 
@@ -216,7 +401,49 @@ async fn require_existing_never_creates() {
             .unwrap_err(),
         "require_existing",
     );
-    permanent(c.reset_position().await.unwrap_err(), "require_existing");
+    permanent(
+        c.reset_position(&Checkpoint::from(start.clone()))
+            .await
+            .unwrap_err(),
+        "slot_on_orphan",
+    );
+
+    // The DBA makes it again, past the checkpoint: refused, then adopted on request (DA-SRC-30).
+    a.execute(&format!("INSERT INTO {}.a VALUES (1)", n.schema), &[])
+        .await
+        .unwrap();
+    a.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'pgoutput')",
+        &[&n.slot],
+    )
+    .await
+    .unwrap();
+    permanent(
+        c.prepare(Some(&Checkpoint::from(start.clone())), &tables)
+            .await
+            .unwrap_err(),
+        "a slot made again, or moved by something else",
+    );
+    c.reconfigure(&pipeline(
+        &n,
+        &["*"],
+        "",
+        &format!("{postgres}, slot_on_orphan: adopt_resnapshot"),
+    ));
+    let before = confirmed(&a, &n).await;
+    // The slot starts at the WAL end it was made at: write on, so the advance has somewhere to go.
+    a.execute(&format!("INSERT INTO {}.a VALUES (2)", n.schema), &[])
+        .await
+        .unwrap();
+    let p = c
+        .prepare(Some(&Checkpoint::from(start.clone())), &tables)
+        .await
+        .unwrap();
+    let SourcePosition::Pg(at) = from(&p.plan, SnapshotReason::PositionLost) else {
+        panic!("a PostgreSQL position")
+    };
+    assert!(before.is_some_and(|b| at > b), "moved forward");
+    assert_eq!(confirmed(&a, &n).await, Some(at), "advanced, not recreated");
     c.teardown().await.unwrap();
     assert_eq!(
         published(&a, &n).await,
@@ -417,6 +644,224 @@ async fn a_slot_of_another_plugin_is_refused() {
     cleanup(&a, &n).await;
 }
 
+/// What a publication publishes besides its table list (DA-SRC-13): a tracked table's row filter
+/// or column list, and stored generated columns (PostgreSQL 18), are refused under
+/// `require_existing` and repaired under `managed`; tables the pipeline doesn't track are warned;
+/// a partition the publication names itself isn't refused for `publish_via_partition_root`; a
+/// managed publication of a schema is set to the tracked tables.
+#[tokio::test]
+async fn a_publication_s_blind_spots_are_refused_warned_or_repaired() {
+    require_it!();
+    let a = admin().await;
+    let version: i32 = a
+        .query_one("SELECT current_setting('server_version_num')::int", &[])
+        .await
+        .unwrap()
+        .get(0);
+    if version < 150_000 {
+        eprintln!("skipped: row filters, column lists and schemas need PostgreSQL 15");
+        return;
+    }
+    let n = fresh(
+        &a,
+        "slot_pub_shape",
+        "CREATE TABLE a (id int PRIMARY KEY, v int);
+         CREATE TABLE b (id int PRIMARY KEY, v int);
+         CREATE TABLE c (id int PRIMARY KEY);
+         CREATE TABLE events (id int, at date, PRIMARY KEY (id, at)) PARTITION BY RANGE (at);
+         CREATE TABLE events_2024 PARTITION OF events FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');",
+    )
+    .await;
+    let s = &n.schema;
+    let start: String = a
+        .query_one(
+            "SELECT lsn::text FROM pg_create_logical_replication_slot($1, 'pgoutput')",
+            &[&n.slot],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let at = Checkpoint::from(SourcePosition::Pg(start.parse().unwrap()));
+    let tracked = [n.table("a"), n.table("b")];
+    let existing = connector(&pipeline(
+        &n,
+        &["*"],
+        "",
+        ", slot_management: require_existing, auto_cleanup: false",
+    ));
+    let publish = |spec: String| {
+        let a = &a;
+        let p = n.publication.clone();
+        async move {
+            a.batch_execute(&format!(
+                "DROP PUBLICATION IF EXISTS {p}; CREATE PUBLICATION {p} {spec}"
+            ))
+            .await
+            .unwrap();
+        }
+    };
+    for spec in [
+        format!("FOR TABLE {s}.a WHERE (id > 0), {s}.b"),
+        format!("FOR TABLE {s}.a, {s}.b (id)"),
+    ] {
+        publish(spec.clone()).await;
+        // The filtered table halts itself at start, its recovery a re-snapshot; the others
+        // resolve.
+        let r = existing.resolve_tables().await.unwrap();
+        let filtered = if spec.contains("WHERE") { "a" } else { "b" };
+        let whole = if filtered == "a" { "b" } else { "a" };
+        assert_eq!(r.halted.len(), 1, "{:?}", r.halted);
+        assert_eq!(r.halted[0].0, n.table(filtered));
+        match &r.halted[0].1 {
+            HaltReason::NotReplicable { reason } => {
+                for needle in [
+                    n.publication.as_str(),
+                    "row filter or a column list",
+                    "BEGIN; ALTER PUBLICATION",
+                    "COMMIT;",
+                    "re-snapshot the table",
+                ] {
+                    assert!(
+                        reason.contains(needle),
+                        "{reason:?} should mention {needle:?}"
+                    );
+                }
+            }
+            other => panic!("NotReplicable expected, got {other:?}"),
+        }
+        let resolved: Vec<_> = r.tables.iter().map(|t| t.table().clone()).collect();
+        assert!(resolved.contains(&n.table(whole)), "{resolved:?}");
+        assert!(!resolved.contains(&n.table(filtered)), "{resolved:?}");
+        // A caller that passes it to prepare anyway is still refused.
+        permanent(
+            existing.prepare(Some(&at), &tracked).await.unwrap_err(),
+            "with a row filter or a column list",
+        );
+    }
+    // A filter on a table the pipeline doesn't track, and the table itself, are only warned.
+    publish(format!("FOR TABLE {s}.a, {s}.b, {s}.c WHERE (id > 0)")).await;
+    let p = existing.prepare(Some(&at), &tracked).await.unwrap();
+    assert_eq!(p.plan, StartPlan::Resume);
+    assert!(
+        p.warnings.iter().any(|w| w.contains(&format!(
+            "also publishes tables the pipeline doesn't replicate ({s}.c)"
+        ))),
+        "{:?}",
+        p.warnings
+    );
+    // A partition named itself arrives under its own name.
+    publish(format!(
+        "FOR TABLE {s}.events_2024 WITH (publish_via_partition_root = true)"
+    ))
+    .await;
+    let p = existing
+        .prepare(Some(&at), &[n.table("events_2024")])
+        .await
+        .unwrap();
+    assert_eq!(p.plan, StartPlan::Resume);
+
+    // Managed: the filter and the schema go, the tracked tables are published whole.
+    publish(format!(
+        "FOR TABLE {s}.a WHERE (id > 0), TABLES IN SCHEMA {s}"
+    ))
+    .await;
+    let managed = connector(&pipeline(&n, &["*"], "", ""));
+    let p = managed.prepare(Some(&at), &tracked).await.unwrap();
+    from(&p.plan, SnapshotReason::PositionLost);
+    assert_eq!(published(&a, &n).await, ["a", "b"]);
+    let filters: i64 = a
+        .query_one(
+            "SELECT count(*) FROM pg_publication_rel r JOIN pg_publication p ON p.oid = r.prpubid
+              WHERE p.pubname = $1 AND (r.prqual IS NOT NULL OR r.prattrs IS NOT NULL)",
+            &[&n.publication],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(filters, 0);
+
+    if version >= 180_000 {
+        a.batch_execute(&format!(
+            "ALTER TABLE {s}.b ADD COLUMN twice int GENERATED ALWAYS AS (v * 2) STORED"
+        ))
+        .await
+        .unwrap();
+        publish(format!(
+            "FOR TABLE {s}.a, {s}.b WITH (publish_generated_columns = stored)"
+        ))
+        .await;
+        permanent(
+            existing.prepare(Some(&at), &tracked).await.unwrap_err(),
+            "publishes stored generated columns",
+        );
+        let p = managed.prepare(Some(&at), &tracked).await.unwrap();
+        from(&p.plan, SnapshotReason::PositionLost);
+        let stored: bool = a
+            .query_one(
+                "SELECT pubgencols = 's' FROM pg_publication WHERE pubname = $1",
+                &[&n.publication],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(!stored, "set to none");
+    }
+    cleanup(&a, &n).await;
+}
+
+/// A managed publication's direct members become exactly the tracked set: a partitioned root the
+/// publication names (not via the root) is dropped and its tracked leaves are added, without a
+/// re-snapshot (the leaves were published through the root).
+#[tokio::test]
+async fn a_managed_publication_of_a_partitioned_root_is_set_to_the_tracked_leaves() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(
+        &a,
+        "slot_pub_root_members",
+        "CREATE TABLE events (id int, at date, PRIMARY KEY (id, at)) PARTITION BY RANGE (at);
+         CREATE TABLE events_2024 PARTITION OF events FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');",
+    )
+    .await;
+    a.batch_execute(&format!(
+        "CREATE PUBLICATION {} FOR TABLE {}.events WITH (publish_via_partition_root = false)",
+        n.publication, n.schema
+    ))
+    .await
+    .unwrap();
+    let start: String = a
+        .query_one(
+            "SELECT lsn::text FROM pg_create_logical_replication_slot($1, 'pgoutput')",
+            &[&n.slot],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let at = Checkpoint::from(SourcePosition::Pg(start.parse().unwrap()));
+    let managed = connector(&pipeline(&n, &["*"], "", ""));
+    let p = managed
+        .prepare(Some(&at), &[n.table("events_2024")])
+        .await
+        .unwrap();
+    assert_eq!(p.plan, StartPlan::Resume);
+    assert!(p.added.is_empty(), "{:?}", p.added);
+    let members: Vec<String> = a
+        .query(
+            "SELECT c.relname::text FROM pg_publication_rel r
+               JOIN pg_publication p ON p.oid = r.prpubid
+               JOIN pg_class c ON c.oid = r.prrelid
+              WHERE p.pubname = $1 ORDER BY 1",
+            &[&n.publication],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(members, ["events_2024"]);
+    cleanup(&a, &n).await;
+}
+
 #[tokio::test]
 async fn a_root_publication_of_tracked_partitions_is_refused() {
     require_it!();
@@ -546,9 +991,18 @@ async fn reset_teardown_and_retained_wal() {
     assert!(!retained.streamed, "no stream reads the slot");
     assert_eq!(retained.behind, None, "the binlog lag is MySQL's");
 
-    let SourcePosition::Pg(fresh_at) = c.reset_position().await.unwrap() else {
+    let reset = c
+        .reset_position(&Checkpoint {
+            position: start.clone(),
+            server: p.server.clone(),
+        })
+        .await
+        .unwrap();
+    let SourcePosition::Pg(fresh_at) = reset.position else {
         panic!("a PostgreSQL position")
     };
+    assert!(reset.server.is_some(), "the checkpoint names its server");
+    assert_eq!(reset.server, p.server, "the server prepare reported");
     let SourcePosition::Pg(old) = start else {
         unreachable!()
     };

@@ -14,8 +14,8 @@ helm install cdc oci://ghcr.io/alex-karpenko/charts/data-avalanche --version <ve
   --set-file config=config.yaml -f values.yaml
 ```
 
-Until the first release, install it from a checkout: `helm install cdc deploy/helm/data-avalanche
-…`. The chart's [README](https://github.com/alex-karpenko/data-avalanche/tree/main/deploy/helm/data-avalanche)
+From a checkout, `helm install cdc deploy/helm/data-avalanche …` installs the same chart. The
+chart's [README](https://github.com/alex-karpenko/data-avalanche/tree/main/deploy/helm/data-avalanche)
 lists every value.
 
 ## The config

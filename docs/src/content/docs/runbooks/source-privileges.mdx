@@ -65,7 +65,27 @@ pipeline runs, set `slot_on_orphan` back to `halt` (a reload applies it), so tha
 state is lost later stops rather than starting over by itself.
 
 With `require_existing`, a table the pipeline replicates but the publication doesn't publish is a
-warning: its changes never arrive. Keep the publication in step with `tables.include`.
+warning: its changes never arrive. Keep the publication in step with `tables.include`, and publish
+the tables whole. A replicated table published with a row filter or a column list (PostgreSQL 15
+and later) halts itself: publish it whole in one transaction, then copy it again (see
+[Sources](/data-avalanche/configuration/sources/#postgresql) and
+[A halted table](/data-avalanche/runbooks/halted-table/)). A publication with
+`publish_generated_columns = stored` is refused for the whole pipeline when a replicated table has
+a stored generated column.
+
+A privilege lost later halts the table it was lost on (MySQL: see its tab), when a snapshot chunk reads it; the other
+tables run on. `SELECT` revoked on one table is the case (PostgreSQL error 42501; MySQL and
+MariaDB show it otherwise, see their tab). A revoke on the whole role or schema gives every table the same error, so every table
+halts, and each is copied again once the grant is back (see
+[A halted table](/data-avalanche/runbooks/halted-table/)). A `toast_strategy: re_query` fetch that
+meets the error ends the pipeline's session instead: the pipeline stops in `error`.
+
+A text key whose collation, or whose domain type, lives in a schema other than `pg_catalog` needs
+`USAGE` on that schema for the role: the snapshot's cursor names both with their schema. Without it the chunk read fails with 42501
+and halts the table.
+
+Point the pipeline at the primary: a standby (a server in recovery) is refused on every version
+(see [Sources](/data-avalanche/configuration/sources/#postgresql)).
 
 On a managed service, follow its guide to logical replication: on Amazon RDS and Aurora the role
 is granted `rds_replication` and `rds.logical_replication` is set; on Cloud SQL the
@@ -99,6 +119,20 @@ CREATE USER 'cdc'@'%' IDENTIFIED BY '…';
 GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'cdc'@'%';
 ```
 
+A privilege lost later halts that table; the other tables run on. How it shows depends on what the
+user still holds on the table (measured on MySQL 8.4 and MariaDB 11.8):
+
+- `SELECT` revoked, and no other privilege on the table: `information_schema` hides the table from
+  the user, so the pipeline sees it as dropped and halts it **`TABLE_DROPPED`**, at the next start
+  or when a snapshot chunk reads it. Before you remove such a table from the config, check the
+  grants: `SHOW GRANTS FOR 'cdc'@'%'`.
+- `SELECT` revoked while another privilege on the table keeps it visible (an `INSERT`, say): the
+  chunk's read fails with error 1142 (1143 for a column) and the table halts
+  `TABLE_NOT_REPLICABLE`, the detail naming the error.
+
+A schema-wide revoke halts every table the same way. Each is copied again once the grant is back
+(see [A halted table](/data-avalanche/runbooks/halted-table/)).
+
 `SELECT` on `*.*` covers the tables and the catalog; grant it on the pipeline's database
 (`shop.*`) instead to narrow it, keeping `REPLICATION SLAVE` and `REPLICATION CLIENT` global.
 
@@ -125,6 +159,10 @@ GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT, SLAVE MONITOR ON *.* TO 'cd
 
 `REPLICATION CLIENT` is MariaDB's `BINLOG MONITOR` since 10.5. `SLAVE MONITOR` lets the pipeline
 read a replica's status to check `log_slave_updates`; without it the pipeline warns.
+
+A Galera node (`wsrep_on = ON`) applies the other nodes' writes without a replica connection: it
+needs `log_slave_updates = ON`, or the pipeline refuses it, since its binlog would lack those
+writes.
 
 </TabItem>
 </Tabs>

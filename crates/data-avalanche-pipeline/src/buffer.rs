@@ -6,7 +6,8 @@ use std::collections::HashMap;
 
 use data_avalanche_core::{
     CdcEvent, ColumnValue, ColumnValueType, Decimal, HaltReason, LogicalType, Op, PositionRange,
-    Row, SourcePosition, SourceSeq, SplitInfo, TableChangeSet, TableSchema, upsert_schema,
+    Row, SourcePosition, SourceSeq, SplitInfo, TableChangeSet, TableSchema, row_bytes,
+    upsert_schema,
 };
 
 use crate::AccumulatorError;
@@ -81,21 +82,6 @@ pub(crate) fn identity(schema: &TableSchema, row: &Row) -> Option<Key> {
         })
         .collect::<Option<_>>()
         .map(Key)
-}
-
-/// Rough in-memory size of a row, for the flush `bytes` trigger and the transaction buffer ceiling.
-pub(crate) fn row_bytes(values: &[ColumnValue]) -> usize {
-    fn value_bytes(v: &ColumnValue) -> usize {
-        let payload = match v {
-            ColumnValue::Text(s) => s.len(),
-            ColumnValue::Bytes(b) => b.len(),
-            ColumnValue::Json(j) => j.to_string().len(),
-            ColumnValue::Array { values, .. } => values.iter().map(value_bytes).sum(),
-            _ => 0,
-        };
-        size_of::<ColumnValue>() + payload
-    }
-    values.iter().map(value_bytes).sum()
 }
 
 /// Conform a source value to its column: the type must match (a mismatch means the buffer's schema
@@ -594,6 +580,7 @@ impl TableBuffer {
             position,
             split,
             snapshot: false,
+            reposition: false,
         }
     }
 }

@@ -250,6 +250,10 @@ async fn chunks_walk_the_table_in_key_order() {
         None,
         "no text key, no collation"
     );
+    assert!(
+        matches!(c.read_chunk(t, None, 0).await, Err(SourceError::Permanent(m)) if m.contains("0 rows")),
+        "a chunk of no rows isn't the table's end"
+    );
     cleanup(&a, &n).await;
 }
 
@@ -276,10 +280,14 @@ async fn text_keys_page_in_one_deterministic_collation() {
          CREATE TABLE \"Codes\" (code text COLLATE \"en_US.utf8\" PRIMARY KEY);
          CREATE TABLE folded (code text COLLATE folding PRIMARY KEY);
          INSERT INTO \"Codes\" VALUES ('b'), ('B'), ('a'), ('Z'), ('é'), ('a b'), ('ab');
-         INSERT INTO folded VALUES ('b'), ('A'), ('é'), ('Z'), ('a b');",
+         INSERT INTO folded VALUES ('b'), ('A'), ('é'), ('Z'), ('a b');
+         CREATE TABLE indexed (id int PRIMARY KEY, code text COLLATE \"en_US.utf8\" NOT NULL);
+         CREATE UNIQUE INDEX indexed_code ON indexed (code COLLATE \"C\");
+         ALTER TABLE indexed REPLICA IDENTITY USING INDEX indexed_code;",
     )
     .await;
-    let c = connector(&pipeline(&n, &["*"], "", ""));
+    let keyed = format!("      primary_key: {{ {}.indexed: [code] }}", n.schema);
+    let c = connector(&pipeline(&n, &["*"], &keyed, ""));
     let r = resolved(&c).await;
     let table = |name: &str| {
         r.tables
@@ -343,6 +351,14 @@ async fn text_keys_page_in_one_deterministic_collation() {
         r.warnings
             .iter()
             .any(|w| w.contains(".folded.code") && w.contains("nondeterministic")),
+        "{:?}",
+        r.warnings
+    );
+    // A key whose index sorts it in another collation than its own (DA-SRC-15).
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains(".indexed.code: the key's index sorts it in C")),
         "{:?}",
         r.warnings
     );
@@ -416,6 +432,52 @@ async fn a_domain_over_char_key_resumes() {
     assert_eq!(keys, [&V::Int16(97), &V::Int16(98), &V::Int16(255)]);
     let again = c.fetch_rows(t, &rows).await.unwrap();
     assert_eq!(again.len(), 3);
+    cleanup(&a, &n).await;
+}
+
+/// A key column of a domain with its own collation, declared with another: the cursor carries
+/// the column's collation, named with its schema, so the comparison has one (DA-SRC-15; 42P22
+/// from the second chunk before).
+#[tokio::test]
+async fn a_domain_key_declared_with_another_collation_resumes() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(
+        &a,
+        "chunks_domain_collation",
+        "CREATE DOMAIN code AS text COLLATE \"POSIX\";
+         CREATE TABLE t (code code COLLATE \"C\" PRIMARY KEY);
+         INSERT INTO t VALUES ('b'), ('a'), ('B'), ('c');",
+    )
+    .await;
+    let c = connector(&pipeline(&n, &["*"], "", ""));
+    let t = &resolved(&c).await.tables[0];
+    let (rows, _) = read_all(&c, t, 1).await;
+    assert_eq!(texts(&rows), ["B", "a", "b", "c"], "in C order");
+    cleanup(&a, &n).await;
+}
+
+/// The `re_query` re-read of the same table: its key literals take the column's collation too
+/// (DA-SRC-15, 42P22 otherwise).
+#[tokio::test]
+async fn a_domain_key_declared_with_another_collation_is_re_read() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(
+        &a,
+        "fetch_domain_collation",
+        "CREATE DOMAIN code AS text COLLATE \"POSIX\";
+         CREATE TABLE t (code code COLLATE \"C\" PRIMARY KEY);
+         INSERT INTO t VALUES ('b'), ('a'), ('B'), ('c');",
+    )
+    .await;
+    let c = connector(&pipeline(&n, &["*"], "", ""));
+    let t = &resolved(&c).await.tables[0];
+    let key = |k: &str| Row(vec![("code".into(), V::Text(k.into()))]);
+    let rows = c.fetch_rows(t, &[key("a"), key("B")]).await.unwrap();
+    let mut got = texts(&rows);
+    got.sort();
+    assert_eq!(got, ["B", "a"]);
     cleanup(&a, &n).await;
 }
 

@@ -155,9 +155,20 @@ impl Connector {
         f: impl Future<Output = Result<T, tokio_postgres::Error>>,
     ) -> Result<T, SourceError> {
         // The connection `f` runs on: the caller has just taken it from [`Self::client`]. Had
-        // another call replaced it in between, a timeout abandons the newer one.
-        let at_start = self.client.lock().await.clone();
-        match tokio::time::timeout(after, f).await {
+        // another call replaced it in between, a timeout abandons the newer one. The wait for the
+        // cache, which a reconnect holds, is inside the budget (DA-SRC-17).
+        // The guard goes at the end of the arm: `abandon` takes the cache again.
+        let deadline = tokio::time::Instant::now() + after;
+        let at_start = match tokio::time::timeout_at(deadline, self.client.lock()).await {
+            Ok(cache) => cache.clone(),
+            Err(_) => {
+                return Err(timed_out(
+                    &format!("{what} (waiting for the catalog connection)"),
+                    after,
+                ));
+            }
+        };
+        match tokio::time::timeout_at(deadline, f).await {
             Ok(r) => r.map_err(sql_error),
             Err(_) => {
                 if let Some(client) = at_start {
@@ -275,6 +286,76 @@ mod tests {
             config.get_ssl_mode(),
             tokio_postgres::config::SslMode::Disable
         );
+    }
+
+    /// A call queued behind a reconnect that holds the connection cache gives up within its own
+    /// budget, not the reconnect's.
+    #[tokio::test]
+    async fn a_bounded_call_waits_for_the_cache_within_its_budget() {
+        let c = Connector::new(&pipeline("public.t").source).unwrap();
+        let held = c.client.lock().await;
+        let started = tokio::time::Instant::now();
+        let r = tokio::time::timeout(
+            Duration::from_secs(5),
+            c.bounded("a query", Duration::from_millis(100), async {
+                Ok::<_, tokio_postgres::Error>(())
+            }),
+        )
+        .await
+        .expect("the call returns within its budget");
+        assert!(matches!(r, Err(SourceError::Transient(m)) if m.contains("timed out")));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(held);
+    }
+
+    /// A server that completes the startup, then answers no query (frozen mid-session): a call
+    /// on the cached connection times out within its budget, and abandons the connection.
+    #[tokio::test]
+    async fn a_call_on_a_frozen_connection_times_out_and_frees_the_cache() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let mut sockets = vec![];
+            while let Ok((mut s, _)) = listener.accept().await {
+                // A startup packet or a cancel request: its length, then the rest.
+                let mut len = [0u8; 4];
+                if s.read_exact(&mut len).await.is_err() {
+                    continue;
+                }
+                let mut rest = vec![0u8; u32::from_be_bytes(len) as usize - 4];
+                let _ = s.read_exact(&mut rest).await;
+                // AuthenticationOk, BackendKeyData, ReadyForQuery (idle), then silence.
+                let mut reply = vec![b'R', 0, 0, 0, 8, 0, 0, 0, 0];
+                reply.extend([b'K', 0, 0, 0, 12, 0, 0, 0, 1, 0, 0, 0, 2]);
+                reply.extend([b'Z', 0, 0, 0, 5, b'I']);
+                let _ = s.write_all(&reply).await;
+                sockets.push(s);
+            }
+        });
+        let mut source = pipeline("public.t").source;
+        source.port = port;
+        source.timeouts.connect = Duration::from_millis(300);
+        let c = Connector::new(&source).unwrap();
+        let client = c.client().await.expect("the startup completes");
+        let started = tokio::time::Instant::now();
+        let r = tokio::time::timeout(
+            Duration::from_secs(5),
+            c.bounded(
+                "a query",
+                Duration::from_millis(200),
+                client.simple_query("SELECT 1"),
+            ),
+        )
+        .await
+        .expect("the call returns within its budget");
+        assert!(matches!(r, Err(SourceError::Transient(m)) if m.contains("timed out")));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            c.client.lock().await.is_none(),
+            "the frozen connection is abandoned"
+        );
+        server.abort();
     }
 
     /// A server that accepts the connection and never answers: the startup times out.

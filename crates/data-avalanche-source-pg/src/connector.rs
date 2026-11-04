@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use data_avalanche_config::{
-    Pipeline, Postgres, SlotOnOrphan, SourceType, Tables, check_table_set, check_unbounded_numeric,
+    Pipeline, Postgres, SlotOnOrphan, SourceChangeAction, SourceType, Tables, check_table_set,
+    check_unbounded_numeric,
 };
 use data_avalanche_core::{
     ChangeStream, Checkpoint, Chunk, HaltReason, InFlightTxn, KeysetCursor, Preflight, Prepared,
@@ -31,6 +32,8 @@ pub(crate) struct Live {
     pub heartbeat: Duration,
     /// From the next prepare.
     pub slot_on_orphan: SlotOnOrphan,
+    /// From the next prepare.
+    pub source_change_action: SourceChangeAction,
     /// At the teardown.
     pub auto_cleanup: bool,
     /// `tables.include` and `tables.exclude`, from the next resolve: in place only while the
@@ -44,6 +47,7 @@ impl Live {
         Self {
             heartbeat: pg.heartbeat,
             slot_on_orphan: pg.slot_on_orphan,
+            source_change_action: pg.source_change_action,
             auto_cleanup: pg.auto_cleanup,
             include: tables.include.clone(),
             exclude: tables.exclude.clone(),
@@ -96,7 +100,8 @@ impl PgConnector {
 
     /// The pipeline-level start checks (config §11.2, `Schema_Change…` §9): the server is
     /// PostgreSQL 14 or newer with `wal_level = logical`, the database encoding is UTF8 (D-M5.8),
-    /// and the user can read the catalogs channels A/C/D query. A user without the `REPLICATION`
+    /// the server is not a standby (in recovery), and the user can read the catalogs channels A/C/D
+    /// query. A user without the `REPLICATION`
     /// attribute warns: a managed service may grant replication another way.
     pub async fn preflight(&self) -> Result<Preflight, SourceError> {
         let client = self.conn.client().await?;
@@ -114,18 +119,20 @@ impl PgConnector {
                               AND has_table_privilege('pg_catalog.pg_attribute', 'SELECT')
                               AND has_table_privilege('pg_catalog.pg_index', 'SELECT')
                               AND has_table_privilege('pg_catalog.pg_type', 'SELECT')
-                              AND has_table_privilege('pg_catalog.pg_namespace', 'SELECT')
+                              AND has_table_privilege('pg_catalog.pg_namespace', 'SELECT'),
+                            pg_is_in_recovery()
                        FROM pg_catalog.pg_database d, pg_catalog.pg_roles r
                       WHERE d.datname = current_database() AND r.rolname = current_user",
                     &[],
                 ),
             )
             .await?;
-        let (num, version, wal_level, encoding, replication, catalogs): (
+        let (num, version, wal_level, encoding, replication, catalogs, recovery): (
             i32,
             String,
             String,
             String,
+            bool,
             bool,
             bool,
         ) = (
@@ -135,6 +142,7 @@ impl PgConnector {
             row.get(3),
             row.get(4),
             row.get(5),
+            row.get(6),
         );
         let refuse = |m: String| Err(SourceError::Permanent(m));
         if num < MIN_SERVER_VERSION {
@@ -158,6 +166,9 @@ impl PgConnector {
             );
         }
         let mut warnings = vec![];
+        if let Err(m) = standby(recovery) {
+            return refuse(m);
+        }
         if !replication {
             warnings.push(
                 "the user has neither the REPLICATION attribute nor superuser; the replication connection may be refused".into(),
@@ -208,6 +219,7 @@ impl PgConnector {
         let live = self.live();
         let selection = catalog::select(&live.include, &live.exclude, &relations);
         let (mut out, unconstrained) = self.described(selection).await?;
+        self.halt_filtered_tables(&mut out).await?;
         // Halted tables are in the set: their per-table config keys aren't stale (V-106).
         let resolved: Vec<TableRef> = out
             .tables
@@ -217,11 +229,9 @@ impl PgConnector {
             .collect();
         let mut report = check_table_set(&self.pipeline, &resolved);
         report.extend(check_unbounded_numeric(&self.pipeline, &unconstrained));
-        if let Some(e) = report.errors.first() {
-            return Err(SourceError::Permanent(format!(
-                "{} {}: {}",
-                e.rule, e.path, e.message
-            )));
+        // Every error, not the first (DA-SRC-17).
+        if let Some(refusal) = report.refusal() {
+            return Err(SourceError::Permanent(refusal));
         }
         out.warnings.extend(
             report
@@ -264,6 +274,14 @@ impl PgConnector {
                             "{key}.{column}: the key's collation {collation} is nondeterministic, \
                              so snapshot chunks order it by \"C\": each chunk scans the table \
                              unless an index has ({column} COLLATE \"C\")"
+                        ));
+                    }
+                    for (column, collation) in notes.index_ordered_otherwise {
+                        out.warnings.push(format!(
+                            "{key}.{column}: the key's index sorts it in {collation}, not in the \
+                             column's own collation, which snapshot chunks order by: \
+                             each chunk scans the table unless an index has ({column}) in its \
+                             own collation"
                         ));
                     }
                     unconstrained.extend(
@@ -315,6 +333,22 @@ impl PgConnector {
     }
 }
 
+/// A standby (in recovery) as a source (DA-SRC-17), on every version: the source reads the
+/// primary's WAL position (`pg_current_wal_lsn()`, refused during recovery) for the snapshot
+/// watermark and the lag, and a managed publication's DDL fails on a read-only server. Refused by
+/// name here, not by the server's error at the first chunk.
+fn standby(in_recovery: bool) -> Result<(), String> {
+    if in_recovery {
+        return Err(
+            "the server is a standby (in recovery); point the pipeline at its primary: the source \
+             reads the primary's WAL position and may change the publication, which a standby \
+             can't"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// The trait is the inherent methods of the modules: `catalog` and here (channel A), `slot`
 /// (the lifecycle), `snapshot`, `stream`, `schema` (channels C and D).
 #[async_trait]
@@ -339,10 +373,8 @@ impl SourceConnector for PgConnector {
         PgConnector::prepare(self, checkpoint, tables).await
     }
 
-    async fn reset_position(&self) -> Result<Checkpoint, SourceError> {
-        PgConnector::reset_position(self)
-            .await
-            .map(Checkpoint::from)
+    async fn reset_position(&self, lost: &Checkpoint) -> Result<Checkpoint, SourceError> {
+        PgConnector::reset_position(self, lost).await
     }
 
     async fn retained(&self) -> Result<Option<RetainedLog>, SourceError> {
@@ -375,7 +407,7 @@ impl SourceConnector for PgConnector {
         from: &Checkpoint,
         tables: &[TableSchema],
     ) -> Result<Box<dyn ChangeStream>, SourceError> {
-        Ok(PgConnector::open_stream(self, &from.position, tables).await?)
+        Ok(PgConnector::open_stream_at(self, from, tables).await?)
     }
 
     async fn end_other_reader(&self) -> Result<bool, SourceError> {
@@ -417,6 +449,17 @@ mod tests {
     use crate::test_support::pipeline;
 
     #[test]
+    fn a_standby_is_refused() {
+        assert_eq!(standby(false), Ok(()));
+        let e = standby(true).unwrap_err();
+        assert!(
+            e.starts_with("the server is a standby (in recovery)"),
+            "{e}"
+        );
+        assert!(!e.contains("  "), "no run of spaces: {e}");
+    }
+
+    #[test]
     fn a_connector_is_a_source_connector() {
         let c: Box<dyn SourceConnector> =
             Box::new(PgConnector::new(&pipeline("public.t")).unwrap());
@@ -445,6 +488,7 @@ mod tests {
         let pg = next.source.postgres.as_mut().unwrap();
         pg.heartbeat = Duration::from_secs(7);
         pg.slot_on_orphan = SlotOnOrphan::AdoptResnapshot;
+        pg.source_change_action = SourceChangeAction::ReSnapshot;
         pg.auto_cleanup = true;
         pg.slot = "another_slot".into();
         next.tables.include = vec!["public.t".into(), "public.u".into()];
@@ -453,6 +497,7 @@ mod tests {
         let live = Live {
             heartbeat: Duration::from_secs(7),
             slot_on_orphan: SlotOnOrphan::AdoptResnapshot,
+            source_change_action: SourceChangeAction::ReSnapshot,
             auto_cleanup: true,
             include: vec!["public.t".into(), "public.u".into()],
             exclude: vec!["public.v".into()],

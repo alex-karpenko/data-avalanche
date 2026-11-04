@@ -4,6 +4,7 @@
 
 mod common;
 mod conformance;
+mod keys;
 mod local;
 mod scenarios;
 mod stores;

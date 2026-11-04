@@ -1,6 +1,7 @@
 # Integration-test infrastructure. Default profile = newest of each engine + S3/Azure emulators.
 # GCS has no usable emulator for object_store; GCS tests use a real bucket (see README.md).
 # `matrix` profile adds the older supported versions (P-8). `init` profile = one-shot bucket creation.
+# `replica` profile = a PostgreSQL primary and its standby (the failover E2E).
 # Host ports are fixed and non-default; see README.md.
 name: data-avalanche-test
 
@@ -22,14 +23,34 @@ services:
   postgres-16: { <<: *pg, image: "postgres:16", ports: ["55416:5432"], profiles: [matrix] }
   postgres-15: { <<: *pg, image: "postgres:15", ports: ["55415:5432"], profiles: [matrix] }
   postgres-14: { <<: *pg, image: "postgres:14", ports: ["55414:5432"], profiles: [matrix] }
-  # TLS required on every TCP connection, throwaway certificates made at start (postgres-tls.sh).
+  # TLS required on every TCP connection, throwaway certificates made at start (postgres-tls.sh,
+  # which runs the anchor's command with the TLS settings added).
   postgres-tls:
+    <<: *pg
     image: "postgres:18"
-    environment: { POSTGRES_USER: avalanche, POSTGRES_PASSWORD: avalanche, POSTGRES_DB: avalanche }
     entrypoint: ["bash", "/postgres-tls.sh"]
     volumes: ["./postgres-tls.sh:/postgres-tls.sh:ro", "./.tls:/tls"]
     ports: ["55419:5432"]
-    healthcheck: { test: ["CMD-SHELL", "pg_isready -U avalanche -d avalanche"], interval: 2s, retries: 30 }
+  # A primary and its streaming standby (profile replica), for the failover E2E
+  # (crates/data-avalanche/tests/e2e/failover.rs): the test promotes the standby, so the pair is
+  # good for one run. Both on tmpfs; recreate both for the next run:
+  #   docker compose -f test-infra/compose.yaml --profile replica up -d --wait --force-recreate postgres-primary postgres-replica
+  postgres-primary:
+    <<: *pg
+    image: "postgres:18"
+    profiles: [replica]
+    volumes: ["./postgres-primary.sh:/docker-entrypoint-initdb.d/replication.sh:ro"]
+    tmpfs: [/var/lib/postgresql]
+    ports: ["55420:5432"]
+  postgres-replica:
+    <<: *pg
+    image: "postgres:18"
+    profiles: [replica]
+    entrypoint: ["bash", "/postgres-replica.sh"]
+    volumes: ["./postgres-replica.sh:/postgres-replica.sh:ro"]
+    tmpfs: [/var/lib/postgresql]
+    ports: ["55421:5432"]
+    depends_on: { postgres-primary: { condition: service_healthy } }
 
   mysql-84:
     image: "mysql:8.4"

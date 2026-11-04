@@ -320,6 +320,11 @@ fn civil_days(date: &str, bc: bool, text: &str) -> Result<i64, ValueError> {
     if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
         return Err(bad("not an ISO date:", text));
     }
+    // PostgreSQL's years end at 5874897 (`date`) and 4714 BC; a longer one is crafted text, and
+    // would overflow the day count (DA-SRC-17).
+    if y > if bc { 4714 } else { 5_874_897 } {
+        return Err(bad("date out of range:", text));
+    }
     // 1 BC is year 0, 2 BC is year -1.
     let y = if bc { 1 - y } else { y };
     Ok(days_from_civil(y, m, d))
@@ -553,6 +558,33 @@ mod tests {
             matches!(decode(&d, text), Err(ValueError::Unrepresentable(_))),
             "{text:?} should be refused"
         );
+    }
+
+    /// Crafted text PostgreSQL never prints: a year past its range is refused, not overflowed
+    /// (DA-SRC-17).
+    #[test]
+    fn a_year_past_postgresql_s_range_is_refused() {
+        for text in [
+            "9223372036854775807-01-01",
+            "5874898-01-01",
+            "9000000000000-12-31 23:59:59+00",
+        ] {
+            let decoded = if text.contains(' ') {
+                decode(&Decode::Timestamp { with_tz: true }, text)
+            } else {
+                decode(&Decode::Date, text)
+            };
+            assert!(
+                matches!(decoded, Err(ValueError::Unrepresentable(_))),
+                "{text}: {decoded:?}"
+            );
+        }
+        assert!(decode(&Decode::Date, "5874897-12-31").is_ok());
+        assert!(matches!(
+            decode(&Decode::Date, "4715-01-01 BC"),
+            Err(ValueError::Unrepresentable(_))
+        ));
+        assert!(decode(&Decode::Date, "4714-11-24 BC").is_ok());
     }
 
     #[test]

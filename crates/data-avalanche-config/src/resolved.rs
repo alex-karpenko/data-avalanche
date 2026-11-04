@@ -233,6 +233,9 @@ pub struct Postgres {
     pub heartbeat: Duration,
     pub slot_management: SlotManagement,
     pub slot_on_orphan: SlotOnOrphan,
+    /// What a start does when the server isn't the one the checkpoint was read on (another system
+    /// identifier, or another timeline after a promotion): `error` halts `WAL_SOURCE_CHANGED`.
+    pub source_change_action: SourceChangeAction,
     /// `None` = alert only (§9.2.1).
     pub max_wal_lag_bytes: Option<u64>,
 }

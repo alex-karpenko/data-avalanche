@@ -5377,12 +5377,14 @@ git commit -m "gap: v1 §50 — M11b's docs: DA-OPS-8, DA-API-14/15, DA-SNAP-17/
 
 ## Exit
 
-- [ ] `npm ci && npm run build` in `docs/` passes with its link validation (the roadmap's exit,
-  amended by Q-M11b-1), in `docs.yml` on the PR.
-- [ ] Every config example of the pages validates (`every_config_example_in_the_docs_validates`),
-  and the generated pages are current (`the_generated_pages_are_current`), in `ci.yml` on the PR.
-- [ ] After the merge, with the Pages source set to "GitHub Actions": `docs.yml`'s run on `main`
-  deploys, and `https://alex-karpenko.github.io/data-avalanche/` serves the site.
+- [x] `npm ci && npm run build` in `docs/` passes with its link validation (the roadmap's exit,
+  amended by Q-M11b-1), in `docs.yml` on the PR (run 41020209936).
+- [x] Every config example of the pages validates (`every_config_example_in_the_docs_validates`),
+  and the generated pages are current (`the_generated_pages_are_current`), in `ci.yml` on the PR
+  (run 41020210010).
+- [x] After the merge, with the Pages source set to "GitHub Actions": `docs.yml`'s run on `main`
+  deploys, and `https://alex-karpenko.github.io/data-avalanche/` serves the site (run
+  41025275696, 2026-10-30).
 
 ## Deviations during execution
 

@@ -193,6 +193,7 @@ pub(crate) struct RawPostgres {
     pub heartbeat: L<Duration>,
     pub slot_management: L<SlotManagement>,
     pub slot_on_orphan: L<SlotOnOrphan>,
+    pub source_change_action: L<SourceChangeAction>,
     #[serde(default, deserialize_with = "tri")]
     pub max_wal_lag_bytes: Tri<ByteSize>,
 }

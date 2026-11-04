@@ -243,9 +243,10 @@ impl DeltaSink {
         // Before the truncate's DELETE: a key that halts the MERGE must not leave the table
         // cleared.
         check_keys(cs, &types)?;
+        // The union of the stored position and this set's end, or a reposition's own (DA-SRC-20).
         let position = match &stored {
-            Some(p) => p.union(&cs.position.end)?,
-            None => cs.position.end.clone(),
+            Some(p) if !cs.reposition => p.union(&cs.position.end)?,
+            _ => cs.position.end.clone(),
         };
         let txn_version = i64::try_from(marker.owner_epoch)
             .map_err(|_| permanent(format!("owner epoch {}", marker.owner_epoch)))?;

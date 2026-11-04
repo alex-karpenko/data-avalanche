@@ -319,11 +319,9 @@ impl MySqlConnector {
             .chain(out.halted.iter().map(|(t, _)| t.clone()))
             .collect();
         let report = check_table_set(&self.pipeline, &resolved);
-        if let Some(e) = report.errors.first() {
-            return Err(SourceError::Permanent(format!(
-                "{} {}: {}",
-                e.rule, e.path, e.message
-            )));
+        // Every error, not the first (DA-SRC-17).
+        if let Some(refusal) = report.refusal() {
+            return Err(SourceError::Permanent(refusal));
         }
         out.warnings.extend(
             report

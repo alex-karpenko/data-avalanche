@@ -38,6 +38,27 @@ them on the new version.
 [Config changes](/data-avalanche/runbooks/config-changes/)). Upgrade first, then reload the new
 config once every node runs the new version, so that every node can apply it.
 
+## Changes that can halt a table or a pipeline after an upgrade
+
+These take effect at the first start on the new version:
+
+- **A PostgreSQL table keyed by a `bit`, `varbit` or PostGIS column** that is already replicating halts with
+  `IDENTIFIER_NOT_USABLE`: its key can't resume a snapshot. Override the key column to `string`
+  (`tables.column_type_overrides: { <schema.table.column>: string }`) and copy the table again. The
+  override changes the Delta column from `binary` to `string`, so drop or move the Delta table
+  before the copy. See [A halted table](/data-avalanche/runbooks/halted-table/).
+- **A PostgreSQL standby** the pipeline read from is now refused, on every version, and the
+  pipeline stops in `error`. Before, it wasn't checked. Point the pipeline at the primary.
+- **A table the publication publishes with a row filter or a column list**, under
+  `require_existing`, now halts with `TABLE_NOT_REPLICABLE`: it wasn't checked before. Publish it
+  whole, then copy it again. A `managed` publication with a filter, a column list, a
+  partition-root flag or stored generated columns is put right at the first start. When that
+  changes what a tracked table's changes carried (a filter or a column list on a tracked table, the
+  partition-root flag while a tracked table is a partition, stored generated columns while a tracked
+  table has one), the pipeline re-snapshots its tables as `snapshots.mode` says.
+- **A MariaDB Galera node** without `log_slave_updates = ON` is now refused, and the pipeline stops
+  in `error`.
+
 ## Rolling back
 
 Roll the nodes back to the old version the same way. The state documents are strict: a version

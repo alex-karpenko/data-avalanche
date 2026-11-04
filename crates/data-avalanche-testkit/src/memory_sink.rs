@@ -448,12 +448,13 @@ impl Sink for MemorySink {
         t.check_schema(&cs)?;
         t.apply(&cs)?;
         t.version += 1;
-        // The stored position is the union of the prior one and this commit's (Data-Flow Phase 4).
+        // The stored position is the union of the prior one and this commit's (Data-Flow Phase 4),
+        // or a reposition's own.
         let committed_position = match &t.marker {
-            Some(stored) => stored
+            Some(stored) if !cs.reposition => stored
                 .committed_position
                 .union(&marker.committed_position)?,
-            None => marker.committed_position,
+            _ => marker.committed_position,
         };
         t.marker = Some(CommitMarker {
             committed_position,
@@ -535,6 +536,7 @@ mod tests {
             },
             split: None,
             snapshot: false,
+            reposition: false,
         }
     }
 
@@ -641,6 +643,35 @@ mod tests {
         let stored = sink.table_state(&t).await.unwrap().marker.unwrap();
         let p = stored.committed_position;
         assert!(p.covers(&a).unwrap() && p.covers(&b).unwrap(), "{p}");
+    }
+
+    /// A reposition replaces the marker instead of joining it (DA-SRC-20): a change below the old
+    /// marker lands after it.
+    #[tokio::test]
+    async fn a_reposition_replaces_the_marker() {
+        let sink = sink().await;
+        commit(
+            &sink,
+            cs(100, vec![upserts(&[(1, Some("a"))], None)], vec![]),
+            1,
+        )
+        .await;
+        let late = cs(30, vec![upserts(&[(2, Some("b"))], None)], vec![]);
+        assert_eq!(
+            commit(&sink, late.clone(), 1).await,
+            CommitOutcome::SkippedCovered
+        );
+        let mut reposition = cs(20, vec![], vec![]);
+        reposition.reposition = true;
+        commit(&sink, reposition.clone(), 1).await;
+        let t = reposition.table.clone();
+        let marker = sink.table_state(&t).await.unwrap().marker.unwrap();
+        assert_eq!(marker.committed_position, SourcePosition::Pg(Lsn(20)));
+        assert!(matches!(
+            commit(&sink, late, 1).await,
+            CommitOutcome::Committed { .. }
+        ));
+        assert_eq!(rows(&sink), owned(&[(1, Some("a")), (2, Some("b"))]));
     }
 
     #[tokio::test]

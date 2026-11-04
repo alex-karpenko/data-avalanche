@@ -172,6 +172,18 @@ pub fn cases() -> Vec<Case> {
                 json!("re_snapshot"),
             )
         }),
+        case("V-123", Error, "source change ignore", || {
+            pg_delta().set(
+                "/pipelines/p/source/postgres/source_change_action",
+                json!("ignore"),
+            )
+        }),
+        case("V-123", Silent, "source change re_snapshot", || {
+            pg_delta().set(
+                "/pipelines/p/source/postgres/source_change_action",
+                json!("re_snapshot"),
+            )
+        }),
         case("V-114", Error, "ntz as date", || {
             pg_delta().set("/pipelines/p/sink/delta/timestamp_ntz_as", json!("date"))
         }),

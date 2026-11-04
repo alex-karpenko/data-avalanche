@@ -410,6 +410,8 @@ mod tests {
             wait_until("the copy lands", || w.ids("x") == [1, 2, 3]).await;
             wait_until("the stream moves on", || w.ids("a") == [1]).await;
             streamed(&status, &w).await;
+            // Its rows land before its last chunk read (an empty one) marks it done.
+            wait_until("the copy is done", || status.borrow().snapshots.is_empty()).await;
         })
         .await;
         end.unwrap();

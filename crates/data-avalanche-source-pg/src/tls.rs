@@ -382,6 +382,90 @@ mod tests {
         control_tls(&no_roots).unwrap();
     }
 
+    /// A throwaway CA named `cn`, self-signed.
+    fn ca(cn: &str) -> (rcgen::Certificate, rcgen::Issuer<'static, rcgen::KeyPair>) {
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec![]).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.distinguished_name.push(DnType::CommonName, cn);
+        let cert = params.self_signed(&key).unwrap();
+        (cert, Issuer::new(params, key))
+    }
+
+    /// A certificate for `localhost` that `issuer` signed.
+    fn localhost(issuer: &rcgen::Issuer<'_, rcgen::KeyPair>) -> CertificateDer<'static> {
+        let key = rcgen::KeyPair::generate().unwrap();
+        rcgen::CertificateParams::new(vec!["localhost".into()])
+            .unwrap()
+            .signed_by(&key, issuer)
+            .unwrap()
+            .der()
+            .clone()
+    }
+
+    /// A server certificate for `localhost` signed by a throwaway CA, the CA's roots, and a
+    /// certificate another CA signed.
+    fn server_material() -> (
+        CertificateDer<'static>,
+        Arc<RootCertStore>,
+        CertificateDer<'static>,
+    ) {
+        let (ca_cert, issuer) = ca("data-avalanche test CA");
+        let (_, other) = ca("another CA");
+        let mut roots = RootCertStore::empty();
+        roots.add(ca_cert.der().clone()).unwrap();
+        (localhost(&issuer), Arc::new(roots), localhost(&other))
+    }
+
+    fn verify(
+        v: &dyn ServerCertVerifier,
+        cert: &CertificateDer<'_>,
+        name: &str,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let name = ServerName::try_from(name.to_owned()).unwrap();
+        v.verify_server_cert(cert, &[], &name, &[], UnixTime::now())
+    }
+
+    /// `verify-ca` takes a certificate the CA signed whatever the name it is reached by, and
+    /// refuses one no root signed (DA-SRC-18).
+    #[test]
+    fn chain_only_forgives_the_name_but_not_the_chain() {
+        let (server, roots, stranger) = server_material();
+        let inner = WebPkiServerVerifier::builder_with_provider(roots, provider())
+            .build()
+            .unwrap();
+        let v = ChainOnly { inner };
+        for name in ["localhost", "127.0.0.1", "db.example.com"] {
+            verify(&v, &server, name).unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+        let e = verify(&v, &stranger, "localhost").unwrap_err();
+        assert_eq!(
+            e,
+            rustls::Error::InvalidCertificate(CertificateError::UnknownIssuer)
+        );
+        assert!(!v.supported_verify_schemes().is_empty());
+    }
+
+    /// `require`, `prefer` and `allow` take any certificate by any name, as libpq does without
+    /// a root certificate, and offer the provider's signature schemes (DA-SRC-18).
+    #[test]
+    fn unverified_takes_any_certificate() {
+        let (server, _, stranger) = server_material();
+        let v = Unverified {
+            algorithms: provider().signature_verification_algorithms,
+        };
+        for cert in [&server, &stranger] {
+            verify(&v, cert, "127.0.0.1").unwrap();
+        }
+        assert_eq!(
+            v.supported_verify_schemes(),
+            provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        );
+    }
+
     #[test]
     fn bad_material_is_refused_by_name() {
         let (ca, cert, _) = material();

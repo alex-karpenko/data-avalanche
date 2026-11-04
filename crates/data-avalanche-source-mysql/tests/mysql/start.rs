@@ -71,8 +71,15 @@ async fn a_first_start_snapshots_and_records_the_server_then_resumes() {
     assert_eq!(again.plan, StartPlan::Resume);
     assert!(again.added.is_empty() && again.warnings.is_empty());
     assert_eq!(again.server, Some(identity.clone()));
-    // A lost position is replaced by the write position now.
-    let reset = c.reset_position().await.unwrap();
+    // A lost position is replaced by the write position now. MySQL doesn't compare the lost
+    // checkpoint's server: one it never was is replaced all the same.
+    let lost = Checkpoint {
+        position: from.clone(),
+        server: Some(ServerIdentity::Mariadb {
+            server_id: u32::MAX,
+        }),
+    };
+    let reset = c.reset_position(&lost).await.unwrap();
     assert!(
         reset.position.covers(&from).unwrap(),
         "{} covers {from}",
@@ -126,25 +133,121 @@ async fn re_snapshots(c: &MySqlConnector, cp: &Checkpoint) {
     assert_eq!(p.server, Some(c.server_identity().await.unwrap()));
 }
 
-/// File/position mode halts on a checkpoint from another server; GTIDs carry across servers.
+/// File/position mode: a checkpoint from another server follows `binlog_purge_action` (halts
+/// under `error`, re-snapshots under `re_snapshot`, DA-SRC-29); GTIDs carry across servers.
 #[tokio::test]
 async fn a_checkpoint_from_another_server() {
     require_it!();
     let (n, _a) = fresh("start_server", "").await;
-    let c = connector(&pipeline(&n, &["t"], "", RE_SNAPSHOT));
-    let position = c.position_now().await.unwrap();
+    let halts = connector(&pipeline(&n, &["t"], "", ""));
+    let recovers = connector(&pipeline(&n, &["t"], "", RE_SNAPSHOT));
+    let position = halts.position_now().await.unwrap();
     for server in [Some(elsewhere()), None] {
         let cp = Checkpoint {
             position: position.clone(),
             server,
         };
-        match (c.mode().await.unwrap(), prepare(&c, &cp).await) {
+        match (halts.mode().await.unwrap(), prepare(&halts, &cp).await) {
             (Mode::File, Err(SourceError::Permanent(m))) => {
-                assert!(m.starts_with("BINLOG_SOURCE_CHANGED: "), "{m}")
+                assert!(m.starts_with("BINLOG_SOURCE_CHANGED: "), "{m}");
+                changes_server(&recovers, &cp, "was recorded on", true).await;
             }
             (Mode::MysqlGtid | Mode::MariadbGtid, Ok(StartPlan::Resume)) => {}
             other => panic!("{cp:?}: {other:?}"),
         }
+    }
+    cleanup(&n).await;
+}
+
+/// Under `re_snapshot`, a checkpoint from another server plans a snapshot from this server's
+/// position now (`SourceChanged`), with a warning naming why.
+async fn changes_server(c: &MySqlConnector, cp: &Checkpoint, why: &str, covers: bool) {
+    let p = SourceConnector::prepare(c, Some(cp), &[])
+        .await
+        .expect("a re-snapshot");
+    let StartPlan::Snapshot { from, reason } = p.plan else {
+        panic!("a snapshot, got {:?}", p.plan)
+    };
+    assert_eq!(reason, SnapshotReason::SourceChanged);
+    if covers {
+        assert!(
+            from.covers(&cp.position).unwrap(),
+            "{from} covers {}",
+            cp.position
+        );
+    }
+    assert!(
+        p.warnings.len() == 1
+            && p.warnings[0].starts_with("BINLOG_SOURCE_CHANGED: ")
+            && p.warnings[0].contains(why)
+            && p.warnings[0].contains("binlog_purge_action is re_snapshot"),
+        "{:?}",
+        p.warnings
+    );
+    assert_eq!(p.server, Some(c.server_identity().await.unwrap()));
+}
+
+/// MariaDB names a server by `@@server_id` alone: in file/position mode a checkpoint that isn't
+/// an event's boundary on the server is another server's, whatever it records (DA-SRC-21).
+#[tokio::test]
+async fn a_mariadb_position_off_an_event_boundary_is_another_server_s() {
+    require_it!();
+    if target().flavour != Flavour::Mariadb {
+        return;
+    }
+    let (n, _a) = fresh("start_boundary", "").await;
+    let halts = connector(&pipeline(&n, &["t"], "", FILE));
+    let SourcePosition::BinlogFile(now) = halts.position_now().await.unwrap() else {
+        panic!("a file position")
+    };
+    // Offset 5 lies inside the file's format description, which starts at 4.
+    let cp = Checkpoint {
+        position: SourcePosition::parse_tagged(&format!("binlog:{}:5", now.file())).unwrap(),
+        server: Some(halts.server_identity().await.unwrap()),
+    };
+    match prepare(&halts, &cp).await {
+        Err(SourceError::Permanent(m)) => assert!(
+            m.starts_with("BINLOG_SOURCE_CHANGED: ") && m.contains("isn't an event's boundary"),
+            "{m}"
+        ),
+        other => panic!("a halt, got {other:?}"),
+    }
+    let recovers = connector(&pipeline(&n, &["t"], "", &format!("{FILE}{RE_SNAPSHOT}")));
+    changes_server(&recovers, &cp, "isn't an event's boundary", true).await;
+    // The server's own position resumes.
+    let cp = Checkpoint {
+        position: SourcePosition::BinlogFile(now),
+        server: cp.server,
+    };
+    assert_eq!(prepare(&halts, &cp).await.unwrap(), StartPlan::Resume);
+    cleanup(&n).await;
+}
+
+/// A file the server's series hasn't reached yet, or another series, can't have been purged: the
+/// checkpoint is another server's (a rebuilt server restarts at 000001 under the same name).
+#[tokio::test]
+async fn a_file_the_server_could_not_have_purged_is_another_server_s() {
+    require_it!();
+    let (n, _a) = fresh("start_never_held", "").await;
+    let halts = connector(&pipeline(&n, &["t"], "", FILE));
+    let recovers = connector(&pipeline(&n, &["t"], "", &format!("{FILE}{RE_SNAPSHOT}")));
+    let SourcePosition::BinlogFile(now) = halts.position_now().await.unwrap() else {
+        panic!("a file position")
+    };
+    let ahead = format!("{}.{:06}", now.base(), now.file_index() + 5);
+    for file in [ahead, "other-base.000001".to_owned()] {
+        let cp = Checkpoint {
+            position: SourcePosition::parse_tagged(&format!("binlog:{file}:4")).unwrap(),
+            server: Some(halts.server_identity().await.unwrap()),
+        };
+        match prepare(&halts, &cp).await {
+            Err(SourceError::Permanent(m)) => assert!(
+                m.starts_with("BINLOG_SOURCE_CHANGED: ") && m.contains("was never on"),
+                "{m}"
+            ),
+            other => panic!("{file}: a halt, got {other:?}"),
+        }
+        changes_server(&recovers, &cp, "was never on", false).await;
     }
     cleanup(&n).await;
 }
@@ -254,19 +357,22 @@ async fn the_binlog_lag_is_the_age_of_the_last_commit_read() {
     let mut s = c.open_stream(&from, &tables).await.expect("stream");
     a.query_drop("INSERT INTO t VALUES (1)").await.unwrap();
     to_commit(&mut s).await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
     a.query_drop("INSERT INTO t VALUES (2)").await.unwrap();
     let r = lag(&c).await;
+    let first = r.behind.expect("a lag behind the write");
     assert!(
-        r.behind.is_some_and(|b| b >= Duration::from_secs(1)),
-        "the commit read 2 s ago is the lag: {r:?}"
+        first >= Duration::from_secs(2),
+        "the commit read 3 s ago is the lag (its binlog timestamp has one-second resolution): {r:?}"
     );
     assert_eq!(r.bytes, None);
     to_commit(&mut s).await;
+    // Relative: the binlog timestamp's one-second truncation and the container's clock against
+    // the host's cancel out, and other tests' writes may keep the stream short of the head.
     let r = lag(&c).await;
     assert!(
-        r.behind.is_some_and(|b| b < Duration::from_secs(2)),
-        "the commit just read is the lag: {r:?}"
+        r.behind.is_some_and(|b| b < first),
+        "the commit just read is the lag, younger than the one read before ({first:?}): {r:?}"
     );
     let _ = Box::new(s).close().await;
     assert_eq!(lag(&c).await.behind, None, "closed");
@@ -384,6 +490,21 @@ async fn a_file_position_stream_opens_only_on_its_server() {
             other => panic!("{cp:?}: {other:?}"),
         }
     }
+    if target().flavour == Flavour::Mariadb {
+        let SourcePosition::BinlogFile(p) = &now else {
+            panic!("a file position")
+        };
+        let cp = Checkpoint {
+            position: SourcePosition::parse_tagged(&format!("binlog:{}:5", p.file())).unwrap(),
+            server: Some(c.server_identity().await.unwrap()),
+        };
+        match c.open_stream(&cp, &tables).await.err() {
+            Some(SourceError::Permanent(m)) => {
+                assert!(m.contains("isn't an event's boundary"), "{m}")
+            }
+            other => panic!("{cp:?}: {other:?}"),
+        }
+    }
     assert_eq!(c.dump_id(), None, "no dump started");
     if target().replication == "gtid" {
         let gtid = connector(&pipeline(&n, &["t"], "", ""));
@@ -394,5 +515,54 @@ async fn a_file_position_stream_opens_only_on_its_server() {
         let s = gtid.open_stream(&cp, &tables).await.expect("a GTID stream");
         Box::new(s).close().await.expect("close");
     }
+    cleanup(&n).await;
+}
+
+/// The dump's open finds a server change on a reconnect, which doesn't rerun `prepare`: under
+/// `re_snapshot` it is `SourceChanged` (the pipeline starts again and recovers), under `error`
+/// the halt.
+#[tokio::test]
+async fn a_server_change_found_at_the_dump_s_open_follows_the_purge_action() {
+    require_it!();
+    let (n, _a) = fresh("start_open_changed", "CREATE TABLE t (id INT PRIMARY KEY)").await;
+    let halts = connector(&pipeline(&n, &["t"], "", FILE));
+    let recovers = connector(&pipeline(&n, &["t"], "", &format!("{FILE}{RE_SNAPSHOT}")));
+    let tables = halts.resolve_tables().await.unwrap().tables;
+    let SourcePosition::BinlogFile(now) = halts.position_now().await.unwrap() else {
+        panic!("a file position")
+    };
+    let own = halts.server_identity().await.unwrap();
+    let ahead = format!("binlog:{}.{:06}:4", now.base(), now.file_index() + 5);
+    let mut cps = vec![
+        Checkpoint {
+            position: SourcePosition::BinlogFile(now.clone()),
+            server: Some(elsewhere()),
+        },
+        Checkpoint {
+            position: SourcePosition::parse_tagged(&ahead).unwrap(),
+            server: Some(own.clone()),
+        },
+    ];
+    if target().flavour == Flavour::Mariadb {
+        cps.push(Checkpoint {
+            position: SourcePosition::parse_tagged(&format!("binlog:{}:5", now.file())).unwrap(),
+            server: Some(own),
+        });
+    }
+    for cp in cps {
+        match halts.open_stream(&cp, &tables).await.err() {
+            Some(SourceError::Permanent(m)) => {
+                assert!(m.starts_with("BINLOG_SOURCE_CHANGED: "), "{m}")
+            }
+            other => panic!("{cp:?}: {other:?}"),
+        }
+        match recovers.open_stream(&cp, &tables).await.err() {
+            Some(SourceError::SourceChanged(m)) => {
+                assert!(m.starts_with("BINLOG_SOURCE_CHANGED: "), "{m}")
+            }
+            other => panic!("{cp:?}: {other:?}"),
+        }
+    }
+    assert_eq!(recovers.dump_id(), None, "no dump started");
     cleanup(&n).await;
 }

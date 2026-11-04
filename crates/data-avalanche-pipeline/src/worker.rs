@@ -11,8 +11,9 @@ use std::time::Instant;
 
 use data_avalanche_config::{Pipeline, SnapshotMode};
 use data_avalanche_core::{
-    Checkpoint, HaltReason, SchemaHint, Sink, SinkError, SinkKind, SnapshotReason, SourceConnector,
-    SourceError, StartPlan, TableRef, TableSchema, TableSpec,
+    Checkpoint, CommitMarker, CommitOutcome, HaltReason, PositionRange, SchemaHint, Sink,
+    SinkError, SinkKind, SnapshotReason, SourceConnector, SourceError, SourcePosition, StartPlan,
+    TableChangeSet, TableRef, TableSchema, TableSpec,
 };
 use data_avalanche_state::{PipelineDocs, SnapshotStatus, StateError, TableHalt, TableSnapshotDoc};
 use data_avalanche_storage::StoreError;
@@ -20,7 +21,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::decide::{Decision, Facts, Plan, decide};
 use crate::jobs::Jobs;
-use crate::schema_change::{Planned, soft_dropped};
+use crate::schema_change::{Planned, missing_columns, soft_dropped};
 use crate::session::{Core, End, Session};
 use crate::settings::Settings;
 use crate::status::Streak;
@@ -212,16 +213,30 @@ impl PipelineWorker {
                     let warning = format!(
                         "the source lost the stream position {position} ({detail}): the stream restarts at a new position and the tables are snapshotted again"
                     );
-                    core.update(|st| {
-                        st.reconnects += 1;
-                        st.warn(warning);
-                    });
+                    core.update(|st| st.reconnects += 1);
+                    // The checkpoint whose position was lost, with the server the session read:
+                    // on another server the source refuses to replace it (DA-SRC-20), and the
+                    // halt or the rerun of Phase 0 its refusal asks ends the worker below.
+                    let Some(stored) = core.settings.checkpoint.load(&core.docs).await? else {
+                        return Err(crate::AccumulatorError::Protocol {
+                            detail: "the stream lost a position the pipeline has no checkpoint for"
+                                .into(),
+                        }
+                        .into());
+                    };
+                    let lost = Checkpoint {
+                        server: core.server.clone().or(stored.checkpoint.server),
+                        ..stored.checkpoint
+                    };
                     let from = write_retry(
                         &core.tuning,
                         || core.may_write(),
-                        || core.source.reset_position(),
+                        || core.source.reset_position(&lost),
                     )
                     .await?;
+                    // Warned only once the reset holds: a refusal on another server halts or
+                    // reruns Phase 0 instead, and says so itself.
+                    core.update(|st| st.warn(warning));
                     start(core, Some(from)).await?;
                     attempt = 0;
                     continue;
@@ -327,10 +342,62 @@ where
     }
 }
 
+/// Moves the table's marker onto `at`, the new server's position (DA-SRC-20): an empty change set
+/// that replaces the marker instead of joining it. A table the lake doesn't hold, or holds no
+/// marker for, has nothing to move.
+async fn reposition(
+    core: &Core,
+    tuning: &Tuning,
+    schema: &TableSchema,
+    at: &SourcePosition,
+) -> Result<(), WorkerError> {
+    let table = schema.table();
+    let state = sink_retry(tuning, || core.may_write(), || core.sink.table_state(table)).await?;
+    let (true, Some(_), Some(columns)) = (state.exists, state.marker, state.schema) else {
+        return Ok(());
+    };
+    let cs = TableChangeSet {
+        table: table.clone(),
+        schema: columns,
+        identifier: schema.identifier().to_vec(),
+        truncate: false,
+        upserts: vec![],
+        deletes: vec![],
+        position: PositionRange {
+            start: at.clone(),
+            end: at.clone(),
+            last_change: at.clone(),
+        },
+        split: None,
+        snapshot: false,
+        reposition: true,
+    };
+    let marker = CommitMarker {
+        owner_epoch: core.owner_epoch,
+        committed_position: at.clone(),
+        pipeline_id: core.settings.pipeline_id.clone(),
+    };
+    let committed = sink_retry(
+        tuning,
+        || core.may_write(),
+        || core.sink.commit(cs.clone(), marker.clone()),
+    )
+    .await?;
+    match committed {
+        CommitOutcome::Fenced { current_epoch } => Err(WorkerError::Fenced {
+            table: table.clone(),
+            current_epoch,
+        }),
+        // A reposition is never skipped as covered (`covers` never skips one): the arm is
+        // unreachable, and harmless.
+        CommitOutcome::Committed { .. } | CommitOutcome::SkippedCovered => Ok(()),
+    }
+}
+
 /// Data-Flow Phase 0, or its rerun after the stream position was lost mid-run (`lost` holds the
 /// new checkpoint `reset_position` returned). Leaves the core tracking the tables to stream, with
 /// every decision persisted: halts and snapshot requests first, then the cached schemas, then a
-/// fresh start's checkpoint, recorded with the server the start read (MySQL).
+/// fresh start's checkpoint, recorded with the server the start read.
 pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(), WorkerError> {
     core.update(|st| st.phase = Phase::Starting);
     let s = &core.settings;
@@ -516,7 +583,11 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
     })?;
     let gap = matches!(
         plan,
-        Plan::Fresh(SnapshotReason::PositionLost | SnapshotReason::AdoptedOrphan)
+        Plan::Fresh(
+            SnapshotReason::PositionLost
+                | SnapshotReason::AdoptedOrphan
+                | SnapshotReason::SourceChanged
+        )
     );
 
     // Each table: what this start does with it.
@@ -621,6 +692,36 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
                         }
                         schema = now;
                     }
+                }
+            }
+            // No schema cached for a table the sink holds (a wiped state): baselined against the
+            // sink table's columns (DA-SNAP-13).
+            None if state.exists && baseline => {
+                let adds = match state.schema.as_deref().map(|s| missing_columns(s, now)) {
+                    Some(Ok(adds)) => adds,
+                    Some(Err(reason)) => {
+                        halts.push((table.clone(), reason));
+                        tracked.insert(table.clone());
+                        continue;
+                    }
+                    None => vec![],
+                };
+                if !adds.is_empty() {
+                    let evolver = core.evolver();
+                    let applied = match evolver.evolution {
+                        true => evolver.evolve(table, adds).await?,
+                        false => Err(HaltReason::EvolutionDisabled),
+                    };
+                    match applied {
+                        Ok(None) => {}
+                        Ok(Some(w)) => warnings.push(w),
+                        Err(reason) => {
+                            halts.push((table.clone(), reason));
+                            tracked.insert(table.clone());
+                            continue;
+                        }
+                    }
+                    evolved = true;
                 }
             }
             Some(_) if cleared.contains(table) => {}
@@ -830,6 +931,17 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
             core.docs.clear_halt(table).await?;
         }
     }
+    // A source change moves every table the lake holds onto the new server's positions before
+    // the checkpoint that names the server: a restart in between still finds the old one
+    // recorded, and repositions them again (DA-SRC-20).
+    if matches!(plan, Plan::Fresh(SnapshotReason::SourceChanged)) {
+        let tables: BTreeSet<&TableRef> = resolved_tables.keys().chain(cached.keys()).collect();
+        for table in tables {
+            if let Some(schema) = cached.get(table).or_else(|| resolved_tables.get(table)) {
+                reposition(core, &tuning, schema, &at).await?;
+            }
+        }
+    }
     if let Some(doc) = fresh {
         if core.hooks.at(&HookPoint::SchemasCached) == HookAction::Crash {
             return Err(WorkerError::Crashed(HookPoint::SchemasCached));
@@ -851,13 +963,15 @@ mod tests {
     use data_avalanche_core::position::Lsn;
     use data_avalanche_core::{
         ColumnSchema, ColumnValue, ColumnValueType as V, Row, SchemaChange, SchemaDelta,
-        ServerIdentity, SourcePosition,
+        ServerIdentity, SourcePosition, upsert_schema,
     };
     use data_avalanche_state::{PositionDoc, SlotDoc};
     use data_avalanche_testkit::{FakeTxn, Method, SinkOp};
 
     use super::*;
-    use crate::test_support::{Countdown, CrashAt, World, Yaml, fast, row, t, wait_until};
+    use crate::test_support::{
+        Countdown, CrashAt, World, Yaml, docs, fast, row, schema, t, wait_until,
+    };
     use crate::{Backoff, HookPoint};
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
@@ -1020,6 +1134,301 @@ mod tests {
         assert_eq!(w.source.reads(&t("b")), 0);
         assert_eq!(st.warnings.len(), 1, "{:?}", st.warnings);
         assert!(st.warnings[0].contains("public.b") && st.warnings[0].contains("lost"));
+    }
+
+    /// A failover to a replica behind the lake (DA-SRC-20): the new server's LSNs sit below the
+    /// table's marker, and the guard would skip its changes. The source-change start repositions
+    /// the table first, so a change on the new server lands even under `never` (nothing copied).
+    #[tokio::test]
+    async fn a_source_change_repositions_every_table_before_streaming() {
+        let w = World::new(&["a"]);
+        let pg = |timeline| ServerIdentity::Postgres {
+            system_identifier: 7,
+            timeline,
+        };
+        w.source.set_server(Some(pg(1)));
+        w.source.load(&t("a"), rows(1..=2));
+        run(&w, &mode("mode: initial"), async |status| {
+            for id in 3..=6 {
+                w.source
+                    .commit(FakeTxn::new().insert(&t("a"), row(id, "before")));
+            }
+            streamed(&status, &w).await;
+        })
+        .await
+        .0
+        .unwrap();
+        let marked = w.sink.table_state(&t("a")).await.unwrap().marker.unwrap();
+        assert!(
+            marked
+                .committed_position
+                .covers(&SourcePosition::Pg(Lsn(0x110)))
+                .unwrap(),
+            "{marked:?}"
+        );
+        w.source.fail_over(pg(2), Lsn(0x100));
+        let (end, st) = run(&w, &mode("mode: never"), async |status| {
+            streamed(&status, &w).await;
+            w.source
+                .commit(FakeTxn::new().insert(&t("a"), row(9, "on the new server")));
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!(w.ids("a"), [1, 2, 3, 4, 5, 6, 9]);
+        let moved = w.sink.table_state(&t("a")).await.unwrap().marker.unwrap();
+        assert!(
+            !moved
+                .committed_position
+                .covers(&marked.committed_position)
+                .unwrap(),
+            "{moved:?}"
+        );
+        assert_eq!(
+            w.docs.slot().await.unwrap().unwrap().doc.server,
+            Some(pg(2))
+        );
+        assert!(
+            st.warnings
+                .iter()
+                .any(|w| w.contains("source server changed")),
+            "{:?}",
+            st.warnings
+        );
+    }
+
+    /// A failover mid-run whose new server can't serve the slot's position (I-1): the stream ends
+    /// with `PositionUnreachable` on another timeline. The reset refuses to make the slot there;
+    /// the worker ends with `SourceChanged`, and the rerun (the controller's `Retry`) repositions
+    /// every table, so a change on the new server below the old marker lands.
+    #[tokio::test]
+    async fn a_failover_mid_run_reruns_phase_0_instead_of_resetting_the_slot() {
+        let w = World::new(&["a"]);
+        let pg = |timeline| ServerIdentity::Postgres {
+            system_identifier: 7,
+            timeline,
+        };
+        w.source.set_server(Some(pg(1)));
+        w.source.load(&t("a"), rows(1..=2));
+        let (end, _) = run(&w, &mode("mode: initial"), async |status| {
+            for id in 3..=6 {
+                w.source
+                    .commit(FakeTxn::new().insert(&t("a"), row(id, "before")));
+            }
+            streamed(&status, &w).await;
+            w.source.fail_over(pg(2), Lsn(0x100));
+            w.source.lose_slot();
+            // Ends when the worker does, or once a reset position would be durable.
+            let mut st = status.clone();
+            let _ = st
+                .wait_for(|s| {
+                    s.reconnects >= 1
+                        && s.snapshots.is_empty()
+                        && s.checkpoint == Some(SourcePosition::Pg(Lsn(0x100)))
+                })
+                .await;
+        })
+        .await;
+        let end = end.expect_err("the worker ends for a rerun");
+        assert!(
+            matches!(end, WorkerError::Source(SourceError::SourceChanged(_))),
+            "{end:?}"
+        );
+        assert_eq!(end.recovery(), crate::Recovery::Retry);
+        let marked = w.sink.table_state(&t("a")).await.unwrap().marker.unwrap();
+        assert_eq!(
+            w.docs.slot().await.unwrap().unwrap().doc.server,
+            Some(pg(1)),
+            "the checkpoint still names the old server"
+        );
+        let (end, st) = run(&w, &mode("mode: never"), async |status| {
+            streamed(&status, &w).await;
+            w.source
+                .commit(FakeTxn::new().insert(&t("a"), row(9, "on the new server")));
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!(w.ids("a"), [1, 2, 3, 4, 5, 6, 9], "no change skipped");
+        let moved = w.sink.table_state(&t("a")).await.unwrap().marker.unwrap();
+        assert!(
+            !moved
+                .committed_position
+                .covers(&marked.committed_position)
+                .unwrap(),
+            "{moved:?}"
+        );
+        assert_eq!(
+            w.docs.slot().await.unwrap().unwrap().doc.server,
+            Some(pg(2))
+        );
+        assert!(
+            st.warnings
+                .iter()
+                .any(|w| w.contains("source server changed")),
+            "{:?}",
+            st.warnings
+        );
+    }
+
+    /// The same failover under `source_change_action: error`: the reset halts with
+    /// `WAL_SOURCE_CHANGED` and replaces nothing; the checkpoint still names the old server, and
+    /// a restart halts the same way.
+    #[tokio::test]
+    async fn a_failover_mid_run_halts_under_error() {
+        let w = World::new(&["a"]);
+        let pg = |timeline| ServerIdentity::Postgres {
+            system_identifier: 7,
+            timeline,
+        };
+        w.source.set_server(Some(pg(1)));
+        w.source.halt_on_source_change();
+        w.source.load(&t("a"), rows(1..=2));
+        let (end, _) = run(&w, &mode("mode: initial"), async |status| {
+            streamed(&status, &w).await;
+            w.source.fail_over(pg(2), Lsn(0x100));
+            w.source.lose_slot();
+            // Until the worker ends (its status closes).
+            let mut st = status.clone();
+            let _ = tokio::time::timeout(Duration::from_secs(10), st.wait_for(|_| false)).await;
+        })
+        .await;
+        let end = end.expect_err("the worker halts");
+        assert_eq!(end.code(), Some("WAL_SOURCE_CHANGED"), "{end:?}");
+        assert_eq!(end.recovery(), crate::Recovery::Error);
+        assert_eq!(
+            w.docs.slot().await.unwrap().unwrap().doc.server,
+            Some(pg(1))
+        );
+        let (end, _) = run(&w, &mode("mode: never"), async |_| {}).await;
+        assert_eq!(
+            end.expect_err("a restart halts").code(),
+            Some("WAL_SOURCE_CHANGED")
+        );
+    }
+
+    /// A reconnect that reaches another server, with no position lost on the way (the stream's
+    /// open reads the server): the worker ends with `SourceChanged`, and the rerun repositions.
+    #[tokio::test]
+    async fn a_reconnect_to_another_server_reruns_phase_0() {
+        let w = World::new(&["a"]);
+        let pg = |timeline| ServerIdentity::Postgres {
+            system_identifier: 7,
+            timeline,
+        };
+        w.source.set_server(Some(pg(1)));
+        w.source.load(&t("a"), rows(1..=2));
+        let (end, _) = run(&w, &mode("mode: initial"), async |status| {
+            w.source
+                .commit(FakeTxn::new().insert(&t("a"), row(3, "before")));
+            streamed(&status, &w).await;
+            w.source.fail_over(pg(2), Lsn(0x100));
+            w.source.fail(
+                Method::Next,
+                SourceError::Transient("connection reset".into()),
+            );
+            // Until the worker ends (its status closes).
+            let mut st = status.clone();
+            let _ = tokio::time::timeout(Duration::from_secs(10), st.wait_for(|_| false)).await;
+        })
+        .await;
+        assert!(
+            matches!(end, Err(WorkerError::Source(SourceError::SourceChanged(_)))),
+            "{end:?}"
+        );
+        let opened = w.source.opened_at();
+        assert!(
+            opened.iter().all(|c| c.server == Some(pg(1))),
+            "no stream opened on the new server: {opened:?}"
+        );
+        let (end, _) = run(&w, &mode("mode: never"), async |status| {
+            streamed(&status, &w).await;
+            w.source
+                .commit(FakeTxn::new().insert(&t("a"), row(9, "on the new server")));
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!(w.ids("a"), [1, 2, 3, 9]);
+    }
+
+    /// D-M12a.2's crash-repeat (M-10): a crash after the source-change start's resets and before
+    /// its checkpoint is saved leaves the old server's checkpoint, so the rerun is a source change
+    /// again and repositions every table once more, and the new server's changes land.
+    #[tokio::test]
+    async fn a_crash_between_the_resets_and_the_checkpoint_repositions_again() {
+        let w = World::new(&["a"]);
+        let pg = |timeline| ServerIdentity::Postgres {
+            system_identifier: 7,
+            timeline,
+        };
+        w.source.set_server(Some(pg(1)));
+        w.source.load(&t("a"), rows(1..=2));
+        run(&w, &mode("mode: initial"), async |status| {
+            for id in 3..=6 {
+                w.source
+                    .commit(FakeTxn::new().insert(&t("a"), row(id, "before")));
+            }
+            streamed(&status, &w).await;
+        })
+        .await
+        .0
+        .unwrap();
+        let recorded = w.docs.slot().await.unwrap().unwrap().doc;
+        w.source.fail_over(pg(2), Lsn(0x100));
+        let mut crashing = deps(&w);
+        crashing.hooks = Arc::new(CrashAt(|p| matches!(p, HookPoint::SchemasCached)));
+        let end = run_with(&mode("mode: never"), crashing, async |_| {}).await;
+        assert!(
+            matches!(end, Err(WorkerError::Crashed(HookPoint::SchemasCached))),
+            "{end:?}"
+        );
+        let first = w.sink.table_state(&t("a")).await.unwrap().marker.unwrap();
+        assert_eq!(
+            first.committed_position,
+            SourcePosition::Pg(Lsn(0x100)),
+            "reset before the crash"
+        );
+        assert_eq!(
+            w.docs.slot().await.unwrap().unwrap().doc,
+            recorded,
+            "the checkpoint naming the old server is kept"
+        );
+        // The new server writes on while the pipeline is down: the rerun starts past the first reset.
+        w.source
+            .commit(FakeTxn::new().insert(&t("a"), row(8, "while down")));
+        let again = w.source.wal_end();
+        let (end, st) = run(&w, &mode("mode: never"), async |status| {
+            streamed(&status, &w).await;
+            let marker = w.sink.table_state(&t("a")).await.unwrap().marker.unwrap();
+            assert_eq!(marker.committed_position, again, "repositioned again");
+            w.source
+                .commit(FakeTxn::new().insert(&t("a"), row(9, "on the new server")));
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!(
+            w.source
+                .prepared_at()
+                .last()
+                .and_then(|c| c.clone()?.server),
+            Some(pg(1)),
+            "the rerun's prepare got the old server's checkpoint"
+        );
+        // Row 8 came before the rerun's position: under `never` nothing is copied.
+        assert_eq!(w.ids("a"), [1, 2, 3, 4, 5, 6, 9]);
+        assert_eq!(
+            w.docs.slot().await.unwrap().unwrap().doc.server,
+            Some(pg(2))
+        );
+        assert!(
+            st.warnings
+                .iter()
+                .any(|w| w.contains("source server changed")),
+            "{:?}",
+            st.warnings
+        );
     }
 
     #[tokio::test]
@@ -1486,6 +1895,92 @@ mod tests {
             st.warnings
                 .iter()
                 .any(|w| w.contains("lost the stream position"))
+        );
+    }
+
+    /// The pipeline's state is gone, and the sink still holds its table: the start adds the
+    /// columns the source gained, before the copy writes them (DA-SNAP-13).
+    #[tokio::test]
+    async fn a_wiped_state_baselines_against_the_sink_table() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let noted = TableSchema::new(
+            t("a"),
+            vec![
+                ColumnSchema::new("id", V::Int64, "bigint").not_null(),
+                ColumnSchema::new("doc", V::Text, "text"),
+                ColumnSchema::new("note", V::Text, "text"),
+            ],
+            vec!["id".into()],
+        )
+        .unwrap();
+        w.source.alter(&t("a"), noted);
+        let wiped = World {
+            source: w.source.clone(),
+            sink: w.sink.clone(),
+            docs: docs().0,
+        };
+        let (end, st) = run(&wiped, &mode("mode: initial"), async |status| {
+            streamed(&status, &wiped).await;
+        })
+        .await;
+        end.unwrap();
+        assert!(st.halted.is_empty(), "{:?}", st.halted);
+        let state = w.sink.table_state(&t("a")).await.unwrap();
+        assert!(state.schema.unwrap().field_with_name("note").is_ok());
+    }
+
+    /// A sink table without the source's key column is keyed otherwise: it halts.
+    #[test]
+    fn a_sink_table_without_the_key_column_halts() {
+        let sink = upsert_schema(&schema("a"));
+        let rekeyed = TableSchema::new(
+            t("a"),
+            vec![
+                ColumnSchema::new("uid", V::Int64, "bigint").not_null(),
+                ColumnSchema::new("doc", V::Text, "text"),
+            ],
+            vec!["uid".into()],
+        )
+        .unwrap();
+        assert!(matches!(
+            missing_columns(&sink, &rekeyed),
+            Err(HaltReason::SchemaMismatch { column, .. }) if column == "uid"
+        ));
+        assert!(missing_columns(&sink, &schema("a")).unwrap().is_empty());
+    }
+
+    /// Delta's names are case-insensitive: a sink column that matches by case alone halts, on a
+    /// key or not, naming both spellings.
+    #[test]
+    fn a_sink_column_matching_by_case_alone_halts() {
+        let sink = upsert_schema(&schema("a"));
+        let cased = |id: &str, doc: &str| {
+            TableSchema::new(
+                t("a"),
+                vec![
+                    ColumnSchema::new(id, V::Int64, "bigint").not_null(),
+                    ColumnSchema::new(doc, V::Text, "text"),
+                ],
+                vec![id.into()],
+            )
+            .unwrap()
+        };
+        let Err(HaltReason::SchemaMismatch { column, detail }) =
+            missing_columns(&sink, &cased("id", "DOC"))
+        else {
+            panic!("a case-only match halts");
+        };
+        assert_eq!(column, "DOC");
+        assert!(detail.contains("doc") && detail.contains("DOC"), "{detail}");
+        assert!(matches!(
+            missing_columns(&sink, &cased("ID", "doc")),
+            Err(HaltReason::SchemaMismatch { column, .. }) if column == "ID"
+        ));
+        assert!(
+            missing_columns(&sink, &cased("id", "doc"))
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -2090,7 +2585,12 @@ mod tests {
             .expect("the clock is past ten seconds");
         core.snapshot_started.insert(t("a"), long_ago);
         w.source.lose_slot();
-        let from = core.source.reset_position().await.unwrap();
+        let lost = core.settings.checkpoint.load(&core.docs).await.unwrap();
+        let from = core
+            .source
+            .reset_position(&lost.unwrap().checkpoint)
+            .await
+            .unwrap();
         start(&mut core, Some(from)).await.unwrap();
         let xid = w.source.open_writer(&[t("b")]);
         w.source.hold_reads();

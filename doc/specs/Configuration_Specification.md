@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-30
+updated: 2026-11-03
 domain: Architecture
 status: Specification (supersedes the Configuration_file_model.md draft)
 tags: [architecture, configuration, spec, validation, multi-sink, iceberg, delta-lake]
@@ -664,7 +664,7 @@ source:
 | `user` | string | yes (resolvable) | — | PR | Required unless `credentials_file` is given (V-010); mutually exclusive with it (V-065). |
 | `password` | string | yes (resolvable) | — | PR | Required unless `credentials_file` is given (V-010); mutually exclusive with it (V-065). Use `${ENV}`. Re-read on reconnect to support rotation. |
 | `credentials_file` | path | yes (resolvable) | — | PR | Alternative to `user`/`password` (§4.6): path to JSON `{user, password}`. Mutually exclusive with them (V-065). Rotating the file's contents + reload rotates the DB credentials without a process restart. |
-| `ssl_mode` | enum | no | `require` | PR | `disable`\|`allow`\|`prefer`\|`require`\|`verify-ca`\|`verify-full`. `allow` is **invalid for MySQL** (V-030). |
+| `ssl_mode` | enum | no | `require` | PR | `disable`\|`allow`\|`prefer`\|`require`\|`verify-ca`\|`verify-full`. `allow` is **invalid for MySQL** (V-030). With MySQL and MariaDB, `verify-ca` also checks the host name, as `verify-full` does: the pinned client can't skip the name check alone (DA-SRC-22), so it fails closed (V-124). |
 | `ssl_cert` / `ssl_key` / `ssl_ca` | PEM/path | no | — | PR | §4.4. |
 | `timeouts.connect` | Duration | no | `10s` | PR | The whole connection setup: TCP, TLS, startup and authentication. |
 | `timeouts.command` | Duration | no | `30s` | PR | |
@@ -682,18 +682,19 @@ source:
 | `slot` | string | yes | — | PR | Logical replication slot name. Charset `^[a-z_][a-z0-9_]{0,62}$` (PG constraint); **unique** per source host+db across pipelines (V-058). |
 | `auto_cleanup` | bool | no | `true` | R | Drop the slot & publication when the pipeline is deleted. Teardown-time policy flag only — consulted at deletion/`id`-change, not on the live path, so a change applies in place with no restart. |
 | `heartbeat` | Duration | no | `60s` | R | StandbyStatusUpdate interval; keeps the connection alive and prevents WAL-lag-as-inactivity. Also paces the stream watchdog: a stream silent for 3 heartbeats while the heartbeat's reads of the slot fail or find no reader is reconnected (DA-SRC-16). |
-| `slot_management` | enum `managed`\|`require_existing` | no | `managed` | PR | `managed`: create the slot if absent, reuse if present, drop on delete per `auto_cleanup`. `require_existing`: never create (DBA-owned slot; error if absent) and **requires `auto_cleanup: false`** (V-103). `research/Postgres_Slot_and_Publication_Lifecycle.md` §2. |
-| `slot_on_orphan` | enum `halt`\|`adopt_resnapshot` | no | `halt` | R | Slot exists but the pipeline has no state for it. `halt`: refuse to start, naming the slot. `adopt_resnapshot`: take ownership and restart from a fresh consistent point, a recovery: the tables are snapshotted as `snapshots.mode` says for one (Data-Flow Phase 0; `initial`/`always` incrementally re-snapshot all tables), and under `never` none is, a warning naming the gap (Q-M6a-1). Resuming from the orphan as if continuous is never offered. (Slot-lifecycle doc §1.1; named `slot_on_orphan` because `slot` is the slot-name string.) |
+| `slot_management` | enum `managed`\|`require_existing` | no | `managed` | PR | `managed`: create the slot if absent, reuse if present, drop on delete per `auto_cleanup`. `require_existing`: never create (DBA-owned slot; error if absent) and **requires `auto_cleanup: false`** (V-103). A slot the DBA creates again after the pipeline's was lost starts past the checkpoint: it is an orphan, adopted or refused as `slot_on_orphan` says. `research/Postgres_Slot_and_Publication_Lifecycle.md` §2. |
+| `slot_on_orphan` | enum `halt`\|`adopt_resnapshot` | no | `halt` | R | Slot exists but the pipeline has no state for it, or (under `require_existing`) a slot made again starts past the pipeline's checkpoint. `halt`: refuse to start, naming the slot and the recovery. `adopt_resnapshot`: take ownership and restart from a fresh consistent point, a recovery: the tables are snapshotted as `snapshots.mode` says for one (Data-Flow Phase 0; `initial`/`always` incrementally re-snapshot all tables), and under `never` none is, a warning naming the gap (Q-M6a-1). Resuming from the orphan as if continuous is never offered. (Slot-lifecycle doc §1.1; named `slot_on_orphan` because `slot` is the slot-name string.) |
+| `source_change_action` | enum `error`\|`re_snapshot` | no | `error` | R | The checkpoint was read on another server than the one the pipeline now reads: another system identifier (another cluster, a restore) or another timeline (a promoted standby). An LSN means something only on its server and timeline (Data-Flow Phase 2a). `error`: halt with `WAL_SOURCE_CHANGED` (operator decides). `re_snapshot`: a recovery from the new server's position: the slot is made there (`managed`) or the DBA's slot there is adopted (`require_existing`), every table's position marker is reset to it, and the tables are snapshotted as `snapshots.mode` says for a recovery (under `never` none is, a warning naming the gap). A checkpoint written before the server was recorded (v0.1.0) is taken as the connected server's (V-123). |
 | `max_wal_lag_bytes` | ByteSize \| null | no | `null` | R | WAL-retention guard (G-22). `data_avalanche_wal_lag_bytes` is always emitted; when set and exceeded the pipeline **halts** to protect the source disk. `null` = alert only. ≥ 64 MiB when set (V-104). |
 
 #### 9.2.2 `source.mysql` (iff `type = mysql`)
 
 | Field | Type | Required | Default | Mutability | Notes |
 |---|---|---|---|---|---|
-| `replication_type` | enum `binlog`\|`gtid` | no | `gtid` | PR | `gtid`: GTID-positioned stream (MySQL `gtid_executed`, MariaDB `gtid_binlog_pos`); position-independent, gap-free, survives a source failover. Requires GTID on the server (MySQL `gtid_mode=ON`; MariaDB `gtid_strict_mode=1`). `binlog`: file/position stream (`COM_BINLOG_DUMP` at `<file>:<pos>`) for servers without GTID. A file/position is only meaningful on the server that wrote it: when the source server changes (failover, restore), the pipeline **halts** with `BINLOG_SOURCE_CHANGED` (`Data-Flow.md` Phase 2b); recover by switching to `gtid` or re-snapshotting. |
+| `replication_type` | enum `binlog`\|`gtid` | no | `gtid` | PR | `gtid`: GTID-positioned stream (MySQL `gtid_executed`, MariaDB `gtid_binlog_pos`); position-independent, gap-free, survives a source failover. Requires GTID on the server (MySQL `gtid_mode=ON`; MariaDB `gtid_strict_mode=1`). `binlog`: file/position stream (`COM_BINLOG_DUMP` at `<file>:<pos>`) for servers without GTID. A file/position is only meaningful on the server that wrote it: when the source server changes (failover, restore), the position is lost and `binlog_purge_action` decides: `error` halts with `BINLOG_SOURCE_CHANGED` (`Data-Flow.md` Phase 2b), `re_snapshot` recovers from the new server's position. MariaDB names a server by `@@server_id` alone, which can repeat, so there a position that is not an event boundary on the connected server (`BINLOG_GTID_POS` is NULL) is a changed server too. In file/position mode, on MySQL and MariaDB alike, a position in a file the server couldn't have purged (another base name, or after its newest binlog) is another server's; one before its oldest is a purge. The check runs at each start and each time the stream reconnects. |
 | `tinyint1_as_bool` | bool | no | `true` | PR | Map `TINYINT(1)` columns to logical `bool`. When `true`, requires the display-width from the catalog query (channel C); when `false`, `TINYINT(1)` maps as `TINYINT SIGNED` → `Int16`. See `research/Type_Mapping.md`. |
 | `tinyint1_detection` | enum `information_schema`\|`none` | no | `information_schema` | PR | Source of the `TINYINT(1)` display-width signal. `none` disables the detection (all `TINYINT` treated as integer); `information_schema` uses the catalog query (always available via channel C). |
-| `binlog_purge_action` | enum `error`\|`re_snapshot` | no | `error` | R | Resume position purged on the server (G-26). `error`: halt with an error (operator decides). `re_snapshot`: automatic recovery from the server's current position, the tables snapshotted as `snapshots.mode` says for a recovery (`initial`/`always` incrementally re-snapshot; under `never` none is, a warning naming the gap — Q-M6a-1). GTID `replication_type` remains recommended. |
+| `binlog_purge_action` | enum `error`\|`re_snapshot` | no | `error` | R | Resume position purged on the server (G-26), or, with `replication_type: binlog`, recorded on another server. `error`: halt with an error (operator decides). `re_snapshot`: automatic recovery from the server's current position (after a server change, every table's position marker is reset to it), the tables snapshotted as `snapshots.mode` says for a recovery (`initial`/`always` incrementally re-snapshot; under `never` none is, a warning naming the gap — Q-M6a-1). GTID `replication_type` remains recommended. |
 | `server_id` | integer | no | derived from `id` | PR | The replica server id the binlog dump registers with. The source server ends any other dump registered under the same id (measured, S-MY10), so each pipeline needs its own (V-120). Default: derived from the pipeline `id` — the first four bytes of its BLAKE3 hash, little-endian, with the top bit set (2147483648…4294967295, away from the small ids replicas usually take). Set it when that range collides with the server's own replicas. |
 | `heartbeat` | Duration | no | `60s` | R | The binlog heartbeat period (`@master_heartbeat_period`): an idle server sends a heartbeat this often (V-121). Also paces the stream watchdog, as `postgres.heartbeat` does: a stream silent for 3 heartbeats while the heartbeat's checks fail or find no binlog dump of the stream's connection on the server (its connection id in `information_schema.PROCESSLIST`, which a user without `PROCESS` sees for its own connections) is reconnected (DA-SRC-16). |
 
@@ -1098,6 +1099,7 @@ on.
 | Engine | Requirement | Severity (at start) | Rationale |
 |---|---|---|---|
 | Both | Configured source credentials hold **SELECT on `information_schema` / system catalogs** (over a regular, non-replication connection) | error → halt pipeline | Detection channels A/C/D query the source catalog; the replication credential is reused — no separate read role. |
+| PostgreSQL | The server **isn't a standby** (`pg_is_in_recovery()` is false) | error → halt pipeline | The source reads the primary's WAL position (`pg_current_wal_lsn()`, refused during recovery) and may change the publication, which a read-only standby can't: point the pipeline at the primary. Decoding on a standby (PostgreSQL 16+) is a later feature. |
 | PostgreSQL | **`REPLICA IDENTITY` ≠ `NOTHING`** on tracked tables | error → halt table | Delete/update keying (pre-existing requirement). |
 | PostgreSQL | Tracked tables are **logged** (`relpersistence = 'p'`; not `UNLOGGED`) | error → halt table (`TABLE_NOT_REPLICABLE`, explicit table) / warning + skip (glob-matched) | PostgreSQL doesn't publish unlogged tables: such a table would be snapshotted once and then never change. |
 | MySQL | **`binlog_format = ROW`** | error → halt pipeline | Granular row-level change capture. |
@@ -1105,7 +1107,7 @@ on.
 | MySQL | **`binlog_row_metadata = FULL`** | error → halt pipeline; a table map without column names at run time (the setting turned back) → halt table | Column names and ENUM/SET strings in `TABLE_MAP`. A row is decoded by position against the schema as of its statement, which channel C builds partly from the catalog read later: the stream checks each table map's names, signedness, charsets and ENUM/SET strings against that schema and halts the table on a mismatch, instead of reading same-typed columns into each other (`Schema_Change…` §2.2). |
 | MySQL | **The source database's changes reach the binlog**: no binlog filter (`binlog_do_db` / `binlog_ignore_db` empty); a server that replicates from another logs what it applies (`log_replica_updates`, MariaDB `log_slave_updates` = ON) | error → halt pipeline; a server with the setting OFF whose replication status the user can't read → warning, naming the grant | Otherwise the snapshot copies the tables and the stream never sees a change to them, without an error. Even a filter that lets `source.db` through leaves out its DDL and `TRUNCATE` issued from another default database: the server filters a statement by the session's database, not its tables'. MariaDB's `log_slave_updates` default is OFF. |
 | MySQL | **`REPLICATION CLIENT` / `REPLICATION SLAVE`** privilege | error → halt pipeline | Binlog dump access. |
-| Both | Each table has an **identifier**: an inferred PK, or a `tables.primary_key` override whose columns exist and are top-level, primitive, NOT NULL, non-floating | error → halt table (explicit table) / warning + skip (glob-matched PK-less table) | Upsert/delete keying (G-13, G-30). |
+| Both | Each table has an **identifier**: an inferred PK, or a `tables.primary_key` override whose columns exist and are top-level, primitive, NOT NULL, non-floating; on PostgreSQL no identifier column is `bit`, `varbit` or a hex-bytes type (PostGIS) unless `column_type_overrides` reads it as `string` | error → halt table (explicit table; `IDENTIFIER_NOT_USABLE` for the bit/hex-bytes key) / warning + skip (glob-matched PK-less table) | Upsert/delete keying (G-13, G-30). A bit or hex-bytes key's text isn't valid input for its type, so the snapshot's keyset cursor can't resume past the first chunk. |
 | PostgreSQL | Identifier columns ⊆ **REPLICA IDENTITY** columns | error → halt table, naming the missing columns | Before-image must carry the old key (`Ghost_Row…` §2). |
 | Both | `tables.partitioning` columns exist; temporal transforms target a date/time column | error → halt table | Partition spec validity (G-24). |
 | Both | No source column is named like a lineage column (`_op`, `_ts`, `_lsn`, `_seq`, `_source_db`, `_pipeline`) or prefixed `__data_avalanche_`, compared case-insensitively | error → halt table (`RESERVED_COLUMN_COLLISION`) | The accumulator injects these columns (§5, D-V1.1). |
@@ -1277,6 +1279,7 @@ errors.
 | V-119 | `sink.delta.merge_memory_limit` | ≥ 16 MiB when set. | error | pipeline |
 | V-121 | `source.mysql.heartbeat` | Between `1s` and `4294967s` (the server's heartbeat period range). | error | pipeline |
 | V-122 | `globals.cluster.memberlist` gossip timers | `gossip_interval`, `probe_interval`, `probe_timeout` and `push_pull_interval` above zero; `gossip_nodes` and `retransmit_factor` at least 1; `probe_timeout` below `probe_interval`. | error | config |
+| V-123 | `source.postgres.source_change_action` | ∈ {error, re_snapshot}. | error | pipeline |
 
 ### 13.4 Cross-field / conditional
 
@@ -1285,6 +1288,7 @@ errors.
 | V-028 | `sink.iceberg.catalog.glue` | Requires `globals.cloud = aws`. | error | pipeline |
 | V-029 | `sink.iceberg.catalog.rest.auth = sigv4` | Requires `globals.cloud = aws`. | error | pipeline |
 | V-030 | `source.ssl_mode = allow` | Invalid for MySQL. | error | pipeline |
+| V-124 | `source.ssl_mode = verify-ca`, when `source.type = mysql` | The host name is checked too, as with `verify-full` (DA-SRC-22). | warning | pipeline |
 | V-073 | `globals.cluster.lease_renewal_interval` | Must be ≤ `lease_duration / 3` (the holder must get ≥2 renew attempts inside the renewal safety deadline). **Hard error** — promoted from the previously-advisory guidance (Clustering doc §18.2/§19.6, D-8). | error | config |
 | V-033 | `tables.snapshots.overrides` keys | Must be full `schema.table`; globs forbidden. | error | pipeline |
 | V-034 | `tables.snapshots.overrides` keys | Key not in the resolved include/exclude set. | warning | pipeline |
@@ -1622,6 +1626,14 @@ Every deviation, so nothing is silent:
     `binlog_purge_action: re_snapshot`: the recovery's snapshot follows `snapshots.mode`, as
     Data-Flow Phase 0 and Q-M6a-1 decided and the code does; under `never` (the default) there is
     none, and a warning names the gap. The rows said every table is re-snapshotted.
+30. **M12a planning (2026-10-30, Q-M12a-1…4)** — §9.2.1 new `source.postgres.source_change_action`
+    (`error` | `re_snapshot`, applied, **V-123**): a start on another PostgreSQL system or
+    timeline halts with `WAL_SOURCE_CHANGED` or recovers; `slot_management: require_existing`
+    and `slot_on_orphan`: a slot the DBA made again past the checkpoint is an orphan. §9.2.2
+    `replication_type: binlog` and `binlog_purge_action`: a changed server is a lost position,
+    recovered by `re_snapshot` (it halted with no recovery); MariaDB's check by
+    `BINLOG_GTID_POS`. §9.1 `ssl_mode`: MySQL `verify-ca` checks the host name too, warning
+    **V-124**.
 
 None of these change the **decided** catalog-auth schema (hive Thrift `none/ldap/kerberos`;
 rest HTTP `none/bearer/oauth2/sigv4`) — those are reproduced verbatim from

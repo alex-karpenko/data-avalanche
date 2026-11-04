@@ -117,7 +117,10 @@ impl WorkerError {
                 StoreError::Transient { .. } | StoreError::Contention { .. },
             ))
             | Self::Contended { .. } => Recovery::Retry,
-            Self::Source(e) if e.is_transient() || matches!(e, SourceError::Contended(_)) => {
+            Self::Source(e)
+                if e.is_transient()
+                    || matches!(e, SourceError::Contended(_) | SourceError::SourceChanged(_)) =>
+            {
                 Recovery::Retry
             }
             Self::Sink(e) if e.is_transient() => Recovery::Retry,
@@ -205,6 +208,13 @@ mod tests {
             // Phase 0's `prepare` met the slot active for another PID.
             (
                 WorkerError::Source(SourceError::Contended("slot active".into())),
+                Recovery::Retry,
+            ),
+            // The stream's reconnect reached another server: Phase 0 plans the recovery.
+            (
+                WorkerError::Source(SourceError::SourceChanged(
+                    "BINLOG_SOURCE_CHANGED: another server".into(),
+                )),
                 Recovery::Retry,
             ),
             (

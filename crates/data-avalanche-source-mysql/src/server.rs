@@ -201,6 +201,9 @@ pub(crate) struct Coverage {
     pub(crate) replica_updates: bool,
     /// Whether the server replicates from another; `None` when the user can't read it.
     pub(crate) replica: Option<bool>,
+    /// A Galera node (`wsrep_on`): it applies the other nodes' writesets without a replica
+    /// connection, so `replica` doesn't show it (DA-SRC-24).
+    pub(crate) galera: bool,
 }
 
 /// Whether the source database's changes reach the binlog (config §11.2): `Err` refuses the
@@ -223,6 +226,13 @@ pub(crate) fn check_coverage(flavour: Flavour, c: &Coverage) -> Result<Option<St
         }
     }
     let setting = flavour.replica_updates();
+    if c.galera && !c.replica_updates {
+        return Err(format!(
+            "this server is a Galera node (wsrep_on = ON) and doesn't log the writesets it \
+             applies from the other nodes ({setting} = OFF): the binlog lacks their changes; set \
+             {setting} = ON"
+        ));
+    }
     match (c.replica_updates, c.replica) {
         (true, _) | (false, Some(false)) => Ok(None),
         (false, Some(true)) => Err(format!(
@@ -368,6 +378,7 @@ mod tests {
             ignore_db: ignore_db.into(),
             replica_updates: updates,
             replica,
+            galera: false,
         };
         let ok = cover("", "", true, None);
         assert_eq!(check_coverage(my, &ok), Ok(None));
@@ -395,6 +406,20 @@ mod tests {
             check_coverage(my, &cover("", "", true, Some(true))),
             Ok(None)
         );
+        // A Galera node is a replica of every other node, with no replica connection.
+        let galera = |updates| Coverage {
+            replica: Some(false),
+            replica_updates: updates,
+            galera: true,
+            ..Coverage::default()
+        };
+        let e = check_coverage(maria, &galera(false)).unwrap_err();
+        assert!(
+            e.starts_with("this server is a Galera node (wsrep_on = ON)")
+                && e.contains("set log_slave_updates = ON"),
+            "{e}"
+        );
+        assert_eq!(check_coverage(maria, &galera(true)), Ok(None));
         // Unreadable: a warning naming the grant.
         let w = check_coverage(maria, &cover("", "", false, None))
             .unwrap()

@@ -46,4 +46,4 @@ pub use source::{
 pub use table::{
     INTERNAL_COLUMN_PREFIX, LINEAGE_COLUMNS, TableRef, first_reserved_collision, is_reserved_column,
 };
-pub use value::{ColumnValue, ColumnValueType, Row, time_text};
+pub use value::{ColumnValue, ColumnValueType, Row, row_bytes, time_text};

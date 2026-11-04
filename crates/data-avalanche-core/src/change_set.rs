@@ -64,6 +64,11 @@ pub struct TableChangeSet {
     /// position guard never skips them ([`crate::CommitMarker::covers`]). A chunk is emitted at
     /// the stream's frontier, which the table's marker may already cover (Q-M6a-6).
     pub snapshot: bool,
+    /// The table's marker is replaced by this set's position instead of joined with it: a
+    /// source-change start (`SnapshotReason::SourceChanged`) moves every table onto the new
+    /// server's positions, which may sit below the ones the lake has marked (DA-SRC-20). The
+    /// guard never skips it; it carries no rows, no truncate and no split.
+    pub reposition: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -95,6 +100,11 @@ impl TableChangeSet {
         };
         if self.identifier.is_empty() {
             return Err(err("a change set with no identifier columns".into()));
+        }
+        if self.reposition && (!self.is_empty() || self.split.is_some()) {
+            return Err(err(
+                "a reposition carries no rows, no truncate and no split".into(),
+            ));
         }
         let canonical = self.schema.fields();
         let mut upsert_extra: Option<Vec<String>> = None;
@@ -279,6 +289,7 @@ mod tests {
             },
             split: None,
             snapshot: false,
+            reposition: false,
         }
     }
 
@@ -373,6 +384,32 @@ mod tests {
             }),
         ] {
             assert!(d.contains("upserts only"), "{d}");
+        }
+    }
+
+    #[test]
+    fn a_reposition_carries_nothing() {
+        let mut c = cs(vec![], vec![]);
+        c.reposition = true;
+        c.validate().unwrap();
+        let refused = |f: fn(&mut TableChangeSet)| {
+            let mut c = cs(vec![], vec![]);
+            c.reposition = true;
+            f(&mut c);
+            detail(c)
+        };
+        for d in [
+            refused(|c| c.upserts = vec![upserts(&[1], None)]),
+            refused(|c| c.deletes = vec![deletes(&[Some(2)])]),
+            refused(|c| c.truncate = true),
+            refused(|c| {
+                c.split = Some(SplitInfo {
+                    txn_start: SourcePosition::Pg(Lsn(20)),
+                    slice: 1,
+                });
+            }),
+        ] {
+            assert!(d.contains("a reposition carries no rows"), "{d}");
         }
     }
 

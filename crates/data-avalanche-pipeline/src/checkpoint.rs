@@ -1,6 +1,7 @@
 //! Where the pipeline's checkpoint lives (Data-Flow Phase 5): PostgreSQL's slot document
-//! (`replication/slot.json`), or MySQL's position document (`replication/position.json`), which
-//! records the server the position was read from with it.
+//! (`replication/slot.json`), or MySQL's position document (`replication/position.json`). Each
+//! records the server the position was read from with it (an older slot document has none: the
+//! next write records it).
 
 use data_avalanche_core::{Checkpoint, SourcePosition};
 use data_avalanche_state::{PipelineDocs, PositionDoc, SlotDoc, StateError};
@@ -41,8 +42,11 @@ impl Store {
     pub async fn load(&self, docs: &PipelineDocs) -> Result<Option<Stored>, StateError> {
         Ok(match self {
             Self::Slot { .. } => docs.slot().await?.map(|v| Stored {
-                checkpoint: SourcePosition::Pg(v.doc.confirmed_flush_lsn).into(),
                 intent: v.doc.is_intent(),
+                checkpoint: Checkpoint {
+                    position: SourcePosition::Pg(v.doc.confirmed_flush_lsn),
+                    server: v.doc.server,
+                },
             }),
             Self::Position => docs.position().await?.map(|v| Stored {
                 checkpoint: Checkpoint {
@@ -85,11 +89,12 @@ impl Store {
                 Self::Slot { name, .. },
                 Checkpoint {
                     position: SourcePosition::Pg(lsn),
-                    ..
+                    server,
                 },
             ) => Ok(Doc::Slot(SlotDoc {
                 slot_name: name.clone(),
                 confirmed_flush_lsn: *lsn,
+                server: server.clone(),
             })),
             (Self::Slot { .. }, c) => Err(protocol(format!(
                 "checkpoint {} isn't a PostgreSQL position",
@@ -159,6 +164,15 @@ mod tests {
                 intent: false
             })
         );
+        let on = Checkpoint {
+            position: SourcePosition::Pg(Lsn(0x300)),
+            server: Some(ServerIdentity::Postgres {
+                system_identifier: 7692239610332024875,
+                timeline: 2,
+            }),
+        };
+        store.doc(&on).unwrap().save(&d).await.unwrap();
+        assert_eq!(store.load(&d).await.unwrap().unwrap().checkpoint, on);
         let unmanaged = Store::Slot {
             name: "p_slot".into(),
             intent: None,

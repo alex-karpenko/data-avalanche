@@ -23,7 +23,7 @@ SPDX SBOM per platform.
 Its entrypoint is `data-avalanche`, with the default arguments
 `run --config /etc/data-avalanche/config.yaml`: mount the config there, or pass other arguments.
 
-Until the first release, build it from the repository:
+To build it from a checkout instead:
 
 ```sh
 docker build -f deploy/docker/Dockerfile -t data-avalanche:dev .

@@ -46,6 +46,11 @@ pub struct SlotDoc {
     /// As PostgreSQL prints it (`0/16B3748`).
     #[serde(serialize_with = "display", deserialize_with = "from_str")]
     pub confirmed_flush_lsn: Lsn,
+    /// The server the position was read on (its system identifier and timeline): a start on
+    /// another one is a source change (DA-SRC-20). `None` in a document written before it was
+    /// recorded (v0.1.0) or for an intent: the next checkpoint write records it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<ServerIdentity>,
 }
 
 impl Document for SlotDoc {
@@ -62,6 +67,7 @@ impl SlotDoc {
         Self {
             slot_name: slot_name.to_owned(),
             confirmed_flush_lsn: Lsn(0),
+            server: None,
         }
     }
 
@@ -331,6 +337,7 @@ mod tests {
         let doc = SlotDoc {
             slot_name: "data_avalanche_orders".into(),
             confirmed_flush_lsn: "0/16B3748".parse().unwrap(),
+            server: None,
         };
         assert_eq!(
             json(&doc),
@@ -343,6 +350,28 @@ mod tests {
         };
         p.save_slot(&later).await.unwrap();
         assert_eq!(p.slot().await.unwrap().unwrap().doc, later);
+    }
+
+    /// A slot document records the server its position was read on; one written before that
+    /// (v0.1.0) still reads, with no server.
+    #[test]
+    fn a_slot_document_records_its_server() {
+        let doc = SlotDoc {
+            slot_name: "s".into(),
+            confirmed_flush_lsn: "0/16B3748".parse().unwrap(),
+            server: Some(ServerIdentity::Postgres {
+                system_identifier: 7692239610332024875,
+                timeline: 2,
+            }),
+        };
+        assert_eq!(
+            json(&doc),
+            "{\n  \"version\": 1,\n  \"slot_name\": \"s\",\n  \"confirmed_flush_lsn\": \"0/16B3748\",\n  \"server\": {\n    \"engine\": \"postgres\",\n    \"system_identifier\": 7692239610332024875,\n    \"timeline\": 2\n  }\n}"
+        );
+        let old: SlotDoc =
+            serde_json::from_str(r#"{"slot_name": "s", "confirmed_flush_lsn": "0/16B3748"}"#)
+                .unwrap();
+        assert_eq!(old.server, None);
     }
 
     #[test]

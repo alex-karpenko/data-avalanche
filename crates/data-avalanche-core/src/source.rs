@@ -41,6 +41,13 @@ pub enum SourceError {
     /// gives up (`Postgres_Slot…` D-15.5).
     #[error("the source's stream position is held by another reader: {0}")]
     Contended(String),
+    /// The stream's connection reached another server than the checkpoint's (a failover, a
+    /// moved address, a rebuilt server): a file/position checkpoint means nothing there. The
+    /// pipeline reruns Phase 0, whose `prepare` plans the recovery
+    /// ([`SnapshotReason::SourceChanged`]). Only a source configured to recover returns it;
+    /// otherwise it halts with a [`Self::Permanent`].
+    #[error("{0}")]
+    SourceChanged(String),
 }
 
 impl SourceError {
@@ -98,9 +105,15 @@ pub enum SnapshotReason {
     /// The pipeline has state, but the source lost its stream position (PostgreSQL: the slot is
     /// gone or invalidated). Warn: data was at risk of a retention gap (D-15.3).
     PositionLost,
-    /// No pipeline state, but the source kept a stream position: `on_orphan: adopt_resnapshot`
+    /// No pipeline state, but the source kept a stream position: `slot_on_orphan: adopt_resnapshot`
     /// took it over (D-15.1).
     AdoptedOrphan,
+    /// The checkpoint was read on another server (PostgreSQL: another system identifier or
+    /// timeline; MySQL / MariaDB in file/position mode: another server), and the pipeline's
+    /// `source_change_action` / `binlog_purge_action` is `re_snapshot`. The stream starts from the
+    /// new server's position, and every table's marker is replaced by it first: the new server's
+    /// positions may sit below ones the lake has marked, which the guard would skip (DA-SRC-20).
+    SourceChanged,
 }
 
 /// How streaming starts (Postgres_Slot… §1, the slot state machine).
@@ -115,15 +128,25 @@ pub enum StartPlan {
     },
 }
 
-/// The source server a stream position was read from (MySQL / MariaDB). A binlog file and offset
-/// mean something only on the server that wrote them: in file/position mode a start against
-/// another server halts the pipeline (`BINLOG_SOURCE_CHANGED`, Data-Flow Phase 2b). Its JSON is
-/// the `server` of `replication/position.json`.
+/// The source server a stream position was read from. A binlog file and offset mean something only
+/// on the server that wrote them: in file/position mode a start against another server halts the
+/// pipeline (`BINLOG_SOURCE_CHANGED`, Data-Flow Phase 2b). A PostgreSQL LSN means something only
+/// on its cluster's timeline: a promoted replica keeps the system identifier and starts a new
+/// timeline, whose LSNs may repeat ones the lake has already marked (`WAL_SOURCE_CHANGED`,
+/// DA-SRC-20). Its JSON is the `server` of `replication/position.json` or `replication/slot.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "engine", rename_all = "lowercase", deny_unknown_fields)]
 pub enum ServerIdentity {
-    Mysql { server_uuid: String },
-    Mariadb { server_id: u32 },
+    Mysql {
+        server_uuid: String,
+    },
+    Mariadb {
+        server_id: u32,
+    },
+    Postgres {
+        system_identifier: u64,
+        timeline: u32,
+    },
 }
 
 impl fmt::Display for ServerIdentity {
@@ -131,6 +154,13 @@ impl fmt::Display for ServerIdentity {
         match self {
             Self::Mysql { server_uuid } => write!(f, "MySQL server {server_uuid}"),
             Self::Mariadb { server_id } => write!(f, "MariaDB server_id {server_id}"),
+            Self::Postgres {
+                system_identifier,
+                timeline,
+            } => write!(
+                f,
+                "PostgreSQL system {system_identifier} on timeline {timeline}"
+            ),
         }
     }
 }
@@ -144,7 +174,7 @@ pub struct Checkpoint {
 }
 
 impl From<SourcePosition> for Checkpoint {
-    /// A position with no recorded server (PostgreSQL).
+    /// A position with no recorded server.
     fn from(position: SourcePosition) -> Self {
         Self {
             position,
@@ -164,8 +194,9 @@ pub struct Prepared {
     /// publication behind its back. Empty when the plan snapshots every table.
     pub added: Vec<TableRef>,
     pub warnings: Vec<String>,
-    /// The server the stream reads, recorded with the checkpoint so the next start can check it
-    /// (MySQL / MariaDB). `None` for a source that records none (PostgreSQL).
+    /// The server the stream reads, recorded with the checkpoint so the next start and the stream's
+    /// reconnects can check it (DA-SRC-20). Both sources report one; `None` for a source that
+    /// records none (a test double).
     pub server: Option<ServerIdentity>,
 }
 
@@ -351,8 +382,11 @@ pub trait SourceConnector: Send + Sync {
 
     /// Replaces a lost stream position after [`SourceError::PositionUnreachable`] (D-15.3): the
     /// new consistent position to snapshot from and stream after, with the server it was read
-    /// from when the source records one.
-    async fn reset_position(&self) -> Result<Checkpoint, SourceError>;
+    /// from when the source records one. `lost` is the checkpoint whose position the stream lost,
+    /// with the server the session read: a source whose positions mean nothing on another server
+    /// (PostgreSQL's LSNs) refuses to replace it there, before it changes anything, as its start
+    /// would (a halt, or [`SourceError::SourceChanged`] for a rerun of Phase 0).
+    async fn reset_position(&self, lost: &Checkpoint) -> Result<Checkpoint, SourceError>;
 
     /// The log the source keeps for the pipeline. `None` when the source keeps nothing for it.
     async fn retained(&self) -> Result<Option<RetainedLog>, SourceError>;
@@ -613,7 +647,7 @@ mod tests {
         async fn retained(&self) -> Result<Option<RetainedLog>, SourceError> {
             Ok(None)
         }
-        async fn reset_position(&self) -> Result<Checkpoint, SourceError> {
+        async fn reset_position(&self, _: &Checkpoint) -> Result<Checkpoint, SourceError> {
             Ok(SourcePosition::Pg(Lsn(0x20)).into())
         }
         async fn current_position(&self) -> Result<SourcePosition, SourceError> {

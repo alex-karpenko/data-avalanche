@@ -84,8 +84,8 @@ pub(crate) struct Core {
     /// The tables whose chunk reads are failing, a streak each. Like `requery_failing` it outlives
     /// a session.
     pub read_failing: BTreeMap<TableRef, Streak>,
-    /// The server the checkpoint is recorded with (MySQL; `None` for PostgreSQL): the one the
-    /// last start read, from `prepare` or the reset position. A reconnect keeps it.
+    /// The server the checkpoint is recorded with: the one the last start read, from `prepare` or
+    /// the reset position. A reconnect keeps it, and a lost position's reset is checked against it.
     pub server: Option<ServerIdentity>,
     /// [`Command::Pause`] is in force: a session finishes its open transaction, makes it durable
     /// and reads nothing more until [`Command::Resume`]. It outlives a session, so a reconnect

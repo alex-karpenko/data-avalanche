@@ -358,6 +358,20 @@ impl MySqlConnector {
             })
             .await?;
         let replica_updates = replica_updates == Some(1);
+        // Off unless the node is in a Galera cluster (MariaDB Galera, Percona XtraDB Cluster);
+        // MySQL itself has no such variable, and the query finds no row.
+        let galera = !replica_updates
+            && self
+                .conn
+                .command("read wsrep_on", |c| {
+                    Box::pin(async move {
+                        let row: Option<(String, String)> = c
+                            .query_first("SHOW GLOBAL VARIABLES LIKE 'wsrep_on'")
+                            .await?;
+                        Ok(row.is_some_and(|(_, v)| v.eq_ignore_ascii_case("ON")))
+                    })
+                })
+                .await?;
         let replica = match replica_updates {
             true => Some(false),
             false => {
@@ -382,6 +396,7 @@ impl MySqlConnector {
             ignore_db,
             replica_updates,
             replica,
+            galera,
         };
         check_coverage(flavour, &c).map_err(SourceError::Permanent)
     }
@@ -437,7 +452,9 @@ impl SourceConnector for MySqlConnector {
     }
 
     /// The server's write position now: the binlog keeps no position for the pipeline to lose.
-    async fn reset_position(&self) -> Result<Checkpoint, SourceError> {
+    /// `lost`'s server isn't compared: a GTID set means the same on every server, and in
+    /// file/position mode the dump's open checks the server before it reports a purged position.
+    async fn reset_position(&self, _lost: &Checkpoint) -> Result<Checkpoint, SourceError> {
         self.checkpoint_now().await
     }
 

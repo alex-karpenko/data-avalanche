@@ -44,8 +44,9 @@ pub(crate) struct ReadColumn {
 /// deterministic collation for both, so the order and the cursor agree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum KeyCollation {
-    /// The column's own, deterministic: its index serves the order.
-    Own(String),
+    /// The column's own, deterministic: its index serves the order. `name` is what the cursor
+    /// records; `qualified`, with its schema, what a cursor literal is collated in.
+    Own { name: String, qualified: String },
     /// A nondeterministic collation's column, compared in `"C"`.
     C,
 }
@@ -53,7 +54,7 @@ enum KeyCollation {
 impl KeyCollation {
     fn name(&self) -> &str {
         match self {
-            KeyCollation::Own(name) => name,
+            KeyCollation::Own { name, .. } => name,
             KeyCollation::C => "C",
         }
     }
@@ -93,9 +94,10 @@ async fn read_plan(c: &PgConnector, schema: &TableSchema) -> Result<Vec<ReadColu
                 &format!(
                     "SELECT a.attname, a.atttypid, a.atttypmod,
                             pg_catalog.format_type(a.atttypid, a.atttypmod), co.collname::text,
-                            co.collisdeterministic, {NOT_NULL}
+                            co.collisdeterministic, {NOT_NULL}, cn.nspname::text
                        FROM pg_catalog.pg_attribute a
                        LEFT JOIN pg_catalog.pg_collation co ON co.oid = a.attcollation
+                       LEFT JOIN pg_catalog.pg_namespace cn ON cn.oid = co.collnamespace
                       WHERE a.attrelid = $1 AND a.attname = ANY($2)
                         AND a.attnum > 0 AND NOT a.attisdropped"
                 ),
@@ -154,7 +156,10 @@ async fn read_plan(c: &PgConnector, schema: &TableSchema) -> Result<Vec<ReadColu
             ));
         }
         let collation = match (r.get::<_, Option<String>>(4), r.get::<_, Option<bool>>(5)) {
-            (Some(name), Some(true)) => Some(KeyCollation::Own(name)),
+            (Some(name), Some(true)) => Some(KeyCollation::Own {
+                qualified: format!("{}.{}", ident(r.get(7)), ident(&name)),
+                name,
+            }),
             (Some(_), _) => Some(KeyCollation::C),
             (None, _) => None,
         };
@@ -219,14 +224,15 @@ fn cast(c: &ReadColumn, text: &str) -> String {
     }
 }
 
-/// A key value in a keyset comparison: [`cast`], collated like the column's [`key_expr`]. A cast
-/// literal's collation yields to the column's own.
+/// A key value in a keyset comparison: [`cast`], collated like the column's [`key_expr`], named
+/// with its schema. Explicitly: a cast to a domain with a collation of its own carries that one,
+/// which conflicts with the column's (42P22, DA-SRC-15).
 fn key_value(c: &ReadColumn, text: &str) -> String {
     let cast = cast(c, text);
-    if c.collation == Some(KeyCollation::C) {
-        format!("{cast} COLLATE \"C\"")
-    } else {
-        cast
+    match &c.collation {
+        Some(KeyCollation::C) => format!("{cast} COLLATE \"C\""),
+        Some(KeyCollation::Own { qualified, .. }) => format!("{cast} COLLATE {qualified}"),
+        None => cast,
     }
 }
 
@@ -395,18 +401,46 @@ fn changed(schema: &TableSchema, detail: String) -> SourceError {
     ))
 }
 
-/// A table, or its schema, gone from the catalog (SQLSTATE 42P01, 3F000) halts that table, not
-/// the pipeline (§2.1). A column gone (42703) is `read_plan`'s own finding come late: dropped
-/// after the plan's catalog read and before the query took its lock, it is transient the same
-/// way.
+/// A table read's error, by SQLSTATE (§2.1). The table, or its schema, gone from the catalog
+/// (42P01, 3F000) halts that table, not the pipeline. A column gone (42703) is `read_plan`'s own
+/// finding come late: dropped after the plan's catalog read and before the query took its lock,
+/// it is transient the same way. Any other permanent error ends the session; the chunk read alone
+/// narrows it further ([`chunk_error`]).
 fn dropped(schema: &TableSchema, e: SourceError) -> SourceError {
-    match &e {
-        SourceError::Permanent(m) if matches!(sqlstate(m), Some("42P01" | "3F000")) => {
-            halt_dropped(schema)
-        }
-        SourceError::Permanent(m) if sqlstate(m) == Some("42703") => changed(schema, m.clone()),
+    let SourceError::Permanent(m) = &e else {
+        return e;
+    };
+    match sqlstate(m) {
+        Some("42P01" | "3F000") => halt_dropped(schema),
+        Some("42703") => changed(schema, m.clone()),
         _ => e,
     }
+}
+
+/// A snapshot chunk read's error after [`dropped`] (DA-SRC-19): an error of this table's read
+/// alone halts the table (`TABLE_NOT_REPLICABLE`), since a restart reads it the same way: its key
+/// no longer compares with the cursor (42883 no such operator, 42804 a datatype mismatch, 42P22 an
+/// indeterminate collation, 42704 the cursor's collation gone), a value or a cursor literal its
+/// type refuses (class 22), or the role lost `SELECT` on it (42501). Any other permanent error
+/// ends the pipeline. Only the chunk read: a `re_query` fetch's permanent error ends the session
+/// (Data-Flow, `toast_strategy`).
+fn chunk_error(schema: &TableSchema, e: SourceError) -> SourceError {
+    match &e {
+        SourceError::Permanent(m) if sqlstate(m).is_some_and(table_scoped) => {
+            SourceError::TableHalt {
+                table: schema.table().clone(),
+                reason: HaltReason::NotReplicable {
+                    reason: format!("its snapshot read fails: {m}"),
+                },
+            }
+        }
+        _ => e,
+    }
+}
+
+/// The SQLSTATEs [`chunk_error`] halts the table for.
+fn table_scoped(code: &str) -> bool {
+    code.starts_with("22") || matches!(code, "42883" | "42804" | "42P22" | "42704" | "42501")
 }
 
 /// The identifier's read columns, in identifier order.
@@ -449,6 +483,12 @@ impl PgConnector {
         after: Option<&KeysetCursor>,
         limit: usize,
     ) -> Result<Chunk, SourceError> {
+        // An empty chunk ends the table: one of no rows asked would end it early (DA-SRC-15).
+        if limit == 0 {
+            return Err(SourceError::Permanent(
+                "a snapshot chunk of 0 rows: chunk_size is at least 1 (V-108)".into(),
+            ));
+        }
         let columns = read_plan(self, table).await?;
         let keys = key_columns(table, &columns);
         let collation = cursor_collation(&keys);
@@ -488,7 +528,9 @@ impl PgConnector {
             "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;
              SELECT pg_catalog.pg_current_snapshot()::text; {sql}"
         );
-        let messages = simple_query(self, "read a snapshot chunk", table, &sql).await?;
+        let messages = simple_query(self, "read a snapshot chunk", table, &sql)
+            .await
+            .map_err(|e| chunk_error(table, e))?;
         // Each SELECT's rows follow its row description: the snapshot's, then the chunk's.
         let mut selects = messages
             .split_inclusive(|m| matches!(m, SimpleQueryMessage::CommandComplete(_)))
@@ -583,7 +625,7 @@ impl PgConnector {
                     let values: Vec<String> = key_cols
                         .iter()
                         .zip(&texts)
-                        .map(|(c, t)| cast(c, t))
+                        .map(|(c, t)| key_value(c, t))
                         .collect();
                     Ok(format!("({})", values.join(", ")))
                 })
@@ -644,11 +686,55 @@ mod tests {
                 ..
             }
         ));
-        let other = SourceError::Permanent("permission denied (SQLSTATE 42501)".into());
+        // An error of our own SQL, or the server's, ends the pipeline.
+        for code in ["42601", "XX000", "28000"] {
+            let other = SourceError::Permanent(format!("boom (SQLSTATE {code})"));
+            assert!(
+                matches!(dropped(&schema(), other), SourceError::Permanent(_)),
+                "{code}"
+            );
+        }
         assert!(matches!(
-            dropped(&schema(), other),
-            SourceError::Permanent(_)
+            dropped(&schema(), SourceError::Transient("reset".into())),
+            SourceError::Transient(_)
         ));
+    }
+
+    /// An error of this table's read alone halts the table, not the pipeline: a restart would read
+    /// it the same way (DA-SRC-19).
+    #[test]
+    fn a_read_only_this_table_fails_halts_the_table() {
+        for code in [
+            "42883", "42804", "42P22", "42704", "42501", "22P02", "22003", "22021",
+        ] {
+            let e = SourceError::Permanent(format!("it failed (SQLSTATE {code})"));
+            match chunk_error(&schema(), dropped(&schema(), e)) {
+                SourceError::TableHalt {
+                    table,
+                    reason: HaltReason::NotReplicable { reason },
+                } => {
+                    assert_eq!(table, TableRef::new("s", "t"));
+                    assert_eq!(
+                        reason,
+                        format!("its snapshot read fails: it failed (SQLSTATE {code})")
+                    );
+                }
+                other => panic!("{code}: {other:?}"),
+            }
+        }
+    }
+
+    /// A `re_query` fetch maps through `dropped` alone: a table-scoped SQLSTATE stays permanent and
+    /// ends the session (Data-Flow).
+    #[test]
+    fn a_requery_error_of_the_table_ends_the_session() {
+        for code in ["42501", "22P02", "42883"] {
+            let e = SourceError::Permanent(format!("it failed (SQLSTATE {code})"));
+            assert!(
+                matches!(dropped(&schema(), e), SourceError::Permanent(_)),
+                "{code}"
+            );
+        }
     }
 
     fn rc(name: &str, type_text: &str, collation: Option<KeyCollation>) -> ReadColumn {
@@ -693,7 +779,12 @@ mod tests {
 
     #[test]
     fn keys_compare_in_one_deterministic_collation() {
-        let own = || Some(KeyCollation::Own("en_US.utf8".into()));
+        let own = || {
+            Some(KeyCollation::Own {
+                name: "en_US.utf8".into(),
+                qualified: "\"pg_catalog\".\"en_US.utf8\"".into(),
+            })
+        };
         assert_eq!(
             key_expr(&rc("code", "text", Some(KeyCollation::C))),
             "src.\"code\" COLLATE \"C\""
@@ -709,8 +800,8 @@ mod tests {
         );
         assert_eq!(
             key_value(&rc("code", "character varying(10)", own()), "it's"),
-            "'it''s'::character varying(10)",
-            "the column's own collation wins over the literal's"
+            "'it''s'::character varying(10) COLLATE \"pg_catalog\".\"en_US.utf8\"",
+            "the column's own collation, named with its schema, over a domain's"
         );
         assert_eq!(
             key_value(&rc("id", "numeric(10,2)", None), "1.50"),

@@ -101,6 +101,7 @@ config_enum!(SslMode, rule = "V-020", {
 config_enum!(ToastStrategy, rule = "V-080", { CarryForward => "carry_forward", ReQuery => "re_query" });
 config_enum!(SlotManagement, rule = "V-102", { Managed => "managed", RequireExisting => "require_existing" });
 config_enum!(SlotOnOrphan, rule = "V-102", { Halt => "halt", AdoptResnapshot => "adopt_resnapshot" });
+config_enum!(SourceChangeAction, rule = "V-123", { Error => "error", ReSnapshot => "re_snapshot" });
 config_enum!(ReplicationType, rule = "V-021", { Binlog => "binlog", Gtid => "gtid" });
 config_enum!(Tinyint1Detection, rule = "V-081", { InformationSchema => "information_schema", None => "none" });
 config_enum!(BinlogPurgeAction, rule = "V-105", { Error => "error", ReSnapshot => "re_snapshot" });

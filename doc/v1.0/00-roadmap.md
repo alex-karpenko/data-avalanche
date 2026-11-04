@@ -435,7 +435,7 @@ pub trait SourceConnector: Send + Sync {                    // built from the re
     async fn resolve_tables(&self) -> Result<ResolvedTables, SourceError>;         // channel A: tables, halted, skipped, warnings
     async fn prepare(&self, checkpoint: Option<&Checkpoint>, tables: &[TableRef])
         -> Result<Prepared, SourceError>;                                           // PG: publication + slot state machine; MySQL: dialect, server, purge → StartPlan
-    async fn reset_position(&self) -> Result<Checkpoint, SourceError>;             // after PositionUnreachable (D-15.3); M7b: with its server
+    async fn reset_position(&self, lost: &Checkpoint) -> Result<Checkpoint, SourceError>;  // after PositionUnreachable (D-15.3); M7b: with its server; M12a: refused on another server (DA-SRC-20)
     async fn retained(&self) -> Result<Option<RetainedLog>, SourceError>;          // M6b (was retained_bytes): the heartbeat's read
     async fn current_position(&self) -> Result<SourcePosition, SourceError>;       // a rescan's catch-up mark (Q-M6a-4)
     async fn in_flight(&self) -> Result<Option<Vec<InFlightTxn>>, SourceError>;   // M6a; default None (DA-SNAP-9)
@@ -1379,12 +1379,28 @@ workspace's and the chart's versions don't match (D-M11a.8).
 
 ### M12 — Hardening and v1 acceptance
 
+Three plans (Q-M12-4), each its own branch and PR. Every gap open at M12's start is processed in
+one of them: fixed, or closed with a pointer (Q-M12-1).
+
+- **M12a — source correctness and recovery** (`M12a-source-hardening.md`): the PostgreSQL and
+  MySQL/MariaDB source gaps (tracker §52): a PostgreSQL failover (`WAL_SOURCE_CHANGED`,
+  `source_change_action`, the markers moved onto the new server), a changed MySQL server under
+  `binlog_purge_action`, a DBA's slot made again, MariaDB rollbacks, the publication's blind
+  spots, the snapshot's edges, the TLS and key tests, a `replica` compose pair and its failover E2E.
+- **M12b — cluster, control, API and observability**: the remaining cluster, snapshot-job, API,
+  observability and operations gaps (among them the snapshot job's `truncate: true`, Q-M12-7, and
+  the validate rate limit below), the dependency audit and the compile time.
+- **M12c — v1 acceptance**: the load, soak and chaos runs (on Oleksii's machine first, Q-M12-3), the
+  real-cloud E2E in CI (S3, GCS, Azure, Q-M12-2), the checklist in §8, and `v1.0.0`.
+
+The scope across the three:
+
 - **Scope:**
   - Load tests measuring the D-V1.3 targets, in steady state and across a failover.
   - Long soak (24h) with churn.
   - Chaos: storage outage shorter and longer than the lease, source restart, network partition.
   - The real-cloud matrix: S3, GCS, Azure × PG and MySQL.
-  - The weekly DB version matrix green for 4 consecutive runs (Q-M5-23).
+  - The weekly DB version matrix green for 4 consecutive runs (Q-M5-23): treated as met (Q-M12-5).
   - A dependency audit: `cargo audit` clean, or every remaining advisory triaged and recorded (the CI
     step is non-blocking, so this is where the audit is enforced).
   - Compile time and the dependency tree (Q-M5-24), checked against a measurement:
@@ -1596,7 +1612,8 @@ implements them.
 
 ## 8. v1.0.0 acceptance checklist
 
-- [ ] All milestone exit criteria met; CI, weekly and cloud workflows green (weekly 4 in a row).
+- [ ] All milestone exit criteria met; CI, weekly and cloud workflows green (weekly 4 in a row:
+      treated as met, Q-M12-5).
 - [ ] D-V1.3 measured: steady-state p99 ≤ 60s and failover recovery ≤ 2 min at default config (M12
       report).
 - [ ] No data loss or duplicate keys in the crash/replay/chaos suites (source vs Delta comparison).
@@ -1640,6 +1657,7 @@ the naming below (2026-09-26).**
 | D-IMPL-21 | M10 observability rulings **D-M10.1…16** (listed in `M10-observability.md` §Decisions and rulings, each pinned by a test). Among them: the worker's events through an `Observer`, its gauges through `WorkerStatus`; every failed commit attempt counted, a covered commit not; the lag's start in the status and its age computed by the controller, clamped at 0; MySQL's binlog lag the age of the last transaction read, `0` at the head; `snapshot_state` running or waiting; soft drops counted at the start and after each evolve; `sink_type` on the commit series only; one tracer provider with its exporter swapped on reload; a bad endpoint a run-time warning; the four spans and their fields; the traces' own filter; the JSON correlation through a weakly held dispatch; colour only on a terminal; the example alert rules; Jaeger as the E2E collector | The specs name the series, the spans and the correlation, not where each value comes from, how a reload reaches the exporter, or which collector proves it | M10 — **approved 2026-10-28** |
 | D-IMPL-22 | M11a packaging rulings **D-M11a.1…9** (listed in `M11a-packaging.md` §Decisions and rulings, each pinned by a test or a measurement). Among them: the build on the toolchain file's Rust and Debian 13, the runtime distroless cc as 65532, debug info stripped; the pods named for the ring, their environment for the config's `${VAR}`s; the config a map or text, the ports and the probes' scheme from it; no restart on a changed config; read-only pods, a grace above the drain; k3s in the compose file, `hostAliases` for the compose services; the release's version check, per-architecture builds, SBOM and provenance | The roadmap names the image, the chart and the release, not their base images, how a pod's identity reaches the config, or how the smoke deploy reaches the test infrastructure | M11a — **approved 2026-10-29** |
 | D-IMPL-23 | M11b documentation rulings **D-M11b.1…11** (listed in `M11b-docs.md` §Decisions and rulings, each pinned by a test or a measurement). Among them: the site's exact pins and its base `/data-avalanche`; every link absolute, the validator's defaults kept; the config's keys generated from the raw model and their docs tied to it by tests, a default a value only where the resolved config proves it; a rule placed by its "Path / Scope" text; the generated pages plain Markdown, the API page sorted against the workspace's `serde_json` features; `docs.yml` deploying from `main`; the chart's `minReadySeconds`; the hand-written pages one task | The roadmap names the site, its references and its runbooks, not the tool's version, how the reference is tied to the model, or how the pages are checked | M11b — **approved 2026-10-29** |
+| D-IMPL-24 | M12a source-hardening rulings **D-M12a.1…15** (listed in `M12a-source-hardening.md` §Decisions and rulings, each pinned by a test or a measurement). Among them: the PostgreSQL checkpoint records the system identifier and the timeline; a source change moves every table's marker onto the new server by a change set with `reposition`, before the checkpoint names it; MySQL's changed server follows `binlog_purge_action`; MariaDB's position checked by `BINLOG_GTID_POS`; a rollback's rows held until the transaction ends; a table's own read errors halt the table; a wiped state adds the missing columns only; the publication refused under `require_existing`, repaired under `managed` | The specs name the failover, the guard and the publication, not how a lagging server's positions get past the markers, how a MariaDB rollback is read, or which read error is the table's | M12a — **approved 2026-10-30** |
 
 ### 9.1 Questions answered at plan review (2026-09-26)
 
@@ -1748,6 +1766,17 @@ the naming below (2026-09-26).**
 | Q-M11b-4 (2026-10-29) | How is the site published? | **`actions/deploy-pages` from `docs.yml`**; the Pages source "GitHub Actions" | M11b Task 3 |
 | Q-M11b-5 (2026-10-29) | How much of the pages does the plan carry? | **Their full text**, each page built and its examples validated in a scratch tree | M11b |
 | Q-M11b-6 (2026-10-29) | How deep is the architecture section? | **An operator's depth**: six pages with diagrams, linking to the specs | M11b Task 3 |
+| Q-M12-1 (2026-10-30) | Which open gaps does M12 take? | **All of them**: each fixed, or closed with a pointer | §4 M12; tracker §52 |
+| Q-M12-2 (2026-10-30) | Which clouds does the acceptance's E2E run on? | **S3, GCS and Azure, GCS in CI too** (the credentials are repository secrets) | §4 M12c, §8 |
+| Q-M12-3 (2026-10-30) | Where do load, soak and chaos run? | **On Oleksii's machine first** | §4 M12c |
+| Q-M12-4 (2026-10-30) | One plan for M12, or several? | **Three: M12a source correctness and recovery; M12b cluster, control, API and observability, with `cargo audit` and the compile time; M12c acceptance and `v1.0.0`** | §4 M12 |
+| Q-M12-5 (2026-10-30) | Does "the weekly matrix 4 in a row" still gate the release? | **Treated as met** | §4 M12, §8 |
+| Q-M12-6 (2026-10-30) | What does a PostgreSQL source change do? | **Halt with a code of its own** (`WAL_SOURCE_CHANGED`, PostgreSQL's `BINLOG_SOURCE_CHANGED`); the runbook gives the recovery | M12a Tasks 1–2 |
+| Q-M12-7 (2026-10-30) | DA-SNAP-15: how does a snapshot job drop rows deleted meanwhile? | **`truncate: true` on `POST /v1/pipelines/{id}/snapshots`**: a metadata-only delete before the copy, on the fenced path (a spec edit, with M12b) | M12b |
+| Q-M12a-1 (2026-10-30) | How is the PostgreSQL recovery asked for? | **`source.postgres.source_change_action: error \| re_snapshot`**, default `error`, applied without a restart (V-123), as `binlog_purge_action` is | M12a Tasks 1–2 |
+| Q-M12a-2 (2026-10-30) | What does a changed MySQL server in file/position mode do? | **It follows `binlog_purge_action`**: `error` halts with `BINLOG_SOURCE_CHANGED`, `re_snapshot` starts from the new server's position | M12a Task 3 |
+| Q-M12a-3 (2026-10-30) | Under `require_existing`, how is a DBA's slot made again taken? | **`slot_on_orphan: adopt_resnapshot` adopts it**, with a recovery snapshot per `snapshots.mode`; `halt` refuses it, naming the key | M12a Task 4 |
+| Q-M12a-4 (2026-10-30) | DA-SRC-22: patch `mysql_async`, or document `verify-ca`? | **Document it**: `verify-ca` stays fail-closed on MySQL (it checks the name too), V-124 warns, and the code names the re-check of each `mysql_async` release | M12a Task 6 |
 
 ### 9.2 Open questions (answer before the named milestone)
 
