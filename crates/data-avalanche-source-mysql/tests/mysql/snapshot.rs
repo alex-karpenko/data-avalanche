@@ -9,7 +9,7 @@ use data_avalanche_source_mysql::{Flavour, MySqlConnector};
 use data_avalanche_testkit::require_it;
 use mysql_async::prelude::Queryable;
 
-use crate::common::{cleanup, connector, fresh, pipeline, target};
+use crate::common::{cleanup, connector, fresh, pipeline, pipeline_as, target, user};
 
 /// Every row of `t`, in chunks of `limit`; the cursors along the way.
 async fn walk(c: &MySqlConnector, t: &TableSchema, limit: usize) -> (Vec<Row>, Vec<KeysetCursor>) {
@@ -270,5 +270,81 @@ async fn a_table_changed_under_the_snapshot_halts_or_waits() {
         halted(c.read_chunk(schema("flag"), None, 10).await.unwrap_err()),
         HaltReason::SchemaMismatch { detail, .. } if detail.contains("TINYINT(1) key value 2")
     ));
+    cleanup(&n).await;
+}
+
+/// A user that loses `SELECT` on a table it read (whole-branch review M-5, DA-SRC-19), measured
+/// on MySQL 8.4 and MariaDB 11.8 alike. With no other privilege on the table, `information_schema`
+/// hides it: the start doesn't list it, the rescan reports it dropped, and a chunk read halts it
+/// `TABLE_DROPPED`, as for a dropped table. A user that keeps another privilege on it (`INSERT`
+/// here) still sees it, and the chunk's `SELECT` fails 1142: `TABLE_NOT_REPLICABLE`.
+#[tokio::test]
+async fn a_lost_select_halts_the_table_as_dropped_unless_another_privilege_shows_it() {
+    require_it!();
+    let (n, mut a) = fresh(
+        "snapshot_revoked",
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT);
+         CREATE TABLE w (id INT PRIMARY KEY, v INT);
+         INSERT INTO t VALUES (1, 1), (2, 2);
+         INSERT INTO w VALUES (1, 1);",
+    )
+    .await;
+    let name = "it_snapshot_revoked";
+    user(
+        &mut a,
+        name,
+        "REPLICATION CLIENT, REPLICATION SLAVE ON *.*",
+        &[
+            format!("GRANT SELECT ON {}.t TO '{name}'@'%'", n.db),
+            format!("GRANT SELECT, INSERT ON {}.w TO '{name}'@'%'", n.db),
+        ],
+    )
+    .await;
+    let c = connector(&pipeline_as(
+        &n,
+        name,
+        "      ssl_mode: disable",
+        "",
+        &["t", "w"],
+        "",
+    ));
+    let r = c.resolve_tables().await.unwrap();
+    let schema = |name: &str| {
+        r.tables
+            .iter()
+            .find(|s| s.table().name == name)
+            .unwrap_or_else(|| panic!("{name} resolves before the revoke"))
+            .clone()
+    };
+    let (t, w) = (schema("t"), schema("w"));
+    assert_eq!(c.read_chunk(&t, None, 10).await.unwrap().rows.len(), 2);
+    assert_eq!(c.read_chunk(&w, None, 10).await.unwrap().rows.len(), 1);
+    for table in ["t", "w"] {
+        a.query_drop(format!(
+            "REVOKE SELECT ON {}.{table} FROM '{name}'@'%'",
+            n.db
+        ))
+        .await
+        .unwrap();
+    }
+    let halt = async |s: &TableSchema| match c.read_chunk(s, None, 10).await {
+        Err(SourceError::TableHalt { reason, .. }) => reason,
+        other => panic!("{}: a halt expected, got {other:?}", s.table()),
+    };
+    let r = c.resolve_tables().await.unwrap();
+    let listed = |s: &TableSchema| r.tables.iter().any(|x| x.table() == s.table());
+    assert!(
+        !listed(&t),
+        "information_schema hides a table with no privilege"
+    );
+    assert!(r.halted.is_empty() && r.skipped.is_empty(), "{r:?}");
+    let rescan = c.rescan(std::slice::from_ref(&t)).await.unwrap();
+    assert_eq!(rescan.dropped, [t.table().clone()], "{rescan:?}");
+    assert_eq!(halt(&t).await, HaltReason::TableDropped);
+    assert!(listed(&w), "another privilege keeps the table visible");
+    match halt(&w).await {
+        HaltReason::NotReplicable { reason } => assert!(reason.contains("(1142)"), "{reason}"),
+        other => panic!("TABLE_NOT_REPLICABLE expected, got {other:?}"),
+    }
     cleanup(&n).await;
 }

@@ -74,8 +74,8 @@ and later) halts itself: publish it whole in one transaction, then copy it again
 a stored generated column.
 
 A privilege lost later halts the table it was lost on (MySQL: see its tab), when a snapshot chunk reads it; the other
-tables run on. `SELECT` revoked on one table is the case (PostgreSQL error 42501; MySQL 1142 and
-1143). A revoke on the whole role or schema gives every table the same error, so every table
+tables run on. `SELECT` revoked on one table is the case (PostgreSQL error 42501; MySQL and
+MariaDB show it otherwise, see their tab). A revoke on the whole role or schema gives every table the same error, so every table
 halts, and each is copied again once the grant is back (see
 [A halted table](/data-avalanche/runbooks/halted-table/)). A `toast_strategy: re_query` fetch that
 meets the error ends the pipeline's session instead: the pipeline stops in `error`.
@@ -119,10 +119,19 @@ CREATE USER 'cdc'@'%' IDENTIFIED BY '…';
 GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'cdc'@'%';
 ```
 
-A privilege lost later, such as `SELECT` revoked on a table (error 1142 or 1143), halts that table
-when a snapshot chunk reads it; the other tables run on. A schema-wide revoke halts every table,
-and each is copied again once the grant is back (see
-[A halted table](/data-avalanche/runbooks/halted-table/)).
+A privilege lost later halts that table; the other tables run on. How it shows depends on what the
+user still holds on the table (measured on MySQL 8.4 and MariaDB 11.8):
+
+- `SELECT` revoked, and no other privilege on the table: `information_schema` hides the table from
+  the user, so the pipeline sees it as dropped and halts it **`TABLE_DROPPED`**, at the next start
+  or when a snapshot chunk reads it. Before you remove such a table from the config, check the
+  grants: `SHOW GRANTS FOR 'cdc'@'%'`.
+- `SELECT` revoked while another privilege on the table keeps it visible (an `INSERT`, say): the
+  chunk's read fails with error 1142 (1143 for a column) and the table halts
+  `TABLE_NOT_REPLICABLE`, the detail naming the error.
+
+A schema-wide revoke halts every table the same way. Each is copied again once the grant is back
+(see [A halted table](/data-avalanche/runbooks/halted-table/)).
 
 `SELECT` on `*.*` covers the tables and the catalog; grant it on the pipeline's database
 (`shop.*`) instead to narrow it, keeping `REPLICATION SLAVE` and `REPLICATION CLIENT` global.
