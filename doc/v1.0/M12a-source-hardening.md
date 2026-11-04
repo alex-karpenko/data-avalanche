@@ -340,7 +340,7 @@ The rulings this plan makes (roadmap D-IMPL-24):
 | D-M12a.10 | **A wiped state baselines against the sink table:** the columns the sink table lacks are added (evolved, or `EvolutionDisabled`); a key the sink table lacks halts the table (`SchemaMismatch`). Types aren't compared | `hop2_schema` is lossy under overrides, so a type compare would halt good tables; a real mismatch still fails the commit (`SINK_REJECTED`) | Task 8 (`a_wiped_state_baselines_against_the_sink_table`, `a_sink_table_without_the_key_column_halts`) |
 | D-M12a.11 | **The snapshot's collation edges:** a key literal is collated in its column's own collation, named with its schema (`KeyCollation::Own { name, qualified }`). A key whose index sorts it in another collation is warned. A chunk of 0 rows is refused. An ENUM or SET key whose members moved (not appended) is a change under the snapshot. What stays: no byte budget per chunk (`chunk_size` per table instead, documented); `E''` literals can't occur (the session pins `standard_conforming_strings`) | A domain with its own collation gave 42P22 from the second chunk; a chunk of no rows asked ends a table early; an ENUM key sorts by member index | Task 8 (`a_domain_key_declared_with_another_collation_resumes`, `text_keys_page_in_one_deterministic_collation`, `an_enum_key_s_moved_members_are_seen`) |
 | D-M12a.12 | **The publication's shape** is read at each start. Under `require_existing` or `FOR ALL TABLES`, a tracked table published with a row filter or column list (PG 15+) halts itself (`TABLE_NOT_REPLICABLE`, naming the atomic `DROP`+`ADD` and the re-snapshot: Oleksii's ruling in Task 9's review, 2026-11-04), and stored generated columns (PG 18) are refused with the `ALTER PUBLICATION` that fixes them. Untracked tables are warned. Under `managed` the pipeline repairs it (`SET TABLE`, `DROP TABLES IN SCHEMA`, `publish_generated_columns = none`) and re-snapshots. `publish_via_partition_root` is refused only for a tracked partition the publication doesn't name itself | Each of these drops changes silently. The managed publication is the pipeline's to set | Task 9 (`a_publication_s_blind_spots_are_refused_warned_or_repaired`) |
-| D-M12a.13 | **DA-SRC-17's items:** fixed are every table-set error reported (not the first), the server's detail and hint in an error, a standby refused on every version (Oleksii's ruling in Task 10's review: the source reads `pg_current_wal_lsn()` and may change the publication), a bounded call's wait for the connection inside its deadline, the cache's guard dropped before the call (a timeout's `abandon` takes it again), a year past PostgreSQL's range. Recorded as not reachable, with the reason in the tracker: loose parsing, types matched by name, cyclic domains, `convert`'s scale, `"char"` above 127 on PG 14, `char(n)` padding, interval narrowing, the dropped-orphan race | Each fixed item is reachable from a real server; the others are not, or are by design | Task 10 (`a_refusal_names_every_error`, `a_server_error_keeps_its_detail_and_hint`, `a_standby_is_refused_before_16`, `a_bounded_call_waits_for_the_cache_within_its_budget`, `a_call_on_a_frozen_connection_times_out_and_frees_the_cache`, `a_year_past_postgresql_s_range_is_refused`) |
+| D-M12a.13 | **DA-SRC-17's items:** fixed are every table-set error reported (not the first), the server's detail and hint in an error, a standby refused on every version (Oleksii's ruling in Task 10's review: the source reads `pg_current_wal_lsn()` and may change the publication), a bounded call's wait for the connection inside its deadline, the cache's guard dropped before the call (a timeout's `abandon` takes it again), a year past PostgreSQL's range. Recorded as not reachable, with the reason in the tracker: loose parsing, types matched by name, cyclic domains, `convert`'s scale, `"char"` above 127 on PG 14, `char(n)` padding, interval narrowing, the dropped-orphan race | Each fixed item is reachable from a real server; the others are not, or are by design | Task 10 (`a_refusal_names_every_error`, `a_server_error_keeps_its_detail_and_hint`, `a_standby_is_refused`, `a_bounded_call_waits_for_the_cache_within_its_budget`, `a_call_on_a_frozen_connection_times_out_and_frees_the_cache`, `a_year_past_postgresql_s_range_is_refused`) |
 | D-M12a.14 | **DA-SRC-9:** one catalog connection per pipeline serves channel C, the chunks and the re-queries (batched per commit). V-077 warns; the throughput is measured in M12c's load runs | A pool would serve a rare path (`re_query` under heavy TOAST churn) at the cost of the connection budget every pipeline pays | The tracker (§53) |
 | D-M12a.15 | **The failover E2E's pair is single-use** (`test-infra` profile `replica`, on tmpfs). The test fails with a hint to recreate it when the replica isn't in recovery. CI starts it fresh | A promotion can't be undone in place; a skip would hide a broken pair in CI | Task 11 (`a_promoted_replica_halts_the_pipeline_then_re_snapshots_on_request`) |
 
@@ -7692,3 +7692,27 @@ git commit -m "docs: the M12a recoveries — a PostgreSQL failover, a DBA's slot
   `postgres-tls`'s new definition (the `x-pg` anchor, `"$@"`) wasn't run against a live
   container while executing (not recreated). The review read it as unchanged, plus
   `logical_decoding_work_mem`.
+  After the task, on Oleksii's approval (2026-11-04), `postgres-tls` was recreated from the new
+  definition (`ssl=on`, `wal_level=logical`, `logical_decoding_work_mem=64kB`) and `tls::` passed
+  12 of 12 against it.
+- **Task 12** (`c97a655`, review fix `36cc04e`): the brief's pages predated the review fixes of
+  Tasks 3–11, so the pages follow the code instead:
+  - a filtered table halts itself (Task 9);
+  - under `managed` the publication is set to the tracked set, and a rewrite of what it publishes
+    of a tracked table re-snapshots every table;
+  - which mode refuses, warns or repairs;
+  - the file-mode rules (`never_held`, the reconnect retry) and the residual risk, MariaDB and
+    MySQL apiece;
+  - the MariaDB hold and Galera;
+  - the privilege trade-off (D-M12a.8) and the collation's `USAGE`;
+  - the rows a failover keeps in the lake.
+
+  Two pages the brief didn't name are in the commit. `runbooks/halted-table.md` names the new
+  halts. `runbooks/upgrade.md` names the first-start changes: a `bit`/`varbit`/PostGIS key (Delta
+  `binary`, so the `string` override needs the table dropped or moved), a standby (unchecked in
+  v0.1.0), a filtered or repaired publication, and a Galera node.
+
+  The tracker is dated 2026-11-04. Open goes 36 → 20, not 18: DA-SRC-25 stays open (Task 6), and
+  DA-SRC-31 (decoding on a standby) is new in §53.1 and §14. Partial goes 4 → 3. DA-SRC-17
+  accounts for every item of its list. D-M12a.13's test name is now `a_standby_is_refused`
+  (Task 10's rename).
