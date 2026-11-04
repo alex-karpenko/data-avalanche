@@ -52,8 +52,10 @@ These take effect at the first start on the new version:
 - **A table the publication publishes with a row filter or a column list**, under
   `require_existing`, now halts with `TABLE_NOT_REPLICABLE`: it wasn't checked before. Publish it
   whole, then copy it again. A `managed` publication with a filter, a column list, a
-  partition-root flag or stored generated columns is put right at the first start, and the
-  pipeline re-snapshots its tables as `snapshots.mode` says.
+  partition-root flag or stored generated columns is put right at the first start. When that
+  changes what a tracked table's changes carried (a filter or a column list on a tracked table, the
+  partition-root flag while a tracked table is a partition, stored generated columns while a tracked
+  table has one), the pipeline re-snapshots its tables as `snapshots.mode` says.
 - **A MariaDB Galera node** without `log_slave_updates = ON` is now refused, and the pipeline stops
   in `error`.
 

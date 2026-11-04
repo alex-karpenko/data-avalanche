@@ -61,6 +61,24 @@ pub enum SlotAction {
     Refuse(String),
 }
 
+/// A slot of the pipeline's name that isn't a pgoutput slot of the pipeline's database: never
+/// streamed, adopted, dropped or advanced (refused, naming the plugin or the database).
+fn not_ours(s: &SlotState, db: &str, name: &str) -> Option<String> {
+    if s.plugin.as_deref() != Some("pgoutput") {
+        Some(format!(
+            "replication slot {name} uses the {} plugin, not pgoutput",
+            s.plugin.as_deref().unwrap_or("physical")
+        ))
+    } else if s.database.as_deref() != Some(db) {
+        Some(format!(
+            "replication slot {name} belongs to database {}, not {db}",
+            s.database.as_deref().unwrap_or("-")
+        ))
+    } else {
+        None
+    }
+}
+
 /// The slot state machine (`Postgres_Slot…` §1–§3), one cell per combination of pipeline state
 /// (`checkpoint`) and server slot (`slot`). Under `require_existing` the pipeline never drops or
 /// creates a slot: one the DBA makes again after the pipeline's was lost starts past the
@@ -74,21 +92,7 @@ pub fn decide(
     orphan: SlotOnOrphan,
 ) -> SlotAction {
     let managed = management == SlotManagement::Managed;
-    let not_ours = |s: &SlotState| {
-        if s.plugin.as_deref() != Some("pgoutput") {
-            Some(format!(
-                "replication slot {name} uses the {} plugin, not pgoutput",
-                s.plugin.as_deref().unwrap_or("physical")
-            ))
-        } else if s.database.as_deref() != Some(db) {
-            Some(format!(
-                "replication slot {name} belongs to database {}, not {db}",
-                s.database.as_deref().unwrap_or("-")
-            ))
-        } else {
-            None
-        }
-    };
+    let not_ours = |s: &SlotState| not_ours(s, db, name);
     // What a DBA does under `require_existing`: make the slot (again), and let the pipeline
     // adopt it.
     let remake = "slot_management is require_existing, so create it again, with slot_on_orphan: adopt_resnapshot for the pipeline to adopt it and re-snapshot";
@@ -125,8 +129,12 @@ pub fn decide(
             SlotAction::Refuse(format!("replication slot {name} doesn't exist; {remake}"))
         }
         (None, Some(s)) => match orphan {
-            SlotOnOrphan::Halt => SlotAction::Refuse(format!(
+            SlotOnOrphan::Halt if managed => SlotAction::Refuse(format!(
                 "replication slot {name} exists but the pipeline has no state (an orphan): drop the slot for a first start, restore the pipeline state, or set slot_on_orphan: adopt_resnapshot"
+            )),
+            // Under `require_existing` a dropped slot isn't made again: a first start refuses.
+            SlotOnOrphan::Halt => SlotAction::Refuse(format!(
+                "replication slot {name} exists but the pipeline has no state (an orphan): restore the pipeline state, or set slot_on_orphan: adopt_resnapshot for the pipeline to adopt it and re-snapshot"
             )),
             SlotOnOrphan::AdoptResnapshot => match not_ours(s) {
                 Some(m) => SlotAction::Refuse(m),
@@ -139,7 +147,7 @@ pub fn decide(
         },
         (None, None) if managed => SlotAction::Create(SnapshotReason::FirstStart),
         (None, None) => SlotAction::Refuse(format!(
-            "replication slot {name} doesn't exist and slot_management is require_existing"
+            "replication slot {name} doesn't exist and slot_management is require_existing: have it created (pg_create_logical_replication_slot('{name}', 'pgoutput') in database {db}), then restart the pipeline"
         )),
     }
 }
@@ -303,8 +311,13 @@ pub(crate) async fn server_identity(
 /// [`server_identity`]'s row: the identifier in decimal, the timeline in hex.
 pub fn parse_identity(id: &str, timeline: &str) -> Result<ServerIdentity, SourceError> {
     let bad = || SourceError::Permanent(format!("the server's identity reads {id}, {timeline}"));
+    // `system_identifier` is a `bigint`: one at or past 2^63 prints negative.
+    let system_identifier = id
+        .parse::<u64>()
+        .or_else(|_| id.parse::<i64>().map(|v| v as u64))
+        .map_err(|_| bad())?;
     Ok(ServerIdentity::Postgres {
-        system_identifier: id.parse().map_err(|_| bad())?,
+        system_identifier,
         timeline: u32::from_str_radix(timeline, 16).map_err(|_| bad())?,
     })
 }
@@ -388,12 +401,17 @@ pub(crate) async fn slot_state(
 
 /// The slot at a source-change start (`source_change_action: re_snapshot`): the stream starts
 /// from the new server's position. `managed` creates the slot there (dropping one that came
-/// over with the failover); `require_existing` takes the DBA's slot, which must exist.
+/// over with the failover); `require_existing` takes the DBA's slot, which must exist. A slot of
+/// the name that isn't the pipeline's kind ([`not_ours`]) is refused under either.
 pub fn on_source_change(
     slot: Option<&SlotState>,
+    db: &str,
     name: &str,
     management: SlotManagement,
 ) -> SlotAction {
+    if let Some(m) = slot.and_then(|s| not_ours(s, db, name)) {
+        return SlotAction::Refuse(m);
+    }
     match (management, slot) {
         (SlotManagement::Managed, None) => SlotAction::Create(SnapshotReason::SourceChanged),
         (SlotManagement::Managed, Some(_)) => SlotAction::Recreate(SnapshotReason::SourceChanged),
@@ -810,7 +828,12 @@ impl PgConnector {
                      server's position"
                 ));
             }
-            on_source_change(slot.as_ref(), self.slot_name(), self.pg.slot_management)
+            on_source_change(
+                slot.as_ref(),
+                &self.pipeline.source.db,
+                self.slot_name(),
+                self.pg.slot_management,
+            )
         } else {
             decide(
                 checkpoint,
@@ -854,7 +877,7 @@ impl PgConnector {
             SlotAction::Adopt(reason) => {
                 // Advancing decodes the orphan's whole backlog: the snapshot timeout bounds it.
                 let row = self.conn.bounded(
-                    "advance the orphan slot",
+                    "advance the slot",
                     self.conn.timeouts.snapshot,
                     client.query_one(
                         "SELECT end_lsn::text FROM pg_replication_slot_advance($1, pg_current_wal_lsn())",
@@ -1031,6 +1054,21 @@ mod tests {
                 timeline: 2
             }
         );
+        assert_eq!(
+            parse_identity("-1", "00000001").unwrap(),
+            ServerIdentity::Postgres {
+                system_identifier: u64::MAX,
+                timeline: 1
+            },
+            "past 2^63 the bigint prints negative"
+        );
+        assert_eq!(
+            parse_identity("-9223372036854775808", "00000001").unwrap(),
+            ServerIdentity::Postgres {
+                system_identifier: 1 << 63,
+                timeline: 1
+            }
+        );
         assert!(parse_identity("x", "00000002").is_err());
         assert!(parse_identity("1", "zz").is_err());
     }
@@ -1102,22 +1140,38 @@ mod tests {
 
     #[test]
     fn a_source_change_starts_from_the_new_server() {
-        assert_eq!(on_source_change(None, "s", M), A::Create(R::SourceChanged));
+        let c = |s: Option<&SlotState>, m| on_source_change(s, "shop", "s", m);
+        assert_eq!(c(None, M), A::Create(R::SourceChanged));
         assert_eq!(
-            on_source_change(Some(&slot(0x10)), "s", M),
+            c(Some(&slot(0x10)), M),
             A::Recreate(R::SourceChanged),
             "a slot that came over with the failover is dropped"
         );
-        assert_eq!(
-            on_source_change(Some(&slot(0x10)), "s", X),
-            A::Adopt(R::SourceChanged)
-        );
-        refused(on_source_change(None, "s", X), "must exist there");
+        assert_eq!(c(Some(&slot(0x10)), X), A::Adopt(R::SourceChanged));
+        refused(c(None, X), "must exist there");
         let lost = SlotState {
             invalidated: true,
             ..slot(0x10)
         };
-        refused(on_source_change(Some(&lost), "s", X), "must exist there");
+        refused(c(Some(&lost), X), "must exist there");
+    }
+
+    /// A same-named slot that isn't a pgoutput slot of the pipeline's database is neither
+    /// dropped (`managed`) nor advanced (`require_existing`) at a source change (M-3).
+    #[test]
+    fn someone_elses_slot_is_refused_at_a_source_change() {
+        let mut physical = slot(0x10);
+        physical.plugin = None;
+        let mut wal2json = slot(0x10);
+        wal2json.plugin = Some("wal2json".into());
+        let mut elsewhere = slot(0x10);
+        elsewhere.database = Some("other".into());
+        for m in [M, X] {
+            let c = |s: &SlotState| on_source_change(Some(s), "shop", "s", m);
+            refused(c(&physical), "uses the physical plugin, not pgoutput");
+            refused(c(&wal2json), "uses the wal2json plugin, not pgoutput");
+            refused(c(&elsewhere), "belongs to database other, not shop");
+        }
     }
 
     #[test]
@@ -1201,7 +1255,16 @@ mod tests {
             d(None, Some(slot(0x10)), M, HALT),
             "(an orphan): drop the slot for a first start, restore the pipeline state, or set slot_on_orphan: adopt_resnapshot",
         );
-        refused(d(None, Some(slot(0x10)), X, HALT), "orphan");
+        let a = d(None, Some(slot(0x10)), X, HALT);
+        refused(
+            a.clone(),
+            "(an orphan): restore the pipeline state, or set slot_on_orphan: adopt_resnapshot for the pipeline to adopt it and re-snapshot",
+        );
+        let A::Refuse(m) = a else { unreachable!() };
+        assert!(
+            !m.contains("drop the slot"),
+            "a dropped slot isn't made again under require_existing: {m}"
+        );
         assert_eq!(
             d(None, Some(slot(0x10)), M, ADOPT),
             A::Adopt(R::AdoptedOrphan)
@@ -1223,7 +1286,10 @@ mod tests {
     #[test]
     fn a_first_start_creates_under_managed() {
         assert_eq!(d(None, None, M, HALT), A::Create(R::FirstStart));
-        refused(d(None, None, X, ADOPT), "doesn't exist");
+        refused(
+            d(None, None, X, ADOPT),
+            "doesn't exist and slot_management is require_existing: have it created (pg_create_logical_replication_slot('s', 'pgoutput') in database shop), then restart the pipeline",
+        );
     }
 
     #[test]

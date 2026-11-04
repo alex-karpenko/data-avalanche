@@ -340,7 +340,8 @@ impl PgConnector {
 fn standby(in_recovery: bool) -> Result<(), String> {
     if in_recovery {
         return Err(
-            "the server is a standby (in recovery); point the pipeline at its primary: the source              reads the primary's WAL position and may change the publication, which a standby \
+            "the server is a standby (in recovery); point the pipeline at its primary: the source \
+             reads the primary's WAL position and may change the publication, which a standby \
              can't"
                 .into(),
         );
@@ -455,6 +456,7 @@ mod tests {
             e.starts_with("the server is a standby (in recovery)"),
             "{e}"
         );
+        assert!(!e.contains("  "), "no run of spaces: {e}");
     }
 
     #[test]

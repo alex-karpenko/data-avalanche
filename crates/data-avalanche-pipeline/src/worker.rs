@@ -388,6 +388,8 @@ async fn reposition(
             table: table.clone(),
             current_epoch,
         }),
+        // A reposition is never skipped as covered (`covers` never skips one): the arm is
+        // unreachable, and harmless.
         CommitOutcome::Committed { .. } | CommitOutcome::SkippedCovered => Ok(()),
     }
 }
@@ -395,7 +397,7 @@ async fn reposition(
 /// Data-Flow Phase 0, or its rerun after the stream position was lost mid-run (`lost` holds the
 /// new checkpoint `reset_position` returned). Leaves the core tracking the tables to stream, with
 /// every decision persisted: halts and snapshot requests first, then the cached schemas, then a
-/// fresh start's checkpoint, recorded with the server the start read (MySQL).
+/// fresh start's checkpoint, recorded with the server the start read.
 pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(), WorkerError> {
     core.update(|st| st.phase = Phase::Starting);
     let s = &core.settings;
@@ -1348,6 +1350,85 @@ mod tests {
         .await;
         end.unwrap();
         assert_eq!(w.ids("a"), [1, 2, 3, 9]);
+    }
+
+    /// D-M12a.2's crash-repeat (M-10): a crash after the source-change start's resets and before
+    /// its checkpoint is saved leaves the old server's checkpoint, so the rerun is a source change
+    /// again and repositions every table once more, and the new server's changes land.
+    #[tokio::test]
+    async fn a_crash_between_the_resets_and_the_checkpoint_repositions_again() {
+        let w = World::new(&["a"]);
+        let pg = |timeline| ServerIdentity::Postgres {
+            system_identifier: 7,
+            timeline,
+        };
+        w.source.set_server(Some(pg(1)));
+        w.source.load(&t("a"), rows(1..=2));
+        run(&w, &mode("mode: initial"), async |status| {
+            for id in 3..=6 {
+                w.source
+                    .commit(FakeTxn::new().insert(&t("a"), row(id, "before")));
+            }
+            streamed(&status, &w).await;
+        })
+        .await
+        .0
+        .unwrap();
+        let recorded = w.docs.slot().await.unwrap().unwrap().doc;
+        w.source.fail_over(pg(2), Lsn(0x100));
+        let mut crashing = deps(&w);
+        crashing.hooks = Arc::new(CrashAt(|p| matches!(p, HookPoint::SchemasCached)));
+        let end = run_with(&mode("mode: never"), crashing, async |_| {}).await;
+        assert!(
+            matches!(end, Err(WorkerError::Crashed(HookPoint::SchemasCached))),
+            "{end:?}"
+        );
+        let first = w.sink.table_state(&t("a")).await.unwrap().marker.unwrap();
+        assert_eq!(
+            first.committed_position,
+            SourcePosition::Pg(Lsn(0x100)),
+            "reset before the crash"
+        );
+        assert_eq!(
+            w.docs.slot().await.unwrap().unwrap().doc,
+            recorded,
+            "the checkpoint naming the old server is kept"
+        );
+        // The new server writes on while the pipeline is down: the rerun starts past the first reset.
+        w.source
+            .commit(FakeTxn::new().insert(&t("a"), row(8, "while down")));
+        let again = w.source.wal_end();
+        let (end, st) = run(&w, &mode("mode: never"), async |status| {
+            streamed(&status, &w).await;
+            let marker = w.sink.table_state(&t("a")).await.unwrap().marker.unwrap();
+            assert_eq!(marker.committed_position, again, "repositioned again");
+            w.source
+                .commit(FakeTxn::new().insert(&t("a"), row(9, "on the new server")));
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!(
+            w.source
+                .prepared_at()
+                .last()
+                .and_then(|c| c.clone()?.server),
+            Some(pg(1)),
+            "the rerun's prepare got the old server's checkpoint"
+        );
+        // Row 8 came before the rerun's position: under `never` nothing is copied.
+        assert_eq!(w.ids("a"), [1, 2, 3, 4, 5, 6, 9]);
+        assert_eq!(
+            w.docs.slot().await.unwrap().unwrap().doc.server,
+            Some(pg(2))
+        );
+        assert!(
+            st.warnings
+                .iter()
+                .any(|w| w.contains("source server changed")),
+            "{:?}",
+            st.warnings
+        );
     }
 
     #[tokio::test]

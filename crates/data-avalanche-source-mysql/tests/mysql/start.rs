@@ -357,19 +357,22 @@ async fn the_binlog_lag_is_the_age_of_the_last_commit_read() {
     let mut s = c.open_stream(&from, &tables).await.expect("stream");
     a.query_drop("INSERT INTO t VALUES (1)").await.unwrap();
     to_commit(&mut s).await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
     a.query_drop("INSERT INTO t VALUES (2)").await.unwrap();
     let r = lag(&c).await;
+    let first = r.behind.expect("a lag behind the write");
     assert!(
-        r.behind.is_some_and(|b| b >= Duration::from_secs(1)),
-        "the commit read 2 s ago is the lag: {r:?}"
+        first >= Duration::from_secs(2),
+        "the commit read 3 s ago is the lag (its binlog timestamp has one-second resolution): {r:?}"
     );
     assert_eq!(r.bytes, None);
     to_commit(&mut s).await;
+    // Relative: the binlog timestamp's one-second truncation and the container's clock against
+    // the host's cancel out, and other tests' writes may keep the stream short of the head.
     let r = lag(&c).await;
     assert!(
-        r.behind.is_some_and(|b| b < Duration::from_secs(2)),
-        "the commit just read is the lag: {r:?}"
+        r.behind.is_some_and(|b| b < first),
+        "the commit just read is the lag, younger than the one read before ({first:?}): {r:?}"
     );
     let _ = Box::new(s).close().await;
     assert_eq!(lag(&c).await.behind, None, "closed");

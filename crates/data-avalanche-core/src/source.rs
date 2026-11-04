@@ -194,8 +194,9 @@ pub struct Prepared {
     /// publication behind its back. Empty when the plan snapshots every table.
     pub added: Vec<TableRef>,
     pub warnings: Vec<String>,
-    /// The server the stream reads, recorded with the checkpoint so the next start can check it.
-    /// `None` for a source that records none.
+    /// The server the stream reads, recorded with the checkpoint so the next start and the stream's
+    /// reconnects can check it (DA-SRC-20). Both sources report one; `None` for a source that
+    /// records none (a test double).
     pub server: Option<ServerIdentity>,
 }
 

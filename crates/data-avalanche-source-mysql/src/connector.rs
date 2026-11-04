@@ -358,7 +358,8 @@ impl MySqlConnector {
             })
             .await?;
         let replica_updates = replica_updates == Some(1);
-        // MySQL has no such variable; MariaDB has it off unless the node is in a Galera cluster.
+        // Off unless the node is in a Galera cluster (MariaDB Galera, Percona XtraDB Cluster);
+        // MySQL itself has no such variable, and the query finds no row.
         let galera = !replica_updates
             && self
                 .conn
