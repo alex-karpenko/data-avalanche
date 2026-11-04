@@ -192,8 +192,8 @@ Replication connection (replication protocol, not SQL)
 - `NOTHING`: DELETE events are unusable — the sink cannot identify which row to delete. Pipelines should reject tables with `REPLICA IDENTITY NOTHING`.
 
 **The server's identity (DA-SRC-20).** An LSN means something only on the server and the timeline
-that wrote it. A start reads the server's system identifier (`pg_control_system()`) and its
-timeline (the current WAL file's, `pg_walfile_name(pg_current_wal_lsn())`), callable by the
+that wrote it. A start, and a stream reconnect, read the server's system identifier
+(`pg_control_system()`) and its timeline (the current WAL file's, `pg_walfile_name(pg_current_wal_lsn())`), callable by the
 replication role, and the checkpoint records them. A physical standby has its primary's system
 identifier, so a failover to it shows as a new timeline; its slots stay behind unless synced.
 
@@ -539,8 +539,8 @@ and the flush's per-table position. A **reposition** change set (`reposition` se
 either, and its commit stores its own position instead of the union: after a source change
 (another PostgreSQL system or timeline, another MySQL server in file/position mode) the new
 server's positions may sort below the stored markers, and the union would skip its changes.
-A recovery from a changed source commits one per table the sink holds a marker for, fenced like
-any commit, before the checkpoint naming the new server is saved and the stream starts. The pipeline **resume checkpoint** persisted to state storage is the
+A recovery from a changed source commits one per table the pipeline resolves at that start or has a
+cached schema for, fenced like any commit, before the checkpoint naming the new server is saved and the stream starts. The pipeline **resume checkpoint** persisted to state storage is the
 **laggard** across all tracked tables (PG `min` / MySQL set-intersection); tables ahead skip via the
 guard or are absorbed by idempotency. The epoch rejects a zombie writer; the position skips done work.
 See `research/Delivery_Guarantee_and_Position_Guard.md` (G-14).
@@ -787,6 +787,9 @@ Replication stream error / TCP timeout
     ─ idempotent sink commits (+ Phase 4 position guard) absorb previously flushed events
     ─ file/position mode: a reconnect that reaches another server (Phase 2b) halts under
       binlog_purge_action: error, and reruns Phase 0 under re_snapshot
+    ─ PostgreSQL: a reconnect that reaches another system or timeline (Phase 2a) halts under
+      source_change_action: error, and reruns Phase 0 under re_snapshot, before a lost slot is
+      dropped or made again there
 ```
 
 ### Sink Commit Failure
