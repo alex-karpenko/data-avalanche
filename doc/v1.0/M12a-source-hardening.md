@@ -7633,3 +7633,17 @@ git commit -m "docs: the M12a recoveries — a PostgreSQL failover, a DBA's slot
   bit/varbit/hex-bytes refusal. On his ruling, 42501, 1142 and 1143 stay table-scoped. D-M12a.8
   records the trade-off, and Task 12's pages should name it. source-pg has 146 tests (the plan
   said 145); MySQL has 153 per target.
+- **Task 8** (review fix, `a95070d`). Two gaps:
+  1. **The `re_query` re-read still used the bare cast.** It built its key literals without the
+     column's own collation, and a domain key declared with another collation raised 42P22
+     there. The new IT `a_domain_key_declared_with_another_collation_is_re_read` was measured
+     failing before the fix. It now uses `key_value`, the chunk read's helper.
+  2. **`missing_columns` matched sink columns exactly.** Delta names are case-insensitive, so a
+     sink `Note` against a source `note` became an `AddColumn` that delta-rs rejects as a
+     duplicate. That error is transient, so the evolver retried it without end. A column that
+     matches by case alone now halts `SchemaMismatch`, naming both spellings
+     (`a_sink_column_matching_by_case_alone_halts`).
+
+  The halt remedies say "drop the sink table and re-snapshot the table", and `moved` covers a
+  removed and a renamed member. Counts: pipeline 257, source-pg 149, MySQL 154 per target. The
+  plan said 256, 147 and 148.
