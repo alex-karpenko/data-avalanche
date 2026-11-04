@@ -7,8 +7,8 @@ use std::collections::BTreeSet;
 use data_avalanche_config::{SlotManagement, SlotOnOrphan, SourceChangeAction};
 use data_avalanche_core::position::Lsn;
 use data_avalanche_core::{
-    Checkpoint, Prepared, RetainedLog, ServerIdentity, SnapshotReason, SourceError, SourcePosition,
-    StartPlan, TableRef,
+    Checkpoint, HaltReason, Prepared, ResolvedTables, RetainedLog, ServerIdentity, SnapshotReason,
+    SourceError, SourcePosition, StartPlan, TableRef,
 };
 use tokio_postgres::Client;
 
@@ -417,6 +417,62 @@ impl PgConnector {
             .map(drop)
     }
 
+    /// DA-SRC-13: under `require_existing` or `FOR ALL TABLES`, a tracked table the publication
+    /// publishes with a row filter or a column list (PostgreSQL 15+) is moved from `out.tables`
+    /// to `out.halted`: some of its changes never reach the stream, so it halts itself and its
+    /// recovery is a re-snapshot. Under a `managed` publication of named tables the repair
+    /// publishes it whole instead.
+    pub(crate) async fn halt_filtered_tables(
+        &self,
+        out: &mut ResolvedTables,
+    ) -> Result<(), SourceError> {
+        let name = &self.pg.publication;
+        let client = self.conn.client().await?;
+        let row = self
+            .conn
+            .command(
+                "read the publication",
+                client.query_opt(
+                    "SELECT puballtables, current_setting('server_version_num')::int
+                       FROM pg_catalog.pg_publication WHERE pubname = $1",
+                    &[name],
+                ),
+            )
+            .await?;
+        let Some(row) = row else { return Ok(()) };
+        let (all_tables, version): (bool, i32) = (row.get(0), row.get(1));
+        let managed = self.pg.slot_management == SlotManagement::Managed;
+        if (managed && !all_tables) || version < 150_000 || out.tables.is_empty() {
+            return Ok(());
+        }
+        let tracked: Vec<TableRef> = out.tables.iter().map(|s| s.table().clone()).collect();
+        let shape = self
+            .conn
+            .command(
+                "read what the publication publishes",
+                publication_shape(&client, name, version, &tracked),
+            )
+            .await?;
+        for table in shape.filtered.iter().filter(|t| tracked.contains(t)) {
+            out.tables.retain(|s| s.table() != table);
+            let publication = ident(name);
+            let target = qualified(table);
+            out.halted.push((
+                table.clone(),
+                HaltReason::NotReplicable {
+                    reason: format!(
+                        "publication {name} publishes it with a row filter or a column list, so \
+                         some of its changes never reach the stream; publish it whole in one \
+                         transaction (BEGIN; ALTER PUBLICATION {publication} DROP TABLE {target}; \
+                         ALTER PUBLICATION {publication} ADD TABLE {target}; COMMIT;), then \
+                         re-snapshot the table"
+                    ),
+                },
+            ));
+        }
+        Ok(())
+    }
+
     /// D-15.4: under `managed`, the publication publishes exactly `tables` and every operation
     /// (created when absent, then `ALTER PUBLICATION … ADD/DROP TABLE` and `SET`); under
     /// `require_existing`, it must exist and a tracked table it doesn't publish warns. A
@@ -501,7 +557,8 @@ impl PgConnector {
         let mut warnings = vec![];
         if !managed || all_tables {
             // A tracked table's row filter or column list (PostgreSQL 15+) keeps some of its rows
-            // or columns from the stream (DA-SRC-13).
+            // or columns from the stream (DA-SRC-13). `resolve_tables` halts such a table, so it
+            // doesn't reach here; this stays as a fail-closed guard for a caller that passes one.
             if !filtered.is_empty() {
                 return Err(SourceError::Permanent(format!(
                     "publication {name} publishes {} with a row filter or a column list, so some \
@@ -603,12 +660,20 @@ impl PgConnector {
                     schemas.join(", ")
                 ));
             }
-            if !missing.is_empty() {
-                let list: Vec<String> = missing.iter().map(|t| qualified(t)).collect();
+            // The publication's direct members become exactly the tracked set: a tracked table
+            // it publishes only through a partitioned root or a schema is added by name (it was
+            // published before, so it isn't in `added` and isn't copied again).
+            let members: BTreeSet<&TableRef> = shape.members.iter().collect();
+            let to_add: Vec<String> = tables
+                .iter()
+                .filter(|t| !members.contains(t))
+                .map(qualified)
+                .collect();
+            if !to_add.is_empty() {
                 sql.push(format!(
                     "ALTER PUBLICATION {} ADD TABLE {}",
                     ident(name),
-                    list.join(", ")
+                    to_add.join(", ")
                 ));
             }
             let extra: Vec<String> = shape

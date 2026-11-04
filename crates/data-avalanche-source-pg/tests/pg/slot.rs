@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use data_avalanche_core::position::Lsn;
 use data_avalanche_core::{
-    Checkpoint, ServerIdentity, SnapshotReason, SourceConnector, SourceError, SourcePosition,
-    StartPlan, TableRef,
+    Checkpoint, HaltReason, ServerIdentity, SnapshotReason, SourceConnector, SourceError,
+    SourcePosition, StartPlan, TableRef,
 };
 use data_avalanche_testkit::require_it;
 use tokio_postgres::Client;
@@ -601,6 +601,34 @@ async fn a_publication_s_blind_spots_are_refused_warned_or_repaired() {
         format!("FOR TABLE {s}.a, {s}.b (id)"),
     ] {
         publish(spec.clone()).await;
+        // The filtered table halts itself at start, its recovery a re-snapshot; the others
+        // resolve.
+        let r = existing.resolve_tables().await.unwrap();
+        let filtered = if spec.contains("WHERE") { "a" } else { "b" };
+        let whole = if filtered == "a" { "b" } else { "a" };
+        assert_eq!(r.halted.len(), 1, "{:?}", r.halted);
+        assert_eq!(r.halted[0].0, n.table(filtered));
+        match &r.halted[0].1 {
+            HaltReason::NotReplicable { reason } => {
+                for needle in [
+                    n.publication.as_str(),
+                    "row filter or a column list",
+                    "BEGIN; ALTER PUBLICATION",
+                    "COMMIT;",
+                    "re-snapshot the table",
+                ] {
+                    assert!(
+                        reason.contains(needle),
+                        "{reason:?} should mention {needle:?}"
+                    );
+                }
+            }
+            other => panic!("NotReplicable expected, got {other:?}"),
+        }
+        let resolved: Vec<_> = r.tables.iter().map(|t| t.table().clone()).collect();
+        assert!(resolved.contains(&n.table(whole)), "{resolved:?}");
+        assert!(!resolved.contains(&n.table(filtered)), "{resolved:?}");
+        // A caller that passes it to prepare anyway is still refused.
         permanent(
             existing.prepare(Some(&at), &tracked).await.unwrap_err(),
             "with a row filter or a column list",
@@ -662,7 +690,8 @@ async fn a_publication_s_blind_spots_are_refused_warned_or_repaired() {
             existing.prepare(Some(&at), &tracked).await.unwrap_err(),
             "publishes stored generated columns",
         );
-        managed.prepare(Some(&at), &tracked).await.unwrap();
+        let p = managed.prepare(Some(&at), &tracked).await.unwrap();
+        from(&p.plan, SnapshotReason::PositionLost);
         let stored: bool = a
             .query_one(
                 "SELECT pubgencols = 's' FROM pg_publication WHERE pubname = $1",
@@ -673,6 +702,59 @@ async fn a_publication_s_blind_spots_are_refused_warned_or_repaired() {
             .get(0);
         assert!(!stored, "set to none");
     }
+    cleanup(&a, &n).await;
+}
+
+/// A managed publication's direct members become exactly the tracked set: a partitioned root the
+/// publication names (not via the root) is dropped and its tracked leaves are added, without a
+/// re-snapshot (the leaves were published through the root).
+#[tokio::test]
+async fn a_managed_publication_of_a_partitioned_root_is_set_to_the_tracked_leaves() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(
+        &a,
+        "slot_pub_root_members",
+        "CREATE TABLE events (id int, at date, PRIMARY KEY (id, at)) PARTITION BY RANGE (at);
+         CREATE TABLE events_2024 PARTITION OF events FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');",
+    )
+    .await;
+    a.batch_execute(&format!(
+        "CREATE PUBLICATION {} FOR TABLE {}.events WITH (publish_via_partition_root = false)",
+        n.publication, n.schema
+    ))
+    .await
+    .unwrap();
+    let start: String = a
+        .query_one(
+            "SELECT lsn::text FROM pg_create_logical_replication_slot($1, 'pgoutput')",
+            &[&n.slot],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let at = Checkpoint::from(SourcePosition::Pg(start.parse().unwrap()));
+    let managed = connector(&pipeline(&n, &["*"], "", ""));
+    let p = managed
+        .prepare(Some(&at), &[n.table("events_2024")])
+        .await
+        .unwrap();
+    assert_eq!(p.plan, StartPlan::Resume);
+    assert!(p.added.is_empty(), "{:?}", p.added);
+    let members: Vec<String> = a
+        .query(
+            "SELECT c.relname::text FROM pg_publication_rel r
+               JOIN pg_publication p ON p.oid = r.prpubid
+               JOIN pg_class c ON c.oid = r.prrelid
+              WHERE p.pubname = $1 ORDER BY 1",
+            &[&n.publication],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(members, ["events_2024"]);
     cleanup(&a, &n).await;
 }
 

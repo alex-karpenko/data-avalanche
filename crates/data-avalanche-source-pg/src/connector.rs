@@ -212,6 +212,7 @@ impl PgConnector {
         let live = self.live();
         let selection = catalog::select(&live.include, &live.exclude, &relations);
         let (mut out, unconstrained) = self.described(selection).await?;
+        self.halt_filtered_tables(&mut out).await?;
         // Halted tables are in the set: their per-table config keys aren't stale (V-106).
         let resolved: Vec<TableRef> = out
             .tables
