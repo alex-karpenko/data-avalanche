@@ -7680,3 +7680,15 @@ git commit -m "docs: the M12a recoveries — a PostgreSQL failover, a DBA's slot
   Task 12's sources page, runbook and tracker rows now say "refused on every version". A spec
   row for §11.2 awaits Oleksii's approval. source-pg has 156 tests on PG 18, 14 and 17 (the plan
   said 153).
+- **Task 11** (review fix `02f0bb7`): the failover E2E's only witness of the marker reset was
+  row 13. That row could arrive through the re-snapshot, which ends only on an empty chunk read,
+  so a broken reset would have passed. The scenario now:
+  - waits for the re-snapshot's completion;
+  - asserts the marker was reset below the old one;
+  - asserts that row 13 streamed in at an LSN below it.
+  Also: `pg_promote()`'s result is checked, the catch-up poll retries, the compose comment's
+  recreate command is complete, and `postgres-replica.sh` guards its `shift`. The E2E takes
+  17.5 s on a fresh pair. `tls::` has 12 tests (the plan said 9 + 3).
+  `postgres-tls`'s new definition (the `x-pg` anchor, `"$@"`) wasn't run against a live
+  container while executing (not recreated). The review read it as unchanged, plus
+  `logical_decoding_work_mem`.
