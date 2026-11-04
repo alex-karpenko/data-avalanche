@@ -67,7 +67,10 @@ The checkpoint records the server: its system identifier and its timeline. A pro
 keeps the identifier and moves to a new timeline. Its WAL ends where its replication did, which can
 be behind what the lake already holds, so it writes again LSNs the lake has marked. Resuming would
 skip those changes. The logical slot isn't on the promoted server either: PostgreSQL doesn't copy
-it to a physical replica.
+it to a physical replica. The check runs at a start and at every stream reconnect, before the
+pipeline drops or makes a slot on the server it reaches: a failover while the pipeline runs halts
+it too, rather than replacing the lost slot there. Under `re_snapshot` the pipeline starts again,
+as at a restart, and recovers as in step 2.
 
 1. If the old server is the one you want, point the pipeline back at it (a reload restarts the
    pipeline) and it resumes.

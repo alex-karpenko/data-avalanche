@@ -83,10 +83,11 @@ it is invalidated, and the pipeline then starts over with a new slot and a snaps
 
 **A failover.** The checkpoint records the server it was read on: its system identifier and its
 timeline. A promoted replica keeps the identifier but starts a timeline of its own, and its LSNs
-can repeat ones the lake has already marked. So a start on another server halts the pipeline with
-`WAL_SOURCE_CHANGED` (`source.postgres.source_change_action: error`, the default). With
-`re_snapshot` the pipeline moves its tables onto the new server's position and copies them as
-`snapshots.mode` says; see
+can repeat ones the lake has already marked. So a start on another server, or a stream reconnect
+that reaches one, halts the pipeline with `WAL_SOURCE_CHANGED`
+(`source.postgres.source_change_action: error`, the default). The check runs before the pipeline
+drops or makes a slot there. With `re_snapshot` the pipeline starts again, moves its tables onto
+the new server's position and copies them as `snapshots.mode` says; see
 [A lost position](/data-avalanche/runbooks/position-lost/#a-failover-wal_source_changed).
 
 **A standby.** Point the pipeline at the primary: a standby (a server in recovery) is refused on

@@ -381,8 +381,11 @@ pub trait SourceConnector: Send + Sync {
 
     /// Replaces a lost stream position after [`SourceError::PositionUnreachable`] (D-15.3): the
     /// new consistent position to snapshot from and stream after, with the server it was read
-    /// from when the source records one.
-    async fn reset_position(&self) -> Result<Checkpoint, SourceError>;
+    /// from when the source records one. `lost` is the checkpoint whose position the stream lost,
+    /// with the server the session read: a source whose positions mean nothing on another server
+    /// (PostgreSQL's LSNs) refuses to replace it there, before it changes anything, as its start
+    /// would (a halt, or [`SourceError::SourceChanged`] for a rerun of Phase 0).
+    async fn reset_position(&self, lost: &Checkpoint) -> Result<Checkpoint, SourceError>;
 
     /// The log the source keeps for the pipeline. `None` when the source keeps nothing for it.
     async fn retained(&self) -> Result<Option<RetainedLog>, SourceError>;
@@ -643,7 +646,7 @@ mod tests {
         async fn retained(&self) -> Result<Option<RetainedLog>, SourceError> {
             Ok(None)
         }
-        async fn reset_position(&self) -> Result<Checkpoint, SourceError> {
+        async fn reset_position(&self, _: &Checkpoint) -> Result<Checkpoint, SourceError> {
             Ok(SourcePosition::Pg(Lsn(0x20)).into())
         }
         async fn current_position(&self) -> Result<SourcePosition, SourceError> {

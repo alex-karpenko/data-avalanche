@@ -217,10 +217,24 @@ impl PipelineWorker {
                         st.reconnects += 1;
                         st.warn(warning);
                     });
+                    // The checkpoint whose position was lost, with the server the session read:
+                    // on another server the source refuses to replace it (DA-SRC-20), and the
+                    // halt or the rerun of Phase 0 its refusal asks ends the worker below.
+                    let Some(stored) = core.settings.checkpoint.load(&core.docs).await? else {
+                        return Err(crate::AccumulatorError::Protocol {
+                            detail: "the stream lost a position the pipeline has no checkpoint for"
+                                .into(),
+                        }
+                        .into());
+                    };
+                    let lost = Checkpoint {
+                        server: core.server.clone().or(stored.checkpoint.server),
+                        ..stored.checkpoint
+                    };
                     let from = write_retry(
                         &core.tuning,
                         || core.may_write(),
-                        || core.source.reset_position(),
+                        || core.source.reset_position(&lost),
                     )
                     .await?;
                     start(core, Some(from)).await?;
@@ -1179,6 +1193,161 @@ mod tests {
             "{:?}",
             st.warnings
         );
+    }
+
+    /// A failover mid-run whose new server can't serve the slot's position (I-1): the stream ends
+    /// with `PositionUnreachable` on another timeline. The reset refuses to make the slot there;
+    /// the worker ends with `SourceChanged`, and the rerun (the controller's `Retry`) repositions
+    /// every table, so a change on the new server below the old marker lands.
+    #[tokio::test]
+    async fn a_failover_mid_run_reruns_phase_0_instead_of_resetting_the_slot() {
+        let w = World::new(&["a"]);
+        let pg = |timeline| ServerIdentity::Postgres {
+            system_identifier: 7,
+            timeline,
+        };
+        w.source.set_server(Some(pg(1)));
+        w.source.load(&t("a"), rows(1..=2));
+        let (end, _) = run(&w, &mode("mode: initial"), async |status| {
+            for id in 3..=6 {
+                w.source
+                    .commit(FakeTxn::new().insert(&t("a"), row(id, "before")));
+            }
+            streamed(&status, &w).await;
+            w.source.fail_over(pg(2), Lsn(0x100));
+            w.source.lose_slot();
+            // Ends when the worker does, or once a reset position would be durable.
+            let mut st = status.clone();
+            let _ = st
+                .wait_for(|s| {
+                    s.reconnects >= 1
+                        && s.snapshots.is_empty()
+                        && s.checkpoint == Some(SourcePosition::Pg(Lsn(0x100)))
+                })
+                .await;
+        })
+        .await;
+        let end = end.expect_err("the worker ends for a rerun");
+        assert!(
+            matches!(end, WorkerError::Source(SourceError::SourceChanged(_))),
+            "{end:?}"
+        );
+        assert_eq!(end.recovery(), crate::Recovery::Retry);
+        let marked = w.sink.table_state(&t("a")).await.unwrap().marker.unwrap();
+        assert_eq!(
+            w.docs.slot().await.unwrap().unwrap().doc.server,
+            Some(pg(1)),
+            "the checkpoint still names the old server"
+        );
+        let (end, st) = run(&w, &mode("mode: never"), async |status| {
+            streamed(&status, &w).await;
+            w.source
+                .commit(FakeTxn::new().insert(&t("a"), row(9, "on the new server")));
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!(w.ids("a"), [1, 2, 3, 4, 5, 6, 9], "no change skipped");
+        let moved = w.sink.table_state(&t("a")).await.unwrap().marker.unwrap();
+        assert!(
+            !moved
+                .committed_position
+                .covers(&marked.committed_position)
+                .unwrap(),
+            "{moved:?}"
+        );
+        assert_eq!(
+            w.docs.slot().await.unwrap().unwrap().doc.server,
+            Some(pg(2))
+        );
+        assert!(
+            st.warnings
+                .iter()
+                .any(|w| w.contains("source server changed")),
+            "{:?}",
+            st.warnings
+        );
+    }
+
+    /// The same failover under `source_change_action: error`: the reset halts with
+    /// `WAL_SOURCE_CHANGED` and replaces nothing; the checkpoint still names the old server, and
+    /// a restart halts the same way.
+    #[tokio::test]
+    async fn a_failover_mid_run_halts_under_error() {
+        let w = World::new(&["a"]);
+        let pg = |timeline| ServerIdentity::Postgres {
+            system_identifier: 7,
+            timeline,
+        };
+        w.source.set_server(Some(pg(1)));
+        w.source.halt_on_source_change();
+        w.source.load(&t("a"), rows(1..=2));
+        let (end, _) = run(&w, &mode("mode: initial"), async |status| {
+            streamed(&status, &w).await;
+            w.source.fail_over(pg(2), Lsn(0x100));
+            w.source.lose_slot();
+            // Until the worker ends (its status closes).
+            let mut st = status.clone();
+            let _ = tokio::time::timeout(Duration::from_secs(10), st.wait_for(|_| false)).await;
+        })
+        .await;
+        let end = end.expect_err("the worker halts");
+        assert_eq!(end.code(), Some("WAL_SOURCE_CHANGED"), "{end:?}");
+        assert_eq!(end.recovery(), crate::Recovery::Error);
+        assert_eq!(
+            w.docs.slot().await.unwrap().unwrap().doc.server,
+            Some(pg(1))
+        );
+        let (end, _) = run(&w, &mode("mode: never"), async |_| {}).await;
+        assert_eq!(
+            end.expect_err("a restart halts").code(),
+            Some("WAL_SOURCE_CHANGED")
+        );
+    }
+
+    /// A reconnect that reaches another server, with no position lost on the way (the stream's
+    /// open reads the server): the worker ends with `SourceChanged`, and the rerun repositions.
+    #[tokio::test]
+    async fn a_reconnect_to_another_server_reruns_phase_0() {
+        let w = World::new(&["a"]);
+        let pg = |timeline| ServerIdentity::Postgres {
+            system_identifier: 7,
+            timeline,
+        };
+        w.source.set_server(Some(pg(1)));
+        w.source.load(&t("a"), rows(1..=2));
+        let (end, _) = run(&w, &mode("mode: initial"), async |status| {
+            w.source
+                .commit(FakeTxn::new().insert(&t("a"), row(3, "before")));
+            streamed(&status, &w).await;
+            w.source.fail_over(pg(2), Lsn(0x100));
+            w.source.fail(
+                Method::Next,
+                SourceError::Transient("connection reset".into()),
+            );
+            // Until the worker ends (its status closes).
+            let mut st = status.clone();
+            let _ = tokio::time::timeout(Duration::from_secs(10), st.wait_for(|_| false)).await;
+        })
+        .await;
+        assert!(
+            matches!(end, Err(WorkerError::Source(SourceError::SourceChanged(_)))),
+            "{end:?}"
+        );
+        let opened = w.source.opened_at();
+        assert!(
+            opened.iter().all(|c| c.server == Some(pg(1))),
+            "no stream opened on the new server: {opened:?}"
+        );
+        let (end, _) = run(&w, &mode("mode: never"), async |status| {
+            streamed(&status, &w).await;
+            w.source
+                .commit(FakeTxn::new().insert(&t("a"), row(9, "on the new server")));
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!(w.ids("a"), [1, 2, 3, 9]);
     }
 
     #[tokio::test]
@@ -2335,7 +2504,12 @@ mod tests {
             .expect("the clock is past ten seconds");
         core.snapshot_started.insert(t("a"), long_ago);
         w.source.lose_slot();
-        let from = core.source.reset_position().await.unwrap();
+        let lost = core.settings.checkpoint.load(&core.docs).await.unwrap();
+        let from = core
+            .source
+            .reset_position(&lost.unwrap().checkpoint)
+            .await
+            .unwrap();
         start(&mut core, Some(from)).await.unwrap();
         let xid = w.source.open_writer(&[t("b")]);
         w.source.hold_reads();

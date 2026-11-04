@@ -258,8 +258,8 @@ struct Db {
     opened: Vec<Checkpoint>,
     /// [`FakeSource::set_server`].
     server: Option<ServerIdentity>,
-    /// [`FakeSource::fail_over`]: the next `prepare` from a checkpoint is a source change.
-    failed_over: bool,
+    /// [`FakeSource::halt_on_source_change`].
+    source_change_halts: bool,
     reads: BTreeMap<TableRef, usize>,
     rescans: usize,
     in_flights: usize,
@@ -317,7 +317,7 @@ impl FakeSource {
             acknowledged: vec![],
             opened: vec![],
             server: None,
-            failed_over: false,
+            source_change_halts: false,
             reads: BTreeMap::new(),
             rescans: 0,
             in_flights: 0,
@@ -458,16 +458,20 @@ impl FakeSource {
     }
 
     /// A failover to a replica whose WAL ends at `wal_end`, behind the old server's: the WAL past
-    /// it is gone, the slot didn't come over, and `server` answers from now on. The next
-    /// `prepare` from a checkpoint starts from the new server's position, as
-    /// `source_change_action: re_snapshot` does ([`SnapshotReason::SourceChanged`]).
+    /// it is gone, the slot didn't come over, and `server` answers from now on (see
+    /// [`Self::set_server`] for what a checkpoint read on the old one meets).
     pub fn fail_over(&self, server: ServerIdentity, wal_end: Lsn) {
         let mut db = self.db();
         db.wal.retain(|e| e.end() <= wal_end);
         db.wal_end = wal_end;
         db.slot = None;
         db.server = Some(server);
-        db.failed_over = true;
+    }
+
+    /// From now on a source change halts, as `source_change_action: error` does
+    /// (`WAL_SOURCE_CHANGED`), instead of `re_snapshot`'s recovery.
+    pub fn halt_on_source_change(&self) {
+        self.db().source_change_halts = true;
     }
 
     /// The tables the next resuming `prepare` reports in `Prepared::added`.
@@ -597,9 +601,14 @@ impl FakeSource {
         self.db().prepares.clone()
     }
 
-    /// The server `prepare` and `reset_position` report from now on, as a MySQL source does
-    /// (`None`, the default: none, as PostgreSQL). Changing it is a failover: the source answers
-    /// from another server.
+    /// The server `prepare` and `reset_position` report from now on (`None`, the default: none).
+    /// Changing it is a failover: the source answers from another server. A PostgreSQL server
+    /// ([`ServerIdentity::Postgres`]) is checked as the PostgreSQL source checks it (DA-SRC-20): a
+    /// checkpoint read on another one is a source change at every `prepare` (planned
+    /// [`SnapshotReason::SourceChanged`]), `open_stream` and `reset_position` (refused with
+    /// [`SourceError::SourceChanged`]), or a `WAL_SOURCE_CHANGED` halt after
+    /// [`Self::halt_on_source_change`]. A MySQL server is a GTID-mode one: its checkpoints are
+    /// carried across servers.
     pub fn set_server(&self, server: Option<ServerIdentity>) {
         self.db().server = server;
     }
@@ -665,6 +674,30 @@ impl FakeSource {
 }
 
 impl Db {
+    /// The PostgreSQL source's server check (DA-SRC-20) of a checkpoint `at`, read on another
+    /// server: a halt after [`FakeSource::halt_on_source_change`]; otherwise at a start
+    /// (`at_start`) `Ok(true)`, a source-change start, and at a reconnect `SourceChanged`.
+    fn source_change(&self, at: &Checkpoint, at_start: bool) -> Result<bool, SourceError> {
+        let (Some(was @ ServerIdentity::Postgres { .. }), Some(now)) = (&at.server, &self.server)
+        else {
+            return Ok(false);
+        };
+        if was == now {
+            return Ok(false);
+        }
+        let why = format!(
+            "WAL_SOURCE_CHANGED: the checkpoint {} was read on {was}, and the pipeline now reads {now}",
+            at.position
+        );
+        if self.source_change_halts {
+            Err(SourceError::Permanent(why))
+        } else if at_start {
+            Ok(true)
+        } else {
+            Err(SourceError::SourceChanged(why))
+        }
+    }
+
     fn create(&mut self, schema: TableSchema) {
         let schema = schema.with_source_id(self.next_source_id);
         self.next_source_id += 1;
@@ -977,10 +1010,13 @@ impl SourceConnector for FakeSource {
         let mut db = self.db();
         db.prepares.push(checkpoint.cloned());
         let server = db.server.clone();
+        let changed = match checkpoint {
+            Some(c) => db.source_change(c, true)?,
+            None => false,
+        };
         let checkpoint = checkpoint.map(|c| lsn(&c.position));
-        let failed_over = std::mem::take(&mut db.failed_over);
         let reason = match (checkpoint, db.slot) {
-            (Some(_), _) if failed_over => Some(SnapshotReason::SourceChanged),
+            (Some(_), _) if changed => Some(SnapshotReason::SourceChanged),
             (None, None) => Some(SnapshotReason::FirstStart),
             (None, Some(_)) => {
                 return Err(SourceError::Permanent(
@@ -1015,9 +1051,10 @@ impl SourceConnector for FakeSource {
         })
     }
 
-    async fn reset_position(&self) -> Result<Checkpoint, SourceError> {
+    async fn reset_position(&self, lost: &Checkpoint) -> Result<Checkpoint, SourceError> {
         self.take_fault(Method::ResetPosition)?;
         let mut db = self.db();
+        db.source_change(lost, false)?;
         db.slot = Some(db.wal_end);
         db.slot_lost = false;
         Ok(Checkpoint {
@@ -1153,7 +1190,11 @@ impl SourceConnector for FakeSource {
         tables: &[TableSchema],
     ) -> Result<Box<dyn ChangeStream>, SourceError> {
         self.take_fault(Method::OpenStream)?;
-        self.db().opened.push(from.clone());
+        {
+            let mut db = self.db();
+            db.source_change(from, false)?;
+            db.opened.push(from.clone());
+        }
         Ok(Box::new(FakeStream {
             source: self.clone(),
             after: lsn(&from.position),
@@ -1488,10 +1529,10 @@ mod tests {
         assert_eq!(src.prepares().last(), Some(&Some(at.position.clone())));
         src.open_stream(&at, &[]).await.unwrap();
         assert_eq!(src.opened_at(), std::slice::from_ref(&at));
-        assert_eq!(src.opened(), [at.position]);
+        assert_eq!(src.opened(), std::slice::from_ref(&at.position));
         let b = ServerIdentity::Mariadb { server_id: 2 };
         src.set_server(Some(b.clone()));
-        assert_eq!(src.reset_position().await.unwrap().server, Some(b));
+        assert_eq!(src.reset_position(&at).await.unwrap().server, Some(b));
     }
 
     #[tokio::test]

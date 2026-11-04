@@ -337,6 +337,32 @@ pub fn source_change(
     }
 }
 
+/// A stream reconnect's check of the server (Data-Flow Phase 2a, Source Disconnect): the stream's
+/// open and the reset of a lost position read the server first, and a `lost` checkpoint read on
+/// another system or timeline halts as a start would (`source_change_action: error`, the same
+/// `WAL_SOURCE_CHANGED`), or asks a rerun of Phase 0 (`re_snapshot`:
+/// [`SourceError::SourceChanged`]), whose `prepare` plans the recovery. Nothing on the server has
+/// changed by then.
+pub fn reconnect_check(
+    lost: &Checkpoint,
+    now: &ServerIdentity,
+    action: SourceChangeAction,
+) -> Result<(), SourceError> {
+    if !source_change(Some(lost), now, action)? {
+        return Ok(());
+    }
+    let was = lost
+        .server
+        .as_ref()
+        .map_or_else(String::new, ToString::to_string);
+    Err(SourceError::SourceChanged(format!(
+        "WAL_SOURCE_CHANGED: the checkpoint {} was read on {was}, and the stream's reconnect \
+         reaches {now}: source_change_action is re_snapshot, so the pipeline starts again to \
+         recover from this server's position",
+        lost.position.untagged()
+    )))
+}
+
 pub(crate) async fn slot_state(
     client: &Client,
     name: &str,
@@ -854,24 +880,29 @@ impl PgConnector {
 
     /// D-15.3 after [`SourceError::PositionUnreachable`]: drop the slot and create it again;
     /// stream from the new position after a re-snapshot. The checkpoint names the server it was
-    /// made on. Under `require_existing` the slot isn't ours to recreate.
-    pub async fn reset_position(&self) -> Result<Checkpoint, SourceError> {
+    /// made on. First, a `lost` checkpoint read on another system or timeline (a failover whose
+    /// new server can't serve the slot's position) halts or asks a rerun of Phase 0
+    /// ([`reconnect_check`]): the slot isn't dropped or made there. Under `require_existing` the
+    /// slot isn't ours to recreate.
+    pub async fn reset_position(&self, lost: &Checkpoint) -> Result<Checkpoint, SourceError> {
+        let client = self.conn.client().await?;
+        let (id, timeline) = self
+            .conn
+            .command("read the server's identity", server_identity(&client))
+            .await?;
+        let server = parse_identity(&id, &timeline)?;
+        reconnect_check(lost, &server, self.live().source_change_action)?;
         if self.pg.slot_management == SlotManagement::RequireExisting {
             return Err(SourceError::Permanent(format!(
                 "replication slot {} lost its position; drop it: slot_management is require_existing, so create it again, with slot_on_orphan: adopt_resnapshot for the pipeline to adopt it and re-snapshot",
                 self.slot_name()
             )));
         }
-        let client = self.conn.client().await?;
         self.drop_slot(&client).await?;
         let at = self.create_slot(&client).await?;
-        let (id, timeline) = self
-            .conn
-            .command("read the server's identity", server_identity(&client))
-            .await?;
         Ok(Checkpoint {
             position: SourcePosition::Pg(at),
-            server: Some(parse_identity(&id, &timeline)?),
+            server: Some(server),
         })
     }
 
@@ -1031,6 +1062,42 @@ mod tests {
             "a checkpoint written before the identity was recorded is taken as this server's"
         );
         assert!(!source_change(None, &now, SourceChangeAction::Error).unwrap());
+    }
+
+    /// A stream reconnect on another system or timeline (I-1): the start's halt under `error`, a
+    /// rerun of Phase 0 under `re_snapshot`; the same server, or a checkpoint naming none, opens.
+    #[test]
+    fn a_reconnect_to_another_server_halts_or_asks_a_rerun() {
+        let now = ServerIdentity::Postgres {
+            system_identifier: 7,
+            timeline: 2,
+        };
+        let lost = read_on(0x20, 7, 1);
+        let e = reconnect_check(&lost, &now, SourceChangeAction::Error).unwrap_err();
+        assert_eq!(e.halt_code(), Some("WAL_SOURCE_CHANGED"), "{e}");
+        assert_eq!(
+            e.to_string(),
+            source_change(Some(&lost), &now, SourceChangeAction::Error)
+                .unwrap_err()
+                .to_string(),
+            "the start's halt"
+        );
+        match reconnect_check(&lost, &now, SourceChangeAction::ReSnapshot) {
+            Err(SourceError::SourceChanged(m)) => assert!(
+                m.starts_with(
+                    "WAL_SOURCE_CHANGED: the checkpoint 0/20 was read on PostgreSQL system 7 on \
+                     timeline 1, and the stream's reconnect reaches PostgreSQL system 7 on \
+                     timeline 2"
+                ),
+                "{m}"
+            ),
+            other => panic!("SourceChanged expected, got {other:?}"),
+        }
+        for action in [SourceChangeAction::Error, SourceChangeAction::ReSnapshot] {
+            assert!(reconnect_check(&read_on(0x20, 7, 2), &now, action).is_ok());
+            let unrecorded: Checkpoint = SourcePosition::Pg(Lsn(0x20)).into();
+            assert!(reconnect_check(&unrecorded, &now, action).is_ok());
+        }
     }
 
     #[test]

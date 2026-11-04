@@ -451,7 +451,9 @@ impl SourceConnector for MySqlConnector {
     }
 
     /// The server's write position now: the binlog keeps no position for the pipeline to lose.
-    async fn reset_position(&self) -> Result<Checkpoint, SourceError> {
+    /// `lost`'s server isn't compared: a GTID set means the same on every server, and in
+    /// file/position mode the dump's open checks the server before it reports a purged position.
+    async fn reset_position(&self, _lost: &Checkpoint) -> Result<Checkpoint, SourceError> {
         self.checkpoint_now().await
     }
 

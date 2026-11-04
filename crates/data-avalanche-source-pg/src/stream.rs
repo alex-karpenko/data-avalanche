@@ -18,8 +18,8 @@ use async_trait::async_trait;
 use data_avalanche_config::Tables;
 use data_avalanche_core::position::Lsn;
 use data_avalanche_core::{
-    CdcEvent, ChangeStream, ColumnSchema, ColumnValue, ColumnValueType, HaltReason, Op, Row,
-    SchemaHint, SourceError, SourcePosition, SourceSeq, StreamItem, TableRef, TableSchema,
+    CdcEvent, ChangeStream, Checkpoint, ColumnSchema, ColumnValue, ColumnValueType, HaltReason, Op,
+    Row, SchemaHint, SourceError, SourcePosition, SourceSeq, StreamItem, TableRef, TableSchema,
     TransactionBoundary,
 };
 use pgwire_replication::{ReplicationClient, ReplicationEvent};
@@ -31,6 +31,7 @@ use crate::connector::PgConnector;
 use crate::error::{protocol, replication_error};
 use crate::pgoutput::{Datum, Message, OldKind, RelationColumn, decode};
 use crate::position::{from_wire, lsn_of, to_wire};
+use crate::slot::{parse_identity, reconnect_check, server_identity};
 use crate::types::{TypeCatalog, plan_column};
 use crate::value::{self, Decode, ValueError};
 
@@ -142,8 +143,29 @@ impl PgConnector {
         from: &SourcePosition,
         tables: &[TableSchema],
     ) -> Result<Box<PgStream>, SourceError> {
-        let start = lsn_of(from)?;
+        self.open_stream_at(&Checkpoint::from(from.clone()), tables)
+            .await
+    }
+
+    /// [`Self::open_stream`] from a checkpoint that may name its server: a reconnect reads the
+    /// server on the stream's catalog connection first, and one on another system or timeline
+    /// halts or asks a rerun of Phase 0 ([`reconnect_check`]) before the slot is read (Data-Flow
+    /// Phase 2a).
+    pub async fn open_stream_at(
+        &self,
+        from: &Checkpoint,
+        tables: &[TableSchema],
+    ) -> Result<Box<PgStream>, SourceError> {
+        let start = lsn_of(&from.position)?;
         let catalog = self.conn.connect().await?;
+        if from.server.is_some() {
+            let (id, timeline) = self
+                .conn
+                .command("read the server's identity", server_identity(&catalog))
+                .await?;
+            let now = parse_identity(&id, &timeline)?;
+            reconnect_check(from, &now, self.live().source_change_action)?;
+        }
         let types = self.types.lock().await.clone();
         let config = self.conn.replication(
             &self.pg.slot,

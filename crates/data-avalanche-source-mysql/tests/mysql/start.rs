@@ -71,8 +71,15 @@ async fn a_first_start_snapshots_and_records_the_server_then_resumes() {
     assert_eq!(again.plan, StartPlan::Resume);
     assert!(again.added.is_empty() && again.warnings.is_empty());
     assert_eq!(again.server, Some(identity.clone()));
-    // A lost position is replaced by the write position now.
-    let reset = c.reset_position().await.unwrap();
+    // A lost position is replaced by the write position now. MySQL doesn't compare the lost
+    // checkpoint's server: one it never was is replaced all the same.
+    let lost = Checkpoint {
+        position: from.clone(),
+        server: Some(ServerIdentity::Mariadb {
+            server_id: u32::MAX,
+        }),
+    };
+    let reset = c.reset_position(&lost).await.unwrap();
     assert!(
         reset.position.covers(&from).unwrap(),
         "{} covers {from}",

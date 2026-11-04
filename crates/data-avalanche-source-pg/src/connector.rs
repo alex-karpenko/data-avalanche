@@ -372,8 +372,8 @@ impl SourceConnector for PgConnector {
         PgConnector::prepare(self, checkpoint, tables).await
     }
 
-    async fn reset_position(&self) -> Result<Checkpoint, SourceError> {
-        PgConnector::reset_position(self).await
+    async fn reset_position(&self, lost: &Checkpoint) -> Result<Checkpoint, SourceError> {
+        PgConnector::reset_position(self, lost).await
     }
 
     async fn retained(&self) -> Result<Option<RetainedLog>, SourceError> {
@@ -406,7 +406,7 @@ impl SourceConnector for PgConnector {
         from: &Checkpoint,
         tables: &[TableSchema],
     ) -> Result<Box<dyn ChangeStream>, SourceError> {
-        Ok(PgConnector::open_stream(self, &from.position, tables).await?)
+        Ok(PgConnector::open_stream_at(self, from, tables).await?)
     }
 
     async fn end_other_reader(&self) -> Result<bool, SourceError> {
