@@ -625,7 +625,7 @@ impl PgConnector {
                     let values: Vec<String> = key_cols
                         .iter()
                         .zip(&texts)
-                        .map(|(c, t)| cast(c, t))
+                        .map(|(c, t)| key_value(c, t))
                         .collect();
                     Ok(format!("({})", values.join(", ")))
                 })

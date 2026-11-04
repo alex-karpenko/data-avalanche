@@ -457,6 +457,30 @@ async fn a_domain_key_declared_with_another_collation_resumes() {
     cleanup(&a, &n).await;
 }
 
+/// The `re_query` re-read of the same table: its key literals take the column's collation too
+/// (DA-SRC-15, 42P22 otherwise).
+#[tokio::test]
+async fn a_domain_key_declared_with_another_collation_is_re_read() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(
+        &a,
+        "fetch_domain_collation",
+        "CREATE DOMAIN code AS text COLLATE \"POSIX\";
+         CREATE TABLE t (code code COLLATE \"C\" PRIMARY KEY);
+         INSERT INTO t VALUES ('b'), ('a'), ('B'), ('c');",
+    )
+    .await;
+    let c = connector(&pipeline(&n, &["*"], "", ""));
+    let t = &resolved(&c).await.tables[0];
+    let key = |k: &str| Row(vec![("code".into(), V::Text(k.into()))]);
+    let rows = c.fetch_rows(t, &[key("a"), key("B")]).await.unwrap();
+    let mut got = texts(&rows);
+    got.sort();
+    assert_eq!(got, ["B", "a"]);
+    cleanup(&a, &n).await;
+}
+
 #[tokio::test]
 async fn fetch_rows_rereads_keys_in_batches() {
     require_it!();

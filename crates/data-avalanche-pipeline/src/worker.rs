@@ -1700,6 +1700,40 @@ mod tests {
         assert!(missing_columns(&sink, &schema("a")).unwrap().is_empty());
     }
 
+    /// Delta's names are case-insensitive: a sink column that matches by case alone halts, on a
+    /// key or not, naming both spellings.
+    #[test]
+    fn a_sink_column_matching_by_case_alone_halts() {
+        let sink = upsert_schema(&schema("a"));
+        let cased = |id: &str, doc: &str| {
+            TableSchema::new(
+                t("a"),
+                vec![
+                    ColumnSchema::new(id, V::Int64, "bigint").not_null(),
+                    ColumnSchema::new(doc, V::Text, "text"),
+                ],
+                vec![id.into()],
+            )
+            .unwrap()
+        };
+        let Err(HaltReason::SchemaMismatch { column, detail }) =
+            missing_columns(&sink, &cased("id", "DOC"))
+        else {
+            panic!("a case-only match halts");
+        };
+        assert_eq!(column, "DOC");
+        assert!(detail.contains("doc") && detail.contains("DOC"), "{detail}");
+        assert!(matches!(
+            missing_columns(&sink, &cased("ID", "doc")),
+            Err(HaltReason::SchemaMismatch { column, .. }) if column == "ID"
+        ));
+        assert!(
+            missing_columns(&sink, &cased("id", "doc"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn a_lost_position_baselines_a_drifted_table() {
         let w = World::new(&["a"]);

@@ -30,9 +30,11 @@ pub(crate) fn soft_dropped(sink: &Schema, source: &TableSchema) -> usize {
 
 /// A table the sink holds while the pipeline has no schema cached for it (a wiped state,
 /// DA-SNAP-13): the source's columns the sink table lacks, by name, as the `AddColumn`s that
-/// baseline it before the copy. A column it holds as another type still surfaces at the first
-/// commit (`SINK_REJECTED`); one the source lacks stays, soft-dropped. A key column it lacks can't
-/// be added: the table is keyed otherwise, and halts.
+/// baseline it before the copy. Names match case-insensitively, as Delta's do: a sink column that
+/// matches by case alone can't sit beside the source's, so it halts, naming both spellings. A
+/// column it holds as another type still surfaces at the first commit (`SINK_REJECTED`); one the
+/// source lacks stays, soft-dropped. A key column it lacks can't be added: the table is keyed
+/// otherwise, and halts.
 pub(crate) fn missing_columns(
     sink: &Schema,
     source: &TableSchema,
@@ -42,13 +44,28 @@ pub(crate) fn missing_columns(
         if sink.field_with_name(&c.name).is_ok() {
             continue;
         }
+        if let Some(f) = sink
+            .fields()
+            .iter()
+            .find(|f| f.name().eq_ignore_ascii_case(&c.name))
+        {
+            return Err(HaltReason::SchemaMismatch {
+                column: c.name.clone(),
+                detail: format!(
+                    "the sink table holds this column as {}, the source as {}; they differ by \
+                     case alone and the sink can't hold both: drop the sink table and \
+                     re-snapshot the table",
+                    f.name(),
+                    c.name
+                ),
+            });
+        }
         if source.is_identifier(&c.name) {
             return Err(HaltReason::SchemaMismatch {
                 column: c.name.clone(),
-                detail:
-                    "the sink table, made by a run whose state is gone, lacks this key column; \
-                         drop the sink table for a new copy"
-                        .into(),
+                detail: "the sink table, made by a run whose state is gone, lacks this key \
+                         column; drop the sink table and re-snapshot the table"
+                    .into(),
             });
         }
         adds.push(SchemaChange::AddColumn(c.clone()));

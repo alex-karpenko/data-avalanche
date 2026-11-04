@@ -527,6 +527,8 @@ mod tests {
         assert!(moved(&was, &c("enum('b','a')")), "reordered");
         assert!(moved(&was, &c("enum('a','c','b')")), "inserted");
         assert!(moved(&c("set('x','y')"), &c("set('y','x')")));
+        assert!(moved(&was, &c("enum('a')")), "removed");
+        assert!(moved(&was, &c("enum('a','x')")), "renamed");
         assert!(!moved(&c("int"), &c("int")));
     }
 
