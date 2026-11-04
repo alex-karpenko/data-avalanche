@@ -161,7 +161,12 @@ impl Connector {
         let deadline = tokio::time::Instant::now() + after;
         let at_start = match tokio::time::timeout_at(deadline, self.client.lock()).await {
             Ok(cache) => cache.clone(),
-            Err(_) => return Err(timed_out(what, after)),
+            Err(_) => {
+                return Err(timed_out(
+                    &format!("{what} (waiting for the catalog connection)"),
+                    after,
+                ));
+            }
         };
         match tokio::time::timeout_at(deadline, f).await {
             Ok(r) => r.map_err(sql_error),
@@ -290,11 +295,14 @@ mod tests {
         let c = Connector::new(&pipeline("public.t").source).unwrap();
         let held = c.client.lock().await;
         let started = tokio::time::Instant::now();
-        let r = c
-            .bounded("a query", Duration::from_millis(100), async {
+        let r = tokio::time::timeout(
+            Duration::from_secs(5),
+            c.bounded("a query", Duration::from_millis(100), async {
                 Ok::<_, tokio_postgres::Error>(())
-            })
-            .await;
+            }),
+        )
+        .await
+        .expect("the call returns within its budget");
         assert!(matches!(r, Err(SourceError::Transient(m)) if m.contains("timed out")));
         assert!(started.elapsed() < Duration::from_secs(1));
         drop(held);

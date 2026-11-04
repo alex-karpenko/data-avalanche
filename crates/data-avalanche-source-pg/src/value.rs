@@ -320,9 +320,9 @@ fn civil_days(date: &str, bc: bool, text: &str) -> Result<i64, ValueError> {
     if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
         return Err(bad("not an ISO date:", text));
     }
-    // PostgreSQL's years end at 5874897 (`date`) and 4713 BC; a longer one is crafted text, and
+    // PostgreSQL's years end at 5874897 (`date`) and 4714 BC; a longer one is crafted text, and
     // would overflow the day count (DA-SRC-17).
-    if y > 5_874_897 {
+    if y > if bc { 4714 } else { 5_874_897 } {
         return Err(bad("date out of range:", text));
     }
     // 1 BC is year 0, 2 BC is year -1.
@@ -580,6 +580,11 @@ mod tests {
             );
         }
         assert!(decode(&Decode::Date, "5874897-12-31").is_ok());
+        assert!(matches!(
+            decode(&Decode::Date, "4715-01-01 BC"),
+            Err(ValueError::Unrepresentable(_))
+        ));
+        assert!(decode(&Decode::Date, "4714-11-24 BC").is_ok());
     }
 
     #[test]

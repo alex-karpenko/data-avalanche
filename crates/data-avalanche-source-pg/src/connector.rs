@@ -100,7 +100,8 @@ impl PgConnector {
 
     /// The pipeline-level start checks (config §11.2, `Schema_Change…` §9): the server is
     /// PostgreSQL 14 or newer with `wal_level = logical`, the database encoding is UTF8 (D-M5.8),
-    /// and the user can read the catalogs channels A/C/D query. A user without the `REPLICATION`
+    /// the server is not a standby (in recovery), and the user can read the catalogs channels A/C/D
+    /// query. A user without the `REPLICATION`
     /// attribute warns: a managed service may grant replication another way.
     pub async fn preflight(&self) -> Result<Preflight, SourceError> {
         let client = self.conn.client().await?;
@@ -165,10 +166,8 @@ impl PgConnector {
             );
         }
         let mut warnings = vec![];
-        match standby(num, recovery) {
-            Err(m) => return refuse(m),
-            Ok(Some(w)) => warnings.push(w),
-            Ok(None) => {}
+        if let Err(m) = standby(recovery) {
+            return refuse(m);
         }
         if !replication {
             warnings.push(
@@ -334,23 +333,19 @@ impl PgConnector {
     }
 }
 
-/// A standby (in recovery) as a source (DA-SRC-17): PostgreSQL decodes logical changes on one
-/// from 16 on; before, it is refused by name, not by the server's error at the slot's creation.
-fn standby(version_num: i32, in_recovery: bool) -> Result<Option<String>, String> {
-    match (in_recovery, version_num >= 160_000) {
-        (false, _) => Ok(None),
-        (true, false) => Err(
-            "the server is a standby (in recovery), and PostgreSQL before 16 can't decode \
-             logical changes on one; point the pipeline at the primary"
+/// A standby (in recovery) as a source (DA-SRC-17), on every version: the source reads the
+/// primary's WAL position (`pg_current_wal_lsn()`, refused during recovery) for the snapshot
+/// watermark and the lag, and a managed publication's DDL fails on a read-only server. Refused by
+/// name here, not by the server's error at the first chunk.
+fn standby(in_recovery: bool) -> Result<(), String> {
+    if in_recovery {
+        return Err(
+            "the server is a standby (in recovery); point the pipeline at its primary: the source              reads the primary's WAL position and may change the publication, which a standby \
+             can't"
                 .into(),
-        ),
-        (true, true) => Ok(Some(
-            "the server is a standby: its slot is invalidated when the primary removes rows the \
-             slot still needs, unless hot_standby_feedback is on with a physical slot on the \
-             primary"
-                .into(),
-        )),
+        );
     }
+    Ok(())
 }
 
 /// The trait is the inherent methods of the modules: `catalog` and here (channel A), `slot`
@@ -453,15 +448,13 @@ mod tests {
     use crate::test_support::pipeline;
 
     #[test]
-    fn a_standby_is_refused_before_16() {
-        assert_eq!(standby(150_004, false), Ok(None));
-        let e = standby(150_004, true).unwrap_err();
+    fn a_standby_is_refused() {
+        assert_eq!(standby(false), Ok(()));
+        let e = standby(true).unwrap_err();
         assert!(
             e.starts_with("the server is a standby (in recovery)"),
             "{e}"
         );
-        let w = standby(160_000, true).unwrap().unwrap();
-        assert!(w.contains("hot_standby_feedback"), "{w}");
     }
 
     #[test]
