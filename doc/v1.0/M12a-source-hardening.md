@@ -7716,3 +7716,35 @@ git commit -m "docs: the M12a recoveries — a PostgreSQL failover, a DBA's slot
   DA-SRC-31 (decoding on a standby) is new in §53.1 and §14. Partial goes 4 → 3. DA-SRC-17
   accounts for every item of its list. D-M12a.13's test name is now `a_standby_is_refused`
   (Task 10's rename).
+- **Whole-branch review** (`final-review.md`; fixes `4bdd258`, `530f7ea`, `6b8063c`, `eff2981`,
+  `ebf1d76`, `063d3cd`; spec `c2a9395`, approved by Oleksii 2026-11-04):
+  - **A PostgreSQL stream reconnect reads the server's identity** (I-1). Before it, a reconnect
+    that reached another server and met a lost slot there remade the slot without resetting the
+    markers, so the promoted server's changes below them were skipped, even under
+    `source_change_action: error`. Now `PgConnector::open_stream_at` compares the identity with
+    the checkpoint's before the stream starts. `SourceConnector::reset_position(&self, lost:
+    &Checkpoint)` takes the lost checkpoint, and PostgreSQL refuses a reset on another server
+    before it touches the slot. Under `error` that gives the start's `WAL_SOURCE_CHANGED`, under
+    `re_snapshot` `SourceError::SourceChanged`, a rerun of Phase 0 that repositions. MySQL ignores
+    the lost checkpoint's server, so a GTID failover still resets. `open_stream(&SourcePosition)`
+    stays as a wrapper for the ITs. Roadmap §3 shows the new signature. Data-Flow Phase 2a and
+    Source Disconnect say a reconnect checks, and Phase 4's reset covers the tables resolved or
+    cached (the rest is DA-SRC-32).
+  - `FakeSource::prepare` plans `SourceChanged` whenever the checkpoint's server differs from the
+    fake's, so a crash between the resets and the checkpoint is tested to reposition again.
+  - The minors: a same-named slot of another plugin or database refused at a source change; a
+    `system_identifier` past 2^63; stale texts; the standby text's spaces; the lag test's bound;
+    the reset's warning only once the reset holds.
+  - **Measured** (M-5): on MySQL 8.4 and MariaDB 11.8 a revoked table `SELECT` halts the table
+    `TABLE_DROPPED`, since `information_schema` hides a table the user holds no privilege on; with
+    another privilege kept it fails 1142 and halts `TABLE_NOT_REPLICABLE`. The runbooks say so; a
+    grant probe is DA-SRC-36.
+  - Left as they are: a managed repair of a via-root publication re-snapshots every table, even for
+    a leaf the publication names itself (narrowing it needs a measurement; DA-SNAP-22's row); a
+    v0.1.0 checkpoint skips the reconnect check until the first checkpoint write records the
+    server (the Global Constraint's window).
+  - The tracker's §54 adds DA-SRC-32…36, DA-OPS-14, DA-SNAP-22 and DA-SINK-12: Open 20 → 28.
+  - The E2E suite runs with `--test-threads=1` (as CI does): one scenario sets a server-wide
+    `max_slot_wal_keep_size`.
+  - Counts: workspace 1404; source-pg 159 on PG 18, 17 and 14 and `tls::` 12; source-mysql 155
+    per target; pipeline 261; E2E 48; the failover E2E 17.9 s.

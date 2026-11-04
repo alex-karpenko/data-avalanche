@@ -435,7 +435,7 @@ pub trait SourceConnector: Send + Sync {                    // built from the re
     async fn resolve_tables(&self) -> Result<ResolvedTables, SourceError>;         // channel A: tables, halted, skipped, warnings
     async fn prepare(&self, checkpoint: Option<&Checkpoint>, tables: &[TableRef])
         -> Result<Prepared, SourceError>;                                           // PG: publication + slot state machine; MySQL: dialect, server, purge → StartPlan
-    async fn reset_position(&self) -> Result<Checkpoint, SourceError>;             // after PositionUnreachable (D-15.3); M7b: with its server
+    async fn reset_position(&self, lost: &Checkpoint) -> Result<Checkpoint, SourceError>;  // after PositionUnreachable (D-15.3); M7b: with its server; M12a: refused on another server (DA-SRC-20)
     async fn retained(&self) -> Result<Option<RetainedLog>, SourceError>;          // M6b (was retained_bytes): the heartbeat's read
     async fn current_position(&self) -> Result<SourcePosition, SourceError>;       // a rescan's catch-up mark (Q-M6a-4)
     async fn in_flight(&self) -> Result<Option<Vec<InFlightTxn>>, SourceError>;   // M6a; default None (DA-SNAP-9)
