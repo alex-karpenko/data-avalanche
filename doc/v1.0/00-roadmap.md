@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-29
+updated: 2026-11-04
 domain: Architecture
 tags: [v1, implementation-plan, roadmap, milestones, workspace, crates, interfaces, test-strategy, ci, risks]
 sources: []
@@ -1379,19 +1379,28 @@ workspace's and the chart's versions don't match (D-M11a.8).
 
 ### M12 — Hardening and v1 acceptance
 
-Three plans (Q-M12-4), each its own branch and PR. Every gap open at M12's start is processed in
-one of them: fixed, or closed with a pointer (Q-M12-1).
+Four plans (Q-M12-4, Q-M12-8), each its own branch and PR, in the order M12a, M12b, M12d, M12c.
+Every gap open at M12's start, and every one they record, is processed in one of them: fixed, or
+closed with a pointer (Q-M12-1).
 
 - **M12a — source correctness and recovery** (`M12a-source-hardening.md`): the PostgreSQL and
   MySQL/MariaDB source gaps (tracker §52): a PostgreSQL failover (`WAL_SOURCE_CHANGED`,
   `source_change_action`, the markers moved onto the new server), a changed MySQL server under
   `binlog_purge_action`, a DBA's slot made again, MariaDB rollbacks, the publication's blind
   spots, the snapshot's edges, the TLS and key tests, a `replica` compose pair and its failover E2E.
-- **M12b — cluster, control, API and observability**: the remaining cluster, snapshot-job, API,
-  observability and operations gaps (among them the snapshot job's `truncate: true`, Q-M12-7, and
-  the validate rate limit below), the dependency audit and the compile time.
-- **M12c — v1 acceptance**: the load, soak and chaos runs (on Oleksii's machine first, Q-M12-3), the
-  real-cloud E2E in CI (S3, GCS, Azure, Q-M12-2), the checklist in §8, and `v1.0.0`.
+- **M12b — cluster, control, API and observability** (`M12b-control-hardening.md`): the cluster,
+  snapshot-job, API, observability and operations gaps (tracker §56): gossip groups that merge, a
+  stale holder shown, the removal tombstone and the pipelines that wait for it, restart-only
+  changes on `?restart=accept`, the snapshot job's `truncate: true` (Q-M12-7), the jobs' retention
+  and loose ends, the reconciler's bound and the PostgreSQL read pool, the API's key fetch,
+  connection cap, validate rate limit (below) and OAS 3.1 check, the trace export's headers, the
+  lag across sessions; the dependency audit and the compile time.
+- **M12d — source and sink follow-ups** (Q-M12-8): the gaps M12a's review recorded in the sources
+  and the sink (tracker §54.1: DA-SRC-25, 31…36, DA-SNAP-22, DA-SINK-12), after M12b and before
+  the acceptance.
+- **M12c — v1 acceptance**: the load, soak and chaos runs (on Oleksii's machine first, Q-M12-3, with
+  DA-OPS-14's measurement), the real-cloud E2E in CI (S3, GCS, Azure, Q-M12-2), the checklist in
+  §8, and `v1.0.0`.
 
 The scope across the three:
 
@@ -1657,6 +1666,7 @@ the naming below (2026-09-26).**
 | D-IMPL-21 | M10 observability rulings **D-M10.1…16** (listed in `M10-observability.md` §Decisions and rulings, each pinned by a test). Among them: the worker's events through an `Observer`, its gauges through `WorkerStatus`; every failed commit attempt counted, a covered commit not; the lag's start in the status and its age computed by the controller, clamped at 0; MySQL's binlog lag the age of the last transaction read, `0` at the head; `snapshot_state` running or waiting; soft drops counted at the start and after each evolve; `sink_type` on the commit series only; one tracer provider with its exporter swapped on reload; a bad endpoint a run-time warning; the four spans and their fields; the traces' own filter; the JSON correlation through a weakly held dispatch; colour only on a terminal; the example alert rules; Jaeger as the E2E collector | The specs name the series, the spans and the correlation, not where each value comes from, how a reload reaches the exporter, or which collector proves it | M10 — **approved 2026-10-28** |
 | D-IMPL-22 | M11a packaging rulings **D-M11a.1…9** (listed in `M11a-packaging.md` §Decisions and rulings, each pinned by a test or a measurement). Among them: the build on the toolchain file's Rust and Debian 13, the runtime distroless cc as 65532, debug info stripped; the pods named for the ring, their environment for the config's `${VAR}`s; the config a map or text, the ports and the probes' scheme from it; no restart on a changed config; read-only pods, a grace above the drain; k3s in the compose file, `hostAliases` for the compose services; the release's version check, per-architecture builds, SBOM and provenance | The roadmap names the image, the chart and the release, not their base images, how a pod's identity reaches the config, or how the smoke deploy reaches the test infrastructure | M11a — **approved 2026-10-29** |
 | D-IMPL-23 | M11b documentation rulings **D-M11b.1…11** (listed in `M11b-docs.md` §Decisions and rulings, each pinned by a test or a measurement). Among them: the site's exact pins and its base `/data-avalanche`; every link absolute, the validator's defaults kept; the config's keys generated from the raw model and their docs tied to it by tests, a default a value only where the resolved config proves it; a rule placed by its "Path / Scope" text; the generated pages plain Markdown, the API page sorted against the workspace's `serde_json` features; `docs.yml` deploying from `main`; the chart's `minReadySeconds`; the hand-written pages one task | The roadmap names the site, its references and its runbooks, not the tool's version, how the reference is tied to the model, or how the pages are checked | M11b — **approved 2026-10-29** |
+| D-IMPL-25 | M12b control-hardening rulings **D-M12b.1…19** (listed in `M12b-control-hardening.md` §Decisions and rulings, each pinned by a test or a measurement). Among them: every node asks the seeds that aren't members; a holder judged by the answering node's gossip; a removal recorded as a tombstone in `globals.state` before the generation applies, torn down where the ring places it when no owner saw it, and waited for by every pipeline that reuses its id or resources; `?restart=accept` keeping each node's started values; a job's truncate as an empty snapshot change set before the start's record; the limits as constants | The specs name the removal, the reload's classes and the job, not how a removal outlives its owner, how a restart-only value reaches a running cluster, or where a truncate sits against a crash | M12b — **in review** |
 | D-IMPL-24 | M12a source-hardening rulings **D-M12a.1…15** (listed in `M12a-source-hardening.md` §Decisions and rulings, each pinned by a test or a measurement). Among them: the PostgreSQL checkpoint records the system identifier and the timeline; a source change moves every table's marker onto the new server by a change set with `reposition`, before the checkpoint names it; MySQL's changed server follows `binlog_purge_action`; MariaDB's position checked by `BINLOG_GTID_POS`; a rollback's rows held until the transaction ends; a table's own read errors halt the table; a wiped state adds the missing columns only; the publication refused under `require_existing`, repaired under `managed` | The specs name the failover, the guard and the publication, not how a lagging server's positions get past the markers, how a MariaDB rollback is read, or which read error is the table's | M12a — **approved 2026-10-30** |
 
 ### 9.1 Questions answered at plan review (2026-09-26)
@@ -1777,6 +1787,11 @@ the naming below (2026-09-26).**
 | Q-M12a-2 (2026-10-30) | What does a changed MySQL server in file/position mode do? | **It follows `binlog_purge_action`**: `error` halts with `BINLOG_SOURCE_CHANGED`, `re_snapshot` starts from the new server's position | M12a Task 3 |
 | Q-M12a-3 (2026-10-30) | Under `require_existing`, how is a DBA's slot made again taken? | **`slot_on_orphan: adopt_resnapshot` adopts it**, with a recovery snapshot per `snapshots.mode`; `halt` refuses it, naming the key | M12a Task 4 |
 | Q-M12a-4 (2026-10-30) | DA-SRC-22: patch `mysql_async`, or document `verify-ca`? | **Document it**: `verify-ca` stays fail-closed on MySQL (it checks the name too), V-124 warns, and the code names the re-check of each `mysql_async` release | M12a Task 6 |
+| Q-M12-8 (2026-11-04) | Where do the source and sink gaps M12a's review recorded go? | **A fourth plan, M12d**, after M12b and before the acceptance; DA-OPS-14 with M12c's load runs | §4 M12 |
+| Q-M12b-1 (2026-11-04) | DA-OBS-7, DA-OPS-12, DA-API-13: build them, or close them with a pointer? | **Build all three** in M12b | M12b Tasks 2, 5, 12 |
+| Q-M12b-2 (2026-11-04) | DA-OPS-12: how does a restart-only key written as a literal change? | **A reload accepts it on request (`?restart=accept`), each node's next start applies it**; the cluster's own fields stay refused | M12b Task 5 |
+| Q-M12b-3 (2026-11-04) | DA-API-13: how is a gone holder told? | **By gossip membership**: `holder.stale` when its node and incarnation aren't a member, `holder.suspect` while SWIM suspects it | M12b Task 2 |
+| Q-M12b-4 (2026-11-04) | Config keys or constants for the new limits? | **Constants**: validate 1/s after a burst of 5 (`429`, `Retry-After`); 1024 connections; a pipeline's newest 100 ended jobs; 1 MiB for a key document | M12b Tasks 7, 10, 11 |
 
 ### 9.2 Open questions (answer before the named milestone)
 

@@ -609,6 +609,49 @@ than closing them with a pointer; the gaps M12a's review recorded in the source 
 (DA-SRC-25, 31…36, DA-SNAP-22, DA-SINK-12) get a plan of their own after M12b and before the
 acceptance. DA-OPS-14 stays with the acceptance's load runs.
 
+## 56. M12b control hardening — the plan (2026-11-04)
+
+`doc/v1.0/M12b-control-hardening.md` is M12b's plan: sixteen tasks for the gaps below, and a spec
+patch (config §1.2, §6.6, §11, §12.3, V-061, V-125, V-126; Data-Flow Phase 4 and On-Demand
+Snapshot; System-Overview's API table), approved with the plan. The rulings (Q-M12b-1…4,
+D-M12b.*) are in the plan, Q-M12-8 (M12's fourth plan, M12d) in the roadmap.
+
+The planning measured:
+- **`cargo audit`** on the base: 17 vulnerabilities and 23 warnings. `cargo update` of the patched
+  releases leaves three, triaged (Task 14): quick-xml 0.39.4's two (only deltalake's
+  `object_store` 0.13 links it; no 0.13 release takes the fix, and deltalake 1.1.3 still
+  requires `^0.13.2`) and proc-macro-error2 (build time only).
+- **The compile time** (Task 15): a clean `cargo build --workspace --all-targets` takes 588 s on
+  12 cores (`aws-lc-sys`'s build script 110 s, `datafusion` 89 s, `deltalake-core` 74 s; the
+  workspace's own units 925 of 3046 unit-seconds), a rebuild after touching `core` 37–40 s.
+  `debug = "line-tables-only"` for the workspace crates keeps those times with 1 GB less target
+  (adopted); `opt-level = 1` for the dependencies takes the clean build to 1028 s for the
+  heaviest suites' 60 s → 42 s (not adopted).
+- **opentelemetry-otlp 0.33.1** merges `OTEL_EXPORTER_OTLP_HEADERS` after the configured headers:
+  the environment wins for a name both set.
+
+**What M12b takes** (each closed with a pointer at its exit):
+
+| ID | Task |
+|---|---|
+| DA-CLUS-15 | 1: every node asks the seeds that aren't members, so groups formed apart merge |
+| DA-API-13 | 2: a holder judged by gossip membership, `holder.stale` and `holder.suspect` (Q-M12b-3) |
+| DA-OPS-9 | 3: the removal tombstone in `globals.state`, torn down where the ring places it when no owner saw the removal |
+| DA-OPS-10 | 4: a pipeline waits for every pending removal of its id or its resources, on every node |
+| DA-OPS-12 | 5: `?restart=accept`, applied at each node's next start; the cluster's own fields refused (Q-M12b-2) |
+| DA-SNAP-15 | 6: the job's `truncate` (Q-M12-7) |
+| DA-SNAP-16, 19, 20, 21 | 7: the newest 100 ended jobs kept, an undecodable job skipped, a copy's halt flagged, a lost restart asked again |
+| DA-SNAP-11 | 8: a key logged once, under its latest writer |
+| DA-SNAP-12 | 9: a PostgreSQL chunk read on a connection of its own |
+| DA-API-16, DA-API-17 | 10: the key fetch (no redirect, 1 MiB, V-125); 1024 connections |
+| DA-API-20, DA-API-18 | 11: posted validates at 1/s after 5 (`429`); the OAS 3.1 schema check |
+| DA-OBS-7 | 12: `globals.tracing.headers` (V-126), an `https` collector tested |
+| DA-OBS-8, DA-OBS-9 | 13: the lag across sessions; the JSON log's ids matched to Jaeger |
+| DA-SNAP-7, DA-X-13 | 16: closed with pointers (the stream runs beside a snapshot; the commit count not seen again) |
+
+Not taken: DA-SRC-25, 31…36, DA-SNAP-22 and DA-SINK-12 (M12d, Q-M12-8); DA-OPS-14 (M12c's load
+runs). No count changes.
+
 ---
 
 ### Counts (by status)
