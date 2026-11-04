@@ -38,6 +38,18 @@ them on the new version.
 [Config changes](/data-avalanche/runbooks/config-changes/)). Upgrade first, then reload the new
 config once every node runs the new version, so that every node can apply it.
 
+## Changes that can halt a table after an upgrade
+
+These take effect at the first start on the new version:
+
+- **A PostgreSQL table keyed by a `bit` or `varbit` column** that is already replicating halts with
+  `IDENTIFIER_NOT_USABLE`: its key can't resume a snapshot. Override the key column to `string`
+  (`tables.column_type_overrides: { <schema.table.column>: string }`) and copy the table again. The
+  override changes the Delta column from `binary` to `string`, so drop or move the Delta table
+  before the copy. See [A halted table](/data-avalanche/runbooks/halted-table/).
+- **A PostgreSQL standby** the pipeline read from is now refused, on every version. Before, it was
+  accepted (warned from PostgreSQL 16). Point the pipeline at the primary.
+
 ## Rolling back
 
 Roll the nodes back to the old version the same way. The state documents are strict: a version

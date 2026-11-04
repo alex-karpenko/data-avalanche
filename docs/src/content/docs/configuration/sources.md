@@ -44,10 +44,29 @@ refuses to start without them (and needs `auto_cleanup: false`). The managed pub
 the pipeline's role to own the tables;
 [Source privileges](/data-avalanche/runbooks/source-privileges/) has both set-ups.
 
+**What the publication publishes.** At each start the pipeline checks what the publication
+publishes of its tables. Under `require_existing`, or a publication `FOR ALL TABLES`, a tracked
+table published with a row filter or a column list (PostgreSQL 15 and later) **halts itself**
+(`TABLE_NOT_REPLICABLE`) and the other tables go on. The changes the filter dropped never reached
+the stream, so fixing the publication isn't enough: publish the table whole in one transaction
+(`BEGIN; ALTER PUBLICATION … DROP TABLE …; ALTER PUBLICATION … ADD TABLE …; COMMIT;`), then copy it
+again (see [A halted table](/data-avalanche/runbooks/halted-table/)). Stored generated columns
+(`publish_generated_columns = stored`, PostgreSQL 18) are refused for the whole pipeline, naming
+the `ALTER PUBLICATION` that fixes them.
+
+Under `managed` the pipeline makes the publication's tables exactly the tracked set: it drops a
+row filter, a column list, a `TABLES IN SCHEMA` member and any other table, and sets
+`publish_generated_columns = none`. A change to what is published of a tracked table means the WAL
+since the checkpoint was decoded under the old publication, so the pipeline re-snapshots its tables
+as `snapshots.mode` says. A tracked table that wasn't published at all is added and copied alone.
+One that was published through its partitioned root or its schema is added by name, with no copy.
+Tables the publication publishes but the pipeline doesn't replicate are a warning: their changes
+are decoded and dropped.
+
 **Partitioned tables.** Name the partitions, or a pattern that matches them: each partition
-replicates as its own table. A publication that publishes through the partition root
-(`publish_via_partition_root = true`) is refused, since the partitions' changes would arrive under
-the parent's name.
+replicates as its own table. A publication that publishes a replicated partition only through its
+root (`publish_via_partition_root = true`) is refused, since the partition's changes would arrive
+under the parent's name.
 
 **Large values.** PostgreSQL leaves an unchanged TOASTed value out of an update. With
 `toast_strategy: carry_forward` (the default) the pipeline keeps the value it wrote last;
@@ -61,6 +80,19 @@ it is invalidated, and the pipeline then starts over with a new slot and a snaps
 `snapshots.mode` says, none under `never` (see
 [A lost position](/data-avalanche/runbooks/position-lost/)).
 
+**A failover.** The checkpoint records the server it was read on: its system identifier and its
+timeline. A promoted replica keeps the identifier but starts a timeline of its own, and its LSNs
+can repeat ones the lake has already marked. So a start on another server halts the pipeline with
+`WAL_SOURCE_CHANGED` (`source.postgres.source_change_action: error`, the default). With
+`re_snapshot` the pipeline moves its tables onto the new server's position and copies them as
+`snapshots.mode` says; see
+[A lost position](/data-avalanche/runbooks/position-lost/#a-failover-wal_source_changed).
+
+**A standby.** Point the pipeline at the primary: a standby (a server in recovery) is refused on
+every version. The source reads the primary's WAL position and may change the publication, which
+a read-only standby can't. Decoding on a standby (PostgreSQL 16 and later) is planned for a later
+release.
+
 ## MySQL
 
 Tested on MySQL 8.4.
@@ -73,7 +105,8 @@ Tested on MySQL 8.4.
 - no binlog filter (`binlog_do_db`, `binlog_ignore_db` empty): a filter drops statements by the
   session's database, so changes to the pipeline's database made from another one would never
   reach it;
-- on a server that replicates from another, `log_replica_updates = ON`.
+- on a server that replicates from another, `log_replica_updates = ON`. A MariaDB Galera node is
+  one (see [MariaDB](#mariadb)).
 
 **Tables.** `tables.include` and `exclude` take bare table names (`orders`, `payment_*`), never
 `db.table`: `source.db` is the one database the pipeline reads. Each table needs a primary key or
@@ -83,8 +116,21 @@ a `tables.primary_key` override.
 
 - `gtid` (the default) follows GTIDs, which survive a failover of the source to a replica.
 - `binlog` follows a file and an offset, for servers without GTIDs. A position is only valid on
-  the server that wrote it: when the pipeline finds another server behind the host (another
-  `server_uuid`), it halts with `BINLOG_SOURCE_CHANGED`.
+  the server that wrote it, so the pipeline checks at each start (and at a reconnect) that the
+  server is the one that wrote the checkpoint:
+  - servers are told apart by `server_uuid` on MySQL and by `server_id` on MariaDB; on MariaDB the
+    position must also be an event boundary of a binlog file the server holds
+    (`BINLOG_GTID_POS`);
+  - a checkpoint's file the server doesn't list is a purge's only when it is older than the
+    server's oldest binlog; a file with another base name, or after the newest, is another
+    server's;
+  - `binlog_purge_action` decides. `error` (the default) halts the pipeline with
+    `BINLOG_SOURCE_CHANGED`. `re_snapshot` starts from the new server's position and copies the
+    tables as `snapshots.mode` says; found at a reconnect, the pipeline runs its start again to
+    do so (see [A lost position](/data-avalanche/runbooks/position-lost/#the-server-changed-binlog_source_changed)).
+  - A server with the same `server_id` and the same binlog file names, whose file has an event
+    boundary at the checkpoint's offset, can't be told apart. `gtid` doesn't depend on any of
+    this: prefer it.
 
 **`server_id`.** The binlog stream registers as a replica with a server id, and the server ends any
 other stream with the same id. Each pipeline takes its own, derived from its `id` (between
@@ -133,8 +179,17 @@ What differs:
 
 - GTIDs need `gtid_strict_mode = 1`; positions are MariaDB's `domain-server-sequence` GTIDs.
 - `log_slave_updates` is off by default; turn it on for a server that replicates from another.
+- A Galera node (`wsrep_on = ON`) applies the other nodes' writes without a replica connection, so
+  it needs `log_slave_updates = ON` too, or it is refused: its binlog would lack those writes.
 - Reading a replica's status takes `SLAVE MONITOR` (10.5 and later). Without it the pipeline
   can't check `log_slave_updates`, and warns.
+- **Savepoints.** In a transaction that also writes a non-transactional table (MyISAM, Aria),
+  MariaDB logs the rows a `ROLLBACK TO SAVEPOINT` or a `ROLLBACK` undid. The pipeline holds such a
+  transaction's rows until its end, up to `sink.max_transaction_buffer_bytes` (counted as the
+  decoded rows), drops the rows the rollback undid, and keeps the non-transactional table's rows,
+  which stand. It halts the pipeline where it can't tell which rows stand: a rollback over rows
+  past that limit, a rollback that undid a non-transactional table's row, or a `ROLLBACK TO` a
+  savepoint it didn't see logged.
 
 ## Connections
 

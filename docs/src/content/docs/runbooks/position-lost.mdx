@@ -1,6 +1,6 @@
 ---
 title: A lost position
-description: A PostgreSQL slot lost, invalidated or orphaned, a WAL backlog, a purged binlog, a changed binlog server.
+description: A PostgreSQL slot lost, invalidated, made again or orphaned, a failover, a renamed publication, a WAL backlog, a purged binlog, a changed binlog server.
 sidebar:
   order: 3
 ---
@@ -50,16 +50,47 @@ hand, or advanced past the pipeline's checkpoint.
 - With `slot_management: managed` (the default) the pipeline creates the slot again at its next
   start and streams from the new slot. It copies the tables as `snapshots.mode` says: under
   `never` it takes none, and warns. The log says why.
-- With `require_existing` the pipeline stops in `error`, and v1 has no in-place recovery
-  (DA-SRC-30). A slot the DBA creates again is past the pipeline's checkpoint, so it counts as
-  lost and is refused again; the refusal's advice to recreate it and restart is wrong. The path
-  that works:
-  1. Have the DBA drop the slot, if it still exists.
-  2. Set `slot_management: managed` and reload. That restarts the pipeline, even one in `error`.
-     The pipeline creates the slot and recovers as under `managed`, above.
-  3. Once the pipeline runs, set `require_existing` back (keep `auto_cleanup: false`).
+- With `require_existing` the pipeline stops in `error`: it creates no slot. Have the DBA create
+  the slot again. A slot made again starts at the server's position now, past the pipeline's
+  checkpoint, so the changes in between are lost and the pipeline refuses it with
+  `slot_on_orphan: halt` (the default). Set `slot_on_orphan: adopt_resnapshot` (applied without a
+  restart) and `POST /v1/pipelines/<id>/restart`: the pipeline adopts the slot and copies the
+  tables as `snapshots.mode` says. Once it runs, set `slot_on_orphan` back to `halt`.
 
-  The role already has `REPLICATION`, which streaming needs, and that is enough to create a slot.
+## A failover (`WAL_SOURCE_CHANGED`)
+
+**Symptom:** after a failover, or after the host was pointed at another server, the pipeline stops
+in `error` with `WAL_SOURCE_CHANGED`, naming the server its checkpoint was read on and the one it
+reads now.
+
+The checkpoint records the server: its system identifier and its timeline. A promoted replica
+keeps the identifier and moves to a new timeline. Its WAL ends where its replication did, which can
+be behind what the lake already holds, so it writes again LSNs the lake has marked. Resuming would
+skip those changes. The logical slot isn't on the promoted server either: PostgreSQL doesn't copy
+it to a physical replica.
+
+1. If the old server is the one you want, point the pipeline back at it (a reload restarts the
+   pipeline) and it resumes.
+2. Otherwise set `source.postgres.source_change_action: re_snapshot` (a reload applies it, without
+   a restart) and `POST /v1/pipelines/<id>/restart`. The pipeline moves every table onto the new
+   server's position, makes its slot there (under `require_existing`, have the DBA create it
+   first), and copies the tables as `snapshots.mode` says: under `never`, none, with a warning, and
+   you start a snapshot job for each table.
+3. Rows the old server wrote that the promoted one never received (the changes written after the
+   replica fell behind or was cut off) stay in the Delta tables. The copy only upserts, so it
+   doesn't delete them; they are the changes the failover lost. To start clean, stop the pipeline,
+   drop or move the Delta tables, then let it copy them afresh, as in the caution above and in
+   [A halted table](/data-avalanche/runbooks/halted-table/#3-copy-the-table-again).
+
+Leave `source_change_action` at `re_snapshot` only where a failover should recover by itself.
+
+## A renamed or dropped publication
+
+The pipeline finds its publication by name at each start. Under `managed` a publication it can't
+find is created again, with the pipeline's tables, and the pipeline re-snapshots: the WAL since its
+checkpoint was decoded without it. The renamed publication stays behind; drop it. Under
+`require_existing` the pipeline stops in `error` ("publication … doesn't exist"): rename it back,
+or set `source.postgres.publication` to the new name and reload.
 
 ## An orphan slot
 
@@ -95,18 +126,27 @@ needs. A pipeline stopped for longer than the server keeps its binlog
 ## The server changed (`BINLOG_SOURCE_CHANGED`)
 
 With `replication_type: binlog`, a position is a file and an offset of one server. When the host
-now leads to another server (a failover, a restore), the pipeline stops in `error` with
-`BINLOG_SOURCE_CHANGED`.
+now leads to another server (a failover, a restore), the checkpoint means nothing there. The
+pipeline tells servers apart by `server_uuid` on MySQL and by `server_id` on MariaDB. On MariaDB it
+also checks that the position is an event boundary of a binlog file the server holds
+(`BINLOG_GTID_POS`). And a checkpoint whose file the server never held is another server's, not a
+purge: the file has another base name, or comes after the server's newest binlog. A file older
+than the server's oldest is a purge (see above). The same checks run when the pipeline
+reconnects, not only at a start.
 
-1. Prefer GTIDs: set `replication_type: gtid` (the server needs them on) and
-   `binlog_purge_action: re_snapshot`, and reload. The pipeline can't carry a file position over
-   to a GTID one, so it starts from the server's position now (and copies the tables as
-   `snapshots.mode` says), then follows GTIDs, which survive later failovers.
-2. Without GTIDs, the position can't be repaired in place: replace the pipeline. Give it a new
-   `id` and a new `sink.prefix` (or none, so the prefix is the new `id`), with
-   `snapshots.mode: initial`, in one reload. The new pipeline copies every table into fresh Delta
-   tables and streams from the server's position now; drop the old tables once nothing reads
-   them. The old pipeline's state stays behind, unused.
+- With `binlog_purge_action: error` (the default) the pipeline stops in `error` with
+  `BINLOG_SOURCE_CHANGED`. Point it back at its server, or recover as below.
+- With `binlog_purge_action: re_snapshot` the pipeline starts from the new server's position, with
+  a warning, and copies the tables as `snapshots.mode` says. Found at a reconnect, the pipeline
+  runs its start again to do so. To recover a stopped pipeline, set it (a reload applies it,
+  without a restart) and `POST /v1/pipelines/<id>/restart`.
+
+One case isn't caught: another server with the same `server_id` and the same binlog file names,
+whose file happens to have an event boundary at the checkpoint's offset. Prefer GTIDs: with
+`replication_type: gtid` (the server needs them on) a position survives a failover to a replica,
+and none of the above applies. Switching is a reload: the pipeline can't carry a file position
+over to a GTID one, so it starts from the server's position now (with
+`binlog_purge_action: re_snapshot`) and copies the tables as `snapshots.mode` says.
 
 </TabItem>
 </Tabs>
