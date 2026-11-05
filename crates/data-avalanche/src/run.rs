@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
-use data_avalanche_api::{Api, Auth, Control, Node, ServeError, Stop, bind, router};
+use data_avalanche_api::{Api, Auth, Control, Node, RateLimit, ServeError, Stop, bind, router};
 use data_avalanche_cluster::{
     ClusterReconciler, ConfigCoordinator, ControllerDeps, ControllerSettings, CoordinatorDeps,
     DocsFn, Gossip, GossipKey, GossipSettings, LeaseTiming, NodeIdentity, NodeMeta, Phase,
@@ -249,6 +249,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         docs,
         leases: deps.leases.clone(),
         control,
+        validates: Arc::new(RateLimit::validate()),
     });
     ready.store(true, Ordering::SeqCst);
     let mut cluster = Some((gossip, reconciler, discovery));

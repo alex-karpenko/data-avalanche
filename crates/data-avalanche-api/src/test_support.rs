@@ -268,6 +268,7 @@ pub(crate) async fn lone_with(file: PathBuf, text: &str, env: Arc<dyn Env + Send
             }),
             leases: leases.clone(),
             control,
+            validates: Arc::new(crate::RateLimit::validate()),
         },
         leases,
         stops,

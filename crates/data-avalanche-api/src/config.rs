@@ -1,9 +1,10 @@
 //! `/v1/config`: the check, the reload and its status (Clustering §9.2).
 
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 use axum::extract::{Extension, RawQuery, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::Response;
 use data_avalanche_cluster::{Checked, ReloadError, Reloaded, RestartFields};
 use data_avalanche_config::Fingerprints;
@@ -43,7 +44,8 @@ async fn node_file(node: &Node) -> Result<String, Failure> {
 /// and all, is not echoed. A body's secrets aren't compared with the running ones
 /// (`secrets_compared: false`): whether a guess is the running secret isn't told. Every validate
 /// is logged at info with its caller, its source, the body's size and the answer's status
-/// (DA-API-20).
+/// (DA-API-20). A node takes posted bodies at [`crate::VALIDATE_PER_SECOND`] after a burst of
+/// [`crate::VALIDATE_BURST`]: past it, 429 with `Retry-After`.
 pub(crate) async fn validate(
     State(api): State<Api>,
     Extension(by): Extension<Principal>,
@@ -55,6 +57,16 @@ pub(crate) async fn validate(
     let posted = !text.trim().is_empty();
     let bytes = text.len();
     let response: Response = 'checked: {
+        if posted && let Err(wait) = node.validates.take(Instant::now()) {
+            let secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+            let mut r = body(
+                StatusCode::TOO_MANY_REQUESTS,
+                &json!({ "error": format!("too many posted configs validated: try again in {secs} s") }),
+            );
+            r.headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(secs));
+            break 'checked r;
+        }
         let (checked, fingerprints) = if posted {
             (
                 node.coordinator.check_posted(&text).await,
@@ -274,6 +286,34 @@ mod tests {
             "pipelines.orders.source.credentials.password",
             "{v}"
         );
+    }
+
+    /// DA-API-20: a node takes posted bodies at a bounded rate, node-wide: past the burst, 429
+    /// with `Retry-After`. The node's own file is checked all the same.
+    #[tokio::test]
+    async fn posted_validates_past_the_burst_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.yaml");
+        std::fs::write(&file, CONFIG).unwrap();
+        let lone = lone(file).await;
+        let a = api(open());
+        a.node.set(lone.node.clone()).unwrap();
+        let addr = serve(a).await;
+        for _ in 0..crate::VALIDATE_BURST {
+            let (code, _, body) =
+                request(addr, "POST", "/v1/config/validate", &[], "pipelines: [").await;
+            assert_eq!(code, 422, "{body}");
+        }
+        let (code, head, body) =
+            request(addr, "POST", "/v1/config/validate", &[], "pipelines: [").await;
+        assert_eq!(code, 429, "{body}");
+        assert!(
+            head.to_ascii_lowercase().contains("retry-after: 1\r\n"),
+            "{head}"
+        );
+        assert!(body.contains("try again in 1 s"), "{body}");
+        let (code, _, body) = request(addr, "POST", "/v1/config/validate", &[], "").await;
+        assert_eq!(code, 200, "the node's file: {body}");
     }
 
     /// A posted body's pipeline id is taken as written (DA-API-19): the answer names a pipeline

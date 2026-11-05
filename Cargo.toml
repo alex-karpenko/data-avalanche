@@ -58,6 +58,8 @@ async-trait = "0.1"
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+# The OpenAPI document checked against the vendored OAS 3.1 schema (DA-API-18), a dev-dependency.
+boon = "=0.6.1"
 # One arrow major workspace-wide (roadmap §2, D-MS.14): 59, as deltalake 1.0 resolves it.
 arrow-array = "59"
 arrow-buffer = "59"

@@ -294,6 +294,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "posted bodies past the node's rate: `Retry-After` says when",
+            "content": {
+              "application/json": {}
+            }
+          },
           "503": {
             "description": "the node is starting or stopping, or its state can't be read",
             "content": {

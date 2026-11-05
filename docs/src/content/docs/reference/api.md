@@ -204,6 +204,7 @@ Least role: `operator`.
 |---|---|
 | `200` | it loads: its warnings and the changes |
 | `422` | invalid, or it changes a restart-only field: the report |
+| `429` | posted bodies past the node's rate: `Retry-After` says when |
 
 ## cluster
 
