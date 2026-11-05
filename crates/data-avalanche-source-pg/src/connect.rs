@@ -22,12 +22,12 @@ use crate::error::{sql_error, timed_out};
 /// is free again when the client gives up.
 pub(crate) const SERVER_FIRST: Duration = Duration::from_secs(5);
 
-/// `d` as a server-side timeout in milliseconds: at least 1 (0 turns a timeout off) and at most
-/// what the setting holds (`i32::MAX`).
 /// The most idle chunk-read connections kept: as many as `snapshots.parallelism` reads without a
 /// warning (V-038).
 pub const IDLE_READS: usize = 4;
 
+/// `d` as a server-side timeout in milliseconds: at least 1 (0 turns a timeout off) and at most
+/// what the setting holds (`i32::MAX`).
 pub(crate) fn server_millis(d: Duration) -> u128 {
     d.as_millis().clamp(1, i32::MAX as u128)
 }
