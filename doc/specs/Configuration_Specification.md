@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-03
+updated: 2026-11-04
 domain: Architecture
 status: Specification (supersedes the Configuration_file_model.md draft)
 tags: [architecture, configuration, spec, validation, multi-sink, iceberg, delta-lake]
@@ -51,7 +51,7 @@ to it triggers:
 |---|---|---|
 | **R** | Reloadable | Applied in place, no interruption. (e.g., `log.level`, `sink.flush.*`, `tables.include`.) |
 | **PR** | Pipeline-restart | The affected pipeline(s) are restarted per the restart policy (§12.4): drain/flush, release resources, re-create. Other pipelines keep running. (e.g., `source.host`, `sink.iceberg.catalog.*`.) |
-| **PROC** | Process-restart | Cannot be hot-applied. The reload is **rejected** with an error naming the field; the operator must restart the worker process. (e.g., `cluster.tokens`, `api.address`, memberlist binding.) |
+| **PROC** | Process-restart | Cannot be hot-applied. The reload is **rejected** with an error naming the field (V-061), unless it is asked with `?restart=accept`: the generation is then published, each running node keeps the value it started with (the field is listed in its `restart_pending`, `GET /v1/config/status`), and a node takes the new value at its next start, a rolling restart. (e.g., `api.address`, memberlist binding, `cluster.lease_renewal_interval`.) The fields the cluster keeps for good — `config_version`, `globals.cloud`, `globals.state`, `globals.azure`, `cluster.tokens`, `cluster.lease_duration`, `cluster.lock_backend` — are refused even then: a new value needs a new `globals.state`, every node stopped (DA-OPS-12). |
 
 The reload engine computes the highest class touched per scope and acts accordingly. A reload
 that touches **only** R-class fields never interrupts data flow.
@@ -487,6 +487,7 @@ When tracing is active, `trace_id` / `span_id` are injected into JSON log record
 |---|---|---|---|---|---|
 | `otlp_endpoint` | URL | no | — | R | OTLP/HTTP (protobuf) collector base URL, e.g. `http://otel-collector:4318`; spans are sent to `<endpoint>/v1/traces`. **Absent ⇒ tracing disabled** (zero overhead, no error). An endpoint the exporter can't use is a warning at run time, and the one in force stays. |
 | `sample_ratio` | float [0,1] | no | `0.0` (no endpoint) / `0.05` (endpoint set) | R | Head sampling ratio (V-097). `> 0` without an endpoint warns (V-098). |
+| `headers` | map<string, string> | no | `{}` | R | Sent with each export: a hosted collector's token or API key, e.g. `authorization: "Bearer ${OTLP_TOKEN}"`. The values are secrets (§4: fingerprinted, never shown). Each name an HTTP token, each value visible ASCII, spaces and tabs (V-126). |
 
 ### 6.7 `globals.azure` (`cloud = azure` only)
 
@@ -1065,7 +1066,9 @@ Other notes:
   block other pipelines. (Resolution checks that a credential is *present and well-formed*, not
   that it is *accepted* by the server.)
 - On reload, a change to any **PROC** field is rejected (V-061) with a message naming the field;
-  the previous config stays in effect (a reload-time instance of whole-config rejection).
+  the previous config stays in effect (a reload-time instance of whole-config rejection). A
+  reload asked with `?restart=accept` publishes it, except for the fields the cluster keeps for
+  good (§1.2), and each node applies it at its next start.
 
 ### 11.1 Resolved config at runtime
 
@@ -1153,14 +1156,24 @@ highest class touched.
 
 - **Added** (`id` new): start it (Phase 0, `Data-Flow.md`), snapshot per `snapshot_mode`.
 - **Removed** (`id` gone): stop, drain/flush, drop DB resources if `auto_cleanup`, retain
-  Iceberg artifacts (never deleted, per `System-Overview.md`). Orphan-cleanup of resources for
-  a tombstoned `id` whose owner was offline is a design item (gap 2.4).
+  Iceberg artifacts (never deleted, per `System-Overview.md`). The node that adopts the
+  generation first records a **removal tombstone** in `globals.state` (`removals/<id>.json`: the
+  id and the last generation that had it) before it applies the removal; a tombstone that can't
+  be written refuses the adoption, which is tried again. The pipeline's owner tears it down and
+  marks the tombstone done. A removal no node owns (its owner was down, or a hand-off was between
+  release and claim) is torn down by the node the ring places the id on: every 30 s a node reads
+  the pending tombstones, resolves each one's pipeline from its generation, claims the lease once
+  it is free, tears it down as `auto_cleanup` says, and marks it done (DA-OPS-9). A pipeline that
+  shares the removed one's id, slot, publication, sink or state location waits, before it claims
+  its lease, until every such tombstone is done, on every node, whatever reload or start brought
+  it (DA-OPS-10).
 - **Renamed** (key changed, `id` same): pure rename; the `_pipeline` label changes, no
   resource churn.
 - **`id` changed**: delete-and-recreate (drop old resources per `auto_cleanup`, start fresh).
 - **Modified, only R fields**: applied in place.
 - **Modified, any PR field**: restart that pipeline per §12.4.
-- **Modified, any PROC field**: reload rejected (V-061).
+- **Modified, any PROC field**: reload rejected (V-061), or with `?restart=accept` published and
+  applied at each node's next start (§1.2).
 
 ### 12.4 Pipeline restart policy (in-flight batches)
 
@@ -1289,6 +1302,8 @@ errors.
 | V-029 | `sink.iceberg.catalog.rest.auth = sigv4` | Requires `globals.cloud = aws`. | error | pipeline |
 | V-030 | `source.ssl_mode = allow` | Invalid for MySQL. | error | pipeline |
 | V-124 | `source.ssl_mode = verify-ca`, when `source.type = mysql` | The host name is checked too, as with `verify-full` (DA-SRC-22). | warning | pipeline |
+| V-125 | `globals.api.jwt.jwks_url`, `globals.api.oauth2.jwks_url`, `discovery_url` | Not `https`: the issuer's keys could be swapped on the way (DA-API-16). | warning | config |
+| V-126 | `globals.tracing.headers` | Each name an HTTP token; each value visible ASCII, spaces and tabs (DA-OBS-7). | error | config |
 | V-073 | `globals.cluster.lease_renewal_interval` | Must be ≤ `lease_duration / 3` (the holder must get ≥2 renew attempts inside the renewal safety deadline). **Hard error** — promoted from the previously-advisory guidance (Clustering doc §18.2/§19.6, D-8). | error | config |
 | V-033 | `tables.snapshots.overrides` keys | Must be full `schema.table`; globs forbidden. | error | pipeline |
 | V-034 | `tables.snapshots.overrides` keys | Key not in the resolved include/exclude set. | warning | pipeline |
@@ -1351,7 +1366,7 @@ errors.
 
 | ID | Path / Scope | Rule | Severity | Locus |
 |---|---|---|---|---|
-| V-061 | any PROC-class field | Changed during a live reload. | error | reload |
+| V-061 | any PROC-class field | Changed during a live reload, without `?restart=accept`; a field the cluster keeps for good (§1.2) even with it. | error | reload |
 | V-062 | `globals.cluster.tokens` | Differs from the cluster-established value in `globals.state`. | error | config |
 | V-076 | `globals.cluster.lock_backend` | Differs from the cluster-established value in the `globals.state` anchor. | error | config |
 | V-094 | `globals.cluster.lease_duration` | Differs from the cluster-established value in the `globals.state` anchor (`lease_duration_ms`). | error | config |
@@ -1634,6 +1649,12 @@ Every deviation, so nothing is silent:
     recovered by `re_snapshot` (it halted with no recovery); MariaDB's check by
     `BINLOG_GTID_POS`. §9.1 `ssl_mode`: MySQL `verify-ca` checks the host name too, warning
     **V-124**.
+31. **M12b planning (2026-11-04, Q-M12b-1…4)** — §1.2 PROC, §11 and §12.3: a reload with
+    `?restart=accept` publishes a process-restart field, applied at each node's next start
+    (DA-OPS-12); the cluster-pinned fields are refused even then (**V-061**). §12.3: the removal
+    tombstone replaces the orphan-cleanup design item (DA-OPS-9, DA-OPS-10). §6.6 new
+    `globals.tracing.headers` (secrets, R, **V-126**). §6.3: a non-`https` key URL warns
+    (**V-125**).
 
 None of these change the **decided** catalog-auth schema (hive Thrift `none/ldap/kerberos`;
 rest HTTP `none/bearer/oauth2/sigv4`) — those are reproduced verbatim from
