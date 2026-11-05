@@ -10233,3 +10233,10 @@ git commit -m "docs: the M12b changes — removing a pipeline, keys applied at t
   clearing) and a second reconnect, as the worker reports it, in
   `the_kept_lag_start_waits_for_the_next_session_to_read_as_far`. While a worker reconnects, its
   status shows no frontier. Tasks 14–16's blocks apply in order on `0a8de54`.
+- **Task 14** (`ce898a5`): two advisories were published after the plan's audit. RUSTSEC-2026-0442
+  (arrow-data 59.3.0, unsound: a RunEndEncoded array's validation allows an out-of-bounds read)
+  is patched in 59.3.2, so the arrow and parquet family (15 packages) moves 59.3.0 → 59.3.2, the
+  workspace's one arrow major unchanged. RUSTSEC-2026-0441 (pin-utils 0.1.0, unmaintained, no
+  patched release) comes only through the AWS SDK under deltalake-aws: triaged in
+  `.cargo/audit.toml` with its reason. `cargo audit` exits 0 with no warning; the build, the
+  gates, the workspace's tests and its ITs pass (2870). Four advisories are now triaged, not three.
