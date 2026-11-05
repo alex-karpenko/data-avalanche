@@ -5387,8 +5387,8 @@ diff --git a/crates/data-avalanche-cluster/src/test_support.rs b/crates/data-ava
 index 5fa8b71..e5a0336 100644
 --- a/crates/data-avalanche-cluster/src/test_support.rs
 +++ b/crates/data-avalanche-cluster/src/test_support.rs
-@@ -174,6 +174,9 @@ impl VersionedStore for ScriptedStore {
-     async fn list(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+@@ -193,6 +193,9 @@ impl VersionedStore for ScriptedStore {
+         }
          self.inner.list(prefix).await
      }
 +    async fn delete(&self, key: &str) -> Result<(), StoreError> {
@@ -10192,3 +10192,12 @@ git commit -m "docs: the M12b changes — removing a pipeline, keys applied at t
   `ScriptedStore::fail_lists`). The implementation had also dropped the existing test
   `an_add_for_a_running_pipeline_restarts_it` (`reconciler.rs`); it is restored verbatim. Task 5's
   blocks apply unchanged on top.
+- **Task 6** (review fix, `7d14c44`): the plan's code gave `SnapshotJobDoc.truncate` only
+  `#[serde(default)]`, so every job document was written with `"truncate": false`, against this
+  plan's own State compatibility constraint: v0.1.0's `SnapshotJobDoc` refuses unknown fields, so a
+  v0.1.0 node (a rolling upgrade, a rollback) would refuse every job this version writes. It is now
+  `skip_serializing_if = "std::ops::Not::not"`; the encode test expects no `truncate` key for a job
+  that keeps its rows, and `"truncate": true`, read back, for `truncating()`. Task 4's fix
+  (`ScriptedStore::fail_lists`) moved `ScriptedStore::list`, so Task 7's `test_support.rs` block
+  (`delete`) is rebased onto its new context; its change is the same. Tasks 7–16's blocks apply
+  in order on `7d14c44`.
