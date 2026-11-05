@@ -1,8 +1,10 @@
 //! How a node finds its peers (Clustering §3.5, §10.2, D-4) and the address it gives them.
 //! `static` asks `memberlist.join_members`; `dns` asks every address `discovery_dns_name`
-//! resolves to (a Kubernetes headless Service), at `advertise_port`. Seeds are asked at start and
-//! again every [`REDISCOVER`] while the node has no peer, so a node that lost them all, or
-//! started before them, finds its way back; once joined, SWIM carries the membership.
+//! resolves to (a Kubernetes headless Service), at `advertise_port`. Seeds are resolved at start
+//! and again every [`REDISCOVER`], and asked when they aren't members: a node that lost its peers,
+//! or started before them, finds its way back, and groups that formed apart (pods started together
+//! that each resolved some of the others, DA-CLUS-15) merge. SWIM carries the membership between
+//! the members.
 //!
 //! A seed is named by the address its peer advertises: that peer's `advertise_addr` at
 //! `advertise_port`. foca accepts an announce only when it is addressed to the receiver's own
@@ -20,7 +22,7 @@ use tokio::task::JoinHandle;
 use crate::gossip::Announcer;
 use crate::{ClusterError, Members};
 
-/// How often a node without peers asks its seeds again.
+/// How often a node resolves its seeds again, and asks those that aren't members.
 pub const REDISCOVER: Duration = Duration::from_secs(5);
 
 /// Where a node's seeds come from.
@@ -69,7 +71,7 @@ impl Seeds {
     }
 }
 
-/// Asks the seeds at once, then every [`REDISCOVER`] while the node has no peer.
+/// Asks the seeds at once, then every [`REDISCOVER`] the seeds that aren't members.
 pub fn discover(
     seeds: Seeds,
     me: Vec<SocketAddr>,
@@ -78,12 +80,14 @@ pub fn discover(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            if members.borrow().peers() == 0 {
-                let addrs = seeds.resolve(&me).await;
-                if !addrs.is_empty() {
-                    tracing::debug!(?addrs, "asking the gossip seeds");
-                    announcer.announce(addrs);
-                }
+            let mut addrs = seeds.resolve(&me).await;
+            {
+                let view = members.borrow();
+                addrs.retain(|a| !view.nodes.values().any(|m| m.addr == *a));
+            }
+            if !addrs.is_empty() {
+                tracing::debug!(?addrs, "asking the gossip seeds that aren't members");
+                announcer.announce(addrs);
             }
             tokio::time::sleep(REDISCOVER).await;
         }
@@ -228,6 +232,60 @@ mod tests {
                 .iter()
                 .all(|a| a.ip().is_loopback() && a.port() == 7010),
             "{found:?}"
+        );
+    }
+
+    /// DA-CLUS-15: nodes that settled in two groups, each with a peer, ask their seeds again and
+    /// merge once they can reach each other.
+    #[tokio::test(start_paused = true)]
+    async fn groups_that_each_have_a_peer_ask_their_seeds_again_and_merge() {
+        use crate::test_support::{Hub, at, gossip_settings};
+        let hub = Hub::new();
+        let start = |name: &str, n: u8| {
+            let (port, inbox) = hub.port(at(n));
+            let me = crate::NodeIdentity {
+                node_id: name.into(),
+                incarnation: 1,
+                rev: 0,
+                addr: at(n),
+                meta: crate::NodeMeta {
+                    phase: crate::Phase::Active,
+                    config_generation: 1,
+                    build: "1.0.0".into(),
+                },
+            };
+            let key = crate::GossipKey::derive(&[7; 32]);
+            crate::Gossip::start(me, key, gossip_settings(), std::sync::Arc::new(port), inbox)
+        };
+        let seeds = Seeds::Static(
+            (1..=4)
+                .map(|n| HostPort {
+                    host: at(n).ip().to_string(),
+                    port: at(n).port(),
+                })
+                .collect(),
+        );
+        hub.cut(&[at(1), at(2)], &[at(3), at(4)]);
+        let nodes = [start("a", 1), start("b", 2), start("c", 3), start("d", 4)];
+        let _discovery: Vec<_> = nodes
+            .iter()
+            .zip(1..)
+            .map(|(g, n)| discover(seeds.clone(), vec![at(n)], g.announcer(), g.members()))
+            .collect();
+        eventually("two groups of two", || {
+            nodes.iter().all(|g| g.members().borrow().peers() == 1)
+        })
+        .await;
+        hub.heal();
+        let t = tokio::time::Instant::now();
+        eventually("one group of four", || {
+            nodes.iter().all(|g| g.members().borrow().peers() == 3)
+        })
+        .await;
+        assert!(
+            t.elapsed() <= REDISCOVER + Duration::from_secs(2),
+            "{:?}",
+            t.elapsed()
         );
     }
 
