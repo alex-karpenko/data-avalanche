@@ -10216,3 +10216,9 @@ git commit -m "docs: the M12b changes — removing a pipeline, keys applied at t
   `an_idle_connection_is_closed_and_gives_its_place_back` (plain and TLS; fails without the
   deadline) and `a_connection_in_use_outlives_the_idle_timeout`. Ruling D-M12b.13 amended; Task
   11's re-export adds `IDLE_TIMEOUT`; the research and tracker rows for DA-API-17 name it.
+- **Task 12** (review fix, `843ed14`): opentelemetry-otlp 0.33.1's `with_headers` URL-decodes each
+  value (`http/mod.rs:880`), so a token with a `%XX` reached the collector changed, and an encoded
+  CR LF (`%0D%0A`, visible ASCII, so V-126 takes it) made the exporter drop the header silently.
+  The exporter is now given each value with `%` as `%25`, which the decoding turns back: a value
+  reaches the collector as written. Test `a_header_value_with_a_percent_reaches_the_collector_as_written`
+  (fails without it: the header doesn't arrive). Tasks 13–16's blocks apply in order on `843ed14`.
