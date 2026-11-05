@@ -2,7 +2,8 @@
 //! §6.3.2). Both are PROC: a reload changes neither. A TLS handshake runs off the accept loop,
 //! bounded by [`HANDSHAKE_TIMEOUT`], so a client that never finishes it holds up no other. At
 //! most [`MAX_CONNECTIONS`] are open at once, handshakes included (DA-API-17): past it, a new
-//! connection waits in the socket's backlog until one closes.
+//! connection waits in the socket's backlog until one closes. A connection that reads and writes
+//! nothing for [`IDLE_TIMEOUT`] is closed, so silent ones can't hold every place.
 
 use std::io;
 use std::net::SocketAddr;
@@ -21,6 +22,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::time::{Instant, Sleep};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
 
@@ -29,6 +31,11 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The most connections open at once (DA-API-17).
 pub const MAX_CONNECTIONS: usize = 1024;
+
+/// A connection that reads and writes nothing for this long is closed, giving its place back
+/// (DA-API-17): a silent connection, a keep-alive one between requests, or a request whose
+/// handler answers nothing for as long.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Error)]
 pub enum ServeError {
@@ -48,6 +55,8 @@ pub struct Bound {
     tls: Option<TlsAcceptor>,
     /// [`MAX_CONNECTIONS`]; a test lowers it.
     max_connections: usize,
+    /// [`IDLE_TIMEOUT`]; a test lowers it.
+    idle_timeout: Duration,
 }
 
 impl std::fmt::Debug for Bound {
@@ -55,6 +64,8 @@ impl std::fmt::Debug for Bound {
         f.debug_struct("Bound")
             .field("tcp", &self.tcp)
             .field("tls", &self.tls.is_some())
+            .field("max_connections", &self.max_connections)
+            .field("idle_timeout", &self.idle_timeout)
             .finish()
     }
 }
@@ -75,6 +86,7 @@ pub async fn bind(address: &HostPort, tls: Option<&TlsIdentity>) -> Result<Bound
         tcp,
         tls,
         max_connections: MAX_CONNECTIONS,
+        idle_timeout: IDLE_TIMEOUT,
     })
 }
 
@@ -100,13 +112,14 @@ impl Bound {
                 let listener = Capped {
                     tcp: self.tcp,
                     open,
+                    idle: self.idle_timeout,
                 };
                 axum::serve(listener, router)
                     .with_graceful_shutdown(stop)
                     .await
             }
             Some(tls) => {
-                let listener = TlsListener::start(self.tcp, tls, open)?;
+                let listener = TlsListener::start(self.tcp, tls, open, self.idle_timeout)?;
                 axum::serve(listener, router)
                     .with_graceful_shutdown(stop)
                     .await
@@ -115,33 +128,84 @@ impl Bound {
     }
 }
 
-/// A connection with its place among the open ones, given back when it closes.
+/// A connection with its place among the open ones, given back when it closes. A read or a
+/// write that waits once nothing moved for `idle` fails, and the server drops the connection.
 pub(crate) struct Counted<S> {
     io: S,
     _open: OwnedSemaphorePermit,
+    idle: Duration,
+    deadline: Pin<Box<Sleep>>,
+}
+
+impl<S> Counted<S> {
+    fn new(io: S, open: OwnedSemaphorePermit, idle: Duration) -> Self {
+        Self {
+            io,
+            _open: open,
+            idle,
+            deadline: Box::pin(tokio::time::sleep(idle)),
+        }
+    }
+
+    /// Something moved: the deadline starts again.
+    fn moved(&mut self) {
+        let next = Instant::now() + self.idle;
+        self.deadline.as_mut().reset(next);
+    }
+
+    /// The inner stream waits: past the deadline, the wait fails instead.
+    fn waits<T>(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<T>> {
+        match self.deadline.as_mut().poll(cx) {
+            Poll::Ready(()) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the connection was idle too long",
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn after<T>(
+        &mut self,
+        cx: &mut Context<'_>,
+        polled: Poll<io::Result<T>>,
+    ) -> Poll<io::Result<T>> {
+        match polled {
+            Poll::Pending => self.waits(cx),
+            ready => {
+                self.moved();
+                ready
+            }
+        }
+    }
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for Counted<S> {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.io).poll_read(cx, buf)
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.io).poll_read(cx, buf);
+        this.after(cx, polled)
     }
 }
 
 impl<S: AsyncWrite + Unpin> AsyncWrite for Counted<S> {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.io).poll_write(cx, buf)
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.io).poll_write(cx, buf);
+        this.after(cx, polled)
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.io).poll_flush(cx)
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.io).poll_flush(cx);
+        this.after(cx, polled)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -149,11 +213,13 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Counted<S> {
     }
 
     fn poll_write_vectored(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.io).poll_write_vectored(cx, bufs)
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.io).poll_write_vectored(cx, bufs);
+        this.after(cx, polled)
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -165,6 +231,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Counted<S> {
 struct Capped {
     tcp: TcpListener,
     open: Arc<Semaphore>,
+    idle: Duration,
 }
 
 impl Listener for Capped {
@@ -177,7 +244,7 @@ impl Listener for Capped {
             .await
             .expect("the semaphore is never closed");
         let (io, peer) = Listener::accept(&mut self.tcp).await;
-        (Counted { io, _open: permit }, peer)
+        (Counted::new(io, permit, self.idle), peer)
     }
 
     fn local_addr(&self) -> io::Result<Self::Addr> {
@@ -215,7 +282,12 @@ struct TlsListener {
 }
 
 impl TlsListener {
-    fn start(tcp: TcpListener, tls: TlsAcceptor, open: Arc<Semaphore>) -> io::Result<Self> {
+    fn start(
+        tcp: TcpListener,
+        tls: TlsAcceptor,
+        open: Arc<Semaphore>,
+        idle: Duration,
+    ) -> io::Result<Self> {
         let addr = tcp.local_addr()?;
         let (tx, done) = mpsc::channel(64);
         tokio::spawn(async move {
@@ -238,7 +310,7 @@ impl TlsListener {
                 tokio::spawn(async move {
                     match tokio::time::timeout(HANDSHAKE_TIMEOUT, tls.accept(stream)).await {
                         Ok(Ok(io)) => {
-                            let _ = handed.send((Counted { io, _open: permit }, peer)).await;
+                            let _ = handed.send((Counted::new(io, permit, idle), peer)).await;
                         }
                         Ok(Err(e)) => tracing::debug!(%peer, "TLS handshake failed: {e}"),
                         Err(_) => tracing::debug!(%peer, "TLS handshake timed out"),
@@ -435,6 +507,131 @@ mod tests {
             if tls.is_none() {
                 assert_eq!(answered.unwrap(), 1, "plain: an answer");
             }
+        }
+    }
+
+    /// A TLS client trusting `der`, its handshake done.
+    async fn tls_client(
+        addr: SocketAddr,
+        der: &CertificateDer<'static>,
+    ) -> tokio_rustls::client::TlsStream<TcpStream> {
+        let mut roots = RootCertStore::empty();
+        roots.add(der.clone()).unwrap();
+        let client = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        TlsConnector::from(Arc::new(client))
+            .connect(ServerName::try_from("localhost").unwrap(), tcp)
+            .await
+            .unwrap()
+    }
+
+    /// Reads one `/health/live` answer off a kept-alive connection.
+    async fn live(s: &mut (impl AsyncRead + AsyncWrite + Unpin)) -> String {
+        s.write_all(b"GET /health/live HTTP/1.1\r\nHost: t\r\n\r\n")
+            .await
+            .unwrap();
+        let mut out = vec![];
+        let mut chunk = [0; 512];
+        while !out.ends_with(b"live\n") {
+            let n = s.read(&mut chunk).await.unwrap();
+            assert!(
+                n > 0,
+                "closed mid-answer: {}",
+                String::from_utf8_lossy(&out)
+            );
+            out.extend_from_slice(&chunk[..n]);
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// DA-API-17: a connection that reads and writes nothing for the idle timeout is closed and
+    /// gives its place back: a silent one, plain or past its TLS handshake, and a kept-alive one
+    /// between requests. Without it, silent connections would hold every place for good.
+    #[tokio::test]
+    async fn an_idle_connection_is_closed_and_gives_its_place_back() {
+        let (id, der) = identity();
+        for tls in [None, Some(&id)] {
+            let mut bound = bind(
+                &HostPort {
+                    host: "127.0.0.1".into(),
+                    port: 0,
+                },
+                tls,
+            )
+            .await
+            .unwrap();
+            bound.max_connections = 1;
+            bound.idle_timeout = Duration::from_millis(300);
+            let addr = bound.local_addr().unwrap();
+            let api = crate::test_support::api(crate::test_support::open());
+            tokio::spawn(bound.serve(router(api), std::future::pending()));
+            let what = if tls.is_some() { "tls" } else { "plain" };
+
+            // The one place, held by a connection that says nothing.
+            let mut held: Box<dyn AsyncRead + Unpin + Send> = match tls {
+                None => Box::new(TcpStream::connect(addr).await.unwrap()),
+                Some(_) => Box::new(tls_client(addr, &der).await),
+            };
+            let mut byte = [0; 1];
+            let closed = tokio::time::timeout(Duration::from_secs(3), held.read(&mut byte))
+                .await
+                .unwrap_or_else(|_| panic!("{what}: the silent connection is still open"));
+            assert!(matches!(closed, Ok(0) | Err(_)), "{what}: {closed:?}");
+
+            // Its place is free: the next connection is answered, then closed once it idles.
+            let answered = tokio::time::timeout(Duration::from_secs(3), async {
+                match tls {
+                    None => {
+                        let mut s = TcpStream::connect(addr).await.unwrap();
+                        let answer = live(&mut s).await;
+                        (answer, Box::new(s) as Box<dyn AsyncRead + Unpin + Send>)
+                    }
+                    Some(_) => {
+                        let mut s = tls_client(addr, &der).await;
+                        let answer = live(&mut s).await;
+                        (answer, Box::new(s) as Box<dyn AsyncRead + Unpin + Send>)
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{what}: the place wasn't given back"));
+            let (answer, mut kept) = answered;
+            assert!(answer.starts_with("HTTP/1.1 200"), "{what}: {answer}");
+            let closed = tokio::time::timeout(Duration::from_secs(3), kept.read(&mut byte))
+                .await
+                .unwrap_or_else(|_| panic!("{what}: the kept-alive connection is still open"));
+            assert!(matches!(closed, Ok(0) | Err(_)), "{what}: {closed:?}");
+        }
+    }
+
+    /// A connection in use isn't cut: requests more often than the idle timeout keep it open
+    /// well past it.
+    #[tokio::test]
+    async fn a_connection_in_use_outlives_the_idle_timeout() {
+        let mut bound = bind(
+            &HostPort {
+                host: "127.0.0.1".into(),
+                port: 0,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        bound.idle_timeout = Duration::from_millis(300);
+        let addr = bound.local_addr().unwrap();
+        let api = crate::test_support::api(crate::test_support::open());
+        tokio::spawn(bound.serve(router(api), std::future::pending()));
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        for _ in 0..8 {
+            let answer = live(&mut s).await;
+            assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
