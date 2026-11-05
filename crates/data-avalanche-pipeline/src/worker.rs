@@ -869,6 +869,7 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
                 table: table.clone(),
                 reason: reason.clone(),
                 at: at.clone(),
+                copy: false,
             })
             .await?;
     }

@@ -227,10 +227,12 @@ pub(crate) async fn get(State(api): State<Api>, Path(id): Path<String>) -> Respo
         None => Value::Null,
     };
     v["position"] = json!(position.map(|p| p.to_string()));
+    // A copy's halt fails its job table, which says why (DA-SNAP-19).
     v["halted_tables"] = json!(
         halts
             .tables
             .iter()
+            .filter(|h| !h.copy)
             .map(|h| json!({
                 "table": h.table.to_string(),
                 "code": h.reason.code(),
@@ -486,11 +488,25 @@ mod tests {
             table: TableRef::new("public", "orders"),
             reason: HaltReason::TableDropped,
             at: SourcePosition::Pg(lsn),
+            copy: false,
+        })
+        .await
+        .unwrap();
+        docs.record_halt(&TableHalt {
+            table: TableRef::new("public", "audit"),
+            reason: HaltReason::TableDropped,
+            at: SourcePosition::Pg(lsn),
+            copy: true,
         })
         .await
         .unwrap();
         let v = json_of(addr, "GET", "/v1/pipelines/orders").await.1;
         assert_eq!(v["actual_state"], "running");
+        assert_eq!(
+            v["halted_tables"].as_array().unwrap().len(),
+            1,
+            "a copy's halt isn't shown: {v}"
+        );
         assert_eq!(v["position"], "pg:0/16B3748");
         assert_eq!(v["halted_tables"][0]["table"], "public.orders");
         assert_eq!(v["halted_tables"][0]["code"], "TABLE_DROPPED");

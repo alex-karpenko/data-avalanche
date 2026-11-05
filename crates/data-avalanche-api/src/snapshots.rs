@@ -15,7 +15,8 @@ use chrono::Utc;
 use data_avalanche_config::{Pipeline, SourceType, key_table};
 use data_avalanche_core::TableRef;
 use data_avalanche_state::{
-    Action, DesiredState, JobStatus, JobTableStatus, Request, SnapshotJobDoc,
+    Action, DesiredState, JobStatus, JobTableStatus, PipelineDocs, Request, SnapshotJobDoc,
+    StateError,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -173,9 +174,14 @@ pub(crate) async fn ask(
                 && tables.contains(&t.table)
         }) {
             let queued = if j.status == JobStatus::Queued {
-                " (it is queued: a queued job runs at the pipeline's next start, a restart)"
+                // Its restart may not have been written (DA-SNAP-21): ask it again, under the
+                // job's id, so the owner takes it at its next poll.
+                match ask_restart_again(&docs, j).await {
+                    Ok(()) => " (it is queued: its restart is asked again, and it runs at the pipeline's next start)".to_owned(),
+                    Err(e) => format!(" (it is queued, and its restart can't be asked again ({e}): it runs at the pipeline's next start)"),
+                }
             } else {
-                ""
+                String::new()
             };
             return conflict(format!(
                 "job {} snapshots {} already; ask again once it ended{queued}",
@@ -213,6 +219,18 @@ pub(crate) async fn ask(
             "truncate": truncate,
         }),
     )
+}
+
+/// Writes queued job `j`'s restart again, unless it is the restart recorded already.
+async fn ask_restart_again(docs: &PipelineDocs, j: &SnapshotJobDoc) -> Result<(), StateError> {
+    let restart = Request {
+        id: j.job_id.clone(),
+        at: j.requested_at,
+    };
+    if docs.requests().await?.restart.as_ref() == Some(&restart) {
+        return Ok(());
+    }
+    docs.request(Action::Restart, restart).await
 }
 
 /// `GET /v1/pipelines/{id}/snapshots`: every job of the pipeline, oldest request first.
@@ -395,7 +413,18 @@ mod tests {
             error.contains("public.orders") && error.contains(&first),
             "{v}"
         );
-        assert!(error.contains("the pipeline's next start"), "queued: {v}");
+        assert!(error.contains("its restart is asked again"), "queued: {v}");
+        // DA-SNAP-21: a job whose restart was lost gets it again when its table is asked.
+        let other = data_avalanche_state::Request {
+            id: "someone-else".into(),
+            at: Utc::now(),
+        };
+        docs.request(data_avalanche_state::Action::Restart, other)
+            .await
+            .unwrap();
+        let (code, _) = ask(addr, r#"{"tables": ["public.orders"]}"#).await;
+        assert_eq!(code, 409);
+        assert_eq!(docs.requests().await.unwrap().restart.unwrap().id, first);
         docs.update_snapshot_job(&first, |j| {
             j.tables[0].status = JobTableStatus::Running;
             j.settle(Utc::now());

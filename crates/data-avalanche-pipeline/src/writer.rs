@@ -75,6 +75,8 @@ pub(crate) struct WriterCtx {
     pub hooks: Arc<dyn Hooks>,
     pub observer: Arc<dyn Observer>,
     pub backoff: Backoff,
+    /// The run's copies (Q-M9b-3): a halt of one is marked a copy's.
+    pub copies: BTreeSet<TableRef>,
 }
 
 impl std::fmt::Debug for WriterCtx {
@@ -169,6 +171,7 @@ impl Writer {
             match self.commit(cs).await? {
                 Some(detail) => {
                     let halt = TableHalt {
+                        copy: self.ctx.copies.contains(&table),
                         table: table.clone(),
                         reason: HaltReason::SinkRejected { detail },
                         at,
@@ -427,6 +430,7 @@ mod tests {
                 hooks,
                 observer: self.ears.clone(),
                 backoff: FAST,
+                copies: BTreeSet::new(),
             };
             let (jobs_tx, jobs_rx) = mpsc::unbounded_channel();
             let (events_tx, mut events_rx) = mpsc::unbounded_channel();
@@ -497,6 +501,7 @@ mod tests {
             table: TableRef::new("public", "c"),
             reason: HaltReason::NumericOverflow { column: "n".into() },
             at: lsn(100),
+            copy: false,
         };
         j.halts.push(overflow.clone());
         j.snapshots.push(snapshot_doc("a"));
@@ -791,6 +796,7 @@ mod tests {
                 detail: "column mismatch".into(),
             },
             at: lsn(100),
+            copy: false,
         };
         assert!(
             matches!(&events[..], [WriterEvent::Halted(h), WriterEvent::Durable(_), WriterEvent::Durable(p)] if *h == halt && *p == lsn(300)),

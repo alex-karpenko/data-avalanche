@@ -7,7 +7,8 @@ use bytes::Bytes;
 use futures_util::TryStreamExt;
 use object_store::path::Path;
 use object_store::{
-    GetOptions, ObjectMeta, ObjectStore, PutMode, PutOptions, PutPayload, PutResult, UpdateVersion,
+    GetOptions, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload,
+    PutResult, UpdateVersion,
 };
 
 /// The version token of a stored object: whatever the backend compares on a conditional update.
@@ -89,6 +90,10 @@ pub trait VersionedStore: Send + Sync + std::fmt::Debug {
     /// Every key under `prefix/`, sorted (`a/b` lists `a/b/c`, not `a/bc`); `""` lists the whole
     /// root.
     async fn list(&self, prefix: &str) -> Result<Vec<String>, StoreError>;
+    /// Deletes unconditionally; an absent object is no error. For documents no one updates any
+    /// more (an ended snapshot job, DA-SNAP-16): never a lease or a pointer (deleting a lease
+    /// restarts its epoch).
+    async fn delete(&self, key: &str) -> Result<(), StoreError>;
 }
 
 /// [`VersionedStore`] over an `object_store` bucket, rooted at a key prefix (`""` = bucket root).
@@ -105,6 +110,7 @@ enum Op {
     Update,
     Put,
     List,
+    Delete,
 }
 
 impl ObjectStoreVersioned {
@@ -243,6 +249,14 @@ impl VersionedStore for ObjectStoreVersioned {
         keys.sort();
         Ok(keys)
     }
+
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        let path = self.path(key)?;
+        match self.store.delete(&path).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(map_error(Op::Delete, key, e)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -298,6 +312,15 @@ mod tests {
         let e = s.update("other", &v, b("two")).await.unwrap_err();
         assert!(matches!(e, StoreError::Conflict { .. }), "{e:?}");
         assert!(s.get("other").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_removes_and_a_missing_object_is_no_error() {
+        let s = store("root");
+        s.put("k", b("one")).await.unwrap();
+        s.delete("k").await.unwrap();
+        assert!(s.get("k").await.unwrap().is_none());
+        s.delete("k").await.unwrap();
     }
 
     #[tokio::test]

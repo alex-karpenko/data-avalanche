@@ -775,6 +775,9 @@ mod tests {
         async fn list(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
             self.inner.list(prefix).await
         }
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
     }
 
     /// A lone node `n1` running generation 1 of its text: its reloads go to `reloads`, its

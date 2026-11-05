@@ -419,6 +419,9 @@ impl VersionedStore for FlakyStore {
     async fn list(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
         self.inner.list(prefix).await
     }
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(key).await
+    }
 }
 
 /// Crashes at the `n`th hook point `when` matches (1 = the first).

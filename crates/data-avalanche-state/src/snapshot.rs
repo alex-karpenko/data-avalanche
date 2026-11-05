@@ -218,6 +218,9 @@ pub fn table_snapshot_key(table: &TableRef) -> String {
 
 pub const JOBS_PREFIX: &str = "snapshots/jobs";
 
+/// How many ended jobs a pipeline keeps; the owner deletes the older ones when a job ends.
+pub const KEPT_ENDED_JOBS: usize = 100;
+
 /// `snapshots/jobs/<job_id>.json`.
 pub fn job_key(job_id: &str) -> String {
     format!("{JOBS_PREFIX}/{}.json", escape_segment(job_id))
@@ -328,6 +331,28 @@ impl PipelineDocs {
         Ok(Some(v.doc))
     }
 
+    /// Deletes the ended jobs past the newest `keep`, newest by `finished_at` (DA-SNAP-16); an
+    /// unfinished job is never deleted. The number deleted.
+    ///
+    /// # Errors
+    /// A storage failure.
+    pub async fn prune_snapshot_jobs(&self, keep: usize) -> Result<usize, StateError> {
+        let mut ended: Vec<SnapshotJobDoc> = self
+            .snapshot_jobs()
+            .await?
+            .into_iter()
+            .map(|v| v.doc)
+            .filter(SnapshotJobDoc::is_finished)
+            .collect();
+        ended.sort_by(|a, b| (b.finished_at, &b.job_id).cmp(&(a.finished_at, &a.job_id)));
+        let mut deleted = 0;
+        for job in ended.iter().skip(keep) {
+            self.docs.store().delete(&job_key(&job.job_id)).await?;
+            deleted += 1;
+        }
+        Ok(deleted)
+    }
+
     /// The jobs not finished yet, oldest request first.
     ///
     /// # Errors
@@ -342,15 +367,21 @@ impl PipelineDocs {
             .collect())
     }
 
-    /// Every job of this pipeline, oldest request first.
+    /// Every job of this pipeline, oldest request first. A job document this build can't decode
+    /// (another release's, or a damaged one) is skipped with a warning (DA-SNAP-20).
     ///
     /// # Errors
-    /// A storage or decode failure (one bad job document fails the listing).
+    /// A storage failure.
     pub async fn snapshot_jobs(&self) -> Result<Vec<Versioned<SnapshotJobDoc>>, StateError> {
         let mut jobs = vec![];
         for key in self.docs.store().list(JOBS_PREFIX).await? {
-            if let Some(job) = self.docs.load::<SnapshotJobDoc>(&key).await? {
-                jobs.push(job);
+            match self.docs.load::<SnapshotJobDoc>(&key).await {
+                Ok(Some(job)) => jobs.push(job),
+                Ok(None) => {}
+                Err(e @ (StateError::Corrupt { .. } | StateError::UnsupportedVersion { .. })) => {
+                    tracing::warn!("snapshot job {key} skipped: {e}");
+                }
+                Err(e) => return Err(e),
             }
         }
         jobs.sort_by(|a, b| {
@@ -726,5 +757,70 @@ mod tests {
             .map(|j| j.job_id)
             .collect();
         assert_eq!(ids, ["a", "c"]);
+    }
+
+    fn ended(id: &str, at: u32, finished: u32) -> SnapshotJobDoc {
+        let mut j = job(id, at);
+        j.status = JobStatus::Completed;
+        j.finished_at = Some(t(finished));
+        j
+    }
+
+    #[tokio::test]
+    async fn pruning_keeps_the_newest_ended_jobs_and_every_unfinished_one() {
+        let p = pipeline();
+        p.create_snapshot_job(&ended("old", 1, 9)).await.unwrap();
+        p.create_snapshot_job(&ended("newer", 2, 10)).await.unwrap();
+        p.create_snapshot_job(&ended("newest", 3, 11))
+            .await
+            .unwrap();
+        p.create_snapshot_job(&job("queued", 0)).await.unwrap();
+        assert_eq!(p.prune_snapshot_jobs(2).await.unwrap(), 1);
+        let ids: Vec<String> = p
+            .snapshot_jobs()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|v| v.doc.job_id)
+            .collect();
+        assert_eq!(
+            ids,
+            ["queued", "newer", "newest"],
+            "finished first is pruned first"
+        );
+        assert!(p.snapshot_job("old").await.unwrap().is_none());
+        assert_eq!(p.prune_snapshot_jobs(2).await.unwrap(), 0);
+        assert_eq!(p.prune_snapshot_jobs(0).await.unwrap(), 2);
+        assert_eq!(
+            p.snapshot_jobs().await.unwrap().len(),
+            1,
+            "a queued job stays"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_job_is_skipped_by_the_listing() {
+        let p = pipeline();
+        p.create_snapshot_job(&job("good", 1)).await.unwrap();
+        let text = String::from_utf8(crate::doc::encode(&job("bad", 2)).to_vec()).unwrap();
+        let bad = text.replacen('{', "{\"from_a_newer_release\": 1, ", 1);
+        p.docs
+            .store()
+            .put(&job_key("bad"), Bytes::from(bad))
+            .await
+            .unwrap();
+        assert!(matches!(
+            p.snapshot_job("bad").await.unwrap_err(),
+            StateError::Corrupt { .. }
+        ));
+        let ids: Vec<String> = p
+            .snapshot_jobs()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|v| v.doc.job_id)
+            .collect();
+        assert_eq!(ids, ["good"]);
+        assert_eq!(p.unfinished_snapshot_jobs().await.unwrap().len(), 1);
     }
 }

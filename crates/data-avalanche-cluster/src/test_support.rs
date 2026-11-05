@@ -193,6 +193,9 @@ impl VersionedStore for ScriptedStore {
         }
         self.inner.list(prefix).await
     }
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(key).await
+    }
 }
 
 /// Balanced defaults (§18): 15 s, renewed every 5 s, deadline at 12.75 s.

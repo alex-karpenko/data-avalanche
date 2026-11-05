@@ -76,6 +76,12 @@ async fn check(store: Arc<dyn ObjectStore>, test: &str) {
     );
     assert_eq!(s.get("doc.json").await.unwrap().unwrap().0, b("two"));
 
+    s.delete("snapshots/jobs/j1.json").await.expect("delete");
+    assert_eq!(s.get("snapshots/jobs/j1.json").await.unwrap(), None);
+    s.delete("snapshots/jobs/j1.json")
+        .await
+        .expect("a delete of a missing object succeeds");
+
     delete_prefix(store.as_ref(), &prefix).await;
 }
 

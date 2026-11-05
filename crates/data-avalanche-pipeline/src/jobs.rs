@@ -312,6 +312,7 @@ mod tests {
                 table: t("a"),
                 reason: HaltReason::TableDropped,
                 at: w.source.wal_end(),
+                copy: false,
             })
             .await
             .unwrap();
@@ -383,6 +384,7 @@ mod tests {
                     detail: "the key changed".into(),
                 },
                 at: w.source.wal_end(),
+                copy: false,
             })
             .await
             .unwrap();
@@ -604,10 +606,6 @@ mod tests {
             SourceError::Permanent("permission denied for table x".into()),
         );
         let (end, st) = run(&w, &never(2), async |status| {
-            wait_until("the copy halts", || {
-                status.borrow().halted.contains_key(&t("x"))
-            })
-            .await;
             w.source
                 .commit(FakeTxn::new().insert(&t("a"), row(1, "streamed")));
             wait_until("the stream moves on", || w.ids("a") == [1]).await;
@@ -615,16 +613,16 @@ mod tests {
         })
         .await;
         assert_eq!(end.unwrap(), Exit::Drained);
-        assert_eq!(
-            st.halted.get(&t("x")),
-            Some(&HaltReason::NotReplicable {
-                reason: "permission denied for table x".into()
-            })
+        assert!(
+            st.halted.is_empty(),
+            "a copy's halt isn't shown: {:?}",
+            st.halted
         );
         let halts = w.docs.halts().await.unwrap().tables;
         assert_eq!(halts.len(), 1, "{halts:?}");
         assert_eq!(halts[0].table, t("x"));
         assert_eq!(halts[0].reason.code(), "TABLE_NOT_REPLICABLE");
+        assert!(halts[0].copy, "it fails its job, marked a copy's");
         assert!(w.ids("x").is_empty());
     }
 
@@ -644,9 +642,13 @@ mod tests {
             w.source.drop_table(&t("x"));
             w.source.release_reads();
             wait_until("the copy halts", || {
-                status.borrow().halted.contains_key(&t("x"))
+                !status.borrow().snapshots.contains_key(&t("x"))
             })
             .await;
+            assert!(
+                status.borrow().halted.is_empty(),
+                "a copy's halt isn't shown"
+            );
             w.source
                 .commit(FakeTxn::new().insert(&t("a"), row(1, "streamed")));
             streamed(&status, &w).await;
@@ -696,6 +698,7 @@ mod tests {
                 table: t("x"),
                 reason: HaltReason::SnapshotTimeout { limit_secs: 60 },
                 at: w.source.wal_end(),
+                copy: false,
             })
             .await
             .unwrap();
