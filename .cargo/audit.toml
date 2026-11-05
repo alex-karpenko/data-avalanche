@@ -13,4 +13,8 @@ ignore = [
     # proc-macro-error2 2.0.1, unmaintained: a build-time proc macro of validator_derive 0.19,
     # through deltalake-core. Nothing of it runs in the binary.
     "RUSTSEC-2026-0173",
+    # pin-utils 0.1.0, unmaintained (archived 2026-10-01, no patched release): the AWS SDK's
+    # aws-smithy-http and aws-smithy-types use it, through deltalake-aws. It pins futures on the
+    # stack; nothing of ours calls it. Lifts once the AWS SDK drops it (checked 2026-11-05).
+    "RUSTSEC-2026-0441",
 ]
