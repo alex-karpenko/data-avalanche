@@ -10201,3 +10201,7 @@ git commit -m "docs: the M12b changes — removing a pipeline, keys applied at t
   (`ScriptedStore::fail_lists`) moved `ScriptedStore::list`, so Task 7's `test_support.rs` block
   (`delete`) is rebased onto its new context; its change is the same. Tasks 7–16's blocks apply
   in order on `7d14c44`.
+- **Task 9** (review fix, `053c03a`): the plan's `connect.rs` block put `IDLE_READS` between
+  `server_millis`'s doc comment and the function, so the doc landed on the constant. The constant
+  now sits above it, each under its own comment. No code changes. Tasks 10–16's blocks apply in
+  order on `053c03a`.
