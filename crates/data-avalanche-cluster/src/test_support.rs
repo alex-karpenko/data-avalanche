@@ -520,6 +520,7 @@ pub(crate) fn members(me: &str, nodes: &[(&str, crate::Phase, bool)]) -> crate::
         .map(|((name, phase, suspect), n)| {
             let member = crate::Member {
                 addr: at(n),
+                incarnation: 1,
                 meta: crate::NodeMeta {
                     phase: *phase,
                     config_generation: 1,

@@ -605,9 +605,10 @@ async fn any_nodes_api_drives_the_holder() {
         .iter()
         .find(|p| p["id"] == json!(id))
         .cloned();
+    // A live holder isn't stale (DA-API-13).
     assert_eq!(
         row,
-        Some(json!({ "id": id, "holder": holder, "owner_epoch": epoch }))
+        Some(json!({ "id": id, "holder": holder, "owner_epoch": epoch, "holder_stale": false }))
     );
     c.landed().await;
     c.stop().await;

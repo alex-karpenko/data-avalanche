@@ -12,6 +12,7 @@ use data_avalanche_cluster::Phase;
 use serde_json::{Value, json};
 use tokio::sync::watch;
 
+use crate::pipelines::{Liveness, liveness};
 use crate::{Api, Principal, body, starting};
 
 /// What the API asked of the node, which the binary carries out; each includes the ones before.
@@ -97,6 +98,9 @@ pub(crate) async fn status(State(api): State<Api>) -> Response {
             "id": id,
             "holder": lease.as_ref().map(|l| l.holder_node_id.clone()),
             "owner_epoch": lease.as_ref().map(|l| l.owner_epoch),
+            "holder_stale": lease
+                .as_ref()
+                .map(|l| liveness(&members, l) == Liveness::Stale),
         }));
     }
     body(
@@ -190,7 +194,7 @@ mod tests {
         assert_eq!(v["members"][0]["config_generation"], 1);
         assert_eq!(
             v["pipelines"],
-            json!([{ "id": "orders", "holder": null, "owner_epoch": null }])
+            json!([{ "id": "orders", "holder": null, "owner_epoch": null, "holder_stale": null }])
         );
         let holder = Holder {
             node_id: "node-b".into(),
@@ -203,7 +207,7 @@ mod tests {
         let v = json_of(addr, "GET", "/v1/cluster/status").await.1;
         assert_eq!(
             v["pipelines"],
-            json!([{ "id": "orders", "holder": "node-b", "owner_epoch": 1 }])
+            json!([{ "id": "orders", "holder": "node-b", "owner_epoch": 1, "holder_stale": true }])
         );
     }
 
