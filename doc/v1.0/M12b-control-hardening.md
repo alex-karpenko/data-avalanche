@@ -10171,4 +10171,14 @@ git commit -m "docs: the M12b changes — removing a pipeline, keys applied at t
 
 ## Deviations during execution
 
-None yet.
+- **Task 3** (review fix, `45056a6`): the sweep's orphan claimed with this node's own `Holder`,
+  and `Claim::step` takes over a lease naming its own holder at once (its own earlier term). An
+  orphan could so take the lease of a live controller of the same id on the same node and tear
+  the pipeline down under it: a re-added id whose tombstone is still pending, or a sweep landing
+  between a tombstone's write and its reload. The orphan now claims with `Claim::patient()`: a
+  lease naming its own holder is watched as another holder's is, and taken over only after a full
+  `lease_duration` without a renewal; the live controller's claim is unchanged. Tests
+  `a_patient_claim_waits_for_its_own_holders_lease` (`claim.rs`) and
+  `an_orphan_waits_for_this_nodes_own_live_holder` (`controller.rs`, which fails without the fix).
+  The sweep still takes up a tombstone of an id this node runs: Task 4's re-added controller
+  waits on that tombstone, so skipping it would deadlock. Task 4's blocks apply unchanged on top.
