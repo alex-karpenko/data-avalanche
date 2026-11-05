@@ -1044,6 +1044,14 @@ pub const RULES: &[RuleMeta] = &[
         r#"source.ssl_mode = verify-ca, when source.type = mysql"#,
         r#"The host name is checked too, as with verify-full (DA-SRC-22)."#,
     ),
+    rule(
+        "V-125",
+        Warning,
+        L::Config,
+        Config,
+        r#"globals.api.jwt.jwks_url, globals.api.oauth2.jwks_url and discovery_url"#,
+        r#"Not https: the issuer's keys could be swapped on the way (DA-API-16)."#,
+    ),
 ];
 
 /// The registry entry for `id` (`"V-007"`).
@@ -1057,7 +1065,7 @@ mod tests {
 
     #[test]
     fn has_every_spec_rule_once_in_order() {
-        assert_eq!(RULES.len(), 118);
+        assert_eq!(RULES.len(), 119);
         assert!(
             RULES.windows(2).all(|w| w[0].id < w[1].id),
             "sorted, no duplicates"

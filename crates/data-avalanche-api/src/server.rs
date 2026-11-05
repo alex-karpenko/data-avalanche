@@ -1,10 +1,14 @@
 //! The listener on `globals.api.address`: plain HTTP, or TLS with `globals.api.tls` (config
 //! §6.3.2). Both are PROC: a reload changes neither. A TLS handshake runs off the accept loop,
-//! bounded by [`HANDSHAKE_TIMEOUT`], so a client that never finishes it holds up no other.
+//! bounded by [`HANDSHAKE_TIMEOUT`], so a client that never finishes it holds up no other. At
+//! most [`MAX_CONNECTIONS`] are open at once, handshakes included (DA-API-17): past it, a new
+//! connection waits in the socket's backlog until one closes.
 
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::Router;
@@ -14,13 +18,17 @@ use rustls::ServerConfig;
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
 
 /// How long a client has to finish its TLS handshake.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The most connections open at once (DA-API-17).
+pub const MAX_CONNECTIONS: usize = 1024;
 
 #[derive(Debug, Error)]
 pub enum ServeError {
@@ -38,6 +46,8 @@ pub enum ServeError {
 pub struct Bound {
     tcp: TcpListener,
     tls: Option<TlsAcceptor>,
+    /// [`MAX_CONNECTIONS`]; a test lowers it.
+    max_connections: usize,
 }
 
 impl std::fmt::Debug for Bound {
@@ -61,7 +71,11 @@ pub async fn bind(address: &HostPort, tls: Option<&TlsIdentity>) -> Result<Bound
             address: format!("{}:{}", address.host, address.port),
             source,
         })?;
-    Ok(Bound { tcp, tls })
+    Ok(Bound {
+        tcp,
+        tls,
+        max_connections: MAX_CONNECTIONS,
+    })
 }
 
 impl Bound {
@@ -80,19 +94,94 @@ impl Bound {
         router: Router,
         stop: impl Future<Output = ()> + Send + 'static,
     ) -> io::Result<()> {
+        let open = Arc::new(Semaphore::new(self.max_connections));
         match self.tls {
             None => {
-                axum::serve(self.tcp, router)
+                let listener = Capped {
+                    tcp: self.tcp,
+                    open,
+                };
+                axum::serve(listener, router)
                     .with_graceful_shutdown(stop)
                     .await
             }
             Some(tls) => {
-                let listener = TlsListener::start(self.tcp, tls)?;
+                let listener = TlsListener::start(self.tcp, tls, open)?;
                 axum::serve(listener, router)
                     .with_graceful_shutdown(stop)
                     .await
             }
         }
+    }
+}
+
+/// A connection with its place among the open ones, given back when it closes.
+pub(crate) struct Counted<S> {
+    io: S,
+    _open: OwnedSemaphorePermit,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Counted<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Counted<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.io).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+}
+
+/// The plain listener, capped: it accepts only while a place is free.
+struct Capped {
+    tcp: TcpListener,
+    open: Arc<Semaphore>,
+}
+
+impl Listener for Capped {
+    type Io = Counted<TcpStream>;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        let permit = Arc::clone(&self.open)
+            .acquire_owned()
+            .await
+            .expect("the semaphore is never closed");
+        let (io, peer) = Listener::accept(&mut self.tcp).await;
+        (Counted { io, _open: permit }, peer)
+    }
+
+    fn local_addr(&self) -> io::Result<Self::Addr> {
+        self.tcp.local_addr()
     }
 }
 
@@ -122,18 +211,25 @@ fn acceptor(id: &TlsIdentity) -> Result<TlsAcceptor, ServeError> {
 /// Accepted connections, each handed over once its handshake is done.
 struct TlsListener {
     addr: SocketAddr,
-    done: mpsc::Receiver<(TlsStream<TcpStream>, SocketAddr)>,
+    done: mpsc::Receiver<(Counted<TlsStream<TcpStream>>, SocketAddr)>,
 }
 
 impl TlsListener {
-    fn start(tcp: TcpListener, tls: TlsAcceptor) -> io::Result<Self> {
+    fn start(tcp: TcpListener, tls: TlsAcceptor, open: Arc<Semaphore>) -> io::Result<Self> {
         let addr = tcp.local_addr()?;
         let (tx, done) = mpsc::channel(64);
         tokio::spawn(async move {
             let mut tcp = tcp;
             loop {
-                // Retries a failed accept after a pause, as axum's plain listener does. Ends
-                // once the server is done with the listener, so the port is let go at once.
+                // A place first, handshakes included; then the accept, retried after a pause
+                // as axum's plain listener does. Ends once the server is done with the
+                // listener, so the port is let go at once.
+                let permit = tokio::select! {
+                    permit = Arc::clone(&open).acquire_owned() => {
+                        permit.expect("the semaphore is never closed")
+                    }
+                    () = tx.closed() => return,
+                };
                 let (stream, peer) = tokio::select! {
                     accepted = Listener::accept(&mut tcp) => accepted,
                     () = tx.closed() => return,
@@ -141,8 +237,8 @@ impl TlsListener {
                 let (tls, handed) = (tls.clone(), tx.clone());
                 tokio::spawn(async move {
                     match tokio::time::timeout(HANDSHAKE_TIMEOUT, tls.accept(stream)).await {
-                        Ok(Ok(stream)) => {
-                            let _ = handed.send((stream, peer)).await;
+                        Ok(Ok(io)) => {
+                            let _ = handed.send((Counted { io, _open: permit }, peer)).await;
                         }
                         Ok(Err(e)) => tracing::debug!(%peer, "TLS handshake failed: {e}"),
                         Err(_) => tracing::debug!(%peer, "TLS handshake timed out"),
@@ -155,7 +251,7 @@ impl TlsListener {
 }
 
 impl Listener for TlsListener {
-    type Io = TlsStream<TcpStream>;
+    type Io = Counted<TlsStream<TcpStream>>;
     type Addr = SocketAddr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
@@ -292,6 +388,54 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(free, "{addr} is still bound");
+    }
+
+    /// DA-API-17: past the cap, a new connection waits until an open one closes; plain and TLS
+    /// alike, a TLS handshake holding a place.
+    #[tokio::test]
+    async fn past_the_cap_a_connection_waits_for_one_to_close() {
+        let (id, _) = identity();
+        for tls in [None, Some(&id)] {
+            let mut bound = bind(
+                &HostPort {
+                    host: "127.0.0.1".into(),
+                    port: 0,
+                },
+                tls,
+            )
+            .await
+            .unwrap();
+            bound.max_connections = 2;
+            let addr = bound.local_addr().unwrap();
+            let api = crate::test_support::api(crate::test_support::open());
+            tokio::spawn(bound.serve(router(api), std::future::pending()));
+            // Two connections that say nothing: a TLS one holds its place in the handshake.
+            let held = [
+                TcpStream::connect(addr).await.unwrap(),
+                TcpStream::connect(addr).await.unwrap(),
+            ];
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut third = TcpStream::connect(addr).await.unwrap();
+            third
+                .write_all(b"GET /health/live HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut byte = [0; 1];
+            let waited =
+                tokio::time::timeout(Duration::from_millis(300), third.read(&mut byte)).await;
+            assert!(
+                waited.is_err(),
+                "tls {}: the third is answered at once",
+                tls.is_some()
+            );
+            drop(held);
+            let answered = tokio::time::timeout(Duration::from_secs(2), third.read(&mut byte))
+                .await
+                .expect("the third is taken once one closes");
+            if tls.is_none() {
+                assert_eq!(answered.unwrap(), 1, "plain: an answer");
+            }
+        }
     }
 
     #[tokio::test]
