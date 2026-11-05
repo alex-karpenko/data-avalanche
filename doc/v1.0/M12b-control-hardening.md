@@ -10182,3 +10182,13 @@ git commit -m "docs: the M12b changes — removing a pipeline, keys applied at t
   `an_orphan_waits_for_this_nodes_own_live_holder` (`controller.rs`, which fails without the fix).
   The sweep still takes up a tombstone of an id this node runs: Task 4's re-added controller
   waits on that tombstone, so skipping it would deadlock. Task 4's blocks apply unchanged on top.
+- **Task 4** (review fix, `72c5028`): `RemovedPipelines::resolve` returned a plain `String` error,
+  so a tombstone whose generation could not be read (a transient storage error) was logged and
+  skipped, and a re-added controller's wait for it ended early. `resolve` now returns
+  `ResolveError { Unread, Invalid }`: an unread generation, or an unread tombstone listing, holds
+  the wait and is retried; only an invalid one (bad config text, a missing pipeline, bad docs) is
+  logged and skipped. Tests `a_removal_whose_generation_is_unread_is_waited_for` and
+  `an_unread_tombstone_list_is_waited_for` (`controller.rs`, with a test-only
+  `ScriptedStore::fail_lists`). The implementation had also dropped the existing test
+  `an_add_for_a_running_pipeline_restarts_it` (`reconciler.rs`); it is restored verbatim. Task 5's
+  blocks apply unchanged on top.
