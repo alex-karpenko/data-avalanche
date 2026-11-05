@@ -207,7 +207,11 @@ async fn a_reload_reaches_every_node_and_each_pipeline_runs_once() {
             "prefix: orders, delta: {}, flush: { seconds: 0, rows: 5 }",
         )
         .replace("prefix: customers,", "prefix: customers-v2,");
-    let out = b.coordinator.reload(&text).await.unwrap();
+    let out = b
+        .coordinator
+        .reload(&text, crate::RestartFields::Refuse)
+        .await
+        .unwrap();
     assert_eq!((out.generation, out.published), (2, true));
     eventually("every node applies generation 2", || {
         nodes.iter().all(|n| n.coordinator.applied() == 2)

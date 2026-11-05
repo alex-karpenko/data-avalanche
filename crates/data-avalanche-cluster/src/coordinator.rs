@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use chrono::Utc;
 use data_avalanche_config::{
-    ConfigDiff, Env, FingerprintKey, Fingerprints, Globals, Pipeline, PipelineChange, Report,
-    ResolvedConfig, diff, diff_with, load_posted_str, load_str,
+    ConfigDiff, Env, FingerprintKey, Fingerprints, Globals, Mutability, Pipeline, PipelineChange,
+    Report, ResolvedConfig, diff, diff_with, load_posted_str, load_str,
 };
 use data_avalanche_core::TableRef;
 use data_avalanche_state::{
@@ -69,13 +69,26 @@ impl Debug for CoordinatorDeps {
     }
 }
 
-/// A reload's outcome.
+/// Whether a reload may publish a change to a field only a process restart applies (config
+/// §1.2, V-061; DA-OPS-12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartFields {
+    /// Refused, naming the field.
+    Refuse,
+    /// Published: every node applies the generation's other changes at once, and the field at
+    /// its next start, when it adopts the generation (`POST /v1/config/reload?restart=accept`).
+    Accept,
+}
+
+/// A reload's outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reloaded {
     /// The generation the cluster runs now.
     pub generation: u64,
     /// False when the file's text is that generation's already: nothing was published.
     pub published: bool,
+    /// The fields this node applies at its next start ([`ConfigCoordinator::restart_pending`]).
+    pub restart_pending: Vec<String>,
 }
 
 /// What a reload would do here ([`ConfigCoordinator::check`]).
@@ -110,6 +123,8 @@ pub enum ReloadError {
 
 /// The generation this node runs.
 struct Running {
+    /// The config the process started with: its restart-only fields are the ones in force.
+    started: ResolvedConfig,
     config: ResolvedConfig,
     generation: Versioned<GenerationDoc>,
     /// A newer generation this node couldn't apply: logged once, tried again at each poll.
@@ -164,6 +179,7 @@ impl ConfigCoordinator {
         let inner = Arc::new(Inner {
             deps,
             running: Mutex::new(Running {
+                started: config.clone(),
                 config,
                 generation,
                 failed: None,
@@ -215,9 +231,16 @@ impl ConfigCoordinator {
     /// generation itself is published again when what it resolves to here changed (a `${VAR}`,
     /// a credentials file): every node resolves it anew.
     ///
+    /// A change to a field only a process restart applies is refused unless `restart` is
+    /// [`RestartFields::Accept`] (DA-OPS-12).
+    ///
     /// # Errors
     /// [`ReloadError`]: nothing was published.
-    pub async fn reload(&self, text: &str) -> Result<Reloaded, ReloadError> {
+    pub async fn reload(
+        &self,
+        text: &str,
+        restart: RestartFields,
+    ) -> Result<Reloaded, ReloadError> {
         let d = &self.inner.deps;
         let mut running = self.inner.running.lock().await;
         if running.stopped {
@@ -241,13 +264,16 @@ impl ConfigCoordinator {
                 self.inner.adopt(&mut running, current.clone()).await;
             }
             let changes = diff(&running.config, &new, &|_, _| None);
-            if changes.is_rejected() {
+            if changes.is_rejected()
+                && (restart == RestartFields::Refuse || !changes.fixed().is_empty())
+            {
                 return Err(ReloadError::Rejected(changes.report));
             }
             if config_hash(text) == current.pointer.doc.hash && changes.is_empty() {
                 return Ok(Reloaded {
                     generation: n,
                     published: false,
+                    restart_pending: running.restart_pending(),
                 });
             }
             match d
@@ -262,6 +288,7 @@ impl ConfigCoordinator {
                     return Ok(Reloaded {
                         generation,
                         published: true,
+                        restart_pending: running.restart_pending(),
                     });
                 }
                 // Another node published first, or the outcome is unknown: read again.
@@ -335,6 +362,13 @@ impl ConfigCoordinator {
         })
     }
 
+    /// The restart-only fields the generation this node runs changed since the process started
+    /// (DA-OPS-12): a published `?restart=accept` reload, or a per-node `${VAR}`. They take
+    /// effect when the node starts again.
+    pub async fn restart_pending(&self) -> Vec<String> {
+        self.inner.running.lock().await.restart_pending()
+    }
+
     /// Stops watching, after the adoption or reload under way: none follows, and a reload is
     /// [`ReloadError::Stopped`].
     pub async fn stop(&self) {
@@ -351,10 +385,21 @@ impl ConfigCoordinator {
     }
 }
 
+impl Running {
+    fn restart_pending(&self) -> Vec<String> {
+        diff(&self.started, &self.config, &|_, _| None)
+            .globals
+            .into_iter()
+            .filter(|f| f.class == Mutability::Proc)
+            .map(|f| f.path)
+            .collect()
+    }
+}
+
 impl Inner {
-    /// Applies generation `g` (config §12): a generation that doesn't load here, or that changes
-    /// a restart-only field as this node resolves it, isn't, and this node runs on what it
-    /// runs.
+    /// Applies generation `g` (config §12): a generation that doesn't load here isn't, and this
+    /// node runs on what it runs. A change to a restart-only field is the next start's
+    /// (DA-OPS-12): the rest applies now, and the node says what waits for its restart.
     async fn adopt(&self, running: &mut Running, g: ConfigGeneration) {
         let d = &self.deps;
         let n = g.pointer.doc.generation;
@@ -376,9 +421,6 @@ impl Inner {
         let changes = diff(&running.config, &new, &|_, p| {
             sets.get(&p.id).copied().flatten()
         });
-        if changes.is_rejected() {
-            return refused(running, lines(&changes.report));
-        }
         let pipelines = match self.pipelines(&new, &changes) {
             Ok(pipelines) => pipelines,
             Err(why) => return refused(running, why),
@@ -414,6 +456,14 @@ impl Inner {
         running.config = new;
         running.generation = g.pointer;
         running.failed = None;
+        let pending = running.restart_pending();
+        if changes.is_rejected() && !pending.is_empty() {
+            tracing::warn!(
+                generation = n,
+                "config generation {n} changes fields this node applies at its next start: {}",
+                pending.join(", ")
+            );
+        }
         self.applied.send_replace(n);
     }
 
@@ -995,12 +1045,17 @@ mod tests {
             "  state: { bucket: app-state }\n",
             "  state: { bucket: app-state }\n  log: { level: debug }\n",
         );
-        let out = n.coordinator.reload(&text).await.unwrap();
+        let out = n
+            .coordinator
+            .reload(&text, RestartFields::Refuse)
+            .await
+            .unwrap();
         assert_eq!(
             out,
             Reloaded {
                 generation: 2,
-                published: true
+                published: true,
+                restart_pending: vec![],
             }
         );
         let pointer = n.generations.current().await.unwrap().unwrap().pointer;
@@ -1025,12 +1080,17 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_unchanged_file_publishes_nothing() {
         let n = lone(&["p"]).await;
-        let out = n.coordinator.reload(&config_text(&["p"])).await.unwrap();
+        let out = n
+            .coordinator
+            .reload(&config_text(&["p"]), RestartFields::Refuse)
+            .await
+            .unwrap();
         assert_eq!(
             out,
             Reloaded {
                 generation: 1,
-                published: false
+                published: false,
+                restart_pending: vec![],
             }
         );
         let current = n.generations.current().await.unwrap().unwrap();
@@ -1046,7 +1106,7 @@ mod tests {
             "cluster: { memberlist: { node_name: n1 } }",
             "cluster: { tokens: 64, memberlist: { node_name: n1 } }",
         );
-        match n.coordinator.reload(&tokens).await {
+        match n.coordinator.reload(&tokens, RestartFields::Refuse).await {
             Err(ReloadError::Rejected(report)) => {
                 assert!(
                     report
@@ -1059,11 +1119,74 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(matches!(
-            n.coordinator.reload("pipelines: [").await,
+            n.coordinator
+                .reload("pipelines: [", RestartFields::Refuse)
+                .await,
             Err(ReloadError::Invalid(_))
         ));
         let current = n.generations.current().await.unwrap().unwrap();
         assert_eq!(current.pointer.doc.generation, 1);
+    }
+
+    /// DA-OPS-12: a restart-only field is published when the reload accepts it. Every node
+    /// adopts the generation and keeps the field pending until its next start; a node started on
+    /// the generation has nothing pending. A field the cluster keeps for good (the anchor's
+    /// `tokens`) is refused all the same.
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_field_is_published_when_accepted_and_pending_until_the_next_start() {
+        let mut n = lone(&["p"]).await;
+        let renew = config_text(&["p"]).replace(
+            "cluster: { memberlist: { node_name: n1 } }",
+            "cluster: { lease_renewal_interval: 4s, memberlist: { node_name: n1 } }",
+        );
+        assert!(matches!(
+            n.coordinator.reload(&renew, RestartFields::Refuse).await,
+            Err(ReloadError::Rejected(_))
+        ));
+        let out = n
+            .coordinator
+            .reload(&renew, RestartFields::Accept)
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            Reloaded {
+                generation: 2,
+                published: true,
+                restart_pending: vec!["globals.cluster.lease_renewal_interval".into()],
+            }
+        );
+        assert!(n.reload().await.pipelines.is_empty());
+        assert_eq!(n.coordinator.applied(), 2);
+        assert_eq!(
+            n.coordinator.restart_pending().await,
+            ["globals.cluster.lease_renewal_interval"]
+        );
+        let tokens = renew.replace("cluster: {", "cluster: { tokens: 64,");
+        assert!(matches!(
+            n.coordinator.reload(&tokens, RestartFields::Accept).await,
+            Err(ReloadError::Rejected(_))
+        ));
+        let started = start(&renew, Vars::default(), Racing::new()).await;
+        assert!(started.coordinator.restart_pending().await.is_empty());
+    }
+
+    /// A generation published elsewhere that changes a restart-only field is adopted: its other
+    /// changes apply, the field waits for the next start.
+    #[tokio::test(start_paused = true)]
+    async fn a_generation_with_a_restart_field_is_adopted_with_it_pending() {
+        let mut n = lone(&["p"]).await;
+        let text = config_text(&["p", "q"]).replace(
+            "cluster: { memberlist: { node_name: n1 } }",
+            "cluster: { lease_renewal_interval: 4s, memberlist: { node_name: n1 } }",
+        );
+        assert_eq!(n.publish_elsewhere(&text).await, 2);
+        assert_eq!(kinds(&n.reload().await), ["add q"]);
+        assert_eq!(n.coordinator.applied(), 2);
+        assert_eq!(
+            n.coordinator.restart_pending().await,
+            ["globals.cluster.lease_renewal_interval"]
+        );
     }
 
     /// A reload while another node's newer generation isn't adopted yet: it is adopted first,
@@ -1074,7 +1197,7 @@ mod tests {
         n.publish_elsewhere(&config_text(&["p", "q"])).await;
         let out = n
             .coordinator
-            .reload(&config_text(&["p", "q", "r"]))
+            .reload(&config_text(&["p", "q", "r"]), RestartFields::Refuse)
             .await
             .unwrap();
         assert_eq!(out.generation, 3);
@@ -1108,10 +1231,16 @@ mod tests {
     async fn a_tables_change_restarts_only_when_the_set_changes() {
         let mut n = lone(&["p"]).await;
         let same = config_text(&["p"]).replace("[public.*]", "[public.a, public.b]");
-        n.coordinator.reload(&same).await.unwrap();
+        n.coordinator
+            .reload(&same, RestartFields::Refuse)
+            .await
+            .unwrap();
         assert_eq!(kinds(&n.reload().await), ["reconfigure p"]);
         let fewer = config_text(&["p"]).replace("[public.*]", "[public.a]");
-        n.coordinator.reload(&fewer).await.unwrap();
+        n.coordinator
+            .reload(&fewer, RestartFields::Refuse)
+            .await
+            .unwrap();
         assert_eq!(kinds(&n.reload().await), ["restart p"]);
     }
 
@@ -1126,7 +1255,7 @@ mod tests {
         assert!(n.reloads.try_recv().is_err(), "nothing applied");
         for text in [config_text(&["p", "r"]), "pipelines: [".to_owned()] {
             assert!(matches!(
-                n.coordinator.reload(&text).await,
+                n.coordinator.reload(&text, RestartFields::Refuse).await,
                 Err(ReloadError::Stopped)
             ));
         }
@@ -1147,14 +1276,15 @@ mod tests {
         racing.arm(&config_text(&["p", "q"]));
         let out = n
             .coordinator
-            .reload(&config_text(&["p", "q", "r"]))
+            .reload(&config_text(&["p", "q", "r"]), RestartFields::Refuse)
             .await
             .unwrap();
         assert_eq!(
             out,
             Reloaded {
                 generation: 3,
-                published: true
+                published: true,
+                restart_pending: vec![],
             }
         );
         assert_eq!(kinds(&n.reload().await), ["add q"]);
@@ -1175,18 +1305,26 @@ mod tests {
         vars.set("P_PASSWORD", "one");
         let mut n = start(&text, vars, Racing::new()).await;
         assert_eq!(
-            n.coordinator.reload(&text).await.unwrap(),
+            n.coordinator
+                .reload(&text, RestartFields::Refuse)
+                .await
+                .unwrap(),
             Reloaded {
                 generation: 1,
-                published: false
+                published: false,
+                restart_pending: vec![],
             }
         );
         n.vars.set("P_PASSWORD", "two");
         assert_eq!(
-            n.coordinator.reload(&text).await.unwrap(),
+            n.coordinator
+                .reload(&text, RestartFields::Refuse)
+                .await
+                .unwrap(),
             Reloaded {
                 generation: 2,
-                published: true
+                published: true,
+                restart_pending: vec![],
             }
         );
         assert_eq!(kinds(&n.reload().await), ["restart p"]);

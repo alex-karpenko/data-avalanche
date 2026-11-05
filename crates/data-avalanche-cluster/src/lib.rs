@@ -28,7 +28,7 @@ pub use controller::{
 };
 pub use coordinator::{
     Checked, ConfigCoordinator, CoordinatorDeps, DocsFn, PUBLISH_ATTEMPTS, ReloadError, Reloaded,
-    removed_pipelines,
+    RestartFields, removed_pipelines,
 };
 pub use discovery::{Seeds, advertise, discover, interfaces};
 pub use error::ClusterError;

@@ -54,7 +54,10 @@ async fn a_reload_publishes_the_file_and_a_restart_keeps_the_generation() {
     let (code, v) = p.reload().await;
     assert_eq!(
         (code, &v),
-        (202, &serde_json::json!({ "generation": 2 })),
+        (
+            202,
+            &serde_json::json!({ "generation": 2, "restart_pending": [] })
+        ),
         "{v}"
     );
     let (code, v) = p.reload().await;
@@ -62,7 +65,7 @@ async fn a_reload_publishes_the_file_and_a_restart_keeps_the_generation() {
         (code, &v),
         (
             200,
-            &serde_json::json!({ "generation": 2, "unchanged": true })
+            &serde_json::json!({ "generation": 2, "unchanged": true, "restart_pending": [] })
         ),
         "the file is the generation already"
     );
@@ -105,7 +108,10 @@ async fn a_reload_publishes_the_file_and_a_restart_keeps_the_generation() {
     let (code, v) = p.reload().await;
     assert_eq!(
         (code, &v),
-        (202, &serde_json::json!({ "generation": 3 })),
+        (
+            202,
+            &serde_json::json!({ "generation": 3, "restart_pending": [] })
+        ),
         "{v}"
     );
     p.metric("data_avalanche_config_generation 3").await;

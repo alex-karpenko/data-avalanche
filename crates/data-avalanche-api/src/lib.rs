@@ -132,14 +132,18 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
                 "POST",
                 "/v1/config/reload",
                 Operator,
-                "Publish the node's file as the next config generation",
+                "Publish the node's file as the next config generation; `?restart=accept` publishes a restart-only field, applied at each node's next start",
                 &[
                     (200, "the file is the generation the cluster runs"),
-                    (202, "published: the generation"),
+                    (
+                        202,
+                        "published: the generation, and this node's fields pending a restart",
+                    ),
+                    (400, "a query other than restart=accept"),
                     (409, "other nodes published first, every time"),
                     (
                         422,
-                        "invalid, or it changes a restart-only field: the report",
+                        "invalid, or it changes a restart-only field without restart=accept, or a field the cluster keeps for good: the report",
                     ),
                 ],
             ),

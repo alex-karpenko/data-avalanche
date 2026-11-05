@@ -50,6 +50,21 @@ pub struct ConfigDiff {
     pub report: Report,
 }
 
+/// Restart-only fields no restart changes in a running cluster (DA-OPS-12): where its state lives
+/// and how it is reached (the cloud, the state's location, Azure's storage account), which each
+/// node reads from its own file before it adopts a generation, and the values the cluster anchor
+/// pins (`tokens`, `lease_duration`, `lock_backend`). A reload never publishes a change to one,
+/// even one that accepts restart-only changes.
+pub const FIXED_FIELDS: &[&str] = &[
+    "config_version",
+    "globals.state",
+    "globals.cloud",
+    "globals.azure",
+    "globals.cluster.tokens",
+    "globals.cluster.lease_duration",
+    "globals.cluster.lock_backend",
+];
+
 impl ConfigDiff {
     pub fn is_empty(&self) -> bool {
         self.globals.is_empty() && self.pipelines.is_empty()
@@ -59,6 +74,23 @@ impl ConfigDiff {
     pub fn is_rejected(&self) -> bool {
         !self.report.is_ok()
     }
+
+    /// The changed fields of [`FIXED_FIELDS`].
+    pub fn fixed(&self) -> Vec<&str> {
+        self.globals
+            .iter()
+            .map(|f| f.path.as_str())
+            .filter(|path| is_fixed(path))
+            .collect()
+    }
+}
+
+/// `path` (dotted) is one of [`FIXED_FIELDS`], or inside one.
+fn is_fixed(path: &str) -> bool {
+    FIXED_FIELDS.iter().any(|fixed| {
+        path.strip_prefix(fixed)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+    })
 }
 
 /// Flattens a serialized value into `path → leaf`. Objects (structs and maps) recurse; arrays are
@@ -177,9 +209,15 @@ pub fn diff_with(
                 rule: "V-061".into(),
                 severity: Severity::Error,
                 loc: None,
-                message: format!(
-                    "{text} changed: it needs a process restart, so the reload is rejected"
-                ),
+                message: if is_fixed(&text) {
+                    format!(
+                        "{text} changed: the cluster keeps it for good, so the reload is rejected; a new value needs a new globals.state, with every node stopped"
+                    )
+                } else {
+                    format!(
+                        "{text} changed: it needs a process restart, so the reload is rejected; reload with ?restart=accept to publish it, and each node applies it at its next start"
+                    )
+                },
             });
         }
         out.globals.push(FieldChange { path: text, class });

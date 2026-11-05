@@ -482,7 +482,10 @@ async fn a_reload_reaches_every_node() {
     let (code, v) = c.nodes[1].proc.as_ref().unwrap().reload().await;
     assert_eq!(
         (code, &v),
-        (202, &serde_json::json!({ "generation": 2 })),
+        (
+            202,
+            &serde_json::json!({ "generation": 2, "restart_pending": [] })
+        ),
         "{v}"
     );
 

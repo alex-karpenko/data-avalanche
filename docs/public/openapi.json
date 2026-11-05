@@ -152,7 +152,7 @@
         "tags": [
           "config"
         ],
-        "summary": "Publish the node's file as the next config generation",
+        "summary": "Publish the node's file as the next config generation; `?restart=accept` publishes a restart-only field, applied at each node's next start",
         "responses": {
           "200": {
             "description": "the file is the generation the cluster runs",
@@ -161,7 +161,13 @@
             }
           },
           "202": {
-            "description": "published: the generation",
+            "description": "published: the generation, and this node's fields pending a restart",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "400": {
+            "description": "a query other than restart=accept",
             "content": {
               "application/json": {}
             }
@@ -185,7 +191,7 @@
             }
           },
           "422": {
-            "description": "invalid, or it changes a restart-only field: the report",
+            "description": "invalid, or it changes a restart-only field without restart=accept, or a field the cluster keeps for good: the report",
             "content": {
               "application/json": {}
             }
