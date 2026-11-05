@@ -360,28 +360,69 @@ struct Pending {
     read: Option<SourcePosition>,
 }
 
-/// The kept lag's start after a worker's status `st`. A worker that has shown a change pending
-/// (`shown`) is the lag from then on. Before that, a worker that follows an earlier one is
-/// re-reading from the checkpoint, and the start the earlier one left stays: its changes still
-/// count until this one has read as far again with nothing pending (its stream's frontier at or
-/// past the kept one). A change it reads again first makes it the lag's source instead.
-fn carry(pending: &mut Option<Pending>, shown: &mut bool, st: &WorkerStatus) {
-    *shown |= st.unsynced_since_micros.is_some();
-    if *shown {
-        *pending = st.unsynced_since_micros.map(|since| Pending {
+/// The lag's start over one lease term (DA-OBS-8): the oldest change still pending, of the
+/// session running now (`own`) and of the sessions before it (`kept`: earlier workers', and this
+/// worker's before a source reconnect). A session re-reads from the checkpoint, so what an
+/// earlier one left counts until this one's stream has read as far again (its frontier at or
+/// past the kept one), even when it makes its own first changes durable before that.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Lag {
+    kept: Option<Pending>,
+    own: Option<Pending>,
+}
+
+impl Lag {
+    /// The oldest pending change's commit time.
+    fn since(&self) -> Option<i64> {
+        [&self.kept, &self.own]
+            .into_iter()
+            .flatten()
+            .map(|p| p.since)
+            .min()
+    }
+
+    /// A session ended (its worker, or its stream at a reconnect): what it had pending is kept,
+    /// with the older start and the further frontier of the two.
+    fn roll(&mut self) {
+        self.kept = match (self.kept.take(), self.own.take()) {
+            (Some(k), Some(o)) => {
+                let read = match (&o.read, &k.read) {
+                    (Some(or), Some(kr)) if or.covers(kr).unwrap_or(false) => o.read.clone(),
+                    (Some(_), None) => o.read.clone(),
+                    _ => k.read.clone(),
+                };
+                Some(Pending {
+                    since: k.since.min(o.since),
+                    read,
+                })
+            }
+            (k, o) => k.or(o),
+        };
+    }
+
+    /// Takes a worker's status `st`; `session` is the reconnect count of the session this
+    /// worker's lag last saw, `None` before its first status.
+    fn carry(&mut self, session: &mut Option<u64>, st: &WorkerStatus) {
+        if session.is_none_or(|n| st.reconnects > n) {
+            self.roll();
+        }
+        *session = Some(st.reconnects);
+        self.own = st.unsynced_since_micros.map(|since| Pending {
             since,
             read: st.read.clone().or_else(|| st.checkpoint.clone()),
         });
-        return;
-    }
-    let caught_up = pending.as_ref().is_some_and(|p| match (&st.read, &p.read) {
-        // Positions that don't compare (another source kind) say the kept changes are gone.
-        (Some(read), Some(kept)) => read.covers(kept).unwrap_or(true),
-        (Some(_), None) => true,
-        (None, _) => false,
-    });
-    if caught_up {
-        *pending = None;
+        let caught_up = self
+            .kept
+            .as_ref()
+            .is_some_and(|p| match (&st.read, &p.read) {
+                // Positions that don't compare (another source kind) say the kept changes are gone.
+                (Some(read), Some(kept)) => read.covers(kept).unwrap_or(true),
+                (Some(_), None) => true,
+                (None, _) => false,
+            });
+        if caught_up {
+            self.kept = None;
+        }
     }
 }
 
@@ -405,8 +446,9 @@ struct Running {
     logged: HashSet<String>,
     /// The worker's reconnects already logged.
     reconnects: u64,
-    /// It has shown a change pending: its status is the lag's start from then on ([`carry`]).
-    lag_shown: bool,
+    /// The reconnect count of the session the lag last saw ([`Lag::carry`]); `None` before
+    /// this worker's first status.
+    lag_session: Option<u64>,
 }
 
 /// A worker never outlives its controller: a controller that panics drops its `Running`, and
@@ -709,7 +751,7 @@ impl PipelineController {
         let mut failures: u32 = 0;
         // The lag's start across this term's workers: what one read and didn't make durable still
         // counts while none runs and while the next one reads it again (I2).
-        let mut pending: Option<Pending> = None;
+        let mut pending = Lag::default();
         // One lease term: a stale reader is ended at most once in it, by whichever of its
         // workers meets it first, a stop and a resume included (DA-SRC-28).
         let reader_ended = Arc::new(AtomicBool::new(false));
@@ -948,7 +990,7 @@ impl PipelineController {
                         // No worker runs (a restart's backoff, ERROR): the lag grows on.
                         None => self
                             .metrics
-                            .replication_lag(lag(pending.as_ref().map(|p| p.since), now_micros())),
+                            .replication_lag(lag(pending.since(), now_micros())),
                     }
                     self.report(&mut reported).await;
                     let asked = self.asked(&mut seen).await;
@@ -1015,7 +1057,7 @@ impl PipelineController {
 
     /// Discard and replay (config §12.4): what the worker read past the durable checkpoint is
     /// read again by the next one. False when no worker runs.
-    async fn discard(&self, worker: &mut Option<Running>, pending: &mut Option<Pending>) -> bool {
+    async fn discard(&self, worker: &mut Option<Running>, pending: &mut Lag) -> bool {
         let Some(mut w) = worker.take() else {
             return false;
         };
@@ -1116,7 +1158,7 @@ impl PipelineController {
             paused: false,
             logged: HashSet::new(),
             reconnects: 0,
-            lag_shown: false,
+            lag_session: None,
         })
     }
 
@@ -1124,7 +1166,7 @@ impl PipelineController {
     /// off (what it read past the durable checkpoint is read again by the next run). True when
     /// it ended on its own; either way the worker has ended when this returns. A cut-off
     /// worker's writer is aborted with it, not waited for.
-    async fn drain(&self, mut w: Running, pending: &mut Option<Pending>) -> bool {
+    async fn drain(&self, mut w: Running, pending: &mut Lag) -> bool {
         let ended = tokio::time::timeout(self.settings.drain_timeout, async {
             let _ = w.handle.control.send(Command::Drain).await;
             (&mut w.task).await
@@ -1162,7 +1204,7 @@ impl PipelineController {
     /// Drains the worker and releases the lease; a worker cut off leaves it to expire.
     async fn let_go(&self, run: LeaseRun, worker: Option<Running>) {
         let drained = match worker {
-            Some(w) => self.drain(w, &mut None).await,
+            Some(w) => self.drain(w, &mut Lag::default()).await,
             None => true,
         };
         if drained {
@@ -1186,7 +1228,7 @@ impl PipelineController {
     /// once the lease is let go of ([`Self::remove_orphan`]).
     async fn remove(&self, run: LeaseRun, worker: Option<Running>) -> bool {
         let drained = match worker {
-            Some(w) => self.drain(w, &mut None).await,
+            Some(w) => self.drain(w, &mut Lag::default()).await,
             None => true,
         };
         let done = if !drained {
@@ -1331,7 +1373,7 @@ impl PipelineController {
     }
 
     /// The worker's status into the metrics, and its new warnings and reconnects into the log.
-    fn observe(&self, w: &mut Running, pending: &mut Option<Pending>) {
+    fn observe(&self, w: &mut Running, pending: &mut Lag) {
         let st = w.handle.status.borrow().clone();
         for warning in &st.warnings {
             if w.logged.insert(warning.clone()) {
@@ -1347,8 +1389,8 @@ impl PipelineController {
         let m = &self.metrics;
         m.wal_lag_bytes(st.retained_bytes);
         m.binlog_lag(st.source_behind);
-        carry(pending, &mut w.lag_shown, &st);
-        m.replication_lag(lag(pending.as_ref().map(|p| p.since), now_micros()));
+        pending.carry(&mut w.lag_session, &st);
+        m.replication_lag(lag(pending.since(), now_micros()));
         m.transaction_buffer_bytes(st.buffer_bytes);
         m.soft_dropped_columns(st.soft_dropped.values().sum());
         m.halted_tables(st.halted.len());
@@ -1541,46 +1583,59 @@ mod tests {
         );
     }
 
-    /// A worker that follows one which left a change pending keeps its start until its stream has
-    /// read as far with nothing pending; one that has shown a change pending is the lag itself.
+    /// A session that follows one which left a change pending keeps that start until its stream
+    /// has read as far, even once its own first re-read change is durable (DA-OBS-8); a source
+    /// reconnect starts a new session as a new worker does.
     #[test]
-    fn the_kept_lag_start_waits_for_the_next_worker_to_read_as_far() {
+    fn the_kept_lag_start_waits_for_the_next_session_to_read_as_far() {
         let at = |lsn| Some(SourcePosition::Pg(data_avalanche_core::position::Lsn(lsn)));
-        let kept = Some(Pending {
-            since: 1,
-            read: at(100),
-        });
-        let status = |read, unsynced| WorkerStatus {
+        let status = |read, unsynced, reconnects| WorkerStatus {
             read,
             checkpoint: at(40),
             unsynced_since_micros: unsynced,
+            reconnects,
             ..WorkerStatus::default()
         };
-        let (mut pending, mut shown) = (kept.clone(), false);
+        // The first worker reads to 100 with a change of time 1 pending, then ends.
+        let mut lag = Lag::default();
+        let mut session = None;
+        lag.carry(&mut session, &status(at(100), Some(1), 0));
+        assert_eq!(lag.since(), Some(1));
+
+        // The next worker: nothing read yet, then short of 100: the kept start holds.
+        let mut session = None;
         for (read, what) in [(None, "nothing read yet"), (at(60), "short of it")] {
-            carry(&mut pending, &mut shown, &status(read, None));
-            assert_eq!(pending, kept, "{what}");
+            lag.carry(&mut session, &status(read, None, 0));
+            assert_eq!(lag.since(), Some(1), "{what}");
         }
-        carry(&mut pending, &mut shown, &status(at(100), None));
-        assert_eq!(pending, None, "read as far, nothing pending");
-
-        let (mut pending, mut shown) = (kept.clone(), false);
-        carry(&mut pending, &mut shown, &status(at(60), Some(7)));
+        // It re-reads the change, makes it durable before reading on: still pending at 100.
+        lag.carry(&mut session, &status(at(60), Some(1), 0));
+        lag.carry(&mut session, &status(at(60), None, 0));
         assert_eq!(
-            pending,
-            Some(Pending {
-                since: 7,
-                read: at(60)
-            }),
-            "read again: the worker's own"
+            lag.since(),
+            Some(1),
+            "its first change durable, not yet at 100"
         );
-        carry(&mut pending, &mut shown, &status(at(60), None));
-        assert_eq!(pending, None, "then durable: the worker says so");
+        lag.carry(&mut session, &status(at(100), None, 0));
+        assert_eq!(lag.since(), None, "read as far, nothing pending");
 
-        let (mut pending, mut shown) = (None, false);
-        carry(&mut pending, &mut shown, &status(None, Some(9)));
+        // A reconnect inside one worker: the new session starts with nothing pending.
+        lag.carry(&mut session, &status(at(150), Some(5), 0));
+        lag.carry(&mut session, &status(at(120), None, 1));
         assert_eq!(
-            pending.unwrap().read,
+            lag.since(),
+            Some(5),
+            "the reconnected session hasn't read to 150"
+        );
+        lag.carry(&mut session, &status(at(140), Some(6), 1));
+        assert_eq!(lag.since(), Some(5), "the older of the two");
+        lag.carry(&mut session, &status(at(160), None, 1));
+        assert_eq!(lag.since(), None);
+
+        let mut lag = Lag::default();
+        lag.carry(&mut None, &status(None, Some(9), 0));
+        assert_eq!(
+            lag.own.unwrap().read,
             at(40),
             "before a frontier, the checkpoint"
         );

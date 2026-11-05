@@ -89,6 +89,8 @@ pub struct Options<'a> {
     pub api: &'a str,
     /// More `globals` keys, one YAML line, e.g. `tracing: { otlp_endpoint: … }`.
     pub globals: &'a str,
+    /// `globals.log`, a YAML flow map; `{ level: info, format: compact }` when empty.
+    pub log: &'a str,
 }
 
 /// The rows [`E2e::insert_series`] gives a key `g`.
@@ -279,7 +281,7 @@ globals:
   cloud: aws
   state: {{ bucket: {bucket}, prefix: {prefix}/globals }}
   api: {{ address: "127.0.0.1:${{E2E_API_PORT}}"{api} }}
-  log: {{ level: info, format: compact }}
+  log: {log}
   cluster:
     lease_duration: 6s
     lease_renewal_interval: 2s
@@ -306,6 +308,11 @@ pipelines:
             memberlist = o.memberlist,
             api = o.api,
             globals = o.globals,
+            log = if o.log.is_empty() {
+                "{ level: info, format: compact }"
+            } else {
+                o.log
+            },
         )
     }
 

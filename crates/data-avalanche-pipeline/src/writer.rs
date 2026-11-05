@@ -190,6 +190,8 @@ impl Writer {
         self.hook(HookPoint::CheckpointPersisted {
             position: job.checkpoint.clone(),
         })?;
+        // Inside the flush's span: a JSON line carries its trace (DA-OBS-9).
+        tracing::debug!(rows, checkpoint = %job.checkpoint, "flush durable");
         // A refused table's progress isn't in the sink: its document stays as it was. The table
         // is in `rejected` already when this job's change set was the one refused.
         for doc in &job.snapshots {
