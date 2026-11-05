@@ -51,13 +51,17 @@ fn table_name(p: &Pipeline, t: &TableRef) -> String {
 #[serde(deny_unknown_fields)]
 struct Asked {
     tables: Vec<String>,
+    /// Empty each table's sink table before its copy (DA-SNAP-15).
+    #[serde(default)]
+    truncate: bool,
 }
 
 /// The body's tables, each once, in its order: named as the source's per-table config keys,
-/// no globs.
-fn tables(p: &Pipeline, text: &str) -> Result<Vec<TableRef>, String> {
-    let asked: Asked = serde_json::from_str(text)
-        .map_err(|e| format!("the body is {{\"tables\": [\"<table>\", ...]}}: {e}"))?;
+/// no globs; and whether the job empties them first.
+fn tables(p: &Pipeline, text: &str) -> Result<(Vec<TableRef>, bool), String> {
+    let asked: Asked = serde_json::from_str(text).map_err(|e| {
+        format!("the body is {{\"tables\": [\"<table>\", ...], \"truncate\": false}}: {e}")
+    })?;
     if asked.tables.is_empty() {
         return Err("the body names no table".into());
     }
@@ -85,7 +89,7 @@ fn tables(p: &Pipeline, text: &str) -> Result<Vec<TableRef>, String> {
             out.push(table);
         }
     }
-    Ok(out)
+    Ok((out, asked.truncate))
 }
 
 fn job_json(p: &Pipeline, j: &SnapshotJobDoc) -> Value {
@@ -115,6 +119,7 @@ fn job_json(p: &Pipeline, j: &SnapshotJobDoc) -> Value {
         "requested_by": j.requested_by,
         "finished_at": j.finished_at,
         "error": j.error,
+        "truncate": j.truncate,
     })
 }
 
@@ -133,8 +138,8 @@ pub(crate) async fn ask(
         Ok(found) => found,
         Err(f) => return f.into(),
     };
-    let tables = match tables(&p, &text) {
-        Ok(tables) => tables,
+    let (tables, truncate) = match tables(&p, &text) {
+        Ok(asked) => asked,
         Err(why) => return Failure::new(StatusCode::UNPROCESSABLE_ENTITY, why).into(),
     };
     let r = match read(node, &p, &docs).await {
@@ -179,7 +184,8 @@ pub(crate) async fn ask(
             ));
         }
     }
-    let job = SnapshotJobDoc::new(new_job_id(&p.id), tables, by.name.clone(), Utc::now());
+    let mut job = SnapshotJobDoc::new(new_job_id(&p.id), tables, by.name.clone(), Utc::now());
+    job.truncate = truncate;
     if let Err(e) = docs.create_snapshot_job(&job).await {
         return unavailable(&e);
     }
@@ -196,7 +202,7 @@ pub(crate) async fn ask(
             }),
         );
     }
-    tracing::info!(pipeline = %p.name, by = %by.name, job = %job.job_id, tables = job.tables.len(), "snapshot job asked through the API");
+    tracing::info!(pipeline = %p.name, by = %by.name, job = %job.job_id, tables = job.tables.len(), truncate, "snapshot job asked through the API");
     let v = job_json(&p, &job);
     body(
         StatusCode::ACCEPTED,
@@ -204,6 +210,7 @@ pub(crate) async fn ask(
             "job_id": v["job_id"],
             "status": v["status"],
             "tables": v["tables"].as_array().into_iter().flatten().map(|t| t["table"].clone()).collect::<Vec<_>>(),
+            "truncate": truncate,
         }),
     )
 }
@@ -342,6 +349,8 @@ mod tests {
             ]
         );
         assert_eq!(docs.requests().await.unwrap().restart.unwrap().id, id);
+        assert!(!job.truncate, "a job keeps the rows unless asked");
+        assert_eq!(v["truncate"], false);
 
         let (code, one) = json_of(addr, "GET", &format!("/v1/snapshots/{id}")).await;
         assert_eq!(code, 200, "{one}");
@@ -409,6 +418,20 @@ mod tests {
         assert_eq!(code, 202, "{v}");
     }
 
+    /// DA-SNAP-15: `truncate: true` is recorded with the job and shown with it.
+    #[tokio::test]
+    async fn a_job_asked_with_truncate_records_it() {
+        let (addr, lone, docs, _dir) = served().await;
+        held(&lone).await;
+        let (code, v) = ask(addr, r#"{"tables": ["public.orders"], "truncate": true}"#).await;
+        assert_eq!(code, 202, "{v}");
+        assert_eq!(v["truncate"], true);
+        let id = v["job_id"].as_str().unwrap();
+        assert!(docs.snapshot_job(id).await.unwrap().unwrap().doc.truncate);
+        let (_, one) = json_of(addr, "GET", &format!("/v1/snapshots/{id}")).await;
+        assert_eq!(one["truncate"], true, "{one}");
+    }
+
     /// The body names tables, each exactly (System-Overview: "tables list, no globs"), as the
     /// source's per-table config keys do: PostgreSQL `schema.table`.
     #[tokio::test]
@@ -422,7 +445,8 @@ mod tests {
             r#"{"tables": []}"#,
             r#"{"tables": ["public.*"]}"#,
             r#"{"tables": ["orders"]}"#,
-            r#"{"tables": ["public.orders"], "truncate": true}"#,
+            r#"{"tables": ["public.orders"], "truncate": "yes"}"#,
+            r#"{"tables": ["public.orders"], "drop": true}"#,
         ] {
             let (code, v) = ask(addr, body).await;
             assert_eq!(code, 422, "{body:?}: {v}");

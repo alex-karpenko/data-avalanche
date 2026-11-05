@@ -42,6 +42,17 @@ impl Jobs {
         self.tables(JobTableStatus::Running)
     }
 
+    /// The asked tables of the jobs that empty their sink tables first (DA-SNAP-15).
+    pub fn truncating(&self) -> BTreeSet<TableRef> {
+        self.jobs
+            .iter()
+            .filter(|j| j.truncate)
+            .flat_map(|j| &j.tables)
+            .filter(|t| t.status == JobTableStatus::Queued)
+            .map(|t| t.table.clone())
+            .collect()
+    }
+
     /// Records what this start did with the job tables: the asked ones `started` run, and the
     /// `failed` ones (asked, or running and gone) failed with their reason. An asked table
     /// neither started nor failed stays queued.
@@ -123,6 +134,17 @@ mod tests {
         w.docs.create_snapshot_job(&doc).await.unwrap();
     }
 
+    async fn ask_truncating(w: &World, id: &str, tables: &[&str]) {
+        let doc = SnapshotJobDoc::new(
+            id.into(),
+            tables.iter().map(|n| t(n)).collect(),
+            "ops".into(),
+            Utc::now(),
+        )
+        .truncating();
+        w.docs.create_snapshot_job(&doc).await.unwrap();
+    }
+
     async fn job(w: &World, id: &str) -> SnapshotJobDoc {
         w.docs.snapshot_job(id).await.unwrap().unwrap().doc
     }
@@ -198,6 +220,59 @@ mod tests {
         assert_eq!(j.status, JobStatus::Running);
         assert_eq!(j.tables[0].status, JobTableStatus::Running);
         assert!(st.warnings.is_empty(), "{:?}", st.warnings);
+    }
+
+    /// DA-SNAP-15: a job asked with `truncate` empties its tables' sink tables before their
+    /// first chunk, so a row deleted at the source while the pipeline didn't stream it goes, in
+    /// a streamed table and in a copy alike. The other tables keep their rows, and a later start
+    /// doesn't empty the table again: the job's copy has begun.
+    #[tokio::test]
+    async fn a_truncating_job_drops_the_rows_deleted_meanwhile() {
+        let w = World::new(&["a", "b", "x"]);
+        w.source.outside_config(&t("x"));
+        established(&w).await;
+        w.source.commit(
+            FakeTxn::new()
+                .insert(&t("a"), row(1, "x"))
+                .insert(&t("a"), row(2, "x"))
+                .insert(&t("a"), row(3, "x"))
+                .insert(&t("b"), row(9, "x")),
+        );
+        w.source.load(&t("x"), rows(1..=3));
+        ask(&w, "p~0", &["x"]).await;
+        let (end, _) = run(&w, &never(10), async |status| {
+            wait_until("x is copied", || w.ids("x") == [1, 2, 3]).await;
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!(w.ids("a"), [1, 2, 3]);
+        w.source.forget(&t("a"), &row(2, "x"));
+        w.source.forget(&t("x"), &row(3, "x"));
+        ask_truncating(&w, "p~1", &["a", "x"]).await;
+        let (end, _) = run(&w, &never(10), async |status| {
+            wait_until("the copies land", || {
+                w.ids("a") == [1, 3] && w.ids("x") == [1, 2]
+            })
+            .await;
+            streamed(&status, &w).await;
+            wait_until("the copies are done", || {
+                status.borrow().snapshots.is_empty()
+            })
+            .await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!(w.ids("b"), [9], "only the job's tables");
+        assert_eq!(
+            job(&w, "p~1").await.tables[0].status,
+            JobTableStatus::Running
+        );
+        w.source.forget(&t("a"), &row(3, "x"));
+        w.source.commit(FakeTxn::new().insert(&t("a"), row(4, "x")));
+        let (end, _) = run(&w, &never(10), async |status| streamed(&status, &w).await).await;
+        end.unwrap();
+        assert_eq!(w.ids("a"), [1, 3, 4], "not emptied again");
     }
 
     fn noted(id: i64, note: Option<&str>) -> Row {

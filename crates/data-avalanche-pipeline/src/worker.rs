@@ -342,25 +342,39 @@ where
     }
 }
 
-/// Moves the table's marker onto `at`, the new server's position (DA-SRC-20): an empty change set
-/// that replaces the marker instead of joining it. A table the lake doesn't hold, or holds no
-/// marker for, has nothing to move.
-async fn reposition(
+/// A change set that carries no rows, committed at Phase 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Empty {
+    /// Moves the table's marker onto `at`, the new server's position (DA-SRC-20): the marker is
+    /// replaced instead of joined. A table the lake holds no marker for has nothing to move.
+    Reposition,
+    /// Empties the sink table before a job's copy (DA-SNAP-15): a metadata-only delete, fenced,
+    /// the marker joined with `at` as any commit's.
+    Truncate,
+}
+
+/// Commits an [`Empty`] change set to `schema`'s sink table at `at`. A table the lake doesn't
+/// hold has nothing to commit.
+async fn commit_empty(
     core: &Core,
     tuning: &Tuning,
     schema: &TableSchema,
     at: &SourcePosition,
+    kind: Empty,
 ) -> Result<(), WorkerError> {
     let table = schema.table();
     let state = sink_retry(tuning, || core.may_write(), || core.sink.table_state(table)).await?;
-    let (true, Some(_), Some(columns)) = (state.exists, state.marker, state.schema) else {
+    let (true, Some(columns)) = (state.exists, state.schema) else {
         return Ok(());
     };
+    if kind == Empty::Reposition && state.marker.is_none() {
+        return Ok(());
+    }
     let cs = TableChangeSet {
         table: table.clone(),
         schema: columns,
         identifier: schema.identifier().to_vec(),
-        truncate: false,
+        truncate: kind == Empty::Truncate,
         upserts: vec![],
         deletes: vec![],
         position: PositionRange {
@@ -369,8 +383,9 @@ async fn reposition(
             last_change: at.clone(),
         },
         split: None,
-        snapshot: false,
-        reposition: true,
+        // A truncate is never skipped as covered: the job asked for it now.
+        snapshot: kind == Empty::Truncate,
+        reposition: kind == Empty::Reposition,
     };
     let marker = CommitMarker {
         owner_epoch: core.owner_epoch,
@@ -388,8 +403,8 @@ async fn reposition(
             table: table.clone(),
             current_epoch,
         }),
-        // A reposition is never skipped as covered (`covers` never skips one): the arm is
-        // unreachable, and harmless.
+        // Neither is ever skipped as covered (`covers` skips neither a reposition nor a
+        // snapshot's set): the arm is unreachable, and harmless.
         CommitOutcome::Committed { .. } | CommitOutcome::SkippedCovered => Ok(()),
     }
 }
@@ -915,6 +930,15 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
             .filter(|(t, _)| asked.contains(t))
             .map(|(t, reason)| (t.clone(), format!("{}: {reason}", reason.code()))),
     );
+    // A truncating job empties each table it starts before the table's first chunk. Repeated
+    // only while the job still has the table queued, before any chunk is read: once recorded
+    // running below, a later start resumes the copy instead (DA-SNAP-15).
+    let truncating = jobs.truncating();
+    for table in started.iter().filter(|t| truncating.contains(*t)) {
+        if let Some(schema) = resolved_tables.get(table).or_else(|| copies.get(table)) {
+            commit_empty(core, &tuning, schema, &at, Empty::Truncate).await?;
+        }
+    }
     core.may_write()?;
     jobs.record(&core.docs, &started, &failed).await?;
     // A copy's halt goes once its job carries it: the pipeline doesn't replicate the table, and
@@ -938,7 +962,7 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
         let tables: BTreeSet<&TableRef> = resolved_tables.keys().chain(cached.keys()).collect();
         for table in tables {
             if let Some(schema) = cached.get(table).or_else(|| resolved_tables.get(table)) {
-                reposition(core, &tuning, schema, &at).await?;
+                commit_empty(core, &tuning, schema, &at, Empty::Reposition).await?;
             }
         }
     }

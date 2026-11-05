@@ -47,7 +47,8 @@ pub struct SplitInfo {
 /// - identifier values are never NULL;
 /// - the range doesn't run backwards, `last_change` is inside it, and a slice's range ends at its
 ///   `txn_start`;
-/// - a snapshot set only upserts: no deletes, no truncate, not a slice.
+/// - a snapshot set only upserts: no deletes, not a slice, and a truncate only without rows (a
+///   job's truncate, DA-SNAP-15).
 #[derive(Debug, Clone)]
 pub struct TableChangeSet {
     pub table: TableRef,
@@ -181,9 +182,13 @@ impl TableChangeSet {
                 )));
             }
         }
-        if self.snapshot && (self.truncate || self.split.is_some() || self.delete_rows() > 0) {
+        if self.snapshot
+            && (self.split.is_some()
+                || self.delete_rows() > 0
+                || (self.truncate && self.upsert_rows() > 0))
+        {
             return Err(err(
-                "a snapshot set carries upserts only: no deletes, truncate or slice".into(),
+                "a snapshot set carries upserts only: no deletes or slice, and a truncate only without rows".into(),
             ));
         }
         if let Some(split) = &self.split
@@ -366,6 +371,11 @@ mod tests {
     fn a_snapshot_set_only_upserts() {
         let mut c = cs(vec![upserts(&[1], None)], vec![]);
         c.snapshot = true;
+        c.validate().unwrap();
+        // A job's truncate (DA-SNAP-15): a snapshot set that empties the table, without rows.
+        let mut c = cs(vec![], vec![]);
+        c.snapshot = true;
+        c.truncate = true;
         c.validate().unwrap();
         let refused = |f: fn(&mut TableChangeSet)| {
             let mut c = cs(vec![upserts(&[1], None)], vec![]);

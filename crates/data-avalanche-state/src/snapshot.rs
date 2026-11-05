@@ -110,6 +110,9 @@ pub struct SnapshotJobDoc {
     pub finished_at: Option<DateTime<Utc>>,
     /// Which tables failed, once the job ended.
     pub error: Option<String>,
+    /// Each table's sink table is emptied before its first chunk (DA-SNAP-15, Q-M12-7).
+    #[serde(default)]
+    pub truncate: bool,
 }
 
 impl Document for SnapshotJobDoc {
@@ -141,7 +144,15 @@ impl SnapshotJobDoc {
             requested_by,
             finished_at: None,
             error: None,
+            truncate: false,
         }
+    }
+
+    /// The job empties each table's sink table before its first chunk.
+    #[must_use]
+    pub fn truncating(mut self) -> Self {
+        self.truncate = true;
+        self
     }
 
     /// Completed or failed: the job has ended, and [`Self::settle`] leaves it as it is.
@@ -607,9 +618,17 @@ mod tests {
   "requested_at": "2026-09-28T10:00:00Z",
   "requested_by": "ops",
   "finished_at": null,
-  "error": null
+  "error": null,
+  "truncate": false
 }"#
         );
+        // A job v0.1.0 wrote, without `truncate`, reads as one that keeps the rows.
+        let old = String::from_utf8(crate::doc::encode(&doc).to_vec())
+            .unwrap()
+            .replace(",\n  \"truncate\": false", "");
+        assert!(!old.contains("truncate"), "{old}");
+        let read: SnapshotJobDoc = crate::doc::decode("j", old.as_bytes()).unwrap();
+        assert!(!read.truncate);
     }
 
     /// A job is queued until a table starts, running while one is queued or running, then
