@@ -10222,3 +10222,14 @@ git commit -m "docs: the M12b changes — removing a pipeline, keys applied at t
   The exporter is now given each value with `%` as `%25`, which the decoding turns back: a value
   reaches the collector as written. Test `a_header_value_with_a_percent_reaches_the_collector_as_written`
   (fails without it: the header doesn't arrive). Tasks 13–16's blocks apply in order on `843ed14`.
+- **Task 13** (review fix, `0a8de54`): at a reconnect inside a worker, `worker.rs` raised
+  `reconnects` but left `read` and `unsynced_since_micros` holding the old session's values until
+  the new session's first progress. `Lag::carry` then rolled the old frontier into `kept` and,
+  against that same stale `read`, released it at once: the lag read 0 while the discarded changes
+  were read again. The plan's unit test fed the reconnect a lower frontier, which the worker never
+  reports. A reconnect is now counted by `WorkerStatus::reconnect`, which clears `read` and
+  `unsynced_since_micros` in the same update (all three reconnect paths). Tests
+  `a_reconnect_clears_the_frontier_and_the_pending_start` (`worker.rs`; fails without the
+  clearing) and a second reconnect, as the worker reports it, in
+  `the_kept_lag_start_waits_for_the_next_session_to_read_as_far`. While a worker reconnects, its
+  status shows no frontier. Tasks 14–16's blocks apply in order on `0a8de54`.
