@@ -26,7 +26,8 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use crate::{
-    Advertiser, Members, PipelineReload, Reload, Reloader, RemovedPipelines, WorkerFactory,
+    Advertiser, Members, PipelineReload, Reload, Reloader, RemovedPipelines, ResolveError,
+    WorkerFactory,
 };
 
 /// A reload re-reads the generation and tries again this many times when another node publishes
@@ -470,21 +471,21 @@ pub fn removed_pipelines(
             let text = generations
                 .text(doc.generation, &doc.hash)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| ResolveError::Unread(e.to_string()))?;
             let config = load_str(&text, &*env, &key)
-                .map_err(|report| lines(&report))?
+                .map_err(|report| ResolveError::Invalid(lines(&report)))?
                 .config;
             let pipeline = config
                 .pipelines
                 .into_values()
                 .find(|p| p.id == doc.pipeline_id)
                 .ok_or_else(|| {
-                    format!(
+                    ResolveError::Invalid(format!(
                         "generation {} has no pipeline {}",
                         doc.generation, doc.pipeline_id
-                    )
+                    ))
                 })?;
-            let d = docs(&pipeline)?;
+            let d = docs(&pipeline).map_err(ResolveError::Invalid)?;
             Ok((pipeline, d))
         })
     }))
@@ -903,6 +904,9 @@ mod tests {
             ..t
         };
         let e = removed.resolve(wrong).await.unwrap_err();
+        let ResolveError::Invalid(e) = e else {
+            panic!("a generation without the pipeline is invalid, not unread: {e:?}");
+        };
         assert!(e.contains("has no pipeline nope"), "{e}");
     }
 

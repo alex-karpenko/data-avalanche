@@ -1307,6 +1307,39 @@ mod tests {
         r.shutdown().await;
     }
 
+    /// An `Add` for a pipeline that runs already (not a change a diff makes) restarts it with the
+    /// added config under the same lease: nothing is torn down.
+    #[tokio::test(start_paused = true)]
+    async fn an_add_for_a_running_pipeline_restarts_it() {
+        let store = ScriptedStore::new();
+        let (fs, d) = factories(&store, &["p"]);
+        let f = fs["p"].clone();
+        let started = pipelines(&["p"]);
+        let (mut p, docs) = started[0].clone();
+        let (_, view) = watch::channel(alone("n1"));
+        let r = ClusterReconciler::start(started, &d, view, reconciler_settings());
+        until(r.statuses().get_mut("p").unwrap(), "running", running).await;
+        let before = leases(&store).observe("p").await.unwrap().unwrap();
+        p.name = "renamed".into();
+        assert!(r.reloader().apply(Reload {
+            pipelines: vec![PipelineReload::Add(p, docs)],
+            cluster: cluster(),
+        }));
+        eventually("a new worker", || f.builds() >= 2).await;
+        assert_eq!(f.source.teardowns(), 0, "nothing torn down");
+        until(r.statuses().get_mut("p").unwrap(), "running again", running).await;
+        let lease = leases(&store).observe("p").await.unwrap().unwrap();
+        assert!(!lease.doc.released);
+        assert_eq!(
+            lease.doc.owner_epoch, before.doc.owner_epoch,
+            "the same lease"
+        );
+        assert_eq!(f.builds(), 2);
+        let text = d.metrics.encode();
+        assert!(text.contains(r#"pipeline="renamed""#), "{text}");
+        r.shutdown().await;
+    }
+
     /// A reload's in-place change reaches the running worker; a restart-only one runs a new
     /// worker.
     #[tokio::test(start_paused = true)]

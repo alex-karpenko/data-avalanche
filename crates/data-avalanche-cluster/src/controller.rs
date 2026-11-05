@@ -156,9 +156,21 @@ pub struct ControllerDeps {
     pub removed: RemovedPipelines,
 }
 
+/// Why a removal tombstone's pipeline didn't resolve ([`RemovedPipelines::resolve`]).
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum ResolveError {
+    /// Its generation's text couldn't be read: a storage failure, tried again later.
+    #[error("its generation is unread: {0}")]
+    Unread(String),
+    /// The generation doesn't give the pipeline here: it doesn't load in this node's
+    /// environment, has no such pipeline, or its state location doesn't build.
+    #[error("{0}")]
+    Invalid(String),
+}
+
 /// [`RemovedPipelines`]' answer: the pipeline and its state documents.
 pub type Resolved = std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<(Pipeline, PipelineDocs), String>> + Send>,
+    Box<dyn std::future::Future<Output = Result<(Pipeline, PipelineDocs), ResolveError>> + Send>,
 >;
 
 /// Resolves a removal tombstone's pipeline, with its state documents, from the generation that
@@ -175,8 +187,9 @@ impl Debug for RemovedPipelines {
 
 impl RemovedPipelines {
     /// # Errors
-    /// The generation's text is unread, or doesn't resolve here, or doesn't have the pipeline.
-    pub async fn resolve(&self, doc: RemovalDoc) -> Result<(Pipeline, PipelineDocs), String> {
+    /// [`ResolveError::Unread`] when the generation's text can't be read (tried again later);
+    /// [`ResolveError::Invalid`] when it doesn't resolve here, or doesn't have the pipeline.
+    pub async fn resolve(&self, doc: RemovalDoc) -> Result<(Pipeline, PipelineDocs), ResolveError> {
         (self.0)(doc).await
     }
 }
@@ -607,9 +620,10 @@ impl PipelineController {
         }
     }
 
-    /// The removals under way this pipeline follows, by id, each with why. A tombstone that
-    /// doesn't resolve here can't be compared, and isn't followed (logged); unread tombstones
-    /// are followed, as "unread".
+    /// The removals under way this pipeline follows, by id, each with why. A tombstone whose
+    /// generation is unread (a storage failure) is followed too, as "unread", and tried again at
+    /// the next read. A tombstone that doesn't resolve here (`Invalid`) can't be compared, and
+    /// isn't followed (logged).
     async fn followed(&self) -> BTreeMap<String, String> {
         let pending = match self.removals.all_pending().await {
             Ok(pending) => pending,
@@ -630,7 +644,10 @@ impl PipelineController {
                     held.insert(id, "takes its place".to_owned());
                 }
                 Ok(_) => {}
-                Err(e) => tracing::warn!(
+                Err(ResolveError::Unread(e)) => {
+                    held.insert(id, format!("unread: {e}"));
+                }
+                Err(ResolveError::Invalid(e)) => tracing::warn!(
                     pipeline = %self.pipeline.name,
                     removed = %id,
                     "a removal under way isn't compared with this pipeline: it doesn't resolve here: {e}"
@@ -2698,6 +2715,70 @@ mod tests {
             "{:?}",
             start.elapsed()
         );
+    }
+
+    /// A tombstone whose generation is unread (a storage failure) is waited for, not taken as
+    /// one that doesn't resolve: the first read fails, and the removal is still waited for at
+    /// the next read, until it is done.
+    #[tokio::test(start_paused = true)]
+    async fn a_removal_whose_generation_is_unread_is_waited_for() {
+        let store = ScriptedStore::new();
+        let f = TestFactory::new(&["a"]);
+        removals(&store).record(&tombstone("old")).await.unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let mut d = deps("n1", &store, &f);
+        d.removed = RemovedPipelines(Arc::new(move |_doc: data_avalanche_state::RemovalDoc| {
+            let first = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            Box::pin(async move {
+                if first {
+                    return Err(ResolveError::Unread("injected".into()));
+                }
+                // The removed pipeline shares this one's slot: it is waited for.
+                Ok((pipeline(), pipeline_docs()))
+            })
+        }));
+        let (c, mut status) = PipelineController::new(pipeline(), pipeline_docs(), &d);
+        let (_target, rx) = watch::channel(Target::Own);
+        let _task = tokio::spawn(c.run(rx));
+        until(&mut status, "standby", is(Actual::Standby { holder: None })).await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the tombstone is read again after the failed read"
+        );
+        assert!(leases(&store).observe("p").await.unwrap().is_none());
+        assert_eq!(f.builds(), 0);
+        removals(&store)
+            .done("old", chrono::Utc::now())
+            .await
+            .unwrap();
+        let start = Instant::now();
+        until(&mut status, "running", is(Actual::Running)).await;
+        assert!(
+            start.elapsed() <= Duration::from_secs(6),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    /// A tombstone list that fails is waited for too: the controller doesn't claim while it
+    /// fails, and claims once it reads again.
+    #[tokio::test(start_paused = true)]
+    async fn an_unread_tombstone_list_is_waited_for() {
+        let store = ScriptedStore::new();
+        let f = TestFactory::new(&["a"]);
+        store.fail_lists(usize::MAX);
+        let d = deps("n1", &store, &f);
+        let (c, mut status) = PipelineController::new(pipeline(), pipeline_docs(), &d);
+        let (_target, rx) = watch::channel(Target::Own);
+        let _task = tokio::spawn(c.run(rx));
+        until(&mut status, "standby", is(Actual::Standby { holder: None })).await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(leases(&store).observe("p").await.unwrap().is_none());
+        assert_eq!(f.builds(), 0);
+        store.fail_lists(0);
+        until(&mut status, "running", is(Actual::Running)).await;
     }
 
     /// A pipeline removed while it waits for a removal ends there, its lease never claimed.

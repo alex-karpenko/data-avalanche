@@ -62,6 +62,8 @@ struct Script {
     read_delay: Duration,
     /// The next reads that fail transiently.
     failed_reads: usize,
+    /// The next listings that fail transiently.
+    failed_lists: usize,
 }
 
 /// An in-memory store whose writes (`create`, `update`, `put`) fail as scripted.
@@ -96,6 +98,11 @@ impl ScriptedStore {
     /// The next `n` reads fail transiently.
     pub fn fail_reads(&self, n: usize) {
         self.lock().failed_reads = n;
+    }
+
+    /// The next `n` listings fail transiently.
+    pub fn fail_lists(&self, n: usize) {
+        self.lock().failed_lists = n;
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Script> {
@@ -172,6 +179,18 @@ impl VersionedStore for ScriptedStore {
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+        let fail = {
+            let mut s = self.lock();
+            let fail = s.failed_lists > 0;
+            s.failed_lists = s.failed_lists.saturating_sub(1);
+            fail
+        };
+        if fail {
+            return Err(StoreError::Transient {
+                key: prefix.to_owned(),
+                reason: "injected".into(),
+            });
+        }
         self.inner.list(prefix).await
     }
 }
@@ -217,7 +236,7 @@ pub(crate) fn removed() -> crate::RemovedPipelines {
     crate::RemovedPipelines(Arc::new(|doc: data_avalanche_state::RemovalDoc| {
         Box::pin(async move {
             if doc.pipeline_id == "unresolvable" {
-                return Err("no such variable".to_owned());
+                return Err(crate::ResolveError::Invalid("no such variable".to_owned()));
             }
             let p = config(&[&doc.pipeline_id])
                 .pipelines
