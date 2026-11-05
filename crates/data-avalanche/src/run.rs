@@ -12,13 +12,13 @@ use data_avalanche_cluster::{
     ClusterReconciler, ConfigCoordinator, ControllerDeps, ControllerSettings, CoordinatorDeps,
     DocsFn, Gossip, GossipKey, GossipSettings, LeaseTiming, NodeIdentity, NodeMeta, Phase,
     ReconcilerSettings, Seeds, Udp, advertise, discover, interfaces, join as join_gossip, leave,
-    node_identity,
+    node_identity, removed_pipelines,
 };
 use data_avalanche_config::{
     Diagnostic, FingerprintKey, ProcessEnv, Report, ResolvedConfig, Severity, load_str,
 };
 use data_avalanche_pipeline::{Backoff, Tuning};
-use data_avalanche_state::{ConfigGenerations, Leases};
+use data_avalanche_state::{ConfigGenerations, Leases, Removals};
 use data_avalanche_telemetry::Metrics;
 use thiserror::Error;
 use tokio::sync::{Semaphore, oneshot, watch};
@@ -150,8 +150,18 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     );
 
     let c = &config.globals.cluster;
+    let docs = Arc::clone(&buckets);
+    let docs: Arc<DocsFn> = Arc::new(move |p| docs.pipeline_docs(p).map_err(|e| e.to_string()));
+    let fingerprints = FingerprintKey::from_bytes(joined.fingerprint_key);
     let deps = ControllerDeps {
         leases: Leases::new(joined.globals.clone()),
+        removals: Removals::new(joined.globals.clone()),
+        removed: removed_pipelines(
+            ConfigGenerations::new(joined.globals.clone()),
+            Arc::new(ProcessEnv),
+            fingerprints,
+            Arc::clone(&docs),
+        ),
         holder,
         factory: Arc::new(Factory::new(&config.globals).map_err(Fatal::Config)?),
         metrics: metrics.clone(),
@@ -207,16 +217,15 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         ReconcilerSettings::new(c),
     );
     // Each newer config generation, this node's reloads included (Clustering §9).
-    let docs = Arc::clone(&buckets);
-    let docs: Arc<DocsFn> = Arc::new(move |p| docs.pipeline_docs(p).map_err(|e| e.to_string()));
     let (log, reloaded_auth) = (Arc::clone(&logger), Arc::clone(&auth));
     let coordinator = Arc::new(ConfigCoordinator::start(
         config.clone(),
         joined.generation,
         CoordinatorDeps {
             generations: ConfigGenerations::new(joined.globals.clone()),
+            removals: deps.removals.clone(),
             env: Arc::new(ProcessEnv),
-            key: FingerprintKey::from_bytes(joined.fingerprint_key),
+            key: fingerprints,
             node_id: deps.holder.node_id.clone(),
             docs: Arc::clone(&docs),
             factory: Arc::clone(&deps.factory),

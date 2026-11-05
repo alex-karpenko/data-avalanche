@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use data_avalanche_config::{Cluster, Pipeline, StateLocation};
-use data_avalanche_state::{Holder, PipelineDocs};
+use data_avalanche_state::{Holder, PipelineDocs, RemovalDoc, StateError};
 use data_avalanche_storage::{Location, colocated_state, explicit_state, join};
 use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -18,6 +18,10 @@ use crate::{
     Actual, ClusterError, ControllerDeps, ControllerStatus, Members, PipelineController, Placement,
     Target, Update,
 };
+
+/// How often a node lists the removal tombstones, to take up those of the ids the ring places on
+/// it that no node removed (DA-OPS-9).
+pub const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 /// This node as a lease holder (Clustering §3.4, D-1): `node_id` is
 /// `globals.cluster.memberlist.node_name`, else the OS hostname; the incarnation is the process's
@@ -255,6 +259,9 @@ impl ClusterReconciler {
                 statuses: statuses_tx,
                 removing: JoinSet::new(),
                 returning: BTreeMap::new(),
+                sweeping: JoinSet::new(),
+                orphans: JoinSet::new(),
+                orphaned: std::collections::BTreeSet::new(),
             },
             members,
             settings,
@@ -363,6 +370,11 @@ struct Loop {
     /// The ids whose removal runs, each with the pipeline a later generation added back under
     /// it: that one starts when the removal ends, so one controller runs a pipeline at a time.
     returning: BTreeMap<String, Option<(Pipeline, PipelineDocs)>>,
+    /// The listing of the removal tombstones under way, one at a time.
+    sweeping: JoinSet<Result<Vec<RemovalDoc>, StateError>>,
+    /// The removals no node removed that this node took up; each ends with its id.
+    orphans: JoinSet<String>,
+    orphaned: std::collections::BTreeSet<String>,
 }
 
 impl Loop {
@@ -472,6 +484,26 @@ impl Loop {
         });
     }
 
+    /// The tombstones a sweep listed (DA-OPS-9): each removal of an id the ring places here,
+    /// that this node neither runs nor took up already, is taken up ([`orphan`]).
+    fn sweep(&mut self, pending: Vec<RemovalDoc>, placement: &Placement, me: &str) {
+        for doc in pending {
+            let id = doc.pipeline_id.clone();
+            if self.returning.contains_key(&id)
+                || self.orphaned.contains(&id)
+                || placement.ring().owner(&id) != Some(me)
+            {
+                continue;
+            }
+            self.orphaned.insert(id.clone());
+            let deps = self.deps.clone();
+            self.orphans.spawn(async move {
+                orphan(doc, deps).await;
+                id
+            });
+        }
+    }
+
     /// A removal ended: the pipeline added back under its id, if any, starts now.
     fn removed(&mut self, id: &str) {
         if let Some(Some((pipeline, docs))) = self.returning.remove(id) {
@@ -480,6 +512,24 @@ impl Loop {
             self.controllers.insert(id.to_owned(), added);
             self.statuses.send_replace(status_map(&self.controllers));
         }
+    }
+}
+
+/// A removal no node removed, taken up by the node the ring places its id on: its pipeline
+/// resolved from the generation its tombstone names, then removed under its lease
+/// ([`PipelineController::remove_orphan`]). One that doesn't resolve here waits for the next
+/// sweep.
+async fn orphan(doc: RemovalDoc, deps: ControllerDeps) {
+    let (id, generation) = (doc.pipeline_id.clone(), doc.generation);
+    match deps.removed.resolve(doc).await {
+        Ok((pipeline, docs)) => {
+            let (c, _status) = PipelineController::new(pipeline, docs, &deps);
+            c.remove_orphan().await;
+        }
+        Err(e) => tracing::warn!(
+            pipeline_id = %id,
+            "a removed pipeline waits for its teardown: generation {generation}, which last had it, doesn't resolve here: {e}"
+        ),
     }
 }
 
@@ -496,6 +546,8 @@ async fn reconcile(
     let mut placement = Placement::new(settings.tokens, settings.stabilization);
     let mut resync = tokio::time::interval(settings.resync);
     resync.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut sweep = tokio::time::interval(SWEEP_INTERVAL);
+    sweep.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut gossiping = true;
     loop {
         let view = members.borrow_and_update().clone();
@@ -552,8 +604,26 @@ async fn reconcile(
                 }
             } => {}
             _ = resync.tick() => {}
+            _ = sweep.tick(), if state.sweeping.is_empty() => {
+                let removals = state.deps.removals.clone();
+                state.sweeping.spawn(async move { removals.all_pending().await });
+            }
+            Some(listed) = state.sweeping.join_next() => match listed {
+                Ok(Ok(pending)) => {
+                    let me = members.borrow().me.clone();
+                    state.sweep(pending, &placement, &me);
+                }
+                Ok(Err(e)) => tracing::warn!("the removal tombstones unread: {e}"),
+                Err(e) => tracing::error!("the removal tombstones' listing ended abnormally: {e}"),
+            },
+            Some(ended) = state.orphans.join_next() => {
+                if let Ok(id) = ended {
+                    state.orphaned.remove(&id);
+                }
+            }
         }
     }
+    state.orphans.abort_all();
     // Every target closes at once (a replaced sender is dropped): the controllers drain
     // together, and the removed pipelines' controllers finish.
     let mut controllers: Vec<Controlled> = state.controllers.into_values().collect();
@@ -578,8 +648,8 @@ mod tests {
 
     use super::*;
     use crate::test_support::{
-        ByPipeline, STABLE, ScriptedStore, TestFactory, alone, config, deps, eventually, leases,
-        members, pipeline_docs, row, until,
+        ByPipeline, STABLE, ScriptedStore, TestFactory, acquired, alone, config, deps, eventually,
+        leases, members, pipeline_docs, removals, row, timing, tombstone, until,
     };
     use crate::{Parts, Phase, Ring, WorkerFactory};
 
@@ -630,6 +700,79 @@ mod tests {
         let (_, view) = watch::channel(alone("n1"));
         let r = ClusterReconciler::start(pipelines(&["p", "q"]), &d, view, reconciler_settings());
         (r, fs["p"].clone(), fs["q"].clone(), d)
+    }
+
+    /// DA-OPS-9: a removal no node removed (no node held the lease when the generation came) is
+    /// taken up by the node the ring places its id on: the lease claimed, the source torn down,
+    /// the lease released, the tombstone done. One that doesn't resolve here waits, and doesn't
+    /// hold up the others.
+    #[tokio::test(start_paused = true)]
+    async fn a_removal_no_node_removed_is_torn_down_where_the_ring_places_it() {
+        let store = ScriptedStore::new();
+        let (fs, d) = factories(&store, &["p"]);
+        let r = removals(&store);
+        r.record(&tombstone("p")).await.unwrap();
+        r.record(&tombstone("unresolvable")).await.unwrap();
+        let (_, view) = watch::channel(alone("n1"));
+        let _r = ClusterReconciler::start(vec![], &d, view, reconciler_settings());
+        eventually("p is torn down", || fs["p"].source.teardowns() == 1).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(r.pending("p").await.unwrap(), None, "p's removal done");
+        let lease = leases(&store).observe("p").await.unwrap().unwrap();
+        assert!(lease.doc.released, "{lease:?}");
+        tokio::time::sleep(SWEEP_INTERVAL * 2).await;
+        assert_eq!(fs["p"].source.teardowns(), 1, "once");
+        assert!(r.pending("unresolvable").await.unwrap().is_some());
+    }
+
+    /// A removal whose lease a gone node holds (its owner crashed, or its drain was cut off)
+    /// waits for the lease to expire, then is taken over and torn down.
+    #[tokio::test(start_paused = true)]
+    async fn a_removal_held_by_a_gone_node_is_torn_down_once_its_lease_expires() {
+        let store = ScriptedStore::new();
+        let (fs, d) = factories(&store, &["p"]);
+        let gone = acquired(&leases(&store), "n9").await;
+        removals(&store).record(&tombstone("p")).await.unwrap();
+        let (_, view) = watch::channel(alone("n1"));
+        let _r = ClusterReconciler::start(vec![], &d, view, reconciler_settings());
+        tokio::time::sleep(timing().duration / 2).await;
+        assert_eq!(fs["p"].source.teardowns(), 0, "the lease holds");
+        eventually("p is torn down", || fs["p"].source.teardowns() == 1).await;
+        let lease = leases(&store).observe("p").await.unwrap().unwrap();
+        assert_eq!(
+            lease.doc.owner_epoch,
+            gone.doc.owner_epoch + 1,
+            "taken over"
+        );
+        assert!(lease.doc.released);
+    }
+
+    /// The node the ring doesn't place a removed id on leaves it to the one it does.
+    #[tokio::test(start_paused = true)]
+    async fn a_removal_is_taken_up_only_where_the_ring_places_it() {
+        let store = ScriptedStore::new();
+        let ids = ["p", "q", "r", "s", "t", "u", "v", "w"];
+        let (fs, d) = factories(&store, &ids);
+        let view = members(
+            "n1",
+            &[("n1", Phase::Active, false), ("n2", Phase::Active, false)],
+        );
+        let ring = Ring::new(["n1", "n2"], 128);
+        let (here, there): (Vec<&str>, Vec<&str>) =
+            ids.iter().partition(|id| ring.owner(id) == Some("n1"));
+        assert!(!here.is_empty() && !there.is_empty(), "{here:?} {there:?}");
+        for id in ids {
+            removals(&store).record(&tombstone(id)).await.unwrap();
+        }
+        let (_, view) = watch::channel(view);
+        let _r = ClusterReconciler::start(vec![], &d, view, reconciler_settings());
+        for id in &here {
+            eventually("torn down here", || fs[*id].source.teardowns() == 1).await;
+        }
+        tokio::time::sleep(SWEEP_INTERVAL * 2).await;
+        for id in &there {
+            assert_eq!(fs[*id].source.teardowns(), 0, "{id} is n2's");
+        }
     }
 
     #[test]

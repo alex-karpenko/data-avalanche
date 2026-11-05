@@ -16,8 +16,8 @@ use data_avalanche_config::{
 };
 use data_avalanche_core::TableRef;
 use data_avalanche_state::{
-    ConfigGeneration, ConfigGenerations, GENERATION_KEY, GenerationDoc, PipelineDocs, StateError,
-    Versioned, config_hash,
+    ConfigGeneration, ConfigGenerations, GENERATION_KEY, GenerationDoc, PipelineDocs, RemovalDoc,
+    Removals, StateError, Versioned, config_hash,
 };
 use data_avalanche_telemetry::Metrics;
 use thiserror::Error;
@@ -25,7 +25,9 @@ use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
-use crate::{Advertiser, Members, PipelineReload, Reload, Reloader, WorkerFactory};
+use crate::{
+    Advertiser, Members, PipelineReload, Reload, Reloader, RemovedPipelines, WorkerFactory,
+};
 
 /// A reload re-reads the generation and tries again this many times when another node publishes
 /// first.
@@ -38,6 +40,9 @@ pub type DocsFn = dyn Fn(&Pipeline) -> Result<PipelineDocs, String> + Send + Syn
 #[derive(Clone)]
 pub struct CoordinatorDeps {
     pub generations: ConfigGenerations,
+    /// The removal tombstones: a generation that removes a pipeline records one first
+    /// (DA-OPS-9).
+    pub removals: Removals,
     /// This node's environment: each generation's text is resolved in it.
     pub env: Arc<dyn Env + Send + Sync>,
     /// The anchor's: the running config was loaded with it, and both sides of a diff must be.
@@ -377,6 +382,22 @@ impl Inner {
             Ok(pipelines) => pipelines,
             Err(why) => return refused(running, why),
         };
+        // The removals' tombstones go first: a removal is torn down by whichever node can, and
+        // what takes a removed pipeline's place waits for it, even if this node stops now.
+        for change in &pipelines {
+            if let PipelineReload::Remove(id) = change {
+                let tombstone = RemovalDoc {
+                    pipeline_id: id.clone(),
+                    generation: running.generation.doc.generation,
+                    hash: running.generation.doc.hash.clone(),
+                    removed_at: Utc::now(),
+                    done_at: None,
+                };
+                if let Err(e) = d.removals.record(&tombstone).await {
+                    return refused(running, format!("the removal of {id} isn't recorded: {e}"));
+                }
+            }
+        }
         d.reloader.apply(Reload {
             pipelines,
             cluster: new.globals.cluster.clone(),
@@ -433,6 +454,40 @@ impl Inner {
             })
             .collect()
     }
+}
+
+/// A removal tombstone's pipeline, from the text of the generation it names, loaded in `env`
+/// with the anchor's `key`, and its state documents (`docs`).
+pub fn removed_pipelines(
+    generations: ConfigGenerations,
+    env: Arc<dyn Env + Send + Sync>,
+    key: FingerprintKey,
+    docs: Arc<DocsFn>,
+) -> RemovedPipelines {
+    RemovedPipelines(Arc::new(move |doc: RemovalDoc| {
+        let (generations, env, docs) = (generations.clone(), Arc::clone(&env), Arc::clone(&docs));
+        Box::pin(async move {
+            let text = generations
+                .text(doc.generation, &doc.hash)
+                .await
+                .map_err(|e| e.to_string())?;
+            let config = load_str(&text, &*env, &key)
+                .map_err(|report| lines(&report))?
+                .config;
+            let pipeline = config
+                .pipelines
+                .into_values()
+                .find(|p| p.id == doc.pipeline_id)
+                .ok_or_else(|| {
+                    format!(
+                        "generation {} has no pipeline {}",
+                        doc.generation, doc.pipeline_id
+                    )
+                })?;
+            let d = docs(&pipeline)?;
+            Ok((pipeline, d))
+        })
+    }))
 }
 
 /// A report's errors, a line each, for the log.
@@ -676,6 +731,7 @@ mod tests {
     /// gossip's view, so a test can make a member gossip a generation.
     struct Lone {
         generations: ConfigGenerations,
+        removals: Removals,
         vars: Arc<Vars>,
         coordinator: ConfigCoordinator,
         reloads: mpsc::UnboundedReceiver<Reload>,
@@ -693,7 +749,8 @@ mod tests {
     }
 
     async fn start(text: &str, vars: Vars, store: Arc<dyn VersionedStore>) -> Lone {
-        let generations = ConfigGenerations::new(DocStore::new(store));
+        let generations = ConfigGenerations::new(DocStore::new(Arc::clone(&store)));
+        let removals = Removals::new(DocStore::new(store));
         let (first, created) = generations
             .bootstrap_or_adopt(text, "n1", Utc::now())
             .await
@@ -728,6 +785,7 @@ mod tests {
         let seen = Arc::clone(&globals);
         let deps = CoordinatorDeps {
             generations: generations.clone(),
+            removals: removals.clone(),
             env: Arc::clone(&vars) as Arc<dyn Env + Send + Sync>,
             key,
             node_id: "n1".into(),
@@ -743,6 +801,7 @@ mod tests {
         let coordinator = ConfigCoordinator::start(config, first.pointer, deps, members_rx, POLL);
         Lone {
             generations,
+            removals,
             vars,
             coordinator,
             reloads,
@@ -816,6 +875,35 @@ mod tests {
                 .lines()
                 .any(|l| l == "data_avalanche_config_generation 2")
         );
+    }
+
+    /// DA-OPS-9: a generation that removes a pipeline records its tombstone before the
+    /// reconciler hears of it, naming the generation that last had it; that generation's text
+    /// resolves it here.
+    #[tokio::test(start_paused = true)]
+    async fn a_removal_is_recorded_with_the_generation_that_last_had_it() {
+        let mut n = lone(&["p", "q"]).await;
+        let first = n.generations.current().await.unwrap().unwrap().pointer;
+        assert_eq!(n.publish_elsewhere(&config_text(&["p"])).await, 2);
+        let r = n.reload().await;
+        assert_eq!(kinds(&r), ["remove q"]);
+        let t = n.removals.pending("q").await.unwrap().expect("recorded");
+        assert_eq!((t.generation, &t.hash), (1, &first.doc.hash));
+        assert_eq!(n.removals.pending("p").await.unwrap(), None);
+        let removed = removed_pipelines(
+            n.generations.clone(),
+            Arc::clone(&n.vars) as Arc<dyn Env + Send + Sync>,
+            FingerprintKey::from_bytes([1; 32]),
+            Arc::new(|_| Ok(pipeline_docs())),
+        );
+        let (q, _) = removed.resolve(t.clone()).await.unwrap();
+        assert_eq!(q.id, "q");
+        let wrong = RemovalDoc {
+            pipeline_id: "nope".into(),
+            ..t
+        };
+        let e = removed.resolve(wrong).await.unwrap_err();
+        assert!(e.contains("has no pipeline nope"), "{e}");
     }
 
     /// A member that gossips a newer generation brings it in at once, not at the next poll.

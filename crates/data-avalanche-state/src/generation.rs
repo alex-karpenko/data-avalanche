@@ -68,22 +68,31 @@ impl ConfigGenerations {
         let Some(pointer) = self.docs.load::<GenerationDoc>(GENERATION_KEY).await? else {
             return Ok(None);
         };
-        let key = config_snapshot_key(pointer.doc.generation, &pointer.doc.hash);
+        let text = self.text(pointer.doc.generation, &pointer.doc.hash).await?;
+        Ok(Some(ConfigGeneration { pointer, text }))
+    }
+
+    /// The text of generation `generation`, whose hash is `hash`: snapshots are immutable and
+    /// kept, so an earlier generation's is read too (a removal tombstone names one).
+    ///
+    /// # Errors
+    /// A storage failure; `Corrupt` when the snapshot is missing or its text doesn't match
+    /// `hash`.
+    pub async fn text(&self, generation: u64, hash: &str) -> Result<String, StateError> {
+        let key = config_snapshot_key(generation, hash);
         let corrupt = |reason: &str| StateError::Corrupt {
             key: key.clone(),
             kind: "config snapshot",
             reason: reason.to_owned(),
         };
         let Some((body, _)) = self.docs.store().get(&key).await? else {
-            return Err(corrupt("missing; config/generation.json points at it"));
+            return Err(corrupt("missing"));
         };
         let text = String::from_utf8(body.to_vec()).map_err(|_| corrupt("not UTF-8"))?;
-        if config_hash(&text) != pointer.doc.hash {
-            return Err(corrupt(
-                "its text doesn't match the hash in config/generation.json",
-            ));
+        if config_hash(&text) != hash {
+            return Err(corrupt("its text doesn't match the hash it is named by"));
         }
-        Ok(Some(ConfigGeneration { pointer, text }))
+        Ok(text)
     }
 
     /// Cold start (§9.3): adopts the current generation if there is one; otherwise publishes

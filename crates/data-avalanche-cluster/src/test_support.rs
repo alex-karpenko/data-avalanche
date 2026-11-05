@@ -9,7 +9,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
-use data_avalanche_state::{Acquired, DocStore, Holder, LeaseDoc, Leases, Versioned};
+use data_avalanche_state::{Acquired, DocStore, Holder, LeaseDoc, Leases, Removals, Versioned};
 use data_avalanche_storage::{ObjectStoreVersioned, ObjectVersion, StoreError, VersionedStore};
 use data_avalanche_telemetry::{Metrics, PipelineLabels, PipelineMetrics};
 use object_store::memory::InMemory;
@@ -194,6 +194,38 @@ pub(crate) fn holder(node: &str) -> Holder {
 
 pub(crate) fn leases(store: &Arc<ScriptedStore>) -> Leases {
     Leases::new(DocStore::new(Arc::clone(store) as Arc<dyn VersionedStore>))
+}
+
+pub(crate) fn removals(store: &Arc<ScriptedStore>) -> Removals {
+    Removals::new(DocStore::new(Arc::clone(store) as Arc<dyn VersionedStore>))
+}
+
+/// A removal of `id` under way, from generation 1.
+pub(crate) fn tombstone(id: &str) -> data_avalanche_state::RemovalDoc {
+    data_avalanche_state::RemovalDoc {
+        pipeline_id: id.into(),
+        generation: 1,
+        hash: "blake3:00".into(),
+        removed_at: Utc::now(),
+        done_at: None,
+    }
+}
+
+/// Resolves a tombstone's pipeline as [`config`] of its id has it, with fresh documents; the
+/// id `unresolvable` doesn't resolve.
+pub(crate) fn removed() -> crate::RemovedPipelines {
+    crate::RemovedPipelines(Arc::new(|doc: data_avalanche_state::RemovalDoc| {
+        Box::pin(async move {
+            if doc.pipeline_id == "unresolvable" {
+                return Err("no such variable".to_owned());
+            }
+            let p = config(&[&doc.pipeline_id])
+                .pipelines
+                .remove(&doc.pipeline_id)
+                .unwrap();
+            Ok((p, pipeline_docs()))
+        })
+    }))
 }
 
 pub(crate) async fn acquired(leases: &Leases, node: &str) -> Versioned<LeaseDoc> {
@@ -401,6 +433,8 @@ pub(crate) fn deps(
         settings: settings(),
         starts: Arc::new(tokio::sync::Semaphore::new(1)),
         handoffs: Arc::new(tokio::sync::Semaphore::new(2)),
+        removals: removals(store),
+        removed: removed(),
     }
 }
 
@@ -776,6 +810,7 @@ impl TestCluster {
             first.pointer,
             crate::CoordinatorDeps {
                 generations: self.generations.clone(),
+                removals: deps.removals.clone(),
                 env: Arc::new(env),
                 key,
                 node_id: name.to_owned(),

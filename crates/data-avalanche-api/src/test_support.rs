@@ -17,13 +17,13 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use data_avalanche_cluster::{
     ClusterReconciler, ConfigCoordinator, ControllerDeps, ControllerSettings, CoordinatorDeps,
     Gossip, GossipKey, GossipSettings, LeaseTiming, NodeIdentity, NodeMeta, Parts, Phase,
-    ReconcilerSettings, Udp, WorkerFactory,
+    ReconcilerSettings, Udp, WorkerFactory, removed_pipelines,
 };
 use data_avalanche_config::{
     ApiAuth, Env, FingerprintKey, HostPort, Jwt, Pipeline, ProcessEnv, ResolvedConfig, load_str,
 };
 use data_avalanche_pipeline::{Backoff, Tuning};
-use data_avalanche_state::{ConfigGenerations, DocStore, Holder, Leases, PipelineDocs};
+use data_avalanche_state::{ConfigGenerations, DocStore, Holder, Leases, PipelineDocs, Removals};
 use data_avalanche_storage::ObjectStoreVersioned;
 use data_avalanche_telemetry::Metrics;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
@@ -207,8 +207,16 @@ pub(crate) async fn lone_with(file: PathBuf, text: &str, env: Arc<dyn Env + Send
     );
     let metrics = Metrics::new();
     let c = &config.globals.cluster;
+    let removals = Removals::new(docs.clone());
     let deps = ControllerDeps {
         leases: leases.clone(),
+        removals: removals.clone(),
+        removed: removed_pipelines(
+            generations.clone(),
+            Arc::clone(&env),
+            key,
+            Arc::new(|p| Err(p.id.clone())),
+        ),
         holder: Holder {
             node_id: "node-a".into(),
             incarnation: 1,
@@ -232,6 +240,7 @@ pub(crate) async fn lone_with(file: PathBuf, text: &str, env: Arc<dyn Env + Send
         first.pointer,
         CoordinatorDeps {
             generations,
+            removals,
             env,
             key,
             node_id: "node-a".into(),

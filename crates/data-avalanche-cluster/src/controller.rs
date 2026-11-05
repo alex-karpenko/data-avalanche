@@ -19,7 +19,8 @@ use data_avalanche_pipeline::{
     WorkerDeps, WorkerError, WorkerHandle, WorkerStatus,
 };
 use data_avalanche_state::{
-    ActualState, DesiredState, Holder, Leases, PipelineDocs, RequestsDoc, StatusDoc,
+    ActualState, DesiredState, Holder, Leases, PipelineDocs, RemovalDoc, Removals, RequestsDoc,
+    StatusDoc,
 };
 use data_avalanche_storage::ObjectVersion;
 use data_avalanche_telemetry::{
@@ -149,6 +150,35 @@ pub struct ControllerDeps {
     pub starts: Arc<Semaphore>,
     /// Caps the workers handed off at once (`max_concurrent_handoffs`, Clustering §8.5).
     pub handoffs: Arc<Semaphore>,
+    /// The removal tombstones in `globals.state` (DA-OPS-9).
+    pub removals: Removals,
+    /// A removed pipeline, from the generation its tombstone names, as this node resolves it.
+    pub removed: RemovedPipelines,
+}
+
+/// [`RemovedPipelines`]' answer: the pipeline and its state documents.
+pub type Resolved = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(Pipeline, PipelineDocs), String>> + Send>,
+>;
+
+/// Resolves a removal tombstone's pipeline, with its state documents, from the generation that
+/// last had it, in this node's environment (the coordinator builds it; `coordinator.rs`
+/// `removed_pipelines`).
+#[derive(Clone)]
+pub struct RemovedPipelines(pub Arc<dyn Fn(RemovalDoc) -> Resolved + Send + Sync>);
+
+impl Debug for RemovedPipelines {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemovedPipelines").finish_non_exhaustive()
+    }
+}
+
+impl RemovedPipelines {
+    /// # Errors
+    /// The generation's text is unread, or doesn't resolve here, or doesn't have the pipeline.
+    pub async fn resolve(&self, doc: RemovalDoc) -> Result<(Pipeline, PipelineDocs), String> {
+        (self.0)(doc).await
+    }
 }
 
 /// One pipeline's controller.
@@ -172,6 +202,7 @@ pub struct PipelineController {
     /// The removed pipelines this one takes the place of: their leases are let go of before
     /// this one's is first claimed ([`Self::following`]).
     following: Following,
+    removals: Removals,
 }
 
 /// The ids of the removed pipelines a pipeline takes the place of (config §9.1: an `id` change
@@ -462,6 +493,7 @@ impl PipelineController {
             updates,
             updater,
             following: Following::default(),
+            removals: deps.removals.clone(),
         }
     }
 
@@ -987,7 +1019,9 @@ impl PipelineController {
                     desired = self.desired().await;
                 }
                 Event::Update(Update::Remove) => {
-                    self.remove(run, worker.take()).await;
+                    if self.remove(run, worker.take()).await {
+                        self.removal_done().await;
+                    }
                     return Left::Removed;
                 }
                 Event::Update(Update::DrainTimeout(d)) => self.settings.drain_timeout = d,
@@ -1162,31 +1196,101 @@ impl PipelineController {
     }
 
     /// A pipeline gone from the config (§12.3): the worker drains, what the source created for
-    /// the pipeline goes, and the lease is released. A drain cut off, or a lease lost meanwhile,
-    /// leaves the source as it is: a cut-off worker may still hold it, a lost lease's holder runs
-    /// it.
-    async fn remove(&self, run: LeaseRun, worker: Option<Running>) {
+    /// the pipeline goes, and the lease is released; true then. A drain cut off, or a lease lost
+    /// meanwhile, leaves the source as it is: a cut-off worker may still hold it, a lost lease's
+    /// holder runs it. Its tombstone stays, and the node the ring places the id on tears it down
+    /// once the lease is let go of ([`Self::remove_orphan`]).
+    async fn remove(&self, run: LeaseRun, worker: Option<Running>) -> bool {
         let drained = match worker {
             Some(w) => self.drain(w, &mut None).await,
             None => true,
         };
-        if !drained {
+        let done = if !drained {
             let _ = run.stop().await;
             tracing::warn!(
                 pipeline = %self.pipeline.name,
-                "removed with its drain cut off: the lease expires, and what the source created for the pipeline stays"
+                "removed with its drain cut off: the lease expires, then what the source created for the pipeline is torn down"
             );
+            false
         } else if self.teardown(&*run.guard).await {
             self.give_back(run).await;
+            true
         } else {
             let _ = run.stop().await;
             tracing::warn!(
                 pipeline = %self.pipeline.name,
-                "removed after its lease was lost: what the source created for the pipeline stays"
+                "removed after its lease was lost: what the source created for the pipeline stays to its holder"
             );
-        }
+            false
+        };
         self.metrics.forget();
         tracing::info!(pipeline = %self.pipeline.name, "pipeline removed");
+        done
+    }
+
+    /// Marks the removal's tombstone done: what follows the pipeline may start. Not written, the
+    /// tombstone stays, and the next sweep removes the pipeline again (nothing left to tear down).
+    async fn removal_done(&self) {
+        if let Err(e) = self
+            .removals
+            .done(&self.pipeline.id, chrono::Utc::now())
+            .await
+        {
+            tracing::warn!(
+                pipeline = %self.pipeline.name,
+                "the removal's tombstone isn't marked done ({e}): a later sweep does it"
+            );
+        }
+    }
+
+    /// A removed pipeline that no node removed (DA-OPS-9): no node held its lease at the
+    /// removal, or its owner's drain was cut off. Its lease is claimed (taken over once it
+    /// expires), what the source created for it torn down, the lease released, and its tombstone
+    /// marked done. Ends early when the tombstone is done meanwhile: its holder removed it.
+    pub(crate) async fn remove_orphan(self) {
+        let mut claim = Claim::new(
+            self.leases.clone(),
+            &self.pipeline.id,
+            self.holder.clone(),
+            self.settings.timing,
+        );
+        loop {
+            match self.removals.pending(&self.pipeline.id).await {
+                Ok(Some(_)) => {}
+                Ok(None) => return,
+                Err(e) => {
+                    tracing::warn!(pipeline = %self.pipeline.name, "the removal's tombstone unread: {e}")
+                }
+            }
+            let wait = match claim.step().await {
+                Ok(Claimed::Mine { lease, written, .. }) => {
+                    tracing::info!(
+                        pipeline = %self.pipeline.name,
+                        "a removed pipeline no node removed: its lease is taken, to tear it down"
+                    );
+                    let run = LeaseRun::start(
+                        self.leases.clone(),
+                        lease,
+                        self.holder.clone(),
+                        self.settings.timing,
+                        written,
+                        Arc::clone(&self.metrics),
+                    );
+                    if self.remove(run, None).await {
+                        self.removal_done().await;
+                    }
+                    return;
+                }
+                Ok(Claimed::HeldBy { takeover_at, .. }) => {
+                    takeover_at.min(Instant::now() + self.settings.timing.renewal_interval)
+                }
+                Err(e) => {
+                    tracing::warn!(pipeline = %self.pipeline.name, "lease claim failed: {e}");
+                    Instant::now() + self.settings.timing.renewal_interval
+                }
+            };
+            tokio::time::sleep_until(wait).await;
+        }
     }
 
     /// The source's `teardown` (PostgreSQL's `auto_cleanup`: the slot and the publication),
@@ -1364,7 +1468,7 @@ mod tests {
     use super::*;
     use crate::test_support::{
         Fault, Kind, ScriptedStore, TestFactory, deps, eventually, holder, leases, node, pipeline,
-        pipeline_docs, pipeline_docs_on, row, until,
+        pipeline_docs, pipeline_docs_on, removals, row, tombstone, until,
     };
 
     /// A real two-second watchdog over `wait` on the paused clock: a controller that spins keeps
@@ -2530,6 +2634,7 @@ mod tests {
         let mut n = node("n1", &store, &docs, &f);
         until(&mut n.status, "running", is(Actual::Running)).await;
         f.source.commit(FakeTxn::new().insert(&t("a"), row(1)));
+        removals(&store).record(&tombstone("p")).await.unwrap();
         n.updates.send(Update::Remove).unwrap();
         tokio::time::timeout(Duration::from_secs(60), &mut n.task)
             .await
@@ -2539,6 +2644,11 @@ mod tests {
         assert_eq!(f.source.teardowns(), 1);
         let lease = leases(&store).observe("p").await.unwrap().unwrap();
         assert!(lease.doc.released);
+        assert_eq!(
+            removals(&store).pending("p").await.unwrap(),
+            None,
+            "the removal is done (DA-OPS-9)"
+        );
         let text = n.metrics.encode();
         assert!(!text.contains(P), "{text}");
         assert!(line(&text, "data_avalanche_owned_pipelines 0"), "{text}");
@@ -2704,6 +2814,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_removal_with_its_drain_cut_off_leaves_the_source() {
         let store = ScriptedStore::new();
+        removals(&store).record(&tombstone("p")).await.unwrap();
         let f = TestFactory::new(&["a"]);
         let mut d = deps("n1", &store, &f);
         d.settings.drain_timeout = Duration::from_secs(1);
@@ -2721,6 +2832,10 @@ mod tests {
             .expect("the controller ends")
             .unwrap();
         assert_eq!(f.source.teardowns(), 0, "the source is left as it is");
+        assert!(
+            removals(&store).pending("p").await.unwrap().is_some(),
+            "the tombstone stays, for the sweep once the lease expires"
+        );
         let lease = leases(&store).observe("p").await.unwrap().unwrap();
         assert!(!lease.doc.released, "the lease expires, not released");
         assert!(lease.doc.is_held_by(&holder("n1")));
