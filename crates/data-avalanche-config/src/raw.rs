@@ -134,6 +134,7 @@ pub(crate) struct RawMemberlist {
 pub(crate) struct RawTracing {
     pub otlp_endpoint: L<String>,
     pub sample_ratio: L<f64>,
+    pub headers: Option<BTreeMap<String, Leaf<String>>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

@@ -9,7 +9,7 @@ pub mod memory_sink;
 pub mod otlp;
 pub use fake_source::{FakeSource, FakeTxn, Method};
 pub use memory_sink::{MemorySink, SinkOp};
-pub use otlp::{OtlpRequest, otlp_collector, otlp_collector_answering};
+pub use otlp::{OtlpRequest, otlp_collector, otlp_collector_answering, otlp_collector_tls};
 
 use futures_util::TryStreamExt;
 use object_store::ObjectStore;

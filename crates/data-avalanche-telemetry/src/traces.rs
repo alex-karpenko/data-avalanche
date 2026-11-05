@@ -5,8 +5,10 @@
 //! One provider and one `tracing` layer serve the whole run: a reload of `globals.tracing` swaps
 //! the exporter behind them and the sampling ratio (D-M10.6). A layer can't be reloaded: the
 //! logs find a span's ids by downcasting to it, which a reload layer doesn't pass through. The
-//! batch exporter runs on a thread of its own and exports with a blocking client.
+//! batch exporter runs on a thread of its own and exports with a blocking client. Each export
+//! carries `globals.tracing.headers` (DA-OBS-7): a hosted collector's token or API key.
 
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
@@ -14,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use opentelemetry::trace::{Link, SpanKind, TraceContextExt, TraceId, TracerProvider};
 use opentelemetry::{Context, KeyValue};
-use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::trace::{
@@ -216,8 +218,11 @@ pub struct Traces {
     provider: SdkTracerProvider,
     switch: Switch,
     ratio: Ratio,
-    /// The endpoint in force.
-    endpoint: RwLock<Option<String>>,
+    /// The endpoint in force, with its headers.
+    endpoint: RwLock<Option<(String, BTreeMap<String, String>)>>,
+    /// Roots the exporter's client trusts besides the platform's: a test's certificate.
+    #[cfg(test)]
+    roots: Vec<Vec<u8>>,
 }
 
 /// Shows the endpoint as it may be logged ([`shown`]): an operator may put credentials in it.
@@ -227,8 +232,8 @@ impl fmt::Debug for Traces {
             .endpoint
             .read()
             .unwrap_or_else(PoisonError::into_inner)
-            .as_deref()
-            .map(shown);
+            .as_ref()
+            .map(|(e, _)| shown(e));
         f.debug_struct("Traces")
             .field("endpoint", &endpoint)
             .field("sample_ratio", &self.ratio.get())
@@ -263,23 +268,31 @@ impl Traces {
             switch,
             ratio,
             endpoint: RwLock::default(),
+            #[cfg(test)]
+            roots: Vec::new(),
         }
     }
 
-    /// Puts `globals.tracing` in force: spans go to `endpoint`'s `/v1/traces`, `sample_ratio` of
-    /// the traces; `None` exports nothing. The same endpoint again keeps its exporter. Returns
-    /// whether traces are exported now.
+    /// Puts `globals.tracing` in force: spans go to `endpoint`'s `/v1/traces` with `headers` on
+    /// each export, `sample_ratio` of the traces; `None` exports nothing. The same endpoint and
+    /// headers again keep their exporter. Returns whether traces are exported now.
     ///
     /// # Errors
     /// [`TracesError::Endpoint`]: `endpoint` isn't a URL the exporter takes; what was in force
     /// stays.
-    pub fn set(&self, endpoint: Option<&str>, sample_ratio: f64) -> Result<bool, TracesError> {
+    pub fn set(
+        &self,
+        endpoint: Option<&str>,
+        headers: &BTreeMap<String, String>,
+        sample_ratio: f64,
+    ) -> Result<bool, TracesError> {
         let mut current = self
             .endpoint
             .write()
             .unwrap_or_else(PoisonError::into_inner);
-        if current.as_deref() != endpoint {
-            let exporter = endpoint.map(|e| self.exporter(e)).transpose()?;
+        let wanted = endpoint.map(|e| (e.to_owned(), headers.clone()));
+        if *current != wanted {
+            let exporter = endpoint.map(|e| self.exporter(e, headers)).transpose()?;
             let old = std::mem::replace(
                 &mut self
                     .switch
@@ -294,7 +307,7 @@ impl Traces {
             if let Some(old) = old {
                 std::thread::spawn(move || drop(old));
             }
-            *current = endpoint.map(str::to_owned);
+            *current = wanted;
         }
         let ratio = if endpoint.is_some() {
             sample_ratio
@@ -305,16 +318,46 @@ impl Traces {
         Ok(endpoint.is_some())
     }
 
-    fn exporter(&self, endpoint: &str) -> Result<Exporter, TracesError> {
+    /// A blocking client that also trusts `roots` (DER), built off any runtime's thread as the
+    /// exporter builds its own.
+    #[cfg(test)]
+    fn trusting(roots: &[Vec<u8>]) -> reqwest::blocking::Client {
+        let certs: Vec<reqwest::Certificate> = roots
+            .iter()
+            .map(|der| reqwest::Certificate::from_der(der).unwrap())
+            .collect();
+        std::thread::spawn(move || {
+            reqwest::blocking::Client::builder()
+                .tls_certs_merge(certs)
+                .build()
+                .unwrap()
+        })
+        .join()
+        .unwrap()
+    }
+
+    /// An exporter to `endpoint` with `headers`. The exporter drops a header whose name or value
+    /// HTTP doesn't take: the config refuses them (V-126).
+    fn exporter(
+        &self,
+        endpoint: &str,
+        headers: &BTreeMap<String, String>,
+    ) -> Result<Exporter, TracesError> {
         let url = format!("{}/v1/traces", endpoint.trim_end_matches('/'));
-        let mut exporter = opentelemetry_otlp::SpanExporter::builder()
+        let builder = opentelemetry_otlp::SpanExporter::builder()
             .with_http()
             .with_endpoint(url)
-            .build()
-            .map_err(|e| TracesError::Endpoint {
-                endpoint: endpoint.to_owned(),
-                reason: e.to_string(),
-            })?;
+            .with_headers(headers.clone().into_iter().collect::<HashMap<_, _>>());
+        #[cfg(test)]
+        let builder = if self.roots.is_empty() {
+            builder
+        } else {
+            builder.with_http_client(Self::trusting(&self.roots))
+        };
+        let mut exporter = builder.build().map_err(|e| TracesError::Endpoint {
+            endpoint: endpoint.to_owned(),
+            reason: e.to_string(),
+        })?;
         let resource = self
             .switch
             .0
@@ -449,7 +492,7 @@ mod tests {
         let (url, requests) = otlp_collector_answering(status.clone());
         let endpoint = url.replace("http://", "http://u:secret@");
         let traces = Traces::new("node-1");
-        traces.set(Some(&endpoint), 1.0).unwrap();
+        traces.set(Some(&endpoint), &BTreeMap::new(), 1.0).unwrap();
         let lines = Lines::default();
         let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(lines.clone()));
         let export = || {
@@ -485,8 +528,8 @@ mod tests {
         assert!(export().is_err());
         assert_eq!(lines.at(tracing::Level::WARN).len(), 2);
 
-        traces.set(None, 1.0).unwrap();
-        traces.set(Some(&endpoint), 1.0).unwrap();
+        traces.set(None, &BTreeMap::new(), 1.0).unwrap();
+        traces.set(Some(&endpoint), &BTreeMap::new(), 1.0).unwrap();
         assert!(export().is_err());
         assert_eq!(lines.at(tracing::Level::WARN).len(), 3, "a new exporter");
         assert!(
@@ -513,12 +556,49 @@ mod tests {
         assert!(health.failed(at(10)), "the first failure after a success");
     }
 
+    /// DA-OBS-7: an `https` collector takes the export over TLS, with the configured headers; a
+    /// client that doesn't trust the collector's certificate exports nothing. A change of the
+    /// headers alone makes a new exporter.
+    #[test]
+    fn an_https_collector_takes_the_export_with_its_headers() {
+        let c = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let (url, requests) = data_avalanche_testkit::otlp_collector_tls(
+            &c.cert.pem(),
+            &c.signing_key.serialize_pem(),
+        );
+        let headers = BTreeMap::from([
+            ("authorization".to_owned(), "Bearer t0k".to_owned()),
+            ("x-tenant".to_owned(), "shop".to_owned()),
+        ]);
+
+        let untrusting = Traces::new("node-1");
+        untrusting.set(Some(&url), &headers, 1.0).unwrap();
+        assert!(block_on(untrusting.switch.export(Vec::new())).is_err());
+
+        let mut traces = Traces::new("node-1");
+        traces.roots = vec![c.cert.der().to_vec()];
+        traces.set(Some(&url), &headers, 1.0).unwrap();
+        block_on(traces.switch.export(Vec::new())).unwrap();
+        let r = requests.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(r.path, "/v1/traces");
+        assert_eq!(r.header("authorization"), Some("Bearer t0k"));
+        assert_eq!(r.header("x-tenant"), Some("shop"));
+        assert!(!format!("{traces:?}").contains("t0k"), "{traces:?}");
+
+        let rotated = BTreeMap::from([("authorization".to_owned(), "Bearer n3w".to_owned())]);
+        traces.set(Some(&url), &rotated, 1.0).unwrap();
+        block_on(traces.switch.export(Vec::new())).unwrap();
+        let r = requests.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(r.header("authorization"), Some("Bearer n3w"));
+        assert_eq!(r.header("x-tenant"), None);
+    }
+
     #[test]
     fn the_debug_of_traces_leaves_out_the_endpoint_s_credentials() {
         let (url, _requests) = data_avalanche_testkit::otlp_collector();
         let traces = Traces::new("node-1");
         let endpoint = format!("{}/?token=t0k", url.replace("http://", "http://u:secret@"));
-        traces.set(Some(&endpoint), 1.0).unwrap();
+        traces.set(Some(&endpoint), &BTreeMap::new(), 1.0).unwrap();
         let text = format!("{traces:?}");
         assert!(text.contains(&url.replace("http://", "")), "{text}");
         assert!(!text.contains("secret"), "{text}");

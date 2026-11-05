@@ -284,6 +284,11 @@ pub const FIELD_DOCS: &[FieldDoc] = &[
         "The share of flushes traced, from 0 to 1.",
     ),
     f(
+        "globals.tracing.headers.*",
+        Note("none"),
+        "Headers sent with each export, a map of name to value: a hosted collector's token or API key (`authorization: Bearer ${OTLP_TOKEN}`). The values are secrets (V-126).",
+    ),
+    f(
         "globals.azure.account_name",
         Note("from the credential chain"),
         "The Azure storage account of every container (`cloud: azure`).",

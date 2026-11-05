@@ -131,3 +131,4 @@ A config with any **error** is rejected whole: at startup the node refuses to st
 | <span id="v-123"></span>V-123 | error | `source.postgres.source_change_action` | ∈ {error, re_snapshot}. |
 | <span id="v-124"></span>V-124 | warning | `source.ssl_mode = verify-ca, when source.type = mysql` | The host name is checked too, as with verify-full (DA-SRC-22). |
 | <span id="v-125"></span>V-125 | warning | `globals.api.jwt.jwks_url, globals.api.oauth2.jwks_url and discovery_url` | Not https: the issuer's keys could be swapped on the way (DA-API-16). |
+| <span id="v-126"></span>V-126 | error | `globals.tracing.headers` | Each name an HTTP token, each value visible ASCII, spaces and tabs (DA-OBS-7). |

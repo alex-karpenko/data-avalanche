@@ -1993,6 +1993,8 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "prometheus-client",
+ "rcgen",
+ "reqwest 0.13.5",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

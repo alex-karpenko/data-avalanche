@@ -172,6 +172,9 @@ pub struct Tracing {
     /// `None` = tracing disabled.
     pub otlp_endpoint: Option<String>,
     pub sample_ratio: f64,
+    /// Sent with each export (DA-OBS-7): a hosted collector's token or API key. Secrets: shown
+    /// and diffed by fingerprint.
+    pub headers: BTreeMap<String, Secret>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

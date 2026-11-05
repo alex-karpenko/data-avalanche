@@ -183,6 +183,7 @@ where
         tracing: Mutex::new(Tracing {
             otlp_endpoint: None,
             sample_ratio: 0.0,
+            headers: Default::default(),
         }),
     };
     Ok((dispatch, logger))
@@ -296,7 +297,12 @@ impl Logger {
             return;
         }
         let endpoint = tracing.otlp_endpoint.as_deref();
-        match self.traces.set(endpoint, tracing.sample_ratio) {
+        let headers = tracing
+            .headers
+            .iter()
+            .map(|(name, value)| (name.clone(), value.expose().to_owned()))
+            .collect();
+        match self.traces.set(endpoint, &headers, tracing.sample_ratio) {
             Ok(on) => {
                 let spans = if on { traced() } else { Targets::new() };
                 if let Err(e) = self.spans.reload(spans) {
@@ -502,6 +508,7 @@ mod tests {
             logger.trace(&Tracing {
                 otlp_endpoint: Some(url.clone()),
                 sample_ratio: 1.0,
+                headers: Default::default(),
             });
             tracing::info_span!(target: "deltalake_core", "a.library.span").in_scope(|| {});
             tracing::info_span!("after.endpoint").in_scope(|| {});
@@ -530,6 +537,7 @@ mod tests {
             logger.trace(&Tracing {
                 otlp_endpoint: endpoint,
                 sample_ratio: 1.0,
+                headers: Default::default(),
             });
             tracing::info_span!("pipeline.flush", pipeline = "orders").in_scope(|| {
                 tracing::info_span!("sink.commit", table = "public.a").in_scope(|| {
@@ -560,6 +568,7 @@ mod tests {
             logger.trace(&Tracing {
                 otlp_endpoint: Some(url),
                 sample_ratio: 1.0,
+                headers: Default::default(),
             });
             tracing::info_span!("pipeline.flush", pipeline = "orders").in_scope(|| {
                 tracing::info_span!("sink.commit", table = "public.a").in_scope(|| {
