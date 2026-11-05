@@ -590,3 +590,79 @@ async fn a_timed_out_chunk_frees_the_connection() {
     locker.batch_execute("ROLLBACK").await.unwrap();
     cleanup(&a, &n).await;
 }
+
+/// DA-SNAP-12: chunk reads run on connections of their own, so a read that waits (here on a
+/// lock) holds up neither another table's read nor a catalog call, and each read's timeout
+/// starts when it runs. Idle read connections are kept for the next reads, up to IDLE_READS.
+#[tokio::test]
+async fn a_waiting_chunk_read_holds_up_no_other_read() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(
+        &a,
+        "chunks_parallel",
+        "CREATE TABLE a (id int PRIMARY KEY); CREATE TABLE b (id int PRIMARY KEY);
+         INSERT INTO a VALUES (1); INSERT INTO b VALUES (1), (2);",
+    )
+    .await;
+    let p = pipeline(&n, &["*"], "", "");
+    let c = std::sync::Arc::new(connector(&p));
+    let tables = resolved(&c).await.tables;
+    let of = |name: &str| {
+        tables
+            .iter()
+            .find(|t| t.table().name == name)
+            .unwrap()
+            .clone()
+    };
+    let (ta, tb) = (of("a"), of("b"));
+    let locker = admin().await;
+    locker
+        .batch_execute(&format!(
+            "BEGIN; LOCK TABLE {}.a IN ACCESS EXCLUSIVE MODE",
+            n.schema
+        ))
+        .await
+        .unwrap();
+    let waiting = tokio::spawn({
+        let c = c.clone();
+        let ta = ta.clone();
+        async move { c.read_chunk(&ta, None, 10).await }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let b = tokio::time::timeout(Duration::from_secs(2), c.read_chunk(&tb, None, 10))
+        .await
+        .expect("table b's read doesn't wait for table a's")
+        .unwrap();
+    assert_eq!(b.rows.len(), 2);
+    tokio::time::timeout(Duration::from_secs(2), c.current_position())
+        .await
+        .expect("the catalog connection is free")
+        .unwrap();
+    assert!(
+        !waiting.is_finished(),
+        "table a's read still waits on the lock"
+    );
+    locker.batch_execute("ROLLBACK").await.unwrap();
+    assert_eq!(waiting.await.unwrap().unwrap().rows.len(), 1);
+    let connections = async || {
+        a.query_one(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE application_name = $1 AND datname = current_database()",
+            &[&data_avalanche_source_pg::APPLICATION_NAME],
+        )
+        .await
+        .unwrap()
+        .get::<_, i64>(0)
+    };
+    let before = connections().await;
+    for _ in 0..3 {
+        c.read_chunk(&tb, None, 10).await.unwrap();
+    }
+    assert_eq!(
+        connections().await,
+        before,
+        "a read takes an idle connection"
+    );
+    cleanup(&admin().await, &n).await;
+}

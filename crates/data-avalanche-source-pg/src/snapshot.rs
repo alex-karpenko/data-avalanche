@@ -528,8 +528,16 @@ impl PgConnector {
             "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;
              SELECT pg_catalog.pg_current_snapshot()::text; {sql}"
         );
-        let messages = simple_query(self, "read a snapshot chunk", table, &sql)
+        let command = self.conn.timeouts.command;
+        let sql = format!(
+            "SET LOCAL statement_timeout = {}; {sql}",
+            server_millis(command)
+        );
+        let messages = self
+            .conn
+            .read("read a snapshot chunk", command + SERVER_FIRST, &sql)
             .await
+            .map_err(|e| dropped(table, e))
             .map_err(|e| chunk_error(table, e))?;
         // Each SELECT's rows follow its row description: the snapshot's, then the chunk's.
         let mut selects = messages
