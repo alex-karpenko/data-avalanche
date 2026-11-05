@@ -1253,7 +1253,8 @@ impl PipelineController {
             &self.pipeline.id,
             self.holder.clone(),
             self.settings.timing,
-        );
+        )
+        .patient();
         loop {
             match self.removals.pending(&self.pipeline.id).await {
                 Ok(Some(_)) => {}
@@ -1467,8 +1468,9 @@ mod tests {
 
     use super::*;
     use crate::test_support::{
-        Fault, Kind, ScriptedStore, TestFactory, deps, eventually, holder, leases, node, pipeline,
-        pipeline_docs, pipeline_docs_on, removals, row, tombstone, until,
+        Fault, Kind, ScriptedStore, TestFactory, acquired, deps, eventually, holder, leases,
+        metrics, node, pipeline, pipeline_docs, pipeline_docs_on, removals, row, timing, tombstone,
+        until,
     };
 
     /// A real two-second watchdog over `wait` on the paused clock: a controller that spins keeps
@@ -2807,6 +2809,45 @@ mod tests {
         f.sink.release_commits();
         until(&mut n.status, "stopped", is(Actual::Stopped)).await;
         assert_eq!(f.ids("a"), [1], "drained before it stopped");
+    }
+
+    /// DA-OPS-9: an orphan claims patiently, so it never takes a pipeline from this node's own
+    /// live controller: the lease its holder keeps renewing is left alone, and the orphan ends
+    /// once the tombstone is done (by that holder), without tearing anything down.
+    #[tokio::test(start_paused = true)]
+    async fn an_orphan_waits_for_this_nodes_own_live_holder() {
+        let store = ScriptedStore::new();
+        removals(&store).record(&tombstone("p")).await.unwrap();
+        let f = TestFactory::new(&["a"]);
+        let d = deps("n1", &store, &f);
+        let lease = acquired(&leases(&store), "n1").await;
+        let (_m, p) = metrics();
+        let run = LeaseRun::start(
+            leases(&store),
+            lease,
+            holder("n1"),
+            timing(),
+            Instant::now(),
+            p,
+        );
+        let (c, _status) = PipelineController::new(pipeline(), pipeline_docs(), &d);
+        let orphan = tokio::spawn(c.remove_orphan());
+        tokio::time::sleep(timing().duration * 3).await;
+        let live = leases(&store).observe("p").await.unwrap().unwrap();
+        assert_eq!(live.doc.owner_epoch, 1, "the live lease is not taken over");
+        assert!(live.doc.is_held_by(&holder("n1")));
+        assert!(!live.doc.released);
+        assert_eq!(f.source.teardowns(), 0, "nothing is torn down under it");
+        removals(&store)
+            .done("p", chrono::Utc::now())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(60), orphan)
+            .await
+            .expect("the orphan ends once the removal is done")
+            .unwrap();
+        assert_eq!(f.source.teardowns(), 0, "the removal was its holder's");
+        let _ = run.stop().await;
     }
 
     /// A removal whose drain is cut off leaves the source and the lease as they are: the cut-off
