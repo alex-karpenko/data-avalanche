@@ -337,7 +337,9 @@ impl Traces {
     }
 
     /// An exporter to `endpoint` with `headers`. The exporter drops a header whose name or value
-    /// HTTP doesn't take: the config refuses them (V-126).
+    /// HTTP doesn't take, silently: the config refuses them (V-126). It also URL-decodes each
+    /// value (opentelemetry-otlp 0.33.1, `with_headers`), so a `%` is passed as `%25`: a value
+    /// reaches the collector as written, and an encoded CR or LF stays text.
     fn exporter(
         &self,
         endpoint: &str,
@@ -347,7 +349,12 @@ impl Traces {
         let builder = opentelemetry_otlp::SpanExporter::builder()
             .with_http()
             .with_endpoint(url)
-            .with_headers(headers.clone().into_iter().collect::<HashMap<_, _>>());
+            .with_headers(
+                headers
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.replace('%', "%25")))
+                    .collect::<HashMap<_, _>>(),
+            );
         #[cfg(test)]
         let builder = if self.roots.is_empty() {
             builder
@@ -591,6 +598,22 @@ mod tests {
         let r = requests.recv_timeout(Duration::from_secs(10)).unwrap();
         assert_eq!(r.header("authorization"), Some("Bearer n3w"));
         assert_eq!(r.header("x-tenant"), None);
+    }
+
+    /// The exporter URL-decodes header values; a value with `%` still reaches the collector as
+    /// written, an encoded CR LF included (V-126 checks the text as written).
+    #[test]
+    fn a_header_value_with_a_percent_reaches_the_collector_as_written() {
+        let (url, requests) = data_avalanche_testkit::otlp_collector();
+        let headers = BTreeMap::from([(
+            "authorization".to_owned(),
+            "Bearer abc%41%0D%0Ax".to_owned(),
+        )]);
+        let traces = Traces::new("node-1");
+        traces.set(Some(&url), &headers, 1.0).unwrap();
+        block_on(traces.switch.export(Vec::new())).unwrap();
+        let r = requests.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(r.header("authorization"), Some("Bearer abc%41%0D%0Ax"));
     }
 
     #[test]
