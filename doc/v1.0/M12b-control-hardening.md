@@ -361,7 +361,7 @@ The rulings this plan makes (roadmap D-IMPL-25):
 | D-M12b.10 | **The reconciler keeps one entry per key**, under its latest writer | A row is kept only when the read saw the latest writer; older writers decide nothing. The bound is the distinct keys written during the wait | Task 8 (`a_key_written_again_is_logged_once_under_its_latest_writer`, `a_writer_keeps_the_keys_no_later_one_wrote`) |
 | D-M12b.11 | **A chunk read takes its own connection**, at most 4 kept idle (`IDLE_READS`); the timeout starts once it has one; on timeout it cancels and drops its own | The catalog connection stays the stream's; V-038's budget (about three connections a snapshotting table) already allows it | Task 9 (`a_waiting_chunk_read_holds_up_no_other_read`) |
 | D-M12b.12 | **The key fetch follows no redirect and reads at most 1 MiB**; a non-`https` key URL is a warning (V-125), not an error | A JWKS is a few kB; a redirect could move the trust to another host. A warning, as V-052, since a mesh may terminate TLS | Task 10 (`a_key_fetch_follows_no_redirect_and_reads_a_bounded_body`, V-125's cases) |
-| D-M12b.13 | **At most 1024 connections a node**: a permit taken before the accept, held by the connection's stream | Waiting at the accept leaves the backlog to the kernel; a permit inside the stream frees on any close path | Task 10 (`past_the_cap_a_connection_waits_for_one_to_close`) |
+| D-M12b.13 | **At most 1024 connections a node**: a permit taken before the accept, held by the connection's stream; a connection that reads and writes nothing for 60 s (`IDLE_TIMEOUT`) is closed (amended in execution, approved 2026-11-05) | Waiting at the accept leaves the backlog to the kernel; a permit inside the stream frees on any close path. axum 0.8's server gives hyper no timer, so without the idle deadline 1024 silent sockets would hold every place for good | Task 10 (`past_the_cap_a_connection_waits_for_one_to_close`, `an_idle_connection_is_closed_and_gives_its_place_back`, `a_connection_in_use_outlives_the_idle_timeout`) |
 | D-M12b.14 | **Posted validates share a node-wide bucket**: 5, refilled at 1 a second; `429` with `Retry-After`. The node's own file is unlimited | The guess is about the node's variables, whoever asks; the file holds no guess | Task 11 (`posted_validates_past_the_burst_wait`) |
 | D-M12b.15 | **The OpenAPI document is checked by `boon` against the vendored OAS 3.1 schema** (`schema-2022-10-07.json`, the plain schema) | Offline and exact-pinned; the dialect schema's deep Schema-object checks need a meta-schema resolver for little gain | Task 11 (`the_document_is_valid_oas_3_1`) |
 | D-M12b.16 | **Tracing headers are secrets keyed into the exporter** (the endpoint and the headers in force); V-126 checks their syntax and never echoes a value; the environment's `OTEL_EXPORTER_OTLP_HEADERS` wins for a name it sets | A rotated token must reach the next export without a restart; the exporter's own merge order (opentelemetry-otlp 0.33.1) puts the environment last | Task 12 (`an_https_collector_takes_the_export_with_its_headers`, `tracing_headers_resolve_as_secrets`, V-126's cases) |
@@ -7306,7 +7306,7 @@ index 4605ac5..a5b1ac7 100644
 +pub use limit::{RateLimit, VALIDATE_BURST, VALIDATE_PER_SECOND};
  pub use openapi::openapi;
 -pub use server::{Bound, HANDSHAKE_TIMEOUT, ServeError, bind};
-+pub use server::{Bound, HANDSHAKE_TIMEOUT, MAX_CONNECTIONS, ServeError, bind};
++pub use server::{Bound, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT, MAX_CONNECTIONS, ServeError, bind};
  
  use crate::auth::Denied;
  
@@ -9893,7 +9893,7 @@ index 516a165..0d743b5 100644
  | D-16.4 IdP mapping | configurable `role_mapping`, default identity on the three names |
  | D-16.5 TLS rule | V-052 stays a **warning** (upstream TLS termination is common in k8s) |
 +| D-16.6 key fetch (M12b, DA-API-16) | A JWKS or discovery fetch follows no redirect (a `3xx` is refused) and reads at most 1 MiB; a non-`https` key URL warns (V-125) |
-+| D-16.7 limits (M12b, DA-API-17, DA-API-20) | Constants, not config: at most 1024 open connections a node (past it, the accept waits for one to close); a posted `validate` body takes a token from a node-wide bucket of 5, refilled at 1 a second, else `429` with `Retry-After` |
++| D-16.7 limits (M12b, DA-API-17, DA-API-20) | Constants, not config: at most 1024 open connections a node (past it, the accept waits for one to close), one idle for 60 s closed; a posted `validate` body takes a token from a node-wide bucket of 5, refilled at 1 a second, else `429` with `Retry-After` |
 ```
 `doc/research/Clustering_Architecture_Research.md`:
 
@@ -10005,7 +10005,7 @@ index 3956465..b3b1b49 100644
 +| DA-SNAP-11 | 🟥 → ✅ | `reconcile.rs`: a key logged once, under its latest writer, the log bounded by the distinct keys written during the wait; `a_key_written_again_is_logged_once_under_its_latest_writer` |
 +| DA-SNAP-12 | 🟥 → ✅ | `connect.rs` `Connector::read`: each chunk read on a connection of its own, `IDLE_READS` (4) kept; `a_waiting_chunk_read_holds_up_no_other_read` |
 +| DA-API-16 | 🟥 → ✅ | `auth.rs`: no redirect, `MAX_KEY_DOCUMENT` (1 MiB); V-125 warns on a non-`https` key URL; `a_key_fetch_follows_no_redirect_and_reads_a_bounded_body` |
-+| DA-API-17 | 🟥 → ✅ | `server.rs` `MAX_CONNECTIONS` (1024), a permit before each accept; `past_the_cap_a_connection_waits_for_one_to_close` |
++| DA-API-17 | 🟥 → ✅ | `server.rs` `MAX_CONNECTIONS` (1024), a permit before each accept, and `IDLE_TIMEOUT` (60 s) closing a connection that moves nothing; `past_the_cap_a_connection_waits_for_one_to_close`, `an_idle_connection_is_closed_and_gives_its_place_back` |
 +| DA-API-18 | 🟥 → ✅ | `the_document_is_valid_oas_3_1`: the document checked by `boon` against the vendored OAS 3.1 schema |
 +| DA-API-20 | 🟥 → ✅ | `limit.rs`: posted validates at 1 a second after a burst of 5, `429` with `Retry-After` (Q-M12b-4); `posted_validates_past_the_burst_wait`. The node's own file stays unlimited |
 +| DA-OBS-7 | 🟥 → ✅ | `globals.tracing.headers` (secrets, R, V-126); the exporter rebuilt when they change; `an_https_collector_takes_the_export_with_its_headers`; `deployment/observability.md` |
@@ -10098,7 +10098,7 @@ index 3956465..b3b1b49 100644
 -| DA-API-17 | 🆕 No connection limit on the TLS listener | 🟢 | 🟥 | §41.1: a handshake task per connection, each bounded at 10 s. | — |
 -| DA-API-18 | 🆕 The OpenAPI document isn't validated against the OAS 3.1 schema | 🟢 | 🟥 | §41.1: snapshot-tested and read back by utoipa only. | — |
 +| DA-API-16 | 🆕 The JWKS fetch accepts http, follows redirects, reads an unbounded body | 🟢 | ✅ | §41.1: a V-rule warning for a non-`https` key URL, no redirects, a body cap. **✅ 2026-11-04 (§57):** `auth.rs`: no redirect, `MAX_KEY_DOCUMENT` (1 MiB); V-125 warns on a non-`https` key URL; `a_key_fetch_follows_no_redirect_and_reads_a_bounded_body` | — |
-+| DA-API-17 | 🆕 No connection limit on the TLS listener | 🟢 | ✅ | §41.1: a handshake task per connection, each bounded at 10 s. **✅ 2026-11-04 (§57):** `server.rs` `MAX_CONNECTIONS` (1024), a permit before each accept; `past_the_cap_a_connection_waits_for_one_to_close` | — |
++| DA-API-17 | 🆕 No connection limit on the TLS listener | 🟢 | ✅ | §41.1: a handshake task per connection, each bounded at 10 s. **✅ 2026-11-04 (§57):** `server.rs` `MAX_CONNECTIONS` (1024), a permit before each accept, and `IDLE_TIMEOUT` (60 s) closing a connection that moves nothing; `past_the_cap_a_connection_waits_for_one_to_close`, `an_idle_connection_is_closed_and_gives_its_place_back` | — |
 +| DA-API-18 | 🆕 The OpenAPI document isn't validated against the OAS 3.1 schema | 🟢 | ✅ | §41.1: snapshot-tested and read back by utoipa only. **✅ 2026-11-04 (§57):** `the_document_is_valid_oas_3_1`: the document checked by `boon` against the vendored OAS 3.1 schema | — |
  | DA-API-19 | 🆕 Validate of a posted body echoes a `${VAR}`-resolved pipeline `id` | 🟡 | ✅ | §41 (2026-10-24, on Oleksii's request, PR #13): a posted body's templated `id` or `defaults.id` is refused with V-055 before any rule runs, so no expanded id is echoed or used (`load_posted_str`, `ConfigCoordinator::check_posted`); the node-file validate and the reload are unchanged. §41.1: an operator could read a node env var fitting V-055's pattern. | — |
 -| DA-API-20 | 🆕 Validate's verdicts on a posted body's other `${VAR}` leaves answer yes or no about a variable | 🟢 | 🟥 | §41.1: V-063 (set or not), the uniqueness rules V-058/V-059/V-120, pattern and range checks, and the diff's field paths tell, one request at a time, whether a variable is set or equals a value; nothing is echoed. Every validate is logged with its caller (2144392); M12 rate-limits validate. | — |
@@ -10205,3 +10205,14 @@ git commit -m "docs: the M12b changes — removing a pipeline, keys applied at t
   `server_millis`'s doc comment and the function, so the doc landed on the constant. The constant
   now sits above it, each under its own comment. No code changes. Tasks 10–16's blocks apply in
   order on `053c03a`.
+- **Task 10** (review fix, `ab4b997`, approved by Oleksii 2026-11-05): the cap came with no idle
+  limit. axum 0.8.9's `serve` builds hyper's connection builder without a timer
+  (`serve/mod.rs:391`), so hyper's header-read timeout never fires, and 1024 connections that say
+  nothing (opened by anyone who reaches the port, before any auth) held every place for good,
+  `/health/live` included. `Counted` now closes a connection that reads and writes nothing for
+  `IDLE_TIMEOUT` (60 s): a silent one, a kept-alive one between requests, or a request whose
+  handler answers nothing for that long (the API has no streaming answers). `Bound.idle_timeout`
+  (tests lower it), and `Bound`'s `Debug` shows both limits. Tests
+  `an_idle_connection_is_closed_and_gives_its_place_back` (plain and TLS; fails without the
+  deadline) and `a_connection_in_use_outlives_the_idle_timeout`. Ruling D-M12b.13 amended; Task
+  11's re-export adds `IDLE_TIMEOUT`; the research and tracker rows for DA-API-17 name it.
