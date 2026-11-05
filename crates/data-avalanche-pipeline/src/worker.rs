@@ -161,12 +161,14 @@ impl PipelineWorker {
                 attempt = 0;
             }
             // A reconnect is counted once it is decided, in one update with its reason: an
-            // observer that sees the count sees why.
+            // observer that sees the count sees why. The new session has read nothing and holds
+            // nothing pending: the frontier and the pending start are cleared in that update, so
+            // the owner never reads the old session's frontier under the new count (DA-OBS-8).
             match failed {
                 SourceError::Transient(error) => {
                     contended_since = None;
                     core.update(|st| {
-                        st.reconnects += 1;
+                        st.reconnect();
                         st.phase = Phase::Reconnecting { error };
                     });
                 }
@@ -204,7 +206,7 @@ impl PipelineWorker {
                     }
                     let error = SourceError::Contended(detail).to_string();
                     core.update(|st| {
-                        st.reconnects += 1;
+                        st.reconnect();
                         st.phase = Phase::Reconnecting { error };
                     });
                 }
@@ -213,7 +215,7 @@ impl PipelineWorker {
                     let warning = format!(
                         "the source lost the stream position {position} ({detail}): the stream restarts at a new position and the tables are snapshotted again"
                     );
-                    core.update(|st| st.reconnects += 1);
+                    core.update(WorkerStatus::reconnect);
                     // The checkpoint whose position was lost, with the server the session read:
                     // on another server the source refuses to replace it (DA-SRC-20), and the
                     // halt or the rerun of Phase 0 its refusal asks ends the worker below.
@@ -1743,6 +1745,40 @@ mod tests {
         let end = worker.run().await;
         assert!(matches!(end, Err(WorkerError::Contended { .. })), "{end:?}");
         assert_eq!(handle.status.borrow().reconnects, 0);
+    }
+
+    /// DA-OBS-8: a reconnect starts a session that has read nothing and holds nothing pending.
+    /// The count comes with a cleared frontier and pending start, so the owner's lag never takes
+    /// the old session's frontier as the new one's.
+    #[tokio::test]
+    async fn a_reconnect_clears_the_frontier_and_the_pending_start() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let p = Yaml {
+            sink: "flush: { seconds: 3600 }",
+            ..Yaml::default()
+        }
+        .build();
+        let end = run_with(&p, deps(&w), async |h| {
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+            wait_until("a change read and pending", || {
+                let st = h.status.borrow();
+                st.read.is_some() && st.unsynced_since_micros.is_some()
+            })
+            .await;
+            for _ in 0..10_000 {
+                w.source
+                    .fail(Method::OpenStream, SourceError::Transient("refused".into()));
+            }
+            w.source
+                .fail(Method::Next, SourceError::Transient("reset".into()));
+            wait_until("a reconnect", || h.status.borrow().reconnects >= 1).await;
+            let st = h.status.borrow().clone();
+            assert_eq!(st.read, None, "the new session has read nothing");
+            assert_eq!(st.unsynced_since_micros, None, "nor holds anything pending");
+        })
+        .await;
+        assert!(end.is_ok(), "{end:?}");
     }
 
     /// A busy slot's reconnect is counted with its reason, as a transient failure's is: the

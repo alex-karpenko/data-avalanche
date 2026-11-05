@@ -1632,6 +1632,19 @@ mod tests {
         lag.carry(&mut session, &status(at(160), None, 1));
         assert_eq!(lag.since(), None);
 
+        // A second reconnect, as the worker reports it: the count comes with no frontier and
+        // nothing pending (the old session's 200 isn't the new one's). The kept start holds
+        // until the new session reads as far, its first change durable before then included.
+        lag.carry(&mut session, &status(at(200), Some(7), 1));
+        lag.carry(&mut session, &status(None, None, 2));
+        assert_eq!(lag.since(), Some(7), "the reconnect's own status");
+        lag.carry(&mut session, &status(None, None, 2));
+        assert_eq!(lag.since(), Some(7), "the same status, polled again");
+        lag.carry(&mut session, &status(at(180), None, 2));
+        assert_eq!(lag.since(), Some(7), "re-read short of 200");
+        lag.carry(&mut session, &status(at(200), None, 2));
+        assert_eq!(lag.since(), None);
+
         let mut lag = Lag::default();
         lag.carry(&mut None, &status(None, Some(9), 0));
         assert_eq!(

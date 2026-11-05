@@ -149,6 +149,14 @@ pub struct WorkerStatus {
 pub const MAX_WARNINGS: usize = 50;
 
 impl WorkerStatus {
+    /// Counts a reconnect: the new session has read nothing yet and holds nothing pending, so
+    /// the frontier and the pending start go with the count (DA-OBS-8).
+    pub fn reconnect(&mut self) {
+        self.reconnects += 1;
+        self.read = None;
+        self.unsynced_since_micros = None;
+    }
+
     /// Adds a warning as the latest. One the status already shows moves to the end instead: a
     /// rerun of Phase 0, a reconnect or a new failing streak that finds the same thing again adds
     /// nothing. Past [`MAX_WARNINGS`] the oldest goes.
