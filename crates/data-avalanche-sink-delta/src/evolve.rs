@@ -5,12 +5,14 @@
 //! - RENAME → `Degraded`: the new name is added with the old column's type, the old one stays;
 //! - NOT NULL changes, appended enum values, changes with no target effect → `Applied`, nothing
 //!   to do (target columns are nullable, S-O);
-//! - everything else (a type change, an identifier change, a dropped table …) → `Unsupported`.
+//! - everything else (a type change, an identifier change, a dropped table …) → `Unsupported`,
+//!   and so is a column added or renamed to a name that differs from one of the table's by case
+//!   alone: delta-rs can't hold both, and would refuse the commit at every retry (DA-SINK-12).
 //!
 //! Every step is idempotent: a replayed delta finds its columns and adds nothing (§8.3).
 
 use data_avalanche_core::{
-    EvolveOutcome, SchemaChange, SchemaDelta, SinkError, added_column_field,
+    EvolveOutcome, SchemaChange, SchemaDelta, SinkError, added_column_field, differ_by_case_alone,
 };
 use deltalake::DeltaTable;
 use deltalake::kernel::StructField;
@@ -37,9 +39,26 @@ pub async fn evolve(
             .cloned()
             .or_else(|| added.iter().find(|f| f.name() == name).cloned())
     };
+    // A name of the table's, or one this delta adds, that `name` matches by case alone.
+    let clash = |name: &str, added: &[StructField]| {
+        schema
+            .fields()
+            .chain(added.iter())
+            .find(|f| differ_by_case_alone(f.name(), name))
+            .map(|f| f.name().clone())
+    };
+    let clashes = |name: &str, held: String| EvolveOutcome::Unsupported {
+        reason: format!(
+            "column {name:?} differs from the table's column {held:?} by case alone, and a \
+             Delta table can't hold both"
+        ),
+    };
     for change in &delta.changes {
         match change {
             SchemaChange::AddColumn(column) => {
+                if let Some(held) = clash(&column.name, &added) {
+                    return Ok((table, clashes(&column.name, held)));
+                }
                 let field = added_column_field(column);
                 match has(&column.name, &added) {
                     Some(existing) => {
@@ -65,6 +84,9 @@ pub async fn evolve(
                 warnings.push(format!("column {name:?} soft-dropped: kept, written NULL"));
             }
             SchemaChange::RenameColumn { from, to, .. } => {
+                if let Some(held) = clash(to, &added) {
+                    return Ok((table, clashes(to, held)));
+                }
                 let old = has(from, &added).ok_or_else(|| {
                     permanent(format!("renamed column {from:?} isn't in the table"))
                 })?;
@@ -196,6 +218,75 @@ mod tests {
         let version = h.version();
         apply(&mut h, vec![rename]).await;
         assert_eq!(h.version(), version, "a replayed rename adds nothing");
+    }
+
+    /// DA-SINK-12: delta-rs refuses a column beside one that differs by case alone, Unicode case
+    /// too, so the evolver says so instead of retrying a commit that fails every time.
+    #[tokio::test]
+    async fn a_column_that_differs_from_one_by_case_alone_is_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = created(&dir).await;
+        let add = |name: &str| SchemaChange::AddColumn(ColumnSchema::new(name, V::Text, "text"));
+        assert_eq!(
+            apply(&mut h, vec![add("ärger")]).await,
+            EvolveOutcome::Applied
+        );
+        let version = h.version();
+        for change in [
+            add("DOC"),
+            add("ÄRGER"),
+            SchemaChange::RenameColumn {
+                from: "ref".into(),
+                to: "Doc".into(),
+                proven: true,
+            },
+            // Within one delta: the second spelling clashes with the first.
+            add("Tag"),
+        ] {
+            let changes = match &change {
+                SchemaChange::AddColumn(c) if c.name == "Tag" => vec![add("tag"), change],
+                _ => vec![change],
+            };
+            let out = apply(&mut h, changes).await;
+            assert!(
+                matches!(&out, EvolveOutcome::Unsupported { reason } if reason.contains("by case alone")),
+                "{out:?}"
+            );
+        }
+        assert_eq!(h.version(), version, "nothing was written");
+        // A rename of a column's case alone clashes with the column it renames, which the sink
+        // keeps (a rename adds the new name and keeps the old one).
+        let out = apply(
+            &mut h,
+            vec![SchemaChange::RenameColumn {
+                from: "doc".into(),
+                to: "DOC".into(),
+                proven: true,
+            }],
+        )
+        .await;
+        assert!(matches!(out, EvolveOutcome::Unsupported { .. }), "{out:?}");
+    }
+
+    /// What the rule above follows, measured on the delta-rs this workspace links: its schema
+    /// check folds names with Unicode lower-casing, not ASCII's.
+    #[tokio::test]
+    async fn delta_rs_refuses_a_column_beside_one_that_differs_by_unicode_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = created(&dir).await;
+        let field = |n: &str| StructField::new(n, deltalake::kernel::DataType::STRING, true);
+        let table = h
+            .table()
+            .clone()
+            .add_columns()
+            .with_fields([field("ärger")])
+            .await
+            .unwrap();
+        let refused = table.add_columns().with_fields([field("ÄRGER")]).await;
+        assert!(
+            refused.is_err(),
+            "delta-rs took a column differing by Unicode case"
+        );
     }
 
     #[tokio::test]

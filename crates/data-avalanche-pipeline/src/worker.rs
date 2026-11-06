@@ -2043,6 +2043,12 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        // Unicode case too, as delta-rs folds it (DA-SINK-12).
+        let sink = upsert_schema(&cased("id", "ärger"));
+        assert!(matches!(
+            missing_columns(&sink, &cased("id", "ÄRGER")),
+            Err(HaltReason::SchemaMismatch { column, .. }) if column == "ÄRGER"
+        ));
     }
 
     #[tokio::test]

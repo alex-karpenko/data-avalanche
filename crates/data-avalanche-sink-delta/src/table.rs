@@ -7,7 +7,9 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_row::{RowConverter, SortField};
 use arrow_schema::SchemaRef;
-use data_avalanche_core::{PartitionTransform, SinkError, SourcePosition, TableRef, TableSpec};
+use data_avalanche_core::{
+    PartitionTransform, SinkError, SourcePosition, TableRef, TableSpec, differ_by_case_alone,
+};
 use deltalake::datafusion::prelude::SessionContext;
 use deltalake::logstore::object_store::path::Path;
 use deltalake::logstore::object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
@@ -213,6 +215,21 @@ impl TableHandle {
         spec: &TableSpec,
         defaults: &TableDefaults,
     ) -> Result<(), SinkError> {
+        // Two source columns that differ by case alone (PostgreSQL's `note` and `"Note"`) can't
+        // both be Delta columns: delta-rs would refuse the table at every retry (DA-SINK-12).
+        let fields = spec.schema.fields();
+        for (i, f) in fields.iter().enumerate() {
+            if let Some(g) = fields[..i]
+                .iter()
+                .find(|g| differ_by_case_alone(g.name(), f.name()))
+            {
+                return Err(permanent(format!(
+                    "columns {:?} and {:?} differ by case alone, and a Delta table can't hold both",
+                    g.name(),
+                    f.name()
+                )));
+            }
+        }
         let columns = spec
             .schema
             .fields()
@@ -490,6 +507,32 @@ mod tests {
 
     fn t() -> TableRef {
         TableRef::new("public", "orders")
+    }
+
+    /// DA-SINK-12: a table whose columns differ by case alone is refused for good, not retried.
+    #[tokio::test]
+    async fn a_table_whose_columns_differ_by_case_alone_is_refused() {
+        use data_avalanche_core::{ColumnSchema, ColumnValueType as V, TableSchema};
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = handle(&dir, &t()).await;
+        let schema = TableSchema::new(
+            t(),
+            vec![
+                ColumnSchema::new("id", V::Int64, "bigint").not_null(),
+                ColumnSchema::new("note", V::Text, "text"),
+                ColumnSchema::new("Note", V::Text, "text"),
+            ],
+            vec!["id".into()],
+        )
+        .unwrap();
+        let e = h
+            .create(&spec(&schema), &TableDefaults::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&e, SinkError::Permanent { reason } if reason.contains("\"note\" and \"Note\" differ by case alone")),
+            "{e}"
+        );
     }
 
     /// Physical rows of `orders` (uuid as text, `at` as timestamp_ntz), in the order given.

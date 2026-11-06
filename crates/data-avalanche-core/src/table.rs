@@ -49,9 +49,24 @@ where
     columns.into_iter().find(|c| is_reserved_column(c))
 }
 
+/// True when `a` and `b` are two names that differ by case alone, which a Delta table can't hold
+/// side by side: delta-rs compares column names after Unicode lower-casing (`to_lowercase`, as
+/// `StructType::try_new` does), so `Ärger` and `ärger` clash as `Note` and `note` do.
+pub fn differ_by_case_alone(a: &str, b: &str) -> bool {
+    a != b && a.to_lowercase() == b.to_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_that_differ_by_case_alone_clash_unicode_too() {
+        assert!(differ_by_case_alone("Note", "note"));
+        assert!(differ_by_case_alone("ÄRGER", "ärger"), "Unicode, not ASCII");
+        assert!(!differ_by_case_alone("note", "note"), "one name");
+        assert!(!differ_by_case_alone("note", "notes"));
+    }
 
     #[test]
     fn unknown_fields_are_refused() {
