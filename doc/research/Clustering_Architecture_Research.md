@@ -1,7 +1,7 @@
 ---
 title: Clustering Architecture Research
 status: Research / Design proposal (input for further elaboration)
-updated: 2026-10-22
+updated: 2026-11-06
 domain: Architecture / Distributed Systems
 tags: [clustering, gossip, swim, memberlist, consistent-hashing, lease, split-brain, rebalancing, config-propagation]
 closes_or_advances: [G-8, G-9, G-2, G-17, G-23, G-36, "OQ-CL1", "OQ-CL3", "OQ-CL4", "OQ-API3", "OQ-P3", "5.1", "5.2"]
@@ -755,6 +755,38 @@ generation, keeps running its own, and tries again at each poll, and the status 
 not converged. A node whose own file differs from the generation in a per-node key is warned at
 startup (DA-OPS-8), since a reload from it would be refused.
 
+**Rolling a PROC change (M12b, DA-OPS-12).** Rejecting every PROC change made a key written as a
+literal impossible to change: a restarted node adopts the stored generation, not its file. A reload
+asked with `?restart=accept` now publishes it: each running node adopts the generation, keeps the
+PROC values it started with (it lists the fields in `restart_pending`, `GET /v1/config/status`, per
+node), and a node takes them at its next start, so a rolling restart applies the change. The
+fields the cluster keeps for good (`config_version`, `globals.cloud`, `globals.state`,
+`globals.azure`, and the anchor's `tokens`, `lease_duration`, `lock_backend`) are refused even
+then (config spec §1.2, V-061): a new value is a new cluster.
+
+### 9.5 Removal tombstones (M12b, DA-OPS-9, DA-OPS-10)
+A removed pipeline used to be torn down only by a controller that ran it when its node adopted the
+generation. A removal that no running controller saw (its owner was down, or the lease was between
+release and claim) left its slot and publication behind, and a pipeline added back on the same
+resources raced the teardown. Now:
+
+- The node that adopts a generation which drops ids first writes `removals/<id>.json` in
+  `globals.state` for each (the id, the last generation that had it, when), a create-if-absent
+  write; a tombstone that can't be written refuses the adoption, which is tried again at the next
+  poll. Then it applies the removal as before.
+- The controller that tears the pipeline down (drain, `auto_cleanup`, release) marks its tombstone
+  done (`done_at`).
+- Every 30 s each node reads the pending tombstones. For one whose id the ring places on it and no
+  live controller holds, it resolves the pipeline from the tombstone's generation, claims the lease
+  once it is free, tears the pipeline down, and marks the tombstone done.
+- A controller, before its first claim, waits until every pending tombstone of its own id, or of a
+  pipeline it `shares` resources with (slot, publication, sink, state location), is done. A
+  tombstone that can't be read is waited for; one whose generation doesn't resolve is logged and
+  not waited for, since nothing could tear it down on this node either.
+
+Tombstones are marked done, not deleted: their number is bounded by the distinct ids ever removed,
+and they record what was removed and when.
+
 ---
 
 ## 10. Single-node mode and seamless scale-out (requirement 6, closes OQ-CL4 / 4.4)
@@ -791,6 +823,12 @@ seed list:
 > periodically**, not just at boot, so a node that has lost all peers can re-bootstrap; once gossip is
 > joined, SWIM carries membership and DNS is only the bootstrap/rejoin path. These fields are already
 > reserved in config spec §16 (G-9 row).
+>
+> **As built (M12b, DA-CLUS-15):** asking the seeds only while a node had no peer let pods started
+> together settle in groups that never merged (each group had a peer). Every node, `static` or
+> `dns`, now resolves its seeds every 5 s (`REDISCOVER`) and announces to the addresses that aren't
+> members of its view; an address that is a member costs nothing. SWIM still carries the
+> membership; the seeds only join groups.
 
 ### 10.3 The N=1 ↔ N>1 symmetry
 The architecture is *identical* at every cluster size; only the membership set differs. That symmetry

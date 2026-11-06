@@ -41,7 +41,12 @@ flowchart TB
 - A row the stream changes while the snapshot runs converges: the streamed change wins over the
   chunk's older copy.
 - `parallelism` (1) tables are snapshotted at once; one table is read in order. On PostgreSQL each
-  table being snapshotted holds about three connections: more than 4 at once warns (V-038).
+  table being snapshotted holds about three connections: more than 4 at once warns (V-038). Each
+  chunk read runs on a connection of its own, so a read that waits (on a lock, say) holds up
+  neither the other tables' reads nor the stream's catalog queries.
+- A snapshot doesn't hold the source's log back: the stream goes on beside it and its position
+  advances with each flush, so the WAL or binlog a slow snapshot keeps is only what the stream
+  hasn't flushed yet.
 - `source.timeouts.snapshot` (6 h) bounds one table's snapshot in one run; past it the table halts
   `SNAPSHOT_TIMEOUT`. Raise it and start a job for the table.
 
@@ -56,7 +61,8 @@ pipeline's jobs. Jobs are kept in the pipeline's state and survive restarts and 
   job's tables from their first row, whatever their mode.
 - A job's table that is halted has its halt cleared and its schema taken afresh from the catalog.
 - A table the config doesn't replicate is copied once, and not streamed.
-- A job **upserts**: it never deletes. A row deleted at the source while the table was halted, or
-  not replicated, stays in the Delta table. To start clean, drop or move the Delta table first.
+- A job **upserts**: a row deleted at the source while the table was halted, or not replicated,
+  stays in the Delta table. Ask the job with `"truncate": true` to empty each of its Delta tables
+  first; until the job completes, they are empty or partly copied.
 
 [Snapshot jobs](/data-avalanche/runbooks/snapshot-jobs/) is the runbook.

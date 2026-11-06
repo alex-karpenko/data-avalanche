@@ -19,8 +19,8 @@ the changes before now are missing, and you copy the tables yourself with a
 
 :::caution[A fresh copy keeps rows deleted in the gap]
 The copy upserts every row it reads and deletes nothing: a row deleted at the source during the
-gap stays in the Delta table. When the tables must be exact, stop the pipeline, drop or move its
-Delta tables, then copy them.
+gap stays in the Delta table. When the tables must be exact, copy them with a snapshot job asked
+with `"truncate": true`, which empties each Delta table before its copy.
 :::
 
 <Tabs>
@@ -81,8 +81,8 @@ as at a restart, and recovers as in step 2.
    you start a snapshot job for each table.
 3. Rows the old server wrote that the promoted one never received (the changes written after the
    replica fell behind or was cut off) stay in the Delta tables. The copy only upserts, so it
-   doesn't delete them; they are the changes the failover lost. To start clean, stop the pipeline,
-   drop or move the Delta tables, then let it copy them afresh, as in the caution above and in
+   doesn't delete them; they are the changes the failover lost. To start clean, copy the tables
+   with a snapshot job asked with `"truncate": true`, as in the caution above and in
    [A halted table](/data-avalanche/runbooks/halted-table/#3-copy-the-table-again).
 
 Leave `source_change_action` at `re_snapshot` only where a failover should recover by itself.
