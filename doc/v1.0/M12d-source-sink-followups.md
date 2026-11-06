@@ -56,8 +56,8 @@ Phase 4's reposition), `doc/specs/Schema_Change_Detection_and_Evolution.md` §7.
 The tracker rows: §54.1 of `analysis/CDC_Design_Gap_Analysis_v1.md`.
 
 **Spec patches:** five places where this plan goes past what the specs say. They are drafted in
-§Spec patches below, to be approved with the plan and applied in Task 9. Approving the plan isn't
-approving them (CLAUDE.md: spec edits need explicit approval).
+§Spec patches below and applied in Task 9. **Oleksii approved the plan and the patches, D-M12d.10
+included, on 2026-11-06.**
 
 ## Global Constraints
 
@@ -204,7 +204,7 @@ approving them (CLAUDE.md: spec edits need explicit approval).
 - A node restarted with an edited config file runs the cluster's stored generation, not the file:
   the E2E moves the pipeline with a reload.
 
-## Spec patches (for approval; applied in Task 9)
+## Spec patches (approved 2026-11-06; applied in Task 9)
 
 **P-1 — `Configuration_Specification.md` §9.2.1, `slot_management` row.** After "`managed`: create
 the slot if absent, reuse if present, drop on delete per `auto_cleanup`." insert: "On PostgreSQL
@@ -1945,7 +1945,7 @@ git add docs
 git commit -m "docs: failover slots, the alternation halt, case clashes and hidden tables (M12d)"
 ```
 
-- [ ] **Step 2: The spec patches (only once Oleksii has approved §Spec patches)**
+- [ ] **Step 2: The spec patches (approved 2026-11-06)**
 
 Apply P-1…P-5 as drafted, bump each spec's `updated:`, and add the config §15 history item.
 
