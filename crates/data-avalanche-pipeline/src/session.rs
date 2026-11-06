@@ -346,7 +346,8 @@ impl<'c> Session<'c> {
         core.update(|st| {
             st.phase = Phase::Streaming;
             st.checkpoint = Some(checkpoint.clone());
-            for h in recorded.iter().chain(&halts) {
+            // A copy's halt fails its job table: it isn't the pipeline's, and isn't shown.
+            for h in recorded.iter().chain(&halts).filter(|h| !h.copy) {
                 st.halted.insert(h.table.clone(), h.reason.clone());
             }
             warnings.into_iter().for_each(|w| st.warn(w));

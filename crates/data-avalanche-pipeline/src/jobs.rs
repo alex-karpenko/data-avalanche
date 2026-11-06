@@ -626,6 +626,49 @@ mod tests {
         assert!(w.ids("x").is_empty());
     }
 
+    /// A copy's halt stays out of the halted tables after a reconnect: the session that opens
+    /// next reads the recorded halts, the copy's among them, and shows only the pipeline's.
+    #[tokio::test]
+    async fn a_copy_s_halt_stays_out_of_the_halted_tables_after_a_reconnect() {
+        let w = World::new(&["a", "x"]);
+        w.source.outside_config(&t("x"));
+        established(&w).await;
+        w.source.load(&t("x"), rows(1..=3));
+        ask(&w, "p~1", &["x"]).await;
+        w.source.fail(
+            Method::ReadChunk,
+            SourceError::Permanent("permission denied for table x".into()),
+        );
+        let (end, st) = run(&w, &never(2), async |status| {
+            w.source
+                .commit(FakeTxn::new().insert(&t("a"), row(1, "streamed")));
+            wait_until("the stream moves on", || w.ids("a") == [1]).await;
+            streamed(&status, &w).await;
+            let halts = w.docs.halts().await.unwrap().tables;
+            assert!(halts.iter().any(|h| h.copy), "recorded first: {halts:?}");
+            w.source
+                .fail(Method::Next, SourceError::Transient("reset".into()));
+            wait_until("a reconnect", || status.borrow().reconnects >= 1).await;
+            w.source
+                .commit(FakeTxn::new().insert(&t("a"), row(2, "streamed")));
+            wait_until("the next session streams", || w.ids("a") == [1, 2]).await;
+            streamed(&status, &w).await;
+            assert!(
+                status.borrow().halted.is_empty(),
+                "a copy's halt isn't shown after a reconnect: {:?}",
+                status.borrow().halted
+            );
+        })
+        .await;
+        assert_eq!(end.unwrap(), Exit::Drained);
+        assert!(st.reconnects >= 1);
+        assert!(st.halted.is_empty(), "{:?}", st.halted);
+        let halts = w.docs.halts().await.unwrap().tables;
+        assert_eq!(halts.len(), 1, "{halts:?}");
+        assert_eq!(halts[0].table, t("x"));
+        assert!(halts[0].copy, "recorded as a copy's");
+    }
+
     /// A copy that halts in a run (here its table is dropped while it is read) fails in its
     /// job at the next start, with the halt's reason, and its halt goes: no job can clear the
     /// halt of a table gone, and the pipeline doesn't replicate it.
