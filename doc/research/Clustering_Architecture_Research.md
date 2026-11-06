@@ -775,10 +775,14 @@ resources raced the teardown. Now:
   write; a tombstone that can't be written refuses the adoption, which is tried again at the next
   poll. Then it applies the removal as before.
 - The controller that tears the pipeline down (drain, `auto_cleanup`, release) marks its tombstone
-  done (`done_at`).
+  done (`done_at`), before it releases the lease.
 - Every 30 s each node reads the pending tombstones. For one whose id the ring places on it and no
   live controller holds, it resolves the pipeline from the tombstone's generation, claims the lease
-  once it is free, tears the pipeline down, and marks the tombstone done.
+  once it is free, tears the pipeline down, and marks the tombstone done. Holding the lease, it
+  first reads the current generation: one that configures the same id again on the same slot or
+  publication undoes the removal (a node went from the generation before it to the one after), so
+  the tombstone is marked done with nothing torn down; one it can't read or load leaves the
+  tombstone for the next sweep (config §12.3, M12b final review).
 - A controller, before its first claim, waits until every pending tombstone of its own id, or of a
   pipeline it `shares` resources with (slot, publication, sink, state location), is done. A
   tombstone that can't be read is waited for; one whose generation doesn't resolve is logged and

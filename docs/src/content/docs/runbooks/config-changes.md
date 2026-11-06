@@ -65,8 +65,36 @@ when the generation lands (its owner was stopped, or the lease was between two n
 the ring places the id on finds the pending record within 30 s, takes the lease once it is free,
 and tears the pipeline down itself. A pipeline added back with the same id, or a new one on the
 removed one's slot, publication, sink or state location, waits for the record to be done before
-it starts, whichever node it lands on. A record that can't be read or resolved is waited for, and
-the node logs why.
+it starts, whichever node it lands on. A record that can't be read (a storage failure) is waited
+for. A record of another id that doesn't resolve on the node (the generation it names no longer
+loads there) is skipped with a warning: the node can't tell whether the pipeline takes its place.
+A record of the pipeline's own id is always waited for, resolved or not.
+
+A removal undone before its owner saw it (the pipeline removed, then added back with the same id
+on the same slot or publication, and the owner went straight to the later generation) leaves a
+pending record too. The node the ring places the id on marks it done once it holds the lease,
+without dropping anything: the slot and the publication are the running pipeline's.
+
+A pipeline added back with its id can be stuck on its old record when the generation the record
+names no longer loads on any node, typically a `${VAR}` it used that is gone; the nodes log the
+record as not resolving. Either restore the variable on the nodes for one sweep (30 s): the node
+the ring places the id on settles the record, tearing the old pipeline down, or, when the pipeline
+came back on the same slot or publication, marking it done without dropping anything. Or drop the
+old slot and publication by hand, then mark the record done yourself: in `globals.state`, set
+`done_at` in `removals/<id>.json`, keeping the rest as it is:
+
+```json
+{
+  "version": 1,
+  "pipeline_id": "orders",
+  "generation": 7,
+  "hash": "blake3:…",
+  "removed_at": "2026-11-06T09:12:03.418Z",
+  "done_at": "2026-11-06T10:00:00Z"
+}
+```
+
+The pipeline starts within a lease renewal interval of the write.
 
 ## Rotate a secret
 
@@ -101,8 +129,8 @@ Some keys are refused even with `restart=accept`, because the cluster keeps them
 
 - `tokens`, `lock_backend` and `lease_duration` are pinned in the cluster's anchor and never
   change for that `globals.state`.
-- `config_version`, `cloud`, `globals.state` and `globals.azure` say what and where the cluster
-  is: changing them makes a new cluster. Stop every node, then start them with a new
+- `config_version`, `globals.cloud`, `globals.state` and `globals.azure` say what and where the
+  cluster is: changing them makes a new cluster. Stop every node, then start them with a new
   `globals.state.prefix`, so that the file bootstraps a new anchor and generation. Never run
   nodes on the old and the new location at once: they would be two clusters holding the same
   pipelines. This path isn't covered by the project's tests yet.

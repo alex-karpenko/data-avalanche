@@ -76,6 +76,6 @@ globals:
       authorization: "Bearer ${OTLP_TOKEN}"
 ```
 
-`OTEL_EXPORTER_OTLP_HEADERS` in a node's environment (`key=value,…`) is sent too, and wins over a
-configured header of the same name. Use an `https` endpoint: a token sent over `http` can be read
-on the way.
+`OTEL_EXPORTER_OTLP_TRACES_HEADERS` in a node's environment (`key=value,…`), read first, or else
+`OTEL_EXPORTER_OTLP_HEADERS`, is sent too, and wins over a configured header of the same name. Use
+an `https` endpoint: a token sent over `http` can be read on the way.
