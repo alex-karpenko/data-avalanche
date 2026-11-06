@@ -782,7 +782,11 @@ resources raced the teardown. Now:
   first reads the current generation: one that configures the same id again on the same slot or
   publication undoes the removal (a node went from the generation before it to the one after), so
   the tombstone is marked done with nothing torn down; one it can't read or load leaves the
-  tombstone for the next sweep (config §12.3, M12b final review).
+  tombstone for the next sweep (config §12.3, M12b final review). That done is one write
+  conditional on the tombstone's version as read under the lease: every record raises the
+  tombstone's `records` counter, so its bytes, and its version on every backend (S3's ETag is
+  the body's MD5), change, and a removal recorded again meanwhile wins and waits for the next
+  sweep.
 - A controller, before its first claim, waits until every pending tombstone of its own id, or of a
   pipeline it `shares` resources with (slot, publication, sink, state location), is done. A
   tombstone that can't be read is waited for; one whose generation doesn't resolve is logged and

@@ -81,7 +81,8 @@ record as not resolving. Either restore the variable on the nodes for one sweep 
 the ring places the id on settles the record, tearing the old pipeline down, or, when the pipeline
 came back on the same slot or publication, marking it done without dropping anything. Or drop the
 old slot and publication by hand, then mark the record done yourself: in `globals.state`, set
-`done_at` in `removals/<id>.json`, keeping the rest as it is:
+`done_at` in `removals/<id>.json`, keeping the rest as it is (`records` counts the nodes'
+records of the removal):
 
 ```json
 {
@@ -90,7 +91,8 @@ old slot and publication by hand, then mark the record done yourself: in `global
   "generation": 7,
   "hash": "blake3:…",
   "removed_at": "2026-11-06T09:12:03.418Z",
-  "done_at": "2026-11-06T10:00:00Z"
+  "done_at": "2026-11-06T10:00:00Z",
+  "records": 3
 }
 ```
 
