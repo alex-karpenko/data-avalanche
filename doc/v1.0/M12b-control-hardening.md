@@ -10240,3 +10240,9 @@ git commit -m "docs: the M12b changes — removing a pipeline, keys applied at t
   patched release) comes only through the AWS SDK under deltalake-aws: triaged in
   `.cargo/audit.toml` with its reason. `cargo audit` exits 0 with no warning; the build, the
   gates, the workspace's tests and its ITs pass (2870). Four advisories are now triaged, not three.
+- **Task 16** (`318ba25`): the blocks applied as written; on top, the
+  tracker's §57 and its pointers carry the day the gaps closed (2026-11-06, not the plan's
+  2026-11-04), as do the tracker's and the two research documents' `updated:`; the DA-OBS-7 and
+  DA-OBS-8 rows name their review fixes' tests; §57 lists the deviations above and the audit's
+  two later advisories. `cargo xtask docs` leaves the references unchanged, the site builds with
+  its link validation, and xtask's tests pass.
