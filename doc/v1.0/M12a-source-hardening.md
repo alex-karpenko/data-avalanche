@@ -7552,12 +7552,15 @@ git commit -m "docs: the M12a recoveries — a PostgreSQL failover, a DBA's slot
 
 ## Exit
 
-- [ ] Every task's Step 4 passes, and the whole E2E suite on PostgreSQL 18 (with the `replica`
-  pair), `mysql-84`, `mysql-84-nogtid` and `mariadb-118`.
-- [ ] The source ITs on all four default MySQL targets, and the TLS ITs from the repository's
-  checkout.
-- [ ] The whole-branch review's findings fixed or recorded; the PR's CI green.
-- [ ] The tracker's §53 rows closed with pointers when M12a merges.
+- [x] Every task's Step 4 passes, and the whole E2E suite on PostgreSQL 18 (with the `replica`
+  pair), `mysql-84`, `mysql-84-nogtid` and `mariadb-118` (locally 2026-11-04; the PR's
+  `integration` and `e2e-mysql` jobs, run 41822813507).
+- [x] The source ITs on all four default MySQL targets, and the TLS ITs from the repository's
+  checkout (locally 2026-11-04: source-mysql 155 per target, `tls::` 12).
+- [x] The whole-branch review's findings fixed or recorded (tracker §54); the PR's CI green
+  (`ci.yml` run 41822813507, `docs.yml` run 41822813341).
+- [x] The tracker's §53 rows closed with pointers when M12a merges (PR #19, `0309b38`,
+  2026-11-04; tracker §55).
 
 ## Deviations during execution
 

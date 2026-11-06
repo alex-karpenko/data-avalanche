@@ -161,12 +161,14 @@ impl PipelineWorker {
                 attempt = 0;
             }
             // A reconnect is counted once it is decided, in one update with its reason: an
-            // observer that sees the count sees why.
+            // observer that sees the count sees why. The new session has read nothing and holds
+            // nothing pending: the frontier and the pending start are cleared in that update, so
+            // the owner never reads the old session's frontier under the new count (DA-OBS-8).
             match failed {
                 SourceError::Transient(error) => {
                     contended_since = None;
                     core.update(|st| {
-                        st.reconnects += 1;
+                        st.reconnect();
                         st.phase = Phase::Reconnecting { error };
                     });
                 }
@@ -204,7 +206,7 @@ impl PipelineWorker {
                     }
                     let error = SourceError::Contended(detail).to_string();
                     core.update(|st| {
-                        st.reconnects += 1;
+                        st.reconnect();
                         st.phase = Phase::Reconnecting { error };
                     });
                 }
@@ -213,7 +215,7 @@ impl PipelineWorker {
                     let warning = format!(
                         "the source lost the stream position {position} ({detail}): the stream restarts at a new position and the tables are snapshotted again"
                     );
-                    core.update(|st| st.reconnects += 1);
+                    core.update(WorkerStatus::reconnect);
                     // The checkpoint whose position was lost, with the server the session read:
                     // on another server the source refuses to replace it (DA-SRC-20), and the
                     // halt or the rerun of Phase 0 its refusal asks ends the worker below.
@@ -342,25 +344,39 @@ where
     }
 }
 
-/// Moves the table's marker onto `at`, the new server's position (DA-SRC-20): an empty change set
-/// that replaces the marker instead of joining it. A table the lake doesn't hold, or holds no
-/// marker for, has nothing to move.
-async fn reposition(
+/// A change set that carries no rows, committed at Phase 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Empty {
+    /// Moves the table's marker onto `at`, the new server's position (DA-SRC-20): the marker is
+    /// replaced instead of joined. A table the lake holds no marker for has nothing to move.
+    Reposition,
+    /// Empties the sink table before a job's copy (DA-SNAP-15): a metadata-only delete, fenced,
+    /// the marker joined with `at` as any commit's.
+    Truncate,
+}
+
+/// Commits an [`Empty`] change set to `schema`'s sink table at `at`. A table the lake doesn't
+/// hold has nothing to commit.
+async fn commit_empty(
     core: &Core,
     tuning: &Tuning,
     schema: &TableSchema,
     at: &SourcePosition,
+    kind: Empty,
 ) -> Result<(), WorkerError> {
     let table = schema.table();
     let state = sink_retry(tuning, || core.may_write(), || core.sink.table_state(table)).await?;
-    let (true, Some(_), Some(columns)) = (state.exists, state.marker, state.schema) else {
+    let (true, Some(columns)) = (state.exists, state.schema) else {
         return Ok(());
     };
+    if kind == Empty::Reposition && state.marker.is_none() {
+        return Ok(());
+    }
     let cs = TableChangeSet {
         table: table.clone(),
         schema: columns,
         identifier: schema.identifier().to_vec(),
-        truncate: false,
+        truncate: kind == Empty::Truncate,
         upserts: vec![],
         deletes: vec![],
         position: PositionRange {
@@ -369,8 +385,9 @@ async fn reposition(
             last_change: at.clone(),
         },
         split: None,
-        snapshot: false,
-        reposition: true,
+        // A truncate is never skipped as covered: the job asked for it now.
+        snapshot: kind == Empty::Truncate,
+        reposition: kind == Empty::Reposition,
     };
     let marker = CommitMarker {
         owner_epoch: core.owner_epoch,
@@ -388,8 +405,8 @@ async fn reposition(
             table: table.clone(),
             current_epoch,
         }),
-        // A reposition is never skipped as covered (`covers` never skips one): the arm is
-        // unreachable, and harmless.
+        // Neither is ever skipped as covered (`covers` skips neither a reposition nor a
+        // snapshot's set): the arm is unreachable, and harmless.
         CommitOutcome::Committed { .. } | CommitOutcome::SkippedCovered => Ok(()),
     }
 }
@@ -854,6 +871,7 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
                 table: table.clone(),
                 reason: reason.clone(),
                 at: at.clone(),
+                copy: false,
             })
             .await?;
     }
@@ -915,6 +933,15 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
             .filter(|(t, _)| asked.contains(t))
             .map(|(t, reason)| (t.clone(), format!("{}: {reason}", reason.code()))),
     );
+    // A truncating job empties each table it starts before the table's first chunk. Repeated
+    // only while the job still has the table queued, before any chunk is read: once recorded
+    // running below, a later start resumes the copy instead (DA-SNAP-15).
+    let truncating = jobs.truncating();
+    for table in started.iter().filter(|t| truncating.contains(*t)) {
+        if let Some(schema) = resolved_tables.get(table).or_else(|| copies.get(table)) {
+            commit_empty(core, &tuning, schema, &at, Empty::Truncate).await?;
+        }
+    }
     core.may_write()?;
     jobs.record(&core.docs, &started, &failed).await?;
     // A copy's halt goes once its job carries it: the pipeline doesn't replicate the table, and
@@ -938,7 +965,7 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
         let tables: BTreeSet<&TableRef> = resolved_tables.keys().chain(cached.keys()).collect();
         for table in tables {
             if let Some(schema) = cached.get(table).or_else(|| resolved_tables.get(table)) {
-                reposition(core, &tuning, schema, &at).await?;
+                commit_empty(core, &tuning, schema, &at, Empty::Reposition).await?;
             }
         }
     }
@@ -1718,6 +1745,40 @@ mod tests {
         let end = worker.run().await;
         assert!(matches!(end, Err(WorkerError::Contended { .. })), "{end:?}");
         assert_eq!(handle.status.borrow().reconnects, 0);
+    }
+
+    /// DA-OBS-8: a reconnect starts a session that has read nothing and holds nothing pending.
+    /// The count comes with a cleared frontier and pending start, so the owner's lag never takes
+    /// the old session's frontier as the new one's.
+    #[tokio::test]
+    async fn a_reconnect_clears_the_frontier_and_the_pending_start() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let p = Yaml {
+            sink: "flush: { seconds: 3600 }",
+            ..Yaml::default()
+        }
+        .build();
+        let end = run_with(&p, deps(&w), async |h| {
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+            wait_until("a change read and pending", || {
+                let st = h.status.borrow();
+                st.read.is_some() && st.unsynced_since_micros.is_some()
+            })
+            .await;
+            for _ in 0..10_000 {
+                w.source
+                    .fail(Method::OpenStream, SourceError::Transient("refused".into()));
+            }
+            w.source
+                .fail(Method::Next, SourceError::Transient("reset".into()));
+            wait_until("a reconnect", || h.status.borrow().reconnects >= 1).await;
+            let st = h.status.borrow().clone();
+            assert_eq!(st.read, None, "the new session has read nothing");
+            assert_eq!(st.unsynced_since_micros, None, "nor holds anything pending");
+        })
+        .await;
+        assert!(end.is_ok(), "{end:?}");
     }
 
     /// A busy slot's reconnect is counted with its reason, as a transient failure's is: the

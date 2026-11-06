@@ -21,4 +21,6 @@ tracing-subscriber = { workspace = true, features = ["registry"] }
 
 [dev-dependencies]
 data-avalanche-testkit.workspace = true
+rcgen.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
 tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "time"] }

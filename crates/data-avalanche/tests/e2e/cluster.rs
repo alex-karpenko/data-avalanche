@@ -482,7 +482,10 @@ async fn a_reload_reaches_every_node() {
     let (code, v) = c.nodes[1].proc.as_ref().unwrap().reload().await;
     assert_eq!(
         (code, &v),
-        (202, &serde_json::json!({ "generation": 2 })),
+        (
+            202,
+            &serde_json::json!({ "generation": 2, "restart_pending": [] })
+        ),
         "{v}"
     );
 
@@ -605,9 +608,10 @@ async fn any_nodes_api_drives_the_holder() {
         .iter()
         .find(|p| p["id"] == json!(id))
         .cloned();
+    // A live holder isn't stale (DA-API-13).
     assert_eq!(
         row,
-        Some(json!({ "id": id, "holder": holder, "owner_epoch": epoch }))
+        Some(json!({ "id": id, "holder": holder, "owner_epoch": epoch, "holder_stale": false }))
     );
     c.landed().await;
     c.stop().await;

@@ -1,11 +1,12 @@
 //! `/v1/config`: the check, the reload and its status (Clustering §9.2).
 
 use std::collections::BTreeMap;
+use std::time::Instant;
 
-use axum::extract::{Extension, State};
-use axum::http::StatusCode;
+use axum::extract::{Extension, RawQuery, State};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::Response;
-use data_avalanche_cluster::{Checked, ReloadError, Reloaded};
+use data_avalanche_cluster::{Checked, ReloadError, Reloaded, RestartFields};
 use data_avalanche_config::Fingerprints;
 use serde_json::json;
 
@@ -43,7 +44,8 @@ async fn node_file(node: &Node) -> Result<String, Failure> {
 /// and all, is not echoed. A body's secrets aren't compared with the running ones
 /// (`secrets_compared: false`): whether a guess is the running secret isn't told. Every validate
 /// is logged at info with its caller, its source, the body's size and the answer's status
-/// (DA-API-20).
+/// (DA-API-20). A node takes posted bodies at [`crate::VALIDATE_PER_SECOND`] after a burst of
+/// [`crate::VALIDATE_BURST`]: past it, 429 with `Retry-After`.
 pub(crate) async fn validate(
     State(api): State<Api>,
     Extension(by): Extension<Principal>,
@@ -55,6 +57,16 @@ pub(crate) async fn validate(
     let posted = !text.trim().is_empty();
     let bytes = text.len();
     let response: Response = 'checked: {
+        if posted && let Err(wait) = node.validates.take(Instant::now()) {
+            let secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+            let mut r = body(
+                StatusCode::TOO_MANY_REQUESTS,
+                &json!({ "error": format!("too many posted configs validated: try again in {secs} s") }),
+            );
+            r.headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(secs));
+            break 'checked r;
+        }
         let (checked, fingerprints) = if posted {
             (
                 node.coordinator.check_posted(&text).await,
@@ -96,8 +108,20 @@ pub(crate) async fn validate(
 
 /// Publishes the node's file as the next config generation: 202 with it, 200 when the file is
 /// the generation the cluster runs already, 422 with the validation report when it is invalid or
-/// changes a field only a process restart applies.
-pub(crate) async fn reload(State(api): State<Api>) -> Response {
+/// changes a field only a process restart applies. With `?restart=accept` such a field is
+/// published, and each node applies it at its next start (DA-OPS-12); a field the cluster keeps
+/// for good is refused all the same. Both answers name the fields this node has pending.
+pub(crate) async fn reload(State(api): State<Api>, RawQuery(query): RawQuery) -> Response {
+    let restart = match query.as_deref() {
+        None | Some("") => RestartFields::Refuse,
+        Some("restart=accept") => RestartFields::Accept,
+        Some(other) => {
+            return body(
+                StatusCode::BAD_REQUEST,
+                &json!({ "error": format!("unknown query {other:?}: the reload takes ?restart=accept only") }),
+            );
+        }
+    };
     let Some(node) = api.node.get() else {
         return starting();
     };
@@ -105,21 +129,30 @@ pub(crate) async fn reload(State(api): State<Api>) -> Response {
         Ok(text) => text,
         Err(failed) => return failed.into(),
     };
-    match node.coordinator.reload(&text).await {
+    match node.coordinator.reload(&text, restart).await {
         Ok(Reloaded {
             generation,
             published: true,
-        }) => body(StatusCode::ACCEPTED, &json!({ "generation": generation })),
-        Ok(Reloaded { generation, .. }) => body(
+            restart_pending,
+        }) => body(
+            StatusCode::ACCEPTED,
+            &json!({ "generation": generation, "restart_pending": restart_pending }),
+        ),
+        Ok(Reloaded {
+            generation,
+            restart_pending,
+            ..
+        }) => body(
             StatusCode::OK,
-            &json!({ "generation": generation, "unchanged": true }),
+            &json!({ "generation": generation, "unchanged": true, "restart_pending": restart_pending }),
         ),
         Err(e) => refused(&e),
     }
 }
 
 /// The generation the cluster runs, and each member's applied one: the reload is complete when
-/// every member's is it.
+/// every member's is it. `restart_pending` names this node's restart-only fields that wait for its
+/// next start (DA-OPS-12): each node answers for itself.
 pub(crate) async fn status(State(api): State<Api>) -> Response {
     let Some(node) = api.node.get() else {
         return starting();
@@ -149,6 +182,7 @@ pub(crate) async fn status(State(api): State<Api>) -> Response {
             "applied": applied,
             "nodes": nodes,
             "converged": converged,
+            "restart_pending": node.coordinator.restart_pending().await,
         }),
     )
 }
@@ -254,6 +288,34 @@ mod tests {
         );
     }
 
+    /// DA-API-20: a node takes posted bodies at a bounded rate, node-wide: past the burst, 429
+    /// with `Retry-After`. The node's own file is checked all the same.
+    #[tokio::test]
+    async fn posted_validates_past_the_burst_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.yaml");
+        std::fs::write(&file, CONFIG).unwrap();
+        let lone = lone(file).await;
+        let a = api(open());
+        a.node.set(lone.node.clone()).unwrap();
+        let addr = serve(a).await;
+        for _ in 0..crate::VALIDATE_BURST {
+            let (code, _, body) =
+                request(addr, "POST", "/v1/config/validate", &[], "pipelines: [").await;
+            assert_eq!(code, 422, "{body}");
+        }
+        let (code, head, body) =
+            request(addr, "POST", "/v1/config/validate", &[], "pipelines: [").await;
+        assert_eq!(code, 429, "{body}");
+        assert!(
+            head.to_ascii_lowercase().contains("retry-after: 1\r\n"),
+            "{head}"
+        );
+        assert!(body.contains("try again in 1 s"), "{body}");
+        let (code, _, body) = request(addr, "POST", "/v1/config/validate", &[], "").await;
+        assert_eq!(code, 200, "the node's file: {body}");
+    }
+
     /// A posted body's pipeline id is taken as written (DA-API-19): the answer names a pipeline
     /// by its id, so expanding a `${VAR}` there would read this node's environment. The node's
     /// own file is the operator's, and expands.
@@ -313,12 +375,15 @@ mod tests {
         assert_eq!(code, 200);
         assert_eq!(
             v,
-            json!({ "generation": 1, "applied": 1, "nodes": { "node-a": 1 }, "converged": true })
+            json!({ "generation": 1, "applied": 1, "nodes": { "node-a": 1 }, "converged": true, "restart_pending": [] })
         );
         let (code, v) = json_of(addr, "POST", "/v1/config/reload").await;
         assert_eq!(
             (code, v),
-            (200, json!({ "generation": 1, "unchanged": true }))
+            (
+                200,
+                json!({ "generation": 1, "unchanged": true, "restart_pending": [] })
+            )
         );
 
         std::fs::write(
@@ -327,7 +392,10 @@ mod tests {
         )
         .unwrap();
         let (code, v) = json_of(addr, "POST", "/v1/config/reload").await;
-        assert_eq!((code, v), (202, json!({ "generation": 2 })));
+        assert_eq!(
+            (code, v),
+            (202, json!({ "generation": 2, "restart_pending": [] }))
+        );
         let mut status = Value::Null;
         for _ in 0..500 {
             status = json_of(addr, "GET", "/v1/config/status").await.1;
@@ -338,7 +406,7 @@ mod tests {
         }
         assert_eq!(
             status,
-            json!({ "generation": 2, "applied": 2, "nodes": { "node-a": 2 }, "converged": true })
+            json!({ "generation": 2, "applied": 2, "nodes": { "node-a": 2 }, "converged": true, "restart_pending": [] })
         );
 
         std::fs::write(
@@ -353,6 +421,33 @@ mod tests {
             v["report"]["errors"][0]["path"], "globals.cluster.tokens",
             "{v}"
         );
+        let (code, v) = json_of(addr, "POST", "/v1/config/reload?restart=accept").await;
+        assert_eq!(code, 422, "the anchor's tokens, even accepted: {v}");
+
+        // DA-OPS-12: a restart-only field, accepted, is published and pending here.
+        std::fs::write(
+            &file,
+            CONFIG.replace("lease_renewal_interval: 10s", "lease_renewal_interval: 8s"),
+        )
+        .unwrap();
+        let (code, v) = json_of(addr, "POST", "/v1/config/reload").await;
+        assert_eq!(code, 422, "{v}");
+        let (code, _) = json_of(addr, "POST", "/v1/config/reload?restart=later").await;
+        assert_eq!(code, 400);
+        let (code, v) = json_of(addr, "POST", "/v1/config/reload?restart=accept").await;
+        assert_eq!(
+            (code, v),
+            (
+                202,
+                json!({ "generation": 3, "restart_pending": ["globals.cluster.lease_renewal_interval"] })
+            )
+        );
+        let v = json_of(addr, "GET", "/v1/config/status").await.1;
+        assert_eq!(
+            v["restart_pending"],
+            json!(["globals.cluster.lease_renewal_interval"]),
+            "{v}"
+        );
 
         std::fs::write(&file, "pipelines: [").unwrap();
         let (code, v) = json_of(addr, "POST", "/v1/config/reload").await;
@@ -362,6 +457,6 @@ mod tests {
         coordinator.stop().await;
         let (code, v) = json_of(addr, "POST", "/v1/config/reload").await;
         assert_eq!(code, 503, "{v}");
-        assert_eq!(coordinator.latest().await.unwrap(), Some(2));
+        assert_eq!(coordinator.latest().await.unwrap(), Some(3));
     }
 }

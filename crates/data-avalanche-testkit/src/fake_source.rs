@@ -352,6 +352,15 @@ impl FakeSource {
         }
     }
 
+    /// Deletes `key`'s row from `table` without logging the change: a row deleted while the
+    /// pipeline didn't stream the table.
+    pub fn forget(&self, table: &TableRef, key: &Row) {
+        let mut db = self.db();
+        let schema = db.schema(table);
+        let key = key_of(&schema, key);
+        db.rows.get_mut(table).expect("a table").remove(&key);
+    }
+
     /// The schema the catalog has for `table` now, with its source id.
     pub fn schema(&self, table: &TableRef) -> TableSchema {
         self.db().schema(table)

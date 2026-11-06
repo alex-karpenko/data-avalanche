@@ -297,7 +297,8 @@ walk_fields!(RawMemberlist {
 });
 walk_fields!(RawTracing {
     otlp_endpoint,
-    sample_ratio
+    sample_ratio,
+    headers
 });
 walk_fields!(RawAzure { account_name });
 

@@ -26,7 +26,9 @@ to the snapshot gauges.
 The ones to watch first:
 
 - **`data_avalanche_replication_lag_seconds`**: the age of the oldest change read but not yet
-  committed; `0` when nothing waits. v1's target is a p99 under 60 s at steady state, and back
+  committed; `0` when nothing waits. After a failover, a restart or a source reconnect, it keeps
+  counting from the oldest change the earlier session left uncommitted until the new one has read
+  that far again. v1's target is a p99 under 60 s at steady state, and back
   under it within 2 minutes of a node failure. A snapshot, a transaction larger than the flush
   bounds, and heavy random-key MERGEs on large tables are outside the target.
 - **`data_avalanche_wal_lag_bytes`**: the WAL a PostgreSQL slot holds on the server's disk.
@@ -59,4 +61,21 @@ on reload, and `--log-level` / `--log-format` override them. A log line never ca
 With `globals.tracing.otlp_endpoint` set, a node sends spans over OTLP/HTTP (protobuf) to
 `<endpoint>/v1/traces`: one per flush and its commits, per snapshot chunk, per schema change
 applied, never one per row. `sample_ratio` (0.05 with an endpoint) samples them. A JSON log line
-written inside a sampled span carries its `trace_id` and `span_id`.
+written inside a sampled span carries its `trace_id` and `span_id`, so a flush's log lines (at
+`debug` for `data_avalanche_pipeline::writer`) lead to its trace.
+
+A hosted collector that needs a token takes it in `globals.tracing.headers`, sent with each
+export. The values are secrets: they never reach the log or the API's answers. Write them as
+`${VAR}`, so that the token stays out of the config text:
+
+```yaml
+globals:
+  tracing:
+    otlp_endpoint: https://otlp.example.com
+    headers:
+      authorization: "Bearer ${OTLP_TOKEN}"
+```
+
+`OTEL_EXPORTER_OTLP_TRACES_HEADERS` in a node's environment (`key=value,…`), read first, or else
+`OTEL_EXPORTER_OTLP_HEADERS`, is sent too, and wins over a configured header of the same name. Use
+an `https` endpoint: a token sent over `http` can be read on the way.

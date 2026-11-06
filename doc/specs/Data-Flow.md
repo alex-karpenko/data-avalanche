@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-03
+updated: 2026-11-04
 domain: Architecture
 tags: [architecture, data-flow, pipeline, cdc, iceberg, delta-lake, multi-sink, arrow, snapshot, replication]
 sources: []
@@ -530,7 +530,7 @@ the table is already committed and is skipped. `last_change_for_table` is the co
 flush's last transaction that wrote the table, not the flush frontier: a replay's flush may read past
 the marker (a keep-alive, another table's transaction) while carrying only transactions the table has.
 A snapshot change set (a chunk's rows, flagged
-`snapshot`) is never skipped: its rows are read now, at a frontier the marker may already cover; the
+`snapshot`, or a job's `truncate` with no rows) is never skipped: its rows are read now, at a frontier the marker may already cover; the
 fence still applies. A split slice (`split` set) ends at its transaction's
 pinned start, which the stored position equals from the first slice on; a slice is skipped only
 when the stored position is strictly past that start (the transaction's commit, or a later one, has
@@ -738,8 +738,9 @@ Triggered via the management REST API (`POST /v1/pipelines/{id}/snapshots`; see 
 endpoint table):
 
 ```
-Request payload: { tables: ["schema.orders", "schema.products"] }
-                  (exact table names, no globs; may include tables not in pipeline config)
+Request payload: { tables: ["schema.orders", "schema.products"], truncate: false }
+                  (exact table names, no globs; may include tables not in pipeline config;
+                   truncate: empty each table's sink table first, default false)
 
 1. Validate: tables list non-empty, no globs.
    Persist a job record snapshots/jobs/<job_id>.json (status queued) and request a restart of the
@@ -749,7 +750,10 @@ Request payload: { tables: ["schema.orders", "schema.products"] }
    schema (Schema_Change_Detection_and_Evolution.md §8.2). The stream resumes from the confirmed
    position, as after any restart. For each table: run the Phase-1 chunk loop (watermark lw/hw +
    keyset chunks) WITHOUT pausing the stream. Tables already in the streaming set keep streaming;
-   the snapshot reconciles against the live stream exactly as at startup.
+   the snapshot reconciles against the live stream exactly as at startup. A `truncate` job first
+   empties each of its tables' sink table: a snapshot change set with `truncate` and no rows,
+   committed (fenced) before the start records the table running, so a crash in between empties
+   it again and a restart after it resumes the copy without emptying it.
 3. Tables not in the pipeline config: snapshot is written to the sink but the table is not added to
    the pipeline's streaming set. Such a table is described by its exact name and copied: read
    chunk by chunk, never streamed, so not reconciled.
@@ -766,8 +770,9 @@ cursors, like the Phase-1 snapshot does after a crash.
 
 There is **no stream pause and no `pause_lsn + 1` assumption**: watermarks reconcile re-snapshotted
 rows against concurrent changes, and idempotent upserts mean re-reading existing keys re-writes the
-same rows. A job never truncates the target: a row deleted at the source while the table wasn't
-streamed stays. This is also the mechanism for **re-snapshot-after-unsafe-DDL** (`Schema_Change_Detection_
+same rows. A job without `truncate` never empties the target: a row deleted at the source while the
+table wasn't streamed stays. With `truncate`, such a row goes, at a price: the sink table is empty,
+then partly copied, until the job completes (DA-SNAP-15). This is also the mechanism for **re-snapshot-after-unsafe-DDL** (`Schema_Change_Detection_
 and_Evolution.md` §8.2).
 
 ---

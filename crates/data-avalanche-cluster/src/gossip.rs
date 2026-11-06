@@ -88,6 +88,8 @@ impl foca::Identity for NodeIdentity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Member {
     pub addr: SocketAddr,
+    /// The member's process (its start in unix milliseconds): a lease's holder names it too.
+    pub incarnation: u64,
     pub meta: NodeMeta,
     /// Suspected of having failed; still a member (D-11: suspects stay on the ring).
     pub suspect: bool,
@@ -138,6 +140,7 @@ fn members_of<'a>(
         .map(|(name, (id, s))| {
             let member = Member {
                 addr: id.addr,
+                incarnation: id.incarnation,
                 meta: id.meta.clone(),
                 suspect: s == State::Suspect,
             };
@@ -146,6 +149,7 @@ fn members_of<'a>(
         .collect();
     let mine = Member {
         addr: me.addr,
+        incarnation: me.incarnation,
         meta: me.meta.clone(),
         suspect: false,
     };

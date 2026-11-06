@@ -190,6 +190,29 @@ mod tests {
         assert_eq!(operations, routes().len());
     }
 
+    /// DA-API-18: the document is valid against the OAS 3.1 schema, vendored in `oas/` (the
+    /// 2022-10-07 one, `https://spec.openapis.org/oas/3.1/schema/2022-10-07`).
+    #[test]
+    fn the_document_is_valid_oas_3_1() {
+        const ID: &str = "https://spec.openapis.org/oas/3.1/schema/2022-10-07";
+        let schema: Value =
+            serde_json::from_str(include_str!("../oas/schema-2022-10-07.json")).unwrap();
+        let mut schemas = boon::Schemas::new();
+        let mut compiler = boon::Compiler::new();
+        compiler.add_resource(ID, schema).unwrap();
+        let oas = compiler.compile(ID, &mut schemas).unwrap();
+        let doc = serde_json::to_value(openapi()).unwrap();
+        if let Err(e) = schemas.validate(&doc, oas) {
+            panic!("the document isn't valid OpenAPI 3.1: {e:#}");
+        }
+        let mut broken = doc;
+        broken["paths"]["/v1/pipelines"]["get"]["responses"] = serde_json::json!("none");
+        assert!(
+            schemas.validate(&broken, oas).is_err(),
+            "the schema catches a broken document"
+        );
+    }
+
     #[tokio::test]
     async fn the_document_is_served() {
         let addr = listen(api(open())).await;

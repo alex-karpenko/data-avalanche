@@ -8,6 +8,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use chrono::Utc;
+use data_avalanche_cluster::Members;
 use data_avalanche_config::Pipeline;
 use data_avalanche_core::SourcePosition;
 use data_avalanche_state::{
@@ -102,14 +103,42 @@ pub(crate) async fn read(
     })
 }
 
-fn summary(p: &Pipeline, r: &Read) -> Value {
+/// A lease holder as this node's gossip sees it (DA-API-13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Liveness {
+    /// The holder's node, in the same process (its incarnation), is a member.
+    Live,
+    /// A member that SWIM suspects of having failed.
+    Suspect,
+    /// Not a member: the node is gone, or another process of it runs. Its lease reads as held
+    /// until it expires and another node takes it over.
+    Stale,
+}
+
+/// How `lease`'s holder stands in `members`, judged by membership, not by clocks.
+pub(crate) fn liveness(members: &Members, lease: &LeaseDoc) -> Liveness {
+    match members.nodes.get(&lease.holder_node_id) {
+        Some(m) if m.incarnation == lease.holder_incarnation => {
+            if m.suspect {
+                Liveness::Suspect
+            } else {
+                Liveness::Live
+            }
+        }
+        _ => Liveness::Stale,
+    }
+}
+
+fn summary(p: &Pipeline, r: &Read, members: &Members) -> Value {
     let (actual, _) = actual(r.lease.as_ref(), r.status.as_ref());
+    let held = r.lease.as_ref().filter(|l| !l.released);
     json!({
         "id": p.id,
         "name": p.name,
         "desired_state": desired_name(r.desired),
         "actual_state": actual,
-        "holder": r.lease.as_ref().filter(|l| !l.released).map(|l| l.holder_node_id.clone()),
+        "holder": held.map(|l| l.holder_node_id.clone()),
+        "holder_stale": held.map(|l| liveness(members, l) == Liveness::Stale),
     })
 }
 
@@ -121,6 +150,7 @@ pub(crate) async fn list(State(api): State<Api>) -> Response {
     let config = node.coordinator.config().await;
     let mut pipelines: Vec<&Pipeline> = config.pipelines.values().collect();
     pipelines.sort_by(|a, b| a.id.cmp(&b.id));
+    let members = node.members.borrow().clone();
     let mut out = vec![];
     for p in pipelines {
         let docs = match (node.docs)(p) {
@@ -133,7 +163,7 @@ pub(crate) async fn list(State(api): State<Api>) -> Response {
             }
         };
         match read(node, p, &docs).await {
-            Ok(r) => out.push(summary(p, &r)),
+            Ok(r) => out.push(summary(p, &r, &members)),
             Err(e) => return unavailable(&e),
         }
     }
@@ -167,7 +197,8 @@ pub(crate) async fn get(State(api): State<Api>, Path(id): Path<String>) -> Respo
         Err(e) => return unavailable(&e),
     };
     let (actual, status) = actual(r.lease.as_ref(), r.status.as_ref());
-    let mut v = summary(&p, &r);
+    let members = node.members.borrow().clone();
+    let mut v = summary(&p, &r, &members);
     v["source"] = json!({
         "type": p.source.kind.as_str(),
         "host": p.source.host,
@@ -182,19 +213,26 @@ pub(crate) async fn get(State(api): State<Api>, Path(id): Path<String>) -> Respo
     v["degraded"] = json!(status.and_then(|s| s.degraded.clone()));
     v["status_written_at"] = json!(status.map(|s| s.written_at));
     v["holder"] = match &r.lease {
-        Some(l) => json!({
-            "node": l.holder_node_id,
-            "owner_epoch": l.owner_epoch,
-            "renewed_at": l.renewed_at,
-            "released": l.released,
-        }),
+        Some(l) => {
+            let live = liveness(&members, l);
+            json!({
+                "node": l.holder_node_id,
+                "owner_epoch": l.owner_epoch,
+                "renewed_at": l.renewed_at,
+                "released": l.released,
+                "stale": !l.released && live == Liveness::Stale,
+                "suspect": !l.released && live == Liveness::Suspect,
+            })
+        }
         None => Value::Null,
     };
     v["position"] = json!(position.map(|p| p.to_string()));
+    // A copy's halt fails its job table, which says why (DA-SNAP-19).
     v["halted_tables"] = json!(
         halts
             .tables
             .iter()
+            .filter(|h| !h.copy)
             .map(|h| json!({
                 "table": h.table.to_string(),
                 "code": h.reason.code(),
@@ -372,9 +410,17 @@ mod tests {
     }
 
     async fn held_by(lone: &Lone, node: &str) -> data_avalanche_state::Versioned<LeaseDoc> {
+        held_by_process(lone, node, 1).await
+    }
+
+    async fn held_by_process(
+        lone: &Lone,
+        node: &str,
+        incarnation: u64,
+    ) -> data_avalanche_state::Versioned<LeaseDoc> {
         let holder = Holder {
             node_id: node.into(),
-            incarnation: 1,
+            incarnation,
         };
         match lone
             .leases
@@ -442,11 +488,25 @@ mod tests {
             table: TableRef::new("public", "orders"),
             reason: HaltReason::TableDropped,
             at: SourcePosition::Pg(lsn),
+            copy: false,
+        })
+        .await
+        .unwrap();
+        docs.record_halt(&TableHalt {
+            table: TableRef::new("public", "audit"),
+            reason: HaltReason::TableDropped,
+            at: SourcePosition::Pg(lsn),
+            copy: true,
         })
         .await
         .unwrap();
         let v = json_of(addr, "GET", "/v1/pipelines/orders").await.1;
         assert_eq!(v["actual_state"], "running");
+        assert_eq!(
+            v["halted_tables"].as_array().unwrap().len(),
+            1,
+            "a copy's halt isn't shown: {v}"
+        );
         assert_eq!(v["position"], "pg:0/16B3748");
         assert_eq!(v["halted_tables"][0]["table"], "public.orders");
         assert_eq!(v["halted_tables"][0]["code"], "TABLE_DROPPED");
@@ -490,6 +550,73 @@ mod tests {
         assert_eq!(v["holder"]["released"], true);
     }
 
+    /// DA-API-13: a holder that isn't a member in this node's view, its node gone or another
+    /// process of it running, reads as stale; this node's own process doesn't. The lone node is
+    /// `node-a`, incarnation 1.
+    #[tokio::test]
+    async fn a_holder_that_isnt_a_member_reads_as_stale() {
+        let (addr, lone, _docs, _dir) = served().await;
+        let stale = async || {
+            let one = json_of(addr, "GET", "/v1/pipelines/orders").await.1;
+            let list = json_of(addr, "GET", "/v1/pipelines").await.1;
+            let cluster = json_of(addr, "GET", "/v1/cluster/status").await.1;
+            assert_eq!(one["holder"]["suspect"], false, "{one}");
+            assert_eq!(list["pipelines"][0]["holder_stale"], one["holder"]["stale"]);
+            assert_eq!(
+                cluster["pipelines"][0]["holder_stale"],
+                one["holder"]["stale"]
+            );
+            one["holder"]["stale"].clone()
+        };
+        let lease = held_by_process(&lone, "node-b", 1).await;
+        assert_eq!(stale().await, true, "a node that isn't a member");
+        lone.leases.release(&lease, Utc::now()).await.unwrap();
+        let v = json_of(addr, "GET", "/v1/pipelines").await.1;
+        assert_eq!(v["pipelines"][0]["holder_stale"], Value::Null, "{v}");
+        let lease = held_by_process(&lone, "node-a", 2).await;
+        assert_eq!(stale().await, true, "another process of this node");
+        lone.leases.release(&lease, Utc::now()).await.unwrap();
+        held_by_process(&lone, "node-a", 1).await;
+        assert_eq!(stale().await, false, "this node's own process");
+    }
+
+    #[test]
+    fn a_suspected_member_holds_its_lease_as_suspect() {
+        let member = |incarnation, suspect| data_avalanche_cluster::Member {
+            addr: "127.0.0.1:7946".parse().unwrap(),
+            incarnation,
+            meta: data_avalanche_cluster::NodeMeta {
+                phase: data_avalanche_cluster::Phase::Active,
+                config_generation: 1,
+                build: "1.0.0".into(),
+            },
+            suspect,
+        };
+        let members = |m| Members {
+            me: "node-a".into(),
+            nodes: [("node-b".to_owned(), m)].into(),
+        };
+        let lease = LeaseDoc {
+            pipeline_id: "orders".into(),
+            holder_node_id: "node-b".into(),
+            holder_incarnation: 7,
+            owner_epoch: 1,
+            acquired_at: Utc::now(),
+            renewed_at: Utc::now(),
+            lease_duration_ms: 15_000,
+            released: false,
+        };
+        assert_eq!(liveness(&members(member(7, false)), &lease), Liveness::Live);
+        assert_eq!(
+            liveness(&members(member(7, true)), &lease),
+            Liveness::Suspect
+        );
+        assert_eq!(
+            liveness(&members(member(8, false)), &lease),
+            Liveness::Stale
+        );
+    }
+
     #[tokio::test]
     async fn a_holder_s_status_of_an_earlier_term_is_not_this_term_s() {
         let (addr, lone, docs, _dir) = served().await;
@@ -523,7 +650,7 @@ mod tests {
             v,
             json!({ "pipelines": [{
                 "id": "orders", "name": "orders", "desired_state": "running",
-                "actual_state": "paused", "holder": "node-b",
+                "actual_state": "paused", "holder": "node-b", "holder_stale": true,
             }] })
         );
     }

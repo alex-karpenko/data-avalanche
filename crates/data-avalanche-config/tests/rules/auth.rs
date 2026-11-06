@@ -120,6 +120,15 @@ pub fn cases() -> Vec<Case> {
         case("V-051", Silent, "oauth2 with discovery", || {
             pg_delta().set("/globals/api", json!({"auth": "oauth2", "oauth2": {"issuer": "https://idp", "discovery_url": "https://idp/.well-known/openid-configuration"}}))
         }),
+        case("V-125", Warning, "jwt keys over http", || {
+            pg_delta().set("/globals/api", json!({"auth": "jwt", "jwt": {"issuer": "https://idp", "jwks_url": "http://idp/certs"}}))
+        }),
+        case("V-125", Warning, "oauth2 discovery over http", || {
+            pg_delta().set("/globals/api", json!({"auth": "oauth2", "oauth2": {"issuer": "https://idp", "discovery_url": "HTTP://idp/.well-known/openid-configuration"}}))
+        }),
+        case("V-125", Silent, "oauth2 keys over https", || {
+            pg_delta().set("/globals/api", json!({"auth": "oauth2", "oauth2": {"issuer": "https://idp", "jwks_url": "HTTPS://idp/certs"}}))
+        }),
         case("V-052", Warning, "jwt without tls", || {
             pg_delta().set("/globals/api", json!({"auth": "jwt", "jwt": {"issuer": "https://idp", "jwks_url": "https://idp/certs"}}))
         }),

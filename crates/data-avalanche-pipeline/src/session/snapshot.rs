@@ -1883,9 +1883,10 @@ mod tests {
                     .update(&t("a"), row(2, "s")),
             );
             w.source.commit(FakeTxn::new().update(&t("a"), row(2, "t")));
+            // Key 2 is logged under its latest writer only (DA-SNAP-11).
             let logged = ReconcileLog {
                 entries: 2,
-                keys: 3,
+                keys: 2,
             };
             wait_until("the log is reported", || {
                 status.borrow().reconcile_log == logged

@@ -7,17 +7,21 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use data_avalanche_config::{Cluster, Pipeline, StateLocation};
-use data_avalanche_state::{Holder, PipelineDocs};
+use data_avalanche_state::{Holder, PipelineDocs, RemovalDoc, StateError};
 use data_avalanche_storage::{Location, colocated_state, explicit_state, join};
+use data_avalanche_telemetry::Metrics;
 use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior};
 
-use crate::controller::Following;
 use crate::{
     Actual, ClusterError, ControllerDeps, ControllerStatus, Members, PipelineController, Placement,
     Target, Update,
 };
+
+/// How often a node lists the removal tombstones, to take up those of the ids the ring places on
+/// it that no node removed (DA-OPS-9).
+pub const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 /// This node as a lease holder (Clustering §3.4, D-1): `node_id` is
 /// `globals.cluster.memberlist.node_name`, else the OS hostname; the incarnation is the process's
@@ -103,9 +107,6 @@ impl Reloader {
 struct Controlled {
     pipeline: Pipeline,
     docs: PipelineDocs,
-    /// The removed pipelines it takes the place of ([`PipelineController::following`]), shared
-    /// with its controller: one started again after a panic waits for what is left of them.
-    following: Following,
     target: watch::Sender<Target>,
     status: watch::Sender<ControllerStatus>,
     task: JoinHandle<()>,
@@ -121,16 +122,10 @@ impl Drop for Controlled {
 }
 
 impl Controlled {
-    fn new(
-        pipeline: Pipeline,
-        docs: PipelineDocs,
-        following: Following,
-        deps: &ControllerDeps,
-    ) -> Self {
+    fn new(pipeline: Pipeline, docs: PipelineDocs, deps: &ControllerDeps) -> Self {
         let mut c = Self {
             pipeline,
             docs,
-            following,
             target: watch::channel(Target::DontOwn).0,
             status: watch::channel(ControllerStatus::default()).0,
             task: tokio::spawn(async {}),
@@ -146,8 +141,7 @@ impl Controlled {
             self.docs.clone(),
             deps,
             self.status.clone(),
-        )
-        .following(self.following.clone());
+        );
         self.updates = controller.updater();
         self.task = tokio::spawn(controller.run(self.target.subscribe()));
     }
@@ -237,10 +231,7 @@ impl ClusterReconciler {
             .into_iter()
             .map(|(pipeline, docs)| {
                 let id = pipeline.id.clone();
-                (
-                    id,
-                    Controlled::new(pipeline, docs, Following::default(), deps),
-                )
+                (id, Controlled::new(pipeline, docs, deps))
             })
             .collect();
         let (statuses_tx, statuses) = watch::channel(status_map(&controllers));
@@ -255,6 +246,9 @@ impl ClusterReconciler {
                 statuses: statuses_tx,
                 removing: JoinSet::new(),
                 returning: BTreeMap::new(),
+                sweeping: JoinSet::new(),
+                orphans: JoinSet::new(),
+                orphaned: std::collections::BTreeSet::new(),
             },
             members,
             settings,
@@ -309,12 +303,20 @@ impl ClusterReconciler {
     }
 }
 
-/// True when `added` takes a place `removed` held, so that it starts only once `removed` is let go
-/// of: an `id` changed, delete then recreate (config §9.1). The same PostgreSQL slot or
-/// publication on the same server, the same sink location, or the same state location.
-fn shares(removed: &Pipeline, added: &Pipeline) -> bool {
-    let (a, b) = (&removed.source, &added.source);
-    let slot = match (&a.postgres, &b.postgres) {
+/// True when `added` takes a place `removed` held, so that it starts only once `removed`'s
+/// removal is done: an `id` changed, delete then recreate (config §9.1). The same PostgreSQL
+/// slot or publication on the same server, the same sink location, or the same state location.
+pub(crate) fn shares(removed: &Pipeline, added: &Pipeline) -> bool {
+    let sink = removed.sink.bucket == added.sink.bucket
+        && join(&[&removed.sink.prefix]) == join(&[&added.sink.prefix]);
+    same_slot(removed, added) || sink || state_location(removed) == state_location(added)
+}
+
+/// True when both are PostgreSQL pipelines on the same server with the same slot or the same
+/// publication.
+pub(crate) fn same_slot(a: &Pipeline, b: &Pipeline) -> bool {
+    let (a, b) = (&a.source, &b.source);
+    match (&a.postgres, &b.postgres) {
         (Some(x), Some(y)) => {
             a.host == b.host
                 && a.port == b.port
@@ -322,10 +324,7 @@ fn shares(removed: &Pipeline, added: &Pipeline) -> bool {
                 && (x.slot == y.slot || x.publication == y.publication)
         }
         _ => false,
-    };
-    let sink = removed.sink.bucket == added.sink.bucket
-        && join(&[&removed.sink.prefix]) == join(&[&added.sink.prefix]);
-    slot || sink || state_location(removed) == state_location(added)
+    }
 }
 
 /// Where a pipeline's state lives (config §10): co-located state is under its sink's prefix.
@@ -363,6 +362,11 @@ struct Loop {
     /// The ids whose removal runs, each with the pipeline a later generation added back under
     /// it: that one starts when the removal ends, so one controller runs a pipeline at a time.
     returning: BTreeMap<String, Option<(Pipeline, PipelineDocs)>>,
+    /// The listing of the removal tombstones under way, one at a time.
+    sweeping: JoinSet<Result<Vec<RemovalDoc>, StateError>>,
+    /// The removals no node removed that this node took up; each ends with its id.
+    orphans: JoinSet<String>,
+    orphaned: std::collections::BTreeSet<String>,
 }
 
 impl Loop {
@@ -383,28 +387,10 @@ impl Loop {
                     .send(Update::DrainTimeout(c.drain_timeout));
             }
         }
-        // The pipelines this reload removes, as configured: an added one that takes the place of
-        // one of them follows it.
-        let removed: Vec<Pipeline> = reload
-            .pipelines
-            .iter()
-            .filter_map(|change| match change {
-                PipelineReload::Remove(id) => match self.controllers.get(id) {
-                    Some(c) => Some(c.pipeline.clone()),
-                    None => self.returning.get(id)?.as_ref().map(|(p, _)| p.clone()),
-                },
-                _ => None,
-            })
-            .collect();
         for change in reload.pipelines {
             match change {
                 PipelineReload::Add(pipeline, docs) => {
                     let id = pipeline.id.clone();
-                    // A followed id that a later generation adds again names another pipeline:
-                    // the one each follower took the place of was removed in an earlier one.
-                    for c in self.controllers.values() {
-                        c.following.forget(&id);
-                    }
                     // Not a change a diff makes. A removal would tear down what the source
                     // created for the pipeline; a restart under its lease leaves it.
                     if let Some(c) = self.controllers.get_mut(&id) {
@@ -423,13 +409,7 @@ impl Loop {
                         *back = Some((pipeline, docs));
                     } else {
                         tracing::info!(pipeline = %pipeline.name, "pipeline added");
-                        let following = Following::new(
-                            removed
-                                .iter()
-                                .filter(|r| r.id != id && shares(r, &pipeline))
-                                .map(|r| r.id.clone()),
-                        );
-                        let added = Controlled::new(pipeline, docs, following, &self.deps);
+                        let added = Controlled::new(pipeline, docs, &self.deps);
                         self.controllers.insert(id, added);
                     }
                 }
@@ -472,14 +452,60 @@ impl Loop {
         });
     }
 
+    /// The tombstones a sweep listed (DA-OPS-9): each removal of an id the ring places here,
+    /// that isn't being removed or taken up here already, is taken up ([`orphan`]). An id this
+    /// node runs too (a pipeline added back, which waits for the removal) is taken up as well:
+    /// the orphan's claim is patient, so it never takes the lease from a live controller here.
+    fn sweep(&mut self, pending: Vec<RemovalDoc>, placement: &Placement, me: &str) {
+        for doc in pending {
+            let id = doc.pipeline_id.clone();
+            if self.returning.contains_key(&id)
+                || self.orphaned.contains(&id)
+                || placement.ring().owner(&id) != Some(me)
+            {
+                continue;
+            }
+            self.orphaned.insert(id.clone());
+            let deps = self.deps.clone();
+            self.orphans.spawn(async move {
+                orphan(doc, deps).await;
+                id
+            });
+        }
+    }
+
     /// A removal ended: the pipeline added back under its id, if any, starts now.
     fn removed(&mut self, id: &str) {
         if let Some(Some((pipeline, docs))) = self.returning.remove(id) {
             tracing::info!(pipeline = %pipeline.name, "pipeline added back, its removal done");
-            let added = Controlled::new(pipeline, docs, Following::default(), &self.deps);
+            let added = Controlled::new(pipeline, docs, &self.deps);
             self.controllers.insert(id.to_owned(), added);
             self.statuses.send_replace(status_map(&self.controllers));
         }
+    }
+}
+
+/// A removal no node removed, taken up by the node the ring places its id on: its pipeline
+/// resolved from the generation its tombstone names, then removed under its lease
+/// ([`PipelineController::remove_orphan`]). One that doesn't resolve here waits for the next
+/// sweep. Its series go to a registry nothing exports: they would carry the labels of a
+/// controller of the pipeline on this node (one that follows the removal), and the removal's
+/// `forget` would drop that one's.
+async fn orphan(doc: RemovalDoc, deps: ControllerDeps) {
+    let deps = ControllerDeps {
+        metrics: Metrics::new(),
+        ..deps
+    };
+    let (id, generation) = (doc.pipeline_id.clone(), doc.generation);
+    match deps.removed.resolve(doc).await {
+        Ok((pipeline, docs)) => {
+            let (c, _status) = PipelineController::new(pipeline, docs, &deps);
+            c.remove_orphan().await;
+        }
+        Err(e) => tracing::warn!(
+            pipeline_id = %id,
+            "a removed pipeline waits for its teardown: generation {generation}, which last had it, doesn't resolve here: {e}"
+        ),
     }
 }
 
@@ -496,6 +522,8 @@ async fn reconcile(
     let mut placement = Placement::new(settings.tokens, settings.stabilization);
     let mut resync = tokio::time::interval(settings.resync);
     resync.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut sweep = tokio::time::interval(SWEEP_INTERVAL);
+    sweep.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut gossiping = true;
     loop {
         let view = members.borrow_and_update().clone();
@@ -552,8 +580,26 @@ async fn reconcile(
                 }
             } => {}
             _ = resync.tick() => {}
+            _ = sweep.tick(), if state.sweeping.is_empty() => {
+                let removals = state.deps.removals.clone();
+                state.sweeping.spawn(async move { removals.all_pending().await });
+            }
+            Some(listed) = state.sweeping.join_next() => match listed {
+                Ok(Ok(pending)) => {
+                    let me = members.borrow().me.clone();
+                    state.sweep(pending, &placement, &me);
+                }
+                Ok(Err(e)) => tracing::warn!("the removal tombstones unread: {e}"),
+                Err(e) => tracing::error!("the removal tombstones' listing ended abnormally: {e}"),
+            },
+            Some(ended) = state.orphans.join_next() => {
+                if let Ok(id) = ended {
+                    state.orphaned.remove(&id);
+                }
+            }
         }
     }
+    state.orphans.abort_all();
     // Every target closes at once (a replaced sender is dropped): the controllers drain
     // together, and the removed pipelines' controllers finish.
     let mut controllers: Vec<Controlled> = state.controllers.into_values().collect();
@@ -578,8 +624,8 @@ mod tests {
 
     use super::*;
     use crate::test_support::{
-        ByPipeline, STABLE, ScriptedStore, TestFactory, alone, config, deps, eventually, leases,
-        members, pipeline_docs, row, until,
+        ByPipeline, STABLE, ScriptedStore, TestFactory, acquired, alone, config, deps, eventually,
+        leases, members, pipeline_docs, removals, row, timing, tombstone, until,
     };
     use crate::{Parts, Phase, Ring, WorkerFactory};
 
@@ -630,6 +676,113 @@ mod tests {
         let (_, view) = watch::channel(alone("n1"));
         let r = ClusterReconciler::start(pipelines(&["p", "q"]), &d, view, reconciler_settings());
         (r, fs["p"].clone(), fs["q"].clone(), d)
+    }
+
+    /// DA-OPS-9: a removal no node removed (no node held the lease when the generation came) is
+    /// taken up by the node the ring places its id on: the lease claimed, the source torn down,
+    /// the lease released, the tombstone done. One that doesn't resolve here waits, and doesn't
+    /// hold up the others.
+    #[tokio::test(start_paused = true)]
+    async fn a_removal_no_node_removed_is_torn_down_where_the_ring_places_it() {
+        let store = ScriptedStore::new();
+        let (fs, d) = factories(&store, &["p"]);
+        let r = removals(&store);
+        r.record(&tombstone("p")).await.unwrap();
+        r.record(&tombstone("unresolvable")).await.unwrap();
+        let (_, view) = watch::channel(alone("n1"));
+        let _r = ClusterReconciler::start(vec![], &d, view, reconciler_settings());
+        eventually("p is torn down", || fs["p"].source.teardowns() == 1).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(r.pending("p").await.unwrap(), None, "p's removal done");
+        let lease = leases(&store).observe("p").await.unwrap().unwrap();
+        assert!(lease.doc.released, "{lease:?}");
+        tokio::time::sleep(SWEEP_INTERVAL * 2).await;
+        assert_eq!(fs["p"].source.teardowns(), 1, "once");
+        assert!(r.pending("unresolvable").await.unwrap().is_some());
+    }
+
+    /// An orphan's series go to a registry nothing exports: those of a controller of the same
+    /// pipeline on this node (the same labels), its renew failures included, outlive the
+    /// removal's `forget`.
+    #[tokio::test(start_paused = true)]
+    async fn an_orphan_leaves_the_nodes_series_of_its_pipeline_alone() {
+        use data_avalanche_telemetry::{PipelineLabels, RenewFailure};
+        let store = ScriptedStore::new();
+        let (fs, d) = factories(&store, &["p"]);
+        let follower = d.metrics.pipeline(
+            PipelineLabels {
+                pipeline: "p".into(),
+                source_host: "127.0.0.1".into(),
+                source_db: "avalanche".into(),
+                sink_type: "delta".into(),
+            },
+            false,
+        );
+        follower.renew_failed(RenewFailure::Transient);
+        let series = |text: &str| {
+            text.lines().any(|l| {
+                l.starts_with("data_avalanche_lease_renew_failures_total{")
+                    && l.contains("pipeline=\"p\"")
+                    && l.ends_with(" 1")
+            })
+        };
+        assert!(series(&d.metrics.encode()), "{}", d.metrics.encode());
+        removals(&store).record(&tombstone("p")).await.unwrap();
+        let (_, view) = watch::channel(alone("n1"));
+        let _r = ClusterReconciler::start(vec![], &d, view, reconciler_settings());
+        eventually("p is torn down", || fs["p"].source.teardowns() == 1).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(series(&d.metrics.encode()), "{}", d.metrics.encode());
+    }
+
+    /// A removal whose lease a gone node holds (its owner crashed, or its drain was cut off)
+    /// waits for the lease to expire, then is taken over and torn down.
+    #[tokio::test(start_paused = true)]
+    async fn a_removal_held_by_a_gone_node_is_torn_down_once_its_lease_expires() {
+        let store = ScriptedStore::new();
+        let (fs, d) = factories(&store, &["p"]);
+        let gone = acquired(&leases(&store), "n9").await;
+        removals(&store).record(&tombstone("p")).await.unwrap();
+        let (_, view) = watch::channel(alone("n1"));
+        let _r = ClusterReconciler::start(vec![], &d, view, reconciler_settings());
+        tokio::time::sleep(timing().duration / 2).await;
+        assert_eq!(fs["p"].source.teardowns(), 0, "the lease holds");
+        eventually("p is torn down", || fs["p"].source.teardowns() == 1).await;
+        let lease = leases(&store).observe("p").await.unwrap().unwrap();
+        assert_eq!(
+            lease.doc.owner_epoch,
+            gone.doc.owner_epoch + 1,
+            "taken over"
+        );
+        assert!(lease.doc.released);
+    }
+
+    /// The node the ring doesn't place a removed id on leaves it to the one it does.
+    #[tokio::test(start_paused = true)]
+    async fn a_removal_is_taken_up_only_where_the_ring_places_it() {
+        let store = ScriptedStore::new();
+        let ids = ["p", "q", "r", "s", "t", "u", "v", "w"];
+        let (fs, d) = factories(&store, &ids);
+        let view = members(
+            "n1",
+            &[("n1", Phase::Active, false), ("n2", Phase::Active, false)],
+        );
+        let ring = Ring::new(["n1", "n2"], 128);
+        let (here, there): (Vec<&str>, Vec<&str>) =
+            ids.iter().partition(|id| ring.owner(id) == Some("n1"));
+        assert!(!here.is_empty() && !there.is_empty(), "{here:?} {there:?}");
+        for id in ids {
+            removals(&store).record(&tombstone(id)).await.unwrap();
+        }
+        let (_, view) = watch::channel(view);
+        let _r = ClusterReconciler::start(vec![], &d, view, reconciler_settings());
+        for id in &here {
+            eventually("torn down here", || fs[*id].source.teardowns() == 1).await;
+        }
+        tokio::time::sleep(SWEEP_INTERVAL * 2).await;
+        for id in &there {
+            assert_eq!(fs[*id].source.teardowns(), 0, "{id} is n2's");
+        }
     }
 
     #[test]
@@ -1067,8 +1220,15 @@ mod tests {
         (r, fs, seen)
     }
 
-    /// One reload adds `y` and removes `x`, with the 60 s drain timeout.
-    fn replace_x(r: &ClusterReconciler, y: Pipeline, docs: PipelineDocs) {
+    /// One reload adds `y` and removes `x`, with the 60 s drain timeout; `x`'s tombstone first,
+    /// as the coordinator records it.
+    async fn replace_x(
+        store: &Arc<ScriptedStore>,
+        r: &ClusterReconciler,
+        y: Pipeline,
+        docs: PipelineDocs,
+    ) {
+        removals(store).record(&tombstone("x")).await.unwrap();
         let mut c = cluster();
         c.drain_timeout = Duration::from_secs(60);
         assert!(r.reloader().apply(Reload {
@@ -1089,7 +1249,7 @@ mod tests {
         let (r, fs, seen) = x_with_its_drain_held(&store).await;
         let (mut y, docs) = pipelines(&["y"]).remove(0);
         y.source.postgres.as_mut().unwrap().slot = "x_slot".into();
-        replace_x(&r, y, docs);
+        replace_x(&store, &r, y, docs).await;
         eventually("y in", || r.statuses().contains_key("y")).await;
         // Past two lease durations: x's lease is renewed meanwhile, so it isn't let go.
         tokio::time::sleep(Duration::from_secs(30)).await;
@@ -1118,7 +1278,7 @@ mod tests {
         let store = ScriptedStore::new();
         let (r, fs, seen) = x_with_its_drain_held(&store).await;
         let (y, docs) = pipelines(&["y"]).remove(0);
-        replace_x(&r, y, docs);
+        replace_x(&store, &r, y, docs).await;
         eventually("y in", || r.statuses().contains_key("y")).await;
         until(r.statuses().get_mut("y").unwrap(), "y running", running).await;
         assert_eq!(fs["x"].sink.waiting_commits(), 1, "x still drains");
@@ -1128,34 +1288,68 @@ mod tests {
         assert_eq!(fs["x"].source.teardowns(), 1);
     }
 
-    /// A followed id that a later generation adds again names another pipeline: the wait on it
-    /// ends, though the lease under that id is still held (here by the removal, still draining;
-    /// next by the pipeline added under the id, which would renew it for good).
+    /// DA-OPS-10: the removal and the add in two generations. `y`, added after `x`'s removal
+    /// began, waits for it all the same: the tombstone, not the reload, says what it follows.
     #[tokio::test(start_paused = true)]
-    async fn a_wait_on_an_id_a_later_generation_adds_again_ends() {
+    async fn a_pipeline_added_after_the_removal_it_follows_waits_for_it() {
         let store = ScriptedStore::new();
         let (r, fs, seen) = x_with_its_drain_held(&store).await;
-        let (mut y, docs) = pipelines(&["y"]).remove(0);
-        y.source.postgres.as_mut().unwrap().slot = "x_slot".into();
-        replace_x(&r, y, docs);
-        eventually("y in", || r.statuses().contains_key("y")).await;
-        tokio::time::sleep(Duration::from_secs(10)).await;
-        assert_eq!(fs["y"].builds(), 0, "y waits for x");
-        let (x, x_docs) = pipelines(&["x"]).remove(0);
+        removals(&store).record(&tombstone("x")).await.unwrap();
         let mut c = cluster();
         c.drain_timeout = Duration::from_secs(60);
         assert!(r.reloader().apply(Reload {
-            pipelines: vec![PipelineReload::Add(x, x_docs)],
+            pipelines: vec![PipelineReload::Remove("x".into())],
+            cluster: c.clone(),
+        }));
+        let (mut y, docs) = pipelines(&["y"]).remove(0);
+        y.source.postgres.as_mut().unwrap().slot = "x_slot".into();
+        assert!(r.reloader().apply(Reload {
+            pipelines: vec![PipelineReload::Add(y, docs)],
             cluster: c,
         }));
+        eventually("y in", || r.statuses().contains_key("y")).await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(fs["y"].builds(), 0, "not while x's removal runs");
+        fs["x"].sink.release_commits();
         until(r.statuses().get_mut("y").unwrap(), "y running", running).await;
         assert_eq!(
-            fs["x"].sink.waiting_commits(),
-            1,
-            "x's removal still drains"
+            *seen.lock().unwrap(),
+            [1],
+            "x torn down before y's first build"
         );
-        assert_eq!(*seen.lock().unwrap(), [0]);
-        fs["x"].sink.release_commits();
+        r.shutdown().await;
+    }
+
+    /// DA-OPS-10: a node that starts while a removal it doesn't run is under way (here a
+    /// crashed holder's, its lease held) waits for it before it runs the pipeline that takes
+    /// the removed one's place, and runs the others at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_node_started_during_a_removal_waits_for_it() {
+        let store = ScriptedStore::new();
+        let (fs, d) = factories(&store, &["x", "y", "z"]);
+        leases(&store)
+            .acquire(
+                "x",
+                &crate::test_support::holder("n9"),
+                timing().duration,
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+        removals(&store).record(&tombstone("x")).await.unwrap();
+        let mut ps = pipelines(&["y", "z"]);
+        ps[0].0.source.postgres.as_mut().unwrap().slot = "x_slot".into();
+        let (_, view) = watch::channel(alone("n1"));
+        let r = ClusterReconciler::start(ps, &d, view, reconciler_settings());
+        until(r.statuses().get_mut("z").unwrap(), "z running", running).await;
+        assert_eq!(fs["y"].builds(), 0, "y waits for x's removal");
+        until(r.statuses().get_mut("y").unwrap(), "y running", running).await;
+        assert_eq!(
+            fs["x"].source.teardowns(),
+            1,
+            "x torn down by the sweep first"
+        );
+        assert_eq!(removals(&store).pending("x").await.unwrap(), None);
         r.shutdown().await;
     }
 

@@ -1,17 +1,18 @@
 //! The two connections to the source: the catalog connection (`tokio-postgres`: catalog channels,
 //! snapshot chunks, slot and publication DDL) and the replication connection
 //! (`pgwire-replication`). Both run with the same pinned session settings, so the text the
-//! decoder parses has one form (D-M5.5).
+//! decoder parses has one form (D-M5.5). Snapshot chunks are read on connections of their own,
+//! one per concurrent read, kept idle between reads (DA-SNAP-12).
 
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use data_avalanche_config::{Source, SslMode, Timeouts};
 use data_avalanche_core::SourceError;
 use pgwire_replication::{Lsn, ReplicationConfig};
 use tokio::sync::Mutex;
-use tokio_postgres::Client;
+use tokio_postgres::{Client, SimpleQueryMessage};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::error::{sql_error, timed_out};
@@ -20,6 +21,10 @@ use crate::error::{sql_error, timed_out};
 /// `lock_timeout`): the server cancels a slow statement first, so the shared catalog connection
 /// is free again when the client gives up.
 pub(crate) const SERVER_FIRST: Duration = Duration::from_secs(5);
+
+/// The most idle chunk-read connections kept: as many as `snapshots.parallelism` reads without a
+/// warning (V-038).
+pub const IDLE_READS: usize = 4;
 
 /// `d` as a server-side timeout in milliseconds: at least 1 (0 turns a timeout off) and at most
 /// what the setting holds (`i32::MAX`).
@@ -51,6 +56,8 @@ pub(crate) struct Connector {
     files: PemFiles,
     tls: Option<MakeRustlsConnect>,
     client: Mutex<Option<Arc<Client>>>,
+    /// Chunk-read connections between reads (DA-SNAP-12).
+    reads: std::sync::Mutex<Vec<Client>>,
 }
 
 impl Connector {
@@ -77,6 +84,7 @@ impl Connector {
             files,
             tls,
             client: Mutex::new(None),
+            reads: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -179,6 +187,54 @@ impl Connector {
         }
     }
 
+    /// Runs `sql` on a chunk-read connection of its own, under a client-side timeout from when
+    /// it has one: an idle one, or one connected for it within `timeouts.connect`. Reads don't
+    /// queue behind one another, and a timeout abandons only its own connection (DA-SNAP-12).
+    pub(crate) async fn read(
+        &self,
+        what: &str,
+        after: Duration,
+        sql: &str,
+    ) -> Result<Vec<SimpleQueryMessage>, SourceError> {
+        let idle = {
+            let mut reads = self.reads.lock().unwrap_or_else(PoisonError::into_inner);
+            reads.retain(|c| !c.is_closed());
+            reads.pop()
+        };
+        let client = match idle {
+            Some(c) => c,
+            None => self.connect().await?,
+        };
+        match tokio::time::timeout(after, client.simple_query(sql)).await {
+            Ok(r) => {
+                if !client.is_closed() {
+                    let mut reads = self.reads.lock().unwrap_or_else(PoisonError::into_inner);
+                    if reads.len() < IDLE_READS {
+                        reads.push(client);
+                    }
+                }
+                r.map_err(sql_error)
+            }
+            Err(_) => {
+                self.cancel(&client).await;
+                Err(timed_out(what, after))
+            }
+        }
+    }
+
+    /// Asks the server to cancel what `client` runs, within `timeouts.connect`; a cancel that
+    /// fails changes nothing.
+    async fn cancel(&self, client: &Client) {
+        let token = client.cancel_token();
+        let _ = tokio::time::timeout(self.timeouts.connect, async {
+            match &self.tls {
+                None => token.cancel_query(tokio_postgres::NoTls).await,
+                Some(tls) => token.cancel_query(tls.clone()).await,
+            }
+        })
+        .await;
+    }
+
     /// Drops `client` from the cache and asks the server to cancel what it runs there, within
     /// `timeouts.connect`; a cancel that fails changes nothing. A client another call abandoned
     /// already, and one connected since, are left alone. Calls that share the connection can see
@@ -191,14 +247,7 @@ impl Connector {
             }
             *slot = None;
         }
-        let token = client.cancel_token();
-        let _ = tokio::time::timeout(self.timeouts.connect, async {
-            match &self.tls {
-                None => token.cancel_query(tokio_postgres::NoTls).await,
-                Some(tls) => token.cancel_query(tls.clone()).await,
-            }
-        })
-        .await;
+        self.cancel(client).await;
     }
 
     /// The replication connection for `slot` and `publication`, starting after `start`. The status

@@ -23,6 +23,9 @@ use tokio::sync::watch;
 
 /// A JWKS fetch, or a discovery, takes at most this long.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The largest JWKS or discovery document read (DA-API-16): a longer one fails the fetch.
+pub const MAX_KEY_DOCUMENT: usize = 1 << 20;
 /// A token signed by a key the cached JWKS lacks fetches the JWKS again, at most this often
 /// (a key rotation; a flood of tokens with made-up key ids fetches nothing more).
 pub const REFETCH_AFTER: Duration = Duration::from_secs(30);
@@ -415,6 +418,8 @@ impl Keys {
             timing,
             http: reqwest::Client::builder()
                 .timeout(FETCH_TIMEOUT)
+                // The key URLs are the configured ones: a redirect is refused (DA-API-16).
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("the HTTP client builds"),
             cache: Mutex::new(Cache::default()),
@@ -526,17 +531,35 @@ impl Keys {
         self.get(&url).await
     }
 
+    /// The document at `url`: a redirect isn't followed, and a body past
+    /// [`MAX_KEY_DOCUMENT`] isn't read (DA-API-16).
     async fn get<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T, String> {
-        let body = self
+        let mut r = self
             .http
             .get(url)
             .send()
             .await
             .and_then(reqwest::Response::error_for_status)
-            .map_err(|e| format!("{url}: {e}"))?
-            .bytes()
-            .await
             .map_err(|e| format!("{url}: {e}"))?;
+        if r.status().is_redirection() {
+            return Err(format!(
+                "{url}: answered {}, and redirects aren't followed: configure the URL it names",
+                r.status()
+            ));
+        }
+        let too_long = || format!("{url}: the document is longer than {MAX_KEY_DOCUMENT} bytes");
+        if r.content_length()
+            .is_some_and(|n| n > MAX_KEY_DOCUMENT as u64)
+        {
+            return Err(too_long());
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = r.chunk().await.map_err(|e| format!("{url}: {e}"))? {
+            if body.len() + chunk.len() > MAX_KEY_DOCUMENT {
+                return Err(too_long());
+            }
+            body.extend_from_slice(&chunk);
+        }
         serde_json::from_slice(&body).map_err(|e| format!("{url}: {e}"))
     }
 }
@@ -578,6 +601,60 @@ mod tests {
         match r {
             Err(Denied::Unauthenticated { why, .. }) => why,
             other => panic!("not a 401: {other:?}"),
+        }
+    }
+
+    /// DA-API-16: a key document's fetch follows no redirect and reads at most
+    /// [`MAX_KEY_DOCUMENT`] bytes.
+    #[tokio::test]
+    async fn a_key_fetch_follows_no_redirect_and_reads_a_bounded_body() {
+        use axum::response::{IntoResponse, Redirect};
+        let app = axum::Router::new()
+            .route(
+                "/moved",
+                axum::routing::get(|| async { Redirect::temporary("/keys") }),
+            )
+            .route("/keys", axum::routing::get(|| async { r#"{"keys": []}"# }))
+            .route(
+                "/big",
+                axum::routing::get(|| async { "x".repeat(MAX_KEY_DOCUMENT + 1).into_response() }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        // A chunked body, no length announced.
+        let raw = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let streamed = format!("http://{}/streamed", raw.local_addr().unwrap());
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut sock, _) = raw.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = sock.read(&mut request).await;
+            let head = "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n";
+            sock.write_all(head.as_bytes()).await.unwrap();
+            let chunk = format!("1000\r\n{}\r\n", " ".repeat(4096));
+            for _ in 0..=MAX_KEY_DOCUMENT / 4096 {
+                if sock.write_all(chunk.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+            let _ = sock.write_all(b"0\r\n\r\n").await;
+        });
+        let timing = Timing {
+            refetch_after: Duration::ZERO,
+            max_age: Duration::from_secs(60),
+        };
+        let keys = Keys::new(&url, KeySource::Jwks(String::new()), timing);
+        let set: JwkSet = keys.get(&format!("{url}/keys")).await.unwrap();
+        assert!(set.keys.is_empty());
+        let e = keys
+            .get::<JwkSet>(&format!("{url}/moved"))
+            .await
+            .unwrap_err();
+        assert!(e.contains("redirects aren't followed"), "{e}");
+        for long in [format!("{url}/big"), streamed] {
+            let e = keys.get::<JwkSet>(&long).await.unwrap_err();
+            assert!(e.contains("longer than 1048576 bytes"), "{long}: {e}");
         }
     }
 

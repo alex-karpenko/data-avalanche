@@ -7,10 +7,10 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::test_support::{
-    LEAVE_WITHIN, STABLE, TestCluster, TestNode, at, config_text, eventually, runners, settles,
-    timing,
+    LEAVE_WITHIN, STABLE, TestCluster, TestNode, at, config_text, eventually, removals, runners,
+    settles, timing,
 };
-use crate::{Ring, leave};
+use crate::{Ring, SWEEP_INTERVAL, leave};
 
 const IDS: [&str; 6] = [
     "orders",
@@ -207,7 +207,11 @@ async fn a_reload_reaches_every_node_and_each_pipeline_runs_once() {
             "prefix: orders, delta: {}, flush: { seconds: 0, rows: 5 }",
         )
         .replace("prefix: customers,", "prefix: customers-v2,");
-    let out = b.coordinator.reload(&text).await.unwrap();
+    let out = b
+        .coordinator
+        .reload(&text, crate::RestartFields::Refuse)
+        .await
+        .unwrap();
     assert_eq!((out.generation, out.published), (2, true));
     eventually("every node applies generation 2", || {
         nodes.iter().all(|n| n.coordinator.applied() == 2)
@@ -246,5 +250,81 @@ async fn a_reload_reaches_every_node_and_each_pipeline_runs_once() {
         );
     }
     assert_eq!(f("payments").source.teardowns(), 1, "the owner alone");
+    c.assert_ran_once();
+}
+
+/// An id of [`IDS`] the ring over `nodes` places on `on`.
+fn placed_on(nodes: &[&str], on: &str) -> &'static str {
+    let ring = Ring::new(nodes.iter().copied(), 128);
+    IDS.into_iter()
+        .find(|id| ring.owner(id) == Some(on))
+        .expect("an id placed there")
+}
+
+/// A removal of `id` under way from generation 1, which had it: a node that skipped the
+/// generation removing it (it adopted the one after, which configures `id` again unchanged),
+/// or refused it, never removed it, and no node marks it done.
+async fn undone_removal(c: &TestCluster, id: &str) {
+    let first = c.generations.current().await.unwrap().unwrap().pointer;
+    assert_eq!(first.doc.generation, 1);
+    removals(&c.store)
+        .record(&data_avalanche_state::RemovalDoc {
+            pipeline_id: id.into(),
+            generation: 1,
+            hash: first.doc.hash,
+            removed_at: chrono::Utc::now(),
+            done_at: None,
+            records: 0,
+        })
+        .await
+        .unwrap();
+}
+
+/// Config §12.3: a removal the current generation undoes, its orphan waiting beside the live
+/// controller, is marked done without a teardown when a hand-off lets the lease go: the
+/// pipeline runs on the joiner, its slot and publication untouched.
+#[tokio::test(start_paused = true)]
+async fn an_undone_removal_tears_nothing_down_at_a_hand_off() {
+    let id = placed_on(&["a", "b"], "b");
+    let c = TestCluster::new(&[id]);
+    let a = c.start("a", 1, 1, None).await;
+    settles("on a", &[&a], |_| "a".to_owned()).await;
+    undone_removal(&c, id).await;
+    // a's sweep takes the removal up: its orphan waits beside a's live controller.
+    tokio::time::sleep(SWEEP_INTERVAL * 2).await;
+    let f = c.factories.0[id].clone();
+    assert_eq!(f.source.teardowns(), 0);
+    assert!(removals(&c.store).pending(id).await.unwrap().is_some());
+    let b = c.start("b", 2, 1, Some(at(1))).await;
+    tokio::time::sleep(STABLE).await;
+    settles("handed to b", &[&a, &b], placed(&["a", "b"])).await;
+    assert_eq!(f.source.teardowns(), 0, "the running pipeline's slot stays");
+    assert_eq!(removals(&c.store).pending(id).await.unwrap(), None);
+    c.insert(1);
+    eventually("1 lands", || c.landed(&[1])).await;
+    c.assert_ran_once();
+}
+
+/// The failover of the above: the holder crashes, the survivor's controller waits on its own
+/// id's tombstone, and proceeds once the survivor's orphan, past the lease's expiry, marks it
+/// done without a teardown.
+#[tokio::test(start_paused = true)]
+async fn an_undone_removal_tears_nothing_down_at_a_failover() {
+    let id = placed_on(&["a", "b"], "a");
+    let c = TestCluster::new(&[id]);
+    let a = c.start("a", 1, 1, None).await;
+    let b = c.start("b", 2, 1, Some(at(1))).await;
+    tokio::time::sleep(STABLE).await;
+    settles("on a", &[&a, &b], placed(&["a", "b"])).await;
+    undone_removal(&c, id).await;
+    tokio::time::sleep(SWEEP_INTERVAL * 2).await;
+    let f = c.factories.0[id].clone();
+    assert_eq!(f.source.teardowns(), 0);
+    drop(a);
+    settles("on b", &[&b], |_| "b".to_owned()).await;
+    assert_eq!(f.source.teardowns(), 0, "the running pipeline's slot stays");
+    assert_eq!(removals(&c.store).pending(id).await.unwrap(), None);
+    c.insert(1);
+    eventually("1 lands", || c.landed(&[1])).await;
     c.assert_ran_once();
 }

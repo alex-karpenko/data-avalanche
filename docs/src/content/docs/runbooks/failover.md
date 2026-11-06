@@ -13,7 +13,11 @@ curl -s https://cdc.example.internal/v1/cluster/status
 ```
 
 It lists the members this node sees, with their state, and each pipeline's lease holder. Ask more
-than one node: they should agree.
+than one node: they should agree. A holder marked `holder_stale` (in `GET /v1/pipelines/<id>`:
+`holder.stale`) isn't a member this node sees, or is an earlier process of a restarted node: its
+lease still reads as held until it expires and another node takes it over. `holder.suspect` means
+the gossip suspects the holder of having failed. Both come from this node's view of the
+membership, not from clocks.
 
 ## A node died
 
@@ -45,10 +49,10 @@ slower failover; it is fixed for the life of a cluster's `globals.state`.
 
 ## The nodes split into groups
 
-With `discovery: dns`, nodes started together can form groups that don't see each other: each
-group's `members` lists only its own, and the groups contend for the leases. Restart the pods of
-the smaller group one at a time. See
-[the caution on DNS discovery](/data-avalanche/configuration/cluster/#discovery).
+Nodes that formed groups that don't see each other (each group's `members` lists only its own)
+merge on their own: every node resolves its seeds again every 5 s and asks those that aren't
+members. Groups that stay apart for more than a few seconds can't reach each other: check the
+network between them, and that each node's `advertise_addr` is the address its peers reach.
 
 ## Taking a node out
 

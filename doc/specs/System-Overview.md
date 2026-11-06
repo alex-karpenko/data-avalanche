@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-28
+updated: 2026-11-04
 domain: Architecture
 tags: [architecture, design, system, multi-sink, iceberg, delta-lake, v1-scope]
 sources: []
@@ -121,12 +121,12 @@ Functional endpoints are versioned under `/v1`; probes and metrics are unversion
 |---|---|---|---|
 | Liveness / readiness | `GET /health/live`, `GET /health/ready` | none | |
 | Metrics | `GET /metrics` | none | Prometheus exposition |
-| Config validate | `POST /v1/config/validate` | operator | dry-run of the full load pipeline (parse → validate → resolve) of the body, or of the node's file when the body is empty: the report and what a reload would change; the resolved config is not returned; nothing is published |
-| Config reload | `POST /v1/config/reload` | operator | publishes a new config generation cluster-wide |
+| Config validate | `POST /v1/config/validate` | operator | dry-run of the full load pipeline (parse → validate → resolve) of the body, or of the node's file when the body is empty: the report and what a reload would change; the resolved config is not returned; nothing is published. A node takes posted bodies at 1 per second after a burst of 5: past it, `429` with `Retry-After` |
+| Config reload | `POST /v1/config/reload` | operator | publishes a new config generation cluster-wide; a process-restart field is refused unless `?restart=accept`, and then applied at each node's next start (`restart_pending`) |
 | Config status | `GET /v1/config/status` | viewer | |
 | Cluster status | `GET /v1/cluster/status` | viewer | |
-| Pipelines status | `GET /v1/pipelines`, `GET /v1/pipelines/{id}` | viewer | `desired_state`, `actual_state`, positions, per-table status (halted tables with their reason) |
-| Request snapshot | `POST /v1/pipelines/{id}/snapshots` | operator | tables list (the per-table config keys), no globs; refused (`409`) unless the desired state is `RUNNING` and a node holds the lease, as a restart (`ERROR` included), or while an unfinished job holds one of the tables; `202` with the job's id. The job runs in a restarted worker. It upserts: a row deleted at the source before the job stays (drop or move the sink table first to start clean) |
+| Pipelines status | `GET /v1/pipelines`, `GET /v1/pipelines/{id}` | viewer | `desired_state`, `actual_state`, positions, per-table status (halted tables with their reason); the lease holder flagged `stale` when it isn't a member the node's gossip sees (gone, or an earlier process of a restarted node), `suspect` while gossip suspects it |
+| Request snapshot | `POST /v1/pipelines/{id}/snapshots` | operator | tables list (the per-table config keys), no globs; refused (`409`) unless the desired state is `RUNNING` and a node holds the lease, as a restart (`ERROR` included), or while an unfinished job holds one of the tables; `202` with the job's id. The job runs in a restarted worker. It upserts: a row deleted at the source before the job stays, unless the job is asked with `truncate: true`, which empties each sink table first. A pipeline keeps its 100 newest ended jobs |
 | Snapshot job status | `GET /v1/snapshots/{job_id}` | viewer | |
 | List snapshot jobs | `GET /v1/pipelines/{id}/snapshots` | viewer | persisted in the pipeline state location; survive restart and failover |
 | Pipeline pause | `POST /v1/pipelines/{id}/pause` | operator | `RUNNING → PAUSED`: flush to a transaction boundary and commit; source connection kept warm; lease kept |

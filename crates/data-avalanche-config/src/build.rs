@@ -266,6 +266,27 @@ fn read_or_report<T>(
 
 // ---- globals ----
 
+/// `globals.tracing.headers`, each value a secret. The structural pass builds none (no
+/// fingerprint key), though each value's template is still checked.
+fn tracing_headers(
+    ctx: &mut Ctx,
+    headers: &Option<BTreeMap<String, Leaf<String>>>,
+    at: &At,
+) -> Option<BTreeMap<String, Secret>> {
+    let mut out = Some(BTreeMap::new());
+    for (name, leaf) in headers.iter().flatten() {
+        let value = ctx.text(leaf, &at.key(name));
+        out = match (out, value, ctx.fingerprint_key()) {
+            (Some(mut m), Some(v), Some(key)) => {
+                m.insert(name.clone(), Secret::new(v, key));
+                Some(m)
+            }
+            _ => None,
+        };
+    }
+    out
+}
+
 fn globals(g: &RawGlobals, ctx: &mut Ctx) -> Option<Globals> {
     let at = At::config(YamlPath::root().key("globals"));
     let cloud = or(ctx, &g.cloud, &at, "cloud", Cloud::Aws);
@@ -298,6 +319,7 @@ fn globals(g: &RawGlobals, ctx: &mut Ctx) -> Option<Globals> {
         "sample_ratio",
         ratio_default,
     );
+    let headers = tracing_headers(ctx, &tracing.headers, &tracing_at.key("headers"));
     let azure = g.azure.clone().unwrap_or_default();
     let account_name = opt(ctx, &azure.account_name, &at.key("azure"), "account_name");
     Some(Globals {
@@ -315,6 +337,7 @@ fn globals(g: &RawGlobals, ctx: &mut Ctx) -> Option<Globals> {
         tracing: Tracing {
             otlp_endpoint: otlp_endpoint?,
             sample_ratio: sample_ratio?,
+            headers: headers?,
         },
         azure: Azure {
             account_name: account_name?,

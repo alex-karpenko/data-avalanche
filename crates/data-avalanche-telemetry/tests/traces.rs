@@ -1,6 +1,7 @@
 //! The OTLP/HTTP export (config §6.6): a sampled span reaches the collector's `/v1/traces`; one
 //! not sampled doesn't; a span's ids are known only when it is sampled.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use data_avalanche_telemetry::{Traces, trace_ids};
@@ -26,7 +27,11 @@ fn flush(traces: &Traces) -> Option<(String, String)> {
 fn a_sampled_flush_is_exported_to_the_collector() {
     let (url, requests) = collector();
     let traces = Traces::new("node-1");
-    assert!(traces.set(Some(&format!("{url}/")), 1.0).unwrap());
+    assert!(
+        traces
+            .set(Some(&format!("{url}/")), &BTreeMap::new(), 1.0)
+            .unwrap()
+    );
     let ids = flush(&traces);
     traces.shutdown();
     let request = requests.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -48,7 +53,7 @@ fn a_sampled_flush_is_exported_to_the_collector() {
 fn a_flush_not_sampled_is_neither_exported_nor_named() {
     let (url, requests) = collector();
     let traces = Traces::new("node-1");
-    traces.set(Some(&url), 0.0).unwrap();
+    traces.set(Some(&url), &BTreeMap::new(), 0.0).unwrap();
     assert_eq!(flush(&traces), None);
     traces.shutdown();
     assert!(requests.recv_timeout(Duration::from_millis(500)).is_err());
@@ -60,16 +65,16 @@ fn a_new_endpoint_takes_the_next_spans_and_none_takes_none() {
     let (first, to_first) = collector();
     let (second, to_second) = collector();
     let traces = Traces::new("node-1");
-    traces.set(Some(&first), 1.0).unwrap();
+    traces.set(Some(&first), &BTreeMap::new(), 1.0).unwrap();
     flush(&traces);
     traces.flush();
     assert!(to_first.recv_timeout(Duration::from_secs(10)).is_ok());
-    traces.set(Some(&second), 1.0).unwrap();
+    traces.set(Some(&second), &BTreeMap::new(), 1.0).unwrap();
     flush(&traces);
     traces.flush();
     assert!(to_second.recv_timeout(Duration::from_secs(10)).is_ok());
     assert!(to_first.try_recv().is_err());
-    assert!(!traces.set(None, 1.0).unwrap());
+    assert!(!traces.set(None, &BTreeMap::new(), 1.0).unwrap());
     assert_eq!(flush(&traces), None, "off: nothing is sampled");
     traces.shutdown();
     assert!(to_second.recv_timeout(Duration::from_millis(500)).is_err());
@@ -79,8 +84,10 @@ fn a_new_endpoint_takes_the_next_spans_and_none_takes_none() {
 fn an_endpoint_that_isn_t_a_url_is_refused_and_the_one_in_force_stays() {
     let (url, requests) = collector();
     let traces = Traces::new("node-1");
-    traces.set(Some(&url), 1.0).unwrap();
-    let e = traces.set(Some("not a url"), 1.0).unwrap_err();
+    traces.set(Some(&url), &BTreeMap::new(), 1.0).unwrap();
+    let e = traces
+        .set(Some("not a url"), &BTreeMap::new(), 1.0)
+        .unwrap_err();
     assert!(e.to_string().contains("not a url"), "{e}");
     flush(&traces);
     traces.shutdown();
@@ -95,7 +102,7 @@ fn a_collector_that_never_answers_doesn_t_hold_the_spans_up() {
     let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", silent.local_addr().unwrap());
     let traces = Traces::new("node-1");
-    traces.set(Some(&url), 1.0).unwrap();
+    traces.set(Some(&url), &BTreeMap::new(), 1.0).unwrap();
     let started = std::time::Instant::now();
     for _ in 0..5_000 {
         flush(&traces);

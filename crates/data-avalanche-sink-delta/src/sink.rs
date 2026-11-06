@@ -856,6 +856,32 @@ mod tests {
         assert_eq!(ids(&s).await, [1]);
     }
 
+    /// DA-SNAP-15: a job's truncate, a snapshot set with no rows, empties the table with its
+    /// DELETE alone, fenced, and isn't skipped though the marker covers its position; the marker
+    /// stays.
+    #[tokio::test]
+    async fn a_job_s_truncate_empties_the_table_and_keeps_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = sink(&dir);
+        s.ensure_table(&spec(&orders())).await.unwrap();
+        let seed = rows(20, &[1, 2]);
+        s.commit(seed.clone(), marker(1, &seed)).await.unwrap();
+        let mut t = change_set(10, vec![], vec![]);
+        t.truncate = true;
+        t.snapshot = true;
+        t.validate().unwrap();
+        assert!(matches!(
+            s.commit(t.clone(), marker(1, &t)).await.unwrap(),
+            CommitOutcome::Committed { .. }
+        ));
+        assert!(ids(&s).await.is_empty());
+        let state = s.table_state(orders().table()).await.unwrap();
+        assert_eq!(
+            state.marker.map(|m| m.committed_position),
+            Some(seed.position.end.clone())
+        );
+    }
+
     /// Q-M5-19: a key outside the Delta range halts the set before its truncate's DELETE, so the
     /// table isn't left cleared.
     #[tokio::test]

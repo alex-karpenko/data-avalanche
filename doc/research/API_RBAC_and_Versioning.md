@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-27
+updated: 2026-11-06
 domain: Auth
 tags: [rbac, api, authorization, roles, jwt, oauth2, versioning, management-api, cdc]
 resolves: [G-16, G-9.1]
@@ -191,3 +191,5 @@ min-role column; the new lifecycle endpoints (G-NEW-15) inherit operator from th
 | D-16.3 binding | none = open; basic = admin; jwt/oauth2 = mapped claim roles, max wins; 401 vs 403 distinguished |
 | D-16.4 IdP mapping | configurable `role_mapping`, default identity on the three names |
 | D-16.5 TLS rule | V-052 stays a **warning** (upstream TLS termination is common in k8s) |
+| D-16.6 key fetch (M12b, DA-API-16) | A JWKS or discovery fetch follows no redirect (a `3xx` is refused) and reads at most 1 MiB; a non-`https` key URL warns (V-125) |
+| D-16.7 limits (M12b, DA-API-17, DA-API-20) | Constants, not config: at most 1024 open connections a node (past it, the accept waits for one to close), one idle for 60 s closed; a posted `validate` body takes a token from a node-wide bucket of 5, refilled at 1 a second, else `429` with `Retry-After` |

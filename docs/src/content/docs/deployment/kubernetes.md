@@ -93,8 +93,8 @@ rolls. It doesn't wait for them: lower it to roll faster, at the cost of moving 
 twice.
 
 The pods start in parallel (`podManagementPolicy: Parallel`), since a pod's name, not its start
-order, places it. With four or more pods started at once, check after a cold start that every node
-sees every other: see [the caution on DNS discovery](/data-avalanche/configuration/cluster/#discovery).
+order, places it. Pods that started together and found only some of the others merge within
+seconds: each one resolves the Service again every 5 s ([discovery](/data-avalanche/configuration/cluster/#discovery)).
 
 ## TLS for the API
 

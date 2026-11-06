@@ -37,6 +37,7 @@ mod generation;
 mod lease;
 mod lifecycle;
 mod pipeline;
+mod removal;
 mod snapshot;
 mod tables;
 #[cfg(test)]
@@ -58,8 +59,9 @@ pub use pipeline::{
     DesiredState, PIPELINE_STATE_KEY, POSITION_KEY, PipelineDocs, PipelineStateDoc, PositionDoc,
     SLOT_KEY, SlotDoc,
 };
+pub use removal::{REMOVALS_PREFIX, RemovalDoc, Removals, removal_key};
 pub use snapshot::{
-    CursorKey, JOBS_PREFIX, JobStatus, JobTable, JobTableStatus, SnapshotCursor, SnapshotJobDoc,
-    SnapshotStatus, TableSnapshotDoc, job_key, table_snapshot_key,
+    CursorKey, JOBS_PREFIX, JobStatus, JobTable, JobTableStatus, KEPT_ENDED_JOBS, SnapshotCursor,
+    SnapshotJobDoc, SnapshotStatus, TableSnapshotDoc, job_key, table_snapshot_key,
 };
 pub use tables::{HALTS_KEY, HaltsDoc, SCHEMAS_PREFIX, TableHalt, table_schema_key};

@@ -269,6 +269,24 @@ pub fn cases() -> Vec<Case> {
                 json!({"otlp_endpoint": "http://otel:4317", "sample_ratio": 1}),
             )
         }),
+        case("V-126", Error, "header name with a space", || {
+            pg_delta().set(
+                "/globals/tracing",
+                json!({"otlp_endpoint": "https://otel:4318", "headers": {"x tenant": "a"}}),
+            )
+        }),
+        case("V-126", Error, "header value with a newline", || {
+            pg_delta().set(
+                "/globals/tracing",
+                json!({"otlp_endpoint": "https://otel:4318", "headers": {"authorization": "Bearer a\nx-evil: 1"}}),
+            )
+        }),
+        case("V-126", Silent, "a bearer header", || {
+            pg_delta().set(
+                "/globals/tracing",
+                json!({"otlp_endpoint": "https://otel:4318", "headers": {"authorization": "Bearer t0k", "x-scope-orgid": "shop"}}),
+            )
+        }),
         case("V-101", Error, "account with a dash", || {
             pg_delta().set("/globals/azure/account_name", json!("my-account"))
         }),

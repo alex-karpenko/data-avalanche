@@ -35,6 +35,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 axum = { workspace = true, features = ["json"] }
+boon.workspace = true
 data-avalanche-pipeline.workspace = true
 data-avalanche-storage.workspace = true
 object_store.workspace = true

@@ -6,10 +6,10 @@
 //! `status.json`, when it changed, takes the restart and the flush the management API asked for
 //! in `requests.json` (D-M9a.2), and follows the on-demand snapshot jobs to their end.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Debug;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use data_avalanche_config::Pipeline;
@@ -19,9 +19,9 @@ use data_avalanche_pipeline::{
     WorkerDeps, WorkerError, WorkerHandle, WorkerStatus,
 };
 use data_avalanche_state::{
-    ActualState, DesiredState, Holder, Leases, PipelineDocs, RequestsDoc, StatusDoc,
+    ActualState, DesiredState, Holder, Leases, PipelineDocs, RemovalDoc, Removals, RequestsDoc,
+    StatusDoc,
 };
-use data_avalanche_storage::ObjectVersion;
 use data_avalanche_telemetry::{
     Metrics, PipelineLabels, PipelineMetrics, PipelineStatus, RowsRead, SnapshotState, Totals,
 };
@@ -30,6 +30,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::jobs::Jobs;
+use crate::reconciler::{same_slot, shares};
 use crate::{Claim, Claimed, LeaseRun, LeaseTiming, RenewEnd, RenewState, release};
 
 /// A worker's source and sink, built afresh for every run.
@@ -149,6 +150,78 @@ pub struct ControllerDeps {
     pub starts: Arc<Semaphore>,
     /// Caps the workers handed off at once (`max_concurrent_handoffs`, Clustering §8.5).
     pub handoffs: Arc<Semaphore>,
+    /// The removal tombstones in `globals.state` (DA-OPS-9).
+    pub removals: Removals,
+    /// A removed pipeline, from the generation its tombstone names, as this node resolves it.
+    pub removed: RemovedPipelines,
+}
+
+/// Why a removal tombstone's pipeline didn't resolve ([`RemovedPipelines::resolve`]).
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum ResolveError {
+    /// Its generation's text couldn't be read: a storage failure, tried again later.
+    #[error("its generation is unread: {0}")]
+    Unread(String),
+    /// The generation doesn't give the pipeline here: it doesn't load in this node's
+    /// environment, has no such pipeline, or its state location doesn't build.
+    #[error("{0}")]
+    Invalid(String),
+}
+
+/// [`RemovedPipelines`]' answer: the pipeline and its state documents.
+pub type Resolved = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(Pipeline, PipelineDocs), ResolveError>> + Send>,
+>;
+
+/// The config generation `globals.state` names now, as this node loads it, and one id's
+/// pipeline in it ([`RemovedPipelines::current`]).
+#[derive(Debug, Clone)]
+pub struct CurrentPipeline {
+    pub generation: u64,
+    /// The generation's text's hash.
+    pub hash: String,
+    /// `None` when the generation has no pipeline of the id.
+    pub pipeline: Option<Pipeline>,
+}
+
+/// [`RemovedPipelines::current`]'s answer.
+pub type Configured = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<CurrentPipeline, ResolveError>> + Send>,
+>;
+
+/// Resolves a removal tombstone's pipeline, with its state documents, from the generation that
+/// last had it, and an id's pipeline in the current generation, in this node's environment (the
+/// coordinator builds it; `coordinator.rs` `removed_pipelines`).
+#[derive(Clone)]
+pub struct RemovedPipelines {
+    /// A tombstone's pipeline ([`Self::resolve`]).
+    pub removed: Arc<dyn Fn(RemovalDoc) -> Resolved + Send + Sync>,
+    /// An id's pipeline in the current generation ([`Self::current`]).
+    pub configured: Arc<dyn Fn(String) -> Configured + Send + Sync>,
+}
+
+impl Debug for RemovedPipelines {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemovedPipelines").finish_non_exhaustive()
+    }
+}
+
+impl RemovedPipelines {
+    /// # Errors
+    /// [`ResolveError::Unread`] when the generation's text can't be read (tried again later);
+    /// [`ResolveError::Invalid`] when it doesn't resolve here, or doesn't have the pipeline.
+    pub async fn resolve(&self, doc: RemovalDoc) -> Result<(Pipeline, PipelineDocs), ResolveError> {
+        (self.removed)(doc).await
+    }
+
+    /// The generation the cluster published last, and its pipeline of `id`, if any.
+    ///
+    /// # Errors
+    /// [`ResolveError::Unread`] when the generation can't be read; [`ResolveError::Invalid`]
+    /// when it doesn't load in this node's environment.
+    pub async fn current(&self, id: &str) -> Result<CurrentPipeline, ResolveError> {
+        (self.configured)(id.to_owned()).await
+    }
 }
 
 /// One pipeline's controller.
@@ -169,41 +242,8 @@ pub struct PipelineController {
     /// channel never closes.
     updates: mpsc::UnboundedReceiver<Update>,
     updater: mpsc::UnboundedSender<Update>,
-    /// The removed pipelines this one takes the place of: their leases are let go of before
-    /// this one's is first claimed ([`Self::following`]).
-    following: Following,
-}
-
-/// The ids of the removed pipelines a pipeline takes the place of (config §9.1: an `id` change
-/// is delete, then recreate), shared by its reconciler and its controller. The controller clears
-/// it once their leases are let go of, the reconciler drops an id a later generation adds again,
-/// and a controller started again after a panic waits only for what is left.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct Following(Arc<Mutex<BTreeSet<String>>>);
-
-impl Following {
-    pub(crate) fn new(ids: impl IntoIterator<Item = String>) -> Self {
-        Self(Arc::new(Mutex::new(ids.into_iter().collect())))
-    }
-
-    /// The ids, as of now.
-    pub(crate) fn ids(&self) -> Vec<String> {
-        self.lock().iter().cloned().collect()
-    }
-
-    fn clear(&self) {
-        self.lock().clear();
-    }
-
-    /// Ends the wait on `id`: a followed id that a later generation adds again names another
-    /// pipeline, the one this pipeline took the place of having been removed in an earlier one.
-    pub(crate) fn forget(&self, id: &str) {
-        self.lock().remove(id);
-    }
-
-    fn lock(&self) -> MutexGuard<'_, BTreeSet<String>> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
-    }
+    removals: Removals,
+    removed: RemovedPipelines,
 }
 
 /// Why the owned phase ended.
@@ -301,6 +341,15 @@ fn same(a: &StatusDoc, b: &StatusDoc) -> bool {
     } == *b
 }
 
+/// True when `current`, the current generation's pipeline of `removed`'s id, undoes the removal
+/// (config §12.3): it is configured again on the same server's slot or publication, which a
+/// teardown would take from it. A source that creates nothing for a pipeline (not PostgreSQL)
+/// has nothing to tear down: the id configured again undoes it. Another id on the old slot is
+/// another pipeline, and doesn't (it follows the removal, D-M12b.5).
+fn undoes(removed: &Pipeline, current: &Pipeline) -> bool {
+    removed.id == current.id && (removed.source.postgres.is_none() || same_slot(removed, current))
+}
+
 /// A pipeline's series labels.
 fn labels(p: &Pipeline) -> PipelineLabels {
     PipelineLabels {
@@ -350,28 +399,69 @@ struct Pending {
     read: Option<SourcePosition>,
 }
 
-/// The kept lag's start after a worker's status `st`. A worker that has shown a change pending
-/// (`shown`) is the lag from then on. Before that, a worker that follows an earlier one is
-/// re-reading from the checkpoint, and the start the earlier one left stays: its changes still
-/// count until this one has read as far again with nothing pending (its stream's frontier at or
-/// past the kept one). A change it reads again first makes it the lag's source instead.
-fn carry(pending: &mut Option<Pending>, shown: &mut bool, st: &WorkerStatus) {
-    *shown |= st.unsynced_since_micros.is_some();
-    if *shown {
-        *pending = st.unsynced_since_micros.map(|since| Pending {
+/// The lag's start over one lease term (DA-OBS-8): the oldest change still pending, of the
+/// session running now (`own`) and of the sessions before it (`kept`: earlier workers', and this
+/// worker's before a source reconnect). A session re-reads from the checkpoint, so what an
+/// earlier one left counts until this one's stream has read as far again (its frontier at or
+/// past the kept one), even when it makes its own first changes durable before that.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Lag {
+    kept: Option<Pending>,
+    own: Option<Pending>,
+}
+
+impl Lag {
+    /// The oldest pending change's commit time.
+    fn since(&self) -> Option<i64> {
+        [&self.kept, &self.own]
+            .into_iter()
+            .flatten()
+            .map(|p| p.since)
+            .min()
+    }
+
+    /// A session ended (its worker, or its stream at a reconnect): what it had pending is kept,
+    /// with the older start and the further frontier of the two.
+    fn roll(&mut self) {
+        self.kept = match (self.kept.take(), self.own.take()) {
+            (Some(k), Some(o)) => {
+                let read = match (&o.read, &k.read) {
+                    (Some(or), Some(kr)) if or.covers(kr).unwrap_or(false) => o.read.clone(),
+                    (Some(_), None) => o.read.clone(),
+                    _ => k.read.clone(),
+                };
+                Some(Pending {
+                    since: k.since.min(o.since),
+                    read,
+                })
+            }
+            (k, o) => k.or(o),
+        };
+    }
+
+    /// Takes a worker's status `st`; `session` is the reconnect count of the session this
+    /// worker's lag last saw, `None` before its first status.
+    fn carry(&mut self, session: &mut Option<u64>, st: &WorkerStatus) {
+        if session.is_none_or(|n| st.reconnects > n) {
+            self.roll();
+        }
+        *session = Some(st.reconnects);
+        self.own = st.unsynced_since_micros.map(|since| Pending {
             since,
             read: st.read.clone().or_else(|| st.checkpoint.clone()),
         });
-        return;
-    }
-    let caught_up = pending.as_ref().is_some_and(|p| match (&st.read, &p.read) {
-        // Positions that don't compare (another source kind) say the kept changes are gone.
-        (Some(read), Some(kept)) => read.covers(kept).unwrap_or(true),
-        (Some(_), None) => true,
-        (None, _) => false,
-    });
-    if caught_up {
-        *pending = None;
+        let caught_up = self
+            .kept
+            .as_ref()
+            .is_some_and(|p| match (&st.read, &p.read) {
+                // Positions that don't compare (another source kind) say the kept changes are gone.
+                (Some(read), Some(kept)) => read.covers(kept).unwrap_or(true),
+                (Some(_), None) => true,
+                (None, _) => false,
+            });
+        if caught_up {
+            self.kept = None;
+        }
     }
 }
 
@@ -395,8 +485,9 @@ struct Running {
     logged: HashSet<String>,
     /// The worker's reconnects already logged.
     reconnects: u64,
-    /// It has shown a change pending: its status is the lag's start from then on ([`carry`]).
-    lag_shown: bool,
+    /// The reconnect count of the session the lag last saw ([`Lag::carry`]); `None` before
+    /// this worker's first status.
+    lag_session: Option<u64>,
 }
 
 /// A worker never outlives its controller: a controller that panics drops its `Running`, and
@@ -461,17 +552,9 @@ impl PipelineController {
             status,
             updates,
             updater,
-            following: Following::default(),
+            removals: deps.removals.clone(),
+            removed: deps.removed.clone(),
         }
-    }
-
-    /// A pipeline that takes the place of the removed pipelines `ids`, in the same reload: a
-    /// changed `id` that keeps the slot, the publication, the sink or the state (config §9.1,
-    /// delete then recreate). Its lease is first claimed once theirs are let go of.
-    #[must_use]
-    pub(crate) fn following(mut self, following: Following) -> Self {
-        self.following = following;
-        self
     }
 
     /// Where a reload's updates for this controller go.
@@ -488,6 +571,7 @@ impl PipelineController {
             self.holder.clone(),
             self.settings.timing,
         );
+        let mut followed = false;
         loop {
             if *target.borrow_and_update() == Target::DontOwn {
                 self.standby(None);
@@ -497,9 +581,9 @@ impl PipelineController {
                 }
                 continue;
             }
-            if !self.following.ids().is_empty() {
+            if !followed {
                 match self.follow(&mut target).await {
-                    Followed::LetGo => {}
+                    Followed::LetGo => followed = true,
                     Followed::DontOwn => continue,
                     Followed::End => return,
                 }
@@ -558,73 +642,49 @@ impl PipelineController {
         }
     }
 
-    /// Waits until the lease of every pipeline this one takes the place of is let go of: absent,
-    /// released, or unchanged for a full `lease_duration` on this node's clock (its holder is
-    /// gone; the takeover's rule, Clustering §5.3). The leases are read every
-    /// `renewal_interval`, the ids as the reconciler leaves them; meanwhile the controller is on
-    /// standby, and takes its target and its updates. Past three lease durations the wait is
-    /// logged as a warning, once a lease duration.
+    /// Before its first claim, waits while a removal it follows is under way (config §12.3,
+    /// DA-OPS-10): the removal of its own id, or of a pipeline it takes the place of ([`shares`]:
+    /// an `id` changed, delete then recreate, keeping the slot, the publication, the sink or the
+    /// state). The removal's tombstone says when it is done, whichever node does it, and whether
+    /// the removal came in this generation, an earlier one, or before this node started. The
+    /// tombstones are read every `renewal_interval`; meanwhile the controller is on standby, and
+    /// takes its target and its updates. Past three lease durations the wait is logged as a
+    /// warning, once a lease duration.
     async fn follow(&mut self, target: &mut watch::Receiver<Target>) -> Followed {
-        tracing::info!(
-            pipeline = %self.pipeline.name,
-            follows = ?self.following.ids(),
-            "pipeline waits for the removal of the pipelines it takes the place of"
-        );
-        self.standby(None);
         let timing = self.settings.timing;
         let started = Instant::now();
         let mut warned: Option<Instant> = None;
-        // Each held lease's version, and when this node first read it.
-        let mut watched: BTreeMap<String, (ObjectVersion, Instant)> = BTreeMap::new();
+        let mut first = true;
         loop {
-            // Each id still held, with its holder.
-            let mut held: BTreeMap<String, String> = BTreeMap::new();
-            for id in self.following.ids() {
-                match self.leases.observe(&id).await {
-                    Ok(None) => {}
-                    Ok(Some(lease)) if lease.doc.released => {}
-                    Ok(Some(lease)) => {
-                        let read = Instant::now();
-                        let since = match watched.get(&id) {
-                            Some((version, since)) if *version == lease.version => *since,
-                            _ => {
-                                watched.insert(id.clone(), (lease.version, read));
-                                read
-                            }
-                        };
-                        if read < since + timing.duration {
-                            held.insert(id, lease.doc.holder_node_id);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            pipeline = %self.pipeline.name,
-                            follows = %id,
-                            "the lease of a pipeline this one takes the place of unread: {e}"
-                        );
-                        held.insert(id, "unread".into());
-                    }
+            let held = self.followed().await;
+            if held.is_empty() {
+                if !first {
+                    tracing::info!(
+                        pipeline = %self.pipeline.name,
+                        "the removals this pipeline follows are done: it claims its lease"
+                    );
                 }
+                return Followed::LetGo;
+            }
+            if first {
+                first = false;
+                tracing::info!(
+                    pipeline = %self.pipeline.name,
+                    follows = ?held,
+                    "pipeline waits for the removals it follows"
+                );
+                self.standby(None);
             }
             let now = Instant::now();
-            if !held.is_empty()
-                && now >= started + timing.duration * 3
+            if now >= started + timing.duration * 3
                 && warned.is_none_or(|at| now >= at + timing.duration)
             {
                 warned = Some(now);
                 tracing::warn!(
                     pipeline = %self.pipeline.name,
                     waiting_for = ?held,
-                    "pipeline still waits for the removal of the pipelines it takes the place of: their leases are held"
+                    "pipeline still waits for the removals it follows"
                 );
-            }
-            if held.is_empty() {
-                self.following.clear();
-                tracing::info!(
-                    pipeline = %self.pipeline.name,
-                    "the pipelines this one takes the place of let go: it claims its lease"
-                );
-                return Followed::LetGo;
             }
             tokio::select! {
                 () = tokio::time::sleep(timing.renewal_interval) => {}
@@ -639,6 +699,43 @@ impl PipelineController {
                 Some(u) = self.updates.recv() => if self.take(u) { return Followed::End },
             }
         }
+    }
+
+    /// The removals under way this pipeline follows, by id, each with why. A tombstone whose
+    /// generation is unread (a storage failure) is followed too, as "unread", and tried again at
+    /// the next read. A tombstone that doesn't resolve here (`Invalid`) can't be compared, and
+    /// isn't followed (logged).
+    async fn followed(&self) -> BTreeMap<String, String> {
+        let pending = match self.removals.all_pending().await {
+            Ok(pending) => pending,
+            Err(e) => {
+                tracing::warn!(pipeline = %self.pipeline.name, "the removal tombstones unread: {e}");
+                return BTreeMap::from([("*".to_owned(), "unread".to_owned())]);
+            }
+        };
+        let mut held = BTreeMap::new();
+        for doc in pending {
+            let id = doc.pipeline_id.clone();
+            if id == self.pipeline.id {
+                held.insert(id, "its own id".to_owned());
+                continue;
+            }
+            match self.removed.resolve(doc).await {
+                Ok((removed, _)) if shares(&removed, &self.pipeline) => {
+                    held.insert(id, "takes its place".to_owned());
+                }
+                Ok(_) => {}
+                Err(ResolveError::Unread(e)) => {
+                    held.insert(id, format!("unread: {e}"));
+                }
+                Err(ResolveError::Invalid(e)) => tracing::warn!(
+                    pipeline = %self.pipeline.name,
+                    removed = %id,
+                    "a removal under way isn't compared with this pipeline: it doesn't resolve here: {e}"
+                ),
+            }
+        }
+        held
     }
 
     /// A reload's update while this node holds no lease for the pipeline: true when it removed
@@ -693,7 +790,7 @@ impl PipelineController {
         let mut failures: u32 = 0;
         // The lag's start across this term's workers: what one read and didn't make durable still
         // counts while none runs and while the next one reads it again (I2).
-        let mut pending: Option<Pending> = None;
+        let mut pending = Lag::default();
         // One lease term: a stale reader is ended at most once in it, by whichever of its
         // workers meets it first, a stop and a resume included (DA-SRC-28).
         let reader_ended = Arc::new(AtomicBool::new(false));
@@ -932,7 +1029,7 @@ impl PipelineController {
                         // No worker runs (a restart's backoff, ERROR): the lag grows on.
                         None => self
                             .metrics
-                            .replication_lag(lag(pending.as_ref().map(|p| p.since), now_micros())),
+                            .replication_lag(lag(pending.since(), now_micros())),
                     }
                     self.report(&mut reported).await;
                     let asked = self.asked(&mut seen).await;
@@ -997,7 +1094,7 @@ impl PipelineController {
 
     /// Discard and replay (config §12.4): what the worker read past the durable checkpoint is
     /// read again by the next one. False when no worker runs.
-    async fn discard(&self, worker: &mut Option<Running>, pending: &mut Option<Pending>) -> bool {
+    async fn discard(&self, worker: &mut Option<Running>, pending: &mut Lag) -> bool {
         let Some(mut w) = worker.take() else {
             return false;
         };
@@ -1098,7 +1195,7 @@ impl PipelineController {
             paused: false,
             logged: HashSet::new(),
             reconnects: 0,
-            lag_shown: false,
+            lag_session: None,
         })
     }
 
@@ -1106,7 +1203,7 @@ impl PipelineController {
     /// off (what it read past the durable checkpoint is read again by the next run). True when
     /// it ended on its own; either way the worker has ended when this returns. A cut-off
     /// worker's writer is aborted with it, not waited for.
-    async fn drain(&self, mut w: Running, pending: &mut Option<Pending>) -> bool {
+    async fn drain(&self, mut w: Running, pending: &mut Lag) -> bool {
         let ended = tokio::time::timeout(self.settings.drain_timeout, async {
             let _ = w.handle.control.send(Command::Drain).await;
             (&mut w.task).await
@@ -1144,7 +1241,7 @@ impl PipelineController {
     /// Drains the worker and releases the lease; a worker cut off leaves it to expire.
     async fn let_go(&self, run: LeaseRun, worker: Option<Running>) {
         let drained = match worker {
-            Some(w) => self.drain(w, &mut None).await,
+            Some(w) => self.drain(w, &mut Lag::default()).await,
             None => true,
         };
         if drained {
@@ -1162,31 +1259,162 @@ impl PipelineController {
     }
 
     /// A pipeline gone from the config (§12.3): the worker drains, what the source created for
-    /// the pipeline goes, and the lease is released. A drain cut off, or a lease lost meanwhile,
-    /// leaves the source as it is: a cut-off worker may still hold it, a lost lease's holder runs
-    /// it.
+    /// the pipeline goes, the removal's tombstone is marked done, and the lease is released, in
+    /// that order: whoever claims the lease next (an orphan of the id on this node included)
+    /// finds the removal done. A drain cut off, or a lease lost meanwhile, leaves the source as
+    /// it is: a cut-off worker may still hold it, a lost lease's holder runs it. Its tombstone
+    /// stays, and the node the ring places the id on tears it down once the lease is let go of
+    /// ([`Self::remove_orphan`]).
     async fn remove(&self, run: LeaseRun, worker: Option<Running>) {
         let drained = match worker {
-            Some(w) => self.drain(w, &mut None).await,
+            Some(w) => self.drain(w, &mut Lag::default()).await,
             None => true,
         };
         if !drained {
             let _ = run.stop().await;
             tracing::warn!(
                 pipeline = %self.pipeline.name,
-                "removed with its drain cut off: the lease expires, and what the source created for the pipeline stays"
+                "removed with its drain cut off: the lease expires, then what the source created for the pipeline is torn down"
             );
         } else if self.teardown(&*run.guard).await {
+            self.removal_done().await;
             self.give_back(run).await;
         } else {
             let _ = run.stop().await;
             tracing::warn!(
                 pipeline = %self.pipeline.name,
-                "removed after its lease was lost: what the source created for the pipeline stays"
+                "removed after its lease was lost: what the source created for the pipeline stays to its holder"
             );
         }
         self.metrics.forget();
         tracing::info!(pipeline = %self.pipeline.name, "pipeline removed");
+    }
+
+    /// Marks the removal's tombstone done: what follows the pipeline may start. Not written, the
+    /// tombstone stays, and the next sweep removes the pipeline again (nothing left to tear down).
+    async fn removal_done(&self) {
+        if let Err(e) = self
+            .removals
+            .done(&self.pipeline.id, chrono::Utc::now())
+            .await
+        {
+            tracing::warn!(
+                pipeline = %self.pipeline.name,
+                "the removal's tombstone isn't marked done ({e}): a later sweep does it"
+            );
+        }
+    }
+
+    /// A removed pipeline that no node removed (DA-OPS-9): no node held its lease at the
+    /// removal, or its owner's drain was cut off. Its lease is claimed (taken over once it
+    /// expires), then, holding it, [`Self::orphaned`] decides. Ends early when the tombstone is
+    /// done meanwhile: its holder removed it.
+    pub(crate) async fn remove_orphan(self) {
+        let mut claim = Claim::new(
+            self.leases.clone(),
+            &self.pipeline.id,
+            self.holder.clone(),
+            self.settings.timing,
+        )
+        .patient();
+        loop {
+            match self.removals.pending(&self.pipeline.id).await {
+                Ok(Some(_)) => {}
+                Ok(None) => return,
+                Err(e) => {
+                    tracing::warn!(pipeline = %self.pipeline.name, "the removal's tombstone unread: {e}")
+                }
+            }
+            let wait = match claim.step().await {
+                Ok(Claimed::Mine { lease, written, .. }) => {
+                    let run = LeaseRun::start(
+                        self.leases.clone(),
+                        lease,
+                        self.holder.clone(),
+                        self.settings.timing,
+                        written,
+                        Arc::clone(&self.metrics),
+                    );
+                    self.orphaned(run).await;
+                    return;
+                }
+                Ok(Claimed::HeldBy { takeover_at, .. }) => {
+                    takeover_at.min(Instant::now() + self.settings.timing.renewal_interval)
+                }
+                Err(e) => {
+                    tracing::warn!(pipeline = %self.pipeline.name, "lease claim failed: {e}");
+                    Instant::now() + self.settings.timing.renewal_interval
+                }
+            };
+            tokio::time::sleep_until(wait).await;
+        }
+    }
+
+    /// An orphan's removal, holding the lease (config §12.3). The tombstone is read again, with
+    /// its version: done meanwhile (its holder removed the pipeline before it let the lease go),
+    /// nothing is left to do. Then the current generation decides: one that undoes the removal
+    /// ([`undoes`]: the same id configured again on the same slot or publication) has the
+    /// tombstone marked done, nothing torn down, for its resources are the running pipeline's.
+    /// That write is conditional on the version read: a node that recorded the removal since (a
+    /// newer generation removed the id again) wins, and the tombstone stays for the next sweep,
+    /// which decides anew. A generation that can't be read, or doesn't load here, tears nothing
+    /// down: the tombstone stays for the next sweep. Else (the id is gone, or configured on
+    /// another slot and publication) the pipeline is torn down. Every way out lets the lease go.
+    async fn orphaned(&self, run: LeaseRun) {
+        let read = match self.removals.pending_versioned(&self.pipeline.id).await {
+            Ok(Some(read)) => read,
+            Ok(None) => {
+                tracing::info!(
+                    pipeline = %self.pipeline.name,
+                    "the removal was done meanwhile: nothing torn down"
+                );
+                return self.give_back(run).await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    pipeline = %self.pipeline.name,
+                    "the removal's tombstone unread ({e}): nothing torn down, the next sweep tries again"
+                );
+                return self.give_back(run).await;
+            }
+        };
+        let current = match self.removed.current(&self.pipeline.id).await {
+            Ok(current) => current,
+            Err(e) => {
+                tracing::warn!(
+                    pipeline = %self.pipeline.name,
+                    "the current config generation can't be compared with the removal ({e}): nothing torn down, the next sweep tries again"
+                );
+                return self.give_back(run).await;
+            }
+        };
+        if current
+            .pipeline
+            .as_ref()
+            .is_some_and(|p| undoes(&self.pipeline, p))
+        {
+            match self.removals.done_if(&read, chrono::Utc::now()).await {
+                Ok(true) => tracing::info!(
+                    pipeline = %self.pipeline.name,
+                    generation = current.generation,
+                    "a removal the current generation undoes: marked done, nothing torn down"
+                ),
+                Ok(false) => tracing::info!(
+                    pipeline = %self.pipeline.name,
+                    "the removal was recorded again since it was read: nothing torn down, the next sweep decides"
+                ),
+                Err(e) => tracing::warn!(
+                    pipeline = %self.pipeline.name,
+                    "a removal the current generation undoes isn't marked done ({e}): nothing torn down, the next sweep tries again"
+                ),
+            }
+            return self.give_back(run).await;
+        }
+        tracing::info!(
+            pipeline = %self.pipeline.name,
+            "a removed pipeline no node removed: its lease is taken, to tear it down"
+        );
+        self.remove(run, None).await;
     }
 
     /// The source's `teardown` (PostgreSQL's `auto_cleanup`: the slot and the publication),
@@ -1242,7 +1470,7 @@ impl PipelineController {
     }
 
     /// The worker's status into the metrics, and its new warnings and reconnects into the log.
-    fn observe(&self, w: &mut Running, pending: &mut Option<Pending>) {
+    fn observe(&self, w: &mut Running, pending: &mut Lag) {
         let st = w.handle.status.borrow().clone();
         for warning in &st.warnings {
             if w.logged.insert(warning.clone()) {
@@ -1258,8 +1486,8 @@ impl PipelineController {
         let m = &self.metrics;
         m.wal_lag_bytes(st.retained_bytes);
         m.binlog_lag(st.source_behind);
-        carry(pending, &mut w.lag_shown, &st);
-        m.replication_lag(lag(pending.as_ref().map(|p| p.since), now_micros()));
+        pending.carry(&mut w.lag_session, &st);
+        m.replication_lag(lag(pending.since(), now_micros()));
         m.transaction_buffer_bytes(st.buffer_bytes);
         m.soft_dropped_columns(st.soft_dropped.values().sum());
         m.halted_tables(st.halted.len());
@@ -1363,8 +1591,9 @@ mod tests {
 
     use super::*;
     use crate::test_support::{
-        Fault, Kind, ScriptedStore, TestFactory, deps, eventually, holder, leases, node, pipeline,
-        pipeline_docs, pipeline_docs_on, row, until,
+        Fault, Kind, ScriptedStore, TestFactory, acquired, deps, eventually, holder, leases,
+        metrics, node, pipeline, pipeline_docs, pipeline_docs_on, removals, row, timing, tombstone,
+        until,
     };
 
     /// A real two-second watchdog over `wait` on the paused clock: a controller that spins keeps
@@ -1451,46 +1680,72 @@ mod tests {
         );
     }
 
-    /// A worker that follows one which left a change pending keeps its start until its stream has
-    /// read as far with nothing pending; one that has shown a change pending is the lag itself.
+    /// A session that follows one which left a change pending keeps that start until its stream
+    /// has read as far, even once its own first re-read change is durable (DA-OBS-8); a source
+    /// reconnect starts a new session as a new worker does.
     #[test]
-    fn the_kept_lag_start_waits_for_the_next_worker_to_read_as_far() {
+    fn the_kept_lag_start_waits_for_the_next_session_to_read_as_far() {
         let at = |lsn| Some(SourcePosition::Pg(data_avalanche_core::position::Lsn(lsn)));
-        let kept = Some(Pending {
-            since: 1,
-            read: at(100),
-        });
-        let status = |read, unsynced| WorkerStatus {
+        let status = |read, unsynced, reconnects| WorkerStatus {
             read,
             checkpoint: at(40),
             unsynced_since_micros: unsynced,
+            reconnects,
             ..WorkerStatus::default()
         };
-        let (mut pending, mut shown) = (kept.clone(), false);
+        // The first worker reads to 100 with a change of time 1 pending, then ends.
+        let mut lag = Lag::default();
+        let mut session = None;
+        lag.carry(&mut session, &status(at(100), Some(1), 0));
+        assert_eq!(lag.since(), Some(1));
+
+        // The next worker: nothing read yet, then short of 100: the kept start holds.
+        let mut session = None;
         for (read, what) in [(None, "nothing read yet"), (at(60), "short of it")] {
-            carry(&mut pending, &mut shown, &status(read, None));
-            assert_eq!(pending, kept, "{what}");
+            lag.carry(&mut session, &status(read, None, 0));
+            assert_eq!(lag.since(), Some(1), "{what}");
         }
-        carry(&mut pending, &mut shown, &status(at(100), None));
-        assert_eq!(pending, None, "read as far, nothing pending");
-
-        let (mut pending, mut shown) = (kept.clone(), false);
-        carry(&mut pending, &mut shown, &status(at(60), Some(7)));
+        // It re-reads the change, makes it durable before reading on: still pending at 100.
+        lag.carry(&mut session, &status(at(60), Some(1), 0));
+        lag.carry(&mut session, &status(at(60), None, 0));
         assert_eq!(
-            pending,
-            Some(Pending {
-                since: 7,
-                read: at(60)
-            }),
-            "read again: the worker's own"
+            lag.since(),
+            Some(1),
+            "its first change durable, not yet at 100"
         );
-        carry(&mut pending, &mut shown, &status(at(60), None));
-        assert_eq!(pending, None, "then durable: the worker says so");
+        lag.carry(&mut session, &status(at(100), None, 0));
+        assert_eq!(lag.since(), None, "read as far, nothing pending");
 
-        let (mut pending, mut shown) = (None, false);
-        carry(&mut pending, &mut shown, &status(None, Some(9)));
+        // A reconnect inside one worker: the new session starts with nothing pending.
+        lag.carry(&mut session, &status(at(150), Some(5), 0));
+        lag.carry(&mut session, &status(at(120), None, 1));
         assert_eq!(
-            pending.unwrap().read,
+            lag.since(),
+            Some(5),
+            "the reconnected session hasn't read to 150"
+        );
+        lag.carry(&mut session, &status(at(140), Some(6), 1));
+        assert_eq!(lag.since(), Some(5), "the older of the two");
+        lag.carry(&mut session, &status(at(160), None, 1));
+        assert_eq!(lag.since(), None);
+
+        // A second reconnect, as the worker reports it: the count comes with no frontier and
+        // nothing pending (the old session's 200 isn't the new one's). The kept start holds
+        // until the new session reads as far, its first change durable before then included.
+        lag.carry(&mut session, &status(at(200), Some(7), 1));
+        lag.carry(&mut session, &status(None, None, 2));
+        assert_eq!(lag.since(), Some(7), "the reconnect's own status");
+        lag.carry(&mut session, &status(None, None, 2));
+        assert_eq!(lag.since(), Some(7), "the same status, polled again");
+        lag.carry(&mut session, &status(at(180), None, 2));
+        assert_eq!(lag.since(), Some(7), "re-read short of 200");
+        lag.carry(&mut session, &status(at(200), None, 2));
+        assert_eq!(lag.since(), None);
+
+        let mut lag = Lag::default();
+        lag.carry(&mut None, &status(None, Some(9), 0));
+        assert_eq!(
+            lag.own.unwrap().read,
             at(40),
             "before a frontier, the checkpoint"
         );
@@ -2530,6 +2785,7 @@ mod tests {
         let mut n = node("n1", &store, &docs, &f);
         until(&mut n.status, "running", is(Actual::Running)).await;
         f.source.commit(FakeTxn::new().insert(&t("a"), row(1)));
+        removals(&store).record(&tombstone("p")).await.unwrap();
         n.updates.send(Update::Remove).unwrap();
         tokio::time::timeout(Duration::from_secs(60), &mut n.task)
             .await
@@ -2539,6 +2795,11 @@ mod tests {
         assert_eq!(f.source.teardowns(), 1);
         let lease = leases(&store).observe("p").await.unwrap().unwrap();
         assert!(lease.doc.released);
+        assert_eq!(
+            removals(&store).pending("p").await.unwrap(),
+            None,
+            "the removal is done (DA-OPS-9)"
+        );
         let text = n.metrics.encode();
         assert!(!text.contains(P), "{text}");
         assert!(line(&text, "data_avalanche_owned_pipelines 0"), "{text}");
@@ -2568,72 +2829,52 @@ mod tests {
         assert!(lease.doc.is_held_by(&holder("n1")), "n1 still holds it");
     }
 
-    /// A followed lease whose holder never renews is let go of once it stayed unchanged for a
-    /// full lease duration (15 s), and one never written at once: only then is the pipeline's
-    /// own lease claimed. The followed lease itself is left as it is.
+    /// DA-OPS-10: a pipeline whose own id's removal is under way (removed, then added again)
+    /// waits on standby, its lease unclaimed, until the removal is done, then claims within a
+    /// renewal interval.
     #[tokio::test(start_paused = true)]
-    async fn a_followed_lease_never_renewed_is_let_go_after_a_lease_duration() {
+    async fn a_pipeline_waits_until_its_own_id_s_removal_is_done() {
         let store = ScriptedStore::new();
         let f = TestFactory::new(&["a"]);
-        leases(&store)
-            .acquire(
-                "x",
-                &holder("n0"),
-                Duration::from_secs(15),
-                chrono::Utc::now(),
-            )
-            .await
-            .unwrap();
+        removals(&store).record(&tombstone("p")).await.unwrap();
         let d = deps("n1", &store, &f);
         let (c, mut status) = PipelineController::new(pipeline(), pipeline_docs(), &d);
-        let c = c.following(Following::new(["x".into(), "never".into()]));
+        let (_target, rx) = watch::channel(Target::Own);
+        let _task = tokio::spawn(c.run(rx));
+        until(&mut status, "standby", is(Actual::Standby { holder: None })).await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(leases(&store).observe("p").await.unwrap().is_none());
+        assert_eq!(f.builds(), 0);
+        removals(&store)
+            .done("p", chrono::Utc::now())
+            .await
+            .unwrap();
+        let start = Instant::now();
+        until(&mut status, "running", is(Actual::Running)).await;
+        assert!(
+            start.elapsed() <= Duration::from_secs(6),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    /// A removal under way that doesn't resolve here can't be compared with the pipeline: it
+    /// isn't waited for. Nor is one that shares nothing with it.
+    #[tokio::test(start_paused = true)]
+    async fn a_removal_that_doesnt_resolve_or_share_isnt_waited_for() {
+        let store = ScriptedStore::new();
+        let f = TestFactory::new(&["a"]);
+        removals(&store)
+            .record(&tombstone("unresolvable"))
+            .await
+            .unwrap();
+        removals(&store).record(&tombstone("x")).await.unwrap();
+        let d = deps("n1", &store, &f);
+        let (c, mut status) = PipelineController::new(pipeline(), pipeline_docs(), &d);
         let (_target, rx) = watch::channel(Target::Own);
         let start = Instant::now();
         let _task = tokio::spawn(c.run(rx));
-        until(&mut status, "standby", is(Actual::Standby { holder: None })).await;
-        tokio::time::sleep(Duration::from_secs(14)).await;
-        assert!(leases(&store).observe("p").await.unwrap().is_none());
-        assert_eq!(f.builds(), 0);
         until(&mut status, "running", is(Actual::Running)).await;
-        let took = start.elapsed();
-        assert!(
-            took >= Duration::from_secs(15) && took < Duration::from_secs(21),
-            "{took:?}"
-        );
-        let x = leases(&store).observe("x").await.unwrap().unwrap();
-        assert!(x.doc.is_held_by(&holder("n0")) && !x.doc.released);
-    }
-
-    /// A controller started again after its wait was done (as after a panic) shares the list
-    /// its predecessor cleared: it doesn't wait again, though the followed id's lease is held by
-    /// then.
-    #[tokio::test(start_paused = true)]
-    async fn a_follower_started_again_after_its_wait_waits_no_more() {
-        let store = ScriptedStore::new();
-        let docs = pipeline_docs();
-        let f = TestFactory::new(&["a"]);
-        let d = deps("n1", &store, &f);
-        let following = Following::new(["x".into()]);
-        let (c, mut status) = PipelineController::new(pipeline(), docs.clone(), &d);
-        let (_target, rx) = watch::channel(Target::Own);
-        let task = tokio::spawn(c.following(following.clone()).run(rx));
-        until(&mut status, "running", is(Actual::Running)).await;
-        assert!(following.ids().is_empty(), "cleared where it is shared");
-        task.abort();
-        leases(&store)
-            .acquire(
-                "x",
-                &holder("n0"),
-                Duration::from_secs(15),
-                chrono::Utc::now(),
-            )
-            .await
-            .unwrap();
-        let (c, mut status) = PipelineController::new(pipeline(), docs, &d);
-        let (_target, rx) = watch::channel(Target::Own);
-        let start = Instant::now();
-        let _task = tokio::spawn(c.following(following).run(rx));
-        until(&mut status, "running again", is(Actual::Running)).await;
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "{:?}",
@@ -2641,24 +2882,78 @@ mod tests {
         );
     }
 
-    /// A pipeline removed while it waits for the pipelines it takes the place of ends there,
-    /// its lease never claimed.
+    /// A tombstone whose generation is unread (a storage failure) is waited for, not taken as
+    /// one that doesn't resolve: the first read fails, and the removal is still waited for at
+    /// the next read, until it is done.
+    #[tokio::test(start_paused = true)]
+    async fn a_removal_whose_generation_is_unread_is_waited_for() {
+        let store = ScriptedStore::new();
+        let f = TestFactory::new(&["a"]);
+        removals(&store).record(&tombstone("old")).await.unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let mut d = deps("n1", &store, &f);
+        d.removed.removed = Arc::new(move |_doc: data_avalanche_state::RemovalDoc| {
+            let first = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            Box::pin(async move {
+                if first {
+                    return Err(ResolveError::Unread("injected".into()));
+                }
+                // The removed pipeline shares this one's slot: it is waited for.
+                Ok((pipeline(), pipeline_docs()))
+            })
+        });
+        let (c, mut status) = PipelineController::new(pipeline(), pipeline_docs(), &d);
+        let (_target, rx) = watch::channel(Target::Own);
+        let _task = tokio::spawn(c.run(rx));
+        until(&mut status, "standby", is(Actual::Standby { holder: None })).await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the tombstone is read again after the failed read"
+        );
+        assert!(leases(&store).observe("p").await.unwrap().is_none());
+        assert_eq!(f.builds(), 0);
+        removals(&store)
+            .done("old", chrono::Utc::now())
+            .await
+            .unwrap();
+        let start = Instant::now();
+        until(&mut status, "running", is(Actual::Running)).await;
+        assert!(
+            start.elapsed() <= Duration::from_secs(6),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    /// A tombstone list that fails is waited for too: the controller doesn't claim while it
+    /// fails, and claims once it reads again.
+    #[tokio::test(start_paused = true)]
+    async fn an_unread_tombstone_list_is_waited_for() {
+        let store = ScriptedStore::new();
+        let f = TestFactory::new(&["a"]);
+        store.fail_lists(usize::MAX);
+        let d = deps("n1", &store, &f);
+        let (c, mut status) = PipelineController::new(pipeline(), pipeline_docs(), &d);
+        let (_target, rx) = watch::channel(Target::Own);
+        let _task = tokio::spawn(c.run(rx));
+        until(&mut status, "standby", is(Actual::Standby { holder: None })).await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(leases(&store).observe("p").await.unwrap().is_none());
+        assert_eq!(f.builds(), 0);
+        store.fail_lists(0);
+        until(&mut status, "running", is(Actual::Running)).await;
+    }
+
+    /// A pipeline removed while it waits for a removal ends there, its lease never claimed.
     #[tokio::test(start_paused = true)]
     async fn a_follower_removed_while_it_waits_ends() {
         let store = ScriptedStore::new();
         let f = TestFactory::new(&["a"]);
-        leases(&store)
-            .acquire(
-                "x",
-                &holder("n0"),
-                Duration::from_secs(15),
-                chrono::Utc::now(),
-            )
-            .await
-            .unwrap();
+        removals(&store).record(&tombstone("p")).await.unwrap();
         let d = deps("n1", &store, &f);
         let (c, mut status) = PipelineController::new(pipeline(), pipeline_docs(), &d);
-        let c = c.following(Following::new(["x".into()]));
         let updates = c.updater();
         let (_target, rx) = watch::channel(Target::Own);
         let mut task = tokio::spawn(c.run(rx));
@@ -2699,6 +2994,45 @@ mod tests {
         assert_eq!(f.ids("a"), [1], "drained before it stopped");
     }
 
+    /// DA-OPS-9: an orphan claims patiently, so it never takes a pipeline from this node's own
+    /// live controller: the lease its holder keeps renewing is left alone, and the orphan ends
+    /// once the tombstone is done (by that holder), without tearing anything down.
+    #[tokio::test(start_paused = true)]
+    async fn an_orphan_waits_for_this_nodes_own_live_holder() {
+        let store = ScriptedStore::new();
+        removals(&store).record(&tombstone("p")).await.unwrap();
+        let f = TestFactory::new(&["a"]);
+        let d = deps("n1", &store, &f);
+        let lease = acquired(&leases(&store), "n1").await;
+        let (_m, p) = metrics();
+        let run = LeaseRun::start(
+            leases(&store),
+            lease,
+            holder("n1"),
+            timing(),
+            Instant::now(),
+            p,
+        );
+        let (c, _status) = PipelineController::new(pipeline(), pipeline_docs(), &d);
+        let orphan = tokio::spawn(c.remove_orphan());
+        tokio::time::sleep(timing().duration * 3).await;
+        let live = leases(&store).observe("p").await.unwrap().unwrap();
+        assert_eq!(live.doc.owner_epoch, 1, "the live lease is not taken over");
+        assert!(live.doc.is_held_by(&holder("n1")));
+        assert!(!live.doc.released);
+        assert_eq!(f.source.teardowns(), 0, "nothing is torn down under it");
+        removals(&store)
+            .done("p", chrono::Utc::now())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(60), orphan)
+            .await
+            .expect("the orphan ends once the removal is done")
+            .unwrap();
+        assert_eq!(f.source.teardowns(), 0, "the removal was its holder's");
+        let _ = run.stop().await;
+    }
+
     /// A removal whose drain is cut off leaves the source and the lease as they are: the cut-off
     /// worker may still hold the slot, and the lease expires instead of being released.
     #[tokio::test(start_paused = true)]
@@ -2715,12 +3049,17 @@ mod tests {
         f.sink.hold_commits();
         f.source.commit(FakeTxn::new().insert(&t("a"), row(1)));
         eventually("the commit waits", || f.sink.waiting_commits() == 1).await;
+        removals(&store).record(&tombstone("p")).await.unwrap();
         updates.send(Update::Remove).unwrap();
         tokio::time::timeout(Duration::from_secs(60), &mut task)
             .await
             .expect("the controller ends")
             .unwrap();
         assert_eq!(f.source.teardowns(), 0, "the source is left as it is");
+        assert!(
+            removals(&store).pending("p").await.unwrap().is_some(),
+            "the tombstone stays, for the sweep once the lease expires"
+        );
         let lease = leases(&store).observe("p").await.unwrap().unwrap();
         assert!(!lease.doc.released, "the lease expires, not released");
         assert!(lease.doc.is_held_by(&holder("n1")));
@@ -2768,5 +3107,214 @@ mod tests {
         store.fail_always(None);
         let lease = leases(&store).observe("p").await.unwrap().unwrap();
         assert!(!lease.doc.released, "this node didn't release it");
+    }
+
+    /// An orphan of `p` on `store`, its current generation answering `current`, run to its end
+    /// (no live holder: it claims at once).
+    async fn orphan_with(
+        store: &Arc<ScriptedStore>,
+        f: &TestFactory,
+        current: impl Fn(&str) -> Result<CurrentPipeline, ResolveError> + Send + Sync + 'static,
+    ) {
+        let mut d = deps("n1", store, f);
+        d.removed = crate::test_support::removed_with(current);
+        let (c, _status) = PipelineController::new(pipeline(), pipeline_docs(), &d);
+        tokio::time::timeout(Duration::from_secs(120), c.remove_orphan())
+            .await
+            .expect("the orphan ends");
+    }
+
+    /// The current generation, 2, with `p` as `edit` leaves it.
+    fn current_p(edit: impl Fn(&mut Pipeline)) -> CurrentPipeline {
+        let mut p = pipeline();
+        edit(&mut p);
+        CurrentPipeline {
+            generation: 2,
+            hash: "blake3:02".into(),
+            pipeline: Some(p),
+        }
+    }
+
+    /// Config §12.3: a removal the current generation undoes (the id configured again on the
+    /// same slot or publication) is marked done holding the lease, nothing torn down, and the
+    /// lease is released.
+    #[tokio::test(start_paused = true)]
+    async fn an_orphan_marks_a_removal_the_current_generation_undoes_done_without_a_teardown() {
+        for (what, edit) in [
+            (
+                "the same pipeline",
+                (|_: &mut Pipeline| {}) as fn(&mut Pipeline),
+            ),
+            ("another slot, the same publication", |p| {
+                p.source.postgres.as_mut().unwrap().slot = "other_slot".into();
+            }),
+            ("the same slot, another publication", |p| {
+                p.source.postgres.as_mut().unwrap().publication = "other_pub".into();
+            }),
+        ] {
+            let store = ScriptedStore::new();
+            let f = TestFactory::new(&["a"]);
+            removals(&store).record(&tombstone("p")).await.unwrap();
+            orphan_with(&store, &f, move |_| Ok(current_p(edit))).await;
+            assert_eq!(f.source.teardowns(), 0, "{what}: nothing torn down");
+            assert_eq!(
+                removals(&store).pending("p").await.unwrap(),
+                None,
+                "{what}: marked done"
+            );
+            let lease = leases(&store).observe("p").await.unwrap().unwrap();
+            assert!(lease.doc.released, "{what}: {lease:?}");
+        }
+    }
+
+    /// (c) A removal the current generation doesn't undo is torn down once, as ever: the id is
+    /// gone, or configured on another slot and another publication, or on another server.
+    #[tokio::test(start_paused = true)]
+    async fn an_orphan_tears_down_a_removal_the_current_generation_doesnt_undo() {
+        type Case = (&'static str, fn() -> CurrentPipeline);
+        let cases: [Case; 3] = [
+            ("the id is gone", crate::test_support::gone),
+            ("another slot and publication", || {
+                current_p(|p| {
+                    let pg = p.source.postgres.as_mut().unwrap();
+                    pg.slot = "other_slot".into();
+                    pg.publication = "other_pub".into();
+                })
+            }),
+            ("another server", || {
+                current_p(|p| p.source.host = "10.0.0.9".into())
+            }),
+        ];
+        for (what, current) in cases {
+            let store = ScriptedStore::new();
+            let f = TestFactory::new(&["a"]);
+            removals(&store).record(&tombstone("p")).await.unwrap();
+            orphan_with(&store, &f, move |_| Ok(current())).await;
+            assert_eq!(f.source.teardowns(), 1, "{what}: torn down once");
+            assert_eq!(
+                removals(&store).pending("p").await.unwrap(),
+                None,
+                "{what}: marked done"
+            );
+            let lease = leases(&store).observe("p").await.unwrap().unwrap();
+            assert!(lease.doc.released, "{what}: {lease:?}");
+        }
+    }
+
+    /// (d) A current generation that can't be read, or doesn't load here, tears nothing down:
+    /// the lease is released and the tombstone stays for the next sweep.
+    #[tokio::test(start_paused = true)]
+    async fn an_orphan_tears_nothing_down_when_the_current_generation_is_unread_or_invalid() {
+        for e in [
+            ResolveError::Unread("injected".into()),
+            ResolveError::Invalid("no such variable".into()),
+        ] {
+            let store = ScriptedStore::new();
+            let f = TestFactory::new(&["a"]);
+            removals(&store).record(&tombstone("p")).await.unwrap();
+            orphan_with(&store, &f, move |_| Err(e.clone())).await;
+            assert_eq!(f.source.teardowns(), 0, "nothing torn down");
+            assert!(
+                removals(&store).pending("p").await.unwrap().is_some(),
+                "the tombstone stays"
+            );
+            let lease = leases(&store).observe("p").await.unwrap().unwrap();
+            assert!(lease.doc.released, "{lease:?}");
+        }
+    }
+
+    /// An undone removal recorded again between the orphan's read of the tombstone and its done
+    /// (a newer generation removed the id again, and its adopter kept the tombstone under way):
+    /// the conditional done loses, the tombstone stays for the next sweep, nothing is torn down,
+    /// and the lease is released.
+    #[tokio::test(start_paused = true)]
+    async fn an_undone_removal_recorded_again_meanwhile_stays_pending() {
+        let store = ScriptedStore::new();
+        let f = TestFactory::new(&["a"]);
+        removals(&store).record(&tombstone("p")).await.unwrap();
+        let mut d = deps("n1", &store, &f);
+        let again = Arc::clone(&store);
+        // The current generation is read between the tombstone's read and the done: a record
+        // lands while it is.
+        d.removed.configured = Arc::new(move |_id: String| {
+            let r = removals(&again);
+            Box::pin(async move {
+                r.record(&tombstone("p")).await.unwrap();
+                Ok(current_p(|_| {}))
+            })
+        });
+        let (c, _status) = PipelineController::new(pipeline(), pipeline_docs(), &d);
+        tokio::time::timeout(Duration::from_secs(120), c.remove_orphan())
+            .await
+            .expect("the orphan ends");
+        assert_eq!(f.source.teardowns(), 0, "nothing torn down");
+        assert!(
+            removals(&store).pending("p").await.unwrap().is_some(),
+            "the removal recorded again stays under way"
+        );
+        let lease = leases(&store).observe("p").await.unwrap().unwrap();
+        assert!(lease.doc.released, "{lease:?}");
+    }
+
+    /// [`undoes`]: the same id on the same server, sharing the slot or the publication; any id
+    /// of a source that creates nothing for a pipeline.
+    #[test]
+    fn a_removal_is_undone_by_the_same_id_on_the_same_slot_or_publication() {
+        let removed = pipeline();
+        let with = |edit: &dyn Fn(&mut Pipeline)| {
+            let mut p = pipeline();
+            edit(&mut p);
+            p
+        };
+        assert!(undoes(&removed, &removed));
+        assert!(undoes(
+            &removed,
+            &with(&|p| p.source.postgres.as_mut().unwrap().slot = "s2".into())
+        ));
+        assert!(!undoes(
+            &removed,
+            &with(&|p| {
+                let pg = p.source.postgres.as_mut().unwrap();
+                pg.slot = "s2".into();
+                pg.publication = "p2".into();
+            })
+        ));
+        assert!(!undoes(&removed, &with(&|p| p.source.db = "other".into())));
+        assert!(!undoes(&removed, &with(&|p| p.id = "q".into())));
+        let mut nothing = pipeline();
+        nothing.source.postgres = None;
+        assert!(undoes(&nothing, &with(&|p| p.source.postgres = None)));
+    }
+
+    /// The owner marks its removal done before it lets the lease go: an orphan of the id on the
+    /// same node, waiting for that lease, finds the removal done and tears nothing down again,
+    /// though the tombstone's write is slow.
+    #[tokio::test(start_paused = true)]
+    async fn an_owners_removal_and_an_orphan_of_it_on_one_node_tear_down_once() {
+        let store = ScriptedStore::new();
+        let f = TestFactory::new(&["a"]);
+        let d = deps("n1", &store, &f);
+        let (c, mut status) = PipelineController::new(pipeline(), pipeline_docs(), &d);
+        let updates = c.updater();
+        let (_target, rx) = watch::channel(Target::Own);
+        let mut task = tokio::spawn(c.run(rx));
+        until(&mut status, "running", is(Actual::Running)).await;
+        removals(&store).record(&tombstone("p")).await.unwrap();
+        let (o, _) = PipelineController::new(pipeline(), pipeline_docs(), &d);
+        let orphan = tokio::spawn(o.remove_orphan());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Longer than the orphan's wait between two claims.
+        store.slow_writes("removals/", timing().renewal_interval * 4);
+        updates.send(Update::Remove).unwrap();
+        tokio::time::timeout(Duration::from_secs(120), &mut task)
+            .await
+            .expect("the controller ends")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(120), orphan)
+            .await
+            .expect("the orphan ends")
+            .unwrap();
+        assert_eq!(f.source.teardowns(), 1, "the owner's alone");
+        assert_eq!(removals(&store).pending("p").await.unwrap(), None);
     }
 }

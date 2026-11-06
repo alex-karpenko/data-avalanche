@@ -93,7 +93,9 @@ mod walk;
 pub use build::derived_server_id;
 pub use coerce::LogFilter;
 pub use diag::{Diagnostic, Locus, PARSE, Report, Severity, TYPE};
-pub use diff::{ConfigDiff, FieldChange, Fingerprints, PipelineChange, diff, diff_with};
+pub use diff::{
+    ConfigDiff, FIXED_FIELDS, FieldChange, Fingerprints, PipelineChange, diff, diff_with,
+};
 pub use external::{
     ClusterAnchor, check_cluster_anchor, check_partitioning, check_table_set,
     check_unbounded_numeric, glob_match, key_table,

@@ -283,12 +283,18 @@ impl<'c> Session<'c> {
                     table,
                     reason,
                     at: checkpoint.clone(),
+                    copy: false,
                 }),
                 Err(e) => return Err(e.into()),
             }
         }
         let mut copies = BTreeMap::new();
         for (table, schema) in &core.copies {
+            // A copy halted earlier in this run (a reconnect opens this session) isn't read
+            // again: its job failed it, as the worker's start does with one halted before.
+            if recorded.iter().any(|h| &h.table == table) {
+                continue;
+            }
             match acc.add_table(schema.clone(), &s.delete_extra(schema)) {
                 Ok(()) => {
                     copies.insert(table.clone(), schema.clone());
@@ -297,6 +303,7 @@ impl<'c> Session<'c> {
                     table,
                     reason,
                     at: checkpoint.clone(),
+                    copy: true,
                 }),
                 Err(e) => return Err(e.into()),
             }
@@ -337,13 +344,15 @@ impl<'c> Session<'c> {
             hooks: core.hooks.clone(),
             observer: core.observer.clone(),
             backoff: core.tuning.sink_backoff,
+            copies: copies.keys().cloned().collect(),
         };
         let writer = tokio::spawn(writer::run(ctx, jobs_rx, events_tx));
         let rows = buffer_permits(core.settings.buffer_rows);
         core.update(|st| {
             st.phase = Phase::Streaming;
             st.checkpoint = Some(checkpoint.clone());
-            for h in recorded.iter().chain(&halts) {
+            // A copy's halt fails its job table: it isn't the pipeline's, and isn't shown.
+            for h in recorded.iter().chain(&halts).filter(|h| !h.copy) {
                 st.halted.insert(h.table.clone(), h.reason.clone());
             }
             warnings.into_iter().for_each(|w| st.warn(w));
@@ -412,7 +421,9 @@ impl<'c> Session<'c> {
                 WriterEvent::Failed(e) => return Err(e),
                 WriterEvent::Halted(h) => self.core.update(|st| {
                     st.snapshots.remove(&h.table);
-                    st.halted.insert(h.table, h.reason);
+                    if !h.copy {
+                        st.halted.insert(h.table, h.reason);
+                    }
                 }),
                 WriterEvent::Degraded(why) => self.core.update(|st| st.degraded = why),
                 WriterEvent::Durable(cp) => {
@@ -596,7 +607,9 @@ impl<'c> Session<'c> {
                 self.hold_ended();
                 self.core.update(|st| {
                     st.snapshots.remove(&h.table);
-                    st.halted.insert(h.table, h.reason);
+                    if !h.copy {
+                        st.halted.insert(h.table, h.reason);
+                    }
                 });
                 Ok(None)
             }
@@ -1164,7 +1177,7 @@ impl<'c> Session<'c> {
         }
         self.acc.halt_table(&table);
         self.schemas.remove(&table);
-        self.copies.remove(&table);
+        let copy = self.copies.remove(&table).is_some();
         self.snaps.stop(&table);
         self.core.writers_waited.remove(&table);
         self.hold_ended();
@@ -1172,10 +1185,13 @@ impl<'c> Session<'c> {
             table: table.clone(),
             reason: reason.clone(),
             at: self.acc.checkpoint().clone(),
+            copy,
         });
         self.core.update(|st| {
             st.snapshots.remove(&table);
-            st.halted.insert(table, reason);
+            if !copy {
+                st.halted.insert(table, reason);
+            }
         });
         Ok(())
     }

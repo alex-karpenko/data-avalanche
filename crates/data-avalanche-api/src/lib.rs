@@ -11,6 +11,7 @@
 mod auth;
 mod cluster;
 mod config;
+mod limit;
 mod openapi;
 mod pipelines;
 mod server;
@@ -35,10 +36,11 @@ use data_avalanche_telemetry::{CONTENT_TYPE, Metrics};
 use serde_json::{Value, json};
 use tokio::sync::watch;
 
-pub use auth::{Auth, FETCH_TIMEOUT, KEYS_MAX_AGE, Principal, REFETCH_AFTER};
+pub use auth::{Auth, FETCH_TIMEOUT, KEYS_MAX_AGE, MAX_KEY_DOCUMENT, Principal, REFETCH_AFTER};
 pub use cluster::{Control, Stop};
+pub use limit::{RateLimit, VALIDATE_BURST, VALIDATE_PER_SECOND};
 pub use openapi::openapi;
-pub use server::{Bound, HANDSHAKE_TIMEOUT, ServeError, bind};
+pub use server::{Bound, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT, MAX_CONNECTIONS, ServeError, bind};
 
 use crate::auth::Denied;
 
@@ -66,6 +68,8 @@ pub struct Node {
     pub leases: Leases,
     /// The node's leave and shutdown.
     pub control: Control,
+    /// The posted-body validates' limit ([`RateLimit::validate`], DA-API-20).
+    pub validates: Arc<RateLimit>,
 }
 
 impl std::fmt::Debug for Node {
@@ -122,6 +126,10 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
                             422,
                             "invalid, or it changes a restart-only field: the report",
                         ),
+                        (
+                            429,
+                            "posted bodies past the node's rate: `Retry-After` says when",
+                        ),
                     ],
                 )
             },
@@ -132,14 +140,18 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
                 "POST",
                 "/v1/config/reload",
                 Operator,
-                "Publish the node's file as the next config generation",
+                "Publish the node's file as the next config generation; `?restart=accept` publishes a restart-only field, applied at each node's next start",
                 &[
                     (200, "the file is the generation the cluster runs"),
-                    (202, "published: the generation"),
+                    (
+                        202,
+                        "published: the generation, and this node's fields pending a restart",
+                    ),
+                    (400, "a query other than restart=accept"),
                     (409, "other nodes published first, every time"),
                     (
                         422,
-                        "invalid, or it changes a restart-only field: the report",
+                        "invalid, or it changes a restart-only field without restart=accept, or a field the cluster keeps for good: the report",
                     ),
                 ],
             ),

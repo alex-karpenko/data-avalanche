@@ -267,7 +267,9 @@ fn roots<'a>(spans: &'a [Span], name: &str, pipeline: &str) -> Vec<(&'a Span, Ve
 
 /// Config §6.6: with an endpoint and every trace sampled, a flush is a trace whose root carries
 /// the pipeline and whose children are its tables' commits; a snapshot chunk is a trace of its
-/// own; the node is the resource's `service.instance.id`.
+/// own; the node is the resource's `service.instance.id`. The binary logs in JSON, and a line
+/// logged in a flush carries that flush's trace and span ids (DA-OBS-9: the process's global
+/// dispatch, end to end).
 #[tokio::test]
 async fn the_flushes_commits_and_chunks_are_traced_to_the_collector() {
     require_it!();
@@ -277,6 +279,7 @@ async fn the_flushes_commits_and_chunks_are_traced_to_the_collector() {
         ITEMS,
         Options {
             globals: &tracing,
+            log: r#"{ level: "info,data_avalanche_pipeline::writer=debug", format: json }"#,
             ..options()
         },
     )
@@ -318,6 +321,27 @@ async fn the_flushes_commits_and_chunks_are_traced_to_the_collector() {
         .into_iter()
         .next()
         .expect("a flush root, as the wait saw");
+    // DA-OBS-9: the flushes' JSON lines name their traces, and one of them is a trace Jaeger has.
+    let traced_flushes: Vec<(String, String)> = roots(&flushes, "pipeline.flush", &e.test)
+        .iter()
+        .map(|(f, _)| (f.trace.to_ascii_lowercase(), f.id.to_ascii_lowercase()))
+        .collect();
+    let logged: Vec<(String, String)> = p
+        .log()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["fields"]["message"] == "flush durable" && v["fields"]["pipeline"] == e.test)
+        .filter_map(|v| {
+            Some((
+                v["trace_id"].as_str()?.to_ascii_lowercase(),
+                v["span_id"].as_str()?.to_ascii_lowercase(),
+            ))
+        })
+        .collect();
+    assert!(
+        logged.iter().any(|ids| traced_flushes.contains(ids)),
+        "a logged flush's ids are a traced flush's: logged {logged:?}, traced {traced_flushes:?}"
+    );
     assert_eq!(
         flush.resource.get("service.name").map(String::as_str),
         Some("data-avalanche")

@@ -49,6 +49,10 @@ pub struct TableHalt {
     pub reason: HaltReason,
     /// The sink holds the table's changes through this position; later ones were dropped.
     pub at: SourcePosition,
+    /// A job's copy of a table outside the config (Q-M9b-3): it fails its job table, and it
+    /// is kept out of the halted tables shown (DA-SNAP-19). The next start clears it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub copy: bool,
 }
 
 /// `halts.json`: the tracked tables that halted, in table order.
@@ -305,6 +309,7 @@ mod tests {
             table: TableRef::new("public", name),
             reason,
             at: "pg:0/16B3748".parse().unwrap(),
+            copy: false,
         }
     }
 

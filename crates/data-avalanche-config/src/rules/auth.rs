@@ -223,6 +223,29 @@ fn rest(r: &RawRest, at: &At, cloud: Option<Cloud>, ctx: &mut Ctx) {
     }
 }
 
+/// V-125: a key URL that isn't `https` lets anyone on the way swap the issuer's keys. The URL
+/// isn't echoed: it may come from a variable.
+fn plain_key_url(ctx: &mut Ctx, at: &At, leaf: &L) {
+    let Some(l) = leaf else {
+        return;
+    };
+    let Some(text) = ctx.text(l, at) else {
+        return;
+    };
+    let text = text.trim();
+    let https = text
+        .get(..8)
+        .is_some_and(|s| s.eq_ignore_ascii_case("https://"));
+    if !text.is_empty() && !https {
+        ctx.warning(
+            "V-125",
+            at,
+            l.loc(),
+            "the issuer's keys are fetched without TLS: anyone on the way can swap them; use an https URL",
+        );
+    }
+}
+
 fn management_api(a: &RawApi, at: &At, ctx: &mut Ctx) {
     let auth = if a.auth.is_none() {
         Some(ApiAuth::None)
@@ -263,12 +286,15 @@ fn management_api(a: &RawApi, at: &At, ctx: &mut Ctx) {
                 &j.jwks_url,
                 "api auth jwt",
             );
+            plain_key_url(ctx, &at.key("jwt").key("jwks_url"), &j.jwks_url);
         }
         // V-051
         Some(ApiAuth::Oauth2) => {
             let o = a.oauth2.clone().unwrap_or_default();
             let o_at = at.key("oauth2");
             require(ctx, "V-051", &o_at, "issuer", &o.issuer, "api auth oauth2");
+            plain_key_url(ctx, &o_at.key("jwks_url"), &o.jwks_url);
+            plain_key_url(ctx, &o_at.key("discovery_url"), &o.discovery_url);
             if missing(ctx, &o.jwks_url, &o_at.key("jwks_url"))
                 && missing(ctx, &o.discovery_url, &o_at.key("discovery_url"))
             {

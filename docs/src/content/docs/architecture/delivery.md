@@ -46,4 +46,5 @@ rows it had, and the pipeline's other tables go on. It never skips the change an
 A snapshot row is written as an upsert too, and a change streamed while the snapshot runs wins over
 the snapshot's copy of the same row (see [Snapshots](/data-avalanche/architecture/snapshots/)). A
 snapshot never deletes: a row deleted at the source while its table wasn't being streamed stays in
-the lake, through a copy too. To remove such rows, drop or move the Delta table before copying it.
+the lake, through a copy too. To remove such rows, copy the table with a snapshot job asked with
+`"truncate": true`, which empties the Delta table first.

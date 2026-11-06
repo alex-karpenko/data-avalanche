@@ -2,7 +2,8 @@
 //! or a released tombstone) is acquired at once. A live holder's lease is taken over only after
 //! it stayed unchanged for a full `lease_duration` on this node's clock: a holder that renews in
 //! the meantime keeps it. A lease naming this process (its node id and incarnation) is its own
-//! earlier term, taken over at once under the next epoch.
+//! earlier term, taken over at once under the next epoch. A patient claim waits for its own
+//! holder's lease too.
 
 use chrono::Utc;
 use data_avalanche_state::{Acquired, Holder, LeaseDoc, Leases, StateError, Versioned};
@@ -39,6 +40,8 @@ pub struct Claim {
     watched: Option<(ObjectVersion, Instant)>,
     /// The least epoch this process's own lease is taken over at (DA-CLUS-14); 0 for none.
     floor: u64,
+    /// Whether a lease naming this holder is watched like another's ([`Self::patient`]).
+    patient: bool,
 }
 
 impl Claim {
@@ -50,7 +53,17 @@ impl Claim {
             timing,
             watched: None,
             floor: 0,
+            patient: false,
         }
+    }
+
+    /// A claim that never takes over its own holder's lease at once: one naming this process is
+    /// watched as another holder's is, and taken over only after a full `lease_duration` without a
+    /// renewal. A removal's teardown (the sweep's orphan) claims this way, so it never takes a
+    /// pipeline from this node's own live controller (DA-OPS-9).
+    pub fn patient(mut self) -> Self {
+        self.patient = true;
+        self
     }
 
     /// The next takeover of this process's own lease runs at an epoch of at least `epoch`: a
@@ -93,7 +106,7 @@ impl Claim {
         // it, so it is taken over at once, under the next epoch: a new term never shares an
         // epoch with a worker that already ran. This rests on (node id, incarnation) naming one
         // process: the incarnation is its start in milliseconds, so a restarted process waits.
-        if !seen.doc.is_held_by(&self.holder) {
+        if self.patient || !seen.doc.is_held_by(&self.holder) {
             self.floor = 0;
             // The wait runs from when the version was read, never from before: a renewal that
             // landed while the read was in flight must count.
@@ -278,6 +291,40 @@ mod tests {
         assert_eq!(epoch(&mine), 2);
         let stored = leases(&store).observe("p").await.unwrap().unwrap();
         assert!(stored.doc.is_held_by(&holder("b")));
+    }
+
+    /// A patient claim watches its own holder's lease as another's: held while it renews, taken
+    /// over only after a full lease duration once it stops (DA-OPS-9).
+    #[tokio::test(start_paused = true)]
+    async fn a_patient_claim_waits_for_its_own_holders_lease() {
+        let store = ScriptedStore::new();
+        let lease = acquired(&leases(&store), "a").await;
+        let (_m, p) = metrics();
+        let run = LeaseRun::start(
+            leases(&store),
+            lease,
+            holder("a"),
+            timing(),
+            Instant::now(),
+            p,
+        );
+        let mut a = claim(&store, "a").patient();
+        for _ in 0..40 {
+            match a.step().await.unwrap() {
+                Claimed::HeldBy { node_id, .. } => assert_eq!(node_id, "a"),
+                mine => panic!("took its own live lease: {mine:?}"),
+            }
+            advance(1_000).await;
+        }
+        // Dropped, not stopped: a stop releases the lease, and a silent holder's is not released.
+        drop(run);
+        let Claimed::HeldBy { takeover_at, .. } = a.step().await.unwrap() else {
+            panic!("held by its silent holder")
+        };
+        tokio::time::sleep_until(takeover_at - Duration::from_millis(10)).await;
+        assert!(matches!(a.step().await.unwrap(), Claimed::HeldBy { .. }));
+        tokio::time::sleep_until(takeover_at).await;
+        assert_eq!(epoch(&a.step().await.unwrap()), 2);
     }
 
     /// DA-CLUS-14: the lake saw epoch 5 while this node's own lease names 1. The takeover

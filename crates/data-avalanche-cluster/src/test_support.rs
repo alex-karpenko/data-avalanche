@@ -9,7 +9,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
-use data_avalanche_state::{Acquired, DocStore, Holder, LeaseDoc, Leases, Versioned};
+use data_avalanche_state::{Acquired, DocStore, Holder, LeaseDoc, Leases, Removals, Versioned};
 use data_avalanche_storage::{ObjectStoreVersioned, ObjectVersion, StoreError, VersionedStore};
 use data_avalanche_telemetry::{Metrics, PipelineLabels, PipelineMetrics};
 use object_store::memory::InMemory;
@@ -62,6 +62,10 @@ struct Script {
     read_delay: Duration,
     /// The next reads that fail transiently.
     failed_reads: usize,
+    /// The next listings that fail transiently.
+    failed_lists: usize,
+    /// Every write of a key under this prefix lands after this long.
+    slow_writes: Option<(String, Duration)>,
 }
 
 /// An in-memory store whose writes (`create`, `update`, `put`) fail as scripted.
@@ -98,6 +102,16 @@ impl ScriptedStore {
         self.lock().failed_reads = n;
     }
 
+    /// The next `n` listings fail transiently.
+    pub fn fail_lists(&self, n: usize) {
+        self.lock().failed_lists = n;
+    }
+
+    /// Every write of a key under `prefix` from now on lands after `delay`, and answers then.
+    pub fn slow_writes(&self, prefix: &str, delay: Duration) {
+        self.lock().slow_writes = Some((prefix.to_owned(), delay));
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Script> {
         self.script
             .lock()
@@ -113,6 +127,14 @@ impl ScriptedStore {
     where
         F: Future<Output = Result<ObjectVersion, StoreError>>,
     {
+        let slow = self
+            .lock()
+            .slow_writes
+            .as_ref()
+            .and_then(|(prefix, delay)| key.starts_with(prefix.as_str()).then_some(*delay));
+        if let Some(delay) = slow {
+            tokio::time::sleep(delay).await;
+        }
         match self.fault() {
             None => write.await,
             Some(Fault {
@@ -172,7 +194,22 @@ impl VersionedStore for ScriptedStore {
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+        let fail = {
+            let mut s = self.lock();
+            let fail = s.failed_lists > 0;
+            s.failed_lists = s.failed_lists.saturating_sub(1);
+            fail
+        };
+        if fail {
+            return Err(StoreError::Transient {
+                key: prefix.to_owned(),
+                reason: "injected".into(),
+            });
+        }
         self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(key).await
     }
 }
 
@@ -194,6 +231,66 @@ pub(crate) fn holder(node: &str) -> Holder {
 
 pub(crate) fn leases(store: &Arc<ScriptedStore>) -> Leases {
     Leases::new(DocStore::new(Arc::clone(store) as Arc<dyn VersionedStore>))
+}
+
+pub(crate) fn removals(store: &Arc<ScriptedStore>) -> Removals {
+    Removals::new(DocStore::new(Arc::clone(store) as Arc<dyn VersionedStore>))
+}
+
+/// A removal of `id` under way, from generation 1.
+pub(crate) fn tombstone(id: &str) -> data_avalanche_state::RemovalDoc {
+    data_avalanche_state::RemovalDoc {
+        pipeline_id: id.into(),
+        generation: 1,
+        hash: "blake3:00".into(),
+        removed_at: Utc::now(),
+        done_at: None,
+        records: 0,
+    }
+}
+
+/// Resolves a tombstone's pipeline as [`config`] of its id has it, with fresh documents; the
+/// id `unresolvable` doesn't resolve. The current generation, 2, has no pipeline: every
+/// removal stands.
+pub(crate) fn removed() -> crate::RemovedPipelines {
+    removed_with(|_| Ok(gone()))
+}
+
+/// The current generation, 2, without the pipeline.
+pub(crate) fn gone() -> crate::CurrentPipeline {
+    crate::CurrentPipeline {
+        generation: 2,
+        hash: "blake3:02".into(),
+        pipeline: None,
+    }
+}
+
+/// [`removed`] with the current generation `current` answers.
+pub(crate) fn removed_with(
+    current: impl Fn(&str) -> Result<crate::CurrentPipeline, crate::ResolveError>
+    + Send
+    + Sync
+    + 'static,
+) -> crate::RemovedPipelines {
+    let current = Arc::new(current);
+    crate::RemovedPipelines {
+        removed: Arc::new(|doc: data_avalanche_state::RemovalDoc| {
+            Box::pin(async move {
+                if doc.pipeline_id == "unresolvable" {
+                    return Err(crate::ResolveError::Invalid("no such variable".to_owned()));
+                }
+                let p = config(&[&doc.pipeline_id])
+                    .pipelines
+                    .remove(&doc.pipeline_id)
+                    .unwrap();
+                Ok((p, pipeline_docs()))
+            })
+        }),
+        configured: Arc::new(move |id: String| {
+            let answer = current(&id);
+            Box::pin(async move { answer })
+        }),
+    }
 }
 
 pub(crate) async fn acquired(leases: &Leases, node: &str) -> Versioned<LeaseDoc> {
@@ -401,6 +498,8 @@ pub(crate) fn deps(
         settings: settings(),
         starts: Arc::new(tokio::sync::Semaphore::new(1)),
         handoffs: Arc::new(tokio::sync::Semaphore::new(2)),
+        removals: removals(store),
+        removed: removed(),
     }
 }
 
@@ -520,6 +619,7 @@ pub(crate) fn members(me: &str, nodes: &[(&str, crate::Phase, bool)]) -> crate::
         .map(|((name, phase, suspect), n)| {
             let member = crate::Member {
                 addr: at(n),
+                incarnation: 1,
                 meta: crate::NodeMeta {
                     phase: *phase,
                     config_generation: 1,
@@ -753,6 +853,16 @@ impl TestCluster {
         deps.holder.incarnation = incarnation;
         deps.factory = Arc::new(self.factories.clone());
         deps.starts = Arc::new(tokio::sync::Semaphore::new(4));
+        let docs = self.docs.clone();
+        let docs_fn: Arc<crate::DocsFn> =
+            Arc::new(move |p| docs.get(&p.id).cloned().ok_or_else(|| p.id.clone()));
+        // As the binary resolves them: from the generations in `globals.state`.
+        deps.removed = crate::removed_pipelines(
+            self.generations.clone(),
+            Arc::new(env.clone()),
+            key,
+            Arc::clone(&docs_fn),
+        );
         let pipelines = config
             .pipelines
             .values()
@@ -769,16 +879,16 @@ impl TestCluster {
             .lock()
             .unwrap()
             .push((name.to_owned(), reconciler.watch_statuses()));
-        let docs = self.docs.clone();
         let coordinator = crate::ConfigCoordinator::start(
             config,
             first.pointer,
             crate::CoordinatorDeps {
                 generations: self.generations.clone(),
+                removals: deps.removals.clone(),
                 env: Arc::new(env),
                 key,
                 node_id: name.to_owned(),
-                docs: Arc::new(move |p| docs.get(&p.id).cloned().ok_or_else(|| p.id.clone())),
+                docs: docs_fn,
                 factory: Arc::new(self.factories.clone()),
                 reloader: reconciler.reloader(),
                 advertiser: gossip.advertiser(),

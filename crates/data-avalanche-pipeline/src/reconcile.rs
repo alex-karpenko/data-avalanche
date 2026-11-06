@@ -14,6 +14,11 @@
 //! saw. A source that can't say what a chunk's read saw ([`Chunk::visibility`] `None`) gets the
 //! window rule: the transactions applied after the chunk was issued.
 //!
+//! A key is logged under its latest writer only (DA-SNAP-11): a chunk row for the key is kept
+//! only when the read saw that writer, and then it holds the latest change already, so an older
+//! writer of the key decides nothing. The log holds each key written once, however often it is
+//! written while a read waits.
+//!
 //! [`Chunk::visibility`]: data_avalanche_core::Chunk::visibility
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -71,6 +76,8 @@ pub(crate) struct Reconciler {
     keys: usize,
     /// The chunks being read: id → when issued.
     outstanding: BTreeMap<u64, u64>,
+    /// Each logged key's latest writer, by its `at`.
+    writers: HashMap<(TableRef, Key), u64>,
 }
 
 impl Reconciler {
@@ -83,6 +90,13 @@ impl Reconciler {
     pub fn applied(&mut self, xid: u64, touched: Touched) {
         let at = self.tick();
         if !touched.is_empty() {
+            for (table, keys) in &touched.keys {
+                for key in keys {
+                    if let Some(older) = self.writers.insert((table.clone(), key.clone()), at) {
+                        self.forget(older, table, key);
+                    }
+                }
+            }
             self.keys += touched.key_count();
             self.log.push(Entry {
                 at,
@@ -90,6 +104,25 @@ impl Reconciler {
                 touched,
                 seen: None,
             });
+        }
+    }
+
+    /// Takes `key` of `table` out of the entry applied at `at`; an entry left with nothing goes.
+    fn forget(&mut self, at: u64, table: &TableRef, key: &Key) {
+        let Ok(i) = self.log.binary_search_by_key(&at, |e| e.at) else {
+            return;
+        };
+        let e = &mut self.log[i];
+        if let Some(keys) = e.touched.keys.get_mut(table)
+            && keys.remove(key)
+        {
+            self.keys -= 1;
+            if keys.is_empty() {
+                e.touched.keys.remove(table);
+            }
+        }
+        if e.touched.is_empty() {
+            self.log.remove(i);
         }
     }
 
@@ -150,6 +183,7 @@ impl Reconciler {
         };
         let horizon = self.outstanding.values().min().copied().unwrap_or(u64::MAX);
         let keys = &mut self.keys;
+        let writers = &mut self.writers;
         self.log.retain(|e| {
             let keep = match visibility {
                 Some(_) => e.seen.is_none_or(|seen| seen >= horizon),
@@ -157,6 +191,11 @@ impl Reconciler {
             };
             if !keep {
                 *keys -= e.touched.key_count();
+                for (table, ks) in &e.touched.keys {
+                    for k in ks {
+                        writers.remove(&(table.clone(), k.clone()));
+                    }
+                }
             }
             keep
         });
@@ -168,6 +207,7 @@ impl Reconciler {
         self.log.clear();
         self.keys = 0;
         self.outstanding.clear();
+        self.writers.clear();
     }
 
     /// The log's size: its transactions and their keys.
@@ -314,7 +354,7 @@ mod tests {
         let mut r = Reconciler::default();
         let c = r.issue();
         r.applied(700, wrote("a", &[1, 2]));
-        r.applied(701, wrote("a", &[2, 3]));
+        r.applied(701, wrote("a", &[3, 4]));
         r.applied(702, Touched::default());
         assert_eq!(
             r.size(),
@@ -345,5 +385,54 @@ mod tests {
         let kept = r.reconcile(c, &t("a"), None, chunk(&[1, 2, 3]));
         assert_eq!(ids(&kept), [1, 3]);
         assert!(r.logged().is_empty(), "no read is open");
+    }
+
+    /// DA-SNAP-11: a key is logged under its latest writer only, so the log holds each key
+    /// once however often it is written while the reads wait.
+    #[test]
+    fn a_key_written_again_is_logged_once_under_its_latest_writer() {
+        let mut r = Reconciler::default();
+        for xid in 700..800 {
+            r.applied(xid, wrote("a", &[1, 2]));
+        }
+        r.applied(800, wrote("b", &[1]));
+        assert_eq!(
+            r.size(),
+            ReconcileLog {
+                entries: 2,
+                keys: 3
+            }
+        );
+        assert_eq!(r.logged(), [799, 800]);
+        let c = r.issue();
+        let kept = r.reconcile(c, &t("a"), Some(&snap(801, &[799])), chunk(&[1, 2, 3]));
+        assert_eq!(ids(&kept), [3], "the latest writer wasn't seen");
+        let c = r.issue();
+        let kept = r.reconcile(c, &t("a"), Some(&snap(801, &[])), chunk(&[1, 2, 3]));
+        assert_eq!(
+            ids(&kept),
+            [1, 2, 3],
+            "the latest writer was seen: its rows are current"
+        );
+        assert!(r.logged().is_empty());
+        r.applied(900, wrote("a", &[1]));
+        assert_eq!(
+            r.logged(),
+            [900],
+            "a key whose writer went is logged afresh"
+        );
+    }
+
+    /// A writer that keeps some of its keys stays, with those keys.
+    #[test]
+    fn a_writer_keeps_the_keys_no_later_one_wrote() {
+        let mut r = Reconciler::default();
+        r.applied(700, wrote("a", &[1, 2]));
+        r.applied(701, wrote("a", &[2]));
+        assert_eq!(r.logged(), [700, 701]);
+        assert_eq!(r.size().keys, 2);
+        let c = r.issue();
+        let kept = r.reconcile(c, &t("a"), Some(&snap(702, &[700])), chunk(&[1, 2]));
+        assert_eq!(ids(&kept), [2], "700 still drops key 1; 701 was seen");
     }
 }

@@ -122,7 +122,8 @@ fn applies_spec_defaults() {
         g.tracing,
         Tracing {
             otlp_endpoint: None,
-            sample_ratio: 0.0
+            sample_ratio: 0.0,
+            headers: Default::default(),
         }
     );
     let p = &cfg.pipelines["orders"];
@@ -791,6 +792,30 @@ fn unreadable_config_file_is_a_parse_error() {
     );
 }
 
+/// DA-OBS-7: `globals.tracing.headers` resolve as secrets: the value is the variable's, and the
+/// resolved config shows it only as a fingerprint.
+#[test]
+fn tracing_headers_resolve_as_secrets() {
+    let yaml = MINIMAL.replace(
+        "globals:\n  state: { bucket: app-state }",
+        "globals:\n  state: { bucket: app-state }\n  tracing:\n    otlp_endpoint: https://otel:4318\n    headers: { authorization: \"Bearer ${OTLP_TOKEN}\" }",
+    );
+    let cfg = load_str(
+        &yaml,
+        &env(&[("PW", "pw"), ("OTLP_TOKEN", "t0k")]),
+        &fp_key(),
+    )
+    .unwrap_or_else(|r| panic!("{r:#?}"))
+    .config;
+    let headers = &cfg.globals.tracing.headers;
+    assert_eq!(headers["authorization"].expose(), "Bearer t0k");
+    let shown = serde_json::to_string(&cfg.globals.tracing).unwrap();
+    assert!(
+        !shown.contains("t0k") && shown.contains("blake3:"),
+        "{shown}"
+    );
+}
+
 // FU-C (config §11 Phase 2): an optional value that resolves to empty is absent, so its default
 // applies — for a tri-state field, the default, not `null`.
 
@@ -808,6 +833,7 @@ fn empty_optional_otlp_endpoint_is_absent() {
         Tracing {
             otlp_endpoint: None,
             sample_ratio: 0.0,
+            headers: Default::default(),
         },
         "an otlp_endpoint that resolves empty is absent, exactly as if it were never written"
     );

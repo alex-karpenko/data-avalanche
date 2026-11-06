@@ -42,6 +42,17 @@ impl Jobs {
         self.tables(JobTableStatus::Running)
     }
 
+    /// The asked tables of the jobs that empty their sink tables first (DA-SNAP-15).
+    pub fn truncating(&self) -> BTreeSet<TableRef> {
+        self.jobs
+            .iter()
+            .filter(|j| j.truncate)
+            .flat_map(|j| &j.tables)
+            .filter(|t| t.status == JobTableStatus::Queued)
+            .map(|t| t.table.clone())
+            .collect()
+    }
+
     /// Records what this start did with the job tables: the asked ones `started` run, and the
     /// `failed` ones (asked, or running and gone) failed with their reason. An asked table
     /// neither started nor failed stays queued.
@@ -123,6 +134,17 @@ mod tests {
         w.docs.create_snapshot_job(&doc).await.unwrap();
     }
 
+    async fn ask_truncating(w: &World, id: &str, tables: &[&str]) {
+        let doc = SnapshotJobDoc::new(
+            id.into(),
+            tables.iter().map(|n| t(n)).collect(),
+            "ops".into(),
+            Utc::now(),
+        )
+        .truncating();
+        w.docs.create_snapshot_job(&doc).await.unwrap();
+    }
+
     async fn job(w: &World, id: &str) -> SnapshotJobDoc {
         w.docs.snapshot_job(id).await.unwrap().unwrap().doc
     }
@@ -200,6 +222,59 @@ mod tests {
         assert!(st.warnings.is_empty(), "{:?}", st.warnings);
     }
 
+    /// DA-SNAP-15: a job asked with `truncate` empties its tables' sink tables before their
+    /// first chunk, so a row deleted at the source while the pipeline didn't stream it goes, in
+    /// a streamed table and in a copy alike. The other tables keep their rows, and a later start
+    /// doesn't empty the table again: the job's copy has begun.
+    #[tokio::test]
+    async fn a_truncating_job_drops_the_rows_deleted_meanwhile() {
+        let w = World::new(&["a", "b", "x"]);
+        w.source.outside_config(&t("x"));
+        established(&w).await;
+        w.source.commit(
+            FakeTxn::new()
+                .insert(&t("a"), row(1, "x"))
+                .insert(&t("a"), row(2, "x"))
+                .insert(&t("a"), row(3, "x"))
+                .insert(&t("b"), row(9, "x")),
+        );
+        w.source.load(&t("x"), rows(1..=3));
+        ask(&w, "p~0", &["x"]).await;
+        let (end, _) = run(&w, &never(10), async |status| {
+            wait_until("x is copied", || w.ids("x") == [1, 2, 3]).await;
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!(w.ids("a"), [1, 2, 3]);
+        w.source.forget(&t("a"), &row(2, "x"));
+        w.source.forget(&t("x"), &row(3, "x"));
+        ask_truncating(&w, "p~1", &["a", "x"]).await;
+        let (end, _) = run(&w, &never(10), async |status| {
+            wait_until("the copies land", || {
+                w.ids("a") == [1, 3] && w.ids("x") == [1, 2]
+            })
+            .await;
+            streamed(&status, &w).await;
+            wait_until("the copies are done", || {
+                status.borrow().snapshots.is_empty()
+            })
+            .await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!(w.ids("b"), [9], "only the job's tables");
+        assert_eq!(
+            job(&w, "p~1").await.tables[0].status,
+            JobTableStatus::Running
+        );
+        w.source.forget(&t("a"), &row(3, "x"));
+        w.source.commit(FakeTxn::new().insert(&t("a"), row(4, "x")));
+        let (end, _) = run(&w, &never(10), async |status| streamed(&status, &w).await).await;
+        end.unwrap();
+        assert_eq!(w.ids("a"), [1, 3, 4], "not emptied again");
+    }
+
     fn noted(id: i64, note: Option<&str>) -> Row {
         Row(vec![
             ("id".into(), ColumnValue::Int64(id)),
@@ -237,6 +312,7 @@ mod tests {
                 table: t("a"),
                 reason: HaltReason::TableDropped,
                 at: w.source.wal_end(),
+                copy: false,
             })
             .await
             .unwrap();
@@ -308,6 +384,7 @@ mod tests {
                     detail: "the key changed".into(),
                 },
                 at: w.source.wal_end(),
+                copy: false,
             })
             .await
             .unwrap();
@@ -529,10 +606,6 @@ mod tests {
             SourceError::Permanent("permission denied for table x".into()),
         );
         let (end, st) = run(&w, &never(2), async |status| {
-            wait_until("the copy halts", || {
-                status.borrow().halted.contains_key(&t("x"))
-            })
-            .await;
             w.source
                 .commit(FakeTxn::new().insert(&t("a"), row(1, "streamed")));
             wait_until("the stream moves on", || w.ids("a") == [1]).await;
@@ -540,17 +613,67 @@ mod tests {
         })
         .await;
         assert_eq!(end.unwrap(), Exit::Drained);
-        assert_eq!(
-            st.halted.get(&t("x")),
-            Some(&HaltReason::NotReplicable {
-                reason: "permission denied for table x".into()
-            })
+        assert!(
+            st.halted.is_empty(),
+            "a copy's halt isn't shown: {:?}",
+            st.halted
         );
         let halts = w.docs.halts().await.unwrap().tables;
         assert_eq!(halts.len(), 1, "{halts:?}");
         assert_eq!(halts[0].table, t("x"));
         assert_eq!(halts[0].reason.code(), "TABLE_NOT_REPLICABLE");
+        assert!(halts[0].copy, "it fails its job, marked a copy's");
         assert!(w.ids("x").is_empty());
+    }
+
+    /// A copy's halt stays out of the halted tables after a reconnect: the session that opens
+    /// next reads the recorded halts, the copy's among them, and shows only the pipeline's. Nor
+    /// is the halted copy read again: its job failed it.
+    #[tokio::test]
+    async fn a_copy_s_halt_stays_out_of_the_halted_tables_after_a_reconnect() {
+        let w = World::new(&["a", "x"]);
+        w.source.outside_config(&t("x"));
+        established(&w).await;
+        w.source.load(&t("x"), rows(1..=3));
+        ask(&w, "p~1", &["x"]).await;
+        w.source.fail(
+            Method::ReadChunk,
+            SourceError::Permanent("permission denied for table x".into()),
+        );
+        let (end, st) = run(&w, &never(2), async |status| {
+            w.source
+                .commit(FakeTxn::new().insert(&t("a"), row(1, "streamed")));
+            wait_until("the stream moves on", || w.ids("a") == [1]).await;
+            streamed(&status, &w).await;
+            let halts = w.docs.halts().await.unwrap().tables;
+            assert!(halts.iter().any(|h| h.copy), "recorded first: {halts:?}");
+            w.source
+                .fail(Method::Next, SourceError::Transient("reset".into()));
+            wait_until("a reconnect", || status.borrow().reconnects >= 1).await;
+            w.source
+                .commit(FakeTxn::new().insert(&t("a"), row(2, "streamed")));
+            wait_until("the next session streams", || w.ids("a") == [1, 2]).await;
+            streamed(&status, &w).await;
+            assert!(
+                status.borrow().halted.is_empty(),
+                "a copy's halt isn't shown after a reconnect: {:?}",
+                status.borrow().halted
+            );
+            assert!(
+                !status.borrow().snapshots.contains_key(&t("x")),
+                "the halted copy isn't a snapshot again: {:?}",
+                status.borrow().snapshots
+            );
+        })
+        .await;
+        assert_eq!(end.unwrap(), Exit::Drained);
+        assert!(st.reconnects >= 1);
+        assert!(st.halted.is_empty(), "{:?}", st.halted);
+        let halts = w.docs.halts().await.unwrap().tables;
+        assert_eq!(halts.len(), 1, "{halts:?}");
+        assert_eq!(halts[0].table, t("x"));
+        assert!(halts[0].copy, "recorded as a copy's");
+        assert!(w.ids("x").is_empty(), "the halted copy isn't read again");
     }
 
     /// A copy that halts in a run (here its table is dropped while it is read) fails in its
@@ -569,9 +692,13 @@ mod tests {
             w.source.drop_table(&t("x"));
             w.source.release_reads();
             wait_until("the copy halts", || {
-                status.borrow().halted.contains_key(&t("x"))
+                !status.borrow().snapshots.contains_key(&t("x"))
             })
             .await;
+            assert!(
+                status.borrow().halted.is_empty(),
+                "a copy's halt isn't shown"
+            );
             w.source
                 .commit(FakeTxn::new().insert(&t("a"), row(1, "streamed")));
             streamed(&status, &w).await;
@@ -621,6 +748,7 @@ mod tests {
                 table: t("x"),
                 reason: HaltReason::SnapshotTimeout { limit_secs: 60 },
                 at: w.source.wal_end(),
+                copy: false,
             })
             .await
             .unwrap();

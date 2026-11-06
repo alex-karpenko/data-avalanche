@@ -1,6 +1,6 @@
 ---
 title: Config changes
-description: Validating and reloading a config, why a restart doesn't apply one, rotating secrets, and the keys a reload refuses.
+description: Validating and reloading a config, why a restart doesn't apply one, removing a pipeline, rotating secrets, and the keys a reload refuses or applies at the next start.
 sidebar:
   order: 7
 ---
@@ -35,7 +35,9 @@ without a restart, so a pipeline in `error` stays there: once the new generation
 `POST /v1/pipelines/<id>/restart` it.
 
 Both calls need the `operator` role. Any node will do, but it publishes **its own file**: send the
-reload to a node whose file is the one you changed.
+reload to a node whose file is the one you changed. A node checks at most 5 posted configs at once,
+then one a second: past that, the validate answers `429` with `Retry-After`. Checking the node's
+own file (no body) has no limit.
 
 ## A restart doesn't apply a config
 
@@ -52,6 +54,50 @@ literal that differs from the generation is ignored, with a warning naming it; `
 `api.address` are the node's file's. A reload from a node is refused until its file matches the
 generation on these keys.
 
+## Remove a pipeline
+
+Delete it from the file and reload. The node that adopts the generation first writes a removal
+record in `globals.state` (`removals/<id>.json`); the pipeline's owner then drains it, drops its
+slot and publication as `auto_cleanup` says, and marks the record done. The sink's tables stay.
+
+The record is what makes a removal survive a node that is down: if no node holds the pipeline
+when the generation lands (its owner was stopped, or the lease was between two nodes), the node
+the ring places the id on finds the pending record within 30 s, takes the lease once it is free,
+and tears the pipeline down itself. A pipeline added back with the same id, or a new one on the
+removed one's slot, publication, sink or state location, waits for the record to be done before
+it starts, whichever node it lands on. A record that can't be read (a storage failure) is waited
+for. A record of another id that doesn't resolve on the node (the generation it names no longer
+loads there) is skipped with a warning: the node can't tell whether the pipeline takes its place.
+A record of the pipeline's own id is always waited for, resolved or not.
+
+A removal undone before its owner saw it (the pipeline removed, then added back with the same id
+on the same slot or publication, and the owner went straight to the later generation) leaves a
+pending record too. The node the ring places the id on marks it done once it holds the lease,
+without dropping anything: the slot and the publication are the running pipeline's.
+
+A pipeline added back with its id can be stuck on its old record when the generation the record
+names no longer loads on any node, typically a `${VAR}` it used that is gone; the nodes log the
+record as not resolving. Either restore the variable on the nodes for one sweep (30 s): the node
+the ring places the id on settles the record, tearing the old pipeline down, or, when the pipeline
+came back on the same slot or publication, marking it done without dropping anything. Or drop the
+old slot and publication by hand, then mark the record done yourself: in `globals.state`, set
+`done_at` in `removals/<id>.json`, keeping the rest as it is (`records` counts the nodes'
+records of the removal):
+
+```json
+{
+  "version": 1,
+  "pipeline_id": "orders",
+  "generation": 7,
+  "hash": "blake3:…",
+  "removed_at": "2026-11-06T09:12:03.418Z",
+  "done_at": "2026-11-06T10:00:00Z",
+  "records": 3
+}
+```
+
+The pipeline starts within a lease renewal interval of the write.
+
 ## Rotate a secret
 
 - **A credentials file** (`credentials_file`): replace its contents on every node (a mounted
@@ -62,32 +108,34 @@ generation on these keys.
 - **The API's TLS certificate** (`globals.api.tls.cert` and `key`): replace the files or the
   variables, then restart the nodes one at a time. A reload meanwhile is refused, naming the key.
 
-## Keys a reload refuses
+## Keys applied at the next start
 
 A reload refuses a change to a key whose class is *process restart*
-([the reference](/data-avalanche/reference/configuration/) marks them), naming it (V-061). Because
-a restarted node adopts the cluster's generation, restarting doesn't apply such a change either:
+([the reference](/data-avalanche/reference/configuration/) marks them), naming it (V-061). Most
+of them (`lease_renewal_interval`, `lease_safety_margin`, `discovery`, `discovery_dns_name`,
+`join_members`, the gossip's ports and timers, `globals.api.tls`) can still be changed:
+
+1. Reload with `restart=accept`:
+
+   ```sh
+   curl -s -X POST 'https://cdc-0.example.internal/v1/config/reload?restart=accept'
+   ```
+
+   The generation is published. Every running node adopts it but keeps the values it started
+   with for those keys; everything else in the reload applies as usual.
+2. Restart the nodes one at a time. Each one takes the new values as it starts.
+3. `GET /v1/config/status` on each node lists, in `restart_pending`, the keys it still runs with
+   the old value. The rollout is done when every node's list is empty.
+
+Some keys are refused even with `restart=accept`, because the cluster keeps them for good:
 
 - `tokens`, `lock_backend` and `lease_duration` are pinned in the cluster's anchor and never
   change for that `globals.state`.
-- `cloud`, `globals.state` and `globals.azure` say where the cluster is: changing them makes a new
-  cluster.
-- The rest (`lease_renewal_interval`, `lease_safety_margin`, `discovery`, `discovery_dns_name`,
-  `join_members`, the gossip's ports and timers, `globals.api.tls`) change only through each
-  node's environment. Write the ones you may want to change as `${VAR}`, with a
-  default, from the start, and change the variable with a rolling restart:
-
-  ```yaml
-  globals:
-    cluster:
-      lease_renewal_interval: ${LEASE_RENEWAL_INTERVAL:-5s}
-  ```
-
-  A key already written as a literal can't be changed in a running cluster. The way out is a new
-  cluster: stop every node, then start them with a new `globals.state.prefix`, so that the file
-  bootstraps a new anchor and generation. Never run nodes on the old and the new location at
-  once: they would be two clusters holding the same pipelines. This path isn't covered by the
-  project's tests yet.
+- `config_version`, `globals.cloud`, `globals.state` and `globals.azure` say what and where the
+  cluster is: changing them makes a new cluster. Stop every node, then start them with a new
+  `globals.state.prefix`, so that the file bootstraps a new anchor and generation. Never run
+  nodes on the old and the new location at once: they would be two clusters holding the same
+  pipelines. This path isn't covered by the project's tests yet.
 
 `node_name` and `globals.api.address` are read from each node's own file when it starts, so a
 restart applies a changed value; a reload is still refused while the generation holds another

@@ -71,11 +71,11 @@ table prefix (`sink.prefix`) and the default MySQL `server_id` derive from it. C
 deletes the pipeline and creates a new one: a new state, and a new snapshot per its
 `snapshots.mode`. Lower-case letters, digits, `_` and `-`, at most 63 characters (V-055).
 
-:::caution[Reusing an id or its resources]
+:::note[Reusing an id or its resources]
 When a pipeline is removed and another one takes its `id`, slot, publication, sink prefix or state
-location, start the new one only after the old one's lease is released (watch
-`GET /v1/cluster/status`), or in the same reload as the removal. A node that starts or joins in
-between, or a second reload, can start the new pipeline while the old one still drains.
+location, the new one waits until the old one is torn down, on whichever node it starts, whatever
+reload or start brought it (see
+[Remove a pipeline](/data-avalanche/runbooks/config-changes/#remove-a-pipeline)).
 :::
 
 ## How defaults merge
@@ -138,7 +138,7 @@ of the [reference](/data-avalanche/reference/configuration/) has a reload class:
 | applied | in place, at once |
 | pipeline restart | that pipeline stops, drops what it hasn't committed, and starts again from its last checkpoint with the new value; the replay is idempotent, and the other pipelines don't notice |
 | pipeline restart, if the table set changes | a restart only when the tables the patterns match change |
-| process restart | the reload is refused, naming the key (V-061); see [Config changes](/data-avalanche/runbooks/config-changes/#keys-a-reload-refuses) |
+| process restart | the reload is refused, naming the key (V-061), unless asked with `?restart=accept`: then each node applies it at its next start; see [Config changes](/data-avalanche/runbooks/config-changes/#keys-applied-at-the-next-start) |
 
 A node that restarts takes the config the cluster runs, not its own file: see
 [Config changes](/data-avalanche/runbooks/config-changes/).

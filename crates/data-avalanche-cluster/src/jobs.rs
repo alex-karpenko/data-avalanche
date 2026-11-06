@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::Utc;
 use data_avalanche_core::TableRef;
 use data_avalanche_state::{
-    HaltsDoc, JobTableStatus, PipelineDocs, SnapshotJobDoc, SnapshotStatus, StateError,
-    TableSnapshotDoc, Versioned,
+    HaltsDoc, JobTableStatus, KEPT_ENDED_JOBS, PipelineDocs, SnapshotJobDoc, SnapshotStatus,
+    StateError, TableSnapshotDoc, Versioned,
 };
 
 /// What a running job table's documents say of it.
@@ -137,8 +137,16 @@ impl Jobs {
                 }
             }
         }
+        if ended.is_empty() {
+            return;
+        }
         for id in ended {
             ids.remove(&id);
+        }
+        match docs.prune_snapshot_jobs(KEPT_ENDED_JOBS).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(pipeline, deleted = n, "ended snapshot jobs pruned"),
+            Err(e) => tracing::warn!(pipeline, "ended snapshot jobs unpruned: {e}"),
         }
     }
 }
@@ -239,6 +247,9 @@ mod tests {
         async fn list(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
             self.inner.list(prefix).await
         }
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
     }
 
     fn starting() -> (Arc<Starting>, PipelineDocs) {
@@ -260,6 +271,7 @@ mod tests {
             table: a.clone(),
             reason: HaltReason::TableDropped,
             at: "pg:0/10".parse().unwrap(),
+            copy: false,
         })
         .await
         .unwrap();
@@ -290,6 +302,46 @@ mod tests {
         let mut jobs = Jobs(Some(BTreeSet::from(["gone".to_owned()])));
         jobs.poll(&docs, "p").await;
         assert_eq!(jobs.0, Some(BTreeSet::new()));
+    }
+
+    /// A job that ends at a poll deletes the ended jobs past the newest [`KEPT_ENDED_JOBS`]
+    /// (DA-SNAP-16).
+    #[tokio::test]
+    async fn a_job_that_ends_prunes_the_oldest_ended_jobs() {
+        let (_, docs) = starting();
+        let a = TableRef::new("public", "a");
+        let t0 = Utc::now() - chrono::Duration::days(1);
+        for i in 0..KEPT_ENDED_JOBS {
+            let mut old =
+                SnapshotJobDoc::new(format!("old-{i:03}"), vec![a.clone()], "api".into(), t0);
+            old.status = JobStatus::Completed;
+            old.finished_at = Some(t0 + chrono::Duration::seconds(i as i64));
+            docs.create_snapshot_job(&old).await.unwrap();
+        }
+        let mut job = SnapshotJobDoc::new("j1".into(), vec![a.clone()], "api".into(), Utc::now());
+        job.status = JobStatus::Running;
+        job.tables[0].status = JobTableStatus::Running;
+        docs.create_snapshot_job(&job).await.unwrap();
+        let mut done = doc(SnapshotStatus::Completed);
+        done.row_count = Some(3);
+        docs.save_table_snapshot(&done).await.unwrap();
+        let mut jobs = Jobs::default();
+        jobs.list(&docs, "p").await;
+        jobs.poll(&docs, "p").await;
+
+        let ids: Vec<String> = docs
+            .snapshot_jobs()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|v| v.doc.job_id)
+            .collect();
+        assert_eq!(ids.len(), KEPT_ENDED_JOBS);
+        assert!(
+            !ids.contains(&"old-000".to_owned()),
+            "the oldest ended job goes"
+        );
+        assert!(ids.contains(&"j1".to_owned()) && ids.contains(&"old-001".to_owned()));
     }
 
     fn doc(status: SnapshotStatus) -> TableSnapshotDoc {
@@ -339,6 +391,7 @@ mod tests {
                 table: a.clone(),
                 reason: HaltReason::SnapshotTimeout { limit_secs: 60 },
                 at: "pg:0/10".parse().unwrap(),
+                copy: false,
             }],
         };
         let Progress::Failed(why) = progress(&a, &halted, Some(&running)) else {

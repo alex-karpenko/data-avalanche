@@ -85,6 +85,41 @@ fn proc_change_rejects_the_reload_with_v061() {
         ("V-061", "globals.cluster.tokens")
     );
     assert_eq!(d.globals[0].class, Mutability::Proc);
+    assert_eq!(d.fixed(), ["globals.cluster.tokens"], "the anchor pins it");
+    assert!(e.message.contains("new globals.state"), "{}", e.message);
+}
+
+/// DA-OPS-12: a restart-only field a restart can change isn't fixed; where the state lives and
+/// what the anchor pins are.
+#[test]
+fn only_the_cluster_s_own_fields_are_fixed() {
+    let with = |cluster: &str| {
+        MINIMAL.replace(
+            "state: { bucket: app-state }",
+            &format!("state: {{ bucket: app-state }}\n  cluster: {cluster}"),
+        )
+    };
+    let renew = diff(
+        &load(MINIMAL),
+        &load(&with("{ lease_renewal_interval: 4s }")),
+        &unknown,
+    );
+    assert!(renew.is_rejected());
+    assert!(renew.fixed().is_empty(), "{:?}", renew.globals);
+    let message = &renew.report.errors[0].message;
+    assert!(message.contains("?restart=accept"), "{message}");
+    let moved = MINIMAL.replace("bucket: app-state", "bucket: other-state");
+    let d = diff(&load(MINIMAL), &load(&moved), &unknown);
+    assert_eq!(d.fixed(), ["globals.state.bucket"]);
+    // The storage account holds `globals.state` on Azure: another one is another cluster.
+    let azure = |account: &str| {
+        MINIMAL.replace(
+            "state: { bucket: app-state }",
+            &format!("cloud: azure\n  azure: {{ account_name: {account} }}\n  state: {{ bucket: app-state }}"),
+        )
+    };
+    let d = diff(&load(&azure("one")), &load(&azure("two")), &unknown);
+    assert_eq!(d.fixed(), ["globals.azure.account_name"]);
 }
 
 #[test]

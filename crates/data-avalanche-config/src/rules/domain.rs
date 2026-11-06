@@ -227,6 +227,37 @@ fn globals(g: &RawGlobals, ctx: &mut Ctx) {
             format!("sample_ratio must be 0..=1, got {}", shown_value(l, &r)),
         );
     }
+    // V-126: a header HTTP takes. The value isn't echoed: it is a secret.
+    if let Some(headers) = g.tracing.as_ref().and_then(|t| t.headers.as_ref()) {
+        let at = root.key("tracing").key("headers");
+        for (name, leaf) in headers {
+            let token = !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b));
+            if !token {
+                ctx.error(
+                    "V-126",
+                    &at.key(name),
+                    leaf.loc(),
+                    format!("header name {name:?} isn't an HTTP token"),
+                );
+                continue;
+            }
+            if let Some(value) = ctx.text(leaf, &at.key(name))
+                && !value
+                    .bytes()
+                    .all(|b| b == b'\t' || (b' '..=b'~').contains(&b))
+            {
+                ctx.error(
+                    "V-126",
+                    &at.key(name),
+                    leaf.loc(),
+                    format!("header {name}'s value holds a control or non-ASCII character"),
+                );
+            }
+        }
+    }
     // V-101
     if let Some(a) = &g.azure
         && let Some((name, loc)) = val(ctx, &a.account_name, &root.key("azure").key("account_name"))

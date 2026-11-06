@@ -137,6 +137,7 @@ OTLP/HTTP traces of flushes, commits, snapshot chunks and schema changes.
 |---|---|---|---|---|---|
 | `otlp_endpoint` | string | — | applied |  | The OTLP/HTTP collector's base URL (`http://otel-collector:4318`); spans go to `<endpoint>/v1/traces`. Absent turns tracing off. |
 | `sample_ratio` | number | 0.05 with an endpoint, else 0 | applied | [V-097](/data-avalanche/reference/validation-rules/#v-097) [V-098](/data-avalanche/reference/validation-rules/#v-098) | The share of flushes traced, from 0 to 1. |
+| `headers.<key>` | map of string | none | applied |  | Headers sent with each export, a map of name to value: a hosted collector's token or API key (`authorization: Bearer ${OTLP_TOKEN}`). The values are secrets (V-126). |
 
 ## `globals.azure`
 

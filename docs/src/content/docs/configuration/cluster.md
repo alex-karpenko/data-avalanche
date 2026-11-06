@@ -63,14 +63,8 @@ pipelines: {}
 - `discovery: dns` resolves `discovery_dns_name`, a Kubernetes headless Service, and joins every
   address it returns. The [Helm chart](/data-avalanche/deployment/kubernetes/) sets it up.
 
-:::caution[Pods started together with DNS discovery]
-A node asks DNS again only while it has no peer. When four or more pods start at once, nodes that
-each resolved some of the others can settle in separate groups that never merge: each group
-places every pipeline, the leases keep one writer per pipeline, but the groups contend for them.
-After a cold start, check that `GET /v1/cluster/status` on any node lists every pod. If it
-doesn't, restart the pods of the smaller group one at a time: a starting node resolves the name
-again.
-:::
+Either way, a node resolves its seeds again every 5 s and asks the ones that aren't members yet,
+so pods started together that each found only some of the others merge into one cluster.
 
 ## Settings fixed for the cluster's life
 

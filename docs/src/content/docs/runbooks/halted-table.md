@@ -55,8 +55,9 @@ streams it again. Follow it with `GET /v1/snapshots/<job_id>` (see
 [Snapshot jobs](/data-avalanche/runbooks/snapshot-jobs/)).
 
 :::caution[Rows deleted while the table was halted]
-A job upserts every row it reads and deletes nothing. A row deleted at the source while the table
-was halted stays in the Delta table. To start clean, drop or move the Delta table before the job.
+A job upserts every row it reads. A row deleted at the source while the table was halted stays in
+the Delta table, unless the job is asked with `"truncate": true`: it empties the Delta table before
+its copy, so readers see it empty, then partly copied, until the job completes.
 :::
 
 :::note[A table created again while the pipeline was down]
