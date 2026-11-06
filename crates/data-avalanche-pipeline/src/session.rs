@@ -290,6 +290,11 @@ impl<'c> Session<'c> {
         }
         let mut copies = BTreeMap::new();
         for (table, schema) in &core.copies {
+            // A copy halted earlier in this run (a reconnect opens this session) isn't read
+            // again: its job failed it, as the worker's start does with one halted before.
+            if recorded.iter().any(|h| &h.table == table) {
+                continue;
+            }
             match acc.add_table(schema.clone(), &s.delete_extra(schema)) {
                 Ok(()) => {
                     copies.insert(table.clone(), schema.clone());

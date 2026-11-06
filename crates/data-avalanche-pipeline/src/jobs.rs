@@ -627,7 +627,8 @@ mod tests {
     }
 
     /// A copy's halt stays out of the halted tables after a reconnect: the session that opens
-    /// next reads the recorded halts, the copy's among them, and shows only the pipeline's.
+    /// next reads the recorded halts, the copy's among them, and shows only the pipeline's. Nor
+    /// is the halted copy read again: its job failed it.
     #[tokio::test]
     async fn a_copy_s_halt_stays_out_of_the_halted_tables_after_a_reconnect() {
         let w = World::new(&["a", "x"]);
@@ -658,6 +659,11 @@ mod tests {
                 "a copy's halt isn't shown after a reconnect: {:?}",
                 status.borrow().halted
             );
+            assert!(
+                !status.borrow().snapshots.contains_key(&t("x")),
+                "the halted copy isn't a snapshot again: {:?}",
+                status.borrow().snapshots
+            );
         })
         .await;
         assert_eq!(end.unwrap(), Exit::Drained);
@@ -667,6 +673,7 @@ mod tests {
         assert_eq!(halts.len(), 1, "{halts:?}");
         assert_eq!(halts[0].table, t("x"));
         assert!(halts[0].copy, "recorded as a copy's");
+        assert!(w.ids("x").is_empty(), "the halted copy isn't read again");
     }
 
     /// A copy that halts in a run (here its table is dropped while it is read) fails in its
