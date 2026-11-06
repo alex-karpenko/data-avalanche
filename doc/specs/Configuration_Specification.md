@@ -1163,10 +1163,12 @@ highest class touched.
   marks the tombstone done. A removal no node owns (its owner was down, or a hand-off was between
   release and claim) is torn down by the node the ring places the id on: every 30 s a node reads
   the pending tombstones, resolves each one's pipeline from its generation, claims the lease once
-  it is free, tears it down as `auto_cleanup` says, and marks it done (DA-OPS-9). A pipeline that
-  shares the removed one's id, slot, publication, sink or state location waits, before it claims
-  its lease, until every such tombstone is done, on every node, whatever reload or start brought
-  it (DA-OPS-10).
+  it is free, tears it down as `auto_cleanup` says, and marks it done (DA-OPS-9). A removal the
+  current generation undoes (the same `id` configured again on the same slot or publication) is
+  marked done without a teardown: its resources are the running pipeline's. The node checks this
+  holding the pipeline's lease. A pipeline that shares the removed one's id, slot, publication,
+  sink or state location waits, before it claims its lease, until every such tombstone is done,
+  on every node, whatever reload or start brought it (DA-OPS-10).
 - **Renamed** (key changed, `id` same): pure rename; the `_pipeline` label changes, no
   resource churn.
 - **`id` changed**: delete-and-recreate (drop old resources per `auto_cleanup`, start fresh).
@@ -1652,7 +1654,8 @@ Every deviation, so nothing is silent:
 31. **M12b planning (2026-11-04, Q-M12b-1…4)** — §1.2 PROC, §11 and §12.3: a reload with
     `?restart=accept` publishes a process-restart field, applied at each node's next start
     (DA-OPS-12); the cluster-pinned fields are refused even then (**V-061**). §12.3: the removal
-    tombstone replaces the orphan-cleanup design item (DA-OPS-9, DA-OPS-10). §6.6 new
+    tombstone replaces the orphan-cleanup design item (DA-OPS-9, DA-OPS-10); a removal the
+    current generation undoes is marked done without a teardown. §6.6 new
     `globals.tracing.headers` (secrets, R, **V-126**). §6.3: a non-`https` key URL warns
     (**V-125**).
 
