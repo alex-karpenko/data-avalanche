@@ -696,6 +696,18 @@ worker's frontier with its count, so the lag keeps the old session's start (Task
 | DA-SNAP-7 | 🔄 → ✅ | closed with a pointer: an incremental snapshot runs beside the stream, whose position advances with each flush, so a slow snapshot holds back only the WAL or binlog the stream hasn't flushed; the guard (`max_wal_lag_bytes`) and `binlog_purge_action` cover the rest (`architecture/snapshots.md`) |
 | DA-X-13 | 🟥 → ✅ | closed with a pointer: not seen again in any E2E run, local or CI, from M7a through M12b (the plans' measurements and deviations record none) |
 
+## 58. M12b control hardening — the exit (2026-11-06)
+
+M12b (`doc/v1.0/M12b-control-hardening.md`) merged 2026-11-06 (PR #20, `6370ef0`), its PR CI green
+on every target (`ci.yml` run 42215952227: `check`, `integration`, `e2e-mysql` on `mysql-84`,
+`mysql-84-nogtid` and `mariadb-118`, `k3s` 24 min; `docs.yml` run 42215952232), and the site
+deployed from `main` (`docs.yml` run 42220732173). The first CI run failed `integration` on
+`sync_commit`'s `a_stalled_synchronous_commit_survives_the_chunk_that_missed_it`: its first sample
+raced the snapshot's last chunk read, which ends after the stalled writer appears now that a chunk
+reads on a connection of its own (DA-SNAP-12). The test waits for the snapshot to stop before it
+checks the stall (`131f9eb`, test only; the plan's deviations record it). The rows §57 closed
+stand as written; no count changes. Next: M12d, the source and sink gaps of §54.1 (Q-M12-8).
+
 ---
 
 ### Counts (by status)
@@ -707,7 +719,7 @@ worker's frontier with its count, so the lag keeps the old session's start (Task
 > M7a's plan (§32), 2026-10-16 for M7a's exit (§33), 2026-10-17 for M7b's plan (§34),
 > 2026-10-20 for M7b's exit (§35), 2026-10-21 for M8a's plan (§36), 2026-10-22 for M8a's exit (§37),
 > 2026-10-22 for M8b's plan (§38), 2026-10-23 for M8b's exit (§39), 2026-10-23 for M9a's plan
-> (§40), 2026-10-23 for M9a's exit (§41), 2026-10-27 for M9b's plan (§42), 2026-10-28 for M9b's exit (§43), 2026-10-28 for M10's plan (§44), and 2026-10-29 for M10's exit (§45), and 2026-10-29 for M11a's plan (§46), and 2026-10-29 for M11a's whole-branch review (§47), and 2026-10-29 for M11a's exit (§48), and 2026-10-29 for M11b's plan (§49), and 2026-10-30 for M11b's pages (§50), and 2026-10-30 for M11b's exit and v0.1.0 (§51), and 2026-10-30 for M12a's plan (§52), and 2026-11-04 for M12a's gaps closed (§53), and 2026-11-04 for M12a's whole-branch review (§54), and 2026-11-04 for M12a's exit (§55), and 2026-11-04 for M12b's gaps closed (§57).
+> (§40), 2026-10-23 for M9a's exit (§41), 2026-10-27 for M9b's plan (§42), 2026-10-28 for M9b's exit (§43), 2026-10-28 for M10's plan (§44), and 2026-10-29 for M10's exit (§45), and 2026-10-29 for M11a's plan (§46), and 2026-10-29 for M11a's whole-branch review (§47), and 2026-10-29 for M11a's exit (§48), and 2026-10-29 for M11b's plan (§49), and 2026-10-30 for M11b's pages (§50), and 2026-10-30 for M11b's exit and v0.1.0 (§51), and 2026-10-30 for M12a's plan (§52), and 2026-11-04 for M12a's gaps closed (§53), and 2026-11-04 for M12a's whole-branch review (§54), and 2026-11-04 for M12a's exit (§55), and 2026-11-06 for M12b's gaps closed (§57), and 2026-11-06 for M12b's exit (§58).
 
 | Status | Count (v1 scope) | Notes |
 |---|---|---|
