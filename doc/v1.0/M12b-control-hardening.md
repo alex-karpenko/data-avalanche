@@ -352,7 +352,7 @@ The rulings this plan makes (roadmap D-IMPL-25):
 | D-M12b.1 | **Every node asks its seeds every 5 s**, `static` and `dns` alike, and announces only to the resolved addresses that aren't members of its view | A group with a peer never asked again, so groups formed apart stayed apart. An announce to a member is wasted, so members are left out; SWIM's push/pull merges the rest | Task 1 (`groups_that_each_have_a_peer_ask_their_seeds_again_and_merge`) |
 | D-M12b.2 | **A holder is judged by the answering node's gossip** (Q-M12b-3): `stale` when its node and incarnation aren't a member (gone, or an earlier process), `suspect` when SWIM suspects it; a released lease is neither. `Member` carries the incarnation | Membership is what each node has without asking another, and no clock is compared. A restarted node is a new incarnation: its old lease reads stale until taken over | Task 2 (`a_holder_that_isnt_a_member_reads_as_stale`, `a_suspected_member_holds_its_lease_as_suspect`) |
 | D-M12b.3 | **A removal is a tombstone in `globals.state`**, written by the adopting node before it applies the generation (a failed write refuses the adoption, retried at the next poll); `record` keeps one under way and replaces a done one. The tearing-down controller marks it done; tombstones are never deleted | Every node sees `globals.state`; a tombstone outlives the node that saw the removal. Marked, not deleted: one per id ever removed, and a record of what went | Task 3 (`a_removal_is_recorded_with_the_generation_that_last_had_it`) |
-| D-M12b.4 | **A removal no controller saw is torn down by the node the ring places its id on**, swept every 30 s (`SWEEP_INTERVAL`): it resolves the pipeline from the tombstone's generation text in its own environment, claims the lease once free (an expired one included), tears down per `auto_cleanup`, releases, marks done | The ring gives one candidate per id without coordination; the lease makes the teardown single-writer as any run is | Task 3 (`a_removal_no_node_removed_is_torn_down_where_the_ring_places_it`, `a_removal_held_by_a_gone_node_is_torn_down_once_its_lease_expires`, `a_removal_is_taken_up_only_where_the_ring_places_it`) |
+| D-M12b.4 | **A removal no controller saw is torn down by the node the ring places its id on**, swept every 30 s (`SWEEP_INTERVAL`): it resolves the pipeline from the tombstone's generation text in its own environment, claims the lease once free (an expired one included), tears down per `auto_cleanup`, releases, marks done. **Amended 2026-11-06 (final review, spec §12.3):** holding the lease, it first reads the current generation: a removal it undoes (the same `id` on the same slot or publication) is marked done without a teardown, and one that can't be read or loaded here tears nothing down | The ring gives one candidate per id without coordination; the lease makes the teardown single-writer as any run is | Task 3 (`a_removal_no_node_removed_is_torn_down_where_the_ring_places_it`, `a_removal_held_by_a_gone_node_is_torn_down_once_its_lease_expires`, `a_removal_is_taken_up_only_where_the_ring_places_it`) |
 | D-M12b.5 | **A controller waits for the removals it follows before its first claim**: every pending tombstone of its id, or of a pipeline it `shares` a slot, publication, sink or state location with. An unreadable tombstone list is waited for; a tombstone that doesn't resolve is logged and not waited for. The reconciler's same-reload `Following` is removed | The wait must hold on every node and across reloads and starts; only the tombstone is visible everywhere. A tombstone no node can resolve can't be torn down here either, so waiting on it would hold the pipeline for good | Task 4 (`a_pipeline_waits_until_its_own_id_s_removal_is_done`, `a_removal_that_doesnt_resolve_or_share_isnt_waited_for`, `a_pipeline_added_after_the_removal_it_follows_waits_for_it`, `a_node_started_during_a_removal_waits_for_it`, `a_follower_removed_while_it_waits_ends`) |
 | D-M12b.6 | **`?restart=accept` publishes restart-only changes; the node keeps what it started with** (Q-M12b-2). The coordinator lists the fields that differ from its start (`restart_pending`, per node); `FIXED_FIELDS` are refused even with it. Any other query on the reload is `400` | A running node can't rebind its ports or change its anchor; the next start reads the generation whole. The fixed fields locate or define the cluster itself | Task 5 (`a_restart_field_is_published_when_accepted_and_pending_until_the_next_start`, `a_generation_with_a_restart_field_is_adopted_with_it_pending`, `only_the_cluster_s_own_fields_are_fixed`) |
 | D-M12b.7 | **A job's truncate is a snapshot change set with `truncate` and no rows**, committed per started table of a truncating job before the start records the table running | One commit path: fenced, retried and counted as any commit. Its order makes a crash before the record truncate again, and a crash after resume without truncating | Task 6 (`a_truncating_job_drops_the_rows_deleted_meanwhile`, `a_job_s_truncate_empties_the_table_and_keeps_the_marker`) |
@@ -10246,3 +10246,31 @@ git commit -m "docs: the M12b changes — removing a pipeline, keys applied at t
   DA-OBS-8 rows name their review fixes' tests; §57 lists the deviations above and the audit's
   two later advisories. `cargo xtask docs` leaves the references unchanged, the site builds with
   its link validation, and xtask's tests pass.
+
+- **Final review** (`1445218`, `ee4a113`, `d5d58ba`, `2fa9ba2`, `599b640`, `a663927`, `4b3fa91`,
+  `8375cab`; approved by Oleksii 2026-11-06). One Critical: any node adopting a generation that
+  drops `p` records its tombstone, but the owner removes `p` only if its own diff says so, and a
+  node can skip generations. So a removal reverted before the owner adopted it left the tombstone
+  pending for good, and at the next hand-off or failover the orphan's claim took the lease and
+  tore down the live pipeline's slot and publication. Spec §12.3 gains the rule (approved
+  sentence, `ee4a113`), and D-M12b.4 is amended: holding the lease, the orphan re-reads the
+  tombstone, then reads the current generation (`RemovedPipelines::configured`,
+  `CurrentPipeline`). A removal it undoes is marked done without a teardown, an unread or invalid
+  one tears nothing down, and a removal of an id really gone is torn down as before. The done is
+  written only if the tombstone is unchanged since the orphan read it. A `record` that kept the
+  pending tombstone wrote back identical bytes, which keeps the ETag on S3 (measured on RustFS;
+  Azurite changes it), so `RemovalDoc` gains `records` (serde default 0, raised by every
+  `record`). Tests in `cluster_tests.rs` (hand-off, failover), `controller.rs` (undone, gone,
+  unread or invalid, the race), `coordinator.rs` (the resolver) and `state/tests/removals.rs`
+  (RustFS and Azurite). Fixed with it:
+  - the owner marks the tombstone done before it gives the lease back (one teardown when an
+    owner and an orphan of the id share a node);
+  - `adopt` again refuses a generation that changes a `FIXED_FIELDS` path;
+  - an orphan's controller gets its own `Metrics`, so it no longer forgets the node's series of
+    its pipeline;
+  - `RateLimit::new` clamps the refill to at least 1 a second (0 panicked);
+  - a copy's halt stays out of `status.halted` after a session reopen;
+  - a copy halted earlier in the run isn't read again after a reconnect (`a663927`, a gap from
+    M9b the review found);
+  - the docs on a tombstone no node resolves, with the escape; the trace headers' variables;
+    the tracker's pointers; the audit file's lift condition.
