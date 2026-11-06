@@ -708,6 +708,45 @@ reads on a connection of its own (DA-SNAP-12). The test waits for the snapshot t
 checks the stall (`131f9eb`, test only; the plan's deviations record it). The rows §57 closed
 stand as written; no count changes. Next: M12d, the source and sink gaps of §54.1 (Q-M12-8).
 
+## 59. M12d source and sink follow-ups — the plan (2026-11-06)
+
+`doc/v1.0/M12d-source-sink-followups.md` is M12d's plan: nine tasks for the gaps below, and five
+spec patches (config §9.2.1, §10, §13 V-127; Schema_Change §7.2; Data-Flow Phases 2a, 2b and 4),
+drafted in the plan for approval. The rulings are Q-M12d-1…5 and D-M12d.1…11.
+
+The planning measured:
+- **delta-rs folds column names with Unicode lower-casing** (`buoyant_kernel` 0.28.1
+  `StructType::try_new`): `ÄRGER` beside `ärger` is refused. DA-SINK-12 is wider than §54.1 said:
+  a PostgreSQL table with both `note` and `"Note"` loops at create too.
+- **MySQL 8.4 and MariaDB 11.8** answer 1142 to `SELECT 1 … LIMIT 0` for a dropped table and an
+  ungranted one alike when the user has no database-level privilege. 1146 needs a privilege on the
+  database, so DA-SRC-36 can say "dropped, or `SELECT` lost" but not which.
+- **PostgreSQL 18, via-root:** `pg_publication_tables` lists only the root, even for a leaf the
+  publication names; `pg_publication_rel` lists both. The repair needs to copy only those leaves
+  (DA-SNAP-22).
+- **PostgreSQL 18 slot synchronization** (a new `postgres-sync-*` pair in test-infra):
+  - a failover slot's first copy waits until its `catalog_xmin` passes the standby's;
+  - a promoted standby's slot is `failover`, `synced` and streaming, at the primary's
+    `confirmed_flush`;
+  - the sync worker never takes a slot past the standby's WAL, so a synced position is at or
+    before the switch point. DA-SRC-33 needs no `TIMELINE_HISTORY` (Q-M12d-5).
+
+**What M12d takes** (each closed with a pointer at its exit):
+
+| ID | Task |
+|---|---|
+| DA-SINK-12 | 1: `differ_by_case_alone` (Unicode), refused at create (`SINK_REJECTED`) and evolve (`EVOLUTION_UNSUPPORTED`) |
+| DA-SRC-35 | 2: MySQL column keys matched without case; V-127 for a key naming no column (both sources) |
+| DA-SRC-25 | 3: `column_names_fold`; MySQL's `keep_names` through the diff's matching; a case-only change `NoTargetEffect` (Q-M12d-3) |
+| DA-SRC-36 | 4: the 1142/1146 probe on the rescan paths; `TABLE_DROPPED` kept, a status warning beside it (Q-M12d-4) |
+| DA-SNAP-22 | 5: any first-tracked sink table baselined; a non-null sink column the source lacks halts; the via-root repair adds only the leaves it hid |
+| DA-SRC-32 | 6: `Sink::held_tables`, the recorded key; every held table repositioned; a refused reposition halts `SINK_REJECTED` |
+| DA-SRC-34 | 7: three `SourceChanged` runs in a row without a durable checkpoint halt the pipeline |
+| DA-SRC-33 | 8: managed failover slots on 17+; `prepare_marked` with the lake's highest marker; a promotion the slot followed continues (Q-M12d-2, Q-M12d-5) |
+| DA-SRC-31 | ⏭ v2 (Q-M12d-1): logical decoding on a standby; the source reads a primary in v1 |
+
+Not taken: DA-OPS-14 (M12c's load runs). No count changes.
+
 ---
 
 ### Counts (by status)
@@ -719,7 +758,7 @@ stand as written; no count changes. Next: M12d, the source and sink gaps of §54
 > M7a's plan (§32), 2026-10-16 for M7a's exit (§33), 2026-10-17 for M7b's plan (§34),
 > 2026-10-20 for M7b's exit (§35), 2026-10-21 for M8a's plan (§36), 2026-10-22 for M8a's exit (§37),
 > 2026-10-22 for M8b's plan (§38), 2026-10-23 for M8b's exit (§39), 2026-10-23 for M9a's plan
-> (§40), 2026-10-23 for M9a's exit (§41), 2026-10-27 for M9b's plan (§42), 2026-10-28 for M9b's exit (§43), 2026-10-28 for M10's plan (§44), and 2026-10-29 for M10's exit (§45), and 2026-10-29 for M11a's plan (§46), and 2026-10-29 for M11a's whole-branch review (§47), and 2026-10-29 for M11a's exit (§48), and 2026-10-29 for M11b's plan (§49), and 2026-10-30 for M11b's pages (§50), and 2026-10-30 for M11b's exit and v0.1.0 (§51), and 2026-10-30 for M12a's plan (§52), and 2026-11-04 for M12a's gaps closed (§53), and 2026-11-04 for M12a's whole-branch review (§54), and 2026-11-04 for M12a's exit (§55), and 2026-11-06 for M12b's gaps closed (§57), and 2026-11-06 for M12b's exit (§58).
+> (§40), 2026-10-23 for M9a's exit (§41), 2026-10-27 for M9b's plan (§42), 2026-10-28 for M9b's exit (§43), 2026-10-28 for M10's plan (§44), and 2026-10-29 for M10's exit (§45), and 2026-10-29 for M11a's plan (§46), and 2026-10-29 for M11a's whole-branch review (§47), and 2026-10-29 for M11a's exit (§48), and 2026-10-29 for M11b's plan (§49), and 2026-10-30 for M11b's pages (§50), and 2026-10-30 for M11b's exit and v0.1.0 (§51), and 2026-10-30 for M12a's plan (§52), and 2026-11-04 for M12a's gaps closed (§53), and 2026-11-04 for M12a's whole-branch review (§54), and 2026-11-04 for M12a's exit (§55), and 2026-11-06 for M12b's gaps closed (§57), and 2026-11-06 for M12b's exit (§58), and 2026-11-06 for M12d's plan (§59).
 
 | Status | Count (v1 scope) | Notes |
 |---|---|---|
