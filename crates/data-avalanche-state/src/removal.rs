@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use data_avalanche_storage::escape_segment;
 use serde::{Deserialize, Serialize};
 
-use crate::doc::{DocStore, Document, StateError};
+use crate::doc::{DocStore, Document, StateError, Versioned};
 
 pub const REMOVALS_PREFIX: &str = "removals";
 
@@ -30,6 +30,13 @@ pub struct RemovalDoc {
     pub removed_at: DateTime<Utc>,
     /// Set once the source's resources are torn down (`auto_cleanup`) and the lease let go.
     pub done_at: Option<DateTime<Utc>>,
+    /// How many times the removal was recorded: every [`Removals::record`] raises it, one that
+    /// keeps a removal under way too, so that every record changes the document's bytes, and so
+    /// its version on every backend (S3's ETag is the body's MD5). A conditional write against a
+    /// version read before ([`Removals::done_if`]) then loses to any record since. Absent in a
+    /// document written before it: 0.
+    #[serde(default)]
+    pub records: u64,
 }
 
 impl Document for RemovalDoc {
@@ -57,7 +64,7 @@ impl Removals {
 
     /// Records `doc`'s removal. One under way is kept, whoever recorded it first (every node
     /// records the same generation's); a done one is replaced: the id was added again, then
-    /// removed again.
+    /// removed again. Either way the record's [`RemovalDoc::records`] goes up by one.
     ///
     /// # Errors
     /// A storage or decode failure.
@@ -65,10 +72,12 @@ impl Removals {
         let key = removal_key(&doc.pipeline_id);
         self.docs
             .modify::<RemovalDoc, _>(&key, |current| {
-                Ok(match current {
+                let records = current.as_ref().map_or(0, |c| c.records).saturating_add(1);
+                let kept = match current {
                     Some(c) if !c.is_done() => c,
                     _ => doc.clone(),
-                })
+                };
+                Ok(RemovalDoc { records, ..kept })
             })
             .await?;
         Ok(())
@@ -85,6 +94,22 @@ impl Removals {
             .await?
             .map(|v| v.doc)
             .filter(|d| !d.is_done()))
+    }
+
+    /// The removal of `pipeline_id` under way, if any, with its version: [`Self::done_if`]
+    /// marks it done only if nothing recorded it since.
+    ///
+    /// # Errors
+    /// A storage or decode failure.
+    pub async fn pending_versioned(
+        &self,
+        pipeline_id: &str,
+    ) -> Result<Option<Versioned<RemovalDoc>>, StateError> {
+        Ok(self
+            .docs
+            .load::<RemovalDoc>(&removal_key(pipeline_id))
+            .await?
+            .filter(|v| !v.doc.is_done()))
     }
 
     /// Every removal under way. A tombstone that doesn't decode is logged and skipped: it can't
@@ -129,6 +154,32 @@ impl Removals {
             .await?;
         Ok(())
     }
+
+    /// Marks `read`, a removal under way as [`Self::pending_versioned`] read it, done at `now`,
+    /// in one write conditional on its version: false, nothing written, when the record changed
+    /// since (a node recorded the removal again). Not retried.
+    ///
+    /// # Errors
+    /// A storage failure other than the lost condition, the outcome unknown included.
+    pub async fn done_if(
+        &self,
+        read: &Versioned<RemovalDoc>,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StateError> {
+        let doc = RemovalDoc {
+            done_at: Some(now),
+            ..read.doc.clone()
+        };
+        match self
+            .docs
+            .update(&removal_key(&doc.pipeline_id), &read.version, &doc)
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(e) if e.is_conflict() => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -157,7 +208,13 @@ mod tests {
             hash: format!("blake3:{generation}"),
             removed_at: t(0),
             done_at: None,
+            records: 0,
         }
+    }
+
+    /// `doc` as the `n`th record left it.
+    fn recorded(doc: RemovalDoc, n: u64) -> RemovalDoc {
+        RemovalDoc { records: n, ..doc }
     }
 
     #[test]
@@ -173,13 +230,19 @@ mod tests {
         let r = removals();
         r.record(&removed("p", 3)).await.unwrap();
         r.record(&removed("p", 4)).await.unwrap();
-        assert_eq!(r.pending("p").await.unwrap(), Some(removed("p", 3)));
+        assert_eq!(
+            r.pending("p").await.unwrap(),
+            Some(recorded(removed("p", 3), 2))
+        );
         r.done("p", t(5)).await.unwrap();
         r.done("p", t(9)).await.unwrap();
         assert_eq!(r.pending("p").await.unwrap(), None);
         assert!(r.all_pending().await.unwrap().is_empty());
         r.record(&removed("p", 7)).await.unwrap();
-        assert_eq!(r.pending("p").await.unwrap(), Some(removed("p", 7)));
+        assert_eq!(
+            r.pending("p").await.unwrap(),
+            Some(recorded(removed("p", 7), 3))
+        );
         r.done("nope", t(5)).await.unwrap();
     }
 
@@ -194,6 +257,58 @@ mod tests {
             .put("removals/bad.json", bytes::Bytes::from_static(b"{"))
             .await
             .unwrap();
-        assert_eq!(r.all_pending().await.unwrap(), [removed("p", 3)]);
+        assert_eq!(
+            r.all_pending().await.unwrap(),
+            [recorded(removed("p", 3), 1)]
+        );
+    }
+
+    /// A record of a removal under way keeps it, and still changes its bytes: its counter goes
+    /// up, so the record's version moves on every backend.
+    #[tokio::test]
+    async fn a_record_that_keeps_a_removal_still_changes_its_bytes() {
+        let r = removals();
+        let key = removal_key("p");
+        r.record(&removed("p", 3)).await.unwrap();
+        let (first, _) = r.docs.store().get(&key).await.unwrap().unwrap();
+        r.record(&removed("p", 4)).await.unwrap();
+        let (second, _) = r.docs.store().get(&key).await.unwrap().unwrap();
+        assert_ne!(first, second);
+        let kept = r.pending("p").await.unwrap().unwrap();
+        assert_eq!(kept, recorded(removed("p", 3), 2));
+    }
+
+    /// A document written before the counter reads as recorded 0 times.
+    #[tokio::test]
+    async fn a_record_without_its_counter_reads_as_zero() {
+        let r = removals();
+        let old = br#"{
+  "version": 1,
+  "pipeline_id": "p",
+  "generation": 3,
+  "hash": "blake3:3",
+  "removed_at": "2026-11-04T10:00:00Z",
+  "done_at": null
+}"#;
+        r.docs
+            .store()
+            .put(&removal_key("p"), bytes::Bytes::from_static(old))
+            .await
+            .unwrap();
+        assert_eq!(r.pending("p").await.unwrap(), Some(removed("p", 3)));
+    }
+
+    /// The conditional done lands against the version read, and loses to a record since.
+    #[tokio::test]
+    async fn a_conditional_done_loses_to_a_record_since_its_read() {
+        let r = removals();
+        r.record(&removed("p", 3)).await.unwrap();
+        let read = r.pending_versioned("p").await.unwrap().unwrap();
+        r.record(&removed("p", 4)).await.unwrap();
+        assert!(!r.done_if(&read, t(5)).await.unwrap());
+        assert!(r.pending("p").await.unwrap().is_some(), "still under way");
+        let read = r.pending_versioned("p").await.unwrap().unwrap();
+        assert!(r.done_if(&read, t(6)).await.unwrap());
+        assert_eq!(r.pending("p").await.unwrap(), None);
     }
 }

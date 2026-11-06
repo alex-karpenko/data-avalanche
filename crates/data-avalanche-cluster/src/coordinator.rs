@@ -447,6 +447,7 @@ impl Inner {
                     hash: running.generation.doc.hash.clone(),
                     removed_at: Utc::now(),
                     done_at: None,
+                    records: 0,
                 };
                 if let Err(e) = d.removals.record(&tombstone).await {
                     return refused(running, format!("the removal of {id} isn't recorded: {e}"));

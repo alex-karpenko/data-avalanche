@@ -245,6 +245,7 @@ pub(crate) fn tombstone(id: &str) -> data_avalanche_state::RemovalDoc {
         hash: "blake3:00".into(),
         removed_at: Utc::now(),
         done_at: None,
+        records: 0,
     }
 }
 

@@ -274,6 +274,7 @@ async fn undone_removal(c: &TestCluster, id: &str) {
             hash: first.doc.hash,
             removed_at: chrono::Utc::now(),
             done_at: None,
+            records: 0,
         })
         .await
         .unwrap();
