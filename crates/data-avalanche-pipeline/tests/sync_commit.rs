@@ -87,16 +87,35 @@ async fn a_stalled_synchronous_commit_survives_the_chunk_that_missed_it() {
         if !waiting {
             return Err("no writer waiting for the standby".into());
         }
-        let rows_done = run.handle.status.borrow().snapshots[&t].rows_done;
+        // The held commit stalls the reads: the snapshot stops once the chunk after the held one
+        // is read and waits for room. A read still running when the writer first waits ends
+        // during the first sample's window, so the stop is waited for, not assumed (one chunk on
+        // its own connection may take longer than the stall's set-up under load). Then it reads
+        // nothing more while the commit is held.
+        let rows_done = || run.handle.status.borrow().snapshots[&t].rows_done;
+        let mut stalled = None;
+        let mut seen = vec![];
+        for _ in 0..20 {
+            let before = rows_done();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let after = rows_done();
+            seen.push(after);
+            if after == before {
+                stalled = Some(after);
+                break;
+            }
+        }
+        let Some(stalled) = stalled else {
+            return Err(format!("the snapshot read on while the commit was held: {seen:?}").into());
+        };
         assert!(
-            rows_done < 4990,
-            "the snapshot read past the stalled row: {rows_done}"
+            stalled < 4990,
+            "the snapshot read past the stalled row: {stalled}"
         );
-        // The held commit stalls the reads: the snapshot reads nothing more meanwhile.
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let later = run.handle.status.borrow().snapshots[&t].rows_done;
         assert_eq!(
-            later, rows_done,
+            rows_done(),
+            stalled,
             "the snapshot read on while the commit was held"
         );
         lake.sink.release_commits();

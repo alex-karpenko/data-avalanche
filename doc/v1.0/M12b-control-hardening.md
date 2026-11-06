@@ -10274,3 +10274,11 @@ git commit -m "docs: the M12b changes — removing a pipeline, keys applied at t
     M9b the review found);
   - the docs on a tombstone no node resolves, with the escape; the trace headers' variables;
     the tracker's pointers; the audit file's lift condition.
+- **The PR's CI** (`integration`): `sync_commit`'s
+  `a_stalled_synchronous_commit_survives_the_chunk_that_missed_it` failed with `left: 20, right:
+  10` (and once in the final review's full IT run). With the first chunk's commit held, the
+  snapshot reads one more chunk and then waits for room. The test sampled `rows_done` once the
+  stalled writer appeared, and a chunk read still running then (on its own connection since Task
+  9) ended in the 300 ms window. The test now waits until two samples 300 ms apart agree, within
+  6 s, then checks that the snapshot stays there while the commit is held, far from the stalled
+  row. A snapshot that never stops still fails it. Test-only; no code changes.
