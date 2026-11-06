@@ -19,11 +19,12 @@ pub struct RateLimit {
 }
 
 impl RateLimit {
-    /// Full: `burst` takes succeed at once.
+    /// Full: `burst` takes succeed at once. `per_second` is at least 1: a bucket that never
+    /// refills would have no wait to answer with.
     pub fn new(burst: u32, per_second: u32) -> Self {
         Self {
             burst: f64::from(burst),
-            per_second: f64::from(per_second),
+            per_second: f64::from(per_second.max(1)),
             state: Mutex::new((f64::from(burst), Instant::now())),
         }
     }
@@ -55,6 +56,16 @@ impl RateLimit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rate of 0 is taken as 1 a second: the wait is a second, not a panic.
+    #[test]
+    fn a_rate_of_zero_refills_once_a_second() {
+        let limit = RateLimit::new(1, 0);
+        let t0 = Instant::now();
+        limit.take(t0).unwrap();
+        assert_eq!(limit.take(t0).unwrap_err(), Duration::from_secs(1));
+        limit.take(t0 + Duration::from_secs(1)).unwrap();
+    }
 
     #[test]
     fn the_burst_is_taken_at_once_then_the_rate_applies() {
