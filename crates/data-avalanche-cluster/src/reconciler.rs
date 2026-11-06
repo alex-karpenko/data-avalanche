@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use data_avalanche_config::{Cluster, Pipeline, StateLocation};
 use data_avalanche_state::{Holder, PipelineDocs, RemovalDoc, StateError};
 use data_avalanche_storage::{Location, colocated_state, explicit_state, join};
+use data_avalanche_telemetry::Metrics;
 use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior};
@@ -306,8 +307,16 @@ impl ClusterReconciler {
 /// removal is done: an `id` changed, delete then recreate (config §9.1). The same PostgreSQL
 /// slot or publication on the same server, the same sink location, or the same state location.
 pub(crate) fn shares(removed: &Pipeline, added: &Pipeline) -> bool {
-    let (a, b) = (&removed.source, &added.source);
-    let slot = match (&a.postgres, &b.postgres) {
+    let sink = removed.sink.bucket == added.sink.bucket
+        && join(&[&removed.sink.prefix]) == join(&[&added.sink.prefix]);
+    same_slot(removed, added) || sink || state_location(removed) == state_location(added)
+}
+
+/// True when both are PostgreSQL pipelines on the same server with the same slot or the same
+/// publication.
+pub(crate) fn same_slot(a: &Pipeline, b: &Pipeline) -> bool {
+    let (a, b) = (&a.source, &b.source);
+    match (&a.postgres, &b.postgres) {
         (Some(x), Some(y)) => {
             a.host == b.host
                 && a.port == b.port
@@ -315,10 +324,7 @@ pub(crate) fn shares(removed: &Pipeline, added: &Pipeline) -> bool {
                 && (x.slot == y.slot || x.publication == y.publication)
         }
         _ => false,
-    };
-    let sink = removed.sink.bucket == added.sink.bucket
-        && join(&[&removed.sink.prefix]) == join(&[&added.sink.prefix]);
-    slot || sink || state_location(removed) == state_location(added)
+    }
 }
 
 /// Where a pipeline's state lives (config §10): co-located state is under its sink's prefix.
@@ -482,8 +488,14 @@ impl Loop {
 /// A removal no node removed, taken up by the node the ring places its id on: its pipeline
 /// resolved from the generation its tombstone names, then removed under its lease
 /// ([`PipelineController::remove_orphan`]). One that doesn't resolve here waits for the next
-/// sweep.
+/// sweep. Its series go to a registry nothing exports: they would carry the labels of a
+/// controller of the pipeline on this node (one that follows the removal), and the removal's
+/// `forget` would drop that one's.
 async fn orphan(doc: RemovalDoc, deps: ControllerDeps) {
+    let deps = ControllerDeps {
+        metrics: Metrics::new(),
+        ..deps
+    };
     let (id, generation) = (doc.pipeline_id.clone(), doc.generation);
     match deps.removed.resolve(doc).await {
         Ok((pipeline, docs)) => {
@@ -687,6 +699,40 @@ mod tests {
         tokio::time::sleep(SWEEP_INTERVAL * 2).await;
         assert_eq!(fs["p"].source.teardowns(), 1, "once");
         assert!(r.pending("unresolvable").await.unwrap().is_some());
+    }
+
+    /// An orphan's series go to a registry nothing exports: those of a controller of the same
+    /// pipeline on this node (the same labels), its renew failures included, outlive the
+    /// removal's `forget`.
+    #[tokio::test(start_paused = true)]
+    async fn an_orphan_leaves_the_nodes_series_of_its_pipeline_alone() {
+        use data_avalanche_telemetry::{PipelineLabels, RenewFailure};
+        let store = ScriptedStore::new();
+        let (fs, d) = factories(&store, &["p"]);
+        let follower = d.metrics.pipeline(
+            PipelineLabels {
+                pipeline: "p".into(),
+                source_host: "127.0.0.1".into(),
+                source_db: "avalanche".into(),
+                sink_type: "delta".into(),
+            },
+            false,
+        );
+        follower.renew_failed(RenewFailure::Transient);
+        let series = |text: &str| {
+            text.lines().any(|l| {
+                l.starts_with("data_avalanche_lease_renew_failures_total{")
+                    && l.contains("pipeline=\"p\"")
+                    && l.ends_with(" 1")
+            })
+        };
+        assert!(series(&d.metrics.encode()), "{}", d.metrics.encode());
+        removals(&store).record(&tombstone("p")).await.unwrap();
+        let (_, view) = watch::channel(alone("n1"));
+        let _r = ClusterReconciler::start(vec![], &d, view, reconciler_settings());
+        eventually("p is torn down", || fs["p"].source.teardowns() == 1).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(series(&d.metrics.encode()), "{}", d.metrics.encode());
     }
 
     /// A removal whose lease a gone node holds (its owner crashed, or its drain was cut off)

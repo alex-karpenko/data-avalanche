@@ -23,8 +23,9 @@ pub mod wire;
 
 pub use claim::{Claim, Claimed, release};
 pub use controller::{
-    Actual, ControllerDeps, ControllerSettings, ControllerStatus, Parts, PipelineController,
-    RemovedPipelines, ResolveError, Resolved, Target, Update, WorkerFactory,
+    Actual, Configured, ControllerDeps, ControllerSettings, ControllerStatus, CurrentPipeline,
+    Parts, PipelineController, RemovedPipelines, ResolveError, Resolved, Target, Update,
+    WorkerFactory,
 };
 pub use coordinator::{
     Checked, ConfigCoordinator, CoordinatorDeps, DocsFn, PUBLISH_ATTEMPTS, ReloadError, Reloaded,

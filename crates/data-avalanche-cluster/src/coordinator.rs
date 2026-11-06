@@ -26,8 +26,8 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use crate::{
-    Advertiser, Members, PipelineReload, Reload, Reloader, RemovedPipelines, ResolveError,
-    WorkerFactory,
+    Advertiser, Configured, CurrentPipeline, Members, PipelineReload, Reload, Reloader,
+    RemovedPipelines, ResolveError, Resolved, WorkerFactory,
 };
 
 /// A reload re-reads the generation and tries again this many times when another node publishes
@@ -421,6 +421,18 @@ impl Inner {
         let changes = diff(&running.config, &new, &|_, p| {
             sets.get(&p.id).copied().flatten()
         });
+        // A field no restart changes in a running cluster (where its state lives, the anchor's
+        // values) is never adopted: a reload refuses to publish one, so it came from elsewhere.
+        let fixed = changes.fixed();
+        if !fixed.is_empty() {
+            return refused(
+                running,
+                format!(
+                    "it changes {}, which no restart changes in a running cluster",
+                    fixed.join(", ")
+                ),
+            );
+        }
         let pipelines = match self.pipelines(&new, &changes) {
             Ok(pipelines) => pipelines,
             Err(why) => return refused(running, why),
@@ -508,14 +520,38 @@ impl Inner {
 }
 
 /// A removal tombstone's pipeline, from the text of the generation it names, loaded in `env`
-/// with the anchor's `key`, and its state documents (`docs`).
+/// with the anchor's `key`, and its state documents (`docs`); and an id's pipeline in the
+/// generation `globals.state` names now, loaded the same way.
 pub fn removed_pipelines(
     generations: ConfigGenerations,
     env: Arc<dyn Env + Send + Sync>,
     key: FingerprintKey,
     docs: Arc<DocsFn>,
 ) -> RemovedPipelines {
-    RemovedPipelines(Arc::new(move |doc: RemovalDoc| {
+    let configured = {
+        let (generations, env) = (generations.clone(), Arc::clone(&env));
+        Arc::new(move |id: String| {
+            let (generations, env) = (generations.clone(), Arc::clone(&env));
+            Box::pin(async move {
+                let g = generations
+                    .current()
+                    .await
+                    .map_err(|e| ResolveError::Unread(e.to_string()))?
+                    .ok_or_else(|| {
+                        ResolveError::Unread("no config generation is published".to_owned())
+                    })?;
+                let config = load_str(&g.text, &*env, &key)
+                    .map_err(|report| ResolveError::Invalid(lines(&report)))?
+                    .config;
+                Ok(CurrentPipeline {
+                    generation: g.pointer.doc.generation,
+                    hash: g.pointer.doc.hash,
+                    pipeline: config.pipelines.into_values().find(|p| p.id == id),
+                })
+            }) as Configured
+        })
+    };
+    let removed = Arc::new(move |doc: RemovalDoc| {
         let (generations, env, docs) = (generations.clone(), Arc::clone(&env), Arc::clone(&docs));
         Box::pin(async move {
             let text = generations
@@ -537,8 +573,12 @@ pub fn removed_pipelines(
                 })?;
             let d = docs(&pipeline).map_err(ResolveError::Invalid)?;
             Ok((pipeline, d))
-        })
-    }))
+        }) as Resolved
+    });
+    RemovedPipelines {
+        removed,
+        configured,
+    }
 }
 
 /// A report's errors, a line each, for the log.
@@ -961,6 +1001,51 @@ mod tests {
             panic!("a generation without the pipeline is invalid, not unread: {e:?}");
         };
         assert!(e.contains("has no pipeline nope"), "{e}");
+    }
+
+    /// An id's pipeline in the generation `globals.state` names now, as this node loads it:
+    /// configured, gone, or a generation that doesn't load here.
+    #[tokio::test(start_paused = true)]
+    async fn the_current_generation_resolves_an_id_here() {
+        let n = lone(&["p", "q"]).await;
+        let removed = removed_pipelines(
+            n.generations.clone(),
+            Arc::clone(&n.vars) as Arc<dyn Env + Send + Sync>,
+            FingerprintKey::from_bytes([1; 32]),
+            Arc::new(|_| Ok(pipeline_docs())),
+        );
+        let first = n.generations.current().await.unwrap().unwrap().pointer;
+        let c = removed.current("q").await.unwrap();
+        assert_eq!((c.generation, &c.hash), (1, &first.doc.hash));
+        assert_eq!(c.pipeline.expect("q is configured").id, "q");
+        assert_eq!(n.publish_elsewhere(&config_text(&["p"])).await, 2);
+        let c = removed.current("q").await.unwrap();
+        assert_eq!(c.generation, 2);
+        assert!(c.pipeline.is_none(), "q is gone");
+        let unset = config_text(&["p"]).replace("host: 127.0.0.1", "host: ${P_HOST}");
+        assert_eq!(n.publish_elsewhere(&unset).await, 3);
+        let e = removed.current("p").await.unwrap_err();
+        assert!(matches!(e, ResolveError::Invalid(_)), "{e:?}");
+    }
+
+    /// A generation that changes a field no restart changes in a running cluster (here, where
+    /// its state lives) is refused: nothing applied, the node keeps its config, and tries again
+    /// at the next poll.
+    #[tokio::test(start_paused = true)]
+    async fn a_generation_that_moves_the_state_is_refused() {
+        let mut n = lone(&["p"]).await;
+        let before = n.coordinator.config().await;
+        let moved = config_text(&["p", "q"]).replace(
+            "state: { bucket: app-state }",
+            "state: { bucket: elsewhere }",
+        );
+        assert_eq!(n.publish_elsewhere(&moved).await, 2);
+        tokio::time::sleep(POLL * 3).await;
+        assert_eq!(n.coordinator.applied(), 1);
+        assert!(n.reloads.try_recv().is_err(), "nothing applied");
+        assert_eq!(n.coordinator.inner.running.lock().await.failed, Some(2));
+        assert_eq!(n.coordinator.config().await, before);
+        assert!(n.coordinator.restart_pending().await.is_empty());
     }
 
     /// A member that gossips a newer generation brings it in at once, not at the next poll.
