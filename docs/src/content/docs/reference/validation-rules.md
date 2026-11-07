@@ -132,3 +132,4 @@ A config with any **error** is rejected whole: at startup the node refuses to st
 | <span id="v-124"></span>V-124 | warning | `source.ssl_mode = verify-ca, when source.type = mysql` | The host name is checked too, as with verify-full (DA-SRC-22). |
 | <span id="v-125"></span>V-125 | warning | `globals.api.jwt.jwks_url, globals.api.oauth2.jwks_url and discovery_url` | Not https: the issuer's keys could be swapped on the way (DA-API-16). |
 | <span id="v-126"></span>V-126 | error | `globals.tracing.headers` | Each name an HTTP token, each value visible ASCII, spaces and tabs (DA-OBS-7). |
+| <span id="v-127"></span>V-127 | warning | `tables.column_type_overrides keys` | The key's column names no column of its table (on MySQL compared without case, as MySQL compares column names): the override changes nothing (DA-SRC-35). (Emitted at schema resolution.) |

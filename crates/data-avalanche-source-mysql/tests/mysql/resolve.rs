@@ -153,6 +153,47 @@ async fn columns_plan_per_the_type_table() {
     cleanup(&n).await;
 }
 
+/// DA-SRC-35: MySQL compares column names without case, so an override or a `primary_key` entry
+/// spelled in another case applies, the schema keeps the catalog's spelling, and a key that names
+/// no column warns (V-127).
+#[tokio::test]
+async fn column_keys_name_columns_without_case() {
+    require_it!();
+    let (n, _a) = fresh(
+        "column_keys_case",
+        "CREATE TABLE t (Id INT NOT NULL, Amount DECIMAL(10,2), v TEXT, UNIQUE KEY (Id));",
+    )
+    .await;
+    let tables = "      column_type_overrides: { t.AMOUNT: string, t.gone: string }\n      primary_key: { t: [ID] }";
+    let r = connector(&pipeline(&n, &["t"], tables, ""))
+        .resolve_tables()
+        .await
+        .unwrap();
+    assert!(r.halted.is_empty() && r.skipped.is_empty(), "{r:?}");
+    let s = &r.tables[0];
+    assert_eq!(s.identifier(), ["Id"], "the catalog's spelling");
+    assert_eq!(
+        s.column("Amount").unwrap().value_type,
+        V::Text,
+        "the override applies"
+    );
+    assert_eq!(
+        r.warnings
+            .iter()
+            .filter(|w| w.starts_with("V-127") && w.contains("t.gone"))
+            .count(),
+        1,
+        "{:?}",
+        r.warnings
+    );
+    assert!(
+        !r.warnings.iter().any(|w| w.contains("t.AMOUNT")),
+        "{:?}",
+        r.warnings
+    );
+    cleanup(&n).await;
+}
+
 #[tokio::test]
 async fn overrides_charsets_wide_decimals_and_reserved_names() {
     require_it!();

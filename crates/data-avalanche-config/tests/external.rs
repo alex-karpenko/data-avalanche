@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use data_avalanche_config::{
     ClusterAnchor, LockBackend, PartitionField, PartitionTransform, RULES, ResolvedConfig,
-    RuleInput, check_cluster_anchor, check_partitioning, check_table_set, check_unbounded_numeric,
-    glob_match, load_str,
+    RuleInput, check_cluster_anchor, check_column_keys, check_partitioning, check_table_set,
+    check_unbounded_numeric, column_override, glob_match, load_str,
 };
 use data_avalanche_core::{ColumnSchema, ColumnValueType, TableRef, TableSchema};
 use support::{MINIMAL, env, fp_key};
@@ -151,6 +151,59 @@ fn unbounded_numeric_v079() {
     );
 }
 
+/// DA-SRC-35: an override's column part matches as written on PostgreSQL and without case on
+/// MySQL, as each compares column names; a key naming no column warns (V-127).
+#[test]
+fn column_keys_match_as_the_source_compares_names_v127() {
+    let pg = load(&MINIMAL.replace(
+        "include: [public.orders]",
+        "include: [public.orders]\n      column_type_overrides: { public.orders.Amount: string, public.orders.code: string }",
+    ));
+    let p = &pg.pipelines["orders"];
+    assert!(column_override(&p.tables, "public.orders", "code", false).is_some());
+    assert!(
+        column_override(&p.tables, "public.orders", "amount", false).is_none(),
+        "PostgreSQL names are case-sensitive"
+    );
+    let report = check_column_keys(p, "public.orders", &["amount", "code"]);
+    assert_eq!(rules(&report), ["V-127"]);
+    assert!(
+        report.warnings[0].message.contains("public.orders.Amount"),
+        "{report:#?}"
+    );
+    assert!(check_column_keys(p, "public.orders", &["Amount", "code"]).is_ok());
+    assert!(
+        check_column_keys(p, "public.other", &["id"]).is_ok(),
+        "another table's keys"
+    );
+
+    let my = load(
+        &MINIMAL
+            .replace("host: db.example.com", "type: mysql\n      host: db.example.com")
+            .replace(
+                "postgres: { publication: orders_pub, slot: orders_slot }",
+                "mysql: {}",
+            )
+            .replace(
+                "include: [public.orders]",
+                "include: [orders]\n      column_type_overrides: { orders.Amount: string, orders.gone: string }",
+            ),
+    );
+    let p = &my.pipelines["orders"];
+    assert!(
+        column_override(&p.tables, "orders", "amount", true).is_some(),
+        "MySQL names compare without case"
+    );
+    assert!(column_override(&p.tables, "orders", "AMOUNT", true).is_some());
+    assert!(column_override(&p.tables, "order", "s.amount", true).is_none());
+    let report = check_column_keys(p, "orders", &["id", "amount"]);
+    assert_eq!(rules(&report), ["V-127"]);
+    assert!(
+        report.warnings[0].message.contains("orders.gone"),
+        "{report:#?}"
+    );
+}
+
 #[test]
 fn globs_stay_inside_a_name() {
     assert!(glob_match("*", "orders"));
@@ -199,8 +252,8 @@ fn partition_columns_exist_and_temporal_transforms_name_dates() {
 /// Every rule that needs input besides the file has a test in this file or in `tests/diff.rs`.
 #[test]
 fn every_external_rule_is_covered() {
-    const COVERED: [&str; 7] = [
-        "V-034", "V-061", "V-062", "V-076", "V-079", "V-094", "V-113",
+    const COVERED: [&str; 8] = [
+        "V-034", "V-061", "V-062", "V-076", "V-079", "V-094", "V-113", "V-127",
     ];
     let external: Vec<&str> = RULES
         .iter()

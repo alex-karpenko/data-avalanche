@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use data_avalanche_config::{
-    Pipeline, Postgres, SlotOnOrphan, SourceChangeAction, SourceType, Tables, check_table_set,
-    check_unbounded_numeric,
+    Pipeline, Postgres, SlotOnOrphan, SourceChangeAction, SourceType, Tables, check_column_keys,
+    check_table_set, check_unbounded_numeric,
 };
 use data_avalanche_core::{
     ChangeStream, Checkpoint, Chunk, HaltReason, InFlightTxn, KeysetCursor, Preflight, Prepared,
@@ -229,6 +229,14 @@ impl PgConnector {
             .collect();
         let mut report = check_table_set(&self.pipeline, &resolved);
         report.extend(check_unbounded_numeric(&self.pipeline, &unconstrained));
+        for s in &out.tables {
+            let columns: Vec<&str> = s.columns().iter().map(|c| c.name.as_str()).collect();
+            report.extend(check_column_keys(
+                &self.pipeline,
+                &table_key(s.table()),
+                &columns,
+            ));
+        }
         // Every error, not the first (DA-SRC-17).
         if let Some(refusal) = report.refusal() {
             return Err(SourceError::Permanent(refusal));

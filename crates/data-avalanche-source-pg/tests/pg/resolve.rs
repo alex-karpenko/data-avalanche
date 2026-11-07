@@ -228,6 +228,26 @@ async fn unconstrained_numerics_under_error_warn_v079() {
         "{:?}",
         r.warnings
     );
+    // An override whose column part is spelled in another case names no column: PostgreSQL's
+    // names are case-sensitive, so it changes nothing and warns (V-127, DA-SRC-35).
+    let c = connector(&pipeline(
+        &n,
+        &["*"],
+        &format!(
+            "      column_type_overrides: {{ {s}.t.W: \"decimal(38,2)\", {s}.t.n: string }}",
+            s = n.schema
+        ),
+        "",
+    ));
+    let r = resolved(&c).await;
+    assert_eq!(r.tables[0].column("n").unwrap().value_type, V::Text);
+    let v127: Vec<&String> = r
+        .warnings
+        .iter()
+        .filter(|w| w.starts_with("V-127"))
+        .collect();
+    assert_eq!(v127.len(), 1, "{:?}", r.warnings);
+    assert!(v127[0].contains(".t.W"), "{v127:?}");
     cleanup(&a, &n).await;
 }
 

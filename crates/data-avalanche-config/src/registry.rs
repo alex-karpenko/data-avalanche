@@ -1060,6 +1060,14 @@ pub const RULES: &[RuleMeta] = &[
         r#"globals.tracing.headers"#,
         r#"Each name an HTTP token, each value visible ASCII, spaces and tabs (DA-OBS-7)."#,
     ),
+    rule(
+        "V-127",
+        Warning,
+        L::Pipeline,
+        SourceSchema,
+        r#"tables.column_type_overrides keys"#,
+        r#"The key's column names no column of its table (on MySQL compared without case, as MySQL compares column names): the override changes nothing (DA-SRC-35). (Emitted at schema resolution.)"#,
+    ),
 ];
 
 /// The registry entry for `id` (`"V-007"`).
@@ -1073,7 +1081,7 @@ mod tests {
 
     #[test]
     fn has_every_spec_rule_once_in_order() {
-        assert_eq!(RULES.len(), 120);
+        assert_eq!(RULES.len(), 121);
         assert!(
             RULES.windows(2).all(|w| w[0].id < w[1].id),
             "sorted, no duplicates"

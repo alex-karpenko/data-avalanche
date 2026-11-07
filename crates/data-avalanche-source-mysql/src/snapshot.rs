@@ -18,6 +18,7 @@
 //! window rule (Data-Flow, snapshot step c).
 
 use chrono::{Datelike, Timelike};
+use data_avalanche_config::column_override;
 use data_avalanche_core::{
     Chunk, ColumnValue, HaltReason, KeysetCursor, Row, SourceError, TableRef, TableSchema,
     identifier_values,
@@ -96,9 +97,7 @@ async fn read_plan(
                 },
             ));
         }
-        let over = tables
-            .column_type_overrides
-            .get(&format!("{key}.{}", col.name));
+        let over = column_override(tables, key, &col.name, true);
         let p = plan_column(
             catalog,
             c.tinyint1_as_bool(),

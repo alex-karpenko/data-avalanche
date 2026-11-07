@@ -5,7 +5,8 @@
 use std::collections::BTreeMap;
 
 use data_avalanche_config::{
-    Tables, Tinyint1Detection, check_partitioning, check_table_set, glob_match,
+    Tables, Tinyint1Detection, check_column_keys, check_partitioning, check_table_set,
+    column_override, glob_match,
 };
 use data_avalanche_core::{
     ColumnSchema, HaltReason, ResolvedTables, SourceError, TableRef, TableSchema,
@@ -136,25 +137,30 @@ pub struct Planned {
 /// A table's schema and plans, checked in this order (config §11.2): every column plans
 /// ([`plan_column`]: overrides, charsets, decimal caps); the identifier (the
 /// `tables.primary_key` entry, else the primary key) passes [`TableSchema::new`] (reserved names,
-/// a non-empty identifier of usable columns); `tables.partitioning` fits the columns.
+/// a non-empty identifier of usable columns); `tables.partitioning` fits the columns. An override
+/// or a `primary_key` entry names its column without case, as MySQL compares column names
+/// (DA-SRC-35); the schema keeps the catalog's spelling.
 pub fn plan_table(
     d: &Described,
     tables: &Tables,
     tinyint1_as_bool: bool,
 ) -> Result<Planned, HaltReason> {
     let key = table_key(&d.table);
-    let identifier = tables
-        .primary_key
-        .get(key)
-        .cloned()
-        .unwrap_or_else(|| d.primary_key.clone());
+    let catalog = |name: &String| {
+        d.columns
+            .iter()
+            .find(|c| c.name.to_lowercase() == name.to_lowercase())
+            .map_or_else(|| name.clone(), |c| c.name.clone())
+    };
+    let identifier: Vec<String> = match tables.primary_key.get(key) {
+        Some(entry) => entry.iter().map(catalog).collect(),
+        None => d.primary_key.clone(),
+    };
     let mut notes = Notes::default();
     let mut columns = Vec::with_capacity(d.columns.len());
     let mut plans = Vec::with_capacity(d.columns.len());
     for c in &d.columns {
-        let over = tables
-            .column_type_overrides
-            .get(&format!("{key}.{}", c.name));
+        let over = column_override(tables, key, &c.name, true);
         let p = plan_column(
             c,
             tinyint1_as_bool,
@@ -353,6 +359,14 @@ impl MySqlConnector {
             };
             match plan_table(&d, &self.pipeline.tables, self.tinyint1_as_bool()) {
                 Ok(p) => {
+                    let columns: Vec<&str> =
+                        p.schema.columns().iter().map(|c| c.name.as_str()).collect();
+                    let keys =
+                        check_column_keys(&self.pipeline, table_key(&listed.table), &columns);
+                    out.warnings.extend(
+                        keys.iter()
+                            .map(|w| format!("{} {}: {}", w.rule, w.path, w.message)),
+                    );
                     for (column, ty) in p.notes.read_as_text {
                         out.warnings.push(format!(
                             "{}.{column}: {ty} is wider than 38 digits and is read as text",
