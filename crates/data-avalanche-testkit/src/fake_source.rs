@@ -893,10 +893,16 @@ impl Db {
 }
 
 /// What `augment` and `rescan` compare: columns by name, with their types.
-fn shape(columns: &[ColumnSchema]) -> Vec<(String, data_avalanche_core::ColumnValueType)> {
+fn shape(
+    columns: &[ColumnSchema],
+    fold: bool,
+) -> Vec<(String, data_avalanche_core::ColumnValueType)> {
     columns
         .iter()
-        .map(|c| (c.name.clone(), c.value_type.clone()))
+        .map(|c| match fold {
+            true => (c.name.to_lowercase(), c.value_type.clone()),
+            false => (c.name.clone(), c.value_type.clone()),
+        })
         .collect()
 }
 
@@ -1152,7 +1158,7 @@ impl SourceConnector for FakeSource {
                     reason: HaltReason::TableDropped,
                 });
             };
-            if shape(now.columns()) != shape(table.columns()) {
+            if shape(now.columns(), false) != shape(table.columns(), false) {
                 return Err(SourceError::Transient(format!(
                     "{} changed under the snapshot",
                     table.table()
@@ -1224,7 +1230,7 @@ impl SourceConnector for FakeSource {
             pending: VecDeque::new(),
             known: tables
                 .iter()
-                .map(|t| (t.table().clone(), shape(t.columns())))
+                .map(|t| (t.table().clone(), shape(t.columns(), false)))
                 .collect(),
         }))
     }
@@ -1282,7 +1288,8 @@ impl SourceConnector for FakeSource {
                     report.dropped.push(k.table().clone())
                 }
                 None => report.dropped.push(k.table().clone()),
-                Some(now) if shape(now.columns()) != shape(k.columns()) => {
+                // Where names fold, a change of case alone is none (DA-SRC-25).
+                Some(now) if shape(now.columns(), db.fold) != shape(k.columns(), db.fold) => {
                     report.changed.push(now.clone())
                 }
                 Some(_) => {}
@@ -1344,7 +1351,7 @@ impl FakeStream {
                                 let Some(known) = self.known.get_mut(&event.table) else {
                                     continue;
                                 };
-                                let now = shape(columns);
+                                let now = shape(columns, false);
                                 if *known != now {
                                     *known = now;
                                     self.pending.push_back(StreamItem::SchemaSignal {

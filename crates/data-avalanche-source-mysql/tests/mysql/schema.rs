@@ -69,13 +69,18 @@ async fn a_change_of_case_alone_keeps_the_cached_name() {
     require_it!();
     let (n, mut a) = fresh(
         "schema_case",
-        "CREATE TABLE t (id INT PRIMARY KEY, note TEXT); INSERT INTO t VALUES (1, 'a');",
+        "CREATE TABLE t (id INT PRIMARY KEY, note TEXT); INSERT INTO t VALUES (1, 'a'), (2, 'b');",
     )
     .await;
     let c = connector(&pipeline(&n, &["t"], "", ""));
     let cached = c.resolve_tables().await.unwrap().tables.remove(0);
+    // The key column is recased too: the cursor and the identifier follow the cached spelling.
+    let key_sql = "ALTER TABLE t RENAME COLUMN id TO ID";
+    a.query_drop(key_sql).await.unwrap();
     let sql = "ALTER TABLE t RENAME COLUMN note TO Note";
     a.query_drop(sql).await.unwrap();
+    let (_, now) = c.augment(&cached, &ddl(key_sql)).await.unwrap();
+    assert_eq!(now.unwrap(), cached, "the key keeps its spelling");
     let (delta, now) = c.augment(&cached, &ddl(sql)).await.unwrap();
     assert!(
         matches!(delta.changes.as_slice(), [SchemaChange::NoTargetEffect(_)]),
@@ -85,8 +90,14 @@ async fn a_change_of_case_alone_keeps_the_cached_name() {
     assert_eq!(now.unwrap(), cached, "the cached spelling stays");
     let report = c.rescan(std::slice::from_ref(&cached)).await.unwrap();
     assert!(report.changed.is_empty(), "{report:?}");
-    let chunk = c.read_chunk(&cached, None, 10).await.unwrap();
-    assert_eq!(chunk.rows.len(), 1);
+    let names: Vec<&str> = cached.columns().iter().map(|c| c.name.as_str()).collect();
+    let first = c.read_chunk(&cached, None, 1).await.unwrap();
+    let second = c.read_chunk(&cached, first.next.as_ref(), 1).await.unwrap();
+    for row in first.rows.iter().chain(&second.rows) {
+        let got: Vec<&str> = row.0.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(got, names, "the rows carry the cached names");
+    }
+    assert_eq!((first.rows.len(), second.rows.len()), (1, 1));
     cleanup(&n).await;
 }
 

@@ -130,7 +130,12 @@ async fn read_plan(
             ));
         }
         out.push(ReadColumn {
-            catalog: catalog.clone(),
+            // Under the cached name, which the rows, the cursor and the identifier use; the
+            // SELECT still finds the column, as MySQL's names compare without case.
+            catalog: CatalogColumn {
+                name: col.name.clone(),
+                ..catalog.clone()
+            },
             decode: p.decode,
             identifier,
         });

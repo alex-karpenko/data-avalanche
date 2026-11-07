@@ -175,7 +175,19 @@ pub fn scope(
     for (i, c) in columns.iter_mut().enumerate() {
         c.source_ordinal = Some(i as i32 + 1);
     }
-    TableSchema::new(cached.table().clone(), columns, now.identifier().to_vec())
+    // The identifier is `now`'s, spelled as the schema's column spells it (a key column the
+    // statement doesn't name may be cased differently in the catalog, DA-SRC-25).
+    let identifier = now
+        .identifier()
+        .iter()
+        .map(|k| column_in(&columns, k).map_or_else(|| k.clone(), |c| c.name.clone()))
+        .collect();
+    TableSchema::new(cached.table().clone(), columns, identifier)
+}
+
+/// The column of `columns` named `name`, without case.
+fn column_in<'a>(columns: &'a [ColumnSchema], name: &str) -> Option<&'a ColumnSchema> {
+    columns.iter().find(|c| same(&c.name, name))
 }
 
 /// The ENUM or SET change between two column types of the same column, if both are one.

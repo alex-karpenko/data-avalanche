@@ -762,6 +762,14 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
                     evolved = true;
                 }
             }
+            // Only the case of a name differs (where names fold): the sink's column has the
+            // cached spelling, which stays (DA-SRC-25).
+            Some(c) if state.exists && baseline && c.columns() != now.columns() => {
+                schema = match now.source_id() {
+                    Some(id) => c.clone().with_source_id(id),
+                    None => c.clone(),
+                };
+            }
             Some(_) if cleared.contains(table) => {}
             Some(c) if matches!(plan, Plan::Resume) && !same_columns(c, now, fold) => {
                 drifted.insert(table.clone());
@@ -2097,6 +2105,35 @@ mod tests {
         assert!(state.schema.unwrap().field_with_name("note").is_ok());
         let cached = w.docs.table_schema(&t("a")).await.unwrap().unwrap().doc;
         assert!(cached.column("note").is_some());
+    }
+
+    /// DA-SRC-25: a baseline (a lost position) of a table whose catalog spelling changed case
+    /// alone, where names fold, caches the sink's spelling, not the catalog's.
+    #[tokio::test]
+    async fn a_baseline_of_a_case_only_change_caches_the_sink_spelling() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.source.fold_column_names();
+        w.source.alter(
+            &t("a"),
+            TableSchema::new(
+                t("a"),
+                vec![
+                    ColumnSchema::new("id", V::Int64, "bigint").not_null(),
+                    ColumnSchema::new("DOC", V::Text, "text"),
+                ],
+                vec!["id".into()],
+            )
+            .unwrap(),
+        );
+        w.source.lose_slot();
+        let (end, _) = run(&w, &mode("mode: never"), async |status| {
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        let cached = w.docs.table_schema(&t("a")).await.unwrap().unwrap().doc;
+        assert_eq!(cached.columns()[1].name, "doc", "the sink's spelling");
     }
 
     /// Runs a worker with `deps` until `drive` returns, then drains it.
