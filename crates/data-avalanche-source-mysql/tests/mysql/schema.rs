@@ -5,7 +5,7 @@ use data_avalanche_core::{ColumnValueType as V, SchemaChange, SchemaHint, TableR
 use data_avalanche_testkit::require_it;
 use mysql_async::prelude::Queryable;
 
-use crate::common::{cleanup, connector, fresh, pipeline};
+use crate::common::{cleanup, connector, fresh, pipeline, pipeline_as, user};
 
 fn ddl(sql: &str) -> SchemaHint {
     SchemaHint::Ddl(sql.into())
@@ -199,5 +199,56 @@ async fn the_rescan_reports_dropped_and_changed_tables() {
     assert_eq!(report.changed.len(), 1);
     assert_eq!(report.changed[0].table().name, "altered");
     assert!(report.halted.is_empty());
+    cleanup(&n).await;
+}
+
+/// DA-SRC-36: a table gone from `information_schema` halts `TABLE_DROPPED`. When the server
+/// refuses to read it (1142) instead of saying it doesn't exist (1146), the rescan says beside
+/// the halt that the pipeline's user may only have lost SELECT on it. A user with database-level
+/// privileges gets 1146 for a dropped table, and no such word.
+#[tokio::test]
+async fn a_table_the_user_can_no_longer_see_reads_as_dropped_with_a_warning() {
+    require_it!();
+    let (n, mut a) = fresh(
+        "schema_hidden",
+        "CREATE TABLE t (id INT PRIMARY KEY); CREATE TABLE gone (id INT PRIMARY KEY);",
+    )
+    .await;
+    let name = "it_schema_hidden";
+    user(
+        &mut a,
+        name,
+        "REPLICATION CLIENT, REPLICATION SLAVE ON *.*",
+        &[format!("GRANT SELECT ON {}.t TO '{name}'@'%'", n.db)],
+    )
+    .await;
+    let c = connector(&pipeline_as(
+        &n,
+        name,
+        "      ssl_mode: disable",
+        "",
+        &["t"],
+        "",
+    ));
+    let t = c.resolve_tables().await.unwrap().tables.remove(0);
+    a.query_drop(format!("REVOKE SELECT ON {}.t FROM '{name}'@'%'", n.db))
+        .await
+        .unwrap();
+    let report = c.rescan(std::slice::from_ref(&t)).await.unwrap();
+    assert_eq!(report.dropped, [t.table().clone()]);
+    assert!(
+        matches!(report.warnings.as_slice(), [w] if w.contains("1142") && w.contains("lost SELECT")),
+        "{report:?}"
+    );
+    // Dropped, read by a user the server tells the truth to (root).
+    let root = connector(&pipeline(&n, &["gone"], "", ""));
+    let gone = root.resolve_tables().await.unwrap().tables.remove(0);
+    a.query_drop("DROP TABLE gone").await.unwrap();
+    let report = root.rescan(std::slice::from_ref(&gone)).await.unwrap();
+    assert_eq!(report.dropped, [gone.table().clone()]);
+    assert!(report.warnings.is_empty(), "{report:?}");
+    a.query_drop(format!("DROP USER '{name}'@'%'"))
+        .await
+        .unwrap();
     cleanup(&n).await;
 }

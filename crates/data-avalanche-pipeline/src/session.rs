@@ -964,6 +964,10 @@ impl<'c> Session<'c> {
         // The tables' changes up to here are good: flush them before the halts drop what is
         // buffered.
         self.flush()?;
+        if !report.warnings.is_empty() {
+            self.core
+                .update(|st| report.warnings.iter().for_each(|w| st.warn(w.clone())));
+        }
         for table in report.dropped {
             if self.schemas.contains_key(&table) {
                 self.halt(table, HaltReason::TableDropped)?;

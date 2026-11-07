@@ -345,6 +345,9 @@ pub struct RetainedLog {
 pub struct RescanReport {
     /// Tables gone from the source catalog: each halts with `TABLE_DROPPED`.
     pub dropped: Vec<TableRef>,
+    /// What the status should say beside the halts: a dropped table that may only be hidden
+    /// from the pipeline's user (MySQL, DA-SRC-36).
+    pub warnings: Vec<String>,
     /// Tables whose catalog schema differs from the known one: the current schemas. The stream's
     /// signals apply changes in order; the pipeline applies one of these only once the stream has
     /// passed the position after the rescan and no signal did it (an idle table).

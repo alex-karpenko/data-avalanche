@@ -537,6 +537,7 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
         match source.rescan(&gone).await {
             Ok(report) => {
                 core.gone_failing.succeeded();
+                warnings.extend(report.warnings);
                 halts.extend(
                     report
                         .dropped

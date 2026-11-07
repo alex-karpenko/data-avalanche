@@ -14,7 +14,23 @@ use data_avalanche_core::{
 use mysql_async::prelude::Queryable;
 
 use crate::connector::MySqlConnector;
+use crate::snapshot::ident;
 use crate::types::{CatalogColumn, ColumnPlan, plan_column};
+
+/// `ER_TABLEACCESS_DENIED_ERROR`, and `ER_NO_SUCH_TABLE`.
+const DENIED: u16 = 1142;
+const NO_SUCH_TABLE: u16 = 1146;
+
+/// The status's word beside a `TABLE_DROPPED` halt of a table the server hides rather than
+/// denies exists ([`MySqlConnector::hidden`], DA-SRC-36).
+pub(crate) fn hidden_note(table: &TableRef) -> String {
+    format!(
+        "table {table}: it is gone from information_schema and the server refuses to read it \
+         (1142): it was dropped, or the pipeline's user lost SELECT on it, and the server hides \
+         which. It halts TABLE_DROPPED; if it still exists, grant SELECT on it again and \
+         re-snapshot it with a snapshot job"
+    )
+}
 
 /// A table the globs can select: `BASE TABLE`, or MariaDB's `SYSTEM VERSIONED`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -307,6 +323,32 @@ impl MySqlConnector {
             }
         }
         Ok(out)
+    }
+
+    /// Whether `table`, gone from `information_schema`, may only be hidden from the pipeline's
+    /// user: the server refuses a `SELECT` on it (1142) rather than saying it doesn't exist
+    /// (1146). For a user without a database-level privilege MySQL and MariaDB answer 1142 for a
+    /// dropped table too, so the two can't be told apart then (measured on MySQL 8.4 and MariaDB
+    /// 11.8, DA-SRC-36).
+    pub(crate) async fn hidden(&self, table: &TableRef) -> Result<bool, SourceError> {
+        let sql = format!(
+            "SELECT 1 FROM {}.{} LIMIT 0",
+            ident(&table.schema),
+            ident(&table.name)
+        );
+        self.conn
+            .command("probe a table gone from the catalog", move |c| {
+                Box::pin(async move {
+                    match c.query_drop(sql).await {
+                        Err(mysql_async::Error::Server(e)) if e.code == DENIED => Ok(true),
+                        Err(mysql_async::Error::Server(e)) if e.code == NO_SUCH_TABLE => Ok(false),
+                        // Readable after all: the catalog was read before a create.
+                        Ok(()) => Ok(false),
+                        Err(e) => Err(e),
+                    }
+                })
+            })
+            .await
     }
 
     /// Channel A: the configured table set, resolved against the catalog and checked (config

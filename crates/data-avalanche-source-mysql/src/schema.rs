@@ -21,7 +21,7 @@ use data_avalanche_core::{
     TableRef, TableSchema,
 };
 
-use crate::catalog::plan_table;
+use crate::catalog::{hidden_note, plan_table};
 use crate::connector::MySqlConnector;
 use crate::ddl::{Renamed, Scope, classify, renamed};
 use crate::server::Fold;
@@ -424,7 +424,13 @@ impl MySqlConnector {
         for k in known {
             let t = k.table();
             match now.remove(&t.name) {
-                None => report.dropped.push(t.clone()),
+                None => {
+                    // The server may hide a table the user lost SELECT on (DA-SRC-36).
+                    if self.hidden(t).await? {
+                        report.warnings.push(hidden_note(t));
+                    }
+                    report.dropped.push(t.clone());
+                }
                 Some(Err(reason)) => report.halted.push((t.clone(), reason)),
                 // A change of case alone isn't one (DA-SRC-25).
                 Some(Ok(s)) => match keep_names(k, &s, &[]) {
