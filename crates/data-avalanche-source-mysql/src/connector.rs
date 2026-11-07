@@ -431,6 +431,10 @@ impl MySqlConnector {
 /// position and the dump watch), `position`, `snapshot`, `stream`, `schema` (channels C and D).
 #[async_trait]
 impl SourceConnector for MySqlConnector {
+    fn column_names_fold(&self) -> bool {
+        true
+    }
+
     async fn preflight(&self) -> Result<Preflight, SourceError> {
         MySqlConnector::preflight(self).await
     }

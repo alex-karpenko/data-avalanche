@@ -61,6 +61,35 @@ async fn a_statement_s_change_is_scoped_to_its_columns() {
     cleanup(&n).await;
 }
 
+/// DA-SRC-25: `RENAME COLUMN note TO Note` changes the case alone, the same column to MySQL.
+/// The statement's change notes it and keeps the cached spelling, which the sink's column has;
+/// the rescan reports no change; and the snapshot reads the table under the cached names.
+#[tokio::test]
+async fn a_change_of_case_alone_keeps_the_cached_name() {
+    require_it!();
+    let (n, mut a) = fresh(
+        "schema_case",
+        "CREATE TABLE t (id INT PRIMARY KEY, note TEXT); INSERT INTO t VALUES (1, 'a');",
+    )
+    .await;
+    let c = connector(&pipeline(&n, &["t"], "", ""));
+    let cached = c.resolve_tables().await.unwrap().tables.remove(0);
+    let sql = "ALTER TABLE t RENAME COLUMN note TO Note";
+    a.query_drop(sql).await.unwrap();
+    let (delta, now) = c.augment(&cached, &ddl(sql)).await.unwrap();
+    assert!(
+        matches!(delta.changes.as_slice(), [SchemaChange::NoTargetEffect(_)]),
+        "{:?}",
+        delta.changes
+    );
+    assert_eq!(now.unwrap(), cached, "the cached spelling stays");
+    let report = c.rescan(std::slice::from_ref(&cached)).await.unwrap();
+    assert!(report.changed.is_empty(), "{report:?}");
+    let chunk = c.read_chunk(&cached, None, 10).await.unwrap();
+    assert_eq!(chunk.rows.len(), 1);
+    cleanup(&n).await;
+}
+
 /// A baseline to the catalog (a fresh start, a job's cleared halt) has no statement: the whole
 /// table's change, with no rename proven.
 #[tokio::test]

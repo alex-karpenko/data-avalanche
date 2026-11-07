@@ -268,6 +268,8 @@ struct Db {
     teardowns: usize,
     fetches: BTreeMap<TableRef, usize>,
     prepares: Vec<Option<Checkpoint>>,
+    /// Column names compare without case, as MySQL's do (DA-SRC-25).
+    fold: bool,
 }
 
 /// The scripted source. Cloning shares the database.
@@ -326,6 +328,7 @@ impl FakeSource {
             teardowns: 0,
             fetches: BTreeMap::new(),
             prepares: vec![],
+            fold: false,
         };
         for t in tables {
             db.create(t);
@@ -420,6 +423,12 @@ impl FakeSource {
         db.wal.push(WalEntry::KeepAlive(at));
         drop(db);
         self.wake.notify_waiters();
+    }
+
+    /// Column names compare without case from now on, as MySQL's do
+    /// ([`SourceConnector::column_names_fold`]).
+    pub fn fold_column_names(&self) {
+        self.db().fold = true;
     }
 
     /// Changes `table`'s schema in the catalog. Stored rows lose dropped columns and read NULL in
@@ -975,6 +984,10 @@ fn diff(cached: &TableSchema, now: &TableSchema) -> Vec<SchemaChange> {
 
 #[async_trait]
 impl SourceConnector for FakeSource {
+    fn column_names_fold(&self) -> bool {
+        self.db().fold
+    }
+
     async fn preflight(&self) -> Result<Preflight, SourceError> {
         self.take_fault(Method::Preflight)?;
         Ok(Preflight {

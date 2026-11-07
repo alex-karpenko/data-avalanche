@@ -357,6 +357,13 @@ pub struct RescanReport {
 /// [`Self::open_stream`].
 #[async_trait]
 pub trait SourceConnector: Send + Sync {
+    /// Whether the source compares column names without case (MySQL: `note` and `Note` are one
+    /// column), so a cached schema and the catalog's may spell a column differently and still
+    /// agree (DA-SRC-25). PostgreSQL's names are case-sensitive.
+    fn column_names_fold(&self) -> bool {
+        false
+    }
+
     /// The pipeline-level start checks (config §11.2).
     async fn preflight(&self) -> Result<Preflight, SourceError>;
 

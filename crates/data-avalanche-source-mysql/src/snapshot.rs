@@ -85,7 +85,9 @@ async fn read_plan(
         let catalog = d
             .columns
             .iter()
-            .find(|x| x.name == col.name)
+            // Without case, as MySQL compares column names: the cached spelling stays when the
+            // catalog's changed case alone (DA-SRC-25).
+            .find(|x| x.name.to_lowercase() == col.name.to_lowercase())
             .ok_or_else(|| changed(schema, format!("column {} is gone", col.name)))?;
         let identifier = schema.is_identifier(&col.name);
         if identifier && catalog.nullable {

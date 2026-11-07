@@ -26,7 +26,7 @@ pub use connect::SESSION_SETUP;
 pub use connector::MySqlConnector;
 pub use ddl::{Altered, Ddl, Renamed, Scope, classify, renamed, shadow_of};
 pub use position::{BinaryLog, Mode, Retention, bytes_after, purged};
-pub use schema::{diff, narrowed, scope, scope_of};
+pub use schema::{diff, keep_names, narrowed, scope, scope_of};
 pub use server::{Flavour, Fold, Settings, grants_replication, version_of};
 pub use start::{at_boundary, dialect_change, never_held, purge_action, same_server};
 pub use stream::MySqlStream;

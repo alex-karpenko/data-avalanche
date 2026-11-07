@@ -11,9 +11,9 @@ use std::time::Instant;
 
 use data_avalanche_config::{Pipeline, SnapshotMode};
 use data_avalanche_core::{
-    Checkpoint, CommitMarker, CommitOutcome, HaltReason, PositionRange, SchemaHint, Sink,
-    SinkError, SinkKind, SnapshotReason, SourceConnector, SourceError, SourcePosition, StartPlan,
-    TableChangeSet, TableRef, TableSchema, TableSpec,
+    Checkpoint, ColumnSchema, CommitMarker, CommitOutcome, HaltReason, PositionRange, SchemaHint,
+    Sink, SinkError, SinkKind, SnapshotReason, SourceConnector, SourceError, SourcePosition,
+    StartPlan, TableChangeSet, TableRef, TableSchema, TableSpec,
 };
 use data_avalanche_state::{PipelineDocs, SnapshotStatus, StateError, TableHalt, TableSnapshotDoc};
 use data_avalanche_storage::StoreError;
@@ -355,6 +355,26 @@ enum Empty {
     Truncate,
 }
 
+/// Whether a cached schema's columns are the catalog's now: the same, in order, with the names
+/// compared without case when the source compares them so (`fold`, MySQL): a change of case alone
+/// is the same column, cached under its first spelling (DA-SRC-25).
+fn same_columns(cached: &TableSchema, now: &TableSchema, fold: bool) -> bool {
+    let (a, b) = (cached.columns(), now.columns());
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| match fold && x.name != y.name {
+                true => {
+                    x.name.to_lowercase() == y.name.to_lowercase()
+                        && ColumnSchema {
+                            name: y.name.clone(),
+                            ..x.clone()
+                        } == *y
+                }
+                false => x == y,
+            })
+}
+
 /// Commits an [`Empty`] change set to `schema`'s sink table at `at`. A table the lake doesn't
 /// hold has nothing to commit.
 async fn commit_empty(
@@ -619,6 +639,7 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
     let mut abandoned = vec![];
     let mut schemas = vec![];
     let mut dump_only = !resolved_tables.is_empty();
+    let fold = source.column_names_fold();
     for (table, now) in &resolved_tables {
         let mode = core.settings.mode(table);
         dump_only &= matches!(mode, SnapshotMode::DumpAlways | SnapshotMode::DumpInitial);
@@ -685,7 +706,7 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
             _ => c.clone(),
         });
         match rebased.as_ref() {
-            Some(c) if state.exists && baseline && c.columns() != now.columns() => {
+            Some(c) if state.exists && baseline && !same_columns(c, now, fold) => {
                 let evolver = core.evolver();
                 let hint = SchemaHint::Columns(now.columns().to_vec());
                 match evolver.plan(c, &hint).await {
@@ -742,7 +763,7 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
                 }
             }
             Some(_) if cleared.contains(table) => {}
-            Some(c) if matches!(plan, Plan::Resume) && c.columns() != now.columns() => {
+            Some(c) if matches!(plan, Plan::Resume) && !same_columns(c, now, fold) => {
                 drifted.insert(table.clone());
                 let idle = match core.settings.rescan_interval {
                     Some(every) => format!(
@@ -2508,6 +2529,49 @@ mod tests {
         assert_eq!(cached, w.source.schema(&t("a")));
         assert_eq!(w.ids("a"), [1, 2, 3]);
         assert_eq!(w.text("a", "note"), [None, None, Some("n".to_owned())]);
+    }
+
+    /// DA-SRC-25: on a source that compares column names without case (MySQL), a column whose
+    /// catalog spelling changed case alone while the pipeline was down is the same column: no
+    /// drift, and the cache keeps the sink's spelling. On PostgreSQL it is a change.
+    #[tokio::test]
+    async fn a_change_of_case_alone_is_no_drift_where_names_fold() {
+        let recased = || {
+            TableSchema::new(
+                t("a"),
+                vec![
+                    ColumnSchema::new("id", V::Int64, "bigint").not_null(),
+                    ColumnSchema::new("DOC", V::Text, "text"),
+                ],
+                vec!["id".into()],
+            )
+            .unwrap()
+        };
+        let drift = |st: &WorkerStatus| {
+            st.warnings
+                .iter()
+                .any(|m| m.contains("changed while the pipeline was down"))
+        };
+        for fold in [true, false] {
+            let w = World::new(&["a"]);
+            w.source.load(&t("a"), rows(1..=2));
+            let p = mode("mode: initial");
+            run(&w, &p, async |status| streamed(&status, &w).await)
+                .await
+                .0
+                .unwrap();
+            if fold {
+                w.source.fold_column_names();
+            }
+            w.source.alter(&t("a"), recased());
+            let (end, st) = run(&w, &p, async |status| streamed(&status, &w).await).await;
+            assert_eq!(end.unwrap(), Exit::Drained);
+            assert_eq!(drift(&st), !fold, "fold {fold}: {:?}", st.warnings);
+            if fold {
+                let cached = w.docs.table_schema(&t("a")).await.unwrap().unwrap().doc;
+                assert_eq!(cached.columns()[1].name, "doc", "the sink's spelling");
+            }
+        }
     }
 
     /// Phase 0's rescan of the tables gone from the source's list warns once per failure streak:
