@@ -2180,6 +2180,28 @@ mod tests {
         assert_eq!(w.ids("a"), [1, 2, 3], "nothing before the drop is lost");
     }
 
+    /// The periodic rescan's warnings reach the status beside the halt (DA-SRC-36).
+    #[tokio::test]
+    async fn a_periodic_rescans_warnings_reach_the_status() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let st = rescanning(&w, &flush_each(), async |status| {
+            w.source
+                .set_rescan_warnings(vec!["table public.a: maybe hidden".into()]);
+            w.source.drop_table(&t("a"));
+            wait_until("the table halts", || !status.borrow().halted.is_empty()).await;
+        })
+        .await;
+        assert_eq!(st.halted.get(&t("a")), Some(&HaltReason::TableDropped));
+        assert!(
+            st.warnings
+                .iter()
+                .any(|m| m == "table public.a: maybe hidden"),
+            "{:?}",
+            st.warnings
+        );
+    }
+
     #[tokio::test]
     async fn the_retained_wal_is_reported_and_bounded() {
         let w = World::new(&["a"]);

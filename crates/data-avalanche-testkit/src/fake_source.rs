@@ -262,6 +262,7 @@ struct Db {
     source_change_halts: bool,
     reads: BTreeMap<TableRef, usize>,
     rescans: usize,
+    rescan_warnings: Vec<String>,
     in_flights: usize,
     readers_ended: usize,
     reconfigures: usize,
@@ -322,6 +323,7 @@ impl FakeSource {
             source_change_halts: false,
             reads: BTreeMap::new(),
             rescans: 0,
+            rescan_warnings: Vec::new(),
             in_flights: 0,
             readers_ended: 0,
             reconfigures: 0,
@@ -551,6 +553,11 @@ impl FakeSource {
             }
             done.await;
         }
+    }
+
+    /// The warnings every `rescan` reports (a source's note beside its halts).
+    pub fn set_rescan_warnings(&self, warnings: Vec<String>) {
+        self.db().rescan_warnings = warnings;
     }
 
     /// Runs `f` once, inside the next `rescan`, after it has read the catalog: a change made
@@ -1281,7 +1288,10 @@ impl SourceConnector for FakeSource {
         self.db().rescans += 1;
         self.take_fault(Method::Rescan)?;
         let mut db = self.db();
-        let mut report = RescanReport::default();
+        let mut report = RescanReport {
+            warnings: db.rescan_warnings.clone(),
+            ..Default::default()
+        };
         for k in known {
             match db.catalog.get(k.table()) {
                 Some(now) if now.source_id() != k.source_id() && k.source_id().is_some() => {

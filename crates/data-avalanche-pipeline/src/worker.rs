@@ -1554,6 +1554,30 @@ mod tests {
         assert_eq!(w.docs.halts().await.unwrap().tables[0].table, t("b"));
     }
 
+    /// A rescan's warnings reach the status from Phase 0's rescan of the tables gone from the
+    /// source's list (DA-SRC-36).
+    #[tokio::test]
+    async fn a_gone_tables_rescan_warnings_reach_the_status() {
+        let w = World::new(&["a", "b"]);
+        w.started(&["a", "b"]).await;
+        w.source.drop_table(&t("b"));
+        w.source
+            .set_rescan_warnings(vec!["table public.b: maybe hidden".into()]);
+        let (end, st) = run(&w, &mode("mode: never"), async |status| {
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!(st.halted.get(&t("b")), Some(&HaltReason::TableDropped));
+        assert!(
+            st.warnings
+                .iter()
+                .any(|m| m == "table public.b: maybe hidden"),
+            "{:?}",
+            st.warnings
+        );
+    }
+
     #[tokio::test]
     async fn a_table_created_again_while_down_halts() {
         let w = World::new(&["a"]);

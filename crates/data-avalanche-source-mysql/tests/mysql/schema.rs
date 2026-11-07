@@ -252,3 +252,28 @@ async fn a_table_the_user_can_no_longer_see_reads_as_dropped_with_a_warning() {
         .unwrap();
     cleanup(&n).await;
 }
+
+/// The probe is advisory: a table whose whole schema is gone (the probe gets 1049, not 1142 or
+/// 1146) is still reported dropped, with no warning, and doesn't fail the rescan.
+#[tokio::test]
+async fn a_table_whose_schema_is_gone_is_still_reported_dropped() {
+    require_it!();
+    let (n, mut a) = fresh(
+        "schema_db_gone",
+        "CREATE TABLE t (id INT PRIMARY KEY); CREATE TABLE u (id INT PRIMARY KEY);",
+    )
+    .await;
+    let c = connector(&pipeline(&n, &["t", "u"], "", ""));
+    let known = c.resolve_tables().await.unwrap().tables;
+    a.query_drop(format!("DROP DATABASE {}", n.db))
+        .await
+        .unwrap();
+    let report = c.rescan(&known).await.unwrap();
+    let mut dropped = report.dropped.clone();
+    dropped.sort();
+    let mut want: Vec<_> = known.iter().map(|s| s.table().clone()).collect();
+    want.sort();
+    assert_eq!(dropped, want);
+    assert!(report.warnings.is_empty(), "{report:?}");
+    cleanup(&n).await;
+}

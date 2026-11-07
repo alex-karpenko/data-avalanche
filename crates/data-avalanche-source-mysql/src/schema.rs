@@ -426,7 +426,7 @@ impl MySqlConnector {
             match now.remove(&t.name) {
                 None => {
                     // The server may hide a table the user lost SELECT on (DA-SRC-36).
-                    if self.hidden(t).await? {
+                    if self.hidden(t).await {
                         report.warnings.push(hidden_note(t));
                     }
                     report.dropped.push(t.clone());

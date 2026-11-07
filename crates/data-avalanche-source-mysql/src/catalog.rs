@@ -329,14 +329,17 @@ impl MySqlConnector {
     /// user: the server refuses a `SELECT` on it (1142) rather than saying it doesn't exist
     /// (1146). For a user without a database-level privilege MySQL and MariaDB answer 1142 for a
     /// dropped table too, so the two can't be told apart then (measured on MySQL 8.4 and MariaDB
-    /// 11.8, DA-SRC-36).
-    pub(crate) async fn hidden(&self, table: &TableRef) -> Result<bool, SourceError> {
+    /// 11.8, DA-SRC-36). The probe only decides whether to add a warning, so it never fails: any
+    /// other answer (1049 for a dropped schema, 1044, a lost connection) reads as not hidden and
+    /// is logged, and the table is reported dropped all the same.
+    pub(crate) async fn hidden(&self, table: &TableRef) -> bool {
         let sql = format!(
             "SELECT 1 FROM {}.{} LIMIT 0",
             ident(&table.schema),
             ident(&table.name)
         );
-        self.conn
+        let probed = self
+            .conn
             .command("probe a table gone from the catalog", move |c| {
                 Box::pin(async move {
                     match c.query_drop(sql).await {
@@ -348,7 +351,11 @@ impl MySqlConnector {
                     }
                 })
             })
-            .await
+            .await;
+        probed.unwrap_or_else(|e| {
+            tracing::warn!(%table, error = %e, "the probe of a table gone from the catalog failed: not reported as hidden");
+            false
+        })
     }
 
     /// Channel A: the configured table set, resolved against the catalog and checked (config
