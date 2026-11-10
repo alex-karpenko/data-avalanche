@@ -407,7 +407,7 @@ pub const FIELD_DOCS: &[FieldDoc] = &[
     f(
         "pipelines.*.source.postgres.source_change_action",
         Value("error"),
-        "A start, or a stream reconnect, on a server other than the checkpoint's (another system identifier, or another timeline after a failover): `error` halts `WAL_SOURCE_CHANGED`; `re_snapshot` starts from the new server's position, snapshotting as `snapshots.mode` says (none under `never`). Under either, a promotion the pipeline's failover slot followed (PostgreSQL 17+, the slot synchronized exactly up to the checkpoint) continues the stream, with a warning.",
+        "A start, or a stream reconnect, on a server other than the checkpoint's (another system identifier, or another timeline after a failover): `error` halts `WAL_SOURCE_CHANGED`; `re_snapshot` starts from the new server's position, snapshotting as `snapshots.mode` says (none under `never`). Under either, a promotion the pipeline's failover slot followed (PostgreSQL 17+, the slot synchronized exactly up to the checkpoint, and no Delta table's marker past it) continues the stream, with a warning.",
     ),
     f(
         "pipelines.*.source.postgres.max_wal_lag_bytes",

@@ -95,7 +95,7 @@ that reaches one, halts the pipeline with `WAL_SOURCE_CHANGED`
 drops or makes a slot there. With `re_snapshot` the pipeline starts again, moves its tables onto
 the new server's position and copies them as `snapshots.mode` says. Under either, a promotion the
 pipeline's failover slot followed (PostgreSQL 17 and later, the standby's copy of the slot
-synchronized exactly up to the checkpoint) continues the stream on the new timeline, with a warning: a
+synchronized exactly up to the checkpoint, and no Delta table's marker past it) continues the stream on the new timeline, with a warning: a
 reconnect to the promoted server starts the pipeline again, and that start continues. See
 [A lost position](/data-avalanche/runbooks/position-lost/#a-failover-wal_source_changed).
 

@@ -60,9 +60,10 @@ hand, or advanced past the pipeline's checkpoint.
 ## A failover (`WAL_SOURCE_CHANGED`)
 
 **A failover slot carries the stream over.** On PostgreSQL 17 and later, a slot the pipeline
-manages (`slot_management: managed`) is a failover slot. When the primary names the standby's
-physical slot in `synchronized_standby_slots` and the standby runs with `sync_replication_slots`
-on (and `hot_standby_feedback`), the standby keeps a copy of the pipeline's slot. A promotion that
+manages (`slot_management: managed`) is a failover slot. When the standby streams from the
+primary through a physical slot (`primary_slot_name`), with `dbname` in its `primary_conninfo`,
+`sync_replication_slots` on and `hot_standby_feedback` on, and the primary names that physical
+slot in `synchronized_standby_slots`, the standby keeps a copy of the pipeline's slot. A promotion that
 copy followed continues the stream on the new timeline, with no halt and no copy, under either
 `source_change_action`: the copy must have confirmed exactly the pipeline's checkpoint, and no
 Delta table's marker may be past it. That holds whether the pipeline was running (its reconnect to
@@ -120,9 +121,12 @@ pipeline starts again, as at a restart, and recovers as in step 2.
 
 Leave `source_change_action` at `re_snapshot` only where a failover should recover by itself.
 
-If the pipeline's address reaches more than one server, the runs keep finding another one: three
-runs in a row that each find another server and make no checkpoint durable stop the pipeline in
-`error` with `WAL_SOURCE_CHANGED`, as for a changing binlog server (see the MySQL and MariaDB tab).
+If the pipeline's address reaches more than one server, the runs keep finding another one. Under
+`re_snapshot` each such run starts the pipeline again, and three runs in a row that each find
+another server and make no checkpoint durable stop the pipeline in `error`, as for a changing
+binlog server (see the MySQL and MariaDB tab), usually with `WAL_SOURCE_CHANGED`. Reconnects that
+keep reaching a promoted server of the same system do the same under either action, and that halt
+carries no code: look for "the source's address reaches more than one server" in its reason.
 
 ## A renamed or dropped publication
 
