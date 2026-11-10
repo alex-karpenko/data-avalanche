@@ -1659,7 +1659,10 @@ Every deviation, so nothing is silent:
     current generation undoes is marked done without a teardown. §6.6 new
     `globals.tracing.headers` (secrets, R, **V-126**). §6.3: a non-`https` key URL warns
     (**V-125**).
-32. **M12d planning (2026-11-06)** — V-127; failover slots (§9.2.1).
+32. **M12d planning (2026-11-06)** — V-127; failover slots (§9.2.1). Amended 2026-11-10 (M12d
+    execution): §9.2.1 `source_change_action` (P-2) reworded, the slot confirmed exactly at the
+    checkpoint with no lake marker past it (it said "at least"); with Data-Flow's P-5 reworded
+    the same way and P-6 added (a reconnect to the same system on a later timeline reruns Phase 0).
 
 None of these change the **decided** catalog-auth schema (hive Thrift `none/ldap/kerberos`;
 rest HTTP `none/bearer/oauth2/sigv4`) — those are reproduced verbatim from

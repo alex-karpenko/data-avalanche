@@ -801,11 +801,12 @@ Replication stream error / TCP timeout
     ─ idempotent sink commits (+ Phase 4 position guard) absorb previously flushed events
     ─ file/position mode: a reconnect that reaches another server (Phase 2b) halts under
       binlog_purge_action: error, and reruns Phase 0 under re_snapshot
-    ─ PostgreSQL: a reconnect that reaches another system or timeline (Phase 2a) halts under
-      source_change_action: error, and reruns Phase 0 under re_snapshot, before a lost slot is
-      dropped or made again there; a reconnect to the same system on a later timeline reruns
-      Phase 0 under either action: the start continues the stream there if the slot followed
-      (DA-SRC-33), else halts (or recovers) as source_change_action says
+    ─ PostgreSQL: a reconnect that reaches another system, or an earlier timeline of the same
+      one (Phase 2a), halts under source_change_action: error, and reruns Phase 0 under
+      re_snapshot, before a lost slot is dropped or made again there; a reconnect to the same
+      system on a later timeline reruns Phase 0 under either action: the start continues the
+      stream there if the slot followed (DA-SRC-33), else halts (or recovers) as
+      source_change_action says
 ```
 
 ### Sink Commit Failure
