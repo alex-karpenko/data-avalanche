@@ -213,7 +213,14 @@ Applied 2026-11-10 (Task 9). P-2 and P-5 were reworded during execution, with Ol
 (2026-11-10), to match Task 8's fix round: the slot is confirmed **exactly** at the checkpoint, with
 no lake marker past it (it read "confirmed at least at the checkpoint and at the lake's highest
 marker"), and P-5's Phase 2a branch says a running pipeline's reconnect reruns the start. P-6 was
-added and approved during execution (2026-11-10).
+added and approved during execution (2026-11-10); its "(or recovers)", which says what the rerun
+does under `re_snapshot`, was approved as applied (2026-11-10). With P-6, Oleksii approved
+(2026-11-10, Task 9's review, M1) narrowing the line's first PostgreSQL clause to "a reconnect that
+reaches another system, or an earlier timeline of the same one (Phase 2a), halts under
+source_change_action: error, and reruns Phase 0 under re_snapshot, before a lost slot is dropped or
+made again there", so that it no longer contradicts P-6. Phase 2a's identity tree reads
+consistently (its "another system or timeline" branch follows the continuation branch) and is
+unchanged.
 
 **P-1 — `Configuration_Specification.md` §9.2.1, `slot_management` row.** After "`managed`: create
 the slot if absent, reuse if present, drop on delete per `auto_cleanup`." insert: "On PostgreSQL
@@ -264,7 +271,10 @@ the user may have lost `SELECT` instead (DA-SRC-36)."
 **P-6 — `Data-Flow.md` "Source Disconnect"** (approved during execution, 2026-11-10, Task 8's
 ruling). The PostgreSQL reconnect line gains: "a reconnect to the same system on a later timeline
 reruns Phase 0 under either action: the start continues the stream there if the slot followed
-(DA-SRC-33), else halts (or recovers) as source_change_action says".
+(DA-SRC-33), else halts (or recovers) as source_change_action says". The "(or recovers)" was
+approved as applied (2026-11-10). Its companion, also approved 2026-11-10: the line's first
+PostgreSQL clause reads "a reconnect that reaches another system, or an earlier timeline of the same
+one (Phase 2a), halts …".
 
 ## File Structure
 
@@ -2080,7 +2090,13 @@ it says otherwise. Later tasks' blocks applied on top unchanged.
   - a permanent sink error in `highest_marker` still ends the start (documented: declining would turn
     a sink fault into a re-snapshot or a misleading halt).
 - **Task 9:** `field_docs.rs`'s `source_change_action` text (it said a later timeline halts under
-  `error`) updated to the continuation, the reference regenerated.
+  `error`) updated to the continuation, the reference regenerated. Its review's fix round: P-6's
+  "(or recovers)" approved as applied; the Data-Flow Source Disconnect line's first PostgreSQL
+  clause narrowed to another system or an earlier timeline (approved, P-6's companion); a 🧪 row
+  for the continuation on PostgreSQL 17 folded into DA-SRC-33's rationale; the runbook's standby
+  set-up gains `primary_slot_name` and `dbname`; the summaries gain the marker condition; the
+  PostgreSQL alternation paragraph says `re_snapshot` and that a promoted-reconnect alternation
+  halts without a code; config §15 item 32 notes the 2026-11-10 rewording.
 
 **Known limitations** (recorded in the gap tracker §60.1, and in the operator docs where an operator
 acts):
@@ -2090,7 +2106,8 @@ acts):
 - the alternation count never decays: three genuine failovers days apart on an idle source halt; and
   an alternation of promoted-server reconnects halts with no code (Task 7; Task 8 re-review N1;
   DA-SRC-38);
-- the failover E2E runs on PostgreSQL 18 only (DA-SRC-39, 🧪);
+- the failover E2E runs on PostgreSQL 18 only; 17 rests on the same mechanism, per the PostgreSQL
+  docs (recorded in DA-SRC-33's rationale);
 - after a crash of a busy primary the synced slot usually lags the last acknowledgement, so the start
   halts; a planned switchover continues reliably. On 17+ a down standby named in
   `synchronized_standby_slots` stalls the pipeline; a slot made before an upgrade to 17 stays plain
@@ -2100,12 +2117,16 @@ acts):
 case and the quadratic create check; Task 2, the accent-insensitive fold, two keys of one column
 differing by case, `plan_table`'s rescan per key entry; Task 3, `FakeSource::fold_column_names`'
 limits, `same_columns`' inline fold, `DROP a, ADD A` merged as one column, no unit test of `scope`'s
-identifier remap, the fake's snapshot reader not folding; Task 4, no IT for a still-readable table;
+identifier remap, the fake's snapshot reader not folding; Task 4, no IT for a still-readable table, the 1049 IT reasoned RED but not run RED, and review
+minors #2, #3, #4, #6, #7 left as justified in `task-4-report.md`;
 Task 5, the halt texts above, no test for a partition the publication names directly, no Phase 0
 test recording the non-null halt; Task 6, M-2 (the reposition halt overwrites an earlier halt), M-3
 (a job's copy halted with `copy: false`), M-5 (a malformed key property fails `table_state`), M-6
 (each held table keeps a loaded handle), M-7 (no RustFS/prefix IT for `held_tables`), the duplicated
-`~2Epipeline-state` literal; Task 7, no test of the reset by another end or a stop; Task 8, N2 (no
+`~2Epipeline-state` literal, the `st.halted.insert` line no test exercises, the brief's test filter
+`held` matching no test (the test is `the_sink_lists_the_tables_it_holds`); Task 7, no test of the
+reset by another end or a stop (the mutants `_ => 0` and `changed = 0` survive), and no comment on
+why the final status is authoritative for `progressed`; Task 8, N2 (no
 worker test of an immediate halt at a PostgreSQL reconnect) and the E2E's timing note.
 
 ## Verification in planning (2026-11-06)
