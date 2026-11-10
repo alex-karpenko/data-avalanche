@@ -1,8 +1,8 @@
 ---
-updated: 2026-10-16
+updated: 2026-11-10
 domain: Schema Evolution
-tags: [mysql, mariadb, ddl, sqlparser, classifier, channel-c, schema-evolution, rename, online-migration, cdc]
-resolves: [G-19a]
+tags: [mysql, mariadb, ddl, sqlparser, classifier, channel-c, schema-evolution, rename, online-migration, case-folding, privileges, cdc]
+resolves: [G-19a, DA-SRC-25, DA-SRC-35, DA-SRC-36]
 ---
 
 # MySQL DDL Classifier (in-band, channel B)
@@ -111,6 +111,8 @@ other order, with the same outcomes:
 | DDL on untracked table | ignore |
 | `binlog_row_metadata = MINIMAL` | refused at start since M7a (config §11.2): channel C's names can't check a positional decode; a table map without names halts the table |
 | Names under `lower_case_table_names` ≠ 0 | table and database names compare without case (as built, M7a); column names always do |
+| A column whose name changed only its case (M12d) | `NoTargetEffect`: the column keeps its cached spelling (§7) |
+| A tracked table gone from the catalog (M12d) | halt `TABLE_DROPPED`; a `1142` probe adds a warning that the user may have lost `SELECT` instead (§7) |
 
 The §0 schema-evolution invariant (apply in stream order, scoped to the implicated change, never
 fast-forward to "now") is preserved: channel B only *locates* the change; channel C *describes* it; the
@@ -142,3 +144,85 @@ apply protocol (§8) sequences it.
 | tier order (M7a) | tokenizer for every statement's verb and names; `sqlparser` for an ALTER's columns and renames |
 | cut-over swap (M7a) | followed for gh-ost / pt-osc shadow names in one statement; any other rename away halts |
 | unlogged row changes (M7a) | partition / tablespace operations that move rows halt the table (`UNSAFE_DDL`) |
+| case-only column change (M12d, DA-SRC-25) | `NoTargetEffect`; `keep_names` keeps the cached spelling, following the diff's own column matching (§7.1) |
+| config column keys (M12d, DA-SRC-35) | `column_type_overrides` keys match a column without case; a key naming no column warns (V-127) (§7.2) |
+| a table gone from the catalog (M12d, DA-SRC-36) | still `TABLE_DROPPED`; a `SELECT 1 … LIMIT 0` probe on the rescan paths notes a `1142` (§7.3) |
+
+---
+
+## §7 — Column and table names the server compares without case (M12d)
+
+Added 2026-11-10 (M12d Tasks 2–4; rulings Q-M12d-3, Q-M12d-4; decisions D-M12d.2–4). MySQL and
+MariaDB compare column names without case, always (`lower_case_table_names` governs table and
+database names only). The pipeline compared them as written, which made three gaps.
+
+### §7.1 A change of case alone (DA-SRC-25)
+
+`CHANGE a A …` or `RENAME COLUMN a TO A` is the same column to MySQL, and the Delta table can't
+hold `a` beside `A` (DA-SINK-12). So the column keeps the spelling the pipeline first cached:
+
+- **`diff`** matches columns by name without case and by the statement's proven renames. A matched
+  pair whose names differ by case alone is a `NoTargetEffect` note ("column "a" is now spelled
+  "A": the same column to MySQL, kept as "a""), not a rename; the delta's other changes to that
+  column (a type change in the same `CHANGE`) name it by its cached spelling.
+- **`keep_names(cached, new, renames)`** rebuilds the new schema under the cached spellings, the
+  identifier too, through **the diff's own matching** (`matched`: each cached column that stays,
+  matched by the statement's proven renames, then by name without case; a cached column whose name
+  a rename takes over is left out), never a bare lookup of the new name (D-M12d.3). So
+  `DROP b, CHANGE a B` keeps `B` (a new name onto a dropped one's), which a lookup would have
+  folded back to `b`. (The plan worded the matching "by position and `source_id`"; the code
+  matches as `diff` does, which is what D-M12d.3 needs.) A new column
+  takes the catalog's spelling. Channel C's scoped change, the batched rescan (channel D) and the
+  Phase 0 drift compare all go through it; the worker's compare asks the source
+  (`SourceConnector::column_names_fold`, MySQL: true) and folds with `to_lowercase`.
+- **The snapshot reads under the cached names.** Task 3's review found that the snapshot's read
+  plan kept the catalog's spelling, so rows, the key columns and the chunk cursor were named
+  otherwise than the cached schema (a `SCHEMA_MISMATCH`, or a panic on a recased key). The plan's
+  column is now the cached name over the catalog's column; `scope` spells the identifier as the
+  result's column. A Phase 0 baseline of a fold-only difference caches the sink's spelling.
+- **A limit, conservative (D-M12d.1).** The Phase 0 baseline of a sink table first met (DA-SNAP-22,
+  `missing_columns`) folds as Delta does and halts `SCHEMA_MISMATCH` on a sink column that matches a
+  source column by case alone; it doesn't consult `column_names_fold`. On MySQL that halts a table
+  whose column only changed case, which the cached path accepts. Safe (a halt, no loss); recorded
+  as a known limitation.
+- Tests: `a_change_of_case_alone_keeps_the_cached_name` (IT, MySQL 8.4 with and without GTIDs and MariaDB 11.8: a key
+  column recased too, chunk size 1 with a resumed cursor), `a_rename_onto_a_dropped_name_keeps_its_new_spelling`,
+  `a_change_of_case_alone_is_no_drift_where_names_fold`,
+  `a_baseline_of_a_case_only_change_caches_the_sink_spelling`.
+
+### §7.2 Config keys that name columns (DA-SRC-35)
+
+`tables.column_type_overrides` keys (`<table key>.<column>`) match a MySQL column without case
+(`config::column_override`, exact first, then folded with `to_lowercase`), in the catalog's plan,
+the snapshot and the stream alike; `tables.primary_key` entries map to the catalog's spelling. A
+key whose column names no column of its table warns at schema resolution on both sources (V-127,
+`check_column_keys`): such an override changes nothing. Two limits stay: MySQL's comparison is
+also accent-insensitive under most collations, which `to_lowercase` isn't (a key differing by an
+accent alone doesn't match, and V-127 warns); and two keys of one column that differ by case alone
+both match, the first in the map's order winning silently.
+
+### §7.3 A table the user can no longer see (DA-SRC-36)
+
+A user who lost `SELECT` on a table, holding no other privilege on it, no longer sees it in
+`information_schema`, so the catalog reports it gone, which halts it `TABLE_DROPPED`. The halt keeps
+its code and shape (`HaltReason::TableDropped` is a unit variant; state compatibility, D-M12d.4).
+On the rescan paths (the worker's gone-tables rescan at a start, the session's periodic one) a
+table gone from the catalog is probed with `SELECT 1 FROM <db>.<table> LIMIT 0`:
+
+- **1146** (`ER_NO_SUCH_TABLE`): dropped. Nothing is added.
+- **1142** (`ER_TABLEACCESS_DENIED_ERROR`): dropped, or the user lost `SELECT`, and the server
+  hides which. The rescan report carries a warning naming `1142` (`RescanReport::warnings`), which
+  the worker and the session put in the pipeline's status: "it was dropped, or the pipeline's user
+  lost SELECT on it, and the server hides which … if it still exists, grant SELECT on it again and
+  re-snapshot it with a snapshot job".
+- **Anything else** (1049 for a dropped schema, 1044, a lost connection), or a read that succeeds:
+  not hidden. The probe is advisory and never fails the rescan: `hidden()` returns a bool and logs
+  any other error (`tracing::warn!`), and the table is reported dropped all the same. (Task 4's
+  review found the first version propagated other errors, so a rescan failed and the halt never
+  came.)
+
+**Its limit, measured (MySQL 8.4, MariaDB 11.8).** For a user without a database-level privilege
+a dropped table and an ungranted one both answer 1142; 1146 needs a privilege on the database. So
+for the common least-privilege user the probe can only say "one or the other", never "dropped". The
+probe runs on the rescan paths only, not in channel B's in-stream `DROP TABLE` (which is a real
+drop).

@@ -1,8 +1,8 @@
 ---
-updated: 2026-10-01
+updated: 2026-11-10
 domain: Architecture
 tags: [sink, multi-sink, delta-lake, delta-rs, iceberg, merge, upsert, capabilities, configuration, arrow]
-resolves: [DA-SINK-1, DA-X-5, DA-X-3]
+resolves: [DA-SINK-1, DA-X-5, DA-X-3, DA-SINK-12]
 ---
 
 # Multi-Sink Architecture and Delta Lake as the Second Sink
@@ -233,8 +233,13 @@ trait Sink: Send + Sync {
     fn capabilities(&self) -> &SinkCapabilities;             // static per build + backend (§6.4)
 
     async fn table_state(&self, t: &TableRef) -> Result<SinkTableState>;
-        // { exists_data, exists_catalog, schema, marker: Option<CommitMarker> }
-        // feeds Phase-0 snapshot-mode decisions (initial / dump_initial) and the position guard
+        // { exists_data, exists_catalog, schema, marker: Option<CommitMarker>, identifier }
+        // feeds Phase-0 snapshot-mode decisions (initial / dump_initial) and the position guard;
+        // `identifier` is the key the table was created with (M12d, DA-SRC-32)
+
+    async fn held_tables(&self) -> Result<Vec<TableRef>>;
+        // M12d (DA-SRC-32): every table at the pipeline's location, tracked or not; a source
+        // change repositions each (Delivery_Guarantee… §8.1)
 
     async fn ensure_table(&self, t: &TableRef, spec: &TableSpec) -> Result<()>;
         // create-if-absent: schema, identifier, partitioning, format properties, registration
@@ -412,7 +417,31 @@ the one evolution op the Delta sink supports*,
 | nullable → NOT NULL (Ignorable, S-O 2026-09-30) | none | none (target columns are always nullable) |
 | NOT NULL → nullable | (n/a today: Ignorable) | `drop_column_not_null` if the Delta column was NOT NULL (we create all non-identifier columns nullable, so usually no-op) |
 | PK / replica-identity change (Unsafe) | halt | halt |
+| ADD / RENAME COLUMN to a name that differs from a column's by case alone (M12d, DA-SINK-12) | — | **Unsupported → halt** `EVOLUTION_UNSUPPORTED`, naming both spellings |
 | Everything else Unsafe/Ignorable | as today | as today |
+
+**Names that differ by case alone (DA-SINK-12, M12d, 2026-11-10).** A Delta table can't hold two
+columns whose names differ by case alone: `buoyant_kernel` 0.28.1's `StructType::try_new` compares
+names after Unicode `str::to_lowercase`, so delta-rs refuses `ÄRGER` beside `ärger`, not only ASCII
+pairs (measured: `delta_rs_refuses_a_column_beside_one_that_differs_by_unicode_case`). Before M12d
+such a schema reached delta-rs and failed at every retry. One rule, `core::differ_by_case_alone`
+(Unicode lower-casing, D-M12d.1), now refuses it up front at each place a name enters:
+
+- **create:** a table whose source columns differ by case alone (PostgreSQL's `note` and `"Note"`)
+  is refused `SinkError::Permanent` ("columns "note" and "Note" differ by case alone, and a Delta
+  table can't hold both"), which halts the table `SINK_REJECTED` instead of retrying;
+- **evolve:** an added column, or a rename's new name, that clashes with a column of the table or
+  one the same delta adds is `Unsupported` before any write ("column "X" differs from the table's
+  column "x" by case alone, and a Delta table can't hold both"), which halts it
+  `EVOLUTION_UNSUPPORTED`;
+- **the baseline of a sink table the pipeline first meets** (`missing_columns`, DA-SNAP-13 /
+  DA-SNAP-22): a sink column that matches a source column by case alone halts `SCHEMA_MISMATCH`,
+  naming both spellings.
+
+A MySQL column whose name changed only its case never reaches create or evolve: it keeps its
+cached spelling (`MySQL_DDL_Classifier.md` §7.1, DA-SRC-25). The baseline check doesn't ask the
+source whether names fold, so on MySQL it halts such a column of a sink table first met; a
+conservative known limitation (D-M12d.1).
 
 Soft-drop is a new outcome class (**Degraded**) the `evolve()` contract already allows. Whether
 soft-drop is acceptable vs halting is D-MS.9.

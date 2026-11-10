@@ -1,8 +1,8 @@
 ---
-updated: 2026-10-08
+updated: 2026-11-10
 domain: Data Flow
-tags: [delivery-guarantee, exactly-once, gtid, lsn, idempotency, checkpoint, multi-table, cdc]
-resolves: [G-14, DA-X-12]
+tags: [delivery-guarantee, exactly-once, gtid, lsn, idempotency, checkpoint, multi-table, reposition, source-change, cdc]
+resolves: [G-14, DA-X-12, DA-SRC-32, DA-SRC-34]
 sources: []
 ---
 
@@ -175,3 +175,80 @@ if true cross-table atomic visibility is ever required it would need a multi-tab
 | D-14.3 correctness basis | **Idempotency (G-13) is correctness**; position guard is optimization + checkpoint-advance |
 | D-14.4 property | Generalize `committed_lsn` → `cdc.committed_position` (engine-tagged); coexists with `cdc.owner_epoch` |
 | D-14.5 limitation | Cross-table atomic visibility not guaranteed (separate commits); documented, cross-ref G-29/G-25 |
+| DA-SRC-32 reposition set (M12d) | a source change repositions every table the sink holds ∪ resolved ∪ cached, under the key the table was made with; a refused one halts `SINK_REJECTED` (§8.1) |
+| DA-SRC-34 alternation (M12d) | three runs in a row ending in a server change, none with a durable checkpoint past its start, halt the pipeline with the change's code (§8.2) |
+
+---
+
+## §8 — A changed source server (M12d)
+
+Added 2026-11-10. A source change (another PostgreSQL system or timeline, another MySQL server in
+file/position mode, DA-SRC-20) makes the new server's positions incomparable with the stored
+markers: they may sort below them, and the guard (§3) would skip the new server's changes as
+covered. The recovery (`source_change_action` / `binlog_purge_action: re_snapshot`) therefore
+commits a **reposition** change set to each table before the checkpoint naming the new server is
+saved: no rows, and a commit that stores its own position instead of the union (Data-Flow Phase 4).
+
+### §8.1 The reposition set (DA-SRC-32, Task 6)
+
+**Every table the lake holds, not only those resolved or cached now.** Before M12d the set was
+the tables the pipeline resolved at that start or had a cached schema for. A job's copy, or a table
+taken out of the config whose schema was never cached, kept the old server's marker and, once
+tracked, skipped the new server's changes up to it. The set is now
+`held_tables() ∪ resolved ∪ cached`, a `BTreeSet`:
+
+- **`Sink::held_tables`** lists the tables under the sink's prefix. The Delta sink lists
+  `<schema>/<table>/` two levels deep (`list_with_delimiter` on the store `DeltaTableBuilder`
+  builds for the sink root, so S3, GCS, Azure and a local root alike), skips the co-located state
+  directory, unescapes each segment (`unescape_table_segment`, which accepts only the canonical
+  form the escape makes: a segment is a table's only if `escape_table_segment` reproduces it), and
+  keeps a table root whose `_delta_log/` lists at least one entry (one page, first entry only).
+- **The recorded key.** `SinkTableState::identifier` is the key the table was created with (the
+  Delta sink records it). `commit_empty` repositions under it, else under the key the pipeline has
+  for the table (cached, else resolved), since a reposition carries no row and a wiped state's
+  table may be keyed otherwise than the source is now (D-M12d.7). A held table that records no
+  key and that the pipeline neither resolves nor caches has no key to commit under: it is skipped,
+  `Ok(false)`, with a warning ("its marker stays on the old server; track it and re-snapshot it
+  before its changes stream").
+- **A refused reposition halts that table.** A `SinkError::Permanent` on one table's reposition (a
+  foreign-format table, a key it can't take) records a `TableHalt` `SINK_REJECTED` ("the source
+  changed, and its reposition fails: …") and the start goes on. Before, it ended every start. A
+  transient error is retried; any other error ends the start.
+- **Known limitation (M-1).** The halt of a refused reposition of a table the pipeline doesn't
+  track is cleared at the next start (a halt of a table neither configured, cached, requested nor
+  copied goes), and the reposition is never retried: the checkpoint already names the new server.
+  Such a table, later tracked with `snapshots: never`, keeps the old server's marker. Holding the
+  checkpoint back until every reposition succeeds would make an always-refusing table fail every
+  start, the regression the halt closes. The operator docs say to drop or move such a Delta table
+  before tracking it.
+- The same listing feeds `highest_marker` for DA-SRC-33's continuation
+  (`Postgres_Slot_and_Publication_Lifecycle.md` §8).
+- Tests: `a_source_change_repositions_a_copy_the_pipeline_doesnt_track`,
+  `a_refused_reposition_halts_that_table_and_the_start_goes_on`,
+  `a_held_table_with_no_key_is_warned_about`; `the_sink_lists_the_tables_it_holds` (Delta); the M12a failover
+  E2E on RustFS runs the listing under `re_snapshot`.
+
+### §8.2 A host that alternates between servers (DA-SRC-34, Task 7)
+
+A host behind a load balancer or a DNS name over several servers reaches another server at each
+connection. Under `re_snapshot` each run would recover, and the next would find the first server
+again: a loop of recoveries. The controller counts them:
+
+- `WorkerStatus::started_from` is the checkpoint the worker's first stream session started from. A
+  run **progressed** when its checkpoint at the end is present and differs from it.
+- A run that ends `SourceError::SourceChanged` after progress sets the count to 1; one without
+  progress adds 1. Any other end sets it to 0, and so does a stop (D-M12d.8).
+- At `SOURCE_CHANGES_IN_A_ROW = 3` the pipeline goes to `ERROR` with the change's code (the prefix
+  of the last `SourceChanged` message, `WAL_SOURCE_CHANGED` or `BINLOG_SOURCE_CHANGED`) and the
+  message "<code>: 3 runs in a row found another source server than the run before, and none made
+  a checkpoint durable: the source's address reaches more than one server (a load balancer, or a
+  DNS name over several). Point the pipeline at one server, then stop and resume it. The last: …".
+- A single failover can't reach it: its reconnect makes the count at most 1, and the rerun's start
+  either streams (the next end resets it), or refuses with a `Permanent` (0, a halt).
+- **Known limitations.** The count never decays with time: three genuine failovers on a source
+  that writes nothing in between (no durable checkpoint past each start) halt the pipeline, however
+  far apart. And a PostgreSQL reconnect to a promoted server of the same system asks the rerun with
+  a message that carries no code (DA-SRC-33, P-6), so an alternation of such reconnects halts
+  without one in the status.
+- Tests: `runs_that_keep_finding_another_server_halt`,
+  `a_durable_checkpoint_starts_the_count_of_server_changes_again`.
