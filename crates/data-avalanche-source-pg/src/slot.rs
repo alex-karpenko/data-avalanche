@@ -24,8 +24,10 @@ pub struct Reconciled {
     /// The statements that bring the publication in line (`managed` only), in order.
     pub sql: Vec<String>,
     /// They create the publication, or change what it publishes for tracked tables (its
-    /// operations; `publish_via_partition_root` while a tracked table is a partition). The WAL
-    /// before now was decoded under the old definition.
+    /// operations, a row filter, a column list). The WAL before now was decoded under the old
+    /// definition. Not `publish_via_partition_root`: `pg_publication_tables` lists only the root
+    /// under it, even for a partition the publication names too, so the tracked partitions are
+    /// among `added` and are copied again, the slot and the other tables' stream staying.
     pub rewritten: bool,
     /// Tracked tables they add to the publication.
     pub added: Vec<TableRef>,
@@ -744,18 +746,9 @@ impl PgConnector {
                 ident(name)
             ));
         }
-        // Publishing via the root mattered only for tracked partitions: their changes arrived
-        // under the parent's name.
-        let partitioned = via_root
-            && !self
-                .conn
-                .command("find partitions", partitions(client, tables))
-                .await?
-                .is_empty();
         Ok(Reconciled {
             sql,
             rewritten: !every_op
-                || partitioned
                 || !filtered.is_empty()
                 || (shape.generated_columns && !shape.generated.is_empty()),
             added: missing.into_iter().cloned().collect(),

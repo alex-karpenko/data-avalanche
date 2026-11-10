@@ -33,9 +33,10 @@ pub(crate) fn soft_dropped(sink: &Schema, source: &TableSchema) -> usize {
 /// baseline it before the copy. Names match without case, Unicode's, as Delta's do
 /// ([`differ_by_case_alone`]): a sink column that matches by case alone can't sit beside the
 /// source's, so it halts, naming both spellings. A
-/// column it holds as another type still surfaces at the first commit (`SINK_REJECTED`); one the
-/// source lacks stays, soft-dropped. A key column it lacks can't be added: the table is keyed
-/// otherwise, and halts.
+/// column it holds as another type still surfaces at the first commit (`SINK_REJECTED`); a
+/// nullable one the source lacks stays, soft-dropped. A key column it lacks can't be added: the
+/// table is keyed otherwise, and halts. So does a non-null column the source lacks: no row of the
+/// source's could fill it (DA-SNAP-22).
 pub(crate) fn missing_columns(
     sink: &Schema,
     source: &TableSchema,
@@ -70,6 +71,23 @@ pub(crate) fn missing_columns(
             });
         }
         adds.push(SchemaChange::AddColumn(c.clone()));
+    }
+    if let Some(f) = sink.fields().iter().find(|f| {
+        !f.is_nullable()
+            && !LINEAGE_COLUMNS.contains(&f.name().as_str())
+            && !f.name().starts_with(INTERNAL_COLUMN_PREFIX)
+            && !source
+                .columns()
+                .iter()
+                .any(|c| c.name == *f.name() || differ_by_case_alone(f.name(), &c.name))
+    }) {
+        return Err(HaltReason::SchemaMismatch {
+            column: f.name().clone(),
+            detail: "the sink table, made by a run whose state is gone, holds this non-null \
+                     column, which the source doesn't have: no row of the source's could fill \
+                     it; drop the sink table and re-snapshot the table"
+                .into(),
+        });
     }
     Ok(adds)
 }

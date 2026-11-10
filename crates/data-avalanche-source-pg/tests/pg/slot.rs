@@ -1031,3 +1031,53 @@ async fn reset_teardown_and_retained_wal() {
     );
     cleanup(&a, &n).await;
 }
+
+/// DA-SNAP-22: a managed publication that publishes via the partition root is set to publish
+/// each partition under its own name, and only the tracked partitions whose changes arrived under
+/// the root's name are copied again (as added tables), the one the publication names beside its
+/// root included; the slot and the other tables' stream stay.
+#[tokio::test]
+async fn a_via_root_repair_copies_only_the_partitions_it_hid() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(
+        &a,
+        "slot_via_root_repair",
+        "CREATE TABLE a (id int PRIMARY KEY);
+         CREATE TABLE events (id int, at date, PRIMARY KEY (id, at)) PARTITION BY RANGE (at);
+         CREATE TABLE events_2024 PARTITION OF events FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+         CREATE TABLE events_2025 PARTITION OF events FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');",
+    )
+    .await;
+    let c = connector(&pipeline(&n, &["*"], "", ""));
+    let tables = [n.table("a"), n.table("events_2024"), n.table("events_2025")];
+    let p = c.prepare(None, &tables).await.unwrap();
+    let start = from(&p.plan, SnapshotReason::FirstStart);
+    let SourcePosition::Pg(slot) = &start else {
+        unreachable!()
+    };
+    a.batch_execute(&format!(
+        "ALTER PUBLICATION {p} ADD TABLE {s}.events; ALTER PUBLICATION {p} SET (publish_via_partition_root = true)",
+        p = n.publication,
+        s = n.schema
+    ))
+    .await
+    .unwrap();
+    let p = c
+        .prepare(Some(&Checkpoint::from(start.clone())), &tables)
+        .await
+        .unwrap();
+    assert_eq!(p.plan, StartPlan::Resume, "the slot stays");
+    assert_eq!(confirmed(&a, &n).await, Some(*slot));
+    assert_eq!(p.added, [n.table("events_2024"), n.table("events_2025")]);
+    let via: bool = a
+        .query_one(
+            "SELECT pubviaroot FROM pg_publication WHERE pubname = $1",
+            &[&n.publication],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(!via, "each partition is published under its own name again");
+    cleanup(&a, &n).await;
+}

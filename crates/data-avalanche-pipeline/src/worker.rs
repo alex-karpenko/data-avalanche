@@ -733,9 +733,10 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
                     }
                 }
             }
-            // No schema cached for a table the sink holds (a wiped state): baselined against the
-            // sink table's columns (DA-SNAP-13).
-            None if state.exists && baseline => {
+            // No schema cached for a table the sink holds: a wiped state, or a table first
+            // tracked at a resume whose sink table a job's copy made. Baselined against the
+            // sink table's columns (DA-SNAP-13, DA-SNAP-22).
+            None if state.exists => {
                 let adds = match state.schema.as_deref().map(|s| missing_columns(s, now)) {
                     Some(Ok(adds)) => adds,
                     Some(Err(reason)) => {
@@ -2043,6 +2044,81 @@ mod tests {
         assert!(st.halted.is_empty(), "{:?}", st.halted);
         let state = w.sink.table_state(&t("a")).await.unwrap();
         assert!(state.schema.unwrap().field_with_name("note").is_ok());
+    }
+
+    /// DA-SNAP-22: a table first tracked at a resume (here, one created since the last start)
+    /// whose sink table exists already, as a job's copy leaves it, is baselined to the source's
+    /// columns before its copy, like a wiped state's.
+    #[tokio::test]
+    async fn a_table_first_tracked_at_a_resume_is_baselined_against_its_sink_table() {
+        let w = World::new(&["a"]);
+        let p = mode("mode: initial");
+        run(&w, &p, async |status| streamed(&status, &w).await)
+            .await
+            .0
+            .unwrap();
+        w.sink
+            .ensure_table(&TableSpec::new(&schema("b"), vec![]).unwrap())
+            .await
+            .unwrap();
+        let noted = TableSchema::new(
+            t("b"),
+            vec![
+                ColumnSchema::new("id", V::Int64, "bigint").not_null(),
+                ColumnSchema::new("doc", V::Text, "text"),
+                ColumnSchema::new("note", V::Text, "text"),
+            ],
+            vec!["id".into()],
+        )
+        .unwrap();
+        w.source.create_table(noted);
+        let mut r = row(1, "x");
+        r.0.push(("note".into(), ColumnValue::Text("n".into())));
+        w.source.load(&t("b"), vec![r]);
+        let (end, st) = run(&w, &p, async |status| streamed(&status, &w).await).await;
+        assert_eq!(end.unwrap(), Exit::Drained);
+        assert_eq!(w.source.prepares().len(), 2, "a resume");
+        assert!(st.halted.is_empty(), "{:?}", st.halted);
+        assert_eq!(w.text("b", "note"), [Some("n".to_owned())]);
+    }
+
+    /// DA-SNAP-22: a sink table holding a non-null column the source no longer has (a key it
+    /// was made with) can't take the source's rows: it halts at the baseline, naming the column,
+    /// rather than at the first MERGE.
+    #[test]
+    fn a_sink_table_with_a_non_null_column_the_source_lacks_halts() {
+        let keyed = TableSchema::new(
+            t("a"),
+            vec![
+                ColumnSchema::new("id", V::Int64, "bigint").not_null(),
+                ColumnSchema::new("region", V::Text, "text").not_null(),
+                ColumnSchema::new("doc", V::Text, "text"),
+            ],
+            vec!["id".into(), "region".into()],
+        )
+        .unwrap();
+        let sink = upsert_schema(&keyed);
+        let Err(HaltReason::SchemaMismatch { column, detail }) =
+            missing_columns(&sink, &schema("a"))
+        else {
+            panic!("a non-null column the source lacks halts");
+        };
+        assert_eq!(column, "region");
+        assert!(detail.contains("non-null"), "{detail}");
+        // A nullable one is soft-dropped: kept, written NULL.
+        let sink = upsert_schema(
+            &TableSchema::new(
+                t("a"),
+                vec![
+                    ColumnSchema::new("id", V::Int64, "bigint").not_null(),
+                    ColumnSchema::new("doc", V::Text, "text"),
+                    ColumnSchema::new("old", V::Text, "text"),
+                ],
+                vec!["id".into()],
+            )
+            .unwrap(),
+        );
+        assert!(missing_columns(&sink, &schema("a")).unwrap().is_empty());
     }
 
     /// A sink table without the source's key column is keyed otherwise: it halts.
