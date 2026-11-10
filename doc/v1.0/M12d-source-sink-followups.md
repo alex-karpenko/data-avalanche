@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-06
+updated: 2026-11-10
 domain: Architecture
 tags: [v1, implementation-plan, m12, m12d, hardening, source, sink, mysql, postgres, delta, failover, slot-sync, schema-evolution, reposition]
 resolves: [DA-SINK-12, DA-SRC-35, DA-SRC-25, DA-SRC-36, DA-SNAP-22, DA-SRC-32, DA-SRC-34, DA-SRC-33, DA-SRC-31]
@@ -132,6 +132,9 @@ included, on 2026-11-06.**
   - its `confirmed_flush` is at least the lake's highest marker;
   - its `confirmed_flush` is at least the checkpoint.
 
+  (Tightened in execution, Task 8: `confirmed_flush` equal to the checkpoint, and no marker past
+  it. See "Deviations during execution".)
+
   Otherwise the source-change path runs as before. It is sound because a standby synchronizes a
   slot only to a position its own WAL holds, which is at or before the switch point (measured,
   PostgreSQL 18).
@@ -206,6 +209,12 @@ included, on 2026-11-06.**
 
 ## Spec patches (approved 2026-11-06; applied in Task 9)
 
+Applied 2026-11-10 (Task 9). P-2 and P-5 were reworded during execution, with Oleksii's approval
+(2026-11-10), to match Task 8's fix round: the slot is confirmed **exactly** at the checkpoint, with
+no lake marker past it (it read "confirmed at least at the checkpoint and at the lake's highest
+marker"), and P-5's Phase 2a branch says a running pipeline's reconnect reruns the start. P-6 was
+added and approved during execution (2026-11-10).
+
 **P-1 — `Configuration_Specification.md` §9.2.1, `slot_management` row.** After "`managed`: create
 the slot if absent, reuse if present, drop on delete per `auto_cleanup`." insert: "On PostgreSQL
 17+ the slot is created as a failover slot (`failover = true`), which a standby with
@@ -214,9 +223,9 @@ the slot if absent, reuse if present, drop on delete per `auto_cleanup`." insert
 **P-2 — `Configuration_Specification.md` §9.2.1, `source_change_action` row.** Before "A checkpoint
 written before the server was recorded (v0.1.0) …" insert: "Neither applies to a promotion the
 slot followed: the same system on a later timeline, whose slot is a failover slot synchronized from
-the old primary, still streaming, and confirmed at least at the checkpoint and at the lake's highest
-marker. The stream continues there with a warning, and the checkpoint records the new server
-(DA-SRC-33)."
+the old primary, still streaming, and confirmed exactly at the checkpoint, with no lake marker past
+it. The stream continues there with a warning, and the checkpoint records the new server
+(DA-SRC-33)." (Reworded 2026-11-10.)
 
 **P-3 — `Configuration_Specification.md` §10 `column_type_overrides` row, and §13.** Append to the
 row: "On MySQL and MariaDB the key's column is matched without case, as the server matches column
@@ -240,8 +249,10 @@ the user may have lost `SELECT` instead (DA-SRC-36)."
 **P-5 — `Data-Flow.md`.**
 - Phase 2a's identity tree: a branch before "another system or timeline": "the same system on a
   later timeline, the slot here a failover slot synced from the old primary, streaming, confirmed
-  ≥ the checkpoint and ≥ the lake's highest marker → continue the stream there (either action,
-  a warning); the checkpoint records the new server (DA-SRC-33)."
+  exactly at the checkpoint, with no lake marker past it → continue the stream there (either
+  action, a warning); the checkpoint records the new server (DA-SRC-33). A running pipeline's
+  reconnect to such a server reruns this start (Source Disconnect), so a promotion is continued
+  whether the pipeline was running or stopped." (Reworded 2026-11-10.)
 - Phase 4's reposition paragraph: "one per table the pipeline resolves at that start or has a
   cached schema for" becomes "one per table the sink holds, and per table the pipeline resolves or
   has a cached schema for, under the key the table was made with; a table whose reposition the
@@ -249,6 +260,11 @@ the user may have lost `SELECT` instead (DA-SRC-36)."
 - Phase 2b, after the dump's reconnect check: "Three Phase 0 reruns in a row for a server change,
   none with a durable checkpoint past its start, halt the pipeline with the change's code, naming
   the alternation: the address reaches more than one server (DA-SRC-34)."
+
+**P-6 — `Data-Flow.md` "Source Disconnect"** (approved during execution, 2026-11-10, Task 8's
+ruling). The PostgreSQL reconnect line gains: "a reconnect to the same system on a later timeline
+reruns Phase 0 under either action: the start continues the stream there if the slot followed
+(DA-SRC-33), else halts (or recovers) as source_change_action says".
 
 ## File Structure
 
@@ -2006,6 +2022,91 @@ git commit -m "gap: v1 §<N> — M12d's gaps closed (DA-SINK-12, DA-SRC-25, 32�
   The approved spec patches are applied.
 - [ ] The whole-branch review runs when Oleksii asks; then the branch is pushed and its PR opened
   against `main` (not merged).
+
+## Deviations during execution
+
+Each was found by the task's review (or its implementer) and fixed in the task's fix round, unless
+it says otherwise. Later tasks' blocks applied on top unchanged.
+
+- **Task 3** (fix round, `5c242af`; Critical in its review, and the planning reference had it too):
+  the snapshot's `read_plan` kept the catalog's spelling in its column, so after a case-only change
+  the rows, the key columns and the chunk cursor were named otherwise than the cached schema (a
+  `SCHEMA_MISMATCH`, or a panic on a recased key). The plan's column is now the cached name over the
+  catalog's column (`CatalogColumn { name: col.name.clone(), ..catalog.clone() }`). `scope` spells
+  the identifier as the result's column (`column_in`), not `now`'s. A new Phase 0 arm
+  (`Some(c) if state.exists && baseline && c.columns() != now.columns()`) caches `c`, the sink's
+  spelling, on a fold-only difference (Important in the review: the baseline cached `now`'s
+  spelling). `FakeSource::rescan` compares names without case when it folds. Test
+  `a_baseline_of_a_case_only_change_caches_the_sink_spelling`; the IT
+  `a_change_of_case_alone_keeps_the_cached_name` recases the key and resumes a chunk cursor. The
+  code's `keep_names` matches as `diff` does (the proven renames, then the name without case), which
+  D-M12d.3's "by position and `source_id`" wording described loosely.
+- **Task 4** (fix round, `bebd9ef`): `hidden()` propagated any error other than 1142/1146 (a dropped
+  schema's 1049), so the rescan failed and `TABLE_DROPPED` never came. It now returns `bool` and logs
+  any other error as not hidden (`tracing::warn!`), so source-mysql gains the `tracing` dependency
+  (D-M12d.4 said it had none; the probe's note still travels as `RescanReport::warnings`).
+  `FakeSource::set_rescan_warnings` and two pipeline tests pin the forwarding
+  (`a_gone_tables_rescan_warnings_reach_the_status`, `a_periodic_rescans_warnings_reach_the_status`);
+  IT `a_table_whose_schema_is_gone_is_still_reported_dropped`.
+- **Task 5** (`3c6a252`, comments only): the `missing_columns` doc covers a table first tracked at a
+  resume. Its halt texts keep the plan's "made by a run whose state is gone", inaccurate at a resume;
+  Oleksii: raise at the whole-branch review.
+- **Task 6** (fix round, `d4ed202`): the `_delta_log/` probe listed every log page; it now reads the
+  first listing entry (`store.list(..).next()`, one page). `unescape_table_segment` accepts only the
+  canonical form (`escape_table_segment` must reproduce the segment). `MemorySink::forget_key`, a test
+  hook; tests `a_refused_reposition_halts_that_table_and_the_start_goes_on` and
+  `a_held_table_with_no_key_is_warned_about`. Not fixed (M-1): a refused reposition of a table the
+  pipeline doesn't track halts one start only and is never retried; tracked later, the table keeps the
+  old server's marker (gap tracker DA-SRC-37).
+- **Task 8** (fix round, `8002013`; Important in its review): the continuation was evaluated only at a
+  start, so a running pipeline whose reconnect reached the promoted server halted
+  `WAL_SOURCE_CHANGED` under the default `error`, against D-M12d.10. Oleksii's ruling: a reconnect to
+  the same system on a later timeline returns `SourceError::SourceChanged` under either action
+  (`slot::reconnect_check`), so the start reruns and continues or halts (spec patch P-6). The message
+  carries no `WAL_SOURCE_CHANGED:` prefix, so alerting on the code isn't paged by a continuation.
+  The worker test `a_failover_mid_run_halts_under_error` now expects a rerun, then the halt; new
+  `a_reconnect_to_the_promoted_server_reruns_the_start_which_continues`. The E2E keeps the pipeline
+  running through the promotion, its address moved by a new `Proxy::tcp` (a raw byte copy). Also in
+  the round:
+  - `continues` requires `confirmed_flush` **equal** to the checkpoint and `marked` at most the
+    checkpoint (it accepted a slot past the checkpoint, which `decide` then re-snapshotted silently);
+    P-2 and P-5 reworded to match (Oleksii, 2026-11-10). The warning ("… came over synchronized up to
+    the checkpoint, with no marker of the lake past it, so the stream continues on the new timeline")
+    is logged only when the final action is a resume;
+  - the `moved` comment names MySQL GTID's resume on another server too; `FakeSource`'s `followed`
+    is cleared by `fail_over` and `set_server`; tests for an earlier timeline and for
+    `highest_marker`'s held tables and other dialects
+    (`the_highest_marker_counts_held_tables_and_skips_other_dialects`);
+  - a permanent sink error in `highest_marker` still ends the start (documented: declining would turn
+    a sink fault into a re-snapshot or a misleading halt).
+- **Task 9:** `field_docs.rs`'s `source_change_action` text (it said a later timeline halts under
+  `error`) updated to the continuation, the reference regenerated.
+
+**Known limitations** (recorded in the gap tracker §60.1, and in the operator docs where an operator
+acts):
+- a refused reposition of an untracked table is never retried (Task 6 M-1; DA-SRC-37);
+- on MySQL, the new baseline arm (DA-SNAP-22) halts a column whose name differs only in case, which
+  Task 3's cached arm accepts; conservative, per D-M12d.1 (DA-SNAP-23);
+- the alternation count never decays: three genuine failovers days apart on an idle source halt; and
+  an alternation of promoted-server reconnects halts with no code (Task 7; Task 8 re-review N1;
+  DA-SRC-38);
+- the failover E2E runs on PostgreSQL 18 only (DA-SRC-39, 🧪);
+- after a crash of a busy primary the synced slot usually lags the last acknowledgement, so the start
+  halts; a planned switchover continues reliably. On 17+ a down standby named in
+  `synchronized_standby_slots` stalls the pipeline; a slot made before an upgrade to 17 stays plain
+  (Task 8 review M6, M7; the runbook and `Postgres_Slot…` §8.5).
+
+**Deferred to the whole-branch review** (the task reviews' minors): Task 1, the evolve test's `Tag`
+case and the quadratic create check; Task 2, the accent-insensitive fold, two keys of one column
+differing by case, `plan_table`'s rescan per key entry; Task 3, `FakeSource::fold_column_names`'
+limits, `same_columns`' inline fold, `DROP a, ADD A` merged as one column, no unit test of `scope`'s
+identifier remap, the fake's snapshot reader not folding; Task 4, no IT for a still-readable table;
+Task 5, the halt texts above, no test for a partition the publication names directly, no Phase 0
+test recording the non-null halt; Task 6, M-2 (the reposition halt overwrites an earlier halt), M-3
+(a job's copy halted with `copy: false`), M-5 (a malformed key property fails `table_state`), M-6
+(each held table keeps a loaded handle), M-7 (no RustFS/prefix IT for `held_tables`), the duplicated
+`~2Epipeline-state` literal; Task 7, no test of the reset by another end or a stop; Task 8, N2 (no
+worker test of an immediate halt at a PostgreSQL reconnect) and the E2E's timing note.
 
 ## Verification in planning (2026-11-06)
 
