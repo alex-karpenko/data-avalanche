@@ -223,7 +223,9 @@ async fn a_checkpoint_from_another_server() {
 /// A stream reconnect, and the reset of a lost position, read the server first (Data-Flow Phase
 /// 2a, Source Disconnect; I-1): a checkpoint read on another system or timeline halts with
 /// `WAL_SOURCE_CHANGED` under `source_change_action: error`, and asks a rerun of Phase 0
-/// (`SourceChanged`) under `re_snapshot`. The slot is neither dropped nor made again; a
+/// (`SourceChanged`) under `re_snapshot`. A checkpoint read on an earlier timeline of this system
+/// (the server is a promoted standby) asks the rerun under either action: its start decides
+/// whether the stream continues (DA-SRC-33). The slot is neither dropped nor made again; a
 /// checkpoint read on this server, or naming none, opens as before.
 #[tokio::test]
 async fn a_reconnect_to_another_server_halts_or_reruns_phase_0() {
@@ -297,6 +299,28 @@ async fn a_reconnect_to_another_server_halts_or_reruns_phase_0() {
             "the slot is neither dropped nor made again"
         );
     }
+    let before = Checkpoint {
+        position: start.clone(),
+        server: Some(ServerIdentity::Postgres {
+            system_identifier,
+            timeline: timeline - 1,
+        }),
+    };
+    for c in [&halt, &recover] {
+        let e = SourceConnector::open_stream(c, &before, &tables)
+            .await
+            .map(drop)
+            .unwrap_err();
+        assert!(
+            matches!(&e, SourceError::SourceChanged(m) if m.contains("promoted server")),
+            "{e:?}"
+        );
+        assert!(matches!(
+            c.reset_position(&before).await,
+            Err(SourceError::SourceChanged(_))
+        ));
+    }
+    assert_eq!(confirmed(&a, &n).await, slot, "the slot is untouched");
     let here = Checkpoint {
         position: start.clone(),
         server: p.server.clone(),

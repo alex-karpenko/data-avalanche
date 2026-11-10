@@ -7,7 +7,8 @@
 //!
 //! The slot-sync pair (`DATA_AVALANCHE_PG_SYNC_REPLICA=<primary port>:<replica port>`, DA-SRC-33):
 //! the pipeline's slot is a failover slot the standby synchronizes, so a promotion it followed
-//! continues the stream on the new timeline, without a halt or a re-snapshot.
+//! continues the stream on the new timeline, without a halt or a re-snapshot, while the pipeline
+//! runs on through it behind one address.
 
 use std::time::Duration;
 
@@ -16,6 +17,7 @@ use data_avalanche_core::position::Lsn;
 use data_avalanche_testkit::require_it;
 
 use crate::harness::{E2e, Options, eventually};
+use crate::proxy::Proxy;
 use crate::source::{Db, Source};
 
 const ITEMS: &str = "CREATE TABLE items (id bigint PRIMARY KEY, doc text);";
@@ -232,10 +234,13 @@ async fn a_promoted_replica_halts_the_pipeline_then_re_snapshots_on_request() {
 }
 
 /// DA-SRC-33 (Q-M12d-5): the pipeline makes its slot a failover slot (PostgreSQL 17+), and the
-/// standby synchronizes it. Stopped once the slot holds the lake's markers, the pipeline is moved
-/// to the promoted standby: its start finds the slot there, synchronized past every marker, and
-/// the stream continues on the new timeline, under `source_change_action`'s default (`error`),
-/// without a re-snapshot.
+/// standby synchronizes it. The pipeline reads the primary through one address (a proxy, as a
+/// virtual IP or a DNS name is), and runs on through the failover: once the standby's copy of
+/// the slot holds the lake's markers, the address is cut off, the standby promoted, and the
+/// address moved to it. The stream's reconnect reaches the promoted server and asks a rerun of
+/// the start, under `source_change_action`'s default (`error`); the start finds the slot there,
+/// synchronized up to the checkpoint, and the stream continues on the new timeline, without a
+/// halt or a re-snapshot.
 #[tokio::test]
 async fn a_promotion_the_failover_slot_followed_continues_the_stream() {
     require_it!();
@@ -245,12 +250,14 @@ async fn a_promotion_the_failover_slot_followed_continues_the_stream() {
         return;
     };
     let standby = standby(replica, "postgres-sync-primary postgres-sync-replica").await;
+    let address = Proxy::tcp(primary).await;
     let e = E2e::on(
         Source::Postgres { port: primary },
         "pg_failover_slot",
         &format!("{ITEMS} INSERT INTO items SELECT g, 'p' FROM generate_series(1, 5) g;"),
         Options {
             tables: ", snapshots: { mode: initial }",
+            port: Some(address.port()),
             ..Options::default()
         },
     )
@@ -287,7 +294,6 @@ async fn a_promotion_the_failover_slot_followed_continues_the_stream() {
         async || e.acknowledges(&marker).await,
     )
     .await;
-    assert!(p.terminate().await.success());
     assert_eq!(
         e.db.text(&format!(
             "SELECT failover FROM pg_replication_slots WHERE slot_name = '{s}'"
@@ -299,33 +305,48 @@ async fn a_promotion_the_failover_slot_followed_continues_the_stream() {
         "a managed slot is a failover slot on PostgreSQL 17+"
     );
 
-    // The standby's copy follows the stopped pipeline's slot up to its checkpoint.
-    let checkpoint = e
-        .docs()
-        .slot()
-        .await
-        .expect("the slot document reads")
-        .expect("a checkpoint")
-        .doc
-        .confirmed_flush_lsn;
+    // The standby's copy follows the slot up to the pipeline's checkpoint, which the slot
+    // confirms; then the address is cut off, so neither moves on. A start continues only from a
+    // slot confirmed exactly at the checkpoint.
+    let caught_up = async || {
+        let checkpoint = e
+            .docs()
+            .slot()
+            .await
+            .expect("the slot document reads")
+            .expect("a checkpoint")
+            .doc
+            .confirmed_flush_lsn;
+        let copy = format!(
+            "SELECT 1 FROM pg_replication_slots
+              WHERE slot_name = '{s}' AND synced AND failover
+                AND confirmed_flush_lsn >= '{checkpoint}'::pg_lsn
+                AND confirmed_flush_lsn >= '{}'::pg_lsn",
+            marker.untagged()
+        );
+        e.acknowledges(&SourcePosition::Pg(checkpoint)).await && standby.any(&copy).await
+    };
     eventually(
         "the standby's copy of the slot reaches the checkpoint",
         Duration::from_secs(180),
-        async || {
-            standby
-                .any(&format!(
-                    "SELECT 1 FROM pg_replication_slots
-                      WHERE slot_name = '{s}' AND synced AND failover
-                        AND confirmed_flush_lsn >= '{checkpoint}'::pg_lsn
-                        AND confirmed_flush_lsn >= '{}'::pg_lsn",
-                    marker.untagged()
-                ))
-                .await
-        },
+        caught_up,
+    )
+    .await;
+    let nowhere = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .expect("a port")
+        .local_addr()
+        .expect("its address")
+        .port();
+    address.switch(nowhere);
+    eventually(
+        "the copy still holds the checkpoint once cut off",
+        Duration::from_secs(60),
+        caught_up,
     )
     .await;
 
-    // The failover: the standby, promoted, takes writes on a timeline of its own.
+    // The failover: the standby, promoted, takes writes on a timeline of its own, and the
+    // address moves to it. The pipeline was never stopped.
     let promoted = standby
         .text("SELECT pg_promote()")
         .await
@@ -339,22 +360,17 @@ async fn a_promotion_the_failover_slot_followed_continues_the_stream() {
         .exec(&format!("INSERT INTO {s}.items VALUES (9, 'r')"))
         .await
         .expect("a write on the promoted standby");
+    address.switch(replica);
 
-    // The pipeline, moved to it, streams on: no halt, no re-snapshot. The node runs the
-    // cluster's config generation, the old server's, until the move is reloaded.
-    let mut p = e.start(&[]);
-    p.ready().await;
-    let first = e.config();
-    let moved = first.replacen(
-        &format!("      port: {primary}\n"),
-        &format!("      port: {replica}\n"),
-        1,
-    );
-    assert_ne!(moved, first);
-    e.write_config(&moved);
-    assert_eq!(p.reload().await.0, 202);
+    // The reconnect reruns the start, which continues the stream: no halt, no re-snapshot. The
+    // reconnects backed off while the address led nowhere: the first row may take a while.
+    eventually(
+        "the lake holds 1..9",
+        Duration::from_secs(180),
+        async || e.ids("items").await == (1..=9).collect::<Vec<_>>(),
+    )
+    .await;
     p.metric(&e.status("running")).await;
-    holds(&e, &(1..=9).collect::<Vec<_>>()).await;
     standby
         .exec(&format!("INSERT INTO {s}.items VALUES (10, 'r')"))
         .await
@@ -366,6 +382,10 @@ async fn a_promotion_the_failover_slot_followed_continues_the_stream() {
         "no re-snapshot"
     );
     let log = p.log();
+    assert!(
+        log.contains("a promoted server of the same system"),
+        "{log}"
+    );
     assert!(
         log.contains("so the stream continues on the new timeline"),
         "{log}"

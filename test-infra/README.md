@@ -125,9 +125,11 @@ it runs the scenario.
 
 The failover-slot scenario (M12d, DA-SRC-33) runs on the second pair: the pipeline's slot is a
 failover slot (PostgreSQL 17+), which `postgres-sync-replica` synchronizes through the physical
-slot `standby_sync`. Once the standby holds it, the pipeline is stopped, the standby promoted and
-the pipeline moved to it: the stream continues on the new timeline, without a halt or a
-re-snapshot. This pair also serves one run; `DATA_AVALANCHE_PG_SYNC_REPLICA` names it.
+slot `standby_sync`. The pipeline reads the primary through one address (a proxy in the test).
+Once the standby holds the slot, the address is cut off, the standby promoted and the address
+moved to it, the pipeline running all along: its reconnect reruns the start, and the stream
+continues on the new timeline, without a halt or a re-snapshot. This pair also serves one run;
+`DATA_AVALANCHE_PG_SYNC_REPLICA` names it.
 
 ```sh
 docker compose -f test-infra/compose.yaml --profile replica up -d --wait --force-recreate \

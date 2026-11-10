@@ -378,7 +378,10 @@ fn same_columns(cached: &TableSchema, now: &TableSchema, fold: bool) -> bool {
 /// DA-SRC-33: the highest position the lake's markers name, at least `checkpoint`: every table
 /// the sink holds, `tracked` too (a reposition's set), for the source to decide whether its
 /// stream continues on another server. A marker another source kind wrote doesn't compare and
-/// is left out.
+/// is left out. A sink read that fails transiently is retried in place; one that fails for good
+/// ends the start with that sink error, as the start's other reads of the same tables would:
+/// declining the continuation instead would turn a sink fault into a re-snapshot or a
+/// `WAL_SOURCE_CHANGED` halt.
 async fn highest_marker<'a>(
     sink: &dyn Sink,
     tuning: &Tuning,
@@ -986,8 +989,10 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
             .await?;
     }
     // A resume on another server than the checkpoint's: the source continued its stream there
-    // (a promotion its slot followed, DA-SRC-33). The checkpoint records the new server, which
-    // the stream's open and a later start check, as a fresh start's does (D-M12d.11).
+    // (PostgreSQL: a promotion its slot followed, DA-SRC-33; MySQL in GTID mode: a GTID set
+    // means the same on any server of the topology). The checkpoint records the new server, which
+    // the stream's open and a later start check, as a fresh start's does (D-M12d.11); MySQL's
+    // writer would record it at the first flush anyway, so there it is only an earlier write.
     let moved = matches!(plan, Plan::Resume)
         && server.is_some()
         && checkpoint
@@ -1518,9 +1523,10 @@ mod tests {
         );
     }
 
-    /// The same failover under `source_change_action: error`: the reset halts with
-    /// `WAL_SOURCE_CHANGED` and replaces nothing; the checkpoint still names the old server, and
-    /// a restart halts the same way.
+    /// The same failover under `source_change_action: error`: the reset, on a promoted server of
+    /// the same system, replaces nothing and asks a rerun of the start (`SourceChanged`, which
+    /// decides whether the stream continues, DA-SRC-33); the checkpoint still names the old
+    /// server, and the rerun, whose slot didn't follow, halts with `WAL_SOURCE_CHANGED`.
     #[tokio::test]
     async fn a_failover_mid_run_halts_under_error() {
         let w = World::new(&["a"]);
@@ -1540,17 +1546,122 @@ mod tests {
             let _ = tokio::time::timeout(Duration::from_secs(10), st.wait_for(|_| false)).await;
         })
         .await;
-        let end = end.expect_err("the worker halts");
-        assert_eq!(end.code(), Some("WAL_SOURCE_CHANGED"), "{end:?}");
-        assert_eq!(end.recovery(), crate::Recovery::Error);
+        let end = end.expect_err("the worker ends");
+        assert!(
+            matches!(end, WorkerError::Source(SourceError::SourceChanged(_))),
+            "{end:?}"
+        );
+        assert_eq!(end.recovery(), crate::Recovery::Retry);
         assert_eq!(
             w.docs.slot().await.unwrap().unwrap().doc.server,
             Some(pg(1))
         );
         let (end, _) = run(&w, &mode("mode: never"), async |_| {}).await;
+        let end = end.expect_err("the rerun halts");
+        assert_eq!(end.code(), Some("WAL_SOURCE_CHANGED"), "{end:?}");
+        assert_eq!(end.recovery(), crate::Recovery::Error);
+    }
+
+    /// DA-SRC-33: a reconnect that reaches a promoted server the slot followed, under
+    /// `source_change_action: error`: the worker ends with `SourceChanged` instead of halting,
+    /// and the rerun's start continues the stream there, nothing re-snapshotted.
+    #[tokio::test]
+    async fn a_reconnect_to_the_promoted_server_reruns_the_start_which_continues() {
+        let w = World::new(&["a"]);
+        let pg = |timeline| ServerIdentity::Postgres {
+            system_identifier: 7,
+            timeline,
+        };
+        w.source.set_server(Some(pg(1)));
+        w.source.halt_on_source_change();
+        w.source.load(&t("a"), rows(1..=2));
+        let (end, _) = run(&w, &mode("mode: initial"), async |status| {
+            w.source
+                .commit(FakeTxn::new().insert(&t("a"), row(3, "before")));
+            streamed(&status, &w).await;
+            w.source.promote_following(pg(2));
+            w.source.fail(
+                Method::Next,
+                SourceError::Transient("connection reset".into()),
+            );
+            // Until the worker ends (its status closes).
+            let mut st = status.clone();
+            let _ = tokio::time::timeout(Duration::from_secs(10), st.wait_for(|_| false)).await;
+        })
+        .await;
+        let end = end.expect_err("the worker ends");
+        assert!(
+            matches!(end, WorkerError::Source(SourceError::SourceChanged(_))),
+            "{end:?}"
+        );
+        assert_eq!(end.recovery(), crate::Recovery::Retry);
+        let read = w.source.reads(&t("a"));
+        let (end, st) = run(&w, &mode("mode: never"), async |status| {
+            streamed(&status, &w).await;
+            w.source
+                .commit(FakeTxn::new().insert(&t("a"), row(4, "after")));
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!(w.ids("a"), [1, 2, 3, 4]);
+        assert_eq!(w.source.reads(&t("a")), read, "nothing re-snapshotted");
         assert_eq!(
-            end.expect_err("a restart halts").code(),
-            Some("WAL_SOURCE_CHANGED")
+            w.docs.slot().await.unwrap().unwrap().doc.server,
+            Some(pg(2))
+        );
+        assert!(st.halted.is_empty(), "{:?}", st.halted);
+    }
+
+    /// DA-SRC-33: the highest marker counts the tables the lake holds outside the config too,
+    /// and leaves out a marker that doesn't compare (another source kind's).
+    #[tokio::test]
+    async fn the_highest_marker_counts_held_tables_and_skips_other_dialects() {
+        let w = World::new(&["a", "x"]);
+        let marked = lake_with_an_untracked_table(&w).await;
+        let SourcePosition::Pg(Lsn(at)) = marked.committed_position else {
+            unreachable!()
+        };
+        let past = SourcePosition::Pg(Lsn(at + 0x40));
+        w.sink.mark_at(&t("x"), past.clone());
+        w.source.fail_over(
+            ServerIdentity::Postgres {
+                system_identifier: 7,
+                timeline: 2,
+            },
+            Lsn(0x100),
+        );
+        let (end, _) = run(&w, &mode("mode: never"), async |status| {
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!(w.source.marks().last(), Some(&Some(past)), "x's marker");
+
+        let w = World::new(&["a", "x"]);
+        lake_with_an_untracked_table(&w).await;
+        let checkpoint = w
+            .docs
+            .slot()
+            .await
+            .unwrap()
+            .unwrap()
+            .doc
+            .confirmed_flush_lsn;
+        w.sink
+            .mark_at(&t("x"), "binlog:b.000001:4".parse().unwrap());
+        w.source.fail_over(
+            ServerIdentity::Postgres {
+                system_identifier: 7,
+                timeline: 2,
+            },
+            Lsn(0x100),
+        );
+        let _ = run(&w, &mode("mode: never"), async |_| {}).await;
+        assert_eq!(
+            w.source.marks().last(),
+            Some(&Some(SourcePosition::Pg(checkpoint))),
+            "the binlog marker is left out"
         );
     }
 

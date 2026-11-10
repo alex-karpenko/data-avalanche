@@ -362,13 +362,39 @@ pub fn source_change(
 /// open and the reset of a lost position read the server first, and a `lost` checkpoint read on
 /// another system or timeline halts as a start would (`source_change_action: error`, the same
 /// `WAL_SOURCE_CHANGED`), or asks a rerun of Phase 0 (`re_snapshot`:
-/// [`SourceError::SourceChanged`]), whose `prepare` plans the recovery. Nothing on the server has
-/// changed by then.
+/// [`SourceError::SourceChanged`]), whose `prepare` plans the recovery. A later timeline of the
+/// checkpoint's system (a promoted standby) asks the rerun under either action: the slot may have
+/// followed the promotion, and only the start, told the lake's highest marker, decides whether the
+/// stream continues there ([`continues`], DA-SRC-33) or halts as the action says. Nothing on the
+/// server has changed by then.
 pub fn reconnect_check(
     lost: &Checkpoint,
     now: &ServerIdentity,
     action: SourceChangeAction,
 ) -> Result<(), SourceError> {
+    if let (
+        Some(
+            was @ ServerIdentity::Postgres {
+                system_identifier: was_system,
+                timeline: was_on,
+            },
+        ),
+        ServerIdentity::Postgres {
+            system_identifier,
+            timeline,
+        },
+    ) = (lost.server.as_ref(), now)
+        && was_system == system_identifier
+        && timeline > was_on
+    {
+        return Err(SourceError::SourceChanged(format!(
+            "the checkpoint {} was read on {was}, and the stream's reconnect reaches {now}, a \
+             promoted server of the same system: the pipeline starts again, and its start decides \
+             whether the stream continues there (a failover slot synchronized up to the \
+             checkpoint) or halts as source_change_action says",
+            lost.position.untagged()
+        )));
+    }
     if !source_change(Some(lost), now, action)? {
         return Ok(());
     }
@@ -440,10 +466,14 @@ pub fn on_source_change(
 
 /// DA-SRC-33 (Q-M12d-5): a promotion the pipeline's slot followed. The checkpoint was read on
 /// this system's earlier timeline, the slot here is a failover slot synchronized from the old
-/// primary and still streams, and it confirmed at least the checkpoint and `marked`, the lake's
-/// highest marker. A standby synchronizes a slot only to a position its own WAL holds, so all of
-/// that is below the timeline's switch point: the new timeline's changes come after every marker,
-/// and the stream continues there, nothing re-snapshotted. `marked` unread (`None`): no.
+/// primary and still streams, and it confirmed exactly the checkpoint, at or past `marked`, the
+/// lake's highest marker. A standby synchronizes a slot only to a position its own WAL holds, so
+/// all of that is below the timeline's switch point: the new timeline's changes come after every
+/// marker, and the stream continues there, nothing re-snapshotted. `marked` unread (`None`): no.
+/// The pipeline acknowledges only a durable checkpoint, so its own slot never confirms past it:
+/// a slot that did was moved by something else (an advance, an older restored state, another
+/// reader), the changes between are lost, and the start takes the source-change path, which
+/// honours `source_change_action`.
 pub fn continues(
     recorded: &Checkpoint,
     now: &ServerIdentity,
@@ -471,7 +501,8 @@ pub fn continues(
         && s.failover
         && s.synced
         && !s.invalidated
-        && s.confirmed_flush.is_some_and(|f| f >= at && f >= marked)
+        && marked <= at
+        && s.confirmed_flush == Some(at)
 }
 
 impl PgConnector {
@@ -894,14 +925,6 @@ impl PgConnector {
             added,
             mut warnings,
         } = self.reconcile_publication(&client, tables).await?;
-        if continued && let Some(was) = recorded.and_then(|c| c.server.as_ref()) {
-            warnings.push(format!(
-                "the checkpoint was read on {was}, and the pipeline now reads {server}: \
-                 replication slot {} came over synchronized, past everything the lake holds, \
-                 so the stream continues on the new timeline",
-                self.slot_name()
-            ));
-        }
         let decided = if changed {
             if let Some(was) = recorded.and_then(|c| c.server.as_ref()) {
                 warnings.push(format!(
@@ -944,6 +967,19 @@ impl PgConnector {
             from: SourcePosition::Pg(from),
             reason,
         };
+        // Said only of a start that does resume: a continued slot can still be refused, or
+        // re-snapshot for a publication the repair rewrote.
+        if continued
+            && action == SlotAction::Resume
+            && let Some(was) = recorded.and_then(|c| c.server.as_ref())
+        {
+            warnings.push(format!(
+                "the checkpoint was read on {was}, and the pipeline now reads {server}: \
+                 replication slot {} came over synchronized up to the checkpoint, with no marker \
+                 of the lake past it, so the stream continues on the new timeline",
+                self.slot_name()
+            ));
+        }
         if let SlotAction::Refuse(m) = action {
             return Err(SourceError::Permanent(m));
         }
@@ -1194,7 +1230,33 @@ mod tests {
             system_identifier: 7,
             timeline: 2,
         };
-        let lost = read_on(0x20, 7, 1);
+        // Another system, and an earlier timeline of this one: a halt, or a rerun under
+        // `re_snapshot`.
+        for lost in [read_on(0x20, 8, 2), read_on(0x20, 7, 3)] {
+            let e = reconnect_check(&lost, &now, SourceChangeAction::Error).unwrap_err();
+            assert_eq!(e.halt_code(), Some("WAL_SOURCE_CHANGED"), "{e}");
+            assert!(matches!(
+                reconnect_check(&lost, &now, SourceChangeAction::ReSnapshot),
+                Err(SourceError::SourceChanged(m)) if m.contains("re_snapshot")
+            ));
+        }
+        // A later timeline of this system (a promoted standby): a rerun under either action, for
+        // the start to decide whether the stream continues (DA-SRC-33).
+        let promoted = read_on(0x20, 7, 1);
+        for action in [SourceChangeAction::Error, SourceChangeAction::ReSnapshot] {
+            match reconnect_check(&promoted, &now, action) {
+                Err(SourceError::SourceChanged(m)) => assert!(
+                    m.starts_with(
+                        "the checkpoint 0/20 was read on PostgreSQL system 7 on timeline 1, and \
+                         the stream's reconnect reaches PostgreSQL system 7 on timeline 2, a \
+                         promoted server"
+                    ) && m.contains("its start decides"),
+                    "{m}"
+                ),
+                other => panic!("SourceChanged expected, got {other:?}"),
+            }
+        }
+        let lost = read_on(0x20, 8, 2);
         let e = reconnect_check(&lost, &now, SourceChangeAction::Error).unwrap_err();
         assert_eq!(e.halt_code(), Some("WAL_SOURCE_CHANGED"), "{e}");
         assert_eq!(
@@ -1207,8 +1269,8 @@ mod tests {
         match reconnect_check(&lost, &now, SourceChangeAction::ReSnapshot) {
             Err(SourceError::SourceChanged(m)) => assert!(
                 m.starts_with(
-                    "WAL_SOURCE_CHANGED: the checkpoint 0/20 was read on PostgreSQL system 7 on \
-                     timeline 1, and the stream's reconnect reaches PostgreSQL system 7 on \
+                    "WAL_SOURCE_CHANGED: the checkpoint 0/20 was read on PostgreSQL system 8 on \
+                     timeline 2, and the stream's reconnect reaches PostgreSQL system 7 on \
                      timeline 2"
                 ),
                 "{m}"
@@ -1241,8 +1303,8 @@ mod tests {
     }
 
     /// DA-SRC-33: a promotion the slot followed continues only on the same system's later
-    /// timeline, with the slot failover, synced and streaming, confirmed at the checkpoint and
-    /// at the lake's highest marker; anything else, or the marker unread, is a source change.
+    /// timeline, with the slot failover, synced and streaming, confirmed exactly at the checkpoint
+    /// with no marker past it; anything else, or the marker unread, is a source change.
     #[test]
     fn a_promotion_the_slot_followed_continues_the_stream() {
         let pg = |system_identifier, timeline| ServerIdentity::Postgres {
@@ -1270,6 +1332,7 @@ mod tests {
         assert!(!on(pg(7, 2), &synced, None), "the markers unread");
         assert!(!on(pg(8, 2), &synced, Some(0x20)), "another system");
         assert!(!on(pg(7, 1), &synced, Some(0x20)), "the same timeline");
+        assert!(!on(pg(7, 0), &synced, Some(0x20)), "an earlier timeline");
         let not = |f: fn(&mut SlotState)| {
             let mut s = synced.clone();
             f(&mut s);
@@ -1285,6 +1348,14 @@ mod tests {
                 Some(0x10)
             ),
             "the slot behind the checkpoint"
+        );
+        assert!(
+            !on(
+                pg(7, 2),
+                &not(|s| s.confirmed_flush = Some(Lsn(0x30))),
+                Some(0x30)
+            ),
+            "the slot past the checkpoint: something else moved it, and changes are lost"
         );
         assert!(
             !continues(&recorded, &pg(7, 2), None, Some(Lsn(0x20))),

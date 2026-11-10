@@ -495,6 +495,7 @@ impl FakeSource {
         db.wal_end = wal_end;
         db.slot = None;
         db.server = Some(server);
+        db.followed = false;
     }
 
     /// A promotion the pipeline's slot followed (DA-SRC-33): `server` answers from now on, with
@@ -658,7 +659,9 @@ impl FakeSource {
     /// [`Self::halt_on_source_change`]. A MySQL server is a GTID-mode one: its checkpoints are
     /// carried across servers.
     pub fn set_server(&self, server: Option<ServerIdentity>) {
-        self.db().server = server;
+        let mut db = self.db();
+        db.server = server;
+        db.followed = false;
     }
 
     /// Chunk reads of `table` so far.
@@ -724,7 +727,9 @@ impl FakeSource {
 impl Db {
     /// The PostgreSQL source's server check (DA-SRC-20) of a checkpoint `at`, read on another
     /// server: a halt after [`FakeSource::halt_on_source_change`]; otherwise at a start
-    /// (`at_start`) `Ok(true)`, a source-change start, and at a reconnect `SourceChanged`.
+    /// (`at_start`) `Ok(true)`, a source-change start, and at a reconnect `SourceChanged`. A
+    /// reconnect to a later timeline of the checkpoint's system (a promoted standby) is
+    /// `SourceChanged` either way: the start decides whether the stream continues (DA-SRC-33).
     fn source_change(&self, at: &Checkpoint, at_start: bool) -> Result<bool, SourceError> {
         let (Some(was @ ServerIdentity::Postgres { .. }), Some(now)) = (&at.server, &self.server)
         else {
@@ -732,6 +737,25 @@ impl Db {
         };
         if was == now {
             return Ok(false);
+        }
+        if let (
+            ServerIdentity::Postgres {
+                system_identifier: a,
+                timeline: t,
+            },
+            ServerIdentity::Postgres {
+                system_identifier: b,
+                timeline: u,
+            },
+        ) = (was, now)
+            && !at_start
+            && a == b
+            && u > t
+        {
+            return Err(SourceError::SourceChanged(format!(
+                "the checkpoint {} was read on {was}, and the stream's reconnect reaches {now}, a promoted server of the same system",
+                at.position
+            )));
         }
         let why = format!(
             "WAL_SOURCE_CHANGED: the checkpoint {} was read on {was}, and the pipeline now reads {now}",
@@ -1042,9 +1066,13 @@ impl SourceConnector for FakeSource {
         {
             let mut db = self.db();
             db.marks.push(marked.cloned());
+            // As `continues` decides: the slot confirmed exactly the checkpoint, and no marker
+            // is past it.
             db.continuing = db.followed
-                && marked.is_some_and(|m| db.slot.is_some_and(|s| s >= lsn(m)))
-                && checkpoint.is_some_and(|c| db.slot.is_some_and(|s| s >= lsn(&c.position)));
+                && checkpoint.is_some_and(|c| {
+                    let at = lsn(&c.position);
+                    db.slot == Some(at) && marked.is_some_and(|m| lsn(m) <= at)
+                });
         }
         self.prepare(checkpoint, tables).await
     }
