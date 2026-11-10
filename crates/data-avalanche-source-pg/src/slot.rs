@@ -707,8 +707,10 @@ impl PgConnector {
                 ));
             }
             // The publication's direct members become exactly the tracked set: a tracked table
-            // it publishes only through a partitioned root or a schema is added by name (it was
-            // published before, so it isn't in `added` and isn't copied again).
+            // it publishes only through a schema is added by name (it was published before, so
+            // it isn't in `added` and isn't copied again); one it publishes only through a
+            // partitioned root isn't listed by the server under its own name, so it is in
+            // `added` and is copied again.
             let members: BTreeSet<&TableRef> = shape.members.iter().collect();
             let to_add: Vec<String> = tables
                 .iter()

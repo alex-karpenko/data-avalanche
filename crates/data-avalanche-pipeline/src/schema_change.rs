@@ -29,13 +29,14 @@ pub(crate) fn soft_dropped(sink: &Schema, source: &TableSchema) -> usize {
 }
 
 /// A table the sink holds while the pipeline has no schema cached for it (a wiped state,
-/// DA-SNAP-13): the source's columns the sink table lacks, by name, as the `AddColumn`s that
+/// DA-SNAP-13, or a table first tracked at a resume, DA-SNAP-22): the source's columns the sink table lacks, by name, as the `AddColumn`s that
 /// baseline it before the copy. Names match without case, Unicode's, as Delta's do
 /// ([`differ_by_case_alone`]): a sink column that matches by case alone can't sit beside the
 /// source's, so it halts, naming both spellings. A
 /// column it holds as another type still surfaces at the first commit (`SINK_REJECTED`); a
 /// nullable one the source lacks stays, soft-dropped. A key column it lacks can't be added: the
-/// table is keyed otherwise, and halts. So does a non-null column the source lacks: no row of the
+/// table is keyed otherwise, and halts. (The halt text says "a run whose state is gone", as the
+/// plan words it; at a resume the table's state was never there.) So does a non-null column the source lacks: no row of the
 /// source's could fill it (DA-SNAP-22).
 pub(crate) fn missing_columns(
     sink: &Schema,
@@ -72,6 +73,7 @@ pub(crate) fn missing_columns(
         }
         adds.push(SchemaChange::AddColumn(c.clone()));
     }
+    // The case-only term can't decide the result: the loop above has already halted on such a pair.
     if let Some(f) = sink.fields().iter().find(|f| {
         !f.is_nullable()
             && !LINEAGE_COLUMNS.contains(&f.name().as_str())
