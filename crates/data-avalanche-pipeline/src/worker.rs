@@ -981,7 +981,8 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
     let truncating = jobs.truncating();
     for table in started.iter().filter(|t| truncating.contains(*t)) {
         if let Some(schema) = resolved_tables.get(table).or_else(|| copies.get(table)) {
-            // No key to commit under is as good as a committed truncate: nothing to empty.
+            // The result is `true`: a truncate runs under the source's key, which a resolved
+            // schema always has (`Ok(false)` is a reposition's).
             commit_empty(
                 core,
                 &tuning,
@@ -2458,6 +2459,123 @@ mod tests {
         assert_eq!(w.ids("a"), [1]);
         let content = w.sink.content(&t("a")).unwrap();
         assert!(content.column_by_name("note").is_none(), "nothing evolved");
+    }
+
+    /// A lake that holds `x`, a table the config doesn't name and the cache doesn't know (a job's
+    /// copy, a table taken out of the config), with a marker on the first server, beside the
+    /// streamed `a`.
+    async fn lake_with_an_untracked_table(w: &World) -> CommitMarker {
+        let pg = |timeline| ServerIdentity::Postgres {
+            system_identifier: 7,
+            timeline,
+        };
+        w.source.outside_config(&t("x"));
+        w.source.set_server(Some(pg(1)));
+        let (end, _) = run(w, &mode("mode: never"), async |status| {
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+            streamed(&status, w).await;
+        })
+        .await;
+        end.unwrap();
+        let spec = TableSpec::new(&w.source.schema(&t("x")), vec![]).unwrap();
+        w.sink.ensure_table(&spec).await.unwrap();
+        let columns = w.sink.table_state(&t("x")).await.unwrap().schema.unwrap();
+        let marked = w.sink.table_state(&t("a")).await.unwrap().marker.unwrap();
+        let at = marked.committed_position.clone();
+        let cs = TableChangeSet {
+            table: t("x"),
+            schema: columns,
+            identifier: vec!["id".into()],
+            truncate: false,
+            upserts: vec![],
+            deletes: vec![],
+            position: PositionRange {
+                start: at.clone(),
+                end: at.clone(),
+                last_change: at,
+            },
+            split: None,
+            snapshot: false,
+            reposition: true,
+        };
+        w.sink.commit(cs, marked.clone()).await.unwrap();
+        marked
+    }
+
+    /// DA-SRC-32: a held table the sink refuses the reposition of halts `SINK_REJECTED` (it shows
+    /// in the status, and the halt registry records it), the start goes on, and the other tables
+    /// are repositioned.
+    #[tokio::test]
+    async fn a_refused_reposition_halts_that_table_and_the_start_goes_on() {
+        let w = World::new(&["a", "x"]);
+        let old = lake_with_an_untracked_table(&w).await;
+        w.sink
+            .fail(SinkOp::Commit, Some(&t("x")), 1, || SinkError::Permanent {
+                reason: "refused".into(),
+            });
+        w.source.fail_over(
+            ServerIdentity::Postgres {
+                system_identifier: 7,
+                timeline: 2,
+            },
+            Lsn(0x100),
+        );
+        let (end, st) = run(&w, &mode("mode: never"), async |status| {
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        match st.halted.get(&t("x")) {
+            Some(HaltReason::SinkRejected { detail }) => {
+                assert!(detail.contains("reposition fails"), "{detail}");
+                assert!(detail.contains("refused"), "{detail}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let halts = w.docs.halts().await.unwrap().tables;
+        assert!(
+            halts
+                .iter()
+                .any(|h| h.table == t("x") && matches!(h.reason, HaltReason::SinkRejected { .. })),
+            "{halts:?}"
+        );
+        let moved = w.sink.table_state(&t("a")).await.unwrap().marker.unwrap();
+        assert_eq!(moved.committed_position, SourcePosition::Pg(Lsn(0x100)));
+        let x = w.sink.table_state(&t("x")).await.unwrap().marker.unwrap();
+        assert_eq!(x, old, "x's marker stays: its reposition was refused");
+    }
+
+    /// DA-SRC-32: a held table that records no key, and that the pipeline doesn't track either,
+    /// has no key to reposition under: its marker stays, and the status says so.
+    #[tokio::test]
+    async fn a_held_table_with_no_key_is_warned_about() {
+        let w = World::new(&["a", "x"]);
+        let old = lake_with_an_untracked_table(&w).await;
+        w.sink.forget_key(&t("x"));
+        w.source.fail_over(
+            ServerIdentity::Postgres {
+                system_identifier: 7,
+                timeline: 2,
+            },
+            Lsn(0x100),
+        );
+        let (end, st) = run(&w, &mode("mode: never"), async |status| {
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert!(
+            st.warnings
+                .iter()
+                .any(|m| m.contains("public.x") && m.contains("records no key")),
+            "{:?}",
+            st.warnings
+        );
+        assert!(st.halted.is_empty(), "{:?}", st.halted);
+        let x = w.sink.table_state(&t("x")).await.unwrap().marker.unwrap();
+        assert_eq!(x, old);
+        let moved = w.sink.table_state(&t("a")).await.unwrap().marker.unwrap();
+        assert_eq!(moved.committed_position, SourcePosition::Pg(Lsn(0x100)));
     }
 
     /// The sink holds the table under another key (the source's key, or its override, changed

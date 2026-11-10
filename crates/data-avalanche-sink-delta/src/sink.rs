@@ -361,6 +361,7 @@ impl Sink for DeltaSink {
     /// can't have made isn't a table of the pipeline's.
     async fn held_tables(&self) -> Result<Vec<TableRef>, SinkError> {
         use deltalake::logstore::object_store::path::Path;
+        use futures_util::StreamExt;
         let root = self.config.location.root_url()?;
         if let Ok(dir) = root.to_file_path()
             && !dir.exists()
@@ -395,8 +396,16 @@ impl Sink for DeltaSink {
                 else {
                     continue;
                 };
+                // One entry is enough, and one page: a log keeps every commit of its retention.
                 let log = table_dir.clone().join("_delta_log");
-                if !list(Some(&log)).await?.objects.is_empty() {
+                if store
+                    .list(Some(&log))
+                    .next()
+                    .await
+                    .transpose()
+                    .map_err(|e| sink_error(e.into()))?
+                    .is_some()
+                {
                     out.push(TableRef::new(schema.clone(), name));
                 }
             }
@@ -540,8 +549,8 @@ mod tests {
         s.attempt(h, cs, &marker(epoch, cs), false).await.unwrap()
     }
 
-    /// and a directory without a log aren't tables. The table state says the key it was made
-    /// with.
+    /// DA-SRC-32: the sink lists every table under its root, escaped names too, and not the
+    /// co-located state or a folder without a `_delta_log`; a table's state gives its key.
     #[tokio::test]
     async fn the_sink_lists_the_tables_it_holds() {
         use data_avalanche_core::{ColumnSchema, ColumnValueType as V, TableSchema};

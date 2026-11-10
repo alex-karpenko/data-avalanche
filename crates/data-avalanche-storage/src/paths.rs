@@ -58,22 +58,29 @@ fn escape_with(ident: &str, mark: char) -> String {
     out
 }
 
-/// The identifier [`escape_table_segment`] made `segment` from; `None` for a segment it can't
-/// have made (a `~` not followed by two hex digits, escaped bytes that aren't UTF-8).
+/// The identifier [`escape_table_segment`] made `segment` from (or, for [`COLOCATED_STATE_DIR`],
+/// the schema segment [`table_root`] makes of it); `None` for a segment it can't have made: a `~`
+/// not followed by two upper-case hex digits, escaped bytes that aren't UTF-8, a character the
+/// escape would have escaped.
 pub fn unescape_table_segment(segment: &str) -> Option<String> {
     let mut bytes = Vec::with_capacity(segment.len());
     let mut rest = segment.as_bytes();
     while let Some((&b, tail)) = rest.split_first() {
         if b == b'~' {
-            let hex = std::str::from_utf8(tail.get(..2)?).ok()?;
-            bytes.push(u8::from_str_radix(hex, 16).ok()?);
+            let hex = tail.get(..2)?;
+            if !hex.iter().all(|h| matches!(h, b'0'..=b'9' | b'A'..=b'F')) {
+                return None;
+            }
+            bytes.push(u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?);
             rest = &tail[2..];
         } else {
             bytes.push(b);
             rest = tail;
         }
     }
-    String::from_utf8(bytes).ok()
+    let name = String::from_utf8(bytes).ok()?;
+    let schema_form = name == COLOCATED_STATE_DIR && segment == "~2Epipeline-state";
+    (schema_form || escape_table_segment(&name) == segment).then_some(name)
 }
 
 /// `<sink.bucket>/<sink.prefix>/<schema>/<table>/`: one table's root, for every sink format, with
@@ -163,6 +170,19 @@ mod tests {
         assert_eq!(unescape_table_segment("bad~4"), None);
         assert_eq!(unescape_table_segment("bad~ZZ"), None);
         assert_eq!(unescape_table_segment("~FF"), None, "not UTF-8");
+        assert_eq!(unescape_table_segment("~2e"), None, "lower-case hex");
+        assert_eq!(
+            unescape_table_segment("~+5"),
+            None,
+            "a sign isn't a hex digit"
+        );
+        assert_eq!(
+            unescape_table_segment("a\tb"),
+            None,
+            "a control character is escaped"
+        );
+        assert_eq!(unescape_table_segment("a%b"), None, "a % is escaped");
+        assert_eq!(unescape_table_segment("~2Fb"), Some("/b".into()));
     }
 
     #[test]

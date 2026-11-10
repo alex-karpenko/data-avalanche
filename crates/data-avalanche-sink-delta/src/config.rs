@@ -242,6 +242,30 @@ mod tests {
     }
 
     #[test]
+    fn the_root_url_is_the_sink_root() {
+        assert_eq!(
+            bucket(Backend::S3, vec![]).root_url().unwrap().as_str(),
+            "s3://lake/orders/v1/"
+        );
+        assert_eq!(
+            bucket(Backend::Azure { account: None }, vec![])
+                .root_url()
+                .unwrap()
+                .as_str(),
+            "az://lake/orders/v1/"
+        );
+        let mut bare = bucket(Backend::Gcs, vec![]);
+        if let DeltaLocation::Bucket { prefix, .. } = &mut bare {
+            prefix.clear();
+        }
+        assert_eq!(bare.root_url().unwrap().as_str(), "gs://lake/");
+        let local = DeltaLocation::Local {
+            root: PathBuf::from("/data/lake"),
+        };
+        assert_eq!(local.root_url().unwrap().as_str(), "file:///data/lake/");
+    }
+
+    #[test]
     fn a_location_that_makes_no_url_is_a_permanent_error() {
         let t = TableRef::new("public", "orders");
         let relative = DeltaLocation::Local {

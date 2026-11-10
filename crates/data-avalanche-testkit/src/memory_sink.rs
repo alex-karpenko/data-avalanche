@@ -290,6 +290,13 @@ impl MemorySink {
         }
     }
 
+    /// The table no longer records the key it was created with, as a table an older writer made
+    /// (`SinkTableState::identifier` is empty).
+    pub fn forget_key(&self, table: &TableRef) {
+        let mut tables = self.tables();
+        tables.get_mut(table).expect("a table").identifier.clear();
+    }
+
     /// The marker of the table's last commit.
     pub fn marker(&self, table: &TableRef) -> Option<CommitMarker> {
         self.tables().get(table).and_then(|t| t.marker.clone())
