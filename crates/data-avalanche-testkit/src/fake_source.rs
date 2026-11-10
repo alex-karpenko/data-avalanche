@@ -260,6 +260,10 @@ struct Db {
     server: Option<ServerIdentity>,
     /// [`FakeSource::halt_on_source_change`].
     source_change_halts: bool,
+    /// [`FakeSource::promote_following`]: the slot followed the last server change.
+    followed: bool,
+    /// Set by `prepare_marked` for the `prepare` it calls: the stream continues on this server.
+    continuing: bool,
     reads: BTreeMap<TableRef, usize>,
     rescans: usize,
     rescan_warnings: Vec<String>,
@@ -269,6 +273,8 @@ struct Db {
     teardowns: usize,
     fetches: BTreeMap<TableRef, usize>,
     prepares: Vec<Option<Checkpoint>>,
+    /// What each `prepare_marked` was told the lake's highest marker is.
+    marks: Vec<Option<SourcePosition>>,
     /// Column names compare without case, as MySQL's do (DA-SRC-25).
     fold: bool,
 }
@@ -321,6 +327,8 @@ impl FakeSource {
             opened: vec![],
             server: None,
             source_change_halts: false,
+            followed: false,
+            continuing: false,
             reads: BTreeMap::new(),
             rescans: 0,
             rescan_warnings: Vec::new(),
@@ -330,6 +338,7 @@ impl FakeSource {
             teardowns: 0,
             fetches: BTreeMap::new(),
             prepares: vec![],
+            marks: vec![],
             fold: false,
         };
         for t in tables {
@@ -488,6 +497,15 @@ impl FakeSource {
         db.server = Some(server);
     }
 
+    /// A promotion the pipeline's slot followed (DA-SRC-33): `server` answers from now on, with
+    /// the WAL and the slot as they were. A start told a marker the slot has confirmed
+    /// ([`SourceConnector::prepare_marked`]) resumes there, as the PostgreSQL source does.
+    pub fn promote_following(&self, server: ServerIdentity) {
+        let mut db = self.db();
+        db.server = Some(server);
+        db.followed = true;
+    }
+
     /// From now on a source change halts, as `source_change_action: error` does
     /// (`WAL_SOURCE_CHANGED`), instead of `re_snapshot`'s recovery.
     pub fn halt_on_source_change(&self) {
@@ -610,6 +628,11 @@ impl FakeSource {
     /// The checkpoint each stream was opened at, with its server, in order.
     pub fn opened_at(&self) -> Vec<Checkpoint> {
         self.db().opened.clone()
+    }
+
+    /// What each start's `prepare_marked` was told the lake's highest marker is (DA-SRC-33).
+    pub fn marks(&self) -> Vec<Option<SourcePosition>> {
+        self.db().marks.clone()
     }
 
     /// The checkpoint's position each `prepare` was called with.
@@ -1006,7 +1029,24 @@ impl SourceConnector for FakeSource {
         Ok(Preflight {
             server_version: "fake".into(),
             warnings: vec![],
+            server: self.db().server.clone(),
         })
+    }
+
+    async fn prepare_marked(
+        &self,
+        checkpoint: Option<&Checkpoint>,
+        tables: &[TableRef],
+        marked: Option<&SourcePosition>,
+    ) -> Result<Prepared, SourceError> {
+        {
+            let mut db = self.db();
+            db.marks.push(marked.cloned());
+            db.continuing = db.followed
+                && marked.is_some_and(|m| db.slot.is_some_and(|s| s >= lsn(m)))
+                && checkpoint.is_some_and(|c| db.slot.is_some_and(|s| s >= lsn(&c.position)));
+        }
+        self.prepare(checkpoint, tables).await
     }
 
     async fn resolve_tables(&self) -> Result<ResolvedTables, SourceError> {
@@ -1045,7 +1085,9 @@ impl SourceConnector for FakeSource {
         let mut db = self.db();
         db.prepares.push(checkpoint.cloned());
         let server = db.server.clone();
+        let continuing = std::mem::take(&mut db.continuing);
         let changed = match checkpoint {
+            Some(_) if continuing => false,
             Some(c) => db.source_change(c, true)?,
             None => false,
         };

@@ -78,6 +78,10 @@ pub struct Preflight {
     /// The server's version string, for status and logs.
     pub server_version: String,
     pub warnings: Vec<String>,
+    /// The server the preflight reached, as a checkpoint records it: a start compares it with
+    /// the checkpoint's to tell [`SourceConnector::prepare_marked`] the lake's highest marker
+    /// (DA-SRC-33). `None` for a source that doesn't continue across a server change.
+    pub server: Option<ServerIdentity>,
 }
 
 /// The tracked table set at start (channel A): the configured include/exclude globs resolved
@@ -389,6 +393,21 @@ pub trait SourceConnector: Send + Sync {
         checkpoint: Option<&Checkpoint>,
         tables: &[TableRef],
     ) -> Result<Prepared, SourceError>;
+
+    /// [`Self::prepare`], told `marked`: the highest position the lake's markers name, at least
+    /// the checkpoint's, read when the preflight found another server than the checkpoint's. A
+    /// source that can keep its stream across a server change (PostgreSQL's synchronized failover
+    /// slot, DA-SRC-33) does only when the new server's position covers it: otherwise a marker
+    /// could cover a change the new server makes. `None`: not read, so no such continuation.
+    async fn prepare_marked(
+        &self,
+        checkpoint: Option<&Checkpoint>,
+        tables: &[TableRef],
+        marked: Option<&SourcePosition>,
+    ) -> Result<Prepared, SourceError> {
+        let _ = marked;
+        self.prepare(checkpoint, tables).await
+    }
 
     /// Replaces a lost stream position after [`SourceError::PositionUnreachable`] (D-15.3): the
     /// new consistent position to snapshot from and stream after, with the server it was read

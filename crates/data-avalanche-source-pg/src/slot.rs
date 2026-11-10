@@ -43,6 +43,12 @@ pub struct SlotState {
     /// `wal_status = 'lost'`, a PostgreSQL 16 `conflicting` logical slot, or a PostgreSQL 17+
     /// `invalidation_reason`: the slot can't stream any more.
     pub invalidated: bool,
+    /// PostgreSQL 17+: a failover slot, which a standby with `sync_replication_slots`
+    /// synchronizes (false before 17).
+    pub failover: bool,
+    /// PostgreSQL 17+: on a standby or a promoted one, the slot was synchronized from the
+    /// primary, not made here (false before 17).
+    pub synced: bool,
 }
 
 /// What [`decide`] says to do with the slot.
@@ -387,7 +393,9 @@ pub(crate) async fn slot_state(
             "SELECT plugin::text, database::text, confirmed_flush_lsn::text,
                     coalesce(wal_status = 'lost', false)
                       OR coalesce((to_jsonb(s) ->> 'conflicting')::bool, false)
-                      OR (to_jsonb(s) ->> 'invalidation_reason') IS NOT NULL
+                      OR (to_jsonb(s) ->> 'invalidation_reason') IS NOT NULL,
+                    coalesce((to_jsonb(s) ->> 'failover')::bool, false),
+                    coalesce((to_jsonb(s) ->> 'synced')::bool, false)
                FROM pg_catalog.pg_replication_slots s
               WHERE slot_name = $1",
             &[&name],
@@ -398,6 +406,8 @@ pub(crate) async fn slot_state(
         database: r.get(1),
         confirmed_flush: r.get::<_, Option<String>>(2).and_then(|t| t.parse().ok()),
         invalidated: r.get(3),
+        failover: r.get(4),
+        synced: r.get(5),
     }))
 }
 
@@ -428,6 +438,42 @@ pub fn on_source_change(
     }
 }
 
+/// DA-SRC-33 (Q-M12d-5): a promotion the pipeline's slot followed. The checkpoint was read on
+/// this system's earlier timeline, the slot here is a failover slot synchronized from the old
+/// primary and still streams, and it confirmed at least the checkpoint and `marked`, the lake's
+/// highest marker. A standby synchronizes a slot only to a position its own WAL holds, so all of
+/// that is below the timeline's switch point: the new timeline's changes come after every marker,
+/// and the stream continues there, nothing re-snapshotted. `marked` unread (`None`): no.
+pub fn continues(
+    recorded: &Checkpoint,
+    now: &ServerIdentity,
+    slot: Option<&SlotState>,
+    marked: Option<Lsn>,
+) -> bool {
+    let (
+        Some(ServerIdentity::Postgres {
+            system_identifier: was,
+            timeline: was_on,
+        }),
+        ServerIdentity::Postgres {
+            system_identifier,
+            timeline,
+        },
+    ) = (recorded.server.as_ref(), now)
+    else {
+        return false;
+    };
+    let (Some(s), Some(marked), Ok(at)) = (slot, marked, lsn_of(&recorded.position)) else {
+        return false;
+    };
+    was == system_identifier
+        && timeline > was_on
+        && s.failover
+        && s.synced
+        && !s.invalidated
+        && s.confirmed_flush.is_some_and(|f| f >= at && f >= marked)
+}
+
 impl PgConnector {
     fn slot_name(&self) -> &str {
         &self.pg.slot
@@ -436,15 +482,30 @@ impl PgConnector {
     async fn create_slot(&self, client: &Client) -> Result<Lsn, SourceError> {
         // Creating a slot waits for the transactions running at that moment: the snapshot timeout
         // bounds it, not the command timeout.
+        // PostgreSQL 17+: a failover slot, which a standby with `sync_replication_slots` keeps,
+        // so a promotion can continue the stream (DA-SRC-33).
+        let failover = self
+            .conn
+            .command(
+                "read the server's version",
+                client.query_one(
+                    "SELECT current_setting('server_version_num')::int >= 170000",
+                    &[],
+                ),
+            )
+            .await?
+            .get::<_, bool>(0);
+        let create = if failover {
+            "SELECT lsn::text FROM pg_create_logical_replication_slot($1, 'pgoutput', false, false, true)"
+        } else {
+            "SELECT lsn::text FROM pg_create_logical_replication_slot($1, 'pgoutput')"
+        };
         let row = self
             .conn
             .bounded(
                 "create the replication slot",
                 self.conn.timeouts.snapshot,
-                client.query_one(
-                    "SELECT lsn::text FROM pg_create_logical_replication_slot($1, 'pgoutput')",
-                    &[&self.slot_name()],
-                ),
+                client.query_one(create, &[&self.slot_name()]),
             )
             .await?;
         parse_lsn(row.get(0))
@@ -793,21 +854,27 @@ impl PgConnector {
         checkpoint: Option<&Checkpoint>,
         tables: &[TableRef],
     ) -> Result<Prepared, SourceError> {
+        self.prepare_marked(checkpoint, tables, None).await
+    }
+
+    /// [`Self::prepare`], told `marked`: the lake's highest marker, read when the preflight found
+    /// another server than the checkpoint's. A promotion the slot followed continues the stream
+    /// ([`continues`]), whatever `source_change_action` says, since no position is lost.
+    pub async fn prepare_marked(
+        &self,
+        checkpoint: Option<&Checkpoint>,
+        tables: &[TableRef],
+        marked: Option<&SourcePosition>,
+    ) -> Result<Prepared, SourceError> {
         let recorded = checkpoint;
         let checkpoint = checkpoint.map(|c| lsn_of(&c.position)).transpose()?;
+        let marked = marked.map(lsn_of).transpose()?;
         let client = self.conn.client().await?;
         let (id, timeline) = self
             .conn
             .command("read the server's identity", server_identity(&client))
             .await?;
         let server = parse_identity(&id, &timeline)?;
-        let changed = source_change(recorded, &server, self.live().source_change_action)?;
-        let Reconciled {
-            sql,
-            rewritten,
-            added,
-            mut warnings,
-        } = self.reconcile_publication(&client, tables).await?;
         let slot = self
             .conn
             .command(
@@ -815,6 +882,26 @@ impl PgConnector {
                 slot_state(&client, self.slot_name()),
             )
             .await?;
+        let continued = recorded.is_some_and(|c| {
+            c.server.as_ref().is_some_and(|was| *was != server)
+                && continues(c, &server, slot.as_ref(), marked)
+        });
+        let changed =
+            !continued && source_change(recorded, &server, self.live().source_change_action)?;
+        let Reconciled {
+            sql,
+            rewritten,
+            added,
+            mut warnings,
+        } = self.reconcile_publication(&client, tables).await?;
+        if continued && let Some(was) = recorded.and_then(|c| c.server.as_ref()) {
+            warnings.push(format!(
+                "the checkpoint was read on {was}, and the pipeline now reads {server}: \
+                 replication slot {} came over synchronized, past everything the lake holds, \
+                 so the stream continues on the new timeline",
+                self.slot_name()
+            ));
+        }
         let decided = if changed {
             if let Some(was) = recorded.and_then(|c| c.server.as_ref()) {
                 warnings.push(format!(
@@ -1011,6 +1098,8 @@ mod tests {
             database: Some("shop".into()),
             confirmed_flush: Some(Lsn(flushed)),
             invalidated: false,
+            failover: false,
+            synced: false,
         }
     }
 
@@ -1149,6 +1238,58 @@ mod tests {
             ..slot(0x10)
         };
         refused(c(Some(&lost), X), "must exist there");
+    }
+
+    /// DA-SRC-33: a promotion the slot followed continues only on the same system's later
+    /// timeline, with the slot failover, synced and streaming, confirmed at the checkpoint and
+    /// at the lake's highest marker; anything else, or the marker unread, is a source change.
+    #[test]
+    fn a_promotion_the_slot_followed_continues_the_stream() {
+        let pg = |system_identifier, timeline| ServerIdentity::Postgres {
+            system_identifier,
+            timeline,
+        };
+        let recorded = Checkpoint {
+            position: SourcePosition::Pg(Lsn(0x20)),
+            server: Some(pg(7, 1)),
+        };
+        let synced = SlotState {
+            failover: true,
+            synced: true,
+            ..slot(0x20)
+        };
+        let on = |now: ServerIdentity, s: &SlotState, marked: Option<u64>| {
+            continues(&recorded, &now, Some(s), marked.map(Lsn))
+        };
+        assert!(on(pg(7, 2), &synced, Some(0x20)));
+        assert!(
+            on(pg(7, 3), &synced, Some(0x18)),
+            "a marker below the checkpoint"
+        );
+        assert!(!on(pg(7, 2), &synced, Some(0x21)), "a marker past the slot");
+        assert!(!on(pg(7, 2), &synced, None), "the markers unread");
+        assert!(!on(pg(8, 2), &synced, Some(0x20)), "another system");
+        assert!(!on(pg(7, 1), &synced, Some(0x20)), "the same timeline");
+        let not = |f: fn(&mut SlotState)| {
+            let mut s = synced.clone();
+            f(&mut s);
+            s
+        };
+        assert!(!on(pg(7, 2), &not(|s| s.synced = false), Some(0x20)));
+        assert!(!on(pg(7, 2), &not(|s| s.failover = false), Some(0x20)));
+        assert!(!on(pg(7, 2), &not(|s| s.invalidated = true), Some(0x20)));
+        assert!(
+            !on(
+                pg(7, 2),
+                &not(|s| s.confirmed_flush = Some(Lsn(0x10))),
+                Some(0x10)
+            ),
+            "the slot behind the checkpoint"
+        );
+        assert!(
+            !continues(&recorded, &pg(7, 2), None, Some(Lsn(0x20))),
+            "no slot"
+        );
     }
 
     /// A same-named slot that isn't a pgoutput slot of the pipeline's database is neither

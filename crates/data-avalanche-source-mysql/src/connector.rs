@@ -324,6 +324,8 @@ impl MySqlConnector {
         Ok(Preflight {
             server_version: settings.version,
             warnings,
+            // A binlog position means nothing on another server: no continuation (DA-SRC-33).
+            server: None,
         })
     }
 

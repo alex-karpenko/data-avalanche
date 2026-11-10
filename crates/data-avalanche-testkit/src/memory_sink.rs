@@ -14,8 +14,8 @@ use arrow_schema::{Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use data_avalanche_core::{
     CommitMarker, CommitOutcome, EvolveOutcome, SchemaChange, SchemaDelta, SchemaOp, Sink,
-    SinkCapabilities, SinkError, SinkKind, SinkTableState, TableChangeSet, TableRef, TableSpec,
-    TransformKind, UNCHANGED_MASK_PREFIX, WriteMode, added_column_field,
+    SinkCapabilities, SinkError, SinkKind, SinkTableState, SourcePosition, TableChangeSet,
+    TableRef, TableSpec, TransformKind, UNCHANGED_MASK_PREFIX, WriteMode, added_column_field,
 };
 use tokio::sync::watch;
 
@@ -295,6 +295,16 @@ impl MemorySink {
     pub fn forget_key(&self, table: &TableRef) {
         let mut tables = self.tables();
         tables.get_mut(table).expect("a table").identifier.clear();
+    }
+
+    /// The table's last commit was at `position`, and its checkpoint never became durable: the
+    /// marker names a position past the pipeline's checkpoint.
+    pub fn mark_at(&self, table: &TableRef, position: SourcePosition) {
+        let mut tables = self.tables();
+        let t = tables.get_mut(table).expect("a table");
+        if let Some(m) = &mut t.marker {
+            m.committed_position = position;
+        }
     }
 
     /// The marker of the table's last commit.

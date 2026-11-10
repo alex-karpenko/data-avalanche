@@ -375,6 +375,30 @@ fn same_columns(cached: &TableSchema, now: &TableSchema, fold: bool) -> bool {
             })
 }
 
+/// DA-SRC-33: the highest position the lake's markers name, at least `checkpoint`: every table
+/// the sink holds, `tracked` too (a reposition's set), for the source to decide whether its
+/// stream continues on another server. A marker another source kind wrote doesn't compare and
+/// is left out.
+async fn highest_marker<'a>(
+    sink: &dyn Sink,
+    tuning: &Tuning,
+    tracked: impl Iterator<Item = &'a TableRef>,
+    checkpoint: &SourcePosition,
+) -> Result<SourcePosition, WorkerError> {
+    let held = sink_retry(tuning, || Ok(()), || sink.held_tables()).await?;
+    let tables: BTreeSet<TableRef> = tracked.cloned().chain(held).collect();
+    let mut highest = checkpoint.clone();
+    for table in tables {
+        let state = sink_retry(tuning, || Ok(()), || sink.table_state(&table)).await?;
+        if let Some(m) = state.marker
+            && !highest.covers(&m.committed_position).unwrap_or(true)
+        {
+            highest = m.committed_position;
+        }
+    }
+    Ok(highest)
+}
+
 /// Commits a change set with no row to `table`: a truncate under `identifier` (the source's
 /// key), or a reposition under the key the table was made with (it carries no row, and the table
 /// may be keyed otherwise than the source is now: a wiped state's, DA-SRC-32), else `identifier`.
@@ -595,11 +619,25 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
                 core.docs.save_slot(&doc).await?;
             }
             let refs: Vec<TableRef> = resolved_tables.keys().cloned().collect();
+            // Another server than the checkpoint's: the source may continue its stream there
+            // only past every marker the lake holds (DA-SRC-33).
+            let marked = match (&checkpoint, &preflight.server) {
+                (Some(c), Some(now)) if c.server.as_ref().is_some_and(|was| was != now) => Some(
+                    highest_marker(
+                        sink.as_ref(),
+                        &tuning,
+                        resolved_tables.keys().chain(cached.keys()),
+                        &c.position,
+                    )
+                    .await?,
+                ),
+                _ => None,
+            };
             // `prepare` may create, recreate or advance the slot.
             let prepared = write_retry(
                 &tuning,
                 || core.may_write(),
-                || source.prepare(checkpoint.as_ref(), &refs),
+                || source.prepare_marked(checkpoint.as_ref(), &refs, marked.as_ref()),
             )
             .await?;
             warnings.extend(prepared.warnings);
@@ -947,7 +985,15 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
             })
             .await?;
     }
-    let fresh = matches!(plan, Plan::Fresh(_)).then_some(doc);
+    // A resume on another server than the checkpoint's: the source continued its stream there
+    // (a promotion its slot followed, DA-SRC-33). The checkpoint records the new server, which
+    // the stream's open and a later start check, as a fresh start's does (D-M12d.11).
+    let moved = matches!(plan, Plan::Resume)
+        && server.is_some()
+        && checkpoint
+            .as_ref()
+            .is_some_and(|c| c.server.is_some() && c.server != server);
+    let fresh = (matches!(plan, Plan::Fresh(_)) || moved).then_some(doc);
     // The schemas before a fresh start's checkpoint: a restart in between still finds the
     // checkpoint before it and starts fresh again. The other way round, it would resume from the
     // new checkpoint under the cache of before the baseline, as if the stream still held the
@@ -1378,6 +1424,93 @@ mod tests {
         );
         assert!(
             st.warnings
+                .iter()
+                .any(|w| w.contains("source server changed")),
+            "{:?}",
+            st.warnings
+        );
+    }
+
+    /// DA-SRC-33: a start that reaches another server than the checkpoint's tells the source the
+    /// lake's highest marker, for it to decide whether its stream continues there; a start on
+    /// the checkpoint's server reads no marker for it.
+    #[tokio::test]
+    async fn a_start_on_another_server_tells_the_source_the_highest_marker() {
+        let w = World::new(&["a"]);
+        let pg = |timeline| ServerIdentity::Postgres {
+            system_identifier: 7,
+            timeline,
+        };
+        w.source.set_server(Some(pg(1)));
+        w.source.load(&t("a"), rows(1..=2));
+        let (end, _) = run(&w, &mode("mode: initial"), async |status| {
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(3, "x")));
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        let (end, _) = run(&w, &mode("mode: never"), async |status| {
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!(w.source.marks(), [None, None], "no server change");
+        let checkpoint = w
+            .docs
+            .slot()
+            .await
+            .unwrap()
+            .unwrap()
+            .doc
+            .confirmed_flush_lsn;
+        let past = SourcePosition::Pg(Lsn(checkpoint.0 + 0x40));
+        w.sink.mark_at(&t("a"), past.clone());
+        w.source.fail_over(pg(2), Lsn(0x100));
+        let (end, _) = run(&w, &mode("mode: never"), async |status| {
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!(w.source.marks()[2], Some(past));
+    }
+
+    /// DA-SRC-33: a promotion the slot followed. The source continues its stream on the new
+    /// server: the start resumes, records the new server with the checkpoint (which the stream's
+    /// open checks), and streams on; nothing is re-snapshotted.
+    #[tokio::test]
+    async fn a_promotion_the_slot_followed_resumes_on_the_new_server() {
+        let w = World::new(&["a"]);
+        let pg = |timeline| ServerIdentity::Postgres {
+            system_identifier: 7,
+            timeline,
+        };
+        w.source.set_server(Some(pg(1)));
+        w.source.load(&t("a"), rows(1..=2));
+        let (end, _) = run(&w, &mode("mode: initial"), async |status| {
+            w.source
+                .commit(FakeTxn::new().insert(&t("a"), row(3, "before")));
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        let read = w.source.reads(&t("a"));
+        w.source.promote_following(pg(2));
+        let (end, st) = run(&w, &mode("mode: initial"), async |status| {
+            streamed(&status, &w).await;
+            w.source
+                .commit(FakeTxn::new().insert(&t("a"), row(4, "after")));
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!(w.ids("a"), [1, 2, 3, 4]);
+        assert_eq!(w.source.reads(&t("a")), read, "nothing re-snapshotted");
+        assert_eq!(
+            w.docs.slot().await.unwrap().unwrap().doc.server,
+            Some(pg(2))
+        );
+        assert!(
+            !st.warnings
                 .iter()
                 .any(|w| w.contains("source server changed")),
             "{:?}",

@@ -1,7 +1,7 @@
 # Integration-test infrastructure. Default profile = newest of each engine + S3/Azure emulators.
 # GCS has no usable emulator for object_store; GCS tests use a real bucket (see README.md).
 # `matrix` profile adds the older supported versions (P-8). `init` profile = one-shot bucket creation.
-# `replica` profile = a PostgreSQL primary and its standby (the failover E2E).
+# `replica` profile = two PostgreSQL primaries with their standbys (the failover E2Es).
 # Host ports are fixed and non-default; see README.md.
 name: data-avalanche-test
 
@@ -51,6 +51,34 @@ services:
     tmpfs: [/var/lib/postgresql]
     ports: ["55421:5432"]
     depends_on: { postgres-primary: { condition: service_healthy } }
+
+  # A primary and its standby that syncs the primary's failover slots (PostgreSQL 17+, DA-SRC-33),
+  # for the failover-slot scenario: the pipeline's slot survives the promotion. Profile replica;
+  # good for one run like the pair above.
+  postgres-sync-primary:
+    <<: *pg
+    image: "postgres:18"
+    profiles: [replica]
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=20",
+              "-c", "max_wal_senders=20", "-c", "logical_decoding_work_mem=64kB",
+              "-c", "synchronized_standby_slots=standby_sync"]
+    environment: { POSTGRES_USER: avalanche, POSTGRES_PASSWORD: avalanche, POSTGRES_DB: avalanche, STANDBY_SLOT: standby_sync }
+    volumes: ["./postgres-primary.sh:/docker-entrypoint-initdb.d/replication.sh:ro"]
+    tmpfs: [/var/lib/postgresql]
+    ports: ["55422:5432"]
+  postgres-sync-replica:
+    <<: *pg
+    image: "postgres:18"
+    profiles: [replica]
+    entrypoint: ["bash", "/postgres-replica.sh"]
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=20",
+              "-c", "max_wal_senders=20", "-c", "logical_decoding_work_mem=64kB",
+              "-c", "sync_replication_slots=on", "-c", "hot_standby_feedback=on"]
+    environment: { POSTGRES_USER: avalanche, POSTGRES_PASSWORD: avalanche, POSTGRES_DB: avalanche, PRIMARY: postgres-sync-primary, STANDBY_SLOT: standby_sync }
+    volumes: ["./postgres-replica.sh:/postgres-replica.sh:ro"]
+    tmpfs: [/var/lib/postgresql]
+    ports: ["55423:5432"]
+    depends_on: { postgres-sync-primary: { condition: service_healthy } }
 
   mysql-84:
     image: "mysql:8.4"

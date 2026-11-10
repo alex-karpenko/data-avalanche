@@ -106,6 +106,35 @@ async fn first_start_then_resume_then_a_lost_slot() {
     cleanup(&a, &n).await;
 }
 
+/// DA-SRC-33: a managed slot is made a failover slot on PostgreSQL 17+, which a standby with
+/// `sync_replication_slots` keeps; before 17 there is no such slot. The preflight names the
+/// server, as `prepare` does.
+#[tokio::test]
+async fn a_managed_slot_is_a_failover_slot_from_postgresql_17() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(&a, "slot_failover", DDL).await;
+    let c = connector(&pipeline(&n, &["*"], "", ""));
+    let p = c.prepare(None, &[n.table("a")]).await.unwrap();
+    let preflight = c.preflight().await.unwrap();
+    assert_eq!(preflight.server, p.server);
+    let row = a
+        .query_one(
+            "SELECT current_setting('server_version_num')::int >= 170000,
+                    coalesce((to_jsonb(s) ->> 'failover')::bool, false)
+               FROM pg_replication_slots s WHERE slot_name = $1",
+            &[&n.slot],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        row.get::<_, bool>(1),
+        row.get::<_, bool>(0),
+        "a failover slot exactly on 17+"
+    );
+    cleanup(&a, &n).await;
+}
+
 /// A checkpoint read on another server, another system or another timeline (a promoted
 /// standby), halts with `WAL_SOURCE_CHANGED`; under `source_change_action: re_snapshot` the slot
 /// is made again on the server read now, and the pipeline snapshots from it. A checkpoint with no

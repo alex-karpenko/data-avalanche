@@ -174,9 +174,17 @@ impl PgConnector {
                 "the user has neither the REPLICATION attribute nor superuser; the replication connection may be refused".into(),
             );
         }
+        let (id, timeline) = self
+            .conn
+            .command(
+                "read the server's identity",
+                crate::slot::server_identity(&client),
+            )
+            .await?;
         Ok(Preflight {
             server_version: version,
             warnings,
+            server: Some(crate::slot::parse_identity(&id, &timeline)?),
         })
     }
 
@@ -379,6 +387,15 @@ impl SourceConnector for PgConnector {
         tables: &[TableRef],
     ) -> Result<Prepared, SourceError> {
         PgConnector::prepare(self, checkpoint, tables).await
+    }
+
+    async fn prepare_marked(
+        &self,
+        checkpoint: Option<&Checkpoint>,
+        tables: &[TableRef],
+        marked: Option<&SourcePosition>,
+    ) -> Result<Prepared, SourceError> {
+        PgConnector::prepare_marked(self, checkpoint, tables, marked).await
     }
 
     async fn reset_position(&self, lost: &Checkpoint) -> Result<Checkpoint, SourceError> {
