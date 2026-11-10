@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use data_avalanche_core::{SinkError, TableRef};
-use data_avalanche_storage::{Backend, table_root};
+use data_avalanche_storage::{Backend, join, table_root};
 use url::Url;
 
 use crate::error::permanent;
@@ -99,6 +99,16 @@ impl DeltaLocation {
     /// object keys are exactly those segments. A location that makes no URL (a relative local
     /// root, a bucket that isn't a URL host) is a `Permanent` error.
     pub fn table_url(&self, table: &TableRef) -> Result<Url, SinkError> {
+        self.url_of(|bucket, prefix| table_root(bucket, prefix, &table.schema, &table.name).root)
+    }
+
+    /// The root every table of the pipeline is under (`<sink.bucket>/<sink.prefix>/`, or the
+    /// local root), as a URL with a trailing `/`.
+    pub fn root_url(&self) -> Result<Url, SinkError> {
+        self.url_of(|_, prefix| join(&[prefix]))
+    }
+
+    fn url_of(&self, path: impl Fn(&str, &str) -> String) -> Result<Url, SinkError> {
         let (mut url, root) = match self {
             Self::Local { root } => (
                 Url::from_directory_path(root).map_err(|()| {
@@ -107,7 +117,7 @@ impl DeltaLocation {
                         root.display()
                     ))
                 })?,
-                table_root("", "", &table.schema, &table.name).root,
+                path("", ""),
             ),
             Self::Bucket {
                 backend,
@@ -123,16 +133,13 @@ impl DeltaLocation {
                 let base = Url::parse(&format!("{scheme}://{bucket}/")).map_err(|e| {
                     permanent(format!("the bucket {bucket:?} isn't a URL host: {e}"))
                 })?;
-                (
-                    base,
-                    table_root(bucket, prefix, &table.schema, &table.name).root,
-                )
+                (base, path(bucket, prefix))
             }
         };
         {
             let mut segments = url.path_segments_mut().expect("a base URL");
             segments.pop_if_empty();
-            for s in root.split('/') {
+            for s in root.split('/').filter(|s| !s.is_empty()) {
                 segments.push(s);
             }
             segments.push("");

@@ -330,13 +330,19 @@ impl Sink for MemorySink {
                 exists: true,
                 schema: Some(t.schema.clone()),
                 marker: t.marker.clone(),
+                identifier: t.identifier.clone(),
             },
             None => SinkTableState {
                 exists: false,
                 schema: None,
                 marker: None,
+                identifier: vec![],
             },
         })
+    }
+
+    async fn held_tables(&self) -> Result<Vec<TableRef>, SinkError> {
+        Ok(self.tables().keys().cloned().collect())
     }
 
     async fn ensure_table(&self, spec: &TableSpec) -> Result<(), SinkError> {

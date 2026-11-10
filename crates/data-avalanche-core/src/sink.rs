@@ -216,6 +216,10 @@ pub struct SinkTableState {
     /// an own commit without one, and a walk-back stops at a cleaned-up log. Nothing decides
     /// "the pipeline never wrote here" from it.
     pub marker: Option<CommitMarker>,
+    /// The key the table was created with (the sink records it); empty when it records none or
+    /// the table is absent. A reposition commits under it: it carries no row, and the table's
+    /// key may not be the one the source has now (DA-SRC-32).
+    pub identifier: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -301,6 +305,10 @@ pub trait Sink: Send + Sync {
         SinkStats::default()
     }
     async fn table_state(&self, table: &TableRef) -> Result<SinkTableState, SinkError>;
+    /// The tables the sink holds at the pipeline's location (Delta: each `<schema>/<table>/`
+    /// root with a `_delta_log` under the pipeline's `sink.prefix`), whether the pipeline
+    /// resolves or caches them or not: a source change repositions every one (DA-SRC-32).
+    async fn held_tables(&self) -> Result<Vec<TableRef>, SinkError>;
     /// Creates the table when it's absent; a present table is left as it is.
     async fn ensure_table(&self, spec: &TableSpec) -> Result<(), SinkError>;
     /// Applies a schema delta, idempotently. `owner_epoch` is the writer's lease epoch: a table a

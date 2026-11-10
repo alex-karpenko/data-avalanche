@@ -375,27 +375,38 @@ fn same_columns(cached: &TableSchema, now: &TableSchema, fold: bool) -> bool {
             })
 }
 
-/// Commits an [`Empty`] change set to `schema`'s sink table at `at`. A table the lake doesn't
-/// hold has nothing to commit.
+/// Commits a change set with no row to `table`: a truncate under `identifier` (the source's
+/// key), or a reposition under the key the table was made with (it carries no row, and the table
+/// may be keyed otherwise than the source is now: a wiped state's, DA-SRC-32), else `identifier`.
+/// A table the lake doesn't hold, or a reposition of one without a marker, has nothing to commit.
+/// `Ok(false)` when there was no key to commit under: a reposition of a table that records none,
+/// which the pipeline neither resolves nor caches.
 async fn commit_empty(
     core: &Core,
     tuning: &Tuning,
-    schema: &TableSchema,
+    table: &TableRef,
+    identifier: &[String],
     at: &SourcePosition,
     kind: Empty,
-) -> Result<(), WorkerError> {
-    let table = schema.table();
+) -> Result<bool, WorkerError> {
     let state = sink_retry(tuning, || core.may_write(), || core.sink.table_state(table)).await?;
     let (true, Some(columns)) = (state.exists, state.schema) else {
-        return Ok(());
+        return Ok(true);
     };
     if kind == Empty::Reposition && state.marker.is_none() {
-        return Ok(());
+        return Ok(true);
+    }
+    let identifier = match kind {
+        Empty::Reposition if !state.identifier.is_empty() => state.identifier,
+        _ => identifier.to_vec(),
+    };
+    if identifier.is_empty() {
+        return Ok(false);
     }
     let cs = TableChangeSet {
         table: table.clone(),
         schema: columns,
-        identifier: schema.identifier().to_vec(),
+        identifier,
         truncate: kind == Empty::Truncate,
         upserts: vec![],
         deletes: vec![],
@@ -427,7 +438,7 @@ async fn commit_empty(
         }),
         // Neither is ever skipped as covered (`covers` skips neither a reposition nor a
         // snapshot's set): the arm is unreachable, and harmless.
-        CommitOutcome::Committed { .. } | CommitOutcome::SkippedCovered => Ok(()),
+        CommitOutcome::Committed { .. } | CommitOutcome::SkippedCovered => Ok(true),
     }
 }
 
@@ -970,7 +981,16 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
     let truncating = jobs.truncating();
     for table in started.iter().filter(|t| truncating.contains(*t)) {
         if let Some(schema) = resolved_tables.get(table).or_else(|| copies.get(table)) {
-            commit_empty(core, &tuning, schema, &at, Empty::Truncate).await?;
+            // No key to commit under is as good as a committed truncate: nothing to empty.
+            commit_empty(
+                core,
+                &tuning,
+                schema.table(),
+                schema.identifier(),
+                &at,
+                Empty::Truncate,
+            )
+            .await?;
         }
     }
     core.may_write()?;
@@ -991,12 +1011,47 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
     }
     // A source change moves every table the lake holds onto the new server's positions before
     // the checkpoint that names the server: a restart in between still finds the old one
-    // recorded, and repositions them again (DA-SRC-20).
+    // recorded, and repositions them again (DA-SRC-20). Every table the sink holds, not only
+    // those resolved or cached now: a job's copy, a table outside the config, would keep the old
+    // server's marker and skip the new one's changes when tracked later (DA-SRC-32). A table the
+    // sink refuses the reposition of halts (`SINK_REJECTED`) instead of ending every start.
     if matches!(plan, Plan::Fresh(SnapshotReason::SourceChanged)) {
-        let tables: BTreeSet<&TableRef> = resolved_tables.keys().chain(cached.keys()).collect();
+        let held = sink_retry(&tuning, || Ok(()), || sink.held_tables()).await?;
+        let tables: BTreeSet<&TableRef> = resolved_tables
+            .keys()
+            .chain(cached.keys())
+            .chain(&held)
+            .collect();
         for table in tables {
-            if let Some(schema) = cached.get(table).or_else(|| resolved_tables.get(table)) {
-                commit_empty(core, &tuning, schema, &at, Empty::Reposition).await?;
+            let identifier = cached
+                .get(table)
+                .or_else(|| resolved_tables.get(table))
+                .map_or(&[][..], |s| s.identifier());
+            match commit_empty(core, &tuning, table, identifier, &at, Empty::Reposition).await {
+                Ok(true) => {}
+                Ok(false) => warnings.push(format!(
+                    "table {table}: the lake holds it, but its table records no key and the \
+                     pipeline doesn't track it, so its marker stays on the old server; track it \
+                     and re-snapshot it before its changes stream"
+                )),
+                Err(WorkerError::Sink(SinkError::Permanent { reason })) => {
+                    let reason = HaltReason::SinkRejected {
+                        detail: format!("the source changed, and its reposition fails: {reason}"),
+                    };
+                    core.may_write()?;
+                    core.docs
+                        .record_halt(&TableHalt {
+                            table: table.clone(),
+                            reason: reason.clone(),
+                            at: at.clone(),
+                            copy: false,
+                        })
+                        .await?;
+                    core.update(|st| {
+                        st.halted.insert(table.clone(), reason);
+                    });
+                }
+                Err(e) => return Err(e),
             }
         }
     }

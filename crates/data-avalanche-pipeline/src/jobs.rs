@@ -222,6 +222,40 @@ mod tests {
         assert!(st.warnings.is_empty(), "{:?}", st.warnings);
     }
 
+    /// DA-SRC-32: a source change repositions every table the lake holds, a job's copy too,
+    /// which the pipeline neither resolves nor caches: its marker leaves the old server's
+    /// positions, so a later copy or stream of it isn't skipped below them.
+    #[tokio::test]
+    async fn a_source_change_repositions_a_copy_the_pipeline_doesnt_track() {
+        use data_avalanche_core::position::Lsn;
+        use data_avalanche_core::{ServerIdentity, Sink, SourcePosition};
+        let pg = |timeline| ServerIdentity::Postgres {
+            system_identifier: 7,
+            timeline,
+        };
+        let w = World::new(&["a", "x"]);
+        w.source.outside_config(&t("x"));
+        w.source.set_server(Some(pg(1)));
+        established(&w).await;
+        w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+        w.source.load(&t("x"), rows(1..=3));
+        ask(&w, "p~0", &["x"]).await;
+        let (end, _) = run(&w, &never(10), async |status| {
+            wait_until("x is copied", || w.ids("x") == [1, 2, 3]).await;
+            streamed(&status, &w).await;
+            wait_until("the copy is done", || status.borrow().snapshots.is_empty()).await;
+        })
+        .await;
+        end.unwrap();
+        let old = w.sink.table_state(&t("x")).await.unwrap().marker.unwrap();
+        w.source.fail_over(pg(2), Lsn(0x100));
+        let (end, _) = run(&w, &never(10), async |status| streamed(&status, &w).await).await;
+        end.unwrap();
+        let moved = w.sink.table_state(&t("x")).await.unwrap().marker.unwrap();
+        assert_eq!(moved.committed_position, SourcePosition::Pg(Lsn(0x100)));
+        assert_ne!(moved, old);
+    }
+
     /// DA-SNAP-15: a job asked with `truncate` empties its tables' sink tables before their
     /// first chunk, so a row deleted at the source while the pipeline didn't stream it goes, in
     /// a streamed table and in a copy alike. The other tables keep their rows, and a later start

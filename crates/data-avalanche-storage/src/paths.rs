@@ -58,6 +58,24 @@ fn escape_with(ident: &str, mark: char) -> String {
     out
 }
 
+/// The identifier [`escape_table_segment`] made `segment` from; `None` for a segment it can't
+/// have made (a `~` not followed by two hex digits, escaped bytes that aren't UTF-8).
+pub fn unescape_table_segment(segment: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(segment.len());
+    let mut rest = segment.as_bytes();
+    while let Some((&b, tail)) = rest.split_first() {
+        if b == b'~' {
+            let hex = std::str::from_utf8(tail.get(..2)?).ok()?;
+            bytes.push(u8::from_str_radix(hex, 16).ok()?);
+            rest = &tail[2..];
+        } else {
+            bytes.push(b);
+            rest = tail;
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
 /// `<sink.bucket>/<sink.prefix>/<schema>/<table>/`: one table's root, for every sink format, with
 /// each name through [`escape_table_segment`]. For MySQL, `schema` is the database (`source.db`).
 /// A schema named exactly [`COLOCATED_STATE_DIR`] has its leading dot escaped
@@ -117,6 +135,34 @@ mod tests {
         assert_eq!(join(&["/a/", "", "b//c", "/"]), "a/b/c");
         assert_eq!(join(&["", ""]), "");
         assert_eq!(join(&[]), "");
+    }
+
+    #[test]
+    fn a_table_segment_unescapes_to_its_name() {
+        for name in [
+            "orders",
+            "a/b",
+            "50%",
+            "~x",
+            ".",
+            "..",
+            "naïve",
+            "tab\tbed",
+            ".pipeline-state",
+        ] {
+            assert_eq!(
+                unescape_table_segment(&escape_table_segment(name)).as_deref(),
+                Some(name),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            unescape_table_segment("~2Epipeline-state").as_deref(),
+            Some(".pipeline-state")
+        );
+        assert_eq!(unescape_table_segment("bad~4"), None);
+        assert_eq!(unescape_table_segment("bad~ZZ"), None);
+        assert_eq!(unescape_table_segment("~FF"), None, "not UTF-8");
     }
 
     #[test]
