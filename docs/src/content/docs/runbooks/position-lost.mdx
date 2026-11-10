@@ -59,6 +59,34 @@ hand, or advanced past the pipeline's checkpoint.
 
 ## A failover (`WAL_SOURCE_CHANGED`)
 
+**A failover slot carries the stream over.** On PostgreSQL 17 and later, a slot the pipeline
+manages (`slot_management: managed`) is a failover slot. When the primary names the standby's
+physical slot in `synchronized_standby_slots` and the standby runs with `sync_replication_slots`
+on (and `hot_standby_feedback`), the standby keeps a copy of the pipeline's slot. A promotion that
+copy followed continues the stream on the new timeline, with no halt and no copy, under either
+`source_change_action`: the copy must have confirmed exactly the pipeline's checkpoint, and no
+Delta table's marker may be past it. That holds whether the pipeline was running (its reconnect to
+the promoted server starts it again, and the start continues) or stopped. The log warns, naming
+both servers, that the slot `came over synchronized up to the checkpoint, with no marker of the
+lake past it, so the stream continues on the new timeline`, and the checkpoint records the new
+server. Otherwise everything below applies. A slot made before PostgreSQL 17, a standby that
+doesn't sync slots, and a promotion whose copy is behind or past the checkpoint aren't covered.
+Under `require_existing` the DBA's slot is carried over only when it was created as a failover
+slot (`pg_create_logical_replication_slot('<slot>', 'pgoutput', false, false, true)`).
+
+- **Plan the switchover.** The standby copies the slot from time to time, not at each of the
+  pipeline's acknowledgements. After a crash under load its copy usually lags the last one, and
+  the start halts as below (or re-snapshots under `re_snapshot`). A planned switchover continues
+  reliably: stop the writes to the primary, let the pipeline catch up, wait until the standby's copy
+  (`SELECT confirmed_flush_lsn, synced FROM pg_replication_slots` on the standby) shows the
+  primary's `confirmed_flush_lsn`, then promote.
+- **A down standby stalls the pipeline.** On PostgreSQL 17 and later the primary holds a failover
+  slot's changes back until every standby named in `synchronized_standby_slots` has received
+  them. A standby that is down or far behind stops the pipeline's stream: its lag grows, and only
+  the server's log says why. Take the standby out of `synchronized_standby_slots` while it's down.
+- **A slot made before an upgrade to 17** stays a plain slot: the pipeline makes a failover slot
+  only when it creates one, so such a slot isn't carried over.
+
 **Symptom:** after a failover, or after the host was pointed at another server, the pipeline stops
 in `error` with `WAL_SOURCE_CHANGED`, naming the server its checkpoint was read on and the one it
 reads now.
@@ -66,19 +94,24 @@ reads now.
 The checkpoint records the server: its system identifier and its timeline. A promoted replica
 keeps the identifier and moves to a new timeline. Its WAL ends where its replication did, which can
 be behind what the lake already holds, so it writes again LSNs the lake has marked. Resuming would
-skip those changes. The logical slot isn't on the promoted server either: PostgreSQL doesn't copy
-it to a physical replica. The check runs at a start and at every stream reconnect, before the
-pipeline drops or makes a slot on the server it reaches: a failover while the pipeline runs halts
-it too, rather than replacing the lost slot there. Under `re_snapshot` the pipeline starts again,
-as at a restart, and recovers as in step 2.
+skip those changes. Unless a standby synchronized it (above), the logical slot isn't on the
+promoted server either: PostgreSQL doesn't copy a plain slot to a physical replica. The check runs
+at a start and at every stream reconnect, before the pipeline drops or makes a slot on the server
+it reaches. A reconnect that reaches a promoted server of the same system starts the pipeline
+again, whose start continues the stream (above) or halts; one that reaches any other server halts
+the running pipeline at once, rather than replacing the lost slot there. Under `re_snapshot` the
+pipeline starts again, as at a restart, and recovers as in step 2.
 
 1. If the old server is the one you want, point the pipeline back at it (a reload restarts the
    pipeline) and it resumes.
 2. Otherwise set `source.postgres.source_change_action: re_snapshot` (a reload applies it, without
-   a restart) and `POST /v1/pipelines/<id>/restart`. The pipeline moves every table onto the new
-   server's position, makes its slot there (under `require_existing`, have the DBA create it
+   a restart) and `POST /v1/pipelines/<id>/restart`. The pipeline moves every Delta table under
+   the sink's prefix onto the new server's position (a job's copy, and a table no longer in the
+   config, included), makes its slot there (under `require_existing`, have the DBA create it
    first), and copies the tables as `snapshots.mode` says: under `never`, none, with a warning, and
-   you start a snapshot job for each table.
+   you start a snapshot job for each table. A Delta table that refuses the move halts
+   `SINK_REJECTED` and the others go on (see
+   [A halted table](/data-avalanche/runbooks/halted-table/)).
 3. Rows the old server wrote that the promoted one never received (the changes written after the
    replica fell behind or was cut off) stay in the Delta tables. The copy only upserts, so it
    doesn't delete them; they are the changes the failover lost. To start clean, copy the tables
@@ -86,6 +119,10 @@ as at a restart, and recovers as in step 2.
    [A halted table](/data-avalanche/runbooks/halted-table/#3-copy-the-table-again).
 
 Leave `source_change_action` at `re_snapshot` only where a failover should recover by itself.
+
+If the pipeline's address reaches more than one server, the runs keep finding another one: three
+runs in a row that each find another server and make no checkpoint durable stop the pipeline in
+`error` with `WAL_SOURCE_CHANGED`, as for a changing binlog server (see the MySQL and MariaDB tab).
 
 ## A renamed or dropped publication
 
@@ -143,6 +180,17 @@ reconnects, not only at a start.
   a warning, and copies the tables as `snapshots.mode` says. Found at a reconnect, the pipeline
   runs its start again to do so. To recover a stopped pipeline, set it (a reload applies it,
   without a restart) and `POST /v1/pipelines/<id>/restart`.
+
+**A server that keeps changing.** Under `re_snapshot` a run that finds another server ends and the
+pipeline starts again. Three runs in a row that each find another server than the run before, none
+making a checkpoint durable, stop the pipeline in `error` with
+`BINLOG_SOURCE_CHANGED` (on PostgreSQL, `WAL_SOURCE_CHANGED`), saying that the source's address
+reaches more than one server (a load balancer, or a DNS name over several). Point the pipeline
+at one server (no load balancer, no round-robin DNS name), then stop and resume it. The count
+starts again when a run makes a checkpoint durable or ends for another reason, and when the
+pipeline is stopped. It doesn't decay with time: on a source that writes nothing in between, three
+genuine failovers in a row, however far apart, can stop the pipeline the same way; stop and resume
+it.
 
 Two cases aren't caught. On MariaDB: another server with the same `server_id` and the same binlog
 file names, whose file happens to have an event boundary at the checkpoint's offset. On MySQL: a

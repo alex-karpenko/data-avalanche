@@ -96,4 +96,6 @@ metadata:
 `tables.column_type_overrides` sets a column's type, in the sink-neutral grammar (`int64`,
 `decimal(38,10)`, `string`, `timestamp_tz`, …). An override must be the column's own type, `string`,
 or a lossless conversion (`int32` to `int64`, `timestamp_ntz` to `timestamp_tz`, …); any other
-halts the table at start with `SCHEMA_MISMATCH`.
+halts the table at start with `SCHEMA_MISMATCH`. On MySQL and MariaDB the key's column matches
+without case, as the server matches column names. A key that names no column of its table changes
+nothing, and warns when the pipeline resolves its tables ([V-127](/data-avalanche/reference/validation-rules/#v-127)): check its spelling.
