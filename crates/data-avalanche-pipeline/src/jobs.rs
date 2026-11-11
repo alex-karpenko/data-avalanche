@@ -348,6 +348,46 @@ mod tests {
         );
     }
 
+    /// DA-SRC-25 × DA-SNAP-15: a truncating job keys its truncate as the sink table records its
+    /// key, whatever any schema spells it. Here the key changed case alone where names fold, and
+    /// the operator dropped the sink table, which this start makes again: the truncate passes the
+    /// sink's key check, so the start succeeds instead of ending on every start (final review
+    /// N-1).
+    #[tokio::test]
+    async fn a_truncating_job_keys_its_truncate_as_the_sink_table_records_it() {
+        use data_avalanche_core::Sink;
+        let w = World::new(&["a"]);
+        established(&w).await;
+        w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+        let (end, _) = run(&w, &never(10), async |status| streamed(&status, &w).await).await;
+        end.unwrap();
+        w.source.fold_column_names();
+        w.source.alter(
+            &t("a"),
+            TableSchema::new(
+                t("a"),
+                vec![
+                    ColumnSchema::new("ID", V::Int64, "bigint").not_null(),
+                    ColumnSchema::new("doc", V::Text, "text"),
+                ],
+                vec!["ID".into()],
+            )
+            .unwrap(),
+        );
+        w.sink.drop_table(&t("a"));
+        ask_truncating(&w, "p~1", &["a"]).await;
+        let (mut core, _control, _status) = w.core(&never(10), &[]);
+        crate::worker::start(&mut core, None).await.unwrap();
+        assert!(
+            w.sink.table_state(&t("a")).await.unwrap().exists,
+            "made again"
+        );
+        assert_eq!(
+            job(&w, "p~1").await.tables[0].status,
+            JobTableStatus::Running
+        );
+    }
+
     fn noted(id: i64, note: Option<&str>) -> Row {
         Row(vec![
             ("id".into(), ColumnValue::Int64(id)),

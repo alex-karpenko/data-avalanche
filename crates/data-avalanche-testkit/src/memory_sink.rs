@@ -297,6 +297,11 @@ impl MemorySink {
         tables.get_mut(table).expect("a table").identifier.clear();
     }
 
+    /// The operator dropped the table, outside the pipeline: it no longer exists in the sink.
+    pub fn drop_table(&self, table: &TableRef) {
+        self.tables().remove(table);
+    }
+
     /// The table's last commit was at `position`, and its checkpoint never became durable: the
     /// marker names a position past the pipeline's checkpoint.
     pub fn mark_at(&self, table: &TableRef, position: SourcePosition) {

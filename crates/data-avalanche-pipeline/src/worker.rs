@@ -402,12 +402,13 @@ async fn highest_marker<'a>(
     Ok(highest)
 }
 
-/// Commits a change set with no row to `table`: a truncate under `identifier` (the source's
-/// key), or a reposition under the key the table was made with (it carries no row, and the table
-/// may be keyed otherwise than the source is now: a wiped state's, DA-SRC-32), else `identifier`.
-/// A table the lake doesn't hold, or a reposition of one without a marker, has nothing to commit.
-/// `Ok(false)` when there was no key to commit under: a reposition of a table that records none,
-/// which the pipeline neither resolves nor caches.
+/// Commits a change set with no row to `table`: a truncate or a reposition, under the key the
+/// sink table records, else `identifier`. Neither carries a row, so the key only has to pass the
+/// sink's check that it is the table's own, which a key spelled or chosen otherwise than the
+/// sink table's would fail for good: a wiped state's (DA-SRC-32), or one whose case alone changed
+/// where names fold (DA-SRC-25). A table the lake doesn't hold, or a reposition of one without a
+/// marker, has nothing to commit. `Ok(false)` when there was no key to commit under: a
+/// reposition of a table that records none, which the pipeline neither resolves nor caches.
 async fn commit_empty(
     core: &Core,
     tuning: &Tuning,
@@ -423,9 +424,9 @@ async fn commit_empty(
     if kind == Empty::Reposition && state.marker.is_none() {
         return Ok(true);
     }
-    let identifier = match kind {
-        Empty::Reposition if !state.identifier.is_empty() => state.identifier,
-        _ => identifier.to_vec(),
+    let identifier = match state.identifier.is_empty() {
+        false => state.identifier,
+        true => identifier.to_vec(),
     };
     if identifier.is_empty() {
         return Ok(false);
@@ -1031,10 +1032,12 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
     // running below, a later start resumes the copy instead (DA-SNAP-15).
     let truncating = jobs.truncating();
     for table in started.iter().filter(|t| truncating.contains(*t)) {
-        // Under the key the session copies the table with, as the sink table records it: the
-        // schema this start caches, else the one cached before (a key whose case alone changed
-        // keeps the cached spelling where names fold, DA-SRC-25), or a copy's. Not the catalog's
-        // spelling: the sink refuses a key that differs from its own, for good.
+        // Under the key the sink table records (`commit_empty`). For a sink table that records
+        // none, under the key the session copies the table with: the schema this start caches,
+        // else a copy's, else the one cached before (a key whose case alone changed keeps the
+        // cached spelling where names fold, DA-SRC-25). A copy's comes before the cached one: a
+        // table taken out of the config keeps its cached schema and can be a job's copy too, and
+        // the session reads it as a copy.
         let schema = schemas
             .iter()
             .find(|s| s.table() == table)
@@ -1042,8 +1045,8 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
             .or_else(|| cached.get(table))
             .or_else(|| resolved_tables.get(table));
         if let Some(schema) = schema {
-            // The result is `true`: a truncate runs under the source's key, which a resolved
-            // schema always has (`Ok(false)` is a reposition's).
+            // The result is `true`: a truncate runs under the sink's key, else the source's,
+            // which a resolved schema always has (`Ok(false)` is a reposition's).
             commit_empty(
                 core,
                 &tuning,
