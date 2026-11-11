@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-06
+updated: 2026-11-11
 domain: Architecture
 tags: [v1, implementation-plan, roadmap, milestones, workspace, crates, interfaces, test-strategy, ci, risks]
 sources: []
@@ -1401,7 +1401,8 @@ closed with a pointer (Q-M12-1).
   on a standby, deferred to v2; DA-SRC-33 continues a promotion the failover slot followed.
 - **M12c — v1 acceptance**: the load, soak and chaos runs (on Oleksii's machine first, Q-M12-3, with
   DA-OPS-14's measurement), the real-cloud E2E in CI (S3, GCS, Azure, Q-M12-2), the checklist in
-  §8, and `v1.0.0`.
+  §8, and `v1.0.0`. Plan: `M12c-acceptance.md` (Q-M12c-1…4): the four gaps left open after M12d
+  fixed first; the cloud E2E a subset of four scenarios; the runs a `load` test target.
 
 The scope across the three:
 
