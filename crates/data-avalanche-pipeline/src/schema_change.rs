@@ -29,15 +29,14 @@ pub(crate) fn soft_dropped(sink: &Schema, source: &TableSchema) -> usize {
 }
 
 /// A table the sink holds while the pipeline has no schema cached for it (a wiped state,
-/// DA-SNAP-13, or a table first tracked at a resume, DA-SNAP-22): the source's columns the sink table lacks, by name, as the `AddColumn`s that
-/// baseline it before the copy. Names match without case, Unicode's, as Delta's do
-/// ([`differ_by_case_alone`]): a sink column that matches by case alone can't sit beside the
-/// source's, so it halts, naming both spellings. A
-/// column it holds as another type still surfaces at the first commit (`SINK_REJECTED`); a
-/// nullable one the source lacks stays, soft-dropped. A key column it lacks can't be added: the
-/// table is keyed otherwise, and halts. (The halt text says "a run whose state is gone", as the
-/// plan words it; at a resume the table's state was never there.) So does a non-null column the source lacks: no row of the
-/// source's could fill it (DA-SNAP-22).
+/// DA-SNAP-13, or a table first tracked at a resume, DA-SNAP-22): the source's columns the sink
+/// table lacks, by name, as the `AddColumn`s that baseline it before the copy. Names match
+/// without case, Unicode's, as Delta's do ([`differ_by_case_alone`]): a sink column that matches
+/// by case alone can't sit beside the source's, so it halts, naming both spellings. A column it
+/// holds as another type still surfaces at the first commit (`SINK_REJECTED`); a nullable one the
+/// source lacks stays, soft-dropped. A key column it lacks can't be added: the table is keyed
+/// otherwise, and halts. So does a non-null column the source lacks: no row of the source's could
+/// fill it (DA-SNAP-22).
 pub(crate) fn missing_columns(
     sink: &Schema,
     source: &TableSchema,
@@ -66,8 +65,9 @@ pub(crate) fn missing_columns(
         if source.is_identifier(&c.name) {
             return Err(HaltReason::SchemaMismatch {
                 column: c.name.clone(),
-                detail: "the sink table, made by a run whose state is gone, lacks this key \
-                         column; drop the sink table and re-snapshot the table"
+                detail: "the sink table, which the pipeline meets for the first time (left by \
+                         a state that's gone, or made by a job's copy), lacks this key column; \
+                         drop the sink table and re-snapshot the table"
                     .into(),
             });
         }
@@ -85,9 +85,10 @@ pub(crate) fn missing_columns(
     }) {
         return Err(HaltReason::SchemaMismatch {
             column: f.name().clone(),
-            detail: "the sink table, made by a run whose state is gone, holds this non-null \
-                     column, which the source doesn't have: no row of the source's could fill \
-                     it; drop the sink table and re-snapshot the table"
+            detail: "the sink table, which the pipeline meets for the first time (left by a \
+                     state that's gone, or made by a job's copy), holds this non-null column, \
+                     which the source doesn't have: no row of the source's could fill it; drop \
+                     the sink table and re-snapshot the table"
                 .into(),
         });
     }
