@@ -329,16 +329,12 @@ async fn a_reconnect_to_another_server_halts_or_reruns_phase_0() {
         let s = SourceConnector::open_stream(&halt, &cp, &tables)
             .await
             .expect("this server's checkpoint opens");
-        drop(s);
-        // The walsender lets go of the slot before the next open.
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while halt.retained().await.unwrap().is_some_and(|l| l.streamed) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the slot stays active"
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        // Closed, not dropped: the replication client's worker connects and starts the
+        // replication in the background, after the open returns, so a dropped stream's worker
+        // can still take the slot after a wait for it to go inactive has passed, and the next
+        // open, or the cleanup's drop of the slot, then fails with `55006`. `close` stops the
+        // worker, waits for it to exit, then waits for the walsender to let go of the slot.
+        s.close().await.expect("the stream closes");
     }
     cleanup(&a, &n).await;
 }
