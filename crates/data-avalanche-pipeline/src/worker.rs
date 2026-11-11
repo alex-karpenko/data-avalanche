@@ -375,6 +375,15 @@ fn same_columns(cached: &TableSchema, now: &TableSchema, fold: bool) -> bool {
             })
 }
 
+/// Whether two keys are the same: the same columns in the same order, the names compared without
+/// case when the source compares them so (`fold`, MySQL), as `same_columns` does (D-M12d.3).
+fn same_key(a: &[String], b: &[String], fold: bool) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| x == y || (fold && x.to_lowercase() == y.to_lowercase()))
+}
+
 /// DA-SRC-33: the highest position the lake's markers name, at least `checkpoint`: every table
 /// the sink holds, `tracked` too (a reposition's set), for the source to decide whether its
 /// stream continues on another server. A marker another source kind wrote doesn't compare and
@@ -1026,7 +1035,7 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
             core.docs.clear_halt(table).await?;
         }
     }
-    let started: BTreeSet<TableRef> = requests
+    let mut started: BTreeSet<TableRef> = requests
         .iter()
         .filter(|t| asked.contains(*t))
         .cloned()
@@ -1041,13 +1050,18 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
     // only while the job still has the table queued, before any chunk is read: once recorded
     // running below, a later start resumes the copy instead (DA-SNAP-15).
     let truncating = jobs.truncating();
-    for table in started.iter().filter(|t| truncating.contains(*t)) {
-        // Under the key the sink table records (`commit_empty`). For a sink table that records
-        // none, under the key the session copies the table with: the schema this start caches,
-        // else a copy's, else the one cached before (a key whose case alone changed keeps the
-        // cached spelling where names fold, DA-SRC-25). A copy's comes before the cached one: a
-        // table taken out of the config keeps its cached schema and can be a job's copy too, and
-        // the session reads it as a copy.
+    let truncated: Vec<TableRef> = started
+        .iter()
+        .filter(|t| truncating.contains(*t))
+        .cloned()
+        .collect();
+    for table in &truncated {
+        // The key the session copies the table with: the schema this start caches, else a
+        // copy's, else the one cached before (a key whose case alone changed keeps the cached
+        // spelling where names fold, DA-SRC-25), else the catalog's (`resolved_tables`, never
+        // reached for a table this start tracks or copies). A copy's comes before the cached
+        // one: a table taken out of the config keeps its cached schema and can be a job's copy
+        // too, and the session reads it as a copy.
         let schema = schemas
             .iter()
             .find(|s| s.table() == table)
@@ -1055,8 +1069,49 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
             .or_else(|| cached.get(table))
             .or_else(|| resolved_tables.get(table));
         if let Some(schema) = schema {
-            // The result is `true`: a truncate runs under the sink's key, else the source's,
-            // which a resolved schema always has (`Ok(false)` is a reposition's).
+            // A sink table keyed by other columns than the session's would refuse every chunk
+            // of the copy for good: the table halts now, its rows kept, rather than emptied and
+            // then halted at its first chunk (final review M-A). A key that differs by case
+            // alone where names fold is the same key (D-M12d.3), and a sink table that records
+            // none is checked at the commit.
+            let state = sink_retry(&tuning, || Ok(()), || sink.table_state(table)).await?;
+            if state.exists
+                && !state.identifier.is_empty()
+                && !same_key(&state.identifier, schema.identifier(), fold)
+            {
+                let reason = HaltReason::SinkRejected {
+                    detail: format!(
+                        "a truncating job asked to copy it again, but the pipeline keys it by \
+                         {:?} and its sink table by {:?}: it isn't emptied; drop or move the \
+                         sink table, then ask the job again",
+                        schema.identifier(),
+                        state.identifier
+                    ),
+                };
+                let copy = copies.contains_key(table);
+                core.may_write()?;
+                core.docs
+                    .record_halt(&TableHalt {
+                        table: table.clone(),
+                        reason: reason.clone(),
+                        at: at.clone(),
+                        copy,
+                    })
+                    .await?;
+                started.remove(table);
+                failed.insert(table.clone(), format!("{}: {reason}", reason.code()));
+                // A copy's halt fails its job table only: it isn't the pipeline's.
+                if !copy {
+                    core.update(|st| {
+                        st.halted.insert(table.clone(), reason);
+                    });
+                }
+                continue;
+            }
+            // Under the key the sink table records (`commit_empty`), which differs from the
+            // session's here by case alone at most; for a sink table that records none, under
+            // the session's. The result is `true`: a resolved schema always has a key
+            // (`Ok(false)` is a reposition's).
             commit_empty(
                 core,
                 &tuning,

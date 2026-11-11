@@ -349,43 +349,114 @@ mod tests {
     }
 
     /// DA-SRC-25 × DA-SNAP-15: a truncating job keys its truncate as the sink table records its
-    /// key, whatever any schema spells it. Here the key changed case alone where names fold, and
-    /// the operator dropped the sink table, which this start makes again: the truncate passes the
-    /// sink's key check, so the start succeeds instead of ending on every start (final review
-    /// N-1).
+    /// key, whatever the session's schema spells it. Here the key changed case alone where names
+    /// fold, and the operator made the sink table again under the catalog's spelling (`ID`), so
+    /// it records a key the cached schema (`id`) spells otherwise: the truncate passes the sink's
+    /// key check under `ID`, so the start succeeds and the truncate commits, where the cached
+    /// spelling would have the sink refuse the truncate for good and end every start (final
+    /// review N-1, I-A).
     #[tokio::test]
     async fn a_truncating_job_keys_its_truncate_as_the_sink_table_records_it() {
-        use data_avalanche_core::Sink;
+        use data_avalanche_core::{Sink, TableSpec};
         let w = World::new(&["a"]);
         established(&w).await;
         w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
         let (end, _) = run(&w, &never(10), async |status| streamed(&status, &w).await).await;
         end.unwrap();
         w.source.fold_column_names();
-        w.source.alter(
-            &t("a"),
-            TableSchema::new(
-                t("a"),
-                vec![
-                    ColumnSchema::new("ID", V::Int64, "bigint").not_null(),
-                    ColumnSchema::new("doc", V::Text, "text"),
-                ],
-                vec!["ID".into()],
-            )
-            .unwrap(),
-        );
+        let recased = TableSchema::new(
+            t("a"),
+            vec![
+                ColumnSchema::new("ID", V::Int64, "bigint").not_null(),
+                ColumnSchema::new("doc", V::Text, "text"),
+            ],
+            vec!["ID".into()],
+        )
+        .unwrap();
+        w.source.alter(&t("a"), recased.clone());
         w.sink.drop_table(&t("a"));
+        w.sink
+            .ensure_table(&TableSpec::new(&recased, vec![]).unwrap())
+            .await
+            .unwrap();
         ask_truncating(&w, "p~1", &["a"]).await;
-        let (mut core, _control, _status) = w.core(&never(10), &[]);
+        let (mut core, _control, status) = w.core(&never(10), &[]);
         crate::worker::start(&mut core, None).await.unwrap();
+        let state = w.sink.table_state(&t("a")).await.unwrap();
+        assert_eq!(state.identifier, ["ID"], "the sink table's own key");
+        assert!(state.marker.is_some(), "the truncate committed");
         assert!(
-            w.sink.table_state(&t("a")).await.unwrap().exists,
-            "made again"
+            status.borrow().halted.is_empty(),
+            "{:?}",
+            status.borrow().halted
         );
         assert_eq!(
             job(&w, "p~1").await.tables[0].status,
             JobTableStatus::Running
         );
+    }
+
+    /// DA-SRC-25 × DA-SNAP-15: a truncating job on a table whose sink table records another key
+    /// than the session's schema (here a halt cleared by the job baselines a key moved from `id`
+    /// to `doc`, the columns unchanged, while the sink table stays keyed `id`) doesn't empty
+    /// it: the session's commits would be refused for good, so the table halts `SINK_REJECTED`
+    /// at the start with its rows intact, its job table fails, and the start goes on (final
+    /// review M-A).
+    #[tokio::test]
+    async fn a_truncating_job_halts_a_table_its_sink_table_keys_otherwise() {
+        let keyed = |key: &str| {
+            TableSchema::new(
+                t("a"),
+                vec![
+                    ColumnSchema::new("id", V::Int64, "bigint").not_null(),
+                    ColumnSchema::new("doc", V::Text, "text").not_null(),
+                ],
+                vec![key.into()],
+            )
+            .unwrap()
+        };
+        let w = World::new(&["a", "b"]);
+        w.source.alter(&t("a"), keyed("id"));
+        established(&w).await;
+        w.source.commit(
+            FakeTxn::new()
+                .insert(&t("a"), row(1, "x"))
+                .insert(&t("a"), row(2, "y")),
+        );
+        let (end, _) = run(&w, &never(10), async |status| streamed(&status, &w).await).await;
+        end.unwrap();
+        assert_eq!(w.ids("a"), [1, 2]);
+        w.docs
+            .record_halt(&TableHalt {
+                table: t("a"),
+                reason: HaltReason::UnsafeDdl {
+                    detail: "the key changed".into(),
+                },
+                at: w.source.wal_end(),
+                copy: false,
+            })
+            .await
+            .unwrap();
+        w.source.alter(&t("a"), keyed("doc"));
+        ask_truncating(&w, "p~1", &["a", "b"]).await;
+        let (mut core, _control, status) = w.core(&never(10), &[]);
+        crate::worker::start(&mut core, None).await.unwrap();
+        assert_eq!(w.ids("a"), [1, 2], "not emptied");
+        let halts = w.docs.halts().await.unwrap().tables;
+        assert_eq!(halts.len(), 1, "{halts:?}");
+        let HaltReason::SinkRejected { detail } = &halts[0].reason else {
+            panic!("{halts:?}");
+        };
+        assert!(
+            detail.contains(r#"["doc"]"#) && detail.contains(r#"["id"]"#),
+            "{detail}"
+        );
+        assert!(status.borrow().halted.contains_key(&t("a")));
+        let j = job(&w, "p~1").await;
+        assert_eq!(j.tables[0].status, JobTableStatus::Failed);
+        let error = j.tables[0].error.clone().unwrap();
+        assert!(error.starts_with("SINK_REJECTED: "), "{error}");
+        assert_eq!(j.tables[1].status, JobTableStatus::Running, "b goes on");
     }
 
     fn noted(id: i64, note: Option<&str>) -> Row {
