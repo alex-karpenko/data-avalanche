@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-10
+updated: 2026-11-11
 domain: Architecture
 tags: [architecture, data-flow, pipeline, cdc, iceberg, delta-lake, multi-sink, arrow, snapshot, replication]
 sources: []
@@ -807,6 +807,9 @@ Replication stream error / TCP timeout
       system on a later timeline reruns Phase 0 under either action: the start continues the
       stream there if the slot followed (DA-SRC-33), else halts (or recovers) as
       source_change_action says
+    ─ Any source: three Phase 0 reruns in a row for a server change, none with a durable
+      checkpoint past its start, halt the pipeline, naming the alternation: the address reaches
+      more than one server (DA-SRC-34)
 ```
 
 ### Sink Commit Failure
