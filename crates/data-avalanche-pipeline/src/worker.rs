@@ -375,15 +375,6 @@ fn same_columns(cached: &TableSchema, now: &TableSchema, fold: bool) -> bool {
             })
 }
 
-/// Whether two keys are the same: the same columns in the same order, the names compared without
-/// case when the source compares them so (`fold`, MySQL), as `same_columns` does (D-M12d.3).
-fn same_key(a: &[String], b: &[String], fold: bool) -> bool {
-    a.len() == b.len()
-        && a.iter()
-            .zip(b)
-            .all(|(x, y)| x == y || (fold && x.to_lowercase() == y.to_lowercase()))
-}
-
 /// DA-SRC-33: the highest position the lake's markers name, at least `checkpoint`: every table
 /// the sink holds, `tracked` too (a reposition's set), for the source to decide whether its
 /// stream continues on another server. A marker another source kind wrote doesn't compare and
@@ -415,7 +406,9 @@ async fn highest_marker<'a>(
 /// sink table records, else `identifier`. Neither carries a row, so the key only has to pass the
 /// sink's check that it is the table's own, which a key spelled or chosen otherwise than the
 /// sink table's would fail for good: a wiped state's (DA-SRC-32), or one whose case alone changed
-/// where names fold (DA-SRC-25). A table the lake doesn't hold, or a reposition of one without a
+/// where names fold (DA-SRC-25). A truncate reaches here only when the sink table records the
+/// session's key or none (the truncate loop halts any other), so for a truncate the recorded key
+/// is defence in depth. A table the lake doesn't hold, or a reposition of one without a
 /// marker, has nothing to commit. `Ok(false)` when there was no key to commit under: a
 /// reposition of a table that records none, which the pipeline neither resolves nor caches.
 async fn commit_empty(
@@ -1069,15 +1062,16 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
             .or_else(|| cached.get(table))
             .or_else(|| resolved_tables.get(table));
         if let Some(schema) = schema {
-            // A sink table keyed by other columns than the session's would refuse every chunk
-            // of the copy for good: the table halts now, its rows kept, rather than emptied and
-            // then halted at its first chunk (final review M-A). A key that differs by case
-            // alone where names fold is the same key (D-M12d.3), and a sink table that records
-            // none is checked at the commit.
+            // A sink table keyed otherwise than the session's (other columns, or the same
+            // spelled otherwise, by case alone included) would refuse every chunk of the copy
+            // for good: a sink compares keys byte for byte, and the session never takes the
+            // sink's spelling. The table halts now, its rows kept, rather than emptied and then
+            // halted at its first chunk (final review M-A, m-1). A sink table that records no
+            // key is checked at the commit.
             let state = sink_retry(&tuning, || Ok(()), || sink.table_state(table)).await?;
             if state.exists
                 && !state.identifier.is_empty()
-                && !same_key(&state.identifier, schema.identifier(), fold)
+                && state.identifier.as_slice() != schema.identifier()
             {
                 let reason = HaltReason::SinkRejected {
                     detail: format!(
@@ -1108,10 +1102,9 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
                 }
                 continue;
             }
-            // Under the key the sink table records (`commit_empty`), which differs from the
-            // session's here by case alone at most; for a sink table that records none, under
-            // the session's. The result is `true`: a resolved schema always has a key
-            // (`Ok(false)` is a reposition's).
+            // Under the key the sink table records (`commit_empty`), which is the session's
+            // here; for a sink table that records none, under the session's. The result is
+            // `true`: a resolved schema always has a key (`Ok(false)` is a reposition's).
             commit_empty(
                 core,
                 &tuning,
