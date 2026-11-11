@@ -217,7 +217,7 @@ tracked, skipped the new server's changes up to it. The set is now
 - **The halt stays while the lake holds the table (DA-SRC-37, M12c).** The reposition is never
   retried: the checkpoint already names the new server, and holding it back until every reposition
   succeeds would make an always-refusing table fail every start, the regression the halt closes.
-  So a later start keeps a refused reposition's halt (its detail begins `REPOSITION_REFUSED`) of a
+  So a later start keeps a refused reposition's halt (its detail begins `the source changed, and its reposition fails`, the code's `REPOSITION_REFUSED`) of a
   table the pipeline doesn't track while the sink still holds it (`table_state(..).exists`), where
   it used to clear the halt of every table neither configured, cached, requested nor copied. Tracked
   later, the table stays halted rather than skipping the new server's changes up to its old marker;
