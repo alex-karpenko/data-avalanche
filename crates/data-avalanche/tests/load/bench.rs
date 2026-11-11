@@ -67,6 +67,24 @@ async fn steady_state_lag_at_the_defaults() {
         "changes/s",
         None,
     );
+    record(RUN, "steady_failed", counts.failed as f64, "", None);
+    assert!(counts.changes > 0, "steady: the writer wrote nothing");
+    assert_eq!(
+        counts.failed, 0,
+        "steady: {} statements failed",
+        counts.failed
+    );
+    let achieved = counts.changes as f64 / secs;
+    assert!(
+        achieved >= 0.8 * rate() as f64,
+        "steady: {achieved} changes/s achieved of {} asked",
+        rate()
+    );
+    let n = lag.0.len() as u64;
+    assert!(
+        n >= window.as_secs() * 9 / 10,
+        "steady: {n} lag samples over {window:?}"
+    );
     for t in &w.tables {
         lands(&e, "lake", t, Duration::from_secs(300)).await;
     }
@@ -103,7 +121,13 @@ async fn merge_cost_under_random_key_churn() {
     let (s0, c0) = histogram(&p, commit, &e.test).await;
     let writer = w.start(&e);
     tokio::time::sleep(window).await;
-    writer.stop().await;
+    let counts = writer.stop().await;
+    assert!(counts.changes > 0, "churn: the writer wrote nothing");
+    assert_eq!(
+        counts.failed, 0,
+        "churn: {} statements failed",
+        counts.failed
+    );
     lands(&e, "lake", table, Duration::from_secs(600)).await;
     let (s1, c1) = histogram(&p, commit, &e.test).await;
     let log = e.log(table).await;
@@ -186,7 +210,13 @@ async fn a_failover_recovers_within_two_minutes() {
         assert!(t0.elapsed() < Duration::from_secs(600), "no recovery");
         tokio::time::sleep(Duration::from_secs(1)).await;
     };
-    writer.stop().await;
+    let counts = writer.stop().await;
+    assert!(counts.changes > 0, "failover: the writer wrote nothing");
+    assert_eq!(
+        counts.failed, 0,
+        "failover: {} statements failed",
+        counts.failed
+    );
     record(RUN, "failover_landed", landed.as_secs_f64(), "s", None);
     record(
         RUN,

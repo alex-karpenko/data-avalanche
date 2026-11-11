@@ -80,7 +80,13 @@ async fn storage_outage(test: &str, outage: Duration) -> Option<(u64, u64)> {
         None,
     );
     tokio::time::sleep(AROUND).await;
-    writer.stop().await;
+    let counts = writer.stop().await;
+    assert!(counts.changes > 0, "{test}: the writer wrote nothing");
+    assert_eq!(
+        counts.failed, 0,
+        "{test}: {} statements failed",
+        counts.failed
+    );
     for t in &w.tables {
         lands(&e, "lake", t, Duration::from_secs(300)).await;
     }
@@ -160,6 +166,10 @@ async fn a_source_restart_loses_nothing() {
     e.streaming().await;
     tokio::time::sleep(AROUND).await;
     let counts = writer.stop().await;
+    assert!(
+        counts.changes > 0,
+        "source restart: the writer wrote nothing"
+    );
     record(
         RUN,
         "source_restart_failed_statements",
@@ -193,7 +203,13 @@ async fn a_partition_under_load_loses_nothing() {
     c.heal();
     c.settled().await;
     tokio::time::sleep(AROUND).await;
-    writer.stop().await;
+    let counts = writer.stop().await;
+    assert!(counts.changes > 0, "partition: the writer wrote nothing");
+    assert_eq!(
+        counts.failed, 0,
+        "partition: {} statements failed",
+        counts.failed
+    );
     let after = c.holders().await[&test].clone();
     record(
         RUN,

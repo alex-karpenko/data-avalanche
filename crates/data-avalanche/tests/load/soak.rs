@@ -137,7 +137,7 @@ async fn a_day_of_churn_loses_nothing() {
     let start = Instant::now();
     let (mut next_churn, mut next_check) = (start + churn_every, start + check_every);
     let mut step = 0;
-    let mut changes = 0;
+    let (mut changes, mut failed) = (0, 0);
     loop {
         let end = start + total;
         let at = next_churn.min(next_check).min(end);
@@ -149,7 +149,9 @@ async fn a_day_of_churn_loses_nothing() {
             next_churn += churn_every;
         }
         if now >= next_check || now >= end {
-            changes += writer.stop().await.changes;
+            let counts = writer.stop().await;
+            changes += counts.changes;
+            failed += counts.failed;
             check(&c, &w).await;
             let kib = rss(n1);
             memory.push(kib);
@@ -163,6 +165,14 @@ async fn a_day_of_churn_loses_nothing() {
     }
     record(RUN, "churn_steps", step as f64, "", None);
     record(RUN, "changes", changes as f64, "", None);
+    record(RUN, "failed", failed as f64, "", None);
+    assert!(changes > 0, "soak: the writer wrote nothing");
+    assert_eq!(failed, 0, "soak: {failed} statements failed");
+    assert!(
+        memory.len() >= 2,
+        "soak: {} memory reading; it needs at least two checks (SOAK_CHECK_MINUTES under SOAK_MINUTES)",
+        memory.len()
+    );
     let (first, last) = (memory[0], *memory.last().expect("a reading"));
     let grew = last as f64 / first as f64;
     record(RUN, "n1_rss_growth", grew, "x", Some(("<= 2", grew <= 2.0)));
