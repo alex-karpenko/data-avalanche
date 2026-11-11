@@ -388,8 +388,8 @@ pub fn reconnect_check(
         && timeline > was_on
     {
         return Err(SourceError::SourceChanged(format!(
-            "the checkpoint {} was read on {was}, and the stream's reconnect reaches {now}, a \
-             promoted server of the same system: the pipeline starts again, and its start decides \
+            "WAL_SOURCE_CHANGED: the checkpoint {} was read on {was}, and the stream's reconnect \
+             reaches {now}, a promoted server of the same system: the pipeline starts again, and its start decides \
              whether the stream continues there (a failover slot synchronized up to the \
              checkpoint) or halts as source_change_action says",
             lost.position.untagged()
@@ -1247,9 +1247,9 @@ mod tests {
             match reconnect_check(&promoted, &now, action) {
                 Err(SourceError::SourceChanged(m)) => assert!(
                     m.starts_with(
-                        "the checkpoint 0/20 was read on PostgreSQL system 7 on timeline 1, and \
-                         the stream's reconnect reaches PostgreSQL system 7 on timeline 2, a \
-                         promoted server"
+                        "WAL_SOURCE_CHANGED: the checkpoint 0/20 was read on PostgreSQL system 7 \
+                         on timeline 1, and the stream's reconnect reaches PostgreSQL system 7 on \
+                         timeline 2, a promoted server"
                     ) && m.contains("its start decides"),
                     "{m}"
                 ),

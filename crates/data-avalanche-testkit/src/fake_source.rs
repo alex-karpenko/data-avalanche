@@ -761,7 +761,7 @@ impl Db {
             && u > t
         {
             return Err(SourceError::SourceChanged(format!(
-                "the checkpoint {} was read on {was}, and the stream's reconnect reaches {now}, a promoted server of the same system",
+                "WAL_SOURCE_CHANGED: the checkpoint {} was read on {was}, and the stream's reconnect reaches {now}, a promoted server of the same system",
                 at.position
             )));
         }

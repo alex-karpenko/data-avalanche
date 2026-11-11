@@ -390,7 +390,8 @@ async fn a_promotion_the_failover_slot_followed_continues_the_stream() {
         log.contains("so the stream continues on the new timeline"),
         "{log}"
     );
-    assert!(!log.contains("WAL_SOURCE_CHANGED"), "{log}");
+    // The reconnect's rerun names the change (D-M12c.3), but nothing halts on it.
+    assert!(!halted_with(&log, "WAL_SOURCE_CHANGED"), "{log}");
     assert!(p.terminate().await.success());
     standby
         .exec(&format!(
