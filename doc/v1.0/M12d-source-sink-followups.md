@@ -221,7 +221,8 @@ source_change_action: error, and reruns Phase 0 under re_snapshot, before a lost
 made again there", so that it no longer contradicts P-6. Phase 2a's identity tree reads
 consistently (its "another system or timeline" branch follows the continuation branch) and is
 unchanged. P-7 was added and approved at the whole-branch review (2026-11-11, its m-2) and applied
-in its fix round.
+in its fix round. P-8 was added and approved at the second re-review (2026-11-11, its I-B) and
+applied in the third fix wave.
 
 **P-1 — `Configuration_Specification.md` §9.2.1, `slot_management` row.** After "`managed`: create
 the slot if absent, reuse if present, drop on delete per `auto_cleanup`." insert: "On PostgreSQL
@@ -283,6 +284,16 @@ a server change, none with a durable checkpoint past its start, halt the pipelin
 alternation: the address reaches more than one server (DA-SRC-34)". P-5 put the sentence in Phase
 2b's file/position-mode tree only, while the controller counts every source's `SourceChanged` run,
 PostgreSQL's included. Phase 2b's sentence stays.
+
+**P-8 — `Schema_Change_Detection_and_Evolution.md` §3 Channel A and §8.2** (approved 2026-11-11, the
+second re-review's I-B). Channel A's "Table absent in target" bullet becomes: "at a first start, a
+cleared halt or a non-replayable gap, use the queried schema as the **baseline** to create the
+target table via the sink (consistent with the snapshot read point, `Data-Flow.md` Phase 1); at a
+replayable resume, create it from the pipeline's cached schema, which the stream's in-order replay
+(B+C) then evolves". §8.2's "create absent tables from the queried baseline" gains "(at a
+replayable resume, from the cached schema, which in-order replay then evolves)". It records O-1
+(D-M12d.3): at a replayable resume the stream still holds the rows before a change, which on MySQL
+decode only under the cached schema, and the change replays in order.
 
 ## File Structure
 
@@ -2128,11 +2139,14 @@ it says otherwise. Later tasks' blocks applied on top unchanged.
       spelling, had the truncate refused for good. Every start then ended in `ERROR`, where before
       M12d one table halted. A truncate is now keyed as the sink table records its key, as the
       reposition already was (`commit_empty`). I-1's lookup is kept only for a sink table that
-      records no key: there the session's spelling is the one the sink's columns have. A copy
-      truly keyed otherwise than its sink table now halts as one table, at its first data commit.
-      Test `a_truncating_job_keys_its_truncate_as_the_sink_table_records_it` (RED: the start
-      failed, `identifier column "id" isn't in the schema`). N-2: the truncate loop's comment now
-      follows the lookup order and says why a copy's schema comes before the cached one.
+      records no key: there the session's spelling is the one the sink's columns have. As N-1
+      landed, a table truly keyed otherwise than its sink table was emptied, then halted at its
+      first data commit; since the third wave (M-A below) it halts `SINK_REJECTED` at the start
+      instead, with no truncate, its rows intact and its job table failed. Test
+      `a_truncating_job_keys_its_truncate_as_the_sink_table_records_it` (RED at `695a490`: the
+      start failed, `identifier column "id" isn't in the schema`; after O-1 it no longer
+      discriminated, see I-A below). N-2: the truncate loop's comment now follows the lookup order
+      and says why a copy's schema comes before the cached one.
     - O-1 (`7fed088`; Task 3, D-M12d.3): a sink table absent at a start is made under the schema
       the session writes it with, not the catalog's. At a resume that is the cached schema, so a
       MySQL key recased while the pipeline was down no longer makes the sink table again under the
@@ -2147,6 +2161,30 @@ it says otherwise. Later tasks' blocks applied on top unchanged.
       refused, keyed by `id` against `ID`), and the MySQL E2E
       `a_deleted_table_of_a_recased_key_is_made_again_under_the_cached_spelling` (RED: the Delta
       table was made with `ID`).
+  - The second re-review's third fix wave (`final-rereview-2.md`), approved by Oleksii on
+    2026-11-11:
+    - I-A (`b6c9968`): after O-1, N-1's test passed with N-1 reverted (the start made the dropped
+      sink table again under the cached `id`, so the lookup's key matched). The test now makes the
+      sink table again by hand under the catalog's spelling (`ID`) after the drop, so the sink
+      records a key the cached schema spells otherwise, and asserts the truncate committed under
+      `ID` (the table's marker) with nothing halted. RED with N-1 reverted: the start failed,
+      `identifier column "id" isn't in the schema`.
+    - M-A (`b6c9968`): the truncate loop compares the session's key (the I-1 lookup) with the key
+      the sink table records. Two keys are the same when they name the same columns in the same
+      order, compared without case where the source folds names (`same_key`, as `same_columns`
+      compares, D-M12d.3). A sink table that records a key other than the session's (other
+      columns, or a case difference where names don't fold) would refuse every chunk of the copy
+      for good, so the table halts `SINK_REJECTED` at the start ("a truncating job asked to copy it
+      again, but the pipeline keys it by [..] and its sink table by [..]: it isn't emptied; …"),
+      its job table fails, and the start goes on; a copy's halt is recorded `copy: true`, as the
+      session records one. A case-only difference where names fold still truncates, under the
+      sink's key (N-1). A sink table that records no key is left to the commit's checks. Test
+      `a_truncating_job_halts_a_table_its_sink_table_keys_otherwise` (RED: the table was emptied,
+      `left: []`, `right: [1, 2]`). The runbooks' `SINK_REJECTED` row and the truncate paragraph
+      name the new halt.
+    - I-B (`035aef4`): spec patch P-8, approved 2026-11-11.
+    - M-B: recorded among the known limitations below.
+    - M-D: the lookup's comment names its last fallback, the catalog's (`resolved_tables`).
 
 **Known limitations** (recorded in the gap tracker §60.1, and in the operator docs where an operator
 acts):
@@ -2161,7 +2199,12 @@ acts):
 - after a crash of a busy primary the synced slot usually lags the last acknowledgement, so the start
   halts; a planned switchover continues reliably. On 17+ a down standby named in
   `synchronized_standby_slots` stalls the pipeline; a slot made before an upgrade to 17 stays plain
-  (Task 8 review M6, M7; the runbook and `Postgres_Slot…` §8.5).
+  (Task 8 review M6, M7; the runbook and `Postgres_Slot…` §8.5);
+- when `partition_by` names a column that is in the catalog's schema but not in the cached one
+  (added while the pipeline was down, or recased on MySQL with the config following the new
+  spelling), a resume whose sink table is absent halts that table `SCHEMA_MISMATCH` at the start,
+  since the table is made under the cached schema (O-1); a clearing job recovers it (second
+  re-review M-B).
 
 **Deferred to the whole-branch review** (the task reviews' minors): Task 1, the evolve test's `Tag`
 case and the quadratic create check; Task 2, the accent-insensitive fold, two keys of one column
