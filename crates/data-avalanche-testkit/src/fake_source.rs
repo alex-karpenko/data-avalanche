@@ -955,6 +955,22 @@ impl Db {
 }
 
 /// What `augment` and `rescan` compare: columns by name, with their types.
+/// `row` with each column named as `schema` spells it, matched without case.
+fn respell(row: Row, schema: &TableSchema) -> Row {
+    Row(row
+        .0
+        .into_iter()
+        .map(|(n, v)| {
+            let named = schema
+                .columns()
+                .iter()
+                .find(|c| c.name.to_lowercase() == n.to_lowercase())
+                .map_or(n, |c| c.name.clone());
+            (named, v)
+        })
+        .collect())
+}
+
 fn shape(
     columns: &[ColumnSchema],
     fold: bool,
@@ -1243,7 +1259,9 @@ impl SourceConnector for FakeSource {
                     reason: HaltReason::TableDropped,
                 });
             };
-            if shape(now.columns(), false) != shape(table.columns(), false) {
+            // Where names fold, the read asks the cached spelling, as MySQL's reads it.
+            let fold = db.fold;
+            if shape(now.columns(), fold) != shape(table.columns(), fold) {
                 return Err(SourceError::Transient(format!(
                     "{} changed under the snapshot",
                     table.table()
@@ -1255,7 +1273,10 @@ impl SourceConnector for FakeSource {
                 .into_iter()
                 .filter(|(k, _)| from.as_ref().is_none_or(|f| k > f))
                 .take(limit)
-                .map(|(_, r)| r)
+                .map(|(_, r)| match fold {
+                    true => respell(r, table),
+                    false => r,
+                })
                 .collect();
             (rows, db.snapshot())
         };

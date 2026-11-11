@@ -822,6 +822,13 @@ pipelines:
         delete_prefix(stores::rustfs().as_ref(), &self.table_root(table)).await;
     }
 
+    /// Deletes the pipeline's own documents (`<sink.prefix>/.pipeline-state`), as a lost state
+    /// would: the next start meets the lake's tables with no schema cached (DA-SNAP-13).
+    pub async fn wipe_state(&self) {
+        let at = colocated_state(TEST_BUCKET, &self.lake_prefix());
+        delete_prefix(stores::rustfs().as_ref(), &at.root).await;
+    }
+
     /// The metrics' `source_db` label: PostgreSQL's database, MySQL's (the test's).
     pub fn source_db(&self) -> &str {
         match self.source {
