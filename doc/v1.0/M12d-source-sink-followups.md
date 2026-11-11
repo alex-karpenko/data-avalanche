@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-10
+updated: 2026-11-11
 domain: Architecture
 tags: [v1, implementation-plan, m12, m12d, hardening, source, sink, mysql, postgres, delta, failover, slot-sync, schema-evolution, reposition]
 resolves: [DA-SINK-12, DA-SRC-35, DA-SRC-25, DA-SRC-36, DA-SNAP-22, DA-SRC-32, DA-SRC-34, DA-SRC-33, DA-SRC-31]
@@ -220,7 +220,8 @@ reaches another system, or an earlier timeline of the same one (Phase 2a), halts
 source_change_action: error, and reruns Phase 0 under re_snapshot, before a lost slot is dropped or
 made again there", so that it no longer contradicts P-6. Phase 2a's identity tree reads
 consistently (its "another system or timeline" branch follows the continuation branch) and is
-unchanged.
+unchanged. P-7 was added and approved at the whole-branch review (2026-11-11, its m-2) and applied
+in its fix round.
 
 **P-1 — `Configuration_Specification.md` §9.2.1, `slot_management` row.** After "`managed`: create
 the slot if absent, reuse if present, drop on delete per `auto_cleanup`." insert: "On PostgreSQL
@@ -275,6 +276,13 @@ reruns Phase 0 under either action: the start continues the stream there if the 
 approved as applied (2026-11-10). Its companion, also approved 2026-11-10: the line's first
 PostgreSQL clause reads "a reconnect that reaches another system, or an earlier timeline of the same
 one (Phase 2a), halts …".
+
+**P-7 — `Data-Flow.md` "Source Disconnect"** (approved 2026-11-11, the whole-branch review's m-2).
+After the PostgreSQL line, a line for every source: "─ Any source: three Phase 0 reruns in a row for
+a server change, none with a durable checkpoint past its start, halt the pipeline, naming the
+alternation: the address reaches more than one server (DA-SRC-34)". P-5 put the sentence in Phase
+2b's file/position-mode tree only, while the controller counts every source's `SourceChanged` run,
+PostgreSQL's included. Phase 2b's sentence stays.
 
 ## File Structure
 
@@ -2059,8 +2067,11 @@ it says otherwise. Later tasks' blocks applied on top unchanged.
   (`a_gone_tables_rescan_warnings_reach_the_status`, `a_periodic_rescans_warnings_reach_the_status`);
   IT `a_table_whose_schema_is_gone_is_still_reported_dropped`.
 - **Task 5** (`3c6a252`, comments only): the `missing_columns` doc covers a table first tracked at a
-  resume. Its halt texts keep the plan's "made by a run whose state is gone", inaccurate at a resume;
-  Oleksii: raise at the whole-branch review.
+  resume. Its halt texts kept the plan's "made by a run whose state is gone", inaccurate at a resume;
+  Oleksii: raise at the whole-branch review. Reworded there (m-1, `cb11145`, approved 2026-11-11):
+  "the sink table, which the pipeline meets for the first time (left by a state that's gone, or made
+  by a job's copy), lacks this key column; …", and the same opening for the non-null column, as the
+  halted-table runbook words it.
 - **Task 6** (fix round, `d4ed202`): the `_delta_log/` probe listed every log page; it now reads the
   first listing entry (`store.list(..).next()`, one page). `unescape_table_segment` accepts only the
   canonical form (`escape_table_segment` must reproduce the segment). `MemorySink::forget_key`, a test
@@ -2097,6 +2108,18 @@ it says otherwise. Later tasks' blocks applied on top unchanged.
   set-up gains `primary_slot_name` and `dbname`; the summaries gain the marker condition; the
   PostgreSQL alternation paragraph says `re_snapshot` and that a promoted-reconnect alternation
   halts without a code; config §15 item 32 notes the 2026-11-10 rewording.
+- **Whole-branch review** (fix round, 2026-11-11; `final-review.md`, ready with fixes):
+  - I-1 (`c122059`; Task 3 × DA-SNAP-15): a truncating job took the key from the catalog's schema
+    now, so on a MySQL table whose key column changed case alone the sink refused the truncate for
+    good (its key keeps the cached spelling) and every start ended in `ERROR`. The truncate now
+    takes the schema the session copies the table under: the one this start caches, a copy's, the
+    one cached before, then the catalog's. The review proposed the cached schema before a copy's;
+    a copy is read under its own described schema (`session.rs`'s `copies`), so a copy's comes
+    first. Test `a_truncating_job_keys_a_recased_key_as_the_sink_table_does` (RED: the start
+    failed, the change set keyed by `ID` against the sink's `id`). The review's optional hardening
+    (a permanent truncate failing that table's job instead of ending the start) wasn't done;
+  - m-1 (`cb11145`): the two baseline halt texts reworded (see Task 5);
+  - m-2 (`7508e67`): spec patch P-7, approved 2026-11-11.
 
 **Known limitations** (recorded in the gap tracker §60.1, and in the operator docs where an operator
 acts):
@@ -2119,7 +2142,7 @@ differing by case, `plan_table`'s rescan per key entry; Task 3, `FakeSource::fol
 limits, `same_columns`' inline fold, `DROP a, ADD A` merged as one column, no unit test of `scope`'s
 identifier remap, the fake's snapshot reader not folding; Task 4, no IT for a still-readable table, the 1049 IT reasoned RED but not run RED, and review
 minors #2, #3, #4, #6, #7 left as justified in `task-4-report.md`;
-Task 5, the halt texts above, no test for a partition the publication names directly, no Phase 0
+Task 5, the halt texts above (reworded at the whole-branch review), no test for a partition the publication names directly, no Phase 0
 test recording the non-null halt; Task 6, M-2 (the reposition halt overwrites an earlier halt), M-3
 (a job's copy halted with `copy: false`), M-5 (a malformed key property fails `table_state`), M-6
 (each held table keeps a loaded handle), M-7 (no RustFS/prefix IT for `held_tables`), the duplicated
