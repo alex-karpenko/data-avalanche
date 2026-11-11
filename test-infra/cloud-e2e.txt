@@ -1,0 +1,4 @@
+smoke::a_pipeline_runs_stops_on_sigterm_and_resumes
+crashes::a_crash_between_a_commit_and_its_checkpoint_skips_the_replay
+cluster::a_killed_nodes_pipelines_are_taken_over
+jobs::a_job_clears_a_dropped_table_s_halt

@@ -25,6 +25,7 @@ mod schema;
 mod smoke;
 mod snapshots;
 mod source;
+mod store;
 mod streaming;
 mod toast;
 mod types;

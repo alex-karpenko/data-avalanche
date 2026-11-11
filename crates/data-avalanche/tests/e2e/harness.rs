@@ -1,7 +1,7 @@
 //! One E2E test's world on the source under test ([`Source::from_env`]): PostgreSQL's schema
 //! `e2e_<test>` with its slot and publication, or MySQL's database `e2e_<test>` with a user of
-//! that name; a RustFS prefix for `globals.state` and the lake, a config file, and the binary as
-//! a child process.
+//! that name; a prefix for `globals.state` and the lake on the run's [`Store`] (RustFS unless
+//! `DATA_AVALANCHE_E2E_STORE` names another), a config file, and the binary as a child process.
 
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -17,17 +17,15 @@ use data_avalanche_sink_delta::{DeltaLocation, DeltaSink, DeltaSinkConfig};
 use data_avalanche_state::{
     DocStore, HaltsDoc, LeaseDoc, Leases, PipelineDocs, TableSnapshotDoc, Versioned,
 };
-use data_avalanche_storage::{Backend, ObjectStoreVersioned, colocated_state, table_root};
-use data_avalanche_testkit::endpoints::{
-    RUSTFS_ACCESS_KEY, RUSTFS_SECRET_KEY, RUSTFS_URL, TEST_BUCKET,
-};
-use data_avalanche_testkit::{delete_prefix, stores, unique_prefix};
+use data_avalanche_storage::{ObjectStoreVersioned, colocated_state, table_root};
+use data_avalanche_testkit::{delete_prefix, unique_prefix};
 use futures_util::TryStreamExt;
 use rustls::pki_types::{CertificateDer, ServerName};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_rustls::TlsConnector;
 
 pub use crate::source::{Db, Source};
+pub use crate::store::Store;
 
 /// Polls `cond` every 100 ms until it holds, for at most `within`.
 pub async fn eventually<F, Fut>(what: &str, within: Duration, mut cond: F)
@@ -107,6 +105,8 @@ pub struct E2e {
     /// PostgreSQL's schema, MySQL's database: `e2e_<test>`.
     pub schema: String,
     pub source: Source,
+    /// Where `globals.state` and the lake are.
+    pub store: Store,
     prefix: String,
     /// The first node's (`n1`) API port.
     port: u16,
@@ -184,6 +184,7 @@ impl E2e {
             test: test.to_owned(),
             schema,
             source,
+            store: Store::from_env(),
             prefix: unique_prefix(&format!("e2e-{test}")),
             port: free_port(),
             dir: tempfile::tempdir().expect("a temp dir"),
@@ -274,11 +275,11 @@ impl E2e {
             .replace("@INCLUDE@", &include)
             .replace("@SCHEMA@", &self.schema)
             .replace("@PREFIX@", &self.prefix)
-            .replace("@BUCKET@", TEST_BUCKET);
+            .replace("@BUCKET@", &self.store.bucket());
         format!(
             r#"config_version: 1
 globals:
-  cloud: aws
+  cloud: {cloud}
   state: {{ bucket: {bucket}, prefix: {prefix}/globals }}
   api: {{ address: "127.0.0.1:${{E2E_API_PORT}}"{api} }}
   log: {log}
@@ -297,7 +298,8 @@ pipelines:
     {pipeline}
 {more}
 "#,
-            bucket = TEST_BUCKET,
+            bucket = self.store.bucket(),
+            cloud = self.store.cloud(),
             prefix = self.prefix,
             test = self.test,
             source = self.source_block("", o.port, o.source, o.postgres, o.mysql),
@@ -349,11 +351,7 @@ pipelines:
             .arg(self.config_path())
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
-            .env("AWS_ACCESS_KEY_ID", RUSTFS_ACCESS_KEY)
-            .env("AWS_SECRET_ACCESS_KEY", RUSTFS_SECRET_KEY)
-            .env("AWS_REGION", "us-east-1")
-            .env("AWS_ENDPOINT_URL", RUSTFS_URL)
-            .env("AWS_ALLOW_HTTP", "true")
+            .envs(self.store.env())
             .env("RUST_BACKTRACE", "1")
             .env("E2E_NODE", node)
             .env("E2E_API_PORT", port.to_string())
@@ -393,27 +391,20 @@ pipelines:
         TableRef::new(&self.schema, name)
     }
 
-    /// A reader of the pipeline's Delta tables on RustFS.
+    /// A reader of the pipeline's Delta tables.
     pub fn lake(&self) -> DeltaSink {
         self.lake_in("lake")
     }
 
     /// [`Self::lake`] of the pipeline whose sink prefix ends in `lake` (`lake`, `lake_b`).
     pub fn lake_in(&self, lake: &str) -> DeltaSink {
-        let opt = |k: &str, v: &str| (k.to_owned(), v.to_owned());
         DeltaSink::new(DeltaSinkConfig {
             pipeline_id: self.test.clone(),
             location: DeltaLocation::Bucket {
-                backend: Backend::S3,
-                bucket: TEST_BUCKET.into(),
+                backend: self.store.backend(),
+                bucket: self.store.bucket(),
                 prefix: format!("{}/{lake}", self.prefix),
-                options: vec![
-                    opt("endpoint", RUSTFS_URL),
-                    opt("allow_http", "true"),
-                    opt("region", "us-east-1"),
-                    opt("access_key_id", RUSTFS_ACCESS_KEY),
-                    opt("secret_access_key", RUSTFS_SECRET_KEY),
-                ],
+                options: self.store.lake_options(),
             },
             table: Default::default(),
             merge_memory_limit: None,
@@ -659,7 +650,7 @@ pipelines:
     }
 
     fn docs_at(&self, root: &str) -> DocStore {
-        let store = ObjectStoreVersioned::new(stores::rustfs(), root).expect("a root");
+        let store = ObjectStoreVersioned::new(self.store.objects(), root).expect("a root");
         DocStore::new(std::sync::Arc::new(store))
     }
 
@@ -712,7 +703,7 @@ pipelines:
 
     /// The pipeline's own documents, co-located with the lake (`<sink.prefix>/.pipeline-state`).
     pub fn docs(&self) -> PipelineDocs {
-        let at = colocated_state(TEST_BUCKET, &self.lake_prefix());
+        let at = colocated_state(&self.store.bucket(), &self.lake_prefix());
         PipelineDocs::new(self.docs_at(&at.root))
     }
 
@@ -761,9 +752,9 @@ pipelines:
 
     /// [`Self::log`] in the lake `lake`.
     pub async fn log_in(&self, lake: &str, table: &str) -> Vec<Vec<serde_json::Value>> {
-        let store = stores::rustfs();
+        let store = self.store.objects();
         let root = table_root(
-            TEST_BUCKET,
+            &self.store.bucket(),
             &format!("{}/{lake}", self.prefix),
             &self.schema,
             table,
@@ -804,12 +795,18 @@ pipelines:
     }
 
     fn table_root(&self, table: &str) -> String {
-        table_root(TEST_BUCKET, &self.lake_prefix(), &self.schema, table).root
+        table_root(
+            &self.store.bucket(),
+            &self.lake_prefix(),
+            &self.schema,
+            table,
+        )
+        .root
     }
 
-    /// The Delta table's root as an `s3://` URL.
+    /// The Delta table's root as an `s3://` URL (RustFS's).
     pub fn table_url(&self, table: &str) -> String {
-        format!("s3://{TEST_BUCKET}/{}", self.table_root(table))
+        format!("s3://{}/{}", self.store.bucket(), self.table_root(table))
     }
 
     /// The Delta table's commits: its `_delta_log/*.json` files.
@@ -819,14 +816,14 @@ pipelines:
 
     /// Deletes the Delta table from the lake, as an operator would.
     pub async fn drop_lake_table(&self, table: &str) {
-        delete_prefix(stores::rustfs().as_ref(), &self.table_root(table)).await;
+        delete_prefix(self.store.objects().as_ref(), &self.table_root(table)).await;
     }
 
     /// Deletes the pipeline's own documents (`<sink.prefix>/.pipeline-state`), as a lost state
     /// would: the next start meets the lake's tables with no schema cached (DA-SNAP-13).
     pub async fn wipe_state(&self) {
-        let at = colocated_state(TEST_BUCKET, &self.lake_prefix());
-        delete_prefix(stores::rustfs().as_ref(), &at.root).await;
+        let at = colocated_state(&self.store.bucket(), &self.lake_prefix());
+        delete_prefix(self.store.objects().as_ref(), &at.root).await;
     }
 
     /// The metrics' `source_db` label: PostgreSQL's database, MySQL's (the test's).
@@ -880,7 +877,7 @@ pipelines:
                 .await
                 .expect("cleanup"),
         }
-        delete_prefix(stores::rustfs().as_ref(), &self.prefix).await;
+        delete_prefix(self.store.objects().as_ref(), &self.prefix).await;
     }
 }
 
