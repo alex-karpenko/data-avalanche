@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-10
+updated: 2026-11-11
 domain: Data Flow
 tags: [postgres, replication-slot, publication, lifecycle, wal, re-snapshot, failover-slot, slot-sync, cdc]
 resolves: [G-15, DA-SRC-33, DA-SNAP-22]
@@ -163,7 +163,13 @@ shape. `slot.rs` `publication_shape` reads them from `pg_publication_rel` (`prqu
   below. Amended 2026-10-22 (M8a's whole-branch review): a holder ends such a reader at most once a
   lease term. Two holders that each believe they hold the lease (two lease stores on one slot) would
   otherwise end each other in turn, splitting the slot's changes between two lakes; with the limit,
-  the later busy spell gives up loudly with the bounded retry's error.
+  the later busy spell gives up loudly with the bounded retry's error. Amended 2026-11-11 (M12c,
+  DA-SRC-39): a session closes its stream on every exit, an error's too. A dropped
+  `pgwire-replication` client detaches its worker, which takes the slot again about 80 ms later
+  (measured in M12d's PostgreSQL 14 reconnect test), so the next session's open met the slot still
+  active (`55006`) and spent a step of the bounded retry. A worker task aborted outright (a lost
+  lease) still drops its session unclosed: its node no longer holds the lease, and the new holder's
+  retry, or its end of the stale reader, covers it.
 - **External (non-app) collisions cannot be detected.** PG replication slots carry **no ownership
   tag/comment**, so a slot created by an unrelated system under the same name is indistinguishable.
   Mitigation is V-058 naming uniqueness + operator discipline; documented as a known limitation, not

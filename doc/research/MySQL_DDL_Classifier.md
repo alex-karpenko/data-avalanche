@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-10
+updated: 2026-11-11
 domain: Schema Evolution
 tags: [mysql, mariadb, ddl, sqlparser, classifier, channel-c, schema-evolution, rename, online-migration, case-folding, privileges, cdc]
 resolves: [G-19a, DA-SRC-25, DA-SRC-35, DA-SRC-36]
@@ -180,11 +180,14 @@ hold `a` beside `A` (DA-SINK-12). So the column keeps the spelling the pipeline 
   otherwise than the cached schema (a `SCHEMA_MISMATCH`, or a panic on a recased key). The plan's
   column is now the cached name over the catalog's column; `scope` spells the identifier as the
   result's column. A Phase 0 baseline of a fold-only difference caches the sink's spelling.
-- **A limit, conservative (D-M12d.1).** The Phase 0 baseline of a sink table first met (DA-SNAP-22,
-  `missing_columns`) folds as Delta does and halts `SCHEMA_MISMATCH` on a sink column that matches a
-  source column by case alone; it doesn't consult `column_names_fold`. On MySQL that halts a table
-  whose column only changed case, which the cached path accepts. Safe (a halt, no loss); recorded
-  as a known limitation.
+- **The first-met baseline (DA-SNAP-23, M12c).** The Phase 0 baseline of a sink table first met
+  (DA-SNAP-22, `missing_columns`) folds as Delta does. Where `column_names_fold` holds (MySQL), a
+  sink column that matches a source column by case alone is that column: no add, and the session
+  writes it under the sink's spelling, in the key too, as the cached path keeps it. On PostgreSQL
+  the pair still halts `SCHEMA_MISMATCH`, naming both spellings. Until M12c it halted on MySQL too
+  (D-M12d.1, conservative). Tests: `where_names_fold_a_sink_column_matching_by_case_alone_is_the_column`,
+  `a_first_met_table_whose_names_changed_case_alone_is_baselined_where_names_fold`, E2E
+  `a_lost_state_meets_a_recased_column_as_the_same_column` (MySQL).
 - Tests: `a_change_of_case_alone_keeps_the_cached_name` (IT, MySQL 8.4 with and without GTIDs and MariaDB 11.8: a key
   column recased too, chunk size 1 with a resumed cursor), `a_rename_onto_a_dropped_name_keeps_its_new_spelling`,
   `a_change_of_case_alone_is_no_drift_where_names_fold`,
