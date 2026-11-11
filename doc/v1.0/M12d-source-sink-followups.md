@@ -2108,7 +2108,8 @@ it says otherwise. Later tasks' blocks applied on top unchanged.
   set-up gains `primary_slot_name` and `dbname`; the summaries gain the marker condition; the
   PostgreSQL alternation paragraph says `re_snapshot` and that a promoted-reconnect alternation
   halts without a code; config §15 item 32 notes the 2026-11-10 rewording.
-- **Whole-branch review** (fix round, 2026-11-11; `final-review.md`, ready with fixes):
+- **Whole-branch review** (two fix rounds, 2026-11-11; `final-review.md`, ready with fixes, then
+  `final-rereview.md`):
   - I-1 (`c122059`; Task 3 × DA-SNAP-15): a truncating job took the key from the catalog's schema
     now, so on a MySQL table whose key column changed case alone the sink refused the truncate for
     good (its key keeps the cached spelling) and every start ended in `ERROR`. The truncate now
@@ -2116,10 +2117,36 @@ it says otherwise. Later tasks' blocks applied on top unchanged.
     one cached before, then the catalog's. The review proposed the cached schema before a copy's;
     a copy is read under its own described schema (`session.rs`'s `copies`), so a copy's comes
     first. Test `a_truncating_job_keys_a_recased_key_as_the_sink_table_does` (RED: the start
-    failed, the change set keyed by `ID` against the sink's `id`). The review's optional hardening
-    (a permanent truncate failing that table's job instead of ending the start) wasn't done;
+    failed, the change set keyed by `ID` against the sink's `id`). N-1 below supersedes the
+    review's optional hardening (a permanent truncate failing that table's job instead of ending
+    the start): keyed as the sink table records it, a truncate no longer fails on its key;
   - m-1 (`cb11145`): the two baseline halt texts reworded (see Task 5);
   - m-2 (`7508e67`): spec patch P-7, approved 2026-11-11.
+  - The re-review's second fix wave, approved by Oleksii on 2026-11-11:
+    - N-1 (`695a490`; Task 3 × DA-SNAP-15): with I-1 alone, a MySQL key that changed case alone,
+      together with a sink table the operator dropped and the start made again under the catalog's
+      spelling, had the truncate refused for good. Every start then ended in `ERROR`, where before
+      M12d one table halted. A truncate is now keyed as the sink table records its key, as the
+      reposition already was (`commit_empty`). I-1's lookup is kept only for a sink table that
+      records no key: there the session's spelling is the one the sink's columns have. A copy
+      truly keyed otherwise than its sink table now halts as one table, at its first data commit.
+      Test `a_truncating_job_keys_its_truncate_as_the_sink_table_records_it` (RED: the start
+      failed, `identifier column "id" isn't in the schema`). N-2: the truncate loop's comment now
+      follows the lookup order and says why a copy's schema comes before the cached one.
+    - O-1 (`7fed088`; Task 3, D-M12d.3): a sink table absent at a start is made under the schema
+      the session writes it with, not the catalog's. At a resume that is the cached schema, so a
+      MySQL key recased while the pipeline was down no longer makes the sink table again under the
+      new spelling, which halted the table at its first commit, with a clearing job no help.
+      - A table whose schema changed while the pipeline was down is made under its cached schema
+        too, and the stream applies the change.
+      - The partition check still runs on the catalog's schema first.
+      - A job's copy was already made under the schema it is read with, and a re-snapshot of a
+        configured table goes through the same loop.
+
+      Tests: `a_dropped_sink_table_is_made_again_under_the_cached_spelling` (RED: the commit was
+      refused, keyed by `id` against `ID`), and the MySQL E2E
+      `a_deleted_table_of_a_recased_key_is_made_again_under_the_cached_spelling` (RED: the Delta
+      table was made with `ID`).
 
 **Known limitations** (recorded in the gap tracker §60.1, and in the operator docs where an operator
 acts):
