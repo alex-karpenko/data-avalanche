@@ -355,6 +355,15 @@ enum Empty {
     Truncate,
 }
 
+/// How the halt of a table whose reposition the sink refused begins (DA-SRC-32): the start
+/// that clears the halts of tables nobody tracks keeps it while the lake holds the table
+/// (DA-SRC-37).
+const REPOSITION_REFUSED: &str = "the source changed, and its reposition fails";
+
+fn refused_reposition(reason: &HaltReason) -> bool {
+    matches!(reason, HaltReason::SinkRejected { detail } if detail.starts_with(REPOSITION_REFUSED))
+}
+
 /// Whether a cached schema's columns are the catalog's now: the same, in order, with the names
 /// compared without case when the source compares them so (`fold`, MySQL): a change of case alone
 /// is the same column, cached under its first spelling (DA-SRC-25).
@@ -1121,13 +1130,28 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
     // A copy's halt goes once its job carries it: the pipeline doesn't replicate the table, and
     // no job can clear the halt of a table gone. It is the halt of a table neither configured
     // nor cached (a table taken out of the config keeps its schema) nor read now.
-    for table in recorded_halts.keys() {
+    //
+    // A refused reposition's halt stays while the lake holds the table (DA-SRC-37): the
+    // checkpoint names the new server, so no later start repositions it, and tracked later the
+    // table would skip the new server's changes up to its old marker. A job's copy of it, or the
+    // table gone from the lake, ends it.
+    for (table, reason) in &recorded_halts {
         if !configured.contains(table)
             && !cached.contains_key(table)
             && !requests.contains(table)
             && !copies.contains_key(table)
             && !cleared.contains(table)
         {
+            if refused_reposition(reason)
+                && sink_retry(&tuning, || Ok(()), || sink.table_state(table))
+                    .await?
+                    .exists
+            {
+                core.update(|st| {
+                    st.halted.insert(table.clone(), reason.clone());
+                });
+                continue;
+            }
             core.may_write()?;
             core.docs.clear_halt(table).await?;
         }
@@ -1159,7 +1183,7 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
                 )),
                 Err(WorkerError::Sink(SinkError::Permanent { reason })) => {
                     let reason = HaltReason::SinkRejected {
-                        detail: format!("the source changed, and its reposition fails: {reason}"),
+                        detail: format!("{REPOSITION_REFUSED}: {reason}"),
                     };
                     core.may_write()?;
                     core.docs
@@ -2858,6 +2882,72 @@ mod tests {
         assert_eq!(moved.committed_position, SourcePosition::Pg(Lsn(0x100)));
         let x = w.sink.table_state(&t("x")).await.unwrap().marker.unwrap();
         assert_eq!(x, old, "x's marker stays: its reposition was refused");
+    }
+
+    /// DA-SRC-37: the halt of a refused reposition outlives the next start while the lake holds
+    /// the table, though the pipeline tracks it neither then nor before: the checkpoint names the
+    /// new server, so no start repositions the table again, and tracked later it would skip the
+    /// new server's changes up to its old marker. Once the table leaves the lake, the halt goes.
+    #[tokio::test]
+    async fn a_refused_repositions_halt_stays_while_the_lake_holds_the_table() {
+        let w = World::new(&["a", "x"]);
+        lake_with_an_untracked_table(&w).await;
+        w.sink
+            .fail(SinkOp::Commit, Some(&t("x")), 1, || SinkError::Permanent {
+                reason: "refused".into(),
+            });
+        w.source.fail_over(
+            ServerIdentity::Postgres {
+                system_identifier: 7,
+                timeline: 2,
+            },
+            Lsn(0x100),
+        );
+        let (end, _) = run(&w, &mode("mode: never"), async |status| {
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        let (end, st) = run(&w, &mode("mode: never"), async |status| {
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert!(
+            matches!(
+                st.halted.get(&t("x")),
+                Some(HaltReason::SinkRejected { .. })
+            ),
+            "{:?}",
+            st.halted
+        );
+        assert!(
+            w.docs
+                .halts()
+                .await
+                .unwrap()
+                .tables
+                .iter()
+                .any(|h| h.table == t("x")),
+            "the halt stays recorded"
+        );
+        w.sink.drop_table(&t("x"));
+        let (end, st) = run(&w, &mode("mode: never"), async |status| {
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert!(!st.halted.contains_key(&t("x")), "{:?}", st.halted);
+        assert!(
+            !w.docs
+                .halts()
+                .await
+                .unwrap()
+                .tables
+                .iter()
+                .any(|h| h.table == t("x")),
+            "the halt of a table the lake no longer holds goes"
+        );
     }
 
     /// DA-SRC-32: a held table that records no key, and that the pipeline doesn't track either,
