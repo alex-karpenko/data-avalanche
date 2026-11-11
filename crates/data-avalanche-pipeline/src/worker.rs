@@ -1031,7 +1031,17 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
     // running below, a later start resumes the copy instead (DA-SNAP-15).
     let truncating = jobs.truncating();
     for table in started.iter().filter(|t| truncating.contains(*t)) {
-        if let Some(schema) = resolved_tables.get(table).or_else(|| copies.get(table)) {
+        // Under the key the session copies the table with, as the sink table records it: the
+        // schema this start caches, else the one cached before (a key whose case alone changed
+        // keeps the cached spelling where names fold, DA-SRC-25), or a copy's. Not the catalog's
+        // spelling: the sink refuses a key that differs from its own, for good.
+        let schema = schemas
+            .iter()
+            .find(|s| s.table() == table)
+            .or_else(|| copies.get(table))
+            .or_else(|| cached.get(table))
+            .or_else(|| resolved_tables.get(table));
+        if let Some(schema) = schema {
             // The result is `true`: a truncate runs under the source's key, which a resolved
             // schema always has (`Ok(false)` is a reposition's).
             commit_empty(

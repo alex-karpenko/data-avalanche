@@ -309,6 +309,45 @@ mod tests {
         assert_eq!(w.ids("a"), [1, 3, 4], "not emptied again");
     }
 
+    /// DA-SRC-25 × DA-SNAP-15: where names fold, a table whose key changed case alone keeps
+    /// the cached spelling, which its sink table records. A truncating job on it empties the
+    /// sink table under that key, as the session then copies it: the start succeeds, where the
+    /// catalog's spelling would have the sink refuse the truncate for good and end every start.
+    #[tokio::test]
+    async fn a_truncating_job_keys_a_recased_key_as_the_sink_table_does() {
+        let w = World::new(&["a"]);
+        established(&w).await;
+        w.source.commit(
+            FakeTxn::new()
+                .insert(&t("a"), row(1, "x"))
+                .insert(&t("a"), row(2, "x")),
+        );
+        let (end, _) = run(&w, &never(10), async |status| streamed(&status, &w).await).await;
+        end.unwrap();
+        assert_eq!(w.ids("a"), [1, 2]);
+        w.source.fold_column_names();
+        w.source.alter(
+            &t("a"),
+            TableSchema::new(
+                t("a"),
+                vec![
+                    ColumnSchema::new("ID", V::Int64, "bigint").not_null(),
+                    ColumnSchema::new("doc", V::Text, "text"),
+                ],
+                vec!["ID".into()],
+            )
+            .unwrap(),
+        );
+        ask_truncating(&w, "p~1", &["a"]).await;
+        let (mut core, _control, _status) = w.core(&never(10), &[]);
+        crate::worker::start(&mut core, None).await.unwrap();
+        assert!(w.ids("a").is_empty(), "emptied: {:?}", w.ids("a"));
+        assert_eq!(
+            job(&w, "p~1").await.tables[0].status,
+            JobTableStatus::Running
+        );
+    }
+
     fn noted(id: i64, note: Option<&str>) -> Row {
         Row(vec![
             ("id".into(), ColumnValue::Int64(id)),
