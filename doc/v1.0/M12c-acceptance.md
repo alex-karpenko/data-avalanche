@@ -57,7 +57,8 @@ DA-SRC-37, 38 and DA-SNAP-23 (§60.1), DA-SRC-39 (§61.1), DA-OPS-14 (§54.1) of
 `analysis/CDC_Design_Gap_Analysis_v1.md`.
 
 **Spec patches:** three places where this plan goes past what the specs say, drafted in §Spec
-patches below and applied in Task 7 once approved.
+patches below and applied in Task 7. **Oleksii approved the plan and the patches P-1…P-3 on
+2026-11-11.**
 
 ## Global Constraints
 
@@ -173,7 +174,7 @@ patches below and applied in Task 7 once approved.
   session without a close. Its node no longer holds the lease; the new holder's bounded retry, or
   its end of the stale walsender (DA-SRC-28), covers the slot. Recorded in the research, not a gap.
 
-## Spec patches (proposed; applied in Task 7 once approved)
+## Spec patches (approved 2026-11-11; applied in Task 7)
 
 **P-1 — `Data-Flow.md`, Phase 2b's dump checks and the Source Disconnect block** (DA-SRC-38). Two
 places say "three Phase 0 reruns in a row for a server change, none with a durable checkpoint past
@@ -231,8 +232,8 @@ single-row inserts (the most events per byte):
 
 On 10.11 the cost grows with the file, about 1.4 ms per MB: a full 1 GiB file (`max_binlog_size`)
 of tiny transactions is about 1.4 s, once per stream open. No cache. The probe left a database
-`m12c_probe` (table `s`, procedure `fill`) on both servers and binlog growth of about 350 MB on
-`mariadb-118`; Oleksii decides whether to drop it.
+`m12c_probe` (table `s`, procedure `fill`) on both servers, dropped on 2026-11-11 at Oleksii's
+word, and binlog growth of about 350 MB on `mariadb-118`.
 
 **The acceptance runs, short** (debug build, PostgreSQL 18, RustFS; each checks the run's logic,
 not D-V1.3, which the release-mode runs of Task 8 measure):
@@ -3861,13 +3862,13 @@ git commit -m "test(load): the v1 acceptance runs and cargo xtask bench|chaos|so
 ### Task 7: The docs, the specs, the research and the tracker
 
 **Files:**
-- Modify: `doc/specs/Data-Flow.md`, `doc/specs/Schema_Change_Detection_and_Evolution.md` (P-1…P-3, once approved)
+- Modify: `doc/specs/Data-Flow.md`, `doc/specs/Schema_Change_Detection_and_Evolution.md` (P-1…P-3, approved)
 - Modify: `docs/src/content/docs/runbooks/halted-table.md`, `docs/src/content/docs/runbooks/position-lost.mdx`
 - Modify: `doc/research/Delivery_Guarantee_and_Position_Guard.md`, `doc/research/MySQL_DDL_Classifier.md`, `doc/research/Postgres_Slot_and_Publication_Lifecycle.md`
 - Modify: `test-infra/README.md`, `doc/v1.0/README.md`
 - Modify: `doc/analysis/CDC_Design_Gap_Analysis_v1.md`
 
-- [ ] **Step 1: The specs.** Apply P-1, P-2 and P-3 as drafted in §Spec patches, and bump each
+- [ ] **Step 1: The specs (approved 2026-11-11).** Apply P-1, P-2 and P-3 as drafted in §Spec patches, and bump each
   spec's `updated:`.
 
 - [ ] **Step 2: The pages, the research, the READMEs.**
