@@ -742,14 +742,11 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
         // The sink table: created when absent, baselined to the schema now after a gap in the
         // stream (`Schema_Change…` §8.2), else the cached schema stays until the stream replays.
         let partition_by = core.settings.partition_by(table);
-        let spec = match TableSpec::new(now, partition_by) {
-            Ok(spec) => spec,
-            Err(reason) => {
-                halts.push((table.clone(), reason));
-                tracked.insert(table.clone());
-                continue;
-            }
-        };
+        if let Err(reason) = TableSpec::new(now, partition_by.clone()) {
+            halts.push((table.clone(), reason));
+            tracked.insert(table.clone());
+            continue;
+        }
         let mut schema = now.clone();
         let mut evolved = false;
         let baseline = matches!(plan, Plan::Fresh(_)) || cleared.contains(table);
@@ -844,6 +841,19 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
             _ => {}
         }
         if !state.exists {
+            // Made under the schema the session writes the table with (D-M12d.3): at a resume,
+            // the cached one, which the catalog's may differ from by the case of a name alone
+            // where names fold (DA-SRC-25), or by a change the stream still holds; else the
+            // schema now. Made under the catalog's, the table would refuse the session's first
+            // commit and halt.
+            let spec = match TableSpec::new(&schema, partition_by) {
+                Ok(spec) => spec,
+                Err(reason) => {
+                    halts.push((table.clone(), reason));
+                    tracked.insert(table.clone());
+                    continue;
+                }
+            };
             match sink_retry(&tuning, || core.may_write(), || sink.ensure_table(&spec)).await {
                 Ok(()) => {}
                 Err(WorkerError::Sink(SinkError::Permanent { reason })) => {
@@ -1148,7 +1158,7 @@ mod tests {
 
     use super::*;
     use crate::test_support::{
-        Countdown, CrashAt, World, Yaml, docs, fast, row, schema, t, wait_until,
+        Countdown, CrashAt, World, Yaml, accumulator, docs, fast, row, schema, t, txn, wait_until,
     };
     use crate::{Backoff, HookPoint};
     use std::sync::atomic::AtomicUsize;
@@ -3140,6 +3150,58 @@ mod tests {
                 assert_eq!(cached.columns()[1].name, "doc", "the sink's spelling");
             }
         }
+    }
+
+    /// DA-SRC-25, D-M12d.3: where names fold, a sink table the operator dropped is made again at
+    /// a resume under the spelling the session writes it with, the cached one, not the catalog's,
+    /// whose key changed case alone: the session's first commit lands instead of halting the
+    /// table (final review O-1). The commit is the session's, made here by hand: the fake stream
+    /// names a change's columns as PostgreSQL does, where MySQL's rows decode by position under
+    /// the cached schema.
+    #[tokio::test]
+    async fn a_dropped_sink_table_is_made_again_under_the_cached_spelling() {
+        let w = World::new(&["a"]);
+        let p = mode("mode: never");
+        run(&w, &p, async |status| streamed(&status, &w).await)
+            .await
+            .0
+            .unwrap();
+        w.source.fold_column_names();
+        w.source.alter(
+            &t("a"),
+            TableSchema::new(
+                t("a"),
+                vec![
+                    ColumnSchema::new("ID", V::Int64, "bigint").not_null(),
+                    ColumnSchema::new("doc", V::Text, "text"),
+                ],
+                vec!["ID".into()],
+            )
+            .unwrap(),
+        );
+        w.sink.drop_table(&t("a"));
+        let (mut core, _control, status) = w.core(&p, &[]);
+        start(&mut core, None).await.unwrap();
+        assert!(status.borrow().halted.is_empty());
+        let cached = w.docs.table_schema(&t("a")).await.unwrap().unwrap().doc;
+        assert_eq!(cached.identifier(), ["id"]);
+        assert_eq!(
+            cached,
+            schema("a").with_source_id(cached.source_id().unwrap())
+        );
+        let mut acc = accumulator(&["a"], 0x10_000);
+        txn(&mut acc, 1, 0x10_100, &[("a", 1, "x")]);
+        for cs in acc.flush().change_sets {
+            let marker = CommitMarker {
+                owner_epoch: core.owner_epoch,
+                committed_position: cs.position.end.clone(),
+                pipeline_id: core.settings.pipeline_id.clone(),
+            };
+            w.sink.commit(cs, marker).await.unwrap();
+        }
+        assert_eq!(w.ids("a"), [1]);
+        let made = w.sink.table_state(&t("a")).await.unwrap();
+        assert_eq!(made.identifier, ["id"], "the cached spelling");
     }
 
     /// Phase 0's rescan of the tables gone from the source's list warns once per failure streak:
