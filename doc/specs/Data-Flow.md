@@ -343,9 +343,10 @@ Connect
 │   └─► COM_BINLOG_DUMP at <file>:<pos>; the dump's connection checks the same (identity,
 │         file, boundary) first, so a reconnect to another server is caught: under error it
 │         halts as above; under re_snapshot the pipeline reruns Phase 0, which plans the
-│         recovery. Three Phase 0 reruns in a row for a server change, none with a durable
-│         checkpoint past its start, halt the pipeline with the change's code, naming the
-│         alternation: the address reaches more than one server (DA-SRC-34)
+│         recovery. Three Phase 0 reruns in a row for a server change, each within 10 minutes
+│         of the one before and none with a durable checkpoint past its start, halt the pipeline
+│         with the change's code, naming the alternation: the address reaches more than one
+│         server (DA-SRC-34, DA-SRC-38)
 └─► Event loop as above (GTID events ignored); the position after each XID_EVENT is
     (current file, end_log_pos); ROTATE_EVENT switches the file
 ```
@@ -549,7 +550,9 @@ either, and its commit stores its own position instead of the union: after a sou
 server's positions may sort below the stored markers, and the union would skip its changes.
 A recovery from a changed source commits one per table the sink holds, and per table the pipeline
 resolves or has a cached schema for, under the key the table was made with; a table whose
-reposition the sink refuses for good halts `SINK_REJECTED` (DA-SRC-32). Each is fenced like any commit, before the checkpoint naming the new server is saved and the stream starts. The pipeline **resume checkpoint** persisted to state storage is the
+reposition the sink refuses for good halts `SINK_REJECTED` (DA-SRC-32), and stays halted while the
+sink holds it, tracked or not: no later start repositions it, so only a snapshot job's copy of it,
+or the table gone from the sink, ends the halt (DA-SRC-37). Each is fenced like any commit, before the checkpoint naming the new server is saved and the stream starts. The pipeline **resume checkpoint** persisted to state storage is the
 **laggard** across all tracked tables (PG `min` / MySQL set-intersection); tables ahead skip via the
 guard or are absorbed by idempotency. The epoch rejects a zombie writer; the position skips done work.
 See `research/Delivery_Guarantee_and_Position_Guard.md` (G-14).
@@ -807,9 +810,10 @@ Replication stream error / TCP timeout
       system on a later timeline reruns Phase 0 under either action: the start continues the
       stream there if the slot followed (DA-SRC-33), else halts (or recovers) as
       source_change_action says
-    ─ Any source: three Phase 0 reruns in a row for a server change, none with a durable
-      checkpoint past its start, halt the pipeline, naming the alternation: the address reaches
-      more than one server (DA-SRC-34)
+    ─ Any source: three Phase 0 reruns in a row for a server change, each within 10 minutes of
+      the one before and none with a durable checkpoint past its start, halt the pipeline with
+      the change's code, naming the alternation: the address reaches more than one server
+      (DA-SRC-34, DA-SRC-38)
 ```
 
 ### Sink Commit Failure

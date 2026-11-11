@@ -305,7 +305,7 @@ the change's stream position via §8.
 | `DROP COLUMN` part of PK / replica identity | **Unsafe** | — | — | halt table (breaks keying) |
 | `RENAME COLUMN` — proven (§6) | **Safe** | `rename_column` (keeps field ID + data) | **Degraded**: add new + soft-drop old (warn; history under old name) | re-point builder to new name |
 | `RENAME COLUMN` — not provable | **Safe (degraded)** | `drop_column` + `add_column` | **Degraded**: add new + soft-drop old (warn) | **warn**: history NULL under new name |
-| MySQL RENAME/CHANGE COLUMN that changes only the name's case (MySQL compares column names without case) | **Ignorable** | none | none | the column keeps its cached spelling; a note (DA-SRC-25) |
+| MySQL RENAME/CHANGE COLUMN that changes only the name's case (MySQL compares column names without case) | **Ignorable** | none | none | the column keeps its cached spelling; a note (DA-SRC-25). A baseline against a target table the pipeline meets with no cached schema (a lost state, a table first tracked at a resume) keeps the target's spelling (DA-SNAP-23) |
 | ADD COLUMN / RENAME COLUMN to a name that differs from a target column's by case alone (Unicode lower-casing) | **Unsafe** for Delta | — | **Unsupported → halt** `EVOLUTION_UNSUPPORTED`, naming both spellings | a table created with two such columns is refused, `SINK_REJECTED` (DA-SINK-12) |
 | Type **widen** within Iceberg set (§7.1.1) | **Safe** | `update_column` promotion | **Unsupported → halt** | builder adopts wider Arrow type |
 | Type **widen** outside the set (e.g. `int→decimal`) | **Unsafe** | — | — | halt table |
