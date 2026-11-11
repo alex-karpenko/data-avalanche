@@ -135,6 +135,31 @@ pub struct ControllerSettings {
     pub tuning: Tuning,
 }
 
+/// The runs in a row that may find another server than the one before without a durable
+/// checkpoint in between, before the pipeline halts: a host that alternates between servers
+/// (DA-SRC-34) resets every table's marker at each run and streams nothing.
+pub const SOURCE_CHANGES_IN_A_ROW: u32 = 3;
+
+/// The halt of a pipeline whose runs keep finding another server: the code of the last change
+/// (`WAL_SOURCE_CHANGED`, `BINLOG_SOURCE_CHANGED`), and the alternation named.
+fn alternating(why: &str, runs: u32) -> Failure {
+    let code = SourceError::Permanent(why.to_owned())
+        .halt_code()
+        .map(str::to_owned);
+    let last = match &code {
+        Some(c) => why
+            .strip_prefix(c.as_str())
+            .and_then(|r| r.strip_prefix(": ")),
+        None => None,
+    }
+    .unwrap_or(why);
+    let error = format!(
+        "{}{runs} runs in a row found another source server than the run before, and none made a checkpoint durable: the source's address reaches more than one server (a load balancer, or a DNS name over several). Point the pipeline at one server, then stop and resume it. The last: {last}",
+        code.as_ref().map_or_else(String::new, |c| format!("{c}: "))
+    );
+    Failure { error, code }
+}
+
 /// What every controller of a node shares.
 #[derive(Debug, Clone)]
 pub struct ControllerDeps {
@@ -788,6 +813,9 @@ impl PipelineController {
         let mut dumped = false;
         let mut retry: Option<(Instant, String)> = None;
         let mut failures: u32 = 0;
+        // The runs in a row that ended finding another server, none with a durable checkpoint
+        // past the one it started from (DA-SRC-34).
+        let mut changed: u32 = 0;
         // The lag's start across this term's workers: what one read and didn't make durable still
         // counts while none runs and while the next one reads it again (I2).
         let mut pending = Lag::default();
@@ -821,6 +849,7 @@ impl PipelineController {
                 dumped = false;
                 retry = None;
                 failures = 0;
+                changed = 0;
             }
             if let Some(w) = worker.as_mut() {
                 match desired {
@@ -929,12 +958,33 @@ impl PipelineController {
                     let mut w = worker.take().expect("a worker ended");
                     self.observe(&mut w, &mut pending);
                     self.metrics.worker_ended();
+                    let progressed = {
+                        let st = w.handle.status.borrow();
+                        st.checkpoint.is_some() && st.checkpoint != st.started_from
+                    };
                     let ended = ended.unwrap_or_else(|e| {
                         Err(WorkerError::Refused(format!(
                             "the worker task ended abnormally: {e}"
                         )))
                     });
+                    changed = match &ended {
+                        Err(WorkerError::Source(SourceError::SourceChanged(_))) if progressed => 1,
+                        Err(WorkerError::Source(SourceError::SourceChanged(_))) => changed + 1,
+                        _ => 0,
+                    };
                     match ended {
+                        Err(WorkerError::Source(SourceError::SourceChanged(why)))
+                            if changed >= SOURCE_CHANGES_IN_A_ROW =>
+                        {
+                            let failure = alternating(&why, changed);
+                            tracing::error!(
+                                pipeline = %self.pipeline.name,
+                                code = failure.code.as_deref(),
+                                "pipeline in ERROR: {}",
+                                failure.error
+                            );
+                            error = Some(failure);
+                        }
                         Ok(Exit::Dumped) => dumped = true,
                         Ok(Exit::Drained) => {
                             retry = Some((Instant::now(), "the worker drained unasked".into()));
@@ -2033,6 +2083,67 @@ mod tests {
         status_doc_until(&docs, "paused", |d| d.actual == ActualState::Paused).await;
         docs.set_desired_state(DesiredState::Stopped).await.unwrap();
         status_doc_until(&docs, "stopped", |d| d.actual == ActualState::Stopped).await;
+    }
+
+    fn changed() -> SourceError {
+        SourceError::SourceChanged(
+            "BINLOG_SOURCE_CHANGED: binlog position f:4 was recorded on server 1, and the stream reaches server 2; binlog_purge_action is re_snapshot, so the pipeline starts again to recover from this server's position".into(),
+        )
+    }
+
+    /// DA-SRC-34: a host that alternates between servers finds another one at every run, and
+    /// each run resets every table's marker while nothing streams. The third run in a row
+    /// without a durable checkpoint halts with the change's code, naming the alternation.
+    #[tokio::test(start_paused = true)]
+    async fn runs_that_keep_finding_another_server_halt() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a"]);
+        for _ in 0..SOURCE_CHANGES_IN_A_ROW {
+            f.source.fail(Method::OpenStream, changed());
+        }
+        let mut n = node("n1", &store, &docs, &f);
+        until(&mut n.status, "error", |s| {
+            matches!(&s.actual, Some(Actual::Error { .. }))
+        })
+        .await;
+        let Some(Actual::Error { error, code }) = n.status.borrow().actual.clone() else {
+            unreachable!()
+        };
+        assert_eq!(code.as_deref(), Some("BINLOG_SOURCE_CHANGED"));
+        assert!(
+            error.starts_with("BINLOG_SOURCE_CHANGED: 3 runs in a row found another source server")
+                && error.contains("Point the pipeline at one server")
+                && error.contains("The last: binlog position f:4 was recorded on server 1"),
+            "{error}"
+        );
+        assert_eq!(f.builds(), 3);
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(f.builds(), 3, "no rerun in ERROR");
+    }
+
+    /// A run that makes a checkpoint durable starts the count again: a failover now and then
+    /// isn't an alternation.
+    #[tokio::test(start_paused = true)]
+    async fn a_durable_checkpoint_starts_the_count_of_server_changes_again() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a"]);
+        f.source.fail(Method::OpenStream, changed());
+        f.source.fail(Method::OpenStream, changed());
+        let mut n = node("n1", &store, &docs, &f);
+        eventually("a third worker", || f.builds() == 3).await;
+        until(&mut n.status, "running", is(Actual::Running)).await;
+        f.source.commit(FakeTxn::new().insert(&t("a"), row(1)));
+        eventually("the row lands", || f.ids("a") == [1]).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        f.source.fail(Method::Next, changed());
+        f.source.fail(Method::OpenStream, changed());
+        eventually("a fifth worker", || f.builds() == 5).await;
+        until(&mut n.status, "running again", is(Actual::Running)).await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(n.status.borrow().actual, Some(Actual::Running));
+        assert_eq!(f.builds(), 5);
     }
 
     #[tokio::test(start_paused = true)]

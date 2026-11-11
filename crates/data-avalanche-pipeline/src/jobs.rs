@@ -222,6 +222,40 @@ mod tests {
         assert!(st.warnings.is_empty(), "{:?}", st.warnings);
     }
 
+    /// DA-SRC-32: a source change repositions every table the lake holds, a job's copy too,
+    /// which the pipeline neither resolves nor caches: its marker leaves the old server's
+    /// positions, so a later copy or stream of it isn't skipped below them.
+    #[tokio::test]
+    async fn a_source_change_repositions_a_copy_the_pipeline_doesnt_track() {
+        use data_avalanche_core::position::Lsn;
+        use data_avalanche_core::{ServerIdentity, Sink, SourcePosition};
+        let pg = |timeline| ServerIdentity::Postgres {
+            system_identifier: 7,
+            timeline,
+        };
+        let w = World::new(&["a", "x"]);
+        w.source.outside_config(&t("x"));
+        w.source.set_server(Some(pg(1)));
+        established(&w).await;
+        w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+        w.source.load(&t("x"), rows(1..=3));
+        ask(&w, "p~0", &["x"]).await;
+        let (end, _) = run(&w, &never(10), async |status| {
+            wait_until("x is copied", || w.ids("x") == [1, 2, 3]).await;
+            streamed(&status, &w).await;
+            wait_until("the copy is done", || status.borrow().snapshots.is_empty()).await;
+        })
+        .await;
+        end.unwrap();
+        let old = w.sink.table_state(&t("x")).await.unwrap().marker.unwrap();
+        w.source.fail_over(pg(2), Lsn(0x100));
+        let (end, _) = run(&w, &never(10), async |status| streamed(&status, &w).await).await;
+        end.unwrap();
+        let moved = w.sink.table_state(&t("x")).await.unwrap().marker.unwrap();
+        assert_eq!(moved.committed_position, SourcePosition::Pg(Lsn(0x100)));
+        assert_ne!(moved, old);
+    }
+
     /// DA-SNAP-15: a job asked with `truncate` empties its tables' sink tables before their
     /// first chunk, so a row deleted at the source while the pipeline didn't stream it goes, in
     /// a streamed table and in a copy alike. The other tables keep their rows, and a later start
@@ -273,6 +307,276 @@ mod tests {
         let (end, _) = run(&w, &never(10), async |status| streamed(&status, &w).await).await;
         end.unwrap();
         assert_eq!(w.ids("a"), [1, 3, 4], "not emptied again");
+    }
+
+    /// DA-SRC-25 × DA-SNAP-15: where names fold, a table whose key changed case alone keeps
+    /// the cached spelling, which its sink table records. A truncating job on it empties the
+    /// sink table under that key, as the session then copies it: the start succeeds, where the
+    /// catalog's spelling would have the sink refuse the truncate for good and end every start.
+    #[tokio::test]
+    async fn a_truncating_job_keys_a_recased_key_as_the_sink_table_does() {
+        let w = World::new(&["a"]);
+        established(&w).await;
+        w.source.commit(
+            FakeTxn::new()
+                .insert(&t("a"), row(1, "x"))
+                .insert(&t("a"), row(2, "x")),
+        );
+        let (end, _) = run(&w, &never(10), async |status| streamed(&status, &w).await).await;
+        end.unwrap();
+        assert_eq!(w.ids("a"), [1, 2]);
+        w.source.fold_column_names();
+        w.source.alter(
+            &t("a"),
+            TableSchema::new(
+                t("a"),
+                vec![
+                    ColumnSchema::new("ID", V::Int64, "bigint").not_null(),
+                    ColumnSchema::new("doc", V::Text, "text"),
+                ],
+                vec!["ID".into()],
+            )
+            .unwrap(),
+        );
+        ask_truncating(&w, "p~1", &["a"]).await;
+        let (mut core, _control, _status) = w.core(&never(10), &[]);
+        crate::worker::start(&mut core, None).await.unwrap();
+        assert!(w.ids("a").is_empty(), "emptied: {:?}", w.ids("a"));
+        assert_eq!(
+            job(&w, "p~1").await.tables[0].status,
+            JobTableStatus::Running
+        );
+    }
+
+    /// DA-SRC-25 × DA-SNAP-15: a truncating job on a table whose sink table records the key
+    /// spelled otherwise than the session's, by case alone where names fold, doesn't empty it.
+    /// Here the key changed case alone, so the session keeps the cached spelling (`id`), and the
+    /// operator made the sink table again under the catalog's (`ID`) and put a row in it. No
+    /// sink accepts a key that differs by case alone, and the session never takes the sink's
+    /// spelling, so every chunk of the copy would be refused: the table halts `SINK_REJECTED` at
+    /// the start with its rows intact, its job table fails, and the start goes on (final review
+    /// I-A, m-1).
+    #[tokio::test]
+    async fn a_truncating_job_halts_a_table_its_sink_table_keys_spelled_otherwise() {
+        use arrow_array::Int64Array;
+        use data_avalanche_core::position::Lsn;
+        use data_avalanche_core::{Op, PositionRange, Sink, SourceSeq, TableChangeSet, TableSpec};
+
+        use crate::batch::{Lineage, MAX_BATCH_BYTES, build};
+        use crate::buffer::{CollapsedRow, RowKind};
+        let w = World::new(&["a"]);
+        established(&w).await;
+        w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+        let (end, _) = run(&w, &never(10), async |status| streamed(&status, &w).await).await;
+        end.unwrap();
+        let marked = w.sink.marker(&t("a")).unwrap();
+        w.source.fold_column_names();
+        let recased = TableSchema::new(
+            t("a"),
+            vec![
+                ColumnSchema::new("ID", V::Int64, "bigint").not_null(),
+                ColumnSchema::new("doc", V::Text, "text"),
+            ],
+            vec!["ID".into()],
+        )
+        .unwrap();
+        w.source.alter(&t("a"), recased.clone());
+        w.sink.drop_table(&t("a"));
+        w.sink
+            .ensure_table(&TableSpec::new(&recased, vec![]).unwrap())
+            .await
+            .unwrap();
+        // The operator's row, committed outside the pipeline.
+        let at = marked.committed_position.clone();
+        let (upserts, _) = build(
+            &recased,
+            &[0],
+            vec![CollapsedRow {
+                kind: RowKind::Upsert,
+                values: vec![ColumnValue::Int64(7), ColumnValue::Text("x".into())],
+                op: Op::Insert,
+                commit_ts_micros: 0,
+                position: at.clone(),
+                seq: SourceSeq::Pg(Lsn(0)),
+            }],
+            &Lineage {
+                source_db: "shop".into(),
+                pipeline: "p".into(),
+            },
+            MAX_BATCH_BYTES,
+        );
+        let columns = w.sink.table_state(&t("a")).await.unwrap().schema.unwrap();
+        let cs = TableChangeSet {
+            table: t("a"),
+            schema: columns,
+            identifier: vec!["ID".into()],
+            truncate: false,
+            upserts,
+            deletes: vec![],
+            position: PositionRange {
+                start: at.clone(),
+                end: at.clone(),
+                last_change: at,
+            },
+            split: None,
+            snapshot: false,
+            reposition: false,
+        };
+        w.sink.commit(cs, marked.clone()).await.unwrap();
+        let ids = || {
+            let b = w.sink.content(&t("a")).unwrap();
+            let ids = b.column_by_name("ID").unwrap();
+            ids.as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        };
+        assert_eq!(ids(), [7]);
+        ask_truncating(&w, "p~1", &["a"]).await;
+        let (mut core, _control, status) = w.core(&never(10), &[]);
+        crate::worker::start(&mut core, None).await.unwrap();
+        assert_eq!(ids(), [7], "not emptied");
+        let state = w.sink.table_state(&t("a")).await.unwrap();
+        assert_eq!(state.identifier, ["ID"], "the sink table's own key");
+        assert_eq!(state.marker, Some(marked), "nothing committed");
+        let halts = w.docs.halts().await.unwrap().tables;
+        assert_eq!(halts.len(), 1, "{halts:?}");
+        assert!(!halts[0].copy);
+        let HaltReason::SinkRejected { detail } = &halts[0].reason else {
+            panic!("{halts:?}");
+        };
+        assert!(
+            detail.contains(r#"["id"]"#) && detail.contains(r#"["ID"]"#),
+            "{detail}"
+        );
+        assert!(status.borrow().halted.contains_key(&t("a")));
+        let j = job(&w, "p~1").await;
+        assert_eq!(j.tables[0].status, JobTableStatus::Failed);
+        let error = j.tables[0].error.clone().unwrap();
+        assert!(error.starts_with("SINK_REJECTED: "), "{error}");
+    }
+
+    /// DA-SRC-25 × DA-SNAP-15: a truncating job on a table whose sink table records another key
+    /// than the session's schema (here a halt cleared by the job baselines a key moved from `id`
+    /// to `doc`, the columns unchanged, while the sink table stays keyed `id`) doesn't empty
+    /// it: the session's commits would be refused for good, so the table halts `SINK_REJECTED`
+    /// at the start with its rows intact, its job table fails, and the start goes on (final
+    /// review M-A).
+    #[tokio::test]
+    async fn a_truncating_job_halts_a_table_its_sink_table_keys_otherwise() {
+        let keyed = |key: &str| {
+            TableSchema::new(
+                t("a"),
+                vec![
+                    ColumnSchema::new("id", V::Int64, "bigint").not_null(),
+                    ColumnSchema::new("doc", V::Text, "text").not_null(),
+                ],
+                vec![key.into()],
+            )
+            .unwrap()
+        };
+        let w = World::new(&["a", "b"]);
+        w.source.alter(&t("a"), keyed("id"));
+        established(&w).await;
+        w.source.commit(
+            FakeTxn::new()
+                .insert(&t("a"), row(1, "x"))
+                .insert(&t("a"), row(2, "y")),
+        );
+        let (end, _) = run(&w, &never(10), async |status| streamed(&status, &w).await).await;
+        end.unwrap();
+        assert_eq!(w.ids("a"), [1, 2]);
+        w.docs
+            .record_halt(&TableHalt {
+                table: t("a"),
+                reason: HaltReason::UnsafeDdl {
+                    detail: "the key changed".into(),
+                },
+                at: w.source.wal_end(),
+                copy: false,
+            })
+            .await
+            .unwrap();
+        w.source.alter(&t("a"), keyed("doc"));
+        ask_truncating(&w, "p~1", &["a", "b"]).await;
+        let (mut core, _control, status) = w.core(&never(10), &[]);
+        crate::worker::start(&mut core, None).await.unwrap();
+        assert_eq!(w.ids("a"), [1, 2], "not emptied");
+        let halts = w.docs.halts().await.unwrap().tables;
+        assert_eq!(halts.len(), 1, "{halts:?}");
+        let HaltReason::SinkRejected { detail } = &halts[0].reason else {
+            panic!("{halts:?}");
+        };
+        assert!(
+            detail.contains(r#"["doc"]"#) && detail.contains(r#"["id"]"#),
+            "{detail}"
+        );
+        assert!(status.borrow().halted.contains_key(&t("a")));
+        let j = job(&w, "p~1").await;
+        assert_eq!(j.tables[0].status, JobTableStatus::Failed);
+        let error = j.tables[0].error.clone().unwrap();
+        assert!(error.starts_with("SINK_REJECTED: "), "{error}");
+        assert_eq!(j.tables[1].status, JobTableStatus::Running, "b goes on");
+    }
+
+    /// DA-SRC-25 × DA-SNAP-15: the same for a job's copy, a table the config doesn't name: its
+    /// sink table, made by an earlier copy, is keyed `id`, and the source moved the key to `doc`,
+    /// so the copy is described keyed `doc`. The table isn't emptied. Its halt is recorded as the
+    /// copy's, so it isn't a halted table of the pipeline (not in the status); the job's table
+    /// fails with the reason, which is where an operator sees it. The start goes on (final review
+    /// M-A, m-3).
+    #[tokio::test]
+    async fn a_truncating_job_halts_a_copy_its_sink_table_keys_otherwise() {
+        let keyed = |key: &str| {
+            TableSchema::new(
+                t("x"),
+                vec![
+                    ColumnSchema::new("id", V::Int64, "bigint").not_null(),
+                    ColumnSchema::new("doc", V::Text, "text").not_null(),
+                ],
+                vec![key.into()],
+            )
+            .unwrap()
+        };
+        let w = World::new(&["a", "x"]);
+        w.source.outside_config(&t("x"));
+        w.source.alter(&t("x"), keyed("id"));
+        established(&w).await;
+        w.source.load(&t("x"), rows(1..=2));
+        ask(&w, "p~0", &["x"]).await;
+        let (end, _) = run(&w, &never(10), async |status| {
+            wait_until("x is copied", || w.ids("x") == [1, 2]).await;
+            streamed(&status, &w).await;
+            wait_until("the copy is done", || status.borrow().snapshots.is_empty()).await;
+        })
+        .await;
+        end.unwrap();
+        w.source.alter(&t("x"), keyed("doc"));
+        ask_truncating(&w, "p~1", &["x"]).await;
+        let (mut core, _control, status) = w.core(&never(10), &[]);
+        crate::worker::start(&mut core, None).await.unwrap();
+        assert_eq!(w.ids("x"), [1, 2], "not emptied");
+        let halts = w.docs.halts().await.unwrap().tables;
+        assert_eq!(halts.len(), 1, "{halts:?}");
+        assert_eq!(halts[0].table, t("x"));
+        assert!(halts[0].copy, "the copy's halt");
+        let HaltReason::SinkRejected { detail } = &halts[0].reason else {
+            panic!("{halts:?}");
+        };
+        assert!(
+            detail.contains(r#"["doc"]"#) && detail.contains(r#"["id"]"#),
+            "{detail}"
+        );
+        assert!(
+            status.borrow().halted.is_empty(),
+            "not the pipeline's: {:?}",
+            status.borrow().halted
+        );
+        let j = job(&w, "p~1").await;
+        assert_eq!(j.tables[0].status, JobTableStatus::Failed);
+        let error = j.tables[0].error.clone().unwrap();
+        assert!(error.starts_with("SINK_REJECTED: "), "{error}");
     }
 
     fn noted(id: i64, note: Option<&str>) -> Row {

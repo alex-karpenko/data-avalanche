@@ -1,5 +1,5 @@
 ---
-updated: 2026-10-16
+updated: 2026-11-11
 domain: Architecture
 tags: [architecture, schema-evolution, ddl, cdc, postgresql, mysql, iceberg, delta-lake, multi-sink, arrow]
 status: design reviewed & approved — unified trigger→augment→diff model
@@ -134,8 +134,11 @@ feed the same evolution pipeline; each has a distinct role. (This replaces the e
 
 Query the source catalog for each tracked table; then:
 
-- **Table absent in target** → use the queried schema as the **baseline** to create the
-  target table via the sink (consistent with the snapshot read point, `Data-Flow.md` Phase 1).
+- **Table absent in target** → at a first start, a cleared halt, a non-replayable gap, or for a
+  table first tracked at a resume, use the queried schema as the **baseline** to create the
+  target table via the sink (consistent with the snapshot read point, `Data-Flow.md` Phase 1);
+  for a table tracked before, at a replayable resume, create it from the pipeline's cached
+  schema, which the stream's in-order replay (B+C) then evolves.
 - **Replayable existing table** → **do not** evolve the target from this query. The decoder
   re-acquires its layout from the in-band signal at stream resume, and any DDL between the
   confirmed offset and now is replayed **in order** by channels B+C. The startup query here is
@@ -302,6 +305,8 @@ the change's stream position via §8.
 | `DROP COLUMN` part of PK / replica identity | **Unsafe** | — | — | halt table (breaks keying) |
 | `RENAME COLUMN` — proven (§6) | **Safe** | `rename_column` (keeps field ID + data) | **Degraded**: add new + soft-drop old (warn; history under old name) | re-point builder to new name |
 | `RENAME COLUMN` — not provable | **Safe (degraded)** | `drop_column` + `add_column` | **Degraded**: add new + soft-drop old (warn) | **warn**: history NULL under new name |
+| MySQL RENAME/CHANGE COLUMN that changes only the name's case (MySQL compares column names without case) | **Ignorable** | none | none | the column keeps its cached spelling; a note (DA-SRC-25) |
+| ADD COLUMN / RENAME COLUMN to a name that differs from a target column's by case alone (Unicode lower-casing) | **Unsafe** for Delta | — | **Unsupported → halt** `EVOLUTION_UNSUPPORTED`, naming both spellings | a table created with two such columns is refused, `SINK_REJECTED` (DA-SINK-12) |
 | Type **widen** within Iceberg set (§7.1.1) | **Safe** | `update_column` promotion | **Unsupported → halt** | builder adopts wider Arrow type |
 | Type **widen** outside the set (e.g. `int→decimal`) | **Unsafe** | — | — | halt table |
 | Type **narrow** (`bigint→int`, `varchar(100)→varchar(10)`, decimal shrink) | **Unsafe** | — | — | halt table |
@@ -311,7 +316,7 @@ the change's stream position via §8.
 | Change of the identifier (the primary key, or the `tables.primary_key` columns), or a `REPLICA IDENTITY` that no longer covers it | **Unsafe** | — | — | halt table; operator re-snapshot |
 | Another `REPLICA IDENTITY` or unique-key change (e.g. `DEFAULT` → `FULL` over the same key) | **Ignorable** | none | none | none: before-images carry more columns; keying is unchanged (Q-M5-17) |
 | `ADD COLUMN` / `RENAME COLUMN` to a **reserved lineage name** (`_op`, `_ts`, `_lsn`, `_seq`, `_source_db`, `_pipeline`, `__data_avalanche_*`; case-insensitive) | **Unsafe** | — | — | halt table `RESERVED_COLUMN_COLLISION` (config §5) |
-| `DROP TABLE` (tracked) | **Unsafe** | — (target kept) | — (target kept) | halt table `TABLE_DROPPED`; the target is never dropped. A re-created table of the same name (new OID) does **not** auto-resume; it needs an operator re-snapshot. Detection — PG: channel B within a stream session (the table's name on another OID, or its OID under another name; a table renamed away halts the same way), channel D / A (§2.1); MySQL: channel B, where a table renamed away halts the same way, except at an online-migration cut-over (next row) |
+| `DROP TABLE` (tracked) | **Unsafe** | — (target kept) | — (target kept) | halt table `TABLE_DROPPED`; the target is never dropped. A re-created table of the same name (new OID) does **not** auto-resume; it needs an operator re-snapshot. Detection — PG: channel B within a stream session (the table's name on another OID, or its OID under another name; a table renamed away halts the same way), channel D / A (§2.1); MySQL: channel B, where a table renamed away halts the same way, except at an online-migration cut-over (next row). On MySQL a table gone from the catalog is probed (`SELECT 1 … LIMIT 0`): where the server answers 1142, the halt's note says the user may have lost `SELECT` instead (DA-SRC-36). |
 | MySQL online-migration **cut-over swap**: one `RENAME TABLE t TO <old>, <shadow> TO t` statement, where `<shadow>` is an untracked table of the same database named as gh-ost (`_t_gho`) or pt-online-schema-change (`_t_new`) names it, after one or more leading `_` | **Safe** if every column delta is | per column delta (rows above) | per column delta (rows above) | the stream follows the table under its name: the shadow's columns are compared with `t`'s as a whole table (a rename isn't provable), and each delta is classified by the rows above. Any other rename of a tracked table away (a two-statement cut-over, another shadow name) halts `TABLE_DROPPED` |
 | MySQL partition or tablespace operation that changes rows without row events (`DROP`, `TRUNCATE`, `EXCHANGE`, `IMPORT`, `DISCARD` or `CONVERT` of a `PARTITION`, `TABLESPACE` or `TABLE`) on a tracked table | **Unsafe** | — | — | halt table `UNSAFE_DDL`; operator re-snapshot. The binlog carries the statement only, so the target would diverge silently |
 | MySQL `ENUM`/`SET` **add** values (append-only) | Ignorable\*\* | none | none | decoded value set widens; verify mapping (G-18) |
@@ -372,7 +377,8 @@ rather than a file rewrite (in both Iceberg and Delta).
 
 ### 8.2 Startup & non-replayable gaps
 
-At pipeline start (channel A): create absent tables from the queried baseline; for an
+At pipeline start (channel A): create absent tables from the queried baseline (at a replayable
+resume, a table tracked before from the cached schema, which in-order replay then evolves); for an
 existing replayable table, defer to in-order replay (B+C) and treat the startup query as a
 drift check only (§0, §3-A). If the resume point is **non-replayable** (PG slot invalidated /
 WAL recycled; MySQL binlog purged), the intervening DDL and rows are unrecoverable from the

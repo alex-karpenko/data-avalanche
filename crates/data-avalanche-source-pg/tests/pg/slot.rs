@@ -106,6 +106,35 @@ async fn first_start_then_resume_then_a_lost_slot() {
     cleanup(&a, &n).await;
 }
 
+/// DA-SRC-33: a managed slot is made a failover slot on PostgreSQL 17+, which a standby with
+/// `sync_replication_slots` keeps; before 17 there is no such slot. The preflight names the
+/// server, as `prepare` does.
+#[tokio::test]
+async fn a_managed_slot_is_a_failover_slot_from_postgresql_17() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(&a, "slot_failover", DDL).await;
+    let c = connector(&pipeline(&n, &["*"], "", ""));
+    let p = c.prepare(None, &[n.table("a")]).await.unwrap();
+    let preflight = c.preflight().await.unwrap();
+    assert_eq!(preflight.server, p.server);
+    let row = a
+        .query_one(
+            "SELECT current_setting('server_version_num')::int >= 170000,
+                    coalesce((to_jsonb(s) ->> 'failover')::bool, false)
+               FROM pg_replication_slots s WHERE slot_name = $1",
+            &[&n.slot],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        row.get::<_, bool>(1),
+        row.get::<_, bool>(0),
+        "a failover slot exactly on 17+"
+    );
+    cleanup(&a, &n).await;
+}
+
 /// A checkpoint read on another server, another system or another timeline (a promoted
 /// standby), halts with `WAL_SOURCE_CHANGED`; under `source_change_action: re_snapshot` the slot
 /// is made again on the server read now, and the pipeline snapshots from it. A checkpoint with no
@@ -194,7 +223,9 @@ async fn a_checkpoint_from_another_server() {
 /// A stream reconnect, and the reset of a lost position, read the server first (Data-Flow Phase
 /// 2a, Source Disconnect; I-1): a checkpoint read on another system or timeline halts with
 /// `WAL_SOURCE_CHANGED` under `source_change_action: error`, and asks a rerun of Phase 0
-/// (`SourceChanged`) under `re_snapshot`. The slot is neither dropped nor made again; a
+/// (`SourceChanged`) under `re_snapshot`. A checkpoint read on an earlier timeline of this system
+/// (the server is a promoted standby) asks the rerun under either action: its start decides
+/// whether the stream continues (DA-SRC-33). The slot is neither dropped nor made again; a
 /// checkpoint read on this server, or naming none, opens as before.
 #[tokio::test]
 async fn a_reconnect_to_another_server_halts_or_reruns_phase_0() {
@@ -268,6 +299,28 @@ async fn a_reconnect_to_another_server_halts_or_reruns_phase_0() {
             "the slot is neither dropped nor made again"
         );
     }
+    let before = Checkpoint {
+        position: start.clone(),
+        server: Some(ServerIdentity::Postgres {
+            system_identifier,
+            timeline: timeline - 1,
+        }),
+    };
+    for c in [&halt, &recover] {
+        let e = SourceConnector::open_stream(c, &before, &tables)
+            .await
+            .map(drop)
+            .unwrap_err();
+        assert!(
+            matches!(&e, SourceError::SourceChanged(m) if m.contains("promoted server")),
+            "{e:?}"
+        );
+        assert!(matches!(
+            c.reset_position(&before).await,
+            Err(SourceError::SourceChanged(_))
+        ));
+    }
+    assert_eq!(confirmed(&a, &n).await, slot, "the slot is untouched");
     let here = Checkpoint {
         position: start.clone(),
         server: p.server.clone(),
@@ -276,16 +329,12 @@ async fn a_reconnect_to_another_server_halts_or_reruns_phase_0() {
         let s = SourceConnector::open_stream(&halt, &cp, &tables)
             .await
             .expect("this server's checkpoint opens");
-        drop(s);
-        // The walsender lets go of the slot before the next open.
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while halt.retained().await.unwrap().is_some_and(|l| l.streamed) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the slot stays active"
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        // Closed, not dropped: the replication client's worker connects and starts the
+        // replication in the background, after the open returns, so a dropped stream's worker
+        // can still take the slot after a wait for it to go inactive has passed, and the next
+        // open, or the cleanup's drop of the slot, then fails with `55006`. `close` stops the
+        // worker, waits for it to exit, then waits for the walsender to let go of the slot.
+        s.close().await.expect("the stream closes");
     }
     cleanup(&a, &n).await;
 }
@@ -1029,5 +1078,55 @@ async fn reset_teardown_and_retained_wal() {
         .is_none(),
         "and the publication"
     );
+    cleanup(&a, &n).await;
+}
+
+/// DA-SNAP-22: a managed publication that publishes via the partition root is set to publish
+/// each partition under its own name, and only the tracked partitions whose changes arrived under
+/// the root's name are copied again (as added tables), the one the publication names beside its
+/// root included; the slot and the other tables' stream stay.
+#[tokio::test]
+async fn a_via_root_repair_copies_only_the_partitions_it_hid() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(
+        &a,
+        "slot_via_root_repair",
+        "CREATE TABLE a (id int PRIMARY KEY);
+         CREATE TABLE events (id int, at date, PRIMARY KEY (id, at)) PARTITION BY RANGE (at);
+         CREATE TABLE events_2024 PARTITION OF events FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+         CREATE TABLE events_2025 PARTITION OF events FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');",
+    )
+    .await;
+    let c = connector(&pipeline(&n, &["*"], "", ""));
+    let tables = [n.table("a"), n.table("events_2024"), n.table("events_2025")];
+    let p = c.prepare(None, &tables).await.unwrap();
+    let start = from(&p.plan, SnapshotReason::FirstStart);
+    let SourcePosition::Pg(slot) = &start else {
+        unreachable!()
+    };
+    a.batch_execute(&format!(
+        "ALTER PUBLICATION {p} ADD TABLE {s}.events; ALTER PUBLICATION {p} SET (publish_via_partition_root = true)",
+        p = n.publication,
+        s = n.schema
+    ))
+    .await
+    .unwrap();
+    let p = c
+        .prepare(Some(&Checkpoint::from(start.clone())), &tables)
+        .await
+        .unwrap();
+    assert_eq!(p.plan, StartPlan::Resume, "the slot stays");
+    assert_eq!(confirmed(&a, &n).await, Some(*slot));
+    assert_eq!(p.added, [n.table("events_2024"), n.table("events_2025")]);
+    let via: bool = a
+        .query_one(
+            "SELECT pubviaroot FROM pg_publication WHERE pubname = $1",
+            &[&n.publication],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(!via, "each partition is published under its own name again");
     cleanup(&a, &n).await;
 }

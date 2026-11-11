@@ -177,6 +177,48 @@ async fn a_purged_checkpoint_halts_under_error() {
     e.cleanup().await;
 }
 
+/// DA-SRC-25 (final review O-1): while the pipeline was down, the key's name changed case alone
+/// (`RENAME COLUMN id TO ID`, the same column to MySQL) and the operator deleted the Delta table.
+/// The resume makes the table again under the cached spelling, the one the pipeline writes it
+/// with, so the rows inserted since stream in with no halt.
+#[tokio::test]
+async fn a_deleted_table_of_a_recased_key_is_made_again_under_the_cached_spelling() {
+    require_it!();
+    crate::mysql_only!();
+    let e = E2e::new(
+        "my_recased_key",
+        ITEMS,
+        Options {
+            tables: ", snapshots: { mode: never }",
+            ..Options::default()
+        },
+    )
+    .await;
+    let mut p = e.start(&[]);
+    p.ready().await;
+    e.streaming().await;
+    e.exec("INSERT INTO items VALUES (1, 'a')").await;
+    eventually("the row streams in", Duration::from_secs(60), async || {
+        e.ids("items").await == [1]
+    })
+    .await;
+    assert!(p.terminate().await.success());
+    e.exec("ALTER TABLE items RENAME COLUMN id TO ID").await;
+    e.drop_lake_table("items").await;
+    let mut p = e.start(&[]);
+    p.ready().await;
+    e.streaming().await;
+    e.exec("INSERT INTO items VALUES (3, 'c')").await;
+    eventually("the row streams in", Duration::from_secs(60), async || {
+        e.ids("items").await == [3]
+    })
+    .await;
+    assert!(e.halts().await.tables.is_empty());
+    p.metric(&e.status("running")).await;
+    assert!(p.terminate().await.success());
+    e.cleanup().await;
+}
+
 /// A failover behind the pipeline's address in file/position mode: the reconnect reaches another
 /// server, whose binlog files the checkpoint means nothing in. The dump's open checks the server
 /// on its own connection and halts the pipeline with `BINLOG_SOURCE_CHANGED`. Back on its server,

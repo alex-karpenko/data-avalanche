@@ -351,6 +351,7 @@ impl<'c> Session<'c> {
         core.update(|st| {
             st.phase = Phase::Streaming;
             st.checkpoint = Some(checkpoint.clone());
+            st.started_from.get_or_insert_with(|| checkpoint.clone());
             // A copy's halt fails its job table: it isn't the pipeline's, and isn't shown.
             for h in recorded.iter().chain(&halts).filter(|h| !h.copy) {
                 st.halted.insert(h.table.clone(), h.reason.clone());
@@ -964,6 +965,10 @@ impl<'c> Session<'c> {
         // The tables' changes up to here are good: flush them before the halts drop what is
         // buffered.
         self.flush()?;
+        if !report.warnings.is_empty() {
+            self.core
+                .update(|st| report.warnings.iter().for_each(|w| st.warn(w.clone())));
+        }
         for table in report.dropped {
             if self.schemas.contains_key(&table) {
                 self.halt(table, HaltReason::TableDropped)?;
@@ -2174,6 +2179,28 @@ mod tests {
         .await;
         assert_eq!(st.halted.get(&t("a")), Some(&HaltReason::TableDropped));
         assert_eq!(w.ids("a"), [1, 2, 3], "nothing before the drop is lost");
+    }
+
+    /// The periodic rescan's warnings reach the status beside the halt (DA-SRC-36).
+    #[tokio::test]
+    async fn a_periodic_rescans_warnings_reach_the_status() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let st = rescanning(&w, &flush_each(), async |status| {
+            w.source
+                .set_rescan_warnings(vec!["table public.a: maybe hidden".into()]);
+            w.source.drop_table(&t("a"));
+            wait_until("the table halts", || !status.borrow().halted.is_empty()).await;
+        })
+        .await;
+        assert_eq!(st.halted.get(&t("a")), Some(&HaltReason::TableDropped));
+        assert!(
+            st.warnings
+                .iter()
+                .any(|m| m == "table public.a: maybe hidden"),
+            "{:?}",
+            st.warnings
+        );
     }
 
     #[tokio::test]

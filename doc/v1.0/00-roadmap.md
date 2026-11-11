@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-04
+updated: 2026-11-06
 domain: Architecture
 tags: [v1, implementation-plan, roadmap, milestones, workspace, crates, interfaces, test-strategy, ci, risks]
 sources: []
@@ -1397,7 +1397,8 @@ closed with a pointer (Q-M12-1).
   lag across sessions; the dependency audit and the compile time.
 - **M12d — source and sink follow-ups** (Q-M12-8): the gaps M12a's review recorded in the sources
   and the sink (tracker §54.1: DA-SRC-25, 31…36, DA-SNAP-22, DA-SINK-12), after M12b and before
-  the acceptance.
+  the acceptance. Plan: `M12d-source-sink-followups.md` (Q-M12d-1…5): DA-SRC-31, logical decoding
+  on a standby, deferred to v2; DA-SRC-33 continues a promotion the failover slot followed.
 - **M12c — v1 acceptance**: the load, soak and chaos runs (on Oleksii's machine first, Q-M12-3, with
   DA-OPS-14's measurement), the real-cloud E2E in CI (S3, GCS, Azure, Q-M12-2), the checklist in
   §8, and `v1.0.0`.

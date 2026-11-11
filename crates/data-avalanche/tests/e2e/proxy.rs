@@ -3,6 +3,8 @@
 //! compressed transaction a binlog dump sends (`BINLOG_PAYLOAD_INVALID`), or sends new
 //! connections to another server and cuts the open ones (a failover behind one address,
 //! `BINLOG_SOURCE_CHANGED`). Without TLS only (`ssl_mode: disable`): it reads the packets.
+//! [`Proxy::tcp`] passes any protocol's bytes through unread, for the switch alone (a PostgreSQL
+//! failover behind one address, DA-SRC-33).
 
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
@@ -66,6 +68,16 @@ fn corrupt(p: &mut [u8]) -> bool {
 impl Proxy {
     /// A proxy to the MySQL server on `upstream`.
     pub async fn start(upstream: u16) -> Self {
+        Self::listen(upstream, true).await
+    }
+
+    /// A proxy to the server on `upstream` that reads nothing it passes: no fault but
+    /// [`Self::switch`].
+    pub async fn tcp(upstream: u16) -> Self {
+        Self::listen(upstream, false).await
+    }
+
+    async fn listen(upstream: u16, mysql: bool) -> Self {
         let l = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("a proxy port");
@@ -83,6 +95,18 @@ impl Proxy {
                     };
                     let (mut cr, mut cw) = client.into_split();
                     let (mut sr, mut sw) = server.into_split();
+                    if !mysql {
+                        let up = tokio::spawn(async move {
+                            let _ = tokio::io::copy(&mut cr, &mut sw).await;
+                        });
+                        let down = tokio::spawn(async move {
+                            let _ = tokio::io::copy(&mut sr, &mut cw).await;
+                        });
+                        let mut t = tasks.lock().expect("no panic holds the lock");
+                        t.push(up.abort_handle());
+                        t.push(down.abort_handle());
+                        continue;
+                    }
                     let dump = Arc::new(AtomicBool::new(false));
                     let up = {
                         let dump = dump.clone();

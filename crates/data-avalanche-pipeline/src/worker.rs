@@ -11,9 +11,9 @@ use std::time::Instant;
 
 use data_avalanche_config::{Pipeline, SnapshotMode};
 use data_avalanche_core::{
-    Checkpoint, CommitMarker, CommitOutcome, HaltReason, PositionRange, SchemaHint, Sink,
-    SinkError, SinkKind, SnapshotReason, SourceConnector, SourceError, SourcePosition, StartPlan,
-    TableChangeSet, TableRef, TableSchema, TableSpec,
+    Checkpoint, ColumnSchema, CommitMarker, CommitOutcome, HaltReason, PositionRange, SchemaHint,
+    Sink, SinkError, SinkKind, SnapshotReason, SourceConnector, SourceError, SourcePosition,
+    StartPlan, TableChangeSet, TableRef, TableSchema, TableSpec,
 };
 use data_avalanche_state::{PipelineDocs, SnapshotStatus, StateError, TableHalt, TableSnapshotDoc};
 use data_avalanche_storage::StoreError;
@@ -355,27 +355,88 @@ enum Empty {
     Truncate,
 }
 
-/// Commits an [`Empty`] change set to `schema`'s sink table at `at`. A table the lake doesn't
-/// hold has nothing to commit.
+/// Whether a cached schema's columns are the catalog's now: the same, in order, with the names
+/// compared without case when the source compares them so (`fold`, MySQL): a change of case alone
+/// is the same column, cached under its first spelling (DA-SRC-25).
+fn same_columns(cached: &TableSchema, now: &TableSchema, fold: bool) -> bool {
+    let (a, b) = (cached.columns(), now.columns());
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| match fold && x.name != y.name {
+                true => {
+                    x.name.to_lowercase() == y.name.to_lowercase()
+                        && ColumnSchema {
+                            name: y.name.clone(),
+                            ..x.clone()
+                        } == *y
+                }
+                false => x == y,
+            })
+}
+
+/// DA-SRC-33: the highest position the lake's markers name, at least `checkpoint`: every table
+/// the sink holds, `tracked` too (a reposition's set), for the source to decide whether its
+/// stream continues on another server. A marker another source kind wrote doesn't compare and
+/// is left out. A sink read that fails transiently is retried in place; one that fails for good
+/// ends the start with that sink error, as the start's other reads of the same tables would:
+/// declining the continuation instead would turn a sink fault into a re-snapshot or a
+/// `WAL_SOURCE_CHANGED` halt.
+async fn highest_marker<'a>(
+    sink: &dyn Sink,
+    tuning: &Tuning,
+    tracked: impl Iterator<Item = &'a TableRef>,
+    checkpoint: &SourcePosition,
+) -> Result<SourcePosition, WorkerError> {
+    let held = sink_retry(tuning, || Ok(()), || sink.held_tables()).await?;
+    let tables: BTreeSet<TableRef> = tracked.cloned().chain(held).collect();
+    let mut highest = checkpoint.clone();
+    for table in tables {
+        let state = sink_retry(tuning, || Ok(()), || sink.table_state(&table)).await?;
+        if let Some(m) = state.marker
+            && !highest.covers(&m.committed_position).unwrap_or(true)
+        {
+            highest = m.committed_position;
+        }
+    }
+    Ok(highest)
+}
+
+/// Commits a change set with no row to `table`: a truncate or a reposition, under the key the
+/// sink table records, else `identifier`. Neither carries a row, so the key only has to pass the
+/// sink's check that it is the table's own, which a key spelled or chosen otherwise than the
+/// sink table's would fail for good: a wiped state's (DA-SRC-32), or one whose case alone changed
+/// where names fold (DA-SRC-25). A truncate reaches here only when the sink table records the
+/// session's key or none (the truncate loop halts any other), so for a truncate the recorded key
+/// is defence in depth. A table the lake doesn't hold, or a reposition of one without a
+/// marker, has nothing to commit. `Ok(false)` when there was no key to commit under: a
+/// reposition of a table that records none, which the pipeline neither resolves nor caches.
 async fn commit_empty(
     core: &Core,
     tuning: &Tuning,
-    schema: &TableSchema,
+    table: &TableRef,
+    identifier: &[String],
     at: &SourcePosition,
     kind: Empty,
-) -> Result<(), WorkerError> {
-    let table = schema.table();
+) -> Result<bool, WorkerError> {
     let state = sink_retry(tuning, || core.may_write(), || core.sink.table_state(table)).await?;
     let (true, Some(columns)) = (state.exists, state.schema) else {
-        return Ok(());
+        return Ok(true);
     };
     if kind == Empty::Reposition && state.marker.is_none() {
-        return Ok(());
+        return Ok(true);
+    }
+    let identifier = match state.identifier.is_empty() {
+        false => state.identifier,
+        true => identifier.to_vec(),
+    };
+    if identifier.is_empty() {
+        return Ok(false);
     }
     let cs = TableChangeSet {
         table: table.clone(),
         schema: columns,
-        identifier: schema.identifier().to_vec(),
+        identifier,
         truncate: kind == Empty::Truncate,
         upserts: vec![],
         deletes: vec![],
@@ -407,7 +468,7 @@ async fn commit_empty(
         }),
         // Neither is ever skipped as covered (`covers` skips neither a reposition nor a
         // snapshot's set): the arm is unreachable, and harmless.
-        CommitOutcome::Committed { .. } | CommitOutcome::SkippedCovered => Ok(()),
+        CommitOutcome::Committed { .. } | CommitOutcome::SkippedCovered => Ok(true),
     }
 }
 
@@ -517,6 +578,7 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
         match source.rescan(&gone).await {
             Ok(report) => {
                 core.gone_failing.succeeded();
+                warnings.extend(report.warnings);
                 halts.extend(
                     report
                         .dropped
@@ -563,11 +625,25 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
                 core.docs.save_slot(&doc).await?;
             }
             let refs: Vec<TableRef> = resolved_tables.keys().cloned().collect();
+            // Another server than the checkpoint's: the source may continue its stream there
+            // only past every marker the lake holds (DA-SRC-33).
+            let marked = match (&checkpoint, &preflight.server) {
+                (Some(c), Some(now)) if c.server.as_ref().is_some_and(|was| was != now) => Some(
+                    highest_marker(
+                        sink.as_ref(),
+                        &tuning,
+                        resolved_tables.keys().chain(cached.keys()),
+                        &c.position,
+                    )
+                    .await?,
+                ),
+                _ => None,
+            };
             // `prepare` may create, recreate or advance the slot.
             let prepared = write_retry(
                 &tuning,
                 || core.may_write(),
-                || source.prepare(checkpoint.as_ref(), &refs),
+                || source.prepare_marked(checkpoint.as_ref(), &refs, marked.as_ref()),
             )
             .await?;
             warnings.extend(prepared.warnings);
@@ -619,6 +695,7 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
     let mut abandoned = vec![];
     let mut schemas = vec![];
     let mut dump_only = !resolved_tables.is_empty();
+    let fold = source.column_names_fold();
     for (table, now) in &resolved_tables {
         let mode = core.settings.mode(table);
         dump_only &= matches!(mode, SnapshotMode::DumpAlways | SnapshotMode::DumpInitial);
@@ -667,14 +744,11 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
         // The sink table: created when absent, baselined to the schema now after a gap in the
         // stream (`Schema_Change…` §8.2), else the cached schema stays until the stream replays.
         let partition_by = core.settings.partition_by(table);
-        let spec = match TableSpec::new(now, partition_by) {
-            Ok(spec) => spec,
-            Err(reason) => {
-                halts.push((table.clone(), reason));
-                tracked.insert(table.clone());
-                continue;
-            }
-        };
+        if let Err(reason) = TableSpec::new(now, partition_by.clone()) {
+            halts.push((table.clone(), reason));
+            tracked.insert(table.clone());
+            continue;
+        }
         let mut schema = now.clone();
         let mut evolved = false;
         let baseline = matches!(plan, Plan::Fresh(_)) || cleared.contains(table);
@@ -685,7 +759,7 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
             _ => c.clone(),
         });
         match rebased.as_ref() {
-            Some(c) if state.exists && baseline && c.columns() != now.columns() => {
+            Some(c) if state.exists && baseline && !same_columns(c, now, fold) => {
                 let evolver = core.evolver();
                 let hint = SchemaHint::Columns(now.columns().to_vec());
                 match evolver.plan(c, &hint).await {
@@ -711,9 +785,10 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
                     }
                 }
             }
-            // No schema cached for a table the sink holds (a wiped state): baselined against the
-            // sink table's columns (DA-SNAP-13).
-            None if state.exists && baseline => {
+            // No schema cached for a table the sink holds: a wiped state, or a table first
+            // tracked at a resume whose sink table a job's copy made. Baselined against the
+            // sink table's columns (DA-SNAP-13, DA-SNAP-22).
+            None if state.exists => {
                 let adds = match state.schema.as_deref().map(|s| missing_columns(s, now)) {
                     Some(Ok(adds)) => adds,
                     Some(Err(reason)) => {
@@ -741,8 +816,16 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
                     evolved = true;
                 }
             }
+            // Only the case of a name differs (where names fold): the sink's column has the
+            // cached spelling, which stays (DA-SRC-25).
+            Some(c) if state.exists && baseline && c.columns() != now.columns() => {
+                schema = match now.source_id() {
+                    Some(id) => c.clone().with_source_id(id),
+                    None => c.clone(),
+                };
+            }
             Some(_) if cleared.contains(table) => {}
-            Some(c) if matches!(plan, Plan::Resume) && c.columns() != now.columns() => {
+            Some(c) if matches!(plan, Plan::Resume) && !same_columns(c, now, fold) => {
                 drifted.insert(table.clone());
                 let idle = match core.settings.rescan_interval {
                     Some(every) => format!(
@@ -760,6 +843,19 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
             _ => {}
         }
         if !state.exists {
+            // Made under the schema the session writes the table with (D-M12d.3): at a resume,
+            // the cached one, which the catalog's may differ from by the case of a name alone
+            // where names fold (DA-SRC-25), or by a change the stream still holds; else the
+            // schema now. Made under the catalog's, the table would refuse the session's first
+            // commit and halt.
+            let spec = match TableSpec::new(&schema, partition_by) {
+                Ok(spec) => spec,
+                Err(reason) => {
+                    halts.push((table.clone(), reason));
+                    tracked.insert(table.clone());
+                    continue;
+                }
+            };
             match sink_retry(&tuning, || core.may_write(), || sink.ensure_table(&spec)).await {
                 Ok(()) => {}
                 Err(WorkerError::Sink(SinkError::Permanent { reason })) => {
@@ -905,7 +1001,17 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
             })
             .await?;
     }
-    let fresh = matches!(plan, Plan::Fresh(_)).then_some(doc);
+    // A resume on another server than the checkpoint's: the source continued its stream there
+    // (PostgreSQL: a promotion its slot followed, DA-SRC-33; MySQL in GTID mode: a GTID set
+    // means the same on any server of the topology). The checkpoint records the new server, which
+    // the stream's open and a later start check, as a fresh start's does (D-M12d.11); MySQL's
+    // writer would record it at the first flush anyway, so there it is only an earlier write.
+    let moved = matches!(plan, Plan::Resume)
+        && server.is_some()
+        && checkpoint
+            .as_ref()
+            .is_some_and(|c| c.server.is_some() && c.server != server);
+    let fresh = (matches!(plan, Plan::Fresh(_)) || moved).then_some(doc);
     // The schemas before a fresh start's checkpoint: a restart in between still finds the
     // checkpoint before it and starts fresh again. The other way round, it would resume from the
     // new checkpoint under the cache of before the baseline, as if the stream still held the
@@ -922,7 +1028,7 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
             core.docs.clear_halt(table).await?;
         }
     }
-    let started: BTreeSet<TableRef> = requests
+    let mut started: BTreeSet<TableRef> = requests
         .iter()
         .filter(|t| asked.contains(*t))
         .cloned()
@@ -937,9 +1043,77 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
     // only while the job still has the table queued, before any chunk is read: once recorded
     // running below, a later start resumes the copy instead (DA-SNAP-15).
     let truncating = jobs.truncating();
-    for table in started.iter().filter(|t| truncating.contains(*t)) {
-        if let Some(schema) = resolved_tables.get(table).or_else(|| copies.get(table)) {
-            commit_empty(core, &tuning, schema, &at, Empty::Truncate).await?;
+    let truncated: Vec<TableRef> = started
+        .iter()
+        .filter(|t| truncating.contains(*t))
+        .cloned()
+        .collect();
+    for table in &truncated {
+        // The key the session copies the table with: the schema this start caches, else a
+        // copy's, else the one cached before (a key whose case alone changed keeps the cached
+        // spelling where names fold, DA-SRC-25), else the catalog's (`resolved_tables`, never
+        // reached for a table this start tracks or copies). A copy's comes before the cached
+        // one: a table taken out of the config keeps its cached schema and can be a job's copy
+        // too, and the session reads it as a copy.
+        let schema = schemas
+            .iter()
+            .find(|s| s.table() == table)
+            .or_else(|| copies.get(table))
+            .or_else(|| cached.get(table))
+            .or_else(|| resolved_tables.get(table));
+        if let Some(schema) = schema {
+            // A sink table keyed otherwise than the session's (other columns, or the same
+            // spelled otherwise, by case alone included) would refuse every chunk of the copy
+            // for good: a sink compares keys byte for byte, and the session never takes the
+            // sink's spelling. The table halts now, its rows kept, rather than emptied and then
+            // halted at its first chunk (final review M-A, m-1). A sink table that records no
+            // key is checked at the commit.
+            let state = sink_retry(&tuning, || Ok(()), || sink.table_state(table)).await?;
+            if state.exists
+                && !state.identifier.is_empty()
+                && state.identifier.as_slice() != schema.identifier()
+            {
+                let reason = HaltReason::SinkRejected {
+                    detail: format!(
+                        "a truncating job asked to copy it again, but the pipeline keys it by \
+                         {:?} and its sink table by {:?}: it isn't emptied; drop or move the \
+                         sink table, then ask the job again",
+                        schema.identifier(),
+                        state.identifier
+                    ),
+                };
+                let copy = copies.contains_key(table);
+                core.may_write()?;
+                core.docs
+                    .record_halt(&TableHalt {
+                        table: table.clone(),
+                        reason: reason.clone(),
+                        at: at.clone(),
+                        copy,
+                    })
+                    .await?;
+                started.remove(table);
+                failed.insert(table.clone(), format!("{}: {reason}", reason.code()));
+                // A copy's halt fails its job table only: it isn't the pipeline's.
+                if !copy {
+                    core.update(|st| {
+                        st.halted.insert(table.clone(), reason);
+                    });
+                }
+                continue;
+            }
+            // Under the key the sink table records (`commit_empty`), which is the session's
+            // here; for a sink table that records none, under the session's. The result is
+            // `true`: a resolved schema always has a key (`Ok(false)` is a reposition's).
+            commit_empty(
+                core,
+                &tuning,
+                schema.table(),
+                schema.identifier(),
+                &at,
+                Empty::Truncate,
+            )
+            .await?;
         }
     }
     core.may_write()?;
@@ -960,12 +1134,47 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
     }
     // A source change moves every table the lake holds onto the new server's positions before
     // the checkpoint that names the server: a restart in between still finds the old one
-    // recorded, and repositions them again (DA-SRC-20).
+    // recorded, and repositions them again (DA-SRC-20). Every table the sink holds, not only
+    // those resolved or cached now: a job's copy, a table outside the config, would keep the old
+    // server's marker and skip the new one's changes when tracked later (DA-SRC-32). A table the
+    // sink refuses the reposition of halts (`SINK_REJECTED`) instead of ending every start.
     if matches!(plan, Plan::Fresh(SnapshotReason::SourceChanged)) {
-        let tables: BTreeSet<&TableRef> = resolved_tables.keys().chain(cached.keys()).collect();
+        let held = sink_retry(&tuning, || Ok(()), || sink.held_tables()).await?;
+        let tables: BTreeSet<&TableRef> = resolved_tables
+            .keys()
+            .chain(cached.keys())
+            .chain(&held)
+            .collect();
         for table in tables {
-            if let Some(schema) = cached.get(table).or_else(|| resolved_tables.get(table)) {
-                commit_empty(core, &tuning, schema, &at, Empty::Reposition).await?;
+            let identifier = cached
+                .get(table)
+                .or_else(|| resolved_tables.get(table))
+                .map_or(&[][..], |s| s.identifier());
+            match commit_empty(core, &tuning, table, identifier, &at, Empty::Reposition).await {
+                Ok(true) => {}
+                Ok(false) => warnings.push(format!(
+                    "table {table}: the lake holds it, but its table records no key and the \
+                     pipeline doesn't track it, so its marker stays on the old server; track it \
+                     and re-snapshot it before its changes stream"
+                )),
+                Err(WorkerError::Sink(SinkError::Permanent { reason })) => {
+                    let reason = HaltReason::SinkRejected {
+                        detail: format!("the source changed, and its reposition fails: {reason}"),
+                    };
+                    core.may_write()?;
+                    core.docs
+                        .record_halt(&TableHalt {
+                            table: table.clone(),
+                            reason: reason.clone(),
+                            at: at.clone(),
+                            copy: false,
+                        })
+                        .await?;
+                    core.update(|st| {
+                        st.halted.insert(table.clone(), reason);
+                    });
+                }
+                Err(e) => return Err(e),
             }
         }
     }
@@ -997,7 +1206,7 @@ mod tests {
 
     use super::*;
     use crate::test_support::{
-        Countdown, CrashAt, World, Yaml, docs, fast, row, schema, t, wait_until,
+        Countdown, CrashAt, World, Yaml, accumulator, docs, fast, row, schema, t, txn, wait_until,
     };
     use crate::{Backoff, HookPoint};
     use std::sync::atomic::AtomicUsize;
@@ -1298,9 +1507,97 @@ mod tests {
         );
     }
 
-    /// The same failover under `source_change_action: error`: the reset halts with
-    /// `WAL_SOURCE_CHANGED` and replaces nothing; the checkpoint still names the old server, and
-    /// a restart halts the same way.
+    /// DA-SRC-33: a start that reaches another server than the checkpoint's tells the source the
+    /// lake's highest marker, for it to decide whether its stream continues there; a start on
+    /// the checkpoint's server reads no marker for it.
+    #[tokio::test]
+    async fn a_start_on_another_server_tells_the_source_the_highest_marker() {
+        let w = World::new(&["a"]);
+        let pg = |timeline| ServerIdentity::Postgres {
+            system_identifier: 7,
+            timeline,
+        };
+        w.source.set_server(Some(pg(1)));
+        w.source.load(&t("a"), rows(1..=2));
+        let (end, _) = run(&w, &mode("mode: initial"), async |status| {
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(3, "x")));
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        let (end, _) = run(&w, &mode("mode: never"), async |status| {
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!(w.source.marks(), [None, None], "no server change");
+        let checkpoint = w
+            .docs
+            .slot()
+            .await
+            .unwrap()
+            .unwrap()
+            .doc
+            .confirmed_flush_lsn;
+        let past = SourcePosition::Pg(Lsn(checkpoint.0 + 0x40));
+        w.sink.mark_at(&t("a"), past.clone());
+        w.source.fail_over(pg(2), Lsn(0x100));
+        let (end, _) = run(&w, &mode("mode: never"), async |status| {
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!(w.source.marks()[2], Some(past));
+    }
+
+    /// DA-SRC-33: a promotion the slot followed. The source continues its stream on the new
+    /// server: the start resumes, records the new server with the checkpoint (which the stream's
+    /// open checks), and streams on; nothing is re-snapshotted.
+    #[tokio::test]
+    async fn a_promotion_the_slot_followed_resumes_on_the_new_server() {
+        let w = World::new(&["a"]);
+        let pg = |timeline| ServerIdentity::Postgres {
+            system_identifier: 7,
+            timeline,
+        };
+        w.source.set_server(Some(pg(1)));
+        w.source.load(&t("a"), rows(1..=2));
+        let (end, _) = run(&w, &mode("mode: initial"), async |status| {
+            w.source
+                .commit(FakeTxn::new().insert(&t("a"), row(3, "before")));
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        let read = w.source.reads(&t("a"));
+        w.source.promote_following(pg(2));
+        let (end, st) = run(&w, &mode("mode: initial"), async |status| {
+            streamed(&status, &w).await;
+            w.source
+                .commit(FakeTxn::new().insert(&t("a"), row(4, "after")));
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!(w.ids("a"), [1, 2, 3, 4]);
+        assert_eq!(w.source.reads(&t("a")), read, "nothing re-snapshotted");
+        assert_eq!(
+            w.docs.slot().await.unwrap().unwrap().doc.server,
+            Some(pg(2))
+        );
+        assert!(
+            !st.warnings
+                .iter()
+                .any(|w| w.contains("source server changed")),
+            "{:?}",
+            st.warnings
+        );
+    }
+
+    /// The same failover under `source_change_action: error`: the reset, on a promoted server of
+    /// the same system, replaces nothing and asks a rerun of the start (`SourceChanged`, which
+    /// decides whether the stream continues, DA-SRC-33); the checkpoint still names the old
+    /// server, and the rerun, whose slot didn't follow, halts with `WAL_SOURCE_CHANGED`.
     #[tokio::test]
     async fn a_failover_mid_run_halts_under_error() {
         let w = World::new(&["a"]);
@@ -1320,17 +1617,122 @@ mod tests {
             let _ = tokio::time::timeout(Duration::from_secs(10), st.wait_for(|_| false)).await;
         })
         .await;
-        let end = end.expect_err("the worker halts");
-        assert_eq!(end.code(), Some("WAL_SOURCE_CHANGED"), "{end:?}");
-        assert_eq!(end.recovery(), crate::Recovery::Error);
+        let end = end.expect_err("the worker ends");
+        assert!(
+            matches!(end, WorkerError::Source(SourceError::SourceChanged(_))),
+            "{end:?}"
+        );
+        assert_eq!(end.recovery(), crate::Recovery::Retry);
         assert_eq!(
             w.docs.slot().await.unwrap().unwrap().doc.server,
             Some(pg(1))
         );
         let (end, _) = run(&w, &mode("mode: never"), async |_| {}).await;
+        let end = end.expect_err("the rerun halts");
+        assert_eq!(end.code(), Some("WAL_SOURCE_CHANGED"), "{end:?}");
+        assert_eq!(end.recovery(), crate::Recovery::Error);
+    }
+
+    /// DA-SRC-33: a reconnect that reaches a promoted server the slot followed, under
+    /// `source_change_action: error`: the worker ends with `SourceChanged` instead of halting,
+    /// and the rerun's start continues the stream there, nothing re-snapshotted.
+    #[tokio::test]
+    async fn a_reconnect_to_the_promoted_server_reruns_the_start_which_continues() {
+        let w = World::new(&["a"]);
+        let pg = |timeline| ServerIdentity::Postgres {
+            system_identifier: 7,
+            timeline,
+        };
+        w.source.set_server(Some(pg(1)));
+        w.source.halt_on_source_change();
+        w.source.load(&t("a"), rows(1..=2));
+        let (end, _) = run(&w, &mode("mode: initial"), async |status| {
+            w.source
+                .commit(FakeTxn::new().insert(&t("a"), row(3, "before")));
+            streamed(&status, &w).await;
+            w.source.promote_following(pg(2));
+            w.source.fail(
+                Method::Next,
+                SourceError::Transient("connection reset".into()),
+            );
+            // Until the worker ends (its status closes).
+            let mut st = status.clone();
+            let _ = tokio::time::timeout(Duration::from_secs(10), st.wait_for(|_| false)).await;
+        })
+        .await;
+        let end = end.expect_err("the worker ends");
+        assert!(
+            matches!(end, WorkerError::Source(SourceError::SourceChanged(_))),
+            "{end:?}"
+        );
+        assert_eq!(end.recovery(), crate::Recovery::Retry);
+        let read = w.source.reads(&t("a"));
+        let (end, st) = run(&w, &mode("mode: never"), async |status| {
+            streamed(&status, &w).await;
+            w.source
+                .commit(FakeTxn::new().insert(&t("a"), row(4, "after")));
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!(w.ids("a"), [1, 2, 3, 4]);
+        assert_eq!(w.source.reads(&t("a")), read, "nothing re-snapshotted");
         assert_eq!(
-            end.expect_err("a restart halts").code(),
-            Some("WAL_SOURCE_CHANGED")
+            w.docs.slot().await.unwrap().unwrap().doc.server,
+            Some(pg(2))
+        );
+        assert!(st.halted.is_empty(), "{:?}", st.halted);
+    }
+
+    /// DA-SRC-33: the highest marker counts the tables the lake holds outside the config too,
+    /// and leaves out a marker that doesn't compare (another source kind's).
+    #[tokio::test]
+    async fn the_highest_marker_counts_held_tables_and_skips_other_dialects() {
+        let w = World::new(&["a", "x"]);
+        let marked = lake_with_an_untracked_table(&w).await;
+        let SourcePosition::Pg(Lsn(at)) = marked.committed_position else {
+            unreachable!()
+        };
+        let past = SourcePosition::Pg(Lsn(at + 0x40));
+        w.sink.mark_at(&t("x"), past.clone());
+        w.source.fail_over(
+            ServerIdentity::Postgres {
+                system_identifier: 7,
+                timeline: 2,
+            },
+            Lsn(0x100),
+        );
+        let (end, _) = run(&w, &mode("mode: never"), async |status| {
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!(w.source.marks().last(), Some(&Some(past)), "x's marker");
+
+        let w = World::new(&["a", "x"]);
+        lake_with_an_untracked_table(&w).await;
+        let checkpoint = w
+            .docs
+            .slot()
+            .await
+            .unwrap()
+            .unwrap()
+            .doc
+            .confirmed_flush_lsn;
+        w.sink
+            .mark_at(&t("x"), "binlog:b.000001:4".parse().unwrap());
+        w.source.fail_over(
+            ServerIdentity::Postgres {
+                system_identifier: 7,
+                timeline: 2,
+            },
+            Lsn(0x100),
+        );
+        let _ = run(&w, &mode("mode: never"), async |_| {}).await;
+        assert_eq!(
+            w.source.marks().last(),
+            Some(&Some(SourcePosition::Pg(checkpoint))),
+            "the binlog marker is left out"
         );
     }
 
@@ -1522,6 +1924,30 @@ mod tests {
         end.unwrap();
         assert_eq!(st.halted.get(&t("b")), Some(&HaltReason::TableDropped));
         assert_eq!(w.docs.halts().await.unwrap().tables[0].table, t("b"));
+    }
+
+    /// A rescan's warnings reach the status from Phase 0's rescan of the tables gone from the
+    /// source's list (DA-SRC-36).
+    #[tokio::test]
+    async fn a_gone_tables_rescan_warnings_reach_the_status() {
+        let w = World::new(&["a", "b"]);
+        w.started(&["a", "b"]).await;
+        w.source.drop_table(&t("b"));
+        w.source
+            .set_rescan_warnings(vec!["table public.b: maybe hidden".into()]);
+        let (end, st) = run(&w, &mode("mode: never"), async |status| {
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert_eq!(st.halted.get(&t("b")), Some(&HaltReason::TableDropped));
+        assert!(
+            st.warnings
+                .iter()
+                .any(|m| m == "table public.b: maybe hidden"),
+            "{:?}",
+            st.warnings
+        );
     }
 
     #[tokio::test]
@@ -1991,6 +2417,81 @@ mod tests {
         assert!(state.schema.unwrap().field_with_name("note").is_ok());
     }
 
+    /// DA-SNAP-22: a table first tracked at a resume (here, one created since the last start)
+    /// whose sink table exists already, as a job's copy leaves it, is baselined to the source's
+    /// columns before its copy, like a wiped state's.
+    #[tokio::test]
+    async fn a_table_first_tracked_at_a_resume_is_baselined_against_its_sink_table() {
+        let w = World::new(&["a"]);
+        let p = mode("mode: initial");
+        run(&w, &p, async |status| streamed(&status, &w).await)
+            .await
+            .0
+            .unwrap();
+        w.sink
+            .ensure_table(&TableSpec::new(&schema("b"), vec![]).unwrap())
+            .await
+            .unwrap();
+        let noted = TableSchema::new(
+            t("b"),
+            vec![
+                ColumnSchema::new("id", V::Int64, "bigint").not_null(),
+                ColumnSchema::new("doc", V::Text, "text"),
+                ColumnSchema::new("note", V::Text, "text"),
+            ],
+            vec!["id".into()],
+        )
+        .unwrap();
+        w.source.create_table(noted);
+        let mut r = row(1, "x");
+        r.0.push(("note".into(), ColumnValue::Text("n".into())));
+        w.source.load(&t("b"), vec![r]);
+        let (end, st) = run(&w, &p, async |status| streamed(&status, &w).await).await;
+        assert_eq!(end.unwrap(), Exit::Drained);
+        assert_eq!(w.source.prepares().len(), 2, "a resume");
+        assert!(st.halted.is_empty(), "{:?}", st.halted);
+        assert_eq!(w.text("b", "note"), [Some("n".to_owned())]);
+    }
+
+    /// DA-SNAP-22: a sink table holding a non-null column the source no longer has (a key it
+    /// was made with) can't take the source's rows: it halts at the baseline, naming the column,
+    /// rather than at the first MERGE.
+    #[test]
+    fn a_sink_table_with_a_non_null_column_the_source_lacks_halts() {
+        let keyed = TableSchema::new(
+            t("a"),
+            vec![
+                ColumnSchema::new("id", V::Int64, "bigint").not_null(),
+                ColumnSchema::new("region", V::Text, "text").not_null(),
+                ColumnSchema::new("doc", V::Text, "text"),
+            ],
+            vec!["id".into(), "region".into()],
+        )
+        .unwrap();
+        let sink = upsert_schema(&keyed);
+        let Err(HaltReason::SchemaMismatch { column, detail }) =
+            missing_columns(&sink, &schema("a"))
+        else {
+            panic!("a non-null column the source lacks halts");
+        };
+        assert_eq!(column, "region");
+        assert!(detail.contains("non-null"), "{detail}");
+        // A nullable one is soft-dropped: kept, written NULL.
+        let sink = upsert_schema(
+            &TableSchema::new(
+                t("a"),
+                vec![
+                    ColumnSchema::new("id", V::Int64, "bigint").not_null(),
+                    ColumnSchema::new("doc", V::Text, "text"),
+                    ColumnSchema::new("old", V::Text, "text"),
+                ],
+                vec!["id".into()],
+            )
+            .unwrap(),
+        );
+        assert!(missing_columns(&sink, &schema("a")).unwrap().is_empty());
+    }
+
     /// A sink table without the source's key column is keyed otherwise: it halts.
     #[test]
     fn a_sink_table_without_the_key_column_halts() {
@@ -2043,6 +2544,12 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        // Unicode case too, as delta-rs folds it (DA-SINK-12).
+        let sink = upsert_schema(&cased("id", "ärger"));
+        assert!(matches!(
+            missing_columns(&sink, &cased("id", "ÄRGER")),
+            Err(HaltReason::SchemaMismatch { column, .. }) if column == "ÄRGER"
+        ));
     }
 
     #[tokio::test]
@@ -2070,6 +2577,35 @@ mod tests {
         assert!(state.schema.unwrap().field_with_name("note").is_ok());
         let cached = w.docs.table_schema(&t("a")).await.unwrap().unwrap().doc;
         assert!(cached.column("note").is_some());
+    }
+
+    /// DA-SRC-25: a baseline (a lost position) of a table whose catalog spelling changed case
+    /// alone, where names fold, caches the sink's spelling, not the catalog's.
+    #[tokio::test]
+    async fn a_baseline_of_a_case_only_change_caches_the_sink_spelling() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.source.fold_column_names();
+        w.source.alter(
+            &t("a"),
+            TableSchema::new(
+                t("a"),
+                vec![
+                    ColumnSchema::new("id", V::Int64, "bigint").not_null(),
+                    ColumnSchema::new("DOC", V::Text, "text"),
+                ],
+                vec!["id".into()],
+            )
+            .unwrap(),
+        );
+        w.source.lose_slot();
+        let (end, _) = run(&w, &mode("mode: never"), async |status| {
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        let cached = w.docs.table_schema(&t("a")).await.unwrap().unwrap().doc;
+        assert_eq!(cached.columns()[1].name, "doc", "the sink's spelling");
     }
 
     /// Runs a worker with `deps` until `drive` returns, then drains it.
@@ -2238,6 +2774,123 @@ mod tests {
         assert_eq!(w.ids("a"), [1]);
         let content = w.sink.content(&t("a")).unwrap();
         assert!(content.column_by_name("note").is_none(), "nothing evolved");
+    }
+
+    /// A lake that holds `x`, a table the config doesn't name and the cache doesn't know (a job's
+    /// copy, a table taken out of the config), with a marker on the first server, beside the
+    /// streamed `a`.
+    async fn lake_with_an_untracked_table(w: &World) -> CommitMarker {
+        let pg = |timeline| ServerIdentity::Postgres {
+            system_identifier: 7,
+            timeline,
+        };
+        w.source.outside_config(&t("x"));
+        w.source.set_server(Some(pg(1)));
+        let (end, _) = run(w, &mode("mode: never"), async |status| {
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+            streamed(&status, w).await;
+        })
+        .await;
+        end.unwrap();
+        let spec = TableSpec::new(&w.source.schema(&t("x")), vec![]).unwrap();
+        w.sink.ensure_table(&spec).await.unwrap();
+        let columns = w.sink.table_state(&t("x")).await.unwrap().schema.unwrap();
+        let marked = w.sink.table_state(&t("a")).await.unwrap().marker.unwrap();
+        let at = marked.committed_position.clone();
+        let cs = TableChangeSet {
+            table: t("x"),
+            schema: columns,
+            identifier: vec!["id".into()],
+            truncate: false,
+            upserts: vec![],
+            deletes: vec![],
+            position: PositionRange {
+                start: at.clone(),
+                end: at.clone(),
+                last_change: at,
+            },
+            split: None,
+            snapshot: false,
+            reposition: true,
+        };
+        w.sink.commit(cs, marked.clone()).await.unwrap();
+        marked
+    }
+
+    /// DA-SRC-32: a held table the sink refuses the reposition of halts `SINK_REJECTED` (it shows
+    /// in the status, and the halt registry records it), the start goes on, and the other tables
+    /// are repositioned.
+    #[tokio::test]
+    async fn a_refused_reposition_halts_that_table_and_the_start_goes_on() {
+        let w = World::new(&["a", "x"]);
+        let old = lake_with_an_untracked_table(&w).await;
+        w.sink
+            .fail(SinkOp::Commit, Some(&t("x")), 1, || SinkError::Permanent {
+                reason: "refused".into(),
+            });
+        w.source.fail_over(
+            ServerIdentity::Postgres {
+                system_identifier: 7,
+                timeline: 2,
+            },
+            Lsn(0x100),
+        );
+        let (end, st) = run(&w, &mode("mode: never"), async |status| {
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        match st.halted.get(&t("x")) {
+            Some(HaltReason::SinkRejected { detail }) => {
+                assert!(detail.contains("reposition fails"), "{detail}");
+                assert!(detail.contains("refused"), "{detail}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let halts = w.docs.halts().await.unwrap().tables;
+        assert!(
+            halts
+                .iter()
+                .any(|h| h.table == t("x") && matches!(h.reason, HaltReason::SinkRejected { .. })),
+            "{halts:?}"
+        );
+        let moved = w.sink.table_state(&t("a")).await.unwrap().marker.unwrap();
+        assert_eq!(moved.committed_position, SourcePosition::Pg(Lsn(0x100)));
+        let x = w.sink.table_state(&t("x")).await.unwrap().marker.unwrap();
+        assert_eq!(x, old, "x's marker stays: its reposition was refused");
+    }
+
+    /// DA-SRC-32: a held table that records no key, and that the pipeline doesn't track either,
+    /// has no key to reposition under: its marker stays, and the status says so.
+    #[tokio::test]
+    async fn a_held_table_with_no_key_is_warned_about() {
+        let w = World::new(&["a", "x"]);
+        let old = lake_with_an_untracked_table(&w).await;
+        w.sink.forget_key(&t("x"));
+        w.source.fail_over(
+            ServerIdentity::Postgres {
+                system_identifier: 7,
+                timeline: 2,
+            },
+            Lsn(0x100),
+        );
+        let (end, st) = run(&w, &mode("mode: never"), async |status| {
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert!(
+            st.warnings
+                .iter()
+                .any(|m| m.contains("public.x") && m.contains("records no key")),
+            "{:?}",
+            st.warnings
+        );
+        assert!(st.halted.is_empty(), "{:?}", st.halted);
+        let x = w.sink.table_state(&t("x")).await.unwrap().marker.unwrap();
+        assert_eq!(x, old);
+        let moved = w.sink.table_state(&t("a")).await.unwrap().marker.unwrap();
+        assert_eq!(moved.committed_position, SourcePosition::Pg(Lsn(0x100)));
     }
 
     /// The sink holds the table under another key (the source's key, or its override, changed
@@ -2502,6 +3155,101 @@ mod tests {
         assert_eq!(cached, w.source.schema(&t("a")));
         assert_eq!(w.ids("a"), [1, 2, 3]);
         assert_eq!(w.text("a", "note"), [None, None, Some("n".to_owned())]);
+    }
+
+    /// DA-SRC-25: on a source that compares column names without case (MySQL), a column whose
+    /// catalog spelling changed case alone while the pipeline was down is the same column: no
+    /// drift, and the cache keeps the sink's spelling. On PostgreSQL it is a change.
+    #[tokio::test]
+    async fn a_change_of_case_alone_is_no_drift_where_names_fold() {
+        let recased = || {
+            TableSchema::new(
+                t("a"),
+                vec![
+                    ColumnSchema::new("id", V::Int64, "bigint").not_null(),
+                    ColumnSchema::new("DOC", V::Text, "text"),
+                ],
+                vec!["id".into()],
+            )
+            .unwrap()
+        };
+        let drift = |st: &WorkerStatus| {
+            st.warnings
+                .iter()
+                .any(|m| m.contains("changed while the pipeline was down"))
+        };
+        for fold in [true, false] {
+            let w = World::new(&["a"]);
+            w.source.load(&t("a"), rows(1..=2));
+            let p = mode("mode: initial");
+            run(&w, &p, async |status| streamed(&status, &w).await)
+                .await
+                .0
+                .unwrap();
+            if fold {
+                w.source.fold_column_names();
+            }
+            w.source.alter(&t("a"), recased());
+            let (end, st) = run(&w, &p, async |status| streamed(&status, &w).await).await;
+            assert_eq!(end.unwrap(), Exit::Drained);
+            assert_eq!(drift(&st), !fold, "fold {fold}: {:?}", st.warnings);
+            if fold {
+                let cached = w.docs.table_schema(&t("a")).await.unwrap().unwrap().doc;
+                assert_eq!(cached.columns()[1].name, "doc", "the sink's spelling");
+            }
+        }
+    }
+
+    /// DA-SRC-25, D-M12d.3: where names fold, a sink table the operator dropped is made again at
+    /// a resume under the spelling the session writes it with, the cached one, not the catalog's,
+    /// whose key changed case alone: the session's first commit lands instead of halting the
+    /// table (final review O-1). The commit is the session's, made here by hand: the fake stream
+    /// names a change's columns as PostgreSQL does, where MySQL's rows decode by position under
+    /// the cached schema.
+    #[tokio::test]
+    async fn a_dropped_sink_table_is_made_again_under_the_cached_spelling() {
+        let w = World::new(&["a"]);
+        let p = mode("mode: never");
+        run(&w, &p, async |status| streamed(&status, &w).await)
+            .await
+            .0
+            .unwrap();
+        w.source.fold_column_names();
+        w.source.alter(
+            &t("a"),
+            TableSchema::new(
+                t("a"),
+                vec![
+                    ColumnSchema::new("ID", V::Int64, "bigint").not_null(),
+                    ColumnSchema::new("doc", V::Text, "text"),
+                ],
+                vec!["ID".into()],
+            )
+            .unwrap(),
+        );
+        w.sink.drop_table(&t("a"));
+        let (mut core, _control, status) = w.core(&p, &[]);
+        start(&mut core, None).await.unwrap();
+        assert!(status.borrow().halted.is_empty());
+        let cached = w.docs.table_schema(&t("a")).await.unwrap().unwrap().doc;
+        assert_eq!(cached.identifier(), ["id"]);
+        assert_eq!(
+            cached,
+            schema("a").with_source_id(cached.source_id().unwrap())
+        );
+        let mut acc = accumulator(&["a"], 0x10_000);
+        txn(&mut acc, 1, 0x10_100, &[("a", 1, "x")]);
+        for cs in acc.flush().change_sets {
+            let marker = CommitMarker {
+                owner_epoch: core.owner_epoch,
+                committed_position: cs.position.end.clone(),
+                pipeline_id: core.settings.pipeline_id.clone(),
+            };
+            w.sink.commit(cs, marker).await.unwrap();
+        }
+        assert_eq!(w.ids("a"), [1]);
+        let made = w.sink.table_state(&t("a")).await.unwrap();
+        assert_eq!(made.identifier, ["id"], "the cached spelling");
     }
 
     /// Phase 0's rescan of the tables gone from the source's list warns once per failure streak:

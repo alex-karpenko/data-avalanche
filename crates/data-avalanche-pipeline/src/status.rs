@@ -110,6 +110,10 @@ pub struct WorkerStatus {
     pub read: Option<SourcePosition>,
     /// The durable checkpoint: what the source was last told it may release.
     pub checkpoint: Option<SourcePosition>,
+    /// The checkpoint the worker's first stream session started from. A durable checkpoint
+    /// past it is the run's progress: the controller halts a pipeline whose runs keep finding
+    /// another server without any (DA-SRC-34).
+    pub started_from: Option<SourcePosition>,
     /// The log the source keeps for the pipeline, read every heartbeat (PostgreSQL: the slot's
     /// retained WAL, `data_avalanche_wal_lag_bytes`).
     pub retained_bytes: Option<u64>,

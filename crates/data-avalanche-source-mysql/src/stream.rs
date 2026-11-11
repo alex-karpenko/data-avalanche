@@ -41,6 +41,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use data_avalanche_config::column_override;
 use data_avalanche_core::position::{
     BinlogFilePos, GtidSet, GtidSource, MariaGtid, MariaGtidState,
 };
@@ -733,9 +734,7 @@ impl MySqlConnector {
         let mut columns = Vec::with_capacity(schema.columns().len());
         for col in schema.columns() {
             let c = CatalogColumn::from_schema(col);
-            let over = tables
-                .column_type_overrides
-                .get(&format!("{key}.{}", col.name));
+            let over = column_override(tables, key, &col.name, true);
             let identifier = schema.is_identifier(&col.name);
             let p = plan_column(
                 &c,

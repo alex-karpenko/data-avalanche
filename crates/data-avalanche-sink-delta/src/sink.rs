@@ -334,6 +334,7 @@ impl Sink for DeltaSink {
                     exists: false,
                     schema: None,
                     marker: None,
+                    identifier: vec![],
                 });
             }
             let pipeline = &self.config.pipeline_id;
@@ -342,6 +343,7 @@ impl Sink for DeltaSink {
             Ok(SinkTableState {
                 exists: true,
                 schema: Some(h.schema()?),
+                identifier: h.identifier()?,
                 marker: epoch
                     .zip(position)
                     .map(|(owner_epoch, committed_position)| CommitMarker {
@@ -352,6 +354,63 @@ impl Sink for DeltaSink {
             })
         })
         .await
+    }
+
+    /// Lists `<schema>/<table>/` under the sink root, two levels, and keeps each table root that
+    /// holds a `_delta_log`. The co-located state directory isn't a schema; a segment the escape
+    /// can't have made isn't a table of the pipeline's.
+    async fn held_tables(&self) -> Result<Vec<TableRef>, SinkError> {
+        use deltalake::logstore::object_store::path::Path;
+        use futures_util::StreamExt;
+        let root = self.config.location.root_url()?;
+        if let Ok(dir) = root.to_file_path()
+            && !dir.exists()
+        {
+            return Ok(vec![]);
+        }
+        let store = deltalake::DeltaTableBuilder::from_url(root)
+            .and_then(|b| b.with_storage_options(self.options.clone()).build_storage())
+            .map_err(sink_error)?
+            .object_store(None);
+        let list = async |prefix: Option<&Path>| {
+            store
+                .list_with_delimiter(prefix)
+                .await
+                .map_err(|e| sink_error(e.into()))
+        };
+        let mut out = vec![];
+        for schema_dir in list(None).await?.common_prefixes {
+            let Some(segment) = schema_dir.filename() else {
+                continue;
+            };
+            if segment == data_avalanche_storage::COLOCATED_STATE_DIR {
+                continue;
+            }
+            let Some(schema) = data_avalanche_storage::unescape_table_segment(segment) else {
+                continue;
+            };
+            for table_dir in list(Some(&schema_dir)).await?.common_prefixes {
+                let Some(name) = table_dir
+                    .filename()
+                    .and_then(data_avalanche_storage::unescape_table_segment)
+                else {
+                    continue;
+                };
+                // One entry is enough, and one page: a log keeps every commit of its retention.
+                let log = table_dir.clone().join("_delta_log");
+                if store
+                    .list(Some(&log))
+                    .next()
+                    .await
+                    .transpose()
+                    .map_err(|e| sink_error(e.into()))?
+                    .is_some()
+                {
+                    out.push(TableRef::new(schema.clone(), name));
+                }
+            }
+        }
+        Ok(out)
     }
 
     async fn ensure_table(&self, spec: &TableSpec) -> Result<(), SinkError> {
@@ -488,6 +547,36 @@ mod tests {
         let mut guard = s.lock(&cs.table).await.unwrap();
         let h = guard.as_mut().unwrap();
         s.attempt(h, cs, &marker(epoch, cs), false).await.unwrap()
+    }
+
+    /// DA-SRC-32: the sink lists every table under its root, escaped names too, and not the
+    /// co-located state or a folder without a `_delta_log`; a table's state gives its key.
+    #[tokio::test]
+    async fn the_sink_lists_the_tables_it_holds() {
+        use data_avalanche_core::{ColumnSchema, ColumnValueType as V, TableSchema};
+        let dir = tempfile::tempdir().unwrap();
+        let s = sink(&dir);
+        assert!(s.held_tables().await.unwrap().is_empty(), "nothing yet");
+        s.ensure_table(&spec(&orders())).await.unwrap();
+        let odd = TableSchema::new(
+            TableRef::new("a/b", "50%"),
+            vec![ColumnSchema::new("k", V::Int64, "bigint").not_null()],
+            vec!["k".into()],
+        )
+        .unwrap();
+        s.ensure_table(&spec(&odd)).await.unwrap();
+        std::fs::create_dir_all(dir.path().join(".pipeline-state/tables")).unwrap();
+        std::fs::create_dir_all(dir.path().join("public/not_a_table")).unwrap();
+        let mut held = s.held_tables().await.unwrap();
+        held.sort();
+        let mut want = vec![
+            TableRef::new("public", "orders"),
+            TableRef::new("a/b", "50%"),
+        ];
+        want.sort();
+        assert_eq!(held, want);
+        let state = s.table_state(&TableRef::new("a/b", "50%")).await.unwrap();
+        assert_eq!(state.identifier, ["k"]);
     }
 
     #[tokio::test]

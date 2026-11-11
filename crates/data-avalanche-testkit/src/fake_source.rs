@@ -260,14 +260,23 @@ struct Db {
     server: Option<ServerIdentity>,
     /// [`FakeSource::halt_on_source_change`].
     source_change_halts: bool,
+    /// [`FakeSource::promote_following`]: the slot followed the last server change.
+    followed: bool,
+    /// Set by `prepare_marked` for the `prepare` it calls: the stream continues on this server.
+    continuing: bool,
     reads: BTreeMap<TableRef, usize>,
     rescans: usize,
+    rescan_warnings: Vec<String>,
     in_flights: usize,
     readers_ended: usize,
     reconfigures: usize,
     teardowns: usize,
     fetches: BTreeMap<TableRef, usize>,
     prepares: Vec<Option<Checkpoint>>,
+    /// What each `prepare_marked` was told the lake's highest marker is.
+    marks: Vec<Option<SourcePosition>>,
+    /// Column names compare without case, as MySQL's do (DA-SRC-25).
+    fold: bool,
 }
 
 /// The scripted source. Cloning shares the database.
@@ -318,14 +327,19 @@ impl FakeSource {
             opened: vec![],
             server: None,
             source_change_halts: false,
+            followed: false,
+            continuing: false,
             reads: BTreeMap::new(),
             rescans: 0,
+            rescan_warnings: Vec::new(),
             in_flights: 0,
             readers_ended: 0,
             reconfigures: 0,
             teardowns: 0,
             fetches: BTreeMap::new(),
             prepares: vec![],
+            marks: vec![],
+            fold: false,
         };
         for t in tables {
             db.create(t);
@@ -422,6 +436,12 @@ impl FakeSource {
         self.wake.notify_waiters();
     }
 
+    /// Column names compare without case from now on, as MySQL's do
+    /// ([`SourceConnector::column_names_fold`]).
+    pub fn fold_column_names(&self) {
+        self.db().fold = true;
+    }
+
     /// Changes `table`'s schema in the catalog. Stored rows lose dropped columns and read NULL in
     /// added ones. Keeps the source id.
     pub fn alter(&self, table: &TableRef, schema: TableSchema) {
@@ -475,6 +495,16 @@ impl FakeSource {
         db.wal_end = wal_end;
         db.slot = None;
         db.server = Some(server);
+        db.followed = false;
+    }
+
+    /// A promotion the pipeline's slot followed (DA-SRC-33): `server` answers from now on, with
+    /// the WAL and the slot as they were. A start told a marker the slot has confirmed
+    /// ([`SourceConnector::prepare_marked`]) resumes there, as the PostgreSQL source does.
+    pub fn promote_following(&self, server: ServerIdentity) {
+        let mut db = self.db();
+        db.server = Some(server);
+        db.followed = true;
     }
 
     /// From now on a source change halts, as `source_change_action: error` does
@@ -544,6 +574,11 @@ impl FakeSource {
         }
     }
 
+    /// The warnings every `rescan` reports (a source's note beside its halts).
+    pub fn set_rescan_warnings(&self, warnings: Vec<String>) {
+        self.db().rescan_warnings = warnings;
+    }
+
     /// Runs `f` once, inside the next `rescan`, after it has read the catalog: a change made
     /// between a rescan and the position read after it.
     pub fn after_next_rescan(&self, f: impl FnOnce(&FakeSource) + Send + 'static) {
@@ -596,6 +631,11 @@ impl FakeSource {
         self.db().opened.clone()
     }
 
+    /// What each start's `prepare_marked` was told the lake's highest marker is (DA-SRC-33).
+    pub fn marks(&self) -> Vec<Option<SourcePosition>> {
+        self.db().marks.clone()
+    }
+
     /// The checkpoint's position each `prepare` was called with.
     pub fn prepares(&self) -> Vec<Option<SourcePosition>> {
         self.db()
@@ -619,7 +659,9 @@ impl FakeSource {
     /// [`Self::halt_on_source_change`]. A MySQL server is a GTID-mode one: its checkpoints are
     /// carried across servers.
     pub fn set_server(&self, server: Option<ServerIdentity>) {
-        self.db().server = server;
+        let mut db = self.db();
+        db.server = server;
+        db.followed = false;
     }
 
     /// Chunk reads of `table` so far.
@@ -685,7 +727,9 @@ impl FakeSource {
 impl Db {
     /// The PostgreSQL source's server check (DA-SRC-20) of a checkpoint `at`, read on another
     /// server: a halt after [`FakeSource::halt_on_source_change`]; otherwise at a start
-    /// (`at_start`) `Ok(true)`, a source-change start, and at a reconnect `SourceChanged`.
+    /// (`at_start`) `Ok(true)`, a source-change start, and at a reconnect `SourceChanged`. A
+    /// reconnect to a later timeline of the checkpoint's system (a promoted standby) is
+    /// `SourceChanged` either way: the start decides whether the stream continues (DA-SRC-33).
     fn source_change(&self, at: &Checkpoint, at_start: bool) -> Result<bool, SourceError> {
         let (Some(was @ ServerIdentity::Postgres { .. }), Some(now)) = (&at.server, &self.server)
         else {
@@ -693,6 +737,25 @@ impl Db {
         };
         if was == now {
             return Ok(false);
+        }
+        if let (
+            ServerIdentity::Postgres {
+                system_identifier: a,
+                timeline: t,
+            },
+            ServerIdentity::Postgres {
+                system_identifier: b,
+                timeline: u,
+            },
+        ) = (was, now)
+            && !at_start
+            && a == b
+            && u > t
+        {
+            return Err(SourceError::SourceChanged(format!(
+                "the checkpoint {} was read on {was}, and the stream's reconnect reaches {now}, a promoted server of the same system",
+                at.position
+            )));
         }
         let why = format!(
             "WAL_SOURCE_CHANGED: the checkpoint {} was read on {was}, and the pipeline now reads {now}",
@@ -884,10 +947,16 @@ impl Db {
 }
 
 /// What `augment` and `rescan` compare: columns by name, with their types.
-fn shape(columns: &[ColumnSchema]) -> Vec<(String, data_avalanche_core::ColumnValueType)> {
+fn shape(
+    columns: &[ColumnSchema],
+    fold: bool,
+) -> Vec<(String, data_avalanche_core::ColumnValueType)> {
     columns
         .iter()
-        .map(|c| (c.name.clone(), c.value_type.clone()))
+        .map(|c| match fold {
+            true => (c.name.to_lowercase(), c.value_type.clone()),
+            false => (c.name.clone(), c.value_type.clone()),
+        })
         .collect()
 }
 
@@ -975,12 +1044,37 @@ fn diff(cached: &TableSchema, now: &TableSchema) -> Vec<SchemaChange> {
 
 #[async_trait]
 impl SourceConnector for FakeSource {
+    fn column_names_fold(&self) -> bool {
+        self.db().fold
+    }
+
     async fn preflight(&self) -> Result<Preflight, SourceError> {
         self.take_fault(Method::Preflight)?;
         Ok(Preflight {
             server_version: "fake".into(),
             warnings: vec![],
+            server: self.db().server.clone(),
         })
+    }
+
+    async fn prepare_marked(
+        &self,
+        checkpoint: Option<&Checkpoint>,
+        tables: &[TableRef],
+        marked: Option<&SourcePosition>,
+    ) -> Result<Prepared, SourceError> {
+        {
+            let mut db = self.db();
+            db.marks.push(marked.cloned());
+            // As `continues` decides: the slot confirmed exactly the checkpoint, and no marker
+            // is past it.
+            db.continuing = db.followed
+                && checkpoint.is_some_and(|c| {
+                    let at = lsn(&c.position);
+                    db.slot == Some(at) && marked.is_some_and(|m| lsn(m) <= at)
+                });
+        }
+        self.prepare(checkpoint, tables).await
     }
 
     async fn resolve_tables(&self) -> Result<ResolvedTables, SourceError> {
@@ -1019,7 +1113,9 @@ impl SourceConnector for FakeSource {
         let mut db = self.db();
         db.prepares.push(checkpoint.cloned());
         let server = db.server.clone();
+        let continuing = std::mem::take(&mut db.continuing);
         let changed = match checkpoint {
+            Some(_) if continuing => false,
             Some(c) => db.source_change(c, true)?,
             None => false,
         };
@@ -1139,7 +1235,7 @@ impl SourceConnector for FakeSource {
                     reason: HaltReason::TableDropped,
                 });
             };
-            if shape(now.columns()) != shape(table.columns()) {
+            if shape(now.columns(), false) != shape(table.columns(), false) {
                 return Err(SourceError::Transient(format!(
                     "{} changed under the snapshot",
                     table.table()
@@ -1211,7 +1307,7 @@ impl SourceConnector for FakeSource {
             pending: VecDeque::new(),
             known: tables
                 .iter()
-                .map(|t| (t.table().clone(), shape(t.columns())))
+                .map(|t| (t.table().clone(), shape(t.columns(), false)))
                 .collect(),
         }))
     }
@@ -1262,14 +1358,18 @@ impl SourceConnector for FakeSource {
         self.db().rescans += 1;
         self.take_fault(Method::Rescan)?;
         let mut db = self.db();
-        let mut report = RescanReport::default();
+        let mut report = RescanReport {
+            warnings: db.rescan_warnings.clone(),
+            ..Default::default()
+        };
         for k in known {
             match db.catalog.get(k.table()) {
                 Some(now) if now.source_id() != k.source_id() && k.source_id().is_some() => {
                     report.dropped.push(k.table().clone())
                 }
                 None => report.dropped.push(k.table().clone()),
-                Some(now) if shape(now.columns()) != shape(k.columns()) => {
+                // Where names fold, a change of case alone is none (DA-SRC-25).
+                Some(now) if shape(now.columns(), db.fold) != shape(k.columns(), db.fold) => {
                     report.changed.push(now.clone())
                 }
                 Some(_) => {}
@@ -1331,7 +1431,7 @@ impl FakeStream {
                                 let Some(known) = self.known.get_mut(&event.table) else {
                                     continue;
                                 };
-                                let now = shape(columns);
+                                let now = shape(columns, false);
                                 if *known != now {
                                     *known = now;
                                     self.pending.push_back(StreamItem::SchemaSignal {

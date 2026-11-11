@@ -97,8 +97,8 @@ pub use diff::{
     ConfigDiff, FIXED_FIELDS, FieldChange, Fingerprints, PipelineChange, diff, diff_with,
 };
 pub use external::{
-    ClusterAnchor, check_cluster_anchor, check_partitioning, check_table_set,
-    check_unbounded_numeric, glob_match, key_table,
+    ClusterAnchor, check_cluster_anchor, check_column_keys, check_partitioning, check_table_set,
+    check_unbounded_numeric, column_override, glob_match, key_table,
 };
 pub use field_docs::{DocDefault, FIELD_DOCS, FieldDoc};
 pub use keys::{Key, KeyShape, config_keys, key_mutability};

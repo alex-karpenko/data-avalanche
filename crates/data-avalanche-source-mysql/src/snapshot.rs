@@ -18,6 +18,7 @@
 //! window rule (Data-Flow, snapshot step c).
 
 use chrono::{Datelike, Timelike};
+use data_avalanche_config::column_override;
 use data_avalanche_core::{
     Chunk, ColumnValue, HaltReason, KeysetCursor, Row, SourceError, TableRef, TableSchema,
     identifier_values,
@@ -84,7 +85,9 @@ async fn read_plan(
         let catalog = d
             .columns
             .iter()
-            .find(|x| x.name == col.name)
+            // Without case, as MySQL compares column names: the cached spelling stays when the
+            // catalog's changed case alone (DA-SRC-25).
+            .find(|x| x.name.to_lowercase() == col.name.to_lowercase())
             .ok_or_else(|| changed(schema, format!("column {} is gone", col.name)))?;
         let identifier = schema.is_identifier(&col.name);
         if identifier && catalog.nullable {
@@ -96,9 +99,7 @@ async fn read_plan(
                 },
             ));
         }
-        let over = tables
-            .column_type_overrides
-            .get(&format!("{key}.{}", col.name));
+        let over = column_override(tables, key, &col.name, true);
         let p = plan_column(
             catalog,
             c.tinyint1_as_bool(),
@@ -129,7 +130,12 @@ async fn read_plan(
             ));
         }
         out.push(ReadColumn {
-            catalog: catalog.clone(),
+            // Under the cached name, which the rows, the cursor and the identifier use; the
+            // SELECT still finds the column, as MySQL's names compare without case.
+            catalog: CatalogColumn {
+                name: col.name.clone(),
+                ..catalog.clone()
+            },
             decode: p.decode,
             identifier,
         });

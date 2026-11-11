@@ -26,6 +26,6 @@ mod store;
 pub use backend::{Backend, BucketSpec, OpenError, Timeouts, open_bucket};
 pub use paths::{
     COLOCATED_STATE_DIR, Location, colocated_state, escape_segment, escape_table_segment,
-    explicit_state, globals_state, join, table_root,
+    explicit_state, globals_state, join, table_root, unescape_table_segment,
 };
 pub use store::{ObjectStoreVersioned, ObjectVersion, StoreError, VersionedStore};

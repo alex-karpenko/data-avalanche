@@ -12,6 +12,7 @@ on `PATH`; it fetches DuckDB itself.
 | postgres-14…17 | postgres:14…17 | 55414…55417 | same | matrix |
 | postgres-tls | postgres:18, TLS required (`postgres-tls.sh`) | 55419 | avalanche / avalanche; `avalanche_cert` by client certificate | default |
 | postgres-primary, postgres-replica | postgres:18, a primary and its streaming standby (`postgres-primary.sh`, `postgres-replica.sh`), on tmpfs | 55420, 55421 | avalanche / avalanche | replica |
+| postgres-sync-primary, postgres-sync-replica | postgres:18, a primary and a standby that synchronizes its failover slots (`synchronized_standby_slots`, `sync_replication_slots`), on tmpfs | 55422, 55423 | avalanche / avalanche | replica |
 | mysql-84 | mysql:8.4 (GTID on) | 53384 | root / avalanche, db `avalanche` | default |
 | mysql-84-nogtid | mysql:8.4 (GTID off: `replication_type: binlog`; TLS off) | 53385 | same | default |
 | mysql-tls | mysql:8.4 (GTID on), TLS required (`mysql-tls.sh`) | 53386 | root / avalanche; `avalanche_cert` / `unused` with its client certificate | default |
@@ -122,9 +123,19 @@ one run: recreate both before the next (the scenario fails with this hint when t
 in recovery). CI's integration job starts the pair fresh and sets `DATA_AVALANCHE_PG_REPLICA`, so
 it runs the scenario.
 
+The failover-slot scenario (M12d, DA-SRC-33) runs on the second pair: the pipeline's slot is a
+failover slot (PostgreSQL 17+), which `postgres-sync-replica` synchronizes through the physical
+slot `standby_sync`. The pipeline reads the primary through one address (a proxy in the test).
+Once the standby holds the slot, the address is cut off, the standby promoted and the address
+moved to it, the pipeline running all along: its reconnect reruns the start, and the stream
+continues on the new timeline, without a halt or a re-snapshot. This pair also serves one run;
+`DATA_AVALANCHE_PG_SYNC_REPLICA` names it.
+
 ```sh
-docker compose -f test-infra/compose.yaml --profile replica up -d --wait --force-recreate postgres-primary postgres-replica
+docker compose -f test-infra/compose.yaml --profile replica up -d --wait --force-recreate \
+  postgres-primary postgres-replica postgres-sync-primary postgres-sync-replica
 DATA_AVALANCHE_IT=1 DATA_AVALANCHE_SKIP_GCS=1 DATA_AVALANCHE_PG_REPLICA=55420:55421 \
+  DATA_AVALANCHE_PG_SYNC_REPLICA=55422:55423 \
   cargo test -p data-avalanche --features e2e-hooks --test e2e -- failover:: --test-threads=1
 ```
 

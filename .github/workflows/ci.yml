@@ -122,13 +122,15 @@ jobs:
           for target in mysql-84-nogtid mariadb-118 mariadb-118-binlog; do
             DATA_AVALANCHE_MYSQL=$target cargo test --locked -p data-avalanche-source-mysql --tests
           done
-      # The PostgreSQL failover scenario's primary and standby (profile replica, M12a).
-      - name: Start the replica pair
-        run: docker compose -f test-infra/compose.yaml --profile replica up -d --wait postgres-primary postgres-replica
+      # The PostgreSQL failover scenarios' primaries and standbys (profile replica): M12a's pair,
+      # and M12d's, whose standby synchronizes the failover slots (DA-SRC-33).
+      - name: Start the replica pairs
+        run: docker compose -f test-infra/compose.yaml --profile replica up -d --wait postgres-primary postgres-replica postgres-sync-primary postgres-sync-replica
       # The slice-1 E2E suite (roadmap §5.3): the binary as a process, built with its crash points.
       - name: Slice-1 E2E
         env:
           DATA_AVALANCHE_PG_REPLICA: "55420:55421"
+          DATA_AVALANCHE_PG_SYNC_REPLICA: "55422:55423"
         run: cargo test --locked -p data-avalanche --features e2e-hooks --test e2e -- --test-threads=1
       - name: Container logs on failure
         if: failure()

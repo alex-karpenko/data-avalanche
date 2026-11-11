@@ -33,6 +33,12 @@ To make the lake an exact copy, add `"truncate": true`: each of the job's tables
 lake before its copy starts, so rows deleted at the source while the table wasn't streamed go.
 Until the job completes, those tables are empty or partly copied: readers see that. A job
 interrupted by a crash after the truncate goes on copying; it doesn't empty the table again.
+A table whose Delta table is keyed otherwise than the pipeline's (other columns, or the same
+spelled otherwise) isn't emptied: it fails in the job with `SINK_REJECTED`, its rows kept. A table
+the config replicates also halts (see [A halted table](/data-avalanche/runbooks/halted-table/)); for
+a table the config doesn't replicate, the reason shows only as that table's `error` in the job
+(`GET /v1/snapshots/{job_id}`, below), not in the pipeline's halted tables. Either way, drop or
+move the Delta table, then ask the job again.
 
 ## Follow it
 

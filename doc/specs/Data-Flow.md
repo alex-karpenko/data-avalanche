@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-04
+updated: 2026-11-11
 domain: Architecture
 tags: [architecture, data-flow, pipeline, cdc, iceberg, delta-lake, multi-sink, arrow, snapshot, replication]
 sources: []
@@ -201,6 +201,12 @@ identifier, so a failover to it shows as a new timeline; its slots stay behind u
 Start with a checkpoint
 ├─► no identity recorded (a checkpoint from before it was) → take the connected server's
 ├─► the same system and timeline → the slot checks below, as before
+├─► the same system on a later timeline, the slot here a failover slot synced from the old
+│     primary, streaming, confirmed exactly at the checkpoint, with no lake marker past it →
+│     continue the stream there (either action, a warning); the checkpoint records the new
+│     server (DA-SRC-33). A running pipeline's reconnect to such a server reruns this start
+│     (Source Disconnect), so a promotion is continued whether the pipeline was running or
+│     stopped
 └─► another system or timeline → source.postgres.source_change_action:
     ├─► error (default): halt the PIPELINE, WAL_SOURCE_CHANGED: "the checkpoint <lsn> was
     │     read on <old>, and the pipeline now reads <new>"
@@ -337,7 +343,9 @@ Connect
 │   └─► COM_BINLOG_DUMP at <file>:<pos>; the dump's connection checks the same (identity,
 │         file, boundary) first, so a reconnect to another server is caught: under error it
 │         halts as above; under re_snapshot the pipeline reruns Phase 0, which plans the
-│         recovery
+│         recovery. Three Phase 0 reruns in a row for a server change, none with a durable
+│         checkpoint past its start, halt the pipeline with the change's code, naming the
+│         alternation: the address reaches more than one server (DA-SRC-34)
 └─► Event loop as above (GTID events ignored); the position after each XID_EVENT is
     (current file, end_log_pos); ROTATE_EVENT switches the file
 ```
@@ -539,8 +547,9 @@ and the flush's per-table position. A **reposition** change set (`reposition` se
 either, and its commit stores its own position instead of the union: after a source change
 (another PostgreSQL system or timeline, another MySQL server in file/position mode) the new
 server's positions may sort below the stored markers, and the union would skip its changes.
-A recovery from a changed source commits one per table the pipeline resolves at that start or has a
-cached schema for, fenced like any commit, before the checkpoint naming the new server is saved and the stream starts. The pipeline **resume checkpoint** persisted to state storage is the
+A recovery from a changed source commits one per table the sink holds, and per table the pipeline
+resolves or has a cached schema for, under the key the table was made with; a table whose
+reposition the sink refuses for good halts `SINK_REJECTED` (DA-SRC-32). Each is fenced like any commit, before the checkpoint naming the new server is saved and the stream starts. The pipeline **resume checkpoint** persisted to state storage is the
 **laggard** across all tracked tables (PG `min` / MySQL set-intersection); tables ahead skip via the
 guard or are absorbed by idempotency. The epoch rejects a zombie writer; the position skips done work.
 See `research/Delivery_Guarantee_and_Position_Guard.md` (G-14).
@@ -792,9 +801,15 @@ Replication stream error / TCP timeout
     ─ idempotent sink commits (+ Phase 4 position guard) absorb previously flushed events
     ─ file/position mode: a reconnect that reaches another server (Phase 2b) halts under
       binlog_purge_action: error, and reruns Phase 0 under re_snapshot
-    ─ PostgreSQL: a reconnect that reaches another system or timeline (Phase 2a) halts under
-      source_change_action: error, and reruns Phase 0 under re_snapshot, before a lost slot is
-      dropped or made again there
+    ─ PostgreSQL: a reconnect that reaches another system, or an earlier timeline of the same
+      one (Phase 2a), halts under source_change_action: error, and reruns Phase 0 under
+      re_snapshot, before a lost slot is dropped or made again there; a reconnect to the same
+      system on a later timeline reruns Phase 0 under either action: the start continues the
+      stream there if the slot followed (DA-SRC-33), else halts (or recovers) as
+      source_change_action says
+    ─ Any source: three Phase 0 reruns in a row for a server change, none with a durable
+      checkpoint past its start, halt the pipeline, naming the alternation: the address reaches
+      more than one server (DA-SRC-34)
 ```
 
 ### Sink Commit Failure

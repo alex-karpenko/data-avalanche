@@ -5,8 +5,10 @@
 //! classifier couldn't read the statement, the whole catalog table is the change, and a rename
 //! reads as a drop and an add (§6, degraded with a warning by the evolver).
 //!
-//! Column names compare without case, as MySQL's do; a result keeps the catalog's spelling, and
-//! a change of case alone (`CHANGE a A`) is a rename.
+//! Column names compare without case, as MySQL's do. A column keeps the spelling the pipeline
+//! first cached: the sink's column has it, and a change of case alone (`CHANGE a A`, `RENAME
+//! COLUMN a TO A`) is the same column to MySQL, noted and nothing more ([`keep_names`],
+//! DA-SRC-25). A new column takes the catalog's spelling.
 //!
 //! The catalog may be ahead of the stream (§0): a scoped change takes only its columns from it.
 //! The stream checks every table map against the schema, so a change taken early (a later DDL's
@@ -19,7 +21,7 @@ use data_avalanche_core::{
     TableRef, TableSchema,
 };
 
-use crate::catalog::plan_table;
+use crate::catalog::{hidden_note, plan_table};
 use crate::connector::MySqlConnector;
 use crate::ddl::{Renamed, Scope, classify, renamed};
 use crate::server::Fold;
@@ -173,7 +175,19 @@ pub fn scope(
     for (i, c) in columns.iter_mut().enumerate() {
         c.source_ordinal = Some(i as i32 + 1);
     }
-    TableSchema::new(cached.table().clone(), columns, now.identifier().to_vec())
+    // The identifier is `now`'s, spelled as the schema's column spells it (a key column the
+    // statement doesn't name may be cased differently in the catalog, DA-SRC-25).
+    let identifier = now
+        .identifier()
+        .iter()
+        .map(|k| column_in(&columns, k).map_or_else(|| k.clone(), |c| c.name.clone()))
+        .collect();
+    TableSchema::new(cached.table().clone(), columns, identifier)
+}
+
+/// The column of `columns` named `name`, without case.
+fn column_in<'a>(columns: &'a [ColumnSchema], name: &str) -> Option<&'a ColumnSchema> {
+    columns.iter().find(|c| same(&c.name, name))
 }
 
 /// The ENUM or SET change between two column types of the same column, if both are one.
@@ -189,33 +203,96 @@ fn members_change(column: &str, from: &CatalogColumn, to: &CatalogColumn) -> Opt
     })
 }
 
+/// The name a cached column `name` has after the proven `renames`.
+fn target<'a>(renames: &'a [(String, String)], name: &'a str) -> &'a str {
+    renames
+        .iter()
+        .find(|(o, _)| same(o, name))
+        .map_or(name, |(_, n)| n.as_str())
+}
+
+/// `DROP b, CHANGE a b`: the old `b` goes before `a` takes its name.
+fn taken(renames: &[(String, String)], n: &str) -> bool {
+    !renames.iter().any(|(o, _)| same(o, n)) && renames.iter().any(|(_, r)| same(r, n))
+}
+
+/// Each column of `cached` that stays, with the column of `new` it is: matched by the proven
+/// `renames`, then by name without case. A taken or a gone column is left out.
+fn matched<'a>(
+    cached: &'a TableSchema,
+    new: &'a TableSchema,
+    renames: &'a [(String, String)],
+) -> impl Iterator<Item = (&'a ColumnSchema, &'a ColumnSchema)> {
+    cached
+        .columns()
+        .iter()
+        .filter(|c| !taken(renames, &c.name))
+        .filter_map(|c| column(new, target(renames, &c.name)).map(|n| (c, n)))
+}
+
+/// `new` with each column whose name differs from its cached column's by case alone named as
+/// `cached` names it, in the identifier too: to MySQL it is the same column, which the sink holds
+/// under the cached spelling (DA-SRC-25). The columns are matched as [`diff`] matches them, so a
+/// column renamed onto a dropped one's name (`DROP b, CHANGE a B`) keeps its new name.
+pub fn keep_names(
+    cached: &TableSchema,
+    new: &TableSchema,
+    renames: &[(String, String)],
+) -> Result<TableSchema, HaltReason> {
+    let kept: BTreeMap<&str, &str> = matched(cached, new, renames)
+        .filter(|(c, n)| c.name != n.name && same(&c.name, &n.name))
+        .map(|(c, n)| (n.name.as_str(), c.name.as_str()))
+        .collect();
+    if kept.is_empty() {
+        return Ok(new.clone());
+    }
+    let name = |n: &str| {
+        kept.get(n)
+            .map_or_else(|| n.to_owned(), |c| (*c).to_owned())
+    };
+    let columns = new
+        .columns()
+        .iter()
+        .map(|c| ColumnSchema {
+            name: name(&c.name),
+            ..c.clone()
+        })
+        .collect();
+    let identifier = new.identifier().iter().map(|k| name(k)).collect();
+    let schema = TableSchema::new(new.table().clone(), columns, identifier)?;
+    Ok(match new.source_id() {
+        Some(id) => schema.with_source_id(id),
+        None => schema,
+    })
+}
+
 /// `cached` → `new` as changes, columns matched by name (without case) and by the proven
-/// `renames`. A column whose name changed only its case is renamed.
+/// `renames`. A column whose name changed only its case is the same column: noted
+/// (`NoTargetEffect`), and its other changes named as `cached` names it ([`keep_names`]).
 pub fn diff(
     cached: &TableSchema,
     new: &TableSchema,
     renames: &[(String, String)],
 ) -> Vec<SchemaChange> {
     let mut changes = vec![];
-    fn target<'a>(renames: &'a [(String, String)], name: &'a str) -> &'a str {
-        renames
-            .iter()
-            .find(|(o, _)| same(o, name))
-            .map_or(name, |(_, n)| n.as_str())
-    }
-    // `DROP b, CHANGE a b`: the old `b` goes before `a` takes its name.
-    let taken = |n: &str| {
-        !renames.iter().any(|(o, _)| same(o, n)) && renames.iter().any(|(_, r)| same(r, n))
-    };
-    for c in cached.columns().iter().filter(|c| taken(&c.name)) {
+    for c in cached.columns().iter().filter(|c| taken(renames, &c.name)) {
         changes.push(SchemaChange::DropColumn(c.name.clone()));
     }
-    for c in cached.columns().iter().filter(|c| !taken(&c.name)) {
+    for c in cached.columns().iter().filter(|c| !taken(renames, &c.name)) {
         let Some(n) = column(new, target(renames, &c.name)) else {
             changes.push(SchemaChange::DropColumn(c.name.clone()));
             continue;
         };
-        let to = n.name.as_str();
+        let to = match n.name == c.name || !same(&n.name, &c.name) {
+            true => n.name.as_str(),
+            false => {
+                changes.push(SchemaChange::NoTargetEffect(format!(
+                    "column {:?} is now spelled {:?}: the same column to MySQL, kept as {:?}",
+                    c.name, n.name, c.name
+                )));
+                c.name.as_str()
+            }
+        };
         if to != c.name {
             changes.push(SchemaChange::RenameColumn {
                 from: c.name.clone(),
@@ -333,6 +410,7 @@ impl MySqlConnector {
         };
         let new = scope(cached, &columns, &renames, &now).map_err(halt)?;
         let changes = diff(cached, &new, &renames);
+        let new = keep_names(cached, &new, &renames).map_err(halt)?;
         Ok((SchemaDelta { table, changes }, Some(new)))
     }
 
@@ -346,10 +424,20 @@ impl MySqlConnector {
         for k in known {
             let t = k.table();
             match now.remove(&t.name) {
-                None => report.dropped.push(t.clone()),
+                None => {
+                    // The server may hide a table the user lost SELECT on (DA-SRC-36).
+                    if self.hidden(t).await {
+                        report.warnings.push(hidden_note(t));
+                    }
+                    report.dropped.push(t.clone());
+                }
                 Some(Err(reason)) => report.halted.push((t.clone(), reason)),
-                Some(Ok(s)) if s != *k => report.changed.push(s),
-                Some(Ok(_)) => {}
+                // A change of case alone isn't one (DA-SRC-25).
+                Some(Ok(s)) => match keep_names(k, &s, &[]) {
+                    Ok(s) if s != *k => report.changed.push(s),
+                    Ok(_) => {}
+                    Err(reason) => report.halted.push((t.clone(), reason)),
+                },
             }
         }
         Ok(report)
@@ -625,21 +713,37 @@ mod tests {
             diff(&cached, &s, &[]).as_slice(),
             [SchemaChange::ChangeType { column, .. }] if column == "price"
         ));
-        // `CHANGE a A INT`: a change of case alone stays a rename.
+        // `CHANGE a A BIGINT`: a change of case alone is the same column (DA-SRC-25): noted, its
+        // type change named as cached, and the schema keeps the cached spelling.
         let now = table(vec![
             col("price", V::Int32, "int", 2),
-            col("A", V::Int32, "int", 3),
+            col("A", V::Int64, "bigint", 3),
         ]);
         let renames = [("a".to_owned(), "A".to_owned())];
         let s = scope(&cached, &cols(&["a", "A"]), &renames, &now).unwrap();
         assert_eq!(names(&s), ["id", "price", "A"]);
+        let changes = diff(&cached, &s, &renames);
+        assert!(
+            matches!(changes.as_slice(), [
+                SchemaChange::NoTargetEffect(note),
+                SchemaChange::ChangeType { column, .. },
+            ] if note.contains("\"A\"") && column == "a"),
+            "{changes:?}"
+        );
         assert_eq!(
-            diff(&cached, &s, &renames),
-            [SchemaChange::RenameColumn {
-                from: "a".into(),
-                to: "A".into(),
-                proven: true
-            }]
+            names(&keep_names(&cached, &s, &renames).unwrap()),
+            ["id", "price", "a"]
+        );
+        // Without the statement (a rescan, a baseline) too.
+        let s = scope(&cached, &Scope::Table, &[], &now).unwrap();
+        assert!(
+            !diff(&cached, &s, &[])
+                .iter()
+                .any(|c| matches!(c, SchemaChange::RenameColumn { .. }))
+        );
+        assert_eq!(
+            names(&keep_names(&cached, &s, &[]).unwrap()),
+            ["id", "price", "a"]
         );
         // A statement's spelling of a renamed column finds it too.
         let renames = [("PRICE".to_owned(), "cost".to_owned())];
@@ -649,6 +753,56 @@ mod tests {
         ]);
         let s = scope(&cached, &cols(&["PRICE", "cost"]), &renames, &now).unwrap();
         assert_eq!(names(&s), ["id", "cost", "a"]);
+    }
+
+    /// `DROP b, CHANGE a B`: `a` is renamed onto the dropped column's name; it keeps its new
+    /// spelling and doesn't take the dropped column's (M12a's withdrawn `keep_names`).
+    #[test]
+    fn a_rename_onto_a_dropped_name_keeps_its_new_spelling() {
+        let cached = table(vec![
+            col("a", V::Int32, "int", 2),
+            col("b", V::Int32, "int", 3),
+        ]);
+        let now = table(vec![col("B", V::Int32, "int", 2)]);
+        let renames = [("a".to_owned(), "B".to_owned())];
+        let s = scope(&cached, &cols(&["b", "a", "B"]), &renames, &now).unwrap();
+        assert_eq!(
+            names(&keep_names(&cached, &s, &renames).unwrap()),
+            ["id", "B"]
+        );
+        assert_eq!(
+            diff(&cached, &s, &renames),
+            [
+                SchemaChange::DropColumn("b".into()),
+                SchemaChange::RenameColumn {
+                    from: "a".into(),
+                    to: "B".into(),
+                    proven: true
+                }
+            ]
+        );
+    }
+
+    /// The identifier is renamed with its column.
+    #[test]
+    fn a_key_column_keeps_its_cached_spelling() {
+        let cached = table(vec![col("v", V::Int32, "int", 2)]);
+        let now = TableSchema::new(
+            cached.table().clone(),
+            vec![
+                col("ID", V::Int32, "int", 1).not_null(),
+                col("v", V::Int32, "int", 2),
+            ],
+            vec!["ID".into()],
+        )
+        .unwrap();
+        let kept = keep_names(&cached, &now, &[]).unwrap();
+        assert_eq!(kept.identifier(), ["id"]);
+        assert!(
+            diff(&cached, &now, &[])
+                .iter()
+                .all(|c| matches!(c, SchemaChange::NoTargetEffect(_)))
+        );
     }
 
     #[test]

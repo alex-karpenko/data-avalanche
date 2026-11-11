@@ -78,6 +78,10 @@ pub struct Preflight {
     /// The server's version string, for status and logs.
     pub server_version: String,
     pub warnings: Vec<String>,
+    /// The server the preflight reached, as a checkpoint records it: a start compares it with
+    /// the checkpoint's to tell [`SourceConnector::prepare_marked`] the lake's highest marker
+    /// (DA-SRC-33). `None` for a source that doesn't continue across a server change.
+    pub server: Option<ServerIdentity>,
 }
 
 /// The tracked table set at start (channel A): the configured include/exclude globs resolved
@@ -345,6 +349,9 @@ pub struct RetainedLog {
 pub struct RescanReport {
     /// Tables gone from the source catalog: each halts with `TABLE_DROPPED`.
     pub dropped: Vec<TableRef>,
+    /// What the status should say beside the halts: a dropped table that may only be hidden
+    /// from the pipeline's user (MySQL, DA-SRC-36).
+    pub warnings: Vec<String>,
     /// Tables whose catalog schema differs from the known one: the current schemas. The stream's
     /// signals apply changes in order; the pipeline applies one of these only once the stream has
     /// passed the position after the rescan and no signal did it (an idle table).
@@ -357,6 +364,13 @@ pub struct RescanReport {
 /// [`Self::open_stream`].
 #[async_trait]
 pub trait SourceConnector: Send + Sync {
+    /// Whether the source compares column names without case (MySQL: `note` and `Note` are one
+    /// column), so a cached schema and the catalog's may spell a column differently and still
+    /// agree (DA-SRC-25). PostgreSQL's names are case-sensitive.
+    fn column_names_fold(&self) -> bool {
+        false
+    }
+
     /// The pipeline-level start checks (config §11.2).
     async fn preflight(&self) -> Result<Preflight, SourceError>;
 
@@ -379,6 +393,21 @@ pub trait SourceConnector: Send + Sync {
         checkpoint: Option<&Checkpoint>,
         tables: &[TableRef],
     ) -> Result<Prepared, SourceError>;
+
+    /// [`Self::prepare`], told `marked`: the highest position the lake's markers name, at least
+    /// the checkpoint's, read when the preflight found another server than the checkpoint's. A
+    /// source that can keep its stream across a server change (PostgreSQL's synchronized failover
+    /// slot, DA-SRC-33) does only when the new server's position covers it: otherwise a marker
+    /// could cover a change the new server makes. `None`: not read, so no such continuation.
+    async fn prepare_marked(
+        &self,
+        checkpoint: Option<&Checkpoint>,
+        tables: &[TableRef],
+        marked: Option<&SourcePosition>,
+    ) -> Result<Prepared, SourceError> {
+        let _ = marked;
+        self.prepare(checkpoint, tables).await
+    }
 
     /// Replaces a lost stream position after [`SourceError::PositionUnreachable`] (D-15.3): the
     /// new consistent position to snapshot from and stream after, with the server it was read

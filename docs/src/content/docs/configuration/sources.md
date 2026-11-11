@@ -42,7 +42,11 @@ drops both when the pipeline is removed (`auto_cleanup: true`). With
 `slot_management: require_existing` it creates neither: a DBA creates them, and the pipeline
 refuses to start without them (and needs `auto_cleanup: false`). The managed publication needs
 the pipeline's role to own the tables;
-[Source privileges](/data-avalanche/runbooks/source-privileges/) has both set-ups.
+[Source privileges](/data-avalanche/runbooks/source-privileges/) has both set-ups. On PostgreSQL 17
+and later a managed slot is a failover slot, which a standby with `sync_replication_slots` keeps,
+so a promotion can continue the stream (see **A failover** below). Such a slot waits
+for every standby the primary names in `synchronized_standby_slots`: a standby that is down
+stalls the pipeline. A slot made before an upgrade to 17 stays a plain one.
 
 **What the publication publishes.** At each start the pipeline checks what the publication
 publishes of its tables. Under `require_existing`, or a publication `FOR ALL TABLES`, a tracked
@@ -59,7 +63,8 @@ row filter, a column list, a `TABLES IN SCHEMA` member and any other table, and 
 `publish_generated_columns = none`. A change to what is published of a tracked table means the WAL
 since the checkpoint was decoded under the old publication, so the pipeline re-snapshots its tables
 as `snapshots.mode` says. A tracked table that wasn't published at all is added and copied alone,
-as `snapshots.mode` says. One that was published through its partitioned root or its schema is added by name, with no copy.
+as `snapshots.mode` says. One that was published through its schema, or through its partitioned
+root with `publish_via_partition_root = false`, is added by name, with no copy.
 Under `require_existing` (or `FOR ALL TABLES`), tables the publication publishes but the pipeline
 doesn't replicate are a warning: their changes are decoded and dropped.
 
@@ -67,7 +72,8 @@ doesn't replicate are a warning: their changes are decoded and dropped.
 replicates as its own table. Under `require_existing` (or `FOR ALL TABLES`), a publication that
 publishes a replicated partition only through its root (`publish_via_partition_root = true`) is
 refused, since the partition's changes would arrive under the parent's name. A managed publication
-is set to `false`, and the pipeline re-snapshots.
+is set to `false`, and the pipeline copies the partitions the root published, as `snapshots.mode`
+says; the other tables stream on.
 
 **Large values.** PostgreSQL leaves an unchanged TOASTed value out of an update. With
 `toast_strategy: carry_forward` (the default) the pipeline keeps the value it wrote last;
@@ -87,7 +93,10 @@ can repeat ones the lake has already marked. So a start on another server, or a 
 that reaches one, halts the pipeline with `WAL_SOURCE_CHANGED`
 (`source.postgres.source_change_action: error`, the default). The check runs before the pipeline
 drops or makes a slot there. With `re_snapshot` the pipeline starts again, moves its tables onto
-the new server's position and copies them as `snapshots.mode` says; see
+the new server's position and copies them as `snapshots.mode` says. Under either, a promotion the
+pipeline's failover slot followed (PostgreSQL 17 and later, the standby's copy of the slot
+synchronized exactly up to the checkpoint, and no Delta table's marker past it) continues the stream on the new timeline, with a warning: a
+reconnect to the promoted server starts the pipeline again, and that start continues. See
 [A lost position](/data-avalanche/runbooks/position-lost/#a-failover-wal_source_changed).
 
 **A standby.** Point the pipeline at the primary: a standby (a server in recovery) is refused on

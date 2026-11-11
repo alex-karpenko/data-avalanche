@@ -5,7 +5,8 @@
 use std::collections::BTreeMap;
 
 use data_avalanche_config::{
-    Tables, Tinyint1Detection, check_partitioning, check_table_set, glob_match,
+    Tables, Tinyint1Detection, check_column_keys, check_partitioning, check_table_set,
+    column_override, glob_match,
 };
 use data_avalanche_core::{
     ColumnSchema, HaltReason, ResolvedTables, SourceError, TableRef, TableSchema,
@@ -13,7 +14,23 @@ use data_avalanche_core::{
 use mysql_async::prelude::Queryable;
 
 use crate::connector::MySqlConnector;
+use crate::snapshot::ident;
 use crate::types::{CatalogColumn, ColumnPlan, plan_column};
+
+/// `ER_TABLEACCESS_DENIED_ERROR`, and `ER_NO_SUCH_TABLE`.
+const DENIED: u16 = 1142;
+const NO_SUCH_TABLE: u16 = 1146;
+
+/// The status's word beside a `TABLE_DROPPED` halt of a table the server hides rather than
+/// denies exists ([`MySqlConnector::hidden`], DA-SRC-36).
+pub(crate) fn hidden_note(table: &TableRef) -> String {
+    format!(
+        "table {table}: it is gone from information_schema and the server refuses to read it \
+         (1142): it was dropped, or the pipeline's user lost SELECT on it, and the server hides \
+         which. It halts TABLE_DROPPED; if it still exists, grant SELECT on it again and \
+         re-snapshot it with a snapshot job"
+    )
+}
 
 /// A table the globs can select: `BASE TABLE`, or MariaDB's `SYSTEM VERSIONED`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,25 +153,30 @@ pub struct Planned {
 /// A table's schema and plans, checked in this order (config §11.2): every column plans
 /// ([`plan_column`]: overrides, charsets, decimal caps); the identifier (the
 /// `tables.primary_key` entry, else the primary key) passes [`TableSchema::new`] (reserved names,
-/// a non-empty identifier of usable columns); `tables.partitioning` fits the columns.
+/// a non-empty identifier of usable columns); `tables.partitioning` fits the columns. An override
+/// or a `primary_key` entry names its column without case, as MySQL compares column names
+/// (DA-SRC-35); the schema keeps the catalog's spelling.
 pub fn plan_table(
     d: &Described,
     tables: &Tables,
     tinyint1_as_bool: bool,
 ) -> Result<Planned, HaltReason> {
     let key = table_key(&d.table);
-    let identifier = tables
-        .primary_key
-        .get(key)
-        .cloned()
-        .unwrap_or_else(|| d.primary_key.clone());
+    let catalog = |name: &String| {
+        d.columns
+            .iter()
+            .find(|c| c.name.to_lowercase() == name.to_lowercase())
+            .map_or_else(|| name.clone(), |c| c.name.clone())
+    };
+    let identifier: Vec<String> = match tables.primary_key.get(key) {
+        Some(entry) => entry.iter().map(catalog).collect(),
+        None => d.primary_key.clone(),
+    };
     let mut notes = Notes::default();
     let mut columns = Vec::with_capacity(d.columns.len());
     let mut plans = Vec::with_capacity(d.columns.len());
     for c in &d.columns {
-        let over = tables
-            .column_type_overrides
-            .get(&format!("{key}.{}", c.name));
+        let over = column_override(tables, key, &c.name, true);
         let p = plan_column(
             c,
             tinyint1_as_bool,
@@ -303,6 +325,39 @@ impl MySqlConnector {
         Ok(out)
     }
 
+    /// Whether `table`, gone from `information_schema`, may only be hidden from the pipeline's
+    /// user: the server refuses a `SELECT` on it (1142) rather than saying it doesn't exist
+    /// (1146). For a user without a database-level privilege MySQL and MariaDB answer 1142 for a
+    /// dropped table too, so the two can't be told apart then (measured on MySQL 8.4 and MariaDB
+    /// 11.8, DA-SRC-36). The probe only decides whether to add a warning, so it never fails: any
+    /// other answer (1049 for a dropped schema, 1044, a lost connection) reads as not hidden and
+    /// is logged, and the table is reported dropped all the same.
+    pub(crate) async fn hidden(&self, table: &TableRef) -> bool {
+        let sql = format!(
+            "SELECT 1 FROM {}.{} LIMIT 0",
+            ident(&table.schema),
+            ident(&table.name)
+        );
+        let probed = self
+            .conn
+            .command("probe a table gone from the catalog", move |c| {
+                Box::pin(async move {
+                    match c.query_drop(sql).await {
+                        Err(mysql_async::Error::Server(e)) if e.code == DENIED => Ok(true),
+                        Err(mysql_async::Error::Server(e)) if e.code == NO_SUCH_TABLE => Ok(false),
+                        // Readable after all: the catalog was read before a create.
+                        Ok(()) => Ok(false),
+                        Err(e) => Err(e),
+                    }
+                })
+            })
+            .await;
+        probed.unwrap_or_else(|e| {
+            tracing::warn!(%table, error = %e, "the probe of a table gone from the catalog failed: not reported as hidden");
+            false
+        })
+    }
+
     /// Channel A: the configured table set, resolved against the catalog and checked (config
     /// §11.2): a table a glob found without a primary key (and no `tables.primary_key` entry) is
     /// skipped with a warning; one named without a glob halts.
@@ -353,6 +408,14 @@ impl MySqlConnector {
             };
             match plan_table(&d, &self.pipeline.tables, self.tinyint1_as_bool()) {
                 Ok(p) => {
+                    let columns: Vec<&str> =
+                        p.schema.columns().iter().map(|c| c.name.as_str()).collect();
+                    let keys =
+                        check_column_keys(&self.pipeline, table_key(&listed.table), &columns);
+                    out.warnings.extend(
+                        keys.iter()
+                            .map(|w| format!("{} {}: {}", w.rule, w.path, w.message)),
+                    );
                     for (column, ty) in p.notes.read_as_text {
                         out.warnings.push(format!(
                             "{}.{column}: {ty} is wider than 38 digits and is read as text",

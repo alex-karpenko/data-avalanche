@@ -2,7 +2,7 @@
 //! - the cluster anchor from `globals.state` at startup (V-062, V-076, V-094; storage in M2);
 //! - a pipeline's resolved table set at start or on a table-set change (V-034, the warning half of
 //!   V-106, V-113; sources in M5/M7);
-//! - source column types at schema resolution (V-079);
+//! - source column types at schema resolution (V-079), and a table's columns (V-127);
 //! - a table's schema, for its `tables.partitioning` entry (config §11.2).
 //!
 //! V-061 (a PROC field changed on reload) is part of [`crate::diff()`].
@@ -16,7 +16,7 @@ use crate::ctx::{At, Ctx};
 use crate::diag::Report;
 use crate::enums::{LockBackend, NumericOverflowAction, SourceType};
 use crate::path::YamlPath;
-use crate::resolved::{Globals, PartitionField, PartitionTransform, Pipeline};
+use crate::resolved::{Globals, PartitionField, PartitionTransform, Pipeline, Tables};
 use crate::units::format_duration;
 
 /// The values the first node wrote to the `globals.state` cluster anchor (Clustering §5.6). The
@@ -180,6 +180,64 @@ pub fn check_table_set(p: &Pipeline, tables: &[TableRef]) -> Report {
                 "strip_schema: true maps {} to the one Glue table {name}; set strip_schema: false or exclude all but one",
                 list.iter().cloned().collect::<Vec<_>>().join(", ")
             ));
+        }
+    }
+    ctx.into_report()
+}
+
+/// `tables.column_type_overrides`' entry for column `column` of the table whose per-table key is
+/// `table_key` (config §10: `schema.table` on PostgreSQL, the bare name on MySQL). The key's column
+/// part matches as written, or without case when `fold`: MySQL compares column names so
+/// (DA-SRC-35).
+pub fn column_override<'a>(
+    tables: &'a Tables,
+    table_key: &str,
+    column: &str,
+    fold: bool,
+) -> Option<&'a LogicalType> {
+    if let Some(t) = tables
+        .column_type_overrides
+        .get(&format!("{table_key}.{column}"))
+    {
+        return Some(t);
+    }
+    if !fold {
+        return None;
+    }
+    let lower = column.to_lowercase();
+    tables
+        .column_type_overrides
+        .iter()
+        .find(|(k, _)| key_column(k, table_key).is_some_and(|c| c.to_lowercase() == lower))
+        .map(|(_, t)| t)
+}
+
+/// The column part of a per-column key of the table `table_key`, if the key is that table's.
+fn key_column<'k>(key: &'k str, table_key: &str) -> Option<&'k str> {
+    key.strip_prefix(table_key)?.strip_prefix('.')
+}
+
+/// V-127: the `tables.column_type_overrides` keys of the table `table_key` that name none of
+/// `columns`, matched as [`column_override`] matches them (without case on MySQL). Such a key
+/// changes nothing; it is often a column spelled otherwise (DA-SRC-35).
+pub fn check_column_keys(p: &Pipeline, table_key: &str, columns: &[&str]) -> Report {
+    let mut ctx = Ctx::structural();
+    let fold = p.source.kind == SourceType::Mysql;
+    let at = pipeline_at(p).key("tables").key("column_type_overrides");
+    for key in p.tables.column_type_overrides.keys() {
+        let Some(column) = key_column(key, table_key) else {
+            continue;
+        };
+        let named = columns
+            .iter()
+            .any(|c| *c == column || (fold && c.to_lowercase() == column.to_lowercase()));
+        if !named {
+            ctx.warning(
+                "V-127",
+                &at.key(key),
+                None,
+                format!("{key} names no column of {table_key}: it changes nothing"),
+            );
         }
     }
     ctx.into_report()

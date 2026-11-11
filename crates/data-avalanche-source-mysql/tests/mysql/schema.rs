@@ -5,7 +5,7 @@ use data_avalanche_core::{ColumnValueType as V, SchemaChange, SchemaHint, TableR
 use data_avalanche_testkit::require_it;
 use mysql_async::prelude::Queryable;
 
-use crate::common::{cleanup, connector, fresh, pipeline};
+use crate::common::{cleanup, connector, fresh, pipeline, pipeline_as, user};
 
 fn ddl(sql: &str) -> SchemaHint {
     SchemaHint::Ddl(sql.into())
@@ -58,6 +58,46 @@ async fn a_statement_s_change_is_scoped_to_its_columns() {
             SchemaChange::EnumValuesAppended("e".into())
         ]
     );
+    cleanup(&n).await;
+}
+
+/// DA-SRC-25: `RENAME COLUMN note TO Note` changes the case alone, the same column to MySQL.
+/// The statement's change notes it and keeps the cached spelling, which the sink's column has;
+/// the rescan reports no change; and the snapshot reads the table under the cached names.
+#[tokio::test]
+async fn a_change_of_case_alone_keeps_the_cached_name() {
+    require_it!();
+    let (n, mut a) = fresh(
+        "schema_case",
+        "CREATE TABLE t (id INT PRIMARY KEY, note TEXT); INSERT INTO t VALUES (1, 'a'), (2, 'b');",
+    )
+    .await;
+    let c = connector(&pipeline(&n, &["t"], "", ""));
+    let cached = c.resolve_tables().await.unwrap().tables.remove(0);
+    // The key column is recased too: the cursor and the identifier follow the cached spelling.
+    let key_sql = "ALTER TABLE t RENAME COLUMN id TO ID";
+    a.query_drop(key_sql).await.unwrap();
+    let sql = "ALTER TABLE t RENAME COLUMN note TO Note";
+    a.query_drop(sql).await.unwrap();
+    let (_, now) = c.augment(&cached, &ddl(key_sql)).await.unwrap();
+    assert_eq!(now.unwrap(), cached, "the key keeps its spelling");
+    let (delta, now) = c.augment(&cached, &ddl(sql)).await.unwrap();
+    assert!(
+        matches!(delta.changes.as_slice(), [SchemaChange::NoTargetEffect(_)]),
+        "{:?}",
+        delta.changes
+    );
+    assert_eq!(now.unwrap(), cached, "the cached spelling stays");
+    let report = c.rescan(std::slice::from_ref(&cached)).await.unwrap();
+    assert!(report.changed.is_empty(), "{report:?}");
+    let names: Vec<&str> = cached.columns().iter().map(|c| c.name.as_str()).collect();
+    let first = c.read_chunk(&cached, None, 1).await.unwrap();
+    let second = c.read_chunk(&cached, first.next.as_ref(), 1).await.unwrap();
+    for row in first.rows.iter().chain(&second.rows) {
+        let got: Vec<&str> = row.0.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(got, names, "the rows carry the cached names");
+    }
+    assert_eq!((first.rows.len(), second.rows.len()), (1, 1));
     cleanup(&n).await;
 }
 
@@ -159,5 +199,81 @@ async fn the_rescan_reports_dropped_and_changed_tables() {
     assert_eq!(report.changed.len(), 1);
     assert_eq!(report.changed[0].table().name, "altered");
     assert!(report.halted.is_empty());
+    cleanup(&n).await;
+}
+
+/// DA-SRC-36: a table gone from `information_schema` halts `TABLE_DROPPED`. When the server
+/// refuses to read it (1142) instead of saying it doesn't exist (1146), the rescan says beside
+/// the halt that the pipeline's user may only have lost SELECT on it. A user with database-level
+/// privileges gets 1146 for a dropped table, and no such word.
+#[tokio::test]
+async fn a_table_the_user_can_no_longer_see_reads_as_dropped_with_a_warning() {
+    require_it!();
+    let (n, mut a) = fresh(
+        "schema_hidden",
+        "CREATE TABLE t (id INT PRIMARY KEY); CREATE TABLE gone (id INT PRIMARY KEY);",
+    )
+    .await;
+    let name = "it_schema_hidden";
+    user(
+        &mut a,
+        name,
+        "REPLICATION CLIENT, REPLICATION SLAVE ON *.*",
+        &[format!("GRANT SELECT ON {}.t TO '{name}'@'%'", n.db)],
+    )
+    .await;
+    let c = connector(&pipeline_as(
+        &n,
+        name,
+        "      ssl_mode: disable",
+        "",
+        &["t"],
+        "",
+    ));
+    let t = c.resolve_tables().await.unwrap().tables.remove(0);
+    a.query_drop(format!("REVOKE SELECT ON {}.t FROM '{name}'@'%'", n.db))
+        .await
+        .unwrap();
+    let report = c.rescan(std::slice::from_ref(&t)).await.unwrap();
+    assert_eq!(report.dropped, [t.table().clone()]);
+    assert!(
+        matches!(report.warnings.as_slice(), [w] if w.contains("1142") && w.contains("lost SELECT")),
+        "{report:?}"
+    );
+    // Dropped, read by a user the server tells the truth to (root).
+    let root = connector(&pipeline(&n, &["gone"], "", ""));
+    let gone = root.resolve_tables().await.unwrap().tables.remove(0);
+    a.query_drop("DROP TABLE gone").await.unwrap();
+    let report = root.rescan(std::slice::from_ref(&gone)).await.unwrap();
+    assert_eq!(report.dropped, [gone.table().clone()]);
+    assert!(report.warnings.is_empty(), "{report:?}");
+    a.query_drop(format!("DROP USER '{name}'@'%'"))
+        .await
+        .unwrap();
+    cleanup(&n).await;
+}
+
+/// The probe is advisory: a table whose whole schema is gone (the probe gets 1049, not 1142 or
+/// 1146) is still reported dropped, with no warning, and doesn't fail the rescan.
+#[tokio::test]
+async fn a_table_whose_schema_is_gone_is_still_reported_dropped() {
+    require_it!();
+    let (n, mut a) = fresh(
+        "schema_db_gone",
+        "CREATE TABLE t (id INT PRIMARY KEY); CREATE TABLE u (id INT PRIMARY KEY);",
+    )
+    .await;
+    let c = connector(&pipeline(&n, &["t", "u"], "", ""));
+    let known = c.resolve_tables().await.unwrap().tables;
+    a.query_drop(format!("DROP DATABASE {}", n.db))
+        .await
+        .unwrap();
+    let report = c.rescan(&known).await.unwrap();
+    let mut dropped = report.dropped.clone();
+    dropped.sort();
+    let mut want: Vec<_> = known.iter().map(|s| s.table().clone()).collect();
+    want.sort();
+    assert_eq!(dropped, want);
+    assert!(report.warnings.is_empty(), "{report:?}");
     cleanup(&n).await;
 }
