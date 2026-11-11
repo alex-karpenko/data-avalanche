@@ -134,10 +134,11 @@ feed the same evolution pipeline; each has a distinct role. (This replaces the e
 
 Query the source catalog for each tracked table; then:
 
-- **Table absent in target** → at a first start, a cleared halt or a non-replayable gap, use the
-  queried schema as the **baseline** to create the target table via the sink (consistent with the
-  snapshot read point, `Data-Flow.md` Phase 1); at a replayable resume, create it from the
-  pipeline's cached schema, which the stream's in-order replay (B+C) then evolves.
+- **Table absent in target** → at a first start, a cleared halt, a non-replayable gap, or for a
+  table first tracked at a resume, use the queried schema as the **baseline** to create the
+  target table via the sink (consistent with the snapshot read point, `Data-Flow.md` Phase 1);
+  for a table tracked before, at a replayable resume, create it from the pipeline's cached
+  schema, which the stream's in-order replay (B+C) then evolves.
 - **Replayable existing table** → **do not** evolve the target from this query. The decoder
   re-acquires its layout from the in-band signal at stream resume, and any DDL between the
   confirmed offset and now is replayed **in order** by channels B+C. The startup query here is
@@ -377,7 +378,7 @@ rather than a file rewrite (in both Iceberg and Delta).
 ### 8.2 Startup & non-replayable gaps
 
 At pipeline start (channel A): create absent tables from the queried baseline (at a replayable
-resume, from the cached schema, which in-order replay then evolves); for an
+resume, a table tracked before from the cached schema, which in-order replay then evolves); for an
 existing replayable table, defer to in-order replay (B+C) and treat the startup query as a
 drift check only (§0, §3-A). If the resume point is **non-replayable** (PG slot invalidated /
 WAL recycled; MySQL binlog purged), the intervening DDL and rows are unrecoverable from the
