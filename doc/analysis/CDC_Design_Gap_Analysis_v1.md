@@ -834,6 +834,15 @@ the known limitations are in the plan's "Deviations during execution" and "Known
 |---|---|---|---|
 | DA-SRC-39 | A session that ends on an error drops the PostgreSQL stream without closing it | 🟢 | Found while fixing a PostgreSQL 14 test flake (`093168b`). Predates M12d |
 
+## 62. M12d source and sink follow-ups — the exit (2026-11-11)
+
+M12d (`doc/v1.0/M12d-source-sink-followups.md`) merged 2026-11-11 (PR #21, `1ba6377`), its PR CI green
+on every target (`ci.yml` run 43018425423: `check`, `integration`, `e2e-mysql` on `mysql-84`,
+`mysql-84-nogtid` and `mariadb-118`, `k3s` 4 min; `docs.yml` run 43018425437), and the site
+deployed from `main` (`docs.yml` run 43022584237). The rows §60 and §61 closed stand as written; no
+count changes. Next: M12c, the acceptance and `v1.0.0` (Q-M12-8), with the open rows: DA-OPS-14 (its
+load runs) and DA-SRC-37, 38, 39, DA-SNAP-23 (Q-M12-1: fixed, or closed with a pointer).
+
 ---
 
 ### Counts (by status)
@@ -845,7 +854,7 @@ the known limitations are in the plan's "Deviations during execution" and "Known
 > M7a's plan (§32), 2026-10-16 for M7a's exit (§33), 2026-10-17 for M7b's plan (§34),
 > 2026-10-20 for M7b's exit (§35), 2026-10-21 for M8a's plan (§36), 2026-10-22 for M8a's exit (§37),
 > 2026-10-22 for M8b's plan (§38), 2026-10-23 for M8b's exit (§39), 2026-10-23 for M9a's plan
-> (§40), 2026-10-23 for M9a's exit (§41), 2026-10-27 for M9b's plan (§42), 2026-10-28 for M9b's exit (§43), 2026-10-28 for M10's plan (§44), and 2026-10-29 for M10's exit (§45), and 2026-10-29 for M11a's plan (§46), and 2026-10-29 for M11a's whole-branch review (§47), and 2026-10-29 for M11a's exit (§48), and 2026-10-29 for M11b's plan (§49), and 2026-10-30 for M11b's pages (§50), and 2026-10-30 for M11b's exit and v0.1.0 (§51), and 2026-10-30 for M12a's plan (§52), and 2026-11-04 for M12a's gaps closed (§53), and 2026-11-04 for M12a's whole-branch review (§54), and 2026-11-04 for M12a's exit (§55), and 2026-11-06 for M12b's gaps closed (§57), and 2026-11-06 for M12b's exit (§58), and 2026-11-06 for M12d's plan (§59), and 2026-11-10 for M12d's gaps closed (§60), and 2026-11-11 for M12d's whole-branch review (§61).
+> (§40), 2026-10-23 for M9a's exit (§41), 2026-10-27 for M9b's plan (§42), 2026-10-28 for M9b's exit (§43), 2026-10-28 for M10's plan (§44), and 2026-10-29 for M10's exit (§45), and 2026-10-29 for M11a's plan (§46), and 2026-10-29 for M11a's whole-branch review (§47), and 2026-10-29 for M11a's exit (§48), and 2026-10-29 for M11b's plan (§49), and 2026-10-30 for M11b's pages (§50), and 2026-10-30 for M11b's exit and v0.1.0 (§51), and 2026-10-30 for M12a's plan (§52), and 2026-11-04 for M12a's gaps closed (§53), and 2026-11-04 for M12a's whole-branch review (§54), and 2026-11-04 for M12a's exit (§55), and 2026-11-06 for M12b's gaps closed (§57), and 2026-11-06 for M12b's exit (§58), and 2026-11-06 for M12d's plan (§59), and 2026-11-10 for M12d's gaps closed (§60), and 2026-11-11 for M12d's whole-branch review (§61), and 2026-11-11 for M12d's exit (§62).
 
 | Status | Count (v1 scope) | Notes |
 |---|---|---|
