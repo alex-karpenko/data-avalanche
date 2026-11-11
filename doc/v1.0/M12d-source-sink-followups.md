@@ -2051,16 +2051,23 @@ git commit -m "gap: v1 §<N> — M12d's gaps closed (DA-SINK-12, DA-SRC-25, 32�
 
 ## Exit
 
-- [ ] Every task's tests pass; `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] Every task's tests pass; `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`
   and `cargo test --workspace` pass; `cargo xtask docs --check` passes.
-- [ ] With `test-infra/up.sh` and both replica pairs recreated, the CI integration job's commands
+- [x] With `test-infra/up.sh` and both replica pairs recreated, the CI integration job's commands
   pass locally: the workspace ITs (`-- --test-threads=1`), the MySQL targets (`mysql-84-nogtid`,
   `mariadb-118`, `mariadb-118-binlog`), PostgreSQL 17 and 14 (`DATA_AVALANCHE_PG_PORT`), and the
   slice-1 E2E with `DATA_AVALANCHE_PG_REPLICA` and `DATA_AVALANCHE_PG_SYNC_REPLICA` set.
-- [ ] The tracker closes DA-SINK-12, DA-SRC-25, DA-SRC-32…36 and DA-SNAP-22, and marks DA-SRC-31 ⏭.
+- [x] The tracker closes DA-SINK-12, DA-SRC-25, DA-SRC-32…36 and DA-SNAP-22, and marks DA-SRC-31 ⏭.
   The approved spec patches are applied.
-- [ ] The whole-branch review runs when Oleksii asks; then the branch is pushed and its PR opened
+- [x] The whole-branch review runs when Oleksii asks; then the branch is pushed and its PR opened
   against `main` (not merged).
+
+Checked 2026-11-11 at `8a138c5`, after the whole-branch review's four fix waves: every gate and every
+CI integration command passed locally (workspace ITs; `mysql-84-nogtid`, `mariadb-118`,
+`mariadb-118-binlog`; PostgreSQL 17 and 14; both replica pairs recreated; the slice-1 E2E 50/50).
+Earlier runs at the waves' heads hit load flakes only, each green when rerun alone: PostgreSQL 14's
+`a_waiting_chunk_read_holds_up_no_other_read`, and the E2E `a_large_transaction_lands_at_once`,
+`a_ddl_replayed_after_a_crash_is_applied_once`, `a_split_transaction_is_replayed_after_a_crash_between_slices`.
 
 ## Deviations during execution
 
