@@ -89,6 +89,10 @@ pub struct Options<'a> {
     pub globals: &'a str,
     /// `globals.log`, a YAML flow map; `{ level: info, format: compact }` when empty.
     pub log: &'a str,
+    /// The product's defaults for the lease (15 s, renewed every 5 s) and the test's pipeline's
+    /// flush (30 s), which D-V1.3's lag targets assume: the acceptance runs. Off, the suite's
+    /// shorter ones (a 6 s lease, a 1 s flush).
+    pub defaults: bool,
 }
 
 /// The rows [`E2e::insert_series`] gives a key `g`.
@@ -283,9 +287,7 @@ globals:
   state: {{ bucket: {bucket}, prefix: {prefix}/globals }}
   api: {{ address: "127.0.0.1:${{E2E_API_PORT}}"{api} }}
   log: {log}
-  cluster:
-    lease_duration: 6s
-    lease_renewal_interval: 2s
+  cluster:{lease}
     drain_timeout: 30s{cluster}
     memberlist: {{ node_name: "${{E2E_NODE}}", bind_addr: [127.0.0.1], bind_port: "${{E2E_GOSSIP_PORT}}", advertise_addr: 127.0.0.1, advertise_port: "${{E2E_ADVERTISE_PORT}}"{memberlist} }}
   {globals}
@@ -294,7 +296,7 @@ pipelines:
     id: {test}
 {source}
     tables: {{ include: ['{include}']{tables} }}
-    sink: {{ type: delta, bucket: {bucket}, prefix: {prefix}/lake, delta: {{}}, flush: {{ seconds: 1 }}{sink} }}
+    sink: {{ type: delta, bucket: {bucket}, prefix: {prefix}/lake, delta: {{}}{flush}{sink} }}
     {pipeline}
 {more}
 "#,
@@ -307,6 +309,16 @@ pipelines:
             sink = o.sink,
             pipeline = o.pipeline,
             cluster = o.cluster.replace(", ", "\n    "),
+            lease = if o.defaults {
+                ""
+            } else {
+                "\n    lease_duration: 6s\n    lease_renewal_interval: 2s"
+            },
+            flush = if o.defaults {
+                ""
+            } else {
+                ", flush: { seconds: 1 }"
+            },
             memberlist = o.memberlist,
             api = o.api,
             globals = o.globals,
@@ -1023,6 +1035,12 @@ impl Proc {
             self.call("GET", &format!("/v1/pipelines/{id}")).await.1["actual_state"] == actual
         })
         .await;
+    }
+
+    /// The process's id: its memory, for the soak (`tests/load`).
+    #[allow(dead_code)]
+    pub fn pid(&self) -> u32 {
+        self.child.id()
     }
 
     /// Waits for `/health/ready`.

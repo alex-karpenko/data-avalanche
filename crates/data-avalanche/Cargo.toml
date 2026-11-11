@@ -53,3 +53,9 @@ tokio-rustls.workspace = true
 name = "e2e"
 path = "tests/e2e/main.rs"
 required-features = ["e2e-hooks"]
+
+# The v1 acceptance runs (M12c): `cargo xtask bench|chaos|soak` builds it in release mode.
+[[test]]
+name = "load"
+path = "tests/load/main.rs"
+required-features = ["e2e-hooks"]

@@ -18,6 +18,7 @@ mod jobs;
 mod k3s;
 mod lifecycle;
 mod mysql;
+mod nodes;
 mod observability;
 mod proxy;
 mod reload;
