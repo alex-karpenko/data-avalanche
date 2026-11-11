@@ -394,7 +394,9 @@ impl<'c> Session<'c> {
     }
 
     /// Runs the session to its end. Flushes already handed to the writer are made durable before
-    /// it returns, unless it fails.
+    /// it returns, unless it fails. The stream is closed either way (DA-SRC-39): a dropped
+    /// PostgreSQL client's worker takes the slot again moments later, and the next session's
+    /// stream would find it active.
     pub async fn run(mut self) -> Result<End, WorkerError> {
         let ended = self.event_loop().await;
         // The chunk reads still out are aborted: the next session reads again from the cursors.
@@ -406,6 +408,7 @@ impl<'c> Session<'c> {
             }
             Err(e) => {
                 self.writer.0.abort();
+                let _ = self.stream.close().await;
                 Err(e)
             }
         }
@@ -419,7 +422,10 @@ impl<'c> Session<'c> {
         drop(self.jobs);
         while let Some(ev) = self.events.recv().await {
             match ev {
-                WriterEvent::Failed(e) => return Err(e),
+                WriterEvent::Failed(e) => {
+                    let _ = self.stream.close().await;
+                    return Err(e);
+                }
                 WriterEvent::Halted(h) => self.core.update(|st| {
                     st.snapshots.remove(&h.table);
                     if !h.copy {
@@ -1952,6 +1958,30 @@ mod tests {
             "the worker reopens it"
         );
         assert_eq!(w.ids("a"), [1]);
+    }
+
+    /// DA-SRC-39: a session that ends on a worker error closes its stream too. A dropped
+    /// PostgreSQL client's worker takes the slot again moments later, so the next session's
+    /// stream would find it active.
+    #[tokio::test]
+    async fn a_session_that_fails_closes_its_stream() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.sink
+            .fail(SinkOp::Commit, Some(&t("a")), 1, || SinkError::NoTable {
+                table: t("a"),
+            });
+        let (mut core, _control, _status) = w.core(&flush_each(), &["a"]);
+        let s = Session::open(&mut core).await.unwrap().unwrap();
+        w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+        let end = tokio::time::timeout(Duration::from_secs(10), s.run())
+            .await
+            .expect("the session ends");
+        assert!(
+            matches!(end, Err(WorkerError::Sink(SinkError::NoTable { .. }))),
+            "a missing sink table stops the pipeline: {end:?}"
+        );
+        assert_eq!(w.source.closes(), 1, "the stream is closed, not dropped");
     }
 
     #[tokio::test]

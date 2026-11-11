@@ -271,6 +271,8 @@ struct Db {
     readers_ended: usize,
     reconfigures: usize,
     teardowns: usize,
+    /// Streams closed (`close`) so far.
+    closes: usize,
     fetches: BTreeMap<TableRef, usize>,
     prepares: Vec<Option<Checkpoint>>,
     /// What each `prepare_marked` was told the lake's highest marker is.
@@ -336,6 +338,7 @@ impl FakeSource {
             readers_ended: 0,
             reconfigures: 0,
             teardowns: 0,
+            closes: 0,
             fetches: BTreeMap::new(),
             prepares: vec![],
             marks: vec![],
@@ -693,6 +696,11 @@ impl FakeSource {
     /// `teardown` calls so far: a removed pipeline's cleanup.
     pub fn teardowns(&self) -> usize {
         self.db().teardowns
+    }
+
+    /// The streams closed so far (`ChangeStream::close`): a stream dropped unclosed isn't one.
+    pub fn closes(&self) -> usize {
+        self.db().closes
     }
 
     /// `fetch_rows` calls for `table` so far, failed ones included.
@@ -1514,6 +1522,7 @@ impl ChangeStream for FakeStream {
     }
 
     async fn close(self: Box<Self>) -> Result<(), SourceError> {
+        self.source.db().closes += 1;
         Ok(())
     }
 }
