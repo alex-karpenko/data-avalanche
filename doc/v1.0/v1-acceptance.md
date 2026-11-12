@@ -68,7 +68,7 @@ table's Delta log over the commits after the snapshot; the mean commit time is t
 | Bytes written per MERGE | 13.0 MB | 11.1 MB |
 | Data files removed per MERGE | 5.95 | 5.95 |
 
-Each MERGE wrote 85 to 99 % of the table's size, so it rewrote close to the whole table, as D-MS.15
+Each MERGE wrote 84 to 99 % of the table's size, so it rewrote close to the whole table, as D-MS.15
 predicts: the cost is proportional to the files touched, not to the rows changed. On this table
 it is about a second a flush; it grows with the table's size, and is what
 `configuration/sink.md`'s flush guidance (fewer, larger flushes) and
@@ -102,8 +102,8 @@ Each under load at the defaults, each ending with the lake holding the source's 
 once, and the owner epochs never going back (`lands`). All passed on both sources. The storage
 outages cut the node off from RustFS for 5 s (a third of the lease) and 45 s (three leases); the
 partition cuts the holder off from the other two nodes for four leases. A storage outage's time
-is from the store's return to the pipeline's status `running` (the short outage's status never
-left it); a restart's is from `docker compose restart` to the server accepting connections again,
+is from the store's return to the pipeline's status `running` (after the short outage it was
+already `running`); a restart's is from `docker compose restart` to the server accepting connections again,
 the pipeline's recovery shown by the lake converging afterwards.
 
 | Run | PostgreSQL 18 | MySQL 8.4 |
