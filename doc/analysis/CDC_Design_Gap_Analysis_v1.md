@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-11
+updated: 2026-11-13
 domain: Architecture
 tags: [gap-analysis, design, re-derivation, spec-readiness, blockers, open-decisions]
 resolves: []
@@ -866,6 +866,26 @@ and `runbooks/position-lost.mdx`. The store switch, the cloud subset and the acc
 The open count goes from 5 to 0 (v1). The acceptance runs themselves (Tasks 5, 6 and 8) are the
 exit's evidence, not gaps.
 
+## 64. M12c v1 acceptance — the runs (2026-11-13)
+
+M12c's Task 8 ran the acceptance runs (`cargo xtask bench|chaos|soak`, release mode) on Oleksii's
+machine at commit `89d7e1c`, against test-infra's PostgreSQL 18, MySQL 8.4 and RustFS, at the
+product's defaults. The report, with the machine and every measurement, is
+`doc/v1.0/v1-acceptance.md`; roadmap §8 checks the items it shows met. Every run passed; no
+target was missed, and no gap surfaced.
+
+| Run | PostgreSQL 18 | MySQL 8.4 |
+|---|---|---|
+| Steady lag p99 (D-V1.3, ≤ 60 s) | 30.9 s | 30.8 s |
+| Failover recovery (D-V1.3, ≤ 120 s) | 52.5 s | 53.7 s |
+| MERGE under random-key churn (R-5, DA-MS-3) | 20 MERGEs, 1.18 s mean, 13.0 MB written each on a 13.1 MB table | 20 MERGEs, 1.38 s mean, 11.1 MB written each |
+| Chaos (4 runs: storage outages shorter and longer than the lease, a source restart, a partition) | 4/4, no loss | 4/4, no loss |
+| Soak, 24 h with churn (node 1 RSS ≤ 2×) | 24/24 checks, 143 churn steps, 17.0M changes, RSS 0.90× | — |
+
+R-5 is measured (DA-MS-3's row carries the numbers; it stays the decided caveat, D-MS.15). The
+cloud subset ran on GCS from Oleksii's machine (4/4 on each source, Task 5); its PR CI and
+`cloud.yml` runs are the exit's. The open count stays 0 (v1).
+
 ---
 
 ### Counts (by status)
@@ -877,7 +897,7 @@ exit's evidence, not gaps.
 > M7a's plan (§32), 2026-10-16 for M7a's exit (§33), 2026-10-17 for M7b's plan (§34),
 > 2026-10-20 for M7b's exit (§35), 2026-10-21 for M8a's plan (§36), 2026-10-22 for M8a's exit (§37),
 > 2026-10-22 for M8b's plan (§38), 2026-10-23 for M8b's exit (§39), 2026-10-23 for M9a's plan
-> (§40), 2026-10-23 for M9a's exit (§41), 2026-10-27 for M9b's plan (§42), 2026-10-28 for M9b's exit (§43), 2026-10-28 for M10's plan (§44), and 2026-10-29 for M10's exit (§45), and 2026-10-29 for M11a's plan (§46), and 2026-10-29 for M11a's whole-branch review (§47), and 2026-10-29 for M11a's exit (§48), and 2026-10-29 for M11b's plan (§49), and 2026-10-30 for M11b's pages (§50), and 2026-10-30 for M11b's exit and v0.1.0 (§51), and 2026-10-30 for M12a's plan (§52), and 2026-11-04 for M12a's gaps closed (§53), and 2026-11-04 for M12a's whole-branch review (§54), and 2026-11-04 for M12a's exit (§55), and 2026-11-06 for M12b's gaps closed (§57), and 2026-11-06 for M12b's exit (§58), and 2026-11-06 for M12d's plan (§59), and 2026-11-10 for M12d's gaps closed (§60), and 2026-11-11 for M12d's whole-branch review (§61), and 2026-11-11 for M12d's exit (§62), and 2026-11-11 for M12c's gaps closed (§63).
+> (§40), 2026-10-23 for M9a's exit (§41), 2026-10-27 for M9b's plan (§42), 2026-10-28 for M9b's exit (§43), 2026-10-28 for M10's plan (§44), and 2026-10-29 for M10's exit (§45), and 2026-10-29 for M11a's plan (§46), and 2026-10-29 for M11a's whole-branch review (§47), and 2026-10-29 for M11a's exit (§48), and 2026-10-29 for M11b's plan (§49), and 2026-10-30 for M11b's pages (§50), and 2026-10-30 for M11b's exit and v0.1.0 (§51), and 2026-10-30 for M12a's plan (§52), and 2026-11-04 for M12a's gaps closed (§53), and 2026-11-04 for M12a's whole-branch review (§54), and 2026-11-04 for M12a's exit (§55), and 2026-11-06 for M12b's gaps closed (§57), and 2026-11-06 for M12b's exit (§58), and 2026-11-06 for M12d's plan (§59), and 2026-11-10 for M12d's gaps closed (§60), and 2026-11-11 for M12d's whole-branch review (§61), and 2026-11-11 for M12d's exit (§62), and 2026-11-11 for M12c's gaps closed (§63), and 2026-11-13 for M12c's acceptance runs (§64, no change).
 
 | Status | Count (v1 scope) | Notes |
 |---|---|---|
@@ -2143,7 +2163,7 @@ Source: `research/Multi_Sink_Architecture_and_Delta_Lake.md` — all decisions *
 | DA-X-10 | **Sink marker disarmed by foreign commits** *(confirmed empirically 2026-09-26, delta probe P3: latest commit after OPTIMIZE carries no marker)* — an external compaction/OPTIMIZE/expire commit carries no `owner_epoch`/`committed_position`; "read the latest snapshot's marker" then returns nothing and the fence silently disarms | 🟡 | ✅(design) | Applies to the Iceberg design as-is. Rule: read the marker from the **latest commit authored by this application** (walk back), or use a carrier persisted in table state (Delta `txn`). Research §8. **Resolved in research 2026-09-26:** Iceberg epoch mirrored to a `cdc.owner_epoch` table property in the same transaction (authoritative; atomicity ✅ probed 2026-09-26, `prototypes/iceberg-capability` G2b), position via own-snapshot walk-back by `cdc.pipeline`, none retained = not covered (`Clustering…` §5.5, `Delivery…` §3–§4, `Iceberg_Maintenance.md` §2). Delta: `txn` + `commitInfo` walk-back (probed). Spec follow-up applied 2026-09-26: `Data-Flow.md` Phase 4 Iceberg item 5 names the table-property carrier. |
 | DA-MS-1 | Delta MERGE atomic delete+upsert, idempotent replay (probes P1/P2/P5) | 🔴→✅ | ✅ | **Proven 2026-09-26** on local fs (`prototypes/delta-capability/`): one MERGE = one version; replay identical; truncate metadata-only. Real-cloud atomicity is DA-MS-4. |
 | DA-MS-2 | Delta epoch fence via `txn` (conflict on same `app_id`, survives foreign OPTIMIZE) (P3/P4) | 🟡→✅ | ✅ | **Proven 2026-09-26**: stale zombie rejected (`Concurrent transaction failed`), reloaded zombie fenced by pre-check; `txn` survives a foreign OPTIMIZE; commitInfo walk-back recovers the position. |
-| DA-MS-3 | Delta MERGE write amplification under random-key churn (P6) | 🟡 | 🔄 | **Measured 2026-09-26**: 1M rows/40 files, 5k updates — sequential keys rewrite 1 file (20k rows); random keys rewrite **all 40 files (995k rows, ≈200×)**. Not a correctness risk; a scope caveat for large tables with spread-out updates. **D-MS.15 decided (b)**: v1 = documented caveat + rows-copied/files-rewritten metrics + flush guidance; post-v1 = deletion-vector writer (own probe). |
+| DA-MS-3 | Delta MERGE write amplification under random-key churn (P6) | 🟡 | 🔄 | **Measured 2026-09-26**: 1M rows/40 files, 5k updates — sequential keys rewrite 1 file (20k rows); random keys rewrite **all 40 files (995k rows, ≈200×)**. Not a correctness risk; a scope caveat for large tables with spread-out updates. **D-MS.15 decided (b)**: v1 = documented caveat + rows-copied/files-rewritten metrics + flush guidance; post-v1 = deletion-vector writer (own probe). **Measured end to end 2026-11-12** (M12c, `doc/v1.0/v1-acceptance.md` §R-5, §64): a 1M-key, 13 MB table churned at random keys at 1000 changes/s; every 30 s flush rewrote close to the whole table (11–13 MB, about six files) in a 1.2–1.4 s MERGE, on PostgreSQL 18 and MySQL 8.4. The caveat stands as decided. |
 | DA-MS-4 | Delta commit atomicity on real S3/GCS/Azure via conditional put (P8) | 🔴→✅ | ✅ | Same capability class as DA-CLUS-1 (proven for the lease). **S3 proven 2026-09-26** (`prototypes/delta-capability/tests/probe_cloud_commit.rs`, us-east-1): delta-rs 1.0 commits with one `If-None-Match: *` PUT (no DynamoDB); raw put-if-absent 160 contenders → 10/10 single winners; same-version MERGE race → exactly one version with the winner's content only; concurrent owners → exactly one lands (fence alone, P8e: `txn` app-id conflict); concurrent foreign appends → all land, none lost. **GCS proven 2026-09-26** (`gs://leasetest`, same probe, `--features gcs`): commit = one `x-goog-if-generation-match: 0` PUT; identical results P8a–e; no 429 surfaced to the caller in 160 racing creates. **Azure Blob proven 2026-09-26** (`dataavalanchetest`, SAS, `--features azure`): commit = one `If-None-Match: *` Put Blob; identical results P8a–e. **Closed on all three clouds.** Residual (not a gap): the Azure account is flat-namespace — ADLS Gen2 (HNS) uses the same Blob endpoint + precondition, re-run to confirm if an HNS account becomes the target. |
 | DA-MS-5 | Delta schema evolution gaps (no drop/rename/widen in delta-rs) | 🟢 | ✅(design) | Soft-drop + warn (D-MS.9); widen → halt. |
 | DA-MS-7 | delta-rs 1.0 refuses ADD COLUMN on column-mapping (`name`) tables (probe P7b) | 🟡 | ✅ | Would disable the only Delta evolution op. **R-1 decided 2026-09-26**: `sink.delta.column_mapping` default `none`, `name` rejected in v1 (V-092). |
