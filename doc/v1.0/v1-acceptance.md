@@ -8,8 +8,9 @@ tags: [v1, acceptance, load, soak, chaos, lag, failover, merge-cost, cloud, rele
 
 The measurements behind roadmap §8, the v1.0.0 acceptance checklist: D-V1.3's two lag targets,
 the soak's memory, MERGE's cost under random-key churn (R-5, D-MS.15), the chaos runs and the
-cloud subset. Every number below is read from `target/acceptance/results.jsonl`, which the runs
-append to (one JSON line per measurement, with its target and whether it was met). The runs are
+cloud subset. Every measurement below is read from `target/acceptance/results.jsonl`, which the
+runs append to (one JSON line per measurement, with its target and whether it was met); the
+cloud subset's times are from Task 5's run. The runs are
 the `load` test target (`crates/data-avalanche/tests/load/`), started by `cargo xtask
 bench|chaos|soak` in release mode (M12c Task 6, Q-M12c-2).
 
@@ -23,12 +24,14 @@ bench|chaos|soak` in release mode (M12c Task 6, Q-M12c-2).
 | Commit | `89d7e1c` (branch `feat/claude/m12c-acceptance`) |
 | Dates | bench and chaos 2026-11-11 22:25 … 2026-11-12 00:39 EET; soak 2026-11-12 00:39 … 2026-11-13 00:42 EET |
 
-Every run is at the product's defaults: a 30 s flush, a 15 s lease renewed every 5 s. The storage is RustFS on the same machine, so object-store latency is lower
-than a cloud bucket's; the source, the lake and three nodes share the machine's cores.
+Every run is at the product's defaults: a 30 s flush, a 15 s lease renewed every 5 s. The storage
+is RustFS on the same machine, so object-store latency is lower than a cloud bucket's. The steady,
+churn and storage-outage runs are one node; the failover, the partition and the soak three; the
+source, the lake and the nodes share the machine's cores.
 
 ## D-V1.3: the lag targets
 
-`steady_state_lag_at_the_defaults`: four tables of 100 000 keys each, snapshotted, then changed at
+`steady_state_lag_at_the_defaults`: one node, four tables of 100 000 keys each, snapshotted, then changed at
 1000 changes a second for 30 minutes after a minute's warm-up, the lag
 (`data_avalanche_replication_lag_seconds`) sampled every second.
 `a_failover_recovers_within_two_minutes`: two tables, three nodes; the lease holder is killed
@@ -44,15 +47,18 @@ under load, a sentinel row written just after must land, and the new holder's la
 | Failover: recovered (lag back under 60 s) | ≤ 120 s | **52.5 s** ✅ | **53.7 s** ✅ |
 
 The steady lag follows the flush: a change waits up to the 30 s flush interval plus the MERGE,
-so p50 sits at about half the interval and the maximum just above it. A failover costs the
-lease's expiry (15 s), the takeover, the stream's reopen and the replay from the last checkpoint.
+so p50 sits at about half the interval and the maximum just above it. The failover's time is
+measured as a whole; what it should be made of (the 15 s lease's expiry, the takeover, the
+stream's reopen, the replay from the last checkpoint) is expected, not measured apart.
 
 ## R-5: MERGE's cost under random-key churn
 
 `merge_cost_under_random_key_churn` (no target: D-V1.3 excludes heavy random-key MERGEs): one
-table of 1 000 000 keys, snapshotted, then updated at 1000 changes a second for 10 minutes over
-its whole key range, so every flush's keys fall in every data file. The figures are the sink's
-own merge metrics over the window.
+node, one table of 1 000 000 keys, snapshotted, then updated at 1000 changes a second for 10
+minutes over its whole key range, so every flush's keys fall in every data file. The table size
+is the snapshot's files; the MERGE count, bytes written and files removed are summed from the
+table's Delta log over the commits after the snapshot; the mean commit time is the delta of
+`data_avalanche_sink_commit_duration_seconds` over the window.
 
 | Measurement | PostgreSQL 18 | MySQL 8.4 |
 |---|---|---|
@@ -62,7 +68,7 @@ own merge metrics over the window.
 | Bytes written per MERGE | 13.0 MB | 11.1 MB |
 | Data files removed per MERGE | 5.95 | 5.95 |
 
-Each MERGE wrote about the table's size, so it rewrote close to the whole table, as D-MS.15
+Each MERGE wrote 85 to 99 % of the table's size, so it rewrote close to the whole table, as D-MS.15
 predicts: the cost is proportional to the files touched, not to the rows changed. On this table
 it is about a second a flush; it grows with the table's size, and is what
 `configuration/sink.md`'s flush guidance (fewer, larger flushes) and
@@ -93,13 +99,18 @@ and 56 MB) and ended below where it started: no growth.
 ## The chaos runs
 
 Each under load at the defaults, each ending with the lake holding the source's rows, every key
-once, and the owner epochs never going back (`lands`). All passed on both sources.
+once, and the owner epochs never going back (`lands`). All passed on both sources. The storage
+outages cut the node off from RustFS for 5 s (a third of the lease) and 45 s (three leases); the
+partition cuts the holder off from the other two nodes for four leases. A storage outage's time
+is from the store's return to the pipeline's status `running` (the short outage's status never
+left it); a restart's is from `docker compose restart` to the server accepting connections again,
+the pipeline's recovery shown by the lake converging afterwards.
 
 | Run | PostgreSQL 18 | MySQL 8.4 |
 |---|---|---|
-| Storage outage shorter than the lease | ✅ running again 0.0007 s after, 0 epochs | ✅ 0.0004 s, 0 epochs |
-| Storage outage longer than the lease | ✅ running again 2.66 s after, 1 epoch (the lease lost and retaken) | ✅ 2.69 s, 1 epoch |
-| Source server restart (`docker compose restart`) | ✅ streaming again 3.0 s after; 1 writer statement failed while it was down | ✅ 8.0 s; 4 statements failed while it was down |
+| Storage outage shorter than the lease | ✅ `running` 0.0007 s after the store's return, 0 epochs | ✅ 0.0004 s, 0 epochs |
+| Storage outage longer than the lease | ✅ `running` 2.66 s after, 1 epoch (the lease lost and retaken) | ✅ 2.69 s, 1 epoch |
+| Source server restart (`docker compose restart`) | ✅ accepting connections 3.0 s after the restart began; 1 writer statement failed while it was down | ✅ 8.0 s; 4 statements failed while it was down |
 | Partition of the holder from the other nodes | ✅ 0 epochs (the holder kept its lease through the store) | ✅ 0 epochs |
 
 The failed statements are the workload's own writes refused by the restarting server; nothing the
