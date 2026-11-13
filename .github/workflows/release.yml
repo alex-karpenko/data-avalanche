@@ -4,6 +4,8 @@ name: release
 # on a runner of its own architecture, to ghcr.io/<owner>/data-avalanche with an SBOM and a
 # provenance attestation; then, once the image is published, the Helm chart as an OCI artifact to
 # ghcr.io/<owner>/charts; and a GitHub release with the SBOM. The tag must equal the workspace's version and the chart's.
+# The `version` job also runs the dependency gate, `cargo xtask deps --check`: every pinned dependency is
+# at its newest stable version or held in dependency-exceptions.yaml, so a tag that fails it publishes nothing.
 # A manual run builds both images and packages the chart without pushing anything.
 on:
   push:
@@ -25,6 +27,11 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - name: Every dependency is current or held
+        run: cargo xtask deps --check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - id: version
         name: The tag, the workspace and the chart agree
         run: |
