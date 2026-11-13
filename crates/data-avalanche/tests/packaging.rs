@@ -41,6 +41,14 @@ fn the_image_builds_with_the_workspace_s_toolchain() {
 }
 
 #[test]
+fn the_msrv_is_the_toolchain_s_minor() {
+    let channel = value(&repo("rust-toolchain.toml"), "channel = ");
+    let minor = channel.rsplit_once('.').expect("a x.y.z channel").0;
+    let msrv = value(&repo("Cargo.toml"), "rust-version = ");
+    assert_eq!(msrv, minor, "rust-version isn't the toolchain's minor");
+}
+
+#[test]
 fn the_image_s_build_context_holds_every_workspace_member() {
     // `.dockerignore` lets in only what it names, and cargo reads every member's manifest even
     // to build one package: a member left out fails the image's build.
