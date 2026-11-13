@@ -156,6 +156,11 @@ pub fn newest_of_shape(current: &str, tags: &[String]) -> Option<String> {
         .cloned()
 }
 
+/// A tag without digits (`nonroot`, `latest`) floats by design: nothing to compare.
+fn floats(tag: &str) -> bool {
+    !tag.chars().any(|c| c.is_ascii_digit())
+}
+
 /// Whether `held` covers `current`: `*`, or a prefix ending at a version boundary.
 fn held_matches(held: &str, current: &str) -> bool {
     held == "*"
@@ -185,9 +190,15 @@ pub fn verdict(
         Ok(None) => Verdict::Floating,
         Ok(Some(newest)) if is_current(&item.current, &newest) => Verdict::Current,
         Ok(Some(newest)) => {
-            match exceptions.iter().find(|e| {
-                e.kind == item.kind && e.name == item.name && held_matches(&e.held, &item.current)
-            }) {
+            // A hold covers what lies outside its line: a newer version inside it (59.4.0 under
+            // `held: "59"`) is a plain bump, so the item is Behind. `*` covers everything.
+            let hold = exceptions.iter().find(|e| {
+                e.kind == item.kind
+                    && e.name == item.name
+                    && held_matches(&e.held, &item.current)
+                    && (e.held == "*" || !held_matches(&e.held, &newest))
+            });
+            match hold {
                 Some(e) => Verdict::Held {
                     newest,
                     reason: e.reason.clone(),
@@ -210,8 +221,12 @@ pub fn check_items(items: Vec<Item>, registry: &dyn Registry, exceptions: &[Exce
     let mut stale = Vec::new();
     for e in exceptions.iter().filter(|e| e.held != "*") {
         let named = |i: &Item| i.kind == e.kind && i.name == e.name;
+        // Held, or Behind with its newest inside the line (already failing, reported once as
+        // Behind, not again as stale): the exception is doing its job or is not the problem.
         let holds = items.iter().any(|(i, v)| {
-            named(i) && held_matches(&e.held, &i.current) && matches!(v, Verdict::Held { .. })
+            named(i)
+                && held_matches(&e.held, &i.current)
+                && matches!(v, Verdict::Held { .. } | Verdict::Behind { .. })
         });
         if holds {
             continue;
@@ -320,15 +335,19 @@ fn crates(root: &Path, items: &mut Vec<Item>) -> Result<(), String> {
     let nodes = meta["resolve"]["nodes"].as_array().ok_or("no resolve")?;
     let mut found = Vec::new();
     for member in members {
-        let Some(pkg) = by_id(member) else { continue };
+        let pkg =
+            by_id(member).ok_or_else(|| format!("workspace member {member} not in packages"))?;
         let manifest = rel(root, pkg["manifest_path"].as_str().unwrap_or_default());
-        let Some(node) = nodes.iter().find(|n| n["id"] == member) else {
-            continue;
-        };
+        let node = nodes
+            .iter()
+            .find(|n| n["id"] == member)
+            .ok_or_else(|| format!("workspace member {member} not in the resolve graph"))?;
         for dep in node["deps"].as_array().into_iter().flatten() {
-            let Some(dep_pkg) = dep["pkg"].as_str().and_then(by_id) else {
-                continue;
-            };
+            let id = dep["pkg"]
+                .as_str()
+                .ok_or("a resolve dependency without a pkg id")?;
+            let dep_pkg = by_id(id)
+                .ok_or_else(|| format!("{id} (a dependency of {member}) not in packages"))?;
             if dep_pkg["source"].is_null() {
                 continue; // a path dependency: ours
             }
@@ -617,15 +636,18 @@ impl Live {
             if line.starts_with('[') {
                 in_rust = line.trim() == "[pkg.rust]";
             } else if in_rust && let Some(v) = line.strip_prefix("version = ") {
-                return Ok(scalar(v).split_whitespace().next().map(String::from));
+                return match scalar(v).split_whitespace().next() {
+                    Some(version) => Ok(Some(version.to_string())),
+                    None => Err(format!("{url}: empty [pkg.rust] version")),
+                };
             }
         }
         Err(format!("{url}: no [pkg.rust] version"))
     }
 
     fn image_newest(&self, item: &Item) -> Result<Option<String>, String> {
-        if !item.current.chars().any(|c| c.is_ascii_digit()) {
-            return Ok(None); // `nonroot`, `latest`: floats by design
+        if floats(&item.current) {
+            return Ok(None);
         }
         let name = item.name.as_str();
         let mut tags = Vec::new();
@@ -651,6 +673,7 @@ impl Live {
             let mut url = Some(format!(
                 "https://hub.docker.com/v2/repositories/{repo}/tags?page_size=100&ordering=last_updated"
             ));
+            // The newest 5 x 100 tags by last_updated: enough for the shapes pinned here.
             for _ in 0..5 {
                 let Some(u) = url.take() else { break };
                 let json = self.json(&u)?;
@@ -907,6 +930,33 @@ mod tests {
         );
         assert_eq!(r.items[0].1, Verdict::Floating);
         assert!(r.passes());
+        assert!(floats("nonroot") && floats("latest"));
+        assert!(!floats("18") && !floats("v1.37.2-k3s1"));
+    }
+
+    #[test]
+    fn a_hold_does_not_cover_a_newer_version_inside_its_line() {
+        let ex = [hold(Kind::Crate, "arrow-array", "59")];
+        let i = || item(Kind::Crate, "arrow-array", "59.3.2");
+        let r = report(i(), Ok(Some("59.4.0")), &ex);
+        assert_eq!(
+            r.items[0].1,
+            Verdict::Behind {
+                newest: "59.4.0".into()
+            }
+        );
+        assert!(!r.passes());
+        // Reported once, as Behind: not also as stale.
+        assert!(r.stale.is_empty());
+        let r = report(i(), Ok(Some("60.1.0")), &ex);
+        assert!(matches!(r.items[0].1, Verdict::Held { .. }));
+        assert!(r.passes());
+    }
+
+    #[test]
+    fn a_hold_matches_at_a_version_boundary() {
+        assert!(held_matches("0.37", "0.37.3"));
+        assert!(!held_matches("0.37", "0.370.1"));
     }
 
     #[test]
