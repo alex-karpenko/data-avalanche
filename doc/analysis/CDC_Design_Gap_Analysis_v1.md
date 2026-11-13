@@ -883,8 +883,8 @@ target was missed, and no gap surfaced.
 | Soak, 24 h with churn (node 1 RSS ≤ 2×) | 24/24 checks, 143 churn steps, 17.0M changes, RSS 0.90× | — |
 
 R-5 is measured (DA-MS-3's row carries the numbers; it stays the decided caveat, D-MS.15). The
-cloud subset ran on GCS from Oleksii's machine (4/4 on each source, Task 5); its PR CI and
-`cloud.yml` runs are the exit's. The open count stays 0 (v1).
+cloud subset ran on GCS from Oleksii's machine (4/4 on each source, Task 5), then 4/4 on S3, GCS
+and Azure on each source in `cloud.yml` (run 43375990336) and on GCS in PR #22's `e2e-gcs`. The open count stays 0 (v1).
 
 ---
 
