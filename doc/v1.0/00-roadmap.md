@@ -1485,7 +1485,7 @@ GTID on (MariaDB also `gtid_strict_mode=1`).
 
 Pinned images (tags checked against their registries on 2026-09-26; refreshed in 1.0.1): `postgres:14…18`, `mysql:8.4`,
 `mariadb:10.11/11.4/11.8`, `rustfs/rustfs:1.0.5`, `mcr.microsoft.com/azure-storage/azurite:3.37.0`;
-init tools `amazon/aws-cli:2.40.2`, `mcr.microsoft.com/azure-cli:2.92.0-azurelinux4.0`. Conditional
+init tools `amazon/aws-cli:2.40.3`, `mcr.microsoft.com/azure-cli:2.92.0-azurelinux4.0`. Conditional
 create/update measured 2026-09-26: **RustFS PASS, Azurite PASS, real GCS PASS** (via `object_store`),
 fake-gcs FAIL (risk R-3).
 

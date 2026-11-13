@@ -948,11 +948,14 @@ suites green. Held: arrow 60 (deltalake-core 1.1.4 requires `^59`), mysql_common
 `doc/v1.0/v1.0.1-dependency-refresh.md` built and re-run (`v1-acceptance.md`, "1.0.1 re-run", at
 `baceeb4`).
 
-- **The moves.** Rust 1.98.1 → 1.100.0 (two `fetch_update` → `try_update` renames); deltalake 1.1
+- **The moves.** Rust 1.98.1 → 1.100.0 (two `fetch_update` → `try_update` renames, in test code); deltalake 1.1
   (`=1.1.2`, `deltalake-core =1.1.4`); pgwire-replication 0.5, serde-saphyr 2, sqlparser 0.64,
   prometheus-client 0.26, base64 0.23, getrandom 0.4; jsonwebtoken 12 (`EncodingKey::from_secret` now
-  returns a `Result`; no auth check changed); the compatible bumps in `Cargo.lock`; the CI tools,
-  the test-infra images, DuckDB 2.0 (a Delta table under a non-ASCII path still reads); the docs
+  returns a `Result`, which a test unwraps; no auth check changed); the compatible bumps in
+  `Cargo.lock`; the CI tools (`prom/prometheus` v3.16.0, and the Dockerfile's `# syntax` frontend
+  1.29, both found behind by the whole-branch review: the inventory now reads `docker run` images in
+  workflow steps and the `# syntax` line), the test-infra images, DuckDB 2.0 (a Delta table under a
+  non-ASCII path now reads); the docs
   site (Starlight 0.43.0, Astro 7.4.12, Mermaid 12.3, Node 26 LTS; the first two released the day
   of the re-run, `e61846b`). Version `1.0.1`.
 - **The holds** (`dependency-exceptions.yaml`): the arrow crates at 59 (deltalake-core 1.1.4
@@ -971,12 +974,13 @@ suites green. Held: arrow 60 (deltalake-core 1.1.4 requires `^59`), mysql_common
   release's AWS SDK bumps dropped it from `Cargo.lock`) is gone, and `release.yml` refuses a tag
   while `cargo xtask audit --check` fails (an unaccepted advisory included). Three stay: quick-xml
   0.39.4 (RUSTSEC-2026-0194, -0195) and proc-macro-error2 2.0.1 (RUSTSEC-2026-0173).
-- **The counts are unchanged.** 1523 tests with the ITs (hermetic 1508 after the toolchain bump),
-  the E2E 51/51 on each source (on PostgreSQL one scenario, the failover slot's, self-skips locally
+- **What is unchanged.** 1523 tests with the ITs (the hermetic count rose with the xtask tests,
+  1508 after the toolchain bump), the E2E 51/51 on each source (on PostgreSQL one scenario, the failover slot's, self-skips locally
   and is proven by PR CI); bench 3/3 and chaos 4/4 on each source, with the D-V1.3 targets met as
   before (p99 30.8 / 30.6 s, failover 53.5 / 52.3 s). The churn MERGE's mean time fell to
   1.07 / 1.03 s (1.18 / 1.38 s in 1.0.0), its bytes and files per MERGE unchanged; the site's
-  figures now quote it. The 24 h soak was not re-run (D-R6).
+  figures now quote it. The 24 h soak was not re-run (D-R6): no product code changed, but the engine
+  (deltalake 1.1 and DataFusion) did move, and bench and chaos are the compensating evidence.
 
 No gap opened or closed; the ⏭ v2 rows stay.
 

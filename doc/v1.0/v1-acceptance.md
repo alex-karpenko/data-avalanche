@@ -138,13 +138,14 @@ were run again: the full integration and E2E suites, `cargo xtask bench` and `ca
 both sources. Same machine and containers as above (PostgreSQL 18, MySQL 8.4, RustFS), 2026-11-13,
 at `baceeb4` (workspace version 1.0.1).
 
-**What moved.** Rust 1.98.1 → 1.100.0 (two `fetch_update` → `try_update` renames, the only product
-code the toolchain forced); deltalake 1.0 → 1.1 (`deltalake =1.1.2`, `deltalake-core =1.1.4`:
+**What moved.** Rust 1.98.1 → 1.100.0 (two `fetch_update` → `try_update` renames, in test code;
+no product code changed beyond a comment and a message in `sink.rs`); deltalake 1.0 → 1.1 (`deltalake =1.1.2`, `deltalake-core =1.1.4`:
 delta-rs now reports the truncate-vs-OPTIMIZE race as a conflict itself, our post-DELETE check stays
 as a backstop); pgwire-replication 0.5, serde-saphyr 2, sqlparser 0.64, prometheus-client 0.26,
-base64 0.23, getrandom 0.4; jsonwebtoken 12 (`EncodingKey::from_secret` returns a `Result`; no auth
-check changed); the compatible bumps in `Cargo.lock`; the CI tools, the test-infra images and
-DuckDB 2.0; the docs site (Starlight 0.43.0, Astro 7.4.12, Mermaid 12.3, Node 26 LTS; the first
+base64 0.23, getrandom 0.4; jsonwebtoken 12 (`EncodingKey::from_secret` returns a `Result`; a test unwraps it, no auth
+check changed); the compatible bumps in `Cargo.lock`; the CI tools (`prom/prometheus` v3.16.0, and the Dockerfile's `# syntax` frontend 1.29, which the
+gate's inventory missed until the whole-branch review), the test-infra images and DuckDB 2.0
+(a Delta table under a non-ASCII path now reads); the docs site (Starlight 0.43.0, Astro 7.4.12, Mermaid 12.3, Node 26 LTS; the first
 two released the day of the re-run, `e61846b`). Held in `dependency-exceptions.yaml`: the arrow
 crates at 59 (deltalake-core 1.1.4 requires `^59`), mysql_common at 0.37 (mysql_async 0.37.1
 requires `^0.37`), and the PostgreSQL, MySQL and MariaDB images (the support matrix).
@@ -183,10 +184,10 @@ files per MERGE unchanged, so D-MS.15's reading stands); its mean time fell 25 %
 `configuration/sink.md` and `deployment/observability.md` is updated to the 1.0.1 measurement. A
 source restart's time is the container's own and has no target.
 
-**The soak was not re-run** (D-R6): no product code changed beyond the two renames the toolchain
-forced and jsonwebtoken 12's `Result`, none of them in the memory or checkpoint paths the soak
-exercises, and the 1.0.1 bench and chaos runs show the engine's steady and failure behaviour
-unchanged. It can be run on request (`cargo xtask soak`).
+**The soak was not re-run** (D-R6). No product code changed beyond a comment and a message in
+`sink.rs`, but the engine the soak's memory profile depends on (deltalake 1.1 and DataFusion) did
+move. The 1.0.1 bench and chaos runs are the compensating evidence: they show the engine's steady
+and failure behaviour unchanged. The soak can be run on request (`cargo xtask soak`).
 
 ## The §8 checklist
 
