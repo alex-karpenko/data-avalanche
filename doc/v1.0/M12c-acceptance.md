@@ -4213,10 +4213,10 @@ git add Cargo.toml Cargo.lock deploy/helm/data-avalanche doc/v1.0 && git commit 
 
 ## Exit
 
-- [ ] Every task's tests, the gates, and the ITs and E2E their tasks name, green (the whole-branch
+- [x] Every task's tests, the gates, and the ITs and E2E their tasks name, green (the whole-branch
   run as M12d's Exit: the workspace ITs, the MySQL targets, PostgreSQL 17 and 14, the E2E on
   PostgreSQL 18 with both replica pairs and on `mysql-84`).
-- [ ] The acceptance runs green on Oleksii's machine (Task 8), D-V1.3 met on both sources.
+- [x] The acceptance runs green on Oleksii's machine (Task 8), D-V1.3 met on both sources.
 - [ ] After the whole-branch review and its fixes: the branch pushed, the PR open; its CI green,
   `e2e-gcs` included. With Oleksii's OK, `cloud.yml` dispatched on the branch (`gh workflow run
   cloud.yml --ref feat/claude/m12c-acceptance`): `e2e` green on S3, GCS and Azure, and the report's
@@ -4224,6 +4224,14 @@ git add Cargo.toml Cargo.lock deploy/helm/data-avalanche doc/v1.0 && git commit 
 - [ ] Oleksii merges, then tags `v1.0.0` on `main`; `release.yml` publishes the image and the
   chart. A short follow-up PR records the release in the README and §8 (as v0.1.0 was recorded in
   M11b's row).
+
+Checked 2026-11-13 at `c292cb6`, after the whole-branch review's fix wave and its re-review's
+residuals: every gate (`cargo test --workspace` 1508 passed) and every CI integration command
+passed locally, with both replica pairs recreated: the workspace ITs; `mysql-84-nogtid`,
+`mariadb-118`, `mariadb-118-binlog`; PostgreSQL 17 and 14 (source and pipeline suites); the E2E
+51/51 on PostgreSQL 18 and 51/51 on `mysql-84`. The harness's review fixes were run short on
+PostgreSQL 18 (bench 3/3, chaos 4/4, soak 1/1); the full-length runs (Task 8) stand, as the fixes
+add checks, not measurements.
 
 ## Verification in planning (2026-11-11)
 
