@@ -11,10 +11,22 @@ S3-compatible store). Each source table becomes a Delta table that mirrors it: i
 are upserts by primary key, deletes remove the row, and every flush commits all of a table's changes
 in one Delta transaction.
 
-:::caution[Not for production yet]
-data-avalanche is under development. v1 is being built and hasn't been tested at scale or in
-production. Expect missing features, breaking changes to the config and the state layout, and bugs.
-Try it on data you can rebuild, and report what you find in the
+:::caution[Not ready for production]
+data-avalanche is under active development and has not been run against production databases or
+workloads. Until it has been, treat every version as experimental:
+
+- **Breaking changes without migration.** The config format, the state kept in object storage and
+  the management API can change between versions; an upgrade may mean starting the pipelines
+  afresh.
+- **Tested on containers and emulators, not at scale.** The test suites run against local database
+  containers and storage emulators. Large tables, long outages, real network faults and every
+  cloud's quirks haven't been exercised, and a bug can leave the lake out of step with the source.
+- **It holds resources on your source.** On PostgreSQL it creates a replication slot and a
+  publication; a stopped or stuck pipeline keeps the slot, and the slot keeps WAL on the primary's
+  disk until the pipeline resumes or the slot is dropped.
+
+To try it, point it at a replica or a throwaway copy of the database and at a bucket or prefix of
+its own, and watch the source's disk. Bug reports and feedback are welcome in the
 [issue tracker](https://github.com/alex-karpenko/data-avalanche/issues).
 :::
 
