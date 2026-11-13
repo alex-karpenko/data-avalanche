@@ -1636,8 +1636,8 @@ implements them.
 - [x] Real-cloud E2E on S3, GCS and Azure. Met 2026-11-13: the cloud subset 4/4 on S3, GCS and
       Azure on PostgreSQL 18 and MySQL 8.4 (`cloud.yml` run 43375990336; `v1-acceptance.md`).
 - [ ] Container image and Helm chart published; k3s smoke deploy green.
-- [ ] Documentation site builds strict; runbooks reviewed. The site builds strict, every internal
-      link valid (2026-11-13); the runbooks' review at the Exit.
+- [x] Documentation site builds strict; runbooks reviewed. The site builds strict, every internal
+      link valid (2026-11-13); the runbooks reviewed by Oleksii (2026-11-13).
 - [x] Compile time and dependency tree reviewed against a `cargo build --timings` measurement (M12,
       Q-M5-24). Met by M12b Task 15 (line tables taken).
 - [x] Gap tracker updated: implementation-surfaced gaps recorded, v1 rows closed with pointers to code

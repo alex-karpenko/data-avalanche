@@ -139,6 +139,6 @@ run passed all four.
 | No data loss or duplicate keys in the crash/replay/chaos suites | ✅ | the crash and replay scenarios in `crates/data-avalanche/tests/e2e/` (`crashes.rs`, `failover.rs`; every PR); the chaos runs above; the soak's hourly checks |
 | Real-cloud E2E on S3, GCS and Azure | ✅ | the cloud subset 4/4 on each store and source: `cloud.yml` run 43375990336, and PR CI's `e2e-gcs` (above) |
 | Container image and Helm chart published; k3s smoke deploy green | at the Exit | `release.yml` on the `v1.0.0` tag (M11a) |
-| Documentation site builds strict; runbooks reviewed | builds ✅; review at the Exit | `docs/` builds strict, every internal link valid (2026-11-13, after this report's page edits); the runbooks' review is Oleksii's |
+| Documentation site builds strict; runbooks reviewed | ✅ | `docs/` builds strict, every internal link valid (2026-11-13, after this report's page edits); the runbooks reviewed by Oleksii (2026-11-13) |
 | Compile time and dependency tree reviewed against `cargo build --timings` | ✅ | M12b Task 15 (`doc/v1.0/M12b-control-hardening.md`): measured, line tables taken |
 | Gap tracker updated | ✅ | `CDC_Design_Gap_Analysis_v1.md` §63 (open 5 → 0) and §64 |
