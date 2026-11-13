@@ -932,6 +932,17 @@ Next recheck: when #3564 and #3300 merge (the COW mirror), and when #2203 merges
 then run G1 from `prototypes/iceberg-capability/README.md` against `main`. No count changes: the
 rows stay ⏭ v2.
 
+## 67. 1.0.1 dependency refresh — the plan (2026-11-13)
+
+`doc/v1.0/v1.0.1-dependency-refresh.md`: every dependency to its newest stable version, and a release
+gate (`cargo xtask deps --check` in `release.yml`) with written holds in `dependency-exceptions.yaml`.
+Verified in scratch: Rust 1.100.0 needs two `fetch_update` → `try_update` renames; deltalake 1.1
+compiles unchanged and now reports the truncate-vs-OPTIMIZE race as a conflict itself (probe P11a's
+gap in 1.0; our post-DELETE check stays as a backstop); pgwire-replication 0.5, serde-saphyr 2,
+sqlparser 0.64, prometheus-client 0.26, base64 0.23 and getrandom 0.4 compile unchanged with their
+suites green. Held: arrow 60 (deltalake-core 1.1.4 requires `^59`), mysql_common 0.38 (mysql_async
+0.37.1 requires `^0.37`). No gap opened or closed.
+
 ---
 
 ### Counts (by status)
@@ -943,7 +954,7 @@ rows stay ⏭ v2.
 > M7a's plan (§32), 2026-10-16 for M7a's exit (§33), 2026-10-17 for M7b's plan (§34),
 > 2026-10-20 for M7b's exit (§35), 2026-10-21 for M8a's plan (§36), 2026-10-22 for M8a's exit (§37),
 > 2026-10-22 for M8b's plan (§38), 2026-10-23 for M8b's exit (§39), 2026-10-23 for M9a's plan
-> (§40), 2026-10-23 for M9a's exit (§41), 2026-10-27 for M9b's plan (§42), 2026-10-28 for M9b's exit (§43), 2026-10-28 for M10's plan (§44), and 2026-10-29 for M10's exit (§45), and 2026-10-29 for M11a's plan (§46), and 2026-10-29 for M11a's whole-branch review (§47), and 2026-10-29 for M11a's exit (§48), and 2026-10-29 for M11b's plan (§49), and 2026-10-30 for M11b's pages (§50), and 2026-10-30 for M11b's exit and v0.1.0 (§51), and 2026-10-30 for M12a's plan (§52), and 2026-11-04 for M12a's gaps closed (§53), and 2026-11-04 for M12a's whole-branch review (§54), and 2026-11-04 for M12a's exit (§55), and 2026-11-06 for M12b's gaps closed (§57), and 2026-11-06 for M12b's exit (§58), and 2026-11-06 for M12d's plan (§59), and 2026-11-10 for M12d's gaps closed (§60), and 2026-11-11 for M12d's whole-branch review (§61), and 2026-11-11 for M12d's exit (§62), and 2026-11-11 for M12c's gaps closed (§63), and 2026-11-13 for M12c's acceptance runs (§64, no change), and 2026-11-13 for v1.0.0's release (§65, no change), and 2026-11-13 for the iceberg-rust recheck (§66, no change).
+> (§40), 2026-10-23 for M9a's exit (§41), 2026-10-27 for M9b's plan (§42), 2026-10-28 for M9b's exit (§43), 2026-10-28 for M10's plan (§44), and 2026-10-29 for M10's exit (§45), and 2026-10-29 for M11a's plan (§46), and 2026-10-29 for M11a's whole-branch review (§47), and 2026-10-29 for M11a's exit (§48), and 2026-10-29 for M11b's plan (§49), and 2026-10-30 for M11b's pages (§50), and 2026-10-30 for M11b's exit and v0.1.0 (§51), and 2026-10-30 for M12a's plan (§52), and 2026-11-04 for M12a's gaps closed (§53), and 2026-11-04 for M12a's whole-branch review (§54), and 2026-11-04 for M12a's exit (§55), and 2026-11-06 for M12b's gaps closed (§57), and 2026-11-06 for M12b's exit (§58), and 2026-11-06 for M12d's plan (§59), and 2026-11-10 for M12d's gaps closed (§60), and 2026-11-11 for M12d's whole-branch review (§61), and 2026-11-11 for M12d's exit (§62), and 2026-11-11 for M12c's gaps closed (§63), and 2026-11-13 for M12c's acceptance runs (§64, no change), and 2026-11-13 for v1.0.0's release (§65, no change), and 2026-11-13 for the iceberg-rust recheck (§66, no change), and 2026-11-13 for 1.0.1's plan (§67, no change).
 
 | Status | Count (v1 scope) | Notes |
 |---|---|---|
