@@ -6,9 +6,9 @@ gossip, ownership by a lease in the object store, so a node that leaves or dies 
 pipelines to the others.
 
 > [!WARNING]
-> **Not ready for production.** data-avalanche is under active development toward its first
-> release (v1.0.0) and has not been run against production databases or workloads. Until it has
-> been, treat every version as experimental:
+> **Not ready for production.** data-avalanche is under active development and has not been run
+> against production databases or workloads. Until it has been, treat every version as
+> experimental:
 >
 > - **Breaking changes without migration.** The config format, the state kept in object storage
 >   and the management API can change between versions; an upgrade may mean starting the
