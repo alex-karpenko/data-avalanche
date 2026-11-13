@@ -418,6 +418,64 @@ fn image_item(reference: &str, pinned_in: &str) -> Option<Item> {
     })
 }
 
+/// The Dockerfile's `# syntax=<image>:<tag>` frontend pin, if `line` is that directive.
+fn syntax_frontend(line: &str) -> Option<String> {
+    let rest = line
+        .trim()
+        .strip_prefix('#')?
+        .trim_start()
+        .strip_prefix("syntax")?;
+    let value = rest.trim_start().strip_prefix('=')?.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+/// `docker run` flags that take their value as the next word.
+const DOCKER_RUN_VALUE_FLAGS: &[&str] = &[
+    "-v",
+    "--volume",
+    "-e",
+    "--env",
+    "--entrypoint",
+    "-w",
+    "--workdir",
+    "--name",
+    "--network",
+    "-u",
+    "--user",
+    "-p",
+    "--publish",
+    "--mount",
+    "--platform",
+    "--env-file",
+    "-l",
+    "--label",
+];
+
+/// The registry images a workflow's `run:` text starts with `docker run` (flags skipped). A name
+/// without a `/` is an image the job built itself (`data-avalanche:arm64`), not a pin.
+fn docker_run_images(text: &str) -> Vec<String> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let mut found = Vec::new();
+    for (i, w) in words.iter().enumerate() {
+        if *w != "docker" || words.get(i + 1) != Some(&"run") {
+            continue;
+        }
+        let mut rest = words[i + 2..].iter();
+        while let Some(w) = rest.next() {
+            if DOCKER_RUN_VALUE_FLAGS.contains(w) {
+                rest.next();
+            } else if !w.starts_with('-') {
+                let image = w.trim_matches(|c| c == '"' || c == '\'');
+                if image.contains('/') && image.contains(':') {
+                    found.push(image.to_string());
+                }
+                break;
+            }
+        }
+    }
+    found
+}
+
 fn images(root: &Path, items: &mut Vec<Item>) -> Result<(), String> {
     let compose = "test-infra/compose.yaml";
     for line in read(root, compose)?.lines() {
@@ -427,6 +485,9 @@ fn images(root: &Path, items: &mut Vec<Item>) -> Result<(), String> {
     }
     let docker = "deploy/docker/Dockerfile";
     for line in read(root, docker)?.lines() {
+        if let Some(item) = syntax_frontend(line).and_then(|r| image_item(&r, docker)) {
+            items.push(item);
+        }
         let mut words = line.split_whitespace();
         if !words.next().is_some_and(|w| w.eq_ignore_ascii_case("FROM")) {
             continue;
@@ -452,6 +513,9 @@ fn workflows(root: &Path, items: &mut Vec<Item>) -> Result<(), String> {
     for file in files {
         let pinned_in = rel(root, &file.display().to_string());
         let text = std::fs::read_to_string(&file).map_err(|e| format!("{pinned_in}: {e}"))?;
+        for r in docker_run_images(&text) {
+            items.extend(image_item(&r, &pinned_in));
+        }
         let lines: Vec<&str> = text.lines().collect();
         for (n, line) in lines.iter().enumerate() {
             let t = line.trim_start();
@@ -977,6 +1041,43 @@ mod tests {
                 .all(|i| !i.pinned_in.starts_with("prototypes/")),
             "a prototype's dependency is inventoried"
         );
+    }
+
+    #[test]
+    fn a_docker_run_image_in_a_workflow_step_is_inventoried() {
+        let text = r#"
+      - name: Alert rules
+        run: >-
+          docker run --rm -v "$PWD/deploy/prometheus:/rules:ro" --entrypoint promtool
+          prom/prometheus:v3.16.0 test rules /rules/alerts.test.yaml
+      - run: |
+          helm template x \
+              | docker run --rm -i ghcr.io/yannh/kubeconform:v0.8.0 -strict -summary -
+      - run: docker run --rm -v "$PWD:/repo:ro" --workdir /repo rhysd/actionlint:1.7.12 -no-color
+      - run: docker run --rm data-avalanche:arm64 --version
+"#;
+        assert_eq!(
+            docker_run_images(text),
+            [
+                "prom/prometheus:v3.16.0",
+                "ghcr.io/yannh/kubeconform:v0.8.0",
+                "rhysd/actionlint:1.7.12",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_dockerfile_syntax_frontend_is_inventoried() {
+        assert_eq!(
+            syntax_frontend("# syntax=docker/dockerfile:1.29").as_deref(),
+            Some("docker/dockerfile:1.29")
+        );
+        assert_eq!(
+            syntax_frontend("#syntax = docker/dockerfile:1").as_deref(),
+            Some("docker/dockerfile:1")
+        );
+        assert_eq!(syntax_frontend("# The data-avalanche image"), None);
+        assert_eq!(syntax_frontend("FROM rust:1 AS build"), None);
     }
 
     #[test]

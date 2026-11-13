@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.29
 # The data-avalanche image (roadmap §4 M11a): the release binary on distroless, as the
 # non-root user. Built from the repository root:
 #   docker build -f deploy/docker/Dockerfile -t data-avalanche .
