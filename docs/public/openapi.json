@@ -3,7 +3,7 @@
   "info": {
     "title": "data-avalanche management API",
     "description": "`globals.api.auth` decides which credentials a node takes: none, basic (one user, admin), or a bearer JWT whose roles are mapped (config §6.3).",
-    "version": "1.0.0"
+    "version": "1.0.1"
   },
   "paths": {
     "/v1/admin/shutdown": {

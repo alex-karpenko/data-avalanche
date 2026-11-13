@@ -1743,7 +1743,7 @@ dependencies = [
 
 [[package]]
 name = "data-avalanche"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -1781,7 +1781,7 @@ dependencies = [
 
 [[package]]
 name = "data-avalanche-api"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -1815,7 +1815,7 @@ dependencies = [
 
 [[package]]
 name = "data-avalanche-cluster"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "arrow-array",
  "async-trait",
@@ -1844,7 +1844,7 @@ dependencies = [
 
 [[package]]
 name = "data-avalanche-config"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "blake3",
  "data-avalanche-core",
@@ -1862,7 +1862,7 @@ dependencies = [
 
 [[package]]
 name = "data-avalanche-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "arrow-array",
  "arrow-row",
@@ -1877,7 +1877,7 @@ dependencies = [
 
 [[package]]
 name = "data-avalanche-pipeline"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -1906,7 +1906,7 @@ dependencies = [
 
 [[package]]
 name = "data-avalanche-sink-delta"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -1931,7 +1931,7 @@ dependencies = [
 
 [[package]]
 name = "data-avalanche-source-mysql"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1954,7 +1954,7 @@ dependencies = [
 
 [[package]]
 name = "data-avalanche-source-pg"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1977,7 +1977,7 @@ dependencies = [
 
 [[package]]
 name = "data-avalanche-state"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1998,7 +1998,7 @@ dependencies = [
 
 [[package]]
 name = "data-avalanche-storage"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2011,7 +2011,7 @@ dependencies = [
 
 [[package]]
 name = "data-avalanche-telemetry"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "data-avalanche-testkit",
  "opentelemetry",
@@ -2029,7 +2029,7 @@ dependencies = [
 
 [[package]]
 name = "data-avalanche-testkit"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "arrow-array",
  "arrow-row",
@@ -7063,7 +7063,7 @@ checksum = "66fee0b777b0f5ac1c69bb06d361268faafa61cd4682ae064a171c16c433e9e4"
 
 [[package]]
 name = "xtask"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "data-avalanche-api",
  "data-avalanche-config",
