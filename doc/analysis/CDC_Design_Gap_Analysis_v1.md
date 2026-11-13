@@ -953,7 +953,8 @@ suites green. Held: arrow 60 (deltalake-core 1.1.4 requires `^59`), mysql_common
   prometheus-client 0.26, base64 0.23, getrandom 0.4; jsonwebtoken 12 (`EncodingKey::from_secret` now
   returns a `Result`; no auth check changed); the compatible bumps in `Cargo.lock`; the CI tools,
   the test-infra images, DuckDB 2.0 (a Delta table under a non-ASCII path still reads); the docs
-  site (Starlight 0.42.11, Astro 7.4.11, Mermaid 12.3, Node 26 LTS). Version `1.0.1`.
+  site (Starlight 0.43.0, Astro 7.4.12, Mermaid 12.3, Node 26 LTS; the first two released the day
+  of the re-run, `e61846b`). Version `1.0.1`.
 - **The holds** (`dependency-exceptions.yaml`): the arrow crates at 59 (deltalake-core 1.1.4
   requires `^59`; one arrow major workspace-wide, D-MS.14), mysql_common at 0.37 (mysql_async 0.37.1,
   the newest, requires `^0.37`), and the postgres, mysql and mariadb images (the source support
@@ -970,7 +971,7 @@ suites green. Held: arrow 60 (deltalake-core 1.1.4 requires `^59`), mysql_common
   and is proven by PR CI); bench 3/3 and chaos 4/4 on each source, with the D-V1.3 targets met as
   before (p99 30.8 / 30.6 s, failover 53.5 / 52.3 s). The churn MERGE's mean time fell to
   1.07 / 1.03 s (1.18 / 1.38 s in 1.0.0), its bytes and files per MERGE unchanged; the site's
-  figures follow. The 24 h soak was not re-run (D-R6).
+  figures now quote it. The 24 h soak was not re-run (D-R6).
 
 No gap opened or closed; the ⏭ v2 rows stay.
 
