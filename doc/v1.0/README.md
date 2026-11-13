@@ -77,6 +77,27 @@ This folder holds the plan for **building** v1. The design it implements is in `
 CI secrets and variables are listed in `test-infra/README.md` ("CI requirements") and in the comments
 of `.github/workflows/ci.yml`.
 
+## Releases
+
+Every release takes the newest stable version of everything. Where a newer version can't be used
+yet, the exception is written down with its reason and checked again at the next release. The
+checklist, in order:
+
+1. **Refresh the dependencies.** Start with `cargo update`: a held crate's newer patch inside its
+   held line is invisible to the check (crates.io reports one newest version), and `cargo update`
+   picks it up. Then run `cargo xtask deps`. Move every item it lists to its newest stable version,
+   or hold it in `dependency-exceptions.yaml` with the reason it can't move, and re-check every hold.
+   Locally the command needs `GITHUB_TOKEN` set, because the unauthenticated GitHub API allows 60
+   calls an hour (about three runs): `GITHUB_TOKEN=$(gh auth token) cargo xtask deps --check`.
+2. **Verify.** The hermetic suite; full integration and E2E on both sources (CI's MySQL/MariaDB
+   matrix); k3s; `cloud.yml` on S3, GCS and Azure; and, when the Delta engine or a source transport
+   moves, `cargo xtask bench` and `chaos` on both sources.
+3. **Bump the version** in `Cargo.toml`, in `Chart.yaml` (`version` and `appVersion`) and in the
+   chart README's install line, then run `cargo xtask docs`.
+4. **One PR** carries the refresh, the verification notes and the bump.
+5. **After the merge, tag `v<version>`.** `release.yml` re-runs `cargo xtask deps --check` and
+   refuses a tag that fails it.
+
 ## Commit conventions for implementation work
 
 The doc prefixes from `CLAUDE.md` (`spec:`, `research:`, `gap:`, `infra:`) cover design
