@@ -12,7 +12,10 @@ workspace = true
 [dependencies]
 data-avalanche-config.workspace = true
 data-avalanche-api.workspace = true
+serde.workspace = true
+serde-saphyr.workspace = true
 serde_json.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
 
 [dev-dependencies]
 rcgen.workspace = true

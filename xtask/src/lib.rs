@@ -7,6 +7,7 @@
 mod acceptance;
 mod api;
 mod config;
+pub mod deps;
 mod examples;
 mod rules;
 

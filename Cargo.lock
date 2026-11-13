@@ -7077,6 +7077,9 @@ dependencies = [
  "data-avalanche-api",
  "data-avalanche-config",
  "rcgen",
+ "reqwest 0.13.5",
+ "serde",
+ "serde-saphyr",
  "serde_json",
 ]
 
