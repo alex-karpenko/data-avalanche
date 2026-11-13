@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-11
+updated: 2026-11-13
 domain: Architecture
 tags: [architecture, data-flow, pipeline, cdc, iceberg, delta-lake, multi-sink, arrow, snapshot, replication]
 sources: []
@@ -551,8 +551,10 @@ server's positions may sort below the stored markers, and the union would skip i
 A recovery from a changed source commits one per table the sink holds, and per table the pipeline
 resolves or has a cached schema for, under the key the table was made with; a table whose
 reposition the sink refuses for good halts `SINK_REJECTED` (DA-SRC-32), and stays halted while the
-sink holds it, tracked or not: no later start repositions it, so only a snapshot job's copy of it,
-or the table gone from the sink, ends the halt (DA-SRC-37). Each is fenced like any commit, before the checkpoint naming the new server is saved and the stream starts. The pipeline **resume checkpoint** persisted to state storage is the
+sink holds it, tracked or not: no later start from the same server repositions it, so only a
+snapshot job's copy of it, or the table gone from the sink, ends the halt (DA-SRC-37). Each is
+fenced like any commit, before the checkpoint naming the new server is saved and the stream
+starts. The pipeline **resume checkpoint** persisted to state storage is the
 **laggard** across all tracked tables (PG `min` / MySQL set-intersection); tables ahead skip via the
 guard or are absorbed by idempotency. The epoch rejects a zombie writer; the position skips done work.
 See `research/Delivery_Guarantee_and_Position_Guard.md` (G-14).
