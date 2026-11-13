@@ -288,8 +288,9 @@ fn duckdb_read(root: &std::path::Path) -> Vec<Vec<Option<String>>> {
 }
 
 /// R-12: an independent reader (DuckDB, delta-kernel based) reads the table, clamped bounds
-/// included, and a table under an escaped root (Q-M4-5). DuckDB can't open a path with non-ASCII
-/// text (Q-M4-6), so the escaped name here is ASCII.
+/// included, and a table under an escaped root (Q-M4-5). The escaped name includes non-ASCII text,
+/// which DuckDB's delta extension once refused (Q-M4-6, 1.5.5 and 1.5.6 in 2026-09) and reads as
+/// of 2.0.0.
 #[tokio::test]
 async fn duckdb_reads_the_table() {
     require_it!();
@@ -324,8 +325,8 @@ async fn duckdb_reads_the_table() {
         cell(2, "dec"),
         Some("9999999999999999999999999999.9999999999")
     );
-    let ascii = TableRef::new("sales 50%", "a/b~c");
-    let odd = crate::scenarios::escaped_names(location, ascii).await;
+    let odd_name = TableRef::new("zamówienia 50%", "日本/b~c");
+    let odd = crate::scenarios::escaped_names(location, odd_name).await;
     let root = data_avalanche_storage::table_root("", "", &odd.schema, &odd.name).root;
     let rows = duckdb_read(&dir.path().join(root));
     assert_eq!((rows.len(), rows[0][1].as_deref()), (1, Some("a")));
