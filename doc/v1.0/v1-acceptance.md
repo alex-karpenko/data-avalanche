@@ -130,6 +130,64 @@ run passed all four.
 | `cloud.yml` `e2e`, same run | GCS | 4/4, 193 s | 4/4, 173 s |
 | `cloud.yml` `e2e`, same run | Azure | 4/4, 132 s | 4/4, 145 s |
 
+## 1.0.1 re-run
+
+The `1.0.1` maintenance release (`doc/v1.0/v1.0.1-dependency-refresh.md`) moved every dependency to
+its newest stable version, so the runs that the Delta engine and the source transports can change
+were run again: the full integration and E2E suites, `cargo xtask bench` and `cargo xtask chaos` on
+both sources. Same machine and containers as above (PostgreSQL 18, MySQL 8.4, RustFS), 2026-11-13,
+at `baceeb4` (workspace version 1.0.1).
+
+**What moved.** Rust 1.98.1 → 1.100.0 (two `fetch_update` → `try_update` renames, the only product
+code the toolchain forced); deltalake 1.0 → 1.1 (`deltalake =1.1.2`, `deltalake-core =1.1.4`:
+delta-rs now reports the truncate-vs-OPTIMIZE race as a conflict itself, our post-DELETE check stays
+as a backstop); pgwire-replication 0.5, serde-saphyr 2, sqlparser 0.64, prometheus-client 0.26,
+base64 0.23, getrandom 0.4; jsonwebtoken 12 (`EncodingKey::from_secret` returns a `Result`; no auth
+check changed); the compatible bumps in `Cargo.lock`; the CI tools, the test-infra images and
+DuckDB 2.0; the docs site (Starlight 0.42.11, Astro 7.4.11, Mermaid 12.3, Node 26 LTS). Held in
+`dependency-exceptions.yaml`: the arrow crates at 59 (deltalake-core 1.1.4 requires `^59`),
+mysql_common at 0.37 (mysql_async 0.37.1 requires `^0.37`), and the PostgreSQL, MySQL and MariaDB
+images (the support matrix).
+
+| Run | Result |
+|---|---|
+| `DATA_AVALANCHE_IT=1 cargo test --workspace --no-fail-fast`, real GCS set | 1523 passed, 0 failed (6 min) |
+| E2E on PostgreSQL 18 (`--test-threads=1`) | 51/51: 49 with `--skip failover::`, then `failover::` 2/2 on a freshly made replica pair (17 s). One of the two, `a_promotion_the_failover_slot_followed_continues_the_stream`, self-skipped: the slot-sync pair wasn't set up locally, so PR CI's e2e job, which sets both pairs on fresh containers, is where it is proven |
+| E2E on MySQL 8.4 | 51/51 (8 min) |
+| `cargo xtask bench` / `chaos` on PostgreSQL 18 | bench 3/3 (67 min), chaos 4/4 (7 min) |
+| `cargo xtask bench` / `chaos` on MySQL 8.4 | bench 3/3 (44 min), chaos 4/4 (8 min) |
+| PR CI (`check`, `integration`, MySQL/MariaDB matrix, `e2e-gcs`, `k3s`, `docs`) | pending: PR CI after the push |
+| `cloud.yml` on S3, GCS and Azure | pending: `cloud.yml` after the push |
+
+The figures beside 1.0.0's (the targets are D-V1.3's):
+
+| Measurement | Target | PostgreSQL 18, 1.0.0 | PostgreSQL 18, 1.0.1 | MySQL 8.4, 1.0.0 | MySQL 8.4, 1.0.1 |
+|---|---|---|---|---|---|
+| Steady lag p99 | ≤ 60 s | 30.9 s | **30.8 s** ✅ | 30.8 s | **30.6 s** ✅ |
+| Steady lag p50 / max | — | 16.2 s / 31.4 s | 16.0 s / 31.6 s | 16.1 s / 31.3 s | 15.8 s / 31.0 s |
+| Samples / rate | ≥ 1620 / ≥ 800 changes/s | 1801 / 999.5 | 1801 / 996.4 | 1801 / 998.3 | 1801 / 999.3 |
+| Writer statements failed | 0 | 0 | 0 | 0 | 0 |
+| Failover: sentinel landed / recovered | ≤ 120 s | 52.5 s / 52.5 s | 53.5 s / 53.5 s ✅ | 53.7 s / 53.7 s | 52.3 s / 52.3 s ✅ |
+| Churn: MERGEs on a 13.1 MB table | — | 20 | 20 | 20 | 20 |
+| Churn: MERGE mean | — | 1.18 s | 1.07 s | 1.38 s | **1.03 s** (−25 %) |
+| Churn: bytes written per MERGE | — | 13.0 MB | 13.0 MB | 11.1 MB | 11.1 MB |
+| Churn: files removed per MERGE | — | 5.95 | 5.95 | 5.95 | 5.95 |
+| Chaos: short outage, `running` again | — | 0.0007 s, 0 epochs | 0.0007 s, 0 epochs | 0.0004 s, 0 epochs | 0.0005 s, 0 epochs |
+| Chaos: long outage, `running` again | — | 2.7 s, 1 epoch | 2.5 s, 1 epoch | 2.7 s, 1 epoch | 2.6 s, 1 epoch |
+| Chaos: source restart, writer statements failed | — | 3.0 s, 1 | 5.1 s, 1 | 8.0 s, 4 | 9.2 s, 5 |
+| Chaos: partition, epochs | — | 0 | 0 | 0 | 0 |
+
+Both targets hold with the same margin. The churn MERGE's cost is the same by volume (bytes and
+files per MERGE unchanged, so D-MS.15's reading stands); its mean time fell 25 % on MySQL (1.38 to
+1.03 s) and 10 % on PostgreSQL (1.18 to 1.07 s), past the ~20 % bar on MySQL, so the MERGE time in
+`configuration/sink.md` and `deployment/observability.md` is updated to the 1.0.1 measurement. A
+source restart's time is the container's own and has no target.
+
+**The soak was not re-run** (D-R6): no product code changed beyond the two renames the toolchain
+forced and jsonwebtoken 12's `Result`, none of them in the memory or checkpoint paths the soak
+exercises, and the 1.0.1 bench and chaos runs show the engine's steady and failure behaviour
+unchanged. It can be run on request (`cargo xtask soak`).
+
 ## The §8 checklist
 
 | Item | Status | Where it is met |

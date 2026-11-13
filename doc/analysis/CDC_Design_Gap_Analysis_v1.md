@@ -943,6 +943,37 @@ sqlparser 0.64, prometheus-client 0.26, base64 0.23 and getrandom 0.4 compile un
 suites green. Held: arrow 60 (deltalake-core 1.1.4 requires `^59`), mysql_common 0.38 (mysql_async
 0.37.1 requires `^0.37`). No gap opened or closed.
 
+## 68. 1.0.1 dependency refresh — executed (2026-11-13)
+
+`doc/v1.0/v1.0.1-dependency-refresh.md` built and re-run (`v1-acceptance.md`, "1.0.1 re-run", at
+`baceeb4`).
+
+- **The moves.** Rust 1.98.1 → 1.100.0 (two `fetch_update` → `try_update` renames); deltalake 1.1
+  (`=1.1.2`, `deltalake-core =1.1.4`); pgwire-replication 0.5, serde-saphyr 2, sqlparser 0.64,
+  prometheus-client 0.26, base64 0.23, getrandom 0.4; jsonwebtoken 12 (`EncodingKey::from_secret` now
+  returns a `Result`; no auth check changed); the compatible bumps in `Cargo.lock`; the CI tools,
+  the test-infra images, DuckDB 2.0 (a Delta table under a non-ASCII path still reads); the docs
+  site (Starlight 0.42.11, Astro 7.4.11, Mermaid 12.3, Node 26 LTS). Version `1.0.1`.
+- **The holds** (`dependency-exceptions.yaml`): the arrow crates at 59 (deltalake-core 1.1.4
+  requires `^59`; one arrow major workspace-wide, D-MS.14), mysql_common at 0.37 (mysql_async 0.37.1,
+  the newest, requires `^0.37`), and the postgres, mysql and mariadb images (the source support
+  matrix, not a build dependency).
+- **The delta-rs conflict fix.** deltalake 1.1 reports the truncate's OPTIMIZE race as a conflict
+  itself (the gap in 1.0 that probe P11a found); the truncate-vs-OPTIMIZE test now asserts the
+  retry, and our `num_files()` check after the DELETE stays as a backstop (`e04cc73`).
+- **The rule.** Every release refreshes its dependencies: `cargo xtask deps` lists each pinned
+  dependency against its registry, `cargo xtask deps --check` fails on one that is neither current
+  nor held, and `release.yml` refuses a tag while it fails (`CLAUDE.md`, Implementation workflow;
+  the checklist in `doc/v1.0/README.md`, Releases).
+- **The counts are unchanged.** 1523 tests with the ITs (hermetic 1508 after the toolchain bump),
+  the E2E 51/51 on each source (on PostgreSQL one scenario, the failover slot's, self-skips locally
+  and is proven by PR CI); bench 3/3 and chaos 4/4 on each source, with the D-V1.3 targets met as
+  before (p99 30.8 / 30.6 s, failover 53.5 / 52.3 s). The churn MERGE's mean time fell to
+  1.07 / 1.03 s (1.18 / 1.38 s in 1.0.0), its bytes and files per MERGE unchanged; the site's
+  figures follow. The 24 h soak was not re-run (D-R6).
+
+No gap opened or closed; the ⏭ v2 rows stay.
+
 ---
 
 ### Counts (by status)
@@ -954,7 +985,7 @@ suites green. Held: arrow 60 (deltalake-core 1.1.4 requires `^59`), mysql_common
 > M7a's plan (§32), 2026-10-16 for M7a's exit (§33), 2026-10-17 for M7b's plan (§34),
 > 2026-10-20 for M7b's exit (§35), 2026-10-21 for M8a's plan (§36), 2026-10-22 for M8a's exit (§37),
 > 2026-10-22 for M8b's plan (§38), 2026-10-23 for M8b's exit (§39), 2026-10-23 for M9a's plan
-> (§40), 2026-10-23 for M9a's exit (§41), 2026-10-27 for M9b's plan (§42), 2026-10-28 for M9b's exit (§43), 2026-10-28 for M10's plan (§44), and 2026-10-29 for M10's exit (§45), and 2026-10-29 for M11a's plan (§46), and 2026-10-29 for M11a's whole-branch review (§47), and 2026-10-29 for M11a's exit (§48), and 2026-10-29 for M11b's plan (§49), and 2026-10-30 for M11b's pages (§50), and 2026-10-30 for M11b's exit and v0.1.0 (§51), and 2026-10-30 for M12a's plan (§52), and 2026-11-04 for M12a's gaps closed (§53), and 2026-11-04 for M12a's whole-branch review (§54), and 2026-11-04 for M12a's exit (§55), and 2026-11-06 for M12b's gaps closed (§57), and 2026-11-06 for M12b's exit (§58), and 2026-11-06 for M12d's plan (§59), and 2026-11-10 for M12d's gaps closed (§60), and 2026-11-11 for M12d's whole-branch review (§61), and 2026-11-11 for M12d's exit (§62), and 2026-11-11 for M12c's gaps closed (§63), and 2026-11-13 for M12c's acceptance runs (§64, no change), and 2026-11-13 for v1.0.0's release (§65, no change), and 2026-11-13 for the iceberg-rust recheck (§66, no change), and 2026-11-13 for 1.0.1's plan (§67, no change).
+> (§40), 2026-10-23 for M9a's exit (§41), 2026-10-27 for M9b's plan (§42), 2026-10-28 for M9b's exit (§43), 2026-10-28 for M10's plan (§44), and 2026-10-29 for M10's exit (§45), and 2026-10-29 for M11a's plan (§46), and 2026-10-29 for M11a's whole-branch review (§47), and 2026-10-29 for M11a's exit (§48), and 2026-10-29 for M11b's plan (§49), and 2026-10-30 for M11b's pages (§50), and 2026-10-30 for M11b's exit and v0.1.0 (§51), and 2026-10-30 for M12a's plan (§52), and 2026-11-04 for M12a's gaps closed (§53), and 2026-11-04 for M12a's whole-branch review (§54), and 2026-11-04 for M12a's exit (§55), and 2026-11-06 for M12b's gaps closed (§57), and 2026-11-06 for M12b's exit (§58), and 2026-11-06 for M12d's plan (§59), and 2026-11-10 for M12d's gaps closed (§60), and 2026-11-11 for M12d's whole-branch review (§61), and 2026-11-11 for M12d's exit (§62), and 2026-11-11 for M12c's gaps closed (§63), and 2026-11-13 for M12c's acceptance runs (§64, no change), and 2026-11-13 for v1.0.0's release (§65, no change), and 2026-11-13 for the iceberg-rust recheck (§66, no change), and 2026-11-13 for 1.0.1's plan (§67, no change), and 2026-11-13 for 1.0.1's execution (§68, no change).
 
 | Status | Count (v1 scope) | Notes |
 |---|---|---|
