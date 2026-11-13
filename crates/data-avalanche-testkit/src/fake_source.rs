@@ -273,6 +273,8 @@ struct Db {
     teardowns: usize,
     /// Streams closed (`close`) so far.
     closes: usize,
+    /// Whether a stream's `close` never returns.
+    hang_close: bool,
     fetches: BTreeMap<TableRef, usize>,
     prepares: Vec<Option<Checkpoint>>,
     /// What each `prepare_marked` was told the lake's highest marker is.
@@ -339,6 +341,7 @@ impl FakeSource {
             reconfigures: 0,
             teardowns: 0,
             closes: 0,
+            hang_close: false,
             fetches: BTreeMap::new(),
             prepares: vec![],
             marks: vec![],
@@ -701,6 +704,12 @@ impl FakeSource {
     /// The streams closed so far (`ChangeStream::close`): a stream dropped unclosed isn't one.
     pub fn closes(&self) -> usize {
         self.db().closes
+    }
+
+    /// Makes every stream's `close` pend forever, as a client whose shutdown is stuck. The
+    /// close still counts in `closes` once it is entered.
+    pub fn hang_close(&self) {
+        self.db().hang_close = true;
     }
 
     /// `fetch_rows` calls for `table` so far, failed ones included.
@@ -1543,7 +1552,14 @@ impl ChangeStream for FakeStream {
     }
 
     async fn close(self: Box<Self>) -> Result<(), SourceError> {
-        self.source.db().closes += 1;
+        let hang = {
+            let mut db = self.source.db();
+            db.closes += 1;
+            db.hang_close
+        };
+        if hang {
+            std::future::pending::<()>().await;
+        }
         Ok(())
     }
 }

@@ -11,7 +11,7 @@ mod snapshot;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use data_avalanche_config::Pipeline;
 use data_avalanche_core::{
@@ -243,6 +243,24 @@ pub(crate) struct Session<'c> {
     unsynced: VecDeque<(u64, i64)>,
 }
 
+/// How long a session waits for its source stream's close. PostgreSQL's close bounds its slot
+/// poll by `timeouts.command` (30 s by default); the rest is the client's shutdown, whose
+/// worker's read has no timeout of its own, so a stalled connection would hold the close.
+const STREAM_CLOSE_BOUND: Duration = Duration::from_secs(60);
+
+/// Closes the source stream, waiting at most `STREAM_CLOSE_BOUND`. A close's error is dropped:
+/// the session's result is already decided. On expiry the stream is dropped.
+async fn close_stream(stream: Box<dyn ChangeStream>) {
+    if tokio::time::timeout(STREAM_CLOSE_BOUND, stream.close())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            "the source stream's close didn't finish within {STREAM_CLOSE_BOUND:?}; it is dropped"
+        );
+    }
+}
+
 impl<'c> Session<'c> {
     /// Loads the durable state and opens the stream at the checkpoint; `Ok(Err)` when the source
     /// fails to open it.
@@ -408,7 +426,7 @@ impl<'c> Session<'c> {
             }
             Err(e) => {
                 self.writer.0.abort();
-                let _ = self.stream.close().await;
+                close_stream(self.stream).await;
                 Err(e)
             }
         }
@@ -423,7 +441,7 @@ impl<'c> Session<'c> {
         while let Some(ev) = self.events.recv().await {
             match ev {
                 WriterEvent::Failed(e) => {
-                    let _ = self.stream.close().await;
+                    close_stream(self.stream).await;
                     return Err(e);
                 }
                 WriterEvent::Halted(h) => self.core.update(|st| {
@@ -446,7 +464,7 @@ impl<'c> Session<'c> {
                 }
             }
         }
-        let _ = self.stream.close().await;
+        close_stream(self.stream).await;
         Ok(end)
     }
 
@@ -1982,6 +2000,30 @@ mod tests {
             "a missing sink table stops the pipeline: {end:?}"
         );
         assert_eq!(w.source.closes(), 1, "the stream is closed, not dropped");
+    }
+
+    /// A close that never returns doesn't hold the session: it ends after `STREAM_CLOSE_BOUND`
+    /// with the result it would have had.
+    #[tokio::test(start_paused = true)]
+    async fn a_close_that_hangs_doesnt_hold_the_session() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        w.sink
+            .fail(SinkOp::Commit, Some(&t("a")), 1, || SinkError::NoTable {
+                table: t("a"),
+            });
+        w.source.hang_close();
+        let (mut core, _control, _status) = w.core(&flush_each(), &["a"]);
+        let s = Session::open(&mut core).await.unwrap().unwrap();
+        w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+        let end = tokio::time::timeout(STREAM_CLOSE_BOUND * 2, s.run())
+            .await
+            .expect("the session ends");
+        assert!(
+            matches!(end, Err(WorkerError::Sink(SinkError::NoTable { .. }))),
+            "the result is the one it would have had: {end:?}"
+        );
+        assert_eq!(w.source.closes(), 1, "the close was tried");
     }
 
     #[tokio::test]
