@@ -60,17 +60,17 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 # The OpenAPI document checked against the vendored OAS 3.1 schema (DA-API-18), a dev-dependency.
 boon = "=0.6.1"
-# One arrow major workspace-wide (roadmap §2, D-MS.14): 59, as deltalake 1.0 resolves it.
+# One arrow major workspace-wide (roadmap §2, D-MS.14): 59, as deltalake 1.1 resolves it.
 arrow-array = "59"
 arrow-buffer = "59"
 arrow-row = "59"
 arrow-schema = "59"
 arrow-select = "59"
 arrow-cast = "59"
-# The Delta sink (roadmap §2.1). `deltalake` asks for `deltalake-core = "1.0"`, which resolves to
-# 1.1; the direct pin keeps the engine the probes ran on (delta P1–P10, 2026-09-26).
-deltalake = { version = "=1.0.0", default-features = false, features = ["datafusion", "rustls", "s3", "gcs", "azure"] }
-deltalake-core = { version = "=1.0.0", default-features = false }
+# The Delta sink (roadmap §2.1). The direct `deltalake-core` pin keeps the engine the sink suite, the
+# E2E and the 1.0.1 bench ran on (1.1; the delta P1–P10 probes ran on 1.0, 2026-09-26).
+deltalake = { version = "=1.1.2", default-features = false, features = ["datafusion", "rustls", "s3", "gcs", "azure"] }
+deltalake-core = { version = "=1.1.4", default-features = false }
 url = "2"
 # The PostgreSQL source (roadmap §2.1): the replication transport the S-PG probes ran on (the
 # pgoutput decoder is ours), and rustls for the catalog connection.

@@ -1147,9 +1147,9 @@ dependencies = [
 
 [[package]]
 name = "brotli-decompressor"
-version = "6.0.0"
+version = "6.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46087801e40b785410c352bee60e9b6226312709cf52d5fff92776cdf5cf6490"
+checksum = "75c74c9c51b9140663e196b5fb88bc94c334d7a497c8311cb759d8557874747f"
 dependencies = [
  "alloc-no-stdlib 3.0.0",
  "alloc-stdlib 0.3.0",
@@ -2786,9 +2786,9 @@ dependencies = [
 
 [[package]]
 name = "deltalake"
-version = "1.0.0"
+version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ec75e286ce53b652d00bd4be3076d8dfa5feed3bf109ae7d43b6055c1611cad"
+checksum = "3331503813be4d57bcf9dab033fe43aa1a98541700ba96940c34696e23b9382a"
 dependencies = [
  "buoyant_kernel",
  "ctor",
@@ -2838,9 +2838,9 @@ dependencies = [
 
 [[package]]
 name = "deltalake-core"
-version = "1.0.0"
+version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da7f1714b6bf844e017d5ba0b665801ff7017c51950261172e6c874a372d3fe9"
+checksum = "7401f62463239cb86df64fdd9b48edeb6c0fb19534817d2aabffeca2e78d98c1"
 dependencies = [
  "alloc-stdlib 0.2.2",
  "arrow",
@@ -2855,7 +2855,7 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "async-trait",
- "brotli-decompressor 6.0.0",
+ "brotli-decompressor 6.3.1",
  "buoyant_kernel",
  "buoyant_kernel_engine",
  "bytes",
