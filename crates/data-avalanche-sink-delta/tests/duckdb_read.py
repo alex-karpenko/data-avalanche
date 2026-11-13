@@ -1,6 +1,6 @@
 """Reads a Delta table with DuckDB's delta_scan and prints every cell as text, as JSON rows.
 
-Used by tests/sink/types.rs (R-12). Run: uv run --no-project --with duckdb==1.5.6 python duckdb_read.py <table dir>
+Used by tests/sink/types.rs (R-12). Run: uv run --no-project --with duckdb==2.0.0 python duckdb_read.py <table dir>
 """
 
 import json

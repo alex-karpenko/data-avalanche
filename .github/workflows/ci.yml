@@ -44,7 +44,7 @@ jobs:
       # against the Kubernetes API's schemas; packaging.rs validates the example's config.
       - uses: azure/setup-helm@v5
         with:
-          version: v4.3.0
+          version: v4.3.2
       - name: Helm chart
         run: |
           chart=deploy/helm/data-avalanche
@@ -110,7 +110,7 @@ jobs:
             echo "GOOGLE_SERVICE_ACCOUNT_PATH=$RUNNER_TEMP/gcs-key.json" >> "$GITHUB_ENV"
           fi
       # uv runs the DuckDB cross-read of the Delta sink (R-12, crates/data-avalanche-sink-delta).
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: astral-sh/setup-uv@v10.3.3
       - name: Start test infrastructure
         run: test-infra/up.sh
       - name: Integration tests
@@ -165,7 +165,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v2
       # uv runs the type scenario's DuckDB read.
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: astral-sh/setup-uv@v10.3.3
       - name: Start ${{ matrix.target }}, mysql-84, RustFS and Jaeger
         run: |
           docker compose -f test-infra/compose.yaml up -d --wait "${{ matrix.target }}" mysql-84 rustfs jaeger
@@ -257,7 +257,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v2
       - uses: azure/setup-helm@v5
         with:
-          version: v4.3.0
+          version: v4.3.2
       - uses: docker/setup-buildx-action@v4
       - name: Start PostgreSQL 18 and RustFS
         run: |

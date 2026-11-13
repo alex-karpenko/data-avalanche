@@ -1,7 +1,7 @@
 """Reads a Delta table on S3 (RustFS) with DuckDB's delta_scan and prints its columns, their DuckDB
 types and every cell as text, as JSON rows in `id` order.
 
-Used by tests/e2e/types.rs. Run: uv run --no-project --with duckdb==1.5.6 python duckdb_read.py
+Used by tests/e2e/types.rs. Run: uv run --no-project --with duckdb==2.0.0 python duckdb_read.py
 <s3 table url>, with DUCKDB_S3_ENDPOINT (host:port), DUCKDB_S3_KEY_ID and DUCKDB_S3_SECRET set.
 """
 

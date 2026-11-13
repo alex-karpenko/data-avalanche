@@ -271,7 +271,7 @@ fn duckdb_read(root: &std::path::Path) -> Vec<Vec<Option<String>>> {
             "run",
             "--no-project",
             "--with",
-            "duckdb==1.5.6",
+            "duckdb==2.0.0",
             "python",
             script,
         ])
