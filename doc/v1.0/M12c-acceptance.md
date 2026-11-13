@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-11
+updated: 2026-11-13
 domain: Architecture
 tags: [v1, implementation-plan, m12, m12c, acceptance, load, soak, chaos, cloud, release, v1.0.0]
 resolves: [DA-SRC-39, DA-SRC-38, DA-SRC-37, DA-SNAP-23, DA-OPS-14]
@@ -4249,3 +4249,36 @@ this plan until the tasks run.
 Not run in planning: the cloud subset on real S3, GCS and Azure (Task 5's Step 4 and the Exit:
 Oleksii's credentials, or the repository's secrets in CI), and the full-length acceptance runs
 (Task 8).
+
+## Deviations during execution
+
+Executed 2026-11-11…13, subagent-driven (P-9): nine tasks, each reviewed. Each deviation below was
+found by the task's review (or its implementer) and fixed in the task's fix round, unless it says
+otherwise. Later tasks' blocks applied on top unchanged.
+
+- **Task 2** (plan text): Step 4 expects `cluster 174`; the crate has 172 tests with the two new
+  ones. The diff is the planned one; the count in the step and in §Verification in planning was
+  wrong.
+- **Task 6** (fix round, `9ad11f5`; Important in its review, and the planned code had it too): a
+  run could pass while measuring nothing, since nothing checked the writer's counts. Every run now
+  asserts `counts.changes > 0`; `counts.failed == 0` in the three bench runs, both storage
+  outages, the partition and the soak (the source restart records its failed statements, the
+  writes the restarting server refuses, without a bound). The steady run asserts a rate of at least
+  0.8 × the target and at least nine tenths of the window's seconds as samples, and records
+  `steady_failed`; the soak sums its failed statements and asserts at least two memory readings.
+- **Task 7** (fix round, `89d7e1c`): the operator page and the research named a refused
+  reposition's halt as a detail that "begins `REPOSITION_REFUSED`", but the detail begins with that
+  constant's text. They now give the text ("the source changed, and its reposition fails") with
+  the constant in parentheses. Task 7's block above (`Delivery_Guarantee…` §8) still shows the old
+  wording. §63's DA-OPS-14 row cites `doc/v1.0/M12c-acceptance.md` §Measured in planning by path.
+- **Task 8** (the report's review, `446ea2d`, `b1d4ad9`): the report and the observability page
+  now say which runs are one node (steady, churn, storage outages) and which three (failover,
+  partition, soak); that the source restart's time is until the server accepts connections, not
+  until the stream resumes; that the churn's MERGE count, bytes and files come from the Delta log
+  and only the mean commit time from a metric; and R-5's measurement date, 2026-11-11.
+- **Task 9**: the management API's OpenAPI document carries `info.version`, so
+  `crates/data-avalanche-api/openapi.json` and `docs/public/openapi.json` are regenerated with the
+  version (`DATA_AVALANCHE_BLESS=1`, `cargo xtask docs`); otherwise the docs check and
+  `the_document_is_the_one_checked_in` fail. Only the version line changes in each.
+
+Minors left for the whole-branch review are in the SDD ledger; none changes behaviour.
