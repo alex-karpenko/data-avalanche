@@ -4221,7 +4221,7 @@ git add Cargo.toml Cargo.lock deploy/helm/data-avalanche doc/v1.0 && git commit 
   `e2e-gcs` included. With Oleksii's OK, `cloud.yml` dispatched on the branch (`gh workflow run
   cloud.yml --ref feat/claude/m12c-acceptance`): `e2e` green on S3, GCS and Azure, and the report's
   cloud rows filled from it.
-- [ ] Oleksii merges, then tags `v1.0.0` on `main`; `release.yml` publishes the image and the
+- [x] Oleksii merges, then tags `v1.0.0` on `main`; `release.yml` publishes the image and the
   chart. A short follow-up PR records the release in the README and §8 (as v0.1.0 was recorded in
   M11b's row).
 

@@ -134,11 +134,11 @@ run passed all four.
 
 | Item | Status | Where it is met |
 |---|---|---|
-| All milestone exit criteria met; CI, weekly and cloud workflows green | at the merge | M0–M12d merged with their exits (`doc/v1.0/README.md`); weekly 4 in a row treated as met (Q-M12-5); M12c's PR CI and `cloud.yml` green at `3364b20` (above); M12c's exit is its merge |
+| All milestone exit criteria met; CI, weekly and cloud workflows green | ✅ | M0–M12d merged with their exits (`doc/v1.0/README.md`); weekly 4 in a row treated as met (Q-M12-5); M12c's PR CI and `cloud.yml` green at `3364b20` (above); M12c merged 2026-11-13 (PR #22, `81ce996`) |
 | D-V1.3 measured: steady p99 ≤ 60 s, failover recovery ≤ 2 min | ✅ | §D-V1.3 above: 30.9 s / 52.5 s (PostgreSQL 18), 30.8 s / 53.7 s (MySQL 8.4) |
 | No data loss or duplicate keys in the crash/replay/chaos suites | ✅ | the crash and replay scenarios in `crates/data-avalanche/tests/e2e/` (`crashes.rs`, `failover.rs`; every PR); the chaos runs above; the soak's hourly checks |
 | Real-cloud E2E on S3, GCS and Azure | ✅ | the cloud subset 4/4 on each store and source: `cloud.yml` run 43375990336, and PR CI's `e2e-gcs` (above) |
-| Container image and Helm chart published; k3s smoke deploy green | at the Exit | `release.yml` on the `v1.0.0` tag (M11a) |
+| Container image and Helm chart published; k3s smoke deploy green | ✅ | `release.yml` run 43388418482 on the `v1.0.0` tag: the image `1.0.0`/`1.0`/`latest` (amd64, arm64), the chart `1.0.0`, the GitHub release; `k3s` green in PR #22's CI |
 | Documentation site builds strict; runbooks reviewed | ✅ | `docs/` builds strict, every internal link valid (2026-11-13, after this report's page edits); the runbooks reviewed by Oleksii (2026-11-13) |
 | Compile time and dependency tree reviewed against `cargo build --timings` | ✅ | M12b Task 15 (`doc/v1.0/M12b-control-hardening.md`): measured, line tables taken |
 | Gap tracker updated | ✅ | `CDC_Design_Gap_Analysis_v1.md` §63 (open 5 → 0) and §64 |
