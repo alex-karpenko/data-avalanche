@@ -142,7 +142,9 @@ pub const SOURCE_CHANGES_IN_A_ROW: u32 = 3;
 
 /// How long after the server change counted before another one still counts toward
 /// [`SOURCE_CHANGES_IN_A_ROW`]. An alternation reruns within the restart backoff (a minute at
-/// most); genuine failovers come further apart and start the count again (DA-SRC-38).
+/// most); genuine failovers come further apart and start the count again (DA-SRC-38). The
+/// interval runs from the end of the counted run to the end of this one, so it includes this
+/// run's whole duration: an alternation whose runs each last over this long isn't counted.
 pub const SOURCE_CHANGE_WINDOW: Duration = Duration::from_secs(600);
 
 /// The halt of a pipeline whose runs keep finding another server: the code of the last change

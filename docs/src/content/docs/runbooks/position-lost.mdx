@@ -59,6 +59,11 @@ hand, or advanced past the pipeline's checkpoint.
 
 ## A failover (`WAL_SOURCE_CHANGED`)
 
+**A WARN is not a halt.** After a promotion the slot followed, the log can show a WARN "worker
+ended, rerun after a backoff: WAL_SOURCE_CHANGED: …" line: the run that follows continues on the
+new timeline. A halt is the pipeline in `ERROR` (the `pipeline in ERROR` line, and the status),
+so alert on that, not on the code in a rerun line.
+
 **A failover slot carries the stream over.** On PostgreSQL 17 and later, a slot the pipeline
 manages (`slot_management: managed`) is a failover slot. When the standby streams from the
 primary through a physical slot (`primary_slot_name`), with `dbname` in its `primary_conninfo`,

@@ -30,6 +30,8 @@ const PASSED: &[&str] = &[
     "AZURE_CLIENT_SECRET",
 ];
 
+/// The object store the E2E suite's lake lives on: the local RustFS or Azurite emulator, or a
+/// real cloud bucket (`DATA_AVALANCHE_E2E_STORE`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Store {
     RustFs,
@@ -63,6 +65,7 @@ impl Store {
         }
     }
 
+    /// The `object_store` backend that speaks to this store.
     pub fn backend(self) -> Backend {
         match self {
             Self::RustFs | Self::S3 => Backend::S3,

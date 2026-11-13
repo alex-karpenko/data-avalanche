@@ -1139,9 +1139,10 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
     // nor cached (a table taken out of the config keeps its schema) nor read now.
     //
     // A refused reposition's halt stays while the lake holds the table (DA-SRC-37): the
-    // checkpoint names the new server, so no later start repositions it, and tracked later the
-    // table would skip the new server's changes up to its old marker. A job's copy of it, or the
-    // table gone from the lake, ends it.
+    // checkpoint names the new server, so no later start from the same server repositions it (a
+    // later source change does, and the halt stays all the same), and tracked later the table
+    // would skip the new server's changes up to its old marker. A job's copy of it, or the table
+    // gone from the lake, ends it.
     for (table, reason) in &recorded_halts {
         if !configured.contains(table)
             && !cached.contains_key(table)

@@ -389,9 +389,9 @@ pub fn reconnect_check(
     {
         return Err(SourceError::SourceChanged(format!(
             "WAL_SOURCE_CHANGED: the checkpoint {} was read on {was}, and the stream's reconnect \
-             reaches {now}, a promoted server of the same system: the pipeline starts again, and its start decides \
-             whether the stream continues there (a failover slot synchronized up to the \
-             checkpoint) or halts as source_change_action says",
+             reaches {now}, a promoted server of the same system: the pipeline starts again, and \
+             its start decides whether the stream continues there (a failover slot synchronized \
+             up to the checkpoint) or halts as source_change_action says",
             lost.position.untagged()
         )));
     }

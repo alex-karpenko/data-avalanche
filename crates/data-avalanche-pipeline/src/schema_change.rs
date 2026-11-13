@@ -46,11 +46,10 @@ pub(crate) struct Baseline {
 /// names so too (`fold`, MySQL), a sink column that matches by case alone is the source's: the
 /// session writes it under the sink's spelling, in the key too, as a cached schema keeps it
 /// (DA-SNAP-23, DA-SRC-25). Elsewhere it can't sit beside the source's, so it halts, naming both
-/// spellings. A column it
-/// holds as another type still surfaces at the first commit (`SINK_REJECTED`); a nullable one the
-/// source lacks stays, soft-dropped. A key column it lacks can't be added: the table is keyed
-/// otherwise, and halts. So does a non-null column the source lacks: no row of the source's could
-/// fill it (DA-SNAP-22).
+/// spellings. A column it holds as another type still surfaces at the first commit
+/// (`SINK_REJECTED`); a nullable one the source lacks stays, soft-dropped. A key column it lacks
+/// can't be added: the table is keyed otherwise, and halts. So does a non-null column the source
+/// lacks: no row of the source's could fill it (DA-SNAP-22).
 pub(crate) fn missing_columns(
     sink: &Schema,
     source: &TableSchema,

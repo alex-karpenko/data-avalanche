@@ -963,7 +963,6 @@ impl Db {
     }
 }
 
-/// What `augment` and `rescan` compare: columns by name, with their types.
 /// `row` with each column named as `schema` spells it, matched without case.
 fn respell(row: Row, schema: &TableSchema) -> Row {
     Row(row
@@ -980,6 +979,7 @@ fn respell(row: Row, schema: &TableSchema) -> Row {
         .collect())
 }
 
+/// What `augment` and `rescan` compare: columns by name, with their types.
 fn shape(
     columns: &[ColumnSchema],
     fold: bool,

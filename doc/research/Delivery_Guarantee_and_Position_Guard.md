@@ -222,7 +222,9 @@ tracked, skipped the new server's changes up to it. The set is now
   it used to clear the halt of every table neither configured, cached, requested nor copied. Tracked
   later, the table stays halted rather than skipping the new server's changes up to its old marker;
   a snapshot job's copy ends the halt, and so does the table leaving the lake (a dropped or moved
-  Delta table). Test: `a_refused_repositions_halt_stays_while_the_lake_holds_the_table`.
+  Delta table). No later start from the same server repositions the table again; a later source
+  change does, and the halt stays all the same until a job's copy or the table's removal.
+  Test: `a_refused_repositions_halt_stays_while_the_lake_holds_the_table`.
 - The same listing feeds `highest_marker` for DA-SRC-33's continuation
   (`Postgres_Slot_and_Publication_Lifecycle.md` §8).
 - Tests: `a_source_change_repositions_a_copy_the_pipeline_doesnt_track`,
@@ -241,7 +243,9 @@ again: a loop of recoveries. The controller counts them:
 - A run that ends `SourceError::SourceChanged` after progress sets the count to 1; one without
   progress adds 1, unless it ends more than `SOURCE_CHANGE_WINDOW` (10 minutes) after the change
   counted before, which sets it to 1 too: an alternation reruns within the restart backoff, a
-  minute at most, and failovers further apart are failovers (DA-SRC-38, M12c). Any other end sets
+  minute at most, and failovers further apart are failovers (DA-SRC-38, M12c). The interval runs
+  from the end of the counted run to the end of this one, so it includes this run's whole
+  duration: an alternation whose runs each last over 10 minutes isn't counted. Any other end sets
   it to 0, and so does a stop (D-M12d.8).
 - At `SOURCE_CHANGES_IN_A_ROW = 3` the pipeline goes to `ERROR` with the change's code (the prefix
   of the last `SourceChanged` message, `WAL_SOURCE_CHANGED` or `BINLOG_SOURCE_CHANGED`) and the
