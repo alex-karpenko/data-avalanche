@@ -1625,8 +1625,9 @@ implements them.
 
 ## 8. v1.0.0 acceptance checklist
 
-- [ ] All milestone exit criteria met; CI, weekly and cloud workflows green (weekly 4 in a row:
-      treated as met, Q-M12-5).
+- [x] All milestone exit criteria met; CI, weekly and cloud workflows green (weekly 4 in a row:
+      treated as met, Q-M12-5). Met 2026-11-13: M12c merged (PR #22, `81ce996`) with its CI and
+      `cloud.yml` green.
 - [x] D-V1.3 measured: steady-state p99 ≤ 60s and failover recovery ≤ 2 min at default config (M12
       report). Met 2026-11-11…12 (`v1-acceptance.md`): p99 30.9 s / 30.8 s, recovery 52.5 s / 53.7 s
       (PostgreSQL 18 / MySQL 8.4).
@@ -1635,7 +1636,9 @@ implements them.
       24 h soak's hourly checks (`v1-acceptance.md`).
 - [x] Real-cloud E2E on S3, GCS and Azure. Met 2026-11-13: the cloud subset 4/4 on S3, GCS and
       Azure on PostgreSQL 18 and MySQL 8.4 (`cloud.yml` run 43375990336; `v1-acceptance.md`).
-- [ ] Container image and Helm chart published; k3s smoke deploy green.
+- [x] Container image and Helm chart published; k3s smoke deploy green. Met 2026-11-13: v1.0.0
+      released (`release.yml` run 43388418482: the image `1.0.0` for amd64 and arm64, the chart
+      `1.0.0`); `k3s` green in PR #22's CI.
 - [x] Documentation site builds strict; runbooks reviewed. The site builds strict, every internal
       link valid (2026-11-13); the runbooks reviewed by Oleksii (2026-11-13).
 - [x] Compile time and dependency tree reviewed against a `cargo build --timings` measurement (M12,
