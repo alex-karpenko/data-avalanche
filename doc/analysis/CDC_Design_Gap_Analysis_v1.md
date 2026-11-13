@@ -886,6 +886,16 @@ R-5 is measured (DA-MS-3's row carries the numbers; it stays the decided caveat,
 cloud subset ran on GCS from Oleksii's machine (4/4 on each source, Task 5), then 4/4 on S3, GCS
 and Azure on each source in `cloud.yml` (run 43375990336) and on GCS in PR #22's `e2e-gcs`. The open count stays 0 (v1).
 
+
+## 65. v1.0.0 released (2026-11-13)
+
+M12c merged (PR #22, `81ce996`), its CI and `cloud.yml` green, and `v1.0.0` tagged on `main`:
+`release.yml` run 43388418482 published the image `ghcr.io/<owner>/data-avalanche` `1.0.0`/`1.0`/
+`latest` for amd64 and arm64 with its attestation, the chart `oci://ghcr.io/<owner>/charts/data-avalanche`
+`1.0.0`, and the GitHub release with the SBOM. Roadmap §8's checklist is complete; the acceptance
+report is `doc/v1.0/v1-acceptance.md`. No gap opened or closed: the open count stays 0 (v1), and
+the ⏭ v2 rows (the Iceberg sink's, DA-SRC-31) are the next version's backlog.
+
 ---
 
 ### Counts (by status)
@@ -897,7 +907,7 @@ and Azure on each source in `cloud.yml` (run 43375990336) and on GCS in PR #22's
 > M7a's plan (§32), 2026-10-16 for M7a's exit (§33), 2026-10-17 for M7b's plan (§34),
 > 2026-10-20 for M7b's exit (§35), 2026-10-21 for M8a's plan (§36), 2026-10-22 for M8a's exit (§37),
 > 2026-10-22 for M8b's plan (§38), 2026-10-23 for M8b's exit (§39), 2026-10-23 for M9a's plan
-> (§40), 2026-10-23 for M9a's exit (§41), 2026-10-27 for M9b's plan (§42), 2026-10-28 for M9b's exit (§43), 2026-10-28 for M10's plan (§44), and 2026-10-29 for M10's exit (§45), and 2026-10-29 for M11a's plan (§46), and 2026-10-29 for M11a's whole-branch review (§47), and 2026-10-29 for M11a's exit (§48), and 2026-10-29 for M11b's plan (§49), and 2026-10-30 for M11b's pages (§50), and 2026-10-30 for M11b's exit and v0.1.0 (§51), and 2026-10-30 for M12a's plan (§52), and 2026-11-04 for M12a's gaps closed (§53), and 2026-11-04 for M12a's whole-branch review (§54), and 2026-11-04 for M12a's exit (§55), and 2026-11-06 for M12b's gaps closed (§57), and 2026-11-06 for M12b's exit (§58), and 2026-11-06 for M12d's plan (§59), and 2026-11-10 for M12d's gaps closed (§60), and 2026-11-11 for M12d's whole-branch review (§61), and 2026-11-11 for M12d's exit (§62), and 2026-11-11 for M12c's gaps closed (§63), and 2026-11-13 for M12c's acceptance runs (§64, no change).
+> (§40), 2026-10-23 for M9a's exit (§41), 2026-10-27 for M9b's plan (§42), 2026-10-28 for M9b's exit (§43), 2026-10-28 for M10's plan (§44), and 2026-10-29 for M10's exit (§45), and 2026-10-29 for M11a's plan (§46), and 2026-10-29 for M11a's whole-branch review (§47), and 2026-10-29 for M11a's exit (§48), and 2026-10-29 for M11b's plan (§49), and 2026-10-30 for M11b's pages (§50), and 2026-10-30 for M11b's exit and v0.1.0 (§51), and 2026-10-30 for M12a's plan (§52), and 2026-11-04 for M12a's gaps closed (§53), and 2026-11-04 for M12a's whole-branch review (§54), and 2026-11-04 for M12a's exit (§55), and 2026-11-06 for M12b's gaps closed (§57), and 2026-11-06 for M12b's exit (§58), and 2026-11-06 for M12d's plan (§59), and 2026-11-10 for M12d's gaps closed (§60), and 2026-11-11 for M12d's whole-branch review (§61), and 2026-11-11 for M12d's exit (§62), and 2026-11-11 for M12c's gaps closed (§63), and 2026-11-13 for M12c's acceptance runs (§64, no change), and 2026-11-13 for v1.0.0's release (§65, no change).
 
 | Status | Count (v1 scope) | Notes |
 |---|---|---|
