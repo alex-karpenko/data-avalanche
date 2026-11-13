@@ -163,7 +163,7 @@ services:
     ports: ["56443:56443", "58080:30080"]
 
   rustfs-init:
-    image: "amazon/aws-cli:2.40.2"
+    image: "amazon/aws-cli:2.40.3"
     profiles: [init]
     environment: { AWS_ACCESS_KEY_ID: avalanche, AWS_SECRET_ACCESS_KEY: avalanche-secret, AWS_DEFAULT_REGION: us-east-1 }
     entrypoint: ["/bin/sh", "-c"]

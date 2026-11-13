@@ -37,12 +37,12 @@ impl Report {
         let mut lines = Vec::new();
         for f in &self.unaccepted {
             lines.push(format!(
-                "unaccepted {} {} {} ({})",
+                "UNACCEPTED {} {} {} ({})",
                 f.id, f.package, f.version, f.kind
             ));
         }
         for id in &self.stale {
-            lines.push(format!("stale      {id} (nothing in Cargo.lock matches)"));
+            lines.push(format!("STALE      {id} (nothing in Cargo.lock matches)"));
         }
         for f in &self.accepted {
             lines.push(format!(
@@ -221,7 +221,7 @@ mod tests {
         assert!(!report.passes());
         assert_eq!(
             report.lines(),
-            ["unaccepted RUSTSEC-2026-0195 quick-xml 0.39.4 (vulnerability)"]
+            ["UNACCEPTED RUSTSEC-2026-0195 quick-xml 0.39.4 (vulnerability)"]
         );
     }
 
@@ -236,7 +236,7 @@ mod tests {
         assert!(!report.passes());
         assert!(
             report.lines()[0]
-                .starts_with("stale      RUSTSEC-2026-0441 (nothing in Cargo.lock matches)")
+                .starts_with("STALE      RUSTSEC-2026-0441 (nothing in Cargo.lock matches)")
         );
     }
 

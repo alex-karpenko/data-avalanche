@@ -5,7 +5,7 @@
 # An entry names what is held (kind, name), the version it is held at (`held`: a version prefix at a
 # version boundary, so "59" matches 59.3.2; or "*" for every version of that name), and why. A hold
 # that no longer holds anything back (the newest version is the one in use, or nothing pins that
-# name any more) is stale and fails the check: delete it.
+# name any more; "*" holds never go stale) is stale and fails the check: delete it.
 - { kind: crate, name: arrow-array, held: "59", reason: "deltalake-core 1.1.4 requires arrow ^59; one arrow major workspace-wide, D-MS.14" }
 - { kind: crate, name: arrow-buffer, held: "59", reason: "deltalake-core 1.1.4 requires arrow ^59; one arrow major workspace-wide, D-MS.14" }
 - { kind: crate, name: arrow-cast, held: "59", reason: "deltalake-core 1.1.4 requires arrow ^59; one arrow major workspace-wide, D-MS.14" }

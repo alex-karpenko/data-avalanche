@@ -30,16 +30,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v2
-      - name: Every dependency is current or held
-        run: cargo xtask deps --check
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-audit
-      - name: No advisory unaccepted, no exception stale
-        run: cargo xtask audit --check
       - id: version
         name: The tag, the workspace and the chart agree
         run: |
@@ -52,6 +42,18 @@ jobs:
             echo "::error::tag ${GITHUB_REF_NAME} isn't v$crate"; exit 1
           fi
           echo "version=$crate" >> "$GITHUB_OUTPUT"
+      - name: Every dependency is current or held
+        run: cargo xtask deps --check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install cargo-audit
+        if: ${{ !cancelled() }}
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: No advisory unaccepted, no exception stale
+        if: ${{ !cancelled() }}
+        run: cargo xtask audit --check
 
   image:
     needs: version

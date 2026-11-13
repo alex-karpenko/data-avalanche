@@ -1,8 +1,10 @@
-//! `cargo xtask docs` writes the documentation site's generated pages; `cargo xtask docs --check`
-//! exits 1, naming them, when a committed copy differs. `cargo xtask bench|chaos|soak` runs an
-//! acceptance run (M12c) and says where its measurements are. `cargo xtask deps` checks every pinned
-//! dependency against its registry; `--check` exits 1 unless each is current, floating or held. `cargo xtask audit` checks the RustSec advisories
+//! The repository's dev tool. `cargo xtask docs` writes the documentation site's generated pages;
+//! `--check` exits 1, naming them, when a committed copy differs. `cargo xtask bench|chaos|soak`
+//! runs an acceptance run (M12c) and says where its measurements are. `cargo xtask deps` checks
+//! every pinned dependency against its registry; `--check` exits 1 unless each is current,
+//! floating or held, and no exception is stale. `cargo xtask audit` checks the RustSec advisories
 //! against `.cargo/audit.toml`; `--check` exits 1 on an unaccepted advisory or a stale exception.
+//! Either command exits 1 without `--check` only when it cannot produce a full report.
 
 use std::process::{Command, ExitCode};
 
@@ -63,7 +65,9 @@ fn deps(check: bool) -> ExitCode {
     for line in report.lines() {
         println!("{line}");
     }
-    if check && !report.passes() {
+    // One rule for both commands: no full report (an unreadable inventory) exits 1 even without
+    // `--check`; a failing verdict exits 1 only with it.
+    if report.incomplete() || (check && !report.passes()) {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
@@ -82,6 +86,8 @@ fn audit(check: bool) -> ExitCode {
     for line in report.lines() {
         println!("{line}");
     }
+    // A report that could not be produced exits 1 above; a failing verdict exits 1 only with
+    // `--check`, as for `deps`.
     if check && !report.passes() {
         ExitCode::FAILURE
     } else {

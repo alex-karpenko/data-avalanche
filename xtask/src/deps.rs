@@ -89,6 +89,14 @@ impl Report {
                 .all(|(_, v)| !matches!(v, Verdict::Behind { .. } | Verdict::Unknown { .. }))
     }
 
+    /// Whether the inventory itself could not be read: no full report exists, so even the plain
+    /// command (without `--check`) exits 1.
+    pub fn incomplete(&self) -> bool {
+        self.items
+            .iter()
+            .any(|(i, v)| i.name == "inventory" && matches!(v, Verdict::Unknown { .. }))
+    }
+
     /// One line per item (verdict, kind, name, current to newest, the file it is pinned in; a
     /// hold's line carries its reason), then one line per stale exception.
     pub fn lines(&self) -> Vec<String> {
@@ -726,6 +734,35 @@ impl Live {
                     .flatten()
                     .filter_map(|t| t.as_str().map(String::from)),
             );
+        } else if first == "ghcr.io" {
+            // Anonymous pull token, then the tag list (public images only).
+            let repo = &name["ghcr.io/".len()..];
+            let token = self.json(&format!(
+                "https://ghcr.io/token?scope=repository:{repo}:pull"
+            ))?["token"]
+                .as_str()
+                .ok_or_else(|| format!("ghcr.io: no token for {repo}"))?
+                .to_string();
+            let url = format!("https://ghcr.io/v2/{repo}/tags/list?n=1000");
+            let resp = self
+                .client
+                .get(&url)
+                .bearer_auth(token)
+                .send()
+                .map_err(|e| format!("{url}: {e}"))?;
+            if !resp.status().is_success() {
+                return Err(format!("HTTP {} ({url})", resp.status().as_u16()));
+            }
+            let json: serde_json::Value =
+                serde_json::from_str(&resp.text().map_err(|e| format!("{url}: {e}"))?)
+                    .map_err(|e| format!("{url}: {e}"))?;
+            tags.extend(
+                json["tags"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|t| t.as_str().map(String::from)),
+            );
         } else if first.contains('.') || first.contains(':') {
             return Err(format!("no lookup for the registry {first}"));
         } else {
@@ -1078,6 +1115,15 @@ mod tests {
         );
         assert_eq!(syntax_frontend("# The data-avalanche image"), None);
         assert_eq!(syntax_frontend("FROM rust:1 AS build"), None);
+    }
+
+    #[test]
+    fn an_unreadable_inventory_is_an_incomplete_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = check(dir.path(), &fake("x", Ok(None)), &[]);
+        assert!(r.incomplete() && !r.passes());
+        let ok = report(item(Kind::Crate, "x", "1.0.0"), Ok(Some("1.0.0")), &[]);
+        assert!(!ok.incomplete());
     }
 
     #[test]
