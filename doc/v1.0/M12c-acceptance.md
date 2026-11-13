@@ -4284,6 +4284,10 @@ otherwise. Later tasks' blocks applied on top unchanged.
   partition, soak); that the source restart's time is until the server accepts connections, not
   until the stream resumes; that the churn's MERGE count, bytes and files come from the Delta log
   and only the mean commit time from a metric; and R-5's measurement date, 2026-11-11.
+- **Task 5** (PR CI, `6a38e36`): the `check` job's actionlint (shellcheck SC2046) refused the
+  unquoted `--exact $(cat test-infra/cloud-e2e.txt)` in `ci.yml`'s `e2e-gcs` and `cloud.yml`'s
+  `e2e`. Both now read the list into a bash array (`mapfile -t scenarios < …`, then `--exact
+  "${scenarios[@]}"`). The local command in `test-infra/README.md` keeps the `$(cat …)` form.
 - **Task 9**: the management API's OpenAPI document carries `info.version`, so
   `crates/data-avalanche-api/openapi.json` and `docs/public/openapi.json` are regenerated with the
   version (`DATA_AVALANCHE_BLESS=1`, `cargo xtask docs`); otherwise the docs check and
