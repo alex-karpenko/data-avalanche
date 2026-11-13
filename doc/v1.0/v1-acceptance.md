@@ -143,10 +143,11 @@ no product code changed beyond a comment and a message in `sink.rs`); deltalake 
 delta-rs now reports the truncate-vs-OPTIMIZE race as a conflict itself, our post-DELETE check stays
 as a backstop); pgwire-replication 0.5, serde-saphyr 2, sqlparser 0.64, prometheus-client 0.26,
 base64 0.23, getrandom 0.4; jsonwebtoken 12 (`EncodingKey::from_secret` returns a `Result`; a test unwraps it, no auth
-check changed); the compatible bumps in `Cargo.lock`; the CI tools (`prom/prometheus` v3.16.0, and the Dockerfile's `# syntax` frontend 1.29, which the
-gate's inventory missed until the whole-branch review), the test-infra images and DuckDB 2.0
-(a Delta table under a non-ASCII path now reads); the docs site (Starlight 0.43.0, Astro 7.4.12, Mermaid 12.3, Node 26 LTS; the first
-two released the day of the re-run, `e61846b`). Held in `dependency-exceptions.yaml`: the arrow
+check changed); the compatible bumps in `Cargo.lock`; the CI tools (`prom/prometheus` v3.16.0,
+and the Dockerfile's `# syntax` frontend 1.29, which the gate's inventory missed until the
+whole-branch review), the test-infra images and DuckDB 2.0 (a Delta table under a non-ASCII path
+now reads); the docs site (Starlight 0.43.1, Astro 7.4.12, Mermaid 12.3, Node 26 LTS; the first two
+released the day of the re-run). Held in `dependency-exceptions.yaml`: the arrow
 crates at 59 (deltalake-core 1.1.4 requires `^59`), mysql_common at 0.37 (mysql_async 0.37.1
 requires `^0.37`), and the PostgreSQL, MySQL and MariaDB images (the support matrix).
 
