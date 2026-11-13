@@ -89,6 +89,9 @@ checklist, in order:
    or hold it in `dependency-exceptions.yaml` with the reason it can't move, and re-check every hold.
    Locally the command needs `GITHUB_TOKEN` set, because the unauthenticated GitHub API allows 60
    calls an hour (about three runs): `GITHUB_TOKEN=$(gh auth token) cargo xtask deps --check`.
+   Then run `cargo xtask audit`: drop every `.cargo/audit.toml` exception nothing in `Cargo.lock`
+   matches any more, re-check the rest, and triage a new advisory: fix it, or accept it with its
+   reason and what lifts it.
 2. **Verify.** The hermetic suite; full integration and E2E on both sources (CI's MySQL/MariaDB
    matrix); k3s; `cloud.yml` on S3, GCS and Azure; and, when the Delta engine or a source transport
    moves, `cargo xtask bench` and `chaos` on both sources.
@@ -96,7 +99,7 @@ checklist, in order:
    chart README's install line, then run `cargo xtask docs`.
 4. **One PR** carries the refresh, the verification notes and the bump.
 5. **After the merge, tag `v<version>`.** `release.yml` re-runs `cargo xtask deps --check` and
-   refuses a tag that fails it.
+   `cargo xtask audit --check` and refuses a tag that fails either.
 
 ## Commit conventions for implementation work
 

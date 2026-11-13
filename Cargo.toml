@@ -46,6 +46,7 @@ mysql_common = { version = "=0.37.3", default-features = false }
 flate2 = "1"
 sqlparser = { version = "=0.64.0", default-features = false, features = ["std"] }
 rustls = { version = "0.23", features = ["aws_lc_rs"] }
+toml = { version = "1.2.1", default-features = false, features = ["std", "parse", "serde"] }
 serde-saphyr = { version = "=2.1.1", default-features = false, features = ["deserialize"] }
 humantime = "2.4"
 tracing = "0.1"

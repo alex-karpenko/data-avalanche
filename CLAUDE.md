@@ -238,6 +238,9 @@ Non-trivial cases: `TINYINT(1)` boolean detection via `information_schema`; `BIG
 - **Every release refreshes its dependencies.** Before a release's version bump, move everything
   `cargo xtask deps` lists to its newest stable version, or hold it in `dependency-exceptions.yaml`
   with the reason it can't move. `release.yml` refuses a tag while `cargo xtask deps --check` fails.
+  The release also drops every `.cargo/audit.toml` exception nothing matches any more and re-checks
+  the rest (`cargo xtask audit`); `release.yml` also refuses a tag while `cargo xtask audit --check`
+  fails.
   The checklist is `doc/v1.0/README.md` (Releases).
 - **One milestone, one branch, one PR.** Every milestone's planning and implementation happen on
   one branch cut from the current `origin/main` (`git fetch` first), named

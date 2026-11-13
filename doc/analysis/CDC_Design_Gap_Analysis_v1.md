@@ -966,6 +966,11 @@ suites green. Held: arrow 60 (deltalake-core 1.1.4 requires `^59`), mysql_common
   dependency against its registry, `cargo xtask deps --check` fails on one that is neither current
   nor held, and `release.yml` refuses a tag while it fails (`CLAUDE.md`, Implementation workflow;
   the checklist in `doc/v1.0/README.md`, Releases).
+- **The audit exceptions.** `cargo xtask audit` compares `cargo audit`'s advisories (no ignores
+  applied) with `.cargo/audit.toml`; the stale pin-utils exception (RUSTSEC-2026-0441: this
+  release's AWS SDK bumps dropped it from `Cargo.lock`) is gone, and `release.yml` refuses a tag
+  while `cargo xtask audit --check` fails (an unaccepted advisory included). Three stay: quick-xml
+  0.39.4 (RUSTSEC-2026-0194, -0195) and proc-macro-error2 2.0.1 (RUSTSEC-2026-0173).
 - **The counts are unchanged.** 1523 tests with the ITs (hermetic 1508 after the toolchain bump),
   the E2E 51/51 on each source (on PostgreSQL one scenario, the failover slot's, self-skips locally
   and is proven by PR CI); bench 3/3 and chaos 4/4 on each source, with the D-V1.3 targets met as

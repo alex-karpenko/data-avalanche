@@ -1415,7 +1415,8 @@ The scope across the three:
   - The real-cloud matrix: S3, GCS, Azure × PG and MySQL.
   - The weekly DB version matrix green for 4 consecutive runs (Q-M5-23): treated as met (Q-M12-5).
   - A dependency audit: `cargo audit` clean, or every remaining advisory triaged and recorded (the CI
-    step is non-blocking, so this is where the audit is enforced).
+    step is non-blocking; since 1.0.1 the release gate enforces it: `cargo xtask audit --check`
+    fails on an unaccepted advisory or a stale exception).
   - Compile time and the dependency tree (Q-M5-24), checked against a measurement:
     - `cargo build --timings`, to see what dominates: DataFusion, `aws-lc-sys` (a C build, through
       `deltalake-aws`'s `aws-config`) or linking;

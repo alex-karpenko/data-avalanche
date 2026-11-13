@@ -6,6 +6,8 @@ name: release
 # ghcr.io/<owner>/charts; and a GitHub release with the SBOM. The tag must equal the workspace's version and the chart's.
 # The `version` job also runs the dependency gate, `cargo xtask deps --check`: every pinned dependency is
 # at its newest stable version or held in dependency-exceptions.yaml, so a tag that fails it publishes nothing.
+# It then runs the audit gate, `cargo xtask audit --check`: no RustSec advisory without an entry in
+# .cargo/audit.toml and no entry that nothing in Cargo.lock matches, on the same terms.
 # A manual run builds both images and packages the chart without pushing anything.
 on:
   push:
@@ -32,6 +34,12 @@ jobs:
         run: cargo xtask deps --check
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: No advisory unaccepted, no exception stale
+        run: cargo xtask audit --check
       - id: version
         name: The tag, the workspace and the chart agree
         run: |

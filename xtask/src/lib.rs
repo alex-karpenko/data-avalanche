@@ -6,6 +6,7 @@
 
 mod acceptance;
 mod api;
+pub mod audit;
 mod config;
 pub mod deps;
 mod examples;

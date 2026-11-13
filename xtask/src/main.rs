@@ -1,7 +1,8 @@
 //! `cargo xtask docs` writes the documentation site's generated pages; `cargo xtask docs --check`
 //! exits 1, naming them, when a committed copy differs. `cargo xtask bench|chaos|soak` runs an
 //! acceptance run (M12c) and says where its measurements are. `cargo xtask deps` checks every pinned
-//! dependency against its registry; `--check` exits 1 unless each is current, floating or held.
+//! dependency against its registry; `--check` exits 1 unless each is current, floating or held. `cargo xtask audit` checks the RustSec advisories
+//! against `.cargo/audit.toml`; `--check` exits 1 on an unaccepted advisory or a stale exception.
 
 use std::process::{Command, ExitCode};
 
@@ -12,9 +13,13 @@ fn main() -> ExitCode {
         ["docs", "--check"] => true,
         ["deps"] => return deps(false),
         ["deps", "--check"] => return deps(true),
+        ["audit"] => return audit(false),
+        ["audit", "--check"] => return audit(true),
         [run] if xtask::RUNS.contains(&run) => return acceptance(run),
         _ => {
-            eprintln!("usage: cargo xtask docs [--check] | deps [--check] | bench | chaos | soak");
+            eprintln!(
+                "usage: cargo xtask docs [--check] | deps [--check] | audit [--check] | bench | chaos | soak"
+            );
             return ExitCode::from(2);
         }
     };
@@ -55,6 +60,25 @@ fn deps(check: bool) -> ExitCode {
         }
     };
     let report = xtask::deps::check(&root, &xtask::deps::Live::new(), &exceptions);
+    for line in report.lines() {
+        println!("{line}");
+    }
+    if check && !report.passes() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Audits `Cargo.lock` against `.cargo/audit.toml`; with `check`, exits 1 unless the report passes.
+fn audit(check: bool) -> ExitCode {
+    let report = match xtask::audit::run(&xtask::repo_root()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
     for line in report.lines() {
         println!("{line}");
     }

@@ -15,6 +15,8 @@ data-avalanche-api.workspace = true
 serde.workspace = true
 serde-saphyr.workspace = true
 serde_json.workspace = true
+toml.workspace = true
+tempfile.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 
 [dev-dependencies]
