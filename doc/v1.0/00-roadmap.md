@@ -39,7 +39,7 @@ build on the interfaces that actually landed. That staging was chosen on 2026-09
 
 ## 1. Scope recap (what v1 is)
 
-- **Sources:** PostgreSQL (`pgoutput`, proto v1, our own decoder over `pgwire-replication =0.4.1`),
+- **Sources:** PostgreSQL (`pgoutput`, proto v1, our own decoder over `pgwire-replication =0.5.0`),
   MySQL 8.4 and MariaDB (`mysql_async =0.37.1` binlog stream; GTID and file/position modes; MariaDB GTID
   dialect; compressed-transaction check).
 - **Sink:** Delta Lake mirror (`deltalake =1.0.0`, one MERGE per table per flush, `txn` fence,
