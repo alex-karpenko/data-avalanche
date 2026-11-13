@@ -1402,7 +1402,9 @@ closed with a pointer (Q-M12-1).
 - **M12c — v1 acceptance**: the load, soak and chaos runs (on Oleksii's machine first, Q-M12-3, with
   DA-OPS-14's measurement), the real-cloud E2E in CI (S3, GCS, Azure, Q-M12-2), the checklist in
   §8, and `v1.0.0`. Plan: `M12c-acceptance.md` (Q-M12c-1…4): the four gaps left open after M12d
-  fixed first; the cloud E2E a subset of four scenarios; the runs a `load` test target.
+  fixed first; the cloud E2E a subset of four scenarios; the runs a `load` test target. Executed
+  2026-11-11…13: the acceptance report is `v1-acceptance.md` (D-V1.3 met on both sources); version
+  `1.0.0`, tagged after the merge.
 
 The scope across the three:
 
