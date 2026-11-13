@@ -274,8 +274,8 @@ impl DeltaSink {
             // truncates again.
             if table.snapshot().map_err(sink_error)?.log_data().num_files() > 0 {
                 return Ok(Step::Retry(
-                    "the truncate left files a concurrent commit wrote (an OPTIMIZE, which \
-                     delta-rs doesn't treat as a conflict)"
+                    "the truncate left files a commit delta-rs didn't count as a conflict \
+                     wrote"
                         .into(),
                 ));
             }
@@ -914,7 +914,8 @@ mod tests {
         t.truncate = true;
         match stale_attempt(&s, &t, 1).await {
             Step::Retry(reason) => assert!(
-                reason.contains("OPTIMIZE") || reason.contains("concurrent transaction deleted"),
+                reason.contains("didn't count as a conflict")
+                    || reason.contains("concurrent transaction deleted"),
                 "{reason}"
             ),
             Step::Done(o) => panic!("{o:?}, rows {:?}", ids(&s).await),
