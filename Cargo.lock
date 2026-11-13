@@ -1747,7 +1747,7 @@ version = "1.0.0"
 dependencies = [
  "arrow-array",
  "arrow-cast",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "clap",
  "data-avalanche-api",
@@ -1784,7 +1784,7 @@ name = "data-avalanche-api"
 version = "1.0.0"
 dependencies = [
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "boon",
  "chrono",
@@ -1831,7 +1831,7 @@ dependencies = [
  "data-avalanche-testkit",
  "foca",
  "gethostname",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "if-addrs",
  "object_store 0.14.2",
  "rand 0.10.3",
@@ -1848,7 +1848,7 @@ version = "1.0.0"
 dependencies = [
  "blake3",
  "data-avalanche-core",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "humantime",
  "rcgen",
  "rustls-pki-types",
@@ -1892,7 +1892,7 @@ dependencies = [
  "data-avalanche-storage",
  "data-avalanche-testkit",
  "futures-util",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "object_store 0.14.2",
  "proptest",
  "serde_json",
@@ -1945,7 +1945,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "serde_json",
- "sqlparser",
+ "sqlparser 0.64.0",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -2097,7 +2097,7 @@ dependencies = [
  "object_store 0.13.2",
  "parking_lot",
  "parquet",
- "sqlparser",
+ "sqlparser 0.62.0",
  "tempfile",
  "tokio",
  "url",
@@ -2175,7 +2175,7 @@ dependencies = [
  "object_store 0.13.2",
  "parquet",
  "recursive",
- "sqlparser",
+ "sqlparser 0.62.0",
  "tokio",
  "uuid",
  "web-time",
@@ -2390,7 +2390,7 @@ dependencies = [
  "recursive",
  "serde",
  "serde_json",
- "sqlparser",
+ "sqlparser 0.62.0",
 ]
 
 [[package]]
@@ -2780,7 +2780,7 @@ dependencies = [
  "log",
  "recursive",
  "regex",
- "sqlparser",
+ "sqlparser 0.62.0",
  "stacker",
 ]
 
@@ -2885,7 +2885,7 @@ dependencies = [
  "roaring",
  "serde",
  "serde_json",
- "sqlparser",
+ "sqlparser 0.62.0",
  "sysinfo",
  "thiserror 2.0.21",
  "tokio",
@@ -3362,9 +3362,9 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "granit-parser"
-version = "1.3.0"
+version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e20f99e46474f56bd905c56e817ebddcf377a611f94c53ac4649e4d3fa3c0cd0"
+checksum = "05f05586d4d4df3d47123207826c40b252728b438a1a07bad3c01ee6bea401df"
 dependencies = [
  "arraydeque",
  "smallvec",
@@ -4638,9 +4638,9 @@ dependencies = [
 
 [[package]]
 name = "pgwire-replication"
-version = "0.4.1"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20f9e5e3d56a31f59f606cedb6526b6e16dc06e4b34790804796c009940d70c2"
+checksum = "3a50650abe90031924c509ad2a3ac1e8f1cb8387dceb0fa4c1db382ea36f6b22"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4849,9 +4849,9 @@ dependencies = [
 
 [[package]]
 name = "prometheus-client"
-version = "0.25.1"
+version = "0.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1784dc11a05f5a8f57c4a62915686be140f24f70301290b997e317241fa9ffc2"
+checksum = "f021d42d29841d029b61b45a25a7ef94feaf1d744913e59665103333a56045b8"
 dependencies = [
  "dtoa",
  "itoa",
@@ -5539,9 +5539,9 @@ dependencies = [
 
 [[package]]
 name = "serde-saphyr"
-version = "1.3.0"
+version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8050abb251097357e24aff63ba2c52a6309ecb7d23a5474023df960a02694d8"
+checksum = "d43fb82d550b07e6f929a58d7d0935182602f48ddead875f5ee313c41c8f07fe"
 dependencies = [
  "annotate-snippets",
  "encoding_rs_io",
@@ -5755,6 +5755,15 @@ dependencies = [
  "log",
  "recursive",
  "sqlparser_derive",
+]
+
+[[package]]
+name = "sqlparser"
+version = "0.64.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92e0d273b4f8ddd14a35ed36862acbc9cc96cec578e36ee1881a9d42e0e0f2c8"
+dependencies = [
+ "log",
 ]
 
 [[package]]

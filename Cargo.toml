@@ -44,15 +44,15 @@ mysql_async = { version = "=0.37.1", default-features = false, features = ["defa
 # `recursive-protection`, whose stack growth builds C code: the parser's recursion limit bounds it).
 mysql_common = { version = "=0.37.3", default-features = false }
 flate2 = "1"
-sqlparser = { version = "=0.62.0", default-features = false, features = ["std"] }
+sqlparser = { version = "=0.64.0", default-features = false, features = ["std"] }
 rustls = { version = "0.23", features = ["aws_lc_rs"] }
-serde-saphyr = { version = "=1.3.0", default-features = false, features = ["deserialize"] }
+serde-saphyr = { version = "=2.1.1", default-features = false, features = ["deserialize"] }
 humantime = "2.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "env-filter"] }
 rustls-pki-types = { version = "1", features = ["std"] }
 blake3 = { version = "1", default-features = false, features = ["std"] }
-getrandom = { version = "0.3", default-features = false, features = ["std"] }
+getrandom = { version = "0.4", default-features = false, features = ["std"] }
 tempfile = "3"
 async-trait = "0.1"
 bytes = "1"
@@ -72,13 +72,14 @@ arrow-cast = "59"
 deltalake = { version = "=1.1.2", default-features = false, features = ["datafusion", "rustls", "s3", "gcs", "azure"] }
 deltalake-core = { version = "=1.1.4", default-features = false }
 url = "2"
-# The PostgreSQL source (roadmap §2.1): the replication transport the S-PG probes ran on (the
-# pgoutput decoder is ours), and rustls for the catalog connection.
-pgwire-replication = { version = "=0.4.1", default-features = false, features = ["tls-rustls", "scram", "md5"] }
+# The PostgreSQL source (roadmap §2.1): the replication transport (the pgoutput decoder is ours;
+# the S-PG probes chose it on 0.4.1, the 1.0.1 integration suite verified 0.5), and rustls for the
+# catalog connection.
+pgwire-replication = { version = "=0.5.0", default-features = false, features = ["tls-rustls", "scram", "md5"] }
 tokio-postgres-rustls = "0.14"
 webpki-roots = "1"
 # The binary's control plane (M6b): metrics (roadmap §2.1).
-prometheus-client = "=0.25.1"
+prometheus-client = "=0.26.0"
 gethostname = "1.1"
 clap = { version = "4.6.7", features = ["derive"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
@@ -88,7 +89,7 @@ tokio-rustls = { version = "0.26.5", default-features = false, features = ["aws_
 # the reqwest object_store already builds, and basic auth's decode and constant-time compare.
 jsonwebtoken = { version = "=11.1.0", default-features = false, features = ["aws_lc_rs"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
-base64 = "0.22.1"
+base64 = "0.23.1"
 subtle = "2.6.1"
 # Its OpenAPI document (roadmap §4 M9), built from the route table with the builders. 6.0.0
 # doesn't build without `macros`: its schema module names a type only that feature defines.
