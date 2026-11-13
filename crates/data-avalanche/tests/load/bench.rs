@@ -89,6 +89,10 @@ async fn steady_state_lag_at_the_defaults() {
         lands(&e, "lake", t, Duration::from_secs(300)).await;
     }
     assert!(p99 <= STEADY_P99, "p99 lag {p99} s over {STEADY_P99} s");
+    assert!(
+        lag.quantile(0.5) > 0.0,
+        "steady: the lag's p50 is 0: a stream that stalled while reading reads 0 (nothing waits)"
+    );
     assert!(p.terminate().await.success());
     e.cleanup().await;
 }

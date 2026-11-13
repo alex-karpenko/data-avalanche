@@ -33,7 +33,7 @@ jobs:
       - name: Clippy (e2e-hooks)
         run: cargo clippy --locked -p data-avalanche --features e2e-hooks --all-targets -- -D warnings
       - name: Unit tests (e2e-hooks)
-        run: cargo test --locked -p data-avalanche --features e2e-hooks --lib
+        run: cargo test --locked -p data-avalanche --features e2e-hooks --lib --test load
       # The example alert rules against their promtool tests (M10); the catalogue test checks
       # the series they name.
       - name: Alert rules

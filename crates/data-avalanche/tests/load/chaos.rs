@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use data_avalanche_testkit::endpoints::RUSTFS_URL;
 
-use crate::harness::{Db, E2e, Options, Store};
+use crate::harness::{Db, E2e, Options, Store, eventually};
 use crate::nodes::Cluster;
 use crate::proxy::Proxy;
 use crate::report::{knob, record};
@@ -50,7 +50,11 @@ async fn storage_outage(test: &str, outage: Duration) -> Option<(u64, u64)> {
     let w = workload();
     let e = E2e::new(test, &w.ddl(), options()).await;
     if e.store != Store::RustFs {
-        eprintln!("skipped: the storage outage runs on RustFS");
+        eprintln!(
+            "skipped: the storage outage runs on RustFS, not {:?}",
+            e.store
+        );
+        e.cleanup().await;
         return None;
     }
     let rustfs: u16 = RUSTFS_URL
@@ -133,7 +137,11 @@ async fn a_storage_outage_longer_than_the_lease_loses_nothing() {
 async fn a_source_restart_loses_nothing() {
     require_load!();
     let w = workload();
-    let mut e = E2e::new("chaos_source", &w.ddl(), options()).await;
+    let ddl = format!(
+        "{} CREATE TABLE sentinel (id bigint PRIMARY KEY, doc text);",
+        w.ddl()
+    );
+    let mut e = E2e::new("chaos_source", &ddl, options()).await;
     w.prefill(&e).await;
     let mut p = e.start(&[]);
     p.ready().await;
@@ -164,6 +172,9 @@ async fn a_source_restart_loses_nothing() {
     record(RUN, "source_restart", t.elapsed().as_secs_f64(), "s", None);
     p.metric(&e.status("running")).await;
     e.streaming().await;
+    // A write through the reconnected connection: it must reach the lake.
+    e.exec("INSERT INTO sentinel VALUES (1, 'after the restart')")
+        .await;
     tokio::time::sleep(AROUND).await;
     let counts = writer.stop().await;
     assert!(
@@ -180,6 +191,10 @@ async fn a_source_restart_loses_nothing() {
     for t in &w.tables {
         lands(&e, "lake", t, Duration::from_secs(300)).await;
     }
+    eventually("the sentinel lands", Duration::from_secs(300), async || {
+        e.ids("sentinel").await == [1]
+    })
+    .await;
     assert!(p.terminate().await.success());
     e.cleanup().await;
 }

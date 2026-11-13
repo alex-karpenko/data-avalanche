@@ -425,7 +425,12 @@ pipelines:
 
     /// The table's rows in the lake, `None` before it exists.
     pub async fn content(&self, table: &str) -> Option<RecordBatch> {
-        self.lake()
+        self.content_in("lake", table).await
+    }
+
+    /// [`Self::content`] in the lake `lake`.
+    pub async fn content_in(&self, lake: &str, table: &str) -> Option<RecordBatch> {
+        self.lake_in(lake)
             .content(&self.table(table))
             .await
             .expect("the lake reads")
@@ -475,7 +480,17 @@ pipelines:
     /// `rows`, or `None` when the lake's `table` lacks one of `cols` (a pipeline that lags behind
     /// a DDL: DA-X-14). A missing table is no rows.
     pub async fn try_rows(&self, table: &str, cols: &[&str]) -> Option<Vec<Vec<String>>> {
-        let Some(b) = self.content(table).await else {
+        self.try_rows_in("lake", table, cols).await
+    }
+
+    /// [`Self::try_rows`] in the lake `lake`.
+    pub async fn try_rows_in(
+        &self,
+        lake: &str,
+        table: &str,
+        cols: &[&str],
+    ) -> Option<Vec<Vec<String>>> {
+        let Some(b) = self.content_in(lake, table).await else {
             return Some(vec![]);
         };
         let options = FormatOptions::default().with_null("NULL");
@@ -516,10 +531,19 @@ pipelines:
 
     /// Waits until the lake's `table` has the source's rows, compared on `cols`.
     pub async fn mirrored(&self, table: &str, cols: &[&str]) {
+        self.mirrored_in("lake", table, cols, Duration::from_secs(60))
+            .await;
+    }
+
+    /// [`Self::mirrored`] in the lake `lake`, waiting at most `within`.
+    pub async fn mirrored_in(&self, lake: &str, table: &str, cols: &[&str], within: Duration) {
         let want = self.source_rows(table, cols).await;
-        let what = format!("{table} has the source's {} rows on {cols:?}", want.len());
-        eventually(&what, Duration::from_secs(60), async || {
-            self.try_rows(table, cols).await.as_ref() == Some(&want)
+        let what = format!(
+            "{lake}/{table} has the source's {} rows on {cols:?}",
+            want.len()
+        );
+        eventually(&what, within, async || {
+            self.try_rows_in(lake, table, cols).await.as_ref() == Some(&want)
         })
         .await;
     }

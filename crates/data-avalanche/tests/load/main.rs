@@ -94,11 +94,10 @@ pub(crate) async fn epochs_never_go_back(e: &E2e, lake: &str, table: &str) {
 }
 
 /// The lake `lake`'s `table` holds the source's rows on [`workload::COLS`], each key once, within
-/// `within`: first the ids (cheap to compare while they move), then the rows.
+/// `within`: first the ids (cheap to compare while they move), then the rows, in every lake.
 pub(crate) async fn lands(e: &E2e, lake: &str, table: &str, within: Duration) {
     e.converged_in(lake, table, within).await;
-    if lake == "lake" {
-        e.mirrored(table, workload::COLS).await;
-    }
+    e.mirrored_in(lake, table, workload::COLS, Duration::from_secs(60))
+        .await;
     epochs_never_go_back(e, lake, table).await;
 }

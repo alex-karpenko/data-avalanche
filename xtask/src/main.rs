@@ -47,7 +47,11 @@ fn acceptance(run: &str) -> ExitCode {
     let mut cmd = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
     cmd.args(&i.args).current_dir(&root);
     for (k, v) in &i.env {
-        if std::env::var_os(k).is_none() {
+        // The two gates are the point of the wrapper: set even when the caller's are empty or
+        // `0`, which would make every run skip and the wrapper exit 0. The other values are
+        // defaults the caller's environment may override.
+        let gate = k == "DATA_AVALANCHE_IT" || k == "DATA_AVALANCHE_LOAD";
+        if gate || std::env::var_os(k).is_none() {
             cmd.env(k, v);
         }
     }
