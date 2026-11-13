@@ -99,10 +99,12 @@ struct Package {
 pub fn findings(audit_json: &str) -> Result<Vec<Finding>, String> {
     let doc: serde_json::Value =
         serde_json::from_str(audit_json).map_err(|e| format!("cargo audit output: {e}"))?;
-    let mut lists: Vec<(&str, &serde_json::Value)> = Vec::new();
-    if let Some(list) = doc.pointer("/vulnerabilities/list") {
-        lists.push(("vulnerability", list));
-    }
+    // cargo audit always writes the list; without it the output isn't what we can read, and a
+    // blocking gate must not pass on that.
+    let list = doc
+        .pointer("/vulnerabilities/list")
+        .ok_or("cargo audit output: no `vulnerabilities.list`")?;
+    let mut lists: Vec<(&str, &serde_json::Value)> = vec![("vulnerability", list)];
     if let Some(warnings) = doc.get("warnings").and_then(|w| w.as_object()) {
         for (kind, list) in warnings {
             lists.push((kind, list));
@@ -152,6 +154,8 @@ pub fn evaluate(accepted: &[String], findings: &[Finding]) -> Report {
 
 /// Audits `root`'s `Cargo.lock` against `.cargo/audit.toml`: `cargo audit` runs from a fresh
 /// temporary directory, so the repository's own ignores don't apply and every advisory shows.
+/// cargo-audit still reads a user-level `$CARGO_HOME/audit.toml`: its ignores can make an exception
+/// look stale locally, never hide an unaccepted advisory (CI has none).
 pub fn run(root: &Path) -> Result<Report, String> {
     let toml_path = root.join(".cargo/audit.toml");
     let text =
@@ -288,5 +292,12 @@ ignore = [
     #[test]
     fn unparsable_output_is_an_error() {
         assert!(findings("not json").is_err());
+    }
+
+    #[test]
+    fn output_without_the_vulnerabilities_list_is_an_error() {
+        // A blocking gate must not pass on output it can't read: cargo audit always writes the list.
+        assert!(findings("{}").is_err());
+        assert!(findings(r#"{"warnings": {}}"#).is_err());
     }
 }
