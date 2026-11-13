@@ -119,23 +119,25 @@ source committed was lost.
 ## The cloud subset
 
 The four scenarios in `test-infra/cloud-e2e.txt` (Q-M12c-4), run with `--exact` against a real
-bucket through `DATA_AVALANCHE_E2E_STORE`.
+bucket through `DATA_AVALANCHE_E2E_STORE`. The CI rows are the test binary's own time; every
+run passed all four.
 
 | Where | Store | PostgreSQL 18 | MySQL 8.4 |
 |---|---|---|---|
 | Oleksii's machine, 2026-11-11 (Task 5, `00f7eaf`) | GCS | 4/4, 462 s | 4/4, 412 s |
-| PR CI `e2e-gcs` | GCS | at the Exit | at the Exit |
-| `cloud.yml` `e2e` | S3 | at the Exit | at the Exit |
-| `cloud.yml` `e2e` | Azure | at the Exit | at the Exit |
+| PR CI `e2e-gcs`, PR #22 run 43372201106, 2026-11-13 (`3364b20`) | GCS | 4/4, 168 s | 4/4, 131 s |
+| `cloud.yml` `e2e`, run 43375990336, 2026-11-13 (`3364b20`) | S3 | 4/4, 159 s | 4/4, 133 s |
+| `cloud.yml` `e2e`, same run | GCS | 4/4, 193 s | 4/4, 173 s |
+| `cloud.yml` `e2e`, same run | Azure | 4/4, 132 s | 4/4, 145 s |
 
 ## The §8 checklist
 
 | Item | Status | Where it is met |
 |---|---|---|
-| All milestone exit criteria met; CI, weekly and cloud workflows green | at the Exit | M0–M12d merged with their exits (`doc/v1.0/README.md`); weekly 4 in a row treated as met (Q-M12-5); M12c's PR CI and `cloud.yml` at the Exit |
+| All milestone exit criteria met; CI, weekly and cloud workflows green | at the merge | M0–M12d merged with their exits (`doc/v1.0/README.md`); weekly 4 in a row treated as met (Q-M12-5); M12c's PR CI and `cloud.yml` green at `3364b20` (above); M12c's exit is its merge |
 | D-V1.3 measured: steady p99 ≤ 60 s, failover recovery ≤ 2 min | ✅ | §D-V1.3 above: 30.9 s / 52.5 s (PostgreSQL 18), 30.8 s / 53.7 s (MySQL 8.4) |
 | No data loss or duplicate keys in the crash/replay/chaos suites | ✅ | the crash and replay scenarios in `crates/data-avalanche/tests/e2e/` (`crashes.rs`, `failover.rs`; every PR); the chaos runs above; the soak's hourly checks |
-| Real-cloud E2E on S3, GCS and Azure | at the Exit | GCS measured locally (above); S3 and Azure by `cloud.yml` |
+| Real-cloud E2E on S3, GCS and Azure | ✅ | the cloud subset 4/4 on each store and source: `cloud.yml` run 43375990336, and PR CI's `e2e-gcs` (above) |
 | Container image and Helm chart published; k3s smoke deploy green | at the Exit | `release.yml` on the `v1.0.0` tag (M11a) |
 | Documentation site builds strict; runbooks reviewed | builds ✅; review at the Exit | `docs/` builds strict, every internal link valid (2026-11-13, after this report's page edits); the runbooks' review is Oleksii's |
 | Compile time and dependency tree reviewed against `cargo build --timings` | ✅ | M12b Task 15 (`doc/v1.0/M12b-control-hardening.md`): measured, line tables taken |

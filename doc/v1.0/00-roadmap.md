@@ -1633,7 +1633,8 @@ implements them.
 - [x] No data loss or duplicate keys in the crash/replay/chaos suites (source vs Delta comparison).
       Met: the E2E crash and failover scenarios (every PR), the chaos runs on both sources and the
       24 h soak's hourly checks (`v1-acceptance.md`).
-- [ ] Real-cloud E2E on S3, GCS and Azure.
+- [x] Real-cloud E2E on S3, GCS and Azure. Met 2026-11-13: the cloud subset 4/4 on S3, GCS and
+      Azure on PostgreSQL 18 and MySQL 8.4 (`cloud.yml` run 43375990336; `v1-acceptance.md`).
 - [ ] Container image and Helm chart published; k3s smoke deploy green.
 - [ ] Documentation site builds strict; runbooks reviewed. The site builds strict, every internal
       link valid (2026-11-13); the runbooks' review at the Exit.

@@ -4217,7 +4217,7 @@ git add Cargo.toml Cargo.lock deploy/helm/data-avalanche doc/v1.0 && git commit 
   run as M12d's Exit: the workspace ITs, the MySQL targets, PostgreSQL 17 and 14, the E2E on
   PostgreSQL 18 with both replica pairs and on `mysql-84`).
 - [x] The acceptance runs green on Oleksii's machine (Task 8), D-V1.3 met on both sources.
-- [ ] After the whole-branch review and its fixes: the branch pushed, the PR open; its CI green,
+- [x] After the whole-branch review and its fixes: the branch pushed, the PR open; its CI green,
   `e2e-gcs` included. With Oleksii's OK, `cloud.yml` dispatched on the branch (`gh workflow run
   cloud.yml --ref feat/claude/m12c-acceptance`): `e2e` green on S3, GCS and Azure, and the report's
   cloud rows filled from it.
@@ -4232,6 +4232,10 @@ passed locally, with both replica pairs recreated: the workspace ITs; `mysql-84-
 51/51 on PostgreSQL 18 and 51/51 on `mysql-84`. The harness's review fixes were run short on
 PostgreSQL 18 (bench 3/3, chaos 4/4, soak 1/1); the full-length runs (Task 8) stand, as the fixes
 add checks, not measurements.
+
+PR #22's CI green at `3364b20` after one fix (actionlint, see the deviations), `e2e-gcs` 4/4 on
+both sources; `cloud.yml` (run 43375990336, dispatched with Oleksii's OK) green: the lease suites on
+S3 and Azure, and the cloud subset 4/4 on S3, GCS and Azure on both sources.
 
 ## Verification in planning (2026-11-11)
 
