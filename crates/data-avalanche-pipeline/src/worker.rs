@@ -355,6 +355,15 @@ enum Empty {
     Truncate,
 }
 
+/// How the halt of a table whose reposition the sink refused begins (DA-SRC-32): the start
+/// that clears the halts of tables nobody tracks keeps it while the lake holds the table
+/// (DA-SRC-37).
+const REPOSITION_REFUSED: &str = "the source changed, and its reposition fails";
+
+fn refused_reposition(reason: &HaltReason) -> bool {
+    matches!(reason, HaltReason::SinkRejected { detail } if detail.starts_with(REPOSITION_REFUSED))
+}
+
 /// Whether a cached schema's columns are the catalog's now: the same, in order, with the names
 /// compared without case when the source compares them so (`fold`, MySQL): a change of case alone
 /// is the same column, cached under its first spelling (DA-SRC-25).
@@ -789,8 +798,15 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
             // tracked at a resume whose sink table a job's copy made. Baselined against the
             // sink table's columns (DA-SNAP-13, DA-SNAP-22).
             None if state.exists => {
-                let adds = match state.schema.as_deref().map(|s| missing_columns(s, now)) {
-                    Some(Ok(adds)) => adds,
+                let adds = match state
+                    .schema
+                    .as_deref()
+                    .map(|s| missing_columns(s, now, fold))
+                {
+                    Some(Ok(base)) => {
+                        schema = base.schema;
+                        base.adds
+                    }
                     Some(Err(reason)) => {
                         halts.push((table.clone(), reason));
                         tracked.insert(table.clone());
@@ -1121,13 +1137,29 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
     // A copy's halt goes once its job carries it: the pipeline doesn't replicate the table, and
     // no job can clear the halt of a table gone. It is the halt of a table neither configured
     // nor cached (a table taken out of the config keeps its schema) nor read now.
-    for table in recorded_halts.keys() {
+    //
+    // A refused reposition's halt stays while the lake holds the table (DA-SRC-37): the
+    // checkpoint names the new server, so no later start from the same server repositions it (a
+    // later source change does, and the halt stays all the same), and tracked later the table
+    // would skip the new server's changes up to its old marker. A job's copy of it, or the table
+    // gone from the lake, ends it.
+    for (table, reason) in &recorded_halts {
         if !configured.contains(table)
             && !cached.contains_key(table)
             && !requests.contains(table)
             && !copies.contains_key(table)
             && !cleared.contains(table)
         {
+            if refused_reposition(reason)
+                && sink_retry(&tuning, || Ok(()), || sink.table_state(table))
+                    .await?
+                    .exists
+            {
+                core.update(|st| {
+                    st.halted.insert(table.clone(), reason.clone());
+                });
+                continue;
+            }
             core.may_write()?;
             core.docs.clear_halt(table).await?;
         }
@@ -1159,7 +1191,7 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
                 )),
                 Err(WorkerError::Sink(SinkError::Permanent { reason })) => {
                     let reason = HaltReason::SinkRejected {
-                        detail: format!("the source changed, and its reposition fails: {reason}"),
+                        detail: format!("{REPOSITION_REFUSED}: {reason}"),
                     };
                     core.may_write()?;
                     core.docs
@@ -2453,6 +2485,83 @@ mod tests {
         assert_eq!(w.text("b", "note"), [Some("n".to_owned())]);
     }
 
+    /// DA-SNAP-23: where the source compares names without case (MySQL), a sink column that
+    /// differs from the source's by case alone is that column: no add, no halt, and the session
+    /// writes it under the sink's spelling, in the key too, as the cached path does (DA-SRC-25).
+    #[test]
+    fn where_names_fold_a_sink_column_matching_by_case_alone_is_the_column() {
+        let sink = upsert_schema(&schema("a"));
+        let cased = TableSchema::new(
+            t("a"),
+            vec![
+                ColumnSchema::new("ID", V::Int64, "bigint").not_null(),
+                ColumnSchema::new("DOC", V::Text, "text"),
+                ColumnSchema::new("note", V::Text, "text"),
+            ],
+            vec!["ID".into()],
+        )
+        .unwrap();
+        let base = missing_columns(&sink, &cased, true).unwrap();
+        let names: Vec<_> = base
+            .schema
+            .columns()
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(names, ["id", "doc", "note"], "the sink's spelling");
+        assert_eq!(base.schema.identifier(), ["id"]);
+        assert!(
+            matches!(&base.adds[..], [SchemaChange::AddColumn(c)] if c.name == "note"),
+            "{:?}",
+            base.adds
+        );
+        assert!(
+            missing_columns(&sink, &cased, false).is_err(),
+            "PostgreSQL's names are case-sensitive: the pair halts"
+        );
+    }
+
+    /// DA-SNAP-23: a table first tracked at a resume whose MySQL columns changed case alone since
+    /// a job's copy made its sink table is baselined, not halted, and its rows land.
+    #[tokio::test]
+    async fn a_first_met_table_whose_names_changed_case_alone_is_baselined_where_names_fold() {
+        let w = World::new(&["a"]);
+        w.source.fold_column_names();
+        let p = mode("mode: initial");
+        run(&w, &p, async |status| streamed(&status, &w).await)
+            .await
+            .0
+            .unwrap();
+        w.sink
+            .ensure_table(&TableSpec::new(&schema("b"), vec![]).unwrap())
+            .await
+            .unwrap();
+        let cased = TableSchema::new(
+            t("b"),
+            vec![
+                ColumnSchema::new("ID", V::Int64, "bigint").not_null(),
+                ColumnSchema::new("Doc", V::Text, "text"),
+            ],
+            vec!["ID".into()],
+        )
+        .unwrap();
+        w.source.create_table(cased);
+        w.source.load(
+            &t("b"),
+            vec![Row(vec![
+                ("ID".into(), ColumnValue::Int64(1)),
+                ("Doc".into(), ColumnValue::Text("x".into())),
+            ])],
+        );
+        let (end, st) = run(&w, &p, async |status| streamed(&status, &w).await).await;
+        assert_eq!(end.unwrap(), Exit::Drained);
+        assert!(st.halted.is_empty(), "{:?}", st.halted);
+        assert_eq!(w.ids("b"), [1]);
+        let cached = w.docs.table_schema(&t("b")).await.unwrap().unwrap().doc;
+        let names: Vec<_> = cached.columns().iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["id", "doc"], "the sink's spelling");
+    }
+
     /// DA-SNAP-22: a sink table holding a non-null column the source no longer has (a key it
     /// was made with) can't take the source's rows: it halts at the baseline, naming the column,
     /// rather than at the first MERGE.
@@ -2470,7 +2579,7 @@ mod tests {
         .unwrap();
         let sink = upsert_schema(&keyed);
         let Err(HaltReason::SchemaMismatch { column, detail }) =
-            missing_columns(&sink, &schema("a"))
+            missing_columns(&sink, &schema("a"), false)
         else {
             panic!("a non-null column the source lacks halts");
         };
@@ -2489,7 +2598,12 @@ mod tests {
             )
             .unwrap(),
         );
-        assert!(missing_columns(&sink, &schema("a")).unwrap().is_empty());
+        assert!(
+            missing_columns(&sink, &schema("a"), false)
+                .unwrap()
+                .adds
+                .is_empty()
+        );
     }
 
     /// A sink table without the source's key column is keyed otherwise: it halts.
@@ -2506,10 +2620,15 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            missing_columns(&sink, &rekeyed),
+            missing_columns(&sink, &rekeyed, false),
             Err(HaltReason::SchemaMismatch { column, .. }) if column == "uid"
         ));
-        assert!(missing_columns(&sink, &schema("a")).unwrap().is_empty());
+        assert!(
+            missing_columns(&sink, &schema("a"), false)
+                .unwrap()
+                .adds
+                .is_empty()
+        );
     }
 
     /// Delta's names are case-insensitive: a sink column that matches by case alone halts, on a
@@ -2529,25 +2648,26 @@ mod tests {
             .unwrap()
         };
         let Err(HaltReason::SchemaMismatch { column, detail }) =
-            missing_columns(&sink, &cased("id", "DOC"))
+            missing_columns(&sink, &cased("id", "DOC"), false)
         else {
             panic!("a case-only match halts");
         };
         assert_eq!(column, "DOC");
         assert!(detail.contains("doc") && detail.contains("DOC"), "{detail}");
         assert!(matches!(
-            missing_columns(&sink, &cased("ID", "doc")),
+            missing_columns(&sink, &cased("ID", "doc"), false),
             Err(HaltReason::SchemaMismatch { column, .. }) if column == "ID"
         ));
         assert!(
-            missing_columns(&sink, &cased("id", "doc"))
+            missing_columns(&sink, &cased("id", "doc"), false)
                 .unwrap()
+                .adds
                 .is_empty()
         );
         // Unicode case too, as delta-rs folds it (DA-SINK-12).
         let sink = upsert_schema(&cased("id", "ärger"));
         assert!(matches!(
-            missing_columns(&sink, &cased("id", "ÄRGER")),
+            missing_columns(&sink, &cased("id", "ÄRGER"), false),
             Err(HaltReason::SchemaMismatch { column, .. }) if column == "ÄRGER"
         ));
     }
@@ -2858,6 +2978,72 @@ mod tests {
         assert_eq!(moved.committed_position, SourcePosition::Pg(Lsn(0x100)));
         let x = w.sink.table_state(&t("x")).await.unwrap().marker.unwrap();
         assert_eq!(x, old, "x's marker stays: its reposition was refused");
+    }
+
+    /// DA-SRC-37: the halt of a refused reposition outlives the next start while the lake holds
+    /// the table, though the pipeline tracks it neither then nor before: the checkpoint names the
+    /// new server, so no start repositions the table again, and tracked later it would skip the
+    /// new server's changes up to its old marker. Once the table leaves the lake, the halt goes.
+    #[tokio::test]
+    async fn a_refused_repositions_halt_stays_while_the_lake_holds_the_table() {
+        let w = World::new(&["a", "x"]);
+        lake_with_an_untracked_table(&w).await;
+        w.sink
+            .fail(SinkOp::Commit, Some(&t("x")), 1, || SinkError::Permanent {
+                reason: "refused".into(),
+            });
+        w.source.fail_over(
+            ServerIdentity::Postgres {
+                system_identifier: 7,
+                timeline: 2,
+            },
+            Lsn(0x100),
+        );
+        let (end, _) = run(&w, &mode("mode: never"), async |status| {
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        let (end, st) = run(&w, &mode("mode: never"), async |status| {
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert!(
+            matches!(
+                st.halted.get(&t("x")),
+                Some(HaltReason::SinkRejected { .. })
+            ),
+            "{:?}",
+            st.halted
+        );
+        assert!(
+            w.docs
+                .halts()
+                .await
+                .unwrap()
+                .tables
+                .iter()
+                .any(|h| h.table == t("x")),
+            "the halt stays recorded"
+        );
+        w.sink.drop_table(&t("x"));
+        let (end, st) = run(&w, &mode("mode: never"), async |status| {
+            streamed(&status, &w).await;
+        })
+        .await;
+        end.unwrap();
+        assert!(!st.halted.contains_key(&t("x")), "{:?}", st.halted);
+        assert!(
+            !w.docs
+                .halts()
+                .await
+                .unwrap()
+                .tables
+                .iter()
+                .any(|h| h.table == t("x")),
+            "the halt of a table the lake no longer holds goes"
+        );
     }
 
     /// DA-SRC-32: a held table that records no key, and that the pipeline doesn't track either,

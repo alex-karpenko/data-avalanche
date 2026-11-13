@@ -1,9 +1,11 @@
 name: cloud
 
 # Real-cloud conformance (roadmap §5.4, P-5): the T1–T10 lease suite on real S3 and real Azure Blob,
-# through the production `open_bucket` path. GCS already runs in ci.yml. Requirements are in
-# test-infra/README.md, "Real S3 and Azure (cloud.yml)". Credentials are injected as env vars and
-# never printed.
+# through the production `open_bucket` path. GCS already runs in ci.yml. And the cloud E2E subset
+# (Q-M12-2, Q-M12c-4): the scenarios test-infra/cloud-e2e.txt names, with globals.state and the
+# lake on S3, GCS and Azure (DATA_AVALANCHE_E2E_STORE), on PostgreSQL 18 and on MySQL 8.4; ci.yml
+# runs the GCS half per change. Requirements are in test-infra/README.md, "Real S3 and Azure
+# (cloud.yml)". Credentials are injected as env vars and never printed.
 
 on:
   schedule:
@@ -49,3 +51,55 @@ jobs:
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
         run: cargo test --locked -p data-avalanche-state --test lease_conformance real_azure -- --nocapture
+
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        store: [s3, gcs, azure]
+        source: [postgres, mysql]
+    env:
+      DATA_AVALANCHE_IT: "1"
+      DATA_AVALANCHE_E2E_STORE: ${{ matrix.store }}
+      DATA_AVALANCHE_E2E_SOURCE: ${{ matrix.source }}
+      DATA_AVALANCHE_S3_BUCKET: ${{ vars.DATA_AVALANCHE_S3_BUCKET }}
+      AWS_REGION: ${{ vars.DATA_AVALANCHE_S3_REGION }}
+      DATA_AVALANCHE_GCS_BUCKET: ${{ vars.DATA_AVALANCHE_GCS_BUCKET }}
+      DATA_AVALANCHE_AZURE_CONTAINER: ${{ vars.DATA_AVALANCHE_AZURE_CONTAINER }}
+      AZURE_STORAGE_ACCOUNT_NAME: ${{ vars.DATA_AVALANCHE_AZURE_ACCOUNT }}
+    steps:
+      - name: Free runner disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - name: GCS credentials
+        if: matrix.store == 'gcs'
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: |
+          umask 077
+          printf '%s' "$GCP_SA_KEY" > "$RUNNER_TEMP/gcs-key.json"
+          echo "GOOGLE_SERVICE_ACCOUNT_PATH=$RUNNER_TEMP/gcs-key.json" >> "$GITHUB_ENV"
+      - name: Start the source
+        run: docker compose -f test-infra/compose.yaml up -d --wait ${{ matrix.source == 'postgres' && 'postgres-18' || 'mysql-84' }}
+      - name: Cloud E2E
+        env:
+          AWS_ACCESS_KEY_ID: ${{ matrix.store == 's3' && secrets.AWS_ACCESS_KEY_ID || '' }}
+          AWS_SECRET_ACCESS_KEY: ${{ matrix.store == 's3' && secrets.AWS_SECRET_ACCESS_KEY || '' }}
+          AZURE_TENANT_ID: ${{ matrix.store == 'azure' && secrets.AZURE_TENANT_ID || '' }}
+          AZURE_CLIENT_ID: ${{ matrix.store == 'azure' && secrets.AZURE_CLIENT_ID || '' }}
+          AZURE_CLIENT_SECRET: ${{ matrix.store == 'azure' && secrets.AZURE_CLIENT_SECRET || '' }}
+        run: |
+          mapfile -t scenarios < test-infra/cloud-e2e.txt
+          cargo test --locked -p data-avalanche --features e2e-hooks --test e2e -- --test-threads=1 --exact "${scenarios[@]}"
+      - name: Container logs on failure
+        if: failure()
+        run: docker compose -f test-infra/compose.yaml logs --no-color
+      - name: Stop the containers
+        if: always()
+        run: docker compose -f test-infra/compose.yaml down -v
+      - name: Remove GCS key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/gcs-key.json"

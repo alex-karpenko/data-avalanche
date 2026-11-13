@@ -216,6 +216,44 @@ By hand: `DATA_AVALANCHE_CLOUD=s3 DATA_AVALANCHE_S3_BUCKET=<bucket> AWS_REGION=<
 data-avalanche-state --test lease_conformance real_s3 -- --nocapture` with AWS credentials in the
 environment or profile (`azure` / `real_azure` likewise, with `AZURE_*`).
 
+## The E2E suite on another store (M12c)
+
+`DATA_AVALANCHE_E2E_STORE` puts an E2E run's `globals.state` and lake on another store than RustFS:
+`azurite` (the binary's Azure path, on the emulator above), or a real cloud, `s3`, `gcs` or `azure`,
+through the bucket variable and the credentials of the tables above (`DATA_AVALANCHE_GCS_BUCKET`
+and `GOOGLE_SERVICE_ACCOUNT_PATH` for GCS). The binary gets the credentials from the test's
+environment. A run writes under `data-avalanche-it/e2e-<test>/<uuid>/` and deletes it at the end.
+
+The cloud subset is the four scenarios `cloud-e2e.txt` names (Q-M12c-4). `ci.yml`'s `e2e-gcs` runs
+it on GCS on every PR, on PostgreSQL 18 and MySQL 8.4; `cloud.yml`'s `e2e` runs it on S3, GCS and
+Azure weekly and on manual dispatch. By hand, with the source's container up:
+
+```sh
+DATA_AVALANCHE_IT=1 DATA_AVALANCHE_E2E_STORE=gcs DATA_AVALANCHE_GCS_BUCKET=<bucket> \
+  GOOGLE_SERVICE_ACCOUNT_PATH=<key.json> cargo test -p data-avalanche --features e2e-hooks \
+  --test e2e -- --test-threads=1 --exact $(cat test-infra/cloud-e2e.txt)
+```
+
+## The acceptance runs (M12c)
+
+`cargo xtask bench`, `cargo xtask chaos` and `cargo xtask soak` run the v1 acceptance runs
+(`crates/data-avalanche/tests/load`) against this infrastructure, the binary built in release mode,
+and append each measurement to `target/acceptance/results.jsonl`. They run on a developer's machine
+(Q-M12-3), with `test-infra/up.sh` done; the E2E source variables pick the source as for the E2E
+suite.
+
+| Run | What | Default length |
+|---|---|---|
+| `bench` | D-V1.3's lag in steady state (p99 at most 60 s) and across a holder's loss (back within 2 minutes), at the product's defaults; MERGE's cost under random-key churn | about 1 h 30 |
+| `chaos` | under load: a storage outage shorter and longer than the lease (RustFS through a proxy), a restart of the source's container (`docker compose restart`), a partition of the holder | about 25 min |
+| `soak` | three nodes, three pipelines, churn every 10 minutes (a column added, a pause, a leave, a job, a `kill -9`), the lakes checked every hour, `n1`'s memory at most twice its first reading | 24 h |
+
+The knobs, each optional: `DATA_AVALANCHE_LOAD_RATE` (changes a second, 1000; chaos takes a
+quarter, the soak a fifth), `DATA_AVALANCHE_LOAD_KEYS` (keys a table, 100 000),
+`DATA_AVALANCHE_LOAD_MINUTES` (the steady window, 30), `DATA_AVALANCHE_CHURN_KEYS` (1 000 000),
+`DATA_AVALANCHE_CHURN_MINUTES` (10), `DATA_AVALANCHE_SOAK_MINUTES` (1440),
+`DATA_AVALANCHE_SOAK_CHURN_MINUTES` (10), `DATA_AVALANCHE_SOAK_CHECK_MINUTES` (60).
+
 ## Lease conformance T1–T10 (M2)
 
 `crates/data-avalanche-state/tests/lease_conformance.rs` runs T1–T10 (Clustering §17.4) through

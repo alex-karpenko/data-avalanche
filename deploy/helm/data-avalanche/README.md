@@ -6,7 +6,7 @@ each other through a headless Service (`discovery: dns`); their state, the lease
 generations are in object storage, so the pods have no volumes.
 
 ```sh
-helm install cdc oci://ghcr.io/alex-karpenko/charts/data-avalanche --version 0.1.0 \
+helm install cdc oci://ghcr.io/alex-karpenko/charts/data-avalanche --version 1.0.0 \
   --set-file config=config.yaml -f values.yaml
 ```
 

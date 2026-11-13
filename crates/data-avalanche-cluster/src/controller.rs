@@ -140,6 +140,13 @@ pub struct ControllerSettings {
 /// (DA-SRC-34) resets every table's marker at each run and streams nothing.
 pub const SOURCE_CHANGES_IN_A_ROW: u32 = 3;
 
+/// How long after the server change counted before another one still counts toward
+/// [`SOURCE_CHANGES_IN_A_ROW`]. An alternation reruns within the restart backoff (a minute at
+/// most); genuine failovers come further apart and start the count again (DA-SRC-38). The
+/// interval runs from the end of the counted run to the end of this one, so it includes this
+/// run's whole duration: an alternation whose runs each last over this long isn't counted.
+pub const SOURCE_CHANGE_WINDOW: Duration = Duration::from_secs(600);
+
 /// The halt of a pipeline whose runs keep finding another server: the code of the last change
 /// (`WAL_SOURCE_CHANGED`, `BINLOG_SOURCE_CHANGED`), and the alternation named.
 fn alternating(why: &str, runs: u32) -> Failure {
@@ -814,8 +821,10 @@ impl PipelineController {
         let mut retry: Option<(Instant, String)> = None;
         let mut failures: u32 = 0;
         // The runs in a row that ended finding another server, none with a durable checkpoint
-        // past the one it started from (DA-SRC-34).
+        // past the one it started from (DA-SRC-34), each within SOURCE_CHANGE_WINDOW of the one
+        // before (DA-SRC-38), and when the last ended.
         let mut changed: u32 = 0;
+        let mut changed_at: Option<Instant> = None;
         // The lag's start across this term's workers: what one read and didn't make durable still
         // counts while none runs and while the next one reads it again (I2).
         let mut pending = Lag::default();
@@ -967,11 +976,19 @@ impl PipelineController {
                             "the worker task ended abnormally: {e}"
                         )))
                     });
+                    let now = Instant::now();
+                    let apart =
+                        changed_at.is_some_and(|at| now.duration_since(at) > SOURCE_CHANGE_WINDOW);
                     changed = match &ended {
-                        Err(WorkerError::Source(SourceError::SourceChanged(_))) if progressed => 1,
+                        Err(WorkerError::Source(SourceError::SourceChanged(_)))
+                            if progressed || apart =>
+                        {
+                            1
+                        }
                         Err(WorkerError::Source(SourceError::SourceChanged(_))) => changed + 1,
                         _ => 0,
                     };
+                    changed_at = (changed > 0).then_some(now);
                     match ended {
                         Err(WorkerError::Source(SourceError::SourceChanged(why)))
                             if changed >= SOURCE_CHANGES_IN_A_ROW =>
@@ -2144,6 +2161,48 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(60)).await;
         assert_eq!(n.status.borrow().actual, Some(Actual::Running));
         assert_eq!(f.builds(), 5);
+    }
+
+    /// DA-SRC-38: server changes far apart are failovers, not an alternation. A change more than
+    /// `SOURCE_CHANGE_WINDOW` after the one counted before starts the count again, though no run
+    /// in between made a checkpoint durable (an idle source).
+    #[tokio::test(start_paused = true)]
+    async fn server_changes_far_apart_dont_halt() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a"]);
+        f.source.fail(Method::OpenStream, changed());
+        f.source.fail(Method::OpenStream, changed());
+        let mut n = node("n1", &store, &docs, &f);
+        eventually("a third worker", || f.builds() == 3).await;
+        until(&mut n.status, "running", is(Actual::Running)).await;
+        tokio::time::sleep(SOURCE_CHANGE_WINDOW + Duration::from_secs(60)).await;
+        f.source.fail(Method::Next, changed());
+        eventually("a fourth worker", || f.builds() == 4).await;
+        until(&mut n.status, "running again", is(Actual::Running)).await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(n.status.borrow().actual, Some(Actual::Running));
+        assert_eq!(f.builds(), 4);
+    }
+
+    /// DA-SRC-38: an alternation whose changes name no code (a message without one) halts with
+    /// none, and says so; the PostgreSQL source prefixes every change it reports, a promoted
+    /// server's reconnect included (`reconnect_check`), so its alternation halts with the code.
+    #[test]
+    fn an_alternation_halts_with_the_code_its_change_names() {
+        let f = alternating(
+            "WAL_SOURCE_CHANGED: the checkpoint 0/20 was read on PostgreSQL system 7 on timeline 1",
+            3,
+        );
+        assert_eq!(f.code.as_deref(), Some("WAL_SOURCE_CHANGED"));
+        assert!(
+            f.error.starts_with("WAL_SOURCE_CHANGED: 3 runs in a row")
+                && f.error.ends_with(
+                    "The last: the checkpoint 0/20 was read on PostgreSQL system 7 on timeline 1"
+                ),
+            "{}",
+            f.error
+        );
     }
 
     #[tokio::test(start_paused = true)]

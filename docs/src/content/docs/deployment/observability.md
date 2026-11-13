@@ -30,7 +30,11 @@ The ones to watch first:
   counting from the oldest change the earlier session left uncommitted until the new one has read
   that far again. v1's target is a p99 under 60 s at steady state, and back
   under it within 2 minutes of a node failure. A snapshot, a transaction larger than the flush
-  bounds, and heavy random-key MERGEs on large tables are outside the target.
+  bounds, and heavy random-key MERGEs on large tables are outside the target. Measured at the
+  defaults (a 30 s flush) on one machine: a p99 of 31 s (p50 16 s) for one node at 1000 changes
+  a second over four tables, on both PostgreSQL 18 and MySQL 8.4; and in a three-node cluster,
+  the lag back under 60 s 53 to 54 s after the lease holder was killed. At steady state the lag follows the flush
+  interval.
 - **`data_avalanche_wal_lag_bytes`**: the WAL a PostgreSQL slot holds on the server's disk.
 - **`data_avalanche_halted_tables`** and **`data_avalanche_pipeline_status`**: something waits for
   an operator.

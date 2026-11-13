@@ -109,6 +109,16 @@ impl Source {
         matches!(self, Self::Postgres { .. })
     }
 
+    /// The server's compose service: `postgres-<major>` on `554<major>`, a MySQL target's own; the
+    /// chaos run restarts it (`tests/load`).
+    #[allow(dead_code)]
+    pub fn service(self) -> String {
+        match self {
+            Self::Postgres { port } => format!("postgres-{}", port - 55400),
+            Self::Mysql(t) => t.service.to_owned(),
+        }
+    }
+
     /// The server's container: `postgres-<major>` on `554<major>`, a MySQL target's service.
     pub fn container(self) -> String {
         match self {
@@ -153,6 +163,13 @@ pub enum Db {
 
 impl Db {
     pub async fn connect(source: Source) -> Self {
+        Self::try_connect(source)
+            .await
+            .unwrap_or_else(|e| panic!("connect to the test source: {e}"))
+    }
+
+    /// [`Self::connect`], its failure returned: a source that is restarting.
+    pub async fn try_connect(source: Source) -> Result<Self, String> {
         match source {
             Source::Postgres { port } => {
                 let dsn = format!(
@@ -160,11 +177,22 @@ impl Db {
                 );
                 let (client, conn) = tokio_postgres::connect(&dsn, NoTls)
                     .await
-                    .expect("connect to test PostgreSQL");
+                    .map_err(|e| e.to_string())?;
                 tokio::spawn(conn);
-                Self::Pg(client)
+                Ok(Self::Pg(client))
             }
-            Source::Mysql(t) => Self::Mysql(Mutex::new(mysql(t.port).await)),
+            Source::Mysql(t) => {
+                let opts = mysql_async::OptsBuilder::default()
+                    .ip_or_hostname("127.0.0.1")
+                    .tcp_port(t.port)
+                    .user(Some("root"))
+                    .pass(Some("avalanche"))
+                    .prefer_socket(false);
+                let conn = mysql_async::Conn::new(opts)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(Self::Mysql(Mutex::new(conn)))
+            }
         }
     }
 
@@ -234,17 +262,4 @@ impl Db {
             Self::Mysql(_) => panic!("a PostgreSQL scenario on MySQL"),
         }
     }
-}
-
-/// A `root` connection to the MySQL server on `port`, in no database.
-pub async fn mysql(port: u16) -> mysql_async::Conn {
-    let opts = mysql_async::OptsBuilder::default()
-        .ip_or_hostname("127.0.0.1")
-        .tcp_port(port)
-        .user(Some("root"))
-        .pass(Some("avalanche"))
-        .prefer_socket(false);
-    mysql_async::Conn::new(opts)
-        .await
-        .expect("connect to the test MySQL server")
 }

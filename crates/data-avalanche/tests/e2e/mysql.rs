@@ -219,6 +219,49 @@ async fn a_deleted_table_of_a_recased_key_is_made_again_under_the_cached_spellin
     e.cleanup().await;
 }
 
+/// DA-SNAP-23: a column whose name changed case alone while the pipeline's state was lost. The
+/// next start meets the lake's table with no schema cached, and MySQL's `DOC` is the sink's `doc`:
+/// the table is baselined under the sink's spelling and copied again, not halted.
+#[tokio::test]
+async fn a_lost_state_meets_a_recased_column_as_the_same_column() {
+    require_it!();
+    crate::mysql_only!();
+    let e = E2e::new(
+        "my_recased_lost",
+        ITEMS,
+        Options {
+            tables: ", snapshots: { mode: initial }",
+            ..Options::default()
+        },
+    )
+    .await;
+    e.exec("INSERT INTO items VALUES (1, 'a')").await;
+    let mut p = e.start(&[]);
+    p.ready().await;
+    e.completed("items", None).await;
+    assert!(p.terminate().await.success());
+    e.exec("ALTER TABLE items RENAME COLUMN doc TO DOC").await;
+    e.exec("INSERT INTO items VALUES (2, 'b')").await;
+    e.wipe_state().await;
+    let mut p = e.start(&[]);
+    p.ready().await;
+    e.completed("items", None).await;
+    e.streaming().await;
+    e.exec("INSERT INTO items VALUES (3, 'c')").await;
+    eventually("the rows land", Duration::from_secs(60), async || {
+        e.ids("items").await == [1, 2, 3]
+    })
+    .await;
+    assert!(e.halts().await.tables.is_empty(), "{:?}", e.halts().await);
+    assert_eq!(
+        e.rows("items", &["id", "doc"]).await,
+        [["1", "a"], ["2", "b"], ["3", "c"]],
+        "the sink's spelling holds every row"
+    );
+    assert!(p.terminate().await.success());
+    e.cleanup().await;
+}
+
 /// A failover behind the pipeline's address in file/position mode: the reconnect reaches another
 /// server, whose binlog files the checkpoint means nothing in. The dump's open checks the server
 /// on its own connection and halts the pipeline with `BINLOG_SOURCE_CHANGED`. Back on its server,

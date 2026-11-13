@@ -271,6 +271,10 @@ struct Db {
     readers_ended: usize,
     reconfigures: usize,
     teardowns: usize,
+    /// Streams closed (`close`) so far.
+    closes: usize,
+    /// Whether a stream's `close` never returns.
+    hang_close: bool,
     fetches: BTreeMap<TableRef, usize>,
     prepares: Vec<Option<Checkpoint>>,
     /// What each `prepare_marked` was told the lake's highest marker is.
@@ -336,6 +340,8 @@ impl FakeSource {
             readers_ended: 0,
             reconfigures: 0,
             teardowns: 0,
+            closes: 0,
+            hang_close: false,
             fetches: BTreeMap::new(),
             prepares: vec![],
             marks: vec![],
@@ -695,6 +701,17 @@ impl FakeSource {
         self.db().teardowns
     }
 
+    /// The streams closed so far (`ChangeStream::close`): a stream dropped unclosed isn't one.
+    pub fn closes(&self) -> usize {
+        self.db().closes
+    }
+
+    /// Makes every stream's `close` pend forever, as a client whose shutdown is stuck. The
+    /// close still counts in `closes` once it is entered.
+    pub fn hang_close(&self) {
+        self.db().hang_close = true;
+    }
+
     /// `fetch_rows` calls for `table` so far, failed ones included.
     pub fn fetches(&self, table: &TableRef) -> usize {
         self.db().fetches.get(table).copied().unwrap_or(0)
@@ -753,7 +770,7 @@ impl Db {
             && u > t
         {
             return Err(SourceError::SourceChanged(format!(
-                "the checkpoint {} was read on {was}, and the stream's reconnect reaches {now}, a promoted server of the same system",
+                "WAL_SOURCE_CHANGED: the checkpoint {} was read on {was}, and the stream's reconnect reaches {now}, a promoted server of the same system",
                 at.position
             )));
         }
@@ -944,6 +961,22 @@ impl Db {
             xip,
         }
     }
+}
+
+/// `row` with each column named as `schema` spells it, matched without case.
+fn respell(row: Row, schema: &TableSchema) -> Row {
+    Row(row
+        .0
+        .into_iter()
+        .map(|(n, v)| {
+            let named = schema
+                .columns()
+                .iter()
+                .find(|c| c.name.to_lowercase() == n.to_lowercase())
+                .map_or(n, |c| c.name.clone());
+            (named, v)
+        })
+        .collect())
 }
 
 /// What `augment` and `rescan` compare: columns by name, with their types.
@@ -1235,7 +1268,9 @@ impl SourceConnector for FakeSource {
                     reason: HaltReason::TableDropped,
                 });
             };
-            if shape(now.columns(), false) != shape(table.columns(), false) {
+            // Where names fold, the read asks the cached spelling, as MySQL's reads it.
+            let fold = db.fold;
+            if shape(now.columns(), fold) != shape(table.columns(), fold) {
                 return Err(SourceError::Transient(format!(
                     "{} changed under the snapshot",
                     table.table()
@@ -1247,7 +1282,10 @@ impl SourceConnector for FakeSource {
                 .into_iter()
                 .filter(|(k, _)| from.as_ref().is_none_or(|f| k > f))
                 .take(limit)
-                .map(|(_, r)| r)
+                .map(|(_, r)| match fold {
+                    true => respell(r, table),
+                    false => r,
+                })
                 .collect();
             (rows, db.snapshot())
         };
@@ -1514,6 +1552,14 @@ impl ChangeStream for FakeStream {
     }
 
     async fn close(self: Box<Self>) -> Result<(), SourceError> {
+        let hang = {
+            let mut db = self.source.db();
+            db.closes += 1;
+            db.hang_close
+        };
+        if hang {
+            std::future::pending::<()>().await;
+        }
         Ok(())
     }
 }

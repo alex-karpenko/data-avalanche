@@ -2,11 +2,13 @@
 //! the sink's evolve. A stream session runs them at a signal's position, with a flush in between.
 //! Phase 0 runs them to baseline a table whose stream position was lost.
 
+use std::collections::BTreeMap;
+
 use arrow_schema::Schema;
 use data_avalanche_core::{
-    DeltaClass, EvolveOutcome, HaltReason, INTERNAL_COLUMN_PREFIX, LINEAGE_COLUMNS, SchemaChange,
-    SchemaDelta, SchemaHint, Sink, SinkError, SourceConnector, SourceError, TableRef, TableSchema,
-    classify, differ_by_case_alone,
+    ColumnSchema, DeltaClass, EvolveOutcome, HaltReason, INTERNAL_COLUMN_PREFIX, LINEAGE_COLUMNS,
+    SchemaChange, SchemaDelta, SchemaHint, Sink, SinkError, SourceConnector, SourceError, TableRef,
+    TableSchema, classify, differ_by_case_alone,
 };
 use tokio::sync::watch;
 use tracing::Instrument;
@@ -28,20 +30,34 @@ pub(crate) fn soft_dropped(sink: &Schema, source: &TableSchema) -> usize {
         .count()
 }
 
+/// What baselines a sink table the pipeline meets for the first time ([`missing_columns`]).
+#[derive(Debug)]
+pub(crate) struct Baseline {
+    /// The source's columns the sink table lacks, to add before the copy.
+    pub adds: Vec<SchemaChange>,
+    /// The schema the session writes the table with.
+    pub schema: TableSchema,
+}
+
 /// A table the sink holds while the pipeline has no schema cached for it (a wiped state,
 /// DA-SNAP-13, or a table first tracked at a resume, DA-SNAP-22): the source's columns the sink
 /// table lacks, by name, as the `AddColumn`s that baseline it before the copy. Names match
-/// without case, Unicode's, as Delta's do ([`differ_by_case_alone`]): a sink column that matches
-/// by case alone can't sit beside the source's, so it halts, naming both spellings. A column it
-/// holds as another type still surfaces at the first commit (`SINK_REJECTED`); a nullable one the
-/// source lacks stays, soft-dropped. A key column it lacks can't be added: the table is keyed
-/// otherwise, and halts. So does a non-null column the source lacks: no row of the source's could
-/// fill it (DA-SNAP-22).
+/// without case, Unicode's, as Delta's do ([`differ_by_case_alone`]). Where the source compares
+/// names so too (`fold`, MySQL), a sink column that matches by case alone is the source's: the
+/// session writes it under the sink's spelling, in the key too, as a cached schema keeps it
+/// (DA-SNAP-23, DA-SRC-25). Elsewhere it can't sit beside the source's, so it halts, naming both
+/// spellings. A column it holds as another type still surfaces at the first commit
+/// (`SINK_REJECTED`); a nullable one the source lacks stays, soft-dropped. A key column it lacks
+/// can't be added: the table is keyed otherwise, and halts. So does a non-null column the source
+/// lacks: no row of the source's could fill it (DA-SNAP-22).
 pub(crate) fn missing_columns(
     sink: &Schema,
     source: &TableSchema,
-) -> Result<Vec<SchemaChange>, HaltReason> {
+    fold: bool,
+) -> Result<Baseline, HaltReason> {
     let mut adds = vec![];
+    // The source's names the sink spells otherwise, by case alone, where names fold.
+    let mut respelled: BTreeMap<&str, &str> = BTreeMap::new();
     for c in source.columns() {
         if sink.field_with_name(&c.name).is_ok() {
             continue;
@@ -51,6 +67,10 @@ pub(crate) fn missing_columns(
             .iter()
             .find(|f| differ_by_case_alone(f.name(), &c.name))
         {
+            if fold {
+                respelled.insert(&c.name, f.name());
+                continue;
+            }
             return Err(HaltReason::SchemaMismatch {
                 column: c.name.clone(),
                 detail: format!(
@@ -92,7 +112,30 @@ pub(crate) fn missing_columns(
                 .into(),
         });
     }
-    Ok(adds)
+    if respelled.is_empty() {
+        return Ok(Baseline {
+            adds,
+            schema: source.clone(),
+        });
+    }
+    let name = |n: &str| respelled.get(n).map_or(n, |s| *s).to_owned();
+    let columns = source
+        .columns()
+        .iter()
+        .map(|c| ColumnSchema {
+            name: name(&c.name),
+            ..c.clone()
+        })
+        .collect();
+    let identifier = source.identifier().iter().map(|k| name(k)).collect();
+    let schema = TableSchema::new(source.table().clone(), columns, identifier)?;
+    Ok(Baseline {
+        adds,
+        schema: match source.source_id() {
+            Some(id) => schema.with_source_id(id),
+            None => schema,
+        },
+    })
 }
 
 /// A change to apply: the table's new schema, and the changes the sink must evolve.

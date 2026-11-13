@@ -27,7 +27,10 @@ Each trigger can be turned off with `null`, but not all three (V-035). `POST
 **What a flush costs.** A Delta MERGE rewrites every data file that holds a key the flush changed.
 Changes to recent rows (appends, updates to new orders) touch a few files; updates spread over a
 large table's whole key range touch most of its files, so each flush rewrites most of the table.
-Watch `data_avalanche_sink_merge_files_rewritten_total` and
+Measured on a table of a million keys (13 MB), updated at random keys at 1000 changes a second:
+every 30 s flush replaced about six data files and wrote 11 to 13 MB, close to the whole table,
+in a MERGE of 1.2 to 1.4 s. The rewrite grows with the table,
+not with the changes. Watch `data_avalanche_sink_merge_files_rewritten_total` and
 `data_avalanche_sink_merge_rows_copied_total`: when they grow much faster than the rows changed,
 flush less often (raise `seconds` and `rows`), so each MERGE carries more changes for the same
 rewrite. The cost of a lower bound is lag: the

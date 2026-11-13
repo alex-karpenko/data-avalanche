@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-10
+updated: 2026-11-11
 domain: Data Flow
 tags: [postgres, replication-slot, publication, lifecycle, wal, re-snapshot, failover-slot, slot-sync, cdc]
 resolves: [G-15, DA-SRC-33, DA-SNAP-22]
@@ -163,7 +163,13 @@ shape. `slot.rs` `publication_shape` reads them from `pg_publication_rel` (`prqu
   below. Amended 2026-10-22 (M8a's whole-branch review): a holder ends such a reader at most once a
   lease term. Two holders that each believe they hold the lease (two lease stores on one slot) would
   otherwise end each other in turn, splitting the slot's changes between two lakes; with the limit,
-  the later busy spell gives up loudly with the bounded retry's error.
+  the later busy spell gives up loudly with the bounded retry's error. Amended 2026-11-11 (M12c,
+  DA-SRC-39): a session closes its stream on every exit, an error's too. A dropped
+  `pgwire-replication` client detaches its worker, which takes the slot again about 80 ms later
+  (measured in M12d's PostgreSQL 14 reconnect test), so the next session's open met the slot still
+  active (`55006`) and spent a step of the bounded retry. A worker task aborted outright (a lost
+  lease) still drops its session unclosed: its node no longer holds the lease, and the new holder's
+  retry, or its end of the stale reader, covers it.
 - **External (non-app) collisions cannot be detected.** PG replication slots carry **no ownership
   tag/comment**, so a slot created by an unrelated system under the same name is indistinguishable.
   Mitigation is V-058 naming uniqueness + operator discipline; documented as a known limitation, not
@@ -279,8 +285,10 @@ rewording P-2 and P-5 to match (2026-11-10).
   same system on a later timeline under either action, so the pipeline reruns its start, which
   continues or halts as above. A running pipeline's failover is therefore continued as a stopped
   one's is. The message ("… a promoted server of the same system: the pipeline starts again, and
-  its start decides whether the stream continues there …") carries no `WAL_SOURCE_CHANGED:` prefix,
-  so alerting on the code isn't paged by each continuation. Another system, or an earlier timeline,
+  its start decides whether the stream continues there …") carries the `WAL_SOURCE_CHANGED:` prefix
+  (D-M12c.3), so the controller's WARN "worker ended, rerun after a backoff: WAL_SOURCE_CHANGED: …"
+  appears at each continuation too: the code in a WARN rerun line isn't a halt (the halt is the
+  `pipeline in ERROR` line). Another system, or an earlier timeline,
   still halts at once under `error`.
 - **The checkpoint is re-recorded (D-M12d.11).** A resume whose server differs from the
   checkpoint's saves the checkpoint document with the new server before the stream opens.
@@ -301,8 +309,9 @@ rewording P-2 and P-5 to match (2026-11-10).
 - The sync worker refuses a slot whose position needs WAL the standby lacks.
 - The E2E `a_promotion_the_failover_slot_followed_continues_the_stream` keeps the pipeline running
   through the promotion (its address moved by a TCP proxy) and checks the lake, no re-snapshot, the
-  reconnect's and the continuation's log lines, and no `WAL_SOURCE_CHANGED`. It runs on PostgreSQL
-  18 only; that `synced` stays true after a promotion on 17 is documented upstream, not measured
+  reconnect's and the continuation's log lines. The reconnect's WARN carries `WAL_SOURCE_CHANGED`,
+  and so does the status's `retrying` error text while the rerun waits; the status's `code` never
+  does, as no halt is raised. It runs on PostgreSQL 18 only; that `synced` stays true after a promotion on 17 is documented upstream, not measured
   here.
 
 ### §8.5 Operational limits
@@ -317,11 +326,11 @@ rewording P-2 and P-5 to match (2026-11-10).
   physical slot `synchronized_standby_slots` names: a standby that is down or far behind stalls
   the pipeline, with only a server-side warning. A plain slot never waited.
 - **Pre-17 slots** stay plain after an upgrade (§8.1).
-- **An alternation can carry no code.** The alternation halt (DA-SRC-34) takes its code from the
-  last `SourceChanged` text; the promoted-reconnect message has none. Three promoted-timeline
-  reconnects in a row with no durable checkpoint between would halt without `WAL_SOURCE_CHANGED`
-  in the status (a rare case: each start on the old server streams, each reconnect reaches the
-  promoted one).
+- **An alternation's code (D-M12c.3).** The alternation halt (DA-SRC-34) takes its code from the
+  last `SourceChanged` text; the promoted-reconnect message carries `WAL_SOURCE_CHANGED:`, so three
+  promoted-timeline reconnects in a row with no durable checkpoint between halt with it in the
+  status (a rare case: each start on the old server streams, each reconnect reaches the promoted
+  one).
 
 ### §8.6 Decoding on a standby: deferred (DA-SRC-31, Q-M12d-1)
 

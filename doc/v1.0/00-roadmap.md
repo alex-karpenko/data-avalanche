@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-06
+updated: 2026-11-13
 domain: Architecture
 tags: [v1, implementation-plan, roadmap, milestones, workspace, crates, interfaces, test-strategy, ci, risks]
 sources: []
@@ -1401,7 +1401,10 @@ closed with a pointer (Q-M12-1).
   on a standby, deferred to v2; DA-SRC-33 continues a promotion the failover slot followed.
 - **M12c — v1 acceptance**: the load, soak and chaos runs (on Oleksii's machine first, Q-M12-3, with
   DA-OPS-14's measurement), the real-cloud E2E in CI (S3, GCS, Azure, Q-M12-2), the checklist in
-  §8, and `v1.0.0`.
+  §8, and `v1.0.0`. Plan: `M12c-acceptance.md` (Q-M12c-1…4): the four gaps left open after M12d
+  fixed first; the cloud E2E a subset of four scenarios; the runs a `load` test target. Executed
+  2026-11-11…13: the acceptance report is `v1-acceptance.md` (D-V1.3 met on both sources); version
+  `1.0.0`, tagged after the merge.
 
 The scope across the three:
 
@@ -1552,7 +1555,7 @@ other (PostgreSQL: 5, 6, the WAL guard and a lost slot; MySQL: 11).
 | R-12 | Clamped PG edge dates (Arrow min/max, Q-M5-1) are valid Parquet but some engines can't render years ±5.8M / ±294k | medium / low | M4 clamps `date` / `timestamp` / `timestamp_ntz` cells to the Delta range 0001-01-01 … 9999-12-31 23:59:59.999999 in Hop 3b (Q-M4-2), and its type round trip reads the bounds through DuckDB `delta_scan`. DuckDB 1.5.6 can't open a table path with non-ASCII text (Q-M4-6). The operator docs list the clamping (`configuration/sink.md`), that limit (`configuration/storage.md`) and the engines checked |
 | R-11 | The real GCS bucket makes PR CI depend on credentials, network and cost | low / low | Per-test unique prefixes plus cleanup, a 1-day lifecycle rule on `data-avalanche-it/`, a dedicated CI bucket and service account; fork PRs skip GCS with a notice (P-10) |
 | R-4 | File/position MySQL mode (new per P-4) has unknown resume edge cases (rotation, restart, failover invalidates positions) | medium / medium | Probe S-MY10 opens M7; a changed source server halts the pipeline (`BINLOG_SOURCE_CHANGED`, Q-M7-2) and the operator docs give the recovery (switch to `gtid` or re-snapshot) |
-| R-5 | Delta MERGE cost under random-key churn (D-MS.15) | known / medium | Merge metrics (M4), flush guidance (`configuration/sink.md`), measured in M12 |
+| R-5 | Delta MERGE cost under random-key churn (D-MS.15) | known / medium | Merge metrics (M4), flush guidance (`configuration/sink.md`), measured in M12. **Measured 2026-11-11** (`v1-acceptance.md` §R-5): on a 1M-key, 13 MB table churned at random keys, every 30 s flush rewrote close to the whole table (11–13 MB) in a 1.2–1.4 s MERGE, on PostgreSQL 18 and MySQL 8.4; the guidance in `configuration/sink.md` carries the numbers |
 | R-6 | DataFusion memory during large MERGEs | medium / medium | Bound the batch bytes per commit (split at `flush.bytes`); a memory test in M4; the DataFusion memory pool configured |
 | R-7 | `mysql_async` silent payload drop (DA-SRC-12) | low / high | Our own check (M7) plus a fault-injection test; upstream report |
 | R-8 | `pgwire-replication` =0.4.1 is a young crate (proto v1 only) | medium / medium | Thin wrapper; the decoder is ours; a fork path is documented |
@@ -1624,16 +1627,21 @@ implements them.
 
 - [ ] All milestone exit criteria met; CI, weekly and cloud workflows green (weekly 4 in a row:
       treated as met, Q-M12-5).
-- [ ] D-V1.3 measured: steady-state p99 ≤ 60s and failover recovery ≤ 2 min at default config (M12
-      report).
-- [ ] No data loss or duplicate keys in the crash/replay/chaos suites (source vs Delta comparison).
-- [ ] Real-cloud E2E on S3, GCS and Azure.
+- [x] D-V1.3 measured: steady-state p99 ≤ 60s and failover recovery ≤ 2 min at default config (M12
+      report). Met 2026-11-11…12 (`v1-acceptance.md`): p99 30.9 s / 30.8 s, recovery 52.5 s / 53.7 s
+      (PostgreSQL 18 / MySQL 8.4).
+- [x] No data loss or duplicate keys in the crash/replay/chaos suites (source vs Delta comparison).
+      Met: the E2E crash and failover scenarios (every PR), the chaos runs on both sources and the
+      24 h soak's hourly checks (`v1-acceptance.md`).
+- [x] Real-cloud E2E on S3, GCS and Azure. Met 2026-11-13: the cloud subset 4/4 on S3, GCS and
+      Azure on PostgreSQL 18 and MySQL 8.4 (`cloud.yml` run 43375990336; `v1-acceptance.md`).
 - [ ] Container image and Helm chart published; k3s smoke deploy green.
-- [ ] Documentation site builds strict; runbooks reviewed.
-- [ ] Compile time and dependency tree reviewed against a `cargo build --timings` measurement (M12,
-      Q-M5-24).
-- [ ] Gap tracker updated: implementation-surfaced gaps recorded, v1 rows closed with pointers to code
-      and tests.
+- [x] Documentation site builds strict; runbooks reviewed. The site builds strict, every internal
+      link valid (2026-11-13); the runbooks reviewed by Oleksii (2026-11-13).
+- [x] Compile time and dependency tree reviewed against a `cargo build --timings` measurement (M12,
+      Q-M5-24). Met by M12b Task 15 (line tables taken).
+- [x] Gap tracker updated: implementation-surfaced gaps recorded, v1 rows closed with pointers to code
+      and tests. Met: §63 (open 5 → 0) and §64.
 
 ---
 

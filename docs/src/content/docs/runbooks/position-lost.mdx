@@ -59,6 +59,11 @@ hand, or advanced past the pipeline's checkpoint.
 
 ## A failover (`WAL_SOURCE_CHANGED`)
 
+**A WARN is not a halt.** After a promotion the slot followed, the log can show a WARN "worker
+ended, rerun after a backoff: WAL_SOURCE_CHANGED: …" line: the run that follows continues on the
+new timeline. A halt is the pipeline in `ERROR` (the `pipeline in ERROR` line, and the status),
+so alert on that, not on the code in a rerun line.
+
 **A failover slot carries the stream over.** On PostgreSQL 17 and later, a slot the pipeline
 manages (`slot_management: managed`) is a failover slot. When the standby streams from the
 primary through a physical slot (`primary_slot_name`), with `dbname` in its `primary_conninfo`,
@@ -123,10 +128,11 @@ Leave `source_change_action` at `re_snapshot` only where a failover should recov
 
 If the pipeline's address reaches more than one server, the runs keep finding another one. Under
 `re_snapshot` each such run starts the pipeline again, and three runs in a row that each find
-another server and make no checkpoint durable stop the pipeline in `error`, as for a changing
-binlog server (see the MySQL and MariaDB tab), usually with `WAL_SOURCE_CHANGED`. Reconnects that
-keep reaching a promoted server of the same system do the same under either action, and that halt
-carries no code: look for "the source's address reaches more than one server" in its reason.
+another server, each within 10 minutes of the one before, and make no checkpoint durable stop the
+pipeline in `error` with `WAL_SOURCE_CHANGED`, as for a changing binlog server (see the MySQL and
+MariaDB tab). Reconnects that keep reaching a promoted server of the same system do the same under
+either action. Failovers further apart than that are failovers, not an alternation: each starts
+the count again.
 
 ## A renamed or dropped publication
 
@@ -186,15 +192,14 @@ reconnects, not only at a start.
   without a restart) and `POST /v1/pipelines/<id>/restart`.
 
 **A server that keeps changing.** Under `re_snapshot` a run that finds another server ends and the
-pipeline starts again. Three runs in a row that each find another server than the run before, none
-making a checkpoint durable, stop the pipeline in `error` with
-`BINLOG_SOURCE_CHANGED` (on PostgreSQL, `WAL_SOURCE_CHANGED`), saying that the source's address
-reaches more than one server (a load balancer, or a DNS name over several). Point the pipeline
-at one server (no load balancer, no round-robin DNS name), then stop and resume it. The count
-starts again when a run makes a checkpoint durable or ends for another reason, and when the
-pipeline is stopped. It doesn't decay with time: on a source that writes nothing in between, three
-genuine failovers in a row, however far apart, can stop the pipeline the same way; stop and resume
-it.
+pipeline starts again. Three runs in a row that each find another server than the run before,
+each within 10 minutes of the one before and none making a checkpoint durable, stop the pipeline
+in `error` with `BINLOG_SOURCE_CHANGED` (on PostgreSQL, `WAL_SOURCE_CHANGED`), saying that the
+source's address reaches more than one server (a load balancer, or a DNS name over several).
+Point the pipeline at one server (no load balancer, no round-robin DNS name), then stop and resume
+it. The count starts again when a run makes a checkpoint durable or ends for another reason, when
+a server change comes more than 10 minutes after the one before (genuine failovers, even on a
+source that writes nothing in between), and when the pipeline is stopped.
 
 Two cases aren't caught. On MariaDB: another server with the same `server_id` and the same binlog
 file names, whose file happens to have an event boundary at the checkpoint's offset. On MySQL: a
