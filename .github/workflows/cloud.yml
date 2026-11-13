@@ -91,7 +91,9 @@ jobs:
           AZURE_TENANT_ID: ${{ matrix.store == 'azure' && secrets.AZURE_TENANT_ID || '' }}
           AZURE_CLIENT_ID: ${{ matrix.store == 'azure' && secrets.AZURE_CLIENT_ID || '' }}
           AZURE_CLIENT_SECRET: ${{ matrix.store == 'azure' && secrets.AZURE_CLIENT_SECRET || '' }}
-        run: cargo test --locked -p data-avalanche --features e2e-hooks --test e2e -- --test-threads=1 --exact $(cat test-infra/cloud-e2e.txt)
+        run: |
+          mapfile -t scenarios < test-infra/cloud-e2e.txt
+          cargo test --locked -p data-avalanche --features e2e-hooks --test e2e -- --test-threads=1 --exact "${scenarios[@]}"
       - name: Container logs on failure
         if: failure()
         run: docker compose -f test-infra/compose.yaml logs --no-color
