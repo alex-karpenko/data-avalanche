@@ -97,7 +97,6 @@ pub(crate) async fn epochs_never_go_back(e: &E2e, lake: &str, table: &str) {
 /// `within`: first the ids (cheap to compare while they move), then the rows, in every lake.
 pub(crate) async fn lands(e: &E2e, lake: &str, table: &str, within: Duration) {
     e.converged_in(lake, table, within).await;
-    e.mirrored_in(lake, table, workload::COLS, Duration::from_secs(60))
-        .await;
+    e.mirrored_in(lake, table, workload::COLS, within).await;
     epochs_never_go_back(e, lake, table).await;
 }

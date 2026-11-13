@@ -245,7 +245,9 @@ pub(crate) struct Session<'c> {
 
 /// How long a session waits for its source stream's close. PostgreSQL's close bounds its slot
 /// poll by `timeouts.command` (30 s by default); the rest is the client's shutdown, whose
-/// worker's read has no timeout of its own, so a stalled connection would hold the close.
+/// worker's read has no timeout of its own, so a stalled connection would hold the close. A
+/// `timeouts.command` set above it cuts that slot poll short; the stream is then dropped, as
+/// before the close was awaited.
 const STREAM_CLOSE_BOUND: Duration = Duration::from_secs(60);
 
 /// Closes the source stream, waiting at most `STREAM_CLOSE_BOUND`. A close's error is dropped:

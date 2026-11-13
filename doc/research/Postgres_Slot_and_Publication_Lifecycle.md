@@ -309,8 +309,9 @@ rewording P-2 and P-5 to match (2026-11-10).
 - The sync worker refuses a slot whose position needs WAL the standby lacks.
 - The E2E `a_promotion_the_failover_slot_followed_continues_the_stream` keeps the pipeline running
   through the promotion (its address moved by a TCP proxy) and checks the lake, no re-snapshot, the
-  reconnect's and the continuation's log lines (the reconnect's WARN carries `WAL_SOURCE_CHANGED`, the status never does). It runs on PostgreSQL
-  18 only; that `synced` stays true after a promotion on 17 is documented upstream, not measured
+  reconnect's and the continuation's log lines. The reconnect's WARN carries `WAL_SOURCE_CHANGED`,
+  and so does the status's `retrying` error text while the rerun waits; the status's `code` never
+  does, as no halt is raised. It runs on PostgreSQL 18 only; that `synced` stays true after a promotion on 17 is documented upstream, not measured
   here.
 
 ### §8.5 Operational limits
