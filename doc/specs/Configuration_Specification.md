@@ -545,8 +545,8 @@ console:
 | `history.retention` | duration | no | `24h` | R | How long the built-in chart history is kept in `globals.state`. 1 h – 30 days (V-132). Older ranges come from `prometheus`. |
 | `events.retention` | duration | no | `30d` | R | How long the event and audit trail is kept in `globals.state`. 1 – 400 days (V-132). |
 | `prometheus` | object | no | — | R | Where chart ranges older than `history.retention` come from. **Absent ⇒ built-in history only**, no warning, no error. Unreachable at run time ⇒ charts fall back to the built-in range and mark the gap; never a config error. |
-| `prometheus.url` | URL | yes (in `prometheus`) | — | R | Base URL; the scheme comes from it. Absolute `http(s)` URL (V-130). |
-| `prometheus.basic` | object `{user, password}` | no | — | R | Basic authentication. Exclusive with `bearer_token` (V-131). `password` is a secret. |
+| `prometheus.url` | URL | yes (in `prometheus`) | — | R | Base URL; the scheme comes from it. Absolute `http(s)` URL (V-130). Required (V-137). |
+| `prometheus.basic` | object `{user, password}` | no | — | R | Basic authentication; both `user` and `password` are required in it (V-137). Exclusive with `bearer_token` (V-131). `password` is a secret. |
 | `prometheus.bearer_token` | string | no | — | R | Bearer authentication. Exclusive with `basic` (V-131). A secret. |
 | `prometheus.headers` | map<string, string> | no | `{}` | R | Sent with every query, e.g. a tenant header. Values are secrets. Each name an HTTP token, each value visible ASCII, spaces and tabs (V-126). |
 | `prometheus.tls.ca` | PEM/path | no | system roots | R | §4.4. |
@@ -1418,6 +1418,7 @@ errors.
 | V-134 | `globals.console.session_key` with `api.auth ∈ {none, jwt}` | Unused: these modes have no sessions. | warning | config |
 | V-135 | `globals.console.enabled = true` with `api.auth ∈ {basic, oauth2}` | Requires `globals.console.session_key`. | error | config |
 | V-136 | `globals.console.enabled = true` with `api.auth = oauth2` | Requires `globals.console.public_url` and `globals.api.oauth2.client_id`. | error | config |
+| V-137 | `globals.console.prometheus` | Requires `url`; `basic` requires `user` and `password`. | error | config |
 
 ### 13.7 Identity / naming
 
