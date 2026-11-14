@@ -102,7 +102,7 @@ Decisions: `research/V1_Scope_Decisions.md`.
 		- OAuth2/OpenID (with RBAC)
 	- roles are nested `viewer` ⊆ `operator` ⊆ `admin`; endpoints and minimum roles are in the [endpoint table](#management-api-endpoints)
 	- TLS is optional (upstream termination is common); authentication without TLS is a config warning
-	- every mutating call is recorded in the cluster's event log with the caller's name and role (from the server's own verification) and an optional `note` the request carries
+	- every mutating call is recorded in the cluster's event log with the caller's name and role (from the server's own verification) and an optional `note` the request carries; the `note` is a string field of the call's JSON body, at most 500 characters (`422` otherwise); a call refused for its role (`403`) is recorded too
 - Web console:
 	- an embedded web console for operators and viewers, served on the management API's listener under the path prefix `/ui/`, with the same authentication and roles
 	- off by default; `globals.console.enabled` in the config switches it on, and a reload can turn it on or off
@@ -133,6 +133,7 @@ Functional endpoints are versioned under `/v1`; probes and metrics are unversion
 | Request snapshot | `POST /v1/pipelines/{id}/snapshots` | operator | tables list (the per-table config keys), no globs; refused (`409`) unless the desired state is `RUNNING` and a node holds the lease, as a restart (`ERROR` included), or while an unfinished job holds one of the tables; `202` with the job's id. The job runs in a restarted worker. It upserts: a row deleted at the source before the job stays, unless the job is asked with `truncate: true`, which empties each sink table first. A pipeline keeps its 100 newest ended jobs |
 | Snapshot job status | `GET /v1/snapshots/{job_id}` | viewer | |
 | List snapshot jobs | `GET /v1/pipelines/{id}/snapshots` | viewer | persisted in the pipeline state location; survive restart and failover |
+| Events | `GET /v1/events` | viewer | the cluster's timeline (actions with their caller, role, note and outcome; refused attempts; the cluster's own events), newest first; filters `since`, `until`, `kind` (a kind or a family), `object`, `actor`, `node`, `q`; `limit` 1–1000 (100); a page that stopped early names its `next`, passed back as `after`. Kept for `globals.console.events.retention` |
 | Pipeline pause | `POST /v1/pipelines/{id}/pause` | operator | `RUNNING → PAUSED`: flush to a transaction boundary and commit; source connection kept warm; lease kept |
 | Pipeline stop | `POST /v1/pipelines/{id}/stop` | operator | `RUNNING/PAUSED → STOPPED`: flush, close the source connection (PG slot kept); lease kept |
 | Pipeline resume | `POST /v1/pipelines/{id}/resume` | operator | `PAUSED/STOPPED → RUNNING` |
@@ -158,6 +159,7 @@ Names are the exposed sample names (OpenMetrics): a counter's name ends in `_tot
 | Sink | `data_avalanche_sink_commit_duration_seconds{sink_type}`, `data_avalanche_sink_commit_failures_total`; Delta MERGE cost and maintenance signals: `data_avalanche_sink_merge_files_rewritten_total`, `data_avalanche_sink_merge_rows_copied_total`, `data_avalanche_sink_soft_dropped_columns` |
 | Clustering | `data_avalanche_lease_state`, `data_avalanche_lease_renew_failures_total`, `data_avalanche_lease_renew_latency_seconds`, `data_avalanche_cluster_members`, `data_avalanche_owned_pipelines`, `data_avalanche_ring_generation` |
 | Status | `data_avalanche_pipeline_status` (running / paused / stopped / error), `data_avalanche_halted_tables` |
+| Events | `data_avalanche_events_written_total`, `data_avalanche_events_dropped_total` (the node's writes to the cluster's timeline; no labels) |
 
 **Definitions:** `replication_lag_seconds` is the age of the oldest change read but not yet durable in the sink: now minus the source commit time of the oldest transaction read since the last checkpoint, `0` when nothing is pending; snapshot rows don't count. `binlog_lag_seconds` is the age of the last transaction the stream read, `0` at the server's head; once a server heartbeat has shown the stream caught up, it counts from that heartbeat as soon as the server writes past the head the stream was at; a MySQL pipeline has no `wal_lag_bytes`, a PostgreSQL one no `binlog_lag_seconds`. `rows_read_total{op}` counts row changes read (`insert`, `update`, `delete`) and snapshot rows (`snapshot`). `snapshot_state{state}` is `running` or `waiting` (held by the source, or behind the previous term's writers). `sink_commit_failures_total` counts every failed attempt, retried ones included.
 
