@@ -367,13 +367,15 @@ oauth2:                                            # OIDC; superset of jwt for t
   discovery_url: https://idp.example.com/realms/cdc/.well-known/openid-configuration  # optional
   roles_claim: realm_access.roles                   # optional (default "roles")
   client_id: cdc-console                            # optional; the web console's sign-in (§6.8)
+  idp_name: Company SSO                             # optional; the provider's name on the sign-in page
   client_secret: ${CONSOLE_CLIENT_SECRET}           # optional; only for a confidential client
   scopes: [openid, profile]                         # optional (default [openid, profile])
 ```
 
-`client_id`, `client_secret` and `scopes` are used only by the web console's sign-in (§6.8):
+`client_id`, `client_secret`, `scopes` and `idp_name` are used only by the web console's sign-in (§6.8):
 authorization code with PKCE, the code exchanged by the server. Token verification doesn't use
-them. All three are R. `client_secret` is a secret (§4: fingerprinted, never shown); a client the
+them. All four are R. `idp_name` names the provider on the sign-in page ("Continue with Company SSO");
+without it, the page shows the issuer's host name. `client_secret` is a secret (§4: fingerprinted, never shown); a client the
 provider registered as public has none. `client_secret` and `scopes` need `client_id` (V-133).
 
 `roles_claim` tells the verifier **where** to read roles; `role_mapping` (§6.3) maps them to the
@@ -516,7 +518,7 @@ retentions below apply to them.
 ```yaml
 console:
   enabled: true
-  session_key: ${CONSOLE_SESSION_KEY}       # required when enabled, unless api.auth = none
+  session_key: ${CONSOLE_SESSION_KEY}       # required when enabled with api.auth basic or oauth2
   public_url: https://cdc.example.com        # required when enabled with api.auth = oauth2
   session_ttl: 8h
   username_claim: preferred_username
@@ -536,9 +538,9 @@ console:
 | Field | Type | Required | Default | Mutability | Notes |
 |---|---|---|---|---|---|
 | `enabled` | bool | no | `false` | R | Serves the console under `/ui/`. A reload turns it on or off without a restart. |
-| `session_key` | string | conditional | — | R | Required when `enabled` and `api.auth ≠ none` (V-135). Encrypts and signs the console's session cookie; the same value on every node. Use `${ENV}`; never stored in object storage. At least 32 bytes (V-128). A change ends every open session (people sign in again). Unused with `api.auth = none` (V-134). |
+| `session_key` | string | conditional | — | R | Required when `enabled` and `api.auth` is `basic` or `oauth2` (V-135). Encrypts and signs the console's session cookie; the same value on every node. Use `${ENV}`; never stored in object storage. At least 32 bytes (V-128). A change ends every open session (people sign in again). Unused with `api.auth` `none` or `jwt`, which have no sessions (V-134): `jwt` expects a bearer token on every request. |
 | `public_url` | URL | conditional | — | R | Required when `enabled` and `api.auth = oauth2` (V-136). The console's address as people reach it, for the OAuth2 redirect URI (`<public_url>/ui/…`). Absolute `http(s)` URL, no query or fragment (V-129). |
-| `session_ttl` | duration | no | `8h` | R | How long a session lasts without activity; with `jwt` and `oauth2`, never past the token's expiry. 5 min – 7 days (V-132). |
+| `session_ttl` | duration | no | `8h` | R | How long a session lasts without activity (`basic`, `oauth2`); with `oauth2`, never past the token's expiry unless the provider refreshes it. 5 min – 7 days (V-132). |
 | `username_claim` | string | no | `preferred_username` | R | The token claim shown and recorded as the person's name (`jwt`, `oauth2`); `sub` when the claim is absent. `basic` records the configured user, `none` records `anonymous (admin)`. |
 | `history.retention` | duration | no | `24h` | R | How long the built-in chart history is kept in `globals.state`. 1 h – 30 days (V-132). Older ranges come from `prometheus`. |
 | `events.retention` | duration | no | `30d` | R | How long the event and audit trail is kept in `globals.state`. 1 – 400 days (V-132). |
@@ -1413,8 +1415,8 @@ errors.
 | V-131 | `globals.console.prometheus` | `basic` and `bearer_token` are exclusive; `extra_labels` names match `[a-zA-Z_][a-zA-Z0-9_]*` and don't start with `__`. | error | config |
 | V-132 | `globals.console` durations | `session_ttl` 5 min – 7 days; `history.retention` 1 h – 30 days; `events.retention` 1 – 400 days. | error | config |
 | V-133 | `globals.api.oauth2.client_secret` / `scopes` | Need `client_id`. | error | config |
-| V-134 | `globals.console.session_key` with `api.auth = none` | Unused: a cluster without authentication has no sessions. | warning | config |
-| V-135 | `globals.console.enabled = true` with `api.auth ≠ none` | Requires `globals.console.session_key`. | error | config |
+| V-134 | `globals.console.session_key` with `api.auth ∈ {none, jwt}` | Unused: these modes have no sessions. | warning | config |
+| V-135 | `globals.console.enabled = true` with `api.auth ∈ {basic, oauth2}` | Requires `globals.console.session_key`. | error | config |
 | V-136 | `globals.console.enabled = true` with `api.auth = oauth2` | Requires `globals.console.public_url` and `globals.api.oauth2.client_id`. | error | config |
 
 ### 13.7 Identity / naming
@@ -1510,7 +1512,7 @@ globals:
     sample_ratio: 0.05
   console:
     enabled: true                              # off by default; served under /ui/
-    session_key: ${CONSOLE_SESSION_KEY}        # ≥ 32 bytes, the same on every node (V-128)
+    # no session_key: with auth jwt the console has no sessions (the proxy sends a token on every request)
     prometheus:
       url: https://prometheus.observability:9090
       extra_labels: { cluster: prod-eu }

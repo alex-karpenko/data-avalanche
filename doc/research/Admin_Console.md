@@ -247,8 +247,8 @@ All Claude's calls, "follow best practices" (Oleksii):
 
 ## 11. Configuration surface
 
-In `doc/specs/Configuration_Specification.md` §6.3.1 and §6.8 (approved 2026-11-14; `idp_name`
-and `session_key` for `basic` and `oauth2` only: a follow-up patch, awaiting approval):
+In `doc/specs/Configuration_Specification.md` §6.3.1 and §6.8 (approved 2026-11-14, with the
+follow-up for `idp_name` and `session_key` in `basic` and `oauth2` only):
 
 - `globals.api.oauth2.client_id` (and optional `client_secret`, `scopes`): the console's client for
   `oauth2`; `idp_name` (optional): the provider's name on the sign-in page.
