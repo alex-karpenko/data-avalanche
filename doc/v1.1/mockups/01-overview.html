@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Overview</title>
+  <style>
+    /*
+     * BRAINSTORM COMPANION FRAME TEMPLATE
+     *
+     * This template provides a consistent frame with:
+     * - OS-aware light/dark theming
+     * - Header branding and connection status
+     * - Scrollable main content area
+     * - CSS helpers for common UI patterns
+     *
+     * Content is injected via placeholder comment in #frame-content.
+     */
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; overflow: hidden; }
+
+    /* ===== THEME VARIABLES ===== */
+    :root {
+      --bg-primary: #f5f5f7;
+      --bg-secondary: #ffffff;
+      --bg-tertiary: #e5e5e7;
+      --border: #d1d1d6;
+      --text-primary: #1d1d1f;
+      --text-secondary: #86868b;
+      --text-tertiary: #aeaeb2;
+      --accent: #0071e3;
+      --accent-hover: #0077ed;
+      --success: #34c759;
+      --warning: #ff9f0a;
+      --error: #ff3b30;
+      --selected-bg: #e8f4fd;
+      --selected-border: #0071e3;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg-primary: #1d1d1f;
+        --bg-secondary: #2d2d2f;
+        --bg-tertiary: #3d3d3f;
+        --border: #424245;
+        --text-primary: #f5f5f7;
+        --text-secondary: #86868b;
+        --text-tertiary: #636366;
+        --accent: #0a84ff;
+        --accent-hover: #409cff;
+        --selected-bg: rgba(10, 132, 255, 0.15);
+        --selected-border: #0a84ff;
+      }
+    }
+
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      display: flex;
+      flex-direction: column;
+      line-height: 1.5;
+    }
+
+    /* ===== FRAME STRUCTURE ===== */
+    .brand { display: flex; align-items: center; min-width: 0; overflow: hidden; color: var(--text-secondary); line-height: 1; }
+    .brand a { color: inherit; text-decoration: none; display: flex; align-items: center; gap: 0.5rem; min-width: 0; max-width: 100%; line-height: 1; }
+    .brand-copy { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 1; transform: translateY(-1px); }
+    .brand-logo { display: block; height: 1em; width: auto; max-width: 180px; flex-shrink: 0; filter: invert(1); }
+    @media (prefers-color-scheme: dark) {
+      .brand-logo { filter: none; }
+    }
+    .status { font-size: 0.7rem; color: var(--status-color, var(--success)); display: flex; align-items: center; gap: 0.4rem; justify-self: end; white-space: nowrap; line-height: 1; }
+    .status::before { content: ''; width: 6px; height: 6px; background: var(--status-color, var(--success)); border-radius: 50%; }
+
+    .main { flex: 1; overflow-y: auto; }
+    #frame-content { padding: 2rem; min-height: 100%; }
+
+    .header {
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border);
+      padding: 0.5rem 1.5rem;
+      flex-shrink: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 1rem;
+      min-height: 42px;
+    }
+    .header .brand { justify-self: start; width: 100%; font-size: 0.75rem; line-height: 1; }
+    .header .status { grid-column: 2; line-height: 1; }
+    .header span {
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+    }
+    .header .selected-text {
+      color: var(--accent);
+      font-weight: 500;
+    }
+
+    /* ===== TYPOGRAPHY ===== */
+    h2 { font-size: 1.5rem; font-weight: 600; margin-bottom: 0.5rem; }
+    h3 { font-size: 1.1rem; font-weight: 600; margin-bottom: 0.25rem; }
+    .subtitle { color: var(--text-secondary); margin-bottom: 1.5rem; }
+    .section { margin-bottom: 2rem; }
+    .label { font-size: 0.7rem; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.5rem; }
+
+    /* ===== OPTIONS (for A/B/C choices) ===== */
+    .options { display: flex; flex-direction: column; gap: 0.75rem; }
+    .option {
+      background: var(--bg-secondary);
+      border: 2px solid var(--border);
+      border-radius: 12px;
+      padding: 1rem 1.25rem;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      display: flex;
+      align-items: flex-start;
+      gap: 1rem;
+    }
+    .option:hover { border-color: var(--accent); }
+    .option.selected { background: var(--selected-bg); border-color: var(--selected-border); }
+    .option .letter {
+      background: var(--bg-tertiary);
+      color: var(--text-secondary);
+      width: 1.75rem; height: 1.75rem;
+      border-radius: 6px;
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 600; font-size: 0.85rem; flex-shrink: 0;
+    }
+    .option.selected .letter { background: var(--accent); color: white; }
+    .option .content { flex: 1; }
+    .option .content h3 { font-size: 0.95rem; margin-bottom: 0.15rem; }
+    .option .content p { color: var(--text-secondary); font-size: 0.85rem; margin: 0; }
+
+    /* ===== CARDS (for showing designs/mockups) ===== */
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; }
+    .card {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .card:hover { border-color: var(--accent); transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+    .card.selected { border-color: var(--selected-border); border-width: 2px; }
+    .card-image { background: var(--bg-tertiary); aspect-ratio: 16/10; display: flex; align-items: center; justify-content: center; }
+    .card-body { padding: 1rem; }
+    .card-body h3 { margin-bottom: 0.25rem; }
+    .card-body p { color: var(--text-secondary); font-size: 0.85rem; }
+
+    /* ===== MOCKUP CONTAINER ===== */
+    .mockup {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+      margin-bottom: 1.5rem;
+    }
+    .mockup-header {
+      background: var(--bg-tertiary);
+      padding: 0.5rem 1rem;
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+      border-bottom: 1px solid var(--border);
+    }
+    .mockup-body { padding: 1.5rem; }
+
+    /* ===== SPLIT VIEW (side-by-side comparison) ===== */
+    .split { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+    @media (max-width: 700px) { .split { grid-template-columns: 1fr; } }
+
+    /* ===== PROS/CONS ===== */
+    .pros-cons { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin: 1rem 0; }
+    .pros, .cons { background: var(--bg-secondary); border-radius: 8px; padding: 1rem; }
+    .pros h4 { color: var(--success); font-size: 0.85rem; margin-bottom: 0.5rem; }
+    .cons h4 { color: var(--error); font-size: 0.85rem; margin-bottom: 0.5rem; }
+    .pros ul, .cons ul { margin-left: 1.25rem; font-size: 0.85rem; color: var(--text-secondary); }
+    .pros li, .cons li { margin-bottom: 0.25rem; }
+
+    /* ===== PLACEHOLDER (for mockup areas) ===== */
+    .placeholder {
+      background: var(--bg-tertiary);
+      border: 2px dashed var(--border);
+      border-radius: 8px;
+      padding: 2rem;
+      text-align: center;
+      color: var(--text-tertiary);
+    }
+
+    /* ===== INLINE MOCKUP ELEMENTS ===== */
+    .mock-nav { background: var(--accent); color: white; padding: 0.75rem 1rem; display: flex; gap: 1.5rem; font-size: 0.9rem; }
+    .mock-sidebar { background: var(--bg-tertiary); padding: 1rem; min-width: 180px; }
+    .mock-content { padding: 1.5rem; flex: 1; }
+    .mock-button { background: var(--accent); color: white; border: none; padding: 0.5rem 1rem; border-radius: 6px; font-size: 0.85rem; }
+    .mock-input { background: var(--bg-primary); border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem; width: 100%; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <b>data-avalanche console · approved mockup</b> <span style="margin-left:auto;opacity:.7">Overview · 1.1.0 · approved 2026-11-14</span>
+  </div>
+
+  <div class="main">
+    <div id="frame-content">
+      <style>
+  .da{font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--text-primary)}
+  .da .bar{display:flex;align-items:center;gap:18px;padding:10px 14px;background:var(--bg-tertiary);border-radius:8px 8px 0 0}
+  .da .bar b{font-size:14px}.da .bar .nav span{margin-right:14px;color:var(--text-secondary)}.da .bar .nav .on{color:var(--text-primary);font-weight:600;border-bottom:2px solid var(--accent);padding-bottom:2px}
+  .da .bar .who{margin-left:auto;color:var(--text-secondary)}
+  .da .pane{padding:14px;background:var(--bg-secondary);border:1px solid var(--border);border-top:0;border-radius:0 0 8px 8px}
+  .da .tiles{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:14px}
+  .da .tile{border:1px solid var(--border);border-radius:8px;padding:10px}
+  .da .tile .k{font-size:11px;text-transform:uppercase;color:var(--text-secondary);letter-spacing:.04em}
+  .da .tile .v{font-size:22px;font-weight:600;margin-top:2px}.da .tile .s{font-size:11px;color:var(--text-secondary)}
+  .da h4{margin:14px 0 6px;font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--text-secondary)}
+  .da .att{border:1px solid var(--border);border-radius:8px;overflow:hidden}
+  .da .att div{display:flex;gap:10px;align-items:center;padding:7px 10px;border-top:1px solid var(--border)}.da .att div:first-child{border-top:0}
+  .da .dot{width:9px;height:9px;border-radius:50%;flex:none}.da .r{background:var(--error)}.da .o{background:var(--warning)}.da .y{background:#e6c200}.da .g{background:var(--success)}.da .n{background:var(--text-tertiary)}
+  .da .att .what{flex:1}.da .att .when{color:var(--text-secondary);font-size:12px}
+  .da .lnk{color:var(--accent);font-size:12px}
+  .da table{width:100%;border-collapse:collapse}.da td,.da th{padding:6px 8px;border-top:1px solid var(--border);text-align:left;font-size:12.5px}
+  .da th{font-weight:500;color:var(--text-secondary);border-top:0;font-size:11px;text-transform:uppercase}
+  .da .chip{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;font-weight:600}
+  .da .c-run{background:rgba(52,199,89,.18);color:#1f8f3a}.da .c-halt{background:rgba(255,59,48,.16);color:#d0302a}.da .c-pause{background:rgba(142,142,147,.2);color:var(--text-secondary)}.da .c-warn{background:rgba(255,159,10,.18);color:#b86e00}
+  .da .two{display:grid;grid-template-columns:1.6fr 1fr;gap:14px}
+  .da .ev{font-size:12px}.da .ev div{padding:4px 0;border-top:1px solid var(--border)}.da .ev div:first-child{border-top:0}.da .ev .t{color:var(--text-secondary);display:inline-block;width:44px}
+  .da .who-act{font-weight:600}
+  .da .btns{display:flex;gap:6px}.da .btn{border:1px solid var(--border);border-radius:6px;padding:4px 10px;font-size:12px;background:var(--bg-secondary)}.da .btn.danger{color:var(--error);border-color:rgba(255,59,48,.5)}
+  .da .meter{height:8px;background:var(--bg-tertiary);border-radius:4px;overflow:hidden}.da .meter i{display:block;height:100%;background:var(--accent)}
+  .da .muted{color:var(--text-secondary)}
+</style>
+
+<h2>Overview</h2>
+<p class="subtitle">Wireframe fidelity, made-up data. Judge the content and the layout, not the colours or fonts.</p>
+
+<div class="mockup"><div class="mockup-header">1 · Overview: "is anything wrong?"</div><div class="mockup-body da">
+  <div class="bar"><b>data-avalanche</b>
+    <div class="nav"><span class="on">Overview</span><span>Cluster</span><span>Pipelines</span><span>Tables</span><span>Snapshots</span><span>Events</span><span>Config</span></div>
+    <div class="who">config gen 42 · Oleksii · <b>operator</b></div></div>
+  <div class="pane">
+    <div class="tiles">
+      <div class="tile"><div class="k">Pipelines</div><div class="v">12</div><div class="s"><span class="dot g" style="display:inline-block"></span> 10 running · 1 paused · <span style="color:var(--error)">1 halted table</span></div></div>
+      <div class="tile"><div class="k">Worst lag</div><div class="v" style="color:#b86e00">4m 12s</div><div class="s">billing-mysql · target 60 s</div></div>
+      <div class="tile"><div class="k">Nodes</div><div class="v">3 / 3</div><div class="s">1 on an older config generation</div></div>
+      <div class="tile"><div class="k">Snapshots</div><div class="v">2</div><div class="s">running · 1 failed today</div></div>
+      <div class="tile"><div class="k">WAL held by slots</div><div class="v" style="color:#b86e00">3.4 GB</div><div class="s">largest: da_inventory 3.2 GB</div></div>
+    </div>
+
+    <h4>Needs attention · 5</h4>
+    <div class="att">
+      <div><span class="dot r"></span><span class="what"><b>orders-pg › public.refunds halted</b>: <code>amount</code> changed int → text, which can't be applied in place</span><span class="when">12 min</span><span class="lnk">Open table →</span></div>
+      <div><span class="dot o"></span><span class="what"><b>billing-mysql lag 4m 12s</b> and rising for 9 min (target 60 s)</span><span class="when">9 min</span><span class="lnk">Open →</span></div>
+      <div><span class="dot o"></span><span class="what"><b>Slot da_inventory holds 3.2 GB of WAL</b> · pipeline <i>inventory</i> paused 2 h ago by <span class="who-act">Oleksii</span></span><span class="when">2 h</span><span class="lnk">Open →</span></div>
+      <div><span class="dot y"></span><span class="what"><b>node-c runs config generation 41</b>, the cluster is on 42</span><span class="when">40 min</span><span class="lnk">Node →</span></div>
+      <div><span class="dot y"></span><span class="what"><b>Restart-only change waiting</b> on orders-pg (<code>sink.prefix</code>), published by <span class="who-act">ci-bot</span></span><span class="when">1 h</span><span class="lnk">Review →</span></div>
+    </div>
+
+    <div class="two">
+      <div>
+        <h4>Pipelines</h4>
+        <table><tr><th>Pipeline</th><th>State</th><th>Node</th><th>Lag, last hour</th><th>Last commit</th></tr>
+          <tr><td><b>orders-pg</b><div class="muted">PG → Delta · 14 tables</div></td><td><span class="chip c-halt">1 halted</span></td><td>node-b</td><td><svg width="120" height="22"><polyline fill="none" stroke="var(--success)" stroke-width="1.5" points="0,18 10,17 20,18 30,16 40,17 50,15 60,17 70,16 80,18 90,17 100,16 110,17 120,16"/></svg> 21 s</td><td>8 s ago</td></tr>
+          <tr><td><b>billing-mysql</b><div class="muted">MySQL → Delta · 6 tables</div></td><td><span class="chip c-warn">lagging</span></td><td>node-a</td><td><svg width="120" height="22"><line x1="0" x2="120" y1="12" y2="12" stroke="var(--text-tertiary)" stroke-dasharray="3 3"/><polyline fill="none" stroke="var(--warning)" stroke-width="1.5" points="0,18 10,18 20,17 30,18 40,17 50,16 60,14 70,12 80,10 90,8 100,6 110,4 120,3"/></svg> 4m 12s</td><td>3 min ago</td></tr>
+          <tr><td><b>inventory</b><div class="muted">PG → Delta · 3 tables</div></td><td><span class="chip c-pause">paused</span><div class="muted" style="font-size:11px">by Oleksii, 2 h ago</div></td><td>node-c</td><td class="muted">—</td><td>2 h ago</td></tr>
+          <tr><td><b>customers</b><div class="muted">PG → Delta · 2 tables</div></td><td><span class="chip c-run">snapshot 62%</span></td><td>node-a</td><td><svg width="120" height="22"><polyline fill="none" stroke="var(--success)" stroke-width="1.5" points="0,17 20,16 40,17 60,15 80,16 100,17 120,16"/></svg> 30 s</td><td>12 s ago</td></tr>
+        </table>
+      </div>
+      <div>
+        <h4>Recent events</h4>
+        <div class="ev">
+          <div><span class="t">14:02</span><b>inventory</b> paused by <span class="who-act">Oleksii</span> (operator)</div>
+          <div><span class="t">13:55</span>lease <b>orders-pg</b> moved node-a → node-b · failover, 41 s</div>
+          <div><span class="t">13:41</span>public.refunds <b>halted</b>: type change refused</div>
+          <div><span class="t">13:40</span>config generation <b>42</b> reloaded by <span class="who-act">ci-bot</span></div>
+          <div><span class="t">13:20</span>snapshot #118 <b>customers</b> finished · 4.1 M rows, 18 min</div>
+          <div><span class="t">12:05</span>snapshot #117 <b>billing</b> cancelled by <span class="who-act">Oleksii</span></div>
+        </div>
+      </div>
+    </div>
+  </div></div></div>
+
+
+    </div>
+  </div>
+
+</body>
+</html>
