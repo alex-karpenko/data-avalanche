@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-13
+updated: 2026-11-14
 domain: Architecture
 tags: [v1, acceptance, load, soak, chaos, lag, failover, merge-cost, cloud, release]
 ---
@@ -158,8 +158,9 @@ requires `^0.37`), and the PostgreSQL, MySQL and MariaDB images (the support mat
 | E2E on MySQL 8.4 | 51/51 (8 min) |
 | `cargo xtask bench` / `chaos` on PostgreSQL 18 | bench 3/3 (67 min), chaos 4/4 (7 min) |
 | `cargo xtask bench` / `chaos` on MySQL 8.4 | bench 3/3 (44 min), chaos 4/4 (8 min) |
-| PR CI (`check`, `integration`, MySQL/MariaDB matrix, `e2e-gcs`, `k3s`, `docs`) | pending: PR CI after the push |
-| `cloud.yml` on S3, GCS and Azure | pending: `cloud.yml` after the push |
+| PR CI (`check`, `integration`, MySQL/MariaDB matrix, `e2e-gcs`, `k3s`, `docs`) | green on PR #24 at `7d415bf` (`ci.yml` run 43566038711, `integration` 22 min with the E2E 51/51, the failover-slot scenario included; `docs.yml` run 43566038737). The first run's `integration` twice failed to bind host port 55420 for the replica pairs, after every test had passed; the job now reserves the test ports (`7d415bf`) |
+| `cloud.yml` on S3, GCS and Azure | green: run 43546386400 at `4c08329`, `s3`, `azure` and the E2E subset on S3, GCS and Azure for both sources (8/8) |
+| `release.yml` dry run (dispatched, nothing published) | green: run 43546383710 at `4c08329`; the version check, `deps --check` and `audit --check` pass, the image builds for amd64 and arm64, the chart packages; login, push, manifest and the GitHub release skipped |
 
 The figures beside 1.0.0's (the targets are D-V1.3's):
 
