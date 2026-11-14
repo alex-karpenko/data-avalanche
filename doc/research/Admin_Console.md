@@ -55,11 +55,11 @@ shows.
 - **Replacing Prometheus/Grafana** for long-term metrics; the console reads Prometheus when one is
   configured (§7).
 
-**Off unless switched on (Oleksii).** The console is optional: a command-line flag on `run`,
-`--console`, turns it on for that node, and without it the node serves no console. The default is
-off. With the flag off, the console's paths (§10), its sign-in pages and sessions (§9) and its live
-stream don't exist on that node (404), and a `globals.console` block in the config is still
-parsed and validated but unused there. What the console *reads* is recorded whatever the flag
+**Off unless switched on (Oleksii).** The console is optional: `globals.console.enabled` in the
+config file switches it on, and the default is `false`. While it's off, the console's paths
+(`/ui/`, §10) and its sign-in pages and sessions (§9) don't exist (404); the rest of the
+`globals.console` block is still validated. It is a reloadable setting: a reload turns the console
+on or off without a restart. What the console *reads* is recorded whatever the switch
 says (Claude's call): the events and attribution (§5, §6), the history (§7) and the new API
 endpoints (§12) are part of the server, because a console on one node shows what every node
 records, and the audit trail is useful through the API alone. The Helm chart follows (§11).
@@ -186,9 +186,8 @@ One sign-in page; what follows depends on `globals.api.auth`:
   `HttpOnly`, `Secure`, `SameSite=Strict` cookie, readable by every node so a load balancer can
   send any request anywhere. **The key comes from configuration** (Oleksii):
   `globals.console.session_key`, set through `${ENV}` to the same value on every node, required
-  on a node started with `--console` when `auth` is not `none`: such a node refuses to start
-  without it, and if a later config generation drops it, that node's console shows a
-  "console misconfigured" page and logs an error, while its pipelines carry on (Claude's call). It is never kept in object storage, because people who may read the
+  when the console is enabled and `auth` is not `none` (a validation rule, so a config without it
+  is refused at start and on reload). It is never kept in object storage, because people who may read the
   lake's bucket must not be able to mint an admin session. Every request is still verified the
   way the API verifies a bearer token today; the role and the recorded name always come from that
   verification.
@@ -219,8 +218,10 @@ All Claude's calls, "follow best practices" (Oleksii):
   `cargo build` without it serves a "console not built" page, so Rust-only work needs no Node
   (Node 26 is already in the repository for the docs site). Nothing is fetched from the internet
   at runtime.
-- **Served from the API listener** under its own path (for example `/console/`), every node
-  serving it. Node-targeted actions and another node's live detail are fetched by the serving node
+- **Served from the API listener** under the path prefix **`/ui/`** (Oleksii), every node serving
+  it. The console's own server routes (sign-in, sign-out, the OAuth2 callback) are under `/ui/`
+  too; the data it reads and the actions it takes go through the versioned API under `/v1/`, which
+  `curl` can use as well. Node-targeted actions and another node's live detail are fetched by the serving node
   from the target node, each with its own time limit. The serving node passes the caller's own
   credentials through, so the target verifies the caller itself and records the same name; no
   node-to-node trust is added (Claude's call). Each node's API address travels in its gossip
@@ -229,8 +230,8 @@ All Claude's calls, "follow best practices" (Oleksii):
   the builder's).
 - **Light and dark** themes following the system setting.
 - **Tests:** Vitest for components; Playwright for real flows against the E2E cluster, including
-  every sign-in mode, the 401/403 pages, the actions' attribution, the §8 budgets, and a node
-  without `--console` serving none of it.
+  every sign-in mode, the 401/403 pages, the actions' attribution, the §8 budgets, and a cluster
+  with the console disabled serving none of it.
 - **Accessibility:** keyboard navigation, labels on every state, contrast in both themes.
 
 ## 11. Configuration surface (proposed; spec edits need approval)
@@ -239,18 +240,18 @@ New settings, to be patched into `doc/specs/Configuration_Specification.md` once
 (names are proposals):
 
 - `globals.api.oauth2.client_id` (and optional `scopes`): the console's client for `oauth2`.
-- The command-line flag `run --console` (Oleksii): off by default; it switches the console on
-  for that node (§3). `System-Overview.md` lists the command-line parameters, so it gains this one.
-- `globals.console` (no `enabled` field: the flag decides): `session_key` (`${ENV}`, required on a
-  node with `--console` unless `auth = none`, §9); `public_url` (required with `oauth2`); `session_ttl` (default 8 h, Claude's call);
+- `globals.console`: `enabled` (default `false`, Oleksii; reloadable, §3); `session_key`
+  (`${ENV}`, required when enabled unless `auth = none`, §9); `public_url` (required when enabled
+  with `oauth2`); `session_ttl` (default 8 h, Claude's call);
   `username_claim` (default `preferred_username`); `history.retention` (default 24 h);
   `events.retention` (default 30 d); `prometheus` (optional: `url`, `auth`, `tls`,
   `extra_labels`).
 
-**Helm chart** (Oleksii: "adapt helm chart accordingly"): a `console.enabled` value, `false` by
-default, that adds `--console` to the container's arguments; the session key and any OAuth2
-client secret reach the pods through the chart's existing `env`/`envFrom`; `NOTES.txt` gives the
-console's address when it is on; the chart's `ci/` values gain a console-on case. The chart has
+**Helm chart** (Oleksii: "adapt helm chart accordingly"): the switch lives in the config, which the
+chart already renders from `config`, so the chart gains no switch of its own. The session key and
+any OAuth2 client secret reach the pods through the chart's existing `env`/`envFrom`; `NOTES.txt`
+gives the console's address (`/ui/`) when the config map enables it; the values file's comments
+show the console block; the chart's `ci/` values gain a console-on case. The chart has
 no Ingress today and gains none (Claude's call): the console is served on the API's Service.
 
 Docs touched besides the spec (Oleksii: don't forget the documentation site):
@@ -258,8 +259,8 @@ Docs touched besides the spec (Oleksii: don't forget the documentation site):
 `Observability_Metrics_and_Tracing.md` (the history store), the gap tracker, the chart's
 README, and the docs site: a console page (switching it on, sign-in per mode, what it shows),
 `reference/configuration` (`globals.console`, `oauth2.client_id`), `reference/api` (the new
-endpoints, the `note` field), `deployment/kubernetes` (`console.enabled`) and
-`deployment/container` (`--console`), `deployment/observability` (history and Prometheus), and
+endpoints, the `note` field), `deployment/kubernetes` and
+`deployment/container` (switching the console on, the session key's secret), `deployment/observability` (history and Prometheus), and
 the runbooks pointing at the console where it does the job.
 
 ## 12. New server work this needs
@@ -270,12 +271,13 @@ the runbooks pointing at the console where it does the job.
   and across pipelines, source detail (slot, WAL held, binlog position), all snapshot jobs, job
   cancel and retry, node leave and shutdown through any node, config generations and diff.
 - Sign-in, sessions, the 401/403 pages (§9).
-- Serving the embedded app (§10), behind the `--console` flag (§3).
+- Serving the embedded app under `/ui/` (§10), behind `globals.console.enabled` (§3).
 
 ## 13. Left to the builder
 
 The attention thresholds; the event and history layouts in object storage; sampling resolution;
-the exact paths of the new endpoints and the console; the SSE message shapes; how the milestones
+the exact paths of the new `/v1/` endpoints (they go into the spec's endpoint table with the first
+server plan) and of the routes under `/ui/`; the SSE message shapes; how the milestones
 split this (likely: server foundations — events, attribution, history, new endpoints; sign-in and
 sessions; the console shell and Overview; the detail pages and actions).
 
