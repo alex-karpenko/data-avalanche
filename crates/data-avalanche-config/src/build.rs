@@ -329,7 +329,7 @@ fn console(c: &RawConsole, at: &At, ctx: &mut Ctx) -> Option<Console> {
     Some(Console {
         enabled: enabled?,
         session_key: session_key?,
-        public_url: public_url?,
+        public_url: public_url?.map(|u| u.trim().to_owned()),
         session_ttl: session_ttl?,
         username_claim: username_claim?,
         history: history?,
@@ -363,7 +363,7 @@ fn prometheus(p: &RawPrometheus, at: &At, ctx: &mut Ctx) -> Option<Prometheus> {
         (Some(_), Some(_)) => return None,
     };
     Some(Prometheus {
-        url: url?,
+        url: url?.trim().to_owned(),
         auth,
         headers: headers?,
         ca: ca?,

@@ -1214,6 +1214,23 @@ fn a_posted_templated_mysql_id_derives_no_server_id() {
 /// Config §6.8: the console's secrets resolve as secrets (shown by fingerprint), Prometheus takes
 /// its bearer token and labels, and the oauth2 sign-in fields keep their defaults.
 #[test]
+fn console_urls_are_stored_trimmed() {
+    let yaml = MINIMAL.replace(
+        "globals:\n  state: { bucket: app-state }",
+        "globals:\n  state: { bucket: app-state }\n  console:\n    enabled: true\n    public_url: \" https://cdc.example.com \"\n    prometheus:\n      url: \" http://prom:9090 \"",
+    );
+    let cfg = load_str(&yaml, &env(&[("PW", "pw")]), &fp_key())
+        .unwrap_or_else(|r| panic!("{r:#?}"))
+        .config;
+    let c = &cfg.globals.console;
+    assert_eq!(c.public_url.as_deref(), Some("https://cdc.example.com"));
+    assert_eq!(
+        c.prometheus.as_ref().map(|p| p.url.as_str()),
+        Some("http://prom:9090")
+    );
+}
+
+#[test]
 fn console_settings_resolve_with_their_secrets_hidden() {
     let yaml = MINIMAL.replace(
         "globals:\n  state: { bucket: app-state }",

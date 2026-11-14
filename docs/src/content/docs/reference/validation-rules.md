@@ -138,7 +138,8 @@ A config with any **error** is rejected whole: at startup the node refuses to st
 | <span id="v-130"></span>V-130 | error | `globals.console.prometheus.url` | An absolute http/https URL. |
 | <span id="v-131"></span>V-131 | error | `globals.console.prometheus` | basic and bearer_token are exclusive; extra_labels names match [a-zA-Z_][a-zA-Z0-9_]* and don't start with __. |
 | <span id="v-132"></span>V-132 | error | `globals.console durations` | session_ttl 5 min – 7 days; history.retention 1 h – 30 days; events.retention 1 – 400 days. |
-| <span id="v-133"></span>V-133 | error | `globals.api.oauth2.client_secret / scopes` | Need client_id. |
+| <span id="v-133"></span>V-133 | error | `globals.api.oauth2.client_secret / globals.api.oauth2.scopes` | Need client_id. |
 | <span id="v-134"></span>V-134 | warning | `globals.console.session_key with api.auth ∈ {none, jwt}` | Unused: these modes have no sessions. |
 | <span id="v-135"></span>V-135 | error | `globals.console.enabled = true with api.auth ∈ {basic, oauth2}` | Requires globals.console.session_key. |
 | <span id="v-136"></span>V-136 | error | `globals.console.enabled = true with api.auth = oauth2` | Requires globals.console.public_url and globals.api.oauth2.client_id. |
+| <span id="v-137"></span>V-137 | error | `globals.console.prometheus` | Requires url; basic requires user and password. |

@@ -351,17 +351,17 @@ pub const FIELD_DOCS: &[FieldDoc] = &[
     f(
         "globals.console.prometheus.url",
         Required,
-        "Where chart ranges older than the built-in history come from: Prometheus's base URL, http or https (V-130). Absent, the console uses its built-in history only.",
+        "Where chart ranges older than the built-in history come from: Prometheus's base URL, http or https (V-130). Absent, the console uses its built-in history only. Required in the block (V-137).",
     ),
     f(
         "globals.console.prometheus.basic.user",
         Required,
-        "Basic authentication's user; exclusive with `bearer_token` (V-131).",
+        "Basic authentication's user; exclusive with `bearer_token` (V-131). Required in `basic` (V-137).",
     ),
     f(
         "globals.console.prometheus.basic.password",
         Required,
-        "Basic authentication's password, a secret.",
+        "Basic authentication's password, a secret. Required in `basic` (V-137).",
     ),
     f(
         "globals.console.prometheus.bearer_token",

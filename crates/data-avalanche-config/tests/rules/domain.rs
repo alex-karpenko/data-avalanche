@@ -320,6 +320,26 @@ pub fn cases() -> Vec<Case> {
                 json!({"url": "http://prometheus.observability:9090"}),
             )
         }),
+        case("V-137", Error, "a prometheus block without url", || {
+            pg_delta().set("/globals/console/prometheus", json!({"bearer_token": "t"}))
+        }),
+        case("V-137", Error, "basic without a password", || {
+            pg_delta().set(
+                "/globals/console/prometheus",
+                json!({"url": "https://prom", "basic": {"user": "u"}}),
+            )
+        }),
+        case(
+            "V-137",
+            Silent,
+            "a prometheus block with url and basic",
+            || {
+                pg_delta().set(
+                    "/globals/console/prometheus",
+                    json!({"url": "https://prom", "basic": {"user": "u", "password": "p"}}),
+                )
+            },
+        ),
         case("V-131", Error, "basic and a bearer token", || {
             pg_delta().set("/globals/console/prometheus", json!({"url": "https://prom", "basic": {"user": "u", "password": "p"}, "bearer_token": "t"}))
         }),

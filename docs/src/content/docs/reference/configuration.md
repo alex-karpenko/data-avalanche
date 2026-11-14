@@ -72,7 +72,7 @@ Token verification for `auth: oauth2`, and the web console's sign-in client.
 | `roles_claim` | string | `roles` | applied |  | The claim, a dotted JSON path, that holds the caller's roles. |
 | `client_id` | string | — | applied |  | The web console's client at the identity provider, for its sign-in (authorization code with PKCE). Token verification doesn't use it. Needed for the console under `oauth2` (V-136). |
 | `client_secret` | string | — | applied | [V-133](/data-avalanche/reference/validation-rules/#v-133) | The console client's secret, only for a client the provider registered as confidential. A secret; needs `client_id` (V-133). |
-| `scopes` | list of string | openid, profile | applied |  | The scopes the console's sign-in asks for. Needs `client_id` (V-133). |
+| `scopes` | list of string | openid, profile | applied | [V-133](/data-avalanche/reference/validation-rules/#v-133) | The scopes the console's sign-in asks for. Needs `client_id` (V-133). |
 | `idp_name` | string | the issuer's host name | applied |  | The provider's name on the console's sign-in page (`Continue with Company SSO`). |
 
 ## `globals.api.tls`
@@ -185,11 +185,11 @@ The cluster's events and audit trail.
 
 Where chart ranges older than the built-in history come from. Absent, the console uses its built-in history only, without a warning.
 
-Rules for the whole block: [V-131](/data-avalanche/reference/validation-rules/#v-131).
+Rules for the whole block: [V-131](/data-avalanche/reference/validation-rules/#v-131), [V-137](/data-avalanche/reference/validation-rules/#v-137).
 
 | Key | Type | Default | On reload | Rules | Description |
 |---|---|---|---|---|---|
-| `url` | string | — | applied | [V-130](/data-avalanche/reference/validation-rules/#v-130) | Where chart ranges older than the built-in history come from: Prometheus's base URL, http or https (V-130). Absent, the console uses its built-in history only. |
+| `url` | string | — | applied | [V-130](/data-avalanche/reference/validation-rules/#v-130) | Where chart ranges older than the built-in history come from: Prometheus's base URL, http or https (V-130). Absent, the console uses its built-in history only. Required in the block (V-137). |
 | `bearer_token` | string | — | applied |  | A bearer token, a secret; exclusive with `basic` (V-131). |
 | `headers.<key>` | map of string | none | applied |  | Headers sent with every query, a map of name to value (a tenant header). The values are secrets (V-126). |
 | `extra_labels.<key>` | map of string | none | applied |  | Label matchers added to every query (`cluster: prod-eu`), for labels a collector adds or renames. Prometheus label names, not starting with `__` (V-131). |
@@ -201,8 +201,8 @@ Basic authentication to Prometheus.
 
 | Key | Type | Default | On reload | Rules | Description |
 |---|---|---|---|---|---|
-| `user` | string | — | applied |  | Basic authentication's user; exclusive with `bearer_token` (V-131). |
-| `password` | string | — | applied |  | Basic authentication's password, a secret. |
+| `user` | string | — | applied |  | Basic authentication's user; exclusive with `bearer_token` (V-131). Required in `basic` (V-137). |
+| `password` | string | — | applied |  | Basic authentication's password, a secret. Required in `basic` (V-137). |
 
 ## `globals.console.prometheus.tls`
 

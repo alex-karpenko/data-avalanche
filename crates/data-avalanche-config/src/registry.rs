@@ -1113,7 +1113,7 @@ pub const RULES: &[RuleMeta] = &[
         Error,
         L::Config,
         Config,
-        r#"globals.api.oauth2.client_secret / scopes"#,
+        r#"globals.api.oauth2.client_secret / globals.api.oauth2.scopes"#,
         r#"Need client_id."#,
     ),
     rule(
@@ -1140,6 +1140,14 @@ pub const RULES: &[RuleMeta] = &[
         r#"globals.console.enabled = true with api.auth = oauth2"#,
         r#"Requires globals.console.public_url and globals.api.oauth2.client_id."#,
     ),
+    rule(
+        "V-137",
+        Error,
+        L::Config,
+        Config,
+        r#"globals.console.prometheus"#,
+        r#"Requires url; basic requires user and password."#,
+    ),
 ];
 
 /// The registry entry for `id` (`"V-007"`).
@@ -1153,7 +1161,7 @@ mod tests {
 
     #[test]
     fn has_every_spec_rule_once_in_order() {
-        assert_eq!(RULES.len(), 130);
+        assert_eq!(RULES.len(), 131);
         assert!(
             RULES.windows(2).all(|w| w[0].id < w[1].id),
             "sorted, no duplicates"

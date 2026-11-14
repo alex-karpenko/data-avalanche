@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use super::pipeline_at;
+use super::{missing, pipeline_at};
 use crate::coerce::LeafType;
 use crate::ctx::{At, Ctx, is_templated, shown, shown_value};
 use crate::enums::*;
@@ -716,8 +716,27 @@ fn console(c: &RawConsole, at: &At, ctx: &mut Ctx) {
         return;
     };
     let p_at = at.key("prometheus");
+    // V-137
+    let url_missing = missing(ctx, &p.url, &p_at.key("url"));
+    if url_missing {
+        ctx.error("V-137", &p_at.key("url"), None, "prometheus needs url");
+    }
+    if let Some(b) = &p.basic {
+        let b_at = p_at.key("basic");
+        for (key, leaf) in [("user", &b.user), ("password", &b.password)] {
+            if missing(ctx, leaf, &b_at.key(key)) {
+                ctx.error(
+                    "V-137",
+                    &b_at.key(key),
+                    None,
+                    format!("prometheus.basic needs {key}"),
+                );
+            }
+        }
+    }
     // V-130
-    if let Some(l) = &p.url
+    if !url_missing
+        && let Some(l) = &p.url
         && let Some(url) = ctx.text(l, &p_at.key("url"))
         && !http_url(url.trim())
     {
