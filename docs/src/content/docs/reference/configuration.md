@@ -61,7 +61,7 @@ Token verification for `auth: jwt`.
 
 ## `globals.api.oauth2`
 
-Token verification for `auth: oauth2`.
+Token verification for `auth: oauth2`, and the web console's sign-in client.
 
 | Key | Type | Default | On reload | Rules | Description |
 |---|---|---|---|---|---|
@@ -70,6 +70,10 @@ Token verification for `auth: oauth2`.
 | `jwks_url` | string | — | applied |  | Where the API fetches the signing keys; optional when `discovery_url` is set. |
 | `discovery_url` | string | — | applied |  | The issuer's OpenID discovery document, which names its keys. |
 | `roles_claim` | string | `roles` | applied |  | The claim, a dotted JSON path, that holds the caller's roles. |
+| `client_id` | string | — | applied |  | The web console's client at the identity provider, for its sign-in (authorization code with PKCE). Token verification doesn't use it. Needed for the console under `oauth2` (V-136). |
+| `client_secret` | string | — | applied | [V-133](/data-avalanche/reference/validation-rules/#v-133) | The console client's secret, only for a client the provider registered as confidential. A secret; needs `client_id` (V-133). |
+| `scopes` | list of string | openid, profile | applied |  | The scopes the console's sign-in asks for. Needs `client_id` (V-133). |
+| `idp_name` | string | the issuer's host name | applied |  | The provider's name on the console's sign-in page (`Continue with Company SSO`). |
 
 ## `globals.api.tls`
 
@@ -146,6 +150,67 @@ Azure Blob Storage (`cloud: azure`).
 | Key | Type | Default | On reload | Rules | Description |
 |---|---|---|---|---|---|
 | `account_name` | string | from the credential chain | process restart | [V-101](/data-avalanche/reference/validation-rules/#v-101) | The Azure storage account of every container (`cloud: azure`). |
+
+## `globals.console`
+
+The web console under `/ui/` (off by default), and how long the events and the chart history it reads are kept: they are recorded whether the console is on or off.
+
+Rules for the whole block: [V-132](/data-avalanche/reference/validation-rules/#v-132).
+
+| Key | Type | Default | On reload | Rules | Description |
+|---|---|---|---|---|---|
+| `enabled` | boolean | `false` | applied | [V-135](/data-avalanche/reference/validation-rules/#v-135) [V-136](/data-avalanche/reference/validation-rules/#v-136) | Serves the web console under `/ui/` on the API's listener. A reload turns it on or off. |
+| `session_key` | string | — | applied | [V-128](/data-avalanche/reference/validation-rules/#v-128) [V-134](/data-avalanche/reference/validation-rules/#v-134) | Encrypts and signs the console's session cookie: at least 32 bytes, the same on every node, set through `${ENV}` and never kept in object storage (V-128). Required with the console on under `basic` or `oauth2` (V-135); a change signs everyone out. |
+| `public_url` | string | — | applied | [V-129](/data-avalanche/reference/validation-rules/#v-129) | The console's address as people reach it (`https://cdc.example.com`), for the OAuth2 redirect. Required with the console on under `oauth2` (V-136). |
+| `session_ttl` | duration | `8h` | applied |  | How long a session lasts without activity, from 5 minutes to 7 days (V-132). |
+| `username_claim` | string | `preferred_username` | applied |  | The token claim shown and recorded as the person's name (`jwt`, `oauth2`); `sub` when the token lacks it. |
+
+## `globals.console.history`
+
+The built-in chart history each node keeps.
+
+| Key | Type | Default | On reload | Rules | Description |
+|---|---|---|---|---|---|
+| `retention` | duration | `24h` | applied |  | How long each node keeps the built-in chart history in `globals.state`, from 1 hour to 30 days (V-132). Older ranges come from `prometheus`. |
+
+## `globals.console.events`
+
+The cluster's events and audit trail.
+
+| Key | Type | Default | On reload | Rules | Description |
+|---|---|---|---|---|---|
+| `retention` | duration | `30d` | applied |  | How long the cluster's events and audit trail are kept in `globals.state`, from 1 to 400 days (V-132). |
+
+## `globals.console.prometheus`
+
+Where chart ranges older than the built-in history come from. Absent, the console uses its built-in history only, without a warning.
+
+Rules for the whole block: [V-131](/data-avalanche/reference/validation-rules/#v-131).
+
+| Key | Type | Default | On reload | Rules | Description |
+|---|---|---|---|---|---|
+| `url` | string | — | applied | [V-130](/data-avalanche/reference/validation-rules/#v-130) | Where chart ranges older than the built-in history come from: Prometheus's base URL, http or https (V-130). Absent, the console uses its built-in history only. |
+| `bearer_token` | string | — | applied |  | A bearer token, a secret; exclusive with `basic` (V-131). |
+| `headers.<key>` | map of string | none | applied |  | Headers sent with every query, a map of name to value (a tenant header). The values are secrets (V-126). |
+| `extra_labels.<key>` | map of string | none | applied |  | Label matchers added to every query (`cluster: prod-eu`), for labels a collector adds or renames. Prometheus label names, not starting with `__` (V-131). |
+| `timeout` | duration | 5s | applied |  | How long one query may take. |
+
+## `globals.console.prometheus.basic`
+
+Basic authentication to Prometheus.
+
+| Key | Type | Default | On reload | Rules | Description |
+|---|---|---|---|---|---|
+| `user` | string | — | applied |  | Basic authentication's user; exclusive with `bearer_token` (V-131). |
+| `password` | string | — | applied |  | Basic authentication's password, a secret. |
+
+## `globals.console.prometheus.tls`
+
+TLS to Prometheus.
+
+| Key | Type | Default | On reload | Rules | Description |
+|---|---|---|---|---|---|
+| `ca` | string | the system's roots | applied |  | The CA certificates the Prometheus server's certificate is checked against. |
 
 ## `pipelines.<name>`
 

@@ -41,6 +41,7 @@ pub(crate) const CLASSES: &[(&str, Mutability)] = &[
     ("globals.cluster.drain_timeout", R),
     ("globals.tracing", R),
     ("globals.azure", Proc),
+    ("globals.console", R),
     ("pipelines.*.name", R),
     // Diffs match pipelines by `id`, so a field-level `id` change never happens (an `id` change is
     // remove + add, §9.1). This entry exists only so `unclassified_paths` covers the path.

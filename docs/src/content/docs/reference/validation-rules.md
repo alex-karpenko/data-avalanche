@@ -131,5 +131,14 @@ A config with any **error** is rejected whole: at startup the node refuses to st
 | <span id="v-123"></span>V-123 | error | `source.postgres.source_change_action` | ∈ {error, re_snapshot}. |
 | <span id="v-124"></span>V-124 | warning | `source.ssl_mode = verify-ca, when source.type = mysql` | The host name is checked too, as with verify-full (DA-SRC-22). |
 | <span id="v-125"></span>V-125 | warning | `globals.api.jwt.jwks_url, globals.api.oauth2.jwks_url and discovery_url` | Not https: the issuer's keys could be swapped on the way (DA-API-16). |
-| <span id="v-126"></span>V-126 | error | `globals.tracing.headers` | Each name an HTTP token, each value visible ASCII, spaces and tabs (DA-OBS-7). |
+| <span id="v-126"></span>V-126 | error | `globals.tracing.headers, globals.console.prometheus.headers` | Each name an HTTP token, each value visible ASCII, spaces and tabs (DA-OBS-7). |
 | <span id="v-127"></span>V-127 | warning | `tables.column_type_overrides keys` | The key's column names no column of its table (on MySQL compared without case, as MySQL compares column names): the override changes nothing (DA-SRC-35). (Emitted at schema resolution.) |
+| <span id="v-128"></span>V-128 | error | `globals.console.session_key` | At least 32 bytes after substitution. |
+| <span id="v-129"></span>V-129 | error | `globals.console.public_url` | An absolute http/https URL without query or fragment. |
+| <span id="v-130"></span>V-130 | error | `globals.console.prometheus.url` | An absolute http/https URL. |
+| <span id="v-131"></span>V-131 | error | `globals.console.prometheus` | basic and bearer_token are exclusive; extra_labels names match [a-zA-Z_][a-zA-Z0-9_]* and don't start with __. |
+| <span id="v-132"></span>V-132 | error | `globals.console durations` | session_ttl 5 min – 7 days; history.retention 1 h – 30 days; events.retention 1 – 400 days. |
+| <span id="v-133"></span>V-133 | error | `globals.api.oauth2.client_secret / scopes` | Need client_id. |
+| <span id="v-134"></span>V-134 | warning | `globals.console.session_key with api.auth ∈ {none, jwt}` | Unused: these modes have no sessions. |
+| <span id="v-135"></span>V-135 | error | `globals.console.enabled = true with api.auth ∈ {basic, oauth2}` | Requires globals.console.session_key. |
+| <span id="v-136"></span>V-136 | error | `globals.console.enabled = true with api.auth = oauth2` | Requires globals.console.public_url and globals.api.oauth2.client_id. |

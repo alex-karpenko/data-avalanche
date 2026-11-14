@@ -688,6 +688,10 @@ mod tests {
                 jwks_url: None,
                 discovery_url: None,
                 roles_claim: "roles".into(),
+                client_id: None,
+                client_secret: None,
+                scopes: Vec::new(),
+                idp_name: None,
             });
             api
         };
@@ -887,6 +891,10 @@ mod tests {
             jwks_url: None,
             discovery_url: Some(format!("{}/.well-known/openid-configuration", idp.url)),
             roles_claim: "roles".into(),
+            client_id: None,
+            client_secret: None,
+            scopes: Vec::new(),
+            idp_name: None,
         };
         api.oauth2 = Some(oauth2(&idp.url));
         let token = bearer(&idp.token(json!(["operator"])));

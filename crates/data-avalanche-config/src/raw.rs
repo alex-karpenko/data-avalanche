@@ -38,6 +38,7 @@ pub(crate) struct RawGlobals {
     pub cluster: Option<RawCluster>,
     pub tracing: Option<RawTracing>,
     pub azure: Option<RawAzure>,
+    pub console: Option<RawConsole>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -78,6 +79,10 @@ pub(crate) struct RawApiOauth2 {
     pub jwks_url: L<String>,
     pub discovery_url: L<String>,
     pub roles_claim: L<String>,
+    pub client_id: L<String>,
+    pub client_secret: L<String>,
+    pub scopes: Option<Vec<Leaf<String>>>,
+    pub idp_name: L<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -141,6 +146,51 @@ pub(crate) struct RawTracing {
 #[serde(deny_unknown_fields)]
 pub(crate) struct RawAzure {
     pub account_name: L<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawConsole {
+    pub enabled: L<bool>,
+    pub session_key: L<String>,
+    pub public_url: L<String>,
+    pub session_ttl: L<Duration>,
+    pub username_claim: L<String>,
+    pub history: Option<RawRetention>,
+    pub events: Option<RawRetention>,
+    pub prometheus: Option<RawPrometheus>,
+}
+
+/// `globals.console.history` and `globals.console.events`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawRetention {
+    pub retention: L<Duration>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawPrometheus {
+    pub url: L<String>,
+    pub basic: Option<RawBasic>,
+    pub bearer_token: L<String>,
+    pub headers: Option<BTreeMap<String, Leaf<String>>>,
+    pub tls: Option<RawCa>,
+    pub extra_labels: Option<BTreeMap<String, Leaf<String>>>,
+    pub timeout: L<Duration>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawBasic {
+    pub user: L<String>,
+    pub password: L<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawCa {
+    pub ca: L<String>,
 }
 
 // ---- pipelines and defaults (§7, §9) ----

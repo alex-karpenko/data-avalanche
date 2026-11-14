@@ -43,6 +43,7 @@ pub struct Globals {
     pub cluster: Cluster,
     pub tracing: Tracing,
     pub azure: Azure,
+    pub console: Console,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -117,6 +118,13 @@ pub struct ApiOauth2 {
     pub jwks_url: Option<String>,
     pub discovery_url: Option<String>,
     pub roles_claim: String,
+    /// The web console's client at the provider (§6.3.1); token verification doesn't use it.
+    pub client_id: Option<String>,
+    /// Only for a client the provider registered as confidential.
+    pub client_secret: Option<Secret>,
+    pub scopes: Vec<String>,
+    /// The provider's name on the sign-in page; `None` shows the issuer's host.
+    pub idp_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -181,6 +189,51 @@ pub struct Tracing {
 pub struct Azure {
     /// `None` = from the credential chain.
     pub account_name: Option<String>,
+}
+
+/// `globals.console` (§6.8): the web console under `/ui/`, and the retention of the events and
+/// the chart history it reads (recorded whether it is on or off).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Console {
+    pub enabled: bool,
+    /// Encrypts and signs the session cookie (`basic`, `oauth2`).
+    pub session_key: Option<Secret>,
+    pub public_url: Option<String>,
+    #[serde(serialize_with = "ser_duration")]
+    pub session_ttl: Duration,
+    pub username_claim: String,
+    pub history: Retention,
+    pub events: Retention,
+    /// `None`: the built-in history only.
+    pub prometheus: Option<Prometheus>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Retention {
+    #[serde(serialize_with = "ser_duration")]
+    pub retention: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Prometheus {
+    pub url: String,
+    pub auth: PrometheusAuth,
+    /// Sent with every query; the values are secrets.
+    pub headers: BTreeMap<String, Secret>,
+    /// `None`: the system's roots.
+    pub ca: Option<Pem>,
+    /// Matchers added to every query: `name="value"`.
+    pub extra_labels: BTreeMap<String, String>,
+    #[serde(serialize_with = "ser_duration")]
+    pub timeout: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PrometheusAuth {
+    None,
+    Basic { user: String, password: Secret },
+    Bearer { token: Secret },
 }
 
 // ---- pipelines ----
