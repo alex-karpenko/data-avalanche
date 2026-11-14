@@ -103,7 +103,7 @@ pub fn duckdb_read(url: &str) -> (Vec<String>, Vec<String>, Vec<Vec<Option<Strin
             "run",
             "--no-project",
             "--with",
-            "duckdb==1.5.6",
+            "duckdb==2.0.0",
             "python",
             script,
             url,

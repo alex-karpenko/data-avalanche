@@ -404,7 +404,7 @@ mod tests {
     impl CommitGuard for Lapses {
         fn may_commit(&self) -> bool {
             self.0
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok()
         }
     }

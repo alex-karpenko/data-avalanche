@@ -39,7 +39,7 @@ Work style: **plan-driven, test-first implementation**, with the design kept ali
 ```
 data-avalanche/
 ├── CLAUDE.md                                     ← this file
-├── Cargo.toml, Cargo.lock, rust-toolchain.toml   Cargo workspace (members crates/*), toolchain 1.98.1
+├── Cargo.toml, Cargo.lock, rust-toolchain.toml   Cargo workspace (members crates/*), toolchain 1.100.0
 ├── crates/                                       the application (roadmap §2 has the full target layout)
 │   ├── data-avalanche-core/                      domain types: values, events, positions, tables (no I/O)
 │   ├── data-avalanche-config/                    YAML config: parse, resolve, merge, V-rules, reload diff
@@ -171,14 +171,14 @@ checkbox, release note) is never proof: verify against the compiled crate or a r
 - **PostgreSQL:** logical replication via `pgoutput`, WAL/LSN, replication slots, publications
 - **MySQL:** binlog / GTID-set, row-based replication (`binlog_row_image = FULL`); MariaDB via the
   MySQL path — **in v1** (D-V1.5; GTID dialect proven, S-MY9)
-- **Client crates (proven 2026-09-26, `prototypes/source-capability/`):** PG `pgwire-replication =0.4.1`
+- **Client crates (proven 2026-09-26, `prototypes/source-capability/`):** PG `pgwire-replication =0.5.0`
   is transport-only — **the pgoutput decoder is ours**; MySQL/MariaDB `mysql_async =0.37.1` binlog stream
   (+ own MariaDB `GTID_EVENT` decode, + payload guard DA-SRC-12). Install one rustls `CryptoProvider`
   at process start (two providers are linked — DA-DEP-5).
 
 ### In-memory format and the sink boundary
-- **Apache Arrow** `RecordBatch` — columnar; a **single arrow major** workspace-wide (arrow 59:
-  deltalake 1.0 + iceberg-rust `main`/0.11)
+- **Apache Arrow** `RecordBatch` — columnar; a **single arrow major** workspace-wide (arrow 59 as
+  deltalake 1.1 resolves it; iceberg-rust 0.11 is on 58, `main` on 60 — tracker §66)
 - **`ColumnValue` enum** — source-decoded value (incl. `UInt64`, tz-flagged `Timestamp`, `Time`,
   typed `Array`)
 - **Collapse** (keep-last by per-change `_seq`, ≤1 delete + ≤1 upsert per key) happens in the core;
@@ -190,7 +190,7 @@ checkbox, release note) is never proof: verify against the compiled crate or a r
 - **`Sink` trait:** `table_state`, `ensure_table`, `evolve` (Applied / Degraded / Unsupported→halt),
   `commit` (atomic per table, idempotent, fenced by `owner_epoch`); declared **capabilities** checked
   at pipeline start
-- **Delta Lake (delta-rs 1.0, DataFusion):** one MERGE per table per flush; fence = `txn`
+- **Delta Lake (delta-rs 1.1, DataFusion):** one MERGE per table per flush; fence = `txn`
   app-transaction; position = `commitInfo` + own-commit walk-back; truncate = metadata-only delete;
   S3 commits via conditional PUT (no DynamoDB); column mapping **off** (it blocks ADD COLUMN); no
   drop/rename/widen → soft-drop / halt; cost ∝ files touched (random-key churn ≈ full rewrite —
@@ -235,6 +235,13 @@ Non-trivial cases: `TINYINT(1)` boolean detection via `information_schema`; `BIG
 
 - **`main` is off limits.** Never commit to, push to or merge into `main`. This is strictly
   prohibited. Oleksii merges every PR himself.
+- **Every release refreshes its dependencies.** Before a release's version bump, move everything
+  `cargo xtask deps` lists to its newest stable version, or hold it in `dependency-exceptions.yaml`
+  with the reason it can't move. `release.yml` refuses a tag while `cargo xtask deps --check` fails.
+  The release also drops every `.cargo/audit.toml` exception nothing matches any more and re-checks
+  the rest (`cargo xtask audit`); `release.yml` also refuses a tag while `cargo xtask audit --check`
+  fails.
+  The checklist is `doc/v1.0/README.md` (Releases).
 - **One milestone, one branch, one PR.** Every milestone's planning and implementation happen on
   one branch cut from the current `origin/main` (`git fetch` first), named
   `feat/claude/m<n>-<topic>`. The branch ends as one PR against `main`. The flow, with its pauses:

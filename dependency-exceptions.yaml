@@ -1,0 +1,18 @@
+# Dependency exceptions (1.0.1's rule): every release takes the newest stable version of everything.
+# Where a newer version cannot be used yet, the hold is written here with its reason, and checked
+# again at the next release (`cargo xtask deps --check`, run by release.yml).
+#
+# An entry names what is held (kind, name), the version it is held at (`held`: a version prefix at a
+# version boundary, so "59" matches 59.3.2; or "*" for every version of that name), and why. A hold
+# that no longer holds anything back (the newest version is the one in use, or nothing pins that
+# name any more; "*" holds never go stale) is stale and fails the check: delete it.
+- { kind: crate, name: arrow-array, held: "59", reason: "deltalake-core 1.1.4 requires arrow ^59; one arrow major workspace-wide, D-MS.14" }
+- { kind: crate, name: arrow-buffer, held: "59", reason: "deltalake-core 1.1.4 requires arrow ^59; one arrow major workspace-wide, D-MS.14" }
+- { kind: crate, name: arrow-cast, held: "59", reason: "deltalake-core 1.1.4 requires arrow ^59; one arrow major workspace-wide, D-MS.14" }
+- { kind: crate, name: arrow-row, held: "59", reason: "deltalake-core 1.1.4 requires arrow ^59; one arrow major workspace-wide, D-MS.14" }
+- { kind: crate, name: arrow-schema, held: "59", reason: "deltalake-core 1.1.4 requires arrow ^59; one arrow major workspace-wide, D-MS.14" }
+- { kind: crate, name: arrow-select, held: "59", reason: "deltalake-core 1.1.4 requires arrow ^59; one arrow major workspace-wide, D-MS.14" }
+- { kind: crate, name: mysql_common, held: "0.37", reason: "mysql_async 0.37.1, the newest, requires mysql_common ^0.37" }
+- { kind: image, name: postgres, held: "*", reason: "the source support matrix, not a build dependency; widening it is a feature" }
+- { kind: image, name: mysql, held: "*", reason: "the source support matrix, not a build dependency; widening it is a feature" }
+- { kind: image, name: mariadb, held: "*", reason: "the source support matrix, not a build dependency; widening it is a feature" }

@@ -1,6 +1,10 @@
-//! `cargo xtask docs` writes the documentation site's generated pages; `cargo xtask docs --check`
-//! exits 1, naming them, when a committed copy differs. `cargo xtask bench|chaos|soak` runs an
-//! acceptance run (M12c) and says where its measurements are.
+//! The repository's dev tool. `cargo xtask docs` writes the documentation site's generated pages;
+//! `--check` exits 1, naming them, when a committed copy differs. `cargo xtask bench|chaos|soak`
+//! runs an acceptance run (M12c) and says where its measurements are. `cargo xtask deps` checks
+//! every pinned dependency against its registry; `--check` exits 1 unless each is current,
+//! floating or held, and no exception is stale. `cargo xtask audit` checks the RustSec advisories
+//! against `.cargo/audit.toml`; `--check` exits 1 on an unaccepted advisory or a stale exception.
+//! Either command exits 1 without `--check` only when it cannot produce a full report.
 
 use std::process::{Command, ExitCode};
 
@@ -9,9 +13,15 @@ fn main() -> ExitCode {
     let check = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["docs"] => false,
         ["docs", "--check"] => true,
+        ["deps"] => return deps(false),
+        ["deps", "--check"] => return deps(true),
+        ["audit"] => return audit(false),
+        ["audit", "--check"] => return audit(true),
         [run] if xtask::RUNS.contains(&run) => return acceptance(run),
         _ => {
-            eprintln!("usage: cargo xtask docs [--check] | bench | chaos | soak");
+            eprintln!(
+                "usage: cargo xtask docs [--check] | deps [--check] | audit [--check] | bench | chaos | soak"
+            );
             return ExitCode::from(2);
         }
     };
@@ -38,6 +48,51 @@ fn main() -> ExitCode {
         eprintln!("{} is stale: run `cargo xtask docs`", path.display());
     }
     ExitCode::FAILURE
+}
+
+/// Checks every pinned dependency against its registry (`dependency-exceptions.yaml` holds the
+/// written exceptions); with `check`, exits 1 unless the report passes.
+fn deps(check: bool) -> ExitCode {
+    let root = xtask::repo_root();
+    let exceptions = match xtask::deps::exceptions(&root) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let report = xtask::deps::check(&root, &xtask::deps::Live::new(), &exceptions);
+    for line in report.lines() {
+        println!("{line}");
+    }
+    // One rule for both commands: no full report (an unreadable inventory) exits 1 even without
+    // `--check`; a failing verdict exits 1 only with it.
+    if report.incomplete() || (check && !report.passes()) {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Audits `Cargo.lock` against `.cargo/audit.toml`; with `check`, exits 1 unless the report passes.
+fn audit(check: bool) -> ExitCode {
+    let report = match xtask::audit::run(&xtask::repo_root()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    for line in report.lines() {
+        println!("{line}");
+    }
+    // A report that could not be produced exits 1 above; a failing verdict exits 1 only with
+    // `--check`, as for `deps`.
+    if check && !report.passes() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 /// Runs `run` (`cargo xtask bench|chaos|soak`), its exit code the test run's.

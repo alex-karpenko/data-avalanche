@@ -91,7 +91,7 @@ in three buckets:
 
 | ID | Title | Why it blocks |
 |---|---|---|
-| ~~DA-SINK-1~~ → re-scoped 2026-09-26 | *No longer a system blocker — see the multi-sink note below.* **iceberg-rust cannot commit deletes/overwrites — the MOR-equality-delete sink (and its COW fallback) is not buildable on any published version** | Confirmed 2026-06 on 0.9.1, rechecked 2026-07-22 on 0.10.0, rechecked 2026-08-23 on 0.10.1, **rechecked 2026-09-19 on compiled 0.10.1 and the v0.11.0-rc.1/rc.2 surfaces — still true**: `EqualityDeleteFileWriter` exists but the `Transaction` API is **append-only** (`fast_append` data files + metadata actions; no row-delta/overwrite/rewrite/merge-append). A CDC sink that applies UPDATE/DELETE cannot be built on the current public API. Upstream epic apache/iceberg-rust#2186 is **open**; the §24.2.3 "`OverwriteAction` merged" reading is **retracted** (PR #2185 is open/unmerged — §24.2.4). **The sink spec must gate on a future iceberg-rust version or adopt §24.2.1 option 2–4.** *(G-13 §8; details §24.2.1, rechecks §24.2.2/§24.2.3, latest §24.2.4)* |
+| ~~DA-SINK-1~~ → re-scoped 2026-09-26 | *No longer a system blocker — see the multi-sink note below.* **iceberg-rust cannot commit deletes/overwrites — the MOR-equality-delete sink (and its COW fallback) is not buildable on any published version** | Confirmed 2026-06 on 0.9.1, rechecked 2026-07-22 on 0.10.0, rechecked 2026-08-23 on 0.10.1, **rechecked 2026-09-19 on compiled 0.10.1 and the v0.11.0-rc.1/rc.2 surfaces — still true**, **rechecked 2026-11-13 on the published 0.11.0 and `main` — still true (§66)**: `EqualityDeleteFileWriter` exists but the `Transaction` API is **append-only** (`fast_append` data files + metadata actions; no row-delta/overwrite/rewrite/merge-append). A CDC sink that applies UPDATE/DELETE cannot be built on the current public API. Upstream epic apache/iceberg-rust#2186 is **open**; the §24.2.3 "`OverwriteAction` merged" reading is **retracted** (PR #2185 is open/unmerged — §24.2.4). **The sink spec must gate on a future iceberg-rust version or adopt §24.2.1 option 2–4.** *(G-13 §8; details §24.2.1, rechecks §24.2.2/§24.2.3, latest §24.2.4)* |
 
 > **MULTI-SINK RE-SCOPE (2026-09-26) — no system-level 🔴 remains on paper.**
 > `research/Multi_Sink_Architecture_and_Delta_Lake.md` (decisions D-MS.1–D-MS.14 signed off) makes the
@@ -896,6 +896,95 @@ M12c merged (PR #22, `81ce996`), its CI and `cloud.yml` green, and `v1.0.0` tagg
 report is `doc/v1.0/v1-acceptance.md`. No gap opened or closed: the open count stays 0 (v1), and
 the ⏭ v2 rows (the Iceberg sink's, DA-SRC-31) are the next version's backlog.
 
+## 66. iceberg-rust recheck — still append-only (2026-11-13)
+
+Rechecked against the published `iceberg` **0.11.0** crate (crates.io, 2026-11-03; MSRV 1.95) and
+upstream `main` at `fa961f5c` (2026-11-13). **The Iceberg sink stays blocked: v2 waits for a
+release that commits deletes.**
+
+- **DA-SINK-1i (G1).** 0.11.0's `Transaction` has the same actions as 0.10.1: `fast_append`,
+  `update_schema`, `update_table_properties`, `replace_sort_order`, `update_location`,
+  `update_statistics`, `upgrade_table_version`, `expire_snapshots`. `fast_append` refuses delete
+  files ("Only data content type is allowed for fast append"). `main` has the same public actions.
+  Groundwork merged on `main` only (not in 0.11.0): the stateful `TransactionAction` (RFC #2620,
+  #3265), a snapshot operation that reports removed files (#3253), a simple snapshot producer
+  (#3474), and a copy-on-write rewrite primitive `iceberg::cow_rewrite` (#2752, merged 2026-10-01 —
+  correcting the probe README, which had it open), which writes replacement files but "does not
+  commit metadata by itself". In flight, all open: #3564 MergingSnapshotProducer (changes
+  requested), #3300 overwrite action on it (changes requested; continues the closed #2185), #2203
+  RowDelta (awaiting review — the MOR path), #3046 RewriteFiles (awaiting review). Epic #2186 open.
+- **DA-CAT-6.** HMS `update_table` still returns `FeatureUnsupported` (0.11.0 and `main`).
+- **DA-CAT-7.** `main` has a SigV4 request signer (`SigV4Signer`, #3082, merged 2026-10-09; not in
+  0.11.0). The auth manager (#3092) and enabling it from catalog properties (#2660, draft) are
+  open, so `rest.auth: sigv4` is still not configurable through the catalog.
+- **DA-SCHEMA-8.** `UpdateSchemaAction` has `add_column` and `delete_column` (0.11.0 and `main`); no
+  rename, no type promotion.
+- **DA-TYPE-5.** `main` folds the Arrow `arrow.uuid` extension type into an Iceberg `uuid`; 0.11.0
+  doesn't.
+- **DA-SINK-10.** Still `expire_snapshots` only; the COW primitive has no rewrite-files commit yet
+  (#3046 open).
+- **DA-DEP-1 — a new constraint.** 0.11.0 builds on arrow **58**, `main` on arrow **60**; the
+  workspace is on arrow **59** (deltalake 1.0 and 1.1.x both require 59). No iceberg-rust release
+  shares the workspace's arrow major, so v2 also needs a deltalake on the same arrow major as the
+  iceberg release it pins (D-MS.14, one arrow major).
+
+Next recheck: when #3564 and #3300 merge (the COW mirror), and when #2203 merges (the MOR default);
+then run G1 from `prototypes/iceberg-capability/README.md` against `main`. No count changes: the
+rows stay ⏭ v2.
+
+## 67. 1.0.1 dependency refresh — the plan (2026-11-13)
+
+`doc/v1.0/v1.0.1-dependency-refresh.md`: every dependency to its newest stable version, and a release
+gate (`cargo xtask deps --check` in `release.yml`) with written holds in `dependency-exceptions.yaml`.
+Verified in scratch: Rust 1.100.0 needs two `fetch_update` → `try_update` renames; deltalake 1.1
+compiles unchanged and now reports the truncate-vs-OPTIMIZE race as a conflict itself (probe P11a's
+gap in 1.0; our post-DELETE check stays as a backstop); pgwire-replication 0.5, serde-saphyr 2,
+sqlparser 0.64, prometheus-client 0.26, base64 0.23 and getrandom 0.4 compile unchanged with their
+suites green. Held: arrow 60 (deltalake-core 1.1.4 requires `^59`), mysql_common 0.38 (mysql_async
+0.37.1 requires `^0.37`). No gap opened or closed.
+
+## 68. 1.0.1 dependency refresh — executed (2026-11-13)
+
+`doc/v1.0/v1.0.1-dependency-refresh.md` built and re-run (`v1-acceptance.md`, "1.0.1 re-run", at
+`baceeb4`).
+
+- **The moves.** Rust 1.98.1 → 1.100.0 (two `fetch_update` → `try_update` renames, in test code); deltalake 1.1
+  (`=1.1.2`, `deltalake-core =1.1.4`); pgwire-replication 0.5, serde-saphyr 2, sqlparser 0.64,
+  prometheus-client 0.26, base64 0.23, getrandom 0.4; jsonwebtoken 12 (`EncodingKey::from_secret` now
+  returns a `Result`, which a test unwraps; no auth check changed); the compatible bumps in
+  `Cargo.lock`; the CI tools (`prom/prometheus` v3.16.0, and the Dockerfile's `# syntax` frontend
+  1.29, both found behind by the whole-branch review: the inventory now reads `docker run` images in
+  workflow steps and the `# syntax` line), the test-infra images, DuckDB 2.0 (a Delta table under a
+  non-ASCII path now reads); the docs
+  site (Starlight 0.43.1, Astro 7.4.12, Mermaid 12.3, Node 26 LTS; the first two released the day
+  of the re-run, `e61846b`). Version `1.0.1`.
+- **The holds** (`dependency-exceptions.yaml`): the arrow crates at 59 (deltalake-core 1.1.4
+  requires `^59`; one arrow major workspace-wide, D-MS.14), mysql_common at 0.37 (mysql_async 0.37.1,
+  the newest, requires `^0.37`), and the postgres, mysql and mariadb images (the source support
+  matrix, not a build dependency).
+- **The delta-rs conflict fix.** deltalake 1.1 reports the truncate's OPTIMIZE race as a conflict
+  itself (the gap in 1.0 that probe P11a found); the truncate-vs-OPTIMIZE test now asserts the
+  retry, and our `num_files()` check after the DELETE stays as a backstop (`e04cc73`).
+- **The rule.** Every release refreshes its dependencies: `cargo xtask deps` lists each pinned
+  dependency against its registry, `cargo xtask deps --check` fails on one that is neither current
+  nor held, and `release.yml` refuses a tag while it fails (`CLAUDE.md`, Implementation workflow;
+  the checklist in `doc/v1.0/README.md`, Releases).
+- **The audit exceptions.** `cargo xtask audit` compares `cargo audit`'s advisories (no ignores
+  applied) with `.cargo/audit.toml`; the stale pin-utils exception (RUSTSEC-2026-0441: this
+  release's AWS SDK bumps dropped it from `Cargo.lock`) is gone, and `release.yml` refuses a tag
+  while `cargo xtask audit --check` fails (an unaccepted advisory included). Three stay: quick-xml
+  0.39.4 (RUSTSEC-2026-0194, -0195) and proc-macro-error2 2.0.1 (RUSTSEC-2026-0173).
+- **What is unchanged.** The E2E 51/51 on each source (on PostgreSQL one scenario, the failover
+  slot's, self-skips locally and is proven by PR CI); bench 3/3 and chaos 4/4 on each source, with
+  the D-V1.3 targets met as before (p99 30.8 / 30.6 s, failover 53.5 / 52.3 s). The test count rose
+  only with the new xtask tests (1523 with the ITs at the re-run; 1535 hermetic at the end). The
+  churn MERGE's mean time fell to 1.07 / 1.03 s (1.18 / 1.38 s in 1.0.0), its bytes and files per
+  MERGE unchanged; the site's figures now quote it. The 24 h soak was not re-run (D-R6): no product
+  code changed beyond a comment and a retry message in `sink.rs`, but the engine (deltalake 1.1 and
+  DataFusion) did move, and bench and chaos are the compensating evidence.
+
+No gap opened or closed; the ⏭ v2 rows stay.
+
 ---
 
 ### Counts (by status)
@@ -907,7 +996,7 @@ the ⏭ v2 rows (the Iceberg sink's, DA-SRC-31) are the next version's backlog.
 > M7a's plan (§32), 2026-10-16 for M7a's exit (§33), 2026-10-17 for M7b's plan (§34),
 > 2026-10-20 for M7b's exit (§35), 2026-10-21 for M8a's plan (§36), 2026-10-22 for M8a's exit (§37),
 > 2026-10-22 for M8b's plan (§38), 2026-10-23 for M8b's exit (§39), 2026-10-23 for M9a's plan
-> (§40), 2026-10-23 for M9a's exit (§41), 2026-10-27 for M9b's plan (§42), 2026-10-28 for M9b's exit (§43), 2026-10-28 for M10's plan (§44), and 2026-10-29 for M10's exit (§45), and 2026-10-29 for M11a's plan (§46), and 2026-10-29 for M11a's whole-branch review (§47), and 2026-10-29 for M11a's exit (§48), and 2026-10-29 for M11b's plan (§49), and 2026-10-30 for M11b's pages (§50), and 2026-10-30 for M11b's exit and v0.1.0 (§51), and 2026-10-30 for M12a's plan (§52), and 2026-11-04 for M12a's gaps closed (§53), and 2026-11-04 for M12a's whole-branch review (§54), and 2026-11-04 for M12a's exit (§55), and 2026-11-06 for M12b's gaps closed (§57), and 2026-11-06 for M12b's exit (§58), and 2026-11-06 for M12d's plan (§59), and 2026-11-10 for M12d's gaps closed (§60), and 2026-11-11 for M12d's whole-branch review (§61), and 2026-11-11 for M12d's exit (§62), and 2026-11-11 for M12c's gaps closed (§63), and 2026-11-13 for M12c's acceptance runs (§64, no change), and 2026-11-13 for v1.0.0's release (§65, no change).
+> (§40), 2026-10-23 for M9a's exit (§41), 2026-10-27 for M9b's plan (§42), 2026-10-28 for M9b's exit (§43), 2026-10-28 for M10's plan (§44), and 2026-10-29 for M10's exit (§45), and 2026-10-29 for M11a's plan (§46), and 2026-10-29 for M11a's whole-branch review (§47), and 2026-10-29 for M11a's exit (§48), and 2026-10-29 for M11b's plan (§49), and 2026-10-30 for M11b's pages (§50), and 2026-10-30 for M11b's exit and v0.1.0 (§51), and 2026-10-30 for M12a's plan (§52), and 2026-11-04 for M12a's gaps closed (§53), and 2026-11-04 for M12a's whole-branch review (§54), and 2026-11-04 for M12a's exit (§55), and 2026-11-06 for M12b's gaps closed (§57), and 2026-11-06 for M12b's exit (§58), and 2026-11-06 for M12d's plan (§59), and 2026-11-10 for M12d's gaps closed (§60), and 2026-11-11 for M12d's whole-branch review (§61), and 2026-11-11 for M12d's exit (§62), and 2026-11-11 for M12c's gaps closed (§63), and 2026-11-13 for M12c's acceptance runs (§64, no change), and 2026-11-13 for v1.0.0's release (§65, no change), and 2026-11-13 for the iceberg-rust recheck (§66, no change), and 2026-11-13 for 1.0.1's plan (§67, no change), and 2026-11-13 for 1.0.1's execution (§68, no change).
 
 | Status | Count (v1 scope) | Notes |
 |---|---|---|
@@ -998,7 +1087,7 @@ and per-column overrides. Essentially complete; residual items are spec-merge an
 | DA-TYPE-2 | `ColumnValue` enum extensions (tz flag, typed `Array`, `Time`, `UInt64`) | 🟡 | ✅ | `Type_Mapping.md` §extensions; reflected in `Data-Flow.md` enum. | G-NEW-22 |
 | DA-TYPE-3 | `BIGINT UNSIGNED` / `numeric(P>38)` overflow handling | 🟡 | ✅ | `decimal(20,0)` for the former; `numeric_overflow_action: string\|error` for the latter. | — |
 | DA-TYPE-4 | `TINYINT(1)`→bool detection requiring `information_schema` | 🟢 | ✅ | `tinyint1_as_bool` + `tinyint1_detection`; G-NEW-21 dropped the stale events-mode warning. | G-NEW-21 |
-| DA-TYPE-5 | `FixedSizeBinary(16)` → Iceberg `uuid` needs explicit iceberg-rust annotation | 🟢 | ⏭ v2 | `Type_Mapping.md` Hop-3 table flags this as the one Arrow type needing a field-level `{"iceberg.type":"uuid"}` hint — verify the mechanism exists in the pinned crate. See §21. **2026-09-26 tidy:** Iceberg-sink only — deferred with the Iceberg sink to v2. | — |
+| DA-TYPE-5 | `FixedSizeBinary(16)` → Iceberg `uuid` needs explicit iceberg-rust annotation | 🟢 | ⏭ v2 | `Type_Mapping.md` Hop-3 table flags this as the one Arrow type needing a field-level `{"iceberg.type":"uuid"}` hint — verify the mechanism exists in the pinned crate. See §21. **2026-09-26 tidy:** Iceberg-sink only — deferred with the Iceberg sink to v2. **2026-11-13 (§66):** `main` maps the Arrow `arrow.uuid` extension type to Iceberg `uuid`; 0.11.0 doesn't. | — |
 | DA-TYPE-6 | Merge the four TYPE config fields + 4 validation rules into the master table | 🟢 | ✅ | Already largely done (V-078..V-082 present); confirm `column_type_overrides`, `numeric_overflow_action`, `toast_strategy`, `tinyint1_*` all merged (G-NEW-21). Verified 2026-09-26: V-078…V-082 present; V-078 now uses the sink-neutral logical type grammar. | G-NEW-21 |
 | DA-TYPE-7 | TOAST unchanged-column strategy (`carry_forward` vs `re_query`) | 🟡 | ✅ | `source.toast_strategy` (PG only); V-077/V-080. Re-query pool-saturation is a warning, not a halt. | — |
 
@@ -1021,7 +1110,7 @@ resume), idempotent replay, and rename resolution. The MySQL classifier is separ
 | DA-SCHEMA-5 | Channel-C/A/D require SELECT on `information_schema`/catalogs | 🟡 | ✅ | §9 precondition; checked at pipeline start (runtime, not config). Reuse replication creds. | DT-R8 |
 | DA-SCHEMA-6 | `method` field removed; detection is fixed four-channel model | 🟢 | ✅ | §10; config V-024/V-031/V-032 deleted, `interval`→`rescan_interval`. | DT-R1 |
 | DA-SCHEMA-7 | ENUM/SET representation (string vs ordinal) | 🟢 | ✅ | `ENUM→string`, `SET→list<string>`; append-only value adds Ignorable, reorder/remove Unsafe. | DT-R5 |
-| DA-SCHEMA-8 | iceberg-rust drop/rename/type-promotion support | 🟡 | ⏭ v2 | §7.1 implementation note — only `add_column` is mature; **verify** drop/rename/promotion against the pinned crate, route unsupported ops to halt. See §21. **2026-09-26 tidy:** Iceberg-sink only — deferred with the Iceberg sink to v2. | — |
+| DA-SCHEMA-8 | iceberg-rust drop/rename/type-promotion support | 🟡 | ⏭ v2 | §7.1 implementation note — only `add_column` is mature; **verify** drop/rename/promotion against the pinned crate, route unsupported ops to halt. See §21. **2026-09-26 tidy:** Iceberg-sink only — deferred with the Iceberg sink to v2. **2026-11-13 (§66):** `add_column` and `delete_column` only; no rename or promotion. | — |
 | DA-SCHEMA-9 | Idempotent DDL replay + checkpoint-after-evolve ordering | 🟡 | ✅ | §8.3 — re-read live Iceberg schema, skip if already applied; advance offset only after schema commit. | — |
 | DA-SCHEMA-10 | 🆕 MySQL's baseline halted a table whose columns changed | 🟡 | ✅ | §42.1. MySQL's channel C refused the column hint Phase 0's baseline passes, so a fresh start (or a job clearing a halt) halted the table `UNSAFE_DDL` instead of baselining it (§8.2). Fixed in M9b Task 2 (a column hint is the whole table, no rename proven). **✅ 2026-10-28** — M9b merged (PR #14, `90b114c`), its CI green on every MySQL target (§43). | — |
 
@@ -1148,7 +1237,7 @@ writer's correctness literally depends on.
 | DA-SINK-7 | Large-transaction vs txn-atomic-flush tension | 🟡 | ✅ | `Large_Transaction…` (G-29) — bounded split commits (default off → atomic), `max_transaction_buffer_bytes` halt-backstop; crash-safe via idempotency. | G-29 |
 | DA-SINK-8 | Spill-to-disk for oversized txns | 🟢 | ✅ (deferred) | `Large_Transaction…` §5 — future `sink.large_txn_mode: split\|spill`; out of scope for v1. **✅ 2026-09-26 — deferral confirmed (`V1_Scope_Decisions.md` §2).** | G-29 §5 |
 | DA-SINK-9 | Iceberg maintenance ownership (compaction/expiry/orphans) | 🟢 | ✅ | `Iceberg_Maintenance…` (G-25) — external for v1; app exposes signals + reserves `sink.maintenance`; built-in gated on iceberg-rust rewrite support. | G-25 |
-| DA-SINK-10 | iceberg-rust compaction/rewrite API availability | 🟢 | ⏭ v2 | Gates any **future** built-in maintenance (deferred anyway). Verify against pinned crate. **2026-09-26 tidy:** Iceberg-sink only — deferred with the Iceberg sink to v2. | G-25 §14 |
+| DA-SINK-10 | iceberg-rust compaction/rewrite API availability | 🟢 | ⏭ v2 | Gates any **future** built-in maintenance (deferred anyway). Verify against pinned crate. **2026-09-26 tidy:** Iceberg-sink only — deferred with the Iceberg sink to v2. **2026-11-13 (§66):** a COW rewrite primitive is on `main` (#2752), with no rewrite-files commit (#3046 open). | G-25 §14 |
 | DA-SINK-11 | Exactly-once vs at-least-once into Iceberg | 🟡 | ✅ | Effectively exactly-once-effect via idempotency (DEDUP) + position guard; at-least-once delivery, dedup absorbs replays. | OQ-IC3 |
 | DA-SINK-12 | 🆕 A case-only `ADD COLUMN` loops the evolver | 🟢 | ✅ | §54.1. delta-rs rejects an `ADD COLUMN` matching a Delta column by case alone as a duplicate; transient, so the evolver retries without end. Predates M12a. Candidate: `missing_columns`' case rule in the evolver, halting `SCHEMA_MISMATCH`, after measuring delta-rs's case folding (ASCII or Unicode). **✅ 2026-11-10 (§60):** wider than recorded: a table created with two such columns looped too. `core::differ_by_case_alone` (Unicode `to_lowercase`, as `buoyant_kernel` 0.28.1 folds; `delta_rs_refuses_a_column_beside_one_that_differs_by_unicode_case`): `create` refuses a case clash `Permanent` (`SINK_REJECTED`, `a_table_whose_columns_differ_by_case_alone_is_refused`), `evolve` returns `Unsupported` naming both spellings (`EVOLUTION_UNSUPPORTED`, `a_column_that_differs_from_one_by_case_alone_is_unsupported`), `missing_columns` halts `SCHEMA_MISMATCH` (`a_sink_column_matching_by_case_alone_halts`); Schema_Change §7.2 (P-4) | — |
 
@@ -1284,7 +1373,7 @@ pinning is the remaining cross-cutting concern.
 | DA-OPS-8 | Per-node literals in a node's own file are ignored once a generation exists | 🟢 | ✅ | §36.1, §38. A node runs the cluster's generation resolved with its own environment (D-3); per-node values go through `${VAR}` (config §6.5.1). M8b warns at startup naming each per-node key that differs, and which value runs; the operator docs stay with M11. **✅ 2026-10-30 (§50):** the operator docs say it, in `configuration/cluster.md` and `runbooks/config-changes.md`: the gossip addresses (`bind_addr`, `bind_port`, `advertise_addr`, `advertise_port`) are the generation's, so a literal there is ignored with a warning; `node_name` and `api.address` are the node's file's. | — |
 | DA-OPS-7 | A controller task that panics goes unnoticed | 🟢 | ✅ | ✅ 2026-10-22 (§37): the reconciler supervises its controllers. One that ended unasked (a panic, a return) is logged and started again on its status channel, and a dropped reconciler counts as a crash; the owned-pipelines gauge is held by a guard, so a panic doesn't over-count it. Readiness after a controller panic is not in M8a (DA-OPS-7's other half: M10). M8a Task 6 (D-M8a.11, `a_controller_that_panics_is_started_again`) | — |
 | DA-OPS-6 | "Restart ≠ apply config" operator footgun | 🟢 | ✅(documented) | Clustering §9.3 D-3 — cloud-generation-wins; a pod restart does **not** apply ConfigMap edits, only `POST /reload` does. Document loudly. | D-3 |
-| DA-DEP-1 | iceberg-rust pinned version & capabilities | 🟡 | ⏭ v2 | `iceberg` 0.10.1, MSRV 1.94 (main has moved to 1.95, #3083; Sources_Index needs refreshing from 1.92). Multiple capability gates ride on the exact version: DA-SINK-1, DA-SINK-2, DA-SCHEMA-8, DA-TYPE-5, DA-SINK-10. Pin and assert at startup. **2026-09-26 tidy:** Iceberg-sink only — deferred with the Iceberg sink to v2. | — |
+| DA-DEP-1 | iceberg-rust pinned version & capabilities | 🟡 | ⏭ v2 | `iceberg` 0.10.1, MSRV 1.94 (main has moved to 1.95, #3083; Sources_Index needs refreshing from 1.92). Multiple capability gates ride on the exact version: DA-SINK-1, DA-SINK-2, DA-SCHEMA-8, DA-TYPE-5, DA-SINK-10. Pin and assert at startup. **2026-09-26 tidy:** Iceberg-sink only — deferred with the Iceberg sink to v2. **2026-11-13 (§66):** iceberg 0.11.0 is MSRV 1.95 on arrow 58, `main` on arrow 60; the workspace is on arrow 59 — no release shares it. | — |
 | DA-DEP-2 | OpenDAL version exposing conditional writes | 🔴 | ✅ | Clustering §17.2 — `if_match` on writes landed late-2024/early-2025; the `iceberg-storage-opendal` transitive pin must be ≥ that, and capabilities asserted at startup (refuse to start if absent). Part of DA-CLUS-1. **2026-09-26 tidy:** superseded — DA-CLUS-1 closed with a per-backend `LeaseStore` (OpenDAL only on S3, where `if_match` exists; native SDKs for GCS/Azure); the Delta sink uses object_store conditional puts (P8), not OpenDAL. | D-5 |
 | DA-DEP-3 | `sqlparser-rs` (MySqlDialect) pin | 🟢 | ✅ | `MySQL_DDL_Classifier.md` §5 — now on a fail-soft path, so a coverage gap degrades rather than halts; de-risked. | G-19a |
 | DA-DEP-4 | `memberlist` crate (Lifeguard, TLS/QUIC transport) | 🟢 | ✅ | Sources_Index; Clustering §2 — features confirmed available. | G-23 |
@@ -2183,8 +2272,8 @@ Source: `research/Multi_Sink_Architecture_and_Delta_Lake.md` — all decisions *
 | DA-MS-6 | Spec-merge debt from the multi-sink design | 🟢 | ✅ | **Applied 2026-09-26**: System-Overview (Sinks block, pluggable format), Data-Flow (Phase 0 sink preflight, Phase 3 collapse + `TableChangeSet` + TRUNCATE barrier, Phase 4 sink contract + Iceberg/Delta realizations), Config (`sink.type` required, `sink.iceberg`/`sink.delta`, catalog → `sink.iceberg.catalog`, pipeline-level `schema_evolution`, sink preconditions §11.2, V-083…V-093), Schema §7 (Applied/Degraded/Unsupported, Delta column), Type_Mapping (logical tags, Hop 3b). |
 
 | DA-X-11 | **iceberg-rust `Transaction::commit` rebases a stale zombie instead of rejecting it** *(probe G2b-3, iceberg 0.10.1, 2026-09-26)* — `do_commit` reloads the table and re-applies the actions on **every** attempt (not only on retry), so requirements are derived from the fresh metadata: a zombie holding a stale `Table` lands on top of the new owner's snapshot and regresses `cdc.owner_epoch` 6 → 5. Invalidates `Clustering…` §5.5 layer 2 ("zombie's commit conflicts and fails") and the TOCTOU-free reading of layer 3 | 🟡 | ✅(research) | **Fix, public API only (G2b-4):** commit through a per-commit catalog view whose `load_table` returns the base the fence was checked against → `fast_append`'s `assert-ref-snapshot-id(main)` makes it a real CAS; conflict surfaced non-retryable; the sink owns reload → re-check → re-pin. Proven: stale zombie rejected with neither property nor snapshot applied; foreign append under the pin → conflict → re-pin succeeds; foreign metadata-only edit not clobbered. Residual: a new owner's metadata-only commit doesn't move `main`, so one pinned zombie commit can still land — same window as "before the new owner's first data commit", absorbed by idempotency. `Clustering…` §5.5 / D-7 updated. Spec applied 2026-09-26: `Data-Flow.md` "Sink Commit Failure" names the pin. **Real catalog (probe G2c, AWS Glue + S3, 2026-09-26):** the pinned commit is a CAS — 6 rounds × 8 concurrent pinned writers → exactly 1 winner per round, **all 42 losers stopped by Glue's `VersionId` lock** (`ConcurrentModificationException`; the client-side requirement check alone stopped none), nothing of theirs applied; a stale pinned zombie rejected; the plain-`Transaction::commit` zombie rebase reproduced on Glue (property 603 → 1). S3 Tables uses the same pattern (`versionToken`; source-read, not run). REST / HMS: see DA-CAT-7 / DA-CAT-6. |
-| DA-CAT-6 | **iceberg-rust HMS catalog cannot commit** — `iceberg-catalog-hms` `update_table` returns `FeatureUnsupported` (0.10.1 and `main`, source-read 2026-09-26) | 🟡 | ⏭ v2 | **Gated 2026-09-26: config V-115 rejects `catalog.hive`** until a pinned release can commit (probe to lift). Every Iceberg sink commit is an `update_table`, so `sink.iceberg.catalog.type: hive` is unusable on the pinned crate (create/load work; commit does not). Moot for v1 while the Iceberg sink is gated (DA-SINK-1i), but it must join the Iceberg sink's **capability assertion** (per catalog backend). Upstream: #3104 (HMS config refactor) is the only open HMS PR; no commit path in flight. Options: capability-gate `hive` · contribute `update_table` (HMS `alter_table` with an env-context `metadata_location` expectation, as Java's `HiveTableOperations` does — needs a lock or `expected_parameter_key`) · route HMS estates via a REST catalog in front of HMS. **2026-09-26 tidy:** Iceberg-sink only — deferred to v2; V-115/V-116 keep the gate in the config meanwhile. |
-| DA-CAT-7 | **iceberg-rust REST client has no SigV4** (0.10.1, source-read 2026-09-26) | 🟡 | ⏭ v2 | **Gated 2026-09-26: config V-116 rejects `rest.auth: sigv4`** until a pinned release carries it (probe to lift). `sink.iceberg.catalog.rest.auth: sigv4` (config §9.5.3, `Catalog_Auth_Research.md` §3.2) is not realizable on the pinned crate, so the AWS Glue Iceberg REST and S3 Tables REST endpoints are unreachable through `iceberg-catalog-rest`. Upstream: open PRs **#3082** (SigV4 request signer) and **#3092** (SigV4 auth manager). Meanwhile the native `glue` catalog (probed, G2c) and the native `iceberg-catalog-s3tables` crate cover AWS. Capability-gate `rest`+`sigv4` until a release carries it. REST commit atomicity itself is server-side (409 on failed requirements) — not probed. **2026-09-26 tidy:** Iceberg-sink only — deferred to v2; V-115/V-116 keep the gate in the config meanwhile. |
+| DA-CAT-6 | **iceberg-rust HMS catalog cannot commit** — `iceberg-catalog-hms` `update_table` returns `FeatureUnsupported` (0.10.1 and `main`, source-read 2026-09-26) | 🟡 | ⏭ v2 | **Gated 2026-09-26: config V-115 rejects `catalog.hive`** until a pinned release can commit (probe to lift). Every Iceberg sink commit is an `update_table`, so `sink.iceberg.catalog.type: hive` is unusable on the pinned crate (create/load work; commit does not). Moot for v1 while the Iceberg sink is gated (DA-SINK-1i), but it must join the Iceberg sink's **capability assertion** (per catalog backend). Upstream: #3104 (HMS config refactor) is the only open HMS PR; no commit path in flight. Options: capability-gate `hive` · contribute `update_table` (HMS `alter_table` with an env-context `metadata_location` expectation, as Java's `HiveTableOperations` does — needs a lock or `expected_parameter_key`) · route HMS estates via a REST catalog in front of HMS. **2026-09-26 tidy:** Iceberg-sink only — deferred to v2; V-115/V-116 keep the gate in the config meanwhile. **2026-11-13 (§66):** still `FeatureUnsupported` on 0.11.0 and `main`. |
+| DA-CAT-7 | **iceberg-rust REST client has no SigV4** (0.10.1, source-read 2026-09-26) | 🟡 | ⏭ v2 | **Gated 2026-09-26: config V-116 rejects `rest.auth: sigv4`** until a pinned release carries it (probe to lift). `sink.iceberg.catalog.rest.auth: sigv4` (config §9.5.3, `Catalog_Auth_Research.md` §3.2) is not realizable on the pinned crate, so the AWS Glue Iceberg REST and S3 Tables REST endpoints are unreachable through `iceberg-catalog-rest`. Upstream: open PRs **#3082** (SigV4 request signer) and **#3092** (SigV4 auth manager). Meanwhile the native `glue` catalog (probed, G2c) and the native `iceberg-catalog-s3tables` crate cover AWS. Capability-gate `rest`+`sigv4` until a release carries it. REST commit atomicity itself is server-side (409 on failed requirements) — not probed. **2026-09-26 tidy:** Iceberg-sink only — deferred to v2; V-115/V-116 keep the gate in the config meanwhile. **2026-11-13 (§66):** `main` has the signer (#3082); the auth manager #3092 and #2660 are open — still not configurable. |
 | DA-CAT-8 | Losing / rejected commits leave orphan files | 🟢 | 🆕 ✅(measured) | G2c: every attempt writes its manifest + manifest list before the catalog decides, and every attempt that passes the client check also writes a `metadata.json`; iceberg-rust does not delete them on failure. 48 racing attempts → 42 orphan `metadata.json` + 86 orphan manifests. Bounded by conflict rate (the pipeline lease makes conflicts rare in practice); reclaimed by external `remove_orphan_files` (`Iceberg_Maintenance.md` §1). No design change. |
 
 ### 25.4 Next

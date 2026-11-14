@@ -37,7 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v2
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: astral-sh/setup-uv@v10.3.3
       - name: Start PostgreSQL ${{ matrix.version }}, RustFS and Jaeger
         run: |
           docker compose -f test-infra/compose.yaml --profile matrix up -d --wait "postgres-${{ matrix.version }}" rustfs jaeger
@@ -99,7 +99,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v2
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: astral-sh/setup-uv@v10.3.3
       - name: Start ${{ matrix.service }}, RustFS and Jaeger
         run: |
           docker compose -f test-infra/compose.yaml --profile matrix up -d --wait "${{ matrix.service }}" rustfs jaeger

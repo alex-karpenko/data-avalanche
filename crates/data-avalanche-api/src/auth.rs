@@ -833,7 +833,7 @@ mod tests {
         let hs = jsonwebtoken::encode(
             &jsonwebtoken::Header::default(),
             &idp.claims(json!(["admin"])),
-            &jsonwebtoken::EncodingKey::from_secret(b"guess"),
+            &jsonwebtoken::EncodingKey::from_secret(b"guess").unwrap(),
         )
         .unwrap();
         assert!(denied_401(auth.verify(&bearer(&hs)).await).contains("shared-secret"));

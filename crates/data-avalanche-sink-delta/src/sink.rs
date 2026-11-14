@@ -264,17 +264,18 @@ impl DeltaSink {
                 Err(e) => return race_or_fail(e),
             };
             h.set_table(table.clone());
-            // A commit delta-rs doesn't count as a conflict can outrun the DELETE. In deltalake-core
-            // 1.0 a DELETE without a predicate declares no read, so `conflict_checker.rs` doesn't
-            // check the files a concurrent commit added, and it skips OPTIMIZE's
-            // `data_change=false` removes: the compacted file survives a DELETE of the files it
-            // replaced (probe P11a). The table isn't empty, so this lost the race: the retry
-            // re-reads the table, re-runs the fence and the guard (the DELETE has no position,
-            // D-M4.8) and truncates again.
+            // A commit delta-rs doesn't count as a conflict can outrun the DELETE. deltalake-core
+            // 1.0 didn't count an OPTIMIZE as one: a DELETE without a predicate declared no read,
+            // and the conflict checker skipped OPTIMIZE's `data_change=false` removes, so the
+            // compacted file survived a DELETE of the files it replaced (probe P11a). 1.1 does
+            // (`ConcurrentDeleteDelete`, mapped to a retry by `race_or_fail`); this check stays as a
+            // backstop. The table isn't empty, so this lost the race: the retry re-reads the
+            // table, re-runs the fence and the guard (the DELETE has no position, D-M4.8) and
+            // truncates again.
             if table.snapshot().map_err(sink_error)?.log_data().num_files() > 0 {
                 return Ok(Step::Retry(
-                    "the truncate left files a concurrent commit wrote (an OPTIMIZE, which \
-                     delta-rs doesn't treat as a conflict)"
+                    "the truncate left files a commit delta-rs didn't count as a conflict \
+                     wrote"
                         .into(),
                 ));
             }
@@ -901,10 +902,10 @@ mod tests {
         );
     }
 
-    /// A foreign OPTIMIZE lands between the read and the truncate's DELETE. delta-rs doesn't see a
-    /// conflict (a predicate-less DELETE declares no read, and the compaction's removes are
-    /// `data_change=false`), so the DELETE commits and the compacted file survives it: the attempt
-    /// must retry, not land a table that still holds rows.
+    /// A foreign OPTIMIZE lands between the read and the truncate's DELETE. deltalake-core 1.0
+    /// saw no conflict (a predicate-less DELETE declared no read, and the compaction's removes are
+    /// `data_change=false`), so our own check caught it; 1.1 raises `ConcurrentDeleteDelete`. Either
+    /// way the stale attempt must retry, not land a table that still holds rows.
     #[tokio::test]
     async fn a_truncate_that_a_foreign_optimize_outran_is_retried() {
         let dir = tempfile::tempdir().unwrap();
@@ -912,7 +913,11 @@ mod tests {
         let mut t = rows(30, &[3]);
         t.truncate = true;
         match stale_attempt(&s, &t, 1).await {
-            Step::Retry(reason) => assert!(reason.contains("OPTIMIZE"), "{reason}"),
+            Step::Retry(reason) => assert!(
+                reason.contains("didn't count as a conflict")
+                    || reason.contains("concurrent transaction deleted"),
+                "{reason}"
+            ),
             Step::Done(o) => panic!("{o:?}, rows {:?}", ids(&s).await),
         }
         let out = s.commit(t.clone(), marker(1, &t)).await.unwrap();

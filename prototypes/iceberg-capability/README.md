@@ -114,6 +114,17 @@ cargo test --features glue --test probe_glue_cas -- --nocapture
 
 Run 2026-09-26 on account `418759522081` (profile `kav`), us-east-1; resources deleted afterwards.
 
+## Upstream status (2026-11-13)
+
+Rechecked on the published **0.11.0** (crates.io, 2026-11-03; MSRV 1.95, arrow 58) and `main` at
+`fa961f5c` (arrow 60): **still append-only**. Same `Transaction` actions as 0.10.1; `fast_append`
+refuses delete files. Merged on `main` only: the stateful `TransactionAction` (#3265), snapshot
+operations that report removed files (#3253), a simple snapshot producer (#3474), and the COW
+rewrite primitive `iceberg::cow_rewrite` (**#2752 merged 2026-10-01** — the 2026-09-19 note below
+had it open), which writes replacement files but commits nothing. Open: #3564
+MergingSnapshotProducer → #3300 overwrite (continues the closed #2185), #2203 RowDelta, #3046
+RewriteFiles. Gap tracker §66 has the per-gate results.
+
 ## Upstream status (2026-09-19)
 
 - The epic `apache/iceberg-rust#2186` ("Copy-on-Write and Merge-on-Read support") is **open**.

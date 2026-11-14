@@ -1,12 +1,15 @@
-//! Repository automation (roadmap §2): the documentation site's generated pages (M11b), and the
-//! acceptance runs' invocations (M12c, [`invocation`]). The
-//! configuration reference comes from the config model (`config_keys`, `FIELD_DOCS`, `RULES`,
-//! `key_mutability`), the API reference from the OpenAPI document, so neither can drift from the
-//! code: `cargo xtask docs` writes them, and a workspace test fails while a committed copy is stale.
+//! Repository automation (roadmap §2): the documentation site's generated pages (M11b), the
+//! dependency and advisory gates ([`deps`], [`audit`], run by `release.yml`), and the acceptance
+//! runs' invocations (M12c, [`invocation`]). The configuration reference comes from the config
+//! model (`config_keys`, `FIELD_DOCS`, `RULES`, `key_mutability`), the API reference from the
+//! OpenAPI document, so neither can drift from the code: `cargo xtask docs` writes them, and a
+//! workspace test fails while a committed copy is stale.
 
 mod acceptance;
 mod api;
+pub mod audit;
 mod config;
+pub mod deps;
 mod examples;
 mod rules;
 

@@ -28,7 +28,7 @@ build on the interfaces that actually landed. That staging was chosen on 2026-09
 | P-2 | First shippable slice | **PostgreSQL → Delta on a single node** (M0–M6) |
 | P-3 | Flush default | **30s** (config §9.4.1 and Data-Flow Phase 3 change from 60s); D-V1.3 lag target stands |
 | P-4 | MySQL positioning | **Both modes**: `gtid` (new **default**) and `binlog` file/position. File/position mode needs its own probe (M7) |
-| P-5 | Storage client for lease/state/config | **`object_store` everywhere** (0.14.2 since 2026-09-26; deltalake 1.0 still pulls its own 0.13, see R-13). T1–T10 conformance is re-proven on it against real S3/GCS/Azure before the lease is trusted (M2) |
+| P-5 | Storage client for lease/state/config | **`object_store` everywhere** (0.14.2 since 2026-09-26; deltalake 1.1 still pulls its own 0.13, see R-13). T1–T10 conformance is re-proven on it against real S3/GCS/Azure before the lease is trusted (M2) |
 | P-6 | Deliverables | Binary, **container image**, **Kubernetes manifests + Helm chart**, **CI** (GitHub Actions), **documentation site** (an Astro Starlight site, Q-M11b-1): architecture and internal flows, REST API reference, configuration reference with detailed examples, operator runbooks |
 | P-7 | S3 emulator | **RustFS** (not MinIO) |
 | P-8 | Source versions | PostgreSQL 14–18, MySQL 8.4 LTS, MariaDB 10.11 / 11.4 / 11.8 LTS. CI runs the newest of each on every change and the full matrix weekly |
@@ -39,7 +39,7 @@ build on the interfaces that actually landed. That staging was chosen on 2026-09
 
 ## 1. Scope recap (what v1 is)
 
-- **Sources:** PostgreSQL (`pgoutput`, proto v1, our own decoder over `pgwire-replication =0.4.1`),
+- **Sources:** PostgreSQL (`pgoutput`, proto v1, our own decoder over `pgwire-replication =0.5.0`),
   MySQL 8.4 and MariaDB (`mysql_async =0.37.1` binlog stream; GTID and file/position modes; MariaDB GTID
   dialect; compressed-transaction check).
 - **Sink:** Delta Lake mirror (`deltalake =1.0.0`, one MERGE per table per flush, `txn` fence,
@@ -70,7 +70,7 @@ with their own lockfiles.
 ```
 data-avalanche/
 ├── Cargo.toml                    workspace: members = ["crates/*", "xtask"], exclude = ["prototypes"]
-├── rust-toolchain.toml           pinned stable toolchain (1.98.1)
+├── rust-toolchain.toml           pinned stable toolchain (1.100.0)
 ├── .github/workflows/            ci.yml (per change) · weekly.yml (matrix) · cloud.yml (real clouds, scheduled/manual)
 ├── test-infra/compose.yaml       PG 14–18, MySQL 8.4, MariaDB 10.11/11.4/11.8, RustFS, Azurite (GCS = real bucket)
 ├── crates/
@@ -120,28 +120,28 @@ Rules:
   `source-pg` as a dev-dependency.
 - `data-avalanche-api` (M9a) reads `state`, `config`, `core` and `telemetry` directly beside
   `cluster`, and links no source or sink crate: a status is read from the state documents.
-- One `arrow` major workspace-wide (**59**, pinned by `deltalake =1.0.0`), per D-MS.14.
+- One `arrow` major workspace-wide (**59**, as `deltalake-core =1.1.4` resolves it), per D-MS.14.
 - Every binary calls `rustls::crypto::CryptoProvider::install_default()` (aws-lc-rs) before any TLS
   (DA-DEP-5).
 - Libraries return `thiserror` errors; `anyhow` only in the binary, `xtask` and tests.
 
-### 2.1 Pinned external crates (exact pins come from the probes)
+### 2.1 Pinned external crates (verified by the suites at each release's refresh)
 
 | Purpose | Crate | Pin | Evidence |
 |---|---|---|---|
-| Delta sink | `deltalake` (features `datafusion`, `rustls`, `s3`, `gcs`, `azure`) + `deltalake-core` | `=1.0.0` both (Q-M4-1: the `deltalake` facade asks for `deltalake-core = "1.0"`, which resolves to 1.1; the direct pin keeps the engine the probes ran on) | delta P1–P10, P8 on S3/GCS/Azure |
-| Object storage / CAS | `object_store` | `0.14.2` (bumped from 0.13.2 on 2026-09-26; deltalake 1.0 requires `^0.13.2`, so M4 adds a second copy, R-13) | API checked; RustFS/Azurite/real-GCS CAS re-run on 0.14.2; T1–T10 re-proof in M2 |
-| Arrow | `arrow` / `parquet` | `59` (as resolved by deltalake) | P9 |
-| PG replication transport | `pgwire-replication` (`default-features = false`, features `tls-rustls`, `scram`, `md5`) | `=0.4.1` | S-PG0–8, re-run as M5's regression tests |
+| Delta sink | `deltalake` (features `datafusion`, `rustls`, `s3`, `gcs`, `azure`) + `deltalake-core` | `deltalake =1.1.2` + `deltalake-core =1.1.4` (1.0.1; Q-M4-1 pinned both at `=1.0.0` for the engine the probes ran on) | delta P1–P10, P8 on S3/GCS/Azure |
+| Object storage / CAS | `object_store` | `0.14.2` (bumped from 0.13.2 on 2026-09-26; deltalake 1.1 still requires `^0.13.2`, so there are two copies, R-13) | API checked; RustFS/Azurite/real-GCS CAS re-run on 0.14.2; T1–T10 re-proof in M2 |
+| Arrow | `arrow` / `parquet` | `59` (as `deltalake-core 1.1.4` resolves it; held, `dependency-exceptions.yaml`) | P9 |
+| PG replication transport | `pgwire-replication` (`default-features = false`, features `tls-rustls`, `scram`, `md5`) | `=0.5.0` (1.0.1; probed on 0.4.1) | S-PG0–8, re-run as M5's regression tests |
 | PG SQL (catalog, chunks) | `tokio-postgres` + `tokio-postgres-rustls` (trust roots `webpki-roots` 1) | `0.7` / `0.14` | S-PG probes; M5's integration suite |
 | MySQL binlog + SQL | `mysql_async` (`default-features = false`, features `default-rustls`, `binlog`) / `mysql_common` (dev, building events in tests) | `=0.37.1` / `=0.37.3` | S-MY0–11b; M7a's integration suite |
 | MariaDB compressed events | `flate2` (already in the lockfile through `mysql_common`) | `1` | Q-M7a-5; M7a Task 6 |
-| DDL classifier | `sqlparser` (`default-features = false`, features `std`: no `recursive-protection`, which builds C) | `=0.62.0` | MySQL_DDL_Classifier §5; M7a Task 11 |
-| YAML 1.2 (serde) | `serde-saphyr` (`deserialize` only) | `=1.3.0` | Verified in M1 planning (2026-09-27): strict booleans, duplicate-key errors, `Spanned` locations, unknown-key errors with location. One trap: `${…}` inside a flow collection must be quoted (M1 Review Focus 1). R-9 closed |
+| DDL classifier | `sqlparser` (`default-features = false`, features `std`: no `recursive-protection`, which builds C) | `=0.64.0` | MySQL_DDL_Classifier §5; M7a Task 11 |
+| YAML 1.2 (serde) | `serde-saphyr` (`deserialize` only) | `=2.1.1` (1.0.1) | Verified in M1 planning (2026-09-27): strict booleans, duplicate-key errors, `Spanned` locations, unknown-key errors with location. One trap: `${…}` inside a flow collection must be quoted (M1 Review Focus 1). R-9 closed |
 | Membership (SWIM) | `foca` (`default-features = false`, features `std`, `serde`, `postcard-codec`) + `rand` (features `std`, `std_rng`, `sys_rng`; foca's random source) | `=2.0.0` / `0.10` | The M8 probe gate (2026-10-20, `prototypes/cluster-capability`): `memberlist` 0.8.5 failed (reaping corrupts its member table, C13), foca passed F1–F8 (Q-M8-1); M8a's gossip and cluster suites |
 | Host addresses | `if-addrs` (an unset `advertise_addr`'s private IPv4) | `0.15` | M8a Task 9 |
 | HTTP API | `axum` `0.8` + `utoipa` `6` | | |
-| Metrics | `prometheus-client` | | |
+| Metrics | `prometheus-client` | `=0.26.0` | |
 | Tracing | `tracing`, `tracing-subscriber`, `opentelemetry-otlp` | | |
 | CLI | `clap` `4` | | |
 | Misc | `thiserror` 2, `async-trait`, `bytes`, `chrono`, `uuid`, `serde_json` (feature `arbitrary_precision`: JSON numbers keep every digit, Q-M5-11), `humantime`, `xxhash-rust` `0.8` (feature `xxh3`: the ring's hash, anchor `hash_algo: xxh3`; M8a), `proptest` (dev) | | |
@@ -1339,7 +1339,7 @@ Split in two (Q-M11-A), each its own plan, branch and PR: M11a packaging, then M
 #### M11a — Packaging
 
 - **Scope:**
-  - Multi-stage Dockerfile: the build on `rust:1.98.1-trixie`, the runtime
+  - Multi-stage Dockerfile: the build on `rust:1.100.0-trixie`, the runtime
     `gcr.io/distroless/cc-debian13:nonroot` (Q-M11-3), linux/amd64 and linux/arm64.
   - Helm chart: StatefulSet (D-1), headless Service, `node_name` from the Downward API, ConfigMap,
     probes, PDB, resource defaults.
@@ -1415,7 +1415,8 @@ The scope across the three:
   - The real-cloud matrix: S3, GCS, Azure × PG and MySQL.
   - The weekly DB version matrix green for 4 consecutive runs (Q-M5-23): treated as met (Q-M12-5).
   - A dependency audit: `cargo audit` clean, or every remaining advisory triaged and recorded (the CI
-    step is non-blocking, so this is where the audit is enforced).
+    step is non-blocking; since 1.0.1 the release gate enforces it: `cargo xtask audit --check`
+    fails on an unaccepted advisory or a stale exception).
   - Compile time and the dependency tree (Q-M5-24), checked against a measurement:
     - `cargo build --timings`, to see what dominates: DataFusion, `aws-lc-sys` (a C build, through
       `deltalake-aws`'s `aws-config`) or linking;
@@ -1459,8 +1460,8 @@ Conventions:
 ### 5.2 Test infrastructure (`test-infra/compose.yaml`)
 
 Default profile (M0): `postgres-18`, `mysql-84`, `mariadb-118`, `rustfs`, `azurite`; M10 adds
-`jaeger` (`jaegertracing/jaeger:2.21.0`, OTLP/HTTP on 54318, the query API on 56686), the E2E
-tracing scenario's collector. M11a adds `k3s` (`rancher/k3s:v1.37.1-k3s1`, profile `k3s`,
+`jaeger` (`jaegertracing/jaeger:2.23.0`, OTLP/HTTP on 54318, the query API on 56686), the E2E
+tracing scenario's collector. M11a adds `k3s` (`rancher/k3s:v1.37.2-k3s1`, profile `k3s`,
 privileged; its API on 56443, the chart's NodePort 30080 on 58080), which `test-infra/k3s.sh`
 starts with the image imported. GCS has no
 emulator: `fake-gcs-server` 1.56.1 rejects `object_store`'s PUT (`400 invalid uploadType`) and ignores
@@ -1482,9 +1483,9 @@ Every service uses a fixed, non-default host port listed in `test-infra/README.m
 as the preconditions require: PG `wal_level=logical`; MySQL/MariaDB ROW / FULL image / FULL metadata /
 GTID on (MariaDB also `gtid_strict_mode=1`).
 
-Pinned images (tags checked against their registries on 2026-09-26): `postgres:14…18`, `mysql:8.4`,
-`mariadb:10.11/11.4/11.8`, `rustfs/rustfs:1.0.0`, `mcr.microsoft.com/azure-storage/azurite:3.37.0`;
-init tools `amazon/aws-cli:2.37.4`, `mcr.microsoft.com/azure-cli:2.90.0-azurelinux4.0`. Conditional
+Pinned images (tags checked against their registries on 2026-09-26; refreshed in 1.0.1): `postgres:14…18`, `mysql:8.4`,
+`mariadb:10.11/11.4/11.8`, `rustfs/rustfs:1.0.5`, `mcr.microsoft.com/azure-storage/azurite:3.37.0`;
+init tools `amazon/aws-cli:2.40.3`, `mcr.microsoft.com/azure-cli:2.92.0-azurelinux4.0`. Conditional
 create/update measured 2026-09-26: **RustFS PASS, Azurite PASS, real GCS PASS** (via `object_store`),
 fake-gcs FAIL (risk R-3).
 
@@ -1552,16 +1553,16 @@ other (PostgreSQL: 5, 6, the WAL guard and a lost slot; MySQL: 11).
 | R-1 | `memberlist` 0.8.5 has never been probed (TLS, metadata size, Lifeguard, runtime-agnostic API) | ~~medium / high~~ realized / contained | M8 opens with a probe gate; `foca` 2.0 as fallback; everything above membership consumes an owner function, so the swap is contained. **Realized 2026-10-20**: memberlist failed the gate (reaping corrupts its member table, C13; UDP left unauthenticated by its TLS); M8a builds on foca 2.0 (Q-M8-1). Lost: Lifeguard (SWIM accuracy is a latency concern, Clustering §8.4) |
 | R-2 | `object_store` CAS behaves differently from the proven native clients (GCS generation, S3 409, Azure MI) | low / high | T1–T10 re-proof on real clouds in M2 before any lease code depends on it; the proven per-backend stores in `prototypes/lease-conformance` are the fallback. **Re-proven 2026-09-29** on `object_store` 0.14.2 through `Leases` (`tests/lease_conformance.rs`): in memory, RustFS, Azurite, real GCS, real S3 and real Azure all PASS (S3 and Azure: `cloud.yml` run 36604762684) |
 | R-3 | An emulator's conditional writes are incomplete | ~~medium~~ low / low | Measured 2026-09-26: RustFS and Azurite honour Create and Update preconditions; fake-gcs doesn't serve `object_store` at all, so it's replaced by a real bucket (P-10). Real GCS via `object_store` passed the same checks (2026-09-26). Re-checked with `object_store` 0.14.2 the same day: fake-gcs 1.56.1 (= `latest`) still fails the plain PUT. Closed |
-| R-12 | Clamped PG edge dates (Arrow min/max, Q-M5-1) are valid Parquet but some engines can't render years ±5.8M / ±294k | medium / low | M4 clamps `date` / `timestamp` / `timestamp_ntz` cells to the Delta range 0001-01-01 … 9999-12-31 23:59:59.999999 in Hop 3b (Q-M4-2), and its type round trip reads the bounds through DuckDB `delta_scan`. DuckDB 1.5.6 can't open a table path with non-ASCII text (Q-M4-6). The operator docs list the clamping (`configuration/sink.md`), that limit (`configuration/storage.md`) and the engines checked |
+| R-12 | Clamped PG edge dates (Arrow min/max, Q-M5-1) are valid Parquet but some engines can't render years ±5.8M / ±294k | medium / low | M4 clamps `date` / `timestamp` / `timestamp_ntz` cells to the Delta range 0001-01-01 … 9999-12-31 23:59:59.999999 in Hop 3b (Q-M4-2), and its type round trip reads the bounds through DuckDB `delta_scan`. DuckDB 2.0.0 reads a Delta table under a non-ASCII path, and the sink's DuckDB test pins it (its table is `zamówienia 50%` / `日本/b~c`); the 1.5.6 refusal measured in September (Q-M4-6) no longer reproduces, because DuckDB loads its Delta extension at run time. The operator docs list the clamping (`configuration/sink.md`) and the engines checked |
 | R-11 | The real GCS bucket makes PR CI depend on credentials, network and cost | low / low | Per-test unique prefixes plus cleanup, a 1-day lifecycle rule on `data-avalanche-it/`, a dedicated CI bucket and service account; fork PRs skip GCS with a notice (P-10) |
 | R-4 | File/position MySQL mode (new per P-4) has unknown resume edge cases (rotation, restart, failover invalidates positions) | medium / medium | Probe S-MY10 opens M7; a changed source server halts the pipeline (`BINLOG_SOURCE_CHANGED`, Q-M7-2) and the operator docs give the recovery (switch to `gtid` or re-snapshot) |
 | R-5 | Delta MERGE cost under random-key churn (D-MS.15) | known / medium | Merge metrics (M4), flush guidance (`configuration/sink.md`), measured in M12. **Measured 2026-11-11** (`v1-acceptance.md` §R-5): on a 1M-key, 13 MB table churned at random keys, every 30 s flush rewrote close to the whole table (11–13 MB) in a 1.2–1.4 s MERGE, on PostgreSQL 18 and MySQL 8.4; the guidance in `configuration/sink.md` carries the numbers |
 | R-6 | DataFusion memory during large MERGEs | medium / medium | Bound the batch bytes per commit (split at `flush.bytes`); a memory test in M4; the DataFusion memory pool configured |
 | R-7 | `mysql_async` silent payload drop (DA-SRC-12) | low / high | Our own check (M7) plus a fault-injection test; upstream report |
-| R-8 | `pgwire-replication` =0.4.1 is a young crate (proto v1 only) | medium / medium | Thin wrapper; the decoder is ours; a fork path is documented |
+| R-8 | `pgwire-replication` =0.5.0 is a young crate (proto v1 only) | medium / medium | Thin wrapper; the decoder is ours; a fork path is documented |
 | R-9 | `serde-saphyr` lacks a strictness or error-location feature the spec needs | ~~low / medium~~ closed | Verified in M1 planning (2026-09-27) against the full M1 implementation in a scratch workspace: every needed feature is there (§2.1). Closed; `serde_yaml_ng` not needed |
 | R-10 | TOAST carry-forward across batches depends on the MERGE update expression (D-IMPL-3) | medium / high | M4 test with an unchanged TOAST column across two flushes; `re_query` strategy as the alternative |
-| R-13 | Two `object_store` versions after M4: ours at 0.14, deltalake 1.0 at `^0.13.2`. Store handles can't be shared across them (e.g. passing our store to delta-rs), and `quick-xml` 0.39.4 (RUSTSEC-2026-0194/0195, fixed in 0.41) comes back through deltalake's copy | known / low | Keep the two apart: the storage crate owns 0.14 for lease/state/config; the Delta sink builds its stores through deltalake's own API. The non-blocking `cargo audit` step reports the advisories. Move to one version when a deltalake release accepts 0.14. Re-checked at M4 planning (2026-09-30): `deltalake` 1.1.0 still requires `^0.13.2` |
+| R-13 | Two `object_store` versions after M4: ours at 0.14, deltalake 1.1 at `^0.13.2`. Store handles can't be shared across them (e.g. passing our store to delta-rs), and `quick-xml` 0.39.4 (RUSTSEC-2026-0194/0195, fixed in 0.41) comes back through deltalake's copy | known / low | Keep the two apart: the storage crate owns 0.14 for lease/state/config; the Delta sink builds its stores through deltalake's own API. The non-blocking `cargo audit` step reports the advisories. Move to one version when a deltalake release accepts 0.14. Re-checked at M4 planning (2026-09-30): `deltalake` 1.1.0 still requires `^0.13.2`; again at 1.0.1: `deltalake-core` 1.1.4 still does |
 
 ---
 

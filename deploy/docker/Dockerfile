@@ -1,9 +1,9 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.29
 # The data-avalanche image (roadmap §4 M11a): the release binary on distroless, as the
 # non-root user. Built from the repository root:
 #   docker build -f deploy/docker/Dockerfile -t data-avalanche .
 
-FROM rust:1.98.1-trixie AS build
+FROM rust:1.100.0-trixie AS build
 WORKDIR /src
 COPY . .
 # The target directory is a cache across builds. Debug info is stripped, the symbols kept: a

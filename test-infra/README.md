@@ -18,10 +18,10 @@ on `PATH`; it fetches DuckDB itself.
 | mysql-tls | mysql:8.4 (GTID on), TLS required (`mysql-tls.sh`) | 53386 | root / avalanche; `avalanche_cert` / `unused` with its client certificate | default |
 | mariadb-118 | mariadb:11.8 (`gtid_strict_mode=1`) | 53318 | root / avalanche | default |
 | mariadb-114, mariadb-1011 | mariadb:11.4, 10.11 | 53314, 53311 | root / avalanche | matrix |
-| rustfs (S3) | rustfs/rustfs:1.0.0 | 59000 | avalanche / avalanche-secret | default |
+| rustfs (S3) | rustfs/rustfs:1.0.5 | 59000 | avalanche / avalanche-secret | default |
 | azurite (Azure Blob) | mcr.microsoft.com/azure-storage/azurite:3.37.0 | 10000 | Azurite's public dev account | default |
-| jaeger (OTLP/HTTP collector, query API) | jaegertracing/jaeger:2.21.0 | 54318 (OTLP), 56686 (query) | — | default |
-| k3s (the smoke deploy's Kubernetes) | rancher/k3s:v1.37.1-k3s1, privileged | 56443 (API), 58080 (the chart's API NodePort) | kubeconfig in `test-infra/.k3s/` | k3s |
+| jaeger (OTLP/HTTP collector, query API) | jaegertracing/jaeger:2.23.0 | 54318 (OTLP), 56686 (query) | — | default |
+| k3s (the smoke deploy's Kubernetes) | rancher/k3s:v1.37.2-k3s1, privileged | 56443 (API), 58080 (the chart's API NodePort) | kubeconfig in `test-infra/.k3s/` | k3s |
 
 Bucket / container `data-avalanche-test` is created by the `init` profile (`up.sh` runs it). Azurite keeps
 port 10000 because `object_store`'s emulator mode always targets `127.0.0.1:10000`.

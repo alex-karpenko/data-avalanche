@@ -76,5 +76,6 @@ yours to run.
 ## Names outside ASCII
 
 Table and column names are written as the source has them, non-ASCII letters included. Some
-readers can't open such a table: DuckDB 1.5.6's `delta_scan` refuses a path with non-ASCII text.
+readers can't open such a table. DuckDB 2.0.0's `delta_scan` reads one (the integration suite
+checks it), but DuckDB's Delta extension refused non-ASCII paths in 2026 releases up to 1.5.6.
 Check your engines before replicating such a table.
