@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-13
+updated: 2026-11-14
 domain: Architecture
 tags: [gap-analysis, design, re-derivation, spec-readiness, blockers, open-decisions]
 resolves: []
@@ -985,6 +985,18 @@ suites green. Held: arrow 60 (deltalake-core 1.1.4 requires `^59`), mysql_common
 
 No gap opened or closed; the ⏭ v2 rows stay.
 
+## 69. v1.0.1 released (2026-11-14)
+
+PR #24 merged (`bde0ed0`): its CI green at `7d415bf` (the `integration` job now reserves the test
+ports, after two runs failed to bind the replica pairs' host port), `cloud.yml` green on S3, GCS and
+Azure, and the `release.yml` dry run green with nothing published. `v1.0.1` tagged on `main`:
+`release.yml` run 43568644955 passed the release gate (`cargo xtask deps --check`, `cargo xtask
+audit --check`) and published the image `ghcr.io/<owner>/data-avalanche` `1.0.1`/`1.0`/`latest` for
+amd64 and arm64 with its attestation, the chart `oci://ghcr.io/<owner>/charts/data-avalanche`
+`1.0.1`, and the GitHub release with the SBOM. The first `github-release` attempt failed pushing the
+chart (GHCR answered "not found" for the manifest it had just received); re-running that job
+published it. No gap opened or closed: the open count stays 0 (v1).
+
 ---
 
 ### Counts (by status)
@@ -996,7 +1008,7 @@ No gap opened or closed; the ⏭ v2 rows stay.
 > M7a's plan (§32), 2026-10-16 for M7a's exit (§33), 2026-10-17 for M7b's plan (§34),
 > 2026-10-20 for M7b's exit (§35), 2026-10-21 for M8a's plan (§36), 2026-10-22 for M8a's exit (§37),
 > 2026-10-22 for M8b's plan (§38), 2026-10-23 for M8b's exit (§39), 2026-10-23 for M9a's plan
-> (§40), 2026-10-23 for M9a's exit (§41), 2026-10-27 for M9b's plan (§42), 2026-10-28 for M9b's exit (§43), 2026-10-28 for M10's plan (§44), and 2026-10-29 for M10's exit (§45), and 2026-10-29 for M11a's plan (§46), and 2026-10-29 for M11a's whole-branch review (§47), and 2026-10-29 for M11a's exit (§48), and 2026-10-29 for M11b's plan (§49), and 2026-10-30 for M11b's pages (§50), and 2026-10-30 for M11b's exit and v0.1.0 (§51), and 2026-10-30 for M12a's plan (§52), and 2026-11-04 for M12a's gaps closed (§53), and 2026-11-04 for M12a's whole-branch review (§54), and 2026-11-04 for M12a's exit (§55), and 2026-11-06 for M12b's gaps closed (§57), and 2026-11-06 for M12b's exit (§58), and 2026-11-06 for M12d's plan (§59), and 2026-11-10 for M12d's gaps closed (§60), and 2026-11-11 for M12d's whole-branch review (§61), and 2026-11-11 for M12d's exit (§62), and 2026-11-11 for M12c's gaps closed (§63), and 2026-11-13 for M12c's acceptance runs (§64, no change), and 2026-11-13 for v1.0.0's release (§65, no change), and 2026-11-13 for the iceberg-rust recheck (§66, no change), and 2026-11-13 for 1.0.1's plan (§67, no change), and 2026-11-13 for 1.0.1's execution (§68, no change).
+> (§40), 2026-10-23 for M9a's exit (§41), 2026-10-27 for M9b's plan (§42), 2026-10-28 for M9b's exit (§43), 2026-10-28 for M10's plan (§44), and 2026-10-29 for M10's exit (§45), and 2026-10-29 for M11a's plan (§46), and 2026-10-29 for M11a's whole-branch review (§47), and 2026-10-29 for M11a's exit (§48), and 2026-10-29 for M11b's plan (§49), and 2026-10-30 for M11b's pages (§50), and 2026-10-30 for M11b's exit and v0.1.0 (§51), and 2026-10-30 for M12a's plan (§52), and 2026-11-04 for M12a's gaps closed (§53), and 2026-11-04 for M12a's whole-branch review (§54), and 2026-11-04 for M12a's exit (§55), and 2026-11-06 for M12b's gaps closed (§57), and 2026-11-06 for M12b's exit (§58), and 2026-11-06 for M12d's plan (§59), and 2026-11-10 for M12d's gaps closed (§60), and 2026-11-11 for M12d's whole-branch review (§61), and 2026-11-11 for M12d's exit (§62), and 2026-11-11 for M12c's gaps closed (§63), and 2026-11-13 for M12c's acceptance runs (§64, no change), and 2026-11-13 for v1.0.0's release (§65, no change), and 2026-11-13 for the iceberg-rust recheck (§66, no change), and 2026-11-13 for 1.0.1's plan (§67, no change), and 2026-11-13 for 1.0.1's execution (§68, no change), and 2026-11-14 for v1.0.1's release (§69, no change).
 
 | Status | Count (v1 scope) | Notes |
 |---|---|---|
