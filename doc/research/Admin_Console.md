@@ -112,6 +112,7 @@ and need a second confirmation where they can't be undone.
 **Attribution covers the API, not only the console** (Claude's call): every mutating API call,
 from the console or `curl`, records the caller's name, role and an optional `note` field in its
 request. The name and role come from the server's own verification (§9), never from the page.
+The `note` field is optional, so existing callers keep working unchanged.
 
 ## 6. Events and audit trail
 
@@ -122,6 +123,9 @@ role when a person or token caused it, note, and outcome. It records at least: e
 (accepted, then its outcome); lease hand-offs and failovers; config reloads and generations; halts
 and schema changes (applied, degraded, refused); snapshot job lifecycle; nodes joining, leaving,
 going suspect; removals and their teardown.
+
+Events name people and describe pipelines, so the docs say to keep `globals.state` where lake
+readers can't read it; the same applies to the history of §7.
 
 Object storage has no append: the builder chooses the layout (for example one small object per
 event under a per-day prefix, listed by time), which must stay cheap to list for a day and to
@@ -171,11 +175,17 @@ One sign-in page; what follows depends on `globals.api.auth`:
 
 - **Session** (best practice: tokens and passwords never reach page JavaScript): an encrypted,
   `HttpOnly`, `Secure`, `SameSite=Strict` cookie, readable by every node so a load balancer can
-  send any request anywhere. The encryption key lives in the cluster's shared state in object
-  storage (Claude's call). Every request is still verified the way the API verifies a bearer token
-  today; the role and the recorded name always come from that verification.
+  send any request anywhere. **The key comes from configuration** (Oleksii):
+  `globals.console.session_key`, set through `${ENV}` to the same value on every node, required
+  when `auth` is not `none`. It is never kept in object storage, because people who may read the
+  lake's bucket must not be able to mint an admin session. Every request is still verified the
+  way the API verifies a bearer token today; the role and the recorded name always come from that
+  verification.
 - **Name shown and recorded:** a configurable claim, `preferred_username` by default, falling back
-  to `sub`; `basic` uses the configured user.
+  to `sub`; `basic` uses the configured user; `none` records `anonymous (admin)` (Claude's call).
+- **The console's public address:** `oauth2` needs the exact redirect URI the provider registered,
+  which a node behind a proxy can't work out safely from forwarded headers. A
+  `globals.console.public_url` setting gives it, required when `auth = oauth2` (Claude's call).
 - **401** (not signed in, expired): back to sign-in, saying why. **403** (signed in, not allowed,
   or a token whose roles map to nothing): names the role needed and the role held.
 - **Sign-out** clears the session and, with `oauth2`, signs out at the provider when it offers an
@@ -200,7 +210,12 @@ All Claude's calls, "follow best practices" (Oleksii):
   at runtime.
 - **Served from the API listener** under its own path (for example `/console/`), every node
   serving it. Node-targeted actions and another node's live detail are fetched by the serving node
-  from the target node, each with its own time limit.
+  from the target node, each with its own time limit. The serving node passes the caller's own
+  credentials through, so the target verifies the caller itself and records the same name; no
+  node-to-node trust is added (Claude's call). Each node's API address travels in its gossip
+  metadata if it doesn't already. While a console is connected, the serving node follows its peers'
+  live changes and merges them into the one stream the page reads (Claude's call; the mechanism is
+  the builder's).
 - **Light and dark** themes following the system setting.
 - **Tests:** Vitest for components; Playwright for real flows against the E2E cluster, including
   every sign-in mode, the 401/403 pages, the actions' attribution, and the §8 budgets.
@@ -212,7 +227,8 @@ New settings, to be patched into `doc/specs/Configuration_Specification.md` once
 (names are proposals):
 
 - `globals.api.oauth2.client_id` (and optional `scopes`): the console's client for `oauth2`.
-- `globals.console`: `enabled` (default `true`); `session_ttl` (default 8 h, Claude's call);
+- `globals.console`: `enabled` (default `true`); `session_key` (`${ENV}`, required unless
+  `auth = none`); `public_url` (required with `oauth2`); `session_ttl` (default 8 h, Claude's call);
   `username_claim` (default `preferred_username`); `history.retention` (default 24 h);
   `events.retention` (default 30 d); `prometheus` (optional: `url`, `auth`, `tls`,
   `extra_labels`).
@@ -237,3 +253,9 @@ The attention thresholds; the event and history layouts in object storage; sampl
 the exact paths of the new endpoints and the console; the SSE message shapes; how the milestones
 split this (likely: server foundations — events, attribution, history, new endpoints; sign-in and
 sessions; the console shell and Overview; the detail pages and actions).
+
+## 14. Delivery
+
+All of it ships as **1.1.0** (Oleksii): one release, built as several milestones (one branch and
+one PR each, as `CLAUDE.md` sets out), with nothing tagged until the last one merges. The 1.1.0
+release follows the release rule of 1.0.1: dependencies refreshed and both gates passing.
