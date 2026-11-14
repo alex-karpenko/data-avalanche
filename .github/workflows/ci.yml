@@ -89,6 +89,13 @@ jobs:
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h /
+      # The replica pairs start after the tests, whose thousands of connections take local ports
+      # from the kernel's ephemeral range (32768-60999); one still held, or in TIME_WAIT, on a pair's
+      # host port fails its bind. Reserving compose.yaml's host ports in that range keeps the
+      # kernel from handing them out (an explicit bind still gets them).
+      - name: Reserve the test ports
+        run: |
+          sudo sysctl -w net.ipv4.ip_local_reserved_ports=53311-53386,54318,55414-55423,56443,56686,58080,59000
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v2
       - name: GCS credentials
@@ -135,6 +142,9 @@ jobs:
       - name: Container logs on failure
         if: failure()
         run: docker compose -f test-infra/compose.yaml --profile replica logs --no-color
+      - name: Sockets on the replica pairs' ports on failure
+        if: failure()
+        run: sudo ss -tanp | grep -E ':5542[0-3]\b' || true
       - name: Stop test infrastructure
         if: always()
         run: test-infra/down.sh
