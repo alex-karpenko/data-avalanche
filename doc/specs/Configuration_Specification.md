@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-10
+updated: 2026-11-14
 domain: Architecture
 status: Specification (supersedes the Configuration_file_model.md draft)
 tags: [architecture, configuration, spec, validation, multi-sink, iceberg, delta-lake]
@@ -256,7 +256,8 @@ lineage columns is the reopen path (`research/V1_Scope_Decisions.md`).
 ## 6. `globals` section
 
 Parameters not tied to any single pipeline: cloud target, application state location,
-management API, logging, cluster membership, tracing, and provider-specific settings.
+management API, logging, cluster membership, tracing, the web console, and provider-specific
+settings.
 
 ```yaml
 globals:
@@ -267,6 +268,7 @@ globals:
   cluster:  { ... }
   tracing:  { ... }     # optional (§6.6)
   azure:    { ... }     # optional, cloud = azure only (§6.7)
+  console:  { ... }     # optional (§6.8)
 ```
 
 ### 6.1 `globals.cloud`
@@ -364,7 +366,15 @@ oauth2:                                            # OIDC; superset of jwt for t
   jwks_url: https://idp.example.com/realms/cdc/protocol/openid-connect/certs   # optional if discovery used
   discovery_url: https://idp.example.com/realms/cdc/.well-known/openid-configuration  # optional
   roles_claim: realm_access.roles                   # optional (default "roles")
+  client_id: cdc-console                            # optional; the web console's sign-in (§6.8)
+  client_secret: ${CONSOLE_CLIENT_SECRET}           # optional; only for a confidential client
+  scopes: [openid, profile]                         # optional (default [openid, profile])
 ```
+
+`client_id`, `client_secret` and `scopes` are used only by the web console's sign-in (§6.8):
+authorization code with PKCE, the code exchanged by the server. Token verification doesn't use
+them. All three are R. `client_secret` is a secret (§4: fingerprinted, never shown); a client the
+provider registered as public has none. `client_secret` and `scopes` need `client_id` (V-133).
 
 `roles_claim` tells the verifier **where** to read roles; `role_mapping` (§6.3) maps them to the
 local roles; **what** each role may call is the endpoint → minimum-role matrix in
@@ -494,6 +504,52 @@ When tracing is active, `trace_id` / `span_id` are injected into JSON log record
 | Field | Type | Required | Default | Mutability | Notes |
 |---|---|---|---|---|---|
 | `account_name` | string | no | from credential chain | PROC | Storage account for all containers (G-34). Credentials still come from the SDK default chain (managed / workload identity) — no secret fields. Valid storage-account name (V-101). |
+
+### 6.8 `globals.console`
+
+The embedded web console (`research/Admin_Console.md`), served on the management API's listener
+under the path prefix `/ui/`. **Off by default:** `enabled: true` switches it on. While it is off,
+nothing under `/ui/` exists (404) and the rest of this block is still validated. The events,
+attribution and chart history the console reads are recorded whether it is on or off, and the
+retentions below apply to them.
+
+```yaml
+console:
+  enabled: true
+  session_key: ${CONSOLE_SESSION_KEY}       # required when enabled, unless api.auth = none
+  public_url: https://cdc.example.com        # required when enabled with api.auth = oauth2
+  session_ttl: 8h
+  username_claim: preferred_username
+  history:
+    retention: 24h
+  events:
+    retention: 30d
+  prometheus:                                # optional; absent ⇒ built-in history only
+    url: https://prometheus.example.com
+    bearer_token: ${PROM_TOKEN}              # or basic: { user, password }
+    headers: { X-Scope-OrgID: prod }
+    tls: { ca: /etc/cdc/tls/prom-ca.pem }
+    extra_labels: { cluster: prod-eu }
+    timeout: 5s
+```
+
+| Field | Type | Required | Default | Mutability | Notes |
+|---|---|---|---|---|---|
+| `enabled` | bool | no | `false` | R | Serves the console under `/ui/`. A reload turns it on or off without a restart. |
+| `session_key` | string | conditional | — | R | Required when `enabled` and `api.auth ≠ none` (V-135). Encrypts and signs the console's session cookie; the same value on every node. Use `${ENV}`; never stored in object storage. At least 32 bytes (V-128). A change ends every open session (people sign in again). Unused with `api.auth = none` (V-134). |
+| `public_url` | URL | conditional | — | R | Required when `enabled` and `api.auth = oauth2` (V-136). The console's address as people reach it, for the OAuth2 redirect URI (`<public_url>/ui/…`). Absolute `http(s)` URL, no query or fragment (V-129). |
+| `session_ttl` | duration | no | `8h` | R | How long a session lasts without activity; with `jwt` and `oauth2`, never past the token's expiry. 5 min – 7 days (V-132). |
+| `username_claim` | string | no | `preferred_username` | R | The token claim shown and recorded as the person's name (`jwt`, `oauth2`); `sub` when the claim is absent. `basic` records the configured user, `none` records `anonymous (admin)`. |
+| `history.retention` | duration | no | `24h` | R | How long the built-in chart history is kept in `globals.state`. 1 h – 30 days (V-132). Older ranges come from `prometheus`. |
+| `events.retention` | duration | no | `30d` | R | How long the event and audit trail is kept in `globals.state`. 1 – 400 days (V-132). |
+| `prometheus` | object | no | — | R | Where chart ranges older than `history.retention` come from. **Absent ⇒ built-in history only**, no warning, no error. Unreachable at run time ⇒ charts fall back to the built-in range and mark the gap; never a config error. |
+| `prometheus.url` | URL | yes (in `prometheus`) | — | R | Base URL; the scheme comes from it. Absolute `http(s)` URL (V-130). |
+| `prometheus.basic` | object `{user, password}` | no | — | R | Basic authentication. Exclusive with `bearer_token` (V-131). `password` is a secret. |
+| `prometheus.bearer_token` | string | no | — | R | Bearer authentication. Exclusive with `basic` (V-131). A secret. |
+| `prometheus.headers` | map<string, string> | no | `{}` | R | Sent with every query, e.g. a tenant header. Values are secrets. Each name an HTTP token, each value visible ASCII, spaces and tabs (V-126). |
+| `prometheus.tls.ca` | PEM/path | no | system roots | R | §4.4. |
+| `prometheus.extra_labels` | map<string, string> | no | `{}` | R | Label matchers added to every query (`name="value"`), for labels a collector adds or renames, and so another cluster's series never mix in. Prometheus label names, not starting `__` (V-131). |
+| `prometheus.timeout` | duration | no | `5s` | R | Per query. |
 
 ---
 
@@ -1351,6 +1407,15 @@ errors.
 | V-099 | `globals.api.role_mapping` | Keys ∈ {viewer, operator, admin}; values are lists of strings. | error | config |
 | V-100 | `globals.api.role_mapping` with `auth ∈ {none, basic}` | Ignored — roles come from the open mode / single basic principal. | warning | config |
 | V-053 | `globals.api.tls.enabled = true` | Requires `cert` + `key`. | error | config |
+| V-128 | `globals.console.session_key` | At least 32 bytes after substitution. | error | config |
+| V-129 | `globals.console.public_url` | An absolute `http`/`https` URL without query or fragment. | error | config |
+| V-130 | `globals.console.prometheus.url` | An absolute `http`/`https` URL. | error | config |
+| V-131 | `globals.console.prometheus` | `basic` and `bearer_token` are exclusive; `extra_labels` names match `[a-zA-Z_][a-zA-Z0-9_]*` and don't start with `__`. | error | config |
+| V-132 | `globals.console` durations | `session_ttl` 5 min – 7 days; `history.retention` 1 h – 30 days; `events.retention` 1 – 400 days. | error | config |
+| V-133 | `globals.api.oauth2.client_secret` / `scopes` | Need `client_id`. | error | config |
+| V-134 | `globals.console.session_key` with `api.auth = none` | Unused: a cluster without authentication has no sessions. | warning | config |
+| V-135 | `globals.console.enabled = true` with `api.auth ≠ none` | Requires `globals.console.session_key`. | error | config |
+| V-136 | `globals.console.enabled = true` with `api.auth = oauth2` | Requires `globals.console.public_url` and `globals.api.oauth2.client_id`. | error | config |
 
 ### 13.7 Identity / naming
 
@@ -1443,6 +1508,12 @@ globals:
   tracing:
     otlp_endpoint: http://otel-collector.observability:4318
     sample_ratio: 0.05
+  console:
+    enabled: true                              # off by default; served under /ui/
+    session_key: ${CONSOLE_SESSION_KEY}        # ≥ 32 bytes, the same on every node (V-128)
+    prometheus:
+      url: https://prometheus.observability:9090
+      extra_labels: { cluster: prod-eu }
 
 defaults:
   source:
@@ -1709,3 +1780,5 @@ reserved fields were promoted (§15 item 20).
   DDL safe/unsafe classification, and the source-side preconditions (§11.2); owns the
   `schema_evolution` semantics that §9.7 configures.
 - `CDC_Gap_Analysis_Report.md` — gap IDs referenced throughout (G-1f is closed by §13).
+- `research/Admin_Console.md` — the web console that §6.8 and the `oauth2` sign-in fields
+  configure.
