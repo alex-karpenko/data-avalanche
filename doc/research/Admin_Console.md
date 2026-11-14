@@ -55,6 +55,15 @@ shows.
 - **Replacing Prometheus/Grafana** for long-term metrics; the console reads Prometheus when one is
   configured (§7).
 
+**Off unless switched on (Oleksii).** The console is optional: a command-line flag on `run`,
+`--console`, turns it on for that node, and without it the node serves no console. The default is
+off. With the flag off, the console's paths (§10), its sign-in pages and sessions (§9) and its live
+stream don't exist on that node (404), and a `globals.console` block in the config is still
+parsed and validated but unused there. What the console *reads* is recorded whatever the flag
+says (Claude's call): the events and attribution (§5, §6), the history (§7) and the new API
+endpoints (§12) are part of the server, because a console on one node shows what every node
+records, and the audit trail is useful through the API alone. The Helm chart follows (§11).
+
 ## 4. Information architecture
 
 Top bar: the sections, the config generation, and the signed-in name and role. Sections are
@@ -177,7 +186,9 @@ One sign-in page; what follows depends on `globals.api.auth`:
   `HttpOnly`, `Secure`, `SameSite=Strict` cookie, readable by every node so a load balancer can
   send any request anywhere. **The key comes from configuration** (Oleksii):
   `globals.console.session_key`, set through `${ENV}` to the same value on every node, required
-  when `auth` is not `none`. It is never kept in object storage, because people who may read the
+  on a node started with `--console` when `auth` is not `none`: such a node refuses to start
+  without it, and if a later config generation drops it, that node's console shows a
+  "console misconfigured" page and logs an error, while its pipelines carry on (Claude's call). It is never kept in object storage, because people who may read the
   lake's bucket must not be able to mint an admin session. Every request is still verified the
   way the API verifies a bearer token today; the role and the recorded name always come from that
   verification.
@@ -218,7 +229,8 @@ All Claude's calls, "follow best practices" (Oleksii):
   the builder's).
 - **Light and dark** themes following the system setting.
 - **Tests:** Vitest for components; Playwright for real flows against the E2E cluster, including
-  every sign-in mode, the 401/403 pages, the actions' attribution, and the §8 budgets.
+  every sign-in mode, the 401/403 pages, the actions' attribution, the §8 budgets, and a node
+  without `--console` serving none of it.
 - **Accessibility:** keyboard navigation, labels on every state, contrast in both themes.
 
 ## 11. Configuration surface (proposed; spec edits need approval)
@@ -227,15 +239,28 @@ New settings, to be patched into `doc/specs/Configuration_Specification.md` once
 (names are proposals):
 
 - `globals.api.oauth2.client_id` (and optional `scopes`): the console's client for `oauth2`.
-- `globals.console`: `enabled` (default `true`); `session_key` (`${ENV}`, required unless
-  `auth = none`); `public_url` (required with `oauth2`); `session_ttl` (default 8 h, Claude's call);
+- The command-line flag `run --console` (Oleksii): off by default; it switches the console on
+  for that node (§3). `System-Overview.md` lists the command-line parameters, so it gains this one.
+- `globals.console` (no `enabled` field: the flag decides): `session_key` (`${ENV}`, required on a
+  node with `--console` unless `auth = none`, §9); `public_url` (required with `oauth2`); `session_ttl` (default 8 h, Claude's call);
   `username_claim` (default `preferred_username`); `history.retention` (default 24 h);
   `events.retention` (default 30 d); `prometheus` (optional: `url`, `auth`, `tls`,
   `extra_labels`).
 
-Docs touched besides the spec: `API_RBAC_and_Versioning.md` §2 (the new endpoints and their
-roles), `Observability_Metrics_and_Tracing.md` (the history store), the docs site (a console
-page, the runbooks pointing at it), and the gap tracker.
+**Helm chart** (Oleksii: "adapt helm chart accordingly"): a `console.enabled` value, `false` by
+default, that adds `--console` to the container's arguments; the session key and any OAuth2
+client secret reach the pods through the chart's existing `env`/`envFrom`; `NOTES.txt` gives the
+console's address when it is on; the chart's `ci/` values gain a console-on case. The chart has
+no Ingress today and gains none (Claude's call): the console is served on the API's Service.
+
+Docs touched besides the spec (Oleksii: don't forget the documentation site):
+`API_RBAC_and_Versioning.md` §2 (the new endpoints and their roles),
+`Observability_Metrics_and_Tracing.md` (the history store), the gap tracker, the chart's
+README, and the docs site: a console page (switching it on, sign-in per mode, what it shows),
+`reference/configuration` (`globals.console`, `oauth2.client_id`), `reference/api` (the new
+endpoints, the `note` field), `deployment/kubernetes` (`console.enabled`) and
+`deployment/container` (`--console`), `deployment/observability` (history and Prometheus), and
+the runbooks pointing at the console where it does the job.
 
 ## 12. New server work this needs
 
@@ -245,7 +270,7 @@ page, the runbooks pointing at it), and the gap tracker.
   and across pipelines, source detail (slot, WAL held, binlog position), all snapshot jobs, job
   cancel and retry, node leave and shutdown through any node, config generations and diff.
 - Sign-in, sessions, the 401/403 pages (§9).
-- Serving the embedded app (§10).
+- Serving the embedded app (§10), behind the `--console` flag (§3).
 
 ## 13. Left to the builder
 
