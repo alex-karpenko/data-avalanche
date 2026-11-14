@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-04
+updated: 2026-11-14
 domain: Architecture
 tags: [architecture, design, system, multi-sink, iceberg, delta-lake, v1-scope]
 sources: []
@@ -102,6 +102,10 @@ Decisions: `research/V1_Scope_Decisions.md`.
 		- OAuth2/OpenID (with RBAC)
 	- roles are nested `viewer` ⊆ `operator` ⊆ `admin`; endpoints and minimum roles are in the [endpoint table](#management-api-endpoints)
 	- TLS is optional (upstream termination is common); authentication without TLS is a config warning
+	- every mutating call is recorded in the cluster's event log with the caller's name and role (from the server's own verification) and an optional `note` the request carries
+- Web console:
+	- an embedded web console for operators and viewers, served on the management API's listener under the path prefix `/ui/`, with the same authentication and roles
+	- off by default; `globals.console.enabled` in the config switches it on, and a reload can turn it on or off
 - Observability
 	- write logs on different levels to stderr
 	- log level and format (text, json, pretty) configured via command line parameters
