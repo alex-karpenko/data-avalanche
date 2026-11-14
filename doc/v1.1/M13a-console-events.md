@@ -136,8 +136,8 @@ task after the arrow.
 Settled with Oleksii before this plan: the console is switched on in the config
 (`globals.console.enabled`, default off) and served under `/ui/`; the Helm chart and the site are
 updated with it; refused attempts are recorded (mockup round, 2026-11-14); the API address goes
-into the gossip with a version bump (M13b). The rest are Claude's calls under Admin_Console §13,
-for review with this plan.
+into the gossip with a version bump (M13b). The rest are Claude's calls under Admin_Console §13;
+Oleksii approved the plan with them, and the spec patch S-M13a.1, on 2026-11-14.
 
 - **D-M13a.1 The milestones of 1.1.0.** M13a (this plan: config, events, attribution,
   `GET /v1/events`); M13b (the owner-served pipeline detail and per-table figures, source detail,
@@ -193,8 +193,8 @@ for review with this plan.
 
 ### Spec patch for approval (S-M13a.1)
 
-The plan needs these three edits to `doc/specs/System-Overview.md`, applied in Task 4's commit
-only once approved (they are not in the diffs below):
+Approved by Oleksii and applied 2026-11-14 (49e5ee4): these three edits to
+`doc/specs/System-Overview.md`, which the code below implements.
 
 1. The endpoint table, after "List snapshot jobs":
 
@@ -7952,7 +7952,7 @@ git commit -m "test(e2e): the timeline on three nodes — a pause with its note,
 - [ ] `promtool test rules` on the alert rules; the site builds with its link check.
 - [ ] Every mutating route of the OpenAPI document records (Task 4's route table), and
   `GET /v1/events` is in it as viewer.
-- [ ] S-M13a.1 applied, once approved.
+- [x] S-M13a.1 applied (49e5ee4).
 - [ ] The PR's CI green on every target.
 
 ## Deviations during execution

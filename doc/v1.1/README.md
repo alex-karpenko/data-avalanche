@@ -21,7 +21,7 @@ merges (Admin_Console §14).
 | File | What it is | Status |
 |---|---|---|
 | [`mockups/`](mockups/) | The console's pages: Overview, Cluster, node, Pipelines, pipeline, table, snapshot jobs, Events, Config, sign-in and errors, node actions and degraded states | Approved 2026-11-14 |
-| [`M13a-console-events.md`](M13a-console-events.md) | `globals.console` and the console's oauth2 fields (V-128…V-136); the cluster's event timeline in `globals.state`; who did each mutating call, refused attempts too; the cluster's own events; `GET /v1/events`; the events page and alert | Draft for review; every task replayed test-first in a scratch workspace on 2026-11-14 |
+| [`M13a-console-events.md`](M13a-console-events.md) | `globals.console` and the console's oauth2 fields (V-128…V-136); the cluster's event timeline in `globals.state`; who did each mutating call, refused attempts too; the cluster's own events; `GET /v1/events`; the events page and alert | **Approved 2026-11-14**, with its spec patch S-M13a.1; every task replayed test-first in a scratch workspace on 2026-11-14. Not started |
 | M13b | The owner-served pipeline detail and per-table figures, source detail, all tables, all snapshot jobs, job cancel and retry ("copy cancelled"), node leave and shutdown through any node, config generations and diff with each node's file status, process and gossip figures, the gossip's API address and file hash (MAC label v2) | To be planned after M13a |
 | M13c | The history sampler and store, the optional Prometheus reader, the SSE stream | To be planned |
 | M14 | Sign-in and sessions (basic, oauth2, jwt), the 401 and 403 pages | To be planned |
