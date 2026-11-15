@@ -237,8 +237,8 @@ struct Families {
     events_dropped: Counter,
     gossip_probe_rtt: Histogram,
     gossip_suspicions: Family<Labels, Counter>,
-    process_resident_memory: Gauge,
-    process_cpu_seconds: Counter<f64, AtomicU64>,
+    process_resident_memory: Family<Labels, Gauge>,
+    process_cpu_seconds: Family<Labels, Counter<f64, AtomicU64>>,
     /// The CPU seconds counted so far: a reading adds what is new.
     process_cpu_counted: Mutex<f64>,
     process_memory_limit: Family<Labels, Gauge>,
@@ -313,8 +313,8 @@ impl Metrics {
             events_dropped: Counter::default(),
             gossip_probe_rtt: probe_rtt(),
             gossip_suspicions: Family::default(),
-            process_resident_memory: Gauge::default(),
-            process_cpu_seconds: Counter::default(),
+            process_resident_memory: Family::default(),
+            process_cpu_seconds: Family::default(),
             process_cpu_counted: Mutex::new(0.0),
             process_memory_limit: Family::default(),
             process_cpu_limit: Family::default(),
@@ -561,7 +561,9 @@ impl Metrics {
     pub fn process(&self, r: &Reading) {
         let f = &self.families;
         if let Some(bytes) = r.memory_bytes {
-            f.process_resident_memory.set(gauge(bytes));
+            f.process_resident_memory
+                .get_or_create(&vec![])
+                .set(gauge(bytes));
         }
         if let Some(seconds) = r.cpu_seconds {
             let mut counted = f
@@ -569,7 +571,9 @@ impl Metrics {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             if seconds > *counted {
-                f.process_cpu_seconds.inc_by(seconds - *counted);
+                f.process_cpu_seconds
+                    .get_or_create(&vec![])
+                    .inc_by(seconds - *counted);
                 *counted = seconds;
             }
         }

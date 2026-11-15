@@ -406,6 +406,35 @@ fn the_process_series_follow_the_readings() {
     );
 }
 
+/// M13b: no reading, no process series: a host without them scrapes no bogus zero.
+#[test]
+fn no_reading_exposes_no_process_series() {
+    let m = Metrics::new();
+    let text = m.encode();
+    assert!(
+        samples(&text, "process_resident_memory_bytes").is_empty(),
+        "a fresh registry has no memory series: {text}"
+    );
+    assert!(
+        samples(&text, "process_cpu_seconds_total").is_empty(),
+        "a fresh registry has no CPU series: {text}"
+    );
+    m.process(&Reading {
+        memory_bytes: None,
+        cpu_seconds: None,
+        ..Reading::default()
+    });
+    let text = m.encode();
+    assert!(
+        samples(&text, "process_resident_memory_bytes").is_empty(),
+        "a reading without memory is no memory series: {text}"
+    );
+    assert!(
+        samples(&text, "process_cpu_seconds_total").is_empty(),
+        "a reading without CPU is no CPU series: {text}"
+    );
+}
+
 /// M13b: a probe's round trip, and the suspicions each way.
 #[test]
 fn the_gossip_series_count() {
