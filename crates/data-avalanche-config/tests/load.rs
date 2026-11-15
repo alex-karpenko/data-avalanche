@@ -1228,6 +1228,26 @@ fn console_urls_are_stored_trimmed() {
     );
 }
 
+/// Config §6.3: `advertise_url` is absent unless written, and stored trimmed.
+#[test]
+fn advertise_url_is_absent_by_default_and_stored_trimmed() {
+    let cfg = load_str(MINIMAL, &env(&[("PW", "pw")]), &fp_key())
+        .unwrap_or_else(|r| panic!("{r:#?}"))
+        .config;
+    assert_eq!(cfg.globals.api.advertise_url, None);
+    let yaml = MINIMAL.replace(
+        "globals:\n  state: { bucket: app-state }",
+        "globals:\n  state: { bucket: app-state }\n  api:\n    advertise_url: \" https://cdc-0.cdc:8080 \"",
+    );
+    let cfg = load_str(&yaml, &env(&[("PW", "pw")]), &fp_key())
+        .unwrap_or_else(|r| panic!("{r:#?}"))
+        .config;
+    assert_eq!(
+        cfg.globals.api.advertise_url.as_deref(),
+        Some("https://cdc-0.cdc:8080")
+    );
+}
+
 /// Config §6.8: the console's secrets resolve as secrets (shown by fingerprint), Prometheus takes
 /// its bearer token and labels, and the oauth2 sign-in fields keep their defaults.
 #[test]

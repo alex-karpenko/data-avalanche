@@ -244,6 +244,7 @@ walk_fields!(RawGlobals {
 walk_fields!(RawGlobalState { bucket, prefix });
 walk_fields!(RawApi {
     address,
+    advertise_url,
     auth,
     user,
     password,

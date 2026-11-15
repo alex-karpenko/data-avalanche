@@ -1148,6 +1148,14 @@ pub const RULES: &[RuleMeta] = &[
         r#"globals.console.prometheus"#,
         r#"Requires url; basic requires user and password."#,
     ),
+    rule(
+        "V-138",
+        Error,
+        L::Config,
+        Config,
+        r#"globals.api.advertise_url"#,
+        r#"An absolute http/https URL with a host, without a path, query or fragment."#,
+    ),
 ];
 
 /// The registry entry for `id` (`"V-007"`).
@@ -1161,7 +1169,7 @@ mod tests {
 
     #[test]
     fn has_every_spec_rule_once_in_order() {
-        assert_eq!(RULES.len(), 131);
+        assert_eq!(RULES.len(), 132);
         assert!(
             RULES.windows(2).all(|w| w[0].id < w[1].id),
             "sorted, no duplicates"

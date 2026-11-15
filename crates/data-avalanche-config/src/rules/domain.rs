@@ -234,6 +234,19 @@ fn globals(g: &RawGlobals, ctx: &mut Ctx) {
     if let Some(c) = &g.console {
         console(c, &root.key("console"), ctx);
     }
+    // V-138
+    if let Some(l) = g.api.as_ref().and_then(|a| a.advertise_url.as_ref())
+        && let Some(url) = ctx.text(l, &root.key("api").key("advertise_url"))
+        && !origin_url(url.trim())
+    {
+        ctx.error(
+            "V-138",
+            &root.key("api").key("advertise_url"),
+            l.loc(),
+            "advertise_url must be an absolute http or https URL with a host and nothing after it \
+             (no path, query or fragment)",
+        );
+    }
     // V-101
     if let Some(a) = &g.azure
         && let Some((name, loc)) = val(ctx, &a.account_name, &root.key("azure").key("account_name"))
@@ -622,6 +635,20 @@ fn http_headers(ctx: &mut Ctx, headers: &BTreeMap<String, Leaf<String>>, at: &At
 }
 
 /// Whether `text` is an absolute `http`/`https` URL with a host.
+/// An `http(s)://host[:port]` URL, a trailing `/` at most: where a node is reached, not a page.
+fn origin_url(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"));
+    rest.is_some_and(|r| {
+        let host = r.strip_suffix('/').unwrap_or(r);
+        !host.is_empty()
+            && !host.contains(['/', '?', '#', '@'])
+            && !host.contains(char::is_whitespace)
+    })
+}
+
 fn http_url(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     let rest = lower

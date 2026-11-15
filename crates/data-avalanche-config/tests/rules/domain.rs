@@ -340,6 +340,32 @@ pub fn cases() -> Vec<Case> {
                 )
             },
         ),
+        case("V-138", Error, "an advertise_url with a path", || {
+            pg_delta().set(
+                "/globals/api/advertise_url",
+                json!("https://cdc-0.cdc.ns.svc:8080/api"),
+            )
+        }),
+        case("V-138", Error, "an advertise_url without a scheme", || {
+            pg_delta().set("/globals/api/advertise_url", json!("cdc-0.cdc.ns.svc:8080"))
+        }),
+        case("V-138", Error, "an advertise_url with credentials", || {
+            pg_delta().set(
+                "/globals/api/advertise_url",
+                json!("https://u:p@cdc-0:8080"),
+            )
+        }),
+        case(
+            "V-138",
+            Silent,
+            "an advertise_url of a host and port",
+            || {
+                pg_delta().set(
+                    "/globals/api/advertise_url",
+                    json!("https://cdc-0.cdc.ns.svc:8080/"),
+                )
+            },
+        ),
         case("V-131", Error, "basic and a bearer token", || {
             pg_delta().set("/globals/console/prometheus", json!({"url": "https://prom", "basic": {"user": "u", "password": "p"}, "bearer_token": "t"}))
         }),
