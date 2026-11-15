@@ -11,7 +11,7 @@ sidebar:
 exposes the pipelines it owns. Every pipeline series has the labels `pipeline`, `source_host` and
 `source_db`; the node's own gauges (`data_avalanche_cluster_members`,
 `data_avalanche_owned_pipelines`, `data_avalanche_ring_generation`,
-`data_avalanche_config_generation`) have none. `sink.metrics.per_table: true` adds a `table` label
+`data_avalanche_config_generation`) and its event counters have none. `sink.metrics.per_table: true` adds a `table` label
 to the snapshot gauges.
 
 | Family | Metrics |
@@ -22,6 +22,7 @@ to the snapshot gauges.
 | Sink | `data_avalanche_sink_commit_duration_seconds{sink_type}`, `data_avalanche_sink_commit_failures_total`, `data_avalanche_sink_merge_files_rewritten_total`, `data_avalanche_sink_merge_rows_copied_total`, `data_avalanche_sink_soft_dropped_columns` |
 | Cluster | `data_avalanche_lease_state`, `data_avalanche_lease_renew_failures_total`, `data_avalanche_lease_renew_latency_seconds`, `data_avalanche_cluster_members`, `data_avalanche_owned_pipelines`, `data_avalanche_ring_generation` |
 | Status | `data_avalanche_pipeline_status` (running, paused, stopped, error), `data_avalanche_halted_tables` |
+| Events | `data_avalanche_events_written_total`, `data_avalanche_events_dropped_total`: the node's writes to the cluster's [timeline](/data-avalanche/deployment/events/) |
 
 The ones to watch first:
 
@@ -53,6 +54,7 @@ is a starting set of Prometheus rules, with `promtool` tests beside it:
 | `DataAvalancheTablesHalted` | a halted table | [A halted table](/data-avalanche/runbooks/halted-table/) |
 | `DataAvalanchePipelineError` | a pipeline in `error` | [A halted table](/data-avalanche/runbooks/halted-table/#a-pipeline-in-error) |
 | `DataAvalancheWalLag` | a slot holds more than 10 GiB of WAL for 10 minutes | [A lost position](/data-avalanche/runbooks/position-lost/) |
+| `DataAvalancheEventsDropped` | a node dropped events from the cluster's timeline in the last 15 minutes | [Events](/data-avalanche/deployment/events/#when-the-timeline-has-gaps) |
 
 ## The log
 

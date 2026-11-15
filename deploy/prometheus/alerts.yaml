@@ -39,6 +39,15 @@ groups:
         annotations:
           summary: "{{ $labels.pipeline }} is in ERROR"
 
+      # Events the node couldn't write to the cluster's timeline (Admin_Console §6): the store
+      # kept failing, or more came than the writer keeps up with. The trail has gaps.
+      - alert: DataAvalancheEventsDropped
+        expr: increase(data_avalanche_events_dropped_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} dropped events from the cluster's timeline"
+
       # The WAL a PostgreSQL slot retains for the pipeline: it fills the server's disk.
       - alert: DataAvalancheWalLag
         expr: data_avalanche_wal_lag_bytes > 10 * 1024 * 1024 * 1024
