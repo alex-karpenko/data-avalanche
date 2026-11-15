@@ -243,4 +243,44 @@ mod tests {
         );
         Recorder::off("node-a").record(r.event("a.b", EventSeverity::Info, "nowhere"));
     }
+
+    /// Writes an event dated `days` ago straight to the store.
+    async fn aged(events: &Events, days: i64, text: &str) {
+        let at = Utc::now() - chrono::Duration::days(days);
+        let event = EventDoc::new(at, "node-a", "member.joined", EventSeverity::Info, text);
+        events.record(&event).await.unwrap();
+    }
+
+    /// The texts of every stored event, newest first.
+    async fn stored(events: &Events) -> Vec<String> {
+        let page = events.list(&EventQuery::default()).await.unwrap();
+        page.events.into_iter().map(|(_, e)| e.text).collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expiry_waits_a_minute_then_runs_hourly_with_the_latest_retention() {
+        let events = store(0);
+        aged(&events, 10, "ten days").await;
+        aged(&events, 3, "three days").await;
+        let (retention, rx) = watch::channel(Duration::from_secs(7 * 86_400));
+        let _task = tokio::spawn(expire_events(Arc::clone(&events), rx));
+
+        tokio::time::sleep(Duration::from_secs(59)).await;
+        assert_eq!(
+            stored(&events).await.len(),
+            2,
+            "nothing before the first minute"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(stored(&events).await, ["three days"]);
+
+        retention.send(Duration::from_secs(86_400)).unwrap();
+        tokio::time::sleep(PRUNE_EVERY - Duration::from_secs(10)).await;
+        assert_eq!(stored(&events).await, ["three days"], "not before the hour");
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        assert!(
+            stored(&events).await.is_empty(),
+            "the latest retention applied"
+        );
+    }
 }
