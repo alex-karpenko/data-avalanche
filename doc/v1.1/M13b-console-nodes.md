@@ -9156,4 +9156,12 @@ git commit -m "test(e2e): nodes and config through any node, on three nodes"
 
 ## Deviations during execution
 
-None yet.
+Each was found by the task's review and fixed in its fix round, unless it says otherwise. Later
+tasks' blocks applied on top unchanged.
+
+- **Task 1** (fix round, `e0fcf43`): the plan's diff put `origin_url` between `http_url` and its
+  doc comment; the line is back above `http_url`. V-138 accepted an empty host (`https://:8080`) and
+  a port that isn't a number (`http://host:abc`, `http://a:1:2`): `origin_url` now requires a host
+  and, when a port is written, 1–65535 in digits, an IPv6 host in brackets (spec §6.3 "a host and
+  port only"); three cases added. `advertise_url` is stored without a trailing `/`, since Task 5
+  builds a peer's request as `{api_url}{path}`.
