@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use data_avalanche_cluster::{Phase, Ring};
 use serde_json::{Value, json};
 
-use crate::peers::{ACTION_LIMIT, Asked, DETAIL_LIMIT, FORWARDED_BY, STATUS_LIMIT};
+use crate::peers::{ACTION_LIMIT, Asked, DETAIL_LIMIT, FORWARDED_BY, MAX_ANSWER, STATUS_LIMIT};
 use crate::{Api, Node, body, starting};
 
 /// The first 16 hex digits of a `blake3:<hex>` hash, as a node gossips its file's.
@@ -290,6 +290,93 @@ pub(crate) async fn config_status(
     .await
 }
 
+/// `GET /v1/config/nodes` (D-M13b.12): the generation the cluster runs, and for each member the
+/// one it runs, whether its own file is that generation's text (`same`, `differs`, or `unknown`
+/// when it gossips no hash), and its fields waiting for a restart, from its own
+/// `/v1/config/status` asked with the caller's credentials (`null`, and `error`, when it doesn't
+/// answer within the limit).
+pub(crate) async fn files(State(api): State<Api>, headers: HeaderMap) -> Response {
+    let Some(node) = api.node.get() else {
+        return starting();
+    };
+    let current = match node.coordinator.generations().current().await {
+        Ok(Some(c)) => c.pointer.doc,
+        Ok(None) => node.coordinator.generation().await,
+        Err(e) => {
+            return body(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({ "error": format!("the config generation can't be read: {e}") }),
+            );
+        }
+    };
+    let members = node.members.borrow().clone();
+    let mut asks = tokio::task::JoinSet::new();
+    for (name, m) in &members.nodes {
+        if *name == members.me || m.meta.api_url.is_empty() {
+            continue;
+        }
+        let (peers, name, url) = (node.peers.clone(), name.clone(), m.meta.api_url.clone());
+        let asked = Asked::from(Method::GET, &headers, Bytes::new());
+        asks.spawn(async move {
+            let answer = peers
+                .send(&name, &url, "/v1/config/status", asked, STATUS_LIMIT)
+                .await;
+            let code = answer.status();
+            let v: Value = axum::body::to_bytes(answer.into_body(), MAX_ANSWER)
+                .await
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or(Value::Null);
+            let pending = if code == StatusCode::OK {
+                Ok(v["restart_pending"].clone())
+            } else {
+                Err(v["error"]
+                    .as_str()
+                    .map_or_else(|| format!("{name} answered {code}"), str::to_owned))
+            };
+            (name, pending)
+        });
+    }
+    let mut pending: std::collections::BTreeMap<String, Result<Value, String>> =
+        asks.join_all().await.into_iter().collect();
+    pending.insert(
+        members.me.clone(),
+        Ok(json!(node.coordinator.restart_pending().await)),
+    );
+    let nodes: Vec<Value> = members
+        .nodes
+        .iter()
+        .map(|(name, m)| {
+            let file = match m.meta.file_hash.as_str() {
+                "" => "unknown",
+                h if h == short(&current.hash) => "same",
+                _ => "differs",
+            };
+            let mut v = json!({
+                "node": name,
+                "generation": m.meta.config_generation,
+                "file": file,
+            });
+            match pending.remove(name) {
+                Some(Ok(p)) => v["restart_pending"] = p,
+                Some(Err(e)) => {
+                    v["restart_pending"] = Value::Null;
+                    v["error"] = json!(e);
+                }
+                None => {
+                    v["restart_pending"] = Value::Null;
+                    v["error"] = json!(format!("{name} gossips no API address"));
+                }
+            }
+            v
+        })
+        .collect();
+    body(
+        StatusCode::OK,
+        &json!({ "generation": current.generation, "hash": current.hash, "nodes": nodes }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
@@ -405,6 +492,71 @@ mod tests {
     async fn recorded(events: &Events) -> Vec<EventDoc> {
         let page = events.list(&EventQuery::default()).await.unwrap();
         page.events.into_iter().map(|(_, e)| e).collect()
+    }
+
+    /// Each member's generation, file and pending fields: node-b's from its own status, asked
+    /// with the caller's credentials; node-c gossips no address, and a file of its own.
+    #[tokio::test]
+    async fn each_node_s_file_and_pending_fields_are_listed() {
+        let log: Log = Arc::default();
+        let kept = Arc::clone(&log);
+        let app = Router::new().fallback(move |uri: Uri, headers: HeaderMap| {
+            let kept = Arc::clone(&kept);
+            async move {
+                kept.lock().unwrap().push(Seen {
+                    method: Method::GET,
+                    uri: uri.to_string(),
+                    authorization: headers
+                        .get("authorization")
+                        .map(|v| v.to_str().unwrap().to_owned()),
+                    target: None,
+                    forwarded_by: None,
+                    body: String::new(),
+                });
+                body(
+                    StatusCode::OK,
+                    &json!({ "restart_pending": ["globals.api.address"] }),
+                )
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        // node-a's view, with node-c beside node-b, served again.
+        let (_, lone, _dir) = served(&b, open()).await;
+        let mut c = member("", Phase::Active);
+        c.meta.file_hash = file_hash("another file");
+        let mut view = lone.node.members.borrow().clone();
+        view.nodes.insert("node-c".into(), c);
+        let (tx, rx) = watch::channel(view);
+        let mut node = lone.node.clone();
+        node.members = rx;
+        let a = api(open());
+        a.node.set(node).unwrap();
+        let addr = serve(a).await;
+        std::mem::forget(tx);
+
+        let auth = [("Authorization", "Bearer the-callers-token")];
+        let (code, _, text) = request(addr, "GET", "/v1/config/nodes", &auth, "").await;
+        assert_eq!(code, 200, "{text}");
+        let v = json(&text);
+        assert_eq!(v["generation"], 1);
+        assert_eq!(
+            v["nodes"],
+            json!([
+                { "node": "node-a", "generation": 1, "file": "same", "restart_pending": [] },
+                { "node": "node-b", "generation": 1, "file": "same", "restart_pending": ["globals.api.address"] },
+                {
+                    "node": "node-c", "generation": 1, "file": "differs", "restart_pending": null,
+                    "error": "node-c gossips no API address",
+                },
+            ])
+        );
+        let seen = log.lock().unwrap()[0].clone();
+        assert_eq!(
+            (seen.uri.as_str(), seen.authorization.as_deref()),
+            ("/v1/config/status", Some("Bearer the-callers-token"))
+        );
     }
 
     #[tokio::test]

@@ -190,6 +190,23 @@ Least role: `viewer`.
 
 The config generation the cluster runs: validate, publish, status.
 
+### `GET /v1/config/diff`
+
+What differs between two config generations as written: each change's path, what a reload of it does, before and after, secrets masked
+
+Least role: `viewer`.
+
+- Query parameter `from`: the generation compared from.
+- Query parameter `to`: the generation compared to.
+
+| Status | When |
+|---|---|
+| `200` | the pipelines added and removed, and the changes |
+| `400` | from or to missing, or not a number |
+| `404` | no such generation |
+| `409` | several snapshots of one and no record of which it is |
+| `500` | a text couldn't be compared |
+
 ### `GET /v1/config/generations`
 
 The config generations, newest first: who published each, why, and what it changed
@@ -219,6 +236,17 @@ Least role: `viewer`.
 | `404` | no such generation |
 | `409` | several snapshots of it and no record of which one it is |
 | `500` | its text couldn't be masked, so it isn't shown |
+
+### `GET /v1/config/nodes`
+
+Each member's config generation, whether its own file is the cluster's generation, and its fields waiting for a restart
+
+Least role: `viewer`.
+
+
+| Status | When |
+|---|---|
+| `200` | the generation the cluster runs, and each member |
 
 ### `POST /v1/config/reload`
 

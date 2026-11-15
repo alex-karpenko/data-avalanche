@@ -105,6 +105,88 @@ pub(crate) async fn list(State(api): State<Api>, RawQuery(raw): RawQuery) -> Res
     }
 }
 
+/// A generation's text, or the answer that says why there is none.
+async fn text_of(node: &crate::Node, n: u64) -> Result<String, Box<Response>> {
+    match node.coordinator.generations().one(n).await {
+        Ok(None) => Err(Box::new(
+            Failure::new(StatusCode::NOT_FOUND, format!("no config generation {n}")).into(),
+        )),
+        Ok(Some((_, None))) => Err(Box::new(ambiguous(n))),
+        Ok(Some((_, Some(text)))) => Ok(text),
+        Err(e) => Err(Box::new(unreadable(&e))),
+    }
+}
+
+fn ambiguous(n: u64) -> Response {
+    Failure::new(
+        StatusCode::CONFLICT,
+        format!(
+            "config generation {n} has several snapshots and no record of which one it is: a publish that lost its race left one behind"
+        ),
+    )
+    .into()
+}
+
+/// `GET /v1/config/diff?from=&to=` (D-M13b.11): what differs between two generations as written.
+pub(crate) async fn diff(State(api): State<Api>, RawQuery(raw): RawQuery) -> Response {
+    let Some(node) = api.node.get() else {
+        return starting();
+    };
+    let (mut from, mut to) = (None, None);
+    for (name, value) in url::form_urlencoded::parse(raw.unwrap_or_default().as_bytes()) {
+        let slot = match &*name {
+            "from" => &mut from,
+            "to" => &mut to,
+            other => {
+                return Failure::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown parameter {other:?}: the diff takes from, to"),
+                )
+                .into();
+            }
+        };
+        let Ok(n) = value.trim().parse::<u64>() else {
+            return Failure::new(
+                StatusCode::BAD_REQUEST,
+                format!("{name} is a generation's number"),
+            )
+            .into();
+        };
+        *slot = Some(n);
+    }
+    let (Some(from), Some(to)) = (from, to) else {
+        return Failure::new(
+            StatusCode::BAD_REQUEST,
+            "the diff takes from and to, both generations",
+        )
+        .into();
+    };
+    let before = match text_of(node, from).await {
+        Ok(t) => t,
+        Err(r) => return *r,
+    };
+    let after = match text_of(node, to).await {
+        Ok(t) => t,
+        Err(r) => return *r,
+    };
+    match node.coordinator.diff_written(&before, &after) {
+        Ok(d) => body(
+            StatusCode::OK,
+            &json!({
+                "from": from,
+                "to": to,
+                "pipelines": { "added": d.added, "removed": d.removed },
+                "changes": d.changes,
+            }),
+        ),
+        Err(e) => Failure::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("the generations' texts can't be compared: {e}"),
+        )
+        .into(),
+    }
+}
+
 /// One generation and its text, secrets masked.
 pub(crate) async fn one(State(api): State<Api>, Path(generation): Path<String>) -> Response {
     let Some(node) = api.node.get() else {
@@ -115,13 +197,7 @@ pub(crate) async fn one(State(api): State<Api>, Path(generation): Path<String>) 
     };
     match node.coordinator.generations().one(n).await {
         Ok(None) => Failure::new(StatusCode::NOT_FOUND, format!("no config generation {n}")).into(),
-        Ok(Some((_, None))) => Failure::new(
-            StatusCode::CONFLICT,
-            format!(
-                "config generation {n} has several snapshots and no record of which one it is: a publish that lost its race left one behind"
-            ),
-        )
-        .into(),
+        Ok(Some((_, None))) => ambiguous(n),
         Ok(Some((listed, Some(text)))) => match node.coordinator.mask(&text) {
             Ok(masked) => {
                 let mut v = listed_json(&listed);
@@ -216,7 +292,24 @@ mod tests {
         );
         assert!(!text.contains("password: pw"), "{text}");
 
+        let (code, v) = json_of(addr, "GET", "/v1/config/diff?from=1&to=2").await;
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(
+            v,
+            json!({
+                "from": 1, "to": 2,
+                "pipelines": { "added": [], "removed": [] },
+                "changes": [{
+                    "path": "globals.cluster.drain_timeout", "class": "in_place",
+                    "before": "45s", "after": "40s",
+                }],
+            })
+        );
+
         for (path, want) in [
+            ("/v1/config/diff?from=1&to=3", 404),
+            ("/v1/config/diff?from=1", 400),
+            ("/v1/config/diff?from=1&to=x", 400),
             ("/v1/config/generations/3", 404),
             ("/v1/config/generations/x", 400),
             ("/v1/config/generations?limit=0", 400),

@@ -12,8 +12,8 @@ use std::time::Duration;
 use chrono::Utc;
 use data_avalanche_config::{
     ConfigDiff, Env, FingerprintKey, Fingerprints, Globals, MaskError, Mutability, Pipeline,
-    PipelineChange, Report, ResolvedConfig, diff, diff_with, load_posted_str, load_str,
-    mask_secrets,
+    PipelineChange, Report, ResolvedConfig, WrittenDiff, diff, diff_with, diff_written,
+    load_posted_str, load_str, mask_secrets,
 };
 use data_avalanche_core::TableRef;
 use data_avalanche_state::{
@@ -234,6 +234,15 @@ impl ConfigCoordinator {
     /// [`MaskError`]: the text isn't shown.
     pub fn mask(&self, text: &str) -> Result<String, MaskError> {
         mask_secrets(text, &self.inner.deps.key)
+    }
+
+    /// What differs between two generations' texts as written, secrets masked under the
+    /// cluster's fingerprint key ([`diff_written`]).
+    ///
+    /// # Errors
+    /// [`MaskError::Parse`]: a text isn't a config.
+    pub fn diff_written(&self, from: &str, to: &str) -> Result<WrittenDiff, MaskError> {
+        diff_written(from, to, &self.inner.deps.key)
     }
 
     /// The config this node runs: its generation's text as resolved here.

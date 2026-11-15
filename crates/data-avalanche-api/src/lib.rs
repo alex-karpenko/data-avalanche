@@ -227,6 +227,32 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
         (
             r(
                 "GET",
+                "/v1/config/diff",
+                Viewer,
+                "What differs between two config generations as written: each change's path, what a reload of it does, before and after, secrets masked",
+                &[
+                    (200, "the pipelines added and removed, and the changes"),
+                    (400, "from or to missing, or not a number"),
+                    (404, "no such generation"),
+                    (409, "several snapshots of one and no record of which it is"),
+                    (500, "a text couldn't be compared"),
+                ],
+            ),
+            get(generations::diff),
+        ),
+        (
+            r(
+                "GET",
+                "/v1/config/nodes",
+                Viewer,
+                "Each member's config generation, whether its own file is the cluster's generation, and its fields waiting for a restart",
+                &[(200, "the generation the cluster runs, and each member")],
+            ),
+            get(nodes::files),
+        ),
+        (
+            r(
+                "GET",
                 "/v1/config/generations",
                 Viewer,
                 "The config generations, newest first: who published each, why, and what it changed",
@@ -764,6 +790,8 @@ mod tests {
                 ("POST", "/v1/config/validate", Operator),
                 ("POST", "/v1/config/reload", Operator),
                 ("GET", "/v1/config/status", Viewer),
+                ("GET", "/v1/config/diff", Viewer),
+                ("GET", "/v1/config/nodes", Viewer),
                 ("GET", "/v1/config/generations", Viewer),
                 ("GET", "/v1/config/generations/{generation}", Viewer),
                 ("GET", "/v1/cluster/status", Viewer),

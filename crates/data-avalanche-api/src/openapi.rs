@@ -59,6 +59,25 @@ fn operation(r: &Route) -> utoipa::openapi::path::Operation {
             );
         }
     }
+    if r.path == "/v1/config/diff" {
+        for (name, description) in [
+            ("from", "the generation compared from"),
+            ("to", "the generation compared to"),
+        ] {
+            op = op.parameter(
+                ParameterBuilder::new()
+                    .name(name)
+                    .parameter_in(ParameterIn::Query)
+                    .required(Required::True)
+                    .description(Some(description))
+                    .schema(Some(
+                        ObjectBuilder::new()
+                            .schema_type(Type::Integer)
+                            .minimum(Some(1)),
+                    )),
+            );
+        }
+    }
     if r.path == "/v1/config/generations" {
         for (name, description) in crate::generations::PARAMETERS {
             let schema = if *name == "limit" {

@@ -185,6 +185,95 @@
         "x-min-role": "viewer"
       }
     },
+    "/v1/config/diff": {
+      "get": {
+        "tags": [
+          "config"
+        ],
+        "summary": "What differs between two config generations as written: each change's path, what a reload of it does, before and after, secrets masked",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "description": "the generation compared from",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "the generation compared to",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the pipelines added and removed, and the changes",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "400": {
+            "description": "from or to missing, or not a number",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "404": {
+            "description": "no such generation",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "409": {
+            "description": "several snapshots of one and no record of which it is",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "500": {
+            "description": "a text couldn't be compared",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "viewer"
+      }
+    },
     "/v1/config/generations": {
       "get": {
         "tags": [
@@ -314,6 +403,49 @@
           },
           "500": {
             "description": "its text couldn't be masked, so it isn't shown",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "viewer"
+      }
+    },
+    "/v1/config/nodes": {
+      "get": {
+        "tags": [
+          "config"
+        ],
+        "summary": "Each member's config generation, whether its own file is the cluster's generation, and its fields waiting for a restart",
+        "responses": {
+          "200": {
+            "description": "the generation the cluster runs, and each member",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
             "content": {
               "application/json": {}
             }

@@ -105,7 +105,7 @@ pub use field_docs::{DocDefault, FIELD_DOCS, FieldDoc};
 pub use keys::{Key, KeyShape, config_keys, key_mutability};
 pub use leaf::Loc;
 pub use load::{Loaded, load_file, load_posted_str, load_str, validate_str};
-pub use mask::{MASK, MaskError, mask_secrets};
+pub use mask::{MASK, MaskError, WrittenChange, WrittenDiff, diff_written, mask_secrets};
 pub use material::{FileRef, Origin, Pem};
 pub use mutability::Mutability;
 pub use registry::{RULES, RuleInput, RuleLocus, RuleMeta, RuleSeverity, rule_meta};

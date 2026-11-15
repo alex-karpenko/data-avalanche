@@ -13,9 +13,15 @@
 //! directive isn't shown ([`MaskError::MergeKey`]): a key that overrides or retags a value would
 //! hide the secret the masker reads.
 
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde::Serialize;
 use thiserror::Error;
 
+use crate::diff::is_fixed;
+use crate::keys::key_mutability;
 use crate::leaf::Loc;
+use crate::mutability::Mutability;
 use crate::parse::parse_document;
 use crate::raw::RawConfig;
 use crate::secret::{FingerprintKey, fingerprint};
@@ -96,6 +102,122 @@ pub fn mask_secrets(text: &str, key: &FingerprintKey) -> Result<String, MaskErro
     }
     check(&secrets, &out)?;
     Ok(out)
+}
+
+/// One value that differs between two config texts, as written, its secrets masked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WrittenChange {
+    /// Dotted, a pipeline by its `id` (`pipelines.orders.source.port`); a list's element as
+    /// `[i]` (`tables.include[0]`).
+    pub path: String,
+    /// What a reload of the change does: `in_place`, `tables` (a pipeline restart when the
+    /// resolved table set changes), `pipeline_restart`, `node_restart`, or `fixed` (refused).
+    pub class: &'static str,
+    /// `None` where the value isn't written.
+    pub before: Option<String>,
+    pub after: Option<String>,
+}
+
+/// What differs between two config texts as written ([`diff_written`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct WrittenDiff {
+    /// Pipelines by `id`.
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    /// Outside the pipelines added and removed.
+    pub changes: Vec<WrittenChange>,
+}
+
+/// What differs between `from` and `to`, both parsed without the environment and compared value
+/// by value as written (Admin_Console §4 Config, D-M13b.11), secrets shown as [`mask_secrets`]
+/// shows them. A `${VAR}` whose value changed isn't a change here: the text is the same.
+///
+/// # Errors
+/// [`MaskError::Parse`]: one of them isn't a config.
+pub fn diff_written(from: &str, to: &str, key: &FingerprintKey) -> Result<WrittenDiff, MaskError> {
+    let (before, before_ids) = flatten(from, key)?;
+    let (after, after_ids) = flatten(to, key)?;
+    let pipeline = |path: &str| {
+        path.strip_prefix("pipelines.")
+            .and_then(|rest| rest.split('.').next())
+            .map(str::to_owned)
+    };
+    let added: Vec<String> = after_ids.difference(&before_ids).cloned().collect();
+    let removed: Vec<String> = before_ids.difference(&after_ids).cloned().collect();
+    let paths: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
+    let changes = paths
+        .into_iter()
+        .filter(|p| pipeline(p).is_none_or(|id| !added.contains(&id) && !removed.contains(&id)))
+        .filter(|p| before.get(*p) != after.get(*p))
+        .map(|p| WrittenChange {
+            path: p.clone(),
+            class: class_of(p),
+            before: before.get(p).cloned(),
+            after: after.get(p).cloned(),
+        })
+        .collect();
+    Ok(WrittenDiff {
+        added,
+        removed,
+        changes,
+    })
+}
+
+/// A written path's reload class.
+fn class_of(path: &str) -> &'static str {
+    let mut segments: Vec<&str> = path
+        .split('.')
+        .map(|s| s.split('[').next().unwrap_or(s))
+        .collect();
+    if segments.first() == Some(&"defaults") {
+        segments.splice(0..1, ["pipelines", "*"]);
+    }
+    let key = segments.join(".");
+    if is_fixed(&key) {
+        return "fixed";
+    }
+    match key_mutability(&key) {
+        Some(Mutability::R) => "in_place",
+        Some(Mutability::PrIfTableSetChanges) => "tables",
+        Some(Mutability::Pr) => "pipeline_restart",
+        Some(Mutability::Proc) | None => "node_restart",
+    }
+}
+
+/// Every leaf of `text` by its dotted path (a pipeline by its `id`), its secrets masked, and
+/// the pipelines' ids.
+fn flatten(
+    text: &str,
+    key: &FingerprintKey,
+) -> Result<(BTreeMap<String, String>, BTreeSet<String>), MaskError> {
+    let raw: RawConfig = parse_document(text).map_err(|_| MaskError::Parse)?;
+    let mut all = vec![];
+    raw.globals.leaves(&["globals".to_owned()], &mut all);
+    raw.defaults.leaves(&["defaults".to_owned()], &mut all);
+    let mut ids = BTreeSet::new();
+    for (name, p) in raw.pipelines.iter().flatten() {
+        let id =
+            p.id.as_ref()
+                .map_or_else(|| name.clone(), |l| l.text().to_owned());
+        Some(p.clone()).leaves(&under(&["pipelines".to_owned()], &id), &mut all);
+        ids.insert(id);
+    }
+    let mut out = BTreeMap::new();
+    for w in all {
+        let shown = match literal(&w.text) {
+            Some(value) if is_secret(&w) => masked(key, &value),
+            _ => w.text.clone(),
+        };
+        let mut path = String::new();
+        for s in &w.path {
+            if !s.starts_with('[') && !path.is_empty() {
+                path.push('.');
+            }
+            path.push_str(s);
+        }
+        out.insert(path, shown);
+    }
+    Ok((out, ids))
 }
 
 /// A literal secret's mask.
@@ -421,6 +543,75 @@ pipelines:
             format!("      password: \"{}\"", masked(&key(), "first-secret"))
         );
         assert!(!b.contains("second-secret"));
+    }
+
+    /// Two generations' differences, by path and class, secrets masked; a pipeline added is
+    /// named, not its every key.
+    #[test]
+    fn a_rotated_literal_secret_shows_only_its_fingerprint() {
+        let from = "\
+config_version: 1
+globals:
+  cluster: { tokens: 128, drain_timeout: 45s }
+pipelines:
+  a:
+    id: orders
+    source: { port: 5432, password: first-secret }
+    tables: { include: [public.orders] }
+";
+        let to = "\
+config_version: 1
+globals:
+  cluster: { tokens: 256, drain_timeout: 40s }
+pipelines:
+  a:
+    id: orders
+    source: { port: 5432, password: second-secret }
+    tables: { include: [public.orders, public.lines] }
+  b:
+    id: users
+    source: { port: 5433 }
+";
+        let d = diff_written(from, to, &key()).unwrap();
+        assert_eq!((d.added, d.removed), (vec!["users".to_owned()], vec![]));
+        let got: Vec<(&str, &str, Option<&str>, Option<&str>)> = d
+            .changes
+            .iter()
+            .map(|c| {
+                (
+                    c.path.as_str(),
+                    c.class,
+                    c.before.as_deref(),
+                    c.after.as_deref(),
+                )
+            })
+            .collect();
+        let first = masked(&key(), "first-secret");
+        let second = masked(&key(), "second-secret");
+        assert_eq!(
+            got,
+            [
+                (
+                    "globals.cluster.drain_timeout",
+                    "in_place",
+                    Some("45s"),
+                    Some("40s")
+                ),
+                ("globals.cluster.tokens", "fixed", Some("128"), Some("256")),
+                (
+                    "pipelines.orders.source.password",
+                    "pipeline_restart",
+                    Some(first.as_str()),
+                    Some(second.as_str())
+                ),
+                (
+                    "pipelines.orders.tables.include[1]",
+                    "tables",
+                    None,
+                    Some("public.lines")
+                ),
+            ]
+        );
     }
 
     /// Only the secret keys are masked: a `user` written as the password's text stays shown, and
