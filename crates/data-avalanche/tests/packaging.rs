@@ -133,6 +133,7 @@ fn the_chart_sets_the_environment_its_values_document() {
         "POD_NAMESPACE",
         "POD_IP",
         "DATA_AVALANCHE_DISCOVERY_DNS_NAME",
+        "DATA_AVALANCHE_POD_DNS_NAME",
     ] {
         assert!(statefulset.contains(&format!("- name: {name}\n")), "{name}");
         assert!(values.contains(name), "values.yaml doesn't document {name}");

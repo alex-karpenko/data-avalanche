@@ -39,8 +39,9 @@ new MAC: a 1.0 node can't open them, nor a 1.1 node a 1.0 node's. Rolled one nod
 two versions would see each other as gone, and each would place the pipelines among its own
 members only. So stop every node, then start them all on 1.1:
 
-- On Kubernetes, `kubectl scale statefulset <release> --replicas=0`, wait until its pods are
-  gone, then `helm upgrade`: it scales the StatefulSet back to the chart's `replicas`.
+- On Kubernetes, `kubectl scale statefulset <release>-data-avalanche --replicas=0` (the StatefulSet
+  is named after the release alone when its name already contains `data-avalanche`), wait until
+  its pods are gone, then `helm upgrade`: it scales the StatefulSet back to the chart's `replicas`.
 - Outside Kubernetes, `SIGTERM` (or `POST /v1/admin/shutdown`) every node, wait for each to exit,
   then start them on 1.1.
 
