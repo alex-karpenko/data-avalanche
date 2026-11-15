@@ -3613,6 +3613,7 @@ index 72e50c7..1d7f040 100644
 +url.workspace = true
  utoipa.workspace = true
  uuid.workspace = true
+ 
 ```
 
 `crates/data-avalanche-api/openapi.json`:
@@ -4966,6 +4967,7 @@ index 31809ab..a56cf1e 100644
 +            note: None,
          }
      }
+ 
 ```
 
 `crates/data-avalanche/src/run.rs`:
@@ -5554,6 +5556,7 @@ index 2f20ad8..d8f5e9f 100644
 +| `400` | a parameter that isn't one, or isn't in its form |
  
  ## openapi.json
+ 
 ```
 
 `xtask/src/api.rs`:
@@ -7274,6 +7277,7 @@ index 03b62d4..e20ab18 100644
 +        done
      }
  }
+ 
 ```
 
 `crates/data-avalanche-cluster/src/lib.rs`:
@@ -7755,6 +7759,7 @@ index 6a714bd..0e39a3b 100644
 +| `DataAvalancheEventsDropped` | a node dropped events from the cluster's timeline in the last 15 minutes | [Events](/data-avalanche/deployment/events/#when-the-timeline-has-gaps) |
  
  ## The log
+ 
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
