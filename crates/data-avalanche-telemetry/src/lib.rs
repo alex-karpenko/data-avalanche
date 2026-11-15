@@ -76,6 +76,24 @@ impl LeaseState {
     }
 }
 
+/// `data_avalanche_gossip_suspicions_total{direction}` (D-M13b.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Suspicion {
+    /// This node's probe of a member failed: it suspects the member.
+    Raised,
+    /// Another member suspected this node, and it refuted.
+    Received,
+}
+
+impl Suspicion {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Raised => "raised",
+            Self::Received => "received",
+        }
+    }
+}
+
 /// `data_avalanche_lease_renew_failures_total{class}` (Clustering §19).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenewFailure {
@@ -213,6 +231,8 @@ struct Families {
     ring_generation: Gauge,
     events_written: Counter,
     events_dropped: Counter,
+    gossip_probe_rtt: Histogram,
+    gossip_suspicions: Family<Labels, Counter>,
     wal_lag_bytes: Family<Labels, Gauge>,
     source_reconnects: Family<Labels, Counter>,
     snapshot_rows_done: Family<Labels, Gauge>,
@@ -233,6 +253,11 @@ struct Families {
     sink_commit_duration: HistogramFamily,
     sink_commit_failures: Family<Labels, Counter>,
     sink_soft_dropped_columns: Family<Labels, Gauge>,
+}
+
+fn probe_rtt() -> Histogram {
+    // 0.5 ms … ~1 s.
+    Histogram::new(exponential_buckets(0.0005, 2.0, 12))
 }
 
 fn renew_latency() -> Histogram {
@@ -276,6 +301,8 @@ impl Metrics {
             ring_generation: Gauge::default(),
             events_written: Counter::default(),
             events_dropped: Counter::default(),
+            gossip_probe_rtt: probe_rtt(),
+            gossip_suspicions: Family::default(),
             wal_lag_bytes: Family::default(),
             source_reconnects: Family::default(),
             snapshot_rows_done: Family::default(),
@@ -338,6 +365,16 @@ impl Metrics {
             "events_dropped",
             "Events this node couldn't write: its queue was full, or the store kept failing",
             f.events_dropped.clone(),
+        );
+        r.register(
+            "gossip_probe_rtt_seconds",
+            "A gossip probe's round trip, from its ping to its ack",
+            f.gossip_probe_rtt.clone(),
+        );
+        r.register(
+            "gossip_suspicions",
+            "Suspicions this node raised of a member, or received of itself and refuted",
+            f.gossip_suspicions.clone(),
         );
         r.register(
             "config_generation",
@@ -479,6 +516,18 @@ impl Metrics {
     /// An event not written: its queue was full, or the store kept failing.
     pub fn event_dropped(&self) {
         self.families.events_dropped.inc();
+    }
+
+    /// A gossip probe's round trip.
+    pub fn gossip_probe_rtt(&self, rtt: Duration) {
+        self.families.gossip_probe_rtt.observe(rtt.as_secs_f64());
+    }
+
+    pub fn gossip_suspicion(&self, direction: Suspicion) {
+        self.families
+            .gossip_suspicions
+            .get_or_create(&vec![("direction", direction.label().to_owned())])
+            .inc();
     }
 
     pub fn set_ring_generation(&self, generation: u64) {

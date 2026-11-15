@@ -219,6 +219,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     let key = GossipKey::derive(&joined.fingerprint_key);
     let gossip = Gossip::start(me, key, GossipSettings::new(m), Arc::new(udp), inbox);
     tracing::info!(%addr, bound = ?bind, "gossip started");
+    gossip.report_to(metrics.clone());
     // The file's hash, gossiped again when the file changes under the node (D-M13b.3).
     let _file = tokio::spawn(watch_file(
         args.config.clone(),

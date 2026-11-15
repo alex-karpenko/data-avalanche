@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use data_avalanche_telemetry::{
     LeaseState, Metrics, PipelineLabels, PipelineStatus, RenewFailure, RowsRead, SnapshotState,
-    Totals,
+    Suspicion, Totals,
 };
 
 const L: &str = r#"pipeline="orders",source_host="db1",source_db="shop""#;
@@ -369,6 +369,28 @@ fn the_node_reports_its_config_generation() {
         text.lines()
             .any(|l| l == "data_avalanche_config_generation 3"),
         "{text}"
+    );
+}
+
+/// M13b: a probe's round trip, and the suspicions each way.
+#[test]
+fn the_gossip_series_count() {
+    let m = Metrics::new();
+    m.gossip_probe_rtt(Duration::from_millis(2));
+    m.gossip_suspicion(Suspicion::Raised);
+    m.gossip_suspicion(Suspicion::Raised);
+    m.gossip_suspicion(Suspicion::Received);
+    let text = m.encode();
+    assert_eq!(
+        samples(&text, "data_avalanche_gossip_probe_rtt_seconds_count"),
+        ["data_avalanche_gossip_probe_rtt_seconds_count 1"]
+    );
+    assert_eq!(
+        samples(&text, "data_avalanche_gossip_suspicions_total"),
+        [
+            "data_avalanche_gossip_suspicions_total{direction=\"raised\"} 2",
+            "data_avalanche_gossip_suspicions_total{direction=\"received\"} 1"
+        ]
     );
 }
 

@@ -65,6 +65,9 @@ const CATALOGUE: &[(&str, Option<&[&str]>)] = &[
     // Events (Admin_Console §6)
     ("data_avalanche_events_written_total", None),
     ("data_avalanche_events_dropped_total", None),
+    // Gossip (D-M13b.8); `gossip_suspicions_total{direction}`, a node series with a label of
+    // its own, is checked in `metrics.rs`.
+    ("data_avalanche_gossip_probe_rtt_seconds_count", None),
 ];
 
 /// The per-table series `sink.metrics.per_table` adds `table` to, with their other labels.
@@ -133,6 +136,7 @@ fn everything(per_table: bool) -> Metrics {
     m.owned_by(1);
     m.set_cluster_members(1);
     m.set_ring_generation(1);
+    m.gossip_probe_rtt(Duration::from_millis(1));
     m
 }
 

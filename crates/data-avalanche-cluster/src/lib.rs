@@ -37,10 +37,12 @@ pub use coordinator::{
 pub use discovery::{Seeds, advertise, discover, interfaces};
 pub use error::ClusterError;
 pub use events::{
-    EVENT_QUEUE, PRUNE_EVERY, Recorder, WRITE_RETRIES, expire_events, record_members,
+    EVENT_QUEUE, MEMBERS_SETTLE, PRUNE_EVERY, Recorder, WRITE_RETRIES, expire_events,
+    record_members,
 };
 pub use gossip::{
-    Advertiser, Announcer, Gossip, GossipSettings, Member, Members, NodeIdentity, NodeMeta, Phase,
+    Advertiser, Announcer, Gossip, GossipFigures, GossipSettings, Member, Members, NodeIdentity,
+    NodeMeta, Phase, SUSPICIONS_KEPT,
 };
 pub use lease::{LeaseGuard, LeaseRun, LeaseTiming, RenewEnd, RenewState};
 pub use node::{JOIN_WAIT, join, leave};
