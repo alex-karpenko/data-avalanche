@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
-use data_avalanche_api::{Api, Auth, Control, Node, RateLimit, ServeError, Stop, bind, router};
+use data_avalanche_api::{
+    Api, Auth, Control, Node, Peers, RateLimit, ServeError, Stop, bind, router,
+};
 use data_avalanche_cluster::{
     ClusterReconciler, ConfigCoordinator, ControllerDeps, ControllerSettings, CoordinatorDeps,
     DocsFn, Gossip, GossipKey, GossipSettings, LeaseTiming, NodeIdentity, NodeMeta, Phase,
@@ -119,7 +121,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     // The listener answers from here: live at once, ready once every controller runs.
     let metrics = Metrics::new();
     // The process's memory and CPU every 15 s, for /metrics and the node's page (D-M13b.7).
-    let (sampled, _process) = watch::channel(ProcessFigures::default());
+    let (sampled, process) = watch::channel(ProcessFigures::default());
     let _sampler = tokio::spawn(sample_process(metrics.clone(), sampled));
     let ready = Arc::new(AtomicBool::new(false));
     let node = Arc::new(OnceLock::new());
@@ -269,6 +271,9 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         c.lease_renewal_interval,
     ));
     let (control, asked) = Control::new();
+    // Another node's detail and actions, asked with the caller's own credentials (D-M13b.4).
+    let peers = Peers::new(deps.holder.node_id.clone(), config.globals.api.tls.as_ref())
+        .map_err(Fatal::Config)?;
     let _ = node.set(Node {
         coordinator: Arc::clone(&coordinator),
         members: gossip.members(),
@@ -280,6 +285,9 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         recorder: recorder.clone(),
         denials: Arc::new(RateLimit::denials()),
         events: Arc::clone(&events),
+        peers,
+        process,
+        gossip: gossip.figures(),
     });
     ready.store(true, Ordering::SeqCst);
     let mut cluster = Some((gossip, reconciler, discovery));

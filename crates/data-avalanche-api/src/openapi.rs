@@ -45,6 +45,7 @@ fn operation(r: &Route) -> utoipa::openapi::path::Operation {
     for (name, description) in [
         ("id", "the pipeline's id"),
         ("job_id", "the snapshot job's id, `<pipeline id>~<suffix>`"),
+        ("node", "a member's name, as the gossip knows it"),
     ] {
         if r.path.contains(&format!("{{{name}}}")) {
             op = op.parameter(
@@ -221,7 +222,7 @@ mod tests {
                         "{method} {path} {code}"
                     );
                 }
-                for name in ["id", "job_id"] {
+                for name in ["id", "job_id", "node"] {
                     if path.contains(&format!("{{{name}}}")) {
                         assert_eq!(op["parameters"][0]["name"], name, "{method} {path}");
                     }

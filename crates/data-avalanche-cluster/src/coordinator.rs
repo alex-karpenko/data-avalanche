@@ -208,6 +208,11 @@ impl ConfigCoordinator {
         *self.inner.applied.borrow()
     }
 
+    /// The generation this node runs: its number, its text's hash, who wrote it and when.
+    pub async fn generation(&self) -> GenerationDoc {
+        self.inner.running.lock().await.generation.doc.clone()
+    }
+
     /// The config this node runs: its generation's text as resolved here.
     pub async fn config(&self) -> ResolvedConfig {
         self.inner.running.lock().await.config.clone()

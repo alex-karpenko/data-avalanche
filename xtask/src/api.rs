@@ -21,6 +21,10 @@ const TAGS: &[(&str, &str)] = &[
     ("cluster", "Membership and leases."),
     ("admin", "The node's process."),
     (
+        "nodes",
+        "Any member, through any node: its detail, and the actions only it takes, sent to it with the caller's own credentials. A node that doesn't answer is named (`502`, `504`).",
+    ),
+    (
         "events",
         "The cluster's timeline and audit trail, kept for `globals.console.events.retention`.",
     ),

@@ -284,6 +284,125 @@ Least role: `admin`.
 | `413` | the body is over 1 MiB |
 | `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
 
+## nodes
+
+Any member, through any node: its detail, and the actions only it takes, sent to it with the caller's own credentials. A node that doesn't answer is named (`502`, `504`).
+
+### `GET /v1/nodes/{node}`
+
+A node's detail: its build and start, its file against its generation, its process and gossip figures, the leases it holds; another node's is fetched from it
+
+Least role: `viewer`.
+
+- Path parameter `node`: a member's name, as the gossip knows it.
+
+| Status | When |
+|---|---|
+| `200` | the node's detail |
+| `404` | no member of that name in this node's view |
+| `421` | a request forwarded to a node that isn't its target |
+| `502` | the node didn't answer |
+| `504` | the node didn't answer within the time limit |
+
+### `POST /v1/nodes/{node}/config/reload`
+
+Publish a node's own file as the next generation, through any node: its own `POST /v1/config/reload`, with the query
+
+Least role: `operator`.
+
+- Path parameter `node`: a member's name, as the gossip knows it.
+- Body: `application/json`.
+- `note`: why, kept with the action's event (optional, at most 500 characters).
+
+| Status | When |
+|---|---|
+| `200` | the file is the generation the cluster runs |
+| `202` | published |
+| `404` | no member of that name in this node's view |
+| `409` | other nodes published first, every time |
+| `413` | the body is over 1 MiB |
+| `421` | a request forwarded to a node that isn't its target |
+| `422` | invalid, or a restart-only field without restart=accept; or the note is too long, not a string, holds a control character, or the body isn't a JSON object |
+| `502` | the node didn't answer |
+| `504` | the node didn't answer within the time limit |
+
+### `GET /v1/nodes/{node}/config/status`
+
+A node's generation and its own restart-pending fields: its own `GET /v1/config/status`
+
+Least role: `viewer`.
+
+- Path parameter `node`: a member's name, as the gossip knows it.
+
+| Status | When |
+|---|---|
+| `200` | the node's config status |
+| `404` | no member of that name in this node's view |
+| `421` | a request forwarded to a node that isn't its target |
+| `502` | the node didn't answer |
+| `504` | the node didn't answer within the time limit |
+
+### `POST /v1/nodes/{node}/config/validate`
+
+Check a node's own file (an empty body), or the body, on that node: its own `POST /v1/config/validate`
+
+Least role: `operator`.
+
+- Path parameter `node`: a member's name, as the gossip knows it.
+- Body: `application/yaml`.
+
+| Status | When |
+|---|---|
+| `200` | it loads: its warnings and the changes |
+| `404` | no member of that name in this node's view |
+| `421` | a request forwarded to a node that isn't its target |
+| `422` | invalid, or it changes a restart-only field: the report |
+| `429` | posted bodies past the node's rate |
+| `502` | the node didn't answer |
+| `504` | the node didn't answer within the time limit |
+
+### `POST /v1/nodes/{node}/leave`
+
+Ask a node to leave the cluster, through any node: its own `POST /v1/cluster/leave`
+
+Least role: `admin`.
+
+- Path parameter `node`: a member's name, as the gossip knows it.
+- Body: `application/json`.
+- `note`: why, kept with the action's event (optional, at most 500 characters).
+
+| Status | When |
+|---|---|
+| `202` | the leave is under way |
+| `404` | no member of that name in this node's view |
+| `409` | leaving already |
+| `413` | the body is over 1 MiB |
+| `421` | a request forwarded to a node that isn't its target |
+| `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
+| `502` | the node didn't answer |
+| `504` | the node didn't answer within the time limit |
+
+### `POST /v1/nodes/{node}/shutdown`
+
+Ask a node to shut down, through any node: its own `POST /v1/admin/shutdown`
+
+Least role: `admin`.
+
+- Path parameter `node`: a member's name, as the gossip knows it.
+- Body: `application/json`.
+- `note`: why, kept with the action's event (optional, at most 500 characters).
+
+| Status | When |
+|---|---|
+| `202` | the shutdown is under way |
+| `404` | no member of that name in this node's view |
+| `409` | shutting down already |
+| `413` | the body is over 1 MiB |
+| `421` | a request forwarded to a node that isn't its target |
+| `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
+| `502` | the node didn't answer |
+| `504` | the node didn't answer within the time limit |
+
 ## events
 
 The cluster's timeline and audit trail, kept for `globals.console.events.retention`.

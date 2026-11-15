@@ -14,7 +14,9 @@ mod cluster;
 mod config;
 mod events;
 mod limit;
+mod nodes;
 mod openapi;
+mod peers;
 mod pipelines;
 mod server;
 mod snapshots;
@@ -31,10 +33,10 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, get, post};
-use data_avalanche_cluster::{ConfigCoordinator, DocsFn, Members, Recorder};
+use data_avalanche_cluster::{ConfigCoordinator, DocsFn, GossipFigures, Members, Recorder};
 use data_avalanche_config::Role;
 use data_avalanche_state::{Events, Leases};
-use data_avalanche_telemetry::{CONTENT_TYPE, Metrics};
+use data_avalanche_telemetry::{CONTENT_TYPE, Metrics, ProcessFigures};
 use serde_json::{Value, json};
 use tokio::sync::watch;
 
@@ -43,6 +45,9 @@ pub use auth::{Auth, FETCH_TIMEOUT, KEYS_MAX_AGE, MAX_KEY_DOCUMENT, Principal, R
 pub use cluster::{Control, Stop};
 pub use limit::{RateLimit, VALIDATE_BURST, VALIDATE_PER_SECOND};
 pub use openapi::openapi;
+pub use peers::{
+    ACTION_LIMIT, ANSWERED_BY, DETAIL_LIMIT, FORWARDED_BY, MAX_ANSWER, Peers, STATUS_LIMIT, TARGET,
+};
 pub use server::{Bound, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT, MAX_CONNECTIONS, ServeError, bind};
 
 use crate::auth::Denied;
@@ -79,6 +84,12 @@ pub struct Node {
     pub events: Arc<Events>,
     /// The refused attempts recorded: [`RateLimit::denials`].
     pub denials: Arc<RateLimit>,
+    /// Asks another node on a caller's behalf (D-M13b.4).
+    pub peers: Peers,
+    /// The process's memory and CPU, sampled.
+    pub process: watch::Receiver<ProcessFigures>,
+    /// What the gossip saw of its probes.
+    pub gossip: watch::Receiver<GossipFigures>,
 }
 
 impl std::fmt::Debug for Node {
@@ -105,6 +116,9 @@ pub struct Route {
     pub answers: &'static [(u16, &'static str)],
     /// What it records, when it changes something (Admin_Console §5).
     pub records: Option<Recorded>,
+    /// Sent on to the node it names (`/v1/nodes/{node}/…`), which records the action itself:
+    /// this node records only a refused attempt of its own gate.
+    pub forwards: bool,
 }
 
 /// What a route's gate and recording know: the auth, the route, and the node once it runs.
@@ -130,7 +144,19 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
         body: None,
         answers,
         records: None,
+        forwards: false,
     };
+    // A node's route, sent on to the node it names.
+    let fwd = |route: Route| Route {
+        forwards: true,
+        ..route
+    };
+    const FORWARDED: [(u16, &str); 4] = [
+        (404, "no member of that name in this node's view"),
+        (421, "a request forwarded to a node that isn't its target"),
+        (502, "the node didn't answer"),
+        (504, "the node didn't answer within the time limit"),
+    ];
     // A mutating route: an optional JSON body with a `note`, and what it records.
     let act = |kind, verb, route: Route| Route {
         body: Some(route.body.unwrap_or("application/json")),
@@ -404,6 +430,130 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
         (
             r(
                 "GET",
+                "/v1/nodes/{node}",
+                Viewer,
+                "A node's detail: its build and start, its file against its generation, its process and gossip figures, the leases it holds; another node's is fetched from it",
+                &[
+                    (200, "the node's detail"),
+                    FORWARDED[0],
+                    FORWARDED[1],
+                    FORWARDED[2],
+                    FORWARDED[3],
+                ],
+            ),
+            get(nodes::get),
+        ),
+        (
+            fwd(act(
+                "node.leave",
+                "leave the cluster:",
+                r(
+                    "POST",
+                    "/v1/nodes/{node}/leave",
+                    Admin,
+                    "Ask a node to leave the cluster, through any node: its own `POST /v1/cluster/leave`",
+                    &[
+                        (202, "the leave is under way"),
+                        (409, "leaving already"),
+                        FORWARDED[0],
+                        FORWARDED[1],
+                        FORWARDED[2],
+                        FORWARDED[3],
+                    ],
+                ),
+            )),
+            post(nodes::leave),
+        ),
+        (
+            fwd(act(
+                "node.shutdown",
+                "shut down",
+                r(
+                    "POST",
+                    "/v1/nodes/{node}/shutdown",
+                    Admin,
+                    "Ask a node to shut down, through any node: its own `POST /v1/admin/shutdown`",
+                    &[
+                        (202, "the shutdown is under way"),
+                        (409, "shutting down already"),
+                        FORWARDED[0],
+                        FORWARDED[1],
+                        FORWARDED[2],
+                        FORWARDED[3],
+                    ],
+                ),
+            )),
+            post(nodes::shutdown),
+        ),
+        (
+            fwd(Route {
+                body: Some("application/yaml"),
+                ..r(
+                    "POST",
+                    "/v1/nodes/{node}/config/validate",
+                    Operator,
+                    "Check a node's own file (an empty body), or the body, on that node: its own `POST /v1/config/validate`",
+                    &[
+                        (200, "it loads: its warnings and the changes"),
+                        (
+                            422,
+                            "invalid, or it changes a restart-only field: the report",
+                        ),
+                        (429, "posted bodies past the node's rate"),
+                        FORWARDED[0],
+                        FORWARDED[1],
+                        FORWARDED[2],
+                        FORWARDED[3],
+                    ],
+                )
+            }),
+            post(nodes::validate),
+        ),
+        (
+            fwd(act(
+                "config.reload",
+                "reload the config",
+                r(
+                    "POST",
+                    "/v1/nodes/{node}/config/reload",
+                    Operator,
+                    "Publish a node's own file as the next generation, through any node: its own `POST /v1/config/reload`, with the query",
+                    &[
+                        (200, "the file is the generation the cluster runs"),
+                        (202, "published"),
+                        (409, "other nodes published first, every time"),
+                        (
+                            422,
+                            "invalid, or a restart-only field without restart=accept",
+                        ),
+                        FORWARDED[0],
+                        FORWARDED[1],
+                        FORWARDED[2],
+                        FORWARDED[3],
+                    ],
+                ),
+            )),
+            post(nodes::reload),
+        ),
+        (
+            fwd(r(
+                "GET",
+                "/v1/nodes/{node}/config/status",
+                Viewer,
+                "A node's generation and its own restart-pending fields: its own `GET /v1/config/status`",
+                &[
+                    (200, "the node's config status"),
+                    FORWARDED[0],
+                    FORWARDED[1],
+                    FORWARDED[2],
+                    FORWARDED[3],
+                ],
+            )),
+            get(nodes::config_status),
+        ),
+        (
+            r(
+                "GET",
                 "/v1/events",
                 Viewer,
                 "The cluster's events and audit trail, newest first: actions with who took them, lease hand-offs, halts, schema changes, snapshot jobs, members, config generations",
@@ -444,7 +594,7 @@ pub fn router(api: Api) -> Router {
             node: Arc::clone(&api.node),
         };
         // The gate runs first (the outer layer), then the recording.
-        let handler = if r.records.is_some() {
+        let handler = if r.records.is_some() && !r.forwards {
             handler.route_layer(from_fn_with_state(gate.clone(), actions::record))
         } else {
             handler
@@ -454,7 +604,25 @@ pub fn router(api: Api) -> Router {
             handler.route_layer(from_fn_with_state(gate, authorize)),
         );
     }
-    router.with_state(api)
+    router
+        .layer(from_fn_with_state(api.clone(), misdirected))
+        .with_state(api)
+}
+
+/// A request forwarded to this node for another one (D-M13b.4: an address since reused, a
+/// renamed pod) is refused before anything reads it.
+async fn misdirected(State(api): State<Api>, req: Request, next: Next) -> Response {
+    let target = req.headers().get(peers::TARGET).cloned();
+    if let (Some(target), Some(node)) = (target, api.node.get()) {
+        let me = node.members.borrow().me.clone();
+        if target.as_bytes() != me.as_bytes() {
+            return body(
+                StatusCode::MISDIRECTED_REQUEST,
+                &json!({ "error": format!("this is {me}, not the node the request was sent to") }),
+            );
+        }
+    }
+    next.run(req).await
 }
 
 /// Lets a caller through to a route that takes `role` or less, with its [`Principal`] in the
@@ -576,6 +744,12 @@ mod tests {
                 ("GET", "/v1/snapshots/{job_id}", Viewer),
                 ("POST", "/v1/cluster/leave", Admin),
                 ("POST", "/v1/admin/shutdown", Admin),
+                ("GET", "/v1/nodes/{node}", Viewer),
+                ("POST", "/v1/nodes/{node}/leave", Admin),
+                ("POST", "/v1/nodes/{node}/shutdown", Admin),
+                ("POST", "/v1/nodes/{node}/config/validate", Operator),
+                ("POST", "/v1/nodes/{node}/config/reload", Operator),
+                ("GET", "/v1/nodes/{node}/config/status", Viewer),
                 ("GET", "/v1/events", Viewer),
                 ("GET", "/v1/openapi.json", Viewer),
             ]

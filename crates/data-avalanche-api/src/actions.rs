@@ -263,6 +263,9 @@ pub(crate) async fn denied(gate: &Gate, name: &str, role: &str, path: &str) {
         None if path.starts_with("/v1/cluster/") || path.starts_with("/v1/admin/") => {
             recorder.node().to_owned()
         }
+        None if let Some(rest) = path.strip_prefix("/v1/nodes/") => {
+            clipped(rest.split('/').next().unwrap_or_default(), MAX_TARGET).into_owned()
+        }
         None => String::new(),
     };
     let mut event = recorder.event(
