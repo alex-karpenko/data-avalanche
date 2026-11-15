@@ -729,7 +729,7 @@ git commit -m "feat(config): globals.api.advertise_url, where the other nodes re
 - Produces (cluster crate root): `FILE_CHECK: Duration` (15 s); `api_url(&Api, IpAddr) -> String`
   (D-M13b.2); `file_hash(&str) -> String` (16 hex digits); `watch_file(PathBuf, String, Advertiser)`
   (async, never ends); `NodeMeta::{api_url, file_hash}: String`; `Advertiser::set_file_hash(String)
-  -> bool` (`true` when it changed); `wire.rs`'s `CONTEXT` ends in `MAC v2`. `GET
+  -> bool` (`false` once the gossip is gone); `wire.rs`'s `CONTEXT` ends in `MAC v2`. `GET
   /v1/cluster/status` gains `members[].api_url`, `members[].file_hash`, `pipelines[].ring_owner`
   and `pipelines[].expires_at`. `run.rs` gossips both from the start and spawns `watch_file`.
 
@@ -9165,3 +9165,6 @@ tasks' blocks applied on top unchanged.
   and, when a port is written, 1–65535 in digits, an IPv6 host in brackets (spec §6.3 "a host and
   port only"); three cases added. `advertise_url` is stored without a trailing `/`, since Task 5
   builds a peer's request as `{api_url}{path}`.
+- **Task 2** (review, no fix round): the plan's Interfaces said `Advertiser::set_file_hash` returns
+  whether the hash changed; it returns `false` once the gossip is gone, which `watch_file` stops
+  on. The plan's text is corrected.
