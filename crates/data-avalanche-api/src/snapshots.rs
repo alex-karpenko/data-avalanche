@@ -55,11 +55,14 @@ struct Asked {
     /// Empty each table's sink table before its copy (DA-SNAP-15).
     #[serde(default)]
     truncate: bool,
+    /// Why, kept with the job and its events (checked by the recording, Admin_Console §5).
+    #[serde(default)]
+    note: Option<String>,
 }
 
 /// The body's tables, each once, in its order: named as the source's per-table config keys,
 /// no globs; and whether the job empties them first.
-fn tables(p: &Pipeline, text: &str) -> Result<(Vec<TableRef>, bool), String> {
+fn tables(p: &Pipeline, text: &str) -> Result<(Vec<TableRef>, bool, Option<String>), String> {
     let asked: Asked = serde_json::from_str(text).map_err(|e| {
         format!("the body is {{\"tables\": [\"<table>\", ...], \"truncate\": false}}: {e}")
     })?;
@@ -90,7 +93,12 @@ fn tables(p: &Pipeline, text: &str) -> Result<(Vec<TableRef>, bool), String> {
             out.push(table);
         }
     }
-    Ok((out, asked.truncate))
+    // The recording checked it already (a 422 before this route runs).
+    let note = asked
+        .note
+        .map(|n| n.trim().to_owned())
+        .filter(|n| !n.is_empty());
+    Ok((out, asked.truncate, note))
 }
 
 fn job_json(p: &Pipeline, j: &SnapshotJobDoc) -> Value {
@@ -139,7 +147,7 @@ pub(crate) async fn ask(
         Ok(found) => found,
         Err(f) => return f.into(),
     };
-    let (tables, truncate) = match tables(&p, &text) {
+    let (tables, truncate, note) = match tables(&p, &text) {
         Ok(asked) => asked,
         Err(why) => return Failure::new(StatusCode::UNPROCESSABLE_ENTITY, why).into(),
     };
@@ -192,6 +200,7 @@ pub(crate) async fn ask(
     }
     let mut job = SnapshotJobDoc::new(new_job_id(&p.id), tables, by.name.clone(), Utc::now());
     job.truncate = truncate;
+    job.note = note;
     if let Err(e) = docs.create_snapshot_job(&job).await {
         return unavailable(&e);
     }

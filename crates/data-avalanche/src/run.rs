@@ -11,14 +11,14 @@ use data_avalanche_api::{Api, Auth, Control, Node, RateLimit, ServeError, Stop, 
 use data_avalanche_cluster::{
     ClusterReconciler, ConfigCoordinator, ControllerDeps, ControllerSettings, CoordinatorDeps,
     DocsFn, Gossip, GossipKey, GossipSettings, LeaseTiming, NodeIdentity, NodeMeta, Phase,
-    ReconcilerSettings, Seeds, Udp, advertise, discover, interfaces, join as join_gossip, leave,
-    node_identity, removed_pipelines,
+    ReconcilerSettings, Recorder, Seeds, Udp, advertise, discover, expire_events, interfaces,
+    join as join_gossip, leave, node_identity, removed_pipelines,
 };
 use data_avalanche_config::{
     Diagnostic, FingerprintKey, ProcessEnv, Report, ResolvedConfig, Severity, load_str,
 };
 use data_avalanche_pipeline::{Backoff, Tuning};
-use data_avalanche_state::{ConfigGenerations, Leases, Removals};
+use data_avalanche_state::{ConfigGenerations, Events, Leases, Removals};
 use data_avalanche_telemetry::Metrics;
 use thiserror::Error;
 use tokio::sync::{Semaphore, oneshot, watch};
@@ -149,6 +149,12 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         "joined the cluster"
     );
 
+    // The cluster's events (Admin_Console §6): recorded from here, expired on every node.
+    let events = Arc::new(Events::new(joined.globals.clone()));
+    let (recorder, _writer) =
+        Recorder::start(Arc::clone(&events), &holder.node_id, metrics.clone());
+    let (retention, kept) = watch::channel(config.globals.console.events.retention);
+    let _expiry = tokio::spawn(expire_events(Arc::clone(&events), kept));
     let c = &config.globals.cluster;
     let docs = Arc::clone(&buckets);
     let docs: Arc<DocsFn> = Arc::new(move |p| docs.pipeline_docs(p).map_err(|e| e.to_string()));
@@ -236,6 +242,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
                 log.apply(&g.log);
                 log.trace(&g.tracing);
                 reloaded_auth.set(&g.api);
+                retention.send_replace(g.console.events.retention);
             }),
         },
         gossip.members(),
@@ -250,6 +257,9 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         leases: deps.leases.clone(),
         control,
         validates: Arc::new(RateLimit::validate()),
+        recorder,
+        denials: Arc::new(RateLimit::denials()),
+        events: Arc::clone(&events),
     });
     ready.store(true, Ordering::SeqCst);
     let mut cluster = Some((gossip, reconciler, discovery));

@@ -53,15 +53,37 @@ fn operation(r: &Route) -> utoipa::openapi::path::Operation {
             );
         }
     }
+    if r.path == "/v1/events" {
+        for (name, description) in crate::events::PARAMETERS {
+            op = op.parameter(
+                ParameterBuilder::new()
+                    .name(*name)
+                    .parameter_in(ParameterIn::Query)
+                    .required(Required::False)
+                    .description(Some(*description))
+                    .schema(Some(ObjectBuilder::new().schema_type(Type::String))),
+            );
+        }
+    }
     if let Some(content_type) = r.body {
-        op = op.request_body(Some(
-            RequestBodyBuilder::new()
-                .required(Some(Required::False))
-                .content(content_type, ContentBuilder::new().build())
-                .build(),
-        ));
+        let mut body = RequestBodyBuilder::new()
+            .required(Some(Required::False))
+            .content(content_type, ContentBuilder::new().build());
+        if r.records.is_some() {
+            body = body.description(Some(format!(
+                "`note`: why, kept with the action's event (optional, at most {} characters)",
+                crate::MAX_NOTE
+            )));
+        }
+        op = op.request_body(Some(body.build()));
     }
     let mut answers = r.answers.to_vec();
+    if r.records.is_some() && !answers.iter().any(|(code, _)| *code == 422) {
+        answers.push((
+            422,
+            "the note is longer than 500 characters, or not a string",
+        ));
+    }
     answers.extend(COMMON);
     answers.sort_unstable();
     for (code, description) in answers {
