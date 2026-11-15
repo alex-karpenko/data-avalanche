@@ -125,8 +125,13 @@ fn literal(text: &str) -> Option<String> {
 /// starts a tag on a node (after the start of a line, whitespace, or one of `[ { , : ? -`). A
 /// tag can make any scalar a merge key, and the spellings of a tag are many. Over-matching, a
 /// `!` after a space in a quoted literal or a comment, fails closed.
+///
+/// The `!` rule rests on the YAML parser's separators being space, tab, CR, LF and NUL (NUL
+/// fails the parse); a byte-order mark is the only other character it skips, so any BOM refuses
+/// the text, and with no BOM every tag starts after a line start, whitespace or `[{,:?-`.
 fn unmaskable(text: &str) -> bool {
     text.contains("<<")
+        || text.contains('\u{FEFF}')
         || text.lines().any(|line| line.starts_with('%'))
         || text.char_indices().any(|(at, c)| {
             c == '!'
@@ -471,6 +476,22 @@ pipelines:
             "      password: !!str hunter2\n",
         ] {
             let text = format!("config_version: 1\npipelines:\n  p:\n    source:\n{shape}");
+            assert_eq!(
+                mask_secrets(&text, &key()),
+                Err(MaskError::MergeKey),
+                "{text}"
+            );
+        }
+        let tail = "config_version: 1\npipelines:\n  p:\n    source:\n      password: ${X}\n";
+        for text in [
+            format!(
+                "\u{FEFF}!!merge \"\\x3c\\x3c\": {{ pipelines: {{ p: {{ source: {{ password: hunter2 }} }} }} }}\n{tail}"
+            ),
+            format!(
+                "# c\n\u{FEFF}!!merge \"\\x3c\\x3c\": {{ pipelines: {{ p: {{ source: {{ password: hunter2 }} }} }} }}\n{tail}"
+            ),
+            "\u{FEFF}config_version: 1\n".to_owned(),
+        ] {
             assert_eq!(
                 mask_secrets(&text, &key()),
                 Err(MaskError::MergeKey),
