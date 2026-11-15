@@ -83,9 +83,10 @@ pub(crate) fn page() -> String {
          **Who did it.** Every route that changes something takes an optional JSON body \
          `{{\"note\": \"…\"}}` and records the action in the cluster's events: what, to what, \
          the caller's name and role as the node verified them, the note, and how it ended \
-         (`accepted`, `unchanged`, `refused`). A caller turned away for its role is recorded \
-         too (`action.denied`). A note longer than 500 characters, or not a string, is `422`, \
-         and nothing is done.\n\n\
+         (`accepted`, `unchanged`, `refused`). A caller turned away for its role, or with no \
+         role mapped, is recorded too (`action.denied`). A note longer than 500 characters, \
+         not a string or holding a control character, or a body that isn't a JSON object, is \
+         `422`; a body over 1 MiB is `413`; either way nothing is done or recorded.\n\n\
          **Outside `/v1`**, with no credentials: `GET /health/live` (the process answers), \
          `GET /health/ready` (`200` once the node runs its config, `503` before and while it \
          stops) and `GET /metrics` (Prometheus text).\n\n",

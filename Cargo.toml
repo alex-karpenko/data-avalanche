@@ -84,6 +84,9 @@ prometheus-client = "=0.26.0"
 gethostname = "1.1"
 clap = { version = "4.6.7", features = ["derive"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+# The recording's body reads (M13a): a body over its limit is told from one that can't be read
+# by axum's own limit error; axum already depends on it.
+http-body-util = "0.1.5"
 # The management API (M9a, roadmap §2.1): TLS on the listener, on the workspace's rustls.
 tokio-rustls = { version = "0.26.5", default-features = false, features = ["aws_lc_rs", "tls12"] }
 # Its auth (config §6.3): JWT verification on aws-lc-rs, the JWKS and OIDC discovery fetched with

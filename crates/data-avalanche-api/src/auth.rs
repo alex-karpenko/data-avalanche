@@ -3,8 +3,9 @@
 //! roles read at `roles_claim` and mapped by `role_mapping` (identity when empty), the highest
 //! one taken; a token with no role it maps is refused (403), not taken as `viewer`. `oauth2`
 //! finds the JWKS through OIDC discovery when it has no `jwks_url`; tokens are verified locally,
-//! never introspected (no client credentials are configured). The settings are R: [`Auth::set`]
-//! takes a reload's. Settings without what their mode reads refuse every request (503).
+//! never introspected (no client credentials are configured). A token's caller is named by
+//! `globals.console.username_claim`, else its `sub`. The settings are R: [`Auth::set`] takes a
+//! reload's. Settings without what their mode reads refuse every request (503).
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
@@ -48,7 +49,7 @@ struct Timing {
 /// An authenticated caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal {
-    /// The basic user, the token's `sub`, or `anonymous`.
+    /// The basic user, the token's `username_claim` (else its `sub`), or `anonymous`.
     pub name: String,
     pub role: Role,
 }
@@ -61,8 +62,8 @@ pub(crate) enum Denied {
         challenge: &'static str,
         why: String,
     },
-    /// 403: verified, but no role this endpoint takes.
-    Forbidden(String),
+    /// 403: verified as `name`, but with no role this node maps.
+    Forbidden { name: String, why: String },
     /// 503: the issuer's keys can't be fetched, or the auth settings don't hold together, so
     /// no caller can be verified.
     Unavailable(String),
@@ -79,16 +80,19 @@ struct Settings {
     jwt: Option<data_avalanche_config::Jwt>,
     oauth2: Option<data_avalanche_config::ApiOauth2>,
     role_mapping: BTreeMap<Role, Vec<String>>,
+    /// The token claim that names the caller (`globals.console.username_claim`).
+    username_claim: String,
 }
 
 impl Settings {
-    fn of(api: &ApiConfig) -> Self {
+    fn of(api: &ApiConfig, username_claim: &str) -> Self {
         Self {
             auth: api.auth,
             credentials: api.credentials.clone(),
             jwt: api.jwt.clone(),
             oauth2: api.oauth2.clone(),
             role_mapping: api.role_mapping.clone(),
+            username_claim: username_claim.to_owned(),
         }
     }
 }
@@ -116,21 +120,43 @@ pub struct Auth {
 }
 
 impl Auth {
-    pub fn new(api: &ApiConfig) -> Self {
-        Self::with_timing(api, REFETCH_AFTER, KEYS_MAX_AGE)
+    /// The authentication of `globals.api`, a token's caller named by its `username_claim`
+    /// (`globals.console.username_claim`), else its `sub`.
+    pub fn new(api: &ApiConfig, username_claim: &str) -> Self {
+        Self::build(api, username_claim, REFETCH_AFTER, KEYS_MAX_AGE)
     }
 
     #[cfg(test)]
     pub(crate) fn with_refetch_after(api: &ApiConfig, refetch_after: Duration) -> Self {
-        Self::with_timing(api, refetch_after, KEYS_MAX_AGE)
+        Self::build(
+            api,
+            crate::test_support::USERNAME_CLAIM,
+            refetch_after,
+            KEYS_MAX_AGE,
+        )
     }
 
+    #[cfg(test)]
     pub(crate) fn with_timing(api: &ApiConfig, refetch_after: Duration, max_age: Duration) -> Self {
+        Self::build(
+            api,
+            crate::test_support::USERNAME_CLAIM,
+            refetch_after,
+            max_age,
+        )
+    }
+
+    fn build(
+        api: &ApiConfig,
+        username_claim: &str,
+        refetch_after: Duration,
+        max_age: Duration,
+    ) -> Self {
         let timing = Timing {
             refetch_after,
             max_age,
         };
-        let settings = Settings::of(api);
+        let settings = Settings::of(api, username_claim);
         Self {
             current: RwLock::new(Current {
                 mode: Arc::new(mode(&settings, timing, None)),
@@ -142,9 +168,10 @@ impl Auth {
 
     /// Takes a reload's settings. Unchanged ones keep the cached JWKS, and so do changed ones
     /// whose keys come from where they did (the same issuer and JWKS or discovery URL): a
-    /// change of the audience, the roles claim or the role mapping fetches nothing.
-    pub fn set(&self, api: &ApiConfig) {
-        let settings = Settings::of(api);
+    /// change of the audience, the roles claim, the role mapping or the username claim fetches
+    /// nothing.
+    pub fn set(&self, api: &ApiConfig, username_claim: &str) {
+        let settings = Settings::of(api, username_claim);
         let mut current = self.current.write().unwrap_or_else(PoisonError::into_inner);
         if current.settings != settings {
             let keys = match &*current.mode {
@@ -203,6 +230,7 @@ fn mode(s: &Settings, timing: Timing, keys: Option<Arc<Keys>>) -> Mode {
             issuer: issuer.to_owned(),
             audience: audience.clone(),
             roles_claim: roles_claim.to_owned(),
+            username_claim: s.username_claim.clone(),
             mapping: s.role_mapping.clone(),
             keys,
         }))
@@ -289,6 +317,7 @@ struct Verifier {
     issuer: String,
     audience: Option<String>,
     roles_claim: String,
+    username_claim: String,
     mapping: BTreeMap<Role, Vec<String>>,
     keys: Arc<Keys>,
 }
@@ -328,20 +357,24 @@ impl Verifier {
             .map_err(|e| unauthenticated(BEARER, format!("the token doesn't verify: {e}")))?
             .claims;
         let name = claims
-            .get("sub")
+            .get(&self.username_claim)
             .and_then(Value::as_str)
+            .or_else(|| claims.get("sub").and_then(Value::as_str))
             .unwrap_or("unknown")
             .to_owned();
-        let role = roles(&claims, &self.roles_claim)
+        let Some(role) = roles(&claims, &self.roles_claim)
             .iter()
             .filter_map(|r| map(&self.mapping, r))
             .max()
-            .ok_or_else(|| {
-                Denied::Forbidden(format!(
+        else {
+            return Err(Denied::Forbidden {
+                why: format!(
                     "the token's {} name no role this node maps",
                     self.roles_claim
-                ))
-            })?;
+                ),
+                name,
+            });
+        };
         Ok(Principal { name, role })
     }
 }
@@ -586,7 +619,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::test_support::{Issuer, config, sign_with};
+    use crate::test_support::{Issuer, USERNAME_CLAIM, config, sign_with};
 
     fn bearer(token: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
@@ -660,7 +693,7 @@ mod tests {
 
     #[tokio::test]
     async fn without_auth_every_caller_is_admin() {
-        let auth = Auth::new(&config().globals.api);
+        let auth = Auth::new(&config().globals.api, USERNAME_CLAIM);
         let p = auth.verify(&HeaderMap::new()).await.unwrap();
         assert_eq!((p.name.as_str(), p.role), ("anonymous", Role::Admin));
     }
@@ -697,7 +730,7 @@ mod tests {
         };
         let token = bearer(&idp.token(json!(["admin"])));
         for api in [jwt_without, basic_without, oauth2_without_urls] {
-            let auth = Auth::new(&api);
+            let auth = Auth::new(&api, USERNAME_CLAIM);
             for headers in [HeaderMap::new(), token.clone()] {
                 let why = unavailable(auth.verify(&headers).await);
                 assert!(why.contains("inconsistent"), "{:?}: {why}", api.auth);
@@ -713,7 +746,7 @@ mod tests {
             user: "ops".into(),
             password: Secret::new("s3cret", &FingerprintKey::from_bytes([1; 32])),
         });
-        let auth = Auth::new(&api);
+        let auth = Auth::new(&api, USERNAME_CLAIM);
         let with = |user_pass: &str| {
             let mut h = HeaderMap::new();
             let v = format!("basic {}", STANDARD.encode(user_pass));
@@ -734,7 +767,7 @@ mod tests {
     #[tokio::test]
     async fn a_token_s_highest_mapped_role_is_the_caller_s() {
         let idp = Issuer::start().await;
-        let auth = Auth::new(&idp.api("roles"));
+        let auth = Auth::new(&idp.api("roles"), USERNAME_CLAIM);
         let role = |roles| {
             let token = idp.token(roles);
             let auth = &auth;
@@ -746,9 +779,12 @@ mod tests {
         assert_eq!(role(json!("operator")).await.unwrap().role, Role::Operator);
         assert!(matches!(
             role(json!(["cdc-admin"])).await,
-            Err(Denied::Forbidden(_))
+            Err(Denied::Forbidden { .. })
         ));
-        assert!(matches!(role(json!([])).await, Err(Denied::Forbidden(_))));
+        assert!(matches!(
+            role(json!([])).await,
+            Err(Denied::Forbidden { .. })
+        ));
 
         // Keycloak's realm roles, mapped: the three names themselves no longer count.
         let mut api = idp.api("realm_access.roles");
@@ -756,7 +792,7 @@ mod tests {
             (Role::Viewer, vec!["readonly".into()]),
             (Role::Admin, vec!["cdc-admin".into()]),
         ]);
-        let auth = Auth::new(&api);
+        let auth = Auth::new(&api, USERNAME_CLAIM);
         let realm = |roles| {
             let mut claims = idp.claims(json!(null));
             claims["realm_access"] = json!({ "roles": roles });
@@ -770,8 +806,48 @@ mod tests {
         );
         assert!(matches!(
             auth.verify(&realm(json!(["admin"]))).await,
-            Err(Denied::Forbidden(_))
+            Err(Denied::Forbidden { .. })
         ));
+    }
+
+    /// Config §6.8: the caller is named by `username_claim` when the token has it as a string,
+    /// else by `sub`.
+    #[tokio::test]
+    async fn a_token_s_caller_is_named_by_the_username_claim_else_sub() {
+        let idp = Issuer::start().await;
+        let named = |claims: &Value, username_claim: &str| {
+            let (auth, token) = (
+                Auth::new(&idp.api("roles"), username_claim),
+                bearer(&idp.sign("k1", claims)),
+            );
+            async move { auth.verify(&token).await.unwrap().name }
+        };
+        let mut claims = idp.claims(json!(["viewer"]));
+        claims["sub"] = json!("u-123");
+        claims["preferred_username"] = json!("oleksii");
+        claims["email"] = json!("oleksii@example.com");
+        assert_eq!(named(&claims, "preferred_username").await, "oleksii");
+        assert_eq!(named(&claims, "email").await, "oleksii@example.com");
+        claims.as_object_mut().unwrap().remove("preferred_username");
+        assert_eq!(named(&claims, "preferred_username").await, "u-123");
+        claims["preferred_username"] = json!(7);
+        assert_eq!(
+            named(&claims, "preferred_username").await,
+            "u-123",
+            "not a string"
+        );
+        // A reload's claim is the one taken.
+        let auth = Auth::new(&idp.api("roles"), "preferred_username");
+        auth.set(&idp.api("roles"), "email");
+        let p = auth.verify(&bearer(&idp.sign("k1", &claims))).await;
+        assert_eq!(p.unwrap().name, "oleksii@example.com");
+        // A token with no role this node maps is refused under its name.
+        let mut unmapped = claims.clone();
+        unmapped["roles"] = json!(["cdc-reader"]);
+        match auth.verify(&bearer(&idp.sign("k1", &unmapped))).await {
+            Err(Denied::Forbidden { name, .. }) => assert_eq!(name, "oleksii@example.com"),
+            other => panic!("not a 403: {other:?}"),
+        }
     }
 
     /// A namespaced claim (Auth0's `https://…/roles`) is a name, not a dotted path.
@@ -779,7 +855,7 @@ mod tests {
     async fn a_namespaced_roles_claim_is_read_by_its_name() {
         let idp = Issuer::start().await;
         let claim = "https://example.com/roles";
-        let auth = Auth::new(&idp.api(claim));
+        let auth = Auth::new(&idp.api(claim), USERNAME_CLAIM);
         let mut claims = idp.claims(json!(null));
         claims[claim] = json!(["operator"]);
         let p = auth.verify(&bearer(&idp.sign("k1", &claims))).await;
@@ -789,7 +865,7 @@ mod tests {
     #[tokio::test]
     async fn a_token_that_doesnt_verify_is_refused() {
         let idp = Issuer::start().await;
-        let auth = Auth::new(&idp.api("roles"));
+        let auth = Auth::new(&idp.api("roles"), USERNAME_CLAIM);
         let now = jsonwebtoken::get_current_timestamp();
         let with = |f: &dyn Fn(&mut Value)| {
             let mut c = idp.claims(json!(["admin"]));
@@ -868,7 +944,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_key_ids_fetch_at_most_once_a_refetch_interval() {
         let idp = Issuer::start().await;
-        let auth = Auth::new(&idp.api("roles"));
+        let auth = Auth::new(&idp.api("roles"), USERNAME_CLAIM);
         auth.verify(&bearer(&idp.token(json!(["viewer"]))))
             .await
             .unwrap();
@@ -898,13 +974,16 @@ mod tests {
         };
         api.oauth2 = Some(oauth2(&idp.url));
         let token = bearer(&idp.token(json!(["operator"])));
-        let p = Auth::new(&api).verify(&token).await.unwrap();
+        let p = Auth::new(&api, USERNAME_CLAIM)
+            .verify(&token)
+            .await
+            .unwrap();
         assert_eq!(p.role, Role::Operator);
 
         // A discovery document of another issuer is not this one's.
         api.oauth2 = Some(oauth2("https://idp.example.com"));
         // The reason is logged; the caller isn't told the URL or the error.
-        let why = unavailable(Auth::new(&api).verify(&token).await);
+        let why = unavailable(Auth::new(&api, USERNAME_CLAIM).verify(&token).await);
         assert_eq!(why, "the token issuer's keys can't be fetched");
         assert!(!why.contains(&idp.url), "{why}");
     }
@@ -918,7 +997,7 @@ mod tests {
         let url = format!("http://{}/jwks", closed.local_addr().unwrap());
         drop(closed);
         api.jwt.as_mut().unwrap().jwks_url = url;
-        let auth = Auth::new(&api);
+        let auth = Auth::new(&api, USERNAME_CLAIM);
         let token = bearer(&idp.token(json!(["admin"])));
         // Again, inside the refetch window: still no keys, still 503.
         for _ in 0..2 {
@@ -934,7 +1013,7 @@ mod tests {
         let token = bearer(&idp.token(json!(["viewer"])));
 
         // Young keys are trusted: the withdrawal isn't heard yet.
-        let young = Auth::new(&api);
+        let young = Auth::new(&api, USERNAME_CLAIM);
         young.verify(&token).await.unwrap();
         idp.remove_key("k1");
         idp.add_key("k2");
@@ -1073,7 +1152,7 @@ mod tests {
         let idp = Issuer::start().await;
         let mut api = idp.api("roles");
         api.jwt.as_mut().unwrap().audience = None;
-        let auth = Auth::new(&api);
+        let auth = Auth::new(&api, USERNAME_CLAIM);
         let mut claims = idp.claims(json!(["operator"]));
         claims.as_object_mut().unwrap().remove("aud");
         let p = auth.verify(&bearer(&idp.sign("k1", &claims))).await;
@@ -1084,13 +1163,13 @@ mod tests {
     async fn a_reload_of_the_role_mapping_keeps_the_keys() {
         let idp = Issuer::start().await;
         let api = idp.api("roles");
-        let auth = Auth::new(&api);
+        let auth = Auth::new(&api, USERNAME_CLAIM);
         let token = bearer(&idp.token(json!(["viewer"])));
         assert_eq!(auth.verify(&token).await.unwrap().role, Role::Viewer);
         idp.set_down(true);
         let mut mapped = api.clone();
         mapped.role_mapping = BTreeMap::from([(Role::Admin, vec!["viewer".into()])]);
-        auth.set(&mapped);
+        auth.set(&mapped, USERNAME_CLAIM);
         let p = auth.verify(&token).await;
         assert_eq!(
             p.unwrap().role,
@@ -1105,17 +1184,17 @@ mod tests {
     async fn a_reload_keeps_the_keys_unless_their_source_changes() {
         let idp = Issuer::start().await;
         let api = idp.api("roles");
-        let auth = Auth::new(&api);
+        let auth = Auth::new(&api, USERNAME_CLAIM);
         let token = bearer(&idp.token(json!(["viewer"])));
         auth.verify(&token).await.unwrap();
         let mut moved = api.clone();
         moved.address.port = 9_999;
-        auth.set(&moved);
+        auth.set(&moved, USERNAME_CLAIM);
         auth.verify(&token).await.unwrap();
         assert_eq!(idp.fetches.load(Ordering::SeqCst), 1);
         let mut other = api.clone();
         other.jwt.as_mut().unwrap().audience = Some("another-api".into());
-        auth.set(&other);
+        auth.set(&other, USERNAME_CLAIM);
         denied_401(auth.verify(&token).await);
         assert_eq!(
             idp.fetches.load(Ordering::SeqCst),
@@ -1124,10 +1203,10 @@ mod tests {
         );
         let mut moved = api.clone();
         moved.jwt.as_mut().unwrap().jwks_url = format!("{}/jwks?again", idp.url);
-        auth.set(&moved);
+        auth.set(&moved, USERNAME_CLAIM);
         auth.verify(&token).await.unwrap();
         assert_eq!(idp.fetches.load(Ordering::SeqCst), 2, "another JWKS URL");
-        auth.set(&config().globals.api);
+        auth.set(&config().globals.api, USERNAME_CLAIM);
         assert_eq!(
             auth.verify(&HeaderMap::new()).await.unwrap().role,
             Role::Admin

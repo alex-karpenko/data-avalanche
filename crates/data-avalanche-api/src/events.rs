@@ -5,10 +5,9 @@ use axum::extract::{RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use chrono::{DateTime, Utc};
-use data_avalanche_state::{EventDoc, EventQuery, MAX_EVENTS};
+use data_avalanche_state::{EventDoc, EventQuery, MAX_EVENTS, StateError};
 use serde_json::{Value, json};
 
-use crate::pipelines::unavailable;
 use crate::{Api, Failure, body, starting};
 
 /// The query's parameters, as a page and `curl` write them.
@@ -31,7 +30,7 @@ pub const PARAMETERS: &[(&str, &str)] = &[
 ];
 
 /// The default page.
-const DEFAULT_LIMIT: usize = 100;
+pub(crate) const DEFAULT_LIMIT: usize = 100;
 
 fn time(name: &str, value: &str) -> Result<DateTime<Utc>, Failure> {
     DateTime::parse_from_rfc3339(value)
@@ -141,8 +140,16 @@ pub(crate) async fn list(State(api): State<Api>, RawQuery(raw): RawQuery) -> Res
                 "next": page.next,
             }),
         ),
-        Err(e) => unavailable(&e),
+        Err(e) => unreadable(&e),
     }
+}
+
+/// The 503 of a timeline that can't be read.
+fn unreadable(e: &StateError) -> Response {
+    body(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &json!({ "error": format!("the cluster's events can't be read: {e}") }),
+    )
 }
 
 #[cfg(test)]
@@ -188,6 +195,24 @@ mod tests {
             let e = p(bad).unwrap_err();
             assert_eq!(e.code, StatusCode::BAD_REQUEST, "{bad:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_timeline_that_cant_be_read_says_so() {
+        let e = StateError::Store(data_avalanche_storage::StoreError::Transient {
+            key: "events".into(),
+            reason: "the bucket is away".into(),
+        });
+        let r = unreadable(&e);
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(r.into_body(), 1 << 10).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let error = v["error"].as_str().unwrap();
+        assert!(
+            error.starts_with("the cluster's events can't be read: "),
+            "{error}"
+        );
+        assert!(!error.contains("pipeline"), "{error}");
     }
 
     #[tokio::test]

@@ -1795,6 +1795,8 @@ dependencies = [
  "data-avalanche-state",
  "data-avalanche-storage",
  "data-avalanche-telemetry",
+ "futures-util",
+ "http-body-util",
  "jsonwebtoken",
  "object_store 0.14.2",
  "rcgen",

@@ -14,7 +14,7 @@ Every node serves the API on `globals.api.address`. `globals.api.auth` decides w
 
 **Answers.** Every body is a JSON object; a refusal carries an `error` string. Every route can also answer `503` (the node is starting or stopping, or its state can't be read) and, unless `auth` is `none`, `401` (no credentials, or ones that don't verify) and `403` (the caller's role is below the route's). A `202` means accepted, not done: a pipeline command or a snapshot job is carried out by the node that holds the pipeline's lease, a reload is published, a leave or a shutdown is under way on the node called.
 
-**Who did it.** Every route that changes something takes an optional JSON body `{"note": "…"}` and records the action in the cluster's events: what, to what, the caller's name and role as the node verified them, the note, and how it ended (`accepted`, `unchanged`, `refused`). A caller turned away for its role is recorded too (`action.denied`). A note longer than 500 characters, or not a string, is `422`, and nothing is done.
+**Who did it.** Every route that changes something takes an optional JSON body `{"note": "…"}` and records the action in the cluster's events: what, to what, the caller's name and role as the node verified them, the note, and how it ended (`accepted`, `unchanged`, `refused`). A caller turned away for its role, or with no role mapped, is recorded too (`action.denied`). A note longer than 500 characters, not a string or holding a control character, or a body that isn't a JSON object, is `422`; a body over 1 MiB is `413`; either way nothing is done or recorded.
 
 **Outside `/v1`**, with no credentials: `GET /health/live` (the process answers), `GET /health/ready` (`200` once the node runs its config, `503` before and while it stops) and `GET /metrics` (Prometheus text).
 
@@ -62,7 +62,8 @@ Least role: `operator`.
 | `202` | asked: the owner acts at its next poll |
 | `404` | no such pipeline in the generation this node runs |
 | `409` | stopped, or no node holds the lease |
-| `422` | the note is longer than 500 characters, or not a string |
+| `413` | the body is over 1 MiB |
+| `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
 
 ### `POST /v1/pipelines/{id}/pause`
 
@@ -80,7 +81,8 @@ Least role: `operator`.
 | `202` | the desired state is paused |
 | `404` | no such pipeline in the generation this node runs |
 | `409` | the pipeline is stopped |
-| `422` | the note is longer than 500 characters, or not a string |
+| `413` | the body is over 1 MiB |
+| `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
 
 ### `POST /v1/pipelines/{id}/restart`
 
@@ -97,7 +99,8 @@ Least role: `operator`.
 | `202` | asked: the owner acts at its next poll |
 | `404` | no such pipeline in the generation this node runs |
 | `409` | paused, stopped, or no node holds the lease |
-| `422` | the note is longer than 500 characters, or not a string |
+| `413` | the body is over 1 MiB |
+| `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
 
 ### `POST /v1/pipelines/{id}/resume`
 
@@ -114,7 +117,8 @@ Least role: `operator`.
 | `200` | running already |
 | `202` | the desired state is running |
 | `404` | no such pipeline in the generation this node runs |
-| `422` | the note is longer than 500 characters, or not a string |
+| `413` | the body is over 1 MiB |
+| `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
 
 ### `GET /v1/pipelines/{id}/snapshots`
 
@@ -144,7 +148,8 @@ Least role: `operator`.
 | `202` | the job is queued: the owner restarts the worker, which takes its tables |
 | `404` | no such pipeline in the generation this node runs |
 | `409` | paused, stopped, no node holds the lease, or an unfinished job holds a table |
-| `422` | the body names no table, a glob, or a table not in the source's form |
+| `413` | the body is over 1 MiB |
+| `422` | the body names no table, a glob, or a table not in the source's form; or the note is too long, not a string, holds a control character, or the body isn't a JSON object |
 
 ### `POST /v1/pipelines/{id}/stop`
 
@@ -161,7 +166,8 @@ Least role: `operator`.
 | `200` | stopped already |
 | `202` | the desired state is stopped |
 | `404` | no such pipeline in the generation this node runs |
-| `422` | the note is longer than 500 characters, or not a string |
+| `413` | the body is over 1 MiB |
+| `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
 
 ## snapshots
 
@@ -199,7 +205,8 @@ Least role: `operator`.
 | `202` | published: the generation, and this node's fields pending a restart |
 | `400` | a query other than restart=accept |
 | `409` | other nodes published first, every time |
-| `422` | invalid, or it changes a restart-only field without restart=accept, or a field the cluster keeps for good: the report |
+| `413` | the body is over 1 MiB |
+| `422` | invalid, or it changes a restart-only field without restart=accept, or a field the cluster keeps for good: the report; or the note is too long, not a string, holds a control character, or the body isn't a JSON object |
 
 ### `GET /v1/config/status`
 
@@ -243,7 +250,8 @@ Least role: `admin`.
 |---|---|
 | `202` | the leave is under way |
 | `409` | leaving already |
-| `422` | the note is longer than 500 characters, or not a string |
+| `413` | the body is over 1 MiB |
+| `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
 
 ### `GET /v1/cluster/status`
 
@@ -273,7 +281,8 @@ Least role: `admin`.
 |---|---|
 | `202` | the shutdown is under way |
 | `409` | shutting down already |
-| `422` | the note is longer than 500 characters, or not a string |
+| `413` | the body is over 1 MiB |
+| `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
 
 ## events
 

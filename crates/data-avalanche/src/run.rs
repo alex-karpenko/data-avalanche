@@ -120,7 +120,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     let ready = Arc::new(AtomicBool::new(false));
     let node = Arc::new(OnceLock::new());
     let api = &first.config.globals.api;
-    let auth = Arc::new(Auth::new(api));
+    let auth = Arc::new(Auth::new(api, &first.config.globals.console.username_claim));
     let bound = bind(&api.address, api.tls.as_ref())
         .await
         .map_err(|e| match e {
@@ -144,7 +144,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     let config = joined.config;
     logger.apply(&config.globals.log);
     logger.trace(&config.globals.tracing);
-    auth.set(&config.globals.api);
+    auth.set(&config.globals.api, &config.globals.console.username_claim);
     tracing::info!(
         node = %holder.node_id,
         incarnation = holder.incarnation,
@@ -247,7 +247,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
             globals: Arc::new(move |g| {
                 log.apply(&g.log);
                 log.trace(&g.tracing);
-                reloaded_auth.set(&g.api);
+                reloaded_auth.set(&g.api, &g.console.username_claim);
                 retention.send_replace(g.console.events.retention);
             }),
             recorder: recorder.clone(),

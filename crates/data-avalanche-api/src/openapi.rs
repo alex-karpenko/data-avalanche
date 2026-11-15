@@ -18,6 +18,10 @@ use utoipa::openapi::{
 
 use crate::{Route, body, routes};
 
+/// What a route that records answers when its body is refused before it runs.
+const NOTE_REFUSED: &str = "the note is too long, not a string, holds a control character, or the body isn't a JSON object";
+const BODY_TOO_LARGE: &str = "the body is over 1 MiB";
+
 /// Every route's answers besides its own.
 const COMMON: [(u16, &str); 3] = [
     (401, "no credentials, or ones that don't verify"),
@@ -55,13 +59,22 @@ fn operation(r: &Route) -> utoipa::openapi::path::Operation {
     }
     if r.path == "/v1/events" {
         for (name, description) in crate::events::PARAMETERS {
+            let schema = if *name == "limit" {
+                ObjectBuilder::new()
+                    .schema_type(Type::Integer)
+                    .minimum(Some(1))
+                    .maximum(Some(data_avalanche_state::MAX_EVENTS))
+                    .default(Some(crate::events::DEFAULT_LIMIT.into()))
+            } else {
+                ObjectBuilder::new().schema_type(Type::String)
+            };
             op = op.parameter(
                 ParameterBuilder::new()
                     .name(*name)
                     .parameter_in(ParameterIn::Query)
                     .required(Required::False)
                     .description(Some(*description))
-                    .schema(Some(ObjectBuilder::new().schema_type(Type::String))),
+                    .schema(Some(schema)),
             );
         }
     }
@@ -77,14 +90,20 @@ fn operation(r: &Route) -> utoipa::openapi::path::Operation {
         }
         op = op.request_body(Some(body.build()));
     }
-    let mut answers = r.answers.to_vec();
-    if r.records.is_some() && !answers.iter().any(|(code, _)| *code == 422) {
-        answers.push((
-            422,
-            "the note is longer than 500 characters, or not a string",
-        ));
+    let mut answers: Vec<(u16, String)> = r
+        .answers
+        .iter()
+        .chain(&COMMON)
+        .map(|(code, d)| (*code, (*d).to_owned()))
+        .collect();
+    // The recording refuses a body before the route runs: its 422 beside the route's own.
+    if r.records.is_some() {
+        match answers.iter_mut().find(|(code, _)| *code == 422) {
+            Some((_, own)) => *own = format!("{own}; or {NOTE_REFUSED}"),
+            None => answers.push((422, NOTE_REFUSED.to_owned())),
+        }
+        answers.push((413, BODY_TOO_LARGE.to_owned()));
     }
-    answers.extend(COMMON);
     answers.sort_unstable();
     for (code, description) in answers {
         op = op.response(
@@ -232,6 +251,33 @@ mod tests {
         assert!(
             schemas.validate(&broken, oas).is_err(),
             "the schema catches a broken document"
+        );
+    }
+
+    /// The recording's own answers on every route that records, and `limit`'s bounds.
+    #[test]
+    fn the_recorded_routes_document_the_recording_s_answers() {
+        let doc: Value = serde_json::to_value(openapi()).unwrap();
+        for r in routes() {
+            let op = &doc["paths"][r.path][r.method.to_ascii_lowercase()];
+            let answers = &op["responses"];
+            if r.records.is_some() {
+                assert_eq!(answers["413"]["description"], BODY_TOO_LARGE, "{}", r.path);
+                let refused = answers["422"]["description"].as_str().unwrap();
+                assert!(refused.ends_with(NOTE_REFUSED), "{}: {refused}", r.path);
+            } else {
+                assert!(answers.get("413").is_none(), "{}", r.path);
+            }
+        }
+        let limit = doc["paths"]["/v1/events"]["get"]["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == "limit")
+            .unwrap();
+        assert_eq!(
+            limit["schema"],
+            serde_json::json!({ "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 })
         );
     }
 

@@ -1,22 +1,25 @@
 //! Attribution (Admin_Console §5–§6): every route that changes something records what it did, to
 //! what, for whom, with the caller's optional `note`, and how it ended, in the cluster's events.
 //! The name and role are the server's own verification ([`Principal`]); nothing in the request
-//! can claim them. A caller below the route's role is recorded too ([`denied`]), within
-//! [`DENIALS_BURST`] at once and one a second after on a node, so a script hammering a route
-//! can't fill the timeline.
+//! can claim them. A caller below the route's role, or with no role at all, is recorded too
+//! ([`denied`]), within [`DENIALS_BURST`] at once and one a second after on a node, and with what
+//! it aimed at cut to [`MAX_TARGET`] characters, so a script hammering a route can't fill the
+//! timeline. The route's answer never depends on the recording: one too large to read passes
+//! through as it is, recorded by its status alone.
 
+use std::borrow::Cow;
 use std::time::Instant;
 
-use axum::body::{Body, to_bytes};
+use axum::body::{Body, Bytes, HttpBody, to_bytes};
 use axum::extract::{RawPathParams, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use data_avalanche_cluster::Recorder;
 use data_avalanche_state::{Actor, EventSeverity};
+use http_body_util::LengthLimitError;
 use serde_json::Value;
 
-use crate::{Failure, Gate, Principal};
+use crate::{Failure, Gate, Node, Principal};
 
 /// The longest note, in characters.
 pub const MAX_NOTE: usize = 500;
@@ -27,12 +30,29 @@ const MAX_BODY: usize = 1 << 20;
 /// Refused attempts a node records at once, then one a second; past that they are only logged.
 pub const DENIALS_BURST: u32 = 30;
 
+/// The most characters of a refused attempt's path, and of the name it aimed at, that are
+/// recorded or logged; a longer one is cut and ends in `…`.
+pub const MAX_TARGET: usize = 128;
+
+/// The most characters of a refusal's reason recorded with an action; a longer one is cut and
+/// ends in `…`.
+pub const MAX_ERROR: usize = 1000;
+
 /// What a mutating route records: its event kind under `action.`, and the verb a page shows
 /// (`pause` → "pause orders").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Recorded {
     pub kind: &'static str,
     pub verb: &'static str,
+}
+
+/// `s` with at most `max` characters: a longer one is cut on a character boundary and ends in
+/// `…`.
+fn clipped(s: &str, max: usize) -> Cow<'_, str> {
+    match s.char_indices().nth(max) {
+        None => Cow::Borrowed(s),
+        Some((at, _)) => Cow::Owned(format!("{}…", &s[..at])),
+    }
 }
 
 /// The `note` in a JSON body: absent, or a string of at most [`MAX_NOTE`] characters without
@@ -44,9 +64,10 @@ pub fn note_of(body: &[u8]) -> Result<Option<String>, String> {
     if body.iter().all(u8::is_ascii_whitespace) {
         return Ok(None);
     }
-    let v: Value = serde_json::from_slice(body).map_err(|e| format!("the body isn't JSON: {e}"))?;
+    let v: Value =
+        serde_json::from_slice(body).map_err(|e| format!("the body must be JSON: {e}"))?;
     let Some(obj) = v.as_object() else {
-        return Err("the body is a JSON object".into());
+        return Err("the body must be a JSON object".into());
     };
     match obj.get("note") {
         None | Some(Value::Null) => Ok(None),
@@ -62,7 +83,7 @@ pub fn note_of(body: &[u8]) -> Result<Option<String>, String> {
                 Ok(Some(n.to_owned()))
             }
         }
-        Some(_) => Err("the note is a string".into()),
+        Some(_) => Err("the note must be a string".into()),
     }
 }
 
@@ -77,21 +98,30 @@ fn outcome(code: StatusCode, answer: &Value) -> Option<(&'static str, EventSever
     }
 }
 
-fn target(
-    recorder: &Recorder,
-    kind: &str,
-    params: &[(String, String)],
-) -> (Option<String>, String) {
-    let pipeline = params
-        .iter()
-        .find(|(k, _)| k == "id")
-        .map(|(_, v)| v.clone());
-    let named = match (&pipeline, kind.split('.').next()) {
-        (Some(p), _) => p.clone(),
-        (None, Some("node")) => recorder.node().to_owned(),
-        _ => String::new(),
-    };
-    (pipeline, named)
+/// Whether `e`, or an error it came from, is a body read past its length limit.
+fn over_limit(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut at = Some(e);
+    while let Some(e) = at {
+        if e.is::<LengthLimitError>() {
+            return true;
+        }
+        at = e.source();
+    }
+    false
+}
+
+/// A request body of at most [`MAX_BODY`] bytes.
+///
+/// # Errors
+/// 413 past the limit; 400 for a body that can't be read otherwise.
+async fn read_body(body: Body) -> Result<Bytes, Failure> {
+    to_bytes(body, MAX_BODY).await.map_err(|e| {
+        if over_limit(&e) {
+            Failure::new(StatusCode::PAYLOAD_TOO_LARGE, "the body is over 1 MiB")
+        } else {
+            Failure::new(StatusCode::BAD_REQUEST, "the body couldn't be read")
+        }
+    })
 }
 
 /// The recording around a mutating route: reads the note (422 on a bad one), runs the route,
@@ -105,8 +135,9 @@ pub(crate) async fn record(State(gate): State<Gate>, req: Request, next: Next) -
         return next.run(req).await;
     };
     let (mut parts, req_body) = req.into_parts();
-    let Ok(bytes) = to_bytes(req_body, MAX_BODY).await else {
-        return Failure::new(StatusCode::PAYLOAD_TOO_LARGE, "the body is too large").into();
+    let bytes = match read_body(req_body).await {
+        Ok(bytes) => bytes,
+        Err(f) => return f.into(),
     };
     let note = match note_of(&bytes) {
         Ok(note) => note,
@@ -123,84 +154,145 @@ pub(crate) async fn record(State(gate): State<Gate>, req: Request, next: Next) -
             })
             .unwrap_or_default()
     };
+    let action = Action {
+        recorded,
+        by,
+        params,
+        note,
+    };
     let answer = next
         .run(Request::from_parts(parts, Body::from(bytes)))
         .await;
     let (head, answer_body) = answer.into_parts();
+    // An answer that may be larger than the recording reads passes through unread.
+    if answer_body
+        .size_hint()
+        .upper()
+        .is_none_or(|n| n > MAX_BODY as u64)
+    {
+        action.note_outcome(node, head.status, &Value::Null);
+        return Response::from_parts(head, answer_body);
+    }
     let Ok(answer_bytes) = to_bytes(answer_body, MAX_BODY).await else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     let v: Value = serde_json::from_slice(&answer_bytes).unwrap_or(Value::Null);
-    if let Some((outcome, severity)) = outcome(head.status, &v) {
-        let recorder = &node.recorder;
-        let (pipeline, named) = target(recorder, recorded.kind, &params);
-        let mut event = recorder.event(
-            &format!("action.{}", recorded.kind),
-            severity,
-            format!("{} {named}", recorded.verb).trim_end().to_owned(),
-        );
-        event.pipeline = pipeline;
-        event.object = v["job_id"]
-            .as_str()
-            .map(str::to_owned)
-            .or_else(|| v["generation"].as_u64().map(|g| g.to_string()))
-            .or_else(|| (recorded.kind.starts_with("node.")).then(|| recorder.node().to_owned()));
-        event.actor = Some(Actor {
-            name: by.name.clone(),
-            role: by.role.to_string(),
-        });
-        event.note = note;
-        event.outcome = Some(outcome.to_owned());
-        if let Some(e) = v["error"].as_str() {
-            event.detail.insert("error".into(), e.to_owned());
-        }
-        recorder.record(event);
-    }
+    action.note_outcome(node, head.status, &v);
     Response::from_parts(head, Body::from(answer_bytes))
 }
 
-/// Records a caller turned away from a mutating route for its role (a 403), within the node's
-/// rate.
-pub(crate) fn denied(gate: &Gate, by: &Principal, path: &str) {
+/// An action under way through a mutating route: what it records, who asked and why.
+struct Action {
+    recorded: Recorded,
+    by: Principal,
+    params: Vec<(String, String)>,
+    note: Option<String>,
+}
+
+impl Action {
+    /// Records how the action ended: its answer's `status`, and the `answer` read (`null` when
+    /// it wasn't).
+    fn note_outcome(self, node: &Node, status: StatusCode, answer: &Value) {
+        let Some((outcome, severity)) = outcome(status, answer) else {
+            return;
+        };
+        let recorder = &node.recorder;
+        let pipeline = self
+            .params
+            .iter()
+            .find(|(k, _)| k == "id")
+            .map(|(_, v)| v.clone());
+        let named = match (&pipeline, self.recorded.kind.split('.').next()) {
+            (Some(p), _) => p.clone(),
+            (None, Some("node")) => recorder.node().to_owned(),
+            _ => String::new(),
+        };
+        let mut event = recorder.event(
+            &format!("action.{}", self.recorded.kind),
+            severity,
+            format!("{} {named}", self.recorded.verb)
+                .trim_end()
+                .to_owned(),
+        );
+        event.pipeline = pipeline;
+        event.object = answer["job_id"]
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| answer["generation"].as_u64().map(|g| g.to_string()))
+            .or_else(|| {
+                (self.recorded.kind.starts_with("node.")).then(|| recorder.node().to_owned())
+            });
+        event.actor = Some(Actor {
+            name: self.by.name,
+            role: self.by.role.to_string(),
+        });
+        event.note = self.note;
+        event.outcome = Some(outcome.to_owned());
+        if let Some(e) = answer["error"].as_str() {
+            event
+                .detail
+                .insert("error".into(), clipped(e, MAX_ERROR).into_owned());
+        }
+        recorder.record(event);
+    }
+}
+
+/// Records a caller turned away from a mutating route (a 403), named `name`, of `role` (`none`
+/// for a token with no role this node maps), within the node's rate. The path and the name it
+/// aims at are cut to [`MAX_TARGET`] characters, and the pipeline is recorded only when the path
+/// names one in the generation this node runs.
+pub(crate) async fn denied(gate: &Gate, name: &str, role: &str, path: &str) {
     let (Some(recorded), Some(node)) = (gate.route.records, gate.node.get()) else {
         return;
     };
+    let shown = clipped(path, MAX_TARGET);
     if node.denials.take(Instant::now()).is_err() {
-        tracing::info!(by = %by.name, path, "a refused attempt not recorded: past the node's rate");
+        tracing::info!(by = %name, path = %shown, "a refused attempt not recorded: past the node's rate");
         return;
     }
     let recorder = &node.recorder;
+    let segment = path
+        .strip_prefix("/v1/pipelines/")
+        .map(|rest| rest.split('/').next().unwrap_or_default());
+    let pipeline = match segment {
+        Some(id) if known(node, id).await => Some(id.to_owned()),
+        _ => None,
+    };
+    let target = match segment {
+        Some(id) => clipped(id, MAX_TARGET).into_owned(),
+        None if path.starts_with("/v1/cluster/") || path.starts_with("/v1/admin/") => {
+            recorder.node().to_owned()
+        }
+        None => String::new(),
+    };
     let mut event = recorder.event(
         "action.denied",
         EventSeverity::Warning,
         format!(
             "{} refused: needs {}",
-            format!("{} {}", recorded.verb, path_target(path, recorder)).trim_end(),
+            format!("{} {target}", recorded.verb).trim_end(),
             gate.route.role
         ),
     );
-    event.pipeline = path
-        .strip_prefix("/v1/pipelines/")
-        .and_then(|rest| rest.split('/').next())
-        .map(str::to_owned);
-    event.object = Some(path.to_owned());
+    event.pipeline = pipeline;
+    event.object = Some(shown.into_owned());
     event.actor = Some(Actor {
-        name: by.name.clone(),
-        role: by.role.to_string(),
+        name: name.to_owned(),
+        role: role.to_owned(),
     });
     event.outcome = Some("denied".into());
     event.detail.insert("action".into(), recorded.kind.into());
     recorder.record(event);
 }
 
-fn path_target(path: &str, recorder: &Recorder) -> String {
-    if let Some(rest) = path.strip_prefix("/v1/pipelines/") {
-        rest.split('/').next().unwrap_or_default().to_owned()
-    } else if path.starts_with("/v1/cluster/") || path.starts_with("/v1/admin/") {
-        recorder.node().to_owned()
-    } else {
-        String::new()
-    }
+/// Whether `id` names a pipeline in the generation this node runs.
+async fn known(node: &Node, id: &str) -> bool {
+    node.coordinator
+        .config()
+        .await
+        .pipelines
+        .values()
+        .any(|p| p.id == id)
 }
 
 #[cfg(test)]
@@ -213,7 +305,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::test_support::{CONFIG, Issuer, Lone, api, lone, open, request, serve};
+    use crate::test_support::{
+        CONFIG, Issuer, Lone, USERNAME_CLAIM, api, lone, open, request, serve,
+    };
     use crate::{Api, Auth};
 
     /// The lone node's API under `auth`, its pipeline `orders` known.
@@ -365,7 +459,8 @@ mod tests {
     #[tokio::test]
     async fn a_caller_below_the_role_is_recorded_as_denied() {
         let idp = Issuer::start().await;
-        let (addr, lone, _dir) = served(Arc::new(Auth::new(&idp.api("roles")))).await;
+        let (addr, lone, _dir) =
+            served(Arc::new(Auth::new(&idp.api("roles"), USERNAME_CLAIM))).await;
         let token = format!("Bearer {}", idp.token(serde_json::json!(["viewer"])));
         let auth = [("Authorization", token.as_str())];
         let (code, _, _) = request(addr, "POST", "/v1/admin/shutdown", &auth, "").await;
@@ -385,6 +480,146 @@ mod tests {
             crate::Stop::Run,
             "nothing was shut down"
         );
+
+        // A pipeline this node runs is named; any other path is recorded cut short, no pipeline.
+        let (code, _, _) = request(addr, "POST", "/v1/pipelines/orders/pause", &auth, "").await;
+        assert_eq!(code, 403);
+        let long = "p".repeat(5000);
+        let (code, _, _) = request(
+            addr,
+            "POST",
+            &format!("/v1/pipelines/{long}/pause"),
+            &auth,
+            "",
+        )
+        .await;
+        assert_eq!(code, 403);
+        let got = events(&lone.events, 3).await;
+        let (made_up, orders) = (&got[0], &got[1]);
+        assert_eq!(orders.pipeline.as_deref(), Some("orders"));
+        assert_eq!(orders.text, "pause orders refused: needs operator");
+        assert_eq!(made_up.pipeline, None, "not a pipeline this node runs");
+        let object = made_up.object.as_deref().unwrap();
+        assert_eq!(object.chars().count(), MAX_TARGET + 1, "{object}");
+        assert!(object.starts_with("/v1/pipelines/ppp"), "{object}");
+        assert!(object.ends_with('…'), "{object}");
+        assert!(
+            made_up.text.chars().count() < 200,
+            "the text's target is cut too: {}",
+            made_up.text
+        );
+        assert!(made_up.text.contains("…"), "{}", made_up.text);
+    }
+
+    /// A verified token whose roles this node maps to nothing is an outsider: refused, and
+    /// recorded under its name with role `none`.
+    #[tokio::test]
+    async fn a_token_with_no_mapped_role_is_recorded_as_denied() {
+        let idp = Issuer::start().await;
+        let (addr, lone, _dir) =
+            served(Arc::new(Auth::new(&idp.api("roles"), USERNAME_CLAIM))).await;
+        let token = format!("Bearer {}", idp.token(serde_json::json!(["cdc-reader"])));
+        let auth = [("Authorization", token.as_str())];
+        let (code, _, body) = request(addr, "POST", "/v1/pipelines/orders/pause", &auth, "").await;
+        assert_eq!(code, 403);
+        assert!(body.contains("name no role this node maps"), "{body}");
+        let got = events(&lone.events, 1).await;
+        assert_eq!(got.len(), 1, "{got:?}");
+        let e = &got[0];
+        assert_eq!(e.kind, "action.denied");
+        assert_eq!(
+            e.actor,
+            Some(Actor {
+                name: "alice".into(),
+                role: "none".into()
+            })
+        );
+        assert_eq!(e.pipeline.as_deref(), Some("orders"));
+        let (code, _, _) = request(addr, "GET", "/v1/pipelines", &auth, "").await;
+        assert_eq!(code, 403);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            events(&lone.events, 1).await.len(),
+            1,
+            "a route that changes nothing records nothing"
+        );
+    }
+
+    /// An answer larger than the recording reads reaches the caller as the route made it, and
+    /// the action is still recorded, by its status.
+    #[tokio::test]
+    async fn a_large_answer_passes_through_and_is_recorded_by_its_status() {
+        use std::sync::OnceLock;
+
+        use axum::middleware::from_fn_with_state;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.yaml");
+        std::fs::write(&file, CONFIG).unwrap();
+        let lone = lone(file).await;
+        let node = Arc::new(OnceLock::new());
+        node.set(lone.node.clone()).unwrap();
+        let route = crate::routes()
+            .into_iter()
+            .find(|r| r.path == "/v1/pipelines/{id}/pause")
+            .unwrap();
+        let gate = Gate {
+            auth: open(),
+            route,
+            node,
+        };
+        let big = MAX_BODY + 1;
+        let app = axum::Router::new().route(
+            route.path,
+            axum::routing::post(move || async move { (StatusCode::ACCEPTED, "x".repeat(big)) })
+                .route_layer(from_fn_with_state(gate.clone(), record))
+                .route_layer(from_fn_with_state(gate, crate::authorize)),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let (code, _, body) = request(
+            addr,
+            "POST",
+            "/v1/pipelines/orders/pause",
+            &[],
+            r#"{"note": "a big one"}"#,
+        )
+        .await;
+        assert_eq!(code, 202);
+        assert_eq!(body.len(), big, "the answer, whole");
+        let got = events(&lone.events, 1).await;
+        let e = &got[0];
+        assert_eq!(e.kind, "action.pipeline.pause");
+        assert_eq!(e.outcome.as_deref(), Some("accepted"));
+        assert_eq!(e.note.as_deref(), Some("a big one"));
+        assert!(e.detail.is_empty(), "{:?}", e.detail);
+    }
+
+    #[tokio::test]
+    async fn a_body_past_the_limit_is_413_and_an_unreadable_one_400() {
+        let over = read_body(Body::from(vec![b' '; MAX_BODY + 1]))
+            .await
+            .unwrap_err();
+        assert_eq!(over.code, StatusCode::PAYLOAD_TOO_LARGE);
+        let broken = Body::from_stream(futures_util::stream::iter([Err::<Bytes, _>(
+            std::io::Error::other("the client went away"),
+        )]));
+        let unread = read_body(broken).await.unwrap_err();
+        assert_eq!(unread.code, StatusCode::BAD_REQUEST);
+        assert_eq!(unread.error, "the body couldn't be read");
+        assert_eq!(
+            read_body(Body::from("{}")).await.unwrap(),
+            Bytes::from("{}")
+        );
+    }
+
+    #[test]
+    fn a_long_text_is_clipped_on_a_character_boundary() {
+        assert_eq!(clipped("orders", 6), "orders");
+        assert_eq!(clipped("ééééé", 3), "ééé…");
+        assert_eq!(clipped("", 0), "");
+        assert_eq!(clipped("ab", 0), "…");
     }
 
     /// A script hammering a route its role doesn't allow is recorded for a burst, then once a
@@ -392,7 +627,8 @@ mod tests {
     #[tokio::test]
     async fn a_flood_of_refused_calls_is_recorded_for_a_burst_only() {
         let idp = Issuer::start().await;
-        let (addr, lone, _dir) = served(Arc::new(Auth::new(&idp.api("roles")))).await;
+        let (addr, lone, _dir) =
+            served(Arc::new(Auth::new(&idp.api("roles"), USERNAME_CLAIM))).await;
         let token = format!("Bearer {}", idp.token(serde_json::json!(["viewer"])));
         let auth = [("Authorization", token.as_str())];
         let started = std::time::Instant::now();
@@ -440,8 +676,15 @@ mod tests {
             "500 characters, not bytes"
         );
         assert!(note_of(br#"{"note": "a\u0007b"}"#).is_err());
-        assert!(note_of(br#"{"note": 5}"#).is_err());
-        assert!(note_of(b"[]").is_err());
-        assert!(note_of(b"note").is_err());
+        assert_eq!(
+            note_of(br#"{"note": 5}"#),
+            Err("the note must be a string".into())
+        );
+        assert_eq!(note_of(b"[]"), Err("the body must be a JSON object".into()));
+        assert!(
+            note_of(b"note")
+                .unwrap_err()
+                .starts_with("the body must be JSON")
+        );
     }
 }

@@ -67,9 +67,12 @@ pub(crate) fn config() -> ResolvedConfig {
         .config
 }
 
+/// `globals.console.username_claim`'s default.
+pub(crate) const USERNAME_CLAIM: &str = "preferred_username";
+
 /// `globals.api` of [`CONFIG`]: `auth: none`.
 pub(crate) fn open() -> Arc<Auth> {
-    Arc::new(Auth::new(&config().globals.api))
+    Arc::new(Auth::new(&config().globals.api, USERNAME_CLAIM))
 }
 
 /// The routes' state before the node runs its generation: the `/v1` routes answer 503.

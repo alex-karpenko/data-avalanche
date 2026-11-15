@@ -44,8 +44,14 @@
               "application/json": {}
             }
           },
+          "413": {
+            "description": "the body is over 1 MiB",
+            "content": {
+              "application/json": {}
+            }
+          },
           "422": {
-            "description": "the note is longer than 500 characters, or not a string",
+            "description": "the note is too long, not a string, holds a control character, or the body isn't a JSON object",
             "content": {
               "application/json": {}
             }
@@ -106,8 +112,14 @@
               "application/json": {}
             }
           },
+          "413": {
+            "description": "the body is over 1 MiB",
+            "content": {
+              "application/json": {}
+            }
+          },
           "422": {
-            "description": "the note is longer than 500 characters, or not a string",
+            "description": "the note is too long, not a string, holds a control character, or the body isn't a JSON object",
             "content": {
               "application/json": {}
             }
@@ -223,8 +235,14 @@
               "application/json": {}
             }
           },
+          "413": {
+            "description": "the body is over 1 MiB",
+            "content": {
+              "application/json": {}
+            }
+          },
           "422": {
-            "description": "invalid, or it changes a restart-only field without restart=accept, or a field the cluster keeps for good: the report",
+            "description": "invalid, or it changes a restart-only field without restart=accept, or a field the cluster keeps for good: the report; or the note is too long, not a string, holds a control character, or the body isn't a JSON object",
             "content": {
               "application/json": {}
             }
@@ -427,7 +445,10 @@
             "description": "at most this many (1–1000, 100 by default)",
             "required": false,
             "schema": {
-              "type": "string"
+              "type": "integer",
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1
             }
           },
           {
@@ -690,8 +711,14 @@
               "application/json": {}
             }
           },
+          "413": {
+            "description": "the body is over 1 MiB",
+            "content": {
+              "application/json": {}
+            }
+          },
           "422": {
-            "description": "the note is longer than 500 characters, or not a string",
+            "description": "the note is too long, not a string, holds a control character, or the body isn't a JSON object",
             "content": {
               "application/json": {}
             }
@@ -775,8 +802,14 @@
               "application/json": {}
             }
           },
+          "413": {
+            "description": "the body is over 1 MiB",
+            "content": {
+              "application/json": {}
+            }
+          },
           "422": {
-            "description": "the note is longer than 500 characters, or not a string",
+            "description": "the note is too long, not a string, holds a control character, or the body isn't a JSON object",
             "content": {
               "application/json": {}
             }
@@ -854,8 +887,14 @@
               "application/json": {}
             }
           },
+          "413": {
+            "description": "the body is over 1 MiB",
+            "content": {
+              "application/json": {}
+            }
+          },
           "422": {
-            "description": "the note is longer than 500 characters, or not a string",
+            "description": "the note is too long, not a string, holds a control character, or the body isn't a JSON object",
             "content": {
               "application/json": {}
             }
@@ -933,8 +972,14 @@
               "application/json": {}
             }
           },
+          "413": {
+            "description": "the body is over 1 MiB",
+            "content": {
+              "application/json": {}
+            }
+          },
           "422": {
-            "description": "the note is longer than 500 characters, or not a string",
+            "description": "the note is too long, not a string, holds a control character, or the body isn't a JSON object",
             "content": {
               "application/json": {}
             }
@@ -1070,8 +1115,14 @@
               "application/json": {}
             }
           },
+          "413": {
+            "description": "the body is over 1 MiB",
+            "content": {
+              "application/json": {}
+            }
+          },
           "422": {
-            "description": "the body names no table, a glob, or a table not in the source's form",
+            "description": "the body names no table, a glob, or a table not in the source's form; or the note is too long, not a string, holds a control character, or the body isn't a JSON object",
             "content": {
               "application/json": {}
             }
@@ -1149,8 +1200,14 @@
               "application/json": {}
             }
           },
+          "413": {
+            "description": "the body is over 1 MiB",
+            "content": {
+              "application/json": {}
+            }
+          },
           "422": {
-            "description": "the note is longer than 500 characters, or not a string",
+            "description": "the note is too long, not a string, holds a control character, or the body isn't a JSON object",
             "content": {
               "application/json": {}
             }

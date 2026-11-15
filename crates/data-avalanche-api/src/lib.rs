@@ -6,7 +6,7 @@
 //!
 //! Every `/v1` route takes the least role in API_RBAC §2 ([`routes`]): no credentials, or ones
 //! that don't verify, are 401 with a `WWW-Authenticate` challenge; a caller below the route's
-//! role is 403.
+//! role, or with no role mapped, is 403, and recorded on a route that changes something.
 
 mod actions;
 mod auth;
@@ -38,7 +38,7 @@ use data_avalanche_telemetry::{CONTENT_TYPE, Metrics};
 use serde_json::{Value, json};
 use tokio::sync::watch;
 
-pub use actions::{DENIALS_BURST, MAX_NOTE, Recorded, note_of};
+pub use actions::{DENIALS_BURST, MAX_ERROR, MAX_NOTE, MAX_TARGET, Recorded, note_of};
 pub use auth::{Auth, FETCH_TIMEOUT, KEYS_MAX_AGE, MAX_KEY_DOCUMENT, Principal, REFETCH_AFTER};
 pub use cluster::{Control, Stop};
 pub use limit::{RateLimit, VALIDATE_BURST, VALIDATE_PER_SECOND};
@@ -467,13 +467,18 @@ async fn authorize(State(gate): State<Gate>, mut req: Request, next: Next) -> Re
             next.run(req).await
         }
         Ok(p) => {
-            actions::denied(&gate, &p, req.uri().path());
+            let path = req.uri().path().to_owned();
+            actions::denied(&gate, &p.name, &p.role.to_string(), &path).await;
             body(
                 StatusCode::FORBIDDEN,
                 &json!({ "error": format!("this needs the {role} role; {} is {}", p.name, p.role) }),
             )
         }
-        Err(Denied::Forbidden(why)) => body(StatusCode::FORBIDDEN, &json!({ "error": why })),
+        Err(Denied::Forbidden { name, why }) => {
+            let path = req.uri().path().to_owned();
+            actions::denied(&gate, &name, "none", &path).await;
+            body(StatusCode::FORBIDDEN, &json!({ "error": why }))
+        }
         Err(Denied::Unauthenticated { challenge, why }) => {
             let mut r = body(StatusCode::UNAUTHORIZED, &json!({ "error": why }));
             r.headers_mut().insert(
@@ -583,7 +588,11 @@ mod tests {
     #[tokio::test]
     async fn every_route_turns_away_callers_below_its_role() {
         let idp = Issuer::start().await;
-        let addr = serve(api(Arc::new(Auth::new(&idp.api("roles"))))).await;
+        let addr = serve(api(Arc::new(Auth::new(
+            &idp.api("roles"),
+            crate::test_support::USERNAME_CLAIM,
+        ))))
+        .await;
         let callers = [
             ("viewer", Some(Role::Viewer)),
             ("operator", Some(Role::Operator)),
