@@ -34,6 +34,11 @@ impl RateLimit {
         Self::new(VALIDATE_BURST, VALIDATE_PER_SECOND)
     }
 
+    /// The refused attempts a node records ([`crate::DENIALS_BURST`], then one a second).
+    pub fn denials() -> Self {
+        Self::new(crate::DENIALS_BURST, 1)
+    }
+
     /// Takes a token at `now`; `Err` with the wait until one is there.
     ///
     /// # Errors

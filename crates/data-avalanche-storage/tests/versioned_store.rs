@@ -75,6 +75,15 @@ async fn check(store: Arc<dyn ObjectStore>, test: &str) {
         ]
     );
     assert_eq!(s.get("doc.json").await.unwrap().unwrap().0, b("two"));
+    // One listing of the folders under a prefix (the events' days, M13a): each once, sorted, no
+    // object directly under it, and nothing from a sibling prefix.
+    s.put("snapshotsx/x.json", b("x")).await.unwrap();
+    assert_eq!(
+        s.folders("snapshots").await.unwrap(),
+        vec!["jobs", "tables"],
+        "the folders under snapshots/"
+    );
+    assert!(s.folders("missing").await.unwrap().is_empty());
 
     s.delete("snapshots/jobs/j1.json").await.expect("delete");
     assert_eq!(s.get("snapshots/jobs/j1.json").await.unwrap(), None);

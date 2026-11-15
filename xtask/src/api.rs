@@ -20,6 +20,10 @@ const TAGS: &[(&str, &str)] = &[
     ),
     ("cluster", "Membership and leases."),
     ("admin", "The node's process."),
+    (
+        "events",
+        "The cluster's timeline and audit trail, kept for `globals.console.events.retention`.",
+    ),
     ("openapi.json", "The document this page is rendered from."),
 ];
 
@@ -76,6 +80,13 @@ pub(crate) fn page() -> String {
          a pipeline command or a snapshot job is carried out by the node that holds the \
          pipeline's lease, a reload is published, a leave or a shutdown is under way on the \
          node called.\n\n\
+         **Who did it.** Every route that changes something takes an optional JSON body \
+         `{{\"note\": \"…\"}}` and records the action in the cluster's events: what, to what, \
+         the caller's name and role as the node verified them, the note, and how it ended \
+         (`accepted`, `unchanged`, `refused`). A caller turned away for its role, or with no \
+         role mapped, is recorded too (`action.denied`). A note longer than 500 characters, \
+         not a string or holding a control character, or a body that isn't a JSON object, is \
+         `422`; a body over 1 MiB is `413`; either way nothing is done or recorded.\n\n\
          **Outside `/v1`**, with no credentials: `GET /health/live` (the process answers), \
          `GET /health/ready` (`200` once the node runs its config, `503` before and while it \
          stops) and `GET /metrics` (Prometheus text).\n\n",
@@ -94,7 +105,8 @@ pub(crate) fn page() -> String {
             for p in op["parameters"].as_array().into_iter().flatten() {
                 let _ = writeln!(
                     out,
-                    "- Path parameter `{}`: {}.",
+                    "- {} parameter `{}`: {}.",
+                    if p["in"] == "query" { "Query" } else { "Path" },
                     p["name"].as_str().expect("a name"),
                     p["description"].as_str().unwrap_or_default(),
                 );
@@ -102,6 +114,9 @@ pub(crate) fn page() -> String {
             if let Some(body) = op["requestBody"]["content"].as_object() {
                 let types: Vec<String> = body.keys().map(|t| format!("`{t}`")).collect();
                 let _ = writeln!(out, "- Body: {}.", types.join(", "));
+                if let Some(d) = op["requestBody"]["description"].as_str() {
+                    let _ = writeln!(out, "- {d}.");
+                }
             }
             out.push_str("\n| Status | When |\n|---|---|\n");
             for (code, answer) in sorted(&op["responses"]) {

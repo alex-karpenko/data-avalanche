@@ -14,7 +14,7 @@ use tokio::sync::watch;
 use tracing::Instrument;
 use tracing::field::Empty;
 
-use crate::{CommitGuard, Tuning, WorkerError, WorkerStatus};
+use crate::{CommitGuard, Observer, Tuning, WorkerError, WorkerStatus};
 
 /// The sink table's columns `source` doesn't have, the lineage and internal columns aside:
 /// soft-dropped, kept and written NULL (`data_avalanche_sink_soft_dropped_columns`).
@@ -156,6 +156,8 @@ pub(crate) struct Evolver<'a> {
     pub tuning: &'a Tuning,
     pub evolution: bool,
     pub status: &'a watch::Sender<WorkerStatus>,
+    /// Hears each evolve the sink applied, fully or degraded.
+    pub observer: &'a dyn Observer,
 }
 
 impl Evolver<'_> {
@@ -217,10 +219,18 @@ impl Evolver<'_> {
             changes = safe.len(),
             outcome = Empty,
         );
+        let changes = safe.clone();
         let applied = self.apply(table, safe).instrument(span.clone()).await;
         let outcome = match &applied {
-            Ok(Ok(None)) => "applied",
-            Ok(Ok(Some(_))) => "degraded",
+            Ok(Ok(None)) => {
+                self.observer.schema_evolved(table, &changes, None);
+                "applied"
+            }
+            Ok(Ok(Some(warning))) => {
+                self.observer
+                    .schema_evolved(table, &changes, Some(warning.as_str()));
+                "degraded"
+            }
             Ok(Err(_)) => "halted",
             Err(_) => "failed",
         };

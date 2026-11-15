@@ -126,6 +126,24 @@ fn applies_spec_defaults() {
             headers: Default::default(),
         }
     );
+    assert_eq!(
+        g.console,
+        Console {
+            enabled: false,
+            session_key: None,
+            public_url: None,
+            session_ttl: Duration::from_secs(8 * 3600),
+            username_claim: "preferred_username".into(),
+            history: Retention {
+                retention: Duration::from_secs(24 * 3600)
+            },
+            events: Retention {
+                retention: Duration::from_secs(30 * 24 * 3600)
+            },
+            prometheus: None,
+        },
+        "config §6.8's defaults: the console off, its records kept 24 h and 30 days"
+    );
     let p = &cfg.pipelines["orders"];
     assert_eq!(p.source.ssl_mode, SslMode::Require);
     assert_eq!(p.source.timeouts.snapshot, Duration::from_secs(6 * 3600));
@@ -1191,4 +1209,62 @@ fn a_posted_templated_mysql_id_derives_no_server_id() {
     );
     assert!(!shown.contains("derived"), "{shown}");
     assert!(!shown.contains("sekret-value-1"), "{shown}");
+}
+
+#[test]
+fn console_urls_are_stored_trimmed() {
+    let yaml = MINIMAL.replace(
+        "globals:\n  state: { bucket: app-state }",
+        "globals:\n  state: { bucket: app-state }\n  console:\n    enabled: true\n    public_url: \" https://cdc.example.com \"\n    prometheus:\n      url: \" http://prom:9090 \"",
+    );
+    let cfg = load_str(&yaml, &env(&[("PW", "pw")]), &fp_key())
+        .unwrap_or_else(|r| panic!("{r:#?}"))
+        .config;
+    let c = &cfg.globals.console;
+    assert_eq!(c.public_url.as_deref(), Some("https://cdc.example.com"));
+    assert_eq!(
+        c.prometheus.as_ref().map(|p| p.url.as_str()),
+        Some("http://prom:9090")
+    );
+}
+
+/// Config §6.8: the console's secrets resolve as secrets (shown by fingerprint), Prometheus takes
+/// its bearer token and labels, and the oauth2 sign-in fields keep their defaults.
+#[test]
+fn console_settings_resolve_with_their_secrets_hidden() {
+    let yaml = MINIMAL.replace(
+        "globals:\n  state: { bucket: app-state }",
+        "globals:\n  state: { bucket: app-state }\n  api:\n    auth: oauth2\n    oauth2: { issuer: https://idp, jwks_url: https://idp/certs, client_id: cdc-console }\n  console:\n    enabled: true\n    session_key: ${KEY}\n    public_url: https://cdc.example.com\n    prometheus:\n      url: https://prom\n      bearer_token: ${PROM}\n      headers: { x-scope-orgid: shop }\n      extra_labels: { cluster: prod-eu }",
+    );
+    let key = "k".repeat(32);
+    let cfg = load_str(
+        &yaml,
+        &env(&[("PW", "pw"), ("KEY", key.as_str()), ("PROM", "pr0m")]),
+        &fp_key(),
+    )
+    .unwrap_or_else(|r| panic!("{r:#?}"))
+    .config;
+    let c = &cfg.globals.console;
+    assert!(c.enabled);
+    assert_eq!(
+        c.session_key.as_ref().map(|k| k.expose()),
+        Some(key.as_str())
+    );
+    let p = c.prometheus.as_ref().expect("prometheus");
+    assert_eq!(p.url, "https://prom");
+    match &p.auth {
+        PrometheusAuth::Bearer { token } => assert_eq!(token.expose(), "pr0m"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(p.extra_labels["cluster"], "prod-eu");
+    assert_eq!(p.timeout, Duration::from_secs(5));
+    let o = cfg.globals.api.oauth2.as_ref().expect("oauth2");
+    assert_eq!(o.client_id.as_deref(), Some("cdc-console"));
+    assert_eq!(o.scopes, ["openid", "profile"]);
+    assert_eq!(o.idp_name, None);
+    let shown = serde_json::to_string(&cfg.globals.console).unwrap();
+    assert!(
+        !shown.contains(&key) && !shown.contains("pr0m") && shown.contains("blake3:"),
+        "{shown}"
+    );
 }

@@ -62,6 +62,9 @@ const CATALOGUE: &[(&str, Option<&[&str]>)] = &[
     // Status
     ("data_avalanche_pipeline_status", Some(&["status"])),
     ("data_avalanche_halted_tables", Some(&[])),
+    // Events (Admin_Console §6)
+    ("data_avalanche_events_written_total", None),
+    ("data_avalanche_events_dropped_total", None),
 ];
 
 /// The per-table series `sink.metrics.per_table` adds `table` to, with their other labels.
@@ -213,7 +216,7 @@ fn the_alert_rules_name_only_catalogued_series_and_labels() {
         "/../../deploy/prometheus/alerts.yaml"
     ));
     let named = selectors(rules);
-    assert_eq!(named.len(), 5, "{named:?}");
+    assert_eq!(named.len(), 6, "{named:?}");
     for (name, labels) in named {
         let (_, extra) = CATALOGUE
             .iter()

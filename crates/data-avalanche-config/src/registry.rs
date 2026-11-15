@@ -1057,7 +1057,7 @@ pub const RULES: &[RuleMeta] = &[
         Error,
         L::Config,
         Config,
-        r#"globals.tracing.headers"#,
+        r#"globals.tracing.headers, globals.console.prometheus.headers"#,
         r#"Each name an HTTP token, each value visible ASCII, spaces and tabs (DA-OBS-7)."#,
     ),
     rule(
@@ -1067,6 +1067,86 @@ pub const RULES: &[RuleMeta] = &[
         SourceSchema,
         r#"tables.column_type_overrides keys"#,
         r#"The key's column names no column of its table (on MySQL compared without case, as MySQL compares column names): the override changes nothing (DA-SRC-35). (Emitted at schema resolution.)"#,
+    ),
+    rule(
+        "V-128",
+        Error,
+        L::Config,
+        Config,
+        r#"globals.console.session_key"#,
+        r#"At least 32 bytes after substitution."#,
+    ),
+    rule(
+        "V-129",
+        Error,
+        L::Config,
+        Config,
+        r#"globals.console.public_url"#,
+        r#"An absolute http/https URL without query or fragment."#,
+    ),
+    rule(
+        "V-130",
+        Error,
+        L::Config,
+        Config,
+        r#"globals.console.prometheus.url"#,
+        r#"An absolute http/https URL."#,
+    ),
+    rule(
+        "V-131",
+        Error,
+        L::Config,
+        Config,
+        r#"globals.console.prometheus"#,
+        r#"basic and bearer_token are exclusive; extra_labels names match [a-zA-Z_][a-zA-Z0-9_]* and don't start with __."#,
+    ),
+    rule(
+        "V-132",
+        Error,
+        L::Config,
+        Config,
+        r#"globals.console durations"#,
+        r#"session_ttl 5 min – 7 days; history.retention 1 h – 30 days; events.retention 1 – 400 days."#,
+    ),
+    rule(
+        "V-133",
+        Error,
+        L::Config,
+        Config,
+        r#"globals.api.oauth2.client_secret / globals.api.oauth2.scopes"#,
+        r#"Need client_id."#,
+    ),
+    rule(
+        "V-134",
+        Warning,
+        L::Config,
+        Config,
+        r#"globals.console.session_key with api.auth ∈ {none, jwt}"#,
+        r#"Unused: these modes have no sessions."#,
+    ),
+    rule(
+        "V-135",
+        Error,
+        L::Config,
+        Config,
+        r#"globals.console.enabled = true with api.auth ∈ {basic, oauth2}"#,
+        r#"Requires globals.console.session_key."#,
+    ),
+    rule(
+        "V-136",
+        Error,
+        L::Config,
+        Config,
+        r#"globals.console.enabled = true with api.auth = oauth2"#,
+        r#"Requires globals.console.public_url and globals.api.oauth2.client_id."#,
+    ),
+    rule(
+        "V-137",
+        Error,
+        L::Config,
+        Config,
+        r#"globals.console.prometheus"#,
+        r#"Requires url; basic requires user and password."#,
     ),
 ];
 
@@ -1081,7 +1161,7 @@ mod tests {
 
     #[test]
     fn has_every_spec_rule_once_in_order() {
-        assert_eq!(RULES.len(), 121);
+        assert_eq!(RULES.len(), 131);
         assert!(
             RULES.windows(2).all(|w| w[0].id < w[1].id),
             "sorted, no duplicates"

@@ -266,9 +266,10 @@ fn read_or_report<T>(
 
 // ---- globals ----
 
-/// `globals.tracing.headers`, each value a secret. The structural pass builds none (no
-/// fingerprint key), though each value's template is still checked.
-fn tracing_headers(
+/// A map whose values are secrets (`globals.tracing.headers`, `globals.console.prometheus.headers`).
+/// The structural pass builds none (no fingerprint key), though each value's template is still
+/// checked.
+fn secret_map(
     ctx: &mut Ctx,
     headers: &Option<BTreeMap<String, Leaf<String>>>,
     at: &At,
@@ -285,6 +286,90 @@ fn tracing_headers(
         };
     }
     out
+}
+
+/// An optional secret. The structural pass builds none (no fingerprint key), though the value's
+/// template is still checked.
+fn secret(ctx: &mut Ctx, leaf: &L<String>, at: &At, key: &str) -> Option<Option<Secret>> {
+    let Some(l) = leaf else { return Some(None) };
+    let text = ctx.text(l, &at.key(key))?;
+    ctx.fingerprint_key().map(|k| Some(Secret::new(text, k)))
+}
+
+/// `globals.console` (§6.8).
+fn console(c: &RawConsole, at: &At, ctx: &mut Ctx) -> Option<Console> {
+    let enabled = or(ctx, &c.enabled, at, "enabled", false);
+    let session_key = secret(ctx, &c.session_key, at, "session_key");
+    let public_url = opt(ctx, &c.public_url, at, "public_url");
+    let session_ttl = or(
+        ctx,
+        &c.session_ttl,
+        at,
+        "session_ttl",
+        Duration::from_secs(8 * 3600),
+    );
+    let username_claim = or(
+        ctx,
+        &c.username_claim,
+        at,
+        "username_claim",
+        "preferred_username".to_string(),
+    );
+    let mut retention = |r: &Option<RawRetention>, key: &str, default: Duration| {
+        let r = r.clone().unwrap_or_default();
+        or(ctx, &r.retention, &at.key(key), "retention", default)
+            .map(|retention| Retention { retention })
+    };
+    let history = retention(&c.history, "history", Duration::from_secs(24 * 3600));
+    let events = retention(&c.events, "events", Duration::from_secs(30 * 24 * 3600));
+    let prometheus = match &c.prometheus {
+        None => Some(None),
+        Some(p) => prometheus(p, &at.key("prometheus"), ctx).map(Some),
+    };
+    Some(Console {
+        enabled: enabled?,
+        session_key: session_key?,
+        public_url: public_url?.map(|u| u.trim().to_owned()),
+        session_ttl: session_ttl?,
+        username_claim: username_claim?,
+        history: history?,
+        events: events?,
+        prometheus: prometheus?,
+    })
+}
+
+fn prometheus(p: &RawPrometheus, at: &At, ctx: &mut Ctx) -> Option<Prometheus> {
+    let url = req(ctx, &p.url, at, "url");
+    let basic = p.basic.as_ref().map(|b| {
+        let at = at.key("basic");
+        let user = req(ctx, &b.user, &at, "user");
+        let password = secret(ctx, &b.password, &at, "password");
+        Some((user?, password??))
+    });
+    let token = secret(ctx, &p.bearer_token, at, "bearer_token");
+    let headers = secret_map(ctx, &p.headers, &at.key("headers"));
+    let tls = p.tls.clone().unwrap_or_default();
+    let ca = pem(ctx, &tls.ca, &at.key("tls"), "ca", PemKind::Certificates);
+    let extra_labels = map(ctx, &p.extra_labels, at, "extra_labels");
+    let timeout = or(ctx, &p.timeout, at, "timeout", Duration::from_secs(5));
+    // V-131 reports `basic` with `bearer_token`; the result keeps neither then.
+    let auth = match (basic, token?) {
+        (None, None) => PrometheusAuth::None,
+        (Some(b), None) => {
+            let (user, password) = b?;
+            PrometheusAuth::Basic { user, password }
+        }
+        (None, Some(token)) => PrometheusAuth::Bearer { token },
+        (Some(_), Some(_)) => return None,
+    };
+    Some(Prometheus {
+        url: url?.trim().to_owned(),
+        auth,
+        headers: headers?,
+        ca: ca?,
+        extra_labels: extra_labels?,
+        timeout: timeout?,
+    })
 }
 
 fn globals(g: &RawGlobals, ctx: &mut Ctx) -> Option<Globals> {
@@ -319,9 +404,14 @@ fn globals(g: &RawGlobals, ctx: &mut Ctx) -> Option<Globals> {
         "sample_ratio",
         ratio_default,
     );
-    let headers = tracing_headers(ctx, &tracing.headers, &tracing_at.key("headers"));
+    let headers = secret_map(ctx, &tracing.headers, &tracing_at.key("headers"));
     let azure = g.azure.clone().unwrap_or_default();
     let account_name = opt(ctx, &azure.account_name, &at.key("azure"), "account_name");
+    let console = console(
+        &g.console.clone().unwrap_or_default(),
+        &at.key("console"),
+        ctx,
+    );
     Some(Globals {
         cloud: cloud?,
         state: GlobalState {
@@ -342,6 +432,7 @@ fn globals(g: &RawGlobals, ctx: &mut Ctx) -> Option<Globals> {
         azure: Azure {
             account_name: account_name?,
         },
+        console: console?,
     })
 }
 
@@ -388,12 +479,23 @@ fn api(a: &RawApi, at: &At, ctx: &mut Ctx) -> Option<Api> {
         let jwks_url = opt(ctx, &o.jwks_url, &at, "jwks_url");
         let discovery_url = opt(ctx, &o.discovery_url, &at, "discovery_url");
         let roles_claim = or(ctx, &o.roles_claim, &at, "roles_claim", "roles".to_string());
+        let client_id = opt(ctx, &o.client_id, &at, "client_id");
+        let client_secret = secret(ctx, &o.client_secret, &at, "client_secret");
+        let scopes = match &o.scopes {
+            None => Some(vec!["openid".to_string(), "profile".to_string()]),
+            Some(_) => list(ctx, &o.scopes, &at, "scopes"),
+        };
+        let idp_name = opt(ctx, &o.idp_name, &at, "idp_name");
         Some(ApiOauth2 {
             issuer: issuer?,
             audience: audience?,
             jwks_url: jwks_url?,
             discovery_url: discovery_url?,
             roles_claim: roles_claim?,
+            client_id: client_id?,
+            client_secret: client_secret?,
+            scopes: scopes?,
+            idp_name: idp_name?,
         })
     });
     let role_mapping = role_mapping(ctx, &a.role_mapping, &at.key("role_mapping"));

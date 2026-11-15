@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Tables and a table page</title>
+  <style>
+    /*
+     * BRAINSTORM COMPANION FRAME TEMPLATE
+     *
+     * This template provides a consistent frame with:
+     * - OS-aware light/dark theming
+     * - Header branding and connection status
+     * - Scrollable main content area
+     * - CSS helpers for common UI patterns
+     *
+     * Content is injected via placeholder comment in #frame-content.
+     */
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; overflow: hidden; }
+
+    /* ===== THEME VARIABLES ===== */
+    :root {
+      --bg-primary: #f5f5f7;
+      --bg-secondary: #ffffff;
+      --bg-tertiary: #e5e5e7;
+      --border: #d1d1d6;
+      --text-primary: #1d1d1f;
+      --text-secondary: #86868b;
+      --text-tertiary: #aeaeb2;
+      --accent: #0071e3;
+      --accent-hover: #0077ed;
+      --success: #34c759;
+      --warning: #ff9f0a;
+      --error: #ff3b30;
+      --selected-bg: #e8f4fd;
+      --selected-border: #0071e3;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg-primary: #1d1d1f;
+        --bg-secondary: #2d2d2f;
+        --bg-tertiary: #3d3d3f;
+        --border: #424245;
+        --text-primary: #f5f5f7;
+        --text-secondary: #86868b;
+        --text-tertiary: #636366;
+        --accent: #0a84ff;
+        --accent-hover: #409cff;
+        --selected-bg: rgba(10, 132, 255, 0.15);
+        --selected-border: #0a84ff;
+      }
+    }
+
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      display: flex;
+      flex-direction: column;
+      line-height: 1.5;
+    }
+
+    /* ===== FRAME STRUCTURE ===== */
+    .brand { display: flex; align-items: center; min-width: 0; overflow: hidden; color: var(--text-secondary); line-height: 1; }
+    .brand a { color: inherit; text-decoration: none; display: flex; align-items: center; gap: 0.5rem; min-width: 0; max-width: 100%; line-height: 1; }
+    .brand-copy { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 1; transform: translateY(-1px); }
+    .brand-logo { display: block; height: 1em; width: auto; max-width: 180px; flex-shrink: 0; filter: invert(1); }
+    @media (prefers-color-scheme: dark) {
+      .brand-logo { filter: none; }
+    }
+    .status { font-size: 0.7rem; color: var(--status-color, var(--success)); display: flex; align-items: center; gap: 0.4rem; justify-self: end; white-space: nowrap; line-height: 1; }
+    .status::before { content: ''; width: 6px; height: 6px; background: var(--status-color, var(--success)); border-radius: 50%; }
+
+    .main { flex: 1; overflow-y: auto; }
+    #frame-content { padding: 2rem; min-height: 100%; }
+
+    .header {
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border);
+      padding: 0.5rem 1.5rem;
+      flex-shrink: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 1rem;
+      min-height: 42px;
+    }
+    .header .brand { justify-self: start; width: 100%; font-size: 0.75rem; line-height: 1; }
+    .header .status { grid-column: 2; line-height: 1; }
+    .header span {
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+    }
+    .header .selected-text {
+      color: var(--accent);
+      font-weight: 500;
+    }
+
+    /* ===== TYPOGRAPHY ===== */
+    h2 { font-size: 1.5rem; font-weight: 600; margin-bottom: 0.5rem; }
+    h3 { font-size: 1.1rem; font-weight: 600; margin-bottom: 0.25rem; }
+    .subtitle { color: var(--text-secondary); margin-bottom: 1.5rem; }
+    .section { margin-bottom: 2rem; }
+    .label { font-size: 0.7rem; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.5rem; }
+
+    /* ===== OPTIONS (for A/B/C choices) ===== */
+    .options { display: flex; flex-direction: column; gap: 0.75rem; }
+    .option {
+      background: var(--bg-secondary);
+      border: 2px solid var(--border);
+      border-radius: 12px;
+      padding: 1rem 1.25rem;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      display: flex;
+      align-items: flex-start;
+      gap: 1rem;
+    }
+    .option:hover { border-color: var(--accent); }
+    .option.selected { background: var(--selected-bg); border-color: var(--selected-border); }
+    .option .letter {
+      background: var(--bg-tertiary);
+      color: var(--text-secondary);
+      width: 1.75rem; height: 1.75rem;
+      border-radius: 6px;
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 600; font-size: 0.85rem; flex-shrink: 0;
+    }
+    .option.selected .letter { background: var(--accent); color: white; }
+    .option .content { flex: 1; }
+    .option .content h3 { font-size: 0.95rem; margin-bottom: 0.15rem; }
+    .option .content p { color: var(--text-secondary); font-size: 0.85rem; margin: 0; }
+
+    /* ===== CARDS (for showing designs/mockups) ===== */
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; }
+    .card {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .card:hover { border-color: var(--accent); transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+    .card.selected { border-color: var(--selected-border); border-width: 2px; }
+    .card-image { background: var(--bg-tertiary); aspect-ratio: 16/10; display: flex; align-items: center; justify-content: center; }
+    .card-body { padding: 1rem; }
+    .card-body h3 { margin-bottom: 0.25rem; }
+    .card-body p { color: var(--text-secondary); font-size: 0.85rem; }
+
+    /* ===== MOCKUP CONTAINER ===== */
+    .mockup {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+      margin-bottom: 1.5rem;
+    }
+    .mockup-header {
+      background: var(--bg-tertiary);
+      padding: 0.5rem 1rem;
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+      border-bottom: 1px solid var(--border);
+    }
+    .mockup-body { padding: 1.5rem; }
+
+    /* ===== SPLIT VIEW (side-by-side comparison) ===== */
+    .split { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+    @media (max-width: 700px) { .split { grid-template-columns: 1fr; } }
+
+    /* ===== PROS/CONS ===== */
+    .pros-cons { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin: 1rem 0; }
+    .pros, .cons { background: var(--bg-secondary); border-radius: 8px; padding: 1rem; }
+    .pros h4 { color: var(--success); font-size: 0.85rem; margin-bottom: 0.5rem; }
+    .cons h4 { color: var(--error); font-size: 0.85rem; margin-bottom: 0.5rem; }
+    .pros ul, .cons ul { margin-left: 1.25rem; font-size: 0.85rem; color: var(--text-secondary); }
+    .pros li, .cons li { margin-bottom: 0.25rem; }
+
+    /* ===== PLACEHOLDER (for mockup areas) ===== */
+    .placeholder {
+      background: var(--bg-tertiary);
+      border: 2px dashed var(--border);
+      border-radius: 8px;
+      padding: 2rem;
+      text-align: center;
+      color: var(--text-tertiary);
+    }
+
+    /* ===== INLINE MOCKUP ELEMENTS ===== */
+    .mock-nav { background: var(--accent); color: white; padding: 0.75rem 1rem; display: flex; gap: 1.5rem; font-size: 0.9rem; }
+    .mock-sidebar { background: var(--bg-tertiary); padding: 1rem; min-width: 180px; }
+    .mock-content { padding: 1.5rem; flex: 1; }
+    .mock-button { background: var(--accent); color: white; border: none; padding: 0.5rem 1rem; border-radius: 6px; font-size: 0.85rem; }
+    .mock-input { background: var(--bg-primary); border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem; width: 100%; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <b>data-avalanche console · approved mockup</b> <span style="margin-left:auto;opacity:.7">Tables and a table page · 1.1.0 · approved 2026-11-14</span>
+  </div>
+
+  <div class="main">
+    <div id="frame-content">
+      <style>
+  .da{font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--text-primary)}
+  .da .bar{display:flex;align-items:center;gap:18px;padding:10px 14px;background:var(--bg-tertiary);border-radius:8px 8px 0 0}
+  .da .bar b{font-size:14px}.da .bar .nav span{margin-right:14px;color:var(--text-secondary)}.da .bar .nav .on{color:var(--text-primary);font-weight:600;border-bottom:2px solid var(--accent);padding-bottom:2px}
+  .da .bar .who{margin-left:auto;color:var(--text-secondary)}
+  .da .pane{padding:14px;background:var(--bg-secondary);border:1px solid var(--border);border-top:0;border-radius:0 0 8px 8px}
+  .da h4{margin:16px 0 6px;font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--text-secondary);font-weight:600}
+  .da .lnk{color:var(--accent)}.da .muted{color:var(--text-secondary)}
+  .da table{width:100%;border-collapse:collapse}.da td,.da th{padding:6px 7px;border-top:1px solid var(--border);text-align:left;font-size:12.5px;vertical-align:middle;white-space:nowrap}
+  .da th{font-weight:500;color:var(--text-secondary);border-top:0;font-size:11px;text-transform:uppercase}
+  .da .chip{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;font-weight:600}
+  .da .c-ok{background:rgba(52,199,89,.18);color:#1f8f3a}.da .c-warn{background:rgba(255,149,0,.18);color:#a85f00}.da .c-bad{background:rgba(255,59,48,.16);color:#d0302a}.da .c-neu{background:var(--bg-tertiary);color:var(--text-secondary)}
+  .da .filters{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+  .da .f{border:1px solid var(--border);border-radius:14px;padding:2px 10px;font-size:12px;background:var(--bg-primary)}.da .f.on{border-color:var(--accent);background:rgba(10,132,255,.10)}
+  .da .search{border:1px solid var(--border);border-radius:6px;padding:3px 8px;font-size:12px;color:var(--text-tertiary);background:var(--bg-primary);width:170px}
+  .da .spark{width:70px;height:16px;vertical-align:middle;margin-right:4px}
+  .da .cost{display:inline-block;height:7px;border-radius:2px;vertical-align:middle;margin-right:5px}
+  .da .btns{display:flex;gap:6px}.da .btn{border:1px solid var(--border);border-radius:6px;padding:4px 10px;font-size:12px;background:var(--bg-secondary)}.da .btn.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+  .da .halt{border:1px solid rgba(255,59,48,.5);background:rgba(255,59,48,.05);border-radius:8px;padding:10px 12px;margin-top:12px}
+  .da .two{display:grid;grid-template-columns:1.5fr 1fr;gap:18px}
+  .da .mini{border:1px solid var(--border);border-radius:6px;padding:6px 8px;background:var(--bg-primary)}.da .mini .h{font-size:11.5px;color:var(--text-secondary)}
+  .da .ev{font-size:12px}.da .ev div{padding:4px 0;border-top:1px solid var(--border)}.da .ev div:first-child{border-top:0}.da .ev .t{color:var(--text-secondary);display:inline-block;width:44px}
+  .da code{font-size:12px}
+  .da .schema td{font-size:12px;padding:4px 7px}
+</style>
+
+<h2>Tables, and a table's page</h2>
+<p class="subtitle">Clicking a row anywhere opens the object's own page (a real link: ⌘-click opens a tab; Back keeps the filters). Here: every table across pipelines, and one halted table. What's wrong or missing?</p>
+
+<div class="mockup"><div class="mockup-header">/ui/tables</div><div class="mockup-body da">
+  <div class="bar"><b>data-avalanche</b><div class="nav"><span>Overview</span><span>Cluster</span><span>Pipelines</span><span class="on">Tables</span><span>Snapshots</span><span>Events</span><span>Config</span></div><div class="who">gen 42 · Oleksii · <b>operator</b></div></div>
+  <div class="pane">
+    <div class="filters">
+      <span class="f on">All 212</span><span class="f">Halted 1</span><span class="f">Stale 2</span><span class="f">Schema changed today 3</span><span class="f">Costly MERGE 4</span><span class="f">Snapshotting 2</span>
+      <span class="muted" style="margin-left:6px">Pipeline</span><span class="f">any ▾</span>
+      <span class="search" style="margin-left:auto">schema.table or Delta path…</span>
+    </div>
+    <table>
+      <tr><th>Table</th><th>Pipeline</th><th>State</th><th>Fresh as of</th><th>Changes/min, 6 h</th><th>Delta version</th><th>Files rewritten / MERGE</th><th>Schema</th></tr>
+      <tr><td><span class="lnk"><b>public.refunds</b></span></td><td><span class="lnk">orders-pg</span></td><td><span class="chip c-bad">halted</span> <span class="muted" style="font-size:11.5px">UNSAFE_DDL</span></td><td style="color:#d0302a">13:41 · 26 min behind</td><td><svg class="spark" viewBox="0 0 70 16"><polyline fill="none" stroke="var(--text-tertiary)" stroke-width="1.4" points="0,9 20,8 40,9 52,8 52,15 70,15"/></svg>—</td><td>2 210</td><td>—</td><td style="color:#d0302a">int → text refused</td></tr>
+      <tr><td><span class="lnk"><b>crm.contacts</b></span></td><td><span class="lnk">crm-pg</span></td><td><span class="chip c-warn">stale</span></td><td style="color:#a85f00">94 s ago</td><td><svg class="spark" viewBox="0 0 70 16"><polyline fill="none" stroke="var(--accent)" stroke-width="1.4" points="0,10 20,9 40,8 60,6 70,5"/></svg>1 120</td><td>9 812</td><td><span class="cost" style="width:40px;background:#ff9500"></span>310 <span class="muted">of 340</span></td><td class="muted">unchanged</td></tr>
+      <tr><td><span class="lnk"><b>public.order_items</b></span></td><td><span class="lnk">orders-pg</span></td><td><span class="chip c-ok">running</span></td><td>8 s ago</td><td><svg class="spark" viewBox="0 0 70 16"><polyline fill="none" stroke="var(--accent)" stroke-width="1.4" points="0,8 20,7 40,8 60,6 70,7"/></svg>5 210</td><td>18 040</td><td><span class="cost" style="width:6px;background:var(--accent)"></span>14 <span class="muted">of 1 900</span></td><td class="muted">unchanged</td></tr>
+      <tr><td><span class="lnk"><b>public.orders</b></span></td><td><span class="lnk">orders-pg</span></td><td><span class="chip c-ok">running</span></td><td>8 s ago</td><td><svg class="spark" viewBox="0 0 70 16"><polyline fill="none" stroke="var(--accent)" stroke-width="1.4" points="0,9 20,8 40,9 60,8 70,8"/></svg>1 840</td><td>18 044</td><td><span class="cost" style="width:4px;background:var(--accent)"></span>6 <span class="muted">of 820</span></td><td>+1 column today</td></tr>
+      <tr><td><span class="lnk"><b>ledger.entries</b></span></td><td><span class="lnk">ledger-my</span></td><td><span class="chip c-neu">snapshot 41%</span></td><td>4 s ago</td><td><svg class="spark" viewBox="0 0 70 16"><polyline fill="none" stroke="var(--accent)" stroke-width="1.4" points="0,10 20,9 40,9 60,8 70,8"/></svg>860</td><td>412</td><td><span class="cost" style="width:10px;background:var(--accent)"></span>22 <span class="muted">of 600</span></td><td class="muted">unchanged</td></tr>
+      <tr><td colspan="8" class="muted">… 207 more</td></tr>
+    </table>
+    <div class="muted" style="font-size:11.5px;margin-top:6px">"Fresh as of" = the source time of the newest change committed to the Delta table: what a lake reader sees. Stale = older than its pipeline's lag target while the source is changing it. "Costly MERGE" = a MERGE rewriting most of the table's files (random-key churn), the cost driver on the bill.</div>
+  </div>
+</div></div>
+
+<div class="mockup" style="margin-top:22px"><div class="mockup-header">/ui/tables/orders-pg/public.refunds</div><div class="mockup-body da">
+  <div class="bar"><b>data-avalanche</b><div class="nav"><span>Overview</span><span>Cluster</span><span>Pipelines</span><span class="on">Tables</span><span>Snapshots</span><span>Events</span><span>Config</span></div><div class="who">gen 42 · Oleksii · <b>operator</b></div></div>
+  <div class="pane">
+    <div style="display:flex;align-items:flex-start;gap:12px">
+      <div style="flex:1"><div style="font-size:18px;font-weight:600">public.refunds <span class="chip c-bad" style="vertical-align:middle">halted</span></div>
+        <div class="muted">in <span class="lnk">orders-pg</span> (on <span class="lnk">node-b</span>) · Delta <code>s3://lake/orders/public/refunds</code> · version 2 210 · 1.9 M rows · 412 files, 3.1 GiB · key <code>id</code></div></div>
+      <div class="btns"><span class="btn primary">Copy again…</span></div>
+    </div>
+
+    <div class="halt">
+      <div><b style="color:#d0302a">Halted at 13:41 · UNSAFE_DDL</b> <span class="muted">· 26 min · survives restarts and failovers</span></div>
+      <div style="margin-top:4px"><code>ALTER TABLE public.refunds ALTER COLUMN amount TYPE text</code> — a type change the Delta table can't follow (int → text).</div>
+      <div style="margin-top:6px"><b>To fix:</b> decide whether the Delta table can keep its history; if not, drop or move it. Then <b>Copy again</b>: the job clears the halt, takes the new schema from the source and copies the table. <span class="lnk">Runbook: a halted table →</span></div>
+      <div class="muted" style="margin-top:4px;font-size:12px">Changes to this table since 13:41 are dropped, not queued: the copy is what brings it back. Rows deleted at the source meanwhile stay in Delta unless the copy truncates first.</div>
+    </div>
+
+    <div class="two">
+      <div>
+        <h4>This table, 24 h</h4>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">
+          <div class="mini"><div class="h">Changes/min</div><svg viewBox="0 0 100 34" style="width:100%;height:34px"><polyline fill="none" stroke="var(--accent)" stroke-width="1.4" vector-effect="non-scaling-stroke" points="0,20 20,18 40,22 60,19 75,20 75,32 100,32"/></svg><div class="h">0 since 13:41</div></div>
+          <div class="mini"><div class="h">Files rewritten / MERGE</div><svg viewBox="0 0 100 34" style="width:100%;height:34px"><polyline fill="none" stroke="var(--accent)" stroke-width="1.4" vector-effect="non-scaling-stroke" points="0,28 20,27 40,28 60,27 75,28"/></svg><div class="h">~3 of 412 before the halt</div></div>
+          <div class="mini"><div class="h">Commit duration</div><svg viewBox="0 0 100 34" style="width:100%;height:34px"><polyline fill="none" stroke="var(--accent)" stroke-width="1.4" vector-effect="non-scaling-stroke" points="0,26 20,25 40,27 60,24 75,25"/></svg><div class="h">p99 1.2 s</div></div>
+        </div>
+
+        <h4>Schema · source vs Delta</h4>
+        <table class="schema"><tr><th>Column</th><th>Source</th><th>Delta</th><th></th></tr>
+          <tr><td><b>id</b> 🔑</td><td>bigint</td><td>long</td><td></td></tr>
+          <tr><td>order_id</td><td>bigint</td><td>long</td><td></td></tr>
+          <tr style="background:rgba(255,59,48,.06)"><td>amount</td><td><b>text</b> <span class="muted">was integer</span></td><td>integer</td><td style="color:#d0302a">refused 13:41</td></tr>
+          <tr><td>reason</td><td>varchar(200)</td><td>string</td><td class="muted">added 2026-10-02</td></tr>
+          <tr><td class="muted">legacy_flag</td><td class="muted">—</td><td class="muted">boolean</td><td class="muted">soft-dropped 2026-09-30</td></tr>
+          <tr><td class="muted">_op, _ts, _lsn, _seq</td><td class="muted">—</td><td class="muted">metadata</td><td></td></tr>
+        </table>
+      </div>
+      <div>
+        <h4>History of this table</h4>
+        <div class="ev">
+          <div><span class="t">13:41</span>halted: UNSAFE_DDL, amount int → text</div>
+          <div><span class="t">10-02</span>column <code>reason</code> added (applied)</div>
+          <div><span class="t">09-30</span>column <code>legacy_flag</code> soft-dropped</div>
+          <div><span class="t">09-28</span>copied by snapshot #52, started by <b>Oleksii</b> · 1.7 M rows · 6 min</div>
+        </div>
+        <h4>Snapshot jobs that touched it</h4>
+        <div class="ev"><div><span class="lnk">#52</span> ✓ 2026-09-28 · 1.7 M rows</div><div><span class="lnk">#14</span> ✓ 2026-09-12 · first copy</div></div>
+      </div>
+    </div>
+  </div>
+</div></div>
+
+    </div>
+  </div>
+
+</body>
+</html>

@@ -11,14 +11,14 @@ use data_avalanche_api::{Api, Auth, Control, Node, RateLimit, ServeError, Stop, 
 use data_avalanche_cluster::{
     ClusterReconciler, ConfigCoordinator, ControllerDeps, ControllerSettings, CoordinatorDeps,
     DocsFn, Gossip, GossipKey, GossipSettings, LeaseTiming, NodeIdentity, NodeMeta, Phase,
-    ReconcilerSettings, Seeds, Udp, advertise, discover, interfaces, join as join_gossip, leave,
-    node_identity, removed_pipelines,
+    ReconcilerSettings, Recorder, Seeds, Udp, advertise, discover, expire_events, interfaces,
+    join as join_gossip, leave, node_identity, record_members, removed_pipelines,
 };
 use data_avalanche_config::{
     Diagnostic, FingerprintKey, ProcessEnv, Report, ResolvedConfig, Severity, load_str,
 };
 use data_avalanche_pipeline::{Backoff, Tuning};
-use data_avalanche_state::{ConfigGenerations, Leases, Removals};
+use data_avalanche_state::{ConfigGenerations, Events, Leases, Removals};
 use data_avalanche_telemetry::Metrics;
 use thiserror::Error;
 use tokio::sync::{Semaphore, oneshot, watch};
@@ -88,6 +88,9 @@ pub(crate) fn leave_within(config: &ResolvedConfig) -> Duration {
     c.drain_timeout.saturating_mul(rounds) + 2 * c.lease_renewal_interval
 }
 
+/// How long a clean stop waits for the events still queued to be written (a crash loses them).
+pub(crate) const EVENTS_FLUSH: Duration = Duration::from_secs(5);
+
 /// Runs every pipeline until SIGTERM, SIGINT or a shutdown through the API. A leave through the
 /// API leaves the cluster first and keeps the process up (D-M9a.8).
 ///
@@ -117,7 +120,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     let ready = Arc::new(AtomicBool::new(false));
     let node = Arc::new(OnceLock::new());
     let api = &first.config.globals.api;
-    let auth = Arc::new(Auth::new(api));
+    let auth = Arc::new(Auth::new(api, &first.config.globals.console.username_claim));
     let bound = bind(&api.address, api.tls.as_ref())
         .await
         .map_err(|e| match e {
@@ -141,7 +144,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     let config = joined.config;
     logger.apply(&config.globals.log);
     logger.trace(&config.globals.tracing);
-    auth.set(&config.globals.api);
+    auth.set(&config.globals.api, &config.globals.console.username_claim);
     tracing::info!(
         node = %holder.node_id,
         incarnation = holder.incarnation,
@@ -149,6 +152,12 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         "joined the cluster"
     );
 
+    // The cluster's events (Admin_Console §6): recorded from here, expired on every node.
+    let events = Arc::new(Events::new(joined.globals.clone()));
+    let (recorder, _writer) =
+        Recorder::start(Arc::clone(&events), &holder.node_id, metrics.clone());
+    let (retention, kept) = watch::channel(config.globals.console.events.retention);
+    let _expiry = tokio::spawn(expire_events(Arc::clone(&events), kept));
     let c = &config.globals.cluster;
     let docs = Arc::clone(&buckets);
     let docs: Arc<DocsFn> = Arc::new(move |p| docs.pipeline_docs(p).map_err(|e| e.to_string()));
@@ -166,6 +175,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         factory: Arc::new(Factory::new(&config.globals).map_err(Fatal::Config)?),
         metrics: metrics.clone(),
         settings: settings(&config),
+        recorder: recorder.clone(),
         starts: Arc::new(Semaphore::new(
             usize::try_from(c.max_concurrent_takeovers).unwrap_or(usize::MAX),
         )),
@@ -206,6 +216,8 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     let key = GossipKey::derive(&joined.fingerprint_key);
     let gossip = Gossip::start(me, key, GossipSettings::new(m), Arc::new(udp), inbox);
     tracing::info!(%addr, bound = ?bind, "gossip started");
+    // Joins, suspicions and departures, each recorded by one node (Admin_Console §6).
+    let _membership = tokio::spawn(record_members(recorder.clone(), gossip.members()));
     let seeds = Seeds::new(c);
     let seeded = !seeds.is_empty();
     let discovery = discover(seeds, own, gossip.announcer(), gossip.members());
@@ -235,8 +247,10 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
             globals: Arc::new(move |g| {
                 log.apply(&g.log);
                 log.trace(&g.tracing);
-                reloaded_auth.set(&g.api);
+                reloaded_auth.set(&g.api, &g.console.username_claim);
+                retention.send_replace(g.console.events.retention);
             }),
+            recorder: recorder.clone(),
         },
         gossip.members(),
         c.lease_renewal_interval,
@@ -250,6 +264,9 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         leases: deps.leases.clone(),
         control,
         validates: Arc::new(RateLimit::validate()),
+        recorder: recorder.clone(),
+        denials: Arc::new(RateLimit::denials()),
+        events: Arc::clone(&events),
     });
     ready.store(true, Ordering::SeqCst);
     let mut cluster = Some((gossip, reconciler, discovery));
@@ -279,6 +296,12 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     tracing::info!("shutting down");
     let _ = stop_http.send(());
     let _ = server.await;
+    // The leave's last events (each lease released) are still queued: written, within a bound.
+    if !recorder.flush(EVENTS_FLUSH).await {
+        tracing::warn!(
+            "the events still queued weren't written within {EVENTS_FLUSH:?}: the timeline misses them"
+        );
+    }
     tracing::info!("stopped");
     logger.finish().await;
     Ok(())

@@ -371,3 +371,21 @@ fn the_node_reports_its_config_generation() {
         "{text}"
     );
 }
+
+/// M13a: the event recorder's two node counters, without labels.
+#[test]
+fn the_event_counters_count() {
+    let m = Metrics::new();
+    m.event_written();
+    m.event_written();
+    m.event_dropped();
+    let text = m.encode();
+    assert_eq!(
+        samples(&text, "data_avalanche_events_written_total"),
+        ["data_avalanche_events_written_total 2"]
+    );
+    assert_eq!(
+        samples(&text, "data_avalanche_events_dropped_total"),
+        ["data_avalanche_events_dropped_total 1"]
+    );
+}

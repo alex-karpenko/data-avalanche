@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Pipeline page</title>
+  <style>
+    /*
+     * BRAINSTORM COMPANION FRAME TEMPLATE
+     *
+     * This template provides a consistent frame with:
+     * - OS-aware light/dark theming
+     * - Header branding and connection status
+     * - Scrollable main content area
+     * - CSS helpers for common UI patterns
+     *
+     * Content is injected via placeholder comment in #frame-content.
+     */
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; overflow: hidden; }
+
+    /* ===== THEME VARIABLES ===== */
+    :root {
+      --bg-primary: #f5f5f7;
+      --bg-secondary: #ffffff;
+      --bg-tertiary: #e5e5e7;
+      --border: #d1d1d6;
+      --text-primary: #1d1d1f;
+      --text-secondary: #86868b;
+      --text-tertiary: #aeaeb2;
+      --accent: #0071e3;
+      --accent-hover: #0077ed;
+      --success: #34c759;
+      --warning: #ff9f0a;
+      --error: #ff3b30;
+      --selected-bg: #e8f4fd;
+      --selected-border: #0071e3;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg-primary: #1d1d1f;
+        --bg-secondary: #2d2d2f;
+        --bg-tertiary: #3d3d3f;
+        --border: #424245;
+        --text-primary: #f5f5f7;
+        --text-secondary: #86868b;
+        --text-tertiary: #636366;
+        --accent: #0a84ff;
+        --accent-hover: #409cff;
+        --selected-bg: rgba(10, 132, 255, 0.15);
+        --selected-border: #0a84ff;
+      }
+    }
+
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      display: flex;
+      flex-direction: column;
+      line-height: 1.5;
+    }
+
+    /* ===== FRAME STRUCTURE ===== */
+    .brand { display: flex; align-items: center; min-width: 0; overflow: hidden; color: var(--text-secondary); line-height: 1; }
+    .brand a { color: inherit; text-decoration: none; display: flex; align-items: center; gap: 0.5rem; min-width: 0; max-width: 100%; line-height: 1; }
+    .brand-copy { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 1; transform: translateY(-1px); }
+    .brand-logo { display: block; height: 1em; width: auto; max-width: 180px; flex-shrink: 0; filter: invert(1); }
+    @media (prefers-color-scheme: dark) {
+      .brand-logo { filter: none; }
+    }
+    .status { font-size: 0.7rem; color: var(--status-color, var(--success)); display: flex; align-items: center; gap: 0.4rem; justify-self: end; white-space: nowrap; line-height: 1; }
+    .status::before { content: ''; width: 6px; height: 6px; background: var(--status-color, var(--success)); border-radius: 50%; }
+
+    .main { flex: 1; overflow-y: auto; }
+    #frame-content { padding: 2rem; min-height: 100%; }
+
+    .header {
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border);
+      padding: 0.5rem 1.5rem;
+      flex-shrink: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 1rem;
+      min-height: 42px;
+    }
+    .header .brand { justify-self: start; width: 100%; font-size: 0.75rem; line-height: 1; }
+    .header .status { grid-column: 2; line-height: 1; }
+    .header span {
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+    }
+    .header .selected-text {
+      color: var(--accent);
+      font-weight: 500;
+    }
+
+    /* ===== TYPOGRAPHY ===== */
+    h2 { font-size: 1.5rem; font-weight: 600; margin-bottom: 0.5rem; }
+    h3 { font-size: 1.1rem; font-weight: 600; margin-bottom: 0.25rem; }
+    .subtitle { color: var(--text-secondary); margin-bottom: 1.5rem; }
+    .section { margin-bottom: 2rem; }
+    .label { font-size: 0.7rem; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.5rem; }
+
+    /* ===== OPTIONS (for A/B/C choices) ===== */
+    .options { display: flex; flex-direction: column; gap: 0.75rem; }
+    .option {
+      background: var(--bg-secondary);
+      border: 2px solid var(--border);
+      border-radius: 12px;
+      padding: 1rem 1.25rem;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      display: flex;
+      align-items: flex-start;
+      gap: 1rem;
+    }
+    .option:hover { border-color: var(--accent); }
+    .option.selected { background: var(--selected-bg); border-color: var(--selected-border); }
+    .option .letter {
+      background: var(--bg-tertiary);
+      color: var(--text-secondary);
+      width: 1.75rem; height: 1.75rem;
+      border-radius: 6px;
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 600; font-size: 0.85rem; flex-shrink: 0;
+    }
+    .option.selected .letter { background: var(--accent); color: white; }
+    .option .content { flex: 1; }
+    .option .content h3 { font-size: 0.95rem; margin-bottom: 0.15rem; }
+    .option .content p { color: var(--text-secondary); font-size: 0.85rem; margin: 0; }
+
+    /* ===== CARDS (for showing designs/mockups) ===== */
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; }
+    .card {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .card:hover { border-color: var(--accent); transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+    .card.selected { border-color: var(--selected-border); border-width: 2px; }
+    .card-image { background: var(--bg-tertiary); aspect-ratio: 16/10; display: flex; align-items: center; justify-content: center; }
+    .card-body { padding: 1rem; }
+    .card-body h3 { margin-bottom: 0.25rem; }
+    .card-body p { color: var(--text-secondary); font-size: 0.85rem; }
+
+    /* ===== MOCKUP CONTAINER ===== */
+    .mockup {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+      margin-bottom: 1.5rem;
+    }
+    .mockup-header {
+      background: var(--bg-tertiary);
+      padding: 0.5rem 1rem;
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+      border-bottom: 1px solid var(--border);
+    }
+    .mockup-body { padding: 1.5rem; }
+
+    /* ===== SPLIT VIEW (side-by-side comparison) ===== */
+    .split { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+    @media (max-width: 700px) { .split { grid-template-columns: 1fr; } }
+
+    /* ===== PROS/CONS ===== */
+    .pros-cons { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin: 1rem 0; }
+    .pros, .cons { background: var(--bg-secondary); border-radius: 8px; padding: 1rem; }
+    .pros h4 { color: var(--success); font-size: 0.85rem; margin-bottom: 0.5rem; }
+    .cons h4 { color: var(--error); font-size: 0.85rem; margin-bottom: 0.5rem; }
+    .pros ul, .cons ul { margin-left: 1.25rem; font-size: 0.85rem; color: var(--text-secondary); }
+    .pros li, .cons li { margin-bottom: 0.25rem; }
+
+    /* ===== PLACEHOLDER (for mockup areas) ===== */
+    .placeholder {
+      background: var(--bg-tertiary);
+      border: 2px dashed var(--border);
+      border-radius: 8px;
+      padding: 2rem;
+      text-align: center;
+      color: var(--text-tertiary);
+    }
+
+    /* ===== INLINE MOCKUP ELEMENTS ===== */
+    .mock-nav { background: var(--accent); color: white; padding: 0.75rem 1rem; display: flex; gap: 1.5rem; font-size: 0.9rem; }
+    .mock-sidebar { background: var(--bg-tertiary); padding: 1rem; min-width: 180px; }
+    .mock-content { padding: 1.5rem; flex: 1; }
+    .mock-button { background: var(--accent); color: white; border: none; padding: 0.5rem 1rem; border-radius: 6px; font-size: 0.85rem; }
+    .mock-input { background: var(--bg-primary); border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem; width: 100%; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <b>data-avalanche console · approved mockup</b> <span style="margin-left:auto;opacity:.7">Pipeline page · 1.1.0 · approved 2026-11-14</span>
+  </div>
+
+  <div class="main">
+    <div id="frame-content">
+      <style>
+  .da{font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--text-primary)}
+  .da .bar{display:flex;align-items:center;gap:18px;padding:10px 14px;background:var(--bg-tertiary);border-radius:8px 8px 0 0}
+  .da .bar b{font-size:14px}.da .bar .nav span{margin-right:14px;color:var(--text-secondary)}.da .bar .nav .on{color:var(--text-primary);font-weight:600;border-bottom:2px solid var(--accent);padding-bottom:2px}
+  .da .bar .who{margin-left:auto;color:var(--text-secondary)}
+  .da .pane{padding:14px;background:var(--bg-secondary);border:1px solid var(--border);border-top:0;border-radius:0 0 8px 8px;position:relative}
+  .da h4{margin:14px 0 6px;font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--text-secondary);font-weight:600}
+  .da .lnk{color:var(--accent);font-size:12px}
+  .da table{width:100%;border-collapse:collapse}.da td,.da th{padding:6px 8px;border-top:1px solid var(--border);text-align:left;font-size:12.5px}
+  .da th{font-weight:500;color:var(--text-secondary);border-top:0;font-size:11px;text-transform:uppercase}
+  .da .chip{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;font-weight:600}
+  .da .c-run{background:rgba(52,199,89,.18);color:#1f8f3a}.da .c-halt{background:rgba(255,59,48,.16);color:#d0302a}
+  .da .two{display:grid;grid-template-columns:1.6fr 1fr;gap:14px}
+  .da .ev{font-size:12px}.da .ev div{padding:4px 0;border-top:1px solid var(--border)}.da .ev div:first-child{border-top:0}.da .ev .t{color:var(--text-secondary);display:inline-block;width:44px}
+  .da .who-act{font-weight:600}.da .note{color:var(--text-secondary);font-style:italic}
+  .da .btns{display:flex;gap:6px}.da .btn{border:1px solid var(--border);border-radius:6px;padding:4px 10px;font-size:12px;background:var(--bg-secondary)}.da .btn.danger{color:var(--error);border-color:rgba(255,59,48,.5)}.da .btn.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+  .da .meter{height:8px;background:var(--bg-tertiary);border-radius:4px;overflow:hidden}.da .meter i{display:block;height:100%;background:var(--accent)}
+  .da .muted{color:var(--text-secondary)}
+  .da .chart{position:relative;border:1px solid var(--border);border-radius:6px;height:110px}
+  .da .chart svg{position:absolute;inset:0;width:100%;height:100%}
+  .da .mark{position:absolute;bottom:0;top:0;border-left:1px dotted var(--text-tertiary)}
+  .da .legend{display:flex;gap:16px;font-size:12px;color:var(--text-secondary);margin-top:4px}
+  .da .dlg{border:1px solid var(--border);border-radius:10px;padding:14px;background:var(--bg-secondary);box-shadow:0 8px 28px rgba(0,0,0,.18);max-width:460px}
+  .da .dlg .title{font-size:15px;font-weight:600;margin-bottom:6px}
+  .da .dlg textarea{width:100%;box-sizing:border-box;border:1px solid var(--border);border-radius:6px;padding:6px 8px;font:inherit;background:var(--bg-primary);color:var(--text-primary);resize:none}
+  .da .impact{background:var(--bg-primary);border-radius:6px;padding:8px 10px;margin:8px 0;font-size:12.5px}
+  .da .chartwrap{display:grid;grid-template-columns:44px 1fr;grid-template-rows:auto 150px 20px}
+  .da .lanes{grid-column:2;position:relative;height:34px}
+  .da .lbl{position:absolute;font-size:11.5px;color:var(--text-secondary);white-space:nowrap;transform:translateX(-50%);padding:0 4px;border-radius:4px;cursor:default}
+  .da .yaxis{grid-row:2;position:relative;font-size:11px;color:var(--text-secondary)}
+  .da .yaxis span{position:absolute;right:6px;transform:translateY(-50%)}
+  .da .plot{grid-row:2;grid-column:2;position:relative;border-left:1px solid var(--border);border-bottom:1px solid var(--border)}
+  .da .grid{position:absolute;left:0;right:0;border-top:1px solid var(--bg-tertiary)}
+  .da .target{position:absolute;left:0;right:0;border-top:1px dashed var(--warning)}
+  .da .target b{position:absolute;right:2px;top:-15px;font-size:11px;font-weight:400;color:#b86e00}
+  .da .plot svg{position:absolute;inset:0;width:100%;height:100%}
+  .da .mark{position:absolute;top:0;bottom:0;border-left:1px dotted var(--text-tertiary);width:9px;margin-left:-4px;cursor:default}
+  .da .mark i{position:absolute;left:4px;top:0;bottom:0;border-left:1px dotted var(--text-tertiary)}
+  .da .mark{border-left:0}
+  .da .xaxis{grid-row:3;grid-column:2;position:relative;font-size:11px;color:var(--text-secondary)}
+  .da .xaxis span{position:absolute;top:3px;transform:translateX(-50%)}
+  .da .hl{background:rgba(10,132,255,.14);color:var(--text-primary)!important}
+  .da .mark.hl{background:none}.da .mark.hl i{border-left:2px solid var(--accent)}
+  .da .cross{position:absolute;top:0;bottom:0;border-left:1px solid var(--text-tertiary);pointer-events:none;display:none}
+  .da .tip{position:absolute;top:6px;font-size:11.5px;background:var(--bg-primary);border:1px solid var(--border);border-radius:5px;padding:2px 6px;pointer-events:none;display:none;white-space:nowrap}
+  .da .ev div{border-radius:4px;cursor:default;padding:4px 6px}
+</style>
+<h2>The pipeline page (accepted), with the v3 chart in place</h2>
+<p class="subtitle">The page you accepted earlier, put together: header and actions, the lag chart v3 (axes, labelled events, hover links to the activity list, crosshair), tables, source, snapshot, activity. Only the header's "away" and "restart pending" flags are new, from the pages since. Clicking a table row opens its table page; the restart dialog is the accepted one below.</p>
+
+<div class="mockup"><div class="mockup-header">orders-pg</div><div class="mockup-body da">
+  <div class="bar"><b>data-avalanche</b><div class="nav"><span>Overview</span><span>Cluster</span><span class="on">Pipelines</span><span>Tables</span><span>Snapshots</span><span>Events</span><span>Config</span></div><div class="who">Oleksii · <b>operator</b></div></div>
+  <div class="pane">
+    <div style="display:flex;align-items:flex-start;gap:12px">
+      <div style="flex:1"><div style="font-size:18px;font-weight:600">orders-pg <span class="chip c-halt" style="vertical-align:middle">1 table halted</span></div>
+        <div class="muted">PostgreSQL <code>orders@pg-prod-replica</code> → Delta <code>s3://lake/orders/</code> · on <span class="lnk">node-b</span> <span style="font-size:11px;color:#a85f00">away from owner node-a</span> · lease epoch 7, renews in 8 s · <span style="font-size:11px;color:#a85f00">restart pending: sink.prefix</span></div></div>
+      <div class="btns"><span class="btn">Flush</span><span class="btn">Pause</span><span class="btn primary">Restart</span><span class="btn">Snapshot…</span><span class="btn danger">Stop</span></div>
+    </div>
+
+    <div class="two" style="margin-top:12px">
+      <div>
+        <h4>Lag, last 6 hours</h4>
+<div class="chartwrap">
+      <div></div>
+      <div class="lanes">
+        <span class="lbl" data-ev="e1" style="left:8.33%;top:17px">restarted</span>
+        <span class="lbl" data-ev="e2" style="left:69.4%;top:17px">snapshot #121</span>
+        <span class="lbl" data-ev="e3" style="left:78.1%;top:0">refunds halted</span>
+        <span class="lbl" data-ev="e4" style="left:84.2%;top:17px">failover</span>
+      </div>
+      <div class="yaxis"><span style="top:0">120 s</span><span style="top:25%">90 s</span><span style="top:50%">60 s</span><span style="top:75%">30 s</span><span style="top:100%">0</span></div>
+      <div class="plot" id="plot">
+        <div class="grid" style="top:25%"></div><div class="grid" style="top:75%"></div>
+        <div class="target" style="top:50%"><b>target 60 s</b></div>
+        <svg viewBox="0 0 600 100" preserveAspectRatio="none">
+          <polyline fill="none" stroke="var(--accent)" stroke-width="2" vector-effect="non-scaling-stroke"
+            points="0,83 20,84 40,83 50,62 60,80 100,83 150,85 200,82 250,84 300,83 350,85 400,84 417,79 430,75 450,77 469,79 480,72 493,23 500,30 510,55 520,76 560,83 600,82"/>
+        </svg>
+        <div class="mark" data-ev="e1" style="left:8.33%"><i></i></div>
+        <div class="mark" data-ev="e2" style="left:69.4%"><i></i></div>
+        <div class="mark" data-ev="e3" style="left:78.1%"><i></i></div>
+        <div class="mark" data-ev="e4" style="left:82.2%"><i></i></div>
+        <div class="cross" id="cross"></div><div class="tip" id="tip"></div>
+      </div>
+      <div class="xaxis"><span style="left:0">09:00</span><span style="left:16.67%">10:00</span><span style="left:33.33%">11:00</span><span style="left:50%">12:00</span><span style="left:66.67%">13:00</span><span style="left:83.33%">14:00</span><span style="left:100%">now</span></div>
+    </div>
+
+        <h4>Tables · 14</h4>
+        <table><tr><th>Table</th><th>State</th><th>Changes/min</th><th>Last commit</th><th>Delta v</th><th>Files / MERGE</th><th>Schema</th></tr>
+          <tr><td><b>public.refunds</b></td><td><span class="chip c-halt">halted</span></td><td>—</td><td>13:41</td><td>2 210</td><td>—</td><td style="color:var(--error)">int → text refused</td></tr>
+          <tr><td>public.orders</td><td><span class="chip c-run">running</span></td><td>1 840</td><td>8 s ago</td><td>18 044</td><td>6</td><td>+1 column today</td></tr>
+          <tr><td>public.order_items</td><td><span class="chip c-run">running</span></td><td>5 210</td><td>8 s ago</td><td>18 040</td><td>14</td><td class="muted">unchanged</td></tr>
+          <tr><td class="muted" colspan="7">… 11 more</td></tr>
+        </table>
+      </div>
+      <div>
+        <h4>Source</h4>
+        <table><tr><td>Slot</td><td><code>da_orders</code> <span class="chip c-run">active</span></td></tr>
+          <tr><td>WAL held</td><td>210 MB <div class="meter" style="margin-top:3px"><i style="width:7%"></i></div><span class="muted" style="font-size:11px">of max_slot_wal_keep_size 3 GB</span></td></tr>
+          <tr><td>Confirmed LSN</td><td><code>3/A41C2B10</code></td></tr><tr><td>Publication</td><td><code>da_orders</code> · 14 tables</td></tr></table>
+        <h4>Snapshot</h4>
+        <div style="border:1px solid var(--border);border-radius:8px;padding:8px">
+          <div><b>#121</b> public.order_items · started by <span class="who-act">Oleksii</span> 13:10</div>
+          <div class="note" style="font-size:12px">"backfill after the 12:40 outage"</div>
+          <div class="meter" style="margin:6px 0"><i style="width:62%"></i></div>
+          <div class="muted" style="font-size:12px">62% · 2.6 M of ~4.2 M rows · ETA 7 min · 41 k rows/s</div>
+          <div style="font-size:12px;margin-top:6px">Earlier: #112 ✓ 2 days ago · #104 ✕ cancelled by <span class="who-act">ci-bot</span> <span class="lnk">all →</span></div>
+        </div>
+        <h4>Activity on this pipeline</h4>
+        <div class="ev">
+      <div data-ev="e4"><span class="t">13:55</span>failover: node-a → node-b · 41 s</div>
+      <div data-ev="e3"><span class="t">13:41</span>public.refunds halted: int → text refused</div>
+      <div data-ev="e2"><span class="t">13:10</span>snapshot #121 started by <span class="who-act">Oleksii</span> <span class="note">"backfill after the 12:40 outage"</span></div>
+      <div data-ev="e1"><span class="t">09:30</span>restarted by <span class="who-act">Oleksii</span> <span class="note">"apply sink.prefix"</span></div>
+    </div>
+      </div>
+    </div>
+  </div></div></div>
+
+<div class="mockup" style="margin-top:22px"><div class="mockup-header">Clicking Restart: what it does, and a note</div><div class="mockup-body da" style="padding:18px">
+  <div class="dlg">
+    <div class="title">Restart orders-pg?</div>
+    <div class="impact">
+      The pipeline stops on <b>node-b</b>, flushes what it has buffered, and starts again from its committed position. Nothing is lost or replayed twice.<br>
+      <span class="muted">Applies the waiting restart-only change: <code>sink.prefix</code>. Lag rises for about 30 s.</span>
+    </div>
+    <div class="muted" style="font-size:12px;margin-bottom:4px">Note (optional, kept with the event)</div>
+    <textarea rows="2">apply sink.prefix</textarea>
+    <div class="muted" style="font-size:11.5px;margin:6px 0 10px">Recorded as: restarted by <b>Oleksii</b> (operator)</div>
+    <div class="btns" style="justify-content:flex-end"><span class="btn">Cancel</span><span class="btn primary">Restart</span></div>
+  </div>
+</div></div>
+
+<script>
+(function(){
+  const root=document;
+  const all=id=>root.querySelectorAll('[data-ev="'+id+'"]');
+  root.querySelectorAll('[data-ev]').forEach(el=>{
+    el.addEventListener('mouseenter',()=>all(el.dataset.ev).forEach(x=>x.classList.add('hl')));
+    el.addEventListener('mouseleave',()=>all(el.dataset.ev).forEach(x=>x.classList.remove('hl')));
+  });
+  const pts=[[0,83],[20,84],[40,83],[50,62],[60,80],[100,83],[150,85],[200,82],[250,84],[300,83],[350,85],[400,84],[417,79],[430,75],[450,77],[469,79],[480,72],[493,23],[500,30],[510,55],[520,76],[560,83],[600,82]];
+  const plot=root.querySelector('#plot'),cross=root.querySelector('#cross'),tip=root.querySelector('#tip');
+  plot.addEventListener('mousemove',e=>{
+    const r=plot.getBoundingClientRect(),f=Math.min(1,Math.max(0,(e.clientX-r.left)/r.width)),x=f*600;
+    let y=pts[pts.length-1][1];
+    for(let i=1;i<pts.length;i++){if(x<=pts[i][0]){const a=pts[i-1],b=pts[i];y=a[1]+(b[1]-a[1])*(x-a[0])/(b[0]-a[0]);break;}}
+    const lag=Math.round((100-y)*1.2),min=Math.round(f*360),hh=9+Math.floor(min/60),mm=min%60;
+    cross.style.display=tip.style.display='block';cross.style.left=(f*100)+'%';
+    tip.textContent=String(hh).padStart(2,'0')+':'+String(mm).padStart(2,'0')+' · lag '+lag+' s';
+    tip.style.left=Math.min(f*100,78)+'%';tip.style.marginLeft='6px';
+  });
+  plot.addEventListener('mouseleave',()=>{cross.style.display=tip.style.display='none';});
+})();
+</script>
+
+    </div>
+  </div>
+
+</body>
+</html>

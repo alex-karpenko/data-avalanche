@@ -17,13 +17,15 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use data_avalanche_cluster::{
     ClusterReconciler, ConfigCoordinator, ControllerDeps, ControllerSettings, CoordinatorDeps,
     Gossip, GossipKey, GossipSettings, LeaseTiming, NodeIdentity, NodeMeta, Parts, Phase,
-    ReconcilerSettings, Udp, WorkerFactory, removed_pipelines,
+    ReconcilerSettings, Recorder, Udp, WorkerFactory, removed_pipelines,
 };
 use data_avalanche_config::{
     ApiAuth, Env, FingerprintKey, HostPort, Jwt, Pipeline, ProcessEnv, ResolvedConfig, load_str,
 };
 use data_avalanche_pipeline::{Backoff, Tuning};
-use data_avalanche_state::{ConfigGenerations, DocStore, Holder, Leases, PipelineDocs, Removals};
+use data_avalanche_state::{
+    ConfigGenerations, DocStore, Events, Holder, Leases, PipelineDocs, Removals,
+};
 use data_avalanche_storage::ObjectStoreVersioned;
 use data_avalanche_telemetry::Metrics;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
@@ -65,9 +67,12 @@ pub(crate) fn config() -> ResolvedConfig {
         .config
 }
 
+/// `globals.console.username_claim`'s default.
+pub(crate) const USERNAME_CLAIM: &str = "preferred_username";
+
 /// `globals.api` of [`CONFIG`]: `auth: none`.
 pub(crate) fn open() -> Arc<Auth> {
-    Arc::new(Auth::new(&config().globals.api))
+    Arc::new(Auth::new(&config().globals.api, USERNAME_CLAIM))
 }
 
 /// The routes' state before the node runs its generation: the `/v1` routes answer 503.
@@ -145,6 +150,8 @@ impl WorkerFactory for NoWorkers {
 /// loopback port, its reloads reaching a reconciler without pipelines.
 pub(crate) struct Lone {
     pub node: Node,
+    /// The node's timeline: what the API recorded.
+    pub events: Arc<Events>,
     /// The leases the node reads: a test takes them as another node would.
     pub leases: Leases,
     /// What the API asked of the node.
@@ -206,6 +213,8 @@ pub(crate) async fn lone_with(file: PathBuf, text: &str, env: Arc<dyn Env + Send
         inbox,
     );
     let metrics = Metrics::new();
+    let events = Arc::new(Events::new(docs.clone()));
+    let (recorder, _) = Recorder::start(Arc::clone(&events), "node-a", metrics.clone());
     let c = &config.globals.cluster;
     let removals = Removals::new(docs.clone());
     let deps = ControllerDeps {
@@ -232,6 +241,7 @@ pub(crate) async fn lone_with(file: PathBuf, text: &str, env: Arc<dyn Env + Send
         },
         starts: Arc::new(Semaphore::new(1)),
         handoffs: Arc::new(Semaphore::new(1)),
+        recorder: recorder.clone(),
     };
     let reconciler =
         ClusterReconciler::start(vec![], &deps, gossip.members(), ReconcilerSettings::new(c));
@@ -250,6 +260,7 @@ pub(crate) async fn lone_with(file: PathBuf, text: &str, env: Arc<dyn Env + Send
             advertiser: gossip.advertiser(),
             metrics,
             globals: Arc::new(|_| {}),
+            recorder: recorder.clone(),
         },
         gossip.members(),
         Duration::from_secs(10),
@@ -269,7 +280,11 @@ pub(crate) async fn lone_with(file: PathBuf, text: &str, env: Arc<dyn Env + Send
             leases: leases.clone(),
             control,
             validates: Arc::new(crate::RateLimit::validate()),
+            recorder,
+            denials: Arc::new(crate::RateLimit::denials()),
+            events: Arc::clone(&events),
         },
+        events,
         leases,
         stops,
         _reconciler: reconciler,

@@ -129,6 +129,26 @@ pub const FIELD_DOCS: &[FieldDoc] = &[
         "The claim, a dotted JSON path, that holds the caller's roles.",
     ),
     f(
+        "globals.api.oauth2.client_id",
+        Required,
+        "The web console's client at the identity provider, for its sign-in (authorization code with PKCE). Token verification doesn't use it. Needed for the console under `oauth2` (V-136).",
+    ),
+    f(
+        "globals.api.oauth2.client_secret",
+        Required,
+        "The console client's secret, only for a client the provider registered as confidential. A secret; needs `client_id` (V-133).",
+    ),
+    f(
+        "globals.api.oauth2.scopes",
+        Note("openid, profile"),
+        "The scopes the console's sign-in asks for. Needs `client_id` (V-133).",
+    ),
+    f(
+        "globals.api.oauth2.idp_name",
+        Note("the issuer's host name"),
+        "The provider's name on the console's sign-in page (`Continue with Company SSO`).",
+    ),
+    f(
         "globals.api.role_mapping.*",
         Note("each role maps to itself"),
         "Maps the local roles `viewer`, `operator` and `admin` to the IdP's role names; a caller gets the highest role any of its roles maps to.",
@@ -292,6 +312,81 @@ pub const FIELD_DOCS: &[FieldDoc] = &[
         "globals.azure.account_name",
         Note("from the credential chain"),
         "The Azure storage account of every container (`cloud: azure`).",
+    ),
+    f(
+        "globals.console.enabled",
+        Value("false"),
+        "Serves the web console under `/ui/` on the API's listener. A reload turns it on or off.",
+    ),
+    f(
+        "globals.console.session_key",
+        Required,
+        "Encrypts and signs the console's session cookie: at least 32 bytes, the same on every node, set through `${ENV}` and never kept in object storage (V-128). Required with the console on under `basic` or `oauth2` (V-135); a change signs everyone out.",
+    ),
+    f(
+        "globals.console.public_url",
+        Required,
+        "The console's address as people reach it (`https://cdc.example.com`), for the OAuth2 redirect. Required with the console on under `oauth2` (V-136).",
+    ),
+    f(
+        "globals.console.session_ttl",
+        Value("8h"),
+        "How long a session lasts without activity, from 5 minutes to 7 days (V-132).",
+    ),
+    f(
+        "globals.console.username_claim",
+        Value("preferred_username"),
+        "The token claim shown and recorded as the person's name (`jwt`, `oauth2`); `sub` when the token lacks it.",
+    ),
+    f(
+        "globals.console.history.retention",
+        Value("24h"),
+        "How long each node keeps the built-in chart history in `globals.state`, from 1 hour to 30 days (V-132). Older ranges come from `prometheus`.",
+    ),
+    f(
+        "globals.console.events.retention",
+        Value("30d"),
+        "How long the cluster's events and audit trail are kept in `globals.state`, from 1 to 400 days (V-132).",
+    ),
+    f(
+        "globals.console.prometheus.url",
+        Required,
+        "Where chart ranges older than the built-in history come from: Prometheus's base URL, http or https (V-130). Absent, the console uses its built-in history only. Required in the block (V-137).",
+    ),
+    f(
+        "globals.console.prometheus.basic.user",
+        Required,
+        "Basic authentication's user; exclusive with `bearer_token` (V-131). Required in `basic` (V-137).",
+    ),
+    f(
+        "globals.console.prometheus.basic.password",
+        Required,
+        "Basic authentication's password, a secret. Required in `basic` (V-137).",
+    ),
+    f(
+        "globals.console.prometheus.bearer_token",
+        Required,
+        "A bearer token, a secret; exclusive with `basic` (V-131).",
+    ),
+    f(
+        "globals.console.prometheus.headers.*",
+        Note("none"),
+        "Headers sent with every query, a map of name to value (a tenant header). The values are secrets (V-126).",
+    ),
+    f(
+        "globals.console.prometheus.tls.ca",
+        Note("the system's roots"),
+        "The CA certificates the Prometheus server's certificate is checked against.",
+    ),
+    f(
+        "globals.console.prometheus.extra_labels.*",
+        Note("none"),
+        "Label matchers added to every query (`cluster: prod-eu`), for labels a collector adds or renames. Prometheus label names, not starting with `__` (V-131).",
+    ),
+    f(
+        "globals.console.prometheus.timeout",
+        Note("5s"),
+        "How long one query may take.",
     ),
     // ---- a pipeline (config §9) ----
     f(

@@ -281,6 +281,95 @@ pub fn cases() -> Vec<Case> {
                 json!({"otlp_endpoint": "https://otel:4318", "headers": {"authorization": "Bearer a\nx-evil: 1"}}),
             )
         }),
+        case("V-126", Error, "a prometheus header with a newline", || {
+            pg_delta().set(
+                "/globals/console/prometheus",
+                json!({"url": "https://prom", "headers": {"x-scope-orgid": "a\nb"}}),
+            )
+        }),
+        case("V-128", Error, "a short session key", || {
+            pg_delta().set("/globals/console/session_key", json!("too-short"))
+        }),
+        case("V-128", Silent, "a 32-byte session key", || {
+            pg_delta().set(
+                "/globals/console/session_key",
+                json!("0123456789abcdef0123456789abcdef"),
+            )
+        }),
+        case("V-129", Error, "a public_url with a query", || {
+            pg_delta().set(
+                "/globals/console/public_url",
+                json!("https://cdc.example.com/?x=1"),
+            )
+        }),
+        case("V-129", Error, "a public_url without a scheme", || {
+            pg_delta().set("/globals/console/public_url", json!("cdc.example.com"))
+        }),
+        case("V-129", Silent, "a public_url under a path", || {
+            pg_delta().set(
+                "/globals/console/public_url",
+                json!("https://example.com/cdc"),
+            )
+        }),
+        case("V-130", Error, "a prometheus url without a scheme", || {
+            pg_delta().set("/globals/console/prometheus", json!({"url": "prom:9090"}))
+        }),
+        case("V-130", Silent, "a prometheus url", || {
+            pg_delta().set(
+                "/globals/console/prometheus",
+                json!({"url": "http://prometheus.observability:9090"}),
+            )
+        }),
+        case("V-137", Error, "a prometheus block without url", || {
+            pg_delta().set("/globals/console/prometheus", json!({"bearer_token": "t"}))
+        }),
+        case("V-137", Error, "basic without a password", || {
+            pg_delta().set(
+                "/globals/console/prometheus",
+                json!({"url": "https://prom", "basic": {"user": "u"}}),
+            )
+        }),
+        case(
+            "V-137",
+            Silent,
+            "a prometheus block with url and basic",
+            || {
+                pg_delta().set(
+                    "/globals/console/prometheus",
+                    json!({"url": "https://prom", "basic": {"user": "u", "password": "p"}}),
+                )
+            },
+        ),
+        case("V-131", Error, "basic and a bearer token", || {
+            pg_delta().set("/globals/console/prometheus", json!({"url": "https://prom", "basic": {"user": "u", "password": "p"}, "bearer_token": "t"}))
+        }),
+        case("V-131", Error, "a reserved label", || {
+            pg_delta().set(
+                "/globals/console/prometheus",
+                json!({"url": "https://prom", "extra_labels": {"__name__": "x"}}),
+            )
+        }),
+        case("V-131", Error, "a label with a dash", || {
+            pg_delta().set(
+                "/globals/console/prometheus",
+                json!({"url": "https://prom", "extra_labels": {"k8s-cluster": "x"}}),
+            )
+        }),
+        case("V-131", Silent, "a bearer token and labels", || {
+            pg_delta().set("/globals/console/prometheus", json!({"url": "https://prom", "bearer_token": "t", "extra_labels": {"cluster": "prod-eu", "_env": "p"}}))
+        }),
+        case("V-132", Error, "a session_ttl of a minute", || {
+            pg_delta().set("/globals/console/session_ttl", json!("1m"))
+        }),
+        case("V-132", Error, "a history kept 31 days", || {
+            pg_delta().set("/globals/console/history", json!({"retention": "31d"}))
+        }),
+        case("V-132", Error, "events kept 12 hours", || {
+            pg_delta().set("/globals/console/events", json!({"retention": "12h"}))
+        }),
+        case("V-132", Silent, "the bounds", || {
+            pg_delta().set("/globals/console", json!({"session_ttl": "7d", "history": {"retention": "1h"}, "events": {"retention": "400d"}}))
+        }),
         case("V-126", Silent, "a bearer header", || {
             pg_delta().set(
                 "/globals/tracing",

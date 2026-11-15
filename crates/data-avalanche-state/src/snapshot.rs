@@ -114,6 +114,9 @@ pub struct SnapshotJobDoc {
     /// only when set: a v0.1.0 reader refuses unknown fields.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncate: bool,
+    /// Why it was asked (Admin_Console §5). Written only when set, as `truncate`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 impl Document for SnapshotJobDoc {
@@ -146,6 +149,7 @@ impl SnapshotJobDoc {
             finished_at: None,
             error: None,
             truncate: false,
+            note: None,
         }
     }
 

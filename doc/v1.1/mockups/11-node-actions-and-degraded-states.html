@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Node actions and degraded states</title>
+  <style>
+    /*
+     * BRAINSTORM COMPANION FRAME TEMPLATE
+     *
+     * This template provides a consistent frame with:
+     * - OS-aware light/dark theming
+     * - Header branding and connection status
+     * - Scrollable main content area
+     * - CSS helpers for common UI patterns
+     *
+     * Content is injected via placeholder comment in #frame-content.
+     */
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; overflow: hidden; }
+
+    /* ===== THEME VARIABLES ===== */
+    :root {
+      --bg-primary: #f5f5f7;
+      --bg-secondary: #ffffff;
+      --bg-tertiary: #e5e5e7;
+      --border: #d1d1d6;
+      --text-primary: #1d1d1f;
+      --text-secondary: #86868b;
+      --text-tertiary: #aeaeb2;
+      --accent: #0071e3;
+      --accent-hover: #0077ed;
+      --success: #34c759;
+      --warning: #ff9f0a;
+      --error: #ff3b30;
+      --selected-bg: #e8f4fd;
+      --selected-border: #0071e3;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg-primary: #1d1d1f;
+        --bg-secondary: #2d2d2f;
+        --bg-tertiary: #3d3d3f;
+        --border: #424245;
+        --text-primary: #f5f5f7;
+        --text-secondary: #86868b;
+        --text-tertiary: #636366;
+        --accent: #0a84ff;
+        --accent-hover: #409cff;
+        --selected-bg: rgba(10, 132, 255, 0.15);
+        --selected-border: #0a84ff;
+      }
+    }
+
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      display: flex;
+      flex-direction: column;
+      line-height: 1.5;
+    }
+
+    /* ===== FRAME STRUCTURE ===== */
+    .brand { display: flex; align-items: center; min-width: 0; overflow: hidden; color: var(--text-secondary); line-height: 1; }
+    .brand a { color: inherit; text-decoration: none; display: flex; align-items: center; gap: 0.5rem; min-width: 0; max-width: 100%; line-height: 1; }
+    .brand-copy { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 1; transform: translateY(-1px); }
+    .brand-logo { display: block; height: 1em; width: auto; max-width: 180px; flex-shrink: 0; filter: invert(1); }
+    @media (prefers-color-scheme: dark) {
+      .brand-logo { filter: none; }
+    }
+    .status { font-size: 0.7rem; color: var(--status-color, var(--success)); display: flex; align-items: center; gap: 0.4rem; justify-self: end; white-space: nowrap; line-height: 1; }
+    .status::before { content: ''; width: 6px; height: 6px; background: var(--status-color, var(--success)); border-radius: 50%; }
+
+    .main { flex: 1; overflow-y: auto; }
+    #frame-content { padding: 2rem; min-height: 100%; }
+
+    .header {
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border);
+      padding: 0.5rem 1.5rem;
+      flex-shrink: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 1rem;
+      min-height: 42px;
+    }
+    .header .brand { justify-self: start; width: 100%; font-size: 0.75rem; line-height: 1; }
+    .header .status { grid-column: 2; line-height: 1; }
+    .header span {
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+    }
+    .header .selected-text {
+      color: var(--accent);
+      font-weight: 500;
+    }
+
+    /* ===== TYPOGRAPHY ===== */
+    h2 { font-size: 1.5rem; font-weight: 600; margin-bottom: 0.5rem; }
+    h3 { font-size: 1.1rem; font-weight: 600; margin-bottom: 0.25rem; }
+    .subtitle { color: var(--text-secondary); margin-bottom: 1.5rem; }
+    .section { margin-bottom: 2rem; }
+    .label { font-size: 0.7rem; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.5rem; }
+
+    /* ===== OPTIONS (for A/B/C choices) ===== */
+    .options { display: flex; flex-direction: column; gap: 0.75rem; }
+    .option {
+      background: var(--bg-secondary);
+      border: 2px solid var(--border);
+      border-radius: 12px;
+      padding: 1rem 1.25rem;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      display: flex;
+      align-items: flex-start;
+      gap: 1rem;
+    }
+    .option:hover { border-color: var(--accent); }
+    .option.selected { background: var(--selected-bg); border-color: var(--selected-border); }
+    .option .letter {
+      background: var(--bg-tertiary);
+      color: var(--text-secondary);
+      width: 1.75rem; height: 1.75rem;
+      border-radius: 6px;
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 600; font-size: 0.85rem; flex-shrink: 0;
+    }
+    .option.selected .letter { background: var(--accent); color: white; }
+    .option .content { flex: 1; }
+    .option .content h3 { font-size: 0.95rem; margin-bottom: 0.15rem; }
+    .option .content p { color: var(--text-secondary); font-size: 0.85rem; margin: 0; }
+
+    /* ===== CARDS (for showing designs/mockups) ===== */
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; }
+    .card {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .card:hover { border-color: var(--accent); transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+    .card.selected { border-color: var(--selected-border); border-width: 2px; }
+    .card-image { background: var(--bg-tertiary); aspect-ratio: 16/10; display: flex; align-items: center; justify-content: center; }
+    .card-body { padding: 1rem; }
+    .card-body h3 { margin-bottom: 0.25rem; }
+    .card-body p { color: var(--text-secondary); font-size: 0.85rem; }
+
+    /* ===== MOCKUP CONTAINER ===== */
+    .mockup {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+      margin-bottom: 1.5rem;
+    }
+    .mockup-header {
+      background: var(--bg-tertiary);
+      padding: 0.5rem 1rem;
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+      border-bottom: 1px solid var(--border);
+    }
+    .mockup-body { padding: 1.5rem; }
+
+    /* ===== SPLIT VIEW (side-by-side comparison) ===== */
+    .split { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+    @media (max-width: 700px) { .split { grid-template-columns: 1fr; } }
+
+    /* ===== PROS/CONS ===== */
+    .pros-cons { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin: 1rem 0; }
+    .pros, .cons { background: var(--bg-secondary); border-radius: 8px; padding: 1rem; }
+    .pros h4 { color: var(--success); font-size: 0.85rem; margin-bottom: 0.5rem; }
+    .cons h4 { color: var(--error); font-size: 0.85rem; margin-bottom: 0.5rem; }
+    .pros ul, .cons ul { margin-left: 1.25rem; font-size: 0.85rem; color: var(--text-secondary); }
+    .pros li, .cons li { margin-bottom: 0.25rem; }
+
+    /* ===== PLACEHOLDER (for mockup areas) ===== */
+    .placeholder {
+      background: var(--bg-tertiary);
+      border: 2px dashed var(--border);
+      border-radius: 8px;
+      padding: 2rem;
+      text-align: center;
+      color: var(--text-tertiary);
+    }
+
+    /* ===== INLINE MOCKUP ELEMENTS ===== */
+    .mock-nav { background: var(--accent); color: white; padding: 0.75rem 1rem; display: flex; gap: 1.5rem; font-size: 0.9rem; }
+    .mock-sidebar { background: var(--bg-tertiary); padding: 1rem; min-width: 180px; }
+    .mock-content { padding: 1.5rem; flex: 1; }
+    .mock-button { background: var(--accent); color: white; border: none; padding: 0.5rem 1rem; border-radius: 6px; font-size: 0.85rem; }
+    .mock-input { background: var(--bg-primary); border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem; width: 100%; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <b>data-avalanche console · approved mockup</b> <span style="margin-left:auto;opacity:.7">Node actions and degraded states · 1.1.0 · approved 2026-11-14</span>
+  </div>
+
+  <div class="main">
+    <div id="frame-content">
+      <style>
+  .da{font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--text-primary)}
+  .da .muted{color:var(--text-secondary)}.da .lnk{color:var(--accent)}
+  .da .grid2{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  .da h5{margin:0 0 6px;font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--text-secondary);font-weight:600}
+  .da .dlg{border:1px solid var(--border);border-radius:10px;padding:14px;background:var(--bg-secondary);box-shadow:0 8px 28px rgba(0,0,0,.18)}
+  .da .dlg .title{font-size:15px;font-weight:600;margin-bottom:6px}
+  .da .impact{background:var(--bg-primary);border-radius:6px;padding:8px 10px;margin:8px 0;font-size:12.5px}
+  .da .box{border:1px solid var(--border);border-radius:6px;padding:5px 8px;color:var(--text-tertiary);font-size:12.5px;background:var(--bg-primary)}
+  .da .btn{border:1px solid var(--border);border-radius:6px;padding:4px 10px;font-size:12px;background:var(--bg-secondary)}.da .btn.primary{background:var(--accent);color:#fff;border-color:var(--accent)}.da .btn.danger{background:#ff3b30;color:#fff;border-color:#ff3b30}.da .btn.off{opacity:.45}
+  .da .warnline{color:#a85f00}
+  .da table{width:100%;border-collapse:collapse}.da td{padding:4px 6px;border-top:1px solid var(--border);font-size:12px}
+  .da .bar{display:flex;align-items:center;gap:14px;padding:8px 12px;background:var(--bg-tertiary);border-radius:8px;font-size:12.5px}
+  .da .live{display:inline-flex;align-items:center;gap:5px;font-size:12px}.da .live i{width:8px;height:8px;border-radius:50%;display:inline-block}
+  .da .panel{border:1px solid var(--border);border-radius:8px;padding:8px 10px;background:var(--bg-secondary);position:relative}
+  .da .panel .age{position:absolute;right:8px;top:6px;font-size:11px;color:var(--text-secondary)}
+  .da .stale{border-color:rgba(255,149,0,.7);background:repeating-linear-gradient(135deg,transparent 0 8px,rgba(255,149,0,.05) 8px 16px)}
+  .da .stale .age{color:#a85f00;font-weight:600}
+  .da .chip{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;font-weight:600}
+  .da .c-ok{background:rgba(52,199,89,.18);color:#1f8f3a}.da .c-unk{background:var(--bg-tertiary);color:var(--text-secondary);border:1px dashed var(--text-tertiary)}
+  .da .who-act{font-weight:600}
+</style>
+
+<h2>Node actions, and the console when things go wrong</h2>
+<p class="subtitle">The two admin dialogs on a node's page, and how the console shows stale data, an unreachable node, a lost connection and a failing Prometheus — never old numbers as current. What's wrong or missing?</p>
+
+<div class="mockup"><div class="mockup-header">Node actions (admin)</div><div class="mockup-body da" style="padding:18px">
+<div class="grid2">
+  <div class="dlg">
+    <div class="title">node-b leaves the cluster?</div>
+    <div class="impact">
+      node-b hands its 6 pipelines to the others, one at a time, and leaves the ring. The process keeps running, out of the cluster, until it is stopped or restarted.
+      <table style="margin-top:6px">
+        <tr><td>orders-pg</td><td>→ node-a</td></tr><tr><td>payments-pg, ledger-my</td><td>→ node-c</td></tr><tr><td>… 3 more</td><td class="muted">spread by the ring</td></tr>
+      </table>
+      <div class="warnline" style="margin-top:6px">ledger-my's running snapshot 7c3a9d5e goes on from its last chunk on node-c. Each hand-off pauses its pipeline for ~10–40 s; lag rises meanwhile.</div>
+      <div class="muted" style="margin-top:4px">Ends when every hand-off is done, or after drain_timeout per round (60 s). Progress shows on the node's page and in Events.</div>
+    </div>
+    <div class="muted" style="font-size:12px;margin-bottom:3px">Note (optional)</div>
+    <div class="box">node pool upgrade</div>
+    <div class="muted" style="font-size:11.5px;margin:6px 0 10px">Recorded as: node-b left the cluster, asked by <b>Oleksii</b> (admin)</div>
+    <div style="display:flex;gap:6px;justify-content:flex-end"><span class="btn">Cancel</span><span class="btn primary">Leave</span></div>
+  </div>
+
+  <div class="dlg">
+    <div class="title">Shut down node-b?</div>
+    <div class="impact">
+      node-b leaves the cluster as on the left (hands off its 6 pipelines), then exits. <b>Kubernetes starts it again</b> as <code>cdc-1</code>; it rejoins and the ring rebalances to it after 15 s of stable membership.
+      <div class="warnline" style="margin-top:6px">With 3 nodes, the other two carry everything until it's back. Without a supervisor, nothing restarts it.</div>
+    </div>
+    <div class="muted" style="font-size:12px;margin-bottom:3px">Type <b>node-b</b> to confirm</div>
+    <div class="box" style="color:var(--text-primary)">node-</div>
+    <div class="muted" style="font-size:12px;margin:8px 0 3px">Note (optional)</div>
+    <div class="box">kernel patch</div>
+    <div class="muted" style="font-size:11.5px;margin:6px 0 10px">Recorded as: node-b shut down by <b>Oleksii</b> (admin)</div>
+    <div style="display:flex;gap:6px;justify-content:flex-end"><span class="btn">Cancel</span><span class="btn danger off">Shut down node-b</span></div>
+  </div>
+</div>
+<div class="muted" style="font-size:12px;margin-top:10px">Sent through whichever node serves the page; the target checks the caller's own credentials. If it's the node serving the page, the page says so and reconnects to another node on its own.</div>
+</div></div>
+
+<div class="mockup" style="margin-top:22px"><div class="mockup-header">When data is late or missing</div><div class="mockup-body da" style="padding:16px">
+<h5>The connection, in the top bar</h5>
+<div class="bar" style="margin-bottom:6px"><b>data-avalanche</b><span class="muted">… sections …</span><span style="margin-left:auto" class="live"><i style="background:#34c759"></i>live</span><span class="muted">· Oleksii · <b>operator</b></span></div>
+<div class="bar" style="margin-bottom:6px"><b>data-avalanche</b><span class="muted">… sections …</span><span style="margin-left:auto" class="live warnline"><i style="background:#ff9500"></i>reconnecting · last update 14 s ago</span><span class="muted">· Oleksii · <b>operator</b></span></div>
+<div class="bar" style="background:rgba(255,59,48,.10)"><b>data-avalanche</b><span style="color:#d0302a">Offline since 14:21:05 — everything below is as of then.</span><span style="margin-left:auto" class="btn">Retry now</span></div>
+<div class="muted" style="font-size:11.5px;margin:4px 0 14px">Reconnects by itself, to any node behind the address. After 10 s without updates every panel turns stale (below); actions are disabled while offline.</div>
+
+<div class="grid2">
+  <div>
+    <h5>A panel whose data stopped updating</h5>
+    <div class="panel stale"><span class="age">as of 14:20:51 · 34 s old</span>
+      <div style="font-weight:600">Lag</div><div style="font-size:22px;font-weight:600;color:var(--text-secondary)">4 s</div><div class="warnline" style="font-size:12px">not current: node-b hasn't answered for 34 s</div></div>
+    <div class="muted" style="font-size:11.5px;margin-top:4px">Every panel carries its age on hover; past its limit it turns hatched and greyed with the reason. A number is never shown without saying it's old.</div>
+
+    <h5 style="margin-top:14px">A node that doesn't answer</h5>
+    <table>
+      <tr><td>payments-pg</td><td><span class="chip c-ok">running</span></td><td>2 s</td><td class="muted">node-a</td></tr>
+      <tr><td>ledger-my</td><td><span class="chip c-unk">unknown</span></td><td class="muted">—</td><td class="warnline">node-b unreachable 40 s · last known: running, 9 s lag</td></tr>
+      <tr><td>orders-pg</td><td><span class="chip c-unk">unknown</span></td><td class="muted">—</td><td class="warnline">node-b unreachable 40 s</td></tr>
+    </table>
+    <div class="muted" style="font-size:11.5px;margin-top:4px">The rest of the page renders; only that node's rows wait, each on its own time limit. The cluster's own view (gossip, leases) says whether node-b is down or only slow to answer.</div>
+  </div>
+  <div>
+    <h5>A chart when Prometheus fails</h5>
+    <div class="panel">
+      <div style="font-size:12px;font-weight:600;margin-bottom:4px">Lag, last 7 days</div>
+      <svg viewBox="0 0 300 90" style="width:100%;height:110px">
+        <rect x="0" y="0" width="255" height="80" fill="rgba(142,142,147,.12)"/>
+        <line x1="0" x2="300" y1="80" y2="80" stroke="var(--border)"/>
+        <text x="127" y="40" text-anchor="middle" font-size="9" fill="var(--text-secondary)">no data: Prometheus unreachable</text>
+        <text x="127" y="52" text-anchor="middle" font-size="9" fill="var(--text-secondary)">built-in history starts here →</text>
+        <line x1="255" x2="255" y1="0" y2="80" stroke="var(--text-tertiary)" stroke-dasharray="2 2"/>
+        <polyline fill="none" stroke="var(--accent)" stroke-width="1.6" points="255,70 262,69 270,71 278,60 284,40 288,62 294,70 300,70"/>
+        <text x="0" y="89" font-size="8" fill="var(--text-secondary)">Nov 7</text><text x="245" y="89" font-size="8" fill="var(--text-secondary)">yesterday 14:00</text><text x="285" y="89" font-size="8" fill="var(--text-secondary)">now</text>
+      </svg>
+      <div class="warnline" style="font-size:12px">Older than 24 h comes from Prometheus, which isn't answering (connection refused, 14:20). <span class="lnk">Status →</span></div>
+    </div>
+    <div class="muted" style="font-size:11.5px;margin-top:4px">With no Prometheus configured, the range picker simply stops at 24 h: no gap, no warning. Configured but returning no series for the labels: the same grey gap, saying "no series for cluster=&quot;prod-eu&quot;".</div>
+
+    <h5 style="margin-top:14px">Console status (from the user menu)</h5>
+    <table>
+      <tr><td>Live updates</td><td><span class="chip c-ok">connected</span> via node-a</td></tr>
+      <tr><td>Nodes answering</td><td>2 of 3 · node-b 40 s</td></tr>
+      <tr><td>Built-in history</td><td>24 h · last sample 6 s ago</td></tr>
+      <tr><td>Prometheus</td><td class="warnline">failing since 14:20 · connection refused</td></tr>
+      <tr><td>Event store</td><td><span class="chip c-ok">ok</span> · 30 days</td></tr>
+    </table>
+  </div>
+</div>
+</div></div>
+
+    </div>
+  </div>
+
+</body>
+</html>

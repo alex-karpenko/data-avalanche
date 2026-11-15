@@ -29,7 +29,7 @@ const BLOCKS: &[(&str, &str)] = &[
     ("globals.api.jwt", "Token verification for `auth: jwt`."),
     (
         "globals.api.oauth2",
-        "Token verification for `auth: oauth2`.",
+        "Token verification for `auth: oauth2`, and the web console's sign-in client.",
     ),
     ("globals.api.tls", "TLS for the API's listener."),
     ("globals.log", "The node's log."),
@@ -46,6 +46,27 @@ const BLOCKS: &[(&str, &str)] = &[
         "OTLP/HTTP traces of flushes, commits, snapshot chunks and schema changes.",
     ),
     ("globals.azure", "Azure Blob Storage (`cloud: azure`)."),
+    (
+        "globals.console",
+        "The web console under `/ui/` (off by default), and how long the events and the chart history it reads are kept: they are recorded whether the console is on or off.",
+    ),
+    (
+        "globals.console.history",
+        "The built-in chart history each node keeps.",
+    ),
+    (
+        "globals.console.events",
+        "The cluster's events and audit trail.",
+    ),
+    (
+        "globals.console.prometheus",
+        "Where chart ranges older than the built-in history come from. Absent, the console uses its built-in history only, without a warning.",
+    ),
+    (
+        "globals.console.prometheus.basic",
+        "Basic authentication to Prometheus.",
+    ),
+    ("globals.console.prometheus.tls", "TLS to Prometheus."),
     (
         "pipelines.*",
         "One pipeline: a source database, its tables, and the sink they replicate to. The map's key is the pipeline's name.",

@@ -14,6 +14,8 @@ Every node serves the API on `globals.api.address`. `globals.api.auth` decides w
 
 **Answers.** Every body is a JSON object; a refusal carries an `error` string. Every route can also answer `503` (the node is starting or stopping, or its state can't be read) and, unless `auth` is `none`, `401` (no credentials, or ones that don't verify) and `403` (the caller's role is below the route's). A `202` means accepted, not done: a pipeline command or a snapshot job is carried out by the node that holds the pipeline's lease, a reload is published, a leave or a shutdown is under way on the node called.
 
+**Who did it.** Every route that changes something takes an optional JSON body `{"note": "…"}` and records the action in the cluster's events: what, to what, the caller's name and role as the node verified them, the note, and how it ended (`accepted`, `unchanged`, `refused`). A caller turned away for its role, or with no role mapped, is recorded too (`action.denied`). A note longer than 500 characters, not a string or holding a control character, or a body that isn't a JSON object, is `422`; a body over 1 MiB is `413`; either way nothing is done or recorded.
+
 **Outside `/v1`**, with no credentials: `GET /health/live` (the process answers), `GET /health/ready` (`200` once the node runs its config, `503` before and while it stops) and `GET /metrics` (Prometheus text).
 
 ## pipelines
@@ -51,6 +53,8 @@ Flush now
 Least role: `operator`.
 
 - Path parameter `id`: the pipeline's id.
+- Body: `application/json`.
+- `note`: why, kept with the action's event (optional, at most 500 characters).
 
 | Status | When |
 |---|---|
@@ -58,6 +62,8 @@ Least role: `operator`.
 | `202` | asked: the owner acts at its next poll |
 | `404` | no such pipeline in the generation this node runs |
 | `409` | stopped, or no node holds the lease |
+| `413` | the body is over 1 MiB |
+| `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
 
 ### `POST /v1/pipelines/{id}/pause`
 
@@ -66,6 +72,8 @@ Pause: flush to a transaction boundary, then read nothing; the connection and th
 Least role: `operator`.
 
 - Path parameter `id`: the pipeline's id.
+- Body: `application/json`.
+- `note`: why, kept with the action's event (optional, at most 500 characters).
 
 | Status | When |
 |---|---|
@@ -73,6 +81,8 @@ Least role: `operator`.
 | `202` | the desired state is paused |
 | `404` | no such pipeline in the generation this node runs |
 | `409` | the pipeline is stopped |
+| `413` | the body is over 1 MiB |
+| `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
 
 ### `POST /v1/pipelines/{id}/restart`
 
@@ -81,12 +91,16 @@ Restart: discard what is unflushed and replay from the checkpoint, under the sam
 Least role: `operator`.
 
 - Path parameter `id`: the pipeline's id.
+- Body: `application/json`.
+- `note`: why, kept with the action's event (optional, at most 500 characters).
 
 | Status | When |
 |---|---|
 | `202` | asked: the owner acts at its next poll |
 | `404` | no such pipeline in the generation this node runs |
 | `409` | paused, stopped, or no node holds the lease |
+| `413` | the body is over 1 MiB |
+| `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
 
 ### `POST /v1/pipelines/{id}/resume`
 
@@ -95,12 +109,16 @@ Resume a paused or stopped pipeline
 Least role: `operator`.
 
 - Path parameter `id`: the pipeline's id.
+- Body: `application/json`.
+- `note`: why, kept with the action's event (optional, at most 500 characters).
 
 | Status | When |
 |---|---|
 | `200` | running already |
 | `202` | the desired state is running |
 | `404` | no such pipeline in the generation this node runs |
+| `413` | the body is over 1 MiB |
+| `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
 
 ### `GET /v1/pipelines/{id}/snapshots`
 
@@ -123,13 +141,15 @@ Least role: `operator`.
 
 - Path parameter `id`: the pipeline's id.
 - Body: `application/json`.
+- `note`: why, kept with the action's event (optional, at most 500 characters).
 
 | Status | When |
 |---|---|
 | `202` | the job is queued: the owner restarts the worker, which takes its tables |
 | `404` | no such pipeline in the generation this node runs |
 | `409` | paused, stopped, no node holds the lease, or an unfinished job holds a table |
-| `422` | the body names no table, a glob, or a table not in the source's form |
+| `413` | the body is over 1 MiB |
+| `422` | the body names no table, a glob, or a table not in the source's form; or the note is too long, not a string, holds a control character, or the body isn't a JSON object |
 
 ### `POST /v1/pipelines/{id}/stop`
 
@@ -138,12 +158,16 @@ Stop: flush, and close the source connection; the lease stays
 Least role: `operator`.
 
 - Path parameter `id`: the pipeline's id.
+- Body: `application/json`.
+- `note`: why, kept with the action's event (optional, at most 500 characters).
 
 | Status | When |
 |---|---|
 | `200` | stopped already |
 | `202` | the desired state is stopped |
 | `404` | no such pipeline in the generation this node runs |
+| `413` | the body is over 1 MiB |
+| `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
 
 ## snapshots
 
@@ -172,6 +196,8 @@ Publish the node's file as the next config generation; `?restart=accept` publish
 
 Least role: `operator`.
 
+- Body: `application/json`.
+- `note`: why, kept with the action's event (optional, at most 500 characters).
 
 | Status | When |
 |---|---|
@@ -179,7 +205,8 @@ Least role: `operator`.
 | `202` | published: the generation, and this node's fields pending a restart |
 | `400` | a query other than restart=accept |
 | `409` | other nodes published first, every time |
-| `422` | invalid, or it changes a restart-only field without restart=accept, or a field the cluster keeps for good: the report |
+| `413` | the body is over 1 MiB |
+| `422` | invalid, or it changes a restart-only field without restart=accept, or a field the cluster keeps for good: the report; or the note is too long, not a string, holds a control character, or the body isn't a JSON object |
 
 ### `GET /v1/config/status`
 
@@ -216,11 +243,15 @@ Leave the cluster: hand every pipeline off; the process stays up, not ready
 
 Least role: `admin`.
 
+- Body: `application/json`.
+- `note`: why, kept with the action's event (optional, at most 500 characters).
 
 | Status | When |
 |---|---|
 | `202` | the leave is under way |
 | `409` | leaving already |
+| `413` | the body is over 1 MiB |
+| `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
 
 ### `GET /v1/cluster/status`
 
@@ -243,11 +274,40 @@ Shut down: leave the cluster, then end the process
 
 Least role: `admin`.
 
+- Body: `application/json`.
+- `note`: why, kept with the action's event (optional, at most 500 characters).
 
 | Status | When |
 |---|---|
 | `202` | the shutdown is under way |
 | `409` | shutting down already |
+| `413` | the body is over 1 MiB |
+| `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
+
+## events
+
+The cluster's timeline and audit trail, kept for `globals.console.events.retention`.
+
+### `GET /v1/events`
+
+The cluster's events and audit trail, newest first: actions with who took them, lease hand-offs, halts, schema changes, snapshot jobs, members, config generations
+
+Least role: `viewer`.
+
+- Query parameter `since`: events at or after this time (RFC 3339).
+- Query parameter `until`: events before this time (RFC 3339).
+- Query parameter `kind`: a kind or a family (`action`, `lease.takeover`); repeat it for several.
+- Query parameter `object`: a pipeline's id, or an object's name (a table, a job, a node).
+- Query parameter `actor`: the name of who caused it.
+- Query parameter `node`: the node that recorded it.
+- Query parameter `q`: text in the event or its note, without case.
+- Query parameter `limit`: at most this many (1–1000, 100 by default).
+- Query parameter `after`: the `next` of the page before: go on from there.
+
+| Status | When |
+|---|---|
+| `200` | the events, and `next` when there are more |
+| `400` | a parameter that isn't one, or isn't in its form |
 
 ## openapi.json
 

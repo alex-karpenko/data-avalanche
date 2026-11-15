@@ -2438,6 +2438,7 @@ mod tests {
             source: w.source.clone(),
             sink: w.sink.clone(),
             docs: docs().0,
+            ears: Arc::default(),
         };
         let (end, st) = run(&wiped, &mode("mode: initial"), async |status| {
             streamed(&status, &wiped).await;

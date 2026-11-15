@@ -11,8 +11,8 @@ use bytes::Bytes;
 use data_avalanche_config::{FingerprintKey, Pipeline, load_str};
 use data_avalanche_core::position::Lsn;
 use data_avalanche_core::{
-    CdcEvent, ColumnSchema, ColumnValue, ColumnValueType as V, Op, Row, Sink, SourcePosition,
-    SourceSeq, TableRef, TableSchema, TableSpec, TransactionBoundary,
+    CdcEvent, ColumnSchema, ColumnValue, ColumnValueType as V, Op, Row, SchemaChange, Sink,
+    SourcePosition, SourceSeq, TableRef, TableSchema, TableSpec, TransactionBoundary,
 };
 use data_avalanche_state::{DocStore, PipelineDocs, SlotDoc, SnapshotStatus, TableSnapshotDoc};
 use data_avalanche_storage::{ObjectStoreVersioned, ObjectVersion, StoreError, VersionedStore};
@@ -25,7 +25,7 @@ use crate::settings::Settings;
 use crate::status::Streak;
 use crate::{
     Accumulator, Backoff, Command, CommitGuard, FlushPolicy, HookAction, HookPoint, Hooks, Lineage,
-    NoHooks, NoObserver, Observer, RowsRead, Tuning, Unguarded, WorkerStatus,
+    NoHooks, Observer, RowsRead, Tuning, Unguarded, WorkerStatus,
 };
 
 /// A span a test saw: its name, its parent's, and its fields as last recorded.
@@ -155,11 +155,19 @@ pub(crate) enum Heard {
     ChunkRead,
 }
 
+/// An evolve heard: the table, its changes in words, and a degraded one's warning.
+pub(crate) type Evolved = (String, Vec<String>, Option<String>);
+
 /// An observer that keeps what it hears, in order.
 #[derive(Debug, Default)]
-pub(crate) struct Ears(Mutex<Vec<Heard>>, Mutex<Vec<Duration>>);
+pub(crate) struct Ears(Mutex<Vec<Heard>>, Mutex<Vec<Duration>>, Mutex<Vec<Evolved>>);
 
 impl Ears {
+    /// Each evolve heard.
+    pub fn evolved(&self) -> Vec<Evolved> {
+        self.2.lock().unwrap().clone()
+    }
+
     pub fn heard(&self) -> Vec<Heard> {
         self.0.lock().unwrap().clone()
     }
@@ -186,6 +194,14 @@ impl Observer for Ears {
 
     fn chunk_read(&self, _: Duration) {
         self.0.lock().unwrap().push(Heard::ChunkRead);
+    }
+
+    fn schema_evolved(&self, table: &TableRef, changes: &[SchemaChange], warning: Option<&str>) {
+        self.2.lock().unwrap().push((
+            table.to_string(),
+            changes.iter().map(ToString::to_string).collect(),
+            warning.map(str::to_owned),
+        ));
     }
 }
 
@@ -519,6 +535,8 @@ pub(crate) struct World {
     pub source: FakeSource,
     pub sink: MemorySink,
     pub docs: PipelineDocs,
+    /// The observer of every core [`Self::core`] makes.
+    pub ears: Arc<Ears>,
 }
 
 impl World {
@@ -533,6 +551,7 @@ impl World {
             source: FakeSource::new(tables),
             sink: MemorySink::new(),
             docs,
+            ears: Arc::default(),
         }
     }
 
@@ -593,7 +612,7 @@ impl World {
             owner_epoch: 1,
             guard: Arc::new(Unguarded),
             hooks: Arc::new(NoHooks),
-            observer: Arc::new(NoObserver),
+            observer: self.ears.clone(),
             tuning: fast(),
             control: control_rx,
             status,

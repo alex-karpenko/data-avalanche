@@ -61,6 +61,7 @@ pub(crate) fn check(raw: &RawConfig, merged: &[(String, RawPipeline)], ctx: &mut
             ctx,
         );
     }
+    console(g, ctx);
     for (name, p) in merged {
         let is_iceberg = p
             .sink
@@ -339,5 +340,89 @@ fn management_api(a: &RawApi, at: &At, ctx: &mut Ctx) {
     {
         require(ctx, "V-053", &at.key("tls"), "cert", &tls.cert, "api TLS");
         require(ctx, "V-053", &at.key("tls"), "key", &tls.key, "api TLS");
+    }
+}
+
+/// §6.8 and §6.3.1: V-133…V-136, the console's needs from the auth mode.
+fn console(g: &RawGlobals, ctx: &mut Ctx) {
+    let api_at = At::config(YamlPath::root().key("globals").key("api"));
+    let console_at = At::config(YamlPath::root().key("globals").key("console"));
+    let default_api = RawApi::default();
+    let a = g.api.as_ref().unwrap_or(&default_api);
+    let auth = if a.auth.is_none() {
+        Some(ApiAuth::None)
+    } else {
+        ctx.peek(&a.auth)
+    };
+    // V-133
+    if let Some(o) = &a.oauth2 {
+        let o_at = api_at.key("oauth2");
+        if o.client_id.is_none() {
+            for (key, present, loc) in [
+                (
+                    "client_secret",
+                    o.client_secret.is_some(),
+                    o.client_secret.as_ref().and_then(|l| l.loc()),
+                ),
+                ("scopes", o.scopes.is_some(), None),
+            ] {
+                if present {
+                    ctx.error(
+                        "V-133",
+                        &o_at.key(key),
+                        loc,
+                        format!("oauth2.{key} needs client_id"),
+                    );
+                }
+            }
+        }
+    }
+    let default_console = RawConsole::default();
+    let c = g.console.as_ref().unwrap_or(&default_console);
+    // V-134
+    if let Some(l) = &c.session_key
+        && matches!(auth, Some(ApiAuth::None | ApiAuth::Jwt))
+    {
+        ctx.warning(
+            "V-134",
+            &console_at.key("session_key"),
+            l.loc(),
+            "session_key is unused: with api auth none or jwt the console has no sessions",
+        );
+    }
+    let enabled = c.enabled.is_some() && ctx.peek(&c.enabled) == Some(true);
+    if !enabled {
+        return;
+    }
+    // V-135
+    if matches!(auth, Some(ApiAuth::Basic | ApiAuth::Oauth2))
+        && missing(ctx, &c.session_key, &console_at.key("session_key"))
+    {
+        ctx.error(
+            "V-135",
+            &console_at.key("session_key"),
+            c.enabled.as_ref().and_then(|l| l.loc()),
+            "the console with api auth basic or oauth2 needs session_key",
+        );
+    }
+    // V-136
+    if auth == Some(ApiAuth::Oauth2) {
+        if missing(ctx, &c.public_url, &console_at.key("public_url")) {
+            ctx.error(
+                "V-136",
+                &console_at.key("public_url"),
+                c.enabled.as_ref().and_then(|l| l.loc()),
+                "the console with api auth oauth2 needs public_url",
+            );
+        }
+        let client_id = a.oauth2.as_ref().and_then(|o| o.client_id.clone());
+        if missing(ctx, &client_id, &api_at.key("oauth2").key("client_id")) {
+            ctx.error(
+                "V-136",
+                &api_at.key("oauth2").key("client_id"),
+                c.enabled.as_ref().and_then(|l| l.loc()),
+                "the console with api auth oauth2 needs oauth2.client_id",
+            );
+        }
     }
 }

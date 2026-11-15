@@ -168,5 +168,87 @@ pub fn cases() -> Vec<Case> {
                 "role_mapping": {"admin": ["x"]}
             }))
         }),
+        case("V-133", Error, "client_secret without client_id", || {
+            pg_delta().set("/globals/api", json!({"auth": "oauth2", "oauth2": {"issuer": "https://idp", "jwks_url": "https://idp/certs", "client_secret": "s"}}))
+        }),
+        case("V-133", Error, "scopes without client_id", || {
+            pg_delta().set("/globals/api", json!({"auth": "oauth2", "oauth2": {"issuer": "https://idp", "jwks_url": "https://idp/certs", "scopes": ["openid"]}}))
+        }),
+        case("V-133", Silent, "a confidential console client", || {
+            pg_delta().set("/globals/api", json!({"auth": "oauth2", "oauth2": {"issuer": "https://idp", "jwks_url": "https://idp/certs", "client_id": "cdc-console", "client_secret": "s", "scopes": ["openid", "email"]}}))
+        }),
+        case("V-134", Warning, "a session key without auth", || {
+            pg_delta().set(
+                "/globals/console",
+                json!({"session_key": "0123456789abcdef0123456789abcdef"}),
+            )
+        }),
+        case("V-134", Warning, "a session key under jwt", || {
+            pg_delta()
+                .set("/globals/api", json!({"auth": "jwt", "jwt": {"issuer": "https://idp", "jwks_url": "https://idp/certs"}}))
+                .set("/globals/console", json!({"enabled": true, "session_key": "0123456789abcdef0123456789abcdef"}))
+        }),
+        case("V-134", Silent, "a session key under basic", || {
+            pg_delta()
+                .set(
+                    "/globals/api",
+                    json!({"auth": "basic", "user": "a", "password": "b"}),
+                )
+                .set(
+                    "/globals/console",
+                    json!({"enabled": true, "session_key": "0123456789abcdef0123456789abcdef"}),
+                )
+        }),
+        case(
+            "V-135",
+            Error,
+            "the console under basic without a session key",
+            || {
+                pg_delta()
+                    .set(
+                        "/globals/api",
+                        json!({"auth": "basic", "user": "a", "password": "b"}),
+                    )
+                    .set("/globals/console", json!({"enabled": true}))
+            },
+        ),
+        case("V-135", Silent, "a disabled console under basic", || {
+            pg_delta()
+                .set(
+                    "/globals/api",
+                    json!({"auth": "basic", "user": "a", "password": "b"}),
+                )
+                .set("/globals/console", json!({"enabled": false}))
+        }),
+        case("V-135", Silent, "the console under jwt", || {
+            pg_delta()
+                .set("/globals/api", json!({"auth": "jwt", "jwt": {"issuer": "https://idp", "jwks_url": "https://idp/certs"}}))
+                .set("/globals/console", json!({"enabled": true}))
+        }),
+        case(
+            "V-136",
+            Error,
+            "the console under oauth2 without public_url",
+            || {
+                pg_delta()
+                .set("/globals/api", json!({"auth": "oauth2", "oauth2": {"issuer": "https://idp", "jwks_url": "https://idp/certs", "client_id": "c"}}))
+                .set("/globals/console", json!({"enabled": true, "session_key": "0123456789abcdef0123456789abcdef"}))
+            },
+        ),
+        case(
+            "V-136",
+            Error,
+            "the console under oauth2 without client_id",
+            || {
+                pg_delta()
+                .set("/globals/api", json!({"auth": "oauth2", "oauth2": {"issuer": "https://idp", "jwks_url": "https://idp/certs"}}))
+                .set("/globals/console", json!({"enabled": true, "session_key": "0123456789abcdef0123456789abcdef", "public_url": "https://cdc.example.com"}))
+            },
+        ),
+        case("V-136", Silent, "the console under oauth2", || {
+            pg_delta()
+                .set("/globals/api", json!({"auth": "oauth2", "oauth2": {"issuer": "https://idp", "jwks_url": "https://idp/certs", "client_id": "c", "idp_name": "Company SSO"}}))
+                .set("/globals/console", json!({"enabled": true, "session_key": "0123456789abcdef0123456789abcdef", "public_url": "https://cdc.example.com"}))
+        }),
     ]
 }

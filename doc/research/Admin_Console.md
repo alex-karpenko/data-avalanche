@@ -70,15 +70,21 @@ Top bar: the sections, the config generation, and the signed-in name and role. S
 cross-linked everywhere: a pipeline links its node, a table its pipeline, a job its pipeline and
 tables, an event its object.
 
+**The approved page designs are `doc/v1.1/mockups/`** (one file per page, approved by Oleksii on
+2026-11-14); a page is built to its mockup, and where this section and a mockup differ, the mockup
+wins. Across every list: clicking a row opens its object's page, and rows are real links (a new
+tab, a copied link); filters and sort live in the address, so a link shows the same view; Back
+keeps them; ↑/↓ and Enter move and open.
+
 | Section | What it shows |
 |---|---|
 | **Overview** | Headline tiles (pipelines by state, worst lag vs target, nodes up, snapshots running/failed, WAL held by slots). **Needs attention** (§4.1). The pipelines with a lag sparkline, state, node and last commit. Recent events. |
-| **Cluster** | Members and their state (alive, suspect, leaving), each node's config generation, the hash ring and who owns what, leases with holder, epoch and time to renewal. A node page: its pipelines, lease renewals, resource figures, node actions. |
-| **Pipelines** | All pipelines with state, source → sink, node, lag, last commit, snapshot state. A pipeline page (accepted mockup): header with source, sink, node, lease; actions; lag chart; tables; source panel (PostgreSQL slot, WAL held vs `max_slot_wal_keep_size`, confirmed LSN, publication; MySQL binlog position or GTID and binlog lag); current snapshot with progress and ETA, earlier jobs; the pipeline's activity; its resolved config, secrets masked. |
+| **Cluster** | Members and their state (alive, suspect, leaving), each node's config generation, leases with holder, ring owner, epoch and time to renewal. **Pipelines held away from their ring owner** stand out (Oleksii; no hash-ring drawing): a tile, a panel with holder, owner, since when, why and when each goes back, orange lease rows, and per node "held / owned". A node page: its pipelines, lease renewals, memory, CPU and gossip figures, node actions. |
+| **Pipelines** | All pipelines with state, source → sink, node, lag, last commit, snapshot state, worst first; select several to act on them together (one at a time, stopping at the first failure). A pipeline page (accepted mockup): header with source, sink, node, lease; actions; lag chart; tables; source panel (PostgreSQL slot, WAL held vs `max_slot_wal_keep_size`, confirmed LSN, publication; MySQL binlog position or GTID and binlog lag); current snapshot with progress and ETA, earlier jobs; the pipeline's activity; its resolved config, secrets masked. |
 | **Tables** | Every table across pipelines: state (running, halted with reason), changes per minute, last commit, Delta version, files rewritten per MERGE, schema changes (applied, soft-dropped columns, refused). A table page with its own charts and events. Also answers a lake reader's "how fresh is table X?" |
-| **Snapshots** | All jobs, running and ended (each pipeline keeps its 100 newest ended jobs), with parameters, who started them and their note, progress, rows done vs estimate, rate, ETA, outcome. Job actions. |
+| **Snapshots** | All jobs, running and ended (each pipeline keeps its 100 newest ended jobs), with parameters, who started them and their note, progress, rows done vs estimate, rate, ETA, outcome; a 24 h timeline per pipeline. A job page: each table's progress and what lake readers see of it, the job's effect on lag. Job actions. A job is shown by the first 8 characters of its id's uuid, and copies the full id. |
 | **Events** | The cluster's timeline (§6), filterable by kind, object, actor and time. |
-| **Config** | The running config (secrets masked), generation history with a diff between any two, which node runs which generation, restart-only changes waiting. Validate a candidate; apply a reload. |
+| **Config** | Four tabs: the running config (secrets masked); generations with a diff between any two, each change tagged with its class and what it did; Nodes: which generation each node runs, whether its own file matches it, restart-only changes waiting; Validate & reload: pick the node whose file to check (a reload publishes that node's file), the report and the changes, accept restart-only changes, a note. Reload only after the same file validated. |
 
 ### 4.1 Needs attention
 
@@ -113,7 +119,8 @@ and need a second confirmation where they can't be undone.
 |---|---|---|---|
 | Pipeline | pause, resume, stop, restart, flush | operator | yes |
 | Pipeline | start a snapshot job (tables, options) | operator | yes |
-| Snapshot job | cancel | operator | **new** |
+| Pipelines (several) | the same actions on a selection | operator | composed |
+| Snapshot job | cancel (a table the job was bringing back from a halt halts again, reason "copy cancelled", Oleksii) | operator | **new** |
 | Snapshot job | retry (a new job with the same parameters) | operator | **new** (or composed from the existing create) |
 | Node | leave, shut down | admin | only on the node receiving the call: **new**, any node forwards to the target |
 | Config | validate, reload (with `?restart=accept`) | operator | yes |
@@ -131,7 +138,9 @@ An event has: time, kind, object (cluster, node, pipeline, table, job, config), 
 role when a person or token caused it, note, and outcome. It records at least: every action of §5
 (accepted, then its outcome); lease hand-offs and failovers; config reloads and generations; halts
 and schema changes (applied, degraded, refused); snapshot job lifecycle; nodes joining, leaving,
-going suspect; removals and their teardown.
+going suspect; removals and their teardown; **refused attempts** (a 403 on a mutating call), so the
+trail shows attempts as well as successes. The Events page filters by time, kind, object, actor and
+node, narrows by dragging across a histogram, and exports CSV or JSON.
 
 Events name people and describe pipelines, so the docs say to keep `globals.state` where lake
 readers can't read it; the same applies to the history of §7.
@@ -179,14 +188,14 @@ One sign-in page; what follows depends on `globals.api.auth`:
 |---|---|
 | `none` | Straight in as `admin`, with a permanent banner: the cluster has no authentication. |
 | `basic` | A form (not the browser's popup, so sign-out works). The server checks the credentials and starts a session. Attempts are rate-limited. |
-| `oauth2` | Authorization code with PKCE against the cluster's identity provider; the server exchanges the code. Needs a new `client_id` (registered with the provider); the cluster has no client today, only token verification. Refresh tokens are used when the provider issues them. |
-| `jwt` | A request already carrying `Authorization: Bearer` (a proxy in front) goes straight through. Otherwise the page takes a pasted token once; the session lasts until the token expires (Claude's call, both ways). |
+| `oauth2` | Authorization code with PKCE against the cluster's identity provider; the server exchanges the code. Needs a new `client_id` (registered with the provider); the cluster has no client today, only token verification. Refresh tokens are used when the provider issues them. The sign-in page goes to the provider by itself after 5 s, unless the person stays, and not after a sign-out or a failed sign-in (no loop); it names the provider by `oauth2.idp_name`, or the issuer's host name (Oleksii). |
+| `jwt` | **No sign-in page and no session** (Oleksii): every request must carry `Authorization: Bearer` (a proxy in front sends it). Without one, or with one refused, the "No valid token" page says why. |
 
-- **Session** (best practice: tokens and passwords never reach page JavaScript): an encrypted,
+- **Session** (`basic` and `oauth2`; best practice: tokens and passwords never reach page JavaScript): an encrypted,
   `HttpOnly`, `Secure`, `SameSite=Strict` cookie, readable by every node so a load balancer can
   send any request anywhere. **The key comes from configuration** (Oleksii):
   `globals.console.session_key`, set through `${ENV}` to the same value on every node, required
-  when the console is enabled and `auth` is not `none` (a validation rule, so a config without it
+  when the console is enabled with `auth` `basic` or `oauth2` (a validation rule, so a config without it
   is refused at start and on reload). It is never kept in object storage, because people who may read the
   lake's bucket must not be able to mint an admin session. Every request is still verified the
   way the API verifies a bearer token today; the role and the recorded name always come from that
@@ -196,8 +205,10 @@ One sign-in page; what follows depends on `globals.api.auth`:
 - **The console's public address:** `oauth2` needs the exact redirect URI the provider registered,
   which a node behind a proxy can't work out safely from forwarded headers. A
   `globals.console.public_url` setting gives it, required when `auth = oauth2` (Claude's call).
-- **401** (not signed in, expired): back to sign-in, saying why. **403** (signed in, not allowed,
-  or a token whose roles map to nothing): names the role needed and the role held.
+- **Not signed in or expired** (401): "Your session has ended", saying why, with a sign-in button
+  back to the page the person was on; with `jwt`, "No valid token" and no button. **Not allowed**
+  (403): "Forbidden", naming the role needed, the role held and, with tokens, which roles mapped to
+  it. The pages are captioned in words, not status codes (Oleksii).
 - **Sign-out** clears the session and, with `oauth2`, signs out at the provider when it offers an
   end-session endpoint.
 - **Same origin:** the console and the API share one listener, so no CORS opens. Mutating
@@ -234,14 +245,15 @@ All Claude's calls, "follow best practices" (Oleksii):
   with the console disabled serving none of it.
 - **Accessibility:** keyboard navigation, labels on every state, contrast in both themes.
 
-## 11. Configuration surface (proposed; spec edits need approval)
+## 11. Configuration surface
 
-New settings, to be patched into `doc/specs/Configuration_Specification.md` once approved
-(names are proposals):
+In `doc/specs/Configuration_Specification.md` §6.3.1 and §6.8 (approved 2026-11-14, with the
+follow-up for `idp_name` and `session_key` in `basic` and `oauth2` only):
 
-- `globals.api.oauth2.client_id` (and optional `scopes`): the console's client for `oauth2`.
+- `globals.api.oauth2.client_id` (and optional `client_secret`, `scopes`): the console's client for
+  `oauth2`; `idp_name` (optional): the provider's name on the sign-in page.
 - `globals.console`: `enabled` (default `false`, Oleksii; reloadable, §3); `session_key`
-  (`${ENV}`, required when enabled unless `auth = none`, §9); `public_url` (required when enabled
+  (`${ENV}`, required when enabled with `basic` or `oauth2`, §9); `public_url` (required when enabled
   with `oauth2`); `session_ttl` (default 8 h, Claude's call);
   `username_claim` (default `preferred_username`); `history.retention` (default 24 h);
   `events.retention` (default 30 d); `prometheus` (optional: `url`, `auth`, `tls`,
@@ -271,6 +283,10 @@ the runbooks pointing at the console where it does the job.
   and across pipelines, source detail (slot, WAL held, binlog position), all snapshot jobs, job
   cancel and retry, node leave and shutdown through any node, config generations and diff.
 - Sign-in, sessions, the 401/403 pages (§9).
+- New figures: process memory and CPU, gossip (peers seen, last probe, suspicions), and each node's
+  file against the running generation (§4).
+- A halt reason for a cancelled copy ("copy cancelled", §5), in the halted-table runbook too.
+- Recording refused attempts (§6).
 - Serving the embedded app under `/ui/` (§10), behind `globals.console.enabled` (§3).
 
 ## 13. Left to the builder

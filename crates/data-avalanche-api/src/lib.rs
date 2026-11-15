@@ -6,11 +6,13 @@
 //!
 //! Every `/v1` route takes the least role in API_RBAC §2 ([`routes`]): no credentials, or ones
 //! that don't verify, are 401 with a `WWW-Authenticate` challenge; a caller below the route's
-//! role is 403.
+//! role, or with no role mapped, is 403, and recorded on a route that changes something.
 
+mod actions;
 mod auth;
 mod cluster;
 mod config;
+mod events;
 mod limit;
 mod openapi;
 mod pipelines;
@@ -29,13 +31,14 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, get, post};
-use data_avalanche_cluster::{ConfigCoordinator, DocsFn, Members};
+use data_avalanche_cluster::{ConfigCoordinator, DocsFn, Members, Recorder};
 use data_avalanche_config::Role;
-use data_avalanche_state::Leases;
+use data_avalanche_state::{Events, Leases};
 use data_avalanche_telemetry::{CONTENT_TYPE, Metrics};
 use serde_json::{Value, json};
 use tokio::sync::watch;
 
+pub use actions::{DENIALS_BURST, MAX_ERROR, MAX_NOTE, MAX_TARGET, Recorded, note_of};
 pub use auth::{Auth, FETCH_TIMEOUT, KEYS_MAX_AGE, MAX_KEY_DOCUMENT, Principal, REFETCH_AFTER};
 pub use cluster::{Control, Stop};
 pub use limit::{RateLimit, VALIDATE_BURST, VALIDATE_PER_SECOND};
@@ -70,6 +73,12 @@ pub struct Node {
     pub control: Control,
     /// The posted-body validates' limit ([`RateLimit::validate`], DA-API-20).
     pub validates: Arc<RateLimit>,
+    /// Records the actions taken through the API, and the refused attempts (Admin_Console §6).
+    pub recorder: Recorder,
+    /// The cluster's timeline, read by `GET /v1/events`.
+    pub events: Arc<Events>,
+    /// The refused attempts recorded: [`RateLimit::denials`].
+    pub denials: Arc<RateLimit>,
 }
 
 impl std::fmt::Debug for Node {
@@ -94,6 +103,16 @@ pub struct Route {
     pub body: Option<&'static str>,
     /// Its own answers; 401, 403 and 503 are every route's.
     pub answers: &'static [(u16, &'static str)],
+    /// What it records, when it changes something (Admin_Console §5).
+    pub records: Option<Recorded>,
+}
+
+/// What a route's gate and recording know: the auth, the route, and the node once it runs.
+#[derive(Debug, Clone)]
+pub(crate) struct Gate {
+    auth: Arc<Auth>,
+    route: Route,
+    node: Arc<OnceLock<Node>>,
 }
 
 const ASKED: (u16, &str) = (202, "asked: the owner acts at its next poll");
@@ -110,6 +129,13 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
         summary,
         body: None,
         answers,
+        records: None,
+    };
+    // A mutating route: an optional JSON body with a `note`, and what it records.
+    let act = |kind, verb, route: Route| Route {
+        body: Some(route.body.unwrap_or("application/json")),
+        records: Some(Recorded { kind, verb }),
+        ..route
     };
     vec![
         (
@@ -136,24 +162,28 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
             post(config::validate),
         ),
         (
-            r(
-                "POST",
-                "/v1/config/reload",
-                Operator,
-                "Publish the node's file as the next config generation; `?restart=accept` publishes a restart-only field, applied at each node's next start",
-                &[
-                    (200, "the file is the generation the cluster runs"),
-                    (
-                        202,
-                        "published: the generation, and this node's fields pending a restart",
-                    ),
-                    (400, "a query other than restart=accept"),
-                    (409, "other nodes published first, every time"),
-                    (
-                        422,
-                        "invalid, or it changes a restart-only field without restart=accept, or a field the cluster keeps for good: the report",
-                    ),
-                ],
+            act(
+                "config.reload",
+                "reload the config",
+                r(
+                    "POST",
+                    "/v1/config/reload",
+                    Operator,
+                    "Publish the node's file as the next config generation; `?restart=accept` publishes a restart-only field, applied at each node's next start",
+                    &[
+                        (200, "the file is the generation the cluster runs"),
+                        (
+                            202,
+                            "published: the generation, and this node's fields pending a restart",
+                        ),
+                        (400, "a query other than restart=accept"),
+                        (409, "other nodes published first, every time"),
+                        (
+                            422,
+                            "invalid, or it changes a restart-only field without restart=accept, or a field the cluster keeps for good: the report",
+                        ),
+                    ],
+                ),
             ),
             post(config::reload),
         ),
@@ -198,102 +228,126 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
             get(pipelines::get),
         ),
         (
-            r(
-                "POST",
-                "/v1/pipelines/{id}/pause",
-                Operator,
-                "Pause: flush to a transaction boundary, then read nothing; the connection and the lease stay",
-                &[
-                    (200, "paused already"),
-                    (202, "the desired state is paused"),
-                    UNKNOWN,
-                    (409, "the pipeline is stopped"),
-                ],
+            act(
+                "pipeline.pause",
+                "pause",
+                r(
+                    "POST",
+                    "/v1/pipelines/{id}/pause",
+                    Operator,
+                    "Pause: flush to a transaction boundary, then read nothing; the connection and the lease stay",
+                    &[
+                        (200, "paused already"),
+                        (202, "the desired state is paused"),
+                        UNKNOWN,
+                        (409, "the pipeline is stopped"),
+                    ],
+                ),
             ),
             post(pipelines::pause),
         ),
         (
-            r(
-                "POST",
-                "/v1/pipelines/{id}/stop",
-                Operator,
-                "Stop: flush, and close the source connection; the lease stays",
-                &[
-                    (200, "stopped already"),
-                    (202, "the desired state is stopped"),
-                    UNKNOWN,
-                ],
+            act(
+                "pipeline.stop",
+                "stop",
+                r(
+                    "POST",
+                    "/v1/pipelines/{id}/stop",
+                    Operator,
+                    "Stop: flush, and close the source connection; the lease stays",
+                    &[
+                        (200, "stopped already"),
+                        (202, "the desired state is stopped"),
+                        UNKNOWN,
+                    ],
+                ),
             ),
             post(pipelines::stop),
         ),
         (
-            r(
-                "POST",
-                "/v1/pipelines/{id}/resume",
-                Operator,
-                "Resume a paused or stopped pipeline",
-                &[
-                    (200, "running already"),
-                    (202, "the desired state is running"),
-                    UNKNOWN,
-                ],
+            act(
+                "pipeline.resume",
+                "resume",
+                r(
+                    "POST",
+                    "/v1/pipelines/{id}/resume",
+                    Operator,
+                    "Resume a paused or stopped pipeline",
+                    &[
+                        (200, "running already"),
+                        (202, "the desired state is running"),
+                        UNKNOWN,
+                    ],
+                ),
             ),
             post(pipelines::resume),
         ),
         (
-            r(
-                "POST",
-                "/v1/pipelines/{id}/restart",
-                Operator,
-                "Restart: discard what is unflushed and replay from the checkpoint, under the same lease; a pipeline in ERROR runs again",
-                &[
-                    ASKED,
-                    UNKNOWN,
-                    (409, "paused, stopped, or no node holds the lease"),
-                ],
+            act(
+                "pipeline.restart",
+                "restart",
+                r(
+                    "POST",
+                    "/v1/pipelines/{id}/restart",
+                    Operator,
+                    "Restart: discard what is unflushed and replay from the checkpoint, under the same lease; a pipeline in ERROR runs again",
+                    &[
+                        ASKED,
+                        UNKNOWN,
+                        (409, "paused, stopped, or no node holds the lease"),
+                    ],
+                ),
             ),
             post(pipelines::restart),
         ),
         (
-            r(
-                "POST",
-                "/v1/pipelines/{id}/flush",
-                Operator,
-                "Flush now",
-                &[
-                    (200, "paused: flushed already"),
-                    ASKED,
-                    UNKNOWN,
-                    (409, "stopped, or no node holds the lease"),
-                ],
+            act(
+                "pipeline.flush",
+                "flush",
+                r(
+                    "POST",
+                    "/v1/pipelines/{id}/flush",
+                    Operator,
+                    "Flush now",
+                    &[
+                        (200, "paused: flushed already"),
+                        ASKED,
+                        UNKNOWN,
+                        (409, "stopped, or no node holds the lease"),
+                    ],
+                ),
             ),
             post(pipelines::flush),
         ),
         (
-            Route {
-                body: Some("application/json"),
-                ..r(
-                    "POST",
-                    "/v1/pipelines/{id}/snapshots",
-                    Operator,
-                    "Snapshot tables on demand, `{\"tables\": [...]}`, each named exactly; one outside the config is copied, not streamed",
-                    &[
-                        (
-                            202,
-                            "the job is queued: the owner restarts the worker, which takes its tables",
-                        ),
-                        UNKNOWN,
-                        (
-                            409,
-                            "paused, stopped, no node holds the lease, or an unfinished job holds a table",
-                        ),
-                        (
-                            422,
-                            "the body names no table, a glob, or a table not in the source's form",
-                        ),
-                    ],
-                )
-            },
+            act(
+                "snapshot.start",
+                "start a snapshot job on",
+                Route {
+                    body: Some("application/json"),
+                    ..r(
+                        "POST",
+                        "/v1/pipelines/{id}/snapshots",
+                        Operator,
+                        "Snapshot tables on demand, `{\"tables\": [...]}`, each named exactly; one outside the config is copied, not streamed",
+                        &[
+                            (
+                                202,
+                                "the job is queued: the owner restarts the worker, which takes its tables",
+                            ),
+                            UNKNOWN,
+                            (
+                                409,
+                                "paused, stopped, no node holds the lease, or an unfinished job holds a table",
+                            ),
+                            (
+                                422,
+                                "the body names no table, a glob, or a table not in the source's form",
+                            ),
+                        ],
+                    )
+                },
+            ),
             post(snapshots::ask),
         ),
         (
@@ -317,27 +371,48 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
             get(snapshots::get),
         ),
         (
-            r(
-                "POST",
-                "/v1/cluster/leave",
-                Admin,
-                "Leave the cluster: hand every pipeline off; the process stays up, not ready",
-                &[(202, "the leave is under way"), (409, "leaving already")],
+            act(
+                "node.leave",
+                "leave the cluster:",
+                r(
+                    "POST",
+                    "/v1/cluster/leave",
+                    Admin,
+                    "Leave the cluster: hand every pipeline off; the process stays up, not ready",
+                    &[(202, "the leave is under way"), (409, "leaving already")],
+                ),
             ),
             post(cluster::leave),
         ),
         (
-            r(
-                "POST",
-                "/v1/admin/shutdown",
-                Admin,
-                "Shut down: leave the cluster, then end the process",
-                &[
-                    (202, "the shutdown is under way"),
-                    (409, "shutting down already"),
-                ],
+            act(
+                "node.shutdown",
+                "shut down",
+                r(
+                    "POST",
+                    "/v1/admin/shutdown",
+                    Admin,
+                    "Shut down: leave the cluster, then end the process",
+                    &[
+                        (202, "the shutdown is under way"),
+                        (409, "shutting down already"),
+                    ],
+                ),
             ),
             post(cluster::shutdown),
+        ),
+        (
+            r(
+                "GET",
+                "/v1/events",
+                Viewer,
+                "The cluster's events and audit trail, newest first: actions with who took them, lease hand-offs, halts, schema changes, snapshot jobs, members, config generations",
+                &[
+                    (200, "the events, and `next` when there are more"),
+                    (400, "a parameter that isn't one, or isn't in its form"),
+                ],
+            ),
+            get(events::list),
         ),
         (
             r(
@@ -363,7 +438,17 @@ pub fn router(api: Api) -> Router {
         .route("/health/ready", get(ready))
         .route("/metrics", get(metrics));
     for (r, handler) in v1() {
-        let gate = (Arc::clone(&api.auth), r.role);
+        let gate = Gate {
+            auth: Arc::clone(&api.auth),
+            route: r,
+            node: Arc::clone(&api.node),
+        };
+        // The gate runs first (the outer layer), then the recording.
+        let handler = if r.records.is_some() {
+            handler.route_layer(from_fn_with_state(gate.clone(), actions::record))
+        } else {
+            handler
+        };
         router = router.route(
             r.path,
             handler.route_layer(from_fn_with_state(gate, authorize)),
@@ -374,21 +459,26 @@ pub fn router(api: Api) -> Router {
 
 /// Lets a caller through to a route that takes `role` or less, with its [`Principal`] in the
 /// request's extensions.
-async fn authorize(
-    State((auth, role)): State<(Arc<Auth>, Role)>,
-    mut req: Request,
-    next: Next,
-) -> Response {
-    match auth.verify(req.headers()).await {
+async fn authorize(State(gate): State<Gate>, mut req: Request, next: Next) -> Response {
+    let role = gate.route.role;
+    match gate.auth.verify(req.headers()).await {
         Ok(p) if p.role >= role => {
             req.extensions_mut().insert(p);
             next.run(req).await
         }
-        Ok(p) => body(
-            StatusCode::FORBIDDEN,
-            &json!({ "error": format!("this needs the {role} role; {} is {}", p.name, p.role) }),
-        ),
-        Err(Denied::Forbidden(why)) => body(StatusCode::FORBIDDEN, &json!({ "error": why })),
+        Ok(p) => {
+            let path = req.uri().path().to_owned();
+            actions::denied(&gate, &p.name, &p.role.to_string(), &path).await;
+            body(
+                StatusCode::FORBIDDEN,
+                &json!({ "error": format!("this needs the {role} role; {} is {}", p.name, p.role) }),
+            )
+        }
+        Err(Denied::Forbidden { name, why }) => {
+            let path = req.uri().path().to_owned();
+            actions::denied(&gate, &name, "none", &path).await;
+            body(StatusCode::FORBIDDEN, &json!({ "error": why }))
+        }
         Err(Denied::Unauthenticated { challenge, why }) => {
             let mut r = body(StatusCode::UNAUTHORIZED, &json!({ "error": why }));
             r.headers_mut().insert(
@@ -486,6 +576,7 @@ mod tests {
                 ("GET", "/v1/snapshots/{job_id}", Viewer),
                 ("POST", "/v1/cluster/leave", Admin),
                 ("POST", "/v1/admin/shutdown", Admin),
+                ("GET", "/v1/events", Viewer),
                 ("GET", "/v1/openapi.json", Viewer),
             ]
         );
@@ -497,7 +588,11 @@ mod tests {
     #[tokio::test]
     async fn every_route_turns_away_callers_below_its_role() {
         let idp = Issuer::start().await;
-        let addr = serve(api(Arc::new(Auth::new(&idp.api("roles"))))).await;
+        let addr = serve(api(Arc::new(Auth::new(
+            &idp.api("roles"),
+            crate::test_support::USERNAME_CLAIM,
+        ))))
+        .await;
         let callers = [
             ("viewer", Some(Role::Viewer)),
             ("operator", Some(Role::Operator)),

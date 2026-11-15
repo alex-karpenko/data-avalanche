@@ -140,6 +140,7 @@ impl Core {
             tuning: &self.tuning,
             evolution: self.settings.evolution,
             status: &self.status,
+            observer: &*self.observer,
         }
     }
 }
@@ -2750,6 +2751,15 @@ mod tests {
         let [apply] = &spans.named("schema.apply")[..] else {
             panic!("one apply")
         };
+        assert_eq!(
+            w.ears.evolved(),
+            [(
+                "public.a".to_owned(),
+                vec!["add column note (text)".to_owned()],
+                None
+            )],
+            "the owner hears the evolve"
+        );
         assert_eq!(apply.parent, None, "a trace of its own");
         for (field, value) in [
             ("pipeline", "p"),

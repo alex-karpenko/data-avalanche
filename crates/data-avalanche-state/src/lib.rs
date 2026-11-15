@@ -14,6 +14,8 @@
 //!   with a random key, establish the anchor, run the config crate's `check_cluster_anchor`,
 //!   adopt or bootstrap the config generation ([`ConfigGenerations::bootstrap_or_adopt`]), then
 //!   load its text with the anchor's key (`tests/startup.rs` runs the whole sequence).
+//! - [`Events`]: `events/<YYYY-MM-DD>/…json`, the cluster's events and audit trail, one document
+//!   per event, a day expiring whole (Admin_Console §6).
 //! - [`ConfigGenerations`]: `config/generation.json` (CAS pointer) and content-addressed
 //!   `config/snapshots/<NNNNNN>-<hash>.yaml` holding the raw config text. A starting node adopts
 //!   the current generation; the first one bootstraps generation 1 (Clustering §9.3).
@@ -33,6 +35,7 @@
 
 mod anchor;
 mod doc;
+mod events;
 mod generation;
 mod lease;
 mod lifecycle;
@@ -45,6 +48,10 @@ mod test_support;
 
 pub use anchor::{ANCHOR_KEY, Anchor, AnchorDoc, HashAlgo, establish_anchor};
 pub use doc::{DocStore, Document, MODIFY_ATTEMPTS, StateError, Versioned};
+pub use events::{
+    Actor, EVENTS_PREFIX, EventDoc, EventPage, EventQuery, EventSeverity, Events, MAX_EVENTS,
+    MAX_SCANNED, RECORD_ATTEMPTS, event_key,
+};
 pub use generation::{
     ConfigGeneration, ConfigGenerations, GENERATION_KEY, GenerationDoc, config_hash,
     config_snapshot_key,

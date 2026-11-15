@@ -9,6 +9,7 @@
 mod api;
 mod cluster;
 mod crashes;
+mod events;
 mod failover;
 mod forwarder;
 mod guards;

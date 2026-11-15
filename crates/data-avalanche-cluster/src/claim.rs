@@ -17,10 +17,14 @@ use crate::LeaseTiming;
 pub enum Claimed {
     /// This node holds the lease; `written` is when its write was sent (the renewer's first
     /// `last_renew_local`). `jumped`: the floor ([`Claim::at_least`]) set its epoch.
+    /// `taken_from`: the node whose live lease this one took over, after it went a full
+    /// `lease_duration` unrenewed (a failover); `None` for a free or given-back lease, or this
+    /// process's own earlier term.
     Mine {
         lease: Versioned<LeaseDoc>,
         written: Instant,
         jumped: bool,
+        taken_from: Option<String>,
     },
     /// Another holder has it. Unless it renews, a step at or after `takeover_at` takes it over.
     HeldBy {
@@ -97,6 +101,7 @@ impl Claim {
                     lease,
                     written: sent,
                     jumped: false,
+                    taken_from: None,
                 });
             }
             Acquired::HeldBy(seen) => seen,
@@ -126,6 +131,8 @@ impl Claim {
                 });
             }
         }
+        let taken_from =
+            (!seen.doc.is_held_by(&self.holder)).then(|| seen.doc.holder_node_id.clone());
         // The floor holds until a takeover lands: a failed write tries it again.
         let floor = self.floor;
         let proposed = seen.doc.owner_epoch.checked_add(1).map(|e| e.max(floor));
@@ -143,6 +150,7 @@ impl Claim {
                     lease,
                     written: sent,
                     jumped,
+                    taken_from,
                 })
             }
             // The holder renewed, or another challenger won: watch again.
@@ -170,6 +178,7 @@ impl Claim {
                             lease,
                             written: sent,
                             jumped,
+                            taken_from,
                         })
                     }
                     _ => Err(e),
@@ -237,6 +246,13 @@ mod tests {
         }
     }
 
+    fn taken_from(c: &Claimed) -> Option<&str> {
+        match c {
+            Claimed::Mine { taken_from, .. } => taken_from.as_deref(),
+            Claimed::HeldBy { .. } => panic!("{c:?}"),
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_free_lease_is_acquired_at_once() {
         let store = ScriptedStore::new();
@@ -248,7 +264,9 @@ mod tests {
         let store = ScriptedStore::new();
         let lease = acquired(&leases(&store), "a").await;
         release(&leases(&store), &lease).await.unwrap();
-        assert_eq!(epoch(&claim(&store, "b").step().await.unwrap()), 2);
+        let mine = claim(&store, "b").step().await.unwrap();
+        assert_eq!(epoch(&mine), 2);
+        assert_eq!(taken_from(&mine), None, "given back, not taken");
     }
 
     #[tokio::test(start_paused = true)]
@@ -289,6 +307,11 @@ mod tests {
         advance(10).await;
         let mine = b.step().await.unwrap();
         assert_eq!(epoch(&mine), 2);
+        assert_eq!(
+            taken_from(&mine),
+            Some("a"),
+            "a failover names whom it took over from"
+        );
         let stored = leases(&store).observe("p").await.unwrap().unwrap();
         assert!(stored.doc.is_held_by(&holder("b")));
     }

@@ -1,9 +1,10 @@
 //! §13.3 value domain. Enumerations are checked by coercion (each enum carries its V-rule, see
 //! `crate::enums`); this module checks ranges, reserved values and the v1 rejections.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
-use super::pipeline_at;
+use super::{missing, pipeline_at};
 use crate::coerce::LeafType;
 use crate::ctx::{At, Ctx, is_templated, shown, shown_value};
 use crate::enums::*;
@@ -227,36 +228,11 @@ fn globals(g: &RawGlobals, ctx: &mut Ctx) {
             format!("sample_ratio must be 0..=1, got {}", shown_value(l, &r)),
         );
     }
-    // V-126: a header HTTP takes. The value isn't echoed: it is a secret.
     if let Some(headers) = g.tracing.as_ref().and_then(|t| t.headers.as_ref()) {
-        let at = root.key("tracing").key("headers");
-        for (name, leaf) in headers {
-            let token = !name.is_empty()
-                && name
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b));
-            if !token {
-                ctx.error(
-                    "V-126",
-                    &at.key(name),
-                    leaf.loc(),
-                    format!("header name {name:?} isn't an HTTP token"),
-                );
-                continue;
-            }
-            if let Some(value) = ctx.text(leaf, &at.key(name))
-                && !value
-                    .bytes()
-                    .all(|b| b == b'\t' || (b' '..=b'~').contains(&b))
-            {
-                ctx.error(
-                    "V-126",
-                    &at.key(name),
-                    leaf.loc(),
-                    format!("header {name}'s value holds a control or non-ASCII character"),
-                );
-            }
-        }
+        http_headers(ctx, headers, &root.key("tracing").key("headers"));
+    }
+    if let Some(c) = &g.console {
+        console(c, &root.key("console"), ctx);
     }
     // V-101
     if let Some(a) = &g.azure
@@ -611,5 +587,194 @@ fn catalog(c: &RawCatalog, at: &At, ctx: &mut Ctx, cross_field: bool) {
         && let Some((RestAuth::Sigv4, loc)) = val(ctx, &r.auth, &at.key("rest").key("auth"))
     {
         ctx.error("V-116", &at.key("rest").key("auth"), loc, "rest auth sigv4 is rejected: the pinned iceberg-rust REST client has no SigV4 signing (DA-CAT-7); on AWS use catalog.glue");
+    }
+}
+
+/// V-126: a header HTTP takes. The value isn't echoed: it is a secret.
+fn http_headers(ctx: &mut Ctx, headers: &BTreeMap<String, Leaf<String>>, at: &At) {
+    for (name, leaf) in headers {
+        let token = !name.is_empty()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b));
+        if !token {
+            ctx.error(
+                "V-126",
+                &at.key(name),
+                leaf.loc(),
+                format!("header name {name:?} isn't an HTTP token"),
+            );
+            continue;
+        }
+        if let Some(value) = ctx.text(leaf, &at.key(name))
+            && !value
+                .bytes()
+                .all(|b| b == b'\t' || (b' '..=b'~').contains(&b))
+        {
+            ctx.error(
+                "V-126",
+                &at.key(name),
+                leaf.loc(),
+                format!("header {name}'s value holds a control or non-ASCII character"),
+            );
+        }
+    }
+}
+
+/// Whether `text` is an absolute `http`/`https` URL with a host.
+fn http_url(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"));
+    rest.is_some_and(|r| {
+        let host = r.split(['/', '?', '#']).next().unwrap_or("");
+        !host.is_empty() && !host.contains(char::is_whitespace)
+    })
+}
+
+/// §6.8: V-128…V-132, and V-126 on the Prometheus headers. URLs aren't echoed: they may come
+/// from a variable.
+fn console(c: &RawConsole, at: &At, ctx: &mut Ctx) {
+    // V-128
+    if let Some(l) = &c.session_key
+        && let Some(key) = ctx.text(l, &at.key("session_key"))
+        && key.len() < 32
+    {
+        ctx.error(
+            "V-128",
+            &at.key("session_key"),
+            l.loc(),
+            format!(
+                "session_key holds {} bytes; it needs at least 32",
+                key.len()
+            ),
+        );
+    }
+    // V-129
+    if let Some(l) = &c.public_url
+        && let Some(url) = ctx.text(l, &at.key("public_url"))
+        && (!http_url(url.trim()) || url.contains(['?', '#']))
+    {
+        ctx.error(
+            "V-129",
+            &at.key("public_url"),
+            l.loc(),
+            "public_url must be an absolute http or https URL without a query or a fragment",
+        );
+    }
+    // V-132
+    let range =
+        |ctx: &mut Ctx, leaf: &Option<Leaf<Duration>>, at: &At, low: u64, high: u64, what: &str| {
+            if let Some((d, loc)) = val(ctx, leaf, at)
+                && !(Duration::from_secs(low)..=Duration::from_secs(high)).contains(&d)
+            {
+                ctx.error(
+                    "V-132",
+                    at,
+                    loc,
+                    format!(
+                        "{what} must be {} to {}, got {}",
+                        crate::units::format_duration(Duration::from_secs(low)),
+                        crate::units::format_duration(Duration::from_secs(high)),
+                        crate::units::format_duration(d)
+                    ),
+                );
+            }
+        };
+    const HOUR: u64 = 3600;
+    const DAY: u64 = 24 * HOUR;
+    range(
+        ctx,
+        &c.session_ttl,
+        &at.key("session_ttl"),
+        5 * 60,
+        7 * DAY,
+        "session_ttl",
+    );
+    if let Some(h) = &c.history {
+        range(
+            ctx,
+            &h.retention,
+            &at.key("history").key("retention"),
+            HOUR,
+            30 * DAY,
+            "history.retention",
+        );
+    }
+    if let Some(e) = &c.events {
+        range(
+            ctx,
+            &e.retention,
+            &at.key("events").key("retention"),
+            DAY,
+            400 * DAY,
+            "events.retention",
+        );
+    }
+    let Some(p) = &c.prometheus else {
+        return;
+    };
+    let p_at = at.key("prometheus");
+    // V-137
+    let url_missing = missing(ctx, &p.url, &p_at.key("url"));
+    if url_missing {
+        ctx.error("V-137", &p_at.key("url"), None, "prometheus needs url");
+    }
+    if let Some(b) = &p.basic {
+        let b_at = p_at.key("basic");
+        for (key, leaf) in [("user", &b.user), ("password", &b.password)] {
+            if missing(ctx, leaf, &b_at.key(key)) {
+                ctx.error(
+                    "V-137",
+                    &b_at.key(key),
+                    None,
+                    format!("prometheus.basic needs {key}"),
+                );
+            }
+        }
+    }
+    // V-130
+    if !url_missing
+        && let Some(l) = &p.url
+        && let Some(url) = ctx.text(l, &p_at.key("url"))
+        && !http_url(url.trim())
+    {
+        ctx.error(
+            "V-130",
+            &p_at.key("url"),
+            l.loc(),
+            "prometheus.url must be an absolute http or https URL",
+        );
+    }
+    // V-131
+    if p.basic.is_some() && p.bearer_token.is_some() {
+        ctx.error(
+            "V-131",
+            &p_at,
+            p.bearer_token.as_ref().and_then(|l| l.loc()),
+            "prometheus takes basic or bearer_token, not both",
+        );
+    }
+    for (name, leaf) in p.extra_labels.iter().flatten() {
+        let mut bytes = name.bytes();
+        let label = bytes
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+            && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            && !name.starts_with("__");
+        if !label {
+            ctx.error(
+                "V-131",
+                &p_at.key("extra_labels").key(name),
+                leaf.loc(),
+                format!(
+                    "extra_labels key {name:?} isn't a Prometheus label name (or starts with __)"
+                ),
+            );
+        }
+    }
+    if let Some(headers) = &p.headers {
+        http_headers(ctx, headers, &p_at.key("headers"));
     }
 }

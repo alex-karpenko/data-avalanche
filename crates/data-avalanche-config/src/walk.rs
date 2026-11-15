@@ -238,7 +238,8 @@ walk_fields!(RawGlobals {
     log,
     cluster,
     tracing,
-    azure
+    azure,
+    console
 });
 walk_fields!(RawGlobalState { bucket, prefix });
 walk_fields!(RawApi {
@@ -263,7 +264,11 @@ walk_fields!(RawApiOauth2 {
     audience,
     jwks_url,
     discovery_url,
-    roles_claim
+    roles_claim,
+    client_id,
+    client_secret,
+    scopes,
+    idp_name
 });
 walk_fields!(RawApiTls { enabled, cert, key });
 walk_fields!(RawLog { level, format });
@@ -301,6 +306,28 @@ walk_fields!(RawTracing {
     headers
 });
 walk_fields!(RawAzure { account_name });
+walk_fields!(RawConsole {
+    enabled,
+    session_key,
+    public_url,
+    session_ttl,
+    username_claim,
+    history,
+    events,
+    prometheus
+});
+walk_fields!(RawRetention { retention });
+walk_fields!(RawPrometheus {
+    url,
+    basic,
+    bearer_token,
+    headers,
+    tls,
+    extra_labels,
+    timeout
+});
+walk_fields!(RawBasic { user, password });
+walk_fields!(RawCa { ca });
 
 // `pipelines`/`defaults` (§7, §9): the three union types have a hand-written `Merge` (config §8.4)
 // and so never went through `merge_struct!`; `RawPartitionField` is never merged as a struct at

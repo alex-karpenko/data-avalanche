@@ -16,8 +16,8 @@ use data_avalanche_config::{
 };
 use data_avalanche_core::TableRef;
 use data_avalanche_state::{
-    ConfigGeneration, ConfigGenerations, GENERATION_KEY, GenerationDoc, PipelineDocs, RemovalDoc,
-    Removals, StateError, Versioned, config_hash,
+    ConfigGeneration, ConfigGenerations, EventSeverity, GENERATION_KEY, GenerationDoc,
+    PipelineDocs, RemovalDoc, Removals, StateError, Versioned, config_hash,
 };
 use data_avalanche_telemetry::Metrics;
 use thiserror::Error;
@@ -26,7 +26,7 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use crate::{
-    Advertiser, Configured, CurrentPipeline, Members, PipelineReload, Reload, Reloader,
+    Advertiser, Configured, CurrentPipeline, Members, PipelineReload, Recorder, Reload, Reloader,
     RemovedPipelines, ResolveError, Resolved, WorkerFactory,
 };
 
@@ -59,6 +59,8 @@ pub struct CoordinatorDeps {
     /// What a generation's globals change outside the cluster: the binary's log filter and the
     /// API's auth.
     pub globals: Arc<dyn Fn(&Globals) + Send + Sync>,
+    /// Where a publish, and a generation this node can't apply, are recorded (Admin_Console §6).
+    pub recorder: Recorder,
 }
 
 impl Debug for CoordinatorDeps {
@@ -284,6 +286,17 @@ impl ConfigCoordinator {
                 Ok(published) => {
                     let generation = published.pointer.doc.generation;
                     tracing::info!(generation, "published config generation {generation}");
+                    let mut e = d.recorder.event(
+                        "config.published",
+                        EventSeverity::Info,
+                        format!(
+                            "config generation {generation} published by {}: {}",
+                            d.node_id,
+                            summary(&changes)
+                        ),
+                    );
+                    e.object = Some(generation.to_string());
+                    d.recorder.record(e);
                     self.inner.adopt(&mut running, published).await;
                     return Ok(Reloaded {
                         generation,
@@ -410,6 +423,16 @@ impl Inner {
                     "config generation {n} can't be applied on this node, which runs {}: {why}",
                     running.generation.doc.generation
                 );
+                let mut e = d.recorder.event(
+                    "config.refused",
+                    EventSeverity::Error,
+                    format!(
+                        "{} can't apply config generation {n}, and runs {}: {why}",
+                        d.node_id, running.generation.doc.generation
+                    ),
+                );
+                e.object = Some(n.to_string());
+                d.recorder.record(e);
             }
             running.failed = Some(n);
         };
@@ -834,9 +857,37 @@ mod tests {
         metrics: Metrics,
         members: watch::Sender<Members>,
         globals: Arc<StdMutex<Vec<Globals>>>,
+        /// The timeline, in a store of its own.
+        events: Arc<data_avalanche_state::Events>,
     }
 
     const POLL: Duration = Duration::from_secs(2);
+
+    impl Lone {
+        /// The events' kinds and objects once `n` are written (on the test clock).
+        async fn recorded(&self, n: usize) -> Vec<(String, Option<String>, String)> {
+            for _ in 0..100 {
+                let page = self
+                    .events
+                    .list(&data_avalanche_state::EventQuery {
+                        limit: 1000,
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                if page.events.len() >= n {
+                    return page
+                        .events
+                        .into_iter()
+                        .rev()
+                        .map(|(_, e)| (e.kind, e.object, e.text))
+                        .collect();
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            panic!("fewer than {n} events");
+        }
+    }
 
     /// [`start`] on `config_text(ids)`, an empty environment and `globals.state` in memory.
     async fn lone(ids: &[&str]) -> Lone {
@@ -878,6 +929,15 @@ mod tests {
         let metrics = Metrics::new();
         let globals = Arc::new(StdMutex::new(Vec::new()));
         let seen = Arc::clone(&globals);
+        let events = Arc::new(data_avalanche_state::Events::new(
+            data_avalanche_state::DocStore::new(Arc::new(
+                data_avalanche_storage::ObjectStoreVersioned::new(
+                    Arc::new(object_store::memory::InMemory::new()),
+                    "state",
+                )
+                .unwrap(),
+            )),
+        ));
         let deps = CoordinatorDeps {
             generations: generations.clone(),
             removals: removals.clone(),
@@ -890,6 +950,7 @@ mod tests {
             advertiser: gossip.advertiser(),
             metrics: metrics.clone(),
             globals: Arc::new(move |g| seen.lock().unwrap().push(g.clone())),
+            recorder: Recorder::start(Arc::clone(&events), "n1", Metrics::new()).0,
         };
         let (members_tx, members_rx) =
             watch::channel(members("n1", &[("n1", Phase::Active, false)]));
@@ -904,6 +965,7 @@ mod tests {
             metrics,
             members: members_tx,
             globals,
+            events,
         }
     }
 
@@ -1163,6 +1225,17 @@ mod tests {
             Some(LogFilter("debug".into()))
         );
         assert_eq!(n.coordinator.applied(), 2);
+        let [(kind, object, text)] = &n.recorded(1).await[..] else {
+            panic!("one event")
+        };
+        assert_eq!(
+            (kind.as_str(), object.as_deref()),
+            ("config.published", Some("2"))
+        );
+        assert!(
+            text.starts_with("config generation 2 published by n1: "),
+            "{text}"
+        );
     }
 
     /// The file as the cluster runs it already: nothing is published.
@@ -1307,6 +1380,19 @@ mod tests {
         assert_eq!(n.publish_elsewhere(&unset).await, 2);
         tokio::time::sleep(POLL * 3).await;
         assert_eq!(n.coordinator.applied(), 1);
+        let refused = n.recorded(1).await;
+        assert_eq!(refused.len(), 1, "once, though polled again: {refused:?}");
+        assert_eq!(
+            (refused[0].0.as_str(), refused[0].1.as_deref()),
+            ("config.refused", Some("2"))
+        );
+        assert!(
+            refused[0]
+                .2
+                .starts_with("n1 can't apply config generation 2, and runs 1: "),
+            "{}",
+            refused[0].2
+        );
         assert!(n.reloads.try_recv().is_err(), "nothing applied");
         assert_eq!(n.gossiped(), 1);
         assert_eq!(n.publish_elsewhere(&config_text(&["p", "q"])).await, 3);
