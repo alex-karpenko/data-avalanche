@@ -11,8 +11,12 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+mod process;
 mod traces;
 
+pub use process::{
+    PROCESS_SAMPLE, ProcessFigures, Reading, read_process, read_process_at, sample_process,
+};
 pub use traces::{Traces, TracesError, shown, trace_ids};
 
 use prometheus_client::encoding::text::encode;
@@ -233,6 +237,12 @@ struct Families {
     events_dropped: Counter,
     gossip_probe_rtt: Histogram,
     gossip_suspicions: Family<Labels, Counter>,
+    process_resident_memory: Gauge,
+    process_cpu_seconds: Counter<f64, AtomicU64>,
+    /// The CPU seconds counted so far: a reading adds what is new.
+    process_cpu_counted: Mutex<f64>,
+    process_memory_limit: Family<Labels, Gauge>,
+    process_cpu_limit: Family<Labels, Seconds>,
     wal_lag_bytes: Family<Labels, Gauge>,
     source_reconnects: Family<Labels, Counter>,
     snapshot_rows_done: Family<Labels, Gauge>,
@@ -303,6 +313,11 @@ impl Metrics {
             events_dropped: Counter::default(),
             gossip_probe_rtt: probe_rtt(),
             gossip_suspicions: Family::default(),
+            process_resident_memory: Gauge::default(),
+            process_cpu_seconds: Counter::default(),
+            process_cpu_counted: Mutex::new(0.0),
+            process_memory_limit: Family::default(),
+            process_cpu_limit: Family::default(),
             wal_lag_bytes: Family::default(),
             source_reconnects: Family::default(),
             snapshot_rows_done: Family::default(),
@@ -325,7 +340,30 @@ impl Metrics {
             sink_soft_dropped_columns: Family::default(),
         };
         let f = &families;
-        let mut r = Registry::with_prefix("data_avalanche");
+        // The process figures carry the names every Prometheus client gives them; the rest are
+        // the node's own, under the prefix.
+        let mut root = Registry::default();
+        root.register(
+            "process_resident_memory_bytes",
+            "Resident memory of the process",
+            f.process_resident_memory.clone(),
+        );
+        root.register(
+            "process_cpu_seconds",
+            "User and system CPU time the process used",
+            f.process_cpu_seconds.clone(),
+        );
+        let r = root.sub_registry_with_prefix("data_avalanche");
+        r.register(
+            "process_memory_limit_bytes",
+            "The container's memory limit, when it has one",
+            f.process_memory_limit.clone(),
+        );
+        r.register(
+            "process_cpu_limit_cores",
+            "The container's CPU limit in cores, when it has one",
+            f.process_cpu_limit.clone(),
+        );
         r.register(
             "pipeline_status",
             "The pipeline's state: 1 on its current status",
@@ -483,7 +521,7 @@ impl Metrics {
             f.sink_soft_dropped_columns.clone(),
         );
         Self {
-            registry: Arc::new(r),
+            registry: Arc::new(root),
             families: Arc::new(families),
         }
     }
@@ -516,6 +554,39 @@ impl Metrics {
     /// An event not written: its queue was full, or the store kept failing.
     pub fn event_dropped(&self) {
         self.families.events_dropped.inc();
+    }
+
+    /// A reading of the process figures (D-M13b.7). A limit the container doesn't have is no
+    /// series at all.
+    pub fn process(&self, r: &Reading) {
+        let f = &self.families;
+        if let Some(bytes) = r.memory_bytes {
+            f.process_resident_memory.set(gauge(bytes));
+        }
+        if let Some(seconds) = r.cpu_seconds {
+            let mut counted = f
+                .process_cpu_counted
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if seconds > *counted {
+                f.process_cpu_seconds.inc_by(seconds - *counted);
+                *counted = seconds;
+            }
+        }
+        match r.memory_limit_bytes {
+            Some(bytes) => {
+                f.process_memory_limit
+                    .get_or_create(&vec![])
+                    .set(gauge(bytes));
+            }
+            None => f.process_memory_limit.clear(),
+        }
+        match r.cpu_limit_cores {
+            Some(cores) => {
+                f.process_cpu_limit.get_or_create(&vec![]).set(cores);
+            }
+            None => f.process_cpu_limit.clear(),
+        }
     }
 
     /// A gossip probe's round trip.

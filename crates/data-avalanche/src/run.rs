@@ -20,7 +20,7 @@ use data_avalanche_config::{
 };
 use data_avalanche_pipeline::{Backoff, Tuning};
 use data_avalanche_state::{ConfigGenerations, Events, Leases, Removals};
-use data_avalanche_telemetry::Metrics;
+use data_avalanche_telemetry::{Metrics, ProcessFigures, sample_process};
 use thiserror::Error;
 use tokio::sync::{Semaphore, oneshot, watch};
 
@@ -118,6 +118,9 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     }
     // The listener answers from here: live at once, ready once every controller runs.
     let metrics = Metrics::new();
+    // The process's memory and CPU every 15 s, for /metrics and the node's page (D-M13b.7).
+    let (sampled, _process) = watch::channel(ProcessFigures::default());
+    let _sampler = tokio::spawn(sample_process(metrics.clone(), sampled));
     let ready = Arc::new(AtomicBool::new(false));
     let node = Arc::new(OnceLock::new());
     let api = &first.config.globals.api;
