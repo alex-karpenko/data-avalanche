@@ -211,6 +211,8 @@ struct Families {
     cluster_members: Gauge,
     config_generation: Gauge,
     ring_generation: Gauge,
+    events_written: Counter,
+    events_dropped: Counter,
     wal_lag_bytes: Family<Labels, Gauge>,
     source_reconnects: Family<Labels, Counter>,
     snapshot_rows_done: Family<Labels, Gauge>,
@@ -272,6 +274,8 @@ impl Metrics {
             cluster_members: Gauge::default(),
             config_generation: Gauge::default(),
             ring_generation: Gauge::default(),
+            events_written: Counter::default(),
+            events_dropped: Counter::default(),
             wal_lag_bytes: Family::default(),
             source_reconnects: Family::default(),
             snapshot_rows_done: Family::default(),
@@ -324,6 +328,16 @@ impl Metrics {
             "cluster_members",
             "Members of the cluster this node sees",
             f.cluster_members.clone(),
+        );
+        r.register(
+            "events_written",
+            "Events this node wrote to the cluster's timeline",
+            f.events_written.clone(),
+        );
+        r.register(
+            "events_dropped",
+            "Events this node couldn't write: its queue was full, or the store kept failing",
+            f.events_dropped.clone(),
         );
         r.register(
             "config_generation",
@@ -455,6 +469,16 @@ impl Metrics {
 
     pub fn set_config_generation(&self, generation: u64) {
         self.families.config_generation.set(gauge(generation));
+    }
+
+    /// An event written to the cluster's timeline.
+    pub fn event_written(&self) {
+        self.families.events_written.inc();
+    }
+
+    /// An event not written: its queue was full, or the store kept failing.
+    pub fn event_dropped(&self) {
+        self.families.events_dropped.inc();
     }
 
     pub fn set_ring_generation(&self, generation: u64) {

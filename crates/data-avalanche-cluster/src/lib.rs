@@ -10,6 +10,7 @@ pub mod controller;
 pub mod coordinator;
 pub mod discovery;
 mod error;
+pub mod events;
 pub mod gossip;
 mod jobs;
 pub mod lease;
@@ -33,6 +34,7 @@ pub use coordinator::{
 };
 pub use discovery::{Seeds, advertise, discover, interfaces};
 pub use error::ClusterError;
+pub use events::{EVENT_QUEUE, PRUNE_EVERY, Recorder, WRITE_RETRIES, expire_events};
 pub use gossip::{
     Advertiser, Announcer, Gossip, GossipSettings, Member, Members, NodeIdentity, NodeMeta, Phase,
 };
