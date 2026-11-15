@@ -7708,10 +7708,10 @@ index 1a6e8c6..6251474 100644
 
 ````diff
 diff --git a/crates/data-avalanche-config/src/mask.rs b/crates/data-avalanche-config/src/mask.rs
-index 1ec3a6d..cd52bb5 100644
+index 31f600b..23e0563 100644
 --- a/crates/data-avalanche-config/src/mask.rs
 +++ b/crates/data-avalanche-config/src/mask.rs
-@@ -387,6 +509,75 @@ pipelines:
+@@ -423,6 +423,75 @@ pipelines:
          assert!(!b.contains("second-secret"));
      }
  
@@ -8331,12 +8331,12 @@ index fff7c1a..98c140c 100644
 
 ````diff
 diff --git a/crates/data-avalanche-config/src/mask.rs b/crates/data-avalanche-config/src/mask.rs
-index 1ec3a6d..cd52bb5 100644
+index 23e0563..3b59046 100644
 --- a/crates/data-avalanche-config/src/mask.rs
 +++ b/crates/data-avalanche-config/src/mask.rs
-@@ -10,9 +10,15 @@
- //! secret's text that is also written as another key's value (a `user` that is the `password`)
- //! stays shown there: only the secret keys are masked.
+@@ -13,9 +13,15 @@
+ //! directive isn't shown ([`MaskError::MergeKey`]): a key that overrides or retags a value would
+ //! hide the secret the masker reads.
  
 +use std::collections::{BTreeMap, BTreeSet};
 +
@@ -8350,7 +8350,7 @@ index 1ec3a6d..cd52bb5 100644
  use crate::parse::parse_document;
  use crate::raw::RawConfig;
  use crate::secret::{FingerprintKey, fingerprint};
-@@ -90,6 +96,122 @@ pub fn mask_secrets(text: &str, key: &FingerprintKey) -> Result<String, MaskErro
+@@ -98,6 +104,122 @@ pub fn mask_secrets(text: &str, key: &FingerprintKey) -> Result<String, MaskErro
      Ok(out)
  }
  
@@ -9173,3 +9173,21 @@ tasks' blocks applied on top unchanged.
   Linux, or before the first sample) exposed them as `0`, which Review Focus 5 rules out. Both are
   now created with the first reading, as the limit series are; `no_reading_exposes_no_process_series`
   pins it. The workspace total is one higher than the plan's.
+- **Task 6** (four fix rounds, `59a9282`, `87b01a7`, `9f3bee1`, `9d5cad2`; two Critical in its
+  review): the plan's masker showed two kinds of secret in clear. (1) A secret written with a
+  reference and something more, `${DB_PASS:-hunter2}` or `hunter2-${SUFFIX}`, was kept as
+  written: `literal` now keeps only exactly one bare `${NAME}`, and masks anything else as a
+  literal (its text fingerprinted); Task 7's `flatten` uses the same `literal`. (2) A secret in a
+  YAML merge (`<<`) that a local key overrides never reaches the model, so neither the masking
+  nor the re-parse check saw it. A text the masker can't vouch for is refused instead
+  (`MaskError::MergeKey`, 500): one containing `<<`, a `%` directive line, a tag on a node (a `!`
+  after a line start, whitespace or `[{,:?-`), or a byte-order mark. The rounds narrowed this
+  from a merge-key line shape, which a tag, an anchor, an explicit key, an escaped `"\x3c\x3c"`
+  with a `%`-escaped or `%TAG` merge tag, and finally a BOM each got past; the last re-review
+  checked the rule's premises against serde-saphyr 2.1.1 and granit-parser 2.1.0's source (only
+  a plain `<<` or a merge tag merges; their separators are space, tab, CR, LF, NUL, and a BOM is
+  the only other character skipped) and probed each shape. An inline `key`/`ssl_key` is a secret
+  when `-----BEGIN` appears anywhere in it (a `Bag Attributes` header first). The over-match, a
+  generation with a ` !` or a `<<` in a comment or a literal, isn't shown; it fails closed.
+  Task 7's two `mask.rs` blocks are re-based on the new file (context lines only; their `+`/`-`
+  lines are unchanged, and the rest of Task 7 applies as written).
