@@ -124,8 +124,8 @@ impl std::fmt::Debug for Joined {
 }
 
 /// The per-node keys (config §6.5.1) whose value in this node's file isn't the generation's,
-/// each with the one the node takes: its name and its API address are the file's, its gossip's
-/// addresses the generation's (DA-OPS-8).
+/// each with the one the node takes: its name, its API address and the URL it gossips for it are
+/// the file's, its gossip's addresses the generation's (DA-OPS-8).
 pub(crate) fn per_node(file: &ResolvedConfig, generation: &ResolvedConfig) -> Vec<String> {
     let (f, g) = (
         &file.globals.cluster.memberlist,
@@ -161,6 +161,9 @@ pub(crate) fn per_node(file: &ResolvedConfig, generation: &ResolvedConfig) -> Ve
         .collect();
     if file.globals.api.address != generation.globals.api.address {
         out.push("globals.api.address (the file's)".to_owned());
+    }
+    if file.globals.api.advertise_url != generation.globals.api.advertise_url {
+        out.push("globals.api.advertise_url (the file's)".to_owned());
     }
     out
 }
@@ -333,6 +336,7 @@ mod tests {
         file.globals.cluster.memberlist.node_name = Some("node-b".into());
         file.globals.cluster.memberlist.bind_port = 7947;
         file.globals.api.address.port = 8081;
+        file.globals.api.advertise_url = Some("https://node-b.cdc.ns.svc:8081".into());
         file.globals.cluster.drain_timeout = Duration::from_secs(1);
         assert_eq!(
             per_node(&file, &generation),
@@ -340,6 +344,7 @@ mod tests {
                 "globals.cluster.memberlist.node_name (the file's)",
                 "globals.cluster.memberlist.bind_port (the generation's)",
                 "globals.api.address (the file's)",
+                "globals.api.advertise_url (the file's)",
             ]
         );
     }

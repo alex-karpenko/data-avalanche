@@ -1,7 +1,7 @@
 //! `data-avalanche run`.
 
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -89,6 +89,23 @@ pub(crate) fn leave_within(config: &ResolvedConfig) -> Duration {
     let pipelines = u32::try_from(config.pipelines.len()).unwrap_or(u32::MAX);
     let rounds = pipelines.div_ceil(c.max_concurrent_handoffs.max(1));
     c.drain_timeout.saturating_mul(rounds) + 2 * c.lease_renewal_interval
+}
+
+/// Where this node's API is, as the others reach it (D-M13b.2), and the client it asks theirs
+/// with (D-M13b.4): both from its file's `globals.api`, which its listener binds, never the
+/// generation's. `address`, `advertise_url` and `tls` are per node (config §6.5.1): a generation
+/// published from another node's file names that node's.
+///
+/// # Errors
+/// [`Fatal::Config`]: the file's API certificate can't be a peer's trust.
+pub(crate) fn own_api(
+    file: &ResolvedConfig,
+    node_id: &str,
+    gossip: IpAddr,
+) -> Result<(String, Peers), Fatal> {
+    let api = &file.globals.api;
+    let peers = Peers::new(node_id, api.tls.as_ref()).map_err(|e| Fatal::Config(e.to_string()))?;
+    Ok((api_url(api, gossip), peers))
 }
 
 /// How long a clean stop waits for the events still queued to be written (a crash loses them).
@@ -208,6 +225,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         .map_err(|e| Fatal::Config(e.to_string()))?;
     let mut own = udp.local_addrs();
     own.push(addr);
+    let (advertised, peers) = own_api(&first.config, &deps.holder.node_id, addr.ip())?;
     let me = NodeIdentity {
         node_id: deps.holder.node_id.clone(),
         incarnation: deps.holder.incarnation,
@@ -217,7 +235,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
             phase: Phase::Joining,
             config_generation: joined.generation.doc.generation,
             build: env!("CARGO_PKG_VERSION").to_owned(),
-            api_url: api_url(&config.globals.api, addr.ip()),
+            api_url: advertised,
             file_hash: file_hash(&fingerprints, &text),
         },
     };
@@ -272,9 +290,6 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         c.lease_renewal_interval,
     ));
     let (control, asked) = Control::new();
-    // Another node's detail and actions, asked with the caller's own credentials (D-M13b.4).
-    let peers = Peers::new(deps.holder.node_id.clone(), config.globals.api.tls.as_ref())
-        .map_err(Fatal::Config)?;
     let _ = node.set(Node {
         coordinator: Arc::clone(&coordinator),
         members: gossip.members(),
@@ -286,6 +301,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         recorder: recorder.clone(),
         denials: Arc::new(RateLimit::denials()),
         events: Arc::clone(&events),
+        // Another node's detail and actions, asked with the caller's own credentials (D-M13b.4).
         peers,
         process,
         gossip: gossip.figures(),
@@ -436,6 +452,20 @@ pipelines:
         )
         .unwrap_or_else(|r| panic!("{}", render(&r)))
         .config
+    }
+
+    /// The API a node gossips is its file's, which its listener binds: a generation published
+    /// from another node's file names that node's address (config §6.5.1).
+    #[test]
+    fn the_api_a_node_gossips_is_its_file_s() {
+        let gossip: IpAddr = "10.0.0.2".parse().unwrap();
+        let mut file = config();
+        file.globals.api.address = "0.0.0.0:8081".parse().unwrap();
+        let (url, _) = own_api(&file, "node-b", gossip).unwrap();
+        assert_eq!(url, "http://10.0.0.2:8081");
+        file.globals.api.advertise_url = Some("https://node-b.cdc.ns.svc:8443".into());
+        let (url, _) = own_api(&file, "node-b", gossip).unwrap();
+        assert_eq!(url, "https://node-b.cdc.ns.svc:8443");
     }
 
     #[test]
