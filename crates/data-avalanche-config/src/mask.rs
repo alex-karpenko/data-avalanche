@@ -9,9 +9,9 @@
 //! The masked text is parsed again and checked before it is returned: every secret is then a
 //! mask or a reference. A text that fails the check isn't shown at all ([`MaskError`]). A
 //! secret's text that is also written as another key's value (a `user` that is the `password`)
-//! stays shown there: only the secret keys are masked. A text containing `<<` or a merge tag isn't
-//! shown ([`MaskError::MergeKey`]): a key that overrides a merged value would hide the secret
-//! the masker reads.
+//! stays shown there: only the secret keys are masked. A text with a merge key (`<<`), a tag or a
+//! directive isn't shown ([`MaskError::MergeKey`]): a key that overrides or retags a value would
+//! hide the secret the masker reads.
 
 use thiserror::Error;
 
@@ -61,7 +61,7 @@ pub enum MaskError {
     Unplaced(String),
     #[error("the secret at {0} is still readable after masking")]
     Leaked(String),
-    #[error("the text uses a YAML merge key (<<), whose overridden values can't be masked")]
+    #[error("the text uses a YAML merge key, a tag or a directive, which can't be masked safely")]
     MergeKey,
 }
 
@@ -71,7 +71,7 @@ pub enum MaskError {
 /// [`MaskError`]: the text isn't shown.
 pub fn mask_secrets(text: &str, key: &FingerprintKey) -> Result<String, MaskError> {
     let secrets = secrets(text)?;
-    if has_merge_key(text) {
+    if unmaskable(text) {
         return Err(MaskError::MergeKey);
     }
     let mut edits: Vec<(usize, usize, String)> = vec![];
@@ -120,13 +120,21 @@ fn literal(text: &str) -> Option<String> {
     }
 }
 
-/// Whether `text` can merge a mapping: it contains `<<` (a merge key, whatever is around it),
-/// `!!merge`, or the merge tag `tag:yaml.org,2002:merge` (a tag can make another scalar a merge
-/// key). Over-matching, a `<<` in a comment or a literal, fails closed.
-fn has_merge_key(text: &str) -> bool {
-    ["<<", "!!merge", "tag:yaml.org,2002:merge"]
-        .iter()
-        .any(|marker| text.contains(marker))
+/// Whether `text` can merge or retag a value the masker reads as written: it contains `<<` (a
+/// merge key, whatever is around it), a line starting with `%` (a directive), or a `!` that
+/// starts a tag on a node (after the start of a line, whitespace, or one of `[ { , : ? -`). A
+/// tag can make any scalar a merge key, and the spellings of a tag are many. Over-matching, a
+/// `!` after a space in a quoted literal or a comment, fails closed.
+fn unmaskable(text: &str) -> bool {
+    text.contains("<<")
+        || text.lines().any(|line| line.starts_with('%'))
+        || text.char_indices().any(|(at, c)| {
+            c == '!'
+                && text[..at]
+                    .chars()
+                    .last()
+                    .is_none_or(|p| p.is_whitespace() || "[{,:?-".contains(p))
+        })
 }
 
 /// Every secret leaf written in `text`.
@@ -446,9 +454,10 @@ pipelines:
         assert_eq!(mask_secrets(text, &key()).unwrap(), text);
     }
 
-    /// A merge key can override a merged secret the masker never sees: the text isn't shown.
+    /// A merge key, a tag or a directive can merge or retag a value the masker never sees: the
+    /// text isn't shown.
     #[test]
-    fn a_merge_key_is_refused() {
+    fn a_merge_key_tag_or_directive_is_refused() {
         let text = "config_version: 1\npipelines:\n  p:\n    source:\n      <<: { password: hunter2 }\n      password: ${X}\n";
         assert_eq!(mask_secrets(text, &key()), Err(MaskError::MergeKey));
         let flow = "config_version: 1\nglobals:\n  api: &s { user: u }\npipelines:\n  p:\n    source: { <<: *s, password: x }\n";
@@ -457,6 +466,9 @@ pipelines:
             "      !!merge <<: { password: hunter2 }\n      password: ${X}\n",
             "      &k <<: { password: hunter2 }\n      password: ${X}\n",
             "      ? <<\n      : { password: hunter2 }\n      password: ${X}\n",
+            "      !!m%65rge \"\\x3c\\x3c\": { password: hunter2 }\n      password: ${X}\n",
+            "      !<tag:yaml.org,2002:%6Derge> \"\\x3c\\x3c\": { password: hunter2 }\n      password: ${X}\n",
+            "      password: !!str hunter2\n",
         ] {
             let text = format!("config_version: 1\npipelines:\n  p:\n    source:\n{shape}");
             assert_eq!(
@@ -465,6 +477,28 @@ pipelines:
                 "{text}"
             );
         }
+        for (directive, tag) in [
+            ("%TAG !y! tag:yaml.org,2002:\n---\n", "!y!merge"),
+            ("%TAG !y! tag:yaml.org,2002:mer\n---\n", "!y!ge"),
+        ] {
+            let text = format!(
+                "{directive}config_version: 1\npipelines:\n  p:\n    source:\n      {tag} \"\\x3c\\x3c\": {{ password: hunter2 }}\n      password: ${{X}}\n"
+            );
+            assert_eq!(
+                mask_secrets(&text, &key()),
+                Err(MaskError::MergeKey),
+                "{text}"
+            );
+        }
+    }
+
+    /// A `!` inside a plain scalar is text, not a tag: the value is masked.
+    #[test]
+    fn a_bang_inside_a_literal_is_not_a_tag() {
+        let text = "config_version: 1\npipelines:\n  p:\n    source:\n      password: hunter2!x\n";
+        let out = mask_secrets(text, &key()).unwrap();
+        assert!(!out.contains("hunter2"), "{out}");
+        assert!(out.contains(MASK), "{out}");
     }
 
     /// An inline key whose PEM sits under a header line is still a secret.
