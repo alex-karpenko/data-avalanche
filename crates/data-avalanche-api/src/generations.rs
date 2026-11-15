@@ -1,6 +1,7 @@
 //! `GET /v1/config/generations` and `GET /v1/config/generations/{generation}` (Admin_Console §4
 //! Config, D-M13b.9): the cluster's config generations, newest first, each with who published it
-//! and why; and one generation with its text, its secrets masked (D-M13b.10).
+//! and why; and one generation with its text, its secrets masked and its comments shown empty
+//! (D-M13b.10).
 
 use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
@@ -205,7 +206,7 @@ pub(crate) async fn diff(State(api): State<Api>, RawQuery(raw): RawQuery) -> Res
     }
 }
 
-/// One generation and its text, secrets masked.
+/// One generation and its text, secrets masked and comments shown empty.
 pub(crate) async fn one(State(api): State<Api>, Path(generation): Path<String>) -> Response {
     let Some(node) = api.node.get() else {
         return starting();
@@ -263,7 +264,8 @@ mod tests {
         .await;
         std::fs::write(
             &file,
-            CONFIG.replace("drain_timeout: 45s", "drain_timeout: 40s"),
+            CONFIG.replace("drain_timeout: 45s", "drain_timeout: 40s")
+                + "# the old password: pw-before\n",
         )
         .unwrap();
         let (code, _, _) = request(
@@ -309,6 +311,8 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("password: pw"), "{text}");
+        assert!(text.ends_with("\n#\n"), "its comment shown empty: {text}");
+        assert!(!text.contains("pw-before"), "{text}");
 
         let (code, v) = json_of(addr, "GET", "/v1/config/diff?from=1&to=2").await;
         assert_eq!(code, 200, "{v}");

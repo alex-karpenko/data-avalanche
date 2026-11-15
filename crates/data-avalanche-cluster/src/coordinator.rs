@@ -231,8 +231,8 @@ impl ConfigCoordinator {
         &self.inner.deps.generations
     }
 
-    /// `text`, a generation's, with its secrets masked under the cluster's fingerprint key
-    /// ([`mask_secrets`]).
+    /// `text`, a generation's, with its secrets masked under the cluster's fingerprint key and
+    /// its comments shown empty ([`mask_secrets`]).
     ///
     /// # Errors
     /// [`MaskError`]: the text isn't shown.

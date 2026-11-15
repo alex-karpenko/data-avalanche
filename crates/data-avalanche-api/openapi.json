@@ -352,7 +352,7 @@
         "tags": [
           "config"
         ],
-        "summary": "One config generation and its text, its secrets masked",
+        "summary": "One config generation and its text, its secrets masked and its comments shown empty",
         "parameters": [
           {
             "name": "generation",
@@ -366,7 +366,7 @@
         ],
         "responses": {
           "200": {
-            "description": "the generation and its text; `hash` is the text's keyed fingerprint, comparable across nodes of one cluster only",
+            "description": "the generation and its text, every comment shown empty (`#`); `hash` is the text's keyed fingerprint, comparable across nodes of one cluster only",
             "content": {
               "application/json": {}
             }
@@ -402,7 +402,7 @@
             }
           },
           "500": {
-            "description": "its text couldn't be masked, so it isn't shown",
+            "description": "its text couldn't be masked, so it isn't shown: it has a merge key (`<<`), a tag (a `!` after a space), a directive or a byte-order mark, or a secret or a comment the masker can't place",
             "content": {
               "application/json": {}
             }

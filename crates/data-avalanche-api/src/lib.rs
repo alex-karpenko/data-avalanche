@@ -274,11 +274,11 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
                 "GET",
                 "/v1/config/generations/{generation}",
                 Viewer,
-                "One config generation and its text, its secrets masked",
+                "One config generation and its text, its secrets masked and its comments shown empty",
                 &[
                     (
                         200,
-                        "the generation and its text; `hash` is the text's keyed fingerprint, comparable across nodes of one cluster only",
+                        "the generation and its text, every comment shown empty (`#`); `hash` is the text's keyed fingerprint, comparable across nodes of one cluster only",
                     ),
                     (400, "a generation that isn't a number"),
                     (404, "no such generation"),
@@ -286,7 +286,10 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
                         409,
                         "several snapshots of it and no record of which one it is",
                     ),
-                    (500, "its text couldn't be masked, so it isn't shown"),
+                    (
+                        500,
+                        "its text couldn't be masked, so it isn't shown: it has a merge key (`<<`), a tag (a `!` after a space), a directive or a byte-order mark, or a secret or a comment the masker can't place",
+                    ),
                 ],
             ),
             get(generations::one),

@@ -3,8 +3,15 @@
 //! in it. A secret written as exactly one `${VAR}` reference stays as written: the text holds no
 //! value. A default (`${VAR:-…}`) or text around a reference is masked like a literal.
 //! A literal one becomes `"•••••• blake3:<8 hex>"`, the start of its fingerprint under the
-//! cluster's key (config §6.2), so that two generations show whether it changed. Everything else
-//! (comments, order, spacing) is left as written.
+//! cluster's key (config §6.2), so that two generations show whether it changed. Every comment is
+//! shown empty, whatever it holds (an old secret, say): a full-line one as its indentation and
+//! `#`, a trailing one as ` #` after the value. Everything else (order, spacing) is left as
+//! written.
+//!
+//! A comment is told from a `#` that is content (in a quoted or a block scalar) by what the text
+//! parses to: a comment's text cut leaves it the same, content's doesn't. So every `#` at a line's
+//! start or after a space or tab is tried, and a cut that changes nothing is kept; a text whose
+//! value the cuts would change isn't shown ([`MaskError::Comments`]).
 //!
 //! The masked text is parsed again and checked before it is returned: every secret is then a
 //! mask or a reference. A text that fails the check isn't shown at all ([`MaskError`]). A
@@ -69,6 +76,8 @@ pub enum MaskError {
     Leaked(String),
     #[error("the text uses a YAML merge key, a tag or a directive, which can't be masked safely")]
     MergeKey,
+    #[error("the text's comments can't be told from its content")]
+    Comments,
 }
 
 /// `text` with every secret masked in place, fingerprinted with `key` (the module's doc).
@@ -100,7 +109,99 @@ pub fn mask_secrets(text: &str, key: &FingerprintKey) -> Result<String, MaskErro
     for (start, end, with) in edits {
         out.replace_range(start..end, &with);
     }
+    let out = blank_comments(&out)?;
     check(&secrets, &out)?;
+    Ok(out)
+}
+
+/// What `text` parses to, as the comments are told by: `None` when it doesn't.
+fn value_of(text: &str) -> Option<serde_json::Value> {
+    parse_document(text).ok()
+}
+
+/// A comment's text to cut: from `from` to `to`, replaced by `with` (`#`, or ` #` after a value).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Cut {
+    from: usize,
+    to: usize,
+    trailing: bool,
+}
+
+/// Where a comment could start, line by line: each `#` at a line's start or after a space or tab,
+/// to its line's end (a CR or an LF: YAML takes either as a break). Only those start one.
+fn cuts(text: &str) -> Vec<Vec<Cut>> {
+    let bytes = text.as_bytes();
+    let mut lines: Vec<Vec<Cut>> = vec![];
+    let mut line_start = 0;
+    let mut current: Vec<Cut> = vec![];
+    for (i, b) in bytes.iter().enumerate() {
+        match b {
+            b'\n' | b'\r' => {
+                if !current.is_empty() {
+                    lines.push(std::mem::take(&mut current));
+                }
+                line_start = i + 1;
+            }
+            b'#' if i == line_start || matches!(bytes[i - 1], b' ' | b'\t') => {
+                let to = text[i..].find(['\n', '\r']).map_or(text.len(), |n| i + n);
+                let before = &text[line_start..i];
+                let trailing = !before.bytes().all(|c| c == b' ' || c == b'\t');
+                let from = if trailing {
+                    line_start + before.trim_end_matches([' ', '\t']).len()
+                } else {
+                    i
+                };
+                current.push(Cut { from, to, trailing });
+            }
+            _ => {}
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// `text` with `cuts` (in order, apart) made.
+fn cut(text: &str, cuts: &[Cut]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for c in cuts {
+        out.push_str(&text[at..c.from]);
+        out.push_str(if c.trailing { " #" } else { "#" });
+        at = c.to;
+    }
+    out.push_str(&text[at..]);
+    out
+}
+
+/// `text` with every comment shown empty (the module's doc). All at once first, the first `#`
+/// of each line; else line by line from the end, each `#` of a line in turn until one's cut
+/// leaves the text's value as it was.
+fn blank_comments(text: &str) -> Result<String, MaskError> {
+    let lines = cuts(text);
+    if lines.is_empty() {
+        return Ok(text.to_owned());
+    }
+    let want = value_of(text).ok_or(MaskError::Comments)?;
+    let first: Vec<Cut> = lines.iter().map(|l| l[0]).collect();
+    let all = cut(text, &first);
+    if value_of(&all).as_ref() == Some(&want) {
+        return Ok(all);
+    }
+    let mut out = text.to_owned();
+    for line in lines.iter().rev() {
+        for c in line {
+            let tried = cut(&out, &[*c]);
+            if value_of(&tried).as_ref() == Some(&want) {
+                out = tried;
+                break;
+            }
+        }
+    }
+    if value_of(&out).as_ref() != Some(&want) {
+        return Err(MaskError::Comments);
+    }
     Ok(out)
 }
 
@@ -492,7 +593,7 @@ pipelines:
 ";
 
     /// Every literal secret is replaced in place; a reference, a path and every other line stay
-    /// as written, comments included.
+    /// as written, but for the comments, shown empty.
     #[test]
     fn a_generations_secrets_are_masked_in_place() {
         let out = mask_secrets(TEXT, &key()).unwrap();
@@ -506,9 +607,9 @@ pipelines:
             assert!(!out.contains(gone), "{gone} is still in:\n{out}");
         }
         for kept in [
-            "# the cluster",
+            "config_version: 1\n#\nglobals:",
             "    password: \"•••••• blake3:",
-            "   # rotate monthly",
+            "\" #\n    tls:",
             "      key: \"•••••• blake3:",
             "x-tenant: \"${TENANT}\" }",
             "session_key: ${SESSION_KEY}",
@@ -523,6 +624,64 @@ pipelines:
             out.contains("      password:\n        \"•••••• blake3:"),
             "the folded scalar's two lines are one mask:\n{out}"
         );
+    }
+
+    /// Every comment is shown empty, whatever it holds: a full-line one keeps its indentation and
+    /// `#`, a trailing one is ` #` after the value. A `#` that is content stays: in a quoted
+    /// scalar, in a block scalar, or not after whitespace in a plain one.
+    #[test]
+    fn every_comment_is_shown_empty() {
+        let text = "\
+# the cluster's config, old-secret rotated
+config_version: 1
+globals:
+  api:
+    tls:
+      enabled: false
+      cert: |
+        # x
+        -----BEGIN CERTIFICATE-----
+pipelines:
+  p:
+    source:
+      # password: old-secret
+      user: \"a # b\"   # was: old-secret
+      host: db#1 # old-secret
+      password: \"a # b\"
+  q:
+    source:
+      password: |
+        # x
+        hunter2
+      user: 'it''s # here' #old-secret
+";
+        let out = mask_secrets(text, &key()).unwrap();
+        assert!(!out.contains("old-secret"), "{out}");
+        assert!(!out.contains("hunter2"), "{out}");
+        assert!(!out.contains("a # b\"\n"), "the secret is masked: {out}");
+        assert_eq!(out.matches(MASK).count(), 2, "{out}");
+        for kept in [
+            "#\nconfig_version: 1\n",
+            "      cert: |\n        # x\n        -----BEGIN CERTIFICATE-----\n",
+            "\n      #\n      user: \"a # b\" #\n",
+            "      host: db#1 #\n",
+            "      user: 'it''s # here' #\n",
+        ] {
+            assert!(out.contains(kept), "{kept:?} is missing from:\n{out}");
+        }
+    }
+
+    /// A comment ends at a line break, a CR alone included.
+    #[test]
+    fn a_comment_ends_at_any_line_break() {
+        for nl in ["\r\n", "\r"] {
+            let text = format!(
+                "config_version: 1{nl}# old-secret{nl}pipelines:{nl}  p:{nl}    source:{nl}      user: u # old-secret{nl}      password: ${{X}}{nl}"
+            );
+            let out = mask_secrets(&text, &key()).unwrap();
+            assert!(!out.contains("old-secret"), "{out:?}");
+            assert_eq!(out, text.replace("# old-secret", "#"), "{out:?}");
+        }
     }
 
     /// Two generations show whether a literal secret changed, and nothing more.
