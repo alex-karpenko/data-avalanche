@@ -91,6 +91,14 @@ pub(crate) fn fingerprint(key: &FingerprintKey, bytes: &[u8]) -> String {
     )
 }
 
+/// `blake3:<64 hex digits>`: a config text's [`fingerprint`] under the cluster's `key`. What the
+/// API and the gossip show of a config text (a generation's, a node's file) in place of its plain
+/// hash: comparable across the nodes of one cluster only, and no use to someone who reads a
+/// masked text and wants to check a guessed secret against it (Admin_Console §4 Config).
+pub fn text_fingerprint(key: &FingerprintKey, text: &str) -> String {
+    fingerprint(key, text.as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,6 +157,21 @@ mod tests {
         let dbg = format!("{k:?}");
         assert_eq!(dbg, "FingerprintKey(***)");
         assert!(!dbg.contains("42"));
+    }
+
+    /// A config text's fingerprint is keyed (Admin_Console §4 Config): it isn't the text's plain
+    /// BLAKE3, so a viewer who reads a masked text can't confirm a guessed secret against it.
+    #[test]
+    fn a_text_fingerprint_is_keyed() {
+        let text = "config_version: 1\n";
+        let fp = text_fingerprint(&key(1), text);
+        assert_eq!(fp, fingerprint(&key(1), text.as_bytes()));
+        assert_eq!(fp.len(), "blake3:".len() + 64);
+        assert_ne!(
+            fp,
+            format!("blake3:{}", blake3::hash(text.as_bytes()).to_hex())
+        );
+        assert_ne!(fp, text_fingerprint(&key(2), text));
     }
 
     #[test]

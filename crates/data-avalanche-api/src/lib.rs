@@ -246,7 +246,10 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
                 "/v1/config/nodes",
                 Viewer,
                 "Each member's config generation, whether its own file is the cluster's generation, and its fields waiting for a restart",
-                &[(200, "the generation the cluster runs, and each member")],
+                &[(
+                    200,
+                    "the generation the cluster runs, its `hash` (its text's keyed fingerprint, comparable across nodes of one cluster only), and each member: `file` compares the keyed fingerprints of the member's file and of that text",
+                )],
             ),
             get(nodes::files),
         ),
@@ -257,7 +260,10 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
                 Viewer,
                 "The config generations, newest first: who published each, why, and what it changed",
                 &[
-                    (200, "the generations, and `next` when there are more"),
+                    (
+                        200,
+                        "the generations, each `hash` its text's keyed fingerprint (comparable across nodes of one cluster only), and `next` when the page is full",
+                    ),
                     (400, "a parameter that isn't one, or isn't in its form"),
                 ],
             ),
@@ -270,7 +276,10 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
                 Viewer,
                 "One config generation and its text, its secrets masked",
                 &[
-                    (200, "the generation and its text"),
+                    (
+                        200,
+                        "the generation and its text; `hash` is the text's keyed fingerprint, comparable across nodes of one cluster only",
+                    ),
                     (400, "a generation that isn't a number"),
                     (404, "no such generation"),
                     (
@@ -288,7 +297,10 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
                 "/v1/cluster/status",
                 Viewer,
                 "The members this node sees, and each pipeline's lease holder",
-                &[(200, "the members and the holders")],
+                &[(
+                    200,
+                    "the members and the holders; a member's `file_hash` is its file's keyed fingerprint (first 16 hex), comparable across nodes of one cluster only",
+                )],
             ),
             get(cluster::status),
         ),
@@ -493,7 +505,10 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
                 Viewer,
                 "A node's detail: its build and start, its file against its generation, its process and gossip figures, the leases it holds; another node's is fetched from it",
                 &[
-                    (200, "the node's detail"),
+                    (
+                        200,
+                        "the node's detail; `file.hash` and `file.generation_hash` are keyed fingerprints (first 16 hex), comparable across nodes of one cluster only",
+                    ),
                     FORWARDED[0],
                     FORWARDED[1],
                     FORWARDED[2],

@@ -150,7 +150,7 @@
         "summary": "The members this node sees, and each pipeline's lease holder",
         "responses": {
           "200": {
-            "description": "the members and the holders",
+            "description": "the members and the holders; a member's `file_hash` is its file's keyed fingerprint (first 16 hex), comparable across nodes of one cluster only",
             "content": {
               "application/json": {}
             }
@@ -306,7 +306,7 @@
         ],
         "responses": {
           "200": {
-            "description": "the generations, and `next` when there are more",
+            "description": "the generations, each `hash` its text's keyed fingerprint (comparable across nodes of one cluster only), and `next` when the page is full",
             "content": {
               "application/json": {}
             }
@@ -366,7 +366,7 @@
         ],
         "responses": {
           "200": {
-            "description": "the generation and its text",
+            "description": "the generation and its text; `hash` is the text's keyed fingerprint, comparable across nodes of one cluster only",
             "content": {
               "application/json": {}
             }
@@ -433,7 +433,7 @@
         "summary": "Each member's config generation, whether its own file is the cluster's generation, and its fields waiting for a restart",
         "responses": {
           "200": {
-            "description": "the generation the cluster runs, and each member",
+            "description": "the generation the cluster runs, its `hash` (its text's keyed fingerprint, comparable across nodes of one cluster only), and each member: `file` compares the keyed fingerprints of the member's file and of that text",
             "content": {
               "application/json": {}
             }
@@ -806,7 +806,7 @@
         ],
         "responses": {
           "200": {
-            "description": "the node's detail",
+            "description": "the node's detail; `file.hash` and `file.generation_hash` are keyed fingerprints (first 16 hex), comparable across nodes of one cluster only",
             "content": {
               "application/json": {}
             }

@@ -13,7 +13,7 @@ use chrono::Utc;
 use data_avalanche_config::{
     ConfigDiff, Env, FingerprintKey, Fingerprints, Globals, MaskError, Mutability, Pipeline,
     PipelineChange, Report, ResolvedConfig, WrittenDiff, diff, diff_with, diff_written,
-    load_posted_str, load_str, mask_secrets,
+    load_posted_str, load_str, mask_secrets, text_fingerprint,
 };
 use data_avalanche_core::TableRef;
 use data_avalanche_state::{
@@ -149,6 +149,9 @@ struct Inner {
     /// One adoption or reload at a time.
     running: Mutex<Running>,
     applied: watch::Sender<u64>,
+    /// Each generation's text fingerprint ([`ConfigCoordinator::generation_fingerprint`]), by its
+    /// text's plain hash: a snapshot never changes, so each is read once.
+    fingerprints: StdMutex<BTreeMap<String, String>>,
 }
 
 /// The node's config generation at run time. Dropped, it stops watching.
@@ -197,6 +200,7 @@ impl ConfigCoordinator {
                 stopped: false,
             }),
             applied: watch::channel(n).0,
+            fingerprints: StdMutex::default(),
         });
         let (stop, stopped) = watch::channel(false);
         let task = tokio::spawn(watch_generations(
@@ -243,6 +247,42 @@ impl ConfigCoordinator {
     /// [`MaskError::Parse`]: a text isn't a config.
     pub fn diff_written(&self, from: &str, to: &str) -> Result<WrittenDiff, MaskError> {
         diff_written(from, to, &self.inner.deps.key)
+    }
+
+    /// `text`'s fingerprint under the cluster's key ([`text_fingerprint`], `blake3:<64 hex>`):
+    /// what the API shows of a config text in place of its plain hash, which a viewer could check
+    /// a guessed secret of a masked text against (Admin_Console §4 Config).
+    pub fn fingerprint(&self, text: &str) -> String {
+        text_fingerprint(&self.inner.deps.key, text)
+    }
+
+    /// [`Self::fingerprint`] of generation `generation`'s text, whose plain hash is `hash`: read
+    /// from its snapshot the first time, then kept.
+    ///
+    /// # Errors
+    /// The snapshot can't be read, or doesn't match `hash`.
+    pub async fn generation_fingerprint(
+        &self,
+        generation: u64,
+        hash: &str,
+    ) -> Result<String, StateError> {
+        let kept = |f: &StdMutex<BTreeMap<String, String>>| {
+            f.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(hash)
+                .cloned()
+        };
+        if let Some(fp) = kept(&self.inner.fingerprints) {
+            return Ok(fp);
+        }
+        let text = self.inner.deps.generations.text(generation, hash).await?;
+        let fp = self.fingerprint(&text);
+        self.inner
+            .fingerprints
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(hash.to_owned(), fp.clone());
+        Ok(fp)
     }
 
     /// The config this node runs: its generation's text as resolved here.
@@ -1078,6 +1118,33 @@ mod tests {
                 PipelineReload::Restart(p, _) => format!("restart {}", p.id),
             })
             .collect()
+    }
+
+    /// What the API shows of a generation's text is its fingerprint under the cluster's key,
+    /// never its plain hash (Admin_Console §4 Config): read once from its snapshot, then kept.
+    #[tokio::test(start_paused = true)]
+    async fn a_generation_s_fingerprint_is_keyed() {
+        let n = lone(&["p"]).await;
+        let text = config_text(&["p"]);
+        let g = n.coordinator.generation().await;
+        let want =
+            data_avalanche_config::text_fingerprint(&FingerprintKey::from_bytes([1; 32]), &text);
+        assert_eq!(n.coordinator.fingerprint(&text), want);
+        assert_eq!(
+            n.coordinator
+                .generation_fingerprint(1, &g.hash)
+                .await
+                .unwrap(),
+            want
+        );
+        assert_ne!(want, g.hash, "not the plain hash");
+        assert!(
+            n.coordinator
+                .generation_fingerprint(1, &config_hash("another text"))
+                .await
+                .is_err(),
+            "a hash no snapshot of it has"
+        );
     }
 
     /// A generation another node published is adopted at the next poll: its pipelines' changes

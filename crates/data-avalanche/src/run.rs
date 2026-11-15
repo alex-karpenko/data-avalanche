@@ -218,17 +218,18 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
             config_generation: joined.generation.doc.generation,
             build: env!("CARGO_PKG_VERSION").to_owned(),
             api_url: api_url(&config.globals.api, addr.ip()),
-            file_hash: file_hash(&text),
+            file_hash: file_hash(&fingerprints, &text),
         },
     };
     let key = GossipKey::derive(&joined.fingerprint_key);
     let gossip = Gossip::start(me, key, GossipSettings::new(m), Arc::new(udp), inbox);
     tracing::info!(%addr, bound = ?bind, "gossip started");
     gossip.report_to(metrics.clone());
-    // The file's hash, gossiped again when the file changes under the node (D-M13b.3).
+    // The file's hash, keyed, gossiped again when the file changes under the node (D-M13b.3).
     let _file = tokio::spawn(watch_file(
         args.config.clone(),
-        file_hash(&text),
+        fingerprints,
+        file_hash(&fingerprints, &text),
         gossip.advertiser(),
     ));
     // Joins, suspicions and departures, each recorded by one node (Admin_Console §6).

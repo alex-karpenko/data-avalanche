@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use crate::peers::{ACTION_LIMIT, Asked, DETAIL_LIMIT, FORWARDED_BY, MAX_ANSWER, STATUS_LIMIT};
 use crate::{Api, Node, body, starting};
 
-/// The first 16 hex digits of a `blake3:<hex>` hash, as a node gossips its file's.
+/// The first 16 hex digits of a `blake3:<hex>` fingerprint, as a node gossips its file's.
 pub(crate) fn short(hash: &str) -> &str {
     let hex = hash.strip_prefix("blake3:").unwrap_or(hash);
     hex.get(..16).unwrap_or(hex)
@@ -35,6 +35,18 @@ async fn detail(node: &Node) -> Value {
     let me = members.nodes.get(&members.me);
     let generation = node.coordinator.generation().await;
     let file_hash = me.map(|m| m.meta.file_hash.as_str()).unwrap_or_default();
+    // Keyed, as the gossiped file's is: never the text's plain hash (Admin_Console §4 Config).
+    let generation_hash = match node
+        .coordinator
+        .generation_fingerprint(generation.generation, &generation.hash)
+        .await
+    {
+        Ok(fp) => Some(short(&fp).to_owned()),
+        Err(e) => {
+            tracing::debug!("a node's detail, its generation's text: {e}");
+            None
+        }
+    };
     let config = node.coordinator.config().await;
     let ring = Ring::new(
         members
@@ -96,8 +108,11 @@ async fn detail(node: &Node) -> Value {
         "config_generation": generation.generation,
         "file": {
             "hash": (!file_hash.is_empty()).then_some(file_hash),
-            "generation_hash": short(&generation.hash),
-            "matches": (!file_hash.is_empty()).then(|| file_hash == short(&generation.hash)),
+            "generation_hash": generation_hash,
+            "matches": generation_hash
+                .as_deref()
+                .filter(|_| !file_hash.is_empty())
+                .map(|g| file_hash == g),
         },
         "restart_pending": node.coordinator.restart_pending().await,
         "process": {
@@ -299,15 +314,30 @@ pub(crate) async fn files(State(api): State<Api>, headers: HeaderMap) -> Respons
     let Some(node) = api.node.get() else {
         return starting();
     };
-    let current = match node.coordinator.generations().current().await {
-        Ok(Some(c)) => c.pointer.doc,
-        Ok(None) => node.coordinator.generation().await,
-        Err(e) => {
-            return body(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &json!({ "error": format!("the config generation can't be read: {e}") }),
-            );
+    let unreadable = |e: data_avalanche_state::StateError| {
+        body(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({ "error": format!("the config generation can't be read: {e}") }),
+        )
+    };
+    // The text's fingerprint under the cluster's key, as each node gossips its file's.
+    let (current, keyed) = match node.coordinator.generations().current().await {
+        Ok(Some(c)) => {
+            let keyed = node.coordinator.fingerprint(&c.text);
+            (c.pointer.doc, keyed)
         }
+        Ok(None) => {
+            let g = node.coordinator.generation().await;
+            match node
+                .coordinator
+                .generation_fingerprint(g.generation, &g.hash)
+                .await
+            {
+                Ok(keyed) => (g, keyed),
+                Err(e) => return unreadable(e),
+            }
+        }
+        Err(e) => return unreadable(e),
     };
     let members = node.members.borrow().clone();
     let mut asks = tokio::task::JoinSet::new();
@@ -349,7 +379,7 @@ pub(crate) async fn files(State(api): State<Api>, headers: HeaderMap) -> Respons
         .map(|(name, m)| {
             let file = match m.meta.file_hash.as_str() {
                 "" => "unknown",
-                h if h == short(&current.hash) => "same",
+                h if h == short(&keyed) => "same",
                 _ => "differs",
             };
             let mut v = json!({
@@ -373,7 +403,7 @@ pub(crate) async fn files(State(api): State<Api>, headers: HeaderMap) -> Respons
         .collect();
     body(
         StatusCode::OK,
-        &json!({ "generation": current.generation, "hash": current.hash, "nodes": nodes }),
+        &json!({ "generation": current.generation, "hash": keyed, "nodes": nodes }),
     )
 }
 
@@ -386,8 +416,10 @@ mod tests {
     use axum::Router;
     use axum::http::Uri;
     use data_avalanche_cluster::{Member, Members, NodeMeta, file_hash};
-    use data_avalanche_config::{FingerprintKey, Origin, Pem, Secret, TlsIdentity};
-    use data_avalanche_state::{EventDoc, EventQuery, Events};
+    use data_avalanche_config::{
+        FingerprintKey, Origin, Pem, Secret, TlsIdentity, text_fingerprint,
+    };
+    use data_avalanche_state::{EventDoc, EventQuery, Events, config_hash};
     use tempfile::TempDir;
     use tokio::sync::watch;
 
@@ -449,7 +481,7 @@ mod tests {
                 config_generation: 1,
                 build: "1.1.0".into(),
                 api_url: api_url.into(),
-                file_hash: file_hash(CONFIG),
+                file_hash: file_hash(&FingerprintKey::from_bytes([1; 32]), CONFIG),
             },
             suspect: false,
         }
@@ -525,7 +557,7 @@ mod tests {
         // node-a's view, with node-c beside node-b, served again.
         let (_, lone, _dir) = served(&b, open()).await;
         let mut c = member("", Phase::Active);
-        c.meta.file_hash = file_hash("another file");
+        c.meta.file_hash = file_hash(&FingerprintKey::from_bytes([1; 32]), "another file");
         let mut view = lone.node.members.borrow().clone();
         view.nodes.insert("node-c".into(), c);
         let (tx, rx) = watch::channel(view);
@@ -559,6 +591,67 @@ mod tests {
         );
     }
 
+    /// The masked text of a generation keeps every byte but its secrets. No hash the API returns
+    /// of that text, nor of a node's file, is its plain BLAKE3: a viewer who puts a guess back for
+    /// a mask, in any quoting, can't confirm it offline. Each is the text's fingerprint under the
+    /// cluster's key, comparable across nodes.
+    #[tokio::test]
+    async fn no_hash_the_api_returns_confirms_a_guessed_secret() {
+        let (b, _log) = fake(Duration::ZERO).await;
+        let (addr, _lone, _dir) = served(&b, open()).await;
+        let get = |path: &'static str| async move {
+            let (code, _, text) = request(addr, "GET", path, &[], "").await;
+            assert_eq!(code, 200, "{path}: {text}");
+            json(&text)
+        };
+        let one = get("/v1/config/generations/1").await;
+        let masked = one["text"].as_str().unwrap();
+        let from = masked
+            .find(&format!("\"{}", data_avalanche_config::MASK))
+            .unwrap();
+        let to = from + 1 + masked[from + 1..].find('"').unwrap() + 1;
+        let guesses: Vec<String> = ["pw", "'pw'", "\"pw\""]
+            .iter()
+            .map(|g| format!("{}{g}{}", &masked[..from], &masked[to..]))
+            .collect();
+        assert!(
+            guesses.iter().any(|g| g == CONFIG),
+            "the right guess is the text"
+        );
+        let plain: Vec<String> = guesses.iter().map(|g| config_hash(g)).collect();
+
+        let keyed = text_fingerprint(&FingerprintKey::from_bytes([1; 32]), CONFIG);
+        let list = get("/v1/config/generations").await;
+        let files = get("/v1/config/nodes").await;
+        let detail = get("/v1/nodes/node-a").await;
+        let status = get("/v1/cluster/status").await;
+        let full = [
+            &list["generations"][0]["hash"],
+            &one["hash"],
+            &files["hash"],
+        ];
+        let short_ones = [
+            &detail["file"]["hash"],
+            &detail["file"]["generation_hash"],
+            &status["members"][0]["file_hash"],
+            &status["members"][1]["file_hash"],
+        ];
+        for got in full.iter().chain(&short_ones) {
+            let got = got.as_str().unwrap_or_else(|| panic!("a hash: {got}"));
+            for p in &plain {
+                assert!(!p.contains(short(got)), "{got} confirms a guess");
+            }
+        }
+        for got in full {
+            assert_eq!(got, &json!(keyed));
+        }
+        for got in short_ones {
+            assert_eq!(got, &json!(short(&keyed)));
+        }
+        assert_eq!(detail["file"]["matches"], true);
+        assert_eq!(files["nodes"][0]["file"], "same");
+    }
+
     #[tokio::test]
     async fn this_node_s_detail_is_answered_here() {
         let (b, log) = fake(Duration::ZERO).await;
@@ -571,7 +664,10 @@ mod tests {
         assert_eq!(v["build"], "1.1.0");
         assert_eq!(v["started_at"], "2024-11-14T16:00:00Z");
         assert_eq!(v["config_generation"], 1);
-        assert_eq!(v["file"]["hash"], file_hash(CONFIG));
+        assert_eq!(
+            v["file"]["hash"],
+            file_hash(&FingerprintKey::from_bytes([1; 32]), CONFIG)
+        );
         assert_eq!(v["file"]["matches"], true);
         assert_eq!(
             v["gossip"]["peers"],

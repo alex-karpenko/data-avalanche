@@ -91,6 +91,11 @@ pub(crate) fn page() -> String {
          role mapped, is recorded too (`action.denied`). A note longer than 500 characters, \
          not a string or holding a control character, or a body that isn't a JSON object, is \
          `422`; a body over 1 MiB is `413`; either way nothing is done or recorded.\n\n\
+         **Hashes.** A hash the API shows of a config text (a generation's `hash`, a node's \
+         `file_hash`, `file.hash` and `file.generation_hash`) is the text's fingerprint keyed \
+         with the cluster's fingerprint key, never its plain hash, the gossiped ones its first \
+         16 hex: comparable across the nodes of one cluster only, and no help to someone \
+         guessing a secret of a masked text.\n\n\
          **Outside `/v1`**, with no credentials: `GET /health/live` (the process answers), \
          `GET /health/ready` (`200` once the node runs its config, `503` before and while it \
          stops) and `GET /metrics` (Prometheus text).\n\n",

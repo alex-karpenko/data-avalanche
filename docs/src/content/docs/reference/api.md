@@ -16,6 +16,8 @@ Every node serves the API on `globals.api.address`. `globals.api.auth` decides w
 
 **Who did it.** Every route that changes something takes an optional JSON body `{"note": "…"}` and records the action in the cluster's events: what, to what, the caller's name and role as the node verified them, the note, and how it ended (`accepted`, `unchanged`, `refused`). A caller turned away for its role, or with no role mapped, is recorded too (`action.denied`). A note longer than 500 characters, not a string or holding a control character, or a body that isn't a JSON object, is `422`; a body over 1 MiB is `413`; either way nothing is done or recorded.
 
+**Hashes.** A hash the API shows of a config text (a generation's `hash`, a node's `file_hash`, `file.hash` and `file.generation_hash`) is the text's fingerprint keyed with the cluster's fingerprint key, never its plain hash, the gossiped ones its first 16 hex: comparable across the nodes of one cluster only, and no help to someone guessing a secret of a masked text.
+
 **Outside `/v1`**, with no credentials: `GET /health/live` (the process answers), `GET /health/ready` (`200` once the node runs its config, `503` before and while it stops) and `GET /metrics` (Prometheus text).
 
 ## pipelines
@@ -218,7 +220,7 @@ Least role: `viewer`.
 
 | Status | When |
 |---|---|
-| `200` | the generations, and `next` when there are more |
+| `200` | the generations, each `hash` its text's keyed fingerprint (comparable across nodes of one cluster only), and `next` when the page is full |
 | `400` | a parameter that isn't one, or isn't in its form |
 
 ### `GET /v1/config/generations/{generation}`
@@ -231,7 +233,7 @@ Least role: `viewer`.
 
 | Status | When |
 |---|---|
-| `200` | the generation and its text |
+| `200` | the generation and its text; `hash` is the text's keyed fingerprint, comparable across nodes of one cluster only |
 | `400` | a generation that isn't a number |
 | `404` | no such generation |
 | `409` | several snapshots of it and no record of which one it is |
@@ -246,7 +248,7 @@ Least role: `viewer`.
 
 | Status | When |
 |---|---|
-| `200` | the generation the cluster runs, and each member |
+| `200` | the generation the cluster runs, its `hash` (its text's keyed fingerprint, comparable across nodes of one cluster only), and each member: `file` compares the keyed fingerprints of the member's file and of that text |
 
 ### `POST /v1/config/reload`
 
@@ -320,7 +322,7 @@ Least role: `viewer`.
 
 | Status | When |
 |---|---|
-| `200` | the members and the holders |
+| `200` | the members and the holders; a member's `file_hash` is its file's keyed fingerprint (first 16 hex), comparable across nodes of one cluster only |
 
 ## admin
 
@@ -356,7 +358,7 @@ Least role: `viewer`.
 
 | Status | When |
 |---|---|
-| `200` | the node's detail |
+| `200` | the node's detail; `file.hash` and `file.generation_hash` are keyed fingerprints (first 16 hex), comparable across nodes of one cluster only |
 | `404` | no member of that name in this node's view |
 | `421` | a request forwarded to a node that isn't its target |
 | `502` | the node didn't answer |

@@ -109,7 +109,7 @@ pub use mask::{MASK, MaskError, WrittenChange, WrittenDiff, diff_written, mask_s
 pub use material::{FileRef, Origin, Pem};
 pub use mutability::Mutability;
 pub use registry::{RULES, RuleInput, RuleLocus, RuleMeta, RuleSeverity, rule_meta};
-pub use secret::{FingerprintKey, Secret};
+pub use secret::{FingerprintKey, Secret, text_fingerprint};
 pub use template::{Env, ProcessEnv};
 pub use units::{ByteSize, ByteSizeError, HostPort, HostPortError};
 

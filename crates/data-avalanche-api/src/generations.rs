@@ -56,10 +56,13 @@ fn query(raw: Option<&str>) -> Result<(Option<u64>, usize), Failure> {
     Ok((before, limit))
 }
 
-fn listed_json(l: &Listed) -> Value {
+/// A generation as listed; `hash` is its text's fingerprint under the cluster's key, never the
+/// text's plain hash: a viewer reads the masked text, and could check a guessed secret against a
+/// plain one (Admin_Console §4 Config).
+fn listed_json(l: &Listed, hash: Option<String>) -> Value {
     let mut v = json!({
         "generation": l.generation,
-        "hash": l.hash,
+        "hash": hash,
         "current": l.current,
     });
     if let Some(r) = &l.record {
@@ -93,12 +96,27 @@ pub(crate) async fn list(State(api): State<Api>, RawQuery(raw): RawQuery) -> Res
             let next = (page.len() == limit)
                 .then(|| page.last().map(|l| l.generation))
                 .flatten();
+            let mut generations = Vec::with_capacity(page.len());
+            for l in &page {
+                let hash = match &l.hash {
+                    Some(h) => match node
+                        .coordinator
+                        .generation_fingerprint(l.generation, h)
+                        .await
+                    {
+                        Ok(fp) => Some(fp),
+                        Err(e) => {
+                            tracing::debug!("config generation {}'s text: {e}", l.generation);
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                generations.push(listed_json(l, hash));
+            }
             body(
                 StatusCode::OK,
-                &json!({
-                    "generations": page.iter().map(listed_json).collect::<Vec<_>>(),
-                    "next": next,
-                }),
+                &json!({ "generations": generations, "next": next }),
             )
         }
         Err(e) => unreadable(&e),
@@ -200,7 +218,7 @@ pub(crate) async fn one(State(api): State<Api>, Path(generation): Path<String>) 
         Ok(Some((_, None))) => ambiguous(n),
         Ok(Some((listed, Some(text)))) => match node.coordinator.mask(&text) {
             Ok(masked) => {
-                let mut v = listed_json(&listed);
+                let mut v = listed_json(&listed, Some(node.coordinator.fingerprint(&text)));
                 v["text"] = json!(masked);
                 body(StatusCode::OK, &v)
             }

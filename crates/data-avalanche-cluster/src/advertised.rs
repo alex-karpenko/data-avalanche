@@ -1,13 +1,12 @@
 //! What a node tells the others about itself beyond its phase (Admin_Console §10, D-M13b.2–3):
-//! where its API is, and a short hash of its own config file, so another node's console page can
-//! reach it and say whether its file still matches the generation it runs.
+//! where its API is, and a short keyed hash of its own config file, so another node's console page
+//! can reach it and say whether its file still matches the generation it runs.
 
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use data_avalanche_config::Api;
-use data_avalanche_state::config_hash;
+use data_avalanche_config::{Api, FingerprintKey, text_fingerprint};
 
 use crate::Advertiser;
 
@@ -39,18 +38,21 @@ pub fn api_url(api: &Api, advertised: IpAddr) -> String {
     }
 }
 
-/// The first 16 hex digits of the text's `config_hash`: enough to tell two files apart, short
-/// enough for every identity in a gossip packet.
-pub fn file_hash(text: &str) -> String {
-    let hash = config_hash(text);
-    let hex = hash.strip_prefix("blake3:").unwrap_or(&hash);
+/// The first 16 hex digits of the text's fingerprint under the cluster's `key`
+/// ([`text_fingerprint`]): enough to tell two files apart, short enough for every identity in a
+/// gossip packet. Keyed, because the packets are signed, not encrypted, and the console shows a
+/// generation's text masked: a plain hash would let anyone who reads both check a guessed secret
+/// offline. Comparable across the nodes of one cluster only.
+pub fn file_hash(key: &FingerprintKey, text: &str) -> String {
+    let fp = text_fingerprint(key, text);
+    let hex = fp.strip_prefix("blake3:").unwrap_or(&fp);
     hex[..16].to_owned()
 }
 
 /// The hash of the file at `path`; empty when it can't be read.
-async fn hash_of(path: &PathBuf) -> String {
+async fn hash_of(key: &FingerprintKey, path: &Path) -> String {
     match tokio::fs::read_to_string(path).await {
-        Ok(text) => file_hash(&text),
+        Ok(text) => file_hash(key, &text),
         Err(e) => {
             tracing::debug!(path = %path.display(), "the config file for its hash: {e}");
             String::new()
@@ -58,12 +60,17 @@ async fn hash_of(path: &PathBuf) -> String {
     }
 }
 
-/// Reads the node's file every [`FILE_CHECK`] and gossips its hash when it changed from `last`
-/// (a ConfigMap updated under a running node). Runs until the gossip is gone.
-pub async fn watch_file(path: PathBuf, mut last: String, advertiser: Advertiser) {
+/// Reads the node's file every [`FILE_CHECK`] and gossips its hash under `key` when it changed
+/// from `last` (a ConfigMap updated under a running node). Runs until the gossip is gone.
+pub async fn watch_file(
+    path: PathBuf,
+    key: FingerprintKey,
+    mut last: String,
+    advertiser: Advertiser,
+) {
     loop {
         tokio::time::sleep(FILE_CHECK).await;
-        let now = hash_of(&path).await;
+        let now = hash_of(&key, &path).await;
         if now != last {
             tracing::info!(path = %path.display(), hash = %now, "the config file changed");
             if !advertiser.set_file_hash(now.clone()) {
@@ -76,9 +83,8 @@ pub async fn watch_file(path: PathBuf, mut last: String, advertiser: Advertiser)
 
 #[cfg(test)]
 mod tests {
-    use data_avalanche_config::{
-        ApiAuth, FingerprintKey, HostPort, Origin, Pem, Secret, TlsIdentity,
-    };
+    use data_avalanche_config::{ApiAuth, HostPort, Origin, Pem, Secret, TlsIdentity};
+    use data_avalanche_state::config_hash;
 
     use super::*;
 
@@ -135,11 +141,21 @@ mod tests {
         assert_eq!(api_url(&a, GOSSIP), "https://cdc-0.cdc.ns.svc:8080");
     }
 
+    /// What the gossip carries of a node's file is keyed (Admin_Console §4 Config): its packets
+    /// are signed, not encrypted, and a plain hash of a text whose masked form a viewer can read
+    /// would let them check a guessed secret offline.
     #[test]
-    fn a_file_hash_is_the_config_hash_s_first_16_digits() {
-        let h = file_hash("config_version: 1\n");
+    fn a_file_hash_is_the_keyed_fingerprint_s_first_16_digits() {
+        let key = FingerprintKey::from_bytes([3; 32]);
+        let text = "config_version: 1\n";
+        let h = file_hash(&key, text);
         assert_eq!(h.len(), 16);
-        assert!(config_hash("config_version: 1\n").starts_with(&format!("blake3:{h}")));
-        assert_ne!(h, file_hash("config_version: 1\n# changed\n"));
+        assert!(text_fingerprint(&key, text).starts_with(&format!("blake3:{h}")));
+        assert!(
+            !config_hash(text).starts_with(&format!("blake3:{h}")),
+            "not the plain hash"
+        );
+        assert_ne!(h, file_hash(&FingerprintKey::from_bytes([4; 32]), text));
+        assert_ne!(h, file_hash(&key, "config_version: 1\n# changed\n"));
     }
 }

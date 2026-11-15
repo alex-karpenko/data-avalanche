@@ -60,7 +60,7 @@ fn phase(p: Phase) -> &'static str {
     }
 }
 
-/// The members this node sees, with where each one's API is and its file's hash; each
+/// The members this node sees, with where each one's API is and its file's keyed hash; each
 /// pipeline's lease holder, epoch and expiry, and its owner on the ring of the active members
 /// (where it goes once the ring has settled, D-M13b.13).
 pub(crate) async fn status(State(api): State<Api>) -> Response {
@@ -213,7 +213,10 @@ mod tests {
         assert_eq!(v["members"][0]["api_url"], "http://127.0.0.1:8080");
         assert_eq!(
             v["members"][0]["file_hash"],
-            data_avalanche_cluster::file_hash(CONFIG)
+            data_avalanche_cluster::file_hash(
+                &data_avalanche_config::FingerprintKey::from_bytes([1; 32]),
+                CONFIG
+            )
         );
         assert_eq!(
             v["pipelines"],
