@@ -29,6 +29,9 @@ fn phase(p: Phase) -> &'static str {
     }
 }
 
+/// How many leases a node's detail reads at once.
+const LEASE_READS: usize = 16;
+
 /// This node's detail (D-M13b.6).
 async fn detail(node: &Node) -> Value {
     let members = node.members.borrow().clone();
@@ -56,25 +59,36 @@ async fn detail(node: &Node) -> Value {
             .map(|(name, _)| name.as_str()),
         config.globals.cluster.tokens,
     );
-    let mut ids: Vec<&str> = config.pipelines.values().map(|p| p.id.as_str()).collect();
+    let mut ids: Vec<String> = config.pipelines.values().map(|p| p.id.clone()).collect();
     ids.sort_unstable();
+    // Read LEASE_READS at a time: one after another, a few hundred pipelines on S3 would take
+    // longer than the detail's limit when asked through another node.
     let mut held = Some(vec![]);
-    for id in ids {
-        match node.leases.observe(id).await {
-            Ok(Some(l)) if !l.doc.released && l.doc.holder_node_id == members.me => {
-                if let Some(h) = held.as_mut() {
-                    h.push(json!({
-                        "id": id,
-                        "owner_epoch": l.doc.owner_epoch,
-                        "ring_owner": ring.owner(id),
-                    }));
+    'chunks: for chunk in ids.chunks(LEASE_READS) {
+        let mut reads = tokio::task::JoinSet::new();
+        for (i, id) in chunk.iter().enumerate() {
+            let (leases, id) = (node.leases.clone(), id.clone());
+            reads.spawn(async move { (i, leases.observe(&id).await) });
+        }
+        let mut read = reads.join_all().await;
+        read.sort_unstable_by_key(|(i, _)| *i);
+        for (id, (_, lease)) in chunk.iter().zip(read) {
+            match lease {
+                Ok(Some(l)) if !l.doc.released && l.doc.holder_node_id == members.me => {
+                    if let Some(h) = held.as_mut() {
+                        h.push(json!({
+                            "id": id,
+                            "owner_epoch": l.doc.owner_epoch,
+                            "ring_owner": ring.owner(id),
+                        }));
+                    }
                 }
-            }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::debug!("a node's detail, the lease of {id}: {e}");
-                held = None;
-                break;
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::debug!("a node's detail, the lease of {id}: {e}");
+                    held = None;
+                    break 'chunks;
+                }
             }
         }
     }
@@ -426,7 +440,7 @@ mod tests {
     use super::*;
     use crate::peers::{ANSWERED_BY, Peers, TARGET};
     use crate::test_support::{
-        CONFIG, Issuer, Lone, USERNAME_CLAIM, api, lone, open, request, serve,
+        CONFIG, Issuer, Lone, USERNAME_CLAIM, api, lone, lone_with, open, request, serve,
     };
     use crate::{Auth, Stop};
 
@@ -652,6 +666,54 @@ mod tests {
         assert_eq!(files["nodes"][0]["file"], "same");
     }
 
+    /// A node's detail lists every lease it holds, however many there are (read
+    /// [`LEASE_READS`] at a time), in id order, and none another node holds.
+    #[tokio::test]
+    async fn the_detail_lists_every_lease_held_here() {
+        let orders = &CONFIG[CONFIG.find("  orders:").unwrap()..];
+        let mut text = CONFIG.to_owned();
+        let ids: Vec<String> = (0..2 * LEASE_READS + 3)
+            .map(|i| format!("p{i:02}"))
+            .collect();
+        for id in &ids {
+            text.push_str(
+                &orders
+                    .replace("orders", id)
+                    .replace("prefix: shop", &format!("prefix: shop-{id}")),
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.yaml");
+        std::fs::write(&file, &text).unwrap();
+        let lone = lone_with(file, &text, Arc::new(data_avalanche_config::ProcessEnv)).await;
+        let a = api(open());
+        a.node.set(lone.node.clone()).unwrap();
+        let addr = serve(a).await;
+        let holder = |node: &str| data_avalanche_state::Holder {
+            node_id: node.into(),
+            incarnation: 1,
+        };
+        let mut want: Vec<String> = vec!["orders".into()];
+        want.extend(ids.iter().filter(|id| *id != "p05").cloned());
+        for id in want.iter().chain([&"p05".to_owned()]) {
+            let by = if id == "p05" { "node-b" } else { "node-a" };
+            lone.leases
+                .acquire(id, &holder(by), Duration::from_secs(30), chrono::Utc::now())
+                .await
+                .unwrap();
+        }
+        let (code, _, text) = request(addr, "GET", "/v1/nodes/node-a", &[], "").await;
+        assert_eq!(code, 200, "{text}");
+        let got: Vec<String> = json(&text)["pipelines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap().to_owned())
+            .collect();
+        want.sort();
+        assert_eq!(got, want);
+    }
+
     #[tokio::test]
     async fn this_node_s_detail_is_answered_here() {
         let (b, log) = fake(Duration::ZERO).await;
@@ -826,19 +888,130 @@ mod tests {
         );
     }
 
-    /// The cluster's nodes share a CA: a peer trusts every certificate of its own `api.tls`.
-    #[tokio::test]
-    async fn peers_trust_this_node_s_own_certificate() {
+    /// A self-signed identity for `localhost`.
+    fn identity() -> TlsIdentity {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
         let key = FingerprintKey::random();
         let pem = |text: String| Pem {
             origin: Origin::Inline,
             text: Secret::new(text, &key),
         };
-        let tls = TlsIdentity {
+        TlsIdentity {
             cert: pem(cert.cert.pem()),
             key: pem(cert.signing_key.serialize_pem()),
-        };
+        }
+    }
+
+    fn asked_by(authorization: &str) -> Asked {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", authorization.parse().unwrap());
+        Asked::from(Method::GET, &headers, Bytes::new())
+    }
+
+    /// A node with TLS sends a caller's credentials over HTTPS only: a peer that gossips an
+    /// `http://` address (one not yet restarted with TLS) is a `502`, and gets nothing.
+    #[tokio::test]
+    async fn a_node_with_tls_never_forwards_over_plain_http() {
+        let (b, log) = fake(Duration::ZERO).await;
+        let peers = Peers::new("node-a", Some(&identity())).unwrap();
+        let r = peers
+            .send("node-b", &b, "/v1/x", asked_by("Bearer t"), DETAIL_LIMIT)
+            .await;
+        assert_eq!(r.status(), 502);
+        assert!(log.lock().unwrap().is_empty(), "nothing sent in clear");
+    }
+
+    /// A forwarded `429` keeps its `Retry-After`, a `401` its `WWW-Authenticate`.
+    #[tokio::test]
+    async fn a_forwarded_answer_keeps_its_retry_and_auth_headers() {
+        let app = Router::new()
+            .route(
+                "/busy",
+                axum::routing::get(|| async {
+                    let mut r = body(StatusCode::TOO_MANY_REQUESTS, &json!({}));
+                    r.headers_mut().insert("retry-after", "7".parse().unwrap());
+                    r
+                }),
+            )
+            .route(
+                "/who",
+                axum::routing::get(|| async {
+                    let mut r = body(StatusCode::UNAUTHORIZED, &json!({}));
+                    r.headers_mut()
+                        .insert("www-authenticate", "Bearer realm=\"x\"".parse().unwrap());
+                    r
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let peers = Peers::new("node-a", None).unwrap();
+        let r = peers
+            .send("node-b", &url, "/busy", asked_by("Bearer t"), DETAIL_LIMIT)
+            .await;
+        assert_eq!(r.status(), 429);
+        assert_eq!(r.headers()["retry-after"], "7");
+        assert_eq!(r.headers()["content-type"], "application/json");
+        let r = peers
+            .send("node-b", &url, "/who", asked_by("Bearer t"), DETAIL_LIMIT)
+            .await;
+        assert_eq!(r.status(), 401);
+        assert_eq!(r.headers()["www-authenticate"], "Bearer realm=\"x\"");
+    }
+
+    /// An answer without a length is read against the cap a chunk at a time: one past it is a
+    /// `502` as soon as it is, not once it ends.
+    #[tokio::test]
+    async fn an_answer_over_the_cap_is_cut_off_as_it_is_read() {
+        use futures_util::StreamExt;
+        let app = Router::new().fallback(|| async {
+            let chunks = futures_util::stream::iter(
+                (0..16).map(|_| Ok::<_, std::io::Error>(Bytes::from(vec![b'x'; 1 << 20]))),
+            )
+            .chain(futures_util::stream::pending());
+            axum::body::Body::from_stream(chunks)
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let t = Instant::now();
+        let r = Peers::new("node-a", None)
+            .unwrap()
+            .send("node-b", &url, "/v1/x", asked_by("Bearer t"), DETAIL_LIMIT)
+            .await;
+        assert_eq!(r.status(), 502);
+        assert!(t.elapsed() < DETAIL_LIMIT, "{:?}", t.elapsed());
+    }
+
+    /// A request to forward never prints the caller's credentials.
+    #[test]
+    fn an_asked_request_s_debug_hides_its_credentials() {
+        let shown = format!("{:?}", asked_by("Bearer the-callers-token"));
+        assert!(!shown.contains("the-callers-token"), "{shown}");
+        assert!(shown.contains("<redacted>"), "{shown}");
+    }
+
+    /// A member that gossips no API address is a `503` naming it; a request forwarded to this
+    /// node for its own detail is answered here.
+    #[tokio::test]
+    async fn a_member_without_an_api_address_is_503_and_this_node_answers_its_own() {
+        let (addr, _lone, _dir) = served("", open()).await;
+        let (code, _, text) = request(addr, "GET", "/v1/nodes/node-b", &[], "").await;
+        assert_eq!(code, 503, "{text}");
+        assert_eq!(json(&text)["error"], "node-b gossips no API address");
+        let forwarded = [(FORWARDED_BY, "node-c"), (TARGET, "node-a")];
+        let (code, _, text) = request(addr, "GET", "/v1/nodes/node-a", &forwarded, "").await;
+        assert_eq!(
+            (code, &json(&text)["node"]),
+            (200, &json!("node-a")),
+            "{text}"
+        );
+    }
+
+    /// The cluster's nodes share a CA: a peer trusts every certificate of its own `api.tls`.
+    #[tokio::test]
+    async fn peers_trust_this_node_s_own_certificate() {
+        let tls = identity();
         let bound = crate::bind(
             &data_avalanche_config::HostPort {
                 host: "127.0.0.1".into(),

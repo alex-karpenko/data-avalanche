@@ -47,7 +47,8 @@ pub use cluster::{Control, Stop};
 pub use limit::{RateLimit, VALIDATE_BURST, VALIDATE_PER_SECOND};
 pub use openapi::openapi;
 pub use peers::{
-    ACTION_LIMIT, ANSWERED_BY, DETAIL_LIMIT, FORWARDED_BY, MAX_ANSWER, Peers, STATUS_LIMIT, TARGET,
+    ACTION_LIMIT, ANSWERED_BY, DETAIL_LIMIT, FORWARDED_BY, MAX_ANSWER, Peers, PeersError,
+    STATUS_LIMIT, TARGET,
 };
 pub use server::{Bound, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT, MAX_CONNECTIONS, ServeError, bind};
 
@@ -152,10 +153,11 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
         forwards: true,
         ..route
     };
-    const FORWARDED: [(u16, &str); 4] = [
+    const FORWARDED: [(u16, &str); 5] = [
         (404, "no member of that name in this node's view"),
         (421, "a request forwarded to a node that isn't its target"),
         (502, "the node didn't answer"),
+        (503, "the member gossips no API address"),
         (504, "the node didn't answer within the time limit"),
     ];
     // A mutating route: an optional JSON body with a `note`, and what it records.
@@ -236,6 +238,7 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
                     (404, "no such generation"),
                     (409, "several snapshots of one and no record of which it is"),
                     (500, "a text couldn't be compared"),
+                    (503, "the config generations can't be read"),
                 ],
             ),
             get(generations::diff),
@@ -265,6 +268,7 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
                         "the generations, each `hash` its text's keyed fingerprint (comparable across nodes of one cluster only), and `next` when the page is full",
                     ),
                     (400, "a parameter that isn't one, or isn't in its form"),
+                    (503, "the config generations can't be read"),
                 ],
             ),
             get(generations::list),
@@ -290,6 +294,7 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
                         500,
                         "its text couldn't be masked, so it isn't shown: it has a merge key (`<<`), a tag (a `!` after a space), a directive or a byte-order mark, or a secret or a comment the masker can't place",
                     ),
+                    (503, "the config generations can't be read"),
                 ],
             ),
             get(generations::one),
@@ -516,6 +521,7 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
                     FORWARDED[1],
                     FORWARDED[2],
                     FORWARDED[3],
+                    FORWARDED[4],
                 ],
             ),
             get(nodes::get),
@@ -536,6 +542,7 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
                         FORWARDED[1],
                         FORWARDED[2],
                         FORWARDED[3],
+                        FORWARDED[4],
                     ],
                 ),
             )),
@@ -557,6 +564,7 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
                         FORWARDED[1],
                         FORWARDED[2],
                         FORWARDED[3],
+                        FORWARDED[4],
                     ],
                 ),
             )),
@@ -581,6 +589,7 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
                         FORWARDED[1],
                         FORWARDED[2],
                         FORWARDED[3],
+                        FORWARDED[4],
                     ],
                 )
             }),
@@ -607,6 +616,7 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
                         FORWARDED[1],
                         FORWARDED[2],
                         FORWARDED[3],
+                        FORWARDED[4],
                     ],
                 ),
             )),
@@ -624,6 +634,7 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
                     FORWARDED[1],
                     FORWARDED[2],
                     FORWARDED[3],
+                    FORWARDED[4],
                 ],
             )),
             get(nodes::config_status),

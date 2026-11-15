@@ -208,6 +208,7 @@ Least role: `viewer`.
 | `404` | no such generation |
 | `409` | several snapshots of one and no record of which it is |
 | `500` | a text couldn't be compared |
+| `503` | the node is starting or stopping, or its state can't be read; or the config generations can't be read |
 
 ### `GET /v1/config/generations`
 
@@ -222,6 +223,7 @@ Least role: `viewer`.
 |---|---|
 | `200` | the generations, each `hash` its text's keyed fingerprint (comparable across nodes of one cluster only), and `next` when the page is full |
 | `400` | a parameter that isn't one, or isn't in its form |
+| `503` | the node is starting or stopping, or its state can't be read; or the config generations can't be read |
 
 ### `GET /v1/config/generations/{generation}`
 
@@ -238,6 +240,7 @@ Least role: `viewer`.
 | `404` | no such generation |
 | `409` | several snapshots of it and no record of which one it is |
 | `500` | its text couldn't be masked, so it isn't shown: it has a merge key (`<<`), a tag (a `!` after a space), a directive or a byte-order mark, or a secret or a comment the masker can't place |
+| `503` | the node is starting or stopping, or its state can't be read; or the config generations can't be read |
 
 ### `GET /v1/config/nodes`
 
@@ -362,6 +365,7 @@ Least role: `viewer`.
 | `404` | no member of that name in this node's view |
 | `421` | a request forwarded to a node that isn't its target |
 | `502` | the node didn't answer |
+| `503` | the node is starting or stopping, or its state can't be read; or the member gossips no API address |
 | `504` | the node didn't answer within the time limit |
 
 ### `POST /v1/nodes/{node}/config/reload`
@@ -384,6 +388,7 @@ Least role: `operator`.
 | `421` | a request forwarded to a node that isn't its target |
 | `422` | invalid, or a restart-only field without restart=accept; or the note is too long, not a string, holds a control character, or the body isn't a JSON object |
 | `502` | the node didn't answer |
+| `503` | the node is starting or stopping, or its state can't be read; or the member gossips no API address |
 | `504` | the node didn't answer within the time limit |
 
 ### `GET /v1/nodes/{node}/config/status`
@@ -400,6 +405,7 @@ Least role: `viewer`.
 | `404` | no member of that name in this node's view |
 | `421` | a request forwarded to a node that isn't its target |
 | `502` | the node didn't answer |
+| `503` | the node is starting or stopping, or its state can't be read; or the member gossips no API address |
 | `504` | the node didn't answer within the time limit |
 
 ### `POST /v1/nodes/{node}/config/validate`
@@ -419,6 +425,7 @@ Least role: `operator`.
 | `422` | invalid, or it changes a restart-only field: the report |
 | `429` | posted bodies past the node's rate |
 | `502` | the node didn't answer |
+| `503` | the node is starting or stopping, or its state can't be read; or the member gossips no API address |
 | `504` | the node didn't answer within the time limit |
 
 ### `POST /v1/nodes/{node}/leave`
@@ -440,6 +447,7 @@ Least role: `admin`.
 | `421` | a request forwarded to a node that isn't its target |
 | `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
 | `502` | the node didn't answer |
+| `503` | the node is starting or stopping, or its state can't be read; or the member gossips no API address |
 | `504` | the node didn't answer within the time limit |
 
 ### `POST /v1/nodes/{node}/shutdown`
@@ -461,6 +469,7 @@ Least role: `admin`.
 | `421` | a request forwarded to a node that isn't its target |
 | `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
 | `502` | the node didn't answer |
+| `503` | the node is starting or stopping, or its state can't be read; or the member gossips no API address |
 | `504` | the node didn't answer within the time limit |
 
 ## events

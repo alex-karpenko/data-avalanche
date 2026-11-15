@@ -38,13 +38,39 @@ pub struct Peers {
     http: reqwest::Client,
 }
 
+/// Why the peers' client can't be built.
+#[derive(Debug, thiserror::Error)]
+pub enum PeersError {
+    /// This node's `api.tls.cert` isn't PEM.
+    #[error("the API certificate as a peer's trust: {0}")]
+    Certificate(String),
+    /// The HTTP client itself.
+    #[error("the peers' HTTP client: {0}")]
+    Client(String),
+}
+
 /// A request to forward: the caller's method, credentials, content type and body.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct Asked {
     pub method: Method,
     pub authorization: Option<HeaderValue>,
     pub content_type: Option<HeaderValue>,
     pub body: Bytes,
+}
+
+/// The caller's credentials never print.
+impl std::fmt::Debug for Asked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Asked")
+            .field("method", &self.method)
+            .field(
+                "authorization",
+                &self.authorization.as_ref().map(|_| "<redacted>"),
+            )
+            .field("content_type", &self.content_type)
+            .field("body", &format_args!("{} bytes", self.body.len()))
+            .finish()
+    }
 }
 
 impl Asked {
@@ -62,30 +88,32 @@ impl Asked {
 impl Peers {
     /// The client of node `me`. Over HTTPS it trusts the platform's roots and every certificate
     /// of this node's own `api.tls.cert` (the cluster's nodes usually share a CA), with the usual
-    /// hostname checks; redirects and proxies are not followed.
+    /// hostname checks; redirects and proxies are not followed. A node with `api.tls` forwards
+    /// over HTTPS only: a caller's credentials never go in clear to a peer that gossips an
+    /// `http://` address (one not yet restarted with TLS, say), which answers `502` instead.
     ///
     /// # Errors
-    /// The certificate isn't PEM, or the client can't be built.
-    pub fn new(me: impl Into<String>, tls: Option<&TlsIdentity>) -> Result<Self, String> {
+    /// [`PeersError`]: the certificate isn't PEM, or the client can't be built.
+    pub fn new(me: impl Into<String>, tls: Option<&TlsIdentity>) -> Result<Self, PeersError> {
         let mut b = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .no_proxy();
+            .no_proxy()
+            .https_only(tls.is_some());
         if let Some(tls) = tls {
             let certs = reqwest::Certificate::from_pem_bundle(tls.cert.text.expose().as_bytes())
-                .map_err(|e| format!("the API certificate as a peer's trust: {e}"))?;
+                .map_err(|e| PeersError::Certificate(e.to_string()))?;
             b = b.tls_certs_merge(certs);
         }
         Ok(Self {
             me: me.into(),
-            http: b
-                .build()
-                .map_err(|e| format!("the peers' HTTP client: {e}"))?,
+            http: b.build().map_err(|e| PeersError::Client(e.to_string()))?,
         })
     }
 
     /// Sends `asked` to `path_and_query` on node `node` at `api_url`, within `limit`: its answer
-    /// as it gave it (with [`ANSWERED_BY`]), or `502` when it can't be reached, `504` past the
-    /// limit.
+    /// as it gave it (its body, and its `Content-Type`, `Retry-After` and `WWW-Authenticate`,
+    /// with [`ANSWERED_BY`]), or `502` when it can't be reached or answers over [`MAX_ANSWER`]
+    /// bytes, `504` past the limit.
     pub(crate) async fn send(
         &self,
         node: &str,
@@ -125,40 +153,67 @@ impl Peers {
             }
         };
         let code = answer.status();
-        let content_type = answer.headers().get(header::CONTENT_TYPE).cloned();
+        let kept: Vec<(header::HeaderName, HeaderValue)> = [
+            header::CONTENT_TYPE,
+            header::RETRY_AFTER,
+            header::WWW_AUTHENTICATE,
+        ]
+        .into_iter()
+        .flat_map(|name| {
+            answer
+                .headers()
+                .get_all(&name)
+                .iter()
+                .map(|v| (name.clone(), v.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+        let over = || {
+            unanswered(
+                StatusCode::BAD_GATEWAY,
+                format!("{node}'s answer is over {MAX_ANSWER} bytes"),
+            )
+        };
         if answer
             .content_length()
             .is_some_and(|n| n > MAX_ANSWER as u64)
         {
-            return unanswered(
-                StatusCode::BAD_GATEWAY,
-                format!("{node}'s answer is over {MAX_ANSWER} bytes"),
-            );
+            return over();
         }
-        let bytes = match answer.bytes().await {
-            Ok(b) if b.len() <= MAX_ANSWER => b,
-            Ok(_) => {
-                return unanswered(
-                    StatusCode::BAD_GATEWAY,
-                    format!("{node}'s answer is over {MAX_ANSWER} bytes"),
-                );
+        // Read a chunk at a time against the cap: an answer without a length is never held
+        // whole past it.
+        let mut answer = answer;
+        let mut bytes = Vec::new();
+        loop {
+            match answer.chunk().await {
+                Ok(Some(chunk)) => {
+                    if bytes.len() + chunk.len() > MAX_ANSWER {
+                        return over();
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(e) if e.is_timeout() => {
+                    return unanswered(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        format!("{node} didn't answer within {limit:?}"),
+                    );
+                }
+                Err(e) => {
+                    return unanswered(
+                        StatusCode::BAD_GATEWAY,
+                        format!("{node}'s answer: {}", cause(&e)),
+                    );
+                }
             }
-            Err(e) if e.is_timeout() => {
-                return unanswered(
-                    StatusCode::GATEWAY_TIMEOUT,
-                    format!("{node} didn't answer within {limit:?}"),
-                );
-            }
-            Err(e) => {
-                return unanswered(
-                    StatusCode::BAD_GATEWAY,
-                    format!("{node}'s answer: {}", cause(&e)),
-                );
-            }
-        };
-        let mut r = (code, bytes).into_response();
-        if let Some(c) = content_type {
-            r.headers_mut().insert(header::CONTENT_TYPE, c);
+        }
+        let mut r = (code, Bytes::from(bytes)).into_response();
+        // The target's own, in place of the body's default type.
+        for (name, _) in &kept {
+            r.headers_mut().remove(name);
+        }
+        for (name, value) in kept {
+            r.headers_mut().append(name, value);
         }
         if let Ok(n) = HeaderValue::from_str(node) {
             r.headers_mut().insert(ANSWERED_BY, n);

@@ -129,7 +129,11 @@ pub(crate) fn page() -> String {
             }
             out.push_str("\n| Status | When |\n|---|---|\n");
             for (code, answer) in sorted(&op["responses"]) {
-                if ["401", "403", "503"].contains(&code.as_str()) {
+                // The common answers, said once above; a route's own `503` reason is shown.
+                let common_503 = "the node is starting or stopping, or its state can't be read";
+                if ["401", "403"].contains(&code.as_str())
+                    || (code == "503" && answer["description"] == common_503)
+                {
                     continue;
                 }
                 let _ = writeln!(

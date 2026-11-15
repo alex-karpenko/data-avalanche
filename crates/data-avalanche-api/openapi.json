@@ -257,7 +257,7 @@
             }
           },
           "503": {
-            "description": "the node is starting or stopping, or its state can't be read",
+            "description": "the node is starting or stopping, or its state can't be read; or the config generations can't be read",
             "content": {
               "application/json": {}
             }
@@ -330,7 +330,7 @@
             }
           },
           "503": {
-            "description": "the node is starting or stopping, or its state can't be read",
+            "description": "the node is starting or stopping, or its state can't be read; or the config generations can't be read",
             "content": {
               "application/json": {}
             }
@@ -408,7 +408,7 @@
             }
           },
           "503": {
-            "description": "the node is starting or stopping, or its state can't be read",
+            "description": "the node is starting or stopping, or its state can't be read; or the config generations can't be read",
             "content": {
               "application/json": {}
             }
@@ -842,7 +842,7 @@
             }
           },
           "503": {
-            "description": "the node is starting or stopping, or its state can't be read",
+            "description": "the node is starting or stopping, or its state can't be read; or the member gossips no API address",
             "content": {
               "application/json": {}
             }
@@ -951,7 +951,7 @@
             }
           },
           "503": {
-            "description": "the node is starting or stopping, or its state can't be read",
+            "description": "the node is starting or stopping, or its state can't be read; or the member gossips no API address",
             "content": {
               "application/json": {}
             }
@@ -1029,7 +1029,7 @@
             }
           },
           "503": {
-            "description": "the node is starting or stopping, or its state can't be read",
+            "description": "the node is starting or stopping, or its state can't be read; or the member gossips no API address",
             "content": {
               "application/json": {}
             }
@@ -1125,7 +1125,7 @@
             }
           },
           "503": {
-            "description": "the node is starting or stopping, or its state can't be read",
+            "description": "the node is starting or stopping, or its state can't be read; or the member gossips no API address",
             "content": {
               "application/json": {}
             }
@@ -1228,7 +1228,7 @@
             }
           },
           "503": {
-            "description": "the node is starting or stopping, or its state can't be read",
+            "description": "the node is starting or stopping, or its state can't be read; or the member gossips no API address",
             "content": {
               "application/json": {}
             }
@@ -1331,7 +1331,7 @@
             }
           },
           "503": {
-            "description": "the node is starting or stopping, or its state can't be read",
+            "description": "the node is starting or stopping, or its state can't be read; or the member gossips no API address",
             "content": {
               "application/json": {}
             }

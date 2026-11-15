@@ -137,9 +137,15 @@ fn operation(r: &Route) -> utoipa::openapi::path::Operation {
     let mut answers: Vec<(u16, String)> = r
         .answers
         .iter()
-        .chain(&COMMON)
         .map(|(code, d)| (*code, (*d).to_owned()))
         .collect();
+    // A route's own reason for a common answer (a `503`) beside the common one.
+    for (code, common) in COMMON {
+        match answers.iter_mut().find(|(c, _)| *c == code) {
+            Some((_, own)) => *own = format!("{common}; or {own}"),
+            None => answers.push((code, common.to_owned())),
+        }
+    }
     // The recording refuses a body before the route runs: its 422 beside the route's own.
     if r.records.is_some() {
         match answers.iter_mut().find(|(code, _)| *code == 422) {

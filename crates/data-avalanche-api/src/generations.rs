@@ -29,9 +29,20 @@ fn query(raw: Option<&str>) -> Result<(Option<u64>, usize), Failure> {
     for (name, value) in url::form_urlencoded::parse(raw.unwrap_or_default().as_bytes()) {
         match &*name {
             "before" => {
-                before = Some(value.trim().parse().map_err(|_| {
-                    Failure::new(StatusCode::BAD_REQUEST, "before is a generation's number")
-                })?);
+                // Generations are numbered from 1, as the OpenAPI document's minimum says.
+                before = Some(
+                    value
+                        .trim()
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|n| *n >= 1)
+                        .ok_or_else(|| {
+                            Failure::new(
+                                StatusCode::BAD_REQUEST,
+                                "before is a generation's number, 1 or more",
+                            )
+                        })?,
+                );
             }
             "limit" => {
                 limit = value
@@ -83,7 +94,8 @@ fn unreadable(e: &StateError) -> Response {
     )
 }
 
-/// The generations, newest first; `next` names the page after when this one is full.
+/// The generations, newest first; `next` names the page after whenever this one is full (there
+/// may be none after it).
 pub(crate) async fn list(State(api): State<Api>, RawQuery(raw): RawQuery) -> Response {
     let Some(node) = api.node.get() else {
         return starting();
@@ -335,6 +347,7 @@ mod tests {
             ("/v1/config/generations/3", 404),
             ("/v1/config/generations/x", 400),
             ("/v1/config/generations?limit=0", 400),
+            ("/v1/config/generations?before=0", 400),
             ("/v1/config/generations?after=1", 400),
         ] {
             assert_eq!(json_of(addr, "GET", path).await.0, want, "{path}");
