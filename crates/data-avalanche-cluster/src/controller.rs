@@ -13,14 +13,16 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use data_avalanche_config::Pipeline;
-use data_avalanche_core::{Sink, SourceConnector, SourceError, SourcePosition};
+use data_avalanche_core::{
+    SchemaChange, Sink, SourceConnector, SourceError, SourcePosition, TableRef,
+};
 use data_avalanche_pipeline::{
     Backoff, Command, CommitGuard, Exit, Hooks, Observer, Phase, PipelineWorker, Recovery, Tuning,
     WorkerDeps, WorkerError, WorkerHandle, WorkerStatus,
 };
 use data_avalanche_state::{
-    ActualState, DesiredState, Holder, Leases, PipelineDocs, RemovalDoc, Removals, RequestsDoc,
-    StatusDoc,
+    ActualState, DesiredState, EventSeverity, Holder, JobStatus, Leases, PipelineDocs, RemovalDoc,
+    Removals, RequestsDoc, SnapshotJobDoc, StatusDoc,
 };
 use data_avalanche_telemetry::{
     Metrics, PipelineLabels, PipelineMetrics, PipelineStatus, RowsRead, SnapshotState, Totals,
@@ -29,6 +31,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 
+use crate::events::{Found, HaltWatch, Recorder, StateWatch};
 use crate::jobs::Jobs;
 use crate::reconciler::{same_slot, shares};
 use crate::{Claim, Claimed, LeaseRun, LeaseTiming, RenewEnd, RenewState, release};
@@ -186,6 +189,8 @@ pub struct ControllerDeps {
     pub removals: Removals,
     /// A removed pipeline, from the generation its tombstone names, as this node resolves it.
     pub removed: RemovedPipelines,
+    /// Where the owner's events go (Admin_Console §6).
+    pub recorder: Recorder,
 }
 
 /// Why a removal tombstone's pipeline didn't resolve ([`RemovedPipelines::resolve`]).
@@ -276,6 +281,9 @@ pub struct PipelineController {
     updater: mpsc::UnboundedSender<Update>,
     removals: Removals,
     removed: RemovedPipelines,
+    recorder: Recorder,
+    /// This term's halted tables, against which a worker's are compared.
+    halts: std::sync::Mutex<HaltWatch>,
 }
 
 /// Why the owned phase ended.
@@ -340,6 +348,8 @@ struct Reported {
     last: Option<StatusDoc>,
     /// The last write failed: the next failure isn't warned of again.
     failing: bool,
+    /// The state the writes showed, for the events.
+    state: StateWatch,
 }
 
 /// `status.json` for an owned pipeline's status; `None` before the first publish.
@@ -392,25 +402,55 @@ fn labels(p: &Pipeline) -> PipelineLabels {
     }
 }
 
-/// The worker's flushes, commits and chunk reads, into the pipeline's series.
+/// The worker's flushes, commits and chunk reads, into the pipeline's series; its schema
+/// changes, into the events.
 #[derive(Debug)]
-struct Observed(Arc<PipelineMetrics>);
+struct Observed {
+    metrics: Arc<PipelineMetrics>,
+    recorder: Recorder,
+    /// The pipeline's id and name.
+    pipeline: (String, String),
+}
 
 impl Observer for Observed {
     fn flushed(&self, rows: u64, took: Duration) {
-        self.0.flushed(rows, took);
+        self.metrics.flushed(rows, took);
     }
 
     fn committed(&self, rows: u64, took: Duration) {
-        self.0.committed(rows, took);
+        self.metrics.committed(rows, took);
     }
 
     fn commit_failed(&self) {
-        self.0.commit_failed();
+        self.metrics.commit_failed();
     }
 
     fn chunk_read(&self, took: Duration) {
-        self.0.chunk_read(took);
+        self.metrics.chunk_read(took);
+    }
+
+    fn schema_evolved(&self, table: &TableRef, changes: &[SchemaChange], warning: Option<&str>) {
+        let (id, name) = &self.pipeline;
+        let what = changes
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let (kind, severity, text) = match warning {
+            None => (
+                "schema.applied",
+                EventSeverity::Info,
+                format!("{name}: {table} evolved: {what}"),
+            ),
+            Some(w) => (
+                "schema.degraded",
+                EventSeverity::Warning,
+                format!("{name}: {table} evolved in part: {what}; {w}"),
+            ),
+        };
+        let mut e = self.recorder.of_pipeline(id, kind, severity, text);
+        e.object = Some(table.to_string());
+        self.recorder.record(e);
     }
 }
 
@@ -586,6 +626,8 @@ impl PipelineController {
             updater,
             removals: deps.removals.clone(),
             removed: deps.removed.clone(),
+            recorder: deps.recorder.clone(),
+            halts: std::sync::Mutex::default(),
         }
     }
 
@@ -625,12 +667,14 @@ impl PipelineController {
                     lease,
                     written,
                     jumped,
+                    taken_from,
                 }) => {
                     tracing::info!(
                         pipeline = %self.pipeline.name,
                         owner_epoch = lease.doc.owner_epoch,
                         "lease acquired"
                     );
+                    self.leased(lease.doc.owner_epoch, taken_from.as_deref());
                     let run = LeaseRun::start(
                         self.leases.clone(),
                         lease,
@@ -842,6 +886,15 @@ impl PipelineController {
         let mut jobs = Jobs::default();
         jobs.list(&self.docs, &self.pipeline.name).await;
         let mut reported = Reported::default();
+        // The halts recorded as the term starts: a worker's later ones are news. Unread, the
+        // first streaming worker's are taken as them.
+        *self.halts.lock().expect("the halts") = match self.docs.halts().await {
+            Ok(h) => HaltWatch::recorded(&h),
+            Err(e) => {
+                tracing::warn!(pipeline = %self.pipeline.name, "the halts unread at the term's start: {e}");
+                HaltWatch::default()
+            }
+        };
         let mut poll = tokio::time::interval(self.settings.timing.renewal_interval);
         poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
         poll.tick().await;
@@ -951,6 +1004,7 @@ impl PipelineController {
                         RenewEnd::Stopped(_) => "the lease's deadline passed".into(),
                     };
                     tracing::error!(pipeline = %self.pipeline.name, "lease lost: {reason}");
+                    self.lost(&reason);
                     return Left::Lost;
                 }
                 // A shutdown drains at once; "don't own" waits for its hand-off permit.
@@ -1126,7 +1180,9 @@ impl PipelineController {
                             }
                         }
                     }
-                    jobs.poll(&self.docs, &self.pipeline.name).await;
+                    for job in jobs.poll(&self.docs, &self.pipeline.name).await {
+                        self.job_ended(&job);
+                    }
                 }
                 Event::Update(Update::Reconfigure(p)) => {
                     self.reconfigure(*p);
@@ -1185,6 +1241,9 @@ impl PipelineController {
         }
         match self.docs.save_status(&doc).await {
             Ok(_) => {
+                for f in reported.state.changes(&self.pipeline.name, &doc) {
+                    self.found(f);
+                }
                 reported.last = Some(doc);
                 reported.failing = false;
             }
@@ -1244,7 +1303,11 @@ impl PipelineController {
             owner_epoch: run.owner_epoch,
             guard: run.guard.clone(),
             hooks: parts.hooks,
-            observer: Arc::new(Observed(Arc::clone(&self.metrics))),
+            observer: Arc::new(Observed {
+                metrics: Arc::clone(&self.metrics),
+                recorder: self.recorder.clone(),
+                pipeline: (self.pipeline.id.clone(), self.pipeline.name.clone()),
+            }),
             reader_ended: Arc::clone(reader_ended),
         };
         let (worker, handle) =
@@ -1337,24 +1400,42 @@ impl PipelineController {
             Some(w) => self.drain(w, &mut Lag::default()).await,
             None => true,
         };
-        if !drained {
+        let name = &self.pipeline.name;
+        let (severity, text) = if !drained {
             let _ = run.stop().await;
             tracing::warn!(
-                pipeline = %self.pipeline.name,
+                pipeline = %name,
                 "removed with its drain cut off: the lease expires, then what the source created for the pipeline is torn down"
             );
+            (
+                EventSeverity::Warning,
+                format!(
+                    "{name} removed with its drain cut off: what its source holds for it is torn down once its lease expires"
+                ),
+            )
         } else if self.teardown(&*run.guard).await {
             self.removal_done().await;
             self.give_back(run).await;
+            (
+                EventSeverity::Info,
+                format!("{name} removed: drained, and what its source held for it torn down"),
+            )
         } else {
             let _ = run.stop().await;
             tracing::warn!(
-                pipeline = %self.pipeline.name,
+                pipeline = %name,
                 "removed after its lease was lost: what the source created for the pipeline stays to its holder"
             );
-        }
+            (
+                EventSeverity::Warning,
+                format!(
+                    "{name} removed after its lease was lost: what its source holds for it is torn down by the next holder"
+                ),
+            )
+        };
         self.metrics.forget();
-        tracing::info!(pipeline = %self.pipeline.name, "pipeline removed");
+        tracing::info!(pipeline = %name, "pipeline removed");
+        self.record("pipeline.removed", severity, text);
     }
 
     /// Marks the removal's tombstone done: what follows the pipeline may start. Not written, the
@@ -1524,7 +1605,14 @@ impl PipelineController {
     async fn give_back(&self, run: LeaseRun) {
         match run.stop().await {
             RenewEnd::Stopped(lease) => match release(&self.leases, &lease).await {
-                Ok(()) => tracing::info!(pipeline = %self.pipeline.name, "lease released"),
+                Ok(()) => {
+                    tracing::info!(pipeline = %self.pipeline.name, "lease released");
+                    self.record(
+                        "lease.released",
+                        EventSeverity::Info,
+                        format!("{} let go by {}", self.pipeline.name, self.holder.node_id),
+                    );
+                }
                 Err(e) => tracing::warn!(
                     pipeline = %self.pipeline.name,
                     "lease not released ({e}); it expires instead"
@@ -1532,13 +1620,96 @@ impl PipelineController {
             },
             RenewEnd::Lost { reason } => {
                 tracing::warn!(pipeline = %self.pipeline.name, "lease lost: {reason}");
+                self.lost(&reason);
             }
         }
+    }
+
+    /// Records one of the pipeline's events.
+    fn record(&self, kind: &str, severity: EventSeverity, text: String) {
+        self.recorder.record(
+            self.recorder
+                .of_pipeline(&self.pipeline.id, kind, severity, text),
+        );
+    }
+
+    /// Records what a watcher found.
+    fn found(&self, f: Found) {
+        let mut e = self
+            .recorder
+            .of_pipeline(&self.pipeline.id, f.kind, f.severity, f.text);
+        e.object = f.object;
+        self.recorder.record(e);
+    }
+
+    /// The lease is this node's at `epoch`: acquired, or taken over from `from` (a failover).
+    fn leased(&self, epoch: u64, from: Option<&str>) {
+        let (name, node) = (&self.pipeline.name, &self.holder.node_id);
+        match from {
+            Some(from) => self.record(
+                "lease.takeover",
+                EventSeverity::Warning,
+                format!("{name} taken over by {node} from {from}, whose lease went unrenewed (owner epoch {epoch})"),
+            ),
+            None => self.record(
+                "lease.acquired",
+                EventSeverity::Info,
+                format!("{name} runs on {node} (owner epoch {epoch})"),
+            ),
+        }
+    }
+
+    fn lost(&self, reason: &str) {
+        self.record(
+            "lease.lost",
+            EventSeverity::Error,
+            format!(
+                "{} lost its lease on {}: {reason}",
+                self.pipeline.name, self.holder.node_id
+            ),
+        );
+    }
+
+    /// A snapshot job that ended, completed or failed.
+    fn job_ended(&self, job: &SnapshotJobDoc) {
+        let short: String = job.job_id.chars().take(8).collect();
+        let name = &self.pipeline.name;
+        let (kind, severity, text) = match job.status {
+            JobStatus::Failed => (
+                "job.failed",
+                EventSeverity::Error,
+                format!(
+                    "snapshot job {short} of {name} failed: {}",
+                    job.error.as_deref().unwrap_or("a table failed")
+                ),
+            ),
+            _ => (
+                "job.completed",
+                EventSeverity::Info,
+                format!(
+                    "snapshot job {short} of {name} completed: {} tables copied",
+                    job.tables.len()
+                ),
+            ),
+        };
+        let mut e = self
+            .recorder
+            .of_pipeline(&self.pipeline.id, kind, severity, text);
+        e.object = Some(job.job_id.clone());
+        self.recorder.record(e);
     }
 
     /// The worker's status into the metrics, and its new warnings and reconnects into the log.
     fn observe(&self, w: &mut Running, pending: &mut Lag) {
         let st = w.handle.status.borrow().clone();
+        let halts = self
+            .halts
+            .lock()
+            .expect("the halts")
+            .changes(&st.phase, &st.halted);
+        for f in halts {
+            self.found(f);
+        }
         for warning in &st.warnings {
             if w.logged.insert(warning.clone()) {
                 tracing::warn!(pipeline = %self.pipeline.name, "{warning}");
@@ -1658,9 +1829,9 @@ mod tests {
 
     use super::*;
     use crate::test_support::{
-        Fault, Kind, ScriptedStore, TestFactory, acquired, deps, eventually, holder, leases,
-        metrics, node, pipeline, pipeline_docs, pipeline_docs_on, removals, row, timing, tombstone,
-        until,
+        Fault, Kind, ScriptedStore, TestFactory, acquired, deps, events_until, eventually, holder,
+        leases, metrics, node, pipeline, pipeline_docs, pipeline_docs_on, recorded_node, removals,
+        row, timing, tombstone, until,
     };
 
     /// A real two-second watchdog over `wait` on the paused clock: a controller that spins keeps
@@ -2330,6 +2501,55 @@ mod tests {
         assert!(done.finished_at.is_some());
         assert_eq!(f.ids("a"), [1, 2, 3]);
         assert_eq!(f.builds(), 2, "the job's restart");
+    }
+
+    /// The owner records its lease, its tables' halts and its jobs' ends, each about its object
+    /// (Admin_Console §6); then its error and its recovery.
+    #[tokio::test(start_paused = true)]
+    async fn the_owner_records_its_lease_halts_jobs_and_errors() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a", "b"]);
+        let (mut n, events) = recorded_node("n1", &store, &docs, &f);
+        until(&mut n.status, "running", is(Actual::Running)).await;
+        f.source.fail(
+            Method::ReadChunk,
+            SourceError::TableHalt {
+                table: t("a"),
+                reason: data_avalanche_core::HaltReason::TableDropped,
+            },
+        );
+        ask_job(&docs, "p~1", &["a"]).await;
+        docs.request(Action::Restart, asked("p~1")).await.unwrap();
+        let has =
+            |seen: &[(String, Option<String>)], kind: &str| seen.iter().any(|(k, _)| k == kind);
+        events_until(&events, "the halt", |s| has(s, "table.halted")).await;
+        // The halt is recorded with the next flush: the job then fails.
+        f.source.commit(FakeTxn::new().insert(&t("b"), row(1)));
+        let seen = events_until(&events, "the job's end", |s| has(s, "job.failed")).await;
+        assert_eq!(seen[0], ("lease.acquired".to_owned(), None));
+        assert!(
+            seen.contains(&("table.halted".to_owned(), Some("public.a".to_owned()))),
+            "{seen:?}"
+        );
+        assert!(
+            seen.contains(&("job.failed".to_owned(), Some("p~1".to_owned()))),
+            "{seen:?}"
+        );
+
+        f.source.fail(
+            Method::Preflight,
+            SourceError::Permanent("no privilege".into()),
+        );
+        docs.request(Action::Restart, asked("r2")).await.unwrap();
+        events_until(&events, "the error", |s| has(s, "pipeline.error")).await;
+        docs.request(Action::Restart, asked("r3")).await.unwrap();
+        let seen = events_until(&events, "the recovery", |s| has(s, "pipeline.running")).await;
+        let halted = seen.iter().filter(|(k, _)| k == "table.halted").count();
+        assert_eq!(
+            halted, 1,
+            "a halt carried into the next worker isn't news: {seen:?}"
+        );
     }
 
     /// A job's table that halts while its snapshot runs fails, with the halt's code, once the

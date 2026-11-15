@@ -238,6 +238,7 @@ pub(crate) async fn lone_with(file: PathBuf, text: &str, env: Arc<dyn Env + Send
         },
         starts: Arc::new(Semaphore::new(1)),
         handoffs: Arc::new(Semaphore::new(1)),
+        recorder: recorder.clone(),
     };
     let reconciler =
         ClusterReconciler::start(vec![], &deps, gossip.members(), ReconcilerSettings::new(c));
@@ -256,6 +257,7 @@ pub(crate) async fn lone_with(file: PathBuf, text: &str, env: Arc<dyn Env + Send
             advertiser: gossip.advertiser(),
             metrics,
             globals: Arc::new(|_| {}),
+            recorder: recorder.clone(),
         },
         gossip.members(),
         Duration::from_secs(10),

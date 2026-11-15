@@ -81,16 +81,17 @@ impl Jobs {
     }
 
     /// One poll: each job's running tables, from their documents, into the job; a job that
-    /// ended, or is gone, is followed no more.
-    pub async fn poll(&mut self, docs: &PipelineDocs, pipeline: &str) {
+    /// ended, or is gone, is followed no more. The jobs that ended at this poll.
+    pub async fn poll(&mut self, docs: &PipelineDocs, pipeline: &str) -> Vec<SnapshotJobDoc> {
+        let mut done = Vec::new();
         if self.0.is_none() {
             self.list(docs, pipeline).await;
         }
         let Some(ids) = self.0.as_mut() else {
-            return;
+            return done;
         };
         if ids.is_empty() {
-            return;
+            return done;
         }
         // The jobs before the halts: the worker's start clears a table's halt, then records it
         // running, so a table read running here had its halt cleared before the halts are read.
@@ -112,7 +113,7 @@ impl Jobs {
             ids.remove(&id);
         }
         if jobs.is_empty() {
-            return;
+            return done;
         }
         let halts = match docs.halts().await {
             Ok(h) => h,
@@ -121,7 +122,7 @@ impl Jobs {
                     pipeline,
                     "halts unread, snapshot jobs followed at the next poll: {e}"
                 );
-                return;
+                return done;
             }
         };
         for v in jobs {
@@ -130,6 +131,7 @@ impl Jobs {
                 Ok(Some(job)) => {
                     tracing::info!(pipeline, job = %id, status = ?job.status, "snapshot job ended");
                     ended.push(id);
+                    done.push(job);
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -138,7 +140,7 @@ impl Jobs {
             }
         }
         if ended.is_empty() {
-            return;
+            return done;
         }
         for id in ended {
             ids.remove(&id);
@@ -148,6 +150,7 @@ impl Jobs {
             Ok(n) => tracing::info!(pipeline, deleted = n, "ended snapshot jobs pruned"),
             Err(e) => tracing::warn!(pipeline, "ended snapshot jobs unpruned: {e}"),
         }
+        done
     }
 }
 

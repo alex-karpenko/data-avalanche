@@ -39,6 +39,32 @@ pub enum SchemaChange {
     Unclassifiable(String),
 }
 
+impl std::fmt::Display for SchemaChange {
+    /// The change in a few words, as an event or a log line names it (`add column note (text)`).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AddColumn(c) => write!(f, "add column {} ({})", c.name, c.source_type),
+            Self::DropColumn(c) => write!(f, "drop column {c}"),
+            Self::RenameColumn { from, to, .. } => write!(f, "rename column {from} to {to}"),
+            Self::ChangeType {
+                column, from, to, ..
+            } => write!(
+                f,
+                "change column {column} from {} to {}",
+                from.source_type, to.source_type
+            ),
+            Self::SetNotNull(c) => write!(f, "set column {c} not null"),
+            Self::DropNotNull(c) => write!(f, "drop not null on column {c}"),
+            Self::IdentifierChanged => f.write_str("change the identifier"),
+            Self::TableDropped => f.write_str("drop the table"),
+            Self::EnumValuesAppended(c) => write!(f, "append values to column {c}"),
+            Self::EnumValuesChanged(c) => write!(f, "change the values of column {c}"),
+            Self::NoTargetEffect(what) => write!(f, "{what} (no effect on the target)"),
+            Self::Unclassifiable(what) => write!(f, "unclassified: {what}"),
+        }
+    }
+}
+
 /// The changes to one table at one stream position.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaDelta {

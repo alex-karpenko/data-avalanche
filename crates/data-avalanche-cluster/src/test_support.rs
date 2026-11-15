@@ -500,6 +500,7 @@ pub(crate) fn deps(
         handoffs: Arc::new(tokio::sync::Semaphore::new(2)),
         removals: removals(store),
         removed: removed(),
+        recorder: crate::Recorder::off(name),
     }
 }
 
@@ -509,7 +510,57 @@ pub(crate) fn node(
     docs: &data_avalanche_state::PipelineDocs,
     factory: &TestFactory,
 ) -> Node {
-    let deps = deps(name, store, factory);
+    node_of(deps(name, store, factory), docs)
+}
+
+/// [`node`], its events recorded to a timeline of their own (not on `store`, whose faults the
+/// tests count).
+pub(crate) fn recorded_node(
+    name: &str,
+    store: &Arc<ScriptedStore>,
+    docs: &data_avalanche_state::PipelineDocs,
+    factory: &TestFactory,
+) -> (Node, Arc<data_avalanche_state::Events>) {
+    let events = Arc::new(data_avalanche_state::Events::new(DocStore::new(Arc::new(
+        ObjectStoreVersioned::new(Arc::new(InMemory::new()), "state").unwrap(),
+    ))));
+    let mut deps = deps(name, store, factory);
+    deps.recorder = crate::Recorder::start(Arc::clone(&events), name, Metrics::new()).0;
+    (node_of(deps, docs), events)
+}
+
+/// The kinds and objects recorded so far, oldest first, once `cond` holds of them (on the test
+/// clock).
+pub(crate) async fn events_until(
+    events: &data_avalanche_state::Events,
+    what: &str,
+    cond: impl Fn(&[(String, Option<String>)]) -> bool,
+) -> Vec<(String, Option<String>)> {
+    let mut last = Vec::new();
+    for _ in 0..1200 {
+        let page = events
+            .list(&data_avalanche_state::EventQuery {
+                limit: 1000,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut seen: Vec<_> = page
+            .events
+            .into_iter()
+            .map(|(_, e)| (e.kind, e.object))
+            .collect();
+        seen.reverse();
+        if cond(&seen) {
+            return seen;
+        }
+        last = seen;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("no {what} recorded: {last:?}");
+}
+
+fn node_of(deps: crate::ControllerDeps, docs: &data_avalanche_state::PipelineDocs) -> Node {
     let (controller, status) = crate::PipelineController::new(pipeline(), docs.clone(), &deps);
     let (target, rx) = tokio::sync::watch::channel(crate::Target::Own);
     Node {
@@ -894,6 +945,7 @@ impl TestCluster {
                 advertiser: gossip.advertiser(),
                 metrics: deps.metrics.clone(),
                 globals: Arc::new(|_| {}),
+                recorder: crate::Recorder::off(name),
             },
             gossip.members(),
             timing().renewal_interval,

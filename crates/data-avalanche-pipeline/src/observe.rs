@@ -5,6 +5,8 @@
 use std::fmt::Debug;
 use std::time::Duration;
 
+use data_avalanche_core::{SchemaChange, TableRef};
+
 /// The owner's ears; every method defaults to nothing, and none may block.
 pub trait Observer: Send + Sync + Debug {
     /// A flush is durable: the rows of its change sets, and the time from when the writer took
@@ -26,6 +28,12 @@ pub trait Observer: Send + Sync + Debug {
     /// A snapshot chunk was read from the source.
     fn chunk_read(&self, took: Duration) {
         let _ = took;
+    }
+
+    /// The sink evolved `table` by `changes`: fully, or degraded, with `warning` saying what it
+    /// left undone. A change the sink refused halts the table instead, and isn't reported here.
+    fn schema_evolved(&self, table: &TableRef, changes: &[SchemaChange], warning: Option<&str>) {
+        let _ = (table, changes, warning);
     }
 }
 

@@ -12,7 +12,7 @@ use data_avalanche_cluster::{
     ClusterReconciler, ConfigCoordinator, ControllerDeps, ControllerSettings, CoordinatorDeps,
     DocsFn, Gossip, GossipKey, GossipSettings, LeaseTiming, NodeIdentity, NodeMeta, Phase,
     ReconcilerSettings, Recorder, Seeds, Udp, advertise, discover, expire_events, interfaces,
-    join as join_gossip, leave, node_identity, removed_pipelines,
+    join as join_gossip, leave, node_identity, record_members, removed_pipelines,
 };
 use data_avalanche_config::{
     Diagnostic, FingerprintKey, ProcessEnv, Report, ResolvedConfig, Severity, load_str,
@@ -172,6 +172,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         factory: Arc::new(Factory::new(&config.globals).map_err(Fatal::Config)?),
         metrics: metrics.clone(),
         settings: settings(&config),
+        recorder: recorder.clone(),
         starts: Arc::new(Semaphore::new(
             usize::try_from(c.max_concurrent_takeovers).unwrap_or(usize::MAX),
         )),
@@ -212,6 +213,8 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     let key = GossipKey::derive(&joined.fingerprint_key);
     let gossip = Gossip::start(me, key, GossipSettings::new(m), Arc::new(udp), inbox);
     tracing::info!(%addr, bound = ?bind, "gossip started");
+    // Joins, suspicions and departures, each recorded by one node (Admin_Console §6).
+    let _membership = tokio::spawn(record_members(recorder.clone(), gossip.members()));
     let seeds = Seeds::new(c);
     let seeded = !seeds.is_empty();
     let discovery = discover(seeds, own, gossip.announcer(), gossip.members());
@@ -244,6 +247,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
                 reloaded_auth.set(&g.api);
                 retention.send_replace(g.console.events.retention);
             }),
+            recorder: recorder.clone(),
         },
         gossip.members(),
         c.lease_renewal_interval,
