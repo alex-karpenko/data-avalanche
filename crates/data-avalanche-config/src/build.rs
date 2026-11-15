@@ -541,7 +541,10 @@ fn api(a: &RawApi, at: &At, ctx: &mut Ctx) -> Option<Api> {
     };
     Some(Api {
         address: address?,
-        advertise_url: advertise_url?.map(|u| u.trim().to_owned()),
+        advertise_url: advertise_url?.map(|u| {
+            let u = u.trim();
+            u.strip_suffix('/').unwrap_or(u).to_owned()
+        }),
         auth,
         credentials,
         jwt,

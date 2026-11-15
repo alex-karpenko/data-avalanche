@@ -1246,6 +1246,18 @@ fn advertise_url_is_absent_by_default_and_stored_trimmed() {
         cfg.globals.api.advertise_url.as_deref(),
         Some("https://cdc-0.cdc:8080")
     );
+    // One trailing `/` is dropped too: a later task builds `{advertise_url}{path}`.
+    let yaml = MINIMAL.replace(
+        "globals:\n  state: { bucket: app-state }",
+        "globals:\n  state: { bucket: app-state }\n  api:\n    advertise_url: \"https://cdc-0.cdc:8080/\"",
+    );
+    let cfg = load_str(&yaml, &env(&[("PW", "pw")]), &fp_key())
+        .unwrap_or_else(|r| panic!("{r:#?}"))
+        .config;
+    assert_eq!(
+        cfg.globals.api.advertise_url.as_deref(),
+        Some("https://cdc-0.cdc:8080")
+    );
 }
 
 /// Config §6.8: the console's secrets resolve as secrets (shown by fingerprint), Prometheus takes

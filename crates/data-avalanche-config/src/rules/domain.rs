@@ -634,21 +634,45 @@ fn http_headers(ctx: &mut Ctx, headers: &BTreeMap<String, Leaf<String>>, at: &At
     }
 }
 
-/// Whether `text` is an absolute `http`/`https` URL with a host.
 /// An `http(s)://host[:port]` URL, a trailing `/` at most: where a node is reached, not a page.
+/// The host is non-empty (an IPv6 host in brackets); a written port is 1 to 65535.
 fn origin_url(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    let rest = lower
+    let Some(r) = lower
         .strip_prefix("https://")
-        .or_else(|| lower.strip_prefix("http://"));
-    rest.is_some_and(|r| {
-        let host = r.strip_suffix('/').unwrap_or(r);
-        !host.is_empty()
-            && !host.contains(['/', '?', '#', '@'])
-            && !host.contains(char::is_whitespace)
-    })
+        .or_else(|| lower.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let authority = r.strip_suffix('/').unwrap_or(r);
+    if authority.contains(['/', '?', '#', '@']) || authority.contains(char::is_whitespace) {
+        return false;
+    }
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(v6) => match v6.split_once(']') {
+            Some((inner, "")) => (inner, None),
+            Some((inner, after)) => match after.strip_prefix(':') {
+                Some(p) => (inner, Some(p)),
+                None => return false,
+            },
+            None => return false,
+        },
+        None => match authority.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (authority, None),
+        },
+    };
+    !host.is_empty() && !host.contains(['[', ']']) && port.is_none_or(valid_port)
 }
 
+/// A port written as 1 to 5 digits, 1 to 65535.
+fn valid_port(p: &str) -> bool {
+    p.len() <= 5
+        && p.bytes().all(|b| b.is_ascii_digit())
+        && matches!(p.parse::<u32>(), Ok(1..=65535))
+}
+
+/// Whether `text` is an absolute `http`/`https` URL with a host.
 fn http_url(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     let rest = lower

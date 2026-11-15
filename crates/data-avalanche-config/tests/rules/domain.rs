@@ -366,6 +366,24 @@ pub fn cases() -> Vec<Case> {
                 )
             },
         ),
+        case(
+            "V-138",
+            Error,
+            "an advertise_url with an empty host",
+            || pg_delta().set("/globals/api/advertise_url", json!("https://:8080")),
+        ),
+        case(
+            "V-138",
+            Error,
+            "an advertise_url with a non-numeric port",
+            || pg_delta().set("/globals/api/advertise_url", json!("http://cdc-0.cdc:abc")),
+        ),
+        case(
+            "V-138",
+            Silent,
+            "an advertise_url of an IPv6 host and port",
+            || pg_delta().set("/globals/api/advertise_url", json!("http://[::1]:8080")),
+        ),
         case("V-131", Error, "basic and a bearer token", || {
             pg_delta().set("/globals/console/prometheus", json!({"url": "https://prom", "basic": {"user": "u", "password": "p"}, "bearer_token": "t"}))
         }),
