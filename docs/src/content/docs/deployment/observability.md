@@ -23,6 +23,8 @@ to the snapshot gauges.
 | Cluster | `data_avalanche_lease_state`, `data_avalanche_lease_renew_failures_total`, `data_avalanche_lease_renew_latency_seconds`, `data_avalanche_cluster_members`, `data_avalanche_owned_pipelines`, `data_avalanche_ring_generation` |
 | Status | `data_avalanche_pipeline_status` (running, paused, stopped, error), `data_avalanche_halted_tables` |
 | Events | `data_avalanche_events_written_total`, `data_avalanche_events_dropped_total`: the node's writes to the cluster's [timeline](/data-avalanche/deployment/events/) |
+| Process | `process_resident_memory_bytes`, `process_cpu_seconds_total` (Linux, the usual names), `data_avalanche_process_memory_limit_bytes`, `data_avalanche_process_cpu_limit_cores`: the container's limits, absent when there is none |
+| Gossip | `data_avalanche_gossip_probe_rtt_seconds`: a probe's round trip; `data_avalanche_gossip_suspicions_total{direction}`: suspicions this node `raised` of another, and `received` of itself |
 
 The ones to watch first:
 

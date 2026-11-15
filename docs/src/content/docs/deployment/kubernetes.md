@@ -101,3 +101,20 @@ seconds: each one resolves the Service again every 5 s ([discovery](/data-avalan
 With `globals.api.tls.enabled: true` the API and the probes speak HTTPS: set `apiTls: true` when the
 config isn't a map the chart can read it from. Pass the certificate and key as `${VAR}`s from a
 Secret, or mount them with `extraVolumes` and name their paths.
+
+### The address the other nodes use
+
+Each node gossips the URL of its API, so that any node can show another's detail and pass a node
+action on to it (`/v1/nodes/{node}`). Without TLS it is `http://` and the pod's IP. With TLS the
+other nodes check the certificate against the name they connect to, so give each pod its DNS name
+under the headless Service, which the chart sets as `DATA_AVALANCHE_POD_DNS_NAME`:
+
+```yaml
+globals:
+  api:
+    advertise_url: https://${DATA_AVALANCHE_POD_DNS_NAME}:8443
+```
+
+The certificate must cover that name: `*.<release>-data-avalanche-headless.<namespace>.svc.cluster.local`, the headless Service the chart names after the release. A
+node trusts the system's roots and every certificate in its own `api.tls.cert`: put your CA after
+the node's certificate there when it is a private one.

@@ -32,6 +32,20 @@ During the roll both versions run the cluster's one config generation and share 
 the release notes say a version can't run beside its predecessor, stop every node first and start
 them on the new version.
 
+## From 1.0 to 1.1: stop every node first
+
+A 1.1 node's gossip packets carry the API address and a hash of the node's config file, under a
+new MAC: a 1.0 node can't open them, nor a 1.1 node a 1.0 node's. Rolled one node at a time, the
+two versions would see each other as gone, and each would place the pipelines among its own
+members only. So stop every node, then start them all on 1.1:
+
+- On Kubernetes, `kubectl scale statefulset <release> --replicas=0`, wait until its pods are
+  gone, then `helm upgrade`: it scales the StatefulSet back to the chart's `replicas`.
+- Outside Kubernetes, `SIGTERM` (or `POST /v1/admin/shutdown`) every node, wait for each to exit,
+  then start them on 1.1.
+
+The pipelines stop for as long as no node runs. Each one resumes from its committed position.
+
 ## A new config with the upgrade
 
 `helm upgrade` doesn't apply a changed config (see
