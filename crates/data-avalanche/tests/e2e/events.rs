@@ -43,7 +43,22 @@ async fn the_timeline_records_who_paused_and_a_failover() {
     c.settled().await;
     let reader = c.live()[0].proc.as_ref().expect("a live node");
 
-    let actions = listed(reader, &format!("kind=action&object={id}")).await;
+    // Written by the node asked, asynchronously: read until both are there.
+    let query = format!("kind=action&object={id}");
+    let kinds_of = |events: &[Value]| -> Vec<String> {
+        events
+            .iter()
+            .map(|e| e["kind"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    eventually("the actions", Duration::from_secs(30), async || {
+        let kinds = kinds_of(&listed(reader, &query).await);
+        ["action.pipeline.pause", "action.pipeline.resume"]
+            .iter()
+            .all(|k| kinds.iter().any(|x| x == k))
+    })
+    .await;
+    let actions = listed(reader, &query).await;
     let kinds: Vec<&str> = actions
         .iter()
         .map(|e| e["kind"].as_str().unwrap())

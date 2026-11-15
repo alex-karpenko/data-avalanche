@@ -1211,8 +1211,6 @@ fn a_posted_templated_mysql_id_derives_no_server_id() {
     assert!(!shown.contains("sekret-value-1"), "{shown}");
 }
 
-/// Config §6.8: the console's secrets resolve as secrets (shown by fingerprint), Prometheus takes
-/// its bearer token and labels, and the oauth2 sign-in fields keep their defaults.
 #[test]
 fn console_urls_are_stored_trimmed() {
     let yaml = MINIMAL.replace(
@@ -1230,6 +1228,8 @@ fn console_urls_are_stored_trimmed() {
     );
 }
 
+/// Config §6.8: the console's secrets resolve as secrets (shown by fingerprint), Prometheus takes
+/// its bearer token and labels, and the oauth2 sign-in fields keep their defaults.
 #[test]
 fn console_settings_resolve_with_their_secrets_hidden() {
     let yaml = MINIMAL.replace(
