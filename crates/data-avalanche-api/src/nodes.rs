@@ -714,6 +714,30 @@ mod tests {
         assert_eq!(got, want);
     }
 
+    /// A peer that answers otherwise than `200`, or not within the limit, has no pending
+    /// fields and is named with why; the others are listed all the same.
+    #[tokio::test]
+    async fn a_peer_s_status_that_fails_is_named_in_the_nodes_files() {
+        for (delay, why) in [
+            (Duration::ZERO, "node-b answered 202 Accepted"),
+            (Duration::from_secs(30), "node-b didn't answer within 2s"),
+        ] {
+            let (b, _log) = fake(delay).await;
+            let (addr, _lone, _dir) = served(&b, open()).await;
+            let t = Instant::now();
+            let (code, _, text) = request(addr, "GET", "/v1/config/nodes", &[], "").await;
+            assert_eq!(code, 200, "{text}");
+            assert!(t.elapsed() < STATUS_LIMIT * 2, "{:?}", t.elapsed());
+            let v = json(&text);
+            assert_eq!(v["nodes"][0]["restart_pending"], json!([]), "{v}");
+            assert_eq!(
+                (&v["nodes"][1]["restart_pending"], &v["nodes"][1]["error"]),
+                (&Value::Null, &json!(why)),
+                "{v}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn this_node_s_detail_is_answered_here() {
         let (b, log) = fake(Duration::ZERO).await;

@@ -18,7 +18,7 @@
 //! secret's text that is also written as another key's value (a `user` that is the `password`)
 //! stays shown there: only the secret keys are masked. A text with a merge key (`<<`), a tag or a
 //! directive isn't shown ([`MaskError::MergeKey`]): a key that overrides or retags a value would
-//! hide the secret the masker reads.
+//! hide the secret the masker reads. [`diff_written`] shows no text, so it needs no such refusal.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -233,6 +233,10 @@ pub struct WrittenDiff {
 /// by value as written (Admin_Console §4 Config, D-M13b.11), secrets shown as [`mask_secrets`]
 /// shows them. A `${VAR}` whose value changed isn't a change here: the text is the same.
 ///
+/// Unlike [`mask_secrets`], it doesn't refuse a text with a merge key, a tag, a directive or a
+/// byte-order mark: it shows no text, only each leaf as parsed, by its path, and a secret key's
+/// leaf is masked there whatever wrote it (a merge, a tag, an anchor). Comments aren't leaves.
+///
 /// # Errors
 /// [`MaskError::Parse`]: one of them isn't a config.
 pub fn diff_written(from: &str, to: &str, key: &FingerprintKey) -> Result<WrittenDiff, MaskError> {
@@ -264,14 +268,19 @@ pub fn diff_written(from: &str, to: &str, key: &FingerprintKey) -> Result<Writte
     })
 }
 
-/// A written path's reload class.
+/// A written path's reload class: its key's, the pipeline's id read as `*` (as the keys are
+/// spelled, a renamed one included), a `defaults` key as the pipelines'.
 fn class_of(path: &str) -> &'static str {
     let mut segments: Vec<&str> = path
         .split('.')
         .map(|s| s.split('[').next().unwrap_or(s))
         .collect();
-    if segments.first() == Some(&"defaults") {
-        segments.splice(0..1, ["pipelines", "*"]);
+    match segments.first() {
+        Some(&"defaults") => {
+            segments.splice(0..1, ["pipelines", "*"]);
+        }
+        Some(&"pipelines") if segments.len() > 1 => segments[1] = "*",
+        _ => {}
     }
     let key = segments.join(".");
     if is_fixed(&key) {
@@ -770,6 +779,56 @@ pipelines:
                     Some("public.lines")
                 ),
             ]
+        );
+    }
+
+    /// A change's class is its key's, whatever the pipeline's id: a key the resolved config
+    /// spells otherwise (the Delta catalog's `type`) included, a `defaults` key as the pipelines'.
+    #[test]
+    fn a_change_is_classed_by_its_key_whatever_the_pipeline_s_id() {
+        assert_eq!(
+            class_of("pipelines.orders.sink.delta.catalog.type"),
+            class_of("pipelines.*.sink.delta.catalog.type")
+        );
+        assert_eq!(
+            Some(class_of("pipelines.orders.sink.delta.catalog.type")),
+            key_mutability("pipelines.*.sink.delta.catalog.type").map(|m| match m {
+                Mutability::R => "in_place",
+                Mutability::PrIfTableSetChanges => "tables",
+                Mutability::Pr => "pipeline_restart",
+                Mutability::Proc => "node_restart",
+            })
+        );
+        assert_ne!(
+            class_of("pipelines.orders.sink.delta.catalog.type"),
+            "node_restart"
+        );
+        assert_eq!(
+            class_of("pipelines.orders.sink.iceberg.catalog.rest.token_file"),
+            class_of("pipelines.*.sink.iceberg.catalog.rest.token_file")
+        );
+        assert_eq!(
+            class_of("defaults.source.port"),
+            class_of("pipelines.orders.source.port")
+        );
+    }
+
+    /// A pipeline removed is named, not its every key; a `defaults` change is classed as the
+    /// pipelines' key it applies to.
+    #[test]
+    fn a_removed_pipeline_is_named_and_a_defaults_change_classed() {
+        let from = "config_version: 1\ndefaults:\n  source: { port: 5432 }\npipelines:\n  a: { source: { host: h } }\n  b: { source: { host: h } }\n";
+        let to = "config_version: 1\ndefaults:\n  source: { port: 5433 }\npipelines:\n  a: { source: { host: h } }\n";
+        let d = diff_written(from, to, &key()).unwrap();
+        assert_eq!((d.added, d.removed), (vec![], vec!["b".to_owned()]));
+        assert_eq!(
+            d.changes,
+            [WrittenChange {
+                path: "defaults.source.port".into(),
+                class: class_of("pipelines.*.source.port"),
+                before: Some("5432".into()),
+                after: Some("5433".into()),
+            }]
         );
     }
 
