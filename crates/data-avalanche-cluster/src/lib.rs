@@ -3,6 +3,7 @@
 //! commit guard it answers, the controller that runs a pipeline's worker while it holds the
 //! lease, and the reconciler that tells each controller whether to own.
 
+pub mod advertised;
 pub mod claim;
 #[cfg(test)]
 mod cluster_tests;
@@ -22,6 +23,7 @@ pub mod ring;
 mod test_support;
 pub mod wire;
 
+pub use advertised::{FILE_CHECK, api_url, file_hash, watch_file};
 pub use claim::{Claim, Claimed, release};
 pub use controller::{
     Actual, Configured, ControllerDeps, ControllerSettings, ControllerStatus, CurrentPipeline,

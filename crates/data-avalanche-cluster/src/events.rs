@@ -706,6 +706,8 @@ mod tests {
                                 phase: *phase,
                                 config_generation: 1,
                                 build: "1.1.0".into(),
+                                api_url: String::new(),
+                                file_hash: String::new(),
                             },
                             suspect: *suspect,
                         },

@@ -11,8 +11,9 @@ use data_avalanche_api::{Api, Auth, Control, Node, RateLimit, ServeError, Stop, 
 use data_avalanche_cluster::{
     ClusterReconciler, ConfigCoordinator, ControllerDeps, ControllerSettings, CoordinatorDeps,
     DocsFn, Gossip, GossipKey, GossipSettings, LeaseTiming, NodeIdentity, NodeMeta, Phase,
-    ReconcilerSettings, Recorder, Seeds, Udp, advertise, discover, expire_events, interfaces,
-    join as join_gossip, leave, node_identity, record_members, removed_pipelines,
+    ReconcilerSettings, Recorder, Seeds, Udp, advertise, api_url, discover, expire_events,
+    file_hash, interfaces, join as join_gossip, leave, node_identity, record_members,
+    removed_pipelines, watch_file,
 };
 use data_avalanche_config::{
     Diagnostic, FingerprintKey, ProcessEnv, Report, ResolvedConfig, Severity, load_str,
@@ -211,11 +212,19 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
             phase: Phase::Joining,
             config_generation: joined.generation.doc.generation,
             build: env!("CARGO_PKG_VERSION").to_owned(),
+            api_url: api_url(&config.globals.api, addr.ip()),
+            file_hash: file_hash(&text),
         },
     };
     let key = GossipKey::derive(&joined.fingerprint_key);
     let gossip = Gossip::start(me, key, GossipSettings::new(m), Arc::new(udp), inbox);
     tracing::info!(%addr, bound = ?bind, "gossip started");
+    // The file's hash, gossiped again when the file changes under the node (D-M13b.3).
+    let _file = tokio::spawn(watch_file(
+        args.config.clone(),
+        file_hash(&text),
+        gossip.advertiser(),
+    ));
     // Joins, suspicions and departures, each recorded by one node (Admin_Console §6).
     let _membership = tokio::spawn(record_members(recorder.clone(), gossip.members()));
     let seeds = Seeds::new(c);

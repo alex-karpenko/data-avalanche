@@ -916,6 +916,8 @@ mod tests {
                 phase: Phase::Active,
                 config_generation: 1,
                 build: "1.0.0".into(),
+                api_url: String::new(),
+                file_hash: String::new(),
             },
         };
         let gossip = Gossip::start(

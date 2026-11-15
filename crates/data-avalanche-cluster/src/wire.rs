@@ -26,7 +26,9 @@ pub const MAC_LEN: usize = 32;
 pub const MAX_PAYLOAD: usize = 1400;
 
 /// The BLAKE3 key-derivation context of the gossip MAC key.
-const CONTEXT: &str = "data-avalanche 2026-10-20 gossip packet MAC v1";
+/// v2 (1.1.0): the node's metadata gained `api_url` and `file_hash`, which a 1.0 node's codec
+/// can't read; under another key, the two versions drop each other's packets instead.
+const CONTEXT: &str = "data-avalanche 2026-10-20 gossip packet MAC v2";
 
 /// The key gossip packets are authenticated with.
 #[derive(Clone, PartialEq, Eq)]
@@ -182,6 +184,20 @@ mod tests {
         assert_ne!(ours, theirs);
         assert_eq!(ours.open(&theirs.seal(b"ping")), None);
         assert_eq!(format!("{ours:?}"), "GossipKey(..)");
+    }
+
+    /// A 1.0 node seals under the v1 label: a 1.1 node drops its packets rather than misread
+    /// the metadata 1.1 added (D-M13b.3).
+    #[test]
+    fn a_v1_packet_doesnt_open() {
+        let anchor = [7; 32];
+        let v1 = GossipKey(blake3::derive_key(
+            "data-avalanche 2026-10-20 gossip packet MAC v1",
+            &anchor,
+        ));
+        let v2 = GossipKey::derive(&anchor);
+        assert_eq!(v2.open(&v1.seal(b"ping")), None);
+        assert_eq!(v1.open(&v2.seal(b"ping")), None);
     }
 
     #[tokio::test]

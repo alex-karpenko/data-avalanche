@@ -43,6 +43,10 @@ pub struct NodeMeta {
     pub config_generation: u64,
     /// The build, e.g. `1.0.0`.
     pub build: String,
+    /// Where the others reach its API (`https://cdc-0.cdc.ns.svc:8080`, D-M13b.2).
+    pub api_url: String,
+    /// The first 16 hex digits of its own config file's hash; empty when it can't read it.
+    pub file_hash: String,
 }
 
 /// One incarnation of a node, as foca knows it.
@@ -227,6 +231,7 @@ enum Command {
     Announce(Vec<SocketAddr>),
     Phase(Phase),
     Generation(u64),
+    FileHash(String),
     Leave(oneshot::Sender<()>),
 }
 
@@ -249,6 +254,11 @@ pub struct Advertiser(mpsc::UnboundedSender<Command>);
 impl Advertiser {
     pub fn set_config_generation(&self, generation: u64) {
         let _ = self.0.send(Command::Generation(generation));
+    }
+
+    /// Tells the others the hash of this node's config file; false once the gossip is gone.
+    pub fn set_file_hash(&self, hash: String) -> bool {
+        self.0.send(Command::FileHash(hash)).is_ok()
     }
 }
 
@@ -409,6 +419,19 @@ impl Actor {
                         log(self.swim.change_identity(next, &mut rt));
                         None
                     }
+                    Some(Command::FileHash(file_hash)) => {
+                        let me = self.swim.identity();
+                        let next = NodeIdentity {
+                            rev: me.rev.wrapping_add(1),
+                            meta: NodeMeta {
+                                file_hash,
+                                ..me.meta.clone()
+                            },
+                            ..me.clone()
+                        };
+                        log(self.swim.change_identity(next, &mut rt));
+                        None
+                    }
                     Some(Command::Leave(done)) => {
                         log(self.swim.leave_cluster(&mut rt));
                         Some(Some(done))
@@ -485,6 +508,8 @@ fn seed(addr: SocketAddr) -> NodeIdentity {
             phase: Phase::Joining,
             config_generation: 0,
             build: String::new(),
+            api_url: String::new(),
+            file_hash: String::new(),
         },
     }
 }
@@ -510,7 +535,9 @@ mod tests {
             meta: NodeMeta {
                 phase: Phase::Active,
                 config_generation: 1,
-                build: "1.0.0".into(),
+                build: "1.1.0".into(),
+                api_url: format!("http://{}", SocketAddr::new(addr.ip(), 8080)),
+                file_hash: "0123456789abcdef".into(),
             },
         }
     }
@@ -612,6 +639,24 @@ mod tests {
             ["a", "b", "c"],
             "a new generation is no departure"
         );
+    }
+
+    /// A node's file changed under it: its new hash reaches every peer (D-M13b.3), and its API
+    /// address travels with it.
+    #[tokio::test(start_paused = true)]
+    async fn a_file_hash_reaches_every_peer() {
+        let hub = Hub::new();
+        let (a, b, c) = three(&hub).await;
+        let meta = |g: &Gossip| g.members().borrow().nodes.get("b").map(|m| m.meta.clone());
+        assert_eq!(meta(&a).unwrap().api_url, "http://10.0.0.2:8080");
+        assert!(b.advertiser().set_file_hash("fedcba9876543210".into()));
+        eventually("b's new hash on a and c", || {
+            [&a, &c]
+                .iter()
+                .all(|g| meta(g).is_some_and(|m| m.file_hash == "fedcba9876543210"))
+        })
+        .await;
+        assert_eq!(names(&a), ["a", "b", "c"], "a new hash is no departure");
     }
 
     #[tokio::test(start_paused = true)]

@@ -8,7 +8,7 @@ use axum::Extension;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Response;
-use data_avalanche_cluster::Phase;
+use data_avalanche_cluster::{Phase, Ring};
 use serde_json::{Value, json};
 use tokio::sync::watch;
 
@@ -60,7 +60,9 @@ fn phase(p: Phase) -> &'static str {
     }
 }
 
-/// The members this node sees, and each pipeline's lease holder.
+/// The members this node sees, with where each one's API is and its file's hash; each
+/// pipeline's lease holder, epoch and expiry, and its owner on the ring of the active members
+/// (where it goes once the ring has settled, D-M13b.13).
 pub(crate) async fn status(State(api): State<Api>) -> Response {
     let Some(node) = api.node.get() else {
         return starting();
@@ -77,10 +79,20 @@ pub(crate) async fn status(State(api): State<Api>) -> Response {
                 "suspect": m.suspect,
                 "config_generation": m.meta.config_generation,
                 "build": m.meta.build,
+                "api_url": (!m.meta.api_url.is_empty()).then_some(&m.meta.api_url),
+                "file_hash": (!m.meta.file_hash.is_empty()).then_some(&m.meta.file_hash),
             })
         })
         .collect();
     let config = node.coordinator.config().await;
+    let ring = Ring::new(
+        members
+            .nodes
+            .iter()
+            .filter(|(_, m)| m.meta.phase == Phase::Active)
+            .map(|(name, _)| name.as_str()),
+        config.globals.cluster.tokens,
+    );
     let mut pipelines = vec![];
     let mut ids: Vec<&str> = config.pipelines.values().map(|p| p.id.as_str()).collect();
     ids.sort_unstable();
@@ -101,6 +113,12 @@ pub(crate) async fn status(State(api): State<Api>) -> Response {
             "holder_stale": lease
                 .as_ref()
                 .map(|l| liveness(&members, l) == Liveness::Stale),
+            "expires_at": lease.as_ref().map(|l| {
+                l.renewed_at + chrono::Duration::milliseconds(
+                    i64::try_from(l.lease_duration_ms).unwrap_or(i64::MAX),
+                )
+            }),
+            "ring_owner": ring.owner(id),
         }));
     }
     body(
@@ -192,9 +210,17 @@ mod tests {
         assert_eq!(v["members"][0]["node"], "node-a");
         assert_eq!(v["members"][0]["phase"], "active");
         assert_eq!(v["members"][0]["config_generation"], 1);
+        assert_eq!(v["members"][0]["api_url"], "http://127.0.0.1:8080");
+        assert_eq!(
+            v["members"][0]["file_hash"],
+            data_avalanche_cluster::file_hash(CONFIG)
+        );
         assert_eq!(
             v["pipelines"],
-            json!([{ "id": "orders", "holder": null, "owner_epoch": null, "holder_stale": null }])
+            json!([{
+                "id": "orders", "holder": null, "owner_epoch": null, "holder_stale": null,
+                "expires_at": null, "ring_owner": "node-a",
+            }])
         );
         let holder = Holder {
             node_id: "node-b".into(),
@@ -205,9 +231,22 @@ mod tests {
             .await
             .unwrap();
         let v = json_of(addr, "GET", "/v1/cluster/status").await.1;
+        let p = &v["pipelines"][0];
         assert_eq!(
-            v["pipelines"],
-            json!([{ "id": "orders", "holder": "node-b", "owner_epoch": 1, "holder_stale": true }])
+            (
+                &p["holder"],
+                &p["owner_epoch"],
+                &p["holder_stale"],
+                &p["ring_owner"]
+            ),
+            (&json!("node-b"), &json!(1), &json!(true), &json!("node-a")),
+            "held away from its owner: {p}"
+        );
+        let expires: chrono::DateTime<Utc> = p["expires_at"].as_str().unwrap().parse().unwrap();
+        let left = expires - Utc::now();
+        assert!(
+            left > chrono::Duration::seconds(25) && left <= chrono::Duration::seconds(30),
+            "{left}"
         );
     }
 
