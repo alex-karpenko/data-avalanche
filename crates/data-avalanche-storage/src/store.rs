@@ -90,6 +90,25 @@ pub trait VersionedStore: Send + Sync + std::fmt::Debug {
     /// Every key under `prefix/`, sorted (`a/b` lists `a/b/c`, not `a/bc`); `""` lists the whole
     /// root.
     async fn list(&self, prefix: &str) -> Result<Vec<String>, StoreError>;
+    /// The next segment of every key under `prefix/`, once each and sorted: `events` lists
+    /// `events/2026-11-14/x.json` as `2026-11-14`. One listing of the folders, not of every key,
+    /// where the store can (the default lists every key).
+    async fn folders(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+        let under = if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{prefix}/")
+        };
+        let mut out: Vec<String> = self
+            .list(prefix)
+            .await?
+            .iter()
+            .filter_map(|k| k.strip_prefix(&under))
+            .filter_map(|rest| rest.split_once('/').map(|(folder, _)| folder.to_owned()))
+            .collect();
+        out.dedup();
+        Ok(out)
+    }
     /// Deletes unconditionally; an absent object is no error. For documents no one updates any
     /// more (an ended snapshot job, DA-SNAP-16): never a lease or a pointer (deleting a lease
     /// restarts its epoch).
@@ -250,6 +269,26 @@ impl VersionedStore for ObjectStoreVersioned {
         Ok(keys)
     }
 
+    async fn folders(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+        let path = if prefix.is_empty() {
+            self.root.clone()
+        } else {
+            self.path(prefix)?
+        };
+        let listed = self
+            .store
+            .list_with_delimiter(Some(&path))
+            .await
+            .map_err(|e| map_error(Op::List, prefix, e))?;
+        let mut out: Vec<String> = listed
+            .common_prefixes
+            .iter()
+            .filter_map(|p| p.filename().map(str::to_owned))
+            .collect();
+        out.sort();
+        Ok(out)
+    }
+
     async fn delete(&self, key: &str) -> Result<(), StoreError> {
         let path = self.path(key)?;
         match self.store.delete(&path).await {
@@ -348,6 +387,63 @@ mod tests {
             vec!["snap/a.json", "snap/b.json", "snap/jobs/j1.json"]
         );
         assert!(s.list("none").await.unwrap().is_empty());
+    }
+
+    /// A store that lists through [`VersionedStore::folders`]' default, over `list`.
+    #[derive(Debug)]
+    struct ListOnly(ObjectStoreVersioned);
+
+    #[async_trait]
+    impl VersionedStore for ListOnly {
+        async fn get(&self, key: &str) -> Result<Option<(Bytes, ObjectVersion)>, StoreError> {
+            self.0.get(key).await
+        }
+        async fn create(&self, key: &str, body: Bytes) -> Result<ObjectVersion, StoreError> {
+            self.0.create(key, body).await
+        }
+        async fn update(
+            &self,
+            key: &str,
+            expected: &ObjectVersion,
+            body: Bytes,
+        ) -> Result<ObjectVersion, StoreError> {
+            self.0.update(key, expected, body).await
+        }
+        async fn put(&self, key: &str, body: Bytes) -> Result<ObjectVersion, StoreError> {
+            self.0.put(key, body).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+            self.0.list(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.0.delete(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn folders_lists_each_next_segment_once() {
+        let s = store("root");
+        for k in [
+            "events/2026-11-14/b.json",
+            "events/2026-11-13/a.json",
+            "events/2026-11-14/a.json",
+            "events/loose.json",
+            "eventsx/2026-01-01/c.json",
+        ] {
+            s.put(k, b("x")).await.unwrap();
+        }
+        let want = vec!["2026-11-13", "2026-11-14"];
+        assert_eq!(
+            s.folders("events").await.unwrap(),
+            want,
+            "object_store's listing"
+        );
+        assert_eq!(
+            ListOnly(s.clone()).folders("events").await.unwrap(),
+            want,
+            "the trait's default, over list"
+        );
+        assert!(s.folders("none").await.unwrap().is_empty());
     }
 
     #[tokio::test]
