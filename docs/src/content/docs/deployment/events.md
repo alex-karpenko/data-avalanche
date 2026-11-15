@@ -19,15 +19,23 @@ curl -X POST https://avalanche.example.com:8080/v1/pipelines/orders-pg/pause \
   -d '{"note": "the warehouse migration, back by 15:00"}'
 ```
 
-The event names the caller and their role as the server verified them (`anonymous` when the API
-has no authentication), the note, and how the call ended: `accepted`, `unchanged` (the pipeline
-was paused already) or `refused` (a `409` or `422`, with the reason). A note is optional, at most
-500 characters; any other body field is the endpoint's own, and a request without a body works
-as before.
+The event names the caller and their role as the server verified them, the note, and how the call
+ended: `accepted`, `unchanged` (the pipeline was paused already) or `refused` (a `409` or `422`
+from the endpoint, with the reason). The name is the `basic` user, `anonymous` when the API has no
+authentication, or, for `jwt` and `oauth2`, the token's `globals.console.username_claim`
+(`preferred_username` by default), its `sub` when the token has no such claim.
+
+A note is optional, at most 500 characters, without control characters other than newlines; any
+other body field is the endpoint's own, and a request without a body works as before. A body
+that is there must be a JSON object: in 1.0 these endpoints ignored their body, and now they
+refuse one that isn't. A call refused before it runs, for a bad note or body (`422`), a body over
+1 MiB (`413`) or one that can't be read (`400`), changes nothing and is not recorded.
 
 A caller whose role is too low for a call (a `403`) is recorded too, as `action.denied`, so the
-trail shows attempts as well as changes. A node records at most 30 of those at once and then one
-a second; the rest are logged only.
+trail shows attempts as well as changes; so is a token that verifies but has no role the node
+maps, with the role `none`. A node records at most 30 of those at once and then one a second;
+the rest are logged only. What a refused attempt aimed at is recorded cut to 128 characters, and
+its pipeline only when it names one the cluster runs.
 
 ## What is recorded
 
@@ -93,4 +101,6 @@ retries a write that fails three times over about 6 seconds, then drops the even
 come faster than it writes them (more than 1024 waiting), it drops the new ones. Each drop is
 logged and counted in `data_avalanche_events_dropped_total`, and the
 [`DataAvalancheEventsDropped`](/data-avalanche/deployment/observability/#alerts) alert fires on
-it. A node that crashes loses the events it hadn't written yet.
+it. A node that stops cleanly (a shutdown or a signal) writes the events still waiting, the
+hand-offs of its leave among them, for up to 5 seconds before it exits, and logs a warning if
+some are left. A node that crashes loses the events it hadn't written yet.
