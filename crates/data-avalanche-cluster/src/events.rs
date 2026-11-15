@@ -1,7 +1,8 @@
 //! The recorder (Admin_Console §6): whatever records an event hands it over without waiting. One
 //! task per node writes them to the cluster's timeline in `globals.state`, retrying a failing
 //! store a few times; an event it can't write is counted (`data_avalanche_events_dropped_total`)
-//! and logged, never allowed to slow or fail what it records. Another task expires the days past
+//! and logged, never allowed to slow or fail what it records. A clean stop waits a bounded time
+//! for the queue to be written ([`Recorder::flush`]). Another task expires the days past
 //! `globals.console.events.retention`.
 
 use std::collections::BTreeMap;
@@ -36,6 +37,9 @@ pub const PRUNE_EVERY: Duration = Duration::from_secs(3600);
 pub struct Recorder {
     node: Arc<str>,
     tx: Option<mpsc::Sender<EventDoc>>,
+    /// The events queued and not yet written or dropped: 0 when the queue is empty and no write
+    /// is in flight.
+    pending: Arc<watch::Sender<usize>>,
     metrics: Metrics,
 }
 
@@ -43,11 +47,13 @@ impl Recorder {
     /// The recorder of `node`, and its writer task.
     pub fn start(events: Arc<Events>, node: &str, metrics: Metrics) -> (Self, JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(EVENT_QUEUE);
-        let task = tokio::spawn(write(events, rx, metrics.clone()));
+        let pending = Arc::new(watch::Sender::new(0));
+        let task = tokio::spawn(write(events, rx, Arc::clone(&pending), metrics.clone()));
         (
             Self {
                 node: node.into(),
                 tx: Some(tx),
+                pending,
                 metrics,
             },
             task,
@@ -59,8 +65,19 @@ impl Recorder {
         Self {
             node: node.into(),
             tx: None,
+            pending: Arc::new(watch::Sender::new(0)),
             metrics: Metrics::new(),
         }
+    }
+
+    /// Waits until every event queued so far is written or dropped, at most `within`: true when
+    /// the queue drained and no write is in flight, false at the bound. For a clean stop; what
+    /// records an event never calls it.
+    pub async fn flush(&self, within: Duration) -> bool {
+        let mut idle = self.pending.subscribe();
+        tokio::time::timeout(within, idle.wait_for(|n| *n == 0))
+            .await
+            .is_ok_and(|r| r.is_ok())
     }
 
     pub fn node(&self) -> &str {
@@ -90,7 +107,10 @@ impl Recorder {
         let Some(tx) = &self.tx else {
             return;
         };
+        // Counted before the writer can take it, uncounted if it isn't queued.
+        self.pending.send_modify(|n| *n += 1);
         if let Err(e) = tx.try_send(event) {
+            self.pending.send_modify(|n| *n -= 1);
             self.metrics.event_dropped();
             let event = match e {
                 mpsc::error::TrySendError::Full(ev) | mpsc::error::TrySendError::Closed(ev) => ev,
@@ -100,7 +120,13 @@ impl Recorder {
     }
 }
 
-async fn write(events: Arc<Events>, mut rx: mpsc::Receiver<EventDoc>, metrics: Metrics) {
+/// Writes each queued event, then marks it done in `pending` (written or dropped).
+async fn write(
+    events: Arc<Events>,
+    mut rx: mpsc::Receiver<EventDoc>,
+    pending: Arc<watch::Sender<usize>>,
+    metrics: Metrics,
+) {
     while let Some(event) = rx.recv().await {
         let mut waits = WRITE_RETRIES.iter();
         loop {
@@ -119,6 +145,7 @@ async fn write(events: Arc<Events>, mut rx: mpsc::Receiver<EventDoc>, metrics: M
                 },
             }
         }
+        pending.send_modify(|n| *n = n.saturating_sub(1));
     }
 }
 
@@ -312,8 +339,10 @@ impl HaltWatch {
     }
 }
 
-/// What changed between two views of the members, each change with the member it is about.
-/// Recorded by one node only ([`records`]).
+/// What changed between two views of the members, each change with the member it is about: one
+/// change per member per pair of views, the first that applies. Recorded by one node only
+/// ([`records`]). A member that was draining and then vanishes reads as `member.down` (only a
+/// `Leaving` one reads as `member.left`).
 pub(crate) fn member_changes(before: &Members, after: &Members) -> Vec<(String, Found)> {
     use EventSeverity::{Info, Warning};
     let mut out = Vec::new();
@@ -388,7 +417,10 @@ pub(crate) fn records(before: &Members, after: &Members, subject: &str) -> bool 
             .is_some_and(|(name, _)| *name == after.me)
 }
 
-/// Records the members' changes this node is the one to record, until the gossip stops.
+/// Records the members' changes this node is the one to record, until the gossip stops. A node
+/// turns `Active` once it sees one peer, before its view has converged: when the rest of a
+/// long-running cluster arrives in its later views, it can record `member.joined` for members
+/// that were up long before it.
 pub async fn record_members(recorder: Recorder, mut members: watch::Receiver<Members>) {
     let mut before = members.borrow_and_update().clone();
     while members.changed().await.is_ok() {
@@ -416,11 +448,12 @@ mod tests {
 
     use super::*;
 
-    /// A store whose first `fail` creates fail.
+    /// A store whose first `fail` creates fail; with `hang`, every create waits forever.
     #[derive(Debug)]
     struct Failing {
         inner: ObjectStoreVersioned,
         fail: AtomicUsize,
+        hang: bool,
     }
 
     #[async_trait]
@@ -429,6 +462,9 @@ mod tests {
             self.inner.get(key).await
         }
         async fn create(&self, key: &str, body: Bytes) -> Result<ObjectVersion, StoreError> {
+            if self.hang {
+                std::future::pending::<()>().await;
+            }
             if self
                 .fail
                 .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -461,11 +497,46 @@ mod tests {
     }
 
     fn store(fail: usize) -> Arc<Events> {
+        failing(fail, false)
+    }
+
+    fn failing(fail: usize, hang: bool) -> Arc<Events> {
         let inner = ObjectStoreVersioned::new(Arc::new(InMemory::new()), "state").unwrap();
         Arc::new(Events::new(DocStore::new(Arc::new(Failing {
             inner,
             fail: AtomicUsize::new(fail),
+            hang,
         }))))
+    }
+
+    /// A clean stop's flush returns once every queued event is stored, however the store
+    /// delays it, and not before.
+    #[tokio::test(start_paused = true)]
+    async fn a_flush_waits_until_the_queue_is_written() {
+        // The first event's write fails twice: 200 ms, then 1 s, before it lands.
+        let events = store(2);
+        let (r, _task) = Recorder::start(Arc::clone(&events), "node-a", Metrics::new());
+        assert!(r.flush(Duration::ZERO).await, "nothing queued");
+        for text in ["one", "two", "three"] {
+            r.record(r.event("member.joined", EventSeverity::Info, text));
+        }
+        assert!(
+            !r.flush(Duration::from_millis(100)).await,
+            "the first write is still being retried"
+        );
+        assert!(r.flush(Duration::from_secs(5)).await);
+        assert_eq!(stored(&events).await, ["three", "two", "one"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_flush_gives_up_at_its_bound() {
+        let events = failing(0, true);
+        let (r, _task) = Recorder::start(Arc::clone(&events), "node-a", Metrics::new());
+        r.record(r.event("member.joined", EventSeverity::Info, "never"));
+        let started = tokio::time::Instant::now();
+        assert!(!r.flush(Duration::from_secs(5)).await);
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+        assert!(Recorder::off("node-a").flush(Duration::ZERO).await);
     }
 
     /// The texts once `n` events are written, waiting up to 20 s (of paused time: the retries').
@@ -712,6 +783,7 @@ mod tests {
         let r = Recorder {
             node: "node-a".into(),
             tx: Some(tx),
+            pending: Arc::new(watch::Sender::new(0)),
             metrics: metrics.clone(),
         };
         r.record(r.event("a.b", EventSeverity::Info, "1"));

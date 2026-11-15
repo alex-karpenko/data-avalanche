@@ -88,6 +88,9 @@ pub(crate) fn leave_within(config: &ResolvedConfig) -> Duration {
     c.drain_timeout.saturating_mul(rounds) + 2 * c.lease_renewal_interval
 }
 
+/// How long a clean stop waits for the events still queued to be written (a crash loses them).
+pub(crate) const EVENTS_FLUSH: Duration = Duration::from_secs(5);
+
 /// Runs every pipeline until SIGTERM, SIGINT or a shutdown through the API. A leave through the
 /// API leaves the cluster first and keeps the process up (D-M9a.8).
 ///
@@ -261,7 +264,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         leases: deps.leases.clone(),
         control,
         validates: Arc::new(RateLimit::validate()),
-        recorder,
+        recorder: recorder.clone(),
         denials: Arc::new(RateLimit::denials()),
         events: Arc::clone(&events),
     });
@@ -293,6 +296,12 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     tracing::info!("shutting down");
     let _ = stop_http.send(());
     let _ = server.await;
+    // The leave's last events (each lease released) are still queued: written, within a bound.
+    if !recorder.flush(EVENTS_FLUSH).await {
+        tracing::warn!(
+            "the events still queued weren't written within {EVENTS_FLUSH:?}: the timeline misses them"
+        );
+    }
     tracing::info!("stopped");
     logger.finish().await;
     Ok(())

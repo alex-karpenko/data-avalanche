@@ -1672,25 +1672,8 @@ impl PipelineController {
 
     /// A snapshot job that ended, completed or failed.
     fn job_ended(&self, job: &SnapshotJobDoc) {
-        let short: String = job.job_id.chars().take(8).collect();
-        let name = &self.pipeline.name;
-        let (kind, severity, text) = match job.status {
-            JobStatus::Failed => (
-                "job.failed",
-                EventSeverity::Error,
-                format!(
-                    "snapshot job {short} of {name} failed: {}",
-                    job.error.as_deref().unwrap_or("a table failed")
-                ),
-            ),
-            _ => (
-                "job.completed",
-                EventSeverity::Info,
-                format!(
-                    "snapshot job {short} of {name} completed: {} tables copied",
-                    job.tables.len()
-                ),
-            ),
+        let Some((kind, severity, text)) = job_event(&self.pipeline.name, job) else {
+            return;
         };
         let mut e = self
             .recorder
@@ -1815,6 +1798,32 @@ impl PipelineController {
             s.owner_epoch = Some(run.owner_epoch);
             s.lease = Some(run.guard.state());
         });
+    }
+}
+
+/// The event of a snapshot job of pipeline `name` by its status: its kind, severity and text once
+/// it ended; nothing while it is queued or running. Every status is named, so a new one is
+/// decided here, not taken for an ending.
+fn job_event(name: &str, job: &SnapshotJobDoc) -> Option<(&'static str, EventSeverity, String)> {
+    let short: String = job.job_id.chars().take(8).collect();
+    match job.status {
+        JobStatus::Queued | JobStatus::Running => None,
+        JobStatus::Completed => Some((
+            "job.completed",
+            EventSeverity::Info,
+            format!(
+                "snapshot job {short} of {name} completed: {} tables copied",
+                job.tables.len()
+            ),
+        )),
+        JobStatus::Failed => Some((
+            "job.failed",
+            EventSeverity::Error,
+            format!(
+                "snapshot job {short} of {name} failed: {}",
+                job.error.as_deref().unwrap_or("a table failed")
+            ),
+        )),
     }
 }
 
@@ -2468,6 +2477,39 @@ mod tests {
         panic!(
             "timed out waiting until {what}: {:?}",
             docs.snapshot_job(id).await
+        );
+    }
+
+    #[test]
+    fn a_job_is_recorded_only_once_it_ended() {
+        let mut job = SnapshotJobDoc::new(
+            "0123456789".into(),
+            vec![t("a"), t("b")],
+            "ops".into(),
+            chrono::Utc::now(),
+        );
+        for status in [JobStatus::Queued, JobStatus::Running] {
+            job.status = status;
+            assert_eq!(job_event("orders", &job), None, "{status:?}");
+        }
+        job.status = JobStatus::Completed;
+        assert_eq!(
+            job_event("orders", &job),
+            Some((
+                "job.completed",
+                EventSeverity::Info,
+                "snapshot job 01234567 of orders completed: 2 tables copied".into()
+            ))
+        );
+        job.status = JobStatus::Failed;
+        job.error = Some("public.b failed".into());
+        assert_eq!(
+            job_event("orders", &job),
+            Some((
+                "job.failed",
+                EventSeverity::Error,
+                "snapshot job 01234567 of orders failed: public.b failed".into()
+            ))
         );
     }
 
