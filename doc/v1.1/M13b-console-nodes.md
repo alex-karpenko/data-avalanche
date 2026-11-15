@@ -259,7 +259,8 @@ derived from the gossip's advertised address, and verifies it with ordinary host
 
 ### Spec patch for approval (S-M13b.1)
 
-Not applied. These edits to two spec files are what the code below implements; Task 1's tests
+Approved by Oleksii 2026-11-15 with the plan; applied as execution starts. These edits to two
+spec files are what the code below implements; Task 1's tests
 need the first file's V-138 row (the registry is checked against the spec's table), so the patch
 lands first, as its own commit `spec: S-M13b.1 — globals.api.advertise_url and V-138; the node and
 generation endpoints; the process and gossip metrics`, once Oleksii approves it.
