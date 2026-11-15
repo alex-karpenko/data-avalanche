@@ -384,6 +384,55 @@ pub fn cases() -> Vec<Case> {
             "an advertise_url of an IPv6 host and port",
             || pg_delta().set("/globals/api/advertise_url", json!("http://[::1]:8080")),
         ),
+        case(
+            "V-138",
+            Silent,
+            "an advertise_url of an IPv6 host alone",
+            || pg_delta().set("/globals/api/advertise_url", json!("http://[::1]")),
+        ),
+        case("V-138", Silent, "an advertise_url over plain http", || {
+            pg_delta().set("/globals/api/advertise_url", json!("http://cdc-0.cdc:8080"))
+        }),
+        case("V-138", Error, "an advertise_url with a query", || {
+            pg_delta().set(
+                "/globals/api/advertise_url",
+                json!("https://cdc-0:8080?x=1"),
+            )
+        }),
+        case("V-138", Error, "an advertise_url with a fragment", || {
+            pg_delta().set("/globals/api/advertise_url", json!("https://cdc-0:8080#x"))
+        }),
+        case(
+            "V-138",
+            Error,
+            "an advertise_url with an empty IPv6 host",
+            || pg_delta().set("/globals/api/advertise_url", json!("http://[]:80")),
+        ),
+        case("V-138", Error, "an advertise_url with two ports", || {
+            pg_delta().set("/globals/api/advertise_url", json!("http://a:1:2"))
+        }),
+        case(
+            "V-138",
+            Error,
+            "an advertise_url over 255 characters",
+            || {
+                pg_delta().set(
+                    "/globals/api/advertise_url",
+                    json!(format!("https://{}.cdc:8443", "a".repeat(250))),
+                )
+            },
+        ),
+        case(
+            "V-138",
+            Silent,
+            "an advertise_url of 255 characters",
+            || {
+                pg_delta().set(
+                    "/globals/api/advertise_url",
+                    json!(format!("https://{}.cdc:8443", "a".repeat(255 - 18))),
+                )
+            },
+        ),
         case("V-131", Error, "basic and a bearer token", || {
             pg_delta().set("/globals/console/prometheus", json!({"url": "https://prom", "basic": {"user": "u", "password": "p"}, "bearer_token": "t"}))
         }),

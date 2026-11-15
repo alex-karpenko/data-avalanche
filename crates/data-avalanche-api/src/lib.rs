@@ -231,7 +231,7 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
                 "GET",
                 "/v1/config/diff",
                 Viewer,
-                "What differs between two config generations as written: each change's path, what a reload of it does, before and after, secrets masked",
+                "What differs between two config generations as written: each change's path, what a reload of it does, before and after, secrets and a URL's credentials masked",
                 &[
                     (200, "the pipelines added and removed, and the changes"),
                     (400, "from or to missing, or not a number"),
@@ -282,7 +282,7 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
                 &[
                     (
                         200,
-                        "the generation and its text, every comment shown empty (`#`); `hash` is the text's keyed fingerprint, comparable across nodes of one cluster only",
+                        "the generation and its text, a URL's credentials masked (`••••••@`) and every comment shown empty (`#`); `hash` is the text's keyed fingerprint, comparable across nodes of one cluster only",
                     ),
                     (400, "a generation that isn't a number"),
                     (404, "no such generation"),

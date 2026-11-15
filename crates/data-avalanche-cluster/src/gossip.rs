@@ -62,26 +62,78 @@ pub struct GossipFigures {
     /// That probe's round trip, once its ack came.
     pub probe_rtt: Option<Duration>,
     /// The members this node suspected (its probe of them failed), and when, in the last
-    /// [`SUSPICIONS_KEPT`].
+    /// [`SUSPICIONS_KEPT`]: the last [`SUSPICIONS_LISTED`], the others counted
+    /// ([`Self::raised_more`]).
     pub raised: Vec<(String, DateTime<Utc>)>,
     /// When the others suspected this node, in the last [`SUSPICIONS_KEPT`]: it refuted (foca
     /// raises its own incarnation, which its packets carry), or it was declared down and
-    /// rejoined.
+    /// rejoined. The last [`SUSPICIONS_LISTED`], the others counted
+    /// ([`Self::received_more`]).
     pub received: Vec<DateTime<Utc>>,
+    /// The suspicions raised beyond those listed, by the hour they were raised in.
+    raised_unlisted: BTreeMap<DateTime<Utc>, u64>,
+    /// The suspicions received beyond those listed, by the hour.
+    received_unlisted: BTreeMap<DateTime<Utc>, u64>,
 }
 
 /// How long the figures keep a suspicion.
 pub const SUSPICIONS_KEPT: Duration = Duration::from_secs(24 * 3600);
 
+/// How many suspicions each way the figures list; the others are only counted.
+pub const SUSPICIONS_LISTED: usize = 100;
+
+/// The hour `at` falls in.
+fn hour_of(at: DateTime<Utc>) -> DateTime<Utc> {
+    let s = at.timestamp();
+    DateTime::from_timestamp(s - s.rem_euclid(3600), 0).unwrap_or(at)
+}
+
 impl GossipFigures {
-    /// Forgets the suspicions older than [`SUSPICIONS_KEPT`] before `now`.
-    fn forget_before(&mut self, now: DateTime<Utc>) {
+    /// Forgets the suspicions older than [`SUSPICIONS_KEPT`] before `now`; a counted one with
+    /// its hour, once all of that hour is.
+    pub fn forget_before(&mut self, now: DateTime<Utc>) {
         let kept = chrono::Duration::from_std(SUSPICIONS_KEPT).unwrap_or(chrono::Duration::MAX);
         let since = now
             .checked_sub_signed(kept)
             .unwrap_or(DateTime::<Utc>::MIN_UTC);
         self.raised.retain(|(_, at)| *at >= since);
         self.received.retain(|at| *at >= since);
+        let in_window =
+            |hour: &DateTime<Utc>, _: &mut u64| *hour + chrono::Duration::hours(1) > since;
+        self.raised_unlisted.retain(in_window);
+        self.received_unlisted.retain(in_window);
+    }
+
+    /// A suspicion this node raised of `node` at `at`.
+    pub(crate) fn raise(&mut self, node: String, at: DateTime<Utc>) {
+        self.raised.push((node, at));
+        if self.raised.len() > SUSPICIONS_LISTED {
+            let (_, oldest) = self.raised.remove(0);
+            *self.raised_unlisted.entry(hour_of(oldest)).or_default() += 1;
+        }
+        self.forget_before(at);
+    }
+
+    /// A suspicion of this node received at `at`.
+    pub(crate) fn receive(&mut self, at: DateTime<Utc>) {
+        self.received.push(at);
+        if self.received.len() > SUSPICIONS_LISTED {
+            let oldest = self.received.remove(0);
+            *self.received_unlisted.entry(hour_of(oldest)).or_default() += 1;
+        }
+        self.forget_before(at);
+    }
+
+    /// How many suspicions this node raised in the last [`SUSPICIONS_KEPT`] beyond those
+    /// listed: counted by the hour, so up to an hour's more.
+    pub fn raised_more(&self) -> u64 {
+        self.raised_unlisted.values().sum()
+    }
+
+    /// How many suspicions of this node it received beyond those listed, as
+    /// [`Self::raised_more`].
+    pub fn received_more(&self) -> u64 {
+        self.received_unlisted.values().sum()
     }
 }
 
@@ -579,10 +631,7 @@ impl Actor {
                 }
             }
             OwnedNotification::ProbeFailed(_, member) => {
-                self.figures.send_modify(|f| {
-                    f.raised.push((member.node_id, now));
-                    f.forget_before(now);
-                });
+                self.figures.send_modify(|f| f.raise(member.node_id, now));
                 if let Some(m) = &self.metrics {
                     m.gossip_suspicion(Suspicion::Raised);
                 }
@@ -598,23 +647,22 @@ impl Actor {
 
     /// The others suspected this node.
     fn suspected(&mut self, now: DateTime<Utc>) {
-        self.figures.send_modify(|f| {
-            f.received.push(now);
-            f.forget_before(now);
-        });
+        self.figures.send_modify(|f| f.receive(now));
         if let Some(m) = &self.metrics {
             m.gossip_suspicion(Suspicion::Received);
         }
     }
 
-    /// A packet that doesn't open: another cluster's, a corrupted one, or forged.
+    /// A packet that doesn't open: another cluster's, a 1.0 node's (gossip v1), a corrupted one,
+    /// or forged.
     fn dropped(&mut self) {
         self.dropped += 1;
         if self.warned.is_none_or(|t| t.elapsed() >= WARN_EVERY) {
             tracing::warn!(
                 dropped = self.dropped,
                 "gossip: dropped packets whose MAC doesn't match this cluster's key: another \
-                 cluster's nodes on this network, or a node of this cluster on another anchor"
+                 cluster's nodes on this network, a node of this cluster on another anchor, or a \
+                 node of another version (1.0)"
             );
             self.warned = Some(Instant::now());
         }
@@ -929,6 +977,26 @@ mod tests {
         f.forget_before(now);
         assert_eq!(f.raised, [("c".to_owned(), now)]);
         assert_eq!(f.received, [now]);
+    }
+
+    /// A failed probe a second for a day lists the last [`SUSPICIONS_LISTED`] and counts the
+    /// rest, by the hour, until they too are a day old.
+    #[test]
+    fn the_figures_list_the_last_suspicions_and_count_the_others() {
+        let now = Utc::now();
+        let mut f = GossipFigures::default();
+        let n = SUSPICIONS_LISTED + 50;
+        for i in 0..n {
+            let at = now + chrono::Duration::seconds(i as i64);
+            f.raise(format!("m{i}"), at);
+            f.receive(at);
+        }
+        assert_eq!(f.raised.len(), SUSPICIONS_LISTED);
+        assert_eq!(f.raised[0].0, "m50", "the newest kept");
+        assert_eq!(f.received.len(), SUSPICIONS_LISTED);
+        assert_eq!((f.raised_more(), f.received_more()), (50, 50));
+        f.forget_before(now + chrono::Duration::hours(26));
+        assert_eq!(f, GossipFigures::default(), "a day later, nothing is left");
     }
 
     /// A node on another anchor has another key: its packets don't open, so it never joins.

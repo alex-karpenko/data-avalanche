@@ -115,6 +115,9 @@ globals:
     advertise_url: https://${DATA_AVALANCHE_POD_DNS_NAME}:8443
 ```
 
-The certificate must cover that name: `*.<release>-data-avalanche-headless.<namespace>.svc.cluster.local`, the headless Service the chart names after the release. A
-node trusts the system's roots and every certificate in its own `api.tls.cert`: put your CA after
-the node's certificate there when it is a private one.
+The certificate must cover that name:
+`*.<release>-data-avalanche-headless.<namespace>.svc.cluster.local`, the headless Service the chart
+names after the release (after the release alone when its name already contains `data-avalanche`;
+the part before `-headless` is cut at 52 characters, so a long release name is shortened there:
+check it with `kubectl get service`). A node trusts the system's roots and every certificate in its
+own `api.tls.cert`: put your CA after the node's certificate there when it is a private one.

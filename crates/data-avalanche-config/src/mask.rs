@@ -3,10 +3,11 @@
 //! in it. A secret written as exactly one `${VAR}` reference stays as written: the text holds no
 //! value. A default (`${VAR:-…}`) or text around a reference is masked like a literal.
 //! A literal one becomes `"•••••• blake3:<8 hex>"`, the start of its fingerprint under the
-//! cluster's key (config §6.2), so that two generations show whether it changed. Every comment is
-//! shown empty, whatever it holds (an old secret, say): a full-line one as its indentation and
-//! `#`, a trailing one as ` #` after the value. Everything else (order, spacing) is left as
-//! written.
+//! cluster's key (config §6.2), so that two generations show whether it changed. A URL written
+//! with credentials, under any key (`prometheus.url: https://user:pass@prom`), shows them as
+//! `••••••@`, in the text and in the diff. Every comment is shown empty, whatever it holds (an
+//! old secret, say): a full-line one as its indentation and `#`, a trailing one as ` #` after the
+//! value. Everything else (order, spacing) is left as written.
 //!
 //! A comment is told from a `#` that is content (in a quoted or a block scalar) by what the text
 //! parses to: a comment's text cut leaves it the same, content's doesn't. So every `#` at a line's
@@ -14,11 +15,12 @@
 //! value the cuts would change isn't shown ([`MaskError::Comments`]).
 //!
 //! The masked text is parsed again and checked before it is returned: every secret is then a
-//! mask or a reference. A text that fails the check isn't shown at all ([`MaskError`]). A
-//! secret's text that is also written as another key's value (a `user` that is the `password`)
-//! stays shown there: only the secret keys are masked. A text with a merge key (`<<`), a tag or a
-//! directive isn't shown ([`MaskError::MergeKey`]): a key that overrides or retags a value would
-//! hide the secret the masker reads. [`diff_written`] shows no text, so it needs no such refusal.
+//! mask or a reference, and no URL shows its credentials. A text that fails the check isn't
+//! shown at all ([`MaskError`]). A secret's text that is also written as another key's value (a
+//! `user` that is the `password`) stays shown there: only the secret keys are masked. A text with
+//! a merge key (`<<`), a tag or a directive isn't shown ([`MaskError::MergeKey`]): a key that
+//! overrides or retags a value would hide the secret the masker reads. [`diff_written`] shows no
+//! text, so it needs no such refusal.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -85,24 +87,32 @@ pub enum MaskError {
 /// # Errors
 /// [`MaskError`]: the text isn't shown.
 pub fn mask_secrets(text: &str, key: &FingerprintKey) -> Result<String, MaskError> {
-    let secrets = secrets(text)?;
+    let all = leaves(text)?;
+    let secrets: Vec<Written> = all.iter().filter(|w| is_secret(w)).cloned().collect();
     if unmaskable(text) {
         return Err(MaskError::MergeKey);
     }
     let mut edits: Vec<(usize, usize, String)> = vec![];
-    for s in &secrets {
-        let Some(value) = literal(&s.text) else {
+    for w in &all {
+        let Some(value) = literal(&w.text) else {
             continue;
         };
-        let Some(at) = s.at else {
-            return Err(MaskError::Unplaced(s.path.join(".")));
+        let with = if is_secret(w) {
+            format!("\"{}\"", masked(key, &value))
+        } else if let Some(url) = without_userinfo(&value) {
+            serde_json::to_string(&url).map_err(|_| MaskError::Unplaced(w.path.join(".")))?
+        } else {
+            continue;
+        };
+        let Some(at) = w.at else {
+            return Err(MaskError::Unplaced(w.path.join(".")));
         };
         let (start, end) =
-            span(text, at, &s.text).ok_or_else(|| MaskError::Unplaced(s.path.join(".")))?;
+            span(text, at, &w.text).ok_or_else(|| MaskError::Unplaced(w.path.join(".")))?;
         if edits.iter().any(|e| e.0 == start) {
             continue; // one value under `defaults`, or one anchor, read by several pipelines
         }
-        edits.push((start, end, format!("\"{}\"", masked(key, &value))));
+        edits.push((start, end, with));
     }
     edits.sort_by_key(|e| std::cmp::Reverse(e.0));
     let mut out = text.to_owned();
@@ -253,12 +263,12 @@ pub fn diff_written(from: &str, to: &str, key: &FingerprintKey) -> Result<Writte
     let changes = paths
         .into_iter()
         .filter(|p| pipeline(p).is_none_or(|id| !added.contains(&id) && !removed.contains(&id)))
-        .filter(|p| before.get(*p) != after.get(*p))
+        .filter(|p| before.get(*p).map(|l| &l.written) != after.get(*p).map(|l| &l.written))
         .map(|p| WrittenChange {
             path: p.clone(),
             class: class_of(p),
-            before: before.get(p).cloned(),
-            after: after.get(p).cloned(),
+            before: before.get(p).map(|l| l.shown.clone()),
+            after: after.get(p).map(|l| l.shown.clone()),
         })
         .collect();
     Ok(WrittenDiff {
@@ -299,7 +309,7 @@ fn class_of(path: &str) -> &'static str {
 fn flatten(
     text: &str,
     key: &FingerprintKey,
-) -> Result<(BTreeMap<String, String>, BTreeSet<String>), MaskError> {
+) -> Result<(BTreeMap<String, Leaf>, BTreeSet<String>), MaskError> {
     let raw: RawConfig = parse_document(text).map_err(|_| MaskError::Parse)?;
     let mut all = vec![];
     raw.globals.leaves(&["globals".to_owned()], &mut all);
@@ -316,7 +326,8 @@ fn flatten(
     for w in all {
         let shown = match literal(&w.text) {
             Some(value) if is_secret(&w) => masked(key, &value),
-            _ => w.text.clone(),
+            Some(value) => without_userinfo(&value).unwrap_or_else(|| w.text.clone()),
+            None => w.text.clone(),
         };
         let mut path = String::new();
         for s in &w.path {
@@ -325,9 +336,49 @@ fn flatten(
             }
             path.push_str(s);
         }
-        out.insert(path, shown);
+        out.insert(
+            path,
+            Leaf {
+                shown,
+                written: w.text,
+            },
+        );
     }
     Ok((out, ids))
+}
+
+/// A leaf as [`diff_written`] compares it, as written, and shows it, masked: a URL whose
+/// credentials alone changed is a change, shown with them masked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Leaf {
+    shown: String,
+    written: String,
+}
+
+/// The credentials of a URL written as `scheme://user:pass@host…`: the authority's part before
+/// its last `@`.
+fn userinfo(value: &str) -> Option<&str> {
+    let (scheme, rest) = value.split_once("://")?;
+    let mut chars = scheme.chars();
+    if !chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        || !chars.all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+    {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    authority.rfind('@').map(|at| &authority[..at])
+}
+
+/// `value`, a URL with credentials, with them masked (`https://••••••@host`); `None` when it
+/// has none, or they are masked already.
+fn without_userinfo(value: &str) -> Option<String> {
+    let user = userinfo(value).filter(|u| *u != MASK)?;
+    let at = value.find("://")? + 3;
+    Some(format!(
+        "{}{MASK}{}",
+        &value[..at],
+        &value[at + user.len()..]
+    ))
 }
 
 /// A literal secret's mask.
@@ -374,8 +425,8 @@ fn unmaskable(text: &str) -> bool {
         })
 }
 
-/// Every secret leaf written in `text`.
-fn secrets(text: &str) -> Result<Vec<Written>, MaskError> {
+/// Every leaf written in `text`, a pipeline's under its key.
+fn leaves(text: &str) -> Result<Vec<Written>, MaskError> {
     let raw: RawConfig = parse_document(text).map_err(|_| MaskError::Parse)?;
     let mut all = vec![];
     raw.globals.leaves(&["globals".to_owned()], &mut all);
@@ -383,6 +434,12 @@ fn secrets(text: &str) -> Result<Vec<Written>, MaskError> {
     for (name, p) in raw.pipelines.iter().flatten() {
         Some(p.clone()).leaves(&under(&["pipelines".to_owned()], name), &mut all);
     }
+    Ok(all)
+}
+
+/// Every secret leaf written in `text`.
+fn secrets(text: &str) -> Result<Vec<Written>, MaskError> {
+    let mut all = leaves(text)?;
     all.retain(is_secret);
     Ok(all)
 }
@@ -425,6 +482,12 @@ fn check(before: &[Written], masked: &str) -> Result<(), MaskError> {
         .any(|a| literal(&a.text).is_some() && !a.text.starts_with(MASK))
     {
         return Err(MaskError::Leaked("a key".to_owned()));
+    }
+    if let Some(w) = leaves(masked)?
+        .iter()
+        .find(|w| literal(&w.text).is_some_and(|v| without_userinfo(&v).is_some()))
+    {
+        return Err(MaskError::Leaked(w.path.join(".")));
     }
     Ok(())
 }
@@ -830,6 +893,55 @@ pipelines:
                 after: Some("5433".into()),
             }]
         );
+    }
+
+    /// A URL's credentials are masked wherever it is written, in the text and in the diff:
+    /// `user:pass@` becomes `••••••@`; a URL without them stays as written.
+    #[test]
+    fn a_url_s_credentials_are_masked() {
+        let text = |pass: &str| {
+            format!(
+                "config_version: 1
+globals:
+  api:
+    jwt: {{ issuer: i, jwks_url: 'https://k:{pass}@idp.example/keys' }}
+  console:
+    prometheus:
+      url: https://prom:{pass}@prom.example:9090/api # old
+pipelines:
+  p:
+    sink:
+      iceberg:
+        catalog:
+          rest: {{ url: \"http://u:{pass}@rest:8181\" }}
+          hive: {{ url: thrift://hive:9083 }}
+"
+            )
+        };
+        let one = text("old-pass");
+        let out = mask_secrets(&one, &key()).unwrap();
+        assert!(!out.contains("old-pass"), "{out}");
+        for kept in [
+            "jwks_url: \"https://••••••@idp.example/keys\" }",
+            "      url: \"https://••••••@prom.example:9090/api\" #\n",
+            "rest: { url: \"http://••••••@rest:8181\" }",
+            "hive: { url: thrift://hive:9083 }",
+        ] {
+            assert!(out.contains(kept), "{kept:?} is missing from:\n{out}");
+        }
+        let d = diff_written(&one, &text("new-pass"), &key()).unwrap();
+        let shown = format!("{d:?}");
+        assert!(!shown.contains("-pass"), "{shown}");
+        let prom = d
+            .changes
+            .iter()
+            .find(|c| c.path == "globals.console.prometheus.url")
+            .expect("a credential's change is a change");
+        assert_eq!(
+            prom.after.as_deref(),
+            Some("https://••••••@prom.example:9090/api")
+        );
+        assert_eq!(d.changes.len(), 3, "{shown}");
     }
 
     /// Only the secret keys are masked: a `user` written as the password's text stays shown, and

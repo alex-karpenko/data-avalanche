@@ -194,7 +194,7 @@ The config generation the cluster runs: validate, publish, status.
 
 ### `GET /v1/config/diff`
 
-What differs between two config generations as written: each change's path, what a reload of it does, before and after, secrets masked
+What differs between two config generations as written: each change's path, what a reload of it does, before and after, secrets and a URL's credentials masked
 
 Least role: `viewer`.
 
@@ -235,7 +235,7 @@ Least role: `viewer`.
 
 | Status | When |
 |---|---|
-| `200` | the generation and its text, every comment shown empty (`#`); `hash` is the text's keyed fingerprint, comparable across nodes of one cluster only |
+| `200` | the generation and its text, a URL's credentials masked (`••••••@`) and every comment shown empty (`#`); `hash` is the text's keyed fingerprint, comparable across nodes of one cluster only |
 | `400` | a generation that isn't a number |
 | `404` | no such generation |
 | `409` | several snapshots of it and no record of which one it is |

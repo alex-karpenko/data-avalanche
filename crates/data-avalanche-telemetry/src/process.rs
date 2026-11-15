@@ -83,7 +83,9 @@ fn v1_cpu(quota: &str, period: &str) -> Option<f64> {
 
 /// The figures under `root` (`/` on a real host), so a test can lay out a fake `/proc` and
 /// `/sys/fs/cgroup`. cgroup v2 is read at the process's own cgroup (`/proc/self/cgroup`'s
-/// `0::<path>`), then at the hierarchy's root; v1 at its controllers' roots.
+/// `0::<path>`), then at the hierarchy's root; v1 at its controllers' roots. The parents in
+/// between aren't walked: a limit set only on a pod's cgroup, above the container's own (a
+/// Kubernetes pod-level limit, not a container's `resources.limits`), isn't seen.
 pub fn read_process_at(root: &Path) -> Reading {
     let read = |p: &str| std::fs::read_to_string(root.join(p.trim_start_matches('/'))).ok();
     let mut r = Reading {

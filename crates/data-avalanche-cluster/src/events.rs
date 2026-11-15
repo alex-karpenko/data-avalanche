@@ -819,7 +819,6 @@ mod tests {
         events.record(&event).await.unwrap();
     }
 
-    /// The texts of every stored event, newest first.
     /// F4: a node that turned active on its first peer sees the rest of a long-running cluster
     /// arrive; none of them is a join. A member that joins once it has settled is.
     #[tokio::test(start_paused = true)]
@@ -858,6 +857,7 @@ mod tests {
         assert_eq!(stored(&events).await, ["d joined (1.1.0)"]);
     }
 
+    /// The texts of every stored event, newest first.
     async fn stored(events: &Events) -> Vec<String> {
         let page = events.list(&EventQuery::default()).await.unwrap();
         page.events.into_iter().map(|(_, e)| e.text).collect()

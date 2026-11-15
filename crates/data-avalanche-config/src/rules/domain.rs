@@ -234,17 +234,19 @@ fn globals(g: &RawGlobals, ctx: &mut Ctx) {
     if let Some(c) = &g.console {
         console(c, &root.key("console"), ctx);
     }
-    // V-138
+    // V-138; at most ADVERTISE_URL_MAX characters, so that it fits every gossip packet.
     if let Some(l) = g.api.as_ref().and_then(|a| a.advertise_url.as_ref())
         && let Some(url) = ctx.text(l, &root.key("api").key("advertise_url"))
-        && !origin_url(url.trim())
+        && (!origin_url(url.trim()) || url.trim().len() > ADVERTISE_URL_MAX)
     {
         ctx.error(
             "V-138",
             &root.key("api").key("advertise_url"),
             l.loc(),
-            "advertise_url must be an absolute http or https URL with a host and nothing after it \
-             (no path, query or fragment)",
+            format!(
+                "advertise_url must be an absolute http or https URL with a host and nothing \
+                 after it (no path, query or fragment), at most {ADVERTISE_URL_MAX} characters"
+            ),
         );
     }
     // V-101
@@ -633,6 +635,10 @@ fn http_headers(ctx: &mut Ctx, headers: &BTreeMap<String, Leaf<String>>, at: &At
         }
     }
 }
+
+/// The longest `globals.api.advertise_url` (V-138): a node's metadata, which holds it, goes in
+/// every gossip packet of at most 1400 bytes.
+const ADVERTISE_URL_MAX: usize = 255;
 
 /// An `http(s)://host[:port]` URL, a trailing `/` at most: where a node is reached, not a page.
 /// The host is non-empty (an IPv6 host in brackets); a written port is 1 to 65535.

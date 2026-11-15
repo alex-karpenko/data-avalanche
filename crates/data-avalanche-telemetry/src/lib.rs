@@ -85,7 +85,7 @@ impl LeaseState {
 pub enum Suspicion {
     /// This node's probe of a member failed: it suspects the member.
     Raised,
-    /// Another member suspected this node, and it refuted.
+    /// Another member suspected this node: it refuted, or, declared down first, it rejoined.
     Received,
 }
 
@@ -411,7 +411,7 @@ impl Metrics {
         );
         r.register(
             "gossip_suspicions",
-            "Suspicions this node raised of a member, or received of itself and refuted",
+            "Suspicions this node raised of a member, or received of itself (refuted, or rejoined once declared down)",
             f.gossip_suspicions.clone(),
         );
         r.register(
@@ -598,6 +598,7 @@ impl Metrics {
         self.families.gossip_probe_rtt.observe(rtt.as_secs_f64());
     }
 
+    /// A suspicion, raised by this node or received of it.
     pub fn gossip_suspicion(&self, direction: Suspicion) {
         self.families
             .gossip_suspicions

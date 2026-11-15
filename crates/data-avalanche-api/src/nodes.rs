@@ -93,7 +93,10 @@ async fn detail(node: &Node) -> Value {
         }
     }
     let p = *node.process.borrow();
-    let g = node.gossip.borrow().clone();
+    // As of now: a suspicion a day old goes though no newer one came to prune it.
+    let mut g = node.gossip.borrow().clone();
+    g.forget_before(Utc::now());
+    let (raised_more, received_more) = (g.raised_more(), g.received_more());
     let peers: Vec<Value> = members
         .nodes
         .iter()
@@ -143,6 +146,8 @@ async fn detail(node: &Node) -> Value {
             "suspicions": {
                 "raised": g.raised.iter().map(|(n, at)| json!({ "node": n, "at": at })).collect::<Vec<_>>(),
                 "received": g.received,
+                "raised_more": raised_more,
+                "received_more": received_more,
             },
         },
         "pipelines": held,
@@ -736,6 +741,35 @@ mod tests {
                 "{v}"
             );
         }
+    }
+
+    /// The gossip's figures are read as of the request: a suspicion older than a day isn't
+    /// shown, though no newer one has come to prune it.
+    #[tokio::test]
+    async fn the_detail_shows_only_a_day_s_suspicions() {
+        let (b, _log) = fake(Duration::ZERO).await;
+        let (_, lone, _dir) = served(&b, open()).await;
+        let now = chrono::Utc::now();
+        let old = now - chrono::Duration::hours(25);
+        let mut figures = data_avalanche_cluster::GossipFigures::default();
+        figures.raised = vec![("node-b".into(), old), ("node-b".into(), now)];
+        figures.received = vec![old];
+        let (tx, rx) = watch::channel(figures);
+        let mut node = lone.node.clone();
+        node.gossip = rx;
+        let a = api(open());
+        a.node.set(node).unwrap();
+        let addr = serve(a).await;
+        let (code, _, text) = request(addr, "GET", "/v1/nodes/node-a", &[], "").await;
+        assert_eq!(code, 200, "{text}");
+        let s = &json(&text)["gossip"]["suspicions"];
+        assert_eq!(s["raised"].as_array().map(Vec::len), Some(1), "{s}");
+        assert_eq!(s["received"], json!([]), "{s}");
+        assert_eq!(
+            (&s["raised_more"], &s["received_more"]),
+            (&json!(0), &json!(0))
+        );
+        drop(tx);
     }
 
     #[tokio::test]

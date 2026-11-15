@@ -42,7 +42,7 @@ pub use events::{
 };
 pub use gossip::{
     Advertiser, Announcer, Gossip, GossipFigures, GossipSettings, Member, Members, NodeIdentity,
-    NodeMeta, Phase, SUSPICIONS_KEPT,
+    NodeMeta, Phase, SUSPICIONS_KEPT, SUSPICIONS_LISTED,
 };
 pub use lease::{LeaseGuard, LeaseRun, LeaseTiming, RenewEnd, RenewState};
 pub use node::{JOIN_WAIT, join, leave};
