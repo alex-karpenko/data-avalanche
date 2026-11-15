@@ -9,8 +9,8 @@
 //! The masked text is parsed again and checked before it is returned: every secret is then a
 //! mask or a reference. A text that fails the check isn't shown at all ([`MaskError`]). A
 //! secret's text that is also written as another key's value (a `user` that is the `password`)
-//! stays shown there: only the secret keys are masked. A text with a YAML merge key (`<<`) is
-//! refused ([`MaskError::MergeKey`]): a key that overrides a merged value would hide the secret
+//! stays shown there: only the secret keys are masked. A text containing `<<` or a merge tag isn't
+//! shown ([`MaskError::MergeKey`]): a key that overrides a merged value would hide the secret
 //! the masker reads.
 
 use thiserror::Error;
@@ -120,22 +120,13 @@ fn literal(text: &str) -> Option<String> {
     }
 }
 
-/// Whether `text` has a YAML merge key: a `<<` followed by `:`, at the start of its line
-/// (after indentation, `- ` or `? `) or after a flow map's `{` or `,`. Over-matching, a `<<:` in
-/// a quoted string or a comment, fails closed.
+/// Whether `text` can merge a mapping: it contains `<<` (a merge key, whatever is around it),
+/// `!!merge`, or the merge tag `tag:yaml.org,2002:merge` (a tag can make another scalar a merge
+/// key). Over-matching, a `<<` in a comment or a literal, fails closed.
 fn has_merge_key(text: &str) -> bool {
-    text.lines().any(|line| {
-        line.match_indices("<<").any(|(at, _)| {
-            let before = line[..at].trim_start();
-            let before = before
-                .strip_prefix("- ")
-                .or_else(|| before.strip_prefix("? "))
-                .unwrap_or(before)
-                .trim_end();
-            let key_position = before.is_empty() || before.ends_with('{') || before.ends_with(',');
-            key_position && line[at + 2..].trim_start().starts_with(':')
-        })
-    })
+    ["<<", "!!merge", "tag:yaml.org,2002:merge"]
+        .iter()
+        .any(|marker| text.contains(marker))
 }
 
 /// Every secret leaf written in `text`.
@@ -462,6 +453,18 @@ pipelines:
         assert_eq!(mask_secrets(text, &key()), Err(MaskError::MergeKey));
         let flow = "config_version: 1\nglobals:\n  api: &s { user: u }\npipelines:\n  p:\n    source: { <<: *s, password: x }\n";
         assert_eq!(mask_secrets(flow, &key()), Err(MaskError::MergeKey));
+        for shape in [
+            "      !!merge <<: { password: hunter2 }\n      password: ${X}\n",
+            "      &k <<: { password: hunter2 }\n      password: ${X}\n",
+            "      ? <<\n      : { password: hunter2 }\n      password: ${X}\n",
+        ] {
+            let text = format!("config_version: 1\npipelines:\n  p:\n    source:\n{shape}");
+            assert_eq!(
+                mask_secrets(&text, &key()),
+                Err(MaskError::MergeKey),
+                "{text}"
+            );
+        }
     }
 
     /// An inline key whose PEM sits under a header line is still a secret.
