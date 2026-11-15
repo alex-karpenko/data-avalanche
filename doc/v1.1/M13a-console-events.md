@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-14
+updated: 2026-11-15
 domain: Architecture
 tags: [v1.1, implementation-plan, m13a, console, events, audit-trail, attribution, api, cluster, config]
 ---
@@ -7950,16 +7950,56 @@ git commit -m "test(e2e): the timeline on three nodes — a pause with its note,
 
 ## Exit
 
-- [ ] Every task's tests pass, and `cargo test --workspace` (1559 tests at the plan's
-  verification).
-- [ ] The E2E suite on PostgreSQL 18 (52 scenarios at the plan's verification, the new one among
-  them: 52/52 in 670 s).
-- [ ] `promtool test rules` on the alert rules; the site builds with its link check.
-- [ ] Every mutating route of the OpenAPI document records (Task 4's route table), and
+- [x] Every task's tests pass, and `cargo test --workspace` (1559 tests at the plan's
+  verification; 1574 after execution and the whole-branch fixes).
+- [x] The E2E suite on PostgreSQL 18 (52 scenarios at the plan's verification, the new one among
+  them: 52/52 in 670 s; on the branch's head 2026-11-15: 52/52 in 608 s).
+- [x] `promtool test rules` on the alert rules; the site builds with its link check.
+- [x] Every mutating route of the OpenAPI document records (Task 4's route table), and
   `GET /v1/events` is in it as viewer.
 - [x] S-M13a.1 applied (49e5ee4).
 - [ ] The PR's CI green on every target.
 
 ## Deviations during execution
 
-None yet.
+Each was found by the task's review (or the whole-branch review) and fixed in its fix round,
+unless it says otherwise. Later tasks' blocks applied on top unchanged.
+
+- **Task 1** (fix round, `ab145e6`; Important in its review): a `globals.console.prometheus` block
+  without `url`, or a `basic` without `user` or `password`, resolved to nothing and surfaced as an
+  internal error, because the spec marked the fields required but no rule reported them. Oleksii
+  approved a new rule, **V-137** (spec `c4184d7`): the registry now holds 131 rules. The same round
+  stores the console's URLs trimmed and corrects the V-133 field docs.
+- **Task 3** (fix round, `a526c44`): `expire_events` had no test. One paused-clock test pins the
+  first prune at 60 s, the hourly repeat and the latest retention read from the `watch`. The cluster
+  crate's library gains a test, so Task 5's targeted count is 181, not the plan's 180.
+- **The plan** (`46ca419`): five diff blocks (Task 4's api `Cargo.toml`, state `snapshot.rs` and
+  `reference/api.md`, Task 5's `jobs.rs`, Task 6's alert rules page) had lost a last context line
+  that was a single space, so `git apply` refused them as corrupt. Content unchanged; every later
+  block applied in order and gave the verified tree.
+- **Whole-branch review** (fix wave `fd6b7da`, `69f0d01`, `e449441`, `91ec832`, `c47c359`):
+  - A refused attempt recorded the raw request path, unbounded (Important): a viewer could write
+    an event of about 190 KB a second per node. The path, the text's target and the log line are
+    now cut to 128 characters, `detail.error` to 1000, and `pipeline` is set only when the path
+    names a pipeline of the generation the node runs.
+  - A clean stop dropped the recorder's queue (Important): `Recorder::flush(within)` now waits
+    for the queue to drain, and `run` calls it for 5 s after `leave()`.
+  - The recorded name of a `jwt` caller is `globals.console.username_claim` (default
+    `preferred_username`, then `sub`), as Configuration_Specification §6.8 says; the plan had left
+    it as `sub` (Important). The claim is rebuilt with the auth on reload.
+  - A verified token with no mapped role on a mutating route is recorded as `action.denied`, role
+    `none` (System-Overview: a call refused for its role is recorded).
+  - An answer the recording layer can't read whole (over 1 MiB, or unsized) passes through
+    unread and is recorded from its status; an unreadable request body is a `400`, only the size
+    limit a `413`.
+  - `Events::record`'s conflict retry stops at 16; `prune` keeps everything when the retention
+    overflows the clock; a test pins the `MAX_SCANNED` stop and its cursor; `job_ended` matches
+    `JobStatus` exhaustively; `GET /v1/events`'s `503` has its own message and its `limit` is an
+    integer in the OpenAPI document; the recorded routes' `422` and `413` are documented; the E2E
+    reads the actions until written. The events page says what isn't recorded.
+  - Left, with rulings in the execution ledger: notes may hold Unicode format characters (M15/M16
+    render them isolated); expiry deletes one key at a time on every node (M13c); a node that
+    turns active before its view converged can record `member.joined` for a long-running member
+    (documented; M13b); a passed-through answer records `accepted`, never `unchanged`; the `400` is
+    not yet in the OpenAPI document; a recorded `403` can wait behind a reload's coordinator lock,
+    as every pipeline route's `404` lookup does.
