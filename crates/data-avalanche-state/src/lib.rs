@@ -50,7 +50,7 @@ pub use anchor::{ANCHOR_KEY, Anchor, AnchorDoc, HashAlgo, establish_anchor};
 pub use doc::{DocStore, Document, MODIFY_ATTEMPTS, StateError, Versioned};
 pub use events::{
     Actor, EVENTS_PREFIX, EventDoc, EventPage, EventQuery, EventSeverity, Events, MAX_EVENTS,
-    MAX_SCANNED, event_key,
+    MAX_SCANNED, RECORD_ATTEMPTS, event_key,
 };
 pub use generation::{
     ConfigGeneration, ConfigGenerations, GENERATION_KEY, GenerationDoc, config_hash,

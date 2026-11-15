@@ -27,6 +27,10 @@ pub const MAX_SCANNED: usize = 5000;
 /// How many documents a listing reads at once.
 const READ_CONCURRENCY: usize = 16;
 
+/// The most keys one [`Events::record`] tries: past this many taken keys, the store is taken to
+/// be misbehaving and the last conflict is returned.
+pub const RECORD_ATTEMPTS: usize = 16;
+
 /// How serious an event is. A person's or a token's action carries an [`Actor`] besides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -103,7 +107,8 @@ impl EventDoc {
     }
 }
 
-/// What [`Events::list`] returns: the newest first.
+/// Which events [`Events::list`] selects, and how many: every filter set must match, and an
+/// unset one matches every event.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EventQuery {
     /// Events at or after.
@@ -161,17 +166,21 @@ impl Events {
     }
 
     /// Writes `event` under a new key; a key taken already (another process of the same node in
-    /// the same microsecond) takes the next sequence number.
+    /// the same microsecond) takes the next sequence number, at most [`RECORD_ATTEMPTS`] keys in
+    /// all.
     ///
     /// # Errors
-    /// A storage failure.
+    /// A storage failure, or the last conflict once [`RECORD_ATTEMPTS`] keys were taken.
     pub async fn record(&self, event: &EventDoc) -> Result<String, StateError> {
+        let mut attempts = 0;
         loop {
             let seq = self.seq.fetch_add(1, Ordering::Relaxed) % 1_000_000;
             let key = event_key(event.at, seq, &event.node);
+            attempts += 1;
             match self.docs.create(&key, event).await {
                 Ok(_) => return Ok(key),
-                Err(StateError::Store(StoreError::Conflict { .. })) => {}
+                Err(StateError::Store(StoreError::Conflict { .. }))
+                    if attempts < RECORD_ATTEMPTS => {}
                 Err(e) => return Err(e),
             }
         }
@@ -254,7 +263,8 @@ impl Events {
 
     /// Deletes every event of the days that ended `retention` or more before `now`, and returns
     /// how many. Whole days only: an event lives at least `retention`, at most a day more. Safe
-    /// on every node at once.
+    /// on every node at once. A retention reaching past the earliest time a date can hold keeps
+    /// everything.
     ///
     /// # Errors
     /// A storage failure; what was deleted before it stays deleted.
@@ -263,7 +273,12 @@ impl Events {
         retention: Duration,
         now: DateTime<Utc>,
     ) -> Result<usize, StateError> {
-        let cutoff = now - chrono::Duration::from_std(retention).unwrap_or(chrono::Duration::MAX);
+        let Some(cutoff) = chrono::Duration::from_std(retention)
+            .ok()
+            .and_then(|r| now.checked_sub_signed(r))
+        else {
+            return Ok(0);
+        };
         let keep_from = cutoff.format("%Y-%m-%d").to_string();
         let store = self.docs.store();
         let mut deleted = 0;
@@ -492,6 +507,116 @@ mod tests {
             .unwrap();
         let page = ev.list(&EventQuery::default()).await.unwrap();
         assert_eq!(page.events.len(), 1);
+    }
+
+    /// A store whose every create finds its key taken, counting the attempts.
+    #[derive(Debug)]
+    struct AlwaysTaken {
+        inner: ObjectStoreVersioned,
+        creates: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl VersionedStore for AlwaysTaken {
+        async fn get(
+            &self,
+            key: &str,
+        ) -> Result<Option<(bytes::Bytes, data_avalanche_storage::ObjectVersion)>, StoreError>
+        {
+            self.inner.get(key).await
+        }
+        async fn create(
+            &self,
+            key: &str,
+            _body: bytes::Bytes,
+        ) -> Result<data_avalanche_storage::ObjectVersion, StoreError> {
+            self.creates.fetch_add(1, Ordering::SeqCst);
+            Err(StoreError::Conflict { key: key.into() })
+        }
+        async fn update(
+            &self,
+            key: &str,
+            expected: &data_avalanche_storage::ObjectVersion,
+            body: bytes::Bytes,
+        ) -> Result<data_avalanche_storage::ObjectVersion, StoreError> {
+            self.inner.update(key, expected, body).await
+        }
+        async fn put(
+            &self,
+            key: &str,
+            body: bytes::Bytes,
+        ) -> Result<data_avalanche_storage::ObjectVersion, StoreError> {
+            self.inner.put(key, body).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+            self.inner.list(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// A store that answers every create with a conflict doesn't hold the writer forever.
+    #[tokio::test]
+    async fn a_write_that_always_conflicts_gives_up() {
+        let store = Arc::new(AlwaysTaken {
+            inner: ObjectStoreVersioned::new(Arc::new(InMemory::new()), "state").unwrap(),
+            creates: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let ev = Events::new(DocStore::new(Arc::clone(&store) as Arc<dyn VersionedStore>));
+        let e = ev
+            .record(&event(at(14, 1, 0), "member.joined", "a"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(e, StateError::Store(StoreError::Conflict { .. })),
+            "the last conflict: {e:?}"
+        );
+        assert_eq!(store.creates.load(Ordering::SeqCst), RECORD_ATTEMPTS);
+    }
+
+    /// A narrow filter over many events stops at [`MAX_SCANNED`] documents and says where, so a
+    /// caller can go on.
+    #[tokio::test]
+    async fn a_listing_stops_after_its_scan_cap_and_says_where() {
+        let (ev, _) = events();
+        let mut wanted = event(at(13, 1, 0), "table.halted", "a");
+        wanted.pipeline = Some("orders".into());
+        ev.record(&wanted).await.unwrap();
+        let base = at(14, 0, 0);
+        for i in 0..=MAX_SCANNED {
+            let t = base + chrono::Duration::milliseconds(i64::try_from(i).unwrap());
+            ev.record(&event(t, "member.joined", "a")).await.unwrap();
+        }
+        let q = EventQuery {
+            object: Some("orders".into()),
+            ..EventQuery::default()
+        };
+        let page = ev.list(&q).await.unwrap();
+        assert!(page.events.is_empty(), "{:?}", page.events.len());
+        let next = page.next.expect("where it stopped");
+        let rest = ev
+            .list(&EventQuery {
+                after: Some(next),
+                ..q
+            })
+            .await
+            .unwrap();
+        assert_eq!(rest.events.len(), 1, "found on the next page");
+        assert_eq!(rest.next, None);
+    }
+
+    #[tokio::test]
+    async fn a_retention_past_the_earliest_date_keeps_everything() {
+        let (ev, _) = events();
+        ev.record(&event(at(10, 12, 0), "member.joined", "a"))
+            .await
+            .unwrap();
+        assert_eq!(ev.prune(Duration::MAX, at(14, 6, 0)).await.unwrap(), 0);
+        assert_eq!(
+            ev.list(&EventQuery::default()).await.unwrap().events.len(),
+            1
+        );
     }
 
     #[tokio::test]
