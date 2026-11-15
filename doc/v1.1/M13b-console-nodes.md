@@ -9168,3 +9168,8 @@ tasks' blocks applied on top unchanged.
 - **Task 2** (review, no fix round): the plan's Interfaces said `Advertiser::set_file_hash` returns
   whether the hash changed; it returns `false` once the gossip is gone, which `watch_file` stops
   on. The plan's text is corrected.
+- **Task 4** (fix round, `9cc0c14`; Important in its review): `process_resident_memory_bytes`
+  and `process_cpu_seconds_total` were registered from the start, so a host without readings (not
+  Linux, or before the first sample) exposed them as `0`, which Review Focus 5 rules out. Both are
+  now created with the first reading, as the limit series are; `no_reading_exposes_no_process_series`
+  pins it. The workspace total is one higher than the plan's.
