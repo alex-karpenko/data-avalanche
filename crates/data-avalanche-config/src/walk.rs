@@ -21,12 +21,38 @@ use std::collections::BTreeMap;
 
 use crate::coerce::LeafType;
 use crate::ctx::{At, Ctx};
-use crate::leaf::{Leaf, Tri};
+use crate::leaf::{Leaf, Loc, Tri};
 use crate::raw::*;
+
+/// A leaf present in the file: its key path (a map's key or a list's `[i]` as one segment), its
+/// text as written, and where that is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Written {
+    pub path: Vec<String>,
+    pub text: String,
+    pub at: Option<Loc>,
+}
 
 pub(crate) trait Walk {
     fn drop_empty(&mut self, ctx: &Ctx);
     fn check_values(&self, ctx: &mut Ctx, at: &At);
+    /// Every leaf present, under `path` ([`Written`]).
+    fn leaves(&self, path: &[String], out: &mut Vec<Written>);
+}
+
+/// `path` and then `key`.
+pub(crate) fn under(path: &[String], key: &str) -> Vec<String> {
+    let mut p = path.to_vec();
+    p.push(key.to_owned());
+    p
+}
+
+fn written<T>(leaf: &Leaf<T>, path: Vec<String>, out: &mut Vec<Written>) {
+    out.push(Written {
+        path,
+        text: leaf.text().to_owned(),
+        at: leaf.written(),
+    });
 }
 
 /// Maps a raw struct's field identifier to its YAML key: every field's Rust name matches, except
@@ -76,6 +102,12 @@ macro_rules! walk_fields {
                     $f, ctx, &at.key($crate::walk::walk_key!($f)),
                 ); )+
             }
+            fn leaves(&self, path: &[String], out: &mut Vec<$crate::walk::Written>) {
+                let $t { $($f),+ } = self;
+                $( $crate::walk::Walk::leaves(
+                    $f, &$crate::walk::under(path, $crate::walk::walk_key!($f)), out,
+                ); )+
+            }
         }
         impl $crate::keys::Keys for $t {
             fn keys(&self, path: &str, out: &mut Vec<$crate::keys::Key>) {
@@ -101,6 +133,11 @@ macro_rules! walk_fields {
                     $crate::walk::Walk::check_values(v, ctx, at);
                 }
             }
+            fn leaves(&self, path: &[String], out: &mut Vec<$crate::walk::Written>) {
+                if let Some(v) = self {
+                    $crate::walk::Walk::leaves(v, path, out);
+                }
+            }
         }
     };
 }
@@ -124,6 +161,12 @@ impl<T: LeafType> Walk for Option<Leaf<T>> {
             ctx.value(l, at);
         }
     }
+
+    fn leaves(&self, path: &[String], out: &mut Vec<Written>) {
+        if let Some(l) = self {
+            written(l, path.to_vec(), out);
+        }
+    }
 }
 
 /// A tri-state leaf (§9.4.1): an explicit value whose resolved text is empty is absent (use the
@@ -144,6 +187,12 @@ impl<T: LeafType> Walk for Tri<T> {
             ctx.value(l, at);
         }
     }
+
+    fn leaves(&self, path: &[String], out: &mut Vec<Written>) {
+        if let Some(Some(l)) = self {
+            written(l, path.to_vec(), out);
+        }
+    }
 }
 
 /// A list of leaves (`join_members`, `bind_addr`): elements are left alone by `drop_empty`.
@@ -153,6 +202,12 @@ impl<T: LeafType> Walk for Option<Vec<Leaf<T>>> {
     fn check_values(&self, ctx: &mut Ctx, at: &At) {
         for (i, l) in self.iter().flatten().enumerate() {
             ctx.value(l, &at.index(i));
+        }
+    }
+
+    fn leaves(&self, path: &[String], out: &mut Vec<Written>) {
+        for (i, l) in self.iter().flatten().enumerate() {
+            written(l, under(path, &format!("[{i}]")), out);
         }
     }
 }
@@ -167,6 +222,14 @@ impl<T: LeafType> Walk for Option<Option<Vec<Leaf<T>>>> {
         if let Some(Some(items)) = self {
             for (i, l) in items.iter().enumerate() {
                 ctx.value(l, &at.index(i));
+            }
+        }
+    }
+
+    fn leaves(&self, path: &[String], out: &mut Vec<Written>) {
+        if let Some(Some(items)) = self {
+            for (i, l) in items.iter().enumerate() {
+                written(l, under(path, &format!("[{i}]")), out);
             }
         }
     }
@@ -186,6 +249,12 @@ impl<T: LeafType> Walk for Option<BTreeMap<String, Leaf<T>>> {
             ctx.value(l, &at.key(k.as_str()));
         }
     }
+
+    fn leaves(&self, path: &[String], out: &mut Vec<Written>) {
+        for (k, l) in self.iter().flatten() {
+            written(l, under(path, k), out);
+        }
+    }
 }
 
 /// A map of lists of leaves (`role_mapping`, `primary_key`): list elements are left alone, same as
@@ -198,6 +267,15 @@ impl<T: LeafType> Walk for Option<BTreeMap<String, Vec<Leaf<T>>>> {
             let at = at.key(k.as_str());
             for (i, l) in items.iter().enumerate() {
                 ctx.value(l, &at.index(i));
+            }
+        }
+    }
+
+    fn leaves(&self, path: &[String], out: &mut Vec<Written>) {
+        for (k, items) in self.iter().flatten() {
+            let path = under(path, k);
+            for (i, l) in items.iter().enumerate() {
+                written(l, under(&path, &format!("[{i}]")), out);
             }
         }
     }
@@ -222,6 +300,15 @@ impl Walk for Option<BTreeMap<String, Vec<RawPartitionField>>> {
             let at = at.key(k.as_str());
             for (i, f) in fields.iter().enumerate() {
                 f.check_values(ctx, &at.index(i));
+            }
+        }
+    }
+
+    fn leaves(&self, path: &[String], out: &mut Vec<Written>) {
+        for (k, fields) in self.iter().flatten() {
+            let path = under(path, k);
+            for (i, f) in fields.iter().enumerate() {
+                f.leaves(&under(&path, &format!("[{i}]")), out);
             }
         }
     }

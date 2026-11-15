@@ -46,6 +46,7 @@ fn operation(r: &Route) -> utoipa::openapi::path::Operation {
         ("id", "the pipeline's id"),
         ("job_id", "the snapshot job's id, `<pipeline id>~<suffix>`"),
         ("node", "a member's name, as the gossip knows it"),
+        ("generation", "a config generation's number"),
     ] {
         if r.path.contains(&format!("{{{name}}}")) {
             op = op.parameter(
@@ -55,6 +56,29 @@ fn operation(r: &Route) -> utoipa::openapi::path::Operation {
                     .required(Required::True)
                     .description(Some(description))
                     .schema(Some(ObjectBuilder::new().schema_type(Type::String))),
+            );
+        }
+    }
+    if r.path == "/v1/config/generations" {
+        for (name, description) in crate::generations::PARAMETERS {
+            let schema = if *name == "limit" {
+                ObjectBuilder::new()
+                    .schema_type(Type::Integer)
+                    .minimum(Some(1))
+                    .maximum(Some(crate::generations::MAX_LIMIT))
+                    .default(Some(crate::generations::DEFAULT_LIMIT.into()))
+            } else {
+                ObjectBuilder::new()
+                    .schema_type(Type::Integer)
+                    .minimum(Some(1))
+            };
+            op = op.parameter(
+                ParameterBuilder::new()
+                    .name(*name)
+                    .parameter_in(ParameterIn::Query)
+                    .required(Required::False)
+                    .description(Some(*description))
+                    .schema(Some(schema)),
             );
         }
     }

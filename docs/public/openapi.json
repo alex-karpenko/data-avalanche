@@ -185,6 +185,157 @@
         "x-min-role": "viewer"
       }
     },
+    "/v1/config/generations": {
+      "get": {
+        "tags": [
+          "config"
+        ],
+        "summary": "The config generations, newest first: who published each, why, and what it changed",
+        "parameters": [
+          {
+            "name": "before",
+            "in": "query",
+            "description": "generations older than this one: the `next` of the page before",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "at most this many (1–100, 20 by default)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 20,
+              "maximum": 100,
+              "minimum": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the generations, and `next` when there are more",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "400": {
+            "description": "a parameter that isn't one, or isn't in its form",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "viewer"
+      }
+    },
+    "/v1/config/generations/{generation}": {
+      "get": {
+        "tags": [
+          "config"
+        ],
+        "summary": "One config generation and its text, its secrets masked",
+        "parameters": [
+          {
+            "name": "generation",
+            "in": "path",
+            "description": "a config generation's number",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the generation and its text",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "400": {
+            "description": "a generation that isn't a number",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "404": {
+            "description": "no such generation",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "409": {
+            "description": "several snapshots of it and no record of which one it is",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "500": {
+            "description": "its text couldn't be masked, so it isn't shown",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "viewer"
+      }
+    },
     "/v1/config/reload": {
       "post": {
         "tags": [

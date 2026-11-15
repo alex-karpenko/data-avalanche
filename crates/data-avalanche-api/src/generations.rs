@@ -1,0 +1,228 @@
+//! `GET /v1/config/generations` and `GET /v1/config/generations/{generation}` (Admin_Console §4
+//! Config, D-M13b.9): the cluster's config generations, newest first, each with who published it
+//! and why; and one generation with its text, its secrets masked (D-M13b.10).
+
+use axum::extract::{Path, RawQuery, State};
+use axum::http::StatusCode;
+use axum::response::Response;
+use data_avalanche_state::{Listed, StateError};
+use serde_json::{Value, json};
+
+use crate::{Api, Failure, body, starting};
+
+/// The list's parameters.
+pub const PARAMETERS: &[(&str, &str)] = &[
+    (
+        "before",
+        "generations older than this one: the `next` of the page before",
+    ),
+    ("limit", "at most this many (1–100, 20 by default)"),
+];
+
+pub const DEFAULT_LIMIT: usize = 20;
+pub const MAX_LIMIT: usize = 100;
+
+fn query(raw: Option<&str>) -> Result<(Option<u64>, usize), Failure> {
+    let mut before = None;
+    let mut limit = DEFAULT_LIMIT;
+    for (name, value) in url::form_urlencoded::parse(raw.unwrap_or_default().as_bytes()) {
+        match &*name {
+            "before" => {
+                before = Some(value.trim().parse().map_err(|_| {
+                    Failure::new(StatusCode::BAD_REQUEST, "before is a generation's number")
+                })?);
+            }
+            "limit" => {
+                limit = value
+                    .trim()
+                    .parse()
+                    .ok()
+                    .filter(|n| (1..=MAX_LIMIT).contains(n))
+                    .ok_or_else(|| {
+                        Failure::new(
+                            StatusCode::BAD_REQUEST,
+                            format!("limit is 1 to {MAX_LIMIT}"),
+                        )
+                    })?;
+            }
+            other => {
+                return Err(Failure::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown parameter {other:?}: the generations take before, limit"),
+                ));
+            }
+        }
+    }
+    Ok((before, limit))
+}
+
+fn listed_json(l: &Listed) -> Value {
+    let mut v = json!({
+        "generation": l.generation,
+        "hash": l.hash,
+        "current": l.current,
+    });
+    if let Some(r) = &l.record {
+        v["node"] = json!(r.node);
+        v["at"] = json!(r.at);
+        v["by"] = json!(r.by);
+        v["note"] = json!(r.note);
+        v["summary"] = json!(r.summary);
+    }
+    v
+}
+
+fn unreadable(e: &StateError) -> Response {
+    body(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &json!({ "error": format!("the config generations can't be read: {e}") }),
+    )
+}
+
+/// The generations, newest first; `next` names the page after when this one is full.
+pub(crate) async fn list(State(api): State<Api>, RawQuery(raw): RawQuery) -> Response {
+    let Some(node) = api.node.get() else {
+        return starting();
+    };
+    let (before, limit) = match query(raw.as_deref()) {
+        Ok(q) => q,
+        Err(f) => return f.into(),
+    };
+    match node.coordinator.generations().history(before, limit).await {
+        Ok(page) => {
+            let next = (page.len() == limit)
+                .then(|| page.last().map(|l| l.generation))
+                .flatten();
+            body(
+                StatusCode::OK,
+                &json!({
+                    "generations": page.iter().map(listed_json).collect::<Vec<_>>(),
+                    "next": next,
+                }),
+            )
+        }
+        Err(e) => unreadable(&e),
+    }
+}
+
+/// One generation and its text, secrets masked.
+pub(crate) async fn one(State(api): State<Api>, Path(generation): Path<String>) -> Response {
+    let Some(node) = api.node.get() else {
+        return starting();
+    };
+    let Ok(n) = generation.parse::<u64>() else {
+        return Failure::new(StatusCode::BAD_REQUEST, "a generation is a number").into();
+    };
+    match node.coordinator.generations().one(n).await {
+        Ok(None) => Failure::new(StatusCode::NOT_FOUND, format!("no config generation {n}")).into(),
+        Ok(Some((_, None))) => Failure::new(
+            StatusCode::CONFLICT,
+            format!(
+                "config generation {n} has several snapshots and no record of which one it is: a publish that lost its race left one behind"
+            ),
+        )
+        .into(),
+        Ok(Some((listed, Some(text)))) => match node.coordinator.mask(&text) {
+            Ok(masked) => {
+                let mut v = listed_json(&listed);
+                v["text"] = json!(masked);
+                body(StatusCode::OK, &v)
+            }
+            Err(e) => Failure::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("config generation {n}'s text isn't shown: {e}"),
+            )
+            .into(),
+        },
+        Err(e) => unreadable(&e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::OnceLock;
+    use std::sync::atomic::AtomicBool;
+
+    use data_avalanche_config::MASK;
+    use data_avalanche_telemetry::Metrics;
+
+    use super::*;
+    use crate::test_support::{CONFIG, json_of, lone, open, request, serve};
+
+    /// Each generation is listed with who published it and why; one generation's text shows
+    /// its secrets masked.
+    #[tokio::test]
+    async fn a_generation_is_listed_with_its_publisher_and_shown_masked() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.yaml");
+        std::fs::write(&file, CONFIG).unwrap();
+        let lone = lone(file.clone()).await;
+        let node = Arc::new(OnceLock::new());
+        node.set(lone.node.clone()).unwrap();
+        let addr = serve(Api {
+            metrics: Metrics::new(),
+            ready: Arc::new(AtomicBool::new(true)),
+            node,
+            auth: open(),
+        })
+        .await;
+        std::fs::write(
+            &file,
+            CONFIG.replace("drain_timeout: 45s", "drain_timeout: 40s"),
+        )
+        .unwrap();
+        let (code, _, _) = request(
+            addr,
+            "POST",
+            "/v1/config/reload",
+            &[],
+            r#"{"note": "shorter drain"}"#,
+        )
+        .await;
+        assert_eq!(code, 202);
+
+        let (code, v) = json_of(addr, "GET", "/v1/config/generations").await;
+        assert_eq!(code, 200, "{v}");
+        let gens = v["generations"].as_array().unwrap();
+        assert_eq!(gens.len(), 2, "{v}");
+        assert_eq!(
+            (
+                &gens[0]["generation"],
+                &gens[0]["current"],
+                &gens[0]["note"]
+            ),
+            (&json!(2), &json!(true), &json!("shorter drain"))
+        );
+        assert_eq!(gens[0]["by"]["name"], "anonymous", "{v}");
+        assert_eq!(gens[0]["node"], "node-a");
+        assert_eq!(gens[1]["summary"], "bootstrap");
+        assert_eq!(v["next"], Value::Null);
+        let (_, v) = json_of(addr, "GET", "/v1/config/generations?limit=1").await;
+        assert_eq!(
+            (v["generations"][0]["generation"].clone(), v["next"].clone()),
+            (json!(2), json!(2))
+        );
+        let (_, v) = json_of(addr, "GET", "/v1/config/generations?before=2").await;
+        assert_eq!(v["generations"][0]["generation"], 1);
+
+        let (code, v) = json_of(addr, "GET", "/v1/config/generations/2").await;
+        assert_eq!(code, 200, "{v}");
+        let text = v["text"].as_str().unwrap();
+        assert!(text.contains("drain_timeout: 40s"), "{text}");
+        assert!(
+            text.contains(&format!("password: \"{MASK} blake3:")),
+            "{text}"
+        );
+        assert!(!text.contains("password: pw"), "{text}");
+
+        for (path, want) in [
+            ("/v1/config/generations/3", 404),
+            ("/v1/config/generations/x", 400),
+            ("/v1/config/generations?limit=0", 400),
+            ("/v1/config/generations?after=1", 400),
+        ] {
+            assert_eq!(json_of(addr, "GET", path).await.0, want, "{path}");
+        }
+    }
+}

@@ -13,6 +13,7 @@ mod auth;
 mod cluster;
 mod config;
 mod events;
+mod generations;
 mod limit;
 mod nodes;
 mod openapi;
@@ -222,6 +223,38 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
                 &[(200, "the generations")],
             ),
             get(config::status),
+        ),
+        (
+            r(
+                "GET",
+                "/v1/config/generations",
+                Viewer,
+                "The config generations, newest first: who published each, why, and what it changed",
+                &[
+                    (200, "the generations, and `next` when there are more"),
+                    (400, "a parameter that isn't one, or isn't in its form"),
+                ],
+            ),
+            get(generations::list),
+        ),
+        (
+            r(
+                "GET",
+                "/v1/config/generations/{generation}",
+                Viewer,
+                "One config generation and its text, its secrets masked",
+                &[
+                    (200, "the generation and its text"),
+                    (400, "a generation that isn't a number"),
+                    (404, "no such generation"),
+                    (
+                        409,
+                        "several snapshots of it and no record of which one it is",
+                    ),
+                    (500, "its text couldn't be masked, so it isn't shown"),
+                ],
+            ),
+            get(generations::one),
         ),
         (
             r(
@@ -731,6 +764,8 @@ mod tests {
                 ("POST", "/v1/config/validate", Operator),
                 ("POST", "/v1/config/reload", Operator),
                 ("GET", "/v1/config/status", Viewer),
+                ("GET", "/v1/config/generations", Viewer),
+                ("GET", "/v1/config/generations/{generation}", Viewer),
                 ("GET", "/v1/cluster/status", Viewer),
                 ("GET", "/v1/pipelines", Viewer),
                 ("GET", "/v1/pipelines/{id}", Viewer),

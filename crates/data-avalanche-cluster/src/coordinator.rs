@@ -11,13 +11,14 @@ use std::time::Duration;
 
 use chrono::Utc;
 use data_avalanche_config::{
-    ConfigDiff, Env, FingerprintKey, Fingerprints, Globals, Mutability, Pipeline, PipelineChange,
-    Report, ResolvedConfig, diff, diff_with, load_posted_str, load_str,
+    ConfigDiff, Env, FingerprintKey, Fingerprints, Globals, MaskError, Mutability, Pipeline,
+    PipelineChange, Report, ResolvedConfig, diff, diff_with, load_posted_str, load_str,
+    mask_secrets,
 };
 use data_avalanche_core::TableRef;
 use data_avalanche_state::{
-    ConfigGeneration, ConfigGenerations, EventSeverity, GENERATION_KEY, GenerationDoc,
-    PipelineDocs, RemovalDoc, Removals, StateError, Versioned, config_hash,
+    Actor, ConfigGeneration, ConfigGenerations, EventSeverity, GENERATION_KEY, GenerationDoc,
+    GenerationRecord, PipelineDocs, RemovalDoc, Removals, StateError, Versioned, config_hash,
 };
 use data_avalanche_telemetry::Metrics;
 use thiserror::Error;
@@ -69,6 +70,14 @@ impl Debug for CoordinatorDeps {
             .field("node_id", &self.node_id)
             .finish_non_exhaustive()
     }
+}
+
+/// Who asked for a reload, and why: the published generation's record keeps them
+/// (Admin_Console §4 Config). Both are none for a reload nobody asked for through the API.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Attribution {
+    pub by: Option<Actor>,
+    pub note: Option<String>,
 }
 
 /// Whether a reload may publish a change to a field only a process restart applies (config
@@ -213,6 +222,20 @@ impl ConfigCoordinator {
         self.inner.running.lock().await.generation.doc.clone()
     }
 
+    /// The cluster's config generations in `globals.state`: their records and texts.
+    pub fn generations(&self) -> &ConfigGenerations {
+        &self.inner.deps.generations
+    }
+
+    /// `text`, a generation's, with its secrets masked under the cluster's fingerprint key
+    /// ([`mask_secrets`]).
+    ///
+    /// # Errors
+    /// [`MaskError`]: the text isn't shown.
+    pub fn mask(&self, text: &str) -> Result<String, MaskError> {
+        mask_secrets(text, &self.inner.deps.key)
+    }
+
     /// The config this node runs: its generation's text as resolved here.
     pub async fn config(&self) -> ResolvedConfig {
         self.inner.running.lock().await.config.clone()
@@ -247,6 +270,21 @@ impl ConfigCoordinator {
         &self,
         text: &str,
         restart: RestartFields,
+    ) -> Result<Reloaded, ReloadError> {
+        self.reload_as(text, restart, Attribution::default()).await
+    }
+
+    /// [`Self::reload`], the generation it publishes recorded as `asked`'s: who and why, with
+    /// what it changed (`config/history/<generation>.json`). The record is written after the
+    /// pointer; a failure to write it is logged, and the generation stands.
+    ///
+    /// # Errors
+    /// As [`Self::reload`].
+    pub async fn reload_as(
+        &self,
+        text: &str,
+        restart: RestartFields,
+        asked: Attribution,
     ) -> Result<Reloaded, ReloadError> {
         let d = &self.inner.deps;
         let mut running = self.inner.running.lock().await;
@@ -291,16 +329,32 @@ impl ConfigCoordinator {
                 Ok(published) => {
                     let generation = published.pointer.doc.generation;
                     tracing::info!(generation, "published config generation {generation}");
+                    let record = GenerationRecord {
+                        generation,
+                        hash: published.pointer.doc.hash.clone(),
+                        node: d.node_id.clone(),
+                        at: published.pointer.doc.written_at,
+                        by: asked.by.clone(),
+                        note: asked.note.clone(),
+                        summary: Some(summary(&changes)),
+                    };
+                    if let Err(e) = d.generations.record(&record).await {
+                        tracing::warn!(generation, "config generation {generation}'s record: {e}");
+                    }
+                    let who = asked.by.as_ref().map_or_else(
+                        || d.node_id.clone(),
+                        |a| format!("{} on {}", a.name, d.node_id),
+                    );
                     let mut e = d.recorder.event(
                         "config.published",
                         EventSeverity::Info,
                         format!(
-                            "config generation {generation} published by {}: {}",
-                            d.node_id,
+                            "config generation {generation} published by {who}: {}",
                             summary(&changes)
                         ),
                     );
                     e.object = Some(generation.to_string());
+                    e.actor = asked.by;
                     d.recorder.record(e);
                     self.inner.adopt(&mut running, published).await;
                     return Ok(Reloaded {
@@ -1241,6 +1295,49 @@ mod tests {
         );
         assert!(
             text.starts_with("config generation 2 published by n1: "),
+            "{text}"
+        );
+    }
+
+    /// The published generation's record names who asked and why, and what it changed.
+    #[tokio::test(start_paused = true)]
+    async fn a_reload_records_who_published_the_generation_and_why() {
+        let n = lone(&["p"]).await;
+        let asked = Attribution {
+            by: Some(Actor {
+                name: "oleksii".into(),
+                role: "operator".into(),
+            }),
+            note: Some("a second pipeline".into()),
+        };
+        n.coordinator
+            .reload_as(
+                &config_text(&["p", "q"]),
+                RestartFields::Refuse,
+                asked.clone(),
+            )
+            .await
+            .unwrap();
+        let listed = n.generations.history(None, 10).await.unwrap();
+        let record = listed[0].record.clone().expect("generation 2's record");
+        assert_eq!(
+            (
+                record.generation,
+                record.node.as_str(),
+                record.by,
+                record.note
+            ),
+            (2, "n1", asked.by, asked.note)
+        );
+        assert_eq!(
+            record.summary.as_deref(),
+            Some("1 pipelines added, 0 removed, 0 changed (0 restarted), 0 global fields")
+        );
+        let [(_, _, text)] = &n.recorded(1).await[..] else {
+            panic!("one event")
+        };
+        assert!(
+            text.starts_with("config generation 2 published by oleksii on n1: "),
             "{text}"
         );
     }

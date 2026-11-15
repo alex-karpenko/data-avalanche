@@ -37,6 +37,7 @@ mod anchor;
 mod doc;
 mod events;
 mod generation;
+mod history;
 mod lease;
 mod lifecycle;
 mod pipeline;
@@ -56,6 +57,7 @@ pub use generation::{
     ConfigGeneration, ConfigGenerations, GENERATION_KEY, GenerationDoc, config_hash,
     config_snapshot_key,
 };
+pub use history::{GenerationRecord, HISTORY_PREFIX, Listed, history_key};
 pub use lease::{Acquired, Holder, LeaseDoc, Leases, lease_key};
 pub use lifecycle::{
     Action, ActualState, REQUESTS_KEY, Request, RequestsDoc, STATUS_KEY, StatusDoc, Transition,

@@ -31,8 +31,8 @@ pub use controller::{
     SOURCE_CHANGES_IN_A_ROW, Target, Update, WorkerFactory,
 };
 pub use coordinator::{
-    Checked, ConfigCoordinator, CoordinatorDeps, DocsFn, PUBLISH_ATTEMPTS, ReloadError, Reloaded,
-    RestartFields, removed_pipelines,
+    Attribution, Checked, ConfigCoordinator, CoordinatorDeps, DocsFn, PUBLISH_ATTEMPTS,
+    ReloadError, Reloaded, RestartFields, removed_pipelines,
 };
 pub use discovery::{Seeds, advertise, discover, interfaces};
 pub use error::ClusterError;

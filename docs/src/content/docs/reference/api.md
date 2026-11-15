@@ -190,6 +190,36 @@ Least role: `viewer`.
 
 The config generation the cluster runs: validate, publish, status.
 
+### `GET /v1/config/generations`
+
+The config generations, newest first: who published each, why, and what it changed
+
+Least role: `viewer`.
+
+- Query parameter `before`: generations older than this one: the `next` of the page before.
+- Query parameter `limit`: at most this many (1–100, 20 by default).
+
+| Status | When |
+|---|---|
+| `200` | the generations, and `next` when there are more |
+| `400` | a parameter that isn't one, or isn't in its form |
+
+### `GET /v1/config/generations/{generation}`
+
+One config generation and its text, its secrets masked
+
+Least role: `viewer`.
+
+- Path parameter `generation`: a config generation's number.
+
+| Status | When |
+|---|---|
+| `200` | the generation and its text |
+| `400` | a generation that isn't a number |
+| `404` | no such generation |
+| `409` | several snapshots of it and no record of which one it is |
+| `500` | its text couldn't be masked, so it isn't shown |
+
 ### `POST /v1/config/reload`
 
 Publish the node's file as the next config generation; `?restart=accept` publishes a restart-only field, applied at each node's next start
