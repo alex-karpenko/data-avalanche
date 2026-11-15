@@ -1,6 +1,7 @@
 //! A config generation's text with its secrets masked in place (Admin_Console §4 Config,
 //! D-M13b.10): the console shows a generation's text, and its diff, without the secrets written
-//! in it. A secret written as a `${VAR}` reference stays as written: the text holds no value.
+//! in it. A secret written as exactly one `${VAR}` reference stays as written: the text holds no
+//! value. A default (`${VAR:-…}`) or text around a reference is masked like a literal.
 //! A literal one becomes `"•••••• blake3:<8 hex>"`, the start of its fingerprint under the
 //! cluster's key (config §6.2), so that two generations show whether it changed. Everything else
 //! (comments, order, spacing) is left as written.
@@ -8,7 +9,9 @@
 //! The masked text is parsed again and checked before it is returned: every secret is then a
 //! mask or a reference. A text that fails the check isn't shown at all ([`MaskError`]). A
 //! secret's text that is also written as another key's value (a `user` that is the `password`)
-//! stays shown there: only the secret keys are masked.
+//! stays shown there: only the secret keys are masked. A text with a YAML merge key (`<<`) is
+//! refused ([`MaskError::MergeKey`]): a key that overrides a merged value would hide the secret
+//! the masker reads.
 
 use thiserror::Error;
 
@@ -16,7 +19,7 @@ use crate::leaf::Loc;
 use crate::parse::parse_document;
 use crate::raw::RawConfig;
 use crate::secret::{FingerprintKey, fingerprint};
-use crate::template::{Expanded, expand};
+use crate::template::{Expanded, expand, is_var_name};
 use crate::walk::{Walk, Written, under};
 
 /// What a masked literal secret starts with.
@@ -58,6 +61,8 @@ pub enum MaskError {
     Unplaced(String),
     #[error("the secret at {0} is still readable after masking")]
     Leaked(String),
+    #[error("the text uses a YAML merge key (<<), whose overridden values can't be masked")]
+    MergeKey,
 }
 
 /// `text` with every secret masked in place, fingerprinted with `key` (the module's doc).
@@ -66,6 +71,9 @@ pub enum MaskError {
 /// [`MaskError`]: the text isn't shown.
 pub fn mask_secrets(text: &str, key: &FingerprintKey) -> Result<String, MaskError> {
     let secrets = secrets(text)?;
+    if has_merge_key(text) {
+        return Err(MaskError::MergeKey);
+    }
     let mut edits: Vec<(usize, usize, String)> = vec![];
     for s in &secrets {
         let Some(value) = literal(&s.text) else {
@@ -97,13 +105,37 @@ fn masked(key: &FingerprintKey, value: &str) -> String {
     format!("{MASK} blake3:{}", &hex[..8])
 }
 
-/// The value of a leaf written as `text`, or `None` when it is a `${VAR}` reference.
+/// The value of a leaf written as `text`, or `None` when it is exactly one bare `${VAR}`
+/// reference (no default, nothing around it). Anything else is a literal: its expansion when it
+/// has no reference, else the raw text, which is what gets fingerprinted.
 fn literal(text: &str) -> Option<String> {
+    if let Some(name) = text.strip_prefix("${").and_then(|t| t.strip_suffix('}'))
+        && is_var_name(name)
+    {
+        return None;
+    }
     match expand(text, None) {
         Ok(Expanded::Text(t)) => Some(t),
-        Ok(Expanded::Unresolved) => None,
-        Err(_) => Some(text.to_owned()),
+        _ => Some(text.to_owned()),
     }
+}
+
+/// Whether `text` has a YAML merge key: a `<<` followed by `:`, at the start of its line
+/// (after indentation, `- ` or `? `) or after a flow map's `{` or `,`. Over-matching, a `<<:` in
+/// a quoted string or a comment, fails closed.
+fn has_merge_key(text: &str) -> bool {
+    text.lines().any(|line| {
+        line.match_indices("<<").any(|(at, _)| {
+            let before = line[..at].trim_start();
+            let before = before
+                .strip_prefix("- ")
+                .or_else(|| before.strip_prefix("? "))
+                .unwrap_or(before)
+                .trim_end();
+            let key_position = before.is_empty() || before.ends_with('{') || before.ends_with(',');
+            key_position && line[at + 2..].trim_start().starts_with(':')
+        })
+    })
 }
 
 /// Every secret leaf written in `text`.
@@ -132,7 +164,7 @@ fn is_secret(w: &Written) -> bool {
         let pattern: Vec<&str> = pattern.split('.').collect();
         pattern.len() == path.len()
             && pattern.iter().zip(&path).all(|(p, s)| *p == "*" || p == s)
-            && (*pem == Pem::No || w.text.trim_start().starts_with("-----BEGIN"))
+            && (*pem == Pem::No || w.text.contains("-----BEGIN"))
     })
 }
 
@@ -143,7 +175,7 @@ fn check(before: &[Written], masked: &str) -> Result<(), MaskError> {
         let path = b.path.join(".");
         let Some(a) = after.iter().find(|a| a.path == b.path) else {
             // An inline PEM key masked is a secret no more: it reads as a path.
-            if b.text.trim_start().starts_with("-----BEGIN") {
+            if b.text.contains("-----BEGIN") {
                 continue;
             }
             return Err(MaskError::Leaked(path));
@@ -406,6 +438,40 @@ pipelines:
     #[test]
     fn a_text_that_doesnt_parse_isnt_shown() {
         assert_eq!(mask_secrets("globals: [", &key()), Err(MaskError::Parse));
+    }
+
+    /// A default or text around a reference is a literal: masked. A bare reference stays.
+    #[test]
+    fn a_default_or_text_around_a_reference_is_masked() {
+        for value in ["${DB_PASS:-hunter2}", "hunter2-${SUFFIX}"] {
+            let text = format!(
+                "config_version: 1\npipelines:\n  p:\n    source:\n      password: {value}\n"
+            );
+            let out = mask_secrets(&text, &key()).unwrap();
+            assert!(!out.contains("hunter2"), "{out}");
+            assert!(out.contains("password: \"•••••• blake3:"), "{out}");
+        }
+        let text = "config_version: 1\npipelines:\n  p:\n    source:\n      password: ${DB_PASS}\n";
+        assert_eq!(mask_secrets(text, &key()).unwrap(), text);
+    }
+
+    /// A merge key can override a merged secret the masker never sees: the text isn't shown.
+    #[test]
+    fn a_merge_key_is_refused() {
+        let text = "config_version: 1\npipelines:\n  p:\n    source:\n      <<: { password: hunter2 }\n      password: ${X}\n";
+        assert_eq!(mask_secrets(text, &key()), Err(MaskError::MergeKey));
+        let flow = "config_version: 1\nglobals:\n  api: &s { user: u }\npipelines:\n  p:\n    source: { <<: *s, password: x }\n";
+        assert_eq!(mask_secrets(flow, &key()), Err(MaskError::MergeKey));
+    }
+
+    /// An inline key whose PEM sits under a header line is still a secret.
+    #[test]
+    fn an_inline_key_with_a_header_is_masked() {
+        let text = "config_version: 1\nglobals:\n  api:\n    tls:\n      enabled: false\n      key: |\n        Bag Attributes\n        -----BEGIN PRIVATE KEY-----\n        MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7\n        -----END PRIVATE KEY-----\n";
+        let out = mask_secrets(text, &key()).unwrap();
+        assert!(!out.contains("MIIEvQ"), "{out}");
+        assert!(!out.contains("Bag Attributes"), "{out}");
+        assert_eq!(out.matches(MASK).count(), 1, "{out}");
     }
 
     /// The list follows the model: every key it names exists, and every key named like a
