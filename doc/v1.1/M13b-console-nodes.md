@@ -9191,3 +9191,10 @@ tasks' blocks applied on top unchanged.
   generation with a ` !` or a `<<` in a comment or a literal, isn't shown; it fails closed.
   Task 7's two `mask.rs` blocks are re-based on the new file (context lines only; their `+`/`-`
   lines are unchanged, and the rest of Task 7 applies as written).
+- **Task 8** (fix round, `b541e21`; Important in its review): Step 2's expected failure didn't
+  happen, since Step 1 puts `DATA_AVALANCHE_POD_DNS_NAME` in the test's own pod environment
+  before the TLS example uses it; the guard on the chart itself was missing. The chart's
+  environment test (`the_chart_sets_the_environment_its_values_document`) now lists the variable,
+  and fails when the StatefulSet loses it. The upgrade page scaled `statefulset <release>`; the
+  chart names it `<release>-data-avalanche` unless the release's name already holds
+  `data-avalanche`, which the page now says.
