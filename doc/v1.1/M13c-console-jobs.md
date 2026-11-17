@@ -201,7 +201,7 @@ start; a retry follows the mockup. The rest are Claude's calls under Admin_Conso
 
 ### Spec patch for approval (S-M13c.1)
 
-Proposed with this plan; applied, as its own commit `spec: S-M13c.1 — cancel and retry a snapshot
+Approved by Oleksii 2026-11-17 with the plan; applied as execution starts, as its own commit `spec: S-M13c.1 — cancel and retry a snapshot
 job; every pipeline's jobs; a job's figures`, once Oleksii approves it and before Task 1. These
 edits to two spec files are what the code below implements:
 
