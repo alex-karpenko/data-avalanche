@@ -152,7 +152,13 @@ struct Inner {
     /// Each generation's text fingerprint ([`ConfigCoordinator::generation_fingerprint`]), by its
     /// text's plain hash: a snapshot never changes, so each is read once.
     fingerprints: StdMutex<BTreeMap<String, String>>,
+    /// Each generation's masked text ([`ConfigCoordinator::mask_generation`]), by its text's
+    /// plain hash, at most [`MASKED_KEPT`].
+    masked: StdMutex<BTreeMap<String, Result<String, MaskError>>>,
 }
+
+/// How many generations' masked texts the coordinator keeps.
+pub const MASKED_KEPT: usize = 64;
 
 /// The node's config generation at run time. Dropped, it stops watching.
 #[derive(Debug)]
@@ -201,6 +207,7 @@ impl ConfigCoordinator {
             }),
             applied: watch::channel(n).0,
             fingerprints: StdMutex::default(),
+            masked: StdMutex::default(),
         });
         let (stop, stopped) = watch::channel(false);
         let task = tokio::spawn(watch_generations(
@@ -238,6 +245,41 @@ impl ConfigCoordinator {
     /// [`MaskError`]: the text isn't shown.
     pub fn mask(&self, text: &str) -> Result<String, MaskError> {
         mask_secrets(text, &self.inner.deps.key)
+    }
+
+    /// [`Self::mask`] of a generation's `text`, whose plain hash is `hash`: made on a blocking
+    /// thread (a long text takes a while to tell its comments from its content), then kept, as a
+    /// snapshot never changes.
+    ///
+    /// # Errors
+    /// [`MaskError`]: the text isn't shown.
+    pub async fn mask_generation(&self, hash: &str, text: String) -> Result<String, MaskError> {
+        let kept = self
+            .inner
+            .masked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(hash)
+            .cloned();
+        if let Some(masked) = kept {
+            return masked;
+        }
+        let key = self.inner.deps.key;
+        let masked = match tokio::task::spawn_blocking(move || mask_secrets(&text, &key)).await {
+            Ok(m) => m,
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(_) => return Err(MaskError::Interrupted),
+        };
+        let mut all = self
+            .inner
+            .masked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if all.len() >= MASKED_KEPT {
+            all.pop_first();
+        }
+        all.insert(hash.to_owned(), masked.clone());
+        masked
     }
 
     /// What differs between two generations' texts as written, secrets masked under the
@@ -1118,6 +1160,32 @@ mod tests {
                 PipelineReload::Restart(p, _) => format!("restart {}", p.id),
             })
             .collect()
+    }
+
+    /// A generation's masked text is made once, off the async workers, and kept by its text's
+    /// hash: the second ask of it is the first's answer.
+    #[tokio::test]
+    async fn a_generation_s_masked_text_is_made_once() {
+        let n = lone(&["p"]).await;
+        let one = "config_version: 1\npipelines:\n  p:\n    source: { password: first }\n";
+        let two = one.replace("first", "second");
+        let first = n
+            .coordinator
+            .mask_generation("blake3:aa", one.to_owned())
+            .await
+            .unwrap();
+        assert!(!first.contains("first"), "{first}");
+        assert_eq!(
+            n.coordinator
+                .mask_generation("blake3:aa", two.clone())
+                .await,
+            Ok(first.clone()),
+            "kept"
+        );
+        assert_ne!(
+            n.coordinator.mask_generation("blake3:bb", two).await,
+            Ok(first)
+        );
     }
 
     /// What the API shows of a generation's text is its fingerprint under the cluster's key,

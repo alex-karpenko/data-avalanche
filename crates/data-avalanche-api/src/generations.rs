@@ -3,6 +3,8 @@
 //! and why; and one generation with its text, its secrets masked and its comments shown empty
 //! (D-M13b.10).
 
+use std::sync::Arc;
+
 use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::Response;
@@ -21,6 +23,9 @@ pub const PARAMETERS: &[(&str, &str)] = &[
 ];
 
 pub const DEFAULT_LIMIT: usize = 20;
+
+/// How many snapshots the list reads at once for their fingerprints.
+const FINGERPRINT_READS: usize = 16;
 pub const MAX_LIMIT: usize = 100;
 
 fn query(raw: Option<&str>) -> Result<(Option<u64>, usize), Failure> {
@@ -109,23 +114,33 @@ pub(crate) async fn list(State(api): State<Api>, RawQuery(raw): RawQuery) -> Res
             let next = (page.len() == limit)
                 .then(|| page.last().map(|l| l.generation))
                 .flatten();
+            // Each text's fingerprint: read FINGERPRINT_READS snapshots at a time the first
+            // time, kept after.
             let mut generations = Vec::with_capacity(page.len());
-            for l in &page {
-                let hash = match &l.hash {
-                    Some(h) => match node
-                        .coordinator
-                        .generation_fingerprint(l.generation, h)
-                        .await
-                    {
-                        Ok(fp) => Some(fp),
-                        Err(e) => {
-                            tracing::debug!("config generation {}'s text: {e}", l.generation);
-                            None
-                        }
-                    },
-                    None => None,
-                };
-                generations.push(listed_json(l, hash));
+            for chunk in page.chunks(FINGERPRINT_READS) {
+                let mut reads = tokio::task::JoinSet::new();
+                for (i, l) in chunk.iter().enumerate() {
+                    let (coordinator, n, hash) =
+                        (Arc::clone(&node.coordinator), l.generation, l.hash.clone());
+                    reads.spawn(async move {
+                        let fp = match hash {
+                            Some(h) => match coordinator.generation_fingerprint(n, &h).await {
+                                Ok(fp) => Some(fp),
+                                Err(e) => {
+                                    tracing::debug!("config generation {n}'s text: {e}");
+                                    None
+                                }
+                            },
+                            None => None,
+                        };
+                        (i, fp)
+                    });
+                }
+                let mut read = reads.join_all().await;
+                read.sort_unstable_by_key(|(i, _)| *i);
+                for (l, (_, fp)) in chunk.iter().zip(read) {
+                    generations.push(listed_json(l, fp));
+                }
             }
             body(
                 StatusCode::OK,
@@ -229,18 +244,23 @@ pub(crate) async fn one(State(api): State<Api>, Path(generation): Path<String>) 
     match node.coordinator.generations().one(n).await {
         Ok(None) => Failure::new(StatusCode::NOT_FOUND, format!("no config generation {n}")).into(),
         Ok(Some((_, None))) => ambiguous(n),
-        Ok(Some((listed, Some(text)))) => match node.coordinator.mask(&text) {
-            Ok(masked) => {
-                let mut v = listed_json(&listed, Some(node.coordinator.fingerprint(&text)));
-                v["text"] = json!(masked);
-                body(StatusCode::OK, &v)
+        Ok(Some((listed, Some(text)))) => {
+            let fingerprint = node.coordinator.fingerprint(&text);
+            // A text comes with its hash: `one` reads it by that hash.
+            let hash = listed.hash.clone().unwrap_or_default();
+            match node.coordinator.mask_generation(&hash, text).await {
+                Ok(masked) => {
+                    let mut v = listed_json(&listed, Some(fingerprint));
+                    v["text"] = json!(masked);
+                    body(StatusCode::OK, &v)
+                }
+                Err(e) => Failure::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("config generation {n}'s text isn't shown: {e}"),
+                )
+                .into(),
             }
-            Err(e) => Failure::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("config generation {n}'s text isn't shown: {e}"),
-            )
-            .into(),
-        },
+        }
         Err(e) => unreadable(&e),
     }
 }
@@ -256,6 +276,50 @@ mod tests {
 
     use super::*;
     use crate::test_support::{CONFIG, json_of, lone, open, request, serve};
+
+    /// More generations than are read at once are each listed with their own text's keyed
+    /// fingerprint, in order.
+    #[tokio::test]
+    async fn every_listed_generation_has_its_own_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let lone = lone(dir.path().join("config.yaml")).await;
+        let g = lone.node.coordinator.generations();
+        let mut texts = vec![CONFIG.to_owned()];
+        let mut base = g.current().await.unwrap().unwrap().pointer;
+        for i in 0..FINGERPRINT_READS + 4 {
+            let text = format!("{CONFIG}# {i}\n");
+            base = g
+                .publish(&base, &text, "node-a", chrono::Utc::now())
+                .await
+                .unwrap()
+                .pointer;
+            texts.push(text);
+        }
+        let node = Arc::new(OnceLock::new());
+        node.set(lone.node.clone()).unwrap();
+        let addr = serve(Api {
+            metrics: Metrics::new(),
+            ready: Arc::new(AtomicBool::new(true)),
+            node,
+            auth: open(),
+        })
+        .await;
+        let (code, v) = json_of(addr, "GET", "/v1/config/generations?limit=100").await;
+        assert_eq!(code, 200, "{v}");
+        let key = data_avalanche_config::FingerprintKey::from_bytes([1; 32]);
+        let want: Vec<Value> = texts
+            .iter()
+            .rev()
+            .map(|t| json!(data_avalanche_config::text_fingerprint(&key, t)))
+            .collect();
+        let got: Vec<Value> = v["generations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| g["hash"].clone())
+            .collect();
+        assert_eq!(got, want);
+    }
 
     /// Each generation is listed with who published it and why; one generation's text shows
     /// its secrets masked.

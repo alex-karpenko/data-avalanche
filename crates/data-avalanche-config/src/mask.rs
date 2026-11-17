@@ -68,7 +68,7 @@ enum Pem {
 }
 
 /// Why a text can't be shown masked.
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum MaskError {
     #[error("the text doesn't parse as a config")]
     Parse,
@@ -80,6 +80,8 @@ pub enum MaskError {
     MergeKey,
     #[error("the text's comments can't be told from its content")]
     Comments,
+    #[error("the masking didn't finish")]
+    Interrupted,
 }
 
 /// `text` with every secret masked in place, fingerprinted with `key` (the module's doc).
@@ -185,34 +187,74 @@ fn cut(text: &str, cuts: &[Cut]) -> String {
     out
 }
 
-/// `text` with every comment shown empty (the module's doc). All at once first, the first `#`
-/// of each line; else line by line from the end, each `#` of a line in turn until one's cut
-/// leaves the text's value as it was.
+/// `text` with every comment shown empty (the module's doc).
 fn blank_comments(text: &str) -> Result<String, MaskError> {
+    blank_comments_counting(text, &mut 0)
+}
+
+/// [`blank_comments`], counting its parses in `parses`. Each line's first `#` is tried, all at
+/// once; a set whose cuts change the text's value is split in halves and each tried again (with
+/// the cuts kept so far), down to the one `#` that is content. A line whose `#` was content tries
+/// its next one in the next round. So a few `#`s that are content among `n` comments cost about
+/// `2 log2 n` parses each, not one per comment. The text with every kept cut is checked once more:
+/// a value changed refuses it.
+fn blank_comments_counting(text: &str, parses: &mut usize) -> Result<String, MaskError> {
     let lines = cuts(text);
     if lines.is_empty() {
         return Ok(text.to_owned());
     }
+    *parses += 1;
     let want = value_of(text).ok_or(MaskError::Comments)?;
-    let first: Vec<Cut> = lines.iter().map(|l| l[0]).collect();
-    let all = cut(text, &first);
-    if value_of(&all).as_ref() == Some(&want) {
-        return Ok(all);
+    let mut same = |cuts: &[Cut]| {
+        let mut cuts = cuts.to_vec();
+        cuts.sort_by_key(|c| c.from);
+        *parses += 1;
+        value_of(&cut(text, &cuts)).as_ref() == Some(&want)
+    };
+    let mut kept: Vec<Cut> = vec![];
+    // (line, which of its `#`s) still to try.
+    let mut round: Vec<(usize, usize)> = (0..lines.len()).map(|l| (l, 0)).collect();
+    while !round.is_empty() {
+        let mut content = vec![];
+        settle(&round, &lines, &mut kept, &mut content, &mut same);
+        round = content
+            .into_iter()
+            .filter(|(l, i)| i + 1 < lines[*l].len())
+            .map(|(l, i)| (l, i + 1))
+            .collect();
     }
-    let mut out = text.to_owned();
-    for line in lines.iter().rev() {
-        for c in line {
-            let tried = cut(&out, &[*c]);
-            if value_of(&tried).as_ref() == Some(&want) {
-                out = tried;
-                break;
-            }
-        }
-    }
+    kept.sort_by_key(|c| c.from);
+    let out = cut(text, &kept);
+    *parses += 1;
     if value_of(&out).as_ref() != Some(&want) {
         return Err(MaskError::Comments);
     }
     Ok(out)
+}
+
+/// Tries the cuts of `set` beside `kept`: all kept when the value stays, else each half in turn;
+/// a single cut that changes it is `content`.
+fn settle(
+    set: &[(usize, usize)],
+    lines: &[Vec<Cut>],
+    kept: &mut Vec<Cut>,
+    content: &mut Vec<(usize, usize)>,
+    same: &mut impl FnMut(&[Cut]) -> bool,
+) {
+    let cuts: Vec<Cut> = set.iter().map(|(l, i)| lines[*l][*i]).collect();
+    let mut with = kept.clone();
+    with.extend(&cuts);
+    if same(&with) {
+        kept.extend(cuts);
+        return;
+    }
+    if let [one] = set {
+        content.push(*one);
+        return;
+    }
+    let (a, b) = set.split_at(set.len() / 2);
+    settle(a, lines, kept, content, same);
+    settle(b, lines, kept, content, same);
 }
 
 /// One value that differs between two config texts, as written, its secrets masked.
@@ -741,6 +783,26 @@ pipelines:
         ] {
             assert!(out.contains(kept), "{kept:?} is missing from:\n{out}");
         }
+    }
+
+    /// A `#` that is content among hundreds of comments costs a few parses, not one per
+    /// comment: the cuts are tried in halves, and only a half holding a content `#` is split.
+    #[test]
+    fn a_content_hash_among_many_comments_costs_a_few_parses() {
+        let mut text = String::from(
+            "config_version: 1\npipelines:\n  p:\n    source:\n      user: \"a # b\"\n",
+        );
+        for i in 0..400 {
+            text.push_str(&format!("      # note {i:03}: rotated old-secret here\n"));
+        }
+        text.push_str("      host: db # old-secret\n");
+        assert!(text.len() > 12_000, "{}", text.len());
+        let mut parses = 0;
+        let out = blank_comments_counting(&text, &mut parses).unwrap();
+        assert!(!out.contains("old-secret"), "{out}");
+        assert!(out.contains("      user: \"a # b\"\n      #\n"), "{out}");
+        assert!(out.ends_with("      host: db #\n"), "{out}");
+        assert!(parses <= 30, "{parses} parses");
     }
 
     /// A comment ends at a line break, a CR alone included.
