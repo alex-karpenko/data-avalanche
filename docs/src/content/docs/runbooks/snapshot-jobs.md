@@ -55,7 +55,9 @@ job document the node can't read is left out of the list, with a warning in the 
 
 `GET /v1/snapshots` lists every pipeline's jobs, newest first, filtered by `status` (`queued`,
 `running`, `cancelling`, `completed`, `failed`, `cancelled`; several, comma-separated), `pipeline`
-and `by` (who asked). A pipeline whose jobs can't be read is named under `unreadable`.
+and `by` (who asked). A pipeline whose jobs can't be read is named under `unreadable`. `404`: no such
+`pipeline` in the config. `400`: an unknown status, a parameter given twice, or any other
+parameter.
 
 For each table a job shows its rows copied, the source's estimate of its rows when the copy began
 (PostgreSQL's `pg_class.reltuples`, which is `-1`, so absent, until the table was analyzed;
@@ -85,7 +87,10 @@ curl -s -X POST https://cdc.example.internal/v1/snapshots/shop~0192f0c47b9e7c3a9
   completed stays copied. A paused pipeline restarts too, and stays paused.
 - A stopped pipeline, or one whose lease no node holds, runs no worker: the job reads `cancelling`
   until the pipeline's next start ends it (`"restart": false` in the answer).
-- `200`: it was cancelled already. `409`: it has ended.
+- `200`: it was cancelled already. `409`: it has ended. `404`: no such job. `503`: the cancel is
+  recorded, but the pipeline's restart couldn't be asked; the pipeline's next start takes it.
+- A job whose tables had all completed before the start took the cancel settles `completed`, its
+  cancel kept.
 
 What the cancelled tables hold:
 
@@ -94,7 +99,10 @@ What the cancelled tables hold:
   job copies it.
 - A table the job was bringing back from a halt halts again, `COPY_CANCELLED`, naming the job: its
   Delta table holds part of its rows. Copy it again, or retry the job.
-- A table the config doesn't replicate isn't read again: it keeps the rows the copy wrote.
+- A table a truncating job had begun to copy halts `COPY_CANCELLED` too: the job emptied its Delta
+  table, which holds part of its rows. Only a table the config replicates halts.
+- A table the config doesn't replicate isn't read again, and doesn't halt: it keeps the rows the
+  copy wrote.
 
 The cancel is recorded in the events (`action.snapshot.cancel`, with the note), and the job's end
 too (`job.cancelled`).
@@ -103,7 +111,8 @@ too (`job.cancelled`).
 
 ```sh
 curl -s -X POST https://cdc.example.internal/v1/snapshots/shop~0192f0c47b9e7c3a9d5e2f0a1b3c4d5e/retry \
-  -H 'content-type: application/json' -d '{"tables": "not_copied"}'
+  -H 'content-type: application/json' \
+  -d '{"tables": "all", "truncate": false, "note": "the replica is back"}'
 ```
 
 A retry starts a new job of an ended job's tables, as `POST /v1/pipelines/{id}/snapshots` does:
@@ -112,7 +121,8 @@ A retry starts a new job of an ended job's tables, as `POST /v1/pipelines/{id}/s
 - `truncate`: the old job's unless given.
 - `note`: why, kept with the new job and its event.
 
-The new job records the one it retries (`retry_of`). `409`: the job hasn't ended, it left no table
+`202` answers with the new job: its `job_id`, `status`, `tables`, `truncate` and the `retry_of` it
+records. `404`: no such job. `409`: the job hasn't ended, it left no table
 to copy, or, as for any job, the pipeline doesn't run, no node holds its lease, or an unfinished
 job holds one of the tables.
 
