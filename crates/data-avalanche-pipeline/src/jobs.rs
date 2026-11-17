@@ -44,9 +44,6 @@ pub(crate) struct Cancelling {
     /// The job empties its sink tables first: a copy it began leaves the table holding part of
     /// its rows, so a stopped copy halts it too (S-M13c.2).
     pub truncate: bool,
-    /// The rows the table's snapshot document counts, filled in by the start that reads it: the
-    /// follower's last poll may predate them.
-    pub rows_done: u64,
 }
 
 impl Jobs {
@@ -111,7 +108,6 @@ impl Jobs {
                     job: j.job_id.clone(),
                     from_halt: t.from_halt.is_some(),
                     truncate: j.truncate,
-                    rows_done: 0,
                 };
                 (t.table.clone(), c)
             })
