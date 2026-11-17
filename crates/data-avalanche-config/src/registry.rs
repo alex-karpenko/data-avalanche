@@ -1154,7 +1154,7 @@ pub const RULES: &[RuleMeta] = &[
         L::Config,
         Config,
         r#"globals.api.advertise_url"#,
-        r#"An absolute http/https URL with a host, without a path, query or fragment."#,
+        r#"An absolute http/https URL with a host, without a path, query or fragment, at most 255 characters."#,
     ),
 ];
 

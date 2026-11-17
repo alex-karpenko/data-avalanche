@@ -66,7 +66,7 @@ pub const FIELD_DOCS: &[FieldDoc] = &[
     f(
         "globals.api.advertise_url",
         Note("derived"),
-        "Where the other nodes reach this node's API (`https://cdc-0.cdc.ns.svc:8080`), for a console page served by another node. Derived: `https` with `tls`, else `http`; `address`'s host, or the gossip's `advertise_addr` when it listens on all addresses; `address`'s port. With TLS, write a name the certificate covers (V-138).",
+        "Where the other nodes reach this node's API (`https://cdc-0.cdc.ns.svc:8080`), for a console page served by another node. Derived: `https` with `tls`, else `http`; `address`'s host, or the gossip's `advertise_addr` when it listens on all addresses; `address`'s port. With TLS, write a name the certificate covers. A host and port only, at most 255 characters (V-138).",
     ),
     f(
         "globals.api.auth",

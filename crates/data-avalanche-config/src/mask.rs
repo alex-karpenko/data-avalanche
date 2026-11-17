@@ -397,30 +397,29 @@ struct Leaf {
     written: String,
 }
 
-/// The credentials of a URL written as `scheme://user:pass@host…`: the authority's part before
-/// its last `@`.
-fn userinfo(value: &str) -> Option<&str> {
-    let (scheme, rest) = value.split_once("://")?;
-    let mut chars = scheme.chars();
-    if !chars.next().is_some_and(|c| c.is_ascii_alphabetic())
-        || !chars.all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
-    {
-        return None;
-    }
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    authority.rfind('@').map(|at| &authority[..at])
-}
-
-/// `value`, a URL with credentials, with them masked (`https://••••••@host`); `None` when it
+/// `value` with the credentials of every URL in it masked (`https://••••••@host`): wherever a
+/// `://` is followed by an `@` before the next `/`, `?`, `#` or the value's end, what lies
+/// between them. A URL inside a `${VAR:-…}` default, or in any text, included. `None` when it
 /// has none, or they are masked already.
 fn without_userinfo(value: &str) -> Option<String> {
-    let user = userinfo(value).filter(|u| *u != MASK)?;
-    let at = value.find("://")? + 3;
-    Some(format!(
-        "{}{MASK}{}",
-        &value[..at],
-        &value[at + user.len()..]
-    ))
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    let mut changed = false;
+    while let Some(at) = rest.find("://") {
+        let (head, tail) = rest.split_at(at + 3);
+        out.push_str(head);
+        let authority = tail.split(['/', '?', '#']).next().unwrap_or(tail);
+        match authority.rfind('@') {
+            Some(end) if &authority[..end] != MASK => {
+                out.push_str(MASK);
+                changed = true;
+                rest = &tail[end..];
+            }
+            _ => rest = tail,
+        }
+    }
+    out.push_str(rest);
+    changed.then_some(out)
 }
 
 /// A literal secret's mask.
@@ -1004,6 +1003,36 @@ pipelines:
             Some("https://••••••@prom.example:9090/api")
         );
         assert_eq!(d.changes.len(), 3, "{shown}");
+    }
+
+    /// A URL's credentials inside a `${VAR:-…}` default, or anywhere else in a value, are masked
+    /// too, in the text and in the diff.
+    #[test]
+    fn a_url_s_credentials_in_a_default_are_masked() {
+        let text = |pass: &str| {
+            format!(
+                "config_version: 1\nglobals:\n  console:\n    prometheus: {{ url: \"${{P:-https://a:{pass}@prom}}\" }}\n"
+            )
+        };
+        let out = mask_secrets(&text("SECRETX"), &key()).unwrap();
+        assert!(!out.contains("SECRETX"), "{out}");
+        assert!(
+            out.contains("url: \"${P:-https://••••••@prom}\" }"),
+            "{out}"
+        );
+        let d = diff_written(&text("SECRETX"), &text("SECRETY"), &key()).unwrap();
+        let shown = format!("{d:?}");
+        assert!(!shown.contains("SECRET"), "{shown}");
+        assert_eq!(d.changes.len(), 1, "{shown}");
+        assert_eq!(
+            without_userinfo("x https://a:b@h/p and http://c@d?q").as_deref(),
+            Some("x https://••••••@h/p and http://••••••@d?q")
+        );
+        assert_eq!(
+            without_userinfo("https://h/p@x"),
+            None,
+            "an @ past the host"
+        );
     }
 
     /// Only the secret keys are masked: a `user` written as the password's text stays shown, and
