@@ -2,6 +2,7 @@
 //! source engine. Each source crate implements it; nothing here performs I/O.
 
 use std::any::Any;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
@@ -431,6 +432,18 @@ pub trait SourceConnector: Send + Sync {
     /// chunks carry no [`ChunkVisibility`].
     async fn in_flight(&self) -> Result<Option<Vec<InFlightTxn>>, SourceError> {
         Ok(None)
+    }
+
+    /// The source's estimate of each table's rows, for a snapshot job's progress and ETA
+    /// (PostgreSQL `pg_class.reltuples`, MySQL `information_schema.TABLES.TABLE_ROWS`). A table
+    /// with none (never analyzed, not a table, not there) is left out. An estimate, never a count:
+    /// it can be far off.
+    async fn row_estimates(
+        &self,
+        tables: &[TableRef],
+    ) -> Result<BTreeMap<TableRef, u64>, SourceError> {
+        let _ = tables;
+        Ok(BTreeMap::new())
     }
 
     /// Up to `limit` rows of `table` after `after`, in identifier order.

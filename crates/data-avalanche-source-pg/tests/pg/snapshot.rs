@@ -69,6 +69,32 @@ async fn a_chunk_carries_its_snapshot_and_in_flight_lists_open_writers() {
     cleanup(&a, &n).await;
 }
 
+/// A snapshot job's progress estimate (D-M13c.5): `reltuples` once the table is analyzed; a table
+/// never analyzed (`-1`) or not there is left out.
+#[tokio::test]
+async fn row_estimates_are_the_catalog_s_once_a_table_is_analyzed() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(
+        &a,
+        "row_estimates",
+        "CREATE TABLE t (id int PRIMARY KEY);
+         CREATE TABLE never (id int PRIMARY KEY);
+         INSERT INTO t SELECT generate_series(1, 1000);
+         ANALYZE t;",
+    )
+    .await;
+    let c = connector(&pipeline(&n, &["t"], "", ""));
+    let got = c
+        .row_estimates(&[n.table("t"), n.table("never"), n.table("nope")])
+        .await
+        .unwrap();
+    assert_eq!(got.get(&n.table("t")), Some(&1000), "{got:?}");
+    assert_eq!(got.len(), 1, "never analyzed, or not there: {got:?}");
+    assert!(c.row_estimates(&[]).await.unwrap().is_empty());
+    cleanup(&a, &n).await;
+}
+
 /// Final review I3: a table dropped under the snapshot halts that table (`TABLE_DROPPED`), and so
 /// does a key column that lost NOT NULL (`IDENTIFIER_NOT_USABLE`): a NULL key sorts after every
 /// cursor, and its rows would be skipped. Neither stops the pipeline.

@@ -434,6 +434,47 @@ impl MySqlConnector {
         Ok(out)
     }
 
+    /// `information_schema.TABLES.TABLE_ROWS` of the tables of `source.db` among `tables`: InnoDB's
+    /// is a sampled estimate, which MySQL may cache (`information_schema_stats_expiry`). A table of
+    /// another database, or with none (NULL), is left out.
+    pub async fn row_estimates(
+        &self,
+        tables: &[TableRef],
+    ) -> Result<BTreeMap<TableRef, u64>, SourceError> {
+        let db = self.pipeline.source.db.clone();
+        let names: Vec<String> = tables
+            .iter()
+            .filter(|t| t.schema == db)
+            .map(|t| t.name.clone())
+            .collect();
+        let mut out = BTreeMap::new();
+        for chunk in names.chunks(NAMES_PER_QUERY) {
+            let list = vec!["?"; chunk.len()].join(", ");
+            let mut params: Vec<mysql_async::Value> = vec![db.clone().into()];
+            params.extend(chunk.iter().map(|n| n.clone().into()));
+            let rows: Vec<(String, Option<u64>)> = self
+                .conn
+                .command("estimate the tables' rows", move |c| {
+                    Box::pin(async move {
+                        c.exec(
+                            format!(
+                                "SELECT TABLE_NAME, TABLE_ROWS FROM information_schema.TABLES
+                                  WHERE TABLE_SCHEMA = ? AND TABLE_NAME IN ({list})"
+                            ),
+                            params,
+                        )
+                        .await
+                    })
+                })
+                .await?;
+            out.extend(
+                rows.into_iter()
+                    .filter_map(|(name, rows)| Some((TableRef::new(db.clone(), name), rows?))),
+            );
+        }
+        Ok(out)
+    }
+
     /// An on-demand snapshot's tables, by exact name (Data-Flow §On-Demand Snapshot): the
     /// config's patterns and its table-set checks don't apply.
     pub async fn describe_tables(
