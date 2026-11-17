@@ -21,8 +21,8 @@ use data_avalanche_pipeline::{
     WorkerDeps, WorkerError, WorkerHandle, WorkerStatus,
 };
 use data_avalanche_state::{
-    ActualState, DesiredState, EventSeverity, Holder, JobStatus, Leases, PipelineDocs, RemovalDoc,
-    Removals, RequestsDoc, SnapshotJobDoc, StatusDoc,
+    ActualState, DesiredState, EventSeverity, Holder, JobStatus, JobTableStatus, Leases,
+    PipelineDocs, RemovalDoc, Removals, RequestsDoc, SnapshotJobDoc, StatusDoc,
 };
 use data_avalanche_telemetry::{
     Metrics, PipelineLabels, PipelineMetrics, PipelineStatus, RowsRead, SnapshotState, Totals,
@@ -1803,9 +1803,14 @@ impl PipelineController {
 
 /// The event of a snapshot job of pipeline `name` by its status: its kind, severity and text once
 /// it ended; nothing while it is queued or running. Every status is named, so a new one is
-/// decided here, not taken for an ending.
+/// decided here, not taken for an ending. The job is named as the console shows it: the first 8
+/// characters of its id's suffix (the uuid after `<pipeline>~`).
 fn job_event(name: &str, job: &SnapshotJobDoc) -> Option<(&'static str, EventSeverity, String)> {
-    let short: String = job.job_id.chars().take(8).collect();
+    let suffix = job
+        .job_id
+        .split_once('~')
+        .map_or(job.job_id.as_str(), |(_, s)| s);
+    let short: String = suffix.chars().take(8).collect();
     match job.status {
         JobStatus::Queued | JobStatus::Running => None,
         JobStatus::Completed => Some((
@@ -1824,6 +1829,25 @@ fn job_event(name: &str, job: &SnapshotJobDoc) -> Option<(&'static str, EventSev
                 job.error.as_deref().unwrap_or("a table failed")
             ),
         )),
+        JobStatus::Cancelled => {
+            let copied = job
+                .tables
+                .iter()
+                .filter(|t| t.status == JobTableStatus::Completed)
+                .count();
+            let by = job
+                .cancel
+                .as_ref()
+                .map_or(String::new(), |c| format!(" by {} ({})", c.by, c.role));
+            Some((
+                "job.cancelled",
+                EventSeverity::Warning,
+                format!(
+                    "snapshot job {short} of {name} cancelled{by}: {copied} of {} tables copied",
+                    job.tables.len()
+                ),
+            ))
+        }
     }
 }
 
@@ -1834,7 +1858,7 @@ mod tests {
     use data_avalanche_state::Action;
     use data_avalanche_testkit::{FakeTxn, Method, SinkOp};
 
-    use data_avalanche_state::{JobStatus, JobTableStatus, SnapshotJobDoc};
+    use data_avalanche_state::{JobCancel, JobStatus, JobTableStatus, SnapshotJobDoc};
 
     use super::*;
     use crate::test_support::{
@@ -2483,7 +2507,7 @@ mod tests {
     #[test]
     fn a_job_is_recorded_only_once_it_ended() {
         let mut job = SnapshotJobDoc::new(
-            "0123456789".into(),
+            "orders~0123456789".into(),
             vec![t("a"), t("b")],
             "ops".into(),
             chrono::Utc::now(),
@@ -2509,6 +2533,24 @@ mod tests {
                 "job.failed",
                 EventSeverity::Error,
                 "snapshot job 01234567 of orders failed: public.b failed".into()
+            ))
+        );
+        job.status = JobStatus::Cancelled;
+        job.tables[0].status = JobTableStatus::Completed;
+        job.tables[1].status = JobTableStatus::Cancelled;
+        job.cancel = Some(JobCancel {
+            by: "Oleksii".into(),
+            role: "operator".into(),
+            at: chrono::Utc::now(),
+            note: None,
+        });
+        assert_eq!(
+            job_event("orders", &job),
+            Some((
+                "job.cancelled",
+                EventSeverity::Warning,
+                "snapshot job 01234567 of orders cancelled by Oleksii (operator): 1 of 2 tables copied"
+                    .into()
             ))
         );
     }

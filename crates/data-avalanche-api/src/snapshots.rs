@@ -107,12 +107,14 @@ fn job_json(p: &Pipeline, j: &SnapshotJobDoc) -> Value {
         JobStatus::Running => "running",
         JobStatus::Completed => "completed",
         JobStatus::Failed => "failed",
+        JobStatus::Cancelled => "cancelled",
     };
     let table_status = |s: JobTableStatus| match s {
         JobTableStatus::Queued => "queued",
         JobTableStatus::Running => "running",
         JobTableStatus::Completed => "completed",
         JobTableStatus::Failed => "failed",
+        JobTableStatus::Cancelled => "cancelled",
     };
     json!({
         "job_id": j.job_id,
