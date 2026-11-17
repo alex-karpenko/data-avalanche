@@ -1625,9 +1625,11 @@ mod tests {
         let recorded = TableHalt {
             table: t("a"),
             reason: HaltReason::CopyCancelled { job: "p~1".into() },
-            at: w.source.wal_end(),
+            // Not a position the start would write: a second record would show.
+            at: data_avalanche_core::SourcePosition::Pg(data_avalanche_core::position::Lsn(1)),
             copy: false,
         };
+        assert_ne!(recorded.at, w.source.wal_end());
         w.docs.record_halt(&recorded).await.unwrap();
         let (mut core, _control, _status) = w.core(&never(2), &[]);
         crate::worker::start(&mut core, None).await.unwrap();
