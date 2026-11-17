@@ -9198,3 +9198,30 @@ tasks' blocks applied on top unchanged.
   and fails when the StatefulSet loses it. The upgrade page scaled `statefulset <release>`; the
   chart names it `<release>-data-avalanche` unless the release's name already holds
   `data-avalanche`, which the page now says.
+- **Whole-branch review** (fix wave `416970c`..`c9d8c56`, fix round 2 `fd4cd02`..`11e6d39`; spec
+  patch S-M13b.2, `93d0554`, approved by Oleksii):
+  - *Keyed hashes (Critical).* A generation's plain `blake3(text)`, returned by the API and
+    gossiped as `file_hash`, let a viewer confirm a guessed literal secret against the masked
+    text. Every hash that leaves a node, in an answer or a gossip packet, is now the keyed
+    fingerprint under the cluster's key (first 16 hex); `same`/`differs` compares keyed values.
+    The stored `config_hash` stays internal. Oleksii chose this over dropping the fields.
+  - *Comments blanked (replaces D-M13b.10's "comments left as written").* A shown text's comments
+    are emptied (`#` stays), so a commented-out old secret isn't shown; a text whose comments
+    can't be told apart safely is refused. Oleksii chose blanking over masking or refusing. The
+    cut is settled by halving, and each generation's masked text is made once, off the async
+    workers, and cached (64 entries).
+  - *The file's API.* The advertised URL and the peers' TLS come from the node's own file, not
+    the adopted generation; startup warns when the file's `advertise_url` or `api.tls` differs.
+  - *Forwarding.* Over HTTPS only when the node has TLS; the answer's cap is applied while
+    streaming; `Retry-After` and `WWW-Authenticate` come back; `PeersError`; `Authorization` is
+    redacted from `Debug`. Node detail reads leases, and the generations list cold fingerprints,
+    16 at a time.
+  - *Config.* A written change's class reads the pipeline id as `*`; URL credentials
+    (`://user:pass@`) are masked wherever a value holds one, a `${VAR:-…}` default included;
+    V-138 bounds `advertise_url` at 255 characters (S-M13b.2).
+  - *Gossip figures* capped (the last 100 each way, plus counts) and pruned on read.
+  - Tests, docs and OpenAPI as the review's triage listed. Final tree: `cargo test --workspace`
+    1637 passed; the E2E suite on PostgreSQL 18, 53 scenarios, passed.
+  - Parked for M13c: a scheme-relative `//user:pass@host` in a key without a scheme check isn't
+    masked (such a config can't work); the worst-case first masking of a text (300 lines each
+    with a quoted `#` and a comment) takes about 0.65 s, once per generation.
