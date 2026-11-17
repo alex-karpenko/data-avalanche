@@ -15,7 +15,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use foca::{AccumulatingRuntime, Foca, NoCustomBroadcast, PeriodicParams, PostcardCodec, State};
+use chrono::{DateTime, Utc};
+use data_avalanche_telemetry::{Metrics, Suspicion};
+use foca::{
+    AccumulatingRuntime, Foca, Incarnation, Message, NoCustomBroadcast, OwnedNotification,
+    PeriodicParams, PostcardCodec, ProbeNumber, State,
+};
 use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -43,6 +48,93 @@ pub struct NodeMeta {
     pub config_generation: u64,
     /// The build, e.g. `1.0.0`.
     pub build: String,
+    /// Where the others reach its API (`https://cdc-0.cdc.ns.svc:8080`, D-M13b.2).
+    pub api_url: String,
+    /// The first 16 hex digits of its own config file's hash; empty when it can't read it.
+    pub file_hash: String,
+}
+
+/// What a node's gossip saw of its probes, for its page (D-M13b.8).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GossipFigures {
+    /// The member the last probe pinged, and when.
+    pub last_probe: Option<(String, DateTime<Utc>)>,
+    /// That probe's round trip, once its ack came.
+    pub probe_rtt: Option<Duration>,
+    /// The members this node suspected (its probe of them failed), and when, in the last
+    /// [`SUSPICIONS_KEPT`]: the last [`SUSPICIONS_LISTED`], the others counted
+    /// ([`Self::raised_more`]).
+    pub raised: Vec<(String, DateTime<Utc>)>,
+    /// When the others suspected this node, in the last [`SUSPICIONS_KEPT`]: it refuted (foca
+    /// raises its own incarnation, which its packets carry), or it was declared down and
+    /// rejoined. The last [`SUSPICIONS_LISTED`], the others counted
+    /// ([`Self::received_more`]).
+    pub received: Vec<DateTime<Utc>>,
+    /// The suspicions raised beyond those listed, by the hour they were raised in.
+    raised_unlisted: BTreeMap<DateTime<Utc>, u64>,
+    /// The suspicions received beyond those listed, by the hour.
+    received_unlisted: BTreeMap<DateTime<Utc>, u64>,
+}
+
+/// How long the figures keep a suspicion.
+pub const SUSPICIONS_KEPT: Duration = Duration::from_secs(24 * 3600);
+
+/// How many suspicions each way the figures list; the others are only counted.
+pub const SUSPICIONS_LISTED: usize = 100;
+
+/// The hour `at` falls in.
+fn hour_of(at: DateTime<Utc>) -> DateTime<Utc> {
+    let s = at.timestamp();
+    DateTime::from_timestamp(s - s.rem_euclid(3600), 0).unwrap_or(at)
+}
+
+impl GossipFigures {
+    /// Forgets the suspicions older than [`SUSPICIONS_KEPT`] before `now`; a counted one with
+    /// its hour, once all of that hour is.
+    pub fn forget_before(&mut self, now: DateTime<Utc>) {
+        let kept = chrono::Duration::from_std(SUSPICIONS_KEPT).unwrap_or(chrono::Duration::MAX);
+        let since = now
+            .checked_sub_signed(kept)
+            .unwrap_or(DateTime::<Utc>::MIN_UTC);
+        self.raised.retain(|(_, at)| *at >= since);
+        self.received.retain(|at| *at >= since);
+        let in_window =
+            |hour: &DateTime<Utc>, _: &mut u64| *hour + chrono::Duration::hours(1) > since;
+        self.raised_unlisted.retain(in_window);
+        self.received_unlisted.retain(in_window);
+    }
+
+    /// A suspicion this node raised of `node` at `at`.
+    pub(crate) fn raise(&mut self, node: String, at: DateTime<Utc>) {
+        self.raised.push((node, at));
+        if self.raised.len() > SUSPICIONS_LISTED {
+            let (_, oldest) = self.raised.remove(0);
+            *self.raised_unlisted.entry(hour_of(oldest)).or_default() += 1;
+        }
+        self.forget_before(at);
+    }
+
+    /// A suspicion of this node received at `at`.
+    pub(crate) fn receive(&mut self, at: DateTime<Utc>) {
+        self.received.push(at);
+        if self.received.len() > SUSPICIONS_LISTED {
+            let oldest = self.received.remove(0);
+            *self.received_unlisted.entry(hour_of(oldest)).or_default() += 1;
+        }
+        self.forget_before(at);
+    }
+
+    /// How many suspicions this node raised in the last [`SUSPICIONS_KEPT`] beyond those
+    /// listed: counted by the hour, so up to an hour's more.
+    pub fn raised_more(&self) -> u64 {
+        self.raised_unlisted.values().sum()
+    }
+
+    /// How many suspicions of this node it received beyond those listed, as
+    /// [`Self::raised_more`].
+    pub fn received_more(&self) -> u64 {
+        self.received_unlisted.values().sum()
+    }
 }
 
 /// One incarnation of a node, as foca knows it.
@@ -227,6 +319,8 @@ enum Command {
     Announce(Vec<SocketAddr>),
     Phase(Phase),
     Generation(u64),
+    FileHash(String),
+    Metrics(Metrics),
     Leave(oneshot::Sender<()>),
 }
 
@@ -250,6 +344,11 @@ impl Advertiser {
     pub fn set_config_generation(&self, generation: u64) {
         let _ = self.0.send(Command::Generation(generation));
     }
+
+    /// Tells the others the hash of this node's config file; false once the gossip is gone.
+    pub fn set_file_hash(&self, hash: String) -> bool {
+        self.0.send(Command::FileHash(hash)).is_ok()
+    }
 }
 
 /// A running gossip. Dropping it stops the gossip without a leave, as a crash would.
@@ -257,6 +356,7 @@ impl Advertiser {
 pub struct Gossip {
     commands: mpsc::UnboundedSender<Command>,
     members: watch::Receiver<Members>,
+    figures: watch::Receiver<GossipFigures>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -284,6 +384,7 @@ impl Gossip {
             PostcardCodec,
         );
         let (members_tx, members) = watch::channel(members_of(&me, std::iter::empty()));
+        let (figures_tx, figures) = watch::channel(GossipFigures::default());
         let (commands, rx) = mpsc::unbounded_channel();
         let actor = Actor {
             swim,
@@ -291,6 +392,10 @@ impl Gossip {
             settings,
             wire,
             members: members_tx,
+            figures: figures_tx,
+            metrics: None,
+            probe: None,
+            incarnation: None,
             size: 1,
             dropped: 0,
             warned: None,
@@ -299,8 +404,19 @@ impl Gossip {
         Self {
             commands,
             members,
+            figures,
             task,
         }
+    }
+
+    /// What the gossip saw of its probes, as it changes.
+    pub fn figures(&self) -> watch::Receiver<GossipFigures> {
+        self.figures.clone()
+    }
+
+    /// Counts the probes' round trips and the suspicions in `metrics` from now on.
+    pub fn report_to(&self, metrics: Metrics) {
+        let _ = self.commands.send(Command::Metrics(metrics));
     }
 
     /// The members, as they change.
@@ -352,6 +468,12 @@ struct Actor {
     settings: GossipSettings,
     wire: Arc<dyn Wire>,
     members: watch::Sender<Members>,
+    figures: watch::Sender<GossipFigures>,
+    metrics: Option<Metrics>,
+    /// The last probe's ping not yet acked: its number and when it went.
+    probe: Option<(ProbeNumber, Instant)>,
+    /// This node's incarnation as its last packet carried it.
+    incarnation: Option<Incarnation>,
     /// The cluster size foca's settings were last computed for.
     size: usize,
     dropped: u64,
@@ -409,6 +531,23 @@ impl Actor {
                         log(self.swim.change_identity(next, &mut rt));
                         None
                     }
+                    Some(Command::FileHash(file_hash)) => {
+                        let me = self.swim.identity();
+                        let next = NodeIdentity {
+                            rev: me.rev.wrapping_add(1),
+                            meta: NodeMeta {
+                                file_hash,
+                                ..me.meta.clone()
+                            },
+                            ..me.clone()
+                        };
+                        log(self.swim.change_identity(next, &mut rt));
+                        None
+                    }
+                    Some(Command::Metrics(metrics)) => {
+                        self.metrics = Some(metrics);
+                        None
+                    }
                     Some(Command::Leave(done)) => {
                         log(self.swim.leave_cluster(&mut rt));
                         Some(Some(done))
@@ -428,7 +567,7 @@ impl Actor {
                 });
             }
             while let Some(n) = rt.to_notify() {
-                tracing::debug!("gossip: {n:?}");
+                self.notified(n);
             }
             if let Some(done) = done {
                 if let Some(done) = done {
@@ -460,14 +599,70 @@ impl Actor {
         });
     }
 
-    /// A packet that doesn't open: another cluster's, a corrupted one, or forged.
+    /// Keeps the figures (D-M13b.8): a ping this node sends starts a probe, its ack ends it; a
+    /// failed probe is a suspicion raised; a packet carrying a higher incarnation of this node
+    /// is a suspicion of it refuted, and a rejoin one that ended in its being declared down.
+    fn notified(&mut self, n: OwnedNotification<NodeIdentity>) {
+        let now = Utc::now();
+        match n {
+            OwnedNotification::DataSent(h) => {
+                if let Message::Ping(probe) = h.message {
+                    self.probe = Some((probe, Instant::now()));
+                    self.figures.send_modify(|f| {
+                        f.last_probe = Some((h.dst.node_id.clone(), now));
+                        f.probe_rtt = None;
+                    });
+                }
+                if self.incarnation.is_some_and(|i| h.src_incarnation > i) {
+                    self.suspected(now);
+                }
+                self.incarnation = Some(h.src_incarnation);
+            }
+            OwnedNotification::DataReceived(h) => {
+                if let (Message::Ack(probe), Some((sent, at))) = (h.message, self.probe)
+                    && probe == sent
+                {
+                    self.probe = None;
+                    let rtt = at.elapsed();
+                    self.figures.send_modify(|f| f.probe_rtt = Some(rtt));
+                    if let Some(m) = &self.metrics {
+                        m.gossip_probe_rtt(rtt);
+                    }
+                }
+            }
+            OwnedNotification::ProbeFailed(_, member) => {
+                self.figures.send_modify(|f| f.raise(member.node_id, now));
+                if let Some(m) = &self.metrics {
+                    m.gossip_suspicion(Suspicion::Raised);
+                }
+            }
+            OwnedNotification::Rejoin(me) => {
+                tracing::info!("gossip: declared down by the others; rejoined as {me:?}");
+                self.incarnation = None;
+                self.suspected(now);
+            }
+            other => tracing::debug!("gossip: {other:?}"),
+        }
+    }
+
+    /// The others suspected this node.
+    fn suspected(&mut self, now: DateTime<Utc>) {
+        self.figures.send_modify(|f| f.receive(now));
+        if let Some(m) = &self.metrics {
+            m.gossip_suspicion(Suspicion::Received);
+        }
+    }
+
+    /// A packet that doesn't open: another cluster's, a 1.0 node's (gossip v1), a corrupted one,
+    /// or forged.
     fn dropped(&mut self) {
         self.dropped += 1;
         if self.warned.is_none_or(|t| t.elapsed() >= WARN_EVERY) {
             tracing::warn!(
                 dropped = self.dropped,
                 "gossip: dropped packets whose MAC doesn't match this cluster's key: another \
-                 cluster's nodes on this network, or a node of this cluster on another anchor"
+                 cluster's nodes on this network, a node of this cluster on another anchor, or a \
+                 node of another version (1.0)"
             );
             self.warned = Some(Instant::now());
         }
@@ -485,6 +680,8 @@ fn seed(addr: SocketAddr) -> NodeIdentity {
             phase: Phase::Joining,
             config_generation: 0,
             build: String::new(),
+            api_url: String::new(),
+            file_hash: String::new(),
         },
     }
 }
@@ -510,7 +707,9 @@ mod tests {
             meta: NodeMeta {
                 phase: Phase::Active,
                 config_generation: 1,
-                build: "1.0.0".into(),
+                build: "1.1.0".into(),
+                api_url: format!("http://{}", SocketAddr::new(addr.ip(), 8080)),
+                file_hash: "0123456789abcdef".into(),
             },
         }
     }
@@ -614,6 +813,24 @@ mod tests {
         );
     }
 
+    /// A node's file changed under it: its new hash reaches every peer (D-M13b.3), and its API
+    /// address travels with it.
+    #[tokio::test(start_paused = true)]
+    async fn a_file_hash_reaches_every_peer() {
+        let hub = Hub::new();
+        let (a, b, c) = three(&hub).await;
+        let meta = |g: &Gossip| g.members().borrow().nodes.get("b").map(|m| m.meta.clone());
+        assert_eq!(meta(&a).unwrap().api_url, "http://10.0.0.2:8080");
+        assert!(b.advertiser().set_file_hash("fedcba9876543210".into()));
+        eventually("b's new hash on a and c", || {
+            [&a, &c]
+                .iter()
+                .all(|g| meta(g).is_some_and(|m| m.file_hash == "fedcba9876543210"))
+        })
+        .await;
+        assert_eq!(names(&a), ["a", "b", "c"], "a new hash is no departure");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_leave_is_seen_at_once() {
         let hub = Hub::new();
@@ -710,6 +927,76 @@ mod tests {
             "healed after {:?}",
             t.elapsed()
         );
+    }
+
+    /// D-M13b.8: a probe's ping and ack give its round trip. A cut makes each side suspect the
+    /// other (raised); once healed, a suspicion reaches its subject (received), which refutes it
+    /// or, declared down first, rejoins: which side, the dissemination decides.
+    #[tokio::test(start_paused = true)]
+    async fn the_figures_keep_a_probe_s_round_trip_and_suspicions_each_way() {
+        let hub = Hub::new();
+        let (a, b, c) = three(&hub).await;
+        let metrics = Metrics::new();
+        a.report_to(metrics.clone());
+        eventually("a probed and was acked", || {
+            let f = a.figures().borrow().clone();
+            f.last_probe.is_some() && f.probe_rtt.is_some()
+        })
+        .await;
+        hub.cut(&[at(1), at(2)], &[at(3)]);
+        eventually("a or b suspects c", || {
+            [&a, &b]
+                .iter()
+                .any(|g| g.figures().borrow().raised.iter().any(|(n, _)| n == "c"))
+        })
+        .await;
+        hub.heal();
+        eventually("a suspicion received", || {
+            [&a, &b, &c]
+                .iter()
+                .any(|g| !g.figures().borrow().received.is_empty())
+        })
+        .await;
+        eventually("c back", || names(&a) == ["a", "b", "c"]).await;
+        let text = metrics.encode();
+        assert!(
+            text.contains("data_avalanche_gossip_probe_rtt_seconds_count"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn suspicions_older_than_a_day_are_forgotten() {
+        let now = Utc::now();
+        let old = now - chrono::Duration::hours(25);
+        let mut f = GossipFigures {
+            raised: vec![("b".into(), old), ("c".into(), now)],
+            received: vec![old, now],
+            ..GossipFigures::default()
+        };
+        f.forget_before(now);
+        assert_eq!(f.raised, [("c".to_owned(), now)]);
+        assert_eq!(f.received, [now]);
+    }
+
+    /// A failed probe a second for a day lists the last [`SUSPICIONS_LISTED`] and counts the
+    /// rest, by the hour, until they too are a day old.
+    #[test]
+    fn the_figures_list_the_last_suspicions_and_count_the_others() {
+        let now = Utc::now();
+        let mut f = GossipFigures::default();
+        let n = SUSPICIONS_LISTED + 50;
+        for i in 0..n {
+            let at = now + chrono::Duration::seconds(i as i64);
+            f.raise(format!("m{i}"), at);
+            f.receive(at);
+        }
+        assert_eq!(f.raised.len(), SUSPICIONS_LISTED);
+        assert_eq!(f.raised[0].0, "m50", "the newest kept");
+        assert_eq!(f.received.len(), SUSPICIONS_LISTED);
+        assert_eq!((f.raised_more(), f.received_more()), (50, 50));
+        f.forget_before(now + chrono::Duration::hours(26));
+        assert_eq!(f, GossipFigures::default(), "a day later, nothing is left");
     }
 
     /// A node on another anchor has another key: its packets don't open, so it never joins.

@@ -21,6 +21,10 @@ const TAGS: &[(&str, &str)] = &[
     ("cluster", "Membership and leases."),
     ("admin", "The node's process."),
     (
+        "nodes",
+        "Any member, through any node: its detail, and the actions only it takes, sent to it with the caller's own credentials. A node that doesn't answer is named (`502`, `504`).",
+    ),
+    (
         "events",
         "The cluster's timeline and audit trail, kept for `globals.console.events.retention`.",
     ),
@@ -87,6 +91,11 @@ pub(crate) fn page() -> String {
          role mapped, is recorded too (`action.denied`). A note longer than 500 characters, \
          not a string or holding a control character, or a body that isn't a JSON object, is \
          `422`; a body over 1 MiB is `413`; either way nothing is done or recorded.\n\n\
+         **Hashes.** A hash the API shows of a config text (a generation's `hash`, a node's \
+         `file_hash`, `file.hash` and `file.generation_hash`) is the text's fingerprint keyed \
+         with the cluster's fingerprint key, never its plain hash, the gossiped ones its first \
+         16 hex: comparable across the nodes of one cluster only, and no help to someone \
+         guessing a secret of a masked text.\n\n\
          **Outside `/v1`**, with no credentials: `GET /health/live` (the process answers), \
          `GET /health/ready` (`200` once the node runs its config, `503` before and while it \
          stops) and `GET /metrics` (Prometheus text).\n\n",
@@ -120,7 +129,11 @@ pub(crate) fn page() -> String {
             }
             out.push_str("\n| Status | When |\n|---|---|\n");
             for (code, answer) in sorted(&op["responses"]) {
-                if ["401", "403", "503"].contains(&code.as_str()) {
+                // The common answers, said once above; a route's own `503` reason is shown.
+                let common_503 = "the node is starting or stopping, or its state can't be read";
+                if ["401", "403"].contains(&code.as_str())
+                    || (code == "503" && answer["description"] == common_503)
+                {
                     continue;
                 }
                 let _ = writeln!(

@@ -45,6 +45,8 @@ fn operation(r: &Route) -> utoipa::openapi::path::Operation {
     for (name, description) in [
         ("id", "the pipeline's id"),
         ("job_id", "the snapshot job's id, `<pipeline id>~<suffix>`"),
+        ("node", "a member's name, as the gossip knows it"),
+        ("generation", "a config generation's number"),
     ] {
         if r.path.contains(&format!("{{{name}}}")) {
             op = op.parameter(
@@ -54,6 +56,48 @@ fn operation(r: &Route) -> utoipa::openapi::path::Operation {
                     .required(Required::True)
                     .description(Some(description))
                     .schema(Some(ObjectBuilder::new().schema_type(Type::String))),
+            );
+        }
+    }
+    if r.path == "/v1/config/diff" {
+        for (name, description) in [
+            ("from", "the generation compared from"),
+            ("to", "the generation compared to"),
+        ] {
+            op = op.parameter(
+                ParameterBuilder::new()
+                    .name(name)
+                    .parameter_in(ParameterIn::Query)
+                    .required(Required::True)
+                    .description(Some(description))
+                    .schema(Some(
+                        ObjectBuilder::new()
+                            .schema_type(Type::Integer)
+                            .minimum(Some(1)),
+                    )),
+            );
+        }
+    }
+    if r.path == "/v1/config/generations" {
+        for (name, description) in crate::generations::PARAMETERS {
+            let schema = if *name == "limit" {
+                ObjectBuilder::new()
+                    .schema_type(Type::Integer)
+                    .minimum(Some(1))
+                    .maximum(Some(crate::generations::MAX_LIMIT))
+                    .default(Some(crate::generations::DEFAULT_LIMIT.into()))
+            } else {
+                ObjectBuilder::new()
+                    .schema_type(Type::Integer)
+                    .minimum(Some(1))
+            };
+            op = op.parameter(
+                ParameterBuilder::new()
+                    .name(*name)
+                    .parameter_in(ParameterIn::Query)
+                    .required(Required::False)
+                    .description(Some(*description))
+                    .schema(Some(schema)),
             );
         }
     }
@@ -93,9 +137,15 @@ fn operation(r: &Route) -> utoipa::openapi::path::Operation {
     let mut answers: Vec<(u16, String)> = r
         .answers
         .iter()
-        .chain(&COMMON)
         .map(|(code, d)| (*code, (*d).to_owned()))
         .collect();
+    // A route's own reason for a common answer (a `503`) beside the common one.
+    for (code, common) in COMMON {
+        match answers.iter_mut().find(|(c, _)| *c == code) {
+            Some((_, own)) => *own = format!("{common}; or {own}"),
+            None => answers.push((code, common.to_owned())),
+        }
+    }
     // The recording refuses a body before the route runs: its 422 beside the route's own.
     if r.records.is_some() {
         match answers.iter_mut().find(|(code, _)| *code == 422) {
@@ -221,7 +271,7 @@ mod tests {
                         "{method} {path} {code}"
                     );
                 }
-                for name in ["id", "job_id"] {
+                for name in ["id", "job_id", "node"] {
                     if path.contains(&format!("{{{name}}}")) {
                         assert_eq!(op["parameters"][0]["name"], name, "{method} {path}");
                     }

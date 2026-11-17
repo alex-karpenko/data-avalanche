@@ -335,6 +335,7 @@ api:
 | Field | Type | Required | Default | Mutability | Notes |
 |---|---|---|---|---|---|
 | `address` | host:port | no | `0.0.0.0:8080` | PROC | IPv4/IPv6/DNS host + port. Listener binding cannot hot-change. |
+| `advertise_url` | URL | no | derived | PROC | Where the other nodes reach this node's API, for the console's pages and node actions served by another node (a node's detail, leave, shutdown). Derived: `https` when `tls.enabled`, else `http`; `address`'s host, or the gossip's `advertise_addr` when `address` listens on all addresses; `address`'s port. With TLS, set it to a name the certificate covers (a pod's headless-Service name): the other nodes verify it as any HTTPS client does. Absolute `http(s)` URL of a host and port only, at most 255 characters (V-138). |
 | `auth` | enum `none` \| `basic` \| `jwt` \| `oauth2` | no | `none` | R | Auth mode for **authenticated** endpoints. |
 | `user` | string | conditional | — | R | For `auth = basic`: required unless `credentials_file` is given (V-049); mutually exclusive with it (V-065). |
 | `password` | string | conditional | — | R | For `auth = basic`: required unless `credentials_file` is given (V-049); mutually exclusive with it (V-065). Use `${ENV}`. |
@@ -1419,6 +1420,7 @@ errors.
 | V-135 | `globals.console.enabled = true` with `api.auth ∈ {basic, oauth2}` | Requires `globals.console.session_key`. | error | config |
 | V-136 | `globals.console.enabled = true` with `api.auth = oauth2` | Requires `globals.console.public_url` and `globals.api.oauth2.client_id`. | error | config |
 | V-137 | `globals.console.prometheus` | Requires `url`; `basic` requires `user` and `password`. | error | config |
+| V-138 | `globals.api.advertise_url` | An absolute `http`/`https` URL with a host, without a path, query or fragment, at most 255 characters. | error | config |
 
 ### 13.7 Identity / naming
 

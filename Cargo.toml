@@ -109,7 +109,7 @@ tracing-opentelemetry = { version = "=0.34.0", default-features = false }
 # the host's addresses, for an unset `advertise_addr`.
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 if-addrs = "0.15"
-foca = { version = "=2.0.0", default-features = false, features = ["std", "serde", "postcard-codec"] }
+foca = { version = "=2.0.0", default-features = false, features = ["std", "serde", "postcard-codec", "unstable-notifications"] }
 rand = { version = "0.10", default-features = false, features = ["std", "std_rng", "sys_rng"] }
 
 # Dependencies build without debug info: DataFusion's full debug build is over 6 GB, which fills

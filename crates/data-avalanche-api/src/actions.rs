@@ -154,6 +154,7 @@ pub(crate) async fn record(State(gate): State<Gate>, req: Request, next: Next) -
             })
             .unwrap_or_default()
     };
+    parts.extensions.insert(Noted(note.clone()));
     let action = Action {
         recorded,
         by,
@@ -180,6 +181,11 @@ pub(crate) async fn record(State(gate): State<Gate>, req: Request, next: Next) -
     action.note_outcome(node, head.status, &v);
     Response::from_parts(head, Body::from(answer_bytes))
 }
+
+/// The note a mutating call's body carried, for the route that keeps it beside its own work (a
+/// reload's generation record).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Noted(pub Option<String>);
 
 /// An action under way through a mutating route: what it records, who asked and why.
 struct Action {
@@ -262,6 +268,9 @@ pub(crate) async fn denied(gate: &Gate, name: &str, role: &str, path: &str) {
         Some(id) => clipped(id, MAX_TARGET).into_owned(),
         None if path.starts_with("/v1/cluster/") || path.starts_with("/v1/admin/") => {
             recorder.node().to_owned()
+        }
+        None if let Some(rest) = path.strip_prefix("/v1/nodes/") => {
+            clipped(rest.split('/').next().unwrap_or_default(), MAX_TARGET).into_owned()
         }
         None => String::new(),
     };

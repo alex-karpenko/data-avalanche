@@ -11,13 +11,14 @@ use std::time::Duration;
 
 use chrono::Utc;
 use data_avalanche_config::{
-    ConfigDiff, Env, FingerprintKey, Fingerprints, Globals, Mutability, Pipeline, PipelineChange,
-    Report, ResolvedConfig, diff, diff_with, load_posted_str, load_str,
+    ConfigDiff, Env, FingerprintKey, Fingerprints, Globals, MaskError, Mutability, Pipeline,
+    PipelineChange, Report, ResolvedConfig, WrittenDiff, diff, diff_with, diff_written,
+    load_posted_str, load_str, mask_secrets, text_fingerprint,
 };
 use data_avalanche_core::TableRef;
 use data_avalanche_state::{
-    ConfigGeneration, ConfigGenerations, EventSeverity, GENERATION_KEY, GenerationDoc,
-    PipelineDocs, RemovalDoc, Removals, StateError, Versioned, config_hash,
+    Actor, ConfigGeneration, ConfigGenerations, EventSeverity, GENERATION_KEY, GenerationDoc,
+    GenerationRecord, PipelineDocs, RemovalDoc, Removals, StateError, Versioned, config_hash,
 };
 use data_avalanche_telemetry::Metrics;
 use thiserror::Error;
@@ -69,6 +70,14 @@ impl Debug for CoordinatorDeps {
             .field("node_id", &self.node_id)
             .finish_non_exhaustive()
     }
+}
+
+/// Who asked for a reload, and why: the published generation's record keeps them
+/// (Admin_Console §4 Config). Both are none for a reload nobody asked for through the API.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Attribution {
+    pub by: Option<Actor>,
+    pub note: Option<String>,
 }
 
 /// Whether a reload may publish a change to a field only a process restart applies (config
@@ -140,7 +149,16 @@ struct Inner {
     /// One adoption or reload at a time.
     running: Mutex<Running>,
     applied: watch::Sender<u64>,
+    /// Each generation's text fingerprint ([`ConfigCoordinator::generation_fingerprint`]), by its
+    /// text's plain hash: a snapshot never changes, so each is read once.
+    fingerprints: StdMutex<BTreeMap<String, String>>,
+    /// Each generation's masked text ([`ConfigCoordinator::mask_generation`]), by its text's
+    /// plain hash, at most [`MASKED_KEPT`].
+    masked: StdMutex<BTreeMap<String, Result<String, MaskError>>>,
 }
+
+/// How many generations' masked texts the coordinator keeps.
+pub const MASKED_KEPT: usize = 64;
 
 /// The node's config generation at run time. Dropped, it stops watching.
 #[derive(Debug)]
@@ -188,6 +206,8 @@ impl ConfigCoordinator {
                 stopped: false,
             }),
             applied: watch::channel(n).0,
+            fingerprints: StdMutex::default(),
+            masked: StdMutex::default(),
         });
         let (stop, stopped) = watch::channel(false);
         let task = tokio::spawn(watch_generations(
@@ -206,6 +226,105 @@ impl ConfigCoordinator {
     /// The generation this node runs.
     pub fn applied(&self) -> u64 {
         *self.inner.applied.borrow()
+    }
+
+    /// The generation this node runs: its number, its text's hash, who wrote it and when.
+    pub async fn generation(&self) -> GenerationDoc {
+        self.inner.running.lock().await.generation.doc.clone()
+    }
+
+    /// The cluster's config generations in `globals.state`: their records and texts.
+    pub fn generations(&self) -> &ConfigGenerations {
+        &self.inner.deps.generations
+    }
+
+    /// `text`, a generation's, with its secrets masked under the cluster's fingerprint key and
+    /// its comments shown empty ([`mask_secrets`]).
+    ///
+    /// # Errors
+    /// [`MaskError`]: the text isn't shown.
+    pub fn mask(&self, text: &str) -> Result<String, MaskError> {
+        mask_secrets(text, &self.inner.deps.key)
+    }
+
+    /// [`Self::mask`] of a generation's `text`, whose plain hash is `hash`: made on a blocking
+    /// thread (a long text takes a while to tell its comments from its content), then kept, as a
+    /// snapshot never changes.
+    ///
+    /// # Errors
+    /// [`MaskError`]: the text isn't shown.
+    pub async fn mask_generation(&self, hash: &str, text: String) -> Result<String, MaskError> {
+        let kept = self
+            .inner
+            .masked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(hash)
+            .cloned();
+        if let Some(masked) = kept {
+            return masked;
+        }
+        let key = self.inner.deps.key;
+        let masked = match tokio::task::spawn_blocking(move || mask_secrets(&text, &key)).await {
+            Ok(m) => m,
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(_) => return Err(MaskError::Interrupted),
+        };
+        let mut all = self
+            .inner
+            .masked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if all.len() >= MASKED_KEPT {
+            all.pop_first();
+        }
+        all.insert(hash.to_owned(), masked.clone());
+        masked
+    }
+
+    /// What differs between two generations' texts as written, secrets masked under the
+    /// cluster's fingerprint key ([`diff_written`]).
+    ///
+    /// # Errors
+    /// [`MaskError::Parse`]: a text isn't a config.
+    pub fn diff_written(&self, from: &str, to: &str) -> Result<WrittenDiff, MaskError> {
+        diff_written(from, to, &self.inner.deps.key)
+    }
+
+    /// `text`'s fingerprint under the cluster's key ([`text_fingerprint`], `blake3:<64 hex>`):
+    /// what the API shows of a config text in place of its plain hash, which a viewer could check
+    /// a guessed secret of a masked text against (Admin_Console §4 Config).
+    pub fn fingerprint(&self, text: &str) -> String {
+        text_fingerprint(&self.inner.deps.key, text)
+    }
+
+    /// [`Self::fingerprint`] of generation `generation`'s text, whose plain hash is `hash`: read
+    /// from its snapshot the first time, then kept.
+    ///
+    /// # Errors
+    /// The snapshot can't be read, or doesn't match `hash`.
+    pub async fn generation_fingerprint(
+        &self,
+        generation: u64,
+        hash: &str,
+    ) -> Result<String, StateError> {
+        let kept = |f: &StdMutex<BTreeMap<String, String>>| {
+            f.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(hash)
+                .cloned()
+        };
+        if let Some(fp) = kept(&self.inner.fingerprints) {
+            return Ok(fp);
+        }
+        let text = self.inner.deps.generations.text(generation, hash).await?;
+        let fp = self.fingerprint(&text);
+        self.inner
+            .fingerprints
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(hash.to_owned(), fp.clone());
+        Ok(fp)
     }
 
     /// The config this node runs: its generation's text as resolved here.
@@ -242,6 +361,21 @@ impl ConfigCoordinator {
         &self,
         text: &str,
         restart: RestartFields,
+    ) -> Result<Reloaded, ReloadError> {
+        self.reload_as(text, restart, Attribution::default()).await
+    }
+
+    /// [`Self::reload`], the generation it publishes recorded as `asked`'s: who and why, with
+    /// what it changed (`config/history/<generation>.json`). The record is written after the
+    /// pointer; a failure to write it is logged, and the generation stands.
+    ///
+    /// # Errors
+    /// As [`Self::reload`].
+    pub async fn reload_as(
+        &self,
+        text: &str,
+        restart: RestartFields,
+        asked: Attribution,
     ) -> Result<Reloaded, ReloadError> {
         let d = &self.inner.deps;
         let mut running = self.inner.running.lock().await;
@@ -286,16 +420,32 @@ impl ConfigCoordinator {
                 Ok(published) => {
                     let generation = published.pointer.doc.generation;
                     tracing::info!(generation, "published config generation {generation}");
+                    let record = GenerationRecord {
+                        generation,
+                        hash: published.pointer.doc.hash.clone(),
+                        node: d.node_id.clone(),
+                        at: published.pointer.doc.written_at,
+                        by: asked.by.clone(),
+                        note: asked.note.clone(),
+                        summary: Some(summary(&changes)),
+                    };
+                    if let Err(e) = d.generations.record(&record).await {
+                        tracing::warn!(generation, "config generation {generation}'s record: {e}");
+                    }
+                    let who = asked.by.as_ref().map_or_else(
+                        || d.node_id.clone(),
+                        |a| format!("{} on {}", a.name, d.node_id),
+                    );
                     let mut e = d.recorder.event(
                         "config.published",
                         EventSeverity::Info,
                         format!(
-                            "config generation {generation} published by {}: {}",
-                            d.node_id,
+                            "config generation {generation} published by {who}: {}",
                             summary(&changes)
                         ),
                     );
                     e.object = Some(generation.to_string());
+                    e.actor = asked.by;
                     d.recorder.record(e);
                     self.inner.adopt(&mut running, published).await;
                     return Ok(Reloaded {
@@ -916,6 +1066,8 @@ mod tests {
                 phase: Phase::Active,
                 config_generation: 1,
                 build: "1.0.0".into(),
+                api_url: String::new(),
+                file_hash: String::new(),
             },
         };
         let gossip = Gossip::start(
@@ -1008,6 +1160,59 @@ mod tests {
                 PipelineReload::Restart(p, _) => format!("restart {}", p.id),
             })
             .collect()
+    }
+
+    /// A generation's masked text is made once, off the async workers, and kept by its text's
+    /// hash: the second ask of it is the first's answer.
+    #[tokio::test]
+    async fn a_generation_s_masked_text_is_made_once() {
+        let n = lone(&["p"]).await;
+        let one = "config_version: 1\npipelines:\n  p:\n    source: { password: first }\n";
+        let two = one.replace("first", "second");
+        let first = n
+            .coordinator
+            .mask_generation("blake3:aa", one.to_owned())
+            .await
+            .unwrap();
+        assert!(!first.contains("first"), "{first}");
+        assert_eq!(
+            n.coordinator
+                .mask_generation("blake3:aa", two.clone())
+                .await,
+            Ok(first.clone()),
+            "kept"
+        );
+        assert_ne!(
+            n.coordinator.mask_generation("blake3:bb", two).await,
+            Ok(first)
+        );
+    }
+
+    /// What the API shows of a generation's text is its fingerprint under the cluster's key,
+    /// never its plain hash (Admin_Console §4 Config): read once from its snapshot, then kept.
+    #[tokio::test(start_paused = true)]
+    async fn a_generation_s_fingerprint_is_keyed() {
+        let n = lone(&["p"]).await;
+        let text = config_text(&["p"]);
+        let g = n.coordinator.generation().await;
+        let want =
+            data_avalanche_config::text_fingerprint(&FingerprintKey::from_bytes([1; 32]), &text);
+        assert_eq!(n.coordinator.fingerprint(&text), want);
+        assert_eq!(
+            n.coordinator
+                .generation_fingerprint(1, &g.hash)
+                .await
+                .unwrap(),
+            want
+        );
+        assert_ne!(want, g.hash, "not the plain hash");
+        assert!(
+            n.coordinator
+                .generation_fingerprint(1, &config_hash("another text"))
+                .await
+                .is_err(),
+            "a hash no snapshot of it has"
+        );
     }
 
     /// A generation another node published is adopted at the next poll: its pipelines' changes
@@ -1234,6 +1439,49 @@ mod tests {
         );
         assert!(
             text.starts_with("config generation 2 published by n1: "),
+            "{text}"
+        );
+    }
+
+    /// The published generation's record names who asked and why, and what it changed.
+    #[tokio::test(start_paused = true)]
+    async fn a_reload_records_who_published_the_generation_and_why() {
+        let n = lone(&["p"]).await;
+        let asked = Attribution {
+            by: Some(Actor {
+                name: "oleksii".into(),
+                role: "operator".into(),
+            }),
+            note: Some("a second pipeline".into()),
+        };
+        n.coordinator
+            .reload_as(
+                &config_text(&["p", "q"]),
+                RestartFields::Refuse,
+                asked.clone(),
+            )
+            .await
+            .unwrap();
+        let listed = n.generations.history(None, 10).await.unwrap();
+        let record = listed[0].record.clone().expect("generation 2's record");
+        assert_eq!(
+            (
+                record.generation,
+                record.node.as_str(),
+                record.by,
+                record.note
+            ),
+            (2, "n1", asked.by, asked.note)
+        );
+        assert_eq!(
+            record.summary.as_deref(),
+            Some("1 pipelines added, 0 removed, 0 changed (0 restarted), 0 global fields")
+        );
+        let [(_, _, text)] = &n.recorded(1).await[..] else {
+            panic!("one event")
+        };
+        assert!(
+            text.starts_with("config generation 2 published by oleksii on n1: "),
             "{text}"
         );
     }

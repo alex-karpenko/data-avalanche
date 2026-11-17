@@ -2023,6 +2023,7 @@ dependencies = [
  "prometheus-client",
  "rcgen",
  "reqwest 0.13.5",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

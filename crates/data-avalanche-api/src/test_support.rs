@@ -202,7 +202,9 @@ pub(crate) async fn lone_with(file: PathBuf, text: &str, env: Arc<dyn Env + Send
         meta: NodeMeta {
             phase: Phase::Active,
             config_generation: 1,
-            build: "1.0.0".into(),
+            build: "1.1.0".into(),
+            api_url: "http://127.0.0.1:8080".into(),
+            file_hash: data_avalanche_cluster::file_hash(&key, text),
         },
     };
     let gossip = Gossip::start(
@@ -283,6 +285,9 @@ pub(crate) async fn lone_with(file: PathBuf, text: &str, env: Arc<dyn Env + Send
             recorder,
             denials: Arc::new(crate::RateLimit::denials()),
             events: Arc::clone(&events),
+            peers: crate::Peers::new("node-a", None).unwrap(),
+            process: tokio::sync::watch::channel(Default::default()).1,
+            gossip: gossip.figures(),
         },
         events,
         leases,

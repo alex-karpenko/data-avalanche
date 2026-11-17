@@ -16,6 +16,8 @@ Every node serves the API on `globals.api.address`. `globals.api.auth` decides w
 
 **Who did it.** Every route that changes something takes an optional JSON body `{"note": "…"}` and records the action in the cluster's events: what, to what, the caller's name and role as the node verified them, the note, and how it ended (`accepted`, `unchanged`, `refused`). A caller turned away for its role, or with no role mapped, is recorded too (`action.denied`). A note longer than 500 characters, not a string or holding a control character, or a body that isn't a JSON object, is `422`; a body over 1 MiB is `413`; either way nothing is done or recorded.
 
+**Hashes.** A hash the API shows of a config text (a generation's `hash`, a node's `file_hash`, `file.hash` and `file.generation_hash`) is the text's fingerprint keyed with the cluster's fingerprint key, never its plain hash, the gossiped ones its first 16 hex: comparable across the nodes of one cluster only, and no help to someone guessing a secret of a masked text.
+
 **Outside `/v1`**, with no credentials: `GET /health/live` (the process answers), `GET /health/ready` (`200` once the node runs its config, `503` before and while it stops) and `GET /metrics` (Prometheus text).
 
 ## pipelines
@@ -190,6 +192,67 @@ Least role: `viewer`.
 
 The config generation the cluster runs: validate, publish, status.
 
+### `GET /v1/config/diff`
+
+What differs between two config generations as written: each change's path, what a reload of it does, before and after, secrets and a URL's credentials masked
+
+Least role: `viewer`.
+
+- Query parameter `from`: the generation compared from.
+- Query parameter `to`: the generation compared to.
+
+| Status | When |
+|---|---|
+| `200` | the pipelines added and removed, and the changes |
+| `400` | from or to missing, or not a number |
+| `404` | no such generation |
+| `409` | several snapshots of one and no record of which it is |
+| `500` | a text couldn't be compared |
+| `503` | the node is starting or stopping, or its state can't be read; or the config generations can't be read |
+
+### `GET /v1/config/generations`
+
+The config generations, newest first: who published each, why, and what it changed
+
+Least role: `viewer`.
+
+- Query parameter `before`: generations older than this one: the `next` of the page before.
+- Query parameter `limit`: at most this many (1–100, 20 by default).
+
+| Status | When |
+|---|---|
+| `200` | the generations, each `hash` its text's keyed fingerprint (comparable across nodes of one cluster only), and `next` when the page is full |
+| `400` | a parameter that isn't one, or isn't in its form |
+| `503` | the node is starting or stopping, or its state can't be read; or the config generations can't be read |
+
+### `GET /v1/config/generations/{generation}`
+
+One config generation and its text, its secrets masked and its comments shown empty
+
+Least role: `viewer`.
+
+- Path parameter `generation`: a config generation's number.
+
+| Status | When |
+|---|---|
+| `200` | the generation and its text, a URL's credentials masked (`••••••@`) and every comment shown empty (`#`); `hash` is the text's keyed fingerprint, comparable across nodes of one cluster only |
+| `400` | a generation that isn't a number |
+| `404` | no such generation |
+| `409` | several snapshots of it and no record of which one it is |
+| `500` | its text couldn't be masked, so it isn't shown: it has a merge key (`<<`), a tag (a `!` after a space), a directive or a byte-order mark, or a secret or a comment the masker can't place |
+| `503` | the node is starting or stopping, or its state can't be read; or the config generations can't be read |
+
+### `GET /v1/config/nodes`
+
+Each member's config generation, whether its own file is the cluster's generation, and its fields waiting for a restart
+
+Least role: `viewer`.
+
+
+| Status | When |
+|---|---|
+| `200` | the generation the cluster runs, its `hash` (its text's keyed fingerprint, comparable across nodes of one cluster only), and each member: `file` compares the keyed fingerprints of the member's file and of that text |
+
 ### `POST /v1/config/reload`
 
 Publish the node's file as the next config generation; `?restart=accept` publishes a restart-only field, applied at each node's next start
@@ -262,7 +325,7 @@ Least role: `viewer`.
 
 | Status | When |
 |---|---|
-| `200` | the members and the holders |
+| `200` | the members and the holders; a member's `file_hash` is its file's keyed fingerprint (first 16 hex), comparable across nodes of one cluster only |
 
 ## admin
 
@@ -283,6 +346,131 @@ Least role: `admin`.
 | `409` | shutting down already |
 | `413` | the body is over 1 MiB |
 | `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
+
+## nodes
+
+Any member, through any node: its detail, and the actions only it takes, sent to it with the caller's own credentials. A node that doesn't answer is named (`502`, `504`).
+
+### `GET /v1/nodes/{node}`
+
+A node's detail: its build and start, its file against its generation, its process and gossip figures, the leases it holds; another node's is fetched from it
+
+Least role: `viewer`.
+
+- Path parameter `node`: a member's name, as the gossip knows it.
+
+| Status | When |
+|---|---|
+| `200` | the node's detail; `file.hash` and `file.generation_hash` are keyed fingerprints (first 16 hex), comparable across nodes of one cluster only |
+| `404` | no member of that name in this node's view |
+| `421` | a request forwarded to a node that isn't its target |
+| `502` | the node didn't answer |
+| `503` | the node is starting or stopping, or its state can't be read; or the member gossips no API address |
+| `504` | the node didn't answer within the time limit |
+
+### `POST /v1/nodes/{node}/config/reload`
+
+Publish a node's own file as the next generation, through any node: its own `POST /v1/config/reload`, with the query
+
+Least role: `operator`.
+
+- Path parameter `node`: a member's name, as the gossip knows it.
+- Body: `application/json`.
+- `note`: why, kept with the action's event (optional, at most 500 characters).
+
+| Status | When |
+|---|---|
+| `200` | the file is the generation the cluster runs |
+| `202` | published |
+| `404` | no member of that name in this node's view |
+| `409` | other nodes published first, every time |
+| `413` | the body is over 1 MiB |
+| `421` | a request forwarded to a node that isn't its target |
+| `422` | invalid, or a restart-only field without restart=accept; or the note is too long, not a string, holds a control character, or the body isn't a JSON object |
+| `502` | the node didn't answer |
+| `503` | the node is starting or stopping, or its state can't be read; or the member gossips no API address |
+| `504` | the node didn't answer within the time limit |
+
+### `GET /v1/nodes/{node}/config/status`
+
+A node's generation and its own restart-pending fields: its own `GET /v1/config/status`
+
+Least role: `viewer`.
+
+- Path parameter `node`: a member's name, as the gossip knows it.
+
+| Status | When |
+|---|---|
+| `200` | the node's config status |
+| `404` | no member of that name in this node's view |
+| `421` | a request forwarded to a node that isn't its target |
+| `502` | the node didn't answer |
+| `503` | the node is starting or stopping, or its state can't be read; or the member gossips no API address |
+| `504` | the node didn't answer within the time limit |
+
+### `POST /v1/nodes/{node}/config/validate`
+
+Check a node's own file (an empty body), or the body, on that node: its own `POST /v1/config/validate`
+
+Least role: `operator`.
+
+- Path parameter `node`: a member's name, as the gossip knows it.
+- Body: `application/yaml`.
+
+| Status | When |
+|---|---|
+| `200` | it loads: its warnings and the changes |
+| `404` | no member of that name in this node's view |
+| `421` | a request forwarded to a node that isn't its target |
+| `422` | invalid, or it changes a restart-only field: the report |
+| `429` | posted bodies past the node's rate |
+| `502` | the node didn't answer |
+| `503` | the node is starting or stopping, or its state can't be read; or the member gossips no API address |
+| `504` | the node didn't answer within the time limit |
+
+### `POST /v1/nodes/{node}/leave`
+
+Ask a node to leave the cluster, through any node: its own `POST /v1/cluster/leave`
+
+Least role: `admin`.
+
+- Path parameter `node`: a member's name, as the gossip knows it.
+- Body: `application/json`.
+- `note`: why, kept with the action's event (optional, at most 500 characters).
+
+| Status | When |
+|---|---|
+| `202` | the leave is under way |
+| `404` | no member of that name in this node's view |
+| `409` | leaving already |
+| `413` | the body is over 1 MiB |
+| `421` | a request forwarded to a node that isn't its target |
+| `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
+| `502` | the node didn't answer |
+| `503` | the node is starting or stopping, or its state can't be read; or the member gossips no API address |
+| `504` | the node didn't answer within the time limit |
+
+### `POST /v1/nodes/{node}/shutdown`
+
+Ask a node to shut down, through any node: its own `POST /v1/admin/shutdown`
+
+Least role: `admin`.
+
+- Path parameter `node`: a member's name, as the gossip knows it.
+- Body: `application/json`.
+- `note`: why, kept with the action's event (optional, at most 500 characters).
+
+| Status | When |
+|---|---|
+| `202` | the shutdown is under way |
+| `404` | no member of that name in this node's view |
+| `409` | shutting down already |
+| `413` | the body is over 1 MiB |
+| `421` | a request forwarded to a node that isn't its target |
+| `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
+| `502` | the node didn't answer |
+| `503` | the node is starting or stopping, or its state can't be read; or the member gossips no API address |
+| `504` | the node didn't answer within the time limit |
 
 ## events
 

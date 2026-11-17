@@ -11,8 +11,12 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+mod process;
 mod traces;
 
+pub use process::{
+    PROCESS_SAMPLE, ProcessFigures, Reading, read_process, read_process_at, sample_process,
+};
 pub use traces::{Traces, TracesError, shown, trace_ids};
 
 use prometheus_client::encoding::text::encode;
@@ -72,6 +76,24 @@ impl LeaseState {
             Self::Held => "held",
             Self::Degraded => "degraded",
             Self::Lost => "lost",
+        }
+    }
+}
+
+/// `data_avalanche_gossip_suspicions_total{direction}` (D-M13b.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Suspicion {
+    /// This node's probe of a member failed: it suspects the member.
+    Raised,
+    /// Another member suspected this node: it refuted, or, declared down first, it rejoined.
+    Received,
+}
+
+impl Suspicion {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Raised => "raised",
+            Self::Received => "received",
         }
     }
 }
@@ -213,6 +235,14 @@ struct Families {
     ring_generation: Gauge,
     events_written: Counter,
     events_dropped: Counter,
+    gossip_probe_rtt: Histogram,
+    gossip_suspicions: Family<Labels, Counter>,
+    process_resident_memory: Family<Labels, Gauge>,
+    process_cpu_seconds: Family<Labels, Counter<f64, AtomicU64>>,
+    /// The CPU seconds counted so far: a reading adds what is new.
+    process_cpu_counted: Mutex<f64>,
+    process_memory_limit: Family<Labels, Gauge>,
+    process_cpu_limit: Family<Labels, Seconds>,
     wal_lag_bytes: Family<Labels, Gauge>,
     source_reconnects: Family<Labels, Counter>,
     snapshot_rows_done: Family<Labels, Gauge>,
@@ -233,6 +263,11 @@ struct Families {
     sink_commit_duration: HistogramFamily,
     sink_commit_failures: Family<Labels, Counter>,
     sink_soft_dropped_columns: Family<Labels, Gauge>,
+}
+
+fn probe_rtt() -> Histogram {
+    // 0.5 ms … ~1 s.
+    Histogram::new(exponential_buckets(0.0005, 2.0, 12))
 }
 
 fn renew_latency() -> Histogram {
@@ -276,6 +311,13 @@ impl Metrics {
             ring_generation: Gauge::default(),
             events_written: Counter::default(),
             events_dropped: Counter::default(),
+            gossip_probe_rtt: probe_rtt(),
+            gossip_suspicions: Family::default(),
+            process_resident_memory: Family::default(),
+            process_cpu_seconds: Family::default(),
+            process_cpu_counted: Mutex::new(0.0),
+            process_memory_limit: Family::default(),
+            process_cpu_limit: Family::default(),
             wal_lag_bytes: Family::default(),
             source_reconnects: Family::default(),
             snapshot_rows_done: Family::default(),
@@ -298,7 +340,30 @@ impl Metrics {
             sink_soft_dropped_columns: Family::default(),
         };
         let f = &families;
-        let mut r = Registry::with_prefix("data_avalanche");
+        // The process figures carry the names every Prometheus client gives them; the rest are
+        // the node's own, under the prefix.
+        let mut root = Registry::default();
+        root.register(
+            "process_resident_memory_bytes",
+            "Resident memory of the process",
+            f.process_resident_memory.clone(),
+        );
+        root.register(
+            "process_cpu_seconds",
+            "User and system CPU time the process used",
+            f.process_cpu_seconds.clone(),
+        );
+        let r = root.sub_registry_with_prefix("data_avalanche");
+        r.register(
+            "process_memory_limit_bytes",
+            "The container's memory limit, when it has one",
+            f.process_memory_limit.clone(),
+        );
+        r.register(
+            "process_cpu_limit_cores",
+            "The container's CPU limit in cores, when it has one",
+            f.process_cpu_limit.clone(),
+        );
         r.register(
             "pipeline_status",
             "The pipeline's state: 1 on its current status",
@@ -338,6 +403,16 @@ impl Metrics {
             "events_dropped",
             "Events this node couldn't write: its queue was full, or the store kept failing",
             f.events_dropped.clone(),
+        );
+        r.register(
+            "gossip_probe_rtt_seconds",
+            "A gossip probe's round trip, from its ping to its ack",
+            f.gossip_probe_rtt.clone(),
+        );
+        r.register(
+            "gossip_suspicions",
+            "Suspicions this node raised of a member, or received of itself (refuted, or rejoined once declared down)",
+            f.gossip_suspicions.clone(),
         );
         r.register(
             "config_generation",
@@ -446,7 +521,7 @@ impl Metrics {
             f.sink_soft_dropped_columns.clone(),
         );
         Self {
-            registry: Arc::new(r),
+            registry: Arc::new(root),
             families: Arc::new(families),
         }
     }
@@ -479,6 +554,56 @@ impl Metrics {
     /// An event not written: its queue was full, or the store kept failing.
     pub fn event_dropped(&self) {
         self.families.events_dropped.inc();
+    }
+
+    /// A reading of the process figures (D-M13b.7). A limit the container doesn't have is no
+    /// series at all.
+    pub fn process(&self, r: &Reading) {
+        let f = &self.families;
+        if let Some(bytes) = r.memory_bytes {
+            f.process_resident_memory
+                .get_or_create(&vec![])
+                .set(gauge(bytes));
+        }
+        if let Some(seconds) = r.cpu_seconds {
+            let mut counted = f
+                .process_cpu_counted
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if seconds > *counted {
+                f.process_cpu_seconds
+                    .get_or_create(&vec![])
+                    .inc_by(seconds - *counted);
+                *counted = seconds;
+            }
+        }
+        match r.memory_limit_bytes {
+            Some(bytes) => {
+                f.process_memory_limit
+                    .get_or_create(&vec![])
+                    .set(gauge(bytes));
+            }
+            None => f.process_memory_limit.clear(),
+        }
+        match r.cpu_limit_cores {
+            Some(cores) => {
+                f.process_cpu_limit.get_or_create(&vec![]).set(cores);
+            }
+            None => f.process_cpu_limit.clear(),
+        }
+    }
+
+    /// A gossip probe's round trip.
+    pub fn gossip_probe_rtt(&self, rtt: Duration) {
+        self.families.gossip_probe_rtt.observe(rtt.as_secs_f64());
+    }
+
+    /// A suspicion, raised by this node or received of it.
+    pub fn gossip_suspicion(&self, direction: Suspicion) {
+        self.families
+            .gossip_suspicions
+            .get_or_create(&vec![("direction", direction.label().to_owned())])
+            .inc();
     }
 
     pub fn set_ring_generation(&self, generation: u64) {

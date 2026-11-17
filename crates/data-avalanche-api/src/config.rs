@@ -6,10 +6,12 @@ use std::time::Instant;
 use axum::extract::{Extension, RawQuery, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::Response;
-use data_avalanche_cluster::{Checked, ReloadError, Reloaded, RestartFields};
+use data_avalanche_cluster::{Attribution, Checked, ReloadError, Reloaded, RestartFields};
 use data_avalanche_config::Fingerprints;
+use data_avalanche_state::Actor;
 use serde_json::json;
 
+use crate::actions::Noted;
 use crate::{Api, Failure, Node, Principal, body, starting};
 
 /// A refused reload or check: 422 with the report, 409 after the retries, 503 when
@@ -111,7 +113,12 @@ pub(crate) async fn validate(
 /// changes a field only a process restart applies. With `?restart=accept` such a field is
 /// published, and each node applies it at its next start (DA-OPS-12); a field the cluster keeps
 /// for good is refused all the same. Both answers name the fields this node has pending.
-pub(crate) async fn reload(State(api): State<Api>, RawQuery(query): RawQuery) -> Response {
+pub(crate) async fn reload(
+    State(api): State<Api>,
+    Extension(by): Extension<Principal>,
+    noted: Option<Extension<Noted>>,
+    RawQuery(query): RawQuery,
+) -> Response {
     let restart = match query.as_deref() {
         None | Some("") => RestartFields::Refuse,
         Some("restart=accept") => RestartFields::Accept,
@@ -129,7 +136,14 @@ pub(crate) async fn reload(State(api): State<Api>, RawQuery(query): RawQuery) ->
         Ok(text) => text,
         Err(failed) => return failed.into(),
     };
-    match node.coordinator.reload(&text, restart).await {
+    let asked = Attribution {
+        by: Some(Actor {
+            name: by.name,
+            role: by.role.to_string(),
+        }),
+        note: noted.and_then(|Extension(Noted(note))| note),
+    };
+    match node.coordinator.reload_as(&text, restart, asked).await {
         Ok(Reloaded {
             generation,
             published: true,

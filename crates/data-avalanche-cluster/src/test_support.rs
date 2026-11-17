@@ -675,6 +675,8 @@ pub(crate) fn members(me: &str, nodes: &[(&str, crate::Phase, bool)]) -> crate::
                     phase: *phase,
                     config_generation: 1,
                     build: "1.0.0".into(),
+                    api_url: String::new(),
+                    file_hash: String::new(),
                 },
                 suspect: *suspect,
             };
@@ -883,6 +885,8 @@ impl TestCluster {
                 phase: crate::Phase::Joining,
                 config_generation: first.pointer.doc.generation,
                 build: "1.0.0".into(),
+                api_url: String::new(),
+                file_hash: String::new(),
             },
         };
         let gossip = crate::Gossip::start(

@@ -27,6 +27,7 @@ pub(crate) const CLASSES: &[(&str, Mutability)] = &[
     ("globals.cloud", Proc),
     ("globals.state", Proc),
     ("globals.api.address", Proc),
+    ("globals.api.advertise_url", Proc),
     ("globals.api.auth", R),
     ("globals.api.credentials", R),
     ("globals.api.jwt", R),

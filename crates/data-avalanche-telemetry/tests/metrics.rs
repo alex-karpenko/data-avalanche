@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use data_avalanche_telemetry::{
-    LeaseState, Metrics, PipelineLabels, PipelineStatus, RenewFailure, RowsRead, SnapshotState,
-    Totals,
+    LeaseState, Metrics, PipelineLabels, PipelineStatus, Reading, RenewFailure, RowsRead,
+    SnapshotState, Suspicion, Totals,
 };
 
 const L: &str = r#"pipeline="orders",source_host="db1",source_db="shop""#;
@@ -369,6 +369,91 @@ fn the_node_reports_its_config_generation() {
         text.lines()
             .any(|l| l == "data_avalanche_config_generation 3"),
         "{text}"
+    );
+}
+
+/// M13b: the process figures under their usual names; a limit only when there is one.
+#[test]
+fn the_process_series_follow_the_readings() {
+    let m = Metrics::new();
+    m.process(&Reading {
+        memory_bytes: Some(1 << 30),
+        memory_limit_bytes: Some(2 << 30),
+        cpu_seconds: Some(12.5),
+        cpu_limit_cores: Some(2.0),
+    });
+    m.process(&Reading {
+        cpu_seconds: Some(14.0),
+        memory_limit_bytes: Some(2 << 30),
+        ..Reading::default()
+    });
+    let text = m.encode();
+    assert_eq!(
+        samples(&text, "process_resident_memory_bytes"),
+        ["process_resident_memory_bytes 1073741824"]
+    );
+    assert_eq!(
+        samples(&text, "process_cpu_seconds_total"),
+        ["process_cpu_seconds_total 14.0"]
+    );
+    assert_eq!(
+        samples(&text, "data_avalanche_process_memory_limit_bytes"),
+        ["data_avalanche_process_memory_limit_bytes 2147483648"]
+    );
+    assert!(
+        samples(&text, "data_avalanche_process_cpu_limit_cores").is_empty(),
+        "no CPU limit in the last reading: {text}"
+    );
+}
+
+/// M13b: no reading, no process series: a host without them scrapes no bogus zero.
+#[test]
+fn no_reading_exposes_no_process_series() {
+    let m = Metrics::new();
+    let text = m.encode();
+    assert!(
+        samples(&text, "process_resident_memory_bytes").is_empty(),
+        "a fresh registry has no memory series: {text}"
+    );
+    assert!(
+        samples(&text, "process_cpu_seconds_total").is_empty(),
+        "a fresh registry has no CPU series: {text}"
+    );
+    m.process(&Reading {
+        memory_bytes: None,
+        cpu_seconds: None,
+        ..Reading::default()
+    });
+    let text = m.encode();
+    assert!(
+        samples(&text, "process_resident_memory_bytes").is_empty(),
+        "a reading without memory is no memory series: {text}"
+    );
+    assert!(
+        samples(&text, "process_cpu_seconds_total").is_empty(),
+        "a reading without CPU is no CPU series: {text}"
+    );
+}
+
+/// M13b: a probe's round trip, and the suspicions each way.
+#[test]
+fn the_gossip_series_count() {
+    let m = Metrics::new();
+    m.gossip_probe_rtt(Duration::from_millis(2));
+    m.gossip_suspicion(Suspicion::Raised);
+    m.gossip_suspicion(Suspicion::Raised);
+    m.gossip_suspicion(Suspicion::Received);
+    let text = m.encode();
+    assert_eq!(
+        samples(&text, "data_avalanche_gossip_probe_rtt_seconds_count"),
+        ["data_avalanche_gossip_probe_rtt_seconds_count 1"]
+    );
+    assert_eq!(
+        samples(&text, "data_avalanche_gossip_suspicions_total"),
+        [
+            "data_avalanche_gossip_suspicions_total{direction=\"raised\"} 2",
+            "data_avalanche_gossip_suspicions_total{direction=\"received\"} 1"
+        ]
     );
 }
 

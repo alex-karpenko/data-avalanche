@@ -150,7 +150,290 @@
         "summary": "The members this node sees, and each pipeline's lease holder",
         "responses": {
           "200": {
-            "description": "the members and the holders",
+            "description": "the members and the holders; a member's `file_hash` is its file's keyed fingerprint (first 16 hex), comparable across nodes of one cluster only",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "viewer"
+      }
+    },
+    "/v1/config/diff": {
+      "get": {
+        "tags": [
+          "config"
+        ],
+        "summary": "What differs between two config generations as written: each change's path, what a reload of it does, before and after, secrets and a URL's credentials masked",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "description": "the generation compared from",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "the generation compared to",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the pipelines added and removed, and the changes",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "400": {
+            "description": "from or to missing, or not a number",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "404": {
+            "description": "no such generation",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "409": {
+            "description": "several snapshots of one and no record of which it is",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "500": {
+            "description": "a text couldn't be compared",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read; or the config generations can't be read",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "viewer"
+      }
+    },
+    "/v1/config/generations": {
+      "get": {
+        "tags": [
+          "config"
+        ],
+        "summary": "The config generations, newest first: who published each, why, and what it changed",
+        "parameters": [
+          {
+            "name": "before",
+            "in": "query",
+            "description": "generations older than this one: the `next` of the page before",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "at most this many (1–100, 20 by default)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 20,
+              "maximum": 100,
+              "minimum": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the generations, each `hash` its text's keyed fingerprint (comparable across nodes of one cluster only), and `next` when the page is full",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "400": {
+            "description": "a parameter that isn't one, or isn't in its form",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read; or the config generations can't be read",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "viewer"
+      }
+    },
+    "/v1/config/generations/{generation}": {
+      "get": {
+        "tags": [
+          "config"
+        ],
+        "summary": "One config generation and its text, its secrets masked and its comments shown empty",
+        "parameters": [
+          {
+            "name": "generation",
+            "in": "path",
+            "description": "a config generation's number",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the generation and its text, a URL's credentials masked (`••••••@`) and every comment shown empty (`#`); `hash` is the text's keyed fingerprint, comparable across nodes of one cluster only",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "400": {
+            "description": "a generation that isn't a number",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "404": {
+            "description": "no such generation",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "409": {
+            "description": "several snapshots of it and no record of which one it is",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "500": {
+            "description": "its text couldn't be masked, so it isn't shown: it has a merge key (`<<`), a tag (a `!` after a space), a directive or a byte-order mark, or a secret or a comment the masker can't place",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read; or the config generations can't be read",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "viewer"
+      }
+    },
+    "/v1/config/nodes": {
+      "get": {
+        "tags": [
+          "config"
+        ],
+        "summary": "Each member's config generation, whether its own file is the cluster's generation, and its fields waiting for a restart",
+        "responses": {
+          "200": {
+            "description": "the generation the cluster runs, its `hash` (its text's keyed fingerprint, comparable across nodes of one cluster only), and each member: `file` compares the keyed fingerprints of the member's file and of that text",
             "content": {
               "application/json": {}
             }
@@ -502,6 +785,573 @@
           }
         ],
         "x-min-role": "viewer"
+      }
+    },
+    "/v1/nodes/{node}": {
+      "get": {
+        "tags": [
+          "nodes"
+        ],
+        "summary": "A node's detail: its build and start, its file against its generation, its process and gossip figures, the leases it holds; another node's is fetched from it",
+        "parameters": [
+          {
+            "name": "node",
+            "in": "path",
+            "description": "a member's name, as the gossip knows it",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the node's detail; `file.hash` and `file.generation_hash` are keyed fingerprints (first 16 hex), comparable across nodes of one cluster only",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "404": {
+            "description": "no member of that name in this node's view",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "421": {
+            "description": "a request forwarded to a node that isn't its target",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "502": {
+            "description": "the node didn't answer",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read; or the member gossips no API address",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "504": {
+            "description": "the node didn't answer within the time limit",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "viewer"
+      }
+    },
+    "/v1/nodes/{node}/config/reload": {
+      "post": {
+        "tags": [
+          "nodes"
+        ],
+        "summary": "Publish a node's own file as the next generation, through any node: its own `POST /v1/config/reload`, with the query",
+        "parameters": [
+          {
+            "name": "node",
+            "in": "path",
+            "description": "a member's name, as the gossip knows it",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "`note`: why, kept with the action's event (optional, at most 500 characters)",
+          "content": {
+            "application/json": {}
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "description": "the file is the generation the cluster runs",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "202": {
+            "description": "published",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "404": {
+            "description": "no member of that name in this node's view",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "409": {
+            "description": "other nodes published first, every time",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "413": {
+            "description": "the body is over 1 MiB",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "421": {
+            "description": "a request forwarded to a node that isn't its target",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "422": {
+            "description": "invalid, or a restart-only field without restart=accept; or the note is too long, not a string, holds a control character, or the body isn't a JSON object",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "502": {
+            "description": "the node didn't answer",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read; or the member gossips no API address",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "504": {
+            "description": "the node didn't answer within the time limit",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "operator"
+      }
+    },
+    "/v1/nodes/{node}/config/status": {
+      "get": {
+        "tags": [
+          "nodes"
+        ],
+        "summary": "A node's generation and its own restart-pending fields: its own `GET /v1/config/status`",
+        "parameters": [
+          {
+            "name": "node",
+            "in": "path",
+            "description": "a member's name, as the gossip knows it",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the node's config status",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "404": {
+            "description": "no member of that name in this node's view",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "421": {
+            "description": "a request forwarded to a node that isn't its target",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "502": {
+            "description": "the node didn't answer",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read; or the member gossips no API address",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "504": {
+            "description": "the node didn't answer within the time limit",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "viewer"
+      }
+    },
+    "/v1/nodes/{node}/config/validate": {
+      "post": {
+        "tags": [
+          "nodes"
+        ],
+        "summary": "Check a node's own file (an empty body), or the body, on that node: its own `POST /v1/config/validate`",
+        "parameters": [
+          {
+            "name": "node",
+            "in": "path",
+            "description": "a member's name, as the gossip knows it",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/yaml": {}
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "description": "it loads: its warnings and the changes",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "404": {
+            "description": "no member of that name in this node's view",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "421": {
+            "description": "a request forwarded to a node that isn't its target",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "422": {
+            "description": "invalid, or it changes a restart-only field: the report",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "posted bodies past the node's rate",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "502": {
+            "description": "the node didn't answer",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read; or the member gossips no API address",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "504": {
+            "description": "the node didn't answer within the time limit",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "operator"
+      }
+    },
+    "/v1/nodes/{node}/leave": {
+      "post": {
+        "tags": [
+          "nodes"
+        ],
+        "summary": "Ask a node to leave the cluster, through any node: its own `POST /v1/cluster/leave`",
+        "parameters": [
+          {
+            "name": "node",
+            "in": "path",
+            "description": "a member's name, as the gossip knows it",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "`note`: why, kept with the action's event (optional, at most 500 characters)",
+          "content": {
+            "application/json": {}
+          },
+          "required": false
+        },
+        "responses": {
+          "202": {
+            "description": "the leave is under way",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "404": {
+            "description": "no member of that name in this node's view",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "409": {
+            "description": "leaving already",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "413": {
+            "description": "the body is over 1 MiB",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "421": {
+            "description": "a request forwarded to a node that isn't its target",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "422": {
+            "description": "the note is too long, not a string, holds a control character, or the body isn't a JSON object",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "502": {
+            "description": "the node didn't answer",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read; or the member gossips no API address",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "504": {
+            "description": "the node didn't answer within the time limit",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "admin"
+      }
+    },
+    "/v1/nodes/{node}/shutdown": {
+      "post": {
+        "tags": [
+          "nodes"
+        ],
+        "summary": "Ask a node to shut down, through any node: its own `POST /v1/admin/shutdown`",
+        "parameters": [
+          {
+            "name": "node",
+            "in": "path",
+            "description": "a member's name, as the gossip knows it",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "`note`: why, kept with the action's event (optional, at most 500 characters)",
+          "content": {
+            "application/json": {}
+          },
+          "required": false
+        },
+        "responses": {
+          "202": {
+            "description": "the shutdown is under way",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "404": {
+            "description": "no member of that name in this node's view",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "409": {
+            "description": "shutting down already",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "413": {
+            "description": "the body is over 1 MiB",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "421": {
+            "description": "a request forwarded to a node that isn't its target",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "422": {
+            "description": "the note is too long, not a string, holds a control character, or the body isn't a JSON object",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "502": {
+            "description": "the node didn't answer",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read; or the member gossips no API address",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "504": {
+            "description": "the node didn't answer within the time limit",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "admin"
       }
     },
     "/v1/openapi.json": {

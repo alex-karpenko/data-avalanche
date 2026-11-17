@@ -143,3 +143,4 @@ A config with any **error** is rejected whole: at startup the node refuses to st
 | <span id="v-135"></span>V-135 | error | `globals.console.enabled = true with api.auth ∈ {basic, oauth2}` | Requires globals.console.session_key. |
 | <span id="v-136"></span>V-136 | error | `globals.console.enabled = true with api.auth = oauth2` | Requires globals.console.public_url and globals.api.oauth2.client_id. |
 | <span id="v-137"></span>V-137 | error | `globals.console.prometheus` | Requires url; basic requires user and password. |
+| <span id="v-138"></span>V-138 | error | `globals.api.advertise_url` | An absolute http/https URL with a host, without a path, query or fragment, at most 255 characters. |

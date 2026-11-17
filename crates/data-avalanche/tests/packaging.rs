@@ -102,6 +102,10 @@ fn pod_env() -> BTreeMap<String, String> {
             "DATA_AVALANCHE_DISCOVERY_DNS_NAME",
             "data-avalanche-headless.cdc.svc.cluster.local".to_owned(),
         ),
+        (
+            "DATA_AVALANCHE_POD_DNS_NAME",
+            "data-avalanche-0.data-avalanche-headless.cdc.svc.cluster.local".to_owned(),
+        ),
         ("ORDERS_DB_PASSWORD", "secret".to_owned()),
         ("API_TLS_CERT", tls.cert.pem()),
         ("API_TLS_KEY", tls.signing_key.serialize_pem()),
@@ -129,6 +133,7 @@ fn the_chart_sets_the_environment_its_values_document() {
         "POD_NAMESPACE",
         "POD_IP",
         "DATA_AVALANCHE_DISCOVERY_DNS_NAME",
+        "DATA_AVALANCHE_POD_DNS_NAME",
     ] {
         assert!(statefulset.contains(&format!("- name: {name}\n")), "{name}");
         assert!(values.contains(name), "values.yaml doesn't document {name}");

@@ -447,6 +447,7 @@ fn api(a: &RawApi, at: &At, ctx: &mut Ctx) -> Option<Api> {
             port: 8080,
         },
     );
+    let advertise_url = opt(ctx, &a.advertise_url, at, "advertise_url");
     let auth = or(ctx, &a.auth, at, "auth", ApiAuth::None);
     // §11 Phase 2 (G4): `credentials_file` is only in effect for `auth = basic` — the file itself is
     // read only then — but every present leaf still gets `${VAR}` substituted either way (V-063).
@@ -540,6 +541,10 @@ fn api(a: &RawApi, at: &At, ctx: &mut Ctx) -> Option<Api> {
     };
     Some(Api {
         address: address?,
+        advertise_url: advertise_url?.map(|u| {
+            let u = u.trim();
+            u.strip_suffix('/').unwrap_or(u).to_owned()
+        }),
         auth,
         credentials,
         jwt,

@@ -52,6 +52,7 @@ pub(crate) struct RawGlobalState {
 #[serde(deny_unknown_fields)]
 pub(crate) struct RawApi {
     pub address: L<HostPort>,
+    pub advertise_url: L<String>,
     pub auth: L<ApiAuth>,
     pub user: L<String>,
     pub password: L<String>,

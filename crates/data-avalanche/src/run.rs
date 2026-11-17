@@ -1,25 +1,28 @@
 //! `data-avalanche run`.
 
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
-use data_avalanche_api::{Api, Auth, Control, Node, RateLimit, ServeError, Stop, bind, router};
+use data_avalanche_api::{
+    Api, Auth, Control, Node, Peers, RateLimit, ServeError, Stop, bind, router,
+};
 use data_avalanche_cluster::{
     ClusterReconciler, ConfigCoordinator, ControllerDeps, ControllerSettings, CoordinatorDeps,
     DocsFn, Gossip, GossipKey, GossipSettings, LeaseTiming, NodeIdentity, NodeMeta, Phase,
-    ReconcilerSettings, Recorder, Seeds, Udp, advertise, discover, expire_events, interfaces,
-    join as join_gossip, leave, node_identity, record_members, removed_pipelines,
+    ReconcilerSettings, Recorder, Seeds, Udp, advertise, api_url, discover, expire_events,
+    file_hash, interfaces, join as join_gossip, leave, node_identity, record_members,
+    removed_pipelines, watch_file,
 };
 use data_avalanche_config::{
     Diagnostic, FingerprintKey, ProcessEnv, Report, ResolvedConfig, Severity, load_str,
 };
 use data_avalanche_pipeline::{Backoff, Tuning};
 use data_avalanche_state::{ConfigGenerations, Events, Leases, Removals};
-use data_avalanche_telemetry::Metrics;
+use data_avalanche_telemetry::{Metrics, ProcessFigures, sample_process};
 use thiserror::Error;
 use tokio::sync::{Semaphore, oneshot, watch};
 
@@ -88,6 +91,23 @@ pub(crate) fn leave_within(config: &ResolvedConfig) -> Duration {
     c.drain_timeout.saturating_mul(rounds) + 2 * c.lease_renewal_interval
 }
 
+/// Where this node's API is, as the others reach it (D-M13b.2), and the client it asks theirs
+/// with (D-M13b.4): both from its file's `globals.api`, which its listener binds, never the
+/// generation's. `address`, `advertise_url` and `tls` are per node (config §6.5.1): a generation
+/// published from another node's file names that node's.
+///
+/// # Errors
+/// [`Fatal::Config`]: the file's API certificate can't be a peer's trust.
+pub(crate) fn own_api(
+    file: &ResolvedConfig,
+    node_id: &str,
+    gossip: IpAddr,
+) -> Result<(String, Peers), Fatal> {
+    let api = &file.globals.api;
+    let peers = Peers::new(node_id, api.tls.as_ref()).map_err(|e| Fatal::Config(e.to_string()))?;
+    Ok((api_url(api, gossip), peers))
+}
+
 /// How long a clean stop waits for the events still queued to be written (a crash loses them).
 pub(crate) const EVENTS_FLUSH: Duration = Duration::from_secs(5);
 
@@ -117,6 +137,9 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     }
     // The listener answers from here: live at once, ready once every controller runs.
     let metrics = Metrics::new();
+    // The process's memory and CPU every 15 s, for /metrics and the node's page (D-M13b.7).
+    let (sampled, process) = watch::channel(ProcessFigures::default());
+    let _sampler = tokio::spawn(sample_process(metrics.clone(), sampled));
     let ready = Arc::new(AtomicBool::new(false));
     let node = Arc::new(OnceLock::new());
     let api = &first.config.globals.api;
@@ -202,6 +225,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         .map_err(|e| Fatal::Config(e.to_string()))?;
     let mut own = udp.local_addrs();
     own.push(addr);
+    let (advertised, peers) = own_api(&first.config, &deps.holder.node_id, addr.ip())?;
     let me = NodeIdentity {
         node_id: deps.holder.node_id.clone(),
         incarnation: deps.holder.incarnation,
@@ -211,11 +235,21 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
             phase: Phase::Joining,
             config_generation: joined.generation.doc.generation,
             build: env!("CARGO_PKG_VERSION").to_owned(),
+            api_url: advertised,
+            file_hash: file_hash(&fingerprints, &text),
         },
     };
     let key = GossipKey::derive(&joined.fingerprint_key);
     let gossip = Gossip::start(me, key, GossipSettings::new(m), Arc::new(udp), inbox);
     tracing::info!(%addr, bound = ?bind, "gossip started");
+    gossip.report_to(metrics.clone());
+    // The file's hash, keyed, gossiped again when the file changes under the node (D-M13b.3).
+    let _file = tokio::spawn(watch_file(
+        args.config.clone(),
+        fingerprints,
+        file_hash(&fingerprints, &text),
+        gossip.advertiser(),
+    ));
     // Joins, suspicions and departures, each recorded by one node (Admin_Console §6).
     let _membership = tokio::spawn(record_members(recorder.clone(), gossip.members()));
     let seeds = Seeds::new(c);
@@ -267,6 +301,10 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         recorder: recorder.clone(),
         denials: Arc::new(RateLimit::denials()),
         events: Arc::clone(&events),
+        // Another node's detail and actions, asked with the caller's own credentials (D-M13b.4).
+        peers,
+        process,
+        gossip: gossip.figures(),
     });
     ready.store(true, Ordering::SeqCst);
     let mut cluster = Some((gossip, reconciler, discovery));
@@ -414,6 +452,20 @@ pipelines:
         )
         .unwrap_or_else(|r| panic!("{}", render(&r)))
         .config
+    }
+
+    /// The API a node gossips is its file's, which its listener binds: a generation published
+    /// from another node's file names that node's address (config §6.5.1).
+    #[test]
+    fn the_api_a_node_gossips_is_its_file_s() {
+        let gossip: IpAddr = "10.0.0.2".parse().unwrap();
+        let mut file = config();
+        file.globals.api.address = "0.0.0.0:8081".parse().unwrap();
+        let (url, _) = own_api(&file, "node-b", gossip).unwrap();
+        assert_eq!(url, "http://10.0.0.2:8081");
+        file.globals.api.advertise_url = Some("https://node-b.cdc.ns.svc:8443".into());
+        let (url, _) = own_api(&file, "node-b", gossip).unwrap();
+        assert_eq!(url, "https://node-b.cdc.ns.svc:8443");
     }
 
     #[test]

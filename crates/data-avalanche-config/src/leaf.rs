@@ -31,6 +31,8 @@ impl fmt::Display for Loc {
 pub(crate) struct Leaf<T> {
     text: String,
     loc: Option<Loc>,
+    /// Where the text itself is written: an alias's anchor, else `loc`.
+    written: Option<Loc>,
     _type: PhantomData<fn() -> T>,
 }
 
@@ -42,6 +44,7 @@ impl<T> Leaf<T> {
         Self {
             text: text.into(),
             loc: None,
+            written: None,
             _type: PhantomData,
         }
     }
@@ -52,6 +55,7 @@ impl<T> Leaf<T> {
         Self {
             text: text.into(),
             loc: Some(loc),
+            written: Some(loc),
             _type: PhantomData,
         }
     }
@@ -63,6 +67,12 @@ impl<T> Leaf<T> {
     pub fn loc(&self) -> Option<Loc> {
         self.loc
     }
+
+    /// Where the text is written in the file: an alias (`*pw`) is located at its anchor's
+    /// value, not at the alias.
+    pub fn written(&self) -> Option<Loc> {
+        self.written
+    }
 }
 
 // Manual impls: derives would demand `T: Clone`/`T: Debug`/`T: PartialEq`, but `T` is only a marker.
@@ -71,6 +81,7 @@ impl<T> Clone for Leaf<T> {
         Self {
             text: self.text.clone(),
             loc: self.loc,
+            written: self.written,
             _type: PhantomData,
         }
     }
@@ -99,14 +110,16 @@ impl<T> PartialEq for Leaf<T> {
 impl<'de, T> Deserialize<'de> for Leaf<T> {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let spanned: Spanned<String> = Spanned::deserialize(d)?;
-        let at = spanned.referenced;
-        let loc = (at.line() > 0).then(|| Loc {
-            line: at.line(),
-            column: at.column(),
-        });
+        let loc_of = |at: serde_saphyr::Location| {
+            (at.line() > 0).then(|| Loc {
+                line: at.line(),
+                column: at.column(),
+            })
+        };
         Ok(Self {
+            loc: loc_of(spanned.referenced),
+            written: loc_of(spanned.defined),
             text: spanned.value,
-            loc,
             _type: PhantomData,
         })
     }

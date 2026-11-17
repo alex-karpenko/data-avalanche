@@ -8,6 +8,7 @@ use data_avalanche_storage::StoreError;
 use serde::{Deserialize, Serialize};
 
 use crate::doc::{CREATE_ATTEMPTS, DocStore, Document, StateError, Versioned};
+use crate::history::GenerationRecord;
 
 pub const GENERATION_KEY: &str = "config/generation.json";
 
@@ -57,6 +58,10 @@ impl ConfigGenerations {
     /// `docs` is rooted at the `globals.state` location.
     pub fn new(docs: DocStore) -> Self {
         Self { docs }
+    }
+
+    pub(crate) fn docs(&self) -> &DocStore {
+        &self.docs
     }
 
     /// The current generation and its text, or `None` before the first bootstrap.
@@ -123,6 +128,18 @@ impl ConfigGenerations {
             attempted = Some(doc.clone());
             match self.docs.create(GENERATION_KEY, &doc).await {
                 Ok(version) => {
+                    let record = GenerationRecord {
+                        generation: 1,
+                        hash: doc.hash.clone(),
+                        node: node_id.to_owned(),
+                        at: now,
+                        by: None,
+                        note: None,
+                        summary: Some("bootstrap".to_owned()),
+                    };
+                    if let Err(e) = self.record(&record).await {
+                        tracing::warn!("config generation 1's record: {e}");
+                    }
                     let pointer = Versioned { doc, version };
                     return Ok((
                         ConfigGeneration {

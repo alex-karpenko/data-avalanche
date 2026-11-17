@@ -86,7 +86,7 @@ impl ConfigDiff {
 }
 
 /// `path` (dotted) is one of [`FIXED_FIELDS`], or inside one.
-fn is_fixed(path: &str) -> bool {
+pub(crate) fn is_fixed(path: &str) -> bool {
     FIXED_FIELDS.iter().any(|fixed| {
         path.strip_prefix(fixed)
             .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))

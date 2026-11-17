@@ -403,11 +403,6 @@ pub(crate) fn member_changes(before: &Members, after: &Members) -> Vec<(String, 
 /// first by name of the active, unsuspected members other than `subject`. Views converge, so
 /// one node records it; a view that hasn't may record it twice or not at all.
 pub(crate) fn records(before: &Members, after: &Members, subject: &str) -> bool {
-    let active = |m: &Members| {
-        m.nodes
-            .get(&m.me)
-            .is_some_and(|n| n.meta.phase == NodePhase::Active)
-    };
     active(before)
         && active(after)
         && after
@@ -417,23 +412,42 @@ pub(crate) fn records(before: &Members, after: &Members, subject: &str) -> bool 
             .is_some_and(|(name, _)| *name == after.me)
 }
 
+/// How long a node is `Active` before it records membership changes (D-M13b.14).
+pub const MEMBERS_SETTLE: Duration = Duration::from_secs(10);
+
 /// Records the members' changes this node is the one to record, until the gossip stops. A node
-/// turns `Active` once it sees one peer, before its view has converged: when the rest of a
-/// long-running cluster arrives in its later views, it can record `member.joined` for members
-/// that were up long before it.
+/// turns `Active` once it sees one peer, before its view has converged, so it records nothing
+/// until it has been `Active` for [`MEMBERS_SETTLE`]: the rest of a long-running cluster
+/// arriving in its later views is its baseline, not a run of joins.
 pub async fn record_members(recorder: Recorder, mut members: watch::Receiver<Members>) {
     let mut before = members.borrow_and_update().clone();
+    let mut active_since = active(&before).then(tokio::time::Instant::now);
     while members.changed().await.is_ok() {
         let after = members.borrow_and_update().clone();
-        for (subject, c) in member_changes(&before, &after) {
-            if records(&before, &after, &subject) {
-                let mut e = recorder.event(c.kind, c.severity, c.text);
-                e.object = c.object;
-                recorder.record(e);
+        let now = tokio::time::Instant::now();
+        active_since = if active(&after) {
+            Some(active_since.unwrap_or(now))
+        } else {
+            None
+        };
+        if active_since.is_some_and(|since| now.duration_since(since) >= MEMBERS_SETTLE) {
+            for (subject, c) in member_changes(&before, &after) {
+                if records(&before, &after, &subject) {
+                    let mut e = recorder.event(c.kind, c.severity, c.text);
+                    e.object = c.object;
+                    recorder.record(e);
+                }
             }
         }
         before = after;
     }
+}
+
+/// This node is `Active` in its own view.
+fn active(m: &Members) -> bool {
+    m.nodes
+        .get(&m.me)
+        .is_some_and(|n| n.meta.phase == NodePhase::Active)
 }
 
 #[cfg(test)]
@@ -706,6 +720,8 @@ mod tests {
                                 phase: *phase,
                                 config_generation: 1,
                                 build: "1.1.0".into(),
+                                api_url: String::new(),
+                                file_hash: String::new(),
                             },
                             suspect: *suspect,
                         },
@@ -801,6 +817,44 @@ mod tests {
         let at = Utc::now() - chrono::Duration::days(days);
         let event = EventDoc::new(at, "node-a", "member.joined", EventSeverity::Info, text);
         events.record(&event).await.unwrap();
+    }
+
+    /// F4: a node that turned active on its first peer sees the rest of a long-running cluster
+    /// arrive; none of them is a join. A member that joins once it has settled is.
+    #[tokio::test(start_paused = true)]
+    async fn a_new_node_records_nothing_until_its_view_settles() {
+        use NodePhase::{Active, Joining};
+        let events = store(0);
+        let (r, _task) = Recorder::start(Arc::clone(&events), "node-a", Metrics::new());
+        let (view, rx) = watch::channel(members("a", &[("a", 1, false, Joining)]));
+        let _recording = tokio::spawn(record_members(r.clone(), rx));
+        tokio::task::yield_now().await;
+        view.send_replace(members(
+            "a",
+            &[("a", 1, false, Active), ("c", 1, false, Active)],
+        ));
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        view.send_replace(members(
+            "a",
+            &[
+                ("a", 1, false, Active),
+                ("b", 1, false, Active),
+                ("c", 1, false, Active),
+            ],
+        ));
+        tokio::time::sleep(MEMBERS_SETTLE).await;
+        view.send_replace(members(
+            "a",
+            &[
+                ("a", 1, false, Active),
+                ("b", 1, false, Active),
+                ("c", 1, false, Active),
+                ("d", 1, false, Joining),
+            ],
+        ));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(r.flush(Duration::from_secs(1)).await);
+        assert_eq!(stored(&events).await, ["d joined (1.1.0)"]);
     }
 
     /// The texts of every stored event, newest first.

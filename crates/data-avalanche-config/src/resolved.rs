@@ -92,6 +92,9 @@ pub struct TlsIdentity {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Api {
     pub address: HostPort,
+    /// Where the other nodes reach this node's API; `None` = derived from the gossip's
+    /// advertised address, `address`'s port and `tls`.
+    pub advertise_url: Option<String>,
     pub auth: ApiAuth,
     /// Set when `auth = basic`.
     pub credentials: Option<Credentials>,

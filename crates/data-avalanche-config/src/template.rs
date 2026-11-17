@@ -104,7 +104,7 @@ pub(crate) fn expand(text: &str, env: Option<&dyn Env>) -> Result<Expanded, Temp
     })
 }
 
-fn is_var_name(name: &str) -> bool {
+pub(crate) fn is_var_name(name: &str) -> bool {
     let mut chars = name.chars();
     chars
         .next()

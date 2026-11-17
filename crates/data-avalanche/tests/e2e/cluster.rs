@@ -372,10 +372,14 @@ async fn any_nodes_api_drives_the_holder() {
         .iter()
         .find(|p| p["id"] == json!(id))
         .cloned();
-    // A live holder isn't stale (DA-API-13).
+    // A live holder isn't stale (DA-API-13); in a settled cluster it is the ring's owner, and the
+    // lease's expiry is a time.
+    let mut row = row.expect("the pipeline's row");
+    assert!(row["expires_at"].is_string(), "{row}");
+    row.as_object_mut().unwrap().remove("expires_at");
     assert_eq!(
         row,
-        Some(json!({ "id": id, "holder": holder, "owner_epoch": epoch, "holder_stale": false }))
+        json!({ "id": id, "holder": holder, "owner_epoch": epoch, "holder_stale": false, "ring_owner": holder })
     );
     c.landed().await;
     c.stop().await;
