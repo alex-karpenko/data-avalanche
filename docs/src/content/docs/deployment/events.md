@@ -41,7 +41,7 @@ its pipeline only when it names one the cluster runs.
 
 | Kind | Severity | When |
 |---|---|---|
-| `action.<object>.<verb>` | info, warning when refused | an API action: `pipeline.pause`, `.stop`, `.resume`, `.restart`, `.flush`, `snapshot.start`, `config.reload`, `node.leave`, `node.shutdown` |
+| `action.<object>.<verb>` | info, warning when refused | an API action: `pipeline.pause`, `.stop`, `.resume`, `.restart`, `.flush`, `snapshot.start`, `snapshot.cancel`, `snapshot.retry`, `config.reload`, `node.leave`, `node.shutdown` |
 | `action.denied` | warning | a call refused for the caller's role |
 | `lease.acquired`, `lease.takeover`, `lease.released`, `lease.lost` | info, warning, info, error | a pipeline starts on a node; is taken over from a node that stopped renewing (a failover); is handed off; is lost |
 | `pipeline.error`, `pipeline.retrying`, `pipeline.running` | error, warning, info | a pipeline goes into `ERROR`; fails and is retried; runs again after either, or after a pause or a stop |
@@ -50,7 +50,7 @@ its pipeline only when it names one the cluster runs.
 | `pipeline.removed` | info, warning | a pipeline gone from the config is drained and its source's slot and publication torn down; a warning when that waits for its lease to expire |
 | `table.halted`, `table.resumed` | error, info | a table halts, with its reason; runs again after a snapshot job brought it back |
 | `schema.applied`, `schema.degraded` | info, warning | a source schema change is evolved into the sink, fully or in part (a change the sink refuses halts the table) |
-| `job.completed`, `job.failed` | info, error | a snapshot job ends |
+| `job.completed`, `job.failed`, `job.cancelled` | info, error, warning | a snapshot job ends; a cancelled one names who cancelled it and how many of its tables were copied |
 | `member.joined`, `member.restarted`, `member.draining`, `member.left` | info | a node joins, restarts, starts handing its pipelines off, leaves |
 | `member.suspect`, `member.alive`, `member.down` | warning, info, warning | a node stops answering probes, answers again, is declared failed |
 | `config.published` | info | a config generation is published |

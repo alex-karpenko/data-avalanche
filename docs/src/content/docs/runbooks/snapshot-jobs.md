@@ -1,6 +1,6 @@
 ---
 title: Snapshot jobs
-description: Copying tables on demand through the API, following a job, and what a job does and doesn't do.
+description: Copying tables on demand through the API, following, cancelling and retrying a job, and what a job does and doesn't do.
 sidebar:
   order: 6
 ---
@@ -43,14 +43,78 @@ move the Delta table, then ask the job again.
 ## Follow it
 
 ```sh
-curl -s https://cdc.example.internal/v1/snapshots/shop~0192f0c4-7b9e-7c3a-9d5e-2f0a1b3c4d5e
+curl -s https://cdc.example.internal/v1/snapshots/shop~0192f0c47b9e7c3a9d5e2f0a1b3c4d5e
 curl -s https://cdc.example.internal/v1/pipelines/shop/snapshots
+curl -s 'https://cdc.example.internal/v1/snapshots?status=running,queued'
 ```
 
 A job's status, and each of its tables', is kept in the pipeline's state: it survives restarts and
 failover, and a job interrupted by a crash goes on from its last chunk. A pipeline keeps its 100
 newest ended jobs (completed, failed or cancelled); older ones are deleted as each job ends. A
 job document the node can't read is left out of the list, with a warning in the log.
+
+`GET /v1/snapshots` lists every pipeline's jobs, newest first, filtered by `status` (`queued`,
+`running`, `cancelling`, `completed`, `failed`, `cancelled`; several, comma-separated), `pipeline`
+and `by` (who asked). A pipeline whose jobs can't be read is named under `unreadable`.
+
+For each table a job shows its rows copied, the source's estimate of its rows when the copy began
+(PostgreSQL's `pg_class.reltuples`, which is `-1`, so absent, until the table was analyzed;
+MySQL's `information_schema.TABLES.TABLE_ROWS`, approximate on InnoDB), when the copy began and
+ended, the halt the job cleared for it (`from_halt`), and what lake readers see of it:
+
+| `lake` | Lake readers see |
+|---|---|
+| `complete` | the table, copied |
+| `as_before` | the rows it held before the job: the copy writes over them, or hasn't begun |
+| `empty` | nothing: a truncating job emptied it, and its copy hasn't written a row yet |
+| `partial` | part of the rows: a truncating job emptied it, and its copy didn't complete |
+
+After a minute, a running job shows its `rate` (rows a second since its first table began) and
+`eta_seconds`, from the rows its unended tables' estimates leave: an estimate moves, and so does
+the ETA. Without an estimate for each of them, there's no ETA.
+
+## Cancel a job
+
+```sh
+curl -s -X POST https://cdc.example.internal/v1/snapshots/shop~0192f0c47b9e7c3a9d5e2f0a1b3c4d5e/cancel \
+  -H 'content-type: application/json' -d '{"note": "the wrong table"}'
+```
+
+- `202`: the job reads `cancelling`. The pipeline's owner restarts its worker, which ends the job's
+  tables that haven't ended: their copy stops, and they read `cancelled`. A table whose copy had
+  completed stays copied. A paused pipeline restarts too, and stays paused.
+- A stopped pipeline, or one whose lease no node holds, runs no worker: the job reads `cancelling`
+  until the pipeline's next start ends it (`"restart": false` in the answer).
+- `200`: it was cancelled already. `409`: it has ended.
+
+What the cancelled tables hold:
+
+- A table the config replicates streams on. A copy that doesn't truncate leaves its rows as they
+  were, partly refreshed; one that truncates leaves the table empty or partly copied until a new
+  job copies it.
+- A table the job was bringing back from a halt halts again, `COPY_CANCELLED`, naming the job: its
+  Delta table holds part of its rows. Copy it again, or retry the job.
+- A table the config doesn't replicate isn't read again: it keeps the rows the copy wrote.
+
+The cancel is recorded in the events (`action.snapshot.cancel`, with the note), and the job's end
+too (`job.cancelled`).
+
+## Retry a job
+
+```sh
+curl -s -X POST https://cdc.example.internal/v1/snapshots/shop~0192f0c47b9e7c3a9d5e2f0a1b3c4d5e/retry \
+  -H 'content-type: application/json' -d '{"tables": "not_copied"}'
+```
+
+A retry starts a new job of an ended job's tables, as `POST /v1/pipelines/{id}/snapshots` does:
+
+- `tables`: `not_copied` (the default) for the tables that didn't complete, `all` for every one.
+- `truncate`: the old job's unless given.
+- `note`: why, kept with the new job and its event.
+
+The new job records the one it retries (`retry_of`). `409`: the job hasn't ended, it left no table
+to copy, or, as for any job, the pipeline doesn't run, no node holds its lease, or an unfinished
+job holds one of the tables.
 
 ## What a job does
 
