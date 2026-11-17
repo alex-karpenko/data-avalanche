@@ -4755,4 +4755,14 @@ git commit -m "test(e2e): a cancelled copy halts its table, and a retry copies i
 
 ## Deviations during execution
 
-None yet.
+Each was found by the task's review and fixed in its fix round, unless it says otherwise. Later
+tasks' blocks applied on top unchanged.
+
+- **Task 3** (fix round, `e4bb58b`, approved by Oleksii): the start cleared a table's halt and
+  recorded the job only later. A crash in between lost the cleared halt: the restart found no halt
+  and the job still queued, so the job's table ran with no `from_halt`, and a cancel of it, before
+  or after that restart, left the table unhalted with part of its rows. The start now notes the
+  halt it clears on the job's queued table before the clear (`Jobs::note_cleared`, idempotent);
+  `record` keeps a noted `from_halt`; `cancelling()` also takes a cancelled job's queued table
+  with a noted halt, which halts `COPY_CANCELLED` as a running one does. Three tests added (a
+  restart after the crash, a cancel before it, the note written once).
