@@ -113,6 +113,15 @@ pub trait VersionedStore: Send + Sync + std::fmt::Debug {
     /// more (an ended snapshot job, DA-SNAP-16): never a lease or a pointer (deleting a lease
     /// restarts its epoch).
     async fn delete(&self, key: &str) -> Result<(), StoreError>;
+    /// Deletes every key of `keys` as [`Self::delete`] does: in batches where the store can (S3
+    /// deletes a thousand a request), else one at a time (the default). The first failure ends
+    /// it; the keys before it may be gone.
+    async fn delete_many(&self, keys: &[String]) -> Result<(), StoreError> {
+        for key in keys {
+            self.delete(key).await?;
+        }
+        Ok(())
+    }
 }
 
 /// [`VersionedStore`] over an `object_store` bucket, rooted at a key prefix (`""` = bucket root).
@@ -296,6 +305,30 @@ impl VersionedStore for ObjectStoreVersioned {
             Err(e) => Err(map_error(Op::Delete, key, e)),
         }
     }
+
+    async fn delete_many(&self, keys: &[String]) -> Result<(), StoreError> {
+        use futures_util::StreamExt;
+        let paths: Vec<object_store::Result<Path>> = keys
+            .iter()
+            .map(|k| self.path(k))
+            .collect::<Result<Vec<Path>, StoreError>>()?
+            .into_iter()
+            .map(Ok)
+            .collect();
+        let mut deleted = self
+            .store
+            .delete_stream(futures_util::stream::iter(paths).boxed());
+        while let Some(r) = deleted.next().await {
+            match r {
+                Ok(_) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => {
+                    let at = format!("{} keys from {}", keys.len(), keys[0]);
+                    return Err(map_error(Op::Delete, &at, e));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -444,6 +477,35 @@ mod tests {
             "the trait's default, over list"
         );
         assert!(s.folders("none").await.unwrap().is_empty());
+    }
+
+    /// The keys go, each once, in batches; a key already gone is no error; another root's
+    /// keys stay. The trait's default deletes them too.
+    #[tokio::test]
+    async fn delete_many_deletes_every_key() {
+        let mem: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let s = ObjectStoreVersioned::new(mem.clone(), "a").unwrap();
+        let other = ObjectStoreVersioned::new(mem, "b").unwrap();
+        let keys: Vec<String> = (0..2500).map(|i| format!("events/d/{i:04}.json")).collect();
+        for k in keys.iter().take(3) {
+            s.put(k, b("x")).await.unwrap();
+            other.put(k, b("x")).await.unwrap();
+        }
+        s.delete_many(&keys).await.unwrap();
+        assert!(s.list("").await.unwrap().is_empty());
+        assert_eq!(
+            other.list("").await.unwrap().len(),
+            3,
+            "another root's stay"
+        );
+        other.delete_many(&[]).await.unwrap();
+        ListOnly(other.clone())
+            .delete_many(&keys[..2])
+            .await
+            .unwrap();
+        assert_eq!(other.list("").await.unwrap(), ["events/d/0002.json"]);
+        let e = s.delete_many(&["a//b".to_owned()]).await.unwrap_err();
+        assert!(matches!(e, StoreError::Permanent { .. }), "{e:?}");
     }
 
     #[tokio::test]

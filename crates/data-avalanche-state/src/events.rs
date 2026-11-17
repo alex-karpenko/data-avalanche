@@ -262,8 +262,8 @@ impl Events {
     }
 
     /// Deletes every event of the days that ended `retention` or more before `now`, and returns
-    /// how many. Whole days only: an event lives at least `retention`, at most a day more. Safe
-    /// on every node at once. A retention reaching past the earliest time a date can hold keeps
+    /// how many. Whole days only: an event lives at least `retention`, at most a day more; each
+    /// day's in one batched delete ([`VersionedStore::delete_many`]). Safe on every node at once. A retention reaching past the earliest time a date can hold keeps
     /// everything.
     ///
     /// # Errors
@@ -286,10 +286,9 @@ impl Events {
             if day.parse::<NaiveDate>().is_err() || day >= keep_from {
                 continue;
             }
-            for key in store.list(&format!("{EVENTS_PREFIX}/{day}")).await? {
-                store.delete(&key).await?;
-                deleted += 1;
-            }
+            let keys = store.list(&format!("{EVENTS_PREFIX}/{day}")).await?;
+            store.delete_many(&keys).await?;
+            deleted += keys.len();
         }
         Ok(deleted)
     }
@@ -643,6 +642,91 @@ mod tests {
                 .unwrap(),
             0,
             "again: nothing left to delete"
+        );
+    }
+
+    /// A store that counts its deletes: one at a time, and in batches (each batch's size).
+    #[derive(Debug)]
+    struct Counting {
+        inner: Arc<dyn VersionedStore>,
+        deletes: std::sync::atomic::AtomicUsize,
+        batches: std::sync::Mutex<Vec<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl VersionedStore for Counting {
+        async fn get(
+            &self,
+            key: &str,
+        ) -> Result<Option<(bytes::Bytes, data_avalanche_storage::ObjectVersion)>, StoreError>
+        {
+            self.inner.get(key).await
+        }
+        async fn create(
+            &self,
+            key: &str,
+            body: bytes::Bytes,
+        ) -> Result<data_avalanche_storage::ObjectVersion, StoreError> {
+            self.inner.create(key, body).await
+        }
+        async fn update(
+            &self,
+            key: &str,
+            expected: &data_avalanche_storage::ObjectVersion,
+            body: bytes::Bytes,
+        ) -> Result<data_avalanche_storage::ObjectVersion, StoreError> {
+            self.inner.update(key, expected, body).await
+        }
+        async fn put(
+            &self,
+            key: &str,
+            body: bytes::Bytes,
+        ) -> Result<data_avalanche_storage::ObjectVersion, StoreError> {
+            self.inner.put(key, body).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+            self.inner.list(prefix).await
+        }
+        async fn folders(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+            self.inner.folders(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.deletes.fetch_add(1, Ordering::SeqCst);
+            self.inner.delete(key).await
+        }
+        async fn delete_many(&self, keys: &[String]) -> Result<(), StoreError> {
+            self.batches.lock().unwrap().push(keys.len());
+            self.inner.delete_many(keys).await
+        }
+    }
+
+    /// Expiry deletes each day's events in one batch, not one key at a time (M13a's carry-in).
+    #[tokio::test]
+    async fn prune_deletes_a_day_in_one_batch() {
+        let (_, inner) = events();
+        let store = Arc::new(Counting {
+            inner,
+            deletes: std::sync::atomic::AtomicUsize::new(0),
+            batches: std::sync::Mutex::new(vec![]),
+        });
+        let ev = Events::new(DocStore::new(Arc::clone(&store) as Arc<dyn VersionedStore>));
+        for (day, n) in [(10, 3), (11, 1), (14, 2)] {
+            for i in 0..n {
+                ev.record(&event(at(day, 12, i), "member.joined", "a"))
+                    .await
+                    .unwrap();
+            }
+        }
+        let deleted = ev
+            .prune(Duration::from_secs(2 * 86_400), at(14, 6, 0))
+            .await
+            .unwrap();
+        assert_eq!(deleted, 4);
+        assert_eq!(*store.batches.lock().unwrap(), [3, 1]);
+        assert_eq!(
+            store.deletes.load(Ordering::SeqCst),
+            0,
+            "none one at a time"
         );
     }
 }

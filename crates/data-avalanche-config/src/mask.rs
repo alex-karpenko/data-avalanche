@@ -398,16 +398,25 @@ struct Leaf {
 }
 
 /// `value` with the credentials of every URL in it masked (`https://••••••@host`): wherever a
-/// `://` is followed by an `@` before the next `/`, `?`, `#` or the value's end, what lies
-/// between them. A URL inside a `${VAR:-…}` default, or in any text, included. `None` when it
-/// has none, or they are masked already.
+/// `//` after a `:` (`scheme://`), or at the start of the value or of a word (a scheme-relative
+/// `//user:pass@host`), is followed by an `@` before the next `/`, `?`, `#` or the value's end,
+/// what lies between them. A URL inside a `${VAR:-…}` default, or in any text, included; a `//`
+/// inside a path isn't one. `None` when it has none, or they are masked already.
 fn without_userinfo(value: &str) -> Option<String> {
     let mut out = String::with_capacity(value.len());
     let mut rest = value;
     let mut changed = false;
-    while let Some(at) = rest.find("://") {
-        let (head, tail) = rest.split_at(at + 3);
+    while let Some(at) = rest.find("//") {
+        let before = rest[..at]
+            .chars()
+            .next_back()
+            .or_else(|| out.chars().next_back());
+        let (head, tail) = rest.split_at(at + 2);
         out.push_str(head);
+        if !before.is_none_or(|c| c == ':' || c.is_whitespace()) {
+            rest = tail;
+            continue;
+        }
         let authority = tail.split(['/', '?', '#']).next().unwrap_or(tail);
         match authority.rfind('@') {
             Some(end) if &authority[..end] != MASK => {
@@ -1033,6 +1042,27 @@ pipelines:
             None,
             "an @ past the host"
         );
+    }
+
+    /// A scheme-relative URL's credentials are masked too (`//user:pass@host`, which a key
+    /// without a scheme check takes); a `//` inside a path isn't a URL's.
+    #[test]
+    fn a_scheme_relative_url_s_credentials_are_masked() {
+        assert_eq!(
+            without_userinfo("//u:p@h:5432/db").as_deref(),
+            Some("//••••••@h:5432/db")
+        );
+        assert_eq!(
+            without_userinfo("see //u@h?x and https://a:b@c").as_deref(),
+            Some("see //••••••@h?x and https://••••••@c")
+        );
+        for kept in ["/data//x@y", "a//u:p@h", "//h/p@x", "//••••••@h"] {
+            assert_eq!(without_userinfo(kept), None, "{kept}");
+        }
+        let text = "config_version: 1\nglobals:\n  console:\n    prometheus: { url: '//prom:SECRETX@prom.example:9090' }\n";
+        let out = mask_secrets(text, &key()).unwrap();
+        assert!(!out.contains("SECRETX"), "{out}");
+        assert!(out.contains("//••••••@prom.example:9090"), "{out}");
     }
 
     /// Only the secret keys are masked: a `user` written as the password's text stays shown, and
