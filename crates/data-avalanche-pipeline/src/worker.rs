@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use chrono::Utc;
 use data_avalanche_config::{Pipeline, SnapshotMode};
 use data_avalanche_core::{
     Checkpoint, ColumnSchema, CommitMarker, CommitOutcome, HaltReason, PositionRange, SchemaHint,
@@ -20,7 +21,7 @@ use data_avalanche_storage::StoreError;
 use tokio::sync::{mpsc, watch};
 
 use crate::decide::{Decision, Facts, Plan, decide};
-use crate::jobs::Jobs;
+use crate::jobs::{Jobs, Taken};
 use crate::schema_change::{Planned, missing_columns, soft_dropped};
 use crate::session::{Core, End, Session};
 use crate::settings::Settings;
@@ -559,6 +560,21 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
     let jobs = Jobs::load(&core.docs).await?;
     let asked = jobs.asked();
     let running = jobs.running();
+    // A cancelled job's running copies stop here (D-M13c.2); one that completed before this
+    // start took the cancel ends completed.
+    let mut taken = Taken::default();
+    let mut cancelling = BTreeMap::new();
+    for (table, c) in jobs.cancelling() {
+        match core.docs.table_snapshot(&table).await?.map(|v| v.doc) {
+            Some(d) if d.status == SnapshotStatus::InProgress => {
+                cancelling.insert(table, c);
+            }
+            Some(d) if d.status == SnapshotStatus::Completed => {
+                taken.completed.insert(table, d.row_count.unwrap_or(0));
+            }
+            _ => {}
+        }
+    }
 
     // New halts, recorded before the checkpoint below.
     let mut halts: Vec<(TableRef, HaltReason)> = resolved.halted.clone();
@@ -574,6 +590,18 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
         .cloned()
         .collect();
     let recorded: BTreeSet<TableRef> = recorded.difference(&cleared).cloned().collect();
+    // A stopped copy of a table its job brought back from a halt halts again: the lake holds a
+    // part of its rows, and its stream position may predate them (D-M13c.2).
+    for (table, c) in &cancelling {
+        if c.from_halt
+            && resolved_tables.contains_key(table)
+            && !recorded.contains(table)
+            && !halts.iter().any(|(t, _)| t == table)
+        {
+            let reason = HaltReason::CopyCancelled { job: c.job.clone() };
+            halts.push((table.clone(), reason));
+        }
+    }
     let gone: Vec<TableSchema> = cached
         .values()
         .filter(|c| !resolved_tables.contains_key(c.table()) && !recorded.contains(c.table()))
@@ -720,8 +748,9 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
         let tracked_before = cached.contains_key(table);
         let facts = Facts {
             tracked_before,
-            // After a gap, a snapshot starts over: rows before its cursor may have changed.
-            in_progress: in_progress && !gap,
+            // After a gap, a snapshot starts over: rows before its cursor may have changed. A
+            // stopped copy isn't resumed: its document is abandoned.
+            in_progress: in_progress && !gap && !cancelling.contains_key(table),
             sink_has_table: state.exists,
             added: added.contains(table),
         };
@@ -974,6 +1003,13 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
             copies.insert(table, schema);
         }
     }
+    // The other stopped copies' documents go too: a halted table's, and a copy's, which no
+    // start reads again.
+    for table in cancelling.keys() {
+        if !requests.contains(table) && !abandoned.contains(table) {
+            abandoned.push(table.clone());
+        }
+    }
 
     // Persist, in this order: a restart in between redoes what follows.
     for (table, reason) in &halts {
@@ -1132,8 +1168,24 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
             .await?;
         }
     }
+    // The started tables' row estimates, for a progress and an ETA: a source that can't give
+    // them doesn't fail the start.
+    if !started.is_empty() {
+        let tables: Vec<TableRef> = started.iter().cloned().collect();
+        match source.row_estimates(&tables).await {
+            Ok(estimates) => taken.estimates = estimates,
+            Err(e) => tracing::warn!("the row estimates of the tables jobs start are unread: {e}"),
+        }
+    }
+    taken.from_halt = started
+        .iter()
+        .filter(|t| cleared.contains(*t))
+        .filter_map(|t| Some((t.clone(), recorded_halts.get(t)?.code().to_owned())))
+        .collect();
+    taken.started = started;
+    taken.failed = failed;
     core.may_write()?;
-    jobs.record(&core.docs, &started, &failed).await?;
+    jobs.record(&core.docs, &taken, Utc::now()).await?;
     // A copy's halt goes once its job carries it: the pipeline doesn't replicate the table, and
     // no job can clear the halt of a table gone. It is the halt of a table neither configured
     // nor cached (a table taken out of the config keeps its schema) nor read now.
