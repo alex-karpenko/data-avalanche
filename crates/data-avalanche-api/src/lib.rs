@@ -477,6 +477,57 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
         ),
         (
             act(
+                "snapshot.cancel",
+                "cancel snapshot job",
+                Route {
+                    body: Some("application/json"),
+                    ..r(
+                        "POST",
+                        "/v1/snapshots/{job_id}/cancel",
+                        Operator,
+                        "Cancel a job: the pipeline's next start ends its unended tables; a table it was bringing back from a halt halts again, COPY_CANCELLED",
+                        &[
+                            (200, "cancelled already"),
+                            (
+                                202,
+                                "cancelling: the owner restarts the worker, or the pipeline's next start ends it",
+                            ),
+                            (404, "no such job"),
+                            (409, "the job has ended"),
+                            (422, "the body isn't `{\"note\": ...}`"),
+                        ],
+                    )
+                },
+            ),
+            post(snapshots::cancel),
+        ),
+        (
+            act(
+                "snapshot.retry",
+                "retry snapshot job",
+                Route {
+                    body: Some("application/json"),
+                    ..r(
+                        "POST",
+                        "/v1/snapshots/{job_id}/retry",
+                        Operator,
+                        "Retry an ended job: a new job of its tables, `{\"tables\": \"all\" | \"not_copied\", \"truncate\": ...}`, that records the job it retries",
+                        &[
+                            (202, "the new job is queued"),
+                            (404, "no such job"),
+                            (
+                                409,
+                                "the job hasn't ended, it left no table to copy, the pipeline doesn't run, no node holds its lease, or an unfinished job holds a table",
+                            ),
+                            (422, "the body isn't of that form"),
+                        ],
+                    )
+                },
+            ),
+            post(snapshots::retry),
+        ),
+        (
+            act(
                 "node.leave",
                 "leave the cluster:",
                 r(
@@ -834,6 +885,8 @@ mod tests {
                 ("POST", "/v1/pipelines/{id}/snapshots", Operator),
                 ("GET", "/v1/pipelines/{id}/snapshots", Viewer),
                 ("GET", "/v1/snapshots/{job_id}", Viewer),
+                ("POST", "/v1/snapshots/{job_id}/cancel", Operator),
+                ("POST", "/v1/snapshots/{job_id}/retry", Operator),
                 ("POST", "/v1/cluster/leave", Admin),
                 ("POST", "/v1/admin/shutdown", Admin),
                 ("GET", "/v1/nodes/{node}", Viewer),

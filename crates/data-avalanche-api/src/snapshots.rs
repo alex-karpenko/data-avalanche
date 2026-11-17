@@ -11,18 +11,18 @@ use axum::Extension;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Response;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use data_avalanche_config::{Pipeline, SourceType, key_table};
 use data_avalanche_core::TableRef;
 use data_avalanche_state::{
-    Action, DesiredState, JobStatus, JobTableStatus, PipelineDocs, Request, SnapshotJobDoc,
-    StateError,
+    Action, DesiredState, JobCancel, JobStatus, JobTable, JobTableStatus, PipelineDocs, Request,
+    SnapshotJobDoc, StateError,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::pipelines::{desired_name, find, read, unavailable};
-use crate::{Api, Failure, Principal, body, starting};
+use crate::{Api, Failure, Node, Principal, body, starting};
 
 /// Between a job's pipeline id and its suffix: a pipeline id has none (V-055).
 const SEPARATOR: char = '~';
@@ -33,7 +33,7 @@ fn new_job_id(pipeline_id: &str) -> String {
 }
 
 /// The pipeline id a job id names.
-fn job_pipeline(job_id: &str) -> Option<&str> {
+pub(crate) fn job_pipeline(job_id: &str) -> Option<&str> {
     match job_id.split_once(SEPARATOR) {
         Some((p, suffix)) if !p.is_empty() && !suffix.is_empty() => Some(p),
         _ => None,
@@ -101,14 +101,71 @@ fn tables(p: &Pipeline, text: &str) -> Result<(Vec<TableRef>, bool, Option<Strin
     Ok((out, asked.truncate, note))
 }
 
-fn job_json(p: &Pipeline, j: &SnapshotJobDoc) -> Value {
-    let status = |s: JobStatus| match s {
+/// A job's status as the API names it: `cancelling` from the cancel until a start ends it.
+fn status_name(j: &SnapshotJobDoc) -> &'static str {
+    match j.status {
+        _ if j.cancel.is_some() && !j.is_finished() => "cancelling",
         JobStatus::Queued => "queued",
         JobStatus::Running => "running",
         JobStatus::Completed => "completed",
         JobStatus::Failed => "failed",
         JobStatus::Cancelled => "cancelled",
+    }
+}
+
+/// What lake readers see of a job's table (Admin_Console §3): `complete` once it is copied;
+/// while a truncating job's copy of it began and hasn't completed, `empty` before its first
+/// rows and `partial` after; else `as_before`, the rows it held before the job (a copy that
+/// doesn't truncate writes over them).
+fn lake(truncate: bool, t: &JobTable) -> &'static str {
+    let began = t.started_at.is_some()
+        || matches!(
+            t.status,
+            JobTableStatus::Running | JobTableStatus::Completed
+        );
+    match t.status {
+        JobTableStatus::Completed => "complete",
+        _ if !truncate || !began => "as_before",
+        _ if t.rows_done == 0 => "empty",
+        _ => "partial",
+    }
+}
+
+/// The least a job runs before its rate is shown: a shorter run's rate says little.
+const RATE_AFTER: chrono::TimeDelta = chrono::TimeDelta::seconds(60);
+
+/// A running job's copy rate, rows a second, since its first table began, and the seconds left
+/// at that rate from the source's estimates of its unended tables. No rate before
+/// [`RATE_AFTER`] or once it ended; no ETA without a rate or an estimate of every unended table.
+fn pace(j: &SnapshotJobDoc, now: DateTime<Utc>) -> (Option<u64>, Option<u64>) {
+    if j.is_finished() {
+        return (None, None);
+    }
+    let Some(first) = j.tables.iter().filter_map(|t| t.started_at).min() else {
+        return (None, None);
     };
+    let ran = now - first;
+    if ran < RATE_AFTER {
+        return (None, None);
+    }
+    let done: u64 = j.tables.iter().map(|t| t.rows_done).sum();
+    let rate = done * 1000
+        / u64::try_from(ran.num_milliseconds())
+            .unwrap_or(u64::MAX)
+            .max(1);
+    if rate == 0 {
+        return (Some(0), None);
+    }
+    let left: Option<u64> = j
+        .tables
+        .iter()
+        .filter(|t| !t.status.is_ended())
+        .map(|t| t.estimate.map(|e| e.saturating_sub(t.rows_done)))
+        .sum();
+    (Some(rate), left.map(|l| l.div_ceil(rate)))
+}
+
+fn job_json(p: &Pipeline, j: &SnapshotJobDoc, now: DateTime<Utc>) -> Value {
     let table_status = |s: JobTableStatus| match s {
         JobTableStatus::Queued => "queued",
         JobTableStatus::Running => "running",
@@ -116,18 +173,38 @@ fn job_json(p: &Pipeline, j: &SnapshotJobDoc) -> Value {
         JobTableStatus::Failed => "failed",
         JobTableStatus::Cancelled => "cancelled",
     };
+    let estimates: Vec<u64> = j.tables.iter().filter_map(|t| t.estimate).collect();
+    let (rate, eta) = pace(j, now);
     json!({
         "job_id": j.job_id,
         "pipeline": p.id,
-        "status": status(j.status),
+        "status": status_name(j),
         "tables": j.tables.iter().map(|t| json!({
             "table": table_name(p, &t.table),
             "status": table_status(t.status),
             "rows_done": t.rows_done,
+            "estimate": t.estimate,
+            "started_at": t.started_at,
+            "ended_at": t.ended_at,
+            "from_halt": t.from_halt,
+            "lake": lake(j.truncate, t),
             "error": t.error,
         })).collect::<Vec<_>>(),
+        "rows_done": j.tables.iter().map(|t| t.rows_done).sum::<u64>(),
+        "estimate": (!estimates.is_empty()).then(|| estimates.iter().sum::<u64>()),
+        "rate": rate,
+        "eta_seconds": eta,
         "requested_at": j.requested_at,
         "requested_by": j.requested_by,
+        "requested_role": j.requested_role,
+        "note": j.note,
+        "retry_of": j.retry_of,
+        "cancel": j.cancel.as_ref().map(|c| json!({
+            "by": c.by,
+            "role": c.role,
+            "at": c.at,
+            "note": c.note,
+        })),
         "finished_at": j.finished_at,
         "error": j.error,
         "truncate": j.truncate,
@@ -153,7 +230,39 @@ pub(crate) async fn ask(
         Ok(asked) => asked,
         Err(why) => return Failure::new(StatusCode::UNPROCESSABLE_ENTITY, why).into(),
     };
-    let r = match read(node, &p, &docs).await {
+    let start = Start {
+        tables,
+        truncate,
+        note,
+        retry_of: None,
+    };
+    start_job(node, &p, &docs, &by, start).await
+}
+
+/// A job to start: its tables, whether it empties them first, why, and the job it retries.
+struct Start {
+    tables: Vec<TableRef>,
+    truncate: bool,
+    note: Option<String>,
+    retry_of: Option<String>,
+}
+
+/// Records job `start` of pipeline `p`, asked by `by`, then its restart: 202 with the job. 409
+/// when the pipeline doesn't run, no node holds its lease, or an unfinished job holds a table.
+async fn start_job(
+    node: &Node,
+    p: &Pipeline,
+    docs: &PipelineDocs,
+    by: &Principal,
+    start: Start,
+) -> Response {
+    let Start {
+        tables,
+        truncate,
+        note,
+        retry_of,
+    } = start;
+    let r = match read(node, p, docs).await {
         Ok(r) => r,
         Err(e) => return unavailable(&e),
     };
@@ -186,7 +295,7 @@ pub(crate) async fn ask(
             let queued = if j.status == JobStatus::Queued {
                 // Its restart may not have been written (DA-SNAP-21): ask it again, under the
                 // job's id, so the owner takes it at its next poll.
-                match ask_restart_again(&docs, j).await {
+                match ask_restart_again(docs, j).await {
                     Ok(()) => " (it is queued: its restart is asked again, and it runs at the pipeline's next start)".to_owned(),
                     Err(e) => format!(" (it is queued, and its restart can't be asked again ({e}): it runs at the pipeline's next start)"),
                 }
@@ -196,13 +305,15 @@ pub(crate) async fn ask(
             return conflict(format!(
                 "job {} snapshots {} already; ask again once it ended{queued}",
                 j.job_id,
-                table_name(&p, &t.table)
+                table_name(p, &t.table)
             ));
         }
     }
     let mut job = SnapshotJobDoc::new(new_job_id(&p.id), tables, by.name.clone(), Utc::now());
     job.truncate = truncate;
     job.note = note;
+    job.requested_role = Some(by.role.to_string());
+    job.retry_of = retry_of;
     if let Err(e) = docs.create_snapshot_job(&job).await {
         return unavailable(&e);
     }
@@ -219,17 +330,241 @@ pub(crate) async fn ask(
             }),
         );
     }
-    tracing::info!(pipeline = %p.name, by = %by.name, job = %job.job_id, tables = job.tables.len(), truncate, "snapshot job asked through the API");
-    let v = job_json(&p, &job);
+    tracing::info!(pipeline = %p.name, by = %by.name, job = %job.job_id, tables = job.tables.len(), truncate, retry_of = ?job.retry_of, "snapshot job asked through the API");
+    let v = job_json(p, &job, Utc::now());
+    let mut answer = json!({
+        "job_id": v["job_id"],
+        "status": v["status"],
+        "tables": v["tables"].as_array().into_iter().flatten().map(|t| t["table"].clone()).collect::<Vec<_>>(),
+        "truncate": truncate,
+    });
+    if let Some(of) = &job.retry_of {
+        answer["retry_of"] = json!(of);
+    }
+    body(StatusCode::ACCEPTED, &answer)
+}
+
+/// The job `job_id` names, with its pipeline and that pipeline's state: 404 when the id names
+/// no pipeline of the generation, or no job of it; 503 when the state can't be read.
+async fn job_of(
+    node: &Node,
+    job_id: &str,
+) -> Result<(Pipeline, PipelineDocs, SnapshotJobDoc), Failure> {
+    let missing = || Failure::new(StatusCode::NOT_FOUND, format!("no snapshot job {job_id:?}"));
+    let pipeline = job_pipeline(job_id).ok_or_else(missing)?;
+    let (p, docs) = find(node, pipeline).await.map_err(|f| match f.code {
+        StatusCode::NOT_FOUND => missing(),
+        _ => f,
+    })?;
+    match docs.snapshot_job(job_id).await {
+        Ok(Some(v)) => Ok((p, docs, v.doc)),
+        Ok(None) => Err(missing()),
+        Err(e) => Err(Failure::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("the pipeline's state: {e}"),
+        )),
+    }
+}
+
+/// A body of a note alone, or none.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CancelBody {
+    /// Checked by the recording (a 422 before this route runs).
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// A JSON body as `T`, an empty one as `T`'s default: 422 with `form` when it isn't one.
+fn parsed<T: serde::de::DeserializeOwned>(text: &str, form: &str) -> Result<T, Failure> {
+    let text = if text.trim().is_empty() { "{}" } else { text };
+    serde_json::from_str(text).map_err(|e| {
+        Failure::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("the body is {form}: {e}"),
+        )
+    })
+}
+
+fn trimmed(note: Option<String>) -> Option<String> {
+    note.map(|n| n.trim().to_owned()).filter(|n| !n.is_empty())
+}
+
+/// `POST /v1/snapshots/{job_id}/cancel` (D-M13c.2): records who cancelled the job and why, then
+/// asks the pipeline's restart, whose start ends the job's unended tables; a copy of a table the
+/// job brought back from a halt halts it again, `COPY_CANCELLED`. A pipeline stopped, or whose
+/// lease no node holds, ends them at its next start. 202 `cancelling`; 200 when it was
+/// cancelled already; 409 once it ended.
+pub(crate) async fn cancel(
+    State(api): State<Api>,
+    Path(job_id): Path<String>,
+    Extension(by): Extension<Principal>,
+    text: String,
+) -> Response {
+    let Some(node) = api.node.get() else {
+        return starting();
+    };
+    let (p, docs, job) = match job_of(node, &job_id).await {
+        Ok(found) => found,
+        Err(f) => return f.into(),
+    };
+    let note = match parsed::<CancelBody>(&text, "{\"note\": \"...\"} or empty") {
+        Ok(n) => trimmed(n.note),
+        Err(f) => return f.into(),
+    };
+    let ended = |j: &SnapshotJobDoc| {
+        body(
+            StatusCode::CONFLICT,
+            &json!({
+                "error": format!("job {job_id} ended ({}) already: there is nothing to cancel", status_name(j)),
+                "job_id": job_id,
+                "status": status_name(j),
+            }),
+        )
+    };
+    if job.is_finished() {
+        return ended(&job);
+    }
+    if job.cancel.is_some() {
+        return body(
+            StatusCode::OK,
+            &json!({ "job_id": job_id, "status": "cancelling", "unchanged": true }),
+        );
+    }
+    let cancel = JobCancel {
+        by: by.name.clone(),
+        role: by.role.to_string(),
+        at: Utc::now(),
+        note,
+    };
+    let updated = docs
+        .update_snapshot_job(&job_id, |j| {
+            if !j.is_finished() && j.cancel.is_none() {
+                j.cancel = Some(cancel.clone());
+            }
+        })
+        .await;
+    match updated {
+        Ok(Some(j)) if j.is_finished() => return ended(&j),
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Failure::new(StatusCode::NOT_FOUND, format!("no snapshot job {job_id:?}"))
+                .into();
+        }
+        Err(e) => return unavailable(&e),
+    }
+    // A worker runs while the pipeline runs or is paused: its restart takes the cancel now.
+    let r = match read(node, &p, &docs).await {
+        Ok(r) => Some(r),
+        Err(e) => {
+            tracing::warn!(pipeline = %p.name, job = %job_id, "a cancel's restart unasked, the pipeline's state unread: {e}");
+            None
+        }
+    };
+    let runs = r.as_ref().is_some_and(|r| {
+        r.desired != DesiredState::Stopped && r.lease.as_ref().is_some_and(|l| !l.released)
+    });
+    let restart = Request {
+        id: format!("{job_id}/cancel"),
+        at: cancel.at,
+    };
+    let asked = runs
+        && {
+            match docs.request(Action::Restart, restart).await {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(pipeline = %p.name, job = %job_id, "a cancel's restart unasked: {e}");
+                    false
+                }
+            }
+        };
+    tracing::info!(pipeline = %p.name, by = %by.name, job = %job_id, restart = asked, "snapshot job cancelled through the API");
+    let detail = if asked {
+        "the owner restarts the pipeline's worker, whose start stops the job's copies"
+    } else {
+        "no worker runs the pipeline now: its next start stops the job's copies"
+    };
     body(
         StatusCode::ACCEPTED,
-        &json!({
-            "job_id": v["job_id"],
-            "status": v["status"],
-            "tables": v["tables"].as_array().into_iter().flatten().map(|t| t["table"].clone()).collect::<Vec<_>>(),
-            "truncate": truncate,
-        }),
+        &json!({ "job_id": job_id, "status": "cancelling", "restart": asked, "detail": detail }),
     )
+}
+
+/// Which of an ended job's tables a retry copies again.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Which {
+    All,
+    /// Those that didn't complete.
+    #[default]
+    NotCopied,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Retried {
+    #[serde(default)]
+    tables: Which,
+    /// The old job's when absent.
+    #[serde(default)]
+    truncate: Option<bool>,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// `POST /v1/snapshots/{job_id}/retry`: a new job of an ended one's tables (`all`, or
+/// `not_copied`, the default), truncating as it did unless the body says, recording the job it
+/// retries; asked as `POST /v1/pipelines/{id}/snapshots` is. 409 for a job that hasn't ended,
+/// or with no table left to copy.
+pub(crate) async fn retry(
+    State(api): State<Api>,
+    Path(job_id): Path<String>,
+    Extension(by): Extension<Principal>,
+    text: String,
+) -> Response {
+    let Some(node) = api.node.get() else {
+        return starting();
+    };
+    let (p, docs, job) = match job_of(node, &job_id).await {
+        Ok(found) => found,
+        Err(f) => return f.into(),
+    };
+    let form =
+        "{\"tables\": \"all\" | \"not_copied\", \"truncate\": true | false, \"note\": \"...\"}";
+    let asked = match parsed::<Retried>(&text, form) {
+        Ok(a) => a,
+        Err(f) => return f.into(),
+    };
+    let conflict = |why: String| {
+        body(
+            StatusCode::CONFLICT,
+            &json!({ "error": why, "job_id": job_id, "status": status_name(&job) }),
+        )
+    };
+    if !job.is_finished() {
+        return conflict(format!(
+            "job {job_id} is {}: retry it once it ended",
+            status_name(&job)
+        ));
+    }
+    let tables: Vec<TableRef> = job
+        .tables
+        .iter()
+        .filter(|t| asked.tables == Which::All || t.status != JobTableStatus::Completed)
+        .map(|t| t.table.clone())
+        .collect();
+    if tables.is_empty() {
+        return conflict(format!(
+            "every table of job {job_id} was copied; retry it with \"tables\": \"all\" to copy them again"
+        ));
+    }
+    let start = Start {
+        tables,
+        truncate: asked.truncate.unwrap_or(job.truncate),
+        note: trimmed(asked.note),
+        retry_of: Some(job_id.clone()),
+    };
+    start_job(node, &p, &docs, &by, start).await
 }
 
 /// Writes queued job `j`'s restart again, unless it is the restart recorded already.
@@ -253,10 +588,11 @@ pub(crate) async fn list(State(api): State<Api>, Path(id): Path<String>) -> Resp
         Ok(found) => found,
         Err(f) => return f.into(),
     };
+    let now = Utc::now();
     match docs.snapshot_jobs().await {
         Ok(jobs) => body(
             StatusCode::OK,
-            &json!({ "jobs": jobs.iter().map(|v| job_json(&p, &v.doc)).collect::<Vec<_>>() }),
+            &json!({ "jobs": jobs.iter().map(|v| job_json(&p, &v.doc, now)).collect::<Vec<_>>() }),
         ),
         Err(e) => unavailable(&e),
     }
@@ -267,19 +603,9 @@ pub(crate) async fn get(State(api): State<Api>, Path(job_id): Path<String>) -> R
     let Some(node) = api.node.get() else {
         return starting();
     };
-    let missing = || Failure::new(StatusCode::NOT_FOUND, format!("no snapshot job {job_id:?}"));
-    let Some(pipeline) = job_pipeline(&job_id) else {
-        return missing().into();
-    };
-    let (p, docs) = match find(node, pipeline).await {
-        Ok(found) => found,
-        Err(f) if f.code == StatusCode::NOT_FOUND => return missing().into(),
-        Err(f) => return f.into(),
-    };
-    match docs.snapshot_job(&job_id).await {
-        Ok(Some(v)) => body(StatusCode::OK, &job_json(&p, &v.doc)),
-        Ok(None) => missing().into(),
-        Err(e) => unavailable(&e),
+    match job_of(node, &job_id).await {
+        Ok((p, _, job)) => body(StatusCode::OK, &job_json(&p, &job, Utc::now())),
+        Err(f) => f.into(),
     }
 }
 
@@ -291,7 +617,8 @@ mod tests {
     use chrono::Utc;
     use data_avalanche_core::TableRef;
     use data_avalanche_state::{
-        Acquired, DesiredState, Holder, JobStatus, JobTableStatus, PipelineDocs, SnapshotJobDoc,
+        Acquired, DesiredState, Holder, JobStatus, JobTable, JobTableStatus, PipelineDocs,
+        SnapshotJobDoc,
     };
     use serde_json::{Value, json};
     use tempfile::TempDir;
@@ -388,8 +715,29 @@ mod tests {
         assert_eq!(one["status"], "queued");
         assert_eq!(
             one["tables"][0],
-            json!({ "table": "public.orders", "status": "queued", "rows_done": 0, "error": null })
+            json!({
+                "table": "public.orders",
+                "status": "queued",
+                "rows_done": 0,
+                "estimate": null,
+                "started_at": null,
+                "ended_at": null,
+                "from_halt": null,
+                "lake": "as_before",
+                "error": null,
+            })
         );
+        assert_eq!(one["requested_role"], "admin", "auth none: an admin");
+        for unset in [
+            "rate",
+            "eta_seconds",
+            "estimate",
+            "retry_of",
+            "cancel",
+            "note",
+        ] {
+            assert_eq!(one[unset], Value::Null, "{unset}: {one}");
+        }
         let (code, all) = json_of(addr, "GET", "/v1/pipelines/orders/snapshots").await;
         assert_eq!(code, 200, "{all}");
         assert_eq!(all["jobs"], json!([one]));
@@ -540,5 +888,275 @@ mod tests {
         let (code, v) = json_of(addr, "GET", "/v1/snapshots/orders~0190").await;
         assert_eq!(code, 500, "{v}");
         assert!(v["error"].as_str().unwrap().contains("no bucket"), "{v}");
+    }
+
+    async fn post(addr: SocketAddr, path: &str, body: &str) -> (u16, Value) {
+        let (code, _, text) = request(addr, "POST", path, &[], body).await;
+        let v = if text.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"))
+        };
+        (code, v)
+    }
+
+    /// A job of `tables`, recorded as the API would, `status` each.
+    async fn recorded(docs: &PipelineDocs, id: &str, tables: &[(&str, JobTableStatus)]) {
+        let mut job = SnapshotJobDoc::new(
+            id.into(),
+            tables
+                .iter()
+                .map(|(n, _)| TableRef::new("public", *n))
+                .collect(),
+            "ops".into(),
+            Utc::now(),
+        );
+        for (t, (_, s)) in job.tables.iter_mut().zip(tables) {
+            t.status = *s;
+        }
+        job.settle(Utc::now());
+        docs.create_snapshot_job(&job).await.unwrap();
+    }
+
+    /// D-M13c.2: a cancel records who cancelled the job and why, then asks the holder's
+    /// restart, whose start ends it; the job reads `cancelling` until then. A second cancel
+    /// changes nothing; one of a job that ended is refused.
+    #[tokio::test]
+    async fn a_job_is_cancelled_through_a_restart() {
+        let (addr, lone, docs, _dir) = served().await;
+        held(&lone).await;
+        recorded(&docs, "orders~01", &[("orders", JobTableStatus::Running)]).await;
+        let (code, v) = post(
+            addr,
+            "/v1/snapshots/orders~01/cancel",
+            r#"{"note": " wrong table "}"#,
+        )
+        .await;
+        assert_eq!(code, 202, "{v}");
+        assert_eq!(v["status"], "cancelling");
+        assert_eq!(v["restart"], true);
+        assert_eq!(
+            docs.requests().await.unwrap().restart.unwrap().id,
+            "orders~01/cancel"
+        );
+        let job = docs.snapshot_job("orders~01").await.unwrap().unwrap().doc;
+        let cancel = job.cancel.unwrap();
+        assert_eq!(
+            (cancel.by.as_str(), cancel.role.as_str()),
+            ("anonymous", "admin")
+        );
+        assert_eq!(cancel.note.as_deref(), Some("wrong table"));
+        assert_eq!(job.status, JobStatus::Running, "the start ends it");
+        let (_, one) = json_of(addr, "GET", "/v1/snapshots/orders~01").await;
+        assert_eq!(one["status"], "cancelling", "{one}");
+        assert_eq!(one["cancel"]["by"], "anonymous");
+        assert_eq!(one["cancel"]["note"], "wrong table");
+
+        let (code, v) = post(addr, "/v1/snapshots/orders~01/cancel", "").await;
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(v["unchanged"], true);
+
+        docs.update_snapshot_job("orders~01", |j| {
+            j.tables[0].end(JobTableStatus::Cancelled, None, Utc::now());
+            j.settle(Utc::now());
+        })
+        .await
+        .unwrap();
+        let (_, one) = json_of(addr, "GET", "/v1/snapshots/orders~01").await;
+        assert_eq!(one["status"], "cancelled", "{one}");
+        recorded(&docs, "orders~02", &[("orders", JobTableStatus::Completed)]).await;
+        let (code, v) = post(addr, "/v1/snapshots/orders~02/cancel", "").await;
+        assert_eq!(code, 409, "{v}");
+        assert!(
+            v["error"].as_str().unwrap().contains("ended (completed)"),
+            "{v}"
+        );
+    }
+
+    /// D-M13c.2: no worker runs a stopped pipeline, nor one whose lease no node holds: the
+    /// cancel is recorded, and its next start takes it. A paused pipeline's worker restarts.
+    #[tokio::test]
+    async fn a_cancel_restarts_only_a_worker_that_runs() {
+        let (addr, lone, docs, _dir) = served().await;
+        recorded(&docs, "orders~01", &[("orders", JobTableStatus::Running)]).await;
+        let (code, v) = post(addr, "/v1/snapshots/orders~01/cancel", "").await;
+        assert_eq!(code, 202, "{v}");
+        assert_eq!(v["restart"], false, "no holder: {v}");
+        assert!(docs.requests().await.unwrap().restart.is_none());
+        assert!(
+            docs.snapshot_job("orders~01")
+                .await
+                .unwrap()
+                .unwrap()
+                .doc
+                .cancel
+                .is_some()
+        );
+
+        held(&lone).await;
+        docs.open("orders", "delta").await.unwrap();
+        docs.set_desired_state(DesiredState::Stopped).await.unwrap();
+        recorded(&docs, "orders~02", &[("items", JobTableStatus::Queued)]).await;
+        let (code, v) = post(addr, "/v1/snapshots/orders~02/cancel", "").await;
+        assert_eq!((code, &v["restart"]), (202, &json!(false)), "stopped: {v}");
+        assert!(docs.requests().await.unwrap().restart.is_none());
+
+        docs.set_desired_state(DesiredState::Paused).await.unwrap();
+        recorded(&docs, "orders~03", &[("customers", JobTableStatus::Queued)]).await;
+        let (code, v) = post(addr, "/v1/snapshots/orders~03/cancel", "").await;
+        assert_eq!((code, &v["restart"]), (202, &json!(true)), "paused: {v}");
+    }
+
+    /// A retry starts a new job of an ended one's tables, those not copied unless the body
+    /// asks for all, truncating as the old job did unless it says, and records the job it
+    /// retries. A job that hasn't ended, or left nothing to copy, is refused.
+    #[tokio::test]
+    async fn an_ended_job_is_retried_as_a_new_job() {
+        let (addr, lone, docs, _dir) = served().await;
+        held(&lone).await;
+        recorded(
+            &docs,
+            "orders~01",
+            &[
+                ("orders", JobTableStatus::Completed),
+                ("items", JobTableStatus::Failed),
+            ],
+        )
+        .await;
+        docs.update_snapshot_job("orders~01", |j| j.truncate = true)
+            .await
+            .unwrap();
+        let (code, v) = post(addr, "/v1/snapshots/orders~01/retry", "").await;
+        assert_eq!(code, 202, "{v}");
+        assert_eq!(v["retry_of"], "orders~01");
+        assert_eq!(v["tables"], json!(["public.items"]), "not copied: {v}");
+        assert_eq!(v["truncate"], true, "as the old job");
+        let id = v["job_id"].as_str().unwrap().to_owned();
+        let job = docs.snapshot_job(&id).await.unwrap().unwrap().doc;
+        assert_eq!(job.retry_of.as_deref(), Some("orders~01"));
+        assert_eq!(job.requested_role.as_deref(), Some("admin"));
+        assert_eq!(docs.requests().await.unwrap().restart.unwrap().id, id);
+        let (_, one) = json_of(addr, "GET", &format!("/v1/snapshots/{id}")).await;
+        assert_eq!(one["retry_of"], "orders~01", "{one}");
+
+        // The new job holds public.items until it ends.
+        let (code, v) = post(
+            addr,
+            "/v1/snapshots/orders~01/retry",
+            r#"{"tables": "all"}"#,
+        )
+        .await;
+        assert_eq!(code, 409, "{v}");
+        docs.update_snapshot_job(&id, |j| {
+            j.tables[0].end(JobTableStatus::Completed, None, Utc::now());
+            j.settle(Utc::now());
+        })
+        .await
+        .unwrap();
+        let (code, v) = post(
+            addr,
+            "/v1/snapshots/orders~01/retry",
+            r#"{"tables": "all", "truncate": false, "note": "again"}"#,
+        )
+        .await;
+        assert_eq!(code, 202, "{v}");
+        assert_eq!(v["tables"], json!(["public.orders", "public.items"]));
+        assert_eq!(v["truncate"], false);
+        let again = v["job_id"].as_str().unwrap();
+        let job = docs.snapshot_job(again).await.unwrap().unwrap().doc;
+        assert_eq!(job.note.as_deref(), Some("again"));
+
+        let (code, v) = post(addr, &format!("/v1/snapshots/{again}/retry"), "").await;
+        assert_eq!(code, 409, "queued: {v}");
+        assert!(
+            v["error"].as_str().unwrap().contains("once it ended"),
+            "{v}"
+        );
+        let (code, v) = post(addr, &format!("/v1/snapshots/{id}/retry"), "").await;
+        assert_eq!(code, 409, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("was copied"), "{v}");
+        for bad in [r#"{"tables": "some"}"#, r#"{"drop": true}"#, r#""x""#] {
+            let (code, v) = post(addr, "/v1/snapshots/orders~01/retry", bad).await;
+            assert_eq!(code, 422, "{bad}: {v}");
+        }
+        let (code, _) = post(addr, "/v1/snapshots/orders~09/retry", "").await;
+        assert_eq!(code, 404);
+        let (code, _) = post(addr, "/v1/snapshots/orders~09/cancel", "").await;
+        assert_eq!(code, 404);
+    }
+
+    fn table(status: JobTableStatus, rows_done: u64, started: bool) -> JobTable {
+        let mut t = JobTable::queued(TableRef::new("public", "a"));
+        t.status = status;
+        t.rows_done = rows_done;
+        t.started_at = started.then(Utc::now);
+        t
+    }
+
+    #[test]
+    fn lake_says_what_lake_readers_see() {
+        use JobTableStatus::{Cancelled, Completed, Failed, Queued, Running};
+        for truncate in [false, true] {
+            assert_eq!(
+                super::lake(truncate, &table(Completed, 5, true)),
+                "complete"
+            );
+            assert_eq!(super::lake(truncate, &table(Queued, 0, false)), "as_before");
+            assert_eq!(
+                super::lake(truncate, &table(Cancelled, 0, false)),
+                "as_before",
+                "cancelled before it began"
+            );
+        }
+        assert_eq!(super::lake(false, &table(Running, 5, true)), "as_before");
+        assert_eq!(super::lake(true, &table(Running, 0, true)), "empty");
+        assert_eq!(super::lake(true, &table(Running, 5, true)), "partial");
+        assert_eq!(super::lake(true, &table(Cancelled, 5, true)), "partial");
+        assert_eq!(super::lake(true, &table(Failed, 0, true)), "empty");
+        assert_eq!(
+            super::lake(true, &table(Running, 5, false)),
+            "partial",
+            "a job a 1.0 node started records no start"
+        );
+    }
+
+    #[test]
+    fn a_job_s_pace_is_its_rate_and_the_time_its_estimates_leave() {
+        let t0 = Utc::now();
+        let mut job = SnapshotJobDoc::new(
+            "orders~01".into(),
+            vec![
+                TableRef::new("public", "a"),
+                TableRef::new("public", "b"),
+                TableRef::new("public", "c"),
+            ],
+            "ops".into(),
+            t0,
+        );
+        for (t, (status, rows, estimate)) in job.tables.iter_mut().zip([
+            (JobTableStatus::Completed, 600, 600),
+            (JobTableStatus::Running, 400, 1000),
+            (JobTableStatus::Running, 0, 500),
+        ]) {
+            t.status = status;
+            t.rows_done = rows;
+            t.estimate = Some(estimate);
+            t.started_at = Some(t0);
+        }
+        job.settle(t0);
+        let at = |s: i64| t0 + chrono::TimeDelta::seconds(s);
+        assert_eq!(super::pace(&job, at(59)), (None, None), "under a minute");
+        // 1000 rows in 100 s; (1000 - 400) + 500 left.
+        assert_eq!(super::pace(&job, at(100)), (Some(10), Some(110)));
+        job.tables[2].estimate = None;
+        assert_eq!(
+            super::pace(&job, at(100)),
+            (Some(10), None),
+            "an unended table without an estimate"
+        );
+        job.tables[1].end(JobTableStatus::Cancelled, None, at(100));
+        job.tables[2].end(JobTableStatus::Cancelled, None, at(100));
+        job.settle(at(100));
+        assert_eq!(super::pace(&job, at(200)), (None, None), "ended");
     }
 }

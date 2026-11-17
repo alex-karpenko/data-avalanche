@@ -188,6 +188,43 @@ Least role: `viewer`.
 | `200` | the job |
 | `404` | no such job |
 
+### `POST /v1/snapshots/{job_id}/cancel`
+
+Cancel a job: the pipeline's next start ends its unended tables; a table it was bringing back from a halt halts again, COPY_CANCELLED
+
+Least role: `operator`.
+
+- Path parameter `job_id`: the snapshot job's id, `<pipeline id>~<suffix>`.
+- Body: `application/json`.
+- `note`: why, kept with the action's event (optional, at most 500 characters).
+
+| Status | When |
+|---|---|
+| `200` | cancelled already |
+| `202` | cancelling: the owner restarts the worker, or the pipeline's next start ends it |
+| `404` | no such job |
+| `409` | the job has ended |
+| `413` | the body is over 1 MiB |
+| `422` | the body isn't `{"note": ...}`; or the note is too long, not a string, holds a control character, or the body isn't a JSON object |
+
+### `POST /v1/snapshots/{job_id}/retry`
+
+Retry an ended job: a new job of its tables, `{"tables": "all" | "not_copied", "truncate": ...}`, that records the job it retries
+
+Least role: `operator`.
+
+- Path parameter `job_id`: the snapshot job's id, `<pipeline id>~<suffix>`.
+- Body: `application/json`.
+- `note`: why, kept with the action's event (optional, at most 500 characters).
+
+| Status | When |
+|---|---|
+| `202` | the new job is queued |
+| `404` | no such job |
+| `409` | the job hasn't ended, it left no table to copy, the pipeline doesn't run, no node holds its lease, or an unfinished job holds a table |
+| `413` | the body is over 1 MiB |
+| `422` | the body isn't of that form; or the note is too long, not a string, holds a control character, or the body isn't a JSON object |
+
 ## config
 
 The config generation the cluster runs: validate, publish, status.
