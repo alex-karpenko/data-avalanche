@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use data_avalanche_core::TableRef;
 use data_avalanche_state::{
     HaltsDoc, JobTableStatus, KEPT_ENDED_JOBS, PipelineDocs, SnapshotJobDoc, SnapshotStatus,
@@ -40,7 +40,10 @@ pub(crate) fn progress(
     }
 }
 
-fn apply(job: &mut SnapshotJobDoc, seen: &BTreeMap<TableRef, Progress>) {
+fn apply(job: &mut SnapshotJobDoc, seen: &BTreeMap<TableRef, Progress>, now: DateTime<Utc>) {
+    // A cancelled job's copies stop at the next start, which ends them: an abandoned document
+    // or a `COPY_CANCELLED` halt is then the cancel's, not a failure (D-M13c.2).
+    let cancelled = job.cancel.is_some();
     for t in &mut job.tables {
         if t.status != JobTableStatus::Running {
             continue;
@@ -48,48 +51,53 @@ fn apply(job: &mut SnapshotJobDoc, seen: &BTreeMap<TableRef, Progress>) {
         match seen.get(&t.table) {
             Some(Progress::Running { rows_done }) => t.rows_done = *rows_done,
             Some(Progress::Completed { rows }) => {
-                t.status = JobTableStatus::Completed;
                 t.rows_done = *rows;
+                t.end(JobTableStatus::Completed, None, now);
             }
-            Some(Progress::Failed(why)) => {
-                t.status = JobTableStatus::Failed;
-                t.error = Some(why.clone());
+            Some(Progress::Failed(why)) if !cancelled => {
+                t.end(JobTableStatus::Failed, Some(why.clone()), now);
             }
-            None => {}
+            Some(Progress::Failed(_)) | None => {}
         }
     }
 }
 
-/// The unfinished jobs this owner follows; `None` until a listing succeeds.
+/// The unfinished jobs this owner follows; none until a listing succeeds.
 #[derive(Debug, Default)]
-pub(crate) struct Jobs(Option<BTreeSet<String>>);
+pub(crate) struct Jobs {
+    ids: BTreeSet<String>,
+    /// A listing succeeded since the last that failed.
+    listed: bool,
+}
 
 impl Jobs {
     /// Lists the unfinished jobs: when the term starts, and after a restart taken (a job's
-    /// restart). A failed listing is tried again at the next poll.
+    /// restart). The jobs followed already stay: one a start ended since is reported at the
+    /// next poll. A failed listing is tried again at the next poll.
     pub async fn list(&mut self, docs: &PipelineDocs, pipeline: &str) {
-        self.0 = match docs.unfinished_snapshot_jobs().await {
-            Ok(jobs) => Some(jobs.into_iter().map(|j| j.job_id).collect()),
+        match docs.unfinished_snapshot_jobs().await {
+            Ok(jobs) => {
+                self.ids.extend(jobs.into_iter().map(|j| j.job_id));
+                self.listed = true;
+            }
             Err(e) => {
                 tracing::warn!(
                     pipeline,
                     "snapshot jobs unlisted, listed at the next poll: {e}"
                 );
-                None
+                self.listed = false;
             }
-        };
+        }
     }
 
     /// One poll: each job's running tables, from their documents, into the job; a job that
     /// ended, or is gone, is followed no more. The jobs that ended at this poll.
     pub async fn poll(&mut self, docs: &PipelineDocs, pipeline: &str) -> Vec<SnapshotJobDoc> {
         let mut done = Vec::new();
-        if self.0.is_none() {
+        if !self.listed {
             self.list(docs, pipeline).await;
         }
-        let Some(ids) = self.0.as_mut() else {
-            return done;
-        };
+        let ids = &mut self.ids;
         if ids.is_empty() {
             return done;
         }
@@ -173,16 +181,17 @@ async fn follow(
         let doc = docs.table_snapshot(&t.table).await?.map(|v| v.doc);
         seen.insert(t.table.clone(), progress(&t.table, halts, doc.as_ref()));
     }
+    let now = Utc::now();
     let mut next = v.doc.clone();
-    apply(&mut next, &seen);
-    next.settle(Utc::now());
+    apply(&mut next, &seen, now);
+    next.settle(now);
     if next == v.doc {
         return Ok(None);
     }
     let job = docs
         .update_snapshot_job(&v.doc.job_id, |j| {
-            apply(j, &seen);
-            j.settle(Utc::now());
+            apply(j, &seen, now);
+            j.settle(now);
         })
         .await?;
     Ok(job.filter(SnapshotJobDoc::is_finished))
@@ -195,7 +204,9 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use data_avalanche_core::HaltReason;
-    use data_avalanche_state::{DocStore, HALTS_KEY, JobStatus, SnapshotCursor, TableHalt};
+    use data_avalanche_state::{
+        DocStore, HALTS_KEY, JobCancel, JobStatus, SnapshotCursor, TableHalt,
+    };
     use data_avalanche_storage::{ObjectStoreVersioned, ObjectVersion, StoreError, VersionedStore};
     use object_store::memory::InMemory;
 
@@ -302,9 +313,108 @@ mod tests {
     #[tokio::test]
     async fn a_job_that_is_gone_is_followed_no_more() {
         let (_, docs) = starting();
-        let mut jobs = Jobs(Some(BTreeSet::from(["gone".to_owned()])));
+        let mut jobs = Jobs {
+            ids: BTreeSet::from(["gone".to_owned()]),
+            listed: true,
+        };
         jobs.poll(&docs, "p").await;
-        assert_eq!(jobs.0, Some(BTreeSet::new()));
+        assert!(jobs.ids.is_empty());
+    }
+
+    fn running_job(id: &str) -> SnapshotJobDoc {
+        let mut job = SnapshotJobDoc::new(
+            id.into(),
+            vec![TableRef::new("public", "a")],
+            "api".into(),
+            Utc::now(),
+        );
+        job.status = JobStatus::Running;
+        job.tables[0].status = JobTableStatus::Running;
+        job
+    }
+
+    /// A table that ends records when; the job's end is the poll's.
+    #[tokio::test]
+    async fn a_table_that_ends_records_when() {
+        let (_, docs) = starting();
+        docs.create_snapshot_job(&running_job("j1")).await.unwrap();
+        let mut done = doc(SnapshotStatus::Completed);
+        done.row_count = Some(3);
+        docs.save_table_snapshot(&done).await.unwrap();
+        let before = Utc::now();
+        let mut jobs = Jobs::default();
+        jobs.list(&docs, "p").await;
+        let ended = jobs.poll(&docs, "p").await;
+        assert_eq!(ended.len(), 1);
+        let t = &ended[0].tables[0];
+        assert_eq!(t.status, JobTableStatus::Completed);
+        assert_eq!(t.rows_done, 3);
+        assert!(t.ended_at.is_some_and(|at| at >= before), "{t:?}");
+        assert_eq!(t.ended_at, ended[0].finished_at);
+    }
+
+    /// D-M13c.2: a cancelled job's copy whose document the start abandoned, or whose table it
+    /// halted `COPY_CANCELLED`, isn't failed: the start ends it cancelled, and the poll after
+    /// reports the job so.
+    #[tokio::test]
+    async fn a_cancelled_job_s_stopped_copy_isn_t_failed() {
+        let (_, docs) = starting();
+        let a = TableRef::new("public", "a");
+        let mut job = running_job("j1");
+        job.cancel = Some(JobCancel {
+            by: "ops".into(),
+            role: "operator".into(),
+            at: Utc::now(),
+            note: None,
+        });
+        docs.create_snapshot_job(&job).await.unwrap();
+        docs.save_table_snapshot(&doc(SnapshotStatus::None))
+            .await
+            .unwrap();
+        docs.record_halt(&TableHalt {
+            table: a.clone(),
+            reason: HaltReason::CopyCancelled { job: "j1".into() },
+            at: "pg:0/10".parse().unwrap(),
+            copy: false,
+        })
+        .await
+        .unwrap();
+        let mut jobs = Jobs::default();
+        jobs.list(&docs, "p").await;
+        assert!(jobs.poll(&docs, "p").await.is_empty());
+        let j = docs.snapshot_job("j1").await.unwrap().unwrap().doc;
+        assert_eq!(j.tables[0].status, JobTableStatus::Running, "{j:?}");
+        // The start ends it.
+        docs.update_snapshot_job("j1", |j| {
+            j.tables[0].end(JobTableStatus::Cancelled, None, Utc::now());
+            j.settle(Utc::now());
+        })
+        .await
+        .unwrap();
+        let ended = jobs.poll(&docs, "p").await;
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].status, JobStatus::Cancelled);
+    }
+
+    /// A job a start ended between two listings (a cancel's restart, then another job's) is
+    /// still reported: a listing adds to the jobs followed.
+    #[tokio::test]
+    async fn a_job_a_start_ended_between_listings_is_reported() {
+        let (_, docs) = starting();
+        docs.create_snapshot_job(&running_job("j1")).await.unwrap();
+        let mut jobs = Jobs::default();
+        jobs.list(&docs, "p").await;
+        docs.update_snapshot_job("j1", |j| {
+            j.tables[0].end(JobTableStatus::Cancelled, None, Utc::now());
+            j.settle(Utc::now());
+        })
+        .await
+        .unwrap();
+        jobs.list(&docs, "p").await;
+        let ended = jobs.poll(&docs, "p").await;
+        assert_eq!(ended.len(), 1, "{ended:?}");
+        assert_eq!(ended[0].job_id, "j1");
+        assert!(jobs.ids.is_empty());
     }
 
     /// A job that ends at a poll deletes the ended jobs past the newest [`KEPT_ENDED_JOBS`]
