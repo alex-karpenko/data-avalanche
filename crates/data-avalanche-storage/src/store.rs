@@ -115,7 +115,8 @@ pub trait VersionedStore: Send + Sync + std::fmt::Debug {
     async fn delete(&self, key: &str) -> Result<(), StoreError>;
     /// Deletes every key of `keys` as [`Self::delete`] does: in batches where the store can (S3
     /// deletes a thousand a request), else one at a time (the default). The first failure ends
-    /// it; the keys before it may be gone.
+    /// it; any of the keys may be gone, those after the failing one too where batches run
+    /// concurrently.
     async fn delete_many(&self, keys: &[String]) -> Result<(), StoreError> {
         for key in keys {
             self.delete(key).await?;

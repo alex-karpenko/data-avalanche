@@ -263,8 +263,8 @@ impl Events {
 
     /// Deletes every event of the days that ended `retention` or more before `now`, and returns
     /// how many. Whole days only: an event lives at least `retention`, at most a day more; each
-    /// day's in one batched delete ([`VersionedStore::delete_many`]). Safe on every node at once. A retention reaching past the earliest time a date can hold keeps
-    /// everything.
+    /// day's in one batched delete ([`VersionedStore::delete_many`]). Safe on every node at once.
+    /// A retention reaching past the earliest time a date can hold keeps everything.
     ///
     /// # Errors
     /// A storage failure; what was deleted before it stays deleted.
