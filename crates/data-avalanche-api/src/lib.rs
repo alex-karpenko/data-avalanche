@@ -51,6 +51,7 @@ pub use peers::{
     STATUS_LIMIT, TARGET,
 };
 pub use server::{Bound, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT, MAX_CONNECTIONS, ServeError, bind};
+pub use snapshots::{EndedJobs, READ_AT_ONCE};
 
 use crate::auth::Denied;
 
@@ -92,6 +93,8 @@ pub struct Node {
     pub process: watch::Receiver<ProcessFigures>,
     /// What the gossip saw of its probes.
     pub gossip: watch::Receiver<GossipFigures>,
+    /// The ended snapshot jobs `GET /v1/snapshots` read: they don't change.
+    pub ended_jobs: Arc<EndedJobs>,
 }
 
 impl std::fmt::Debug for Node {
@@ -464,6 +467,20 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
                 &[(200, "the jobs"), UNKNOWN],
             ),
             get(snapshots::list),
+        ),
+        (
+            r(
+                "GET",
+                "/v1/snapshots",
+                Viewer,
+                "Every pipeline's snapshot jobs, newest request first: by status, pipeline and who asked; a pipeline whose jobs can't be read is named under `unreadable`",
+                &[
+                    (200, "the jobs"),
+                    (400, "a parameter that isn't one, or a status that isn't"),
+                    (404, "no such pipeline in the generation this node runs"),
+                ],
+            ),
+            get(snapshots::all),
         ),
         (
             r(
@@ -884,6 +901,7 @@ mod tests {
                 ("POST", "/v1/pipelines/{id}/flush", Operator),
                 ("POST", "/v1/pipelines/{id}/snapshots", Operator),
                 ("GET", "/v1/pipelines/{id}/snapshots", Viewer),
+                ("GET", "/v1/snapshots", Viewer),
                 ("GET", "/v1/snapshots/{job_id}", Viewer),
                 ("POST", "/v1/snapshots/{job_id}/cancel", Operator),
                 ("POST", "/v1/snapshots/{job_id}/retry", Operator),

@@ -19,6 +19,7 @@ data-avalanche-config.workspace = true
 data-avalanche-core.workspace = true
 data-avalanche-state.workspace = true
 data-avalanche-telemetry.workspace = true
+futures-util.workspace = true
 http-body-util.workspace = true
 jsonwebtoken.workspace = true
 reqwest.workspace = true
@@ -40,7 +41,6 @@ axum = { workspace = true, features = ["json"] }
 boon.workspace = true
 data-avalanche-pipeline.workspace = true
 data-avalanche-storage.workspace = true
-futures-util.workspace = true
 object_store.workspace = true
 rcgen.workspace = true
 tempfile.workspace = true

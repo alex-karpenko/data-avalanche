@@ -175,6 +175,22 @@ Least role: `operator`.
 
 Snapshot jobs started through the API.
 
+### `GET /v1/snapshots`
+
+Every pipeline's snapshot jobs, newest request first: by status, pipeline and who asked; a pipeline whose jobs can't be read is named under `unreadable`
+
+Least role: `viewer`.
+
+- Query parameter `status`: queued, running, cancelling, completed, failed or cancelled; several comma-separated.
+- Query parameter `pipeline`: a pipeline's id.
+- Query parameter `by`: who asked for it.
+
+| Status | When |
+|---|---|
+| `200` | the jobs |
+| `400` | a parameter that isn't one, or a status that isn't |
+| `404` | no such pipeline in the generation this node runs |
+
 ### `GET /v1/snapshots/{job_id}`
 
 A snapshot job: its status and each table's

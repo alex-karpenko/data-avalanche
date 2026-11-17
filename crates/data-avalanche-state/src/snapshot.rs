@@ -465,6 +465,37 @@ impl PipelineDocs {
         });
         Ok(jobs)
     }
+
+    /// Every job of this pipeline as [`Self::snapshot_jobs`] reads them, each with its key; but
+    /// a job `known` gives by its key is taken from there, not read (an ended job doesn't
+    /// change, so a reader may keep it).
+    ///
+    /// # Errors
+    /// As [`Self::snapshot_jobs`].
+    pub async fn snapshot_jobs_reusing(
+        &self,
+        known: impl Fn(&str) -> Option<SnapshotJobDoc>,
+    ) -> Result<Vec<(String, SnapshotJobDoc)>, StateError> {
+        let mut jobs = vec![];
+        for key in self.docs.store().list(JOBS_PREFIX).await? {
+            if let Some(job) = known(&key) {
+                jobs.push((key, job));
+                continue;
+            }
+            match self.docs.load::<SnapshotJobDoc>(&key).await {
+                Ok(Some(v)) => jobs.push((key, v.doc)),
+                Ok(None) => {}
+                Err(e @ (StateError::Corrupt { .. } | StateError::UnsupportedVersion { .. })) => {
+                    tracing::warn!("snapshot job {key} skipped: {e}");
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        jobs.sort_by(|(_, a), (_, b)| {
+            (a.requested_at, &a.job_id).cmp(&(b.requested_at, &b.job_id))
+        });
+        Ok(jobs)
+    }
 }
 
 #[cfg(test)]
@@ -999,5 +1030,38 @@ mod tests {
             .collect();
         assert_eq!(ids, ["good"]);
         assert_eq!(p.unfinished_snapshot_jobs().await.unwrap().len(), 1);
+    }
+
+    /// A job the caller knows by its key is taken from it, not read; the others are read; a
+    /// key it knows that the listing lacks isn't returned.
+    #[tokio::test]
+    async fn jobs_known_by_their_key_are_not_read_again() {
+        let p = pipeline();
+        let a = TableRef::new("public", "a");
+        let mut ended = SnapshotJobDoc::new("p~1".into(), vec![a.clone()], "ops".into(), t(1));
+        ended.tables[0].end(JobTableStatus::Completed, None, t(2));
+        ended.settle(t(2));
+        p.create_snapshot_job(&ended).await.unwrap();
+        let running = SnapshotJobDoc::new("p~2".into(), vec![a], "ops".into(), t(3));
+        p.create_snapshot_job(&running).await.unwrap();
+        let mut kept = ended.clone();
+        kept.requested_by = "kept".into();
+        let known = |key: &str| match key {
+            k if k == job_key("p~1") => Some(kept.clone()),
+            k if k == job_key("p~0") => panic!("not listed, not asked"),
+            _ => None,
+        };
+        let got = p.snapshot_jobs_reusing(known).await.unwrap();
+        let got: Vec<(&str, &str, &str)> = got
+            .iter()
+            .map(|(k, j)| (k.as_str(), j.job_id.as_str(), j.requested_by.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("snapshots/jobs/p~1.json", "p~1", "kept"),
+                ("snapshots/jobs/p~2.json", "p~2", "ops"),
+            ]
+        );
     }
 }

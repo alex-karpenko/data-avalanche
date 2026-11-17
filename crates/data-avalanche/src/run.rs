@@ -305,6 +305,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         peers,
         process,
         gossip: gossip.figures(),
+        ended_jobs: Arc::default(),
     });
     ready.store(true, Ordering::SeqCst);
     let mut cluster = Some((gossip, reconciler, discovery));

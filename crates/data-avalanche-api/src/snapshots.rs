@@ -8,7 +8,7 @@
 use std::collections::BTreeSet;
 
 use axum::Extension;
-use axum::extract::{Path, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use chrono::{DateTime, Utc};
@@ -611,6 +611,173 @@ pub(crate) async fn get(State(api): State<Api>, Path(job_id): Path<String>) -> R
     }
 }
 
+/// How many pipelines' jobs `GET /v1/snapshots` reads at once.
+pub const READ_AT_ONCE: usize = 16;
+
+/// The statuses a job is listed by.
+const STATUSES: [&str; 6] = [
+    "queued",
+    "running",
+    "cancelling",
+    "completed",
+    "failed",
+    "cancelled",
+];
+
+/// `GET /v1/snapshots`'s query.
+pub(crate) const PARAMETERS: &[(&str, &str)] = &[
+    (
+        "status",
+        "queued, running, cancelling, completed, failed or cancelled; several comma-separated",
+    ),
+    ("pipeline", "a pipeline's id"),
+    ("by", "who asked for it"),
+];
+
+/// The ended snapshot jobs `GET /v1/snapshots` read, by pipeline and key: an ended job doesn't
+/// change, so it is read once. A job a later listing lacks (pruned) goes.
+#[derive(Debug, Default)]
+pub struct EndedJobs(
+    std::sync::Mutex<std::collections::BTreeMap<(String, String), SnapshotJobDoc>>,
+);
+
+impl EndedJobs {
+    fn known(&self, pipeline: &str, key: &str) -> Option<SnapshotJobDoc> {
+        let kept = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        kept.get(&(pipeline.to_owned(), key.to_owned())).cloned()
+    }
+
+    /// Keeps pipeline `pipeline`'s ended jobs of `listed`, and only those.
+    fn keep(&self, pipeline: &str, listed: &[(String, SnapshotJobDoc)]) {
+        let mut kept = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        kept.retain(|(p, _), _| p != pipeline);
+        for (key, job) in listed.iter().filter(|(_, j)| j.is_finished()) {
+            kept.insert((pipeline.to_owned(), key.clone()), job.clone());
+        }
+    }
+}
+
+/// `GET /v1/snapshots`'s filter: the statuses, the pipeline, who asked.
+#[derive(Debug, Default)]
+struct Filter {
+    statuses: Vec<String>,
+    pipeline: Option<String>,
+    by: Option<String>,
+}
+
+fn filter(params: &[(String, String)]) -> Result<Filter, Failure> {
+    let bad = |why: String| Failure::new(StatusCode::BAD_REQUEST, why);
+    let mut f = Filter::default();
+    let mut seen = Vec::new();
+    for (name, value) in params {
+        if seen.contains(name) {
+            return Err(bad(format!("{name} is given twice")));
+        }
+        seen.push(name.clone());
+        let value = value.trim().to_owned();
+        match name.as_str() {
+            "status" => {
+                for s in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    if !STATUSES.contains(&s) {
+                        return Err(bad(format!(
+                            "status {s:?} isn't one of {}",
+                            STATUSES.join(", ")
+                        )));
+                    }
+                    f.statuses.push(s.to_owned());
+                }
+            }
+            "pipeline" => f.pipeline = Some(value),
+            "by" => f.by = Some(value),
+            other => {
+                return Err(bad(format!(
+                    "unknown parameter {other:?}: the jobs take status, pipeline, by"
+                )));
+            }
+        }
+    }
+    Ok(f)
+}
+
+/// Pipeline `p`'s jobs, each with its key, the ended ones [`EndedJobs`] keeps not read again.
+async fn jobs_of(node: &Node, p: &Pipeline) -> Result<Vec<(String, SnapshotJobDoc)>, String> {
+    let docs = (node.docs)(p).map_err(|e| format!("the state location: {e}"))?;
+    let jobs = docs
+        .snapshot_jobs_reusing(|key| node.ended_jobs.known(&p.id, key))
+        .await
+        .map_err(|e| e.to_string())?;
+    node.ended_jobs.keep(&p.id, &jobs);
+    Ok(jobs)
+}
+
+/// `GET /v1/snapshots`: the jobs of every pipeline of the generation, newest request first,
+/// filtered; the pipelines read [`READ_AT_ONCE`] at a time. A pipeline whose jobs can't be read
+/// is named under `unreadable`, and the others are listed.
+pub(crate) async fn all(State(api): State<Api>, RawQuery(raw): RawQuery) -> Response {
+    use futures_util::StreamExt;
+    let Some(node) = api.node.get() else {
+        return starting();
+    };
+    let params: Vec<(String, String)> =
+        url::form_urlencoded::parse(raw.unwrap_or_default().as_bytes())
+            .into_owned()
+            .collect();
+    let f = match filter(&params) {
+        Ok(f) => f,
+        Err(f) => return f.into(),
+    };
+    let config = node.coordinator.config().await;
+    let mut pipelines: Vec<&Pipeline> = config
+        .pipelines
+        .values()
+        .filter(|p| f.pipeline.as_ref().is_none_or(|id| &p.id == id))
+        .collect();
+    if let Some(id) = &f.pipeline
+        && pipelines.is_empty()
+    {
+        return Failure::new(
+            StatusCode::NOT_FOUND,
+            format!("no pipeline {id:?} in the config generation this node runs"),
+        )
+        .into();
+    }
+    pipelines.sort_by(|a, b| a.id.cmp(&b.id));
+    // Owned: a stream over references doesn't make a `Send` future (rust-lang/rust#64552).
+    let owned: Vec<Pipeline> = pipelines.iter().map(|p| (*p).clone()).collect();
+    let read = futures_util::stream::iter(owned)
+        .map(|p| async move { jobs_of(node, &p).await })
+        .buffered(READ_AT_ONCE)
+        .collect::<Vec<_>>()
+        .await;
+    let now = Utc::now();
+    let mut jobs = vec![];
+    let mut unreadable = vec![];
+    for (p, got) in pipelines.into_iter().zip(read) {
+        match got {
+            Ok(listed) => jobs.extend(listed.into_iter().map(|(_, j)| (p, j))),
+            Err(error) => unreadable.push(json!({ "pipeline": p.id, "error": error })),
+        }
+    }
+    jobs.retain(|(_, j)| {
+        (f.statuses.is_empty() || f.statuses.iter().any(|s| s == status_name(j)))
+            && f.by.as_ref().is_none_or(|by| &j.requested_by == by)
+    });
+    jobs.sort_by(|(_, a), (_, b)| (b.requested_at, &b.job_id).cmp(&(a.requested_at, &a.job_id)));
+    body(
+        StatusCode::OK,
+        &json!({
+            "jobs": jobs.iter().map(|(p, j)| job_json(p, j, now)).collect::<Vec<_>>(),
+            "unreadable": unreadable,
+        }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
@@ -619,8 +786,8 @@ mod tests {
     use chrono::Utc;
     use data_avalanche_core::TableRef;
     use data_avalanche_state::{
-        Acquired, DesiredState, Holder, JobStatus, JobTable, JobTableStatus, PipelineDocs,
-        SnapshotJobDoc,
+        Acquired, DesiredState, Holder, JobCancel, JobStatus, JobTable, JobTableStatus,
+        PipelineDocs, SnapshotJobDoc,
     };
     use serde_json::{Value, json};
     use tempfile::TempDir;
@@ -1194,5 +1361,175 @@ mod tests {
         assert_eq!(one["estimate"], Value::Null, "one table has none: {one}");
         assert_eq!(one["tables"][0]["estimate"], 600, "{one}");
         assert_eq!(one["tables"][1]["estimate"], Value::Null, "{one}");
+    }
+
+    /// [`CONFIG`] and a second pipeline, `billing`, its state elsewhere.
+    async fn served_two() -> (SocketAddr, Lone, PipelineDocs, PipelineDocs, TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.yaml");
+        let two = format!(
+            "{CONFIG}  billing:
+    id: billing
+    source:
+      host: db.example.com
+      db: billing
+      user: cdc
+      password: pw
+      postgres: {{ publication: billing_pub, slot: billing_slot }}
+    tables:
+      include: [public.invoices]
+    sink:
+      type: delta
+      bucket: lake
+      prefix: bill
+"
+        );
+        std::fs::write(&file, &two).unwrap();
+        let env = std::sync::Arc::new(data_avalanche_config::ProcessEnv);
+        let lone = crate::test_support::lone_with(file, &two, env).await;
+        let config = lone.node.coordinator.config().await;
+        let orders = (lone.node.docs)(&config.pipelines["orders"]).unwrap();
+        let billing = (lone.node.docs)(&config.pipelines["billing"]).unwrap();
+        let a = api(open());
+        a.node.set(lone.node.clone()).unwrap();
+        (serve(a).await, lone, orders, billing, dir)
+    }
+
+    async fn listed(addr: SocketAddr, query: &str) -> (u16, Value) {
+        json_of(addr, "GET", &format!("/v1/snapshots{query}")).await
+    }
+
+    fn ids(v: &Value) -> Vec<String> {
+        v["jobs"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{v}"))
+            .iter()
+            .map(|j| {
+                format!(
+                    "{} {}",
+                    j["job_id"].as_str().unwrap(),
+                    j["status"].as_str().unwrap()
+                )
+            })
+            .collect()
+    }
+
+    /// Every pipeline's jobs, newest request first, filtered by status (several at once),
+    /// pipeline and who asked.
+    #[tokio::test]
+    async fn the_jobs_of_every_pipeline_are_listed_and_filtered() {
+        let (addr, _lone, orders, billing, _dir) = served_two().await;
+        recorded(
+            &orders,
+            "orders~01",
+            &[("orders", JobTableStatus::Completed)],
+        )
+        .await;
+        recorded(
+            &billing,
+            "billing~02",
+            &[("invoices", JobTableStatus::Running)],
+        )
+        .await;
+        recorded(&orders, "orders~03", &[("orders", JobTableStatus::Queued)]).await;
+        orders
+            .update_snapshot_job("orders~03", |j| {
+                j.cancel = Some(JobCancel {
+                    by: "ops".into(),
+                    role: "operator".into(),
+                    at: Utc::now(),
+                    note: None,
+                });
+            })
+            .await
+            .unwrap();
+        let (code, v) = listed(addr, "").await;
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(
+            ids(&v),
+            [
+                "orders~03 cancelling",
+                "billing~02 running",
+                "orders~01 completed"
+            ]
+        );
+        assert_eq!(v["jobs"][1]["pipeline"], "billing");
+        assert_eq!(v["unreadable"], json!([]));
+        let (_, v) = listed(addr, "?status=running,cancelling").await;
+        assert_eq!(ids(&v), ["orders~03 cancelling", "billing~02 running"]);
+        let (_, v) = listed(addr, "?pipeline=billing").await;
+        assert_eq!(ids(&v), ["billing~02 running"]);
+        let (_, v) = listed(addr, "?by=ops&status=completed").await;
+        assert_eq!(ids(&v), ["orders~01 completed"]);
+        let (_, v) = listed(addr, "?by=someone").await;
+        assert!(ids(&v).is_empty());
+        assert_eq!(listed(addr, "?pipeline=nope").await.0, 404);
+        for bad in ["?status=done", "?colour=red", "?by=a&by=b"] {
+            let (code, v) = listed(addr, bad).await;
+            assert_eq!(code, 400, "{bad}: {v}");
+        }
+    }
+
+    /// An ended job is read once: it doesn't change. A running one is read each time, and an
+    /// ended one pruned goes.
+    #[tokio::test]
+    async fn an_ended_job_is_read_once_and_goes_once_pruned() {
+        let (addr, _lone, orders, billing, _dir) = served_two().await;
+        recorded(
+            &orders,
+            "orders~01",
+            &[("orders", JobTableStatus::Completed)],
+        )
+        .await;
+        recorded(
+            &billing,
+            "billing~02",
+            &[("invoices", JobTableStatus::Running)],
+        )
+        .await;
+        assert_eq!(listed(addr, "").await.1["jobs"][1]["requested_by"], "ops");
+        for (docs, id) in [(&orders, "orders~01"), (&billing, "billing~02")] {
+            docs.update_snapshot_job(id, |j| j.requested_by = "changed".into())
+                .await
+                .unwrap();
+        }
+        let (_, v) = listed(addr, "").await;
+        assert_eq!(v["jobs"][0]["requested_by"], "changed", "running: {v}");
+        assert_eq!(v["jobs"][1]["requested_by"], "ops", "ended, kept: {v}");
+        assert_eq!(orders.prune_snapshot_jobs(0).await.unwrap(), 1);
+        let (_, v) = listed(addr, "").await;
+        assert_eq!(ids(&v), ["billing~02 running"]);
+    }
+
+    /// A pipeline whose jobs can't be read is named; the others' are listed.
+    #[tokio::test]
+    async fn a_pipeline_whose_jobs_can_t_be_read_is_named() {
+        let (_, lone, orders, _billing, _dir) = served_two().await;
+        recorded(
+            &orders,
+            "orders~01",
+            &[("orders", JobTableStatus::Completed)],
+        )
+        .await;
+        let mut node = lone.node.clone();
+        let docs = std::sync::Arc::clone(&node.docs);
+        node.docs = std::sync::Arc::new(move |p| match p.id.as_str() {
+            "billing" => Err("no bucket".into()),
+            _ => docs(p),
+        });
+        let a = api(open());
+        a.node.set(node).unwrap();
+        let addr = serve(a).await;
+        let (code, v) = listed(addr, "").await;
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(ids(&v), ["orders~01 completed"]);
+        assert_eq!(v["unreadable"][0]["pipeline"], "billing");
+        assert!(
+            v["unreadable"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("no bucket"),
+            "{v}"
+        );
     }
 }

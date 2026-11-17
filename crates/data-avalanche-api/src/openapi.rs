@@ -101,6 +101,18 @@ fn operation(r: &Route) -> utoipa::openapi::path::Operation {
             );
         }
     }
+    if r.path == "/v1/snapshots" {
+        for (name, description) in crate::snapshots::PARAMETERS {
+            op = op.parameter(
+                ParameterBuilder::new()
+                    .name(*name)
+                    .parameter_in(ParameterIn::Query)
+                    .required(Required::False)
+                    .description(Some(*description))
+                    .schema(Some(ObjectBuilder::new().schema_type(Type::String))),
+            );
+        }
+    }
     if r.path == "/v1/events" {
         for (name, description) in crate::events::PARAMETERS {
             let schema = if *name == "limit" {
