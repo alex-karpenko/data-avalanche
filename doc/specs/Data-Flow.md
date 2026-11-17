@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-13
+updated: 2026-11-17
 domain: Architecture
 tags: [architecture, data-flow, pipeline, cdc, iceberg, delta-lake, multi-sink, arrow, snapshot, replication]
 sources: []
@@ -792,7 +792,9 @@ job's tables. A queued table ends `cancelled`. A running table's snapshot state 
 snapshot its mode no longer asks for is: the table streams on, and ends `cancelled`. A table the
 job's start had brought back from a halt halts again, `COPY_CANCELLED`, naming the job: its sink
 table holds part of its rows, and its stream position may predate them, so copying it again takes
-a new job. A table whose copy completed before the start took the cancel ends `completed`. With
+a new job. So does a table a truncating job had begun to copy: the job emptied its sink table,
+which now holds part of its rows. Only a table the pipeline replicates halts; a job's copy of a
+table outside the config is only abandoned. A table whose copy completed before the start took the cancel ends `completed`. With
 no worker running (a stopped pipeline, or one whose lease no node holds), the next start takes the
 cancel. `POST /v1/snapshots/{job_id}/retry` asks a new job of an ended job's tables, those that
 didn't complete unless it asks for all, and records the job it retries.
