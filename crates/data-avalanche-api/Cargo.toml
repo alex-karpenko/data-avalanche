@@ -37,6 +37,8 @@ utoipa.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
+bytes.workspace = true
 axum = { workspace = true, features = ["json"] }
 boon.workspace = true
 data-avalanche-pipeline.workspace = true

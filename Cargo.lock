@@ -1783,10 +1783,12 @@ dependencies = [
 name = "data-avalanche-api"
 version = "1.0.1"
 dependencies = [
+ "async-trait",
  "axum",
  "base64 0.23.1",
  "blake3",
  "boon",
+ "bytes",
  "chrono",
  "data-avalanche-cluster",
  "data-avalanche-config",

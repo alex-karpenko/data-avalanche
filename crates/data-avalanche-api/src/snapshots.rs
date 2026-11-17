@@ -136,9 +136,9 @@ const RATE_AFTER: chrono::TimeDelta = chrono::TimeDelta::seconds(60);
 
 /// A running job's copy rate, rows a second, since its first table began, and the seconds left
 /// at that rate from the source's estimates of its unended tables. No rate before
-/// [`RATE_AFTER`] or once it ended; no ETA without a rate or an estimate of every unended table.
+/// [`RATE_AFTER`], once it ended or is cancelled; no ETA without a rate or an estimate of every unended table.
 fn pace(j: &SnapshotJobDoc, now: DateTime<Utc>) -> (Option<u64>, Option<u64>) {
-    if j.is_finished() {
+    if j.is_finished() || j.cancel.is_some() {
         return (None, None);
     }
     let Some(first) = j.tables.iter().filter_map(|t| t.started_at).min() else {
@@ -394,9 +394,10 @@ fn trimmed(note: Option<String>) -> Option<String> {
 
 /// `POST /v1/snapshots/{job_id}/cancel` (D-M13c.2): records who cancelled the job and why, then
 /// asks the pipeline's restart, whose start ends the job's unended tables; a copy of a table the
-/// job brought back from a halt halts it again, `COPY_CANCELLED`. A pipeline stopped, or whose
-/// lease no node holds, ends them at its next start. 202 `cancelling`; 200 when it was
-/// cancelled already; 409 once it ended.
+/// job brought back from a halt, or one a truncating job had begun to copy, halts it,
+/// `COPY_CANCELLED`. A pipeline stopped, or whose lease no node holds, ends them at its next
+/// start. 202 `cancelling`; 200 when it was cancelled already; 409 once it ended; 503 when the
+/// restart can't be asked (the cancel stays recorded).
 pub(crate) async fn cancel(
     State(api): State<Api>,
     Path(job_id): Path<String>,
@@ -448,6 +449,14 @@ pub(crate) async fn cancel(
         .await;
     match updated {
         Ok(Some(j)) if j.is_finished() => return ended(&j),
+        // Another cancel won the write between the read and this one: the job is cancelled
+        // already, by them.
+        Ok(Some(j)) if j.cancel.as_ref() != Some(&cancel) => {
+            return body(
+                StatusCode::OK,
+                &json!({ "job_id": job_id, "status": "cancelling", "unchanged": true }),
+            );
+        }
         Ok(Some(_)) => {}
         Ok(None) => {
             return Failure::new(StatusCode::NOT_FOUND, format!("no snapshot job {job_id:?}"))
@@ -455,40 +464,41 @@ pub(crate) async fn cancel(
         }
         Err(e) => return unavailable(&e),
     }
-    // A worker runs while the pipeline runs or is paused: its restart takes the cancel now.
-    let r = match read(node, &p, &docs).await {
-        Ok(r) => Some(r),
+    // A worker runs while the pipeline runs or is paused: its restart takes the cancel now. When
+    // the state can't be read, the restart is asked anyway: the controller leaves a stopped or
+    // paused pipeline as it is.
+    let runs = match read(node, &p, &docs).await {
+        Ok(r) => {
+            r.desired != DesiredState::Stopped && r.lease.as_ref().is_some_and(|l| !l.released)
+        }
         Err(e) => {
-            tracing::warn!(pipeline = %p.name, job = %job_id, "a cancel's restart unasked, the pipeline's state unread: {e}");
-            None
+            tracing::warn!(pipeline = %p.name, job = %job_id, "a cancel's restart asked, the pipeline's state unread: {e}");
+            true
         }
     };
-    let runs = r.as_ref().is_some_and(|r| {
-        r.desired != DesiredState::Stopped && r.lease.as_ref().is_some_and(|l| !l.released)
-    });
     let restart = Request {
         id: format!("{job_id}/cancel"),
         at: cancel.at,
     };
-    let asked = runs
-        && {
-            match docs.request(Action::Restart, restart).await {
-                Ok(()) => true,
-                Err(e) => {
-                    tracing::warn!(pipeline = %p.name, job = %job_id, "a cancel's restart unasked: {e}");
-                    false
-                }
-            }
-        };
-    tracing::info!(pipeline = %p.name, by = %by.name, job = %job_id, restart = asked, "snapshot job cancelled through the API");
-    let detail = if asked {
+    if runs && let Err(e) = docs.request(Action::Restart, restart).await {
+        tracing::warn!(pipeline = %p.name, job = %job_id, "a cancel's restart unasked: {e}");
+        return body(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({
+                "error": format!("the cancel is recorded, but its restart isn't ({e}): the pipeline's next start takes it"),
+                "job_id": job_id,
+            }),
+        );
+    }
+    tracing::info!(pipeline = %p.name, by = %by.name, job = %job_id, restart = runs, "snapshot job cancelled through the API");
+    let detail = if runs {
         "the owner restarts the pipeline's worker, whose start stops the job's copies"
     } else {
         "no worker runs the pipeline now: its next start stops the job's copies"
     };
     body(
         StatusCode::ACCEPTED,
-        &json!({ "job_id": job_id, "status": "cancelling", "restart": asked, "detail": detail }),
+        &json!({ "job_id": job_id, "status": "cancelling", "restart": runs, "detail": detail }),
     )
 }
 
@@ -650,6 +660,15 @@ impl EndedJobs {
         kept.get(&(pipeline.to_owned(), key.to_owned())).cloned()
     }
 
+    /// Drops the jobs of every pipeline `ids` doesn't hold: one removed from the config.
+    fn retain_pipelines(&self, ids: &[&str]) {
+        let mut kept = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        kept.retain(|(p, _), _| ids.contains(&p.as_str()));
+    }
+
     /// Keeps pipeline `pipeline`'s ended jobs of `listed`, and only those.
     fn keep(&self, pipeline: &str, listed: &[(String, SnapshotJobDoc)]) {
         let mut kept = self
@@ -738,6 +757,11 @@ pub(crate) async fn all(State(api): State<Api>, RawQuery(raw): RawQuery) -> Resp
         .values()
         .filter(|p| f.pipeline.as_ref().is_none_or(|id| &p.id == id))
         .collect();
+    if f.pipeline.is_none() {
+        // Every pipeline is listed: a removed one's ended jobs needn't be kept.
+        let ids: Vec<&str> = pipelines.iter().map(|p| p.id.as_str()).collect();
+        node.ended_jobs.retain_pipelines(&ids);
+    }
     if let Some(id) = &f.pipeline
         && pipelines.is_empty()
     {
@@ -789,6 +813,7 @@ mod tests {
         Acquired, DesiredState, Holder, JobCancel, JobStatus, JobTable, JobTableStatus,
         PipelineDocs, SnapshotJobDoc,
     };
+    use data_avalanche_storage::{ObjectStoreVersioned, ObjectVersion, StoreError, VersionedStore};
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
@@ -1501,6 +1526,28 @@ mod tests {
         assert_eq!(ids(&v), ["billing~02 running"]);
     }
 
+    /// A listing of every pipeline drops the kept jobs of a pipeline the config no longer has,
+    /// and keeps the others'.
+    #[test]
+    fn a_removed_pipeline_s_ended_jobs_are_dropped() {
+        let ended = super::EndedJobs::default();
+        let mut job = SnapshotJobDoc::new(
+            "orders~01".into(),
+            vec![TableRef::new("public", "a")],
+            "ops".into(),
+            Utc::now(),
+        );
+        job.tables[0].status = JobTableStatus::Completed;
+        job.settle(Utc::now());
+        let listed = [("orders~01".to_owned(), job)];
+        ended.keep("orders", &listed);
+        ended.keep("gone", &listed);
+        assert!(ended.known("gone", "orders~01").is_some());
+        ended.retain_pipelines(&["orders"]);
+        assert!(ended.known("gone", "orders~01").is_none(), "removed");
+        assert!(ended.known("orders", "orders~01").is_some(), "kept");
+    }
+
     /// A pipeline whose jobs can't be read is named; the others' are listed.
     #[tokio::test]
     async fn a_pipeline_whose_jobs_can_t_be_read_is_named() {
@@ -1530,6 +1577,209 @@ mod tests {
                 .unwrap()
                 .contains("no bucket"),
             "{v}"
+        );
+    }
+
+    /// A cancelled job shows no rate and no ETA: its copies are stopping.
+    #[test]
+    fn a_cancelling_job_shows_no_pace() {
+        let t0 = Utc::now();
+        let mut job = SnapshotJobDoc::new(
+            "orders~01".into(),
+            vec![TableRef::new("public", "a")],
+            "ops".into(),
+            t0,
+        );
+        job.tables[0].status = JobTableStatus::Running;
+        job.tables[0].rows_done = 1000;
+        job.tables[0].estimate = Some(2000);
+        job.tables[0].started_at = Some(t0);
+        let later = t0 + chrono::TimeDelta::seconds(100);
+        assert_eq!(super::pace(&job, later), (Some(10), Some(100)));
+        job.cancel = Some(JobCancel {
+            by: "ops".into(),
+            role: "operator".into(),
+            at: later,
+            note: None,
+        });
+        assert_eq!(super::pace(&job, later), (None, None), "cancelling");
+    }
+
+    /// A store that fails what a test asks it to, and lets a rival write first: the seam for the
+    /// paths a cancel takes when its follow-up reads and writes fail, or another cancel wins.
+    #[derive(Debug)]
+    struct Flaky {
+        inner: ObjectStoreVersioned,
+        /// Keys containing one of these fail to read.
+        no_read: std::sync::Mutex<Vec<String>>,
+        /// Keys containing one of these fail to write.
+        no_write: std::sync::Mutex<Vec<String>>,
+        /// The next conditional write of a key containing `.0` finds the fields `.1` set under it, as another
+        /// writer's would.
+        rival: std::sync::Mutex<Option<(String, Value)>>,
+    }
+
+    impl Flaky {
+        fn hit(list: &std::sync::Mutex<Vec<String>>, key: &str) -> Result<(), StoreError> {
+            if list
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|k| key.contains(k.as_str()))
+            {
+                return Err(StoreError::Transient {
+                    key: key.into(),
+                    reason: "the store is down".into(),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VersionedStore for Flaky {
+        async fn get(
+            &self,
+            key: &str,
+        ) -> Result<Option<(bytes::Bytes, ObjectVersion)>, StoreError> {
+            Self::hit(&self.no_read, key)?;
+            self.inner.get(key).await
+        }
+        async fn create(&self, key: &str, body: bytes::Bytes) -> Result<ObjectVersion, StoreError> {
+            Self::hit(&self.no_write, key)?;
+            self.inner.create(key, body).await
+        }
+        async fn update(
+            &self,
+            key: &str,
+            expected: &ObjectVersion,
+            body: bytes::Bytes,
+        ) -> Result<ObjectVersion, StoreError> {
+            Self::hit(&self.no_write, key)?;
+            let rival = {
+                let mut r = self.rival.lock().unwrap();
+                if r.as_ref().is_some_and(|(k, _)| key.contains(k.as_str())) {
+                    r.take()
+                } else {
+                    None
+                }
+            };
+            if let Some((_, fields)) = rival {
+                let (stored, _) = self.inner.get(key).await?.expect("the job is stored");
+                let mut theirs: Value = serde_json::from_slice(&stored).unwrap();
+                for (k, v) in fields.as_object().unwrap() {
+                    theirs[k] = v.clone();
+                }
+                self.inner
+                    .put(
+                        key,
+                        bytes::Bytes::from(serde_json::to_vec(&theirs).unwrap()),
+                    )
+                    .await?;
+            }
+            self.inner.update(key, expected, body).await
+        }
+        async fn put(&self, key: &str, body: bytes::Bytes) -> Result<ObjectVersion, StoreError> {
+            Self::hit(&self.no_write, key)?;
+            self.inner.put(key, body).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+            self.inner.list(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// [`served`] over a [`Flaky`] store, a job `orders~01` running, a node holding the lease.
+    async fn flaky() -> (SocketAddr, std::sync::Arc<Flaky>, PipelineDocs, TempDir) {
+        let (_, lone, _, dir) = served().await;
+        held(&lone).await;
+        let inner = ObjectStoreVersioned::new(
+            std::sync::Arc::new(object_store::memory::InMemory::new()),
+            "orders",
+        )
+        .unwrap();
+        let store = std::sync::Arc::new(Flaky {
+            inner,
+            no_read: Default::default(),
+            no_write: Default::default(),
+            rival: Default::default(),
+        });
+        let docs = PipelineDocs::new(data_avalanche_state::DocStore::new(store.clone()));
+        recorded(&docs, "orders~01", &[("orders", JobTableStatus::Running)]).await;
+        let mut node = lone.node.clone();
+        let shared = docs.clone();
+        node.docs = std::sync::Arc::new(move |_| Ok(shared.clone()));
+        let a = api(open());
+        a.node.set(node).unwrap();
+        (serve(a).await, store, docs, dir)
+    }
+
+    /// D-M13c.2: when the pipeline's state can't be read after the cancel is recorded, the
+    /// restart is asked anyway: a worker may run, and the controller leaves a stopped or paused
+    /// pipeline as it is. The answer isn't "no worker runs".
+    #[tokio::test]
+    async fn a_cancel_asks_the_restart_when_the_state_can_t_be_read() {
+        let (addr, store, docs, _dir) = flaky().await;
+        store.no_read.lock().unwrap().push("pipeline-state".into());
+        let (code, v) = post(addr, "/v1/snapshots/orders~01/cancel", "").await;
+        assert_eq!((code, &v["restart"]), (202, &json!(true)), "{v}");
+        store.no_read.lock().unwrap().clear();
+        assert_eq!(
+            docs.requests().await.unwrap().restart.unwrap().id,
+            "orders~01/cancel"
+        );
+        assert!(
+            docs.snapshot_job("orders~01")
+                .await
+                .unwrap()
+                .unwrap()
+                .doc
+                .cancel
+                .is_some()
+        );
+    }
+
+    /// D-M13c.2: a restart that can't be written leaves the cancel recorded, and the answer says
+    /// so: 503, as a job's own restart failing does, not a 202 that says no worker runs.
+    #[tokio::test]
+    async fn a_cancel_whose_restart_can_t_be_written_answers_503() {
+        let (addr, store, docs, _dir) = flaky().await;
+        store.no_write.lock().unwrap().push("requests".into());
+        let (code, v) = post(addr, "/v1/snapshots/orders~01/cancel", "").await;
+        assert_eq!(code, 503, "{v}");
+        let error = v["error"].as_str().unwrap();
+        assert!(error.contains("cancel is recorded"), "{v}");
+        assert!(error.contains("next start"), "{v}");
+        assert_eq!(v["job_id"], "orders~01");
+        let job = docs.snapshot_job("orders~01").await.unwrap().unwrap().doc;
+        assert!(job.cancel.is_some(), "the cancel stays recorded");
+    }
+
+    /// Two cancels at once: the one whose write lost the race answers as for a job cancelled
+    /// already (200 `unchanged`), and the stored cancel still names the first.
+    #[tokio::test]
+    async fn the_cancel_that_loses_a_race_answers_unchanged() {
+        let (addr, store, docs, _dir) = flaky().await;
+        let theirs = JobCancel {
+            by: "first".into(),
+            role: "operator".into(),
+            at: Utc::now(),
+            note: Some("theirs".into()),
+        };
+        *store.rival.lock().unwrap() = Some(("orders~01".into(), json!({ "cancel": theirs })));
+        let (code, v) = post(addr, "/v1/snapshots/orders~01/cancel", "").await;
+        assert_eq!((code, &v["unchanged"]), (200, &json!(true)), "{v}");
+        let job = docs.snapshot_job("orders~01").await.unwrap().unwrap().doc;
+        assert_eq!(
+            job.cancel.unwrap().by,
+            "first",
+            "the stored cancel is theirs"
+        );
+        assert!(
+            docs.requests().await.unwrap().restart.is_none(),
+            "the winner asks the restart, not this one"
         );
     }
 }
