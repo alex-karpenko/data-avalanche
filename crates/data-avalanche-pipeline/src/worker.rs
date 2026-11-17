@@ -567,6 +567,8 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
     for (table, c) in jobs.cancelling() {
         match core.docs.table_snapshot(&table).await?.map(|v| v.doc) {
             Some(d) if d.status == SnapshotStatus::InProgress => {
+                let rows = d.cursor.as_ref().map_or(0, |cur| cur.rows_done);
+                taken.cancelled_rows.insert(table.clone(), rows);
                 cancelling.insert(table, c);
             }
             Some(d) if d.status == SnapshotStatus::Completed => {
@@ -591,9 +593,10 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
         .collect();
     let recorded: BTreeSet<TableRef> = recorded.difference(&cleared).cloned().collect();
     // A stopped copy of a table its job brought back from a halt halts again: the lake holds a
-    // part of its rows, and its stream position may predate them (D-M13c.2).
+    // part of its rows, and its stream position may predate them (D-M13c.2). So does one of a
+    // truncating job: it emptied the sink table, which holds part of its rows (S-M13c.2).
     for (table, c) in &cancelling {
-        if c.from_halt
+        if (c.from_halt || c.truncate)
             && resolved_tables.contains_key(table)
             && !recorded.contains(table)
             && !halts.iter().any(|(t, _)| t == table)
@@ -1183,7 +1186,10 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
         let tables: Vec<TableRef> = started.iter().cloned().collect();
         match source.row_estimates(&tables).await {
             Ok(estimates) => taken.estimates = estimates,
-            Err(e) => tracing::warn!("the row estimates of the tables jobs start are unread: {e}"),
+            Err(e) => {
+                let names: Vec<String> = tables.iter().map(ToString::to_string).collect();
+                tracing::warn!(pipeline = %core.settings.pipeline_id, "the row estimates of the tables jobs start ({}) are unread: {e}", names.join(", "));
+            }
         }
     }
     taken.from_halt = started

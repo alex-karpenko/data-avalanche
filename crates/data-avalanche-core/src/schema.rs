@@ -147,8 +147,9 @@ pub enum HaltReason {
     )]
     #[serde(rename = "SNAPSHOT_TIMEOUT")]
     SnapshotTimeout { limit_secs: u64 },
-    /// A snapshot job bringing the table back from a halt was cancelled before its copy ended
-    /// (Admin_Console §5): the sink holds a partial copy, so the table stays halted.
+    /// A snapshot job bringing the table back from a halt, or a truncating one, was cancelled
+    /// before its copy ended (Admin_Console §5): the sink holds a partial copy, so the table
+    /// stays halted.
     #[error("snapshot job {job} was cancelled before it copied the table; copy it again")]
     #[serde(rename = "COPY_CANCELLED")]
     CopyCancelled { job: String },

@@ -30,6 +30,9 @@ pub(crate) struct Taken {
     /// A cancelled job's running tables whose copy completed before a start took the cancel,
     /// with their rows: they end completed, not cancelled.
     pub completed: BTreeMap<TableRef, u64>,
+    /// A cancelled job's stopped copies, with the rows their snapshot documents' cursors count:
+    /// a table ends cancelled with the larger of that and the rows it recorded.
+    pub cancelled_rows: BTreeMap<TableRef, u64>,
 }
 
 /// A cancelled job's running copy of a table.
@@ -38,6 +41,12 @@ pub(crate) struct Cancelling {
     pub job: String,
     /// The job's start cleared a halt of the table: stopped, the table halts again.
     pub from_halt: bool,
+    /// The job empties its sink tables first: a copy it began leaves the table holding part of
+    /// its rows, so a stopped copy halts it too (S-M13c.2).
+    pub truncate: bool,
+    /// The rows the table's snapshot document counts, filled in by the start that reads it: the
+    /// follower's last poll may predate them.
+    pub rows_done: u64,
 }
 
 impl Jobs {
@@ -81,7 +90,8 @@ impl Jobs {
     }
 
     /// The running tables of the cancelled jobs that no live job asks for or runs (D-M13c.2):
-    /// their copy stops at this start. A queued table whose halt a start cleared and noted
+    /// their copy stops at this start; one of a truncating job, or one brought back from a
+    /// halt, halts its table. A queued table whose halt a start cleared and noted
     /// (see [`Jobs::note_cleared`]) counts too: that start crashed before it recorded the job,
     /// so the copy may have begun.
     pub fn cancelling(&self) -> BTreeMap<TableRef, Cancelling> {
@@ -100,6 +110,8 @@ impl Jobs {
                 let c = Cancelling {
                     job: j.job_id.clone(),
                     from_halt: t.from_halt.is_some(),
+                    truncate: j.truncate,
+                    rows_done: 0,
                 };
                 (t.table.clone(), c)
             })
@@ -115,6 +127,9 @@ impl Jobs {
         docs: &PipelineDocs,
         cleared: &BTreeMap<TableRef, String>,
     ) -> Result<(), StateError> {
+        if cleared.is_empty() {
+            return Ok(());
+        }
         let unnoted = |job: &SnapshotJobDoc| {
             job.tables.iter().any(|t| {
                 t.status == JobTableStatus::Queued
@@ -180,7 +195,13 @@ impl Jobs {
                                 t.rows_done = *rows;
                                 t.end(JobTableStatus::Completed, None, now);
                             }
-                            _ => t.end(JobTableStatus::Cancelled, None, now),
+                            _ => {
+                                // The cursor's rows, when the follower's last poll was behind.
+                                if let Some(rows) = taken.cancelled_rows.get(&t.table) {
+                                    t.rows_done = t.rows_done.max(*rows);
+                                }
+                                t.end(JobTableStatus::Cancelled, None, now);
+                            }
                         }
                     } else if let Some(e) = taken.failed.get(&t.table) {
                         t.end(JobTableStatus::Failed, Some(e.clone()), now);
@@ -1543,5 +1564,99 @@ mod tests {
             again.version, noted.version,
             "the second note writes nothing"
         );
+    }
+
+    /// D-M13c.2, S-M13c.2: a cancelled copy of a table a truncating job had begun to copy halts
+    /// it, `COPY_CANCELLED` naming the job: the job emptied the sink table, which holds part of
+    /// its rows. The copy is abandoned, and the job's table ends cancelled. (A job that doesn't
+    /// truncate halts nothing: `a_cancelled_copy_stops_and_the_table_streams_on`.)
+    #[tokio::test]
+    async fn a_cancelled_copy_of_a_truncating_job_halts_its_table() {
+        let w = World::new(&["a", "b"]);
+        established(&w).await;
+        w.source.load(&t("a"), rows(1..=4));
+        ask_truncating(&w, "p~1", &["a"]).await;
+        copying(&w, "p~1", "a", None).await;
+        cancel(&w, "p~1").await;
+        let (end, st) = run(&w, &never(2), async |status| streamed(&status, &w).await).await;
+        end.unwrap();
+        let reason = HaltReason::CopyCancelled { job: "p~1".into() };
+        assert_eq!(st.halted.get(&t("a")), Some(&reason));
+        let halts = w.docs.halts().await.unwrap().tables;
+        assert_eq!(halts.len(), 1, "{halts:?}");
+        assert_eq!(halts[0].reason, reason);
+        assert!(!halts[0].copy, "the pipeline's table");
+        assert_eq!(w.source.reads(&t("a")), 0);
+        assert_eq!(snapshot_status(&w, "a").await, SnapshotStatus::None);
+        let j = job(&w, "p~1").await;
+        assert_eq!(j.status, JobStatus::Cancelled);
+        assert_eq!(j.tables[0].status, JobTableStatus::Cancelled);
+    }
+
+    /// S-M13c.2: only a table the pipeline replicates halts: a truncating job's copy of a table
+    /// outside the config is abandoned, and nothing halts.
+    #[tokio::test]
+    async fn a_cancelled_truncating_copy_outside_the_config_halts_nothing() {
+        let w = World::new(&["a", "x"]);
+        w.source.outside_config(&t("x"));
+        established(&w).await;
+        w.source.load(&t("x"), rows(1..=4));
+        ask_truncating(&w, "p~1", &["x"]).await;
+        copying(&w, "p~1", "x", None).await;
+        cancel(&w, "p~1").await;
+        let (end, st) = run(&w, &never(2), async |status| streamed(&status, &w).await).await;
+        end.unwrap();
+        assert_eq!(w.source.reads(&t("x")), 0);
+        assert_eq!(snapshot_status(&w, "x").await, SnapshotStatus::None);
+        assert!(w.docs.halts().await.unwrap().tables.is_empty());
+        assert!(st.halted.is_empty(), "{:?}", st.halted);
+        let j = job(&w, "p~1").await;
+        assert_eq!(j.status, JobStatus::Cancelled);
+        assert_eq!(j.tables[0].status, JobTableStatus::Cancelled);
+    }
+
+    /// D-M13c.2: a start that crashed after recording the `COPY_CANCELLED` halt, before the
+    /// job's table ended, doesn't record it again: the next start leaves the halt as it was and
+    /// ends the table cancelled.
+    #[tokio::test]
+    async fn a_copy_cancelled_halt_recorded_already_isn_t_recorded_again() {
+        let w = World::new(&["a"]);
+        established(&w).await;
+        w.source.load(&t("a"), rows(1..=4));
+        ask(&w, "p~1", &["a"]).await;
+        copying(&w, "p~1", "a", Some("TABLE_DROPPED")).await;
+        cancel(&w, "p~1").await;
+        let recorded = TableHalt {
+            table: t("a"),
+            reason: HaltReason::CopyCancelled { job: "p~1".into() },
+            at: w.source.wal_end(),
+            copy: false,
+        };
+        w.docs.record_halt(&recorded).await.unwrap();
+        let (mut core, _control, _status) = w.core(&never(2), &[]);
+        crate::worker::start(&mut core, None).await.unwrap();
+        assert_eq!(w.docs.halts().await.unwrap().tables, vec![recorded]);
+        assert_eq!(snapshot_status(&w, "a").await, SnapshotStatus::None);
+        let j = job(&w, "p~1").await;
+        assert_eq!(j.status, JobStatus::Cancelled);
+        assert_eq!(j.tables[0].status, JobTableStatus::Cancelled);
+    }
+
+    /// A cancelled copy keeps the rows its snapshot document's cursor counts: the follower's
+    /// last poll may predate them, and the lake holds them (`lake` reads `partial`, not `empty`).
+    #[tokio::test]
+    async fn a_cancelled_copy_keeps_the_rows_its_cursor_counts() {
+        let w = World::new(&["a"]);
+        established(&w).await;
+        w.source.load(&t("a"), rows(1..=4));
+        ask_truncating(&w, "p~1", &["a"]).await;
+        copying(&w, "p~1", "a", None).await;
+        assert_eq!(job(&w, "p~1").await.tables[0].rows_done, 0, "last polled");
+        cancel(&w, "p~1").await;
+        let (mut core, _control, _status) = w.core(&never(2), &[]);
+        crate::worker::start(&mut core, None).await.unwrap();
+        let j = job(&w, "p~1").await;
+        assert_eq!(j.tables[0].status, JobTableStatus::Cancelled);
+        assert_eq!(j.tables[0].rows_done, 2, "the cursor's count");
     }
 }
