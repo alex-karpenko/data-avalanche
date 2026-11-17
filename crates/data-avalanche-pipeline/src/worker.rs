@@ -1072,6 +1072,15 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
         core.may_write()?;
         core.docs.save_table_schema(schema).await?;
     }
+    // The cleared halts are noted on their jobs before the clear (D-M13c.2): a restart after a
+    // crash in between still knows the copy came back from a halt.
+    let noted: BTreeMap<TableRef, String> = cleared
+        .iter()
+        .filter(|t| !halts.iter().any(|(h, _)| h == *t))
+        .filter_map(|t| Some((t.clone(), recorded_halts.get(t)?.code().to_owned())))
+        .collect();
+    core.may_write()?;
+    jobs.note_cleared(&core.docs, &noted).await?;
     // The cleared halts after the baselined schemas: a restart in between finds the table halted
     // and asked for still, and baselines it again.
     for table in &cleared {

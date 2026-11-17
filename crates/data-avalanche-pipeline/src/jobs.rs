@@ -81,14 +81,20 @@ impl Jobs {
     }
 
     /// The running tables of the cancelled jobs that no live job asks for or runs (D-M13c.2):
-    /// their copy stops at this start.
+    /// their copy stops at this start. A queued table whose halt a start cleared and noted
+    /// (see [`Jobs::note_cleared`]) counts too: that start crashed before it recorded the job,
+    /// so the copy may have begun.
     pub fn cancelling(&self) -> BTreeMap<TableRef, Cancelling> {
         let (asked, running) = (self.asked(), self.running());
         self.jobs
             .iter()
             .filter(|j| j.cancel.is_some())
             .flat_map(|j| j.tables.iter().map(move |t| (j, t)))
-            .filter(|(_, t)| t.status == JobTableStatus::Running)
+            .filter(|(_, t)| match t.status {
+                JobTableStatus::Running => true,
+                JobTableStatus::Queued => t.from_halt.is_some(),
+                _ => false,
+            })
             .filter(|(_, t)| !asked.contains(&t.table) && !running.contains(&t.table))
             .map(|(j, t)| {
                 let c = Cancelling {
@@ -98,6 +104,46 @@ impl Jobs {
                 (t.table.clone(), c)
             })
             .collect()
+    }
+
+    /// Notes, on each live job, the halt a start clears for its queued table (`cleared` maps
+    /// the table to the halt's code), before the clear (D-M13c.2): a restart after a crash in
+    /// between still knows the copy came back from a halt. The status stays queued. A job is
+    /// written only when one of its tables changes, so the call is idempotent.
+    pub async fn note_cleared(
+        &self,
+        docs: &PipelineDocs,
+        cleared: &BTreeMap<TableRef, String>,
+    ) -> Result<(), StateError> {
+        let unnoted = |job: &SnapshotJobDoc| {
+            job.tables.iter().any(|t| {
+                t.status == JobTableStatus::Queued
+                    && cleared
+                        .get(&t.table)
+                        .is_some_and(|code| t.from_halt.as_deref() != Some(code.as_str()))
+            })
+        };
+        for job in self.live() {
+            // Read fresh: this job's doc may have been noted by an earlier call.
+            let Some(v) = docs.snapshot_job(&job.job_id).await? else {
+                continue;
+            };
+            if !unnoted(&v.doc) {
+                continue;
+            }
+            docs.update_snapshot_job(&job.job_id, |j| {
+                for t in &mut j.tables {
+                    if t.status != JobTableStatus::Queued {
+                        continue;
+                    }
+                    if let Some(code) = cleared.get(&t.table) {
+                        t.from_halt = Some(code.clone());
+                    }
+                }
+            })
+            .await?;
+        }
+        Ok(())
     }
 
     /// Records what this start did with the job tables, at `now`: the asked ones started run,
@@ -142,7 +188,12 @@ impl Jobs {
                         t.status = JobTableStatus::Running;
                         t.started_at = Some(now);
                         t.estimate = taken.estimates.get(&t.table).copied();
-                        t.from_halt = taken.from_halt.get(&t.table).cloned();
+                        // A halt noted before a crash stays noted (see `note_cleared`).
+                        t.from_halt = taken
+                            .from_halt
+                            .get(&t.table)
+                            .cloned()
+                            .or_else(|| t.from_halt.clone());
                     }
                 }
                 j.settle(now);
@@ -155,6 +206,7 @@ impl Jobs {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use chrono::Utc;
@@ -169,6 +221,7 @@ mod tests {
     use data_avalanche_testkit::{FakeTxn, Method};
     use tokio::sync::watch;
 
+    use super::Jobs;
     use crate::test_support::{World, Yaml, fast, row, t, wait_until};
     use crate::{Command, Exit, Phase, PipelineWorker, WorkerDeps, WorkerError, WorkerStatus};
 
@@ -1370,5 +1423,125 @@ mod tests {
         let a = &job(&w, "p~1").await.tables[0];
         assert_eq!(a.status, JobTableStatus::Running);
         assert_eq!(a.estimate, None);
+    }
+
+    /// Post-crash state (fix round 1): job `id`'s table `table` is still queued, its start
+    /// having noted the `code` halt it cleared on the job before it crashed. The table's copy
+    /// document is in progress past two rows, and no halt is recorded.
+    async fn crashed_copy(w: &World, id: &str, table: &str, code: &str) {
+        w.docs
+            .update_snapshot_job(id, |j| {
+                let jt = j.tables.iter_mut().find(|jt| jt.table == t(table)).unwrap();
+                jt.from_halt = Some(code.into());
+            })
+            .await
+            .unwrap();
+        w.docs
+            .save_table_snapshot(&TableSnapshotDoc {
+                table: t(table),
+                status: SnapshotStatus::InProgress,
+                start_position: Some(w.source.wal_end()),
+                cursor: Some(SnapshotCursor {
+                    key: vec![CursorKey {
+                        col: "id".into(),
+                        val: 2.into(),
+                        ty: "bigint".into(),
+                    }],
+                    chunk_size: 2,
+                    rows_done: 2,
+                    collation: None,
+                }),
+                row_count: None,
+                completed_at: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Fix round 1: a halt a start clears is noted on its job before the clear, so a restart
+    /// after a crash still knows the copy came back from a halt; a cancel after that halts the
+    /// table again.
+    #[tokio::test]
+    async fn a_halt_cleared_before_a_crash_is_kept_by_the_restart() {
+        let w = World::new(&["a"]);
+        established(&w).await;
+        w.source.load(&t("a"), rows(1..=4));
+        ask(&w, "p~1", &["a"]).await;
+        crashed_copy(&w, "p~1", "a", "SNAPSHOT_TIMEOUT").await;
+        let (mut core, _control, _status) = w.core(&never(2), &[]);
+        crate::worker::start(&mut core, None).await.unwrap();
+        let a = &job(&w, "p~1").await.tables[0];
+        assert_eq!(a.status, JobTableStatus::Running);
+        assert_eq!(a.from_halt.as_deref(), Some("SNAPSHOT_TIMEOUT"), "{a:?}");
+        cancel(&w, "p~1").await;
+        let (mut core, _control, _status) = w.core(&never(2), &[]);
+        crate::worker::start(&mut core, None).await.unwrap();
+        let reason = HaltReason::CopyCancelled { job: "p~1".into() };
+        let halts = w.docs.halts().await.unwrap().tables;
+        assert_eq!(halts.len(), 1, "{halts:?}");
+        assert_eq!(halts[0].reason, reason);
+        assert_eq!(snapshot_status(&w, "a").await, SnapshotStatus::None);
+        let j = job(&w, "p~1").await;
+        assert_eq!(j.status, JobStatus::Cancelled);
+        assert_eq!(j.tables[0].status, JobTableStatus::Cancelled);
+    }
+
+    /// Fix round 1: a job cancelled after a crash between a halt's clear and its job's record
+    /// (its table still queued, the halt noted) halts the table again when the next start
+    /// stops the copy.
+    #[tokio::test]
+    async fn a_cancel_after_a_crash_between_the_clear_and_the_record_halts_the_table() {
+        let w = World::new(&["a"]);
+        established(&w).await;
+        w.source.load(&t("a"), rows(1..=4));
+        ask(&w, "p~1", &["a"]).await;
+        crashed_copy(&w, "p~1", "a", "SNAPSHOT_TIMEOUT").await;
+        cancel(&w, "p~1").await;
+        let (mut core, _control, _status) = w.core(&never(2), &[]);
+        crate::worker::start(&mut core, None).await.unwrap();
+        let reason = HaltReason::CopyCancelled { job: "p~1".into() };
+        let halts = w.docs.halts().await.unwrap().tables;
+        assert_eq!(halts.len(), 1, "{halts:?}");
+        assert_eq!(halts[0].reason, reason);
+        assert_eq!(w.source.reads(&t("a")), 0);
+        assert_eq!(snapshot_status(&w, "a").await, SnapshotStatus::None);
+        let j = job(&w, "p~1").await;
+        assert_eq!(j.status, JobStatus::Cancelled);
+        assert_eq!(j.tables[0].status, JobTableStatus::Cancelled);
+    }
+
+    /// Fix round 1: noting a cleared halt writes its job once; a second note with the same map
+    /// writes nothing, and the table stays queued.
+    #[tokio::test]
+    async fn noting_a_cleared_halt_twice_writes_the_job_once() {
+        let w = World::new(&["a"]);
+        established(&w).await;
+        ask(&w, "p~1", &["a"]).await;
+        let cleared = BTreeMap::from([(t("a"), "SNAPSHOT_TIMEOUT".to_owned())]);
+        let before = w.docs.snapshot_job("p~1").await.unwrap().unwrap().version;
+        Jobs::load(&w.docs)
+            .await
+            .unwrap()
+            .note_cleared(&w.docs, &cleared)
+            .await
+            .unwrap();
+        let noted = w.docs.snapshot_job("p~1").await.unwrap().unwrap();
+        assert_ne!(noted.version, before, "the job is written");
+        assert_eq!(noted.doc.tables[0].status, JobTableStatus::Queued);
+        assert_eq!(
+            noted.doc.tables[0].from_halt.as_deref(),
+            Some("SNAPSHOT_TIMEOUT")
+        );
+        Jobs::load(&w.docs)
+            .await
+            .unwrap()
+            .note_cleared(&w.docs, &cleared)
+            .await
+            .unwrap();
+        let again = w.docs.snapshot_job("p~1").await.unwrap().unwrap();
+        assert_eq!(
+            again.version, noted.version,
+            "the second note writes nothing"
+        );
     }
 }
