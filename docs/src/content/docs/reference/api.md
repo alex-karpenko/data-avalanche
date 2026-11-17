@@ -206,7 +206,7 @@ Least role: `viewer`.
 
 ### `POST /v1/snapshots/{job_id}/cancel`
 
-Cancel a job: the pipeline's next start ends its unended tables; a table it was bringing back from a halt halts again, COPY_CANCELLED
+Cancel a job: the pipeline's next start ends its unended tables; a table it was bringing back from a halt, or a truncating job had begun to copy, halts, COPY_CANCELLED
 
 Least role: `operator`.
 
