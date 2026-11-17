@@ -173,7 +173,6 @@ fn job_json(p: &Pipeline, j: &SnapshotJobDoc, now: DateTime<Utc>) -> Value {
         JobTableStatus::Failed => "failed",
         JobTableStatus::Cancelled => "cancelled",
     };
-    let estimates: Vec<u64> = j.tables.iter().filter_map(|t| t.estimate).collect();
     let (rate, eta) = pace(j, now);
     json!({
         "job_id": j.job_id,
@@ -191,7 +190,10 @@ fn job_json(p: &Pipeline, j: &SnapshotJobDoc, now: DateTime<Utc>) -> Value {
             "error": t.error,
         })).collect::<Vec<_>>(),
         "rows_done": j.tables.iter().map(|t| t.rows_done).sum::<u64>(),
-        "estimate": (!estimates.is_empty()).then(|| estimates.iter().sum::<u64>()),
+        // The job's total only when every table has an estimate: a short total reads as the job's.
+        "estimate": (!j.tables.is_empty())
+            .then(|| j.tables.iter().map(|t| t.estimate).sum::<Option<u64>>())
+            .flatten(),
         "rate": rate,
         "eta_seconds": eta,
         "requested_at": j.requested_at,
@@ -1158,5 +1160,39 @@ mod tests {
         job.tables[2].end(JobTableStatus::Cancelled, None, at(100));
         job.settle(at(100));
         assert_eq!(super::pace(&job, at(200)), (None, None), "ended");
+    }
+
+    /// A job's estimate is the sum of its tables' estimates when every table has one, else none:
+    /// a total that leaves a table out would read short. Each table's estimate is shown as stored.
+    #[tokio::test]
+    async fn a_job_s_estimate_is_none_unless_every_table_has_one() {
+        let (addr, _lone, docs, _dir) = served().await;
+        recorded(
+            &docs,
+            "orders~01",
+            &[
+                ("orders", JobTableStatus::Queued),
+                ("items", JobTableStatus::Queued),
+            ],
+        )
+        .await;
+        docs.update_snapshot_job("orders~01", |j| {
+            j.tables[0].estimate = Some(600);
+            j.tables[1].estimate = Some(400);
+        })
+        .await
+        .unwrap();
+        let (_, one) = json_of(addr, "GET", "/v1/snapshots/orders~01").await;
+        assert_eq!(one["estimate"], 1000, "{one}");
+        assert_eq!(one["tables"][0]["estimate"], 600, "{one}");
+        assert_eq!(one["tables"][1]["estimate"], 400, "{one}");
+
+        docs.update_snapshot_job("orders~01", |j| j.tables[1].estimate = None)
+            .await
+            .unwrap();
+        let (_, one) = json_of(addr, "GET", "/v1/snapshots/orders~01").await;
+        assert_eq!(one["estimate"], Value::Null, "one table has none: {one}");
+        assert_eq!(one["tables"][0]["estimate"], 600, "{one}");
+        assert_eq!(one["tables"][1]["estimate"], Value::Null, "{one}");
     }
 }
