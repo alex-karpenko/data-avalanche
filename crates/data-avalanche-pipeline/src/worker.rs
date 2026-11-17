@@ -1112,6 +1112,12 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
         .filter(|t| truncating.contains(*t))
         .cloned()
         .collect();
+    // The copy's start is noted on its job before the truncate (F14), as the halt a start
+    // clears is noted before the clear: a crash after the truncate, before the job records the
+    // table running, leaves the table queued but noted, and a cancel then halts it.
+    core.may_write()?;
+    jobs.note_truncating(&core.docs, &truncated.iter().cloned().collect(), Utc::now())
+        .await?;
     for table in &truncated {
         // The key the session copies the table with: the schema this start caches, else a
         // copy's, else the one cached before (a key whose case alone changed keeps the cached
