@@ -4766,3 +4766,9 @@ tasks' blocks applied on top unchanged.
   `record` keeps a noted `from_halt`; `cancelling()` also takes a cancelled job's queued table
   with a noted halt, which halts `COPY_CANCELLED` as a running one does. Three tests added (a
   restart after the crash, a cancel before it, the note written once).
+- **Task 5** (fix round, `02e30a5`): a job's `estimate` summed the estimates its tables had, so a
+  job with a table the source couldn't estimate showed a total short of it (Review Focus 5: no
+  figure rather than a wrong one). It is now the sum only when every table has an estimate, as
+  `eta_seconds`; one test added (`a_job_s_estimate_is_none_unless_every_table_has_one`), at the
+  end of `snapshots.rs`'s tests, so Task 6's second `snapshots.rs` hunk appends its tests after
+  it.
