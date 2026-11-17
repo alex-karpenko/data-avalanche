@@ -94,9 +94,9 @@ curl -s -X POST https://cdc.example.internal/v1/snapshots/shop~0192f0c47b9e7c3a9
 
 What the cancelled tables hold:
 
-- A table the config replicates streams on. A copy that doesn't truncate leaves its rows as they
-  were, partly refreshed; one that truncates leaves the table empty or partly copied until a new
-  job copies it.
+- A table the config replicates streams on when its copy didn't truncate: its rows stay as they
+  were, partly refreshed. So does a truncating job's table that was still queued: nothing was
+  emptied.
 - A table the job was bringing back from a halt halts again, `COPY_CANCELLED`, naming the job: its
   Delta table holds part of its rows. Copy it again, or retry the job.
 - A table a truncating job had begun to copy halts `COPY_CANCELLED` too: the job emptied its Delta
