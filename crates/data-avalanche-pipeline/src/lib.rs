@@ -37,7 +37,7 @@ pub use hooks::{CommitGuard, HookAction, HookPoint, Hooks, NoHooks, Unguarded};
 pub use observe::{NoObserver, Observer};
 pub use policy::{FlushPolicy, FlushReason, TxnLimits};
 pub use status::{
-    CHANGES_WINDOW, Command, Exit, Phase, ReconcileLog, RowsRead, SnapshotProgress, TableCommit,
-    TableFigures, Tuning, WorkerStatus,
+    CHANGES_WINDOW, Command, Exit, LeftPending, Phase, ReconcileLog, RowsRead, SnapshotProgress,
+    TableCommit, TableFigures, Tuning, WorkerStatus,
 };
 pub use worker::{PipelineWorker, WorkerDeps, WorkerHandle};

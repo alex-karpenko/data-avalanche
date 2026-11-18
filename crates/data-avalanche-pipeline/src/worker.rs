@@ -2342,6 +2342,54 @@ mod tests {
             let st = h.status.borrow().clone();
             assert_eq!(st.read, None, "the new session has read nothing");
             assert_eq!(st.unsynced_since_micros, None, "nor holds anything pending");
+            // What lake readers lack stays known: the old session's pending change.
+            assert!(st.pending_since_micros().is_some(), "{st:?}");
+        })
+        .await;
+        assert!(end.is_ok(), "{end:?}");
+    }
+
+    /// S-M13d.3: a stream with nothing pending says when it last was. A reconnect keeps that
+    /// time: through the outage lake readers see the lake as of then.
+    #[tokio::test]
+    async fn a_caught_up_stream_says_when_and_a_reconnect_keeps_it() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let p = Yaml {
+            sink: "flush: { seconds: 0 }",
+            ..Yaml::default()
+        }
+        .build();
+        let end = run_with(&p, deps(&w), async |h| {
+            let before = Utc::now();
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+            wait_until("the change durable, nothing pending", || {
+                let st = h.status.borrow();
+                st.rows_read.insert == 1
+                    && st.unsynced_since_micros.is_none()
+                    && st.caught_up_at.is_some_and(|at| at >= before)
+            })
+            .await;
+            for _ in 0..10_000 {
+                w.source
+                    .fail(Method::OpenStream, SourceError::Transient("refused".into()));
+            }
+            w.source
+                .fail(Method::Next, SourceError::Transient("reset".into()));
+            wait_until("a reconnect", || h.status.borrow().reconnects >= 1).await;
+            let kept = h.status.borrow().caught_up_at;
+            assert!(kept.is_some_and(|at| at >= before), "{kept:?}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let st = h.status.borrow().clone();
+            assert!(
+                matches!(st.phase, Phase::Reconnecting { .. }),
+                "{:?}",
+                st.phase
+            );
+            assert_eq!(
+                st.caught_up_at, kept,
+                "kept through the outage, and not moved"
+            );
         })
         .await;
         assert!(end.is_ok(), "{end:?}");

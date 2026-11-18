@@ -1194,7 +1194,8 @@ impl<'c> Session<'c> {
         self.progress(None);
     }
 
-    /// [`Self::report_progress`], and with `read` the new frontier (always a change).
+    /// [`Self::report_progress`], and with `read` the new frontier (always a change). A stream
+    /// with nothing pending is caught up as of now (`caught_up_at`, S-M13d.3).
     fn progress(&self, read: Option<SourcePosition>) {
         let since = self.unsynced.front().map(|(_, ts)| *ts);
         let since = match (since, self.unflushed_since) {
@@ -1203,7 +1204,9 @@ impl<'c> Session<'c> {
         };
         let rows_read = self.core.rows_read;
         let bytes = self.acc.buffered_bytes() as u64;
+        let now = chrono::Utc::now();
         self.core.status.send_if_modified(|st| {
+            let before = (st.caught_up_at, st.left_pending.is_some());
             let changed = read.is_some()
                 || (st.unsynced_since_micros, st.rows_read, st.buffer_bytes)
                     != (since, rows_read, bytes);
@@ -1213,7 +1216,8 @@ impl<'c> Session<'c> {
             st.unsynced_since_micros = since;
             st.rows_read = rows_read;
             st.buffer_bytes = bytes;
-            changed
+            st.progressed(now);
+            changed || (st.caught_up_at, st.left_pending.is_some()) != before
         });
     }
 
