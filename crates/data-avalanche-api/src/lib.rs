@@ -22,6 +22,7 @@ mod peers;
 mod pipelines;
 mod server;
 mod snapshots;
+mod tables;
 #[cfg(test)]
 mod test_support;
 
@@ -37,7 +38,7 @@ use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, get, post};
 use data_avalanche_cluster::{
-    ConfigCoordinator, ControllerStatus, DocsFn, GossipFigures, Members, Recorder,
+    ConfigCoordinator, ControllerStatus, DocsFn, GossipFigures, Members, Recorder, WorkerFactory,
 };
 use data_avalanche_config::Role;
 use data_avalanche_state::{Events, Leases};
@@ -57,6 +58,7 @@ pub use peers::{
 };
 pub use server::{Bound, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT, MAX_CONNECTIONS, ServeError, bind};
 pub use snapshots::{EndedJobs, READ_AT_ONCE};
+pub use tables::{FACTS_FOR, Lake};
 
 use crate::auth::Denied;
 
@@ -103,6 +105,10 @@ pub struct Node {
     /// The status of each pipeline this node's controllers run: the lease holder answers a
     /// pipeline's live figures from it (Admin_Console §4).
     pub statuses: watch::Receiver<BTreeMap<String, watch::Receiver<ControllerStatus>>>,
+    /// Builds a pipeline's sink, which reads a table's Delta facts and columns on request.
+    pub factory: Arc<dyn WorkerFactory>,
+    /// The tables' facts and columns read, each kept [`FACTS_FOR`].
+    pub lake: Arc<Lake>,
 }
 
 impl std::fmt::Debug for Node {
@@ -366,6 +372,20 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
                 ],
             ),
             get(live::get),
+        ),
+        (
+            r(
+                "GET",
+                "/v1/pipelines/{id}/tables/{table}",
+                Viewer,
+                "A table of the pipeline, named as its config names it: what the worker shows of it, its halt and when it began, the Delta table's facts (read on request, kept 30 s), its columns at the source against Delta's, and the snapshot jobs that copied it",
+                &[
+                    (200, "the table"),
+                    (400, "a table name not in the source's form"),
+                    (404, "no such pipeline, or no trace of the table in it"),
+                ],
+            ),
+            get(tables::get),
         ),
         (
             act(
@@ -927,6 +947,7 @@ mod tests {
                 ("GET", "/v1/pipelines", Viewer),
                 ("GET", "/v1/pipelines/{id}", Viewer),
                 ("GET", "/v1/pipelines/{id}/live", Viewer),
+                ("GET", "/v1/pipelines/{id}/tables/{table}", Viewer),
                 ("POST", "/v1/pipelines/{id}/pause", Operator),
                 ("POST", "/v1/pipelines/{id}/stop", Operator),
                 ("POST", "/v1/pipelines/{id}/resume", Operator),

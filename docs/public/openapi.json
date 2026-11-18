@@ -2164,6 +2164,72 @@
         "x-min-role": "operator"
       }
     },
+    "/v1/pipelines/{id}/tables/{table}": {
+      "get": {
+        "tags": [
+          "pipelines"
+        ],
+        "summary": "A table of the pipeline, named as its config names it: what the worker shows of it, its halt and when it began, the Delta table's facts (read on request, kept 30 s), its columns at the source against Delta's, and the snapshot jobs that copied it",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "the pipeline's id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the table",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "400": {
+            "description": "a table name not in the source's form",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "404": {
+            "description": "no such pipeline, or no trace of the table in it",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "viewer"
+      }
+    },
     "/v1/snapshots": {
       "get": {
         "tags": [

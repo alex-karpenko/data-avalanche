@@ -189,6 +189,20 @@ Least role: `operator`.
 | `413` | the body is over 1 MiB |
 | `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
 
+### `GET /v1/pipelines/{id}/tables/{table}`
+
+A table of the pipeline, named as its config names it: what the worker shows of it, its halt and when it began, the Delta table's facts (read on request, kept 30 s), its columns at the source against Delta's, and the snapshot jobs that copied it
+
+Least role: `viewer`.
+
+- Path parameter `id`: the pipeline's id.
+
+| Status | When |
+|---|---|
+| `200` | the table |
+| `400` | a table name not in the source's form |
+| `404` | no such pipeline, or no trace of the table in it |
+
 ## snapshots
 
 Snapshot jobs started through the API.

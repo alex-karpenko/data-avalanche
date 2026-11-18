@@ -255,6 +255,35 @@ async fn from_holder(node: &Node, id: &str, headers: &HeaderMap) -> Response {
     }
 }
 
+/// The pipeline's live figures as a value: this node's, or its lease holder's. `Err` says why
+/// there are none: the answer's `code`, and its `error` and `node`.
+pub(crate) async fn live(
+    node: &Node,
+    p: &Pipeline,
+    docs: &PipelineDocs,
+    headers: &HeaderMap,
+) -> Result<Value, Value> {
+    if let Some(v) = here(node, p, docs).await {
+        return Ok(v);
+    }
+    let r = from_holder(node, &p.id, headers).await;
+    let code = r.status();
+    let read = axum::body::to_bytes(r.into_body(), crate::MAX_ANSWER).await;
+    let v: Value = match read {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        Err(_) => Value::Null,
+    };
+    match code {
+        StatusCode::OK if v.is_object() => Ok(v),
+        StatusCode::OK => Err(json!({
+            "code": StatusCode::BAD_GATEWAY.as_u16(),
+            "error": "the holder's answer isn't the pipeline's figures",
+            "node": Value::Null,
+        })),
+        _ => Err(json!({ "code": code.as_u16(), "error": v["error"], "node": v["node"] })),
+    }
+}
+
 /// `GET /v1/pipelines/{id}/live`.
 pub(crate) async fn get(
     State(api): State<Api>,

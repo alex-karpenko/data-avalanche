@@ -30,6 +30,7 @@ use data_avalanche_state::{
 };
 use data_avalanche_storage::ObjectStoreVersioned;
 use data_avalanche_telemetry::Metrics;
+use data_avalanche_testkit::{FakeSource, MemorySink};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use object_store::memory::InMemory;
 use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
@@ -150,6 +151,21 @@ impl WorkerFactory for NoWorkers {
     }
 }
 
+/// Builds every pipeline's parts on one shared [`MemorySink`]: a node reads tables' facts
+/// through it.
+#[derive(Debug)]
+struct Lakes(MemorySink);
+
+impl WorkerFactory for Lakes {
+    fn build(&self, _: &Pipeline) -> Result<Parts, String> {
+        Ok(Parts {
+            source: Arc::new(FakeSource::new(vec![])),
+            sink: Arc::new(self.0.clone()),
+            hooks: Arc::new(data_avalanche_pipeline::NoHooks),
+        })
+    }
+}
+
 /// A lone node `node-a` running generation 1 of [`CONFIG`], read from `file`: its gossip on a
 /// loopback port, its reloads reaching a reconciler without pipelines.
 pub(crate) struct Lone {
@@ -162,6 +178,8 @@ pub(crate) struct Lone {
     pub stops: tokio::sync::watch::Receiver<Stop>,
     pub _reconciler: ClusterReconciler,
     pub _gossip: Gossip,
+    /// The sink every pipeline's [`Node::factory`] builds: a test creates and commits its tables.
+    pub sink: MemorySink,
 }
 
 /// `${VAR}` values a test sets, and changes.
@@ -272,6 +290,7 @@ pub(crate) async fn lone_with(file: PathBuf, text: &str, env: Arc<dyn Env + Send
         Duration::from_secs(10),
     );
     let (control, stops) = Control::new();
+    let sink = MemorySink::new();
     Lone {
         node: Node {
             coordinator: Arc::new(coordinator),
@@ -294,12 +313,15 @@ pub(crate) async fn lone_with(file: PathBuf, text: &str, env: Arc<dyn Env + Send
             gossip: gossip.figures(),
             ended_jobs: Arc::default(),
             statuses: reconciler.watch_statuses(),
+            factory: Arc::new(Lakes(sink.clone())),
+            lake: Arc::default(),
         },
         events,
         leases,
         stops,
         _reconciler: reconciler,
         _gossip: gossip,
+        sink,
     }
 }
 
