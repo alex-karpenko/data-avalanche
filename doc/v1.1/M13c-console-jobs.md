@@ -4772,3 +4772,27 @@ tasks' blocks applied on top unchanged.
   `eta_seconds`; one test added (`a_job_s_estimate_is_none_unless_every_table_has_one`), at the
   end of `snapshots.rs`'s tests, so Task 6's second `snapshots.rs` hunk appends its tests after
   it.
+- **Whole-branch review** (fix wave `a967f3d..782d46f`, approved by Oleksii, with spec patch
+  S-M13c.2, `b88ad8e`):
+  - **S-M13c.2:** a table a truncating job had begun to copy halts `COPY_CANCELLED` too when the
+    cancel is taken (its sink table was emptied and holds part of its rows); only a table the
+    pipeline replicates halts. `Cancelling` carries the job's `truncate`.
+  - **A truncating start that crashed before `record`:** the start notes the copy's `started_at`
+    on the job's queued table before emptying it (`Jobs::note_truncating`; only the tables that
+    pass the sink's key check, so one halted `SINK_REJECTED` isn't shown as begun), and
+    `cancelling()` takes a cancelled truncating job's queued table with it noted, as Task 3's note
+    does for a cleared halt.
+  - **The masker:** a `//` opens an authority also after `:-`, a quote, a bracket, `=` or `,` (a
+    `${VAR:-//user:pass@host}` default showed its password to viewers).
+  - **The cancel's answers:** a state that can't be read asks the restart anyway (a stopped or
+    paused pipeline stays so); a restart that can't be written answers `503`, the cancel recorded;
+    a second cancel that lost the write to another's answers `200` `unchanged`; a cancelling job
+    shows no rate or ETA.
+  - **A cancelled table's rows:** the start records the cursor's count when it is larger
+    (`Taken.cancelled_rows`), so `lake` isn't left `empty` for a partial table.
+  - **`EndedJobs`** drops the entries of pipelines the generation no longer has when a request
+    lists every pipeline.
+  - Smaller: `note_cleared` returns early with nothing to note; the estimate warning names the
+    pipeline and the tables; `delete_many`'s doc on a partial failure; a test that a recorded
+    `COPY_CANCELLED` halt isn't recorded again (proved against the mutant); the runbooks' answers
+    (`404`s, `400`s, `503`, a cancel whose tables all completed, a retry's body and answer).
