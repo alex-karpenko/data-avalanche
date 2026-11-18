@@ -19,8 +19,10 @@ once the cause is fixed. The halt stays across restarts and failovers until then
 curl -s https://cdc.example.internal/v1/pipelines/shop
 ```
 
-Its `halted_tables` lists each halted table with its code, a detail, and `since`, when it halted
-(none for a halt recorded before 1.1.0). The table's page,
+Its `halted_tables` lists each halted table with its code, a detail, and `since`, when it halted.
+A halt recorded before 1.1.0 has none, and keeps none while it halts for the same reason; it
+gets one if it halts again for another. Without `since` the table has no `fresh_as_of` either.
+The table's page,
 `GET /v1/pipelines/shop/tables/public.orders`, adds its columns at the source against Delta's and
 the jobs that copied it ([A pipeline's tables and figures](/data-avalanche/runbooks/pipeline-figures/)).
 

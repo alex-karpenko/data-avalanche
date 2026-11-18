@@ -233,8 +233,11 @@ pub(crate) struct Session<'c> {
     /// The heartbeat's read of the source's log, one at a time, run beside the loop: a source
     /// that doesn't answer holds up neither the stream nor a drain (DA-SRC-16).
     retained_read: JoinSet<Result<Option<RetainedLog>, SourceError>>,
-    /// The heartbeat's read of the source's detail, apart from `retained_read`: a stalled one
-    /// holds up neither the watchdog nor the guard.
+    /// The heartbeat's read of the source's detail, apart from `retained_read`: inside the
+    /// session a stalled one holds up neither the watchdog nor the guard. At the source both
+    /// share the catalog connection, so a slow detail query can delay that heartbeat's guard read
+    /// by up to `timeouts.command`; a timeout fails the guard read as transient, which counts as
+    /// answered: one late reading, no false reconnect.
     detail_read: JoinSet<Result<Option<SourceDetail>, SourceError>>,
     watchdog: Watchdog,
     /// A reload changed the heartbeat or the rescan interval: the loop re-arms its timers.
