@@ -150,6 +150,9 @@ pub struct WorkerStatus {
     pub soft_dropped: BTreeMap<TableRef, usize>,
     /// The tables the last Phase 0 tracks: the pipeline's page lists them.
     pub tracked: BTreeSet<TableRef>,
+    /// The `dump_*` tables this worker doesn't stream: a `dump_initial` table the sink had at the
+    /// start, or a dump whose snapshot ended. The pipeline's page lists them `copied`.
+    pub copied: BTreeSet<TableRef>,
     /// Per table, what this worker committed to it since it started: the pipeline's page.
     pub tables: BTreeMap<TableRef, TableFigures>,
     /// What the source keeps for the pipeline, as of `source_read_at`: read every heartbeat. A

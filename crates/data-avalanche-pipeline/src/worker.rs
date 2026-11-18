@@ -730,6 +730,7 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
         .chain(halts.iter().map(|(t, _)| t.clone()))
         .collect();
     let mut tracked = BTreeSet::new();
+    let mut copied = BTreeSet::new();
     let mut drifted = BTreeSet::new();
     let mut requests = vec![];
     let mut abandoned = vec![];
@@ -778,7 +779,10 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
         // halted in this pass gets no `in_progress` document (final review M5).
         let request = matches!(decision, Decision::Snapshot { resume: false, .. });
         match decision {
-            Decision::Stop => continue,
+            Decision::Stop => {
+                copied.insert(table.clone());
+                continue;
+            }
             Decision::Stream if in_progress => abandoned.push(table.clone()),
             _ => {}
         }
@@ -1299,6 +1303,7 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
     core.server = server;
     core.update(|st| {
         st.tracked.clone_from(&tracked);
+        st.copied = copied;
         warnings.into_iter().for_each(|w| st.warn(w));
     });
     core.tracked = tracked;
@@ -1989,6 +1994,26 @@ mod tests {
         assert_eq!(worker.run().await.unwrap(), Exit::Dumped);
         assert_eq!(w.source.reads(&t("a")), 0);
         assert!(w.source.opened().len() <= 1);
+    }
+
+    /// A `dump_*` table beside streaming ones shows `copied` once it isn't streamed: the
+    /// `dump_initial` table the sink has at the start, the `dump_always` one once its snapshot is
+    /// durable (D-M13d.5).
+    #[tokio::test]
+    async fn a_dump_beside_streaming_tables_shows_copied() {
+        let w = World::new(&["a", "b", "c"]);
+        w.started(&["a", "b", "c"]).await;
+        w.source.load(&t("b"), rows(1..=2));
+        let p = mode("mode: never, overrides: { public.a: dump_initial, public.b: dump_always }");
+        let (end, st) = run(&w, &p, async |status| streamed(&status, &w).await).await;
+        end.unwrap();
+        assert_eq!(w.ids("b"), [1, 2]);
+        assert_eq!(st.copied, BTreeSet::from([t("a"), t("b")]));
+        assert_eq!(
+            st.tracked,
+            BTreeSet::from([t("b"), t("c")]),
+            "a never streams"
+        );
     }
 
     #[tokio::test]

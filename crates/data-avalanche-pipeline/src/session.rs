@@ -464,9 +464,13 @@ impl<'c> Session<'c> {
                     // A completion durable now ends its snapshot, as in the loop.
                     self.durable += 1;
                     let done = self.snaps.durable(self.durable);
+                    let copies = &self.copies;
                     self.core.update(|st| {
-                        for (table, _) in done {
+                        for (table, dump) in done {
                             st.snapshots.remove(&table);
+                            if dump && !copies.contains_key(&table) {
+                                st.copied.insert(table);
+                            }
                         }
                         st.checkpoint = Some(cp);
                     });
@@ -669,14 +673,18 @@ impl<'c> Session<'c> {
                     self.unsynced.pop_front();
                 }
                 for (table, dump) in self.snaps.durable(self.durable) {
+                    // A dump, or a copy, stops once its snapshot is durable: the config's dump
+                    // shows `copied`, a copy outside the config leaves the pipeline's page.
+                    let copy = dump && self.copies.remove(&table).is_some();
                     self.core.update(|st| {
                         st.snapshots.remove(&table);
+                        if dump && !copy {
+                            st.copied.insert(table.clone());
+                        }
                     });
                     if dump {
-                        // A dump, or a copy, stops once its snapshot is durable.
                         self.acc.halt_table(&table);
                         self.schemas.remove(&table);
-                        self.copies.remove(&table);
                     }
                 }
                 if let Err(e) = self.stream.acknowledge(&cp).await {

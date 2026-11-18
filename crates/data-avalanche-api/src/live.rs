@@ -80,12 +80,14 @@ fn tables(
     let running = matches!(s.actual, Some(Actual::Running)) && w.phase == Phase::Streaming;
     let fresh = fresh_as_of(w, now);
     let window = chrono::Duration::from_std(FRESH_WITHIN).expect("a minute");
+    // A copy outside the config is listed while it copies: once it ends, or halts, its job
+    // tells (its figures stay in `tables` until the worker ends).
     let all: BTreeSet<&TableRef> = w
         .tracked
         .iter()
         .chain(w.halted.keys())
         .chain(w.snapshots.keys())
-        .chain(w.tables.keys())
+        .chain(w.copied.iter())
         .collect();
     all.into_iter()
         .map(|t| {
@@ -95,9 +97,15 @@ fn tables(
             let state = match (halt, snapshot) {
                 (Some(_), _) => "halted",
                 (None, Some(_)) => "snapshot",
+                (None, None) if w.copied.contains(t) => "copied",
                 (None, None) => "streaming",
             };
-            let fresh = if halt.is_some() { since } else { Some(fresh) };
+            // A halted table is as fresh as its halt; a dump that ended, as its last copy.
+            let fresh = match state {
+                "halted" => since,
+                "copied" => None,
+                _ => Some(fresh),
+            };
             let figures = w.tables.get(t);
             json!({
                 "table": table_name(p, t),
@@ -294,6 +302,7 @@ mod tests {
             phase: Phase::Streaming,
             unsynced_since_micros: Some((now - lag).timestamp_micros()),
             tracked: [t("orders"), t("items")].into(),
+            copied: [t("dumped")].into(),
             halted: [(t("items"), HaltReason::TableDropped)].into(),
             snapshots: [(
                 t("audit"),
@@ -322,6 +331,15 @@ mod tests {
                 files_rewritten: 6,
                 files: Some(820),
             },
+            at: now,
+        });
+        // A copy outside the config that ended: its job tells, the page doesn't list it.
+        w.committed(&TableCommit {
+            table: t("ended"),
+            rows: 3,
+            snapshot: true,
+            version: 2,
+            cost: CommitCost::default(),
             at: now,
         });
         w
@@ -358,7 +376,8 @@ mod tests {
     }
 
     /// The node that runs the worker answers from its memory: each table's state, figures and
-    /// freshness; a halted table is as fresh as its halt, and isn't stale.
+    /// freshness; a halted table is as fresh as its halt, and isn't stale; a dump that ended is
+    /// `copied`, and a copy that ended isn't listed.
     #[tokio::test]
     async fn the_node_that_runs_the_worker_answers_from_its_memory() {
         let lagging = statuses(Actual::Running, Some(worker(chrono::Duration::seconds(90))));
@@ -417,6 +436,22 @@ mod tests {
         assert_eq!(
             audit["stale"], false,
             "a copy's readers see what its job says"
+        );
+        let dumped = by_table(&v, "public.dumped");
+        assert_eq!(
+            (&dumped["state"], &dumped["stale"], &dumped["fresh_as_of"]),
+            (&json!("copied"), &json!(false), &Value::Null),
+            "a dump that ended isn't streamed"
+        );
+        let listed: Vec<&Value> = v["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| &t["table"])
+            .collect();
+        assert!(
+            !listed.contains(&&json!("public.ended")),
+            "a copy that ended: {listed:?}"
         );
     }
 
