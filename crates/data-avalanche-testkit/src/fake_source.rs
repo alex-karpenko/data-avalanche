@@ -36,8 +36,8 @@ use data_avalanche_core::{
     CdcEvent, ChangeStream, Checkpoint, Chunk, ChunkVisibility, ColumnSchema, ColumnValue,
     HaltReason, InFlightTxn, KeysetCursor, Op, Preflight, Prepared, RescanReport, ResolvedTables,
     RetainedLog, Row, SchemaChange, SchemaDelta, SchemaHint, ServerIdentity, SnapshotReason,
-    SourceConnector, SourceError, SourcePosition, SourceSeq, StartPlan, StreamItem, TableRef,
-    TableSchema, TransactionBoundary, XidSnapshot, identifier_values,
+    SourceConnector, SourceDetail, SourceError, SourcePosition, SourceSeq, StartPlan, StreamItem,
+    TableRef, TableSchema, TransactionBoundary, XidSnapshot, identifier_values,
 };
 use tokio::sync::Notify;
 
@@ -240,6 +240,8 @@ struct Db {
     retained: Option<Option<u64>>,
     /// [`FakeSource::set_behind`].
     behind: Option<Duration>,
+    /// What `detail` reports (by default, nothing).
+    detail: Option<SourceDetail>,
     /// [`FakeSource::detach_stream`].
     detached: bool,
     /// [`FakeSource::stall_retained`].
@@ -320,6 +322,7 @@ impl FakeSource {
             added: vec![],
             retained: None,
             behind: None,
+            detail: None,
             detached: false,
             retained_stalled: false,
             faults: vec![],
@@ -541,6 +544,11 @@ impl FakeSource {
     /// How far behind `retained` says the stream reads from now on (by default, it doesn't say).
     pub fn set_behind(&self, behind: Option<Duration>) {
         self.db().behind = behind;
+    }
+
+    /// What `detail` reports from now on (by default, nothing).
+    pub fn set_detail(&self, detail: Option<SourceDetail>) {
+        self.db().detail = detail;
     }
 
     /// `retained` reports that no stream reads the slot, whatever the open streams do: a stream
@@ -1208,6 +1216,10 @@ impl SourceConnector for FakeSource {
             position: SourcePosition::Pg(db.wal_end),
             server: db.server.clone(),
         })
+    }
+
+    async fn detail(&self) -> Result<Option<SourceDetail>, SourceError> {
+        Ok(self.db().detail.clone())
     }
 
     async fn retained(&self) -> Result<Option<RetainedLog>, SourceError> {

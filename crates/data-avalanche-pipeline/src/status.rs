@@ -1,11 +1,12 @@
 //! What a running worker shows and takes: its status, the commands it obeys, why it ended, and
 //! the timings its retries use.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use data_avalanche_config::Pipeline;
-use data_avalanche_core::{HaltReason, Op, SourcePosition, TableRef};
+use data_avalanche_core::{CommitCost, HaltReason, Op, SourceDetail, SourcePosition, TableRef};
 use tokio::sync::watch;
 
 use crate::Backoff;
@@ -147,6 +148,78 @@ pub struct WorkerStatus {
     /// written NULL (`data_avalanche_sink_soft_dropped_columns`). Counted at the start and after
     /// each evolve.
     pub soft_dropped: BTreeMap<TableRef, usize>,
+    /// The tables the last Phase 0 tracks: the pipeline's page lists them.
+    pub tracked: BTreeSet<TableRef>,
+    /// Per table, what this worker committed to it since it started: the pipeline's page.
+    pub tables: BTreeMap<TableRef, TableFigures>,
+    /// What the source keeps for the pipeline, as of `source_read_at`: read every heartbeat. A
+    /// failed read keeps the last one.
+    pub source: Option<SourceDetail>,
+    pub source_read_at: Option<DateTime<Utc>>,
+}
+
+/// One commit the writer made to a table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableCommit {
+    pub table: TableRef,
+    /// The rows it wrote, upserts and deletes.
+    pub rows: u64,
+    /// A snapshot chunk's rows, not the stream's changes.
+    pub snapshot: bool,
+    pub version: u64,
+    pub cost: CommitCost,
+    pub at: DateTime<Utc>,
+}
+
+/// The window [`TableFigures::changes_per_minute`] counts over.
+pub const CHANGES_WINDOW: Duration = Duration::from_secs(60);
+
+/// A table's figures since the worker started, from its commits.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TableFigures {
+    /// The stream's changes committed to it; a snapshot's rows don't count.
+    pub changes: u64,
+    /// The commits of the last [`CHANGES_WINDOW`] that carried changes: when, and how many.
+    recent: VecDeque<(DateTime<Utc>, u64)>,
+    pub last_commit: Option<DateTime<Utc>>,
+    /// The table's version after the last commit.
+    pub version: Option<u64>,
+    /// The cost of the last commit that wrote rows: a MERGE's files rewritten, and the table's
+    /// files after it.
+    pub cost: Option<CommitCost>,
+}
+
+impl TableFigures {
+    fn add(&mut self, c: &TableCommit) {
+        self.last_commit = Some(c.at);
+        self.version = Some(c.version);
+        if c.rows > 0 {
+            self.cost = Some(c.cost);
+        }
+        if !c.snapshot && c.rows > 0 {
+            self.changes += c.rows;
+            self.recent.push_back((c.at, c.rows));
+        }
+        let window = chrono::Duration::from_std(CHANGES_WINDOW).expect("a minute");
+        while self
+            .recent
+            .front()
+            .is_some_and(|(at, _)| *at <= c.at - window)
+        {
+            self.recent.pop_front();
+        }
+    }
+
+    /// The changes committed in the [`CHANGES_WINDOW`] before `now`.
+    #[must_use]
+    pub fn changes_per_minute(&self, now: DateTime<Utc>) -> u64 {
+        let window = chrono::Duration::from_std(CHANGES_WINDOW).expect("a minute");
+        self.recent
+            .iter()
+            .filter(|(at, _)| *at > now - window)
+            .map(|(_, rows)| rows)
+            .sum()
+    }
 }
 
 /// The warnings a status keeps.
@@ -159,6 +232,11 @@ impl WorkerStatus {
         self.reconnects += 1;
         self.read = None;
         self.unsynced_since_micros = None;
+    }
+
+    /// A commit the writer made: the table's figures take it.
+    pub fn committed(&mut self, c: &TableCommit) {
+        self.tables.entry(c.table.clone()).or_default().add(c);
     }
 
     /// Adds a warning as the latest. One the status already shows moves to the end instead: a
@@ -253,6 +331,49 @@ mod tests {
         st.warn("a".into());
         assert_eq!(st.warnings, ["b", "a"]);
         assert_eq!(st.warnings_dropped, 0);
+    }
+
+    fn commit(rows: u64, snapshot: bool, secs: i64) -> TableCommit {
+        TableCommit {
+            table: TableRef::new("public", "t"),
+            rows,
+            snapshot,
+            version: secs as u64,
+            cost: CommitCost {
+                files_rewritten: rows,
+                files: Some(10),
+            },
+            at: DateTime::from_timestamp(secs, 0).unwrap(),
+        }
+    }
+
+    #[test]
+    fn a_table_s_figures_follow_its_commits() {
+        let mut st = WorkerStatus::default();
+        st.committed(&commit(5, false, 1_000));
+        st.committed(&commit(100, true, 1_030));
+        st.committed(&commit(3, false, 1_050));
+        // A marker-only commit moves the version, not the cost.
+        st.committed(&commit(0, false, 1_055));
+        let f = &st.tables[&TableRef::new("public", "t")];
+        assert_eq!(f.changes, 8, "a snapshot's rows aren't changes");
+        assert_eq!(f.version, Some(1_055));
+        assert_eq!(f.last_commit, DateTime::from_timestamp(1_055, 0));
+        assert_eq!(
+            f.cost,
+            Some(CommitCost {
+                files_rewritten: 3,
+                files: Some(10)
+            })
+        );
+        let at = |secs| DateTime::from_timestamp(secs, 0).unwrap();
+        assert_eq!(f.changes_per_minute(at(1_055)), 8);
+        assert_eq!(
+            f.changes_per_minute(at(1_060)),
+            3,
+            "the first is a minute old"
+        );
+        assert_eq!(f.changes_per_minute(at(1_200)), 0);
     }
 
     #[test]

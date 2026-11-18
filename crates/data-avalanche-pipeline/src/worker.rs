@@ -1297,11 +1297,14 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
         doc.save(&core.docs).await?;
     }
     core.server = server;
+    core.update(|st| {
+        st.tracked.clone_from(&tracked);
+        warnings.into_iter().for_each(|w| st.warn(w));
+    });
     core.tracked = tracked;
     core.copies = copies;
     core.drifted = drifted;
     core.dump_only = dump_only;
-    core.update(|st| warnings.into_iter().for_each(|w| st.warn(w)));
     Ok(())
 }
 
@@ -1422,6 +1425,7 @@ mod tests {
         .await;
         end.unwrap();
         assert_eq!(st.soft_dropped, BTreeMap::from([(t("a"), 1)]));
+        assert_eq!(st.tracked, BTreeSet::from([t("a")]), "Phase 0's tables");
     }
 
     #[tokio::test]
