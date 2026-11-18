@@ -38,10 +38,10 @@ pub use sink::{
     WriteMode,
 };
 pub use source::{
-    ChangeStream, Checkpoint, Chunk, ChunkVisibility, InFlightTxn, KeysetCursor, Preflight,
-    Prepared, RescanReport, ResolvedTables, RetainedLog, SchemaHint, ServerIdentity,
-    SnapshotReason, SourceConnector, SourceError, StartPlan, StreamItem, XidSnapshot,
-    identifier_values,
+    ChangeStream, Checkpoint, Chunk, ChunkVisibility, InFlightTxn, KeysetCursor, MySqlDetail,
+    PgDetail, Preflight, Prepared, PublicationDetail, RescanReport, ResolvedTables, RetainedLog,
+    SchemaHint, ServerIdentity, SlotDetail, SnapshotReason, SourceConnector, SourceDetail,
+    SourceError, StartPlan, StreamItem, XidSnapshot, identifier_values,
 };
 pub use table::{
     INTERNAL_COLUMN_PREFIX, LINEAGE_COLUMNS, TableRef, differ_by_case_alone,

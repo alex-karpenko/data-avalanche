@@ -7,8 +7,9 @@ use std::collections::BTreeSet;
 use data_avalanche_config::{SlotManagement, SlotOnOrphan, SourceChangeAction};
 use data_avalanche_core::position::Lsn;
 use data_avalanche_core::{
-    Checkpoint, HaltReason, Prepared, ResolvedTables, RetainedLog, ServerIdentity, SnapshotReason,
-    SourceError, SourcePosition, StartPlan, TableRef,
+    Checkpoint, HaltReason, PgDetail, Prepared, PublicationDetail, ResolvedTables, RetainedLog,
+    ServerIdentity, SlotDetail, SnapshotReason, SourceDetail, SourceError, SourcePosition,
+    StartPlan, TableRef,
 };
 use tokio_postgres::Client;
 
@@ -1114,6 +1115,62 @@ impl PgConnector {
                 behind: None,
             })
         }))
+    }
+
+    /// The slot, the publication and the write position, for the pipeline's page: one query on
+    /// views every role reads.
+    pub async fn detail(&self) -> Result<Option<SourceDetail>, SourceError> {
+        let client = self.conn.client().await?;
+        let row = self
+            .conn
+            .command(
+                "read the slot and the publication",
+                client.query_one(
+                    "SELECT pg_current_wal_lsn()::text,
+                            pg_size_bytes(current_setting('max_slot_wal_keep_size'))::bigint,
+                            s.slot_name IS NOT NULL, s.active,
+                            s.confirmed_flush_lsn::text, s.restart_lsn::text,
+                            pg_wal_lsn_diff(pg_current_wal_lsn(), s.restart_lsn)::bigint,
+                            s.wal_status,
+                            p.pubname IS NOT NULL,
+                            (SELECT count(*) FROM pg_catalog.pg_publication_tables t
+                              WHERE t.pubname = $2)
+                       FROM (SELECT 1) one
+                       LEFT JOIN pg_catalog.pg_replication_slots s ON s.slot_name = $1
+                       LEFT JOIN pg_catalog.pg_publication p ON p.pubname = $2",
+                    &[&self.slot_name(), &self.pg.publication],
+                ),
+            )
+            .await?;
+        let lsn = |text: Option<String>| -> Result<Option<SourcePosition>, SourceError> {
+            text.map(|t| parse_lsn(&t).map(SourcePosition::Pg))
+                .transpose()
+        };
+        let slot = if row.get::<_, bool>(2) {
+            Some(SlotDetail {
+                name: self.slot_name().to_owned(),
+                active: row.get(3),
+                confirmed_flush: lsn(row.get(4))?,
+                restart_lsn: lsn(row.get(5))?,
+                wal_held_bytes: row
+                    .get::<_, Option<i64>>(6)
+                    .map(|b| u64::try_from(b).unwrap_or(0)),
+                wal_status: row.get(7),
+            })
+        } else {
+            None
+        };
+        let publication = row.get::<_, bool>(8).then(|| PublicationDetail {
+            name: self.pg.publication.clone(),
+            tables: u64::try_from(row.get::<_, i64>(9)).unwrap_or(0),
+        });
+        Ok(Some(SourceDetail::Postgres(PgDetail {
+            head: SourcePosition::Pg(parse_lsn(row.get(0))?),
+            slot,
+            // -1: unlimited.
+            max_slot_wal_keep_size: u64::try_from(row.get::<_, i64>(1)).ok(),
+            publication,
+        })))
     }
 }
 

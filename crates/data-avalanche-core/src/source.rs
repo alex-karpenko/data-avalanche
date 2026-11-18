@@ -346,6 +346,63 @@ pub struct RetainedLog {
     pub behind: Option<Duration>,
 }
 
+/// What the source keeps for the pipeline, read every heartbeat for the pipeline's page (the
+/// console's source panel, Admin_Console §4). A figure the server doesn't give is `None`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "engine", rename_all = "snake_case")]
+pub enum SourceDetail {
+    Postgres(PgDetail),
+    /// MySQL and MariaDB.
+    Mysql(MySqlDetail),
+}
+
+/// PostgreSQL: the pipeline's slot and publication, and the server's write position.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PgDetail {
+    /// The server's write position (`pg_current_wal_lsn()`).
+    pub head: SourcePosition,
+    /// The pipeline's slot; `None` when the server has none by its name.
+    pub slot: Option<SlotDetail>,
+    /// `max_slot_wal_keep_size` in bytes: the WAL a slot may hold before the server invalidates
+    /// it. `None` when unlimited (`-1`).
+    pub max_slot_wal_keep_size: Option<u64>,
+    /// The pipeline's publication; `None` when the server has none by its name.
+    pub publication: Option<PublicationDetail>,
+}
+
+/// A PostgreSQL replication slot (`pg_replication_slots`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SlotDetail {
+    pub name: String,
+    /// A walsender reads it now.
+    pub active: bool,
+    /// The position the server was last told it may release (`confirmed_flush_lsn`).
+    pub confirmed_flush: Option<SourcePosition>,
+    /// The oldest WAL the slot keeps (`restart_lsn`).
+    pub restart_lsn: Option<SourcePosition>,
+    /// The WAL the slot holds on the server's disk: from `restart_lsn` to the write position.
+    pub wal_held_bytes: Option<u64>,
+    /// `reserved`, `extended`, `unreserved` or `lost`.
+    pub wal_status: Option<String>,
+}
+
+/// A PostgreSQL publication and how many tables it publishes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PublicationDetail {
+    pub name: String,
+    pub tables: u64,
+}
+
+/// MySQL and MariaDB: the server's binlog position and how long it keeps its binlogs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MySqlDetail {
+    /// The server's write position: its executed GTID set, or its binlog file and offset.
+    pub head: SourcePosition,
+    /// `binlog_expire_logs_seconds`: how long the server keeps a binlog. `None` when it never
+    /// expires them (`0`).
+    pub binlog_expire_seconds: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RescanReport {
     /// Tables gone from the source catalog: each halts with `TABLE_DROPPED`.
@@ -420,6 +477,12 @@ pub trait SourceConnector: Send + Sync {
 
     /// The log the source keeps for the pipeline. `None` when the source keeps nothing for it.
     async fn retained(&self) -> Result<Option<RetainedLog>, SourceError>;
+
+    /// What the source keeps for the pipeline, for the pipeline's page: read every heartbeat
+    /// beside [`Self::retained`]. `None` for a source that says nothing.
+    async fn detail(&self) -> Result<Option<SourceDetail>, SourceError> {
+        Ok(None)
+    }
 
     /// The source's current position: a snapshot chunk's low and high watermarks, and the point
     /// the stream must pass before a rescan's change is applied.
@@ -798,6 +861,44 @@ mod tests {
             None,
             "a source without chunk visibility"
         );
+        assert_eq!(
+            block_on(source.detail()).unwrap(),
+            None,
+            "a source that says nothing"
+        );
+    }
+
+    #[test]
+    fn a_source_detail_names_its_engine() {
+        let pg = SourceDetail::Postgres(PgDetail {
+            head: SourcePosition::Pg(Lsn(0x30)),
+            slot: Some(SlotDetail {
+                name: "da_orders".into(),
+                active: true,
+                confirmed_flush: Some(SourcePosition::Pg(Lsn(0x20))),
+                restart_lsn: Some(SourcePosition::Pg(Lsn(0x10))),
+                wal_held_bytes: Some(32),
+                wal_status: Some("reserved".into()),
+            }),
+            max_slot_wal_keep_size: None,
+            publication: Some(PublicationDetail {
+                name: "da_orders".into(),
+                tables: 14,
+            }),
+        });
+        let v = serde_json::to_value(&pg).unwrap();
+        assert_eq!(v["engine"], "postgres");
+        assert_eq!(v["head"], SourcePosition::Pg(Lsn(0x30)).to_string());
+        assert_eq!(v["slot"]["wal_held_bytes"], 32);
+        assert_eq!(v["max_slot_wal_keep_size"], serde_json::Value::Null);
+        assert_eq!(v["publication"]["tables"], 14);
+        let my = SourceDetail::Mysql(MySqlDetail {
+            head: SourcePosition::Pg(Lsn(0x30)),
+            binlog_expire_seconds: Some(2_592_000),
+        });
+        let v = serde_json::to_value(&my).unwrap();
+        assert_eq!(v["engine"], "mysql");
+        assert_eq!(v["binlog_expire_seconds"], 2_592_000);
     }
 
     #[test]

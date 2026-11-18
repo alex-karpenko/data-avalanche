@@ -10,8 +10,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use data_avalanche_core::{
     ChangeStream, Checkpoint, Chunk, KeysetCursor, Preflight, Prepared, RescanReport,
-    ResolvedTables, RetainedLog, Row, SchemaDelta, SchemaHint, SourceConnector, SourceError,
-    SourcePosition, TableRef, TableSchema,
+    ResolvedTables, RetainedLog, Row, SchemaDelta, SchemaHint, SourceConnector, SourceDetail,
+    SourceError, SourcePosition, TableRef, TableSchema,
 };
 use mysql_async::prelude::Queryable;
 use tokio::sync::OnceCell;
@@ -474,6 +474,10 @@ impl SourceConnector for MySqlConnector {
 
     async fn retained(&self) -> Result<Option<RetainedLog>, SourceError> {
         MySqlConnector::retained(self).await
+    }
+
+    async fn detail(&self) -> Result<Option<SourceDetail>, SourceError> {
+        MySqlConnector::detail(self).await
     }
 
     async fn current_position(&self) -> Result<SourcePosition, SourceError> {

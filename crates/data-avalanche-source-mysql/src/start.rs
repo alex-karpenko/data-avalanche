@@ -20,8 +20,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use data_avalanche_config::BinlogPurgeAction;
 use data_avalanche_core::position::BinlogFilePos;
 use data_avalanche_core::{
-    Checkpoint, Prepared, RetainedLog, ServerIdentity, SnapshotReason, SourceError, SourcePosition,
-    StartPlan,
+    Checkpoint, MySqlDetail, Prepared, RetainedLog, ServerIdentity, SnapshotReason, SourceDetail,
+    SourceError, SourcePosition, StartPlan,
 };
 use mysql_async::prelude::Queryable;
 
@@ -426,6 +426,25 @@ impl MySqlConnector {
             streamed,
             behind,
         }))
+    }
+
+    /// The server's write position and how long it keeps its binlogs, for the pipeline's page.
+    pub async fn detail(&self) -> Result<Option<SourceDetail>, SourceError> {
+        let head = self.position_now().await?;
+        let expire: Option<u64> = self
+            .conn
+            .command("read the binlog expiry", |c| {
+                Box::pin(async move {
+                    c.query_first("SELECT @@GLOBAL.binlog_expire_logs_seconds")
+                        .await
+                })
+            })
+            .await?;
+        Ok(Some(SourceDetail::Mysql(MySqlDetail {
+            head,
+            // 0: the server never expires its binlogs.
+            binlog_expire_seconds: expire.filter(|s| *s > 0),
+        })))
     }
 }
 
