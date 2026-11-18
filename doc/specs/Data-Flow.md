@@ -529,8 +529,10 @@ For every `TableChangeSet` the sink must:
    accumulator never knows the target format.
 7. **Tolerate unmaintained tables** — never assume compaction/expiry has run.
 
-Outcome per table: `Committed{version}` | `SkippedCovered` (position guard) | `Fenced` (stop the
-pipeline; lease lost).
+Outcome per table: `Committed{version, cost}` | `SkippedCovered` (position guard) | `Fenced` (stop
+the pipeline; lease lost). `cost` is the files the commit rewrote and the table's files after it, as
+far as the sink counts them. On request, a sink also reads a table's facts: its version, files,
+their size and its rows (Delta: from the files' statistics), for the table's page.
 
 **Position guard (optimization, not correctness):** before committing a table, the sink reads that
 table's own `committed_position` marker — an **engine-tagged** value (PG LSN, or **canonical GTID-set**
@@ -718,8 +720,10 @@ membership, the lease registry) lives separately under `globals.state` per
 │                                                  source id); written after the checkpoint that covers a
 │                                                  change; finds a table dropped and re-created while down
 ├── halts.json                                   — halted tables: table, code, detail, `at` (the sink holds
-│                                                  the table's changes through it); written before the
-│                                                  next checkpoint; a halted table stays halted at start
+│                                                  the table's changes through it), and when each halt
+│                                                  began (`since`, written only when there is one);
+│                                                  written before the next checkpoint; a halted table
+│                                                  stays halted at start
 └── snapshots/
     ├── <schema>.<table>.json                    — per-table snapshot state (a `.`, `/`, `%` or control character
     │                                              inside a name is escaped as `%XX` in the file name)
