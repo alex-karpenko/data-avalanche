@@ -467,7 +467,9 @@ async fn stored(node: &Node, p: &Pipeline) -> Result<Vec<Value>, String> {
     Ok(crate::live::stored(p, &halts, Utc::now()))
 }
 
-/// One pipeline's tables, each with its pipeline and node, and why the holder couldn't be asked.
+/// One pipeline's tables, each with its pipeline and node, and why the holder couldn't be asked:
+/// the pipeline, the answer's `code`, the `error` (with why its halts couldn't be read either,
+/// when they couldn't) and the holder's `node`, null when none is known.
 async fn of_pipeline(
     node: &Node,
     p: &Pipeline,
@@ -476,7 +478,12 @@ async fn of_pipeline(
     let docs = match (node.docs)(p) {
         Ok(docs) => docs,
         Err(e) => {
-            let why = json!({ "pipeline": p.id, "error": format!("the state location: {e}") });
+            let why = json!({
+                "pipeline": p.id,
+                "code": StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                "error": format!("the state location: {e}"),
+                "node": null,
+            });
             return (vec![], Some(why));
         }
     };
@@ -487,11 +494,14 @@ async fn of_pipeline(
         }
         Err(why) => match stored(node, p).await {
             Ok(rows) => (rows, Value::Null, Some(why)),
-            Err(e) => (
-                vec![],
-                Value::Null,
-                Some(json!({ "code": why["code"], "error": e })),
-            ),
+            Err(e) => {
+                let error = match why["error"].as_str() {
+                    Some(holder) => format!("{holder}; its halts: {e}"),
+                    None => format!("its halts: {e}"),
+                };
+                let why = json!({ "code": why["code"], "error": error, "node": why["node"] });
+                (vec![], Value::Null, Some(why))
+            }
         },
     };
     let rows = rows
@@ -512,7 +522,7 @@ async fn of_pipeline(
 }
 
 /// `GET /v1/tables`: every pipeline's tables, worst first, filtered; each pipeline's holder asked
-/// [`READ_AT_ONCE`] at a time. A pipeline whose holder can't be asked lists its halted tables
+/// [`READ_AT_ONCE`] at a time, in any order, so a slow one holds up no other. A pipeline whose holder can't be asked lists its halted tables
 /// from storage, and is named under `unreachable` with why. `counts` are by listed state, of the
 /// tables the pipeline and `q` filters keep.
 pub(crate) async fn all(
@@ -552,7 +562,7 @@ pub(crate) async fn all(
     let headers = &headers;
     let read = futures_util::stream::iter(pipelines)
         .map(|p| async move { of_pipeline(node, &p, headers).await })
-        .buffered(READ_AT_ONCE)
+        .buffer_unordered(READ_AT_ONCE)
         .collect::<Vec<_>>()
         .await;
     let mut tables = vec![];
@@ -567,6 +577,8 @@ pub(crate) async fn all(
         }));
         unreachable.extend(why);
     }
+    // Read in any order: listed by pipeline.
+    unreachable.sort_by(|a: &Value, b: &Value| a["pipeline"].as_str().cmp(&b["pipeline"].as_str()));
     let mut counts = serde_json::Map::new();
     counts.insert("all".into(), json!(tables.len()));
     for state in STATES {
@@ -580,6 +592,7 @@ pub(crate) async fn all(
             .position(|s| t["listed_as"] == *s)
             .unwrap_or(STATES.len())
     };
+    // Total: a pipeline lists each of its tables once.
     tables.sort_by(|a, b| {
         (rank(a), a["pipeline"].as_str(), a["table"].as_str()).cmp(&(
             rank(b),
@@ -1110,6 +1123,59 @@ mod tests {
         let stale: Vec<String> = names(&v).into_iter().map(|(n, _)| n).collect();
         assert_eq!(stale, ["public.events", "public.orders", "public.quiet"]);
         assert_eq!(v["counts"]["stale"], 3);
+    }
+
+    /// Every `unreachable` entry says the pipeline, the answer's code, why and the node: a state
+    /// location that can't be built is `503` with no node; a holder that can't be asked and
+    /// halts that can't be read keep the holder's code and node, with both errors.
+    #[tokio::test]
+    async fn every_unreachable_pipeline_says_why_and_where() {
+        let (addr, _lone, _dir) = served_with("http://127.0.0.1:1", open(), |n| {
+            n.docs = Arc::new(|_| Err("no such bucket".into()));
+        })
+        .await;
+        let (code, _, text) = request(addr, "GET", "/v1/tables", &[], "").await;
+        assert_eq!(code, 200, "{text}");
+        assert_eq!(
+            json(&text)["unreachable"],
+            json!([{
+                "pipeline": "orders",
+                "code": 503,
+                "error": "the state location: no such bucket",
+                "node": null,
+            }])
+        );
+        // The state location builds once, for the holder's question; then it fails.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (addr, lone, _dir) = served_with("http://127.0.0.1:1", open(), |n| {
+            let real = Arc::clone(&n.docs);
+            n.docs = Arc::new(move |p| {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    real(p)
+                } else {
+                    Err("down".into())
+                }
+            });
+        })
+        .await;
+        let holder = Holder {
+            node_id: "node-z".into(),
+            incarnation: 1,
+        };
+        lone.leases
+            .acquire("orders", &holder, Duration::from_secs(30), Utc::now())
+            .await
+            .unwrap();
+        let (_, _, text) = request(addr, "GET", "/v1/tables", &[], "").await;
+        assert_eq!(
+            json(&text)["unreachable"],
+            json!([{
+                "pipeline": "orders",
+                "code": 503,
+                "error": "node-z holds orders's lease and isn't a member this node sees; its halts: the state location: down",
+                "node": "node-z",
+            }])
+        );
     }
 
     /// A holder without a worker (a stopped pipeline) answers with its halts from storage: they
