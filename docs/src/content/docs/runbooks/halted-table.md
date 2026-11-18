@@ -19,7 +19,10 @@ once the cause is fixed. The halt stays across restarts and failovers until then
 curl -s https://cdc.example.internal/v1/pipelines/shop
 ```
 
-Its `halted_tables` lists each halted table with its code and a detail.
+Its `halted_tables` lists each halted table with its code, a detail, and `since`, when it halted
+(none for a halt recorded before 1.1.0). The table's page,
+`GET /v1/pipelines/shop/tables/public.orders`, adds its columns at the source against Delta's and
+the jobs that copied it ([A pipeline's tables and figures](/data-avalanche/runbooks/pipeline-figures/)).
 
 ## 2. Fix the cause
 
