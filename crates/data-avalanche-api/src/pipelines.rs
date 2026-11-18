@@ -238,6 +238,7 @@ pub(crate) async fn get(State(api): State<Api>, Path(id): Path<String>) -> Respo
                 "code": h.reason.code(),
                 "detail": h.reason.to_string(),
                 "at": h.at.to_string(),
+                "since": halts.since(&h.table),
             }))
             .collect::<Vec<_>>()
     );
@@ -511,6 +512,12 @@ mod tests {
         assert_eq!(v["halted_tables"][0]["table"], "public.orders");
         assert_eq!(v["halted_tables"][0]["code"], "TABLE_DROPPED");
         assert_eq!(v["halted_tables"][0]["at"], "pg:0/16B3748");
+        let since = docs
+            .halts()
+            .await
+            .unwrap()
+            .since(&TableRef::new("public", "orders"));
+        assert_eq!(v["halted_tables"][0]["since"], json!(since.unwrap()));
         assert!(
             v["halted_tables"][0]["detail"]
                 .as_str()

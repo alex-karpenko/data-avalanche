@@ -506,6 +506,7 @@ mod tests {
                 at: "pg:0/10".parse().unwrap(),
                 copy: false,
             }],
+            since: vec![],
         };
         let Progress::Failed(why) = progress(&a, &halted, Some(&running)) else {
             panic!("a halt fails the table")
