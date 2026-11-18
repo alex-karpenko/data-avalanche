@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex, Once};
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use data_avalanche_core::{
-    CommitMarker, CommitOutcome, EvolveOutcome, SchemaDelta, SchemaOp, Sink, SinkCapabilities,
-    SinkError, SinkKind, SinkStats, SinkTableState, SourcePosition, TableChangeSet, TableRef,
-    TableSpec, TransformKind, WriteMode,
+    CommitCost, CommitMarker, CommitOutcome, EvolveOutcome, SchemaDelta, SchemaOp, Sink,
+    SinkCapabilities, SinkError, SinkKind, SinkStats, SinkTableState, SourcePosition,
+    TableChangeSet, TableFacts, TableRef, TableSpec, TransformKind, WriteMode,
 };
 use deltalake::DeltaTableError;
 use deltalake::kernel::Transaction;
@@ -251,10 +251,12 @@ impl DeltaSink {
         let txn_version = i64::try_from(marker.owner_epoch)
             .map_err(|_| permanent(format!("owner epoch {}", marker.owner_epoch)))?;
         let mut table = h.table().clone();
+        let mut rewritten = 0;
         if cs.truncate {
             // The clear carries the fence but no position: a crash before the MERGE replays both.
             table = match truncate(table, self.props(marker.owner_epoch, txn_version, None)).await {
                 Ok((t, metrics)) => {
+                    rewritten += metrics.num_removed_files as u64;
                     self.count(|s| {
                         s.files_removed += metrics.num_removed_files as u64;
                         s.rows_deleted += metrics.num_deleted_rows.unwrap_or(0) as u64;
@@ -285,6 +287,7 @@ impl DeltaSink {
             let props = self.props(marker.owner_epoch, txn_version, Some(&position));
             match merge(table, cs, &types, props, self.config.merge_memory_limit).await {
                 Ok((t, metrics)) => {
+                    rewritten += metrics.num_target_files_removed as u64;
                     self.count(|s| s.add(&metrics));
                     table = t;
                 }
@@ -303,7 +306,17 @@ impl DeltaSink {
             }
         };
         h.remember(version, position);
-        Ok(Step::Done(CommitOutcome::Committed { version }))
+        let files = table
+            .snapshot()
+            .ok()
+            .map(|s| s.log_data().num_files() as u64);
+        Ok(Step::Done(CommitOutcome::Committed {
+            version,
+            cost: CommitCost {
+                files_rewritten: rewritten,
+                files,
+            },
+        }))
     }
 }
 
@@ -353,6 +366,31 @@ impl Sink for DeltaSink {
                         pipeline_id: pipeline.clone(),
                     }),
             })
+        })
+        .await
+    }
+
+    /// The table's latest version, its files and their size, and its rows from the files'
+    /// `numRecords` statistics (none when a file has none).
+    async fn facts(&self, table: &TableRef) -> Result<Option<TableFacts>, SinkError> {
+        self.with_table(table, async |h| {
+            if !h.refresh().await? {
+                return Ok(None);
+            }
+            let snapshot = h.table().snapshot().map_err(sink_error)?;
+            let (mut files, mut bytes, mut rows) = (0, 0, Some(0));
+            for file in snapshot.log_data().iter() {
+                files += 1;
+                bytes += u64::try_from(file.size()).unwrap_or(0);
+                rows = rows.zip(file.num_records()).map(|(r, n)| r + n as u64);
+            }
+            Ok(Some(TableFacts {
+                location: Some(self.config.location.table_url(table)?.to_string()),
+                version: h.version(),
+                files: Some(files),
+                bytes: Some(bytes),
+                rows,
+            }))
         })
         .await
     }
@@ -944,10 +982,58 @@ mod tests {
         t.truncate = true;
         assert_eq!(
             s.commit(t.clone(), marker(1, &t)).await.unwrap(),
-            CommitOutcome::Committed { version: 1 }
+            CommitOutcome::Committed {
+                version: 1,
+                cost: CommitCost {
+                    files_rewritten: 0,
+                    files: Some(1)
+                }
+            }
         );
         assert_eq!(s.stats().retries, 0);
         assert_eq!(ids(&s).await, [1]);
+    }
+
+    /// The table's page: a MERGE that rewrites a file says so, and the table's facts follow its
+    /// commits; an absent table has none.
+    #[tokio::test]
+    async fn a_commit_reports_its_cost_and_the_facts_follow() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = sink(&dir);
+        assert_eq!(s.facts(orders().table()).await.unwrap(), None);
+        s.ensure_table(&spec(&orders())).await.unwrap();
+        let empty = s.facts(orders().table()).await.unwrap().expect("a table");
+        assert_eq!(
+            (empty.files, empty.bytes, empty.rows),
+            (Some(0), Some(0), Some(0))
+        );
+        let seed = rows(10, &[1, 2]);
+        let CommitOutcome::Committed { cost, .. } =
+            s.commit(seed.clone(), marker(1, &seed)).await.unwrap()
+        else {
+            panic!("committed")
+        };
+        assert_eq!(
+            cost,
+            CommitCost {
+                files_rewritten: 0,
+                files: Some(1)
+            }
+        );
+        let update = rows(20, &[1]);
+        let CommitOutcome::Committed { version, cost } =
+            s.commit(update.clone(), marker(1, &update)).await.unwrap()
+        else {
+            panic!("committed")
+        };
+        assert_eq!(cost.files_rewritten, 1, "the MERGE rewrote the seed's file");
+        let facts = s.facts(orders().table()).await.unwrap().expect("a table");
+        let url = local(&dir).table_url(orders().table()).unwrap();
+        assert_eq!(facts.location, Some(url.to_string()));
+        assert_eq!(facts.version, version);
+        assert_eq!(facts.files, cost.files);
+        assert_eq!(facts.rows, Some(2));
+        assert!(facts.bytes.is_some_and(|b| b > 0), "{facts:?}");
     }
 
     /// DA-SNAP-15: a job's truncate, a snapshot set with no rows, empties the table with its
@@ -988,7 +1074,7 @@ mod tests {
         s.ensure_table(&keyed).await.unwrap();
         let mut seed = rows(10, &[1]);
         seed.identifier = vec!["at".into()];
-        let CommitOutcome::Committed { version } =
+        let CommitOutcome::Committed { version, .. } =
             s.commit(seed.clone(), marker(1, &seed)).await.unwrap()
         else {
             panic!("committed")
@@ -1020,7 +1106,7 @@ mod tests {
         s.commit(seed.clone(), marker(1, &seed)).await.unwrap();
         let mut t = rows(20, &[2]);
         t.truncate = true;
-        let CommitOutcome::Committed { version } =
+        let CommitOutcome::Committed { version, .. } =
             s.commit(t.clone(), marker(1, &t)).await.unwrap()
         else {
             panic!("committed")

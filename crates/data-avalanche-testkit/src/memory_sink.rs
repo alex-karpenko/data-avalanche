@@ -13,9 +13,10 @@ use arrow_row::{OwnedRow, RowConverter, SortField};
 use arrow_schema::{Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use data_avalanche_core::{
-    CommitMarker, CommitOutcome, EvolveOutcome, SchemaChange, SchemaDelta, SchemaOp, Sink,
-    SinkCapabilities, SinkError, SinkKind, SinkTableState, SourcePosition, TableChangeSet,
-    TableRef, TableSpec, TransformKind, UNCHANGED_MASK_PREFIX, WriteMode, added_column_field,
+    CommitCost, CommitMarker, CommitOutcome, EvolveOutcome, SchemaChange, SchemaDelta, SchemaOp,
+    Sink, SinkCapabilities, SinkError, SinkKind, SinkTableState, SourcePosition, TableChangeSet,
+    TableFacts, TableRef, TableSpec, TransformKind, UNCHANGED_MASK_PREFIX, WriteMode,
+    added_column_field,
 };
 use tokio::sync::watch;
 
@@ -345,6 +346,18 @@ impl Sink for MemorySink {
         &self.capabilities
     }
 
+    /// The version and the rows; the reference sink keeps no files.
+    async fn facts(&self, table: &TableRef) -> Result<Option<TableFacts>, SinkError> {
+        self.fault(SinkOp::TableState, table)?;
+        Ok(self.tables().get(table).map(|t| TableFacts {
+            location: None,
+            version: t.version,
+            files: None,
+            bytes: None,
+            rows: Some(t.rows.len() as u64),
+        }))
+    }
+
     async fn table_state(&self, table: &TableRef) -> Result<SinkTableState, SinkError> {
         self.fault(SinkOp::TableState, table)?;
         Ok(match self.tables().get(table) {
@@ -488,7 +501,11 @@ impl Sink for MemorySink {
             committed_position,
             ..marker
         });
-        Ok(CommitOutcome::Committed { version: t.version })
+        // The reference sink keeps no files: it doesn't measure a commit's cost.
+        Ok(CommitOutcome::Committed {
+            version: t.version,
+            cost: CommitCost::default(),
+        })
     }
 }
 
@@ -627,7 +644,10 @@ mod tests {
         );
         assert_eq!(
             commit(&sink, first.clone(), 1).await,
-            CommitOutcome::Committed { version: 1 }
+            CommitOutcome::Committed {
+                version: 1,
+                cost: CommitCost::default()
+            }
         );
         let second = cs(
             20,
@@ -636,6 +656,22 @@ mod tests {
         );
         commit(&sink, second.clone(), 1).await;
         assert_eq!(rows(&sink), owned(&[(2, Some("B"))]));
+        assert_eq!(
+            sink.facts(&first.table).await.unwrap(),
+            Some(TableFacts {
+                location: None,
+                version: 2,
+                files: None,
+                bytes: None,
+                rows: Some(1),
+            })
+        );
+        assert_eq!(
+            sink.facts(&TableRef::new("public", "absent"))
+                .await
+                .unwrap(),
+            None
+        );
 
         // Replay under the guard: skipped, nothing changes.
         assert_eq!(
@@ -735,7 +771,10 @@ mod tests {
         assert_eq!(sink.version(&t), Some(0), "nothing written");
         assert_eq!(
             sink.commit(set, m).await.unwrap(),
-            CommitOutcome::Committed { version: 1 }
+            CommitOutcome::Committed {
+                version: 1,
+                cost: CommitCost::default()
+            }
         );
         sink.fail(SinkOp::TableState, None, 1, || SinkError::Permanent {
             reason: "gone".into(),
@@ -822,7 +861,10 @@ mod tests {
         });
         assert_eq!(
             commit(&sink, slice.clone(), 1).await,
-            CommitOutcome::Committed { version: 2 },
+            CommitOutcome::Committed {
+                version: 2,
+                cost: CommitCost::default()
+            },
             "the marker equals the pinned start, so the slice is written"
         );
         commit(
