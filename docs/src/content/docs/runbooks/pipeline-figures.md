@@ -46,6 +46,10 @@ source outage makes its tables stale once it outlasts the target. A table is nev
 the pipeline is paused, stopped or starting, nor when it is halted, copying or `copied`, nor when
 its `fresh_as_of` is `null`.
 
+Freshness carries across the pipeline's restarts on the node that holds it: a retry's new worker
+keeps the last caught-up time. After a failover, or a restart of that node, it starts over:
+`fresh_as_of` is `null`, and nothing is stale, until the stream catches up.
+
 Without a worker (a stopped pipeline, or one starting) the holder lists the pipeline's halted
 tables from storage, as fresh as each halt began.
 

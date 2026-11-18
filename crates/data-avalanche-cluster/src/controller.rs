@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use chrono::{DateTime, Utc};
 use data_avalanche_config::Pipeline;
 use data_avalanche_core::{
     SchemaChange, Sink, SourceConnector, SourceError, SourcePosition, TableRef,
@@ -122,6 +123,16 @@ pub struct ControllerStatus {
     pub owner_epoch: Option<u64>,
     pub lease: Option<RenewState>,
     pub worker: Option<WorkerStatus>,
+    /// The source commit time, in microseconds since the Unix epoch, of the oldest change this
+    /// lease term's workers read and the sink doesn't hold yet: the running worker's, or one an
+    /// earlier worker of the term left until the next reads as far (the lag's start,
+    /// DA-OBS-8). Kept while no worker runs; `None` when nothing is known to wait.
+    pub pending_since_micros: Option<i64>,
+    /// The last time, in this lease term, lake readers had every change its workers read: the
+    /// latest `caught_up_at` a worker reported while nothing of the term was pending. Kept while
+    /// no worker runs and across the term's workers; a new term (a failover, or this node's
+    /// restart) starts without one (S-M13d.3).
+    pub caught_up_at: Option<DateTime<Utc>>,
 }
 
 /// A controller's timings.
@@ -480,6 +491,8 @@ struct Pending {
 struct Lag {
     kept: Option<Pending>,
     own: Option<Pending>,
+    /// The term's last caught-up time ([`ControllerStatus::caught_up_at`]).
+    caught_up_at: Option<DateTime<Utc>>,
 }
 
 impl Lag {
@@ -533,6 +546,11 @@ impl Lag {
             });
         if caught_up {
             self.kept = None;
+        }
+        // A worker that hasn't read an earlier one's pending change again is caught up by its
+        // own count only: the term isn't.
+        if self.since().is_none() && st.caught_up_at.is_some() {
+            self.caught_up_at = self.caught_up_at.max(st.caught_up_at);
         }
     }
 }
@@ -872,6 +890,7 @@ impl PipelineController {
         // The lag's start across this term's workers: what one read and didn't make durable still
         // counts while none runs and while the next one reads it again (I2).
         let mut pending = Lag::default();
+        self.term(&pending);
         // One lease term: a stale reader is ended at most once in it, by whichever of its
         // workers meets it first, a stop and a resume included (DA-SRC-28).
         let reader_ended = Arc::new(AtomicBool::new(false));
@@ -1147,10 +1166,13 @@ impl PipelineController {
                     desired = self.desired().await.or(desired);
                     match worker.as_mut() {
                         Some(w) => self.observe(w, &mut pending),
-                        // No worker runs (a restart's backoff, ERROR): the lag grows on.
-                        None => self
-                            .metrics
-                            .replication_lag(lag(pending.since(), now_micros())),
+                        // No worker runs (a restart's backoff, ERROR): the lag grows on, and the
+                        // term's freshness stands.
+                        None => {
+                            self.metrics
+                                .replication_lag(lag(pending.since(), now_micros()));
+                            self.term(&pending);
+                        }
                     }
                     self.report(&mut reported).await;
                     let asked = self.asked(&mut seen).await;
@@ -1745,7 +1767,22 @@ impl PipelineController {
                 snapshot: read.snapshot,
             },
         });
-        self.status.send_modify(|s| s.worker = Some(st));
+        self.status.send_modify(|s| {
+            s.worker = Some(st);
+            s.pending_since_micros = pending.since();
+            s.caught_up_at = pending.caught_up_at;
+        });
+    }
+
+    /// The term's freshness into the status, as of `pending`: while no worker runs, and as a term
+    /// starts.
+    fn term(&self, pending: &Lag) {
+        self.status.send_if_modified(|s| {
+            let term = (pending.since(), pending.caught_up_at);
+            let changed = (s.pending_since_micros, s.caught_up_at) != term;
+            (s.pending_since_micros, s.caught_up_at) = term;
+            changed
+        });
     }
 
     fn standby(&self, holder: Option<String>) {
@@ -2020,6 +2057,98 @@ mod tests {
             at(40),
             "before a frontier, the checkpoint"
         );
+    }
+
+    /// S-M13d.3: the term's caught-up time is the latest a worker reported while nothing of the
+    /// term was pending. A worker that follows one which left a change pending doesn't move it
+    /// until its stream has read as far.
+    #[test]
+    fn the_term_s_caught_up_time_waits_for_the_next_worker_to_read_as_far() {
+        let at = |lsn| Some(SourcePosition::Pg(data_avalanche_core::position::Lsn(lsn)));
+        let time = |secs| chrono::DateTime::from_timestamp(secs, 0);
+        let status = |read, unsynced, caught_up_at| WorkerStatus {
+            read,
+            checkpoint: at(40),
+            unsynced_since_micros: unsynced,
+            caught_up_at,
+            ..WorkerStatus::default()
+        };
+        // The first worker is caught up at 10, then reads to 100 with a change pending, and ends.
+        let mut lag = Lag::default();
+        let mut session = None;
+        lag.carry(&mut session, &status(at(50), None, time(10)));
+        assert_eq!((lag.since(), lag.caught_up_at), (None, time(10)));
+        lag.carry(&mut session, &status(at(100), Some(11_000_000), time(10)));
+        assert_eq!(
+            (lag.since(), lag.caught_up_at),
+            (Some(11_000_000), time(10))
+        );
+        // The next worker: nothing yet, then caught up by its own count short of 100.
+        let mut session = None;
+        lag.carry(&mut session, &status(None, None, None));
+        assert_eq!(
+            (lag.since(), lag.caught_up_at),
+            (Some(11_000_000), time(10)),
+            "a new worker knows nothing"
+        );
+        lag.carry(&mut session, &status(at(60), None, time(30)));
+        assert_eq!(
+            (lag.since(), lag.caught_up_at),
+            (Some(11_000_000), time(10)),
+            "short of the first worker's change"
+        );
+        lag.carry(&mut session, &status(at(100), None, time(40)));
+        assert_eq!((lag.since(), lag.caught_up_at), (None, time(40)));
+        lag.carry(&mut session, &status(at(110), None, time(35)));
+        assert_eq!(lag.caught_up_at, time(40), "never moves back");
+    }
+
+    /// S-M13d.3: freshness carries across the term's workers. A worker that caught up, a failing
+    /// run (`Retrying`), then a worker that hasn't caught up: the status keeps the first's time.
+    #[tokio::test(start_paused = true)]
+    async fn the_term_s_caught_up_time_outlives_its_worker() {
+        let store = ScriptedStore::new();
+        let docs = pipeline_docs();
+        let f = TestFactory::new(&["a"]);
+        let mut d = deps("n1", &store, &f);
+        d.settings.restart = Backoff {
+            first: Duration::from_secs(20),
+            max: Duration::from_secs(20),
+        };
+        let (c, mut status) = PipelineController::new(pipeline(), docs.clone(), &d);
+        let (_target, rx) = watch::channel(Target::Own);
+        let _task = tokio::spawn(c.run(rx));
+        until(&mut status, "running", is(Actual::Running)).await;
+        until(&mut status, "caught up", |s| s.caught_up_at.is_some()).await;
+
+        // The stream fails, and its position stays busy past the contended window, for this
+        // worker and the next: each ends with `Contended` (Recovery::Retry) and never streams.
+        for _ in 0..10_000 {
+            f.source.fail(
+                Method::EndOtherReader,
+                SourceError::Permanent("permission denied".into()),
+            );
+            f.source
+                .fail(Method::OpenStream, SourceError::Contended("active".into()));
+        }
+        f.source
+            .fail(Method::Next, SourceError::Transient("reset".into()));
+        let retrying = |s: &ControllerStatus| matches!(s.actual, Some(Actual::Retrying { .. }));
+        until(&mut status, "the first worker ended", retrying).await;
+        let first = status.borrow().worker.as_ref().unwrap().caught_up_at;
+        assert!(first.is_some());
+        assert_eq!(status.borrow().caught_up_at, first, "while no worker runs");
+
+        let second = |s: &ControllerStatus| {
+            f.builds() == 2 && s.worker.as_ref().is_some_and(|w| w.caught_up_at.is_none())
+        };
+        until(&mut status, "the second worker's first statuses", second).await;
+        assert_eq!(
+            status.borrow().caught_up_at,
+            first,
+            "the term's, not the worker's"
+        );
+        assert_eq!(status.borrow().pending_since_micros, None);
     }
 
     /// `data_avalanche_replication_lag_seconds`'s value now.

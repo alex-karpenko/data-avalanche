@@ -667,6 +667,7 @@ mod tests {
             owner_epoch: Some(4),
             lease: None,
             worker: Some(worker),
+            ..ControllerStatus::default()
         };
         let statuses = watch::channel(BTreeMap::from([(
             "orders".to_owned(),
@@ -1045,6 +1046,8 @@ mod tests {
             actual: Some(Actual::Running),
             owner_epoch: Some(4),
             lease: None,
+            pending_since_micros: w.unsynced_since_micros,
+            caught_up_at: None,
             worker: Some(w),
         };
         watch::channel(BTreeMap::from([(
@@ -1187,6 +1190,7 @@ mod tests {
             owner_epoch: Some(4),
             lease: None,
             worker: None,
+            ..ControllerStatus::default()
         };
         let stopped = watch::channel(BTreeMap::from([(
             "orders".to_owned(),

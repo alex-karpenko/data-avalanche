@@ -69,25 +69,25 @@ fn replicating(s: &ControllerStatus, w: &WorkerStatus) -> bool {
     }
 }
 
-/// What lake readers see of the pipeline's tables as of now: every change read before the oldest
-/// one not yet durable (`replication_lag_seconds`, System-Overview). While the worker streams,
-/// all of them when none waits. Otherwise (a source outage, a retry, an error, a pause, a stop) as
-/// of the oldest change known to wait, else as of when the stream was last caught up; `None`
-/// when neither is known.
+/// What lake readers see of the pipeline's tables as of now, over the controller's lease term
+/// (its workers' freshness carried across their runs): every change read before the oldest one
+/// not yet durable (`replication_lag_seconds`, System-Overview); while the worker streams, all of
+/// them when none waits. Otherwise (a source outage, a retry, an error, a pause, a stop) as of
+/// when the term was last caught up; `None` when that isn't known either.
 fn fresh_as_of(
     s: &ControllerStatus,
     w: &WorkerStatus,
     now: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
-    let pending = w
-        .pending_since_micros()
+    let pending = s
+        .pending_since_micros
         .and_then(DateTime::from_timestamp_micros)
         .map(|at| at.min(now));
     let streams = matches!(s.actual, Some(Actual::Running)) && w.phase == Phase::Streaming;
     if streams {
         Some(pending.unwrap_or(now))
     } else {
-        pending.or_else(|| w.caught_up_at.map(|at| at.min(now)))
+        pending.or_else(|| s.caught_up_at.map(|at| at.min(now)))
     }
 }
 
@@ -487,10 +487,14 @@ mod tests {
         actual: Actual,
         worker: Option<WorkerStatus>,
     ) -> watch::Receiver<BTreeMap<String, watch::Receiver<ControllerStatus>>> {
+        // As the controller publishes a term with this one worker: its pending start and
+        // caught-up time are the term's.
         let status = ControllerStatus {
             actual: Some(actual),
             owner_epoch: Some(7),
             lease: None,
+            pending_since_micros: worker.as_ref().and_then(WorkerStatus::pending_since_micros),
+            caught_up_at: worker.as_ref().and_then(|w| w.caught_up_at),
             worker,
         };
         watch::channel(BTreeMap::from([(
@@ -705,6 +709,43 @@ mod tests {
             (&Value::Null, &Value::Null)
         );
         assert_eq!(by_table(&v, "public.orders")["stale"], false);
+    }
+
+    /// Freshness is the lease term's: a worker that follows a failed run knows nothing yet, and
+    /// the term's caught-up time still says what readers see, stale past the target.
+    #[tokio::test]
+    async fn a_retry_s_new_worker_keeps_the_term_s_freshness() {
+        let caught_up = Utc::now() - chrono::Duration::seconds(90);
+        let mut fresh = worker(chrono::Duration::zero());
+        fresh.phase = Phase::Starting;
+        fresh.unsynced_since_micros = None;
+        assert_eq!(fresh.caught_up_at, None);
+        let status = ControllerStatus {
+            actual: Some(Actual::Retrying {
+                error: "refused".into(),
+            }),
+            owner_epoch: Some(7),
+            lease: None,
+            worker: Some(fresh),
+            pending_since_micros: None,
+            caught_up_at: Some(caught_up),
+        };
+        let retrying = watch::channel(BTreeMap::from([(
+            "orders".to_owned(),
+            watch::channel(status).1,
+        )]))
+        .1;
+        let (addr, _lone, _dir) =
+            served_with("http://127.0.0.1:1", open(), |n| n.statuses = retrying).await;
+        let (code, _, text) = request(addr, "GET", "/v1/pipelines/orders/live", &[], "").await;
+        assert_eq!(code, 200, "{text}");
+        let v = json(&text);
+        assert_eq!(v["worker"]["fresh_as_of"], json!(caught_up), "{v}");
+        let orders = by_table(&v, "public.orders");
+        assert_eq!(
+            (&orders["fresh_as_of"], &orders["stale"]),
+            (&json!(caught_up), &json!(true))
+        );
     }
 
     /// A stopped pipeline's holder runs no worker: its halts come from storage, each as fresh as
