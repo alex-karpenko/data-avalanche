@@ -1783,6 +1783,7 @@ dependencies = [
 name = "data-avalanche-api"
 version = "1.0.1"
 dependencies = [
+ "arrow-schema",
  "async-trait",
  "axum",
  "base64 0.23.1",
@@ -1797,6 +1798,7 @@ dependencies = [
  "data-avalanche-state",
  "data-avalanche-storage",
  "data-avalanche-telemetry",
+ "data-avalanche-testkit",
  "futures-util",
  "http-body-util",
  "jsonwebtoken",

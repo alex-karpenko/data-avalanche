@@ -33,15 +33,15 @@ pub use logical::{LogicalType, LogicalTypeError, MAX_LIST_DEPTH};
 pub use position::{PositionError, SourcePosition};
 pub use schema::{ColumnSchema, HaltReason, TableSchema, canonical_logical, hop2_compatible};
 pub use sink::{
-    CommitMarker, CommitOutcome, EvolveOutcome, PartitionField, PartitionTransform, SchemaOp, Sink,
-    SinkCapabilities, SinkError, SinkKind, SinkStats, SinkTableState, TableSpec, TransformKind,
-    WriteMode,
+    CommitCost, CommitMarker, CommitOutcome, EvolveOutcome, PartitionField, PartitionTransform,
+    SchemaOp, Sink, SinkCapabilities, SinkError, SinkKind, SinkStats, SinkTableState, TableFacts,
+    TableSpec, TransformKind, WriteMode,
 };
 pub use source::{
-    ChangeStream, Checkpoint, Chunk, ChunkVisibility, InFlightTxn, KeysetCursor, Preflight,
-    Prepared, RescanReport, ResolvedTables, RetainedLog, SchemaHint, ServerIdentity,
-    SnapshotReason, SourceConnector, SourceError, StartPlan, StreamItem, XidSnapshot,
-    identifier_values,
+    ChangeStream, Checkpoint, Chunk, ChunkVisibility, InFlightTxn, KeysetCursor, MySqlDetail,
+    PgDetail, Preflight, Prepared, PublicationDetail, RescanReport, ResolvedTables, RetainedLog,
+    SchemaHint, ServerIdentity, SlotDetail, SnapshotReason, SourceConnector, SourceDetail,
+    SourceError, StartPlan, StreamItem, XidSnapshot, identifier_values,
 };
 pub use table::{
     INTERNAL_COLUMN_PREFIX, LINEAGE_COLUMNS, TableRef, differ_by_case_alone,

@@ -42,13 +42,13 @@ pub async fn mirror_and_replay(location: DeltaLocation) {
         vec![upserts(&[(1, Some("A")), (4, Some("d"))], None)],
         vec![deletes(&[2])],
     );
-    let CommitOutcome::Committed { version: v1 } = commit(&s, first.clone(), 1).await else {
+    let CommitOutcome::Committed { version: v1, .. } = commit(&s, first.clone(), 1).await else {
         panic!("first commit")
     };
-    assert_eq!(
+    assert!(matches!(
         commit(&s, second.clone(), 1).await,
-        CommitOutcome::Committed { version: v1 + 1 }
-    );
+        CommitOutcome::Committed { version, .. } if version == v1 + 1
+    ));
     let want = owned(&[(1, Some("A")), (3, Some("c")), (4, Some("d"))]);
     assert_eq!(rows(&s).await, want);
     assert_eq!(commit(&s, first, 1).await, CommitOutcome::SkippedCovered);

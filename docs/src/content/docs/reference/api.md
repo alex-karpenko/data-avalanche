@@ -67,6 +67,24 @@ Least role: `operator`.
 | `413` | the body is over 1 MiB |
 | `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
 
+### `GET /v1/pipelines/{id}/live`
+
+What the pipeline's worker shows now, from the node that runs it: its phase, lag, source detail, and each table's state, figures and freshness; another node asks the lease holder
+
+Least role: `viewer`.
+
+- Path parameter `id`: the pipeline's id.
+
+| Status | When |
+|---|---|
+| `200` | the worker's figures |
+| `404` | no such pipeline in the generation this node runs |
+| `409` | no node holds the lease |
+| `421` | a forwarded request to a node that doesn't run the worker |
+| `502` | the holder didn't answer |
+| `503` | the node is starting or stopping, or its state can't be read; or the holder can't be asked: not a member, or no API address |
+| `504` | the holder didn't answer in time |
+
 ### `POST /v1/pipelines/{id}/pause`
 
 Pause: flush to a transaction boundary, then read nothing; the connection and the lease stay
@@ -170,6 +188,38 @@ Least role: `operator`.
 | `404` | no such pipeline in the generation this node runs |
 | `413` | the body is over 1 MiB |
 | `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
+
+### `GET /v1/pipelines/{id}/tables/{table}`
+
+A table of the pipeline, named as its config names it: what the worker shows of it, its halt and when it began, the Delta table's facts (read on request, kept 30 s), its columns at the source against Delta's, and the snapshot jobs that copied it
+
+Least role: `viewer`.
+
+- Path parameter `id`: the pipeline's id.
+- Path parameter `table`: the table, named as its config key: `schema.table` on PostgreSQL, the table alone on MySQL.
+
+| Status | When |
+|---|---|
+| `200` | the table |
+| `400` | a table name not in the source's form |
+| `404` | no such pipeline, or no trace of the table in it |
+
+## tables
+
+Every pipeline's tables, each as its lease holder's worker shows it now.
+
+### `GET /v1/tables`
+
+Every pipeline's tables, worst first, as each lease holder's worker shows them: by listed state (halted, stale, snapshot, costly, streaming, copied), pipeline, and text in the name; a pipeline whose holder can't be asked lists its halted tables from storage and is named under `unreachable`
+
+Least role: `viewer`.
+
+
+| Status | When |
+|---|---|
+| `200` | the tables, with counts by listed state |
+| `400` | a parameter that isn't one, or a state that isn't |
+| `404` | no such pipeline in the generation this node runs |
 
 ## snapshots
 

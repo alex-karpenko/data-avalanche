@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use data_avalanche_core::position::Lsn;
 use data_avalanche_core::{
-    Checkpoint, HaltReason, ServerIdentity, SnapshotReason, SourceConnector, SourceError,
-    SourcePosition, StartPlan, TableRef,
+    ChangeStream, Checkpoint, HaltReason, ServerIdentity, SnapshotReason, SourceConnector,
+    SourceDetail, SourceError, SourcePosition, StartPlan, TableRef,
 };
 use data_avalanche_testkit::require_it;
 use tokio_postgres::Client;
@@ -981,6 +981,53 @@ async fn a_root_publication_of_tracked_partitions_is_refused() {
         .await
         .unwrap_err();
     permanent(e, "publish_via_partition_root = false");
+    cleanup(&a, &n).await;
+}
+
+/// The pipeline's page shows the slot, the WAL it holds against `max_slot_wal_keep_size`, and the
+/// publication: none of them before the start creates them.
+#[tokio::test]
+async fn the_detail_shows_the_slot_and_the_publication() {
+    require_it!();
+    let a = admin().await;
+    let n = fresh(&a, "slot_detail", DDL).await;
+    let c = connector(&pipeline(&n, &["a", "b"], "", ""));
+    let Some(SourceDetail::Postgres(before)) = c.detail().await.unwrap() else {
+        panic!("a PostgreSQL detail")
+    };
+    assert_eq!((before.slot, before.publication), (None, None));
+    let (stream, _, _) = first_stream(&c).await;
+    let Some(SourceDetail::Postgres(d)) = c.detail().await.unwrap() else {
+        panic!("a PostgreSQL detail")
+    };
+    let slot = d.slot.expect("the slot");
+    assert_eq!(slot.name, n.slot);
+    assert_eq!(slot.wal_status.as_deref(), Some("reserved"));
+    assert!(slot.wal_held_bytes.is_some());
+    let (Some(SourcePosition::Pg(restart)), Some(SourcePosition::Pg(head))) =
+        (slot.restart_lsn, Some(d.head))
+    else {
+        panic!("positions")
+    };
+    assert!(restart <= head);
+    let publication = d.publication.expect("the publication");
+    assert_eq!(
+        (publication.name, publication.tables),
+        (n.publication.clone(), 2)
+    );
+    // The emulator keeps the default: unlimited.
+    let keep: i64 = a
+        .query_one(
+            "SELECT pg_size_bytes(current_setting('max_slot_wal_keep_size'))",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(d.max_slot_wal_keep_size, u64::try_from(keep).ok());
+    // Closed, not dropped: the stream was never read, so its worker may not have taken the slot
+    // yet, and a dropped one can take it after the cleanup's wait has passed (`55006`).
+    stream.close().await.expect("the stream closes");
     cleanup(&a, &n).await;
 }
 

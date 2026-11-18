@@ -730,6 +730,7 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
         .chain(halts.iter().map(|(t, _)| t.clone()))
         .collect();
     let mut tracked = BTreeSet::new();
+    let mut copied = BTreeSet::new();
     let mut drifted = BTreeSet::new();
     let mut requests = vec![];
     let mut abandoned = vec![];
@@ -778,7 +779,10 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
         // halted in this pass gets no `in_progress` document (final review M5).
         let request = matches!(decision, Decision::Snapshot { resume: false, .. });
         match decision {
-            Decision::Stop => continue,
+            Decision::Stop => {
+                copied.insert(table.clone());
+                continue;
+            }
             Decision::Stream if in_progress => abandoned.push(table.clone()),
             _ => {}
         }
@@ -1297,11 +1301,15 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
         doc.save(&core.docs).await?;
     }
     core.server = server;
+    core.update(|st| {
+        st.tracked.clone_from(&tracked);
+        st.copied = copied;
+        warnings.into_iter().for_each(|w| st.warn(w));
+    });
     core.tracked = tracked;
     core.copies = copies;
     core.drifted = drifted;
     core.dump_only = dump_only;
-    core.update(|st| warnings.into_iter().for_each(|w| st.warn(w)));
     Ok(())
 }
 
@@ -1422,6 +1430,7 @@ mod tests {
         .await;
         end.unwrap();
         assert_eq!(st.soft_dropped, BTreeMap::from([(t("a"), 1)]));
+        assert_eq!(st.tracked, BTreeSet::from([t("a")]), "Phase 0's tables");
     }
 
     #[tokio::test]
@@ -1987,6 +1996,26 @@ mod tests {
         assert!(w.source.opened().len() <= 1);
     }
 
+    /// A `dump_*` table beside streaming ones shows `copied` once it isn't streamed: the
+    /// `dump_initial` table the sink has at the start, the `dump_always` one once its snapshot is
+    /// durable (D-M13d.5).
+    #[tokio::test]
+    async fn a_dump_beside_streaming_tables_shows_copied() {
+        let w = World::new(&["a", "b", "c"]);
+        w.started(&["a", "b", "c"]).await;
+        w.source.load(&t("b"), rows(1..=2));
+        let p = mode("mode: never, overrides: { public.a: dump_initial, public.b: dump_always }");
+        let (end, st) = run(&w, &p, async |status| streamed(&status, &w).await).await;
+        end.unwrap();
+        assert_eq!(w.ids("b"), [1, 2]);
+        assert_eq!(st.copied, BTreeSet::from([t("a"), t("b")]));
+        assert_eq!(
+            st.tracked,
+            BTreeSet::from([t("b"), t("c")]),
+            "a never streams"
+        );
+    }
+
     #[tokio::test]
     async fn a_dump_always_table_dumps_and_ends() {
         let w = World::new(&["a"]);
@@ -2313,6 +2342,54 @@ mod tests {
             let st = h.status.borrow().clone();
             assert_eq!(st.read, None, "the new session has read nothing");
             assert_eq!(st.unsynced_since_micros, None, "nor holds anything pending");
+            // What lake readers lack stays known: the old session's pending change.
+            assert!(st.pending_since_micros().is_some(), "{st:?}");
+        })
+        .await;
+        assert!(end.is_ok(), "{end:?}");
+    }
+
+    /// S-M13d.3: a stream with nothing pending says when it last was. A reconnect keeps that
+    /// time: through the outage lake readers see the lake as of then.
+    #[tokio::test]
+    async fn a_caught_up_stream_says_when_and_a_reconnect_keeps_it() {
+        let w = World::new(&["a"]);
+        w.started(&["a"]).await;
+        let p = Yaml {
+            sink: "flush: { seconds: 0 }",
+            ..Yaml::default()
+        }
+        .build();
+        let end = run_with(&p, deps(&w), async |h| {
+            let before = Utc::now();
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(1, "x")));
+            wait_until("the change durable, nothing pending", || {
+                let st = h.status.borrow();
+                st.rows_read.insert == 1
+                    && st.unsynced_since_micros.is_none()
+                    && st.caught_up_at.is_some_and(|at| at >= before)
+            })
+            .await;
+            for _ in 0..10_000 {
+                w.source
+                    .fail(Method::OpenStream, SourceError::Transient("refused".into()));
+            }
+            w.source
+                .fail(Method::Next, SourceError::Transient("reset".into()));
+            wait_until("a reconnect", || h.status.borrow().reconnects >= 1).await;
+            let kept = h.status.borrow().caught_up_at;
+            assert!(kept.is_some_and(|at| at >= before), "{kept:?}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let st = h.status.borrow().clone();
+            assert!(
+                matches!(st.phase, Phase::Reconnecting { .. }),
+                "{:?}",
+                st.phase
+            );
+            assert_eq!(
+                st.caught_up_at, kept,
+                "kept through the outage, and not moved"
+            );
         })
         .await;
         assert!(end.is_ok(), "{end:?}");

@@ -41,7 +41,7 @@ pub(crate) fn job_pipeline(job_id: &str) -> Option<&str> {
 }
 
 /// A table as the request and the answers name it: the source's per-table config key.
-fn table_name(p: &Pipeline, t: &TableRef) -> String {
+pub(crate) fn table_name(p: &Pipeline, t: &TableRef) -> String {
     match p.source.kind {
         SourceType::Postgres => t.to_string(),
         SourceType::Mysql => t.name.clone(),
@@ -58,6 +58,22 @@ struct Asked {
     /// Why, kept with the job and its events (checked by the recording, Admin_Console §5).
     #[serde(default)]
     note: Option<String>,
+}
+
+/// The table `name` names, in the source's form: the per-table config key.
+pub(crate) fn named_table(p: &Pipeline, name: &str) -> Result<TableRef, String> {
+    match p.source.kind {
+        SourceType::Mysql if name.contains('.') => None,
+        _ => key_table(p, name),
+    }
+    .filter(|t| !t.schema.is_empty() && !t.name.is_empty())
+    .ok_or_else(|| match p.source.kind {
+        SourceType::Postgres => format!("{name:?}: a PostgreSQL table is schema.table"),
+        SourceType::Mysql => format!(
+            "{name:?}: a MySQL table is named without its database ({})",
+            p.source.db
+        ),
+    })
 }
 
 /// The body's tables, each once, in its order: named as the source's per-table config keys,
@@ -77,18 +93,7 @@ fn tables(p: &Pipeline, text: &str) -> Result<(Vec<TableRef>, bool, Option<Strin
                 "{name:?}: a table is named exactly, without a glob"
             ));
         }
-        let table = match p.source.kind {
-            SourceType::Mysql if name.contains('.') => None,
-            _ => key_table(p, name),
-        }
-        .filter(|t| !t.schema.is_empty() && !t.name.is_empty())
-        .ok_or_else(|| match p.source.kind {
-            SourceType::Postgres => format!("{name:?}: a PostgreSQL table is schema.table"),
-            SourceType::Mysql => format!(
-                "{name:?}: a MySQL table is named without its database ({})",
-                p.source.db
-            ),
-        })?;
+        let table = named_table(p, name)?;
         if seen.insert(table.clone()) {
             out.push(table);
         }
@@ -102,7 +107,7 @@ fn tables(p: &Pipeline, text: &str) -> Result<(Vec<TableRef>, bool, Option<Strin
 }
 
 /// A job's status as the API names it: `cancelling` from the cancel until a start ends it.
-fn status_name(j: &SnapshotJobDoc) -> &'static str {
+pub(crate) fn status_name(j: &SnapshotJobDoc) -> &'static str {
     match j.status {
         _ if j.cancel.is_some() && !j.is_finished() => "cancelling",
         JobStatus::Queued => "queued",
@@ -117,7 +122,7 @@ fn status_name(j: &SnapshotJobDoc) -> &'static str {
 /// while a truncating job's copy of it began and hasn't completed, `empty` before its first
 /// rows and `partial` after; else `as_before`, the rows it held before the job (a copy that
 /// doesn't truncate writes over them).
-fn lake(truncate: bool, t: &JobTable) -> &'static str {
+pub(crate) fn lake(truncate: bool, t: &JobTable) -> &'static str {
     let began = t.started_at.is_some()
         || matches!(
             t.status,
@@ -165,14 +170,17 @@ fn pace(j: &SnapshotJobDoc, now: DateTime<Utc>) -> (Option<u64>, Option<u64>) {
     (Some(rate), left.map(|l| l.div_ceil(rate)))
 }
 
-fn job_json(p: &Pipeline, j: &SnapshotJobDoc, now: DateTime<Utc>) -> Value {
-    let table_status = |s: JobTableStatus| match s {
+pub(crate) fn table_status(s: JobTableStatus) -> &'static str {
+    match s {
         JobTableStatus::Queued => "queued",
         JobTableStatus::Running => "running",
         JobTableStatus::Completed => "completed",
         JobTableStatus::Failed => "failed",
         JobTableStatus::Cancelled => "cancelled",
-    };
+    }
+}
+
+fn job_json(p: &Pipeline, j: &SnapshotJobDoc, now: DateTime<Utc>) -> Value {
     let (rate, eta) = pace(j, now);
     json!({
         "job_id": j.job_id,
@@ -725,7 +733,10 @@ fn filter(params: &[(String, String)]) -> Result<Filter, Failure> {
 }
 
 /// Pipeline `p`'s jobs, each with its key, the ended ones [`EndedJobs`] keeps not read again.
-async fn jobs_of(node: &Node, p: &Pipeline) -> Result<Vec<(String, SnapshotJobDoc)>, String> {
+pub(crate) async fn jobs_of(
+    node: &Node,
+    p: &Pipeline,
+) -> Result<Vec<(String, SnapshotJobDoc)>, String> {
     let docs = (node.docs)(p).map_err(|e| format!("the state location: {e}"))?;
     let jobs = docs
         .snapshot_jobs_reusing(|key| node.ended_jobs.known(&p.id, key))

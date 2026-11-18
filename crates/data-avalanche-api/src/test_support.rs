@@ -8,16 +8,18 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::Json;
+use axum::body::Bytes;
 use axum::extract::State;
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::routing::get as get_route;
+use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 use data_avalanche_cluster::{
     ClusterReconciler, ConfigCoordinator, ControllerDeps, ControllerSettings, CoordinatorDeps,
-    Gossip, GossipKey, GossipSettings, LeaseTiming, NodeIdentity, NodeMeta, Parts, Phase,
-    ReconcilerSettings, Recorder, Udp, WorkerFactory, removed_pipelines,
+    Gossip, GossipKey, GossipSettings, LeaseTiming, Member, Members, NodeIdentity, NodeMeta, Parts,
+    Phase, ReconcilerSettings, Recorder, Udp, WorkerFactory, file_hash, removed_pipelines,
 };
 use data_avalanche_config::{
     ApiAuth, Env, FingerprintKey, HostPort, Jwt, Pipeline, ProcessEnv, ResolvedConfig, load_str,
@@ -28,13 +30,16 @@ use data_avalanche_state::{
 };
 use data_avalanche_storage::ObjectStoreVersioned;
 use data_avalanche_telemetry::Metrics;
+use data_avalanche_testkit::{FakeSource, MemorySink};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use object_store::memory::InMemory;
 use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
 use serde_json::{Value, json};
+use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, watch};
 
+use crate::peers::{FORWARDED_BY, TARGET};
 use crate::{Api, Auth, Control, Node, Stop, bind, router};
 
 pub(crate) const CONFIG: &str = r#"
@@ -146,6 +151,21 @@ impl WorkerFactory for NoWorkers {
     }
 }
 
+/// Builds every pipeline's parts on one shared [`MemorySink`]: a node reads tables' facts
+/// through it.
+#[derive(Debug)]
+struct Lakes(MemorySink);
+
+impl WorkerFactory for Lakes {
+    fn build(&self, _: &Pipeline) -> Result<Parts, String> {
+        Ok(Parts {
+            source: Arc::new(FakeSource::new(vec![])),
+            sink: Arc::new(self.0.clone()),
+            hooks: Arc::new(data_avalanche_pipeline::NoHooks),
+        })
+    }
+}
+
 /// A lone node `node-a` running generation 1 of [`CONFIG`], read from `file`: its gossip on a
 /// loopback port, its reloads reaching a reconciler without pipelines.
 pub(crate) struct Lone {
@@ -158,6 +178,8 @@ pub(crate) struct Lone {
     pub stops: tokio::sync::watch::Receiver<Stop>,
     pub _reconciler: ClusterReconciler,
     pub _gossip: Gossip,
+    /// The sink every pipeline's [`Node::factory`] builds: a test creates and commits its tables.
+    pub sink: MemorySink,
 }
 
 /// `${VAR}` values a test sets, and changes.
@@ -268,6 +290,7 @@ pub(crate) async fn lone_with(file: PathBuf, text: &str, env: Arc<dyn Env + Send
         Duration::from_secs(10),
     );
     let (control, stops) = Control::new();
+    let sink = MemorySink::new();
     Lone {
         node: Node {
             coordinator: Arc::new(coordinator),
@@ -289,12 +312,16 @@ pub(crate) async fn lone_with(file: PathBuf, text: &str, env: Arc<dyn Env + Send
             process: tokio::sync::watch::channel(Default::default()).1,
             gossip: gossip.figures(),
             ended_jobs: Arc::default(),
+            statuses: reconciler.watch_statuses(),
+            factory: Arc::new(Lakes(sink.clone())),
+            lake: Arc::default(),
         },
         events,
         leases,
         stops,
         _reconciler: reconciler,
         _gossip: gossip,
+        sink,
     }
 }
 
@@ -450,4 +477,110 @@ pub(crate) fn sign_with(key: &KeyPair, kid: Option<&str>, claims: &Value) -> Str
         &EncodingKey::from_ec_der(&key.serialize_der()),
     )
     .unwrap()
+}
+
+/// What a fake node saw of one request.
+#[derive(Debug, Clone)]
+pub(crate) struct Seen {
+    pub method: Method,
+    pub uri: String,
+    pub authorization: Option<String>,
+    pub target: Option<String>,
+    pub forwarded_by: Option<String>,
+    pub body: String,
+}
+
+pub(crate) type Log = Arc<Mutex<Vec<Seen>>>;
+
+/// A fake node: answers every request `202 {"node": "node-b"}` after `delay`, keeping what it
+/// saw.
+pub(crate) async fn fake(delay: Duration) -> (String, Log) {
+    fake_answering(delay, StatusCode::ACCEPTED, json!({ "node": "node-b" })).await
+}
+
+/// A fake node: answers every request `code` with `answer` after `delay`, keeping what it saw.
+pub(crate) async fn fake_answering(
+    delay: Duration,
+    code: StatusCode,
+    answer: Value,
+) -> (String, Log) {
+    let log: Log = Arc::default();
+    let kept = Arc::clone(&log);
+    let app = Router::new().fallback(
+        move |method: Method, uri: Uri, headers: HeaderMap, bytes: Bytes| {
+            let (kept, answer) = (Arc::clone(&kept), answer.clone());
+            async move {
+                let h = |n: &str| headers.get(n).map(|v| v.to_str().unwrap().to_owned());
+                kept.lock().unwrap().push(Seen {
+                    method,
+                    uri: uri.to_string(),
+                    authorization: h("authorization"),
+                    target: h(TARGET),
+                    forwarded_by: h(FORWARDED_BY),
+                    body: String::from_utf8(bytes.to_vec()).unwrap(),
+                });
+                tokio::time::sleep(delay).await;
+                crate::body(code, &answer)
+            }
+        },
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, log)
+}
+
+pub(crate) fn member(api_url: &str, phase: Phase) -> Member {
+    Member {
+        addr: "127.0.0.1:7946".parse().unwrap(),
+        incarnation: 1_731_600_000_000,
+        meta: NodeMeta {
+            phase,
+            config_generation: 1,
+            build: "1.1.0".into(),
+            api_url: api_url.into(),
+            file_hash: file_hash(&FingerprintKey::from_bytes([1; 32]), CONFIG),
+        },
+        suspect: false,
+    }
+}
+
+/// node-a's API under `auth`; its view holds itself at its own address and node-b at
+/// `b_url`.
+pub(crate) async fn served(b_url: &str, auth: Arc<Auth>) -> (SocketAddr, Lone, TempDir) {
+    served_with(b_url, auth, |_| {}).await
+}
+
+/// [`served`], its node changed by `change` before it serves.
+pub(crate) async fn served_with(
+    b_url: &str,
+    auth: Arc<Auth>,
+    change: impl FnOnce(&mut Node),
+) -> (SocketAddr, Lone, TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("config.yaml");
+    std::fs::write(&file, CONFIG).unwrap();
+    let mut lone = lone(file).await;
+    let (view, members) = watch::channel(Members {
+        me: "node-a".into(),
+        nodes: Default::default(),
+    });
+    lone.node.members = members;
+    change(&mut lone.node);
+    let a = api(auth);
+    a.node.set(lone.node.clone()).unwrap();
+    let addr = serve(a).await;
+    view.send_replace(Members {
+        me: "node-a".into(),
+        nodes: [
+            (
+                "node-a".to_owned(),
+                member(&format!("http://{addr}"), Phase::Active),
+            ),
+            ("node-b".to_owned(), member(b_url, Phase::Active)),
+        ]
+        .into(),
+    });
+    std::mem::forget(view);
+    (addr, lone, dir)
 }

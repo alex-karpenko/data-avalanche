@@ -9,6 +9,7 @@
 mod api;
 mod cluster;
 mod console_nodes;
+mod console_pipelines;
 mod crashes;
 mod events;
 mod failover;

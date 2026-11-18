@@ -668,6 +668,7 @@ mod tests {
                 at: data_avalanche_core::SourcePosition::Pg(data_avalanche_core::position::Lsn(1)),
                 copy: false,
             }],
+            since: vec![],
         };
         let mut w = HaltWatch::recorded(&recorded);
         assert!(

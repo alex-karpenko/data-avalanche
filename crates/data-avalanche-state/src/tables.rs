@@ -10,6 +10,7 @@
 //! after it are dropped, so resuming it from a later checkpoint would skip them. A recorded halt
 //! keeps the table halted at every start until a re-snapshot clears it.
 
+use chrono::{DateTime, Utc};
 use data_avalanche_core::{HaltReason, SourcePosition, TableRef, TableSchema};
 use data_avalanche_storage::escape_segment;
 use serde::{Deserialize, Serialize};
@@ -55,11 +56,31 @@ pub struct TableHalt {
     pub copy: bool,
 }
 
+/// When a table's halt began (Admin_Console §4, a table's page).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HaltSince {
+    pub table: TableRef,
+    pub at: DateTime<Utc>,
+}
+
 /// `halts.json`: the tracked tables that halted, in table order.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HaltsDoc {
     pub tables: Vec<TableHalt>,
+    /// When each halt began, in table order: written only when there is one, so a 1.0 node
+    /// reads a registry without halts. A halt a 1.0 node recorded has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub since: Vec<HaltSince>,
+}
+
+impl HaltsDoc {
+    /// When the table's halt began, when it was recorded with its time.
+    #[must_use]
+    pub fn since(&self, table: &TableRef) -> Option<DateTime<Utc>> {
+        self.since.iter().find(|s| &s.table == table).map(|s| s.at)
+    }
 }
 
 impl Document for HaltsDoc {
@@ -136,17 +157,39 @@ impl PipelineDocs {
             .unwrap_or_default())
     }
 
-    /// Records a table's halt, replacing an earlier one of the same table.
+    /// Records a table's halt, replacing an earlier one of the same table, and when it began:
+    /// now, unless the table's recorded halt has the same reason (a repeat after a crash keeps
+    /// its time, or its lack of one: a halt a 1.0 node recorded stays without).
     ///
     /// # Errors
     /// A storage or decode failure.
     pub async fn record_halt(&self, halt: &TableHalt) -> Result<Versioned<HaltsDoc>, StateError> {
+        let now = Utc::now();
         self.docs
             .modify(HALTS_KEY, |cur: Option<HaltsDoc>| {
                 let mut doc = cur.unwrap_or_default();
+                let same = doc
+                    .tables
+                    .iter()
+                    .any(|h| h.table == halt.table && h.reason == halt.reason);
+                // A same-reason repeat keeps the recorded start, none included: a 1.0 halt's
+                // start is unknown, and now isn't it.
+                let at = if same {
+                    doc.since(&halt.table)
+                } else {
+                    Some(now)
+                };
                 doc.tables.retain(|h| h.table != halt.table);
                 doc.tables.push(halt.clone());
                 doc.tables.sort_by(|a, b| a.table.cmp(&b.table));
+                doc.since.retain(|s| s.table != halt.table);
+                if let Some(at) = at {
+                    doc.since.push(HaltSince {
+                        table: halt.table.clone(),
+                        at,
+                    });
+                }
+                doc.since.sort_by(|a, b| a.table.cmp(&b.table));
                 Ok(doc)
             })
             .await
@@ -161,6 +204,7 @@ impl PipelineDocs {
             .modify(HALTS_KEY, |cur: Option<HaltsDoc>| {
                 let mut doc = cur.unwrap_or_default();
                 doc.tables.retain(|h| &h.table != table);
+                doc.since.retain(|s| &s.table != table);
                 Ok(doc)
             })
             .await
@@ -344,8 +388,77 @@ mod tests {
         assert_eq!(p.halts().await.unwrap().tables, vec![overflow]);
     }
 
+    /// Admin_Console §4 (a table's page): a halt records when it began. Recorded again for the
+    /// same reason (a crash's repeat), it keeps that time; for another reason it starts again;
+    /// cleared, it goes.
+    #[tokio::test]
+    async fn a_halt_records_when_it_began() {
+        let p = pipeline();
+        let orders = TableRef::new("public", "orders");
+        let before = chrono::Utc::now();
+        p.record_halt(&halt("orders", HaltReason::TableDropped))
+            .await
+            .unwrap();
+        let first = p.halts().await.unwrap().since(&orders).unwrap();
+        assert!(first >= before && first <= chrono::Utc::now(), "{first}");
+        p.record_halt(&halt("orders", HaltReason::TableDropped))
+            .await
+            .unwrap();
+        assert_eq!(p.halts().await.unwrap().since(&orders), Some(first), "kept");
+        let other = HaltReason::UnsafeDdl {
+            detail: "narrowed".into(),
+        };
+        p.record_halt(&halt("orders", other)).await.unwrap();
+        let again = p.halts().await.unwrap().since(&orders).unwrap();
+        assert!(again >= first, "another reason starts again");
+        p.clear_halt(&orders).await.unwrap();
+        let doc = p.halts().await.unwrap();
+        assert_eq!(doc.since(&orders), None);
+        assert!(doc.since.is_empty(), "{doc:?}");
+    }
+
+    /// A halt a 1.0 node recorded has no time. Recorded again for the same reason, it still has
+    /// none: its start is unknown, and now isn't it. For another reason it starts now.
+    #[tokio::test]
+    async fn a_1_0_halt_recorded_again_keeps_no_time() {
+        let p = pipeline();
+        let orders = TableRef::new("public", "orders");
+        let old = halt("orders", HaltReason::TableDropped);
+        p.docs
+            .modify(HALTS_KEY, |_: Option<HaltsDoc>| {
+                Ok(HaltsDoc {
+                    tables: vec![old.clone()],
+                    since: vec![],
+                })
+            })
+            .await
+            .unwrap();
+        p.record_halt(&old).await.unwrap();
+        let doc = p.halts().await.unwrap();
+        assert_eq!(doc.since(&orders), None, "{doc:?}");
+        assert!(doc.since.is_empty(), "{doc:?}");
+        let other = HaltReason::UnsafeDdl {
+            detail: "narrowed".into(),
+        };
+        let before = chrono::Utc::now();
+        p.record_halt(&halt("orders", other)).await.unwrap();
+        let since = p.halts().await.unwrap().since(&orders);
+        assert!(since.is_some_and(|s| s >= before), "{since:?}");
+    }
+
+    /// A 1.0 `halts.json` has no times: it reads, and its halts have none.
+    #[test]
+    fn a_halt_without_a_time_reads() {
+        let doc: HaltsDoc = serde_json::from_str(
+            r#"{"tables":[{"table":{"schema":"public","name":"orders"},"reason":{"code":"TABLE_DROPPED"},"at":"pg:0/16B3748"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(doc.since(&TableRef::new("public", "orders")), None);
+    }
+
     #[test]
     fn halts_json_shape() {
+        let at: chrono::DateTime<chrono::Utc> = "2026-11-18T09:30:00Z".parse().unwrap();
         let doc = HaltsDoc {
             tables: vec![halt(
                 "orders",
@@ -353,6 +466,10 @@ mod tests {
                     column: "price".into(),
                 },
             )],
+            since: vec![HaltSince {
+                table: TableRef::new("public", "orders"),
+                at,
+            }],
         };
         assert_eq!(
             json(&doc),
@@ -369,6 +486,15 @@ mod tests {
         "column": "price"
       },
       "at": "pg:0/16B3748"
+    }
+  ],
+  "since": [
+    {
+      "table": {
+        "schema": "public",
+        "name": "orders"
+      },
+      "at": "2026-11-18T09:30:00Z"
     }
   ]
 }"#

@@ -73,4 +73,4 @@ pub use snapshot::{
     CursorKey, JOBS_PREFIX, JobCancel, JobStatus, JobTable, JobTableStatus, KEPT_ENDED_JOBS,
     SnapshotCursor, SnapshotJobDoc, SnapshotStatus, TableSnapshotDoc, job_key, table_snapshot_key,
 };
-pub use tables::{HALTS_KEY, HaltsDoc, SCHEMAS_PREFIX, TableHalt, table_schema_key};
+pub use tables::{HALTS_KEY, HaltSince, HaltsDoc, SCHEMAS_PREFIX, TableHalt, table_schema_key};

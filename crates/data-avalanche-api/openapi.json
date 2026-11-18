@@ -1591,6 +1591,90 @@
         "x-min-role": "operator"
       }
     },
+    "/v1/pipelines/{id}/live": {
+      "get": {
+        "tags": [
+          "pipelines"
+        ],
+        "summary": "What the pipeline's worker shows now, from the node that runs it: its phase, lag, source detail, and each table's state, figures and freshness; another node asks the lease holder",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "the pipeline's id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the worker's figures",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "404": {
+            "description": "no such pipeline in the generation this node runs",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "409": {
+            "description": "no node holds the lease",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "421": {
+            "description": "a forwarded request to a node that doesn't run the worker",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "502": {
+            "description": "the holder didn't answer",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read; or the holder can't be asked: not a member, or no API address",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "504": {
+            "description": "the holder didn't answer in time",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "viewer"
+      }
+    },
     "/v1/pipelines/{id}/pause": {
       "post": {
         "tags": [
@@ -2080,6 +2164,81 @@
         "x-min-role": "operator"
       }
     },
+    "/v1/pipelines/{id}/tables/{table}": {
+      "get": {
+        "tags": [
+          "pipelines"
+        ],
+        "summary": "A table of the pipeline, named as its config names it: what the worker shows of it, its halt and when it began, the Delta table's facts (read on request, kept 30 s), its columns at the source against Delta's, and the snapshot jobs that copied it",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "the pipeline's id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "table",
+            "in": "path",
+            "description": "the table, named as its config key: `schema.table` on PostgreSQL, the table alone on MySQL",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the table",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "400": {
+            "description": "a table name not in the source's form",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "404": {
+            "description": "no such pipeline, or no trace of the table in it",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "viewer"
+      }
+    },
     "/v1/snapshots": {
       "get": {
         "tags": [
@@ -2398,6 +2557,61 @@
           }
         ],
         "x-min-role": "operator"
+      }
+    },
+    "/v1/tables": {
+      "get": {
+        "tags": [
+          "tables"
+        ],
+        "summary": "Every pipeline's tables, worst first, as each lease holder's worker shows them: by listed state (halted, stale, snapshot, costly, streaming, copied), pipeline, and text in the name; a pipeline whose holder can't be asked lists its halted tables from storage and is named under `unreachable`",
+        "responses": {
+          "200": {
+            "description": "the tables, with counts by listed state",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "400": {
+            "description": "a parameter that isn't one, or a state that isn't",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "404": {
+            "description": "no such pipeline in the generation this node runs",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "viewer"
       }
     }
   },

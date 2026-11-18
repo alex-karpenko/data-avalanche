@@ -25,7 +25,7 @@ use tracing::field::Empty;
 
 use crate::backoff::Backoff;
 use crate::checkpoint::{Doc, Store};
-use crate::{CommitGuard, HookAction, HookPoint, Hooks, Observer, WorkerError};
+use crate::{CommitGuard, HookAction, HookPoint, Hooks, Observer, TableCommit, WorkerError};
 
 /// One flush and what becomes durable with it.
 #[derive(Debug)]
@@ -56,6 +56,8 @@ pub(crate) enum WriterEvent {
     /// job, in job order, a job with refused change sets included: the session counts them to
     /// know which jobs are durable (consecutive jobs may share a checkpoint).
     Durable(SourcePosition),
+    /// A change set is committed: the table's figures take it.
+    Committed(TableCommit),
     /// The writer stopped; no further event follows.
     Failed(WorkerError),
 }
@@ -248,7 +250,15 @@ impl Writer {
                 observer.commit_failed();
             }
             match outcome {
-                Ok(CommitOutcome::Committed { .. }) => {
+                Ok(CommitOutcome::Committed { version, cost }) => {
+                    let _ = self.events.send(WriterEvent::Committed(TableCommit {
+                        table: cs.table.clone(),
+                        rows,
+                        snapshot: cs.snapshot,
+                        version,
+                        cost,
+                        at: chrono::Utc::now(),
+                    }));
                     observer.committed(rows, at.elapsed());
                     span.record("outcome", "committed");
                     self.degraded(None);
@@ -441,9 +451,12 @@ mod tests {
             }
             drop(jobs_tx);
             run(ctx, jobs_rx, events_tx).await;
+            // The table figures' events are the session's tests'.
             let mut out = vec![];
             while let Some(e) = events_rx.recv().await {
-                out.push(e);
+                if !matches!(e, WriterEvent::Committed(_)) {
+                    out.push(e);
+                }
             }
             out
         }

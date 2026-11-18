@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use data_avalanche_core::{
     CdcEvent, ChangeStream, Checkpoint, ColumnValue, ServerIdentity, SnapshotReason,
-    SourceConnector, SourceError, SourcePosition, StartPlan, StreamItem,
+    SourceConnector, SourceDetail, SourceError, SourcePosition, StartPlan, StreamItem,
 };
 use data_avalanche_source_mysql::{Flavour, Mode, MySqlConnector, MySqlStream};
 use data_avalanche_testkit::require_it;
@@ -275,6 +275,32 @@ async fn a_purged_file_follows_the_purge_action() {
     }
     let recovers = connector(&pipeline(&n, &["t"], "", RE_SNAPSHOT));
     re_snapshots(&recovers, &cp).await;
+    cleanup(&n).await;
+}
+
+/// The pipeline's page shows the server's write position, as the current position reads it, and
+/// how long the server keeps its binlogs (`0`: never expired, so none).
+#[tokio::test]
+async fn the_detail_shows_the_head_and_the_binlog_expiry() {
+    require_it!();
+    let (n, mut a) = fresh("start_detail", "CREATE TABLE t (id INT PRIMARY KEY)").await;
+    let c = connector(&pipeline(&n, &["t"], "", ""));
+    let Some(SourceDetail::Mysql(d)) = c.detail().await.unwrap() else {
+        panic!("a MySQL detail")
+    };
+    let now = c.current_position().await.unwrap();
+    assert_eq!(
+        std::mem::discriminant(&d.head),
+        std::mem::discriminant(&now),
+        "{:?} against {now:?}",
+        d.head
+    );
+    let expire: u64 = a
+        .query_first("SELECT @@GLOBAL.binlog_expire_logs_seconds")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(d.binlog_expire_seconds, (expire > 0).then_some(expire));
     cleanup(&n).await;
 }
 

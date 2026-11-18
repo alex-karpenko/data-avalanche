@@ -7,6 +7,7 @@ use std::fmt;
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::{
@@ -251,10 +252,36 @@ pub struct SinkStats {
     pub rows_copied: u64,
 }
 
+/// What one commit cost, for the table's figures on the pipeline's page (D-MS.15: a MERGE that
+/// rewrites most of the table's files is the cost driver).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CommitCost {
+    /// Files the commit replaced or removed.
+    pub files_rewritten: u64,
+    /// The table's files after the commit; `None` when the sink doesn't count them.
+    pub files: Option<u64>,
+}
+
+/// A table as the sink holds it now, read on request for the table's page. A figure the sink
+/// can't give is `None`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TableFacts {
+    /// Where the table lives (Delta: its root URL); `None` when the sink has no such place.
+    pub location: Option<String>,
+    /// The table's latest version.
+    pub version: u64,
+    pub files: Option<u64>,
+    /// The size of its data files.
+    pub bytes: Option<u64>,
+    /// Its rows, when every data file records its count.
+    pub rows: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommitOutcome {
     Committed {
         version: u64,
+        cost: CommitCost,
     },
     /// The guard found the range already committed; nothing was written.
     SkippedCovered,
@@ -305,6 +332,12 @@ pub trait Sink: Send + Sync {
         SinkStats::default()
     }
     async fn table_state(&self, table: &TableRef) -> Result<SinkTableState, SinkError>;
+    /// The table as the sink holds it now, for the table's page; `None` when the table is absent
+    /// or the sink says nothing. Any node may ask: it reads the table, not the writer's memory.
+    async fn facts(&self, table: &TableRef) -> Result<Option<TableFacts>, SinkError> {
+        let _ = table;
+        Ok(None)
+    }
     /// The tables the sink holds at the pipeline's location (Delta: each `<schema>/<table>/`
     /// root with a `_delta_log` under the pipeline's `sink.prefix`), whether the pipeline
     /// resolves or caches them or not: a source change repositions every one (DA-SRC-32).

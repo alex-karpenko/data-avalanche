@@ -16,8 +16,9 @@ use std::time::{Duration, Instant};
 use data_avalanche_config::Pipeline;
 use data_avalanche_core::{
     CdcEvent, ChangeStream, ColumnValue, HaltReason, Op, RescanReport, RetainedLog, Row,
-    SchemaHint, ServerIdentity, Sink, SinkTableState, SourceConnector, SourceError, SourcePosition,
-    SourceSeq, StreamItem, TableRef, TableSchema, TransactionBoundary, identifier_values,
+    SchemaHint, ServerIdentity, Sink, SinkTableState, SourceConnector, SourceDetail, SourceError,
+    SourcePosition, SourceSeq, StreamItem, TableRef, TableSchema, TransactionBoundary,
+    identifier_values,
 };
 use data_avalanche_state::{PipelineDocs, TableHalt};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -232,6 +233,12 @@ pub(crate) struct Session<'c> {
     /// The heartbeat's read of the source's log, one at a time, run beside the loop: a source
     /// that doesn't answer holds up neither the stream nor a drain (DA-SRC-16).
     retained_read: JoinSet<Result<Option<RetainedLog>, SourceError>>,
+    /// The heartbeat's read of the source's detail, apart from `retained_read`: inside the
+    /// session a stalled one holds up neither the watchdog nor the guard. At the source both
+    /// share the catalog connection, so a slow detail query can delay that heartbeat's guard read
+    /// by up to `timeouts.command`; a timeout fails the guard read as transient, which counts as
+    /// answered: one late reading, no false reconnect.
+    detail_read: JoinSet<Result<Option<SourceDetail>, SourceError>>,
     watchdog: Watchdog,
     /// A reload changed the heartbeat or the rescan interval: the loop re-arms its timers.
     retimed: bool,
@@ -406,6 +413,7 @@ impl<'c> Session<'c> {
             draining: false,
             paused: None,
             retained_read: JoinSet::new(),
+            detail_read: JoinSet::new(),
             watchdog: Watchdog::default(),
             retimed: false,
             open_since: None,
@@ -454,13 +462,18 @@ impl<'c> Session<'c> {
                     }
                 }),
                 WriterEvent::Degraded(why) => self.core.update(|st| st.degraded = why),
+                WriterEvent::Committed(c) => self.core.update(|st| st.committed(&c)),
                 WriterEvent::Durable(cp) => {
                     // A completion durable now ends its snapshot, as in the loop.
                     self.durable += 1;
                     let done = self.snaps.durable(self.durable);
+                    let copies = &self.copies;
                     self.core.update(|st| {
-                        for (table, _) in done {
+                        for (table, dump) in done {
                             st.snapshots.remove(&table);
+                            if dump && !copies.contains_key(&table) {
+                                st.copied.insert(table);
+                            }
                         }
                         st.checkpoint = Some(cp);
                     });
@@ -551,6 +564,9 @@ impl<'c> Session<'c> {
                 }
                 read = self.retained_read.join_next(), if !self.retained_read.is_empty() => {
                     self.wal_lag(read.expect("not empty"))?;
+                }
+                read = self.detail_read.join_next(), if !self.detail_read.is_empty() => {
+                    self.source_detail(read.expect("not empty"));
                 }
                 _ = async { rescan.as_mut().expect("guarded").tick().await },
                     if rescan.is_some() && self.rescan.is_none() && !parked =>
@@ -645,6 +661,10 @@ impl<'c> Session<'c> {
                 self.core.update(|st| st.degraded = why);
                 Ok(None)
             }
+            Some(WriterEvent::Committed(c)) => {
+                self.core.update(|st| st.committed(&c));
+                Ok(None)
+            }
             Some(WriterEvent::Durable(cp)) => {
                 self.durable += 1;
                 debug_assert!(self.durable <= self.handed, "one Durable per job");
@@ -656,14 +676,18 @@ impl<'c> Session<'c> {
                     self.unsynced.pop_front();
                 }
                 for (table, dump) in self.snaps.durable(self.durable) {
+                    // A dump, or a copy, stops once its snapshot is durable: the config's dump
+                    // shows `copied`, a copy outside the config leaves the pipeline's page.
+                    let copy = dump && self.copies.remove(&table).is_some();
                     self.core.update(|st| {
                         st.snapshots.remove(&table);
+                        if dump && !copy {
+                            st.copied.insert(table.clone());
+                        }
                     });
                     if dump {
-                        // A dump, or a copy, stops once its snapshot is durable.
                         self.acc.halt_table(&table);
                         self.schemas.remove(&table);
-                        self.copies.remove(&table);
                     }
                 }
                 if let Err(e) = self.stream.acknowledge(&cp).await {
@@ -1066,6 +1090,10 @@ impl<'c> Session<'c> {
             self.retained_read
                 .spawn(async move { source.retained().await });
         }
+        if self.detail_read.is_empty() {
+            let source = self.core.source.clone();
+            self.detail_read.spawn(async move { source.detail().await });
+        }
         self.report_progress();
         let why = self.watchdog.beat(self.reads_stream())?;
         Some(End::Source(SourceError::Transient(why)))
@@ -1135,6 +1163,19 @@ impl<'c> Session<'c> {
         }
     }
 
+    /// A heartbeat's read of the source's detail came back: the status takes it, with when. A
+    /// failed read keeps the last one, whose time then says how old it is.
+    fn source_detail(&self, read: Result<Result<Option<SourceDetail>, SourceError>, JoinError>) {
+        match read {
+            Ok(Ok(detail)) => self.core.update(|st| {
+                st.source = detail;
+                st.source_read_at = Some(chrono::Utc::now());
+            }),
+            Ok(Err(e)) => tracing::debug!(error = %e, "the source's detail can't be read"),
+            Err(e) => tracing::debug!(error = %e, "the source's detail read ended"),
+        }
+    }
+
     /// The schema a snapshot reads `table` under: a streamed table's, or a copy's.
     pub(super) fn read_schema(&self, table: &TableRef) -> Option<&TableSchema> {
         self.schemas.get(table).or_else(|| self.copies.get(table))
@@ -1156,7 +1197,8 @@ impl<'c> Session<'c> {
         self.progress(None);
     }
 
-    /// [`Self::report_progress`], and with `read` the new frontier (always a change).
+    /// [`Self::report_progress`], and with `read` the new frontier (always a change). A stream
+    /// with nothing pending is caught up as of now (`caught_up_at`, S-M13d.3).
     fn progress(&self, read: Option<SourcePosition>) {
         let since = self.unsynced.front().map(|(_, ts)| *ts);
         let since = match (since, self.unflushed_since) {
@@ -1165,7 +1207,9 @@ impl<'c> Session<'c> {
         };
         let rows_read = self.core.rows_read;
         let bytes = self.acc.buffered_bytes() as u64;
+        let now = chrono::Utc::now();
         self.core.status.send_if_modified(|st| {
+            let before = (st.caught_up_at, st.left_pending.is_some());
             let changed = read.is_some()
                 || (st.unsynced_since_micros, st.rows_read, st.buffer_bytes)
                     != (since, rows_read, bytes);
@@ -1175,7 +1219,8 @@ impl<'c> Session<'c> {
             st.unsynced_since_micros = since;
             st.rows_read = rows_read;
             st.buffer_bytes = bytes;
-            changed
+            st.progressed(now);
+            changed || (st.caught_up_at, st.left_pending.is_some()) != before
         });
     }
 
@@ -1544,6 +1589,32 @@ mod tests {
         assert_eq!(st.rows_read.insert, 1);
     }
 
+    /// Each table's commits show in its figures: the changes, the version the sink reported,
+    /// and when.
+    #[tokio::test]
+    async fn each_table_s_commits_show_in_its_figures() {
+        let w = World::new(&["a", "b"]);
+        w.started(&["a", "b"]).await;
+        let before = chrono::Utc::now();
+        let (end, st) = session(&w, &flush_each(), &["a", "b"], async |status| {
+            w.source.commit(
+                FakeTxn::new()
+                    .insert(&t("a"), row(1, "x"))
+                    .insert(&t("b"), row(1, "y")),
+            );
+            w.source.commit(FakeTxn::new().insert(&t("a"), row(2, "x")));
+            durable(&status, w.source.wal_end()).await;
+        })
+        .await;
+        end.unwrap();
+        let a = &st.tables[&t("a")];
+        assert_eq!((a.changes, a.version), (2, w.sink.version(&t("a"))));
+        assert_eq!(a.changes_per_minute(chrono::Utc::now()), 2);
+        assert!(a.last_commit.is_some_and(|at| at >= before), "{a:?}");
+        assert_eq!(a.cost, Some(data_avalanche_core::CommitCost::default()));
+        assert_eq!(st.tables[&t("b")].changes, 1);
+    }
+
     /// A column the source drops stays in the sink: the evolve's soft-drop is counted.
     #[tokio::test]
     async fn a_dropped_column_is_counted_soft_dropped() {
@@ -1613,9 +1684,15 @@ mod tests {
         pump(&mut s, &second).await;
         s.flush().unwrap();
         assert_eq!((s.handed, s.durable), (2, 0));
-        // The writer's events wait in the channel: take the first job's `Durable` only.
-        let ev = s.events.recv().await;
-        assert!(s.writer_event(ev).await.unwrap().is_none());
+        // The writer's events wait in the channel: take them up to the first job's `Durable`.
+        loop {
+            let ev = s.events.recv().await;
+            let durable = matches!(ev, Some(WriterEvent::Durable(_)));
+            assert!(s.writer_event(ev).await.unwrap().is_none());
+            if durable {
+                break;
+            }
+        }
         assert_eq!(s.durable, 1);
         assert_eq!(
             status.borrow().unsynced_since_micros,
@@ -2286,12 +2363,20 @@ mod tests {
         let (mut core, _control, status) = w.core(&p, &["a"]);
         core.settings.heartbeat = Duration::from_millis(5);
         let s = Session::open(&mut core).await.unwrap().unwrap();
+        let detail = SourceDetail::Mysql(data_avalanche_core::MySqlDetail {
+            head: w.source.wal_end(),
+            binlog_expire_seconds: Some(60),
+        });
         let driver = async {
             w.source.set_retained(Some(1024));
             w.source.set_behind(Some(Duration::from_secs(3)));
-            wait_until("the lag is reported", || {
+            w.source.set_detail(Some(detail.clone()));
+            wait_until("the lag and the detail are reported", || {
                 let st = status.borrow();
-                st.retained_bytes == Some(1024) && st.source_behind == Some(Duration::from_secs(3))
+                st.retained_bytes == Some(1024)
+                    && st.source_behind == Some(Duration::from_secs(3))
+                    && st.source.as_ref() == Some(&detail)
+                    && st.source_read_at.is_some()
             })
             .await;
             w.source.set_retained(Some(65 << 20));

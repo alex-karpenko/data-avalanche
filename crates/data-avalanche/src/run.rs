@@ -306,6 +306,11 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         process,
         gossip: gossip.figures(),
         ended_jobs: Arc::default(),
+        // The pipelines this node runs: their live figures are answered here (Admin_Console §4).
+        statuses: reconciler.watch_statuses(),
+        // A table's Delta facts, read by any node on request.
+        factory: Arc::clone(&deps.factory),
+        lake: Arc::default(),
     });
     ready.store(true, Ordering::SeqCst);
     let mut cluster = Some((gossip, reconciler, discovery));
