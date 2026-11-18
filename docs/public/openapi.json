@@ -2080,6 +2080,90 @@
         "x-min-role": "operator"
       }
     },
+    "/v1/snapshots": {
+      "get": {
+        "tags": [
+          "snapshots"
+        ],
+        "summary": "Every pipeline's snapshot jobs, newest request first: by status, pipeline and who asked; a pipeline whose jobs can't be read is named under `unreadable`",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "description": "queued, running, cancelling, completed, failed or cancelled; several comma-separated",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "pipeline",
+            "in": "query",
+            "description": "a pipeline's id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "by",
+            "in": "query",
+            "description": "who asked for it",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the jobs",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "400": {
+            "description": "a parameter that isn't one, or a status that isn't",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "404": {
+            "description": "no such pipeline in the generation this node runs",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "viewer"
+      }
+    },
     "/v1/snapshots/{job_id}": {
       "get": {
         "tags": [
@@ -2138,6 +2222,182 @@
           }
         ],
         "x-min-role": "viewer"
+      }
+    },
+    "/v1/snapshots/{job_id}/cancel": {
+      "post": {
+        "tags": [
+          "snapshots"
+        ],
+        "summary": "Cancel a job: the pipeline's next start ends its unended tables; a table it was bringing back from a halt, or a truncating job had begun to copy, halts, COPY_CANCELLED",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "description": "the snapshot job's id, `<pipeline id>~<suffix>`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "`note`: why, kept with the action's event (optional, at most 500 characters)",
+          "content": {
+            "application/json": {}
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "description": "cancelled already",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "202": {
+            "description": "cancelling: the owner restarts the worker, or the pipeline's next start ends it",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "404": {
+            "description": "no such job",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "409": {
+            "description": "the job has ended",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "413": {
+            "description": "the body is over 1 MiB",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "422": {
+            "description": "the body isn't `{\"note\": ...}`; or the note is too long, not a string, holds a control character, or the body isn't a JSON object",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "operator"
+      }
+    },
+    "/v1/snapshots/{job_id}/retry": {
+      "post": {
+        "tags": [
+          "snapshots"
+        ],
+        "summary": "Retry an ended job: a new job of its tables, `{\"tables\": \"all\" | \"not_copied\", \"truncate\": ...}`, that records the job it retries",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "description": "the snapshot job's id, `<pipeline id>~<suffix>`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "`note`: why, kept with the action's event (optional, at most 500 characters)",
+          "content": {
+            "application/json": {}
+          },
+          "required": false
+        },
+        "responses": {
+          "202": {
+            "description": "the new job is queued",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "404": {
+            "description": "no such job",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "409": {
+            "description": "the job hasn't ended, it left no table to copy, the pipeline doesn't run, no node holds its lease, or an unfinished job holds a table",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "413": {
+            "description": "the body is over 1 MiB",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "422": {
+            "description": "the body isn't of that form; or the note is too long, not a string, holds a control character, or the body isn't a JSON object",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "operator"
       }
     }
   },

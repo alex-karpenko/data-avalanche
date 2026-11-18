@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-14
+updated: 2026-11-17
 domain: Architecture
 tags: [architecture, design, system, multi-sink, iceberg, delta-lake, v1-scope]
 sources: []
@@ -137,8 +137,11 @@ Functional endpoints are versioned under `/v1`; probes and metrics are unversion
 | Config nodes | `GET /v1/config/nodes` | viewer | each member's generation, whether its own file is the cluster's generation, and its restart-pending fields |
 | Pipelines status | `GET /v1/pipelines`, `GET /v1/pipelines/{id}` | viewer | `desired_state`, `actual_state`, positions, per-table status (halted tables with their reason); the lease holder flagged `stale` when it isn't a member the node's gossip sees (gone, or an earlier process of a restarted node), `suspect` while gossip suspects it |
 | Request snapshot | `POST /v1/pipelines/{id}/snapshots` | operator | tables list (the per-table config keys), no globs; refused (`409`) unless the desired state is `RUNNING` and a node holds the lease, as a restart (`ERROR` included), or while an unfinished job holds one of the tables; `202` with the job's id. The job runs in a restarted worker. It upserts: a row deleted at the source before the job stays, unless the job is asked with `truncate: true`, which empties each sink table first. A pipeline keeps its 100 newest ended jobs |
-| Snapshot job status | `GET /v1/snapshots/{job_id}` | viewer | |
+| Snapshot job status | `GET /v1/snapshots/{job_id}` | viewer | the job's status (`queued`, `running`, `cancelling`, `completed`, `failed`, `cancelled`), who asked, their role and note, the job it retries, who cancelled it and why; each table's status, rows copied, the source's row estimate, when its copy began and ended, the halt the job cleared for it, and what lake readers see of it (`complete`, `partial`, `empty`, `as_before`); the job's rate and ETA once it has run a minute |
 | List snapshot jobs | `GET /v1/pipelines/{id}/snapshots` | viewer | persisted in the pipeline state location; survive restart and failover |
+| All snapshot jobs | `GET /v1/snapshots` | viewer | every pipeline's jobs, newest request first; filters `status` (several, comma-separated), `pipeline`, `by`; a pipeline whose jobs can't be read is named under `unreadable` |
+| Cancel snapshot job | `POST /v1/snapshots/{job_id}/cancel` | operator | records who cancelled the job and why, then restarts the pipeline's worker where one runs (the desired state isn't `STOPPED` and a node holds the lease): that start ends the job's unended tables `cancelled`, and a table the job was bringing back from a halt, or one a truncating job had begun to copy, halts (`COPY_CANCELLED`); without a worker, the next start does. `202` `cancelling`; `200` when cancelled already; `409` once the job ended |
+| Retry snapshot job | `POST /v1/snapshots/{job_id}/retry` | operator | a new job of an ended job's tables (`tables`: `not_copied`, the default, or `all`), truncating as the old one did unless `truncate` says; it records the job it retries, and is otherwise asked as `Request snapshot` is. `409` while the job hasn't ended, or when no table is left to copy |
 | Events | `GET /v1/events` | viewer | the cluster's timeline (actions with their caller, role, note and outcome; refused attempts; the cluster's own events), newest first; filters `since`, `until`, `kind` (a kind or a family), `object`, `actor`, `node`, `q`; `limit` 1–1000 (100); a page that stopped early names its `next`, passed back as `after`. Kept for `globals.console.events.retention` |
 | Pipeline pause | `POST /v1/pipelines/{id}/pause` | operator | `RUNNING → PAUSED`: flush to a transaction boundary and commit; source connection kept warm; lease kept |
 | Pipeline stop | `POST /v1/pipelines/{id}/stop` | operator | `RUNNING/PAUSED → STOPPED`: flush, close the source connection (PG slot kept); lease kept |

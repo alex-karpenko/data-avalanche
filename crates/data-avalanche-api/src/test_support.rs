@@ -288,6 +288,7 @@ pub(crate) async fn lone_with(file: PathBuf, text: &str, env: Arc<dyn Env + Send
             peers: crate::Peers::new("node-a", None).unwrap(),
             process: tokio::sync::watch::channel(Default::default()).1,
             gossip: gossip.figures(),
+            ended_jobs: Arc::default(),
         },
         events,
         leases,

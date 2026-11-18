@@ -52,6 +52,7 @@ pub enum Method {
     Retained,
     CurrentPosition,
     InFlight,
+    RowEstimates,
     ReadChunk,
     FetchRows,
     OpenStream,
@@ -281,6 +282,8 @@ struct Db {
     marks: Vec<Option<SourcePosition>>,
     /// Column names compare without case, as MySQL's do (DA-SRC-25).
     fold: bool,
+    /// [`FakeSource::set_row_estimates`].
+    estimates: BTreeMap<TableRef, u64>,
 }
 
 /// The scripted source. Cloning shares the database.
@@ -346,6 +349,7 @@ impl FakeSource {
             prepares: vec![],
             marks: vec![],
             fold: false,
+            estimates: BTreeMap::new(),
         };
         for t in tables {
             db.create(t);
@@ -522,6 +526,11 @@ impl FakeSource {
     /// The tables the next resuming `prepare` reports in `Prepared::added`.
     pub fn report_added(&self, tables: &[TableRef]) {
         self.db().added = tables.to_vec();
+    }
+
+    /// The rows `row_estimates` reports for these tables from now on (by default, none).
+    pub fn set_row_estimates(&self, estimates: BTreeMap<TableRef, u64>) {
+        self.db().estimates = estimates;
     }
 
     /// The bytes `retained` reports from now on (by default, the log from the slot to its end).
@@ -1222,6 +1231,18 @@ impl SourceConnector for FakeSource {
     async fn current_position(&self) -> Result<SourcePosition, SourceError> {
         self.take_fault(Method::CurrentPosition)?;
         Ok(SourcePosition::Pg(self.db().wal_end))
+    }
+
+    async fn row_estimates(
+        &self,
+        tables: &[TableRef],
+    ) -> Result<BTreeMap<TableRef, u64>, SourceError> {
+        self.take_fault(Method::RowEstimates)?;
+        let db = self.db();
+        Ok(tables
+            .iter()
+            .filter_map(|t| Some((t.clone(), *db.estimates.get(t)?)))
+            .collect())
     }
 
     async fn in_flight(

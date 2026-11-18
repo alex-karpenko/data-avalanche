@@ -203,14 +203,23 @@ impl Action {
             return;
         };
         let recorder = &node.recorder;
-        let pipeline = self
-            .params
-            .iter()
-            .find(|(k, _)| k == "id")
-            .map(|(_, v)| v.clone());
-        let named = match (&pipeline, self.recorded.kind.split('.').next()) {
-            (Some(p), _) => p.clone(),
-            (None, Some("node")) => recorder.node().to_owned(),
+        let param = |name: &str| {
+            self.params
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        };
+        // A job's route names the job, and the pipeline its id names.
+        let job = param("job_id");
+        let pipeline = param("id").or_else(|| {
+            job.as_deref()
+                .and_then(crate::snapshots::job_pipeline)
+                .map(str::to_owned)
+        });
+        let named = match (&job, &pipeline, self.recorded.kind.split('.').next()) {
+            (Some(j), _, _) => j.clone(),
+            (None, Some(p), _) => p.clone(),
+            (None, None, Some("node")) => recorder.node().to_owned(),
             _ => String::new(),
         };
         let mut event = recorder.event(
@@ -260,11 +269,16 @@ pub(crate) async fn denied(gate: &Gate, name: &str, role: &str, path: &str) {
     let segment = path
         .strip_prefix("/v1/pipelines/")
         .map(|rest| rest.split('/').next().unwrap_or_default());
-    let pipeline = match segment {
+    // A job's route: the job, and the pipeline its id names.
+    let job = path
+        .strip_prefix("/v1/snapshots/")
+        .map(|rest| rest.split('/').next().unwrap_or_default());
+    let named = segment.or_else(|| job.and_then(crate::snapshots::job_pipeline));
+    let pipeline = match named {
         Some(id) if known(node, id).await => Some(id.to_owned()),
         _ => None,
     };
-    let target = match segment {
+    let target = match segment.or(job) {
         Some(id) => clipped(id, MAX_TARGET).into_owned(),
         None if path.starts_with("/v1/cluster/") || path.starts_with("/v1/admin/") => {
             recorder.node().to_owned()
@@ -463,6 +477,86 @@ mod tests {
         assert_eq!(got[0].kind, "action.snapshot.start");
         assert_eq!(got[0].object.as_deref(), Some(job_id.as_str()));
         assert_eq!(got[0].text, "start a snapshot job on orders");
+    }
+
+    /// A job's cancel and retry are recorded naming the job and its pipeline; a retry's object
+    /// is the new job, its text the job it retries. A caller below the role is recorded naming
+    /// them too.
+    #[tokio::test]
+    async fn a_job_s_actions_name_the_job_and_its_pipeline() {
+        let idp = Issuer::start().await;
+        let (addr, lone, _dir) =
+            served(Arc::new(Auth::new(&idp.api("roles"), USERNAME_CLAIM))).await;
+        let config = lone.node.coordinator.config().await;
+        let docs = (lone.node.docs)(&config.pipelines["orders"]).unwrap();
+        let mut job = data_avalanche_state::SnapshotJobDoc::new(
+            "orders~0123456789".into(),
+            vec![data_avalanche_core::TableRef::new("public", "orders")],
+            "ops".into(),
+            chrono::Utc::now(),
+        );
+        job.tables[0].status = data_avalanche_state::JobTableStatus::Failed;
+        job.settle(chrono::Utc::now());
+        docs.create_snapshot_job(&job).await.unwrap();
+        lone.leases
+            .acquire(
+                "orders",
+                &data_avalanche_state::Holder {
+                    node_id: "node-a".into(),
+                    incarnation: 1,
+                },
+                Duration::from_secs(30),
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+        let viewer = format!("Bearer {}", idp.token(serde_json::json!(["viewer"])));
+        let (code, _, _) = request(
+            addr,
+            "POST",
+            "/v1/snapshots/orders~0123456789/cancel",
+            &[("Authorization", viewer.as_str())],
+            "",
+        )
+        .await;
+        assert_eq!(code, 403);
+        let operator = format!("Bearer {}", idp.token(serde_json::json!(["operator"])));
+        let auth = [("Authorization", operator.as_str())];
+        let path = "/v1/snapshots/orders~0123456789";
+        let (code, _, body) = request(addr, "POST", &format!("{path}/cancel"), &auth, "").await;
+        assert_eq!(code, 409, "ended: {body}");
+        let (code, _, body) = request(
+            addr,
+            "POST",
+            &format!("{path}/retry"),
+            &auth,
+            r#"{"note": "the replica is back"}"#,
+        )
+        .await;
+        assert_eq!(code, 202, "{body}");
+        let new = serde_json::from_str::<serde_json::Value>(&body).unwrap()["job_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let got = events(&lone.events, 3).await;
+        let (retried, cancelled, denied) = (&got[0], &got[1], &got[2]);
+        assert_eq!(denied.kind, "action.denied");
+        assert_eq!(
+            denied.text,
+            "cancel snapshot job orders~0123456789 refused: needs operator"
+        );
+        assert_eq!(denied.pipeline.as_deref(), Some("orders"));
+        assert_eq!(cancelled.kind, "action.snapshot.cancel");
+        assert_eq!(cancelled.text, "cancel snapshot job orders~0123456789");
+        assert_eq!(cancelled.outcome.as_deref(), Some("refused"));
+        assert_eq!(cancelled.pipeline.as_deref(), Some("orders"));
+        assert_eq!(cancelled.object.as_deref(), Some("orders~0123456789"));
+        assert_eq!(retried.kind, "action.snapshot.retry");
+        assert_eq!(retried.text, "retry snapshot job orders~0123456789");
+        assert_eq!(retried.outcome.as_deref(), Some("accepted"));
+        assert_eq!(retried.pipeline.as_deref(), Some("orders"));
+        assert_eq!(retried.object.as_deref(), Some(new.as_str()));
+        assert_eq!(retried.note.as_deref(), Some("the replica is back"));
     }
 
     #[tokio::test]

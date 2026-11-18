@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-13
+updated: 2026-11-17
 domain: Architecture
 tags: [architecture, data-flow, pipeline, cdc, iceberg, delta-lake, multi-sink, arrow, snapshot, replication]
 sources: []
@@ -764,7 +764,10 @@ Request payload: { tables: ["schema.orders", "schema.products"], truncate: false
    schema (Schema_Change_Detection_and_Evolution.md §8.2). The stream resumes from the confirmed
    position, as after any restart. For each table: run the Phase-1 chunk loop (watermark lw/hw +
    keyset chunks) WITHOUT pausing the stream. Tables already in the streaming set keep streaming;
-   the snapshot reconciles against the live stream exactly as at startup. A `truncate` job first
+   the snapshot reconciles against the live stream exactly as at startup. The start records, for
+   each table it takes, when the copy began, the source's estimate of its rows (PostgreSQL
+   `pg_class.reltuples`, MySQL `information_schema.TABLES.TABLE_ROWS`; none when the source has
+   none or can't say, which doesn't fail the start) and the halt it cleared. A `truncate` job first
    empties each of its tables' sink table: a snapshot change set with `truncate` and no rows,
    committed (fenced) before the start records the table running, so a crash in between empties
    it again and a restart after it resumes the copy without emptying it.
@@ -781,6 +784,21 @@ Request payload: { tables: ["schema.orders", "schema.products"], truncate: false
 Jobs are persisted in the per-pipeline state location, so they are **listed after a restart or a
 failover**. A job that was running continues on the (new) owner from the persisted per-table chunk
 cursors, like the Phase-1 snapshot does after a crash.
+
+**Cancel and retry.** `POST /v1/snapshots/{job_id}/cancel` records the cancel in the job (who,
+their role, when, why) and asks the pipeline's worker to restart, as a job does; the job reads
+`cancelling` until a start takes the cancel. That start's Phase 0 neither starts nor resumes the
+job's tables. A queued table ends `cancelled`. A running table's snapshot state is abandoned, as a
+snapshot its mode no longer asks for is: the table streams on, and ends `cancelled`. A table the
+job's start had brought back from a halt halts again, `COPY_CANCELLED`, naming the job: its sink
+table holds part of its rows, and its stream position may predate them, so copying it again takes
+a new job. So does a table a truncating job had begun to copy: the job emptied its sink table,
+which now holds part of its rows. Only a table the pipeline replicates halts; a job's copy of a
+table outside the config is only abandoned. A table whose copy completed before the start took
+the cancel ends `completed`. With no worker running (a stopped pipeline, or one whose lease no
+node holds), the next start takes the cancel. `POST /v1/snapshots/{job_id}/retry` asks a new job
+of an ended job's tables, those that didn't complete unless it asks for all, and records the job
+it retries.
 
 There is **no stream pause and no `pause_lsn + 1` assumption**: watermarks reconcile re-snapshotted
 rows against concurrent changes, and idempotent upserts mean re-reading existing keys re-writes the

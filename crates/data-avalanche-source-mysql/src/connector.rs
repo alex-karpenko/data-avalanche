@@ -2,6 +2,7 @@
 
 use data_avalanche_config::{BinlogPurgeAction, Mysql, Pipeline, SourceType, Tables};
 use std::any::Any;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -447,6 +448,13 @@ impl SourceConnector for MySqlConnector {
 
     async fn describe_tables(&self, tables: &[TableRef]) -> Result<ResolvedTables, SourceError> {
         MySqlConnector::describe_tables(self, tables).await
+    }
+
+    async fn row_estimates(
+        &self,
+        tables: &[TableRef],
+    ) -> Result<BTreeMap<TableRef, u64>, SourceError> {
+        MySqlConnector::row_estimates(self, tables).await
     }
 
     async fn prepare(

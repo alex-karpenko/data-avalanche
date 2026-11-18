@@ -91,6 +91,21 @@ async fn check(store: Arc<dyn ObjectStore>, test: &str) {
         .await
         .expect("a delete of a missing object succeeds");
 
+    // A batched delete (the events' expiry, M13c): every key goes, a missing one included; a
+    // sibling prefix's keys stay.
+    let day: Vec<String> = (0..5)
+        .map(|i| format!("events/2026-11-01/{i}.json"))
+        .collect();
+    for k in &day[..4] {
+        s.put(k, b("e")).await.unwrap();
+    }
+    s.put("events/2026-11-02/0.json", b("e")).await.unwrap();
+    s.delete_many(&day).await.expect("a batched delete");
+    assert_eq!(
+        s.list("events").await.unwrap(),
+        vec!["events/2026-11-02/0.json"]
+    );
+
     delete_prefix(store.as_ref(), &prefix).await;
 }
 

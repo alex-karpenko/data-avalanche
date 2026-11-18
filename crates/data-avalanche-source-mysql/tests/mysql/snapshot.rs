@@ -33,6 +33,39 @@ async fn walk(c: &MySqlConnector, t: &TableSchema, limit: usize) -> (Vec<Row>, V
     }
 }
 
+/// A snapshot job's progress estimate (D-M13c.5): `TABLE_ROWS`, an estimate InnoDB samples, after
+/// `ANALYZE TABLE`; a table of another database, or not there, is left out.
+#[tokio::test]
+async fn row_estimates_are_information_schema_s() {
+    require_it!();
+    let (n, mut a) = fresh(
+        "row_estimates",
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         INSERT INTO t WITH RECURSIVE s (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 1000)
+           SELECT i FROM s;
+         ANALYZE TABLE t;",
+    )
+    .await;
+    a.query_drop("ANALYZE TABLE t").await.unwrap();
+    let c = connector(&pipeline(&n, &["t"], "", ""));
+    let t = data_avalanche_core::TableRef::new(n.db.clone(), "t");
+    let got = c
+        .row_estimates(&[
+            t.clone(),
+            data_avalanche_core::TableRef::new(n.db.clone(), "nope"),
+            data_avalanche_core::TableRef::new("other", "t"),
+        ])
+        .await
+        .unwrap();
+    let rows = got.get(&t).copied().unwrap_or_else(|| panic!("{got:?}"));
+    assert!(
+        (500..=2000).contains(&rows),
+        "an estimate near 1000: {rows}"
+    );
+    assert_eq!(got.len(), 1, "{got:?}");
+    cleanup(&n).await;
+}
+
 /// Key types and values chosen where a cursor parameter could go wrong: past `i64`, digits a
 /// double loses, case and accents under the column's collation, latin1 above ASCII, trailing zero
 /// bytes, the clock ranges' ends, negative times, ENUM (upper-case labels too) and SET in member

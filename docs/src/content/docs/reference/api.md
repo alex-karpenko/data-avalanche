@@ -175,6 +175,22 @@ Least role: `operator`.
 
 Snapshot jobs started through the API.
 
+### `GET /v1/snapshots`
+
+Every pipeline's snapshot jobs, newest request first: by status, pipeline and who asked; a pipeline whose jobs can't be read is named under `unreadable`
+
+Least role: `viewer`.
+
+- Query parameter `status`: queued, running, cancelling, completed, failed or cancelled; several comma-separated.
+- Query parameter `pipeline`: a pipeline's id.
+- Query parameter `by`: who asked for it.
+
+| Status | When |
+|---|---|
+| `200` | the jobs |
+| `400` | a parameter that isn't one, or a status that isn't |
+| `404` | no such pipeline in the generation this node runs |
+
 ### `GET /v1/snapshots/{job_id}`
 
 A snapshot job: its status and each table's
@@ -187,6 +203,43 @@ Least role: `viewer`.
 |---|---|
 | `200` | the job |
 | `404` | no such job |
+
+### `POST /v1/snapshots/{job_id}/cancel`
+
+Cancel a job: the pipeline's next start ends its unended tables; a table it was bringing back from a halt, or a truncating job had begun to copy, halts, COPY_CANCELLED
+
+Least role: `operator`.
+
+- Path parameter `job_id`: the snapshot job's id, `<pipeline id>~<suffix>`.
+- Body: `application/json`.
+- `note`: why, kept with the action's event (optional, at most 500 characters).
+
+| Status | When |
+|---|---|
+| `200` | cancelled already |
+| `202` | cancelling: the owner restarts the worker, or the pipeline's next start ends it |
+| `404` | no such job |
+| `409` | the job has ended |
+| `413` | the body is over 1 MiB |
+| `422` | the body isn't `{"note": ...}`; or the note is too long, not a string, holds a control character, or the body isn't a JSON object |
+
+### `POST /v1/snapshots/{job_id}/retry`
+
+Retry an ended job: a new job of its tables, `{"tables": "all" | "not_copied", "truncate": ...}`, that records the job it retries
+
+Least role: `operator`.
+
+- Path parameter `job_id`: the snapshot job's id, `<pipeline id>~<suffix>`.
+- Body: `application/json`.
+- `note`: why, kept with the action's event (optional, at most 500 characters).
+
+| Status | When |
+|---|---|
+| `202` | the new job is queued |
+| `404` | no such job |
+| `409` | the job hasn't ended, it left no table to copy, the pipeline doesn't run, no node holds its lease, or an unfinished job holds a table |
+| `413` | the body is over 1 MiB |
+| `422` | the body isn't of that form; or the note is too long, not a string, holds a control character, or the body isn't a JSON object |
 
 ## config
 

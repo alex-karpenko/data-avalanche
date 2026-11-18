@@ -147,6 +147,12 @@ pub enum HaltReason {
     )]
     #[serde(rename = "SNAPSHOT_TIMEOUT")]
     SnapshotTimeout { limit_secs: u64 },
+    /// A snapshot job bringing the table back from a halt, or a truncating one, was cancelled
+    /// before its copy ended (Admin_Console §5): the sink holds a partial copy, so the table
+    /// stays halted.
+    #[error("snapshot job {job} was cancelled before it copied the table; copy it again")]
+    #[serde(rename = "COPY_CANCELLED")]
+    CopyCancelled { job: String },
 }
 
 impl HaltReason {
@@ -167,6 +173,7 @@ impl HaltReason {
             Self::NotReplicable { .. } => "TABLE_NOT_REPLICABLE",
             Self::SinkRejected { .. } => "SINK_REJECTED",
             Self::SnapshotTimeout { .. } => "SNAPSHOT_TIMEOUT",
+            Self::CopyCancelled { .. } => "COPY_CANCELLED",
         }
     }
 }
@@ -508,6 +515,9 @@ mod tests {
             HaltReason::NotReplicable { reason: "r".into() },
             HaltReason::SinkRejected { detail: "d".into() },
             HaltReason::SnapshotTimeout { limit_secs: 21_600 },
+            HaltReason::CopyCancelled {
+                job: "orders~0199".into(),
+            },
         ]
     }
 
@@ -545,6 +555,17 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&HaltReason::TableDropped).unwrap(),
             r#"{"code":"TABLE_DROPPED"}"#
+        );
+        let cancelled = HaltReason::CopyCancelled {
+            job: "orders~0199".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&cancelled).unwrap(),
+            r#"{"code":"COPY_CANCELLED","job":"orders~0199"}"#
+        );
+        assert_eq!(
+            cancelled.to_string(),
+            "snapshot job orders~0199 was cancelled before it copied the table; copy it again"
         );
         let unknown =
             serde_json::from_str::<HaltReason>(r#"{"code":"UNSAFE_DDL","detail":"x","y":1}"#);

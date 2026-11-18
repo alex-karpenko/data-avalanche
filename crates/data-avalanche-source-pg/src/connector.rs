@@ -335,6 +335,45 @@ impl PgConnector {
             .await
     }
 
+    /// `pg_class.reltuples` of `tables`, once the table was analyzed or vacuumed: before that it
+    /// is `-1` (PostgreSQL 14 and later), and the table is left out, as one that isn't there.
+    pub async fn row_estimates(
+        &self,
+        tables: &[TableRef],
+    ) -> Result<BTreeMap<TableRef, u64>, SourceError> {
+        if tables.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let schemas: Vec<&str> = tables.iter().map(|t| t.schema.as_str()).collect();
+        let names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
+        let client = self.conn.client().await?;
+        let rows = self
+            .conn
+            .command(
+                "estimate the tables' rows",
+                client.query(
+                    "SELECT n.nspname, c.relname, c.reltuples::float8
+                       FROM pg_catalog.pg_class c
+                       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                       JOIN unnest($1::text[], $2::text[]) AS w(s, t)
+                         ON w.s = n.nspname AND w.t = c.relname
+                      WHERE c.relkind IN ('r', 'p') AND c.reltuples >= 0",
+                    &[&schemas, &names],
+                ),
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let rows: f64 = r.get(2);
+                (
+                    TableRef::new(r.get::<_, String>(0), r.get::<_, String>(1)),
+                    rows.round() as u64,
+                )
+            })
+            .collect())
+    }
+
     /// `pg_current_wal_lsn()`: a snapshot chunk's watermark (Snapshot_Resumability §1).
     pub async fn current_position(&self) -> Result<SourcePosition, SourceError> {
         let client = self.conn.client().await?;
@@ -412,6 +451,13 @@ impl SourceConnector for PgConnector {
 
     async fn in_flight(&self) -> Result<Option<Vec<InFlightTxn>>, SourceError> {
         PgConnector::in_flight(self).await
+    }
+
+    async fn row_estimates(
+        &self,
+        tables: &[TableRef],
+    ) -> Result<BTreeMap<TableRef, u64>, SourceError> {
+        PgConnector::row_estimates(self, tables).await
     }
 
     async fn read_chunk(

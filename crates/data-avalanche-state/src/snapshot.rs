@@ -74,6 +74,8 @@ pub enum JobStatus {
     Completed,
     /// Every table ended, and one or more failed.
     Failed,
+    /// Every table ended, and one or more was cancelled ([`SnapshotJobDoc::cancel`]).
+    Cancelled,
 }
 
 /// Where one requested table of a job is.
@@ -86,6 +88,18 @@ pub enum JobTableStatus {
     Running,
     Completed,
     Failed,
+    /// The job was cancelled before the table's copy ended (or began).
+    Cancelled,
+}
+
+impl JobTableStatus {
+    /// Completed, failed or cancelled: the table's part of the job is over.
+    pub fn is_ended(self) -> bool {
+        match self {
+            Self::Queued | Self::Running => false,
+            Self::Completed | Self::Failed | Self::Cancelled => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +110,55 @@ pub struct JobTable {
     pub rows_done: u64,
     /// Why it failed.
     pub error: Option<String>,
+    /// When a start took the table and its copy began. The fields below are written only when
+    /// set, as the job's `truncate`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    /// When it completed, failed or was cancelled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<DateTime<Utc>>,
+    /// The source's estimate of the table's rows when its copy began, for a progress and an ETA.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate: Option<u64>,
+    /// The code of the halt the job's start cleared: the job was bringing the table back from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_halt: Option<String>,
+}
+
+impl JobTable {
+    /// A table just asked for: queued, nothing done.
+    pub fn queued(table: TableRef) -> Self {
+        Self {
+            table,
+            status: JobTableStatus::Queued,
+            rows_done: 0,
+            error: None,
+            started_at: None,
+            ended_at: None,
+            estimate: None,
+            from_halt: None,
+        }
+    }
+
+    /// Ends the table's part of the job as `status`, at `now`, with `error` when it failed.
+    pub fn end(&mut self, status: JobTableStatus, error: Option<String>, now: DateTime<Utc>) {
+        debug_assert!(status.is_ended(), "{status:?} doesn't end a table");
+        self.status = status;
+        self.error = error;
+        self.ended_at = Some(now);
+    }
+}
+
+/// Who cancelled a job, when and why (Admin_Console §5). The start that takes it ends the job's
+/// tables that haven't ended (D-M13c.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobCancel {
+    pub by: String,
+    pub role: String,
+    pub at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// An on-demand snapshot job (Data-Flow §On-Demand Snapshot); survives restart and failover.
@@ -117,6 +180,15 @@ pub struct SnapshotJobDoc {
     /// Why it was asked (Admin_Console §5). Written only when set, as `truncate`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// The role of the caller who asked for it. Written only when set, as `truncate`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_role: Option<String>,
+    /// The ended job this one retries (`POST /v1/snapshots/{job_id}/retry`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_of: Option<String>,
+    /// The job was asked to stop: the pipeline's next start ends its unended tables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel: Option<JobCancel>,
 }
 
 impl Document for SnapshotJobDoc {
@@ -135,21 +207,16 @@ impl SnapshotJobDoc {
         Self {
             job_id,
             status: JobStatus::Queued,
-            tables: tables
-                .into_iter()
-                .map(|table| JobTable {
-                    table,
-                    status: JobTableStatus::Queued,
-                    rows_done: 0,
-                    error: None,
-                })
-                .collect(),
+            tables: tables.into_iter().map(JobTable::queued).collect(),
             requested_at,
             requested_by,
             finished_at: None,
             error: None,
             truncate: false,
             note: None,
+            requested_role: None,
+            retry_of: None,
+            cancel: None,
         }
     }
 
@@ -160,14 +227,17 @@ impl SnapshotJobDoc {
         self
     }
 
-    /// Completed or failed: the job has ended, and [`Self::settle`] leaves it as it is.
+    /// Completed, failed or cancelled: the job has ended, and [`Self::settle`] leaves it as it is.
     pub fn is_finished(&self) -> bool {
-        matches!(self.status, JobStatus::Completed | JobStatus::Failed)
+        match self.status {
+            JobStatus::Queued | JobStatus::Running => false,
+            JobStatus::Completed | JobStatus::Failed | JobStatus::Cancelled => true,
+        }
     }
 
     /// Sets the job's status from its tables': queued while every table is, running while one
-    /// is queued or running, then completed or failed, at `now`. A finished job stays as it
-    /// ended. True when it changed.
+    /// is queued or running, then cancelled when a table was, else completed or failed, at
+    /// `now`. A finished job stays as it ended. True when it changed.
     pub fn settle(&mut self, now: DateTime<Utc>) -> bool {
         if self.is_finished() {
             return false;
@@ -181,6 +251,8 @@ impl SnapshotJobDoc {
             .any(|t| matches!(t.status, JobTableStatus::Queued | JobTableStatus::Running))
         {
             JobStatus::Running
+        } else if self.tables.iter().any(is(JobTableStatus::Cancelled)) {
+            JobStatus::Cancelled
         } else if self.tables.iter().all(is(JobTableStatus::Completed)) {
             JobStatus::Completed
         } else {
@@ -390,6 +462,37 @@ impl PipelineDocs {
         }
         jobs.sort_by(|a, b| {
             (a.doc.requested_at, &a.doc.job_id).cmp(&(b.doc.requested_at, &b.doc.job_id))
+        });
+        Ok(jobs)
+    }
+
+    /// Every job of this pipeline as [`Self::snapshot_jobs`] reads them, each with its key; but
+    /// a job `known` gives by its key is taken from there, not read (an ended job doesn't
+    /// change, so a reader may keep it).
+    ///
+    /// # Errors
+    /// As [`Self::snapshot_jobs`].
+    pub async fn snapshot_jobs_reusing(
+        &self,
+        known: impl Fn(&str) -> Option<SnapshotJobDoc>,
+    ) -> Result<Vec<(String, SnapshotJobDoc)>, StateError> {
+        let mut jobs = vec![];
+        for key in self.docs.store().list(JOBS_PREFIX).await? {
+            if let Some(job) = known(&key) {
+                jobs.push((key, job));
+                continue;
+            }
+            match self.docs.load::<SnapshotJobDoc>(&key).await {
+                Ok(Some(v)) => jobs.push((key, v.doc)),
+                Ok(None) => {}
+                Err(e @ (StateError::Corrupt { .. } | StateError::UnsupportedVersion { .. })) => {
+                    tracing::warn!("snapshot job {key} skipped: {e}");
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        jobs.sort_by(|(_, a), (_, b)| {
+            (a.requested_at, &a.job_id).cmp(&(b.requested_at, &b.job_id))
         });
         Ok(jobs)
     }
@@ -731,6 +834,107 @@ mod tests {
         assert_eq!(doc.status, JobStatus::Queued);
     }
 
+    /// A job whose table was cancelled ends cancelled once no table is queued or running,
+    /// whatever its other tables did; a job whose tables all completed before its cancel was
+    /// taken completed.
+    #[test]
+    fn a_cancelled_table_cancels_the_job() {
+        let mut doc = two_tables();
+        doc.cancel = Some(JobCancel {
+            by: "Oleksii".into(),
+            role: "operator".into(),
+            at: t(1),
+            note: None,
+        });
+        doc.tables[0].status = JobTableStatus::Running;
+        assert!(doc.settle(t(1)));
+        assert_eq!(doc.status, JobStatus::Running, "asked, not yet taken");
+        doc.tables[0].end(JobTableStatus::Completed, None, t(2));
+        doc.tables[1].end(JobTableStatus::Cancelled, None, t(2));
+        assert!(doc.settle(t(2)));
+        assert_eq!(doc.status, JobStatus::Cancelled);
+        assert_eq!((doc.finished_at, doc.error.as_deref()), (Some(t(2)), None));
+        assert_eq!(doc.tables[1].ended_at, Some(t(2)));
+        assert!(doc.is_finished());
+
+        let mut doc = two_tables();
+        doc.tables[0].end(JobTableStatus::Failed, Some("TABLE_DROPPED".into()), t(3));
+        doc.tables[1].end(JobTableStatus::Cancelled, None, t(3));
+        assert!(doc.settle(t(3)));
+        assert_eq!(
+            doc.status,
+            JobStatus::Cancelled,
+            "a cancel ends it, a failure or not"
+        );
+        assert_eq!(
+            doc.error.as_deref(),
+            Some("1 of 2 tables failed: public.orders (TABLE_DROPPED)")
+        );
+
+        let mut doc = two_tables();
+        doc.cancel = Some(JobCancel {
+            by: "Oleksii".into(),
+            role: "operator".into(),
+            at: t(4),
+            note: Some("too late".into()),
+        });
+        for table in &mut doc.tables {
+            table.end(JobTableStatus::Completed, None, t(4));
+        }
+        assert!(doc.settle(t(4)));
+        assert_eq!(
+            doc.status,
+            JobStatus::Completed,
+            "the cancel came after the copies"
+        );
+    }
+
+    /// The fields 1.1 added are written only when set, so a job asked without them reads as a
+    /// 1.0 job did; set, they read back.
+    #[test]
+    fn the_fields_1_1_added_are_written_only_when_set() {
+        let doc = two_tables();
+        let text = String::from_utf8(crate::doc::encode(&doc).to_vec()).unwrap();
+        for key in [
+            "started_at",
+            "ended_at",
+            "estimate",
+            "from_halt",
+            "requested_role",
+            "retry_of",
+            "cancel",
+        ] {
+            assert!(!text.contains(key), "{key} in {text}");
+        }
+        let mut doc = two_tables();
+        doc.requested_role = Some("operator".into());
+        doc.retry_of = Some("orders~0198".into());
+        doc.cancel = Some(JobCancel {
+            by: "ci-bot".into(),
+            role: "operator".into(),
+            at: t(2),
+            note: Some("maintenance".into()),
+        });
+        doc.tables[0].started_at = Some(t(1));
+        doc.tables[0].estimate = Some(4_200_000);
+        doc.tables[0].from_halt = Some("UNSAFE_DDL".into());
+        doc.tables[0].end(JobTableStatus::Cancelled, None, t(2));
+        let text = String::from_utf8(crate::doc::encode(&doc).to_vec()).unwrap();
+        let read: SnapshotJobDoc = crate::doc::decode("j", text.as_bytes()).unwrap();
+        assert_eq!(read, doc);
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            json["cancel"],
+            json!({
+                "by": "ci-bot", "role": "operator", "at": "2026-09-28T10:00:02Z",
+                "note": "maintenance",
+            })
+        );
+        assert_eq!(json["tables"][0]["status"], "cancelled");
+        assert_eq!(json["tables"][0]["from_halt"], "UNSAFE_DDL");
+        assert_eq!(json["tables"][0]["estimate"], 4_200_000);
+    }
+
     #[tokio::test]
     async fn the_unfinished_jobs_leave_out_the_ended_ones() {
         let p = pipeline();
@@ -826,5 +1030,38 @@ mod tests {
             .collect();
         assert_eq!(ids, ["good"]);
         assert_eq!(p.unfinished_snapshot_jobs().await.unwrap().len(), 1);
+    }
+
+    /// A job the caller knows by its key is taken from it, not read; the others are read; a
+    /// key it knows that the listing lacks isn't returned.
+    #[tokio::test]
+    async fn jobs_known_by_their_key_are_not_read_again() {
+        let p = pipeline();
+        let a = TableRef::new("public", "a");
+        let mut ended = SnapshotJobDoc::new("p~1".into(), vec![a.clone()], "ops".into(), t(1));
+        ended.tables[0].end(JobTableStatus::Completed, None, t(2));
+        ended.settle(t(2));
+        p.create_snapshot_job(&ended).await.unwrap();
+        let running = SnapshotJobDoc::new("p~2".into(), vec![a], "ops".into(), t(3));
+        p.create_snapshot_job(&running).await.unwrap();
+        let mut kept = ended.clone();
+        kept.requested_by = "kept".into();
+        let known = |key: &str| match key {
+            k if k == job_key("p~1") => Some(kept.clone()),
+            k if k == job_key("p~0") => panic!("not listed, not asked"),
+            _ => None,
+        };
+        let got = p.snapshot_jobs_reusing(known).await.unwrap();
+        let got: Vec<(&str, &str, &str)> = got
+            .iter()
+            .map(|(k, j)| (k.as_str(), j.job_id.as_str(), j.requested_by.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("snapshots/jobs/p~1.json", "p~1", "kept"),
+                ("snapshots/jobs/p~2.json", "p~2", "ops"),
+            ]
+        );
     }
 }

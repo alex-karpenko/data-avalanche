@@ -51,6 +51,7 @@ pub use peers::{
     STATUS_LIMIT, TARGET,
 };
 pub use server::{Bound, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT, MAX_CONNECTIONS, ServeError, bind};
+pub use snapshots::{EndedJobs, READ_AT_ONCE};
 
 use crate::auth::Denied;
 
@@ -92,6 +93,8 @@ pub struct Node {
     pub process: watch::Receiver<ProcessFigures>,
     /// What the gossip saw of its probes.
     pub gossip: watch::Receiver<GossipFigures>,
+    /// The ended snapshot jobs `GET /v1/snapshots` read: they don't change.
+    pub ended_jobs: Arc<EndedJobs>,
 }
 
 impl std::fmt::Debug for Node {
@@ -468,12 +471,77 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
         (
             r(
                 "GET",
+                "/v1/snapshots",
+                Viewer,
+                "Every pipeline's snapshot jobs, newest request first: by status, pipeline and who asked; a pipeline whose jobs can't be read is named under `unreadable`",
+                &[
+                    (200, "the jobs"),
+                    (400, "a parameter that isn't one, or a status that isn't"),
+                    (404, "no such pipeline in the generation this node runs"),
+                ],
+            ),
+            get(snapshots::all),
+        ),
+        (
+            r(
+                "GET",
                 "/v1/snapshots/{job_id}",
                 Viewer,
                 "A snapshot job: its status and each table's",
                 &[(200, "the job"), (404, "no such job")],
             ),
             get(snapshots::get),
+        ),
+        (
+            act(
+                "snapshot.cancel",
+                "cancel snapshot job",
+                Route {
+                    body: Some("application/json"),
+                    ..r(
+                        "POST",
+                        "/v1/snapshots/{job_id}/cancel",
+                        Operator,
+                        "Cancel a job: the pipeline's next start ends its unended tables; a table it was bringing back from a halt, or a truncating job had begun to copy, halts, COPY_CANCELLED",
+                        &[
+                            (200, "cancelled already"),
+                            (
+                                202,
+                                "cancelling: the owner restarts the worker, or the pipeline's next start ends it",
+                            ),
+                            (404, "no such job"),
+                            (409, "the job has ended"),
+                            (422, "the body isn't `{\"note\": ...}`"),
+                        ],
+                    )
+                },
+            ),
+            post(snapshots::cancel),
+        ),
+        (
+            act(
+                "snapshot.retry",
+                "retry snapshot job",
+                Route {
+                    body: Some("application/json"),
+                    ..r(
+                        "POST",
+                        "/v1/snapshots/{job_id}/retry",
+                        Operator,
+                        "Retry an ended job: a new job of its tables, `{\"tables\": \"all\" | \"not_copied\", \"truncate\": ...}`, that records the job it retries",
+                        &[
+                            (202, "the new job is queued"),
+                            (404, "no such job"),
+                            (
+                                409,
+                                "the job hasn't ended, it left no table to copy, the pipeline doesn't run, no node holds its lease, or an unfinished job holds a table",
+                            ),
+                            (422, "the body isn't of that form"),
+                        ],
+                    )
+                },
+            ),
+            post(snapshots::retry),
         ),
         (
             act(
@@ -833,7 +901,10 @@ mod tests {
                 ("POST", "/v1/pipelines/{id}/flush", Operator),
                 ("POST", "/v1/pipelines/{id}/snapshots", Operator),
                 ("GET", "/v1/pipelines/{id}/snapshots", Viewer),
+                ("GET", "/v1/snapshots", Viewer),
                 ("GET", "/v1/snapshots/{job_id}", Viewer),
+                ("POST", "/v1/snapshots/{job_id}/cancel", Operator),
+                ("POST", "/v1/snapshots/{job_id}/retry", Operator),
                 ("POST", "/v1/cluster/leave", Admin),
                 ("POST", "/v1/admin/shutdown", Admin),
                 ("GET", "/v1/nodes/{node}", Viewer),
