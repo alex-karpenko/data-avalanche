@@ -257,9 +257,8 @@ The rest are Claude's calls under Admin_Console §13.
 
 ### Spec patch for approval (S-M13d.1)
 
-This patch is applied as its own commit, `spec: S-M13d.1 — a pipeline's live figures, a table's
-page, every pipeline's tables; a halt's since; a commit's cost`, once Oleksii approves it and
-before Task 1. The code below implements these edits to two spec files:
+Approved by Oleksii 2026-11-18 with the plan. This patch is applied as execution starts, as its own commit, `spec: S-M13d.1 — a pipeline's live figures, a table's
+page, every pipeline's tables; a halt's since; a commit's cost`, before Task 1. The code below implements these edits to two spec files:
 
 1. `doc/specs/System-Overview.md`, the endpoint table:
    - the pipeline status row says a halted table shows since when;
