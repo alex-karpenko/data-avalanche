@@ -1112,12 +1112,11 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
         .filter(|t| truncating.contains(*t))
         .cloned()
         .collect();
-    // The copy's start is noted on its job before the truncate (F14), as the halt a start
-    // clears is noted before the clear: a crash after the truncate, before the job records the
-    // table running, leaves the table queued but noted, and a cancel then halts it.
-    core.may_write()?;
-    jobs.note_truncating(&core.docs, &truncated.iter().cloned().collect(), Utc::now())
-        .await?;
+    // Each table's key check comes first: a table that fails it isn't emptied, so its copy never
+    // began. The tables that pass are noted on their jobs (F14) before any is emptied, as the
+    // halt a start clears is noted before the clear: a crash after a truncate, before the job
+    // records the table running, leaves the table queued but noted, and a cancel then halts it.
+    let mut to_empty: Vec<&TableSchema> = Vec::new();
     for table in &truncated {
         // The key the session copies the table with: the schema this start caches, else a
         // copy's, else the one cached before (a key whose case alone changed keeps the cached
@@ -1172,19 +1171,26 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
                 }
                 continue;
             }
-            // Under the key the sink table records (`commit_empty`), which is the session's
-            // here; for a sink table that records none, under the session's. The result is
-            // `true`: a resolved schema always has a key (`Ok(false)` is a reposition's).
-            commit_empty(
-                core,
-                &tuning,
-                schema.table(),
-                schema.identifier(),
-                &at,
-                Empty::Truncate,
-            )
-            .await?;
+            to_empty.push(schema);
         }
+    }
+    core.may_write()?;
+    let noting: BTreeSet<TableRef> = to_empty.iter().map(|s| s.table().clone()).collect();
+    jobs.note_truncating(&core.docs, &noting, Utc::now())
+        .await?;
+    for schema in to_empty {
+        // Under the key the sink table records (`commit_empty`), which is the session's here; for
+        // a sink table that records none, under the session's. The result is `true`: a resolved
+        // schema always has a key (`Ok(false)` is a reposition's).
+        commit_empty(
+            core,
+            &tuning,
+            schema.table(),
+            schema.identifier(),
+            &at,
+            Empty::Truncate,
+        )
+        .await?;
     }
     // The started tables' row estimates, for a progress and an ETA: a source that can't give
     // them doesn't fail the start.

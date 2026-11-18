@@ -695,6 +695,10 @@ mod tests {
         assert_eq!(j.tables[0].status, JobTableStatus::Failed);
         let error = j.tables[0].error.clone().unwrap();
         assert!(error.starts_with("SINK_REJECTED: "), "{error}");
+        assert_eq!(
+            j.tables[0].started_at, None,
+            "a copy that never began isn't noted as begun"
+        );
         assert_eq!(j.tables[1].status, JobTableStatus::Running, "b goes on");
     }
 
