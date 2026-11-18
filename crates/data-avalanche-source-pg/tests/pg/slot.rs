@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use data_avalanche_core::position::Lsn;
 use data_avalanche_core::{
-    Checkpoint, HaltReason, ServerIdentity, SnapshotReason, SourceConnector, SourceDetail,
-    SourceError, SourcePosition, StartPlan, TableRef,
+    ChangeStream, Checkpoint, HaltReason, ServerIdentity, SnapshotReason, SourceConnector,
+    SourceDetail, SourceError, SourcePosition, StartPlan, TableRef,
 };
 use data_avalanche_testkit::require_it;
 use tokio_postgres::Client;
@@ -1025,7 +1025,9 @@ async fn the_detail_shows_the_slot_and_the_publication() {
         .unwrap()
         .get(0);
     assert_eq!(d.max_slot_wal_keep_size, u64::try_from(keep).ok());
-    drop(stream);
+    // Closed, not dropped: the stream was never read, so its worker may not have taken the slot
+    // yet, and a dropped one can take it after the cleanup's wait has passed (`55006`).
+    stream.close().await.expect("the stream closes");
     cleanup(&a, &n).await;
 }
 
