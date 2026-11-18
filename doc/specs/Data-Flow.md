@@ -794,10 +794,11 @@ job's start had brought back from a halt halts again, `COPY_CANCELLED`, naming t
 table holds part of its rows, and its stream position may predate them, so copying it again takes
 a new job. So does a table a truncating job had begun to copy: the job emptied its sink table,
 which now holds part of its rows. Only a table the pipeline replicates halts; a job's copy of a
-table outside the config is only abandoned. A table whose copy completed before the start took the cancel ends `completed`. With
-no worker running (a stopped pipeline, or one whose lease no node holds), the next start takes the
-cancel. `POST /v1/snapshots/{job_id}/retry` asks a new job of an ended job's tables, those that
-didn't complete unless it asks for all, and records the job it retries.
+table outside the config is only abandoned. A table whose copy completed before the start took
+the cancel ends `completed`. With no worker running (a stopped pipeline, or one whose lease no
+node holds), the next start takes the cancel. `POST /v1/snapshots/{job_id}/retry` asks a new job
+of an ended job's tables, those that didn't complete unless it asks for all, and records the job
+it retries.
 
 There is **no stream pause and no `pause_lsn + 1` assumption**: watermarks reconcile re-snapshotted
 rows against concurrent changes, and idempotent upserts mean re-reading existing keys re-writes the
