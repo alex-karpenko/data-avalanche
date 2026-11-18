@@ -8,7 +8,7 @@ use std::time::Duration;
 use data_avalanche_testkit::require_it;
 use serde_json::Value;
 
-use crate::harness::{Doc, E2e, Options, Proc, eventually};
+use crate::harness::{Doc, E2e, Options, Proc, Source, eventually};
 
 /// A table as a request names it: the source's per-table config key.
 fn key(e: &E2e, table: &str) -> String {
@@ -258,7 +258,8 @@ async fn post(p: &Proc, path: &str, body: &str) -> (u16, Value) {
 /// restart's start ends it, and the table halts again, `COPY_CANCELLED`; the pipeline stays
 /// paused. The cancel and the job's end are in the events. Resumed, a retry of the job copies the
 /// table and clears the halt; `GET /v1/snapshots` lists both jobs, the retry first, with the
-/// source's row estimate.
+/// source's row estimate (exact after `ANALYZE` on PostgreSQL, InnoDB's approximate
+/// `TABLE_ROWS` on MySQL).
 #[tokio::test]
 async fn a_cancelled_copy_halts_its_table_and_a_retry_copies_it() {
     require_it!();
@@ -279,7 +280,11 @@ async fn a_cancelled_copy_halts_its_table_and_a_retry_copies_it() {
     e.exec("DROP TABLE gone; CREATE TABLE gone (id bigint PRIMARY KEY, doc text)")
         .await;
     e.insert_series("gone", 1_000, Doc::Row).await;
-    e.exec("ANALYZE gone").await;
+    e.exec(match e.source {
+        Source::Postgres { .. } => "ANALYZE gone",
+        Source::Mysql(_) => "ANALYZE TABLE gone",
+    })
+    .await;
     eventually("gone halts", Duration::from_secs(60), async || {
         e.halts()
             .await
@@ -358,7 +363,18 @@ async fn a_cancelled_copy_halts_its_table_and_a_retry_copies_it() {
     let job = ended(&p, &retry).await;
     assert_eq!(job["status"], "completed", "{job}");
     assert_eq!(job["tables"][0]["rows_done"], 1_000, "{job}");
-    assert_eq!(job["tables"][0]["estimate"], 1_000, "analyzed: {job}");
+    match e.source {
+        Source::Postgres { .. } => {
+            assert_eq!(job["tables"][0]["estimate"], 1_000, "analyzed: {job}");
+        }
+        Source::Mysql(_) => {
+            let n = job["tables"][0]["estimate"].as_u64();
+            assert!(
+                n.is_some_and(|n| (500..=2_000).contains(&n)),
+                "InnoDB's estimate is near 1000: {job}"
+            );
+        }
+    }
     assert_eq!(job["tables"][0]["lake"], "complete", "{job}");
     assert!(e.halts().await.tables.is_empty(), "the halt is cleared");
     e.exec("INSERT INTO gone VALUES (1001, 'streamed')").await;
