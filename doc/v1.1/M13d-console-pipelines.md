@@ -369,6 +369,31 @@ index d27bdc0..c58dc02 100644
  | List snapshot jobs | `GET /v1/pipelines/{id}/snapshots` | viewer | persisted in the pipeline state location; survive restart and failover |
 ````
 
+### Spec patch S-M13d.3 (approved during execution)
+
+Raised by the whole-branch review (I2), approved by Oleksii 2026-11-18 ("Stale when not by
+choice"). Applied as its own commit, `spec: S-M13d.3 — a table is stale while its pipeline should
+be replicating, an outage included`, before the review's fix wave. Before it, a table was stale
+only while the worker streamed, and `fresh_as_of` read "now" through a source outage.
+
+`doc/specs/System-Overview.md`:
+
+````diff
+diff --git a/doc/specs/System-Overview.md b/doc/specs/System-Overview.md
+index c58dc02..e373250 100644
+--- a/doc/specs/System-Overview.md
++++ b/doc/specs/System-Overview.md
+@@ -136,7 +136,7 @@ Functional endpoints are versioned under `/v1`; probes and metrics are unversion
+ | Config diff | `GET /v1/config/diff?from=&to=` | viewer | what differs between two generations as written, each change with what a reload of it does; secrets masked |
+ | Config nodes | `GET /v1/config/nodes` | viewer | each member's generation, whether its own file is the cluster's generation, and its restart-pending fields |
+ | Pipelines status | `GET /v1/pipelines`, `GET /v1/pipelines/{id}` | viewer | `desired_state`, `actual_state`, positions, per-table status (halted tables with their reason and since when; a halt recorded before 1.1.0 has no time); the lease holder flagged `stale` when it isn't a member the node's gossip sees (gone, or an earlier process of a restarted node), `suspect` while gossip suspects it |
+-| Pipeline live figures | `GET /v1/pipelines/{id}/live` | viewer | what the pipeline's worker shows now, answered from the memory of the node that holds its lease: phase, positions, lag and what lake readers see (`fresh_as_of`); the source's detail, read every heartbeat (PostgreSQL: the slot, the WAL it holds against `max_slot_wal_keep_size`, its confirmed position, the publication; MySQL/MariaDB: the server's position and binlog expiry); each table's state (`streaming`, `snapshot`, `halted`, or `copied`: a `dump_*` table whose copy ended, or a `dump_initial` one the sink had at the start, which isn't streamed; a snapshot job's table outside the config is listed while it copies), changes since the worker started and in the last minute, last commit and Delta version, the last MERGE's files rewritten against the table's files, freshness, and `stale` (older than the lag target while the worker streams). Another node asks the holder with the caller's credentials: `409` no node holds the lease, `503` a holder it can't ask, `502`/`504` no answer, `421` a forwarded request to a node that no longer runs the worker |
++| Pipeline live figures | `GET /v1/pipelines/{id}/live` | viewer | what the pipeline's worker shows now, answered from the memory of the node that holds its lease: phase, positions, lag and what lake readers see (`fresh_as_of`); the source's detail, read every heartbeat (PostgreSQL: the slot, the WAL it holds against `max_slot_wal_keep_size`, its confirmed position, the publication; MySQL/MariaDB: the server's position and binlog expiry); each table's state (`streaming`, `snapshot`, `halted`, or `copied`: a `dump_*` table whose copy ended, or a `dump_initial` one the sink had at the start, which isn't streamed; a snapshot job's table outside the config is listed while it copies), changes since the worker started and in the last minute, last commit and Delta version, the last MERGE's files rewritten against the table's files, freshness, and `stale` (older than the lag target while the pipeline should be replicating: running, reconnecting, retrying or in error; never while paused, stopped or starting, nor for a halted or `copied` table or one being copied; through a source outage `fresh_as_of` keeps the last time readers were caught up). Another node asks the holder with the caller's credentials: `409` no node holds the lease, `503` a holder it can't ask, `502`/`504` no answer, `421` a forwarded request to a node that no longer runs the worker |
+ | Table detail | `GET /v1/pipelines/{id}/tables/{table}` | viewer | a table, named as its config key: the worker's figures of it, its halt and since when, the Delta table's location, version, files, bytes and rows (read on request by the node asked, kept 30 s), its columns at the source against Delta's (kept, soft-dropped, not yet added, lineage), and the snapshot jobs that copied it. `404` when the pipeline has no trace of the table |
+ | All tables | `GET /v1/tables` | viewer | every pipeline's tables, worst first, as each holder's worker shows them, listed as `halted`, `stale`, `snapshot`, `costly` (the last MERGE rewrote over half the table's files), `streaming` or `copied`, with counts; filters `state` (several, comma-separated), `pipeline`, `q`; a pipeline whose holder can't be asked lists its halted tables from storage and is named under `unreachable` |
+ | Request snapshot | `POST /v1/pipelines/{id}/snapshots` | operator | tables list (the per-table config keys), no globs; refused (`409`) unless the desired state is `RUNNING` and a node holds the lease, as a restart (`ERROR` included), or while an unfinished job holds one of the tables; `202` with the job's id. The job runs in a restarted worker. It upserts: a row deleted at the source before the job stays, unless the job is asked with `truncate: true`, which empties each sink table first. A pipeline keeps its 100 newest ended jobs |
+````
+
 ## File Structure
 
 | File | Responsibility |
@@ -5147,6 +5172,13 @@ git commit -m "test(e2e): a pipeline's tables and figures through any node — l
   - The sources' `detail` tests passed on PostgreSQL 18 and on the three MySQL targets.
   - The site built, with a clean link check.
   - The plan's 61 diff blocks applied in order on `1a65b1d` and gave the verified tree.
+- At execution, on the branch after the whole-branch review's fixes (`e6548d7`):
+  - `cargo test --workspace`: 1719 passed. fmt and both clippy runs are clean.
+  - The site built, with a clean link check.
+  - The E2E suite, 55 scenarios each, at `ea69b9b` (the fix wave before its last commit):
+    PostgreSQL 18 (819 s), MySQL 8.4 with GTIDs (763 s), MySQL 8.4 in file/position mode (708 s)
+    and MariaDB 11.8 (695 s) passed. At `e6548d7` (that last commit: the table page's read and
+    wording), the console scenario passed on the four (79–82 s each).
 - Then, on Oleksii's request: the whole-branch review and its fixes, the push, and the PR.
 
 ## Deviations during execution
@@ -5442,3 +5474,61 @@ Expected: no output from the first three; every test passes. The OpenAPI documen
 git add crates/data-avalanche-api/src/live.rs crates/data-avalanche-pipeline/src/session.rs crates/data-avalanche-pipeline/src/status.rs crates/data-avalanche-pipeline/src/worker.rs
 git commit -m "fix(api): a dump that ended is listed copied, a copy that ended isn't listed"
 ```
+
+### Task 6: the plan's text, and a fix round
+
+- The regenerated Task 6's `git add` left out `Cargo.lock`, which the task changes (it adds
+  `arrow-schema`, and `data-avalanche-testkit` as a dev-dependency). The commit includes it.
+- Step 2 built and failed at run time (the route table's test), as in Task 5, not at the build.
+- The review found the route's `{table}` path parameter missing from the OpenAPI document and the
+  site's reference: the generator documented only `id`, `job_id`, `node` and `generation`, and its
+  test checked only three of them. The fix round (`fix(api): the table's page documents its table
+  path parameter`) declares `table`, and the test now checks every route's path parameters against
+  its path, in order.
+
+### Task 7: the plan's text
+
+- Step 2 failed at the build (the tests' imports come with Step 3's diff), not on `404`.
+
+### The whole-branch review and its fix wave
+
+The whole-branch review found three Important issues and a few smaller ones. Oleksii approved
+every recommended fix, spec patch S-M13d.3, and then a fix for the retry gap the fix wave
+reported. A scoped re-review confirmed each; one new issue it found (a panicking read) was fixed
+in a last commit, and checked.
+
+- **A holder without a worker** (D-M13d.6). A stopped pipeline keeps its lease without a worker,
+  and a starting one has none yet: `/live` listed no tables, so the halts left `GET /v1/tables`.
+  Without a worker, `/live` now lists the pipeline's halts from storage, as `halted` rows; when
+  they can't be read either, it answers `503`, and `GET /v1/tables` lists the pipeline from
+  storage or names it under `unreachable`. Live rows and stored rows share one shape, the halt's
+  `at` included.
+- **Freshness through an outage** (D-M13d.5, S-M13d.3). A reconnect cleared the pending start,
+  so `fresh_as_of` read "now" and nothing was ever stale while the source was down.
+  - The worker keeps what a reconnect left pending (`WorkerStatus::left_pending`) and the last
+    time it was caught up (`caught_up_at`); `replication_lag_seconds` keeps its meaning.
+  - The controller carries both over its lease term, as it carries the lag (`Lag`), and publishes
+    them as `ControllerStatus::{pending_since_micros, caught_up_at}`: a retry's new worker keeps
+    the pipeline's freshness. A failover or a restart of the node starts over.
+  - `fresh_as_of` is the term's pending start; else now while the worker streams; else the term's
+    `caught_up_at`; else none. A streaming table is `stale` while the pipeline should be
+    replicating (running, reconnecting, retrying, in error) and that is over `FRESH_WITHIN` old;
+    never while paused, stopped or starting.
+- **The table page's Delta read** (D-M13d.7). It had no time bound and concurrent misses each
+  read. It is bounded by `FACTS_WITHIN` (10 s; `delta_error` says so, and the read ends in the
+  background and fills the cache), and one read per table and generation runs at a time; its
+  entry goes however the read ends, a panic included.
+- **Columns** (D-M13d.8): `not_in_delta` when the Delta table doesn't exist, `unknown` when it
+  couldn't be read, never a guessed `kept`.
+- **`unreachable`** (D-M13d.9): every entry carries `pipeline`, `code`, `error` and `node`; a
+  holder's error is kept beside a failed storage read. The holders are asked out of order
+  (`buffer_unordered`), the rows sorted after.
+- **Cost** (D-M13d.4): a snapshot's commit no longer sets a table's cost, so a re-snapshot doesn't
+  list it `costly`.
+- **A 1.0 halt's `since`** (D-M13d.2): a halt recorded again for the same reason keeps the time it
+  has, none included, so a halt from before 1.1.0 keeps no time.
+- **The detail read** (D-M13d.3): it holds up neither the watchdog nor the guard inside the
+  session; at the source both share the catalog connection, so a slow detail query can delay one
+  guard reading by up to `timeouts.command` (a timeout counts as an answer).
+- The runbook says all of it, with every answer code each route gives.
+
