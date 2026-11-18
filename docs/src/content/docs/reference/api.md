@@ -204,6 +204,23 @@ Least role: `viewer`.
 | `400` | a table name not in the source's form |
 | `404` | no such pipeline, or no trace of the table in it |
 
+## tables
+
+Every pipeline's tables, each as its lease holder's worker shows it now.
+
+### `GET /v1/tables`
+
+Every pipeline's tables, worst first, as each lease holder's worker shows them: by listed state (halted, stale, snapshot, costly, streaming, copied), pipeline, and text in the name; a pipeline whose holder can't be asked lists its halted tables from storage and is named under `unreachable`
+
+Least role: `viewer`.
+
+
+| Status | When |
+|---|---|
+| `200` | the tables, with counts by listed state |
+| `400` | a parameter that isn't one, or a state that isn't |
+| `404` | no such pipeline in the generation this node runs |
+
 ## snapshots
 
 Snapshot jobs started through the API.

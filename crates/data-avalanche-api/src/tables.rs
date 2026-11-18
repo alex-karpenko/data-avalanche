@@ -1,13 +1,15 @@
-//! A table's page (Admin_Console §4 Tables, D-M13d.5): what its pipeline's worker shows of it,
-//! its halt with the time it began, the Delta table's facts read on request, its columns at the
-//! source against Delta's, and the snapshot jobs that copied it.
+//! The tables (Admin_Console §4 Tables, D-M13d.5, D-M13d.7). Every pipeline's tables, each as
+//! its lease holder's worker shows it, or from storage when the holder can't be asked. A table's
+//! page: what its pipeline's worker shows of it, its halt with the time it began, the Delta
+//! table's facts read on request, its columns at the source against Delta's, and the snapshot
+//! jobs that copied it.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use arrow_schema::{Schema, SchemaRef};
-use axum::extract::{Path, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use chrono::{DateTime, Utc};
@@ -19,8 +21,10 @@ use serde_json::{Value, json};
 
 use crate::live::live;
 use crate::pipelines::{find, unavailable};
-use crate::snapshots::{jobs_of, lake, named_table, status_name, table_name, table_status};
-use crate::{Api, Node, body, starting};
+use crate::snapshots::{
+    READ_AT_ONCE, jobs_of, lake, named_table, status_name, table_name, table_status,
+};
+use crate::{Api, Failure, Node, body, starting};
 
 /// How long a table's Delta facts and columns, once read, answer for it: the table's page reads
 /// them on request, and a reload of the page within this reads nothing again.
@@ -269,17 +273,244 @@ pub(crate) async fn get(
     )
 }
 
+/// The states `GET /v1/tables` filters by, worst first: the order it lists them in. `costly` is a
+/// streaming table whose last MERGE rewrote more than half its files (D-MS.15); `copied`, a
+/// `dump_*` table that isn't streamed.
+const STATES: [&str; 6] = [
+    "halted",
+    "stale",
+    "snapshot",
+    "costly",
+    "streaming",
+    "copied",
+];
+
+/// `GET /v1/tables`'s filter: the states, the pipeline, and text the table's name holds.
+#[derive(Debug, Default)]
+struct Filter {
+    states: Vec<String>,
+    pipeline: Option<String>,
+    q: Option<String>,
+}
+
+fn filter(params: &[(String, String)]) -> Result<Filter, Failure> {
+    let bad = |why: String| Failure::new(StatusCode::BAD_REQUEST, why);
+    let mut f = Filter::default();
+    let mut seen = Vec::new();
+    for (name, value) in params {
+        if seen.contains(name) {
+            return Err(bad(format!("{name} is given twice")));
+        }
+        seen.push(name.clone());
+        let value = value.trim().to_owned();
+        match name.as_str() {
+            "state" => {
+                for s in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    if !STATES.contains(&s) {
+                        return Err(bad(format!(
+                            "state {s:?} isn't one of {}",
+                            STATES.join(", ")
+                        )));
+                    }
+                    f.states.push(s.to_owned());
+                }
+            }
+            "pipeline" => f.pipeline = Some(value),
+            "q" => f.q = Some(value.to_lowercase()).filter(|q| !q.is_empty()),
+            other => {
+                return Err(bad(format!(
+                    "unknown parameter {other:?}: the tables take state, pipeline, q"
+                )));
+            }
+        }
+    }
+    Ok(f)
+}
+
+/// The state a table is listed under: its own, `stale` for a stale one, `costly` for a streaming
+/// one whose last MERGE rewrote more than half its files. A `copied` one is neither.
+fn listed_state(t: &Value) -> &'static str {
+    let rewritten = t["files_rewritten"].as_u64();
+    let files = t["files"].as_u64();
+    match t["state"].as_str() {
+        Some("halted") => "halted",
+        _ if t["stale"] == true => "stale",
+        Some("snapshot") => "snapshot",
+        Some("copied") => "copied",
+        _ if rewritten
+            .zip(files)
+            .is_some_and(|(r, f)| f > 0 && r * 2 > f) =>
+        {
+            "costly"
+        }
+        _ => "streaming",
+    }
+}
+
+/// A pipeline's tables when its holder can't be asked: its halts, from storage.
+async fn stored(node: &Node, p: &Pipeline) -> Result<Vec<Value>, String> {
+    let docs = (node.docs)(p).map_err(|e| format!("the state location: {e}"))?;
+    let halts = docs.halts().await.map_err(|e| e.to_string())?;
+    Ok(halts
+        .tables
+        .iter()
+        .filter(|h| !h.copy)
+        .map(|h| {
+            let since = halts.since(&h.table);
+            json!({
+                "table": table_name(p, &h.table),
+                "state": "halted",
+                "halt": { "code": h.reason.code(), "detail": h.reason.to_string(), "since": since },
+                "fresh_as_of": since,
+                "stale": false,
+            })
+        })
+        .collect())
+}
+
+/// One pipeline's tables, each with its pipeline and node, and why the holder couldn't be asked.
+async fn of_pipeline(
+    node: &Node,
+    p: &Pipeline,
+    headers: &HeaderMap,
+) -> (Vec<Value>, Option<Value>) {
+    let docs = match (node.docs)(p) {
+        Ok(docs) => docs,
+        Err(e) => {
+            let why = json!({ "pipeline": p.id, "error": format!("the state location: {e}") });
+            return (vec![], Some(why));
+        }
+    };
+    let (rows, node_name, why) = match live(node, p, &docs, headers).await {
+        Ok(v) => {
+            let rows = v["tables"].as_array().cloned().unwrap_or_default();
+            (rows, v["node"].clone(), None)
+        }
+        Err(why) => match stored(node, p).await {
+            Ok(rows) => (rows, Value::Null, Some(why)),
+            Err(e) => (
+                vec![],
+                Value::Null,
+                Some(json!({ "code": why["code"], "error": e })),
+            ),
+        },
+    };
+    let rows = rows
+        .into_iter()
+        .map(|mut t| {
+            t["pipeline"] = json!(p.id);
+            t["node"] = node_name.clone();
+            t["live"] = json!(why.is_none());
+            t["listed_as"] = json!(listed_state(&t));
+            t
+        })
+        .collect();
+    let why = why.map(|mut w| {
+        w["pipeline"] = json!(p.id);
+        w
+    });
+    (rows, why)
+}
+
+/// `GET /v1/tables`: every pipeline's tables, worst first, filtered; each pipeline's holder asked
+/// [`READ_AT_ONCE`] at a time. A pipeline whose holder can't be asked lists its halted tables
+/// from storage, and is named under `unreachable` with why. `counts` are by listed state, of the
+/// tables the pipeline and `q` filters keep.
+pub(crate) async fn all(
+    State(api): State<Api>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    use futures_util::StreamExt;
+    let Some(node) = api.node.get() else {
+        return starting();
+    };
+    let params: Vec<(String, String)> =
+        url::form_urlencoded::parse(raw.unwrap_or_default().as_bytes())
+            .into_owned()
+            .collect();
+    let f = match filter(&params) {
+        Ok(f) => f,
+        Err(f) => return f.into(),
+    };
+    let config = node.coordinator.config().await;
+    let mut pipelines: Vec<Pipeline> = config
+        .pipelines
+        .values()
+        .filter(|p| f.pipeline.as_ref().is_none_or(|id| &p.id == id))
+        .cloned()
+        .collect();
+    if let Some(id) = &f.pipeline
+        && pipelines.is_empty()
+    {
+        return Failure::new(
+            StatusCode::NOT_FOUND,
+            format!("no pipeline {id:?} in the config generation this node runs"),
+        )
+        .into();
+    }
+    pipelines.sort_by(|a, b| a.id.cmp(&b.id));
+    let headers = &headers;
+    let read = futures_util::stream::iter(pipelines)
+        .map(|p| async move { of_pipeline(node, &p, headers).await })
+        .buffered(READ_AT_ONCE)
+        .collect::<Vec<_>>()
+        .await;
+    let mut tables = vec![];
+    let mut unreachable = vec![];
+    for (rows, why) in read {
+        tables.extend(rows.into_iter().filter(|t| {
+            f.q.as_ref().is_none_or(|q| {
+                t["table"]
+                    .as_str()
+                    .is_some_and(|n| n.to_lowercase().contains(q.as_str()))
+            })
+        }));
+        unreachable.extend(why);
+    }
+    let mut counts = serde_json::Map::new();
+    counts.insert("all".into(), json!(tables.len()));
+    for state in STATES {
+        let n = tables.iter().filter(|t| t["listed_as"] == state).count();
+        counts.insert(state.into(), json!(n));
+    }
+    tables.retain(|t| f.states.is_empty() || f.states.iter().any(|s| t["listed_as"] == s.as_str()));
+    let rank = |t: &Value| {
+        STATES
+            .iter()
+            .position(|s| t["listed_as"] == *s)
+            .unwrap_or(STATES.len())
+    };
+    tables.sort_by(|a, b| {
+        (rank(a), a["pipeline"].as_str(), a["table"].as_str()).cmp(&(
+            rank(b),
+            b["pipeline"].as_str(),
+            b["table"].as_str(),
+        ))
+    });
+    body(
+        StatusCode::OK,
+        &json!({
+            "as_of": Utc::now(),
+            "counts": counts,
+            "tables": tables,
+            "unreachable": unreachable,
+        }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
     use data_avalanche_cluster::{Actual, ControllerStatus};
+    use data_avalanche_core::CommitCost;
     use data_avalanche_core::position::Lsn;
     use data_avalanche_core::{
         ColumnSchema, ColumnValueType as V, HaltReason, Sink, SourcePosition, TableSpec,
     };
-    use data_avalanche_pipeline::{Phase, WorkerStatus};
-    use data_avalanche_state::{SnapshotJobDoc, TableHalt};
+    use data_avalanche_pipeline::{Phase, SnapshotProgress, TableCommit, WorkerStatus};
+    use data_avalanche_state::{Holder, SnapshotJobDoc, TableHalt};
     use tokio::sync::watch;
 
     use super::*;
@@ -453,6 +684,172 @@ mod tests {
         assert_eq!(
             (&v["live"], &v["live_error"]["code"]),
             (&Value::Null, &json!(409))
+        );
+    }
+
+    fn commit(table: &str, rewritten: u64, files: u64) -> TableCommit {
+        TableCommit {
+            table: t(table),
+            rows: 1,
+            snapshot: false,
+            version: 3,
+            cost: CommitCost {
+                files_rewritten: rewritten,
+                files: Some(files),
+            },
+            at: Utc::now(),
+        }
+    }
+
+    /// A worker 90 s behind: `items` halted, `audit` copying, `events` rewriting most of its files
+    /// (stale too: so `quiet`, caught up, is the one streaming table), `orders` stale; `dumped` a
+    /// dump that ended, its copy rewriting every file.
+    fn statuses(
+        behind: i64,
+    ) -> watch::Receiver<BTreeMap<String, watch::Receiver<ControllerStatus>>> {
+        let mut w = WorkerStatus {
+            phase: Phase::Streaming,
+            unsynced_since_micros: Some(
+                (Utc::now() - chrono::Duration::seconds(behind)).timestamp_micros(),
+            ),
+            tracked: [t("orders"), t("items"), t("events"), t("quiet")].into(),
+            copied: [t("dumped")].into(),
+            halted: [(t("items"), HaltReason::TableDropped)].into(),
+            snapshots: [(
+                t("audit"),
+                SnapshotProgress {
+                    rows_done: 1,
+                    waiting: false,
+                },
+            )]
+            .into(),
+            ..WorkerStatus::default()
+        };
+        w.committed(&commit("events", 8, 10));
+        w.committed(&commit("quiet", 1, 10));
+        w.committed(&commit("dumped", 10, 10));
+        let status = ControllerStatus {
+            actual: Some(Actual::Running),
+            owner_epoch: Some(4),
+            lease: None,
+            worker: Some(w),
+        };
+        watch::channel(BTreeMap::from([(
+            "orders".to_owned(),
+            watch::channel(status).1,
+        )]))
+        .1
+    }
+
+    fn names(v: &Value) -> Vec<(String, String)> {
+        v["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| {
+                (
+                    t["table"].as_str().unwrap().to_owned(),
+                    t["listed_as"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    /// Every table, worst first, with counts by listed state; the filters keep their tables.
+    #[tokio::test]
+    async fn every_table_is_listed_worst_first() {
+        let behind = statuses(0);
+        let (addr, _lone, _dir) =
+            served_with("http://127.0.0.1:1", open(), |n| n.statuses = behind).await;
+        let (code, _, text) = request(addr, "GET", "/v1/tables", &[], "").await;
+        assert_eq!(code, 200, "{text}");
+        let v = json(&text);
+        let pairs = |p: &[(&str, &str)]| -> Vec<(String, String)> {
+            p.iter()
+                .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
+                .collect()
+        };
+        assert_eq!(
+            names(&v),
+            pairs(&[
+                ("public.items", "halted"),
+                ("public.audit", "snapshot"),
+                ("public.events", "costly"),
+                ("public.orders", "streaming"),
+                ("public.quiet", "streaming"),
+                ("public.dumped", "copied"),
+            ])
+        );
+        assert_eq!(v["tables"][0]["pipeline"], "orders");
+        assert_eq!(v["tables"][0]["node"], "node-a");
+        assert_eq!(
+            v["counts"],
+            json!({
+                "all": 6, "halted": 1, "stale": 0, "snapshot": 1, "costly": 1, "streaming": 2,
+                "copied": 1
+            })
+        );
+        assert_eq!(v["unreachable"], json!([]));
+        let (_, _, text) =
+            request(addr, "GET", "/v1/tables?state=halted,costly&q=EVE", &[], "").await;
+        assert_eq!(names(&json(&text)), pairs(&[("public.events", "costly")]));
+        let (code, _, _) = request(addr, "GET", "/v1/tables?state=gone", &[], "").await;
+        assert_eq!(code, 400);
+        let (code, _, _) = request(addr, "GET", "/v1/tables?pipeline=nope", &[], "").await;
+        assert_eq!(code, 404);
+    }
+
+    /// Past the lag target while streaming, a table is stale, listed after the halted ones.
+    #[tokio::test]
+    async fn a_table_behind_the_target_is_stale() {
+        let behind = statuses(90);
+        let (addr, _lone, _dir) =
+            served_with("http://127.0.0.1:1", open(), |n| n.statuses = behind).await;
+        let (_, _, text) = request(addr, "GET", "/v1/tables?state=stale", &[], "").await;
+        let v = json(&text);
+        let stale: Vec<String> = names(&v).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(stale, ["public.events", "public.orders", "public.quiet"]);
+        assert_eq!(v["counts"]["stale"], 3);
+    }
+
+    /// A holder that can't be asked: the pipeline's halted tables come from storage, and the
+    /// pipeline is named under `unreachable` with why.
+    #[tokio::test]
+    async fn a_pipeline_whose_holder_can_t_be_asked_lists_its_halts() {
+        let (addr, lone, _dir) = served("http://127.0.0.1:1", open()).await;
+        let docs = (lone.node.docs)(&config().pipelines["orders"]).unwrap();
+        docs.record_halt(&TableHalt {
+            table: t("items"),
+            reason: HaltReason::TableDropped,
+            at: SourcePosition::Pg(Lsn(0x20)),
+            copy: false,
+        })
+        .await
+        .unwrap();
+        let holder = Holder {
+            node_id: "node-z".into(),
+            incarnation: 1,
+        };
+        lone.leases
+            .acquire("orders", &holder, Duration::from_secs(30), Utc::now())
+            .await
+            .unwrap();
+        let (code, _, text) = request(addr, "GET", "/v1/tables", &[], "").await;
+        assert_eq!(code, 200, "{text}");
+        let v = json(&text);
+        assert_eq!(
+            names(&v),
+            [("public.items".to_owned(), "halted".to_owned())]
+        );
+        assert_eq!(v["tables"][0]["live"], false);
+        assert!(v["tables"][0]["fresh_as_of"].is_string(), "{v}");
+        assert_eq!(
+            (
+                &v["unreachable"][0]["pipeline"],
+                &v["unreachable"][0]["code"],
+                &v["unreachable"][0]["node"]
+            ),
+            (&json!("orders"), &json!(503), &json!("node-z"))
         );
     }
 }

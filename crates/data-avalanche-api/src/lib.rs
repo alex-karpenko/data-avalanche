@@ -388,6 +388,20 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
             get(tables::get),
         ),
         (
+            r(
+                "GET",
+                "/v1/tables",
+                Viewer,
+                "Every pipeline's tables, worst first, as each lease holder's worker shows them: by listed state (halted, stale, snapshot, costly, streaming, copied), pipeline, and text in the name; a pipeline whose holder can't be asked lists its halted tables from storage and is named under `unreachable`",
+                &[
+                    (200, "the tables, with counts by listed state"),
+                    (400, "a parameter that isn't one, or a state that isn't"),
+                    (404, "no such pipeline in the generation this node runs"),
+                ],
+            ),
+            get(tables::all),
+        ),
+        (
             act(
                 "pipeline.pause",
                 "pause",
@@ -948,6 +962,7 @@ mod tests {
                 ("GET", "/v1/pipelines/{id}", Viewer),
                 ("GET", "/v1/pipelines/{id}/live", Viewer),
                 ("GET", "/v1/pipelines/{id}/tables/{table}", Viewer),
+                ("GET", "/v1/tables", Viewer),
                 ("POST", "/v1/pipelines/{id}/pause", Operator),
                 ("POST", "/v1/pipelines/{id}/stop", Operator),
                 ("POST", "/v1/pipelines/{id}/resume", Operator),

@@ -13,6 +13,10 @@ const TAGS: &[(&str, &str)] = &[
         "pipelines",
         "Pipelines: their state, and the lifecycle commands.",
     ),
+    (
+        "tables",
+        "Every pipeline's tables, each as its lease holder's worker shows it now.",
+    ),
     ("snapshots", "Snapshot jobs started through the API."),
     (
         "config",
