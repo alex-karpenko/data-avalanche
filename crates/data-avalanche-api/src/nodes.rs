@@ -428,113 +428,25 @@ pub(crate) async fn files(State(api): State<Api>, headers: HeaderMap) -> Respons
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use axum::Router;
     use axum::http::Uri;
-    use data_avalanche_cluster::{Member, Members, NodeMeta, file_hash};
+    use data_avalanche_cluster::file_hash;
     use data_avalanche_config::{
         FingerprintKey, Origin, Pem, Secret, TlsIdentity, text_fingerprint,
     };
     use data_avalanche_state::{EventDoc, EventQuery, Events, config_hash};
-    use tempfile::TempDir;
     use tokio::sync::watch;
 
     use super::*;
     use crate::peers::{ANSWERED_BY, Peers, TARGET};
     use crate::test_support::{
-        CONFIG, Issuer, Lone, USERNAME_CLAIM, api, lone, lone_with, open, request, serve,
+        CONFIG, Issuer, Log, Seen, USERNAME_CLAIM, api, fake, lone_with, member, open, request,
+        serve, served,
     };
     use crate::{Auth, Stop};
-
-    /// What a fake node saw of one request.
-    #[derive(Debug, Clone)]
-    struct Seen {
-        method: Method,
-        uri: String,
-        authorization: Option<String>,
-        target: Option<String>,
-        forwarded_by: Option<String>,
-        body: String,
-    }
-
-    type Log = Arc<Mutex<Vec<Seen>>>;
-
-    /// A fake node: answers every request `202 {"node": "node-b"}` after `delay`, keeping what it
-    /// saw.
-    async fn fake(delay: Duration) -> (String, Log) {
-        let log: Log = Arc::default();
-        let kept = Arc::clone(&log);
-        let app = Router::new().fallback(
-            move |method: Method, uri: Uri, headers: HeaderMap, bytes: Bytes| {
-                let kept = Arc::clone(&kept);
-                async move {
-                    let h = |n: &str| headers.get(n).map(|v| v.to_str().unwrap().to_owned());
-                    kept.lock().unwrap().push(Seen {
-                        method,
-                        uri: uri.to_string(),
-                        authorization: h("authorization"),
-                        target: h(TARGET),
-                        forwarded_by: h(FORWARDED_BY),
-                        body: String::from_utf8(bytes.to_vec()).unwrap(),
-                    });
-                    tokio::time::sleep(delay).await;
-                    body(StatusCode::ACCEPTED, &json!({ "node": "node-b" }))
-                }
-            },
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (url, log)
-    }
-
-    fn member(api_url: &str, phase: Phase) -> Member {
-        Member {
-            addr: "127.0.0.1:7946".parse().unwrap(),
-            incarnation: 1_731_600_000_000,
-            meta: NodeMeta {
-                phase,
-                config_generation: 1,
-                build: "1.1.0".into(),
-                api_url: api_url.into(),
-                file_hash: file_hash(&FingerprintKey::from_bytes([1; 32]), CONFIG),
-            },
-            suspect: false,
-        }
-    }
-
-    /// node-a's API under `auth`; its view holds itself at its own address and node-b at
-    /// `b_url`.
-    async fn served(b_url: &str, auth: Arc<Auth>) -> (SocketAddr, Lone, TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("config.yaml");
-        std::fs::write(&file, CONFIG).unwrap();
-        let mut lone = lone(file).await;
-        let (view, members) = watch::channel(Members {
-            me: "node-a".into(),
-            nodes: Default::default(),
-        });
-        lone.node.members = members;
-        let a = api(auth);
-        a.node.set(lone.node.clone()).unwrap();
-        let addr = serve(a).await;
-        view.send_replace(Members {
-            me: "node-a".into(),
-            nodes: [
-                (
-                    "node-a".to_owned(),
-                    member(&format!("http://{addr}"), Phase::Active),
-                ),
-                ("node-b".to_owned(), member(b_url, Phase::Active)),
-            ]
-            .into(),
-        });
-        std::mem::forget(view);
-        (addr, lone, dir)
-    }
 
     fn json(text: &str) -> Value {
         serde_json::from_str(text).unwrap_or_else(|e| panic!("{e}: {text}"))

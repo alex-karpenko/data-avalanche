@@ -41,7 +41,7 @@ pub(crate) fn job_pipeline(job_id: &str) -> Option<&str> {
 }
 
 /// A table as the request and the answers name it: the source's per-table config key.
-fn table_name(p: &Pipeline, t: &TableRef) -> String {
+pub(crate) fn table_name(p: &Pipeline, t: &TableRef) -> String {
     match p.source.kind {
         SourceType::Postgres => t.to_string(),
         SourceType::Mysql => t.name.clone(),

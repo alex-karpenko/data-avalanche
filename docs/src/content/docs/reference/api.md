@@ -67,6 +67,24 @@ Least role: `operator`.
 | `413` | the body is over 1 MiB |
 | `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
 
+### `GET /v1/pipelines/{id}/live`
+
+What the pipeline's worker shows now, from the node that runs it: its phase, lag, source detail, and each table's state, figures and freshness; another node asks the lease holder
+
+Least role: `viewer`.
+
+- Path parameter `id`: the pipeline's id.
+
+| Status | When |
+|---|---|
+| `200` | the worker's figures |
+| `404` | no such pipeline in the generation this node runs |
+| `409` | no node holds the lease |
+| `421` | a forwarded request to a node that doesn't run the worker |
+| `502` | the holder didn't answer |
+| `503` | the node is starting or stopping, or its state can't be read; or the holder can't be asked: not a member, or no API address |
+| `504` | the holder didn't answer in time |
+
 ### `POST /v1/pipelines/{id}/pause`
 
 Pause: flush to a transaction boundary, then read nothing; the connection and the lease stay

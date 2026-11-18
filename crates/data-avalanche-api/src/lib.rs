@@ -15,6 +15,7 @@ mod config;
 mod events;
 mod generations;
 mod limit;
+mod live;
 mod nodes;
 mod openapi;
 mod peers;
@@ -24,6 +25,7 @@ mod snapshots;
 #[cfg(test)]
 mod test_support;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -34,7 +36,9 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, get, post};
-use data_avalanche_cluster::{ConfigCoordinator, DocsFn, GossipFigures, Members, Recorder};
+use data_avalanche_cluster::{
+    ConfigCoordinator, ControllerStatus, DocsFn, GossipFigures, Members, Recorder,
+};
 use data_avalanche_config::Role;
 use data_avalanche_state::{Events, Leases};
 use data_avalanche_telemetry::{CONTENT_TYPE, Metrics, ProcessFigures};
@@ -45,6 +49,7 @@ pub use actions::{DENIALS_BURST, MAX_ERROR, MAX_NOTE, MAX_TARGET, Recorded, note
 pub use auth::{Auth, FETCH_TIMEOUT, KEYS_MAX_AGE, MAX_KEY_DOCUMENT, Principal, REFETCH_AFTER};
 pub use cluster::{Control, Stop};
 pub use limit::{RateLimit, VALIDATE_BURST, VALIDATE_PER_SECOND};
+pub use live::FRESH_WITHIN;
 pub use openapi::openapi;
 pub use peers::{
     ACTION_LIMIT, ANSWERED_BY, DETAIL_LIMIT, FORWARDED_BY, MAX_ANSWER, Peers, PeersError,
@@ -95,6 +100,9 @@ pub struct Node {
     pub gossip: watch::Receiver<GossipFigures>,
     /// The ended snapshot jobs `GET /v1/snapshots` read: they don't change.
     pub ended_jobs: Arc<EndedJobs>,
+    /// The status of each pipeline this node's controllers run: the lease holder answers a
+    /// pipeline's live figures from it (Admin_Console §4).
+    pub statuses: watch::Receiver<BTreeMap<String, watch::Receiver<ControllerStatus>>>,
 }
 
 impl std::fmt::Debug for Node {
@@ -334,6 +342,30 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
                 &[(200, "the pipeline"), UNKNOWN],
             ),
             get(pipelines::get),
+        ),
+        (
+            r(
+                "GET",
+                "/v1/pipelines/{id}/live",
+                Viewer,
+                "What the pipeline's worker shows now, from the node that runs it: its phase, lag, source detail, and each table's state, figures and freshness; another node asks the lease holder",
+                &[
+                    (200, "the worker's figures"),
+                    UNKNOWN,
+                    (409, "no node holds the lease"),
+                    (
+                        421,
+                        "a forwarded request to a node that doesn't run the worker",
+                    ),
+                    (502, "the holder didn't answer"),
+                    (
+                        503,
+                        "the holder can't be asked: not a member, or no API address",
+                    ),
+                    (504, "the holder didn't answer in time"),
+                ],
+            ),
+            get(live::get),
         ),
         (
             act(
@@ -894,6 +926,7 @@ mod tests {
                 ("GET", "/v1/cluster/status", Viewer),
                 ("GET", "/v1/pipelines", Viewer),
                 ("GET", "/v1/pipelines/{id}", Viewer),
+                ("GET", "/v1/pipelines/{id}/live", Viewer),
                 ("POST", "/v1/pipelines/{id}/pause", Operator),
                 ("POST", "/v1/pipelines/{id}/stop", Operator),
                 ("POST", "/v1/pipelines/{id}/resume", Operator),
