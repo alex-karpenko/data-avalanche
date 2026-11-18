@@ -5,7 +5,7 @@
 //! jobs that copied it.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arrow_schema::{Schema, SchemaRef};
@@ -13,10 +13,13 @@ use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use chrono::{DateTime, Utc};
+use data_avalanche_cluster::WorkerFactory;
 use data_avalanche_config::{Pipeline, SourceType};
 use data_avalanche_core::{
     INTERNAL_COLUMN_PREFIX, LINEAGE_COLUMNS, LOGICAL_TAG, TableFacts, TableRef, TableSchema,
 };
+use futures_util::FutureExt;
+use futures_util::future::{BoxFuture, Shared};
 use serde_json::{Value, json};
 
 use crate::live::live;
@@ -30,6 +33,10 @@ use crate::{Api, Failure, Node, body, starting};
 /// them on request, and a reload of the page within this reads nothing again.
 pub const FACTS_FOR: Duration = Duration::from_secs(30);
 
+/// How long the table's page waits for its Delta read: past it the page answers without the
+/// facts (`delta_error`), and the read goes on, kept for the next request once it ends.
+pub const FACTS_WITHIN: Duration = Duration::from_secs(10);
+
 /// What the sink holds of a table, read at `at`.
 #[derive(Debug, Clone)]
 struct Read {
@@ -41,13 +48,39 @@ struct Read {
     kept: Instant,
 }
 
-/// The tables' Delta facts and columns this node read, each kept [`FACTS_FOR`].
-#[derive(Debug, Default)]
+/// A read in flight, shared by every request that finds nothing kept.
+type Reading = Shared<BoxFuture<'static, Result<Read, String>>>;
+
+/// A read's key: the pipeline, the table, and the config generation it is read under.
+type Key = (String, TableRef, u64);
+
+/// The tables' Delta facts and columns this node read, each kept [`FACTS_FOR`], and the reads in
+/// flight: one per table and generation, whoever waits for it.
+#[derive(Debug)]
 pub struct Lake {
     read: Mutex<HashMap<(String, TableRef), Read>>,
+    reading: Mutex<HashMap<Key, Reading>>,
+    /// How long a request waits for a read: [`FACTS_WITHIN`].
+    within: Duration,
+}
+
+impl Default for Lake {
+    fn default() -> Self {
+        Self::with_bound(FACTS_WITHIN)
+    }
 }
 
 impl Lake {
+    /// A lake whose requests wait `within` for a read.
+    #[must_use]
+    pub fn with_bound(within: Duration) -> Self {
+        Self {
+            read: Mutex::default(),
+            reading: Mutex::default(),
+            within,
+        }
+    }
+
     fn kept(&self, id: &str, table: &TableRef, generation: u64) -> Option<Read> {
         let read = self.read.lock().expect("the lake's reads");
         read.get(&(id.to_owned(), table.clone()))
@@ -61,11 +94,13 @@ impl Lake {
         read.insert((id.to_owned(), table.clone()), r);
     }
 
-    /// The sink's facts and columns of `table`: kept ones while fresh, else read through a sink
-    /// built for the pipeline now. A failed read isn't kept.
+    /// The sink's facts and columns of `table`: kept ones while fresh, else the read in flight,
+    /// else a new one through a sink built for the pipeline now. A request waits for it
+    /// [`FACTS_WITHIN`]; the read runs on its own task, so neither the bound nor a dropped request
+    /// ends it, and it is kept when it ends. A failed read isn't kept.
     async fn read(
-        &self,
-        node: &Node,
+        self: &Arc<Self>,
+        factory: &Arc<dyn WorkerFactory>,
         p: &Pipeline,
         table: &TableRef,
         generation: u64,
@@ -73,19 +108,75 @@ impl Lake {
         if let Some(r) = self.kept(&p.id, table, generation) {
             return Ok(r);
         }
-        let sink = node.factory.build(p)?.sink;
-        let at = Utc::now();
-        let (facts, state) = tokio::join!(sink.facts(table), sink.table_state(table));
-        let r = Read {
-            facts: facts.map_err(|e| e.to_string())?,
-            schema: state.map_err(|e| e.to_string())?.schema,
-            at,
-            generation,
-            kept: Instant::now(),
-        };
-        self.keep(&p.id, table, r.clone());
-        Ok(r)
+        let reading = self.reading(factory, p, table, generation);
+        tokio::time::timeout(self.within, reading)
+            .await
+            .unwrap_or_else(|_| Err(format!("not read within {} s", self.within.as_secs_f64())))
     }
+
+    /// The read of `table` in flight, started when none is.
+    fn reading(
+        self: &Arc<Self>,
+        factory: &Arc<dyn WorkerFactory>,
+        p: &Pipeline,
+        table: &TableRef,
+        generation: u64,
+    ) -> Reading {
+        let key = (p.id.clone(), table.clone(), generation);
+        let mut reading = self.reading.lock().expect("the lake's reads in flight");
+        if let Some(r) = reading.get(&key) {
+            return r.clone();
+        }
+        let (lake, factory, p, table) = (
+            Arc::clone(self),
+            Arc::clone(factory),
+            p.clone(),
+            table.clone(),
+        );
+        let ended = key.clone();
+        let task = tokio::spawn(async move {
+            let r = read_sink(&*factory, &p, &table, generation).await;
+            // Kept before the read leaves the flight: a request in between finds one or the
+            // other, and never reads again.
+            if let Ok(r) = &r {
+                lake.keep(&p.id, &table, r.clone());
+            }
+            lake.reading
+                .lock()
+                .expect("the lake's reads in flight")
+                .remove(&ended);
+            r
+        });
+        let shared = async move {
+            task.await
+                .unwrap_or_else(|e| Err(format!("the read ended: {e}")))
+        }
+        .boxed()
+        .shared();
+        reading.insert(key, shared.clone());
+        shared
+    }
+}
+
+/// `table`'s facts and columns through a sink built for `p` now. The columns come from the
+/// table's state: the facts don't carry them, and a [`data_avalanche_core::Sink`] that read both
+/// from one snapshot would need a method of its own.
+async fn read_sink(
+    factory: &dyn WorkerFactory,
+    p: &Pipeline,
+    table: &TableRef,
+    generation: u64,
+) -> Result<Read, String> {
+    let sink = factory.build(p)?.sink;
+    let at = Utc::now();
+    let (facts, state) = tokio::join!(sink.facts(table), sink.table_state(table));
+    Ok(Read {
+        facts: facts.map_err(|e| e.to_string())?,
+        schema: state.map_err(|e| e.to_string())?.schema,
+        at,
+        generation,
+        kept: Instant::now(),
+    })
 }
 
 /// The type Delta's column has, as the sink records it: its logical tag, else its Arrow type.
@@ -96,10 +187,21 @@ fn delta_type(f: &arrow_schema::Field) -> String {
         .unwrap_or_else(|| f.data_type().to_string())
 }
 
+/// What the table's page knows of Delta's columns.
+#[derive(Debug, Clone, Copy)]
+enum DeltaColumns<'a> {
+    /// The read failed or ran past its bound.
+    Unread,
+    /// The read found no Delta table.
+    Absent,
+    Read(&'a Schema),
+}
+
 /// The table's columns at the source (the pipeline's cached schema) against Delta's: the source's
 /// in order, then the ones only Delta has (`soft_dropped`: kept, written NULL), then the lineage
-/// columns. MySQL compares names without case (DA-SRC-25).
-fn columns(source: Option<&TableSchema>, delta: Option<&Schema>, fold: bool) -> Vec<Value> {
+/// columns. A source column Delta lacks, or Delta has no table yet, is `not_in_delta`; with
+/// Delta unread, `unknown`. MySQL compares names without case (DA-SRC-25).
+fn columns(source: Option<&TableSchema>, delta: DeltaColumns<'_>, fold: bool) -> Vec<Value> {
     let same = |a: &str, b: &str| {
         if fold {
             a.eq_ignore_ascii_case(b)
@@ -107,19 +209,25 @@ fn columns(source: Option<&TableSchema>, delta: Option<&Schema>, fold: bool) -> 
             a == b
         }
     };
-    let fields: Vec<&arrow_schema::Field> = delta
-        .map(|s| s.fields().iter().map(AsRef::as_ref).collect())
-        .unwrap_or_default();
+    let fields: Vec<&arrow_schema::Field> = match delta {
+        DeltaColumns::Read(s) => s.fields().iter().map(AsRef::as_ref).collect(),
+        DeltaColumns::Unread | DeltaColumns::Absent => vec![],
+    };
     let field = |name: &str| fields.iter().find(|f| same(f.name(), name)).copied();
     let mut out = vec![];
     for c in source.map(TableSchema::columns).unwrap_or_default() {
         let f = field(&c.name);
+        let state = match (delta, f) {
+            (DeltaColumns::Unread, _) => "unknown",
+            (_, Some(_)) => "kept",
+            (_, None) => "not_in_delta",
+        };
         out.push(json!({
             "name": c.name,
             "source": c.source_type,
             "delta": f.map(delta_type),
             "key": source.is_some_and(|s| s.identifier().iter().any(|k| k == &c.name)),
-            "state": if f.is_some() || delta.is_none() { "kept" } else { "not_in_delta" },
+            "state": state,
         }));
     }
     let lineage = |n: &str| LINEAGE_COLUMNS.contains(&n);
@@ -172,7 +280,7 @@ pub(crate) async fn get(
         docs.halts(),
         docs.table_schema(&table),
         jobs_of(node, &p),
-        node.lake.read(node, &p, &table, generation),
+        node.lake.read(&node.factory, &p, &table, generation),
     );
     let (halts, cached) = match (halts, cached) {
         (Ok(h), Ok(c)) => (h, c.map(|v| v.doc)),
@@ -214,7 +322,7 @@ pub(crate) async fn get(
         ),
         Err(e) => (None, Some(e.clone())),
     };
-    let sink_schema = lake_read.as_ref().ok().and_then(|r| r.schema.clone());
+    let sink_schema = lake_read.as_ref().ok().map(|r| r.schema.clone());
     let copied: Vec<Value> = jobs
         .iter()
         .rev()
@@ -249,6 +357,11 @@ pub(crate) async fn get(
         );
     }
     let fold = p.source.kind == SourceType::Mysql;
+    let delta_columns = match &sink_schema {
+        None => DeltaColumns::Unread,
+        Some(None) => DeltaColumns::Absent,
+        Some(Some(s)) => DeltaColumns::Read(s),
+    };
     body(
         StatusCode::OK,
         &json!({
@@ -267,7 +380,7 @@ pub(crate) async fn get(
             })),
             "delta": delta,
             "delta_error": delta_error,
-            "columns": columns(cached.as_ref(), sink_schema.as_deref(), fold),
+            "columns": columns(cached.as_ref(), delta_columns, fold),
             "jobs": copied,
         }),
     )
@@ -489,14 +602,19 @@ pub(crate) async fn all(
 mod tests {
     use std::collections::BTreeMap;
 
-    use data_avalanche_cluster::{Actual, ControllerStatus};
-    use data_avalanche_core::CommitCost;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use data_avalanche_cluster::{Actual, ControllerStatus, Parts, WorkerFactory};
     use data_avalanche_core::position::Lsn;
     use data_avalanche_core::{
-        ColumnSchema, ColumnValueType as V, HaltReason, Sink, SourcePosition, TableSpec,
+        ColumnSchema, ColumnValueType as V, CommitCost, CommitMarker, CommitOutcome, EvolveOutcome,
+        HaltReason, SchemaDelta, Sink, SinkCapabilities, SinkError, SinkKind, SinkTableState,
+        SourcePosition, TableChangeSet, TableSpec,
     };
     use data_avalanche_pipeline::{Phase, SnapshotProgress, TableCommit, WorkerStatus};
     use data_avalanche_state::{Holder, SnapshotJobDoc, TableHalt};
+    use data_avalanche_testkit::{FakeSource, MemorySink, SinkOp};
     use tokio::sync::watch;
 
     use super::*;
@@ -634,6 +752,202 @@ mod tests {
         let old = Instant::now().checked_sub(FACTS_FOR).unwrap();
         lake.keep("orders", &t("b"), read(old));
         assert!(lake.kept("orders", &t("b"), 1).is_none(), "expired");
+    }
+
+    /// A sink whose table reads wait until `gate` opens; its factory counts the sinks it builds.
+    #[derive(Debug)]
+    struct Gated {
+        sink: MemorySink,
+        gate: watch::Receiver<bool>,
+        builds: Arc<AtomicUsize>,
+    }
+
+    impl Gated {
+        async fn open(&self) {
+            let mut gate = self.gate.clone();
+            let _ = gate.wait_for(|open| *open).await;
+        }
+    }
+
+    impl WorkerFactory for Gated {
+        fn build(&self, _: &Pipeline) -> Result<Parts, String> {
+            self.builds.fetch_add(1, Ordering::SeqCst);
+            Ok(Parts {
+                source: Arc::new(FakeSource::new(vec![])),
+                sink: Arc::new(Gated {
+                    sink: self.sink.clone(),
+                    gate: self.gate.clone(),
+                    builds: Arc::clone(&self.builds),
+                }),
+                hooks: Arc::new(data_avalanche_pipeline::NoHooks),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Sink for Gated {
+        fn kind(&self) -> SinkKind {
+            self.sink.kind()
+        }
+        fn capabilities(&self) -> &SinkCapabilities {
+            self.sink.capabilities()
+        }
+        async fn table_state(&self, table: &TableRef) -> Result<SinkTableState, SinkError> {
+            self.open().await;
+            self.sink.table_state(table).await
+        }
+        async fn facts(&self, table: &TableRef) -> Result<Option<TableFacts>, SinkError> {
+            self.open().await;
+            self.sink.facts(table).await
+        }
+        async fn held_tables(&self) -> Result<Vec<TableRef>, SinkError> {
+            self.sink.held_tables().await
+        }
+        async fn ensure_table(&self, spec: &TableSpec) -> Result<(), SinkError> {
+            self.sink.ensure_table(spec).await
+        }
+        async fn evolve(
+            &self,
+            table: &TableRef,
+            delta: &SchemaDelta,
+            owner_epoch: u64,
+        ) -> Result<EvolveOutcome, SinkError> {
+            self.sink.evolve(table, delta, owner_epoch).await
+        }
+        async fn commit(
+            &self,
+            cs: TableChangeSet,
+            marker: CommitMarker,
+        ) -> Result<CommitOutcome, SinkError> {
+            self.sink.commit(cs, marker).await
+        }
+    }
+
+    /// A node whose sink reads wait for the returned gate, its lake reads bounded by `bound`;
+    /// `public.orders` is cached and in the sink. The counter is the sinks built.
+    async fn gated(
+        bound: Duration,
+    ) -> (
+        std::net::SocketAddr,
+        crate::test_support::Lone,
+        tempfile::TempDir,
+        watch::Sender<bool>,
+        Arc<AtomicUsize>,
+    ) {
+        let (gate, opened) = watch::channel(false);
+        let builds = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&builds);
+        let (addr, lone, dir) = served_with("http://127.0.0.1:1", open(), |n| {
+            n.factory = Arc::new(Gated {
+                sink: MemorySink::new(),
+                gate: opened,
+                builds: counted,
+            });
+            n.lake = Arc::new(Lake::with_bound(bound));
+        })
+        .await;
+        (addr, lone, dir, gate, builds)
+    }
+
+    async fn page(addr: std::net::SocketAddr, table: &str) -> (u16, Value) {
+        let path = format!("/v1/pipelines/orders/tables/{table}");
+        let (code, _, text) = request(addr, "GET", &path, &[], "").await;
+        (code, json(&text))
+    }
+
+    fn states(v: &Value) -> Vec<&str> {
+        v["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["state"].as_str().unwrap())
+            .collect()
+    }
+
+    /// A lake read past its bound: the page answers without it, its columns unknown. The read goes
+    /// on and, once it ends, answers the next request from what it kept.
+    #[tokio::test]
+    async fn a_slow_lake_read_is_bounded_and_ends_in_the_background() {
+        let (addr, lone, _dir, gate, builds) = gated(Duration::from_millis(100)).await;
+        let docs = (lone.node.docs)(&config().pipelines["orders"]).unwrap();
+        docs.save_table_schema(&schema("orders", false))
+            .await
+            .unwrap();
+        let (code, v) = page(addr, "public.orders").await;
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(
+            (&v["delta"], &v["delta_error"]),
+            (&Value::Null, &json!("not read within 0.1 s"))
+        );
+        assert_eq!(states(&v), ["unknown", "unknown"]);
+        gate.send_replace(true);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let (_, v) = page(addr, "public.orders").await;
+            if v["delta_error"].is_null() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the read never ended: {v}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "one read, ended in the background"
+        );
+    }
+
+    /// Two requests that find nothing kept share one read.
+    #[tokio::test]
+    async fn concurrent_misses_share_one_read() {
+        let (addr, lone, _dir, gate, builds) = gated(FACTS_WITHIN).await;
+        let docs = (lone.node.docs)(&config().pipelines["orders"]).unwrap();
+        docs.save_table_schema(&schema("orders", false))
+            .await
+            .unwrap();
+        let ((a, va), (b, vb), ()) = tokio::join!(
+            page(addr, "public.orders"),
+            page(addr, "public.orders"),
+            async {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                gate.send_replace(true);
+            }
+        );
+        assert_eq!((a, b), (200, 200), "{va} {vb}");
+        assert_eq!(
+            (&va["delta_error"], &vb["delta_error"]),
+            (&Value::Null, &Value::Null)
+        );
+        assert_eq!(builds.load(Ordering::SeqCst), 1, "one sink built for both");
+    }
+
+    /// The columns' state when Delta's schema isn't known: a read that found no Delta table says
+    /// the source's columns aren't in Delta; a failed read says nothing is known of them.
+    #[tokio::test]
+    async fn columns_say_what_is_unknown() {
+        let (addr, lone, _dir) = served("http://127.0.0.1:1", open()).await;
+        let docs = (lone.node.docs)(&config().pipelines["orders"]).unwrap();
+        docs.save_table_schema(&schema("orders", false))
+            .await
+            .unwrap();
+        docs.save_table_schema(&schema("items", false))
+            .await
+            .unwrap();
+        let (code, v) = page(addr, "public.orders").await;
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(
+            (&v["delta"], &v["delta_error"]),
+            (&Value::Null, &Value::Null)
+        );
+        assert_eq!(states(&v), ["not_in_delta", "not_in_delta"]);
+        lone.sink
+            .fail(SinkOp::TableState, None, 10, || SinkError::Transient {
+                reason: "the store is down".into(),
+            });
+        let (code, v) = page(addr, "public.items").await;
+        assert_eq!(code, 200, "{v}");
+        assert!(v["delta_error"].is_string(), "{v}");
+        assert_eq!(states(&v), ["unknown", "unknown"]);
     }
 
     /// A table the pipeline has no trace of is 404; a name not in the source's form is 400. With

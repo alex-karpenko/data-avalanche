@@ -58,7 +58,7 @@ pub use peers::{
 };
 pub use server::{Bound, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT, MAX_CONNECTIONS, ServeError, bind};
 pub use snapshots::{EndedJobs, READ_AT_ONCE};
-pub use tables::{FACTS_FOR, Lake};
+pub use tables::{FACTS_FOR, FACTS_WITHIN, Lake};
 
 use crate::auth::Denied;
 
