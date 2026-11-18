@@ -196,6 +196,7 @@ A table of the pipeline, named as its config names it: what the worker shows of 
 Least role: `viewer`.
 
 - Path parameter `id`: the pipeline's id.
+- Path parameter `table`: the table, named as its config key: `schema.table` on PostgreSQL, the table alone on MySQL.
 
 | Status | When |
 |---|---|

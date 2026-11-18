@@ -47,6 +47,10 @@ fn operation(r: &Route) -> utoipa::openapi::path::Operation {
         ("job_id", "the snapshot job's id, `<pipeline id>~<suffix>`"),
         ("node", "a member's name, as the gossip knows it"),
         ("generation", "a config generation's number"),
+        (
+            "table",
+            "the table, named as its config key: `schema.table` on PostgreSQL, the table alone on MySQL",
+        ),
     ] {
         if r.path.contains(&format!("{{{name}}}")) {
             op = op.parameter(
@@ -283,11 +287,20 @@ mod tests {
                         "{method} {path} {code}"
                     );
                 }
-                for name in ["id", "job_id", "node"] {
-                    if path.contains(&format!("{{{name}}}")) {
-                        assert_eq!(op["parameters"][0]["name"], name, "{method} {path}");
-                    }
-                }
+                let templated: Vec<&str> = path
+                    .split('/')
+                    .filter_map(|s| s.strip_prefix('{')?.strip_suffix('}'))
+                    .collect();
+                let declared: Vec<&str> = op["parameters"]
+                    .as_array()
+                    .map(|ps| {
+                        ps.iter()
+                            .filter(|p| p["in"] == "path")
+                            .map(|p| p["name"].as_str().unwrap())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                assert_eq!(declared, templated, "{method} {path}");
             }
         }
         assert_eq!(operations, routes().len());

@@ -2179,6 +2179,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "table",
+            "in": "path",
+            "description": "the table, named as its config key: `schema.table` on PostgreSQL, the table alone on MySQL",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
