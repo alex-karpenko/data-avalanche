@@ -159,7 +159,7 @@ impl PipelineDocs {
 
     /// Records a table's halt, replacing an earlier one of the same table, and when it began:
     /// now, unless the table's recorded halt has the same reason (a repeat after a crash keeps
-    /// its time).
+    /// its time, or its lack of one: a halt a 1.0 node recorded stays without).
     ///
     /// # Errors
     /// A storage or decode failure.
@@ -172,15 +172,23 @@ impl PipelineDocs {
                     .tables
                     .iter()
                     .any(|h| h.table == halt.table && h.reason == halt.reason);
-                let at = doc.since(&halt.table).filter(|_| same).unwrap_or(now);
+                // A same-reason repeat keeps the recorded start, none included: a 1.0 halt's
+                // start is unknown, and now isn't it.
+                let at = if same {
+                    doc.since(&halt.table)
+                } else {
+                    Some(now)
+                };
                 doc.tables.retain(|h| h.table != halt.table);
                 doc.tables.push(halt.clone());
                 doc.tables.sort_by(|a, b| a.table.cmp(&b.table));
                 doc.since.retain(|s| s.table != halt.table);
-                doc.since.push(HaltSince {
-                    table: halt.table.clone(),
-                    at,
-                });
+                if let Some(at) = at {
+                    doc.since.push(HaltSince {
+                        table: halt.table.clone(),
+                        at,
+                    });
+                }
                 doc.since.sort_by(|a, b| a.table.cmp(&b.table));
                 Ok(doc)
             })
@@ -407,6 +415,35 @@ mod tests {
         let doc = p.halts().await.unwrap();
         assert_eq!(doc.since(&orders), None);
         assert!(doc.since.is_empty(), "{doc:?}");
+    }
+
+    /// A halt a 1.0 node recorded has no time. Recorded again for the same reason, it still has
+    /// none: its start is unknown, and now isn't it. For another reason it starts now.
+    #[tokio::test]
+    async fn a_1_0_halt_recorded_again_keeps_no_time() {
+        let p = pipeline();
+        let orders = TableRef::new("public", "orders");
+        let old = halt("orders", HaltReason::TableDropped);
+        p.docs
+            .modify(HALTS_KEY, |_: Option<HaltsDoc>| {
+                Ok(HaltsDoc {
+                    tables: vec![old.clone()],
+                    since: vec![],
+                })
+            })
+            .await
+            .unwrap();
+        p.record_halt(&old).await.unwrap();
+        let doc = p.halts().await.unwrap();
+        assert_eq!(doc.since(&orders), None, "{doc:?}");
+        assert!(doc.since.is_empty(), "{doc:?}");
+        let other = HaltReason::UnsafeDdl {
+            detail: "narrowed".into(),
+        };
+        let before = chrono::Utc::now();
+        p.record_halt(&halt("orders", other)).await.unwrap();
+        let since = p.halts().await.unwrap().since(&orders);
+        assert!(since.is_some_and(|s| s >= before), "{since:?}");
     }
 
     /// A 1.0 `halts.json` has no times: it reads, and its halts have none.
