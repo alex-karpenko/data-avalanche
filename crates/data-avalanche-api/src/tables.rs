@@ -73,7 +73,7 @@ impl Default for Lake {
 impl Lake {
     /// A lake whose requests wait `within` for a read.
     #[must_use]
-    pub fn with_bound(within: Duration) -> Self {
+    pub(crate) fn with_bound(within: Duration) -> Self {
         Self {
             read: Mutex::default(),
             reading: Mutex::default(),
@@ -134,17 +134,20 @@ impl Lake {
             table.clone(),
         );
         let ended = key.clone();
+        // A read that never ends holds its key: the object store client's own timeouts end it.
         let task = tokio::spawn(async move {
+            // Leaves the flight however the read ends, a panic included: the next request reads
+            // again.
+            let _flight = Flight {
+                lake: Arc::clone(&lake),
+                key: ended,
+            };
             let r = read_sink(&*factory, &p, &table, generation).await;
             // Kept before the read leaves the flight: a request in between finds one or the
             // other, and never reads again.
             if let Ok(r) = &r {
                 lake.keep(&p.id, &table, r.clone());
             }
-            lake.reading
-                .lock()
-                .expect("the lake's reads in flight")
-                .remove(&ended);
             r
         });
         let shared = async move {
@@ -155,6 +158,23 @@ impl Lake {
         .shared();
         reading.insert(key, shared.clone());
         shared
+    }
+}
+
+/// A read in flight: dropped as its task ends, however it ends, it takes the read's key out of
+/// [`Lake`]'s flight.
+struct Flight {
+    lake: Arc<Lake>,
+    key: Key,
+}
+
+impl Drop for Flight {
+    fn drop(&mut self) {
+        self.lake
+            .reading
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.key);
     }
 }
 
@@ -495,7 +515,9 @@ async fn of_pipeline(
         Err(why) => match stored(node, p).await {
             Ok(rows) => (rows, Value::Null, Some(why)),
             Err(e) => {
+                // This node as the holder failed on the same halts read: said once.
                 let error = match why["error"].as_str() {
+                    Some(holder) if holder.contains(&e) => holder.to_owned(),
                     Some(holder) => format!("{holder}; its halts: {e}"),
                     None => format!("its halts: {e}"),
                 };
@@ -522,9 +544,9 @@ async fn of_pipeline(
 }
 
 /// `GET /v1/tables`: every pipeline's tables, worst first, filtered; each pipeline's holder asked
-/// [`READ_AT_ONCE`] at a time, in any order, so a slow one holds up no other. A pipeline whose holder can't be asked lists its halted tables
-/// from storage, and is named under `unreachable` with why. `counts` are by listed state, of the
-/// tables the pipeline and `q` filters keep.
+/// [`READ_AT_ONCE`] at a time, in any order, so a slow one holds up no other. A pipeline whose
+/// holder can't be asked lists its halted tables from storage, and is named under `unreachable`
+/// with why. `counts` are by listed state, of the tables the pipeline and `q` filters keep.
 pub(crate) async fn all(
     State(api): State<Api>,
     RawQuery(raw): RawQuery,
@@ -837,8 +859,8 @@ mod tests {
         }
     }
 
-    /// A node whose sink reads wait for the returned gate, its lake reads bounded by `bound`;
-    /// `public.orders` is cached and in the sink. The counter is the sinks built.
+    /// A node whose sink reads wait for the returned gate, its lake reads bounded by `bound`; its
+    /// sink starts empty. The counter is the sinks built.
     async fn gated(
         bound: Duration,
     ) -> (
@@ -933,6 +955,93 @@ mod tests {
             (&Value::Null, &Value::Null)
         );
         assert_eq!(builds.load(Ordering::SeqCst), 1, "one sink built for both");
+    }
+
+    /// A read that panics answers its request with why, and leaves its table to the next read:
+    /// the next request reads again.
+    #[tokio::test]
+    async fn a_lake_read_that_panics_leaves_the_table_to_the_next() {
+        /// The shared sink, whose first `facts` call panics.
+        #[derive(Debug)]
+        struct Panics {
+            sink: MemorySink,
+            once: Arc<std::sync::atomic::AtomicBool>,
+        }
+        #[async_trait::async_trait]
+        impl Sink for Panics {
+            fn kind(&self) -> SinkKind {
+                self.sink.kind()
+            }
+            fn capabilities(&self) -> &SinkCapabilities {
+                self.sink.capabilities()
+            }
+            async fn table_state(&self, table: &TableRef) -> Result<SinkTableState, SinkError> {
+                self.sink.table_state(table).await
+            }
+            async fn facts(&self, table: &TableRef) -> Result<Option<TableFacts>, SinkError> {
+                assert!(!self.once.swap(false, Ordering::SeqCst), "a broken read");
+                self.sink.facts(table).await
+            }
+            async fn held_tables(&self) -> Result<Vec<TableRef>, SinkError> {
+                self.sink.held_tables().await
+            }
+            async fn ensure_table(&self, spec: &TableSpec) -> Result<(), SinkError> {
+                self.sink.ensure_table(spec).await
+            }
+            async fn evolve(
+                &self,
+                table: &TableRef,
+                delta: &SchemaDelta,
+                owner_epoch: u64,
+            ) -> Result<EvolveOutcome, SinkError> {
+                self.sink.evolve(table, delta, owner_epoch).await
+            }
+            async fn commit(
+                &self,
+                cs: TableChangeSet,
+                marker: CommitMarker,
+            ) -> Result<CommitOutcome, SinkError> {
+                self.sink.commit(cs, marker).await
+            }
+        }
+        #[derive(Debug)]
+        struct Factory(MemorySink, Arc<std::sync::atomic::AtomicBool>);
+        impl WorkerFactory for Factory {
+            fn build(&self, _: &Pipeline) -> Result<Parts, String> {
+                Ok(Parts {
+                    source: Arc::new(FakeSource::new(vec![])),
+                    sink: Arc::new(Panics {
+                        sink: self.0.clone(),
+                        once: Arc::clone(&self.1),
+                    }),
+                    hooks: Arc::new(data_avalanche_pipeline::NoHooks),
+                })
+            }
+        }
+        let sink = MemorySink::new();
+        sink.ensure_table(&TableSpec::new(&schema("orders", false), vec![]).unwrap())
+            .await
+            .unwrap();
+        let once = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (addr, lone, _dir) = served_with("http://127.0.0.1:1", open(), |n| {
+            n.factory = Arc::new(Factory(sink, once));
+        })
+        .await;
+        let docs = (lone.node.docs)(&config().pipelines["orders"]).unwrap();
+        docs.save_table_schema(&schema("orders", false))
+            .await
+            .unwrap();
+        let (code, v) = page(addr, "public.orders").await;
+        assert_eq!(code, 200, "{v}");
+        let why = v["delta_error"].as_str().unwrap_or_default();
+        assert!(why.contains("panicked"), "{v}");
+        let (code, v) = page(addr, "public.orders").await;
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(
+            (&v["delta_error"], &v["delta"]["version"]),
+            (&Value::Null, &json!(0)),
+            "read again: {v}"
+        );
     }
 
     /// The columns' state when Delta's schema isn't known: a read that found no Delta table says
@@ -1179,6 +1288,49 @@ mod tests {
                 "node": "node-z",
             }])
         );
+    }
+
+    /// This node holds the lease without a worker and can't read the halts: storage can't either.
+    /// The one failure is said once.
+    #[tokio::test]
+    async fn the_same_halts_failure_is_said_once() {
+        use data_avalanche_storage::{ObjectStoreVersioned, VersionedStore};
+        let mem = Arc::new(object_store::memory::InMemory::new());
+        let store: Arc<dyn VersionedStore> =
+            Arc::new(ObjectStoreVersioned::new(mem, "state").unwrap());
+        store
+            .put("halts.json", bytes::Bytes::from_static(b"not a registry"))
+            .await
+            .unwrap();
+        let status = ControllerStatus {
+            actual: Some(Actual::Stopped),
+            owner_epoch: Some(4),
+            ..ControllerStatus::default()
+        };
+        let stopped = watch::channel(BTreeMap::from([(
+            "orders".to_owned(),
+            watch::channel(status).1,
+        )]))
+        .1;
+        let (addr, _lone, _dir) = served_with("http://127.0.0.1:1", open(), |n| {
+            n.statuses = stopped;
+            n.docs = Arc::new(move |_| {
+                Ok(data_avalanche_state::PipelineDocs::new(
+                    data_avalanche_state::DocStore::new(Arc::clone(&store)),
+                ))
+            });
+        })
+        .await;
+        let (code, _, text) = request(addr, "GET", "/v1/tables", &[], "").await;
+        assert_eq!(code, 200, "{text}");
+        let why = &json(&text)["unreachable"][0];
+        assert_eq!(
+            (&why["code"], &why["node"]),
+            (&json!(503), &json!("node-a"))
+        );
+        let error = why["error"].as_str().unwrap();
+        assert!(error.starts_with("orders's halts: "), "{error}");
+        assert!(!error.contains("; its halts:"), "said twice: {error}");
     }
 
     /// A holder without a worker (a stopped pipeline) answers with its halts from storage: they

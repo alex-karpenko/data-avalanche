@@ -47,8 +47,8 @@ the pipeline is paused, stopped or starting, nor when it is halted, copying or `
 its `fresh_as_of` is `null`.
 
 Freshness carries across the pipeline's restarts on the node that holds it: a retry's new worker
-keeps the last caught-up time. After a failover, or a restart of that node, it starts over:
-`fresh_as_of` is `null`, and nothing is stale, until the stream catches up.
+keeps the last caught-up time. After a failover, or a restart of that node, the pipeline's earlier
+freshness is gone, so until its new worker streams, `fresh_as_of` is `null` and nothing is stale.
 
 Without a worker (a stopped pipeline, or one starting) the holder lists the pipeline's halted
 tables from storage, as fresh as each halt began.
