@@ -192,16 +192,20 @@ The rest are Claude's calls under Admin_Console §13.
     (`CommitCost::default()`).
   - **Tracked set:** Phase 0 writes it into `WorkerStatus::tracked`, so a table with no commit yet
     is listed.
+  - **Copied set** (S-M13d.2, a Task 5 fix round): `WorkerStatus::copied` holds the `dump_*` tables
+    the worker doesn't stream. Phase 0 puts a `dump_initial` table the sink has there (it stops
+    at once), and the session a dump of the config once its snapshot is durable. A copy outside
+    the config never joins it.
 - **D-M13d.5 Freshness and stale.**
-  - A table's `fresh_as_of` is what lake readers see. For a streaming or copied table it is the
-    pipeline's: now minus `replication_lag_seconds` (the source time of the oldest change not yet
-    durable, or now when none waits; System-Overview's definition). For a halted table it is its
-    halt's `since`.
+  - A table's `fresh_as_of` is what lake readers see. For a streaming table, or one being copied,
+    it is the pipeline's: now minus `replication_lag_seconds` (the source time of the oldest
+    change not yet durable, or now when none waits; System-Overview's definition). For a halted
+    table it is its halt's `since`. A `copied` table has none.
   - A table is `stale` when it streams, the controller runs, the worker streams, and `fresh_as_of`
     is over `FRESH_WITHIN` old: 60 s, the spec's lag target (Scope, p99 ≤ 60 s). There is no config
     knob.
-  - A paused pipeline, a halted table and a table being copied are never stale: the copy's readers
-    see what its job says (`lake`).
+  - A paused pipeline, a halted table, a table being copied and a `copied` one are never stale:
+    the copy's readers see what its job says (`lake`).
 - **D-M13d.6 The live route.** `GET /v1/pipelines/{id}/live` (viewer).
   - A node whose controller for the pipeline is past `Standby` answers from its status. It reads
     the halt registry for the halts' times; a failed read leaves the times out.
@@ -215,8 +219,12 @@ The rest are Claude's calls under Admin_Console §13.
     - `421`: a forwarded request to a node that doesn't run the worker.
   - The answer: the node, `actual` and its error, `owner_epoch`, `worker` (phase, positions, lag,
     `fresh_as_of`, rows read, buffer, warnings), `source` (the detail, `read_at`, retained bytes,
-    `behind_seconds`), and `tables`. Each table carries its state (`streaming`, `halted`,
-    `snapshot`), halt, snapshot progress, figures, `soft_dropped`, `fresh_as_of` and `stale`.
+    `behind_seconds`), and `tables`. Each table carries its state (`halted`, `snapshot`,
+    `copied`, else `streaming`), halt, snapshot progress, figures, `soft_dropped`, `fresh_as_of`
+    and `stale`.
+  - The tables are the tracked, halted, copying and `copied` ones (S-M13d.2). A copy outside the
+    config is listed while it copies; once it ends, or halts, its job tells, and its figures
+    don't list it.
 - **D-M13d.7 The Delta facts.**
   - `Sink::facts` reads, through a sink the node's `WorkerFactory` builds for that one read: the
     `location`, the latest `version`, `files`, `bytes` and `rows`. Rows are the files' `numRecords`
@@ -241,9 +249,9 @@ The rest are Claude's calls under Admin_Console §13.
 - **D-M13d.9 Every pipeline's tables.** `GET /v1/tables` (viewer).
   - Every pipeline of the generation is asked, 16 at a time (`READ_AT_ONCE`, as M13c's list).
   - Each row gains `pipeline`, `node`, `live` and `listed_as`, the first that fits: `halted`,
-    `stale`, `snapshot`, `costly` (a streaming table whose last MERGE rewrote more than half its
-    files: random-key churn, D-MS.15), else `streaming`. That is also the order, then by pipeline
-    and table.
+    `stale`, `snapshot`, `copied` (never `costly`), `costly` (a streaming table whose last MERGE
+    rewrote more than half its files: random-key churn, D-MS.15), else `streaming`. The order is
+    `halted`, `stale`, `snapshot`, `costly`, `streaming`, `copied`, then by pipeline and table.
   - `counts` are by `listed_as`, after the `pipeline` and `q` filters and before `state`.
   - Filters: `state` (several, comma-separated), `pipeline` (`404` when the generation has none),
     `q` (text in the table's name, any case). `400` for any other parameter, a repeated one or an
@@ -333,6 +341,34 @@ index fb270b9..e1a6d40 100644
      │                                              inside a name is escaped as `%XX` in the file name)
 ````
 
+### Spec patch S-M13d.2 (approved during execution)
+
+Raised by Task 5's review, approved by Oleksii 2026-11-18 ("State `copied`"). Applied as its own
+commit, `spec: S-M13d.2 — a dump that isn't streamed is listed copied`, before Task 5's fix
+round. A finished `dump_*` table stayed in the tracked set, and a finished or halted copy in the
+figures, so both were listed `streaming`, and could be `stale`, though nothing streamed them.
+
+`doc/specs/System-Overview.md`:
+
+````diff
+diff --git a/doc/specs/System-Overview.md b/doc/specs/System-Overview.md
+index d27bdc0..c58dc02 100644
+--- a/doc/specs/System-Overview.md
++++ b/doc/specs/System-Overview.md
+@@ -136,9 +136,9 @@ Functional endpoints are versioned under `/v1`; probes and metrics are unversion
+ | Config diff | `GET /v1/config/diff?from=&to=` | viewer | what differs between two generations as written, each change with what a reload of it does; secrets masked |
+ | Config nodes | `GET /v1/config/nodes` | viewer | each member's generation, whether its own file is the cluster's generation, and its restart-pending fields |
+ | Pipelines status | `GET /v1/pipelines`, `GET /v1/pipelines/{id}` | viewer | `desired_state`, `actual_state`, positions, per-table status (halted tables with their reason and since when; a halt recorded before 1.1.0 has no time); the lease holder flagged `stale` when it isn't a member the node's gossip sees (gone, or an earlier process of a restarted node), `suspect` while gossip suspects it |
+-| Pipeline live figures | `GET /v1/pipelines/{id}/live` | viewer | what the pipeline's worker shows now, answered from the memory of the node that holds its lease: phase, positions, lag and what lake readers see (`fresh_as_of`); the source's detail, read every heartbeat (PostgreSQL: the slot, the WAL it holds against `max_slot_wal_keep_size`, its confirmed position, the publication; MySQL/MariaDB: the server's position and binlog expiry); each table's state, changes since the worker started and in the last minute, last commit and Delta version, the last MERGE's files rewritten against the table's files, freshness, and `stale` (older than the lag target while the worker streams). Another node asks the holder with the caller's credentials: `409` no node holds the lease, `503` a holder it can't ask, `502`/`504` no answer, `421` a forwarded request to a node that no longer runs the worker |
++| Pipeline live figures | `GET /v1/pipelines/{id}/live` | viewer | what the pipeline's worker shows now, answered from the memory of the node that holds its lease: phase, positions, lag and what lake readers see (`fresh_as_of`); the source's detail, read every heartbeat (PostgreSQL: the slot, the WAL it holds against `max_slot_wal_keep_size`, its confirmed position, the publication; MySQL/MariaDB: the server's position and binlog expiry); each table's state (`streaming`, `snapshot`, `halted`, or `copied`: a `dump_*` table whose copy ended, or a `dump_initial` one the sink had at the start, which isn't streamed; a snapshot job's table outside the config is listed while it copies), changes since the worker started and in the last minute, last commit and Delta version, the last MERGE's files rewritten against the table's files, freshness, and `stale` (older than the lag target while the worker streams). Another node asks the holder with the caller's credentials: `409` no node holds the lease, `503` a holder it can't ask, `502`/`504` no answer, `421` a forwarded request to a node that no longer runs the worker |
+ | Table detail | `GET /v1/pipelines/{id}/tables/{table}` | viewer | a table, named as its config key: the worker's figures of it, its halt and since when, the Delta table's location, version, files, bytes and rows (read on request by the node asked, kept 30 s), its columns at the source against Delta's (kept, soft-dropped, not yet added, lineage), and the snapshot jobs that copied it. `404` when the pipeline has no trace of the table |
+-| All tables | `GET /v1/tables` | viewer | every pipeline's tables, worst first, as each holder's worker shows them, listed as `halted`, `stale`, `snapshot`, `costly` (the last MERGE rewrote over half the table's files) or `streaming`, with counts; filters `state` (several, comma-separated), `pipeline`, `q`; a pipeline whose holder can't be asked lists its halted tables from storage and is named under `unreachable` |
++| All tables | `GET /v1/tables` | viewer | every pipeline's tables, worst first, as each holder's worker shows them, listed as `halted`, `stale`, `snapshot`, `costly` (the last MERGE rewrote over half the table's files), `streaming` or `copied`, with counts; filters `state` (several, comma-separated), `pipeline`, `q`; a pipeline whose holder can't be asked lists its halted tables from storage and is named under `unreachable` |
+ | Request snapshot | `POST /v1/pipelines/{id}/snapshots` | operator | tables list (the per-table config keys), no globs; refused (`409`) unless the desired state is `RUNNING` and a node holds the lease, as a restart (`ERROR` included), or while an unfinished job holds one of the tables; `202` with the job's id. The job runs in a restarted worker. It upserts: a row deleted at the source before the job stays, unless the job is asked with `truncate: true`, which empties each sink table first. A pipeline keeps its 100 newest ended jobs |
+ | Snapshot job status | `GET /v1/snapshots/{job_id}` | viewer | the job's status (`queued`, `running`, `cancelling`, `completed`, `failed`, `cancelled`), who asked, their role and note, the job it retries, who cancelled it and why; each table's status, rows copied, the source's row estimate, when its copy began and ended, the halt the job cleared for it, and what lake readers see of it (`complete`, `partial`, `empty`, `as_before`); the job's rate and ETA once it has run a minute |
+ | List snapshot jobs | `GET /v1/pipelines/{id}/snapshots` | viewer | persisted in the pipeline state location; survive restart and failover |
+````
+
 ## File Structure
 
 | File | Responsibility |
@@ -343,7 +379,7 @@ index fb270b9..e1a6d40 100644
 | `crates/data-avalanche-source-mysql/src/{start,connector}.rs`, `tests/mysql/start.rs` | MySQL's and MariaDB's detail (Task 2) |
 | `crates/data-avalanche-sink-delta/src/sink.rs`, `tests/sink/scenarios.rs` | Delta's commit cost and facts (Task 3) |
 | `crates/data-avalanche-testkit/src/{memory_sink,fake_source}.rs` | The reference sink's facts; the fake source's detail (Tasks 3, 4) |
-| `crates/data-avalanche-pipeline/src/{status,writer,session,worker,lib}.rs` | `TableCommit`, `TableFigures`, the status's figures, tracked set and source detail (Task 4) |
+| `crates/data-avalanche-pipeline/src/{status,writer,session,worker,lib}.rs` | `TableCommit`, `TableFigures`, the status's figures, tracked set and source detail (Task 4); the copied set (Task 5's fix round) |
 | `crates/data-avalanche-cluster/src/{reconciler,events,jobs}.rs` | `watch_statuses` public; the halts' new field in tests (Tasks 1, 5) |
 | `crates/data-avalanche-api/src/{live,tables}.rs` | The live route; a table's page; every table; `Lake` (Tasks 5–7) |
 | `crates/data-avalanche-api/src/{lib,pipelines,snapshots,nodes,test_support}.rs`, `Cargo.toml`, `openapi.json` | `Node`'s new fields, the routes, `since` in the status, shared helpers, the moved test support (Tasks 1, 5–7) |
@@ -3293,7 +3329,7 @@ git commit -m "feat(api): GET /v1/pipelines/{id}/live — the worker's figures f
 **Files:**
 - Create: `crates/data-avalanche-api/src/tables.rs`
 - Modify: `crates/data-avalanche-api/Cargo.toml`, `crates/data-avalanche-api/src/lib.rs`, `crates/data-avalanche-api/src/live.rs`, `crates/data-avalanche-api/src/snapshots.rs`, `crates/data-avalanche-api/src/test_support.rs`, `crates/data-avalanche/src/run.rs`
-- Generated: `crates/data-avalanche-api/openapi.json`, `docs/public/openapi.json`, `docs/src/content/docs/reference/api.md`, `Cargo.lock`
+- Generated: `crates/data-avalanche-api/openapi.json`, `docs/public/openapi.json`, `docs/src/content/docs/reference/api.md`
 
 **Interfaces:**
 - Consumes: Task 5's `live`; Task 3's `Sink::facts`; `WorkerFactory` (M8); `jobs_of`,
@@ -3435,10 +3471,10 @@ index 70492dc..179a886 100644
 
 ````diff
 diff --git a/crates/data-avalanche-api/src/live.rs b/crates/data-avalanche-api/src/live.rs
-index 25b3665..321cb6b 100644
+index 7293ca0..a830385 100644
 --- a/crates/data-avalanche-api/src/live.rs
 +++ b/crates/data-avalanche-api/src/live.rs
-@@ -247,6 +247,35 @@ async fn from_holder(node: &Node, id: &str, headers: &HeaderMap) -> Response {
+@@ -255,6 +255,35 @@ async fn from_holder(node: &Node, id: &str, headers: &HeaderMap) -> Response {
      }
  }
  
@@ -4155,7 +4191,7 @@ Expected: no output from the first three; every test passes.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add Cargo.lock crates/data-avalanche-api/Cargo.toml crates/data-avalanche-api/openapi.json crates/data-avalanche-api/src/lib.rs crates/data-avalanche-api/src/live.rs crates/data-avalanche-api/src/snapshots.rs crates/data-avalanche-api/src/tables.rs crates/data-avalanche-api/src/test_support.rs crates/data-avalanche/src/run.rs docs/public/openapi.json docs/src/content/docs/reference/api.md
+git add crates/data-avalanche-api/Cargo.toml crates/data-avalanche-api/openapi.json crates/data-avalanche-api/src/lib.rs crates/data-avalanche-api/src/live.rs crates/data-avalanche-api/src/snapshots.rs crates/data-avalanche-api/src/tables.rs crates/data-avalanche-api/src/test_support.rs crates/data-avalanche/src/run.rs docs/public/openapi.json docs/src/content/docs/reference/api.md
 git commit -m "feat(api): GET /v1/pipelines/{id}/tables/{table} — a table's figures, halt, Delta facts, columns and jobs"
 ```
 
@@ -4170,7 +4206,7 @@ git commit -m "feat(api): GET /v1/pipelines/{id}/tables/{table} — a table's fi
 **Interfaces:**
 - Consumes: Task 6's `live`; `READ_AT_ONCE` (M13c).
 - Produces: `GET /v1/tables` (viewer) with `state` (`halted`, `stale`, `snapshot`, `costly`,
-  `streaming`), `pipeline`, `q`; each row gains `pipeline`, `node`, `live`, `listed_as`. The
+  `streaming`, `copied`), `pipeline`, `q`; each row gains `pipeline`, `node`, `live`, `listed_as`. The
   site's API page gains a `tables` section.
 
 - [ ] **Step 1: Write the failing tests**
@@ -4181,7 +4217,7 @@ The tests: `every_table_is_listed_worst_first`, `a_table_behind_the_target_is_st
 
 ````diff
 diff --git a/crates/data-avalanche-api/src/lib.rs b/crates/data-avalanche-api/src/lib.rs
-index 179a886..9bcc0d7 100644
+index 179a886..e1ffe94 100644
 --- a/crates/data-avalanche-api/src/lib.rs
 +++ b/crates/data-avalanche-api/src/lib.rs
 @@ -948,6 +962,7 @@ mod tests {
@@ -4198,10 +4234,10 @@ index 179a886..9bcc0d7 100644
 
 ````diff
 diff --git a/crates/data-avalanche-api/src/tables.rs b/crates/data-avalanche-api/src/tables.rs
-index 99aaf29..83f7d43 100644
+index 99aaf29..68ac1ab 100644
 --- a/crates/data-avalanche-api/src/tables.rs
 +++ b/crates/data-avalanche-api/src/tables.rs
-@@ -455,4 +677,163 @@ mod tests {
+@@ -455,4 +686,170 @@ mod tests {
              (&Value::Null, &json!(409))
          );
      }
@@ -4220,8 +4256,9 @@ index 99aaf29..83f7d43 100644
 +        }
 +    }
 +
-+    /// A worker 90 s behind: `items` halted, `audit` copied, `events` rewriting most of its files
-+    /// (stale too: so `quiet`, caught up, is the one streaming table), `orders` stale.
++    /// A worker 90 s behind: `items` halted, `audit` copying, `events` rewriting most of its files
++    /// (stale too: so `quiet`, caught up, is the one streaming table), `orders` stale; `dumped` a
++    /// dump that ended, its copy rewriting every file.
 +    fn statuses(
 +        behind: i64,
 +    ) -> watch::Receiver<BTreeMap<String, watch::Receiver<ControllerStatus>>> {
@@ -4231,6 +4268,7 @@ index 99aaf29..83f7d43 100644
 +                (Utc::now() - chrono::Duration::seconds(behind)).timestamp_micros(),
 +            ),
 +            tracked: [t("orders"), t("items"), t("events"), t("quiet")].into(),
++            copied: [t("dumped")].into(),
 +            halted: [(t("items"), HaltReason::TableDropped)].into(),
 +            snapshots: [(
 +                t("audit"),
@@ -4244,6 +4282,7 @@ index 99aaf29..83f7d43 100644
 +        };
 +        w.committed(&commit("events", 8, 10));
 +        w.committed(&commit("quiet", 1, 10));
++        w.committed(&commit("dumped", 10, 10));
 +        let status = ControllerStatus {
 +            actual: Some(Actual::Running),
 +            owner_epoch: Some(4),
@@ -4293,13 +4332,17 @@ index 99aaf29..83f7d43 100644
 +                ("public.events", "costly"),
 +                ("public.orders", "streaming"),
 +                ("public.quiet", "streaming"),
++                ("public.dumped", "copied"),
 +            ])
 +        );
 +        assert_eq!(v["tables"][0]["pipeline"], "orders");
 +        assert_eq!(v["tables"][0]["node"], "node-a");
 +        assert_eq!(
 +            v["counts"],
-+            json!({ "all": 5, "halted": 1, "stale": 0, "snapshot": 1, "costly": 1, "streaming": 2 })
++            json!({
++                "all": 6, "halted": 1, "stale": 0, "snapshot": 1, "costly": 1, "streaming": 2,
++                "copied": 1
++            })
 +        );
 +        assert_eq!(v["unreachable"], json!([]));
 +        let (_, _, text) =
@@ -4385,7 +4428,7 @@ build.
 
 ````diff
 diff --git a/crates/data-avalanche-api/src/lib.rs b/crates/data-avalanche-api/src/lib.rs
-index 179a886..9bcc0d7 100644
+index 179a886..e1ffe94 100644
 --- a/crates/data-avalanche-api/src/lib.rs
 +++ b/crates/data-avalanche-api/src/lib.rs
 @@ -387,6 +387,20 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
@@ -4397,7 +4440,7 @@ index 179a886..9bcc0d7 100644
 +                "GET",
 +                "/v1/tables",
 +                Viewer,
-+                "Every pipeline's tables, worst first, as each lease holder's worker shows them: by listed state (halted, stale, snapshot, costly, streaming), pipeline, and text in the name; a pipeline whose holder can't be asked lists its halted tables from storage and is named under `unreachable`",
++                "Every pipeline's tables, worst first, as each lease holder's worker shows them: by listed state (halted, stale, snapshot, costly, streaming, copied), pipeline, and text in the name; a pipeline whose holder can't be asked lists its halted tables from storage and is named under `unreachable`",
 +                &[
 +                    (200, "the tables, with counts by listed state"),
 +                    (400, "a parameter that isn't one, or a state that isn't"),
@@ -4415,7 +4458,7 @@ index 179a886..9bcc0d7 100644
 
 ````diff
 diff --git a/crates/data-avalanche-api/src/tables.rs b/crates/data-avalanche-api/src/tables.rs
-index 99aaf29..83f7d43 100644
+index 99aaf29..68ac1ab 100644
 --- a/crates/data-avalanche-api/src/tables.rs
 +++ b/crates/data-avalanche-api/src/tables.rs
 @@ -1,13 +1,15 @@
@@ -4451,13 +4494,21 @@ index 99aaf29..83f7d43 100644
  
  /// How long a table's Delta facts and columns, once read, answer for it: the table's page reads
  /// them on request, and a reload of the page within this reads nothing again.
-@@ -269,17 +273,235 @@ pub(crate) async fn get(
+@@ -269,17 +273,244 @@ pub(crate) async fn get(
      )
  }
  
 +/// The states `GET /v1/tables` filters by, worst first: the order it lists them in. `costly` is a
-+/// streaming table whose last MERGE rewrote more than half its files (D-MS.15).
-+const STATES: [&str; 5] = ["halted", "stale", "snapshot", "costly", "streaming"];
++/// streaming table whose last MERGE rewrote more than half its files (D-MS.15); `copied`, a
++/// `dump_*` table that isn't streamed.
++const STATES: [&str; 6] = [
++    "halted",
++    "stale",
++    "snapshot",
++    "costly",
++    "streaming",
++    "copied",
++];
 +
 +/// `GET /v1/tables`'s filter: the states, the pipeline, and text the table's name holds.
 +#[derive(Debug, Default)]
@@ -4502,7 +4553,7 @@ index 99aaf29..83f7d43 100644
 +}
 +
 +/// The state a table is listed under: its own, `stale` for a stale one, `costly` for a streaming
-+/// one whose last MERGE rewrote more than half its files.
++/// one whose last MERGE rewrote more than half its files. A `copied` one is neither.
 +fn listed_state(t: &Value) -> &'static str {
 +    let rewritten = t["files_rewritten"].as_u64();
 +    let files = t["files"].as_u64();
@@ -4510,6 +4561,7 @@ index 99aaf29..83f7d43 100644
 +        Some("halted") => "halted",
 +        _ if t["stale"] == true => "stale",
 +        Some("snapshot") => "snapshot",
++        Some("copied") => "copied",
 +        _ if rewritten
 +            .zip(files)
 +            .is_some_and(|(r, f)| f > 0 && r * 2 > f) =>
@@ -4780,10 +4832,10 @@ index 00bb060..ab29d1d 100644
 ````diff
 diff --git a/docs/src/content/docs/runbooks/pipeline-figures.md b/docs/src/content/docs/runbooks/pipeline-figures.md
 new file mode 100644
-index 0000000..7b7970d
+index 0000000..556dbe8
 --- /dev/null
 +++ b/docs/src/content/docs/runbooks/pipeline-figures.md
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,82 @@
 +---
 +title: A pipeline's tables and figures
 +description: What a pipeline's worker shows now, a table's page, and every pipeline's tables, asked of any node.
@@ -4812,12 +4864,15 @@ index 0000000..7b7970d
 +  and the publication with its table count. MySQL and MariaDB: the server's `head` (its GTID set,
 +  or binlog file and offset) and `binlog_expire_seconds` (`null`: never expired), and how far the
 +  stream reads behind (`behind_seconds`).
-+- `tables`: each table the worker tracks, halts, copies or has written, with its `state`
-+  (`streaming`, `halted`, `snapshot`), the changes committed since the worker started, the
-+  changes of the last minute (`changes_per_minute`), its `last_commit` and Delta `version`, the
-+  last MERGE's `files_rewritten` against the table's `files`, and its `fresh_as_of`. A halted
-+  table is as fresh as its halt. A streaming table is **stale** when that is over 60 s old (the
-+  lag target) while the worker streams; a paused pipeline is never stale.
++- `tables`: each table the worker tracks, halts or copies, with its `state` (`streaming`,
++  `halted`, `snapshot`, or `copied`: a `dump_*` table whose copy ended, or a `dump_initial` one
++  the lake had at the start, which isn't streamed), the changes committed since the worker
++  started, the changes of the last minute (`changes_per_minute`), its `last_commit` and Delta
++  `version`, the last MERGE's `files_rewritten` against the table's `files`, and its
++  `fresh_as_of`. A halted table is as fresh as its halt; a `copied` one has none. A streaming
++  table is **stale** when that is over 60 s old (the lag target) while the worker streams; a
++  paused pipeline is never stale. A snapshot job's table outside the config is listed while it
++  copies; afterwards its job tells ([Snapshot jobs](/data-avalanche/runbooks/snapshot-jobs/)).
 +
 +The figures start again with each worker: a restart or a failover sets the counts to zero.
 +
@@ -4857,8 +4912,8 @@ index 0000000..7b7970d
 +
 +Every pipeline's tables, worst first, each with its `pipeline`, `node` and `listed_as`:
 +`halted`, `stale`, `snapshot`, `costly` (a streaming table whose last MERGE rewrote more than half
-+its files: random-key churn, the cost driver), or `streaming`. `counts` gives how many there are of
-+each. Filter with `state` (comma-separated), `pipeline`, and `q` (text in the table's name, any
++its files: random-key churn, the cost driver), `streaming`, or `copied`. `counts` gives how many
++there are of each. Filter with `state` (comma-separated), `pipeline`, and `q` (text in the table's name, any
 +case).
 +
 +A pipeline whose holder can't be asked is named under `unreachable` with why; its halted tables
@@ -5072,6 +5127,7 @@ git commit -m "test(e2e): a pipeline's tables and figures through any node — l
 ```
 
 ---
+
 ## Exit
 
 - Every task is committed, one commit each, after the spec patch's commit. The gates pass on the
@@ -5095,4 +5151,294 @@ git commit -m "test(e2e): a pipeline's tables and figures through any node — l
 
 ## Deviations during execution
 
-None yet.
+### Task 5: the plan's text
+
+- Step 2's expected failure: the step-1 diff adds the route table's row only, so the build passes
+  and the route table's test fails at run time, not the build.
+- The step-1 and step-3 `lib.rs` diffs were split from one diff. The implementer applied step 3
+  before step 1. The committed tree is the verified one.
+
+### Task 5: a fix round, the `copied` state (S-M13d.2)
+
+Task 5's review found that the listing reported a finished `dump_*` table, and a finished or
+halted copy outside the config, as `streaming`, and could call them `stale`, for the rest of the
+worker's life. Oleksii chose a `copied` state (D-M13d.4–6, D-M13d.9, S-M13d.2). The fix lands on
+Task 5's commit as its own commit, after the spec patch's; Tasks 7 and 8 above carry `copied` in
+`GET /v1/tables` and the runbook.
+
+- [ ] **Step 1: Write the failing tests**
+
+The tests: `the_node_that_runs_the_worker_answers_from_its_memory` gains a `copied` table and a
+copy that ended (live); `a_dump_beside_streaming_tables_shows_copied` (worker).
+
+`crates/data-avalanche-api/src/live.rs`:
+
+````diff
+diff --git a/crates/data-avalanche-api/src/live.rs b/crates/data-avalanche-api/src/live.rs
+index 25b3665..7293ca0 100644
+--- a/crates/data-avalanche-api/src/live.rs
++++ b/crates/data-avalanche-api/src/live.rs
+@@ -294,6 +302,7 @@ mod tests {
+             phase: Phase::Streaming,
+             unsynced_since_micros: Some((now - lag).timestamp_micros()),
+             tracked: [t("orders"), t("items")].into(),
++            copied: [t("dumped")].into(),
+             halted: [(t("items"), HaltReason::TableDropped)].into(),
+             snapshots: [(
+                 t("audit"),
+@@ -324,6 +333,15 @@ mod tests {
+             },
+             at: now,
+         });
++        // A copy outside the config that ended: its job tells, the page doesn't list it.
++        w.committed(&TableCommit {
++            table: t("ended"),
++            rows: 3,
++            snapshot: true,
++            version: 2,
++            cost: CommitCost::default(),
++            at: now,
++        });
+         w
+     }
+ 
+@@ -358,7 +376,8 @@ mod tests {
+     }
+ 
+     /// The node that runs the worker answers from its memory: each table's state, figures and
+-    /// freshness; a halted table is as fresh as its halt, and isn't stale.
++    /// freshness; a halted table is as fresh as its halt, and isn't stale; a dump that ended is
++    /// `copied`, and a copy that ended isn't listed.
+     #[tokio::test]
+     async fn the_node_that_runs_the_worker_answers_from_its_memory() {
+         let lagging = statuses(Actual::Running, Some(worker(chrono::Duration::seconds(90))));
+@@ -418,6 +437,22 @@ mod tests {
+             audit["stale"], false,
+             "a copy's readers see what its job says"
+         );
++        let dumped = by_table(&v, "public.dumped");
++        assert_eq!(
++            (&dumped["state"], &dumped["stale"], &dumped["fresh_as_of"]),
++            (&json!("copied"), &json!(false), &Value::Null),
++            "a dump that ended isn't streamed"
++        );
++        let listed: Vec<&Value> = v["tables"]
++            .as_array()
++            .unwrap()
++            .iter()
++            .map(|t| &t["table"])
++            .collect();
++        assert!(
++            !listed.contains(&&json!("public.ended")),
++            "a copy that ended: {listed:?}"
++        );
+     }
+ 
+     /// A paused pipeline is behind by design: nothing is stale.
+````
+
+`crates/data-avalanche-pipeline/src/worker.rs`:
+
+````diff
+diff --git a/crates/data-avalanche-pipeline/src/worker.rs b/crates/data-avalanche-pipeline/src/worker.rs
+index e667386..2da13cd 100644
+--- a/crates/data-avalanche-pipeline/src/worker.rs
++++ b/crates/data-avalanche-pipeline/src/worker.rs
+@@ -1991,6 +1996,26 @@ mod tests {
+         assert!(w.source.opened().len() <= 1);
+     }
+ 
++    /// A `dump_*` table beside streaming ones shows `copied` once it isn't streamed: the
++    /// `dump_initial` table the sink has at the start, the `dump_always` one once its snapshot is
++    /// durable (D-M13d.5).
++    #[tokio::test]
++    async fn a_dump_beside_streaming_tables_shows_copied() {
++        let w = World::new(&["a", "b", "c"]);
++        w.started(&["a", "b", "c"]).await;
++        w.source.load(&t("b"), rows(1..=2));
++        let p = mode("mode: never, overrides: { public.a: dump_initial, public.b: dump_always }");
++        let (end, st) = run(&w, &p, async |status| streamed(&status, &w).await).await;
++        end.unwrap();
++        assert_eq!(w.ids("b"), [1, 2]);
++        assert_eq!(st.copied, BTreeSet::from([t("a"), t("b")]));
++        assert_eq!(
++            st.tracked,
++            BTreeSet::from([t("b"), t("c")]),
++            "a never streams"
++        );
++    }
++
+     #[tokio::test]
+     async fn a_dump_always_table_dumps_and_ends() {
+         let w = World::new(&["a"]);
+````
+
+- [ ] **Step 2: Run them to see them fail**
+
+Run: `cargo test -p data-avalanche-pipeline --lib worker:: && cargo test -p data-avalanche-api --lib live::`
+Expected: the build fails: no field `copied` in `WorkerStatus`.
+
+- [ ] **Step 3: Implement**
+
+`crates/data-avalanche-api/src/live.rs`:
+
+````diff
+diff --git a/crates/data-avalanche-api/src/live.rs b/crates/data-avalanche-api/src/live.rs
+index 25b3665..7293ca0 100644
+--- a/crates/data-avalanche-api/src/live.rs
++++ b/crates/data-avalanche-api/src/live.rs
+@@ -80,12 +80,14 @@ fn tables(
+     let running = matches!(s.actual, Some(Actual::Running)) && w.phase == Phase::Streaming;
+     let fresh = fresh_as_of(w, now);
+     let window = chrono::Duration::from_std(FRESH_WITHIN).expect("a minute");
++    // A copy outside the config is listed while it copies: once it ends, or halts, its job
++    // tells (its figures stay in `tables` until the worker ends).
+     let all: BTreeSet<&TableRef> = w
+         .tracked
+         .iter()
+         .chain(w.halted.keys())
+         .chain(w.snapshots.keys())
+-        .chain(w.tables.keys())
++        .chain(w.copied.iter())
+         .collect();
+     all.into_iter()
+         .map(|t| {
+@@ -95,9 +97,15 @@ fn tables(
+             let state = match (halt, snapshot) {
+                 (Some(_), _) => "halted",
+                 (None, Some(_)) => "snapshot",
++                (None, None) if w.copied.contains(t) => "copied",
+                 (None, None) => "streaming",
+             };
+-            let fresh = if halt.is_some() { since } else { Some(fresh) };
++            // A halted table is as fresh as its halt; a dump that ended, as its last copy.
++            let fresh = match state {
++                "halted" => since,
++                "copied" => None,
++                _ => Some(fresh),
++            };
+             let figures = w.tables.get(t);
+             json!({
+                 "table": table_name(p, t),
+````
+
+`crates/data-avalanche-pipeline/src/session.rs`:
+
+````diff
+diff --git a/crates/data-avalanche-pipeline/src/session.rs b/crates/data-avalanche-pipeline/src/session.rs
+index 0763e60..6adf0d3 100644
+--- a/crates/data-avalanche-pipeline/src/session.rs
++++ b/crates/data-avalanche-pipeline/src/session.rs
+@@ -464,9 +464,13 @@ impl<'c> Session<'c> {
+                     // A completion durable now ends its snapshot, as in the loop.
+                     self.durable += 1;
+                     let done = self.snaps.durable(self.durable);
++                    let copies = &self.copies;
+                     self.core.update(|st| {
+-                        for (table, _) in done {
++                        for (table, dump) in done {
+                             st.snapshots.remove(&table);
++                            if dump && !copies.contains_key(&table) {
++                                st.copied.insert(table);
++                            }
+                         }
+                         st.checkpoint = Some(cp);
+                     });
+@@ -669,14 +673,18 @@ impl<'c> Session<'c> {
+                     self.unsynced.pop_front();
+                 }
+                 for (table, dump) in self.snaps.durable(self.durable) {
++                    // A dump, or a copy, stops once its snapshot is durable: the config's dump
++                    // shows `copied`, a copy outside the config leaves the pipeline's page.
++                    let copy = dump && self.copies.remove(&table).is_some();
+                     self.core.update(|st| {
+                         st.snapshots.remove(&table);
++                        if dump && !copy {
++                            st.copied.insert(table.clone());
++                        }
+                     });
+                     if dump {
+-                        // A dump, or a copy, stops once its snapshot is durable.
+                         self.acc.halt_table(&table);
+                         self.schemas.remove(&table);
+-                        self.copies.remove(&table);
+                     }
+                 }
+                 if let Err(e) = self.stream.acknowledge(&cp).await {
+````
+
+`crates/data-avalanche-pipeline/src/status.rs`:
+
+````diff
+diff --git a/crates/data-avalanche-pipeline/src/status.rs b/crates/data-avalanche-pipeline/src/status.rs
+index 6cc9751..68eab72 100644
+--- a/crates/data-avalanche-pipeline/src/status.rs
++++ b/crates/data-avalanche-pipeline/src/status.rs
+@@ -150,6 +150,9 @@ pub struct WorkerStatus {
+     pub soft_dropped: BTreeMap<TableRef, usize>,
+     /// The tables the last Phase 0 tracks: the pipeline's page lists them.
+     pub tracked: BTreeSet<TableRef>,
++    /// The `dump_*` tables this worker doesn't stream: a `dump_initial` table the sink had at the
++    /// start, or a dump whose snapshot ended. The pipeline's page lists them `copied`.
++    pub copied: BTreeSet<TableRef>,
+     /// Per table, what this worker committed to it since it started: the pipeline's page.
+     pub tables: BTreeMap<TableRef, TableFigures>,
+     /// What the source keeps for the pipeline, as of `source_read_at`: read every heartbeat. A
+````
+
+`crates/data-avalanche-pipeline/src/worker.rs`:
+
+````diff
+diff --git a/crates/data-avalanche-pipeline/src/worker.rs b/crates/data-avalanche-pipeline/src/worker.rs
+index e667386..2da13cd 100644
+--- a/crates/data-avalanche-pipeline/src/worker.rs
++++ b/crates/data-avalanche-pipeline/src/worker.rs
+@@ -730,6 +730,7 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
+         .chain(halts.iter().map(|(t, _)| t.clone()))
+         .collect();
+     let mut tracked = BTreeSet::new();
++    let mut copied = BTreeSet::new();
+     let mut drifted = BTreeSet::new();
+     let mut requests = vec![];
+     let mut abandoned = vec![];
+@@ -778,7 +779,10 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
+         // halted in this pass gets no `in_progress` document (final review M5).
+         let request = matches!(decision, Decision::Snapshot { resume: false, .. });
+         match decision {
+-            Decision::Stop => continue,
++            Decision::Stop => {
++                copied.insert(table.clone());
++                continue;
++            }
+             Decision::Stream if in_progress => abandoned.push(table.clone()),
+             _ => {}
+         }
+@@ -1299,6 +1303,7 @@ pub(crate) async fn start(core: &mut Core, lost: Option<Checkpoint>) -> Result<(
+     core.server = server;
+     core.update(|st| {
+         st.tracked.clone_from(&tracked);
++        st.copied = copied;
+         warnings.into_iter().for_each(|w| st.warn(w));
+     });
+     core.tracked = tracked;
+````
+
+- [ ] **Step 4: Run the tests and the gates**
+
+Run: `cargo test -p data-avalanche-pipeline --lib worker:: && cargo test -p data-avalanche-api --lib live::`, then
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy -p data-avalanche --features e2e-hooks --all-targets -- -D warnings
+cargo test --workspace
+```
+
+Expected: no output from the first three; every test passes. The OpenAPI document doesn't move.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/data-avalanche-api/src/live.rs crates/data-avalanche-pipeline/src/session.rs crates/data-avalanche-pipeline/src/status.rs crates/data-avalanche-pipeline/src/worker.rs
+git commit -m "fix(api): a dump that ended is listed copied, a copy that ended isn't listed"
+```
