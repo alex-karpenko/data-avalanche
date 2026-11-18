@@ -89,14 +89,23 @@ async fn a_pipeline_s_tables_are_shown_through_any_node() {
     assert_eq!(column(&p, "doc")["state"], "kept", "{p}");
     assert_eq!(column(&p, "_op")["state"], "lineage", "{p}");
 
-    // A column dropped at the source stays in Delta: soft-dropped, once the facts kept expire.
+    // A column dropped at the source stays in Delta: soft-dropped once the pipeline caches the
+    // source's new schema (Delta's columns, kept a while, still hold it). On a timeout, the last
+    // page and the pipeline's live answer say why.
     c.e.exec("ALTER TABLE items DROP COLUMN doc; INSERT INTO items VALUES (100)")
         .await;
-    eventually("doc soft-dropped", Duration::from_secs(90), async || {
+    let until = std::time::Instant::now() + Duration::from_secs(90);
+    loop {
         let (code, p) = o.call("GET", &page).await;
-        code == 200 && column(&p, "doc")["state"] == "soft_dropped"
-    })
-    .await;
+        if code == 200 && column(&p, "doc")["state"] == "soft_dropped" {
+            break;
+        }
+        if std::time::Instant::now() >= until {
+            let (_, l) = o.call("GET", &live).await;
+            panic!("doc not soft-dropped within 90 s: the page ({code}) {p}\nthe live answer {l}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
     // Every pipeline's tables, each with the node that runs it.
     let (code, t) = o.call("GET", "/v1/tables").await;
