@@ -351,21 +351,7 @@ fn listed_state(t: &Value) -> &'static str {
 async fn stored(node: &Node, p: &Pipeline) -> Result<Vec<Value>, String> {
     let docs = (node.docs)(p).map_err(|e| format!("the state location: {e}"))?;
     let halts = docs.halts().await.map_err(|e| e.to_string())?;
-    Ok(halts
-        .tables
-        .iter()
-        .filter(|h| !h.copy)
-        .map(|h| {
-            let since = halts.since(&h.table);
-            json!({
-                "table": table_name(p, &h.table),
-                "state": "halted",
-                "halt": { "code": h.reason.code(), "detail": h.reason.to_string(), "since": since },
-                "fresh_as_of": since,
-                "stale": false,
-            })
-        })
-        .collect())
+    Ok(crate::live::stored(p, &halts, Utc::now()))
 }
 
 /// One pipeline's tables, each with its pipeline and node, and why the holder couldn't be asked.
@@ -810,6 +796,46 @@ mod tests {
         let stale: Vec<String> = names(&v).into_iter().map(|(n, _)| n).collect();
         assert_eq!(stale, ["public.events", "public.orders", "public.quiet"]);
         assert_eq!(v["counts"]["stale"], 3);
+    }
+
+    /// A holder without a worker (a stopped pipeline) answers with its halts from storage: they
+    /// are listed live, from it.
+    #[tokio::test]
+    async fn a_holder_without_a_worker_lists_its_halts() {
+        let status = ControllerStatus {
+            actual: Some(Actual::Stopped),
+            owner_epoch: Some(4),
+            lease: None,
+            worker: None,
+        };
+        let stopped = watch::channel(BTreeMap::from([(
+            "orders".to_owned(),
+            watch::channel(status).1,
+        )]))
+        .1;
+        let (addr, lone, _dir) =
+            served_with("http://127.0.0.1:1", open(), |n| n.statuses = stopped).await;
+        let docs = (lone.node.docs)(&config().pipelines["orders"]).unwrap();
+        docs.record_halt(&TableHalt {
+            table: t("items"),
+            reason: HaltReason::TableDropped,
+            at: SourcePosition::Pg(Lsn(0x20)),
+            copy: false,
+        })
+        .await
+        .unwrap();
+        let (code, _, text) = request(addr, "GET", "/v1/tables", &[], "").await;
+        assert_eq!(code, 200, "{text}");
+        let v = json(&text);
+        assert_eq!(
+            names(&v),
+            [("public.items".to_owned(), "halted".to_owned())]
+        );
+        assert_eq!(
+            (&v["tables"][0]["live"], &v["tables"][0]["node"]),
+            (&json!(true), &json!("node-a"))
+        );
+        assert_eq!(v["unreachable"], json!([]));
     }
 
     /// A holder that can't be asked: the pipeline's halted tables come from storage, and the
