@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-18
+updated: 2026-11-19
 domain: Architecture
 tags: [v1.1, implementation-plan, m13e, console, chart-history, prometheus, api, cluster, state, telemetry, pipeline]
 ---
@@ -229,7 +229,7 @@ The rest are Claude's calls under Admin_Console §13.
   sample: a new chunk or a new series is written at once), never for the minute's; one scenario
   on each source, about 42 s.
 
-### Spec patch S-M13e.1 (needs approval)
+### Spec patch S-M13e.1 (approved 2026-11-19, applied)
 
 `doc/specs/System-Overview.md` §Management API endpoints, a row after **Events**:
 
