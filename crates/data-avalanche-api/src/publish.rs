@@ -297,9 +297,9 @@ mod tests {
         );
     }
 
-    /// The loop sends nothing while no stream follows, and the state once one does.
+    /// The loop, once a stream follows the node, sends it what it runs within a look.
     #[tokio::test]
-    async fn the_node_publishes_only_while_followed() {
+    async fn the_node_publishes_once_followed() {
         let (mut node, _tx, _dir) = node(Actual::Running).await;
         node.feed = Feed::new();
         let task = tokio::spawn(publish(node.clone()));
