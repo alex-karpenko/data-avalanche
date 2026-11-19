@@ -27,6 +27,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Notify, broadcast, mpsc, watch};
 use tokio::task::{AbortHandle, JoinSet};
 
+use crate::auth::Denied;
 use crate::follow::FOLLOW_SILENCE;
 use crate::nodes::phase;
 use crate::peers::FORWARDED_BY;
@@ -242,18 +243,20 @@ struct Follow {
 }
 
 impl Follow {
-    /// Whether the caller's credentials still verify here as a viewer's, as the route's own check
-    /// says: a token expired, a password changed or a role taken away since the stream opened
-    /// don't.
+    /// Whether the caller isn't refused here, as the route's own check says: a token expired, a
+    /// password changed or a role taken away since the stream opened is. A verifier that can't
+    /// check now (its settings refused, the issuer's keys unreachable: a 503) refuses no caller:
+    /// the peer is followed, and answers for itself.
     async fn still_verified(&self) -> bool {
         let mut headers = HeaderMap::new();
         if let Some(a) = &self.authorization {
             headers.insert(header::AUTHORIZATION, a.clone());
         }
-        self.auth
-            .verify(&headers)
-            .await
-            .is_ok_and(|p| p.role >= Role::Viewer)
+        match self.auth.verify(&headers).await {
+            Ok(p) => p.role >= Role::Viewer,
+            Err(Denied::Unavailable(_)) => true,
+            Err(Denied::Unauthenticated { .. } | Denied::Forbidden { .. }) => false,
+        }
     }
 }
 
@@ -845,6 +848,44 @@ mod tests {
         );
         assert!(s.ended().await, "the stream ends: the page opens it again");
         assert_eq!(log.lock().unwrap().len(), 1, "node-b never asked again");
+    }
+
+    /// A verifier that can't check now (the settings refused after a reload) isn't the caller
+    /// failing: the peer is followed again, and its own answer is what the page sees.
+    #[tokio::test]
+    async fn a_stream_whose_verifier_is_unavailable_goes_on_following() {
+        let (b_url, log) = crate::test_support::fake_answering(
+            Duration::ZERO,
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({ "error": "the API's auth settings are inconsistent" }),
+        )
+        .await;
+        let auth = std::sync::Arc::new(crate::Auth::new(
+            &basic("s3cret"),
+            crate::test_support::USERNAME_CLAIM,
+        ));
+        let (addr, lone, _dir) = served_with(&b_url, std::sync::Arc::clone(&auth), |_| {}).await;
+        let mut s = stream(addr, "/v1/stream", &[("authorization", OPS)]).await;
+        s.next().await;
+        let unreachable = json!({
+            "node": "node-a",
+            "peer": "node-b",
+            "state": "unreachable",
+            "error": "it answered 503: the API's auth settings are inconsistent",
+        });
+        assert_eq!(s.next().await, ("peer".into(), unreachable.clone()));
+        // `auth: basic` without its credentials: every caller is answered 503, none refused.
+        let mut refused = basic("s3cret");
+        refused.credentials = None;
+        auth.set(&refused, crate::test_support::USERNAME_CLAIM);
+        assert_eq!(
+            s.next().await,
+            ("peer".into(), unreachable),
+            "followed again, no reset"
+        );
+        assert_eq!(log.lock().unwrap().len(), 2);
+        lone.node.feed.publish(live("node", None, 1));
+        assert_eq!(s.next().await.1["n"], 1, "the stream goes on");
     }
 
     #[tokio::test]
