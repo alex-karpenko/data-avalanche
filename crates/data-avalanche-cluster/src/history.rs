@@ -13,7 +13,8 @@ use std::time::Duration;
 use chrono::{DateTime, TimeDelta, Utc};
 use data_avalanche_core::TableRef;
 use data_avalanche_state::{
-    ChartChunk, ChartScope, Charts, SAMPLE_EVERY, TABLE_SAMPLE_EVERY, chart_key, hour_of,
+    CLOSED_AFTER, ChartChunk, ChartScope, Charts, SAMPLE_EVERY, TABLE_SAMPLE_EVERY, chart_key,
+    hour_of,
 };
 use data_avalanche_telemetry::{Metrics, ProcessFigures};
 use futures_util::{StreamExt, stream};
@@ -26,8 +27,12 @@ use crate::controller::{Actual, ControllerStatus};
 pub const WRITE_EVERY: Duration = Duration::from_secs(60);
 
 /// How long after its hour ends a chunk that can't be written is still kept for another try;
-/// past it, its samples are dropped with a warning.
+/// past it, its samples are dropped with a warning. A reader takes an hour as final only
+/// [`CLOSED_AFTER`] after it ended, past this: the two move together.
 pub const UNWRITTEN_KEPT: Duration = Duration::from_secs(3600);
+
+// No reader holds an hour as final while its writer may still write it.
+const _: () = assert!(UNWRITTEN_KEPT.as_secs() < CLOSED_AFTER.as_secs());
 
 /// How often the expired days are deleted.
 pub const HISTORY_PRUNE_EVERY: Duration = Duration::from_secs(3600);

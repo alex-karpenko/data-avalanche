@@ -25,9 +25,11 @@ const READ_CONCURRENCY: usize = 16;
 /// The most ended hours a [`Charts`] keeps in memory; past it, the oldest go first.
 pub const CLOSED_KEPT: usize = 4096;
 
-/// How long after its hour ends a chunk is taken as final and kept in memory: its writer writes
-/// it once more within a minute of the hour's end.
-pub const CLOSED_AFTER: Duration = Duration::from_secs(300);
+/// How long after its hour ends a chunk is taken as final and kept in memory: only once no writer
+/// may still write it. A writer tries an ended chunk again until the sampler's `UNWRITTEN_KEPT`
+/// (an hour, `data_avalanche_cluster::UNWRITTEN_KEPT`) after its hour ended, so this is that hour
+/// and a margin; the two move together.
+pub const CLOSED_AFTER: Duration = Duration::from_secs(65 * 60);
 
 /// What a series belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,12 +247,16 @@ impl Charts {
         }
     }
 
-    /// Writes `chunk` over what its writer wrote of the hour before.
+    /// Writes `chunk` over what its writer wrote of the hour before, and lets go of the copy of it
+    /// held as final, if any.
     ///
     /// # Errors
     /// A storage failure.
     pub async fn write(&self, chunk: &ChartChunk) -> Result<(), StateError> {
-        self.docs.put(&chunk.key(), chunk).await.map(|_| ())
+        let key = chunk.key();
+        let written = self.docs.put(&key, chunk).await.map(|_| ());
+        self.closed.lock().expect("unpoisoned").remove(&key);
+        written
     }
 
     /// `scope`'s chunks of the hours that meet `[since, until)`, each writer's apart, by hour. A
@@ -306,6 +312,7 @@ impl Charts {
                             let mut closed = self.closed.lock().expect("unpoisoned");
                             closed.insert(key, Arc::clone(&chunk));
                             while closed.len() > CLOSED_KEPT {
+                                // Keys start with the day: the first is of the oldest day.
                                 closed.pop_first();
                             }
                         }
@@ -441,23 +448,26 @@ mod tests {
     #[tokio::test]
     async fn an_ended_hour_is_read_once_and_the_current_one_every_time() {
         let (charts, store) = charts();
+        // Another node's writer, over the same store.
+        let writer = Charts::new(DocStore::new(Arc::clone(&store)));
         let p = ChartScope::Pipeline("p".into());
-        charts
+        writer
             .write(&chunk(&p, at(18, 0, 0), "e1", 1.0))
             .await
             .unwrap();
-        charts
+        writer
             .write(&chunk(&p, at(18, 1, 0), "e1", 1.0))
             .await
             .unwrap();
-        let now = at(18, 1, 30);
+        // The 0 o'clock hour ended over CLOSED_AFTER ago; the 1 o'clock one not yet.
+        let now = at(18, 2, 30);
         charts.read(&p, at(18, 0, 0), now, now).await.unwrap();
-        // Both rewritten behind the reader's back: only the current hour is read again.
-        charts
+        // Both rewritten behind the reader's back: only the hour not yet final is read again.
+        writer
             .write(&chunk(&p, at(18, 0, 0), "e1", 5.0))
             .await
             .unwrap();
-        charts
+        writer
             .write(&chunk(&p, at(18, 1, 0), "e1", 6.0))
             .await
             .unwrap();
@@ -476,6 +486,48 @@ mod tests {
             charts.read(&p, at(18, 0, 0), now, now).await.unwrap().len(),
             2
         );
+    }
+
+    /// A writer tries an ended hour again until `UNWRITTEN_KEPT` after it ended (a store that
+    /// recovers from an outage): a read before then doesn't take the hour as final.
+    #[tokio::test]
+    async fn an_hour_its_writer_may_still_write_is_read_again() {
+        let (charts, store) = charts();
+        let writer = Charts::new(DocStore::new(Arc::clone(&store)));
+        let p = ChartScope::Pipeline("p".into());
+        writer
+            .write(&chunk(&p, at(18, 0, 0), "e1", 1.0))
+            .await
+            .unwrap();
+        // Half an hour after the hour ended.
+        let now = at(18, 1, 30);
+        charts.read(&p, at(18, 0, 0), now, now).await.unwrap();
+        writer
+            .write(&chunk(&p, at(18, 0, 0), "e1", 5.0))
+            .await
+            .unwrap();
+        let now = at(18, 1, 45);
+        let read = charts.read(&p, at(18, 0, 0), now, now).await.unwrap();
+        assert_eq!(read[0].series["lag_seconds"].v, [5.0]);
+    }
+
+    /// A node's own write of an hour it holds as final replaces what it holds.
+    #[tokio::test]
+    async fn a_write_lets_go_of_the_hour_held_as_final() {
+        let (charts, _) = charts();
+        let p = ChartScope::Pipeline("p".into());
+        charts
+            .write(&chunk(&p, at(18, 0, 0), "e1", 1.0))
+            .await
+            .unwrap();
+        let now = at(18, 3, 0);
+        charts.read(&p, at(18, 0, 0), now, now).await.unwrap();
+        charts
+            .write(&chunk(&p, at(18, 0, 0), "e1", 5.0))
+            .await
+            .unwrap();
+        let read = charts.read(&p, at(18, 0, 0), now, now).await.unwrap();
+        assert_eq!(read[0].series["lag_seconds"].v, [5.0]);
     }
 
     #[tokio::test]
