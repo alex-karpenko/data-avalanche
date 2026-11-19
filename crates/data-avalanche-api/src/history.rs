@@ -1,12 +1,13 @@
 //! `GET /v1/history` (Admin_Console §7, D-M13e.5): the series the nodes sampled, read by any node
 //! from the chart history in `globals.state`, over a range and at a step. A pipeline's series
-//! follow it across its lease terms, a node's across its processes.
+//! follow it across its lease terms, a node's across its processes. A pipeline's range older than
+//! the history kept comes from `globals.console.prometheus` when it is set (D-M13e.6).
 
 use axum::extract::{RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use chrono::{DateTime, TimeDelta, Utc};
-use data_avalanche_config::{Pipeline, ResolvedConfig};
+use data_avalanche_config::{Pipeline, Prometheus, ResolvedConfig};
 use data_avalanche_state::{
     ChartChunk, ChartScope, Fold, SERIES, Series, SeriesScope, StateError, series_of,
 };
@@ -15,6 +16,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 use crate::events::time;
+use crate::prometheus::{Outcome, promql};
 use crate::snapshots::{READ_AT_ONCE, named_table};
 use crate::{Api, Failure, Node, body, starting};
 
@@ -369,21 +371,123 @@ pub(crate) async fn read(State(api): State<Api>, RawQuery(raw): RawQuery) -> Res
     };
     let retention = config.globals.console.history.retention;
     let kept_since = now - TimeDelta::from_std(retention).unwrap_or(MAX_SPAN);
-    match answer(node, &q, kept_since, now).await {
-        Ok(series) => body(
-            StatusCode::OK,
-            &json!({
-                "since": q.since,
-                "until": q.until,
-                "step": q.step,
-                "kept_since": kept_since,
-                "series": series,
+    let mut series = match answer(node, &q, kept_since, now).await {
+        Ok(series) => series,
+        Err(e) => {
+            return body(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({ "error": format!("the chart history: {e}") }),
+            );
+        }
+    };
+    let mut out = json!({
+        "since": q.since,
+        "until": q.until,
+        "step": q.step,
+        "kept_since": kept_since,
+    });
+    // Without a Prometheus, the history kept is the whole answer: nothing is marked missing.
+    if let Some(prometheus) = &config.globals.console.prometheus {
+        if q.since < kept_since {
+            older(node, prometheus, &q, kept_since, &mut series).await;
+        }
+        out["prometheus"] = match node.prometheus.last() {
+            None => json!({ "state": "unasked" }),
+            Some(o) => json!({
+                "state": if o.error.is_some() { "failing" } else { "ok" },
+                "at": o.at,
+                "error": o.error,
             }),
-        ),
-        Err(e) => body(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &json!({ "error": format!("the chart history: {e}") }),
-        ),
+        };
+    }
+    out["series"] = json!(series);
+    body(StatusCode::OK, &out)
+}
+
+/// Adds to `series` the points of their range before `kept_since` from `prometheus`, at the
+/// query's step, and says where each one's older range comes from (`older`): `prometheus`,
+/// `failing` (Prometheus didn't answer; the range shows the history kept only), or
+/// `not_in_prometheus` (a table's or a node's series). Records how the reads went.
+async fn older(
+    node: &Node,
+    prometheus: &Prometheus,
+    q: &Query,
+    kept_since: DateTime<Utc>,
+    series: &mut [Value],
+) {
+    let Asked::Pipelines(ps) = &q.asked else {
+        for s in series.iter_mut() {
+            s["older"] = json!("not_in_prometheus");
+        }
+        return;
+    };
+    let names: Vec<String> = ps.iter().map(|p| p.name.clone()).collect();
+    let start = q.since.timestamp().div_euclid(q.step) * q.step;
+    // A point's step must end by `kept_since`: the step it begins is the history's.
+    let last = kept_since.timestamp().div_euclid(q.step) * q.step - q.step;
+    let (Some(start_at), Some(end_at)) = (
+        DateTime::from_timestamp(start, 0),
+        DateTime::from_timestamp(last.min(q.until.timestamp()), 0),
+    ) else {
+        return;
+    };
+    if start_at > end_at {
+        // The range older than the history kept is within the step the history begins.
+        return;
+    }
+    let read = match node.prometheus.client(prometheus) {
+        Err(e) => Err(e),
+        Ok(client) => {
+            let queries = q.series.iter().map(|s| {
+                let client = Arc::clone(&client);
+                let query = promql(s, &names, &prometheus.extra_labels, q.step);
+                async move {
+                    match query {
+                        None => Ok((s.name, Default::default())),
+                        Some(query) => client
+                            .range(&query, start_at, end_at, q.step)
+                            .await
+                            .map(|r| (s.name, r)),
+                    }
+                }
+            });
+            futures_util::future::join_all(queries)
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+        }
+    };
+    node.prometheus.record(Outcome {
+        at: Utc::now(),
+        error: read.as_ref().err().map(ToString::to_string),
+    });
+    let Ok(read) = read else {
+        for s in series.iter_mut() {
+            s["older"] = json!("failing");
+        }
+        return;
+    };
+    let by_id: std::collections::BTreeMap<&str, &str> = ps
+        .iter()
+        .map(|p| (p.id.as_str(), p.name.as_str()))
+        .collect();
+    for s in series.iter_mut() {
+        let name = s["pipeline"].as_str().and_then(|id| by_id.get(id)).copied();
+        let found = read
+            .iter()
+            .find(|(n, _)| Some(*n) == s["name"].as_str())
+            .and_then(|(_, r)| name.and_then(|n| r.get(n)));
+        let mut points: Vec<Value> = found
+            .into_iter()
+            .flatten()
+            .filter(|(t, _)| *t >= start && *t <= last)
+            .map(|(t, v)| json!([t, v]))
+            .collect();
+        if let Some(kept) = s["points"].as_array() {
+            points.extend(kept.iter().cloned());
+        }
+        s["points"] = json!(points);
+        s["older"] = json!("prometheus");
     }
 }
 
@@ -395,7 +499,14 @@ mod tests {
     use object_store::memory::InMemory;
 
     use super::*;
-    use crate::test_support::{config, json_of, open, served, served_with};
+    use std::collections::BTreeMap;
+    use std::net::SocketAddr;
+
+    use data_avalanche_config::ProcessEnv;
+
+    use crate::test_support::{
+        Lone, api, config, json_of, lone_with, open, serve, served, served_with,
+    };
 
     fn params(q: &str) -> Vec<(String, String)> {
         url::form_urlencoded::parse(q.as_bytes())
@@ -634,5 +745,167 @@ mod tests {
             (kept.with_timezone(&Utc) - expected).num_seconds().abs() < 5,
             "{v}"
         );
+    }
+
+    /// Every range query a fake Prometheus was asked: its form, and its `Authorization`.
+    type Queries = Arc<std::sync::Mutex<Vec<(BTreeMap<String, String>, Option<String>)>>>;
+
+    /// A fake Prometheus on a loopback port: it answers each range query `code` and, on 200,
+    /// `orders` at the query's first two steps (7, then 8).
+    async fn fake_prometheus(code: u16) -> (String, Queries) {
+        use axum::body::Bytes;
+        use axum::http::HeaderMap;
+        let asked: Queries = Arc::default();
+        let seen = Arc::clone(&asked);
+        let app = axum::Router::new().route(
+            "/api/v1/query_range",
+            axum::routing::post(move |headers: HeaderMap, body: Bytes| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    let form: BTreeMap<String, String> =
+                        url::form_urlencoded::parse(&body).into_owned().collect();
+                    let auth = headers
+                        .get("authorization")
+                        .map(|v| v.to_str().unwrap().to_owned());
+                    let start: i64 = form["start"].parse().unwrap();
+                    let step: i64 = form["step"].trim_end_matches('s').parse().unwrap();
+                    seen.lock().unwrap().push((form, auth));
+                    let answer = json!({
+                        "status": "success",
+                        "data": { "resultType": "matrix", "result": [{
+                            "metric": { "pipeline": "orders" },
+                            "values": [[start, "7"], [start + step, "8"]],
+                        }]},
+                    });
+                    match code {
+                        200 => (StatusCode::OK, answer.to_string()),
+                        c => (
+                            StatusCode::from_u16(c).unwrap(),
+                            "the TSDB is starting".to_owned(),
+                        ),
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        (format!("http://{addr}"), asked)
+    }
+
+    /// node-a's API running [`crate::test_support::CONFIG`] with `globals.console.prometheus`
+    /// at `url`.
+    async fn served_prometheus(url: &str) -> (SocketAddr, Lone, tempfile::TempDir) {
+        let text = crate::test_support::CONFIG.replace(
+            "pipelines:\n",
+            &format!(
+                "  console:\n    prometheus: {{ url: \"{url}\", bearer_token: tok, extra_labels: {{ cluster: prod-eu }} }}\npipelines:\n"
+            ),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.yaml");
+        std::fs::write(&file, &text).unwrap();
+        let lone = lone_with(file, &text, Arc::new(ProcessEnv)).await;
+        let a = api(open());
+        a.node.set(lone.node.clone()).unwrap();
+        (serve(a).await, lone, dir)
+    }
+
+    /// A lag sample 30 s ago, in the history kept.
+    async fn recent(charts: &Charts) -> i64 {
+        let t = Utc::now() - TimeDelta::seconds(30);
+        let hour = t.duration_trunc(TimeDelta::hours(1)).unwrap();
+        let mut p = chunk(ChartScope::Pipeline("orders".into()), hour, "e1");
+        let offset = u16::try_from((t - hour).num_seconds()).unwrap();
+        p.series.insert("lag_seconds".into(), pts(&[(offset, 2.0)]));
+        written(charts, vec![p]).await;
+        t.timestamp()
+    }
+
+    fn since(hours: i64) -> String {
+        (Utc::now() - TimeDelta::hours(hours)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    }
+
+    #[tokio::test]
+    async fn a_pipeline_s_range_past_the_retention_comes_from_prometheus() {
+        let (url, asked) = fake_prometheus(200).await;
+        let (addr, lone, _dir) = served_prometheus(&url).await;
+        let sampled = recent(&lone.node.charts).await;
+        let (code, v) = json_of(
+            addr,
+            "GET",
+            &format!("/v1/history?series=lag_seconds&since={}", since(30)),
+        )
+        .await;
+        assert_eq!(code, 200, "{v}");
+        let step = v["step"].as_i64().unwrap();
+        assert_eq!(step, 75, "30 h at 1440 points, a multiple of 15 s");
+        let s = &v["series"][0];
+        assert_eq!(s["older"], "prometheus");
+        let points = s["points"].as_array().unwrap();
+        let (first, second) = (points[0][0].as_i64().unwrap(), &points[1]);
+        assert_eq!(
+            (&points[0][1], second),
+            (&json!(7.0), &json!([first + step, 8.0]))
+        );
+        // The history kept follows: its sample in its step.
+        let last = points.last().unwrap();
+        assert_eq!(last, &json!([sampled.div_euclid(step) * step, 2.0]));
+        assert_eq!(v["prometheus"]["state"], "ok");
+        let asked = asked.lock().unwrap();
+        let (form, auth) = &asked[0];
+        assert_eq!(auth.as_deref(), Some("Bearer tok"));
+        assert_eq!(
+            form["query"],
+            r#"max by (pipeline) (data_avalanche_replication_lag_seconds{pipeline=~"orders",cluster="prod-eu"})"#
+        );
+        assert_eq!(form["step"], "75s");
+        let kept = DateTime::parse_from_rfc3339(v["kept_since"].as_str().unwrap())
+            .unwrap()
+            .timestamp();
+        assert!(form["end"].parse::<i64>().unwrap() + step <= kept);
+    }
+
+    /// Prometheus failing never fails the answer: the history kept is shown, and the older range
+    /// is marked. A table's or a node's series aren't asked of it.
+    #[tokio::test]
+    async fn a_failing_prometheus_leaves_the_history_kept() {
+        let (url, asked) = fake_prometheus(503).await;
+        let (addr, lone, _dir) = served_prometheus(&url).await;
+        recent(&lone.node.charts).await;
+        let (_, v) = json_of(addr, "GET", "/v1/history?series=lag_seconds").await;
+        assert_eq!(
+            v["prometheus"]["state"], "unasked",
+            "an hour is within the history"
+        );
+        assert!(v["series"][0].get("older").is_none());
+        let (code, v) = json_of(
+            addr,
+            "GET",
+            &format!("/v1/history?series=lag_seconds&since={}", since(30)),
+        )
+        .await;
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(v["series"][0]["older"], "failing");
+        assert_eq!(v["series"][0]["points"].as_array().unwrap().len(), 1);
+        assert_eq!(v["prometheus"]["state"], "failing");
+        assert!(
+            v["prometheus"]["error"].as_str().unwrap().contains("503"),
+            "{v}"
+        );
+        let before = asked.lock().unwrap().len();
+        for q in ["node=node-a", "pipeline=orders&table=public.orders"] {
+            let (_, v) =
+                json_of(addr, "GET", &format!("/v1/history?{q}&since={}", since(30))).await;
+            assert!(
+                v["series"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|s| s["older"] == "not_in_prometheus"),
+                "{v}"
+            );
+        }
+        assert_eq!(asked.lock().unwrap().len(), before);
     }
 }

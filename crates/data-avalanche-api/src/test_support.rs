@@ -316,6 +316,7 @@ pub(crate) async fn lone_with(file: PathBuf, text: &str, env: Arc<dyn Env + Send
             factory: Arc::new(Lakes(sink.clone())),
             lake: Arc::default(),
             charts: Arc::new(data_avalanche_state::Charts::new(docs.clone())),
+            prometheus: Arc::default(),
         },
         events,
         leases,

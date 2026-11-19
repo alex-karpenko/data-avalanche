@@ -21,6 +21,7 @@ mod nodes;
 mod openapi;
 mod peers;
 mod pipelines;
+mod prometheus;
 mod server;
 mod snapshots;
 mod tables;
@@ -57,6 +58,10 @@ pub use openapi::openapi;
 pub use peers::{
     ACTION_LIMIT, ANSWERED_BY, DETAIL_LIMIT, FORWARDED_BY, MAX_ANSWER, Peers, PeersError,
     STATUS_LIMIT, TARGET,
+};
+pub use prometheus::{
+    MAX_PROMETHEUS_ANSWER, MIN_RATE_WINDOW, Outcome, PrometheusClient, PrometheusError,
+    PrometheusReader, promql,
 };
 pub use server::{Bound, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT, MAX_CONNECTIONS, ServeError, bind};
 pub use snapshots::{EndedJobs, READ_AT_ONCE};
@@ -113,6 +118,8 @@ pub struct Node {
     pub lake: Arc<Lake>,
     /// The chart history every node samples into `globals.state` (Admin_Console §7).
     pub charts: Arc<Charts>,
+    /// Reads a pipeline's series older than the history kept from `globals.console.prometheus`.
+    pub prometheus: Arc<PrometheusReader>,
 }
 
 impl std::fmt::Debug for Node {

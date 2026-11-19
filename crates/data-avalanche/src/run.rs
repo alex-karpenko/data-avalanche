@@ -329,6 +329,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         factory: Arc::clone(&deps.factory),
         lake: Arc::default(),
         charts,
+        prometheus: Arc::default(),
     });
     ready.store(true, Ordering::SeqCst);
     let mut cluster = Some((gossip, reconciler, discovery));
