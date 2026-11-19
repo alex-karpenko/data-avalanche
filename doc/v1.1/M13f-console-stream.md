@@ -3972,3 +3972,79 @@ git commit -m "test(e2e): the live stream through any node, across a failover an
   and `mariadb-118` (40 s); the whole E2E suite passed on PostgreSQL 18 (57 tests, 833 s); the
   site built (31 pages, link check clean).
 - Then, on Oleksii's request: the whole-branch review and its fixes, the push, the PR.
+
+## Deviations during execution
+
+The code above is the plan as approved. Where execution changed it, this section says what and
+why; the decisions it amends (D-M13f.1, .4, .5) are read with it.
+
+### Task 1: nothing is built while no stream is open
+
+Task 1's review found that the plan's code broke its own Global Constraint: the sampler built a
+`samples` message for every scope at every sample, and the recorder cloned and serialized each
+event, before `Feed::publish` asked whether a stream was open. A fix round in Task 1's commit:
+the sampler has a private `live` flag, set from `feed.followed()` in `sample_history` before each
+sample, and builds its messages only then; the recorder builds an event's message only
+`if feed.followed()`. New test: `nothing_is_built_while_no_stream_is_open`.
+
+### Task 4: a message ends at a blank line under any line ending
+
+Task 4's review found that `Frames::next` found a message's end only at LF LF, so a followed
+stream framed with CRLF or CR alone (D-M13f.5: "a line ends at CR, LF or both") never yielded a
+message and failed at `MAX_FRAME`. A fix round in Task 4's commit: `message_end` walks the buffer
+line by line (CR LF, CR or LF) to the first blank line. New test:
+`a_message_ends_at_a_blank_line_under_any_line_ending`.
+
+### The whole-branch review's fixes
+
+The review found no Critical issue and two Important ones, both in D-M13f.5; Oleksii ruled on each
+and on the minors, each fix in its own commit after Task 6's:
+
+- **A re-followed peer refused an expired caller** (I1, D-M13f.5 amended): the node asked checked
+  the caller once, at the stream's opening, while each peer checked again at every re-follow; once
+  the caller's token expired or its password rotated, healthy peers showed `unreachable` for as
+  long as the page stayed open (a role lowered below viewer also recorded a denial every 10 s).
+  Oleksii chose to re-check locally: before each re-follow of a peer, the node verifies the
+  caller's kept `Authorization` with its own `Auth`, as the route's gate does. A refused caller
+  (bad, expired or missing credentials, a role below viewer) ends the stream with `reset`, reason
+  `credentials`, its last message, so the page reconnects with fresh ones. A verifier that can't
+  check now (auth misconfigured after a reload, a key not cached while the identity provider is
+  down) doesn't end it: the stream goes on following, and the peer's own answer shows. That last
+  rule was a residual of the fix wave's re-review, fixed on Oleksii's ruling in its own commit.
+- **Generation skew showed a healthy peer unreachable** (I2, D-M13f.5 amended): a peer that
+  hadn't adopted the generation the node asked runs answered a forwarded stream's `pipeline`
+  filter with `404` (and a future `kind` would be `400` during a rolling upgrade). A stream that
+  carries `FORWARDED_BY` now reads no config: it accepts a pipeline id it doesn't know (passing
+  none of its messages), ignores a kind or a parameter it doesn't know, and still refuses a
+  parameter given twice. A direct request is unchanged.
+- **Every state again whenever a stream opens** (D-M13f.4 amended): the publisher re-sent the
+  states only when the count of open streams grew, so a stream that opened as another closed
+  within a second waited for a change. `Feed` counts openings (`opened`), incremented once a
+  stream has subscribed (a residual of the re-review: before it, the publisher could re-send in
+  the gap), and the publisher compares that count.
+- **The publisher's states don't wait on a reload** (D-M13f.4): a figures tick read the config,
+  whose lock a reload holds across storage, before sending the states it had computed. The
+  publisher now sends the states (`Publisher::states`, synchronous) before it builds the figures
+  (`Publisher::figures`, the only part that reads the config).
+- **A peer's refusal is read to 8 KiB** and its reason clipped to `MAX_ERROR`, so a proxy's page
+  never lands in memory or in a `peer` message every 10 s.
+- **Tests:** the stream's head says `Cache-Control: no-cache`; the stream is served with
+  `globals.console.enabled: false`; a member at a new address is followed there and its old
+  address dropped; the publisher's loop test is renamed `the_node_publishes_once_followed`
+  (the plan's name claimed more than it checks).
+- **Docs:** the observability page and §8.1 say what a `pipeline` filter drops, that a parameter
+  given twice or empty is `400`, the `credentials` reset, that a gap's events are re-read from
+  `GET /v1/events` after a peer comes back, that the higher `owner_epoch` runs a pipeline two
+  nodes name, and that a node full of streams shows as `unreachable` on other pages; a doc
+  comment's broken wrap in `history.rs`.
+
+The review's other minors stay as they are (its triage: harmless or bounded): the unbiased
+`select!` at a node's stop, `kind=node,,event`'s empty entries, the frame scan's rescan of a
+trickled message, the E2E reader's per-read UTF-8 decode, and the like.
+
+### At the exit
+
+On `a394808`, the last fix: `cargo test --workspace` 1786 passed, both clippy runs and
+`cargo fmt --all --check` clean; the whole E2E suite on PostgreSQL 18 passed (57 tests, 823 s);
+Task 6's scenario passed on `mysql-84` (38 s), `mysql-84-nogtid` (39 s) and `mariadb-118`
+(37 s); `cargo xtask docs --check` held and the site built (31 pages, link check clean).
