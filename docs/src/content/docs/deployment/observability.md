@@ -58,6 +58,59 @@ is a starting set of Prometheus rules, with `promtool` tests beside it:
 | `DataAvalancheWalLag` | a slot holds more than 10 GiB of WAL for 10 minutes | [A lost position](/data-avalanche/runbooks/position-lost/) |
 | `DataAvalancheEventsDropped` | a node dropped events from the cluster's timeline in the last 15 minutes | [Events](/data-avalanche/deployment/events/#when-the-timeline-has-gaps) |
 
+## Chart history
+
+Every node keeps a short history of the figures its charts need, without Prometheus, in the
+cluster's state location (`globals.state`, under `history/`). Each node samples what it owns:
+
+| Of | Series | Every |
+|---|---|---|
+| a pipeline, by the node that holds its lease | `lag_seconds`, `changes_per_minute`, `wal_held_bytes` (PostgreSQL), `binlog_lag_seconds` (MySQL, MariaDB), `snapshot_rows_per_second` (while a snapshot copies) | 15 s |
+| each of its tables | `changes_per_minute`, `files_rewritten` (the costliest MERGE of the minute), `commit_seconds` (the slowest commit of the minute) | 1 min; a table the pipeline starts tracking at once |
+| the node | `memory_bytes` and `cpu_cores` (Linux), `lease_renew_seconds` (its slowest lease renewal since the sample before) | 15 s |
+
+`lag_seconds` is what the pipeline's live figures show: how far behind lake readers are. The
+samples of the current hour are written when the hour begins or a new series starts (a table the
+pipeline starts tracking shows within a sample), then every minute, so a node that
+crashes loses at most a minute of them, and a pipeline's history follows it to the node that
+takes it over. A storage outage holds the samples in memory and writes them when it ends; it
+never slows a pipeline. History older than `globals.console.history.retention` (24 h by default)
+is deleted a day at a time. A pipeline's history costs about 60 writes an hour, to one object
+an hour.
+
+`GET /v1/history` reads it, from any node:
+
+```sh
+curl -u oleksii:… 'https://avalanche.example.com:8080/v1/history?pipeline=orders-pg&series=lag_seconds&since=2026-11-18T06:00:00Z'
+```
+
+It answers each series' points, `[unix seconds, value]`, at a step that keeps a series to 1440
+points (a longer step keeps each step's peak of a lag or a size, and the mean of a rate), and
+`kept_since`, where the history kept begins.
+
+### Older ranges from Prometheus
+
+With `globals.console.prometheus` set, a pipeline's range older than the retention comes from
+that Prometheus, which scrapes the nodes' `/metrics`: each series is one range query over
+`data_avalanche_replication_lag_seconds`, `data_avalanche_rows_read_total`,
+`data_avalanche_wal_lag_bytes` or `data_avalanche_binlog_lag_seconds`, grouped by `pipeline`,
+with `extra_labels` in every selector so another cluster's series never mix in:
+
+```yaml
+globals:
+  console:
+    prometheus:
+      url: https://prometheus.observability:9090
+      bearer_token: ${PROM_TOKEN}
+      extra_labels: { cluster: prod-eu }
+```
+
+Each series then says where its older range came from (`older`): `prometheus`; `failing`, when
+Prometheus didn't answer within `timeout` (the history kept is shown, and the answer's
+`prometheus` says what failed); or `not_in_prometheus` for a table's or a node's series, whose
+metrics carry no such label. Without the setting, the history kept is the whole answer, and
+nothing is marked.
+
 ## The log
 
 To stderr, as `globals.log.format`: `json` (one object a line), `compact` or `pretty`; at
