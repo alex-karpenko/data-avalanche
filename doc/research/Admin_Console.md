@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-14
+updated: 2026-11-19
 domain: Architecture
 tags: [admin-console, web-ui, management-api, auth, sessions, audit, metrics-history, prometheus, v1.1]
 ---
@@ -180,6 +180,52 @@ expire.
 - **Replication first.** The console's work never slows the pipelines: lower priority, its own
   request limits.
 
+### 8.1 The live stream (M13f)
+
+`GET /v1/stream` (viewer) is the push above. Oleksii decided three things on 2026-11-19: it sends
+**values as they change** (not "something changed, read again"), the **figures every 5 s**, and
+**no replay** (a page reads the current state, then applies what follows). The rest is Claude's
+call.
+
+- **Each node publishes its own, from memory.** A pipeline's `pipeline` state (looked at every
+  second, sent on a change of state, error or lease term; `standby` once when the node stops
+  running it), its `figures` (the live answer, the halts' start times left out: they are in
+  storage), the node's own `node` figures, each chart `samples` as taken, each `event` once
+  written. Nothing is built while no stream is open on the node; a stream that opens gets every
+  state again within a second. A node killed sends no `standby`: when two nodes name the same
+  pipeline as theirs, the one with the higher `owner_epoch` runs it.
+- **The node asked merges the others.** It follows each other member with an API address, with
+  the caller's own credentials and the target and forwarded-by headers of §10's forwarding, and
+  passes their messages on as sent; a stream asked for by another node is that node's own alone.
+  `peer` says when a member is followed (`following`) and when it can't be (`unreachable`, with
+  why: it can't be reached, it is full of streams, "it answered 503", or it refuses credentials
+  the node asked still takes, "it answered 401" on other auth settings), retried after 1, 2, 5,
+  then every 10 s; `members` says when the members or their phases change. Every message's data
+  names the node that sent it. A member followed again sends its states again (its stream is a
+  new one), but not its events from the gap: a page reads `GET /v1/events` for the gap.
+- **The caller is checked by the node asked, at the open and before each follow again.** Its
+  credentials kept (its `Authorization` alone, never logged) are verified again, as the route
+  does, before a member is followed again; once they no longer verify (a token expired, a
+  password changed, a role taken away), the stream is sent `reset` (`credentials`) and ends, and
+  the page opens it again with fresh credentials. How a stream ends with its session is M14's.
+- **A stream another node asked for takes what its node doesn't know.** The node asked checked
+  the query against its own generation, maybe newer: a pipeline the node followed doesn't run is
+  accepted (nothing about it passes until it runs it), a kind or a parameter it doesn't know is
+  skipped, and it reads no config; a parameter given twice is still `400`. So a healthy member a
+  generation behind is followed, not `unreachable` with a `404`.
+- **Bounded.** 64 streams a node, its peers' included (`503` with `Retry-After` past that): each
+  page holds a place on every node, so a node full of streams shows on other pages as
+  `unreachable`, "it answered 503". A stream more than 1024 messages behind is sent `reset`
+  (`lagged`, with `missed`) and reads again; a followed stream silent for 45 s (three
+  keep-alives) is dropped and followed again; a followed message over 1 MiB ends that follow, and
+  a refusal is read to 8 KiB, its reason clipped. A slow page holds only its own stream.
+- **It never holds a node's stop.** A node ends its streams before its server's graceful stop.
+- **Filters:** `pipeline` (ids) and `kind`; the control messages (`hello`, `members`, `peer`,
+  `reset`) are always sent. A `pipeline` filter drops the messages that name no pipeline
+  (`node`, a node's `samples`, events without a pipeline). A pipeline the generation doesn't
+  have is `404`; a kind or a parameter that isn't one, or one given twice or empty, `400`. The
+  filters go to the followed nodes with the request.
+
 ## 9. Sign-in and sessions
 
 One sign-in page; what follows depends on `globals.api.auth`:
@@ -293,9 +339,9 @@ the runbooks pointing at the console where it does the job.
 
 The attention thresholds; the event and history layouts in object storage; sampling resolution;
 the exact paths of the new `/v1/` endpoints (they go into the spec's endpoint table with the first
-server plan) and of the routes under `/ui/`; the SSE message shapes; how the milestones
-split this (likely: server foundations — events, attribution, history, new endpoints; sign-in and
-sessions; the console shell and Overview; the detail pages and actions).
+server plan) and of the routes under `/ui/`; the SSE message shapes (settled in §8.1); how the
+milestones split this (likely: server foundations — events, attribution, history, new endpoints;
+sign-in and sessions; the console shell and Overview; the detail pages and actions).
 
 ## 14. Delivery
 

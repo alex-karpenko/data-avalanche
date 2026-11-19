@@ -114,6 +114,52 @@ what failed); or `not_in_prometheus` for a table's or a node's series, whose met
 label. A series without `older` asked nothing older than the history kept. Without the setting,
 the history kept is the whole answer, and nothing is marked.
 
+## The live stream
+
+`GET /v1/stream` sends the cluster's changes as they happen, as server-sent events, from any
+node: the node asked follows every other member's stream with the caller's own credentials and
+merges them into one. It sends no replay: read the current state (`GET /v1/pipelines`,
+`/v1/cluster/status`, `/v1/history`), then apply what follows.
+
+```sh
+curl -N -u alice:… 'https://avalanche.example.com:8080/v1/stream?pipeline=orders-pg'
+```
+
+Each message's data is a JSON object; `node` names the node that sent it.
+
+| Message | When | Data |
+|---|---|---|
+| `hello` | first | `at`, and `follows`: the other members followed |
+| `pipeline` | a pipeline's state, error or lease term changes on the node that runs it (looked at every second); `standby` once when it stops running it | `pipeline`, `actual`, `error`, `owner_epoch` |
+| `figures` | every 5 s, for each pipeline a node runs | what `GET /v1/pipelines/{id}/live` answers, without the halts' start times |
+| `node` | every 5 s, from each node | `phase`, `process`, `gossip`, and the `pipelines` it runs |
+| `samples` | each chart sample, as it is taken | `scope` (`pipeline` or `node`), `pipeline`, `at` (unix seconds), `series`, and a pipeline's `tables` |
+| `event` | each event, once written | the event as `GET /v1/events` lists it |
+| `members` | the members or their phases change | `members`: each one's `node` and `phase` |
+| `peer` | another node's stream is followed, or can't be (it is followed again after 1, 2, 5, then every 10 s) | `peer`, `state` (`following` or `unreachable`), `error` |
+| `reset` | the stream fell more than 1024 messages behind and missed some (`lagged`), or the caller's credentials no longer verify (`credentials`) | `reason`; with `lagged`, `missed`: read the current state again; with `credentials` the stream ends: open it again with fresh credentials |
+
+`pipeline` takes a pipeline's id, or several comma-separated, and sends only the messages about
+them. `kind` takes the kinds wanted, comma-separated, of `pipeline`, `figures`, `node`,
+`samples` and `event`. `hello`, `members`, `peer` and `reset` are always sent. A `pipeline`
+filter drops the messages that name no pipeline: `node`, a node's `samples`, and the events
+without one. A pipeline the generation doesn't have is `404`; a kind or a parameter that isn't
+one, or a parameter given twice or empty, `400`.
+
+A node killed sends no `standby`: when two nodes name the same pipeline as theirs, the one with the
+higher `owner_epoch` runs it. When a `peer` comes back to `following`, that node's states are
+sent again, but not its events from the gap: read `GET /v1/events` for the gap.
+
+A node holds at most 64 streams at once, those it serves its peers included; past that it answers
+`503` with `Retry-After`. Each page holds a place on every node, since its node follows the
+others: a node full of streams shows on other pages as `unreachable`, "it answered 503". A stream
+with nothing to send sends a comment every 15 s, so a proxy in front of the nodes must wait longer
+than that before it closes one, and must not buffer the answer (the node sends
+`X-Accel-Buffering: no` for nginx). A node builds no message while no stream is open on it, and
+ends its streams when it stops. The caller's credentials are checked when the stream opens, and
+again by the node asked before it follows another node again: once they no longer verify (a
+token expired, a password changed), the stream is sent `reset` (`credentials`) and ends.
+
 ## The log
 
 To stderr, as `globals.log.format`: `json` (one object a line), `compact` or `pretty`; at

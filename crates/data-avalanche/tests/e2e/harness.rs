@@ -977,7 +977,111 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(mut s: S, request: &[u8]) -
     Some(out)
 }
 
+/// A `GET /v1/stream` open on a node, read one message at a time.
+pub struct Sse {
+    read: Box<dyn AsyncRead + Send + Unpin>,
+    buffer: String,
+}
+
+impl Sse {
+    /// The next message's kind and data, keep-alive comments skipped; `None` once the stream
+    /// ended.
+    pub async fn next(&mut self) -> Option<(String, serde_json::Value)> {
+        loop {
+            while let Some(end) = self.buffer.find("\n\n") {
+                let frame: String = self.buffer.drain(..end + 2).collect();
+                let kind = frame.lines().find_map(|l| l.strip_prefix("event:"));
+                let data = frame.lines().find_map(|l| l.strip_prefix("data:"));
+                if let (Some(kind), Some(data)) = (kind, data) {
+                    let data = serde_json::from_str(data.trim()).expect("a message's data is JSON");
+                    return Some((kind.trim().to_owned(), data));
+                }
+            }
+            let mut chunk = [0u8; 8192];
+            let n = self.read.read(&mut chunk).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            self.buffer
+                .push_str(std::str::from_utf8(&chunk[..n]).expect("UTF-8"));
+        }
+    }
+
+    /// Reads on until a message of `kind` whose data `is` what is waited for, within `within`:
+    /// its data. Panics past it, naming `what` and the messages read meanwhile.
+    pub async fn until(
+        &mut self,
+        what: &str,
+        kind: &str,
+        within: Duration,
+        is: impl Fn(&serde_json::Value) -> bool,
+    ) -> serde_json::Value {
+        let mut read = Vec::new();
+        let found = tokio::time::timeout(within, async {
+            while let Some((k, v)) = self.next().await {
+                if k == kind && is(&v) {
+                    return Some(v);
+                }
+                read.push(format!("{k} {v}"));
+            }
+            None
+        })
+        .await;
+        match found {
+            Ok(Some(v)) => v,
+            _ => panic!(
+                "{what}: no such {kind} within {within:?}; read meanwhile:\n{}",
+                read.join("\n")
+            ),
+        }
+    }
+}
+
 impl Proc {
+    /// Opens `GET path` as a stream, with the token of [`Self::authorize`], over HTTP/1.0: its
+    /// answer's body is the stream's bytes as sent. `None` when nothing answers or the answer
+    /// isn't `200`.
+    pub async fn stream(&self, path: &str) -> Option<Sse> {
+        let auth = self
+            .token
+            .as_deref()
+            .map_or(String::new(), |t| format!("Authorization: Bearer {t}\r\n"));
+        let request = format!("GET {path} HTTP/1.0\r\nHost: t\r\n{auth}\r\n");
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", self.port))
+            .await
+            .ok()?;
+        let mut read: Box<dyn AsyncRead + Send + Unpin> = match &self.client.tls {
+            None => {
+                let mut tcp = tcp;
+                tcp.write_all(request.as_bytes()).await.ok()?;
+                Box::new(tcp)
+            }
+            Some(tls) => {
+                let name = ServerName::IpAddress(std::net::Ipv4Addr::LOCALHOST.into());
+                let mut s = tls.connect(name, tcp).await.ok()?;
+                s.write_all(request.as_bytes()).await.ok()?;
+                Box::new(s)
+            }
+        };
+        // The head, a byte at a time: what follows it is the stream's.
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let mut b = [0u8; 1];
+            if read.read(&mut b).await.ok()? == 0 {
+                return None;
+            }
+            head.push(b[0]);
+        }
+        let head = String::from_utf8(head).ok()?;
+        if head.get(9..12) != Some("200") {
+            return None;
+        }
+        Some(Sse {
+            read,
+            buffer: String::new(),
+        })
+    }
+
     pub fn log(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }

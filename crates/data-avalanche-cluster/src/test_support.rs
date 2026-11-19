@@ -525,7 +525,13 @@ pub(crate) fn recorded_node(
         ObjectStoreVersioned::new(Arc::new(InMemory::new()), "state").unwrap(),
     ))));
     let mut deps = deps(name, store, factory);
-    deps.recorder = crate::Recorder::start(Arc::clone(&events), name, Metrics::new()).0;
+    deps.recorder = crate::Recorder::start(
+        Arc::clone(&events),
+        name,
+        Metrics::new(),
+        &crate::Feed::new(),
+    )
+    .0;
     (node_of(deps, docs), events)
 }
 

@@ -4,7 +4,8 @@
 //! current hour's chunks. A chunk is written when it gets its first sample or a new series, then
 //! every [`WRITE_EVERY`] while it changes, and once more when its hour or its lease term ends. A
 //! write that fails is tried again at the next sample; the samples wait in memory, never holding
-//! up a pipeline. Another task expires the days past `globals.console.history.retention`.
+//! up a pipeline. Each sample also goes to the node's live streams as it is taken (M13f). Another
+//! task expires the days past `globals.console.history.retention`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -18,10 +19,12 @@ use data_avalanche_state::{
 };
 use data_avalanche_telemetry::{Metrics, ProcessFigures};
 use futures_util::{StreamExt, stream};
+use serde_json::{Map, Value, json};
 use tokio::sync::{oneshot, watch};
 use tokio::time::MissedTickBehavior;
 
 use crate::controller::{Actual, ControllerStatus};
+use crate::live::{Feed, Live};
 
 /// Between two writes of a chunk that keeps changing.
 pub const WRITE_EVERY: Duration = Duration::from_secs(60);
@@ -65,6 +68,8 @@ pub struct Sampler {
     open: BTreeMap<String, Open>,
     /// Per pipeline, its snapshots' rows done at the last sample, and its term's writer.
     copied: BTreeMap<String, (String, DateTime<Utc>, u64)>,
+    /// Whether a stream is open: the samples are sent as taken only then.
+    live: bool,
 }
 
 /// The values one sample adds to a scope: the scope's own series, then each table's.
@@ -82,13 +87,14 @@ impl Sampler {
             incarnation,
             open: BTreeMap::new(),
             copied: BTreeMap::new(),
+            live: false,
         }
     }
 
     /// Samples at `now`: each pipeline in `statuses` this node runs (its tables too when
     /// `tables`), and the node, from `process` and the slowest lease renewal since the last
     /// sample. A chunk of a scope this sample doesn't reach (a lease gone) or of another hour or
-    /// term ends.
+    /// term ends. Returns each scope's sample as a live message (`samples`, M13f): a chart's tail.
     pub fn sample(
         &mut self,
         now: DateTime<Utc>,
@@ -96,7 +102,8 @@ impl Sampler {
         process: &ProcessFigures,
         slowest_renewal: Option<Duration>,
         tables: bool,
-    ) {
+    ) -> Vec<Live> {
+        let mut sent = Vec::new();
         let hour = hour_of(now);
         let t = u16::try_from((now - hour).num_seconds()).unwrap_or(u16::MAX);
         let mut current = Vec::new();
@@ -115,6 +122,9 @@ impl Sampler {
                 .map(|o| o.chunk.tables.keys().cloned().collect())
                 .unwrap_or_default();
             let values = self.pipeline(id, &writer, s, now, tables, &known);
+            if self.live {
+                sent.extend(self.sampled(&scope, now, &values));
+            }
             current.push(self.add(scope, hour, &writer, t, values));
         }
         let r = &process.reading;
@@ -134,12 +144,55 @@ impl Sampler {
         );
         let writer = format!("i{}", self.incarnation);
         let scope = ChartScope::Node(self.node.clone());
+        if self.live {
+            sent.extend(self.sampled(&scope, now, &values));
+        }
         current.push(self.add(scope, hour, &writer, t, values));
         for (key, open) in &mut self.open {
             open.ended = !current.contains(key);
         }
         self.copied
             .retain(|id, _| statuses.get(id).is_some_and(|s| s.worker.is_some()));
+        sent
+    }
+
+    /// A scope's sample at `now` as a live message: its series, and its tables' (none when it
+    /// has no value).
+    fn sampled(
+        &self,
+        scope: &ChartScope,
+        now: DateTime<Utc>,
+        (own, tables): &Values,
+    ) -> Option<Live> {
+        if own.is_empty() && tables.iter().all(|(_, v)| v.is_empty()) {
+            return None;
+        }
+        let values = |list: &[(&'static str, f64)]| -> Map<String, Value> {
+            list.iter()
+                .map(|(n, v)| ((*n).to_owned(), json!(v)))
+                .collect()
+        };
+        let tables: Map<String, Value> = tables
+            .iter()
+            .filter(|(_, v)| !v.is_empty())
+            .map(|(t, v)| (t.clone(), Value::Object(values(v))))
+            .collect();
+        let (kind, pipeline) = match scope {
+            ChartScope::Pipeline(id) => ("pipeline", Some(id.clone())),
+            ChartScope::Node(_) => ("node", None),
+        };
+        Some(Live {
+            kind: "samples",
+            pipeline: pipeline.clone(),
+            data: json!({
+                "node": self.node,
+                "scope": kind,
+                "pipeline": pipeline,
+                "at": now.timestamp(),
+                "series": values(own),
+                "tables": tables,
+            }),
+        })
     }
 
     /// A pipeline's values at `now`, from its controller's status.
@@ -321,14 +374,15 @@ impl Sampler {
 }
 
 /// Samples every [`SAMPLE_EVERY`] (the tables every [`TABLE_SAMPLE_EVERY`]) the controllers
-/// `statuses` lists and the process's `figures`, and writes what is due, until `stop` fires (or
-/// its sender is dropped): then it takes a last sample and writes every chunk it holds, ended
-/// ([`Sampler::finish`]), and returns.
+/// `statuses` lists and the process's `figures`, sends each sample to `feed`, and writes what is
+/// due, until `stop` fires (or its sender is dropped): then it takes a last sample and writes
+/// every chunk it holds, ended ([`Sampler::finish`]), and returns.
 pub async fn sample_history(
     mut sampler: Sampler,
     statuses: watch::Receiver<BTreeMap<String, watch::Receiver<ControllerStatus>>>,
     process: watch::Receiver<ProcessFigures>,
     metrics: Metrics,
+    feed: Feed,
     mut stop: oneshot::Receiver<()>,
 ) {
     let per_table = (TABLE_SAMPLE_EVERY.as_secs() / SAMPLE_EVERY.as_secs()).max(1);
@@ -343,13 +397,16 @@ pub async fn sample_history(
             .map(|(id, s)| (id.clone(), s.borrow().clone()))
             .collect();
         let figures = *process.borrow();
-        sampler.sample(
+        sampler.live = feed.followed();
+        for live in sampler.sample(
             now,
             &current,
             &figures,
             metrics.take_slowest_renewal(),
             tables,
-        );
+        ) {
+            feed.publish(live);
+        }
         now
     };
     loop {
@@ -520,6 +577,54 @@ mod tests {
         assert_eq!(n[0].series["memory_bytes"].v, [f64::from(1u32 << 30)]);
         assert_eq!(n[0].series["cpu_cores"].v, [0.5]);
         assert_eq!(n[0].series["lease_renew_seconds"].v, [0.041]);
+    }
+
+    /// Each sample is a live message too: a pipeline's series and tables, and the node's.
+    #[test]
+    fn each_sample_is_sent_as_taken() {
+        let (mut s, _, _) = sampler();
+        s.live = true;
+        let now = at(9, 0, 15);
+        let sent = s.sample(
+            now,
+            &statuses(&[("orders", running(4, now))]),
+            &figures(1 << 30, 0.5),
+            None,
+            true,
+        );
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        let p = &sent[0];
+        assert_eq!((p.kind, p.pipeline.as_deref()), ("samples", Some("orders")));
+        assert_eq!(p.data["node"], "node-a");
+        assert_eq!(p.data["scope"], "pipeline");
+        assert_eq!(p.data["at"], now.timestamp());
+        assert_eq!(p.data["series"]["lag_seconds"], 30.0);
+        assert_eq!(p.data["tables"]["public.orders"]["files_rewritten"], 4.0);
+        let n = &sent[1];
+        assert_eq!((n.kind, n.pipeline.as_deref()), ("samples", None));
+        assert_eq!(n.data["scope"], "node");
+        assert_eq!(n.data["series"]["memory_bytes"], (1u64 << 30) as f64);
+        assert!(n.data["series"].get("lease_renew_seconds").is_none());
+    }
+
+    /// With no stream open nothing is built, yet the samples are still taken.
+    #[tokio::test]
+    async fn nothing_is_built_while_no_stream_is_open() {
+        let (mut s, charts, _) = sampler();
+        let now = at(9, 0, 15);
+        let sent = s.sample(
+            now,
+            &statuses(&[("orders", running(4, now))]),
+            &figures(1 << 30, 0.5),
+            None,
+            true,
+        );
+        assert!(sent.is_empty(), "{sent:?}");
+        assert_eq!(s.write(now).await, 0);
+        let p = stored(&charts, &ChartScope::Pipeline("orders".into()), now).await;
+        assert_eq!(p[0].series["lag_seconds"].v, [30.0]);
+        let n = stored(&charts, &ChartScope::Node("node-a".into()), now).await;
+        assert_eq!(n[0].series["memory_bytes"].v, [f64::from(1u32 << 30)]);
     }
 
     #[tokio::test]

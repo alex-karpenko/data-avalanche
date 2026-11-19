@@ -8,11 +8,11 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use data_avalanche_api::{
-    Api, Auth, Control, Node, Peers, RateLimit, ServeError, Stop, bind, router,
+    Api, Auth, Control, Node, Peers, RateLimit, ServeError, Stop, bind, publish, router,
 };
 use data_avalanche_cluster::{
     ClusterReconciler, ConfigCoordinator, ControllerDeps, ControllerSettings, CoordinatorDeps,
-    DocsFn, Gossip, GossipKey, GossipSettings, LeaseTiming, NodeIdentity, NodeMeta, Phase,
+    DocsFn, Feed, Gossip, GossipKey, GossipSettings, LeaseTiming, NodeIdentity, NodeMeta, Phase,
     ReconcilerSettings, Recorder, Sampler, Seeds, Udp, advertise, api_url, discover, expire_events,
     expire_history, file_hash, interfaces, join as join_gossip, leave, node_identity,
     record_members, removed_pipelines, sample_history, watch_file,
@@ -181,8 +181,10 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
 
     // The cluster's events (Admin_Console §6): recorded from here, expired on every node.
     let events = Arc::new(Events::new(joined.globals.clone()));
+    // The node's live messages (M13f): what its open streams send.
+    let feed = Feed::new();
     let (recorder, _writer) =
-        Recorder::start(Arc::clone(&events), &holder.node_id, metrics.clone());
+        Recorder::start(Arc::clone(&events), &holder.node_id, metrics.clone(), &feed);
     let (retention, kept) = watch::channel(config.globals.console.events.retention);
     let _expiry = tokio::spawn(expire_events(Arc::clone(&events), kept));
     // The chart history (Admin_Console §7): sampled once the controllers run, expired on every
@@ -282,6 +284,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         reconciler.watch_statuses(),
         process.clone(),
         metrics.clone(),
+        feed.clone(),
         history_stop,
     ));
     // Each newer config generation, this node's reloads included (Clustering §9).
@@ -336,7 +339,10 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         lake: Arc::default(),
         charts,
         prometheus: Arc::default(),
+        feed: feed.clone(),
     });
+    // What the node sends its live streams of its own accord: its pipelines' states and figures.
+    let publisher = node.get().cloned().map(|n| tokio::spawn(publish(n)));
     ready.store(true, Ordering::SeqCst);
     let mut cluster = Some((gossip, reconciler, discovery));
     let mut stops = Stops::new(Box::pin(shutdown_signal()), asked);
@@ -363,6 +369,11 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         tracing::info!("left the cluster; the process stays up until it is stopped");
     }
     tracing::info!("shutting down");
+    if let Some(p) = publisher {
+        p.abort();
+    }
+    // An open stream would hold the server's stop, which waits for the open requests.
+    feed.close();
     let _ = stop_http.send(());
     let _ = server.await;
     // The leave's last events (each lease released) are still queued, and the history's last

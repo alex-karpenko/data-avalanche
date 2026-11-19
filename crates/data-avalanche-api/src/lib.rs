@@ -13,6 +13,7 @@ mod auth;
 mod cluster;
 mod config;
 mod events;
+mod follow;
 mod generations;
 mod history;
 mod limit;
@@ -22,8 +23,10 @@ mod openapi;
 mod peers;
 mod pipelines;
 mod prometheus;
+mod publish;
 mod server;
 mod snapshots;
+mod stream;
 mod tables;
 #[cfg(test)]
 mod test_support;
@@ -40,7 +43,8 @@ use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, get, post};
 use data_avalanche_cluster::{
-    ConfigCoordinator, ControllerStatus, DocsFn, GossipFigures, Members, Recorder, WorkerFactory,
+    ConfigCoordinator, ControllerStatus, DocsFn, Feed, GossipFigures, Members, Recorder,
+    WorkerFactory,
 };
 use data_avalanche_config::Role;
 use data_avalanche_state::{Charts, Events, Leases};
@@ -51,6 +55,7 @@ use tokio::sync::watch;
 pub use actions::{DENIALS_BURST, MAX_ERROR, MAX_NOTE, MAX_TARGET, Recorded, note_of};
 pub use auth::{Auth, FETCH_TIMEOUT, KEYS_MAX_AGE, MAX_KEY_DOCUMENT, Principal, REFETCH_AFTER};
 pub use cluster::{Control, Stop};
+pub use follow::{FOLLOW_SILENCE, MAX_FRAME};
 pub use history::{MAX_POINTS, MAX_SPAN};
 pub use limit::{RateLimit, VALIDATE_BURST, VALIDATE_PER_SECOND};
 pub use live::FRESH_WITHIN;
@@ -63,8 +68,10 @@ pub use prometheus::{
     MAX_PROMETHEUS_ANSWER, MIN_RATE_WINDOW, Outcome, PrometheusClient, PrometheusError,
     PrometheusReader, promql,
 };
+pub use publish::{FIGURES_EVERY, STATE_EVERY, publish};
 pub use server::{Bound, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT, MAX_CONNECTIONS, ServeError, bind};
 pub use snapshots::{EndedJobs, READ_AT_ONCE};
+pub use stream::{FOLLOW_BACKOFF, KEEP_ALIVE, KINDS};
 pub use tables::{FACTS_FOR, FACTS_WITHIN, Lake};
 
 use crate::auth::Denied;
@@ -120,6 +127,8 @@ pub struct Node {
     pub charts: Arc<Charts>,
     /// Reads a pipeline's series older than the history kept from `globals.console.prometheus`.
     pub prometheus: Arc<PrometheusReader>,
+    /// The node's live messages, sent to each `GET /v1/stream` open on it (M13f).
+    pub feed: Feed,
 }
 
 impl std::fmt::Debug for Node {
@@ -818,6 +827,27 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
         (
             r(
                 "GET",
+                "/v1/stream",
+                Viewer,
+                "The cluster's live changes as server-sent events, from any node: each pipeline's state and figures, each node's own, the samples taken and the events written, as they happen",
+                &[
+                    (
+                        200,
+                        "`text/event-stream`: `hello` first, then each change as it happens, without replay: read the current state, then apply what follows",
+                    ),
+                    (400, "a parameter that isn't one, or isn't in its form"),
+                    (404, "no such pipeline in the generation this node runs"),
+                    (
+                        503,
+                        "as many streams are open on this node as it takes; `Retry-After` says when to try again",
+                    ),
+                ],
+            ),
+            get(stream::open),
+        ),
+        (
+            r(
+                "GET",
                 "/v1/openapi.json",
                 Viewer,
                 "This document",
@@ -1013,6 +1043,7 @@ mod tests {
                 ("GET", "/v1/nodes/{node}/config/status", Viewer),
                 ("GET", "/v1/events", Viewer),
                 ("GET", "/v1/history", Viewer),
+                ("GET", "/v1/stream", Viewer),
                 ("GET", "/v1/openapi.json", Viewer),
             ]
         );

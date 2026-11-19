@@ -1102,7 +1102,13 @@ mod tests {
             advertiser: gossip.advertiser(),
             metrics: metrics.clone(),
             globals: Arc::new(move |g| seen.lock().unwrap().push(g.clone())),
-            recorder: Recorder::start(Arc::clone(&events), "n1", Metrics::new()).0,
+            recorder: Recorder::start(
+                Arc::clone(&events),
+                "n1",
+                Metrics::new(),
+                &crate::Feed::new(),
+            )
+            .0,
         };
         let (members_tx, members_rx) =
             watch::channel(members("n1", &[("n1", Phase::Active, false)]));

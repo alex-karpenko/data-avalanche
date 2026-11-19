@@ -238,7 +238,8 @@ pub(crate) async fn lone_with(file: PathBuf, text: &str, env: Arc<dyn Env + Send
     );
     let metrics = Metrics::new();
     let events = Arc::new(Events::new(docs.clone()));
-    let (recorder, _) = Recorder::start(Arc::clone(&events), "node-a", metrics.clone());
+    let feed = data_avalanche_cluster::Feed::new();
+    let (recorder, _) = Recorder::start(Arc::clone(&events), "node-a", metrics.clone(), &feed);
     let c = &config.globals.cluster;
     let removals = Removals::new(docs.clone());
     let deps = ControllerDeps {
@@ -317,6 +318,7 @@ pub(crate) async fn lone_with(file: PathBuf, text: &str, env: Arc<dyn Env + Send
             lake: Arc::default(),
             charts: Arc::new(data_avalanche_state::Charts::new(docs.clone())),
             prometheus: Arc::default(),
+            feed,
         },
         events,
         leases,
@@ -585,4 +587,75 @@ pub(crate) async fn served_with(
     });
     std::mem::forget(view);
     (addr, lone, dir)
+}
+
+/// A `GET /v1/stream` read as a page reads it: its code and head, then one message at a time.
+pub(crate) struct Stream {
+    pub code: u16,
+    /// The response's headers, `name: value` a line, names in lower case.
+    pub head: String,
+    response: reqwest::Response,
+    buffer: String,
+}
+
+/// Opens a stream at `path` with `headers`.
+pub(crate) async fn stream(addr: SocketAddr, path: &str, headers: &[(&str, &str)]) -> Stream {
+    let mut asked = reqwest::Client::new().get(format!("http://{addr}{path}"));
+    for (k, v) in headers {
+        asked = asked.header(*k, *v);
+    }
+    let response = asked.send().await.unwrap();
+    let head = response
+        .headers()
+        .iter()
+        .map(|(k, v)| format!("{k}: {}\n", v.to_str().unwrap_or("")))
+        .collect();
+    Stream {
+        code: response.status().as_u16(),
+        head,
+        response,
+        buffer: String::new(),
+    }
+}
+
+impl Stream {
+    /// The next message's kind and data, keep-alive comments skipped; within 5 s.
+    pub async fn next(&mut self) -> (String, Value) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                while let Some(end) = self.buffer.find("\n\n") {
+                    let frame: String = self.buffer.drain(..end + 2).collect();
+                    let (mut kind, mut data) = (None, String::new());
+                    for line in frame.lines() {
+                        if let Some(k) = line.strip_prefix("event:") {
+                            kind = Some(k.trim().to_owned());
+                        } else if let Some(d) = line.strip_prefix("data:") {
+                            data.push_str(d.trim_start());
+                        }
+                    }
+                    if let Some(kind) = kind {
+                        return (kind, serde_json::from_str(&data).unwrap());
+                    }
+                }
+                let chunk = self
+                    .response
+                    .chunk()
+                    .await
+                    .unwrap()
+                    .expect("the stream ended");
+                self.buffer.push_str(std::str::from_utf8(&chunk).unwrap());
+            }
+        })
+        .await
+        .expect("a message within 5 s")
+    }
+
+    /// Whether the response ends within 3 s, what it still sends read past.
+    pub async fn ended(&mut self) -> bool {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while self.response.chunk().await.ok().flatten().is_some() {}
+        })
+        .await
+        .is_ok()
+    }
 }

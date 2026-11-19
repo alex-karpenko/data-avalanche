@@ -48,7 +48,7 @@ pub struct Recorded {
 
 /// `s` with at most `max` characters: a longer one is cut on a character boundary and ends in
 /// `…`.
-fn clipped(s: &str, max: usize) -> Cow<'_, str> {
+pub(crate) fn clipped(s: &str, max: usize) -> Cow<'_, str> {
     match s.char_indices().nth(max) {
         None => Cow::Borrowed(s),
         Some((at, _)) => Cow::Owned(format!("{}…", &s[..at])),

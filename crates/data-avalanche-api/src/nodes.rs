@@ -8,7 +8,8 @@ use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::Response;
 use chrono::{DateTime, Utc};
-use data_avalanche_cluster::{Phase, Ring};
+use data_avalanche_cluster::{GossipFigures, Members, Phase, Ring};
+use data_avalanche_telemetry::ProcessFigures;
 use serde_json::{Value, json};
 
 use crate::peers::{ACTION_LIMIT, Asked, DETAIL_LIMIT, FORWARDED_BY, MAX_ANSWER, STATUS_LIMIT};
@@ -20,13 +21,54 @@ pub(crate) fn short(hash: &str) -> &str {
     hex.get(..16).unwrap_or(hex)
 }
 
-fn phase(p: Phase) -> &'static str {
+pub(crate) fn phase(p: Phase) -> &'static str {
     match p {
         Phase::Joining => "joining",
         Phase::Active => "active",
         Phase::Draining => "draining",
         Phase::Leaving => "leaving",
     }
+}
+
+/// The process's figures, as a node's detail and its live `node` message show them.
+pub(crate) fn process_json(p: &ProcessFigures) -> Value {
+    json!({
+        "memory_bytes": p.reading.memory_bytes,
+        "memory_limit_bytes": p.reading.memory_limit_bytes,
+        "cpu_seconds": p.reading.cpu_seconds,
+        "cpu_cores": p.cpu_cores,
+        "cpu_limit_cores": p.reading.cpu_limit_cores,
+    })
+}
+
+/// What the gossip saw of the node's peers and its probes, as of `now`: a suspicion a day old
+/// goes though no newer one came to prune it.
+pub(crate) fn gossip_json(members: &Members, mut g: GossipFigures, now: DateTime<Utc>) -> Value {
+    g.forget_before(now);
+    let (raised_more, received_more) = (g.raised_more(), g.received_more());
+    let peers: Vec<Value> = members
+        .nodes
+        .iter()
+        .filter(|(name, _)| **name != members.me)
+        .map(|(name, m)| {
+            json!({
+                "node": name,
+                "state": if m.suspect { "suspect" } else { "alive" },
+                "phase": phase(m.meta.phase),
+            })
+        })
+        .collect();
+    json!({
+        "peers": peers,
+        "last_probe": g.last_probe.map(|(n, at)| json!({ "node": n, "at": at })),
+        "probe_rtt_ms": g.probe_rtt.map(|d| d.as_secs_f64() * 1000.0),
+        "suspicions": {
+            "raised": g.raised.iter().map(|(n, at)| json!({ "node": n, "at": at })).collect::<Vec<_>>(),
+            "received": g.received,
+            "raised_more": raised_more,
+            "received_more": received_more,
+        },
+    })
 }
 
 /// How many leases a node's detail reads at once.
@@ -93,22 +135,7 @@ async fn detail(node: &Node) -> Value {
         }
     }
     let p = *node.process.borrow();
-    // As of now: a suspicion a day old goes though no newer one came to prune it.
-    let mut g = node.gossip.borrow().clone();
-    g.forget_before(Utc::now());
-    let (raised_more, received_more) = (g.raised_more(), g.received_more());
-    let peers: Vec<Value> = members
-        .nodes
-        .iter()
-        .filter(|(name, _)| **name != members.me)
-        .map(|(name, m)| {
-            json!({
-                "node": name,
-                "state": if m.suspect { "suspect" } else { "alive" },
-                "phase": phase(m.meta.phase),
-            })
-        })
-        .collect();
+    let g = node.gossip.borrow().clone();
     let started = me.and_then(|m| {
         i64::try_from(m.incarnation)
             .ok()
@@ -132,24 +159,8 @@ async fn detail(node: &Node) -> Value {
                 .map(|g| file_hash == g),
         },
         "restart_pending": node.coordinator.restart_pending().await,
-        "process": {
-            "memory_bytes": p.reading.memory_bytes,
-            "memory_limit_bytes": p.reading.memory_limit_bytes,
-            "cpu_seconds": p.reading.cpu_seconds,
-            "cpu_cores": p.cpu_cores,
-            "cpu_limit_cores": p.reading.cpu_limit_cores,
-        },
-        "gossip": {
-            "peers": peers,
-            "last_probe": g.last_probe.map(|(n, at)| json!({ "node": n, "at": at })),
-            "probe_rtt_ms": g.probe_rtt.map(|d| d.as_secs_f64() * 1000.0),
-            "suspicions": {
-                "raised": g.raised.iter().map(|(n, at)| json!({ "node": n, "at": at })).collect::<Vec<_>>(),
-                "received": g.received,
-                "raised_more": raised_more,
-                "received_more": received_more,
-            },
-        },
+        "process": process_json(&p),
+        "gossip": gossip_json(&members, g, Utc::now()),
         "pipelines": held,
     })
 }
