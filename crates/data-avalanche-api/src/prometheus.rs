@@ -73,7 +73,8 @@ fn selector(names: &[String], extra: &BTreeMap<String, String>, more: &str) -> S
 }
 
 /// The query of series `s` for the pipelines named `names`, one result per pipeline, at `step`
-/// seconds; `None` for a series Prometheus doesn't have.
+/// seconds; `None` for a series Prometheus doesn't have. Its value at `t` is of the step that
+/// ends at `t`: a gauge's peak over it, a rate over it (or [`MIN_RATE_WINDOW`] when longer).
 pub fn promql(
     s: &Series,
     names: &[String],
@@ -81,8 +82,12 @@ pub fn promql(
     step: i64,
 ) -> Option<String> {
     let window = step.max(MIN_RATE_WINDOW);
-    let gauge =
-        |metric: &str| format!("max by (pipeline) ({metric}{})", selector(names, extra, ""));
+    let gauge = |metric: &str| {
+        format!(
+            "max by (pipeline) (max_over_time({metric}{}[{step}s]))",
+            selector(names, extra, "")
+        )
+    };
     let rate = |op: &str| {
         format!(
             "sum by (pipeline) (rate(data_avalanche_rows_read_total{}[{window}s]))",
@@ -279,7 +284,8 @@ pub struct PrometheusReader {
 }
 
 impl PrometheusReader {
-    /// The client of `config`, the one made before while it is the same.
+    /// The client of `config`, the one made before while it is the same. A new one forgets how
+    /// the last read went: it was of another Prometheus.
     ///
     /// # Errors
     /// [`PrometheusError::Client`]: it can't be made.
@@ -290,6 +296,7 @@ impl PrometheusReader {
         {
             return Ok(Arc::clone(c));
         }
+        *self.last.lock().expect("unpoisoned") = None;
         let c = Arc::new(PrometheusClient::new(config)?);
         *held = Some(Arc::clone(&c));
         Ok(c)
@@ -320,7 +327,7 @@ mod tests {
         let extra = BTreeMap::from([("cluster".to_owned(), "prod \"eu\"".to_owned())]);
         assert_eq!(
             promql(s("lag_seconds"), &names, &extra, 60).unwrap(),
-            r#"max by (pipeline) (data_avalanche_replication_lag_seconds{pipeline=~"orders|bill\\.ing",cluster="prod \"eu\""})"#
+            r#"max by (pipeline) (max_over_time(data_avalanche_replication_lag_seconds{pipeline=~"orders|bill\\.ing",cluster="prod \"eu\""}[60s]))"#
         );
         assert_eq!(
             promql(s("changes_per_minute"), &names[..1], &BTreeMap::new(), 600).unwrap(),
@@ -355,12 +362,23 @@ mod tests {
         };
         let r = PrometheusReader::default();
         let a = r.client(&config).unwrap();
+        let failing = Outcome {
+            at: Utc::now(),
+            error: Some("unreachable".into()),
+        };
+        r.record(failing.clone());
         assert!(Arc::ptr_eq(&a, &r.client(&config).unwrap()));
+        assert_eq!(
+            r.last(),
+            Some(failing),
+            "the same client: its last read stays"
+        );
         let other = Prometheus {
             url: "http://127.0.0.1:10".into(),
             ..config
         };
         assert!(!Arc::ptr_eq(&a, &r.client(&other).unwrap()));
+        assert_eq!(r.last(), None, "another Prometheus: not asked yet");
     }
 
     /// A fake Prometheus on a loopback port: for each connection it reads the request, then
