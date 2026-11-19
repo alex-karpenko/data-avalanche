@@ -889,6 +889,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_member_at_a_new_address_is_followed_there() {
+        use data_avalanche_cluster::Phase;
+
+        use crate::test_support::member;
+        let (old, new) = (node_b().await, node_b().await);
+        let at = |url: &str| Members {
+            me: "node-a".into(),
+            nodes: [
+                ("node-a".to_owned(), member("", Phase::Active)),
+                ("node-b".to_owned(), member(url, Phase::Active)),
+            ]
+            .into(),
+        };
+        let (view, members) = watch::channel(at(&old.url));
+        let (addr, _lone, _dir) = served_with("", crate::test_support::open(), |n| {
+            n.members = members;
+        })
+        .await;
+        let mut s = stream(addr, "/v1/stream", &[]).await;
+        s.next().await;
+        assert_eq!(s.next().await.1["state"], "following");
+        view.send_replace(at(&new.url));
+        assert_eq!(
+            s.next().await,
+            (
+                "peer".into(),
+                json!({ "node": "node-a", "peer": "node-b", "state": "following" })
+            ),
+            "followed again, at its new address"
+        );
+        assert_eq!(new.seen.lock().unwrap().len(), 1);
+        let within = tokio::time::Instant::now() + Duration::from_secs(3);
+        while old.send.receiver_count() > 0 {
+            assert!(
+                tokio::time::Instant::now() < within,
+                "the old address still followed"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
     async fn a_member_that_leaves_is_no_longer_followed_and_the_members_are_sent() {
         use data_avalanche_cluster::Phase;
 
