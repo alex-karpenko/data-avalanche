@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-14
+updated: 2026-11-19
 domain: Architecture
 tags: [admin-console, web-ui, management-api, auth, sessions, audit, metrics-history, prometheus, v1.1]
 ---
@@ -180,6 +180,33 @@ expire.
 - **Replication first.** The console's work never slows the pipelines: lower priority, its own
   request limits.
 
+### 8.1 The live stream (M13f)
+
+`GET /v1/stream` (viewer) is the push above. Oleksii decided three things on 2026-11-19: it sends
+**values as they change** (not "something changed, read again"), the **figures every 5 s**, and
+**no replay** (a page reads the current state, then applies what follows). The rest is Claude's
+call.
+
+- **Each node publishes its own, from memory.** A pipeline's `pipeline` state (looked at every
+  second, sent on a change of state, error or lease term; `standby` once when the node stops
+  running it), its `figures` (the live answer, the halts' start times left out: they are in
+  storage), the node's own `node` figures, each chart `samples` as taken, each `event` once
+  written. Nothing is built while no stream is open on the node; a stream that opens gets every
+  state again within a second.
+- **The node asked merges the others.** It follows each other member with an API address, with
+  the caller's own credentials and the target and forwarded-by headers of §10's forwarding, and
+  passes their messages on as sent; a stream asked for by another node is that node's own alone.
+  `peer` says when a member is followed (`following`) and when it can't be (`unreachable`, with
+  why), retried after 1, 2, 5, then every 10 s; `members` says when the members or their phases
+  change. Every message's data names the node that sent it.
+- **Bounded.** 64 streams a node, its peers' included (`503` with `Retry-After` past that); a
+  stream more than 1024 messages behind is sent `reset` and reads again; a followed stream silent
+  for 45 s (three keep-alives) is dropped and followed again; a followed message over 1 MiB ends
+  that follow. A slow page holds only its own stream.
+- **It never holds a node's stop.** A node ends its streams before its server's graceful stop.
+- **Filters:** `pipeline` (ids) and `kind`; the control messages (`hello`, `members`, `peer`,
+  `reset`) are always sent. The filters go to the followed nodes with the request.
+
 ## 9. Sign-in and sessions
 
 One sign-in page; what follows depends on `globals.api.auth`:
@@ -293,9 +320,9 @@ the runbooks pointing at the console where it does the job.
 
 The attention thresholds; the event and history layouts in object storage; sampling resolution;
 the exact paths of the new `/v1/` endpoints (they go into the spec's endpoint table with the first
-server plan) and of the routes under `/ui/`; the SSE message shapes; how the milestones
-split this (likely: server foundations — events, attribution, history, new endpoints; sign-in and
-sessions; the console shell and Overview; the detail pages and actions).
+server plan) and of the routes under `/ui/`; the SSE message shapes (settled in §8.1); how the
+milestones split this (likely: server foundations — events, attribution, history, new endpoints;
+sign-in and sessions; the console shell and Overview; the detail pages and actions).
 
 ## 14. Delivery
 
