@@ -35,32 +35,18 @@ pub(crate) struct Publisher {
 }
 
 impl Publisher {
-    /// The messages due at `now`: each pipeline whose state changed since the last look (every
-    /// one when a stream opened on the node since), a `standby` for each that stopped running
-    /// here, and with `figures` each pipeline's live figures and the node's.
-    pub(crate) async fn due(
-        &mut self,
-        node: &Node,
-        now: DateTime<Utc>,
-        figures: bool,
-    ) -> Vec<Live> {
+    /// The states due at `now`: each pipeline whose state changed since the last look (every one
+    /// when a stream opened on the node since), and a `standby` for each that stopped running
+    /// here. Read from memory alone, without waiting on anything: a reload holding the config
+    /// never holds them.
+    pub(crate) fn states(&mut self, node: &Node, now: DateTime<Utc>) -> Vec<Live> {
         let opened = node.feed.opened();
         if opened != self.opened {
             self.sent.clear();
         }
         self.opened = opened;
         let me = node.members.borrow().me.clone();
-        let running: BTreeMap<String, ControllerStatus> = node
-            .statuses
-            .borrow()
-            .iter()
-            .map(|(id, s)| (id.clone(), s.borrow().clone()))
-            .filter(|(_, s)| {
-                s.actual
-                    .as_ref()
-                    .is_some_and(|a| !matches!(a, Actual::Standby { .. }))
-            })
-            .collect();
+        let running = running(node);
         let mut out = Vec::new();
         for (id, s) in &running {
             let (actual, error) = s.actual.as_ref().map_or(("starting", None), actual_of);
@@ -81,21 +67,42 @@ impl Publisher {
             let state = json!({ "actual": "standby", "error": null, "owner_epoch": null });
             out.push(state_of(&me, &id, now, &state));
         }
-        if figures {
-            let config = node.coordinator.config().await;
-            for (id, s) in &running {
-                if let Some(p) = config.pipelines.values().find(|p| p.id == *id) {
-                    out.push(Live {
-                        kind: "figures",
-                        pipeline: Some(id.clone()),
-                        data: answer(&me, p, s, None, now),
-                    });
-                }
-            }
-            out.push(node_of(node, &me, running.keys().cloned().collect(), now));
-        }
         out
     }
+}
+
+/// The pipelines the node runs (its lease held), with their statuses.
+fn running(node: &Node) -> BTreeMap<String, ControllerStatus> {
+    node.statuses
+        .borrow()
+        .iter()
+        .map(|(id, s)| (id.clone(), s.borrow().clone()))
+        .filter(|(_, s)| {
+            s.actual
+                .as_ref()
+                .is_some_and(|a| !matches!(a, Actual::Standby { .. }))
+        })
+        .collect()
+}
+
+/// At `now`, each pipeline the node runs's live figures, then the node's own. It reads the
+/// config the coordinator holds, which a reload may hold a while: the states are sent first.
+pub(crate) async fn figures(node: &Node, now: DateTime<Utc>) -> Vec<Live> {
+    let me = node.members.borrow().me.clone();
+    let config = node.coordinator.config().await;
+    let running = running(node);
+    let mut out = Vec::new();
+    for (id, s) in &running {
+        if let Some(p) = config.pipelines.values().find(|p| p.id == *id) {
+            out.push(Live {
+                kind: "figures",
+                pipeline: Some(id.clone()),
+                data: answer(&me, p, s, None, now),
+            });
+        }
+    }
+    out.push(node_of(node, &me, running.keys().cloned().collect(), now));
+    out
 }
 
 /// A pipeline's state message.
@@ -143,9 +150,15 @@ pub async fn publish(node: Node) {
             publisher = Publisher::default();
             continue;
         }
-        let figures = ticks.is_multiple_of(per_figures);
-        for live in publisher.due(&node, Utc::now(), figures).await {
+        let now = Utc::now();
+        // The states first: the figures wait on the config, which a reload may hold.
+        for live in publisher.states(&node, now) {
             node.feed.publish(live);
+        }
+        if ticks.is_multiple_of(per_figures) {
+            for live in figures(&node, now).await {
+                node.feed.publish(live);
+            }
         }
         ticks += 1;
     }
@@ -196,7 +209,7 @@ mod tests {
         let (node, tx, _dir) = node(Actual::Running).await;
         let mut p = Publisher::default();
         let now = Utc::now();
-        let sent = p.due(&node, now, false).await;
+        let sent = p.states(&node, now);
         assert_eq!(kinds(&sent), ["pipeline"]);
         let d = &sent[0].data;
         assert_eq!(sent[0].pipeline.as_deref(), Some("orders"));
@@ -216,7 +229,7 @@ mod tests {
                 &json!(4)
             )
         );
-        assert!(p.due(&node, now, false).await.is_empty(), "unchanged");
+        assert!(p.states(&node, now).is_empty(), "unchanged");
         set(
             &tx,
             status(
@@ -226,16 +239,16 @@ mod tests {
                 4,
             ),
         );
-        let sent = p.due(&node, now, false).await;
+        let sent = p.states(&node, now);
         assert_eq!(sent[0].data["actual"], "retrying");
         assert_eq!(sent[0].data["error"], "the source is down");
         // The lease gone: once `standby`, then nothing.
         set(&tx, status(Actual::Standby { holder: None }, 4));
-        let sent = p.due(&node, now, false).await;
+        let sent = p.states(&node, now);
         assert_eq!(kinds(&sent), ["pipeline"]);
         assert_eq!(sent[0].data["actual"], "standby");
         assert_eq!(sent[0].data["owner_epoch"], Value::Null);
-        assert!(p.due(&node, now, false).await.is_empty());
+        assert!(p.states(&node, now).is_empty());
     }
 
     #[tokio::test]
@@ -244,13 +257,13 @@ mod tests {
         let mut p = Publisher::default();
         let now = Utc::now();
         let first = node.feed.subscribe();
-        assert_eq!(p.due(&node, now, false).await.len(), 1);
-        assert!(p.due(&node, now, false).await.is_empty());
+        assert_eq!(p.states(&node, now).len(), 1);
+        assert!(p.states(&node, now).is_empty());
         let second = node.feed.subscribe();
-        let again = p.due(&node, now, false).await;
+        let again = p.states(&node, now);
         assert_eq!(again[0].data["actual"], "paused");
         drop(first);
-        assert!(p.due(&node, now, false).await.is_empty(), "one closed");
+        assert!(p.states(&node, now).is_empty(), "one closed");
         drop(second);
     }
 
@@ -262,11 +275,11 @@ mod tests {
         let mut p = Publisher::default();
         let now = Utc::now();
         let first = node.feed.subscribe();
-        assert_eq!(p.due(&node, now, false).await.len(), 1);
-        assert!(p.due(&node, now, false).await.is_empty());
+        assert_eq!(p.states(&node, now).len(), 1);
+        assert!(p.states(&node, now).is_empty());
         drop(first);
         let _second = node.feed.subscribe();
-        let again = p.due(&node, now, false).await;
+        let again = p.states(&node, now);
         assert_eq!(kinds(&again), ["pipeline"]);
         assert_eq!(again[0].data["actual"], "paused");
     }
@@ -276,24 +289,25 @@ mod tests {
         let (node, _tx, _dir) = node(Actual::Running).await;
         let mut p = Publisher::default();
         let now = Utc::now();
-        let sent = p.due(&node, now, true).await;
-        assert_eq!(kinds(&sent), ["pipeline", "figures", "node"]);
-        let f = &sent[1].data;
+        assert_eq!(kinds(&p.states(&node, now)), ["pipeline"]);
+        let sent = figures(&node, now).await;
+        assert_eq!(kinds(&sent), ["figures", "node"]);
+        let f = &sent[0].data;
         assert_eq!(
             (&f["id"], &f["node"], &f["actual"]),
             (&json!("orders"), &json!("node-a"), &json!("running"))
         );
         assert_eq!(f["worker"]["phase"], "starting");
-        let n = &sent[2].data;
+        let n = &sent[1].data;
         assert_eq!(n["node"], "node-a");
         assert_eq!(n["pipelines"], json!(["orders"]));
         assert!(n["process"].get("memory_bytes").is_some(), "{n}");
         assert!(n["gossip"]["peers"].is_array(), "{n}");
-        let again = p.due(&node, now, true).await;
+        assert!(p.states(&node, now).is_empty(), "the state once");
         assert_eq!(
-            kinds(&again),
+            kinds(&figures(&node, now).await),
             ["figures", "node"],
-            "figures every time, the state once"
+            "figures every time"
         );
     }
 
