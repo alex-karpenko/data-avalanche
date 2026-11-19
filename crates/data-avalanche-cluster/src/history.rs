@@ -375,9 +375,8 @@ impl Sampler {
 
 /// Samples every [`SAMPLE_EVERY`] (the tables every [`TABLE_SAMPLE_EVERY`]) the controllers
 /// `statuses` lists and the process's `figures`, sends each sample to `feed`, and writes what is
-/// due, until `stop` fires (or
-/// its sender is dropped): then it takes a last sample and writes every chunk it holds, ended
-/// ([`Sampler::finish`]), and returns.
+/// due, until `stop` fires (or its sender is dropped): then it takes a last sample and writes
+/// every chunk it holds, ended ([`Sampler::finish`]), and returns.
 pub async fn sample_history(
     mut sampler: Sampler,
     statuses: watch::Receiver<BTreeMap<String, watch::Receiver<ControllerStatus>>>,

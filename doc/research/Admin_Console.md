@@ -192,20 +192,39 @@ call.
   running it), its `figures` (the live answer, the halts' start times left out: they are in
   storage), the node's own `node` figures, each chart `samples` as taken, each `event` once
   written. Nothing is built while no stream is open on the node; a stream that opens gets every
-  state again within a second.
+  state again within a second. A node killed sends no `standby`: when two nodes name the same
+  pipeline as theirs, the one with the higher `owner_epoch` runs it.
 - **The node asked merges the others.** It follows each other member with an API address, with
   the caller's own credentials and the target and forwarded-by headers of §10's forwarding, and
   passes their messages on as sent; a stream asked for by another node is that node's own alone.
   `peer` says when a member is followed (`following`) and when it can't be (`unreachable`, with
-  why), retried after 1, 2, 5, then every 10 s; `members` says when the members or their phases
-  change. Every message's data names the node that sent it.
-- **Bounded.** 64 streams a node, its peers' included (`503` with `Retry-After` past that); a
-  stream more than 1024 messages behind is sent `reset` and reads again; a followed stream silent
-  for 45 s (three keep-alives) is dropped and followed again; a followed message over 1 MiB ends
-  that follow. A slow page holds only its own stream.
+  why: it can't be reached, it is full of streams, "it answered 503", or it refuses credentials
+  the node asked still takes, "it answered 401" on other auth settings), retried after 1, 2, 5,
+  then every 10 s; `members` says when the members or their phases change. Every message's data
+  names the node that sent it. A member followed again sends its states again (its stream is a
+  new one), but not its events from the gap: a page reads `GET /v1/events` for the gap.
+- **The caller is checked by the node asked, at the open and before each follow again.** Its
+  credentials kept (its `Authorization` alone, never logged) are verified again, as the route
+  does, before a member is followed again; once they no longer verify (a token expired, a
+  password changed, a role taken away), the stream is sent `reset` (`credentials`) and ends, and
+  the page opens it again with fresh credentials. How a stream ends with its session is M14's.
+- **A stream another node asked for takes what its node doesn't know.** The node asked checked
+  the query against its own generation, maybe newer: a pipeline the node followed doesn't run is
+  accepted (nothing about it passes until it runs it), a kind or a parameter it doesn't know is
+  skipped, and it reads no config; a parameter given twice is still `400`. So a healthy member a
+  generation behind is followed, not `unreachable` with a `404`.
+- **Bounded.** 64 streams a node, its peers' included (`503` with `Retry-After` past that): each
+  page holds a place on every node, so a node full of streams shows on other pages as
+  `unreachable`, "it answered 503". A stream more than 1024 messages behind is sent `reset`
+  (`lagged`, with `missed`) and reads again; a followed stream silent for 45 s (three
+  keep-alives) is dropped and followed again; a followed message over 1 MiB ends that follow, and
+  a refusal is read to 8 KiB, its reason clipped. A slow page holds only its own stream.
 - **It never holds a node's stop.** A node ends its streams before its server's graceful stop.
 - **Filters:** `pipeline` (ids) and `kind`; the control messages (`hello`, `members`, `peer`,
-  `reset`) are always sent. The filters go to the followed nodes with the request.
+  `reset`) are always sent. A `pipeline` filter drops the messages that name no pipeline
+  (`node`, a node's `samples`, events without a pipeline). A pipeline the generation doesn't
+  have is `404`; a kind or a parameter that isn't one, or one given twice or empty, `400`. The
+  filters go to the followed nodes with the request.
 
 ## 9. Sign-in and sessions
 
