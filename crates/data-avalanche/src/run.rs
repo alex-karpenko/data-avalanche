@@ -13,15 +13,15 @@ use data_avalanche_api::{
 use data_avalanche_cluster::{
     ClusterReconciler, ConfigCoordinator, ControllerDeps, ControllerSettings, CoordinatorDeps,
     DocsFn, Gossip, GossipKey, GossipSettings, LeaseTiming, NodeIdentity, NodeMeta, Phase,
-    ReconcilerSettings, Recorder, Seeds, Udp, advertise, api_url, discover, expire_events,
-    file_hash, interfaces, join as join_gossip, leave, node_identity, record_members,
-    removed_pipelines, watch_file,
+    ReconcilerSettings, Recorder, Sampler, Seeds, Udp, advertise, api_url, discover, expire_events,
+    expire_history, file_hash, interfaces, join as join_gossip, leave, node_identity,
+    record_members, removed_pipelines, sample_history, watch_file,
 };
 use data_avalanche_config::{
     Diagnostic, FingerprintKey, ProcessEnv, Report, ResolvedConfig, Severity, load_str,
 };
 use data_avalanche_pipeline::{Backoff, Tuning};
-use data_avalanche_state::{ConfigGenerations, Events, Leases, Removals};
+use data_avalanche_state::{Charts, ConfigGenerations, Events, Leases, Removals};
 use data_avalanche_telemetry::{Metrics, ProcessFigures, sample_process};
 use thiserror::Error;
 use tokio::sync::{Semaphore, oneshot, watch};
@@ -181,6 +181,12 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         Recorder::start(Arc::clone(&events), &holder.node_id, metrics.clone());
     let (retention, kept) = watch::channel(config.globals.console.events.retention);
     let _expiry = tokio::spawn(expire_events(Arc::clone(&events), kept));
+    // The chart history (Admin_Console §7): sampled once the controllers run, expired on every
+    // node.
+    let charts = Arc::new(Charts::new(joined.globals.clone()));
+    let (history_retention, history_kept) =
+        watch::channel(config.globals.console.history.retention);
+    let _history_expiry = tokio::spawn(expire_history(Arc::clone(&charts), history_kept));
     let c = &config.globals.cluster;
     let docs = Arc::clone(&buckets);
     let docs: Arc<DocsFn> = Arc::new(move |p| docs.pipeline_docs(p).map_err(|e| e.to_string()));
@@ -262,6 +268,16 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         gossip.members(),
         ReconcilerSettings::new(c),
     );
+    let _history = tokio::spawn(sample_history(
+        Sampler::new(
+            Arc::clone(&charts),
+            &deps.holder.node_id,
+            deps.holder.incarnation,
+        ),
+        reconciler.watch_statuses(),
+        process.clone(),
+        metrics.clone(),
+    ));
     // Each newer config generation, this node's reloads included (Clustering §9).
     let (log, reloaded_auth) = (Arc::clone(&logger), Arc::clone(&auth));
     let coordinator = Arc::new(ConfigCoordinator::start(
@@ -283,6 +299,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
                 log.trace(&g.tracing);
                 reloaded_auth.set(&g.api, &g.console.username_claim);
                 retention.send_replace(g.console.events.retention);
+                history_retention.send_replace(g.console.history.retention);
             }),
             recorder: recorder.clone(),
         },

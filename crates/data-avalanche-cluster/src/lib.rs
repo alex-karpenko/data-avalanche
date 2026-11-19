@@ -13,6 +13,7 @@ pub mod discovery;
 mod error;
 pub mod events;
 pub mod gossip;
+pub mod history;
 mod jobs;
 pub mod lease;
 pub mod node;
@@ -43,6 +44,9 @@ pub use events::{
 pub use gossip::{
     Advertiser, Announcer, Gossip, GossipFigures, GossipSettings, Member, Members, NodeIdentity,
     NodeMeta, Phase, SUSPICIONS_KEPT, SUSPICIONS_LISTED,
+};
+pub use history::{
+    HISTORY_PRUNE_EVERY, Sampler, UNWRITTEN_KEPT, WRITE_EVERY, expire_history, sample_history,
 };
 pub use lease::{LeaseGuard, LeaseRun, LeaseTiming, RenewEnd, RenewState};
 pub use node::{JOIN_WAIT, join, leave};

@@ -69,28 +69,6 @@ fn replicating(s: &ControllerStatus, w: &WorkerStatus) -> bool {
     }
 }
 
-/// What lake readers see of the pipeline's tables as of now, over the controller's lease term
-/// (its workers' freshness carried across their runs): every change read before the oldest one
-/// not yet durable (`replication_lag_seconds`, System-Overview); while the worker streams, all of
-/// them when none waits. Otherwise (a source outage, a retry, an error, a pause, a stop) as of
-/// when the term was last caught up; `None` when that isn't known either.
-fn fresh_as_of(
-    s: &ControllerStatus,
-    w: &WorkerStatus,
-    now: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
-    let pending = s
-        .pending_since_micros
-        .and_then(DateTime::from_timestamp_micros)
-        .map(|at| at.min(now));
-    let streams = matches!(s.actual, Some(Actual::Running)) && w.phase == Phase::Streaming;
-    if streams {
-        Some(pending.unwrap_or(now))
-    } else {
-        pending.or_else(|| s.caught_up_at.map(|at| at.min(now)))
-    }
-}
-
 /// One table's row, as the pipeline's live figures list it (and the tables, and a table's page
 /// as its `live`): the same fields whether its worker shows it or only its halt is known.
 struct Row<'a> {
@@ -175,7 +153,7 @@ fn tables(
     now: DateTime<Utc>,
 ) -> Vec<Value> {
     let replicating = replicating(s, w);
-    let fresh = fresh_as_of(s, w, now);
+    let fresh = s.fresh_as_of(now);
     let window = chrono::Duration::from_std(FRESH_WITHIN).expect("a minute");
     // A copy outside the config is listed while it copies: once it ends, or halts, its job
     // tells (its figures stay in `tables` until the worker ends).
@@ -233,7 +211,7 @@ fn answer(
     let (actual, error) = s.actual.as_ref().map_or(("starting", None), actual_of);
     let w = s.worker.as_ref();
     let worker = w.map(|w| {
-        let fresh = fresh_as_of(s, w, now);
+        let fresh = s.fresh_as_of(now);
         json!({
             "phase": phase_name(&w.phase),
             "reconnecting": match &w.phase {

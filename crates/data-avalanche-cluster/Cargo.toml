@@ -20,6 +20,7 @@ data-avalanche-state.workspace = true
 data-avalanche-storage.workspace = true
 data-avalanche-telemetry.workspace = true
 foca.workspace = true
+futures-util.workspace = true
 gethostname.workspace = true
 getrandom.workspace = true
 if-addrs.workspace = true

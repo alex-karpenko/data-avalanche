@@ -135,6 +135,28 @@ pub struct ControllerStatus {
     pub caught_up_at: Option<DateTime<Utc>>,
 }
 
+impl ControllerStatus {
+    /// What lake readers see of the pipeline's tables as of `now`, over the lease term (its
+    /// workers' freshness carried across their runs): every change read before the oldest one
+    /// not yet durable (`replication_lag_seconds`, System-Overview); while the worker streams,
+    /// all of them when none waits. Otherwise (a source outage, a retry, an error, a pause, a
+    /// stop) as of when the term was last caught up; `None` when that isn't known either, or no
+    /// worker runs. The pipeline's live figures and its history's `lag_seconds` read it.
+    pub fn fresh_as_of(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        let w = self.worker.as_ref()?;
+        let pending = self
+            .pending_since_micros
+            .and_then(DateTime::from_timestamp_micros)
+            .map(|at| at.min(now));
+        let streams = matches!(self.actual, Some(Actual::Running)) && w.phase == Phase::Streaming;
+        if streams {
+            Some(pending.unwrap_or(now))
+        } else {
+            pending.or_else(|| self.caught_up_at.map(|at| at.min(now)))
+        }
+    }
+}
+
 /// A controller's timings.
 #[derive(Debug, Clone)]
 pub struct ControllerSettings {
