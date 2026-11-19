@@ -81,7 +81,7 @@ an hour.
 `GET /v1/history` reads it, from any node:
 
 ```sh
-curl -u oleksii:… 'https://avalanche.example.com:8080/v1/history?pipeline=orders-pg&series=lag_seconds&since=2026-11-18T06:00:00Z'
+curl -u alice:… 'https://avalanche.example.com:8080/v1/history?pipeline=orders-pg&series=lag_seconds&since=2026-11-18T06:00:00Z'
 ```
 
 It answers each series' points, `[unix seconds, value]`, at a step that keeps a series to 1440
