@@ -4463,3 +4463,70 @@ git commit -m "test(e2e): a pipeline's history through any node, across a failov
 - `cargo xtask docs --check` and `cd docs && npm run build` (its link check) pass.
 - At the plan's verification (the code above, on `cf78904`, each task's red and green commits apart): every Step 2 failure as stated; each task's gates and its tests pass at its commit; `cargo xtask docs --check` holds from Task 4 on; `cargo test --workspace` 1741 passed at Task 7; Task 7's scenario passed on PostgreSQL 18, `mysql-84`, `mysql-84-nogtid` and `mariadb-118` (42 s each); the site built (31 pages, link check clean).
 - Then, on Oleksii's request: the whole-branch review and its fixes, the push, the PR.
+
+## Deviations during execution
+
+### Task 1: `DocStore::put`'s place
+
+The plan's `doc.rs` hunk put `put` between `update`'s doc comment and `update`, so `update`'s
+text documented `put`. A fix round moved `put` above that comment, in Task 1's commit.
+
+### Task 4: an asked step keeps at most 1440 points (S-M13e.2)
+
+Task 4's review found that only the default step was coarsened: `step=15` over 31 days answered
+about 178,000 points a series. Oleksii chose to clamp an asked step to the default's coarsest, the
+answer's `step` saying the one used; spec patch S-M13e.2 drops "by default" from the System-Overview
+row. The fix lands in Task 4's commit, the spec patch on its own after it.
+
+### Task 5: the answer's size cap while it is read
+
+Task 5's review found that `MAX_PROMETHEUS_ANSWER` held only for an answer with a
+`Content-Length`: a chunked one was read whole before its size was checked. A fix round reads it a
+chunk at a time and stops past the cap, with tests for an endless chunked answer (it failed on the
+old read, at the timeout), an answer that isn't a matrix, and a Prometheus slower than `timeout`.
+
+### Task 7: the next term's lag
+
+One PostgreSQL run of the scenario failed (99 s) and a mysql-84 one took 104 s. An instrumented run
+measured why: the next term's first lag sample was readable 4 s after the lease settled, but a
+point's time is its step's start, and when that sample shared the kill's step the test's
+`t > killed` skipped it until the chunk's next write, a minute later (D-M13e.3). Two fix rounds in
+Task 7's commit: the wait is 120 s, as the suite's other waits across a recovery after a kill; a
+point in the kill's own step that the killed holder hadn't written counts; the kept-samples check
+asserts the holder wrote some. Ten runs after it, five on each source: the next term's lag seen
+2–3.4 s after the lease settled. The chart history has no gap after a failover beyond the takeover.
+
+### The whole-branch review's fixes
+
+Oleksii ruled all four of its findings fixed, each in its own commit after Task 7's:
+
+- **A late write was hidden** (D-M13e.4): a reader cached an hour as final 5 minutes after it
+  ended, while its writer may retry it for an hour more (`UNWRITTEN_KEPT`). An hour is now final
+  only 65 minutes after it ends (`CLOSED_AFTER`, tied to `UNWRITTEN_KEPT`), and a write evicts its
+  own key from the cache.
+- **A node that stopped dropped its last samples** (D-M13e.3): `sample_history` takes a stop
+  signal; on stop it samples once more, ends every chunk and writes them, within 5 s, beside the
+  events' flush.
+- **No series for the labels read as success** (D-M13e.6, Admin_Console §7): when no pipeline
+  asked has a series anywhere in the range asked, the reader records "no series for the labels"
+  and the pipeline series are `failing`. Each series' one query runs to `until`, of which only the
+  points before the history kept are shown: judged over the older range alone, a pipeline or a
+  cluster younger than the retention read as failing (the fix wave's re-review; Oleksii chose
+  this refinement, in its own commit).
+- **The older range lost a gauge's peak** (D-M13e.6, the spec row): a gauge is
+  `max_over_time` over its step, at least 5 minutes as a rate's window is (a shorter window can
+  hold no scrape), and every Prometheus point is evaluated at its step's end and shifted to its
+  start, so it covers its step as the history's points do.
+
+With them: the site's `failing` and `step` wording and the research doc's date; the reader
+forgets its last outcome when its client is rebuilt; an asked pipeline is read once
+(`pipeline=a,a`); no Prometheus query when no pipeline is asked. Apart from the plan, the site's
+API examples use a generic basic user (`alice`), the events page's too.
+
+### At the exit
+
+On `8b5c902`, the last code commit: `cargo fmt --all --check`, both clippy runs and
+`cargo xtask docs --check` clean; `cargo test --workspace` 1749 passed; the whole E2E suite on
+PostgreSQL 18, 56 passed (13 min); Task 7's scenario on `mysql-84` and PostgreSQL after each fix
+round, and on `mysql-84-nogtid` and `mariadb-118` at the exit (42 s each); the site built (31
+pages, link check clean).
