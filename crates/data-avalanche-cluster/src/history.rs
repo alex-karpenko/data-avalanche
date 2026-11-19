@@ -18,7 +18,7 @@ use data_avalanche_state::{
 };
 use data_avalanche_telemetry::{Metrics, ProcessFigures};
 use futures_util::{StreamExt, stream};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tokio::time::MissedTickBehavior;
 
 use crate::controller::{Actual, ControllerStatus};
@@ -304,6 +304,15 @@ impl Sampler {
         failed
     }
 
+    /// Ends every chunk held and writes each one not yet written, at `now`: what a node that stops
+    /// does last. Returns how many writes failed; those chunks stay held.
+    pub async fn finish(&mut self, now: DateTime<Utc>) -> usize {
+        for open in self.open.values_mut() {
+            open.ended = true;
+        }
+        self.write(now).await
+    }
+
     /// The chunks held in memory, written or not.
     pub fn held(&self) -> usize {
         self.open.len()
@@ -311,20 +320,21 @@ impl Sampler {
 }
 
 /// Samples every [`SAMPLE_EVERY`] (the tables every [`TABLE_SAMPLE_EVERY`]) the controllers
-/// `statuses` lists and the process's `figures`, and writes what is due, until the task is
-/// aborted.
+/// `statuses` lists and the process's `figures`, and writes what is due, until `stop` fires (or
+/// its sender is dropped): then it takes a last sample and writes every chunk it holds, ended
+/// ([`Sampler::finish`]), and returns.
 pub async fn sample_history(
     mut sampler: Sampler,
     statuses: watch::Receiver<BTreeMap<String, watch::Receiver<ControllerStatus>>>,
     process: watch::Receiver<ProcessFigures>,
     metrics: Metrics,
+    mut stop: oneshot::Receiver<()>,
 ) {
     let per_table = (TABLE_SAMPLE_EVERY.as_secs() / SAMPLE_EVERY.as_secs()).max(1);
     let mut every = tokio::time::interval(SAMPLE_EVERY);
     every.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut ticks: u64 = 0;
-    loop {
-        every.tick().await;
+    let sample = |sampler: &mut Sampler, tables: bool| {
         let now = Utc::now();
         let current: BTreeMap<String, ControllerStatus> = statuses
             .borrow()
@@ -337,10 +347,26 @@ pub async fn sample_history(
             &current,
             &figures,
             metrics.take_slowest_renewal(),
-            ticks.is_multiple_of(per_table),
+            tables,
         );
+        now
+    };
+    loop {
+        tokio::select! {
+            _ = every.tick() => {}
+            _ = &mut stop => break,
+        }
+        let now = sample(&mut sampler, ticks.is_multiple_of(per_table));
         sampler.write(now).await;
         ticks += 1;
+    }
+    let now = sample(&mut sampler, ticks.is_multiple_of(per_table));
+    let failed = sampler.finish(now).await;
+    if failed > 0 {
+        tracing::warn!(
+            failed,
+            "chart history unwritten at the stop: the charts miss it"
+        );
     }
 }
 
@@ -684,6 +710,46 @@ mod tests {
             1,
             "the 9 o'clock chunk dropped, the 10 o'clock one kept"
         );
+    }
+
+    /// A node that stops: its last sample taken (its pipelines handed off), every chunk it holds
+    /// is written, ended, without waiting for the minute.
+    #[tokio::test]
+    async fn a_sampler_that_stops_writes_every_chunk_it_holds() {
+        let (mut s, charts, _) = sampler();
+        let cores = figures(1 << 20, 0.25);
+        let t1 = at(9, 0, 0);
+        s.sample(
+            t1,
+            &statuses(&[("orders", running(4, t1))]),
+            &cores,
+            None,
+            false,
+        );
+        s.write(t1).await;
+        // Sampled since, not yet due.
+        let t2 = at(9, 0, 15);
+        s.sample(
+            t2,
+            &statuses(&[("orders", running(4, t2))]),
+            &cores,
+            None,
+            false,
+        );
+        s.write(t2).await;
+        // The leave handed the pipeline off: the last sample finds it a standby.
+        let t3 = at(9, 0, 30);
+        let standby = ControllerStatus {
+            actual: Some(Actual::Standby { holder: None }),
+            ..ControllerStatus::default()
+        };
+        s.sample(t3, &statuses(&[("orders", standby)]), &cores, None, false);
+        assert_eq!(s.finish(t3).await, 0);
+        assert_eq!(s.held(), 0, "every chunk written and let go");
+        let p = stored(&charts, &ChartScope::Pipeline("orders".into()), t3).await;
+        assert_eq!(p[0].series["lag_seconds"].t, [0, 15]);
+        let n = stored(&charts, &ChartScope::Node("node-a".into()), t3).await;
+        assert_eq!(n[0].series["memory_bytes"].t, [0, 15, 30]);
     }
 
     /// A snapshot's rate is its rows done between two samples of one term: none at the first

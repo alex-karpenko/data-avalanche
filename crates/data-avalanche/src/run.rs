@@ -111,6 +111,10 @@ pub(crate) fn own_api(
 /// How long a clean stop waits for the events still queued to be written (a crash loses them).
 pub(crate) const EVENTS_FLUSH: Duration = Duration::from_secs(5);
 
+/// How long a clean stop waits for the chart history still held to be written (a crash loses up
+/// to a minute of it).
+const HISTORY_FLUSH: Duration = Duration::from_secs(5);
+
 /// Runs every pipeline until SIGTERM, SIGINT or a shutdown through the API. A leave through the
 /// API leaves the cluster first and keeps the process up (D-M9a.8).
 ///
@@ -268,7 +272,8 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         gossip.members(),
         ReconcilerSettings::new(c),
     );
-    let _history = tokio::spawn(sample_history(
+    let (stop_history, history_stop) = oneshot::channel();
+    let history = tokio::spawn(sample_history(
         Sampler::new(
             Arc::clone(&charts),
             &deps.holder.node_id,
@@ -277,6 +282,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         reconciler.watch_statuses(),
         process.clone(),
         metrics.clone(),
+        history_stop,
     ));
     // Each newer config generation, this node's reloads included (Clustering §9).
     let (log, reloaded_auth) = (Arc::clone(&logger), Arc::clone(&auth));
@@ -359,10 +365,21 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     tracing::info!("shutting down");
     let _ = stop_http.send(());
     let _ = server.await;
-    // The leave's last events (each lease released) are still queued: written, within a bound.
-    if !recorder.flush(EVENTS_FLUSH).await {
+    // The leave's last events (each lease released) are still queued, and the history's last
+    // samples held (each pipeline's chunk ended by the handoff): both written, within a bound.
+    let _ = stop_history.send(());
+    let (events, history) = tokio::join!(
+        recorder.flush(EVENTS_FLUSH),
+        tokio::time::timeout(HISTORY_FLUSH, history)
+    );
+    if !events {
         tracing::warn!(
             "the events still queued weren't written within {EVENTS_FLUSH:?}: the timeline misses them"
+        );
+    }
+    if history.is_err() {
+        tracing::warn!(
+            "the chart history held wasn't written within {HISTORY_FLUSH:?}: the charts miss it"
         );
     }
     tracing::info!("stopped");
