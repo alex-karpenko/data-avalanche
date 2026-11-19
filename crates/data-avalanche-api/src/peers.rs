@@ -34,8 +34,8 @@ pub const MAX_ANSWER: usize = 8 << 20;
 /// The client every forwarded request goes through.
 #[derive(Debug, Clone)]
 pub struct Peers {
-    me: String,
-    http: reqwest::Client,
+    pub(crate) me: String,
+    pub(crate) http: reqwest::Client,
 }
 
 /// Why the peers' client can't be built.
@@ -223,7 +223,7 @@ impl Peers {
 }
 
 /// The innermost cause: reqwest's own message says only "error sending request".
-fn cause(e: &(dyn std::error::Error + 'static)) -> String {
+pub(crate) fn cause(e: &(dyn std::error::Error + 'static)) -> String {
     let mut inner = e;
     while let Some(next) = inner.source() {
         inner = next;

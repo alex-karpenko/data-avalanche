@@ -2,22 +2,32 @@
 //! A stream starts with `hello`, then sends each change as it happens, without replay: a page
 //! reads the current state, then applies what follows. A stream that fell too far behind is sent
 //! `reset`, and reads again.
+//!
+//! The node a page asks merges into its stream each other member's, followed with the caller's
+//! own credentials (`peer` says when one is followed and when it can't be, `members` when the
+//! members change); a stream it is asked for by another node is its own alone.
 
 use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::time::Duration;
 
+use std::collections::BTreeMap;
+
 use axum::extract::{RawQuery, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
-use data_avalanche_cluster::{Live, MAX_STREAMS, Opened};
+use data_avalanche_cluster::{Live, MAX_STREAMS, Members, Opened};
 use data_avalanche_config::ResolvedConfig;
 use serde_json::{Value, json};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
+use tokio::task::{AbortHandle, JoinSet};
 
-use crate::{Api, Failure, starting};
+use crate::follow::FOLLOW_SILENCE;
+use crate::nodes::phase;
+use crate::peers::FORWARDED_BY;
+use crate::{Api, Failure, Node, starting};
 
 /// What `GET /v1/stream` takes, each once.
 pub const PARAMETERS: &[(&str, &str)] = &[
@@ -37,6 +47,15 @@ pub const KINDS: &[&str] = &["pipeline", "figures", "node", "samples", "event"];
 
 /// How often a stream with nothing to send sends a comment, under the server's idle timeout.
 pub const KEEP_ALIVE: Duration = Duration::from_secs(15);
+
+/// How long a peer's stream that ended or failed waits before it is followed again: each wait in
+/// turn, the last one from then on, until it is followed.
+pub const FOLLOW_BACKOFF: [Duration; 4] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+];
 
 /// How long a client refused for [`MAX_STREAMS`] waits before it tries again, in seconds.
 const RETRY_AFTER: &str = "5";
@@ -131,14 +150,18 @@ fn event(kind: &str, data: &Value) -> Event {
 }
 
 /// `GET /v1/stream`.
-pub(crate) async fn open(State(api): State<Api>, RawQuery(raw): RawQuery) -> Response {
+pub(crate) async fn open(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
     let Some(node) = api.node.get() else {
         return starting();
     };
-    let params: Vec<(String, String)> =
-        url::form_urlencoded::parse(raw.unwrap_or_default().as_bytes())
-            .into_owned()
-            .collect();
+    let raw = raw.unwrap_or_default();
+    let params: Vec<(String, String)> = url::form_urlencoded::parse(raw.as_bytes())
+        .into_owned()
+        .collect();
     let config = node.coordinator.config().await;
     let filter = match filter(&params, &config) {
         Ok(f) => f,
@@ -155,8 +178,18 @@ pub(crate) async fn open(State(api): State<Api>, RawQuery(raw): RawQuery) -> Res
         return r;
     };
     let me = node.members.borrow().me.clone();
+    // Asked by another node: this node's own messages alone, never followed further.
+    let follow = (!headers.contains_key(FORWARDED_BY)).then(|| Follow {
+        node: node.clone(),
+        path: if raw.is_empty() {
+            "/v1/stream".to_owned()
+        } else {
+            format!("/v1/stream?{raw}")
+        },
+        authorization: headers.get(header::AUTHORIZATION).cloned(),
+    });
     let (tx, rx) = mpsc::channel(BUFFER);
-    tokio::spawn(pump(me, filter, opened, tx));
+    tokio::spawn(pump(me, filter, opened, tx, follow));
     let events = futures_util::stream::unfold(rx, |mut rx| async move {
         rx.recv().await.map(|e| (Ok::<_, Infallible>(e), rx))
     });
@@ -177,18 +210,174 @@ async fn deliver(tx: &mpsc::Sender<Event>, opened: &mut Opened, e: Event) -> boo
     }
 }
 
-/// Sends `hello`, then this node's messages that pass `filter`, until the client goes or the
-/// node stops.
-async fn pump(me: String, filter: Filter, mut opened: Opened, tx: mpsc::Sender<Event>) {
-    let hello = json!({ "node": me, "at": Utc::now(), "follows": [] });
+/// What a stream follows its peers with: the node's members and client, the stream's own path
+/// and query, and the caller's credentials.
+struct Follow {
+    node: Node,
+    path: String,
+    authorization: Option<HeaderValue>,
+}
+
+/// Each other member with an API address, by name.
+fn peers_of(view: &Members) -> BTreeMap<String, String> {
+    view.nodes
+        .iter()
+        .filter(|(name, m)| **name != view.me && !m.meta.api_url.is_empty())
+        .map(|(name, m)| (name.clone(), m.meta.api_url.clone()))
+        .collect()
+}
+
+/// The members as `members` lists them.
+fn listed(view: &Members) -> Value {
+    view.nodes
+        .iter()
+        .map(|(name, m)| json!({ "node": name, "phase": phase(m.meta.phase) }))
+        .collect()
+}
+
+/// The peers a stream follows, each by its own task, all ended with the stream.
+#[derive(Default)]
+struct Following {
+    tasks: JoinSet<()>,
+    nodes: BTreeMap<String, (String, AbortHandle)>,
+}
+
+impl Following {
+    /// Follows each peer of `view` not yet followed at its address, and stops following the
+    /// others.
+    fn reconcile(&mut self, f: &Follow, view: &Members, tx: &mpsc::Sender<Event>) {
+        let want = peers_of(view);
+        self.nodes.retain(|name, (url, task)| {
+            let keep = want.get(name) == Some(url);
+            if !keep {
+                task.abort();
+            }
+            keep
+        });
+        for (name, url) in want {
+            if !self.nodes.contains_key(&name) {
+                let task = self.tasks.spawn(follow_peer(
+                    f.node.peers.clone(),
+                    view.me.clone(),
+                    name.clone(),
+                    url.clone(),
+                    f.path.clone(),
+                    f.authorization.clone(),
+                    tx.clone(),
+                ));
+                self.nodes.insert(name, (url, task));
+            }
+        }
+        while self.tasks.try_join_next().is_some() {}
+    }
+}
+
+/// Passes `peer`'s messages on, its `hello` as `peer` following; when its stream can't be
+/// opened, ends or fails, says so as `peer` unreachable and follows it again after
+/// [`FOLLOW_BACKOFF`]. Ends once the stream's client goes.
+async fn follow_peer(
+    peers: crate::Peers,
+    me: String,
+    peer: String,
+    url: String,
+    path: String,
+    authorization: Option<HeaderValue>,
+    tx: mpsc::Sender<Event>,
+) {
+    let mut failed = 0;
+    loop {
+        let error = match peers
+            .follow(&peer, &url, &path, authorization.clone(), FOLLOW_SILENCE)
+            .await
+        {
+            Err(e) => e,
+            Ok(mut followed) => loop {
+                let e = match followed.next().await {
+                    Ok(Some(f)) if f.kind == "hello" => {
+                        failed = 0;
+                        event(
+                            "peer",
+                            &json!({ "node": me, "peer": peer, "state": "following" }),
+                        )
+                    }
+                    Ok(Some(f)) => Event::default().event(f.kind).data(f.data),
+                    Ok(None) => break "its stream ended".to_owned(),
+                    Err(e) => break e,
+                };
+                if tx.send(e).await.is_err() {
+                    return;
+                }
+            },
+        };
+        let unreachable =
+            json!({ "node": me, "peer": peer, "state": "unreachable", "error": error });
+        if tx.send(event("peer", &unreachable)).await.is_err() {
+            return;
+        }
+        let wait = FOLLOW_BACKOFF[failed.min(FOLLOW_BACKOFF.len() - 1)];
+        failed += 1;
+        tokio::select! {
+            () = tx.closed() => return,
+            () = tokio::time::sleep(wait) => {}
+        }
+    }
+}
+
+/// The next change of the members, when the stream follows them.
+async fn changed(members: &mut Option<watch::Receiver<Members>>) -> Option<()> {
+    match members {
+        Some(m) => m.changed().await.ok(),
+        None => std::future::pending().await,
+    }
+}
+
+/// Sends `hello`, then this node's messages that pass `filter` and, with `follow`, each peer's,
+/// until the client goes or the node stops.
+async fn pump(
+    me: String,
+    filter: Filter,
+    mut opened: Opened,
+    tx: mpsc::Sender<Event>,
+    follow: Option<Follow>,
+) {
+    let mut members = follow.as_ref().map(|f| f.node.members.clone());
+    let view = members.as_mut().map(|m| m.borrow_and_update().clone());
+    let follows: Vec<String> = view
+        .as_ref()
+        .map(|v| peers_of(v).into_keys().collect())
+        .unwrap_or_default();
+    let hello = json!({ "node": me, "at": Utc::now(), "follows": follows });
     if !deliver(&tx, &mut opened, event("hello", &hello)).await {
         return;
+    }
+    let mut following = Following::default();
+    let mut shown = view.as_ref().map(listed);
+    if let (Some(f), Some(view)) = (&follow, &view) {
+        following.reconcile(f, view, &tx);
     }
     loop {
         let next = tokio::select! {
             () = tx.closed() => return,
             _ = opened.closed.wait_for(|c| *c) => return,
-            r = opened.messages.recv() => r,
+            Some(()) = changed(&mut members) => None,
+            r = opened.messages.recv() => Some(r),
+        };
+        let Some(next) = next else {
+            let (Some(f), Some(m)) = (&follow, &mut members) else {
+                continue;
+            };
+            let view = m.borrow_and_update().clone();
+            following.reconcile(f, &view, &tx);
+            let now = listed(&view);
+            if shown.as_ref() == Some(&now) {
+                continue;
+            }
+            shown = Some(now.clone());
+            let e = event("members", &json!({ "node": me, "members": now }));
+            if !deliver(&tx, &mut opened, e).await {
+                return;
+            }
+            continue;
         };
         let e = match next {
             Ok(live) if filter.passes(&live) => event(live.kind, &live.data),
@@ -356,6 +545,175 @@ mod tests {
         let within = tokio::time::Instant::now() + Duration::from_secs(3);
         while lone.node.feed.followers() > 0 {
             assert!(tokio::time::Instant::now() < within, "still open");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A fake node-b whose stream says `hello`, then sends what the test sends it; what each
+    /// request carried is kept.
+    struct NodeB {
+        url: String,
+        send: broadcast::Sender<(String, Value)>,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<(String, HeaderMap)>>>,
+    }
+
+    async fn node_b() -> NodeB {
+        use axum::http::Uri;
+        use futures_util::StreamExt;
+        let send = broadcast::Sender::<(String, Value)>::new(16);
+        let seen = std::sync::Arc::<std::sync::Mutex<Vec<(String, HeaderMap)>>>::default();
+        let (sender, kept) = (send.clone(), std::sync::Arc::clone(&seen));
+        let app = axum::Router::new().route(
+            "/v1/stream",
+            axum::routing::get(move |uri: Uri, headers: HeaderMap| {
+                kept.lock().unwrap().push((uri.to_string(), headers));
+                let rx = sender.subscribe();
+                async move {
+                    let hello = event("hello", &json!({ "node": "node-b" }));
+                    let rest = futures_util::stream::unfold(rx, |mut rx| async move {
+                        let (kind, data) = rx.recv().await.ok()?;
+                        Some((event(&kind, &data), rx))
+                    });
+                    Sse::new(
+                        futures_util::stream::iter([hello])
+                            .chain(rest)
+                            .map(Ok::<_, Infallible>),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        NodeB { url, send, seen }
+    }
+
+    #[tokio::test]
+    async fn a_stream_merges_each_other_node_s_followed_with_the_callers_credentials() {
+        let b = node_b().await;
+        let (addr, lone, _dir) = served_with(&b.url, crate::test_support::open(), |_| {}).await;
+        let mut s = stream(
+            addr,
+            "/v1/stream?kind=figures,node",
+            &[("authorization", "Basic dmlld2VyOnZpZXdlcg==")],
+        )
+        .await;
+        let (kind, hello) = s.next().await;
+        assert_eq!(
+            (kind.as_str(), &hello["follows"]),
+            ("hello", &json!(["node-b"]))
+        );
+        assert_eq!(
+            s.next().await,
+            (
+                "peer".into(),
+                json!({ "node": "node-a", "peer": "node-b", "state": "following" })
+            )
+        );
+        b.send
+            .send((
+                "figures".into(),
+                json!({ "node": "node-b", "id": "orders" }),
+            ))
+            .unwrap();
+        assert_eq!(
+            s.next().await,
+            (
+                "figures".into(),
+                json!({ "node": "node-b", "id": "orders" })
+            ),
+            "as node-b sent it"
+        );
+        lone.node.feed.publish(live("node", None, 1));
+        assert_eq!(
+            s.next().await.1,
+            live("node", None, 1).data,
+            "and node-a's own"
+        );
+        let (uri, h) = b.seen.lock().unwrap()[0].clone();
+        assert_eq!(
+            uri, "/v1/stream?kind=figures,node",
+            "asked as the caller asked"
+        );
+        assert_eq!(h[crate::peers::TARGET], "node-b");
+        assert_eq!(h[FORWARDED_BY], "node-a");
+        assert_eq!(h[header::AUTHORIZATION], "Basic dmlld2VyOnZpZXdlcg==");
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_cant_be_followed_is_named_and_followed_again() {
+        let (b_url, log) = crate::test_support::fake_answering(
+            Duration::ZERO,
+            StatusCode::NOT_FOUND,
+            json!({ "error": "no pipeline \"orders\" in the config generation this node runs" }),
+        )
+        .await;
+        let (addr, _lone, _dir) = served_with(&b_url, crate::test_support::open(), |_| {}).await;
+        let mut s = stream(addr, "/v1/stream", &[]).await;
+        s.next().await;
+        let unreachable = json!({
+            "node": "node-a",
+            "peer": "node-b",
+            "state": "unreachable",
+            "error": "it answered 404: no pipeline \"orders\" in the config generation this node runs",
+        });
+        assert_eq!(s.next().await, ("peer".into(), unreachable.clone()));
+        // After the first wait, FOLLOW_BACKOFF[0].
+        assert_eq!(s.next().await, ("peer".into(), unreachable));
+        assert_eq!(log.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_stream_another_node_asked_for_follows_none() {
+        let b = node_b().await;
+        let (addr, lone, _dir) = served_with(&b.url, crate::test_support::open(), |_| {}).await;
+        let mut s = stream(addr, "/v1/stream", &[(FORWARDED_BY, "node-c")]).await;
+        let (_, hello) = s.next().await;
+        assert_eq!(hello["follows"], json!([]));
+        lone.node.feed.publish(live("node", None, 1));
+        assert_eq!(s.next().await.1["n"], 1);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(b.seen.lock().unwrap().is_empty(), "node-b never asked");
+    }
+
+    #[tokio::test]
+    async fn a_member_that_leaves_is_no_longer_followed_and_the_members_are_sent() {
+        use data_avalanche_cluster::Phase;
+
+        use crate::test_support::member;
+        let b = node_b().await;
+        let both = Members {
+            me: "node-a".into(),
+            nodes: [
+                ("node-a".to_owned(), member("", Phase::Active)),
+                ("node-b".to_owned(), member(&b.url, Phase::Active)),
+            ]
+            .into(),
+        };
+        let (view, members) = watch::channel(both.clone());
+        let (addr, _lone, _dir) = served_with("", crate::test_support::open(), |n| {
+            n.members = members;
+        })
+        .await;
+        let mut s = stream(addr, "/v1/stream", &[]).await;
+        s.next().await;
+        assert_eq!(s.next().await.1["state"], "following");
+        let mut alone = both.clone();
+        alone.nodes.remove("node-b");
+        view.send_replace(alone);
+        assert_eq!(
+            s.next().await,
+            (
+                "members".into(),
+                json!({ "node": "node-a", "members": [{ "node": "node-a", "phase": "active" }] })
+            )
+        );
+        let within = tokio::time::Instant::now() + Duration::from_secs(3);
+        while b.send.receiver_count() > 0 {
+            assert!(
+                tokio::time::Instant::now() < within,
+                "node-b still followed"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }

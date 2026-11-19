@@ -13,6 +13,7 @@ mod auth;
 mod cluster;
 mod config;
 mod events;
+mod follow;
 mod generations;
 mod history;
 mod limit;
@@ -54,6 +55,7 @@ use tokio::sync::watch;
 pub use actions::{DENIALS_BURST, MAX_ERROR, MAX_NOTE, MAX_TARGET, Recorded, note_of};
 pub use auth::{Auth, FETCH_TIMEOUT, KEYS_MAX_AGE, MAX_KEY_DOCUMENT, Principal, REFETCH_AFTER};
 pub use cluster::{Control, Stop};
+pub use follow::{FOLLOW_SILENCE, MAX_FRAME};
 pub use history::{MAX_POINTS, MAX_SPAN};
 pub use limit::{RateLimit, VALIDATE_BURST, VALIDATE_PER_SECOND};
 pub use live::FRESH_WITHIN;
@@ -69,7 +71,7 @@ pub use prometheus::{
 pub use publish::{FIGURES_EVERY, STATE_EVERY, publish};
 pub use server::{Bound, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT, MAX_CONNECTIONS, ServeError, bind};
 pub use snapshots::{EndedJobs, READ_AT_ONCE};
-pub use stream::{KEEP_ALIVE, KINDS};
+pub use stream::{FOLLOW_BACKOFF, KEEP_ALIVE, KINDS};
 pub use tables::{FACTS_FOR, FACTS_WITHIN, Lake};
 
 use crate::auth::Denied;
