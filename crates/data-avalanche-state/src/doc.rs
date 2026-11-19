@@ -166,6 +166,12 @@ impl DocStore {
         Ok(self.store.create(key, encode(doc)).await?)
     }
 
+    /// Writes `doc` at `key` unconditionally: for a document only one writer ever writes (a
+    /// chart history chunk, its own term's or process's).
+    pub async fn put<T: Document>(&self, key: &str, doc: &T) -> Result<ObjectVersion, StateError> {
+        Ok(self.store.put(key, encode(doc)).await?)
+    }
+
     /// Writes `doc` only if the object is still at `expected`.
     ///
     /// # Errors

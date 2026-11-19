@@ -34,6 +34,7 @@
 //! management API's `status.json` and `requests.json` with the desired state's transitions.
 
 mod anchor;
+mod charts;
 mod doc;
 mod events;
 mod generation;
@@ -48,6 +49,10 @@ mod tables;
 mod test_support;
 
 pub use anchor::{ANCHOR_KEY, Anchor, AnchorDoc, HashAlgo, establish_anchor};
+pub use charts::{
+    CHARTS_PREFIX, CLOSED_AFTER, CLOSED_KEPT, ChartChunk, ChartScope, Charts, Fold, Points,
+    SAMPLE_EVERY, SERIES, Series, SeriesScope, TABLE_SAMPLE_EVERY, chart_key, hour_of, series_of,
+};
 pub use doc::{DocStore, Document, MODIFY_ATTEMPTS, StateError, Versioned};
 pub use events::{
     Actor, EVENTS_PREFIX, EventDoc, EventPage, EventQuery, EventSeverity, Events, MAX_EVENTS,
