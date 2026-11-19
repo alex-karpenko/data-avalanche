@@ -217,11 +217,13 @@ Prometheus. Settled in `doc/v1.1/M13e-console-history.md` (D-M13e.1–7):
   rate to its mean.
 - **Prometheus** (`globals.console.prometheus`): a pipeline's range older than the retention is one
   `query_range` per series over the catalogue's metrics, `by (pipeline)`, with `extra_labels` in
-  every selector: a gauge's peak over each step (`max_over_time`), a rate over at least 5
-  minutes, each value standing at the start of the step it covers. Tables and nodes have no such
-  series (their metrics carry no `table` or node label) and say so (`not_in_prometheus`).
-  Prometheus failing (unreachable, a refusing or invalid answer, one over 8 MiB, or no series for
-  the labels) never fails an answer: the series say `failing`.
+  every selector: a gauge's peak (`max_over_time`) and a rate, each over the step or 5 minutes
+  when longer, each value standing at the start of the step it covers. It is asked over the whole
+  range, and only the steps older than the history kept are shown: a pipeline younger than the
+  retention has nothing older and isn't failing. Tables and nodes have no such series (their
+  metrics carry no `table` or node label) and say so (`not_in_prometheus`). Prometheus failing
+  (unreachable, a refusing or invalid answer, one over 8 MiB, or no series for the labels
+  anywhere in the range asked) never fails an answer: the series say `failing`.
 
 ---
 

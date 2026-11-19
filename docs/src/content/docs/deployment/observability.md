@@ -106,9 +106,10 @@ globals:
       extra_labels: { cluster: prod-eu }
 ```
 
-Each series then says where its older range came from (`older`): `prometheus`; `failing`, when
-Prometheus didn't serve it: unreachable or past `timeout`, a refusing or invalid answer, one over
-8 MiB, or no series for the labels (the history kept is shown, and the answer's `prometheus` says
+Each series then says where its older range came from (`older`): `prometheus` (with no points
+for a pipeline younger than the retention); `failing`, when Prometheus didn't serve it:
+unreachable or past `timeout`, a refusing or invalid answer, one over 8 MiB, or no series for the
+labels anywhere in the range asked (the history kept is shown, and the answer's `prometheus` says
 what failed); or `not_in_prometheus` for a table's or a node's series, whose metrics carry no such
 label. A series without `older` asked nothing older than the history kept. Without the setting,
 the history kept is the whole answer, and nothing is marked.

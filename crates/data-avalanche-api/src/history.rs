@@ -443,8 +443,15 @@ async fn older(
         return;
     }
     // Prometheus gives a step's value at its end (a peak or a rate looks back): each is asked one
-    // step later and stands at its step's start, as the history's points do.
+    // step later and stands at its step's start, as the history's points do. Asked to the step
+    // `until` falls in, though only the steps up to `last` are kept: a pipeline younger than the
+    // retention has series only there, and is one the labels match.
     let step = TimeDelta::seconds(q.step);
+    let Some(until_at) =
+        DateTime::from_timestamp(q.until.timestamp().div_euclid(q.step) * q.step, 0)
+    else {
+        return;
+    };
     let read = match node.prometheus.client(prometheus) {
         Err(e) => Err(e.to_string()),
         Ok(client) => {
@@ -455,7 +462,7 @@ async fn older(
                     match query {
                         None => Ok((s.name, Default::default())),
                         Some(query) => client
-                            .range(&query, start_at + step, end_at + step, q.step)
+                            .range(&query, start_at + step, until_at + step, q.step)
                             .await
                             .map(|mut r| {
                                 for (t, _) in r.values_mut().flatten() {
@@ -472,7 +479,8 @@ async fn older(
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| e.to_string())
                 .and_then(|read| {
-                    // Answered, but with no series of any pipeline asked: the labels match none.
+                    // Answered, but with no series of any pipeline asked anywhere in the range:
+                    // the labels match none.
                     let none = read
                         .iter()
                         .all(|(_, r)| names.iter().all(|n| !r.contains_key(n)));
@@ -782,10 +790,21 @@ mod tests {
     /// Every range query a fake Prometheus was asked: its form, and its `Authorization`.
     type Queries = Arc<std::sync::Mutex<Vec<(BTreeMap<String, String>, Option<String>)>>>;
 
+    /// What a fake Prometheus has of `orders`.
+    #[derive(Debug, Clone, Copy)]
+    enum Has {
+        /// A value at every step asked: 7, then 8, then 9.
+        Every,
+        /// A value (5) at each step asked after this time only: a pipeline younger than the
+        /// retention.
+        After(i64),
+        /// No series at all.
+        Nothing,
+    }
+
     /// A fake Prometheus on a loopback port: it answers each range query `code` and, on 200,
-    /// `orders` at the query's first two steps (7, then 8) and at its last (9), or, without
-    /// `series`, no series at all.
-    async fn fake_prometheus(code: u16, series: bool) -> (String, Queries) {
+    /// what it `has` of `orders` over the steps asked.
+    async fn fake_prometheus(code: u16, has: Has) -> (String, Queries) {
         use axum::body::Bytes;
         use axum::http::HeaderMap;
         let asked: Queries = Arc::default();
@@ -804,13 +823,26 @@ mod tests {
                     let end: i64 = form["end"].parse().unwrap();
                     let step: i64 = form["step"].trim_end_matches('s').parse().unwrap();
                     seen.lock().unwrap().push((form, auth));
-                    let result = if series {
-                        json!([{
-                            "metric": { "pipeline": "orders" },
-                            "values": [[start, "7"], [start + step, "8"], [end, "9"]],
-                        }])
-                    } else {
+                    let values: Vec<Value> = match has {
+                        Has::Every => (start..=end)
+                            .step_by(usize::try_from(step).unwrap())
+                            .enumerate()
+                            .map(|(i, t)| {
+                                let v = ["7", "8"].get(i).copied().unwrap_or("9");
+                                json!([t, v])
+                            })
+                            .collect(),
+                        Has::After(born) => (start..=end)
+                            .step_by(usize::try_from(step).unwrap())
+                            .filter(|t| *t > born)
+                            .map(|t| json!([t, "5"]))
+                            .collect(),
+                        Has::Nothing => Vec::new(),
+                    };
+                    let result = if values.is_empty() {
                         json!([])
+                    } else {
+                        json!([{ "metric": { "pipeline": "orders" }, "values": values }])
                     };
                     let answer = json!({
                         "status": "success",
@@ -867,7 +899,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_pipeline_s_range_past_the_retention_comes_from_prometheus() {
-        let (url, asked) = fake_prometheus(200, true).await;
+        let (url, asked) = fake_prometheus(200, Has::Every).await;
         let (addr, lone, _dir) = served_prometheus(&url).await;
         let sampled = recent(&lone.node.charts).await;
         let (code, v) = json_of(
@@ -890,36 +922,58 @@ mod tests {
         let s = &v["series"][0];
         assert_eq!(s["older"], "prometheus");
         let points = s["points"].as_array().unwrap();
-        // Each value Prometheus gives at a step's end is the point of the step it ends.
+        // Each value Prometheus gives at a step's end is the point of the step it ends, up to the
+        // last step that ends by `kept_since`.
+        let older = usize::try_from((last - first) / step + 1).unwrap();
         assert_eq!(
-            &points[..3],
-            [
-                json!([first, 7.0]),
-                json!([first + step, 8.0]),
-                json!([last, 9.0])
-            ]
+            &points[..2],
+            [json!([first, 7.0]), json!([first + step, 8.0])]
         );
-        // The history kept follows: its sample in its step.
-        assert_eq!(points[3..], [json!([sampled.div_euclid(step) * step, 2.0])]);
+        assert_eq!(points[older - 1], json!([last, 9.0]));
+        // The history kept follows, with nothing of Prometheus's in its steps.
+        assert_eq!(
+            points[older..],
+            [json!([sampled.div_euclid(step) * step, 2.0])]
+        );
         assert_eq!(v["prometheus"]["state"], "ok");
         let asked = asked.lock().unwrap();
         let (form, auth) = &asked[0];
         assert_eq!(auth.as_deref(), Some("Bearer tok"));
         assert_eq!(
             form["query"],
-            r#"max by (pipeline) (max_over_time(data_avalanche_replication_lag_seconds{pipeline=~"orders",cluster="prod-eu"}[75s]))"#
+            r#"max by (pipeline) (max_over_time(data_avalanche_replication_lag_seconds{pipeline=~"orders",cluster="prod-eu"}[300s]))"#
         );
         assert_eq!(form["step"], "75s");
-        // Evaluated at each step's end: one step past each point.
+        // Evaluated at each step's end, one step past each point, over the whole range asked: a
+        // series seen anywhere in it is one the labels match.
         assert_eq!(form["start"], (first + step).to_string());
-        assert_eq!(form["end"], (last + step).to_string());
+        let until = timestamp("until").div_euclid(step) * step;
+        assert_eq!(form["end"], (until + step).to_string());
+    }
+
+    /// A pipeline younger than the retention (or a cluster) has no series older than the history
+    /// kept: nothing older, and Prometheus is fine.
+    #[tokio::test]
+    async fn a_pipeline_younger_than_the_retention_has_nothing_older() {
+        // Created an hour after `kept_since`.
+        let born = (Utc::now() - TimeDelta::hours(23)).timestamp();
+        let (url, _) = fake_prometheus(200, Has::After(born)).await;
+        let (addr, lone, _dir) = served_prometheus(&url).await;
+        recent(&lone.node.charts).await;
+        let (code, v) = json_of(addr, "GET", &format!("/v1/history?since={}", since(30))).await;
+        assert_eq!(code, 200, "{v}");
+        let series = v["series"].as_array().unwrap();
+        assert!(series.iter().all(|s| s["older"] == "prometheus"), "{v}");
+        assert_eq!(series[0]["points"].as_array().unwrap().len(), 1, "{v}");
+        assert_eq!(v["prometheus"]["state"], "ok", "{v}");
+        assert_eq!(v["prometheus"]["error"], Value::Null);
     }
 
     /// A Prometheus that answers without a series of any pipeline asked (its `extra_labels` match
     /// none, or it doesn't scrape the nodes) is failing: the older range is marked.
     #[tokio::test]
     async fn a_prometheus_without_the_series_is_failing() {
-        let (url, _) = fake_prometheus(200, false).await;
+        let (url, _) = fake_prometheus(200, Has::Nothing).await;
         let (addr, lone, _dir) = served_prometheus(&url).await;
         recent(&lone.node.charts).await;
         let (code, v) = json_of(addr, "GET", &format!("/v1/history?since={}", since(30))).await;
@@ -936,7 +990,7 @@ mod tests {
     /// is marked. A table's or a node's series aren't asked of it.
     #[tokio::test]
     async fn a_failing_prometheus_leaves_the_history_kept() {
-        let (url, asked) = fake_prometheus(503, true).await;
+        let (url, asked) = fake_prometheus(503, Has::Every).await;
         let (addr, lone, _dir) = served_prometheus(&url).await;
         recent(&lone.node.charts).await;
         let (_, v) = json_of(addr, "GET", "/v1/history?series=lag_seconds").await;

@@ -74,7 +74,8 @@ fn selector(names: &[String], extra: &BTreeMap<String, String>, more: &str) -> S
 
 /// The query of series `s` for the pipelines named `names`, one result per pipeline, at `step`
 /// seconds; `None` for a series Prometheus doesn't have. Its value at `t` is of the step that
-/// ends at `t`: a gauge's peak over it, a rate over it (or [`MIN_RATE_WINDOW`] when longer).
+/// ends at `t`: a gauge's peak over it, a rate over it; each over [`MIN_RATE_WINDOW`] when that
+/// is longer, so a step shorter than the scrapes leaves no window empty.
 pub fn promql(
     s: &Series,
     names: &[String],
@@ -84,7 +85,7 @@ pub fn promql(
     let window = step.max(MIN_RATE_WINDOW);
     let gauge = |metric: &str| {
         format!(
-            "max by (pipeline) (max_over_time({metric}{}[{step}s]))",
+            "max by (pipeline) (max_over_time({metric}{}[{window}s]))",
             selector(names, extra, "")
         )
     };
@@ -327,7 +328,7 @@ mod tests {
         let extra = BTreeMap::from([("cluster".to_owned(), "prod \"eu\"".to_owned())]);
         assert_eq!(
             promql(s("lag_seconds"), &names, &extra, 60).unwrap(),
-            r#"max by (pipeline) (max_over_time(data_avalanche_replication_lag_seconds{pipeline=~"orders|bill\\.ing",cluster="prod \"eu\""}[60s]))"#
+            r#"max by (pipeline) (max_over_time(data_avalanche_replication_lag_seconds{pipeline=~"orders|bill\\.ing",cluster="prod \"eu\""}[300s]))"#
         );
         assert_eq!(
             promql(s("changes_per_minute"), &names[..1], &BTreeMap::new(), 600).unwrap(),

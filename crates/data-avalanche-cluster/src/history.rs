@@ -31,8 +31,9 @@ pub const WRITE_EVERY: Duration = Duration::from_secs(60);
 /// [`CLOSED_AFTER`] after it ended, past this: the two move together.
 pub const UNWRITTEN_KEPT: Duration = Duration::from_secs(3600);
 
-// No reader holds an hour as final while its writer may still write it.
-const _: () = assert!(UNWRITTEN_KEPT.as_secs() < CLOSED_AFTER.as_secs());
+// No reader holds an hour as final while its writer may still write it: the last try comes at
+// most a sample after `UNWRITTEN_KEPT`.
+const _: () = assert!(UNWRITTEN_KEPT.as_secs() + SAMPLE_EVERY.as_secs() < CLOSED_AFTER.as_secs());
 
 /// How often the expired days are deleted.
 pub const HISTORY_PRUNE_EVERY: Duration = Duration::from_secs(3600);
