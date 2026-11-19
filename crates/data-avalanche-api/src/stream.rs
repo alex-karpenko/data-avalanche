@@ -5,10 +5,13 @@
 //!
 //! The node a page asks merges into its stream each other member's, followed with the caller's
 //! own credentials (`peer` says when one is followed and when it can't be, `members` when the
-//! members change); a stream it is asked for by another node is its own alone.
+//! members change); a stream it is asked for by another node is its own alone. Before it follows
+//! a peer again, it checks the caller's credentials itself: once they no longer verify, the stream
+//! is sent `reset` (`credentials`) and ends, and the page opens it again with fresh ones.
 
 use std::collections::BTreeSet;
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::time::Duration;
 
 use std::collections::BTreeMap;
@@ -19,15 +22,15 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
 use data_avalanche_cluster::{Live, MAX_STREAMS, Members, Opened};
-use data_avalanche_config::ResolvedConfig;
+use data_avalanche_config::{ResolvedConfig, Role};
 use serde_json::{Value, json};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{Notify, broadcast, mpsc, watch};
 use tokio::task::{AbortHandle, JoinSet};
 
 use crate::follow::FOLLOW_SILENCE;
 use crate::nodes::phase;
 use crate::peers::FORWARDED_BY;
-use crate::{Api, Failure, Node, starting};
+use crate::{Api, Auth, Failure, Node, starting};
 
 /// What `GET /v1/stream` takes, each once.
 pub const PARAMETERS: &[(&str, &str)] = &[
@@ -179,14 +182,17 @@ pub(crate) async fn open(
     };
     let me = node.members.borrow().me.clone();
     // Asked by another node: this node's own messages alone, never followed further.
-    let follow = (!headers.contains_key(FORWARDED_BY)).then(|| Follow {
-        node: node.clone(),
-        path: if raw.is_empty() {
-            "/v1/stream".to_owned()
-        } else {
-            format!("/v1/stream?{raw}")
-        },
-        authorization: headers.get(header::AUTHORIZATION).cloned(),
+    let follow = (!headers.contains_key(FORWARDED_BY)).then(|| {
+        Arc::new(Follow {
+            node: node.clone(),
+            auth: Arc::clone(&api.auth),
+            path: if raw.is_empty() {
+                "/v1/stream".to_owned()
+            } else {
+                format!("/v1/stream?{raw}")
+            },
+            authorization: headers.get(header::AUTHORIZATION).cloned(),
+        })
     });
     let (tx, rx) = mpsc::channel(BUFFER);
     tokio::spawn(pump(me, filter, opened, tx, follow));
@@ -210,12 +216,30 @@ async fn deliver(tx: &mpsc::Sender<Event>, opened: &mut Opened, e: Event) -> boo
     }
 }
 
-/// What a stream follows its peers with: the node's members and client, the stream's own path
-/// and query, and the caller's credentials.
+/// What a stream follows its peers with: the node's members and client, the API's own check of
+/// a caller, the stream's own path and query, and the caller's credentials (its `Authorization`
+/// alone, never logged).
 struct Follow {
     node: Node,
+    auth: Arc<Auth>,
     path: String,
     authorization: Option<HeaderValue>,
+}
+
+impl Follow {
+    /// Whether the caller's credentials still verify here as a viewer's, as the route's own check
+    /// says: a token expired, a password changed or a role taken away since the stream opened
+    /// don't.
+    async fn still_verified(&self) -> bool {
+        let mut headers = HeaderMap::new();
+        if let Some(a) = &self.authorization {
+            headers.insert(header::AUTHORIZATION, a.clone());
+        }
+        self.auth
+            .verify(&headers)
+            .await
+            .is_ok_and(|p| p.role >= Role::Viewer)
+    }
 }
 
 /// Each other member with an API address, by name.
@@ -235,17 +259,19 @@ fn listed(view: &Members) -> Value {
         .collect()
 }
 
-/// The peers a stream follows, each by its own task, all ended with the stream.
+/// The peers a stream follows, each by its own task, all ended with the stream; `refused` is
+/// told when the caller's credentials no longer verify.
 #[derive(Default)]
 struct Following {
     tasks: JoinSet<()>,
     nodes: BTreeMap<String, (String, AbortHandle)>,
+    refused: Arc<Notify>,
 }
 
 impl Following {
     /// Follows each peer of `view` not yet followed at its address, and stops following the
     /// others.
-    fn reconcile(&mut self, f: &Follow, view: &Members, tx: &mpsc::Sender<Event>) {
+    fn reconcile(&mut self, f: &Arc<Follow>, view: &Members, tx: &mpsc::Sender<Event>) {
         let want = peers_of(view);
         self.nodes.retain(|name, (url, task)| {
             let keep = want.get(name) == Some(url);
@@ -257,13 +283,12 @@ impl Following {
         for (name, url) in want {
             if !self.nodes.contains_key(&name) {
                 let task = self.tasks.spawn(follow_peer(
-                    f.node.peers.clone(),
+                    Arc::clone(f),
                     view.me.clone(),
                     name.clone(),
                     url.clone(),
-                    f.path.clone(),
-                    f.authorization.clone(),
                     tx.clone(),
+                    Arc::clone(&self.refused),
                 ));
                 self.nodes.insert(name, (url, task));
             }
@@ -274,20 +299,33 @@ impl Following {
 
 /// Passes `peer`'s messages on, its `hello` as `peer` following; when its stream can't be
 /// opened, ends or fails, says so as `peer` unreachable and follows it again after
-/// [`FOLLOW_BACKOFF`]. Ends once the stream's client goes.
+/// [`FOLLOW_BACKOFF`]. Ends once the stream's client goes, or, telling `refused`, when the
+/// caller's credentials no longer verify here before it is followed again.
 async fn follow_peer(
-    peers: crate::Peers,
+    f: Arc<Follow>,
     me: String,
     peer: String,
     url: String,
-    path: String,
-    authorization: Option<HeaderValue>,
     tx: mpsc::Sender<Event>,
+    refused: Arc<Notify>,
 ) {
     let mut failed = 0;
+    let mut again = false;
     loop {
-        let error = match peers
-            .follow(&peer, &url, &path, authorization.clone(), FOLLOW_SILENCE)
+        if std::mem::replace(&mut again, true) && !f.still_verified().await {
+            refused.notify_one();
+            return;
+        }
+        let error = match f
+            .node
+            .peers
+            .follow(
+                &peer,
+                &url,
+                &f.path,
+                f.authorization.clone(),
+                FOLLOW_SILENCE,
+            )
             .await
         {
             Err(e) => e,
@@ -331,14 +369,25 @@ async fn changed(members: &mut Option<watch::Receiver<Members>>) -> Option<()> {
     }
 }
 
+/// What a stream does next.
+enum Next {
+    /// The members changed.
+    Members,
+    /// This node's next message, or how many it missed.
+    Live(Result<Arc<Live>, broadcast::error::RecvError>),
+    /// The caller's credentials no longer verify.
+    Refused,
+}
+
 /// Sends `hello`, then this node's messages that pass `filter` and, with `follow`, each peer's,
-/// until the client goes or the node stops.
+/// until the client goes or the node stops; or, once the caller's credentials no longer verify
+/// when a peer is followed again, `reset` (`credentials`), and ends.
 async fn pump(
     me: String,
     filter: Filter,
     mut opened: Opened,
     tx: mpsc::Sender<Event>,
-    follow: Option<Follow>,
+    follow: Option<Arc<Follow>>,
 ) {
     let mut members = follow.as_ref().map(|f| f.node.members.clone());
     let view = members.as_mut().map(|m| m.borrow_and_update().clone());
@@ -351,6 +400,7 @@ async fn pump(
         return;
     }
     let mut following = Following::default();
+    let refused = Arc::clone(&following.refused);
     let mut shown = view.as_ref().map(listed);
     if let (Some(f), Some(view)) = (&follow, &view) {
         following.reconcile(f, view, &tx);
@@ -359,25 +409,36 @@ async fn pump(
         let next = tokio::select! {
             () = tx.closed() => return,
             _ = opened.closed.wait_for(|c| *c) => return,
-            Some(()) = changed(&mut members) => None,
-            r = opened.messages.recv() => Some(r),
+            () = refused.notified() => Next::Refused,
+            Some(()) = changed(&mut members) => Next::Members,
+            r = opened.messages.recv() => Next::Live(r),
         };
-        let Some(next) = next else {
-            let (Some(f), Some(m)) = (&follow, &mut members) else {
-                continue;
-            };
-            let view = m.borrow_and_update().clone();
-            following.reconcile(f, &view, &tx);
-            let now = listed(&view);
-            if shown.as_ref() == Some(&now) {
-                continue;
-            }
-            shown = Some(now.clone());
-            let e = event("members", &json!({ "node": me, "members": now }));
-            if !deliver(&tx, &mut opened, e).await {
+        let next = match next {
+            Next::Live(r) => r,
+            Next::Refused => {
+                // Its peers' messages end first, so `reset` is the stream's last.
+                following.tasks.shutdown().await;
+                let e = event("reset", &json!({ "node": me, "reason": "credentials" }));
+                deliver(&tx, &mut opened, e).await;
                 return;
             }
-            continue;
+            Next::Members => {
+                let (Some(f), Some(m)) = (&follow, &mut members) else {
+                    continue;
+                };
+                let view = m.borrow_and_update().clone();
+                following.reconcile(f, &view, &tx);
+                let now = listed(&view);
+                if shown.as_ref() == Some(&now) {
+                    continue;
+                }
+                shown = Some(now.clone());
+                let e = event("members", &json!({ "node": me, "members": now }));
+                if !deliver(&tx, &mut opened, e).await {
+                    return;
+                }
+                continue;
+            }
         };
         let e = match next {
             Ok(live) if filter.passes(&live) => event(live.kind, &live.data),
@@ -661,6 +722,79 @@ mod tests {
         // After the first wait, FOLLOW_BACKOFF[0].
         assert_eq!(s.next().await, ("peer".into(), unreachable));
         assert_eq!(log.lock().unwrap().len(), 2);
+    }
+
+    /// `globals.api` with `auth: basic`, its one user `ops` with `password`.
+    fn basic(password: &str) -> data_avalanche_config::Api {
+        use data_avalanche_config::{ApiAuth, Credentials, FingerprintKey, Secret};
+        let mut api = crate::test_support::config().globals.api;
+        api.auth = ApiAuth::Basic;
+        api.credentials = Some(Credentials::Inline {
+            user: "ops".into(),
+            password: Secret::new(password, &FingerprintKey::from_bytes([1; 32])),
+        });
+        api
+    }
+
+    /// `ops:s3cret`, as a Basic `Authorization`.
+    const OPS: &str = "Basic b3BzOnMzY3JldA==";
+
+    #[tokio::test]
+    async fn a_stream_whose_credentials_no_longer_verify_ends_before_a_peer_is_followed_again() {
+        let (b_url, log) = crate::test_support::fake_answering(
+            Duration::ZERO,
+            StatusCode::NOT_FOUND,
+            json!({ "error": "no pipeline \"orders\"" }),
+        )
+        .await;
+        let auth = std::sync::Arc::new(crate::Auth::new(
+            &basic("s3cret"),
+            crate::test_support::USERNAME_CLAIM,
+        ));
+        let (addr, _lone, _dir) = served_with(&b_url, std::sync::Arc::clone(&auth), |_| {}).await;
+        let mut s = stream(addr, "/v1/stream", &[("authorization", OPS)]).await;
+        assert_eq!(s.code, 200);
+        s.next().await;
+        assert_eq!(s.next().await.1["state"], "unreachable");
+        // The password changes before node-b is followed again (FOLLOW_BACKOFF[0]).
+        auth.set(&basic("rotated"), crate::test_support::USERNAME_CLAIM);
+        assert_eq!(
+            s.next().await,
+            (
+                "reset".into(),
+                json!({ "node": "node-a", "reason": "credentials" })
+            )
+        );
+        assert!(s.ended().await, "the stream ends: the page opens it again");
+        assert_eq!(log.lock().unwrap().len(), 1, "node-b never asked again");
+    }
+
+    #[tokio::test]
+    async fn a_peer_refusing_credentials_this_node_takes_is_unreachable_and_the_stream_goes_on() {
+        let (b_url, log) = crate::test_support::fake_answering(
+            Duration::ZERO,
+            StatusCode::UNAUTHORIZED,
+            json!({ "error": "wrong user or password" }),
+        )
+        .await;
+        let auth = std::sync::Arc::new(crate::Auth::new(
+            &basic("s3cret"),
+            crate::test_support::USERNAME_CLAIM,
+        ));
+        let (addr, lone, _dir) = served_with(&b_url, auth, |_| {}).await;
+        let mut s = stream(addr, "/v1/stream", &[("authorization", OPS)]).await;
+        s.next().await;
+        let unreachable = json!({
+            "node": "node-a",
+            "peer": "node-b",
+            "state": "unreachable",
+            "error": "it answered 401: wrong user or password",
+        });
+        assert_eq!(s.next().await, ("peer".into(), unreachable.clone()));
+        assert_eq!(s.next().await, ("peer".into(), unreachable), "asked again");
+        assert_eq!(log.lock().unwrap().len(), 2);
+        lone.node.feed.publish(live("node", None, 1));
+        assert_eq!(s.next().await.1["n"], 1, "the stream goes on");
     }
 
     #[tokio::test]
