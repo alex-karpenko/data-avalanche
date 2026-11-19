@@ -14,6 +14,7 @@ mod cluster;
 mod config;
 mod events;
 mod generations;
+mod history;
 mod limit;
 mod live;
 mod nodes;
@@ -41,7 +42,7 @@ use data_avalanche_cluster::{
     ConfigCoordinator, ControllerStatus, DocsFn, GossipFigures, Members, Recorder, WorkerFactory,
 };
 use data_avalanche_config::Role;
-use data_avalanche_state::{Events, Leases};
+use data_avalanche_state::{Charts, Events, Leases};
 use data_avalanche_telemetry::{CONTENT_TYPE, Metrics, ProcessFigures};
 use serde_json::{Value, json};
 use tokio::sync::watch;
@@ -49,6 +50,7 @@ use tokio::sync::watch;
 pub use actions::{DENIALS_BURST, MAX_ERROR, MAX_NOTE, MAX_TARGET, Recorded, note_of};
 pub use auth::{Auth, FETCH_TIMEOUT, KEYS_MAX_AGE, MAX_KEY_DOCUMENT, Principal, REFETCH_AFTER};
 pub use cluster::{Control, Stop};
+pub use history::{MAX_POINTS, MAX_SPAN};
 pub use limit::{RateLimit, VALIDATE_BURST, VALIDATE_PER_SECOND};
 pub use live::FRESH_WITHIN;
 pub use openapi::openapi;
@@ -109,6 +111,8 @@ pub struct Node {
     pub factory: Arc<dyn WorkerFactory>,
     /// The tables' facts and columns read, each kept [`FACTS_FOR`].
     pub lake: Arc<Lake>,
+    /// The chart history every node samples into `globals.state` (Admin_Console §7).
+    pub charts: Arc<Charts>,
 }
 
 impl std::fmt::Debug for Node {
@@ -789,6 +793,24 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
         (
             r(
                 "GET",
+                "/v1/history",
+                Viewer,
+                "The series the nodes sampled, over a range: a pipeline's, a table's or a node's, from any node",
+                &[
+                    (
+                        200,
+                        "each series' points, `[unix seconds, value]`, oldest first; `kept_since`: where the history kept starts",
+                    ),
+                    (400, "a parameter that isn't one, or isn't in its form"),
+                    (404, "no such pipeline in the generation this node runs"),
+                    (503, "the chart history can't be read"),
+                ],
+            ),
+            get(history::read),
+        ),
+        (
+            r(
+                "GET",
                 "/v1/openapi.json",
                 Viewer,
                 "This document",
@@ -983,6 +1005,7 @@ mod tests {
                 ("POST", "/v1/nodes/{node}/config/reload", Operator),
                 ("GET", "/v1/nodes/{node}/config/status", Viewer),
                 ("GET", "/v1/events", Viewer),
+                ("GET", "/v1/history", Viewer),
                 ("GET", "/v1/openapi.json", Viewer),
             ]
         );

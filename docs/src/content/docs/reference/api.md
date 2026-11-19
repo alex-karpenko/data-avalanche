@@ -600,6 +600,31 @@ Least role: `viewer`.
 | `200` | the events, and `next` when there are more |
 | `400` | a parameter that isn't one, or isn't in its form |
 
+## history
+
+The series the nodes sampled for charts, kept for `globals.console.history.retention`; a pipeline's older range from `globals.console.prometheus` when it is set.
+
+### `GET /v1/history`
+
+The series the nodes sampled, over a range: a pipeline's, a table's or a node's, from any node
+
+Least role: `viewer`.
+
+- Query parameter `pipeline`: a pipeline's id, or several comma-separated; without it or `node`, every pipeline.
+- Query parameter `table`: a table of the one pipeline asked, as its config key: the table's series.
+- Query parameter `node`: a node's name: the node's series.
+- Query parameter `series`: the series, comma-separated; by default every series of what is asked.
+- Query parameter `since`: from this time (RFC 3339); an hour before `until` by default.
+- Query parameter `until`: to this time (RFC 3339); now by default.
+- Query parameter `step`: seconds between points; by default, and at the finest, the samples' own, coarsened to at most 1440 points.
+
+| Status | When |
+|---|---|
+| `200` | each series' points, `[unix seconds, value]`, oldest first; `kept_since`: where the history kept starts |
+| `400` | a parameter that isn't one, or isn't in its form |
+| `404` | no such pipeline in the generation this node runs |
+| `503` | the node is starting or stopping, or its state can't be read; or the chart history can't be read |
+
 ## openapi.json
 
 The document this page is rendered from.

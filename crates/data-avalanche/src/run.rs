@@ -328,6 +328,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         // A table's Delta facts, read by any node on request.
         factory: Arc::clone(&deps.factory),
         lake: Arc::default(),
+        charts,
     });
     ready.store(true, Ordering::SeqCst);
     let mut cluster = Some((gossip, reconciler, discovery));

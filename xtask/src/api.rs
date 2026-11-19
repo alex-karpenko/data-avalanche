@@ -32,6 +32,10 @@ const TAGS: &[(&str, &str)] = &[
         "events",
         "The cluster's timeline and audit trail, kept for `globals.console.events.retention`.",
     ),
+    (
+        "history",
+        "The series the nodes sampled for charts, kept for `globals.console.history.retention`; a pipeline's older range from `globals.console.prometheus` when it is set.",
+    ),
     ("openapi.json", "The document this page is rendered from."),
 ];
 
