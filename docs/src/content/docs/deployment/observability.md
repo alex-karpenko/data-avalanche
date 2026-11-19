@@ -84,9 +84,10 @@ an hour.
 curl -u alice:… 'https://avalanche.example.com:8080/v1/history?pipeline=orders-pg&series=lag_seconds&since=2026-11-18T06:00:00Z'
 ```
 
-It answers each series' points, `[unix seconds, value]`, at a step that keeps a series to 1440
-points (a longer step keeps each step's peak of a lag or a size, and the mean of a rate), and
-`kept_since`, where the history kept begins.
+It answers each series' points, `[unix seconds, value]`, and `kept_since`, where the history kept
+begins. The step keeps a series to 1440 points by default; a `step` asked, in seconds, is never
+finer than the samples nor than 1440 points over the range. A longer step keeps each step's peak
+of a lag or a size, and the mean of a rate.
 
 ### Older ranges from Prometheus
 
@@ -106,10 +107,11 @@ globals:
 ```
 
 Each series then says where its older range came from (`older`): `prometheus`; `failing`, when
-Prometheus didn't answer within `timeout` (the history kept is shown, and the answer's
-`prometheus` says what failed); or `not_in_prometheus` for a table's or a node's series, whose
-metrics carry no such label. Without the setting, the history kept is the whole answer, and
-nothing is marked.
+Prometheus didn't serve it: unreachable or past `timeout`, a refusing or invalid answer, one over
+8 MiB, or no series for the labels (the history kept is shown, and the answer's `prometheus` says
+what failed); or `not_in_prometheus` for a table's or a node's series, whose metrics carry no such
+label. A series without `older` asked nothing older than the history kept. Without the setting,
+the history kept is the whole answer, and nothing is marked.
 
 ## The log
 

@@ -2,9 +2,9 @@
 //! series it owns, those of the pipelines whose lease it holds (their tables' every
 //! [`TABLE_SAMPLE_EVERY`], and a table new to the term's chunk at once) and its own, into the
 //! current hour's chunks. A chunk is written when it gets its first sample or a new series, then
-//! every [`WRITE_EVERY`] while it changes, and once more when its hour or its lease term ends. A write that fails is tried again at the next sample; the samples wait
-//! in memory, never holding up a pipeline. Another task expires the days past
-//! `globals.console.history.retention`.
+//! every [`WRITE_EVERY`] while it changes, and once more when its hour or its lease term ends. A
+//! write that fails is tried again at the next sample; the samples wait in memory, never holding
+//! up a pipeline. Another task expires the days past `globals.console.history.retention`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -243,9 +243,9 @@ impl Sampler {
     }
 
     /// Writes the chunks due at `now`: one never written, one with a new series, one that changed
-    /// [`WRITE_EVERY`] or more after its last write, and one that ended. A written chunk that ended is dropped; one
-    /// that can't be written stays for the next call, until [`UNWRITTEN_KEPT`] after its hour.
-    /// Returns how many writes failed.
+    /// [`WRITE_EVERY`] or more after its last write, and one that ended. A written chunk that
+    /// ended is dropped; one that can't be written stays for the next call, until
+    /// [`UNWRITTEN_KEPT`] after its hour. Returns how many writes failed.
     pub async fn write(&mut self, now: DateTime<Utc>) -> usize {
         let every = TimeDelta::from_std(WRITE_EVERY).expect("a minute");
         let due: Vec<(String, ChartChunk)> = self

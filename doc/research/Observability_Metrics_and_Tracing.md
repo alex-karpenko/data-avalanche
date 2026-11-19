@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-18
+updated: 2026-11-19
 domain: Architecture
 tags: [observability, metrics, prometheus, tracing, otlp, logs, correlation, cardinality, cdc, chart-history, console]
 resolves: [G-33, G-32]
@@ -211,13 +211,17 @@ Prometheus. Settled in `doc/v1.1/M13e-console-history.md` (D-M13e.1–7):
 - **Retention.** `globals.console.history.retention` (24 h): whole days deleted on every node, as
   the events are; reads stop at the retention whatever storage still holds.
 - **Reading.** `GET /v1/history` lists a day's folder per scope and loads the hours that meet the
-  range, 16 at a time; an hour ended over 5 minutes ago is final and kept in memory (4096 at
-  most). A coarser step folds a gauge to its peak and a rate to its mean.
+  range, 16 at a time; an hour ended over 65 minutes ago (past the hour its writer still tries
+  it again) is final and kept in memory (4096 at most). A `step` asked is never finer than the
+  samples nor than 1440 points over the range; a coarser step folds a gauge to its peak and a
+  rate to its mean.
 - **Prometheus** (`globals.console.prometheus`): a pipeline's range older than the retention is one
   `query_range` per series over the catalogue's metrics, `by (pipeline)`, with `extra_labels` in
-  every selector; a rate over at least 5 minutes. Tables and nodes have no such series (their
-  metrics carry no `table` or node label) and say so (`not_in_prometheus`). Prometheus failing
-  never fails an answer.
+  every selector: a gauge's peak over each step (`max_over_time`), a rate over at least 5
+  minutes, each value standing at the start of the step it covers. Tables and nodes have no such
+  series (their metrics carry no `table` or node label) and say so (`not_in_prometheus`).
+  Prometheus failing (unreachable, a refusing or invalid answer, one over 8 MiB, or no series for
+  the labels) never fails an answer: the series say `failing`.
 
 ---
 
