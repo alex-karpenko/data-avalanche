@@ -506,6 +506,7 @@ mod tests {
         assert_eq!(s.code, 200);
         assert!(s.head.contains("text/event-stream"), "{}", s.head);
         assert!(s.head.contains("x-accel-buffering: no"), "{}", s.head);
+        assert!(s.head.contains("cache-control: no-cache"), "{}", s.head);
         hello(&mut s).await;
         lone.node.feed.publish(live("figures", Some("orders"), 1));
         lone.node.feed.publish(live("node", None, 2));
@@ -514,6 +515,31 @@ mod tests {
             ("figures".into(), live("figures", None, 1).data)
         );
         assert_eq!(s.next().await, ("node".into(), live("node", None, 2).data));
+    }
+
+    /// Served whatever the console's switch says, as the events and the history are.
+    #[tokio::test]
+    async fn a_stream_is_served_with_the_console_off() {
+        use crate::test_support::{CONFIG, api, lone_with, serve};
+        let text = CONFIG.replace(
+            "pipelines:\n",
+            "  console: { enabled: false }\npipelines:\n",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.yaml");
+        std::fs::write(&file, &text).unwrap();
+        let lone = lone_with(
+            file,
+            &text,
+            std::sync::Arc::new(data_avalanche_config::ProcessEnv),
+        )
+        .await;
+        assert!(!lone.node.coordinator.config().await.globals.console.enabled);
+        let a = api(crate::test_support::open());
+        a.node.set(lone.node.clone()).unwrap();
+        let mut s = stream(serve(a).await, "/v1/stream", &[]).await;
+        assert_eq!(s.code, 200);
+        hello(&mut s).await;
     }
 
     #[tokio::test]
