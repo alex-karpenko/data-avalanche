@@ -66,6 +66,11 @@ impl Feed {
         self.tx.receiver_count() > 0
     }
 
+    /// How many streams are open on this node: a new one is sent every pipeline's state again.
+    pub fn followers(&self) -> usize {
+        self.tx.receiver_count()
+    }
+
     /// A new stream's messages, from now on.
     pub fn subscribe(&self) -> broadcast::Receiver<Arc<Live>> {
         self.tx.subscribe()
@@ -104,6 +109,7 @@ mod tests {
         feed.publish(live(1));
         let (mut a, mut b) = (feed.subscribe(), feed.subscribe());
         assert!(feed.followed());
+        assert_eq!(feed.followers(), 2);
         feed.publish(live(2));
         assert_eq!(
             *a.recv().await.unwrap(),
@@ -113,6 +119,7 @@ mod tests {
         assert_eq!(*b.recv().await.unwrap(), live(2));
         drop((a, b));
         assert!(!feed.followed());
+        assert_eq!(feed.followers(), 0);
         feed.publish(live(3));
     }
 

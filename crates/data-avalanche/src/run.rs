@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use data_avalanche_api::{
-    Api, Auth, Control, Node, Peers, RateLimit, ServeError, Stop, bind, router,
+    Api, Auth, Control, Node, Peers, RateLimit, ServeError, Stop, bind, publish, router,
 };
 use data_avalanche_cluster::{
     ClusterReconciler, ConfigCoordinator, ControllerDeps, ControllerSettings, CoordinatorDeps,
@@ -339,7 +339,10 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         lake: Arc::default(),
         charts,
         prometheus: Arc::default(),
+        feed: feed.clone(),
     });
+    // What the node sends its live streams of its own accord: its pipelines' states and figures.
+    let publisher = node.get().cloned().map(|n| tokio::spawn(publish(n)));
     ready.store(true, Ordering::SeqCst);
     let mut cluster = Some((gossip, reconciler, discovery));
     let mut stops = Stops::new(Box::pin(shutdown_signal()), asked);
@@ -366,6 +369,9 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         tracing::info!("left the cluster; the process stays up until it is stopped");
     }
     tracing::info!("shutting down");
+    if let Some(p) = publisher {
+        p.abort();
+    }
     let _ = stop_http.send(());
     let _ = server.await;
     // The leave's last events (each lease released) are still queued, and the history's last

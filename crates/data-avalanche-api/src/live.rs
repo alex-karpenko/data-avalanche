@@ -37,7 +37,7 @@ fn phase_name(p: &Phase) -> &'static str {
 }
 
 /// The controller's state, and its error.
-fn actual_of(a: &Actual) -> (&'static str, Option<&str>) {
+pub(crate) fn actual_of(a: &Actual) -> (&'static str, Option<&str>) {
     match a {
         Actual::Standby { .. } => ("standby", None),
         Actual::Starting => ("starting", None),
@@ -201,7 +201,7 @@ fn tables(
 }
 
 /// The answer of the node that runs the pipeline.
-fn answer(
+pub(crate) fn answer(
     me: &str,
     p: &Pipeline,
     s: &ControllerStatus,

@@ -22,6 +22,7 @@ mod openapi;
 mod peers;
 mod pipelines;
 mod prometheus;
+mod publish;
 mod server;
 mod snapshots;
 mod tables;
@@ -40,7 +41,8 @@ use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, get, post};
 use data_avalanche_cluster::{
-    ConfigCoordinator, ControllerStatus, DocsFn, GossipFigures, Members, Recorder, WorkerFactory,
+    ConfigCoordinator, ControllerStatus, DocsFn, Feed, GossipFigures, Members, Recorder,
+    WorkerFactory,
 };
 use data_avalanche_config::Role;
 use data_avalanche_state::{Charts, Events, Leases};
@@ -63,6 +65,7 @@ pub use prometheus::{
     MAX_PROMETHEUS_ANSWER, MIN_RATE_WINDOW, Outcome, PrometheusClient, PrometheusError,
     PrometheusReader, promql,
 };
+pub use publish::{FIGURES_EVERY, STATE_EVERY, publish};
 pub use server::{Bound, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT, MAX_CONNECTIONS, ServeError, bind};
 pub use snapshots::{EndedJobs, READ_AT_ONCE};
 pub use tables::{FACTS_FOR, FACTS_WITHIN, Lake};
@@ -120,6 +123,8 @@ pub struct Node {
     pub charts: Arc<Charts>,
     /// Reads a pipeline's series older than the history kept from `globals.console.prometheus`.
     pub prometheus: Arc<PrometheusReader>,
+    /// The node's live messages, sent to each `GET /v1/stream` open on it (M13f).
+    pub feed: Feed,
 }
 
 impl std::fmt::Debug for Node {
