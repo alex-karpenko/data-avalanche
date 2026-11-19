@@ -72,12 +72,14 @@ impl Feed {
     /// A new stream, or none while [`MAX_STREAMS`] are open.
     pub fn open(&self) -> Option<Opened> {
         let place = Arc::clone(&self.streams).try_acquire_owned().ok()?;
-        self.opened.fetch_add(1, Ordering::Relaxed);
-        Some(Opened {
+        let opened = Opened {
             messages: self.tx.subscribe(),
             closed: self.closed.subscribe(),
             _place: place,
-        })
+        };
+        // Counted once subscribed; Relaxed is enough: the broadcast's lock orders the subscribe.
+        self.opened.fetch_add(1, Ordering::Relaxed);
+        Some(opened)
     }
 
     /// Sends `live` to every stream open now: to none, and dropped, when none is.
@@ -106,8 +108,10 @@ impl Feed {
 
     /// A new stream's messages, from now on.
     pub fn subscribe(&self) -> broadcast::Receiver<Arc<Live>> {
+        let messages = self.tx.subscribe();
+        // Counted once subscribed; Relaxed is enough: the broadcast's lock orders the subscribe.
         self.opened.fetch_add(1, Ordering::Relaxed);
-        self.tx.subscribe()
+        messages
     }
 
     /// Ends every stream: the node stops, and an open stream must not hold the server's stop.
