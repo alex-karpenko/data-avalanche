@@ -258,6 +258,7 @@ impl Writer {
                         version,
                         cost,
                         at: chrono::Utc::now(),
+                        took: at.elapsed(),
                     }));
                     observer.committed(rows, at.elapsed());
                     span.record("outcome", "committed");

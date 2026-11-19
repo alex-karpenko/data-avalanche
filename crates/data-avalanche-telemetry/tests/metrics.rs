@@ -77,6 +77,29 @@ fn renewals_count_their_failures_and_time_their_successes() {
     );
 }
 
+/// The node's chart of lease renewals samples the slowest of any pipeline since its last sample
+/// (D-M13e.2).
+#[test]
+fn the_slowest_renewal_since_the_last_sample_is_taken_once() {
+    let m = Metrics::new();
+    assert_eq!(m.take_slowest_renewal(), None);
+    let p = m.pipeline(labels(), false);
+    let q = m.pipeline(
+        PipelineLabels {
+            pipeline: "billing".into(),
+            ..labels()
+        },
+        false,
+    );
+    p.renewed(Duration::from_millis(20));
+    q.renewed(Duration::from_millis(610));
+    p.renewed(Duration::from_millis(41));
+    assert_eq!(m.take_slowest_renewal(), Some(Duration::from_millis(610)));
+    assert_eq!(m.take_slowest_renewal(), None);
+    q.renewed(Duration::from_millis(9));
+    assert_eq!(m.take_slowest_renewal(), Some(Duration::from_millis(9)));
+}
+
 #[test]
 fn counters_keep_counting_across_workers() {
     let m = Metrics::new();

@@ -470,6 +470,7 @@ mod tests {
                 files: Some(820),
             },
             at: now,
+            took: std::time::Duration::ZERO,
         });
         // A copy outside the config that ended: its job tells, the page doesn't list it.
         w.committed(&TableCommit {
@@ -479,6 +480,7 @@ mod tests {
             version: 2,
             cost: CommitCost::default(),
             at: now,
+            took: std::time::Duration::ZERO,
         });
         w
     }

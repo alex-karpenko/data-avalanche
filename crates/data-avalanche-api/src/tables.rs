@@ -1121,6 +1121,7 @@ mod tests {
                 files: Some(files),
             },
             at: Utc::now(),
+            took: std::time::Duration::ZERO,
         }
     }
 
