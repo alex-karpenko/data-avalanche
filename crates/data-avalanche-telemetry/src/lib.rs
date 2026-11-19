@@ -229,6 +229,8 @@ struct Families {
     lease_state: Family<Labels, Gauge>,
     lease_renew_failures: Family<Labels, Counter>,
     lease_renew_latency: HistogramFamily,
+    /// The node's slowest renewal since the history last took it (D-M13e.2).
+    slowest_renewal: Mutex<Option<Duration>>,
     owned_pipelines: Gauge,
     cluster_members: Gauge,
     config_generation: Gauge,
@@ -305,6 +307,7 @@ impl Metrics {
             lease_state: Family::default(),
             lease_renew_failures: Family::default(),
             lease_renew_latency: Family::new_with_constructor(renew_latency),
+            slowest_renewal: Mutex::new(None),
             owned_pipelines: Gauge::default(),
             cluster_members: Gauge::default(),
             config_generation: Gauge::default(),
@@ -610,6 +613,16 @@ impl Metrics {
         self.families.ring_generation.set(gauge(generation));
     }
 
+    /// The slowest lease renewal of any pipeline on this node since the last call, which forgets
+    /// it; `None` when none renewed.
+    pub fn take_slowest_renewal(&self) -> Option<Duration> {
+        self.families
+            .slowest_renewal
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
     /// The handle that sets one pipeline's series. `per_table` is `sink.metrics.per_table`.
     pub fn pipeline(&self, labels: PipelineLabels, per_table: bool) -> PipelineMetrics {
         PipelineMetrics {
@@ -718,6 +731,12 @@ impl PipelineMetrics {
             .lease_renew_latency
             .get_or_create(&self.base())
             .observe(took.as_secs_f64());
+        let mut slowest = self
+            .families
+            .slowest_renewal
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *slowest = (*slowest).max(Some(took));
     }
 
     /// `None` drops the series: the source doesn't report it, or its read failed.

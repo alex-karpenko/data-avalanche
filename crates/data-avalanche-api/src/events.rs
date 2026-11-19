@@ -32,7 +32,7 @@ pub const PARAMETERS: &[(&str, &str)] = &[
 /// The default page.
 pub(crate) const DEFAULT_LIMIT: usize = 100;
 
-fn time(name: &str, value: &str) -> Result<DateTime<Utc>, Failure> {
+pub(crate) fn time(name: &str, value: &str) -> Result<DateTime<Utc>, Failure> {
     DateTime::parse_from_rfc3339(value)
         .map(|t| t.with_timezone(&Utc))
         .map_err(|e| {

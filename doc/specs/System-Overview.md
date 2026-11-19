@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-17
+updated: 2026-11-19
 domain: Architecture
 tags: [architecture, design, system, multi-sink, iceberg, delta-lake, v1-scope]
 sources: []
@@ -146,6 +146,7 @@ Functional endpoints are versioned under `/v1`; probes and metrics are unversion
 | Cancel snapshot job | `POST /v1/snapshots/{job_id}/cancel` | operator | records who cancelled the job and why, then restarts the pipeline's worker where one runs (the desired state isn't `STOPPED` and a node holds the lease): that start ends the job's unended tables `cancelled`, and a table the job was bringing back from a halt, or one a truncating job had begun to copy, halts (`COPY_CANCELLED`); without a worker, the next start does. `202` `cancelling`; `200` when cancelled already; `409` once the job ended |
 | Retry snapshot job | `POST /v1/snapshots/{job_id}/retry` | operator | a new job of an ended job's tables (`tables`: `not_copied`, the default, or `all`), truncating as the old one did unless `truncate` says; it records the job it retries, and is otherwise asked as `Request snapshot` is. `409` while the job hasn't ended, or when no table is left to copy |
 | Events | `GET /v1/events` | viewer | the cluster's timeline (actions with their caller, role, note and outcome; refused attempts; the cluster's own events), newest first; filters `since`, `until`, `kind` (a kind or a family), `object`, `actor`, `node`, `q`; `limit` 1–1000 (100); a page that stopped early names its `next`, passed back as `after`. Kept for `globals.console.events.retention` |
+| Chart history | `GET /v1/history` | viewer | the series the nodes sampled for the console's charts, read by any node from `globals.state`: a pipeline's (`lag_seconds`, `changes_per_minute`, `wal_held_bytes`, `binlog_lag_seconds`, `snapshot_rows_per_second`), a table's (`changes_per_minute`, `files_rewritten`, `commit_seconds`) or a node's (`memory_bytes`, `cpu_cores`, `lease_renew_seconds`); filters `pipeline` (several, or every pipeline), `table`, `node`, `series`, `since` and `until` (an hour by default, 31 days at most), `step` (at most 1440 points; a coarser step keeps a gauge's peak and a rate's mean). Kept for `globals.console.history.retention`; with `globals.console.prometheus`, a pipeline's older range comes from it, and each series says where (`older`: `prometheus`, `failing`, `not_in_prometheus`) |
 | Pipeline pause | `POST /v1/pipelines/{id}/pause` | operator | `RUNNING → PAUSED`: flush to a transaction boundary and commit; source connection kept warm; lease kept |
 | Pipeline stop | `POST /v1/pipelines/{id}/stop` | operator | `RUNNING/PAUSED → STOPPED`: flush, close the source connection (PG slot kept); lease kept |
 | Pipeline resume | `POST /v1/pipelines/{id}/resume` | operator | `PAUSED/STOPPED → RUNNING` |

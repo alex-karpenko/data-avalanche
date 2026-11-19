@@ -192,9 +192,12 @@ pub struct TableCommit {
     pub version: u64,
     pub cost: CommitCost,
     pub at: DateTime<Utc>,
+    /// How long it took, its retries included.
+    pub took: Duration,
 }
 
-/// The window [`TableFigures::changes_per_minute`] counts over.
+/// The window [`TableFigures::changes_per_minute`], [`TableFigures::slowest_commit`] and
+/// [`TableFigures::most_rewritten`] look over.
 pub const CHANGES_WINDOW: Duration = Duration::from_secs(60);
 
 /// A table's figures since the worker started, from its commits.
@@ -202,14 +205,25 @@ pub const CHANGES_WINDOW: Duration = Duration::from_secs(60);
 pub struct TableFigures {
     /// The stream's changes committed to it; a snapshot's rows don't count.
     pub changes: u64,
-    /// The commits of the last [`CHANGES_WINDOW`] that carried changes: when, and how many.
-    recent: VecDeque<(DateTime<Utc>, u64)>,
+    /// The commits of the last [`CHANGES_WINDOW`].
+    recent: VecDeque<Recent>,
     pub last_commit: Option<DateTime<Utc>>,
     /// The table's version after the last commit.
     pub version: Option<u64>,
     /// The cost of the stream's last commit that wrote rows (a snapshot's don't count): a MERGE's
     /// files rewritten, and the table's files after it.
     pub cost: Option<CommitCost>,
+}
+
+/// One commit of a table's last [`CHANGES_WINDOW`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Recent {
+    at: DateTime<Utc>,
+    /// The stream's changes it wrote; none for a snapshot chunk.
+    changes: u64,
+    took: Duration,
+    /// The files it rewrote: a stream commit that wrote rows only.
+    rewritten: Option<u64>,
 }
 
 impl TableFigures {
@@ -220,16 +234,18 @@ impl TableFigures {
         if c.rows > 0 && !c.snapshot {
             self.cost = Some(c.cost);
         }
-        if !c.snapshot && c.rows > 0 {
+        let stream = !c.snapshot && c.rows > 0;
+        if stream {
             self.changes += c.rows;
-            self.recent.push_back((c.at, c.rows));
         }
+        self.recent.push_back(Recent {
+            at: c.at,
+            changes: if stream { c.rows } else { 0 },
+            took: c.took,
+            rewritten: stream.then_some(c.cost.files_rewritten),
+        });
         let window = chrono::Duration::from_std(CHANGES_WINDOW).expect("a minute");
-        while self
-            .recent
-            .front()
-            .is_some_and(|(at, _)| *at <= c.at - window)
-        {
+        while self.recent.front().is_some_and(|r| r.at <= c.at - window) {
             self.recent.pop_front();
         }
     }
@@ -237,12 +253,25 @@ impl TableFigures {
     /// The changes committed in the [`CHANGES_WINDOW`] before `now`.
     #[must_use]
     pub fn changes_per_minute(&self, now: DateTime<Utc>) -> u64 {
+        self.window(now).map(|r| r.changes).sum()
+    }
+
+    /// The longest commit of the [`CHANGES_WINDOW`] before `now`; `None` without one.
+    #[must_use]
+    pub fn slowest_commit(&self, now: DateTime<Utc>) -> Option<Duration> {
+        self.window(now).map(|r| r.took).max()
+    }
+
+    /// The most files a stream commit of the [`CHANGES_WINDOW`] before `now` rewrote; `None`
+    /// when none wrote rows.
+    #[must_use]
+    pub fn most_rewritten(&self, now: DateTime<Utc>) -> Option<u64> {
+        self.window(now).filter_map(|r| r.rewritten).max()
+    }
+
+    fn window(&self, now: DateTime<Utc>) -> impl Iterator<Item = &Recent> {
         let window = chrono::Duration::from_std(CHANGES_WINDOW).expect("a minute");
-        self.recent
-            .iter()
-            .filter(|(at, _)| *at > now - window)
-            .map(|(_, rows)| rows)
-            .sum()
+        self.recent.iter().filter(move |r| r.at > now - window)
     }
 }
 
@@ -421,6 +450,7 @@ mod tests {
                 files: Some(10),
             },
             at: DateTime::from_timestamp(secs, 0).unwrap(),
+            took: Duration::from_millis(rows * 10),
         }
     }
 
@@ -451,6 +481,29 @@ mod tests {
             "the first is a minute old"
         );
         assert_eq!(f.changes_per_minute(at(1_200)), 0);
+    }
+
+    /// The history samples a table's slowest commit and its costliest MERGE of the last minute
+    /// (D-M13e.2): a snapshot chunk's commit is slow but rewrites nothing of the stream's.
+    #[test]
+    fn a_table_s_last_minute_has_its_slowest_commit_and_costliest_merge() {
+        let mut st = WorkerStatus::default();
+        st.committed(&commit(7, false, 1_000));
+        st.committed(&commit(500, true, 1_030));
+        st.committed(&commit(3, false, 1_050));
+        let f = &st.tables[&TableRef::new("public", "t")];
+        let at = |secs| DateTime::from_timestamp(secs, 0).unwrap();
+        assert_eq!(f.slowest_commit(at(1_055)), Some(Duration::from_secs(5)));
+        assert_eq!(f.most_rewritten(at(1_055)), Some(7));
+        assert_eq!(
+            (f.slowest_commit(at(1_091)), f.most_rewritten(at(1_091))),
+            (Some(Duration::from_millis(30)), Some(3)),
+            "the first two are over a minute old"
+        );
+        assert_eq!(
+            (f.slowest_commit(at(1_200)), f.most_rewritten(at(1_200))),
+            (None, None)
+        );
     }
 
     /// A snapshot commit moves the version and the last commit, not the cost: a re-snapshot's

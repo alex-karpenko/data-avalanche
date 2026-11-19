@@ -13,15 +13,15 @@ use data_avalanche_api::{
 use data_avalanche_cluster::{
     ClusterReconciler, ConfigCoordinator, ControllerDeps, ControllerSettings, CoordinatorDeps,
     DocsFn, Gossip, GossipKey, GossipSettings, LeaseTiming, NodeIdentity, NodeMeta, Phase,
-    ReconcilerSettings, Recorder, Seeds, Udp, advertise, api_url, discover, expire_events,
-    file_hash, interfaces, join as join_gossip, leave, node_identity, record_members,
-    removed_pipelines, watch_file,
+    ReconcilerSettings, Recorder, Sampler, Seeds, Udp, advertise, api_url, discover, expire_events,
+    expire_history, file_hash, interfaces, join as join_gossip, leave, node_identity,
+    record_members, removed_pipelines, sample_history, watch_file,
 };
 use data_avalanche_config::{
     Diagnostic, FingerprintKey, ProcessEnv, Report, ResolvedConfig, Severity, load_str,
 };
 use data_avalanche_pipeline::{Backoff, Tuning};
-use data_avalanche_state::{ConfigGenerations, Events, Leases, Removals};
+use data_avalanche_state::{Charts, ConfigGenerations, Events, Leases, Removals};
 use data_avalanche_telemetry::{Metrics, ProcessFigures, sample_process};
 use thiserror::Error;
 use tokio::sync::{Semaphore, oneshot, watch};
@@ -111,6 +111,10 @@ pub(crate) fn own_api(
 /// How long a clean stop waits for the events still queued to be written (a crash loses them).
 pub(crate) const EVENTS_FLUSH: Duration = Duration::from_secs(5);
 
+/// How long a clean stop waits for the chart history still held to be written (a crash loses up
+/// to a minute of it).
+const HISTORY_FLUSH: Duration = Duration::from_secs(5);
+
 /// Runs every pipeline until SIGTERM, SIGINT or a shutdown through the API. A leave through the
 /// API leaves the cluster first and keeps the process up (D-M9a.8).
 ///
@@ -181,6 +185,12 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         Recorder::start(Arc::clone(&events), &holder.node_id, metrics.clone());
     let (retention, kept) = watch::channel(config.globals.console.events.retention);
     let _expiry = tokio::spawn(expire_events(Arc::clone(&events), kept));
+    // The chart history (Admin_Console §7): sampled once the controllers run, expired on every
+    // node.
+    let charts = Arc::new(Charts::new(joined.globals.clone()));
+    let (history_retention, history_kept) =
+        watch::channel(config.globals.console.history.retention);
+    let _history_expiry = tokio::spawn(expire_history(Arc::clone(&charts), history_kept));
     let c = &config.globals.cluster;
     let docs = Arc::clone(&buckets);
     let docs: Arc<DocsFn> = Arc::new(move |p| docs.pipeline_docs(p).map_err(|e| e.to_string()));
@@ -262,6 +272,18 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         gossip.members(),
         ReconcilerSettings::new(c),
     );
+    let (stop_history, history_stop) = oneshot::channel();
+    let history = tokio::spawn(sample_history(
+        Sampler::new(
+            Arc::clone(&charts),
+            &deps.holder.node_id,
+            deps.holder.incarnation,
+        ),
+        reconciler.watch_statuses(),
+        process.clone(),
+        metrics.clone(),
+        history_stop,
+    ));
     // Each newer config generation, this node's reloads included (Clustering §9).
     let (log, reloaded_auth) = (Arc::clone(&logger), Arc::clone(&auth));
     let coordinator = Arc::new(ConfigCoordinator::start(
@@ -283,6 +305,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
                 log.trace(&g.tracing);
                 reloaded_auth.set(&g.api, &g.console.username_claim);
                 retention.send_replace(g.console.events.retention);
+                history_retention.send_replace(g.console.history.retention);
             }),
             recorder: recorder.clone(),
         },
@@ -311,6 +334,8 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         // A table's Delta facts, read by any node on request.
         factory: Arc::clone(&deps.factory),
         lake: Arc::default(),
+        charts,
+        prometheus: Arc::default(),
     });
     ready.store(true, Ordering::SeqCst);
     let mut cluster = Some((gossip, reconciler, discovery));
@@ -340,10 +365,21 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     tracing::info!("shutting down");
     let _ = stop_http.send(());
     let _ = server.await;
-    // The leave's last events (each lease released) are still queued: written, within a bound.
-    if !recorder.flush(EVENTS_FLUSH).await {
+    // The leave's last events (each lease released) are still queued, and the history's last
+    // samples held (each pipeline's chunk ended by the handoff): both written, within a bound.
+    let _ = stop_history.send(());
+    let (events, history) = tokio::join!(
+        recorder.flush(EVENTS_FLUSH),
+        tokio::time::timeout(HISTORY_FLUSH, history)
+    );
+    if !events {
         tracing::warn!(
             "the events still queued weren't written within {EVENTS_FLUSH:?}: the timeline misses them"
+        );
+    }
+    if history.is_err() {
+        tracing::warn!(
+            "the chart history held wasn't written within {HISTORY_FLUSH:?}: the charts miss it"
         );
     }
     tracing::info!("stopped");

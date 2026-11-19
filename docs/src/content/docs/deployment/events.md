@@ -15,7 +15,7 @@ Every call that changes something records who made it and, if they gave one, why
 
 ```sh
 curl -X POST https://avalanche.example.com:8080/v1/pipelines/orders-pg/pause \
-  -u oleksii:… -H 'Content-Type: application/json' \
+  -u alice:… -H 'Content-Type: application/json' \
   -d '{"note": "the warehouse migration, back by 15:00"}'
 ```
 
@@ -65,7 +65,7 @@ node going suspect, is recorded by one node.
 `GET /v1/events` (any role) returns the newest first, 100 at a time:
 
 ```sh
-curl -s 'https://avalanche.example.com:8080/v1/events?kind=action&actor=oleksii&since=2026-11-14T00:00:00Z'
+curl -s 'https://avalanche.example.com:8080/v1/events?kind=action&actor=alice&since=2026-11-14T00:00:00Z'
 ```
 
 | Parameter | Filters on |

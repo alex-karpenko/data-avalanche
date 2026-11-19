@@ -1,7 +1,7 @@
 ---
-updated: 2026-10-29
+updated: 2026-11-19
 domain: Architecture
-tags: [observability, metrics, prometheus, tracing, otlp, logs, correlation, cardinality, cdc]
+tags: [observability, metrics, prometheus, tracing, otlp, logs, correlation, cardinality, cdc, chart-history, console]
 resolves: [G-33, G-32]
 ---
 
@@ -185,6 +185,45 @@ trace backend.
 
 **Doc edits owed (spec, propose-only):** System-Overview observability section to list the catalogue +
 the cardinality policy; the §16 `otlp_endpoint` reservation promoted.
+
+---
+
+## §5a — Chart history (1.1.0, M13e)
+
+The console's charts (`Admin_Console.md` §4.2, §7) read a built-in history, independent of any
+Prometheus. Settled in `doc/v1.1/M13e-console-history.md` (D-M13e.1–7):
+
+- **Who samples what.** Each node samples the series it owns every 15 s: the pipelines whose lease
+  it holds (`lag_seconds` as the live figures compute it, `changes_per_minute`, `wal_held_bytes`,
+  `binlog_lag_seconds`, `snapshot_rows_per_second`), their tables every minute (every table the
+  worker tracks; one new to the term's chunk at once)
+  (`changes_per_minute`, `files_rewritten`: the minute's costliest MERGE, `commit_seconds`: its
+  slowest commit), and itself (`memory_bytes`, `cpu_cores`, `lease_renew_seconds`: its slowest
+  renewal since the last sample).
+- **Layout.** `globals.state/history/<YYYY-MM-DD>/<pipelines|nodes>/<id>/<HH>-<writer>.json`: one
+  object per scope, hour and writer, the writer a lease term (`e<epoch>`) or a process
+  (`i<incarnation>`). Only its writer writes it, unconditionally, so a failover's two terms both
+  stay and no write races another. Samples are `{t: seconds into the hour, v}` lists.
+- **Cadence.** A chunk is written with its first sample or a new series, then every minute while it changes, and
+  once more when its hour or its term ends: a crash loses at most a minute; about 60 writes an
+  hour per pipeline. A failing store keeps the samples in memory (an hour past their hour at
+  most) and never slows a pipeline.
+- **Retention.** `globals.console.history.retention` (24 h): whole days deleted on every node, as
+  the events are; reads stop at the retention whatever storage still holds.
+- **Reading.** `GET /v1/history` lists a day's folder per scope and loads the hours that meet the
+  range, 16 at a time; an hour ended over 65 minutes ago (past the hour its writer still tries
+  it again) is final and kept in memory (4096 at most). A `step` asked is never finer than the
+  samples nor than 1440 points over the range; a coarser step folds a gauge to its peak and a
+  rate to its mean.
+- **Prometheus** (`globals.console.prometheus`): a pipeline's range older than the retention is one
+  `query_range` per series over the catalogue's metrics, `by (pipeline)`, with `extra_labels` in
+  every selector: a gauge's peak (`max_over_time`) and a rate, each over the step or 5 minutes
+  when longer, each value standing at the start of the step it covers. It is asked over the whole
+  range, and only the steps older than the history kept are shown: a pipeline younger than the
+  retention has nothing older and isn't failing. Tables and nodes have no such series (their
+  metrics carry no `table` or node label) and say so (`not_in_prometheus`). Prometheus failing
+  (unreachable, a refusing or invalid answer, one over 8 MiB, or no series for the labels
+  anywhere in the range asked) never fails an answer: the series say `failing`.
 
 ---
 
