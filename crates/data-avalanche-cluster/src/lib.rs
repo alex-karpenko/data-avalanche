@@ -50,7 +50,7 @@ pub use history::{
     HISTORY_PRUNE_EVERY, Sampler, UNWRITTEN_KEPT, WRITE_EVERY, expire_history, sample_history,
 };
 pub use lease::{LeaseGuard, LeaseRun, LeaseTiming, RenewEnd, RenewState};
-pub use live::{FEED_CAPACITY, Feed, Live};
+pub use live::{FEED_CAPACITY, Feed, Live, MAX_STREAMS, Opened};
 pub use node::{JOIN_WAIT, join, leave};
 pub use placement::Placement;
 pub use reconciler::{

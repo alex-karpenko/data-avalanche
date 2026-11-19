@@ -136,6 +136,18 @@ fn operation(r: &Route) -> utoipa::openapi::path::Operation {
             );
         }
     }
+    if r.path == "/v1/stream" {
+        for (name, description) in crate::stream::PARAMETERS {
+            op = op.parameter(
+                ParameterBuilder::new()
+                    .name(*name)
+                    .parameter_in(ParameterIn::Query)
+                    .required(Required::False)
+                    .description(Some(*description))
+                    .schema(Some(ObjectBuilder::new().schema_type(Type::String))),
+            );
+        }
+    }
     if r.path == "/v1/events" {
         for (name, description) in crate::events::PARAMETERS {
             let schema = if *name == "limit" {
@@ -191,11 +203,17 @@ fn operation(r: &Route) -> utoipa::openapi::path::Operation {
     }
     answers.sort_unstable();
     for (code, description) in answers {
+        // The stream's messages are server-sent events; its refusals JSON as every route's.
+        let content = if r.path == "/v1/stream" && code == 200 {
+            "text/event-stream"
+        } else {
+            "application/json"
+        };
         op = op.response(
             code.to_string(),
             ResponseBuilder::new()
                 .description(description)
-                .content("application/json", ContentBuilder::new().build()),
+                .content(content, ContentBuilder::new().build()),
         );
     }
     op.build()

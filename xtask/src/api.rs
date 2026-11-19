@@ -36,6 +36,10 @@ const TAGS: &[(&str, &str)] = &[
         "history",
         "The series the nodes sampled for charts, kept for `globals.console.history.retention`; a pipeline's older range from `globals.console.prometheus` when it is set.",
     ),
+    (
+        "stream",
+        "The cluster's live changes as server-sent events, from any node, without replay: read the current state, then apply what follows.",
+    ),
     ("openapi.json", "The document this page is rendered from."),
 ];
 

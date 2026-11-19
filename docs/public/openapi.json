@@ -2680,6 +2680,81 @@
         "x-min-role": "operator"
       }
     },
+    "/v1/stream": {
+      "get": {
+        "tags": [
+          "stream"
+        ],
+        "summary": "The cluster's live changes as server-sent events, from any node: each pipeline's state and figures, each node's own, the samples taken and the events written, as they happen",
+        "parameters": [
+          {
+            "name": "pipeline",
+            "in": "query",
+            "description": "a pipeline's id, or several comma-separated: only the messages about them; by default every message",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "description": "the kinds sent, comma-separated, of `pipeline`, `figures`, `node`, `samples`, `event`; by default every kind",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "`text/event-stream`: `hello` first, then each change as it happens, without replay: read the current state, then apply what follows",
+            "content": {
+              "text/event-stream": {}
+            }
+          },
+          "400": {
+            "description": "a parameter that isn't one, or isn't in its form",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "404": {
+            "description": "no such pipeline in the generation this node runs",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read; or as many streams are open on this node as it takes; `Retry-After` says when to try again",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "x-min-role": "viewer"
+      }
+    },
     "/v1/tables": {
       "get": {
         "tags": [

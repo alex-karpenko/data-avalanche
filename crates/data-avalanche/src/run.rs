@@ -372,6 +372,8 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
     if let Some(p) = publisher {
         p.abort();
     }
+    // An open stream would hold the server's stop, which waits for the open requests.
+    feed.close();
     let _ = stop_http.send(());
     let _ = server.await;
     // The leave's last events (each lease released) are still queued, and the history's last

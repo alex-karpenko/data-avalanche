@@ -7,10 +7,12 @@ use std::sync::Arc;
 
 use data_avalanche_state::EventDoc;
 use serde_json::Value;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, watch};
 
 /// The messages a stream may fall behind by before it misses some (and is told so).
 pub const FEED_CAPACITY: usize = 1024;
+/// The streams open on a node at once, its peers' included: each holds a connection.
+pub const MAX_STREAMS: usize = 64;
 
 /// One live message: its kind (the stream's event name), the pipeline it is about, and its data,
 /// which names the node that sent it.
@@ -37,6 +39,16 @@ impl Live {
 pub struct Feed {
     tx: broadcast::Sender<Arc<Live>>,
     closed: Arc<watch::Sender<bool>>,
+    streams: Arc<Semaphore>,
+}
+
+/// A stream open on the node: its messages from now on, the feed's close, and its place among
+/// the [`MAX_STREAMS`], given back when it is dropped.
+#[derive(Debug)]
+pub struct Opened {
+    pub messages: broadcast::Receiver<Arc<Live>>,
+    pub closed: watch::Receiver<bool>,
+    _place: OwnedSemaphorePermit,
 }
 
 impl Default for Feed {
@@ -50,7 +62,18 @@ impl Feed {
         Self {
             tx: broadcast::Sender::new(FEED_CAPACITY),
             closed: Arc::new(watch::Sender::new(false)),
+            streams: Arc::new(Semaphore::new(MAX_STREAMS)),
         }
+    }
+
+    /// A new stream, or none while [`MAX_STREAMS`] are open.
+    pub fn open(&self) -> Option<Opened> {
+        let place = Arc::clone(&self.streams).try_acquire_owned().ok()?;
+        Some(Opened {
+            messages: self.tx.subscribe(),
+            closed: self.closed.subscribe(),
+            _place: place,
+        })
     }
 
     /// Sends `live` to every stream open now: to none, and dropped, when none is.
@@ -135,6 +158,16 @@ mod tests {
             Err(broadcast::error::RecvError::Lagged(1))
         ));
         assert_eq!(*slow.recv().await.unwrap(), live(1));
+    }
+
+    #[test]
+    fn at_most_max_streams_are_open_at_once() {
+        let feed = Feed::new();
+        let open: Vec<Opened> = (0..MAX_STREAMS).map(|_| feed.open().unwrap()).collect();
+        assert_eq!(feed.followers(), MAX_STREAMS);
+        assert!(feed.open().is_none());
+        drop(open);
+        assert!(feed.open().is_some(), "their places given back");
     }
 
     #[test]

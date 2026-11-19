@@ -25,6 +25,7 @@ mod prometheus;
 mod publish;
 mod server;
 mod snapshots;
+mod stream;
 mod tables;
 #[cfg(test)]
 mod test_support;
@@ -68,6 +69,7 @@ pub use prometheus::{
 pub use publish::{FIGURES_EVERY, STATE_EVERY, publish};
 pub use server::{Bound, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT, MAX_CONNECTIONS, ServeError, bind};
 pub use snapshots::{EndedJobs, READ_AT_ONCE};
+pub use stream::{KEEP_ALIVE, KINDS};
 pub use tables::{FACTS_FOR, FACTS_WITHIN, Lake};
 
 use crate::auth::Denied;
@@ -823,6 +825,27 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
         (
             r(
                 "GET",
+                "/v1/stream",
+                Viewer,
+                "The cluster's live changes as server-sent events, from any node: each pipeline's state and figures, each node's own, the samples taken and the events written, as they happen",
+                &[
+                    (
+                        200,
+                        "`text/event-stream`: `hello` first, then each change as it happens, without replay: read the current state, then apply what follows",
+                    ),
+                    (400, "a parameter that isn't one, or isn't in its form"),
+                    (404, "no such pipeline in the generation this node runs"),
+                    (
+                        503,
+                        "as many streams are open on this node as it takes; `Retry-After` says when to try again",
+                    ),
+                ],
+            ),
+            get(stream::open),
+        ),
+        (
+            r(
+                "GET",
                 "/v1/openapi.json",
                 Viewer,
                 "This document",
@@ -1018,6 +1041,7 @@ mod tests {
                 ("GET", "/v1/nodes/{node}/config/status", Viewer),
                 ("GET", "/v1/events", Viewer),
                 ("GET", "/v1/history", Viewer),
+                ("GET", "/v1/stream", Viewer),
                 ("GET", "/v1/openapi.json", Viewer),
             ]
         );

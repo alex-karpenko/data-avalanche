@@ -625,6 +625,26 @@ Least role: `viewer`.
 | `404` | no such pipeline in the generation this node runs |
 | `503` | the node is starting or stopping, or its state can't be read; or the chart history can't be read |
 
+## stream
+
+The cluster's live changes as server-sent events, from any node, without replay: read the current state, then apply what follows.
+
+### `GET /v1/stream`
+
+The cluster's live changes as server-sent events, from any node: each pipeline's state and figures, each node's own, the samples taken and the events written, as they happen
+
+Least role: `viewer`.
+
+- Query parameter `pipeline`: a pipeline's id, or several comma-separated: only the messages about them; by default every message.
+- Query parameter `kind`: the kinds sent, comma-separated, of `pipeline`, `figures`, `node`, `samples`, `event`; by default every kind.
+
+| Status | When |
+|---|---|
+| `200` | `text/event-stream`: `hello` first, then each change as it happens, without replay: read the current state, then apply what follows |
+| `400` | a parameter that isn't one, or isn't in its form |
+| `404` | no such pipeline in the generation this node runs |
+| `503` | the node is starting or stopping, or its state can't be read; or as many streams are open on this node as it takes; `Retry-After` says when to try again |
+
 ## openapi.json
 
 The document this page is rendered from.
