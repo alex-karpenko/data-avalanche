@@ -13,6 +13,8 @@ use crate::peers::{DETAIL_LIMIT, FORWARDED_BY, Peers, TARGET};
 pub const MAX_FRAME: usize = 1 << 20;
 /// How long a followed stream may send nothing, its keep-alive included, before it is dropped.
 pub const FOLLOW_SILENCE: Duration = Duration::from_secs(45);
+/// The most read of a refusal's body: a proxy's page past it is not read.
+pub(crate) const MAX_REFUSAL: usize = 8 << 10;
 
 /// One message: its kind (`event:`) and its data, its `data:` lines joined.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,10 +121,26 @@ impl Followed {
     }
 }
 
+/// A refusal's `error`, clipped to [`MAX_ERROR`](crate::MAX_ERROR): none when its body is over
+/// [`MAX_REFUSAL`] (read no further) or isn't JSON naming one.
+async fn reason(mut answer: reqwest::Response) -> Option<String> {
+    let mut body = Vec::new();
+    while let Some(chunk) = answer.chunk().await.ok()? {
+        if body.len() + chunk.len() > MAX_REFUSAL {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
+    let e = v["error"].as_str()?;
+    Some(crate::actions::clipped(e, crate::MAX_ERROR).into_owned())
+}
+
 impl Peers {
     /// Opens node `node`'s stream at `api_url` + `path_and_query` with the caller's
     /// `authorization`, answered within [`DETAIL_LIMIT`]; dropped once it sends nothing for
-    /// `silence`. An answer other than `200` is an error naming its code and its own.
+    /// `silence`. An answer other than `200` is an error naming its code and its own reason, read
+    /// to a cap and clipped.
     pub(crate) async fn follow(
         &self,
         node: &str,
@@ -147,12 +165,10 @@ impl Peers {
         };
         let code = answer.status();
         if code != reqwest::StatusCode::OK {
-            let said = tokio::time::timeout(DETAIL_LIMIT, answer.bytes())
+            let said = tokio::time::timeout(DETAIL_LIMIT, reason(answer))
                 .await
                 .ok()
-                .and_then(Result::ok)
-                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-                .and_then(|v| v["error"].as_str().map(str::to_owned));
+                .flatten();
             return Err(match said {
                 Some(e) => format!("it answered {}: {e}", code.as_u16()),
                 None => format!("it answered {}", code.as_u16()),
@@ -304,5 +320,37 @@ mod tests {
             .await
             .unwrap_err();
         assert!(!err.is_empty(), "the connection's own cause");
+    }
+
+    /// A proxy's big page, or a long reason: what is read of it and what is said of it are capped.
+    #[tokio::test]
+    async fn a_refusal_is_read_and_said_to_a_cap() {
+        let peers = Peers::new("node-a", None).unwrap();
+        let (url, _log) = crate::test_support::fake_answering(
+            Duration::ZERO,
+            reqwest::StatusCode::BAD_GATEWAY,
+            serde_json::json!({ "error": "x".repeat(4 * MAX_REFUSAL) }),
+        )
+        .await;
+        let err = peers
+            .follow("node-b", &url, "/v1/stream", None, FOLLOW_SILENCE)
+            .await
+            .unwrap_err();
+        assert_eq!(err, "it answered 502", "a body over the cap isn't read");
+        let (url, _log) = crate::test_support::fake_answering(
+            Duration::ZERO,
+            reqwest::StatusCode::NOT_FOUND,
+            serde_json::json!({ "error": "y".repeat(3 * crate::MAX_ERROR) }),
+        )
+        .await;
+        let err = peers
+            .follow("node-b", &url, "/v1/stream", None, FOLLOW_SILENCE)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            format!("it answered 404: {}…", "y".repeat(crate::MAX_ERROR)),
+            "a reason clipped"
+        );
     }
 }
