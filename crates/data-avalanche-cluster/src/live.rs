@@ -4,6 +4,7 @@
 //! open. A stream that falls more than [`FEED_CAPACITY`] messages behind is told to read again.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use data_avalanche_state::EventDoc;
 use serde_json::Value;
@@ -40,6 +41,7 @@ pub struct Feed {
     tx: broadcast::Sender<Arc<Live>>,
     closed: Arc<watch::Sender<bool>>,
     streams: Arc<Semaphore>,
+    opened: Arc<AtomicU64>,
 }
 
 /// A stream open on the node: its messages from now on, the feed's close, and its place among
@@ -63,12 +65,14 @@ impl Feed {
             tx: broadcast::Sender::new(FEED_CAPACITY),
             closed: Arc::new(watch::Sender::new(false)),
             streams: Arc::new(Semaphore::new(MAX_STREAMS)),
+            opened: Arc::default(),
         }
     }
 
     /// A new stream, or none while [`MAX_STREAMS`] are open.
     pub fn open(&self) -> Option<Opened> {
         let place = Arc::clone(&self.streams).try_acquire_owned().ok()?;
+        self.opened.fetch_add(1, Ordering::Relaxed);
         Some(Opened {
             messages: self.tx.subscribe(),
             closed: self.closed.subscribe(),
@@ -89,13 +93,20 @@ impl Feed {
         self.tx.receiver_count() > 0
     }
 
-    /// How many streams are open on this node: a new one is sent every pipeline's state again.
+    /// How many streams are open on this node.
     pub fn followers(&self) -> usize {
         self.tx.receiver_count()
     }
 
+    /// How many streams were ever opened on this node: when it grows, a new one is sent every
+    /// pipeline's state again, whether or not another closed meanwhile.
+    pub fn opened(&self) -> u64 {
+        self.opened.load(Ordering::Relaxed)
+    }
+
     /// A new stream's messages, from now on.
     pub fn subscribe(&self) -> broadcast::Receiver<Arc<Live>> {
+        self.opened.fetch_add(1, Ordering::Relaxed);
         self.tx.subscribe()
     }
 
@@ -133,6 +144,7 @@ mod tests {
         let (mut a, mut b) = (feed.subscribe(), feed.subscribe());
         assert!(feed.followed());
         assert_eq!(feed.followers(), 2);
+        assert_eq!(feed.opened(), 2);
         feed.publish(live(2));
         assert_eq!(
             *a.recv().await.unwrap(),
@@ -143,6 +155,7 @@ mod tests {
         drop((a, b));
         assert!(!feed.followed());
         assert_eq!(feed.followers(), 0);
+        assert_eq!(feed.opened(), 2, "ever opened");
         feed.publish(live(3));
     }
 
@@ -166,6 +179,11 @@ mod tests {
         let open: Vec<Opened> = (0..MAX_STREAMS).map(|_| feed.open().unwrap()).collect();
         assert_eq!(feed.followers(), MAX_STREAMS);
         assert!(feed.open().is_none());
+        assert_eq!(
+            feed.opened(),
+            MAX_STREAMS as u64,
+            "a stream refused is none opened"
+        );
         drop(open);
         assert!(feed.open().is_some(), "their places given back");
     }
