@@ -88,8 +88,11 @@ fn bad(error: impl Into<String>) -> Failure {
     Failure::new(StatusCode::BAD_REQUEST, error)
 }
 
-/// The filter of `params`, each once, against `config`.
-fn filter(params: &[(String, String)], config: &ResolvedConfig) -> Result<Filter, Failure> {
+/// The filter of `params`, each once, against `config`. A stream another node asked for
+/// (`config` none) was checked by that node, which may run a newer generation: a pipeline or a
+/// kind this node doesn't know is taken (it passes nothing until this node runs it), and a
+/// parameter it doesn't know is skipped.
+fn filter(params: &[(String, String)], config: Option<&ResolvedConfig>) -> Result<Filter, Failure> {
     let mut f = Filter::default();
     let mut given = BTreeSet::new();
     for (name, value) in params {
@@ -106,13 +109,15 @@ fn filter(params: &[(String, String)], config: &ResolvedConfig) -> Result<Filter
                 if list.is_empty() {
                     return Err(bad("pipeline names a pipeline's id"));
                 }
-                for id in &list {
-                    if !config.pipelines.values().any(|p| p.id == *id) {
-                        return Err(Failure::new(
-                            StatusCode::NOT_FOUND,
-                            format!("no pipeline {id:?} in the config generation this node runs"),
-                        ));
-                    }
+                if let Some(c) = config
+                    && let Some(id) = list
+                        .iter()
+                        .find(|id| !c.pipelines.values().any(|p| p.id == **id))
+                {
+                    return Err(Failure::new(
+                        StatusCode::NOT_FOUND,
+                        format!("no pipeline {id:?} in the config generation this node runs"),
+                    ));
                 }
                 f.pipelines = Some(list.iter().map(|s| (*s).to_owned()).collect());
             }
@@ -123,6 +128,9 @@ fn filter(params: &[(String, String)], config: &ResolvedConfig) -> Result<Filter
                 let mut kinds = BTreeSet::new();
                 for k in list {
                     let Some(k) = KINDS.iter().find(|n| **n == k) else {
+                        if config.is_none() {
+                            continue;
+                        }
                         return Err(bad(format!(
                             "unknown kind {k:?}: a stream sends {}",
                             KINDS.join(", ")
@@ -132,6 +140,7 @@ fn filter(params: &[(String, String)], config: &ResolvedConfig) -> Result<Filter
                 }
                 f.kinds = Some(kinds);
             }
+            _ if config.is_none() => {}
             _ => {
                 return Err(bad(format!(
                     "unknown parameter {name:?}: the stream takes {}",
@@ -165,8 +174,14 @@ pub(crate) async fn open(
     let params: Vec<(String, String)> = url::form_urlencoded::parse(raw.as_bytes())
         .into_owned()
         .collect();
-    let config = node.coordinator.config().await;
-    let filter = match filter(&params, &config) {
+    let forwarded = headers.contains_key(FORWARDED_BY);
+    // Asked by another node, which checked the query: no config read.
+    let config = if forwarded {
+        None
+    } else {
+        Some(node.coordinator.config().await)
+    };
+    let filter = match filter(&params, config.as_ref()) {
         Ok(f) => f,
         Err(f) => return f.into(),
     };
@@ -182,7 +197,7 @@ pub(crate) async fn open(
     };
     let me = node.members.borrow().me.clone();
     // Asked by another node: this node's own messages alone, never followed further.
-    let follow = (!headers.contains_key(FORWARDED_BY)).then(|| {
+    let follow = (!forwarded).then(|| {
         Arc::new(Follow {
             node: node.clone(),
             auth: Arc::clone(&api.auth),
@@ -547,6 +562,43 @@ mod tests {
         ] {
             let (c, v) = crate::test_support::json_of(addr, "GET", path).await;
             assert_eq!((c, v["error"].as_str().unwrap()), (code, error), "{path}");
+        }
+    }
+
+    /// Another node, on a newer generation, already checked what it asks: a pipeline or a kind
+    /// this one doesn't know is accepted.
+    #[tokio::test]
+    async fn a_stream_another_node_asked_for_accepts_what_this_one_doesnt_know() {
+        let (addr, lone, _dir) = node_a().await;
+        let path = "/v1/stream?pipeline=nope&kind=node,future&since=1";
+        let mut s = stream(addr, path, &[(FORWARDED_BY, "node-c")]).await;
+        assert_eq!(s.code, 200);
+        hello(&mut s).await;
+        let feed = &lone.node.feed;
+        feed.publish(live("figures", Some("nope"), 1));
+        feed.publish(live("node", Some("orders"), 2));
+        feed.publish(live("node", None, 3));
+        feed.publish(live("node", Some("nope"), 4));
+        assert_eq!(s.next().await.1["n"], 4, "only node, about nope");
+        let twice = [(FORWARDED_BY, "node-c")];
+        let (code, _, body) = crate::test_support::request(
+            addr,
+            "GET",
+            "/v1/stream?kind=node&kind=event",
+            &twice,
+            "",
+        )
+        .await;
+        assert_eq!(code, 400, "{body}");
+        assert!(body.contains("kind is given twice"), "{body}");
+        // Asked directly, the same is refused.
+        for (path, code) in [
+            ("/v1/stream?pipeline=nope&kind=node,future", 404),
+            ("/v1/stream?kind=node,future", 400),
+            ("/v1/stream?since=1", 400),
+        ] {
+            let (c, _) = crate::test_support::json_of(addr, "GET", path).await;
+            assert_eq!(c, code, "{path}");
         }
     }
 
