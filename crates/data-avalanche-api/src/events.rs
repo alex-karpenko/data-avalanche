@@ -5,8 +5,8 @@ use axum::extract::{RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use chrono::{DateTime, Utc};
-use data_avalanche_state::{EventDoc, EventQuery, MAX_EVENTS, StateError};
-use serde_json::{Value, json};
+use data_avalanche_state::{EventQuery, MAX_EVENTS, StateError};
+use serde_json::json;
 
 use crate::{Api, Failure, body, starting};
 
@@ -114,12 +114,6 @@ fn query(params: &[(String, String)]) -> Result<EventQuery, Failure> {
     Ok(q)
 }
 
-pub(crate) fn event_json(key: &str, e: &EventDoc) -> Value {
-    let mut v = serde_json::to_value(e).expect("an event serializes");
-    v["key"] = json!(key);
-    v
-}
-
 pub(crate) async fn list(State(api): State<Api>, RawQuery(raw): RawQuery) -> Response {
     let Some(node) = api.node.get() else {
         return starting();
@@ -136,7 +130,7 @@ pub(crate) async fn list(State(api): State<Api>, RawQuery(raw): RawQuery) -> Res
         Ok(page) => body(
             StatusCode::OK,
             &json!({
-                "events": page.events.iter().map(|(k, e)| event_json(k, e)).collect::<Vec<_>>(),
+                "events": page.events.iter().map(|(k, e)| e.to_json(k)).collect::<Vec<_>>(),
                 "next": page.next,
             }),
         ),
@@ -156,6 +150,9 @@ fn unreadable(e: &StateError) -> Response {
 mod tests {
     use chrono::TimeZone;
     use data_avalanche_state::{Actor, EventSeverity};
+
+    use data_avalanche_state::EventDoc;
+    use serde_json::Value;
 
     use super::*;
     use crate::test_support::{CONFIG, api, json_of, lone, open, serve};

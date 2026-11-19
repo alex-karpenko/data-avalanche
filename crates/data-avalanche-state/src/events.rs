@@ -105,6 +105,14 @@ impl EventDoc {
             detail: BTreeMap::new(),
         }
     }
+
+    /// The event as `GET /v1/events` lists it and a live stream sends it: its fields, with its
+    /// `key`.
+    pub fn to_json(&self, key: &str) -> serde_json::Value {
+        let mut v = serde_json::to_value(self).expect("an event serializes");
+        v["key"] = serde_json::Value::from(key);
+        v
+    }
 }
 
 /// Which events [`Events::list`] selects, and how many: every filter set must match, and an
@@ -728,5 +736,19 @@ mod tests {
             0,
             "none one at a time"
         );
+    }
+
+    #[test]
+    fn an_event_s_json_names_its_key() {
+        let mut e = event(at(18, 9, 30), "action.pipeline.pause", "node-a");
+        e.pipeline = Some("orders".into());
+        let v = e.to_json("events/2026-11-18/093000.000000Z-000001-node-a.json");
+        assert_eq!(
+            v["key"],
+            "events/2026-11-18/093000.000000Z-000001-node-a.json"
+        );
+        assert_eq!(v["kind"], "action.pipeline.pause");
+        assert_eq!(v["node"], "node-a");
+        assert_eq!(v["pipeline"], "orders");
     }
 }

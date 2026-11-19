@@ -238,7 +238,12 @@ pub(crate) async fn lone_with(file: PathBuf, text: &str, env: Arc<dyn Env + Send
     );
     let metrics = Metrics::new();
     let events = Arc::new(Events::new(docs.clone()));
-    let (recorder, _) = Recorder::start(Arc::clone(&events), "node-a", metrics.clone());
+    let (recorder, _) = Recorder::start(
+        Arc::clone(&events),
+        "node-a",
+        metrics.clone(),
+        &data_avalanche_cluster::Feed::new(),
+    );
     let c = &config.globals.cluster;
     let removals = Removals::new(docs.clone());
     let deps = ControllerDeps {

@@ -2,7 +2,8 @@
 //! task per node writes them to the cluster's timeline in `globals.state`, retrying a failing
 //! store a few times; an event it can't write is counted (`data_avalanche_events_dropped_total`)
 //! and logged, never allowed to slow or fail what it records. A clean stop waits a bounded time
-//! for the queue to be written ([`Recorder::flush`]). Another task expires the days past
+//! for the queue to be written ([`Recorder::flush`]). Each event written goes to the node's live
+//! streams too ([`Feed`], M13f). Another task expires the days past
 //! `globals.console.events.retention`.
 
 use std::collections::BTreeMap;
@@ -18,6 +19,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::gossip::{Members, Phase as NodePhase};
+use crate::live::{Feed, Live};
 
 /// Events waiting to be written; past this, new ones are dropped and counted.
 pub const EVENT_QUEUE: usize = 1024;
@@ -44,11 +46,22 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    /// The recorder of `node`, and its writer task.
-    pub fn start(events: Arc<Events>, node: &str, metrics: Metrics) -> (Self, JoinHandle<()>) {
+    /// The recorder of `node`, and its writer task, which sends each event it writes to `feed`.
+    pub fn start(
+        events: Arc<Events>,
+        node: &str,
+        metrics: Metrics,
+        feed: &Feed,
+    ) -> (Self, JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(EVENT_QUEUE);
         let pending = Arc::new(watch::Sender::new(0));
-        let task = tokio::spawn(write(events, rx, Arc::clone(&pending), metrics.clone()));
+        let task = tokio::spawn(write(
+            events,
+            rx,
+            Arc::clone(&pending),
+            metrics.clone(),
+            feed.clone(),
+        ));
         (
             Self {
                 node: node.into(),
@@ -120,19 +133,24 @@ impl Recorder {
     }
 }
 
-/// Writes each queued event, then marks it done in `pending` (written or dropped).
+/// Writes each queued event, sends it to `feed` once written, then marks it done in `pending`
+/// (written or dropped).
 async fn write(
     events: Arc<Events>,
     mut rx: mpsc::Receiver<EventDoc>,
     pending: Arc<watch::Sender<usize>>,
     metrics: Metrics,
+    feed: Feed,
 ) {
     while let Some(event) = rx.recv().await {
         let mut waits = WRITE_RETRIES.iter();
         loop {
             match events.record(&event).await {
-                Ok(_) => {
+                Ok(key) => {
                     metrics.event_written();
+                    if feed.followed() {
+                        feed.publish(Live::event(&key, &event));
+                    }
                     break;
                 }
                 Err(e) => match waits.next() {
@@ -529,7 +547,8 @@ mod tests {
     async fn a_flush_waits_until_the_queue_is_written() {
         // The first event's write fails twice: 200 ms, then 1 s, before it lands.
         let events = store(2);
-        let (r, _task) = Recorder::start(Arc::clone(&events), "node-a", Metrics::new());
+        let (r, _task) =
+            Recorder::start(Arc::clone(&events), "node-a", Metrics::new(), &Feed::new());
         assert!(r.flush(Duration::ZERO).await, "nothing queued");
         for text in ["one", "two", "three"] {
             r.record(r.event("member.joined", EventSeverity::Info, text));
@@ -545,7 +564,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_flush_gives_up_at_its_bound() {
         let events = failing(0, true);
-        let (r, _task) = Recorder::start(Arc::clone(&events), "node-a", Metrics::new());
+        let (r, _task) =
+            Recorder::start(Arc::clone(&events), "node-a", Metrics::new(), &Feed::new());
         r.record(r.event("member.joined", EventSeverity::Info, "never"));
         let started = tokio::time::Instant::now();
         assert!(!r.flush(Duration::from_secs(5)).await);
@@ -569,7 +589,8 @@ mod tests {
     async fn a_failing_store_is_retried_then_the_event_lands() {
         let events = store(2);
         let metrics = Metrics::new();
-        let (r, _task) = Recorder::start(Arc::clone(&events), "node-a", metrics.clone());
+        let (r, _task) =
+            Recorder::start(Arc::clone(&events), "node-a", metrics.clone(), &Feed::new());
         r.record(r.event("member.joined", EventSeverity::Info, "node-c joined"));
         assert_eq!(written(&events, 1).await, ["node-c joined"]);
         assert!(
@@ -583,7 +604,8 @@ mod tests {
     async fn a_store_that_keeps_failing_drops_the_event_and_counts_it() {
         let events = store(WRITE_RETRIES.len() + 1);
         let metrics = Metrics::new();
-        let (r, _task) = Recorder::start(Arc::clone(&events), "node-a", metrics.clone());
+        let (r, _task) =
+            Recorder::start(Arc::clone(&events), "node-a", metrics.clone(), &Feed::new());
         r.record(r.event("member.joined", EventSeverity::Info, "lost"));
         r.record(r.event("member.joined", EventSeverity::Info, "kept"));
         assert_eq!(written(&events, 1).await, ["kept"]);
@@ -592,6 +614,30 @@ mod tests {
             text.contains("data_avalanche_events_dropped_total 1"),
             "{text}"
         );
+    }
+
+    /// A stream sees each event once it is written, with the key it was written at; one the
+    /// store keeps refusing never reaches it.
+    #[tokio::test(start_paused = true)]
+    async fn a_written_event_reaches_the_live_streams_with_its_key() {
+        let events = store(WRITE_RETRIES.len() + 1);
+        let feed = Feed::new();
+        let mut stream = feed.subscribe();
+        let (r, _task) = Recorder::start(Arc::clone(&events), "node-a", Metrics::new(), &feed);
+        r.record(r.event("member.joined", EventSeverity::Info, "lost"));
+        r.record(r.of_pipeline(
+            "orders",
+            "action.pipeline.pause",
+            EventSeverity::Info,
+            "kept",
+        ));
+        let live = stream.recv().await.unwrap();
+        assert_eq!(live.kind, "event");
+        assert_eq!(live.pipeline.as_deref(), Some("orders"));
+        assert_eq!(live.data["text"], "kept");
+        let (key, _) = &events.list(&EventQuery::default()).await.unwrap().events[0];
+        assert_eq!(live.data["key"], key.as_str());
+        assert!(stream.try_recv().is_err(), "the dropped event isn't sent");
     }
 
     fn status(actual: ActualState, error: Option<&str>, degraded: Option<&str>) -> StatusDoc {
@@ -826,7 +872,8 @@ mod tests {
     async fn a_new_node_records_nothing_until_its_view_settles() {
         use NodePhase::{Active, Joining};
         let events = store(0);
-        let (r, _task) = Recorder::start(Arc::clone(&events), "node-a", Metrics::new());
+        let (r, _task) =
+            Recorder::start(Arc::clone(&events), "node-a", Metrics::new(), &Feed::new());
         let (view, rx) = watch::channel(members("a", &[("a", 1, false, Joining)]));
         let _recording = tokio::spawn(record_members(r.clone(), rx));
         tokio::task::yield_now().await;
