@@ -56,6 +56,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "503": {
             "description": "the node is starting or stopping, or its state can't be read",
             "content": {
@@ -127,6 +133,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "503": {
             "description": "the node is starting or stopping, or its state can't be read",
             "content": {
@@ -169,6 +181,12 @@
           },
           "403": {
             "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -259,6 +277,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "500": {
             "description": "a text couldn't be compared",
             "content": {
@@ -341,6 +365,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "503": {
             "description": "the node is starting or stopping, or its state can't be read; or the config generations can't be read",
             "content": {
@@ -416,6 +446,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "500": {
             "description": "its text couldn't be masked, so it isn't shown: it has a merge key (`<<`), a tag (a `!` after a space), a directive or a byte-order mark, or a secret or a comment the masker can't place",
             "content": {
@@ -464,6 +500,12 @@
           },
           "403": {
             "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -551,6 +593,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "503": {
             "description": "the node is starting or stopping, or its state can't be read",
             "content": {
@@ -593,6 +641,12 @@
           },
           "403": {
             "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -656,7 +710,7 @@
             }
           },
           "429": {
-            "description": "posted bodies past the node's rate: `Retry-After` says when",
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long; or posted bodies past the node's rate: `Retry-After` says when",
             "content": {
               "application/json": {}
             }
@@ -799,6 +853,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "503": {
             "description": "the node is starting or stopping, or its state can't be read",
             "content": {
@@ -923,6 +983,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "503": {
             "description": "the node is starting or stopping, or its state can't be read; or the chart history can't be read",
             "content": {
@@ -988,6 +1054,12 @@
           },
           "421": {
             "description": "a request forwarded to a node that isn't its target",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -1104,6 +1176,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "502": {
             "description": "the node didn't answer",
             "content": {
@@ -1181,6 +1259,12 @@
           },
           "421": {
             "description": "a request forwarded to a node that isn't its target",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -1279,7 +1363,7 @@
             }
           },
           "429": {
-            "description": "posted bodies past the node's rate",
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long; or posted bodies past the node's rate",
             "content": {
               "application/json": {}
             }
@@ -1390,6 +1474,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "502": {
             "description": "the node didn't answer",
             "content": {
@@ -1496,6 +1586,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "502": {
             "description": "the node didn't answer",
             "content": {
@@ -1554,6 +1650,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "503": {
             "description": "the node is starting or stopping, or its state can't be read",
             "content": {
@@ -1596,6 +1698,12 @@
           },
           "403": {
             "description": "the caller's role is below the route's",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -1659,6 +1767,12 @@
           },
           "404": {
             "description": "no such pipeline in the generation this node runs",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -1757,6 +1871,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "503": {
             "description": "the node is starting or stopping, or its state can't be read",
             "content": {
@@ -1828,6 +1948,12 @@
           },
           "421": {
             "description": "a forwarded request to a node that doesn't run the worker",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -1938,6 +2064,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "503": {
             "description": "the node is starting or stopping, or its state can't be read",
             "content": {
@@ -2022,6 +2154,12 @@
           },
           "422": {
             "description": "the note is too long, not a string, holds a control character, or the body isn't a JSON object",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -2114,6 +2252,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "503": {
             "description": "the node is starting or stopping, or its state can't be read",
             "content": {
@@ -2173,6 +2317,12 @@
           },
           "404": {
             "description": "no such pipeline in the generation this node runs",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -2259,6 +2409,12 @@
           },
           "422": {
             "description": "the body names no table, a glob, or a table not in the source's form; or the note is too long, not a string, holds a control character, or the body isn't a JSON object",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -2351,6 +2507,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "503": {
             "description": "the node is starting or stopping, or its state can't be read",
             "content": {
@@ -2425,6 +2587,12 @@
           },
           "404": {
             "description": "no such pipeline, or no trace of the table in it",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -2516,6 +2684,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "503": {
             "description": "the node is starting or stopping, or its state can't be read",
             "content": {
@@ -2575,6 +2749,12 @@
           },
           "404": {
             "description": "no such job",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -2673,6 +2853,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "503": {
             "description": "the node is starting or stopping, or its state can't be read",
             "content": {
@@ -2761,6 +2947,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "503": {
             "description": "the node is starting or stopping, or its state can't be read",
             "content": {
@@ -2839,6 +3031,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "503": {
             "description": "the node is starting or stopping, or its state can't be read; or as many streams are open on this node as it takes; `Retry-After` says when to try again",
             "content": {
@@ -2893,6 +3091,12 @@
           },
           "404": {
             "description": "no such pipeline in the generation this node runs",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }

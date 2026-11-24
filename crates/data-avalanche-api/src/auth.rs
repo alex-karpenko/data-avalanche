@@ -29,6 +29,7 @@ use serde_json::Value;
 use subtle::ConstantTimeEq;
 use tokio::sync::watch;
 
+use crate::console::Attempts;
 use crate::session::{By, Sealer, Session, Unsealed, session_cookies};
 
 /// A JWKS fetch, or a discovery, takes at most this long.
@@ -139,10 +140,10 @@ pub(crate) enum Denied {
 }
 
 const BASIC: &str = r#"Basic realm="data-avalanche""#;
-const BEARER: &str = r#"Bearer realm="data-avalanche""#;
+pub(crate) const BEARER: &str = r#"Bearer realm="data-avalanche""#;
 /// The challenge of a request without `Authorization` while the console's sessions are on: a
 /// scheme no browser answers with its own credentials popup (Admin_Console §9).
-const SESSION: &str = r#"Session realm="data-avalanche""#;
+pub(crate) const SESSION: &str = r#"Session realm="data-avalanche""#;
 
 /// The settings that decide who calls: `auth` and what it reads.
 #[derive(Debug, Clone, PartialEq)]
@@ -157,6 +158,8 @@ struct Settings {
     /// The console's session key and `session_ttl`: set when the console is enabled with `auth`
     /// `basic` or `oauth2` and a key (V-135).
     sessions: Option<(Secret, Duration)>,
+    /// `globals.console.enabled`.
+    console: bool,
 }
 
 impl Settings {
@@ -173,6 +176,7 @@ impl Settings {
             role_mapping: api.role_mapping.clone(),
             username_claim: console.username_claim.clone(),
             sessions,
+            console: console.enabled,
         }
     }
 }
@@ -217,11 +221,22 @@ struct Current {
     sessions: Option<Arc<Sessions>>,
 }
 
+/// What the console's own routes (`/ui/`) read of the settings: how people sign in, and the
+/// sessions that keeps them signed in.
+#[derive(Debug, Clone)]
+pub(crate) struct SignIn {
+    pub auth: ApiAuth,
+    pub sessions: Option<Arc<Sessions>>,
+    pub credentials: Option<Credentials>,
+}
+
 /// The node's authentication, swapped by a reload.
 #[derive(Debug)]
 pub struct Auth {
     current: RwLock<Current>,
     timing: Timing,
+    /// The failed basic sign-ins of each address (Admin_Console §9).
+    pub(crate) attempts: Attempts,
 }
 
 impl Auth {
@@ -264,6 +279,7 @@ impl Auth {
                 settings,
             }),
             timing,
+            attempts: Attempts::default(),
         }
     }
 
@@ -283,6 +299,52 @@ impl Auth {
             current.sessions = Sessions::of(&settings);
             current.settings = settings;
         }
+    }
+
+    /// How people sign in to the console, while it is enabled.
+    pub(crate) fn sign_in(&self) -> Option<SignIn> {
+        let current = self.current.read().unwrap_or_else(PoisonError::into_inner);
+        let s = &current.settings;
+        s.console.then(|| SignIn {
+            auth: s.auth,
+            sessions: current.sessions.clone(),
+            credentials: s.credentials.clone(),
+        })
+    }
+
+    /// Whether `/v1` limits failed `Authorization: Basic` credentials: while `auth` is `basic`.
+    pub(crate) fn limits_basic(&self) -> bool {
+        self.current
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .settings
+            .auth
+            == ApiAuth::Basic
+    }
+
+    /// [`Self::verify_caller`] for a request from `from`, limiting `Authorization: Basic`
+    /// credentials by address while `auth` is `basic` (Admin_Console §9): `Err` with the wait
+    /// left while the address waits, its credentials not compared; else the attempt is counted
+    /// as failed, and a match resets the count. Without an address nothing is counted.
+    pub(crate) async fn verify_from(
+        &self,
+        headers: &HeaderMap,
+        from: Option<std::net::IpAddr>,
+    ) -> Result<Result<Verified, Denied>, Duration> {
+        let counted = from.filter(|_| self.limits_basic() && sent_basic(headers));
+        if let Some(ip) = counted {
+            self.attempts.attempt(ip, std::time::Instant::now())?;
+        }
+        let verified = self.verify_caller(headers).await;
+        if let Some(ip) = counted {
+            match &verified {
+                Ok(_) => self.attempts.succeeded(ip),
+                // The node couldn't tell: the attempt is given back, earlier failures stay.
+                Err(Denied::Unavailable(_)) => self.attempts.refund(ip),
+                Err(_) => {}
+            }
+        }
+        Ok(verified)
     }
 
     /// The caller of a request with these headers.
@@ -481,6 +543,17 @@ fn unauthenticated(challenge: &'static str, why: impl Into<String>) -> Denied {
     }
 }
 
+/// Whether the request sent `Authorization: Basic`, well formed or not.
+pub(crate) fn sent_basic(headers: &HeaderMap) -> bool {
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.get(..5).map(|scheme| (scheme, &v[5..])))
+        .is_some_and(|(scheme, rest)| {
+            scheme.eq_ignore_ascii_case("basic") && (rest.is_empty() || rest.starts_with(' '))
+        })
+}
+
 /// The value of `Authorization: <scheme> <value>`, the scheme matched without case.
 fn credential<'h>(headers: &'h HeaderMap, scheme: &str) -> Option<&'h str> {
     let value = headers.get(AUTHORIZATION)?.to_str().ok()?;
@@ -495,6 +568,12 @@ fn same(given: &str, expected: &str) -> subtle::Choice {
         .ct_eq(blake3::hash(expected.as_bytes()).as_bytes())
 }
 
+/// Whether `user` and `password` are the configured ones, both compared in full whichever
+/// differs.
+pub(crate) fn basic_matches(c: &Credentials, user: &str, password: &str) -> bool {
+    bool::from(same(user, c.user()) & same(password, c.password().expose()))
+}
+
 fn basic(c: &Credentials, headers: &HeaderMap) -> Result<Principal, Denied> {
     let given = credential(headers, "Basic")
         .ok_or_else(|| unauthenticated(BASIC, "basic credentials are required"))?;
@@ -506,10 +585,7 @@ fn basic(c: &Credentials, headers: &HeaderMap) -> Result<Principal, Denied> {
     let (user, password) = decoded
         .split_once(':')
         .ok_or_else(|| unauthenticated(BASIC, "the basic credentials don't decode"))?;
-    // Both compared in full, whichever differs.
-    let user_ok = same(user, c.user());
-    let password_ok = same(password, c.password().expose());
-    if bool::from(user_ok & password_ok) {
+    if basic_matches(c, user, password) {
         Ok(Principal {
             name: user.to_owned(),
             role: Role::Admin,
@@ -579,14 +655,16 @@ impl Verifier {
             .get("exp")
             .and_then(Value::as_i64)
             .and_then(|exp| DateTime::from_timestamp(exp, 0));
-        let Some(role) = roles(&claims, &self.roles_claim)
-            .iter()
-            .filter_map(|r| map(&self.mapping, r))
-            .max()
-        else {
+        let carried = roles(&claims, &self.roles_claim);
+        let Some(role) = carried.iter().filter_map(|r| map(&self.mapping, r)).max() else {
+            let carried = if carried.is_empty() {
+                "none".to_owned()
+            } else {
+                carried.join(", ")
+            };
             return Err(Denied::Forbidden {
                 why: format!(
-                    "the token's {} name no role this node maps",
+                    "the token's {} ({carried}) name no role this node maps",
                     self.roles_claim
                 ),
                 name,

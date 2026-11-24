@@ -25,9 +25,13 @@ const NOTE_REFUSED: &str = "the note is too long, not a string, holds a control 
 const BODY_TOO_LARGE: &str = "the body is over 1 MiB";
 
 /// Every route's answers besides its own.
-const COMMON: [(u16, &str); 3] = [
+const COMMON: [(u16, &str); 4] = [
     (401, "no credentials, or ones that don't verify"),
     (403, "the caller's role is below the route's"),
+    (
+        429,
+        "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+    ),
     (
         503,
         "the node is starting or stopping, or its state can't be read",

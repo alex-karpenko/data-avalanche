@@ -14,6 +14,7 @@ mod actions;
 mod auth;
 mod cluster;
 mod config;
+mod console;
 mod events;
 mod follow;
 mod generations;
@@ -22,6 +23,7 @@ mod limit;
 mod live;
 mod nodes;
 mod openapi;
+mod pages;
 mod peers;
 mod pipelines;
 mod prometheus;
@@ -60,6 +62,7 @@ pub use auth::{
     Auth, CSRF_HEADER, FETCH_TIMEOUT, KEYS_MAX_AGE, MAX_KEY_DOCUMENT, Principal, REFETCH_AFTER,
 };
 pub use cluster::{Control, Stop};
+pub use console::{SIGN_IN_ATTEMPTS, SIGN_IN_WAIT};
 pub use follow::{FOLLOW_SILENCE, MAX_FRAME};
 pub use history::{MAX_POINTS, MAX_SPAN};
 pub use limit::{RateLimit, VALIDATE_BURST, VALIDATE_PER_SECOND};
@@ -157,7 +160,7 @@ pub struct Route {
     pub summary: &'static str,
     /// The request body's content type, when it takes one.
     pub body: Option<&'static str>,
-    /// Its own answers; 401, 403 and 503 are every route's.
+    /// Its own answers; 401, 403, 429 (`basic`: an address that failed too often) and 503 are every route's.
     pub answers: &'static [(u16, &'static str)],
     /// What it records, when it changes something (Admin_Console §5).
     pub records: Option<Recorded>,
@@ -892,6 +895,7 @@ pub fn router(api: Api) -> Router {
         );
     }
     router
+        .merge(console::routes(&api))
         .layer(from_fn_with_state(api.clone(), misdirected))
         .with_state(api)
 }
@@ -932,7 +936,14 @@ pub(crate) fn unforged(method: &Method, headers: &HeaderMap, csrf: &str) -> bool
 /// request's extensions.
 async fn authorize(State(gate): State<Gate>, mut req: Request, next: Next) -> Response {
     let role = gate.route.role;
-    let verified = gate.auth.verify_caller(req.headers()).await;
+    let from = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<server::Client>>()
+        .map(|c| c.0.0.ip());
+    let verified = match gate.auth.verify_from(req.headers(), from).await {
+        Ok(verified) => verified,
+        Err(wait) => return console::too_many_json(wait),
+    };
     if let Ok(auth::Verified {
         session: Some(s), ..
     }) = &verified

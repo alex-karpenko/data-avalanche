@@ -75,10 +75,6 @@ impl Sealer {
     }
 
     /// `plain`, sealed for `purpose`, as URL-safe base64.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the sign-in (Task 3) starts sessions")
-    )]
     pub(crate) fn seal(&self, purpose: &str, plain: &[u8]) -> String {
         let mut nonce = [0; NONCE_LEN];
         aws_lc_rs::rand::fill(&mut nonce).expect("the system's random source");
@@ -134,10 +130,6 @@ impl Sealer {
 }
 
 /// A random token, URL-safe: 32 bytes of the system's random source.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the sign-in (Task 3) starts sessions")
-)]
 pub(crate) fn random_token() -> String {
     let mut b = [0; 32];
     aws_lc_rs::rand::fill(&mut b).expect("the system's random source");
@@ -198,10 +190,6 @@ impl std::fmt::Debug for By {
 
 /// A session too long for [`MAX_CHUNKS`] cookies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the sign-in (Task 3) starts sessions")
-)]
 #[error(
     "the session needs {0} bytes of cookies, more than the {MAX_CHUNKS} cookies of {COOKIE_CHUNK} bytes a browser is sent: the provider's tokens are too long"
 )]
@@ -212,10 +200,6 @@ const SESSION: &str = "session";
 
 impl Session {
     /// A session signed in at `signed_in`, with a new anti-forgery token.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the sign-in (Task 3) starts sessions")
-    )]
     pub(crate) fn new(by: By, signed_in: i64) -> Self {
         Self {
             signed_in,
@@ -229,10 +213,6 @@ impl Session {
     ///
     /// # Errors
     /// [`TooLong`]: it needs more than [`MAX_CHUNKS`] cookies.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the sign-in (Task 3) starts sessions")
-    )]
     pub(crate) fn cookies(&self, sealer: &Sealer, max_age: u64) -> Result<Vec<String>, TooLong> {
         let plain = serde_json::to_vec(self).expect("a session serializes");
         let sealed = sealer.seal(SESSION, &plain);
@@ -251,6 +231,13 @@ impl Session {
             .collect();
         out.extend((chunks.len()..MAX_CHUNKS).map(|i| removed(&chunk_name(i), "/")));
         Ok(out)
+    }
+
+    /// The `Set-Cookie` values that end a session: each of its cookies removed.
+    pub(crate) fn removed() -> Vec<String> {
+        (0..MAX_CHUNKS)
+            .map(|i| removed(&chunk_name(i), "/"))
+            .collect()
     }
 
     /// The session the request's cookies hold: `None` without its cookie.
@@ -319,10 +306,6 @@ pub(crate) fn cookie<'h>(headers: &'h HeaderMap, name: &str) -> Option<&'h str> 
 
 /// A `Set-Cookie` value: `HttpOnly` and `Secure`, for `path`, kept `max_age` seconds, `same_site`
 /// `Strict` or `Lax`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the sign-in (Task 3) starts sessions")
-)]
 pub(crate) fn set_cookie(
     name: &str,
     value: &str,
@@ -336,10 +319,6 @@ pub(crate) fn set_cookie(
 }
 
 /// The `Set-Cookie` value that removes cookie `name` at `path`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the sign-in (Task 3) starts sessions")
-)]
 pub(crate) fn removed(name: &str, path: &str) -> String {
     format!("{name}=; Path={path}; Max-Age=0; HttpOnly; Secure; SameSite=Strict")
 }
