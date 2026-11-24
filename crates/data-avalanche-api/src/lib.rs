@@ -6,7 +6,9 @@
 //!
 //! Every `/v1` route takes the least role in API_RBAC §2 ([`routes`]): no credentials, or ones
 //! that don't verify, are 401 with a `WWW-Authenticate` challenge; a caller below the route's
-//! role, or with no role mapped, is 403, and recorded on a route that changes something.
+//! role, or with no role mapped, is 403, and recorded on a route that changes something. A
+//! request the console's session authenticates sends the session's anti-forgery token
+//! ([`CSRF_HEADER`]) when it changes something: without it, 403, before its role is looked at.
 
 mod actions;
 mod auth;
@@ -25,6 +27,7 @@ mod pipelines;
 mod prometheus;
 mod publish;
 mod server;
+mod session;
 mod snapshots;
 mod stream;
 mod tables;
@@ -38,7 +41,7 @@ use std::sync::{Arc, OnceLock};
 
 use axum::Router;
 use axum::extract::{Request, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, get, post};
@@ -53,7 +56,9 @@ use serde_json::{Value, json};
 use tokio::sync::watch;
 
 pub use actions::{DENIALS_BURST, MAX_ERROR, MAX_NOTE, MAX_TARGET, Recorded, note_of};
-pub use auth::{Auth, FETCH_TIMEOUT, KEYS_MAX_AGE, MAX_KEY_DOCUMENT, Principal, REFETCH_AFTER};
+pub use auth::{
+    Auth, CSRF_HEADER, FETCH_TIMEOUT, KEYS_MAX_AGE, MAX_KEY_DOCUMENT, Principal, REFETCH_AFTER,
+};
 pub use cluster::{Control, Stop};
 pub use follow::{FOLLOW_SILENCE, MAX_FRAME};
 pub use history::{MAX_POINTS, MAX_SPAN};
@@ -70,6 +75,7 @@ pub use prometheus::{
 };
 pub use publish::{FIGURES_EVERY, STATE_EVERY, publish};
 pub use server::{Bound, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT, MAX_CONNECTIONS, ServeError, bind};
+pub use session::{COOKIE_CHUNK, KEPT_AFTER, MAX_CHUNKS, SESSION_COOKIE};
 pub use snapshots::{EndedJobs, READ_AT_ONCE};
 pub use stream::{FOLLOW_BACKOFF, KEEP_ALIVE, KINDS};
 pub use tables::{FACTS_FOR, FACTS_WITHIN, Lake};
@@ -906,11 +912,35 @@ async fn misdirected(State(api): State<Api>, req: Request, next: Next) -> Respon
     next.run(req).await
 }
 
+/// The 403 of a request its session authenticates that changes something without the session's
+/// anti-forgery token.
+const FORGED: &str = "a request the console's session authenticates sends the session's anti-forgery token (X-CSRF-Token) when it changes something";
+
+/// Whether a request its session authenticates sent the session's anti-forgery token, as a
+/// request that changes something must: a `GET`, a `HEAD` or an `OPTIONS` needs none.
+pub(crate) fn unforged(method: &Method, headers: &HeaderMap, csrf: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
+        return true;
+    }
+    headers
+        .get(CSRF_HEADER)
+        .is_some_and(|sent| bool::from(sent.as_bytes().ct_eq(csrf.as_bytes())))
+}
+
 /// Lets a caller through to a route that takes `role` or less, with its [`Principal`] in the
 /// request's extensions.
 async fn authorize(State(gate): State<Gate>, mut req: Request, next: Next) -> Response {
     let role = gate.route.role;
-    match gate.auth.verify(req.headers()).await {
+    let verified = gate.auth.verify_caller(req.headers()).await;
+    if let Ok(auth::Verified {
+        session: Some(s), ..
+    }) = &verified
+        && !unforged(req.method(), req.headers(), &s.csrf)
+    {
+        return body(StatusCode::FORBIDDEN, &json!({ "error": FORGED }));
+    }
+    match verified.map(|v| v.principal) {
         Ok(p) if p.role >= role => {
             req.extensions_mut().insert(p);
             next.run(req).await
@@ -1049,6 +1079,68 @@ mod tests {
         );
     }
 
+    /// Admin_Console §9: a request the console's session authenticates passes the gate as a
+    /// caller with credentials does; one that changes something sends the session's
+    /// anti-forgery token too, and is refused without it, whatever the caller's role.
+    #[tokio::test]
+    async fn a_session_s_requests_that_change_something_send_its_anti_forgery_token() {
+        use crate::test_support::{basic_api, basic_session, session_cookie, sessions};
+        let hour = std::time::Duration::from_secs(3600);
+        let auth = Auth::new(&basic_api("s3cret"), &sessions(hour));
+        let addr = serve(api(Arc::new(auth))).await;
+        let session = basic_session("s3cret", hour / 2);
+        let cookie = session_cookie(&session);
+        for r in routes() {
+            let path = r.path.replace("{id}", "orders");
+            let with = [("Cookie", cookie.as_str())];
+            let (code, _, body) = request(addr, r.method, &path, &with, "").await;
+            let past = |code: u16| code != 401 && code != 403;
+            if r.method == "GET" {
+                assert!(past(code), "{} {path}: {code} {body}", r.method);
+                continue;
+            }
+            assert_eq!(code, 403, "{} {path} without the token", r.method);
+            assert!(body.contains("anti-forgery token"), "{body}");
+            let wrong = [("Cookie", cookie.as_str()), (CSRF_HEADER, "not-it")];
+            let (code, _, _) = request(addr, r.method, &path, &wrong, "").await;
+            assert_eq!(code, 403, "{} {path} with another token", r.method);
+            let right = [
+                ("Cookie", cookie.as_str()),
+                (CSRF_HEADER, session.csrf.as_str()),
+            ];
+            let (code, _, body) = request(addr, r.method, &path, &right, "").await;
+            assert!(past(code), "{} {path}: {code} {body}", r.method);
+        }
+    }
+
+    /// A session below a route's role is told so, with the right anti-forgery token: the role's
+    /// 403, not the forgery's.
+    #[tokio::test]
+    async fn a_session_below_the_role_with_the_right_token_is_refused_for_its_role() {
+        use crate::session::{By, Session};
+        use crate::test_support::{session_cookie, sessions};
+        let idp = Issuer::start().await;
+        let hour = std::time::Duration::from_secs(3600);
+        let auth = Auth::new(&idp.oauth2_api("roles"), &sessions(hour));
+        let addr = serve(api(Arc::new(auth))).await;
+        let session = Session::new(
+            By::Oauth2 {
+                access: idp.token(serde_json::json!(["viewer"])),
+                refresh: None,
+            },
+            chrono::Utc::now().timestamp() - 60,
+        );
+        let cookie = session_cookie(&session);
+        let sent = [
+            ("Cookie", cookie.as_str()),
+            (CSRF_HEADER, session.csrf.as_str()),
+        ];
+        let (code, _, body) = request(addr, "POST", "/v1/pipelines/orders/pause", &sent, "").await;
+        assert_eq!(code, 403, "{body}");
+        assert!(body.contains("this needs the operator role"), "{body}");
+        assert!(!body.contains("anti-forgery"), "{body}");
+    }
+
     /// Every `/v1` route: 401 without a token or with one that doesn't verify, 403 below its
     /// role or with no role mapped, through at its role and above. Through means past the gate:
     /// the node doesn't run its generation here, so most routes answer 503 themselves.
@@ -1057,7 +1149,7 @@ mod tests {
         let idp = Issuer::start().await;
         let addr = serve(api(Arc::new(Auth::new(
             &idp.api("roles"),
-            crate::test_support::USERNAME_CLAIM,
+            &crate::test_support::console(),
         ))))
         .await;
         let callers = [

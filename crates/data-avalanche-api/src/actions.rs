@@ -328,9 +328,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::test_support::{
-        CONFIG, Issuer, Lone, USERNAME_CLAIM, api, lone, open, request, serve,
-    };
+    use crate::test_support::{CONFIG, Issuer, Lone, api, console, lone, open, request, serve};
     use crate::{Api, Auth};
 
     /// The lone node's API under `auth`, its pipeline `orders` known.
@@ -485,8 +483,7 @@ mod tests {
     #[tokio::test]
     async fn a_job_s_actions_name_the_job_and_its_pipeline() {
         let idp = Issuer::start().await;
-        let (addr, lone, _dir) =
-            served(Arc::new(Auth::new(&idp.api("roles"), USERNAME_CLAIM))).await;
+        let (addr, lone, _dir) = served(Arc::new(Auth::new(&idp.api("roles"), &console()))).await;
         let config = lone.node.coordinator.config().await;
         let docs = (lone.node.docs)(&config.pipelines["orders"]).unwrap();
         let mut job = data_avalanche_state::SnapshotJobDoc::new(
@@ -562,8 +559,7 @@ mod tests {
     #[tokio::test]
     async fn a_caller_below_the_role_is_recorded_as_denied() {
         let idp = Issuer::start().await;
-        let (addr, lone, _dir) =
-            served(Arc::new(Auth::new(&idp.api("roles"), USERNAME_CLAIM))).await;
+        let (addr, lone, _dir) = served(Arc::new(Auth::new(&idp.api("roles"), &console()))).await;
         let token = format!("Bearer {}", idp.token(serde_json::json!(["viewer"])));
         let auth = [("Authorization", token.as_str())];
         let (code, _, _) = request(addr, "POST", "/v1/admin/shutdown", &auth, "").await;
@@ -619,8 +615,7 @@ mod tests {
     #[tokio::test]
     async fn a_token_with_no_mapped_role_is_recorded_as_denied() {
         let idp = Issuer::start().await;
-        let (addr, lone, _dir) =
-            served(Arc::new(Auth::new(&idp.api("roles"), USERNAME_CLAIM))).await;
+        let (addr, lone, _dir) = served(Arc::new(Auth::new(&idp.api("roles"), &console()))).await;
         let token = format!("Bearer {}", idp.token(serde_json::json!(["cdc-reader"])));
         let auth = [("Authorization", token.as_str())];
         let (code, _, body) = request(addr, "POST", "/v1/pipelines/orders/pause", &auth, "").await;
@@ -730,8 +725,7 @@ mod tests {
     #[tokio::test]
     async fn a_flood_of_refused_calls_is_recorded_for_a_burst_only() {
         let idp = Issuer::start().await;
-        let (addr, lone, _dir) =
-            served(Arc::new(Auth::new(&idp.api("roles"), USERNAME_CLAIM))).await;
+        let (addr, lone, _dir) = served(Arc::new(Auth::new(&idp.api("roles"), &console()))).await;
         let token = format!("Bearer {}", idp.token(serde_json::json!(["viewer"])));
         let auth = [("Authorization", token.as_str())];
         let started = std::time::Instant::now();

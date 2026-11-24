@@ -27,7 +27,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Notify, broadcast, mpsc, watch};
 use tokio::task::{AbortHandle, JoinSet};
 
-use crate::auth::Denied;
+use crate::auth::{Denied, Presented};
 use crate::follow::FOLLOW_SILENCE;
 use crate::nodes::phase;
 use crate::peers::FORWARDED_BY;
@@ -207,7 +207,7 @@ pub(crate) async fn open(
             } else {
                 format!("/v1/stream?{raw}")
             },
-            authorization: headers.get(header::AUTHORIZATION).cloned(),
+            presented: Presented::of(&headers),
         })
     });
     let (tx, rx) = mpsc::channel(BUFFER);
@@ -233,13 +233,13 @@ async fn deliver(tx: &mpsc::Sender<Event>, opened: &mut Opened, e: Event) -> boo
 }
 
 /// What a stream follows its peers with: the node's members and client, the API's own check of
-/// a caller, the stream's own path and query, and the caller's credentials (its `Authorization`
-/// alone, never logged).
+/// a caller, the stream's own path and query, and the credentials the caller presented (never
+/// logged).
 struct Follow {
     node: Node,
     auth: Arc<Auth>,
     path: String,
-    authorization: Option<HeaderValue>,
+    presented: Presented,
 }
 
 impl Follow {
@@ -248,11 +248,7 @@ impl Follow {
     /// check now (its settings refused, the issuer's keys unreachable: a 503) refuses no caller:
     /// the peer is followed, and answers for itself.
     async fn still_verified(&self) -> bool {
-        let mut headers = HeaderMap::new();
-        if let Some(a) = &self.authorization {
-            headers.insert(header::AUTHORIZATION, a.clone());
-        }
-        match self.auth.verify(&headers).await {
+        match self.auth.verify(&self.presented.headers()).await {
             Ok(p) => p.role >= Role::Viewer,
             Err(Denied::Unavailable(_)) => true,
             Err(Denied::Unauthenticated { .. } | Denied::Forbidden { .. }) => false,
@@ -337,13 +333,7 @@ async fn follow_peer(
         let error = match f
             .node
             .peers
-            .follow(
-                &peer,
-                &url,
-                &f.path,
-                f.authorization.clone(),
-                FOLLOW_SILENCE,
-            )
+            .follow(&peer, &url, &f.path, &f.presented, FOLLOW_SILENCE)
             .await
         {
             Err(e) => e,
@@ -830,7 +820,7 @@ mod tests {
         .await;
         let auth = std::sync::Arc::new(crate::Auth::new(
             &basic("s3cret"),
-            crate::test_support::USERNAME_CLAIM,
+            &crate::test_support::console(),
         ));
         let (addr, _lone, _dir) = served_with(&b_url, std::sync::Arc::clone(&auth), |_| {}).await;
         let mut s = stream(addr, "/v1/stream", &[("authorization", OPS)]).await;
@@ -838,7 +828,7 @@ mod tests {
         s.next().await;
         assert_eq!(s.next().await.1["state"], "unreachable");
         // The password changes before node-b is followed again (FOLLOW_BACKOFF[0]).
-        auth.set(&basic("rotated"), crate::test_support::USERNAME_CLAIM);
+        auth.set(&basic("rotated"), &crate::test_support::console());
         assert_eq!(
             s.next().await,
             (
@@ -862,7 +852,7 @@ mod tests {
         .await;
         let auth = std::sync::Arc::new(crate::Auth::new(
             &basic("s3cret"),
-            crate::test_support::USERNAME_CLAIM,
+            &crate::test_support::console(),
         ));
         let (addr, lone, _dir) = served_with(&b_url, std::sync::Arc::clone(&auth), |_| {}).await;
         let mut s = stream(addr, "/v1/stream", &[("authorization", OPS)]).await;
@@ -877,7 +867,7 @@ mod tests {
         // `auth: basic` without its credentials: every caller is answered 503, none refused.
         let mut refused = basic("s3cret");
         refused.credentials = None;
-        auth.set(&refused, crate::test_support::USERNAME_CLAIM);
+        auth.set(&refused, &crate::test_support::console());
         assert_eq!(
             s.next().await,
             ("peer".into(), unreachable),
@@ -898,7 +888,7 @@ mod tests {
         .await;
         let auth = std::sync::Arc::new(crate::Auth::new(
             &basic("s3cret"),
-            crate::test_support::USERNAME_CLAIM,
+            &crate::test_support::console(),
         ));
         let (addr, lone, _dir) = served_with(&b_url, auth, |_| {}).await;
         let mut s = stream(addr, "/v1/stream", &[("authorization", OPS)]).await;

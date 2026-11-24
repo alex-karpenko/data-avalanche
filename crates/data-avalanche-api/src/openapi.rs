@@ -10,7 +10,9 @@ use utoipa::openapi::extensions::ExtensionsBuilder;
 use utoipa::openapi::path::{HttpMethod, OperationBuilder, ParameterBuilder, ParameterIn};
 use utoipa::openapi::request_body::RequestBodyBuilder;
 use utoipa::openapi::schema::{ObjectBuilder, Type};
-use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityRequirement, SecurityScheme};
+use utoipa::openapi::security::{
+    ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityRequirement, SecurityScheme,
+};
 use utoipa::openapi::{
     ComponentsBuilder, ContentBuilder, InfoBuilder, OpenApi, OpenApiBuilder, Paths, Required,
     ResponseBuilder,
@@ -39,6 +41,7 @@ fn operation(r: &Route) -> utoipa::openapi::path::Operation {
         .tag(r.path.split('/').nth(2).unwrap_or("v1"))
         .security(SecurityRequirement::new("basic", Vec::<String>::new()))
         .security(SecurityRequirement::new("bearer", Vec::<String>::new()))
+        .security(SecurityRequirement::new("session", Vec::<String>::new()))
         .extensions(Some(
             ExtensionsBuilder::new().add("x-min-role", role).build(),
         ));
@@ -243,6 +246,13 @@ pub fn openapi() -> OpenApi {
                     .bearer_format("JWT")
                     .build(),
             ),
+        )
+        .security_scheme(
+            "session",
+            SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::with_description(
+                crate::SESSION_COOKIE,
+                "the web console's session (`globals.console`, with `auth` basic or oauth2), taken when a request has no `Authorization`; a request that changes something sends the session's anti-forgery token in `X-CSRF-Token`",
+            ))),
         )
         .build();
     OpenApiBuilder::new()

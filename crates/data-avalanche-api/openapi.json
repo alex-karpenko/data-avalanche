@@ -69,6 +69,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "admin"
@@ -137,6 +140,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "admin"
@@ -180,6 +186,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -269,6 +278,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -342,6 +354,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -420,6 +435,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -463,6 +481,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -543,6 +564,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "operator"
@@ -586,6 +610,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -647,6 +674,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "operator"
@@ -782,6 +812,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -903,6 +936,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -981,6 +1017,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -1090,6 +1129,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "operator"
@@ -1168,6 +1210,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -1264,6 +1309,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "operator"
@@ -1367,6 +1415,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "admin"
@@ -1470,6 +1521,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "admin"
@@ -1513,6 +1567,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -1556,6 +1613,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -1616,6 +1676,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -1707,6 +1770,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "operator"
@@ -1791,6 +1857,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -1882,6 +1951,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "operator"
@@ -1967,6 +2039,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "operator"
@@ -2052,6 +2127,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "operator"
@@ -2112,6 +2190,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -2195,6 +2276,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "operator"
@@ -2280,6 +2364,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "operator"
@@ -2355,6 +2442,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -2439,6 +2529,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -2499,6 +2592,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -2590,6 +2686,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "operator"
@@ -2675,6 +2774,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "operator"
@@ -2750,6 +2852,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -2805,6 +2910,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -2821,6 +2929,12 @@
         "type": "http",
         "scheme": "bearer",
         "bearerFormat": "JWT"
+      },
+      "session": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "__Host-da_session",
+        "description": "the web console's session (`globals.console`, with `auth` basic or oauth2), taken when a request has no `Authorization`; a request that changes something sends the session's anti-forgery token in `X-CSRF-Token`"
       }
     }
   }

@@ -22,7 +22,8 @@ use data_avalanche_cluster::{
     Phase, ReconcilerSettings, Recorder, Udp, WorkerFactory, file_hash, removed_pipelines,
 };
 use data_avalanche_config::{
-    ApiAuth, Env, FingerprintKey, HostPort, Jwt, Pipeline, ProcessEnv, ResolvedConfig, load_str,
+    ApiAuth, Console, Env, FingerprintKey, HostPort, Jwt, Pipeline, ProcessEnv, ResolvedConfig,
+    Secret, load_str,
 };
 use data_avalanche_pipeline::{Backoff, Tuning};
 use data_avalanche_state::{
@@ -72,12 +73,86 @@ pub(crate) fn config() -> ResolvedConfig {
         .config
 }
 
-/// `globals.console.username_claim`'s default.
-pub(crate) const USERNAME_CLAIM: &str = "preferred_username";
+/// `globals.console` of [`CONFIG`]: disabled, its defaults.
+pub(crate) fn console() -> Console {
+    config().globals.console
+}
+
+/// [`console`], naming a token's caller by `username_claim`.
+pub(crate) fn console_naming(username_claim: &str) -> Console {
+    Console {
+        username_claim: username_claim.into(),
+        ..console()
+    }
+}
+
+/// The session key the tests' consoles seal with.
+pub(crate) const SESSION_KEY: &str = "the tests' session key, of 32 bytes or more";
+
+/// [`console`], enabled, its sessions sealed with [`SESSION_KEY`] and lasting `ttl`.
+pub(crate) fn sessions(ttl: Duration) -> Console {
+    Console {
+        enabled: true,
+        session_key: Some(Secret::new(
+            SESSION_KEY,
+            &FingerprintKey::from_bytes([1; 32]),
+        )),
+        session_ttl: ttl,
+        ..console()
+    }
+}
+
+/// `globals.api` with `auth: basic`, its one user `ops` with password `password`.
+pub(crate) fn basic_api(password: &str) -> data_avalanche_config::Api {
+    let mut api = config().globals.api;
+    api.auth = ApiAuth::Basic;
+    api.credentials = Some(data_avalanche_config::Credentials::Inline {
+        user: "ops".into(),
+        password: Secret::new(password, &FingerprintKey::from_bytes([1; 32])),
+    });
+    api
+}
+
+/// The `Cookie` header that carries `session`, sealed with [`SESSION_KEY`].
+pub(crate) fn session_cookie(session: &crate::session::Session) -> String {
+    let sealer = crate::session::Sealer::new(SESSION_KEY);
+    session
+        .cookies(&sealer, 3600)
+        .unwrap()
+        .iter()
+        .filter(|c| !c.contains("Max-Age=0"))
+        .map(|c| c.split(';').next().unwrap().to_owned())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// A basic session of user `ops`, who gave `password`, signed in `ago` before now.
+pub(crate) fn basic_session(password: &str, ago: Duration) -> crate::session::Session {
+    let sealer = crate::session::Sealer::new(SESSION_KEY);
+    crate::session::Session::new(
+        crate::session::By::Basic {
+            user: "ops".into(),
+            fingerprint: sealer.fingerprint(password),
+        },
+        chrono::Utc::now().timestamp() - i64::try_from(ago.as_secs()).unwrap(),
+    )
+}
+
+/// What a request with these headers presented.
+pub(crate) fn presented(headers: &[(&str, &str)]) -> crate::auth::Presented {
+    let mut h = HeaderMap::new();
+    for (k, v) in headers {
+        h.append(
+            axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+            v.parse().unwrap(),
+        );
+    }
+    crate::auth::Presented::of(&h)
+}
 
 /// `globals.api` of [`CONFIG`]: `auth: none`.
 pub(crate) fn open() -> Arc<Auth> {
-    Arc::new(Auth::new(&config().globals.api, USERNAME_CLAIM))
+    Arc::new(Auth::new(&config().globals.api, &console()))
 }
 
 /// The routes' state before the node runs its generation: the `/v1` routes answer 503.
@@ -441,6 +516,25 @@ impl Issuer {
         }
     }
 
+    /// `globals.api` with `auth: oauth2` for this issuer, its keys at its JWKS, the console's
+    /// client `cdc-console`.
+    pub fn oauth2_api(&self, roles_claim: &str) -> data_avalanche_config::Api {
+        let mut api = config().globals.api;
+        api.auth = ApiAuth::Oauth2;
+        api.oauth2 = Some(data_avalanche_config::ApiOauth2 {
+            issuer: self.url.clone(),
+            audience: Some("cdc".into()),
+            jwks_url: Some(format!("{}/jwks", self.url)),
+            discovery_url: None,
+            roles_claim: roles_claim.into(),
+            client_id: Some("cdc-console".into()),
+            client_secret: None,
+            scopes: vec!["openid".into(), "profile".into()],
+            idp_name: None,
+        });
+        api
+    }
+
     /// `globals.api` with `auth: jwt` for this issuer.
     pub fn api(&self, roles_claim: &str) -> data_avalanche_config::Api {
         let mut api = config().globals.api;
@@ -489,6 +583,8 @@ pub(crate) struct Seen {
     pub method: Method,
     pub uri: String,
     pub authorization: Option<String>,
+    pub cookie: Option<String>,
+    pub csrf: Option<String>,
     pub target: Option<String>,
     pub forwarded_by: Option<String>,
     pub body: String,
@@ -519,6 +615,8 @@ pub(crate) async fn fake_answering(
                     method,
                     uri: uri.to_string(),
                     authorization: h("authorization"),
+                    cookie: h("cookie"),
+                    csrf: h(crate::CSRF_HEADER),
                     target: h(TARGET),
                     forwarded_by: h(FORWARDED_BY),
                     body: String::from_utf8(bytes.to_vec()).unwrap(),
