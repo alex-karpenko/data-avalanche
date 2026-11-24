@@ -97,7 +97,7 @@ Decisions: `research/V1_Scope_Decisions.md`.
 	- listening address:port is a command line parameter
 	- authentication/authorization:
 		- anonymous
-		- basic
+		- basic; failed basic credentials are counted per client address (an IPv6 address by its /64), on the API and on the console's sign-in form alike: after 5 in a row, that address waits 1 minute (`429` with `Retry-After`, even for the right password), and a success starts the count again; a node counts at most 10 000 addresses
 		- JWT (with RBAC)
 		- OAuth2/OpenID (with RBAC)
 	- roles are nested `viewer` ⊆ `operator` ⊆ `admin`; endpoints and minimum roles are in the [endpoint table](#management-api-endpoints)
