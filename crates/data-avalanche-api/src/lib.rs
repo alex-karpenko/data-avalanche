@@ -22,6 +22,7 @@ mod history;
 mod limit;
 mod live;
 mod nodes;
+mod oauth2;
 mod openapi;
 mod pages;
 mod peers;
@@ -67,6 +68,7 @@ pub use follow::{FOLLOW_SILENCE, MAX_FRAME};
 pub use history::{MAX_POINTS, MAX_SPAN};
 pub use limit::{RateLimit, VALIDATE_BURST, VALIDATE_PER_SECOND};
 pub use live::FRESH_WITHIN;
+pub use oauth2::{AUTO_REDIRECT, ID_COOKIE, REFRESH_AHEAD, SIGN_IN_COOKIE, SIGN_IN_WITHIN};
 pub use openapi::openapi;
 pub use peers::{
     ACTION_LIMIT, ANSWERED_BY, DETAIL_LIMIT, FORWARDED_BY, MAX_ANSWER, Peers, PeersError,
@@ -918,7 +920,7 @@ async fn misdirected(State(api): State<Api>, req: Request, next: Next) -> Respon
 
 /// The 403 of a request its session authenticates that changes something without the session's
 /// anti-forgery token.
-const FORGED: &str = "a request the console's session authenticates sends the session's anti-forgery token (X-CSRF-Token) when it changes something";
+pub(crate) const FORGED: &str = "a request the console's session authenticates sends the session's anti-forgery token (X-CSRF-Token) when it changes something";
 
 /// Whether a request its session authenticates sent the session's anti-forgery token, as a
 /// request that changes something must: a `GET`, a `HEAD` or an `OPTIONS` needs none.

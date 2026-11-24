@@ -21,12 +21,12 @@ use axum::routing::{get, post};
 use axum::{Extension, Router};
 use chrono::{SecondsFormat, Utc};
 use data_avalanche_config::ApiAuth;
-use serde_json::json;
+use serde_json::{Value, json};
 
-use crate::auth::{BEARER, Denied, SESSION, SignIn, Verified};
+use crate::auth::{BEARER, Denied, SESSION, Sessions, SignIn, Verified};
 use crate::pages::{self, Frame};
-use crate::session::{By, KEPT_AFTER, Session, sealed_value};
-use crate::{Api, body};
+use crate::session::{By, KEPT_AFTER, Session, TooLong, as_sent, sealed_value};
+use crate::{Api, body, oauth2};
 
 /// Failed basic sign-ins in a row from one address before it waits.
 pub const SIGN_IN_ATTEMPTS: u32 = 5;
@@ -55,6 +55,9 @@ pub(crate) fn routes(api: &Api) -> Router<Api> {
         .route("/ui/sign-in", get(sign_in_page).post(sign_in))
         .route("/ui/sign-out", post(sign_out))
         .route("/ui/session", get(session))
+        .route("/ui/session/refresh", post(oauth2::refresh))
+        .route("/ui/oauth2/start", get(oauth2::start))
+        .route("/ui/oauth2/callback", get(oauth2::callback))
         .route("/ui/assets/{file}", get(asset))
         .layer(from_fn_with_state(api.clone(), guard))
 }
@@ -62,7 +65,8 @@ pub(crate) fn routes(api: &Api) -> Router<Api> {
 /// Serves `/ui/` while the console is enabled; every answer, the refusal too, has the security
 /// headers.
 async fn guard(State(api): State<Api>, req: Request, next: Next) -> Response {
-    let mut r = if api.auth.sign_in().is_none() {
+    let sign_in = api.auth.sign_in();
+    let mut r = if sign_in.is_none() {
         (
             StatusCode::NOT_FOUND,
             [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
@@ -72,8 +76,13 @@ async fn guard(State(api): State<Api>, req: Request, next: Next) -> Response {
     } else {
         next.run(req).await
     };
+    // Read after the answer: a sign-in or a sign-out may just have discovered the provider.
+    let form_action = sign_in
+        .as_ref()
+        .map(|s| oauth2::form_action(&api, s))
+        .unwrap_or_default();
     let h = r.headers_mut();
-    let csp = policy("");
+    let csp = policy(&form_action);
     if let Ok(v) = HeaderValue::from_str(&csp) {
         h.insert(header::CONTENT_SECURITY_POLICY, v);
     }
@@ -92,12 +101,12 @@ async fn guard(State(api): State<Api>, req: Request, next: Next) -> Response {
 }
 
 /// `303 See Other` to `to`.
-fn see_other(to: &str) -> Response {
+pub(crate) fn see_other(to: &str) -> Response {
     (StatusCode::SEE_OTHER, [(header::LOCATION, to)]).into_response()
 }
 
 /// An HTML page with `code`.
-fn html(code: StatusCode, page: String) -> Response {
+pub(crate) fn html(code: StatusCode, page: String) -> Response {
     (
         code,
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
@@ -107,7 +116,7 @@ fn html(code: StatusCode, page: String) -> Response {
 }
 
 /// `r` with a `Set-Cookie` for each of `cookies` (base64 and ASCII, so always a header value).
-fn with_cookies(mut r: Response, cookies: impl IntoIterator<Item = String>) -> Response {
+pub(crate) fn with_cookies(mut r: Response, cookies: impl IntoIterator<Item = String>) -> Response {
     for c in cookies {
         r.headers_mut().append(
             header::SET_COOKIE,
@@ -118,7 +127,7 @@ fn with_cookies(mut r: Response, cookies: impl IntoIterator<Item = String>) -> R
 }
 
 /// `r` with a `WWW-Authenticate` challenge.
-fn challenged(mut r: Response, challenge: &'static str) -> Response {
+pub(crate) fn challenged(mut r: Response, challenge: &'static str) -> Response {
     r.headers_mut().insert(
         header::WWW_AUTHENTICATE,
         HeaderValue::from_static(challenge),
@@ -133,7 +142,7 @@ pub(crate) fn retry_secs(wait: Duration) -> u64 {
 
 /// The challenge of a `/ui/` 401: the session's, or the token's under `jwt`; never `Basic`, whose
 /// popup the sign-in form replaces.
-fn challenge(auth: ApiAuth) -> &'static str {
+pub(crate) fn challenge(auth: ApiAuth) -> &'static str {
     if auth == ApiAuth::Jwt {
         BEARER
     } else {
@@ -188,13 +197,14 @@ fn climbs(next: &str) -> bool {
 }
 
 /// The query's parameters, the last of each name taken.
-fn params(raw: Option<&str>) -> BTreeMap<String, String> {
+pub(crate) fn params(raw: Option<&str>) -> BTreeMap<String, String> {
     url::form_urlencoded::parse(raw.unwrap_or_default().as_bytes())
         .into_owned()
         .collect()
 }
 
-fn frame(api: &Api, sign_in: &SignIn) -> Frame {
+/// What every page shows around its card, for this node and these settings.
+pub(crate) fn frame(api: &Api, sign_in: &SignIn) -> Frame {
     Frame {
         node: api
             .node
@@ -205,7 +215,8 @@ fn frame(api: &Api, sign_in: &SignIn) -> Frame {
 }
 
 /// A page under `/ui/` (the app's, from M15): the landing page for a caller who verifies, the
-/// sign-in for one who brought nothing, else why not.
+/// sign-in for one who brought nothing, else why not. An `oauth2` session whose token is about
+/// to expire is refreshed first, its new cookies set with the page.
 async fn page(
     State(api): State<Api>,
     info: Option<Extension<ConnectInfo<crate::server::Client>>>,
@@ -217,11 +228,38 @@ async fn page(
     };
     let frame = frame(&api, &sign_in);
     let here = safe_next(uri.path_and_query().map(|p| p.as_str()));
+    let mut headers = headers;
+    let mut renewed = Vec::new();
+    let mut not_refreshed = None;
+    match oauth2::due(&api, &sign_in, &headers).await {
+        Some(Ok(new)) => match sign_in.sessions.as_ref().map(|s| session_cookies(&new, s)) {
+            Some(Ok(cookies)) => {
+                headers.insert(
+                    header::COOKIE,
+                    as_sent(&cookies).parse().expect("cookies are header text"),
+                );
+                // Set whatever the page then says: a provider that rotates refresh tokens has
+                // spent the old one.
+                renewed = cookies;
+            }
+            Some(Err(e)) => {
+                let why = format!("the refreshed session can't be kept: {e}");
+                return challenged(
+                    html(StatusCode::UNAUTHORIZED, pages::ended(&frame, &why, &here)),
+                    challenge(sign_in.auth),
+                );
+            }
+            // `due` refreshes only with the console's sessions on.
+            None => {}
+        },
+        Some(Err(e)) => not_refreshed = Some(e),
+        None => {}
+    }
     let verified = match api.auth.verify_from(&headers, client(info)).await {
         Ok(verified) => verified,
         Err(wait) => return too_many(pages::waiting(&frame, &here, retry_secs(wait)), wait),
     };
-    match verified {
+    let r = match verified {
         Ok(Verified { principal, session }) => html(
             StatusCode::OK,
             pages::signed_in(
@@ -231,8 +269,16 @@ async fn page(
                 session.is_some(),
             ),
         ),
+        Err(Denied::Unauthenticated { .. }) if let Some(e) = not_refreshed => {
+            let why = format!("the provider's token expired and couldn't be refreshed: {e}");
+            challenged(
+                html(StatusCode::UNAUTHORIZED, pages::ended(&frame, &why, &here)),
+                challenge(sign_in.auth),
+            )
+        }
         Err(denied) => refused(&frame, &sign_in, &headers, &here, denied),
-    }
+    };
+    with_cookies(r, renewed)
 }
 
 /// Why a page isn't shown: the sign-in for one who brought no credentials (`basic`, `oauth2`),
@@ -271,7 +317,8 @@ fn refused(
     }
 }
 
-/// `GET /ui/sign-in`: the form (`basic`); a caller already signed in goes on to `next`.
+/// `GET /ui/sign-in`: the form (`basic`), or the way to the provider (`oauth2`); a caller
+/// already signed in goes on to `next`.
 async fn sign_in_page(
     State(api): State<Api>,
     info: Option<Extension<ConnectInfo<crate::server::Client>>>,
@@ -303,14 +350,14 @@ async fn sign_in_page(
                 pages::basic_sign_in(&frame, &next, "", None, info),
             )
         }
-        _ => StatusCode::NOT_FOUND.into_response(),
+        _ => oauth2::sign_in_page(&api, &sign_in, &q, &next),
     }
 }
 
 /// Whether a form posted to `/ui/` came from the console's own pages, as the browser says
 /// (`Sec-Fetch-Site`, else `Origin` against `Host`); a client that says neither (`curl`) is
 /// taken at its word.
-fn same_origin(headers: &HeaderMap) -> bool {
+pub(crate) fn same_origin(headers: &HeaderMap) -> bool {
     if let Some(site) = headers.get("sec-fetch-site") {
         return site == "same-origin" || site == "none";
     }
@@ -332,7 +379,9 @@ fn same_origin(headers: &HeaderMap) -> bool {
 }
 
 /// The client's address, as the connection says (a proxy's own, behind one).
-fn client(info: Option<Extension<ConnectInfo<crate::server::Client>>>) -> Option<IpAddr> {
+pub(crate) fn client(
+    info: Option<Extension<ConnectInfo<crate::server::Client>>>,
+) -> Option<IpAddr> {
     info.map(|Extension(ConnectInfo(c))| c.0.ip())
 }
 
@@ -400,26 +449,32 @@ async fn sign_in(
         },
         Utc::now().timestamp(),
     );
-    started(&session, sessions, &next)
+    match session_cookies(&session, sessions) {
+        Ok(cookies) => with_cookies(see_other(&next), cookies),
+        Err(e) => body(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({ "error": e.to_string() }),
+        ),
+    }
 }
 
-/// A session started: its cookies, and on to `next`.
-pub(crate) fn started(session: &Session, sessions: &crate::auth::Sessions, next: &str) -> Response {
-    let max_age = (sessions.ttl + KEPT_AFTER).as_secs();
-    let cookies = match session.cookies(&sessions.sealer, max_age) {
-        Ok(c) => c,
-        Err(e) => {
-            return body(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &json!({ "error": e.to_string() }),
-            );
-        }
-    };
-    with_cookies(see_other(next), cookies)
+/// The `Set-Cookie` values of `session`, kept until a day after it ends.
+///
+/// # Errors
+/// [`TooLong`]: it needs more cookies than a browser is sent.
+pub(crate) fn session_cookies(
+    session: &Session,
+    sessions: &Sessions,
+) -> Result<Vec<String>, TooLong> {
+    // In whole seconds: a session starts on one.
+    let left = sessions.ends(session.signed_in).timestamp() - Utc::now().timestamp();
+    let left = u64::try_from(left).unwrap_or_default();
+    session.cookies(&sessions.sealer, left + KEPT_AFTER.as_secs())
 }
 
-/// `POST /ui/sign-out`: the session's cookies removed, then the sign-in. Only from the
-/// console's own pages: a sign-out another site posts is refused.
+/// `POST /ui/sign-out`: the session's cookies removed, then the sign-in, or, with `oauth2`, the
+/// provider's end-session endpoint when it has one. Only from the console's own pages: a
+/// sign-out another site posts is refused.
 async fn sign_out(State(api): State<Api>, headers: HeaderMap) -> Response {
     let Some(sign_in) = api.auth.sign_in() else {
         return StatusCode::NOT_FOUND.into_response();
@@ -430,7 +485,15 @@ async fn sign_out(State(api): State<Api>, headers: HeaderMap) -> Response {
             pages::cross_site(&frame(&api, &sign_in)),
         );
     }
-    with_cookies(see_other("/ui/sign-in?signed_out"), Session::removed())
+    let to = oauth2::end_session(&api, &sign_in, &headers).await;
+    let mut cookies = Session::removed();
+    if sign_in.auth == ApiAuth::Oauth2 {
+        cookies.push(oauth2::id_removed());
+    }
+    with_cookies(
+        see_other(to.as_deref().unwrap_or("/ui/sign-in?signed_out")),
+        cookies,
+    )
 }
 
 /// `GET /ui/session`: who the caller is, as the console's app reads it: name, role, how they
@@ -448,17 +511,7 @@ async fn session(
         Err(wait) => return too_many_json(wait),
     };
     match verified {
-        Ok(Verified { principal, session }) => body(
-            StatusCode::OK,
-            &json!({
-                "name": principal.name,
-                "role": principal.role,
-                "auth": sign_in.auth,
-                "expires": principal.expires.map(|e| e.to_rfc3339_opts(SecondsFormat::Secs, true)),
-                "signed_in": session.as_ref().and_then(|s| chrono::DateTime::from_timestamp(s.signed_in, 0)).map(|t| t.to_rfc3339_opts(SecondsFormat::Secs, true)),
-                "csrf": session.map(|s| s.csrf),
-            }),
-        ),
+        Ok(v) => body(StatusCode::OK, &session_json(&sign_in, v)),
         Err(Denied::Unauthenticated { why, .. }) => challenged(
             body(StatusCode::UNAUTHORIZED, &json!({ "error": why })),
             challenge(sign_in.auth),
@@ -473,12 +526,33 @@ async fn session(
     }
 }
 
+/// The caller as `GET /ui/session` describes them.
+pub(crate) fn session_json(sign_in: &SignIn, v: Verified) -> Value {
+    let at = |t: chrono::DateTime<Utc>| t.to_rfc3339_opts(SecondsFormat::Secs, true);
+    json!({
+        "name": v.principal.name,
+        "role": v.principal.role,
+        "auth": sign_in.auth,
+        "expires": v.principal.expires.map(at),
+        "signed_in": v
+            .session
+            .as_ref()
+            .and_then(|s| chrono::DateTime::from_timestamp(s.signed_in, 0))
+            .map(at),
+        "csrf": v.session.map(|s| s.csrf),
+    })
+}
+
 /// The pages' stylesheet and scripts, built into the binary.
 async fn asset(Path(file): Path<String>) -> Response {
     let (text, kind) = match file.as_str() {
         "console.css" => (
             include_str!("../assets/console.css"),
             "text/css; charset=utf-8",
+        ),
+        "sign-in.js" => (
+            include_str!("../assets/sign-in.js"),
+            "text/javascript; charset=utf-8",
         ),
         _ => return StatusCode::NOT_FOUND.into_response(),
     };

@@ -116,14 +116,7 @@ pub(crate) fn basic_api(password: &str) -> data_avalanche_config::Api {
 /// The `Cookie` header that carries `session`, sealed with [`SESSION_KEY`].
 pub(crate) fn session_cookie(session: &crate::session::Session) -> String {
     let sealer = crate::session::Sealer::new(SESSION_KEY);
-    session
-        .cookies(&sealer, 3600)
-        .unwrap()
-        .iter()
-        .filter(|c| !c.contains("Max-Age=0"))
-        .map(|c| c.split(';').next().unwrap().to_owned())
-        .collect::<Vec<_>>()
-        .join("; ")
+    crate::session::as_sent(&session.cookies(&sealer, 3600).unwrap())
 }
 
 /// A basic session of user `ops`, who gave `password`, signed in `ago` before now.
@@ -405,7 +398,9 @@ pub(crate) async fn lone_with(file: PathBuf, text: &str, env: Arc<dyn Env + Send
 }
 
 /// An identity provider: ES256 keys made at run time, its JWKS at `/jwks` and its OIDC discovery
-/// document at `/.well-known/openid-configuration`, on a loopback port.
+/// document at `/.well-known/openid-configuration`, on a loopback port. It signs the console's
+/// client in too: `/authorize` approves at once, `/token` exchanges a code for its PKCE verifier
+/// and refreshes, `/end-session` signs out.
 pub(crate) struct Issuer {
     pub url: String,
     keys: Arc<Mutex<Vec<(String, KeyPair)>>>,
@@ -413,6 +408,33 @@ pub(crate) struct Issuer {
     pub fetches: Arc<AtomicUsize>,
     down: Arc<AtomicBool>,
     hanging: Arc<AtomicBool>,
+    pub sign_ins: Arc<SignIns>,
+}
+
+/// A token request's form, and its `Authorization`.
+pub(crate) type TokenRequest = (BTreeMap<String, String>, Option<String>);
+
+/// What the provider did for the console's client.
+#[derive(Default)]
+pub(crate) struct SignIns {
+    /// The roles of the tokens it issues.
+    pub roles: Mutex<Value>,
+    /// The authorization requests' queries, as asked.
+    pub asked: Mutex<Vec<BTreeMap<String, String>>>,
+    /// Each code issued, with its PKCE challenge and redirect URI.
+    codes: Mutex<BTreeMap<String, (String, String)>>,
+    /// The token requests' forms, and their `Authorization`.
+    pub token_requests: Mutex<Vec<TokenRequest>>,
+    /// Refreshes asked for.
+    pub refreshes: AtomicUsize,
+    /// Refuses every refresh, as a provider that revoked the sign-in.
+    pub refusing: AtomicBool,
+    /// Fields that replace or add to the discovery document's, when an object.
+    pub discovery: Mutex<Value>,
+    /// A refresh token whose refresh waits for [`Self::release`].
+    pub held: Mutex<Option<String>>,
+    /// Lets the held refresh go on.
+    pub release: tokio::sync::Notify,
 }
 
 #[derive(Clone)]
@@ -422,6 +444,7 @@ struct Served {
     fetches: Arc<AtomicUsize>,
     down: Arc<AtomicBool>,
     hanging: Arc<AtomicBool>,
+    sign_ins: Arc<SignIns>,
 }
 
 fn jwk(kid: &str, key: &KeyPair) -> Value {
@@ -450,7 +473,125 @@ async fn jwks(State(s): State<Served>) -> Result<Json<Value>, axum::http::Status
 }
 
 async fn discovery(State(s): State<Served>) -> Json<Value> {
-    Json(json!({ "issuer": s.url, "jwks_uri": format!("{}/jwks", s.url) }))
+    let mut doc = json!({
+        "issuer": s.url,
+        "jwks_uri": format!("{}/jwks", s.url),
+        "authorization_endpoint": format!("{}/authorize", s.url),
+        "token_endpoint": format!("{}/token", s.url),
+        "end_session_endpoint": format!("{}/end-session", s.url),
+    });
+    if let Some(changes) = s.sign_ins.discovery.lock().unwrap().as_object() {
+        for (k, v) in changes {
+            doc[k] = v.clone();
+        }
+    }
+    Json(doc)
+}
+
+/// Approves at once: back to the client's redirect URI with a code and the state.
+async fn authorize(
+    State(s): State<Served>,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let q: BTreeMap<String, String> =
+        url::form_urlencoded::parse(raw.unwrap_or_default().as_bytes())
+            .into_owned()
+            .collect();
+    s.sign_ins.asked.lock().unwrap().push(q.clone());
+    let code = format!("code-{}", s.sign_ins.asked.lock().unwrap().len());
+    let redirect = q.get("redirect_uri").cloned().unwrap_or_default();
+    s.sign_ins.codes.lock().unwrap().insert(
+        code.clone(),
+        (
+            q.get("code_challenge").cloned().unwrap_or_default(),
+            redirect.clone(),
+        ),
+    );
+    let state =
+        url::form_urlencoded::byte_serialize(q.get("state").map_or("", String::as_str).as_bytes())
+            .collect::<String>();
+    (
+        StatusCode::SEE_OTHER,
+        [(
+            axum::http::header::LOCATION,
+            format!("{redirect}?code={code}&state={state}"),
+        )],
+    )
+        .into_response()
+}
+
+/// Exchanges a code whose PKCE verifier matches, or refreshes, for tokens with the provider's
+/// roles.
+async fn token(
+    State(s): State<Served>,
+    headers: HeaderMap,
+    form: Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let form: BTreeMap<String, String> = url::form_urlencoded::parse(&form).into_owned().collect();
+    let authorization = headers
+        .get("authorization")
+        .map(|v| v.to_str().unwrap().to_owned());
+    s.sign_ins
+        .token_requests
+        .lock()
+        .unwrap()
+        .push((form.clone(), authorization));
+    let refused = |why: &str| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid_grant", "error_description": why })),
+        )
+            .into_response()
+    };
+    let n = match form.get("grant_type").map(String::as_str) {
+        Some("authorization_code") => {
+            let code = form.get("code").cloned().unwrap_or_default();
+            let Some((challenge, redirect)) = s.sign_ins.codes.lock().unwrap().remove(&code) else {
+                return refused("no such code");
+            };
+            let verifier = form.get("code_verifier").cloned().unwrap_or_default();
+            if crate::oauth2::challenge(&verifier) != challenge
+                || form.get("redirect_uri") != Some(&redirect)
+            {
+                return refused("the verifier or the redirect URI doesn't match");
+            }
+            0
+        }
+        Some("refresh_token") => {
+            let held = s.sign_ins.held.lock().unwrap().clone();
+            if held.is_some() && held.as_ref() == form.get("refresh_token") {
+                s.sign_ins.release.notified().await;
+            }
+            if s.sign_ins.refusing.load(Ordering::SeqCst) {
+                return refused("the refresh token was revoked");
+            }
+            s.sign_ins.refreshes.fetch_add(1, Ordering::SeqCst) + 1
+        }
+        _ => return refused("unsupported grant"),
+    };
+    let now = jsonwebtoken::get_current_timestamp();
+    let claims = json!({
+        "iss": s.url, "aud": "cdc", "sub": "alice", "preferred_username": "alice.smith",
+        "exp": now + 600, "roles": s.sign_ins.roles.lock().unwrap().clone(),
+    });
+    let keys = s.keys.lock().unwrap();
+    let (kid, key) = &keys[0];
+    let access = sign_with(key, Some(kid), &claims);
+    let id = sign_with(
+        key,
+        Some(kid),
+        &json!({ "iss": s.url, "aud": "cdc-console", "sub": "alice", "exp": now + 600 }),
+    );
+    Json(json!({
+        "access_token": access,
+        "token_type": "Bearer",
+        "expires_in": 600,
+        "refresh_token": format!("refresh-{n}"),
+        "id_token": id,
+    }))
+    .into_response()
 }
 
 impl Issuer {
@@ -462,16 +603,24 @@ impl Issuer {
         let fetches = Arc::new(AtomicUsize::new(0));
         let down = Arc::new(AtomicBool::new(false));
         let hanging = Arc::new(AtomicBool::new(false));
+        let sign_ins = Arc::new(SignIns {
+            roles: Mutex::new(json!(["operator"])),
+            ..SignIns::default()
+        });
         let served = Served {
             down: Arc::clone(&down),
             hanging: Arc::clone(&hanging),
             url: url.clone(),
             keys: Arc::clone(&keys),
             fetches: Arc::clone(&fetches),
+            sign_ins: Arc::clone(&sign_ins),
         };
         let app = axum::Router::new()
             .route("/jwks", get_route(jwks))
             .route("/.well-known/openid-configuration", get_route(discovery))
+            .route("/authorize", get_route(authorize))
+            .route("/token", axum::routing::post(token))
+            .route("/end-session", get_route(|| async { "signed out" }))
             .with_state(served);
         tokio::spawn(async move { axum::serve(listener, app).await });
         let issuer = Self {
@@ -480,6 +629,7 @@ impl Issuer {
             fetches,
             down,
             hanging,
+            sign_ins,
         };
         issuer.add_key("k1");
         issuer

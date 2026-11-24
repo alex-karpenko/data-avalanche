@@ -22,7 +22,9 @@ use axum::http::{HeaderMap, HeaderValue};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use chrono::{DateTime, SecondsFormat, Utc};
-use data_avalanche_config::{Api as ApiConfig, ApiAuth, Console, Credentials, Role, Secret};
+use data_avalanche_config::{
+    Api as ApiConfig, ApiAuth, ApiOauth2, Console, Credentials, Role, Secret,
+};
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{AlgorithmFamily, DecodingKey, Validation, decode, decode_header};
 use serde_json::Value;
@@ -30,6 +32,7 @@ use subtle::ConstantTimeEq;
 use tokio::sync::watch;
 
 use crate::console::Attempts;
+use crate::oauth2::Provider;
 use crate::session::{By, Sealer, Session, Unsealed, session_cookies};
 
 /// A JWKS fetch, or a discovery, takes at most this long.
@@ -160,6 +163,8 @@ struct Settings {
     sessions: Option<(Secret, Duration)>,
     /// `globals.console.enabled`.
     console: bool,
+    /// `globals.console.public_url`.
+    public_url: Option<String>,
 }
 
 impl Settings {
@@ -177,6 +182,7 @@ impl Settings {
             username_claim: console.username_claim.clone(),
             sessions,
             console: console.enabled,
+            public_url: console.public_url.clone(),
         }
     }
 }
@@ -228,6 +234,8 @@ pub(crate) struct SignIn {
     pub auth: ApiAuth,
     pub sessions: Option<Arc<Sessions>>,
     pub credentials: Option<Credentials>,
+    pub oauth2: Option<ApiOauth2>,
+    pub public_url: Option<String>,
 }
 
 /// The node's authentication, swapped by a reload.
@@ -237,6 +245,8 @@ pub struct Auth {
     timing: Timing,
     /// The failed basic sign-ins of each address (Admin_Console §9).
     pub(crate) attempts: Attempts,
+    /// The `oauth2` provider's client, for the console's sign-in.
+    pub(crate) provider: Provider,
 }
 
 impl Auth {
@@ -280,6 +290,7 @@ impl Auth {
             }),
             timing,
             attempts: Attempts::default(),
+            provider: Provider::default(),
         }
     }
 
@@ -309,7 +320,25 @@ impl Auth {
             auth: s.auth,
             sessions: current.sessions.clone(),
             credentials: s.credentials.clone(),
+            oauth2: s.oauth2.clone(),
+            public_url: s.public_url.clone(),
         })
+    }
+
+    /// The caller `token` names, verified as a bearer token is (`jwt`, `oauth2`): what the
+    /// console's sign-in checks of the provider's token before it starts a session.
+    pub(crate) async fn verify_token(&self, token: &str) -> Result<Principal, Denied> {
+        let mode = Arc::clone(
+            &self
+                .current
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .mode,
+        );
+        match &*mode {
+            Mode::Token(verifier) => verifier.verify_token(token).await,
+            _ => Err(Denied::Unavailable(MISCONFIGURED.into())),
+        }
     }
 
     /// Whether `/v1` limits failed `Authorization: Basic` credentials: while `auth` is `basic`.
@@ -566,6 +595,11 @@ fn same(given: &str, expected: &str) -> subtle::Choice {
     blake3::hash(given.as_bytes())
         .as_bytes()
         .ct_eq(blake3::hash(expected.as_bytes()).as_bytes())
+}
+
+/// Whether `given` is `expected`, compared in constant time.
+pub(crate) fn same_secret(given: &str, expected: &str) -> bool {
+    bool::from(same(given, expected))
 }
 
 /// Whether `user` and `password` are the configured ones, both compared in full whichever

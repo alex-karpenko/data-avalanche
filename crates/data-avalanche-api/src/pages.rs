@@ -32,6 +32,11 @@ pub(crate) fn escape(s: &str) -> String {
 /// A whole page: `title` in the browser's tab, `card` (HTML) in the middle, `script` loaded
 /// after it when set.
 fn page(frame: &Frame, title: &str, card: &str, script: Option<&str>) -> String {
+    page_with(frame, title, card, "", script)
+}
+
+/// [`page`], with `head` (HTML) in its head.
+fn page_with(frame: &Frame, title: &str, card: &str, head: &str, script: Option<&str>) -> String {
     let banner = if frame.open {
         r#"<div class="warnband" role="alert">⚠ This cluster has no authentication: anyone who can reach it is an admin. Set <code>globals.api.auth</code>.</div>"#
     } else {
@@ -48,7 +53,7 @@ fn page(frame: &Frame, title: &str, card: &str, script: Option<&str>) -> String 
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title} · data-avalanche</title>
 <link rel="stylesheet" href="/ui/assets/console.css">
-</head>
+{head}</head>
 <body>
 {banner}<main><div class="card">
 <div class="brand">data-avalanche<small>console</small></div>
@@ -97,6 +102,63 @@ pub(crate) fn basic_sign_in(
     }
     card.push_str("<button class=\"btn\" type=\"submit\">Sign in</button>\n</form>");
     page(frame, "Sign in", &card, None)
+}
+
+/// The `oauth2` sign-in: a button to the provider, named by `provider`; with `countdown`, the
+/// page goes there by itself after that many seconds unless the person stays (its script).
+/// `error` and `info` are shown above the button.
+pub(crate) fn oauth2_sign_in(
+    frame: &Frame,
+    next: &str,
+    provider: &str,
+    countdown: Option<u64>,
+    error: Option<&str>,
+    info: Option<&str>,
+) -> String {
+    let next_q = escape(&encode(next));
+    let mut card = String::from(r#"<div class="muted">Sign in to the cluster</div>"#);
+    if let Some(e) = error {
+        let _ = write!(
+            card,
+            r#"<div class="msg err" role="alert">{}</div>"#,
+            escape(e)
+        );
+    }
+    if let Some(i) = info {
+        let _ = write!(card, r#"<div class="msg info">{}</div>"#, escape(i));
+    }
+    let _ = write!(
+        card,
+        r#"
+<a class="btn" id="continue" href="/ui/oauth2/start?next={next_q}">Continue with {provider}</a>"#,
+        provider = escape(provider),
+    );
+    if let Some(seconds) = countdown {
+        let _ = write!(
+            card,
+            r#"
+<div id="countdown" data-seconds="{seconds}"><p class="muted">Going to {provider} in <span id="left">{seconds}</span> s · <a id="stay" href="/ui/sign-in?next={next_q}&amp;stay">stay here</a></p><div class="count"><i id="bar"></i></div></div>"#,
+            provider = escape(provider),
+        );
+    }
+    page(frame, "Sign in", &card, Some("/ui/assets/sign-in.js"))
+}
+
+/// The OAuth2 callback's answer: the session's cookies are set, and the page goes on to `next`
+/// from here, the console's own page, so the browser sends them (a `SameSite=Strict` cookie
+/// isn't sent on a redirect the provider began).
+pub(crate) fn signing_in(frame: &Frame, next: &str) -> String {
+    let card = format!(
+        r#"<div class="title">Signed in</div>
+<p><a href="{next}">Go on to <code>{next}</code></a>.</p>"#,
+        next = escape(next),
+    );
+    let head = format!(
+        r#"<meta http-equiv="refresh" content="0;url={}">
+"#,
+        escape(next)
+    );
+    page_with(frame, "Signing in", &card, &head, None)
 }
 
 /// 401 with a session (`basic`, `oauth2`): it ended, why, and a way back to `next`.

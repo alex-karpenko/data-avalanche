@@ -254,6 +254,16 @@ impl Session {
     }
 }
 
+/// The `Cookie` header a browser sends back after these `Set-Cookie` values: the ones they
+/// keep, each `name=value`.
+pub(crate) fn as_sent(set: &[String]) -> String {
+    set.iter()
+        .filter(|c| !c.contains("Max-Age=0"))
+        .filter_map(|c| c.split(';').next())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// The session's cookies, joined in order: `None` without its first.
 pub(crate) fn sealed_value(headers: &HeaderMap) -> Option<String> {
     let mut sealed = String::new();
