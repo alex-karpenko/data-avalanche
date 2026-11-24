@@ -1082,7 +1082,7 @@ pub const RULES: &[RuleMeta] = &[
         L::Config,
         Config,
         r#"globals.console.public_url"#,
-        r#"An absolute http/https URL without query or fragment."#,
+        r#"An absolute `http`/`https` URL without a path (a trailing `/` aside), query or fragment."#,
     ),
     rule(
         "V-130",
