@@ -336,7 +336,7 @@ pub const FIELD_DOCS: &[FieldDoc] = &[
     f(
         "globals.console.session_ttl",
         Value("8h"),
-        "How long a session lasts without activity, from 5 minutes to 7 days (V-132).",
+        "How long a session lasts after sign-in, however it is used, from 5 minutes to 7 days (V-132). With `oauth2`, never past the token's expiry unless the provider refreshes it.",
     ),
     f(
         "globals.console.username_claim",
