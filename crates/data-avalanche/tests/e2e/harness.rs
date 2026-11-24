@@ -1042,11 +1042,22 @@ impl Proc {
     /// answer's body is the stream's bytes as sent. `None` when nothing answers or the answer
     /// isn't `200`.
     pub async fn stream(&self, path: &str) -> Option<Sse> {
-        let auth = self
-            .token
+        let auth = self.token.as_deref().map(|t| format!("Bearer {t}"));
+        let headers: Vec<(&str, &str)> = auth
             .as_deref()
-            .map_or(String::new(), |t| format!("Authorization: Bearer {t}\r\n"));
-        let request = format!("GET {path} HTTP/1.0\r\nHost: t\r\n{auth}\r\n");
+            .map(|a| ("Authorization", a))
+            .into_iter()
+            .collect();
+        self.stream_with(path, &headers).await
+    }
+
+    /// [`Self::stream`], with `headers` (a session's cookie) instead of the token.
+    pub async fn stream_with(&self, path: &str, headers: &[(&str, &str)]) -> Option<Sse> {
+        let headers: String = headers
+            .iter()
+            .map(|(k, v)| format!("{k}: {v}\r\n"))
+            .collect();
+        let request = format!("GET {path} HTTP/1.0\r\nHost: t\r\n{headers}\r\n");
         let tcp = tokio::net::TcpStream::connect(("127.0.0.1", self.port))
             .await
             .ok()?;
@@ -1082,6 +1093,11 @@ impl Proc {
         })
     }
 
+    /// The API's port.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
     pub fn log(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
@@ -1106,9 +1122,29 @@ impl Proc {
         path: &str,
         body: &str,
     ) -> Option<(u16, String, String)> {
-        let auth = token.map_or(String::new(), |t| format!("Authorization: Bearer {t}\r\n"));
+        let auth = token.map(|t| format!("Bearer {t}"));
+        let mut headers = vec![("Content-Type", "application/yaml")];
+        if let Some(a) = &auth {
+            headers.push(("Authorization", a));
+        }
+        self.exchange(method, path, &headers, body).await
+    }
+
+    /// A request with `headers` and `body`: the status code, the head and the body. `None` when
+    /// nothing answers.
+    pub async fn exchange(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> Option<(u16, String, String)> {
+        let headers: String = headers
+            .iter()
+            .map(|(k, v)| format!("{k}: {v}\r\n"))
+            .collect();
         let request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: t\r\n{auth}Content-Type: application/yaml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "{method} {path} HTTP/1.1\r\nHost: t\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         let tcp = tokio::net::TcpStream::connect(("127.0.0.1", self.port))
@@ -1127,6 +1163,19 @@ impl Proc {
             head.to_owned(),
             body.to_owned(),
         ))
+    }
+
+    /// [`Self::exchange`], panicking with the method and the path when nothing answers.
+    pub async fn exchange_ok(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> (u16, String, String) {
+        self.exchange(method, path, headers, body)
+            .await
+            .unwrap_or_else(|| panic!("{method} {path} answers"))
     }
 
     /// [`Self::call`] and the other requests carry `token` as their bearer from now on.
