@@ -77,7 +77,7 @@ pub use publish::{FIGURES_EVERY, STATE_EVERY, publish};
 pub use server::{Bound, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT, MAX_CONNECTIONS, ServeError, bind};
 pub use session::{COOKIE_CHUNK, KEPT_AFTER, MAX_CHUNKS, SESSION_COOKIE};
 pub use snapshots::{EndedJobs, READ_AT_ONCE};
-pub use stream::{FOLLOW_BACKOFF, KEEP_ALIVE, KINDS};
+pub use stream::{CREDENTIALS_EVERY, FOLLOW_BACKOFF, KEEP_ALIVE, KINDS};
 pub use tables::{FACTS_FOR, FACTS_WITHIN, Lake};
 
 use crate::auth::Denied;
