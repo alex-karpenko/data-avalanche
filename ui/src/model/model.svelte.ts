@@ -26,6 +26,11 @@ export const EVENTS_READ = 100;
 export const LAG_SPAN_S = 3600;
 /** A burst of events reads their parts again once, after this. */
 export const REREAD_AFTER_MS = 1_000;
+/**
+ * A pipeline's page reads the cluster again this often: a lease's renewals send no event, and
+ * its end (`expires_at`) is only what the last read saw.
+ */
+export const CLUSTER_REREAD_MS = 5_000;
 
 export type Part =
   | 'pipelines'

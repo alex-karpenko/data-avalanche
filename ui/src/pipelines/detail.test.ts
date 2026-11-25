@@ -14,6 +14,18 @@ describe("a pipeline's page", () => {
     });
   });
 
+  it('says a lease expired when its end has passed, not that it expires in 0 s', () => {
+    const where = (now: number) => header(detail(), undefined, liveFigures(), lease(), now)!.where;
+    expect(where(NOW + 8_000)).toBe('on n2 · away from owner n1 · lease epoch 2, expired 0 s ago');
+    expect(where(NOW + 23_000)).toBe('on n2 · away from owner n1 · lease epoch 2, expired 15 s ago');
+    expect(where(NOW + 7_000)).toContain('expires in 1 s');
+  });
+
+  it('says a released lease is released, with no epoch to count down', () => {
+    const d = detail({ holder: { ...detail().holder!, released: true } });
+    expect(header(d, undefined, null, undefined, NOW)!.where).toBe('lease released');
+  });
+
   it("heads with its list row's alone until its own read, and says when no node holds it", () => {
     const item = { ...facts().pipelines[3], holder: null };
     expect(header(null, item, null, undefined, NOW)).toEqual({

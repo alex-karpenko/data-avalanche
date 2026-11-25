@@ -86,6 +86,26 @@ function button(t: HTMLElement, text: string): HTMLButtonElement {
 }
 
 describe("a pipeline's page", () => {
+  it("reads the cluster's leases again every 5 s while shown, and stops when it goes", async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      const asked: string[] = [];
+      const api: Client = { ...client(), get: async <T,>(path: string) => (asked.push(path), {} as T) };
+      await render({ api });
+      expect(asked).toEqual([]);
+      vi.advanceTimersByTime(5_000);
+      expect(asked).toEqual(['/v1/cluster/status']);
+      vi.advanceTimersByTime(10_000);
+      expect(asked).toHaveLength(3);
+      unmount(mounted!);
+      mounted = undefined;
+      vi.advanceTimersByTime(10_000);
+      expect(asked).toHaveLength(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('shows its header, tables, source, snapshot and activity', async () => {
     const t = await render();
     expect(t.querySelector('h2')?.textContent).toContain('orders-pg');

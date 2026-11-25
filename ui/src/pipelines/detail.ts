@@ -47,6 +47,8 @@ export function header(
       : actual === 'error'
         ? { label: 'error', tone: 'red' }
         : { label: actual ?? 'unknown', tone: actual === 'running' ? 'green' : 'grey' };
+  // A released lease has no holder to count down for (the cluster's status leaves it out).
+  if (fig === null && d?.holder?.released === true) return { state, route: route(p, true), where: 'lease released' };
   const node = fig?.node ?? d?.holder?.node ?? item?.holder ?? null;
   const parts = [node === null ? 'no node holds its lease' : `on ${node}`];
   if (node !== null && lease?.ring_owner != null && lease.ring_owner !== node) {
@@ -55,7 +57,8 @@ export function header(
   const epoch = fig?.owner_epoch ?? d?.holder?.owner_epoch ?? lease?.owner_epoch;
   if (node !== null && epoch !== undefined && epoch !== null) {
     const ends = at(lease?.expires_at);
-    parts.push(`lease epoch ${epoch}${ends === null ? '' : `, expires in ${duration((ends - now) / 1000)}`}`);
+    const left = ends === null ? '' : ends > now ? `, expires in ${duration((ends - now) / 1000)}` : `, expired ${duration((now - ends) / 1000)} ago`;
+    parts.push(`lease epoch ${epoch}${left}`);
   }
   return { state, route: route(p, true), where: parts.join(' · ') };
 }

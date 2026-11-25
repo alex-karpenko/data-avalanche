@@ -3,6 +3,7 @@
   // lease; its actions; the lag over 6 hours with its events; its tables; its source; its
   // snapshot; its activity. Hovering an event on the chart highlights it in the activity, and the
   // reverse.
+  import { onMount } from 'svelte';
   import type { Client } from '../lib/api';
   import { ACTIONS, ask, mayAct, noteBody, recordedAs, VERBS, type Target, type Verb } from '../lib/actions';
   import Chart from '../lib/Chart.svelte';
@@ -10,7 +11,7 @@
   import { ago, clock, duration } from '../lib/format';
   import type { Session } from '../lib/session';
   import { at } from '../model/facts';
-  import type { Model } from '../model/model.svelte';
+  import { CLUSTER_REREAD_MS, type Model } from '../model/model.svelte';
   import { LAG_TARGET_S } from '../overview/attention';
   import { activity, header, marks, snapshotPanel, sourceLines, tableLines } from './detail';
   import { SPAN_S } from './lag.svelte';
@@ -49,6 +50,11 @@
   );
   const asOf = $derived(last ?? 0);
   const readAt = $derived(at(page.figures?.source?.read_at));
+
+  onMount(() => {
+    const timer = setInterval(() => void model.load(['cluster']), CLUSTER_REREAD_MS);
+    return () => clearInterval(timer);
+  });
 
   let hovered = $state<string | null>(null);
   let acting = $state<Verb | null>(null);
