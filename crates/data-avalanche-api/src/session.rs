@@ -15,7 +15,8 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 
-/// The session cookie; one too long for a cookie goes on in `__Host-da_session.1`, `__Host-da_session.2`, ….
+/// The session cookie; one too long for a cookie goes on in `__Host-da_session.1`,
+/// `__Host-da_session.2`, ….
 pub const SESSION_COOKIE: &str = "__Host-da_session";
 /// A cookie's value is at most this long: browsers keep a cookie of 4096 bytes, its name and
 /// attributes included.

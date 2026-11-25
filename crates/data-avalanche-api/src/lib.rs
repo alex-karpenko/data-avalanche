@@ -164,7 +164,8 @@ pub struct Route {
     pub summary: &'static str,
     /// The request body's content type, when it takes one.
     pub body: Option<&'static str>,
-    /// Its own answers; 401, 403, 429 (`basic`: an address that failed too often) and 503 are every route's.
+    /// Its own answers; 401, 403, 429 (`basic`: an address that failed too often) and 503 are
+    /// every route's.
     pub answers: &'static [(u16, &'static str)],
     /// What it records, when it changes something (Admin_Console §5).
     pub records: Option<Recorded>,

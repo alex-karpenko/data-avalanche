@@ -94,9 +94,9 @@ impl Drop for Idp {
 /// An OpenID provider for the console's `oauth2` sign-in, on a loopback port: its discovery
 /// document, its JWKS, a token endpoint that exchanges a code it issued once, only with the PKCE
 /// verifier of the code's challenge and the redirect URI of its request (`invalid_grant`
-/// otherwise), and refreshes, and an end-session endpoint. Its authorization step approves at once, in the test's own process
-/// ([`Provider::approve`]). Its tokens name `alice` (`preferred_username` `alice.smith`) with
-/// `roles`.
+/// otherwise), and refreshes, and an end-session endpoint. Its authorization step approves at
+/// once, in the test's own process ([`Provider::approve`]). Its tokens name `alice`
+/// (`preferred_username` `alice.smith`) with `roles`.
 pub struct Provider {
     pub issuer: String,
     served: JoinHandle<()>,

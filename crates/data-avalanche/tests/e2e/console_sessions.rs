@@ -269,5 +269,12 @@ async fn an_oauth2_session_started_through_the_provider_is_every_node_s() {
         ))
     );
     assert!(query_value(to, "id_token_hint").is_some(), "{to}");
+    let set = headers_of(&head, "set-cookie");
+    assert!(
+        set.iter().any(|c| c.starts_with("da_id=;")
+            && c.contains("Path=/ui/sign-out")
+            && c.contains("Max-Age=0")),
+        "the ID token's cookie removed: {set:?}"
+    );
     c.stop().await;
 }
