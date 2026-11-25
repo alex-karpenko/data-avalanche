@@ -27,7 +27,10 @@ const BODY_TOO_LARGE: &str = "the body is over 1 MiB";
 /// Every route's answers besides its own.
 const COMMON: [(u16, &str); 4] = [
     (401, "no credentials, or ones that don't verify"),
-    (403, "the caller's role is below the route's"),
+    (
+        403,
+        "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
+    ),
     (
         429,
         "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",

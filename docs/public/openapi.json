@@ -33,7 +33,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -110,7 +110,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -180,7 +180,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -260,7 +260,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -360,7 +360,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -429,7 +429,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -499,7 +499,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -570,7 +570,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -640,7 +640,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -698,7 +698,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -848,7 +848,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -972,7 +972,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -1041,7 +1041,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -1141,7 +1141,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -1246,7 +1246,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -1339,7 +1339,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -1439,7 +1439,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -1551,7 +1551,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -1645,7 +1645,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -1697,7 +1697,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -1760,7 +1760,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -1842,7 +1842,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -1929,7 +1929,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -2035,7 +2035,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -2129,7 +2129,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -2229,7 +2229,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -2310,7 +2310,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -2384,7 +2384,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -2484,7 +2484,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -2580,7 +2580,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -2673,7 +2673,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -2742,7 +2742,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -2824,7 +2824,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -2918,7 +2918,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -3020,7 +3020,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -3084,7 +3084,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }

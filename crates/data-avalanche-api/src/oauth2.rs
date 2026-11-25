@@ -892,7 +892,9 @@ pub(crate) async fn refresh(
             crate::auth::span(c.sessions.ttl)
         ));
     }
-    if !same_origin(&headers) || !crate::unforged(&Method::POST, &headers, &session.csrf) {
+    if !same_origin(&headers, sign_in.public_url.as_deref())
+        || !crate::unforged(&Method::POST, &headers, &session.csrf)
+    {
         return body(StatusCode::FORBIDDEN, &json!({ "error": crate::FORGED }));
     }
     if !matches!(

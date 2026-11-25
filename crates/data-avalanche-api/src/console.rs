@@ -384,9 +384,10 @@ async fn sign_in_page(
 }
 
 /// Whether a form posted to `/ui/` came from the console's own pages, as the browser says
-/// (`Sec-Fetch-Site`, else `Origin` against `Host`); a client that says neither (`curl`) is
-/// taken at its word.
-pub(crate) fn same_origin(headers: &HeaderMap) -> bool {
+/// (`Sec-Fetch-Site`, else `Origin` against `Host`, or against `public_url`'s origin when it is
+/// set: behind a proxy that rewrites `Host`); a client that says neither (`curl`) is taken at
+/// its word.
+pub(crate) fn same_origin(headers: &HeaderMap, public_url: Option<&str>) -> bool {
     if let Some(site) = headers.get("sec-fetch-site") {
         return site == "same-origin" || site == "none";
     }
@@ -395,6 +396,11 @@ pub(crate) fn same_origin(headers: &HeaderMap) -> bool {
     };
     let host = headers.get(header::HOST).and_then(|h| h.to_str().ok());
     let origin = origin.to_str().ok().and_then(|o| url::Url::parse(o).ok());
+    if let (Some(o), Some(public)) = (&origin, public_url.and_then(oauth2::origin))
+        && o.origin().ascii_serialization() == public
+    {
+        return true;
+    }
     match (origin, host) {
         (Some(o), Some(host)) => {
             let authority = match o.port() {
@@ -432,7 +438,7 @@ async fn sign_in(
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if !same_origin(&headers) {
+    if !same_origin(&headers, sign_in.public_url.as_deref()) {
         return html(StatusCode::FORBIDDEN, pages::cross_site(&frame));
     }
     let form: BTreeMap<String, String> = url::form_urlencoded::parse(&form).into_owned().collect();
@@ -508,7 +514,7 @@ async fn sign_out(State(api): State<Api>, headers: HeaderMap) -> Response {
     let Some(sign_in) = api.auth.sign_in() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if !same_origin(&headers) {
+    if !same_origin(&headers, sign_in.public_url.as_deref()) {
         return html(
             StatusCode::FORBIDDEN,
             pages::cross_site(&frame(&api, &sign_in)),
@@ -1109,6 +1115,35 @@ mod tests {
         );
         let (_, _, page) = request(addr, "GET", "/ui/sign-in?signed_out", &[], "").await;
         assert!(page.contains("You signed out."), "{page}");
+    }
+
+    /// A browser that sends no `Sec-Fetch-Site`, behind a proxy that rewrites `Host`: its
+    /// `Origin` is the console's `public_url`'s, which is taken; another origin still isn't.
+    #[tokio::test]
+    async fn a_form_from_the_public_url_s_origin_is_taken_behind_a_proxy() {
+        let console = Console {
+            public_url: Some("https://console.example/".into()),
+            ..sessions(HOUR)
+        };
+        let addr = node(&basic_api("s3cret"), &console).await;
+        let form = "user=ops&password=s3cret";
+        // The request's `Host` is `t`, the proxy's rewrite.
+        let own = [("Origin", "https://console.example")];
+        let (code, _, page) = request(addr, "POST", "/ui/sign-in", &own, form).await;
+        assert_eq!(code, 303, "{page}");
+        for other in [
+            "https://evil.example",
+            "https://console.example:8443",
+            "http://console.example",
+        ] {
+            let from = [("Origin", other)];
+            let (code, _, _) = request(addr, "POST", "/ui/sign-in", &from, form).await;
+            assert_eq!(code, 403, "{other}");
+            let (code, _, _) = request(addr, "POST", "/ui/sign-out", &from, "").await;
+            assert_eq!(code, 403, "{other}");
+        }
+        let (code, _, _) = request(addr, "POST", "/ui/sign-out", &own, "").await;
+        assert_eq!(code, 303);
     }
 
     #[test]
