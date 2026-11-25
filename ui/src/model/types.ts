@@ -70,9 +70,23 @@ export interface Halt {
 export interface TableItem {
   pipeline: string;
   table: string;
+  /** `streaming`, `halted`, `snapshot` or `copied`. */
   state: string;
   halt: Halt | null;
+  snapshot: { rows_done: number; waiting: boolean } | null;
+  /** The stream's changes committed in the last minute. */
+  changes_per_minute: number;
   last_commit: string | null;
+  /** The Delta table's version after the last commit. */
+  version: number | null;
+  /** The last MERGE's files rewritten, of the table's `files`. */
+  files_rewritten: number | null;
+  files: number | null;
+  /** The sink's columns the source no longer has, kept and written NULL. */
+  soft_dropped: number;
+  /** What lake readers see: the source time of the newest change committed. */
+  fresh_as_of: string | null;
+  stale: boolean;
 }
 
 /** `GET /v1/tables`. */
@@ -90,6 +104,8 @@ export interface Job {
   status: 'queued' | 'running' | 'cancelling' | 'completed' | 'failed' | 'cancelled';
   rows_done: number;
   estimate: number | null;
+  /** Seconds left at the observed rate, `null` until there is one. */
+  eta_seconds: number | null;
   requested_at: string;
   finished_at: string | null;
   error: string | null;

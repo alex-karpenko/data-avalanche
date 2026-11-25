@@ -9,6 +9,8 @@
   import { awaitSession, checkSession, keepFresh, RETRY_MS, type Session } from './lib/session';
   import { Model } from './model/model.svelte';
   import Overview from './overview/Overview.svelte';
+  import { LagHistory } from './pipelines/lag.svelte';
+  import List from './pipelines/List.svelte';
 
   // The server says why the session ended: its 401 or 403 page, or the sign-in.
   const ended = () => location.reload();
@@ -26,6 +28,8 @@
     check: () => checkSession({ fetch, ended }),
   });
   const model = new Model(api);
+  /** Every pipeline's lag over 6 hours, read when the list is first shown. */
+  const lag = new LagHistory(api);
 
   async function readGeneration() {
     try {
@@ -43,6 +47,7 @@
         if ((e as { kind?: string }).kind === 'config.published') void readGeneration();
       }),
       model.follow(live),
+      lag.follow(live),
     ];
     const read = (s: Session) => {
       session = s;
@@ -77,6 +82,18 @@
   >
     {#if router.section === 'overview'}
       <Overview {model} {now} stale={live.stale(now)} last={live.last} />
+    {:else if router.section === 'pipelines' && router.rest.length === 0}
+      <List
+        {model}
+        {lag}
+        {session}
+        {api}
+        {router}
+        {now}
+        stale={live.stale(now)}
+        last={live.last}
+        offline={live.state === 'offline'}
+      />
     {:else}
       <Later section={router.section} />
     {/if}
