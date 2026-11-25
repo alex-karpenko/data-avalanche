@@ -79,14 +79,19 @@ behind the stream reads), its snapshot jobs, and what happened to it. Hovering a
 chart highlights it in the list below, and the reverse.
 
 Every part of the page says how old its data is. A part that couldn't be read keeps what it had and
-says so with its age (`jobs (HTTP 503), last read 20 min ago`, or `never read`), the source's
-panel says when it was read (`read 40 s ago`), and while the live connection is stale every panel
-is dimmed and the banner says for how long.
+says so with its age (`Couldn't be read; showing what was last read: its snapshot jobs (HTTP 503),
+last read 20 min ago`, or `…, never read`), on the list as on a pipeline's page, the source's panel
+says when it was read (`read 40 s ago`), and while the live connection is stale every panel is
+dimmed and the banner says for how long (`Not current: as of 14:02:00 · 34 s old`, or `Not current:
+no live update yet` before the first message). The lease line counts down to the lease's end
+(`expires in 8 s`) and says `expired 3 s ago` when the end has passed without a renewal, and `lease
+released` once its holder let go; a pipeline's page reads the cluster again every 5 s while it is
+shown.
 
 ### Acting on pipelines
 
-An `operator` or an `admin` sees the actions a pipeline's state takes: flush, pause, resume,
-restart, stop, and a snapshot of chosen tables (truncated first, or not). Each opens a dialog that
+An `operator` or an `admin` sees the actions a pipeline's state takes: flush (of a running pipeline:
+a paused one was flushed by its pause), pause, resume, restart, stop, and a snapshot of chosen tables (truncated first, or not). Each opens a dialog that
 says what it does and to what, takes an optional note (up to 500 characters), and shows the line
 it will be recorded as: `restarted by Oleksii (operator)`. The server checks the role again and
 records the action, with the note, in the cluster's events, whatever the page shows. A `viewer`

@@ -1,8 +1,9 @@
 //! The console's app in a browser (Admin_Console §10; M15, M16a): Playwright's flows (`ui/e2e`)
 //! against a node under each `globals.api.auth` mode, the console switched off, the pipelines'
-//! pages and their actions, and the page budgets (§8) with 50 pipelines on three nodes. Needs `DATA_AVALANCHE_BROWSER=1`, the
-//! app built into the binary (`npm ci && npm run build` in `ui/`, then the binary) and Playwright's
-//! Chromium (`npx playwright install chromium` in `ui/`); without the variable each skips itself.
+//! pages and their actions, and the page budgets (§8) with 50 pipelines on three nodes. Needs
+//! `DATA_AVALANCHE_BROWSER=1`, the app built into the binary (`npm ci && npm run build` in `ui/`,
+//! then the binary) and Playwright's Chromium (`npx playwright install chromium` in `ui/`);
+//! without the variable each skips itself.
 
 use std::path::PathBuf;
 use std::time::Duration;
