@@ -14,6 +14,7 @@
     attention,
     nodeHref,
   } from './attention';
+  import { staleNotice } from '../lib/notices';
   import { rows, tiles } from './derive';
   import { EVENTS_SHOWN, PARTS, type Model } from '../model/model.svelte';
   import Sparkline from './Sparkline.svelte';
@@ -34,15 +35,12 @@
   const failing = $derived(
     PARTS.filter((p) => model.read[p].error !== null).map((p) => `${p} (${model.read[p].error})`),
   );
-  const asOf = $derived(last ?? Math.max(0, ...PARTS.map((p) => model.read[p].at ?? 0)));
   const href = (kind: string, id: string) => `/ui/${kind}/${encodeURIComponent(id)}`;
 </script>
 
 <h2>Overview</h2>
 {#if stale}
-  <p class="notice stale-note" role="status">
-    Not current: as of {clock(asOf, true)} · {duration((now - asOf) / 1000)} old
-  </p>
+  <p class="notice stale-note" role="status">{staleNotice(last, now)}</p>
 {/if}
 {#if failing.length > 0}
   <p class="notice failing" role="alert">Couldn't be read, shown as last read: {failing.join('; ')}</p>

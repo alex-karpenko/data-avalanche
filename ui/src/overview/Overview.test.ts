@@ -8,10 +8,10 @@ import Overview from './Overview.svelte';
 
 let mounted: ReturnType<typeof mount> | undefined;
 
-function render(model: Model, stale = false): HTMLElement {
+function render(model: Model, stale = false, last: number | null = NOW - 34_000): HTMLElement {
   const target = document.createElement('div');
   document.body.replaceChildren(target);
-  mounted = mount(Overview, { target, props: { model, now: NOW, stale, last: NOW - 34_000 } });
+  mounted = mount(Overview, { target, props: { model, now: NOW, stale, last } });
   flushSync();
   return target;
 }
@@ -79,6 +79,10 @@ describe('the Overview', () => {
     expect(text(page.querySelector('.failing'))).toBe(
       "Couldn't be read, shown as last read: jobs (the request timed out)",
     );
+  });
+
+  it('says when no live update came at all', () => {
+    expect(text(render(model(), true, null).querySelector('.stale-note'))).toBe('Not current: no live update yet');
   });
 
   it("shows the page when a node doesn't answer the config read", () => {

@@ -11,6 +11,13 @@ import { LagHistory } from './lag.svelte';
 
 export type PagePart = 'detail' | 'live' | 'jobs' | 'events';
 export const PAGE_PARTS: PagePart[] = ['detail', 'live', 'jobs', 'events'];
+/** What people call each part, in the notice that says one couldn't be read. */
+export const PART_NAMES: Record<PagePart, string> = {
+  detail: 'the pipeline',
+  live: 'its figures',
+  jobs: 'its snapshot jobs',
+  events: 'its activity',
+};
 
 /** The parts an event about the pipeline changes. */
 function partsOf(kind: string): PagePart[] {

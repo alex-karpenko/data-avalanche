@@ -8,14 +8,15 @@
   import { ACTIONS, ask, mayAct, noteBody, recordedAs, VERBS, type Target, type Verb } from '../lib/actions';
   import Chart from '../lib/Chart.svelte';
   import Dialog from '../lib/Dialog.svelte';
-  import { ago, clock, duration } from '../lib/format';
+  import { ago } from '../lib/format';
+  import { failingNotice, failures, staleNotice } from '../lib/notices';
   import type { Session } from '../lib/session';
   import { at } from '../model/facts';
   import { CLUSTER_REREAD_MS, type Model } from '../model/model.svelte';
   import { LAG_TARGET_S } from '../overview/attention';
   import { activity, header, marks, snapshotPanel, sourceLines, tableLines } from './detail';
   import { SPAN_S } from './lag.svelte';
-  import { PAGE_PARTS, type PipelinePage } from './page.svelte';
+  import { PAGE_PARTS, PART_NAMES, type PipelinePage } from './page.svelte';
 
   interface Props {
     page: PipelinePage;
@@ -42,13 +43,7 @@
   const desired = $derived(page.detail?.desired_state ?? item?.desired_state ?? null);
   const can = $derived(mayAct(session.role) && desired !== null);
   const offered = $derived(desired === null ? [] : VERBS.filter((v) => ACTIONS[v].takes(desired)));
-  const failing = $derived(
-    PAGE_PARTS.filter((p) => page.read[p].error !== null).map((p) => {
-      const r = page.read[p];
-      return `${p} (${r.error}), ${r.at === null ? 'never read' : `last read ${ago(r.at, now)}`}`;
-    }),
-  );
-  const asOf = $derived(last ?? 0);
+  const failing = $derived(failingNotice(failures(PAGE_PARTS.map((p) => [PART_NAMES[p], page.read[p]]), now)));
   const readAt = $derived(at(page.figures?.source?.read_at));
 
   onMount(() => {
@@ -135,10 +130,10 @@
     </div>
   {/if}
   {#if stale}
-    <p class="notice" role="status">Not current: as of {clock(asOf, true)} · {duration((now - asOf) / 1000)} old</p>
+    <p class="notice" role="status">{staleNotice(last, now)}</p>
   {/if}
-  {#if failing.length > 0}
-    <p class="notice failing" role="alert">Couldn't be read, shown as last read: {failing.join('; ')}</p>
+  {#if failing !== null}
+    <p class="notice failing" role="alert">{failing}</p>
   {/if}
 
   <section class="panel" class:stale>

@@ -15,7 +15,8 @@
     type Verb,
   } from '../lib/actions';
   import Dialog from '../lib/Dialog.svelte';
-  import { ago, clock, duration } from '../lib/format';
+  import { ago } from '../lib/format';
+  import { failingNotice, failures, staleNotice } from '../lib/notices';
   import type { Router } from '../lib/router.svelte';
   import { formatValue } from '../lib/series';
   import type { Session } from '../lib/session';
@@ -156,7 +157,20 @@
     return outcomeText(o);
   }
 
-  const asOf = $derived(last ?? 0);
+  /** The parts the list shows, as people call them. */
+  const failing = $derived(
+    failingNotice(
+      failures(
+        [
+          ['the pipelines', model.read.pipelines],
+          ['the cluster', model.read.cluster],
+          ['the snapshot jobs', model.read.jobs],
+          ['the tables', model.read.tables],
+        ],
+        now,
+      ),
+    ),
+  );
   const headings: { column: Column | null; label: string }[] = [
     { column: 'pipeline', label: 'Pipeline' },
     { column: 'state', label: 'State' },
@@ -173,10 +187,10 @@
 
 <h2>Pipelines</h2>
 {#if stale}
-  <p class="notice" role="status">Not current: as of {clock(asOf, true)} · {duration((now - asOf) / 1000)} old</p>
+  <p class="notice" role="status">{staleNotice(last, now)}</p>
 {/if}
-{#if model.read.pipelines.error !== null}
-  <p class="notice failing" role="alert">Couldn't be read, shown as last read: {model.read.pipelines.error}</p>
+{#if failing !== null}
+  <p class="notice failing" role="alert">{failing}</p>
 {/if}
 {#if lag.error !== null}
   <p class="notice failing" role="alert">The lag lines couldn't be read: {lag.error}</p>

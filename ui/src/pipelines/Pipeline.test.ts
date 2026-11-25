@@ -53,7 +53,7 @@ function client(): Client & { sent: unknown[][] } {
 const session = (role: Role): Session => ({ name: 'Oleksii', role, auth: 'basic', expires: null, signed_in: null, csrf: 't' });
 
 async function render(
-  over: { role?: Role; offline?: boolean; missing?: boolean; stale?: boolean; read?: Partial<PipelinePage['read']>; api?: Client } = {},
+  over: { role?: Role; offline?: boolean; missing?: boolean; stale?: boolean; last?: number | null; read?: Partial<PipelinePage['read']>; api?: Client } = {},
 ) {
   const api = over.api ?? client();
   const page = new PipelinePage(api, 'orders-pg', liveFigures(), () => NOW);
@@ -68,7 +68,7 @@ async function render(
   document.body.replaceChildren(target);
   mounted = mount(Pipeline, {
     target,
-    props: { page, model, session: session(over.role ?? 'operator'), api, now: NOW, stale: over.stale ?? false, last: NOW, offline: over.offline ?? false },
+    props: { page, model, session: session(over.role ?? 'operator'), api, now: NOW, stale: over.stale ?? false, last: over.last === undefined ? NOW : over.last, offline: over.offline ?? false },
   });
   await vi.dynamicImportSettled();
   await tick();
@@ -225,12 +225,19 @@ describe("a pipeline's page", () => {
 
   it('says how old a part that failed to read is: its last read, which the page keeps', async () => {
     const t = await render({ read: { jobs: { at: NOW - 20 * 60_000, error: 'HTTP 503' } } });
-    expect(t.querySelector('.notice.failing')?.textContent).toContain('jobs (HTTP 503), last read 20 min ago');
+    expect(t.querySelector('.notice.failing')?.textContent).toBe(
+      "Couldn't be read; showing what was last read: its snapshot jobs (HTTP 503), last read 20 min ago",
+    );
   });
 
   it('says a part that failed and was never read is never read', async () => {
     const t = await render({ read: { events: { at: null, error: 'HTTP 503' } } });
-    expect(t.querySelector('.notice.failing')?.textContent).toContain('events (HTTP 503), never read');
+    expect(t.querySelector('.notice.failing')?.textContent).toContain('its activity (HTTP 503), never read');
+  });
+
+  it('says when no live update came at all, instead of an age since the epoch', async () => {
+    const t = await render({ stale: true, last: null });
+    expect(t.querySelector('.notice')?.textContent).toBe('Not current: no live update yet');
   });
 
   it('dims every panel while the stream is stale, the snapshot and the activity too', async () => {

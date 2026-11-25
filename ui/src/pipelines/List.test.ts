@@ -31,12 +31,15 @@ function api(fail: Record<string, HttpError> = {}): Client & { sent: unknown[][]
 
 const session = (role: Role): Session => ({ name: 'Oleksii', role, auth: 'basic', expires: null, signed_in: null, csrf: 't' });
 
-function render(over: { role?: Role; path?: string; client?: Client; offline?: boolean } = {}) {
+function render(
+  over: { role?: Role; path?: string; client?: Client; offline?: boolean; read?: Partial<Model['read']>; stale?: boolean; last?: number | null } = {},
+) {
   history.replaceState(null, '', over.path ?? '/ui/pipelines');
   const router = new Router();
   const client = over.client ?? api();
   const model = new Model(client);
   model.facts = facts();
+  Object.assign(model.read, over.read ?? {});
   const target = document.createElement('div');
   document.body.replaceChildren(target);
   mounted = mount(List, {
@@ -48,8 +51,8 @@ function render(over: { role?: Role; path?: string; client?: Client; offline?: b
       api: client,
       router,
       now: NOW,
-      stale: false,
-      last: NOW,
+      stale: over.stale ?? false,
+      last: over.last === undefined ? NOW : over.last,
       offline: over.offline ?? false,
     },
   });
@@ -166,5 +169,28 @@ describe('the pipeline list', () => {
     const { t } = render({ offline: true });
     check(t, 'orders-pg');
     expect(button(t, 'Flush…').disabled).toBe(true);
+  });
+
+  it("says which parts couldn't be read and how old what it shows is", () => {
+    const { t } = render({
+      read: {
+        pipelines: { at: NOW - 3 * 60_000, error: 'HTTP 502' },
+        cluster: { at: null, error: 'the request timed out' },
+        jobs: { at: NOW - 20 * 60_000, error: 'HTTP 503' },
+        tables: { at: NOW - 90_000, error: 'HTTP 500' },
+        events: { at: null, error: 'not shown here' },
+      },
+    });
+    expect(t.querySelector('.notice.failing')?.textContent).toBe(
+      "Couldn't be read; showing what was last read: the pipelines (HTTP 502), last read 3 min ago; " +
+        'the cluster (the request timed out), never read; the snapshot jobs (HTTP 503), last read 20 min ago; ' +
+        'the tables (HTTP 500), last read 1 min ago',
+    );
+  });
+
+  it('says nothing about the parts when all were read, and when no live update came', () => {
+    const { t } = render({ stale: true, last: null });
+    expect(t.querySelector('.notice.failing')).toBeNull();
+    expect(t.querySelector('.notice')?.textContent).toBe('Not current: no live update yet');
   });
 });
