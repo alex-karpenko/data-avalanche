@@ -44,6 +44,7 @@ function partsOf(kind: string): Part[] {
   if (kind.startsWith('table.') || kind.startsWith('schema.')) return ['tables'];
   if (kind.startsWith('pipeline.')) return ['pipelines'];
   if (kind.startsWith('action.snapshot.')) return ['jobs'];
+  if (kind.startsWith('action.pipeline.')) return ['pipelines'];
   return [];
 }
 

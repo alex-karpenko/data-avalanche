@@ -110,6 +110,7 @@ describe("the Overview's data", () => {
     expect(o.facts.actions.customers).toEqual(paused);
     expect(client.asked).toEqual([]);
     await vi.advanceTimersByTimeAsync(REREAD_AFTER_MS);
-    expect(client.asked.sort()).toEqual(['/v1/config/nodes', '/v1/snapshots']);
+    // A person's pause, stop or resume changes the pipeline's desired state: its row reads again.
+    expect(client.asked.sort()).toEqual(['/v1/config/nodes', '/v1/pipelines', '/v1/snapshots']);
   });
 });

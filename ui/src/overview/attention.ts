@@ -4,6 +4,7 @@
 
 import { bytes, duration } from '../lib/format';
 import { at, lagOf, tablesOf, type Facts } from './facts';
+import type { EventItem } from './types';
 
 /** The lag a pipeline is expected to stay under. */
 export const LAG_TARGET_S = 60;
@@ -147,22 +148,33 @@ export function attention(f: Facts, now: number): Attention[] {
       });
     }
   }
+  // One line per pipeline: its newest lease loss within the hour, counted when there were more.
+  const lost = new Map<string, { e: EventItem; when: number; n: number }>();
   for (const e of f.events) {
     const when = at(e.at);
     if (
       (e.kind === 'lease.lost' || e.kind === 'lease.takeover') &&
+      e.pipeline !== undefined &&
       when !== null &&
       now - when <= LEASE_LOSS_WITHIN_S * 1000
     ) {
-      add({
-        severity: 'orange',
-        what: e.kind === 'lease.lost' ? `${e.pipeline} lost its lease` : `${e.pipeline} failed over`,
-        why: e.text,
-        since: when,
-        href: pipelineHref(e.pipeline ?? ''),
-        link: 'Open',
-      });
+      const seen = lost.get(e.pipeline);
+      if (seen === undefined) lost.set(e.pipeline, { e, when, n: 1 });
+      else {
+        seen.n += 1;
+        if (when > seen.when) Object.assign(seen, { e, when });
+      }
     }
+  }
+  for (const [pipeline, { e, when, n }] of lost) {
+    add({
+      severity: 'orange',
+      what: e.kind === 'lease.lost' ? `${pipeline} lost its lease` : `${pipeline} failed over`,
+      why: n > 1 ? `${e.text} · ${n} in the last hour` : e.text,
+      since: when,
+      href: pipelineHref(pipeline),
+      link: 'Open',
+    });
   }
   for (const j of f.jobs) {
     const ended = at(j.finished_at);

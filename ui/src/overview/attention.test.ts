@@ -86,6 +86,37 @@ describe('needs attention', () => {
     ).not.toContain('lease');
   });
 
+  it('lists a pipeline\'s lease losses in the last hour once: its newest, and how many', () => {
+    const lease = (kind: string, minutes: number, pipeline: string | undefined, text: string) =>
+      event({ kind, at: iso(NOW - minutes * MIN), pipeline, text });
+    const f = facts();
+    f.tables = [];
+    f.figures = {};
+    f.lag = {};
+    f.jobs = [];
+    f.unreachable = {};
+    f.config = null;
+    f.events = [
+      lease('lease.takeover', 40, 'customers', 'customers taken over from n3 by n2'),
+      lease('lease.takeover', 5, 'customers', 'customers taken over from n1 by n3'),
+      lease('lease.lost', 20, undefined, 'a lease was lost'),
+    ];
+    const orange = attention(f, NOW).filter((a) => a.severity === 'orange');
+    expect(orange).toEqual([
+      expect.objectContaining({
+        what: 'customers failed over',
+        why: 'customers taken over from n1 by n3 · 2 in the last hour',
+        since: NOW - 5 * MIN,
+        href: '/ui/pipelines/customers',
+      }),
+    ]);
+    f.events = [lease('lease.lost', 20, 'customers', 'customers lost its lease')];
+    expect(attention(f, NOW)[0]).toMatchObject({ what: 'customers lost its lease', why: 'customers lost its lease' });
+    expect(attention(f, NOW)).toHaveLength(1);
+    f.events = [lease('lease.lost', 20, undefined, 'a lease was lost')];
+    expect(attention(f, NOW)).toEqual([]);
+  });
+
   it('takes a pipeline that is starting: no worker, no source yet', () => {
     const f = facts();
     f.figures.customers = figures({ id: 'customers', node: 'n1', worker: null, source: null });
