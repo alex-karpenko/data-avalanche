@@ -235,12 +235,13 @@ pub(crate) fn cross_site(frame: &Frame) -> String {
 const SIGN_OUT: &str = r#"
 <form method="post" action="/ui/sign-out"><button class="btn sec" type="submit">Sign out</button></form>"#;
 
-/// The landing page, until the console's app is built (M15): who is signed in, and, with a
-/// session, a way out.
-pub(crate) fn signed_in(frame: &Frame, name: &str, role: &str, session: bool) -> String {
+/// The page of a binary built without the console's app (`ui/`): who is signed in, how to build
+/// the app, and, with a session, a way out.
+pub(crate) fn not_built(frame: &Frame, name: &str, role: &str, session: bool) -> String {
     let mut card = format!(
         r#"<div class="title">Signed in</div>
-<p>You are <b>{name}</b>, signed in as <b>{role}</b>.</p>"#,
+<p>You are <b>{name}</b>, signed in as <b>{role}</b>.</p>
+<p>The console's app isn't built into this binary: run <code>npm ci &amp;&amp; npm run build</code> in <code>ui/</code>, then build the binary again.</p>"#,
         name = escape(name),
         role = escape(role),
     );

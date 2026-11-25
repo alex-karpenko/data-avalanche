@@ -420,6 +420,7 @@ mod tests {
             ready: Arc::new(AtomicBool::new(true)),
             node: Arc::new(OnceLock::new()),
             auth: crate::test_support::open(),
+            app: crate::App::of(&[]),
         };
         tokio::spawn(bound.serve(router(api), std::future::pending()));
 

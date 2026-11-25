@@ -302,6 +302,7 @@ mod tests {
             ready: Arc::new(AtomicBool::new(true)),
             node,
             auth: open(),
+            app: crate::App::of(&[]),
         })
         .await;
         let (code, v) = json_of(addr, "GET", "/v1/config/generations?limit=100").await;
@@ -336,6 +337,7 @@ mod tests {
             ready: Arc::new(AtomicBool::new(true)),
             node,
             auth: open(),
+            app: crate::App::of(&[]),
         })
         .await;
         std::fs::write(
