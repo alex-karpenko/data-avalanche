@@ -85,6 +85,7 @@
     const x = u.cursor.left;
     if (idx === null || idx === undefined || x === undefined || x < 0) {
       at = null;
+      onHover(null);
       return;
     }
     at = readout(u.data[0][idx], u.data[1][idx] ?? null, unit);
@@ -122,9 +123,16 @@
     };
   });
 
-  // New samples, a new range, or another event hovered: drawn again.
+  // New samples, a new range or a new target: the y axis is ranged again too (setData resets the
+  // scales, so a spike is not clipped by the old range).
   $effect(() => {
-    plot?.setData(data, false);
+    // Read before the plot is checked: the first run comes before uPlot has loaded, and a
+    // dependency read only after `plot?.` would never be tracked.
+    const samples = data;
+    void target;
+    void since;
+    void until;
+    plot?.setData(samples, true);
     plot?.setScale('x', { min: since, max: until });
   });
   $effect(() => {
