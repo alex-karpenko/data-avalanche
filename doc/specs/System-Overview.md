@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-19
+updated: 2026-11-24
 domain: Architecture
 tags: [architecture, design, system, multi-sink, iceberg, delta-lake, v1-scope]
 sources: []
@@ -97,7 +97,7 @@ Decisions: `research/V1_Scope_Decisions.md`.
 	- listening address:port is a command line parameter
 	- authentication/authorization:
 		- anonymous
-		- basic
+		- basic; failed basic credentials are counted per client address (an IPv6 address by its /64), on the API and on the console's sign-in form alike: after 5 in a row, that address waits 1 minute (`429` with `Retry-After`, even for the right password), and a success starts the count again; a node counts at most 10 000 addresses
 		- JWT (with RBAC)
 		- OAuth2/OpenID (with RBAC)
 	- roles are nested `viewer` ⊆ `operator` ⊆ `admin`; endpoints and minimum roles are in the [endpoint table](#management-api-endpoints)
@@ -106,6 +106,8 @@ Decisions: `research/V1_Scope_Decisions.md`.
 - Web console:
 	- an embedded web console for operators and viewers, served on the management API's listener under the path prefix `/ui/`, with the same authentication and roles
 	- off by default; `globals.console.enabled` in the config switches it on, and a reload can turn it on or off
+	- people sign in as `globals.api.auth` says: a form (`basic`) or the identity provider's sign-in (`oauth2`, authorization code with PKCE), each starting a session in an encrypted cookie every node reads, which lasts `globals.console.session_ttl` from sign-in; `jwt` takes a bearer token on every request, from a proxy in front; `none` lets everyone in as `admin`, with a banner
+	- the management API takes the console's session as it takes credentials; a request the session authenticates that changes something carries the session's anti-forgery token (`X-CSRF-Token`)
 - Observability
 	- write logs on different levels to stderr
 	- log level and format (text, json, pretty) configured via command line parameters

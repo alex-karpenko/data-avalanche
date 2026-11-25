@@ -305,10 +305,59 @@ pub fn cases() -> Vec<Case> {
         case("V-129", Error, "a public_url without a scheme", || {
             pg_delta().set("/globals/console/public_url", json!("cdc.example.com"))
         }),
-        case("V-129", Silent, "a public_url under a path", || {
+        case("V-129", Error, "a public_url under a path", || {
             pg_delta().set(
                 "/globals/console/public_url",
-                json!("https://example.com/cdc"),
+                json!("https://cdc.example.com/console"),
+            )
+        }),
+        case("V-129", Error, "a public_url under the path /ui/", || {
+            pg_delta().set(
+                "/globals/console/public_url",
+                json!("https://cdc.example.com/ui/"),
+            )
+        }),
+        case("V-129", Error, "a public_url with the path //", || {
+            pg_delta().set(
+                "/globals/console/public_url",
+                json!("https://cdc.example.com//"),
+            )
+        }),
+        case(
+            "V-129",
+            Silent,
+            "a public_url with a trailing slash alone",
+            || {
+                pg_delta().set(
+                    "/globals/console/public_url",
+                    json!("https://cdc.example.com/"),
+                )
+            },
+        ),
+        case("V-129", Error, "a public_url with a user", || {
+            pg_delta().set("/globals/console/public_url", json!("https://u@h/"))
+        }),
+        case(
+            "V-129",
+            Error,
+            "a public_url with a user and a password",
+            || pg_delta().set("/globals/console/public_url", json!("https://u:p@h")),
+        ),
+        case(
+            "V-129",
+            Error,
+            "a public_url under a path, its scheme upper-case",
+            || {
+                pg_delta().set(
+                    "/globals/console/public_url",
+                    json!("HTTPS://cdc.example.com/console"),
+                )
+            },
+        ),
+        case("V-129", Silent, "a public_url with a port", || {
+            pg_delta().set(
+                "/globals/console/public_url",
+                json!("https://cdc.example.com:8443"),
             )
         }),
         case("V-130", Error, "a prometheus url without a scheme", || {

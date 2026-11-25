@@ -134,7 +134,7 @@ A config with any **error** is rejected whole: at startup the node refuses to st
 | <span id="v-126"></span>V-126 | error | `globals.tracing.headers, globals.console.prometheus.headers` | Each name an HTTP token, each value visible ASCII, spaces and tabs (DA-OBS-7). |
 | <span id="v-127"></span>V-127 | warning | `tables.column_type_overrides keys` | The key's column names no column of its table (on MySQL compared without case, as MySQL compares column names): the override changes nothing (DA-SRC-35). (Emitted at schema resolution.) |
 | <span id="v-128"></span>V-128 | error | `globals.console.session_key` | At least 32 bytes after substitution. |
-| <span id="v-129"></span>V-129 | error | `globals.console.public_url` | An absolute http/https URL without query or fragment. |
+| <span id="v-129"></span>V-129 | error | `globals.console.public_url` | An absolute `http`/`https` URL without user information (`user@`), a path (a trailing `/` aside), a query or a fragment. |
 | <span id="v-130"></span>V-130 | error | `globals.console.prometheus.url` | An absolute http/https URL. |
 | <span id="v-131"></span>V-131 | error | `globals.console.prometheus` | basic and bearer_token are exclusive; extra_labels names match [a-zA-Z_][a-zA-Z0-9_]* and don't start with __. |
 | <span id="v-132"></span>V-132 | error | `globals.console durations` | session_ttl 5 min – 7 days; history.retention 1 h – 30 days; events.retention 1 – 400 days. |

@@ -13,6 +13,7 @@ use axum::response::{IntoResponse, Response};
 use data_avalanche_config::TlsIdentity;
 use serde_json::json;
 
+use crate::auth::Presented;
 use crate::body;
 
 /// The node a forwarded request is for: a node that isn't it answers `421`.
@@ -49,24 +50,21 @@ pub enum PeersError {
     Client(String),
 }
 
-/// A request to forward: the caller's method, credentials, content type and body.
+/// A request to forward: the caller's method, credentials, content type and body. The
+/// credentials never print.
 #[derive(Clone)]
 pub(crate) struct Asked {
     pub method: Method,
-    pub authorization: Option<HeaderValue>,
+    pub presented: Presented,
     pub content_type: Option<HeaderValue>,
     pub body: Bytes,
 }
 
-/// The caller's credentials never print.
 impl std::fmt::Debug for Asked {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Asked")
             .field("method", &self.method)
-            .field(
-                "authorization",
-                &self.authorization.as_ref().map(|_| "<redacted>"),
-            )
+            .field("presented", &self.presented)
             .field("content_type", &self.content_type)
             .field("body", &format_args!("{} bytes", self.body.len()))
             .finish()
@@ -78,7 +76,7 @@ impl Asked {
     pub(crate) fn from(method: Method, headers: &HeaderMap, body: Bytes) -> Self {
         Self {
             method,
-            authorization: headers.get(header::AUTHORIZATION).cloned(),
+            presented: Presented::of(headers),
             content_type: headers.get(header::CONTENT_TYPE).cloned(),
             body,
         }
@@ -126,12 +124,10 @@ impl Peers {
             .http
             .request(asked.method, format!("{api_url}{path_and_query}"))
             .timeout(limit)
+            .headers(asked.presented.headers())
             .header(TARGET, node)
             .header(FORWARDED_BY, &self.me)
             .body(asked.body);
-        if let Some(a) = asked.authorization {
-            req = req.header(header::AUTHORIZATION, a);
-        }
         if let Some(c) = asked.content_type {
             req = req.header(header::CONTENT_TYPE, c);
         }

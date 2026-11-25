@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-19
+updated: 2026-11-25
 domain: Architecture
 tags: [admin-console, web-ui, management-api, auth, sessions, audit, metrics-history, prometheus, v1.1]
 ---
@@ -262,6 +262,90 @@ One sign-in page; what follows depends on `globals.api.auth`:
   framing.
 - **Plain HTTP:** `Secure` cookies work on `localhost`; elsewhere TLS is expected (on the listener
   or a proxy in front, as V-052 already assumes).
+
+### 9.1 Sessions as built (M14)
+
+Oleksii decided three things on 2026-11-24: a session lasts `session_ttl` **from sign-in**, however
+it is used (the config spec says so since S-M14.1); the sign-in and error pages are **rendered by
+the server** (M15's app links to them); and failed basic sign-ins are counted **per client
+address**. The rest is Claude's call.
+
+- **The cookie.** `__Host-da_session` (the prefix means a sibling subdomain can't plant one),
+  AES-256-GCM under a key derived from `session_key`, the key's id
+  beside the ciphertext so a changed key is told from an altered cookie; `HttpOnly`, `Secure`,
+  `SameSite=Strict`, `Path=/`, no `Domain`. One too long for a cookie (a provider's long tokens)
+  goes on in `__Host-da_session.1` … `.3`; one longer starts no session. It holds when the person signed in, the
+  anti-forgery token, and what verifies them: the basic user and a keyed fingerprint of the
+  password, or the provider's access token and its refresh token. Nothing is kept server-side.
+- **Every request verifies it again**, as the API verifies credentials: a basic session's user and
+  password must still be the configured ones; an `oauth2` session's access token verifies as a
+  bearer token does (issuer, audience, signature, roles). It ends `session_ttl` after sign-in, or
+  sooner when that fails, when `session_key` or `auth` changes, or when the console is switched
+  off. A request with `Authorization` is taken by its credentials, never its cookie. A session
+  under inconsistent settings, or a token that can't be checked now (the provider's keys are
+  unreachable), answers 503, not 401. While sessions are on, a 401 for a request without
+  `Authorization` carries `WWW-Authenticate: Session realm="data-avalanche"`, so a browser never
+  shows its credentials popup; a request that sent `Authorization` gets `Basic` or `Bearer`; the
+  console's own 401 pages carry `Session` (`Bearer` under `jwt`), never `Basic`.
+- **The API takes it too**, so the console's app calls `/v1` with no token in page JavaScript. A
+  request the session authenticates that changes something sends the session's anti-forgery token
+  (`X-CSRF-Token`, from `GET /ui/session`): `403` without it, before its role is looked at.
+- **Peers open it** (M13f's carry-in): a node passes a caller's session cookies and anti-forgery
+  token on with its `Authorization` (node actions, another node's detail, a stream's follows), and
+  the peer verifies them with the key every node has.
+- **A stream ends with it** (M13f's carry-in): every open stream, one another node asked for too
+  (the header saying so is one any client can send), checks its caller every minute and a second
+  after the credentials' expiry; once they no longer verify it is sent `reset` (`credentials`) and
+  ends, and the page opens it again.
+- **`oauth2`.** Authorization code with PKCE (`S256`) and a new state, kept in a sealed
+  `__Host-da_oauth2` cookie (`SameSite=Lax`, `Path=/` as the prefix requires, 10 min; the prefix
+  means a sibling subdomain can't plant a sign-in of its own, a login CSRF); the code exchanged with
+  the console's client (`client_secret_basic`, or `client_secret_post` when that is all the provider
+  takes); the token verified before a session starts, so a token whose roles map to nothing is
+  "Forbidden" at sign-in. The callback answers a page that goes on to `next` from the console's own
+  origin, since a `Strict` cookie doesn't follow a redirect the provider began; it answers 503 when
+  the token can't be checked now, and a callback whose state isn't the browser's own sign-in shows
+  nothing from the provider. A session whose token expires within a minute is refreshed by the next
+  page asked for, or by `POST /ui/session/refresh` (the app's, with the anti-forgery token; it
+  refreshes whenever called, with no expiry check); a session past its end is never refreshed (it
+  ends when it would have). A provider that refuses the refresh (a 4xx other than 408 and 429:
+  `invalid_grant`, a revoked token) ends the session: the app's refresh answers 401, a page too once
+  the token has expired. One that can't be reached (a transport error, a timeout, a 408, a 429, a
+  5xx, its discovery unreadable) answers the app's refresh 503 with `Retry-After`, the cookies kept,
+  so M15's app tries again rather than signing in; a page answers 503 only once the token has
+  expired (before that the old token verifies and the page is served). One node makes one refresh
+  per refresh token at a time and gives its outcome to the same token: a new token or a refusal for
+  30 s, since a provider that rotates refresh tokens refuses one used twice; an outage for 5 s, as
+  long as a failed discovery is remembered, then it asks again. Failed discoveries, code exchanges
+  and refreshes are logged with the provider's error, never a token. The ID token is kept in
+  `da_id`, sent only to the sign-out, for the provider's `id_token_hint`.
+- **The routes under `/ui/`:** `GET /ui/sign-in` (the form, or the way to the provider),
+  `POST /ui/sign-in` (basic), `GET /ui/oauth2/start`, `GET /ui/oauth2/callback`,
+  `POST /ui/sign-out`, `GET /ui/session`, `POST /ui/session/refresh`, `/ui/assets/…`, and every
+  other page (M15's app; until then, who is signed in). A page asked for with no credentials goes
+  to the sign-in; with credentials that no longer verify it is the 401 page, saying why.
+- **No path prefix.** The console and `/v1` are served at the root of one host: every redirect and
+  route is an absolute `/ui/…` path, and `public_url` is the origin with no path.
+- **Hardening.** A Content-Security-Policy that runs no inline script or style
+  (`script-src 'self'`, `form-action 'self'` and the provider's origins, `frame-ancestors
+  'none'`), `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy: no-referrer`, `no-store`; a page
+  on a node that hasn't discovered the provider yet discovers it first, so `form-action` names its
+  end-session origin. A form posted to `/ui/` from another site (`Sec-Fetch-Site`, else `Origin`
+  against `Host` or `public_url`'s origin) is refused.
+  `next` is always a path under `/ui/` with no `.` or `..` segment (encoded ones too), else
+  `/ui/`.
+- **Failed basic credentials** are limited per client address (an IPv6 address by its /64), on the
+  sign-in form and on the API's `Authorization: Basic` (and the console's pages that take Basic).
+  After 5 failures in a row the address waits 1 minute on that node: `429` with `Retry-After`, even
+  for the right password; a success starts the count again. Bearer tokens and sessions aren't
+  counted. A node keeps at most 10 000 addresses; when its table is full, a new address's failures
+  aren't counted, so a flood never locks anyone else out. A request forwarded by another node counts
+  against that node's address (during a password rotation a peer may refuse one node's forwarded
+  Basic requests for up to a minute). Behind a proxy every client shares the proxy's address
+  (forwarded headers aren't trusted). The OpenAPI document lists `429` on every operation.
+- **Signing out** removes the cookies; with `oauth2` it goes on to the provider's end-session
+  endpoint, when it has one. Since nothing is kept server-side, a copy of the cookie taken before
+  works until the session ends: a short `session_ttl`, or a new `session_key`, bounds that.
 
 ## 10. Front end and serving
 

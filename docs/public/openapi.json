@@ -33,7 +33,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -56,6 +56,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "503": {
             "description": "the node is starting or stopping, or its state can't be read",
             "content": {
@@ -69,6 +75,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "admin"
@@ -101,7 +110,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -124,6 +133,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "503": {
             "description": "the node is starting or stopping, or its state can't be read",
             "content": {
@@ -137,6 +152,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "admin"
@@ -162,7 +180,13 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -180,6 +204,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -233,7 +260,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -246,6 +273,12 @@
           },
           "409": {
             "description": "several snapshots of one and no record of which it is",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -269,6 +302,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -324,7 +360,13 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -342,6 +384,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -384,7 +429,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -397,6 +442,12 @@
           },
           "409": {
             "description": "several snapshots of it and no record of which one it is",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -420,6 +471,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -445,7 +499,13 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -463,6 +523,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -507,7 +570,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -530,6 +593,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "503": {
             "description": "the node is starting or stopping, or its state can't be read",
             "content": {
@@ -543,6 +612,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "operator"
@@ -568,7 +640,13 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -586,6 +664,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -617,7 +698,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -629,7 +710,7 @@
             }
           },
           "429": {
-            "description": "posted bodies past the node's rate: `Retry-After` says when",
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long; or posted bodies past the node's rate: `Retry-After` says when",
             "content": {
               "application/json": {}
             }
@@ -647,6 +728,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "operator"
@@ -764,7 +848,13 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -782,6 +872,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -879,13 +972,19 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
           },
           "404": {
             "description": "no such pipeline in the generation this node runs",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -903,6 +1002,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -939,7 +1041,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -952,6 +1054,12 @@
           },
           "421": {
             "description": "a request forwarded to a node that isn't its target",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -981,6 +1089,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -1030,7 +1141,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -1065,6 +1176,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "502": {
             "description": "the node didn't answer",
             "content": {
@@ -1090,6 +1207,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "operator"
@@ -1126,7 +1246,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -1139,6 +1259,12 @@
           },
           "421": {
             "description": "a request forwarded to a node that isn't its target",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -1168,6 +1294,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -1210,7 +1339,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -1234,7 +1363,7 @@
             }
           },
           "429": {
-            "description": "posted bodies past the node's rate",
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long; or posted bodies past the node's rate",
             "content": {
               "application/json": {}
             }
@@ -1264,6 +1393,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "operator"
@@ -1307,7 +1439,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -1342,6 +1474,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "502": {
             "description": "the node didn't answer",
             "content": {
@@ -1367,6 +1505,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "admin"
@@ -1410,7 +1551,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -1445,6 +1586,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "502": {
             "description": "the node didn't answer",
             "content": {
@@ -1470,6 +1617,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "admin"
@@ -1495,7 +1645,13 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -1513,6 +1669,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -1538,7 +1697,13 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -1556,6 +1721,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -1592,13 +1760,19 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
           },
           "404": {
             "description": "no such pipeline in the generation this node runs",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -1616,6 +1790,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -1665,7 +1842,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -1694,6 +1871,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "503": {
             "description": "the node is starting or stopping, or its state can't be read",
             "content": {
@@ -1707,6 +1890,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "operator"
@@ -1743,7 +1929,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -1762,6 +1948,12 @@
           },
           "421": {
             "description": "a forwarded request to a node that doesn't run the worker",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -1791,6 +1983,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -1840,7 +2035,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -1869,6 +2064,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "503": {
             "description": "the node is starting or stopping, or its state can't be read",
             "content": {
@@ -1882,6 +2083,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "operator"
@@ -1925,7 +2129,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -1954,6 +2158,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "503": {
             "description": "the node is starting or stopping, or its state can't be read",
             "content": {
@@ -1967,6 +2177,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "operator"
@@ -2016,7 +2229,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -2039,6 +2252,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "503": {
             "description": "the node is starting or stopping, or its state can't be read",
             "content": {
@@ -2052,6 +2271,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "operator"
@@ -2088,13 +2310,19 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
           },
           "404": {
             "description": "no such pipeline in the generation this node runs",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -2112,6 +2340,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -2153,7 +2384,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -2182,6 +2413,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "503": {
             "description": "the node is starting or stopping, or its state can't be read",
             "content": {
@@ -2195,6 +2432,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "operator"
@@ -2244,7 +2484,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -2267,6 +2507,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "503": {
             "description": "the node is starting or stopping, or its state can't be read",
             "content": {
@@ -2280,6 +2526,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "operator"
@@ -2331,13 +2580,19 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
           },
           "404": {
             "description": "no such pipeline, or no trace of the table in it",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -2355,6 +2610,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -2415,13 +2673,19 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
           },
           "404": {
             "description": "no such pipeline in the generation this node runs",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -2439,6 +2703,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -2475,13 +2742,19 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
           },
           "404": {
             "description": "no such job",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -2499,6 +2772,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -2548,7 +2824,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -2577,6 +2853,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "503": {
             "description": "the node is starting or stopping, or its state can't be read",
             "content": {
@@ -2590,6 +2872,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "operator"
@@ -2633,7 +2918,7 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
@@ -2662,6 +2947,12 @@
               "application/json": {}
             }
           },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
           "503": {
             "description": "the node is starting or stopping, or its state can't be read",
             "content": {
@@ -2675,6 +2966,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "operator"
@@ -2726,13 +3020,19 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
           },
           "404": {
             "description": "no such pipeline in the generation this node runs",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -2750,6 +3050,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -2781,13 +3084,19 @@
             }
           },
           "403": {
-            "description": "the caller's role is below the route's",
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
             "content": {
               "application/json": {}
             }
           },
           "404": {
             "description": "no such pipeline in the generation this node runs",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
             "content": {
               "application/json": {}
             }
@@ -2805,6 +3114,9 @@
           },
           {
             "bearer": []
+          },
+          {
+            "session": []
           }
         ],
         "x-min-role": "viewer"
@@ -2821,6 +3133,12 @@
         "type": "http",
         "scheme": "bearer",
         "bearerFormat": "JWT"
+      },
+      "session": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "__Host-da_session",
+        "description": "the web console's session (`globals.console`, with `auth` basic or oauth2), taken when a request has no `Authorization`; a request that changes something sends the session's anti-forgery token in `X-CSRF-Token`"
       }
     }
   }

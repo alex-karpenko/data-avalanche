@@ -92,7 +92,8 @@ pub(crate) fn page() -> String {
          **Answers.** Every body is a JSON object; a refusal carries an `error` string. Every \
          route can also answer `503` (the node is starting or stopping, or its state can't be \
          read) and, unless `auth` is `none`, `401` (no credentials, or ones that don't verify) \
-         and `403` (the caller's role is below the route's). A `202` means accepted, not done: \
+         and `403` (the caller's role is below the route's; or a session's request that changes \
+         something without its `X-CSRF-Token`). A `202` means accepted, not done: \
          a pipeline command or a snapshot job is carried out by the node that holds the \
          pipeline's lease, a reload is published, a leave or a shutdown is under way on the \
          node called.\n\n\

@@ -5,9 +5,10 @@
 //!
 //! The node a page asks merges into its stream each other member's, followed with the caller's
 //! own credentials (`peer` says when one is followed and when it can't be, `members` when the
-//! members change); a stream it is asked for by another node is its own alone. Before it follows
-//! a peer again, it checks the caller's credentials itself: once they no longer verify, the stream
-//! is sent `reset` (`credentials`) and ends, and the page opens it again with fresh ones.
+//! members change); a stream it is asked for by another node is its own alone. Every stream, one
+//! another node asked for too, checks the caller's credentials again itself, from time to time and
+//! before it follows a peer again: once they no longer verify, the stream is sent `reset`
+//! (`credentials`) and ends, and the page opens it again with fresh ones.
 
 use std::collections::BTreeSet;
 use std::convert::Infallible;
@@ -16,18 +17,20 @@ use std::time::Duration;
 
 use std::collections::BTreeMap;
 
+use axum::Extension;
 use axum::extract::{RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use data_avalanche_cluster::{Live, MAX_STREAMS, Members, Opened};
 use data_avalanche_config::{ResolvedConfig, Role};
 use serde_json::{Value, json};
 use tokio::sync::{Notify, broadcast, mpsc, watch};
 use tokio::task::{AbortHandle, JoinSet};
+use tokio::time::Instant;
 
-use crate::auth::Denied;
+use crate::auth::{Denied, Presented, Principal};
 use crate::follow::FOLLOW_SILENCE;
 use crate::nodes::phase;
 use crate::peers::FORWARDED_BY;
@@ -162,9 +165,16 @@ fn event(kind: &str, data: &Value) -> Event {
     Event::default().event(kind).data(data.to_string())
 }
 
+/// An open stream checks its caller again this often, and at its credentials' expiry when that
+/// comes first: once they no longer verify (a session or a token ended, a password changed, a
+/// role taken away), it is sent `reset` (`credentials`) and ends, and the page opens it again
+/// with fresh credentials.
+pub const CREDENTIALS_EVERY: Duration = Duration::from_secs(60);
+
 /// `GET /v1/stream`.
 pub(crate) async fn open(
     State(api): State<Api>,
+    Extension(caller): Extension<Principal>,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Response {
@@ -197,21 +207,27 @@ pub(crate) async fn open(
         return r;
     };
     let me = node.members.borrow().me.clone();
+    // Every stream is checked again, one another node asked for too: the header saying so is one
+    // any client can send.
+    let recheck = Arc::new(Recheck {
+        auth: Arc::clone(&api.auth),
+        presented: Presented::of(&headers),
+        expires: caller.expires,
+    });
     // Asked by another node: this node's own messages alone, never followed further.
     let follow = (!forwarded).then(|| {
         Arc::new(Follow {
             node: node.clone(),
-            auth: Arc::clone(&api.auth),
             path: if raw.is_empty() {
                 "/v1/stream".to_owned()
             } else {
                 format!("/v1/stream?{raw}")
             },
-            authorization: headers.get(header::AUTHORIZATION).cloned(),
+            recheck: Arc::clone(&recheck),
         })
     });
     let (tx, rx) = mpsc::channel(BUFFER);
-    tokio::spawn(pump(me, filter, opened, tx, follow));
+    tokio::spawn(pump(me, filter, opened, tx, recheck, follow));
     let events = futures_util::stream::unfold(rx, |mut rx| async move {
         rx.recv().await.map(|e| (Ok::<_, Infallible>(e), rx))
     });
@@ -232,31 +248,44 @@ async fn deliver(tx: &mpsc::Sender<Event>, opened: &mut Opened, e: Event) -> boo
     }
 }
 
-/// What a stream follows its peers with: the node's members and client, the API's own check of
-/// a caller, the stream's own path and query, and the caller's credentials (its `Authorization`
-/// alone, never logged).
-struct Follow {
-    node: Node,
+/// What every stream checks its caller again with: the API's own check of a caller, the
+/// credentials the caller presented (never logged), and when they expire.
+struct Recheck {
     auth: Arc<Auth>,
-    path: String,
-    authorization: Option<HeaderValue>,
+    presented: Presented,
+    expires: Option<DateTime<Utc>>,
 }
 
-impl Follow {
+/// What a stream follows its peers with: the node's members and client, the stream's own path
+/// and query, and its caller's check (whose credentials each peer is followed with).
+struct Follow {
+    node: Node,
+    path: String,
+    recheck: Arc<Recheck>,
+}
+
+impl Recheck {
     /// Whether the caller isn't refused here, as the route's own check says: a token expired, a
     /// password changed or a role taken away since the stream opened is. A verifier that can't
     /// check now (its settings refused, the issuer's keys unreachable: a 503) refuses no caller:
-    /// the peer is followed, and answers for itself.
+    /// the stream goes on, and a peer is followed and answers for itself.
     async fn still_verified(&self) -> bool {
-        let mut headers = HeaderMap::new();
-        if let Some(a) = &self.authorization {
-            headers.insert(header::AUTHORIZATION, a.clone());
-        }
-        match self.auth.verify(&headers).await {
+        match self.auth.verify(&self.presented.headers()).await {
             Ok(p) => p.role >= Role::Viewer,
             Err(Denied::Unavailable(_)) => true,
             Err(Denied::Unauthenticated { .. } | Denied::Forbidden { .. }) => false,
         }
+    }
+
+    /// When the caller is checked again: [`CREDENTIALS_EVERY`] from now, or a second after its
+    /// credentials expire when that comes first.
+    fn next_check(&self) -> Instant {
+        let every = Instant::now() + CREDENTIALS_EVERY;
+        self.expires
+            .and_then(|at| (at - Utc::now()).to_std().ok())
+            .map_or(every, |left| {
+                every.min(Instant::now() + left + Duration::from_secs(1))
+            })
     }
 }
 
@@ -330,20 +359,14 @@ async fn follow_peer(
     let mut failed = 0;
     let mut again = false;
     loop {
-        if std::mem::replace(&mut again, true) && !f.still_verified().await {
+        if std::mem::replace(&mut again, true) && !f.recheck.still_verified().await {
             refused.notify_one();
             return;
         }
         let error = match f
             .node
             .peers
-            .follow(
-                &peer,
-                &url,
-                &f.path,
-                f.authorization.clone(),
-                FOLLOW_SILENCE,
-            )
+            .follow(&peer, &url, &f.path, &f.recheck.presented, FOLLOW_SILENCE)
             .await
         {
             Err(e) => e,
@@ -395,16 +418,20 @@ enum Next {
     Live(Result<Arc<Live>, broadcast::error::RecvError>),
     /// The caller's credentials no longer verify.
     Refused,
+    /// Time to check the caller again.
+    Check,
 }
 
 /// Sends `hello`, then this node's messages that pass `filter` and, with `follow`, each peer's,
 /// until the client goes or the node stops; or, once the caller's credentials no longer verify
-/// when a peer is followed again, `reset` (`credentials`), and ends.
+/// (checked by `recheck` every [`CREDENTIALS_EVERY`], at their expiry, and before a peer is
+/// followed again), `reset` (`credentials`), and ends.
 async fn pump(
     me: String,
     filter: Filter,
     mut opened: Opened,
     tx: mpsc::Sender<Event>,
+    recheck: Arc<Recheck>,
     follow: Option<Arc<Follow>>,
 ) {
     let mut members = follow.as_ref().map(|f| f.node.members.clone());
@@ -420,6 +447,7 @@ async fn pump(
     let mut following = Following::default();
     let refused = Arc::clone(&following.refused);
     let mut shown = view.as_ref().map(listed);
+    let mut check = recheck.next_check();
     if let (Some(f), Some(view)) = (&follow, &view) {
         following.reconcile(f, view, &tx);
     }
@@ -428,12 +456,17 @@ async fn pump(
             () = tx.closed() => return,
             _ = opened.closed.wait_for(|c| *c) => return,
             () = refused.notified() => Next::Refused,
+            () = tokio::time::sleep_until(check) => Next::Check,
             Some(()) = changed(&mut members) => Next::Members,
             r = opened.messages.recv() => Next::Live(r),
         };
         let next = match next {
+            Next::Check if recheck.still_verified().await => {
+                check = recheck.next_check();
+                continue;
+            }
             Next::Live(r) => r,
-            Next::Refused => {
+            Next::Check | Next::Refused => {
                 // Its peers' messages end first, so `reset` is the stream's last.
                 following.tasks.shutdown().await;
                 let e = event("reset", &json!({ "node": me, "reason": "credentials" }));
@@ -480,7 +513,9 @@ mod tests {
     use data_avalanche_cluster::FEED_CAPACITY;
 
     use super::*;
-    use crate::test_support::{Stream, served_with, stream};
+    use crate::test_support::{
+        Stream, basic_api, basic_session, served_with, session_cookie, sessions, stream,
+    };
 
     fn live(kind: &'static str, pipeline: Option<&str>, n: u64) -> Live {
         Live {
@@ -805,18 +840,6 @@ mod tests {
         assert_eq!(log.lock().unwrap().len(), 2);
     }
 
-    /// `globals.api` with `auth: basic`, its one user `ops` with `password`.
-    fn basic(password: &str) -> data_avalanche_config::Api {
-        use data_avalanche_config::{ApiAuth, Credentials, FingerprintKey, Secret};
-        let mut api = crate::test_support::config().globals.api;
-        api.auth = ApiAuth::Basic;
-        api.credentials = Some(Credentials::Inline {
-            user: "ops".into(),
-            password: Secret::new(password, &FingerprintKey::from_bytes([1; 32])),
-        });
-        api
-    }
-
     /// `ops:s3cret`, as a Basic `Authorization`.
     const OPS: &str = "Basic b3BzOnMzY3JldA==";
 
@@ -829,8 +852,8 @@ mod tests {
         )
         .await;
         let auth = std::sync::Arc::new(crate::Auth::new(
-            &basic("s3cret"),
-            crate::test_support::USERNAME_CLAIM,
+            &basic_api("s3cret"),
+            &crate::test_support::console(),
         ));
         let (addr, _lone, _dir) = served_with(&b_url, std::sync::Arc::clone(&auth), |_| {}).await;
         let mut s = stream(addr, "/v1/stream", &[("authorization", OPS)]).await;
@@ -838,7 +861,7 @@ mod tests {
         s.next().await;
         assert_eq!(s.next().await.1["state"], "unreachable");
         // The password changes before node-b is followed again (FOLLOW_BACKOFF[0]).
-        auth.set(&basic("rotated"), crate::test_support::USERNAME_CLAIM);
+        auth.set(&basic_api("rotated"), &crate::test_support::console());
         assert_eq!(
             s.next().await,
             (
@@ -861,8 +884,8 @@ mod tests {
         )
         .await;
         let auth = std::sync::Arc::new(crate::Auth::new(
-            &basic("s3cret"),
-            crate::test_support::USERNAME_CLAIM,
+            &basic_api("s3cret"),
+            &crate::test_support::console(),
         ));
         let (addr, lone, _dir) = served_with(&b_url, std::sync::Arc::clone(&auth), |_| {}).await;
         let mut s = stream(addr, "/v1/stream", &[("authorization", OPS)]).await;
@@ -875,9 +898,9 @@ mod tests {
         });
         assert_eq!(s.next().await, ("peer".into(), unreachable.clone()));
         // `auth: basic` without its credentials: every caller is answered 503, none refused.
-        let mut refused = basic("s3cret");
+        let mut refused = basic_api("s3cret");
         refused.credentials = None;
-        auth.set(&refused, crate::test_support::USERNAME_CLAIM);
+        auth.set(&refused, &crate::test_support::console());
         assert_eq!(
             s.next().await,
             ("peer".into(), unreachable),
@@ -897,8 +920,8 @@ mod tests {
         )
         .await;
         let auth = std::sync::Arc::new(crate::Auth::new(
-            &basic("s3cret"),
-            crate::test_support::USERNAME_CLAIM,
+            &basic_api("s3cret"),
+            &crate::test_support::console(),
         ));
         let (addr, lone, _dir) = served_with(&b_url, auth, |_| {}).await;
         let mut s = stream(addr, "/v1/stream", &[("authorization", OPS)]).await;
@@ -914,6 +937,78 @@ mod tests {
         assert_eq!(log.lock().unwrap().len(), 2);
         lone.node.feed.publish(live("node", None, 1));
         assert_eq!(s.next().await.1["n"], 1, "the stream goes on");
+    }
+
+    /// M13f's carry-in: a stream ends with its caller's session, and a token's stream with its
+    /// token, at their end; the page opens it again with fresh credentials.
+    #[tokio::test]
+    async fn a_stream_ends_when_its_session_does() {
+        let hour = Duration::from_secs(3600);
+        let auth = std::sync::Arc::new(crate::Auth::new(&basic_api("s3cret"), &sessions(hour)));
+        let (addr, lone, _dir) = served_with("", auth, |_| {}).await;
+        // It ends within three seconds.
+        let session = basic_session("s3cret", hour - Duration::from_secs(2));
+        let cookie = session_cookie(&session);
+        let opened = std::time::Instant::now();
+        let mut s = stream(addr, "/v1/stream", &[("cookie", cookie.as_str())]).await;
+        assert_eq!(s.code, 200);
+        hello(&mut s).await;
+        lone.node.feed.publish(live("node", None, 1));
+        assert_eq!(
+            s.next().await.1["n"],
+            1,
+            "it streams while the session lasts"
+        );
+        assert_eq!(
+            s.next().await,
+            (
+                "reset".into(),
+                json!({ "node": "node-a", "reason": "credentials" })
+            )
+        );
+        assert!(s.ended().await, "the stream ends: the page opens it again");
+        let took = opened.elapsed();
+        assert!(
+            took >= Duration::from_secs(1) && took < Duration::from_secs(8),
+            "{took:?}"
+        );
+    }
+
+    /// A stream another node asked for is checked here too: the forwarded-by header is one any
+    /// client can send, and it never keeps a stream open past its credentials.
+    #[tokio::test]
+    async fn a_stream_another_node_asked_for_ends_when_its_session_does() {
+        let hour = Duration::from_secs(3600);
+        let auth = std::sync::Arc::new(crate::Auth::new(&basic_api("s3cret"), &sessions(hour)));
+        let (addr, lone, _dir) = served_with("", auth, |_| {}).await;
+        // It ends within three seconds.
+        let session = basic_session("s3cret", hour - Duration::from_secs(2));
+        let cookie = session_cookie(&session);
+        let opened = std::time::Instant::now();
+        let headers = [("cookie", cookie.as_str()), (FORWARDED_BY, "node-c")];
+        let mut s = stream(addr, "/v1/stream", &headers).await;
+        assert_eq!(s.code, 200);
+        let (_, hello) = s.next().await;
+        assert_eq!(hello["follows"], json!([]), "it follows none");
+        lone.node.feed.publish(live("node", None, 1));
+        assert_eq!(
+            s.next().await.1["n"],
+            1,
+            "it streams while the session lasts"
+        );
+        assert_eq!(
+            s.next().await,
+            (
+                "reset".into(),
+                json!({ "node": "node-a", "reason": "credentials" })
+            )
+        );
+        assert!(s.ended().await, "the stream ends");
+        let took = opened.elapsed();
+        assert!(
+            took >= Duration::from_secs(1) && took < Duration::from_secs(8),
+            "{took:?}"
+        );
     }
 
     #[tokio::test]

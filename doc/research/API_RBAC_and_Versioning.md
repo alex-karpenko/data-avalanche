@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-06
+updated: 2026-11-24
 domain: Auth
 tags: [rbac, api, authorization, roles, jwt, oauth2, versioning, management-api, cdc]
 resolves: [G-16, G-9.1]
@@ -129,6 +129,30 @@ As built in M9a (D-M9a.6, and the review fixes in the plan's deviations):
   introspection).
 - A node that left the cluster keeps the auth of its last generation until it is stopped
   (DA-API-14).
+
+As built in M14 (Admin_Console §9.1): with the console on and `auth` `basic` or `oauth2`, a
+request without `Authorization` may carry the console's session cookie (`__Host-da_session`) instead. Its person is
+verified again on every request (the basic user and password; the provider's access token, as a
+bearer token is), so the role and the recorded name come from the same verification. A request the
+session authenticates that changes something sends the session's anti-forgery token
+(`X-CSRF-Token`); without it, 403, not recorded as a role refusal. A token whose roles map to no
+role is refused naming the roles it carried. The OpenAPI document lists the cookie as the
+`session` scheme, and `429` on every operation.
+
+While the console's sessions are on, a 401 for a request without `Authorization` carries
+`WWW-Authenticate: Session realm="data-avalanche"`, so a browser never shows its credentials popup;
+a request that sent `Authorization` gets `Basic` or `Bearer` as before. A session under
+inconsistent settings, or an `oauth2` token that can't be checked now (the provider's keys are
+unreachable), answers 503, not 401.
+
+`basic`: failed `Authorization: Basic` credentials are limited per client address, as the console's
+sign-in form limits them (an IPv6 address by its /64). After 5 failures in a row the address waits
+1 minute: `429` with `Retry-After`, even for the right password. A success starts the count again.
+Bearer tokens and sessions aren't counted. A node keeps at most 10 000 addresses; when its table is
+full, a new address's failures aren't counted, so a flood never locks anyone else out. A request
+forwarded by another node counts against that node's address, so during a password rotation a peer
+may refuse one node's forwarded Basic requests for up to a minute. Behind a proxy every client
+shares the proxy's address (forwarded headers aren't trusted).
 
 ---
 

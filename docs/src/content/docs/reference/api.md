@@ -12,7 +12,7 @@ Every node serves the API on `globals.api.address`. `globals.api.auth` decides w
 
 **Roles.** A route's *least role* is the lowest that may call it: `viewer` reads, `operator` also runs the pipeline commands, snapshots and config reloads, `admin` also makes a node leave the cluster or shut down. With `auth: none` every caller is `admin`; with `auth: basic` the one user is `admin`; with `jwt` or `oauth2` the token's roles are mapped by `roles_claim` and `role_mapping`.
 
-**Answers.** Every body is a JSON object; a refusal carries an `error` string. Every route can also answer `503` (the node is starting or stopping, or its state can't be read) and, unless `auth` is `none`, `401` (no credentials, or ones that don't verify) and `403` (the caller's role is below the route's). A `202` means accepted, not done: a pipeline command or a snapshot job is carried out by the node that holds the pipeline's lease, a reload is published, a leave or a shutdown is under way on the node called.
+**Answers.** Every body is a JSON object; a refusal carries an `error` string. Every route can also answer `503` (the node is starting or stopping, or its state can't be read) and, unless `auth` is `none`, `401` (no credentials, or ones that don't verify) and `403` (the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`). A `202` means accepted, not done: a pipeline command or a snapshot job is carried out by the node that holds the pipeline's lease, a reload is published, a leave or a shutdown is under way on the node called.
 
 **Who did it.** Every route that changes something takes an optional JSON body `{"note": "…"}` and records the action in the cluster's events: what, to what, the caller's name and role as the node verified them, the note, and how it ended (`accepted`, `unchanged`, `refused`). A caller turned away for its role, or with no role mapped, is recorded too (`action.denied`). A note longer than 500 characters, not a string or holding a control character, or a body that isn't a JSON object, is `422`; a body over 1 MiB is `413`; either way nothing is done or recorded.
 
@@ -34,6 +34,7 @@ Least role: `viewer`.
 | Status | When |
 |---|---|
 | `200` | the pipelines |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 
 ### `GET /v1/pipelines/{id}`
 
@@ -47,6 +48,7 @@ Least role: `viewer`.
 |---|---|
 | `200` | the pipeline |
 | `404` | no such pipeline in the generation this node runs |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 
 ### `POST /v1/pipelines/{id}/flush`
 
@@ -66,6 +68,7 @@ Least role: `operator`.
 | `409` | stopped, or no node holds the lease |
 | `413` | the body is over 1 MiB |
 | `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 
 ### `GET /v1/pipelines/{id}/live`
 
@@ -81,6 +84,7 @@ Least role: `viewer`.
 | `404` | no such pipeline in the generation this node runs |
 | `409` | no node holds the lease |
 | `421` | a forwarded request to a node that doesn't run the worker |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 | `502` | the holder didn't answer |
 | `503` | the node is starting or stopping, or its state can't be read; or the holder can't be asked: not a member, or no API address |
 | `504` | the holder didn't answer in time |
@@ -103,6 +107,7 @@ Least role: `operator`.
 | `409` | the pipeline is stopped |
 | `413` | the body is over 1 MiB |
 | `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 
 ### `POST /v1/pipelines/{id}/restart`
 
@@ -121,6 +126,7 @@ Least role: `operator`.
 | `409` | paused, stopped, or no node holds the lease |
 | `413` | the body is over 1 MiB |
 | `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 
 ### `POST /v1/pipelines/{id}/resume`
 
@@ -139,6 +145,7 @@ Least role: `operator`.
 | `404` | no such pipeline in the generation this node runs |
 | `413` | the body is over 1 MiB |
 | `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 
 ### `GET /v1/pipelines/{id}/snapshots`
 
@@ -152,6 +159,7 @@ Least role: `viewer`.
 |---|---|
 | `200` | the jobs |
 | `404` | no such pipeline in the generation this node runs |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 
 ### `POST /v1/pipelines/{id}/snapshots`
 
@@ -170,6 +178,7 @@ Least role: `operator`.
 | `409` | paused, stopped, no node holds the lease, or an unfinished job holds a table |
 | `413` | the body is over 1 MiB |
 | `422` | the body names no table, a glob, or a table not in the source's form; or the note is too long, not a string, holds a control character, or the body isn't a JSON object |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 
 ### `POST /v1/pipelines/{id}/stop`
 
@@ -188,6 +197,7 @@ Least role: `operator`.
 | `404` | no such pipeline in the generation this node runs |
 | `413` | the body is over 1 MiB |
 | `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 
 ### `GET /v1/pipelines/{id}/tables/{table}`
 
@@ -203,6 +213,7 @@ Least role: `viewer`.
 | `200` | the table |
 | `400` | a table name not in the source's form |
 | `404` | no such pipeline, or no trace of the table in it |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 
 ## tables
 
@@ -220,6 +231,7 @@ Least role: `viewer`.
 | `200` | the tables, with counts by listed state |
 | `400` | a parameter that isn't one, or a state that isn't |
 | `404` | no such pipeline in the generation this node runs |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 
 ## snapshots
 
@@ -240,6 +252,7 @@ Least role: `viewer`.
 | `200` | the jobs |
 | `400` | a parameter that isn't one, or a status that isn't |
 | `404` | no such pipeline in the generation this node runs |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 
 ### `GET /v1/snapshots/{job_id}`
 
@@ -253,6 +266,7 @@ Least role: `viewer`.
 |---|---|
 | `200` | the job |
 | `404` | no such job |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 
 ### `POST /v1/snapshots/{job_id}/cancel`
 
@@ -272,6 +286,7 @@ Least role: `operator`.
 | `409` | the job has ended |
 | `413` | the body is over 1 MiB |
 | `422` | the body isn't `{"note": ...}`; or the note is too long, not a string, holds a control character, or the body isn't a JSON object |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 
 ### `POST /v1/snapshots/{job_id}/retry`
 
@@ -290,6 +305,7 @@ Least role: `operator`.
 | `409` | the job hasn't ended, it left no table to copy, the pipeline doesn't run, no node holds its lease, or an unfinished job holds a table |
 | `413` | the body is over 1 MiB |
 | `422` | the body isn't of that form; or the note is too long, not a string, holds a control character, or the body isn't a JSON object |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 
 ## config
 
@@ -310,6 +326,7 @@ Least role: `viewer`.
 | `400` | from or to missing, or not a number |
 | `404` | no such generation |
 | `409` | several snapshots of one and no record of which it is |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 | `500` | a text couldn't be compared |
 | `503` | the node is starting or stopping, or its state can't be read; or the config generations can't be read |
 
@@ -326,6 +343,7 @@ Least role: `viewer`.
 |---|---|
 | `200` | the generations, each `hash` its text's keyed fingerprint (comparable across nodes of one cluster only), and `next` when the page is full |
 | `400` | a parameter that isn't one, or isn't in its form |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 | `503` | the node is starting or stopping, or its state can't be read; or the config generations can't be read |
 
 ### `GET /v1/config/generations/{generation}`
@@ -342,6 +360,7 @@ Least role: `viewer`.
 | `400` | a generation that isn't a number |
 | `404` | no such generation |
 | `409` | several snapshots of it and no record of which one it is |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 | `500` | its text couldn't be masked, so it isn't shown: it has a merge key (`<<`), a tag (a `!` after a space), a directive or a byte-order mark, or a secret or a comment the masker can't place |
 | `503` | the node is starting or stopping, or its state can't be read; or the config generations can't be read |
 
@@ -355,6 +374,7 @@ Least role: `viewer`.
 | Status | When |
 |---|---|
 | `200` | the generation the cluster runs, its `hash` (its text's keyed fingerprint, comparable across nodes of one cluster only), and each member: `file` compares the keyed fingerprints of the member's file and of that text |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 
 ### `POST /v1/config/reload`
 
@@ -373,6 +393,7 @@ Least role: `operator`.
 | `409` | other nodes published first, every time |
 | `413` | the body is over 1 MiB |
 | `422` | invalid, or it changes a restart-only field without restart=accept, or a field the cluster keeps for good: the report; or the note is too long, not a string, holds a control character, or the body isn't a JSON object |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 
 ### `GET /v1/config/status`
 
@@ -384,6 +405,7 @@ Least role: `viewer`.
 | Status | When |
 |---|---|
 | `200` | the generations |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 
 ### `POST /v1/config/validate`
 
@@ -397,7 +419,7 @@ Least role: `operator`.
 |---|---|
 | `200` | it loads: its warnings and the changes |
 | `422` | invalid, or it changes a restart-only field: the report |
-| `429` | posted bodies past the node's rate: `Retry-After` says when |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long; or posted bodies past the node's rate: `Retry-After` says when |
 
 ## cluster
 
@@ -418,6 +440,7 @@ Least role: `admin`.
 | `409` | leaving already |
 | `413` | the body is over 1 MiB |
 | `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 
 ### `GET /v1/cluster/status`
 
@@ -429,6 +452,7 @@ Least role: `viewer`.
 | Status | When |
 |---|---|
 | `200` | the members and the holders; a member's `file_hash` is its file's keyed fingerprint (first 16 hex), comparable across nodes of one cluster only |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 
 ## admin
 
@@ -449,6 +473,7 @@ Least role: `admin`.
 | `409` | shutting down already |
 | `413` | the body is over 1 MiB |
 | `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 
 ## nodes
 
@@ -467,6 +492,7 @@ Least role: `viewer`.
 | `200` | the node's detail; `file.hash` and `file.generation_hash` are keyed fingerprints (first 16 hex), comparable across nodes of one cluster only |
 | `404` | no member of that name in this node's view |
 | `421` | a request forwarded to a node that isn't its target |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 | `502` | the node didn't answer |
 | `503` | the node is starting or stopping, or its state can't be read; or the member gossips no API address |
 | `504` | the node didn't answer within the time limit |
@@ -490,6 +516,7 @@ Least role: `operator`.
 | `413` | the body is over 1 MiB |
 | `421` | a request forwarded to a node that isn't its target |
 | `422` | invalid, or a restart-only field without restart=accept; or the note is too long, not a string, holds a control character, or the body isn't a JSON object |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 | `502` | the node didn't answer |
 | `503` | the node is starting or stopping, or its state can't be read; or the member gossips no API address |
 | `504` | the node didn't answer within the time limit |
@@ -507,6 +534,7 @@ Least role: `viewer`.
 | `200` | the node's config status |
 | `404` | no member of that name in this node's view |
 | `421` | a request forwarded to a node that isn't its target |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 | `502` | the node didn't answer |
 | `503` | the node is starting or stopping, or its state can't be read; or the member gossips no API address |
 | `504` | the node didn't answer within the time limit |
@@ -526,7 +554,7 @@ Least role: `operator`.
 | `404` | no member of that name in this node's view |
 | `421` | a request forwarded to a node that isn't its target |
 | `422` | invalid, or it changes a restart-only field: the report |
-| `429` | posted bodies past the node's rate |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long; or posted bodies past the node's rate |
 | `502` | the node didn't answer |
 | `503` | the node is starting or stopping, or its state can't be read; or the member gossips no API address |
 | `504` | the node didn't answer within the time limit |
@@ -549,6 +577,7 @@ Least role: `admin`.
 | `413` | the body is over 1 MiB |
 | `421` | a request forwarded to a node that isn't its target |
 | `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 | `502` | the node didn't answer |
 | `503` | the node is starting or stopping, or its state can't be read; or the member gossips no API address |
 | `504` | the node didn't answer within the time limit |
@@ -571,6 +600,7 @@ Least role: `admin`.
 | `413` | the body is over 1 MiB |
 | `421` | a request forwarded to a node that isn't its target |
 | `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 | `502` | the node didn't answer |
 | `503` | the node is starting or stopping, or its state can't be read; or the member gossips no API address |
 | `504` | the node didn't answer within the time limit |
@@ -599,6 +629,7 @@ Least role: `viewer`.
 |---|---|
 | `200` | the events, and `next` when there are more |
 | `400` | a parameter that isn't one, or isn't in its form |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 
 ## history
 
@@ -623,6 +654,7 @@ Least role: `viewer`.
 | `200` | each series' points, `[unix seconds, value]`, oldest first; `kept_since`: where the history kept starts |
 | `400` | a parameter that isn't one, or isn't in its form |
 | `404` | no such pipeline in the generation this node runs |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 | `503` | the node is starting or stopping, or its state can't be read; or the chart history can't be read |
 
 ## stream
@@ -643,6 +675,7 @@ Least role: `viewer`.
 | `200` | `text/event-stream`: `hello` first, then each change as it happens, without replay: read the current state, then apply what follows |
 | `400` | a parameter that isn't one, or isn't in its form |
 | `404` | no such pipeline in the generation this node runs |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 | `503` | the node is starting or stopping, or its state can't be read; or as many streams are open on this node as it takes; `Retry-After` says when to try again |
 
 ## openapi.json
@@ -659,4 +692,5 @@ Least role: `viewer`.
 | Status | When |
 |---|---|
 | `200` | the OpenAPI document |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 

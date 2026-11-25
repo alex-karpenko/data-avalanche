@@ -10,7 +10,9 @@ use utoipa::openapi::extensions::ExtensionsBuilder;
 use utoipa::openapi::path::{HttpMethod, OperationBuilder, ParameterBuilder, ParameterIn};
 use utoipa::openapi::request_body::RequestBodyBuilder;
 use utoipa::openapi::schema::{ObjectBuilder, Type};
-use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityRequirement, SecurityScheme};
+use utoipa::openapi::security::{
+    ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityRequirement, SecurityScheme,
+};
 use utoipa::openapi::{
     ComponentsBuilder, ContentBuilder, InfoBuilder, OpenApi, OpenApiBuilder, Paths, Required,
     ResponseBuilder,
@@ -23,9 +25,16 @@ const NOTE_REFUSED: &str = "the note is too long, not a string, holds a control 
 const BODY_TOO_LARGE: &str = "the body is over 1 MiB";
 
 /// Every route's answers besides its own.
-const COMMON: [(u16, &str); 3] = [
+const COMMON: [(u16, &str); 4] = [
     (401, "no credentials, or ones that don't verify"),
-    (403, "the caller's role is below the route's"),
+    (
+        403,
+        "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
+    ),
+    (
+        429,
+        "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+    ),
     (
         503,
         "the node is starting or stopping, or its state can't be read",
@@ -39,6 +48,7 @@ fn operation(r: &Route) -> utoipa::openapi::path::Operation {
         .tag(r.path.split('/').nth(2).unwrap_or("v1"))
         .security(SecurityRequirement::new("basic", Vec::<String>::new()))
         .security(SecurityRequirement::new("bearer", Vec::<String>::new()))
+        .security(SecurityRequirement::new("session", Vec::<String>::new()))
         .extensions(Some(
             ExtensionsBuilder::new().add("x-min-role", role).build(),
         ));
@@ -243,6 +253,13 @@ pub fn openapi() -> OpenApi {
                     .bearer_format("JWT")
                     .build(),
             ),
+        )
+        .security_scheme(
+            "session",
+            SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::with_description(
+                crate::SESSION_COOKIE,
+                "the web console's session (`globals.console`, with `auth` basic or oauth2), taken when a request has no `Authorization`; a request that changes something sends the session's anti-forgery token in `X-CSRF-Token`",
+            ))),
         )
         .build();
     OpenApiBuilder::new()

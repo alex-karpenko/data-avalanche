@@ -331,12 +331,12 @@ pub const FIELD_DOCS: &[FieldDoc] = &[
     f(
         "globals.console.public_url",
         Required,
-        "The console's address as people reach it (`https://cdc.example.com`), for the OAuth2 redirect. Required with the console on under `oauth2` (V-136).",
+        "The console's origin as people reach it (`https://cdc.example.com`), for the OAuth2 redirect URI (`<public_url>/ui/…`): the console is served at the root of its host, under no path prefix. Absolute `http(s)` URL, no user information (`user@`), path (a trailing `/` aside), query or fragment (V-129). Required with the console on under `oauth2` (V-136).",
     ),
     f(
         "globals.console.session_ttl",
         Value("8h"),
-        "How long a session lasts without activity, from 5 minutes to 7 days (V-132).",
+        "How long a session lasts after sign-in, however it is used, from 5 minutes to 7 days (V-132). With `oauth2`, never past the token's expiry unless the provider refreshes it.",
     ),
     f(
         "globals.console.username_claim",

@@ -6,21 +6,34 @@
 //! never introspected (no client credentials are configured). A token's caller is named by
 //! `globals.console.username_claim`, else its `sub`. The settings are R: [`Auth::set`] takes a
 //! reload's. Settings without what their mode reads refuse every request (503).
+//!
+//! With the console enabled and `auth` `basic` or `oauth2`, a request without `Authorization` may
+//! carry the console's session cookie instead (Admin_Console §9, [`crate::session`]): every node
+//! opens it with the session key, and verifies its person again as it verifies credentials, on
+//! every request. A session ends `session_ttl` after sign-in, when the basic user or password
+//! changes, when its provider's token no longer verifies, or when the key or the mode changes.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
-use axum::http::HeaderMap;
-use axum::http::header::AUTHORIZATION;
+use axum::http::header::{AUTHORIZATION, COOKIE};
+use axum::http::{HeaderMap, HeaderValue};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use data_avalanche_config::{Api as ApiConfig, ApiAuth, Credentials, Role};
+use chrono::{DateTime, SecondsFormat, Utc};
+use data_avalanche_config::{
+    Api as ApiConfig, ApiAuth, ApiOauth2, Console, Credentials, Role, Secret,
+};
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{AlgorithmFamily, DecodingKey, Validation, decode, decode_header};
 use serde_json::Value;
 use subtle::ConstantTimeEq;
 use tokio::sync::watch;
+
+use crate::console::Attempts;
+use crate::oauth2::Provider;
+use crate::session::{By, Sealer, Session, Unsealed, session_cookies};
 
 /// A JWKS fetch, or a discovery, takes at most this long.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -46,12 +59,72 @@ struct Timing {
     max_age: Duration,
 }
 
+/// The header a mutating request the console's session authenticates carries its anti-forgery
+/// token in (Admin_Console §9).
+pub const CSRF_HEADER: &str = "x-csrf-token";
+
 /// An authenticated caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal {
     /// The basic user, the token's `username_claim` (else its `sub`), or `anonymous`.
     pub name: String,
     pub role: Role,
+    /// When its credentials stop verifying: a token's `exp`, a session's end (the earlier of
+    /// the two for an `oauth2` session). `None`: they don't expire (basic credentials, `none`).
+    pub expires: Option<DateTime<Utc>>,
+}
+
+/// A caller verified, with the session that verified them, if one did.
+#[derive(Debug, Clone)]
+pub(crate) struct Verified {
+    pub principal: Principal,
+    pub session: Option<Session>,
+}
+
+/// The credentials a caller presented, passed on to a peer as they came (Admin_Console §10): its
+/// `Authorization`, its session's cookies and its anti-forgery token. They never print.
+#[derive(Clone, Default)]
+pub(crate) struct Presented {
+    authorization: Option<HeaderValue>,
+    cookie: Option<HeaderValue>,
+    csrf: Option<HeaderValue>,
+}
+
+impl std::fmt::Debug for Presented {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let shown = |v: &Option<HeaderValue>| v.as_ref().map(|_| "<redacted>");
+        f.debug_struct("Presented")
+            .field("authorization", &shown(&self.authorization))
+            .field("cookie", &shown(&self.cookie))
+            .field("csrf", &shown(&self.csrf))
+            .finish()
+    }
+}
+
+impl Presented {
+    /// What a request with these headers presented: of its cookies, the session's alone.
+    pub(crate) fn of(headers: &HeaderMap) -> Self {
+        Self {
+            authorization: headers.get(AUTHORIZATION).cloned(),
+            cookie: session_cookies(headers).and_then(|c| HeaderValue::from_str(&c).ok()),
+            csrf: headers.get(CSRF_HEADER).cloned(),
+        }
+    }
+
+    /// As headers of a request to a peer, or of the check [`Auth::verify`] makes again.
+    pub(crate) fn headers(&self) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (name, value) in [
+            (AUTHORIZATION.as_str(), &self.authorization),
+            (COOKIE.as_str(), &self.cookie),
+            (CSRF_HEADER, &self.csrf),
+        ] {
+            if let Some(v) = value {
+                h.insert(name, v.clone());
+            }
+        }
+        h
+    }
 }
 
 /// Why a caller is turned away.
@@ -70,7 +143,10 @@ pub(crate) enum Denied {
 }
 
 const BASIC: &str = r#"Basic realm="data-avalanche""#;
-const BEARER: &str = r#"Bearer realm="data-avalanche""#;
+pub(crate) const BEARER: &str = r#"Bearer realm="data-avalanche""#;
+/// The challenge of a request without `Authorization` while the console's sessions are on: a
+/// scheme no browser answers with its own credentials popup (Admin_Console §9).
+pub(crate) const SESSION: &str = r#"Session realm="data-avalanche""#;
 
 /// The settings that decide who calls: `auth` and what it reads.
 #[derive(Debug, Clone, PartialEq)]
@@ -82,18 +158,56 @@ struct Settings {
     role_mapping: BTreeMap<Role, Vec<String>>,
     /// The token claim that names the caller (`globals.console.username_claim`).
     username_claim: String,
+    /// The console's session key and `session_ttl`: set when the console is enabled with `auth`
+    /// `basic` or `oauth2` and a key (V-135).
+    sessions: Option<(Secret, Duration)>,
+    /// `globals.console.enabled`.
+    console: bool,
+    /// `globals.console.public_url`.
+    public_url: Option<String>,
 }
 
 impl Settings {
-    fn of(api: &ApiConfig, username_claim: &str) -> Self {
+    fn of(api: &ApiConfig, console: &Console) -> Self {
+        let sessions = (console.enabled && matches!(api.auth, ApiAuth::Basic | ApiAuth::Oauth2))
+            .then(|| console.session_key.clone())
+            .flatten()
+            .map(|key| (key, console.session_ttl));
         Self {
             auth: api.auth,
             credentials: api.credentials.clone(),
             jwt: api.jwt.clone(),
             oauth2: api.oauth2.clone(),
             role_mapping: api.role_mapping.clone(),
-            username_claim: username_claim.to_owned(),
+            username_claim: console.username_claim.clone(),
+            sessions,
+            console: console.enabled,
+            public_url: console.public_url.clone(),
         }
+    }
+}
+
+/// The console's sessions: the sealer of the session key, and how long a session lasts.
+#[derive(Debug)]
+pub(crate) struct Sessions {
+    pub(crate) sealer: Sealer,
+    pub(crate) ttl: Duration,
+}
+
+impl Sessions {
+    fn of(s: &Settings) -> Option<Arc<Self>> {
+        s.sessions.as_ref().map(|(key, ttl)| {
+            Arc::new(Self {
+                sealer: Sealer::new(key.expose()),
+                ttl: *ttl,
+            })
+        })
+    }
+
+    /// When a session signed in at `signed_in` (Unix seconds) ends.
+    pub(crate) fn ends(&self, signed_in: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(signed_in, 0).unwrap_or_default()
+            + chrono::Duration::from_std(self.ttl).unwrap_or_default()
     }
 }
 
@@ -110,6 +224,18 @@ enum Mode {
 struct Current {
     settings: Settings,
     mode: Arc<Mode>,
+    sessions: Option<Arc<Sessions>>,
+}
+
+/// What the console's own routes (`/ui/`) read of the settings: how people sign in, and the
+/// sessions that keeps them signed in.
+#[derive(Debug, Clone)]
+pub(crate) struct SignIn {
+    pub auth: ApiAuth,
+    pub sessions: Option<Arc<Sessions>>,
+    pub credentials: Option<Credentials>,
+    pub oauth2: Option<ApiOauth2>,
+    pub public_url: Option<String>,
 }
 
 /// The node's authentication, swapped by a reload.
@@ -117,20 +243,24 @@ struct Current {
 pub struct Auth {
     current: RwLock<Current>,
     timing: Timing,
+    /// The failed basic sign-ins of each address (Admin_Console §9).
+    pub(crate) attempts: Attempts,
+    /// The `oauth2` provider's client, for the console's sign-in.
+    pub(crate) provider: Provider,
 }
 
 impl Auth {
-    /// The authentication of `globals.api`, a token's caller named by its `username_claim`
-    /// (`globals.console.username_claim`), else its `sub`.
-    pub fn new(api: &ApiConfig, username_claim: &str) -> Self {
-        Self::build(api, username_claim, REFETCH_AFTER, KEYS_MAX_AGE)
+    /// The authentication of `globals.api`, a token's caller named by `console`'s
+    /// `username_claim`, else its `sub`; with the console's sessions when `console` enables them.
+    pub fn new(api: &ApiConfig, console: &Console) -> Self {
+        Self::build(api, console, REFETCH_AFTER, KEYS_MAX_AGE)
     }
 
     #[cfg(test)]
     pub(crate) fn with_refetch_after(api: &ApiConfig, refetch_after: Duration) -> Self {
         Self::build(
             api,
-            crate::test_support::USERNAME_CLAIM,
+            &crate::test_support::console(),
             refetch_after,
             KEYS_MAX_AGE,
         )
@@ -138,17 +268,12 @@ impl Auth {
 
     #[cfg(test)]
     pub(crate) fn with_timing(api: &ApiConfig, refetch_after: Duration, max_age: Duration) -> Self {
-        Self::build(
-            api,
-            crate::test_support::USERNAME_CLAIM,
-            refetch_after,
-            max_age,
-        )
+        Self::build(api, &crate::test_support::console(), refetch_after, max_age)
     }
 
     fn build(
         api: &ApiConfig,
-        username_claim: &str,
+        console: &Console,
         refetch_after: Duration,
         max_age: Duration,
     ) -> Self {
@@ -156,22 +281,25 @@ impl Auth {
             refetch_after,
             max_age,
         };
-        let settings = Settings::of(api, username_claim);
+        let settings = Settings::of(api, console);
         Self {
             current: RwLock::new(Current {
                 mode: Arc::new(mode(&settings, timing, None)),
+                sessions: Sessions::of(&settings),
                 settings,
             }),
             timing,
+            attempts: Attempts::default(),
+            provider: Provider::default(),
         }
     }
 
     /// Takes a reload's settings. Unchanged ones keep the cached JWKS, and so do changed ones
     /// whose keys come from where they did (the same issuer and JWKS or discovery URL): a
-    /// change of the audience, the roles claim, the role mapping or the username claim fetches
-    /// nothing.
-    pub fn set(&self, api: &ApiConfig, username_claim: &str) {
-        let settings = Settings::of(api, username_claim);
+    /// change of the audience, the roles claim, the role mapping, the username claim or the
+    /// console's sessions fetches nothing.
+    pub fn set(&self, api: &ApiConfig, console: &Console) {
+        let settings = Settings::of(api, console);
         let mut current = self.current.write().unwrap_or_else(PoisonError::into_inner);
         if current.settings != settings {
             let keys = match &*current.mode {
@@ -179,12 +307,27 @@ impl Auth {
                 _ => None,
             };
             current.mode = Arc::new(mode(&settings, self.timing, keys));
+            current.sessions = Sessions::of(&settings);
             current.settings = settings;
         }
     }
 
-    /// The caller of a request with these headers.
-    pub(crate) async fn verify(&self, headers: &HeaderMap) -> Result<Principal, Denied> {
+    /// How people sign in to the console, while it is enabled.
+    pub(crate) fn sign_in(&self) -> Option<SignIn> {
+        let current = self.current.read().unwrap_or_else(PoisonError::into_inner);
+        let s = &current.settings;
+        s.console.then(|| SignIn {
+            auth: s.auth,
+            sessions: current.sessions.clone(),
+            credentials: s.credentials.clone(),
+            oauth2: s.oauth2.clone(),
+            public_url: s.public_url.clone(),
+        })
+    }
+
+    /// The caller `token` names, verified as a bearer token is (`jwt`, `oauth2`): what the
+    /// console's sign-in checks of the provider's token before it starts a session.
+    pub(crate) async fn verify_token(&self, token: &str) -> Result<Principal, Denied> {
         let mode = Arc::clone(
             &self
                 .current
@@ -193,14 +336,96 @@ impl Auth {
                 .mode,
         );
         match &*mode {
+            Mode::Token(verifier) => verifier.verify_token(token).await,
+            _ => Err(Denied::Unavailable(MISCONFIGURED.into())),
+        }
+    }
+
+    /// Whether `/v1` limits failed `Authorization: Basic` credentials: while `auth` is `basic`.
+    pub(crate) fn limits_basic(&self) -> bool {
+        self.current
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .settings
+            .auth
+            == ApiAuth::Basic
+    }
+
+    /// [`Self::verify_caller`] for a request from `from`, limiting `Authorization: Basic`
+    /// credentials by address while `auth` is `basic` (Admin_Console §9): `Err` with the wait
+    /// left while the address waits, its credentials not compared; else the attempt is counted
+    /// as failed, and a match resets the count. Without an address nothing is counted.
+    pub(crate) async fn verify_from(
+        &self,
+        headers: &HeaderMap,
+        from: Option<std::net::IpAddr>,
+    ) -> Result<Result<Verified, Denied>, Duration> {
+        let counted = from.filter(|_| self.limits_basic() && sent_basic(headers));
+        if let Some(ip) = counted {
+            self.attempts.attempt(ip, std::time::Instant::now())?;
+        }
+        let verified = self.verify_caller(headers).await;
+        if let Some(ip) = counted {
+            match &verified {
+                Ok(_) => self.attempts.succeeded(ip),
+                // The node couldn't tell: the attempt is given back, earlier failures stay.
+                Err(Denied::Unavailable(_)) => self.attempts.refund(ip),
+                Err(_) => {}
+            }
+        }
+        Ok(verified)
+    }
+
+    /// The caller of a request with these headers.
+    pub(crate) async fn verify(&self, headers: &HeaderMap) -> Result<Principal, Denied> {
+        self.verify_caller(headers).await.map(|v| v.principal)
+    }
+
+    /// The caller of a request with these headers, and their session: one is opened when the
+    /// request has no `Authorization` and the console's sessions are on.
+    pub(crate) async fn verify_caller(&self, headers: &HeaderMap) -> Result<Verified, Denied> {
+        let sessions_on = self
+            .current
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .sessions
+            .is_some();
+        let verified = self.verified(headers).await;
+        match verified {
+            Err(Denied::Unauthenticated { why, .. })
+                if sessions_on && !headers.contains_key(AUTHORIZATION) =>
+            {
+                Err(unauthenticated(SESSION, why))
+            }
+            other => other,
+        }
+    }
+
+    async fn verified(&self, headers: &HeaderMap) -> Result<Verified, Denied> {
+        let (mode, sessions) = {
+            let current = self.current.read().unwrap_or_else(PoisonError::into_inner);
+            (Arc::clone(&current.mode), current.sessions.clone())
+        };
+        if !headers.contains_key(AUTHORIZATION)
+            && let Some(sessions) = &sessions
+            && let Some(opened) = Session::of(headers, &sessions.sealer)
+        {
+            return session(&mode, sessions, opened, Utc::now()).await;
+        }
+        let principal = match &*mode {
             Mode::Open => Ok(Principal {
                 name: "anonymous".into(),
                 role: Role::Admin,
+                expires: None,
             }),
             Mode::Basic(credentials) => basic(credentials, headers),
             Mode::Token(verifier) => verifier.verify(headers).await,
             Mode::Refused => Err(Denied::Unavailable(MISCONFIGURED.into())),
-        }
+        }?;
+        Ok(Verified {
+            principal,
+            session: None,
+        })
     }
 
     /// Waits for the JWKS fetch under way, if any.
@@ -267,11 +492,95 @@ fn mode(s: &Settings, timing: Timing, keys: Option<Arc<Keys>>) -> Mode {
     }
 }
 
+/// A session's person, verified again at `now`: it ends `ttl` after sign-in, whatever its use;
+/// a basic session's user and password are still the configured ones; an oauth2 session's
+/// access token verifies as a bearer token does.
+async fn session(
+    mode: &Mode,
+    sessions: &Sessions,
+    opened: Result<Session, Unsealed>,
+    now: DateTime<Utc>,
+) -> Result<Verified, Denied> {
+    let challenge = match mode {
+        Mode::Basic(_) => BASIC,
+        _ => BEARER,
+    };
+    let session = opened.map_err(|e| unauthenticated(challenge, e.to_string()))?;
+    let ends = sessions.ends(session.signed_in);
+    if now >= ends {
+        return Err(unauthenticated(
+            challenge,
+            format!(
+                "the session expired at {} ({} after sign-in)",
+                ends.to_rfc3339_opts(SecondsFormat::Secs, true),
+                span(sessions.ttl)
+            ),
+        ));
+    }
+    let principal = match (mode, &session.by) {
+        (Mode::Basic(c), By::Basic { user, fingerprint }) => {
+            let now_password = sessions.sealer.fingerprint(c.password().expose());
+            if !bool::from(same(user, c.user()) & same(fingerprint, &now_password)) {
+                return Err(unauthenticated(
+                    BASIC,
+                    "the user or the password changed since the sign-in",
+                ));
+            }
+            Principal {
+                name: user.clone(),
+                role: Role::Admin,
+                expires: Some(ends),
+            }
+        }
+        (Mode::Token(verifier), By::Oauth2 { access, .. }) => {
+            let mut p = verifier.verify_token(access).await.map_err(|d| match d {
+                Denied::Unauthenticated { challenge, why } => {
+                    unauthenticated(challenge, format!("the provider's token: {why}"))
+                }
+                other => other,
+            })?;
+            p.expires = Some(p.expires.map_or(ends, |at| at.min(ends)));
+            p
+        }
+        (Mode::Refused, _) => return Err(Denied::Unavailable(MISCONFIGURED.into())),
+        _ => {
+            return Err(unauthenticated(
+                challenge,
+                "the cluster's sign-in changed since the session began",
+            ));
+        }
+    };
+    Ok(Verified {
+        principal,
+        session: Some(session),
+    })
+}
+
+/// A duration as a page says it: `8 h`, `90 min`, `45 s`.
+pub(crate) fn span(d: Duration) -> String {
+    match d.as_secs() {
+        s if s % 3600 == 0 => format!("{} h", s / 3600),
+        s if s % 60 == 0 => format!("{} min", s / 60),
+        s => format!("{s} s"),
+    }
+}
+
 fn unauthenticated(challenge: &'static str, why: impl Into<String>) -> Denied {
     Denied::Unauthenticated {
         challenge,
         why: why.into(),
     }
+}
+
+/// Whether the request sent `Authorization: Basic`, well formed or not.
+pub(crate) fn sent_basic(headers: &HeaderMap) -> bool {
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.get(..5).map(|scheme| (scheme, &v[5..])))
+        .is_some_and(|(scheme, rest)| {
+            scheme.eq_ignore_ascii_case("basic") && (rest.is_empty() || rest.starts_with(' '))
+        })
 }
 
 /// The value of `Authorization: <scheme> <value>`, the scheme matched without case.
@@ -288,6 +597,17 @@ fn same(given: &str, expected: &str) -> subtle::Choice {
         .ct_eq(blake3::hash(expected.as_bytes()).as_bytes())
 }
 
+/// Whether `given` is `expected`, compared in constant time.
+pub(crate) fn same_secret(given: &str, expected: &str) -> bool {
+    bool::from(same(given, expected))
+}
+
+/// Whether `user` and `password` are the configured ones, both compared in full whichever
+/// differs.
+pub(crate) fn basic_matches(c: &Credentials, user: &str, password: &str) -> bool {
+    bool::from(same(user, c.user()) & same(password, c.password().expose()))
+}
+
 fn basic(c: &Credentials, headers: &HeaderMap) -> Result<Principal, Denied> {
     let given = credential(headers, "Basic")
         .ok_or_else(|| unauthenticated(BASIC, "basic credentials are required"))?;
@@ -299,13 +619,11 @@ fn basic(c: &Credentials, headers: &HeaderMap) -> Result<Principal, Denied> {
     let (user, password) = decoded
         .split_once(':')
         .ok_or_else(|| unauthenticated(BASIC, "the basic credentials don't decode"))?;
-    // Both compared in full, whichever differs.
-    let user_ok = same(user, c.user());
-    let password_ok = same(password, c.password().expose());
-    if bool::from(user_ok & password_ok) {
+    if basic_matches(c, user, password) {
         Ok(Principal {
             name: user.to_owned(),
             role: Role::Admin,
+            expires: None,
         })
     } else {
         Err(unauthenticated(BASIC, "wrong user or password"))
@@ -326,6 +644,11 @@ impl Verifier {
     async fn verify(&self, headers: &HeaderMap) -> Result<Principal, Denied> {
         let token = credential(headers, "Bearer")
             .ok_or_else(|| unauthenticated(BEARER, "a bearer token is required"))?;
+        self.verify_token(token).await
+    }
+
+    /// The caller `token` names, once it verifies.
+    pub(crate) async fn verify_token(&self, token: &str) -> Result<Principal, Denied> {
         let header = decode_header(token)
             .map_err(|e| unauthenticated(BEARER, format!("not a token: {e}")))?;
         if AlgorithmFamily::Hmac == header.alg.family() {
@@ -362,20 +685,30 @@ impl Verifier {
             .or_else(|| claims.get("sub").and_then(Value::as_str))
             .unwrap_or("unknown")
             .to_owned();
-        let Some(role) = roles(&claims, &self.roles_claim)
-            .iter()
-            .filter_map(|r| map(&self.mapping, r))
-            .max()
-        else {
+        let expires = claims
+            .get("exp")
+            .and_then(Value::as_i64)
+            .and_then(|exp| DateTime::from_timestamp(exp, 0));
+        let carried = roles(&claims, &self.roles_claim);
+        let Some(role) = carried.iter().filter_map(|r| map(&self.mapping, r)).max() else {
+            let carried = if carried.is_empty() {
+                "none".to_owned()
+            } else {
+                carried.join(", ")
+            };
             return Err(Denied::Forbidden {
                 why: format!(
-                    "the token's {} name no role this node maps",
+                    "the token's {} ({carried}) name no role this node maps",
                     self.roles_claim
                 ),
                 name,
             });
         };
-        Ok(Principal { name, role })
+        Ok(Principal {
+            name,
+            role,
+            expires,
+        })
     }
 }
 
@@ -619,7 +952,11 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::test_support::{Issuer, USERNAME_CLAIM, config, sign_with};
+    use crate::session::{By, Session};
+    use crate::test_support::{
+        Issuer, basic_api, basic_session, config, console, console_naming, session_cookie,
+        sessions, sign_with,
+    };
 
     fn bearer(token: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
@@ -693,7 +1030,7 @@ mod tests {
 
     #[tokio::test]
     async fn without_auth_every_caller_is_admin() {
-        let auth = Auth::new(&config().globals.api, USERNAME_CLAIM);
+        let auth = Auth::new(&config().globals.api, &console());
         let p = auth.verify(&HeaderMap::new()).await.unwrap();
         assert_eq!((p.name.as_str(), p.role), ("anonymous", Role::Admin));
     }
@@ -730,7 +1067,7 @@ mod tests {
         };
         let token = bearer(&idp.token(json!(["admin"])));
         for api in [jwt_without, basic_without, oauth2_without_urls] {
-            let auth = Auth::new(&api, USERNAME_CLAIM);
+            let auth = Auth::new(&api, &console());
             for headers in [HeaderMap::new(), token.clone()] {
                 let why = unavailable(auth.verify(&headers).await);
                 assert!(why.contains("inconsistent"), "{:?}: {why}", api.auth);
@@ -746,7 +1083,7 @@ mod tests {
             user: "ops".into(),
             password: Secret::new("s3cret", &FingerprintKey::from_bytes([1; 32])),
         });
-        let auth = Auth::new(&api, USERNAME_CLAIM);
+        let auth = Auth::new(&api, &console());
         let with = |user_pass: &str| {
             let mut h = HeaderMap::new();
             let v = format!("basic {}", STANDARD.encode(user_pass));
@@ -767,7 +1104,7 @@ mod tests {
     #[tokio::test]
     async fn a_token_s_highest_mapped_role_is_the_caller_s() {
         let idp = Issuer::start().await;
-        let auth = Auth::new(&idp.api("roles"), USERNAME_CLAIM);
+        let auth = Auth::new(&idp.api("roles"), &console());
         let role = |roles| {
             let token = idp.token(roles);
             let auth = &auth;
@@ -792,7 +1129,7 @@ mod tests {
             (Role::Viewer, vec!["readonly".into()]),
             (Role::Admin, vec!["cdc-admin".into()]),
         ]);
-        let auth = Auth::new(&api, USERNAME_CLAIM);
+        let auth = Auth::new(&api, &console());
         let realm = |roles| {
             let mut claims = idp.claims(json!(null));
             claims["realm_access"] = json!({ "roles": roles });
@@ -817,7 +1154,7 @@ mod tests {
         let idp = Issuer::start().await;
         let named = |claims: &Value, username_claim: &str| {
             let (auth, token) = (
-                Auth::new(&idp.api("roles"), username_claim),
+                Auth::new(&idp.api("roles"), &console_naming(username_claim)),
                 bearer(&idp.sign("k1", claims)),
             );
             async move { auth.verify(&token).await.unwrap().name }
@@ -837,8 +1174,8 @@ mod tests {
             "not a string"
         );
         // A reload's claim is the one taken.
-        let auth = Auth::new(&idp.api("roles"), "preferred_username");
-        auth.set(&idp.api("roles"), "email");
+        let auth = Auth::new(&idp.api("roles"), &console_naming("preferred_username"));
+        auth.set(&idp.api("roles"), &console_naming("email"));
         let p = auth.verify(&bearer(&idp.sign("k1", &claims))).await;
         assert_eq!(p.unwrap().name, "oleksii@example.com");
         // A token with no role this node maps is refused under its name.
@@ -855,7 +1192,7 @@ mod tests {
     async fn a_namespaced_roles_claim_is_read_by_its_name() {
         let idp = Issuer::start().await;
         let claim = "https://example.com/roles";
-        let auth = Auth::new(&idp.api(claim), USERNAME_CLAIM);
+        let auth = Auth::new(&idp.api(claim), &console());
         let mut claims = idp.claims(json!(null));
         claims[claim] = json!(["operator"]);
         let p = auth.verify(&bearer(&idp.sign("k1", &claims))).await;
@@ -865,7 +1202,7 @@ mod tests {
     #[tokio::test]
     async fn a_token_that_doesnt_verify_is_refused() {
         let idp = Issuer::start().await;
-        let auth = Auth::new(&idp.api("roles"), USERNAME_CLAIM);
+        let auth = Auth::new(&idp.api("roles"), &console());
         let now = jsonwebtoken::get_current_timestamp();
         let with = |f: &dyn Fn(&mut Value)| {
             let mut c = idp.claims(json!(["admin"]));
@@ -944,7 +1281,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_key_ids_fetch_at_most_once_a_refetch_interval() {
         let idp = Issuer::start().await;
-        let auth = Auth::new(&idp.api("roles"), USERNAME_CLAIM);
+        let auth = Auth::new(&idp.api("roles"), &console());
         auth.verify(&bearer(&idp.token(json!(["viewer"]))))
             .await
             .unwrap();
@@ -974,16 +1311,13 @@ mod tests {
         };
         api.oauth2 = Some(oauth2(&idp.url));
         let token = bearer(&idp.token(json!(["operator"])));
-        let p = Auth::new(&api, USERNAME_CLAIM)
-            .verify(&token)
-            .await
-            .unwrap();
+        let p = Auth::new(&api, &console()).verify(&token).await.unwrap();
         assert_eq!(p.role, Role::Operator);
 
         // A discovery document of another issuer is not this one's.
         api.oauth2 = Some(oauth2("https://idp.example.com"));
         // The reason is logged; the caller isn't told the URL or the error.
-        let why = unavailable(Auth::new(&api, USERNAME_CLAIM).verify(&token).await);
+        let why = unavailable(Auth::new(&api, &console()).verify(&token).await);
         assert_eq!(why, "the token issuer's keys can't be fetched");
         assert!(!why.contains(&idp.url), "{why}");
     }
@@ -997,7 +1331,7 @@ mod tests {
         let url = format!("http://{}/jwks", closed.local_addr().unwrap());
         drop(closed);
         api.jwt.as_mut().unwrap().jwks_url = url;
-        let auth = Auth::new(&api, USERNAME_CLAIM);
+        let auth = Auth::new(&api, &console());
         let token = bearer(&idp.token(json!(["admin"])));
         // Again, inside the refetch window: still no keys, still 503.
         for _ in 0..2 {
@@ -1013,7 +1347,7 @@ mod tests {
         let token = bearer(&idp.token(json!(["viewer"])));
 
         // Young keys are trusted: the withdrawal isn't heard yet.
-        let young = Auth::new(&api, USERNAME_CLAIM);
+        let young = Auth::new(&api, &console());
         young.verify(&token).await.unwrap();
         idp.remove_key("k1");
         idp.add_key("k2");
@@ -1152,7 +1486,7 @@ mod tests {
         let idp = Issuer::start().await;
         let mut api = idp.api("roles");
         api.jwt.as_mut().unwrap().audience = None;
-        let auth = Auth::new(&api, USERNAME_CLAIM);
+        let auth = Auth::new(&api, &console());
         let mut claims = idp.claims(json!(["operator"]));
         claims.as_object_mut().unwrap().remove("aud");
         let p = auth.verify(&bearer(&idp.sign("k1", &claims))).await;
@@ -1163,13 +1497,13 @@ mod tests {
     async fn a_reload_of_the_role_mapping_keeps_the_keys() {
         let idp = Issuer::start().await;
         let api = idp.api("roles");
-        let auth = Auth::new(&api, USERNAME_CLAIM);
+        let auth = Auth::new(&api, &console());
         let token = bearer(&idp.token(json!(["viewer"])));
         assert_eq!(auth.verify(&token).await.unwrap().role, Role::Viewer);
         idp.set_down(true);
         let mut mapped = api.clone();
         mapped.role_mapping = BTreeMap::from([(Role::Admin, vec!["viewer".into()])]);
-        auth.set(&mapped, USERNAME_CLAIM);
+        auth.set(&mapped, &console());
         let p = auth.verify(&token).await;
         assert_eq!(
             p.unwrap().role,
@@ -1184,17 +1518,17 @@ mod tests {
     async fn a_reload_keeps_the_keys_unless_their_source_changes() {
         let idp = Issuer::start().await;
         let api = idp.api("roles");
-        let auth = Auth::new(&api, USERNAME_CLAIM);
+        let auth = Auth::new(&api, &console());
         let token = bearer(&idp.token(json!(["viewer"])));
         auth.verify(&token).await.unwrap();
         let mut moved = api.clone();
         moved.address.port = 9_999;
-        auth.set(&moved, USERNAME_CLAIM);
+        auth.set(&moved, &console());
         auth.verify(&token).await.unwrap();
         assert_eq!(idp.fetches.load(Ordering::SeqCst), 1);
         let mut other = api.clone();
         other.jwt.as_mut().unwrap().audience = Some("another-api".into());
-        auth.set(&other, USERNAME_CLAIM);
+        auth.set(&other, &console());
         denied_401(auth.verify(&token).await);
         assert_eq!(
             idp.fetches.load(Ordering::SeqCst),
@@ -1203,13 +1537,245 @@ mod tests {
         );
         let mut moved = api.clone();
         moved.jwt.as_mut().unwrap().jwks_url = format!("{}/jwks?again", idp.url);
-        auth.set(&moved, USERNAME_CLAIM);
+        auth.set(&moved, &console());
         auth.verify(&token).await.unwrap();
         assert_eq!(idp.fetches.load(Ordering::SeqCst), 2, "another JWKS URL");
-        auth.set(&config().globals.api, USERNAME_CLAIM);
+        auth.set(&config().globals.api, &console());
         assert_eq!(
             auth.verify(&HeaderMap::new()).await.unwrap().role,
             Role::Admin
         );
+    }
+
+    fn with_cookie(cookie: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(COOKIE, HeaderValue::from_str(cookie).unwrap());
+        h
+    }
+
+    const HOUR: Duration = Duration::from_secs(3600);
+
+    /// Admin_Console §9: every node opens a session with the key every node has, and verifies its
+    /// person again as it verifies basic credentials.
+    #[tokio::test]
+    async fn a_basic_session_verifies_on_every_node_with_the_key() {
+        let session = basic_session("s3cret", Duration::from_secs(60));
+        let ends = DateTime::from_timestamp(session.signed_in, 0).unwrap() + HOUR;
+        let cookie = with_cookie(&format!("theme=dark; {}", session_cookie(&session)));
+        for _node in 0..2 {
+            let auth = Auth::new(&basic_api("s3cret"), &sessions(HOUR));
+            let v = auth.verify_caller(&cookie).await.unwrap();
+            assert_eq!(
+                v.principal,
+                Principal {
+                    name: "ops".into(),
+                    role: Role::Admin,
+                    expires: Some(ends),
+                }
+            );
+            assert_eq!(v.session, Some(session.clone()));
+        }
+        // Credentials sent beside it are the ones taken.
+        let mut both = cookie.clone();
+        both.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Basic b3BzOm5vcGU="),
+        );
+        let auth = Auth::new(&basic_api("s3cret"), &sessions(HOUR));
+        assert_eq!(
+            denied_401(auth.verify(&both).await),
+            "wrong user or password"
+        );
+    }
+
+    /// S-M14.1: a session ends `session_ttl` after sign-in, however it was used.
+    #[tokio::test]
+    async fn a_session_ends_its_ttl_after_sign_in() {
+        let auth = Auth::new(&basic_api("s3cret"), &sessions(8 * HOUR));
+        let old = basic_session("s3cret", 8 * HOUR + Duration::from_secs(1));
+        let why = denied_401(auth.verify(&with_cookie(&session_cookie(&old))).await);
+        let ends = DateTime::from_timestamp(old.signed_in, 0).unwrap() + 8 * HOUR;
+        assert_eq!(
+            why,
+            format!(
+                "the session expired at {} (8 h after sign-in)",
+                ends.to_rfc3339_opts(SecondsFormat::Secs, true)
+            )
+        );
+        // A shorter `session_ttl`, reloaded, ends older sessions at once.
+        let young = basic_session("s3cret", 2 * HOUR);
+        let cookie = with_cookie(&session_cookie(&young));
+        auth.verify(&cookie).await.unwrap();
+        auth.set(&basic_api("s3cret"), &sessions(HOUR));
+        assert!(denied_401(auth.verify(&cookie).await).contains("(1 h after sign-in)"));
+    }
+
+    /// Config §6.8: a password or a session key changed, the sign-in's mode changed, or the
+    /// console switched off, and a session no longer lets its person in.
+    #[tokio::test]
+    async fn a_session_ends_with_its_password_its_key_or_its_mode() {
+        let cookie = with_cookie(&session_cookie(&basic_session("s3cret", HOUR / 2)));
+        let auth = Auth::new(&basic_api("s3cret"), &sessions(HOUR));
+        auth.verify(&cookie).await.unwrap();
+        auth.set(&basic_api("rotated"), &sessions(HOUR));
+        assert_eq!(
+            denied_401(auth.verify(&cookie).await),
+            "the user or the password changed since the sign-in"
+        );
+        let mut rekeyed = sessions(HOUR);
+        rekeyed.session_key = Some(Secret::new(
+            "another session key, of 32 bytes or more",
+            &FingerprintKey::from_bytes([1; 32]),
+        ));
+        auth.set(&basic_api("s3cret"), &rekeyed);
+        assert_eq!(
+            denied_401(auth.verify(&cookie).await),
+            "the session key changed"
+        );
+        auth.set(&basic_api("s3cret"), &sessions(HOUR));
+        assert_eq!(
+            denied_401(auth.verify(&with_cookie("__Host-da_session=AAAA")).await),
+            "the session cookie doesn't decrypt"
+        );
+        // The console off: the cookie isn't looked at.
+        auth.set(&basic_api("s3cret"), &console());
+        assert_eq!(
+            denied_401(auth.verify(&cookie).await),
+            "basic credentials are required"
+        );
+        // Another mode: a basic session isn't an oauth2 one.
+        let idp = Issuer::start().await;
+        auth.set(&idp.oauth2_api("roles"), &sessions(HOUR));
+        assert_eq!(
+            denied_401(auth.verify(&cookie).await),
+            "the cluster's sign-in changed since the session began"
+        );
+        // `jwt` and `none` have no sessions.
+        for api in [idp.api("roles"), config().globals.api] {
+            auth.set(&api, &sessions(HOUR));
+            assert!(
+                auth.verify_caller(&cookie)
+                    .await
+                    .map_or(true, |v| v.session.is_none())
+            );
+        }
+    }
+
+    /// Admin_Console §9: an oauth2 session's role and name come from its access token, verified as
+    /// a bearer token is; it lasts while both the token and the session do.
+    #[tokio::test]
+    async fn an_oauth2_session_verifies_its_token_as_a_bearer_token_is() {
+        let idp = Issuer::start().await;
+        let auth = Auth::new(&idp.oauth2_api("roles"), &sessions(8 * HOUR));
+        let session_of = |claims: &Value| {
+            Session::new(
+                By::Oauth2 {
+                    access: idp.sign("k1", claims),
+                    refresh: None,
+                },
+                Utc::now().timestamp() - 60,
+            )
+        };
+        let mut claims = idp.claims(json!(["operator"]));
+        claims["preferred_username"] = json!("alice.smith");
+        let cookie = with_cookie(&session_cookie(&session_of(&claims)));
+        let p = auth.verify(&cookie).await.unwrap();
+        let exp = claims["exp"].as_i64().unwrap();
+        assert_eq!(
+            (p.name.as_str(), p.role, p.expires),
+            (
+                "alice.smith",
+                Role::Operator,
+                DateTime::from_timestamp(exp, 0)
+            ),
+            "the token's expiry, before the session's"
+        );
+        // The session's end, when the token outlives it.
+        let short = Auth::new(
+            &idp.oauth2_api("roles"),
+            &sessions(Duration::from_secs(300)),
+        );
+        let s = session_of(&claims);
+        let ends = DateTime::from_timestamp(s.signed_in + 300, 0);
+        let p = short.verify(&with_cookie(&session_cookie(&s))).await;
+        assert_eq!(p.unwrap().expires, ends);
+        // A token expired (past the verifier's minute of leeway) or with no role mapped.
+        let mut expired = claims.clone();
+        expired["exp"] = json!(Utc::now().timestamp() - 120);
+        let why = denied_401(
+            auth.verify(&with_cookie(&session_cookie(&session_of(&expired))))
+                .await,
+        );
+        assert!(why.starts_with("the provider's token: "), "{why}");
+        let mut unmapped = claims.clone();
+        unmapped["roles"] = json!(["cdc-reader"]);
+        assert!(matches!(
+            auth.verify(&with_cookie(&session_cookie(&session_of(&unmapped))))
+                .await,
+            Err(Denied::Forbidden { name, .. }) if name == "alice.smith"
+        ));
+    }
+
+    fn challenge_of(r: Result<Principal, Denied>) -> &'static str {
+        match r {
+            Err(Denied::Unauthenticated { challenge, .. }) => challenge,
+            other => panic!("not a 401: {other:?}"),
+        }
+    }
+
+    /// Admin_Console §9: with the sessions on, a 401 to a request without `Authorization`
+    /// carries a challenge no browser answers with its credentials popup.
+    #[tokio::test]
+    async fn a_refused_session_or_no_credentials_are_challenged_for_a_session() {
+        let on = Auth::new(&basic_api("s3cret"), &sessions(HOUR));
+        let old = basic_session("s3cret", 2 * HOUR);
+        let refused = on.verify(&with_cookie(&session_cookie(&old))).await;
+        assert_eq!(challenge_of(refused), SESSION);
+        assert_eq!(challenge_of(on.verify(&HeaderMap::new()).await), SESSION);
+        // Credentials sent keep their scheme's challenge.
+        let mut wrong = HeaderMap::new();
+        wrong.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Basic b3BzOm5vcGU="),
+        );
+        assert_eq!(challenge_of(on.verify(&wrong).await), BASIC);
+        // The console off: nothing changes.
+        let off = Auth::new(&basic_api("s3cret"), &console());
+        assert_eq!(challenge_of(off.verify(&HeaderMap::new()).await), BASIC);
+        let idp = Issuer::start().await;
+        let oauth2 = Auth::new(&idp.oauth2_api("roles"), &sessions(HOUR));
+        assert_eq!(
+            challenge_of(oauth2.verify(&HeaderMap::new()).await),
+            SESSION
+        );
+        assert_eq!(challenge_of(oauth2.verify(&bearer("nope")).await), BEARER);
+    }
+
+    /// A verifier that can't check refuses no one: a session too is answered 503.
+    #[tokio::test]
+    async fn a_session_under_inconsistent_settings_is_answered_unavailable() {
+        let cookie = with_cookie(&session_cookie(&basic_session("s3cret", HOUR / 2)));
+        let mut api = basic_api("s3cret");
+        api.credentials = None;
+        let auth = Auth::new(&api, &sessions(HOUR));
+        assert_eq!(
+            auth.verify_caller(&cookie).await.map(|_| ()),
+            Err(Denied::Unavailable(MISCONFIGURED.into()))
+        );
+    }
+
+    /// What a peer is passed of a caller's credentials never prints.
+    #[test]
+    fn what_a_caller_presented_never_prints() {
+        let p = crate::test_support::presented(&[
+            ("authorization", "Bearer the-token"),
+            ("cookie", "__Host-da_session=the-session"),
+            (CSRF_HEADER, "the-csrf"),
+        ]);
+        let printed = format!("{p:?}");
+        for secret in ["the-token", "the-session", "the-csrf"] {
+            assert!(!printed.contains(secret), "{printed}");
+        }
+        assert_eq!(p.headers().len(), 3);
     }
 }

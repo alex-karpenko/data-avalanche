@@ -5,8 +5,9 @@
 
 use std::time::Duration;
 
-use axum::http::{HeaderValue, header};
+use axum::http::header;
 
+use crate::auth::Presented;
 use crate::peers::{DETAIL_LIMIT, FORWARDED_BY, Peers, TARGET};
 
 /// The largest message read from a followed stream.
@@ -137,8 +138,8 @@ async fn reason(mut answer: reqwest::Response) -> Option<String> {
 }
 
 impl Peers {
-    /// Opens node `node`'s stream at `api_url` + `path_and_query` with the caller's
-    /// `authorization`, answered within [`DETAIL_LIMIT`]; dropped once it sends nothing for
+    /// Opens node `node`'s stream at `api_url` + `path_and_query` with the credentials the
+    /// caller `presented`, answered within [`DETAIL_LIMIT`]; dropped once it sends nothing for
     /// `silence`. An answer other than `200` is an error naming its code and its own reason, read
     /// to a cap and clipped.
     pub(crate) async fn follow(
@@ -146,18 +147,16 @@ impl Peers {
         node: &str,
         api_url: &str,
         path_and_query: &str,
-        authorization: Option<HeaderValue>,
+        presented: &Presented,
         silence: Duration,
     ) -> Result<Followed, String> {
-        let mut req = self
+        let req = self
             .http
             .get(format!("{api_url}{path_and_query}"))
+            .headers(presented.headers())
             .header(TARGET, node)
             .header(FORWARDED_BY, &self.me)
             .header(header::ACCEPT, "text/event-stream");
-        if let Some(a) = authorization {
-            req = req.header(header::AUTHORIZATION, a);
-        }
         let answer = match tokio::time::timeout(DETAIL_LIMIT, req.send()).await {
             Err(_) => return Err(format!("it didn't answer within {DETAIL_LIMIT:?}")),
             Ok(Err(e)) => return Err(crate::peers::cause(&e)),
@@ -191,6 +190,7 @@ mod tests {
     use futures_util::stream;
 
     use super::*;
+    use crate::test_support::presented;
 
     fn frame(kind: &str, data: &str) -> Frame {
         Frame {
@@ -279,7 +279,10 @@ mod tests {
                 "node-b",
                 &url,
                 "/v1/stream?kind=node",
-                Some(HeaderValue::from_static("Basic dmlld2VyOnZpZXdlcg==")),
+                &presented(&[
+                    ("authorization", "Basic dmlld2VyOnZpZXdlcg=="),
+                    ("cookie", "theme=dark; __Host-da_session=abc"),
+                ]),
                 silence,
             )
             .await
@@ -293,6 +296,11 @@ mod tests {
         assert_eq!(h[TARGET], "node-b");
         assert_eq!(h[FORWARDED_BY], "node-a");
         assert_eq!(h[header::AUTHORIZATION], "Basic dmlld2VyOnZpZXdlcg==");
+        assert_eq!(
+            h[header::COOKIE],
+            "__Host-da_session=abc",
+            "the session's cookie alone"
+        );
     }
 
     #[tokio::test]
@@ -305,7 +313,13 @@ mod tests {
         .await;
         let peers = Peers::new("node-a", None).unwrap();
         let err = peers
-            .follow("node-b", &url, "/v1/stream", None, FOLLOW_SILENCE)
+            .follow(
+                "node-b",
+                &url,
+                "/v1/stream",
+                &Presented::default(),
+                FOLLOW_SILENCE,
+            )
             .await
             .unwrap_err();
         assert_eq!(err, "it answered 404: no pipeline \"x\"");
@@ -314,7 +328,7 @@ mod tests {
                 "node-b",
                 "http://127.0.0.1:9",
                 "/v1/stream",
-                None,
+                &Presented::default(),
                 FOLLOW_SILENCE,
             )
             .await
@@ -333,7 +347,13 @@ mod tests {
         )
         .await;
         let err = peers
-            .follow("node-b", &url, "/v1/stream", None, FOLLOW_SILENCE)
+            .follow(
+                "node-b",
+                &url,
+                "/v1/stream",
+                &Presented::default(),
+                FOLLOW_SILENCE,
+            )
             .await
             .unwrap_err();
         assert_eq!(err, "it answered 502", "a body over the cap isn't read");
@@ -344,7 +364,13 @@ mod tests {
         )
         .await;
         let err = peers
-            .follow("node-b", &url, "/v1/stream", None, FOLLOW_SILENCE)
+            .follow(
+                "node-b",
+                &url,
+                "/v1/stream",
+                &Presented::default(),
+                FOLLOW_SILENCE,
+            )
             .await
             .unwrap_err();
         assert_eq!(

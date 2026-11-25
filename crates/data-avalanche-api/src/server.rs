@@ -13,7 +13,8 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::Router;
-use axum::serve::Listener;
+use axum::extract::connect_info::Connected;
+use axum::serve::{IncomingStream, Listener};
 use data_avalanche_config::{HostPort, TlsIdentity};
 use rustls::ServerConfig;
 use rustls_pki_types::pem::PemObject;
@@ -114,13 +115,15 @@ impl Bound {
                     open,
                     idle: self.idle_timeout,
                 };
-                axum::serve(listener, router)
+                let service = router.into_make_service_with_connect_info::<Client>();
+                axum::serve(listener, service)
                     .with_graceful_shutdown(stop)
                     .await
             }
             Some(tls) => {
                 let listener = TlsListener::start(self.tcp, tls, open, self.idle_timeout)?;
-                axum::serve(listener, router)
+                let service = router.into_make_service_with_connect_info::<Client>();
+                axum::serve(listener, service)
                     .with_graceful_shutdown(stop)
                     .await
             }
@@ -224,6 +227,23 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Counted<S> {
 
     fn is_write_vectored(&self) -> bool {
         self.io.is_write_vectored()
+    }
+}
+
+/// The address a request came from, as its connection says: a proxy's own, behind one. The
+/// console's sign-in counts failures by it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Client(pub SocketAddr);
+
+impl Connected<IncomingStream<'_, Capped>> for Client {
+    fn connect_info(stream: IncomingStream<'_, Capped>) -> Self {
+        Self(*stream.remote_addr())
+    }
+}
+
+impl Connected<IncomingStream<'_, TlsListener>> for Client {
+    fn connect_info(stream: IncomingStream<'_, TlsListener>) -> Self {
+        Self(*stream.remote_addr())
     }
 }
 

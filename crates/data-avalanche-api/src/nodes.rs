@@ -454,8 +454,8 @@ mod tests {
     use super::*;
     use crate::peers::{ANSWERED_BY, Peers, TARGET};
     use crate::test_support::{
-        CONFIG, Issuer, Log, Seen, USERNAME_CLAIM, api, fake, lone_with, member, open, request,
-        serve, served,
+        CONFIG, Issuer, Log, Seen, api, console, fake, lone_with, member, open, request, serve,
+        served,
     };
     use crate::{Auth, Stop};
 
@@ -483,6 +483,8 @@ mod tests {
                     authorization: headers
                         .get("authorization")
                         .map(|v| v.to_str().unwrap().to_owned()),
+                    cookie: None,
+                    csrf: None,
                     target: None,
                     forwarded_by: None,
                     body: String::new(),
@@ -749,6 +751,37 @@ mod tests {
         assert_eq!(seen.forwarded_by.as_deref(), Some("node-a"));
     }
 
+    /// M13f's carry-in: a peer opens the console's session with the key every node has, so a
+    /// node passes the session on as it passes a token, with its anti-forgery token.
+    #[tokio::test]
+    async fn a_node_action_is_forwarded_with_the_callers_session() {
+        let (b, log) = fake(Duration::ZERO).await;
+        let auth = Auth::new(
+            &crate::test_support::basic_api("s3cret"),
+            &crate::test_support::sessions(Duration::from_secs(3600)),
+        );
+        let (addr, _lone, _dir) = served(&b, Arc::new(auth)).await;
+        let session = crate::test_support::basic_session("s3cret", Duration::from_secs(60));
+        let cookie = format!(
+            "theme=dark; {}",
+            crate::test_support::session_cookie(&session)
+        );
+        let sent = [
+            ("Cookie", cookie.as_str()),
+            (crate::CSRF_HEADER, session.csrf.as_str()),
+        ];
+        let (code, _, text) = request(addr, "POST", "/v1/nodes/node-b/leave", &sent, "").await;
+        assert_eq!(code, 202, "{text}");
+        let seen = log.lock().unwrap()[0].clone();
+        assert_eq!(seen.authorization, None);
+        assert_eq!(
+            seen.cookie.as_deref(),
+            cookie.strip_prefix("theme=dark; "),
+            "the session's cookies alone"
+        );
+        assert_eq!(seen.csrf.as_deref(), Some(session.csrf.as_str()));
+    }
+
     #[tokio::test]
     async fn a_peer_that_doesnt_answer_is_named_within_the_limit() {
         let (addr, _lone, _dir) = served("http://127.0.0.1:1", open()).await;
@@ -853,7 +886,7 @@ mod tests {
         let idp = Issuer::start().await;
         let (b, log) = fake(Duration::ZERO).await;
         let (addr, lone, _dir) =
-            served(&b, Arc::new(Auth::new(&idp.api("roles"), USERNAME_CLAIM))).await;
+            served(&b, Arc::new(Auth::new(&idp.api("roles"), &console()))).await;
         let token = format!("Bearer {}", idp.token(json!(["viewer"])));
         let auth = [("Authorization", token.as_str())];
         let (code, _, _) = request(addr, "POST", "/v1/nodes/node-b/leave", &auth, "").await;

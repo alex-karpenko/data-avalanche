@@ -11,6 +11,7 @@ mod cluster;
 mod console_history;
 mod console_nodes;
 mod console_pipelines;
+mod console_sessions;
 mod console_stream;
 mod crashes;
 mod events;
