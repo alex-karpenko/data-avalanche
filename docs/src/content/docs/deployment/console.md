@@ -69,14 +69,21 @@ gets is verified as any API token is: its signature, expiry, issuer, audience an
 When the provider issues refresh tokens, a session's token is refreshed by the next console page
 asked for once the token expires within a minute (or already has, while the session lasts), or by
 the app's `POST /ui/session/refresh`. `/v1` calls with the cookie don't refresh. A node makes one
-refresh per refresh token at a time and gives its outcome to the same token for 30 s, since a
-provider that rotates refresh tokens refuses one used twice. That is per node: behind a load
-balancer two nodes may refresh one session at once, so a provider that rotates refresh tokens
-should allow a short reuse window. A session past
-its end is never refreshed: it ends when it would have. If the provider's token can't be checked at
-the moment (its keys are unreachable), the sign-in callback answers 503; the person tries again.
-Signing out removes the session's cookies and, when the provider has an end-session endpoint,
-signs out there (see Sessions).
+refresh per refresh token at a time and gives its outcome (a new token or a refusal) to the same
+token for 30 s, since a provider that rotates refresh tokens refuses one used twice. That is per
+node: behind a load balancer two nodes may refresh one session at once, so a provider that rotates
+refresh tokens should allow a short reuse window. A session past its end is never refreshed: it
+ends when it would have.
+
+A provider that refuses a refresh (it answers 4xx: a revoked or spent refresh token) ends the
+session, once its token has expired: the page says so (401), and so does the app's refresh. A
+provider that can't be reached (no connection, a timeout, a 5xx, its discovery document unreadable)
+doesn't: the page or the refresh answers 503 with `Retry-After`, "try again in a moment", the
+session's cookies are kept, and the node asks the provider again at the next request. If the
+provider's token can't be checked at the moment (its keys are unreachable), the sign-in callback
+answers 503; the person tries again. Failed sign-ins and refreshes are also logged with the
+provider's error, never a token. Signing out removes the session's cookies and, when the provider
+has an end-session endpoint, signs out there (see Sessions).
 
 ## Sessions
 
@@ -85,7 +92,7 @@ so a load balancer may send each request anywhere. It ends `session_ttl` after s
 default), however it is used, and sooner when:
 
 - the basic user or password changes;
-- the provider's token expires and can't be refreshed;
+- the provider's token expires and the provider refuses its refresh;
 - `session_key` or `globals.api.auth` changes;
 - the console is switched off.
 
@@ -99,8 +106,9 @@ returns to `/ui/`.
 
 The cookie is `__Host-da_session`: `HttpOnly`, `Secure`, `SameSite=Strict`, `Path=/`, and no
 `Domain`, so a sibling subdomain can't plant one. A session too long for one cookie (a provider's
-long tokens) goes on in `__Host-da_session.1` to `.3`. With `oauth2`, `da_oauth2` (the sign-in in
-progress) and `da_id` (the ID token, for the sign-out) are also set, each scoped to its own path.
+long tokens) goes on in `__Host-da_session.1` to `.3`. With `oauth2`, two more are set:
+`__Host-da_oauth2`, the sign-in in progress (`Path=/`, `SameSite=Lax` so the provider's redirect
+back brings it, 10 min), and `da_id`, the ID token for the sign-out (sent only to `/ui/sign-out`).
 
 A request that has a session but whose settings are inconsistent, or whose token can't be
 checked at the moment, answers 503, not 401.
@@ -117,11 +125,13 @@ ends with its session, with a `reset` message, and the page opens it again.
 ## Behind a proxy
 
 - Serve the console and `/v1` at the root of one host, with no path prefix: the console's redirects
-  and routes are absolute `/ui/…` paths, the `__Host-` cookie must be `Path=/`, and the provider
+  and routes are absolute `/ui/…` paths, the `__Host-` cookies must be `Path=/`, and the provider
   returns to `public_url` + `/ui/oauth2/callback`. `globals.console.public_url` is that origin, with
   no path.
-- Terminate TLS in front or on the listener (see above), and pass `Host` through: the console
-  compares a form's `Origin` with it.
+- Terminate TLS in front or on the listener (see above), and pass `Host` through: when a browser
+  doesn't say where a form came from (`Sec-Fetch-Site`), the console compares the form's `Origin`
+  with `Host`, or with `public_url`'s origin when it is set, so a proxy that rewrites `Host` needs
+  `public_url`.
 - Don't strip or rewrite the `Cookie` and `Set-Cookie` headers, and don't add a `Domain`.
 - Every client shares the proxy's address for the password limit above.
 - A session long enough to need three or more cookies (a provider's long tokens) makes a `Cookie`
