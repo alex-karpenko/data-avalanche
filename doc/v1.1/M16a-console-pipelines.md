@@ -5790,3 +5790,10 @@ git commit -m "test(e2e): the pipelines' pages and actions in a browser, a viewe
   one. The list now acts on the selected pipelines its filters show (`chosen` = `shown` ∩
   `selected`), counts those, and keeps the hidden ones ticked for when the filter clears.
   `List.test.ts` gained a test. No later task touches `List.svelte` or `rows.ts`.
+- **Task 5, `ui/src/pipelines/{Pipeline.svelte,page.svelte.ts}` (fix commit after the task's
+  own).** The task review found the page short of "every panel shows how old its data is"
+  (Admin_Console §8): a part whose read failed kept its data without its age, the Snapshot and
+  Activity panels didn't dim while the stream was stale, and the source's `read_at` went
+  unshown. Now a failed part says `jobs (HTTP 503), last read 20 min ago` (or `never read`), every
+  panel dims while stale as on the Overview, and the Source panel says `read 40 s ago`. `read.at`
+  takes the page's injected clock. Five tests were added. No later task touches these files.
