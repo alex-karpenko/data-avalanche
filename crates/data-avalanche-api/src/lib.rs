@@ -68,7 +68,9 @@ pub use follow::{FOLLOW_SILENCE, MAX_FRAME};
 pub use history::{MAX_POINTS, MAX_SPAN};
 pub use limit::{RateLimit, VALIDATE_BURST, VALIDATE_PER_SECOND};
 pub use live::FRESH_WITHIN;
-pub use oauth2::{AUTO_REDIRECT, ID_COOKIE, REFRESH_AHEAD, SIGN_IN_COOKIE, SIGN_IN_WITHIN};
+pub use oauth2::{
+    AUTO_REDIRECT, ID_COOKIE, REFRESH_AHEAD, REFRESH_RETRY_AFTER, SIGN_IN_COOKIE, SIGN_IN_WITHIN,
+};
 pub use openapi::openapi;
 pub use peers::{
     ACTION_LIMIT, ANSWERED_BY, DETAIL_LIMIT, FORWARDED_BY, MAX_ANSWER, Peers, PeersError,

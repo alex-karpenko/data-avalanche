@@ -24,8 +24,8 @@ use serde_json::{Value, json};
 
 use crate::auth::{Denied, FETCH_TIMEOUT, MAX_KEY_DOCUMENT, Sessions, SignIn};
 use crate::console::{
-    challenged, client, frame, html, params, safe_next, same_origin, see_other, session_cookies,
-    session_json, too_many_json, with_cookies,
+    challenged, client, frame, html, params, retry_after, safe_next, same_origin, see_other,
+    session_cookies, session_json, too_many_json, with_cookies,
 };
 use crate::pages;
 use crate::session::{By, KEPT_AFTER, Session, as_sent, cookie, random_token, removed, set_cookie};
@@ -44,6 +44,9 @@ const ENDPOINTS_MAX_AGE: Duration = Duration::from_secs(600);
 /// refresh token: a provider that rotates refresh tokens refuses one used twice, and may end
 /// the whole sign-in for it.
 const REFRESHED_KEPT: Duration = Duration::from_secs(30);
+/// A refresh the provider couldn't be reached for is answered 503, its `Retry-After` this long:
+/// the session isn't over, and the refresh is made again once the provider is back.
+pub const REFRESH_RETRY_AFTER: Duration = Duration::from_secs(5);
 
 /// The provider's endpoints the console uses.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,8 +73,21 @@ impl std::fmt::Debug for Tokens {
     }
 }
 
-/// When a refresh was made, and what it gave.
-type Refreshed = (Instant, Result<Tokens, String>);
+/// Why the provider gave no tokens.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum Failed {
+    /// The provider refused (it answered 4xx: `invalid_grant`, a revoked token): a refresh it
+    /// refused ends the session.
+    #[error("{0}")]
+    Refused(String),
+    /// The provider couldn't be reached, or answered what isn't an answer (a transport error, a
+    /// timeout, a 5xx, a discovery document that can't be read): try again in a moment.
+    #[error("{0}")]
+    Unreachable(String),
+}
+
+/// When a refresh was made, and what it gave: a success or a refusal, never an outage.
+type Refreshed = (Instant, Result<Tokens, Failed>);
 
 /// The discovery URL read and the issuer it was checked against, its endpoints, and when.
 type Discovered = (String, String, Endpoints, Instant);
@@ -97,7 +113,8 @@ pub(crate) struct Provider {
 struct InFlight<'p> {
     refreshing: &'p Mutex<HashMap<Digest, Arc<tokio::sync::Mutex<()>>>>,
     key: Digest,
-    lock: Arc<tokio::sync::Mutex<()>>,
+    /// Held until the drop, which lets it go under the map's lock.
+    lock: Option<Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl Drop for InFlight<'_> {
@@ -106,12 +123,13 @@ impl Drop for InFlight<'_> {
             .refreshing
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        // The last of the requests that share this entry removes it (the map's and this one's
-        // are the only holders left; another takes its own under the map's lock).
+        // This request's holder goes under the map's lock, where every other is taken and let
+        // go: the last of the requests that share the entry sees the map's the only one left,
+        // and removes it.
+        drop(self.lock.take());
         if in_flight
             .get(&self.key)
-            .is_some_and(|l| Arc::ptr_eq(l, &self.lock))
-            && Arc::strong_count(&self.lock) == 2
+            .is_some_and(|l| Arc::strong_count(l) == 1)
         {
             in_flight.remove(&self.key);
         }
@@ -208,7 +226,17 @@ impl Provider {
         {
             return Ok(e.clone());
         }
-        let doc: Value = serde_json::from_slice(&self.read(self.http.get(&url)).await?)
+        let discovered = self.discover(o, url).await;
+        if let Err(e) = &discovered {
+            tracing::warn!("the console's oauth2 provider can't be discovered: {e}");
+        }
+        discovered
+    }
+
+    /// Reads `url`, the discovery document of `o`, and caches its endpoints.
+    async fn discover(&self, o: &ApiOauth2, url: String) -> Result<Endpoints, String> {
+        let read = self.read(self.http.get(&url)).await;
+        let doc: Value = serde_json::from_slice(&read.map_err(|e| e.to_string())?)
             .map_err(|e| format!("{url}: {e}"))?;
         let found = doc.get("issuer").and_then(Value::as_str);
         if found != Some(o.issuer.as_str()) {
@@ -253,16 +281,18 @@ impl Provider {
 
     /// The body of `req`'s answer: a redirect isn't followed, an answer other than `200` is an
     /// error with the provider's `error_description` (or `error`), and a body past
-    /// [`MAX_KEY_DOCUMENT`] isn't read.
-    async fn read(&self, req: reqwest::RequestBuilder) -> Result<Vec<u8>, String> {
-        let mut r = req.send().await.map_err(|e| crate::peers::cause(&e))?;
+    /// [`MAX_KEY_DOCUMENT`] isn't read. A 4xx is the provider's refusal; anything else that
+    /// isn't a `200` is an outage.
+    async fn read(&self, req: reqwest::RequestBuilder) -> Result<Vec<u8>, Failed> {
+        let unreachable = |e: reqwest::Error| Failed::Unreachable(crate::peers::cause(&e));
+        let mut r = req.send().await.map_err(unreachable)?;
         let code = r.status();
         let mut body = Vec::new();
-        while let Some(chunk) = r.chunk().await.map_err(|e| crate::peers::cause(&e))? {
+        while let Some(chunk) = r.chunk().await.map_err(unreachable)? {
             if body.len() + chunk.len() > MAX_KEY_DOCUMENT {
-                return Err(format!(
+                return Err(Failed::Unreachable(format!(
                     "the provider's answer is longer than {MAX_KEY_DOCUMENT} bytes"
-                ));
+                )));
             }
             body.extend_from_slice(&chunk);
         }
@@ -273,9 +303,14 @@ impl Provider {
                     .and_then(Value::as_str)
                     .map(|s| crate::actions::clipped(s, crate::MAX_ERROR).into_owned())
             });
-            return Err(match said {
+            let why = match said {
                 Some(s) => format!("the provider answered {}: {s}", code.as_u16()),
                 None => format!("the provider answered {}", code.as_u16()),
+            };
+            return Err(if code.is_client_error() {
+                Failed::Refused(why)
+            } else {
+                Failed::Unreachable(why)
             });
         }
         Ok(body)
@@ -287,7 +322,7 @@ impl Provider {
         o: &ApiOauth2,
         e: &Endpoints,
         form: &[(&str, &str)],
-    ) -> Result<Tokens, String> {
+    ) -> Result<Tokens, Failed> {
         let (form, basic) = client_form(o, e, form);
         let mut req = self
             .http
@@ -302,11 +337,12 @@ impl Provider {
         }
         let answer = self.read(req.body(form)).await?;
         let v: Value = serde_json::from_slice(&answer)
-            .map_err(|e| format!("the provider's token answer: {e}"))?;
+            .map_err(|e| Failed::Unreachable(format!("the provider's token answer: {e}")))?;
         let text = |name: &str| v.get(name).and_then(Value::as_str).map(str::to_owned);
         Ok(Tokens {
-            access: text("access_token")
-                .ok_or("the provider's token answer has no access_token")?,
+            access: text("access_token").ok_or_else(|| {
+                Failed::Unreachable("the provider's token answer has no access_token".into())
+            })?,
             refresh: text("refresh_token"),
             id: text("id_token"),
         })
@@ -323,7 +359,7 @@ impl Provider {
         code: &str,
         verifier: &str,
         redirect_uri: &str,
-    ) -> Result<Tokens, String> {
+    ) -> Result<Tokens, Failed> {
         self.token(
             o,
             e,
@@ -339,29 +375,31 @@ impl Provider {
 
     /// Refreshes with `refresh` (RFC 6749 §6); a provider that issues no new refresh token keeps
     /// the old one. Another request bringing the same refresh token within
-    /// [`REFRESHED_KEPT`] gets this one's outcome, without asking the provider again.
+    /// [`REFRESHED_KEPT`] gets this one's outcome, without asking the provider again, unless the
+    /// provider couldn't be reached: that isn't kept, so the next request asks again.
     ///
     /// # Errors
-    /// The provider refused it.
+    /// [`Failed`]: the provider refused it, or couldn't be reached.
     pub(crate) async fn refresh(
         &self,
         o: &ApiOauth2,
         e: &Endpoints,
         refresh: &str,
-    ) -> Result<Tokens, String> {
+    ) -> Result<Tokens, Failed> {
         let key = *blake3::hash(refresh.as_bytes()).as_bytes();
         let in_flight = InFlight {
             refreshing: &self.refreshing,
             key,
-            lock: Arc::clone(
+            lock: Some(Arc::clone(
                 self.refreshing
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .entry(key)
                     .or_default(),
-            ),
+            )),
         };
-        let _one_at_a_time = in_flight.lock.lock().await;
+        let held = in_flight.lock.as_deref().expect("held until the drop");
+        let _one_at_a_time = held.lock().await;
         {
             let mut done = self
                 .refreshed
@@ -383,18 +421,25 @@ impl Provider {
                 t.refresh = t.refresh.or_else(|| Some(refresh.to_owned()));
                 t
             });
-        self.refreshed
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(key, (Instant::now(), outcome.clone()));
+        if let Err(e) = &outcome {
+            // The provider's words, never a token.
+            tracing::warn!("an oauth2 session's refresh failed: {e}");
+        }
+        if !matches!(outcome, Err(Failed::Unreachable(_))) {
+            self.refreshed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(key, (Instant::now(), outcome.clone()));
+        }
         outcome
     }
 }
 
 /// The cookie a sign-in leaves for the provider with: its state, PKCE verifier and `next`,
-/// sealed. Sent back only to the callback, and `SameSite=Lax`: the provider's redirect back is
-/// another site's navigation, which a `Strict` cookie doesn't follow.
-pub const SIGN_IN_COOKIE: &str = "da_oauth2";
+/// sealed. `SameSite=Lax`: the provider's redirect back is another site's navigation, which a
+/// `Strict` cookie doesn't follow. `__Host-`, so no sibling host can plant one (a sign-in of its
+/// own, for a login CSRF), which takes the path `/`.
+pub const SIGN_IN_COOKIE: &str = "__Host-da_oauth2";
 /// The cookie that keeps the provider's ID token, sealed, for the sign-out's `id_token_hint`:
 /// sent only to `/ui/sign-out`.
 pub const ID_COOKIE: &str = "da_id";
@@ -456,11 +501,17 @@ impl<'s> Client<'s> {
 }
 
 /// `form-action`'s other sources: the provider's origins a sign-out form goes on to (the
-/// issuer's, and its end-session endpoint's once discovered).
-pub(crate) fn form_action(api: &Api, sign_in: &SignIn) -> String {
+/// issuer's, and its end-session endpoint's). A page (`discover`) on a node that hasn't
+/// discovered the provider yet discovers it first, a failure aside: a browser applies
+/// `form-action` to the sign-out's redirect.
+pub(crate) async fn form_action(api: &Api, sign_in: &SignIn, discover: bool) -> String {
     let Some(c) = Client::of(sign_in) else {
         return String::new();
     };
+    if discover && api.auth.provider.cached(c.o).is_none() {
+        // Without its endpoints, the issuer's origin alone (as with no end-session endpoint).
+        let _ = api.auth.provider.endpoints(c.o).await;
+    }
     let mut origins: BTreeSet<String> = origin(&c.o.issuer).into_iter().collect();
     if let Some(end) = api
         .auth
@@ -514,7 +565,7 @@ fn failed(
 ) -> Response {
     with_cookies(
         not_signed_in(api, sign_in, c, code, next, why),
-        [removed(SIGN_IN_COOKIE, CALLBACK)],
+        [removed(SIGN_IN_COOKIE, "/")],
     )
 }
 
@@ -603,7 +654,7 @@ pub(crate) async fn start(State(api): State<Api>, RawQuery(raw): RawQuery) -> Re
         [set_cookie(
             SIGN_IN_COOKIE,
             &sealed,
-            CALLBACK,
+            "/",
             SIGN_IN_WITHIN.as_secs(),
             "Lax",
         )],
@@ -669,12 +720,16 @@ pub(crate) async fn callback(
         );
     };
     let tokens = match api.auth.provider.endpoints(c.o).await {
-        Ok(e) => {
-            api.auth
-                .provider
-                .exchange(c.o, &e, code, &started.verifier, &c.redirect_uri())
-                .await
-        }
+        Ok(e) => api
+            .auth
+            .provider
+            .exchange(c.o, &e, code, &started.verifier, &c.redirect_uri())
+            .await
+            .map_err(|e| {
+                // The provider's words, never the code or the verifier.
+                tracing::warn!("an oauth2 sign-in's code wasn't exchanged: {e}");
+                e.to_string()
+            }),
         Err(e) => Err(e),
     };
     let tokens = match tokens {
@@ -692,7 +747,7 @@ pub(crate) async fn callback(
                     StatusCode::FORBIDDEN,
                     pages::forbidden(&frame(&api, &sign_in), &name, &why, false),
                 ),
-                [removed(SIGN_IN_COOKIE, CALLBACK)],
+                [removed(SIGN_IN_COOKIE, "/")],
             );
         }
         Err(Denied::Unauthenticated { why, .. }) => {
@@ -720,9 +775,7 @@ pub(crate) async fn callback(
             StatusCode::OK,
             pages::signing_in(&frame(&api, &sign_in), &started.next),
         ),
-        cookies
-            .into_iter()
-            .chain([removed(SIGN_IN_COOKIE, CALLBACK)]),
+        cookies.into_iter().chain([removed(SIGN_IN_COOKIE, "/")]),
     );
     let id = tokens
         .id
@@ -739,20 +792,28 @@ pub(crate) async fn callback(
 /// token, so it ends when it would have.
 ///
 /// # Errors
-/// It has no refresh token, or the provider refused it.
+/// [`Failed::Refused`]: it has no refresh token, or the provider refused it;
+/// [`Failed::Unreachable`]: the provider can't be reached.
 pub(crate) async fn renewed(
     api: &Api,
     c: &Client<'_>,
     session: &Session,
-) -> Result<Session, String> {
+) -> Result<Session, Failed> {
     let By::Oauth2 {
         refresh: Some(refresh),
         ..
     } = &session.by
     else {
-        return Err("the provider issued no refresh token".into());
+        return Err(Failed::Refused(
+            "the provider issued no refresh token".into(),
+        ));
     };
-    let e = api.auth.provider.endpoints(c.o).await?;
+    let e = api
+        .auth
+        .provider
+        .endpoints(c.o)
+        .await
+        .map_err(Failed::Unreachable)?;
     let t = api.auth.provider.refresh(c.o, &e, refresh).await?;
     Ok(Session {
         by: By::Oauth2 {
@@ -770,7 +831,7 @@ pub(crate) async fn due(
     api: &Api,
     sign_in: &SignIn,
     headers: &HeaderMap,
-) -> Option<Result<Session, String>> {
+) -> Option<Result<Session, Failed>> {
     let c = Client::of(sign_in)?;
     let session = Session::of(headers, &c.sessions.sealer)?.ok()?;
     let By::Oauth2 {
@@ -793,7 +854,8 @@ pub(crate) async fn due(
 
 /// `POST /ui/session/refresh`: the console's app refreshes its session ahead of its token's
 /// expiry, sending the session's anti-forgery token; it answers as `GET /ui/session` does, with
-/// the new cookies.
+/// the new cookies. A provider that refuses the refresh is a 401; one that can't be reached a
+/// 503 with `Retry-After`, the session's cookies kept.
 pub(crate) async fn refresh(
     State(api): State<Api>,
     info: Option<Extension<ConnectInfo<crate::server::Client>>>,
@@ -847,7 +909,19 @@ pub(crate) async fn refresh(
     }
     let new = match renewed(&api, &c, &session).await {
         Ok(s) => s,
-        Err(e) => return unauthorized(format!("the provider's token couldn't be refreshed: {e}")),
+        // The session goes on: its cookies are kept, and the app tries again.
+        Err(Failed::Unreachable(e)) => {
+            return retry_after(
+                body(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({ "error": format!("the provider's token couldn't be refreshed: {e}") }),
+                ),
+                REFRESH_RETRY_AFTER,
+            );
+        }
+        Err(Failed::Refused(e)) => {
+            return unauthorized(format!("the provider's token couldn't be refreshed: {e}"));
+        }
     };
     let cookies = match session_cookies(&new, c.sessions) {
         Ok(cookies) => cookies,
@@ -983,6 +1057,14 @@ mod tests {
         let start = format!("/ui/oauth2/start?next={}", pages::encode(next));
         let (code, head, _) = request(addr, "GET", &start, &[], "").await;
         assert_eq!(code, 303);
+        // `__Host-`: no sibling host can plant it, so its path is `/`.
+        let set = header_of(&head, "set-cookie");
+        assert!(
+            set.iter().any(|c| c.starts_with("__Host-da_oauth2=")
+                && c.contains("; Path=/;")
+                && c.contains("Max-Age=600; HttpOnly; Secure; SameSite=Lax")),
+            "{set:?}"
+        );
         let at_provider = header_of(&head, "location")[0].to_owned();
         let left_with = kept_for(&head, CALLBACK);
         let back = reqwest::Client::builder()
@@ -1076,7 +1158,7 @@ mod tests {
         let set = header_of(&head, "set-cookie");
         assert!(
             set.iter()
-                .any(|c| c.starts_with("da_oauth2=;") && c.contains("Max-Age=0")),
+                .any(|c| c.starts_with("__Host-da_oauth2=; Path=/;") && c.contains("Max-Age=0")),
             "the sign-in's state is spent: {set:?}"
         );
         assert!(
@@ -1125,7 +1207,7 @@ mod tests {
         let spent = |head: &str| {
             header_of(head, "set-cookie")
                 .iter()
-                .any(|c| c.starts_with("da_oauth2=;"))
+                .any(|c| c.starts_with("__Host-da_oauth2=; Path=/;"))
         };
         let refused = "/ui/oauth2/callback?error=access_denied&error_description=The+user+said+no";
         for unbound in [
@@ -1245,6 +1327,94 @@ mod tests {
             page.contains("Your session has ended")
                 && page.contains("The provider&#39;s token expired and couldn&#39;t be refreshed: the provider answered 400: the refresh token was revoked."),
             "{page}"
+        );
+        // The app's refresh too: a refusal (`invalid_grant`) is a 401, the cookies kept.
+        let now = Utc::now().timestamp();
+        let session = oauth2_session(&idp, "refresh-app", now - 600, now + 30);
+        let (code, head, text) = refresh_of(addr, &session).await;
+        assert_eq!(code, 401, "{text}");
+        assert!(text.contains("the refresh token was revoked"), "{text}");
+        assert!(header_of(&head, "retry-after").is_empty(), "{head}");
+        assert!(removals(&head).is_empty(), "{head}");
+    }
+
+    /// A provider that can't be reached during a refresh isn't the session ending: a page and
+    /// the app's refresh answer 503 with `Retry-After`, the cookies kept.
+    #[tokio::test]
+    async fn a_refresh_whose_provider_can_t_be_reached_is_unavailable_not_ended() {
+        let idp = Issuer::start().await;
+        // Nothing listens on port 1: the connection is refused.
+        *idp.sign_ins.discovery.lock().unwrap() =
+            json!({ "token_endpoint": "http://127.0.0.1:1/token" });
+        let addr = node(&idp, |_| {}).await;
+        let now = Utc::now().timestamp();
+        let expired = oauth2_session(&idp, "refresh-page", now - 600, now - 120);
+        let cookie = crate::test_support::session_cookie(&expired);
+        let (code, head, page) =
+            request(addr, "GET", "/ui/x", &[("Cookie", cookie.as_str())], "").await;
+        assert_eq!(code, 503, "{page}");
+        assert!(
+            page.contains("Signing in isn't possible right now")
+                && page.contains("The provider&#39;s token couldn&#39;t be refreshed:"),
+            "{page}"
+        );
+        assert!(!page.contains("Your session has ended"), "{page}");
+        assert_eq!(
+            header_of(&head, "retry-after"),
+            [REFRESH_RETRY_AFTER.as_secs().to_string().as_str()]
+        );
+        assert!(header_of(&head, "set-cookie").is_empty(), "{head}");
+        let session = oauth2_session(&idp, "refresh-app", now - 600, now + 30);
+        let (code, head, text) = refresh_of(addr, &session).await;
+        assert_eq!(code, 503, "{text}");
+        assert!(
+            text.contains("the provider's token couldn't be refreshed:"),
+            "{text}"
+        );
+        assert_eq!(
+            header_of(&head, "retry-after"),
+            [REFRESH_RETRY_AFTER.as_secs().to_string().as_str()]
+        );
+        assert!(header_of(&head, "set-cookie").is_empty(), "{head}");
+    }
+
+    /// A provider that answers 5xx is down, not refusing: 503, and its outcome isn't kept, so
+    /// the refresh is made again once the provider is back.
+    #[tokio::test]
+    async fn a_refresh_the_provider_fails_is_made_again_once_it_is_back() {
+        let idp = Issuer::start().await;
+        idp.sign_ins.failing.store(true, Ordering::SeqCst);
+        let addr = node(&idp, |_| {}).await;
+        let now = Utc::now().timestamp();
+        let session = oauth2_session(&idp, "refresh-0", now - 600, now + 30);
+        let (code, head, text) = refresh_of(addr, &session).await;
+        assert_eq!(code, 503, "{text}");
+        assert!(text.contains("the provider answered 503"), "{text}");
+        assert!(!header_of(&head, "retry-after").is_empty(), "{head}");
+        idp.sign_ins.failing.store(false, Ordering::SeqCst);
+        let (code, _, text) = refresh_of(addr, &session).await;
+        assert_eq!(code, 200, "{text}");
+        assert_eq!(idp.sign_ins.refreshes.load(Ordering::SeqCst), 1);
+    }
+
+    /// The sign-out form's page names the provider's end-session origin in `form-action` even on
+    /// a node that hasn't discovered the provider yet: a browser applies it to the sign-out's
+    /// redirect.
+    #[tokio::test]
+    async fn a_cold_node_s_pages_let_the_sign_out_go_on_to_the_provider() {
+        let idp = Issuer::start().await;
+        *idp.sign_ins.discovery.lock().unwrap() =
+            json!({ "end_session_endpoint": "https://logout.example/end-session" });
+        let addr = node(&idp, |_| {}).await;
+        let (_, head, _) = request(addr, "GET", "/ui/sign-in", &[], "").await;
+        let csp = header_of(&head, "content-security-policy")[0].to_owned();
+        let form_action = csp
+            .split("; ")
+            .find(|d| d.starts_with("form-action "))
+            .unwrap();
+        assert_eq!(
+            form_action,
+            format!("form-action 'self' {} https://logout.example", idp.url)
         );
     }
 
@@ -1473,6 +1643,29 @@ mod tests {
         assert_eq!(a.unwrap(), b.unwrap());
         assert_eq!(idp.sign_ins.refreshes.load(Ordering::SeqCst), 1);
         assert!(provider.refreshing.lock().unwrap().is_empty());
+    }
+
+    /// The same on threads that end their refreshes at once: whichever ends last forgets it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_refreshes_in_flight_are_forgotten_whichever_ends_last() {
+        let idp = Issuer::start().await;
+        let o = Arc::new(idp.oauth2_api("roles").oauth2.unwrap());
+        let provider = Arc::new(Provider::default());
+        let e = Arc::new(provider.endpoints(&o).await.unwrap());
+        for n in 0..50 {
+            let tasks: Vec<_> = (0..4)
+                .map(|_| {
+                    let (provider, o, e) = (Arc::clone(&provider), Arc::clone(&o), Arc::clone(&e));
+                    tokio::spawn(
+                        async move { provider.refresh(&o, &e, &format!("refresh-{n}")).await },
+                    )
+                })
+                .collect();
+            for t in tasks {
+                t.await.unwrap().unwrap();
+            }
+            assert!(provider.refreshing.lock().unwrap().is_empty(), "after {n}");
+        }
     }
 
     /// One session's refresh, however long the provider takes, doesn't hold up another's.

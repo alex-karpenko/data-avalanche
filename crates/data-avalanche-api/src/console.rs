@@ -76,11 +76,16 @@ async fn guard(State(api): State<Api>, req: Request, next: Next) -> Response {
     } else {
         next.run(req).await
     };
-    // Read after the answer: a sign-in or a sign-out may just have discovered the provider.
-    let form_action = sign_in
-        .as_ref()
-        .map(|s| oauth2::form_action(&api, s))
-        .unwrap_or_default();
+    // Read after the answer: a sign-in or a sign-out may just have discovered the provider. A
+    // page (whose forms the policy governs) discovers it, when no request has yet.
+    let page = r
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .is_some_and(|t| t.as_bytes().starts_with(b"text/html"));
+    let form_action = match &sign_in {
+        Some(s) => oauth2::form_action(&api, s, page).await,
+        None => String::new(),
+    };
     let h = r.headers_mut();
     let csp = policy(&form_action);
     if let Ok(v) = HeaderValue::from_str(&csp) {
@@ -150,6 +155,13 @@ pub(crate) fn challenge(auth: ApiAuth) -> &'static str {
     }
 }
 
+/// `r` with a `Retry-After` of `wait`.
+pub(crate) fn retry_after(mut r: Response, wait: Duration) -> Response {
+    r.headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from(retry_secs(wait)));
+    r
+}
+
 /// 429 for a JSON answer: the address waits `wait`.
 pub(crate) fn too_many_json(wait: Duration) -> Response {
     let secs = retry_secs(wait);
@@ -216,7 +228,9 @@ pub(crate) fn frame(api: &Api, sign_in: &SignIn) -> Frame {
 
 /// A page under `/ui/` (the app's, from M15): the landing page for a caller who verifies, the
 /// sign-in for one who brought nothing, else why not. An `oauth2` session whose token is about
-/// to expire is refreshed first, its new cookies set with the page.
+/// to expire is refreshed first, its new cookies set with the page; once the token expired, a
+/// provider that refuses the refresh ends the session (401), one that can't be reached answers
+/// "try again" (503, `Retry-After`), the session kept.
 async fn page(
     State(api): State<Api>,
     info: Option<Extension<ConnectInfo<crate::server::Client>>>,
@@ -269,7 +283,22 @@ async fn page(
                 session.is_some(),
             ),
         ),
-        Err(Denied::Unauthenticated { .. }) if let Some(e) = not_refreshed => {
+        // The provider is down, not the session over: try again in a moment.
+        Err(Denied::Unauthenticated { .. })
+            if let Some(oauth2::Failed::Unreachable(e)) = &not_refreshed =>
+        {
+            let why = format!("the provider's token couldn't be refreshed: {e}");
+            retry_after(
+                html(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    pages::unavailable(&frame, &why),
+                ),
+                oauth2::REFRESH_RETRY_AFTER,
+            )
+        }
+        Err(Denied::Unauthenticated { .. })
+            if let Some(oauth2::Failed::Refused(e)) = &not_refreshed =>
+        {
             let why = format!("the provider's token expired and couldn't be refreshed: {e}");
             challenged(
                 html(StatusCode::UNAUTHORIZED, pages::ended(&frame, &why, &here)),

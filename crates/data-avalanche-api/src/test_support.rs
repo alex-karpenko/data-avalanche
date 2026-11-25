@@ -429,6 +429,8 @@ pub(crate) struct SignIns {
     pub refreshes: AtomicUsize,
     /// Refuses every refresh, as a provider that revoked the sign-in.
     pub refusing: AtomicBool,
+    /// Answers every refresh 503, as a provider that is down.
+    pub failing: AtomicBool,
     /// Fields that replace or add to the discovery document's, when an object.
     pub discovery: Mutex<Value>,
     /// A refresh token whose refresh waits for [`Self::release`].
@@ -563,6 +565,13 @@ async fn token(
             let held = s.sign_ins.held.lock().unwrap().clone();
             if held.is_some() && held.as_ref() == form.get("refresh_token") {
                 s.sign_ins.release.notified().await;
+            }
+            if s.sign_ins.failing.load(Ordering::SeqCst) {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": "temporarily_unavailable" })),
+                )
+                    .into_response();
             }
             if s.sign_ins.refusing.load(Ordering::SeqCst) {
                 return refused("the refresh token was revoked");
