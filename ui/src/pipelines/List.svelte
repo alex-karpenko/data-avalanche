@@ -63,7 +63,8 @@
   let selected = $state<string[]>([]);
   let acting = $state<Verb | null>(null);
 
-  const chosen = $derived(all.filter((r) => selected.includes(r.id)));
+  /** The selected pipelines the filters show: the only ones an action can reach. */
+  const chosen = $derived(shown.filter((r) => selected.includes(r.id)));
   const offered = $derived(VERBS.filter((v) => chosen.some((r) => ACTIONS[v].takes(r.desired))));
 
   const href = (id: string) => `/ui/pipelines/${encodeURIComponent(id)}`;
@@ -76,9 +77,13 @@
     selected = selected.includes(id) ? selected.filter((s) => s !== id) : [...selected, id];
   }
 
+  /** Ticks or unticks the rows shown; the selection of rows hidden by the filters is kept. */
   function toggleAll() {
     const ids = shown.map((r) => r.id);
-    selected = ids.every((id) => selected.includes(id)) ? [] : ids;
+    const every = ids.every((id) => selected.includes(id));
+    selected = every
+      ? selected.filter((id) => !ids.includes(id))
+      : [...selected, ...ids.filter((id) => !selected.includes(id))];
   }
 
   /** The rows' keys and clicks: a click anywhere on a row opens it; ↑/↓ move between rows. */
@@ -216,9 +221,9 @@
   />
 </div>
 
-{#if can && selected.length > 0}
+{#if can && chosen.length > 0}
   <div class="acting" role="toolbar" aria-label="Act on the selected pipelines">
-    <b>{selected.length} selected</b> ·
+    <b>{chosen.length} selected</b> ·
     {#each offered as v (v)}
       <button type="button" class:destructive={ACTIONS[v].destructive} disabled={offline} onclick={() => (acting = v)}>
         {ACTIONS[v].label}…

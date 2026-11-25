@@ -146,6 +146,22 @@ describe('the pipeline list', () => {
     expect(t.querySelector('.acting')?.textContent).toContain('3 selected');
   });
 
+  it('acts only on the selected pipelines its filters show, and keeps the rest selected', () => {
+    const { t, router } = render();
+    check(t, 'orders-pg');
+    check(t, 'billing-mysql');
+    expect(t.querySelector('.acting')?.textContent).toContain('2 selected');
+    router.replace('/ui/pipelines?source=mysql');
+    flushSync();
+    expect(ids(t)).toEqual(['billing-mysql']);
+    expect(t.querySelector('.acting')?.textContent).toContain('1 selected');
+    button(t, 'Restart…').click();
+    flushSync();
+    const dialog = t.querySelector('[role="dialog"]')!;
+    expect(dialog.querySelector('h3')?.textContent).toBe('Restart billing-mysql?');
+    expect(dialog.textContent).not.toContain('orders-pg');
+  });
+
   it('keeps actions from being confirmed while offline', () => {
     const { t } = render({ offline: true });
     check(t, 'orders-pg');
