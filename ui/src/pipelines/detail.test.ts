@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { facts, NOW } from '../model/fixtures';
+import { event, facts, iso, NOW, table } from '../model/fixtures';
 import { activity, header, marks, position, snapshotPanel, sourceLines, tableLines } from './detail';
 import { detail, events, jobs, liveFigures } from './fixtures';
 
@@ -50,6 +50,27 @@ describe("a pipeline's page", () => {
     expect(lines.map((t) => [t.table, t.state.label, t.changes, t.schema])).toEqual([
       ['public.refunds', 'halted', null, "amount changed int → text, which can't be applied in place"],
     ]);
+  });
+
+  it("names a MySQL pipeline's tables as its figures do, however storage and events spell them", () => {
+    const base = detail();
+    const d = detail({
+      id: 'billing-mysql',
+      source: { type: 'mysql', host: 'mysql-8', port: 3306, db: 'billing' },
+      halted_tables: [{ table: 'billing.refunds', code: 'SCHEMA_REFUSED', detail: 'refused', since: base.halted_tables[0].since }],
+    });
+    // Storage's halts carry `db.table`.
+    expect(tableLines('billing-mysql', null, d, [], NOW).map((t) => [t.table, t.href])).toEqual([
+      ['refunds', '/ui/tables/billing-mysql/refunds'],
+    ]);
+    // The figures carry the bare name; a schema event's object carries `db.table`.
+    const fig = liveFigures();
+    fig.source = { detail: { engine: 'mysql' } };
+    const { pipeline: _p, ...invoices } = table('billing-mysql', 'invoices');
+    fig.tables = [invoices];
+    const schema = event({ kind: 'schema.applied', at: iso(NOW - 60_000), object: 'billing.invoices', text: 'billing.invoices: column note added' });
+    const lines = tableLines('billing-mysql', fig, d, [schema], NOW);
+    expect(lines.map((t) => [t.table, t.schema])).toEqual([['invoices', 'billing.invoices: column note added']]);
   });
 
   it("shows PostgreSQL's slot, WAL held against its limit, the confirmed LSN and the publication", () => {

@@ -20,7 +20,7 @@ export class LagHistory {
   #api: Client;
   #pipeline: string | null;
   #now: () => number;
-  /** Read once: what the stream missed is read again; never read, nothing is. */
+  /** Asked once: what the stream missed is read again; never asked, nothing is. */
   #asked = false;
 
   /** Every pipeline's lines, or `pipeline`'s alone. */
@@ -30,9 +30,9 @@ export class LagHistory {
     this.#now = now;
   }
 
-  /** Reads the lines unless they were read already. */
+  /** Reads the lines unless they were read already; a read that failed is tried again. */
   async ensure(): Promise<void> {
-    if (!this.#asked) await this.load();
+    if (!this.#asked || this.error !== null) await this.load();
   }
 
   async load(): Promise<void> {

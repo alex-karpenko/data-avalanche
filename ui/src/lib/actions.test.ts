@@ -12,7 +12,8 @@ describe('pipeline actions', () => {
   it('are offered in the states the server takes them in', () => {
     const offered = (desired: Target['desired']) => VERBS.filter((v) => ACTIONS[v].takes(desired));
     expect(offered('running')).toEqual(['flush', 'pause', 'restart', 'stop']);
-    expect(offered('paused')).toEqual(['flush', 'resume', 'stop']);
+    // The server answers a paused pipeline's flush `unchanged`: the pause flushed it already.
+    expect(offered('paused')).toEqual(['resume', 'stop']);
     expect(offered('stopped')).toEqual(['resume']);
   });
 

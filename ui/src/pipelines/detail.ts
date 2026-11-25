@@ -82,6 +82,16 @@ const STATES: Record<string, { label: string; tone: Tone }> = {
   copied: { label: 'copied', tone: 'grey' },
 };
 
+/**
+ * A table as the worker's figures name it. MySQL's are bare (`invoices`), while the halts storage
+ * keeps and a schema event's object carry `db.table`; PostgreSQL's are `schema.table` everywhere.
+ * The server takes a MySQL table in a snapshot request only without its database.
+ */
+function named(mysql: boolean, table: string): string {
+  const dot = table.indexOf('.');
+  return mysql && dot !== -1 ? table.slice(dot + 1) : table;
+}
+
 /** Each table, halted first: from the worker's figures, else the halts storage keeps. */
 export function tableLines(
   id: string,
@@ -90,10 +100,11 @@ export function tableLines(
   events: EventItem[],
   now: number,
 ): TableLine[] {
+  const mysql = d?.source.type === 'mysql' || fig?.source?.detail?.engine === 'mysql';
   const tables =
     fig?.tables ??
     (d?.halted_tables ?? []).map((h) => ({
-      table: h.table,
+      table: named(mysql, h.table),
       state: 'halted',
       halt: { code: h.code, detail: h.detail, since: h.since },
       changes_per_minute: 0,
@@ -108,7 +119,7 @@ export function tableLines(
     .map((t) => {
       const change = events.find(
         (e) =>
-          e.kind.startsWith('schema.') && e.object === t.table && now - (at(e.at) ?? 0) < SCHEMA_SHOWN_S * 1000,
+          e.kind.startsWith('schema.') && e.object !== undefined && named(mysql, e.object) === t.table && now - (at(e.at) ?? 0) < SCHEMA_SHOWN_S * 1000,
       );
       const schema =
         t.halt !== null

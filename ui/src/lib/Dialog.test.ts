@@ -73,6 +73,22 @@ describe("an action's dialog", () => {
     expect(closed).toBe(0);
   });
 
+  it('stays open, free to try again, when the action throws', async () => {
+    let closed = 0;
+    const t = render({
+      onConfirm: async () => {
+        throw new Error('the connection dropped');
+      },
+      onClose: () => closed++,
+    });
+    t.querySelector<HTMLButtonElement>('.go')!.click();
+    await settle();
+    expect(t.querySelector('[role="alert"]')?.textContent).toBe('the connection dropped');
+    expect(t.querySelector<HTMLButtonElement>('.go')!.disabled).toBe(false);
+    expect(t.querySelector<HTMLButtonElement>('.buttons button')!.disabled).toBe(false);
+    expect(closed).toBe(0);
+  });
+
   it("can't be confirmed while blocked, and says why", () => {
     const t = render({ blocked: 'Offline: actions wait until the console is live again.' });
     expect(t.querySelector<HTMLButtonElement>('.go')!.disabled).toBe(true);

@@ -44,8 +44,14 @@
   async function go() {
     busy = true;
     failed = null;
-    const why = await onConfirm(note);
-    busy = false;
+    let why: string | null;
+    try {
+      why = await onConfirm(note);
+    } catch (e) {
+      why = e instanceof Error ? e.message : String(e);
+    } finally {
+      busy = false;
+    }
     if (why === null) onClose();
     else failed = why;
   }

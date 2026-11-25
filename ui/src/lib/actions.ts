@@ -44,7 +44,8 @@ export const ACTIONS: Record<Verb, Action> = {
     past: 'flushed',
     each: 'Each one commits what it has buffered now, whatever its flush policy says.',
     destructive: false,
-    takes: (d) => d !== 'stopped',
+    // A paused pipeline was flushed by its pause: the server answers `unchanged`, nothing buffered.
+    takes: (d) => d === 'running',
     effect: (t) => `${t.id} commits what it has buffered now${on(t)}, whatever its flush policy says.`,
   },
   pause: {

@@ -41,6 +41,31 @@ describe("pipelines' lag over 6 hours", () => {
     expect(a.asked).toHaveLength(1);
   });
 
+  it('reads again when asked to be there after a read failed', async () => {
+    let fail = true;
+    const asked: string[] = [];
+    const a: Client = {
+      get: async <T,>(path: string) => {
+        asked.push(path);
+        if (fail) throw new HttpError(503, 'slow down');
+        return { series: [{ name: 'lag_seconds', pipeline: 'orders-pg', points: [[t, 1]] }] } as T;
+      },
+      send: async () => {
+        throw new Error('reads only');
+      },
+    };
+    const h = new LagHistory(a, null, () => NOW);
+    await h.ensure();
+    expect(h.error).toBe('slow down');
+    fail = false;
+    await h.ensure();
+    expect(asked).toHaveLength(2);
+    expect(h.error).toBeNull();
+    expect(h.lines).toEqual({ 'orders-pg': [[t, 1]] });
+    await h.ensure();
+    expect(asked).toHaveLength(2);
+  });
+
   it('adds each sample and keeps 6 hours; one scoped to a pipeline takes its own alone', () => {
     const h = new LagHistory(api({ series: [] }), 'orders-pg', () => NOW);
     h.lines = { 'orders-pg': [[t - SPAN_S, 1], [t - 60, 2]] };
