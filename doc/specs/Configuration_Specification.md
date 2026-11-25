@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-24
+updated: 2026-11-25
 domain: Architecture
 status: Specification (supersedes the Configuration_file_model.md draft)
 tags: [architecture, configuration, spec, validation, multi-sink, iceberg, delta-lake]
@@ -540,7 +540,7 @@ console:
 |---|---|---|---|---|---|
 | `enabled` | bool | no | `false` | R | Serves the console under `/ui/`. A reload turns it on or off without a restart. |
 | `session_key` | string | conditional | — | R | Required when `enabled` and `api.auth` is `basic` or `oauth2` (V-135). Encrypts and signs the console's session cookie; the same value on every node. Use `${ENV}`; never stored in object storage. At least 32 bytes (V-128). A change ends every open session (people sign in again). Unused with `api.auth` `none` or `jwt`, which have no sessions (V-134): `jwt` expects a bearer token on every request. |
-| `public_url` | URL | conditional | — | R | Required when `enabled` and `api.auth = oauth2` (V-136). The console's origin as people reach it, for the OAuth2 redirect URI (`<public_url>/ui/…`): the console is served at the root of its host, under no path prefix. Absolute `http(s)` URL, no path (a trailing `/` aside), query or fragment (V-129). |
+| `public_url` | URL | conditional | — | R | Required when `enabled` and `api.auth = oauth2` (V-136). The console's origin as people reach it, for the OAuth2 redirect URI (`<public_url>/ui/…`): the console is served at the root of its host, under no path prefix. Absolute `http(s)` URL, no user information (`user@`), path (a trailing `/` aside), query or fragment (V-129). |
 | `session_ttl` | duration | no | `8h` | R | How long a session lasts after sign-in, however it is used (`basic`, `oauth2`); with `oauth2`, never past the token's expiry unless the provider refreshes it. 5 min – 7 days (V-132). |
 | `username_claim` | string | no | `preferred_username` | R | The token claim shown and recorded as the person's name (`jwt`, `oauth2`); `sub` when the claim is absent. `basic` records the configured user, `none` records `anonymous (admin)`. |
 | `history.retention` | duration | no | `24h` | R | How long the built-in chart history is kept in `globals.state`. 1 h – 30 days (V-132). Older ranges come from `prometheus`. |
@@ -1411,7 +1411,7 @@ errors.
 | V-100 | `globals.api.role_mapping` with `auth ∈ {none, basic}` | Ignored — roles come from the open mode / single basic principal. | warning | config |
 | V-053 | `globals.api.tls.enabled = true` | Requires `cert` + `key`. | error | config |
 | V-128 | `globals.console.session_key` | At least 32 bytes after substitution. | error | config |
-| V-129 | `globals.console.public_url` | An absolute `http`/`https` URL without a path (a trailing `/` aside), query or fragment. | error | config |
+| V-129 | `globals.console.public_url` | An absolute `http`/`https` URL without user information (`user@`), a path (a trailing `/` aside), a query or a fragment. | error | config |
 | V-130 | `globals.console.prometheus.url` | An absolute `http`/`https` URL. | error | config |
 | V-131 | `globals.console.prometheus` | `basic` and `bearer_token` are exclusive; `extra_labels` names match `[a-zA-Z_][a-zA-Z0-9_]*` and don't start with `__`. | error | config |
 | V-132 | `globals.console` durations | `session_ttl` 5 min – 7 days; `history.retention` 1 h – 30 days; `events.retention` 1 – 400 days. | error | config |
