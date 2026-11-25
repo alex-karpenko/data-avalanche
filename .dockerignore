@@ -5,4 +5,9 @@
 !rust-toolchain.toml
 !crates/
 !xtask/
+!ui/
 crates/**/target/
+ui/node_modules/
+ui/dist/
+ui/test-results/
+ui/playwright-report/

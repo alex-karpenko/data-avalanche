@@ -1,11 +1,22 @@
 # syntax=docker/dockerfile:1.29
 # The data-avalanche image (roadmap §4 M11a): the release binary on distroless, as the
-# non-root user. Built from the repository root:
+# non-root user, the console's app built into it (M15). Built from the repository root:
 #   docker build -f deploy/docker/Dockerfile -t data-avalanche .
+
+# The console's app: its files, embedded by the API crate's build.
+FROM node:26.13.1-trixie-slim AS ui
+WORKDIR /src/ui
+COPY ui/package.json ui/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm,sharing=locked npm ci
+COPY ui/ ./
+RUN npm run build
 
 FROM rust:1.100.0-trixie AS build
 WORKDIR /src
 COPY . .
+COPY --from=ui /src/ui/dist ui/dist
+# The build refuses to go on without the app.
+ENV DATA_AVALANCHE_UI=required
 # The target directory is a cache across builds. Debug info is stripped, the symbols kept: a
 # panic's backtrace still names its functions.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \

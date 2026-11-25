@@ -1,6 +1,6 @@
 ---
-title: Web console sign-in
-description: Switching the web console on, how people sign in under each API auth mode, and what a session is.
+title: Web console
+description: Switching the web console on, what it shows, how people sign in under each API auth mode, and what a session is.
 sidebar:
   order: 5
 ---
@@ -25,6 +25,40 @@ everyone out. Make one with `openssl rand -base64 48`.
 
 Serve the console over HTTPS, on the listener (`globals.api.tls`) or on a proxy in front of it: its
 cookies are `Secure`, which browsers send over plain HTTP only to `localhost`.
+
+## What it shows
+
+Every page has the same top bar: the sections, the live connection's state, the cluster's config
+generation, and who is signed in, with their role and the sign-out. This release has the
+**Overview**; the other sections say they aren't in this build yet.
+
+The page shows the cluster as it is when it opens, then follows the cluster's live updates
+(`GET /v1/stream`) through whichever node served it, so it changes as things happen without a
+reload. The bar says `live`, `reconnecting` with how long since the last update, or, after 30 s
+without one, the page says it is offline since then and that everything shown is as of that time,
+with a way to retry at once. The connection comes back by itself.
+
+The **Overview** answers "is anything wrong?":
+
+- tiles: the pipelines by state, the worst lag against its target, the nodes up and their config
+  generation, the snapshots running (and failed today), and the WAL the PostgreSQL slots hold;
+- **Needs attention**: what is wrong now, red first, then orange, then yellow, the newest first,
+  each with a link to where it's dealt with;
+- every pipeline, the worst first, with its state, node, lag over the last hour against the target,
+  and last commit;
+- the newest events.
+
+What needs attention, and the thresholds (fixed in this release, and stated at the foot of the
+page; a later release makes them configurable):
+
+| | |
+|---|---|
+| Red | A table halted; a pipeline stopped by an error; a pipeline no node has held for over 30 s; a node the others' probes get no answer from |
+| Orange | A pipeline's lag over 60 s and higher than 5 min ago; a slot holding WAL past 50% of `max_slot_wal_keep_size` (16 GB when the server sets none); a lease lost or taken over in the last hour; a snapshot job failed in the last 24 h; a node the console can't follow; a pipeline that can't commit |
+| Yellow | A node on another config generation; a restart-only change waiting on a node; a pipeline paused or stopped by a person over 1 h ago |
+
+A node the console can't follow shows its pipelines as last known, marked with how long it has been
+out of reach.
 
 ## Signing in
 
@@ -142,3 +176,16 @@ ends with its session, with a `reset` message, and the page opens it again.
   by default: raise it in front of the console.
 - Without `Authorization`, an API 401 carries `WWW-Authenticate: Session realm="data-avalanche"`
   while the console's sessions are on, so a browser shows no credentials popup. Pass it through.
+
+## Building it from source
+
+The console is built into the binary: the release images carry it. A binary built from a checkout
+carries it when `ui/` was built first, with Node.js (the version in `ui/.nvmrc`):
+
+```sh
+cd ui && npm ci && npm run build && cd ..
+cargo build --release -p data-avalanche
+```
+
+Without that, the console's pages say the app isn't built into this binary, and the sign-in and
+the API work as before. Set `DATA_AVALANCHE_UI=required` to make the build fail instead.

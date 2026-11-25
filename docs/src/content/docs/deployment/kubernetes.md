@@ -121,3 +121,28 @@ names after the release (after the release alone when its name already contains 
 the part before `-headless` is cut at 52 characters, so a long release name is shortened there:
 check it with `kubectl get service`). A node trusts the system's roots and every certificate in its
 own `api.tls.cert`: put your CA after the node's certificate there when it is a private one.
+
+## The web console
+
+The [web console](/data-avalanche/deployment/console/) is switched on in the config, so the chart
+has no setting for it: with `globals.console.enabled: true` every pod serves it under `/ui/` on the
+API's port, through the chart's Service, and the install's notes give its address. Its session key
+must be the same on every pod: pass it, and an OAuth2 client secret, from a Secret through `env`:
+
+```yaml
+env:
+  - name: CONSOLE_SESSION_KEY
+    valueFrom:
+      secretKeyRef: { name: data-avalanche-console, key: session-key }
+config:
+  globals:
+    console:
+      enabled: true
+      session_key: ${CONSOLE_SESSION_KEY}
+      public_url: https://cdc.example.com    # with auth: oauth2
+```
+
+The chart has no Ingress: put the Service behind yours, at the root of one host
+([Behind a proxy](/data-avalanche/deployment/console/#behind-a-proxy)), and set `public_url` to the
+address people's browsers use. `ci/console-values.yaml` in the chart's directory is a complete
+example, with sign-in through an OpenID provider.

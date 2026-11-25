@@ -73,6 +73,8 @@ This folder holds the plan for **building** v1. The design it implements is in `
 | `DATA_AVALANCHE_PG_REPLICA=<primary port>:<replica port>` (from M12a) | The PostgreSQL failover E2E scenario on `test-infra`'s `replica` profile (`55420:55421`); unset, it is skipped |
 | `DATA_AVALANCHE_E2E_STORE=rustfs\|azurite\|s3\|gcs\|azure` (from M12c) | The store of an E2E run's state and lake (default `rustfs`); the cloud subset (`test-infra/cloud-e2e.txt`) on a real cloud |
 | `DATA_AVALANCHE_LOAD` (non-empty, from M12c) | Enables the acceptance runs (`--test load`), with `DATA_AVALANCHE_IT`; `cargo xtask bench\|chaos\|soak` sets both |
+| `DATA_AVALANCHE_UI=required` (from 1.1.0 M15) | The API crate's build fails unless `ui/dist` holds the console's app (`npm ci && npm run build` in `ui/`); unset, a build without it serves the "isn't built" page. CI and the image set it |
+| `DATA_AVALANCHE_BROWSER` (non-empty, from 1.1.0 M15) | The console's flows in Chromium (`console_app.rs`, Playwright from `ui/`), with `DATA_AVALANCHE_IT`; needs the app built in and `npx playwright install chromium` in `ui/` |
 
 CI secrets and variables are listed in `test-infra/README.md` ("CI requirements") and in the comments
 of `.github/workflows/ci.yml`.

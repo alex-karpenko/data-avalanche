@@ -1,0 +1,45 @@
+# The cluster with the web console on (Admin_Console §11): people sign in through the company's
+# OpenID provider, and the console is served under /ui/ on the API's Service. The session key and
+# the client secret come from a Secret; the session key is the same on every pod. CI renders this
+# file and checks NOTES.txt gives the console's address; packaging.rs validates its config.
+replicaCount: 3
+env:
+  - name: ORDERS_DB_PASSWORD
+    valueFrom:
+      secretKeyRef: { name: orders-db, key: password }
+  - name: CONSOLE_SESSION_KEY
+    valueFrom:
+      secretKeyRef: { name: data-avalanche-console, key: session-key }
+  - name: CONSOLE_CLIENT_SECRET
+    valueFrom:
+      secretKeyRef: { name: data-avalanche-console, key: client-secret }
+config:
+  config_version: 1
+  globals:
+    cloud: aws
+    state: { bucket: example-cdc-state, prefix: cdc }
+    api:
+      address: "0.0.0.0:8080"
+      auth: oauth2
+      oauth2:
+        issuer: https://login.example.com/realms/ops
+        discovery_url: https://login.example.com/realms/ops/.well-known/openid-configuration
+        audience: cdc
+        roles_claim: roles
+        client_id: cdc-console
+        client_secret: ${CONSOLE_CLIENT_SECRET}
+    console:
+      enabled: true
+      session_key: ${CONSOLE_SESSION_KEY}
+      # Where people's browsers reach the console: the provider sends them back here.
+      public_url: https://cdc.example.com
+    cluster:
+      discovery: dns
+      discovery_dns_name: ${DATA_AVALANCHE_DISCOVERY_DNS_NAME}
+      memberlist: { node_name: "${POD_NAME}", advertise_addr: "${POD_IP}" }
+  pipelines:
+    orders:
+      id: orders
+      source: { host: orders-db.example.internal, db: orders, user: cdc, password: "${ORDERS_DB_PASSWORD}", postgres: { publication: orders_pub, slot: orders_slot } }
+      tables: { include: [public.*] }
+      sink: { type: delta, bucket: example-lake, prefix: orders }

@@ -18,8 +18,23 @@ env:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # The console's app (M15) is built first, and every build below embeds it.
+    env:
+      DATA_AVALANCHE_UI: required
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: ui/.nvmrc
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: Console app
+        working-directory: ui
+        run: |
+          npm ci
+          npm run check
+          npm test
+          npm run build
       # Reads rust-toolchain.toml (channel + components) and caches the build.
       - uses: actions-rust-lang/setup-rust-toolchain@v2
       - name: Format
@@ -55,6 +70,9 @@ jobs:
           done
           # The API's TLS turns the probes to HTTPS.
           [ "$(helm template ci "$chart" -f "$chart/ci/tls-values.yaml" | grep -c 'scheme: HTTPS')" = 3 ]
+          # The console on: the notes give its address.
+          helm install --dry-run=client ci "$chart" -f "$chart/ci/console-values.yaml" \
+            | grep -qx '  https://cdc.example.com/ui/'
       - name: Workflows
         run: docker run --rm -v "$PWD:/repo:ro" --workdir /repo rhysd/actionlint:1.7.12 -no-color
       # RustSec advisory audit of Cargo.lock. Non-blocking by design: a vulnerable dependency is
@@ -81,6 +99,9 @@ jobs:
     env:
       DATA_AVALANCHE_IT: "1"
       DATA_AVALANCHE_GCS_BUCKET: ${{ vars.DATA_AVALANCHE_GCS_BUCKET }}
+      # The console's app built into the binary, and its flows in a browser (M15).
+      DATA_AVALANCHE_UI: required
+      DATA_AVALANCHE_BROWSER: "1"
     steps:
       # The workspace's test build and then the E2E build don't fit on the runner's disk beside
       # its preinstalled SDKs, which nothing here uses.
@@ -118,6 +139,19 @@ jobs:
           fi
       # uv runs the DuckDB cross-read of the Delta sink (R-12, crates/data-avalanche-sink-delta).
       - uses: astral-sh/setup-uv@v10.3.3
+      # The console's app, built before the first cargo build embeds it, and Playwright's
+      # Chromium for its flows (crates/data-avalanche/tests/e2e/console_app.rs).
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: ui/.nvmrc
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: Console app and its browser
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build
+          npx playwright install --with-deps chromium
       - name: Start test infrastructure
         run: test-infra/up.sh
       - name: Integration tests

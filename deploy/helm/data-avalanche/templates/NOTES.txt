@@ -8,6 +8,18 @@ The API, /metrics and the probes: {{ include "data-avalanche.fullname" . }}.{{ .
   curl http://localhost:{{ include "data-avalanche.apiPort" . }}/v1/cluster/status
   {{- end }}
 When the config turns the API's auth on, the request needs its credentials.
+{{- $config := include "data-avalanche.configMap.values" . | fromYaml }}
+{{- if dig "globals" "console" "enabled" false $config }}
+
+The web console:
+{{- with dig "globals" "console" "public_url" "" $config }}
+  {{ . }}/ui/
+where people's browsers reach the API's Service (globals.console.public_url).
+{{- else }}
+  {{ lower (include "data-avalanche.scheme" .) }}://localhost:{{ include "data-avalanche.apiPort" . }}/ui/
+through the port-forward above.
+{{- end }}
+{{- end }}
 
 A changed config reaches the running cluster through the API's reload (POST /v1/config/reload),
 not through a restart: a starting node adopts the cluster's latest config generation.
