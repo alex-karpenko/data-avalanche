@@ -34,9 +34,11 @@
   const lag = new LagHistory(api);
   /** The pipeline whose page is shown; its page reads and follows it while shown. */
   const pageId = $derived(router.section === 'pipelines' && router.rest.length === 1 ? router.rest[0] : null);
+  /** Signed in or not: a token refresh swaps the session's object, not who is signed in. */
+  const signedIn = $derived(session !== null);
   let page = $state<PipelinePage | null>(null);
   $effect(() => {
-    if (pageId === null || session === null) {
+    if (pageId === null || !signedIn) {
       page = null;
       return;
     }
@@ -98,17 +100,20 @@
   >
     {#if router.section === 'overview'}
       <Overview {model} {now} stale={live.stale(now)} last={live.last} />
-    {:else if page !== null}
-      <Pipeline
-        {page}
-        {model}
-        {session}
-        {api}
-        {now}
-        stale={live.stale(now)}
-        last={live.last}
-        offline={live.state === 'offline'}
-      />
+    {:else if page !== null && page.id === pageId}
+      <!-- Each pipeline's page starts clean: nothing chosen or open carries over from the last. -->
+      {#key page}
+        <Pipeline
+          {page}
+          {model}
+          {session}
+          {api}
+          {now}
+          stale={live.stale(now)}
+          last={live.last}
+          offline={live.state === 'offline'}
+        />
+      {/key}
     {:else if router.section === 'pipelines' && router.rest.length === 0}
       <List
         {model}

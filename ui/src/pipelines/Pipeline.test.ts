@@ -169,6 +169,23 @@ describe("a pipeline's page", () => {
     expect(api.sent).toEqual([['POST', '/v1/pipelines/orders-pg/snapshots', { tables: ['public.refunds'], truncate: true }]]);
   });
 
+  it('opens the snapshot dialog with nothing chosen, whatever a cancelled one had', async () => {
+    const t = await render();
+    button(t, 'Snapshot…').click();
+    flushSync();
+    let dialog = t.querySelector('[role="dialog"]')!;
+    dialog.querySelectorAll<HTMLInputElement>('input[type="checkbox"]').forEach((b) => b.click());
+    flushSync();
+    expect(dialog.textContent).toContain('Truncate empties each table first');
+    button(t, 'Cancel').click();
+    flushSync();
+    button(t, 'Snapshot…').click();
+    flushSync();
+    dialog = t.querySelector('[role="dialog"]')!;
+    expect([...dialog.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')].map((b) => b.checked)).toEqual([false, false, false]);
+    expect(dialog.textContent).toContain('Choose the tables to copy.');
+  });
+
   it("highlights an event on the chart while its activity line is hovered", async () => {
     const t = await render();
     const takeover = t.querySelectorAll('.activity li')[0];

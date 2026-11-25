@@ -99,6 +99,13 @@
     }
   }
 
+  /** Opens the snapshot dialog with nothing chosen: a choice doesn't outlive its dialog. */
+  function openSnapshot() {
+    chosen = [];
+    truncate = false;
+    snapping = true;
+  }
+
   const pick = (t: string) => (chosen = chosen.includes(t) ? chosen.filter((c) => c !== t) : [...chosen, t]);
 </script>
 
@@ -123,7 +130,7 @@
         </button>
       {/each}
       {#if desired === 'running'}
-        <button type="button" disabled={offline} onclick={() => (snapping = true)}>Snapshot…</button>
+        <button type="button" disabled={offline} onclick={openSnapshot}>Snapshot…</button>
       {/if}
     </div>
   {/if}
