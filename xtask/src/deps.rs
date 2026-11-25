@@ -602,14 +602,22 @@ fn duckdb(root: &Path, items: &mut Vec<Item>) -> Result<(), String> {
     Ok(())
 }
 
-/// The site's packages (`docs/`) and the console's (`ui/`), each with its Node version.
+/// The site's packages (`docs/`) and the console's (`ui/`: what the page runs, uPlot, and what
+/// builds it), each with its Node version.
 fn npm(root: &Path, items: &mut Vec<Item>) -> Result<(), String> {
-    for (dir, section) in [("docs", "dependencies"), ("ui", "devDependencies")] {
+    let sections: [(&str, &[&str]); 2] = [
+        ("docs", &["dependencies"]),
+        ("ui", &["dependencies", "devDependencies"]),
+    ];
+    for (dir, sections) in sections {
         let file = format!("{dir}/package.json");
         let text = read(root, &file)?;
         let json: serde_json::Value =
             serde_json::from_str(&text).map_err(|e| format!("{file}: {e}"))?;
-        for (name, version) in json[section].as_object().into_iter().flatten() {
+        let packages = sections
+            .iter()
+            .flat_map(|s| json[*s].as_object().into_iter().flatten());
+        for (name, version) in packages {
             items.push(Item {
                 kind: Kind::Npm,
                 name: name.clone(),
@@ -1077,6 +1085,7 @@ mod tests {
         assert!(has(Kind::Tool, "duckdb"));
         assert!(has(Kind::Npm, "astro"));
         assert!(has(Kind::Npm, "svelte"));
+        assert!(has(Kind::Npm, "uplot"));
         assert!(has(Kind::Node, "node"));
         assert!(
             items
