@@ -7,8 +7,9 @@ name: data-avalanche-test
 
 x-pg: &pg
   environment: { POSTGRES_USER: avalanche, POSTGRES_PASSWORD: avalanche, POSTGRES_DB: avalanche }
-  command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=20",
-            "-c", "max_wal_senders=20", "-c", "logical_decoding_work_mem=64kB"]
+  command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=64",
+            "-c", "max_wal_senders=64", "-c", "max_connections=300",
+            "-c", "logical_decoding_work_mem=64kB"]
   healthcheck: { test: ["CMD-SHELL", "pg_isready -U avalanche -d avalanche"], interval: 2s, retries: 30 }
 
 x-mariadb: &mariadb
@@ -59,7 +60,7 @@ services:
     <<: *pg
     image: "postgres:18"
     profiles: [replica]
-    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=20",
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=64",
               "-c", "max_wal_senders=20", "-c", "logical_decoding_work_mem=64kB",
               "-c", "synchronized_standby_slots=standby_sync"]
     environment: { POSTGRES_USER: avalanche, POSTGRES_PASSWORD: avalanche, POSTGRES_DB: avalanche, STANDBY_SLOT: standby_sync }
@@ -71,7 +72,7 @@ services:
     image: "postgres:18"
     profiles: [replica]
     entrypoint: ["bash", "/postgres-replica.sh"]
-    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=20",
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=64",
               "-c", "max_wal_senders=20", "-c", "logical_decoding_work_mem=64kB",
               "-c", "sync_replication_slots=on", "-c", "hot_standby_feedback=on"]
     environment: { POSTGRES_USER: avalanche, POSTGRES_PASSWORD: avalanche, POSTGRES_DB: avalanche, PRIMARY: postgres-sync-primary, STANDBY_SLOT: standby_sync }

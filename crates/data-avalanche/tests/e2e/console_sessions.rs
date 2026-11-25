@@ -17,7 +17,7 @@ use crate::idp::{Provider, query_value};
 use crate::nodes::{Cluster, ITEMS};
 
 /// A session key made at run time: 48 random bytes.
-fn session_key() -> String {
+pub(crate) fn session_key() -> String {
     let mut b = [0u8; 48];
     std::fs::File::open("/dev/urandom")
         .and_then(|mut f| f.read_exact(&mut b))

@@ -212,13 +212,15 @@ impl Provider {
         let at = issuer.clone();
         let issued = Issued::default();
         let issued_in = std::sync::Arc::clone(&issued);
+        let codes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let codes_in = std::sync::Arc::clone(&codes);
         let served = tokio::spawn(async move {
             let refreshes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             loop {
                 let Ok((mut s, _)) = listener.accept().await else {
                     return;
                 };
-                let (jwks, discovery, key, roles, issuer, refreshes, issued) = (
+                let (jwks, discovery, key, roles, issuer, refreshes, issued, codes) = (
                     jwks.clone(),
                     discovery.clone(),
                     std::sync::Arc::clone(&key),
@@ -226,12 +228,23 @@ impl Provider {
                     at.clone(),
                     std::sync::Arc::clone(&refreshes),
                     std::sync::Arc::clone(&issued_in),
+                    std::sync::Arc::clone(&codes_in),
                 );
                 tokio::spawn(async move {
                     let Some((line, body)) = read_request(&mut s).await else {
                         return;
                     };
                     let path = line.split(' ').nth(1).unwrap_or_default().to_owned();
+                    // A browser's sign-in: approved at once, sent back with a code.
+                    if path.starts_with("/authorize?") {
+                        let back = approval(&issuer, &issued, &codes, &format!("{issuer}{path}"));
+                        let answer = format!(
+                            "HTTP/1.1 302 Found\r\nLocation: {back}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = s.write_all(answer.as_bytes()).await;
+                        let _ = s.shutdown().await;
+                        return;
+                    }
                     let (code, answer) = if path.starts_with("/.well-known/openid-configuration") {
                         (200, discovery)
                     } else if path.starts_with("/jwks") {
@@ -308,7 +321,7 @@ impl Provider {
         Self {
             issuer,
             served,
-            codes: std::sync::Arc::default(),
+            codes,
             issued,
         }
     }
@@ -325,24 +338,35 @@ impl Provider {
     /// The provider's approval of the authorization request at `location`: where it sends the
     /// browser back, with a code and the request's state.
     pub fn approve(&self, location: &str) -> String {
-        assert!(
-            location.starts_with(&format!("{}/authorize?", self.issuer)),
-            "{location}"
-        );
-        assert_eq!(
-            query_value(location, "code_challenge_method").as_deref(),
-            Some("S256")
-        );
-        let back = query_value(location, "redirect_uri").expect("a redirect URI");
-        let state = query_value(location, "state").expect("a state");
-        let challenge = query_value(location, "code_challenge").expect("a code challenge");
-        let n = self.codes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.issued
-            .lock()
-            .unwrap()
-            .insert(format!("code-{n}"), (challenge, back.clone()));
-        format!("{back}?code=code-{n}&state={state}")
+        approval(&self.issuer, &self.issued, &self.codes, location)
     }
+}
+
+/// The approval of the authorization request at `location` by the provider at `issuer`: a new
+/// code, recorded with the request's challenge and redirect URI, and where the browser goes back.
+fn approval(
+    issuer: &str,
+    issued: &Issued,
+    codes: &std::sync::atomic::AtomicUsize,
+    location: &str,
+) -> String {
+    assert!(
+        location.starts_with(&format!("{issuer}/authorize?")),
+        "{location}"
+    );
+    assert_eq!(
+        query_value(location, "code_challenge_method").as_deref(),
+        Some("S256")
+    );
+    let back = query_value(location, "redirect_uri").expect("a redirect URI");
+    let state = query_value(location, "state").expect("a state");
+    let challenge = query_value(location, "code_challenge").expect("a code challenge");
+    let n = codes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    issued
+        .lock()
+        .unwrap()
+        .insert(format!("code-{n}"), (challenge, back.clone()));
+    format!("{back}?code=code-{n}&state={state}")
 }
 
 impl Drop for Provider {

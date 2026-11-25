@@ -17,7 +17,7 @@ use data_avalanche_state::{
 };
 use serde_json::{Value, json};
 
-use crate::{Api, Failure, Node, Principal, body, starting};
+use crate::{Api, Failure, Node, Principal, READ_AT_ONCE, body, starting};
 
 /// What a status read failed on: 503, the store is the answer.
 pub(crate) fn unavailable(e: &StateError) -> Response {
@@ -142,8 +142,10 @@ fn summary(p: &Pipeline, r: &Read, members: &Members) -> Value {
     })
 }
 
-/// Every pipeline of the generation the node runs, by id.
+/// Every pipeline of the generation the node runs, by id, read [`READ_AT_ONCE`] at a time: the
+/// console's first page waits on this list (Admin_Console §8).
 pub(crate) async fn list(State(api): State<Api>) -> Response {
+    use futures_util::StreamExt;
     let Some(node) = api.node.get() else {
         return starting();
     };
@@ -151,19 +153,31 @@ pub(crate) async fn list(State(api): State<Api>) -> Response {
     let mut pipelines: Vec<&Pipeline> = config.pipelines.values().collect();
     pipelines.sort_by(|a, b| a.id.cmp(&b.id));
     let members = node.members.borrow().clone();
-    let mut out = vec![];
+    let mut each = vec![];
     for p in pipelines {
-        let docs = match (node.docs)(p) {
-            Ok(docs) => docs,
+        match (node.docs)(p) {
+            // Owned: a stream over references doesn't make a `Send` future (rust-lang/rust#64552).
+            Ok(docs) => each.push((p.clone(), docs)),
             Err(e) => {
                 return body(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     &json!({ "error": format!("{}: the state location: {e}", p.id) }),
                 );
             }
-        };
-        match read(node, p, &docs).await {
-            Ok(r) => out.push(summary(p, &r, &members)),
+        }
+    }
+    let read = futures_util::stream::iter(each)
+        .map(|(p, docs)| async move {
+            let r = read(node, &p, &docs).await;
+            (p, r)
+        })
+        .buffered(READ_AT_ONCE)
+        .collect::<Vec<_>>()
+        .await;
+    let mut out = vec![];
+    for (p, r) in read {
+        match r {
+            Ok(r) => out.push(summary(&p, &r, &members)),
             Err(e) => return unavailable(&e),
         }
     }

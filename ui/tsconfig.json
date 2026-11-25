@@ -15,7 +15,8 @@
     "skipLibCheck": true,
     "types": [
       "svelte",
-      "vite/client"
+      "vite/client",
+      "node"
     ],
     "moduleDetection": "force",
     "allowJs": true
