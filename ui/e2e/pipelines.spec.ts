@@ -56,6 +56,8 @@ test("a pipeline's page: its tables, source and lag chart; paused and resumed th
   await page.click('.actions >> text=Resume');
   await page.click('[role="dialog"] button.go');
   await expect(page.locator('h2 .chip')).toHaveText('running', { timeout: 15_000 });
+  // The server recorded the resume, by whom (the activity's line is the server's event).
+  await expect(page.locator('.activity')).toContainText(new RegExp(`resume ${pipeline}\\s*· ${user} \\(admin\\)`), { timeout: 15_000 });
 });
 
 test('an action on the pipelines selected', async ({ page }) => {
@@ -66,4 +68,7 @@ test('an action on the pipelines selected', async ({ page }) => {
   await page.click('[role="dialog"] button.go');
   await expect(dialog(page)).toHaveCount(0);
   await expect(page.locator('.acting')).toHaveCount(0);
+  // The server recorded the flush, by whom: the pipeline's page shows the event it wrote.
+  await page.click(`a.open[href="/ui/pipelines/${pipeline}"]`);
+  await expect(page.locator('.activity')).toContainText(new RegExp(`flush ${pipeline}\\s*· ${user} \\(admin\\)`), { timeout: 15_000 });
 });

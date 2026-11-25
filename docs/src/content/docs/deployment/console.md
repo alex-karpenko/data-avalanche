@@ -78,6 +78,11 @@ confirmed LSN and the publication; MySQL's position, how long the server keeps b
 behind the stream reads), its snapshot jobs, and what happened to it. Hovering an event on the
 chart highlights it in the list below, and the reverse.
 
+Every part of the page says how old its data is. A part that couldn't be read keeps what it had and
+says so with its age (`jobs (HTTP 503), last read 20 min ago`, or `never read`), the source's
+panel says when it was read (`read 40 s ago`), and while the live connection is stale every panel
+is dimmed and the banner says for how long.
+
 ### Acting on pipelines
 
 An `operator` or an `admin` sees the actions a pipeline's state takes: flush, pause, resume,
@@ -91,6 +96,9 @@ On **Pipelines**, select several to act on them together: the dialog names each 
 and those the action doesn't apply to (a paused pipeline isn't restarted). They are asked one at a
 time, in order; a failure stops the rest, and the dialog says which failed, why, and which weren't
 asked. While the page is offline, actions wait.
+
+An action on the list reaches only the selected pipelines the filters show. Those a filter hides
+stay ticked and come back, selected, when the filter is cleared.
 
 ## Signing in
 
