@@ -5771,4 +5771,16 @@ git commit -m "test(e2e): the pipelines' pages and actions in a browser, a viewe
 
 ## Deviations during execution
 
-None yet.
+- **Task 2, `ui/src/lib/Chart.svelte` (fix commit after the task's own).** The task review found
+  two faults in the plan's code, and the fix found a third:
+  - the hover stayed on an event after the pointer left the plot (`cursor` returned without
+    `onHover(null)`);
+  - the data effect called `setData(data, false)`, which keeps the y scale, so new samples or a
+    new target could fall off the axis. It now calls `setData(samples, true)`, which re-ranges
+    the auto y scale (uPlot 1.6.32 `setData` → `commit`), then sets the x range;
+  - that effect read `data` only inside `plot?.setData(…)`. Its first run comes before uPlot
+    loads, so it never subscribed to the samples and the chart kept its first draw. It now
+    reads `data`, `target`, `since` and `until` before the call.
+
+  `Chart.test.ts` gained a test for each. No later task touches `Chart.svelte` or `series.ts`,
+  so their diffs apply as written.
