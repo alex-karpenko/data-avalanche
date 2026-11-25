@@ -5797,3 +5797,20 @@ git commit -m "test(e2e): the pipelines' pages and actions in a browser, a viewe
   unshown. Now a failed part says `jobs (HTTP 503), last read 20 min ago` (or `never read`), every
   panel dims while stale as on the Overview, and the Source panel says `read 40 s ago`. `read.at`
   takes the page's injected clock. Five tests were added. No later task touches these files.
+- **Task 6, `ui/e2e/budget.spec.ts` (fix commit after the task's own).** The budget's move from
+  the list to a pipeline took 3 770–4 436 ms in three runs of five. The flow waited for every
+  pipeline's figures, but a worker still starting sends its figures with no tables: p01's own
+  `/live` read answered at once with `"actual":"starting"` and `"tables":[]`, and the tables came
+  when its worker had started (a node starts its workers one after another, over about 15 s). The
+  move was timing a worker's start, not the page. The flow now waits until the stream has sent
+  every pipeline's figures with its tables; the budget and what each move measures are
+  unchanged. Five runs in a row then passed, the list to a pipeline 13–14 ms.
+- **Task 6, `ui/e2e/pipelines.spec.ts` and the site (a second fix commit).** The task review found
+  the flush and resume flows checking only the page, not what the server recorded; they now wait
+  for the server's `flush <id>` and `resume <id>` lines, with who did it, in the pipeline's
+  activity. The site's console page gained the two behaviours fixed above: the list acts on the
+  selected pipelines it shows, and each part of a pipeline's page says how old it is.
+- **The whole E2E suite** at the budget fix (`6acb0da`), on PostgreSQL 18 with the browser flows:
+  65 passed (1 034 s); the first page drawn in 250 ms, the moves 20, 12, 17 and 11 ms. The second
+  fix commit changed two flows and the site only; the console's six flows passed again on it
+  (the moves 21, 14, 15 and 13 ms).
