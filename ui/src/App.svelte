@@ -1,6 +1,6 @@
 <script lang="ts">
   // The console's app: who is signed in, the live stream, and the page the address names.
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import Frame from './Frame.svelte';
   import Later from './Later.svelte';
   import { client } from './lib/api';
@@ -11,6 +11,8 @@
   import Overview from './overview/Overview.svelte';
   import { LagHistory } from './pipelines/lag.svelte';
   import List from './pipelines/List.svelte';
+  import { PipelinePage } from './pipelines/page.svelte';
+  import Pipeline from './pipelines/Pipeline.svelte';
 
   // The server says why the session ended: its 401 or 403 page, or the sign-in.
   const ended = () => location.reload();
@@ -30,6 +32,20 @@
   const model = new Model(api);
   /** Every pipeline's lag over 6 hours, read when the list is first shown. */
   const lag = new LagHistory(api);
+  /** The pipeline whose page is shown; its page reads and follows it while shown. */
+  const pageId = $derived(router.section === 'pipelines' && router.rest.length === 1 ? router.rest[0] : null);
+  let page = $state<PipelinePage | null>(null);
+  $effect(() => {
+    if (pageId === null || session === null) {
+      page = null;
+      return;
+    }
+    // What the stream sent already is drawn at once (Admin_Console §8: now first).
+    const p = new PipelinePage(api, pageId, untrack(() => model.facts.figures[pageId] ?? null));
+    page = p;
+    void p.load();
+    return p.follow(live);
+  });
 
   async function readGeneration() {
     try {
@@ -82,6 +98,17 @@
   >
     {#if router.section === 'overview'}
       <Overview {model} {now} stale={live.stale(now)} last={live.last} />
+    {:else if page !== null}
+      <Pipeline
+        {page}
+        {model}
+        {session}
+        {api}
+        {now}
+        stale={live.stale(now)}
+        last={live.last}
+        offline={live.state === 'offline'}
+      />
     {:else if router.section === 'pipelines' && router.rest.length === 0}
       <List
         {model}

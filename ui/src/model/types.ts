@@ -111,11 +111,33 @@ export interface Job {
   error: string | null;
 }
 
+/** A snapshot job as a pipeline's page shows it: who asked, why, and each table's progress. */
+export interface JobDetail extends Job {
+  tables: { table: string; status: string; rows_done: number; estimate: number | null }[];
+  /** Rows a second, observed. */
+  rate: number | null;
+  requested_by: string;
+  requested_role: string | null;
+  note: string | null;
+  truncate: boolean;
+  cancel: { by: string; role: string | null; at: string; note: string | null } | null;
+}
+
 /** PostgreSQL's source detail; MySQL's has no slot. */
 export interface SourceDetail {
   engine: 'postgres' | 'mysql';
-  slot?: { name: string; wal_held_bytes: number | null } | null;
+  /** The server's write position, tagged: `pg:3/A41C2B10`. */
+  head?: string;
+  slot?: {
+    name: string;
+    wal_held_bytes: number | null;
+    active?: boolean;
+    confirmed_flush?: string | null;
+  } | null;
   max_slot_wal_keep_size?: number | null;
+  publication?: { name: string; tables: number } | null;
+  /** MySQL: how long the server keeps a binlog; `null` when it never expires them. */
+  binlog_expire_seconds?: number | null;
 }
 
 /** A pipeline's live figures: `GET /v1/pipelines/{id}/live`, and the stream's `figures`. */
@@ -127,7 +149,12 @@ export interface Figures {
   as_of: string;
   error: string | null;
   /** `null` without a worker: the pipeline is stopped, or starting. */
-  source: { detail: SourceDetail | null } | null;
+  source: {
+    detail: SourceDetail | null;
+    read_at?: string | null;
+    /** MySQL: how far the stream reads behind the source's newest change. */
+    behind_seconds?: number | null;
+  } | null;
   tables: Omit<TableItem, 'pipeline'>[];
   worker: { lag_seconds: number | null; degraded: string | null } | null;
 }
@@ -139,6 +166,8 @@ export interface EventItem {
   kind: string;
   node: string;
   pipeline?: string;
+  /** What else it concerns, by name: a table, a job id, a node. */
+  object?: string;
   severity: 'info' | 'warning' | 'error';
   text: string;
   actor?: { name: string; role: string };
@@ -152,4 +181,27 @@ export interface Series {
   name: string;
   pipeline?: string;
   points: [number, number][];
+}
+
+/** `GET /v1/pipelines/{id}`: the pipeline, its lease and its halted tables, from storage. */
+export interface PipelineDetail {
+  id: string;
+  name: string;
+  desired_state: Desired;
+  actual_state: Actual | null;
+  source: SourceAt;
+  sink: SinkAt;
+  error: string | null;
+  degraded: string | null;
+  holder: {
+    node: string;
+    owner_epoch: number;
+    renewed_at: string;
+    released: boolean;
+    stale: boolean;
+    suspect: boolean;
+  } | null;
+  /** The committed position, tagged. */
+  position: string | null;
+  halted_tables: { table: string; code: string; detail: string; since: string | null }[];
 }
