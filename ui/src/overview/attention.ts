@@ -3,8 +3,8 @@
 // 2026-11-25: a later release makes them configurable).
 
 import { bytes, duration } from '../lib/format';
-import { at, lagOf, tablesOf, type Facts } from './facts';
-import type { EventItem } from './types';
+import { at, lagOf, tablesOf, type Facts } from '../model/facts';
+import type { EventItem } from '../model/types';
 
 /** The lag a pipeline is expected to stay under. */
 export const LAG_TARGET_S = 60;

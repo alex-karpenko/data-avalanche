@@ -1,7 +1,7 @@
 // The tests' cluster: mockup 01's, in the API's shapes.
 
 import type { Facts } from './facts';
-import type { EventItem, Figures } from './types';
+import type { Actual, ClusterStatus, Desired, EventItem, Figures, PipelineItem, SourceAt } from './types';
 
 export const NOW = Date.UTC(2026, 10, 25, 14, 2, 0);
 const MIN = 60_000;
@@ -38,22 +38,42 @@ const pause = event({
 const line = (f: (ago: number) => number): [number, number][] =>
   Array.from({ length: 13 }, (_, i) => 60 - i * 5).map((ago) => [(NOW - ago * MIN) / 1000, f(ago)]);
 
+const pg = (db: string, host: string): SourceAt => ({ type: 'postgres', host, port: 5432, db });
+
+function item(id: string, desired: Desired, actual: Actual, holder: string, source: SourceAt): PipelineItem {
+  return {
+    id,
+    name: id,
+    desired_state: desired,
+    actual_state: actual,
+    holder,
+    holder_stale: false,
+    source,
+    sink: { type: 'delta', bucket: 'lake', prefix: id },
+  };
+}
+
+function lease(id: string, holder: string, owner_epoch: number, ring_owner: string): ClusterStatus['pipelines'][number] {
+  return { id, holder, holder_stale: false, owner_epoch, expires_at: iso(NOW + 8_000), ring_owner };
+}
+
 export function facts(): Facts {
   return {
     pipelines: [
-      { id: 'orders-pg', name: 'orders-pg', desired_state: 'running', actual_state: 'running', holder: 'n2', holder_stale: false },
-      { id: 'billing-mysql', name: 'billing-mysql', desired_state: 'running', actual_state: 'running', holder: 'n1', holder_stale: false },
-      { id: 'inventory', name: 'inventory', desired_state: 'paused', actual_state: 'paused', holder: 'n3', holder_stale: false },
-      { id: 'customers', name: 'customers', desired_state: 'running', actual_state: 'running', holder: 'n1', holder_stale: false },
+      item('orders-pg', 'running', 'running', 'n2', pg('orders', 'pg-prod-replica')),
+      item('billing-mysql', 'running', 'running', 'n1', { type: 'mysql', host: 'mysql-8', port: 3306, db: 'billing' }),
+      item('inventory', 'paused', 'paused', 'n3', pg('inventory', 'pg-prod')),
+      item('customers', 'running', 'running', 'n1', pg('crm', 'pg-crm')),
     ],
     cluster: {
       node: 'n1',
       members: ['n1', 'n2', 'n3'].map((node) => ({ node, phase: 'active', suspect: false, config_generation: 42 })),
       pipelines: [
-        { id: 'orders-pg', holder: 'n2', holder_stale: false, owner_epoch: 2 },
-        { id: 'billing-mysql', holder: 'n1', holder_stale: false, owner_epoch: 3 },
-        { id: 'inventory', holder: 'n3', holder_stale: false, owner_epoch: 1 },
-        { id: 'customers', holder: 'n1', holder_stale: false, owner_epoch: 1 },
+        // Held by n2 away from its ring owner, since a failover.
+        lease('orders-pg', 'n2', 2, 'n1'),
+        lease('billing-mysql', 'n1', 3, 'n1'),
+        lease('inventory', 'n3', 1, 'n3'),
+        lease('customers', 'n1', 1, 'n1'),
       ],
     },
     config: {

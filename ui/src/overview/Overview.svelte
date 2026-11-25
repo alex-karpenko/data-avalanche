@@ -15,11 +15,11 @@
     nodeHref,
   } from './attention';
   import { rows, tiles } from './derive';
-  import { EVENTS_SHOWN, PARTS, type Overview } from './model.svelte';
+  import { EVENTS_SHOWN, PARTS, type Model } from '../model/model.svelte';
   import Sparkline from './Sparkline.svelte';
 
   interface Props {
-    model: Overview;
+    model: Model;
     now: number;
     /** The live updates stopped: every number is as of `last`. */
     stale: boolean;

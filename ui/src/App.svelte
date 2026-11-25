@@ -7,7 +7,7 @@
   import { Live } from './lib/live.svelte';
   import { Router } from './lib/router.svelte';
   import { awaitSession, checkSession, keepFresh, RETRY_MS, type Session } from './lib/session';
-  import { Overview as OverviewModel } from './overview/model.svelte';
+  import { Model } from './model/model.svelte';
   import Overview from './overview/Overview.svelte';
 
   // The server says why the session ended: its 401 or 403 page, or the sign-in.
@@ -25,7 +25,7 @@
     open: (url) => new EventSource(url),
     check: () => checkSession({ fetch, ended }),
   });
-  const overview = new OverviewModel(api);
+  const model = new Model(api);
 
   async function readGeneration() {
     try {
@@ -42,7 +42,7 @@
       live.on('event', (e) => {
         if ((e as { kind?: string }).kind === 'config.published') void readGeneration();
       }),
-      overview.follow(live),
+      model.follow(live),
     ];
     const read = (s: Session) => {
       session = s;
@@ -50,7 +50,7 @@
       stops.push(keepFresh(s, { fetch, ended }, (next) => (session = next)));
       live.start();
       void readGeneration();
-      void overview.load();
+      void model.load();
     };
     stops.push(awaitSession({ fetch, ended }, read, (why) => (unread = why)));
     const tick = setInterval(() => {
@@ -76,7 +76,7 @@
     onRetry={() => live.retry()}
   >
     {#if router.section === 'overview'}
-      <Overview model={overview} {now} stale={live.stale(now)} last={live.last} />
+      <Overview {model} {now} stale={live.stale(now)} last={live.last} />
     {:else}
       <Later section={router.section} />
     {/if}

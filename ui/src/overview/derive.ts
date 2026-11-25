@@ -2,7 +2,7 @@
 
 import { ago, bytes, duration } from '../lib/format';
 import { FAILED_WITHIN_S, LAG_TARGET_S, walPast } from './attention';
-import { at, lagOf, tablesOf, type Facts } from './facts';
+import { at, lagOf, tablesOf, type Facts } from '../model/facts';
 
 export type Tone = 'normal' | 'green' | 'orange' | 'red' | 'grey';
 

@@ -2,8 +2,8 @@ import { flushSync, mount, unmount } from 'svelte';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { Client } from '../lib/api';
 import { clock } from '../lib/format';
-import { facts, NOW } from './fixtures';
-import { Overview as Model } from './model.svelte';
+import { facts, NOW } from '../model/fixtures';
+import { Model } from '../model/model.svelte';
 import Overview from './Overview.svelte';
 
 let mounted: ReturnType<typeof mount> | undefined;

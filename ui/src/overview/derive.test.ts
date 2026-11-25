@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { rows, tiles } from './derive';
-import { facts, figures, NOW } from './fixtures';
+import { facts, figures, NOW } from '../model/fixtures';
 
 describe("the Overview's", () => {
   it("tiles are mockup 01's", () => {

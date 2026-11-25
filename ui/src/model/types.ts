@@ -1,8 +1,23 @@
-// What the Overview reads from `/v1` and the live stream: the fields it uses, as the server sends
+// What the console reads from `/v1` and the live stream: the fields it uses, as the server sends
 // them (the API's reference names the rest).
 
 export type Actual = 'starting' | 'running' | 'paused' | 'stopped' | 'dumped' | 'retrying' | 'error';
 export type Desired = 'running' | 'paused' | 'stopped';
+
+/** Where a pipeline reads: its config's `source`. */
+export interface SourceAt {
+  type: 'postgres' | 'mysql';
+  host: string;
+  port: number;
+  db: string;
+}
+
+/** Where a pipeline writes: its config's `sink`. */
+export interface SinkAt {
+  type: 'delta' | 'iceberg';
+  bucket: string;
+  prefix: string;
+}
 
 /** `GET /v1/pipelines`'s rows. */
 export interface PipelineItem {
@@ -12,13 +27,24 @@ export interface PipelineItem {
   actual_state: Actual | null;
   holder: string | null;
   holder_stale: boolean;
+  source: SourceAt;
+  sink: SinkAt;
 }
 
 /** `GET /v1/cluster/status`. */
 export interface ClusterStatus {
   node: string;
   members: { node: string; phase: string; suspect: boolean; config_generation: number | null }[];
-  pipelines: { id: string; holder: string | null; holder_stale: boolean; owner_epoch: number }[];
+  pipelines: {
+    id: string;
+    holder: string | null;
+    holder_stale: boolean;
+    owner_epoch: number;
+    /** When the lease ends unless renewed (RFC 3339). */
+    expires_at: string | null;
+    /** The node the ring gives it to: a holder that isn't it holds it away from its owner. */
+    ring_owner: string | null;
+  }[];
 }
 
 /** `GET /v1/config/nodes`. */

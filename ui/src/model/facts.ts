@@ -1,4 +1,4 @@
-// What the Overview knows, from its reads and the stream, and what follows from it for one
+// What the console knows, from its reads and the stream, and what follows from it for one
 // pipeline.
 
 import type {
@@ -8,6 +8,8 @@ import type {
   Figures,
   Job,
   PipelineItem,
+  SinkAt,
+  SourceAt,
   TableItem,
 } from './types';
 
@@ -73,4 +75,15 @@ export function at(t: string | null | undefined): number | null {
   if (t === null || t === undefined) return null;
   const ms = Date.parse(t);
   return Number.isNaN(ms) ? null : ms;
+}
+
+const SHORT = { postgres: 'PG', mysql: 'MY', delta: 'Δ', iceberg: 'Iceberg' } as const;
+const LONG = { postgres: 'PostgreSQL', mysql: 'MySQL', delta: 'Delta', iceberg: 'Iceberg' } as const;
+
+/** Where a pipeline reads and writes: `PG orders@pg-prod → Δ lake/orders`, the engines' names
+ * written out with `long`. */
+export function route(p: { source: SourceAt; sink: SinkAt }, long = false): string {
+  const n = long ? LONG : SHORT;
+  const lake = [p.sink.bucket, p.sink.prefix.replace(/^\/+|\/+$/g, '')].filter((s) => s !== '').join('/');
+  return `${n[p.source.type]} ${p.source.db}@${p.source.host} → ${n[p.sink.type]} ${lake}`;
 }

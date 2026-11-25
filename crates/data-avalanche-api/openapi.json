@@ -1682,7 +1682,7 @@
         "tags": [
           "pipelines"
         ],
-        "summary": "Every pipeline: its desired and actual states and its holder",
+        "summary": "Every pipeline: its desired and actual states, its holder, and its source and sink",
         "responses": {
           "200": {
             "description": "the pipelines",
