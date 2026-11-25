@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -429,8 +429,9 @@ pub(crate) struct SignIns {
     pub refreshes: AtomicUsize,
     /// Refuses every refresh, as a provider that revoked the sign-in.
     pub refusing: AtomicBool,
-    /// Answers every refresh 503, as a provider that is down.
-    pub failing: AtomicBool,
+    /// Answers every refresh with this status, when not 0: a provider that is down (503) or
+    /// that limits its callers (429).
+    pub failing: AtomicU16,
     /// Fields that replace or add to the discovery document's, when an object.
     pub discovery: Mutex<Value>,
     /// A refresh token whose refresh waits for [`Self::release`].
@@ -566,9 +567,10 @@ async fn token(
             if held.is_some() && held.as_ref() == form.get("refresh_token") {
                 s.sign_ins.release.notified().await;
             }
-            if s.sign_ins.failing.load(Ordering::SeqCst) {
+            let failing = s.sign_ins.failing.load(Ordering::SeqCst);
+            if failing != 0 {
                 return (
-                    StatusCode::SERVICE_UNAVAILABLE,
+                    StatusCode::from_u16(failing).unwrap(),
                     Json(json!({ "error": "temporarily_unavailable" })),
                 )
                     .into_response();

@@ -300,23 +300,25 @@ address**. The rest is Claude's call.
 - **`oauth2`.** Authorization code with PKCE (`S256`) and a new state, kept in a sealed
   `__Host-da_oauth2` cookie (`SameSite=Lax`, `Path=/` as the prefix requires, 10 min; the prefix
   means a sibling subdomain can't plant a sign-in of its own, a login CSRF); the code exchanged with
-  the console's client (`client_secret_basic`, or `client_secret_post` when that is all the
-  provider takes); the token verified before a session starts, so a token whose roles map to
-  nothing is "Forbidden" at sign-in. The callback answers a page that goes on to `next` from the
-  console's own origin, since a `Strict` cookie doesn't follow a redirect the provider began; it
-  answers 503 when the token can't be checked now, and a callback whose state isn't the browser's
-  own sign-in shows nothing from the provider. A session whose token expires within a minute is
-  refreshed by the next page asked for, or by `POST /ui/session/refresh` (the app's, with the
-  anti-forgery token; it refreshes whenever called, with no expiry check); a session past its end
-  is never refreshed (it ends when it would have). A provider that refuses the refresh (a 4xx:
-  `invalid_grant`, a revoked token) ends the session once its token has expired (401); one that
-  can't be reached (a transport error, a timeout, a 5xx, its discovery unreadable) answers 503
-  with `Retry-After`, the cookies kept, so M15's app tries again rather than signing in. One node
-  makes one refresh per refresh token at a time and gives its outcome, a new token or a refusal,
-  to the same token for 30 s, since a provider that rotates refresh tokens refuses one used twice;
-  an outage isn't kept, so the node asks again once the provider is back. Failed discoveries, code
-  exchanges and refreshes are logged with the provider's error, never a token. The ID token is kept
-  in `da_id`, sent only to the sign-out, for the provider's `id_token_hint`.
+  the console's client (`client_secret_basic`, or `client_secret_post` when that is all the provider
+  takes); the token verified before a session starts, so a token whose roles map to nothing is
+  "Forbidden" at sign-in. The callback answers a page that goes on to `next` from the console's own
+  origin, since a `Strict` cookie doesn't follow a redirect the provider began; it answers 503 when
+  the token can't be checked now, and a callback whose state isn't the browser's own sign-in shows
+  nothing from the provider. A session whose token expires within a minute is refreshed by the next
+  page asked for, or by `POST /ui/session/refresh` (the app's, with the anti-forgery token; it
+  refreshes whenever called, with no expiry check); a session past its end is never refreshed (it
+  ends when it would have). A provider that refuses the refresh (a 4xx other than 408 and 429:
+  `invalid_grant`, a revoked token) ends the session: the app's refresh answers 401, a page too once
+  the token has expired. One that can't be reached (a transport error, a timeout, a 408, a 429, a
+  5xx, its discovery unreadable) answers the app's refresh 503 with `Retry-After`, the cookies kept,
+  so M15's app tries again rather than signing in; a page answers 503 only once the token has
+  expired (before that the old token verifies and the page is served). One node makes one refresh
+  per refresh token at a time and gives its outcome to the same token: a new token or a refusal for
+  30 s, since a provider that rotates refresh tokens refuses one used twice; an outage for 5 s, as
+  long as a failed discovery is remembered, then it asks again. Failed discoveries, code exchanges
+  and refreshes are logged with the provider's error, never a token. The ID token is kept in
+  `da_id`, sent only to the sign-out, for the provider's `id_token_hint`.
 - **The routes under `/ui/`:** `GET /ui/sign-in` (the form, or the way to the provider),
   `POST /ui/sign-in` (basic), `GET /ui/oauth2/start`, `GET /ui/oauth2/callback`,
   `POST /ui/sign-out`, `GET /ui/session`, `POST /ui/session/refresh`, `/ui/assets/…`, and every

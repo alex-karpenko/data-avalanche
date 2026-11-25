@@ -75,15 +75,18 @@ node: behind a load balancer two nodes may refresh one session at once, so a pro
 refresh tokens should allow a short reuse window. A session past its end is never refreshed: it
 ends when it would have.
 
-A provider that refuses a refresh (it answers 4xx: a revoked or spent refresh token) ends the
-session, once its token has expired: the page says so (401), and so does the app's refresh. A
-provider that can't be reached (no connection, a timeout, a 5xx, its discovery document unreadable)
-doesn't: the page or the refresh answers 503 with `Retry-After`, "try again in a moment", the
-session's cookies are kept, and the node asks the provider again at the next request. If the
-provider's token can't be checked at the moment (its keys are unreachable), the sign-in callback
-answers 503; the person tries again. Failed sign-ins and refreshes are also logged with the
-provider's error, never a token. Signing out removes the session's cookies and, when the provider
-has an end-session endpoint, signs out there (see Sessions).
+A provider that refuses a refresh (a 4xx other than 408 and 429: a revoked or spent refresh token)
+ends the session: the app's refresh answers 401 at once, and a page says so (401) once the token has
+expired. A provider that can't be reached (no connection, a timeout, a 408, a 429, a 5xx, its
+discovery document unreadable) doesn't end it: the app's refresh answers 503 with `Retry-After`,
+"try again in a moment", and so does a page once the token has expired; before that the old token
+still verifies and the page is served. The session's cookies are kept. A node remembers an outage
+(and a failed discovery) for 5 s, so requests in that time get the same answer without asking the
+provider, then asks it again. If the provider's token can't be checked at the moment (its keys are
+unreachable), the sign-in callback answers 503; the person tries again. Failed sign-ins and
+refreshes are also logged with the provider's error, never a token. Signing out removes the
+session's cookies and, when the provider has an end-session endpoint, signs out there (see
+Sessions).
 
 ## Sessions
 

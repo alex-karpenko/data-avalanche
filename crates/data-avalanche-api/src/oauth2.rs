@@ -45,7 +45,8 @@ const ENDPOINTS_MAX_AGE: Duration = Duration::from_secs(600);
 /// the whole sign-in for it.
 const REFRESHED_KEPT: Duration = Duration::from_secs(30);
 /// A refresh the provider couldn't be reached for is answered 503, its `Retry-After` this long:
-/// the session isn't over, and the refresh is made again once the provider is back.
+/// the session isn't over. The outage is given again for this long to the same refresh token, and
+/// a failed discovery is remembered as long, then the provider is asked again.
 pub const REFRESH_RETRY_AFTER: Duration = Duration::from_secs(5);
 
 /// The provider's endpoints the console uses.
@@ -76,21 +77,34 @@ impl std::fmt::Debug for Tokens {
 /// Why the provider gave no tokens.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum Failed {
-    /// The provider refused (it answered 4xx: `invalid_grant`, a revoked token): a refresh it
-    /// refused ends the session.
+    /// The provider refused (it answered 4xx, but 408 and 429: `invalid_grant`, a revoked
+    /// token): a refresh it refused ends the session.
     #[error("{0}")]
     Refused(String),
     /// The provider couldn't be reached, or answered what isn't an answer (a transport error, a
-    /// timeout, a 5xx, a discovery document that can't be read): try again in a moment.
+    /// timeout, a 408 or a 429, a 5xx, a discovery document that can't be read): try again in a
+    /// moment.
     #[error("{0}")]
     Unreachable(String),
 }
 
-/// When a refresh was made, and what it gave: a success or a refusal, never an outage.
+/// When a refresh was made, and what it gave.
 type Refreshed = (Instant, Result<Tokens, Failed>);
+
+/// How long a refresh's outcome is given again: a success or a refusal [`REFRESHED_KEPT`], an
+/// outage [`REFRESH_RETRY_AFTER`].
+fn kept_for(outcome: &Result<Tokens, Failed>) -> Duration {
+    match outcome {
+        Err(Failed::Unreachable(_)) => REFRESH_RETRY_AFTER,
+        _ => REFRESHED_KEPT,
+    }
+}
 
 /// The discovery URL read and the issuer it was checked against, its endpoints, and when.
 type Discovered = (String, String, Endpoints, Instant);
+
+/// The discovery URL that failed and the issuer it was read for, why, and when.
+type Undiscovered = (String, String, String, Instant);
 
 /// A refresh token's digest, which keys the refreshes in flight and their outcomes.
 type Digest = [u8; 32];
@@ -101,6 +115,9 @@ pub(crate) struct Provider {
     http: reqwest::Client,
     /// The discovery URL read and the issuer checked, its endpoints, and when.
     endpoints: Mutex<Option<Discovered>>,
+    /// The last discovery that failed, given again for [`REFRESH_RETRY_AFTER`]: a node with the
+    /// provider down doesn't wait for it, nor warn, on every page.
+    undiscovered: Mutex<Option<Undiscovered>>,
     /// A refresh token's digest, and what its refresh gave.
     refreshed: Mutex<HashMap<Digest, Refreshed>>,
     /// The refreshes in flight, each held through its refresh: two requests that bring the same
@@ -146,6 +163,7 @@ impl Default for Provider {
                 .build()
                 .expect("the HTTP client builds"),
             endpoints: Mutex::default(),
+            undiscovered: Mutex::default(),
             refreshed: Mutex::default(),
             refreshing: Mutex::default(),
         }
@@ -210,7 +228,8 @@ fn client_form(o: &ApiOauth2, e: &Endpoints, form: &[(&str, &str)]) -> (String, 
 }
 
 impl Provider {
-    /// The endpoints of `o`'s provider: discovered, then cached for [`ENDPOINTS_MAX_AGE`].
+    /// The endpoints of `o`'s provider: discovered, then cached for [`ENDPOINTS_MAX_AGE`]; a
+    /// discovery that failed is given again for [`REFRESH_RETRY_AFTER`].
     ///
     /// # Errors
     /// The discovery document can't be read, names another issuer, or lacks an endpoint.
@@ -226,10 +245,29 @@ impl Provider {
         {
             return Ok(e.clone());
         }
-        let discovered = self.discover(o, url).await;
-        if let Err(e) = &discovered {
-            tracing::warn!("the console's oauth2 provider can't be discovered: {e}");
+        if let Some((at, issuer, why, when)) = &*self
+            .undiscovered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            && *at == url
+            && *issuer == o.issuer
+            && when.elapsed() < REFRESH_RETRY_AFTER
+        {
+            return Err(why.clone());
         }
+        let discovered = self.discover(o, url.clone()).await;
+        let mut undiscovered = self
+            .undiscovered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *undiscovered = match &discovered {
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!("the console's oauth2 provider can't be discovered: {e}");
+                Some((url, o.issuer.clone(), e.clone(), Instant::now()))
+            }
+        };
+        drop(undiscovered);
         discovered
     }
 
@@ -281,8 +319,8 @@ impl Provider {
 
     /// The body of `req`'s answer: a redirect isn't followed, an answer other than `200` is an
     /// error with the provider's `error_description` (or `error`), and a body past
-    /// [`MAX_KEY_DOCUMENT`] isn't read. A 4xx is the provider's refusal; anything else that
-    /// isn't a `200` is an outage.
+    /// [`MAX_KEY_DOCUMENT`] isn't read. A 4xx is the provider's refusal, but a 408 or a 429
+    /// (RFC 6749 §5.2 refuses with 400 or 401); anything else that isn't a `200` is an outage.
     async fn read(&self, req: reqwest::RequestBuilder) -> Result<Vec<u8>, Failed> {
         let unreachable = |e: reqwest::Error| Failed::Unreachable(crate::peers::cause(&e));
         let mut r = req.send().await.map_err(unreachable)?;
@@ -307,7 +345,11 @@ impl Provider {
                 Some(s) => format!("the provider answered {}: {s}", code.as_u16()),
                 None => format!("the provider answered {}", code.as_u16()),
             };
-            return Err(if code.is_client_error() {
+            let transient = matches!(
+                code,
+                reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS
+            );
+            return Err(if code.is_client_error() && !transient {
                 Failed::Refused(why)
             } else {
                 Failed::Unreachable(why)
@@ -375,8 +417,9 @@ impl Provider {
 
     /// Refreshes with `refresh` (RFC 6749 §6); a provider that issues no new refresh token keeps
     /// the old one. Another request bringing the same refresh token within
-    /// [`REFRESHED_KEPT`] gets this one's outcome, without asking the provider again, unless the
-    /// provider couldn't be reached: that isn't kept, so the next request asks again.
+    /// [`REFRESHED_KEPT`] gets this one's outcome, without asking the provider again; an outage
+    /// only within [`REFRESH_RETRY_AFTER`], so requests queued behind this one get its 503, and
+    /// the provider is asked again once that has passed.
     ///
     /// # Errors
     /// [`Failed`]: the provider refused it, or couldn't be reached.
@@ -405,7 +448,7 @@ impl Provider {
                 .refreshed
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            done.retain(|_, (at, _)| at.elapsed() < REFRESHED_KEPT);
+            done.retain(|_, (at, outcome)| at.elapsed() < kept_for(outcome));
             if let Some((_, outcome)) = done.get(&key) {
                 return outcome.clone();
             }
@@ -425,12 +468,10 @@ impl Provider {
             // The provider's words, never a token.
             tracing::warn!("an oauth2 session's refresh failed: {e}");
         }
-        if !matches!(outcome, Err(Failed::Unreachable(_))) {
-            self.refreshed
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(key, (Instant::now(), outcome.clone()));
-        }
+        self.refreshed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key, (Instant::now(), outcome.clone()));
         outcome
     }
 }
@@ -1380,12 +1421,12 @@ mod tests {
         assert!(header_of(&head, "set-cookie").is_empty(), "{head}");
     }
 
-    /// A provider that answers 5xx is down, not refusing: 503, and its outcome isn't kept, so
-    /// the refresh is made again once the provider is back.
+    /// A provider that answers 5xx is down, not refusing: 503, and its outcome is kept only for
+    /// [`REFRESH_RETRY_AFTER`], so the refresh is made again once the provider is back.
     #[tokio::test]
     async fn a_refresh_the_provider_fails_is_made_again_once_it_is_back() {
         let idp = Issuer::start().await;
-        idp.sign_ins.failing.store(true, Ordering::SeqCst);
+        idp.sign_ins.failing.store(503, Ordering::SeqCst);
         let addr = node(&idp, |_| {}).await;
         let now = Utc::now().timestamp();
         let session = oauth2_session(&idp, "refresh-0", now - 600, now + 30);
@@ -1393,10 +1434,65 @@ mod tests {
         assert_eq!(code, 503, "{text}");
         assert!(text.contains("the provider answered 503"), "{text}");
         assert!(!header_of(&head, "retry-after").is_empty(), "{head}");
-        idp.sign_ins.failing.store(false, Ordering::SeqCst);
+        idp.sign_ins.failing.store(0, Ordering::SeqCst);
+        tokio::time::sleep(REFRESH_RETRY_AFTER + Duration::from_millis(200)).await;
         let (code, _, text) = refresh_of(addr, &session).await;
         assert_eq!(code, 200, "{text}");
         assert_eq!(idp.sign_ins.refreshes.load(Ordering::SeqCst), 1);
+    }
+
+    /// Requests that bring one refresh token during an outage wait for one another's refresh:
+    /// they ask the provider once, and each answers 503.
+    #[tokio::test]
+    async fn refreshes_of_one_token_during_an_outage_ask_the_provider_once() {
+        let idp = Issuer::start().await;
+        idp.sign_ins.failing.store(503, Ordering::SeqCst);
+        let addr = node(&idp, |_| {}).await;
+        let now = Utc::now().timestamp();
+        let session = oauth2_session(&idp, "refresh-0", now - 600, now + 30);
+        let (a, b) = tokio::join!(refresh_of(addr, &session), refresh_of(addr, &session));
+        assert_eq!((a.0, b.0), (503, 503), "{} {}", a.2, b.2);
+        assert_eq!(idp.sign_ins.token_requests.lock().unwrap().len(), 1);
+    }
+
+    /// RFC 6749 §5.2 refuses with 400 or 401: a 429 (a gateway that limits the node) or a 408 is
+    /// the provider out of reach for now, not a refusal.
+    #[tokio::test]
+    async fn a_rate_limited_refresh_is_an_outage_not_a_refusal() {
+        for status in [429, 408] {
+            let idp = Issuer::start().await;
+            idp.sign_ins.failing.store(status, Ordering::SeqCst);
+            let addr = node(&idp, |_| {}).await;
+            let now = Utc::now().timestamp();
+            let session = oauth2_session(&idp, "refresh-0", now - 600, now + 30);
+            let (code, head, text) = refresh_of(addr, &session).await;
+            assert_eq!(code, 503, "{status}: {text}");
+            assert!(!header_of(&head, "retry-after").is_empty(), "{head}");
+        }
+    }
+
+    /// A discovery that failed is remembered for [`REFRESH_RETRY_AFTER`]: a cold node with the
+    /// provider down doesn't wait for it again on every page.
+    #[tokio::test]
+    async fn a_failed_discovery_is_remembered_a_moment() {
+        let idp = Issuer::start().await;
+        let (down, log) = crate::test_support::fake_answering(
+            Duration::ZERO,
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({ "error": "down" }),
+        )
+        .await;
+        let mut o = idp.oauth2_api("roles").oauth2.unwrap();
+        o.discovery_url = Some(format!("{down}/.well-known/openid-configuration"));
+        let provider = Provider::default();
+        let first = provider.endpoints(&o).await.unwrap_err();
+        let again = provider.endpoints(&o).await.unwrap_err();
+        assert_eq!(first, again);
+        assert_eq!(log.lock().unwrap().len(), 1, "asked once");
+        assert!(provider.cached(&o).is_none());
+        // Another discovery URL isn't the one that failed.
+        o.discovery_url = None;
+        assert!(provider.endpoints(&o).await.is_ok());
     }
 
     /// The sign-out form's page names the provider's end-session origin in `form-action` even on
