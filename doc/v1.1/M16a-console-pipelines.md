@@ -5784,3 +5784,9 @@ git commit -m "test(e2e): the pipelines' pages and actions in a browser, a viewe
 
   `Chart.test.ts` gained a test for each. No later task touches `Chart.svelte` or `series.ts`,
   so their diffs apply as written.
+- **Task 4, `ui/src/pipelines/List.svelte` (fix commit after the task's own).** The task review
+  found the selection outliving the filters: `chosen` came from every pipeline, so after ticking
+  two and filtering one out the toolbar still said "2 selected" and an action reached the hidden
+  one. The list now acts on the selected pipelines its filters show (`chosen` = `shown` ∩
+  `selected`), counts those, and keeps the hidden ones ticked for when the filter clears.
+  `List.test.ts` gained a test. No later task touches `List.svelte` or `rows.ts`.
