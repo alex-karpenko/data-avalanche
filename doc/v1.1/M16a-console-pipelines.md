@@ -5814,3 +5814,24 @@ git commit -m "test(e2e): the pipelines' pages and actions in a browser, a viewe
   65 passed (1 034 s); the first page drawn in 250 ms, the moves 20, 12, 17 and 11 ms. The second
   fix commit changed two flows and the site only; the console's six flows passed again on it
   (the moves 21, 14, 15 and 13 ms).
+- **The whole-branch review** (Opus) found no Critical issue and four Important ones, fixed in
+  one wave (`5dd1a0d`..`f8477dd`) and re-reviewed:
+  - a pipeline's lease said "expires in 0 s" on every healthy pipeline within a lease term (the
+    cluster part was read again only on lease and member events): the page reads it every 5 s,
+    and the header says `expires in`, `expired … ago` or `lease released`;
+  - a pipeline's page carried its state (the snapshot dialog's tables and Truncate, an open
+    dialog) to the next pipeline's: the page is keyed and drawn only for its own id, and the
+    snapshot dialog starts clean;
+  - an OAuth2 token refresh rebuilt the pipeline's page: the page is built on being signed in,
+    not on the session object;
+  - the list didn't say when its cluster, jobs or tables reads failed, or how old they were: one
+    helper (`ui/src/lib/notices.ts`) words the list's and the page's notices, with people's names
+    for the parts, and the stale notice says "no live update yet" before the first.
+
+  And from the deferred minors: flush is offered on a running pipeline only (a paused one was
+  flushed by its pause, and the server answers `unchanged`; this changes D-M16a.3); the dialog
+  frees itself when an action throws; the lag lines read again after a failed read; a MySQL
+  pipeline's tables are named one way (the figures' bare name). After the wave: 1 853 workspace
+  tests, 147 UI tests, the console's six flows (the moves 21, 14, 27 and 11 ms). Two findings were
+  parked for M16b: the site's example notice says `HTTP 503` where the page prints the server's
+  error or the status text, and a failed 5 s cluster read leaves the header saying "expired".
