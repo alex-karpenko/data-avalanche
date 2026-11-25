@@ -71,3 +71,11 @@ button {
 .muted {
   color: var(--text-2);
 }
+
+/* The session couldn't be read: the page says why while it tries again. */
+.unread {
+  margin: 16px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: var(--orange-bg);
+}

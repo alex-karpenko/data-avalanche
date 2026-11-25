@@ -31,6 +31,7 @@ const pause = event({
   pipeline: 'inventory',
   text: 'pause inventory',
   actor: { name: 'Oleksii', role: 'operator' },
+  outcome: 'accepted',
 });
 
 /** Every 5 min over the last hour: `f(minutes ago)`. */
@@ -64,8 +65,8 @@ export function facts(): Facts {
       ],
     },
     jobs: [
-      { job_id: '7c3a9d5e-0000-4000-8000-000000000001', pipeline: 'customers', status: 'running', rows_done: 62, estimate: 100, requested_at: iso(NOW - 20 * MIN), finished_at: null, error: null },
-      { job_id: '5b1e2f40-0000-4000-8000-000000000002', pipeline: 'billing-mysql', status: 'failed', rows_done: 10, estimate: 50, requested_at: iso(NOW - 200 * MIN), finished_at: iso(NOW - 180 * MIN), error: 'the source connection was lost' },
+      { job_id: 'customers~019ab5d07c3a7d5e8f0a1b2c3d4e5f60', pipeline: 'customers', status: 'running', rows_done: 62, estimate: 100, requested_at: iso(NOW - 20 * MIN), finished_at: null, error: null },
+      { job_id: 'billing-mysql~019ab4f25b1e7f40a3c2d1e0f9a8b7c6', pipeline: 'billing-mysql', status: 'failed', rows_done: 10, estimate: 50, requested_at: iso(NOW - 200 * MIN), finished_at: iso(NOW - 180 * MIN), error: 'the source connection was lost' },
     ],
     tables: [
       { pipeline: 'orders-pg', table: 'public.refunds', state: 'halted', halt: { code: 'SCHEMA_REFUSED', detail: "amount changed int → text, which can't be applied in place", since: iso(NOW - 12 * MIN) }, last_commit: iso(NOW - 15 * MIN) },
@@ -113,6 +114,7 @@ export function facts(): Facts {
       pause,
     ],
     actions: { inventory: pause },
+    leaseLosses: [],
     unreachable: {},
     unheld: {},
   };

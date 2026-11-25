@@ -3,6 +3,7 @@
 
 import type { Client } from '../lib/api';
 import type { Live } from '../lib/live.svelte';
+import { LEASE_LOSS_WITHIN_S } from './attention';
 import { empty, type Facts } from './facts';
 import type {
   Actual,
@@ -18,15 +19,34 @@ import type {
 
 /** The events the Overview lists. */
 export const EVENTS_SHOWN = 8;
-/** The events read for the rules (lease losses of the last hour). */
+/** The newest events read, and kept. */
 export const EVENTS_READ = 100;
 /** The span of the pipelines' lag lines. */
 export const LAG_SPAN_S = 3600;
 /** A burst of events reads their parts again once, after this. */
 export const REREAD_AFTER_MS = 1_000;
 
-export type Part = 'pipelines' | 'cluster' | 'config' | 'jobs' | 'tables' | 'events' | 'actions' | 'lag';
-export const PARTS: Part[] = ['pipelines', 'cluster', 'config', 'jobs', 'tables', 'events', 'actions', 'lag'];
+export type Part =
+  | 'pipelines'
+  | 'cluster'
+  | 'config'
+  | 'jobs'
+  | 'tables'
+  | 'events'
+  | 'actions'
+  | 'leases'
+  | 'lag';
+export const PARTS: Part[] = [
+  'pipelines',
+  'cluster',
+  'config',
+  'jobs',
+  'tables',
+  'events',
+  'actions',
+  'leases',
+  'lag',
+];
 
 /** When a part was last read (ms), and why its last read failed. */
 export interface Read {
@@ -35,12 +55,22 @@ export interface Read {
 }
 
 const ACTIONS = 'action.pipeline.pause,action.pipeline.stop,action.pipeline.resume';
+const LEASES = 'lease.lost,lease.takeover';
+
+/** An action that was carried out: a refused one is recorded under the same kind. */
+const accepted = (e: EventItem) => ACTIONS.split(',').includes(e.kind) && e.outcome === 'accepted';
+
+/** `r` with only the keys in `keep`. */
+function only<T>(r: Record<string, T>, keep: Set<string>): Record<string, T> {
+  return Object.fromEntries(Object.entries(r).filter(([k]) => keep.has(k)));
+}
 
 /** The parts an event's kind changes. */
 function partsOf(kind: string): Part[] {
   if (kind.startsWith('job.')) return ['jobs'];
   if (kind.startsWith('config.')) return ['config'];
-  if (kind.startsWith('member.') || kind.startsWith('lease.')) return ['cluster', 'pipelines'];
+  if (kind.startsWith('lease.')) return ['cluster', 'pipelines', 'leases'];
+  if (kind.startsWith('member.')) return ['cluster', 'pipelines'];
   if (kind.startsWith('table.') || kind.startsWith('schema.')) return ['tables'];
   if (kind.startsWith('pipeline.')) return ['pipelines'];
   if (kind.startsWith('action.snapshot.')) return ['jobs'];
@@ -115,9 +145,12 @@ export class Overview {
 
   /** An event, once written: the newest first, and the parts it changes read again. */
   event(e: EventItem): void {
+    if (LEASES.split(',').includes(e.kind) && !this.facts.leaseLosses.some((x) => x.key === e.key)) {
+      this.facts.leaseLosses = [e, ...this.facts.leaseLosses];
+    }
     if (this.facts.events.some((x) => x.key === e.key)) return;
     this.facts.events = [e, ...this.facts.events].slice(0, EVENTS_READ);
-    if (ACTIONS.split(',').includes(e.kind) && e.pipeline !== undefined) {
+    if (accepted(e) && e.pipeline !== undefined) {
       this.facts.actions[e.pipeline] = e;
     }
     this.#reread(partsOf(e.kind));
@@ -127,8 +160,10 @@ export class Overview {
   peer(m: PeerMsg): void {
     if (m.state === 'unreachable') {
       this.facts.unreachable[m.peer] ??= Date.now();
-    } else {
+    } else if (m.peer in this.facts.unreachable) {
       delete this.facts.unreachable[m.peer];
+      // Its events of the gap aren't sent again (Admin_Console §8.1): they are read.
+      this.#reread(['events', 'pipelines', 'cluster', 'leases']);
     }
   }
 
@@ -147,9 +182,16 @@ export class Overview {
     try {
       const f = this.facts;
       switch (part) {
-        case 'pipelines':
+        case 'pipelines': {
           f.pipelines = (await this.#api.get<{ pipelines: PipelineItem[] }>('/v1/pipelines')).pipelines;
+          // A removed pipeline's figures, lag and actions go with it.
+          const ids = new Set(f.pipelines.map((p) => p.id));
+          f.figures = only(f.figures, ids);
+          f.lag = only(f.lag, ids);
+          f.actions = only(f.actions, ids);
+          f.unheld = only(f.unheld, ids);
           break;
+        }
         case 'cluster': {
           f.cluster = await this.#api.get<ClusterStatus>('/v1/cluster/status');
           const unheld: Record<string, number> = {};
@@ -157,6 +199,8 @@ export class Overview {
             if (l.holder === null || l.holder_stale) unheld[l.id] = f.unheld[l.id] ?? Date.now();
           }
           f.unheld = unheld;
+          // A member removed gets no more `peer`: it is out of reach no longer.
+          f.unreachable = only(f.unreachable, new Set(f.cluster.members.map((m) => m.node)));
           break;
         }
         case 'config':
@@ -178,8 +222,16 @@ export class Overview {
             `/v1/events?kind=${ACTIONS}&limit=1000`,
           );
           const newest: Record<string, EventItem> = {};
-          for (const e of events) if (e.pipeline !== undefined) newest[e.pipeline] ??= e;
+          for (const e of events) if (accepted(e) && e.pipeline !== undefined) newest[e.pipeline] ??= e;
           f.actions = newest;
+          break;
+        }
+        case 'leases': {
+          const since = new Date(Date.now() - LEASE_LOSS_WITHIN_S * 1000).toISOString();
+          const { events } = await this.#api.get<{ events: EventItem[] }>(
+            `/v1/events?kind=${LEASES}&since=${since}&limit=1000`,
+          );
+          f.leaseLosses = events;
           break;
         }
         case 'lag': {

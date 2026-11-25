@@ -44,6 +44,13 @@ describe("the Overview's", () => {
     ]);
   });
 
+  it("tiles and rows take a node that doesn't answer the config read", () => {
+    const f = facts();
+    f.config!.nodes[2] = { node: 'n3', generation: 41, file: 'differs', restart_pending: null, error: 'n3 gossips no API address' };
+    expect(tiles(f, NOW)).toEqual(tiles(facts(), NOW));
+    expect(rows(f, NOW)).toEqual(rows(facts(), NOW));
+  });
+
   it('tiles and rows take a pipeline that is starting: no worker, no source yet', () => {
     const f = facts();
     f.figures.customers = figures({ id: 'customers', node: 'n1', worker: null, source: null });

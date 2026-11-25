@@ -28,10 +28,15 @@ const READS = {
   '/v1/events?limit=100': { events: facts().events },
   '/v1/events?kind=action.pipeline.pause,action.pipeline.stop,action.pipeline.resume&limit=1000': {
     events: [
-      event({ kind: 'action.pipeline.resume', at: iso(NOW - 60_000), pipeline: 'b' }),
+      // A refused stop (a 409) is recorded under its action's kind too.
+      event({ kind: 'action.pipeline.stop', at: iso(NOW - 30_000), pipeline: 'customers', severity: 'warning', outcome: 'refused' }),
+      event({ kind: 'action.pipeline.resume', at: iso(NOW - 60_000), pipeline: 'customers', outcome: 'accepted' }),
       facts().actions.inventory,
-      event({ kind: 'action.pipeline.pause', at: iso(NOW - 120_000), pipeline: 'b' }),
+      event({ kind: 'action.pipeline.pause', at: iso(NOW - 120_000), pipeline: 'customers', outcome: 'accepted' }),
     ],
+  },
+  [`/v1/events?kind=lease.lost,lease.takeover&since=${iso(NOW - 3_600_000)}&limit=1000`]: {
+    events: [event({ kind: 'lease.takeover', at: iso(NOW - 50 * 60_000), pipeline: 'customers', text: 'customers taken over from n1 by n3' })],
   },
   '/v1/history?series=lag_seconds': {
     series: [{ name: 'lag_seconds', pipeline: 'orders-pg', points: [[NOW / 1000, 21]] }],
@@ -49,7 +54,8 @@ describe("the Overview's data", () => {
     const o = new Overview(api(READS));
     await o.load();
     expect(o.facts.pipelines.map((p) => p.id)).toEqual(['orders-pg', 'billing-mysql', 'inventory', 'customers']);
-    expect(o.facts.actions.b.kind).toBe('action.pipeline.resume');
+    expect(o.facts.actions.customers.kind).toBe('action.pipeline.resume');
+    expect(o.facts.leaseLosses.map((e) => e.text)).toEqual(['customers taken over from n1 by n3']);
     expect(o.facts.lag['orders-pg']).toEqual([[NOW / 1000, 21]]);
     expect(Object.values(o.read).every((r) => r.at === NOW && r.error === null)).toBe(true);
     const { '/v1/snapshots': _, ...without } = READS;
@@ -81,6 +87,67 @@ describe("the Overview's data", () => {
     expect(o.facts.unreachable).toEqual({});
   });
 
+  it('reads the gap when a node is followed again, and forgets a node gone from the cluster', async () => {
+    const client = api(READS);
+    const o = new Overview(client);
+    o.facts = facts();
+    o.peer({ peer: 'n3', state: 'following' });
+    await vi.advanceTimersByTimeAsync(REREAD_AFTER_MS);
+    expect(client.asked).toEqual([]);
+    o.peer({ peer: 'n3', state: 'unreachable', error: 'it answered 503' });
+    o.peer({ peer: 'n3', state: 'following' });
+    await vi.advanceTimersByTimeAsync(REREAD_AFTER_MS);
+    expect(client.asked.sort()).toEqual([
+      '/v1/cluster/status',
+      `/v1/events?kind=lease.lost,lease.takeover&since=${iso(NOW - 3_600_000 + 2 * REREAD_AFTER_MS)}&limit=1000`,
+      '/v1/events?limit=100',
+      '/v1/pipelines',
+    ]);
+    // A member removed gets no more `peer`: the cluster's members say it's gone.
+    o.peer({ peer: 'n4', state: 'unreachable', error: "it can't be reached" });
+    o.peer({ peer: 'n2', state: 'unreachable', error: "it can't be reached" });
+    await o.load(['cluster']);
+    expect(Object.keys(o.facts.unreachable)).toEqual(['n2']);
+  });
+
+  it('keeps only accepted pauses, stops and resumes, read or streamed', () => {
+    const o = new Overview(api({}));
+    o.facts = facts();
+    const before = o.facts.actions.inventory;
+    o.event(event({ key: 'refused', kind: 'action.pipeline.resume', at: iso(NOW), pipeline: 'inventory', severity: 'warning', outcome: 'refused', actor: { name: 'ci-bot', role: 'operator' } }));
+    expect(o.facts.actions.inventory).toEqual(before);
+    const resumed = event({ kind: 'action.pipeline.resume', at: iso(NOW), pipeline: 'inventory', outcome: 'accepted', actor: { name: 'ci-bot', role: 'operator' } });
+    o.event(resumed);
+    expect(o.facts.actions.inventory).toEqual(resumed);
+  });
+
+  it("forgets a removed pipeline's figures, lag, actions and lease", async () => {
+    const o = new Overview(api({ '/v1/pipelines': { pipelines: facts().pipelines.filter((p) => p.id !== 'orders-pg') } }));
+    o.facts = facts();
+    o.facts.actions['orders-pg'] = o.facts.actions.inventory;
+    o.facts.unheld = { 'orders-pg': NOW, customers: NOW };
+    await o.load(['pipelines']);
+    expect(Object.keys(o.facts.figures).sort()).toEqual(['billing-mysql', 'inventory']);
+    expect(Object.keys(o.facts.lag)).toEqual(['billing-mysql']);
+    expect(Object.keys(o.facts.actions)).toEqual(['inventory']);
+    expect(o.facts.unheld).toEqual({ customers: NOW });
+  });
+
+  it("keeps the hour's lease losses: a streamed one joins them once", async () => {
+    const client = api(READS);
+    const o = new Overview(client);
+    o.facts = facts();
+    const lost = event({ kind: 'lease.lost', at: iso(NOW), pipeline: 'customers', text: 'n1 lost the lease of customers' });
+    o.event(lost);
+    o.event(lost);
+    o.event(event({ kind: 'lease.acquired', at: iso(NOW), pipeline: 'customers' }));
+    expect(o.facts.leaseLosses).toEqual([lost]);
+    await vi.advanceTimersByTimeAsync(REREAD_AFTER_MS);
+    expect(client.asked).toContain(
+      `/v1/events?kind=lease.lost,lease.takeover&since=${iso(NOW - 3_600_000 + REREAD_AFTER_MS)}&limit=1000`,
+    );
+  });
+
   it('remembers since when a lease has had no holder, until one holds it', async () => {
     const status = structuredClone(facts().cluster!);
     status.pipelines[3].holder = null;
@@ -100,7 +167,7 @@ describe("the Overview's data", () => {
     const client = api(READS);
     const o = new Overview(client);
     o.facts = facts();
-    const paused = event({ kind: 'action.pipeline.pause', at: iso(NOW), pipeline: 'customers', actor: { name: 'ci-bot', role: 'operator' } });
+    const paused = event({ kind: 'action.pipeline.pause', at: iso(NOW), pipeline: 'customers', actor: { name: 'ci-bot', role: 'operator' }, outcome: 'accepted' });
     o.event(paused);
     o.event(paused);
     o.event(event({ kind: 'job.completed', at: iso(NOW), pipeline: 'customers' }));

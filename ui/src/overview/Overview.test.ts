@@ -63,6 +63,7 @@ describe('the Overview', () => {
       '/ui/pipelines/inventory',
     ]);
     expect(text(rows[3])).toBe('inventory PostgreSQL → Delta · 1 table paused by Oleksii, 2 h ago n3 — 2 h ago');
+    expect(rows[3].querySelectorAll('a')[1]?.getAttribute('href')).toBe('/ui/cluster/nodes/n3');
     expect(rows[1].querySelector('polyline')).not.toBeNull();
     expect([...page.querySelectorAll('.ev li')].map(text)[1]).toBe(
       `${clock(NOW - 7_200_000)} pause inventory by Oleksii (operator)`,
@@ -78,6 +79,14 @@ describe('the Overview', () => {
     expect(text(page.querySelector('.failing'))).toBe(
       "Couldn't be read, shown as last read: jobs (the request timed out)",
     );
+  });
+
+  it("shows the page when a node doesn't answer the config read", () => {
+    const m = model();
+    m.facts.config!.nodes[1] = { node: 'n2', generation: 42, file: 'same', restart_pending: null, error: 'n2 answered 504' };
+    const page = render(m);
+    expect(text(page.querySelector('h3'))).toBe('Needs attention · 6');
+    expect(page.querySelectorAll('tbody tr')).toHaveLength(4);
   });
 
   it('says when nothing needs attention', () => {

@@ -11,7 +11,7 @@ describe('needs attention', () => {
     expect(lines()).toEqual([
       "red orders-pg › public.refunds halted: amount changed int → text, which can't be applied in place",
       `orange billing-mysql lag 4m 12s: and rising (target ${LAG_TARGET_S} s)`,
-      'orange Snapshot 5b1e2f40 of billing-mysql failed: the source connection was lost',
+      'orange Snapshot 019ab4f2 of billing-mysql failed: the source connection was lost',
       'orange Slot da_inventory holds 3.2 GB of WAL: 80% of max_slot_wal_keep_size · pipeline inventory',
       'yellow inventory paused: by Oleksii',
       'yellow Restart-only change waiting on n2: globals.api.address',
@@ -31,7 +31,7 @@ describe('needs attention', () => {
     f.cluster!.members[2].suspect = true;
     f.unreachable = { n2: NOW - 40_000 };
     f.figures['orders-pg'].worker!.degraded = 'a commit failed: 503 from the store';
-    f.events.unshift(event({ kind: 'lease.takeover', at: iso(NOW - 5 * MIN), pipeline: 'customers', text: 'customers taken over from n1 by n3' }));
+    f.leaseLosses.unshift(event({ kind: 'lease.takeover', at: iso(NOW - 5 * MIN), pipeline: 'customers', text: 'customers taken over from n1 by n3' }));
     expect(lines(f).filter((l) => !l.includes('refunds') && !l.startsWith('yellow'))).toEqual([
       'red customers has no node running it: no node holds its lease',
       'red billing-mysql stopped by an error: the slot was invalidated',
@@ -39,7 +39,7 @@ describe('needs attention', () => {
       "orange n2 doesn't answer the console: its pipelines show as last known",
       'orange customers failed over: customers taken over from n1 by n3',
       `orange billing-mysql lag 4m 12s: and rising (target ${LAG_TARGET_S} s)`,
-      'orange Snapshot 5b1e2f40 of billing-mysql failed: the source connection was lost',
+      'orange Snapshot 019ab4f2 of billing-mysql failed: the source connection was lost',
       'orange Slot da_inventory holds 3.2 GB of WAL: 80% of max_slot_wal_keep_size · pipeline inventory',
       "orange orders-pg can't commit: a commit failed: 503 from the store",
     ]);
@@ -82,7 +82,7 @@ describe('needs attention', () => {
     expect(quiet(unheld(NOW - 30_000)).join()).toContain('customers has no node running it');
     // A lease taken over two hours ago is history.
     expect(
-      quiet((f) => f.events.unshift(event({ kind: 'lease.lost', at: iso(NOW - 61 * MIN), pipeline: 'customers' }))).join(),
+      quiet((f) => f.leaseLosses.unshift(event({ kind: 'lease.lost', at: iso(NOW - 61 * MIN), pipeline: 'customers' }))).join(),
     ).not.toContain('lease');
   });
 
@@ -96,7 +96,7 @@ describe('needs attention', () => {
     f.jobs = [];
     f.unreachable = {};
     f.config = null;
-    f.events = [
+    f.leaseLosses = [
       lease('lease.takeover', 40, 'customers', 'customers taken over from n3 by n2'),
       lease('lease.takeover', 5, 'customers', 'customers taken over from n1 by n3'),
       lease('lease.lost', 20, undefined, 'a lease was lost'),
@@ -110,11 +110,31 @@ describe('needs attention', () => {
         href: '/ui/pipelines/customers',
       }),
     ]);
-    f.events = [lease('lease.lost', 20, 'customers', 'customers lost its lease')];
+    f.leaseLosses = [lease('lease.lost', 20, 'customers', 'customers lost its lease')];
     expect(attention(f, NOW)[0]).toMatchObject({ what: 'customers lost its lease', why: 'customers lost its lease' });
     expect(attention(f, NOW)).toHaveLength(1);
-    f.events = [lease('lease.lost', 20, undefined, 'a lease was lost')];
+    f.leaseLosses = [lease('lease.lost', 20, undefined, 'a lease was lost')];
     expect(attention(f, NOW)).toEqual([]);
+  });
+
+  it("names a job by its uuid's first 8 characters, and links a node to its page", () => {
+    const f = facts();
+    f.cluster!.members[2].suspect = true;
+    f.unreachable = { n2: NOW - 40_000 };
+    const links = Object.fromEntries(attention(f, NOW).map((a) => [a.what, a.href]));
+    expect(links).toMatchObject({
+      'Snapshot 019ab4f2 of billing-mysql failed': '/ui/snapshots/billing-mysql~019ab4f25b1e7f40a3c2d1e0f9a8b7c6',
+      'n3 is down': '/ui/cluster/nodes/n3',
+      "n2 doesn't answer the console": '/ui/cluster/nodes/n2',
+      'n3 runs config generation 41': '/ui/cluster/nodes/n3',
+    });
+  });
+
+  it("takes a node that doesn't answer the config read: no restart-only changes known", () => {
+    const f = facts();
+    // `GET /v1/config/nodes`' row for a member that doesn't answer within 2 s.
+    f.config!.nodes[1] = { node: 'n2', generation: 42, file: 'same', restart_pending: null, error: 'n2 answered 504' };
+    expect(lines(f)).toEqual(lines().filter((l) => !l.includes('Restart-only')));
   });
 
   it('takes a pipeline that is starting: no worker, no source yet', () => {

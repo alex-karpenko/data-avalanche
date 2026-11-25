@@ -13,7 +13,7 @@ When the config turns the API's auth on, the request needs its credentials.
 
 The web console:
 {{- with dig "globals" "console" "public_url" "" $config }}
-  {{ . }}/ui/
+  {{ trimSuffix "/" . }}/ui/
 where people's browsers reach the API's Service (globals.console.public_url).
 {{- else }}
   {{ lower (include "data-avalanche.scheme" .) }}://localhost:{{ include "data-avalanche.apiPort" . }}/ui/

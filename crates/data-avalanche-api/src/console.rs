@@ -228,10 +228,10 @@ pub(crate) fn frame(api: &Api, sign_in: &SignIn) -> Frame {
 }
 
 /// A page under `/ui/`: the app's page for a caller who verifies, the sign-in for one who brought
-/// nothing, else why not. An `oauth2` session whose token is about
-/// to expire is refreshed first, its new cookies set with the page; once the token expired, a
-/// provider that refuses the refresh ends the session (401), one that can't be reached answers
-/// "try again" (503, `Retry-After`), the session kept.
+/// nothing, else why not. An `oauth2` session whose token is about to expire is refreshed first,
+/// its new cookies set with the page; once the token expired, a provider that refuses the refresh
+/// ends the session (401), one that can't be reached answers "try again" (503, `Retry-After`),
+/// the session kept.
 async fn page(
     State(api): State<Api>,
     info: Option<Extension<ConnectInfo<crate::server::Client>>>,

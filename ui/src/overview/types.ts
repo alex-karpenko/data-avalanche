@@ -24,7 +24,14 @@ export interface ClusterStatus {
 /** `GET /v1/config/nodes`. */
 export interface ConfigNodes {
   generation: number;
-  nodes: { node: string; generation: number | null; file: string; restart_pending: string[] }[];
+  nodes: {
+    node: string;
+    generation: number | null;
+    file: string;
+    /** `null`, with an `error`, for a node that doesn't answer or gossips no API address. */
+    restart_pending: string[] | null;
+    error?: string;
+  }[];
 }
 
 export interface Halt {
@@ -51,6 +58,7 @@ export interface Tables {
 
 /** A snapshot job, as `GET /v1/snapshots` lists it. */
 export interface Job {
+  /** `<pipeline>~<uuid>`. */
   job_id: string;
   pipeline: string;
   status: 'queued' | 'running' | 'cancelling' | 'completed' | 'failed' | 'cancelled';
@@ -93,6 +101,8 @@ export interface EventItem {
   text: string;
   actor?: { name: string; role: string };
   note?: string;
+  /** How an action ended: `accepted`, `unchanged`, `refused`, `denied`. */
+  outcome?: string;
 }
 
 /** `GET /v1/history`'s series: points `[unix seconds, value]`, oldest first. */

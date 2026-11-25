@@ -106,9 +106,9 @@ live stream (Oleksii, 2026-11-25):
 | lag rising | higher now than 5 min ago |
 | a slot's WAL | over 50% of `max_slot_wal_keep_size`, or over 16 GiB when the server sets none |
 | a lease with no holder | none (or a holder that stopped renewing) for over 30 s: a rebalance hands leases over within that |
-| lease renewal failures | a `lease.lost` or `lease.takeover` event in the last hour |
+| lease renewal failures | a `lease.lost` or `lease.takeover` event in the last hour (the hour's lease events, read on their own) |
 | a snapshot job failed | in the last 24 h |
-| paused or stopped by a person | over 1 h ago (the newest `action.pipeline.*` event names a person) |
+| paused or stopped by a person | over 1 h ago (the newest accepted `action.pipeline.*` event names a person) |
 | sink commit failures | the worker reports itself degraded |
 | a node down | SWIM marks it suspect; a node the console's stream can't follow is orange |
 

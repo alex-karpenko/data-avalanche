@@ -39,6 +39,12 @@ export interface Attention {
 const RANK: Record<Severity, number> = { red: 0, orange: 1, yellow: 2 };
 
 const pipelineHref = (id: string) => `/ui/pipelines/${encodeURIComponent(id)}`;
+export const nodeHref = (node: string) => `/ui/cluster/nodes/${encodeURIComponent(node)}`;
+
+/** A job's short name: the first 8 characters of its id's uuid, after the pipeline's `~`. */
+export function shortJob(id: string): string {
+  return id.slice(id.lastIndexOf('~') + 1).slice(0, 8);
+}
 
 /** Whether a slot's WAL held is past its threshold. */
 export function walPast(held: number, limit: number | null | undefined): boolean {
@@ -95,7 +101,7 @@ export function attention(f: Facts, now: number): Attention[] {
         what: `${m.node} is down`,
         why: "the other nodes' probes get no answer",
         since: null,
-        href: `/ui/nodes/${encodeURIComponent(m.node)}`,
+        href: nodeHref(m.node),
         link: 'Node',
       });
     }
@@ -150,7 +156,7 @@ export function attention(f: Facts, now: number): Attention[] {
   }
   // One line per pipeline: its newest lease loss within the hour, counted when there were more.
   const lost = new Map<string, { e: EventItem; when: number; n: number }>();
-  for (const e of f.events) {
+  for (const e of f.leaseLosses) {
     const when = at(e.at);
     if (
       (e.kind === 'lease.lost' || e.kind === 'lease.takeover') &&
@@ -181,7 +187,7 @@ export function attention(f: Facts, now: number): Attention[] {
     if (j.status === 'failed' && ended !== null && now - ended <= FAILED_WITHIN_S * 1000) {
       add({
         severity: 'orange',
-        what: `Snapshot ${j.job_id.slice(0, 8)} of ${j.pipeline} failed`,
+        what: `Snapshot ${shortJob(j.job_id)} of ${j.pipeline} failed`,
         why: j.error ?? '',
         since: ended,
         href: `/ui/snapshots/${encodeURIComponent(j.job_id)}`,
@@ -195,7 +201,7 @@ export function attention(f: Facts, now: number): Attention[] {
       what: `${node} doesn't answer the console`,
       why: 'its pipelines show as last known',
       since,
-      href: `/ui/nodes/${encodeURIComponent(node)}`,
+      href: nodeHref(node),
       link: 'Node',
     });
   }
@@ -209,15 +215,16 @@ export function attention(f: Facts, now: number): Attention[] {
         what: `${n.node} runs config generation ${n.generation}`,
         why: `the cluster is on ${f.config.generation}`,
         since: null,
-        href: `/ui/nodes/${encodeURIComponent(n.node)}`,
+        href: nodeHref(n.node),
         link: 'Node',
       });
     }
-    if (n.restart_pending.length > 0) {
+    const pending = n.restart_pending ?? [];
+    if (pending.length > 0) {
       add({
         severity: 'yellow',
         what: `Restart-only change waiting on ${n.node}`,
-        why: n.restart_pending.join(', '),
+        why: pending.join(', '),
         since: null,
         href: '/ui/config',
         link: 'Review',

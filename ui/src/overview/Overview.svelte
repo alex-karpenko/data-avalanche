@@ -12,6 +12,7 @@
     WAL_SHARE,
     WAL_UNLIMITED_BYTES,
     attention,
+    nodeHref,
   } from './attention';
   import { rows, tiles } from './derive';
   import { EVENTS_SHOWN, PARTS, type Overview } from './model.svelte';
@@ -95,7 +96,7 @@
               <span class="chip {r.state.tone}">{r.state.label}</span>
               {#if r.state.note !== null}<div class="muted note">{r.state.note}</div>{/if}
             </td>
-            <td>{#if r.node !== null}<a href={href('nodes', r.node)}>{r.node}</a>{/if}</td>
+            <td>{#if r.node !== null}<a href={nodeHref(r.node)}>{r.node}</a>{/if}</td>
             <td>
               <Sparkline points={r.points} target={LAG_TARGET_S} />
               {r.lag === null ? '' : duration(r.lag)}

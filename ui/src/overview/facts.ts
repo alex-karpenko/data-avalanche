@@ -24,8 +24,10 @@ export interface Facts {
   lag: Record<string, [number, number][]>;
   /** The newest events, newest first. */
   events: EventItem[];
-  /** Each pipeline's newest pause, stop or resume. */
+  /** Each pipeline's newest accepted pause, stop or resume. */
   actions: Record<string, EventItem>;
+  /** The leases lost or taken over in the last hour, newest first. */
+  leaseLosses: EventItem[];
   /** The nodes the stream can't follow, since when (ms). */
   unreachable: Record<string, number>;
   /** The pipelines whose lease no node holds (or renews), since when the page saw it (ms). */
@@ -43,6 +45,7 @@ export function empty(): Facts {
     lag: {},
     events: [],
     actions: {},
+    leaseLosses: [],
     unreachable: {},
     unheld: {},
   };

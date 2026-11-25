@@ -6,29 +6,24 @@
   import { client } from './lib/api';
   import { Live } from './lib/live.svelte';
   import { Router } from './lib/router.svelte';
-  import { keepFresh, readSession, type Session } from './lib/session';
+  import { awaitSession, checkSession, keepFresh, RETRY_MS, type Session } from './lib/session';
   import { Overview as OverviewModel } from './overview/model.svelte';
   import Overview from './overview/Overview.svelte';
 
-  // The server says why the session ended: its 401 page, or the sign-in.
+  // The server says why the session ended: its 401 or 403 page, or the sign-in.
   const ended = () => location.reload();
   const fetch = globalThis.fetch.bind(globalThis);
 
   let session = $state<Session | null>(null);
+  /** Why the session couldn't be read, while it is read again. */
+  let unread = $state<string | null>(null);
   let generation = $state<number | null>(null);
   let now = $state(Date.now());
   const router = new Router();
   const api = client({ fetch, csrf: () => session?.csrf ?? null, ended });
   const live = new Live({
     open: (url) => new EventSource(url),
-    check: async () => {
-      const r = await fetch('/ui/session', { headers: { Accept: 'application/json' } });
-      if (r.status === 401) {
-        ended();
-        return 'ended';
-      }
-      return r.ok ? 'ok' : 'later';
-    },
+    check: () => checkSession({ fetch, ended }),
   });
   const overview = new OverviewModel(api);
 
@@ -49,14 +44,15 @@
       }),
       overview.follow(live),
     ];
-    void readSession({ fetch, ended }).then((s) => {
-      if (s === null) return;
+    const read = (s: Session) => {
       session = s;
+      unread = null;
       stops.push(keepFresh(s, { fetch, ended }, (next) => (session = next)));
       live.start();
       void readGeneration();
       void overview.load();
-    });
+    };
+    stops.push(awaitSession({ fetch, ended }, read, (why) => (unread = why)));
     const tick = setInterval(() => {
       now = Date.now();
       live.tick(now);
@@ -85,4 +81,9 @@
       <Later section={router.section} />
     {/if}
   </Frame>
+{:else if unread !== null}
+  <p class="unread" role="alert">
+    The console couldn't read your session: {unread}. Trying again in {RETRY_MS / 1000} s.
+    <button type="button" onclick={() => location.reload()}>Reload</button>
+  </p>
 {/if}
