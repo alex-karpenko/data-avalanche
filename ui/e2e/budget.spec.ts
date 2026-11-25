@@ -51,16 +51,18 @@ test(`moving between pages takes under ${MOVE_MS} ms`, async ({ page }) => {
   await expect(page.locator('.conn')).toHaveText('live', { timeout: 15_000 });
   // A pipeline's page draws its tables from the figures the stream sent; until they come (each
   // node sends its pipelines' every 5 s, once the page follows it) it reads them from the node that
-  // runs it. The moves are timed once the stream has sent every pipeline's.
+  // runs it. A pipeline's worker draws none until it runs, and a node starts its workers one after
+  // another. The moves are timed once the stream has sent every pipeline's figures with its tables.
   await page.evaluate(
     (n) =>
       new Promise<void>((done, fail) => {
-        const ids = new Set<string>();
+        const ready = new Set<string>();
         const es = new EventSource('/v1/stream?kind=figures');
-        const end = setTimeout(() => (es.close(), fail(new Error(`figures for ${ids.size} of ${n}`))), 30_000);
+        const end = setTimeout(() => (es.close(), fail(new Error(`tables for ${ready.size} of ${n}`))), 45_000);
         es.addEventListener('figures', (e) => {
-          ids.add(JSON.parse((e as MessageEvent).data).id);
-          if (ids.size === n) (clearTimeout(end), es.close(), done());
+          const f = JSON.parse((e as MessageEvent).data);
+          if (f.tables?.length > 0) ready.add(f.id);
+          if (ready.size === n) (clearTimeout(end), es.close(), done());
         });
       }),
     pipelines,
