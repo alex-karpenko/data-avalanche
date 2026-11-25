@@ -7,6 +7,8 @@
   import { Live } from './lib/live.svelte';
   import { Router } from './lib/router.svelte';
   import { keepFresh, readSession, type Session } from './lib/session';
+  import { Overview as OverviewModel } from './overview/model.svelte';
+  import Overview from './overview/Overview.svelte';
 
   // The server says why the session ended: its 401 page, or the sign-in.
   const ended = () => location.reload();
@@ -28,6 +30,7 @@
       return r.ok ? 'ok' : 'later';
     },
   });
+  const overview = new OverviewModel(api);
 
   async function readGeneration() {
     try {
@@ -44,6 +47,7 @@
       live.on('event', (e) => {
         if ((e as { kind?: string }).kind === 'config.published') void readGeneration();
       }),
+      overview.follow(live),
     ];
     void readSession({ fetch, ended }).then((s) => {
       if (s === null) return;
@@ -51,6 +55,7 @@
       stops.push(keepFresh(s, { fetch, ended }, (next) => (session = next)));
       live.start();
       void readGeneration();
+      void overview.load();
     });
     const tick = setInterval(() => {
       now = Date.now();
@@ -74,6 +79,10 @@
     {now}
     onRetry={() => live.retry()}
   >
-    <Later section={router.section} />
+    {#if router.section === 'overview'}
+      <Overview model={overview} {now} stale={live.stale(now)} last={live.last} />
+    {:else}
+      <Later section={router.section} />
+    {/if}
   </Frame>
 {/if}
