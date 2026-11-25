@@ -1,6 +1,6 @@
-//! The console's app in a browser (Admin_Console §10; M15): Playwright's flows (`ui/e2e`) against
-//! a node under each `globals.api.auth` mode, the console switched off, and the first page drawn
-//! within its budget (§8) with 50 pipelines on three nodes. Needs `DATA_AVALANCHE_BROWSER=1`, the
+//! The console's app in a browser (Admin_Console §10; M15, M16a): Playwright's flows (`ui/e2e`)
+//! against a node under each `globals.api.auth` mode, the console switched off, the pipelines'
+//! pages and their actions, and the page budgets (§8) with 50 pipelines on three nodes. Needs `DATA_AVALANCHE_BROWSER=1`, the
 //! app built into the binary (`npm ci && npm run build` in `ui/`, then the binary) and Playwright's
 //! Chromium (`npx playwright install chromium` in `ui/`); without the variable each skips itself.
 
@@ -115,8 +115,8 @@ async fn oauth2_sign_in_in_a_browser() {
     e.cleanup().await;
 }
 
-/// `jwt`: the proxy's token on every request; without one, "No valid token"; one whose roles
-/// map to none, "Forbidden".
+/// `jwt`: the proxy's token on every request, a viewer's showing the pipelines with nothing to act
+/// on; without one, "No valid token"; one whose roles map to none, "Forbidden".
 #[tokio::test]
 async fn jwt_tokens_in_a_browser() {
     require_it!();
@@ -132,6 +132,7 @@ async fn jwt_tokens_in_a_browser() {
     let env = [
         ("DA_VIEWER_TOKEN", viewer.as_str()),
         ("DA_UNMAPPED_TOKEN", unmapped.as_str()),
+        ("DA_PIPELINE", e.test.as_str()),
     ];
     playwright("jwt.spec.ts", p.port(), &env).await;
     assert!(p.terminate().await.success());
@@ -153,9 +154,33 @@ async fn no_authentication_and_the_console_off_in_a_browser() {
     e.cleanup().await;
 }
 
-/// Admin_Console §8: the Overview drawn under 1 s with 50 pipelines on three nodes.
+/// The pipelines' pages under `basic` (mockups 05, 06): the list's filters in the address, kept by
+/// Back; a row opened from the keyboard; a pipeline's tables, source and lag chart; a pause and a
+/// resume through their dialogs, recorded with the note; an action on a selection.
 #[tokio::test]
-async fn the_first_page_is_drawn_within_its_budget() {
+async fn the_pipelines_pages_and_their_actions_in_a_browser() {
+    require_it!();
+    require_browser!();
+    let (e, p) = node(
+        "console_app_pipelines",
+        ", auth: basic, user: ops, password: s3cret",
+        &console(""),
+    )
+    .await;
+    let env = [
+        ("DA_USER", "ops"),
+        ("DA_PASSWORD", "s3cret"),
+        ("DA_PIPELINE", e.test.as_str()),
+    ];
+    playwright("pipelines.spec.ts", p.port(), &env).await;
+    assert!(p.terminate().await.success());
+    e.cleanup().await;
+}
+
+/// Admin_Console §8: the Overview drawn under 1 s, and moving between pages under 300 ms, with 50
+/// pipelines on three nodes.
+#[tokio::test]
+async fn the_pages_are_drawn_within_their_budgets() {
     require_it!();
     require_browser!();
     let more: String = (1..PIPELINES)
@@ -180,18 +205,21 @@ async fn the_first_page_is_drawn_within_its_budget() {
     for i in 1..PIPELINES {
         c.e.drop_source(&format!("_p{i:02}")).await;
     }
-    // Every pipeline runs on a node; whether the ring has balanced them yet doesn't matter here.
     for i in 0..c.nodes.len() {
         c.start(i).await;
     }
+    // Every pipeline runs on its ring owner: a pipeline still being handed over has no tables to
+    // draw until its new worker runs, which would time the hand-off, not the page.
     eventually(
-        "every pipeline runs on a node",
+        "every pipeline runs on its ring owner",
         Duration::from_secs(180),
         async || {
             let (_, v) = c.proc("n1").call("GET", "/v1/cluster/status").await;
-            v["pipelines"]
-                .as_array()
-                .is_some_and(|p| p.len() == PIPELINES && p.iter().all(|l| l["holder"].is_string()))
+            v["pipelines"].as_array().is_some_and(|p| {
+                p.len() == PIPELINES
+                    && p.iter()
+                        .all(|l| l["holder"].is_string() && l["holder"] == l["ring_owner"])
+            })
         },
     )
     .await;
