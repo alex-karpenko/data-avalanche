@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-24
+updated: 2026-11-25
 domain: Auth
 tags: [v1.1, implementation-plan, m14, console, sign-in, sessions, oauth2, pkce, csrf, api]
 ---
@@ -7722,4 +7722,99 @@ git commit -m "test(e2e): console sessions on three nodes, basic and oauth2"
 
 ## Deviations during execution
 
-None yet. Where execution changes the plan, this section says what and why.
+Each task was reviewed after its implementation; where a review found a problem in the plan's
+own code, the task's commit was amended in a fix round. The rulings below are Oleksii's where
+marked, the executor's otherwise.
+
+**Task 1** (`5db8733`):
+- While the console's sessions are on, a `401` for a request without `Authorization` carries
+  `WWW-Authenticate: Session realm="data-avalanche"`, not `Basic`, so a browser shows no
+  password popup; with `Authorization`, `Basic` or `Bearer` as before; with the console off,
+  unchanged (Oleksii).
+- The session cookie is `__Host-da_session` (chunks `.1`–`.3`), not `da_session`; `da_oauth2`
+  and `da_id` keep their names, since they are scoped to a path and `__Host-` needs `Path=/`
+  (Oleksii).
+- A session under `Mode::Refused` (inconsistent settings) is answered `503`, as a header is and
+  as M13f's stream is.
+- New tests: `a_refused_session_or_no_credentials_are_challenged_for_a_session`,
+  `a_session_under_inconsistent_settings_is_answered_unavailable`, and a `viewer` session whose
+  mutating call carries the right anti-forgery token, refused `403` for its role.
+
+**Task 2** (`4aceffa`): as planned.
+
+**Task 3** (`8aa9d8a`, two fix rounds):
+- The attempts table is bounded: it is pruned at most once a second, and in a full table
+  (10 000 addresses) a new address's failure isn't counted, so no one is locked out by
+  another's flood. IPv6 is counted per /64; IPv4, and IPv4-mapped IPv6, per address (Oleksii).
+- One counted verification, `Auth::verify_from(headers, Option<IpAddr>)`, refuses a waiting
+  address, reserves the attempt under one lock, verifies, and resets on a success. `/v1`'s
+  `authorize` and every `/ui/` route that verifies a caller use it, so the API's
+  `Authorization: Basic` is limited too (`429` with `Retry-After`; the OpenAPI document's common
+  responses gain `429`), and no `/ui/` route is a way around the limit (Oleksii: the API's Basic
+  is limited in M14). Forwarded requests are counted (no node trust). A request answered `503`
+  gives back the failure it reserved. Every `429` carries `Retry-After`.
+- `safe_next` refuses a `next` with a `.` or `..` segment, percent-encoded ones too.
+- The `/ui/` `401` pages carry `Session realm="data-avalanche"` (`Bearer` under `jwt`); the
+  console-off `404` carries the hardening headers too.
+- New tests: the escaping of the form's values; the hardening headers on a `303`, `401` and
+  `429`; the table's cap, pruning, full table and per-/64 counting.
+- Spec: the limit is a line in System-Overview's `basic` bullet (`b2a050d`, approved by
+  Oleksii).
+
+**Task 4** (`ada30f0`, one fix round):
+- Merged by hand onto Tasks 1 and 3's amended code (`verify_from`, the cookie helper, the
+  `Session` and `Bearer` challenges, the guard's CSP).
+- A refresh refuses a session past `session_ttl`, or under another key or mode, before calling
+  the provider: `401` with the `Session` challenge and the session's cookies removed (§6.8:
+  from sign-in, however it is used).
+- `Unavailable` is `503` on the refresh (JSON, like `GET /ui/session`) and on the callback (the
+  sign-in page with an "unavailable" reason).
+- The callback checks `state` before it shows a provider's `error`; an unparseable
+  authorization endpoint is a `503` page; a too-long session after a refresh is `500`; a
+  page's failed cookies after a refresh show the "ended" page with the reason.
+- Discovery is cached by (discovery URL, issuer). The refresh is single-flight per refresh
+  token (an in-flight map keyed by its digest), not one lock per node, so a provider that hangs
+  holds up only its own sessions; the outcome is kept 30 s as planned.
+- New tests: the issuer mismatch, `client_secret_post`, the refused ended-session refresh, the
+  `503`s.
+
+**Task 5** (`3fbcef7`, one fix round): the site and the research docs follow Tasks 1–4's
+rulings. The console page is titled "Web console sign-in" and gains "Behind a proxy": the
+console and `/v1` at the root of one host, the header size, a shared address's attempts.
+Signing out removes the session's cookies and, with an end-session endpoint, signs out at the
+provider.
+
+**V-129** (`ae4247a` spec, `022355c` code, approved by Oleksii): `globals.console.public_url`
+is an origin with no path (a trailing `/` aside), since the console's routes, redirects and
+cookie paths are absolute `/ui/…`. Found by Task 5's review.
+
+**Task 6** (`3fe1225`, one fix round): the E2E's provider checks what a real one does: the
+code (single use), `S256(code_verifier)` against the challenge, and the `redirect_uri`, so the
+scenario proves the binary sends them. `Proc::exchange_ok` joins the harness.
+
+**The whole-branch review** and its fixes (`514cca9` spec, `73705d5`…`f9eb2f5`):
+- Every stream re-checks its caller's credentials, one opened with
+  `x-data-avalanche-forwarded-by` too: a client could send that header and keep a stream past its
+  session (`73705d5`).
+- A provider outage during a refresh (a transport error, a timeout, a `5xx`, `408` or `429`, a
+  failed discovery) answers `503` with `Retry-After: 5` and keeps the session's cookies; a
+  provider's refusal (any other `4xx`) ends the session (`401`) as before. An outage, and a failed
+  discovery, are remembered 5 s; a success or a refusal 30 s (Oleksii).
+- The refresh's in-flight map no longer leaks an entry when two refreshes of one token race to
+  finish (Oleksii).
+- The sign-in cookie is `__Host-da_oauth2` with `Path=/`, so a sibling subdomain can't plant one
+  (Oleksii; `da_id` keeps its name).
+- A node that hasn't run discovery runs it before building a page's CSP, so `form-action` names
+  the provider's end-session origin.
+- With no `Sec-Fetch-Site`, the cross-site check also accepts an `Origin` equal to `public_url`'s
+  origin (a proxy that rewrites `Host`).
+- OAuth2 sign-in, discovery and refresh failures are logged, never a token.
+- The OpenAPI document's common `403` names the missing `X-CSRF-Token`.
+- V-129 refuses user information in `public_url` (`514cca9` spec, approved by Oleksii;
+  `d6a3a55` code).
+- The E2E asserts `da_id`'s removal at sign-out.
+
+**At the exit** (`f9eb2f5`, the last code commit): `cargo test --workspace` 1849 passed, both
+clippy runs and `cargo fmt --all --check` clean, `cargo xtask docs --check` held; the whole E2E
+suite passed on PostgreSQL 18 (59 tests, 842 s); Task 6's scenario passed on `mysql-84` (28 s),
+`mysql-84-nogtid` (31 s) and `mariadb-118` (32 s); the site built (32 pages, link check clean).
