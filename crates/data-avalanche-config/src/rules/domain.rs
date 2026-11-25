@@ -690,6 +690,14 @@ fn http_url(text: &str) -> bool {
     })
 }
 
+/// Whether an http(s) URL names a user (`user@`, `user:password@`) in its authority.
+fn has_userinfo(text: &str) -> bool {
+    let rest = text.split_once("://").map_or(text, |(_, r)| r);
+    rest.split(['/', '?', '#'])
+        .next()
+        .is_some_and(|authority| authority.contains('@'))
+}
+
 /// Whether an http(s) URL has anything after its authority but a single `/`.
 fn has_path(text: &str) -> bool {
     let rest = text.split_once("://").map_or(text, |(_, r)| r);
@@ -717,13 +725,16 @@ fn console(c: &RawConsole, at: &At, ctx: &mut Ctx) {
     // V-129
     if let Some(l) = &c.public_url
         && let Some(url) = ctx.text(l, &at.key("public_url"))
-        && (!http_url(url.trim()) || url.contains(['?', '#']) || has_path(url.trim()))
+        && (!http_url(url.trim())
+            || url.contains(['?', '#'])
+            || has_userinfo(url.trim())
+            || has_path(url.trim()))
     {
         ctx.error(
             "V-129",
             &at.key("public_url"),
             l.loc(),
-            "public_url must be an absolute http or https URL with no path, query or fragment: the console is served at the root of its host",
+            "public_url must be an absolute http or https URL with no user information (user@), path, query or fragment: the console is served at the root of its host",
         );
     }
     // V-132

@@ -331,7 +331,7 @@ pub const FIELD_DOCS: &[FieldDoc] = &[
     f(
         "globals.console.public_url",
         Required,
-        "The console's origin as people reach it (`https://cdc.example.com`), for the OAuth2 redirect URI (`<public_url>/ui/…`): the console is served at the root of its host, under no path prefix. Absolute `http(s)` URL, no path (a trailing `/` aside), query or fragment (V-129). Required with the console on under `oauth2` (V-136).",
+        "The console's origin as people reach it (`https://cdc.example.com`), for the OAuth2 redirect URI (`<public_url>/ui/…`): the console is served at the root of its host, under no path prefix. Absolute `http(s)` URL, no user information (`user@`), path (a trailing `/` aside), query or fragment (V-129). Required with the console on under `oauth2` (V-136).",
     ),
     f(
         "globals.console.session_ttl",

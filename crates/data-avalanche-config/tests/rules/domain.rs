@@ -334,6 +334,26 @@ pub fn cases() -> Vec<Case> {
                 )
             },
         ),
+        case("V-129", Error, "a public_url with a user", || {
+            pg_delta().set("/globals/console/public_url", json!("https://u@h/"))
+        }),
+        case(
+            "V-129",
+            Error,
+            "a public_url with a user and a password",
+            || pg_delta().set("/globals/console/public_url", json!("https://u:p@h")),
+        ),
+        case(
+            "V-129",
+            Error,
+            "a public_url under a path, its scheme upper-case",
+            || {
+                pg_delta().set(
+                    "/globals/console/public_url",
+                    json!("HTTPS://cdc.example.com/console"),
+                )
+            },
+        ),
         case("V-129", Silent, "a public_url with a port", || {
             pg_delta().set(
                 "/globals/console/public_url",
