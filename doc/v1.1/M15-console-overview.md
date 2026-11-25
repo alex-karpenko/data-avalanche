@@ -6055,4 +6055,59 @@ git commit -m "build: the console shipped — the image builds the app, CI runs 
 
 ## Deviations during execution
 
-None yet. Where execution changes the plan, this section says what and why.
+Each task was reviewed after its implementation; where a review found a problem in the plan's
+own code, a fix commit followed the task's commit. The rulings are the executor's: D-M15.5,
+D-M15.7 and D-M15.8 bind, and the plan's code broke them.
+
+**Task 1** (`1d8fdbf`): as planned. Two slips in the plan's text: its Interfaces list
+`clock(at, seconds = false)`, but `seconds` comes with Task 3; and Step 2's "28 others pass" is
+the whole xtask suite's count, while the command runs `deps::` (17).
+
+**Task 2** (`da9a482`): as planned.
+
+**Task 3** (`75c1acc`, fix `e0ae702`): the live stream's recovery.
+- The forced reopen counts the current source's silence (`#sourceAt`), not the page's last
+  message: a stream reopened after offline was closed again at the next tick, before its
+  `hello` on a slow link.
+- A session check that throws (the network down) counts as `'later'` and reopens; the stream
+  was stuck offline until "Retry now".
+- An attempt counter drops a check that a retry or a stop overtook, and `#open` closes any
+  source still open: "Retry now" during a pending check opened a second stream.
+- Three tests in `live.test.ts`.
+
+**Task 4** (`868eced`, fix `3eb3b89`): the Overview's rules.
+- Lease losses are one line per pipeline (the newest, "· N in the last hour"): two failovers of
+  one pipeline gave two lines with one key, which Svelte refuses. A lease event without a
+  pipeline gives none.
+- A pause, stop or resume reads the pipelines again, so `desired_state` follows: the "paused by
+  a person" line never came after a pause, and stayed after a resume, while the page was open.
+
+**Task 5** (`4129c53`): as planned.
+
+**Task 6** (`ee872b2`): as planned.
+
+**The whole-branch review** (fix `f900c2a`, one commit):
+- `GET /v1/config/nodes` sends `restart_pending: null` (with `error`) for a node that doesn't
+  answer: the page typed it as a list and the Overview threw exactly when a node was down. Typed
+  nullable and guarded, tested in the server's shape.
+- A snapshot job is named by the 8 characters after `~` in its id (`<pipeline>~<uuid>`), not the
+  id's first 8; the fixtures' ids are real-shaped.
+- Node links go to `/ui/cluster/nodes/<node>` (mockup 04), not `/ui/nodes/<node>`.
+- A peer followed again reads the events, the pipelines, the cluster and the lease losses (the
+  stream sends no events from the gap, §8.1); a node no longer a member is dropped from the
+  unreachable ones (the stream sends no message for it).
+- Only accepted actions count as a pipeline's newest pause, stop or resume; a refused one
+  doesn't.
+- A pipeline that left the config is pruned from the page's figures, lag, actions and leases.
+- A `403` from the session ends the page (the server's 403 page says why), not a retry.
+- The first session read failing with anything but a `401` or `403` says so on the page and
+  tries again in 5 s, rather than leaving it blank.
+- The refresh retries a `5xx` or a network failure (a proxy's `502` during a rolling restart)
+  and an unreadable answer, and ends the page only on `401` or `403`; a stopped refresh arms no
+  timer.
+- A `leases` part reads the last hour's `lease.lost` and `lease.takeover`
+  (`/v1/events?kind=…&since=…`), joined by the stream's; the rule reads it, not the newest 100
+  events. `Admin_Console.md` §4.1's table says so.
+- `NOTES.txt` trims a trailing `/` from `public_url`.
+- Left, as the review advised: the actions read stopping at the server's scan limit, `build.rs`
+  watching `ui/` while there is no build, and the minor test and wording items.
