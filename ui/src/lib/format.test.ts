@@ -27,8 +27,9 @@ describe('the console writes', () => {
     expect(bytes(1536)).toBe('1.5 kB');
   });
 
-  it('the time of day, hours and minutes', () => {
+  it('the time of day, to the minute or the second', () => {
     const at = new Date(2026, 10, 25, 9, 5, 30).getTime();
     expect(clock(at)).toBe('09:05');
+    expect(clock(at, true)).toBe('09:05:30');
   });
 });

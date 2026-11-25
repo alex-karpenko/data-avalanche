@@ -32,8 +32,10 @@ export function bytes(n: number): string {
   return `${v < 10 ? v.toFixed(1).replace(/\.0$/, '') : Math.round(v)} ${UNITS[unit]}`;
 }
 
-/** The local time of day of `at` (ms): `09:05`. */
-export function clock(at: number): string {
+/** The local time of day of `at` (ms): `09:05`, or `09:05:30` with `seconds`. */
+export function clock(at: number, seconds = false): string {
   const d = new Date(at);
-  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  const two = (n: number) => String(n).padStart(2, '0');
+  const hm = `${two(d.getHours())}:${two(d.getMinutes())}`;
+  return seconds ? `${hm}:${two(d.getSeconds())}` : hm;
 }
