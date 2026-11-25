@@ -2,3 +2,7 @@ target/
 prototypes/*/target/
 test-infra/.tls/
 test-infra/.k3s/
+ui/node_modules/
+ui/dist/
+ui/test-results/
+ui/playwright-report/
