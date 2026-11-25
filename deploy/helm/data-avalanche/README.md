@@ -43,6 +43,16 @@ The kubelet updates a mounted ConfigMap after a delay (up to about a minute), so
 `POST /v1/config/reload`, or call `POST /v1/config/validate` first, which reports what a reload
 would change.
 
+### The web console
+
+The console is in the config (`globals.console`), so the chart has no switch of its own: with
+`enabled: true` every pod serves it under `/ui/` on the API's port, through the chart's Service,
+and the install's notes give its address. Its session key (and an OAuth2 client secret) reach the
+config through `env` from a Secret; the key must be the same on every pod. The chart has no
+Ingress: put the Service behind yours, and set `public_url` to the address people's browsers use
+(required with `auth: oauth2`, where the provider sends them back to it).
+`ci/console-values.yaml` is a complete example, with sign-in through an OpenID provider.
+
 ## Values
 
 | Key | Default | |

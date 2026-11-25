@@ -12,6 +12,7 @@
 - { kind: crate, name: arrow-row, held: "59", reason: "deltalake-core 1.1.4 requires arrow ^59; one arrow major workspace-wide, D-MS.14" }
 - { kind: crate, name: arrow-schema, held: "59", reason: "deltalake-core 1.1.4 requires arrow ^59; one arrow major workspace-wide, D-MS.14" }
 - { kind: crate, name: arrow-select, held: "59", reason: "deltalake-core 1.1.4 requires arrow ^59; one arrow major workspace-wide, D-MS.14" }
+- { kind: npm, name: typescript, held: "6", reason: "svelte-check 4.7.8, the newest, takes typescript ^5 or ^6" }
 - { kind: crate, name: mysql_common, held: "0.37", reason: "mysql_async 0.37.1, the newest, requires mysql_common ^0.37" }
 - { kind: image, name: postgres, held: "*", reason: "the source support matrix, not a build dependency; widening it is a feature" }
 - { kind: image, name: mysql, held: "*", reason: "the source support matrix, not a build dependency; widening it is a feature" }

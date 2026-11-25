@@ -87,6 +87,17 @@ DATA_AVALANCHE_IT=1 DATA_AVALANCHE_SKIP_GCS=1 DATA_AVALANCHE_E2E_SOURCE=mysql DA
   cargo test -p data-avalanche --features e2e-hooks --test e2e -- --test-threads=1
 ```
 
+The console's flows in a browser (`console_app.rs`, 1.1.0 M15) run the app's Playwright specs
+(`ui/e2e/`) against the suite's nodes, when `DATA_AVALANCHE_BROWSER` is set and the binary carries
+the app. The first-page budget runs 50 pipelines on PostgreSQL, so the PostgreSQL services allow
+64 slots and WAL senders and 300 connections:
+
+```sh
+(cd ui && npm ci && npm run build && npx playwright install chromium)
+DATA_AVALANCHE_UI=required DATA_AVALANCHE_IT=1 DATA_AVALANCHE_SKIP_GCS=1 DATA_AVALANCHE_BROWSER=1 \
+  cargo test -p data-avalanche --features e2e-hooks --test e2e -- --test-threads=1 console_app::
+```
+
 On MySQL each test makes a database and a user named `e2e_<test>` (the user's binlog dump shows
 the stream is open). Two scenarios change server-wide state: the purge scenarios purge the
 target's older binlogs, and the failover scenario (on `mysql-84-nogtid`) makes its database and

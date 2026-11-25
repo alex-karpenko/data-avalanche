@@ -97,6 +97,24 @@ One list, ordered red → orange → yellow, each line linking to where it's fix
 | yellow | nodes on different config generations; restart-only changes waiting; a pending removal (tombstone); a pipeline paused or stopped by a person for longer than a while |
 
 The thresholds are config-free defaults (the builder picks them, and the page states each one).
+As built in M15 (`ui/src/overview/attention.ts`), computed in the page from the `/v1` reads and the
+live stream (Oleksii, 2026-11-25):
+
+| Rule | Threshold |
+|---|---|
+| lag target | 60 s (the lag tile and the pipelines' lines show it too) |
+| lag rising | higher now than 5 min ago |
+| a slot's WAL | over 50% of `max_slot_wal_keep_size`, or over 16 GiB when the server sets none |
+| a lease with no holder | none (or a holder that stopped renewing) for over 30 s: a rebalance hands leases over within that |
+| lease renewal failures | a `lease.lost` or `lease.takeover` event in the last hour (the hour's lease events, read on their own) |
+| a snapshot job failed | in the last 24 h |
+| paused or stopped by a person | over 1 h ago (the newest accepted `action.pipeline.*` event names a person) |
+| sink commit failures | the worker reports itself degraded |
+| a node down | SWIM marks it suspect; a node the console's stream can't follow is orange |
+
+A pending removal (tombstone) isn't in M15's list: the API doesn't expose `removals/`, so the
+rule waits on that (DA-API-21). **Later release:** the thresholds become configurable (Oleksii,
+2026-11-25; DA-OPS-15); until then they are the defaults above.
 
 ### 4.2 Charts
 

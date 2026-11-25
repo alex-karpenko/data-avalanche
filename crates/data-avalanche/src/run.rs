@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use data_avalanche_api::{
-    Api, Auth, Control, Node, Peers, RateLimit, ServeError, Stop, bind, publish, router,
+    Api, App, Auth, Control, Node, Peers, RateLimit, ServeError, Stop, bind, publish, router,
 };
 use data_avalanche_cluster::{
     ClusterReconciler, ConfigCoordinator, ControllerDeps, ControllerSettings, CoordinatorDeps,
@@ -161,6 +161,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
             ready: Arc::clone(&ready),
             node: Arc::clone(&node),
             auth: Arc::clone(&auth),
+            app: App::built(),
         }),
         async {
             let _ = http_stopped.await;

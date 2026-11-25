@@ -59,6 +59,7 @@ pub(crate) fn routes(api: &Api) -> Router<Api> {
         .route("/ui/oauth2/start", get(oauth2::start))
         .route("/ui/oauth2/callback", get(oauth2::callback))
         .route("/ui/assets/{file}", get(asset))
+        .route("/ui/app/{*file}", get(app_file))
         .layer(from_fn_with_state(api.clone(), guard))
 }
 
@@ -226,11 +227,11 @@ pub(crate) fn frame(api: &Api, sign_in: &SignIn) -> Frame {
     }
 }
 
-/// A page under `/ui/` (the app's, from M15): the landing page for a caller who verifies, the
-/// sign-in for one who brought nothing, else why not. An `oauth2` session whose token is about
-/// to expire is refreshed first, its new cookies set with the page; once the token expired, a
-/// provider that refuses the refresh ends the session (401), one that can't be reached answers
-/// "try again" (503, `Retry-After`), the session kept.
+/// A page under `/ui/`: the app's page for a caller who verifies, the sign-in for one who brought
+/// nothing, else why not. An `oauth2` session whose token is about to expire is refreshed first,
+/// its new cookies set with the page; once the token expired, a provider that refuses the refresh
+/// ends the session (401), one that can't be reached answers "try again" (503, `Retry-After`),
+/// the session kept.
 async fn page(
     State(api): State<Api>,
     info: Option<Extension<ConnectInfo<crate::server::Client>>>,
@@ -274,15 +275,20 @@ async fn page(
         Err(wait) => return too_many(pages::waiting(&frame, &here, retry_secs(wait)), wait),
     };
     let r = match verified {
-        Ok(Verified { principal, session }) => html(
-            StatusCode::OK,
-            pages::signed_in(
-                &frame,
-                &principal.name,
-                &principal.role.to_string(),
-                session.is_some(),
+        Ok(Verified { principal, session }) => match api.app.index() {
+            Some(page) => {
+                ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], page).into_response()
+            }
+            None => html(
+                StatusCode::OK,
+                pages::not_built(
+                    &frame,
+                    &principal.name,
+                    &principal.role.to_string(),
+                    session.is_some(),
+                ),
             ),
-        ),
+        },
         // The provider is down, not the session over: try again in a moment.
         Err(Denied::Unauthenticated { .. })
             if let Some(oauth2::Failed::Unreachable(e)) = &not_refreshed =>
@@ -601,6 +607,22 @@ async fn asset(Path(file): Path<String>) -> Response {
         .into_response()
 }
 
+/// `GET /ui/app/{file}`: a file the app loads, to anyone (code, no data), kept by the browser for
+/// good: a new build names its files anew.
+async fn app_file(State(api): State<Api>, Path(file): Path<String>) -> Response {
+    match api.app.file(&file) {
+        Some((body, kind)) => (
+            [
+                (header::CONTENT_TYPE, kind),
+                (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+            ],
+            body,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 /// The failed basic sign-ins of each address (an IPv6 client by its /64): [`SIGN_IN_ATTEMPTS`]
 /// in a row, and it waits [`SIGN_IN_WAIT`]; a sign-in that succeeds starts the count again. Kept
 /// by each node for itself, in memory, for at most [`ADDRESSES_KEPT`] addresses: past that,
@@ -721,12 +743,12 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
-    use crate::Auth;
     use crate::session::SESSION_COOKIE;
     use crate::test_support::{
         Issuer, api, basic_api, basic_session, config, console, request, serve, session_cookie,
         sessions,
     };
+    use crate::{App, AppFile, Auth};
 
     const HOUR: Duration = Duration::from_secs(3600);
 
@@ -772,6 +794,7 @@ mod tests {
             "/ui/sign-in",
             "/ui/session",
             "/ui/assets/console.css",
+            "/ui/app/index-x.js",
         ] {
             let (code, _, body) = request(addr, "GET", path, &[], "").await;
             assert_eq!(code, 404, "{path}");
@@ -1432,5 +1455,105 @@ mod tests {
         for other in ["/ui/assets/other.js", "/ui/assets/..%2Fsrc%2Flib.rs"] {
             assert_eq!(request(addr, "GET", other, &[], "").await.0, 404, "{other}");
         }
+    }
+
+    /// The built app of the tests below: its page, and a file it loads.
+    static APP: &[AppFile] = &[
+        AppFile {
+            path: "app/index-x.js",
+            body: b"export {};",
+        },
+        AppFile {
+            path: "index.html",
+            body: b"<!doctype html><title>the app</title>",
+        },
+    ];
+
+    /// [`node`], with [`APP`] built in.
+    async fn node_with_app(api_config: &data_avalanche_config::Api, c: &Console) -> SocketAddr {
+        let mut a = api(Arc::new(Auth::new(api_config, c)));
+        a.app = App::of(APP);
+        serve(a).await
+    }
+
+    /// Admin_Console §10: every page under `/ui/` is the app's page for a caller who verifies;
+    /// the server's own pages still answer the others.
+    #[tokio::test]
+    async fn a_signed_in_caller_gets_the_app_at_every_page() {
+        let addr = node_with_app(&basic_api("s3cret"), &sessions(8 * HOUR)).await;
+        let (code, head, _) = request(addr, "GET", "/ui/pipelines/orders", &[], "").await;
+        assert_eq!(
+            (code, header_of(&head, "location")),
+            (303, vec!["/ui/sign-in?next=%2Fui%2Fpipelines%2Forders"])
+        );
+        let form = "user=ops&password=s3cret";
+        let (_, head, _) = request(addr, "POST", "/ui/sign-in", &[], form).await;
+        let cookie = kept(&head);
+        for path in ["/ui/", "/ui/pipelines/orders?tab=tables"] {
+            let with = [("Cookie", cookie.as_str())];
+            let (code, head, page) = request(addr, "GET", path, &with, "").await;
+            assert_eq!(
+                (code, page.as_str()),
+                (200, "<!doctype html><title>the app</title>"),
+                "{path}"
+            );
+            assert_eq!(
+                header_of(&head, "content-type"),
+                ["text/html; charset=utf-8"]
+            );
+            assert_eq!(header_of(&head, "cache-control"), ["no-store"]);
+            assert_eq!(header_of(&head, "x-frame-options"), ["DENY"]);
+        }
+        // A session that no longer opens: the server's page says why, not the app.
+        let ended = format!("{SESSION_COOKIE}=x");
+        let (code, _, page) = request(addr, "GET", "/ui/", &[("Cookie", &ended)], "").await;
+        assert_eq!(code, 401);
+        assert!(!page.contains("the app"), "{page}");
+    }
+
+    /// Admin_Console §10: the files the app loads answer anyone (code, no data) and stay in the
+    /// browser's cache, since a new build names them anew; a name not built is 404.
+    #[tokio::test]
+    async fn the_app_s_files_are_served_to_anyone_and_kept() {
+        let addr = node_with_app(&basic_api("s3cret"), &sessions(8 * HOUR)).await;
+        let (code, head, body) = request(addr, "GET", "/ui/app/index-x.js", &[], "").await;
+        assert_eq!((code, body.as_str()), (200, "export {};"));
+        assert_eq!(
+            header_of(&head, "content-type"),
+            ["text/javascript; charset=utf-8"]
+        );
+        assert_eq!(
+            header_of(&head, "cache-control"),
+            ["public, max-age=31536000, immutable"]
+        );
+        assert_eq!(header_of(&head, "x-content-type-options"), ["nosniff"]);
+        for path in [
+            "/ui/app/index-y.js",
+            "/ui/app/index.html",
+            "/ui/app/../index.html",
+        ] {
+            assert_eq!(request(addr, "GET", path, &[], "").await.0, 404, "{path}");
+        }
+    }
+
+    /// Admin_Console §10: a binary built without the app (Rust-only work needs no Node) tells a
+    /// signed-in caller so, and how to build it.
+    #[tokio::test]
+    async fn without_the_app_a_signed_in_caller_is_told_it_isn_t_built() {
+        let addr = node(&basic_api("s3cret"), &sessions(8 * HOUR)).await;
+        let form = "user=ops&password=s3cret";
+        let (_, head, _) = request(addr, "POST", "/ui/sign-in", &[], form).await;
+        let cookie = kept(&head);
+        let (code, _, page) = request(addr, "GET", "/ui/", &[("Cookie", &cookie)], "").await;
+        assert_eq!(code, 200);
+        assert!(
+            page.contains("isn't built into this binary")
+                && page.contains("<code>npm ci &amp;&amp; npm run build</code>"),
+            "{page}"
+        );
+        assert_eq!(
+            request(addr, "GET", "/ui/app/index-x.js", &[], "").await.0,
+            404
+        );
     }
 }

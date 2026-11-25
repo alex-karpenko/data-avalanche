@@ -29,6 +29,9 @@ To build it from a checkout instead:
 docker build -f deploy/docker/Dockerfile -t data-avalanche:dev .
 ```
 
+The image's build makes the [web console](/data-avalanche/deployment/console/) in a Node.js stage first,
+and the binary's build refuses to go on without it.
+
 ## The command line
 
 ```text

@@ -8,6 +8,7 @@
 
 mod api;
 mod cluster;
+mod console_app;
 mod console_history;
 mod console_nodes;
 mod console_pipelines;

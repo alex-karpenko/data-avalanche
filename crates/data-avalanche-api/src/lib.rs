@@ -11,6 +11,7 @@
 //! ([`CSRF_HEADER`]) when it changes something: without it, 403, before its role is looked at.
 
 mod actions;
+mod app;
 mod auth;
 mod cluster;
 mod config;
@@ -59,6 +60,7 @@ use serde_json::{Value, json};
 use tokio::sync::watch;
 
 pub use actions::{DENIALS_BURST, MAX_ERROR, MAX_NOTE, MAX_TARGET, Recorded, note_of};
+pub use app::{App, AppFile};
 pub use auth::{
     Auth, CSRF_HEADER, FETCH_TIMEOUT, KEYS_MAX_AGE, MAX_KEY_DOCUMENT, Principal, REFETCH_AFTER,
 };
@@ -98,6 +100,8 @@ pub struct Api {
     /// Set once the node runs its config generation; the `/v1` routes answer 503 before.
     pub node: Arc<OnceLock<Node>>,
     pub auth: Arc<Auth>,
+    /// The console's app, served under `/ui/`: [`App::built`] in a node.
+    pub app: App,
 }
 
 /// What the `/v1` routes act on, once the node runs its config generation.

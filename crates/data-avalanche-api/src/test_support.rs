@@ -155,6 +155,7 @@ pub(crate) fn api(auth: Arc<Auth>) -> Api {
         ready: Arc::new(AtomicBool::new(true)),
         node: Arc::default(),
         auth,
+        app: crate::App::of(&[]),
     }
 }
 

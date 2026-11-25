@@ -17,6 +17,13 @@
 #   globals:
 #     api:
 #       advertise_url: https://${DATA_AVALANCHE_POD_DNS_NAME}:8443
+# and, with the web console on (served under /ui/ on the API's Service; ci/console-values.yaml),
+# its session key the same on every pod, from a Secret through env:
+#   globals:
+#     console:
+#       enabled: true
+#       session_key: ${CONSOLE_SESSION_KEY}
+#       public_url: https://cdc.example.com    # with auth oauth2: where browsers reach it
 # A changed config reaches a running cluster through the API's reload, not a pod restart: a
 # starting node adopts the cluster's latest config generation, not its file.
 config: {}

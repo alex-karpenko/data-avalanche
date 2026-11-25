@@ -90,8 +90,20 @@ fn block(values: &str, key: &str) -> String {
     text
 }
 
+/// 48 random bytes, as the console's session key: made for the test.
+fn session_key() -> String {
+    use base64::Engine;
+    use std::io::Read;
+    let mut b = [0u8; 48];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut b))
+        .expect("the system's random source");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+}
+
 /// What the chart puts in every pod's environment, and the secrets the examples' configs name:
-/// a password, and the API's certificate and key as PEM text, made for the test.
+/// a password, the API's certificate and key as PEM text, and the console's session key and
+/// client secret, made for the test.
 fn pod_env() -> BTreeMap<String, String> {
     let tls = rcgen::generate_simple_self_signed(vec!["data-avalanche".into()]).unwrap();
     [
@@ -109,6 +121,8 @@ fn pod_env() -> BTreeMap<String, String> {
         ("ORDERS_DB_PASSWORD", "secret".to_owned()),
         ("API_TLS_CERT", tls.cert.pem()),
         ("API_TLS_KEY", tls.signing_key.serialize_pem()),
+        ("CONSOLE_SESSION_KEY", session_key()),
+        ("CONSOLE_CLIENT_SECRET", session_key()),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_owned(), v))
@@ -117,7 +131,11 @@ fn pod_env() -> BTreeMap<String, String> {
 
 #[test]
 fn the_examples_configs_validate_with_the_pod_s_environment() {
-    for example in ["ci/example-values.yaml", "ci/tls-values.yaml"] {
+    for example in [
+        "ci/example-values.yaml",
+        "ci/tls-values.yaml",
+        "ci/console-values.yaml",
+    ] {
         let config = block(&chart(example), "config");
         let report = validate_str(&config, &pod_env());
         assert!(report.is_ok(), "{example}: {:#?}\n{config}", report.errors);

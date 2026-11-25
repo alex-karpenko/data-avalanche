@@ -226,6 +226,7 @@ mod tests {
             ready: Arc::new(AtomicBool::new(true)),
             node,
             auth: crate::test_support::open(),
+            app: crate::App::of(&[]),
         })
         .await;
         let check = |text: String| async move {
@@ -382,6 +383,7 @@ mod tests {
             ready: Arc::new(AtomicBool::new(true)),
             node,
             auth: crate::test_support::open(),
+            app: crate::App::of(&[]),
         })
         .await;
 

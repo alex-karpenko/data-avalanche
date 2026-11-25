@@ -17,12 +17,20 @@ use crate::idp::{Provider, query_value};
 use crate::nodes::{Cluster, ITEMS};
 
 /// A session key made at run time: 48 random bytes.
-fn session_key() -> String {
+pub(crate) fn session_key() -> String {
     let mut b = [0u8; 48];
     std::fs::File::open("/dev/urandom")
         .and_then(|mut f| f.read_exact(&mut b))
         .expect("the system's random source");
     URL_SAFE_NO_PAD.encode(b)
+}
+
+/// Whether the binary under test carries the console's app: its build embeds `ui/dist` when
+/// that holds a build (`crates/data-avalanche-api/build.rs`).
+fn app_built() -> bool {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../ui/dist/index.html")
+        .exists()
 }
 
 /// `n1`, `n2` and `n3` running the test's pipeline, its rows landed, with `globals.api` entries
@@ -81,12 +89,12 @@ async fn every_node_takes(c: &Cluster, cookie: &str, name: &str, role: &str) {
         let p = c.proc(n);
         let (code, _, page) = p.exchange_ok("GET", "/ui/", &with, "").await;
         assert_eq!(code, 200, "{n}: {page}");
-        assert!(
-            page.contains(&format!(
-                "You are <b>{name}</b>, signed in as <b>{role}</b>."
-            )),
-            "{n}: {page}"
-        );
+        let signed_in = if app_built() {
+            r#"<div id="app">"#.to_owned()
+        } else {
+            format!("You are <b>{name}</b>, signed in as <b>{role}</b>.")
+        };
+        assert!(page.contains(&signed_in), "{n}: {page}");
         let (code, _, text) = p.exchange_ok("GET", "/ui/session", &with, "").await;
         assert_eq!(code, 200, "{n}: {text}");
         let v: Value = serde_json::from_str(&text).unwrap();

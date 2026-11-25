@@ -602,27 +602,32 @@ fn duckdb(root: &Path, items: &mut Vec<Item>) -> Result<(), String> {
     Ok(())
 }
 
+/// The site's packages (`docs/`) and the console's (`ui/`), each with its Node version.
 fn npm(root: &Path, items: &mut Vec<Item>) -> Result<(), String> {
-    let text = read(root, "docs/package.json")?;
-    let json: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| format!("docs/package.json: {e}"))?;
-    for (name, version) in json["dependencies"].as_object().into_iter().flatten() {
+    for (dir, section) in [("docs", "dependencies"), ("ui", "devDependencies")] {
+        let file = format!("{dir}/package.json");
+        let text = read(root, &file)?;
+        let json: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| format!("{file}: {e}"))?;
+        for (name, version) in json[section].as_object().into_iter().flatten() {
+            items.push(Item {
+                kind: Kind::Npm,
+                name: name.clone(),
+                current: version.as_str().unwrap_or_default().to_string(),
+                pinned_in: file.clone(),
+            });
+        }
+        let nvmrc = format!("{dir}/.nvmrc");
         items.push(Item {
-            kind: Kind::Npm,
-            name: name.clone(),
-            current: version.as_str().unwrap_or_default().to_string(),
-            pinned_in: "docs/package.json".into(),
+            kind: Kind::Node,
+            name: "node".into(),
+            current: read(root, &nvmrc)?
+                .trim()
+                .trim_start_matches('v')
+                .to_string(),
+            pinned_in: nvmrc,
         });
     }
-    items.push(Item {
-        kind: Kind::Node,
-        name: "node".into(),
-        current: read(root, "docs/.nvmrc")?
-            .trim()
-            .trim_start_matches('v')
-            .to_string(),
-        pinned_in: "docs/.nvmrc".into(),
-    });
     Ok(())
 }
 
@@ -1071,6 +1076,7 @@ mod tests {
         assert!(has(Kind::Tool, "helm"));
         assert!(has(Kind::Tool, "duckdb"));
         assert!(has(Kind::Npm, "astro"));
+        assert!(has(Kind::Npm, "svelte"));
         assert!(has(Kind::Node, "node"));
         assert!(
             items

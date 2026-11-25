@@ -1,0 +1,81 @@
+/* The console's colours, light and dark as the system says (Admin_Console §10). A state is
+   never told by colour alone: each carries its label. */
+:root {
+  --bg: #f5f5f7;
+  --bg-panel: #ffffff;
+  --bg-bar: #e9e9ec;
+  --border: #d1d1d6;
+  --text: #1d1d1f;
+  --text-2: #6e6e73;
+  --accent: #0066cc;
+  --green: #1f8f3a;
+  --orange: #b86e00;
+  --yellow: #a68b00;
+  --red: #d0302a;
+  --grey: #8e8e93;
+  --green-bg: rgba(52, 199, 89, 0.16);
+  --orange-bg: rgba(255, 159, 10, 0.18);
+  --yellow-bg: rgba(230, 194, 0, 0.18);
+  --red-bg: rgba(255, 59, 48, 0.14);
+  --grey-bg: rgba(142, 142, 147, 0.18);
+  color-scheme: light dark;
+  font: 13px/1.45 system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1d1d1f;
+    --bg-panel: #2a2a2c;
+    --bg-bar: #333336;
+    --border: #48484a;
+    --text: #f5f5f7;
+    --text-2: #a1a1a6;
+    --accent: #4da3ff;
+    --green: #4cd964;
+    --orange: #ffb340;
+    --yellow: #ffd60a;
+    --red: #ff6961;
+    --grey: #98989d;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+}
+
+a {
+  color: var(--accent);
+}
+
+h2 {
+  font-size: 18px;
+  margin: 0 0 12px;
+}
+
+button {
+  font: inherit;
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-panel);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.muted {
+  color: var(--text-2);
+}
+
+/* The session couldn't be read: the page says why while it tries again. */
+.unread {
+  margin: 16px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: var(--orange-bg);
+}
