@@ -38,7 +38,8 @@ export interface Deps {
   open: (url: string) => SourceLike;
   /**
    * Once the stream closed, whether its credentials still hold: go on (`ok`), the page was left
-   * to the server (`ended`), or ask again later.
+   * to the server (`ended`), or the check could not tell (`later`, and a failed check too): the
+   * stream opens again now.
    */
   check: () => Promise<'ok' | 'ended' | 'later'>;
 }
@@ -57,6 +58,10 @@ export class Live {
   #resync = new Set<() => void>();
   #hellos = 0;
   #opened = 0;
+  /** When the current source was opened (ms since the epoch). */
+  #sourceAt = 0;
+  /** Bumped whenever a pending reopen is no longer wanted; a check that returns later does nothing. */
+  #attempt = 0;
   #reopens = 0;
   #timer: ReturnType<typeof setTimeout> | undefined;
   #stopped = false;
@@ -87,6 +92,7 @@ export class Live {
 
   stop(): void {
     this.#stopped = true;
+    this.#attempt++;
     clearTimeout(this.#timer);
     this.#source?.close();
     this.#source = null;
@@ -95,7 +101,7 @@ export class Live {
   /** Opens the stream again now ("Retry now"). */
   retry(): void {
     clearTimeout(this.#timer);
-    this.#source?.close();
+    this.#attempt++;
     this.#reopens = 0;
     this.#open();
   }
@@ -115,14 +121,20 @@ export class Live {
       this.state = 'reconnecting';
     } else {
       this.state = 'offline';
-      if (this.#source !== null && this.#timer === undefined) this.#closed();
+      // Silent since the last message or since the source opened, whichever is later.
+      const silent = now - Math.max(this.last ?? 0, this.#sourceAt);
+      if (this.#source !== null && this.#timer === undefined && silent >= OFFLINE_AFTER_MS) {
+        this.#closed();
+      }
     }
   }
 
   #open(): void {
     this.#timer = undefined;
     if (this.#stopped) return;
+    this.#source?.close();
     this.#opened ||= Date.now();
+    this.#sourceAt = Date.now();
     const source = this.#deps.open(this.#url);
     this.#source = source;
     for (const kind of KINDS) {
@@ -162,11 +174,15 @@ export class Live {
     this.#source?.close();
     this.#source = null;
     const wait = REOPEN_MS[Math.min(this.#reopens++, REOPEN_MS.length - 1)];
+    const attempt = ++this.#attempt;
     this.#timer = setTimeout(() => {
-      void this.#deps.check().then((verdict) => {
-        if (verdict === 'ended' || this.#stopped) return;
-        this.#open();
-      });
+      void this.#deps
+        .check()
+        .catch(() => 'later' as const)
+        .then((verdict) => {
+          if (attempt !== this.#attempt || verdict === 'ended' || this.#stopped) return;
+          this.#open();
+        });
     }, wait);
   }
 }
