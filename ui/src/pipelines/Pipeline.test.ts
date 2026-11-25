@@ -52,20 +52,23 @@ function client(): Client & { sent: unknown[][] } {
 
 const session = (role: Role): Session => ({ name: 'Oleksii', role, auth: 'basic', expires: null, signed_in: null, csrf: 't' });
 
-async function render(over: { role?: Role; offline?: boolean; missing?: boolean; api?: Client } = {}) {
+async function render(
+  over: { role?: Role; offline?: boolean; missing?: boolean; stale?: boolean; read?: Partial<PipelinePage['read']>; api?: Client } = {},
+) {
   const api = over.api ?? client();
   const page = new PipelinePage(api, 'orders-pg', liveFigures(), () => NOW);
   page.detail = detail();
   page.jobs = jobs();
   page.events = events();
   page.missing = over.missing ?? false;
+  Object.assign(page.read, over.read ?? {});
   const model = new Model(api);
   model.facts = facts();
   const target = document.createElement('div');
   document.body.replaceChildren(target);
   mounted = mount(Pipeline, {
     target,
-    props: { page, model, session: session(over.role ?? 'operator'), api, now: NOW, stale: false, last: NOW, offline: over.offline ?? false },
+    props: { page, model, session: session(over.role ?? 'operator'), api, now: NOW, stale: over.stale ?? false, last: NOW, offline: over.offline ?? false },
   });
   await vi.dynamicImportSettled();
   await tick();
@@ -181,5 +184,28 @@ describe("a pipeline's page", () => {
   it('says when the generation has no such pipeline', async () => {
     const t = await render({ missing: true });
     expect(t.querySelector('[role="alert"]')?.textContent).toBe('There is no pipeline orders-pg in the generation this node runs.');
+  });
+
+  it('says how old a part that failed to read is: its last read, which the page keeps', async () => {
+    const t = await render({ read: { jobs: { at: NOW - 20 * 60_000, error: 'HTTP 503' } } });
+    expect(t.querySelector('.notice.failing')?.textContent).toContain('jobs (HTTP 503), last read 20 min ago');
+  });
+
+  it('says a part that failed and was never read is never read', async () => {
+    const t = await render({ read: { events: { at: null, error: 'HTTP 503' } } });
+    expect(t.querySelector('.notice.failing')?.textContent).toContain('events (HTTP 503), never read');
+  });
+
+  it('dims every panel while the stream is stale, the snapshot and the activity too', async () => {
+    const t = await render({ stale: true });
+    const panel = (title: string) => [...t.querySelectorAll('section')].find((s) => s.querySelector('h3')?.textContent?.startsWith(title));
+    for (const title of ['Tables', 'Source', 'Snapshot', 'Activity']) {
+      expect(panel(title)?.classList.contains('stale'), title).toBe(true);
+    }
+  });
+
+  it("shows how old the source's read is, under its lines", async () => {
+    const t = await render();
+    expect(t.querySelector('aside')?.textContent).toContain('read 4 s ago');
   });
 });

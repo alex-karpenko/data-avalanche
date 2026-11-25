@@ -9,6 +9,7 @@
   import Dialog from '../lib/Dialog.svelte';
   import { ago, clock, duration } from '../lib/format';
   import type { Session } from '../lib/session';
+  import { at } from '../model/facts';
   import type { Model } from '../model/model.svelte';
   import { LAG_TARGET_S } from '../overview/attention';
   import { activity, header, marks, snapshotPanel, sourceLines, tableLines } from './detail';
@@ -41,9 +42,13 @@
   const can = $derived(mayAct(session.role) && desired !== null);
   const offered = $derived(desired === null ? [] : VERBS.filter((v) => ACTIONS[v].takes(desired)));
   const failing = $derived(
-    PAGE_PARTS.filter((p) => page.read[p].error !== null).map((p) => `${p} (${page.read[p].error})`),
+    PAGE_PARTS.filter((p) => page.read[p].error !== null).map((p) => {
+      const r = page.read[p];
+      return `${p} (${r.error}), ${r.at === null ? 'never read' : `last read ${ago(r.at, now)}`}`;
+    }),
   );
   const asOf = $derived(last ?? 0);
+  const readAt = $derived(at(page.figures?.source?.read_at));
 
   let hovered = $state<string | null>(null);
   let acting = $state<Verb | null>(null);
@@ -177,8 +182,9 @@
             {#each source as s (s.label)}<dt>{s.label}</dt><dd class={s.tone}>{s.value}</dd>{/each}
           </dl>
         {/if}
+        {#if readAt !== null}<p class="muted">read {ago(readAt, now)}</p>{/if}
       </section>
-      <section class="panel">
+      <section class="panel" class:stale>
         <h3>Snapshot</h3>
         {#if snap.current !== null}
           <p><a href={snap.current.href}>{snap.current.job}</a> {snap.current.what}</p>
@@ -198,7 +204,7 @@
     </aside>
   </div>
 
-  <section class="panel">
+  <section class="panel" class:stale>
     <h3>Activity on this pipeline</h3>
     <ul class="activity">
       {#each lines as e (e.key)}

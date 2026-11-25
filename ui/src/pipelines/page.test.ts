@@ -93,4 +93,13 @@ describe("a pipeline's page data", () => {
     await vi.advanceTimersByTimeAsync(REREAD_AFTER_MS);
     expect(a.asked).toEqual(['/v1/pipelines/orders-pg']);
   });
+
+  it("records each part's read at the class's own clock, and a part that never read stays unread", async () => {
+    const p = new PipelinePage(api(READS), 'orders-pg', null, () => NOW);
+    await p.load();
+    expect(p.read.detail.at).toBe(NOW);
+    const failing = new PipelinePage(api({ ...READS, '/v1/pipelines/orders-pg/snapshots': new HttpError(503, 'down') }), 'orders-pg', null, () => NOW);
+    await failing.load();
+    expect(failing.read.jobs).toEqual({ at: null, error: 'down' });
+  });
 });

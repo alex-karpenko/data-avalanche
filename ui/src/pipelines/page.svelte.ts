@@ -40,6 +40,7 @@ export class PipelinePage {
   #path: string;
   #pending = new Set<PagePart>();
   #timer: ReturnType<typeof setTimeout> | undefined;
+  #now: () => number;
 
   /** `seed`: the figures the stream sent already, shown before the page's own read. */
   constructor(api: Client, id: string, seed: Figures | null = null, now: () => number = Date.now) {
@@ -47,6 +48,7 @@ export class PipelinePage {
     this.id = id;
     this.#path = `/v1/pipelines/${encodeURIComponent(id)}`;
     this.figures = seed;
+    this.#now = now;
     this.lag = new LagHistory(api, id, now);
   }
 
@@ -132,7 +134,7 @@ export class PipelinePage {
           ).events;
           break;
       }
-      this.read[part] = { at: Date.now(), error: null };
+      this.read[part] = { at: this.#now(), error: null };
     } catch (e) {
       if (part === 'detail' && e instanceof HttpError && e.status === 404) this.missing = true;
       this.read[part] = { at: this.read[part].at, error: e instanceof Error ? e.message : String(e) };
