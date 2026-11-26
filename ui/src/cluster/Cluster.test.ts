@@ -53,6 +53,9 @@ describe('the Cluster page', () => {
     expect(rows(t, 'away')).toEqual([['orders-pg', 'n2', 'n1', '—', 'away for over an hour: no hand-off since', 'once n1 has been in the ring 15 s, 1 hand-off at a time']]);
     expect(rows(t, 'leases').map((r) => r[0])).toEqual(['orders-pg', 'billing-mysql', 'customers', 'inventory']);
     expect(t.querySelector('section.removals')).toBeNull();
+    const lease = (id: string) => [...t.querySelectorAll('section.leases tbody tr')].find((r) => text(r.querySelector('td')) === id);
+    expect(lease('orders-pg')?.classList.contains('orange')).toBe(true);
+    expect(lease('billing-mysql')?.classList.contains('orange')).toBe(false);
   });
 
   it('shows no away panel while every pipeline is on its owner', async () => {

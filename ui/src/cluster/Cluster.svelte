@@ -115,7 +115,7 @@
     </thead>
     <tbody>
       {#each leases as l (l.id)}
-        <tr>
+        <tr class={l.state.tone}>
           <td><a href={l.href}>{l.id}</a></td>
           <td>{l.holder ?? '—'}</td>
           <td>{l.owner ?? '—'}</td>
