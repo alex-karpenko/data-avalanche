@@ -5434,4 +5434,10 @@ git commit -m "test(e2e): the Cluster pages and a node's actions in a browser on
 
 ## Deviations during execution
 
-None yet.
+- **Task 3, `ui/src/cluster/{Cluster.svelte,Cluster.test.ts}` (fix commit after the task's own).**
+  The task review found the leases' rows untoned: only their State cell was coloured, where
+  Admin_Console §4 and mockup 03 ask for "orange lease rows" (the members' and the away panel's
+  rows were toned already). Each lease row now takes its state's tone (`class={l.state.tone}`:
+  orange away from its owner, red with no holder or not renewing), on the page's existing
+  `tr.<tone>` rules; the page test checks the away row is orange and a held one isn't. No later
+  task touches these files.
