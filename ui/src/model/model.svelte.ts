@@ -15,6 +15,7 @@ import type {
   Job,
   NodeFigures,
   PipelineItem,
+  PrometheusStatus,
   Removal,
   Series,
   Tables,
@@ -168,8 +169,9 @@ export class Model {
     this.facts.figures[m.id] = m;
   }
 
-  /** A pipeline's chart sample: its lag joins the line, which keeps the last hour. */
+  /** A chart sample: when it was taken; a pipeline's lag joins its line, which keeps the last hour. */
   samples(m: SamplesMsg): void {
+    this.facts.lastSample = Math.max(this.facts.lastSample ?? 0, m.at * 1000);
     const lag = m.series?.lag_seconds;
     if (m.scope !== 'pipeline' || m.pipeline === undefined || lag === undefined) return;
     const points = [...(this.facts.lag[m.pipeline] ?? []), [m.at, lag] as [number, number]];
@@ -273,7 +275,10 @@ export class Model {
           f.removals = (await this.#api.get<{ removals: Removal[] }>('/v1/cluster/removals')).removals;
           break;
         case 'lag': {
-          const { series } = await this.#api.get<{ series: Series[] }>('/v1/history?series=lag_seconds');
+          const { series, prometheus } = await this.#api.get<{ series: Series[]; prometheus?: PrometheusStatus }>(
+            '/v1/history?series=lag_seconds',
+          );
+          f.prometheus = prometheus ?? null;
           f.lag = Object.fromEntries(
             series.filter((s) => s.pipeline !== undefined).map((s) => [s.pipeline!, s.points]),
           );

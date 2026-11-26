@@ -9,6 +9,7 @@ import type {
   Job,
   NodeFigures,
   PipelineItem,
+  PrometheusStatus,
   Removal,
   SinkAt,
   SourceAt,
@@ -40,6 +41,10 @@ export interface Facts {
   removals: Removal[];
   /** Each member's own figures, as the stream last sent them. */
   nodes: Record<string, NodeFigures>;
+  /** How the node's Prometheus last answered; `null` when none is configured (or not read). */
+  prometheus: PrometheusStatus | null;
+  /** When the stream's newest chart sample was taken (ms); `null` before the first. */
+  lastSample: number | null;
 }
 
 export function empty(): Facts {
@@ -58,6 +63,8 @@ export function empty(): Facts {
     unheld: {},
     removals: [],
     nodes: {},
+    prometheus: null,
+    lastSample: null,
   };
 }
 

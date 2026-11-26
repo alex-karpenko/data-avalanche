@@ -211,5 +211,7 @@ export function facts(): Facts {
     unheld: {},
     removals: [],
     nodes: Object.fromEntries(['n1', 'n2', 'n3'].map((n) => [n, nodeFigures(n)])),
+    prometheus: null,
+    lastSample: null,
   };
 }

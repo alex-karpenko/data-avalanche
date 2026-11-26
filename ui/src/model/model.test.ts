@@ -207,6 +207,27 @@ describe("the console's model", () => {
     expect(a.asked).toEqual(expect.arrayContaining(['/v1/config/nodes', '/v1/cluster/removals']));
   });
 
+  it("keeps how Prometheus last answered the node, from the lag lines' read, and when the last sample came", async () => {
+    const o = new Model(
+      api({
+        ...READS,
+        '/v1/history?series=lag_seconds': {
+          series: [],
+          prometheus: { state: 'failing', at: iso(NOW - 60_000), error: 'connection refused' },
+        },
+      }),
+    );
+    await o.load(['lag']);
+    expect(o.facts.prometheus).toEqual({ state: 'failing', at: iso(NOW - 60_000), error: 'connection refused' });
+    const plain = new Model(api(READS));
+    await plain.load(['lag']);
+    expect(plain.facts.prometheus).toBeNull();
+    expect(plain.facts.lastSample).toBeNull();
+    plain.samples({ scope: 'node', at: NOW / 1000 - 6, series: { memory_bytes: 1 } });
+    plain.samples({ scope: 'pipeline', pipeline: 'orders-pg', at: NOW / 1000 - 20, series: { lag_seconds: 3 } });
+    expect(plain.facts.lastSample).toBe(NOW - 6_000);
+  });
+
   it('names its parts as people read them, for the notices that say which failed', () => {
     expect(PART_NAMES).toEqual({
       pipelines: 'the pipelines',

@@ -8,6 +8,7 @@
   import { client } from './lib/api';
   import { Live } from './lib/live.svelte';
   import { Router } from './lib/router.svelte';
+  import { consoleStatus } from './lib/status';
   import { awaitSession, checkSession, keepFresh, RETRY_MS, type Session } from './lib/session';
   import { Model } from './model/model.svelte';
   import Node from './nodes/Node.svelte';
@@ -127,6 +128,8 @@
     last={live.last}
     {now}
     onRetry={() => live.retry()}
+    status={consoleStatus({ state: live.state, via: live.via, last: live.last, facts: model.facts, read: model.read }, now)}
+    onStatus={() => void model.load(['lag', 'events'])}
   >
     {#if router.section === 'overview'}
       <Overview {model} {now} stale={live.stale(now)} last={live.last} />

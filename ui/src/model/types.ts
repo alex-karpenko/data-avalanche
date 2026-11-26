@@ -293,3 +293,11 @@ export interface NodeDetail {
   /** The pipelines whose lease it holds; `null` when the leases couldn't be read. */
   pipelines: { id: string; owner_epoch: number; ring_owner: string | null }[] | null;
 }
+
+/** How the node's Prometheus last answered a chart's read (`GET /v1/history`); absent when no
+ * Prometheus is configured. */
+export interface PrometheusStatus {
+  state: 'unasked' | 'ok' | 'failing';
+  at?: string;
+  error?: string | null;
+}
