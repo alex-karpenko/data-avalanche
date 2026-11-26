@@ -1,6 +1,7 @@
 import { flushSync, mount, tick, unmount } from 'svelte';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Client } from '../lib/api';
+import type { Role, Session } from '../lib/session';
 import { facts, NOW } from '../model/fixtures';
 import { Model } from '../model/model.svelte';
 import { LagHistory } from '../pipelines/lag.svelte';
@@ -37,14 +38,18 @@ afterEach(() => {
   mounted = undefined;
 });
 
+const sent: unknown[][] = [];
 const api: Client = {
   get: async <T,>() => ({}) as T,
-  send: async () => {
-    throw new Error('nothing is changed');
-  },
+  send: async <T,>(method: string, path: string, body?: unknown) => (sent.push([method, path, body]), {} as T),
 };
 
-async function render(over: { missing?: boolean; stale?: boolean; read?: Partial<NodePage['read']> } = {}): Promise<HTMLElement> {
+const session = (role: Role): Session => ({ name: 'Oleksii', role, auth: 'basic', expires: null, signed_in: null, csrf: 't' });
+
+async function render(
+  over: { missing?: boolean; stale?: boolean; read?: Partial<NodePage['read']>; role?: Role; offline?: boolean; via?: string } = {},
+): Promise<HTMLElement> {
+  sent.length = 0;
   const page = new NodePage(api, 'n2', () => NOW);
   page.detail = nodeDetail();
   page.series = nodeSeries();
@@ -56,7 +61,21 @@ async function render(over: { missing?: boolean; stale?: boolean; read?: Partial
   const lag = new LagHistory(api);
   const target = document.createElement('div');
   document.body.replaceChildren(target);
-  mounted = mount(Node, { target, props: { page, model, lag, now: NOW, stale: over.stale ?? false, last: NOW - 34_000 } });
+  mounted = mount(Node, {
+    target,
+    props: {
+      page,
+      model,
+      lag,
+      session: session(over.role ?? 'admin'),
+      api,
+      via: over.via ?? 'n1',
+      now: NOW,
+      stale: over.stale ?? false,
+      last: NOW - 34_000,
+      offline: over.offline ?? false,
+    },
+  });
   await vi.dynamicImportSettled();
   await tick();
   flushSync();
@@ -64,6 +83,14 @@ async function render(over: { missing?: boolean; stale?: boolean; read?: Partial
 }
 
 const text = (e: Element | null | undefined) => e?.textContent?.replace(/\s+/g, ' ').trim();
+const settle = async () => {
+  for (let i = 0; i < 5; i++) await tick();
+  flushSync();
+};
+const paragraphs = (t: HTMLElement) => [...t.querySelectorAll('[role="dialog"] p')].map((p) => text(p));
+function button(t: HTMLElement, label: string): HTMLButtonElement {
+  return [...t.querySelectorAll<HTMLButtonElement>('button')].find((b) => text(b) === label)!;
+}
 
 describe("a node's page", () => {
   it("shows mockup 04's page: its header, its pipelines, its charts, its activity and its gossip", async () => {
@@ -96,5 +123,52 @@ describe("a node's page", () => {
     const t = await render({ stale: true });
     expect(text(t.querySelector('.notice'))).toMatch(/^Not current: as of \d\d:\d\d:\d\d · 34 s old$/);
     expect([...t.querySelectorAll('section')].every((s) => s.classList.contains('stale'))).toBe(true);
+  });
+
+  it('offers an admin Leave and Shut down, and a viewer or operator neither', async () => {
+    const buttons = (t: HTMLElement) => [...t.querySelectorAll('.actions button')].map((b) => text(b));
+    expect(buttons(await render())).toEqual(['Leave…', 'Shut down…']);
+    expect(text((await render()).querySelector('.actions + p'))).toContain('There is no in-place restart');
+    expect(buttons(await render({ role: 'operator' }))).toEqual([]);
+    expect(buttons(await render({ role: 'viewer' }))).toEqual([]);
+  });
+
+  it('leaves through its dialog: what it hands off, the note, and the line it is recorded as', async () => {
+    const t = await render();
+    button(t, 'Leave…').click();
+    flushSync();
+    const dialog = () => t.querySelector('[role="dialog"]');
+    expect(text(dialog()?.querySelector('h3'))).toBe('n2 leaves the cluster?');
+    expect(text(dialog())).toContain('Its pipelines: orders-pg.');
+    expect(paragraphs(t)).toContain('Recorded as: n2 left the cluster, asked by Oleksii (admin)');
+    const note = dialog()!.querySelector<HTMLTextAreaElement>('textarea')!;
+    note.value = 'node pool upgrade';
+    note.dispatchEvent(new Event('input'));
+    button(t, 'Leave').click();
+    await settle();
+    expect(sent).toEqual([['POST', '/v1/nodes/n2/leave', { note: 'node pool upgrade' }]]);
+    expect(dialog()).toBeNull();
+  });
+
+  it('shuts down only once its name is typed', async () => {
+    const t = await render();
+    button(t, 'Shut down…').click();
+    flushSync();
+    const confirm = button(t, 'Shut down n2');
+    expect(confirm.disabled).toBe(true);
+    expect(paragraphs(t)).toContain('Type n2 to confirm.');
+    const typed = t.querySelector<HTMLInputElement>('[role="dialog"] input.typed')!;
+    typed.value = 'n2';
+    typed.dispatchEvent(new Event('input'));
+    flushSync();
+    expect(confirm.disabled).toBe(false);
+    confirm.click();
+    await settle();
+    expect(sent).toEqual([['POST', '/v1/nodes/n2/shutdown', undefined]]);
+  });
+
+  it('waits while offline: its actions are disabled', async () => {
+    const t = await render({ offline: true });
+    expect([...t.querySelectorAll<HTMLButtonElement>('.actions button')].map((b) => b.disabled)).toEqual([true, true]);
   });
 });

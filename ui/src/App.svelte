@@ -134,7 +134,18 @@
       <Cluster {model} {renewals} {now} stale={live.stale(now)} last={live.last} />
     {:else if nodePage !== null && nodePage.name === nodeName}
       {#key nodePage}
-        <Node page={nodePage} {model} {lag} {now} stale={live.stale(now)} last={live.last} />
+        <Node
+          page={nodePage}
+          {model}
+          {lag}
+          {session}
+          {api}
+          via={live.via}
+          {now}
+          stale={live.stale(now)}
+          last={live.last}
+          offline={live.state === 'offline'}
+        />
       {/key}
     {:else if page !== null && page.id === pageId}
       <!-- Each pipeline's page starts clean: nothing chosen or open carries over from the last. -->

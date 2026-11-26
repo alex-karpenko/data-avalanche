@@ -1,14 +1,19 @@
 <script lang="ts">
   // A node's page (Admin_Console §4, mockup 04): its header, the pipelines it holds, its lease
-  // renewals, memory and CPU over 6 hours, what it recorded, and what its gossip sees.
+  // renewals, memory and CPU over 6 hours, what it recorded, and what its gossip sees; an admin's
+  // leave and shutdown (mockup 11).
   import { onMount } from 'svelte';
+  import type { Client } from '../lib/api';
   import Chart from '../lib/Chart.svelte';
+  import Dialog from '../lib/Dialog.svelte';
   import { failingNotice, failures, staleNotice, type PartRead } from '../lib/notices';
+  import type { Session } from '../lib/session';
   import type { Model } from '../model/model.svelte';
   import { LAG_TARGET_S } from '../overview/attention';
   import Sparkline from '../overview/Sparkline.svelte';
   import { activity } from '../pipelines/detail';
   import type { LagHistory } from '../pipelines/lag.svelte';
+  import { askNode, mayAdmin, NODE_ACTIONS, NODE_VERBS, nodeTarget, recordedOn, typedOk, type NodeVerb } from './actions';
   import { NODE_PART_NAMES, NODE_PARTS, SPAN_S, type NodePage } from './page.svelte';
   import { cpuNote, gossipLines, memoryNote, nodeHeader, nodePipelines, renewalNote } from './view';
 
@@ -17,12 +22,18 @@
     model: Model;
     /** Every pipeline's lag over 6 hours. */
     lag: LagHistory;
+    session: Session;
+    api: Client;
+    /** The node the console's live updates come through. */
+    via: string | null;
     now: number;
     /** The live updates stopped: every number is as of `last`. */
     stale: boolean;
     last: number | null;
+    /** Offline: actions wait. */
+    offline: boolean;
   }
-  let { page, model, lag, now, stale, last }: Props = $props();
+  let { page, model, lag, session, api, via, now, stale, last, offline }: Props = $props();
 
   const name = $derived(page.name);
   const head = $derived(nodeHeader(name, model.facts, page.detail, now));
@@ -35,6 +46,33 @@
     failingNotice(failures(NODE_PARTS.map((p): [string, PartRead] => [NODE_PART_NAMES[p], page.read[p]]), now)),
   );
   const series = (s: string) => page.series[s] ?? [];
+
+  /** A member still in the ring: a leaving one is leaving already. */
+  const active = $derived(model.facts.cluster?.members.find((m) => m.node === name)?.phase === 'active');
+  let acting = $state<NodeVerb | null>(null);
+  let typed = $state('');
+  const blocked = $derived(
+    offline
+      ? 'Offline: actions wait until the console is live again.'
+      : acting !== null && NODE_ACTIONS[acting].typed && !typedOk(typed, name)
+        ? `Type ${name} to confirm.`
+        : null,
+  );
+
+  function open(v: NodeVerb) {
+    typed = '';
+    acting = v;
+  }
+
+  async function act(v: NodeVerb, note: string): Promise<string | null> {
+    try {
+      // What follows comes on the stream: the recorded action, and the member's new phase.
+      await askNode(api, v, name, note);
+      return null;
+    } catch (e) {
+      return e instanceof Error ? e.message : String(e);
+    }
+  }
 
   onMount(() => void lag.ensure());
 </script>
@@ -49,6 +87,20 @@
     {#if head !== null}<span class="chip {head.state.tone}">{head.state.label}</span>{/if}
   </h2>
   {#if head !== null}<p class="where muted">{head.line}</p>{/if}
+  {#if mayAdmin(session.role) && head !== null}
+    <div class="actions">
+      {#each NODE_VERBS as v (v)}
+        <button type="button" class="destructive" disabled={offline || !active} onclick={() => open(v)}>
+          {NODE_ACTIONS[v].label}…
+        </button>
+      {/each}
+    </div>
+    <p class="muted">
+      Leave hands its pipelines to the others and stays up, out of the ring. Shut down leaves, then
+      exits; a supervisor such as Kubernetes starts it again. There is no in-place restart. Admin
+      only.
+    </p>
+  {/if}
   {#if stale}
     <p class="notice" role="status">{staleNotice(last, now)}</p>
   {/if}
@@ -143,11 +195,37 @@
       {/if}
     </section>
   </div>
+
+  {#if acting !== null}
+    {@const v = acting}
+    {@const target = nodeTarget(name, model.facts, via)}
+    <Dialog
+      title={NODE_ACTIONS[v].title(name)}
+      lines={NODE_ACTIONS[v].lines(target)}
+      recorded={recordedOn(v, name, session)}
+      confirm={NODE_ACTIONS[v].confirm(name)}
+      destructive={NODE_ACTIONS[v].destructive}
+      {blocked}
+      onConfirm={(note) => act(v, note)}
+      onClose={() => (acting = null)}
+    >
+      {#if NODE_ACTIONS[v].typed}
+        <label>Type {name} to confirm <input class="typed" bind:value={typed} autocomplete="off" spellcheck="false" /></label>
+      {/if}
+    </Dialog>
+  {/if}
 {/if}
 
 <style>
   .where {
     margin-top: -6px;
+  }
+  .actions {
+    display: flex;
+    gap: 8px;
+  }
+  .destructive {
+    color: var(--red);
   }
   .notice {
     padding: 6px 10px;
