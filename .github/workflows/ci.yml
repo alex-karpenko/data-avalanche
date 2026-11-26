@@ -118,6 +118,8 @@ jobs:
         run: |
           sudo sysctl -w net.ipv4.ip_local_reserved_ports=53311-53386,54318,55414-55423,56443,56686,58080,59000
       - uses: actions/checkout@v7
+      - name: Keep the test ports out of the ephemeral range
+        run: test-infra/reserve-ports.sh
       - uses: actions-rust-lang/setup-rust-toolchain@v2
       - name: GCS credentials
         env:
@@ -207,6 +209,8 @@ jobs:
       - name: Free runner disk
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - uses: actions/checkout@v7
+      - name: Keep the test ports out of the ephemeral range
+        run: test-infra/reserve-ports.sh
       - uses: actions-rust-lang/setup-rust-toolchain@v2
       # uv runs the type scenario's DuckDB read.
       - uses: astral-sh/setup-uv@v10.3.3
@@ -245,6 +249,8 @@ jobs:
       - name: Free runner disk
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - uses: actions/checkout@v7
+      - name: Keep the test ports out of the ephemeral range
+        run: test-infra/reserve-ports.sh
       - uses: actions-rust-lang/setup-rust-toolchain@v2
       - name: GCS credentials
         env:
@@ -298,6 +304,8 @@ jobs:
       - name: Free runner disk
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - uses: actions/checkout@v7
+      - name: Keep the test ports out of the ephemeral range
+        run: test-infra/reserve-ports.sh
       - uses: actions-rust-lang/setup-rust-toolchain@v2
       - uses: azure/setup-helm@v5
         with:

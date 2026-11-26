@@ -26,6 +26,12 @@ on `PATH`; it fetches DuckDB itself.
 Bucket / container `data-avalanche-test` is created by the `init` profile (`up.sh` runs it). Azurite keeps
 port 10000 because `object_store`'s emulator mode always targets `127.0.0.1:10000`.
 
+Every host port but Azurite's lies inside Linux's ephemeral range (32768–60999), where an outbound
+connection (an image pull, a crate download) can take one before its container binds it. CI jobs
+run `test-infra/reserve-ports.sh` after checkout: it reserves every port `compose.yaml` publishes
+(`net.ipv4.ip_local_reserved_ports`, with `sudo`), so the kernel never gives them out as ephemeral
+ports, and names any already taken. On a Linux machine of your own, run it once after a restart.
+
 `mysql-tls` writes its throwaway CA and client pair to `test-infra/.tls/mysql/` at each start; its
 server certificate names `localhost` only, so a `verify-full` connection to `127.0.0.1` fails by
 design.
