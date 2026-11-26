@@ -5477,4 +5477,6 @@ git commit -m "test(e2e): the Cluster pages and a node's actions in a browser on
   `Admin_Console.md` §4.4 now gives. After the wave: 1 854 workspace tests, 212 UI tests, the
   console's seven browser flows (the first page in 250 ms, the moves 19, 12, 16, 14, 11 and
   28 ms).
+- **The whole E2E suite** at the wave (`c8a1955`), on PostgreSQL 18 with the browser flows: 66
+  passed (938 s); the first page drawn in 334 ms, the moves 15, 11, 40, 10, 9 and 16 ms.
 
