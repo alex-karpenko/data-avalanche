@@ -77,7 +77,7 @@ describe('the Overview', () => {
     expect(text(page.querySelector('.stale-note'))).toMatch(/^Not current: as of \d\d:\d\d:\d\d · 34 s old$/);
     expect(page.querySelector('.tiles')?.classList.contains('stale')).toBe(true);
     expect(text(page.querySelector('.failing'))).toBe(
-      "Couldn't be read, shown as last read: jobs (the request timed out)",
+      "Couldn't be read; showing what was last read: the snapshot jobs (the request timed out), last read 1 min ago",
     );
   });
 

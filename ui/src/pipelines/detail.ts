@@ -2,6 +2,7 @@
 // header, the tables, the source, the snapshot, the chart's events and the activity.
 
 import { ago, bytes, clock, duration } from '../lib/format';
+import type { PartRead } from '../lib/notices';
 import { compact, formatValue, type Mark } from '../lib/series';
 import { at, route } from '../model/facts';
 import type { ClusterStatus, EventItem, Figures, JobDetail, PipelineDetail, PipelineItem } from '../model/types';
@@ -30,12 +31,17 @@ export interface Header {
   where: string;
 }
 
+/**
+ * `clusterRead`: the cluster's last read; once it fails, the lease's end is only what the last
+ * good read saw, so nothing is counted down.
+ */
 export function header(
   d: PipelineDetail | null,
   item: PipelineItem | undefined,
   fig: Figures | null,
   lease: ClusterStatus['pipelines'][number] | undefined,
   now: number,
+  clusterRead: PartRead = { at: null, error: null },
 ): Header | null {
   const p = d ?? item;
   if (p === undefined) return null;
@@ -56,7 +62,7 @@ export function header(
   }
   const epoch = fig?.owner_epoch ?? d?.holder?.owner_epoch ?? lease?.owner_epoch;
   if (node !== null && epoch !== undefined && epoch !== null) {
-    const ends = at(lease?.expires_at);
+    const ends = clusterRead.error === null ? at(lease?.expires_at) : null;
     const left = ends === null ? '' : ends > now ? `, expires in ${duration((ends - now) / 1000)}` : `, expired ${duration((now - ends) / 1000)} ago`;
     parts.push(`lease epoch ${epoch}${left}`);
   }

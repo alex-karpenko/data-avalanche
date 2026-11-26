@@ -56,6 +56,17 @@ describe('the live stream', () => {
     expect(live.last).toBe(NOW);
   });
 
+  it('names the node it comes through, from each hello, and none before the first', () => {
+    const live = new Live({ open, check: vi.fn() });
+    live.start();
+    expect(live.via).toBeNull();
+    sources[0].send('hello', { node: 'n1', follows: ['n2'] });
+    expect(live.via).toBe('n1');
+    // The browser reconnected by itself, to another node behind the address.
+    sources[0].send('hello', { node: 'n3' });
+    expect(live.via).toBe('n3');
+  });
+
   it('turns stale, then offline, as the messages stop, and reopens a silent stream', async () => {
     const live = new Live({ open, check: vi.fn().mockResolvedValue('ok') });
     live.start();

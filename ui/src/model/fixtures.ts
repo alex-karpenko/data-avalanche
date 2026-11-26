@@ -1,7 +1,7 @@
 // The tests' cluster: mockup 01's, in the API's shapes.
 
 import type { Facts } from './facts';
-import type { Actual, ClusterStatus, Desired, EventItem, Figures, PipelineItem, SourceAt, TableItem } from './types';
+import type { Actual, ClusterStatus, Desired, EventItem, Figures, NodeFigures, PipelineItem, SourceAt, TableItem } from './types';
 
 export const NOW = Date.UTC(2026, 10, 25, 14, 2, 0);
 const MIN = 60_000;
@@ -57,6 +57,24 @@ function lease(id: string, holder: string, owner_epoch: number, ring_owner: stri
   return { id, holder, holder_stale: false, owner_epoch, expires_at: iso(NOW + 8_000), ring_owner };
 }
 
+/** A node's live figures: alive peers, a recent probe, 1.3 GiB of a 2 GiB limit, and `pipelines`. */
+export function nodeFigures(node: string, over: Partial<NodeFigures> = {}): NodeFigures {
+  return {
+    node,
+    at: iso(NOW - 2_000),
+    phase: 'active',
+    process: { memory_bytes: 1.3 * GIB, memory_limit_bytes: 2 * GIB, cpu_seconds: 5400, cpu_cores: 0.6, cpu_limit_cores: 2 },
+    gossip: {
+      peers: ['n1', 'n2', 'n3'].filter((n) => n !== node).map((n) => ({ node: n, state: 'alive' as const, phase: 'active' })),
+      last_probe: { node: node === 'n1' ? 'n2' : 'n1', at: iso(NOW - 400) },
+      probe_rtt_ms: 1.2,
+      suspicions: { raised: [], received: 0, raised_more: 0, received_more: 0 },
+    },
+    pipelines: [],
+    ...over,
+  };
+}
+
 /** A table with nothing to say but what `over` says: streaming, no figures yet. */
 export function table(pipeline: string, name: string, over: Partial<TableItem> = {}): TableItem {
   return {
@@ -104,7 +122,15 @@ export function facts(): Facts {
     ],
     cluster: {
       node: 'n1',
-      members: ['n1', 'n2', 'n3'].map((node) => ({ node, phase: 'active', suspect: false, config_generation: 42 })),
+      members: ['n1', 'n2', 'n3'].map((node, i) => ({
+        node,
+        addr: `10.0.1.1${i + 1}:7946`,
+        phase: 'active',
+        suspect: false,
+        config_generation: 42,
+        build: '1.1.0',
+        api_url: `https://10.0.1.1${i + 1}:8080`,
+      })),
       pipelines: [
         // Held by n2 away from its ring owner, since a failover.
         lease('orders-pg', 'n2', 2, 'n1'),
@@ -112,6 +138,16 @@ export function facts(): Facts {
         lease('inventory', 'n3', 1, 'n3'),
         lease('customers', 'n1', 1, 'n1'),
       ],
+      settings: {
+        tokens: 128,
+        lock_backend: 'storage',
+        lease_seconds: 15,
+        rebalance_stabilization_seconds: 15,
+        max_concurrent_handoffs: 1,
+        drain_timeout_seconds: 60,
+        history_retention_seconds: 86_400,
+        events_retention_seconds: 2_592_000,
+      },
     },
     config: {
       generation: 42,
@@ -171,5 +207,7 @@ export function facts(): Facts {
     leaseLosses: [],
     unreachable: {},
     unheld: {},
+    removals: [],
+    nodes: Object.fromEntries(['n1', 'n2', 'n3'].map((n) => [n, nodeFigures(n)])),
   };
 }

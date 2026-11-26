@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { HttpError, type Client } from '../lib/api';
-import { event, facts, figures, iso, NOW } from './fixtures';
-import { Model, REREAD_AFTER_MS } from './model.svelte';
+import { event, facts, figures, iso, nodeFigures, NOW } from './fixtures';
+import { Model, PART_NAMES, REREAD_AFTER_MS } from './model.svelte';
 
 /** A `Client` answering each path from `answers`; a path not there fails. */
 function api(answers: Record<string, unknown>): Client & { asked: string[] } {
@@ -38,6 +38,9 @@ const READS = {
   [`/v1/events?kind=lease.lost,lease.takeover&since=${iso(NOW - 3_600_000)}&limit=1000`]: {
     events: [event({ kind: 'lease.takeover', at: iso(NOW - 50 * 60_000), pipeline: 'customers', text: 'customers taken over from n1 by n3' })],
   },
+  '/v1/cluster/removals': {
+    removals: [{ id: 'payments', generation: 41, removed_at: iso(NOW - 4 * 60_000) }],
+  },
   '/v1/history?series=lag_seconds': {
     series: [{ name: 'lag_seconds', pipeline: 'orders-pg', points: [[NOW / 1000, 21]] }],
   },
@@ -57,6 +60,8 @@ describe("the console's model", () => {
     expect(o.facts.actions.customers.kind).toBe('action.pipeline.resume');
     expect(o.facts.leaseLosses.map((e) => e.text)).toEqual(['customers taken over from n1 by n3']);
     expect(o.facts.lag['orders-pg']).toEqual([[NOW / 1000, 21]]);
+    expect(o.facts.removals.map((r) => r.id)).toEqual(['payments']);
+    expect(o.facts.cluster?.settings?.lease_seconds).toBe(15);
     expect(Object.values(o.read).every((r) => r.at === NOW && r.error === null)).toBe(true);
     const { '/v1/snapshots': _, ...without } = READS;
     const later = new Model(api(without));
@@ -178,6 +183,42 @@ describe("the console's model", () => {
     expect(client.asked).toEqual([]);
     await vi.advanceTimersByTimeAsync(REREAD_AFTER_MS);
     // A person's pause, stop or resume changes the pipeline's desired state: its row reads again.
-    expect(client.asked.sort()).toEqual(['/v1/config/nodes', '/v1/pipelines', '/v1/snapshots']);
+    expect(client.asked.sort()).toEqual(['/v1/cluster/removals', '/v1/config/nodes', '/v1/pipelines', '/v1/snapshots']);
+  });
+  it("keeps each member's own figures, the newest a node sent, and drops a node no longer a member", async () => {
+    const o = new Model(api(READS));
+    o.node(nodeFigures('n2', { at: iso(NOW - 5_000), pipelines: ['orders-pg'] }));
+    o.node(nodeFigures('n2', { at: iso(NOW - 10_000), pipelines: [] }));
+    expect(o.facts.nodes.n2.pipelines).toEqual(['orders-pg']);
+    o.node(nodeFigures('n4'));
+    await o.load(['cluster']);
+    expect(Object.keys(o.facts.nodes)).toEqual(['n2']);
+  });
+
+  it('reads the pending removals again when a pipeline is removed or a generation published', async () => {
+    const a = api(READS);
+    const o = new Model(a);
+    o.event(event({ kind: 'pipeline.removed', at: iso(NOW), pipeline: 'payments' }));
+    await vi.advanceTimersByTimeAsync(REREAD_AFTER_MS);
+    expect(a.asked).toContain('/v1/cluster/removals');
+    a.asked.length = 0;
+    o.event(event({ kind: 'config.published', at: iso(NOW), text: 'generation 43 published by ops' }));
+    await vi.advanceTimersByTimeAsync(REREAD_AFTER_MS);
+    expect(a.asked).toEqual(expect.arrayContaining(['/v1/config/nodes', '/v1/cluster/removals']));
+  });
+
+  it('names its parts as people read them, for the notices that say which failed', () => {
+    expect(PART_NAMES).toEqual({
+      pipelines: 'the pipelines',
+      cluster: 'the cluster',
+      config: "the nodes' config",
+      jobs: 'the snapshot jobs',
+      tables: 'the tables',
+      events: 'the events',
+      actions: "the pipelines' last actions",
+      leases: "the hour's lease hand-offs",
+      lag: 'the lag lines',
+      removals: 'the pending removals',
+    });
   });
 });

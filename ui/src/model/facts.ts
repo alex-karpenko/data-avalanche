@@ -7,7 +7,9 @@ import type {
   EventItem,
   Figures,
   Job,
+  NodeFigures,
   PipelineItem,
+  Removal,
   SinkAt,
   SourceAt,
   TableItem,
@@ -34,6 +36,10 @@ export interface Facts {
   unreachable: Record<string, number>;
   /** The pipelines whose lease no node holds (or renews), since when the page saw it (ms). */
   unheld: Record<string, number>;
+  /** The removals not torn down yet, oldest first (DA-API-21). */
+  removals: Removal[];
+  /** Each member's own figures, as the stream last sent them. */
+  nodes: Record<string, NodeFigures>;
 }
 
 export function empty(): Facts {
@@ -50,6 +56,8 @@ export function empty(): Facts {
     leaseLosses: [],
     unreachable: {},
     unheld: {},
+    removals: [],
+    nodes: {},
   };
 }
 

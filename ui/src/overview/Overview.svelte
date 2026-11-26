@@ -7,6 +7,7 @@
     LAG_TARGET_S,
     LEASE_LOSS_WITHIN_S,
     PAUSED_FOR_S,
+    REMOVAL_PENDING_S,
     RISING_OVER_S,
     UNHELD_FOR_S,
     WAL_SHARE,
@@ -14,9 +15,9 @@
     attention,
     nodeHref,
   } from './attention';
-  import { staleNotice } from '../lib/notices';
+  import { failingNotice, failures, staleNotice } from '../lib/notices';
   import { rows, tiles } from './derive';
-  import { EVENTS_SHOWN, PARTS, type Model } from '../model/model.svelte';
+  import { EVENTS_SHOWN, PART_NAMES, PARTS, type Model } from '../model/model.svelte';
   import Sparkline from './Sparkline.svelte';
 
   interface Props {
@@ -32,9 +33,7 @@
   const shown = $derived(tiles(model.facts, now));
   const table = $derived(rows(model.facts, now));
   const events = $derived(model.facts.events.slice(0, EVENTS_SHOWN));
-  const failing = $derived(
-    PARTS.filter((p) => model.read[p].error !== null).map((p) => `${p} (${model.read[p].error})`),
-  );
+  const failing = $derived(failingNotice(failures(PARTS.map((p) => [PART_NAMES[p], model.read[p]]), now)));
   const href = (kind: string, id: string) => `/ui/${kind}/${encodeURIComponent(id)}`;
 </script>
 
@@ -42,8 +41,8 @@
 {#if stale}
   <p class="notice stale-note" role="status">{staleNotice(last, now)}</p>
 {/if}
-{#if failing.length > 0}
-  <p class="notice failing" role="alert">Couldn't be read, shown as last read: {failing.join('; ')}</p>
+{#if failing !== null}
+  <p class="notice failing" role="alert">{failing}</p>
 {/if}
 
 <div class="tiles" class:stale>
@@ -76,7 +75,7 @@
   {WAL_SHARE * 100}% of max_slot_wal_keep_size, or {bytes(WAL_UNLIMITED_BYTES)} without one ·
   paused or stopped by a person for over {PAUSED_FOR_S / 3600} h · snapshot jobs failed in the last
   {FAILED_WITHIN_S / 3600} h · leases lost in the last {LEASE_LOSS_WITHIN_S / 3600} h, or with no
-  holder for over {UNHELD_FOR_S} s
+  holder for over {UNHELD_FOR_S} s · a removal pending for over {REMOVAL_PENDING_S / 60} min
 </p>
 
 <div class="two">
