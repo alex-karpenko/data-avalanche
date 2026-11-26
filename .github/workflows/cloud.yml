@@ -73,6 +73,8 @@ jobs:
       - name: Free runner disk
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - uses: actions/checkout@v7
+      - name: Keep the test ports out of the ephemeral range
+        run: test-infra/reserve-ports.sh
       - uses: actions-rust-lang/setup-rust-toolchain@v2
       - name: GCS credentials
         if: matrix.store == 'gcs'

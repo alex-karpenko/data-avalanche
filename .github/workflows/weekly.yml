@@ -36,6 +36,8 @@ jobs:
       DATA_AVALANCHE_PG_PORT: "554${{ matrix.version }}"
     steps:
       - uses: actions/checkout@v7
+      - name: Keep the test ports out of the ephemeral range
+        run: test-infra/reserve-ports.sh
       - uses: actions-rust-lang/setup-rust-toolchain@v2
       - uses: astral-sh/setup-uv@v10.3.3
       - name: Start PostgreSQL ${{ matrix.version }}, RustFS and Jaeger
@@ -68,6 +70,8 @@ jobs:
       DATA_AVALANCHE_MYSQL: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v7
+      - name: Keep the test ports out of the ephemeral range
+        run: test-infra/reserve-ports.sh
       - uses: actions-rust-lang/setup-rust-toolchain@v2
       - name: Start ${{ matrix.target }}
         run: docker compose -f test-infra/compose.yaml --profile matrix up -d --wait "${{ matrix.target }}"
@@ -98,6 +102,8 @@ jobs:
       DATA_AVALANCHE_MYSQL: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v7
+      - name: Keep the test ports out of the ephemeral range
+        run: test-infra/reserve-ports.sh
       - uses: actions-rust-lang/setup-rust-toolchain@v2
       - uses: astral-sh/setup-uv@v10.3.3
       - name: Start ${{ matrix.service }}, RustFS and Jaeger
