@@ -1,6 +1,7 @@
-//! The console's app in a browser (Admin_Console §10; M15, M16a): Playwright's flows (`ui/e2e`)
-//! against a node under each `globals.api.auth` mode, the console switched off, the pipelines'
-//! pages and their actions, and the page budgets (§8) with 50 pipelines on three nodes. Needs
+//! The console's app in a browser (Admin_Console §10; M15, M16a, M16b): Playwright's flows
+//! (`ui/e2e`) against a node under each `globals.api.auth` mode, the console switched off, the
+//! pipelines' pages and their actions, the Cluster pages and a node's actions, and the page
+//! budgets (§8) with 50 pipelines on three nodes. Needs
 //! `DATA_AVALANCHE_BROWSER=1`, the app built into the binary (`npm ci && npm run build` in `ui/`,
 //! then the binary) and Playwright's Chromium (`npx playwright install chromium` in `ui/`);
 //! without the variable each skips itself.
@@ -13,10 +14,13 @@ use data_avalanche_testkit::require_it;
 use crate::console_sessions::session_key;
 use crate::harness::{Doc, E2e, Options, Proc, eventually};
 use crate::idp::{Idp, Provider};
-use crate::nodes::{Cluster, ITEMS};
+use crate::nodes::{Cluster, ITEMS, MORE};
 
 /// The pipelines of the budget's cluster (Admin_Console §8).
 const PIPELINES: usize = 50;
+
+/// `ops:s3cret`, the `basic` user of the flows, as an `Authorization` header.
+const OPS: (&str, &str) = ("Authorization", "Basic b3BzOnMzY3JldA==");
 
 /// Returns early unless the browser's flows are asked for.
 macro_rules! require_browser {
@@ -176,6 +180,59 @@ async fn the_pipelines_pages_and_their_actions_in_a_browser() {
     playwright("pipelines.spec.ts", p.port(), &env).await;
     assert!(p.terminate().await.success());
     e.cleanup().await;
+}
+
+/// The Cluster pages under `basic` on three nodes (mockups 03, 04, 11): the members and leases, the
+/// console's status, a node's page; n3 asked to leave through its dialog, recorded with its note
+/// and still running out of the cluster; n2 shut down once its name is typed, and gone.
+#[tokio::test]
+async fn the_cluster_pages_and_a_node_s_actions_in_a_browser() {
+    require_it!();
+    require_browser!();
+    let mut c = Cluster::with(
+        "console_app_cluster",
+        ITEMS,
+        MORE,
+        Options {
+            tables: ", snapshots: { mode: never }",
+            cluster: ", rebalance_stabilization: 3s",
+            api: ", auth: basic, user: ops, password: s3cret",
+            globals: &console(""),
+            ..Options::default()
+        },
+    )
+    .await;
+    c.start_all().await;
+    c.settled().await;
+    let env = [("DA_USER", "ops"), ("DA_PASSWORD", "s3cret")];
+    playwright("cluster.spec.ts", c.proc("n1").port(), &env).await;
+
+    let i = c.index("n2");
+    let mut n2 = c.nodes[i].proc.take().expect("n2 ran");
+    assert!(n2.exit().await.success(), "{}", n2.log());
+    let n1 = c.proc("n1");
+    for (kind, node, note) in [
+        ("action.node.leave", "n3", Some("node pool upgrade")),
+        ("action.node.shutdown", "n2", None),
+    ] {
+        eventually(
+            &format!("{kind} is recorded"),
+            Duration::from_secs(30),
+            async || {
+                let path = format!("/v1/events?kind={kind}");
+                let (_, _, body) = n1.exchange_ok("GET", &path, &[OPS], "").await;
+                let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                v["events"].as_array().is_some_and(|e| {
+                    e.iter()
+                        .any(|e| e["node"] == node && e["note"].as_str() == note)
+                })
+            },
+        )
+        .await;
+    }
+    // n3 left the ring but keeps running, out of the cluster, until it is stopped.
+    assert_eq!(c.proc("n3").answers("/health/live").await, Some(200));
+    c.stop().await;
 }
 
 /// Admin_Console §8: the Overview drawn under 1 s, and moving between pages under 300 ms, with 50
