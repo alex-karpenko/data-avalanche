@@ -9,10 +9,10 @@
   import Chart from '../lib/Chart.svelte';
   import Dialog from '../lib/Dialog.svelte';
   import { ago } from '../lib/format';
-  import { failingNotice, failures, staleNotice } from '../lib/notices';
+  import { failingNotice, failures, staleNotice, type PartRead } from '../lib/notices';
   import type { Session } from '../lib/session';
   import { at } from '../model/facts';
-  import { CLUSTER_REREAD_MS, type Model } from '../model/model.svelte';
+  import { CLUSTER_REREAD_MS, PART_NAMES as MODEL_PART_NAMES, type Model } from '../model/model.svelte';
   import { LAG_TARGET_S } from '../overview/attention';
   import { activity, header, marks, snapshotPanel, sourceLines, tableLines } from './detail';
   import { SPAN_S } from './lag.svelte';
@@ -33,7 +33,7 @@
   const id = $derived(page.id);
   const item = $derived(model.facts.pipelines.find((p) => p.id === id));
   const lease = $derived(model.facts.cluster?.pipelines.find((l) => l.id === id));
-  const head = $derived(header(page.detail, item, page.figures, lease, now));
+  const head = $derived(header(page.detail, item, page.figures, lease, now, model.read.cluster));
   const tables = $derived(tableLines(id, page.figures, page.detail, page.events, now));
   const source = $derived(sourceLines(page.figures));
   const snap = $derived(snapshotPanel(page.jobs, now));
@@ -43,7 +43,18 @@
   const desired = $derived(page.detail?.desired_state ?? item?.desired_state ?? null);
   const can = $derived(mayAct(session.role) && desired !== null);
   const offered = $derived(desired === null ? [] : VERBS.filter((v) => ACTIONS[v].takes(desired)));
-  const failing = $derived(failingNotice(failures(PAGE_PARTS.map((p) => [PART_NAMES[p], page.read[p]]), now)));
+  // The lease in the header comes from the cluster the console reads every 5 s.
+  const failing = $derived(
+    failingNotice(
+      failures(
+        [
+          ...PAGE_PARTS.map((p): [string, PartRead] => [PART_NAMES[p], page.read[p]]),
+          [MODEL_PART_NAMES.cluster, model.read.cluster],
+        ],
+        now,
+      ),
+    ),
+  );
   const readAt = $derived(at(page.figures?.source?.read_at));
 
   onMount(() => {

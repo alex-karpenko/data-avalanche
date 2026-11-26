@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-24
+updated: 2026-11-26
 domain: Architecture
 tags: [architecture, design, system, multi-sink, iceberg, delta-lake, v1-scope]
 sources: []
@@ -130,7 +130,8 @@ Functional endpoints are versioned under `/v1`; probes and metrics are unversion
 | Config validate | `POST /v1/config/validate` | operator | dry-run of the full load pipeline (parse → validate → resolve) of the body, or of the node's file when the body is empty: the report and what a reload would change; the resolved config is not returned; nothing is published. A node takes posted bodies at 1 per second after a burst of 5: past it, `429` with `Retry-After` |
 | Config reload | `POST /v1/config/reload` | operator | publishes a new config generation cluster-wide; a process-restart field is refused unless `?restart=accept`, and then applied at each node's next start (`restart_pending`) |
 | Config status | `GET /v1/config/status` | viewer | |
-| Cluster status | `GET /v1/cluster/status` | viewer | each member's state, API URL and config file hash; each pipeline's lease holder, its ring owner and when the lease expires |
+| Cluster status | `GET /v1/cluster/status` | viewer | each member's state, API URL, config file hash and start (`started_at`); each pipeline's lease holder, its ring owner and when the lease expires; the cluster's settings (`tokens`, `lock_backend`, the lease duration, `rebalance_stabilization`, `max_concurrent_handoffs`, `drain_timeout`, and the console's history and events retention) |
+| Pending removals | `GET /v1/cluster/removals` | viewer | the removal tombstones not done yet (Configuration §12.3), oldest first: each pipeline's id, the generation that removed it and when; `503` when they can't be read |
 | Node detail | `GET /v1/nodes/{node}` | viewer | the node's build, start, phase, config generation and whether its file is that generation's, its restart-pending fields, process and gossip figures, and the pipelines it holds; another node's is fetched from it with the caller's credentials (`404` no such member, `503` no API address, `502`/`504` no answer) |
 | Node leave / shutdown | `POST /v1/nodes/{node}/leave`, `POST /v1/nodes/{node}/shutdown` | admin | the node's own `POST /v1/cluster/leave` or `POST /v1/admin/shutdown`, asked of any node and passed on with the caller's credentials; the node that acts records it. A request passed on names its node: any other node refuses it (`421`) |
 | Node config | `POST /v1/nodes/{node}/config/validate`, `POST /v1/nodes/{node}/config/reload`, `GET /v1/nodes/{node}/config/status` | operator (status: viewer) | the node's own config routes, asked of any node: the check and the reload read that node's file |

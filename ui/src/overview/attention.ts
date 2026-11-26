@@ -22,6 +22,8 @@ export const FAILED_WITHIN_S = 86_400;
 export const LEASE_LOSS_WITHIN_S = 3600;
 /** A lease with no holder for longer than this: a rebalance hands leases over within it. */
 export const UNHELD_FOR_S = 30;
+/** A removal is torn down at once by its owner, else within the ring's next sweeps (every 30 s). */
+export const REMOVAL_PENDING_S = 120;
 
 export type Severity = 'red' | 'orange' | 'yellow';
 
@@ -206,8 +208,8 @@ export function attention(f: Facts, now: number): Attention[] {
     });
   }
 
-  // Yellow: nodes on different config generations; restart-only changes waiting; a pipeline
-  // paused or stopped by a person for a while.
+  // Yellow: nodes on different config generations; restart-only changes waiting; a removal
+  // waiting for its teardown; a pipeline paused or stopped by a person for a while.
   for (const n of f.config?.nodes ?? []) {
     if (f.config !== null && n.generation !== null && n.generation !== f.config.generation) {
       add({
@@ -228,6 +230,19 @@ export function attention(f: Facts, now: number): Attention[] {
         since: null,
         href: '/ui/config',
         link: 'Review',
+      });
+    }
+  }
+  for (const r of f.removals) {
+    const since = at(r.removed_at);
+    if (since !== null && now - since > REMOVAL_PENDING_S * 1000) {
+      add({
+        severity: 'yellow',
+        what: `Removal of ${r.id} pending`,
+        why: `its teardown hasn't finished since generation ${r.generation} removed it`,
+        since,
+        href: '/ui/cluster',
+        link: 'Cluster',
       });
     }
   }

@@ -53,7 +53,7 @@ function client(): Client & { sent: unknown[][] } {
 const session = (role: Role): Session => ({ name: 'Oleksii', role, auth: 'basic', expires: null, signed_in: null, csrf: 't' });
 
 async function render(
-  over: { role?: Role; offline?: boolean; missing?: boolean; stale?: boolean; last?: number | null; read?: Partial<PipelinePage['read']>; api?: Client } = {},
+  over: { role?: Role; offline?: boolean; missing?: boolean; stale?: boolean; last?: number | null; read?: Partial<PipelinePage['read']>; cluster?: Model['read']['cluster']; api?: Client } = {},
 ) {
   const api = over.api ?? client();
   const page = new PipelinePage(api, 'orders-pg', liveFigures(), () => NOW);
@@ -64,6 +64,7 @@ async function render(
   Object.assign(page.read, over.read ?? {});
   const model = new Model(api);
   model.facts = facts();
+  if (over.cluster !== undefined) model.read.cluster = over.cluster;
   const target = document.createElement('div');
   document.body.replaceChildren(target);
   mounted = mount(Pipeline, {
@@ -228,6 +229,15 @@ describe("a pipeline's page", () => {
     expect(t.querySelector('.notice.failing')?.textContent).toBe(
       "Couldn't be read; showing what was last read: its snapshot jobs (HTTP 503), last read 20 min ago",
     );
+  });
+
+  it("says when the cluster's leases couldn't be read, and counts its lease down no more", async () => {
+    const t = await render({ cluster: { at: NOW - 30_000, error: 'HTTP 503' } });
+    expect(t.querySelector('.notice.failing')?.textContent).toBe(
+      "Couldn't be read; showing what was last read: the cluster (HTTP 503), last read 30 s ago",
+    );
+    expect(t.querySelector('.where')?.textContent).toContain('lease epoch 2');
+    expect(t.querySelector('.where')?.textContent).not.toMatch(/expire/);
   });
 
   it('says a part that failed and was never read is never read', async () => {

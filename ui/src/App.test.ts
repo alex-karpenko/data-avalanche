@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import App from './App.svelte';
 import { RETRY_MS, type Session } from './lib/session';
 import { facts } from './model/fixtures';
+import { nodeDetail } from './nodes/fixtures';
 import { detail, liveFigures } from './pipelines/fixtures';
 
 // The chart's uPlot, as in the pipeline page's tests.
@@ -53,7 +54,7 @@ describe('the app', () => {
   });
 
   /** The console as the server answers it, for pipelines `a` and `b`; `asked` lists the reads. */
-  function serve(session: () => Session) {
+  function serve(session: () => Session, cluster: unknown = { members: [], pipelines: [] }) {
     const asked: string[] = [];
     const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200 });
     const fetch = vi.fn(async (input: RequestInfo | URL) => {
@@ -62,7 +63,12 @@ describe('the app', () => {
       if (path === '/ui/session') return json(session());
       if (path === '/ui/session/refresh') return json(session());
       if (path === '/v1/pipelines') return json({ pipelines: facts().pipelines });
-      if (path === '/v1/cluster/status') return json({ members: [], pipelines: [] });
+      if (path === '/v1/cluster/status') return json(cluster);
+      if (path === '/v1/cluster/removals') return json({ removals: [] });
+      if (path === '/v1/snapshots') return json({ jobs: [] });
+      if (path === '/v1/config/nodes') return json(facts().config);
+      if (path === '/v1/nodes/n2') return json(nodeDetail());
+      if (path === '/v1/tables') return json({ tables: [], unreachable: [] });
       const one = /^\/v1\/pipelines\/([^/]+)(\/[a-z]+)?$/.exec(path);
       if (one !== null) {
         const id = one[1];
@@ -153,5 +159,22 @@ describe('the app', () => {
     expect(asked).toContain('/ui/session/refresh');
     expect(reads()).toBe(1);
     expect(t.querySelector('h2')).toBe(h2);
+  });
+
+  it("reads each member's lease renewals once as the Cluster page opens, not again at each answer", async () => {
+    const asked = serve(operator, { members: facts().cluster!.members, pipelines: [] });
+    await open('/ui/cluster');
+    await settle();
+    const renewals = asked.filter((p) => p.includes('series=lease_renew_seconds')).sort();
+    expect(renewals).toEqual(['n1', 'n2', 'n3'].map((n) => `/v1/history?node=${n}&series=lease_renew_seconds`));
+  });
+
+  it("reads a node's detail, charts and activity once as its page opens", async () => {
+    const asked = serve(operator, { members: facts().cluster!.members, pipelines: [] });
+    const t = await open('/ui/cluster/nodes/n2');
+    expect(t.querySelector('h2')?.textContent).toContain('n2');
+    expect(asked.filter((p) => p === '/v1/nodes/n2')).toHaveLength(1);
+    expect(asked.filter((p) => p.startsWith('/v1/history?node=n2&series=lease_renew_seconds,'))).toHaveLength(1);
+    expect(asked.filter((p) => p.startsWith('/v1/events?node=n2'))).toHaveLength(1);
   });
 });

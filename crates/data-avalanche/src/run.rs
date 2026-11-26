@@ -323,6 +323,7 @@ pub async fn run(args: RunArgs) -> Result<(), Fatal> {
         file: args.config.clone(),
         docs,
         leases: deps.leases.clone(),
+        removals: deps.removals.clone(),
         control,
         validates: Arc::new(RateLimit::validate()),
         recorder: recorder.clone(),

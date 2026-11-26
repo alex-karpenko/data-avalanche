@@ -30,7 +30,8 @@ cookies are `Secure`, which browsers send over plain HTTP only to `localhost`.
 
 Every page has the same top bar: the sections, the live connection's state, the cluster's config
 generation, and who is signed in, with their role and the sign-out. This build has the
-**Overview** and the **Pipelines**; the other sections say they aren't in this build yet.
+**Overview**, the **Cluster** and the **Pipelines**; the other sections say they aren't in this
+build yet.
 
 The page shows the cluster as it is when it opens, then follows the cluster's live updates
 (`GET /v1/stream`) through whichever node served it, so it changes as things happen without a
@@ -55,10 +56,68 @@ page; a later release makes them configurable):
 |---|---|
 | Red | A table halted; a pipeline stopped by an error; a pipeline no node has held for over 30 s; a node the others' probes get no answer from |
 | Orange | A pipeline's lag over 60 s and higher than 5 min ago; a slot holding WAL past 50% of `max_slot_wal_keep_size` (16 GB when the server sets none); a lease lost or taken over in the last hour; a snapshot job failed in the last 24 h; a node the console can't follow; a pipeline that can't commit |
-| Yellow | A node on another config generation; a restart-only change waiting on a node; a pipeline paused or stopped by a person over 1 h ago |
+| Yellow | A node on another config generation; a restart-only change waiting on a node; a pipeline paused or stopped by a person over 1 h ago; a removed pipeline whose teardown hasn't finished after 2 min |
 
 A node the console can't follow shows its pipelines as last known, marked with how long it has been
 out of reach.
+
+### The cluster
+
+**Cluster** shows the members and the leases:
+
+- tiles: the members by state, the leases held, the config generation (and the nodes on another),
+  the pipelines away from their ring owner, and the cluster's settings (tokens, lease duration,
+  lock backend);
+- every member: its state (`alive`, `suspect` when the others' probes miss it, which keeps it in
+  the ring, `leaving` while it hands off, `joining`), its address, version, config generation, the
+  pipelines it holds, its slowest lease renewal in the last hour, and how long it has been up;
+- the pipelines **away from their owner** after a failover, each with why (the lease lost or taken
+  over in the last hour, from the events) and when it goes back: the ring owner takes it back once
+  the membership has been stable for `rebalance_stabilization`, `max_concurrent_handoffs` at a
+  time. One away for over an hour, or with no hand-off recorded, is red;
+- every lease: its holder, ring owner, owner epoch, when it expires, and its state (held, away
+  from owner, not renewing, no holder), the row coloured by it: orange away from its owner, red
+  with no holder or not renewing, those with no holder or not renewed first;
+- the **pending removals**, while any: a pipeline removed from the config whose teardown (its
+  slot, its state) hasn't finished, the generation that removed it, and since when
+  (`GET /v1/cluster/removals`).
+
+A node's page (`/ui/cluster/nodes/<name>`, from its row) has its state, its API and gossip
+addresses, version, config generation and when it started; the pipelines it holds, with their lag;
+its lease renewals, memory (against its limit) and CPU over 6 hours; what it recorded; and what its
+gossip sees: its peers and their states, its last probe, and the suspicions of the last day. Each part is read from the node itself, through whichever
+node served the page.
+
+### Acting on nodes
+
+An `admin` sees two actions on a node's page:
+
+- **Leave**: the node hands its pipelines to the others, one at a time, and leaves the ring. The
+  process keeps running, out of the cluster, until it is stopped or restarted. Each hand-off pauses
+  its pipeline for a while; a running snapshot goes on from its last chunk where its pipeline goes.
+- **Shut down**: a leave, then the process exits. A supervisor such as Kubernetes starts it
+  again and it rejoins; without one, nothing restarts it. The dialog asks for the node's name typed
+  before it acts.
+
+There is no in-place restart. Each dialog names the pipelines the node holds, takes a note, and
+shows the line it will be recorded as (`n2 left the cluster, asked by Oleksii (admin)`); the node
+acted on checks the role again and records it. When the console's live updates come through that
+node, the dialog says what follows: after a leave the console stays on that node, out of the
+cluster, so open it through another; after a shutdown it reconnects through the address it was
+opened at, which reaches another node only behind a load balancer. An `operator` or a `viewer`
+sees no node actions.
+
+### The console's status
+
+The user menu (a click on your name) shows the console's own state:
+
+| | |
+|---|---|
+| Live updates | `connected` and through which node, or `reconnecting` / `offline` with the last update's age |
+| Nodes answering | how many members the console follows, and for how long each other one has been out of reach |
+| Built-in history | its retention (`globals.console.history`) and when the last sample came |
+| Prometheus | `not configured`, `ok`, or `failing` with its error, and when the node last asked it; read again as the menu opens |
+| Event store | `ok` with its retention (`globals.console.events`), or `failing` with why; read again as the menu opens |
 
 ### The pipelines
 
@@ -79,14 +138,16 @@ behind the stream reads), its snapshot jobs, and what happened to it. Hovering a
 chart highlights it in the list below, and the reverse.
 
 Every part of the page says how old its data is. A part that couldn't be read keeps what it had and
-says so with its age (`Couldn't be read; showing what was last read: its snapshot jobs (HTTP 503),
-last read 20 min ago`, or `…, never read`), on the list as on a pipeline's page, the source's panel
+says so with its age and the server's reason (`Couldn't be read; showing what was last read: the
+snapshot jobs (the request timed out), last read 20 min ago`, or `…, never read`), on every page,
+the source's panel
 says when it was read (`read 40 s ago`), and while the live connection is stale every panel is
 dimmed and the banner says for how long (`Not current: as of 14:02:00 · 34 s old`, or `Not current:
 no live update yet` before the first message). The lease line counts down to the lease's end
 (`expires in 8 s`) and says `expired 3 s ago` when the end has passed without a renewal, and `lease
 released` once its holder let go; a pipeline's page reads the cluster again every 5 s while it is
-shown.
+shown. While the cluster can't be read, the lease line counts nothing down (its end is only what
+the last read saw), and the page's notice names the cluster.
 
 ### Acting on pipelines
 

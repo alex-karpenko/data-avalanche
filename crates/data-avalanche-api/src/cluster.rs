@@ -81,6 +81,10 @@ pub(crate) async fn status(State(api): State<Api>) -> Response {
                 "build": m.meta.build,
                 "api_url": (!m.meta.api_url.is_empty()).then_some(&m.meta.api_url),
                 "file_hash": (!m.meta.file_hash.is_empty()).then_some(&m.meta.file_hash),
+                // A member's incarnation is when its process started (ms since the epoch).
+                "started_at": i64::try_from(m.incarnation)
+                    .ok()
+                    .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis),
             })
         })
         .collect();
@@ -121,10 +125,57 @@ pub(crate) async fn status(State(api): State<Api>) -> Response {
             "ring_owner": ring.owner(id),
         }));
     }
+    let c = &config.globals.cluster;
+    let secs = |d: std::time::Duration| d.as_secs();
+    let settings = json!({
+        "tokens": c.tokens,
+        "lock_backend": c.lock_backend,
+        "lease_seconds": secs(c.lease_duration),
+        "rebalance_stabilization_seconds": secs(c.rebalance_stabilization),
+        "max_concurrent_handoffs": c.max_concurrent_handoffs,
+        "drain_timeout_seconds": secs(c.drain_timeout),
+        "history_retention_seconds": secs(config.globals.console.history.retention),
+        "events_retention_seconds": secs(config.globals.console.events.retention),
+    });
     body(
         StatusCode::OK,
-        &json!({ "node": members.me, "members": nodes, "pipelines": pipelines }),
+        &json!({
+            "node": members.me,
+            "members": nodes,
+            "pipelines": pipelines,
+            "settings": settings,
+        }),
     )
+}
+
+/// The removals not torn down yet (DA-API-21; Configuration §12.3), oldest first: a pipeline
+/// whose tombstone waits for its owner, or for the node the ring places it on, to tear it down.
+pub(crate) async fn removals(State(api): State<Api>) -> Response {
+    let Some(node) = api.node.get() else {
+        return starting();
+    };
+    match node.removals.all_pending().await {
+        Ok(mut pending) => {
+            pending.sort_by(|a, b| {
+                (a.removed_at, &a.pipeline_id).cmp(&(b.removed_at, &b.pipeline_id))
+            });
+            let removals: Vec<Value> = pending
+                .iter()
+                .map(|r| {
+                    json!({
+                        "id": r.pipeline_id,
+                        "generation": r.generation,
+                        "removed_at": r.removed_at,
+                    })
+                })
+                .collect();
+            body(StatusCode::OK, &json!({ "removals": removals }))
+        }
+        Err(e) => body(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({ "error": format!("the removals can't be read: {e}") }),
+        ),
+    }
 }
 
 /// 202 once the leave is asked, naming the node that leaves; 409 when this node leaves, or
@@ -211,6 +262,8 @@ mod tests {
         assert_eq!(v["members"][0]["phase"], "active");
         assert_eq!(v["members"][0]["config_generation"], 1);
         assert_eq!(v["members"][0]["api_url"], "http://127.0.0.1:8080");
+        // The test's gossip gives its node incarnation 1: 1 ms past the epoch.
+        assert_eq!(v["members"][0]["started_at"], "1970-01-01T00:00:00.001Z");
         assert_eq!(
             v["members"][0]["file_hash"],
             data_avalanche_cluster::file_hash(
@@ -224,6 +277,16 @@ mod tests {
                 "id": "orders", "holder": null, "owner_epoch": null, "holder_stale": null,
                 "expires_at": null, "ring_owner": "node-a",
             }])
+        );
+        assert_eq!(
+            v["settings"],
+            json!({
+                "tokens": 128, "lock_backend": "storage", "lease_seconds": 30,
+                "rebalance_stabilization_seconds": 15, "max_concurrent_handoffs": 2,
+                "drain_timeout_seconds": 45, "history_retention_seconds": 86_400,
+                "events_retention_seconds": 2_592_000,
+            }),
+            "the cluster's settings the console states"
         );
         let holder = Holder {
             node_id: "node-b".into(),
@@ -251,6 +314,55 @@ mod tests {
             left > chrono::Duration::seconds(25) && left <= chrono::Duration::seconds(30),
             "{left}"
         );
+    }
+
+    /// DA-API-21: the removals not done yet, oldest first; a done one is gone from the list.
+    #[tokio::test]
+    async fn the_pending_removals_are_listed_until_they_are_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.yaml");
+        std::fs::write(&file, CONFIG).unwrap();
+        let lone = lone(file).await;
+        let a = api(open());
+        a.node.set(lone.node.clone()).unwrap();
+        let addr = serve(a).await;
+        assert_eq!(
+            json_of(addr, "GET", "/v1/cluster/removals").await,
+            (200, json!({ "removals": [] }))
+        );
+
+        let at = |s: &str| s.parse::<chrono::DateTime<Utc>>().unwrap();
+        for (id, removed_at) in [
+            ("payments", "2026-11-26T10:05:00Z"),
+            ("billing", "2026-11-26T10:00:00Z"),
+        ] {
+            let doc = data_avalanche_state::RemovalDoc {
+                pipeline_id: id.into(),
+                generation: 3,
+                hash: "blake3:00".into(),
+                removed_at: at(removed_at),
+                done_at: None,
+                records: 0,
+            };
+            lone.removals.record(&doc).await.unwrap();
+        }
+        assert_eq!(
+            json_of(addr, "GET", "/v1/cluster/removals").await,
+            (
+                200,
+                json!({ "removals": [
+                    { "id": "billing", "generation": 3, "removed_at": "2026-11-26T10:00:00Z" },
+                    { "id": "payments", "generation": 3, "removed_at": "2026-11-26T10:05:00Z" },
+                ] })
+            )
+        );
+        lone.removals
+            .done("billing", at("2026-11-26T10:06:00Z"))
+            .await
+            .unwrap();
+        let v = json_of(addr, "GET", "/v1/cluster/removals").await.1;
+        assert_eq!(v["removals"].as_array().map(Vec::len), Some(1), "{v}");
+        assert_eq!(v["removals"][0]["id"], "payments");
     }
 
     #[tokio::test]

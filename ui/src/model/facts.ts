@@ -7,7 +7,10 @@ import type {
   EventItem,
   Figures,
   Job,
+  NodeFigures,
   PipelineItem,
+  PrometheusStatus,
+  Removal,
   SinkAt,
   SourceAt,
   TableItem,
@@ -34,6 +37,14 @@ export interface Facts {
   unreachable: Record<string, number>;
   /** The pipelines whose lease no node holds (or renews), since when the page saw it (ms). */
   unheld: Record<string, number>;
+  /** The removals not torn down yet, oldest first (DA-API-21). */
+  removals: Removal[];
+  /** Each member's own figures, as the stream last sent them. */
+  nodes: Record<string, NodeFigures>;
+  /** How the node's Prometheus last answered; `null` when none is configured (or not read). */
+  prometheus: PrometheusStatus | null;
+  /** When the stream's newest chart sample was taken (ms); `null` before the first. */
+  lastSample: number | null;
 }
 
 export function empty(): Facts {
@@ -50,6 +61,10 @@ export function empty(): Facts {
     leaseLosses: [],
     unreachable: {},
     unheld: {},
+    removals: [],
+    nodes: {},
+    prometheus: null,
+    lastSample: null,
   };
 }
 

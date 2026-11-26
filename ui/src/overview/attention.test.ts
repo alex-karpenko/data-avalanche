@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { attention, LAG_TARGET_S } from './attention';
+import { attention, LAG_TARGET_S, REMOVAL_PENDING_S } from './attention';
 import { event, facts, figures, iso, NOW } from '../model/fixtures';
 
 const MIN = 60_000;
@@ -152,5 +152,24 @@ describe('needs attention', () => {
     f.config!.nodes = [];
     f.actions = {};
     expect(attention(f, NOW)).toEqual([]);
+  });
+  it('says when a removal has waited past its threshold for its teardown, and links the cluster', () => {
+    const f = facts();
+    f.removals = [
+      { id: 'payments', generation: 41, removed_at: iso(NOW - REMOVAL_PENDING_S * 1000 - 1_000) },
+      { id: 'audit', generation: 42, removed_at: iso(NOW - 30_000) },
+    ];
+    const pending = attention(f, NOW).filter((a) => a.what.startsWith('Removal'));
+    expect(pending).toEqual([
+      {
+        severity: 'yellow',
+        what: 'Removal of payments pending',
+        why: 'its teardown hasn\'t finished since generation 41 removed it',
+        since: NOW - REMOVAL_PENDING_S * 1000 - 1_000,
+        href: '/ui/cluster',
+        link: 'Cluster',
+      },
+    ]);
+    expect(REMOVAL_PENDING_S).toBe(120);
   });
 });
