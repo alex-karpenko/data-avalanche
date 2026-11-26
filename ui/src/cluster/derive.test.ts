@@ -32,7 +32,19 @@ describe('the cluster', () => {
     f.cluster!.pipelines[3] = { ...f.cluster!.pipelines[3], holder: null, expires_at: null };
     const [members, leases] = clusterTiles(f, NOW);
     expect(members).toEqual({ key: 'Members', value: '1 of 3', detail: '1 suspect · 1 leaving', tone: 'orange' });
-    expect(leases).toEqual({ key: 'Leases', value: '4', detail: '1 with no holder', tone: 'red' });
+    expect(leases).toEqual({ key: 'Leases', value: '4', detail: '1 with no holder or not renewing', tone: 'red' });
+  });
+
+  it('counts a lease not renewed as unheld, and names a member in any other state', () => {
+    const f = facts();
+    f.cluster!.pipelines[0] = { ...f.cluster!.pipelines[0], holder_stale: true };
+    f.cluster!.members[2].phase = 'joining';
+    const [members, leases] = clusterTiles(f, NOW);
+    expect(leases).toEqual({ key: 'Leases', value: '4', detail: '1 with no holder or not renewing', tone: 'red' });
+    expect(members).toEqual({ key: 'Members', value: '2 of 3', detail: '1 joining', tone: 'orange' });
+    f.cluster!.members[1].suspect = true;
+    f.cluster!.members[0].phase = 'joining';
+    expect(clusterTiles(f, NOW)[0]).toEqual({ key: 'Members', value: '0 of 3', detail: '1 suspect · 2 joining', tone: 'orange' });
   });
 
   it('lists each member: its state, address, version, generation, pipelines held and owned, lease renewal, how long it is up', () => {

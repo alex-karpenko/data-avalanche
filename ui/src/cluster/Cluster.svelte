@@ -1,10 +1,11 @@
 <script lang="ts">
   // The Cluster page (Admin_Console §4, mockup 03): its members, the pipelines held away from
   // their ring owner, every lease, and the removals waiting for their teardown (DA-API-21).
+  import { onMount } from 'svelte';
   import { clock } from '../lib/format';
   import { failingNotice, failures, staleNotice, type PartRead } from '../lib/notices';
   import Tiles from '../lib/Tiles.svelte';
-  import { PART_NAMES, type Model, type Part } from '../model/model.svelte';
+  import { CLUSTER_REREAD_MS, PART_NAMES, type Model, type Part } from '../model/model.svelte';
   import { REMOVAL_PENDING_S } from '../overview/attention';
   import { awayRows, clusterTiles, leaseRows, memberRows, removalRows } from './derive';
   import type { Renewals } from './renewals.svelte';
@@ -38,6 +39,12 @@
       ),
     ),
   );
+
+  // A lease's renewals send no event: its end (`expires_at`) is only what the last read saw.
+  onMount(() => {
+    const timer = setInterval(() => void model.load(['cluster']), CLUSTER_REREAD_MS);
+    return () => clearInterval(timer);
+  });
 </script>
 
 <h2>Cluster</h2>

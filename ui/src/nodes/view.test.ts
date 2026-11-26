@@ -21,6 +21,22 @@ describe("a node's page", () => {
     });
   });
 
+  it('says a node the cluster no longer lists is not a member, its detail kept for the line', () => {
+    const f = facts();
+    f.cluster!.members = f.cluster!.members.filter((m) => m.node !== 'n2');
+    expect(nodeHeader('n2', f, nodeDetail(), NOW)).toEqual({
+      state: { label: 'not a member', tone: 'grey' },
+      line: '10.0.1.12:8080 · gossip 10.0.1.12:7946 · 1.1.0 · config gen 42 · started 3 d ago',
+    });
+  });
+
+  it("heads with its detail's phase while the cluster is not read yet", () => {
+    const f = facts();
+    f.cluster = null;
+    expect(nodeHeader('n2', f, { ...nodeDetail(), phase: 'draining' }, NOW)!.state).toEqual({ label: 'leaving', tone: 'grey' });
+    expect(nodeHeader('n2', f, nodeDetail(), NOW)!.state).toEqual({ label: 'alive', tone: 'green' });
+  });
+
   it("says a node the console's stream can't reach is unreachable, and a name no member has is none", () => {
     const f = facts();
     f.unreachable = { n2: NOW - 40_000 };

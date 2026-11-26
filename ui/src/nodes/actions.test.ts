@@ -10,7 +10,7 @@ describe("a node's actions", () => {
 
   it('say what a leave hands off, where a running snapshot goes on, and how long it takes', () => {
     const t = nodeTarget('n1', facts(), 'n2');
-    expect(t).toEqual({ name: 'n1', pipelines: ['billing-mysql', 'customers'], snapshots: [{ job: '019ab5d0', pipeline: 'customers' }], members: 3, via: 'n2', drainSeconds: 60 });
+    expect(t).toEqual({ name: 'n1', pipelines: ['billing-mysql', 'customers'], snapshots: [{ job: '019ab5d0', pipeline: 'customers' }], members: 3, carriers: ['n2', 'n3'], via: 'n2', drainSeconds: 60 });
     expect(NODE_ACTIONS.leave.title('n1')).toBe('n1 leaves the cluster?');
     expect(NODE_ACTIONS.leave.lines(t)).toEqual([
       'n1 hands its 2 pipelines to the others, one at a time, and leaves the ring. The process keeps running, out of the cluster, until it is stopped or restarted.',
@@ -31,12 +31,28 @@ describe("a node's actions", () => {
     expect([NODE_ACTIONS.leave.typed, NODE_ACTIONS.shutdown.typed]).toEqual([false, true]);
   });
 
-  it("says so when the node is the one the console's live updates come through", () => {
+  it('says only the others that can carry its pipelines carry them: active, not suspect', () => {
+    const f = facts();
+    f.cluster!.members[2].suspect = true;
+    const t = nodeTarget('n2', f, 'n1');
+    expect(t.carriers).toEqual(['n1']);
+    expect(NODE_ACTIONS.shutdown.lines(t)[1]).toBe('With 3 nodes, only 1 of the others can carry everything until it is back: n1.');
+    f.cluster!.members[0].phase = 'draining';
+    expect(NODE_ACTIONS.shutdown.lines(nodeTarget('n2', f, 'n1'))[1]).toBe(
+      'No other node can carry its pipelines now: nothing runs them until it is back.',
+    );
+    f.cluster!.members = f.cluster!.members.filter((m) => m.node === 'n2');
+    expect(NODE_ACTIONS.shutdown.lines(nodeTarget('n2', f, 'n1'))[1]).toBe('It is the only node: nothing runs its pipelines until it is back.');
+  });
+
+  it("says what follows when the node is the one the console's live updates come through", () => {
     const t = nodeTarget('n2', facts(), 'n2');
     expect(NODE_ACTIONS.leave.lines(t).at(-1)).toBe(
-      "This console's live updates come through n2: once it goes, the page reconnects to another node on its own.",
+      "This console's live updates come through n2, which keeps answering out of the cluster: to follow the cluster, open the console through another node.",
     );
-    expect(NODE_ACTIONS.shutdown.lines(t).at(-1)).toBe(NODE_ACTIONS.leave.lines(t).at(-1));
+    expect(NODE_ACTIONS.shutdown.lines(t).at(-1)).toBe(
+      "This console's live updates come through n2: once it exits, the page reconnects through the address it was opened at, which reaches another node only behind a load balancer.",
+    );
   });
 
   it('says a node holding nothing just leaves the ring', () => {

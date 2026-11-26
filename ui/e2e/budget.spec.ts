@@ -73,7 +73,7 @@ test(`moving between pages takes under ${MOVE_MS} ms`, async ({ page }) => {
     ['a pipeline back to the pipelines', await move(page, null, 'tbody a.open', pipelines)],
     ['the pipelines to the Overview', await move(page, 'nav a[href="/ui/"]', '.tile', 5)],
     ['the Overview to the Cluster', await move(page, 'nav a[href="/ui/cluster"]', '.leases tbody tr', pipelines)],
-    ['the Cluster to a node', await move(page, '.members a[href="/ui/cluster/nodes/n2"]', '.pipelines tbody tr', 1)],
+    ['the Cluster to a node', await move(page, '.members a[href="/ui/cluster/nodes/n2"]', '.pipelines tbody tr a[href^="/ui/pipelines/"]', 1)],
   ] as const;
   for (const [what, ms] of moves) console.log(`${what}: ${Math.round(ms)} ms`);
   for (const [what, ms] of moves) expect(ms, what).toBeLessThan(MOVE_MS);

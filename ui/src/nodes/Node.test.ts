@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Client } from '../lib/api';
 import type { Role, Session } from '../lib/session';
 import { facts, NOW } from '../model/fixtures';
-import { Model } from '../model/model.svelte';
+import { CLUSTER_REREAD_MS, Model } from '../model/model.svelte';
 import { LagHistory } from '../pipelines/lag.svelte';
 import { nodeDetail, nodeEvents, nodeSeries } from './fixtures';
 import Node from './Node.svelte';
@@ -39,8 +39,9 @@ afterEach(() => {
 });
 
 const sent: unknown[][] = [];
+const asked: string[] = [];
 const api: Client = {
-  get: async <T,>() => ({}) as T,
+  get: async <T,>(path: string) => (asked.push(path), (path === '/v1/cluster/status' ? facts().cluster : {}) as T),
   send: async <T,>(method: string, path: string, body?: unknown) => (sent.push([method, path, body]), {} as T),
 };
 
@@ -165,6 +166,22 @@ describe("a node's page", () => {
     confirm.click();
     await settle();
     expect(sent).toEqual([['POST', '/v1/nodes/n2/shutdown', undefined]]);
+  });
+
+  it('reads the cluster again every 5 s while open: a renewal sends no event', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      await render();
+      asked.length = 0;
+      await vi.advanceTimersByTimeAsync(CLUSTER_REREAD_MS);
+      expect(asked).toEqual(['/v1/cluster/status']);
+      unmount(mounted!);
+      mounted = undefined;
+      await vi.advanceTimersByTimeAsync(3 * CLUSTER_REREAD_MS);
+      expect(asked).toEqual(['/v1/cluster/status']);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('waits while offline: its actions are disabled', async () => {

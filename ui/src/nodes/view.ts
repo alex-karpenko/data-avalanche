@@ -14,11 +14,20 @@ export interface NodeHeader {
   line: string;
 }
 
-/** Its header: from its own detail where read, else what the cluster's status says; `null` for a name no member has. */
+/**
+ * Its header: from its own detail where read, else what the cluster's status says; `null` for a
+ * name no member has. Its state is the cluster's; its detail's phase (read as the page opened)
+ * only until the cluster is read: a node the cluster no longer lists is not a member.
+ */
 export function nodeHeader(name: string, f: Facts, d: NodeDetail | null, now: number): NodeHeader | null {
   const m = f.cluster?.members.find((x) => x.node === name);
   if (m === undefined && d === null) return null;
-  let state = stateOf(m ?? { suspect: false, phase: d?.phase ?? 'unknown' });
+  let state: NodeHeader['state'] =
+    m !== undefined
+      ? stateOf(m)
+      : f.cluster === null
+        ? stateOf({ suspect: false, phase: d?.phase ?? 'unknown' })
+        : { label: 'not a member', tone: 'grey' };
   const unreachable = f.unreachable[name];
   if (unreachable !== undefined) {
     state = { label: `${state.label} · unreachable ${duration((now - unreachable) / 1000)}`, tone: 'orange' };

@@ -22,12 +22,17 @@ export function stateOf(m: { suspect: boolean; phase: string }): { label: string
 /** The five tiles: members, leases, the config generation, away from owner, the settings. */
 export function clusterTiles(f: Facts, _now: number): Tile[] {
   const members = f.cluster?.members ?? [];
-  const alive = members.filter((m) => stateOf(m).label === 'alive').length;
-  const suspect = members.filter((m) => m.suspect).length;
-  const leaving = members.filter((m) => !m.suspect && stateOf(m).label === 'leaving').length;
-  const others = [suspect > 0 ? `${suspect} suspect` : null, leaving > 0 ? `${leaving} leaving` : null].filter((x) => x !== null);
+  const labels = members.map((m) => stateOf(m).label);
+  const alive = labels.filter((l) => l === 'alive').length;
+  // Every state but alive, counted by its label: suspect, leaving, then any other (`joining`).
+  const counts = new Map<string, number>([
+    ['suspect', 0],
+    ['leaving', 0],
+  ]);
+  for (const l of labels.filter((x) => x !== 'alive').sort()) counts.set(l, (counts.get(l) ?? 0) + 1);
+  const others = [...counts].filter(([, n]) => n > 0).map(([l, n]) => `${n} ${l}`);
   const leases = f.cluster?.pipelines ?? [];
-  const unheld = leases.filter((l) => l.holder === null).length;
+  const unheld = leases.filter((l) => l.holder === null || l.holder_stale).length;
   const behind = (f.config?.nodes ?? []).filter((n) => n.generation !== null && n.generation !== f.config?.generation);
   const away = leases.filter((l) => l.holder !== null && l.ring_owner !== null && l.holder !== l.ring_owner).length;
   const last = f.leaseLosses[0];
@@ -43,7 +48,7 @@ export function clusterTiles(f: Facts, _now: number): Tile[] {
     {
       key: 'Leases',
       value: String(leases.length),
-      detail: unheld === 0 ? 'all held' : `${unheld} with no holder`,
+      detail: unheld === 0 ? 'all held' : `${unheld} with no holder or not renewing`,
       tone: unheld === 0 ? 'normal' : 'red',
     },
     {

@@ -8,7 +8,7 @@
   import Dialog from '../lib/Dialog.svelte';
   import { failingNotice, failures, staleNotice, type PartRead } from '../lib/notices';
   import type { Session } from '../lib/session';
-  import type { Model } from '../model/model.svelte';
+  import { CLUSTER_REREAD_MS, type Model } from '../model/model.svelte';
   import { LAG_TARGET_S } from '../overview/attention';
   import Sparkline from '../overview/Sparkline.svelte';
   import { activity } from '../pipelines/detail';
@@ -75,6 +75,11 @@
   }
 
   onMount(() => void lag.ensure());
+  // A lease's renewals send no event: its end (`expires_at`) is only what the last read saw.
+  onMount(() => {
+    const timer = setInterval(() => void model.load(['cluster']), CLUSTER_REREAD_MS);
+    return () => clearInterval(timer);
+  });
 </script>
 
 {#if page.missing}

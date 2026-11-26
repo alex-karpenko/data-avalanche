@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { HttpError, type Client } from '../lib/api';
 import { event, facts, figures, iso, nodeFigures, NOW } from './fixtures';
-import { Model, PART_NAMES, REREAD_AFTER_MS } from './model.svelte';
+import type { Live } from '../lib/live.svelte';
+import { Model, PART_NAMES, REMOVALS_REREAD_MS, REREAD_AFTER_MS } from './model.svelte';
 
 /** A `Client` answering each path from `answers`; a path not there fails. */
 function api(answers: Record<string, unknown>): Client & { asked: string[] } {
@@ -103,6 +104,7 @@ describe("the console's model", () => {
     o.peer({ peer: 'n3', state: 'following' });
     await vi.advanceTimersByTimeAsync(REREAD_AFTER_MS);
     expect(client.asked.sort()).toEqual([
+      '/v1/cluster/removals',
       '/v1/cluster/status',
       `/v1/events?kind=lease.lost,lease.takeover&since=${iso(NOW - 3_600_000 + 2 * REREAD_AFTER_MS)}&limit=1000`,
       '/v1/events?limit=100',
@@ -205,6 +207,22 @@ describe("the console's model", () => {
     o.event(event({ kind: 'config.published', at: iso(NOW), text: 'generation 43 published by ops' }));
     await vi.advanceTimersByTimeAsync(REREAD_AFTER_MS);
     expect(a.asked).toEqual(expect.arrayContaining(['/v1/config/nodes', '/v1/cluster/removals']));
+  });
+
+  it('reads the pending removals again every 30 s while any is listed: one undone is marked done with no event', async () => {
+    const a = api(READS);
+    const o = new Model(a);
+    const live = { on: () => () => {}, onResync: () => () => {} } as unknown as Live;
+    expect(REMOVALS_REREAD_MS).toBe(30_000);
+    const stop = o.follow(live);
+    await vi.advanceTimersByTimeAsync(REMOVALS_REREAD_MS);
+    expect(a.asked).toEqual([]);
+    o.facts.removals = [{ id: 'payments', generation: 41, removed_at: iso(NOW - 4 * 60_000) }];
+    await vi.advanceTimersByTimeAsync(REMOVALS_REREAD_MS);
+    expect(a.asked).toEqual(['/v1/cluster/removals']);
+    stop();
+    await vi.advanceTimersByTimeAsync(3 * REMOVALS_REREAD_MS);
+    expect(a.asked).toEqual(['/v1/cluster/removals']);
   });
 
   it("keeps how Prometheus last answered the node, from the lag lines' read, and when the last sample came", async () => {

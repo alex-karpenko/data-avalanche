@@ -75,8 +75,9 @@ out of reach.
   over in the last hour, from the events) and when it goes back: the ring owner takes it back once
   the membership has been stable for `rebalance_stabilization`, `max_concurrent_handoffs` at a
   time. One away for over an hour, or with no hand-off recorded, is red;
-- every lease: its holder, ring owner, owner epoch, when it expires, and its pipeline's state,
-  those with no holder or not renewed first;
+- every lease: its holder, ring owner, owner epoch, when it expires, and its state (held, away
+  from owner, not renewing, no holder), the row coloured by it: orange away from its owner, red
+  with no holder or not renewing, those with no holder or not renewed first;
 - the **pending removals**, while any: a pipeline removed from the config whose teardown (its
   slot, its state) hasn't finished, the generation that removed it, and since when
   (`GET /v1/cluster/removals`).
@@ -101,8 +102,10 @@ An `admin` sees two actions on a node's page:
 There is no in-place restart. Each dialog names the pipelines the node holds, takes a note, and
 shows the line it will be recorded as (`n2 left the cluster, asked by Oleksii (admin)`); the node
 acted on checks the role again and records it. When the console's live updates come through that
-node, the dialog says so: the page reconnects to another node by itself. An `operator` or a
-`viewer` sees no node actions.
+node, the dialog says what follows: after a leave the console stays on that node, out of the
+cluster, so open it through another; after a shutdown it reconnects through the address it was
+opened at, which reaches another node only behind a load balancer. An `operator` or a `viewer`
+sees no node actions.
 
 ### The console's status
 
@@ -114,7 +117,7 @@ The user menu (a click on your name) shows the console's own state:
 | Nodes answering | how many members the console follows, and for how long each other one has been out of reach |
 | Built-in history | its retention (`globals.console.history`) and when the last sample came |
 | Prometheus | `not configured`, `ok`, or `failing` with its error, and when the node last asked it; read again as the menu opens |
-| Event store | `ok` with its retention (`globals.console.events`), or `failing` with why |
+| Event store | `ok` with its retention (`globals.console.events`), or `failing` with why; read again as the menu opens |
 
 ### The pipelines
 

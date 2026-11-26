@@ -30,10 +30,15 @@ export const LAG_SPAN_S = 3600;
 /** A burst of events reads their parts again once, after this. */
 export const REREAD_AFTER_MS = 1_000;
 /**
- * A pipeline's page reads the cluster again this often: a lease's renewals send no event, and
- * its end (`expires_at`) is only what the last read saw.
+ * A pipeline's page, the Cluster page and a node's page read the cluster again this often: a
+ * lease's renewals send no event, and its end (`expires_at`) is only what the last read saw.
  */
 export const CLUSTER_REREAD_MS = 5_000;
+/**
+ * While any removal is listed, the removals are read again this often (the tombstone sweep's
+ * cadence): one the next generation undoes is marked done by the sweep, with no event.
+ */
+export const REMOVALS_REREAD_MS = 30_000;
 
 export type Part =
   | 'pipelines'
@@ -135,8 +140,12 @@ export class Model {
       live.on('peer', (d) => this.peer(d as PeerMsg)),
       live.on('node', (d) => this.node(d as NodeFigures)),
     ];
+    const removals = setInterval(() => {
+      if (this.facts.removals.length > 0) void this.load(['removals']);
+    }, REMOVALS_REREAD_MS);
     return () => {
       for (const stop of stops) stop();
+      clearInterval(removals);
       clearTimeout(this.#timer);
     };
   }
@@ -198,7 +207,7 @@ export class Model {
     } else if (m.peer in this.facts.unreachable) {
       delete this.facts.unreachable[m.peer];
       // Its events of the gap aren't sent again (Admin_Console §8.1): they are read.
-      this.#reread(['events', 'pipelines', 'cluster', 'leases']);
+      this.#reread(['events', 'pipelines', 'cluster', 'leases', 'removals']);
     }
   }
 

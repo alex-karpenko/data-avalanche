@@ -21,6 +21,8 @@ export interface NodeTarget {
   snapshots: { job: string; pipeline: string }[];
   /** How many members the cluster has, it among them. */
   members: number;
+  /** The other members that can carry its pipelines: active and not suspect, by name. */
+  carriers: string[];
   /** The node the console's live updates come through. */
   via: string | null;
   drainSeconds: number | null;
@@ -38,6 +40,10 @@ export function nodeTarget(name: string, f: Facts, via: string | null): NodeTarg
       .filter((j) => j.status === 'running' && pipelines.includes(j.pipeline))
       .map((j) => ({ job: shortJob(j.job_id), pipeline: j.pipeline })),
     members: f.cluster?.members.length ?? 0,
+    carriers: (f.cluster?.members ?? [])
+      .filter((m) => m.node !== name && m.phase === 'active' && !m.suspect)
+      .map((m) => m.node)
+      .sort(),
     via,
     drainSeconds: f.cluster?.settings?.drain_timeout_seconds ?? null,
   };
@@ -46,11 +52,29 @@ export function nodeTarget(name: string, f: Facts, via: string | null): NodeTarg
 const plural = (n: number, one: string) => `${n} ${one}${n === 1 ? '' : 's'}`;
 const STAYS_UP = 'The process keeps running, out of the cluster, until it is stopped or restarted.';
 
-/** The line when the console's live updates come through the node. */
-function viaLine(t: NodeTarget): string[] {
-  return t.via === t.name
-    ? [`This console's live updates come through ${t.name}: once it goes, the page reconnects to another node on its own.`]
-    : [];
+/**
+ * The line when the console's live updates come through the node: a leave keeps its process and
+ * its HTTP server up, so the stream stays on it; after a shutdown the page reconnects through the
+ * address it was opened at.
+ */
+function viaLine(v: NodeVerb, t: NodeTarget): string[] {
+  if (t.via !== t.name) return [];
+  return v === 'leave'
+    ? [
+        `This console's live updates come through ${t.name}, which keeps answering out of the cluster: to follow the cluster, open the console through another node.`,
+      ]
+    : [
+        `This console's live updates come through ${t.name}: once it exits, the page reconnects through the address it was opened at, which reaches another node only behind a load balancer.`,
+      ];
+}
+
+/** Who carries a shut-down node's pipelines until it is back. */
+function carriersLine(t: NodeTarget): string {
+  const others = t.members - 1;
+  if (others <= 0) return 'It is the only node: nothing runs its pipelines until it is back.';
+  if (t.carriers.length >= others) return `With ${t.members} nodes, the other ${others} carry everything until it is back.`;
+  if (t.carriers.length === 0) return 'No other node can carry its pipelines now: nothing runs them until it is back.';
+  return `With ${t.members} nodes, only ${t.carriers.length} of the others can carry everything until it is back: ${t.carriers.join(', ')}.`;
 }
 
 export interface NodeAction {
@@ -72,7 +96,7 @@ export const NODE_ACTIONS: Record<NodeVerb, NodeAction> = {
     typed: false,
     lines: (t) => {
       const k = t.pipelines.length;
-      if (k === 0) return [`${t.name} holds no pipeline: it leaves the ring. ${STAYS_UP}`, ...viaLine(t)];
+      if (k === 0) return [`${t.name} holds no pipeline: it leaves the ring. ${STAYS_UP}`, ...viaLine('leave', t)];
       return [
         `${t.name} hands its ${plural(k, 'pipeline')} to the others, one at a time, and leaves the ring. ${STAYS_UP}`,
         `Its pipelines: ${t.pipelines.join(', ')}. The ring places each on another node.`,
@@ -82,7 +106,7 @@ export const NODE_ACTIONS: Record<NodeVerb, NodeAction> = {
         `Each hand-off pauses its pipeline for a while; lag rises meanwhile. It ends when every hand-off is done, or after drain_timeout${
           t.drainSeconds === null ? '' : ` (${t.drainSeconds} s)`
         } for each round.`,
-        ...viaLine(t),
+        ...viaLine('leave', t),
       ];
     },
   },
@@ -94,13 +118,10 @@ export const NODE_ACTIONS: Record<NodeVerb, NodeAction> = {
     typed: true,
     lines: (t) => {
       const k = t.pipelines.length;
-      const others = t.members - 1;
       return [
         `${t.name} leaves the cluster as a leave does${k === 0 ? '' : `, handing off its ${plural(k, 'pipeline')}`}, then exits. A supervisor such as Kubernetes starts it again, and it rejoins; without one, nothing restarts it.`,
-        others > 0
-          ? `With ${t.members} nodes, the other ${others} carry everything until it is back.`
-          : 'It is the only node: nothing runs its pipelines until it is back.',
-        ...viaLine(t),
+        carriersLine(t),
+        ...viaLine('shutdown', t),
       ];
     },
   },

@@ -1,8 +1,8 @@
 import { flushSync, mount, tick, unmount } from 'svelte';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Client } from '../lib/api';
 import { facts, iso, NOW } from '../model/fixtures';
-import { Model } from '../model/model.svelte';
+import { CLUSTER_REREAD_MS, Model } from '../model/model.svelte';
 import Cluster from './Cluster.svelte';
 import { Renewals } from './renewals.svelte';
 
@@ -12,8 +12,9 @@ afterEach(() => {
   mounted = undefined;
 });
 
+const asked: string[] = [];
 const api: Client = {
-  get: async <T,>() => ({ series: [] }) as T,
+  get: async <T,>(path: string) => (asked.push(path), (path === '/v1/cluster/status' ? facts().cluster : { series: [] }) as T),
   send: async () => {
     throw new Error('nothing is changed');
   },
@@ -85,5 +86,21 @@ describe('the Cluster page', () => {
     const t = await render({ stale: true });
     expect(text(t.querySelector('.notice'))).toMatch(/^Not current: as of \d\d:\d\d:\d\d · 34 s old$/);
     expect([...t.querySelectorAll('.tiles, section')].every((s) => s.classList.contains('stale'))).toBe(true);
+  });
+
+  it('reads the cluster again every 5 s while open: a renewal sends no event', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      await render();
+      asked.length = 0;
+      await vi.advanceTimersByTimeAsync(CLUSTER_REREAD_MS);
+      expect(asked).toEqual(['/v1/cluster/status']);
+      unmount(mounted!);
+      mounted = undefined;
+      await vi.advanceTimersByTimeAsync(3 * CLUSTER_REREAD_MS);
+      expect(asked).toEqual(['/v1/cluster/status']);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
