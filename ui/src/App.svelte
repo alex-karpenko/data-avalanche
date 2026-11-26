@@ -10,6 +10,8 @@
   import { Router } from './lib/router.svelte';
   import { awaitSession, checkSession, keepFresh, RETRY_MS, type Session } from './lib/session';
   import { Model } from './model/model.svelte';
+  import Node from './nodes/Node.svelte';
+  import { NodePage } from './nodes/page.svelte';
   import Overview from './overview/Overview.svelte';
   import { LagHistory } from './pipelines/lag.svelte';
   import List from './pipelines/List.svelte';
@@ -50,6 +52,21 @@
   /** Signed in or not: a token refresh swaps the session's object, not who is signed in. */
   const signedIn = $derived(session !== null);
   let page = $state<PipelinePage | null>(null);
+  /** The node whose page is shown: `/ui/cluster/nodes/{name}`. */
+  const nodeName = $derived(
+    router.section === 'cluster' && router.rest.length === 2 && router.rest[0] === 'nodes' ? router.rest[1] : null,
+  );
+  let nodePage = $state<NodePage | null>(null);
+  $effect(() => {
+    if (nodeName === null || !signedIn) {
+      nodePage = null;
+      return;
+    }
+    const p = new NodePage(api, nodeName);
+    nodePage = p;
+    void p.load();
+    return p.follow(live);
+  });
   $effect(() => {
     if (pageId === null || !signedIn) {
       page = null;
@@ -115,6 +132,10 @@
       <Overview {model} {now} stale={live.stale(now)} last={live.last} />
     {:else if onCluster}
       <Cluster {model} {renewals} {now} stale={live.stale(now)} last={live.last} />
+    {:else if nodePage !== null && nodePage.name === nodeName}
+      {#key nodePage}
+        <Node page={nodePage} {model} {lag} {now} stale={live.stale(now)} last={live.last} />
+      {/key}
     {:else if page !== null && page.id === pageId}
       <!-- Each pipeline's page starts clean: nothing chosen or open carries over from the last. -->
       {#key page}

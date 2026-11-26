@@ -13,7 +13,7 @@ export const AWAY_RED_AFTER_S = 3600;
 const pipelineHref = (id: string) => `/ui/pipelines/${encodeURIComponent(id)}`;
 
 /** A member's state in words: SWIM's suspicion first, then its phase. */
-function stateOf(m: { suspect: boolean; phase: string }): { label: string; tone: Tone } {
+export function stateOf(m: { suspect: boolean; phase: string }): { label: string; tone: Tone } {
   if (m.suspect) return { label: 'suspect', tone: 'orange' };
   if (m.phase === 'active') return { label: 'alive', tone: 'green' };
   return { label: m.phase === 'draining' ? 'leaving' : m.phase, tone: 'grey' };

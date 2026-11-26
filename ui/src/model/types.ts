@@ -274,3 +274,22 @@ export interface NodeFigures {
   /** The pipelines it runs. */
   pipelines: string[];
 }
+
+/** `GET /v1/nodes/{node}`: a node's detail, from the node itself. */
+export interface NodeDetail {
+  node: string;
+  api_url: string | null;
+  gossip_addr: string | null;
+  build: string | null;
+  incarnation: number | null;
+  started_at: string | null;
+  phase: string | null;
+  config_generation: number;
+  /** Its own file against its generation (keyed fingerprints). */
+  file: { hash: string | null; generation_hash: string | null; matches: boolean | null };
+  restart_pending: string[];
+  process: Process;
+  gossip: Gossip;
+  /** The pipelines whose lease it holds; `null` when the leases couldn't be read. */
+  pipelines: { id: string; owner_epoch: number; ring_owner: string | null }[] | null;
+}
