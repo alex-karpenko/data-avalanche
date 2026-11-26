@@ -5463,7 +5463,7 @@ git commit -m "test(e2e): the Cluster pages and a node's actions in a browser on
     cluster; a shutdown's reconnect goes to the address the console was opened at. The lines now
     say so (this corrects D-M16b.5's wording; the site and `Admin_Console.md` §4.4 follow).
     Whether a leave should close its live streams, so that browsers reconnect through the load
-    balancer, is a server and spec question left for Oleksii;
+    balancer, was put to Oleksii: no (2026-11-26), a leave keeps them, and the lines stand;
   - a removal ended without an event (undone by a later generation, or ended while a peer was out
     of reach) stayed listed and turned yellow after 2 min: the removals are read again when a
     peer is followed again, and every 30 s while any is listed (`REMOVALS_REREAD_MS`).
