@@ -47,7 +47,7 @@
   <div class="who">
     <span class="conn {conn}" role="status">{connection}</span>
     {#if generation !== null}<span>config gen {generation}</span>{/if}
-    <details class="menu" bind:open ontoggle={() => open && onStatus()}>
+    <details class="menu" bind:open ontoggle={(e) => e.currentTarget.open && onStatus()}>
       <summary>{session.name} <b>{session.role}</b></summary>
       {#if open}
         <div class="status">

@@ -80,6 +80,7 @@ describe('the frame', () => {
     menu!.open = true;
     menu!.dispatchEvent(new Event('toggle'));
     flushSync();
+    expect(onStatus).toHaveBeenCalledOnce();
     expect(menu?.querySelector('h3')?.textContent).toBe('Console status');
     const rows = [...(menu?.querySelectorAll('tr') ?? [])].map((r) => [...r.querySelectorAll('td')].map((d) => d.textContent?.trim()));
     expect(rows).toEqual([
