@@ -5449,3 +5449,32 @@ git commit -m "test(e2e): the Cluster pages and a node's actions in a browser on
   element (`(e) => e.currentTarget.open && onStatus()`), and the test checks the read right after
   opening, which the plan's test, counting one call over an open and a close, couldn't tell
   apart. No later task touches these files.
+- **Task 7.** The console's seven browser flows on three nodes passed (102 s): the first page
+  drawn in 207 ms, the moves 18, 13, 41, 11, 9 and 13 ms.
+- **The whole-branch review** (Opus) found no Critical issue and four Important ones, fixed in
+  one wave (`75c8a1f`) and re-reviewed:
+  - the Cluster page counted every lease down from one read, so within a lease term each healthy
+    lease read "expired": a renewal sends no event. The Cluster page and a node's page now read
+    the cluster again every 5 s (`CLUSTER_REREAD_MS`), as M16a's pipeline page does;
+  - a node's page fell back to the detail's phase once the status no longer listed the member,
+    so a node that crashed or left showed `alive`: it now says `not a member` (grey);
+  - the dialogs said the page "reconnects to another node on its own" when the console's stream
+    comes through the node acted on. A leave keeps the process and its streams up, out of the
+    cluster; a shutdown's reconnect goes to the address the console was opened at. The lines now
+    say so (this corrects D-M16b.5's wording; the site and `Admin_Console.md` §4.4 follow).
+    Whether a leave should close its live streams, so that browsers reconnect through the load
+    balancer, is a server and spec question left for Oleksii;
+  - a removal ended without an event (undone by a later generation, or ended while a peer was out
+    of reach) stayed listed and turned yellow after 2 min: the removals are read again when a
+    peer is followed again, and every 30 s while any is listed (`REMOVALS_REREAD_MS`).
+
+  And from the task reviews' minors: the Leases tile counts leases not renewed; the Members tile
+  names a joining member and isn't green then; the shutdown dialog names the members that can
+  carry the pipelines (active, not suspect) when not every other one can; the budget's move to a
+  node waits for a pipeline's link, not any row; the site names the lease column's state and its
+  row colours. D-M16b.1's reason for a route of its own ("the status, memory only") was wrong:
+  the status reads each lease from storage; the route stands, for the reason
+  `Admin_Console.md` §4.4 now gives. After the wave: 1 854 workspace tests, 212 UI tests, the
+  console's seven browser flows (the first page in 250 ms, the moves 19, 12, 16, 14, 11 and
+  28 ms).
+
