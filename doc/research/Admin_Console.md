@@ -151,29 +151,37 @@ Claude's calls (`doc/v1.1/M16b-console-cluster.md`), on mockups 03, 04 and 11:
 
 - **The server's part.** The page's tiles and texts need what the config says of the cluster
   and each member's age: `GET /v1/cluster/status` adds the cluster's `settings` and each member's
-  `started_at`. The pending removals get a route of their own (read from storage, which the
-  status never waits on).
+  `started_at`. The pending removals get a route of their own: the status is read every few
+  seconds while a page shows leases, and the tombstones, a list in storage that only the
+  Cluster page and the Overview's rule need, needn't be read with it.
 - **The Cluster page.** Tiles: members, leases, the config generation, the pipelines away from
   their owner, the cluster's settings. Members with their state (suspect stays in the ring;
   leaving while draining; out of the console's reach for how long), address, version,
   generation, pipelines held, slowest lease renewal in the last hour, and age. The pipelines
   away from their owner, while any: why comes from the hour's `lease.lost`/`lease.takeover`
   events, and when it goes back from `rebalance_stabilization` and `max_concurrent_handoffs`;
-  red with no hand-off in the hour, or away over an hour. Every lease, the unheld first. The
-  pending removals, while any.
-- **A node's page.** Its header from its own detail, else the status; its pipelines with their
+  red with no hand-off in the hour, or away over an hour. Every lease, the unheld first, each
+  row toned by its state. The pending removals, while any, read again every 30 s until done (a
+  removal can end without an event). The page reads the cluster again every 5 s: a renewal
+  sends no event, and a lease's end is only what the last read saw.
+- **A node's page.** Its header from its own detail, else the status, and "not a member" once
+  the status no longer lists it; its pipelines with their
   lag; its lease renewal, memory and CPU over 6 hours; its activity; its gossip. Each part is
   read from the node through whichever node serves the page, and keeps what it had when a read
   fails.
 - **Node actions.** Leave and Shut down, an admin's. The leave dialog lists what the node holds
   and says the ring places each pipeline (the console can't know where before it happens); a
   shutdown is confirmed by the node's name typed (§5's second confirmation: the console can't
-  bring a node back); when the console's stream comes through that node, the dialog says the
-  page will reconnect elsewhere. There is no in-place restart.
+  bring a node back); when the console's stream comes through that node, the dialog says what
+  follows: a leave keeps that node answering, out of the cluster, so the console stays there
+  until opened through another node; after a shutdown the page reconnects through the address
+  it was opened at, which reaches another node only behind a load balancer. There is no
+  in-place restart.
 - **The console's status** (user menu, §7): live updates and through which node, the nodes the
   console follows, the built-in history's retention and last sample, Prometheus (`not
   configured`, `ok`, or `failing` with its error and when the node last asked it: the node keeps
-  only its last read's outcome, so not "since when"), and the event store.
+  only its last read's outcome, so not "since when"), and the event store; opening the menu reads
+  Prometheus's state and the events again.
 - **Where the mockups and the server differ.** A lease shows when it *expires*, not when it
   renews; the renewal column is the hour's slowest, not a p99 (the history keeps each step's
   maximum); the node header has no pod name or incarnation, which the API doesn't have as such.
