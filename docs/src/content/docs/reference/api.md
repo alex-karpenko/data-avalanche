@@ -26,7 +26,7 @@ Pipelines: their state, and the lifecycle commands.
 
 ### `GET /v1/pipelines`
 
-Every pipeline: its desired and actual states and its holder
+Every pipeline: its desired and actual states, its holder, and its source and sink
 
 Least role: `viewer`.
 

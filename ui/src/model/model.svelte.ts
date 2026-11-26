@@ -1,9 +1,10 @@
-// The Overview's data (Admin_Console §8): read at once, each part within its own time limit, then
-// kept current by the live stream. A part that can't be read keeps what it last had and says why.
+// What every page knows of the cluster (Admin_Console §8): read at once, each part within its own
+// time limit, then kept current by the live stream. A part that can't be read keeps what it last
+// had and says why. One for the app: moving between pages reads nothing again.
 
 import type { Client } from '../lib/api';
 import type { Live } from '../lib/live.svelte';
-import { LEASE_LOSS_WITHIN_S } from './attention';
+import { LEASE_LOSS_WITHIN_S } from '../overview/attention';
 import { empty, type Facts } from './facts';
 import type {
   Actual,
@@ -25,6 +26,11 @@ export const EVENTS_READ = 100;
 export const LAG_SPAN_S = 3600;
 /** A burst of events reads their parts again once, after this. */
 export const REREAD_AFTER_MS = 1_000;
+/**
+ * A pipeline's page reads the cluster again this often: a lease's renewals send no event, and
+ * its end (`expires_at`) is only what the last read saw.
+ */
+export const CLUSTER_REREAD_MS = 5_000;
 
 export type Part =
   | 'pipelines'
@@ -78,7 +84,7 @@ function partsOf(kind: string): Part[] {
   return [];
 }
 
-export class Overview {
+export class Model {
   facts = $state<Facts>(empty());
   read = $state<Record<Part, Read>>(
     Object.fromEntries(PARTS.map((p) => [p, { at: null, error: null }])) as Record<Part, Read>,

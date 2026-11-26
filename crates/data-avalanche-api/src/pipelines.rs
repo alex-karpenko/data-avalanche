@@ -129,6 +129,8 @@ pub(crate) fn liveness(members: &Members, lease: &LeaseDoc) -> Liveness {
     }
 }
 
+/// A pipeline as the list shows it: its states, its holder, and where it reads and writes (the
+/// console's list names them, Admin_Console §4).
 fn summary(p: &Pipeline, r: &Read, members: &Members) -> Value {
     let (actual, _) = actual(r.lease.as_ref(), r.status.as_ref());
     let held = r.lease.as_ref().filter(|l| !l.released);
@@ -139,6 +141,13 @@ fn summary(p: &Pipeline, r: &Read, members: &Members) -> Value {
         "actual_state": actual,
         "holder": held.map(|l| l.holder_node_id.clone()),
         "holder_stale": held.map(|l| liveness(members, l) == Liveness::Stale),
+        "source": {
+            "type": p.source.kind.as_str(),
+            "host": p.source.host,
+            "port": p.source.port,
+            "db": p.source.db,
+        },
+        "sink": { "type": p.sink.kind.as_str(), "bucket": p.sink.bucket, "prefix": p.sink.prefix },
     })
 }
 
@@ -213,14 +222,6 @@ pub(crate) async fn get(State(api): State<Api>, Path(id): Path<String>) -> Respo
     let (actual, status) = actual(r.lease.as_ref(), r.status.as_ref());
     let members = node.members.borrow().clone();
     let mut v = summary(&p, &r, &members);
-    v["source"] = json!({
-        "type": p.source.kind.as_str(),
-        "host": p.source.host,
-        "port": p.source.port,
-        "db": p.source.db,
-    });
-    v["sink"] =
-        json!({ "type": p.sink.kind.as_str(), "bucket": p.sink.bucket, "prefix": p.sink.prefix });
     v["actual_state"] = json!(actual);
     v["error"] = json!(status.and_then(|s| s.error.clone()));
     v["code"] = json!(status.and_then(|s| s.code.clone()));
@@ -674,6 +675,8 @@ mod tests {
             json!({ "pipelines": [{
                 "id": "orders", "name": "orders", "desired_state": "running",
                 "actual_state": "paused", "holder": "node-b", "holder_stale": true,
+                "source": { "type": "postgres", "host": "db.example.com", "port": 5432, "db": "shop" },
+                "sink": { "type": "delta", "bucket": "lake", "prefix": "shop" },
             }] })
         );
     }

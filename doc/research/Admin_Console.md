@@ -125,6 +125,25 @@ small text, stacked when close; hovering a line or label highlights the event in
 list and the reverse; a crosshair with the time and value at the pointer. Colour is never the only
 signal: states also carry a label or icon.
 
+### 4.3 Pipelines as built (M16a)
+
+Oleksii decided two things on 2026-11-25: M16 is built as four milestones (M16a the shared pieces
+and Pipelines, M16b Cluster and nodes, M16c Tables and Snapshots, M16d Events and Config), and
+**uPlot** draws the time series. The rest is Claude's call (`doc/v1.1/M16a-console-pipelines.md`).
+
+- **Charts.** uPlot draws the line, the axes and the crosshair, loaded with the first chart in a
+  file of its own; the page draws the target dashed and each event as a dotted line, its label a
+  button above the plot, stacked on up to three lines. Hovering a label, or the plot within 4 px
+  of a line, highlights the event in the page's list, and the reverse. Lag lines cover 6 hours at
+  a minute a point.
+- **Lists.** A list's filters and sort live in its address, changed in place, so Back leaves the
+  list and comes back to it as it was; an unknown value is the default view.
+- **Where the mockups and the server differ.** A pipeline never has a change waiting for its
+  restart (a reload restarts it, config §12.4; only `globals` fields wait for a node's restart),
+  so the Pipelines pages show no "restart pending"; the lease's header says when it expires (the
+  cluster status gives `expires_at`), not when it renews; a restart's dialog says it drops what
+  isn't committed and reads it again, as the API's restart does, rather than "flushes".
+
 ## 5. Actions
 
 Every action opens one dialog: what it does, to what, and its effect (for example: "The pipeline

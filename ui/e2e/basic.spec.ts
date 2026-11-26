@@ -13,7 +13,7 @@ test('a page asked for without a session goes to the sign-in, then back to it', 
   await signIn(page, user, password);
   await expect(page).toHaveURL(/\/ui\/pipelines$/);
   await expect(page.locator('nav [aria-current="page"]')).toHaveText('Pipelines');
-  await expect(page.locator('main')).toContainText("This page isn't in this build yet.");
+  await expect(page.locator('h2')).toHaveText('Pipelines');
   await page.click('nav >> text=Overview');
   await expect(page).toHaveURL(/\/ui\/$/);
   await overview(page, user, 'admin');

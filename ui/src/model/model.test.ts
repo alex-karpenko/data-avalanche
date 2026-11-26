@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { HttpError, type Client } from '../lib/api';
 import { event, facts, figures, iso, NOW } from './fixtures';
-import { Overview, REREAD_AFTER_MS } from './model.svelte';
+import { Model, REREAD_AFTER_MS } from './model.svelte';
 
 /** A `Client` answering each path from `answers`; a path not there fails. */
 function api(answers: Record<string, unknown>): Client & { asked: string[] } {
@@ -14,7 +14,7 @@ function api(answers: Record<string, unknown>): Client & { asked: string[] } {
       return answers[path] as T;
     },
     send: async () => {
-      throw new Error('the Overview changes nothing');
+      throw new Error('the model changes nothing');
     },
   };
 }
@@ -43,7 +43,7 @@ const READS = {
   },
 };
 
-describe("the Overview's data", () => {
+describe("the console's model", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.setSystemTime(NOW);
@@ -51,7 +51,7 @@ describe("the Overview's data", () => {
   afterEach(() => vi.useRealTimers());
 
   it('is read part by part; a part that fails keeps what it had and says why', async () => {
-    const o = new Overview(api(READS));
+    const o = new Model(api(READS));
     await o.load();
     expect(o.facts.pipelines.map((p) => p.id)).toEqual(['orders-pg', 'billing-mysql', 'inventory', 'customers']);
     expect(o.facts.actions.customers.kind).toBe('action.pipeline.resume');
@@ -59,7 +59,7 @@ describe("the Overview's data", () => {
     expect(o.facts.lag['orders-pg']).toEqual([[NOW / 1000, 21]]);
     expect(Object.values(o.read).every((r) => r.at === NOW && r.error === null)).toBe(true);
     const { '/v1/snapshots': _, ...without } = READS;
-    const later = new Overview(api(without));
+    const later = new Model(api(without));
     later.facts.jobs = facts().jobs;
     await later.load();
     expect(later.read.jobs).toEqual({ at: null, error: '/v1/snapshots is unavailable' });
@@ -68,7 +68,7 @@ describe("the Overview's data", () => {
   });
 
   it("follows the stream: the newest owner's figures, a state, the lag's last hour", () => {
-    const o = new Overview(api({}));
+    const o = new Model(api({}));
     o.facts = facts();
     o.figures(figures({ id: 'billing-mysql', node: 'n2', owner_epoch: 2, worker: { lag_seconds: 1, degraded: null } }));
     expect(o.facts.figures['billing-mysql'].node).toBe('n1');
@@ -89,7 +89,7 @@ describe("the Overview's data", () => {
 
   it('reads the gap when a node is followed again, and forgets a node gone from the cluster', async () => {
     const client = api(READS);
-    const o = new Overview(client);
+    const o = new Model(client);
     o.facts = facts();
     o.peer({ peer: 'n3', state: 'following' });
     await vi.advanceTimersByTimeAsync(REREAD_AFTER_MS);
@@ -111,7 +111,7 @@ describe("the Overview's data", () => {
   });
 
   it('keeps only accepted pauses, stops and resumes, read or streamed', () => {
-    const o = new Overview(api({}));
+    const o = new Model(api({}));
     o.facts = facts();
     const before = o.facts.actions.inventory;
     o.event(event({ key: 'refused', kind: 'action.pipeline.resume', at: iso(NOW), pipeline: 'inventory', severity: 'warning', outcome: 'refused', actor: { name: 'ci-bot', role: 'operator' } }));
@@ -122,7 +122,7 @@ describe("the Overview's data", () => {
   });
 
   it("forgets a removed pipeline's figures, lag, actions and lease", async () => {
-    const o = new Overview(api({ '/v1/pipelines': { pipelines: facts().pipelines.filter((p) => p.id !== 'orders-pg') } }));
+    const o = new Model(api({ '/v1/pipelines': { pipelines: facts().pipelines.filter((p) => p.id !== 'orders-pg') } }));
     o.facts = facts();
     o.facts.actions['orders-pg'] = o.facts.actions.inventory;
     o.facts.unheld = { 'orders-pg': NOW, customers: NOW };
@@ -135,7 +135,7 @@ describe("the Overview's data", () => {
 
   it("keeps the hour's lease losses: a streamed one joins them once", async () => {
     const client = api(READS);
-    const o = new Overview(client);
+    const o = new Model(client);
     o.facts = facts();
     const lost = event({ kind: 'lease.lost', at: iso(NOW), pipeline: 'customers', text: 'n1 lost the lease of customers' });
     o.event(lost);
@@ -151,7 +151,7 @@ describe("the Overview's data", () => {
   it('remembers since when a lease has had no holder, until one holds it', async () => {
     const status = structuredClone(facts().cluster!);
     status.pipelines[3].holder = null;
-    const o = new Overview(api({ '/v1/cluster/status': status }));
+    const o = new Model(api({ '/v1/cluster/status': status }));
     await o.load(['cluster']);
     expect(o.facts.unheld).toEqual({ customers: NOW });
     vi.setSystemTime(NOW + 20_000);
@@ -165,7 +165,7 @@ describe("the Overview's data", () => {
 
   it('lists an event once, and reads again what it changed, a burst at once', async () => {
     const client = api(READS);
-    const o = new Overview(client);
+    const o = new Model(client);
     o.facts = facts();
     const paused = event({ kind: 'action.pipeline.pause', at: iso(NOW), pipeline: 'customers', actor: { name: 'ci-bot', role: 'operator' }, outcome: 'accepted' });
     o.event(paused);

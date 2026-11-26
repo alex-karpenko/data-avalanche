@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { attention, LAG_TARGET_S } from './attention';
-import { event, facts, figures, iso, NOW } from './fixtures';
+import { event, facts, figures, iso, NOW } from '../model/fixtures';
 
 const MIN = 60_000;
 const GIB = 1024 ** 3;

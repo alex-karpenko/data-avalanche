@@ -372,7 +372,7 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
                 "GET",
                 "/v1/pipelines",
                 Viewer,
-                "Every pipeline: its desired and actual states and its holder",
+                "Every pipeline: its desired and actual states, its holder, and its source and sink",
                 &[(200, "the pipelines")],
             ),
             get(pipelines::list),

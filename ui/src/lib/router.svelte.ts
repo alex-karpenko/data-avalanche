@@ -23,6 +23,18 @@ export function sectionOf(path: string): Section {
   return SECTIONS.find((s) => s.id === first)?.id ?? 'overview';
 }
 
+/** The names after a page's section, decoded: `['orders-pg']` for `/ui/pipelines/orders-pg`. */
+export function restOf(path: string): string[] {
+  const names = path.split(/[?#]/)[0].replace(/^\/ui\/?/, '').split('/').filter((n) => n !== '');
+  return names.slice(1).map((n) => {
+    try {
+      return decodeURIComponent(n);
+    } catch {
+      return n;
+    }
+  });
+}
+
 /** Whether a click on `a` is the app's to handle: a plain left click on one of its pages. */
 export function isAppLink(a: HTMLAnchorElement, e: MouseEvent): boolean {
   if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) {
@@ -37,6 +49,10 @@ export function isAppLink(a: HTMLAnchorElement, e: MouseEvent): boolean {
 export class Router {
   path = $state(location.pathname + location.search);
   section = $derived(sectionOf(this.path));
+  /** The names after the section: an object's page. */
+  rest = $derived(restOf(this.path));
+  /** The address's query: a list's filters and sort. */
+  query = $derived(new URLSearchParams(this.path.split('?')[1] ?? ''));
 
   /** Follows the app's links, and Back and Forward; returns the way to stop. */
   listen(): () => void {
@@ -60,5 +76,12 @@ export class Router {
     history.pushState(null, '', to);
     this.path = to;
     window.scrollTo(0, 0);
+  }
+
+  /** Changes the address in place (a list's filters): Back goes to the page before the list. */
+  replace(to: string): void {
+    if (to === this.path) return;
+    history.replaceState(null, '', to);
+    this.path = to;
   }
 }

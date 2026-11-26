@@ -1,14 +1,18 @@
 <script lang="ts">
   // The console's app: who is signed in, the live stream, and the page the address names.
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import Frame from './Frame.svelte';
   import Later from './Later.svelte';
   import { client } from './lib/api';
   import { Live } from './lib/live.svelte';
   import { Router } from './lib/router.svelte';
   import { awaitSession, checkSession, keepFresh, RETRY_MS, type Session } from './lib/session';
-  import { Overview as OverviewModel } from './overview/model.svelte';
+  import { Model } from './model/model.svelte';
   import Overview from './overview/Overview.svelte';
+  import { LagHistory } from './pipelines/lag.svelte';
+  import List from './pipelines/List.svelte';
+  import { PipelinePage } from './pipelines/page.svelte';
+  import Pipeline from './pipelines/Pipeline.svelte';
 
   // The server says why the session ended: its 401 or 403 page, or the sign-in.
   const ended = () => location.reload();
@@ -25,7 +29,25 @@
     open: (url) => new EventSource(url),
     check: () => checkSession({ fetch, ended }),
   });
-  const overview = new OverviewModel(api);
+  const model = new Model(api);
+  /** Every pipeline's lag over 6 hours, read when the list is first shown. */
+  const lag = new LagHistory(api);
+  /** The pipeline whose page is shown; its page reads and follows it while shown. */
+  const pageId = $derived(router.section === 'pipelines' && router.rest.length === 1 ? router.rest[0] : null);
+  /** Signed in or not: a token refresh swaps the session's object, not who is signed in. */
+  const signedIn = $derived(session !== null);
+  let page = $state<PipelinePage | null>(null);
+  $effect(() => {
+    if (pageId === null || !signedIn) {
+      page = null;
+      return;
+    }
+    // What the stream sent already is drawn at once (Admin_Console §8: now first).
+    const p = new PipelinePage(api, pageId, untrack(() => model.facts.figures[pageId] ?? null));
+    page = p;
+    void p.load();
+    return p.follow(live);
+  });
 
   async function readGeneration() {
     try {
@@ -42,7 +64,8 @@
       live.on('event', (e) => {
         if ((e as { kind?: string }).kind === 'config.published') void readGeneration();
       }),
-      overview.follow(live),
+      model.follow(live),
+      lag.follow(live),
     ];
     const read = (s: Session) => {
       session = s;
@@ -50,7 +73,7 @@
       stops.push(keepFresh(s, { fetch, ended }, (next) => (session = next)));
       live.start();
       void readGeneration();
-      void overview.load();
+      void model.load();
     };
     stops.push(awaitSession({ fetch, ended }, read, (why) => (unread = why)));
     const tick = setInterval(() => {
@@ -76,7 +99,33 @@
     onRetry={() => live.retry()}
   >
     {#if router.section === 'overview'}
-      <Overview model={overview} {now} stale={live.stale(now)} last={live.last} />
+      <Overview {model} {now} stale={live.stale(now)} last={live.last} />
+    {:else if page !== null && page.id === pageId}
+      <!-- Each pipeline's page starts clean: nothing chosen or open carries over from the last. -->
+      {#key page}
+        <Pipeline
+          {page}
+          {model}
+          {session}
+          {api}
+          {now}
+          stale={live.stale(now)}
+          last={live.last}
+          offline={live.state === 'offline'}
+        />
+      {/key}
+    {:else if router.section === 'pipelines' && router.rest.length === 0}
+      <List
+        {model}
+        {lag}
+        {session}
+        {api}
+        {router}
+        {now}
+        stale={live.stale(now)}
+        last={live.last}
+        offline={live.state === 'offline'}
+      />
     {:else}
       <Later section={router.section} />
     {/if}

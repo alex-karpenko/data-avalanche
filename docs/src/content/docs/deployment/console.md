@@ -29,8 +29,8 @@ cookies are `Secure`, which browsers send over plain HTTP only to `localhost`.
 ## What it shows
 
 Every page has the same top bar: the sections, the live connection's state, the cluster's config
-generation, and who is signed in, with their role and the sign-out. This release has the
-**Overview**; the other sections say they aren't in this build yet.
+generation, and who is signed in, with their role and the sign-out. This build has the
+**Overview** and the **Pipelines**; the other sections say they aren't in this build yet.
 
 The page shows the cluster as it is when it opens, then follows the cluster's live updates
 (`GET /v1/stream`) through whichever node served it, so it changes as things happen without a
@@ -59,6 +59,51 @@ page; a later release makes them configurable):
 
 A node the console can't follow shows its pipelines as last known, marked with how long it has been
 out of reach.
+
+### The pipelines
+
+**Pipelines** lists every pipeline, the worst first: its state, source and sink, the node that runs
+it (`away` when that isn't its owner on the ring, after a failover), its lag over 6 hours against
+the 60 s target, its changes a minute, its last commit, its tables (how many are halted), and its
+snapshot (the running job's progress and ETA, else the last job's outcome). The filters (by state,
+node, source and name) and the sort (a column's heading) are kept in the page's address, so a link
+shows the same view and Back returns to it. A click anywhere on a row opens it; ↑ and ↓ move
+between rows and Enter opens one.
+
+A pipeline's page has its source and sink, its node and lease, its lag over 6 hours with the
+events that marked it (actions, halts, failovers, snapshot jobs) drawn on the chart, its tables
+with their changes, Delta version, files rewritten by the last MERGE and last schema change, what
+its source keeps for it (PostgreSQL's slot, the WAL it holds against `max_slot_wal_keep_size`, the
+confirmed LSN and the publication; MySQL's position, how long the server keeps binlogs, and how far
+behind the stream reads), its snapshot jobs, and what happened to it. Hovering an event on the
+chart highlights it in the list below, and the reverse.
+
+Every part of the page says how old its data is. A part that couldn't be read keeps what it had and
+says so with its age (`Couldn't be read; showing what was last read: its snapshot jobs (HTTP 503),
+last read 20 min ago`, or `…, never read`), on the list as on a pipeline's page, the source's panel
+says when it was read (`read 40 s ago`), and while the live connection is stale every panel is
+dimmed and the banner says for how long (`Not current: as of 14:02:00 · 34 s old`, or `Not current:
+no live update yet` before the first message). The lease line counts down to the lease's end
+(`expires in 8 s`) and says `expired 3 s ago` when the end has passed without a renewal, and `lease
+released` once its holder let go; a pipeline's page reads the cluster again every 5 s while it is
+shown.
+
+### Acting on pipelines
+
+An `operator` or an `admin` sees the actions a pipeline's state takes: flush (of a running pipeline:
+a paused one was flushed by its pause), pause, resume, restart, stop, and a snapshot of chosen tables (truncated first, or not). Each opens a dialog that
+says what it does and to what, takes an optional note (up to 500 characters), and shows the line
+it will be recorded as: `restarted by Oleksii (operator)`. The server checks the role again and
+records the action, with the note, in the cluster's events, whatever the page shows. A `viewer`
+sees no actions.
+
+On **Pipelines**, select several to act on them together: the dialog names each one and its node,
+and those the action doesn't apply to (a paused pipeline isn't restarted). They are asked one at a
+time, in order; a failure stops the rest, and the dialog says which failed, why, and which weren't
+asked. While the page is offline, actions wait.
+
+An action on the list reaches only the selected pipelines the filters show. Those a filter hides
+stay ticked and come back, selected, when the filter is cleared.
 
 ## Signing in
 
