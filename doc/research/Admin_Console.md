@@ -1,5 +1,5 @@
 ---
-updated: 2026-11-25
+updated: 2026-11-26
 domain: Architecture
 tags: [admin-console, web-ui, management-api, auth, sessions, audit, metrics-history, prometheus, v1.1]
 ---
@@ -112,8 +112,9 @@ live stream (Oleksii, 2026-11-25):
 | sink commit failures | the worker reports itself degraded |
 | a node down | SWIM marks it suspect; a node the console's stream can't follow is orange |
 
-A pending removal (tombstone) isn't in M15's list: the API doesn't expose `removals/`, so the
-rule waits on that (DA-API-21). **Later release:** the thresholds become configurable (Oleksii,
+A pending removal (tombstone) wasn't in M15's list: the API didn't expose `removals/` (DA-API-21).
+M16b adds `GET /v1/cluster/removals` and the rule: a removal pending over 2 min is yellow (past
+one 30 s round of every node's tombstone check and a teardown), linking the Cluster page. **Later release:** the thresholds become configurable (Oleksii,
 2026-11-25; DA-OPS-15); until then they are the defaults above.
 
 ### 4.2 Charts
@@ -143,6 +144,39 @@ and Pipelines, M16b Cluster and nodes, M16c Tables and Snapshots, M16d Events an
   so the Pipelines pages show no "restart pending"; the lease's header says when it expires (the
   cluster status gives `expires_at`), not when it renews; a restart's dialog says it drops what
   isn't committed and reads it again, as the API's restart does, rather than "flushes".
+
+### 4.4 The Cluster as M16b builds it
+
+Claude's calls (`doc/v1.1/M16b-console-cluster.md`), on mockups 03, 04 and 11:
+
+- **The server's part.** The page's tiles and texts need what the config says of the cluster
+  and each member's age: `GET /v1/cluster/status` adds the cluster's `settings` and each member's
+  `started_at`. The pending removals get a route of their own (read from storage, which the
+  status never waits on).
+- **The Cluster page.** Tiles: members, leases, the config generation, the pipelines away from
+  their owner, the cluster's settings. Members with their state (suspect stays in the ring;
+  leaving while draining; out of the console's reach for how long), address, version,
+  generation, pipelines held, slowest lease renewal in the last hour, and age. The pipelines
+  away from their owner, while any: why comes from the hour's `lease.lost`/`lease.takeover`
+  events, and when it goes back from `rebalance_stabilization` and `max_concurrent_handoffs`;
+  red with no hand-off in the hour, or away over an hour. Every lease, the unheld first. The
+  pending removals, while any.
+- **A node's page.** Its header from its own detail, else the status; its pipelines with their
+  lag; its lease renewal, memory and CPU over 6 hours; its activity; its gossip. Each part is
+  read from the node through whichever node serves the page, and keeps what it had when a read
+  fails.
+- **Node actions.** Leave and Shut down, an admin's. The leave dialog lists what the node holds
+  and says the ring places each pipeline (the console can't know where before it happens); a
+  shutdown is confirmed by the node's name typed (§5's second confirmation: the console can't
+  bring a node back); when the console's stream comes through that node, the dialog says the
+  page will reconnect elsewhere. There is no in-place restart.
+- **The console's status** (user menu, §7): live updates and through which node, the nodes the
+  console follows, the built-in history's retention and last sample, Prometheus (`not
+  configured`, `ok`, or `failing` with its error and when the node last asked it: the node keeps
+  only its last read's outcome, so not "since when"), and the event store.
+- **Where the mockups and the server differ.** A lease shows when it *expires*, not when it
+  renews; the renewal column is the hour's slowest, not a p99 (the history keeps each step's
+  maximum); the node header has no pod name or incarnation, which the API doesn't have as such.
 
 ## 5. Actions
 
