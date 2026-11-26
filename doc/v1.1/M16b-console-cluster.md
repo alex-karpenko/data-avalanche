@@ -5441,3 +5441,11 @@ git commit -m "test(e2e): the Cluster pages and a node's actions in a browser on
   orange away from its owner, red with no holder or not renewing), on the page's existing
   `tr.<tone>` rules; the page test checks the away row is orange and a held one isn't. No later
   task touches these files.
+- **Task 6, `ui/src/{Frame.svelte,Frame.test.ts}` (fix commit after the task's own).** The task
+  review asked whether `bind:open` updates before the menu's toggle handler runs; it doesn't:
+  Svelte attaches the handler first (`$.event`, then `$.bind_property`, both `addEventListener`
+  at once), so the plan's handler (`() => open && onStatus()`) read the old value, and the menu
+  read the status again as it closed, not as it opened (D-M16b.6). The handler now reads the
+  element (`(e) => e.currentTarget.open && onStatus()`), and the test checks the read right after
+  opening, which the plan's test, counting one call over an open and a close, couldn't tell
+  apart. No later task touches these files.
