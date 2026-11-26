@@ -54,7 +54,7 @@ use data_avalanche_cluster::{
     WorkerFactory,
 };
 use data_avalanche_config::Role;
-use data_avalanche_state::{Charts, Events, Leases};
+use data_avalanche_state::{Charts, Events, Leases, Removals};
 use data_avalanche_telemetry::{CONTENT_TYPE, Metrics, ProcessFigures};
 use serde_json::{Value, json};
 use tokio::sync::watch;
@@ -115,6 +115,9 @@ pub struct Node {
     pub docs: Arc<DocsFn>,
     /// The leases in `globals.state`: who holds each pipeline.
     pub leases: Leases,
+    /// The removal tombstones (Configuration §12.3), the pending ones read for the console
+    /// (DA-API-21).
+    pub removals: Removals,
     /// The node's leave and shutdown.
     pub control: Control,
     /// The posted-body validates' limit ([`RateLimit::validate`], DA-API-20).
@@ -362,10 +365,20 @@ fn v1() -> Vec<(Route, MethodRouter<Api>)> {
                 "The members this node sees, and each pipeline's lease holder",
                 &[(
                     200,
-                    "the members and the holders; a member's `file_hash` is its file's keyed fingerprint (first 16 hex), comparable across nodes of one cluster only",
+                    "the members and the holders, and the cluster's settings a console states (`settings`: its tokens, lock, lease and hand-off settings and the history's and the events' retention); a member's `file_hash` is its file's keyed fingerprint (first 16 hex), comparable across nodes of one cluster only",
                 )],
             ),
             get(cluster::status),
+        ),
+        (
+            r(
+                "GET",
+                "/v1/cluster/removals",
+                Viewer,
+                "The pipeline removals not torn down yet, oldest first: each one's id, the last generation that had it, and when it was removed",
+                &[(200, "the pending removals")],
+            ),
+            get(cluster::removals),
         ),
         (
             r(
@@ -1067,6 +1080,7 @@ mod tests {
                 ("GET", "/v1/config/generations", Viewer),
                 ("GET", "/v1/config/generations/{generation}", Viewer),
                 ("GET", "/v1/cluster/status", Viewer),
+                ("GET", "/v1/cluster/removals", Viewer),
                 ("GET", "/v1/pipelines", Viewer),
                 ("GET", "/v1/pipelines/{id}", Viewer),
                 ("GET", "/v1/pipelines/{id}/live", Viewer),

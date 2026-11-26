@@ -243,6 +243,9 @@ pub(crate) struct Lone {
     pub events: Arc<Events>,
     /// The leases the node reads: a test takes them as another node would.
     pub leases: Leases,
+    /// The removal tombstones the node's coordinator records: a test records them as a reload
+    /// would.
+    pub removals: Removals,
     /// What the API asked of the node.
     pub stops: tokio::sync::watch::Receiver<Stop>,
     pub _reconciler: ClusterReconciler,
@@ -344,7 +347,7 @@ pub(crate) async fn lone_with(file: PathBuf, text: &str, env: Arc<dyn Env + Send
         first.pointer,
         CoordinatorDeps {
             generations,
-            removals,
+            removals: removals.clone(),
             env,
             key,
             node_id: "node-a".into(),
@@ -373,6 +376,7 @@ pub(crate) async fn lone_with(file: PathBuf, text: &str, env: Arc<dyn Env + Send
                 Ok(PipelineDocs::new(DocStore::new(Arc::new(store))))
             }),
             leases: leases.clone(),
+            removals: removals.clone(),
             control,
             validates: Arc::new(crate::RateLimit::validate()),
             recorder,
@@ -391,6 +395,7 @@ pub(crate) async fn lone_with(file: PathBuf, text: &str, env: Arc<dyn Env + Send
         },
         events,
         leases,
+        removals,
         stops,
         _reconciler: reconciler,
         _gossip: gossip,
