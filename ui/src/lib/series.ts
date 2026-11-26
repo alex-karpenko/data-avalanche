@@ -71,6 +71,7 @@ export function compact(n: number): string {
 export function formatValue(unit: Unit, v: number): string {
   switch (unit) {
     case 'seconds':
+      if (v > 0 && v < 1) return `${Math.round(v * 1000)} ms`;
       return v < 120 ? `${Math.round(v)} s` : duration(v);
     case 'bytes':
       return bytes(v);

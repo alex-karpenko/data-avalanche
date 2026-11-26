@@ -19,6 +19,7 @@
   import { rows, tiles } from './derive';
   import { EVENTS_SHOWN, PART_NAMES, PARTS, type Model } from '../model/model.svelte';
   import Sparkline from './Sparkline.svelte';
+  import Tiles from '../lib/Tiles.svelte';
 
   interface Props {
     model: Model;
@@ -45,15 +46,7 @@
   <p class="notice failing" role="alert">{failing}</p>
 {/if}
 
-<div class="tiles" class:stale>
-  {#each shown as t (t.key)}
-    <div class="tile {t.tone}">
-      <div class="k">{t.key}</div>
-      <div class="v">{t.value}</div>
-      <div class="s">{t.detail}</div>
-    </div>
-  {/each}
-</div>
+<Tiles tiles={shown} {stale} />
 
 <h3>Needs attention · {list.length}</h3>
 {#if list.length === 0}
@@ -139,37 +132,6 @@
   }
   .stale {
     opacity: 0.55;
-  }
-  .tiles {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-    gap: 10px;
-  }
-  .tile {
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 10px;
-    background: var(--bg-panel);
-  }
-  .k {
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: var(--text-2);
-  }
-  .v {
-    font-size: 22px;
-    font-weight: 600;
-  }
-  .s {
-    font-size: 11px;
-    color: var(--text-2);
-  }
-  .tile.orange .v {
-    color: var(--orange);
-  }
-  .tile.red .v {
-    color: var(--red);
   }
   .att,
   .ev {

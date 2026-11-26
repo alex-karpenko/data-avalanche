@@ -1,6 +1,8 @@
 <script lang="ts">
   // The console's app: who is signed in, the live stream, and the page the address names.
   import { onMount, untrack } from 'svelte';
+  import Cluster from './cluster/Cluster.svelte';
+  import { Renewals } from './cluster/renewals.svelte';
   import Frame from './Frame.svelte';
   import Later from './Later.svelte';
   import { client } from './lib/api';
@@ -32,6 +34,17 @@
   const model = new Model(api);
   /** Every pipeline's lag over 6 hours, read when the list is first shown. */
   const lag = new LagHistory(api);
+  /** Each member's lease renewals over the last hour, read each time the Cluster page is shown. */
+  const renewals = new Renewals(api);
+  const onCluster = $derived(router.section === 'cluster' && router.rest.length === 0);
+  /** The members' names: read again when they change, not at each read of the cluster. */
+  const memberNames = $derived((model.facts.cluster?.members ?? []).map((m) => m.node).join('\n'));
+  $effect(() => {
+    if (!onCluster || !signedIn || memberNames === '') return;
+    const names = memberNames.split('\n');
+    // The read follows the members, not the renewals it writes.
+    untrack(() => void renewals.load(names));
+  });
   /** The pipeline whose page is shown; its page reads and follows it while shown. */
   const pageId = $derived(router.section === 'pipelines' && router.rest.length === 1 ? router.rest[0] : null);
   /** Signed in or not: a token refresh swaps the session's object, not who is signed in. */
@@ -100,6 +113,8 @@
   >
     {#if router.section === 'overview'}
       <Overview {model} {now} stale={live.stale(now)} last={live.last} />
+    {:else if onCluster}
+      <Cluster {model} {renewals} {now} stale={live.stale(now)} last={live.last} />
     {:else if page !== null && page.id === pageId}
       <!-- Each pipeline's page starts clean: nothing chosen or open carries over from the last. -->
       {#key page}

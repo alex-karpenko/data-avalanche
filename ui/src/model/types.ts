@@ -41,6 +41,8 @@ export interface Member {
   config_generation: number | null;
   build?: string;
   api_url?: string | null;
+  /** When its process started (RFC 3339). */
+  started_at?: string | null;
 }
 
 /** The cluster's settings a console states (`GET /v1/cluster/status`'s `settings`). */
@@ -205,6 +207,7 @@ export interface EventItem {
 export interface Series {
   name: string;
   pipeline?: string;
+  node?: string;
   points: [number, number][];
 }
 

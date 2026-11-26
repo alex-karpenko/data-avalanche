@@ -130,6 +130,8 @@ export function facts(): Facts {
         config_generation: 42,
         build: '1.1.0',
         api_url: `https://10.0.1.1${i + 1}:8080`,
+        // n3 restarted two hours ago; the others have been up three days.
+        started_at: iso(node === 'n3' ? NOW - 2 * 60 * MIN : NOW - 3 * 24 * 60 * MIN),
       })),
       pipelines: [
         // Held by n2 away from its ring owner, since a failover.
