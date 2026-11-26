@@ -21,6 +21,14 @@ describe("a pipeline's page", () => {
     expect(where(NOW + 7_000)).toContain('expires in 1 s');
   });
 
+  it("counts nothing down once the cluster's read fails: its lease's end is only what the last read saw", () => {
+    const failed = { at: NOW - 30_000, error: 'HTTP 503' };
+    expect(header(detail(), undefined, liveFigures(), lease(), NOW + 23_000, failed)!.where).toBe(
+      'on n2 · away from owner n1 · lease epoch 2',
+    );
+    expect(header(detail(), undefined, liveFigures(), lease(), NOW, { at: NOW, error: null })!.where).toContain('expires in 8 s');
+  });
+
   it('says a released lease is released, with no epoch to count down', () => {
     const d = detail({ holder: { ...detail().holder!, released: true } });
     expect(header(d, undefined, null, undefined, NOW)!.where).toBe('lease released');

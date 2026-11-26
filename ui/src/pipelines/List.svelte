@@ -20,7 +20,7 @@
   import type { Router } from '../lib/router.svelte';
   import { formatValue } from '../lib/series';
   import type { Session } from '../lib/session';
-  import type { Model } from '../model/model.svelte';
+  import { PART_NAMES, type Model, type Part } from '../model/model.svelte';
   import { LAG_TARGET_S } from '../overview/attention';
   import Sparkline from '../overview/Sparkline.svelte';
   import type { LagHistory } from './lag.svelte';
@@ -157,19 +157,10 @@
     return outcomeText(o);
   }
 
-  /** The parts the list shows, as people call them. */
+  /** The parts the list shows. */
+  const LIST_PARTS: Part[] = ['pipelines', 'cluster', 'jobs', 'tables'];
   const failing = $derived(
-    failingNotice(
-      failures(
-        [
-          ['the pipelines', model.read.pipelines],
-          ['the cluster', model.read.cluster],
-          ['the snapshot jobs', model.read.jobs],
-          ['the tables', model.read.tables],
-        ],
-        now,
-      ),
-    ),
+    failingNotice(failures(LIST_PARTS.map((p) => [PART_NAMES[p], model.read[p]]), now)),
   );
   const headings: { column: Column | null; label: string }[] = [
     { column: 'pipeline', label: 'Pipeline' },

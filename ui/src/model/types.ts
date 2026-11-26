@@ -31,10 +31,37 @@ export interface PipelineItem {
   sink: SinkAt;
 }
 
+/** A member as `GET /v1/cluster/status` lists it. */
+export interface Member {
+  node: string;
+  /** Its gossip address. */
+  addr?: string;
+  phase: string;
+  suspect: boolean;
+  config_generation: number | null;
+  build?: string;
+  api_url?: string | null;
+  /** When its process started (RFC 3339). */
+  started_at?: string | null;
+}
+
+/** The cluster's settings a console states (`GET /v1/cluster/status`'s `settings`). */
+export interface ClusterSettings {
+  tokens: number;
+  lock_backend: string;
+  lease_seconds: number;
+  rebalance_stabilization_seconds: number;
+  max_concurrent_handoffs: number;
+  drain_timeout_seconds: number;
+  history_retention_seconds: number;
+  events_retention_seconds: number;
+}
+
 /** `GET /v1/cluster/status`. */
 export interface ClusterStatus {
   node: string;
-  members: { node: string; phase: string; suspect: boolean; config_generation: number | null }[];
+  members: Member[];
+  settings?: ClusterSettings;
   pipelines: {
     id: string;
     holder: string | null;
@@ -180,6 +207,7 @@ export interface EventItem {
 export interface Series {
   name: string;
   pipeline?: string;
+  node?: string;
   points: [number, number][];
 }
 
@@ -204,4 +232,72 @@ export interface PipelineDetail {
   /** The committed position, tagged. */
   position: string | null;
   halted_tables: { table: string; code: string; detail: string; since: string | null }[];
+}
+
+/** A removal not torn down yet (`GET /v1/cluster/removals`, DA-API-21). */
+export interface Removal {
+  id: string;
+  /** The last config generation that had the pipeline. */
+  generation: number;
+  removed_at: string;
+}
+
+/** A node's process, as its detail and its live `node` message show it. */
+export interface Process {
+  memory_bytes: number | null;
+  memory_limit_bytes: number | null;
+  cpu_seconds: number | null;
+  cpu_cores: number | null;
+  cpu_limit_cores: number | null;
+}
+
+/** What a node's gossip saw: its peers, its last probe, the suspicions of the last day. */
+export interface Gossip {
+  peers: { node: string; state: 'alive' | 'suspect'; phase: string }[];
+  last_probe: { node: string; at: string } | null;
+  probe_rtt_ms: number | null;
+  suspicions: {
+    raised: { node: string; at: string }[];
+    received: number;
+    raised_more: number;
+    received_more: number;
+  };
+}
+
+/** The stream's `node` message: a node's own figures, sent every 5 s. */
+export interface NodeFigures {
+  node: string;
+  at: string;
+  phase: string | null;
+  process: Process;
+  gossip: Gossip;
+  /** The pipelines it runs. */
+  pipelines: string[];
+}
+
+/** `GET /v1/nodes/{node}`: a node's detail, from the node itself. */
+export interface NodeDetail {
+  node: string;
+  api_url: string | null;
+  gossip_addr: string | null;
+  build: string | null;
+  incarnation: number | null;
+  started_at: string | null;
+  phase: string | null;
+  config_generation: number;
+  /** Its own file against its generation (keyed fingerprints). */
+  file: { hash: string | null; generation_hash: string | null; matches: boolean | null };
+  restart_pending: string[];
+  process: Process;
+  gossip: Gossip;
+  /** The pipelines whose lease it holds; `null` when the leases couldn't be read. */
+  pipelines: { id: string; owner_epoch: number; ring_owner: string | null }[] | null;
+}
+
+/** How the node's Prometheus last answered a chart's read (`GET /v1/history`); absent when no
+ * Prometheus is configured. */
+export interface PrometheusStatus {
+  state: 'unasked' | 'ok' | 'failing';
+  at?: string;
+  error?: string | null;
 }

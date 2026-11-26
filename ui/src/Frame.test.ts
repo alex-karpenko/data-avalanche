@@ -32,6 +32,8 @@ function render(props: Partial<Parameters<typeof Frame>[1]> = {}): HTMLElement {
       last: NOW,
       now: NOW,
       onRetry: () => {},
+      status: [],
+      onStatus: () => {},
       ...props,
     },
   });
@@ -59,6 +61,40 @@ describe('the frame', () => {
     expect(open.querySelector('[role="alert"]')?.textContent).toContain(
       'This cluster has no authentication: everyone who reaches the console is admin.',
     );
+  });
+
+  it("shows the console's status from the user menu, read again as it opens", () => {
+    const onStatus = vi.fn();
+    const page = render({
+      onStatus,
+      status: [
+        { label: 'Live updates', chip: 'connected', text: 'via n1', tone: 'ok' },
+        { label: 'Prometheus', chip: 'failing', text: 'connection refused · last asked 13:40', tone: 'red' },
+        { label: 'Event store', chip: null, text: 'not read yet', tone: 'muted' },
+      ],
+    });
+    const menu = page.querySelector<HTMLDetailsElement>('.who details.menu');
+    expect(menu?.querySelector('summary')?.textContent).toMatch(/^Oleksii\s+operator$/);
+    // Closed, it draws nothing: its rows aren't the page's.
+    expect(menu?.querySelector('.status')).toBeNull();
+    menu!.open = true;
+    menu!.dispatchEvent(new Event('toggle'));
+    flushSync();
+    expect(onStatus).toHaveBeenCalledOnce();
+    expect(menu?.querySelector('h3')?.textContent).toBe('Console status');
+    const rows = [...(menu?.querySelectorAll('tr') ?? [])].map((r) => [...r.querySelectorAll('td')].map((d) => d.textContent?.trim()));
+    expect(rows).toEqual([
+      ['Live updates', 'connected via n1'],
+      ['Prometheus', 'failing connection refused · last asked 13:40'],
+      ['Event store', 'not read yet'],
+    ]);
+    expect(menu?.querySelector('.chip.red')?.textContent).toBe('failing');
+    expect(menu?.querySelector('td.muted')?.textContent?.trim()).toBe('not read yet');
+    menu!.open = false;
+    menu!.dispatchEvent(new Event('toggle'));
+    flushSync();
+    expect(menu?.querySelector('.status')).toBeNull();
+    expect(onStatus).toHaveBeenCalledOnce();
   });
 
   it('says how old the page is once the updates stop', () => {

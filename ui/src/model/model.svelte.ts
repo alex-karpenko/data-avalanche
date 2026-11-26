@@ -5,7 +5,7 @@
 import type { Client } from '../lib/api';
 import type { Live } from '../lib/live.svelte';
 import { LEASE_LOSS_WITHIN_S } from '../overview/attention';
-import { empty, type Facts } from './facts';
+import { at, empty, type Facts } from './facts';
 import type {
   Actual,
   ClusterStatus,
@@ -13,7 +13,10 @@ import type {
   EventItem,
   Figures,
   Job,
+  NodeFigures,
   PipelineItem,
+  PrometheusStatus,
+  Removal,
   Series,
   Tables,
 } from './types';
@@ -27,10 +30,15 @@ export const LAG_SPAN_S = 3600;
 /** A burst of events reads their parts again once, after this. */
 export const REREAD_AFTER_MS = 1_000;
 /**
- * A pipeline's page reads the cluster again this often: a lease's renewals send no event, and
- * its end (`expires_at`) is only what the last read saw.
+ * A pipeline's page, the Cluster page and a node's page read the cluster again this often: a
+ * lease's renewals send no event, and its end (`expires_at`) is only what the last read saw.
  */
 export const CLUSTER_REREAD_MS = 5_000;
+/**
+ * While any removal is listed, the removals are read again this often (the tombstone sweep's
+ * cadence): one the next generation undoes is marked done by the sweep, with no event.
+ */
+export const REMOVALS_REREAD_MS = 30_000;
 
 export type Part =
   | 'pipelines'
@@ -41,7 +49,8 @@ export type Part =
   | 'events'
   | 'actions'
   | 'leases'
-  | 'lag';
+  | 'lag'
+  | 'removals';
 export const PARTS: Part[] = [
   'pipelines',
   'cluster',
@@ -52,7 +61,22 @@ export const PARTS: Part[] = [
   'actions',
   'leases',
   'lag',
+  'removals',
 ];
+
+/** Each part as people read it, for the notices that say which couldn't be read. */
+export const PART_NAMES: Record<Part, string> = {
+  pipelines: 'the pipelines',
+  cluster: 'the cluster',
+  config: "the nodes' config",
+  jobs: 'the snapshot jobs',
+  tables: 'the tables',
+  events: 'the events',
+  actions: "the pipelines' last actions",
+  leases: "the hour's lease hand-offs",
+  lag: 'the lag lines',
+  removals: 'the pending removals',
+};
 
 /** When a part was last read (ms), and why its last read failed. */
 export interface Read {
@@ -74,7 +98,8 @@ function only<T>(r: Record<string, T>, keep: Set<string>): Record<string, T> {
 /** The parts an event's kind changes. */
 function partsOf(kind: string): Part[] {
   if (kind.startsWith('job.')) return ['jobs'];
-  if (kind.startsWith('config.')) return ['config'];
+  if (kind.startsWith('config.')) return ['config', 'removals'];
+  if (kind === 'pipeline.removed') return ['pipelines', 'removals'];
   if (kind.startsWith('lease.')) return ['cluster', 'pipelines', 'leases'];
   if (kind.startsWith('member.')) return ['cluster', 'pipelines'];
   if (kind.startsWith('table.') || kind.startsWith('schema.')) return ['tables'];
@@ -113,11 +138,23 @@ export class Model {
       live.on('event', (d) => this.event(d as EventItem)),
       live.on('members', () => this.#reread(['cluster'])),
       live.on('peer', (d) => this.peer(d as PeerMsg)),
+      live.on('node', (d) => this.node(d as NodeFigures)),
     ];
+    const removals = setInterval(() => {
+      if (this.facts.removals.length > 0) void this.load(['removals']);
+    }, REMOVALS_REREAD_MS);
     return () => {
       for (const stop of stops) stop();
+      clearInterval(removals);
       clearTimeout(this.#timer);
     };
+  }
+
+  /** A node's own figures, every 5 s: the newest it sent wins. */
+  node(m: NodeFigures): void {
+    const had = this.facts.nodes[m.node];
+    if (had !== undefined && (at(had.at) ?? 0) > (at(m.at) ?? 0)) return;
+    this.facts.nodes[m.node] = m;
   }
 
   /** A pipeline's state changed on the node that runs it; `standby` when it stopped running it. */
@@ -141,8 +178,9 @@ export class Model {
     this.facts.figures[m.id] = m;
   }
 
-  /** A pipeline's chart sample: its lag joins the line, which keeps the last hour. */
+  /** A chart sample: when it was taken; a pipeline's lag joins its line, which keeps the last hour. */
   samples(m: SamplesMsg): void {
+    this.facts.lastSample = Math.max(this.facts.lastSample ?? 0, m.at * 1000);
     const lag = m.series?.lag_seconds;
     if (m.scope !== 'pipeline' || m.pipeline === undefined || lag === undefined) return;
     const points = [...(this.facts.lag[m.pipeline] ?? []), [m.at, lag] as [number, number]];
@@ -169,7 +207,7 @@ export class Model {
     } else if (m.peer in this.facts.unreachable) {
       delete this.facts.unreachable[m.peer];
       // Its events of the gap aren't sent again (Admin_Console §8.1): they are read.
-      this.#reread(['events', 'pipelines', 'cluster', 'leases']);
+      this.#reread(['events', 'pipelines', 'cluster', 'leases', 'removals']);
     }
   }
 
@@ -206,7 +244,9 @@ export class Model {
           }
           f.unheld = unheld;
           // A member removed gets no more `peer`: it is out of reach no longer.
-          f.unreachable = only(f.unreachable, new Set(f.cluster.members.map((m) => m.node)));
+          const members = new Set(f.cluster.members.map((m) => m.node));
+          f.unreachable = only(f.unreachable, members);
+          f.nodes = only(f.nodes, members);
           break;
         }
         case 'config':
@@ -240,8 +280,14 @@ export class Model {
           f.leaseLosses = events;
           break;
         }
+        case 'removals':
+          f.removals = (await this.#api.get<{ removals: Removal[] }>('/v1/cluster/removals')).removals;
+          break;
         case 'lag': {
-          const { series } = await this.#api.get<{ series: Series[] }>('/v1/history?series=lag_seconds');
+          const { series, prometheus } = await this.#api.get<{ series: Series[]; prometheus?: PrometheusStatus }>(
+            '/v1/history?series=lag_seconds',
+          );
+          f.prometheus = prometheus ?? null;
           f.lag = Object.fromEntries(
             series.filter((s) => s.pipeline !== undefined).map((s) => [s.pipeline!, s.points]),
           );

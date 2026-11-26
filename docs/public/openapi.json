@@ -160,6 +160,58 @@
         "x-min-role": "admin"
       }
     },
+    "/v1/cluster/removals": {
+      "get": {
+        "tags": [
+          "cluster"
+        ],
+        "summary": "The pipeline removals not torn down yet, oldest first: each one's id, the last generation that had it, and when it was removed",
+        "responses": {
+          "200": {
+            "description": "the pending removals",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "description": "no credentials, or ones that don't verify",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "403": {
+            "description": "the caller's role is below the route's; or a session's request that changes something without its `X-CSRF-Token`",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "429": {
+            "description": "with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "503": {
+            "description": "the node is starting or stopping, or its state can't be read",
+            "content": {
+              "application/json": {}
+            }
+          }
+        },
+        "security": [
+          {
+            "basic": []
+          },
+          {
+            "bearer": []
+          },
+          {
+            "session": []
+          }
+        ],
+        "x-min-role": "viewer"
+      }
+    },
     "/v1/cluster/status": {
       "get": {
         "tags": [
@@ -168,7 +220,7 @@
         "summary": "The members this node sees, and each pipeline's lease holder",
         "responses": {
           "200": {
-            "description": "the members and the holders; a member's `file_hash` is its file's keyed fingerprint (first 16 hex), comparable across nodes of one cluster only",
+            "description": "the members and the holders, and the cluster's settings a console states (`settings`: its tokens, lock, lease and hand-off settings and the history's and the events' retention); a member's `file_hash` is its file's keyed fingerprint (first 16 hex), comparable across nodes of one cluster only",
             "content": {
               "application/json": {}
             }

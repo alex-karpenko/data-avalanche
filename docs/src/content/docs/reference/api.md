@@ -442,6 +442,18 @@ Least role: `admin`.
 | `422` | the note is too long, not a string, holds a control character, or the body isn't a JSON object |
 | `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 
+### `GET /v1/cluster/removals`
+
+The pipeline removals not torn down yet, oldest first: each one's id, the last generation that had it, and when it was removed
+
+Least role: `viewer`.
+
+
+| Status | When |
+|---|---|
+| `200` | the pending removals |
+| `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
+
 ### `GET /v1/cluster/status`
 
 The members this node sees, and each pipeline's lease holder
@@ -451,7 +463,7 @@ Least role: `viewer`.
 
 | Status | When |
 |---|---|
-| `200` | the members and the holders; a member's `file_hash` is its file's keyed fingerprint (first 16 hex), comparable across nodes of one cluster only |
+| `200` | the members and the holders, and the cluster's settings a console states (`settings`: its tokens, lock, lease and hand-off settings and the history's and the events' retention); a member's `file_hash` is its file's keyed fingerprint (first 16 hex), comparable across nodes of one cluster only |
 | `429` | with `basic`: the caller's address failed too many basic sign-ins, and waits: `Retry-After` says how long |
 
 ## admin

@@ -50,6 +50,8 @@ export class Live {
   state = $state<State>('connecting');
   /** When the last message came (ms since the epoch); `null` before the first. */
   last = $state<number | null>(null);
+  /** The node the stream comes through, as its last hello named it; `null` before the first. */
+  via = $state<string | null>(null);
 
   #deps: Deps;
   #url: string;
@@ -157,7 +159,10 @@ export class Live {
     this.last = Date.now();
     this.#reopens = 0;
     this.state = 'live';
-    if (kind === 'hello' && this.#hellos++ > 0) this.#resyncAll();
+    if (kind === 'hello') {
+      this.via = (data as { node?: string }).node ?? null;
+      if (this.#hellos++ > 0) this.#resyncAll();
+    }
     if (kind === 'reset') {
       const reason = (data as { reason?: string }).reason;
       if (reason === 'lagged') this.#resyncAll();

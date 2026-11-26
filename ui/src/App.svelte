@@ -1,13 +1,18 @@
 <script lang="ts">
   // The console's app: who is signed in, the live stream, and the page the address names.
   import { onMount, untrack } from 'svelte';
+  import Cluster from './cluster/Cluster.svelte';
+  import { Renewals } from './cluster/renewals.svelte';
   import Frame from './Frame.svelte';
   import Later from './Later.svelte';
   import { client } from './lib/api';
   import { Live } from './lib/live.svelte';
   import { Router } from './lib/router.svelte';
+  import { consoleStatus } from './lib/status';
   import { awaitSession, checkSession, keepFresh, RETRY_MS, type Session } from './lib/session';
   import { Model } from './model/model.svelte';
+  import Node from './nodes/Node.svelte';
+  import { NodePage } from './nodes/page.svelte';
   import Overview from './overview/Overview.svelte';
   import { LagHistory } from './pipelines/lag.svelte';
   import List from './pipelines/List.svelte';
@@ -32,11 +37,37 @@
   const model = new Model(api);
   /** Every pipeline's lag over 6 hours, read when the list is first shown. */
   const lag = new LagHistory(api);
+  /** Each member's lease renewals over the last hour, read each time the Cluster page is shown. */
+  const renewals = new Renewals(api);
+  const onCluster = $derived(router.section === 'cluster' && router.rest.length === 0);
+  /** The members' names: read again when they change, not at each read of the cluster. */
+  const memberNames = $derived((model.facts.cluster?.members ?? []).map((m) => m.node).join('\n'));
+  $effect(() => {
+    if (!onCluster || !signedIn || memberNames === '') return;
+    const names = memberNames.split('\n');
+    // The read follows the members, not the renewals it writes.
+    untrack(() => void renewals.load(names));
+  });
   /** The pipeline whose page is shown; its page reads and follows it while shown. */
   const pageId = $derived(router.section === 'pipelines' && router.rest.length === 1 ? router.rest[0] : null);
   /** Signed in or not: a token refresh swaps the session's object, not who is signed in. */
   const signedIn = $derived(session !== null);
   let page = $state<PipelinePage | null>(null);
+  /** The node whose page is shown: `/ui/cluster/nodes/{name}`. */
+  const nodeName = $derived(
+    router.section === 'cluster' && router.rest.length === 2 && router.rest[0] === 'nodes' ? router.rest[1] : null,
+  );
+  let nodePage = $state<NodePage | null>(null);
+  $effect(() => {
+    if (nodeName === null || !signedIn) {
+      nodePage = null;
+      return;
+    }
+    const p = new NodePage(api, nodeName);
+    nodePage = p;
+    void p.load();
+    return p.follow(live);
+  });
   $effect(() => {
     if (pageId === null || !signedIn) {
       page = null;
@@ -97,9 +128,28 @@
     last={live.last}
     {now}
     onRetry={() => live.retry()}
+    status={consoleStatus({ state: live.state, via: live.via, last: live.last, facts: model.facts, read: model.read }, now)}
+    onStatus={() => void model.load(['lag', 'events'])}
   >
     {#if router.section === 'overview'}
       <Overview {model} {now} stale={live.stale(now)} last={live.last} />
+    {:else if onCluster}
+      <Cluster {model} {renewals} {now} stale={live.stale(now)} last={live.last} />
+    {:else if nodePage !== null && nodePage.name === nodeName}
+      {#key nodePage}
+        <Node
+          page={nodePage}
+          {model}
+          {lag}
+          {session}
+          {api}
+          via={live.via}
+          {now}
+          stale={live.stale(now)}
+          last={live.last}
+          offline={live.state === 'offline'}
+        />
+      {/key}
     {:else if page !== null && page.id === pageId}
       <!-- Each pipeline's page starts clean: nothing chosen or open carries over from the last. -->
       {#key page}

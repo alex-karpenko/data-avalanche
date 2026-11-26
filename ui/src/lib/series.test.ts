@@ -59,6 +59,9 @@ describe("a chart's values", () => {
   it('are written in their units, short', () => {
     expect(formatValue('seconds', 94)).toBe('94 s');
     expect(formatValue('seconds', 252)).toBe('4m 12s');
+    // A lease renewal, under a second: in milliseconds.
+    expect(formatValue('seconds', 0.038)).toBe('38 ms');
+    expect(formatValue('seconds', 0)).toBe('0 s');
     expect(formatValue('bytes', 210 * 1024 ** 2)).toBe('210 MB');
     expect(formatValue('rows/s', 41_200)).toBe('41 k/s');
     expect(formatValue('changes/min', 2_600_000)).toBe('2.6 M/min');
