@@ -48,8 +48,8 @@ Rust 1.100.0, no new crate. No new package anywhere.
   `11-node-actions-and-degraded-states.html` (the node dialogs, the console status).
 - `doc/specs/System-Overview.md`, Management API endpoints (`/v1/cluster/status`,
   `/v1/nodes/{node}`, `/v1/nodes/{node}/leave|shutdown`, `/v1/history`, `/v1/events`,
-  `/v1/stream`): **spec patch S-M16b.1** (below, for approval) adds the new route and the status's
-  new fields.
+  `/v1/stream`): **spec patch S-M16b.1** (below, approved and applied 2026-11-26) adds the new
+  route and the status's new fields.
 - `doc/specs/Configuration_Specification.md` §12.3 (removal tombstones: `removals/<id>.json`, the
   owner or the ring's node tears a removal down and marks it done).
 - `doc/v1.1/M16a-console-pipelines.md` (the model, the chart, the dialog, the notices, the
@@ -57,7 +57,7 @@ Rust 1.100.0, no new crate. No new package anywhere.
   `M13e-console-history.md` (a node's series, `prometheus` in the answer),
   `M13f-console-stream.md` (`hello`, `node`).
 
-### Spec patch S-M16b.1 (proposed; applied only on Oleksii's approval, before Task 1)
+### Spec patch S-M16b.1 (approved and applied 2026-11-26)
 
 `doc/specs/System-Overview.md`, the Management API endpoints table. The Cluster status row's
 semantics become:
@@ -5407,7 +5407,7 @@ git commit -m "test(e2e): the Cluster pages and a node's actions in a browser on
 
 ## Exit
 
-- Spec patch S-M16b.1 applied (on approval) before Task 1.
+- Spec patch S-M16b.1 applied (2026-11-26, before Task 1).
 - Every task committed, one commit each, after the plan's commits; the gates pass on the last one
   (`cargo fmt --all --check`, both clippy runs, `cargo test --workspace`, and in `ui/`
   `npm run check`, `npm test`, `npm run build`).
